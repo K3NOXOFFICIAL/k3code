@@ -8,12 +8,12 @@ from learn_helpers import FakeCaller
 
 
 def seed(log: DecisionLog) -> None:
-    for i in range(3):
+    for _ in range(3):
         log.record("model_switch", subject="m-x -> m-y", choice="m-y",
                    detail={"from": "m-x", "to": "m-y", "task_kind": "review", "to_tier": "strong"})
         log.record("plan", subject="exit_plan", choice="deny", detail={"has_verification": False})
         log.record("proposal", subject="t", choice="dismiss", detail={"kind": "improvement"})
-    for i in range(5):
+    for _ in range(5):
         log.record("approval", subject="npm test *", choice="once", detail={"tool": "bash"})
 
 

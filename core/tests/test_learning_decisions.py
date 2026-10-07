@@ -1,6 +1,6 @@
 import json
 
-from k3code.learning.decisions import DecisionLog, KINDS, project_id, scrub
+from k3code.learning.decisions import KINDS, DecisionLog, project_id, scrub
 from learn_helpers import FakeClock
 
 
