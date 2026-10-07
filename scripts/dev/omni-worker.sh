@@ -105,6 +105,7 @@ resume_prompt() {
 if [ "$RESUMING" = 1 ]; then PROMPT=$(resume_prompt); else PROMPT=$(base_prompt); fi
 
 SESSION=""; attempt=0; status=fail; omni_errors=0; LAST_BACKEND=""; KEY_QUOTA_UNTIL=0
+run_stamp="$RUNS/.run-start"; touch "$run_stamp"   # a REPORT.md newer than this counts as done
 while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
   attempt=$((attempt + 1))
   # While the OmniRoute key itself is out of quota, stay on Claude until the reset.
@@ -168,10 +169,10 @@ sys.exit(0 if re.search(r"prompt is too long|compaction failed|context length ex
   iserr=$(printf '%s' "$json" | python3 -c 'import sys,json
 try: print(json.load(sys.stdin).get("is_error",True))
 except Exception: print(True)')
-  if [ $rc -eq 0 ] && [ "$iserr" = "False" ] && [ "$WT/REPORT.md" -nt "$stamp" ]; then status=ok; break; fi
+  if [ $rc -eq 0 ] && [ "$iserr" = "False" ] && [ "$WT/REPORT.md" -nt "$run_stamp" ]; then status=ok; break; fi
   echo "$(date -Is) attempt $attempt rc=$rc is_error=$iserr report=$([ -f "$WT/REPORT.md" ] && echo y || echo n)" >> "$RUNS/driver.log"
   # The OmniRoute key's own daily quota is exhausted: no combo can work until the reset.
-  if printf '%s' "$json" | grep -qiE 'API key reached its daily usage quota|key.{0,20}quota'; then
+  if [ "$iserr" != "False" ] && printf '%s' "$json" | grep -qiE 'API key reached its daily usage quota'; then
     h=$(printf '%s' "$json" | grep -oE 'Resets in [0-9]+h' | grep -oE '[0-9]+' | head -1)
     KEY_QUOTA_UNTIL=$(( $(date +%s) + ${h:-1} * 3600 ))
     echo "$(date -Is) OmniRoute key quota exhausted — Claude fallback for ${h:-1}h" >> "$RUNS/driver.log"
