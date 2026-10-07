@@ -215,3 +215,12 @@ async def test_outside_roots_asks_without_add_dir(tmp_path, monkeypatch):
     assert len(seen) == 1 and not (extra / "f.txt").exists()
 
 
+
+
+async def test_auto_mode_logs_side_effects_to_event_stream(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, [bash("echo hi > a.txt"), "ok"], monkeypatch, mode="auto")
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    seen = await run_turn(server, "go", [])
+    assert seen == [] and (tmp_path / "a.txt").exists()
+    events = [json.loads(x) for x in server._frames if "permission.auto_allowed" in x]  # type: ignore[attr-defined]
+    assert events and events[0]["params"]["payload"]["tool"] == "bash"
