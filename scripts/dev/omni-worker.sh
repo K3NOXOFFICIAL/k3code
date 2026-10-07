@@ -34,9 +34,12 @@ if [ -z "${OMNIROUTE_API_KEY:-}" ]; then
   export OMNIROUTE_API_KEY
 fi
 
+RESUMING=0
 if [ ! -d "$WT" ]; then
   BASE=${BASE:-$(git -C "$REPO" rev-parse --abbrev-ref HEAD)}
   git -C "$REPO" worktree add -q "$WT" -b "w/$NAME" "$BASE" || exit 2
+else
+  RESUMING=1   # restarted driver on an existing worktree: continue from its state
 fi
 
 wait_online() {  # pause while offline / gateway unreachable, resume automatically
@@ -47,10 +50,12 @@ wait_online() {  # pause while offline / gateway unreachable, resume automatical
   done
 }
 
-PROMPT="$(cat "$PREAMBLE")
-
-## Your task
-$(cat "$TASK")"
+base_prompt() { printf '%s\n\n## Your task\n%s\n' "$(cat "$PREAMBLE")" "$(cat "$TASK")"; }
+resume_prompt() {
+  base_prompt
+  printf '\n## Resuming\n%s\n' "An earlier worker session already worked on this task in this same worktree and did not finish. First read PROGRESS.md (if present), then run git log --oneline -20, git status and git diff --stat to see what is already done. Do NOT redo finished work; continue with what is missing, then verify, commit and write REPORT.md."
+}
+if [ "$RESUMING" = 1 ]; then PROMPT=$(resume_prompt); else PROMPT=$(base_prompt); fi
 
 SESSION=""; attempt=0; status=fail
 while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
@@ -58,7 +63,7 @@ while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
   MODEL=${MODEL_LIST[$midx]}
   FALLBACK=${MODEL_LIST[$(( (midx + 1) % ${#MODEL_LIST[@]} ))]}
   FB=(); [ "$FALLBACK" != "$MODEL" ] && FB=(--fallback-model "$FALLBACK")
-  out="$RUNS/attempt-$attempt.json"
+  out="$RUNS/attempt-$attempt.json"; stamp="$RUNS/.attempt-start"; touch "$stamp"
   echo "$(date -Is) attempt $attempt model=$MODEL (session=${SESSION:-new})" >> "$RUNS/driver.log"
   if [ -z "$SESSION" ]; then
     (cd "$WT" && nice -n 10 ionice -c3 claude -p --settings "$SETTINGS" --model "$MODEL" "${FB[@]}" \
@@ -79,20 +84,12 @@ except Exception: print("")')
   if grep -qiE "prompt is too long|compaction failed|context.{0,20}(length|window)" "$out" "$RUNS/attempt-$attempt.err" 2>/dev/null; then
     echo "$(date -Is) context exhausted — next attempt starts a fresh session" >> "$RUNS/driver.log"
     SESSION=""
-    PROMPT="$(cat "$PREAMBLE")
-
-## Your task
-$(cat "$TASK")
-
-## Resuming
-A previous worker session ran out of context while working on this task in this same worktree.
-First read PROGRESS.md (if present), then run git log --oneline -20, git status and git diff --stat to see what is already done.
-Do NOT redo finished work; continue with what is missing."
+    PROMPT=$(resume_prompt)
   fi
   iserr=$(printf '%s' "$json" | python3 -c 'import sys,json
 try: print(json.load(sys.stdin).get("is_error",True))
 except Exception: print(True)')
-  if [ $rc -eq 0 ] && [ "$iserr" = "False" ] && [ -f "$WT/REPORT.md" ]; then status=ok; break; fi
+  if [ $rc -eq 0 ] && [ "$iserr" = "False" ] && [ "$WT/REPORT.md" -nt "$stamp" ]; then status=ok; break; fi
   echo "$(date -Is) attempt $attempt rc=$rc is_error=$iserr report=$([ -f "$WT/REPORT.md" ] && echo y || echo n)" >> "$RUNS/driver.log"
   stalls=$((stalls + 1))
   if [ "$stalls" -ge "$ROTATE_AFTER" ] && [ "${#MODEL_LIST[@]}" -gt 1 ]; then
