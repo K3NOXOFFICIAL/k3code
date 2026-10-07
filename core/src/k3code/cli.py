@@ -13,10 +13,18 @@ from typing import Any
 import click
 
 from k3code.agent.loop import AgentLoop
-from k3code.config import load_config
+from k3code.config import K3CODE_HOME, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.permissions import PermissionMode
 from k3code.providers import make_providers
+from k3code.reliability import (
+    BudgetExceeded,
+    DiskGuardFull,
+    Reliability,
+    ReliabilityFlags,
+    ReliabilitySettings,
+)
+from k3code.reliability.persistent_retry import TurnCancelled
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -57,6 +65,22 @@ def _print_event(event: RouterEvent) -> None:
         logger.info("Failover: %s/%s (reason: %s) — %s", event.provider, event.model, event.reason, event.detail)
     elif event.kind == "router.exhausted":
         logger.warning("Chain exhausted: %s", event.detail)
+    elif event.kind.startswith(("reliability.", "net.state")):
+        # M2: reliability events surface as info lines.
+        logger.info("%s %s", event.kind, event.detail)
+
+
+def _build_reliability(config: Any, session: str) -> Reliability:
+    """M2: build the reliability bundle from the config's reliability dict."""
+    raw = dict(getattr(config, "reliability", None) or {})
+    flags_raw = raw.pop("flags", None)
+    flags = ReliabilityFlags(**flags_raw) if isinstance(flags_raw, dict) else None
+    known = {"enabled", "flags", "max_wait", "max_park_seconds",
+             "session_tokens", "session_usd", "day_tokens", "day_usd"}
+    settings = ReliabilitySettings(flags=flags) if flags else ReliabilitySettings()
+    for key in known & set(raw):
+        setattr(settings, key, raw[key])
+    return Reliability.from_settings(settings, session=session, home=K3CODE_HOME)
 
 
 async def _run_headless(
@@ -75,6 +99,10 @@ async def _run_headless(
     cooldowns = CooldownStore()
     router = Router(chain, cooldowns=cooldowns, on_event=_print_event)
 
+    # M2: reliability bundle (netwatch, persistent retry, journal, guards).
+    reliability = _build_reliability(config, session="headless")
+    reliability.register_providers(chain)
+
     loop = AgentLoop(
         router,
         system_prompt=system_prompt,
@@ -83,6 +111,7 @@ async def _run_headless(
         headless=True,
         on_event=_print_event,
         cwd=Path.cwd(),
+        reliability=reliability,
     )
 
     final_text = ""
@@ -98,6 +127,7 @@ async def _run_headless(
     loop.on_text_delta = on_text_delta
 
     try:
+        await reliability.start()
         async for _ in loop.run(prompt, model=model, max_tokens=config.max_tokens, temperature=config.temperature):
             pass
         return {"text": final_text, "tools": tool_results}
@@ -107,9 +137,17 @@ async def _run_headless(
         return {"error": "chain_exhausted", "message": str(e), "last_reason": e.last_reason}
     except ContextOverflow as e:
         return {"error": "context_overflow", "message": str(e)}
+    except TurnCancelled as e:
+        return {"error": "cancelled", "message": str(e)}
+    except BudgetExceeded as e:
+        return {"error": "budget_exceeded", "message": str(e), "scope": e.scope, "kind": e.kind}
+    except DiskGuardFull as e:
+        return {"error": "disk_guard", "message": str(e)}
     except Exception as e:
         logger.exception("Agent failed")
         return {"error": "agent_error", "message": str(e)}
+    finally:
+        await reliability.stop()
 
 
 async def _run_repl(
@@ -126,6 +164,10 @@ async def _run_repl(
     cooldowns = CooldownStore()
     router = Router(chain, cooldowns=cooldowns, on_event=_print_event)
 
+    # M2: reliability bundle; one journal/session per REPL process.
+    reliability = _build_reliability(config, session="repl")
+    reliability.register_providers(chain)
+
     loop = AgentLoop(
         router,
         system_prompt=system_prompt,
@@ -134,12 +176,18 @@ async def _run_repl(
         headless=False,
         on_event=_print_event,
         cwd=Path.cwd(),
+        reliability=reliability,
     )
 
-    print("k3code REPL (type /exit to quit, /model <name> to switch)")
+    print("k3code REPL (type /exit to quit, /model <name> to switch, /stop to cancel a stuck turn)")
     print(f"Permission mode: {permission_mode.value}")
     if model:
         print(f"Model override: {model}")
+
+    try:
+        await reliability.start()
+    except Exception:
+        logger.debug("netwatch start failed; continuing without it")
 
     while True:
         try:
@@ -151,6 +199,12 @@ async def _run_repl(
             continue
         if user_input == "/exit":
             break
+        if user_input == "/stop":
+            # M2: abort a paused/parked wait in another turn (best effort here:
+            # the REPL is single-threaded, so /stop mainly guards the next turn).
+            reliability.cancel()
+            print("Stop requested.")
+            continue
         if user_input.startswith("/model "):
             model = user_input[7:].strip()
             print(f"Model set to: {model}")
@@ -179,9 +233,20 @@ async def _run_repl(
             print(f"\n[Error] Chain exhausted: {e}")
         except ContextOverflow as e:
             print(f"\n[Error] Context overflow: {e}")
+        except TurnCancelled as e:
+            print(f"\n[Stopped] {e}")
+        except BudgetExceeded as e:
+            print(f"\n[Budget] {e} — raise the limit in config (reliability.session_*) to continue.")
+        except DiskGuardFull as e:
+            print(f"\n[Disk] {e}")
+        except KeyboardInterrupt:
+            # M2: Ctrl-C mid-turn cancels any parked/paused wait.
+            reliability.cancel()
+            print("\n[Interrupted] turn cancelled (/stop semantics).")
         except Exception as e:
             logger.exception("REPL turn failed")
             print(f"\n[Error] {e}")
+    await reliability.stop()
 
 
 @click.command()

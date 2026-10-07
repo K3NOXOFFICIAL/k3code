@@ -40,6 +40,11 @@ class Settings(BaseModel):
     temperature: float | None = None
     permission_mode: str = "ask"  # ask | auto-edit | yolo
     headless_permission: str | None = None  # overrides permission_mode in -p mode
+    # M2 reliability layer; keys mirror reliability.ReliabilitySettings, e.g.
+    #   reliability: {enabled: true, max_wait: 3600,
+    #                 flags: {netwatch: true, journal: true, ...},
+    #                 session_tokens: 2000000, session_usd: 5.0}
+    reliability: dict[str, Any] = Field(default_factory=dict)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
