@@ -14,7 +14,7 @@ import { FACES } from '../content/faces.js'
 import { VERBS } from '../content/verbs.js'
 import { fmtDuration } from '../domain/messages.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
-import { isReducedMotion, MIN_ANIMATION_TICK_MS } from '../lib/animation.js'
+import { isReducedMotion } from '../lib/animation.js'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
 import { useScrollbarSnapshot, useViewportSnapshot } from '../lib/viewportStore.js'
 import type { Theme } from '../theme.js'
@@ -37,8 +37,7 @@ const ASCII_FRAMES = ['|', '/', '-', '\\']
 
 // Faster tick for spinner-style indicators — they read as motion only
 // at frame rates closer to their authored interval.
-// Busy-indicator timers never run faster than the shared animation floor.
-const SPINNER_TICK_MS = MIN_ANIMATION_TICK_MS
+const SPINNER_TICK_MS = 100
 
 interface IndicatorRender {
   frame: string
