@@ -130,7 +130,9 @@ class Reliability:
     # ── lifecycle ──
 
     def attach_router(self, router: Any) -> None:
-        """Build the persistent-retry wrapper around the live router."""
+        """Build the persistent-retry wrapper around the live router (once per router)."""
+        if self.retry is not None and self.retry.router is router:
+            return
         if self.flags.persistent_retry:
             self.retry = PersistentRetry(
                 router,
@@ -184,6 +186,16 @@ class Reliability:
         return router.stream(messages, tools, model=model, max_tokens=max_tokens, temperature=temperature)
 
     # ── tool hooks (M2: journal + loop guard) ──
+
+    def begin_turn(self) -> None:
+        """Start a fresh run: the loop guard only judges repetition *within* one run.
+
+        The bundle lives as long as the session, so without this an identical reply in two
+        separate turns (a ``/loop`` tick that answers "nothing changed" twice) counted as a
+        doom loop and escalated a cheap background turn to the main tier.
+        """
+        if self.loop_guard is not None:
+            self.loop_guard.reset()
 
     def observe_tool_request(self, call: ToolCall) -> GuardOutcome | None:
         """Loop-guard check for a pending tool call (None when the guard is off)."""

@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -80,6 +81,33 @@ class RetryConfig:
     max_wait: float | None = None
     #: Sleep granularity while waiting (keeps waits cancel-aware).
     poll_interval: float = 0.5
+
+
+class _RetryAfterObserver:
+    """The single ``on_event`` wrapper on a router: forwards every event, tells live retries the Retry-After.
+
+    ``listeners`` holds :class:`PersistentRetry` instances weakly, so loops that are gone cost nothing.
+    A provider's Retry-After applies to every caller of that provider, so each live instance hears it.
+    """
+
+    def __init__(self, inner: Callable[[Any], None]) -> None:
+        self.inner = inner
+        self.listeners: weakref.WeakSet[PersistentRetry] = weakref.WeakSet()
+
+    def __call__(self, event: Any) -> None:
+        # RouterEvent payloads: kind "router.retry", reason rate_limit/quota,
+        # extra {"delay": seconds} (the provider's Retry-After when declared).
+        kind = getattr(event, "kind", None) or (event.get("event") if isinstance(event, dict) else None)
+        reason = getattr(event, "reason", None) or (event.get("reason") if isinstance(event, dict) else "")
+        if kind == "router.retry" and reason in RATE_LIMIT_REASONS:
+            extra = getattr(event, "extra", None)
+            if extra is None and isinstance(event, dict):
+                extra = event.get("extra")
+            delay = (extra or {}).get("delay")
+            if isinstance(delay, (int, float)):
+                for listener in list(self.listeners):
+                    listener._last_retry_after = float(delay)
+        self.inner(event)
 
 
 class PersistentRetry:
@@ -278,23 +306,18 @@ class PersistentRetry:
     # ── Retry-After tracking ──
 
     def _watch_router_events(self) -> None:
-        """Wrap the router's on_event to remember provider-declared retry windows."""
+        """Subscribe to the router's ``router.retry`` events to remember provider-declared retry windows.
+
+        The router is shared by every agent loop in the process, and a new ``PersistentRetry`` is
+        built per loop. Installing one wrapper per instance grew a callback chain by one layer per
+        turn until ``RecursionError`` (~1000 turns, found by the 72 h soak), so the router gets one
+        :class:`_RetryAfterObserver`; instances register on it by weak reference.
+        """
         on_event = getattr(self.router, "on_event", None)
         if on_event is None:
             return
-
-        def observed(event: Any) -> None:
-            # RouterEvent payloads: kind "router.retry", reason rate_limit/quota,
-            # extra {"delay": seconds} (the provider's Retry-After when declared).
-            kind = getattr(event, "kind", None) or (event.get("event") if isinstance(event, dict) else None)
-            reason = getattr(event, "reason", None) or (event.get("reason") if isinstance(event, dict) else "")
-            if kind == "router.retry" and reason in RATE_LIMIT_REASONS:
-                extra = getattr(event, "extra", None)
-                if extra is None and isinstance(event, dict):
-                    extra = event.get("extra")
-                delay = (extra or {}).get("delay")
-                if isinstance(delay, (int, float)):
-                    self._last_retry_after = float(delay)
-            on_event(event)
-
-        self.router.on_event = observed
+        observer = on_event if isinstance(on_event, _RetryAfterObserver) else None
+        if observer is None:
+            observer = _RetryAfterObserver(on_event)
+            self.router.on_event = observer
+        observer.listeners.add(self)

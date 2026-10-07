@@ -176,3 +176,44 @@ async def test_agent_permission_denied_headless(temp_cwd):
     tool_results = [e for e in events if e.type == "done" and e.message and e.message.role == "tool"]
     assert len(tool_results) == 1
     assert "Permission denied" in tool_results[0].message.content
+
+
+@pytest.mark.asyncio
+async def test_identical_replies_in_separate_turns_are_not_a_doom_loop(temp_cwd):
+    """The loop guard judges repetition inside one run. A session whose /loop tick answers 'nothing
+    changed' every time shares one Reliability across turns; that must not count as repeating itself
+    (it escalated 40% of the soak's cheap background turns to the main tier)."""
+    from k3code.reliability import Reliability
+
+    msg = Message(role="assistant", content="Nothing changed.", tool_calls=[])
+    provider = FakeProvider([[make_done_event(msg)]] * 12)
+    router = Router(build_chain([provider], [["fake-model"]]), max_retries=0)
+    reliability = Reliability.from_settings(None, session="s")
+
+    for _ in range(12):
+        loop = AgentLoop(
+            router, system_prompt="t", max_turns=5, permission_mode="yolo", cwd=temp_cwd, reliability=reliability
+        )
+        async for _event in loop.run("check"):
+            pass
+        assert loop.escalation_reason is None
+        assert reliability.needs_input is False
+
+
+@pytest.mark.asyncio
+async def test_a_long_session_of_turns_never_hits_the_recursion_limit(temp_cwd):
+    """One AgentLoop per turn on a shared router and bundle, past 1000 turns (the 72 h soak died at ~490)."""
+    from k3code.reliability import Reliability
+
+    msg = Message(role="assistant", content="ok", tool_calls=[])
+    provider = FakeProvider([[make_done_event(msg)]] * 1300)
+    router = Router(build_chain([provider], [["fake-model"]]), max_retries=0, on_event=lambda e: None)
+    reliability = Reliability.from_settings(None, session="s")
+
+    for i in range(1300):
+        loop = AgentLoop(
+            router, system_prompt="t", max_turns=3, permission_mode="yolo", cwd=temp_cwd, reliability=reliability
+        )
+        async for _event in loop.run(f"turn {i}"):
+            pass
+    assert provider._call_count == 1300

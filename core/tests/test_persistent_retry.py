@@ -384,3 +384,79 @@ async def test_pause_end_clears_network_cooldowns():
 
     assert [e.kind for e in seen] == [PAUSED, RESUMED]  # no park after the resume
     assert router.cooldowns.cleared == [FailoverReason.network]
+
+
+# ── regression: one on_event wrapper per router, however many loops are built ──
+
+
+def _wrapper_depth(cb) -> int:
+    """Count nested k3code wrappers (the observer exposes .inner)."""
+    depth = 0
+    while hasattr(cb, "inner"):
+        depth += 1
+        cb = cb.inner
+    return depth
+
+
+def test_many_retries_on_one_router_do_not_stack_wrappers():
+    """The 72 h soak died with RecursionError after ~1000 turns: every AgentLoop built a PersistentRetry on
+    the shared router and wrapped router.on_event once more. The chain must stay one layer deep and
+    deliver each event to the original callback exactly once."""
+    import gc
+    import weakref
+
+    delivered: list[Any] = []
+    router = FakeRouter(fails=0, error=Exception("unused"))
+    router.on_event = delivered.append
+    first = PersistentRetry(router, None, config=RetryConfig())
+    ref = weakref.ref(first)
+
+    last = first
+    for _ in range(3000):
+        last = PersistentRetry(router, None, config=RetryConfig())
+
+    assert _wrapper_depth(router.on_event) == 1
+    router.on_event(_RetryEvent(delay=12.0))  # would raise RecursionError on the old chain
+    assert len(delivered) == 1
+    assert last._last_retry_after == 12.0
+
+    # Instances that are gone are not kept alive by the router (bounded memory).
+    del first
+    gc.collect()
+    assert ref() is None
+
+
+def test_retry_after_reaches_every_live_instance():
+    router = FakeRouter(fails=0, error=Exception("unused"))
+    a = PersistentRetry(router, None, config=RetryConfig())
+    b = PersistentRetry(router, None, config=RetryConfig())
+    router.on_event(_RetryEvent(delay=7.0))
+    assert a._last_retry_after == 7.0 and b._last_retry_after == 7.0
+
+
+def test_replaced_router_callback_is_wrapped_once_more_not_per_instance():
+    """If something swaps router.on_event (plan-first does), the next instance wraps the new callback once."""
+    router = FakeRouter(fails=0, error=Exception("unused"))
+    PersistentRetry(router, None, config=RetryConfig())
+    seen: list[Any] = []
+    router.on_event = seen.append
+    for _ in range(50):
+        PersistentRetry(router, None, config=RetryConfig())
+    assert _wrapper_depth(router.on_event) == 1
+    router.on_event("evt")
+    assert seen == ["evt"]
+
+
+def test_reliability_attach_router_is_idempotent_per_router():
+    from k3code.reliability.hooks import Reliability
+
+    router = FakeRouter(fails=0, error=Exception("unused"))
+    rel = Reliability.from_settings(None, session="s")
+    rel.attach_router(router)
+    first = rel.retry
+    for _ in range(100):
+        rel.attach_router(router)
+    assert rel.retry is first
+    other = FakeRouter(fails=0, error=Exception("unused"))
+    rel.attach_router(other)  # a different tier's router rebinds
+    assert rel.retry is not first and rel.retry.router is other

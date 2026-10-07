@@ -153,6 +153,7 @@ class AgentLoop:
         # The reliability bundle is shared per session; bind its retry wrapper to *this* loop's router
         # (another loop on a different tier may have attached its own since construction).
         self.reliability.attach_router(self.router)
+        self.reliability.begin_turn()
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
             *(history or []),
