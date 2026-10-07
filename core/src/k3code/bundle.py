@@ -140,6 +140,15 @@ def read_bundle(path: Path) -> Bundle:
     return out
 
 
+def _strip_redacted(obj: Any) -> Any:
+    """Drop ``<redacted>`` placeholders anywhere inside ``obj`` (they must never be written to config)."""
+    if isinstance(obj, dict):
+        return {k: _strip_redacted(v) for k, v in obj.items() if v != REDACTED}
+    if isinstance(obj, list):
+        return [_strip_redacted(v) for v in obj if v != REDACTED]
+    return obj
+
+
 def merge_settings(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     """Deep-merge ``incoming`` over ``existing``; ``<redacted>`` never overwrites (or creates) a value."""
     out = dict(existing)
@@ -149,9 +158,9 @@ def merge_settings(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[s
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = merge_settings(out[k], v)
         elif isinstance(v, dict):
-            out[k] = merge_settings({}, v)
+            out[k] = _strip_redacted(v)
         elif isinstance(v, list):
-            out[k] = [x for x in v if x != REDACTED]
+            out[k] = _strip_redacted(v)
         else:
             out[k] = v
     return out

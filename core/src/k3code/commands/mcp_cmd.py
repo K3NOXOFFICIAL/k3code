@@ -28,7 +28,13 @@ class McpCommand(CommandDef):
         lines = []
         for st in states:
             rows.append(
-                {"name": st.name, "transport": st.transport, "status": st.status, "tools": len(st.tools), "error": st.error}
+                {
+                    "name": st.name,
+                    "transport": st.transport,
+                    "status": st.status,
+                    "tools": len(st.tools),
+                    "error": st.error,
+                }
             )
             err = f"  [{st.error}]" if st.error else ""
             lines.append(f"{st.name} ({st.transport}): {st.status}, {len(st.tools)} tool(s){err}")

@@ -91,6 +91,11 @@ class Settings(BaseModel):
     goal: GoalConfig = Field(default_factory=GoalConfig)
 
 
+def _current_home() -> Path:
+    """``K3CODE_HOME`` read at call time (the module constant is import-time only)."""
+    return Path(os.environ.get("K3CODE_HOME", Path.home() / ".k3code")).expanduser()
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
     if path.is_file():
         with path.open() as f:
@@ -118,7 +123,7 @@ def load_config(
     defaults = Settings().model_dump()
 
     # 2. User config (~/.k3code/config.yaml)
-    user_config = _load_yaml(K3CODE_HOME / "config.yaml")
+    user_config = _load_yaml(_current_home() / "config.yaml")
 
     # 3. Project config (<project_dir>/.k3code/config.yaml)
     project_config = {}
