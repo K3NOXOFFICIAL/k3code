@@ -105,6 +105,11 @@ class GoCommand(CommandDef):
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         live = _live(ctx, session_id)
+        from k3code.commands.ultra_cmd import go_for_ultraplan
+
+        if (planned := go_for_ultraplan(live)) is not None:
+            ctx.store.save(live.stored)
+            return planned
         task = (live.stored.meta.get("preview_task") if live else None) or ""
         if not task:
             return _msg("Nothing to run: use /preview <task> first.")

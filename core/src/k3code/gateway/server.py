@@ -36,6 +36,7 @@ from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, autonomy_cfg
 from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
+from k3code.autonomy.ultra import Ultra
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, load_config
@@ -136,6 +137,8 @@ class LiveSession:
         self.scope_override: str | None = None
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
+        #: /go after /ultraplan: {task, plan, path}; consumed by the next turn's scope gate.
+        self.preapproved_plan: dict[str, Any] | None = None
 
     @property
     def state(self) -> str:
@@ -268,6 +271,7 @@ class GatewayServer:
         self.autonomy = PlanFirst(self)
         self.subagents = SubagentManager(self)
         self.fanout = FanoutExecutor(self)
+        self.ultra = Ultra(self)
 
     # ── session registry ──────────────────────────────────────────────
 
@@ -1225,6 +1229,43 @@ class GatewayServer:
         if result.get("type") == "exit":
             self._running = False
         return result
+
+    # ── long-running command jobs (/ultraplan, /ultracode, /ultraresearch) ──
+
+    def start_job(self, session: LiveSession, label: str, make_coro: Callable[[], Any]) -> None:
+        """Run ``make_coro()`` as the session's turn: it shows as working, /stop interrupts it, and its returned
+        text becomes the assistant message."""
+        if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
+            raise _InvalidParams("a turn is already running in this session; /stop it or wait")
+
+        async def runner() -> None:
+            _ctx_session.set(session)
+            session.needs_input = False
+            session.streaming = True
+            session.emit("message.start", {})
+            session.emit("status.update", {"kind": "status", "text": label, "state": "working"})
+            status, text = "done", ""
+            try:
+                text = await make_coro()
+            except asyncio.CancelledError:
+                status, text = "interrupted", f"{label} interrupted."
+            except Exception as e:  # noqa: BLE001 - a failed job is reported, never crashes the gateway
+                logger.exception("%s failed", label)
+                status, text = "error", f"{label} failed: {e}"
+                session.emit("error", {"message": text})
+            finally:
+                session.streaming = False
+                self.subagents.interrupt_session(session.session_id)  # nothing may outlive the job
+            session.emit("message.delta", {"text": text})
+            session.stored.messages = [
+                *session.stored.messages, {"role": "user", "content": label}, {"role": "assistant", "content": text},
+            ]
+            self.store.save(session.stored)
+            session.emit("message.complete", {"text": text, "usage": {}, "status": status, "error": None,
+                                              "state": session.state})
+            session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+
+        session.turn_task = asyncio.get_running_loop().create_task(runner())
 
     # ── background sessions (/bg, Ctrl+B) ─────────────────────────────
 

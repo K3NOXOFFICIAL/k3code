@@ -107,6 +107,14 @@ class PlanFirst:
     # ── the gate ──
 
     async def prepare(self, session: Any, text: str) -> GateResult:
+        pre = getattr(session, "preapproved_plan", None)
+        if pre:  # /go after /ultraplan: the plan is approved, skip the gate and let fan-out take it
+            from k3code.autonomy.ultra import plan_verdict
+
+            session.preapproved_plan = None
+            plan = str(pre["plan"])
+            return GateResult(prompt=f"{text}\n\nApproved plan (follow it):\n{plan}", verdict=plan_verdict(plan),
+                              plan=plan)
         if not self.gate_applies(session):
             return GateResult(prompt=text)
         sid = session.session_id

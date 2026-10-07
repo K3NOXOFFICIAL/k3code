@@ -198,12 +198,13 @@ def build_registry() -> CommandRegistry:
     from k3code.commands.review import ReviewCommand
     from k3code.commands.settings_cmd import SettingsCommand
     from k3code.commands.skills_cmd import SkillsCommand
+    from k3code.commands.ultra_cmd import UltraCodeCommand, UltraPlanCommand
 
     reg = CommandRegistry()
     for extra in (
         ExportCommand(), ImportCommand(), ForkCommand(), BranchCommand(), SettingsCommand(), ConfigCommand(),
         OutputStyleCommand(), MemoryCommand(), SkillsCommand(), McpCommand(), ReviewCommand(), GoalCommand(),
-        ArtifactsCommand(), BgCommand(),
+        ArtifactsCommand(), BgCommand(), UltraPlanCommand(), UltraCodeCommand(),
     ):
         reg.register(extra)
     for cmd in (
