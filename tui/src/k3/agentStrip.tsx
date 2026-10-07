@@ -26,7 +26,13 @@ const color = (state: StripState, t: Theme): string =>
   state === 'done' ? t.color.statusGood : state === 'failed' ? t.color.error : state === 'input' ? t.color.warn : t.color.accent
 
 const sessionState = (s: LiveSessionStatus | string): StripState =>
-  s === 'waiting' ? 'input' : s === 'working' || s === 'starting' ? 'working' : 'done'
+  s === 'waiting' || s === 'needs_input'
+    ? 'input'
+    : s === 'working' || s === 'starting'
+      ? 'working'
+      : s === 'failed'
+        ? 'failed'
+        : 'done'
 
 const agentState = (status: string): StripState =>
   status === 'completed' || status === 'done'
@@ -50,7 +56,8 @@ export function buildStripRows(
     }
 
     rows.push({
-      activity: s.preview?.trim() || (s.status === 'waiting' ? 'waiting for input' : s.status),
+      activity:
+        s.preview?.trim() || (s.status === 'waiting' || s.status === 'needs_input' ? 'waiting for input' : s.status),
       elapsedSeconds: s.started_at != null ? Math.max(0, nowMs / 1000 - s.started_at) : null,
       id: s.id,
       key: `session:${s.id}`,

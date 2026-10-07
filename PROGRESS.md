@@ -1,10 +1,11 @@
 # PROGRESS (M4c automation)
 
 ## Done
-- automation/clock.py (Clock, FakeClock), cronexpr.py (cron/interval/daily), store.py (automation.db), runner.py (seam), loops.py (LoopManager) + tests
+- automation/: clock (FakeClock), cronexpr, store (automation.db), runner seam, loops, scheduler (+retry_policy), automations (+triggers, webhook), suggestions, engine, server_runner, nlcron
+- gateway hooks (state completed/failed, session_event, last_user_activity, active_list automation counts)
+- commands /loop /schedule /automations; CLI `k3code schedule …`, `k3code slash …`
+- TUI: strip maps needs_input/failed/completed; ⟳ badge (automationCount)
+- tests (test_auto_*.py), VENDOR.toml port entries; full suite 373 passed, ruff clean, npm run build ok
 
-## In progress / next
-- scheduler (jobs, retry ladder, quota hold, grace), gateway ServerRunner + server hooks, commands (/loop /schedule /automations), CLI `k3code schedule`
-- automations: triggers, actions, engine, suggestions
-- TUI: completed/failed states, ⟳ badge
-- live acceptance, VENDOR.toml entries, REPORT.md
+## Next
+- final live acceptance run (clean daemon), REPORT.md

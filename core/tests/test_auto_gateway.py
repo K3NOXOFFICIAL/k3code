@@ -92,3 +92,69 @@ async def test_schedule_natural_language_confirmed(tmp_path, monkeypatch):
     out = await cmd(server, '/schedule add "every weekday at 9" "again"', sid)
     assert "Cancelled" in out["output"] and len(eng.db.rows("jobs")) == 1
     await eng.stop()
+
+
+async def test_automations_command_and_session_event_trigger(tmp_path, monkeypatch):
+    from m1cmd_helpers import submit_and_wait
+
+    server, provider = make_server(tmp_path, monkeypatch, ["done"])
+    clock = FakeClock()
+    eng = await engine_for(server, clock)
+    sid = await new_session(server, tmp_path)
+    out = await cmd(
+        server,
+        "/automations add {name: ping, trigger: {type: session_event, event: completed}, "
+        "action: {type: notify, text: 'finished {{session}}'}}",
+        sid,
+    )
+    assert "Added automation" in out["output"]
+    assert "ping" in (await cmd(server, "/automations list", sid))["output"]
+    await submit_and_wait(server, "hello")
+    await until(lambda: eng.db.rows("automations")[0]["fire_count"] == 1)
+    assert any(f"finished {sid}" in (n.get("text") or "") for n in notices(server))
+    bad = await cmd(
+        server, "/automations add {name: x, trigger: {type: webhook}, action: {type: notify, text: a}}", sid
+    )
+    assert "webhook triggers are disabled" in bad["output"]
+    assert "Paused" in (await cmd(server, "/automations pause ping", sid))["output"]
+    assert "Removed" in (await cmd(server, "/automations rm ping", sid))["output"]
+    counts = server.automation.counts()
+    assert counts["automations"] == 0
+    await eng.stop()
+
+
+def notices(server):
+    import json
+
+    out = []
+    for f in server._frames:
+        m = json.loads(f)
+        if m.get("params", {}).get("type") == "notification.show":
+            out.append(m["params"]["payload"])
+    return out
+
+
+async def test_suggest_accept_dismiss_via_command(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, monkeypatch)
+    eng = await engine_for(server, FakeClock())
+    sid = await new_session(server, tmp_path)
+    listing = (await cmd(server, "/automations suggest", sid))["output"]
+    assert "Nightly test run" in listing and "needs input" in listing
+    assert "Dismissed" in (await cmd(server, "/automations suggest dismiss 1", sid))["output"]
+    assert "Nightly test run" not in (await cmd(server, "/automations suggest", sid))["output"]
+    out = (await cmd(server, "/automations suggest accept 1", sid))["output"]
+    assert "Created automation" in out and eng.automations.active_count() == 1
+    await eng.stop()
+
+
+async def test_active_list_reports_automation_counts(tmp_path, monkeypatch):
+    from m1cmd_helpers import rpc
+
+    server, _ = make_server(tmp_path, monkeypatch)
+    eng = await engine_for(server, FakeClock())
+    sid = await new_session(server, tmp_path)
+    await cmd(server, "/loop 5m x", sid)
+    await cmd(server, '/schedule add "* * * * *" y', sid)
+    res = (await rpc(server, "session.active_list"))["result"]
+    assert res["automation"]["loops"] == 1 and res["automation"]["jobs"] == 1 and res["automation"]["active"] == 2
+    await eng.stop()

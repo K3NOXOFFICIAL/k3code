@@ -110,12 +110,12 @@ async def test_two_clients_share_one_session_and_background_prompt_survives_deta
     for _ in range(100):
         rows = (await b.call("session.list"))["result"]["sessions"]
         row = next(r for r in rows if r["id"] == sid)
-        if row["message_count"] >= 2 and row["state"] == "idle":
+        if row["message_count"] >= 2 and row["state"] == "completed":  # background run finished
             break
         await asyncio.sleep(0.1)
     assert row["message_count"] >= 2, row
     active = (await b.call("session.active_list"))["result"]["sessions"]
-    assert active[0]["id"] == sid and active[0]["state"] == "idle"
+    assert active[0]["id"] == sid and active[0]["state"] == "completed"
     stats = server.usage.aggregate("session")
     assert stats and stats[0]["calls"] == 1 and stats[0]["tokens_in"] == 7
     b.close()
@@ -336,10 +336,10 @@ async def test_in_flight_turn_survives_client_disconnect(tmp_path, monkeypatch):
     assert server.live[sid].state == "working"  # still running with nobody attached
     for _ in range(100):
         row = next(r for r in (await b.call("session.list"))["result"]["sessions"] if r["id"] == sid)
-        if row["state"] == "idle" and row["message_count"] >= 4:
+        if row["state"] == "completed" and row["message_count"] >= 4:
             break
         await asyncio.sleep(0.1)
-    assert row["state"] == "idle" and row["message_count"] >= 4, row  # system, user, assistant(tool), tool, assistant
+    assert row["state"] == "completed" and row["message_count"] >= 4, row
     assert (work / "marker.txt").read_text().strip() == "slept"
     b.close()
     server.request_stop()

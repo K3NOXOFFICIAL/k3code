@@ -159,7 +159,7 @@ class ServerRunner:
         return await self.run_prompt(mgr.kick_prompt() or objective, session_id=session_id)
 
     def notify(self, text: str, level: str = "info", key: str = "") -> None:
-        payload: dict[str, Any] = {"text": text, "level": level, "kind": "automation"}
+        payload: dict[str, Any] = {"text": text, "level": level, "kind": "ttl", "ttl_ms": 12000}
         if key:
             payload["key"] = key
         self.server.broadcast("notification.show", payload)

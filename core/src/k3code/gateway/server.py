@@ -1226,7 +1226,11 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
 
 async def _session_active_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     current = server.session
-    return {"sessions": server._active_rows(current.session_id if current else None)}
+    out: dict[str, Any] = {"sessions": server._active_rows(current.session_id if current else None)}
+    if server.automation is not None:
+        counts = server.automation.counts()
+        out["automation"] = {**counts, "active": sum(counts.values())}
+    return out
 
 
 async def _session_resume(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

@@ -656,3 +656,17 @@ for _name in ("rm", "pause", "resume", "run"):
     schedule_group.command(_name, help=f"{_name} a job by id or name")(
         click.argument("ref")(lambda ref, _n=_name: _schedule_action(_n, ref))
     )
+
+
+@cli.command("slash")
+@click.argument("command", nargs=-1, required=True)
+@click.option("--socket", "socket_opt", type=click.Path(path_type=Path), help="Daemon socket path")
+def slash_cmd(command: tuple[str, ...], socket_opt: Path | None) -> None:
+    """Run a slash command against the running daemon, e.g. `k3code slash /automations list`."""
+    from k3code.daemon import slash_via_daemon
+
+    try:
+        out = asyncio.run(slash_via_daemon(" ".join(command), cwd=str(Path.cwd()), sock=socket_opt))
+    except OSError as e:
+        raise click.ClickException(f"cannot reach the daemon ({e}); start it with `k3code daemon`") from e
+    click.echo(out)
