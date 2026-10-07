@@ -90,7 +90,9 @@ class _Runner:
                 await asyncio.wait_for(session.initialize(), CONNECT_TIMEOUT)
                 listed = await asyncio.wait_for(session.list_tools(), CONNECT_TIMEOUT)
                 self.state.tools = [
-                    McpToolInfo(self.name, t.name, t.description or "", dict(t.inputSchema or {}))
+                    McpToolInfo(
+                        self.name, t.name, t.description or "", dict(_attr(t, "input_schema", "inputSchema") or {})
+                    )
                     for t in listed.tools
                 ]
                 self.state.status = "connected"
@@ -134,6 +136,14 @@ class _Runner:
         self.task = None
 
 
+def _attr(obj: Any, *names: str) -> Any:
+    """First present attribute (mcp 2.x snake_case, mcp 1.x camelCase)."""
+    for n in names:
+        if hasattr(obj, n):
+            return getattr(obj, n)
+    return None
+
+
 def _describe(e: BaseException) -> str:
     if isinstance(e, BaseExceptionGroup) and e.exceptions:
         return _describe(e.exceptions[0])
@@ -147,13 +157,20 @@ class McpManager:
         self.servers = dict(servers or {})
         self._runners: dict[str, _Runner] = {}
         self._started = False
+        self._stale = False
 
     def configure(self, servers: dict[str, McpServerConfig]) -> None:
+        """Adopt new server definitions; running servers are restarted on the next ``ensure_started``."""
+        if {k: v.model_dump() for k, v in servers.items()} != {k: v.model_dump() for k, v in self.servers.items()}:
+            self._stale = True
         self.servers = dict(servers)
 
     async def ensure_started(self) -> None:
+        if self._started and self._stale:
+            await self.close()
         if self._started:
             return
+        self._stale = False
         self._started = True
         for name, cfg in self.servers.items():
             runner = _Runner(name, cfg)
@@ -206,7 +223,7 @@ class McpManager:
         except Exception as e:  # noqa: BLE001
             return {"error": f"MCP call failed: {_describe(e)}"}
         text = "\n".join(getattr(c, "text", None) or f"[{getattr(c, 'type', 'content')}]" for c in res.content)
-        return {"error": text or "MCP tool error"} if res.isError else {"content": text}
+        return {"error": text or "MCP tool error"} if _attr(res, "is_error", "isError") else {"content": text}
 
     def search(self, query: str, limit: int = 8) -> list[McpToolInfo]:
         """Tools whose qualified name/description match ``query`` (exact names first)."""

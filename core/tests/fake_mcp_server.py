@@ -1,8 +1,8 @@
 """Tiny stdio MCP server for tests: tools ``echo`` and ``add``."""
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("fake")
+mcp = MCPServer("fake")
 
 
 @mcp.tool()

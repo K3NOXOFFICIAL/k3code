@@ -5,13 +5,13 @@ from __future__ import annotations
 import httpx
 import respx
 import yaml
-from m1cmd_helpers import cmd, make_server, new_session, rpc, submit_and_wait
 
 from k3code import memory as memmod
 from k3code.extratools import register_skill_tool
 from k3code.paths import home
 from k3code.prompting import build_system_prompt
 from k3code.tools import build_registry
+from m1cmd_helpers import cmd, make_server, new_session, rpc, submit_and_wait
 
 
 def write_skill(root, name, desc, body="Do the thing."):
@@ -35,7 +35,8 @@ async def test_config_set_get_rollback(tmp_path, monkeypatch):
     assert "max_turns = 9" in (await cmd(server, "/config get max_turns", sid))["output"]
 
     # validation: wrong type, unknown reliability key, bad permission action — file untouched
-    for bad in ("max_turns notanumber", "reliability.bogus 1", "permissions.bash maybe", "reliability.flags.netwatch 3"):
+    bad_sets = ("max_turns notanumber", "reliability.bogus 1", "permissions.bash maybe", "reliability.flags.netwatch 3")
+    for bad in bad_sets:
         res = await cmd(server, f"/config set {bad}", sid)
         assert "Invalid config" in res["output"], (bad, res)
     assert yaml.safe_load(cfg.read_text())["max_turns"] == 9
@@ -206,4 +207,20 @@ async def test_skill_tool_registered_in_turn_and_allowed(tmp_path, monkeypatch):
     assert loop.permissions.decide("skill", {"name": "alpha"}).action == "allow"
     assert server.store.get(sid) is not None
     await rpc(server, "session.interrupt", {"session_id": sid})
+    await server.close()
+
+
+async def test_all_m1_commands_registered_with_help(tmp_path, monkeypatch):
+    from k3code.commands.builtin import build_registry
+
+    reg = build_registry()
+    for name in (
+        "export", "import", "fork", "branch", "settings", "config", "output-style", "memory", "skills",
+        "mcp", "review", "goal",
+    ):
+        cmd_def = reg.get(name)
+        assert cmd_def is not None and cmd_def.help, name
+    server, _ = make_server(tmp_path, monkeypatch)
+    res = (await rpc(server, "command.dispatch", {"name": "help"}))["result"]
+    assert "/goal" in res["output"] and "/review" in res["output"]
     await server.close()

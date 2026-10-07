@@ -9,12 +9,12 @@ import tarfile
 
 import yaml
 from click.testing import CliRunner
-from m1cmd_helpers import cmd, frames_of, make_server, new_session, rpc
 
 from k3code.cli import cli
 from k3code.gateway.sessions import SessionStore
 from k3code.paths import home
 from k3code.redact import REDACTED, redact
+from m1cmd_helpers import cmd, frames_of, make_server, new_session
 
 SECRET_KEY = "sk-proj-abcdef0123456789ABCDEF0123456789"
 SECRET_TOKEN = "tok_9f8e7d6c5b4a39281706f5e4d3c2b1a0"

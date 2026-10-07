@@ -36,7 +36,9 @@ class TextProvider:
         return None
 
 
-def make_server(tmp: Path, monkeypatch, replies: list[str] | None = None, **settings) -> tuple[GatewayServer, TextProvider]:
+def make_server(
+    tmp: Path, monkeypatch, replies: list[str] | None = None, **settings
+) -> tuple[GatewayServer, TextProvider]:
     monkeypatch.setenv("K3CODE_HOME", str(tmp / "home"))
     store = SessionStore(tmp / "sessions.db")
     config = Settings(
