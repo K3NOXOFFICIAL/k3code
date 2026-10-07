@@ -262,6 +262,9 @@ class GatewayServer:
         #: Server→client requests still unanswered: id → (session_id, frame). Re-sent on attach.
         self._open_requests: dict[str, tuple[str, str]] = {}
         self._stdio_client = Client(lambda line: self._write(line))
+        #: k3 panes (tuios) link: set only when this gateway runs inside a pane ($TUIOS_SOCKET + $TUIOS_PANE_ID)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self.panes = self._make_panes()
         self.clients: list[Client] = [self._stdio_client]
         self._socket_server: asyncio.AbstractServer | None = None
         self._stop = asyncio.Event()
@@ -342,8 +345,34 @@ class GatewayServer:
 
     # ── transport ─────────────────────────────────────────────────────
 
+    def _make_panes(self) -> Any:
+        from k3code.integrations.panes import PaneLink
+
+        return PaneLink.from_env(inject=self._pane_inject)
+
+    def _pane_inject(self, req_id: str, method: str, result: dict[str, Any]) -> None:
+        """The tuios Inbox answered a request: resolve it as if the TUI had (callable from any thread)."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+
+        def resolve() -> None:
+            sid = (self._open_requests.get(req_id) or ("", ""))[0]
+            if req_id not in self._server_request_futures:
+                return  # already answered in the pane
+            self._resolve_server_request(req_id, {"result": result})
+            cancel = encode_server_request(
+                "request.cancel", {"id": req_id, "method": method, "reason": "answered in the Inbox"})
+            for c in self.clients:
+                if c.session_id == sid and c is self._stdio_client:
+                    self._send(c, cancel)
+
+        loop.call_soon_threadsafe(resolve)
+
     def _write(self, line: str) -> None:
         """One JSON frame to stdout (the stdio client's sink). Only frames ever land here."""
+        if self.panes is not None:
+            self.panes.on_server_line(line)
         out = self._stdout
         if out is None:
             sys.stdout.write(line + "\n")
@@ -590,6 +619,9 @@ class GatewayServer:
 
     async def _handle_line(self, text: str, client: Client | None = None) -> None:
         client = client or self._stdio_client
+        self._loop = asyncio.get_running_loop()
+        if self.panes is not None and client is self._stdio_client:
+            self.panes.on_client_line(text)
         token = _ctx_client.set(client)
         try:
             await self._dispatch_line(text, client)
@@ -1715,7 +1747,8 @@ async def _subagent_interrupt(server: GatewayServer, params: dict[str, Any]) -> 
 
 async def _subagent_tail(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     h = server.subagents.handles.get(str(_require(params, "subagent_id")))
-    return {"text": "\n".join(h.tail[-30:]) + (("\n" + h.result) if h and h.done else "") if h else ""}
+    text = "\n".join(h.tail[-30:]) + (("\n" + h.result) if h and h.done else "") if h else ""
+    return {"text": text, "status": h.status if h else "unknown", "done": bool(h and h.done)}
 
 
 async def _clipboard_paste(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

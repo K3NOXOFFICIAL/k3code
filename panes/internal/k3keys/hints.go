@@ -88,6 +88,9 @@ func Hints(mode Mode, locked bool) []Hint {
 		add("esc", "exit", HintEssential)
 
 	case ModeAgents:
+		add("i", "inbox", HintNormal)
+		add("n", "next waiting", HintNormal)
+		add("s", "agent settings", HintNormal)
 		add("a", "lock", HintNormal)
 		add("esc", "exit", HintEssential)
 	}

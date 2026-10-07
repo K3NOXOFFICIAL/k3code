@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -346,7 +347,7 @@ def _run_gateway() -> None:
         asyncio.run(_serve())
 
 
-def _launch_tui(*, model: str | None = None) -> None:
+def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = None, require: bool = False) -> None:
     """Spawn the built TUI (tui/dist/entry.js) with this process as its gateway."""
     from k3code.paths import find_node
 
@@ -354,6 +355,9 @@ def _launch_tui(*, model: str | None = None) -> None:
     repo_root = _find_repo_root()
     entry = repo_root / "tui" / "dist" / "entry.js" if repo_root else None
     if node is None or entry is None or not entry.is_file():
+        if require:
+            click.echo("The TUI is not available (need node + tui/dist/entry.js).", err=True)
+            sys.exit(1)
         logger.warning("TUI not available (need node + tui/dist/entry.js); falling back to REPL")
         config = load_config(project_dir=Path.cwd())
         with contextlib.suppress(KeyboardInterrupt):
@@ -363,6 +367,7 @@ def _launch_tui(*, model: str | None = None) -> None:
     env = os.environ.copy()
     # The TUI spawns `K3CODE_GATEWAY_CMD` as its Python gateway.
     env["K3CODE_GATEWAY_CMD"] = f"{sys.executable} -m k3code.cli gateway --stdio"
+    env.update(env_extra or {})
     env.setdefault("K3CODE_LOG_LEVEL", "INFO")
     if model:
         env["K3CODE_MODEL"] = model
@@ -442,13 +447,36 @@ def cli(
 @click.option("--stdio", "stdio_flag", is_flag=True, default=True, help="Serve JSON-RPC 2.0 on stdin/stdout")
 @click.option("--attach", is_flag=True, help="Bridge stdin/stdout to a running daemon's socket")
 @click.option("--socket", "socket_opt", type=click.Path(path_type=Path), help="Daemon socket path")
-def gateway(stdio_flag: bool, attach: bool, socket_opt: Path | None) -> None:
+@click.option("--readonly", is_flag=True, help="With --attach: refuse every request that would change the session")
+def gateway(stdio_flag: bool, attach: bool, socket_opt: Path | None, readonly: bool) -> None:
     """Run the JSON-RPC gateway (what the TUI spawns), or attach to the daemon with --attach."""
     if attach:
         from k3code.daemon import attach_bridge
 
-        sys.exit(asyncio.run(attach_bridge(socket_opt)))
+        sys.exit(asyncio.run(attach_bridge(socket_opt, readonly=readonly)))
     _run_gateway()
+
+
+@cli.command("attach")
+@click.argument("session_id")
+@click.option("--readonly", is_flag=True, help="Watch only: prompts and approvals from this window are refused")
+@click.option("--socket", "socket_opt", type=click.Path(path_type=Path), help="Daemon socket path")
+def attach_cmd(session_id: str, readonly: bool, socket_opt: Path | None) -> None:
+    """Open the TUI on a session that runs in the daemon (what /bg --pane and /fork --pane start in a pane)."""
+    cmd = f"{sys.executable} -m k3code.cli gateway --attach" + (" --readonly" if readonly else "")
+    if socket_opt:
+        cmd += f" --socket {shlex.quote(str(socket_opt))}"
+    _launch_tui(env_extra={"K3CODE_GATEWAY_CMD": cmd, "K3CODE_TUI_RESUME": session_id}, require=True)
+
+
+@cli.command("tail")
+@click.argument("subagent_id")
+@click.option("--socket", "socket_opt", type=click.Path(path_type=Path), help="Daemon socket path")
+def tail_cmd(subagent_id: str, socket_opt: Path | None) -> None:
+    """Follow a sub-agent of the daemon, read-only (what fan-out opens per child with autonomy.fanout.panes)."""
+    from k3code.daemon import tail_subagent
+
+    sys.exit(asyncio.run(tail_subagent(subagent_id, socket_opt)))
 
 
 @cli.command("daemon")

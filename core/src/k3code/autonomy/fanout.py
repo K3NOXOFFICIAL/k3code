@@ -227,6 +227,8 @@ class FanoutExecutor:
         h = mgr.spawn(ctx.session, description=description, prompt=prompt, agent_type=agent_type,
                       index=idx, count=len(ctx.result.subtasks), **kw)
         st.handles.append(h)
+        if self.cfg.get("panes"):  # k3 panes: one read-only pane per child (the pane's process opens it)
+            ctx.session.emit("pane.open", {"subagent_id": h.id, "name": f"fan {st.id} {st.title}"[:40]})
         await mgr.wait(h)
         if ctx.budget is not None:
             ctx.budget.charge(h)

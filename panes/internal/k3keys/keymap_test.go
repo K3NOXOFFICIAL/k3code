@@ -320,3 +320,18 @@ func TestMergeBindingsNilSafe(t *testing.T) {
 		t.Fatal("MergeBindings aliases defaultBindings")
 	}
 }
+
+// TestAgentsModeKeys covers Ctrl+G a: the Inbox, the next waiting pane and the
+// agent settings.
+func TestAgentsModeKeys(t *testing.T) {
+	run(t, "agents: inbox", []step{
+		{"ctrl+g", nil, true},
+		{"a", nil, true},
+		{"i", []string{"prefix_inbox", "enter_terminal_mode"}, true},
+	})
+	run(t, "agents: next waiting pane", []step{
+		{"ctrl+g", nil, true},
+		{"a", nil, true},
+		{"n", []string{"prefix_next_attention", "enter_terminal_mode"}, true},
+	})
+}

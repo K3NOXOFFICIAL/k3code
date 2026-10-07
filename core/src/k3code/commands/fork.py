@@ -8,6 +8,7 @@ from typing import Any
 from k3code.commands import CommandDef
 from k3code.commands._util import pop_flag, reply, split_args
 from k3code.gateway.sessions import StoredSession
+from k3code.integrations.panes import open_pane_spec
 
 
 def fork_session(store: Any, src: StoredSession, title: str = "", *, cwd: str | None = None) -> StoredSession:
@@ -28,11 +29,12 @@ def fork_session(store: Any, src: StoredSession, title: str = "", *, cwd: str | 
 
 class ForkCommand(CommandDef):
     def __init__(self) -> None:
-        super().__init__(name="fork", help="Copy this session into a new one: /fork [title] [--activate]")
+        super().__init__(name="fork", help="Copy this session into a new one: /fork [title] [--activate|--pane]")
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         args = split_args(arg)
         activate = pop_flag(args, "--activate")
+        pane = pop_flag(args, "--pane")
         live = ctx.sessions.get(session_id) if session_id else None
         if live is None:
             return reply("No active session to fork.")
@@ -40,8 +42,13 @@ class ForkCommand(CommandDef):
         new = fork_session(ctx.store, live.stored, " ".join(args))
         if activate:
             ctx.activate_session(new.session_id)
+        extra: dict[str, Any] = {}
+        if pane:  # opened by the process in the pane when running inside k3 panes, else just a fork
+            extra["open_pane"] = open_pane_spec(new.session_id, name=f"fork {new.session_id[:6]}", cwd=new.cwd)
         return reply(
-            f"Forked → {new.session_id} ({len(new.messages)} messages)" + (" and activated." if activate else "."),
+            f"Forked → {new.session_id} ({len(new.messages)} messages)"
+            + (" and activated." if activate else " and opening it in a new pane." if pane else "."),
             session_id=new.session_id,
             activated=activate,
+            **extra,
         )
