@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 K3CODE_HOME = Path(os.environ.get("K3CODE_HOME", Path.home() / ".k3code")).expanduser()
 
@@ -16,9 +16,9 @@ class ProviderEntry(BaseModel):
     """One provider block in the fallback chain."""
 
     name: str
-    kind: str  # "openai" or "anthropic"
-    base_url: str
-    api_key_env: str
+    kind: str  # "openai", "anthropic" or "claude-cli" (the local Claude Code login, no key needed)
+    base_url: str = ""  # required for "openai" / "anthropic"
+    api_key_env: str = ""  # required for "openai" / "anthropic"
     api_key: str = ""  # populated by load_config() from the api_key_env var; never set this directly
     models: dict[str, str | list[str]] = Field(default_factory=dict)  # {default, cheap, ...}
     #: M4a: model list per tier, e.g. {strong: [opus], cheap: haiku}; falls back to models[<tier>], then models.default.
@@ -27,9 +27,19 @@ class ProviderEntry(BaseModel):
     @field_validator("kind")
     @classmethod
     def validate_kind(cls, v: str) -> str:
-        if v not in ("openai", "anthropic"):
-            raise ValueError("kind must be 'openai' or 'anthropic'")
+        if v not in ("openai", "anthropic", "claude-cli"):
+            raise ValueError("kind must be 'openai', 'anthropic' or 'claude-cli'")
         return v
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_endpoint_for_api_kinds(cls, data: Any) -> Any:
+        # API providers still must name their endpoint and key variable; only claude-cli has neither.
+        if isinstance(data, dict) and data.get("kind") != "claude-cli":
+            for key in ("base_url", "api_key_env"):
+                if key not in data:
+                    raise ValueError(f"{key} is required for provider kind {data.get('kind')!r}")
+        return data
 
 
 class McpServerConfig(BaseModel):

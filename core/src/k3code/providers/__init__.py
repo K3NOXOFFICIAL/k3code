@@ -5,6 +5,7 @@ from __future__ import annotations
 from k3code.config import ProviderEntry
 from k3code.providers.anthropic import AnthropicProvider
 from k3code.providers.base import Provider
+from k3code.providers.claude_cli import ClaudeCliProvider
 from k3code.providers.fake import FakeProvider, fake_provider_requested, load_fake_steps
 from k3code.providers.openai_compat import OpenAICompatProvider
 
@@ -38,7 +39,16 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                     api_key=entry.api_key,
                 )
             )
+        elif entry.kind == "claude-cli":
+            providers.append(ClaudeCliProvider(name=entry.name))
     return providers
 
 
-__all__ = ["make_providers", "Provider", "OpenAICompatProvider", "AnthropicProvider", "FakeProvider"]
+__all__ = [
+    "make_providers",
+    "Provider",
+    "OpenAICompatProvider",
+    "AnthropicProvider",
+    "ClaudeCliProvider",
+    "FakeProvider",
+]

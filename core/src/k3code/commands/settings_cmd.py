@@ -44,7 +44,7 @@ def build_settings_view(ctx: Any, session_id: str | None) -> dict[str, Any]:
                 "kind": p.kind,
                 "base_url": p.base_url,
                 "api_key_env": p.api_key_env,
-                "key_set": bool(p.api_key),
+                "key_set": bool(p.api_key) or p.kind == "claude-cli",  # claude-cli uses the local Claude Code login
             }
             for p in cfg.providers
         ],
@@ -64,7 +64,9 @@ def build_settings_view(ctx: Any, session_id: str | None) -> dict[str, Any]:
 def render_text(v: dict[str, Any]) -> str:
     chain = " → ".join(p["provider"] + ":" + ",".join(p["models"]) for p in v["model_chain"]) or "no providers"
     provs = ", ".join(
-        f"{p['name']} [{p['kind']}] key {'set' if p['key_set'] else 'MISSING'} ({p['api_key_env']})"
+        f"{p['name']} [claude-cli] uses the Claude Code login"
+        if p["kind"] == "claude-cli"
+        else f"{p['name']} [{p['kind']}] key {'set' if p['key_set'] else 'MISSING'} ({p['api_key_env']})"
         for p in v["providers"]
     )
     lines = [

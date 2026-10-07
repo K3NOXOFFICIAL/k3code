@@ -44,6 +44,10 @@ def _is_omniroute(name: str, base_url: str) -> bool:
     return any(m in text for m in OMNIROUTE_MARKERS)
 
 
+async def _noop_probe() -> tuple[bool, float | None, str]:
+    return True, None, "local"
+
+
 async def _probe_provider(base_url: str, timeout: float = 5.0) -> tuple[bool, float | None, str]:
     start = time.monotonic()
     try:
@@ -60,8 +64,22 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
         return [Check("providers", FAIL, "no providers configured", f"add providers to {k3_home() / 'config.yaml'}")]
     results: list[tuple[bool, float | None, str]] = []
     if probe:
-        results = await asyncio.gather(*(_probe_provider(p.base_url) for p in config.providers))
+        results = await asyncio.gather(
+            *(_probe_provider(p.base_url) if p.kind != "claude-cli" else _noop_probe() for p in config.providers)
+        )
     for i, p in enumerate(config.providers):
+        if p.kind == "claude-cli":  # local binary, nothing to reach over HTTP
+            path = shutil.which("claude")
+            checks.append(
+                Check(
+                    f"provider:{p.name}",
+                    OK if path else FAIL,
+                    f"Claude Code CLI at {path}" if path else "Claude Code CLI not found on PATH",
+                    "" if path else "install Claude Code and run `claude` once to log in, or remove this entry",
+                    {"kind": "claude-cli", "command": path or ""},
+                )
+            )
+            continue
         if not probe:
             checks.append(Check(f"provider:{p.name}", OK, "probe skipped", data={"base_url": p.base_url}))
             continue
@@ -96,7 +114,7 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
 
 
 def check_keys(config: Settings) -> Check:
-    missing = [p.api_key_env for p in config.providers if not os.environ.get(p.api_key_env)]
+    missing = [p.api_key_env for p in config.providers if p.kind != "claude-cli" and not os.environ.get(p.api_key_env)]
     if not config.providers:
         return Check("api-keys", WARN, "no providers, nothing to check")
     if missing:
