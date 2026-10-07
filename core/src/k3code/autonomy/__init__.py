@@ -23,7 +23,9 @@ DEFAULTS: dict[str, Any] = {
     "preview_timeout": 30,
     "advisor_compact_chars": 24000,
     #: M4b: parallel sub-agent execution of large/huge plans
-    "fanout": {"enabled": True, "max_parallel": 3, "require_tests": True, "test_command": "", "test_timeout": 600},
+    #: ``panes``: inside k3 panes, open one read-only pane per child
+    "fanout": {"enabled": True, "panes": False, "max_parallel": 3, "require_tests": True, "test_command": "",
+               "test_timeout": 600},
 }
 
 

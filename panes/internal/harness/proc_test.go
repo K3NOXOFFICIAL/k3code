@@ -128,3 +128,34 @@ func TestIdentify(t *testing.T) {
 		}
 	}
 }
+
+func TestK3codeProcessDetection(t *testing.T) {
+	r, _ := Load()
+	var err error
+	for _, tc := range []struct {
+		name string
+		p    ProcInfo
+		want string
+	}{
+		{"console script", ProcInfo{Comm: "k3code", Argv: []string{"/usr/bin/python3", "/home/u/.local/bin/k3code", "attach", "ab12"}, Exe: "/usr/bin/python3.12"}, "k3code"},
+		{"bare name", ProcInfo{Comm: "k3code", Argv: []string{"k3code"}}, "k3code"},
+		{"tui launcher", ProcInfo{Comm: "k3code-tui", Argv: []string{"k3code-tui"}}, "k3code"},
+		{"editor in a k3code checkout", ProcInfo{Comm: "tail", Exe: "/usr/bin/tail", Argv: []string{"tail", "-f", "/home/u/src/k3code/PLAN.md"}}, ""},
+	} {
+		got, _, ok := r.IdentifyDetail(tc.p)
+		if tc.want == "" {
+			if ok {
+				t.Errorf("%s: identified as %q, want none", tc.name, got)
+			}
+			continue
+		}
+		if !ok || got != tc.want {
+			t.Errorf("%s: identified as %q (ok=%v), want %q", tc.name, got, ok, tc.want)
+		}
+	}
+	got, rerr := r.ResumeArgv("k3code", "ab12")
+	err = rerr
+	if err != nil || len(got) != 3 || got[0] != "k3code" || got[1] != "attach" || got[2] != "ab12" {
+		t.Errorf("ResumeArgv = %q, %v", got, err)
+	}
+}

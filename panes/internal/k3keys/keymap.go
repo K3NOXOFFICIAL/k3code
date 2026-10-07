@@ -128,6 +128,9 @@ var defaultBindings = map[Mode]map[string]string{
 		"esc": "k3:typing",
 	},
 	ModeAgents: {
+		"i":   "prefix_inbox",
+		"n":   "prefix_next_attention",
+		"s":   "prefix_agents_settings",
 		"a":   "k3:lock",
 		"esc": "k3:typing",
 	},

@@ -30,7 +30,33 @@ var (
 	pprofAddr  string
 )
 
+const helpText = `k3 - TUIOS with the k3 modal keymap (full reference: docs/k3-keymap.md)
+
+Usage: k3 [-h|--help]
+
+Keys: ctrl+g opens the Chooser: p panes, t tabs, s sessions, r resize,
+/ search, a agents, ? help. esc returns to typing.
+
+Agents (ctrl+g a):
+  i  Inbox: approvals and questions from agents in other panes
+  n  jump to the next pane that is waiting for you
+  s  agent settings
+  a  lock the mode
+A pane running an agent (k3code, claude, codex, ...) carries a state badge:
+working, needs input, idle, done or errored. k3code reports its own state
+and, with "k3code" in [agents.approvals] enabled, sends its approval prompts
+to the Inbox when its pane is not in front of you. In a tuios daemon session
+k3code can open /bg --pane and /fork --pane sessions in new panes.
+`
+
 func main() {
+	for _, a := range os.Args[1:] {
+		if a == "-h" || a == "--help" {
+			fmt.Print(helpText)
+			return
+		}
+	}
+
 	// The build identity, handed to internal/app before anything can crash.
 	app.SetBuildStamp(version, commit)
 

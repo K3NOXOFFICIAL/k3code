@@ -29,6 +29,13 @@ def _isolated_k3code_home(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_tuios(monkeypatch):
+    """Tests run inside k3 panes must not report to the real tuios daemon."""
+    for var in ("TUIOS_SOCKET", "TUIOS_PANE_ID", "TUIOS_PANE_TOKEN", "TUIOS_SESSION"):
+        monkeypatch.delenv(var, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_nmcli(monkeypatch):
     """Netwatch must not spawn nmcli from tests (a cancel mid-spawn wedges loop teardown)."""
     from k3code.reliability import netwatch

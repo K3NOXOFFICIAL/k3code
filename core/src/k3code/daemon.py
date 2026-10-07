@@ -15,6 +15,7 @@ import os
 import signal
 import time
 from pathlib import Path
+from typing import Any
 
 from k3code import sdnotify
 
@@ -115,38 +116,127 @@ async def run_daemon(
         await server.close()
 
 
-async def attach_bridge(sock: Path | None = None) -> int:
-    """Pump this process's stdin/stdout to the daemon socket (``k3code gateway --attach``)."""
+async def attach_bridge(sock: Path | None = None, *, readonly: bool = False) -> int:
+    """Pump this process's stdin/stdout to the daemon socket (``k3code gateway --attach``).
+
+    Inside a k3 pane (``$TUIOS_SOCKET``) the bridge also mirrors the session's state into tuios, holds approvals in
+    the tuios Inbox and opens new panes for ``open_pane`` results. ``readonly`` refuses everything that would change
+    the session (``k3code attach --readonly``).
+    """
     import sys
+
+    from k3code.integrations.panes import PaneLink
 
     sock = sock or socket_path()
     try:
-        reader, writer = await asyncio.open_unix_connection(str(sock))
+        reader, writer = await asyncio.open_unix_connection(str(sock), limit=1 << 26)
     except OSError as e:
         sys.stderr.write(f"k3code: cannot attach to the daemon at {sock}: {e}\nStart it with `k3code daemon`.\n")
         return 1
     loop = asyncio.get_running_loop()
-    stdin = asyncio.StreamReader()
+    stdin = asyncio.StreamReader(limit=1 << 26)
     await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(stdin), sys.stdin)
 
+    def emit(line: str) -> None:
+        sys.stdout.buffer.write(line.encode() + b"\n")
+        sys.stdout.buffer.flush()
+
+    def inject(req_id: str, method: str, result: dict) -> None:  # the Inbox answered (called from a thread)
+        def go() -> None:
+            writer.write((json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}) + "\n").encode())
+            emit(json.dumps({"jsonrpc": "2.0", "id": f"cancel-{req_id}", "method": "request.cancel",
+                             "params": {"id": req_id, "method": method, "reason": "answered in the Inbox"}}))
+
+        loop.call_soon_threadsafe(go)
+
+    link = PaneLink.from_env(inject, readonly=readonly)
+    if link is not None:
+        link.reporter.report("idle")
+
     async def up() -> None:
-        while chunk := await stdin.read(65536):
-            writer.write(chunk)
-            await writer.drain()
+        if link is None:
+            while chunk := await stdin.read(65536):
+                writer.write(chunk)
+                await writer.drain()
+        else:
+            while raw := await stdin.readline():
+                text = raw.decode("utf-8", errors="replace").strip()
+                verdict = link.on_client_line(text) if text else None
+                if verdict is not None:  # read-only pane: answer it ourselves, never forward
+                    if verdict:
+                        emit(verdict)
+                    continue
+                writer.write(raw if raw.endswith(b"\n") else raw + b"\n")
+                await writer.drain()
         writer.write_eof()
 
     async def down() -> None:
-        while chunk := await reader.read(65536):
-            sys.stdout.buffer.write(chunk)
+        if link is None:
+            while chunk := await reader.read(65536):
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+            return
+        while raw := await reader.readline():
+            sys.stdout.buffer.write(raw)
             sys.stdout.buffer.flush()
+            link.on_server_line(raw.decode("utf-8", errors="replace").strip())
 
     tasks = [asyncio.create_task(up()), asyncio.create_task(down())]
     _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for t in pending:
         t.cancel()
+    if link is not None:
+        link.reporter.report_tuios("none")
+        link.reporter.flush(2.0)
     with contextlib.suppress(Exception):
         writer.close()
     return 0
+
+
+async def tail_subagent(subagent_id: str, sock: Path | None = None, *, interval: float = 1.0, out: Any = None) -> int:
+    """Follow a sub-agent of the daemon read-only (``k3code tail``): print its tail until it finishes."""
+    import sys
+
+    out = out or sys.stdout
+    sock = sock or socket_path()
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(sock), limit=1 << 26)
+    except OSError as e:
+        out.write(f"k3code: cannot attach to the daemon at {sock}: {e}\n")
+        return 1
+    shown = ""
+    seq = 0
+    try:
+        while True:
+            seq += 1
+            req = {"jsonrpc": "2.0", "id": seq, "method": "subagent.tail", "params": {"subagent_id": subagent_id}}
+            writer.write((json.dumps(req) + "\n").encode())
+            await writer.drain()
+            resp: dict[str, Any] = {}
+            while line := await reader.readline():
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if msg.get("id") == seq and "method" not in msg:
+                    resp = msg.get("result") or {}
+                    break
+            else:
+                return 1
+            text = str(resp.get("text") or "")
+            if text.startswith(shown):
+                out.write(text[len(shown):])
+            elif text != shown:  # the 30-line window moved on: show what is new at the end
+                out.write("\n" + text)
+            out.flush()
+            shown = text
+            if resp.get("done") or resp.get("status") == "unknown":
+                out.write(f"\n[{resp.get('status', 'done')}]\n")
+                return 0
+            await asyncio.sleep(interval)
+    finally:
+        with contextlib.suppress(Exception):
+            writer.close()
 
 
 async def slash_via_daemon(command: str, *, cwd: str, sock: Path | None = None, session_id: str | None = None) -> str:
