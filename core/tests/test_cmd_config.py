@@ -168,10 +168,10 @@ async def test_memory_command(tmp_path, monkeypatch):
     server.config.mem0.url = "http://mem0.test"
     with respx.mock() as router:
         route = router.post("http://mem0.test/search").mock(
-            return_value=httpx.Response(200, json={"results": [{"memory": "the owner likes tea"}]})
+            return_value=httpx.Response(200, json={"results": [{"memory": "Alice likes tea"}]})
         )
         out = (await cmd(server, "/memory mem0 tea", sid))["output"]
-    assert route.called and "the owner likes tea" in out
+    assert route.called and "Alice likes tea" in out
     await server.close()
 
 

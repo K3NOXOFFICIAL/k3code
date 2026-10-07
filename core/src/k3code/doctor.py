@@ -26,7 +26,7 @@ from k3code.reliability.netwatch import NetWatchConfig, _default_provider_probe,
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 #: Hosts that mean "this chain entry goes through OmniRoute".
-OMNIROUTE_MARKERS = ("<omniroute-public-host>", "<omniroute-host>", "omniroute")
+OMNIROUTE_MARKERS = ("omniroute", ":20128")
 MIN_FREE_GB = 5.0
 
 

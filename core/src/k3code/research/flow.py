@@ -128,7 +128,7 @@ class Research:
         tools = self.tools()
         if reason := await tools.unavailable_reason():
             raise ResearchUnavailable(f"/ultraresearch needs a search tool and none is available: {reason}. "
-                                      "Connect an MCP server with a web search tool (e.g. k3nox hub_searxng) or "
+                                      "Connect an MCP server with a web search tool (e.g. hub_searxng) or "
                                       "set research.searxng_url.")
         n_sub = int(n_sub or cfg["sub_questions"])
         state = ResearchState(question)

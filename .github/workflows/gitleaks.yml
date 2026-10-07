@@ -1,0 +1,56 @@
+name: gitleaks
+
+# Secret scan for every pull request and push. It checks the commits that the event adds,
+# which covers every line that enters the repository from now on. Existing history is not
+# rescanned here; see .gitleaks.toml.
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks (pinned release, checksum verified)
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          set -eu
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}"
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tmp="$(mktemp -d)"
+          curl -sSfL -o "$tmp/$archive" "$base/$archive"
+          curl -sSfL -o "$tmp/checksums.txt" "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          (cd "$tmp" && grep -F "$archive" checksums.txt | sha256sum -c -)
+          tar -xzf "$tmp/$archive" -C "$tmp" gitleaks
+          sudo install -m 0755 "$tmp/gitleaks" /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan the commits added by this event
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_SHA: ${{ github.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -eu
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            range="${BASE_SHA}..${HEAD_SHA}"
+          elif [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            # First push of a new branch: the commits that are not on the default branch.
+            range="origin/${DEFAULT_BRANCH}..${PUSH_SHA}"
+          else
+            range="${BEFORE_SHA}..${PUSH_SHA}"
+          fi
+          echo "scanning range: ${range}"
+          gitleaks detect --source . --config .gitleaks.toml --redact --exit-code 1 --log-opts="${range}"

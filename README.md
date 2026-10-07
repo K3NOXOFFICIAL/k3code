@@ -1,10 +1,11 @@
 # k3code
 
 **A terminal coding agent that keeps working when you are not looking.**
-It plans before it acts, runs many agents in parallel, survives dropped connections and crashes, routes cheap work to cheap models, and learns how you like to work.
 
-> **Status: pre-release (v0.0.1, working name).** Every feature of the first roadmap (M0–M6) is built and integrated on the `m0-scaffold` branch; its draft pull request into `Main` is still open, so `Main` itself only holds the initial commit. The core test suite passes (613 tests). The exit-criteria verification is partly done: of 51 checks, **41 pass and 10 are pending** (none fail) (they need a live model, a person, or days of real use). See [Project status](#project-status) and [`docs/reports/exit-status.md`](docs/reports/exit-status.md) for exactly what is verified.
-> The repository is private. Release downloads need a GitHub token; there is no release yet, so you install from a clone.
+k3code plans before it acts, can run several agents in parallel, retries through dropped connections and provider outages, and sends cheap background work to cheaper models. It has a Python core, a terminal UI (TypeScript, Ink) and an optional multi-window terminal (`k3`, a fork of TUIOS). It works with OpenAI-compatible and Anthropic providers, and with a local Claude Code login.
+
+> **Status: alpha, version 0.1.0 (unreleased).** The core is built and its test suite passes, and most exit criteria have scripted evidence. Live-model behaviour, the 72-hour daemon soak and multi-day use are not verified yet. Read [Safety](#safety) before you add a provider key or let it run unattended, and [Status](#status) for what has been tested.
+> The repository is private for now. Install from the `m0-scaffold` branch (see [Install](#install)). There is no tagged release yet.
 
 ---
 
@@ -14,10 +15,12 @@ It plans before it acts, runs many agents in parallel, survives dropped connecti
 - [Quick start](#quick-start)
 - [Using k3code](#using-k3code)
 - [Running 24/7](#running-247)
+- [Safety](#safety)
 - [Configuration](#configuration)
 - [How it works](#how-it-works)
 - [Development](#development)
-- [Project status](#project-status)
+- [Documentation](#documentation)
+- [Status](#status)
 - [Credits and licenses](#credits-and-licenses)
 
 ---
@@ -194,6 +197,21 @@ What keeps it alive and safe when nobody is watching:
 
 ---
 
+## Safety
+
+k3code edits files and runs shell commands on your machine, as your user. Some modes do that without asking. Read this section before you choose a mode and before you add a provider key.
+
+- **Permission modes** are described under [Permission modes](#permission-modes). In short: `default` asks before edits and before shell commands that are not allowlisted; `plan` is read-only; `auto` runs everything that is not denied and logs each auto-approved side effect; `yolo` skips approval prompts. The config key `permission_mode` takes `ask` (the same as `default`), `auto-edit` (the same as `accept-edits`) or `yolo`, and the `--permission` flag takes the same three values.
+- **`yolo` does not ask.** Use it for scratch projects and for scripted runs you can throw away. Anything the agent reads (a file, a web page, a tool result) can try to steer it, and in `yolo` nothing stops it from acting on that. Start in `default` on anything you care about.
+- **Hardline list.** Refused in every mode, `yolo` included: `rm -rf /` and `rm -rf ~`, `mkfs`, `dd` to a device, `curl … | sh`, `env` and `printenv`, `cat` of `~/.ssh/` or `.env` files, `git push --force` to `main` or `master`, and stopping or restarting services over ssh on the hosts listed in `_REMOTE_HOSTS` (`core/src/k3code/permissions/hardline.py`). These are pattern matches, not a sandbox, and they only match the spellings they list. The host names in `_REMOTE_HOSTS` are placeholders in this release. Add your own patterns under `permissions.hardline` in your config.
+- **Sandbox, and where it fails open.** In `auto` and `yolo` modes, and in every background, cron and loop session, bash runs inside [bubblewrap](https://github.com/containers/bubblewrap). The system is read-only, only the project is writable, `$HOME` is hidden, and the command does not inherit your API keys. The network stays on. **If `bwrap` is missing or user namespaces are disabled, bash runs without the sandbox.** k3code logs a warning once, and `k3code doctor` reports it. Install bubblewrap before you run unattended.
+- **Spend caps.** Off by default. `reliability.session_tokens`, `reliability.session_usd`, `reliability.day_tokens` and `reliability.day_usd` stop a turn, or the day's work, when a limit is reached. Dollar figures are estimates, not an invoice.
+- **Approvals write rules.** Choosing *always* writes a narrow rule (for example `git commit *`) into the project's `.k3code/config.yaml`. Review those rules before you commit that file.
+- **Secrets.** Keys live in `~/.config/k3code/env` (mode 0600) or in your environment. The config names an environment variable, never the value. `k3code export` redacts secrets.
+- **Not a security boundary.** Treat k3code like a script you run yourself. It is not built to contain a hostile model, repository or MCP server.
+
+To report a vulnerability, use the private route in [SECURITY.md](SECURITY.md).
+
 ## Configuration
 
 State lives in `~/.k3code/` (override with `K3CODE_HOME`): `config.yaml`, session and usage databases, the journal, memory, learned preferences, logs. Secrets live only in `~/.config/k3code/env` (mode 0600) or your environment. A project can add `.k3code/config.yaml`, read from the directory k3code was started in (or `--config-dir`).
@@ -225,7 +243,7 @@ mcp:
     search: {url: "https://example.org/mcp"}
 ```
 
-Tip: keep at least one chain entry that does not go through a self-hosted gateway, so a gateway outage still has a fallback. (`k3code doctor` only warns when every entry points at an OmniRoute or k3nox host; it cannot recognise other gateways.)
+Tip: keep at least one chain entry that does not go through a self-hosted gateway, so a gateway outage still has a fallback. (`k3code doctor` only warns when every entry looks like an OmniRoute gateway: its name contains `omniroute`, or it uses port 20128. It cannot recognise other gateways.)
 
 ---
 
@@ -277,19 +295,44 @@ python3 scripts/vendor_check.py
 ```
 
 - **Exit checks:** `scripts/exit/run_all.sh [--soak-minutes N] [--only m0,m1,…]` runs every check (real-TUI scripted flows, daemon and chaos tests, the panes tests, a clean-install test in a Fedora 44 podman container, and a 30-minute daemon soak in the background) and **overwrites the tracked** [`docs/reports/exit-status.md`](docs/reports/exit-status.md). Expect 30–40 minutes and heavy CPU, RAM and disk use. It needs `bash`, `python3`, `uv`, `node` (with the TUI built first), `go`, and optionally `podman`. Live-model rows stay pending while the provider quota is exhausted.
-- **How it was built:** most of the code was written by headless coding agents driven by [`scripts/dev/omni-worker.sh`](scripts/dev/omni-worker.sh) from the task specs in [`scripts/dev/tasks/`](scripts/dev/tasks). Each task produced a branch and a report in `docs/reports/`.
-- **Branches:** named by milestone. `m0/…` scaffold pieces; `m1/…` gateway, tui, permissions, commands; `m2/…` reliability and ops; `m3/…` keymap and panes integration; `m4/…` autonomy, automation, fan-out; `m5/…` learning; `m6/…` install; `exit/verify`. The `*/merge-*` branches are integration merges. Everything is integrated on `m0-scaffold`, the open draft pull request into `Main`.
+- **How it was built:** most of the code was written by headless coding agents driven by [`scripts/dev/omni-worker.sh`](scripts/dev/omni-worker.sh) from the task specs in [`scripts/dev/tasks/`](scripts/dev/tasks). Each task produced a branch and a report in `docs/reports/`. Those scripts are internal build tooling; you do not need them to build, test or use k3code.
+- **Branches:** named by milestone. `m0/…` scaffold pieces; `m1/…` gateway, tui, permissions, commands; `m2/…` reliability and ops; `m3/…` keymap and panes integration; `m4/…` autonomy, automation, fan-out; `m5/…` learning; `m6/…` install; `exit/verify`. The `*/merge-*` branches are integration merges. Everything is integrated on `m0-scaffold`, the branch to install from.
 - **License hygiene:** `scripts/vendor_check.py` checks each file entry in `VENDOR.toml` (the file exists, the license is MIT or Apache-2.0, the project is not on a short banned list that includes the leaked Claude Code source and the closed Ante binary). It does not check the `[[tree]]` entries (`tui/`, `panes/`) or inspect the code itself.
 
 ---
 
-## Project status
+## Documentation
 
-Verification as of 2026-10-07 (51 exit checks: 41 pass, 0 fail, 10 pending). The authoritative table, with the evidence behind every row, is [`docs/reports/exit-status.md`](docs/reports/exit-status.md).
+| Document | What it covers |
+|---|---|
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Development setup, tests, commit style, and the rules for the vendored TUI |
+| [`SECURITY.md`](SECURITY.md) | How to report a vulnerability privately, and what is in scope |
+| [`CHANGELOG.md`](CHANGELOG.md) | What each version contains |
+| [`docs/PLAN.md`](docs/PLAN.md) | The design plan and roadmap (M0 to M6) |
+| [`docs/tui-contract.md`](docs/tui-contract.md) | The protocol between the core and the TUI |
+| [`docs/UPSTREAM.md`](docs/UPSTREAM.md) | How the vendored TUI relates to its upstream |
+| [`docs/k3-panes-test.md`](docs/k3-panes-test.md) | Manual test steps for the `k3` multi-window terminal |
+| [`docs/reports/`](docs/reports) | One report per milestone and merge, including the exit-status table |
+| [`VENDOR.toml`](VENDOR.toml) | Every file and tree taken from another project, with its license |
+
+---
+
+## Status
+
+**Alpha, version 0.1.0 (unreleased).** This is the first version meant for people other than its author. Expect rough edges, and expect the config format and some commands to change.
+
+As of 2026-10-08, 51 exit-criteria checks have been run: 46 pass, none fail, and 5 are pending. The pending rows need a live model, a person or days of real use. The table with the evidence behind every row is [`docs/reports/exit-status.md`](docs/reports/exit-status.md). The core test suite has 811 tests at this commit.
+
+What is not verified yet:
+
+- **Live models.** Many scripted checks use a scripted fake provider. The live-model rows ran through the `claude-cli` provider (a local Claude Code login), not through a gateway.
+- **Long unattended runs.** A 30-minute daemon soak passed. The 72-hour soak is pending.
+- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container.
+- **Updates.** There is no release yet, so the update and rollback path has only been tested against local version directories.
 
 | | Milestone | Built | Verified so far |
 |---|---|---|---|
-| **M0** | Scaffold, core skeleton, vendored TUI and panes | ✅ | Passes; the live-model row is pending (live provider calls are paused) |
+| **M0** | Scaffold, core skeleton, vendored TUI and panes | ✅ | Passes; the live-model row is pending (needs a live model) |
 | **M1** | Daily-driver agent: gateway, TUI (agent list, focus mode, history), permissions, commands | ✅ | Nine scripted real-TUI flows pass; the live `/review` check is pending, and so is 3 days of real use |
 | **M2** | 24/7 reliability: offline pause/resume, retry, journal, governor, daemon, doctor, stats | ✅ | All five chaos checks and a 30-minute soak (119 turns, none lost, memory flat) pass; the 72-hour soak is pending |
 | **M3** | `k3` keymap, agent states and approvals in panes | ✅ | Keymap tests and the live pane-badge check pass; the first-time-user test is pending |
@@ -297,7 +340,6 @@ Verification as of 2026-10-07 (51 exit checks: 41 pass, 0 fail, 10 pending). The
 | **M5** | Learning, proposals, project preparation, self-optimizer | ✅ | Demo and tests pass; live mem0 and 2 weeks of use are pending |
 | **M6** | Installer, guided setup, update with rollback, release CI | ✅ | A clean Fedora 44 container installs in about a minute; setup resume, `--from-bundle` and update rollback pass. The upstream-sync check passes under the agreed policy: TUIOS stays mergeable (0 conflicting files) and the heavily modified Hermes TUI is a documented frozen fork whose upstream fixes are cherry-picked by hand ([`docs/UPSTREAM.md`](docs/UPSTREAM.md)) |
 
-Other open items: there is no release yet, so the update path is only tested against local version directories; the goals and requirements the project is measured against are in [`GOAL.md`](GOAL.md).
 
 ---
 

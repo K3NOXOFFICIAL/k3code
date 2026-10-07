@@ -48,7 +48,7 @@ def test_mcp_server_env_headers_and_args_are_redacted_by_default():
     cfg = {
         "mcp": {
             "servers": {
-                "k3nox": {
+                "gateway": {
                     "url": "https://mcp.example.com/mcp?api_key=SECRETVALUE1",
                     "headers": {"Authorization": "Basic Zm9vOmJhcg==", "X-Custom": "abc"},
                     "env": {"SOME_VAR": "plain-looking-value", "PATH": "/usr/bin"},
@@ -59,16 +59,16 @@ def test_mcp_server_env_headers_and_args_are_redacted_by_default():
         },
         "providers": [{"name": "p", "api_key_env": "MY_KEY_ENV", "base_url": "https://p/v1"}],
         "cookie_jar": "abc",
-        "author": "the owner",
+        "author": "alice",
     }
     out = redact(cfg)
-    srv = out["mcp"]["servers"]["k3nox"]
+    srv = out["mcp"]["servers"]["gateway"]
     assert "SECRETVALUE1" not in srv["url"] and set(srv["headers"].values()) == {REDACTED}
     assert set(srv["env"].values()) == {REDACTED}
     assert "tok_12345678" not in " ".join(srv["args"]) and "80" in srv["args"]
     assert srv["command"] == "npx"
     assert out["providers"][0]["api_key_env"] == "MY_KEY_ENV"  # the env var *name* is not a secret
-    assert out["cookie_jar"] == REDACTED and out["author"] == "the owner"
+    assert out["cookie_jar"] == REDACTED and out["author"] == "alice"
 
 
 def test_session_payloads_are_scrubbed_in_every_string():

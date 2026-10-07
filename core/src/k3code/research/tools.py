@@ -1,7 +1,7 @@
 """Research tools: ``web_search`` (SearXNG), ``web_fetch`` (httpx + readability-lite) and MCP discovery.
 
-MCP servers win when they offer a search/fetch tool (the k3nox ``hub_searxng`` / ``hub_fetch`` family); otherwise the
-built-ins are used. ``research.searxng_url`` defaults to https://<searxng-host> and is probed once; if it is
+MCP servers win when they offer a search/fetch tool (for example ``hub_searxng`` / ``hub_fetch``); otherwise the
+built-ins are used. ``research.searxng_url`` has no default: set it to a SearXNG instance (probed once). If it is
 unreachable ``web_search`` is disabled with a clear message instead of failing every call.
 """
 
@@ -22,10 +22,10 @@ from k3code.providers.types import ToolSpec
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_SEARXNG = "https://<searxng-host>"
+DEFAULT_SEARXNG = ""  # no default instance: web_search stays off until research.searxng_url is set
 MAX_FETCH_CHARS = 14_000
 MAX_FETCH_BYTES = 2 * 1024 * 1024  # how much of a response body is read at most
-UA = "k3code-research/0.1 (+https://github.com/k3nox/k3code)"
+UA = "k3code-research/0.1 (+https://github.com/K3NOXOFFICIAL/k3code)"
 
 
 @dataclass
@@ -183,7 +183,7 @@ class SearxngSearch:
 
 class DuckDuckGoSearch:
     """Keyless fallback: DuckDuckGo's HTML endpoint. Used only when SearXNG is not reachable, so /ultraresearch works on
-    a machine that cannot see the owner's SearXNG (a fresh install, a laptop on a hotel network)."""
+    a machine without a reachable SearXNG (a fresh install, a laptop on a hotel network)."""
 
     URL = "https://html.duckduckgo.com/html/"
     _ANCHOR = re.compile(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.S)
@@ -295,7 +295,7 @@ def parse_search_text(text: str) -> list[Hit]:
 
 
 class McpTools(ResearchTools):
-    """Search/fetch through connected MCP tools (e.g. k3nox ``hub_searxng`` and ``hub_fetch``)."""
+    """Search/fetch through connected MCP tools (e.g. ``hub_searxng`` and ``hub_fetch``)."""
 
     def __init__(self, mcp: Any, search_tool: Any, fetch_tool: Any | None, fallback: BuiltinTools) -> None:
         self.mcp, self.search_tool, self.fetch_tool, self.fallback = mcp, search_tool, fetch_tool, fallback

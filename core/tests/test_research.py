@@ -226,7 +226,7 @@ async def test_pick_tools_prefers_mcp_search_and_fetch():
 
     def tool(name):
         return SimpleNamespace(
-            name=name, qualified=f"mcp__k3nox__{name}", schema={"properties": {"query": {}, "url": {}}}
+            name=name, qualified=f"mcp__example__{name}", schema={"properties": {"query": {}, "url": {}}}
         )
 
     mcp = FakeMcp([tool("hub_searxng__search"), tool("hub_fetch__fetch")])
@@ -252,7 +252,7 @@ def test_finalize_report_and_loose_json():
 
 async def test_pick_tools_ignores_non_web_search_decoys():
     def tool(name):
-        return SimpleNamespace(name=name, qualified=f"mcp__k3nox__{name}", schema={})
+        return SimpleNamespace(name=name, qualified=f"mcp__example__{name}", schema={})
 
     decoys = [tool("search_memory"), tool("fleet_sessions_search"), tool("nc_search_files"), tool("fleet_fetch"),
               tool("mcp_tool_search")]

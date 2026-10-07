@@ -181,7 +181,8 @@ def test_an_approved_prefix_does_not_cover_writes_outside_the_project_or_unvette
 
 def test_launchers_are_never_offered_as_always_allow_rules():
     launchers = (
-        "python3 script.py", "ssh protected-host-a ls", "sudo ls", "bash run.sh", "xargs rm", "find . -delete", "env X=1 ls",
+        "python3 script.py", "ssh protected-host-a ls", "sudo ls", "bash run.sh", "xargs rm", "find . -delete",
+        "env X=1 ls",
     )
     for cmd in launchers:
         d = decide(mode="default", tool="bash", args={"command": cmd}, cwd="/proj")
