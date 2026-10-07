@@ -264,8 +264,8 @@ async def _run_repl(
 @click.option(
     "--permission",
     type=click.Choice(["ask", "auto-edit", "yolo"]),
-    default="ask",
-    help="Permission mode (default: ask)",
+    default=None,
+    help="Permission mode (default: permission_mode from the config, which defaults to ask)",
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
 @click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
@@ -281,7 +281,7 @@ async def _run_repl(
 def main(
     prompt: str | None,
     model: str | None,
-    permission: str,
+    permission: str | None,
     json_output: bool,
     session: str,
     resume: bool,
@@ -301,14 +301,12 @@ def main(
         _run_gateway()
         return
 
-    permission_mode = PermissionMode(permission)
-
     # Load config
     config = load_config(project_dir=config_dir or Path.cwd())
 
-    # Headless permission override
-    if config.headless_permission and prompt:
-        permission_mode = PermissionMode(config.headless_permission)
+    # The flag wins; then headless_permission (-p only); then the config's permission_mode. The flag used to default
+    # to "ask", which silently ignored a configured permission_mode in -p and REPL runs.
+    permission_mode = PermissionMode(permission or (prompt and config.headless_permission) or config.permission_mode)
 
     if prompt:
         result = asyncio.run(
@@ -395,8 +393,8 @@ def _find_repo_root() -> Path | None:
 @click.option(
     "--permission",
     type=click.Choice(["ask", "auto-edit", "yolo"]),
-    default="ask",
-    help="Permission mode (default: ask)",
+    default=None,
+    help="Permission mode (default: permission_mode from the config, which defaults to ask)",
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
 @click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
@@ -407,7 +405,7 @@ def cli(
     ctx: click.Context,
     prompt: str | None,
     model: str | None,
-    permission: str,
+    permission: str | None,
     json_output: bool,
     session: str,
     resume: bool,
