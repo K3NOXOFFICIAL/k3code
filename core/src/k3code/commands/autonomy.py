@@ -7,7 +7,7 @@ from typing import Any
 from k3code.artifacts import write_artifact_file
 from k3code.autonomy import advisor, autonomy_cfg
 from k3code.autonomy import preview as preview_mod
-from k3code.autonomy.proposals import format_proposals
+from k3code.autonomy.proposals import LEARNED_KINDS, format_proposals
 from k3code.autonomy.scope import SCOPES
 from k3code.commands import CommandDef
 from k3code.errors import ChainExhausted
@@ -40,6 +40,8 @@ class ScopeCommand(CommandDef):
         if level not in SCOPES:
             return _msg(f"Unknown scope: {level} ({'|'.join(SCOPES)}|auto)")
         live.scope_override = level
+        if hasattr(ctx, "learning"):
+            ctx.learning.record("scope", live, subject="override", choice=level)
         return _msg(f"The next task will be treated as '{level}' (danger checks still apply).")
 
 
@@ -56,10 +58,18 @@ class ProposalsCommand(CommandDef):
             p = store.get(parts[1])
             if p is None:
                 return _msg(f"No such proposal: {parts[1]}")
+            hub = getattr(ctx, "learning", None)
+            live = _live(ctx, session_id)
             if parts[0] == "dismiss":
                 store.set_status(p.id, "dismissed")
+                if hub is not None:
+                    hub.decide(p, "dismiss", live)
                 return _msg(f"Dismissed {p.id}; it will not come back.")
             store.set_status(p.id, "accepted")
+            if hub is not None:
+                hub.decide(p, "accept", live)
+                if p.kind in LEARNED_KINDS and p.payload.get("op") != "send":
+                    return _msg(f"Accepted {p.id}: {await hub.apply(p, live)}")
             return {"type": "send", "message": p.action, "text": p.action, "notice": f"Accepted {p.id}: {p.text}"}
         items = store.all()
         if parts[:1] != ["all"]:

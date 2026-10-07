@@ -89,3 +89,24 @@ class SettingsCommand(CommandDef):
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         view = build_settings_view(ctx, session_id)
         return reply(render_text(view), type="settings", settings=view)
+
+
+class FocusCommand(CommandDef):
+    """Gateway twin of the TUI's /focus: shows in /help and toggles ``display.focus`` (``config.set``)."""
+
+    def __init__(self) -> None:
+        super().__init__(name="focus", help="Toggle focus mode: only prompts, errors, final answers [on|off|status]")
+
+    async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+        mode = arg.strip().lower()
+        cur = bool(ctx.config.display.focus_mode)
+        if mode in ("", "toggle"):
+            nxt = not cur
+        elif mode in ("on", "off"):
+            nxt = mode == "on"
+        elif mode in ("status", "show", "?"):
+            return reply(f"focus view {'on' if cur else 'off'}", focus=cur)
+        else:
+            return reply("usage: /focus [on|off|status]")
+        ctx.config.display.focus_mode = nxt
+        return reply(f"focus view {'enabled' if nxt else 'disabled'}", focus=nxt)

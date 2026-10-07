@@ -57,11 +57,12 @@ from k3code.gateway.protocol import (
 )
 from k3code.gateway.sessions import SessionStore
 from k3code.goals import GoalManager, make_judge
+from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, suggest_rules
-from k3code.permissions.state import PermissionState, log_decision, persist_rules, project_config_path
+from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
 from k3code.providers.types import Message, StreamEvent, Usage
@@ -286,6 +287,7 @@ class GatewayServer:
             last_attempt=lambda: self.last_attempt,
         )
         self.autonomy = PlanFirst(self)
+        self.learning = LearningHub(self, self.autonomy.proposals)
         #: Automation engine (loops, cron, triggers); started by the daemon or on the first /loop|/schedule.
         self.automation: Any = None
         self.last_user_activity = time.time()
@@ -985,6 +987,8 @@ class GatewayServer:
                     break
                 # The attempt stalled on a cheap tier: continue the same task one tier up.
                 reason = loop.escalation_reason or "unknown"
+                if "loop_guard" in reason:
+                    self.usage.record("loop_guard", session=session.session_id, detail=reason)
                 self.model_caller.note_escalation(kind, tier, new_tier, reason, session.session_id)
                 tier = new_tier
                 session.needs_input = False
@@ -1026,6 +1030,8 @@ class GatewayServer:
                 session.paused = False
                 session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")
             self.autonomy.finish(session, gate, status, final_text, text)
+            if self.learning.enabled:
+                self.learning.spawn(self.learning.turn_finished(session, status))
 
         # Persist whatever the loop accumulated (also on error/interrupt).
         if loop.turn_messages:
@@ -1138,14 +1144,7 @@ class GatewayServer:
                 session.perms.session_rules.extend(rules)
             if choice == "always" and rules:
                 persist_rules(project_config_path(session.perms.cwd), rules)
-            log_decision(
-                session=session.session_id,
-                tool=tool_name,
-                pattern=pattern,
-                choice=choice,
-                cwd=str(session.perms.cwd),
-                home=self._home(),
-            )
+            self.learning.approval(session, tool_name, pattern, choice)
             return ApprovalResult(choice, reason)
 
         return approve
@@ -1176,14 +1175,10 @@ class GatewayServer:
                 return None
             choice = str(result.get("choice", "deny")).lower()
             target = {"once": "default", "session": "accept-edits"}.get(choice)
-            log_decision(
-                session=session.session_id,
-                tool="exit_plan",
-                pattern="*",
-                choice=choice,
-                cwd=str(session.perms.cwd),
-                home=self._home(),
-            )
+            self.learning.record(
+                "plan", session, subject="exit_plan", choice=choice,
+                detail={"has_verification": _has_verification(plan), "edited": bool(result.get("edited")),
+                        "risk": "", "plan_len": len(plan)})
             if target:
                 session.set_mode(PermissionMode(target))
             return target
@@ -1325,7 +1320,11 @@ class GatewayServer:
             )
         except (asyncio.CancelledError, RuntimeError):
             return False
-        return str(result.get("choice", "deny")).lower() == "once"
+        approved = str(result.get("choice", "deny")).lower() == "once"
+        self.learning.record("plan", session, subject="confirm", choice="approved" if approved else "rejected",
+                             detail={"has_verification": _has_verification(plan), "risk": risk,
+                                     "edited": bool(result.get("edited"))})
+        return approved
 
     # ── commands ──────────────────────────────────────────────────────
 
@@ -1454,6 +1453,7 @@ class GatewayServer:
             return False
         session.loop.interrupt() if session.loop else None
         self.subagents.interrupt_session(session.session_id)
+        self.learning.record("interrupt", session, subject=_running_tool(session), choice="stop")
         if session.reliability is not None:
             session.reliability.cancel()  # abort a paused/parked wait too
         session.turn_task.cancel()
@@ -1468,6 +1468,22 @@ class GatewayServer:
 
     def log(self, message: str) -> None:
         logger.info(message)
+
+
+def _running_tool(session: Any) -> str:
+    """Name of the tool the loop was in the middle of (last assistant tool call), else ``turn``."""
+    for m in reversed(getattr(getattr(session, "loop", None), "turn_messages", None) or []):
+        calls = getattr(m, "tool_calls", None)
+        if getattr(m, "role", "") == "assistant" and calls:
+            return str(calls[-1].name)
+    return "turn"
+
+
+def _has_verification(plan: str) -> bool:
+    import re as _re
+
+    m = _re.search(r"^\s*#{1,4}\s*Verification\s*\n(.*?)(?=^\s*#{1,4}\s|\Z)", plan or "", _re.S | _re.M | _re.I)
+    return bool(m and m.group(1).strip())
 
 
 class _InvalidParams(Exception):
@@ -1542,6 +1558,8 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
     live = LiveSession(stored.session_id, stored, server)
     live.reasoning_effort = params.get("effort")
     server.session = live
+    if server.learning.enabled and not params.get("background"):
+        server.learning.spawn(server.learning.prepare_project(live))
     return {"session_id": stored.session_id, "info": live.live_info()}
 
 
@@ -1854,6 +1872,11 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         yolo = session.perms.mode != PermissionMode.YOLO
         session.set_mode(PermissionMode.YOLO if yolo else PermissionMode.DEFAULT)
         return {"ok": True, "key": key, "value": "1" if yolo else "0"}
+    if key in ("focus", "display.focus"):  # /focus: display-only, stored as display.focus_mode
+        raw = params.get("value")
+        on = raw if isinstance(raw, bool) else str(raw).lower() in ("1", "true", "on", "yes")
+        server.config.display.focus_mode = on
+        return {"ok": True, "key": key, "value": "on" if server.config.display.focus_mode else "off"}
     if "." not in key:
         raise _InvalidParams(f"unsupported config key: {key}")
     section, field_name = key.split(".", 1)
