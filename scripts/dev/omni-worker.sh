@@ -170,6 +170,9 @@ sys.exit(0 if re.search(r"prompt is too long|compaction failed|context length ex
 try: print(json.load(sys.stdin).get("is_error",True))
 except Exception: print(True)')
   if [ $rc -eq 0 ] && [ "$iserr" = "False" ] && [ "$WT/REPORT.md" -nt "$run_stamp" ]; then status=ok; break; fi
+  # Finished but the process hung on exit (e.g. a leftover child held stdout): a fresh report counts.
+  if [ "$killed_idle" = 1 ] && [ "$WT/REPORT.md" -nt "$run_stamp" ] \
+     && git -C "$WT" diff --quiet HEAD 2>/dev/null; then status=ok; break; fi
   echo "$(date -Is) attempt $attempt rc=$rc is_error=$iserr report=$([ -f "$WT/REPORT.md" ] && echo y || echo n)" >> "$RUNS/driver.log"
   # The OmniRoute key's own daily quota is exhausted: no combo can work until the reset.
   if [ "$iserr" != "False" ] && printf '%s' "$json" | grep -qiE 'API key reached its daily usage quota'; then
