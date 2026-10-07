@@ -6,9 +6,9 @@ The roadmap and exit criteria are in [`docs/PLAN.md`](docs/PLAN.md), the evidenc
 | | |
 |---|---|
 | **Set** | 2026-10-07 |
-| **Owner** | the owner |
+| **Owner** | the project owner |
 | **Name** | `k3code` (working name; a better one will be chosen later) |
-| **Repository** | `K3NOXOFFICIAL/k3code` (private), synced with `~/src/k3code` |
+| **Repository** | `K3NOXOFFICIAL/k3code` (private) |
 | **Done when** | Every milestone M0–M6 meets its exit criteria, verified on the owner's laptop (see [§8](#8-definition-of-done)) |
 
 ---

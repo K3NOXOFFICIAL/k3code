@@ -1,11 +1,11 @@
 # k3code: a new coding harness assembled from OSS parts
 
 ## Context
-the owner wants their own terminal coding harness, **k3code** (working name). It should feel like Claude Code (slash commands, an agent list under the input, ↑ history), run unattended 24/7, keep retrying when offline and pause/resume work, route to fallback providers and cheaper models, improve itself, learn the user's decisions, plan before it acts, fan out agents on its own, and ship with a multi-window terminal (a tuios fork) and a guided installer.
+The owner wants their own terminal coding harness, **k3code** (working name). It should feel like Claude Code (slash commands, an agent list under the input, ↑ history), run unattended 24/7, keep retrying when offline and pause/resume work, route to fallback providers and cheaper models, improve itself, learn the user's decisions, plan before it acts, fan out agents on its own, and ship with a multi-window terminal (a tuios fork) and a guided installer.
 
-the owner chose **"a new harness built from the parts of other harnesses"** over a fork of a single project. The design judge's top-scored option was a whole-fork of Hermes (tied 35/35 with the small-core design). I did not take it, because it is the "Hermes fork" option the user already declined. The whole-fork stays the documented fallback if the M0 TUI spike shows that a new core is too costly.
+The owner chose **"a new harness built from the parts of other harnesses"** over a fork of a single project. The design judge's top-scored option was a whole-fork of Hermes (tied 35/35 with the small-core design). I did not take it, because it is the "Hermes fork" option the user already declined. The whole-fork stays the documented fallback if the M0 TUI spike shows that a new core is too costly.
 
-Repo: **`K3NOXOFFICIAL/k3code`**, private, MIT, upstream notices kept. Local checkout `~/src/k3code`. gh is already authenticated with `repo` scope.
+Repo: **`K3NOXOFFICIAL/k3code`**, private, MIT, upstream notices kept. Local checkout: a local clone. gh is already authenticated with `repo` scope.
 
 Research (2026-10-07):
 
@@ -25,15 +25,15 @@ Research (2026-10-07):
 ## Step 0: goal and token model (right after approval)
 1. **Set the standing goal.** Write the full original request, plus the additions made in this session (OmniRoute workers, private repo, name k3code), to:
    - `GOAL.md` in the repo;
-   - `~/.claude/projects/-home-user/memory/k3code-standing-goal.md`, with a pointer in `MEMORY.md`;
-   - mem0 (`agent_id=claude-code-laptop`).
+   - `<user memory dir>/k3code-standing-goal.md`, with a pointer in `MEMORY.md`;
+   - mem0 (`agent_id=claude-code-<device>`).
 
    Work continues until every milestone's exit criteria pass.
 2. **Gate on cheap workers.** Run `claude -p --settings ~/.claude/settings.omniroute.json --model sonnet "reply OK"` (sonnet maps to `auto/coding-manual`). Then confirm the call appears in `hub_omniroute_insights__usage_summary` and not on the Claude account. Always pass `--model` explicitly, because the profile's OPUS slot is empty.
 3. **Build model.**
    - **Claude (me):** specs, orchestration, architecture decisions, final reviews only.
    - **Code-writing work:** Bash-launched headless `claude -p` workers on the OmniRoute profile, one git worktree each, **at most 2–3 concurrently** (protected-host-a HDD).
-   - **Text-only work** (docs, boilerplate, summaries): `mcp__k3nox__ai_delegate` with `auto/coding-cheap`.
+   - **Text-only work** (docs, boilerplate, summaries): `mcp__gateway__ai_delegate` with `auto/coding-cheap`.
    - **No `Workflow`/`agent()` fan-out during the build.** Those bill Claude; the design workflow alone used about 1.4M Claude tokens.
    - **Driver.** `scripts/dev/omni-worker.sh <task.md> <worktree>` runs a worker headless, logs to `.k3dev/runs/`, retries on OmniRoute errors, and is supervised so workers keep going while Claude is idle.
 
@@ -72,10 +72,10 @@ Research (2026-10-07):
 | Plan-first auto mode + scope decision + auto fan-out | hermes `delegate_tool` batch, `subagent_worktree`, `kanban_decompose` prompts; pi planner/worker/reviewer prompts | NEW `scope_gate`, `complexity`, `fanout` with governor |
 | Agent strip under the input, ↑ history, states | hermes ui-tui `agentsPanel`, `agentControls`, `activeSessionSwitcher` (moved below the composer, cross-session rows) | NEW `tui/src/k3/agentStrip.tsx` |
 | Focus mode (only questions, input, results) | hermes `/focus` + details | NEW importance tag on every event + `focusPolicy.ts` |
-| Compaction, MCP (deferred tools), memory, skills | hermes `context_compressor`, `mcp_tool`, `memory_manager`, skills; opencode compaction template | k3nox MCP + mem0 + skills-library preconfigured |
+| Compaction, MCP (deferred tools), memory, skills | hermes `context_compressor`, `mcp_tool`, `memory_manager`, skills; opencode compaction template | gateway MCP + mem0 + skills-library preconfigured |
 | Sessions: export/import/fork/branch/resume/rename | hermes `hermes_state_portability`, `session_export`, `rewind` | NEW `.k3bundle` (settings + session, redacted) |
 | Install + guided setup + doctor + update | openclaw onboard flow (resumable) + systemd policy + health-check contract; hermes setup/doctor | NEW `install.sh`, 12-step wizard (user, system, main use, theme, provider chain, degradation tiers, keymap tour), versioned update with rollback |
-| /review, /ultraresearch | codex `review/rubric.md` (Apache NOTICE); atomic-agents deep-research prompts | runs on k3nox searxng/fetch |
+| /review, /ultraresearch | codex `review/rubric.md` (Apache NOTICE); atomic-agents deep-research prompts | runs on gateway searxng/fetch |
 | Multi-window | tuios subtree | NEW `internal/k3keys` |
 
 **Commands.** All 36 are mapped:

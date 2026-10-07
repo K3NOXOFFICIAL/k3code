@@ -10,7 +10,7 @@ k3code has three parts. You only need the toolchain for the part you change.
 # core: Python 3.12+ with uv
 cd core && uv sync
 uv run pytest -q
-uv run ruff check . ../scripts
+uv run ruff check src tests
 
 # TUI: Node 22+
 cd tui && npm ci
@@ -26,11 +26,11 @@ Do not run `go test ./...` in `panes/`. Its upstream remote-sync tests recurse w
 
 License bookkeeping is checked with `python3 scripts/vendor_check.py`.
 
-CI runs the core, TUI, panes and vendor checks on every pull request (`.github/workflows/ci.yml`). A secret scan runs too (`.github/workflows/gitleaks.yml`).
+CI runs the core, TUI, panes and vendor checks on every pull request (`.github/workflows/ci.yml`). A secret scan runs too (`.github/workflows/gitleaks.yml`). The CI core job also lints `../scripts`, where some older scripts still have lint errors; `ruff check src tests` is the check to keep green for core changes.
 
 ## Before you open a pull request
 
-- The core test suite and `ruff` must pass.
+- The core test suite and `ruff check src tests` must pass.
 - A behaviour change needs a test. A bug fix needs a test that fails without the fix.
 - Security-sensitive code (permissions, the hardline list, the sandbox, the daemon socket, redaction, bundle import and export, the updater) needs a test and a line in `CHANGELOG.md`.
 - Do not commit secrets, not even in tests. Use obviously fake values, and build them at run time when they would match a secret pattern. The secret scan fails on new matches.
