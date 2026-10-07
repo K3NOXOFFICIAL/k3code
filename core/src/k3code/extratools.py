@@ -24,6 +24,9 @@ def register_skill_tool(reg: ToolRegistry, cwd: Path, roots: list[str]) -> None:
                 near = skills_mod.search(name, base, roots, limit=5)
                 hint = f" Did you mean: {', '.join(s.name for s in near)}?" if near else ""
                 return {"error": f"Unknown skill: {name}.{hint}"}
+            from k3code.learning.curator import record_use
+
+            record_use(skill.name)
             text = skill.text()
             if len(text) > MAX_SKILL_CHARS:
                 text = text[:MAX_SKILL_CHARS] + "\n…(truncated)"

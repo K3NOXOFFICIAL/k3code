@@ -135,13 +135,13 @@ async def polish(caller: Any, prefs: list[Preference], *, session_id: str = "") 
     return prefs
 
 
-def write_auto_section(path: Path, prefs: list[Preference]) -> None:
+def write_auto_section(path: Path, prefs: list[Preference], heading: str = HEADING) -> None:
     """Replace the auto section of ``path``; all other text is preserved byte for byte."""
     body = "\n".join(f"- {p.text}" for p in prefs) or "- (nothing learned yet)"
-    section = f"{HEADING}\n{_NOTE}\n{body}\n"
+    section = f"{heading}\n{_NOTE}\n{body}\n"
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     lines = text.splitlines(keepends=True)
-    start = next((i for i, ln in enumerate(lines) if ln.strip() == HEADING), None)
+    start = next((i for i, ln in enumerate(lines) if ln.strip() == heading), None)
     if start is None:
         sep = "" if not text or text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
         new = text + sep + section
@@ -153,12 +153,12 @@ def write_auto_section(path: Path, prefs: list[Preference]) -> None:
     path.write_text(new, encoding="utf-8")
 
 
-def read_auto_section(path: Path) -> list[str]:
+def read_auto_section(path: Path, heading: str = HEADING) -> list[str]:
     if not path.is_file():
         return []
     lines = path.read_text(encoding="utf-8").splitlines()
     try:
-        i = next(i for i, ln in enumerate(lines) if ln.strip() == HEADING)
+        i = next(i for i, ln in enumerate(lines) if ln.strip() == heading)
     except StopIteration:
         return []
     out = []
