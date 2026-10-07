@@ -13,8 +13,8 @@ from typing import Any
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning.decisions import DecisionLog, project_id
 from k3code.permissions import hardline
-from k3code.permissions.state import load_permissions_config, persist_rules, project_config_path
 from k3code.permissions.rules import Rule
+from k3code.permissions.state import load_permissions_config, persist_rules, project_config_path
 
 APPROVED = ("once", "session", "always")
 

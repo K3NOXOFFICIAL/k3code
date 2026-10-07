@@ -92,8 +92,9 @@ async def review_session(caller: Any, messages: list[dict[str, Any]], *, store: 
         body = scrub(str(s["body"]))
         md = write_draft(s["name"], scrub(str(s.get("description", ""))).replace("\n", " "), body)
         drafts.append(str(md))
-        p = store.add("skill", f"Save skill '{s['name']}'? ({s.get('description', '')[:80]})", f"save skill {s['name']}",
-                      session_id, payload={"op": "save", "name": s["name"], "draft": str(md)}, project=project,
+        label = f"Save skill '{s['name']}'? ({str(s.get('description', ''))[:80]})"
+        payload = {"op": "save", "name": s["name"], "draft": str(md)}
+        p = store.add("skill", label, f"save skill {s['name']}", session_id, payload=payload, project=project,
                       key=dedup_key("skill", f"save {s['name']}"))
         if p:
             props.append(p)

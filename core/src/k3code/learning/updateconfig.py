@@ -151,6 +151,10 @@ async def run(ctx: Any, session_id: str | None, request: str, path: Path) -> str
     if str(answer.get("choice") or answer.get("answer") or "").lower() not in ("apply", "yes", "y"):
         return "Cancelled; config unchanged.\n" + diff
     bak = confio.write_yaml(path, merged)
+    if getattr(ctx, "learning", None) is not None:
+        live = ctx.sessions.get(session_id) if session_id else None
+        ctx.learning.record("config", live, subject="update-config", choice="apply",
+                            detail={"keys": sorted(patch)})
     for k, v in patch.items():  # live config object picks the change up
         if hasattr(ctx.config, k) and v is not None and not isinstance(v, dict):
             setattr(ctx.config, k, v)

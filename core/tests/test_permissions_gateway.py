@@ -128,8 +128,10 @@ async def test_always_persists_project_rule_and_new_session_skips(tmp_path, monk
     seen2 = await run_turn(server2, "go", [])
     assert seen2 == []
     # decisions log
-    rows = [json.loads(x) for x in (tmp_path / "home" / "decisions.jsonl").read_text().splitlines()]
-    assert rows[0]["choice"] == "always" and rows[0]["tool"] == "bash" and rows[0]["cwd"] == str(tmp_path)
+    from k3code.learning.decisions import DecisionLog
+
+    rows = DecisionLog(tmp_path / "home").query("approval")
+    assert rows[0]["choice"] == "always" and rows[0]["detail"]["tool"] == "bash" and rows[0]["cwd"] == str(tmp_path)
 
 
 async def test_deny_is_visible_to_model(tmp_path, monkeypatch):

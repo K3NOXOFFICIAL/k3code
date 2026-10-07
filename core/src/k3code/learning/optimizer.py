@@ -242,11 +242,8 @@ class Experiments:
 def _prev_values(cur: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     prev: dict[str, Any] = {}
     for k, v in patch.items():
-        if isinstance(v, dict) and isinstance(cur.get(k), dict):
-            prev[k] = _prev_values(cur[k], v)
-        elif isinstance(v, dict):
-            prev[k] = {kk: None for kk in v} if all(not isinstance(x, dict) for x in v.values()) else None
-            prev[k] = _prev_values({}, v) if cur.get(k) is None else cur.get(k)
+        if isinstance(v, dict):
+            prev[k] = _prev_values(cur.get(k) if isinstance(cur.get(k), dict) else {}, v)
         else:
             prev[k] = cur.get(k)
     return prev
@@ -256,10 +253,12 @@ def _restore(cur: dict[str, Any], patch: dict[str, Any], prev: dict[str, Any]) -
     out = dict(cur)
     for k, v in patch.items():
         old = prev.get(k)
-        if isinstance(v, dict) and isinstance(out.get(k), dict) and isinstance(old, dict):
-            out[k] = _restore(out[k], v, old)
-            if not out[k]:
-                out.pop(k)
+        if isinstance(v, dict) and isinstance(old, dict):
+            sub = _restore(out[k] if isinstance(out.get(k), dict) else {}, v, old)
+            if sub:
+                out[k] = sub
+            else:
+                out.pop(k, None)
         elif old is None:
             out.pop(k, None)
         else:

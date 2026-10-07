@@ -83,7 +83,8 @@ class DecisionLog:
         clean = json.loads(scrub(json.dumps(detail or {}, ensure_ascii=False)))
         cur = self._db.execute(
             "INSERT INTO decisions (ts, kind, session, cwd, project, subject, choice, detail) VALUES (?,?,?,?,?,?,?,?)",
-            (self.clock() if ts is None else ts, kind, session, cwd, project if project is not None else self._project(cwd),
+            (self.clock() if ts is None else ts, kind, session, cwd,
+             project if project is not None else self._project(cwd),
              scrub(subject), choice, json.dumps(clean, ensure_ascii=False)),
         )
         self._db.commit()

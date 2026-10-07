@@ -41,7 +41,8 @@ def detect(root: Path) -> dict[str, Any]:
                             "ci": "", "monorepo": False, "docker": False, "makefile": (root / "Makefile").is_file()}
     if _has(root, "pyproject.toml", "setup.py", "requirements.txt"):
         info["language"] = "python"
-        py = (root / "pyproject.toml").read_text(encoding="utf-8", errors="ignore") if (root / "pyproject.toml").is_file() else ""
+        pyp = root / "pyproject.toml"
+        py = pyp.read_text(encoding="utf-8", errors="ignore") if pyp.is_file() else ""
         if _has(root, "uv.lock") or "[tool.uv]" in py:
             info["package_manager"], run = "uv", "uv run "
         elif _has(root, "poetry.lock") or "[tool.poetry]" in py:
@@ -59,7 +60,7 @@ def detect(root: Path) -> dict[str, Any]:
         pm = "pnpm" if _has(root, "pnpm-lock.yaml") else "yarn" if _has(root, "yarn.lock") else "npm"
         info["package_manager"] = pm
         scripts = pkg.get("scripts") or {}
-        run = f"{pm} run " if pm != "npm" or True else ""
+        run = f"{pm} run "
         for key, name in (("test", "test"), ("lint", "lint"), ("build", "build")):
             if name in scripts:
                 info[key] = f"{pm} test" if name == "test" else f"{run}{name}"
@@ -113,9 +114,10 @@ def scan_risks(root: Path, info: dict[str, Any], limit: int = 300) -> list[str]:
         except OSError:
             continue
         n += 1
-        if p.name == ".env" or p.name.startswith(".env."):
-            if not p.name.endswith((".example", ".sample", ".template")):
-                risks.append(f"secrets file committed? {p.relative_to(root)}")
+        if (p.name == ".env" or p.name.startswith(".env.")) and not p.name.endswith(
+            (".example", ".sample", ".template")
+        ):
+            risks.append(f"secrets file committed? {p.relative_to(root)}")
         for name, rx in SECRET_RES.items():
             if rx.search(text):
                 risks.append(f"possible {name} in {p.relative_to(root)}")
@@ -162,7 +164,8 @@ def template_memory(info: dict[str, Any]) -> str:
     for k in ("test", "lint", "build"):
         if info.get(k):
             lines.append(f"- {k}: `{info[k]}`")
-    lines += ["", "## Conventions", f"- Language: {info['language']}" + (f" ({info['package_manager']})" if info["package_manager"] else "")]
+    pm = f" ({info['package_manager']})" if info["package_manager"] else ""
+    lines += ["", "## Conventions", f"- Language: {info['language']}{pm}"]
     return "\n".join(lines) + "\n"
 
 
@@ -197,6 +200,8 @@ async def prepare(root: Path, *, store: ProposalStore, caller: Any = None, prefe
     """Detect + write ``project.json`` (the only unconditional write), then create proposals."""
     root = Path(root)
     info = detect(root)
+    if info["language"] == "unknown" and not (root / ".git").exists() and not info["docker"]:
+        return []  # not a project (empty or scratch directory): nothing to prepare
     risks = scan_risks(root, info)
     meta = {**info, "risks": risks, "detected_at": clock(), "project": project_id(root)}
     path = project_json_path(root)
@@ -212,9 +217,10 @@ async def prepare(root: Path, *, store: ProposalStore, caller: Any = None, prefe
             out.append(p)
 
     if not any((root / n).is_file() for n in ("K3CODE.md", "AGENTS.md")):
-        draft = await draft_memory(caller, root, info, session_id)
+        # drafted on the cheap tier when accepted (no model call on session start)
         add("project_setup", "Create a K3CODE.md with this project's build/test commands and conventions?",
-            "write K3CODE.md", {"op": "write_file", "path": str(root / "K3CODE.md"), "content": draft})
+            "write K3CODE.md", {"op": "draft_memory", "path": str(root / "K3CODE.md"), "root": str(root),
+                                "info": info})
     pats = safe_commands(info)
     if pats:
         add("project_setup", f"Allow the detected safe commands without asking ({', '.join(pats)})?",
@@ -232,9 +238,13 @@ async def prepare(root: Path, *, store: ProposalStore, caller: Any = None, prefe
     return out
 
 
-def apply(payload: dict[str, Any]) -> str:
+async def apply(payload: dict[str, Any], caller: Any = None, session_id: str = "") -> str:
     """Run the accepted project_setup operation (writes only after acceptance)."""
     op = payload.get("op")
+    if op == "draft_memory":
+        payload = {"op": "write_file", "path": payload["path"],
+                   "content": await draft_memory(caller, Path(payload["root"]), payload["info"], session_id)}
+        op = "write_file"
     if op == "write_file":
         path = Path(payload["path"])
         if path.exists():

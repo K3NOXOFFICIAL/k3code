@@ -19,7 +19,9 @@ from k3code.routing.tiers import TaskKind
 
 HEADING = "## Learned preferences (auto)"
 _NOTE = "<!-- managed by k3code; rewritten automatically, edit outside this section -->"
-TEST_RE = re.compile(r"\b(pytest|npm test|npm run test|yarn test|pnpm test|cargo test|go test|make test|uv run pytest)\b")
+TEST_RE = re.compile(
+    r"\b(pytest|npm test|npm run test|yarn test|pnpm test|cargo test|go test|make test|uv run pytest)\b"
+)
 
 
 @dataclass
@@ -64,7 +66,8 @@ def derive(log: DecisionLog, *, min_evidence: int = 3) -> tuple[list[Preference]
 
     # plans
     plans = log.query("plan")
-    no_verif = sum(1 for r in plans if r["choice"] in ("deny", "rejected") and r["detail"].get("has_verification") is False)
+    no_verif = sum(1 for r in plans if r["choice"] in ("deny", "rejected")
+                   and r["detail"].get("has_verification") is False)
     if no_verif >= max(2, min_evidence - 1):
         add("plan:verification", "rejects plans without verification steps", no_verif)
     edited = sum(1 for r in plans if r["detail"].get("edited"))

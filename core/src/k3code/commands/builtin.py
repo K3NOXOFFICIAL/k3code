@@ -26,7 +26,14 @@ class _ModelCommand(CommandDef):
             return self._chain(ctx, session_id, arg.split()[1:])
         if not arg:
             return {"type": "message", "message": f"Current model key: {ctx.config.default_model}"}
-        ctx.config.default_model = arg
+        key, _, reason = arg.partition(" ")
+        old = ctx.config.default_model
+        if hasattr(ctx, "learning") and key != old:
+            live = ctx.sessions.get(session_id) if session_id else None
+            kind = getattr(live, "current_kind", "") if live is not None else ""
+            ctx.learning.record("model_switch", live, subject=f"{old} -> {key}", choice=key,
+                                detail={"from": old, "to": key, "reason": reason.strip(), "task_kind": kind or ""})
+        ctx.config.default_model = key if reason else arg
         return {"type": "message", "message": f"Model key set to: {arg}"}
 
 
@@ -192,6 +199,13 @@ def build_registry() -> CommandRegistry:
     from k3code.commands.fork import ForkCommand
     from k3code.commands.goal import GoalCommand
     from k3code.commands.import_ import ImportCommand
+    from k3code.commands.learning_cmd import (
+        LearnCommand,
+        OptimizerCommand,
+        PermissionsCommand,
+        SelfImproveCommand,
+        UpdateConfigCommand,
+    )
     from k3code.commands.loop import LoopCommand
     from k3code.commands.mcp_cmd import McpCommand
     from k3code.commands.memory_cmd import MemoryCommand
@@ -205,7 +219,8 @@ def build_registry() -> CommandRegistry:
     for extra in (
         ExportCommand(), ImportCommand(), ForkCommand(), BranchCommand(), SettingsCommand(), ConfigCommand(),
         OutputStyleCommand(), MemoryCommand(), SkillsCommand(), McpCommand(), ReviewCommand(), GoalCommand(),
-        LoopCommand(), ScheduleCommand(), AutomationsCommand(),
+        LoopCommand(), ScheduleCommand(), AutomationsCommand(), PermissionsCommand(), UpdateConfigCommand(),
+        OptimizerCommand(), SelfImproveCommand(), LearnCommand(),
     ):
         reg.register(extra)
     for cmd in (

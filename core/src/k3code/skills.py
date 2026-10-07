@@ -53,7 +53,8 @@ def _find(root: Path) -> list[Path]:
         if depth >= MAX_DEPTH:
             continue
         try:
-            stack.extend((c, depth + 1) for c in sorted(d.iterdir()) if c.is_dir() and not c.name.startswith((".", "_")))
+            kids = [c for c in sorted(d.iterdir()) if c.is_dir() and not c.name.startswith((".", "_"))]
+            stack.extend((c, depth + 1) for c in kids)
         except OSError:
             continue
     return sorted(found)

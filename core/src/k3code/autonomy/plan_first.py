@@ -66,6 +66,12 @@ def parse_plan(text: str) -> dict[str, str]:
     return {k: v.strip() for k, v in sections.items()}
 
 
+def learning_project(session: Any) -> str:
+    from k3code.learning.decisions import project_id
+
+    return project_id(session.stored.cwd or ".")
+
+
 class PlanFirst:
     """Scope gate + planning turn + proposer/advisor hooks, bound to a GatewayServer."""
 
@@ -158,7 +164,8 @@ class PlanFirst:
             cap.plan = plan
             cap.asked += 1
             show("proposed")
-            if session.perms.mode is PermissionMode.AUTO and verdict.risk != "high":
+            auto_ok = verdict.risk != "high" or bool(self.cfg.get("auto_do_plans"))
+            if session.perms.mode is PermissionMode.AUTO and auto_ok:
                 cap.approved, cap.auto, cap.mode = True, True, "auto"
             elif session.perms.mode is PermissionMode.AUTO:
                 cap.approved = await server._confirm_plan(session, plan, verdict.risk)
@@ -221,7 +228,12 @@ class PlanFirst:
     async def propose_from(self, session: Any, context: str) -> None:
         if not self.cfg["proposals"]:
             return
-        for p in await propose(self.server.model_caller, self.proposals, context, session_id=session.session_id):
+        hub = getattr(self.server, "learning", None)
+        project = learning_project(session)
+        kw: dict[str, Any] = {}
+        if hub is not None and hub.enabled:
+            kw = {"ranker": hub.ranker(project), "preferences": hub.preferences(), "project": project}
+        for p in await propose(self.server.model_caller, self.proposals, context, session_id=session.session_id, **kw):
             self.emit_proposal(session, p)
 
     def emit_proposal(self, session: Any, p: Any) -> None:
