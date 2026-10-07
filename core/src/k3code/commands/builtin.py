@@ -7,6 +7,7 @@ from typing import Any
 
 from k3code import chain_config
 from k3code.commands import CommandDef, CommandRegistry
+from k3code.commands.autonomy import AdvisorCommand, GoCommand, PreviewCommand, ProposalsCommand, ScopeCommand
 from k3code.commands.daemon import DaemonCommand
 from k3code.commands.debug import DebugCommand
 from k3code.commands.doctor import DoctorCommand
@@ -203,6 +204,11 @@ def build_registry() -> CommandRegistry:
         StatsCommand(),
         DebugCommand(),
         DaemonCommand(),
+        ScopeCommand(),
+        ProposalsCommand(),
+        PreviewCommand(),
+        GoCommand(),
+        AdvisorCommand(),
     ):
         reg.register(cmd)
     return reg

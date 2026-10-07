@@ -136,8 +136,11 @@ class Router:
         cooldowns: CooldownStore | None = None,
         on_event: EventCallback | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        tier: str = "main",
     ) -> None:
         self.chain = list(chain)
+        #: M4a: model tier this router serves; tagged on every event.
+        self.tier = tier
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
@@ -337,7 +340,7 @@ class Router:
                 attempt=attempt,
                 reason=reason,
                 detail=detail,
-                extra=extra or {},
+                extra={**(extra or {}), "tier": self.tier},
             )
         )
 

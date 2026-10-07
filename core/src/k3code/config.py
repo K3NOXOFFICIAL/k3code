@@ -21,6 +21,8 @@ class ProviderEntry(BaseModel):
     api_key_env: str
     api_key: str = ""  # populated by load_config() from the api_key_env var; never set this directly
     models: dict[str, str | list[str]] = Field(default_factory=dict)  # {default, cheap, ...}
+    #: M4a: model list per tier, e.g. {strong: [opus], cheap: haiku}; falls back to models[<tier>], then models.default.
+    tiers: dict[str, str | list[str]] = Field(default_factory=dict)
 
     @field_validator("kind")
     @classmethod
@@ -89,6 +91,11 @@ class Settings(BaseModel):
     mcp: McpConfig = Field(default_factory=McpConfig)
     mem0: Mem0Config = Field(default_factory=Mem0Config)
     goal: GoalConfig = Field(default_factory=GoalConfig)
+
+    # M4a: task kind → tier overrides, e.g. {title: fast, review: strong}.
+    task_tiers: dict[str, str] = Field(default_factory=dict)
+    # M4a autonomy: plan_first, gate_modes, advisor_auto, proposals, escalate_after, ...
+    autonomy: dict[str, Any] = Field(default_factory=dict)
 
 
 def _current_home() -> Path:

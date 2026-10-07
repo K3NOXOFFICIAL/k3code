@@ -32,6 +32,8 @@ from typing import Any
 
 from k3code import confio
 from k3code.agent.loop import AgentLoop, ApprovalResult
+from k3code.autonomy import advisor, autonomy_cfg
+from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, load_config
@@ -65,6 +67,8 @@ from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build
 from k3code.reliability import events as rev
 from k3code.reliability.persistent_retry import TurnCancelled
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
+from k3code.routing.caller import ModelCaller
+from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, tier_for
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -121,6 +125,12 @@ class LiveSession:
         self.needs_input = False
         #: (provider, model) of the latest router attempt, for usage rows.
         self.last_entry: tuple[str, str] = ("", "")
+        #: M4a: tier and task kind of the call in flight (for usage rows); /scope override for the next task.
+        self.last_tier = "main"
+        self.current_kind = "interactive_turn"
+        self.scope_override: str | None = None
+        #: /advisor text awaiting "accept" (kept out of the main context until then).
+        self.pending_advisor: str = ""
 
     @property
     def state(self) -> str:
@@ -241,6 +251,14 @@ class GatewayServer:
         self.safe_mode_notice = ""
         self._client_seq = 0
         self.usage = UsageDB(self._home() / "usage.db")
+        self._tiers: TierRouters | None = None
+        #: (provider, model) of the most recent router attempt on any task (side calls read it).
+        self.last_attempt: tuple[str, str] = ("", "")
+        self.model_caller = ModelCaller(
+            self.tier_routers, self.config, self.usage, emit=lambda t, p: self.emit(t, p),
+            last_attempt=lambda: self.last_attempt,
+        )
+        self.autonomy = PlanFirst(self)
 
     # ── session registry ──────────────────────────────────────────────
 
@@ -605,12 +623,24 @@ class GatewayServer:
         # Old provider clients are dropped for GC; chains are only replaced on
         # a model change (rare), and httpx pools close with the objects.
         self.providers = make_providers(self.config.providers)
-        chain = build_chain(self.providers, _resolve_model_specs(self.config, key))
         self.cooldowns = CooldownStore()
-        self.router = Router(chain, cooldowns=self.cooldowns, on_event=self._on_router_event)
+        self._tiers = TierRouters(
+            self.providers, self.config, cooldowns=self.cooldowns, on_event=self._on_router_event, main_key=key
+        )
+        self.router = self._tiers.get(Tier.MAIN)
         self._chain_key = key
 
     _chain_key: str | None = None
+
+    def tier_routers(self) -> TierRouters:
+        """The per-tier routers (built with the main router; rebuilt when the model key changes)."""
+        if self._tiers is None:
+            if self.router is not None:  # a router injected from outside (tests): every tier shares it
+                self._tiers = TierRouters([], self.config, cooldowns=self.cooldowns, fallback_router=self.router)
+            else:
+                self._ensure_router()
+        assert self._tiers is not None
+        return self._tiers
 
     async def _reliability_for(self, session: LiveSession) -> Reliability:
         """One Reliability bundle per session: netwatch runs while the session lives, events go to its clients."""
@@ -628,8 +658,11 @@ class GatewayServer:
         """Router events: failover/retry/exhausted → TUI + usage rows. Reliability kinds go via the session sink."""
         sess = _ctx_session.get()
         sid = sess.session_id if sess else ""
-        if event.kind == "router.attempt" and sess is not None:
-            sess.last_entry = (event.provider, event.model)
+        if event.kind == "router.attempt":
+            self.last_attempt = (event.provider, event.model)
+            if sess is not None:
+                sess.last_entry = (event.provider, event.model)
+                sess.last_tier = str(event.extra.get("tier", "main"))
         elif event.kind == "router.retry":
             self.usage.record("retry", session=sid, provider=event.provider, model=event.model, detail=event.reason)
         elif event.kind == "router.failover":
@@ -717,7 +750,9 @@ class GatewayServer:
                     self.emit_goal(session)
                 return
             judge = self.goal_judge or make_judge(self._goal_completer(session))
-            decision = await mgr.evaluate_after_turn(final_text, judge, cwd=session.stored.cwd or None)
+            decision = await mgr.evaluate_after_turn(
+                final_text, judge, cwd=session.stored.cwd or None, reviewer=self._goal_reviewer(session)
+            )
             self.emit_goal(session)
             if decision.message:
                 session.emit(
@@ -727,17 +762,12 @@ class GatewayServer:
                 return
             prompt = decision.prompt
 
-    async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
-        """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
-        self._ensure_router(session.stored.model or None)
-        assert self.router is not None
-        session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
-        session.perms.reload()
-        session.needs_input = False
-        reliability = await self._reliability_for(session)
-        await self.mcp.ensure_started()
+    def _build_loop(
+        self, session: LiveSession, reliability: Reliability, router: Router, kind: TaskKind, approval: Any,
+        *, max_tool_errors: int = 0,
+    ) -> AgentLoop:
         loop = AgentLoop(
-            self.router,
+            router,
             system_prompt=build_system_prompt(
                 session.system_prompt,
                 cwd=session.perms.cwd,
@@ -749,7 +779,7 @@ class GatewayServer:
             headless=False,
             on_event=self._on_router_event,
             cwd=session.perms.cwd,
-            approval_callback=await self._approval_callback_for(session),
+            approval_callback=approval,
             plan_callback=self._plan_callback_for(session),
             on_auto_allow=lambda tool, args, dec: session.emit(
                 "permission.auto_allowed",
@@ -759,16 +789,40 @@ class GatewayServer:
             reliability=reliability,
             session=session.session_id,
             background=session.background,
+            task_kind=kind.value,
+            max_tool_errors=max_tool_errors,
         )
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
-        session.loop = loop
+        return loop
+
+    async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
+        """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
+        self._ensure_router(session.stored.model or None)
+        assert self.router is not None
+        session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
+        session.perms.reload()
+        session.needs_input = False
+        reliability = await self._reliability_for(session)
+        await self.mcp.ensure_started()
+        approval = await self._approval_callback_for(session)
+
+        # M4a: which tier runs this turn; cheap/fast tiers escalate when the attempt stalls.
+        kind = TaskKind.BACKGROUND_TURN if session.background else TaskKind.INTERACTIVE_TURN
+        tier = tier_for(kind, self.config.task_tiers)
+        cheap_start = tier in (Tier.FAST, Tier.CHEAP)
+        max_errors = int(autonomy_cfg(self.config)["escalate"]["tool_errors"]) if cheap_start else 0
+        escalation = Escalation(tier, thresholds={"tool_errors": 1, "loop_guard": 1})  # the loop counted already
 
         config = self.config
         final_text = ""
         usage = Usage()
         error: str | None = None
         status = "done"
+        gate = GateResult(prompt=text)
+        loop = self._build_loop(session, reliability, self.tier_routers().get(tier), kind, approval,
+                                max_tool_errors=max_errors)
+        session.loop = loop
 
         async def on_text_delta(chunk: str) -> None:
             nonlocal final_text
@@ -780,15 +834,45 @@ class GatewayServer:
         session.emit("message.start", {})
         session.emit("status.update", {"kind": "status", "text": "thinking", "state": "working"})
         session.streaming = True
+        session.current_kind = kind.value
         try:
-            async for event in loop.run(
-                text,
-                model=session.stored.model or None,
-                max_tokens=config.max_tokens,
-                temperature=config.temperature,
-                history=session.history,
-            ):
-                self._on_stream_event(session, event)
+            try:
+                gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
+            except Exception:  # noqa: BLE001 - the autonomy layer must never block the user's task
+                logger.exception("autonomy gate failed; running the task directly")
+            session.current_kind = kind.value
+            history = session.history
+            prompt = gate.prompt
+            if not gate.proceed:
+                final_text = gate.message
+                session.emit("message.delta", {"text": gate.message})
+            while gate.proceed:
+                async for event in loop.run(
+                    prompt,
+                    max_tokens=config.max_tokens,
+                    temperature=config.temperature,
+                    history=history,
+                ):
+                    self._on_stream_event(session, event)
+                new_tier = escalation.record(loop.escalation_reason) if cheap_start and loop.escalation_reason else None
+                if new_tier is None or loop.interrupted:
+                    break
+                # The attempt stalled on a cheap tier: continue the same task one tier up.
+                reason = loop.escalation_reason or "unknown"
+                self.model_caller.note_escalation(kind, tier, new_tier, reason, session.session_id)
+                tier = new_tier
+                session.needs_input = False
+                if reliability.loop_guard is not None:
+                    reliability.loop_guard.reset()
+                history = [m for m in loop.turn_messages if m.role != "system"]
+                prompt = (
+                    f"The previous attempt stalled ({reason}). Continue the task from where it left off, "
+                    "with a different approach if needed."
+                )
+                loop = self._build_loop(session, reliability, self.tier_routers().get(tier), kind, approval,
+                                        max_tool_errors=max_errors)
+                loop.on_text_delta = on_text_delta
+                session.loop = loop
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)
@@ -813,6 +897,7 @@ class GatewayServer:
             if session.paused:  # a cancelled wait never saw "resumed"
                 session.paused = False
                 session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")
+            self.autonomy.finish(session, gate, status, final_text, text)
 
         # Persist whatever the loop accumulated (also on error/interrupt).
         if loop.turn_messages:
@@ -866,6 +951,8 @@ class GatewayServer:
                     model=model,
                     tokens_in=u.prompt_tokens if u else 0,
                     tokens_out=u.completion_tokens if u else 0,
+                    tier=session.last_tier,
+                    task_kind=session.current_kind,
                 )
                 if u:
                     session.emit("session.usage", {"usage": _usage_payload(u)})
@@ -977,6 +1064,7 @@ class GatewayServer:
             setattr(self.config, key, getattr(fresh, key))
         if "providers" in keys:
             self.router = None
+            self._tiers = None
         self.mcp.configure(self.config.mcp.servers)
 
     def activate_session(self, session_id: str) -> LiveSession | None:
@@ -1000,23 +1088,54 @@ class GatewayServer:
         return cache[key]
 
     async def oneshot(
-        self, system: str, user: str, *, model_key: str | None = None, max_tokens: int = 2048
+        self,
+        system: str,
+        user: str,
+        *,
+        model_key: str | None = None,
+        max_tokens: int = 2048,
+        kind: TaskKind | None = None,
+        session_id: str = "",
     ) -> str:
-        """Sub-turn: one tool-less completion through the router; returns the text."""
+        """Sub-turn: one tool-less completion; returns the text.
+
+        With a task ``kind`` (and no explicit ``model_key``) the call goes through :class:`ModelCaller`
+        (tier policy, escalation, tier/kind usage rows); otherwise through a plain chain for ``model_key``.
+        """
+        messages = [Message(role="system", content=system), Message(role="user", content=user)]
+        if kind is not None and model_key is None:
+            res = await self.model_caller.complete(kind, messages, session_id=session_id, max_tokens=max_tokens)
+            return res.text
         router = self._router_for(model_key)
-        msg = await router.complete(
-            [Message(role="system", content=system), Message(role="user", content=user)],
-            [],
-            model=model_key,
-            max_tokens=max_tokens,
-        )
+        msg = await router.complete(messages, [], model=model_key, max_tokens=max_tokens)
         return msg.content or ""
 
     def _goal_completer(self, session: LiveSession) -> Any:
+        override = self.config.goal.judge_model
+        explicit = override if override and override != "cheap" else None  # "cheap" = the policy's default
+
         async def complete(system: str, user: str) -> str:
-            return await self.oneshot(system, user, model_key=self.config.goal.judge_model, max_tokens=512)
+            return await self.oneshot(
+                system, user, model_key=explicit, kind=TaskKind.GOAL_JUDGE, session_id=session.session_id,
+                max_tokens=512,
+            )
 
         return complete
+
+    def _goal_reviewer(self, session: LiveSession) -> Any:
+        """M4a: a strong-tier advisor veto on ``done`` (``autonomy.advisor_on_goal``); None when disabled."""
+        cfg = autonomy_cfg(self.config)
+        if not cfg.get("advisor_on_goal"):
+            return None
+
+        async def review(goal: str) -> tuple[bool, list[str]]:
+            ctx = await advisor.condensed_context(
+                self.model_caller, session.stored.messages, threshold=int(cfg["advisor_compact_chars"]),
+                session_id=session.session_id,
+            )
+            return await advisor.review_done(self.model_caller, goal, ctx, session_id=session.session_id)
+
+        return review
 
     def goal_manager(self, session: LiveSession) -> GoalManager:
         def load() -> dict[str, Any] | None:
@@ -1037,6 +1156,28 @@ class GatewayServer:
         session.control["revision"] += 1
         session.control["updated_at"] = time.time()
         session.emit("session.control.update", {"control": dict(session.control)})
+
+    async def _confirm_plan(self, session: LiveSession, plan: str, risk: str) -> bool:
+        """Auto mode + high-risk plan: ask once; approving does not leave auto mode."""
+        self.usage.record("approval", session=session.session_id, detail="plan(high risk)")
+        try:
+            result = await self._ask_client(
+                "approval",
+                {
+                    "request_id": next_request_id("approval"),
+                    "command": f"Approve this {risk}-risk plan?",
+                    "description": plan,
+                    "choices": ["once", "deny"],
+                    "labels": {"once": "Approve plan and run it", "deny": "Reject plan"},
+                    "allow_permanent": False,
+                    "allow_session": False,
+                    "tool_name": "exit_plan",
+                },
+                session.session_id,
+            )
+        except (asyncio.CancelledError, RuntimeError):
+            return False
+        return str(result.get("choice", "deny")).lower() == "once"
 
     # ── commands ──────────────────────────────────────────────────────
 

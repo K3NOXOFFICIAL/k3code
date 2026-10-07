@@ -74,6 +74,7 @@ JUDGE_USER_PROMPT_TEMPLATE = (
 Judge = Callable[[str, str], Awaitable[tuple[str, str, bool, bool]]]
 #: One-shot model call: (system, user) → text. Raises on transport errors.
 Completer = Callable[[str, str], Awaitable[str]]
+Reviewer = Callable[[str], Awaitable[tuple[bool, list[str]]]]  # (goal) -> (blocking, issues)
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
@@ -328,7 +329,9 @@ class GoalManager:
         self._save(s)
         return Decision("paused", False, None, verdict, why, message)
 
-    async def evaluate_after_turn(self, last_response: str, judge: Judge, *, cwd: str | None = None) -> Decision:
+    async def evaluate_after_turn(
+        self, last_response: str, judge: Judge, *, cwd: str | None = None, reviewer: Reviewer | None = None
+    ) -> Decision:
         """Judge the finished turn; both user prompts and our continuations spend the turn budget."""
         s = self.state
         if s is None or s.status != "active":
@@ -374,6 +377,21 @@ class GoalManager:
                     f"✗ Check failed ({s.turns_used}/{s.max_turns} turns, attempt {gate.attempts}/{gate.max_retries}): "
                     f"$ {gate.command}",
                 )
+            if reviewer is not None:  # advisor veto: blocking issues keep the goal going
+                blocking, issues = await reviewer(s.goal)
+                if blocking and issues and s.turns_used < s.max_turns:
+                    s.last_verdict = "advisor_blocked"
+                    s.last_reason = "advisor: " + "; ".join(issues)[:300]
+                    self._save(s)
+                    listed = "\n".join(f"- {i}" for i in issues)
+                    prompt = (
+                        f"[Goal check] A reviewer found blocking issues before the goal could be called done:\n"
+                        f"{listed}\nFix them, then confirm the goal is complete. Goal: {s.goal}"
+                    )
+                    return Decision(
+                        "active", True, prompt, "advisor_blocked", s.last_reason,
+                        f"⚠ Advisor found blocking issues ({s.turns_used}/{s.max_turns} turns): {issues[0][:120]}",
+                    )
             s.status = "done"
             self._save(s)
             return Decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}")

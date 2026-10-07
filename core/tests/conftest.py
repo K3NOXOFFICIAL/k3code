@@ -24,3 +24,14 @@ def httpx_mock():
 def _isolated_k3code_home(tmp_path_factory, monkeypatch):
     """Never let tests write decisions/sessions into the real ~/.k3code."""
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path_factory.mktemp("k3home")))
+
+
+@pytest.fixture(autouse=True)
+def _no_real_nmcli(monkeypatch):
+    """Netwatch must not spawn nmcli from tests (a cancel mid-spawn wedges loop teardown)."""
+    from k3code.reliability import netwatch
+
+    async def _none(timeout: float = 2.0) -> str | None:
+        return None
+
+    monkeypatch.setattr(netwatch, "nmcli_state", _none)

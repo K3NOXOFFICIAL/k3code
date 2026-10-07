@@ -135,9 +135,11 @@ async def _tcp_probe(host: str, port: int, timeout: float) -> None:
 
 async def nmcli_state(timeout: float = 2.0) -> str | None:
     """Read NetworkManager's state via ``nmcli -t -f STATE general``; None if unavailable."""
+    proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
             "nmcli", "-t", "-f", "STATE", "general",
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -149,6 +151,12 @@ async def nmcli_state(timeout: float = 2.0) -> str | None:
     except Exception as e:  # noqa: BLE001 - degrade gracefully
         logger.debug("nmcli probe failed: %s", e)
         return None
+    finally:  # a timed-out or cancelled probe must not leave nmcli running
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), 1.0)
     return None
 
 

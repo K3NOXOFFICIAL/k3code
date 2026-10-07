@@ -64,8 +64,17 @@ class AgentLoop:
         on_auto_allow: AutoAllowCallback | None = None,
         permissions: PermissionState | None = None,
         background: bool = False,
+        task_kind: str = "interactive_turn",
+        max_tool_errors: int = 0,
     ) -> None:
         self.router = router
+        #: M4a: what this loop is for (routes to a tier; tagged on usage rows).
+        self.task_kind = task_kind
+        #: Stop the loop once this many tool calls in a row failed (0 = never); see escalation_reason.
+        self.max_tool_errors = max_tool_errors
+        self._tool_errors = 0
+        #: Set when the loop stopped because the attempt looks stuck: "tool_errors" | "loop_guard".
+        self.escalation_reason: str | None = None
         self.system_prompt = system_prompt
         self.max_turns = max_turns
         self.cwd = cwd or Path.cwd()
@@ -141,6 +150,9 @@ class AgentLoop:
         ``history`` is prior conversation messages (no system entry); when given,
         the loop continues that conversation instead of starting fresh.
         """
+        # The reliability bundle is shared per session; bind its retry wrapper to *this* loop's router
+        # (another loop on a different tier may have attached its own since construction).
+        self.reliability.attach_router(self.router)
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
             *(history or []),
@@ -253,6 +265,11 @@ class AgentLoop:
                 self.reliability.save_transcript(messages)
                 # Yield the tool result as a stream event
                 yield StreamEvent(type="done", message=tool_msg)
+                self._tool_errors = self._tool_errors + 1 if "error" in result and "content" not in result else 0
+                if self.max_tool_errors and self._tool_errors >= self.max_tool_errors:
+                    self.escalation_reason = "tool_errors"
+                    self.turn_messages = messages
+                    return
 
             self.turn_messages = messages
 
@@ -347,6 +364,7 @@ class AgentLoop:
 
     def _stop_for_input(self, messages: list[Message]) -> Any:
         """Yield a final assistant message marking the turn stopped (needs_input)."""
+        self.escalation_reason = "loop_guard"
         stop_msg = Message(
             role="assistant",
             content="I stopped because I was repeating myself (loop guard). Please give me more input to proceed.",
