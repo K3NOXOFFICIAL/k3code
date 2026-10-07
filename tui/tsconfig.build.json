@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@k3code/ink": ["src/types/hermes-ink.d.ts"]
+    }
+  }
+}

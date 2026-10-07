@@ -1,0 +1,23 @@
+{
+  "name": "@k3code/shared",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    "./ansi": "./ansi.ts",
+    "./billing": "./billing-types.ts",
+    "./billing-policy": "./billing-policy.ts",
+    "./charge-settlement": "./charge-settlement.ts",
+    "./color": "./color.ts",
+    "./format": "./format.ts",
+    "./fuzzy": "./fuzzy.ts",
+    "./gateway-events": "./gateway-events.ts",
+    "./json-rpc-channel": "./json-rpc-channel.ts",
+    "./model-search-text": "./model-search-text.ts",
+    "./reasoning-effort": "./reasoning-effort.ts",
+    "./reconnect-backoff": "./reconnect-backoff.ts",
+    "./skin": "./skin.ts",
+    "./slash": "./slash.ts"
+  },
+  "types": "./gateway-events.ts"
+}

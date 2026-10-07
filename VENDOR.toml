@@ -1,0 +1,28 @@
+# VENDOR.toml - Inventory of vendored code
+# Format: each entry is either a [[tree]] (directory) or [[file]] (single file)
+# project: upstream project name
+# upstream_path: path within the upstream project
+# commit: git commit hash
+# license: SPDX license identifier
+# local_path: path in this repo
+
+[[tree]]
+project = "hermes-agent"
+upstream_path = "ui-tui"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "tui"
+
+[[tree]]
+project = "hermes-agent"
+upstream_path = "apps/shared/src"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "tui/shared"
+
+[[tree]]
+project = "tuios"
+upstream_path = "."
+commit = "f3d8929"
+license = "MIT"
+local_path = "panes"
