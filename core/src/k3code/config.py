@@ -21,6 +21,8 @@ class ProviderEntry(BaseModel):
     api_key_env: str
     api_key: str = ""  # populated by load_config() from the api_key_env var; never set this directly
     models: dict[str, str | list[str]] = Field(default_factory=dict)  # {default, cheap, ...}
+    #: M4a: model list per tier, e.g. {strong: [opus], cheap: haiku}; falls back to models[<tier>], then models.default.
+    tiers: dict[str, str | list[str]] = Field(default_factory=dict)
 
     @field_validator("kind")
     @classmethod
@@ -45,6 +47,10 @@ class Settings(BaseModel):
     #                 flags: {netwatch: true, journal: true, ...},
     #                 session_tokens: 2000000, session_usd: 5.0}
     reliability: dict[str, Any] = Field(default_factory=dict)
+    # M4a: task kind → tier overrides, e.g. {title: fast, review: strong}.
+    task_tiers: dict[str, str] = Field(default_factory=dict)
+    # M4a autonomy: plan_first, gate_modes, advisor_auto, proposals, escalate_after, ...
+    autonomy: dict[str, Any] = Field(default_factory=dict)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
