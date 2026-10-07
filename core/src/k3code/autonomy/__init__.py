@@ -16,6 +16,8 @@ DEFAULTS: dict[str, Any] = {
     "proposals": True,
     #: failures per signal before a cheap-tier task escalates
     "escalate": {"tool_errors": 3, "loop_guard": 1, "judge_not_done": 2},
+    #: name a new session from its first prompt (one cheap-tier call, background); opt-in
+    "auto_title": False,
     "preview_timeout": 30,
     "advisor_compact_chars": 24000,
 }

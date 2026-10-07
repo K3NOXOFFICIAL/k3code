@@ -13,6 +13,7 @@ from k3code.commands.debug import DebugCommand
 from k3code.commands.doctor import DoctorCommand
 from k3code.commands.stats import StatsCommand
 from k3code.config import load_config
+from k3code.session_ai import compact_messages
 
 
 class _ModelCommand(CommandDef):
@@ -79,12 +80,25 @@ class _ClearCommand(CommandDef):
 
 class _CompactCommand(CommandDef):
     def __init__(self) -> None:
-        super().__init__(name="compact", help="Summarize the transcript to free context (stub: reports counts)")
+        super().__init__(name="compact", help="Summarize the older transcript to free context")
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         live = ctx.sessions.get(session_id) if session_id else None
-        n = len(live.messages) if live else 0
-        return {"type": "message", "message": f"Compact: {n} messages in transcript (full compaction lands in M2)."}
+        if live is None:
+            return {"type": "message", "message": "No active session."}
+        before = len(live.messages)
+        try:
+            messages, folded = await compact_messages(
+                ctx.model_caller, list(live.messages), session_id=live.session_id
+            )
+        except Exception as e:  # noqa: BLE001 - e.g. every provider rate-limited
+            return {"type": "message", "message": f"Compact failed: {e}"}
+        if not folded:
+            return {"type": "message", "message": f"Nothing to compact ({before} messages)."}
+        live.messages = messages
+        ctx.store.save(live.stored)
+        note = f"Compacted {folded} messages into a summary ({before} → {len(messages)})."
+        return {"type": "message", "message": note}
 
 
 class _RenameCommand(CommandDef):

@@ -69,6 +69,7 @@ from k3code.reliability.persistent_retry import TurnCancelled
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 from k3code.routing.caller import ModelCaller
 from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router_options, tier_for
+from k3code.session_ai import make_title
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -252,6 +253,7 @@ class GatewayServer:
         self._client_seq = 0
         self.usage = UsageDB(self._home() / "usage.db")
         self._tiers: TierRouters | None = None
+        self._side_tasks: set[asyncio.Task[Any]] = set()  # fire-and-forget work (titles)
         #: (provider, model) of the most recent router attempt on any task (side calls read it).
         self.last_attempt: tuple[str, str] = ("", "")
         self.model_caller = ModelCaller(
@@ -917,7 +919,19 @@ class GatewayServer:
              "state": session.state},
         )
         session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+        if status == "done" and not session.stored.title and autonomy_cfg(self.config)["auto_title"]:
+            task = asyncio.create_task(self._auto_title(session, text))
+            self._side_tasks.add(task)
+            task.add_done_callback(self._side_tasks.discard)
         return status, final_text
+
+    async def _auto_title(self, session: LiveSession, first_message: str) -> None:
+        """Name a fresh session on the ``title`` task kind; best-effort, never surfaces errors."""
+        title = await make_title(self.model_caller, first_message, session_id=session.session_id)
+        if title and not session.stored.title:
+            session.stored.title = title
+            self.store.save(session.stored)
+            session.emit("session.title", {"session_id": session.session_id, "title": title})
 
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
