@@ -285,28 +285,6 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    aliases: ['fork'],
-    help: 'branch the session',
-    name: 'branch',
-    run: (arg, ctx) => {
-      const prevSid = ctx.sid
-
-      ctx.gateway.rpc<SessionBranchResponse>('session.branch', { name: arg, session_id: ctx.sid }).then(
-        ctx.guarded<SessionBranchResponse>(r => {
-          if (!r.session_id) {
-            return
-          }
-
-          void ctx.session.closeSession(prevSid)
-          patchUiState({ sid: r.session_id })
-          ctx.session.setSessionStartedAt(Date.now())
-          ctx.transcript.sys(`branched → ${r.title ?? ''}`)
-        })
-      )
-    }
-  },
-
-  {
     help: 'pin light/dark mode or trust auto-detection (usage: /theme [auto|light|dark])',
     name: 'theme',
     usage: '/theme [auto|light|dark]',

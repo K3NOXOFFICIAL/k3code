@@ -109,6 +109,10 @@ export function createSlashHandler(ctx: SlashHandlerContext): (cmd: string) => b
         return sys(d.output || '(no output)')
       }
 
+      if (d.type === 'settings') {
+        return page(d.output || '(no settings)', 'Settings')
+      }
+
       if (d.type === 'alias') {
         return void handler(`/${d.target}${argTail}`)
       }

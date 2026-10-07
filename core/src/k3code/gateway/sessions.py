@@ -79,6 +79,35 @@ class SessionStore:
         self._db.commit()
         return sess
 
+    def insert(self, sess: StoredSession) -> StoredSession:
+        """Insert a fully-formed session (import/fork); the caller guarantees the id is free."""
+        now = time.time()
+        sess.created_at = sess.created_at or now
+        sess.updated_at = now
+        self._db.execute(
+            "INSERT INTO sessions"
+            " (session_id, title, model, provider, cwd, messages, usage, created_at, updated_at, meta)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (
+                sess.session_id,
+                sess.title,
+                sess.model,
+                sess.provider,
+                sess.cwd,
+                json.dumps(sess.messages, ensure_ascii=False),
+                json.dumps(sess.usage, ensure_ascii=False),
+                sess.created_at,
+                sess.updated_at,
+                json.dumps(sess.meta, ensure_ascii=False),
+            ),
+        )
+        self._db.commit()
+        return sess
+
+    @staticmethod
+    def new_id() -> str:
+        return uuid.uuid4().hex[:16]
+
     def get(self, session_id: str) -> StoredSession | None:
         row = self._db.execute(
             "SELECT session_id, title, model, provider, cwd, messages, usage, created_at, updated_at, meta"

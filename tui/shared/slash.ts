@@ -71,11 +71,19 @@ export interface PrefillCommandDispatchResponse {
   type: 'prefill'
 }
 
+/** `/settings`: a structured overview; the TUI shows `output` in the pager overlay. */
+export interface SettingsCommandDispatchResponse {
+  output?: string
+  settings?: Record<string, unknown>
+  type: 'settings'
+}
+
 export type CommandDispatchResponse =
   | AliasCommandDispatchResponse
   | ExecCommandDispatchResponse
   | PrefillCommandDispatchResponse
   | SendCommandDispatchResponse
+  | SettingsCommandDispatchResponse
   | SkillCommandDispatchResponse
 
 const str = (value: unknown) => (typeof value === 'string' ? value : undefined)
@@ -105,6 +113,13 @@ export function parseCommandDispatch(raw: unknown): CommandDispatchResponse | nu
       return typeof row.message === 'string'
         ? { display: str(row.display), message: row.message, notice: str(row.notice), type: 'send' }
         : null
+
+    case 'settings':
+      return {
+        output: str(row.output),
+        settings: row.settings && typeof row.settings === 'object' ? (row.settings as Record<string, unknown>) : undefined,
+        type: 'settings'
+      }
 
     case 'skill':
       return typeof row.name === 'string'

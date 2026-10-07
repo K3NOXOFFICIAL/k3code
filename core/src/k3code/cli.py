@@ -18,7 +18,9 @@ import click
 from k3code.agent.loop import AgentLoop
 from k3code.config import K3CODE_HOME, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
+from k3code.extratools import register_skill_tool
 from k3code.permissions import PermissionMode
+from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
 from k3code.reliability import (
     BudgetExceeded,
@@ -88,7 +90,7 @@ async def _run_headless(
     resume: bool = False,
 ) -> dict[str, Any] | None:
     """Run headless mode and return final result dict."""
-    system_prompt = _load_system_prompt()
+    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
@@ -110,6 +112,7 @@ async def _run_headless(
         reliability=reliability,
         session=session,
     )
+    register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
 
     final_text = ""
     tool_results: list[dict[str, Any]] = []
@@ -156,7 +159,7 @@ async def _run_repl(
     config: Any,
 ) -> None:
     """Run minimal REPL."""
-    system_prompt = _load_system_prompt()
+    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
@@ -177,6 +180,7 @@ async def _run_repl(
         cwd=Path.cwd(),
         reliability=reliability,
     )
+    register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
 
     print("k3code REPL (type /exit to quit, /model <name> to switch, /stop to cancel a stuck turn)")
     print(f"Permission mode: {permission_mode.value}")
@@ -490,6 +494,96 @@ def stats_cmd(by: str, days: int | None, as_json: bool) -> None:
 
     rows = UsageDB(k3_home() / "usage.db").aggregate(by, days=days)
     click.echo(json.dumps(rows, indent=2) if as_json else format_stats(rows, by))
+
+
+@cli.command("export")
+@click.argument("path", required=False, type=click.Path(path_type=Path))
+@click.option("--all", "all_sessions", is_flag=True, help="Export every session")
+@click.option("--session", "session_id", help="Export one session by id")
+@click.option("--settings-only", is_flag=True)
+@click.option("--session-only", is_flag=True)
+def export_cmd(
+    path: Path | None, all_sessions: bool, session_id: str | None, settings_only: bool, session_only: bool
+) -> None:
+    """Write a .k3bundle (settings with secrets redacted + sessions)."""
+    from k3code.bundle import BundleError
+    from k3code.commands.export import run_export
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import home
+
+    store = SessionStore(home() / "sessions.db")
+    try:
+        recent = store.most_recent()
+        out, manifest = run_export(
+            store,
+            Path.cwd(),
+            path=str(path) if path else None,
+            all_sessions=all_sessions,
+            session=session_id,
+            current=recent.session_id if recent else None,
+            settings_only=settings_only,
+            session_only=session_only,
+        )
+    except BundleError as e:
+        raise click.ClickException(str(e)) from e
+    finally:
+        store.close()
+    c = manifest["contents"]
+    click.echo(
+        f"Exported {len(c['sessions'])} session(s), {len(c['settings'])} settings file(s) to {out} (secrets redacted)."
+    )
+
+
+@cli.command("import")
+@click.argument("path", type=click.Path(path_type=Path))
+@click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation (headless)")
+@click.option("--settings-only", is_flag=True)
+@click.option("--session-only", is_flag=True)
+def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool) -> None:
+    """Import a .k3bundle: merge settings (existing config backed up) and sessions."""
+    from k3code.bundle import BundleError, apply_bundle, read_bundle
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import home
+
+    try:
+        bundle = read_bundle(path)
+    except BundleError as e:
+        raise click.ClickException(str(e)) from e
+    click.echo(bundle.describe())
+    if not yes:
+        click.confirm("Import this bundle? Existing config is backed up first.", abort=True)
+    store = SessionStore(home() / "sessions.db")
+    try:
+        rep = apply_bundle(bundle, store=store, cwd=Path.cwd(), settings=not session_only, sessions=not settings_only)
+    except (BundleError, ValueError) as e:
+        raise click.ClickException(str(e)) from e
+    finally:
+        store.close()
+    click.echo("Imported.\n" + rep.describe())
+
+
+@cli.command("config-edit")
+@click.option("--project", is_flag=True, help="Edit the project config instead of the user config")
+def config_edit_cmd(project: bool) -> None:
+    """Open the user (or project) config in $EDITOR."""
+    from k3code.commands.config_cmd import open_editor, target_path
+
+    raise SystemExit(open_editor(target_path(Path.cwd(), project)))
+
+
+@cli.command("memory")
+@click.argument("action", type=click.Choice(["edit", "list"]), default="list")
+@click.option("--user", is_flag=True, help="User memory instead of project memory")
+def memory_cmd(action: str, user: bool) -> None:
+    """List memory files, or open one in $EDITOR."""
+    from k3code.commands.config_cmd import open_editor
+    from k3code.memory import project_memory_path, user_memory_path
+
+    target = user_memory_path() if user else project_memory_path(Path.cwd())
+    if action == "edit":
+        raise SystemExit(open_editor(target))
+    for scope, p in (("user", user_memory_path()), ("project", project_memory_path(Path.cwd()))):
+        click.echo(f"{scope}: {p}  " + (f"{p.stat().st_size} bytes" if p.is_file() else "(missing)"))
 
 
 if __name__ == "__main__":

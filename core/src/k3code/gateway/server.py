@@ -30,11 +30,13 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from k3code import confio
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
+from k3code.extratools import register_mcp_tools, register_skill_tool
 from k3code.gateway.protocol import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -49,10 +51,16 @@ from k3code.gateway.protocol import (
     next_request_id,
 )
 from k3code.gateway.sessions import SessionStore
+from k3code.goals import GoalManager, make_judge
+from k3code.mcpclient import McpManager
+from k3code.paths import project_config_path as _proj_cfg
+from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, suggest_rules
 from k3code.permissions.state import PermissionState, log_decision, persist_rules, project_config_path
+from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
 from k3code.providers.types import Message, StreamEvent, Usage
+from k3code.redact import redact
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
 from k3code.reliability.persistent_retry import TurnCancelled
@@ -83,7 +91,7 @@ class LiveSession:
         self.session_id = session_id
         self.stored = stored
         self.server = server
-        self.system_prompt = _load_system_prompt()
+        self.system_prompt = _load_system_prompt()  # base prompt; per-turn extras via build_system_prompt
         self.loop: AgentLoop | None = None
         self.turn_task: asyncio.Task[None] | None = None
         self.streaming = False
@@ -97,7 +105,11 @@ class LiveSession:
             cwd=Path(stored.cwd or Path.cwd()),
             add_dirs=list(stored.meta.get("add_dirs") or []),
         )
-        self.control = {"goal": "", "loop": "", "heartbeat": "", "revision": 0, "updated_at": 0.0}
+        self.control: dict[str, Any] = {"goal": "", "loop": "", "heartbeat": "", "revision": 0, "updated_at": 0.0}
+        if stored.meta.get("goal"):
+            from k3code.goals import GoalState
+
+            self.control["goal"] = GoalState.from_dict(stored.meta["goal"]).snapshot()
         #: Background/cron/loop sessions run bash inside the sandbox.
         self.background = bool(stored.meta.get("background"))
         self.reliability: Reliability | None = None
@@ -208,6 +220,8 @@ class GatewayServer:
         self._stdout = stdout
         self.commands: CommandRegistry = build_commands()
         self.live: dict[str, LiveSession] = {}
+        self.mcp = McpManager(self.config.mcp.servers)
+        self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
         self.providers: list[Any] = []
         self.router: Router | None = None
         self.cooldowns = CooldownStore()
@@ -476,6 +490,7 @@ class GatewayServer:
             if live.reliability is not None:
                 with contextlib.suppress(Exception):
                     await live.reliability.stop()
+        await self.mcp.close()
         for p in self.providers:
             await p.aclose()
         self.store.close()
@@ -684,17 +699,52 @@ class GatewayServer:
     # ── turn lifecycle ────────────────────────────────────────────────
 
     async def _run_turn(self, session: LiveSession, text: str) -> None:
-        """Execute one user prompt end-to-end, emitting wire events to the session's clients."""
+        """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget."""
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
+        prompt = text
+        mgr = self.goal_manager(session)
+        while True:
+            try:
+                status, final_text = await self._run_one_turn(session, prompt)
+            except asyncio.CancelledError:
+                if mgr.is_active():
+                    mgr.pause("interrupted")
+                    self.emit_goal(session)
+                raise
+            if status != "done" or not mgr.is_active():
+                if status == "error" and mgr.is_active():
+                    mgr.pause("turn failed")
+                    self.emit_goal(session)
+                return
+            judge = self.goal_judge or make_judge(self._goal_completer(session))
+            decision = await mgr.evaluate_after_turn(final_text, judge, cwd=session.stored.cwd or None)
+            self.emit_goal(session)
+            if decision.message:
+                session.emit(
+                    "notification.show", {"text": decision.message, "level": "info", "kind": "info", "key": "goal"}
+                )
+            if not decision.should_continue or not decision.prompt:
+                return
+            prompt = decision.prompt
+
+    async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
+        """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
         self._ensure_router(session.stored.model or None)
         assert self.router is not None
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
         reliability = await self._reliability_for(session)
+        await self.mcp.ensure_started()
         loop = AgentLoop(
             self.router,
-            system_prompt=session.system_prompt,
+            system_prompt=build_system_prompt(
+                session.system_prompt,
+                cwd=session.perms.cwd,
+                config=self.config,
+                session_meta=session.stored.meta,
+                mcp=self.mcp,
+            ),
             max_turns=self.config.max_turns,
             headless=False,
             on_event=self._on_router_event,
@@ -710,6 +760,8 @@ class GatewayServer:
             session=session.session_id,
             background=session.background,
         )
+        register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
+        register_mcp_tools(loop.tools, self.mcp)
         session.loop = loop
 
         config = self.config
@@ -778,6 +830,7 @@ class GatewayServer:
              "state": session.state},
         )
         session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+        return status, final_text
 
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
@@ -903,6 +956,87 @@ class GatewayServer:
             return target
 
         return approve_plan
+
+    # ── services for command handlers ─────────────────────────────────
+
+    async def clarify(self, question: str, choices: list[str], session_id: str | None) -> dict[str, Any]:
+        """Ask the client a multiple-choice question (``clarify`` server request)."""
+        return await self._ask_client("clarify", {"question": question, "choices": choices}, session_id or "")
+
+    def apply_file_config(self, cwd: str | Path | None = None) -> None:
+        """Re-read config files into the live settings (only keys present in a file are replaced)."""
+        base = Path(cwd) if cwd else Path.cwd()
+        fresh = load_config(project_dir=base)
+        keys: set[str] = set()
+        for path in (_user_cfg(), _proj_cfg(base)):
+            try:
+                keys |= set(confio.read_yaml(path))
+            except confio.ConfigError:
+                continue
+        for key in keys & set(Settings.model_fields):
+            setattr(self.config, key, getattr(fresh, key))
+        if "providers" in keys:
+            self.router = None
+        self.mcp.configure(self.config.mcp.servers)
+
+    def activate_session(self, session_id: str) -> LiveSession | None:
+        stored = self.store.get(session_id)
+        if stored is None:
+            return None
+        live = self.live_for(stored)
+        self.session = live  # attaches the requesting client (setter)
+        live.emit("session.info", live.live_info())
+        return live
+
+    def _router_for(self, key: str | None) -> Router:
+        """A throwaway-cache router for one-shot calls (review, goal judge), independent of the turn router."""
+        key = key or self.config.default_model
+        cache: dict[str, Router] = self.__dict__.setdefault("_oneshot_routers", {})
+        if key not in cache:
+            if not self.providers:
+                self.providers = make_providers(self.config.providers)
+            chain = build_chain(self.providers, _resolve_model_specs(self.config, key))
+            cache[key] = Router(chain, cooldowns=self.cooldowns, on_event=self._on_router_event)
+        return cache[key]
+
+    async def oneshot(
+        self, system: str, user: str, *, model_key: str | None = None, max_tokens: int = 2048
+    ) -> str:
+        """Sub-turn: one tool-less completion through the router; returns the text."""
+        router = self._router_for(model_key)
+        msg = await router.complete(
+            [Message(role="system", content=system), Message(role="user", content=user)],
+            [],
+            model=model_key,
+            max_tokens=max_tokens,
+        )
+        return msg.content or ""
+
+    def _goal_completer(self, session: LiveSession) -> Any:
+        async def complete(system: str, user: str) -> str:
+            return await self.oneshot(system, user, model_key=self.config.goal.judge_model, max_tokens=512)
+
+        return complete
+
+    def goal_manager(self, session: LiveSession) -> GoalManager:
+        def load() -> dict[str, Any] | None:
+            return session.stored.meta.get("goal")
+
+        def save(state: dict[str, Any] | None) -> None:
+            if state is None:
+                session.stored.meta.pop("goal", None)
+            else:
+                session.stored.meta["goal"] = state
+            self.store.save(session.stored)
+
+        return GoalManager(load, save, default_max_turns=self.config.goal.max_turns)
+
+    def emit_goal(self, session: LiveSession) -> None:
+        """Push the goal snapshot to the TUI goal bar (``session.control.update``)."""
+        session.control["goal"] = self.goal_manager(session).snapshot() or ""
+        session.control["revision"] += 1
+        session.control["updated_at"] = time.time()
+        session.emit("session.control.update", {"control": dict(session.control)})
 
     # ── commands ──────────────────────────────────────────────────────
 
@@ -1199,11 +1333,10 @@ async def _command_dispatch(server: GatewayServer, params: dict[str, Any]) -> di
 
 
 async def _slash_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    command = str(_require(params, "command")).strip()
+    # The TUI sends the command without its leading slash ("model foo"); accept both.
+    command = str(_require(params, "command")).strip().lstrip("/")
     session_id = params.get("session_id")
-    if not command.startswith("/"):
-        return {"type": "send", "text": command}
-    parts = command[1:].split(None, 1)
+    parts = command.split(None, 1)
     name, arg = parts[0], parts[1] if len(parts) > 1 else ""
     return await server.dispatch_command(name, arg, session_id)
 
@@ -1260,7 +1393,7 @@ async def _session_mode_set(server: GatewayServer, params: dict[str, Any]) -> di
 async def _config_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     key = str(_require(params, "key"))
     if key == "full":
-        return {"config": server.config.model_dump()}
+        return {"config": redact(server.config.model_dump())}  # provider api_key never goes to clients
     if key == "mtime":
         return {"mtime": 0.0}
     value: Any = server.config

@@ -48,11 +48,15 @@ class CommandRegistry:
         cmd = self.get(name)
         if cmd is None:
             available = ", ".join(f"/{n}" for n in self.names())
-            return {"type": "message", "message": f"Unknown command: /{name}. Available: {available}"}
+            msg = f"Unknown command: /{name}. Available: {available}"
+            return {"type": "message", "message": msg, "output": msg}
         try:
             result = await cmd.handle(ctx, session_id, arg.strip())
         except Exception as e:  # noqa: BLE001 - surface as chat text, never crash the gateway
-            return {"type": "message", "message": f"/{cmd.name} failed: {e}"}
+            msg = f"/{cmd.name} failed: {e}"
+            return {"type": "message", "message": msg, "output": msg}
         if not isinstance(result, dict) or "type" not in result:
-            return {"type": "message", "message": str(result)}
+            return {"type": "message", "message": str(result), "output": str(result)}
+        if result["type"] == "message":
+            result.setdefault("output", result.get("message", ""))  # slash.exec clients render `output`
         return result
