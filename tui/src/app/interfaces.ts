@@ -265,6 +265,7 @@ export interface InputHandlerActions {
   dispatchSubmission: (full: string) => void
   guardBusySessionSwitch: (what?: string) => boolean
   newSession: (msg?: string, title?: string) => void
+  resumeById?: (id: string) => void
   sys: (text: string) => void
 }
 

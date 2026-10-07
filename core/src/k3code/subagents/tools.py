@@ -8,7 +8,9 @@ from k3code.providers.types import ToolSpec
 from k3code.subagents.runner import DepthLimit
 
 
-def register_task_tools(reg: Any, server: Any, parent: Any, *, depth: int = 1, parent_child_id: str | None = None) -> None:
+def register_task_tools(
+    reg: Any, server: Any, parent: Any, *, depth: int = 1, parent_child_id: str | None = None
+) -> None:
     """Register ``task``/``task_result`` on ``reg``. ``depth`` is the depth a child spawned here would have."""
     mgr = server.subagents
 
@@ -28,7 +30,8 @@ def register_task_tools(reg: Any, server: Any, parent: Any, *, depth: int = 1, p
         except ValueError as e:
             return {"error": str(e)}
         if arguments.get("background"):
-            return {"content": f"Started sub-agent {h.id} in the background. Poll with task_result(id=\"{h.id}\")."}
+            return {"content": (
+                f"Started sub-agent {h.id} in the background. Poll with task_result(id=\"{h.id}\").")}
         await mgr.wait(h)
         return {"content": h.render()}
 
@@ -55,7 +58,7 @@ def register_task_tools(reg: Any, server: Any, parent: Any, *, depth: int = 1, p
                 "type": "object",
                 "properties": {
                     "description": {"type": "string", "description": "3-8 word label"},
-                    "prompt": {"type": "string", "description": "Everything the sub-agent needs; it has no other context"},
+                    "prompt": {"type": "string", "description": "Everything the sub-agent needs; no other context"},
                     "agent_type": {"type": "string"},
                     "tier": {"type": "string", "enum": ["main", "strong", "cheap", "fast"]},
                     "isolation": {"type": "string", "enum": ["none", "worktree"]},
@@ -73,7 +76,7 @@ def register_task_tools(reg: Any, server: Any, parent: Any, *, depth: int = 1, p
             description="Result (or progress) of a background sub-agent started with task(background=true).",
             parameters={
                 "type": "object",
-                "properties": {"id": {"type": "string"}, "wait": {"type": "boolean", "description": "block until done"}},
+                "properties": {"id": {"type": "string"}, "wait": {"type": "boolean"}},
                 "required": ["id"],
             },
             side_effect=False,

@@ -5,11 +5,11 @@ from __future__ import annotations
 import subprocess
 
 import pytest
-from m1cmd_helpers import git_repo
-from test_autonomy_gateway import call, events, make, models_called, run_turn, start
 
 from k3code.subagents import DepthLimit
 from k3code.subagents.types import load_agent_types, parse_agent_md
+from m1cmd_helpers import git_repo
+from test_autonomy_gateway import call, events, make, models_called, run_turn, start
 
 NO_GATE = {"autonomy": {"plan_first": False, "proposals": False}}
 
@@ -173,10 +173,12 @@ async def test_children_get_own_reliability_and_do_not_share_parents(tmp_path, m
 def test_agent_type_files_and_override(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / "agents").mkdir(parents=True)
-    (home / "agents" / "scribe.md").write_text("---\nname: scribe\ndescription: writes docs\ntools: read, write\ntier: cheap\n---\nWrite docs.\n")
+    scribe = "---\nname: scribe\ndescription: writes docs\ntools: read, write\ntier: cheap\n---\nWrite docs.\n"
+    (home / "agents" / "scribe.md").write_text(scribe)
     proj = tmp_path / "proj"
     (proj / ".k3code" / "agents").mkdir(parents=True)
-    (proj / ".k3code" / "agents" / "explorer.md").write_text("---\nname: explorer\ntools: read\n---\nProject explorer.\n")
+    override = "---\nname: explorer\ntools: read\n---\nProject explorer.\n"
+    (proj / ".k3code" / "agents" / "explorer.md").write_text(override)
     types = load_agent_types(proj, home)
     assert {"explorer", "worker", "reviewer", "planner", "scribe"} <= set(types)
     assert types["scribe"].tools == ["read", "write"] and types["scribe"].tier == "cheap"

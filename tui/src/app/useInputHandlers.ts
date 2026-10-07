@@ -548,8 +548,21 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return
     }
 
-    // TODO(M2): Ctrl+B should background a running foreground turn (/bg semantics); the gateway
-    // contract has no foreground→background handoff yet (only prompt.background for new tasks).
+    // Ctrl+B = /bg: hand the running turn to a background session and continue in a fresh one.
+    if (isCtrl(key, ch, 'b') && !key.meta && !key.shift) {
+      if (!live.busy || !live.sid) {
+        return void actions.sys('nothing is running to send to the background (use /bg <prompt>)')
+      }
+
+      return void gateway
+        .rpc<{ new_session_id?: string }>('prompt.background', { session_id: live.sid })
+        .then(r => {
+          if (r?.new_session_id) {
+            actions.resumeById?.(r.new_session_id)
+            actions.sys('turn sent to the background; it appears in the agent strip')
+          }
+        })
+    }
 
     if (key.upArrow && !cState.inputBuf.length) {
       const inputSel = getInputSelection()

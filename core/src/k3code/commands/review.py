@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from k3code.artifacts import write_artifact_file
 from k3code.commands import CommandDef
 from k3code.commands._util import reply, session_cwd, split_args
 from k3code.goals import _extract_json_object
@@ -151,4 +152,8 @@ class ReviewCommand(CommandDef):
         except ValueError as e:
             return reply(f"Review failed: {e}")
         out = render_findings(result, desc) + ("\n(input truncated)" if truncated else "")
+        home = getattr(ctx, "_home", None)
+        if home is not None and getattr(ctx, "artifacts", None) is not None:
+            write_artifact_file(ctx, "review", home() / "artifacts" / "review", f"review {desc}", out,
+                                session=session_id or "")
         return reply(out, review=result)

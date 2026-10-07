@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from k3code.artifacts import write_artifact_file
 from k3code.autonomy import advisor, autonomy_cfg
 from k3code.autonomy import preview as preview_mod
 from k3code.autonomy.proposals import format_proposals
@@ -84,6 +85,8 @@ class PreviewCommand(CommandDef):
         except ChainExhausted as e:  # e.g. "all providers rate-limited until HH:MM"
             return _msg(f"Preview unavailable: {e}")
         live.stored.meta["preview_task"] = arg
+        write_artifact_file(ctx, "preview", ctx._home() / "artifacts" / "preview", f"preview {arg}", text,
+                            session=live.session_id)
         live.messages = [
             *live.messages,
             {"role": "user", "content": f"/preview {arg}"},

@@ -32,6 +32,7 @@ from typing import Any
 
 from k3code import confio
 from k3code.agent.loop import AgentLoop, ApprovalResult
+from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, autonomy_cfg
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.commands import CommandRegistry
@@ -254,6 +255,7 @@ class GatewayServer:
         self.safe_mode_notice = ""
         self._client_seq = 0
         self.usage = UsageDB(self._home() / "usage.db")
+        self.artifacts = ArtifactStore(self._home() / "artifacts.db")
         self._tiers: TierRouters | None = None
         self._side_tasks: set[asyncio.Task[Any]] = set()  # fire-and-forget work (titles)
         #: (provider, model) of the most recent router attempt on any task (side calls read it).
@@ -1211,6 +1213,79 @@ class GatewayServer:
             self._running = False
         return result
 
+    # ── background sessions (/bg, Ctrl+B) ─────────────────────────────
+
+    def _fresh_session_like(self, src: LiveSession, *, background: bool = False) -> LiveSession:
+        """A new session with ``src``'s cwd, model, permission mode and add-dirs."""
+        stored = self.store.create(model=src.stored.model or self.config.default_model,
+                                   provider=src.stored.provider or "", cwd=src.stored.cwd or str(Path.cwd()))
+        stored.meta["mode"] = src.perms.mode.value
+        stored.meta["add_dirs"] = list(src.perms.add_dirs)
+        if background:
+            stored.meta["background"] = True
+            stored.meta["origin_session"] = src.session_id
+        self.store.save(stored)
+        live = LiveSession(stored.session_id, stored, self)
+        live.reasoning_effort = src.reasoning_effort
+        self.live[live.session_id] = live
+        return live
+
+    def start_background(self, origin: LiveSession, prompt: str) -> LiveSession:
+        """``/bg <prompt>``: run ``prompt`` in a new background session; notify ``origin`` when it ends."""
+        if self.background_paused:
+            raise _InvalidParams("background work is paused (restart-storm safe mode); resume with /daemon resume")
+        live = self._fresh_session_like(origin, background=True)
+        live.stored.title = live.stored.title or " ".join(prompt.split())[:60]
+        self.store.save(live.stored)
+        live.turn_task = asyncio.get_running_loop().create_task(self._run_turn(live, prompt))
+        self._watch_background(live, origin.session_id)
+        return live
+
+    def background_current(self, session: LiveSession, client: Client | None) -> LiveSession:
+        """Ctrl+B: the running turn keeps going as a background session; the client gets a fresh foreground one."""
+        session.background = True
+        session.stored.meta["background"] = True
+        session.stored.meta["origin_session"] = session.session_id
+        if session.loop is not None:
+            session.loop.background = True  # bash is sandboxed from now on
+        self.store.save(session.stored)
+        fresh = self._fresh_session_like(session)
+        if client is not None:
+            self.attach(client, fresh)
+        session.emit("session.info", session.live_info())
+        if session.turn_task is not None:
+            self._watch_background(session, fresh.session_id)
+        return fresh
+
+    def _watch_background(self, live: LiveSession, notify_sid: str) -> None:
+        """Tell ``notify_sid``'s clients when the background session finishes or needs input."""
+        task = live.turn_task
+        if task is None:
+            return
+
+        def done(t: asyncio.Task[Any]) -> None:
+            title = live.stored.title or live.session_id[:8]
+            if t.cancelled():
+                text, level = f"Background session '{title}' was stopped.", "warning"
+            elif live.needs_input:
+                text, level = f"Background session '{title}' needs your input.", "warning"
+            elif t.exception() is not None:
+                text, level = f"Background session '{title}' failed: {t.exception()}", "error"
+            else:
+                last = next((m.get("content") for m in reversed(live.messages) if m.get("role") == "assistant"), "")
+                text, level = f"Background session '{title}' finished. {str(last or '')[:160]}".strip(), "info"
+            target = self.live.get(notify_sid)
+            payload = {"text": text, "level": level, "kind": "background", "key": f"bg-{live.session_id}",
+                       "session_id": live.session_id}
+            if target is not None:
+                target.emit("notification.show", payload, importance="essential")
+            else:
+                self.emit("notification.show", payload, importance="essential")
+            self.emit("session.background_done", {"session_id": live.session_id, "state": live.state,
+                                                  "origin_session": notify_sid}, importance="essential")
+
+        task.add_done_callback(done)
+
     async def interrupt_turn(self, session_id: str | None = None) -> bool:
         """Interrupt the running turn (session.interrupt, /stop)."""
         session = self._session_for(session_id)
@@ -1472,6 +1547,22 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     return {"turn_id": session.turn_task.get_name(), "status": "streaming"}
 
 
+async def _prompt_background(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``/bg``/Ctrl+B. With ``text``: new background session. Without: hand the running turn off."""
+    session = server._session_for(params.get("session_id")) or server.session
+    if session is None:
+        raise _InvalidParams("no active session")
+    text = str(params.get("text") or "").strip()
+    if text:
+        live = server.start_background(session, text)
+        return {"session_id": live.session_id, "status": "started", "info": live.live_info()}
+    if not session.streaming or session.turn_task is None or session.turn_task.done():
+        raise _InvalidParams("nothing is running in this session; give a prompt: /bg <prompt>")
+    fresh = server.background_current(session, _ctx_client.get())
+    return {"session_id": session.session_id, "new_session_id": fresh.session_id, "status": "backgrounded",
+            "info": fresh.live_info()}
+
+
 async def _subagent_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     sid = params.get("session_id") or (server.session.session_id if server.session else "")
     rows = [
@@ -1637,6 +1728,7 @@ _HANDLERS: dict[str, Any] = {
     "session.mode.cycle": _session_mode_cycle,
     "session.mode.set": _session_mode_set,
     "prompt.submit": _prompt_submit,
+    "prompt.background": _prompt_background,
     "subagent.list": _subagent_list,
     "subagent.interrupt": _subagent_interrupt,
     "subagent.tail": _subagent_tail,

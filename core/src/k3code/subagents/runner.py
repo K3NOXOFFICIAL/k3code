@@ -92,7 +92,9 @@ class Handle:
             if self.merge == "no_changes":
                 out.append("\n[worktree] no file changes.")
             elif self.merge == "merged":
-                out.append(f"\n[worktree] changes merged into your checkout from branch {self.branch}.\n{self.diff_stat}")
+                out.append(
+                    f"\n[worktree] changes merged into your checkout from branch {self.branch}.\n{self.diff_stat}"
+                )
             elif self.merge == "conflict":
                 out.append(
                     f"\n[worktree] MERGE CONFLICT: not merged. The work is on branch {self.branch} "
@@ -343,7 +345,8 @@ class SubagentManager:
         h.loop = loop
         final = ""
         try:
-            async for ev in loop.run(prompt, max_tokens=server.config.max_tokens, temperature=server.config.temperature):
+            stream = loop.run(prompt, max_tokens=server.config.max_tokens, temperature=server.config.temperature)
+            async for ev in stream:
                 if ev.type == "tool_call" and ev.tool_call:
                     h.tool_count += 1
                     h.last_tool = ev.tool_call.name

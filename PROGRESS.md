@@ -1,7 +1,9 @@
 # PROGRESS (M4b-fanout)
 ## Done
-(nothing yet)
+- subagents/ (types, worktree, runner), task/task_result tools, subagent.* RPCs (tests/test_subagents.py)
+- artifacts registry + /artifacts + producers (tests/test_artifacts.py)
+- /bg, prompt.background, Ctrl+B in TUI (tests/test_bg.py)
 ## In progress
-1. subagents/ (types, worktree, runner) + task/task_result tools
+- fan-out executor
 ## Next
-2. /bg + Ctrl+B  3. artifacts  4. fan-out executor  5. /ultraplan /ultracode  6. /ultraresearch  7. TUI/contract events, VENDOR.toml, REPORT.md
+- /ultraplan /ultracode, /ultraresearch (+web tools), TUI events/contract docs for fanout.*, VENDOR.toml (atomic-agents, pi), vitest, REPORT.md
