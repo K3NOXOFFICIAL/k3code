@@ -256,6 +256,10 @@ async def test_pick_tools_prefers_mcp_search_and_fetch():
         ("timeout", False),
         ("connection timed out", False),
         ("403 Forbidden", False),
+        # the fetch server echoes the URL: its path or host must not read as a status or a DNS failure
+        ("Failed to fetch https://github.com/o/r/issues/503: ReadTimeout()", False),
+        ("Failed to fetch https://dns.google/resolve: timeout", False),
+        ("Failed to fetch https://example.org/x - status code 404", True),
     ],
 )
 async def test_mcp_fetch_errors_are_dead_links_only_when_the_page_is_gone(error, dead):

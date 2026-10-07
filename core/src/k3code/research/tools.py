@@ -304,12 +304,15 @@ _DEAD_TEXT = re.compile(
     r"name or service not known|could not resolve|name resolution|\bdns\b",
     re.IGNORECASE,
 )
+_URL = re.compile(r"https?://\S+")
 
 
 def mcp_fetch_error(text: str) -> RuntimeError:
     """DeadLink when an MCP fetch error names a missing page or a failed connection; a plain RuntimeError otherwise
-    (a timeout or a 401/403/429 means the page exists)."""
-    dead = _DEAD_STATUS.search(text) or _DEAD_TEXT.search(text)
+    (a timeout or a 401/403/429 means the page exists). URLs echoed in the message are not matched: the path of
+    .../issues/503 or the host dns.google is not a status or a DNS failure."""
+    bare = _URL.sub(" ", text)
+    dead = _DEAD_STATUS.search(bare) or _DEAD_TEXT.search(bare)
     return DeadLink(text[:200]) if dead else RuntimeError(text[:200])
 
 
