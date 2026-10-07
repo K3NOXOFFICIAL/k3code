@@ -13,7 +13,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import chaoslib as cl  # noqa: E402
-from lib import REPO, emit, live_backend, live_providers_yaml, run, tail  # noqa: E402
+from lib import OMNI_AGENT_MODEL, REPO, emit, live_backend, live_providers_yaml, run, tail  # noqa: E402
 
 M = "M0"
 START = float(os.environ.get("EXIT_RUN_START") or time.time())
@@ -68,7 +68,7 @@ def headless_live() -> None:
     proj.mkdir(parents=True)
     (proj / "app.py").write_text('def greet():\n    return "hello"\n\nprint(greet())\n')
     (home / "config.yaml").write_text(
-        live_providers_yaml(backend, ["auto/coding-manual", "auto/best-coding"], "auto/coding-cheap"))
+        live_providers_yaml(backend, OMNI_AGENT_MODEL, "auto/coding-cheap"))
     rc, out = run([K3, "-p", "Read app.py, edit greet() to return 'hello, k3', then run it with bash as "
                    "`python3 app.py > out.txt` and tell me the output.", "--permission", "yolo"],
                   cwd=proj, env=base_env(home), timeout=420)

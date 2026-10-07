@@ -54,7 +54,7 @@ def live_backend() -> dict:
     """
     if os.environ.get("K3_ALLOW_OMNIROUTE") == "1":
         ok, detail = omniroute_quota()
-        return {"kind": "omniroute", "ok": ok, "detail": detail, "label": "live OmniRoute auto/coding-*"}
+        return {"kind": "omniroute", "ok": ok, "detail": detail, "label": f"live OmniRoute {OMNI_AGENT_MODEL} (cheap tier auto/coding-cheap)"}
     import shutil
 
     path = shutil.which("claude")
@@ -70,7 +70,10 @@ def live_backend() -> dict:
             "detail": "Claude Code login ok" if logged else f"Claude Code is not logged in ({tail(out, 1)})"}
 
 
-def live_providers_yaml(backend: dict, omni_default: str | list[str] = "auto/coding-cheap",
+OMNI_AGENT_MODEL = "the owner's personal combo"  # owner decision 2026-10-07: agents run on this OmniRoute combo
+
+
+def live_providers_yaml(backend: dict, omni_default: str | list[str] = OMNI_AGENT_MODEL,
                         omni_cheap: str = "auto/coding-cheap") -> str:
     """The `providers:` block of a k3code config for the live backend (no secrets, only the key variable name)."""
     if backend["kind"] == "omniroute":
