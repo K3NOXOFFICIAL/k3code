@@ -158,3 +158,19 @@ async def test_active_list_reports_automation_counts(tmp_path, monkeypatch):
     res = (await rpc(server, "session.active_list"))["result"]
     assert res["automation"]["loops"] == 1 and res["automation"]["jobs"] == 1 and res["automation"]["active"] == 2
     await eng.stop()
+
+
+async def test_finished_cron_sessions_release_resources(tmp_path, monkeypatch):
+    from k3code.automation import server_runner
+
+    monkeypatch.setattr(server_runner, "KEEP_FINISHED_RUNS", 2)
+    server, provider = make_server(tmp_path, monkeypatch, ["ok"])
+    eng = await engine_for(server, FakeClock())
+    for i in range(4):
+        res = await eng.runner.run_prompt(f"job {i}", name="cron: t")
+        assert res.status == "completed"
+    runs = [s for s in server.live.values() if s.stored.meta.get("origin") == "automation"]
+    assert len(runs) == 2  # older ones evicted from memory...
+    assert len(server.store.list(limit=50)) >= 4  # ...but still stored
+    assert all(s.reliability is None or not s.reliability._started for s in runs)
+    await eng.stop()

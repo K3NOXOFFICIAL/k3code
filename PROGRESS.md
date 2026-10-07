@@ -1,11 +1,8 @@
 # PROGRESS (M4c automation)
 
 ## Done
-- automation/: clock (FakeClock), cronexpr, store (automation.db), runner seam, loops, scheduler (+retry_policy), automations (+triggers, webhook), suggestions, engine, server_runner, nlcron
-- gateway hooks (state completed/failed, session_event, last_user_activity, active_list automation counts)
-- commands /loop /schedule /automations; CLI `k3code schedule …`, `k3code slash …`
-- TUI: strip maps needs_input/failed/completed; ⟳ badge (automationCount)
-- tests (test_auto_*.py), VENDOR.toml port entries; full suite 373 passed, ruff clean, npm run build ok
+Everything in the task: loops, cron jobs with reliability rules, automations + triggers + suggestions, commands, CLI, TUI states and ⟳ badge, tests, VENDOR entries, live acceptance. See REPORT.md.
 
-## Next
-- final live acceptance run (clean daemon), REPORT.md
+## Next (open TODOs)
+- Route loop ticks to the cheap tier once routing/tiers.py (M4a) is merged.
+- See REPORT.md "Open TODOs".

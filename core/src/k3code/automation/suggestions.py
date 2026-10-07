@@ -115,12 +115,13 @@ class Suggestions:
         return self.pending()
 
     def get(self, ref: str) -> dict[str, Any] | None:
-        row = self.db.find("suggestions", ref)
-        if row is not None:
-            return row
+        """By 1-based pending index (checked first: ``1`` must never be read as an id prefix), id/prefix, or title."""
         pending = self.pending()
         if ref.isdigit() and 1 <= int(ref) <= len(pending):
             return pending[int(ref) - 1]
+        row = self.db.find("suggestions", ref)
+        if row is not None:
+            return row
         return next((s for s in self.db.rows("suggestions") if s["title"].lower() == ref.lower()), None)
 
     def dismiss(self, ref: str) -> bool:

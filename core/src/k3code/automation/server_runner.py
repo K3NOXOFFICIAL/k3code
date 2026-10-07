@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     from k3code.gateway.server import GatewayServer
 
 _STATUS = {"done": "completed", "error": "failed", "needs_input": "needs_input", "interrupted": "interrupted"}
+KEEP_FINISHED_RUNS = 20  # finished unattended sessions kept live (visible in the strip)
 BUSY_POLL_S = 1.0
 SHELL_TIMEOUT_S = 600.0
 
@@ -97,6 +99,8 @@ class ServerRunner:
         prev_background = live.background
         live.background = True
         live.extra_tools = [_schedule_next_installer(tick)] if tick is not None else []
+        # TODO(M4a): loop ticks (existing session, no ``model``) should run on the cheap tier via the ``loop_tick``
+        # task kind in routing/tiers.py; that module is not merged yet, so ticks use the session's main model.
         if model and not existing:
             live.stored.model = model
         task = asyncio.get_running_loop().create_task(srv._run_turn(live, prompt), name=f"auto-{live.session_id}")
@@ -112,6 +116,8 @@ class ServerRunner:
         finally:
             live.background = prev_background if existing else True
             live.extra_tools = []
+            if not existing:
+                await self._release(live)
             srv.broadcast_active_list()
         result = RunResult(
             status=_STATUS.get(status, "failed"),
@@ -123,6 +129,21 @@ class ServerRunner:
         if result.status == "failed":
             result.failure_kind, result.retry_after = classify_failure(live.last_error or text, live.last_exc)
         return result
+
+    async def _release(self, live: Any) -> None:
+        """A finished unattended session must not keep a netwatch loop alive, and ``server.live`` must not grow
+        without bound with a ``* * * * *`` job: stop its reliability bundle and keep only the newest finished runs."""
+        if live.reliability is not None:
+            with contextlib.suppress(Exception):
+                await live.reliability.stop()  # re-arms on the next turn
+        finished = [
+            s
+            for s in self.server.live.values()
+            if s.stored.meta.get("origin") == self.origin and not s.streaming and s.pending_approval is None
+        ]
+        finished.sort(key=lambda s: s.stored.updated_at)
+        for old in finished[: max(0, len(finished) - KEEP_FINISHED_RUNS)]:
+            self.server.live.pop(old.session_id, None)  # stays in the session store, resumable by id
 
     async def run_shell(self, command: str, cwd: str) -> tuple[int, str]:
         """Run a shell command inside the bwrap sandbox (unsandboxed with a note when bwrap is unusable)."""
