@@ -14,8 +14,18 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/config"
 )
 
+// k3: PreHandler hook for k3keys keymap
+var PreHandler func(tea.Msg, *app.OS) (bool, tea.Model, tea.Cmd)
+
 // HandleInput is the main input coordinator that routes messages to appropriate handlers
 func HandleInput(msg tea.Msg, o *app.OS) (tea.Model, tea.Cmd) {
+	// k3: PreHandler hook for k3keys keymap
+	if PreHandler != nil {
+		if ok, m, c := PreHandler(msg, o); ok {
+			return m, c
+		}
+	}
+
 	var result tea.Model
 	var cmd tea.Cmd
 
