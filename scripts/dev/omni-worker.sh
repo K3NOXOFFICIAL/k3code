@@ -110,6 +110,9 @@ while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
   [ "$USE_CLAUDE" = 1 ] || wait_online
   if [ "$USE_CLAUDE" = 1 ]; then
     MODEL=$CLAUDE_FALLBACK_MODEL; FB=(); SET=("${LEAN[@]}")   # default settings = native Claude account
+    # Never resume a session written by other models on Claude: foreign thinking blocks fail
+    # signature checks (HTTP 400). Start fresh and continue from the worktree state instead.
+    SESSION=""; PROMPT=$(resume_prompt)
   else
     MODEL=${MODEL_LIST[$midx]}
     FALLBACK=${MODEL_LIST[$(( (midx + 1) % ${#MODEL_LIST[@]} ))]}
@@ -152,8 +155,8 @@ except Exception: print("")')
   if printf '%s' "$json" | python3 -c 'import sys,json,re
 try: r=json.load(sys.stdin).get("result") or ""
 except Exception: r=""
-sys.exit(0 if re.search(r"prompt is too long|compaction failed|context length exceeded|maximum context", r, re.I) else 1)'; then
-    echo "$(date -Is) context exhausted — next attempt starts a fresh session" >> "$RUNS/driver.log"
+sys.exit(0 if re.search(r"prompt is too long|compaction failed|context length exceeded|maximum context|invalid .?signature.? in .?thinking|blocks with cache_control", r, re.I) else 1)'; then
+    echo "$(date -Is) context exhausted or session incompatible with model — next attempt starts a fresh session" >> "$RUNS/driver.log"
     SESSION=""
     PROMPT=$(resume_prompt)
   fi
