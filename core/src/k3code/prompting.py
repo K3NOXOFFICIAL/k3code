@@ -41,4 +41,8 @@ def build_system_prompt(
         parts.append(skills)
     if mcp is not None and (m := mcp_prompt(mcp)):
         parts.append(m)
+    from k3code.learning.optimizer import overlay_prompt
+
+    if overlay := overlay_prompt():
+        parts.append(overlay)
     return "\n\n".join(parts) + "\n"
