@@ -101,6 +101,8 @@ export interface ApprovalReq {
   choices?: string[]
   command: string
   description: string
+  /** Per-choice label overrides (e.g. exit_plan: once → "Approve plan"). */
+  labels?: Record<string, string>
   /** Server→client request id; the answer is the response frame for it. */
   requestId: string
   smartDenied?: boolean

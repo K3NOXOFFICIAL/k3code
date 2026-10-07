@@ -5,7 +5,7 @@ import { useEffect, useRef } from 'react'
 import { DASHBOARD_TUI_MODE } from '../config/env.js'
 import { DOUBLE_ESC_MS, TYPING_IDLE_MS } from '../config/timing.js'
 import { applyCompletion } from '../domain/slash.js'
-import type { ConfigSetResponse, VoiceRecordResponse } from '../gatewayTypes.js'
+import type { VoiceRecordResponse } from '../gatewayTypes.js'
 import { isAction, isCopyShortcut, isMac, isMacActionFallback, isVoiceToggleKey } from '../lib/platform.js'
 import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionWheel.js'
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
@@ -751,25 +751,17 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       })
     }
 
-    // shift-tab flips yolo without spending a turn (claude-code parity)
+    // shift-tab cycles the permission mode: default → accept-edits → plan → auto
+    // (the gateway answers with the new mode and emits session.info for the status line).
     if (key.shift && key.tab && !cState.completions.length) {
       if (!live.sid) {
-        return void actions.sys('yolo needs an active session')
+        return void actions.sys('permission mode needs an active session')
       }
 
-      // gateway.rpc swallows errors with its own sys() message and resolves to null,
-      // so we only speak when it came back with a real shape. null = rpc already spoke.
-      return void gateway.rpc<ConfigSetResponse>('config.set', { key: 'yolo', session_id: live.sid }).then(r => {
-        if (r?.value === '1') {
-          return actions.sys('yolo on')
-        }
-
-        if (r?.value === '0') {
-          return actions.sys('yolo off')
-        }
-
-        if (r) {
-          actions.sys('failed to toggle yolo')
+      // gateway.rpc swallows errors with its own sys() message and resolves to null.
+      return void gateway.rpc<{ mode?: string }>('session.mode.cycle', { session_id: live.sid }).then(r => {
+        if (r?.mode) {
+          actions.sys(`mode: ${r.mode}`)
         }
       })
     }

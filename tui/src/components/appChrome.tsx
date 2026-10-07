@@ -506,6 +506,7 @@ export function StatusRule({
   statusBarFields = null,
   statusColor,
   model,
+  mode,
   modelFast,
   modelReasoningEffort,
   modelReasoningEffortWire,
@@ -728,6 +729,12 @@ export function StatusRule({
             {' │ '}
             {modelText}
           </Text>
+          {mode ? (
+            <Text color={mode === 'default' ? t.color.muted : t.color.warn} wrap="truncate-end">
+              {' │ '}
+              {mode}
+            </Text>
+          ) : null}
           {ctxLabel ? (
             <Text color={t.color.muted} wrap="truncate-end">
               {' │ '}
@@ -958,6 +965,8 @@ interface StatusRuleProps {
   cols: number
   cwdLabel: string
   model: string
+  // Permission mode (default | accept-edits | plan | auto | yolo) — Shift+Tab cycles it.
+  mode?: string
   modelFast?: boolean
   modelReasoningEffort?: string
   modelReasoningEffortWire?: string
