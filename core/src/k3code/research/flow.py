@@ -47,8 +47,15 @@ class ResearchUnavailable(Exception):
     """No search tool is reachable; the message says what to configure."""
 
 
+#: Counts that must stay positive: sources_per_topic <= 0 spilled every hit, so the run reported "no results" anyway.
+_AT_LEAST_ONE = ("sub_questions", "results_per_query", "sources_per_topic", "min_sources")
+
+
 def research_cfg(config: Any) -> dict[str, Any]:
-    return {**DEFAULTS, **dict(getattr(config, "research", None) or {})}
+    cfg = {**DEFAULTS, **dict(getattr(config, "research", None) or {})}
+    for key in _AT_LEAST_ONE:
+        cfg[key] = max(1, int(cfg[key]))
+    return cfg
 
 
 def loose_json(text: str) -> Any:

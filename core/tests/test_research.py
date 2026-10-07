@@ -499,3 +499,37 @@ async def test_dropped_sources_are_replaced_from_spare_hits(tmp_path, monkeypatc
     urls = {s.url for s in res.state.sources}
     assert len(urls) >= 6, urls
     assert not any(u.endswith(("/0", "/1", "/2", "/3")) for u in urls)
+
+
+def test_research_counts_are_clamped_to_at_least_one():
+    """sources_per_topic 0 made every hit spill, so a run with hits raised "the searches returned no results"."""
+    from k3code.research.flow import research_cfg
+
+    cfg = research_cfg(SimpleNamespace(research={"sources_per_topic": 0, "min_sources": -2, "sub_questions": "0",
+                                                 "results_per_query": 0}))
+    assert {k: cfg[k] for k in ("sources_per_topic", "min_sources", "sub_questions", "results_per_query")} == {
+        "sources_per_topic": 1, "min_sources": 1, "sub_questions": 1, "results_per_query": 1}
+    assert research_cfg(SimpleNamespace(research={}))["sources_per_topic"] == 4  # unset keys keep their defaults
+
+
+async def test_sources_per_topic_zero_still_produces_sources(tmp_path, monkeypatch):
+    from k3code.research.tools import Hit, ResearchTools
+
+    class Tools(ResearchTools):
+        name = "stub"
+
+        async def search(self, query, n=5):
+            return [Hit(f"t{i}", f"https://example.org/{i}", snippet=f"snippet {i}") for i in range(3)]
+
+        async def fetch(self, url):
+            return "page", "page text"
+
+    server = make(tmp_path, monkeypatch, [
+        {"type": "text", "match": "Number of sub-topics", "text": '{"sub_topics":[{"name":"A","queries":["a"]}]}'},
+        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+        {"type": "text", "text": "ok"},
+    ], mode="auto", research={"sources_per_topic": 0, "min_sources": 1, "sub_questions": 1})
+    server.research_tools = Tools()
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    res = await server.research.run(server.session, "q", n_sub=1)
+    assert res.state.sources, "sources_per_topic 0 spilled every hit"
