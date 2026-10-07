@@ -87,3 +87,6 @@ Chaos, via the proxy:
 - Every row is PASS, FAIL or PENDING, with concrete evidence and, for PENDING rows, the exact action that would close it.
 - Fix any FAIL that is a bug in k3code and rerun. Mark it FAIL only if it can't be fixed in this task, and explain why.
 - Commit everything, plus a short `REPORT.md`.
+
+## Also fix
+- `/help` lists `/loop` and `/schedule` twice (duplicate registration after the merges): dedupe the registry and add a test that `/help` has no duplicates.
