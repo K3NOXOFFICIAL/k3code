@@ -6,6 +6,9 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -195,20 +198,34 @@ async def _run_repl(
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
 @click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
+@click.option("--repl", is_flag=True, help="Force the legacy line REPL instead of the TUI")
+@click.option(
+    "--stdio",
+    "stdio_flag",
+    is_flag=True,
+    help="(gateway subcommand) serve JSON-RPC 2.0 on stdin/stdout",
+)
 def main(
     prompt: str | None,
     model: str | None,
     permission: str,
     json_output: bool,
     config_dir: Path | None,
+    repl: bool,
+    stdio_flag: bool,
 ) -> None:
     """k3code — terminal coding agent.
 
     Examples:
       k3code -p "create hello.py" --permission yolo
       k3code -p "fix the bug" --json
-      k3code  # starts REPL
+      k3code  # starts the TUI (or the REPL with --repl / non-tty)
     """
+    if stdio_flag:
+        # `k3code gateway --stdio` / `k3code --stdio`: JSON-RPC on stdio.
+        _run_gateway()
+        return
+
     permission_mode = PermissionMode(permission)
 
     # Load config
@@ -220,17 +237,112 @@ def main(
 
     if prompt:
         result = asyncio.run(
-            _run_headless(
-                prompt, model=model, permission_mode=permission_mode, config=config, json_output=json_output
-            )
+            _run_headless(prompt, model=model, permission_mode=permission_mode, config=config, json_output=json_output)
         )
         if json_output and result:
             print(json.dumps(result, ensure_ascii=False))
         sys.exit(0 if result and "error" not in result else 1)
-    else:
+    elif repl or not sys.stdin.isatty() or not sys.stdout.isatty():
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(_run_repl(model=model, permission_mode=permission_mode, config=config))
+    else:
+        _launch_tui(model=model)
+
+
+def _run_gateway() -> None:
+    """Serve the JSON-RPC gateway on stdio (stdout = frames, stderr = logs)."""
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    from k3code.gateway.server import GatewayServer
+
+    async def _serve() -> None:
+        server = GatewayServer()
+        try:
+            await server.serve()
+        finally:
+            await server.close()
+
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(_serve())
+
+
+def _launch_tui(*, model: str | None = None) -> None:
+    """Spawn the built TUI (tui/dist/entry.js) with this process as its gateway."""
+    node = shutil.which("node")
+    repo_root = _find_repo_root()
+    entry = repo_root / "tui" / "dist" / "entry.js" if repo_root else None
+    if node is None or entry is None or not entry.is_file():
+        logger.warning("TUI not available (need node + tui/dist/entry.js); falling back to REPL")
+        config = load_config(project_dir=Path.cwd())
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(_run_repl(model=model, permission_mode=PermissionMode(config.permission_mode), config=config))
+        return
+
+    env = os.environ.copy()
+    # The TUI spawns `K3CODE_GATEWAY_CMD` as its Python gateway.
+    env["K3CODE_GATEWAY_CMD"] = f"{sys.executable} -m k3code.cli gateway --stdio"
+    env.setdefault("K3CODE_LOG_LEVEL", "INFO")
+    if model:
+        env["K3CODE_MODEL"] = model
+    logger.info("launching TUI: %s %s", node, entry)
+    result = subprocess.run([node, str(entry)], env=env, check=False)
+    sys.exit(result.returncode)
+
+
+def _find_repo_root() -> Path | None:
+    """Walk up from cwd for a tui/dist/entry.js (works from the repo or installed)."""
+    here = Path(__file__).resolve()
+    for candidate in (Path.cwd(), *here.parents):
+        if (candidate / "tui" / "dist" / "entry.js").is_file():
+            return candidate
+    return None
+
+
+@click.group(invoke_without_command=True)
+@click.pass_context
+@click.option("-p", "--prompt", help="Headless prompt; omit for TUI/REPL")
+@click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
+@click.option(
+    "--permission",
+    type=click.Choice(["ask", "auto-edit", "yolo"]),
+    default="ask",
+    help="Permission mode (default: ask)",
+)
+@click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
+@click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
+@click.option("--repl", is_flag=True, help="Force the legacy line REPL instead of the TUI")
+def cli(
+    ctx: click.Context,
+    prompt: str | None,
+    model: str | None,
+    permission: str,
+    json_output: bool,
+    config_dir: Path | None,
+    repl: bool,
+) -> None:
+    """k3code — terminal coding agent."""
+    if ctx.invoked_subcommand is None:
+        ctx.invoke(
+            main,
+            prompt=prompt,
+            model=model,
+            permission=permission,
+            json_output=json_output,
+            config_dir=config_dir,
+            repl=repl,
+            stdio_flag=False,
+        )
+
+
+@cli.command("gateway")
+@click.option("--stdio", "stdio_flag", is_flag=True, default=True, help="Serve JSON-RPC 2.0 on stdin/stdout")
+def gateway(stdio_flag: bool) -> None:
+    """Run the JSON-RPC gateway (what the TUI spawns)."""
+    _run_gateway()
 
 
 if __name__ == "__main__":
-    main()
+    cli()
