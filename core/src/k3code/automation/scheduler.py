@@ -152,17 +152,21 @@ class JobScheduler:
             self._wake.clear()
             now = self.clock.now()
             soonest = POLL_S
-            for job in self.db.rows("jobs", "state='active'"):
-                if job["id"] in self._running:
-                    continue
-                manual = bool(job["run_requested"])
-                due_at = job["next_run_at"]
-                if manual or (due_at is not None and due_at <= now):
-                    self._running[job["id"]] = asyncio.get_running_loop().create_task(
-                        self._execute(job["id"], manual), name=f"job-{job['id']}"
-                    )
-                elif due_at is not None:
-                    soonest = min(soonest, due_at - now)
+            try:
+                for job in self.db.rows("jobs", "state='active'"):
+                    if job["id"] in self._running:
+                        continue
+                    manual = bool(job["run_requested"])
+                    due_at = job["next_run_at"]
+                    if manual or (due_at is not None and due_at <= now):
+                        self._running[job["id"]] = asyncio.get_running_loop().create_task(
+                            self._execute(job["id"], manual), name=f"job-{job['id']}"
+                        )
+                    elif due_at is not None:
+                        soonest = min(soonest, due_at - now)
+            except Exception:  # noqa: BLE001 - one bad read ended the task and every cron job with it, silently
+                logger.exception("scheduler pass failed; retrying")
+                soonest = min(soonest, 5.0)
             sleeper = asyncio.ensure_future(self.clock.sleep(max(0.0, soonest)))
             waker = asyncio.ensure_future(self._wake.wait())
             try:

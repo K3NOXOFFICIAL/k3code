@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SEARXNG = "https://<searxng-host>"
 MAX_FETCH_CHARS = 14_000
+MAX_FETCH_BYTES = 2 * 1024 * 1024  # how much of a response body is read at most
 UA = "k3code-research/0.1 (+https://github.com/k3nox/k3code)"
 
 
@@ -113,16 +114,25 @@ async def fetch_page(url: str, *, timeout: float = 20.0, client: httpx.AsyncClie
     own = client is None
     client = client or httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": UA})
     try:
-        r = await client.get(url)
-        r.raise_for_status()
+        # Streamed and capped: client.get() buffered the whole body (a 1 GB download, a never-ending stream) in the
+        # shared daemon before the text was cut to MAX_FETCH_CHARS.
+        async with client.stream("GET", url) as r:
+            r.raise_for_status()
+            ctype = r.headers.get("content-type", "")
+            encoding = r.encoding or "utf-8"
+            buf = bytearray()
+            async for chunk in r.aiter_bytes():
+                buf += chunk
+                if len(buf) >= MAX_FETCH_BYTES:
+                    break
     finally:
         if own:
             await client.aclose()
-    ctype = r.headers.get("content-type", "")
-    if "html" in ctype or r.text.lstrip().lower().startswith(("<!doctype", "<html")):
-        title, text = extract_text(r.text)
+    body = bytes(buf[:MAX_FETCH_BYTES]).decode(encoding, errors="replace")
+    if "html" in ctype or body.lstrip().lower().startswith(("<!doctype", "<html")):
+        title, text = extract_text(body)
     else:
-        title, text = url, r.text
+        title, text = url, body
     return title or url, text[:MAX_FETCH_CHARS]
 
 

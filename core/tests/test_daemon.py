@@ -344,3 +344,47 @@ async def test_in_flight_turn_survives_client_disconnect(tmp_path, monkeypatch):
     b.close()
     server.request_stop()
     await asyncio.wait_for(task, 10)
+
+
+# ── regressions from the long-run audit: one daemon per home ──
+
+
+def test_a_second_daemon_on_the_same_home_is_refused(tmp_path):
+    """Nothing stopped a second `k3code daemon`: it unlinked the live socket and rebound it, leaving the first daemon
+    (sessions, cron, loops) running but unreachable."""
+    import os
+
+    from k3code.daemon import DaemonAlreadyRunning, acquire_instance_lock
+
+    sock = tmp_path / "run" / "gateway.sock"
+    first = acquire_instance_lock(sock)
+    try:
+        with pytest.raises(DaemonAlreadyRunning):
+            acquire_instance_lock(sock)
+        assert (sock.parent / "daemon.lock").read_text().strip() == str(os.getpid())
+    finally:
+        os.close(first)
+    os.close(acquire_instance_lock(sock))  # released: a new daemon can start
+
+
+async def test_start_socket_refuses_a_live_socket_and_stop_leaves_foreign_sockets_alone(tmp_path, monkeypatch):
+    import contextlib
+
+    from m1cmd_helpers import make_server
+
+    one, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    sock = tmp_path / "run" / "gateway.sock"
+    await one.start_socket(sock)
+    two, _ = make_server(tmp_path / "other", monkeypatch, ["ok"])
+    with pytest.raises(RuntimeError, match="another process"):
+        await two.start_socket(sock)
+    assert sock.exists()  # the live one was not unlinked
+    # a socket that was replaced by someone else is not ours to remove on stop
+    sock.unlink()
+    replacement = await asyncio.start_unix_server(lambda r, w: None, path=str(sock))
+    await one.stop_socket()
+    assert sock.exists()
+    replacement.close()
+    with contextlib.suppress(Exception):
+        await one.close()
+        await two.close()

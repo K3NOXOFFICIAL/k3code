@@ -111,8 +111,15 @@ class ServerRunner:
             try:
                 status, text = await task
             except asyncio.CancelledError:
-                task.cancel()
-                raise
+                me = asyncio.current_task()
+                if task.cancelled() and not (me is not None and me.cancelling()):
+                    # /stop (or deleting the session) cancelled the *turn*; this caller is fine. Re-raising took the
+                    # cron job / loop / automation supervisor down with it (next_run_at never advanced, so a cron job
+                    # re-fired at once; a loop task died while its row stayed 'active').
+                    status, text = "interrupted", ""
+                else:
+                    task.cancel()
+                    raise
             except Exception as e:  # noqa: BLE001
                 status, text = "error", str(e)
             finally:

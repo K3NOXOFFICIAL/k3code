@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections.abc import Callable
@@ -103,13 +104,49 @@ class AutomationEngine:
             self._rel.netwatch.subscribe(
                 lambda old, new: self.automations.net_change(old.usable_for_llm, new.usable_for_llm)
             )
+        stale = self.db.interrupt_stale_runs(self.clock.now())
+        if stale:
+            logger.info("%d run(s) were still marked running from before the restart: marked interrupted", stale)
+        self.prune()
+        self._maintenance = asyncio.get_running_loop().create_task(self._maintenance_loop(), name="automation-prune")
         n = self.loops.resume_all()
         self.jobs.start()
         await self.automations.start()
         logger.info("automation engine started (%d loops resumed, %d jobs)", n, self.jobs.active_count())
         self.changed()
 
+    #: Run history is pruned at start and then this often (wall clock).
+    PRUNE_EVERY_S = 6 * 3600.0
+    _maintenance: asyncio.Task[None] | None = None
+
+    def prune(self) -> int:
+        """Drop old run rows and the finished unattended sessions they pointed to; returns the sessions removed."""
+        sids = self.db.prune_runs(self.clock.now())
+        removed = 0
+        store = getattr(self.server, "store", None)
+        live = getattr(self.server, "live", {})
+        for sid in dict.fromkeys(sids):
+            stored = store.get(sid) if store is not None else None
+            if stored is not None and sid not in live and stored.meta.get("origin") == "automation":
+                removed += bool(store.delete(sid))
+        if sids:
+            logger.info("pruned %d old run(s), %d unattended session(s)", len(sids), removed)
+        return removed
+
+    async def _maintenance_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.PRUNE_EVERY_S)
+            try:
+                self.prune()
+            except Exception:  # noqa: BLE001 - housekeeping must never take the engine down
+                logger.exception("automation housekeeping failed")
+
     async def stop(self) -> None:
+        if self._maintenance is not None:
+            self._maintenance.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._maintenance
+            self._maintenance = None
         await self.loops.close()
         await self.jobs.close()
         await self.automations.stop()

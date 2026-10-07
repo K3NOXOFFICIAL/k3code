@@ -129,10 +129,11 @@ class SessionStore:
             meta=json.loads(row[9] or "{}"),
         )
 
-    def list(self, *, limit: int = 50) -> list[StoredSession]:
+    def list(self, *, limit: int = 50, include_automation: bool = True) -> list[StoredSession]:
+        where = "" if include_automation else " WHERE COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
         rows = self._db.execute(
             "SELECT session_id, title, model, provider, cwd, messages, usage, created_at, updated_at"
-            " FROM sessions ORDER BY updated_at DESC LIMIT ?",
+            f" FROM sessions{where} ORDER BY updated_at DESC LIMIT ?",  # noqa: S608
             (max(1, limit),),
         ).fetchall()
         out: list[StoredSession] = []
@@ -178,7 +179,8 @@ class SessionStore:
         return cur.rowcount > 0
 
     def most_recent(self) -> StoredSession | None:
-        rows = self.list(limit=1)
+        """The session to continue: the newest one the user worked in (cron/loop/automation runs are not that)."""
+        rows = self.list(limit=1, include_automation=False)
         return rows[0] if rows else None
 
     def close(self) -> None:

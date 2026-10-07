@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,8 @@ def glob_to_regex(pattern: str) -> re.Pattern[str]:
 
 
 class Trigger:
+    RESTART_BASE_S = 1.0  # first back-off after a crash (doubles up to 60 s)
+
     def __init__(self, spec: dict[str, Any], fire: Fire, clock: Clock, *, cwd: str = "") -> None:
         self.spec, self.fire, self.clock, self.cwd = spec, fire, clock, cwd
         self._task: asyncio.Task[None] | None = None
@@ -60,12 +63,23 @@ class Trigger:
                 await self._task
 
     async def _guarded(self) -> None:
-        try:
-            await self.run()
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001
-            logger.exception("trigger %s crashed", self.spec)
+        """Run the trigger; when it crashes or ends early, start it again with back-off (1 s .. 60 s). A trigger task
+        used to end for good on the first exception (a repo dir missing for a moment) while the automation's row
+        stayed 'active' and silently never fired again."""
+        delay = self.RESTART_BASE_S
+        while not self._stop.is_set():
+            started = time.monotonic()
+            try:
+                await self.run()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("trigger %s crashed; restarting in %.0fs", self.spec, delay)
+            if time.monotonic() - started > 120:
+                delay = self.RESTART_BASE_S  # it ran fine for a while: the next failure starts the ladder over
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
+            delay = min(delay * 2, 60.0)
 
     async def run(self) -> None:
         raise NotImplementedError

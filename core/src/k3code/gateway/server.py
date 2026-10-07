@@ -235,6 +235,23 @@ class LiveSession:
         }
 
 
+def _socket_is_live(path: Path) -> bool:
+    """True when something accepts connections on the Unix socket ``path`` (as opposed to a stale file)."""
+    import socket as _socket
+
+    probe = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        probe.connect(str(path))
+        return True
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
 class Client:
     """One attached JSON-RPC peer (the stdio pipe, or one Unix-socket connection)."""
 
@@ -537,10 +554,13 @@ class GatewayServer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
+            if _socket_is_live(path):
+                raise RuntimeError(f"{path} is served by another process; not taking it over")
             path.unlink()  # stale socket from a crashed daemon
         self._socket_server = await asyncio.start_unix_server(self._on_connect, path=str(path))
         os.chmod(path, 0o600)
         self.socket_path = path
+        self._socket_ino = os.stat(path).st_ino  # so stop_socket only removes the socket this process created
 
     async def stop_socket(self) -> None:
         if self._socket_server is not None:
@@ -557,7 +577,9 @@ class GatewayServer:
                 await asyncio.wait_for(self._socket_server.wait_closed(), timeout=3.0)
             self._socket_server = None
         with contextlib.suppress(Exception):
-            Path(getattr(self, "socket_path", "")).unlink()
+            path = Path(getattr(self, "socket_path", ""))
+            if path.exists() and os.stat(path).st_ino == getattr(self, "_socket_ino", None):
+                path.unlink()
 
     socket_path: Path
 

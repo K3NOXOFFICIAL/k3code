@@ -264,3 +264,27 @@ async def test_pick_tools_ignores_non_web_search_decoys():
     # a generic web search tool is still found when no searxng marker exists
     generic = SimpleNamespace(tools=lambda: [*decoys, tool("brave_search")])
     assert pick_tools(SimpleNamespace(research={}), generic).search_tool.name == "brave_search"
+
+
+async def test_fetch_page_reads_a_capped_prefix_not_the_whole_body():
+    """client.get() buffered the entire response in the shared daemon before truncating the text."""
+    import httpx
+
+    from k3code.research import tools
+
+    served = {"bytes": 0}
+
+    async def body():
+        chunk = b"<p>" + b"x" * 65_000 + b"</p>"
+        for _ in range(2000):  # 130 MB if it were ever read to the end
+            served["bytes"] += len(chunk)
+            yield chunk
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=body())
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        title, text = await tools.fetch_page("https://example.com/huge", client=client)
+    assert len(text) <= tools.MAX_FETCH_CHARS and text.startswith("x")
+    assert served["bytes"] < 6 * tools.MAX_FETCH_BYTES  # stopped reading soon after the cap

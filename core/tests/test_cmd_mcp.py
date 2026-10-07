@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import sys
 from pathlib import Path
 
@@ -24,10 +26,10 @@ async def test_manager_lists_calls_and_searches():
     try:
         await mgr.ensure_started()
         states = {s.name: s for s in mgr.states()}
-        assert states["fake"].status == "connected" and len(states["fake"].tools) == 2
+        assert states["fake"].status == "connected" and len(states["fake"].tools) == 4
         assert states["broken"].status == "failed" and states["broken"].error
         names = sorted(t.qualified for t in mgr.tools())
-        assert names == ["mcp__fake__add", "mcp__fake__echo"]
+        assert names == ["mcp__fake__add", "mcp__fake__die", "mcp__fake__echo", "mcp__fake__sleep"]
         assert qualified_name("my server", "a.b") == "mcp__my_server__a_b"
 
         assert await mgr.call("mcp__fake__echo", {"text": "hi"}) == {"content": "echo:hi"}
@@ -88,8 +90,8 @@ async def test_mcp_command_status_reload_and_turn(tmp_path, monkeypatch):
     server.mcp.configure(server.config.mcp.servers)
     try:
         res = await cmd(server, "/mcp", sid)
-        assert "fake (stdio): connected, 2 tool(s)" in res["output"]
-        assert res["servers"][0]["tools"] == 2
+        assert "fake (stdio): connected, 4 tool(s)" in res["output"]
+        assert res["servers"][0]["tools"] == 4
 
         await submit_and_wait(server, "go")
         assert "mcp__fake__add" in provider.seen[0][0].content  # names in prompt, deferred
@@ -102,3 +104,70 @@ async def test_mcp_command_status_reload_and_turn(tmp_path, monkeypatch):
         assert "Usage" in (await cmd(server, "/mcp bogus", sid))["output"]
     finally:
         await server.close()
+
+
+# ── regressions from the long-run audit: one MCP runner serves every session ──
+
+
+async def test_a_cancelled_call_does_not_kill_the_server_for_everyone():
+    """/stop cancels the caller; the runner then resolved a cancelled future (InvalidStateError), exited, and the stdio
+    subprocess died: every later call from every session failed until `/mcp reload`."""
+    mgr = McpManager({"fake": fake_cfg()})
+    try:
+        await mgr.ensure_started()
+        task = asyncio.create_task(mgr.call("mcp__fake__sleep", {"seconds": 1.0}))
+        await asyncio.sleep(0.3)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(1.2)  # the abandoned call finishes server-side
+        assert (await mgr.call("mcp__fake__echo", {"text": "still alive"})) == {"content": "echo:still alive"}
+        assert [s.status for s in mgr.states()] == ["connected"]
+    finally:
+        await mgr.close()
+
+
+async def test_a_slow_call_does_not_block_other_sessions():
+    mgr = McpManager({"fake": fake_cfg()})
+    try:
+        await mgr.ensure_started()
+        slow = asyncio.create_task(mgr.call("mcp__fake__sleep", {"seconds": 1.5}))
+        await asyncio.sleep(0.2)
+        started = asyncio.get_running_loop().time()
+        assert (await mgr.call("mcp__fake__echo", {"text": "fast"})) == {"content": "echo:fast"}
+        assert asyncio.get_running_loop().time() - started < 1.0  # not queued behind the sleeping call
+        assert (await slow) == {"content": "slept"}
+    finally:
+        await mgr.close()
+
+
+async def test_a_dead_server_is_restarted_on_a_later_turn(monkeypatch):
+    """ensure_started() returned as soon as it had run once: a server that crashed (or was down at daemon boot) stayed
+    'connected'/'failed' until `/mcp reload`."""
+    import k3code.mcpclient as mc
+
+    monkeypatch.setattr(mc, "RESTART_BACKOFF_S", 0.0)
+    mgr = McpManager({"fake": fake_cfg()})
+    try:
+        await mgr.ensure_started()
+        crashed = await mgr.call("mcp__fake__die", {})
+        assert "error" in crashed
+        for _ in range(100):  # the runner notices the broken connection
+            if mgr._runners["fake"].state.status == "failed" or mgr._runners["fake"].task.done():
+                break
+            await asyncio.sleep(0.05)
+        await mgr.ensure_started()  # the next turn of any session
+        assert [s.status for s in mgr.states()] == ["connected"]
+        assert (await mgr.call("mcp__fake__echo", {"text": "back"})) == {"content": "echo:back"}
+    finally:
+        await mgr.close()
+
+
+async def test_ensure_started_is_single_flight():
+    mgr = McpManager({"fake": fake_cfg()})
+    try:
+        await asyncio.gather(*(mgr.ensure_started() for _ in range(8)))
+        assert len(mgr._runners) == 1
+        assert len([r for r in mgr._runners.values() if r.task and not r.task.done()]) == 1
+    finally:
+        await mgr.close()

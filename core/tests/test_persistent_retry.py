@@ -460,3 +460,28 @@ def test_reliability_attach_router_is_idempotent_per_router():
     other = FakeRouter(fails=0, error=Exception("unused"))
     rel.attach_router(other)  # a different tier's router rebinds
     assert rel.retry is not first and rel.retry.router is other
+
+
+async def test_each_stream_call_starts_a_fresh_park_ladder():
+    """The ladder only ever climbed over the life of a session: after a few unrelated outages every later blip parked
+    the full park_max (and a Retry-After seen hours earlier was reused)."""
+    nw = FakeNetWatch(NetState.ONLINE)
+    router = FakeRouter(fails=3, error=AllProvidersUnreachable("nope"))
+    retry, clock, events, seen = _retry(router, netwatch=nw)
+    await _drain(retry.stream([Message(role="user", content="x")], []))
+    assert [p.data["delay"] for p in seen if p.kind == PARKED] == [1.0, 2.0, 4.0]
+    retry._last_retry_after = 3600.0  # a stale window from an earlier rate limit
+    router2 = FakeRouter(fails=1, error=AllProvidersUnreachable("again"))
+    retry.router = router2
+    seen.clear()
+    await _drain(retry.stream([Message(role="user", content="x")], []))
+    assert [p.data["delay"] for p in seen if p.kind == PARKED] == [1.0]  # back at the bottom of the ladder
+    assert retry._last_retry_after is None
+
+
+async def test_a_huge_park_step_cannot_overflow():
+    router = FakeRouter(fails=0, error=Exception("x"))
+    retry, clock, events, seen = _retry(router, netwatch=FakeNetWatch(NetState.ONLINE))
+    retry._park_step = 5000  # backoff_factor ** 5000 overflows a float
+    await retry._park("test", None)
+    assert [p.data["delay"] for p in seen if p.kind == PARKED] == [retry.config.park_max]

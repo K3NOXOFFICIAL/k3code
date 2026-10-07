@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -67,6 +68,29 @@ SAFE_MODE_NOTICE = (
 )
 
 
+class DaemonAlreadyRunning(RuntimeError):
+    """Another k3code daemon holds this home's instance lock."""
+
+
+def acquire_instance_lock(sock: Path) -> int:
+    """Take an exclusive, non-blocking flock on ``<run dir>/daemon.lock``; returns the fd to keep open.
+
+    Without it a second ``k3code daemon`` (a manual start next to the systemd unit, the 5 s RestartSec window) unlinked
+    the live socket and rebound it: the first daemon kept running its sessions, cron and loops but became unreachable,
+    and stopping either one then deleted the other's socket.
+    """
+    sock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(sock.parent / "daemon.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise DaemonAlreadyRunning(f"another k3code daemon is already running ({sock})") from None
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
+
+
 async def run_daemon(
     *,
     home: Path | None = None,
@@ -81,6 +105,7 @@ async def run_daemon(
 
     home = home or k3_home()
     sock = sock or socket_path(home)
+    lock_fd = acquire_instance_lock(sock)  # refuses to start a second daemon on this home (held until we exit)
     count = record_restart(home)
     server = GatewayServer()
     if server_out is not None:
@@ -99,6 +124,8 @@ async def run_daemon(
         if sock.exists() or serve.done():
             break
         await asyncio.sleep(0.05)
+    if serve.done():
+        serve.result()  # the server failed to come up: raise its error instead of announcing READY=1
     await server.ensure_automation()  # resume loops, start the cron scheduler and triggers
     sdnotify.ready()
     logger.info("daemon ready on %s", sock)
@@ -114,6 +141,8 @@ async def run_daemon(
         with contextlib.suppress(asyncio.CancelledError):
             await dog
         await server.close()
+        with contextlib.suppress(OSError):
+            os.close(lock_fd)
 
 
 async def attach_bridge(sock: Path | None = None, *, readonly: bool = False) -> int:

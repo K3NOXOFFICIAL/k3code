@@ -284,24 +284,25 @@ class AutomationManager:
             logger.info("automation %s: skipped (previous run still going)", aid)
             return None
         self._busy.add(aid)
-        run_id = self.db.insert(
-            "job_runs",
-            owner=aid,
-            owner_kind="automation",
-            started_at=now,
-            scheduled_for=now,
-            note=str(info.get("event", "")),
-        )
-        self.db.update("automations", aid, last_fired_at=now, fire_count=row["fire_count"] + 1)
-        self.on_change()
-        info = {**info, "automation": row["name"]}
-        try:
-            result = await self._run_action(row, info)
-        except asyncio.CancelledError:
-            self.db.update("job_runs", run_id, status="interrupted", finished_at=self.clock.now())
-            raise
-        except Exception as e:  # noqa: BLE001
-            result = RunResult(status="failed", error=str(e))
+        try:  # everything after the claim sits in the try: an exception in the inserts leaked `_busy` for good
+            run_id = self.db.insert(
+                "job_runs",
+                owner=aid,
+                owner_kind="automation",
+                started_at=now,
+                scheduled_for=now,
+                note=str(info.get("event", "")),
+            )
+            self.db.update("automations", aid, last_fired_at=now, fire_count=row["fire_count"] + 1)
+            self.on_change()
+            info = {**info, "automation": row["name"]}
+            try:
+                result = await self._run_action(row, info)
+            except asyncio.CancelledError:
+                self.db.update("job_runs", run_id, status="interrupted", finished_at=self.clock.now())
+                raise
+            except Exception as e:  # noqa: BLE001
+                result = RunResult(status="failed", error=str(e))
         finally:
             self._busy.discard(aid)
         self.db.update(

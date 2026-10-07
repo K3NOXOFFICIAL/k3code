@@ -13,6 +13,7 @@ import contextlib
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 CONNECT_TIMEOUT = 30.0
 CALL_TIMEOUT = 120.0
+#: A runner that failed (or whose server died) is restarted on a later turn, at most this often.
+RESTART_BACKOFF_S = 30.0
 _SAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
@@ -56,8 +59,25 @@ class _Runner:
         self.cfg = cfg
         self.state = McpServerState(name, "http" if cfg.url else "stdio")
         self.ready = asyncio.Event()
+        self.dead = asyncio.Event()  # set when the server connection broke
         self.queue: asyncio.Queue[tuple[str, dict[str, Any], asyncio.Future[Any]] | None] = asyncio.Queue()
         self.task: asyncio.Task[None] | None = None
+        self.started_at = 0.0  # monotonic time of the last start (restart back-off)
+
+    async def _call(self, session: Any, tool: str, args: dict[str, Any], fut: asyncio.Future[Any]) -> None:
+        """One tool call. The caller may have been cancelled meanwhile (/stop, a timeout): its future is then done and
+        resolving it raises InvalidStateError, which used to kill the runner for EVERY session."""
+        try:
+            res = await asyncio.wait_for(session.call_tool(tool, args), CALL_TIMEOUT)
+            if not fut.done():
+                fut.set_result(res)
+        except Exception as e:  # noqa: BLE001
+            if not fut.done():
+                fut.set_exception(e)
+            if _is_transport_error(e):
+                self.state.status = "failed"  # the server is gone: stop advertising it as connected
+                self.state.error = _describe(e)
+                self.dead.set()
 
     async def _run(self) -> None:
         from mcp import ClientSession
@@ -97,13 +117,31 @@ class _Runner:
                 ]
                 self.state.status = "connected"
                 self.ready.set()
-                while (req := await self.queue.get()) is not None:
-                    tool, args, fut = req
-                    try:
-                        res = await asyncio.wait_for(session.call_tool(tool, args), CALL_TIMEOUT)
-                        fut.set_result(res)
-                    except Exception as e:  # noqa: BLE001
-                        fut.set_exception(e)
+                inflight: set[asyncio.Task[None]] = set()
+                get_next: asyncio.Task[Any] | None = None
+                try:
+                    while True:
+                        get_next = asyncio.ensure_future(self.queue.get())
+                        dead = asyncio.ensure_future(self.dead.wait())
+                        done, _ = await asyncio.wait({get_next, dead}, return_when=asyncio.FIRST_COMPLETED)
+                        dead.cancel()
+                        if get_next not in done:  # the connection broke while idle
+                            get_next.cancel()
+                            raise RuntimeError(self.state.error or "mcp connection lost")
+                        req = get_next.result()
+                        if req is None:
+                            break
+                        tool, args, fut = req
+                        if fut.done():  # the caller gave up while the request was queued
+                            continue
+                        call = asyncio.create_task(self._call(session, tool, args, fut))
+                        inflight.add(call)  # concurrent: a slow call must not block the other sessions
+                        call.add_done_callback(inflight.discard)
+                finally:
+                    if get_next is not None and not get_next.done():
+                        get_next.cancel()
+                    for call in list(inflight):
+                        call.cancel()
         except BaseException as e:  # noqa: BLE001 - includes SDK ExceptionGroups
             if self.state.status != "connected" or not isinstance(e, asyncio.CancelledError):
                 self.state.status = "failed"
@@ -144,6 +182,20 @@ def _attr(obj: Any, *names: str) -> Any:
     return None
 
 
+def _is_transport_error(e: BaseException) -> bool:
+    """The connection to the server is gone (as opposed to the tool failing)."""
+    if isinstance(e, BaseExceptionGroup):
+        return any(_is_transport_error(x) for x in e.exceptions)
+    name = type(e).__name__
+    text = str(e).lower()
+    return (
+        isinstance(e, (BrokenPipeError, ConnectionError, EOFError))
+        or name in ("ClosedResourceError", "BrokenResourceError", "EndOfStream")
+        or "connection closed" in text
+        or "server disconnected" in text
+    )
+
+
 def _describe(e: BaseException) -> str:
     if isinstance(e, BaseExceptionGroup) and e.exceptions:
         return _describe(e.exceptions[0])
@@ -158,6 +210,7 @@ class McpManager:
         self._runners: dict[str, _Runner] = {}
         self._started = False
         self._stale = False
+        self._lock = asyncio.Lock()  # ensure_started runs on every turn of every session: single-flight
 
     def configure(self, servers: dict[str, McpServerConfig]) -> None:
         """Adopt new server definitions; running servers are restarted on the next ``ensure_started``."""
@@ -166,20 +219,29 @@ class McpManager:
         self.servers = dict(servers)
 
     async def ensure_started(self) -> None:
-        if self._started and self._stale:
-            await self.close()
-        if self._started:
-            return
-        self._stale = False
-        self._started = True
-        for name, cfg in self.servers.items():
-            runner = _Runner(name, cfg)
-            self._runners[name] = runner
-            if not cfg.enabled:
-                runner.state.status = "disabled"
-                runner.ready.set()
-                continue
-            runner.start()
+        async with self._lock:
+            if self._started and self._stale:
+                await self._close()
+            if self._started:
+                await self._revive()
+                return
+            self._stale = False
+            self._started = True
+            for name, cfg in self.servers.items():
+                self._runners[name] = self._launch(name, cfg)
+            await self._await_ready()
+
+    def _launch(self, name: str, cfg: McpServerConfig) -> _Runner:
+        runner = _Runner(name, cfg)
+        if not cfg.enabled:
+            runner.state.status = "disabled"
+            runner.ready.set()
+            return runner
+        runner.started_at = time.monotonic()
+        runner.start()
+        return runner
+
+    async def _await_ready(self) -> None:
         await asyncio.gather(
             *(asyncio.wait_for(r.ready.wait(), CONNECT_TIMEOUT + 5) for r in self._runners.values()),
             return_exceptions=True,
@@ -189,6 +251,20 @@ class McpManager:
                 r.state.status = "failed"
                 r.state.error = "connect timeout"
 
+    async def _revive(self) -> None:
+        """Restart servers that failed to start or died, at most once per RESTART_BACKOFF_S each. ensure_started used
+        to return as soon as it had run once, so a server that was down at daemon boot (network not up yet) or that
+        crashed later stayed broken until `/mcp reload`."""
+        now = time.monotonic()
+        for name, r in list(self._runners.items()):
+            gone = r.task is None or r.task.done() or r.dead.is_set() or r.state.status == "failed"
+            if not r.cfg.enabled or not gone or now - r.started_at < RESTART_BACKOFF_S:
+                continue
+            logger.info("restarting mcp server %s (%s)", name, r.state.error or r.state.status)
+            await r.stop()
+            self._runners[name] = self._launch(name, r.cfg)
+        await self._await_ready()
+
     async def reload(self, servers: dict[str, McpServerConfig] | None = None) -> None:
         await self.close()
         if servers is not None:
@@ -196,6 +272,10 @@ class McpManager:
         await self.ensure_started()
 
     async def close(self) -> None:
+        async with self._lock:
+            await self._close()
+
+    async def _close(self) -> None:
         await asyncio.gather(*(r.stop() for r in self._runners.values()), return_exceptions=True)
         self._runners.clear()
         self._started = False

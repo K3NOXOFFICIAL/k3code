@@ -482,15 +482,19 @@ def tail_cmd(subagent_id: str, socket_opt: Path | None) -> None:
 @cli.command("daemon")
 def daemon_cmd() -> None:
     """Run the long-lived host: sessions keep running while no TUI is attached (systemd: Type=notify)."""
-    from k3code.daemon import run_daemon
+    from k3code.daemon import DaemonAlreadyRunning, run_daemon
 
     logging.basicConfig(
         stream=sys.stderr,
         level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(run_daemon())
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            asyncio.run(run_daemon())
+    except DaemonAlreadyRunning as e:
+        click.echo(f"k3code daemon: {e}. Use `k3code attach`, or `k3code service restart` to restart it.", err=True)
+        raise SystemExit(75) from e  # EX_TEMPFAIL
 
 
 @cli.group("service")

@@ -153,6 +153,10 @@ class PersistentRetry:
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Yield router stream events, pausing/parking across infrastructure failures."""
+        # Every call starts a fresh ladder: the instance lives as long as the session, and a ladder that only ever
+        # climbed made every later blip park the full 10 minutes (and reused a stale hour-long Retry-After).
+        self._park_step = 0
+        self._last_retry_after = None
         deadline = None if self.config.max_wait is None else self._monotonic() + self.config.max_wait
         while True:
             self._raise_if_cancelled()
@@ -251,7 +255,7 @@ class PersistentRetry:
         """
         if delay is None:
             delay = min(
-                self.config.park_base * (self.config.backoff_factor**self._park_step),
+                self.config.park_base * (self.config.backoff_factor ** min(self._park_step, 32)),
                 self.config.park_max,
             )
             self._park_step += 1
