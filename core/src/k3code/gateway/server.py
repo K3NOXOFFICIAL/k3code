@@ -1307,7 +1307,8 @@ class GatewayServer:
             res = await self.model_caller.complete(kind, messages, session_id=session_id, max_tokens=max_tokens)
             return res.text
         router = self._router_for(model_key)
-        msg = await router.complete(messages, [], model=model_key, max_tokens=max_tokens)
+        # the chain already holds each provider's resolved model; an explicit model= would override it with the key
+        msg = await router.complete(messages, [], max_tokens=max_tokens)
         return msg.content or ""
 
     def _goal_completer(self, session: LiveSession) -> Any:

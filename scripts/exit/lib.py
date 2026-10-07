@@ -70,7 +70,9 @@ def live_backend() -> dict:
             "detail": "Claude Code login ok" if logged else f"Claude Code is not logged in ({tail(out, 1)})"}
 
 
-OMNI_AGENT_MODEL = "the owner's personal combo"  # owner decision 2026-10-07: agents run on this OmniRoute combo
+# Build workers run on the owner's personal combo (owner decision 2026-10-07), but that combo prepends a "Who are you?" bootstrap
+# prompt that makes a headless product agent stop and ask. The product's own live rows therefore use a plain combo.
+OMNI_AGENT_MODEL = "auto/coding-manual"
 
 
 def live_providers_yaml(backend: dict, omni_default: str | list[str] = OMNI_AGENT_MODEL,
