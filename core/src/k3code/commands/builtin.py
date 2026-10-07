@@ -185,7 +185,9 @@ class _HelpCommand(CommandDef):
 
 
 def build_registry() -> CommandRegistry:
+    from k3code.commands.artifacts_cmd import ArtifactsCommand
     from k3code.commands.automations_cmd import AutomationsCommand
+    from k3code.commands.bg import BgCommand
     from k3code.commands.branch import BranchCommand
     from k3code.commands.config_cmd import ConfigCommand
     from k3code.commands.export import ExportCommand
@@ -196,16 +198,20 @@ def build_registry() -> CommandRegistry:
     from k3code.commands.mcp_cmd import McpCommand
     from k3code.commands.memory_cmd import MemoryCommand
     from k3code.commands.output_style import OutputStyleCommand
+    from k3code.commands.research_cmd import UltraResearchCommand
     from k3code.commands.review import ReviewCommand
     from k3code.commands.schedule import ScheduleCommand
     from k3code.commands.settings_cmd import SettingsCommand
     from k3code.commands.skills_cmd import SkillsCommand
+    from k3code.commands.ultra_cmd import UltraCodeCommand, UltraPlanCommand
 
     reg = CommandRegistry()
     for extra in (
         ExportCommand(), ImportCommand(), ForkCommand(), BranchCommand(), SettingsCommand(), ConfigCommand(),
         OutputStyleCommand(), MemoryCommand(), SkillsCommand(), McpCommand(), ReviewCommand(), GoalCommand(),
         LoopCommand(), ScheduleCommand(), AutomationsCommand(),
+        ArtifactsCommand(), BgCommand(), UltraPlanCommand(), UltraCodeCommand(),
+        UltraResearchCommand(),
     ):
         reg.register(extra)
     for cmd in (

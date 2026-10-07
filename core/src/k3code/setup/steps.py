@@ -321,7 +321,10 @@ def build_config(data: dict[str, Any]) -> dict[str, Any]:
         "output_style": usage.get("output_style", "default"),
         "display": {"theme": theme.get("theme", ""), "focus_mode": bool(theme.get("focus_mode", False))},
         "tiers": {"main": "default", "strong": "strong", "cheap": "cheap", "fast": "fast", "background": "cheap"},
-        "autonomy": {"plan_first": bool(usage.get("plan_first", False)), "fanout_cap": int(usage.get("fanout_cap", 3))},
+        "autonomy": {
+            "plan_first": bool(usage.get("plan_first", False)),
+            "fanout": {"max_parallel": int(usage.get("fanout_cap", 3))},
+        },
         "panes": {"keymap": theme.get("keymap", "k3")},
     }
     if perms.get("extra_hardline"):
