@@ -58,3 +58,33 @@ upstream_path = "."
 commit = "f3d892942bfb45a0a0775d14895ae77ff9c06468"
 license = "MIT"
 local_path = "panes"
+
+[[file]]
+project = "opencode"
+upstream_path = "packages/opencode/src/util/wildcard.ts"
+commit = "ecc4916b5a9608c30e6dd58a67f2137b594407ca"
+license = "MIT"
+local_path = "core/src/k3code/permissions/wildcard.py"
+sha256_upstream = "f05b06c9e850eeaf3f039c58b1f2159157dd70e72f875d53045bf7fb5e119ad2"
+modified = true
+port-to-python = true
+
+[[file]]
+project = "opencode"
+upstream_path = "packages/opencode/src/permission/arity.ts"
+commit = "ecc4916b5a9608c30e6dd58a67f2137b594407ca"
+license = "MIT"
+local_path = "core/src/k3code/permissions/arity.py"
+sha256_upstream = "4200d3074fa8b6b6a63100fa93deb201be16f92c655721401d47c2ca0a109832"
+modified = true
+port-to-python = true
+
+[[file]]
+project = "opencode"
+upstream_path = "packages/opencode/src/permission/index.ts"
+commit = "ecc4916b5a9608c30e6dd58a67f2137b594407ca"
+license = "MIT"
+local_path = "core/src/k3code/permissions/rules.py"
+sha256_upstream = "5b9e4aa65290a39363722b9fae4c68080188d8ed76896afa0d96cd9dbfd2821d"
+modified = true
+port-to-python = true
