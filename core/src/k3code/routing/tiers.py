@@ -106,6 +106,12 @@ def tier_model_specs(config: Any, tier: Tier | str, *, key: str | None = None) -
     return resolved
 
 
+def router_options(config: Any) -> dict[str, float]:
+    """``router:`` settings (max_inline_wait, quota_cooldown) as Router keyword arguments."""
+    raw = getattr(config, "router", None) or {}
+    return {k: float(raw[k]) for k in ("max_inline_wait", "quota_cooldown") if k in raw}
+
+
 class TierRouters:
     """One :class:`Router` per tier over shared providers and cooldowns, built lazily."""
 
@@ -134,7 +140,9 @@ class TierRouters:
             return self.fallback_router
         if tier not in self._routers:
             chain = build_chain(self.providers, tier_model_specs(self.config, tier, key=self.main_key))
-            self._routers[tier] = Router(chain, cooldowns=self.cooldowns, on_event=self.on_event, tier=tier.value)
+            self._routers[tier] = Router(
+                chain, cooldowns=self.cooldowns, on_event=self.on_event, tier=tier.value, **router_options(self.config)
+            )
         return self._routers[tier]
 
     def for_kind(self, kind: TaskKind | str) -> Router:

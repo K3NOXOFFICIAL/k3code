@@ -25,9 +25,20 @@ class AllProvidersUnreachable(K3CodeError):
 class ChainExhausted(K3CodeError):
     """Every entry in the fallback chain failed and the failure is not retryable as a whole."""
 
-    def __init__(self, message: str, last_reason: str = "unknown") -> None:
+    def __init__(
+        self,
+        message: str,
+        last_reason: str = "unknown",
+        *,
+        retry_after: float | None = None,
+        until: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.last_reason = last_reason
+        #: set when every entry is cooling down: seconds until the earliest one resets…
+        self.retry_after = retry_after
+        #: …and that moment as a wall-clock epoch timestamp
+        self.until = until
 
 
 class PermissionDenied(K3CodeError):

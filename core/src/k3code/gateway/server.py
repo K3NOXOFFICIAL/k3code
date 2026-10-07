@@ -68,7 +68,7 @@ from k3code.reliability import events as rev
 from k3code.reliability.persistent_retry import TurnCancelled
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 from k3code.routing.caller import ModelCaller
-from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, tier_for
+from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router_options, tier_for
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -234,7 +234,7 @@ class GatewayServer:
         self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
         self.providers: list[Any] = []
         self.router: Router | None = None
-        self.cooldowns = CooldownStore()
+        self.cooldowns = CooldownStore(path=self._home() / "cooldowns.json")
         self._running = False
         self._server_request_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
         #: Server→client requests still unanswered: id → (session_id, frame). Re-sent on attach.
@@ -623,7 +623,7 @@ class GatewayServer:
         # Old provider clients are dropped for GC; chains are only replaced on
         # a model change (rare), and httpx pools close with the objects.
         self.providers = make_providers(self.config.providers)
-        self.cooldowns = CooldownStore()
+        self.cooldowns = CooldownStore(path=self._home() / "cooldowns.json")
         self._tiers = TierRouters(
             self.providers, self.config, cooldowns=self.cooldowns, on_event=self._on_router_event, main_key=key
         )
@@ -693,8 +693,10 @@ class GatewayServer:
         session.emit(kind, {"detail": detail, **data}, importance=ess)
         if kind in (rev.PAUSED, rev.PARKED):
             if kind == rev.PARKED:
-                until = time.strftime("%H:%M", time.localtime(time.time() + float(data.get("delay") or 0)))
-                text = f"⏸ waiting for provider until {until}"
+                stamp = data.get("until") or time.time() + float(data.get("delay") or 0)
+                until = time.strftime("%H:%M", time.localtime(float(stamp)))
+                what = "all providers rate-limited" if "rate-limited" in detail else "waiting for provider"
+                text = f"⏸ {what} until {until}"
             else:
                 text = "⏸ offline — will resume automatically"
             session.paused = True
@@ -1084,7 +1086,9 @@ class GatewayServer:
             if not self.providers:
                 self.providers = make_providers(self.config.providers)
             chain = build_chain(self.providers, _resolve_model_specs(self.config, key))
-            cache[key] = Router(chain, cooldowns=self.cooldowns, on_event=self._on_router_event)
+            cache[key] = Router(
+                chain, cooldowns=self.cooldowns, on_event=self._on_router_event, **router_options(self.config)
+            )
         return cache[key]
 
     async def oneshot(

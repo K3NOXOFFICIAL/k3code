@@ -92,6 +92,8 @@ class Settings(BaseModel):
     mem0: Mem0Config = Field(default_factory=Mem0Config)
     goal: GoalConfig = Field(default_factory=GoalConfig)
 
+    # router knobs: {max_inline_wait: 20, quota_cooldown: 3600}; see router.router.Router
+    router: dict[str, Any] = Field(default_factory=dict)
     # M4a: task kind → tier overrides, e.g. {title: fast, review: strong}.
     task_tiers: dict[str, str] = Field(default_factory=dict)
     # M4a autonomy: plan_first, gate_modes, advisor_auto, proposals, escalate_after, ...

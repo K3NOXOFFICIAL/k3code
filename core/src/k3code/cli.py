@@ -16,7 +16,7 @@ from typing import Any
 import click
 
 from k3code.agent.loop import AgentLoop
-from k3code.config import K3CODE_HOME, load_config
+from k3code.config import K3CODE_HOME, _current_home, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_skill_tool
 from k3code.permissions import PermissionMode
@@ -30,6 +30,7 @@ from k3code.reliability import (
 )
 from k3code.reliability.persistent_retry import TurnCancelled
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
+from k3code.routing.tiers import router_options
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -60,6 +61,10 @@ def _resolve_model_specs(config: Any) -> list[str | list[str]]:
             spec = next(iter(p.models.values()), "")
         resolved.append(spec)
     return resolved
+
+
+def _cooldown_path() -> Path:
+    return _current_home() / "cooldowns.json"
 
 
 def _print_event(event: RouterEvent) -> None:
@@ -94,8 +99,8 @@ async def _run_headless(
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
-    cooldowns = CooldownStore()
-    router = Router(chain, cooldowns=cooldowns, on_event=_print_event)
+    cooldowns = CooldownStore(path=_cooldown_path())
+    router = Router(chain, cooldowns=cooldowns, on_event=_print_event, **router_options(config))
 
     # M2: reliability bundle (netwatch, persistent retry, journal, guards).
     reliability = _build_reliability(config, session=session)
@@ -163,8 +168,8 @@ async def _run_repl(
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
-    cooldowns = CooldownStore()
-    router = Router(chain, cooldowns=cooldowns, on_event=_print_event)
+    cooldowns = CooldownStore(path=_cooldown_path())
+    router = Router(chain, cooldowns=cooldowns, on_event=_print_event, **router_options(config))
 
     # M2: reliability bundle; one journal/session per REPL process.
     reliability = _build_reliability(config, session="repl")

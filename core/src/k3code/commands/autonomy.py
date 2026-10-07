@@ -9,6 +9,7 @@ from k3code.autonomy import preview as preview_mod
 from k3code.autonomy.proposals import format_proposals
 from k3code.autonomy.scope import SCOPES
 from k3code.commands import CommandDef
+from k3code.errors import ChainExhausted
 
 
 def _msg(text: str, **extra: Any) -> dict[str, Any]:
@@ -80,6 +81,8 @@ class PreviewCommand(CommandDef):
             text = await preview_mod.preview(ctx.model_caller, arg, session_id=live.session_id, timeout=timeout)
         except TimeoutError:
             return _msg(f"Preview timed out after {timeout:.0f}s; try a shorter task.")
+        except ChainExhausted as e:  # e.g. "all providers rate-limited until HH:MM"
+            return _msg(f"Preview unavailable: {e}")
         live.stored.meta["preview_task"] = arg
         live.messages = [
             *live.messages,

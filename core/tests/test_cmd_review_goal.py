@@ -112,7 +112,8 @@ def controls(server):
 
 
 async def test_goal_loop_continue_twice_then_done(tmp_path, monkeypatch):
-    server, provider = make_server(tmp_path, monkeypatch, replies=["step 1", "step 2", "all finished"], autonomy=NO_ADVISOR)
+    server, provider = make_server(tmp_path, monkeypatch, replies=["step 1", "step 2", "all finished"],
+        autonomy=NO_ADVISOR)
     server.goal_judge = scripted_judge(["continue", "continue", "done"])
     sid = await new_session(server, tmp_path)
 
@@ -133,7 +134,8 @@ async def test_goal_loop_continue_twice_then_done(tmp_path, monkeypatch):
 
 
 async def test_goal_turn_budget_stops_loop(tmp_path, monkeypatch):
-    server, provider = make_server(tmp_path, monkeypatch, replies=["more work"], autonomy=NO_ADVISOR)
+    server, provider = make_server(tmp_path, monkeypatch, replies=["more work"],
+        autonomy=NO_ADVISOR)
     server.goal_judge = scripted_judge(["continue"])
     sid = await new_session(server, tmp_path)
     await run_goal(server, sid, "/goal never ends --turns 3")
@@ -153,7 +155,8 @@ async def test_goal_turn_budget_stops_loop(tmp_path, monkeypatch):
 
 async def test_goal_check_gate_enforced(tmp_path, monkeypatch):
     marker = tmp_path / "ok.flag"
-    server, provider = make_server(tmp_path, monkeypatch, replies=["claim done", "fixed", "really done"], autonomy=NO_ADVISOR)
+    server, provider = make_server(tmp_path, monkeypatch, replies=["claim done", "fixed", "really done"],
+        autonomy=NO_ADVISOR)
     server.goal_judge = scripted_judge(["done"])  # judge always says done
     sid = await new_session(server, tmp_path)
 
@@ -169,7 +172,8 @@ async def test_goal_check_gate_enforced(tmp_path, monkeypatch):
 
 
 async def test_goal_check_gate_exhausts_retries(tmp_path, monkeypatch):
-    server, provider = make_server(tmp_path, monkeypatch, replies=["done?"], autonomy=NO_ADVISOR)
+    server, provider = make_server(tmp_path, monkeypatch, replies=["done?"],
+        autonomy=NO_ADVISOR)
     server.goal_judge = scripted_judge(["done"])
     sid = await new_session(server, tmp_path)
     await run_goal(server, sid, '/goal impossible --check "exit 1"')
@@ -180,7 +184,8 @@ async def test_goal_check_gate_exhausts_retries(tmp_path, monkeypatch):
 
 
 async def test_goal_pause_clear_status_and_blocked(tmp_path, monkeypatch):
-    server, provider = make_server(tmp_path, monkeypatch, replies=["can't"], autonomy=NO_ADVISOR)
+    server, provider = make_server(tmp_path, monkeypatch, replies=["can't"],
+        autonomy=NO_ADVISOR)
     server.goal_judge = scripted_judge(["blocked"])
     sid = await new_session(server, tmp_path)
     assert "No active goal" in (await cmd(server, "/goal status", sid))["output"]
@@ -209,7 +214,8 @@ async def test_goal_survives_session_reload(tmp_path, monkeypatch):
 
 async def test_goal_default_judge_uses_cheap_model_through_router(tmp_path, monkeypatch):
     # No injected judge: the judge is a real one-shot call → reply with a done verdict JSON.
-    server, provider = make_server(tmp_path, monkeypatch, replies=['{"verdict": "done", "reason": "ok"}'], autonomy=NO_ADVISOR)
+    server, provider = make_server(tmp_path, monkeypatch, replies=['{"verdict": "done", "reason": "ok"}'],
+        autonomy=NO_ADVISOR)
     sid = await new_session(server, tmp_path)
     await run_goal(server, sid, "/goal anything")
     assert server.goal_manager(server.session).state.status == "done"

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import httpx
 import pytest
 import respx
@@ -35,3 +37,45 @@ def _no_real_nmcli(monkeypatch):
         return None
 
     monkeypatch.setattr(netwatch, "nmcli_state", _none)
+
+
+def _descendants(root: int) -> list[int]:
+    """Live descendant pids of ``root`` (from /proc; Linux only, empty elsewhere)."""
+    import os
+
+    children: dict[int, list[int]] = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return []
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as f:
+                ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(name))
+    out: list[int] = []
+    stack = [root]
+    while stack:
+        for pid in children.get(stack.pop(), []):
+            out.append(pid)
+            stack.append(pid)
+    return out
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _reap_child_processes():
+    """Kill every process the suite spawned (MCP stdio servers, daemons, shells) at session end.
+
+    A leaked child keeps pytest's stdout pipe open, so ``pytest | tail`` would never return.
+    """
+    yield
+    import os
+    import signal
+
+    for pid in reversed(_descendants(os.getpid())):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
