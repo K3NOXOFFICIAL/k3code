@@ -142,7 +142,25 @@ class _HelpCommand(CommandDef):
 
 
 def build_registry() -> CommandRegistry:
+    from k3code.commands.branch import BranchCommand
+    from k3code.commands.config_cmd import ConfigCommand
+    from k3code.commands.export import ExportCommand
+    from k3code.commands.fork import ForkCommand
+    from k3code.commands.goal import GoalCommand
+    from k3code.commands.import_ import ImportCommand
+    from k3code.commands.mcp_cmd import McpCommand
+    from k3code.commands.memory_cmd import MemoryCommand
+    from k3code.commands.output_style import OutputStyleCommand
+    from k3code.commands.review import ReviewCommand
+    from k3code.commands.settings_cmd import SettingsCommand
+    from k3code.commands.skills_cmd import SkillsCommand
+
     reg = CommandRegistry()
+    for extra in (
+        ExportCommand(), ImportCommand(), ForkCommand(), BranchCommand(), SettingsCommand(), ConfigCommand(),
+        OutputStyleCommand(), MemoryCommand(), SkillsCommand(), McpCommand(), ReviewCommand(), GoalCommand(),
+    ):
+        reg.register(extra)
     for cmd in (
         _ModelCommand(),
         _EffortCommand(),

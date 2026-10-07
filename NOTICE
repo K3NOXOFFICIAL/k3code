@@ -1,0 +1,15 @@
+k3code
+Copyright (c) k3nox. MIT License (see LICENSE).
+
+Third-party material included in this repository:
+
+* OpenAI Codex (https://github.com/openai/codex), Apache License 2.0
+  core/src/k3code/prompts/review_rubric.md is adapted from
+  codex-rs/prompts/templates/review/rubric.md (commit 81de4f251cfdaf32ecb85e2160ebfc11a562d44b).
+  Copyright OpenAI. Licensed under the Apache License, Version 2.0; a copy is in
+  LICENSES/codex-Apache-2.0.txt. The file was modified (output schema replaced).
+
+* Hermes Agent (Nous Research), MIT License — LICENSES/hermes-agent-MIT.txt
+  core/src/k3code/goals.py is a Python port of the design of hermes_cli/goals.py.
+
+See VENDOR.toml for the complete per-file list.
