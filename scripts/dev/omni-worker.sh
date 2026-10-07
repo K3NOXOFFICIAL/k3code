@@ -23,6 +23,11 @@ mkdir -p "$RUNS"
 TASK=$(readlink -f "$TASK")
 
 [ -f "$SETTINGS" ] || { echo "missing $SETTINGS" >&2; exit 2; }
+# Same OmniRoute key, exposed to the worker's tools for live smoke tests (never printed).
+if [ -z "${OMNIROUTE_API_KEY:-}" ]; then
+  OMNIROUTE_API_KEY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["env"].get("ANTHROPIC_AUTH_TOKEN",""))' "$SETTINGS")
+  export OMNIROUTE_API_KEY
+fi
 
 if [ ! -d "$WT" ]; then
   BASE=${BASE:-$(git -C "$REPO" rev-parse --abbrev-ref HEAD)}
