@@ -48,7 +48,7 @@ def score(text: str, kind: str, *, log: DecisionLog, store: ProposalStore | None
     if store is not None:
         mine = tokens(text)
         sim = max((jaccard(mine, tokens(p.text)) for p in store.all() if p.status == "dismissed"), default=0.0)
-    return round(0.55 * rate + 0.15 * recency + 0.30 * (1 - sim) - (0.5 if sim >= 0.7 else 0.0), 4)
+    return round(rate * (0.6 + 0.4 * recency) * (1 - sim) ** 2, 4)
 
 
 def rank(items: list[dict[str, str]], *, log: DecisionLog, store: ProposalStore | None, project: str = "",

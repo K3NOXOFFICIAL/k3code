@@ -38,6 +38,16 @@ def scrub(text: str) -> str:
     return _SECRET.sub("[redacted]", text)
 
 
+def _scrub_obj(o: Any) -> Any:
+    if isinstance(o, str):
+        return scrub(o)
+    if isinstance(o, dict):
+        return {k: _scrub_obj(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_scrub_obj(v) for v in o]
+    return o
+
+
 def project_id(cwd: str | Path) -> str:
     """Stable id for a project: the git remote URL when there is one, else a hash of the path."""
     p = Path(cwd)
@@ -80,7 +90,7 @@ class DecisionLog:
                detail: dict[str, Any] | None = None, ts: float | None = None, project: str | None = None) -> int:
         if kind not in KINDS:
             raise ValueError(f"unknown decision kind: {kind}")
-        clean = json.loads(scrub(json.dumps(detail or {}, ensure_ascii=False)))
+        clean = _scrub_obj(detail or {})
         cur = self._db.execute(
             "INSERT INTO decisions (ts, kind, session, cwd, project, subject, choice, detail) VALUES (?,?,?,?,?,?,?,?)",
             (self.clock() if ts is None else ts, kind, session, cwd,
