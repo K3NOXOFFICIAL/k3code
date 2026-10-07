@@ -142,7 +142,7 @@ async def run(a: argparse.Namespace) -> int:
     # SIGTERM/SIGINT must stop the daemon too (a bare kill of this driver used to orphan it) and must not produce a
     # verdict: a stopped 72 h run would otherwise be judged on whatever samples it had and could report PASS.
     stop = asyncio.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
         asyncio.get_running_loop().add_signal_handler(sig, stop.set)
     try:
         d.start()
