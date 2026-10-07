@@ -1,0 +1,37 @@
+# The 72-hour soak (M2 exit criterion (f))
+
+**Status: RUNNING.** It started on **2026-10-08 00:06 (Europe/Berlin)** and ends about **2026-10-11 03:06**.
+
+What it runs: a `k3code daemon` in a throwaway home on the scripted fake provider, with a `/loop 30s` in one session
+and two cron jobs (every minute), sampled every 5 minutes: runs completed, lost turns (failed/stuck/skipped ticks),
+errors in the daemon log, daemon RSS. Compaction is on (`context.compact_at_tokens: 4000`), so the RSS bound measures
+leaks and not the growth of one endless conversation. Verdict: PASS when nothing was lost, there were no errors, the
+daemon stayed alive and RSS growth after warm-up stays below 25 % of the warm RSS + 20 MB.
+
+## Where things are
+
+| What | Path |
+|---|---|
+| frozen code (detached worktree at commit `41c7cf9`, own venv) | `~/src/k3code/.k3dev/soak/src` (**do not touch**: any change to the daemon code restarts the 72 h) |
+| sample log (one line per 5 min) | `~/src/k3code/.k3dev/soak/src/scripts/exit/rows/soak/soak-20261008-000651.log` |
+| stdout of the run | `~/src/k3code/.k3dev/soak/soak-72h.out` |
+| the exit row, written when it ends | `~/src/k3code/.k3dev/soak/rows-72h.jsonl` |
+| the daemon | `pgrep -af 'k3code daemon'` (cwd-independent; its home is `/tmp/k3exit.*`) |
+
+```
+tail -n 3 ~/src/k3code/.k3dev/soak/src/scripts/exit/rows/soak/soak-20261008-000651.log
+cat ~/src/k3code/.k3dev/soak/rows-72h.jsonl          # when it has finished: status + evidence
+```
+
+## Things that make it fail for reasons that are not bugs
+
+- **The laptop suspends or loses power.** The run holds a `systemd-inhibit --what=sleep:idle` lock, which stops
+  *idle* suspend but not a closed lid or a dead battery; keep the machine on AC power with the lid open (or set
+  `HandleLidSwitch=ignore`). A suspend shows up as skipped loop ticks.
+- A reboot ends it (the daemon is a child of the run, not a service).
+- If you want to stop it: `pkill -f 'exit/soak.py --hours 72'` (it stops its daemon).
+
+## If it passes
+
+Merge the row into the report: append `rows-72h.jsonl` to `scripts/exit/rows/rows.jsonl` (replacing the M2 "72 h soak"
+PENDING row) and run `python3 scripts/exit/render.py scripts/exit/rows/rows.jsonl docs/reports/exit-status.md`.

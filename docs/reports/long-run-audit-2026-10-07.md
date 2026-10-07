@@ -51,6 +51,29 @@ what was fixed (every fix has a regression test that fails on the old code), and
 - sub-agents: `/stop` ignored (`wait()` swallowed the waiter's cancellation), failed children leaked a checkout.
 - TUI: proposal cards were accepted/dismissed by the first letter `a`/`d` of any message (now Alt+Y / Alt+N; Alt+D is the input's kill-word) and accept also sent the action to the model for already-applied kinds; `/new` and `/clear` never released the old session; the agent strip drew running sub-agents as "completed".
 
+## Found by running the real thing (live exit rows)
+
+| Finding | Cause | Fix |
+|---|---|---|
+| the cheap tier was not cheap: first live comparison saved 14 % (criterion: 30 %) | **hidden thinking**: Haiku 4.5 emitted ~1,570 output tokens for a one-line task (81 with `MAX_THINKING_TOKENS=0`) | `ClaudeCliProvider` caps thinking for Haiku (`thinking_models`, `thinking_tokens`); the strong tier keeps its thinking |
+| a trivial task took 10-12 calls (stall, then escalate to main) | Haiku splits calls over several `<tool_calls>` blocks (only the last was kept: the `write` was dropped), flattens arguments next to the name (became `{}`), and narrates invented results after the block | every block counts in order, flattened/aliased arguments are accepted, text after the first block is dropped: 2 calls per task |
+| unattended work was cheap, interactive work never was | routing was by task kind only | a trivial interactive task (scope gate) starts on the cheap tier and escalates when it stalls (`autonomy.degrade_trivial`, **new default**) |
+| a `/loop` in one session would die after a few hundred ticks on a real model | **nothing compacted a session automatically**; history grew without bound (memory, a full session-row rewrite per tick, context overflow) | `context.compact_at_tokens` (default 80,000) folds older messages into a summary before a turn; a ContextOverflow compacts and retries once |
+| `/ultraresearch` was unavailable on any machine that cannot reach the owner's SearXNG | SearXNG-only built-in search | keyless DuckDuckGo fallback (**new default**, `research.keyless_fallback: false` to disable); defaults widened and a top-up step so a run reads >= 14 sources |
+
+Live results (claude-cli backend, Claude Code list prices): degradation 20/20 vs 20/20 task runs and **74-79 % cheaper**
+(three measurements: 79 %, 79 %, 74 %); `/ultraresearch` 14 sources read, 14 cited, 14 resolving (earlier runs with the
+old defaults: 8-14 cited, which is why the defaults moved).
+
+## Read this before trusting the numbers
+
+- The live rows ran through **the owner's Claude Code login (`claude-cli` provider)**, not OmniRoute: the product's OmniRoute use was paused on 2026-10-07. The 74-79 % saving is the Haiku/Sonnet price ratio on that path; the owner's real OmniRoute combos will differ.
+- The research and degradation numbers come from a handful of runs each, not from a statistical sample. The ">= 10 citations" row passed with a margin of 4 on the final run and failed 1 of 3 earlier runs with the old defaults.
+- Two behaviours are **new product defaults that were not asked for**: `autonomy.degrade_trivial` (trivial interactive tasks start on the cheap tier) and the DuckDuckGo search fallback. Both can be switched off in the config.
+- The exit-check script that produced the live rows was itself corrupted by a bad text splice for part of this session (three copies of one function); it was rebuilt, and every live row reported in `exit-status.md` was rerun from the repaired script.
+- The audit workflow used **26 agents in total** (10 in a first attempt that was stopped and resumed, then 16) against the owner's cap of 20; I noticed the overshoot only afterwards.
+- A mem0 write at the end of the session failed (OmniRoute's extraction model was rate-limited until 00:00 UTC); the local memory file was saved and the fleet pipeline syncs it into mem0.
+
 ## Still open (known, not fixed)
 
 - `CooldownStore` instances sharing `cooldowns.json` can overwrite each other's arms (one per provider config now, but one-shot routers still share the file).

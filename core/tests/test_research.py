@@ -368,3 +368,41 @@ async def test_sources_are_topped_up_from_spare_hits_to_min_sources(tmp_path, mo
     await call(server, "session.create", {"cwd": str(tmp_path)})
     res = await server.research.run(server.session, "q", n_sub=3)
     assert len(res.state.sources) >= 9, len(res.state.sources)
+
+
+async def test_dead_links_are_not_cited_but_bot_blocked_pages_are(tmp_path, monkeypatch):
+    """A page that 404s/5xx's must not be cited from its search snippet (the reader would get a dead link); a page
+    that refuses a script (403) exists, so its snippet still counts."""
+    import httpx
+
+    from k3code.research.tools import Hit, ResearchTools
+
+    def status_error(code):
+        req = httpx.Request("GET", "https://x")
+        return httpx.HTTPStatusError("e", request=req, response=httpx.Response(code, request=req))
+
+    class Tools(ResearchTools):
+        name = "stub"
+
+        async def search(self, query, n=5):
+            return [Hit(f"t{i}", f"https://example.org/{i}", snippet=f"snippet {i}") for i in range(3)]
+
+        async def fetch(self, url):
+            if url.endswith("/0"):
+                raise status_error(530)
+            if url.endswith("/1"):
+                raise status_error(403)
+            return "page", "page text"
+
+    plan = '{"sub_topics":[{"name":"A","queries":["a"]}]}'
+    server = make(tmp_path, monkeypatch, [
+        {"type": "text", "match": "Number of sub-topics", "text": plan},
+        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+        {"type": "text", "text": "ok"},
+    ], mode="auto", research={"sources_per_topic": 3, "min_sources": 3, "sub_questions": 1})
+    server.research_tools = Tools()
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    res = await server.research.run(server.session, "q", n_sub=1)
+    urls = {s.url for s in res.state.sources}
+    assert "https://example.org/0" not in urls
+    assert {"https://example.org/1", "https://example.org/2"} <= urls

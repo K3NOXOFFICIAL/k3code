@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 from k3code.artifacts import write_artifact_file
 from k3code.providers.types import Message
 from k3code.research import prompts
@@ -27,6 +29,16 @@ logger = logging.getLogger(__name__)
 CITE_RE = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\]")
 DEFAULTS = {"sub_questions": 5, "results_per_query": 6, "sources_per_topic": 4, "min_sources": 14, "concurrency": 4,
             "max_claims": 60}
+
+
+def is_dead_link(exc: BaseException) -> bool:
+    """True when the page is gone (404/410, any 5xx, no connection), so citing it would hand the reader a dead link.
+    A 401/403/429 (the site refuses a script, e.g. StackOverflow) or a timeout means the page exists: the search
+    snippet is still real content from it."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        return code in (404, 410) or code >= 500
+    return isinstance(exc, httpx.ConnectError)
 
 
 class ResearchUnavailable(Exception):
@@ -174,7 +186,9 @@ class Research:
                     title, text = await tools.fetch(hit.url)
                 except Exception as e:  # noqa: BLE001
                     logger.warning("fetch %s failed: %s", hit.url, e)
-                    title, text = hit.title, hit.snippet
+                    if is_dead_link(e):
+                        return topic, hit, hit.title, []  # never cite a page that is gone
+                    title, text = hit.title, hit.snippet  # bot-blocked or slow: the page exists, the snippet is real
                 if not text.strip():
                     return topic, hit, hit.title, []
                 reply = await self._ask(
