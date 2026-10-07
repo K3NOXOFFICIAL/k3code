@@ -514,6 +514,7 @@ export function StatusRule({
   bgCount,
   lastTurnEndedAt,
   liveSessionCount,
+  automationCount = 0,
   sessionTitle,
   sessionStartedAt,
   turnStartedAt,
@@ -637,6 +638,8 @@ export function StatusRule({
   const tpsText = typeof usage.avg_tps === 'number' ? `↑ ${Math.round(usage.avg_tps)} t/s` : ''
   const showTps = segs.tps && ok('tps') && !!tpsText && fits(SEP + stringWidth(tpsText))
 
+  const automationText = automationCount > 0 ? `⟳ ${automationCount}` : ''
+  const showAutomation = !!automationText && fits(SEP + stringWidth(automationText))
   const showSessionCount = !!sessionCountText && fits(SEP + stringWidth(sessionCountText))
   const showBg = segs.bg && ok('bg_tasks') && bgCount > 0 && fits(SEP + stringWidth(`${bgCount} bg`))
   const subagentCount = typeof usage.active_subagents === 'number' ? usage.active_subagents : 0
@@ -800,6 +803,7 @@ export function StatusRule({
           </Text>
         ) : null}
         {showSessionCount ? sessionCountNode : null}
+        {showAutomation ? <Text color={t.color.accent}> │ {automationText}</Text> : null}
         {showBg ? (
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
@@ -944,6 +948,8 @@ interface StatusRuleProps {
   bgCount: number
   lastTurnEndedAt?: null | number
   liveSessionCount: number
+  // Active loops + cron jobs + automations (⟳ badge).
+  automationCount?: number
   busy: boolean
   // Context compaction in progress — FaceTicker freezes on "compacting".
   compacting?: boolean

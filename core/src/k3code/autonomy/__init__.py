@@ -8,6 +8,8 @@ DEFAULTS: dict[str, Any] = {
     "plan_first": True,
     #: permission modes in which the scope gate runs ("default" also plans when listed here)
     "gate_modes": ["auto"],
+    #: run the plan-first gate for unattended sessions too (cron, loop ticks, automations); off = pre-approved
+    "gate_unattended": False,
     #: advisor critique after plan approval / before a goal is declared done (auto mode)
     "advisor_on_plan": True,
     "advisor_on_goal": True,

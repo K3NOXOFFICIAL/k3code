@@ -83,8 +83,8 @@ class PlanFirst:
 
     def gate_applies(self, session: Any) -> bool:
         cfg = self.cfg
-        if session.background:
-            return False  # unattended sessions have nobody to approve plans
+        if session.background and not cfg["gate_unattended"]:
+            return False  # unattended runs are pre-approved: nobody is there to approve a plan
         override = getattr(session, "scope_override", None)
         if override:
             return True

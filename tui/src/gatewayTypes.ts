@@ -177,7 +177,14 @@ export interface SessionCreateResponse {
   stored_session_id?: string
 }
 
-export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working'
+export type LiveSessionStatus =
+  | 'completed'
+  | 'failed'
+  | 'idle'
+  | 'needs_input'
+  | 'starting'
+  | 'waiting'
+  | 'working'
 
 export interface SessionActiveItem {
   current?: boolean
@@ -193,6 +200,8 @@ export interface SessionActiveItem {
 }
 
 export interface SessionActiveListResponse {
+  // Active /loop + cron + automation counts (daemon); drives the ⟳ status badge.
+  automation?: { active?: number }
   sessions?: SessionActiveItem[]
 }
 

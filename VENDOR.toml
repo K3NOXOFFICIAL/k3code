@@ -109,3 +109,63 @@ local_path = "core/src/k3code/goals.py"
 sha256_upstream = "49f45045769db7ee9b9fd87a4c873a5011ac574318a7762572473504ea0d86d6"
 modified = true
 port = true  # design port: GoalState/judge/continuation/budget/gate re-implemented (async, trimmed), not a line copy
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "hermes_cli/loops.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/loops.py"
+sha256_upstream = "0a094df000134279cd9473ed955bf8985e1e0b0a683cb5eac7481296a2005c95"
+modified = true
+port = true  # design port, no line copy: /loop: tick loop, stop/status/list, sentinel and self-paced ideas re-implemented on the k3code gateway
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "cron/jobs.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/cronexpr.py"
+sha256_upstream = "3a3f78b89dbdd08bffd0f0f34082bcde3b2faaf9f1900e5c15d6efeae0d35260"
+modified = true
+port = true  # design port, no line copy: compute_next_run schedule shape (cron/interval) re-implemented without croniter
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "cron/unreachable_retry.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/retry_policy.py"
+sha256_upstream = "00d5865d618341f51a38ca6fe6d827b92fa3eefbe60176f4a1550cb3aa55f667"
+modified = true
+port = true  # design port, no line copy: 5/15/30 min zero-API-call retry ladder re-implemented; shared with quota hold
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "cron/quota_hold.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/retry_policy.py"
+sha256_upstream = "7146487f391ffddfbb894ddf37b444cbf370168606086177575dc9156b296b31"
+modified = true
+port = true  # design port, no line copy: retry-after quota hold re-implemented (boundary + slack)
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "cron/suggestions.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/suggestions.py"
+sha256_upstream = "c7726fa20e619fd4653b85ec3dc1a80f75e687f07bd6acd834e77693b8de416c"
+modified = true
+port = true  # design port, no line copy: dedup-key latch, MAX_PENDING cap, accept/dismiss re-implemented on sqlite
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "cron/suggestion_catalog.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/suggestions.py"
+sha256_upstream = "71c64068ea6d785e5a453a8abbbc7a642af991ad95f315116894bddd9ac351b0"
+modified = true
+port = true  # design port, no line copy: CatalogEntry shape; entries are k3code-specific
