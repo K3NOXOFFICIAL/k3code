@@ -30,13 +30,13 @@ def core_python() -> str:
 
 
 def write_home(home: Path, script: list[dict[str, Any]] | None, config_extra: str = "",
-               permission_mode: str = "default") -> None:
+               permission_mode: str = "default", cheap: str = "m") -> None:
     home.mkdir(parents=True, exist_ok=True)
     if script is not None:
         (home / "fake.json").write_text(json.dumps(script))
     (home / "config.yaml").write_text(
         f"permission_mode: {permission_mode}\nproviders:\n  - {{name: fake, kind: openai, base_url: 'http://fake', "
-        "api_key_env: PATH, models: {default: m, cheap: m}}\nreliability: {flags: {netwatch: false}}\n" + config_extra)
+        "api_key_env: PATH, models: {default: m, cheap: " + cheap + "}}\nreliability: {flags: {netwatch: false}}\n" + config_extra)
 
 
 class Tui:
