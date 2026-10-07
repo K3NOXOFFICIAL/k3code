@@ -6,3 +6,4 @@ dist/
 *.pyc
 .pytest_cache/
 .ruff_cache/
+.k3code/
