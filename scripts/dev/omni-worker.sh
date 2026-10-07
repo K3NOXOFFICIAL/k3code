@@ -75,6 +75,20 @@ while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
 try: print(json.load(sys.stdin).get("session_id",""))
 except Exception: print("")')
   [ -n "$sid" ] && SESSION=$sid
+  # Context exhausted (or compaction failed): continue in a fresh session from the worktree state.
+  if grep -qiE "prompt is too long|compaction failed|context.{0,20}(length|window)" "$out" "$RUNS/attempt-$attempt.err" 2>/dev/null; then
+    echo "$(date -Is) context exhausted — next attempt starts a fresh session" >> "$RUNS/driver.log"
+    SESSION=""
+    PROMPT="$(cat "$PREAMBLE")
+
+## Your task
+$(cat "$TASK")
+
+## Resuming
+A previous worker session ran out of context while working on this task in this same worktree.
+First read PROGRESS.md (if present), then run git log --oneline -20, git status and git diff --stat to see what is already done.
+Do NOT redo finished work; continue with what is missing."
+  fi
   iserr=$(printf '%s' "$json" | python3 -c 'import sys,json
 try: print(json.load(sys.stdin).get("is_error",True))
 except Exception: print(True)')

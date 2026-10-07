@@ -9,6 +9,10 @@ Rules:
   - Keep their copyright headers. Add a header line `# Vendored from <project>@<commit>:<path> (<license>)`, or `//` for TS/Go.
   - Record each copied file in `VENDOR.toml`.
   - NEVER use Open-ClaudeCode or any leaked Claude Code source.
+- Work in small steps and commit work in progress often, at least after every finished module.
+  - Keep a short `PROGRESS.md` at the repo root (done / in progress / next). A later session may have to continue from it.
+  - Do not stop to announce next steps; keep calling tools until the task is done.
+- Keep your context small: read files in focused ranges, never dump huge files or `node_modules`, and pipe long command output through `tail` or `head`.
 - Write tests for what you build. Run them and make them pass before finishing.
 - Keep the code style consistent: Python 3.12+, type hints, `ruff`-clean, small modules.
 - Do not push and do not create PRs. Commit your work on the current branch with clear messages, ending with:
