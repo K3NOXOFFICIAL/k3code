@@ -302,11 +302,19 @@ def check_vendor() -> Check:
     return Check("vendor", FAIL, last, "fix VENDOR.toml / the vendored file headers")
 
 
-def check_sandbox() -> Check:
-    from k3code.reliability.sandbox import bwrap_path
+def check_sandbox(probe: bool = True) -> Check:
+    from k3code.reliability import sandbox
 
-    path = bwrap_path()
+    path = sandbox.bwrap_path()
     if path:
+        # bwrap present is not enough: user namespaces may be blocked, and then every sandboxed command fails
+        if probe and not sandbox.usable():
+            return Check(
+                "sandbox",
+                WARN,
+                "bubblewrap is installed but unusable (user namespaces blocked?); unattended bash runs unsandboxed",
+                "allow unprivileged user namespaces for bwrap (try: bwrap --ro-bind / / true)",
+            )
         return Check("sandbox", OK, f"bubblewrap at {path}")
     return Check(
         "sandbox",
@@ -348,7 +356,8 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
         check_home(home),
         check_journal(home),
         check_vendor(),
-        check_sandbox(),
+        # the probe runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
+        await asyncio.to_thread(check_sandbox, probe),
         check_isolation(),
     ]
     return checks

@@ -14,6 +14,7 @@ import { FACES } from '../content/faces.js'
 import { VERBS } from '../content/verbs.js'
 import { fmtDuration } from '../domain/messages.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
+import { isReducedMotion } from '../lib/animation.js'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
 import { useScrollbarSnapshot, useViewportSnapshot } from '../lib/viewportStore.js'
 import type { Theme } from '../theme.js'
@@ -135,6 +136,8 @@ function FaceTicker({
   const [verbTick, setVerbTick] = useState(() => Math.floor(Math.random() * VERBS.length))
   const [now, setNow] = useState(() => Date.now())
   const isOccluded = useStore($isStatusRuleOccluded)
+  // Reduced motion (K3_NO_ANIMATION): static glyph and verb; the elapsed clock still ticks.
+  const [reduced] = useState(() => isReducedMotion())
 
   // Pre-compute cadence + verb-visibility for the active style so an
   // `/indicator` switch re-arms the interval (and skips the verb timer
@@ -159,6 +162,13 @@ function FaceTicker({
 
     setNow(Date.now())
 
+    if (reduced) {
+      // Reduced motion: no glyph or verb timers, only the elapsed clock ticks (once a second).
+      const clockOnly = setInterval(() => setNow(Date.now()), 1000)
+
+      return () => clearInterval(clockOnly)
+    }
+
     const glyph = setInterval(() => setTick(n => n + 1), intervalMs)
     const clock = setInterval(() => setNow(Date.now()), 1000)
     // Verb timer is gated on `displayVerb` — `unicode` style hides the verb
@@ -174,7 +184,7 @@ function FaceTicker({
         clearInterval(verb)
       }
     }
-  }, [displayVerb, freezeVerb, intervalMs, isOccluded])
+  }, [displayVerb, freezeVerb, intervalMs, isOccluded, reduced])
 
   const { frame } = renderIndicator(style, tick)
   const verb = verbOverride ?? VERBS[verbTick % VERBS.length] ?? ''

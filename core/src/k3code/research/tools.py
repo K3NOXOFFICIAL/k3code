@@ -294,6 +294,28 @@ def parse_search_text(text: str) -> list[Hit]:
     return hits
 
 
+class DeadLink(RuntimeError):
+    """The page is gone (404/410, a 5xx, no connection): citing its search snippet would be a dead link."""
+
+
+_DEAD_STATUS = re.compile(r"\b(?:404|410|5\d\d)\b")
+_DEAD_TEXT = re.compile(
+    r"not found|connection refused|connection reset|econnrefused|econnreset|enotfound|getaddrinfo|"
+    r"name or service not known|could not resolve|name resolution|\bdns\b",
+    re.IGNORECASE,
+)
+_URL = re.compile(r"https?://\S+")
+
+
+def mcp_fetch_error(text: str) -> RuntimeError:
+    """DeadLink when an MCP fetch error names a missing page or a failed connection; a plain RuntimeError otherwise
+    (a timeout or a 401/403/429 means the page exists). URLs echoed in the message are not matched: the path of
+    .../issues/503 or the host dns.google is not a status or a DNS failure."""
+    bare = _URL.sub(" ", text)
+    dead = _DEAD_STATUS.search(bare) or _DEAD_TEXT.search(bare)
+    return DeadLink(text[:200]) if dead else RuntimeError(text[:200])
+
+
 class McpTools(ResearchTools):
     """Search/fetch through connected MCP tools (e.g. k3nox ``hub_searxng`` and ``hub_fetch``)."""
 
@@ -317,7 +339,7 @@ class McpTools(ResearchTools):
             return await self.fallback.fetch(url)
         res = await self.mcp.call(self.fetch_tool.qualified, {self._arg(self.fetch_tool, "url", "uri"): url})
         if "error" in res:
-            raise RuntimeError(str(res["error"])[:200])
+            raise mcp_fetch_error(str(res["error"]))
         text = str(res.get("content", ""))
         return url, text[:MAX_FETCH_CHARS]
 

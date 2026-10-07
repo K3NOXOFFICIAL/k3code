@@ -20,7 +20,7 @@ from k3code.agent.loop import AgentLoop
 from k3code.config import K3CODE_HOME, _current_home, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_skill_tool
-from k3code.permissions import PermissionMode
+from k3code.permissions import InvalidPermissionMode, PermissionMode, permission_mode_from_config
 from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
 from k3code.reliability import (
@@ -258,6 +258,14 @@ async def _run_repl(
     await reliability.stop()
 
 
+def _permission_from_config(key: str, value: str) -> PermissionMode:
+    """The PermissionMode for a config string. An unknown value is a usage error, not a ValueError traceback."""
+    try:
+        return permission_mode_from_config(key, value)
+    except InvalidPermissionMode as e:
+        raise click.ClickException(str(e)) from None
+
+
 @click.command()
 @click.option("-p", "--prompt", "prompt", help="Headless prompt; omit for REPL")
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
@@ -311,7 +319,12 @@ def main(
 
     # The flag wins; then headless_permission (-p only); then the config's permission_mode. The flag used to default
     # to "ask", which silently ignored a configured permission_mode in -p and REPL runs.
-    permission_mode = PermissionMode(permission or (prompt and config.headless_permission) or config.permission_mode)
+    if permission:
+        permission_mode = PermissionMode(permission)  # --permission is a click.Choice, so this cannot fail
+    elif prompt and config.headless_permission:
+        permission_mode = _permission_from_config("headless_permission", config.headless_permission)
+    else:
+        permission_mode = _permission_from_config("permission_mode", config.permission_mode)
 
     if prompt:
         result = asyncio.run(
@@ -368,7 +381,10 @@ def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = 
         logger.warning("TUI not available (need node + tui/dist/entry.js); falling back to REPL")
         config = load_config(project_dir=Path.cwd())
         with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(_run_repl(model=model, permission_mode=PermissionMode(config.permission_mode), config=config))
+            asyncio.run(_run_repl(
+                model=model, permission_mode=_permission_from_config("permission_mode", config.permission_mode),
+                config=config,
+            ))
         return
 
     env = os.environ.copy()

@@ -61,7 +61,7 @@ from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
-from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, suggest_rules
+from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
@@ -121,8 +121,15 @@ class LiveSession:
         self.todo_revision = 0
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
         self.pending_request_id: str | None = None
+        # an invalid configured permission_mode fails this session's creation with a named error (an RPC reply), not
+        # a bare ValueError from the constructor
+        mode = (
+            PermissionMode(stored.meta["mode"])
+            if stored.meta.get("mode")
+            else permission_mode_from_config("permission_mode", server.config.permission_mode)
+        )
         self.perms = PermissionState(
-            mode=PermissionMode(stored.meta.get("mode") or server.config.permission_mode),
+            mode=mode,
             cwd=Path(stored.cwd or Path.cwd()),
             add_dirs=list(stored.meta.get("add_dirs") or []),
         )

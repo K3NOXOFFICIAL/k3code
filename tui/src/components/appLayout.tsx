@@ -8,6 +8,7 @@ import { Fragment, memo, type MutableRefObject, useEffect, useMemo, useRef } fro
 import { useGateway } from '../app/gatewayContext.js'
 import type { AppLayoutProps } from '../app/interfaces.js'
 import { $isBlocked, $overlayState, patchOverlayState } from '../app/overlayStore.js'
+import { $petEnabled } from '../app/petStore.js'
 import { $uiState } from '../app/uiStore.js'
 import { INLINE_MODE, NATIVE_MODE, SHOW_FPS, TERMUX_TUI_MODE } from '../config/env.js'
 import { PLACEHOLDER } from '../content/placeholders.js'
@@ -20,6 +21,7 @@ import {
 } from '../lib/inputMetrics.js'
 import { PerfPane } from '../lib/perfPane.js'
 import { composerPromptText } from '../lib/prompt.js'
+import { petColumnWidth } from '../lib/terminalPet.js'
 import { ActiveWidgetSlot, AmbientDock, AmbientRail, useAmbientRailWidth } from '../sdk/host.js'
 
 import { AgentsOverlay } from './agentsOverlay.js'
@@ -38,6 +40,8 @@ import { MessageLine } from './messageLine.js'
 import { QueuedMessages } from './queuedMessages.js'
 import { LiveTodoPanel, StreamingAssistant } from './streamingAssistant.js'
 import { type InputCursorSnapshot, TextInput, type TextInputMouseApi } from './textInput.js'
+import { PetCorner } from './terminalPet.js'
+import { WorkingLine } from './workingLine.js'
 
 const PromptPrefix = memo(function PromptPrefix({
   bold = false,
@@ -72,7 +76,8 @@ const TranscriptPane = memo(function TranscriptPane({
   transcript
 }: Pick<AppLayoutProps, 'actions' | 'composer' | 'progress' | 'transcript'> & { nativeMode: boolean }) {
   const ui = useStore($uiState)
-  const railCols = useAmbientRailWidth('left') + useAmbientRailWidth('right')
+  const petEnabled = useStore($petEnabled)
+  const railCols = useAmbientRailWidth('left') + useAmbientRailWidth('right') + petColumnWidth(petEnabled, composer.cols)
   const bodyCols = Math.max(28, composer.cols - railCols)
 
   // LiveTodoPanel rides as a child of the latest user-message row so it
@@ -339,6 +344,10 @@ const ComposerPane = memo(function ComposerPane({
         {!nativeMode && composer.input === '?' && !composer.inputBuf.length && <HelpHint t={ui.theme} />}
 
         {!isBlocked && (
+          <WorkingLine busy={ui.busy} effort={ui.info?.reasoning_effort} startedAt={status.turnStartedAt} t={ui.theme} />
+        )}
+
+        {!isBlocked && (
           <>
             {composer.inputBuf.map((line, i) => (
               <Box key={i}>
@@ -533,6 +542,7 @@ export const AppLayout = memo(function AppLayout({
             </PerfPane>
           )}
           {!overlay.agents && !overlay.journey && <AmbientRail side="right" />}
+          {!overlay.agents && !overlay.journey && <PetCorner busy={ui.busy} cols={composer.cols} t={ui.theme} />}
         </Box>
 
         {!overlay.agents && !overlay.journey && (
