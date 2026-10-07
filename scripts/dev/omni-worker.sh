@@ -59,7 +59,7 @@ RUNTIME_SETTINGS=""
 if curl -s -o /dev/null -m 5 "$DIRECT_URL/"; then
   RUNTIME_SETTINGS=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/k3dev-settings.XXXXXX.json")
   chmod 600 "$RUNTIME_SETTINGS"
-  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.setdefault("env",{})["ANTHROPIC_BASE_URL"]=sys.argv[2]; d["env"]["API_TIMEOUT_MS"]="900000"; d["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"]="1"; d["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]="110000"; json.dump(d,open(sys.argv[3],"w"))' \
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.setdefault("env",{})["ANTHROPIC_BASE_URL"]=sys.argv[2]; d["env"]["API_TIMEOUT_MS"]="900000"; d["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"]="1"; d["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]="110000"; d["env"]["CLAUDE_CODE_DISABLE_THINKING"]="1"; d["env"]["DISABLE_PROMPT_CACHING"]="1"; json.dump(d,open(sys.argv[3],"w"))' \
     "$SETTINGS" "$DIRECT_URL" "$RUNTIME_SETTINGS"
   trap 'rm -f "$RUNTIME_SETTINGS"' EXIT
   trap 'exit 143' INT TERM HUP
