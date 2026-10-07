@@ -90,6 +90,40 @@ async def test_agent_loop_write_then_read(temp_cwd):
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_tool_calls_only_on_final_message(temp_cwd):
+    """Regression test: real providers (openai_compat, anthropic) only attach
+    parsed tool calls to the final "done" message — they never emit a separate
+    "tool_call"-type StreamEvent as the call is assembled off the wire. The loop
+    must still execute the tool in that case (it must not rely solely on
+    "tool_call" events, which no real provider currently produces).
+    """
+    test_file = temp_cwd / "test.txt"
+    write_call = ToolCall(id="call_1", name="write", arguments={"path": str(test_file), "content": "hi"})
+    msg1 = Message(role="assistant", content=None, tool_calls=[write_call])
+    msg2 = Message(role="assistant", content="Wrote the file", tool_calls=[])
+
+    # Note: no make_tool_call_event(...) here, matching the real providers' contract.
+    provider = FakeProvider([
+        [make_done_event(msg1)],
+        [make_done_event(msg2)],
+    ])
+
+    chain = build_chain([provider], [["fake-model"]])
+    router = Router(chain, max_retries=0)
+
+    loop = AgentLoop(router, system_prompt="test", max_turns=5, permission_mode="yolo", cwd=temp_cwd)
+
+    events = []
+    async for event in loop.run(f"Create {test_file} with 'hi'"):
+        events.append(event)
+
+    assert test_file.read_text() == "hi"
+    tool_results = [e for e in events if e.type == "done" and e.message and e.message.role == "tool"]
+    assert len(tool_results) == 1
+    assert "True" in tool_results[0].message.content  # str(result) of {"ok": True, "path": ...}
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_max_turns(temp_cwd):
     """Agent stops after max_turns."""
     # Always returns a tool call, never finishes

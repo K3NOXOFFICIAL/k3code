@@ -70,6 +70,12 @@ class AgentLoop:
                     if self.on_text_delta:
                         await self.on_text_delta(event.text)
                 elif event.type == "tool_call" and event.tool_call:
+                    # Some providers may emit per-call events incrementally as they're
+                    # parsed off the stream; both real providers (openai_compat,
+                    # anthropic) currently don't — they only attach the fully-parsed
+                    # list to the final "done" message below, which is the
+                    # authoritative source. Accumulate here too in case a future/
+                    # other provider relies on this instead.
                     tool_calls.append(event.tool_call)
                 elif event.type == "done" and event.message:
                     final_message = event.message
@@ -77,8 +83,11 @@ class AgentLoop:
 
             if final_message:
                 messages.append(final_message)
-                # If no tool calls, we're done
-                if not final_message.tool_calls:
+                # The final message's tool_calls is the authoritative list (see note
+                # above); prefer it over whatever was accumulated from live events.
+                if final_message.tool_calls:
+                    tool_calls = final_message.tool_calls
+                else:
                     logger.info("Agent finished (no tool calls)")
                     return
 
