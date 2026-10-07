@@ -25,7 +25,7 @@ from k3code.routing.tiers import TaskKind, Tier
 logger = logging.getLogger(__name__)
 
 CITE_RE = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\]")
-DEFAULTS = {"sub_questions": 4, "results_per_query": 4, "sources_per_topic": 3, "concurrency": 4, "max_claims": 60}
+DEFAULTS = {"sub_questions": 5, "results_per_query": 6, "sources_per_topic": 4, "concurrency": 4, "max_claims": 60}
 
 
 class ResearchUnavailable(Exception):

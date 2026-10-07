@@ -14,7 +14,7 @@ import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
@@ -181,6 +181,53 @@ class SearxngSearch:
         return out
 
 
+class DuckDuckGoSearch:
+    """Keyless fallback: DuckDuckGo's HTML endpoint. Used only when SearXNG is not reachable, so /ultraresearch works on
+    a machine that cannot see the owner's SearXNG (a fresh install, a laptop on a hotel network)."""
+
+    URL = "https://html.duckduckgo.com/html/"
+    _ANCHOR = re.compile(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.S)
+    _SNIPPET = re.compile(r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|td|div)>', re.S)
+
+    def __init__(self, *, client: httpx.AsyncClient | None = None) -> None:
+        self._client = client
+
+    @staticmethod
+    def _clean(fragment: str) -> str:
+        return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", fragment))).strip()
+
+    @classmethod
+    def parse(cls, page: str, n: int = 5) -> list[Hit]:
+        anchors = list(cls._ANCHOR.finditer(page))
+        hits: list[Hit] = []
+        for i, m in enumerate(anchors):
+            href = html.unescape(m.group(1))
+            if href.startswith("//"):
+                href = "https:" + href
+            query = parse_qs(urlparse(href).query)
+            url = unquote(query["uddg"][0]) if "uddg" in query else href  # DuckDuckGo wraps the target in /l/?uddg=
+            if _safe_url(url) is None or "duckduckgo.com/y.js" in url:  # not http(s), or an ad
+                continue
+            end = anchors[i + 1].start() if i + 1 < len(anchors) else len(page)
+            snippet = cls._SNIPPET.search(page, m.end(), end)  # the snippet that belongs to this result only
+            hits.append(Hit(cls._clean(m.group(2)) or url, url, cls._clean(snippet.group(1)) if snippet else ""))
+            if len(hits) >= n:
+                break
+        return hits
+
+    async def search(self, query: str, n: int = 5) -> list[Hit]:
+        own = self._client is None
+        agent = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
+        client = self._client or httpx.AsyncClient(timeout=15.0, headers=agent)
+        try:
+            r = await client.post(self.URL, data={"q": query})
+            r.raise_for_status()
+        finally:
+            if own:
+                await client.aclose()
+        return self.parse(r.text, n)
+
+
 # ── tool providers used by the research flow ──
 
 
@@ -202,14 +249,21 @@ class ResearchTools:
 class BuiltinTools(ResearchTools):
     name = "builtin web_search/web_fetch"
 
-    def __init__(self, searxng_url: str | None) -> None:
+    def __init__(self, searxng_url: str | None, *, keyless_fallback: bool = True) -> None:
         self.searx = SearxngSearch(searxng_url)
+        self.ddg = DuckDuckGoSearch() if keyless_fallback else None
 
     async def unavailable_reason(self) -> str:
-        return "" if await self.searx.available() else self.searx.reason
+        if await self.searx.available() or self.ddg is not None:
+            return ""
+        return self.searx.reason
 
     async def search(self, query: str, n: int = 5) -> list[Hit]:
-        return await self.searx.search(query, n)
+        if await self.searx.available():
+            return await self.searx.search(query, n)
+        if self.ddg is not None:
+            return await self.ddg.search(query, n)
+        return []
 
     async def fetch(self, url: str) -> tuple[str, str]:
         return await fetch_page(url)
@@ -287,7 +341,9 @@ def rank_tool(tools: list[Any], strong: tuple[str, ...], generic: tuple[str, ...
 def pick_tools(config: Any, mcp: Any) -> ResearchTools:
     """MCP search/fetch when connected, else the built-ins."""
     cfg = dict(getattr(config, "research", None) or {})
-    builtin = BuiltinTools(cfg.get("searxng_url", DEFAULT_SEARXNG))
+    builtin = BuiltinTools(
+        cfg.get("searxng_url", DEFAULT_SEARXNG), keyless_fallback=bool(cfg.get("keyless_fallback", True))
+    )
     tools = list(mcp.tools()) if mcp is not None else []
     search = rank_tool(tools, ("searxng", "web_search", "websearch", "web-search"), ("search",), _NOT_WEB)
     if search is not None:

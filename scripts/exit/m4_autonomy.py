@@ -648,10 +648,64 @@ def preview() -> None:
 
 
 # ---------------------------------------------------------------- 6. /ultraresearch
+def ultraresearch_live() -> tuple[str, str]:
+    """Real /ultraresearch (live model, keyless DuckDuckGo search), then GET every cited URL."""
+    import httpx
+
+    from test_autonomy_gateway import GatewayServer, ProviderEntry, SessionStore, Settings, call
+
+    d = sub("research-live")
+    os.environ["K3CODE_HOME"] = str(d / "home")
+    os.environ.pop("K3CODE_FAKE_PROVIDER", None)
+    provider = ProviderEntry(
+        name="claude-code", kind="claude-cli", models={"default": lib.LIVE_DEFAULT_MODEL},
+        tiers={"strong": lib.LIVE_DEFAULT_MODEL, "cheap": lib.LIVE_CHEAP_MODEL, "fast": lib.LIVE_CHEAP_MODEL})
+    # searxng_url "" = no SearXNG: the built-in tools search through the keyless DuckDuckGo fallback
+    server = GatewayServer(config=Settings(providers=[provider], permission_mode="auto", research={"searxng_url": ""}),
+                           store=SessionStore(d / "sessions.db"))
+    frames: list[str] = []
+    server._write = frames.append  # type: ignore[method-assign]
+    server._frames = frames  # type: ignore[attr-defined]
+    question = "How do Python asyncio TaskGroups differ from asyncio.gather, and when should each be used?"
+
+    async def go():
+        await call(server, "session.create", {"cwd": str(d)})
+        t0 = time.monotonic()
+        res = await server.research.run(server.session, question)
+        return res, time.monotonic() - t0
+
+    res, secs = asyncio.run(go())
+    by_id = {s.id: s for s in res.state.sources}
+    urls = [by_id[i].url for i in res.cited if i in by_id]
+    ok = 0
+    bad: list[str] = []
+    agent = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
+    with httpx.Client(follow_redirects=True, timeout=25.0, headers=agent) as c:
+        for u in urls:
+            try:
+                r = c.get(u)
+                if r.status_code < 400:
+                    ok += 1
+                else:
+                    bad.append(f"{r.status_code} {u[:60]}")
+            except Exception as e:  # noqa: BLE001
+                bad.append(f"{type(e).__name__} {u[:60]}")
+    status = "PASS" if ok >= 10 else "FAIL"
+    ev = (f"question: {question}\n{len(res.state.sources)} sources read, {len(urls)} cited, {ok} resolve (HTTP 2xx/3xx) "
+          f"in a {secs:.0f} s run via {res.tools}\nnon-resolving: {bad or 'none'}\n"
+          f"report saved: {res.path}")
+    return status, ev
+
+
 def ultraresearch() -> None:
     crit = "/ultraresearch yields >=10 resolving citations"
     how = "live /ultraresearch (fake-tools pipeline test run for harness correctness)"
     rc, out = lib.run(["uv", "run", "pytest", "-q", "tests/test_research.py"], cwd=CORE, timeout=300)
+    if LIVE_OK and BACKEND["kind"] == "claude-cli":
+        status, ev = ultraresearch_live()
+        emit(M, crit, f"real /ultraresearch on a real question: {BACKEND['label']}; keyless DuckDuckGo search; "
+             f"every cited URL fetched (pipeline tests rc={rc})", status, ev)
+        return
     dns = lib.run("getent hosts <searxng-host> || echo '<searxng-host>: no DNS answer'")[1].strip()
     mcp_note = "k3nox hub_searxng MCP is not configured in this temp home"
     reasons = []

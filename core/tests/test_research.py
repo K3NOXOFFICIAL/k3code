@@ -152,11 +152,12 @@ async def test_ultraresearch_tiers_and_writer_sees_crosscheck_flags(tmp_path, mo
 
 
 async def test_ultraresearch_clear_message_when_search_unavailable(tmp_path, monkeypatch):
-    server = make(tmp_path, monkeypatch, [], mode="auto", research={"searxng_url": "http://127.0.0.1:9"})
+    off = {"keyless_fallback": False}  # with the DuckDuckGo fallback on, a down SearXNG is no longer an error
+    server = make(tmp_path, monkeypatch, [], mode="auto", research={"searxng_url": "http://127.0.0.1:9", **off})
     await call(server, "session.create", {"cwd": str(tmp_path)})
     out = await call(server, "slash.exec", {"command": "ultraresearch anything"})
     assert "unavailable" in out["output"] and "unreachable" in out["output"] and "research.searxng_url" in out["output"]
-    server.config.research = {"searxng_url": ""}
+    server.config.research = {"searxng_url": "", **off}
     out = await call(server, "slash.exec", {"command": "ultraresearch anything"})
     assert "no SearXNG URL configured" in out["output"]
     out = await call(server, "slash.exec", {"command": "ultraresearch"})
@@ -288,3 +289,56 @@ async def test_fetch_page_reads_a_capped_prefix_not_the_whole_body():
         title, text = await tools.fetch_page("https://example.com/huge", client=client)
     assert len(text) <= tools.MAX_FETCH_CHARS and text.startswith("x")
     assert served["bytes"] < 6 * tools.MAX_FETCH_BYTES  # stopped reading soon after the cap
+
+
+# ── keyless fallback: DuckDuckGo's HTML endpoint when SearXNG is not reachable ──
+
+def _ddg_result(target: str, title: str, snippet: str | None = None) -> str:
+    wrapped = "//duckduckgo.com/l/?uddg=" + target + "&amp;rut=abc"
+    out = f'<div class="result results_links"><a rel="nofollow" class="result__a" href="{wrapped}">{title}</a>'
+    if snippet is not None:
+        out += f'<a class="result__snippet" href="{wrapped}">{snippet}</a>'
+    return out + "</div>"
+
+
+DDG_PAGE = "".join([
+    _ddg_result(
+        "https%3A%2F%2Fdocs.python.org%2F3%2Flibrary%2Fasyncio%2Dtask.html",
+        "asyncio &mdash; <b>Task</b> groups",
+        "A <b>TaskGroup</b> waits for all its tasks.",
+    ),
+    '<div class="result result--ad"><a rel="nofollow" class="result__a" '
+    'href="https://duckduckgo.com/y.js?ad_domain=ads.example&amp;u3=x">An ad</a></div>',  # an ad: no snippet, skipped
+    _ddg_result("https%3A%2F%2Fexample.org%2Fa%3Fb%3D1%26c%3D2", "Second result", "Second   snippet"),
+    '<div class="result"><a class="result__a" href="javascript:alert(1)">not http</a></div>',
+])
+
+
+def test_duckduckgo_results_are_unwrapped_and_cleaned():
+    from k3code.research.tools import DuckDuckGoSearch
+
+    hits = DuckDuckGoSearch.parse(DDG_PAGE, 5)
+    assert [h.url for h in hits] == [
+        "https://docs.python.org/3/library/asyncio-task.html",
+        "https://example.org/a?b=1&c=2",
+    ]
+    assert hits[0].title == "asyncio — Task groups" and hits[0].snippet == "A TaskGroup waits for all its tasks."
+    assert hits[1].snippet == "Second snippet"
+    assert len(DuckDuckGoSearch.parse(DDG_PAGE, 1)) == 1
+
+
+async def test_builtin_tools_fall_back_to_duckduckgo_only_when_searxng_is_down():
+    import httpx
+
+    from k3code.research import tools
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "html.duckduckgo.com" and request.method == "POST"
+        return httpx.Response(200, text=DDG_PAGE)
+
+    bt = tools.BuiltinTools("http://127.0.0.1:9", keyless_fallback=True)  # nothing listens on port 9
+    bt.ddg = tools.DuckDuckGoSearch(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    assert await bt.unavailable_reason() == ""
+    assert [h.url for h in await bt.search("asyncio taskgroup", 5)][0].startswith("https://docs.python.org/")
+    off = tools.BuiltinTools("http://127.0.0.1:9", keyless_fallback=False)
+    assert "SearXNG" in await off.unavailable_reason()
