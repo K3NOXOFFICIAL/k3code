@@ -69,6 +69,8 @@ from k3code.redact import redact
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
 from k3code.reliability.persistent_retry import TurnCancelled
+from k3code.research.flow import Research
+from k3code.research.tools import register_web_tools
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 from k3code.routing.caller import ModelCaller
 from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router_options, tier_for
@@ -272,6 +274,8 @@ class GatewayServer:
         self.subagents = SubagentManager(self)
         self.fanout = FanoutExecutor(self)
         self.ultra = Ultra(self)
+        self.research = Research(self)
+        self.research_tools: Any = None  # test seam: replaces the MCP/built-in search+fetch provider
 
     # ── session registry ──────────────────────────────────────────────
 
@@ -810,6 +814,7 @@ class GatewayServer:
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
         register_task_tools(loop.tools, self, session, depth=1)
+        register_web_tools(loop.tools, self.config)
         return loop
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:

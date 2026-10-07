@@ -119,3 +119,41 @@ license = "MIT"
 local_path = "core/src/k3code/subagents/worktree.py"
 modified = true
 note = "design port: one git worktree + branch per child, finalize/diff, non-interactive git env; rewritten async"
+
+[[file]]
+project = "atomic-agents"
+upstream_path = "atomic-examples/deep-research/deep_research/state.py"
+commit = "d2b61b90b2816dbdf9f42f8638b7d375bf08cd11"
+license = "MIT"
+local_path = "core/src/k3code/research/state.py"
+sha256_upstream = "c9f1f92b8f02f4f39bbcb19497f9f813543f099df19ff11c2f7a290ee80730d9"
+modified = true
+note = "Eigenwise/atomic-agents; research state design (Source/Learning/SubTopic, stable S-ids) adapted"
+
+[[file]]
+project = "atomic-agents"
+upstream_path = "atomic-examples/deep-research/deep_research/agents/planner_agent.py"
+commit = "d2b61b90b2816dbdf9f42f8638b7d375bf08cd11"
+license = "MIT"
+local_path = "core/src/k3code/research/prompts.py"
+sha256_upstream = "e11d9784e8e56ba5b2087f4c45284d86e5ce1ebf22c0de53cf2a3c918ec504cb"
+modified = true
+note = "planner/extractor/reflector/writer system prompts adapted (instructor/pydantic schemas replaced by JSON replies; no instructor dependency)"
+
+[[file]]
+project = "atomic-agents"
+upstream_path = "atomic-examples/deep-research/deep_research/main.py"
+commit = "d2b61b90b2816dbdf9f42f8638b7d375bf08cd11"
+license = "MIT"
+local_path = "core/src/k3code/research/flow.py"
+modified = true
+note = "design port: plan -> search -> extract -> reflect -> write pipeline reimplemented over ModelCaller tiers"
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "hermes_cli/kanban_swarm.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/autonomy/fanout.py"
+modified = true
+note = "design port only: decompose -> parallel workers -> review -> sequential merge; rewritten, no code copied"

@@ -1,0 +1,313 @@
+"""Research tools: ``web_search`` (SearXNG), ``web_fetch`` (httpx + readability-lite) and MCP discovery.
+
+MCP servers win when they offer a search/fetch tool (the k3nox ``hub_searxng`` / ``hub_fetch`` family); otherwise the
+built-ins are used. ``research.searxng_url`` defaults to https://<searxng-host> and is probed once; if it is
+unreachable ``web_search`` is disabled with a clear message instead of failing every call.
+"""
+
+from __future__ import annotations
+
+import html
+import json
+import logging
+import re
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+
+from k3code.providers.types import ToolSpec
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_SEARXNG = "https://<searxng-host>"
+MAX_FETCH_CHARS = 14_000
+UA = "k3code-research/0.1 (+https://github.com/k3nox/k3code)"
+
+
+@dataclass
+class Hit:
+    title: str
+    url: str
+    snippet: str = ""
+
+
+# ── readability-lite ──
+
+_SKIP = {"script", "style", "noscript", "nav", "footer", "header", "aside", "form", "svg", "iframe"}
+_BLOCK = {"p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "section", "article", "pre", "blockquote"}
+
+
+class _Text(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.title = ""
+        self._skip = 0
+        self._in_title = False
+        self._main_depth = 0
+        self.main_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in _SKIP:
+            self._skip += 1
+        elif tag == "title":
+            self._in_title = True
+        elif tag in ("main", "article"):
+            self._main_depth += 1
+        if tag in _BLOCK:
+            self._emit("\n")
+        if tag in ("h1", "h2", "h3"):
+            self._emit("\n# ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _SKIP and self._skip:
+            self._skip -= 1
+        elif tag == "title":
+            self._in_title = False
+        elif tag in ("main", "article") and self._main_depth:
+            self._main_depth -= 1
+        if tag in _BLOCK:
+            self._emit("\n")
+
+    def _emit(self, s: str) -> None:
+        if self._skip:
+            return
+        self.parts.append(s)
+        if self._main_depth:
+            self.main_parts.append(s)
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title += data
+        elif not self._skip:
+            self._emit(data)
+
+
+def extract_text(markup: str) -> tuple[str, str]:
+    """(title, text) from HTML: scripts/nav/footers dropped, <main>/<article> preferred, whitespace collapsed."""
+    p = _Text()
+    try:
+        p.feed(markup)
+        p.close()
+    except Exception:  # noqa: BLE001 - malformed markup: use whatever was parsed
+        logger.debug("html parse error", exc_info=True)
+    chunks = p.main_parts if len("".join(p.main_parts).strip()) > 400 else p.parts
+    text = html.unescape("".join(chunks))
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
+    return re.sub(r"\s+", " ", p.title).strip(), text
+
+
+def _safe_url(url: str) -> str | None:
+    u = urlparse(url)
+    return url if u.scheme in ("http", "https") and u.netloc else None
+
+
+async def fetch_page(url: str, *, timeout: float = 20.0, client: httpx.AsyncClient | None = None) -> tuple[str, str]:
+    """(title, text) of a web page (text truncated). Raises ValueError/httpx errors for the caller to report."""
+    if _safe_url(url) is None:
+        raise ValueError(f"not an http(s) URL: {url}")
+    own = client is None
+    client = client or httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": UA})
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+    finally:
+        if own:
+            await client.aclose()
+    ctype = r.headers.get("content-type", "")
+    if "html" in ctype or r.text.lstrip().lower().startswith(("<!doctype", "<html")):
+        title, text = extract_text(r.text)
+    else:
+        title, text = url, r.text
+    return title or url, text[:MAX_FETCH_CHARS]
+
+
+class SearxngSearch:
+    """SearXNG JSON search; probes the instance once and stays disabled (with a reason) if unreachable."""
+
+    def __init__(self, url: str | None, *, client: httpx.AsyncClient | None = None) -> None:
+        self.url = (url or "").rstrip("/")
+        self._client = client
+        self._ok: bool | None = None
+        self.reason = ""
+
+    async def _get(self, params: dict[str, str]) -> httpx.Response:
+        own = self._client is None
+        client = self._client or httpx.AsyncClient(timeout=15.0, headers={"User-Agent": UA})
+        try:
+            return await client.get(f"{self.url}/search", params=params)
+        finally:
+            if own:
+                await client.aclose()
+
+    async def available(self) -> bool:
+        if self._ok is not None:
+            return self._ok
+        if not self.url:
+            self._ok, self.reason = False, "no SearXNG URL configured (set research.searxng_url)"
+            return False
+        try:
+            r = await self._get({"q": "test", "format": "json"})
+            r.raise_for_status()
+            r.json()
+            self._ok = True
+        except Exception as e:  # noqa: BLE001
+            self._ok = False
+            self.reason = (f"SearXNG at {self.url} is unreachable or not returning JSON ({type(e).__name__}); "
+                           "set research.searxng_url to a working instance")
+        return self._ok
+
+    async def search(self, query: str, n: int = 5) -> list[Hit]:
+        r = await self._get({"q": query, "format": "json"})
+        r.raise_for_status()
+        out = []
+        for item in (r.json().get("results") or [])[:n]:
+            if isinstance(item, dict) and item.get("url"):
+                out.append(Hit(str(item.get("title") or item["url"]), str(item["url"]), str(item.get("content") or "")))
+        return out
+
+
+# ── tool providers used by the research flow ──
+
+
+class ResearchTools:
+    """What the flow needs: ``search`` and ``fetch``. Subclassed by the built-in and the MCP provider (and by tests)."""
+
+    name = "none"
+
+    async def unavailable_reason(self) -> str:
+        return ""
+
+    async def search(self, query: str, n: int = 5) -> list[Hit]:
+        raise NotImplementedError
+
+    async def fetch(self, url: str) -> tuple[str, str]:
+        raise NotImplementedError
+
+
+class BuiltinTools(ResearchTools):
+    name = "builtin web_search/web_fetch"
+
+    def __init__(self, searxng_url: str | None) -> None:
+        self.searx = SearxngSearch(searxng_url)
+
+    async def unavailable_reason(self) -> str:
+        return "" if await self.searx.available() else self.searx.reason
+
+    async def search(self, query: str, n: int = 5) -> list[Hit]:
+        return await self.searx.search(query, n)
+
+    async def fetch(self, url: str) -> tuple[str, str]:
+        return await fetch_page(url)
+
+
+_URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
+
+
+def parse_search_text(text: str) -> list[Hit]:
+    """Hits from an MCP search tool's reply: JSON (results/items list) or URL-bearing text blocks."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    items = data.get("results") if isinstance(data, dict) else data if isinstance(data, list) else None
+    hits: list[Hit] = []
+    if isinstance(items, list):
+        for it in items:
+            if isinstance(it, dict) and (it.get("url") or it.get("link")):
+                url = str(it.get("url") or it.get("link"))
+                hits.append(Hit(str(it.get("title") or url), url, str(it.get("content") or it.get("snippet") or "")))
+        if hits:
+            return hits
+    for line in text.splitlines():
+        m = _URL_RE.search(line)
+        if m:
+            hits.append(Hit(line.replace(m.group(0), "").strip(" -*:[]()") or m.group(0), m.group(0).rstrip(".,;")))
+    return hits
+
+
+class McpTools(ResearchTools):
+    """Search/fetch through connected MCP tools (e.g. k3nox ``hub_searxng`` and ``hub_fetch``)."""
+
+    def __init__(self, mcp: Any, search_tool: Any, fetch_tool: Any | None, fallback: BuiltinTools) -> None:
+        self.mcp, self.search_tool, self.fetch_tool, self.fallback = mcp, search_tool, fetch_tool, fallback
+        self.name = f"MCP {search_tool.qualified}" + (f" + {fetch_tool.qualified}" if fetch_tool else "")
+
+    @staticmethod
+    def _arg(tool: Any, *candidates: str) -> str:
+        props = (tool.schema or {}).get("properties") or {}
+        return next((c for c in candidates if c in props), candidates[0])
+
+    async def search(self, query: str, n: int = 5) -> list[Hit]:
+        res = await self.mcp.call(self.search_tool.qualified, {self._arg(self.search_tool, "query", "q"): query})
+        if "error" in res:
+            raise RuntimeError(str(res["error"])[:200])
+        return parse_search_text(str(res.get("content", "")))[:n]
+
+    async def fetch(self, url: str) -> tuple[str, str]:
+        if self.fetch_tool is None:
+            return await self.fallback.fetch(url)
+        res = await self.mcp.call(self.fetch_tool.qualified, {self._arg(self.fetch_tool, "url", "uri"): url})
+        if "error" in res:
+            raise RuntimeError(str(res["error"])[:200])
+        text = str(res.get("content", ""))
+        return url, text[:MAX_FETCH_CHARS]
+
+
+def pick_tools(config: Any, mcp: Any) -> ResearchTools:
+    """MCP search/fetch when connected, else the built-ins."""
+    cfg = dict(getattr(config, "research", None) or {})
+    builtin = BuiltinTools(cfg.get("searxng_url", DEFAULT_SEARXNG))
+    tools = list(mcp.tools()) if mcp is not None else []
+    search = next((t for t in tools if "search" in t.name.lower() and "tool_search" not in t.name.lower()), None)
+    if search is not None:
+        fetch = next((t for t in tools if "fetch" in t.name.lower() or "scrape" in t.name.lower()), None)
+        return McpTools(mcp, search, fetch, builtin)
+    return builtin
+
+
+# ── agent-facing tools ──
+
+
+def register_web_tools(reg: Any, config: Any) -> None:
+    """``web_fetch`` always; ``web_search`` over SearXNG (probed lazily, disabled with a message if unreachable)."""
+    cfg = dict(getattr(config, "research", None) or {})
+    searx = SearxngSearch(cfg.get("searxng_url", DEFAULT_SEARXNG))
+
+    async def tool_fetch(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
+        url = str(arguments.get("url") or "")
+        try:
+            title, text = await fetch_page(url)
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"web_fetch failed: {e}"}
+        return {"content": f"# {title}\n{url}\n\n{text}"}
+
+    async def tool_search(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
+        query = str(arguments.get("query") or "").strip()
+        if not query:
+            return {"error": "web_search needs a query"}
+        if not await searx.available():
+            return {"error": f"web_search is disabled: {searx.reason}"}
+        try:
+            hits = await searx.search(query, int(arguments.get("limit") or 5))
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"web_search failed: {e}"}
+        return {"content": "\n".join(f"- {h.title}\n  {h.url}\n  {h.snippet[:200]}" for h in hits) or "no results"}
+
+    reg.register(
+        ToolSpec(name="web_fetch", description="Fetch a web page and return its readable text.",
+                 parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+                 side_effect=False),
+        tool_fetch,
+    )
+    reg.register(
+        ToolSpec(name="web_search", description="Search the web (SearXNG). Returns titles, URLs and snippets.",
+                 parameters={"type": "object", "properties": {"query": {"type": "string"},
+                                                              "limit": {"type": "integer"}}, "required": ["query"]},
+                 side_effect=False),
+        tool_search,
+    )
