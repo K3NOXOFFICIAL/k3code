@@ -42,9 +42,28 @@ else
   RESUMING=1   # restarted driver on an existing worktree: continue from its state
 fi
 
+# Prefer OmniRoute's tailnet address: the public URL sits behind Cloudflare, which cuts
+# responses after ~100 s (HTTP 524). The settings copy lives in RAM (XDG_RUNTIME_DIR, 0600)
+# and is removed on exit; it holds the same key as the source profile.
+DIRECT_URL=${K3DEV_DIRECT_URL:-http://<omniroute-host>:20128}
+RUNTIME_SETTINGS=""
+if curl -s -o /dev/null -m 5 "$DIRECT_URL/"; then
+  RUNTIME_SETTINGS=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/k3dev-settings.XXXXXX.json")
+  chmod 600 "$RUNTIME_SETTINGS"
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.setdefault("env",{})["ANTHROPIC_BASE_URL"]=sys.argv[2]; d["env"]["API_TIMEOUT_MS"]="900000"; json.dump(d,open(sys.argv[3],"w"))' \
+    "$SETTINGS" "$DIRECT_URL" "$RUNTIME_SETTINGS"
+  trap 'rm -f "$RUNTIME_SETTINGS"' EXIT
+  trap 'exit 143' INT TERM HUP
+  SETTINGS=$RUNTIME_SETTINGS
+  HEALTH_URL="$DIRECT_URL/"
+else
+  HEALTH_URL="https://<omniroute-public-host>/"
+fi
+echo "$(date -Is) gateway=$HEALTH_URL" >> "$RUNS/driver.log"
+
 wait_online() {  # pause while offline / gateway unreachable, resume automatically
   local n=0
-  until curl -s -o /dev/null -m 10 https://<omniroute-public-host>/; do
+  until curl -s -o /dev/null -m 10 "$HEALTH_URL"; do
     [ $((n % 6)) -eq 0 ] && echo "$(date -Is) offline/gateway down — waiting" >> "$RUNS/driver.log"
     n=$((n + 1)); sleep 20
   done
@@ -81,7 +100,10 @@ try: print(json.load(sys.stdin).get("session_id",""))
 except Exception: print("")')
   [ -n "$sid" ] && SESSION=$sid
   # Context exhausted (or compaction failed): continue in a fresh session from the worktree state.
-  if grep -qiE "prompt is too long|compaction failed|context.{0,20}(length|window)" "$out" "$RUNS/attempt-$attempt.err" 2>/dev/null; then
+  if printf '%s' "$json" | python3 -c 'import sys,json,re
+try: r=json.load(sys.stdin).get("result") or ""
+except Exception: r=""
+sys.exit(0 if re.search(r"prompt is too long|compaction failed|context length exceeded|maximum context", r, re.I) else 1)'; then
     echo "$(date -Is) context exhausted — next attempt starts a fresh session" >> "$RUNS/driver.log"
     SESSION=""
     PROMPT=$(resume_prompt)
