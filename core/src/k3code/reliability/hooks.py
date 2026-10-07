@@ -23,7 +23,7 @@ from typing import Any
 from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec
 from k3code.reliability import events as ev
 from k3code.reliability.events import EventEmitter
-from k3code.reliability.governor import Budget, BudgetExceeded, DiskGuardFull, Governor, GovernorConfig
+from k3code.reliability.governor import DAY_LEDGER, Budget, BudgetExceeded, DiskGuardFull, Governor, GovernorConfig
 from k3code.reliability.journal import ToolJournal, interrupted_result
 from k3code.reliability.loopguard import GuardOutcome, LoopGuard, Verdict
 from k3code.reliability.netwatch import NetState, NetWatch, NetWatchConfig
@@ -87,7 +87,9 @@ class Reliability:
         self.cancel_token = cancel_token or CancelToken()
         self.netwatch = NetWatch(NetWatchConfig(**(netwatch_config or {}))) if self.flags.netwatch else None
         self.retry_config = RetryConfig(max_wait=max_wait)
-        self.governor = Governor(GovernorConfig(), events=self.events) if self.flags.budget_guard else None
+        self.governor = (
+            Governor(GovernorConfig(), events=self.events, day_ledger=DAY_LEDGER) if self.flags.budget_guard else None
+        )
         self.loop_guard = LoopGuard() if self.flags.loop_guard else None
         self.journal: ToolJournal | None = None  # opened lazily in _open_journal
         self.retry: PersistentRetry | None = None  # built in attach_router
@@ -188,12 +190,16 @@ class Reliability:
     # ── tool hooks (M2: journal + loop guard) ──
 
     def begin_turn(self) -> None:
-        """Start a fresh run: the loop guard only judges repetition *within* one run.
+        """Start a fresh run: clear a previous ``/stop`` and judge loop-guard repetition only *within* one run.
+
+        ``/stop`` sets the cancel token; the bundle (and its token) lives as long as the session, so without the
+        reset every later turn of that session was refused as "interrupted" without a single model call.
 
         The bundle lives as long as the session, so without this an identical reply in two
         separate turns (a ``/loop`` tick that answers "nothing changed" twice) counted as a
         doom loop and escalated a cheap background turn to the main tier.
         """
+        self.cancel_token.reset()
         if self.loop_guard is not None:
             self.loop_guard.reset()
 
@@ -324,7 +330,7 @@ class Reliability:
             return None
         err = self.governor.check_budgets()
         if err is not None:
-            self.events.emit(ev.BUDGET_EXCEEDED, detail=str(err), scope=err.scope, kind=err.kind)
+            self.events.emit(ev.BUDGET_EXCEEDED, detail=str(err), scope=err.scope, budget_kind=err.kind)
         return err
 
     def check_disk(self) -> DiskGuardFull | None:

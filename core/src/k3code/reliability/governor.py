@@ -19,7 +19,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import shutil
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -104,6 +105,30 @@ class Budget:
         return None
 
 
+class _DayLedger:
+    """Process-wide spend of the current local day: ``day`` budgets are shared by every session and rolled at midnight.
+
+    Each session has its own Governor, so a per-governor counter made the "day" cap per session and never reset.
+    The ledger lives in the daemon process; a daemon restart starts the day's count from zero.
+    """
+
+    def __init__(self) -> None:
+        self.date = ""
+        self.tokens = 0
+        self.usd = 0.0
+
+    def roll(self, today: str) -> None:
+        if self.date != today:
+            self.date, self.tokens, self.usd = today, 0, 0.0
+
+
+DAY_LEDGER = _DayLedger()
+
+
+def _local_date() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
 @dataclass
 class GovernorConfig:
     """All governor knobs, configurable via config later."""
@@ -136,9 +161,13 @@ class Governor:
         config: GovernorConfig | None = None,
         *,
         events: EventEmitter | None = None,
+        day_ledger: _DayLedger | None = None,
     ) -> None:
         self.config = config or GovernorConfig()
         self.events = events or EventEmitter()
+        #: Sessions of one daemon pass the shared ``DAY_LEDGER``; a bare Governor keeps its own day count.
+        self.day_ledger = day_ledger or _DayLedger()
+        self.today: Callable[[], str] = _local_date  # injectable clock for the day budget (tests)
         self._counters = _Counters()
         self._budgets: dict[str, Budget] = {}
         self._lock = asyncio.Lock()
@@ -184,13 +213,21 @@ class Governor:
     def record_usage(self, prompt_tokens: int, completion_tokens: int, *, usd: float | None = None) -> None:
         """Apply a usage report (from router 'done' messages) to every budget."""
         cost = usd if usd is not None else (prompt_tokens + completion_tokens) / self.config.tokens_per_usd
+        self.day_ledger.roll(self.today())
+        self.day_ledger.tokens += prompt_tokens + completion_tokens
+        self.day_ledger.usd += cost
         for b in self._budgets.values():
+            if b.scope == "day":
+                continue  # synced from the shared ledger in check_budgets
             b.used_tokens += prompt_tokens + completion_tokens
             b.used_usd += cost
 
     def check_budgets(self) -> BudgetExceeded | None:
         """First budget violation, or None."""
+        self.day_ledger.roll(self.today())
         for b in self._budgets.values():
+            if b.scope == "day":
+                b.used_tokens, b.used_usd = self.day_ledger.tokens, self.day_ledger.usd
             msg = b.would_exceed()  # usage already applied; check without delta
             if msg is None:
                 continue

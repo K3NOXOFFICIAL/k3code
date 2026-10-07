@@ -994,7 +994,12 @@ class GatewayServer:
             final_text += chunk
             session.emit("message.delta", {"text": chunk})
 
+        async def on_text_reset() -> None:
+            nonlocal final_text
+            final_text = ""  # a retried attempt streams the answer again; judge and loop hash want one copy
+
         loop.on_text_delta = on_text_delta
+        loop.on_text_reset = on_text_reset
 
         session.emit("message.start", {})
         session.emit("status.update", {"kind": "status", "text": "thinking", "state": "working"})
@@ -1052,6 +1057,7 @@ class GatewayServer:
                     session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
                 )
                 loop.on_text_delta = on_text_delta
+                loop.on_text_reset = on_text_reset
                 session.loop = loop
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"

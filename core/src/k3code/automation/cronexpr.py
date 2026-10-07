@@ -114,6 +114,22 @@ def parse_cron(expr: str) -> CronSpec:
     return CronSpec(*sets, dom_star=parts[2].startswith("*"), dow_star=parts[4].startswith("*"))
 
 
+def _first_after(wall: datetime, after: float) -> float | None:
+    """Epoch of the wall-clock time ``wall`` that is strictly after ``after``, or None.
+
+    Datetime arithmetic drops ``fold``, so inside the repeated DST fall-back hour a candidate resolved to its first
+    (summer-time) occurrence even when ``after`` was already in the second pass: ``cron_next`` then returned a time
+    ~55 minutes in the past and the job re-fired back to back. Try both occurrences and take the earlier one that is
+    still in the future.
+    """
+    best: float | None = None
+    for fold in (0, 1):
+        ts = wall.replace(fold=fold).timestamp()
+        if ts > after and (best is None or ts < best):
+            best = ts
+    return best
+
+
 def cron_next(expr: str, after: float, tz: tzinfo | None = None) -> float:
     """First matching minute strictly after ``after`` (epoch seconds)."""
     spec = parse_cron(expr)
@@ -126,7 +142,9 @@ def cron_next(expr: str, after: float, tz: tzinfo | None = None) -> float:
                 for m in sorted(spec.minute):
                     if h == dt.hour and m < dt.minute:
                         continue
-                    return dt.replace(hour=h, minute=m).timestamp()
+                    ts = _first_after(dt.replace(hour=h, minute=m), after)
+                    if ts is not None:
+                        return ts
         dt = (dt + timedelta(days=1)).replace(hour=0, minute=0)
     raise ScheduleError(f"cron expression never fires: {expr!r}")
 

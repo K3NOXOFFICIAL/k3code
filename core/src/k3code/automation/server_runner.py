@@ -143,6 +143,9 @@ class ServerRunner:
         finished.sort(key=lambda s: s.stored.updated_at)
         for old in finished[: max(0, len(finished) - KEEP_FINISHED_RUNS)]:
             self.server.live.pop(old.session_id, None)  # stays in the session store, resumable by id
+            if old.reliability is not None:  # an evicted session's netwatch tasks would otherwise run forever
+                with contextlib.suppress(Exception):
+                    await old.reliability.stop()
 
     async def run_shell(self, command: str, cwd: str) -> tuple[int, str]:
         """Run a shell command inside the bwrap sandbox (unsandboxed with a note when bwrap is unusable)."""
@@ -162,6 +165,7 @@ class ServerRunner:
     async def start_goal(self, objective: str, session_id: str | None, cwd: str) -> RunResult:
         """Create (or reuse) a session, set a /goal on it and let the goal loop drive it."""
         srv = self.server
+        created = session_id is None
         if session_id is None:
             stored = srv.store.create(
                 title=f"goal: {objective[:40]}", model=srv.config.default_model, cwd=cwd or str(Path.cwd())
@@ -176,7 +180,11 @@ class ServerRunner:
         mgr = srv.goal_manager(live)
         mgr.set(objective, max_turns=None, check=None)
         srv.emit_goal(live)
-        return await self.run_prompt(mgr.kick_prompt() or objective, session_id=session_id)
+        try:
+            return await self.run_prompt(mgr.kick_prompt() or objective, session_id=session_id)
+        finally:
+            if created:  # run_prompt sees an existing session here and skips its own release: do it for the fresh one
+                await self._release(live)
 
     def notify(self, text: str, level: str = "info", key: str = "") -> None:
         payload: dict[str, Any] = {"text": text, "level": level, "kind": "ttl", "ttl_ms": 12000}

@@ -55,3 +55,27 @@ def test_sunday_zero_and_seven():
 def test_bad_expressions(bad):
     with pytest.raises(ScheduleError):
         parse_schedule(bad)
+
+
+def test_cron_next_is_strictly_after_inside_the_dst_fall_back_hour():
+    """Europe/Berlin leaves summer time on 2026-10-25 (03:00 CEST -> 02:00 CET): 02:xx happens twice. cron_next
+    resolved the candidate to the first pass even when `after` was already in the second, returning the past."""
+    from datetime import UTC, datetime
+    from zoneinfo import ZoneInfo
+
+    from k3code.automation.cronexpr import cron_next
+
+    berlin = ZoneInfo("Europe/Berlin")
+
+    def at(hh, mm, fold):
+        return datetime(2026, 10, 25, hh, mm, tzinfo=berlin, fold=fold).timestamp()
+
+    for expr, minute in (("50 2 * * *", 50), ("20 2 * * *", 20), ("*/10 2 * * *", None)):
+        for after in (at(2, 15, 0), at(2, 45, 0), at(2, 15, 1), at(2, 45, 1), at(1, 59, 0), at(3, 0, 1)):
+            nxt = cron_next(expr, after, berlin)
+            assert nxt > after, (expr, datetime.fromtimestamp(after, UTC), datetime.fromtimestamp(nxt, UTC))
+            assert nxt - after < 26 * 3600
+            if minute is not None:
+                assert datetime.fromtimestamp(nxt, berlin).minute == minute
+    # second pass, 02:45 CET: "50 2" is 02:50 CET (five minutes later), not 02:50 CEST (an hour ago)
+    assert cron_next("50 2 * * *", at(2, 45, 1), berlin) == at(2, 50, 1)

@@ -291,3 +291,28 @@ def test_build_chain_expands_models():
     assert chain[2].model == "c"
     assert chain[0].provider_index == 0
     assert chain[2].provider_index == 1
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "max_tokens: 8192 > 4096, which is the maximum allowed number of output tokens for claude-3-haiku",
+        "max_tokens is too large: 8192. This model supports at most 4096 completion tokens",
+        "Invalid value for max_completion_tokens: exceeds the output token limit of this model",
+    ],
+)
+def test_rejected_output_token_cap_is_entry_specific_not_context_overflow(message):
+    """A 400 about the output cap used to be context_overflow, which aborts the fallback walk (no failover, and
+    nothing compaction could fix): the healthy next entry got zero calls on every unattended tick."""
+    from k3code.providers.base import ProviderError
+
+    err = ProviderError(message, status_code=400)
+    assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.bad_request
+
+
+def test_a_genuine_context_overflow_is_still_context_overflow():
+    from k3code.providers.base import ProviderError
+
+    msg = "This model's maximum context length is 8192 tokens, however you requested 9000"
+    err = ProviderError(msg, status_code=400)
+    assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.context_overflow

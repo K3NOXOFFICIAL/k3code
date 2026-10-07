@@ -286,3 +286,47 @@ def test_budget_boundary_is_strictly_greater(psi_dir: Path, tmp_path: Path):
     b = Budget(scope="session", tokens=10)
     assert b.would_exceed(tokens=10) is None  # equal is fine
     assert b.would_exceed(tokens=11) is not None
+
+
+# ── regressions: the Reliability wrapper and the day budget ──
+
+
+def test_reliability_budget_exceeded_reports_instead_of_raising_typeerror():
+    """emit(kind=...) collided with EventEmitter.emit's own `kind` parameter: every exceeded budget was a TypeError."""
+    from k3code.reliability import Reliability
+    from k3code.reliability import events as ev
+
+    rel = Reliability.from_settings(None, session="s")
+    rel.governor.add_budget(Budget(scope="session", tokens=100))
+    seen = []
+    rel.events.add(seen.append)
+    rel.governor.record_usage(80, 40)
+    err = rel.check_budgets()
+    assert err is not None and err.scope == "session" and err.kind == "tokens"
+    assert [e.kind for e in seen] == [ev.BUDGET_EXCEEDED]
+    assert seen[0].data["budget_kind"] == "tokens"
+
+
+def test_day_budget_is_shared_across_sessions_and_rolls_over_at_midnight():
+    from k3code.reliability.governor import _DayLedger
+
+    ledger = _DayLedger()  # what sessions of one daemon share (hooks.py passes DAY_LEDGER)
+    a, b = Governor(day_ledger=ledger), Governor(day_ledger=ledger)
+    day = ["2026-10-07"]
+    a.today = b.today = lambda: day[0]
+    a.add_budget(Budget(scope="day", tokens=100))
+    b.add_budget(Budget(scope="day", tokens=100))
+    a.record_usage(40, 20)
+    assert a.check_budgets() is None and b.check_budgets() is None
+    b.record_usage(30, 20)  # a different session spends the rest of today's budget
+    assert a.check_budgets() is not None and b.check_budgets() is not None
+    day[0] = "2026-10-08"  # next local day: counters start over
+    assert a.check_budgets() is None and b.check_budgets() is None
+
+
+def test_sessions_built_by_reliability_share_the_process_day_ledger():
+    from k3code.reliability import Reliability
+    from k3code.reliability.governor import DAY_LEDGER
+
+    a, b = Reliability.from_settings(None, session="a"), Reliability.from_settings(None, session="b")
+    assert a.governor.day_ledger is b.governor.day_ledger is DAY_LEDGER

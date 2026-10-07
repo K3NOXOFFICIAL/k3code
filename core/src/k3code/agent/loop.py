@@ -87,6 +87,8 @@ class AgentLoop:
         self._sandbox_warned = False
         self.on_event = on_event
         self.on_text_delta = on_text_delta
+        #: called when a retry makes the streamed text so far void (the consumer clears its copy)
+        self.on_text_reset: Callable[[], Awaitable[None]] | None = None
         self.approval_callback = approval_callback
         self.tools = build_registry()
         self._interrupt = asyncio.Event()
@@ -206,6 +208,12 @@ class AgentLoop:
                     text_parts.append(event.text)
                     if self.on_text_delta:
                         await self.on_text_delta(event.text)
+                elif event.type == "reset":
+                    # the router is retrying after partial output: forget what this attempt streamed
+                    text_parts.clear()
+                    tool_calls.clear()
+                    if self.on_text_reset:
+                        await self.on_text_reset()
                 elif event.type == "tool_call" and event.tool_call:
                     # Some providers may emit per-call events incrementally as they're
                     # parsed off the stream; both real providers (openai_compat,

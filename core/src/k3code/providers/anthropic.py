@@ -96,6 +96,7 @@ class AnthropicProvider(Provider):
             # tool index -> {"id", "name", "args"}
             tool_blocks: dict[int, dict[str, Any]] = {}
             usage_in = usage_out = 0
+            complete = False  # message_stop arrived
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -107,6 +108,10 @@ class AnthropicProvider(Provider):
                 except json.JSONDecodeError:
                     continue
                 etype = event.get("type")
+                if etype == "error":
+                    raise _inband_error(event)  # overloaded_error etc. after a 200
+                if etype == "message_stop":
+                    complete = True
                 if etype == "content_block_start":
                     block = event.get("content_block") or {}
                     if block.get("type") == "tool_use":
@@ -133,6 +138,11 @@ class AnthropicProvider(Provider):
                 elif etype == "message_delta":
                     usage = event.get("usage") or {}
                     usage_out = int(usage.get("output_tokens") or 0)
+            if not complete:
+                raise to_provider_error(
+                    httpx.RemoteProtocolError("peer closed connection: stream ended before message_stop"),
+                    kind="anthropic",
+                )
             from k3code.providers.types import Usage
 
             usage = Usage(prompt_tokens=usage_in, completion_tokens=usage_out)
@@ -168,6 +178,25 @@ async def _error_from_response(response: httpx.Response) -> ProviderError:
         body = {}
     message = _error_message(body) or f"HTTP {response.status_code}"
     return ProviderError(message=message, status_code=response.status_code, headers=dict(response.headers), body=body)
+
+
+_INBAND_STATUS = {
+    "overloaded_error": 529,
+    "rate_limit_error": 429,
+    "api_error": 500,
+    "authentication_error": 401,
+    "permission_error": 403,
+    "not_found_error": 404,
+    "invalid_request_error": 400,
+}
+
+
+def _inband_error(event: dict[str, Any]) -> ProviderError:
+    """An ``event: error`` inside a 200 stream, as a ProviderError the classifier understands."""
+    err = event.get("error") if isinstance(event.get("error"), dict) else {}
+    status = _INBAND_STATUS.get(str(err.get("type") or ""), 500)
+    message = str(err.get("message") or "error in stream")
+    return ProviderError(message=message, status_code=status, headers={}, body=event)
 
 
 def _error_message(body: dict[str, Any]) -> str:

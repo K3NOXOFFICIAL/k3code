@@ -240,10 +240,12 @@ class Router:
             attempt = 0
             while True:
                 self._emit("router.attempt", entry, attempt=attempt + 1)
+                streamed = False  # this attempt already yielded output the consumer has collected
                 try:
                     async for event in entry.provider.stream(
                         messages, tools, target_model, max_tokens=max_tokens, temperature=temperature
                     ):
+                        streamed = True
                         yield event
                     # The provider yields its "done" event then closes normally.
                     return
@@ -254,6 +256,11 @@ class Router:
                     all_network = all_network and classified.reason is FailoverReason.network
                     if classified.reason is FailoverReason.context_overflow:
                         raise ContextOverflow(summarize(exc, limit=500)) from exc
+                    if streamed:
+                        # The next attempt (same entry or the next one) streams the answer from the start: tell the
+                        # consumer to drop what it has, or it would see "Hello Hello world".
+                        streamed = False
+                        yield StreamEvent(type="reset")
                     cooldown = self._cooldown_seconds(classified)
                     if cooldown is not None or classified.immediate_failover:
                         self._failover(

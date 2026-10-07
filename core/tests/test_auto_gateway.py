@@ -217,3 +217,20 @@ async def test_stats_command_with_days_filter(tmp_path, monkeypatch):
     out = await cmd(server, "/stats day 7", sid)
     assert "cron_job" in out["output"] and "cheap" in out["output"]
     assert server.usage.aggregate("session", days=1)
+
+
+async def test_goal_automations_do_not_leak_sessions_or_netwatch_tasks(tmp_path, monkeypatch):
+    """start_goal created a session then ran it as an "existing" one, so run_prompt never released it: every fire of a
+    goal automation left a LiveSession and a started NetWatch (two forever-tasks) behind."""
+    from k3code.automation.server_runner import KEEP_FINISHED_RUNS, ServerRunner
+
+    server, provider = make_server(tmp_path, monkeypatch, ["goal reply"])
+    runner = ServerRunner(server)
+    async with asyncio.timeout(60):  # a leak used to hang the shutdown below
+        for _ in range(KEEP_FINISHED_RUNS + 6):
+            await runner.start_goal("tidy the repo", None, str(tmp_path))
+        unattended = [s for s in server.live.values() if s.stored.meta.get("origin") == runner.origin]
+        assert len(unattended) <= KEEP_FINISHED_RUNS
+        # none of them keeps polling the network while idle
+        assert all(s.reliability is None or not s.reliability._started for s in unattended)
+        await server.close()

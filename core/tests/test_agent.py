@@ -217,3 +217,72 @@ async def test_a_long_session_of_turns_never_hits_the_recursion_limit(temp_cwd):
         async for _event in loop.run(f"turn {i}"):
             pass
     assert provider._call_count == 1300
+
+
+@pytest.mark.asyncio
+async def test_a_stop_does_not_poison_the_next_turn_of_the_session(temp_cwd):
+    """/stop sets the bundle's cancel token; the next turn of the same session must run normally."""
+    from k3code.reliability import Reliability
+
+    msg = Message(role="assistant", content="hello", tool_calls=[])
+    provider = FakeProvider([[make_done_event(msg)]] * 3)
+    router = Router(build_chain([provider], [["fake-model"]]), max_retries=0)
+    reliability = Reliability.from_settings(None, session="s")
+    reliability.cancel()  # what the gateway does on /stop
+    loop = AgentLoop(
+        router, system_prompt="t", max_turns=3, permission_mode="yolo", cwd=temp_cwd, reliability=reliability
+    )
+    done = [e async for e in loop.run("again") if e.type == "done"]
+    assert done and done[-1].message.content == "hello"
+    assert provider._call_count == 1
+    assert reliability.cancel_token.cancelled is False
+
+
+class _FlakyMidStream:
+    """Streams half an answer, dies, then streams the whole answer (a proxy that dropped the connection)."""
+
+    name = "flaky"
+    base_url = "https://flaky.test"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+        import httpx
+
+        self.calls += 1
+        yield make_text_event("Hello ")
+        if self.calls == 1:
+            raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+        yield make_text_event("world")
+        yield make_done_event(Message(role="assistant", content="Hello world", tool_calls=[]))
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_a_retry_after_partial_output_resets_the_consumers_copy(temp_cwd):
+    """The router used to retry silently after text had already been yielded: consumers saw "Hello Hello world"."""
+    provider = _FlakyMidStream()
+    router = Router(build_chain([provider], [["fake-model"]]), max_retries=1, base_delay=0.0, max_delay=0.0)
+    loop = AgentLoop(router, system_prompt="t", max_turns=3, permission_mode="yolo", cwd=temp_cwd)
+    seen: list[str] = []
+    resets: list[int] = []
+
+    async def on_delta(chunk: str) -> None:
+        seen.append(chunk)
+
+    async def on_reset() -> None:
+        resets.append(len(seen))
+        seen.clear()
+
+    loop.on_text_delta = on_delta
+    loop.on_text_reset = on_reset
+    events = [e async for e in loop.run("hi")]
+    assert provider.calls == 2
+    assert resets == [1]  # one partial chunk was discarded
+    assert "".join(seen) == "Hello world"
+    assert [e.type for e in events].count("reset") == 1
+    done = [e for e in events if e.type == "done"]
+    assert done[-1].message.content == "Hello world"

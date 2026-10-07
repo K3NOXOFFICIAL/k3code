@@ -62,6 +62,10 @@ class CancelToken:
     def cancel(self) -> None:
         self._event.set()
 
+    def reset(self) -> None:
+        """Clear the flag in place (PersistentRetry holds this same instance, so it must not be replaced)."""
+        self._event.clear()
+
     @property
     def cancelled(self) -> bool:
         return self._event.is_set()

@@ -96,18 +96,24 @@ class OpenAICompatProvider(Provider):
             tool_calls: dict[int, dict[str, Any]] = {}
             content_parts: list[str] = []
             usage = None
+            complete = False  # [DONE] or a finish_reason arrived: the answer is whole
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
+                    complete = True
                     break
                 try:
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(chunk, dict) and chunk.get("error") and not chunk.get("choices"):
+                    raise _inband_error(chunk)  # the upstream failed after answering 200
                 choices = chunk.get("choices") or []
                 if choices:
+                    if choices[0].get("finish_reason"):
+                        complete = True
                     delta = choices[0].get("delta") or {}
                     if text := delta.get("content"):
                         content_parts.append(text)
@@ -124,6 +130,15 @@ class OpenAICompatProvider(Provider):
                             slot["args"].append(args)
                 if chunk_usage := chunk.get("usage"):
                     usage = _parse_usage(chunk_usage)
+            if not complete:
+                # A proxy closing early or an upstream dying mid-answer ends the body cleanly: without this the
+                # half sentence became a successful turn, was saved to history and never failed over.
+                raise to_provider_error(
+                    httpx.RemoteProtocolError(
+                        "peer closed connection: stream ended before the completion finished (no [DONE]/finish_reason)"
+                    ),
+                    kind="openai",
+                )
             final_calls: list[ToolCall] = []
             for idx in sorted(tool_calls):
                 slot = tool_calls[idx]
@@ -156,6 +171,24 @@ async def _error_from_response(response: httpx.Response) -> ProviderError:
     message = _error_message(body) or f"HTTP {response.status_code}"
     headers = dict(response.headers)
     return ProviderError(message=message, status_code=response.status_code, headers=headers, body=body)
+
+
+def _inband_error(chunk: dict[str, Any]) -> ProviderError:
+    """An ``{"error": {...}}`` data chunk inside a 200 stream, as a ProviderError the classifier understands."""
+    err = chunk.get("error")
+    status = None
+    if isinstance(err, dict):
+        for key in ("status", "status_code", "code"):
+            value = err.get(key)
+            if isinstance(value, int) and 400 <= value < 600:
+                status = value
+                break
+            if isinstance(value, str) and value.isdigit() and 400 <= int(value) < 600:
+                status = int(value)
+                break
+    return ProviderError(
+        message=_error_message(chunk) or "error in stream", status_code=status or 502, headers={}, body=chunk
+    )
 
 
 def _error_message(body: dict[str, Any]) -> str:

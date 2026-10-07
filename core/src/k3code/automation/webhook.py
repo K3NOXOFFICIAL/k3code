@@ -17,6 +17,7 @@ from typing import Any
 logger = logging.getLogger("k3code.automation.webhook")
 
 MAX_HEADER_BYTES = 16 * 1024
+READ_TIMEOUT_S = 10.0  # reading + authenticating the request; the action itself is not bound by it
 MAX_BODY_BYTES = 1024 * 1024
 Handler = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -37,6 +38,7 @@ class WebhookServer:
         self.host = host
         self._hooks: dict[str, tuple[str, Handler]] = {}
         self._server: asyncio.AbstractServer | None = None
+        self._tasks: set[asyncio.Task[None]] = set()  # fired actions: they outlive the HTTP request that started them
 
     def register(self, automation_id: str, token: str, handler: Handler) -> None:
         self._hooks[automation_id] = (token, handler)
@@ -54,10 +56,31 @@ class WebhookServer:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        tasks = list(self._tasks)
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _spawn(self, handler: Handler, event: dict[str, Any]) -> None:
+        """Run the action in the background and answer 202 now: a prompt/goal/shell action takes far longer than
+        the request timeout (it used to be cancelled 10 s in and the sender saw 400, then retried)."""
+
+        async def run() -> None:
+            try:
+                await handler(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("webhook action failed")
+
+        task = asyncio.get_running_loop().create_task(run(), name="k3-webhook-action")
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
-            status, body = await asyncio.wait_for(self._handle(reader), 10)
+            status, body = await asyncio.wait_for(self._handle(reader), READ_TIMEOUT_S)
         except Exception:  # noqa: BLE001
             status, body = 400, {"error": "bad request"}
         payload = json.dumps(body).encode()
@@ -94,5 +117,5 @@ class WebhookServer:
         if length > MAX_BODY_BYTES:
             return 413, {"error": "body too large"}
         raw = await reader.readexactly(length) if length else b""
-        await handler({"event": "webhook", "body": raw.decode("utf-8", "replace")[:2000]})
+        self._spawn(handler, {"event": "webhook", "body": raw.decode("utf-8", "replace")[:2000]})
         return 202, {"ok": True}

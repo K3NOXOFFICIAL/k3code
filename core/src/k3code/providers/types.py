@@ -53,7 +53,9 @@ class ToolSpec:
 class StreamEvent:
     """One streaming event, normalized."""
 
-    type: Literal["text_delta", "tool_call", "done", "error"]
+    #: "reset": the router is retrying or failing over after this attempt already streamed output; consumers discard
+    #: the partial text/tool calls they collected (the new attempt streams the whole answer again).
+    type: Literal["text_delta", "tool_call", "done", "error", "reset"]
     text: str | None = None
     tool_call: ToolCall | None = None
     message: Message | None = None  # set on "done": the full assistant message

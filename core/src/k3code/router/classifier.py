@@ -140,7 +140,7 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = (
 _CONTEXT_OVERFLOW_PATTERNS = (
     "context length", "context size", "maximum context", "token limit", "too many tokens",
     "reduce the length", "exceeds the limit", "context window", "prompt is too long",
-    "prompt exceeds max length", "max_tokens", "maximum number of tokens",
+    "prompt exceeds max length", "maximum number of tokens",
     "exceeds the max_model_len", "max_model_len", "prompt length", "input is too long",
     "maximum model length", "context length exceeded", "truncating input",
     "slot context", "n_ctx_slot",
@@ -152,6 +152,11 @@ _CONTEXT_OVERFLOW_PATTERNS = (
     "request entity too large", "payload too large", "error code: 413", "request_too_large",
     "request exceeds the maximum size",
 )
+
+# A rejected *output* cap ("max_tokens: 8192 > 4096, the maximum allowed number of output tokens for this model",
+# "max_tokens is too large ...") is about this one entry, not about the conversation: another entry can serve the
+# request, and compaction cannot help. Classified as overflow it aborted the whole fallback walk on every tick.
+_OUTPUT_CAP_PATTERNS = ("max_tokens", "max_completion_tokens", "output tokens", "output token limit")
 
 _CONTEXT_OVERFLOW_ERROR_CODES = frozenset({"context_length_exceeded", "max_tokens_exceeded"})
 
@@ -356,6 +361,8 @@ def _status_400(c: _Ctx) -> FailoverReason:
     if any(p in msg for p in _REQUEST_VALIDATION_PATTERNS if p != "invalid_request_error"):
         return _R.bad_request
     if code in {"unknown_parameter", "unsupported_parameter"}:
+        return _R.bad_request
+    if code not in _CONTEXT_OVERFLOW_ERROR_CODES and any(p in msg for p in _OUTPUT_CAP_PATTERNS):
         return _R.bad_request
     # A malformed message array is not overflow: the input can be tiny and
     # compaction cannot fix it.

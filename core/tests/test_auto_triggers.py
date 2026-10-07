@@ -137,6 +137,7 @@ async def test_webhook_auth():
     assert await _post(port, "/hook/abc", "s3cret", '{"a":1}') == 202
     assert await _post(port, "/hook/abc", "Bearer wrong", header="Authorization") == 401
     assert await _post(port, "/hook/abc", "Bearer s3cret", header="Authorization") == 202
+    await until(lambda: len(events) >= 2)  # the action runs in the background after the 202
     assert events[0]["event"] == "webhook" and json.loads(events[0]["body"]) == {"a": 1}
     await srv.stop()
 
@@ -231,7 +232,8 @@ async def test_manager_file_trigger_and_webhook_end_to_end(tmp_path):
     token = w["trigger"]["token"]
     assert await _post(m.webhook.port, f"/hook/{w['id']}", "nope") == 401
     assert await _post(m.webhook.port, f"/hook/{w['id']}", token, "hi") == 202
-    assert r.notes and r.notes[0][0] == "hooked hi"
+    await until(lambda: bool(r.notes))
+    assert r.notes[0][0] == "hooked hi"
     m.add(
         name="files",
         trigger={"type": "file_change", "glob": "*.txt", "debounce": 0.05},
@@ -278,3 +280,44 @@ def test_suggestions_dedup_latch(tmp_path):
 
 async def test_result_type_unused():
     assert RunResult("completed").status == "completed"
+
+
+async def test_webhook_action_longer_than_the_request_timeout_is_not_killed(monkeypatch):
+    """The whole action used to run inside the request's wait_for(10 s): a real agent turn was cancelled mid-flight
+    and the sender (GitHub, CI) got a 400 and retried it."""
+    from k3code.automation import webhook
+
+    monkeypatch.setattr(webhook, "READ_TIMEOUT_S", 0.2)
+    finished = []
+
+    async def slow(event):
+        await asyncio.sleep(0.6)  # 3x the request timeout
+        finished.append(event["body"])
+
+    srv = WebhookServer(0)
+    port = await srv.start()
+    srv.register("abc", "s3cret", slow)
+    assert await _post(port, "/hook/abc", "s3cret", "payload") == 202  # answered at once, not after 0.6 s
+    assert finished == []
+    await until(lambda: finished == ["payload"], tries=300)
+    await srv.stop()
+
+
+async def test_webhook_stop_cancels_running_actions():
+    started, cancelled = asyncio.Event(), []
+
+    async def forever(event):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    srv = WebhookServer(0)
+    port = await srv.start()
+    srv.register("abc", "s3cret", forever)
+    assert await _post(port, "/hook/abc", "s3cret") == 202
+    await asyncio.wait_for(started.wait(), 5)
+    await srv.stop()
+    assert cancelled == [True]
