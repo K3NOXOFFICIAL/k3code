@@ -1,318 +1,533 @@
 #!/bin/sh
-# k3code installer: POSIX sh, idempotent, no root.
+# k3code installer. POSIX sh, no root, safe to re-run.
 #
-#   curl -fsSL <raw url>/install/install.sh | sh            # release install (private repo: needs GITHUB_TOKEN)
-#   sh install/install.sh --from-source                      # from a cloned checkout (always works)
+#   curl -fsSL https://raw.githubusercontent.com/K3NOXOFFICIAL/k3code/Main/install/install.sh | sh
+#   sh install/install.sh --from-source                 # the checkout this script belongs to
+#   sh install/install.sh --from-git URL --ref REF      # a clone (default: the latest v* tag, else Main)
 #
-# Private repo: release downloads need a GitHub token. Export GITHUB_TOKEN=<token with repo read>
-# or log in with `gh auth login` (the script falls back to `gh auth token`). Fetching this script via
-# curl from a private repo needs the same token:
-#   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github.raw" \
-#     https://api.github.com/repos/K3NOXOFFICIAL/k3code/contents/install/install.sh | sh -s -- --yes
-#
-# Layout:  $K3CODE_DATA (default ~/.local/share/k3code)
-#            versions/<ver>/{venv,tui,bin/k3}   current -> versions/<ver>   previous (file)   node/<ver>
-#          ~/.local/bin/{k3code,k3} -> symlinks into current/
-#
-# Flags: --from-source --from-bundle FILE --channel stable|dev --version X --yes --headless --no-setup
-#        --no-activate (stage only; used by `k3code update --from-source`) --print-version --help
-# Dev env: K3_EDITABLE=1 (--from-source: editable core install instead of a copy)
-# Test/offline env: K3_SKIP_PIP=1 K3_SKIP_TUI=1 K3_SKIP_GO=1 K3_NO_DOWNLOAD=1 K3_STUB_VENV=1
+# Each run builds the requested version next to the existing ones, switches to it and keeps the version
+# before it for rollback. Layout under PREFIX (default ~/.local):
+#   PREFIX/bin/{k3code,k3}                                  links into share/k3code/current
+#   PREFIX/share/k3code/versions/<ver>/{venv,tui,bin}
+#   PREFIX/share/k3code/current -> versions/<ver>           previous: a file with the name of the version before
+# The installer never runs onboarding; it ends by telling you to run `k3code onboard`.
+# Env (mostly for tests): K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG, K3_NO_DOWNLOAD (= --no-install-deps),
+#   K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv), K3_EDITABLE (--from-source only).
 set -eu
 
-REPO="${K3_REPO:-K3NOXOFFICIAL/k3code}"
-DATA="${K3CODE_DATA:-$HOME/.local/share/k3code}"
-BIN="${K3_BIN_DIR:-$HOME/.local/bin}"
-NODE_VER="${K3_NODE_VERSION:-22.23.1}"
-GO_VER="${K3_GO_VERSION:-1.26.6}"
+DEFAULT_URL=https://github.com/K3NOXOFFICIAL/k3code.git
+DATA=""
+BIN=""
+INSTALL_LOG=""
+TMP=""
+BUILDING=""
 
-FROM_SOURCE=0 BUNDLE="" CHANNEL=stable WANT_VERSION="" YES=0 SETUP=1 ACTIVATE=1 PRINT_VERSION=0
+usage() {
+  cat <<EOF
+usage: install.sh [--from-git [URL] | --from-source] [options]
 
-# Install log: everything `log` prints is also appended here, and a failure prints where to look.
-INSTALL_LOG="${K3_INSTALL_LOG:-$DATA/install.log}"
-mkdir -p "$(dirname "$INSTALL_LOG")" 2>/dev/null || true
-printf '\n==== %s install start (args: %s) ====\n' "$(date '+%F %T')" "$*" >>"$INSTALL_LOG" 2>/dev/null || true
-log() {
-  printf '%s\n' "k3code-install: $*" >&2
-  printf '%s\n' "k3code-install: $*" >>"$INSTALL_LOG" 2>/dev/null || true
+Source (default: --from-git $DEFAULT_URL):
+  --from-git [URL]      clone URL and install that
+  --from-source         install the checkout this script belongs to
+  --ref REF             with --from-git: a tag, a branch or a full commit SHA (default: latest v* tag, else Main)
+  --channel stable|dev  stable = latest tag (default); dev = Main
+  --version X           same as --ref vX
+
+Options:
+  --prefix DIR          install into DIR/bin and DIR/share/k3code (default: ~/.local)
+  --from-bundle FILE    after installing, import a k3code export (settings and sessions)
+  --yes, -y             do not ask (installs uv without asking)
+  --no-install-deps     install nothing (no uv, no Python); fail with the hints instead
+  --check               print the platform and dependency report, change nothing
+  --no-activate         build the version without switching to it (used by k3code update)
+  --print-version       print the version name on stdout (used by k3code update)
+  -h, --help
+
+Optional and never installed by this script: node 18+ with npm (builds the TUI), go (builds the
+k3 pane binary), bubblewrap (sandbox). k3code runs without them.
+EOF
 }
-on_exit() {
+
+# ---- output ----------------------------------------------------------------
+say() { # say TEXT: stderr and the install log, no prefix (hints stay copy-pasteable)
+  printf '%s\n' "$*" >&2
+  if [ -n "$INSTALL_LOG" ]; then printf '%s\n' "$*" >>"$INSTALL_LOG" 2>/dev/null || true; fi
+}
+log() { say "k3code-install: $*"; }
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+cleanup() {
   rc=$?
-  if [ "$rc" -ne 0 ]; then
-    printf '%s\n' "k3code-install: FAILED (exit $rc). Log: $INSTALL_LOG" >&2
-    printf '%s\n' "==== failed with exit $rc ====" >>"$INSTALL_LOG" 2>/dev/null || true
-  fi
+  if [ -n "$BUILDING" ]; then rm -rf "$BUILDING"; fi
+  if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
+  if [ "$rc" -ne 0 ]; then say "k3code-install: FAILED (exit $rc)${INSTALL_LOG:+. Log: $INSTALL_LOG}"; fi
+  exit "$rc"
 }
-trap on_exit EXIT
-die() { log "ERROR: $*"; exit 1; }
-
-usage() { sed -n '2,20p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0; }
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --from-source) FROM_SOURCE=1 ;;
-    --from-bundle) [ $# -ge 2 ] || die "--from-bundle needs a file"; BUNDLE="$2"; shift ;;
-    --channel) [ $# -ge 2 ] || die "--channel needs a value"; CHANNEL="$2"; shift ;;
-    --version) [ $# -ge 2 ] || die "--version needs a value"; WANT_VERSION="${2#v}"; shift ;;
-    --yes|-y) YES=1 ;;
-    --headless|--no-setup) SETUP=0 ;;
-    --no-activate) ACTIVATE=0 ;;
-    --print-version) PRINT_VERSION=1 ;;
-    -h|--help) usage ;;
-    *) die "unknown option: $1 (see --help)" ;;
-  esac
-  shift
-done
-case "$CHANNEL" in stable|dev) ;; *) die "--channel must be stable or dev" ;; esac
 
 # ---- helpers ---------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 
-ask() { # ask "question" -> 0 if yes
-  [ "$YES" = 1 ] && return 0
-  if has_tty; then
+ask() { # ask QUESTION: --yes answers yes; otherwise ask on the terminal
+  if [ "$YES" = 1 ]; then return 0; fi
+  if (: </dev/tty) 2>/dev/null; then
     printf '%s [y/N] ' "$1" >/dev/tty
-    read -r ans </dev/tty || return 1
-    case "$ans" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+    read -r ans </dev/tty || ans=""
+    case "$ans" in y | Y | yes | YES) return 0 ;; esac
+    return 1
   fi
-  die "$1 -- cannot ask (no tty); re-run with --yes"
+  die "$1 (no terminal to ask on: re-run with --yes, or --no-install-deps)"
 }
 
-has_tty() { (: </dev/tty) 2>/dev/null; }
-no_download() { [ "${K3_NO_DOWNLOAD:-0}" = 1 ]; }
-
-fetch() { # fetch URL DEST
-  if have curl; then curl -fsSL "$1" -o "$2"; elif have wget; then wget -qO "$2" "$1"; else die "need curl or wget"; fi
+fetch() { # fetch URL FILE
+  if have curl; then curl -fsSL "$1" -o "$2"; else wget -qO "$2" "$1"; fi
 }
 
-sha256_of() { if have sha256sum; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
+node_major() { "$1" --version 2>/dev/null | sed 's/^v//; s/\..*//'; }
 
-OS=$(uname -s); ARCH=$(uname -m)
-case "$OS" in
-  Linux) GOOS=linux; NODEOS=linux ;;
-  Darwin) GOOS=darwin; NODEOS=darwin; log "macOS support is best-effort" ;;
-  *) die "unsupported OS: $OS" ;;
-esac
-case "$ARCH" in
-  x86_64|amd64) GOARCH=amd64; NODEARCH=x64 ;;
-  aarch64|arm64) GOARCH=arm64; NODEARCH=arm64 ;;
-  *) die "unsupported architecture: $ARCH" ;;
-esac
+# ---- platform and package manager ------------------------------------------
+detect_platform() {
+  OS_NAME=$(uname -s)
+  case "$OS_NAME" in
+    Linux)
+      PLATFORM=Linux
+      # shellcheck source=/dev/null
+      DISTRO=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-Linux}") || DISTRO=Linux
+      ;;
+    Darwin)
+      PLATFORM=macOS
+      DISTRO="macOS $(sw_vers -productVersion 2>/dev/null || true)"
+      ;;
+    *) die "unsupported OS: $OS_NAME (k3code runs on Linux and macOS; on Windows use WSL)" ;;
+  esac
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64 | amd64 | aarch64 | arm64) ;;
+    *) die "unsupported architecture: $ARCH (x86_64 and arm64/aarch64 are supported)" ;;
+  esac
+}
 
-SRC_ROOT=""
-if [ "$FROM_SOURCE" = 1 ]; then
-  d=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || d=""
-  if [ -n "$d" ] && [ -f "$d/core/pyproject.toml" ] && [ -f "$d/VERSION" ]; then SRC_ROOT="$d"
-  elif [ -f ./core/pyproject.toml ] && [ -f ./VERSION ]; then SRC_ROOT=$(pwd)
-  else die "--from-source must run from a k3code checkout (sh install/install.sh --from-source)"; fi
-fi
+detect_pm() {
+  PM=""
+  for p in dnf apt-get pacman zypper apk brew; do
+    if have "$p"; then
+      PM=$p
+      return 0
+    fi
+  done
+  return 0
+}
 
-PATH_ORIG="$PATH"
-mkdir -p "$DATA" "$BIN"
-export PATH="$BIN:$PATH"
+hint_cmd() { # hint_cmd NAME: the command that installs NAME here (run it yourself; no root is used)
+  case "$1:$PM" in
+    uv:brew) echo "brew install uv" ;;
+    uv:*) echo "curl -LsSf https://astral.sh/uv/install.sh | sh" ;;
+    python:*) echo "uv python install 3.12" ;;
+    curl:dnf) echo "sudo dnf install -y curl ca-certificates" ;;
+    curl:apt-get) echo "sudo apt-get install -y curl ca-certificates" ;;
+    curl:pacman) echo "sudo pacman -S --needed curl ca-certificates" ;;
+    curl:zypper) echo "sudo zypper install -y curl ca-certificates" ;;
+    curl:apk) echo "sudo apk add curl ca-certificates" ;;
+    curl:*) echo "install curl (or wget) with your system package manager" ;;
+    git:brew) echo "xcode-select --install" ;;
+    git:dnf) echo "sudo dnf install -y git" ;;
+    git:apt-get) echo "sudo apt-get install -y git" ;;
+    git:pacman) echo "sudo pacman -S --needed git" ;;
+    git:zypper) echo "sudo zypper install -y git" ;;
+    git:apk) echo "sudo apk add git" ;;
+    git:*) echo "install git with your system package manager" ;;
+    node:brew) echo "brew install node" ;;
+    node:dnf) echo "sudo dnf install -y nodejs npm" ;;
+    node:apt-get) echo "sudo apt-get install -y nodejs npm" ;;
+    node:pacman) echo "sudo pacman -S --needed nodejs npm" ;;
+    node:zypper) echo "sudo zypper install -y nodejs npm" ;;
+    node:apk) echo "sudo apk add nodejs npm" ;;
+    node:*) echo "download Node 22 LTS from https://nodejs.org/" ;;
+    go:brew) echo "brew install go" ;;
+    go:dnf) echo "sudo dnf install -y golang" ;;
+    go:apt-get) echo "sudo apt-get install -y golang-go" ;;
+    go:pacman) echo "sudo pacman -S --needed go" ;;
+    go:zypper) echo "sudo zypper install -y go" ;;
+    go:apk) echo "sudo apk add go" ;;
+    go:*) echo "download Go from https://go.dev/dl/ (go build fetches its own toolchain if yours is old)" ;;
+    bwrap:dnf) echo "sudo dnf install -y bubblewrap" ;;
+    bwrap:apt-get) echo "sudo apt-get install -y bubblewrap" ;;
+    bwrap:pacman) echo "sudo pacman -S --needed bubblewrap" ;;
+    bwrap:zypper) echo "sudo zypper install -y bubblewrap" ;;
+    bwrap:apk) echo "sudo apk add bubblewrap" ;;
+    bwrap:*) echo "install bubblewrap with your system package manager" ;;
+    *) echo "see the k3code README" ;;
+  esac
+}
 
-# ---- 1. uv -----------------------------------------------------------------
-UV=""
+# ---- dependency lookup -----------------------------------------------------
+find_uv() { # sets UV; succeeds when uv is on PATH or in BIN
+  UV=""
+  if have uv; then
+    UV=$(command -v uv)
+  elif [ -x "$BIN/uv" ]; then
+    UV=$BIN/uv
+  fi
+  [ -n "$UV" ]
+}
+
+find_python() { # sets PY_FOUND to the first python3 that is 3.12 or newer
+  PY_FOUND=""
+  for p in python3.14 python3.13 python3.12 python3; do
+    c=$(command -v "$p" 2>/dev/null || true)
+    [ -n "$c" ] || continue
+    if "$c" -c 'import sys; sys.exit(sys.version_info[:2] < (3, 12))' 2>/dev/null; then
+      PY_FOUND=$c
+      return 0
+    fi
+  done
+  return 0
+}
+
+find_node() { # sets NODE_OK=1 when node 18+ and npm work (also accepts a node from an older install)
+  NODE_OK=0
+  if have node && have npm && [ "$(node_major node)" -ge 18 ] 2>/dev/null; then
+    NODE_OK=1
+    return 0
+  fi
+  for n in "$DATA"/node/*/bin/node; do
+    [ -x "$n" ] || continue
+    if [ "$(node_major "$n")" -ge 18 ] 2>/dev/null && [ -x "$(dirname "$n")/npm" ]; then
+      PATH="$(dirname "$n"):$PATH"
+      export PATH
+      NODE_OK=1
+      return 0
+    fi
+  done
+  return 0
+}
+
+item() { # item ok|missing NAME [NOTE]
+  if [ "$1" = ok ]; then say "  [ok]      $2${3:+ ($3)}"; else say "  [missing] $2${3:+ -- $3}"; fi
+}
+
+report() {
+  find_python
+  find_node
+  say "k3code-install: platform $PLATFORM $ARCH${DISTRO:+, $DISTRO}; package manager: ${PM:-none found}"
+  say "dependencies:"
+  if find_uv; then item ok "uv"; else
+    item missing "uv" "required; installed from astral.sh after a notice (or by you, see below)"
+    say "      $(hint_cmd uv)"
+    if ! have curl && ! have wget; then
+      item missing "curl or wget" "needed to install uv"
+      say "      $(hint_cmd curl)"
+    fi
+  fi
+  if [ -n "$PY_FOUND" ]; then item ok "python 3.12+" "$PY_FOUND"; else
+    item missing "python 3.12+" "uv downloads a managed one when needed"
+    say "      $(hint_cmd python)"
+  fi
+  if have git; then item ok "git"; else
+    item missing "git" "needed for --from-git, the default"
+    say "      $(hint_cmd git)"
+  fi
+  if [ "$NODE_OK" = 1 ]; then item ok "node 18+ with npm"; else
+    item missing "node 18+ with npm" "optional: builds the TUI; without it k3code uses the line REPL"
+    say "      $(hint_cmd node)"
+  fi
+  if have go; then item ok "go"; else
+    item missing "go" "optional: builds the k3 pane binary"
+    say "      $(hint_cmd go)"
+  fi
+  if [ "$PLATFORM" = Linux ]; then
+    if have bwrap; then item ok "bubblewrap"; else
+      item missing "bubblewrap" "optional: sandbox for unattended runs"
+      say "      $(hint_cmd bwrap)"
+    fi
+  fi
+  return 0
+}
+
 ensure_uv() {
-  if have uv; then UV=$(command -v uv); return; fi
-  [ -x "$BIN/uv" ] && { UV="$BIN/uv"; return; }
-  no_download && die "uv is missing and K3_NO_DOWNLOAD=1"
-  ask "uv (Python package manager) is missing. Install it user-locally from astral.sh?" || die "uv is required"
-  log "installing uv via the official installer"
+  if find_uv; then return 0; fi
+  if [ "$NO_DEPS" = 1 ]; then die "uv is missing and --no-install-deps is set; install it: $(hint_cmd uv)"; fi
+  if ! have curl && ! have wget; then die "curl or wget is needed to install uv: $(hint_cmd curl)"; fi
+  log "uv is missing. Installing it into $BIN with its official installer (https://astral.sh/uv/install.sh)."
+  ask "Install uv now?" || die "uv is required: install it with '$(hint_cmd uv)' and re-run this installer"
   tmp=$(mktemp "${TMPDIR:-/tmp}/uv-install.XXXXXX")
   fetch https://astral.sh/uv/install.sh "$tmp"
-  UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$BIN" sh "$tmp" >&2
+  UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$BIN" sh "$tmp" >&2 || die "the uv installer failed (output above); install uv yourself: $(hint_cmd uv)"
   rm -f "$tmp"
-  UV="$BIN/uv"; [ -x "$UV" ] || die "uv installation failed"
+  find_uv || die "uv installation failed"
 }
 
-# ---- 2. Node >= 22 ---------------------------------------------------------
-node_major() { "$1" --version 2>/dev/null | sed 's/^v//; s/\..*//'; }
-ensure_node() {
-  if have node && [ "$(node_major node)" -ge 22 ] 2>/dev/null; then return; fi
-  for n in "$DATA"/node/*/bin/node; do
-    if [ -x "$n" ] && [ "$(node_major "$n")" -ge 22 ] 2>/dev/null; then PATH="$(dirname "$n"):$PATH"; export PATH; return; fi
-  done
-  no_download && die "Node >= 22 is missing and K3_NO_DOWNLOAD=1"
-  log "Node >= 22 not found; downloading Node $NODE_VER into $DATA/node/$NODE_VER"
-  base="https://nodejs.org/dist/v$NODE_VER"
-  name="node-v$NODE_VER-$NODEOS-$NODEARCH"
-  ext=tar.xz; [ "$NODEOS" = darwin ] && ext=tar.gz
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/k3-node.XXXXXX")
-  fetch "$base/$name.$ext" "$tmp/$name.$ext"
-  fetch "$base/SHASUMS256.txt" "$tmp/SHASUMS256.txt"
-  want=$(grep " $name.$ext\$" "$tmp/SHASUMS256.txt" | cut -d' ' -f1)
-  [ -n "$want" ] && [ "$want" = "$(sha256_of "$tmp/$name.$ext")" ] || die "Node checksum mismatch"
-  mkdir -p "$DATA/node/$NODE_VER"
-  tar -xf "$tmp/$name.$ext" -C "$DATA/node/$NODE_VER" --strip-components=1
-  rm -rf "$tmp"
-  PATH="$DATA/node/$NODE_VER/bin:$PATH"; export PATH
+default_ref() { # latest v* tag on the remote, else Main
+  if [ "$CHANNEL" = dev ]; then
+    echo Main
+    return 0
+  fi
+  t=$(git ls-remote --tags --refs --sort=-v:refname "$GIT_URL" 2>/dev/null |
+    sed -n 's#.*refs/tags/\(v[0-9][^/]*\)$#\1#p' | head -n 1)
+  echo "${t:-Main}"
 }
 
-# ---- 3. Go (source builds only) -------------------------------------------
-ensure_go() {
-  [ "${K3_SKIP_GO:-0}" = 1 ] && return
-  if have go; then return; fi
-  [ -x "$DATA/go/$GO_VER/bin/go" ] && { PATH="$DATA/go/$GO_VER/bin:$PATH"; export PATH; return; }
-  no_download && die "Go is missing and K3_NO_DOWNLOAD=1"
-  log "Go not found; downloading Go $GO_VER into $DATA/go/$GO_VER"
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/k3-go.XXXXXX")
-  fetch "https://go.dev/dl/go$GO_VER.$GOOS-$GOARCH.tar.gz" "$tmp/go.tgz"
-  mkdir -p "$DATA/go/$GO_VER"
-  tar -xzf "$tmp/go.tgz" -C "$DATA/go/$GO_VER" --strip-components=1
-  rm -rf "$tmp"
-  PATH="$DATA/go/$GO_VER/bin:$PATH"; export PATH
-}
-
-# ---- release lookup (private repo: token) ---------------------------------
-gh_token() {
-  if [ -n "${GITHUB_TOKEN:-}" ]; then printf '%s' "$GITHUB_TOKEN"; return; fi
-  if [ -n "${GH_TOKEN:-}" ]; then printf '%s' "$GH_TOKEN"; return; fi
-  if [ "${K3_NO_GH:-0}" != 1 ] && have gh; then gh auth token 2>/dev/null || true; fi
-}
-
-# Downloads the release assets for this arch into $1 and prints the version. Runs under uv's python.
-FETCH_PY='
-import hashlib, json, os, platform, sys, urllib.request
-repo, channel, want, dest = sys.argv[1:5]
-tok = os.environ.get("GITHUB_TOKEN", "")
-def req(url, accept="application/vnd.github+json"):
-    r = urllib.request.Request(url, headers={"Accept": accept, "Authorization": "Bearer " + tok, "X-GitHub-Api-Version": "2022-11-28"})
-    return urllib.request.urlopen(r, timeout=120)
-api = "https://api.github.com/repos/" + repo + "/releases"
-if want:
-    rel = json.load(req(api + "/tags/v" + want))
-elif channel == "stable":
-    rel = json.load(req(api + "/latest"))
-else:
-    rel = json.load(req(api + "?per_page=1"))[0]
-ver = rel["tag_name"].lstrip("v")
-arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine(), platform.machine())
-wanted = ("SHA256SUMS",)
-for a in rel["assets"]:
-    n = a["name"]
-    if n in wanted or n.endswith(".whl") or n.startswith("k3code-tui") or n == "k3-linux-" + arch:
-        with req(a["url"], "application/octet-stream") as r, open(os.path.join(dest, n), "wb") as f:
-            f.write(r.read())
-sums = {}
-p = os.path.join(dest, "SHA256SUMS")
-if os.path.exists(p):
-    for line in open(p):
-        parts = line.split()
-        if len(parts) == 2:
-            sums[parts[1].lstrip("*")] = parts[0]
-for n in os.listdir(dest):
-    if n != "SHA256SUMS" and n in sums and hashlib.sha256(open(os.path.join(dest, n), "rb").read()).hexdigest() != sums[n]:
-        sys.exit("checksum mismatch: " + n)
-print(ver)
-'
-
-# ---- main ------------------------------------------------------------------
-ensure_uv
-[ "${K3_SKIP_TUI:-0}" = 1 ] || ensure_node
-[ "$FROM_SOURCE" = 1 ] && ensure_go
-
-DL=""
-if [ "$FROM_SOURCE" = 1 ]; then
-  VER=$(tr -d '[:space:]' <"$SRC_ROOT/VERSION")
-  sha=$(git -C "$SRC_ROOT" rev-parse --short HEAD 2>/dev/null || true)
-  VER="$VER-src${sha:+.$sha}"
-else
-  TOKEN=$(gh_token)
-  [ -n "$TOKEN" ] || die "the repo is private: set GITHUB_TOKEN (repo read access) or run \`gh auth login\`. Or use --from-source from a clone."
-  DL=$(mktemp -d "${TMPDIR:-/tmp}/k3-release.XXXXXX")
-  log "looking up release (channel=$CHANNEL${WANT_VERSION:+, version=$WANT_VERSION})"
-  VER=$(GITHUB_TOKEN="$TOKEN" "$UV" run --no-project --python '>=3.12' python -I -c "$FETCH_PY" "$REPO" "$CHANNEL" "$WANT_VERSION" "$DL" | tail -n 1) \
-    || die "release lookup/download failed (token valid? release exists?)"
-fi
-
-VERDIR="$DATA/versions/$VER"
-if [ -f "$VERDIR/.complete" ]; then
-  log "version $VER already installed"
-else
-  log "installing version $VER into $VERDIR"
-  rm -rf "$VERDIR"; mkdir -p "$VERDIR"
-  trap 'on_exit; rm -rf "$VERDIR" ; [ -z "$DL" ] || rm -rf "$DL"' EXIT INT TERM
-  if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: fake core, no pip
-    mkdir -p "$VERDIR/venv/bin"
-    printf '#!/bin/sh\necho "k3code %s"\n' "$VER" >"$VERDIR/venv/bin/k3code"; chmod +x "$VERDIR/venv/bin/k3code"
-  else
-    "$UV" venv --quiet --python '>=3.12' "$VERDIR/venv" >&2
-    if [ "$FROM_SOURCE" = 1 ]; then
-      if [ "${K3_SKIP_PIP:-0}" != 1 ]; then
-        # A regular install by default: the installed daemon must not import a git checkout that can be edited,
-        # switched to another branch or deleted (a removed worktree used to break `k3code` outright).
-        # K3_EDITABLE=1 keeps the developer's `pip install -e` (changes show up without re-installing).
-        if [ "${K3_EDITABLE:-0}" = 1 ]; then
-          "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" -e "$SRC_ROOT/core" >&2
-        else
-          "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" "$SRC_ROOT/core" >&2
-        fi
-      fi
+# ---- source ----------------------------------------------------------------
+acquire_source() {
+  if [ "$FROM" = source ]; then
+    d=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || d=""
+    if [ -n "$d" ] && [ -f "$d/core/pyproject.toml" ] && [ -f "$d/VERSION" ]; then
+      SRC_ROOT=$d
+    elif [ -f ./core/pyproject.toml ] && [ -f ./VERSION ]; then
+      SRC_ROOT=$(pwd)
     else
-      "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" "$DL"/*.whl >&2
+      die "--from-source must run from a k3code checkout (sh install/install.sh --from-source)"
+    fi
+    SOURCE_PATH=$SRC_ROOT
+    SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD 2>/dev/null || true)
+  else
+    [ -n "$GIT_URL" ] || GIT_URL=$DEFAULT_URL
+    [ -n "$REF" ] || REF=$(default_ref)
+    TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-src.XXXXXX")
+    SRC_ROOT=$TMP/src
+    mkdir "$SRC_ROOT"
+    log "fetching $REF from $GIT_URL"
+    git -c init.defaultBranch=main init -q "$SRC_ROOT"
+    git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" ||
+      die "could not fetch '$REF' from $GIT_URL. If the repo is private and git has no credentials: gh auth login && gh auth setup-git (or check --ref)"
+    git -C "$SRC_ROOT" checkout -q FETCH_HEAD
+    SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD)
+  fi
+  if [ ! -f "$SRC_ROOT/core/pyproject.toml" ] || [ ! -f "$SRC_ROOT/VERSION" ]; then
+    die "not a k3code checkout (no core/pyproject.toml or VERSION): $SRC_ROOT"
+  fi
+  VER="$(tr -d '[:space:]' <"$SRC_ROOT/VERSION")-src${SHA:+.$SHA}"
+  VERDIR="$DATA/versions/$VER"
+  # The TUI build writes node_modules into its tree. A read-only checkout is built from a copy.
+  if [ "$FROM" = source ] && [ ! -f "$VERDIR/.complete" ] && [ "${K3_EDITABLE:-0}" != 1 ] &&
+    [ "${K3_SKIP_TUI:-0}" != 1 ] && [ ! -w "$SRC_ROOT/tui" ]; then
+    log "the checkout is read-only: building from a temporary copy"
+    TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-src.XXXXXX")
+    cp -R "$SRC_ROOT" "$TMP/src"
+    SRC_ROOT=$TMP/src
+  fi
+  return 0
+}
+
+# ---- build -----------------------------------------------------------------
+build_tui() {
+  if [ "${K3_SKIP_TUI:-0}" = 1 ]; then return 0; fi
+  if [ "$NODE_OK" != 1 ]; then
+    log "TUI skipped: node 18+ with npm not found (k3code falls back to the line REPL)"
+    return 0
+  fi
+  log "building the TUI (npm ci; this takes a minute)"
+  if (cd "$SRC_ROOT/tui" && npm ci --no-audit --no-fund >&2 && npm run build:ink >&2 && npm run build >&2) &&
+    [ -d "$SRC_ROOT/tui/dist" ]; then
+    cp -R "$SRC_ROOT/tui/dist" "$VERDIR/tui/dist"
+  else
+    log "WARNING: the TUI did not build (output above); k3code will use the line REPL"
+  fi
+  return 0
+}
+
+build_panes() {
+  if [ "${K3_SKIP_GO:-0}" = 1 ]; then return 0; fi
+  if ! have go; then
+    log "k3 pane binary skipped: go not found (optional)"
+    return 0
+  fi
+  log "building the k3 pane binary"
+  if ! (cd "$SRC_ROOT/panes" && CGO_ENABLED=0 go build -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
+    log "WARNING: the k3 pane binary did not build (output above); the multi-window binary is missing"
+  fi
+  return 0
+}
+
+install_version() {
+  if [ -f "$VERDIR/.complete" ]; then
+    log "version $VER already installed"
+    return 0
+  fi
+  log "installing version $VER into $VERDIR"
+  rm -rf "$VERDIR"
+  mkdir -p "$VERDIR"
+  BUILDING=$VERDIR
+  if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: a fake core command, no uv, no network
+    mkdir -p "$VERDIR/venv/bin"
+    printf '#!/bin/sh\necho "k3code %s"\n' "$VER" >"$VERDIR/venv/bin/k3code"
+    chmod +x "$VERDIR/venv/bin/k3code"
+  else
+    "$UV" venv --quiet --python '>=3.12' "$VERDIR/venv" >&2 ||
+      die "could not create a Python 3.12+ environment; try: $(hint_cmd python)"
+    if [ "${K3_SKIP_PIP:-0}" != 1 ]; then
+      log "installing the k3code core"
+      if [ "${K3_EDITABLE:-0}" = 1 ]; then
+        "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" -e "$SRC_ROOT/core" >&2
+      else
+        # A regular copy: the installed k3code must not depend on a checkout that can be switched or deleted.
+        "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" "$SRC_ROOT/core" >&2
+      fi
     fi
   fi
   mkdir -p "$VERDIR/tui" "$VERDIR/bin"
-  if [ "$FROM_SOURCE" = 1 ]; then
-    if [ "${K3_SKIP_TUI:-0}" != 1 ]; then
-      log "building the TUI"
-      (cd "$SRC_ROOT/tui" && npm ci --no-audit --no-fund >&2 && npm run build:ink >&2 && npm run build >&2)
-      cp -R "$SRC_ROOT/tui/dist" "$VERDIR/tui/dist"
-    fi
-    if [ "${K3_SKIP_GO:-0}" != 1 ]; then
-      log "building the k3 pane binary"
-      (cd "$SRC_ROOT/panes" && go build -o "$VERDIR/bin/k3" ./cmd/k3 >&2)
-    fi
-    printf '%s\n' "$SRC_ROOT" >"$DATA/source_path"
-  else
-    tui=$(ls "$DL"/k3code-tui*.tar.gz 2>/dev/null | head -n 1 || true)
-    [ -z "$tui" ] || tar -xzf "$tui" -C "$VERDIR/tui"
-    if [ -f "$DL/k3-linux-$GOARCH" ]; then cp "$DL/k3-linux-$GOARCH" "$VERDIR/bin/k3"; chmod +x "$VERDIR/bin/k3"; fi
-    rm -rf "$DL"
+  build_tui
+  build_panes
+  if [ "${K3_SKIP_PIP:-0}" != 1 ]; then
+    "$VERDIR/venv/bin/k3code" --version >&2 || die "the new version does not start (k3code --version failed); nothing was activated"
   fi
+  if [ "$FROM" = source ]; then printf '%s\n' "$SOURCE_PATH" >"$DATA/source_path"; fi
   printf '%s\n' "$VER" >"$VERDIR/.complete"
-  trap on_exit EXIT
-  trap - INT TERM
-fi
+  BUILDING=""
+  return 0
+}
 
-if [ "$ACTIVATE" = 1 ]; then
-  cur=""
-  [ -L "$DATA/current" ] && cur=$(basename "$(readlink "$DATA/current")")
-  if [ "$cur" != "$VER" ]; then
-    [ -z "$cur" ] || printf '%s\n' "$cur" >"$DATA/previous"
-    ln -sfn "$VERDIR" "$DATA/current"
-    log "current -> $VER"
-  fi
-  link() { # link NAME TARGET
-    [ -e "$2" ] || return 0
-    [ "$(readlink "$BIN/$1" 2>/dev/null || true)" = "$2" ] || ln -sfn "$2" "$BIN/$1"
-  }
-  link k3code "$DATA/current/venv/bin/k3code"
-  link k3 "$DATA/current/bin/k3"
-fi
-
-if [ "$PRINT_VERSION" = 1 ]; then printf '%s\n' "$VER"; exit 0; fi
-[ "$ACTIVATE" = 1 ] || exit 0
-
-case ":$PATH_ORIG:" in *":$BIN:"*) ;; *) log "note: add $BIN to your PATH (e.g. export PATH=\"$BIN:\$PATH\")" ;; esac
-
-# ---- doctor / import / setup ----------------------------------------------
-K3="$BIN/k3code"
-log "running k3code doctor"
-K3CODE_DATA="$DATA" "$K3" doctor --no-probe >&2 || log "doctor reported problems (expected before setup)"
-
-if [ -n "$BUNDLE" ]; then
-  [ -f "$BUNDLE" ] || die "bundle not found: $BUNDLE"
-  log "importing bundle $BUNDLE"
-  K3CODE_DATA="$DATA" "$K3" import "$BUNDLE" --yes >&2
-fi
-if [ "$SETUP" = 1 ]; then
-  if has_tty; then
-    if [ -n "$BUNDLE" ]; then K3CODE_DATA="$DATA" "$K3" setup --step secrets </dev/tty
-    else K3CODE_DATA="$DATA" "$K3" setup </dev/tty; fi
+# ---- activation ------------------------------------------------------------
+link_bin() { # link_bin NAME TARGET: BIN/NAME -> TARGET; drops a stale link of ours
+  if [ -e "$2" ]; then
+    if [ "$(readlink "$BIN/$1" 2>/dev/null || true)" != "$2" ]; then ln -sfn "$2" "$BIN/$1"; fi
   else
-    log "no terminal available: run \`k3code setup\` later"
+    case "$(readlink "$BIN/$1" 2>/dev/null || true)" in
+      "$DATA"/*) rm -f "$BIN/$1" ;;
+    esac
   fi
-fi
-log "done. Version $VER installed. Run: k3code"
+  return 0
+}
+
+prune_versions() { # keep the current and the previous version only
+  prev=$(cat "$DATA/previous" 2>/dev/null || true)
+  for d in "$DATA"/versions/*; do
+    [ -d "$d" ] || continue
+    n=$(basename "$d")
+    case "$n" in "$VER" | "$prev") continue ;; esac
+    rm -rf "$d"
+    log "removed old version $n"
+  done
+  return 0
+}
+
+activate() {
+  cur=""
+  if [ -L "$DATA/current" ]; then cur=$(basename "$(readlink "$DATA/current")"); fi
+  if [ "$cur" != "$VER" ]; then
+    if [ -n "$cur" ]; then printf '%s\n' "$cur" >"$DATA/previous"; fi
+    ln -sfn "$VERDIR" "$DATA/current"
+    log "current -> $VER${cur:+ (previous: $cur, kept for rollback)}"
+  fi
+  if [ "$FROM" = git ] && [ -e "$DATA/source_path" ]; then rm -f "$DATA/source_path"; fi
+  link_bin k3code "$DATA/current/venv/bin/k3code"
+  link_bin k3 "$DATA/current/bin/k3"
+  prune_versions
+}
+
+import_bundle() {
+  [ -f "$BUNDLE" ] || die "bundle not found: $BUNDLE"
+  log "importing $BUNDLE (settings and sessions; secrets are not in bundles)"
+  "$BIN/k3code" import "$BUNDLE" --yes >&2 || die "import of $BUNDLE failed"
+}
+
+# ---- main ------------------------------------------------------------------
+main() {
+  export GIT_TERMINAL_PROMPT=0
+  FROM="" GIT_URL="" REF="" CHANNEL=stable WANT_VERSION="" PREFIX="$HOME/.local" BUNDLE=""
+  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0
+  if [ "${K3_NO_DOWNLOAD:-0}" = 1 ]; then NO_DEPS=1; fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from-source) FROM=source ;;
+      --from-git)
+        FROM=git
+        if [ $# -ge 2 ]; then
+          case "$2" in
+            -*) ;;
+            *)
+              GIT_URL=$2
+              shift
+              ;;
+          esac
+        fi
+        ;;
+      --ref)
+        [ $# -ge 2 ] || die "--ref needs a value"
+        REF=$2
+        shift
+        ;;
+      --channel)
+        [ $# -ge 2 ] || die "--channel needs a value"
+        CHANNEL=$2
+        shift
+        ;;
+      --version)
+        [ $# -ge 2 ] || die "--version needs a value"
+        WANT_VERSION=${2#v}
+        shift
+        ;;
+      --prefix)
+        [ $# -ge 2 ] || die "--prefix needs a directory"
+        PREFIX=$2
+        shift
+        ;;
+      --from-bundle)
+        [ $# -ge 2 ] || die "--from-bundle needs a file"
+        BUNDLE=$2
+        shift
+        ;;
+      --yes | -y) YES=1 ;;
+      --no-install-deps) NO_DEPS=1 ;;
+      --check) CHECK=1 ;;
+      --no-activate) ACTIVATE=0 ;;
+      --print-version) PRINT_VERSION=1 ;;
+      --no-setup | --headless) ;; # legacy no-ops: setup no longer runs here; old callers (k3code update) still pass it
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *) die "unknown option: $1 (see --help)" ;;
+    esac
+    shift
+  done
+  case "$CHANNEL" in stable | dev) ;; *) die "--channel must be stable or dev" ;; esac
+  if [ -n "$BUNDLE" ] && [ ! -f "$BUNDLE" ]; then die "bundle not found: $BUNDLE (checked before installing anything)"; fi
+  if [ -n "$WANT_VERSION" ] && [ -z "$REF" ]; then REF="v$WANT_VERSION"; fi
+  if [ -z "$FROM" ]; then FROM=git; fi
+  if [ "${K3_EDITABLE:-0}" = 1 ] && [ "$FROM" = git ]; then
+    die "K3_EDITABLE=1 needs --from-source (a --from-git build comes from a temporary clone)"
+  fi
+  DATA="${K3CODE_DATA:-$PREFIX/share/k3code}"
+  BIN="${K3_BIN_DIR:-$PREFIX/bin}"
+  trap cleanup EXIT
+  trap 'exit 1' INT TERM
+  detect_platform
+  detect_pm
+  if [ "$CHECK" = 1 ]; then
+    report
+    exit 0
+  fi
+  mkdir -p "$DATA" "$BIN"
+  INSTALL_LOG="${K3_INSTALL_LOG:-$DATA/install.log}"
+  printf '\n==== %s install start (args: %s) ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$INSTALL_LOG" 2>/dev/null || true
+  report
+  if [ "$NO_DEPS" = 1 ]; then export UV_PYTHON_DOWNLOADS=never; fi
+  if [ "$FROM" = git ] && ! have git; then die "git is needed for --from-git: $(hint_cmd git)"; fi
+  ensure_uv
+  if [ -z "$PY_FOUND" ] && [ "$NO_DEPS" != 1 ]; then
+    log "no Python 3.12+ here: uv will download a managed one (kept in uv's own data directory)"
+  fi
+  acquire_source
+  install_version
+  if [ "$ACTIVATE" = 1 ]; then activate; fi
+  if [ "$PRINT_VERSION" = 1 ]; then
+    printf '%s\n' "$VER"
+    exit 0
+  fi
+  if [ "$ACTIVATE" != 1 ]; then exit 0; fi
+  if [ -n "$BUNDLE" ]; then import_bundle; fi
+  case ":$PATH:" in
+    *":$BIN:"*) ;;
+    *) say "Add $BIN to your PATH:  export PATH=\"$BIN:\$PATH\"   (in ~/.bashrc or ~/.zshrc)" ;;
+  esac
+  if [ "$DATA" != "$HOME/.local/share/k3code" ]; then
+    say "For a non-default prefix, 'k3code update' needs:  export K3CODE_DATA=\"$DATA\""
+  fi
+  # shellcheck disable=SC2016 # the backticks are literal text for the user
+  say "$(printf 'Installed k3code %s. Next: run `k3code onboard` to set up your provider (or `k3code` to start).' "$VER")"
+}
+
+main "$@" </dev/null
