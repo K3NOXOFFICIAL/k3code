@@ -225,14 +225,21 @@ def broken_update() -> None:
 
 
 def upstream_sync() -> None:
-    how = "scripts/sync-upstream.sh --dry-run: git fetch tuios + hermes-agent upstream HEAD into temp bare repos, 3-way blob diff vs recorded base commits"
+    crit = ("Upstream sync: mergeable subtrees have <10 conflicting files; the Hermes TUI is a documented frozen fork")
+    how = ("scripts/sync-upstream.sh --dry-run: git fetch tuios + hermes-agent upstream HEAD into temp bare repos, 3-way "
+           "blob diff vs recorded base commits; the frozen fork (hermes-agent:tui) is reported, not counted; "
+           "docs/UPSTREAM.md must document the policy and the cherry-pick procedure")
     rc, out = run(["sh", str(REPO / "scripts/sync-upstream.sh"), "--dry-run"], timeout=1500)
     (LOGS / "m6_sync.log").write_text(out)
     if rc == 3:
-        return emit("M6", "Upstream-sync dry run (<10 conflicting files per subtree)", how, "PENDING", out,
-                    "rerun scripts/sync-upstream.sh --dry-run with network access to github.com")
-    emit("M6", "Upstream-sync dry run (<10 conflicting files per subtree)", how, "PASS" if rc == 0 else "FAIL",
+        return emit("M6", crit, how, "PENDING", out, "rerun scripts/sync-upstream.sh --dry-run with network access to github.com")
+    doc = REPO / "docs" / "UPSTREAM.md"
+    doc_ok = doc.is_file() and all(w in doc.read_text() for w in ("Frozen fork", "Cherry-picking", "Merging TUIOS"))
+    frozen_reported = "FROZEN FORK" in out
+    emit("M6", crit, how, "PASS" if rc == 0 and doc_ok and frozen_reported else "FAIL",
          "\n".join(ln for ln in out.splitlines() if ln.startswith("SUBTREE")) or out)
+    if not doc_ok:
+        print("docs/UPSTREAM.md missing or incomplete")
 
 
 if __name__ == "__main__":

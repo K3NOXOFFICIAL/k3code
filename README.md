@@ -3,7 +3,7 @@
 **A terminal coding agent that keeps working when you are not looking.**
 It plans before it acts, runs many agents in parallel, survives dropped connections and crashes, routes cheap work to cheap models, and learns how you like to work.
 
-> **Status: pre-release (v0.0.1, working name).** Every feature of the first roadmap (M0–M6) is built and integrated on the `m0-scaffold` branch; its draft pull request into `Main` is still open, so `Main` itself only holds the initial commit. The core test suite passes (613 tests). The exit-criteria verification is partly done: of 51 checks, **40 pass, 1 fails and 10 are pending** (they need a live model, a person, or days of real use). See [Project status](#project-status) and [`docs/reports/exit-status.md`](docs/reports/exit-status.md) for exactly what is verified.
+> **Status: pre-release (v0.0.1, working name).** Every feature of the first roadmap (M0–M6) is built and integrated on the `m0-scaffold` branch; its draft pull request into `Main` is still open, so `Main` itself only holds the initial commit. The core test suite passes (613 tests). The exit-criteria verification is partly done: of 51 checks, **41 pass and 10 are pending** (none fail) (they need a live model, a person, or days of real use). See [Project status](#project-status) and [`docs/reports/exit-status.md`](docs/reports/exit-status.md) for exactly what is verified.
 > The repository is private. Release downloads need a GitHub token; there is no release yet, so you install from a clone.
 
 ---
@@ -285,7 +285,7 @@ python3 scripts/vendor_check.py
 
 ## Project status
 
-Verification as of 2026-10-07 (51 exit checks: 40 pass, 1 fail, 10 pending). The authoritative table, with the evidence behind every row, is [`docs/reports/exit-status.md`](docs/reports/exit-status.md).
+Verification as of 2026-10-07 (51 exit checks: 41 pass, 0 fail, 10 pending). The authoritative table, with the evidence behind every row, is [`docs/reports/exit-status.md`](docs/reports/exit-status.md).
 
 | | Milestone | Built | Verified so far |
 |---|---|---|---|
@@ -295,7 +295,7 @@ Verification as of 2026-10-07 (51 exit checks: 40 pass, 1 fail, 10 pending). The
 | **M3** | `k3` keymap, agent states and approvals in panes | ✅ | Keymap tests and the live pane-badge check pass; the first-time-user test is pending |
 | **M4** | Plan-first and scope gate, tiers, fan-out, `/ultra*`, `/preview`, `/advisor`, loops, cron, automations | ✅ | Scripted checks pass; four checks need a live model or your task-size labels |
 | **M5** | Learning, proposals, project preparation, self-optimizer | ✅ | Demo and tests pass; live mem0 and 2 weeks of use are pending |
-| **M6** | Installer, guided setup, update with rollback, release CI | ✅ | A clean Fedora 44 container installs in about a minute; setup resume, `--from-bundle` and update rollback pass. **One check fails:** a dry-run upstream sync of the modified Hermes TUI reports 48 conflicting files (the target is fewer than 10). The proposal is to treat the TUI as a frozen fork and cherry-pick upstream fixes instead of merging; that decision is open |
+| **M6** | Installer, guided setup, update with rollback, release CI | ✅ | A clean Fedora 44 container installs in about a minute; setup resume, `--from-bundle` and update rollback pass. The upstream-sync check passes under the agreed policy: TUIOS stays mergeable (0 conflicting files) and the heavily modified Hermes TUI is a documented frozen fork whose upstream fixes are cherry-picked by hand ([`docs/UPSTREAM.md`](docs/UPSTREAM.md)) |
 
 Other open items: there is no release yet, so the update path is only tested against local version directories; the goals and requirements the project is measured against are in [`GOAL.md`](GOAL.md).
 

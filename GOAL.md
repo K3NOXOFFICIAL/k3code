@@ -217,6 +217,7 @@ The goal is complete when **every milestone M0–M6 meets its exit criteria**, v
 - Provide a working provider key (and a quota) for the live-model checks.
 - Choose the final name.
 - Decide when to merge the integration branch into `Main` and when to make the repository public.
+- Decided 2026-10-07: the Hermes TUI is a frozen fork (see [`docs/UPSTREAM.md`](docs/UPSTREAM.md)).
 
 ---
 

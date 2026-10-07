@@ -116,6 +116,7 @@ Research (2026-10-07):
 - **M6 Install + guided setup + update (1 wk).**
   - Release CI (Go binary, TUI dist, pinned Node runtime, core wheel, checksums), `install.sh` (+ `--from-bundle`), the resumable wizard, `/update` with rollback.
   - *Exit:* a fresh Fedora VM is fully set up in under 10 min.
+  - *Upstream policy (decided 2026-10-07):* the TUIOS subtree stays mergeable (a dry-run sync reports fewer than 10 conflicting files); the Hermes TUI is a documented **frozen fork** whose upstream fixes are cherry-picked by hand. See [`UPSTREAM.md`](UPSTREAM.md). The exit check verifies that policy and tooling exist and that every mergeable subtree is under the limit.
   - Installing on protected-host-b/protected-host-a **only with the owner's explicit approval** (hard limit).
 
 ## Guardrails

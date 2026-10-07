@@ -65,6 +65,9 @@ def textual_conflicts(files: list[str], trio: tuple[Path | str, Path | str, Path
     return bad
 
 
+FROZEN_DEFAULT = ("hermes-agent:tui",)
+
+
 def three_way(base: dict[str, str], ours: dict[str, str], theirs: dict[str, str]) -> dict[str, list[str]]:
     res: dict[str, list[str]] = {"conflicts": [], "theirs_only": [], "ours_only": [], "identical": []}
     for f in sorted(set(base) | set(ours) | set(theirs)):
@@ -84,7 +87,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--threshold", type=int, default=10)
+    # Frozen forks are reported but not merged, so they do not count against the threshold (docs/UPSTREAM.md).
+    ap.add_argument("--frozen", action="append", default=None,
+                    help="subtree to report as a frozen fork (default: hermes-agent:tui)")
     a = ap.parse_args()
+    frozen = set(a.frozen if a.frozen is not None else FROZEN_DEFAULT)
     vendor = tomllib.loads((REPO / "VENDOR.toml").read_text())
     entries = [(e["project"], e["upstream_path"], e["local_path"], e["commit"], "tree") for e in vendor.get("tree", [])
                if e["project"] in UPSTREAM_URLS]
@@ -125,10 +132,12 @@ def main() -> int:
                     "conflicts": len(r["conflicts"]), "theirs_only": len(r["theirs_only"]),
                     "ours_only": len(r["ours_only"]), "both_changed": len(both), "base_missing": not base, "examples": r["conflicts"][:5]}
     agg: dict[str, int] = {}
+    upstream_changed: dict[str, int] = {}
     for k, v in subtrees.items():
         name = k if k.split(":")[1] in ("tui", "tui/shared", "panes") else "hermes-agent:vendored files"
         agg[name] = agg.get(name, 0) + v["conflicts"]
-    worst = max(agg.values()) if agg else 0
+        upstream_changed[name] = upstream_changed.get(name, 0) + v["theirs_only"] + v["conflicts"]
+    worst = max((n for k, n in agg.items() if k not in frozen), default=0)
     if a.json:
         print(json.dumps({"subtrees": subtrees, "aggregate": agg, "threshold": a.threshold}, indent=1))
     else:
@@ -137,7 +146,11 @@ def main() -> int:
                   f"upstream-only={v['theirs_only']} ours-only={v['ours_only']}"
                   + (" (base path missing upstream)" if v["base_missing"] else ""))
         for k, n in agg.items():
-            print(f"SUBTREE {k}: {n} conflicting file(s) (target <{a.threshold}) {'OK' if n < a.threshold else 'OVER'}")
+            if k in frozen:
+                print(f"SUBTREE {k}: {n} conflicting file(s); FROZEN FORK, not merged: {upstream_changed[k]} files "
+                      f"changed upstream since the base, to be cherry-picked by hand (docs/UPSTREAM.md)")
+            else:
+                print(f"SUBTREE {k}: {n} conflicting file(s) (target <{a.threshold}) {'OK' if n < a.threshold else 'OVER'}")
     return 0 if worst < a.threshold else 1
 
 
