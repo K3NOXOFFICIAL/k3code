@@ -2,7 +2,7 @@
 // so the copy — and the "what happened / what to do" shape — is unit-testable
 // without rendering. Every slash command cited here exists in
 // ui-tui/src/app/slash/commands (/logs, /retry, /model, /update, /resume,
-// /sessions, /quit) and `hermes doctor` is a real subcommand.
+// /sessions, /quit) and `k3code doctor` is a real subcommand.
 
 import type { ErrorSurface } from '@k3code/shared/gateway-events'
 
@@ -35,13 +35,13 @@ const detailLine = (raw: string | undefined): string | null => {
 // ── Backend process lifecycle ─────────────────────────────────────────────
 
 export const BACKEND_RESTARTING =
-  'Hermes stopped unexpectedly — restarting and reopening your chat (the reply in progress was lost).'
+  'k3code stopped unexpectedly — restarting and reopening your chat (the reply in progress was lost).'
 
-export const BACKEND_RESTARTING_ACTIVITY = 'Hermes stopped unexpectedly · restarting…'
+export const BACKEND_RESTARTING_ACTIVITY = 'k3code stopped unexpectedly · restarting…'
 
-// Attached (dashboard / embedded) mode: only the socket dropped; Hermes and any
+// Attached (dashboard / embedded) mode: only the socket dropped; k3code and any
 // reply in progress are still alive on the backend and come back on reconnect.
-export const CONNECTION_LOST = 'Connection to Hermes lost — reconnecting and reopening your chat…'
+export const CONNECTION_LOST = 'Connection to k3code lost — reconnecting and reopening your chat…'
 
 export const CONNECTION_LOST_ACTIVITY = 'connection lost · reconnecting…'
 
@@ -50,16 +50,16 @@ export const backendGaveUp = (code: null | number, lastLine?: string): string =>
   const detail = detailLine(lastLine)
 
   return [
-    `Hermes stopped${exit} and could not be restarted. Your chat is saved.`,
+    `k3code stopped${exit} and could not be restarted. Your chat is saved.`,
     detail,
-    'Hermes keeps trying to reconnect in the background and reopens this chat when it succeeds; if it does not, type /resume.',
-    'Type /logs for the full log, or /quit and run `hermes doctor` to check the install.'
+    'k3code keeps trying to reconnect in the background and reopens this chat when it succeeds; if it does not, type /resume.',
+    'Type /logs for the full log, or /quit and run `k3code doctor` to check the install.'
   ]
     .filter(Boolean)
     .join('\n')
 }
 
-export const BACKEND_GAVE_UP_ACTIVITY = 'Hermes stopped · /logs for details'
+export const BACKEND_GAVE_UP_ACTIVITY = 'k3code stopped · /logs for details'
 
 /** Last line of the backend log tail that is not our own [lifecycle]/[startup] bookkeeping. */
 export const lastStderrLine = (tail: string): string | undefined =>
@@ -77,7 +77,7 @@ export const backendReconnecting = (attempt: number | undefined, delayMs: number
 }
 
 export const BACKEND_SLOW_START =
-  'Hermes is taking longer than usual to start. Still waiting… If it never connects: /logs shows the last backend output; /quit and run `hermes doctor`.'
+  'k3code is taking longer than usual to start. Still waiting… If it never connects: /logs shows the last backend output; /quit and run `k3code doctor`.'
 
 export const BACKEND_SLOW_START_STATUS = 'still starting…'
 
@@ -95,7 +95,7 @@ export const stderrProblemActivity = (line: string): string => {
   const m = /([A-Z][A-Za-z]*(?:Error|Exception)):/.exec(line)
   const what = m ? ` (${m[1]})` : ''
 
-  return `Something went wrong inside Hermes${what} · /logs for details`
+  return `Something went wrong inside k3code${what} · /logs for details`
 }
 
 // ── RPC errors ────────────────────────────────────────────────────────────
@@ -114,7 +114,7 @@ export const isVersionSkewError = (err: unknown): boolean => {
 }
 
 export const VERSION_SKEW_MESSAGE =
-  'The terminal UI and the Hermes backend are out of sync (different versions). Run /update, or exit and run `hermes update`, then start the TUI again.'
+  'The terminal UI and the k3code backend are out of sync (different versions). Run /update, or exit and run `k3code update`, then start the TUI again.'
 
 const SESSION_NOT_FOUND_RE = /session not found/i
 const NOT_CONNECTED_RE = /^gateway not (?:connected|running)\b/
@@ -137,12 +137,12 @@ const RPC_ERROR_ROWS: RpcErrorRow[] = [
   [
     (_code, text) => NOT_CONNECTED_RE.test(text),
     () =>
-      'Hermes is not connected right now, so that was not sent. It reconnects automatically; wait a moment and try again, or type /logs if this persists.'
+      'k3code is not connected right now, so that was not sent. It reconnects automatically; wait a moment and try again, or type /logs if this persists.'
   ],
   [
     (_code, text) => TIMED_OUT_RE.exec(text),
     m =>
-      `Hermes did not answer within ${m?.[1] ?? '?'}s. Try again; if it keeps happening, type /logs and report the last lines.`
+      `k3code did not answer within ${m?.[1] ?? '?'}s. Try again; if it keeps happening, type /logs and report the last lines.`
   ]
 ]
 
@@ -255,9 +255,9 @@ const TURN_CODE_COPY: Record<string, [string, string]> = {
 const TURN_LAYER_COPY: Record<string, [string, string]> = {
   auth: ['The model provider rejected the credentials', 'Fix them with /model, then /retry.'],
   billing: ['The model provider reports no credit left', 'Top up the account or switch with /model.'],
-  disk: ['The disk is full, so Hermes could not save the turn', 'Free some space, then /retry.'],
+  disk: ['The disk is full, so k3code could not save the turn', 'Free some space, then /retry.'],
   endpoint: ['Your custom model endpoint did not answer', 'Check the endpoint is running, then /retry.'],
-  gateway: ['Hermes hit an internal error while running this turn', 'Send /retry; type /logs for the trace.'],
+  gateway: ['k3code hit an internal error while running this turn', 'Send /retry; type /logs for the trace.'],
   provider: ['The model provider returned an error', 'Send /retry, or switch with /model.'],
   streaming: ['The connection to the model provider dropped mid-reply', 'Send /retry.']
 }
@@ -298,13 +298,7 @@ export const isBareErrorText = (text: string, error: null | string | undefined):
 const PROMPT_TIMEOUT_COPY: Record<string, string> = {
   secret:
     'Secret prompt closed: no answer in time, so the step that needed it was skipped. Send your request again when you are ready to enter it.',
-  sudo: 'Password prompt closed: no answer in time, so the command was skipped. Send your request again when you are ready to enter it.',
-  'vault.code':
-    'Verification-code prompt closed: no answer in time, so the sign-in was skipped. Send your request again when you have the code.',
-  'vault.save_login':
-    'Save-login prompt closed: no answer in time, so nothing was saved. Send your request again when you are ready.',
-  'vault.unlock_prompt':
-    'Unlock prompt closed: no answer in time, so the password manager stayed locked. Send your request again when you are ready to unlock it.'
+  sudo: 'Password prompt closed: no answer in time, so the command was skipped. Send your request again when you are ready to enter it.'
 }
 
 export const promptTimeoutNotice = (method: string | undefined, reason: string | undefined): null | string =>

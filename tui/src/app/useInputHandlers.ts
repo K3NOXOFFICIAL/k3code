@@ -5,8 +5,8 @@ import { useEffect, useRef } from 'react'
 import { DASHBOARD_TUI_MODE } from '../config/env.js'
 import { DOUBLE_ESC_MS, TYPING_IDLE_MS } from '../config/timing.js'
 import { applyCompletion } from '../domain/slash.js'
-import type { ConfigSetResponse, VoiceRecordResponse } from '../gatewayTypes.js'
-import { isAction, isCopyShortcut, isMac, isMacActionFallback, isVoiceToggleKey } from '../lib/platform.js'
+import type { ConfigSetResponse } from '../gatewayTypes.js'
+import { isAction, isCopyShortcut, isMac, isMacActionFallback } from '../lib/platform.js'
 import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionWheel.js'
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
 import { closeWidget, dispatchWidgetInput } from '../sdk/host.js'
@@ -121,28 +121,8 @@ export function shouldFallThroughForScroll(key: {
   return false
 }
 
-export function applyVoiceRecordResponse(
-  response: null | VoiceRecordResponse,
-  starting: boolean,
-  voice: Pick<InputHandlerContext['voice'], 'setProcessing' | 'setRecording'>,
-  sys: (text: string) => void
-) {
-  if (!starting || response?.status === 'recording') {
-    return
-  }
-
-  voice.setRecording(false)
-
-  if (response?.status === 'busy') {
-    voice.setProcessing(true)
-    sys('voice: still transcribing; try again shortly')
-  } else {
-    voice.setProcessing(false)
-  }
-}
-
 export function dismissSensitivePrompt(
-  overlay: Pick<OverlayState, 'secret' | 'sudo' | 'vaultUnlock'>,
+  overlay: Pick<OverlayState, 'secret' | 'sudo'>,
   rpc: GatewayRpc,
   sys: (text: string) => void
 ) {
@@ -164,17 +144,6 @@ export function dismissSensitivePrompt(
     sys('secret entry cancelled')
 
     respondToServerRequest(requestId, { value: '' })
-
-    return
-  }
-
-  if (overlay.vaultUnlock) {
-    const requestId = overlay.vaultUnlock.requestId
-
-    patchOverlayState({ vaultUnlock: null })
-    sys(`${overlay.vaultUnlock.displayName} stays locked`)
-
-    respondToServerRequest(requestId, { value: '' })
   }
 }
 
@@ -185,7 +154,7 @@ export function shouldDetachEditedHistoryInput(historyIdx: null | number, histor
 }
 
 export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
-  const { actions, composer, gateway, terminal, voice, wheelStep } = ctx
+  const { actions, composer, gateway, terminal, wheelStep } = ctx
   const { actions: cActions, refs: cRefs, state: cState } = composer
 
   const overlay = useStore($overlayState)
@@ -238,41 +207,12 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return
     }
 
-    // The connection card has no local dismissal: the operation belongs to the running turn, so
-    // ending the turn is what settles it (as `interrupt`) and closes the card.
-    if (overlay.connection) {
-      const sid = getUiState().sid
-
-      if (!sid) {
-        return
-      }
-
-      return turnController.interruptTurn({
-        appendMessage: actions.appendMessage,
-        gw: gateway.gw,
-        sid,
-        sys: actions.sys
-      })
-    }
-
-    if (overlay.sudo || overlay.secret || overlay.vaultUnlock) {
+    if (overlay.sudo || overlay.secret) {
       return dismissSensitivePrompt(overlay, gateway.rpc, actions.sys)
     }
 
     if (overlay.modelPicker) {
       return patchOverlayState({ modelPicker: false })
-    }
-
-    if (overlay.petPicker) {
-      return patchOverlayState({ petPicker: false })
-    }
-
-    if (overlay.billing) {
-      return patchOverlayState({ billing: null })
-    }
-
-    if (overlay.subscription) {
-      return patchOverlayState({ subscription: null })
     }
 
     if (overlay.skillsHub) {
@@ -353,45 +293,6 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
   }
 
-  // CLI parity: Ctrl+B toggles a VAD-bounded push-to-talk capture
-  // (NOT the voice-mode umbrella bit). The mode is enabled via /voice on;
-  // Ctrl+B while the mode is off sys-nudges the user. While the mode is
-  // on, the first press starts a single VAD-bounded capture
-  // (gateway -> start_continuous(auto_restart=false), VAD auto-stop ->
-  // transcribe -> idle), a subsequent press stops and transcribes it.
-  // The gateway publishes voice.status + voice.transcript events that
-  // createGatewayEventHandler turns into UI badges and composer injection.
-  const voiceRecordToggle = () => {
-    if (!voice.enabled) {
-      return actions.sys('voice: mode is off — enable with /voice on')
-    }
-
-    const starting = !voice.recording
-    const action = starting ? 'start' : 'stop'
-
-    // Optimistic UI — flip the REC badge immediately so the user gets
-    // feedback while the RPC round-trips; the voice.status event is the
-    // authoritative source and may correct us.
-    if (starting) {
-      voice.setRecording(true)
-    } else {
-      voice.setRecording(false)
-      voice.setProcessing(false)
-    }
-
-    gateway
-      .rpc<VoiceRecordResponse>('voice.record', { action, session_id: getUiState().sid })
-      .then(r => applyVoiceRecordResponse(r, starting, voice, actions.sys))
-      .catch((e: Error) => {
-        // Revert optimistic UI on failure.
-        if (starting) {
-          voice.setRecording(false)
-        }
-
-        actions.sys(`voice error: ${e.message}`)
-      })
-  }
-
   // Double-Esc discards the draft, matching Claude Code / Gemini CLI. It
   // sits above the isBlocked early-return so a prompt overlay cannot swallow
   // it. Ctrl+C now clears a non-empty composer even mid-stream; Esc Esc is
@@ -431,13 +332,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       // answering felt like the prompt had locked the entire UI.  Explicitly
       // skip the prompt-overlay early-return for scroll keys so they fall
       // through to the wheel / PageUp / Shift+arrow handlers below.
-      const promptOverlay =
-        overlay.approval ||
-        overlay.billing ||
-        overlay.clarify ||
-        overlay.confirm ||
-        overlay.connection ||
-        overlay.subscription
+      const promptOverlay = overlay.approval || overlay.clarify || overlay.confirm
 
       const fallThroughForScroll = promptOverlay && shouldFallThroughForScroll(key)
 
@@ -517,7 +412,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         return
       }
 
-      if (isCtrl(key, ch, 'c') || (key.escape && (overlay.secret || overlay.sudo || overlay.vaultUnlock))) {
+      if (isCtrl(key, ch, 'c') || (key.escape && (overlay.secret || overlay.sudo))) {
         cancelOverlayFromCtrlC()
       } else if (key.escape && overlay.sessions) {
         patchOverlayState({ sessions: false })
@@ -584,14 +479,6 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       const step = Math.max(4, Math.floor(viewport / 2))
 
       return scrollTranscript(key.pageUp ? -step : step)
-    }
-
-    // Escape-based voice bindings (ctrl/alt/super+escape) must win before the
-    // generic Esc handlers below; otherwise queue-edit cancel / selection-clear
-    // would swallow the chord and /voice would advertise a shortcut that never
-    // actually toggles recording in those UI states.
-    if (key.escape && isVoiceToggleKey(key, ch, voice.recordKey)) {
-      return voiceRecordToggle()
     }
 
     // Queue-edit cancel beats selection-clear for plain Esc: the queue header
@@ -736,10 +623,6 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       forceRedraw(terminal.stdout ?? process.stdout)
 
       return
-    }
-
-    if (isVoiceToggleKey(key, ch, voice.recordKey)) {
-      return voiceRecordToggle()
     }
 
     // Cmd/Ctrl+G, plus Alt+G fallback for VSCode/Cursor (they bind the

@@ -101,7 +101,7 @@ const baseProps = {
   t: DEFAULT_THEME,
   turnStartedAt: null,
   usage: { context_max: 200_000, context_percent: 25, context_used: 50_000, total: 50_000 },
-  voiceLabel: ''
+
 }
 
 describe('StatusRule model label', () => {
@@ -241,7 +241,7 @@ describe('StatusRule session count click target', () => {
       t: DEFAULT_THEME,
       turnStartedAt: null,
       usage: { total: 0 },
-      voiceLabel: ''
+
     })
 
     const clickableSessionCount = findClickableWithText(element, '1 session')
@@ -274,7 +274,7 @@ describe('StatusRule session count click target', () => {
         output: 0,
         total: 50_000
       },
-      voiceLabel: 'voice off'
+
     })
 
     const rendered = textContent(element)

@@ -52,7 +52,7 @@ export const resolveEditor = (
 
 /** Suspend Ink, open ``initial`` in $EDITOR, return the edited text (null if aborted). */
 export async function openInEditor(initial: string, suffix = '.txt'): Promise<null | string> {
-  const dir = mkdtempSync(join(tmpdir(), 'hermes-edit-'))
+  const dir = mkdtempSync(join(tmpdir(), 'k3code-edit-'))
   const file = join(dir, `edit${suffix}`)
   writeFileSync(file, initial)
   const [cmd, ...args] = resolveEditor()

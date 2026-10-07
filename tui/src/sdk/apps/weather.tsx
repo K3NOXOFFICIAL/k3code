@@ -119,7 +119,7 @@ async function geocodeLocation(location: string): Promise<Coordinates> {
   const params = new URLSearchParams({ count: '1', format: 'json', language: 'en', name: location })
 
   const res = await fetch(`https://geocoding-api.open-meteo.com/v1/search?${params}`, {
-    headers: { 'User-Agent': 'hermes-tui-weather' },
+    headers: { 'User-Agent': 'k3code-tui-weather' },
     signal: AbortSignal.timeout(10_000)
   })
 
@@ -149,7 +149,7 @@ async function geolocateByIp(): Promise<Coordinates> {
   const fields = 'success,city,country,latitude,longitude,timezone'
 
   const res = await fetch(`https://ipwho.is/?fields=${fields}`, {
-    headers: { 'User-Agent': 'hermes-tui-weather' },
+    headers: { 'User-Agent': 'k3code-tui-weather' },
     signal: AbortSignal.timeout(10_000)
   })
 
@@ -189,7 +189,7 @@ async function fetchReport(location: string): Promise<Report> {
   })
 
   const res = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, {
-    headers: { 'User-Agent': 'hermes-tui-weather' },
+    headers: { 'User-Agent': 'k3code-tui-weather' },
     signal: AbortSignal.timeout(10_000)
   })
 

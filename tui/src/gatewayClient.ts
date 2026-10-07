@@ -22,8 +22,8 @@ const MAX_GATEWAY_LOG_LINES = 200
 const MAX_LOG_LINE_BYTES = 4096
 const MAX_BUFFERED_EVENTS = 2000
 const MAX_LOG_PREVIEW = 240
-const STARTUP_TIMEOUT_MS = Math.max(5000, parseInt(process.env.HERMES_TUI_STARTUP_TIMEOUT_MS ?? '15000', 10) || 15000)
-const REQUEST_TIMEOUT_MS = Math.max(30000, parseInt(process.env.HERMES_TUI_RPC_TIMEOUT_MS ?? '120000', 10) || 120000)
+const STARTUP_TIMEOUT_MS = Math.max(5000, parseInt(process.env.K3CODE_TUI_STARTUP_TIMEOUT_MS ?? '15000', 10) || 15000)
+const REQUEST_TIMEOUT_MS = Math.max(30000, parseInt(process.env.K3CODE_TUI_RPC_TIMEOUT_MS ?? '120000', 10) || 120000)
 const WS_CONNECTING = 0
 const WS_OPEN = 1
 const WS_CLOSING = 2
@@ -55,26 +55,26 @@ const describeChild = (proc: ChildProcess | null) => {
 }
 
 const resolveGatewayAttachUrl = () => {
-  const raw = process.env.HERMES_TUI_GATEWAY_URL?.trim()
+  const raw = process.env.K3CODE_TUI_GATEWAY_URL?.trim()
 
   return raw ? raw : null
 }
 
 const resolveSidecarUrl = () => {
-  const raw = process.env.HERMES_TUI_SIDECAR_URL?.trim()
+  const raw = process.env.K3CODE_TUI_SIDECAR_URL?.trim()
 
   return raw ? raw : null
 }
 
 const resolvePython = () => {
-  // Trust HERMES_PYTHON only. The launcher guarantees it: hermes_cli/main.py
+  // Trust K3CODE_PYTHON only. The launcher guarantees it: k3code's cli
   // validates it and falls back to its own sys.executable, and the Nix
   // wrapper sets it too. So a TUI started the normal way already knows its
   // interpreter, and scanning VIRTUAL_ENV / .venv here can only find a
   // DIFFERENT python than the parent process runs on — with the pm store,
   // a stale venv path is actively dangerous (the interpreter a gateway
   // child gets must match the one that spawned it).
-  const configured = process.env.HERMES_PYTHON?.trim()
+  const configured = process.env.K3CODE_PYTHON?.trim()
 
   if (configured) {
     return configured
@@ -84,6 +84,54 @@ const resolvePython = () => {
   // straight out of ui-tui/. A developer doing that runs inside their own
   // activated environment, so PATH is the right question there.
   return process.platform === 'win32' ? 'python' : 'python3'
+}
+
+// k3code: the launcher may override the spawned gateway command entirely
+// (K3CODE_GATEWAY_CMD, e.g. "python -m k3code.cli gateway --stdio"). Parsed
+// with shell-style quoting so paths with spaces survive; null when unset or
+// when it would produce an empty argv.
+const resolveGatewayCmd = (): string[] | null => {
+  const raw = process.env.K3CODE_GATEWAY_CMD?.trim()
+
+  if (!raw) {
+    return null
+  }
+
+  const argv: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+  let hasToken = false
+
+  for (const ch of raw) {
+    if (quote) {
+      if (ch === quote) {
+        quote = null
+      } else {
+        current += ch
+      }
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      hasToken = true
+      continue
+    }
+    if (/\s/.test(ch)) {
+      if (hasToken) {
+        argv.push(current)
+        current = ''
+        hasToken = false
+      }
+      continue
+    }
+    current += ch
+    hasToken = true
+  }
+  if (hasToken) {
+    argv.push(current)
+  }
+
+  return argv.length > 0 ? argv : null
 }
 
 // Matches `<scheme>://user:pass@host…` style user-info segments in
@@ -439,18 +487,20 @@ export class GatewayClient extends EventEmitter {
   }
 
   private startSpawnedGateway(root: string) {
+    const cmdOverride = resolveGatewayCmd()
     const python = resolvePython()
-    const cwd = process.env.HERMES_CWD || root
+    const cwd = process.env.K3CODE_CWD || root
     const env = { ...process.env }
     const pyPath = env.PYTHONPATH?.trim()
 
     env.PYTHONPATH = pyPath ? `${root}${delimiter}${pyPath}` : root
-    // Tell the gateway child where the Hermes source root is so its import
+    // Tell the gateway child where the k3code source root is so its import
     // guard can force it ahead of any same-named package in the launch cwd.
-    env.HERMES_PYTHON_SRC_ROOT = root
-    this.startReadyTimer(python, cwd)
-    this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
-    this.lifecycle(`[lifecycle] spawned gateway child ${describeChild(this.proc)} python=${python} cwd=${cwd}`)
+    env.K3CODE_PYTHON_SRC_ROOT = root
+    const [cmd, ...cmdArgs] = cmdOverride ?? [python, '-m', 'tui_gateway.entry']
+    this.startReadyTimer(cmd, cwd)
+    this.proc = spawn(cmd, cmdArgs, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    this.lifecycle(`[lifecycle] spawned gateway child ${describeChild(this.proc)} cmd=${cmd} cwd=${cwd}`)
 
     const stdin = this.proc.stdin!
     this.channel.attach({ send: text => void stdin.write(text + '\n') })
@@ -643,7 +693,7 @@ export class GatewayClient extends EventEmitter {
     this.disposed = false
     this.clearReconnect()
 
-    const root = process.env.HERMES_PYTHON_SRC_ROOT ?? resolve(import.meta.dirname, '../../')
+    const root = process.env.K3CODE_PYTHON_SRC_ROOT ?? resolve(import.meta.dirname, '../../')
     const attachUrl = resolveGatewayAttachUrl()
     const sidecarUrl = resolveSidecarUrl()
 

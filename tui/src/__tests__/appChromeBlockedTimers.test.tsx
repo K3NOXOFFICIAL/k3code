@@ -12,7 +12,6 @@ import { patchUiState, resetUiState } from '../app/uiStore.js'
 import { StatusRule } from '../components/appChrome.js'
 import { AppLayout } from '../components/appLayout.js'
 import type { GatewayClient } from '../gatewayClient.js'
-import { DEFAULT_VOICE_RECORD_KEY } from '../lib/platform.js'
 import { DEFAULT_THEME } from '../theme.js'
 
 type StatusRuleProps = React.ComponentProps<typeof StatusRule>
@@ -89,8 +88,7 @@ const idleProps: StatusRuleProps = {
   statusColor: DEFAULT_THEME.color.ok,
   t: DEFAULT_THEME,
   turnStartedAt: null,
-  usage: { context_max: 200_000, context_percent: 25, context_used: 50_000, total: 50_000 },
-  voiceLabel: ''
+  usage: { context_max: 200_000, context_percent: 25, context_used: 50_000, total: 50_000 }
 }
 
 // Busy swaps the idle read-out for the FaceTicker, which owns the glyph +
@@ -155,8 +153,7 @@ const layoutProps: AppLayoutProps = {
     queueEditIdx: null,
     queuedDisplay: [],
     submit: () => {},
-    updateInput: () => {},
-    voiceRecordKey: DEFAULT_VOICE_RECORD_KEY
+    updateInput: () => {}
   },
   mouseTracking: 'off',
   progress: { showProgressArea: false },
@@ -169,8 +166,7 @@ const layoutProps: AppLayoutProps = {
     showStickyPrompt: false,
     statusColor: DEFAULT_THEME.color.ok,
     stickyPrompt: '',
-    turnStartedAt: null,
-    voiceLabel: ''
+    turnStartedAt: null
   },
   transcript: {
     historyItems: [],
@@ -355,7 +351,6 @@ describe('status-chrome timers track the current overlay model', () => {
   const occluding: Array<[string, Partial<OverlayState>]> = [
     ['modelPicker', { modelPicker: true }],
     ['pager', { pager: { lines: ['a'], offset: 0 } }],
-    ['petPicker', { petPicker: true }],
     ['pluginsHub', { pluginsHub: true }],
     ['sessions', { sessions: true }],
     ['skillsHub', { skillsHub: true }],
@@ -369,12 +364,10 @@ describe('status-chrome timers track the current overlay model', () => {
   const nonOccluding: Array<[string, Partial<OverlayState>]> = [
     ['agents', { agents: true }],
     ['approval', { approval: { command: 'ls', requestId: 'a-1' } as OverlayState['approval'] }],
-    ['billing', { billing: { kind: 'credits' } as OverlayState['billing'] }],
     ['clarify', { clarify: { question: 'which?', requestId: 'c-1' } as OverlayState['clarify'] }],
     ['confirm', { confirm: { onConfirm: () => {}, prompt: 'sure?' } as OverlayState['confirm'] }],
     ['journey', { journey: true }],
     ['secret', { secret: { envVar: 'TOKEN', prompt: 'token?' } as OverlayState['secret'] }],
-    ['subscription', { subscription: { kind: 'expired' } as OverlayState['subscription'] }],
     ['sudo', { sudo: { requestId: 'sudo-1' } as OverlayState['sudo'] }]
   ]
 

@@ -3,55 +3,69 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 const MAX = 1000
-const dir = process.env.HERMES_HOME ?? join(homedir(), '.hermes')
-const file = join(dir, '.hermes_history')
 
-let cache: string[] | null = null
+const home = () => process.env.K3CODE_HOME ?? join(homedir(), '.k3code')
 
-export function load() {
-  if (cache) {
-    return cache
-  }
+// Per-project: each cwd gets its own history file, so ↑ recalls prompts
+// relevant to the repo the user is actually in.
+const dir = (projectKey: string) => join(home(), 'projects', projectKey)
+const file = (projectKey: string) => join(dir(projectKey), '.input_history')
 
-  try {
-    if (!existsSync(file)) {
-      cache = []
+/** Stable per-project key: the cwd with path separators flattened. */
+export const projectHistoryKey = (projectRoot?: string): string => {
+  const root = projectRoot ?? process.env.K3CODE_PROJECT_CWD ?? process.cwd()
 
-      return cache
-    }
-
-    const entries: string[] = []
-    let current: string[] = []
-
-    for (const line of readFileSync(file, 'utf8').split('\n')) {
-      if (line.startsWith('+')) {
-        current.push(line.slice(1))
-      } else if (current.length) {
-        entries.push(current.join('\n'))
-        current = []
-      }
-    }
-
-    if (current.length) {
-      entries.push(current.join('\n'))
-    }
-
-    cache = entries.slice(-MAX)
-  } catch {
-    cache = []
-  }
-
-  return cache
+  return root.replace(/[/:\\]+/g, '_') || 'default'
 }
 
-export function append(line: string) {
+const caches = new Map<string, string[]>()
+
+export function load(projectKey: string = projectHistoryKey()) {
+  const cached = caches.get(projectKey)
+
+  if (cached) {
+    return cached
+  }
+
+  const f = file(projectKey)
+  let entries: string[] = []
+
+  try {
+    if (existsSync(f)) {
+      let current: string[] = []
+
+      for (const line of readFileSync(f, 'utf8').split('\n')) {
+        if (line.startsWith('+')) {
+          current.push(line.slice(1))
+        } else if (current.length) {
+          entries.push(current.join('\n'))
+          current = []
+        }
+      }
+
+      if (current.length) {
+        entries.push(current.join('\n'))
+      }
+
+      entries = entries.slice(-MAX)
+    }
+  } catch {
+    entries = []
+  }
+
+  caches.set(projectKey, entries)
+
+  return entries
+}
+
+export function append(line: string, projectKey: string = projectHistoryKey()) {
   const trimmed = line.trim()
 
   if (!trimmed) {
     return
   }
 
-  const items = load()
+  const items = load(projectKey)
 
   if (items.at(-1) === trimmed) {
     return
@@ -64,9 +78,7 @@ export function append(line: string) {
   }
 
   try {
-    if (!existsSync(dir)) {
-      mkdirSync(dir, { recursive: true })
-    }
+    mkdirSync(dir(projectKey), { recursive: true })
 
     const ts = new Date().toISOString().replace('T', ' ').replace('Z', '')
 
@@ -75,7 +87,7 @@ export function append(line: string) {
       .map(l => `+${l}`)
       .join('\n')
 
-    appendFileSync(file, `\n# ${ts}\n${encoded}\n`)
+    appendFileSync(file(projectKey), `\n# ${ts}\n${encoded}\n`)
   } catch {
     void 0
   }

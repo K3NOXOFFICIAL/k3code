@@ -16,9 +16,6 @@ import type {
   GatewaySkin,
   SessionMostRecentResponse
 } from '../gatewayTypes.js'
-import { billingDialogCopy } from '../lib/billingDialog.js'
-import { isTodoDone } from '../lib/liveProgress.js'
-import { openExternalUrl } from '../lib/openExternalUrl.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { topLevelSubagents } from '../lib/subagentTree.js'
 import { isPaintableHex, setTerminalBackground, setTerminalForeground } from '../lib/terminalModes.js'
@@ -27,12 +24,11 @@ import { bootSeededPin, invalidateBootBackground, writeBootTheme } from '../lib/
 import { defaultThemeForCurrentBackground, fromSkin, skinIsLight, type Theme, themeToneHex } from '../theme.js'
 import type { Msg, SessionInfo, SubagentProgress } from '../types.js'
 
-import { applyConnectionRequest, applyConnectionUpdate } from './connectionOperationStore.js'
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import { applyGoalSnapshot } from './goalStatus.js'
 import type { GatewayEventHandlerContext, NoticeLevel } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
-import { flashGoodVibes, flashPet } from './petFlashStore.js'
+import { flashGoodVibes } from './petFlashStore.js'
 import { forgetServerRequest } from './serverRequestStore.js'
 import { turnController } from './turnController.js'
 import { getTurnState } from './turnStore.js'
@@ -48,17 +44,11 @@ import {
   stderrLooksLikeProblem,
   stderrProblemActivity
 } from './userMessages.js'
-import { isWakeUserDisabled } from './wakeState.js'
 
 const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i
 
 const NOTICE_LEVELS: readonly NoticeLevel[] = ['error', 'info', 'success', 'warn']
 const isNoticeLevel = (value: unknown): value is NoticeLevel => NOTICE_LEVELS.includes(value as NoticeLevel)
-
-type VoiceSubmitMode = 'direct' | 'draft'
-
-const normalizeVoiceSubmitMode = (value: unknown): VoiceSubmitMode =>
-  typeof value === 'string' && value.trim().toLowerCase() === 'draft' ? 'draft' : 'direct'
 
 // Shallow-compare Usage to avoid creating a new object reference when values
 // haven't changed. A fresh reference on every streaming event forces every
@@ -146,9 +136,9 @@ const commitTheme = (theme: Theme) => {
   // disagrees with the background, and caching one without the other
   // recreates the multi-stage flash on the next launch (light first frame →
   // dark skin resolve against the cached background → light config pin).
-  const pin = configPinnedTheme ? process.env.HERMES_TUI_THEME : undefined
+  const pin = configPinnedTheme ? process.env.K3CODE_TUI_THEME : undefined
 
-  writeBootTheme(theme, process.env.HERMES_TUI_BACKGROUND, pin === 'light' || pin === 'dark' ? pin : undefined)
+  writeBootTheme(theme, process.env.K3CODE_TUI_BACKGROUND, pin === 'light' || pin === 'dark' ? pin : undefined)
 
   if (changed) {
     setTimeout(() => forceRedraw(process.stdout), 40).unref?.()
@@ -210,14 +200,14 @@ export function reapplyTheme(): void {
 
 /**
  * Apply the persisted mode pin (`display.tui_theme`). 'light'/'dark' bridge
- * to HERMES_TUI_THEME — the priority-2 signal `detectLightMode` already
- * honors (only an explicit HERMES_TUI_LIGHT env var outranks it); 'auto'
+ * to K3CODE_TUI_THEME — the priority-2 signal `detectLightMode` already
+ * honors (only an explicit K3CODE_TUI_LIGHT env var outranks it); 'auto'
  * clears the pin so the OSC-11 probe + env heuristics decide. The pin exists
  * because the probe cannot always be trusted: xterm.js hosts report #000000
  * regardless of the painted background when the editor theme leaves the
  * terminal background unset.
  */
-// True once CONFIG (via light/dark) owns the HERMES_TUI_THEME env pin, so an
+// True once CONFIG (via light/dark) owns the K3CODE_TUI_THEME env pin, so an
 // 'auto' hydrate knows not to clobber a user's shell-exported pin. A pin the
 // boot cache replayed counts as config-owned — it originated from
 // display.tui_theme last session, and treating it as a shell export would
@@ -229,7 +219,7 @@ export function applyConfiguredTuiTheme(raw: unknown): void {
     .trim()
     .toLowerCase()
 
-  const current = process.env.HERMES_TUI_THEME ?? ''
+  const current = process.env.K3CODE_TUI_THEME ?? ''
 
   if (mode === 'light' || mode === 'dark') {
     // Record config ownership BEFORE the match short-circuit — otherwise a
@@ -241,9 +231,9 @@ export function applyConfiguredTuiTheme(raw: unknown): void {
       return
     }
 
-    process.env.HERMES_TUI_THEME = mode
+    process.env.K3CODE_TUI_THEME = mode
   } else {
-    // 'auto' clears only a pin CONFIG set — never a HERMES_TUI_THEME the user
+    // 'auto' clears only a pin CONFIG set — never a K3CODE_TUI_THEME the user
     // exported in their shell, which is an explicit override that outranks
     // auto-detection (see detectLightMode's priority order).
     if (!current || !configPinnedTheme) {
@@ -251,7 +241,7 @@ export function applyConfiguredTuiTheme(raw: unknown): void {
     }
 
     configPinnedTheme = false
-    delete process.env.HERMES_TUI_THEME
+    delete process.env.K3CODE_TUI_THEME
   }
 
   reapplyTheme()
@@ -264,10 +254,10 @@ let themeBackgroundSyncStarted = false
  * OSC-11 probe answers. The env heuristics `detectLightMode` runs at module
  * load are blind in xterm.js hosts (VS Code / Cursor set no COLORFGBG), so a
  * light editor terminal otherwise gets the dark fallback palette. The answer
- * is cached into HERMES_TUI_BACKGROUND — the slot `detectLightMode` already
+ * is cached into K3CODE_TUI_BACKGROUND — the slot `detectLightMode` already
  * reads (and child processes inherit) — then the current skin (or the
  * skinless default) is re-applied against the corrected base. Explicit
- * HERMES_TUI_LIGHT / HERMES_TUI_THEME overrides still win inside
+ * K3CODE_TUI_LIGHT / K3CODE_TUI_THEME overrides still win inside
  * detectLightMode, so users can pin a mode regardless of the probe.
  */
 /** Infer the terminal's polarity from its reported FOREGROUND (OSC 10).
@@ -334,7 +324,7 @@ export function syncThemeToTerminalBackground(): void {
     }
 
     resolved = true
-    process.env.HERMES_TUI_BACKGROUND = hex
+    process.env.K3CODE_TUI_BACKGROUND = hex
     reapplyTheme()
   })
 
@@ -343,7 +333,7 @@ export function syncThemeToTerminalBackground(): void {
   // the background didn't (first-writer-wins via `resolved`), and an explicit
   // user pin still outranks it inside detectLightMode.
   onTerminalForeground(hex => {
-    if (resolved || process.env.HERMES_TUI_THEME || process.env.HERMES_TUI_LIGHT) {
+    if (resolved || process.env.K3CODE_TUI_THEME || process.env.K3CODE_TUI_LIGHT) {
       return
     }
 
@@ -354,7 +344,7 @@ export function syncThemeToTerminalBackground(): void {
     }
 
     resolved = true
-    process.env.HERMES_TUI_BACKGROUND = inferred
+    process.env.K3CODE_TUI_BACKGROUND = inferred
     reapplyTheme()
   })
 
@@ -367,16 +357,16 @@ export function syncThemeToTerminalBackground(): void {
     if (
       resolved ||
       process.platform !== 'darwin' ||
-      process.env.HERMES_TUI_BACKGROUND ||
-      process.env.HERMES_TUI_THEME ||
-      process.env.HERMES_TUI_LIGHT ||
+      process.env.K3CODE_TUI_BACKGROUND ||
+      process.env.K3CODE_TUI_THEME ||
+      process.env.K3CODE_TUI_LIGHT ||
       process.env.COLORFGBG
     ) {
       return
     }
 
     execFile('defaults', ['read', '-g', 'AppleInterfaceStyle'], (error, stdout) => {
-      if (resolved || process.env.HERMES_TUI_BACKGROUND || process.env.HERMES_TUI_THEME) {
+      if (resolved || process.env.K3CODE_TUI_BACKGROUND || process.env.K3CODE_TUI_THEME) {
         return
       }
 
@@ -391,7 +381,7 @@ export function syncThemeToTerminalBackground(): void {
       // intentionally doesn't gate on `resolved` (a measurement outranks an
       // inference).
       resolved = true
-      process.env.HERMES_TUI_BACKGROUND = dark ? '#1e1e1e' : '#ffffff'
+      process.env.K3CODE_TUI_BACKGROUND = dark ? '#1e1e1e' : '#ffffff'
       reapplyTheme()
     })
   }, 1500).unref?.()
@@ -452,7 +442,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   const { appendMessage, panel, setHistoryItems } = ctx.transcript
   const { setInput } = ctx.composer
   const { submitLiteralRef, submitRef } = ctx.submission
-  const { setProcessing: setVoiceProcessing, setRecording: setVoiceRecording, setVoiceEnabled } = ctx.voice
 
   let pendingThinkingStatus = ''
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
@@ -664,7 +653,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       // Startup queries are arbitrary launcher/script text (Omarchy prompted
-      // launches, `hermes --tui -q "…"`) — submit LITERALLY, bypassing the
+      // launches, `k3code --tui -q "…"`) — submit LITERALLY, bypassing the
       // slash/!/interpolation dispatcher, matching one-shot's semantics.
       submitLiteralRef.current(STARTUP_QUERY || 'What do you see in this image?')
     }, 0)
@@ -688,14 +677,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     // report through sys(), mutate transcript state, and trip React's
     // "too many re-renders" guard in embedded dashboard PTYs.
     ensureAgentsNudgeConfig()
-
-    // Arm "Hey Hermes" if this surface owns it (server gates on config).
-    // Fire-and-forget + idempotent server-side, so reconnects are harmless.
-    // Skipped when the user explicitly ran `/wake off` this session — an
-    // explicit opt-out must survive gateway reconnects (see wakeState.ts).
-    if (!isWakeUserDisabled()) {
-      void rpc('wake.start', { surface: 'tui' }).catch(() => undefined)
-    }
 
     // Bound to the live session when one exists (reconnect): project-local
     // skills follow the session's repo. Before the first session the gateway
@@ -750,8 +731,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     // Opt-in: when `display.tui_auto_resume_recent` is true, look up
     // the most recent human-facing session and resume it instead of
-    // forging a brand-new one.  Mirrors classic CLI's `hermes -c` /
-    // `hermes --tui` muscle memory and addresses the audit's "session
+    // forging a brand-new one.  Mirrors classic CLI's `k3code -c` /
+    // `k3code --tui` muscle memory and addresses the audit's "session
     // unrecoverable after disconnection" gap.  Default off so existing
     // users aren't surprised.  (Shares the memoized full-config read.)
     getFullConfigOnce()
@@ -795,23 +776,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     }
 
     switch (ev.type) {
-      case 'connection.request':
-        if (ev.payload) {
-          applyConnectionRequest(ev.payload)
-        }
-
-        return
-
-      case 'connection.update':
-        if (ev.payload) {
-          // The settling frame is the only record of how each app ended; the card is gone by then.
-          for (const line of applyConnectionUpdate(ev.payload)) {
-            sys(line)
-          }
-        }
-
-        return
-
       case 'gateway.ready':
         handleReady(ev.payload?.skin)
 
@@ -988,35 +952,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         turnController.clearNotice(ev.payload?.key)
 
         return
-      case 'billing.step_up.verification': {
-        // The billing step-up device flow runs in the headless gateway, so it
-        // can't open a browser or print the URL where the user sees it. Surface
-        // the link here (clickable/copyable in the transcript) and best-effort
-        // open it via the TUI process's own opener. This event arrives while the
-        // billing.step_up RPC is still polling (and may even outlive the RPC's
-        // 120s timeout), so the link — not the RPC result — is the source of truth.
-        if (!ev.payload) {
-          return
-        }
-
-        const url = ev.payload.verification_url
-        const code = ev.payload.user_code
-
-        if (!url) {
-          return
-        }
-
-        sys('💳 Open this link to allow Remote Spending:')
-        sys(url)
-
-        if (code) {
-          sys(`If prompted, enter code: ${code}`)
-        }
-
-        void openExternalUrl(url)
-
-        return
-      }
 
       case 'gateway.stderr': {
         // Every raw line is already in the /logs buffer (gatewayClient.pushLog).
@@ -1053,116 +988,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
-      case 'voice.status': {
-        // Continuous VAD loop reports its internal state so the status bar
-        // can show listening / transcribing / idle without polling.
-        const state = String(ev.payload?.state ?? '')
-
-        if (state === 'listening') {
-          setVoiceRecording(true)
-          setVoiceProcessing(false)
-        } else if (state === 'transcribing') {
-          setVoiceRecording(false)
-          setVoiceProcessing(true)
-        } else {
-          setVoiceRecording(false)
-          setVoiceProcessing(false)
-        }
-
-        return
-      }
-
-      case 'voice.transcript': {
-        // Explicit user-intent stop: the user said (or typed) a bare stop
-        // phrase. The backend already halted the capture loop and flipped
-        // voice mode off — mirror it here like a manual /voice off, and say
-        // so (this is intent, not the no-speech timeout below).
-        if (ev.payload?.stop_phrase) {
-          setVoiceEnabled(false)
-          setVoiceRecording(false)
-          setVoiceProcessing(false)
-          sys('voice: stop phrase — voice chat ended')
-
-          return
-        }
-
-        // CLI parity: the 3-strikes silence detector flipped off automatically.
-        // Mirror that on the UI side and tell the user why the mode is off.
-        if (ev.payload?.no_speech_limit) {
-          setVoiceEnabled(false)
-          setVoiceRecording(false)
-          setVoiceProcessing(false)
-          sys('voice: no speech detected 3 times, continuous mode stopped')
-
-          return
-        }
-
-        const text = String(ev.payload?.text ?? '').trim()
-
-        if (!text) {
-          return
-        }
-
-        void getFullConfigOnce().then(cfg => {
-          const submitMode = normalizeVoiceSubmitMode(cfg?.config?.voice?.submit_mode)
-
-          if (submitMode === 'draft') {
-            setInput(current => (current.trim() ? `${current.trimEnd()} ${text}` : text))
-
-            return
-          }
-
-          // Default to CLI parity. Clear + defer submit so the cleared input
-          // is committed before submit reads it; invalid config also falls
-          // back to this established direct-submit behavior.
-          setInput('')
-          setTimeout(() => submitRef.current(text), 0)
-        })
-
-        return
-      }
-
-      case 'wake.detected': {
-        // "Hey Hermes": optionally open a fresh session (start_new_session),
-        // then arm voice capture so the user can speak hands-free. Mirrors CLI.
-        void (async () => {
-          // Multi-profile routing: the TUI is a single-profile process, so a
-          // phrase enrolled by ANOTHER profile can't be routed here — surface
-          // the switch command instead of starting voice on the wrong profile.
-          const wakeProfile = ev.payload?.profile?.trim()
-          const ownProfile = getUiState().info?.profile_name || 'default'
-
-          if (wakeProfile && wakeProfile !== ownProfile) {
-            sys(`wake phrase for profile '${wakeProfile}' — run: hermes -p ${wakeProfile} --tui`)
-            await rpc('wake.resume', {}).catch(() => undefined)
-
-            return
-          }
-
-          if (ev.payload?.start_new_session !== false) {
-            await newSession()
-          }
-
-          const sid = getUiState().sid
-
-          if (!sid) {
-            await rpc('wake.resume', {}).catch(() => undefined)
-
-            return
-          }
-
-          setVoiceEnabled(true)
-          await rpc('voice.toggle', { action: 'on' })
-          await rpc('voice.record', { action: 'start', session_id: sid })
-        })().catch((e: unknown) => {
-          sys(`wake: ${rpcErrorMessage(e)}`)
-
-          void rpc('wake.resume', {}).catch(() => undefined)
-        })
-
-        return
-      }
-
+      
       case 'gateway.start_timeout': {
         // Still waiting (the ready timer does not give up) — say so, and point
         // at /logs for the interpreter/cwd/stderr detail instead of printing
@@ -1258,10 +1084,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
 
       case 'reaction':
-        // Core-detected affection (ily / <3 / good bot): flash the ♥ and let the
-        // pet celebrate. Same signal drives the desktop's floating hearts.
+        // Core-detected affection (ily / <3 / good bot): flash the ♥.
         flashGoodVibes()
-        flashPet('jump')
 
         return
 
@@ -1331,9 +1155,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
-        // A password/secret/vault card that timed out vanished silently; say
-        // what happened and how to get it back. Clarify already records its
-        // own "(timed out)" line via tool.complete.
+        // A password/secret card that timed out vanished silently; say what
+        // happened and how to get it back. Clarify already records its own
+        // "(timed out)" line via tool.complete.
         const timeoutNotice = promptTimeoutNotice(ev.payload?.method, ev.payload?.reason)
 
         if (timeoutNotice) {
@@ -1345,7 +1169,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           const next = { ...prev }
           let changed = false
 
-          for (const key of ['approval', 'clarify', 'secret', 'sudo', 'vaultUnlock'] as const) {
+          for (const key of ['approval', 'clarify', 'secret', 'sudo'] as const) {
             if (prev[key]?.requestId === id) {
               next[key] = null
               changed = true
@@ -1579,9 +1403,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
           msgs.forEach(appendMessage)
 
-          // Pet beat: celebrate a finished plan, otherwise a clean-finish wave.
-          flashPet(isTodoDone(getTurnState().todos) ? 'jump' : 'wave')
-
           if (bellOnComplete && stdout?.isTTY) {
             stdout.write('\x07')
           }
@@ -1597,41 +1418,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, ev.payload!.usage ?? undefined) }))
         }
 
-        // Billing wall (out of credits / payment required): open a proper
-        // confirm dialog with the one recovery action, not a truncating status
-        // notice. The transcript already carries the full provider guidance;
-        // this is the actionable layer. Set AFTER recordMessageComplete() so the
-        // turn-idle resetFlowOverlays() (which clears `confirm`) can't wipe it;
-        // the top-of-loop guard already scopes this to the active session.
-        if (ev.payload?.billing) {
-          const block = ev.payload.billing
-          const copy = billingDialogCopy(block)
-
-          patchOverlayState({
-            confirm: {
-              cancelLabel: copy.cancelLabel,
-              confirmLabel: copy.confirmLabel,
-              detail: copy.detail,
-              onConfirm: () => {
-                if (block.is_nous) {
-                  submitRef.current('/topup')
-                } else if (block.billing_url) {
-                  openExternalUrl(block.billing_url)
-                } else {
-                  submitRef.current('/model')
-                }
-              },
-              title: copy.title
-            }
-          })
-        }
-
         return
       }
 
       case 'error':
         turnController.recordError()
-        flashPet('failed')
 
         {
           const message = String(ev.payload?.message || 'unknown error')

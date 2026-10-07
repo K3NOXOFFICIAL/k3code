@@ -389,7 +389,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   )
 
   const openEditor = useCallback(async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'hermes-'))
+    const dir = mkdtempSync(join(tmpdir(), 'k3code-'))
     const file = join(dir, 'prompt.md')
     const [cmd, ...args] = resolveEditor()
 

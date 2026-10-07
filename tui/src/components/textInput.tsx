@@ -6,14 +6,7 @@ import { setInputSelection } from '../app/inputSelectionStore.js'
 import { highlightMask, highlightsStable } from '../domain/composerHighlights.js'
 import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
 import { cursorLayout, offsetFromPosition } from '../lib/inputMetrics.js'
-import {
-  DEFAULT_VOICE_RECORD_KEY,
-  isActionMod,
-  isMac,
-  isMacActionFallback,
-  isVoiceToggleKey,
-  type ParsedVoiceRecordKey
-} from '../lib/platform.js'
+import { isActionMod, isMac, isMacActionFallback } from '../lib/platform.js'
 import { isTermuxTuiMode } from '../lib/termux.js'
 
 type InkExt = typeof Ink & {
@@ -669,7 +662,7 @@ export function supportsFastEchoTerminal(env: NodeJS.ProcessEnv = process.env): 
   // stale paints at soft-wrap boundaries on tall/narrow viewports. Keep this
   // off by default in Termux mode; allow explicit opt-in for local debugging.
   if (isTermuxTuiMode(env)) {
-    const override = String(env.HERMES_TUI_TERMUX_FAST_ECHO ?? '')
+    const override = String(env.K3CODE_TUI_TERMUX_FAST_ECHO ?? '')
       .trim()
       .toLowerCase()
 
@@ -784,7 +777,6 @@ export function TextInput({
   mouseApiRef,
   cursorSnapshotRef,
   ignoreVerticalArrows = false,
-  voiceRecordKey = DEFAULT_VOICE_RECORD_KEY,
   placeholder = '',
   placeholderColor,
   accentColor,
@@ -1382,12 +1374,9 @@ export function TextInput({
     (inp: string, k: Key, event: InputEvent) => {
       const eventRaw = event.keypress.raw
 
-      // Configured voice shortcut wins over composer-level defaults like
-      // paste/copy so users who bind voice to ctrl+v / alt+v / cmd+v
-      // actually get voice toggled instead of a paste (Copilot round-7
-      // follow-up on #19835). The pass-through predicate is a no-op for
-      // ordinary typing and plain paste when voice is unbound to 'v'.
-      if (event.keypress.name === 'f7' || shouldPassThroughToGlobalHandler(inp, k, voiceRecordKey)) {
+      // F7 is reserved for global (composer-external) handling so users keep
+      // one predictable chord that always escapes composer-level defaults.
+      if (event.keypress.name === 'f7') {
         flushKeyBurst()
 
         return
@@ -1842,7 +1831,6 @@ interface TextInputProps {
   /** Hex color for placeholder text (theme muted); SGR dim when omitted. */
   placeholderColor?: string
   value: string
-  voiceRecordKey?: ParsedVoiceRecordKey
 }
 
 export type RightClickDecision = { action: 'copy'; text: string } | { action: 'paste' }
@@ -1873,21 +1861,18 @@ export function decideRightClickAction(
   return { action: 'paste' }
 }
 
-export const shouldPassThroughToGlobalHandler = (
-  input: string,
-  key: Key,
-  voiceRecordKey: ParsedVoiceRecordKey = DEFAULT_VOICE_RECORD_KEY
-): boolean =>
-  (key.ctrl && input === 'c') ||
-  (key.ctrl && input === 'x') ||
-  (key.ctrl && input === 'o') ||
-  (key.ctrl && (input === 'r' || input === 't')) ||
-  key.tab ||
-  (key.shift && key.tab) ||
-  key.pageUp ||
-  key.pageDown ||
-  key.escape ||
-  isVoiceToggleKey(key, input, voiceRecordKey)
+export const shouldPassThroughToGlobalHandler = (input: string, key: Key): boolean =>
+  Boolean(
+    (key.ctrl && input === 'c') ||
+      (key.ctrl && input === 'x') ||
+      (key.ctrl && input === 'o') ||
+      (key.ctrl && (input === 'r' || input === 't')) ||
+      key.tab ||
+      (key.shift && key.tab) ||
+      key.pageUp ||
+      key.pageDown ||
+      key.escape
+  )
 
 export interface TextInputMouseApi {
   dragAt: (row: number, col: number) => void

@@ -14,33 +14,22 @@ interface CommandRegistryLoad {
   names: string[]
 }
 
-const NATIVE_MUTATING_COMMANDS = new Set(['browser', 'busy', 'fast', 'reload-mcp', 'rollback', 'stop'])
+// k3code M1: the core-side command registry is `k3code.commands.builtin.
+// build_registry()`. Commands the TUI handles locally need no route assert;
+// the gateway-side ones (effort/exit/rename/resume) must dispatch natively
+// via command.dispatch — never as a slash-worker prompt fallback.
+const NATIVE_MUTATING_COMMANDS = new Set(['effort', 'exit', 'rename', 'resume'])
 
 const MUTATING_COMMANDS = [
-  'bg',
-  'btw',
-  'branch',
-  'browser',
-  'busy',
   'clear',
-  'compress',
-  'fast',
+  'compact',
+  'effort',
+  'exit',
+  'help',
   'model',
-  'new',
-  'personality',
-  'queue',
-  'reasoning',
-  'reload-mcp',
-  'retry',
-  'rollback',
-  'steer',
-  'stop',
-  'title',
-  'tools',
-  'undo',
-  'verbose',
-  'voice',
-  'yolo'
+  'rename',
+  'resume',
+  'stop'
 ] as const
 
 const loadCommandRegistryNames = (): CommandRegistryLoad => {
@@ -52,9 +41,16 @@ const loadCommandRegistryNames = (): CommandRegistryLoad => {
         process.env.PYTHON ?? 'python3',
         [
           '-c',
-          'import json; from hermes_cli.commands import COMMAND_REGISTRY; print(json.dumps([c.name for c in COMMAND_REGISTRY]))'
+          'import json; from k3code.commands.builtin import build_registry; print(json.dumps(build_registry().names()))'
         ],
-        { cwd: resolve(here, '../../..'), encoding: 'utf8' }
+        {
+          cwd: resolve(here, '../../..'),
+          encoding: 'utf8',
+          // Pipe stderr: a missing k3code install prints a python traceback
+          // that would otherwise leak into the test runner's output. The
+          // traceback still lands on the error object for the skip reason.
+          stdio: ['ignore', 'pipe', 'pipe']
+        }
       )
     ) as string[]
 

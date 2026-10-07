@@ -8,9 +8,7 @@ import { Fragment, memo, type MutableRefObject, useEffect, useMemo, useRef } fro
 import { useGateway } from '../app/gatewayContext.js'
 import type { AppLayoutProps } from '../app/interfaces.js'
 import { $isBlocked, $overlayState, patchOverlayState } from '../app/overlayStore.js'
-import { $petBox } from '../app/petFlashStore.js'
 import { $uiState } from '../app/uiStore.js'
-import { usePet } from '../app/usePet.js'
 import { INLINE_MODE, NATIVE_MODE, SHOW_FPS, TERMUX_TUI_MODE } from '../config/env.js'
 import { PLACEHOLDER } from '../content/placeholders.js'
 import { prevRenderedMsg } from '../domain/blockLayout.js'
@@ -34,83 +32,9 @@ import { GoalBar } from './goalBar.js'
 import { HelpHint } from './helpHint.js'
 import { Journey } from './journey.js'
 import { MessageLine } from './messageLine.js'
-import { PetKitty, PetSprite } from './petSprite.js'
 import { QueuedMessages } from './queuedMessages.js'
 import { LiveTodoPanel, StreamingAssistant } from './streamingAssistant.js'
 import { type InputCursorSnapshot, TextInput, type TextInputMouseApi } from './textInput.js'
-
-// Box geometry, kept here so the transcript's reservation math matches the
-// rendered overlay exactly.
-const PET_BOTTOM = 3 // rows the pet floats above the screen bottom (over the composer)
-const PET_PAD_LEFT = 2
-const PET_RIGHT = 1
-const PET_GUTTER_GAP = 1
-const KITTY_PLACEHOLDER = '\u{10eeee}'
-// Below this many columns of remaining text width, the right gutter is too
-// cramped, so the transcript collapses to reserving bottom rows instead.
-const MIN_GUTTER_BODY_COLS = 72
-
-// Petdex mascot — a small floating overlay riding the bottom-right corner just
-// above the status bar, with a little top/left breathing room. It reserves no
-// layout rows (the transcript scrolls underneath); instead it publishes its
-// footprint so the transcript can keep its text clear of it (right gutter on
-// wide terminals, reserved bottom rows on narrow ones). Renders nothing unless
-// a pet is installed + enabled.
-export const PetPane = memo(function PetPane() {
-  const { enabled, grid, kitty } = usePet()
-
-  // Footprint in cells. For kitty we count real placeholder cells (zero-width
-  // diacritics make string length lie); for half-blocks it's the grid shape.
-  const { width, height } = useMemo(() => {
-    if (kitty) {
-      return {
-        height: kitty.placeholder.length,
-        width: Math.max(0, ...kitty.placeholder.map(row => [...row].filter(ch => ch === KITTY_PLACEHOLDER).length))
-      }
-    }
-
-    if (grid) {
-      return { height: grid.length, width: Math.max(0, ...grid.map(row => row.length)) }
-    }
-
-    return { height: 0, width: 0 }
-  }, [grid, kitty])
-
-  const active = enabled && width > 0 && height > 0
-
-  useEffect(() => {
-    $petBox.set(
-      active
-        ? {
-            // Bottom PET_BOTTOM rows sit over the composer, so the transcript
-            // only needs to clear the rest in the row-reservation (band) mode.
-            height: Math.max(0, height - PET_BOTTOM),
-            width: width + PET_PAD_LEFT + PET_RIGHT + PET_GUTTER_GAP
-          }
-        : null
-    )
-
-    return () => $petBox.set(null)
-  }, [active, height, width])
-
-  if (!active) {
-    return null
-  }
-
-  return (
-    <NoSelect
-      bottom={PET_BOTTOM}
-      flexShrink={0}
-      paddingLeft={PET_PAD_LEFT}
-      paddingTop={1}
-      position="absolute"
-      right={PET_RIGHT}
-    >
-      {kitty ? <PetKitty color={kitty.color} placeholder={kitty.placeholder} /> : null}
-      {!kitty && grid ? <PetSprite grid={grid} /> : null}
-    </NoSelect>
-  )
-})
 
 const PromptPrefix = memo(function PromptPrefix({
   bold = false,
@@ -145,17 +69,8 @@ const TranscriptPane = memo(function TranscriptPane({
   transcript
 }: Pick<AppLayoutProps, 'actions' | 'composer' | 'progress' | 'transcript'> & { nativeMode: boolean }) {
   const ui = useStore($uiState)
-  const petBox = useStore($petBox)
   const railCols = useAmbientRailWidth('left') + useAmbientRailWidth('right')
-
-  // Keep transcript text clear of the floating pet, responsively:
-  //  - wide terminals: reserve a right gutter so lines wrap to the pet's left
-  //    (as long as enough width is left for comfortable reading);
-  //  - narrow terminals: keep full width and reserve bottom rows instead, so
-  //    the newest lines sit above the pet rather than getting cramped.
-  const useGutter = !nativeMode && !!petBox && composer.cols - railCols - petBox.width >= MIN_GUTTER_BODY_COLS
-  const bodyCols = Math.max(28, (useGutter && petBox ? composer.cols - petBox.width : composer.cols) - railCols)
-  const petBandRows = petBox && !useGutter ? petBox.height : 0
+  const bodyCols = Math.max(28, composer.cols - railCols)
 
   // LiveTodoPanel rides as a child of the latest user-message row so it
   // visually belongs to the prompt and follows it during scroll. -1 when
@@ -250,8 +165,6 @@ const TranscriptPane = memo(function TranscriptPane({
         sections={ui.sections}
       />
 
-      {/* Narrow terminals: reserve rows so the newest lines sit above the pet. */}
-      {!nativeMode && petBandRows > 0 ? <Box height={petBandRows} /> : null}
     </Box>
   )
 
@@ -468,7 +381,6 @@ const ComposerPane = memo(function ComposerPane({
                   // toward the resolved surface inherits that wrong polarity.
                   placeholderColor={ui.theme.color.muted}
                   value={composer.input}
-                  voiceRecordKey={composer.voiceRecordKey}
                 />
               </Box>
 
@@ -553,7 +465,6 @@ const StatusRulePane = memo(function StatusRulePane({
         t={ui.theme}
         turnStartedAt={status.turnStartedAt}
         usage={ui.usage}
-        voiceLabel={status.voiceLabel}
       />
     </Box>
   )
@@ -618,7 +529,6 @@ export const AppLayout = memo(function AppLayout({
                 onClarifyQuestionAnswer={actions.answerClarifyQuestion}
                 onSecretSubmit={actions.answerSecret}
                 onSudoSubmit={actions.answerSudo}
-                onVaultUnlockSubmit={actions.answerVaultUnlock}
               />
             </PerfPane>
 
@@ -639,8 +549,6 @@ export const AppLayout = memo(function AppLayout({
             )}
           </>
         )}
-
-        {!overlay.agents && !NATIVE_MODE && <PetPane />}
       </Box>
 
       <ActiveWidgetSlot />
