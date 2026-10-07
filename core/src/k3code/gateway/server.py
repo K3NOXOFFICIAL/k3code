@@ -225,6 +225,7 @@ class GatewayServer:
         #: Set by the daemon in restart-storm safe mode: no background work starts.
         self.background_paused = False
         self.safe_mode_notice = ""
+        self._client_seq = 0
         self.usage = UsageDB(self._home() / "usage.db")
 
     # ── session registry ──────────────────────────────────────────────
@@ -396,7 +397,8 @@ class GatewayServer:
         def send(line: str) -> None:
             writer.write((line + "\n").encode("utf-8"))
 
-        client = Client(send, name=f"socket#{len(self.clients)}")
+        self._client_seq += 1
+        client = Client(send, name=f"socket#{self._client_seq}")
         self.clients.append(client)
         logger.info("client %s attached", client.name)
         try:

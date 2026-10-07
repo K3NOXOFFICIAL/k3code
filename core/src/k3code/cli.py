@@ -473,6 +473,7 @@ def doctor_cmd(as_json: bool, no_probe: bool) -> None:
     """Health checks with fix hints. Exit status 1 when any check fails."""
     from k3code import doctor
 
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     checks = asyncio.run(doctor.run_checks(load_config(project_dir=Path.cwd()), probe=not no_probe))
     click.echo(doctor.to_json(checks) if as_json else doctor.format_report(checks))
     sys.exit(1 if doctor.summary(checks)[doctor.FAIL] else 0)

@@ -245,3 +245,52 @@ def test_service_install_dry_run_touches_nothing(tmp_path, monkeypatch):
     assert "Type=notify" in out and "enable --now" in out and "loginctl enable-linger" in out
     assert not (tmp_path / "cfg").exists()
     assert "disable --now" in "\n".join(service.uninstall(dry_run=True))
+
+
+async def test_gateway_attach_bridge_pumps_stdio_to_the_socket(running_daemon):
+    import sys
+
+    home, _server = running_daemon
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "k3code.cli",
+        "gateway",
+        "--attach",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "K3CODE_GATEWAY_SOCKET": str(daemon.socket_path(home))},
+    )
+    try:
+        proc.stdin.write(b'{"jsonrpc":"2.0","id":9,"method":"session.list","params":{}}\n')
+        await proc.stdin.drain()
+        types, result = [], None
+        while result is None:
+            frame = json.loads(await asyncio.wait_for(proc.stdout.readline(), 15))
+            if frame.get("id") == 9:
+                result = frame["result"]
+            else:
+                types.append(frame["params"]["type"])
+        assert types[:2] == ["gateway.ready", "session.active_list"] and "sessions" in result
+    finally:
+        proc.stdin.close()
+        await asyncio.wait_for(proc.wait(), 10)
+
+
+async def test_gateway_attach_without_daemon_fails_clearly(tmp_path):
+    import sys
+
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "k3code.cli",
+        "gateway",
+        "--attach",
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "K3CODE_GATEWAY_SOCKET": str(tmp_path / "none.sock")},
+    )
+    _out, err = await asyncio.wait_for(proc.communicate(), 15)
+    assert proc.returncode == 1 and b"Start it with `k3code daemon`" in err

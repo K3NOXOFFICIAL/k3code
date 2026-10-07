@@ -15,6 +15,9 @@ the script back. The script is a list of steps applied in order to *every*
        "message": "provider on fire", "headers": {"retry-after": "1"}}
     ]
 
+Any step may carry ``"when": "first"`` (only before a tool result is in the conversation) or
+``"when": "after_tool"`` (only after one), so a script can call a tool once and then finish.
+
 ``text``/``tool_call``/``usage`` accumulate into one assistant turn (a final
 done event); ``error`` aborts the stream with a ProviderError so the router
 classifies and fails over. This makes full agent-loop runs testable with zero
@@ -70,7 +73,11 @@ class FakeProvider(Provider):
         tool_calls: list[ToolCall] = []
         usage: tuple[int, int] | None = None
 
+        has_tool_result = any(m.role == "tool" for m in messages)
         for step in self.steps:
+            when = step.get("when")  # optional: "first" = before any tool result, "after_tool" = after one
+            if (when == "first" and has_tool_result) or (when == "after_tool" and not has_tool_result):
+                continue
             kind = step.get("type")
             if kind == "text":
                 text = str(step.get("text", ""))
