@@ -191,6 +191,15 @@ class CooldownStore:
         self.entries.pop(_identity(provider, model, base_url), None)
         self._save()
 
+    def clear_reason(self, reason: FailoverReason) -> int:
+        """Drop every cooldown armed for ``reason`` (e.g. network ones once connectivity is back); returns the count."""
+        stale = [k for k, e in self.entries.items() if e.reason is reason]
+        for k in stale:
+            del self.entries[k]
+        if stale:
+            self._save()
+        return len(stale)
+
 
 def _provider_reset_delay(retry_after: Any) -> float | None:
     """Seconds until the provider-declared reset, or None when missing/invalid/negative.

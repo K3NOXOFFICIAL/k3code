@@ -212,3 +212,15 @@ async def test_restarted_router_does_not_hit_exhausted_provider(tmp_path):
     router2, _, _, _ = make([a2, Scripted("b", ["b"])], store=CooldownStore(path=path))
     assert (await router2.complete(MSGS, [])).content == "b"
     assert a2.calls == 0
+
+
+def test_clear_reason_drops_only_that_reason():
+    from k3code.router.classifier import FailoverReason
+    from k3code.router.cooldown import CooldownStore
+
+    store = CooldownStore()
+    store.arm(FailoverReason.network, provider="a", model="m", base_url="u", network_cooldown=60)
+    store.arm(FailoverReason.rate_limit, provider="b", model="m", base_url="u", retry_after=60)
+    assert store.clear_reason(FailoverReason.network) == 1
+    assert not store.in_cooldown(provider="a", model="m", base_url="u")
+    assert store.in_cooldown(provider="b", model="m", base_url="u")

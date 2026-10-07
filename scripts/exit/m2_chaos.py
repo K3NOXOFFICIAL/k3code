@@ -106,9 +106,11 @@ async def check_b(procs: cl.Procs) -> None:
     cl.start_fake_upstream(procs, up)
     cl.start_fake_upstream(procs, web)
     cl.start_proxy(procs, px, up, mode)
-    d, peer, sid = await start(procs, config(provider("omni", px, "K") , web), env={"K": "x"})
+    # the internet probe goes through the proxy too, so "proxy down" = the network is gone (offline -> paused);
+    # with a separate always-up probe it would be PROVIDER_DOWN, which parks instead (that is check (e)).
+    d, peer, sid = await start(procs, config(provider("omni", px, "K"), px), env={"K": "x"})
     prompt = ("Do these steps in order, one bash tool call each, then reply DONE: RUN[echo one > a.txt] "
-              "RUN[sleep 2; echo two > b.txt] RUN[echo three > c.txt] RUN[cat a.txt b.txt c.txt]")
+              "RUN[sleep 7; echo two > b.txt] RUN[echo three > c.txt] RUN[cat a.txt b.txt c.txt]")
     t0 = time.monotonic()
     await peer.call("prompt.submit", session_id=sid, text=prompt)
     for _ in range(120):
@@ -117,18 +119,21 @@ async def check_b(procs: cl.Procs) -> None:
         await asyncio.sleep(0.25)
     mode.write_text("down")
     t_down = time.monotonic()
+    marks = [f"proxy down +{t_down - t0:.1f}s"]
     paused = await peer.wait_for("reliability.paused", 60, after=t_down)
     await asyncio.sleep(3)
     mode.write_text("up")
     t_up = time.monotonic()
+    marks.append(f"proxy up +{t_up - t0:.1f}s")
     resumed = await peer.wait_for("reliability.resumed", 60, after=t_up)
     done = await peer.wait_for("message.complete", 90, after=t_up)
     lat = (resumed[0] - t_up) if resumed else float("nan")
     fin = (done[0] - t_up) if done else float("nan")
     ok = paused is not None and resumed is not None and lat <= 10 and done is not None and (d.proj / "c.txt").exists()
     emit("M2", crit, how, "PASS" if ok else "FAIL",
-         f"paused {paused[0] - t_down:.1f}s after proxy down; resumed {lat:.1f}s after proxy up; task finished "
-         f"{fin:.1f}s after proxy up; c.txt={(d.proj / 'c.txt').exists()}\n{ev_lines(peer, t0, KINDS)}")
+         f"paused {(paused[0] - t_down) if paused else float('nan'):.1f}s after proxy down; resumed {lat:.1f}s after proxy up; task finished "
+         f"{fin:.1f}s after proxy up; c.txt={(d.proj / 'c.txt').exists()}\n"
+         f"{', '.join(marks)}\n{ev_lines(peer, t0, KINDS)}")
     peer.close()
 
 
@@ -183,19 +188,26 @@ async def check_e(procs: cl.Procs) -> None:
     cl.start_proxy(procs, px, up, mode)
     d, peer, sid = await start(
         procs, config(provider("primary", px, "K") + provider("secondary", up, "K"), web), env={"K": "x"})
+    await peer.call("prompt.submit", session_id=sid, text="warm up")  # starts the session's netwatch
+    await peer.wait_for("message.complete", 30)
+    n_before = peer.count("message.complete")
     mode.write_text("down")
     await asyncio.sleep(4)  # let netwatch probe the provider endpoints
+    chain_pre = await cmd(peer, sid, "model", "chain")  # before any request: no cooldown masks the health
     t0 = time.monotonic()
     await peer.call("prompt.submit", session_id=sid, text="say hi")
     done = await peer.wait_for("message.complete", 40, after=t0)
+    assert peer.count("message.complete") > n_before
     await asyncio.sleep(1)
     chain = await cmd(peer, sid, "model", "chain")
     stats = await cmd(peer, sid, "stats", "session")
     failover = any("failover:" in str((e.get("payload") or {}).get("text", "")) for _, e in peer.events)
     paused = peer.count("reliability.paused")
-    ok = done is not None and failover and paused == 0 and "provider_down" in chain.lower().replace(" ", "_")
+    pre_down = any("primary" in ln and "[provider_down]" in ln for ln in chain_pre.splitlines())
+    ok = done is not None and failover and paused == 0 and pre_down
     emit("M2", crit, how, "PASS" if ok else "FAIL",
-         f"paused events: {paused}; failover seen: {failover}\n{ev_lines(peer, t0, KINDS)}\n{chain}\n{stats}")
+         f"paused events: {paused}; failover seen: {failover}; primary provider_down before request: {pre_down}\n"
+         f"{chain_pre}\n{ev_lines(peer, t0, KINDS)}\n{chain}\n{stats}")
     peer.close()
 
 

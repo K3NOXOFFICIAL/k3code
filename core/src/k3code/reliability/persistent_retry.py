@@ -35,6 +35,7 @@ from k3code.providers.types import Message, StreamEvent, ToolSpec
 from k3code.reliability import events as ev
 from k3code.reliability.events import EventEmitter
 from k3code.reliability.netwatch import NetState, NetWatch
+from k3code.router.classifier import FailoverReason
 
 #: ChainExhausted reasons that mean "the provider is rate-limiting / quota'd us".
 RATE_LIMIT_REASONS = frozenset({"rate_limit", "quota"})
@@ -182,6 +183,10 @@ class PersistentRetry:
             )
         finally:
             self._raise_if_cancelled()
+        # Cooldowns armed by the outage's connection errors are stale now: retry immediately, don't park on them.
+        cooldowns = getattr(self.router, "cooldowns", None)
+        if cooldowns is not None and hasattr(cooldowns, "clear_reason"):
+            cooldowns.clear_reason(FailoverReason.network)
         self.events.emit(ev.RESUMED, detail=f"network {self.netwatch.state.value if self.netwatch else 'up'}")
 
     async def _park(
