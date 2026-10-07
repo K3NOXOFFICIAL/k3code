@@ -14,7 +14,7 @@ set -uo pipefail
 
 TASK=${1:?task file}; NAME=${2:?name}; BASE=${3:-}; MODEL=${4:-sonnet}
 SETTINGS=${K3DEV_SETTINGS:-$HOME/.claude/settings.omniroute.json}
-MAX_ATTEMPTS=${K3DEV_MAX_ATTEMPTS:-8}
+MAX_ATTEMPTS=${K3DEV_MAX_ATTEMPTS:-30}
 REPO=$(git -C "$(dirname "$0")" rev-parse --path-format=absolute --git-common-dir | sed 's#/\.git$##')
 WT="$REPO/.claude/worktrees/w-$NAME"
 RUNS="$REPO/.k3dev/runs/$NAME"
@@ -58,7 +58,7 @@ while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
   else
     (cd "$WT" && nice -n 10 ionice -c3 claude -p --settings "$SETTINGS" --model "$MODEL" \
        --permission-mode auto --output-format json --resume "$SESSION" \
-       "Continue the task from where you stopped. Re-check the acceptance criteria, finish, commit, and write REPORT.md.") \
+       "You stopped before finishing. Do NOT stop to announce next steps — keep calling tools until the whole task is done. Continue exactly where you left off, then verify the acceptance criteria, commit, and write REPORT.md.") \
        > "$out" 2> "$RUNS/attempt-$attempt.err"
   fi
   rc=$?
