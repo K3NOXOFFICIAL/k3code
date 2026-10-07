@@ -47,7 +47,7 @@ else:
                  "or set K3_ALLOW_OMNIROUTE=1 to go live")
     (home / "config.yaml").write_text(
         "providers:\n"
-        '  - {name: omniroute, kind: openai, base_url: "http://<omniroute-host>:20128/v1", '
+        '  - {name: omniroute, kind: openai, base_url: "http://localhost:20128/v1", '
         "api_key_env: OMNIROUTE_API_KEY, "
         "models: {default: [auto/coding-manual, auto/best-coding], cheap: auto/coding-cheap}}\n"
     )

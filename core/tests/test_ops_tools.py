@@ -61,7 +61,7 @@ async def test_doctor_json_shape(tmp_path, monkeypatch):
 
 async def test_doctor_omniroute_bypass_and_missing_key(tmp_path, monkeypatch):
     monkeypatch.delenv("K3_TEST_KEY", raising=False)
-    omni = _entry("omniroute", "http://<omniroute-host>:20128/v1")
+    omni = _entry("omniroute", "http://localhost:20128/v1")
     checks = {c.name: c for c in await doctor.run_checks(_config(omni), probe=False, home=tmp_path)}
     assert checks["omniroute-bypass"].status == "warn"
     assert checks["api-keys"].status == "fail" and "K3_TEST_KEY" in checks["api-keys"].detail

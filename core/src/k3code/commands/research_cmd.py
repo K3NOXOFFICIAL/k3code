@@ -28,7 +28,7 @@ class UltraResearchCommand(CommandDef):
         question = arg.strip()
         tools = ctx.research.tools()
         if (why := await tools.unavailable_reason()):
-            return reply(f"/ultraresearch is unavailable: {why}. Connect an MCP web-search server (e.g. k3nox "
+            return reply(f"/ultraresearch is unavailable: {why}. Connect an MCP web-search server (e.g. "
                          "hub_searxng) or set research.searxng_url.")
 
         async def job() -> str:
