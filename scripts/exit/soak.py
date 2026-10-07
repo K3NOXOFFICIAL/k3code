@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -138,6 +139,11 @@ async def run(a: argparse.Namespace) -> int:
 
     log(f"# soak start {time.strftime('%F %T')} duration={total_s}s interval={a.interval}s home={d.root}")
     samples: list[dict] = []
+    # SIGTERM/SIGINT must stop the daemon too (a bare kill of this driver used to orphan it) and must not produce a
+    # verdict: a stopped 72 h run would otherwise be judged on whatever samples it had and could report PASS.
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        asyncio.get_running_loop().add_signal_handler(sig, stop.set)
     try:
         d.start()
         peer = await d.peer()
@@ -155,13 +161,21 @@ async def run(a: argparse.Namespace) -> int:
             log(f"# schedule add {expr!r}: {(p.stdout + p.stderr).strip()[:150]}")
         samples.append(sample(d, t_start, wall0))
         log(fmt(samples[-1]))
-        while time.monotonic() - t_start < total_s and d.alive():
-            await asyncio.sleep(max(0.0, min(a.interval, total_s - (time.monotonic() - t_start))))
+        while time.monotonic() - t_start < total_s and d.alive() and not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), max(0.0, min(a.interval, total_s - (time.monotonic() - t_start))))
+            except TimeoutError:
+                pass
+            if stop.is_set():
+                break
             samples.append(sample(d, t_start, wall0))
             log(fmt(samples[-1]))
         peer.close()
     finally:
         procs.close()
+    if stop.is_set():
+        log(f"# stopped early by a signal after {len(samples)} samples; daemon stopped; no verdict, no exit row")
+        return 2
     span = f"{a.hours} h" if a.hours else f"{a.minutes:g} min"
     status, ev = verdict(samples, f"{span} soak")
     log(f"# verdict {status}: {ev}")

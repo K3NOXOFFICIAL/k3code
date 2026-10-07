@@ -30,7 +30,7 @@ cat ~/src/k3code/.k3dev/soak/rows-72h.jsonl          # when it has finished: sta
   *idle* suspend but not a closed lid or a dead battery; keep the machine on AC power with the lid open (or set
   `HandleLidSwitch=ignore`). A suspend shows up as skipped loop ticks.
 - A reboot ends it (the daemon is a child of the run, not a service).
-- If you want to stop it: `pkill -f 'exit/soak.py --hours 72'` (it stops its daemon).
+- To stop it early: `systemctl --user stop k3code-soak-72h` (stops the driver and the daemon; a stopped run writes no verdict and no exit row).
 
 ## If it passes
 

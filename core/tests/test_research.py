@@ -406,3 +406,36 @@ async def test_dead_links_are_not_cited_but_bot_blocked_pages_are(tmp_path, monk
     urls = {s.url for s in res.state.sources}
     assert "https://example.org/0" not in urls
     assert {"https://example.org/1", "https://example.org/2"} <= urls
+
+
+async def test_dropped_sources_are_replaced_from_spare_hits(tmp_path, monkeypatch):
+    """Dead links (and pages that yield no claims) are dropped after reading; the run reads spare hits until
+    min_sources sources produced claims instead of finishing short."""
+    import httpx
+
+    from k3code.research.tools import Hit, ResearchTools
+
+    class Tools(ResearchTools):
+        name = "stub"
+
+        async def search(self, query, n=5):
+            return [Hit(f"t{i}", f"https://example.org/{i}") for i in range(12)]
+
+        async def fetch(self, url):
+            if int(url.rsplit("/", 1)[1]) < 4:  # the first four hits (the ones picked first) are dead
+                req = httpx.Request("GET", url)
+                raise httpx.HTTPStatusError("gone", request=req, response=httpx.Response(404, request=req))
+            return "page", "page text"
+
+    plan = '{"sub_topics":[{"name":"A","queries":["a"]}]}'
+    server = make(tmp_path, monkeypatch, [
+        {"type": "text", "match": "Number of sub-topics", "text": plan},
+        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+        {"type": "text", "text": "ok"},
+    ], mode="auto", research={"sources_per_topic": 4, "min_sources": 6, "sub_questions": 1})
+    server.research_tools = Tools()
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    res = await server.research.run(server.session, "q", n_sub=1)
+    urls = {s.url for s in res.state.sources}
+    assert len(urls) >= 6, urls
+    assert not any(u.endswith(("/0", "/1", "/2", "/3")) for u in urls)

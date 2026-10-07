@@ -166,14 +166,6 @@ class Research:
                 state.urls_seen.add(h.url)
                 per_topic[topic.name] = per_topic.get(topic.name, 0) + 1
                 picks.append((topic, h))
-        # Top up to min_sources from the spare hits: after cross-topic de-duplication a run used to read ~12 sources,
-        # and a report cites only the sources that contributed claims, which left it at 8-10 citations.
-        for topic, h in spare:
-            if len(picks) >= int(cfg["min_sources"]):
-                break
-            if h.url not in state.urls_seen:
-                state.urls_seen.add(h.url)
-                picks.append((topic, h))
         if not picks:
             raise RuntimeError("the searches returned no results; nothing to research from")
 
@@ -201,7 +193,22 @@ class Research:
                     if isinstance(data, dict) else []
                 return topic, hit, title or hit.title, claims
 
-        read = await asyncio.gather(*(one_read(t, h) for t, h in picks))
+        # Read, then backfill from the spare hits until min_sources sources produced claims. A report cites only the
+        # sources that contributed claims: after cross-topic de-duplication a run read ~12 and cited 8-10, and every
+        # source dropped on the way (a dead link, a page with nothing to extract) would otherwise stay missing.
+        read: list[tuple[SubTopic, Hit, str, list[str]]] = []
+        batch = picks
+        while batch:
+            read += await asyncio.gather(*(one_read(t, h) for t, h in batch))
+            need = int(cfg["min_sources"]) - sum(1 for r in read if r[3])
+            batch = []
+            while spare and len(batch) < need:
+                topic, h = spare.pop(0)
+                if h.url not in state.urls_seen:
+                    state.urls_seen.add(h.url)
+                    batch.append((topic, h))
+            if batch:
+                self.progress(session, "reading", f"{len(batch)} more sources")
         for topic, hit, title, claims in read:  # registered in plan order so S-ids are deterministic
             if claims:
                 src = state.register_source(hit.url, title)
