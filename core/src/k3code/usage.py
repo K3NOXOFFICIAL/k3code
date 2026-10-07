@@ -91,6 +91,14 @@ class UsageDB:
         )
         self._db.commit()
 
+    def rows(self, since: float = 0.0) -> list[dict[str, Any]]:
+        """Raw events with ``ts >= since`` as dicts (for the self-optimizer)."""
+        cur = self._db.execute(
+            "SELECT ts, session, kind, provider, model, detail, tier, task_kind FROM events WHERE ts >= ? ORDER BY ts",
+            (since,))
+        names = [c[0] for c in cur.description]
+        return [dict(zip(names, r, strict=True)) for r in cur]
+
     def aggregate(
         self, by: str = "day", *, session: str | None = None, days: int | None = None
     ) -> list[dict[str, Any]]:

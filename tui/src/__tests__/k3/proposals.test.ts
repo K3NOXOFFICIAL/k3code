@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   $proposals,
   addProposal,
+  glyphFor,
   handleProposalKey,
   PROPOSALS_MAX,
   removeProposal,
@@ -43,5 +44,15 @@ describe('proposal cards', () => {
     addProposal(card('p1'))
     removeProposal('p1')
     expect($proposals.get()).toEqual([])
+  })
+})
+
+describe('kind icons', () => {
+  it('has a distinct icon for every learned kind and a fallback for unknown ones', () => {
+    const kinds = ['permission_rule', 'preference', 'project_setup', 'skill', 'optimizer', 'consequence', 'improvement']
+    const icons = kinds.map(glyphFor)
+
+    expect(new Set(icons).size).toBe(kinds.length)
+    expect(glyphFor('something_new')).toBe('•')
   })
 })

@@ -56,6 +56,7 @@ class Mem0Config(BaseModel):
     url: str = ""
     api_key_env: str = ""
     user_id: str = ""
+    agent_id: str = "k3code"
 
 
 class DisplayConfig(BaseModel):
@@ -111,6 +112,8 @@ class Settings(BaseModel):
     router: dict[str, Any] = Field(default_factory=dict)
     # M4a: task kind → tier overrides, e.g. {title: fast, review: strong}.
     task_tiers: dict[str, str] = Field(default_factory=dict)
+    # M5 learning: see k3code.learning.DEFAULTS (enabled, perm_min_approvals, optimizer: {...}, ...)
+    learning: dict[str, Any] = Field(default_factory=dict)
     # M4a autonomy: plan_first, gate_modes, advisor_auto, proposals, escalate_after, ...
     autonomy: dict[str, Any] = Field(default_factory=dict)
     # M4b: ultracode: {max_tokens, max_agents}; research: {searxng_url, max_subquestions, ...}

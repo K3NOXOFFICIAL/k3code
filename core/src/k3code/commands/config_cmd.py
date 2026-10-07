@@ -48,6 +48,12 @@ def open_editor(path: Path) -> int:
     return subprocess.call([*shlex.split(editor), str(path)])
 
 
+def _learn(ctx: Any, session_id: str | None, kind: str, subject: str, choice: str) -> None:
+    hub = getattr(ctx, "learning", None)
+    if hub is not None:
+        hub.record(kind, ctx.sessions.get(session_id) if session_id else None, subject=subject, choice=choice)
+
+
 class ConfigCommand(CommandDef):
     def __init__(self) -> None:
         super().__init__(name="config", help=USAGE)
@@ -80,6 +86,7 @@ class ConfigCommand(CommandDef):
             except confio.ConfigError as e:
                 return reply(f"Invalid config: {e}")
             ctx.apply_file_config(cwd)
+            _learn(ctx, session_id, "config", rest[0], "set")
             return reply(f"Set {rest[0]} in {path}" + (f" (backup: {bak.name})" if bak else ""))
         if sub == "edit":
             return reply(f"Edit {path} (run `$EDITOR {path}` or `k3code config edit`).", path=str(path))
@@ -89,5 +96,6 @@ class ConfigCommand(CommandDef):
             except confio.ConfigError as e:
                 return reply(str(e))
             ctx.apply_file_config(cwd)
+            _learn(ctx, session_id, "undo", str(path), "config-rollback")
             return reply(f"Rolled {path} back to {bak.name}.")
         return reply(USAGE)
