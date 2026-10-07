@@ -20,7 +20,7 @@ RISKS = ("low", "med", "high")
 
 #: Actions that always force a plan and ``risk=high``.
 DANGER_RE = re.compile(
-    r"\b(delete|deleting|rm\s+-\w*r|drop\s+(table|database|schema)|truncate|wipe|purge|migrat\w+|deploy\w*"
+    r"\b(delete|deleting|rm\s+-\w+|drop\s+(table|database|schema)|truncate|wipe|purge|migrat\w+|deploy\w*"
     r"|credentials?|secrets?|passwords?|api[ _-]?keys?|force[- ]?push|push\s+(-f|--force)|reset\s+--hard"
     r"|production)\b",
     re.IGNORECASE,

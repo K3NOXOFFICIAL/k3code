@@ -792,10 +792,8 @@ class GatewayServer:
                 final_text = gate.message
                 session.emit("message.delta", {"text": gate.message})
             while gate.proceed:
-                use_model = (session.stored.model or None) if tier is Tier.MAIN else None
                 async for event in loop.run(
                     prompt,
-                    model=use_model,
                     max_tokens=config.max_tokens,
                     temperature=config.temperature,
                     history=history,

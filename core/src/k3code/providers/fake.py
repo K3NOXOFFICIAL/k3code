@@ -15,6 +15,10 @@ the script back. The script is a list of steps applied in order to *every*
        "message": "provider on fire", "headers": {"retry-after": "1"}}
     ]
 
+A step may also carry ``"model": "<name>"`` (only when called with that model) and
+``"match": "<text>"`` (only when the text appears in some message), so one script can answer
+the classifier, the planner and the executor differently. Every call is recorded in ``log``.
+
 Any step may carry ``"when": "first"`` (only before a tool result is in the conversation) or
 ``"when": "after_tool"`` (only after one), so a script can call a tool once and then finish.
 
@@ -51,6 +55,8 @@ class FakeProvider(Provider):
         self.api_key = ""
         self.steps = steps
         self.calls = 0
+        #: one entry per stream() call: {"model", "tools": [names], "text": joined message contents}
+        self.log: list[dict[str, Any]] = []
 
     def __repr__(self) -> str:
         return f"FakeProvider(name={self.name!r}, steps={len(self.steps)})"
@@ -74,7 +80,13 @@ class FakeProvider(Provider):
         usage: tuple[int, int] | None = None
 
         has_tool_result = any(m.role == "tool" for m in messages)
+        haystack = "\n".join(str(m.content or "") for m in messages)
+        self.log.append({"model": model, "tools": [t.name for t in tools], "text": haystack})
         for step in self.steps:
+            if step.get("model") not in (None, model):
+                continue
+            if step.get("match") is not None and str(step["match"]) not in haystack:
+                continue
             when = step.get("when")  # optional: "first" = before any tool result, "after_tool" = after one
             if (when == "first" and has_tool_result) or (when == "after_tool" and not has_tool_result):
                 continue
