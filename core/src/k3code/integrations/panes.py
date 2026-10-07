@@ -35,7 +35,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 HARNESS = "k3code"
-#: gateway session state -> tuios agent state
+#: gateway session state -> tuios agent state (``idle`` right after a turn reads ``done``, see PaneReporter.report)
 STATE_MAP = {
     "working": "working",
     "needs_input": "needs_input",
@@ -142,6 +142,8 @@ class PaneReporter:
         tuios = map_state(state)
         if tuios is None:
             return False
+        if tuios == "idle" and self._last is not None and self._last[0] in ("working", "needs_input"):
+            tuios = "done"  # a turn just ended (like Claude Code's Stop hook): tuios lists it as finished
         return self.report_tuios(tuios, message, kind)
 
     def report_tuios(self, state: str, message: str = "", kind: str = "") -> bool:

@@ -70,12 +70,13 @@ def test_clean_summary_is_one_short_line():
 
 def test_reports_every_change_once(tuios):
     link = PaneLink.from_env(environ=tuios.env())
-    for st in ("working", "working", "needs_input", "working", "completed"):
+    for st in ("idle", "working", "working", "needs_input", "working", "idle", "idle", "completed"):
         link.on_server_line(event(st))
     link.reporter.flush()
     got = tuios.verbs("set-agent-state")
-    assert [g["state"] for g in got] == ["working", "needs_input", "working", "done"]
-    assert got[0] == {"session": "work", "window": "pane-1", "state": "working", "harness": "k3code"}
+    # a turn that ends (working -> idle) reads "done"; idle at rest stays idle; an unattended run is done too
+    assert [g["state"] for g in got] == ["idle", "working", "needs_input", "working", "done", "idle", "done"]
+    assert got[1] == {"session": "work", "window": "pane-1", "state": "working", "harness": "k3code"}
 
 
 def test_failed_maps_to_errored(tuios):
