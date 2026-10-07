@@ -39,6 +39,15 @@ t+7.5s  done
 ```
 and `tuios list-attention` listed the finished turn in the Inbox. The pane's tuios daemon is separate from the user's.
 
+**Live approval hold** (same private daemon, `[agents.approvals] enabled = ["k3code"]`, `LIVE_APPROVAL=1 core/scripts/live_panes_demo.py`):
+the gateway's `approval` request became an Inbox item: `tuios list-attention -s live5 --json` →
+`counts.approval=1`, item `{harness:"k3code", kind:"approval", summary:"rm -rf build", risk:["recursive delete"]}`
+(so `k3code` resolves as a harness id, and the needs_input→request-approval ordering works). Answering it needs the
+person's attach nonce, which a headless run does not have, so the answer half is only tested with the fake socket.
+Review fixes made after this run: the hold thread flushes the `needs_input` report before `request-approval`
+(FakeTuios now enforces tuios' `not_blocked` rule), and `start-agent` runs on a thread so it cannot stall the gateway loop.
+`K3CODE_TUI_RESUME` is consumed by the TUI on `gateway.ready` (`STARTUP_RESUME_ID`), so `k3code attach <id>` resumes that session.
+
 ## Deviations / notes
 - Inbox has no "session" decision: Inbox = once / always / deny; "session" exists only in the pane's own prompt (documented).
   `always` is only offered when the request carries a rule pattern.
@@ -49,7 +58,7 @@ and `tuios list-attention` listed the finished turn in the Inbox. The pane's tui
 - `idle` after a turn is reported as `done`.
 
 ## Open TODOs
-- Not exercised live: real Ink TUI + node in a pane, a live Inbox answer (`reply-approval` needs the person's nonce), `/bg --pane` against a real tuios.
+- Not exercised live: real Ink TUI + node in a pane, a live Inbox *answer* (needs the person's nonce), `/bg --pane` against a real tuios.
   Covered with a fake tuios socket instead.
 - No-op `status.update` state "paused"/"new" is not mapped.
 - Optional: ship a tuios integration-installer target for k3code (not needed: the gateway reports directly).

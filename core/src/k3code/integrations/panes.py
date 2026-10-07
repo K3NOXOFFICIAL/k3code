@@ -326,6 +326,8 @@ class PaneLink:
         return out
 
     def _hold(self, req_id: str, hold: _Hold, params: dict[str, Any], summary: str) -> None:
+        # tuios only holds a pane that is already on needs_input/approval: send that report first.
+        self.reporter.flush()
         try:
             res = self.sock.call("request-approval", self.approval_params(params, summary),
                                  timeout=_HOLD_TIMEOUT, conn_hook=hold.attach)
@@ -357,10 +359,19 @@ class PaneLink:
     # ── new panes ─────────────────────────────────────────────────────
 
     def open_pane(self, spec: dict[str, Any]) -> dict[str, Any] | None:
-        """Start ``k3code attach <session>`` (or ``k3code tail <subagent>``) in a new pane of this tuios session."""
-        argv = k3code_argv(spec, self.env)
-        if argv is None:
+        """Start ``k3code attach <session>`` (or ``k3code tail <subagent>``) in a new pane of this tuios session.
+
+        Runs on a thread (start-agent waits for the new pane): the gateway's event loop calls this."""
+        if k3code_argv(spec, self.env) is None:
             return None
+        if self.sync:
+            return self._start_agent(spec)
+        threading.Thread(target=self._start_agent, args=(spec,), name="k3-panes-open", daemon=True).start()
+        return None
+
+    def _start_agent(self, spec: dict[str, Any]) -> dict[str, Any] | None:
+        argv = k3code_argv(spec, self.env)
+        assert argv is not None
         params: dict[str, Any] = {
             "session": self.sock.session, "agent": " ".join(shlex.quote(a) for a in argv),
             "name": str(spec.get("name") or spec.get("session_id") or spec.get("subagent_id") or "k3code")[:40],

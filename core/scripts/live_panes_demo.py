@@ -1,4 +1,7 @@
-"""Pane program: a real GatewayServer (fake provider) with the panes tap on its stdio frames, running two turns."""
+"""Pane program: a real GatewayServer (fake provider) with the panes tap on its stdio frames, running one turn.
+
+With LIVE_APPROVAL=1 it then asks for an approval. It ends by sleeping 10 minutes so the pane stays inspectable.
+"""
 
 import asyncio
 import json
@@ -42,6 +45,10 @@ async def main():
     time.sleep(1)
     server.panes.reporter.flush()
     print("turn done; state =", server.session.state, flush=True)
+    if os.environ.get("LIVE_APPROVAL"):  # hold an approval in the tuios Inbox and wait for the answer
+        approve = await server._approval_callback_for(server.session)
+        res = await approve("bash", {"command": "rm -rf build"})
+        print("approval resolved:", res.choice, flush=True)
     time.sleep(600)
 
 

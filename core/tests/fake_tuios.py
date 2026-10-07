@@ -43,10 +43,19 @@ class FakeTuios:
                     self._cond.notify_all()
                 handler = self.answers.get(req["verb"])
                 result = handler(req.get("params") or {}) if handler else {"applied": True}
+                if req["verb"] == "request-approval" and not self._blocked(req.get("params") or {}):
+                    result = {"request_id": "", "decision": "", "reason": "not_blocked"}  # the real daemon's rule
                 try:
                     conn.sendall((json.dumps({"id": req["id"], "result": result}) + "\n").encode())
                 except OSError:
                     return
+
+    def _blocked(self, params: dict[str, Any]) -> bool:
+        """tuios holds a pane only when it was last reported needs_input with kind approval."""
+        with self._lock:
+            last = [r["params"] for r in self.requests
+                    if r["verb"] == "set-agent-state" and r["params"].get("window") == params.get("window")]
+        return bool(last) and last[-1].get("state") == "needs_input" and last[-1].get("kind") == "approval"
 
     def verbs(self, verb: str) -> list[dict[str, Any]]:
         with self._lock:
