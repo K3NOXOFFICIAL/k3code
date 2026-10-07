@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -13,6 +14,11 @@ from k3code.router import Router, RouterEvent
 from k3code.tools import build_registry
 
 logger = logging.getLogger(__name__)
+
+#: Callback asked when a side-effect tool needs interactive approval:
+#: (tool_name, arguments) → allowed?. ``None`` means "no prompter": ask-mode
+#: denials fall through to check_permission's message.
+ApprovalCallback = Callable[[str, dict[str, Any]], Awaitable[bool]]
 
 
 class AgentLoop:
@@ -29,6 +35,7 @@ class AgentLoop:
         on_event: Callable[[RouterEvent], None] | None = None,
         on_text_delta: Callable[[str], Awaitable[None]] | None = None,
         cwd: Path | None = None,
+        approval_callback: ApprovalCallback | None = None,
     ) -> None:
         self.router = router
         self.system_prompt = system_prompt
@@ -38,7 +45,23 @@ class AgentLoop:
         self.on_event = on_event
         self.on_text_delta = on_text_delta
         self.cwd = cwd or Path.cwd()
+        self.approval_callback = approval_callback
         self.tools = build_registry()
+        self._interrupt = asyncio.Event()
+        #: Conversation messages of the most recent run(), in order (system first).
+        #: The gateway persists these after each turn.
+        self.turn_messages: list[Message] = []
+
+    def interrupt(self) -> None:
+        """Request cancellation of the running turn (checked between steps)."""
+        self._interrupt.set()
+
+    def reset_interrupt(self) -> None:
+        self._interrupt.clear()
+
+    @property
+    def interrupted(self) -> bool:
+        return self._interrupt.is_set()
 
     async def run(
         self,
@@ -47,26 +70,34 @@ class AgentLoop:
         model: str | None = None,
         max_tokens: int = 8192,
         temperature: float | None = None,
+        history: list[Message] | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        """Run the agent loop, yielding stream events."""
+        """Run the agent loop, yielding stream events.
+
+        ``history`` is prior conversation messages (no system entry); when given,
+        the loop continues that conversation instead of starting fresh.
+        """
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
+            *(history or []),
             Message(role="user", content=user_prompt),
         ]
+        self.turn_messages = []
 
         for turn in range(self.max_turns):
+            if self.interrupted:
+                logger.info("Turn %d interrupted before start", turn + 1)
+                return
             logger.info("Turn %d/%d", turn + 1, self.max_turns)
             stream = self.router.stream(
                 messages, self.tools.specs(), model=model, max_tokens=max_tokens, temperature=temperature
             )
 
             tool_calls: list[ToolCall] = []
-            text_parts: list[str] = []
             final_message: Message | None = None
 
             async for event in stream:
                 if event.type == "text_delta" and event.text:
-                    text_parts.append(event.text)
                     if self.on_text_delta:
                         await self.on_text_delta(event.text)
                 elif event.type == "tool_call" and event.tool_call:
@@ -89,10 +120,20 @@ class AgentLoop:
                     tool_calls = final_message.tool_calls
                 else:
                     logger.info("Agent finished (no tool calls)")
+                    self.turn_messages = messages
                     return
+            elif self.interrupted:
+                # Stream aborted without a final message (e.g. interrupt during
+                # streaming): nothing more to execute.
+                self.turn_messages = messages
+                return
 
             # Execute tool calls sequentially and yield results
             for tc in tool_calls:
+                if self.interrupted:
+                    logger.info("Interrupted before tool %s", tc.name)
+                    self.turn_messages = messages
+                    return
                 result = await self._execute_tool(tc)
                 tool_msg = Message(
                     role="tool",
@@ -104,7 +145,10 @@ class AgentLoop:
                 # Yield the tool result as a stream event
                 yield StreamEvent(type="done", message=tool_msg)
 
+            self.turn_messages = messages
+
         logger.warning("Max turns (%d) reached", self.max_turns)
+        self.turn_messages = messages
 
     async def _execute_tool(self, tool_call: ToolCall) -> dict[str, Any]:
         """Execute a single tool call with permission checking."""
@@ -112,11 +156,14 @@ class AgentLoop:
         if not handler:
             return {"error": f"Unknown tool: {tool_call.name}"}
 
-        # Permission check
+        # Permission check; an interactive prompter may grant what the static
+        # policy denies (ask mode).
         if spec.side_effect:
             allowed, message = check_permission(self.permission_mode, tool_call.name, headless=self.headless)
+            if not allowed and self.approval_callback is not None and not self.headless:
+                allowed = await self.approval_callback(tool_call.name, tool_call.arguments)
             if not allowed:
-                return {"error": message}
+                return {"error": message or f"Permission denied: {tool_call.name}"}
 
         args = tool_call.arguments
         try:

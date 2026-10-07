@@ -3,7 +3,10 @@
 # Adapted for k3code: Hermes arms cooldowns on the agent object; k3code keeps a
 # standalone CooldownStore keyed by (provider, model, base_url), so the router can
 # consult it without an agent. Retry-After / provider reset windows are honored
-# through the vendored retry_utils parsers.
+# through the vendored retry_utils parsers. k3code addition: network failures also
+# cool down (the provider is down for everyone), with a flat configurable window
+# instead of the exponential ladder — set ``K3CODE_NETWORK_COOLDOWN_SECONDS=0``
+# (or arm with ``network_cooldown=0``) to disable.
 
 """Per-entry rate-limit cooldowns for the fallback walk.
 
@@ -15,17 +18,34 @@ provider declares nothing. The router skips entries still in cooldown.
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from k3code.router.classifier import FailoverReason
 
-_COOLDOWN_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.quota})
+# rate_limit/quota use the exponential reset ladder below; network uses a flat
+# window (same provider being unreachable is chain-wide news) — still configurable.
+_COOLDOWN_REASONS = frozenset({FailoverReason.rate_limit, FailoverReason.quota, FailoverReason.network})
+
+_NETWORK_COOLDOWN_ENV = "K3CODE_NETWORK_COOLDOWN_SECONDS"
 
 # Exponential fallback when the provider declares no reset: 60 s → 2 m → 4 m … capped.
 _BASE_COOLDOWN_SECONDS = 60.0
 _MAX_COOLDOWN_SECONDS = 14400.0  # 4 h, carried over from Hermes
+
+
+def network_cooldown_seconds() -> float:
+    """Flat cooldown window for network failures (0 disables arming)."""
+    raw = os.environ.get(_NETWORK_COOLDOWN_ENV)
+    if raw is None:
+        return _BASE_COOLDOWN_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _BASE_COOLDOWN_SECONDS
+    return max(0.0, value)
 
 
 def _identity(provider: str, model: str, base_url: str) -> tuple[str, str, str]:
@@ -61,12 +81,22 @@ class CooldownStore:
         base_url: str = "",
         retry_after: float | None = None,
         backoff_count: int = 0,
+        network_cooldown: float | None = None,
         now: float | None = None,
     ) -> float | None:
-        """Put an entry into cooldown until its reset window. Returns the armed seconds."""
+        """Put an entry into cooldown until its reset window. Returns the armed seconds.
+
+        ``network_cooldown`` overrides the flat network window (0 disables arming
+        on network failures); rate_limit/quota keep the reset/exponential ladder.
+        """
         if reason not in _COOLDOWN_REASONS:
             return None
-        if provider_delta := _provider_reset_delay(retry_after):
+        if reason is FailoverReason.network:
+            window = network_cooldown if network_cooldown is not None else network_cooldown_seconds()
+            if window <= 0:
+                return None
+            seconds = math.ceil(window)
+        elif provider_delta := _provider_reset_delay(retry_after):
             seconds = math.ceil(provider_delta)
         else:
             seconds = min(_BASE_COOLDOWN_SECONDS * (2**backoff_count), _MAX_COOLDOWN_SECONDS)
