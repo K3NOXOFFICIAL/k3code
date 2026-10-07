@@ -10,12 +10,6 @@ from k3code.setup.state import clear_state, load_state, save_state
 from k3code.setup.steps import STEP_NAMES, STEPS, Ctx, Step, step_secrets, write_config, write_user_md
 
 
-def needs_setup() -> bool:
-    from k3code.paths import user_config_path
-
-    return not user_config_path().is_file()
-
-
 def run_setup(
     p: Prompter,
     *,

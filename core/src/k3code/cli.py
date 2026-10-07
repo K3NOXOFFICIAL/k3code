@@ -311,6 +311,11 @@ def main(
 
     # Load config
     config = load_config(project_dir=config_dir or Path.cwd())
+    if not config.providers and (prompt or not _is_interactive()):
+        from k3code.setup.onboard import NO_CONFIG_HINT
+
+        click.echo(NO_CONFIG_HINT, err=True)
+        sys.exit(78)  # EX_CONFIG: never prompt in headless or piped runs
 
     # The flag wins; then headless_permission (-p only); then the config's permission_mode. The flag used to default
     # to "ask", which silently ignored a configured permission_mode in -p and REPL runs.
@@ -331,11 +336,15 @@ def main(
         if json_output and result:
             print(json.dumps(result, ensure_ascii=False))
         sys.exit(0 if result and "error" not in result else 1)
-    elif repl or not sys.stdin.isatty() or not sys.stdout.isatty():
+    elif repl or not _is_interactive():
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(_run_repl(model=model, permission_mode=permission_mode, config=config))
     else:
         _launch_tui(model=model)
+
+
+def _is_interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 def _run_gateway() -> None:
@@ -430,19 +439,15 @@ def cli(
 ) -> None:
     """k3code — terminal coding agent."""
     if ctx.invoked_subcommand is None:
-        if prompt is None and sys.stdin.isatty() and sys.stdout.isatty():
-            from k3code.setup.wizard import needs_setup
+        if prompt is None and _is_interactive():
+            from k3code.setup.onboard import first_run
+            from k3code.setup.prompter import InteractivePrompter
 
-            if needs_setup():
-                click.echo("No k3code config found: starting guided setup.")
-                from k3code.setup.prompter import InteractivePrompter
-                from k3code.setup.wizard import run_setup
-
-                try:
-                    run_setup(InteractivePrompter())
-                except (KeyboardInterrupt, EOFError):
-                    click.echo("\nSetup interrupted; re-run `k3code setup` to resume.")
-                    raise SystemExit(130) from None
+            try:
+                first_run(InteractivePrompter())  # asks fast/full once while no config exists; never starts the wizard
+            except (KeyboardInterrupt, EOFError):
+                click.echo("\nSetup interrupted. Run `k3code onboard` any time to set up.")
+                raise SystemExit(130) from None
         ctx.invoke(
             main,
             prompt=prompt,
@@ -654,6 +659,28 @@ def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, res
         raise click.ClickException(str(e)) from e
     except (KeyboardInterrupt, EOFError):
         click.echo("\nInterrupted; progress saved. Re-run `k3code setup` to resume.")
+        raise SystemExit(130) from None
+
+
+@cli.command("onboard")
+@click.option(
+    "--answers", type=click.Path(path_type=Path, exists=True, dir_okay=False), help="YAML answers file (no prompts)"
+)
+@click.option("--no-probe", is_flag=True, help="Skip the live models call")
+def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
+    """Guided first-run setup: fast (API endpoint + key) or full. Run it any time."""
+    from k3code.setup.onboard import run_onboarding
+    from k3code.setup.prompter import AnswerPrompter, InteractivePrompter, Prompter
+
+    if answers is None and not _is_interactive():
+        raise click.UsageError("`k3code onboard` needs a terminal; pass --answers FILE to run it without prompts")
+    p: Prompter = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
+    try:
+        run_onboarding(p, do_probe=not no_probe)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    except (KeyboardInterrupt, EOFError):
+        click.echo("\nInterrupted. Run `k3code onboard` again to finish.")
         raise SystemExit(130) from None
 
 
