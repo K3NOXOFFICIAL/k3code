@@ -59,6 +59,9 @@ class FakeProvider(Provider):
         self.calls = 0
         #: one entry per stream() call: {"model", "tools": [names], "text": joined message contents}
         self.log: list[dict[str, Any]] = []
+        #: K3CODE_FAKE_LOG=0 stops recording: every entry holds the whole conversation text, so a long soak on
+        #: the fake provider would otherwise grow quadratically (that measured the double, not the daemon).
+        self.record = os.environ.get("K3CODE_FAKE_LOG", "1") != "0"
 
     def __repr__(self) -> str:
         return f"FakeProvider(name={self.name!r}, steps={len(self.steps)})"
@@ -85,7 +88,8 @@ class FakeProvider(Provider):
         last_user = max((i for i, m in enumerate(messages) if m.role == "user"), default=-1)
         turn_tool_result = any(m.role == "tool" for m in messages[last_user + 1 :])
         haystack = "\n".join(str(m.content or "") for m in messages)
-        self.log.append({"model": model, "tools": [t.name for t in tools], "text": haystack})
+        if self.record:
+            self.log.append({"model": model, "tools": [t.name for t in tools], "text": haystack})
         for step in self.steps:
             if step.get("model") not in (None, model):
                 continue

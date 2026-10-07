@@ -9,6 +9,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --soak-minutes) SOAK_MIN="$2"; shift 2;; --only) ONLY="$2"; shift 2;; *) echo "bad arg $1"; exit 2;; esac; done
 export EXIT_ROWS="$REPO/scripts/exit/rows/rows.jsonl"; mkdir -p "$REPO/scripts/exit/rows" "$REPO/docs/reports"
 LOGS="$REPO/scripts/exit/rows/logs"; mkdir -p "$LOGS"
+# A partial run (--only) keeps the rows of the milestones it does not rerun; they are merged back below.
+PREV_ROWS="$LOGS/rows.prev.jsonl"; cp -f "$EXIT_ROWS" "$PREV_ROWS" 2>/dev/null || : > "$PREV_ROWS"
 : > "$EXIT_ROWS"
 export EXIT_RUN_START; EXIT_RUN_START="$(date +%s)"
 export EXIT_SOAK_MINUTES="$SOAK_MIN"
@@ -26,5 +28,20 @@ for m in ${ONLY//,/ }; do
   echo "[exit] $m rc=$? (log: scripts/exit/rows/logs/$m.log)"
 done
 [ -n "$SOAK_PID" ] && { echo "[exit] waiting for soak ($SOAK_PID)"; wait "$SOAK_PID"; }
+python3 - "$PREV_ROWS" "$EXIT_ROWS" "$ONLY" <<'PY'
+import json, sys
+prev, cur, only = sys.argv[1], sys.argv[2], {m.strip().upper() for m in sys.argv[3].split(",") if m.strip()}
+def load(p):
+    try:
+        return [json.loads(ln) for ln in open(p) if ln.strip()]
+    except FileNotFoundError:
+        return []
+kept = [r for r in load(prev) if r.get("milestone", "").upper() not in only]
+new = load(cur)
+with open(cur, "w") as f:
+    for r in kept + new:
+        f.write(json.dumps(r) + "\n")
+print(f"[exit] merged {len(kept)} kept row(s) from milestones not rerun + {len(new)} new row(s)")
+PY
 python3 "$HERE/render.py" "$EXIT_ROWS" "$REPO/docs/reports/exit-status.md"
 echo "[exit] wrote docs/reports/exit-status.md"

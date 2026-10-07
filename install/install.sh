@@ -16,6 +16,7 @@
 #
 # Flags: --from-source --from-bundle FILE --channel stable|dev --version X --yes --headless --no-setup
 #        --no-activate (stage only; used by `k3code update --from-source`) --print-version --help
+# Dev env: K3_EDITABLE=1 (--from-source: editable core install instead of a copy)
 # Test/offline env: K3_SKIP_PIP=1 K3_SKIP_TUI=1 K3_SKIP_GO=1 K3_NO_DOWNLOAD=1 K3_STUB_VENV=1
 set -eu
 
@@ -45,7 +46,7 @@ on_exit() {
 trap on_exit EXIT
 die() { log "ERROR: $*"; exit 1; }
 
-usage() { sed -n '2,19p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { sed -n '2,20p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -238,7 +239,16 @@ else
   else
     "$UV" venv --quiet --python '>=3.12' "$VERDIR/venv" >&2
     if [ "$FROM_SOURCE" = 1 ]; then
-      [ "${K3_SKIP_PIP:-0}" = 1 ] || "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" -e "$SRC_ROOT/core" >&2
+      if [ "${K3_SKIP_PIP:-0}" != 1 ]; then
+        # A regular install by default: the installed daemon must not import a git checkout that can be edited,
+        # switched to another branch or deleted (a removed worktree used to break `k3code` outright).
+        # K3_EDITABLE=1 keeps the developer's `pip install -e` (changes show up without re-installing).
+        if [ "${K3_EDITABLE:-0}" = 1 ]; then
+          "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" -e "$SRC_ROOT/core" >&2
+        else
+          "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" "$SRC_ROOT/core" >&2
+        fi
+      fi
     else
       "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" "$DL"/*.whl >&2
     fi

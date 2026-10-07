@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 import re
 import sqlite3
 import subprocess
@@ -21,11 +20,32 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chaoslib as cl  # noqa: E402
 from lib import REPO, emit  # noqa: E402
 
-LOOP_EVERY = 30  # seconds
+LOOP_EVERY = 30.0  # seconds; --loop-every shortens it for a fast soak (thousands of turns in minutes)
 JOBS = [("soak-cron-a", "* * * * *", 60.0), ("soak-cron-b", "1m", 60.0)]
 STUCK_AFTER = 300.0  # a run still 'running' after this long counts as lost
 RSS_SLACK_KB = 20 * 1024  # growth allowed on top of 25 % of the warm-up RSS
 ERR_RE = re.compile(r"Traceback|\bERROR\b|\bCRITICAL\b")
+
+
+def skipped_loop_ticks(db: Path, now: float) -> int:
+    """Loop ticks that never fired, from the gaps between consecutive starts (cadence = median gap)."""
+    if not db.exists():
+        return 0
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+    try:
+        starts = [r[0] for r in con.execute(
+            "SELECT started_at FROM job_runs WHERE owner_kind='loop' ORDER BY started_at")]
+    finally:
+        con.close()
+    if len(starts) < 5:
+        return 0
+    gaps = sorted(b - a for a, b in zip(starts, starts[1:], strict=False))
+    cadence = gaps[len(gaps) // 2]
+    if cadence <= 0:
+        return 0
+    skipped = sum(max(0, round(g / cadence) - 1) for g in gaps)
+    trailing = (now - starts[-1]) / cadence  # a stall right now: nothing started yet to measure a gap from
+    return skipped + max(0, int(trailing) - 1)
 
 
 def sample(d: cl.Daemon, t_start: float, wall0: float) -> dict:
@@ -47,13 +67,14 @@ def sample(d: cl.Daemon, t_start: float, wall0: float) -> dict:
                 stuck += int(in_flight or 0)
         con.close()
     lost += stuck
-    # schedule shortfall: a source that should have fired floor(elapsed/period) times (-1 for boundary/in-flight)
-    sources = {"loop": (LOOP_EVERY, 1), "job": (60.0, len(JOBS))}
+    # Schedule shortfall = ticks that never fired. Cron jobs are minute-aligned, so floor(elapsed/60) is exact (-1 for
+    # boundary/in-flight). The /loop is fixed-delay (next tick = finish + interval + ~15 ms dispatch), so its real
+    # cadence drifts a little from the nominal one; count skipped ticks from the measured gaps instead, which still
+    # catches a stall of any length.
     missing = 0
-    for kind, (period, n_sources) in sources.items():
-        expected = int(elapsed // period) * n_sources - n_sources
-        total = sum(runs.get(kind, {}).values())
-        missing += max(0, expected - total)
+    expected = int(elapsed // 60.0) * len(JOBS) - len(JOBS)
+    missing += max(0, expected - sum(runs.get("job", {}).values()))
+    missing += skipped_loop_ticks(db, now)
     log_text = d.log.read_text(errors="replace") if d.log.exists() else ""
     errors = len(ERR_RE.findall(log_text))
     done = sum(v for r in runs.values() for s, v in r.items() if s == "completed")
@@ -102,6 +123,7 @@ async def run(a: argparse.Namespace) -> int:
         [{"type": "text", "text": "tick ok"}, {"type": "usage", "prompt_tokens": 20, "completion_tokens": 3}]))
     d.env["K3CODE_FAKE_PROVIDER"] = str(d.home / "fake.json")
     d.env["FAKE_KEY"] = "x"
+    d.env["K3CODE_FAKE_LOG"] = "0"  # the double records every request in full: it would be the leak we measure
     d.write_config("providers:\n  - {name: fake, kind: openai, base_url: 'http://fake', api_key_env: FAKE_KEY,"
                    " models: {default: m}}\ndefault_model: default\nheadless_permission: yolo\n"
                    "reliability: {flags: {netwatch: false}}\n")
@@ -122,7 +144,7 @@ async def run(a: argparse.Namespace) -> int:
         sid = (await peer.call("session.create", cwd=str(d.proj)))["result"]["session_id"]
         await peer.call("session.mode.set", session_id=sid, mode="yolo")
         r = await peer.call("command.dispatch", name="loop", session_id=sid,
-                            arg=f"{LOOP_EVERY}s --max-ticks 10000000 soak loop tick")
+                            arg=f"{LOOP_EVERY:g}s --max-ticks 10000000 soak loop tick")
         log(f"# loop: {json.dumps(r.get('result') or r.get('error'))[:200]}")
         for name, expr, _ in JOBS:
             p = subprocess.run([cl.k3code_bin(), "schedule", "add", expr, "--name", name, "--cwd", str(d.proj),
@@ -143,7 +165,7 @@ async def run(a: argparse.Namespace) -> int:
     (logdir / (logf.stem + ".verdict.json")).write_text(json.dumps({"status": status, "evidence": ev}))
     if a.report:
         how = (f"scripts/exit/soak.sh --{'hours' if a.hours else 'minutes'} {a.hours or a.minutes:g}: daemon in a "
-               f"temp home on the fake provider with /loop {LOOP_EVERY}s + 2 cron jobs (every minute); sampled every "
+               f"temp home on the fake provider with /loop {LOOP_EVERY:g}s + 2 cron jobs (every minute); sampled every "
                f"{a.interval:g}s; log {logf.relative_to(REPO)}")
         if a.hours:
             emit("M2", f"{a.hours:g} h soak: no lost turns, no errors, bounded memory", how, status,
@@ -166,4 +188,8 @@ if __name__ == "__main__":
     g.add_argument("--hours", type=float)
     ap.add_argument("--interval", type=float, default=300.0, help="seconds between samples (default 300 = 5 min)")
     ap.add_argument("--report", action="store_true", help="emit the M2 soak row(s) to $EXIT_ROWS")
-    sys.exit(asyncio.run(run(ap.parse_args())))
+    ap.add_argument("--loop-every", type=float, default=LOOP_EVERY,
+                    help="seconds between /loop ticks (default 30; use 1-2 for a fast soak)")
+    args = ap.parse_args()
+    LOOP_EVERY = args.loop_every
+    sys.exit(asyncio.run(run(args)))
