@@ -156,6 +156,7 @@ export interface UiState {
   focusView: boolean
   info: null | SessionInfo
   liveSessionCount: number
+  automationCount: number
   inlineDiffs: boolean
   mouseTracking: MouseTrackingMode
   notice: Notice | null

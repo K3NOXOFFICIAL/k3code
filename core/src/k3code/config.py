@@ -68,6 +68,20 @@ class GoalConfig(BaseModel):
     judge_model: str = "cheap"
 
 
+class AutomationConfig(BaseModel):
+    """/loop, /schedule and automations."""
+
+    #: Deprecated: NL→cron and the --until judge go through ModelCaller (``classification`` / ``goal_judge`` kinds,
+    #: tier policy ``task_tiers``); kept so existing configs still load.
+    cheap_model: str = ""
+    max_concurrent: int = 2  # unattended runs at once (governor slots)
+    grace_hours: float = 6.0  # missed cron runs fire once on recovery within this window
+    webhook_port: int | None = None  # None = webhook triggers disabled
+    git_poll_seconds: float = 15.0
+    idle_poll_seconds: float = 30.0
+    suggestions: bool = True
+
+
 class Settings(BaseModel):
     """Runtime settings for k3code."""
 
@@ -91,6 +105,7 @@ class Settings(BaseModel):
     mcp: McpConfig = Field(default_factory=McpConfig)
     mem0: Mem0Config = Field(default_factory=Mem0Config)
     goal: GoalConfig = Field(default_factory=GoalConfig)
+    automation: AutomationConfig = Field(default_factory=AutomationConfig)
 
     # router knobs: {max_inline_wait: 20, quota_cooldown: 3600}; see router.router.Router
     router: dict[str, Any] = Field(default_factory=dict)

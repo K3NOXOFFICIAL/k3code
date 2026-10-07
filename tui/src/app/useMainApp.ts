@@ -665,8 +665,14 @@ export function useMainApp(gw: GatewayClient) {
             // the whole TUI and causes idle flicker.
             const prev = getUiState()
 
-            if (prev.liveSessionCount !== liveSessionCount || prev.sessionTitle !== sessionTitle) {
-              patchUiState({ liveSessionCount, sessionTitle })
+            const automationCount = result.automation?.active ?? 0
+
+            if (
+              prev.liveSessionCount !== liveSessionCount ||
+              prev.sessionTitle !== sessionTitle ||
+              prev.automationCount !== automationCount
+            ) {
+              patchUiState({ automationCount, liveSessionCount, sessionTitle })
             }
           }
         })

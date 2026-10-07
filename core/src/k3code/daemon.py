@@ -98,6 +98,7 @@ async def run_daemon(
         if sock.exists() or serve.done():
             break
         await asyncio.sleep(0.05)
+    await server.ensure_automation()  # resume loops, start the cron scheduler and triggers
     sdnotify.ready()
     logger.info("daemon ready on %s", sock)
     if ready_event is not None:
@@ -146,3 +147,53 @@ async def attach_bridge(sock: Path | None = None) -> int:
     with contextlib.suppress(Exception):
         writer.close()
     return 0
+
+
+async def slash_via_daemon(command: str, *, cwd: str, sock: Path | None = None, session_id: str | None = None) -> str:
+    """Run one slash command (``/automations list`` …) against the running daemon and return its output text.
+
+    Uses a throwaway session when ``session_id`` is not given. Answers any ``clarify`` request with its first choice.
+    """
+    sock = sock or socket_path()
+    reader, writer = await asyncio.open_unix_connection(str(sock))
+    pending: dict[int, asyncio.Future[dict]] = {}
+    seq = 0
+
+    async def pump() -> None:
+        while line := await reader.readline():
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("id") in pending and "method" not in msg:
+                pending[msg["id"]].set_result(msg)
+            elif msg.get("method") == "clarify" and "id" in msg:
+                choices = (msg.get("params") or {}).get("choices") or [""]
+                reply = {"jsonrpc": "2.0", "id": msg["id"], "result": {"answer": choices[0]}}
+                writer.write((json.dumps(reply) + "\n").encode())
+
+    async def call(method: str, params: dict) -> dict:
+        nonlocal seq
+        seq += 1
+        fut: asyncio.Future[dict] = asyncio.get_running_loop().create_future()
+        pending[seq] = fut
+        writer.write((json.dumps({"jsonrpc": "2.0", "id": seq, "method": method, "params": params}) + "\n").encode())
+        await writer.drain()
+        return await asyncio.wait_for(fut, 60)
+
+    task = asyncio.create_task(pump())
+    throwaway = session_id is None
+    try:
+        if session_id is None:
+            created = await call("session.create", {"cwd": cwd})
+            session_id = created["result"]["session_id"]
+        res = await call("slash.exec", {"command": command.lstrip("/"), "session_id": session_id})
+        if "error" in res:
+            return f"error: {res['error'].get('message', res['error'])}"
+        return str(res["result"].get("output") or res["result"].get("message") or "")
+    finally:
+        if throwaway and session_id is not None:
+            with contextlib.suppress(Exception):
+                await call("session.delete", {"session_id": session_id})
+        task.cancel()
+        writer.close()

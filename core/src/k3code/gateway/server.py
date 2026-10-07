@@ -132,13 +132,25 @@ class LiveSession:
         self.scope_override: str | None = None
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
+        #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
+        self.extra_tools: list[Callable[[Any], None]] = []
+        #: Outcome of the last unattended run (``completed`` / ``failed``); cleared when a new turn starts.
+        self.run_result: str | None = None
+        #: What the last turn ended with, for the cron/loop runners.
+        self.last_error = ""
+        self.last_exc: BaseException | None = None
+        self.last_api_calls = 0
+        #: Task kind for the next unattended turn (``loop_tick`` / ``cron_job`` / ``background_turn``).
+        self.task_kind: str = ""
 
     @property
     def state(self) -> str:
-        """``working`` (also while paused), ``needs_input`` or ``idle``."""
+        """``working`` (also while paused), ``needs_input``, ``completed``/``failed`` (unattended run) or ``idle``."""
         if self.needs_input:
             return "needs_input"
-        return "working" if self.streaming else "idle"
+        if self.streaming:
+            return "working"
+        return self.run_result or "idle"
 
     def emit(self, event_type: str, payload: dict[str, Any] | None = None, importance: str | None = None) -> None:
         """Send an event to every client attached to this session."""
@@ -261,6 +273,9 @@ class GatewayServer:
             last_attempt=lambda: self.last_attempt,
         )
         self.autonomy = PlanFirst(self)
+        #: Automation engine (loops, cron, triggers); started by the daemon or on the first /loop|/schedule.
+        self.automation: Any = None
+        self.last_user_activity = time.time()
 
     # ── session registry ──────────────────────────────────────────────
 
@@ -359,6 +374,25 @@ class GatewayServer:
         line = encode_event(event_type, payload, importance)
         for client in self._targets(session):
             self._send(client, line)
+
+    def broadcast(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
+        """Send an event to every attached client, whatever session it is looking at (strip, status badge)."""
+        line = encode_event(event_type, payload or {}, None)
+        for client in self.clients:
+            if not client.closed:
+                self._send(client, line)
+
+    def broadcast_active_list(self) -> None:
+        self.broadcast("session.active_list", {"sessions": self._active_rows(None)})
+
+    async def ensure_automation(self) -> Any:
+        """The automation engine, started on first use (the daemon starts it eagerly)."""
+        if self.automation is None:
+            from k3code.automation.engine import AutomationEngine
+
+            self.automation = AutomationEngine(self)
+            await self.automation.start()
+        return self.automation
 
     def _reply(self, client: Client, line: str) -> None:
         self._send(client, line)
@@ -488,6 +522,7 @@ class GatewayServer:
                     "state": s.state,
                     "paused": s.paused,
                     "background": s.background,
+                    "origin": s.stored.meta.get("origin", ""),
                     "title": s.stored.title or "Session",
                 }
             )
@@ -504,6 +539,8 @@ class GatewayServer:
         self._open_requests.clear()
 
     async def close(self) -> None:
+        if self.automation is not None:
+            await self.automation.stop()
         for live in self.live.values():
             if live.turn_task is not None and not live.turn_task.done():
                 live.turn_task.cancel()
@@ -735,7 +772,7 @@ class GatewayServer:
 
     # ── turn lifecycle ────────────────────────────────────────────────
 
-    async def _run_turn(self, session: LiveSession, text: str) -> None:
+    async def _run_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget."""
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
         prompt = text
@@ -752,7 +789,8 @@ class GatewayServer:
                 if status == "error" and mgr.is_active():
                     mgr.pause("turn failed")
                     self.emit_goal(session)
-                return
+                self._session_finished(session, status)
+                return status, final_text
             judge = self.goal_judge or make_judge(self._goal_completer(session))
             decision = await mgr.evaluate_after_turn(
                 final_text, judge, cwd=session.stored.cwd or None, reviewer=self._goal_reviewer(session)
@@ -763,8 +801,14 @@ class GatewayServer:
                     "notification.show", {"text": decision.message, "level": "info", "kind": "info", "key": "goal"}
                 )
             if not decision.should_continue or not decision.prompt:
-                return
+                self._session_finished(session, status)
+                return status, final_text
             prompt = decision.prompt
+
+    def _session_finished(self, session: LiveSession, status: str) -> None:
+        """Tell the automation engine (``session_event`` triggers) that a session's run ended."""
+        if self.automation is not None:
+            self.automation.session_event(session.session_id, status, str(session.stored.meta.get("origin") or ""))
 
     def _build_loop(
         self, session: LiveSession, reliability: Reliability, router: Router, kind: TaskKind, approval: Any,
@@ -798,6 +842,8 @@ class GatewayServer:
         )
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
+        for install in session.extra_tools:
+            install(loop.tools)
         return loop
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
@@ -807,12 +853,16 @@ class GatewayServer:
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
+        session.run_result = None
+        session.last_error, session.last_exc, session.last_api_calls = "", None, 0
         reliability = await self._reliability_for(session)
         await self.mcp.ensure_started()
         approval = await self._approval_callback_for(session)
 
         # M4a: which tier runs this turn; cheap/fast tiers escalate when the attempt stalls.
-        kind = TaskKind.BACKGROUND_TURN if session.background else TaskKind.INTERACTIVE_TURN
+        kind = TaskKind(session.task_kind) if session.task_kind and session.background else (
+            TaskKind.BACKGROUND_TURN if session.background else TaskKind.INTERACTIVE_TURN
+        )
         tier = tier_for(kind, self.config.task_tiers)
         cheap_start = tier in (Tier.FAST, Tier.CHEAP)
         max_errors = int(autonomy_cfg(self.config)["escalate"]["tool_errors"]) if cheap_start else 0
@@ -880,6 +930,7 @@ class GatewayServer:
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)
+            session.last_exc = e
             session.emit("error", {"message": str(e)})
         except BudgetExceeded as e:
             # The reliability event already told the client (error + needs_input).
@@ -895,6 +946,7 @@ class GatewayServer:
             logger.exception("turn failed")
             status = "error"
             error = str(e)
+            session.last_exc = e
             session.emit("error", {"message": str(e)})
         finally:
             session.streaming = False
@@ -908,6 +960,12 @@ class GatewayServer:
             session.stored.messages = _serialize_messages(loop.turn_messages)
             session.stored.model = session.stored.model or self._chain_key or self.config.default_model
             self.store.save(session.stored)
+        session.last_error = error or ""
+        session.last_api_calls = sum(1 for m in loop.turn_messages if m.role == "assistant")
+        if session.background:
+            session.run_result = {"done": "completed", "interrupted": "completed"}.get(status, "failed")
+            if status == "needs_input":
+                session.run_result = None
         for msg in reversed(loop.turn_messages):
             if msg.role == "assistant" and msg.usage:
                 usage = msg.usage
@@ -1331,7 +1389,11 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
 
 async def _session_active_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     current = server.session
-    return {"sessions": server._active_rows(current.session_id if current else None)}
+    out: dict[str, Any] = {"sessions": server._active_rows(current.session_id if current else None)}
+    if server.automation is not None:
+        counts = server.automation.counts()
+        out["automation"] = {**counts, "active": sum(counts.values())}
+    return out
 
 
 async def _session_resume(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -1455,6 +1517,7 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     if session is None:
         raise _InvalidParams("no active session")
     text = _require(params, "text")
+    server.last_user_activity = time.time()
     if session.streaming:
         return {"turn_id": "", "status": "queued"}
     if params.get("background"):
