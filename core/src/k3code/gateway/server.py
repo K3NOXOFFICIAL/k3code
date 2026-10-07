@@ -34,6 +34,7 @@ from k3code import confio
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, autonomy_cfg
+from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
@@ -266,6 +267,7 @@ class GatewayServer:
         )
         self.autonomy = PlanFirst(self)
         self.subagents = SubagentManager(self)
+        self.fanout = FanoutExecutor(self)
 
     # ── session registry ──────────────────────────────────────────────
 
@@ -853,6 +855,17 @@ class GatewayServer:
             session.current_kind = kind.value
             history = session.history
             prompt = gate.prompt
+            if gate.proceed and (subtasks := self.fanout.applies(session, gate)):
+                fan = await self.fanout.run(session, text, gate.plan, subtasks)  # M4b: parallel worktree children
+                if fan is not None and fan.ok:
+                    gate.proceed, gate.message = False, fan.summary()
+                    session.stored.messages = [
+                        *session.stored.messages, {"role": "user", "content": text},
+                        {"role": "assistant", "content": gate.message},
+                    ]
+                    self.store.save(session.stored)
+                elif fan is not None:
+                    prompt = fan.escalation_prompt(text)  # the parent finishes what the children could not
             if not gate.proceed:
                 final_text = gate.message
                 session.emit("message.delta", {"text": gate.message})

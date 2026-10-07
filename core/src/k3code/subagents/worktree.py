@@ -100,3 +100,45 @@ async def remove(wt: Worktree, *, keep_branch: bool) -> None:
     await git(wt.repo, "worktree", "remove", "--force", str(wt.path))
     if not keep_branch:
         await git(wt.repo, "branch", "-D", wt.branch)
+
+
+async def head_sha(repo: str | Path) -> str:
+    _, out = await git(repo, "rev-parse", "HEAD")
+    return out.strip()
+
+
+async def merge_trial(wt: Worktree) -> tuple[bool, str]:
+    """Merge the branch into the parent checkout WITHOUT committing, so tests can run on the result.
+
+    On conflict the merge is aborted. Follow with :func:`commit_merge` or :func:`abort_merge`.
+    """
+    rc, out = await git(wt.repo, "merge", "--no-ff", "--no-commit", wt.branch)
+    if rc == 0:
+        return True, out.strip()
+    await git(wt.repo, "merge", "--abort")
+    return False, out.strip()
+
+
+async def commit_merge(wt: Worktree, message: str | None = None) -> tuple[bool, str]:
+    rc, out = await git(wt.repo, "-c", "user.name=k3code", "-c", "user.email=k3code@localhost",
+                        "commit", "-q", "--no-edit", "-m", message or f"Merge {wt.branch}")
+    if rc != 0 and "nothing to commit" in out:
+        return True, out.strip()  # fast-forward-like no-op merge
+    return rc == 0, out.strip()
+
+
+async def abort_merge(wt: Worktree) -> None:
+    await git(wt.repo, "merge", "--abort")
+
+
+async def bring_parent_into(wt: Worktree, parent_sha: str) -> tuple[bool, str]:
+    """Merge the parent's current HEAD into the child's worktree. On conflict the markers stay in the tree
+    (the child resolves them); returns (clean, output)."""
+    rc, out = await git(wt.path, "-c", "user.name=k3code", "-c", "user.email=k3code@localhost",
+                        "merge", "--no-edit", parent_sha)
+    return rc == 0, out.strip()
+
+
+async def conflicted_files(path: str | Path) -> list[str]:
+    _, out = await git(path, "diff", "--name-only", "--diff-filter=U")
+    return [x for x in out.splitlines() if x.strip()]

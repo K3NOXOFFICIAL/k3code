@@ -173,6 +173,7 @@ class SubagentManager:
         auto_merge: bool = True,
         index: int = 0,
         count: int = 1,
+        worktree: wt_mod.Worktree | None = None,
     ) -> Handle:
         """Create the child and start it as a task; the caller awaits :meth:`wait` or polls."""
         if depth > MAX_DEPTH:
@@ -190,6 +191,8 @@ class SubagentManager:
             depth=depth, parent_sid=parent.session_id, parent_child_id=parent_child_id, isolation=isolation,
             index=index, count=count,
         )
+        if worktree is not None:  # a rework round continues in the same worktree
+            h.worktree, h.isolation, h.branch = worktree, "worktree", worktree.branch
         self.handles[h.id] = h
         self._emit(parent, "subagent.spawn_requested", h)
         h.task = asyncio.get_running_loop().create_task(self._run(parent, h, atype, prompt, auto_merge))
@@ -242,7 +245,8 @@ class SubagentManager:
         cwd = Path(parent.perms.cwd)
         try:
             if h.isolation == "worktree":
-                h.worktree = await wt_mod.create(cwd, h.id)
+                if h.worktree is None:
+                    h.worktree = await wt_mod.create(cwd, h.id)
                 if h.worktree is not None:
                     cwd = h.worktree.path
                     h.branch = h.worktree.branch
