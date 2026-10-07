@@ -13,7 +13,7 @@ from k3code import service
 from k3code.gateway.sessions import SessionStore
 from k3code.outputstyle import PRESETS as STYLE_PRESETS
 from k3code.paths import home
-from k3code.permissions.hardline import HARDLINE_PATTERNS
+from k3code.permissions.hardline import HARDLINE_NAMES
 from k3code.setup import detect, probe
 from k3code.setup.prompter import Prompter
 from k3code.setup.state import env_file_path, read_env_file, set_env_var
@@ -240,7 +240,7 @@ def step_permissions(c: Ctx) -> dict[str, Any]:
     default = c.data.get("usage", {}).get("permission_mode", "ask")
     mode = c.p.select("permissions.mode", "Default permission mode", PERMISSION_MODES, default)
     c.say("Hardline denies (never allowed, even in yolo):")
-    for name, _rx in HARDLINE_PATTERNS:
+    for name in HARDLINE_NAMES:
         c.say(f"  - {name}")
     extra = c.p.raw("permissions.extra_hardline")
     if extra is None:

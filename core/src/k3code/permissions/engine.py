@@ -52,6 +52,17 @@ BUILTIN_BASH_ALLOW = [
     "git log*",
 ]
 
+#: ``rg --pre CMD`` runs CMD on every file; ``git diff|log --output=FILE`` writes FILE; ``--ext-diff``/``--textconv``
+#: run configured external programs.
+BUILTIN_BASH_ASK = [
+    "rg* --pre*",
+    "rg* --hostname-bin*",
+    "git diff* --output*",
+    "git log* --output*",
+    "git diff* --ext-diff*",
+    "git diff* --textconv*",
+]
+
 PURE_TOOLS = frozenset({"read", "grep", "glob", "todo", "skill", "mcp_tool_search", "task", "task_result"})
 EDIT_TOOLS = frozenset({"write", "edit"})
 READ_TOOLS = frozenset({"read", "grep", "glob"})  # path-taking read-only tools
@@ -75,12 +86,13 @@ def builtin_defaults() -> list[Rule]:
     """Builtin ruleset: pure tools + safe bash allow, writes/other bash ask."""
     rules: list[Rule] = [Rule(tool=t, pattern="*", action="allow") for t in sorted(PURE_TOOLS - READ_TOOLS)]
     rules += [Rule(tool="bash", pattern=p, action="allow") for p in BUILTIN_BASH_ALLOW]
+    # Flags that make an allowed read-only command execute or write something: longer patterns win, so these ask.
+    rules += [Rule(tool="bash", pattern=p, action="ask") for p in BUILTIN_BASH_ASK]
     rules.append(Rule(tool=EXIT_PLAN_TOOL, pattern="*", action="allow"))
     return rules
 
 
 _RANK: dict[str, int] = {"allow": 1, "ask": 2, "deny": 3}
-_UNSAFE_SHELL = re.compile(r"[<>]|\$\(|`")  # redirects / substitution void a builtin allow
 
 
 def _norm(path: str | Path) -> str:
@@ -123,7 +135,7 @@ def decide(
     ruleset = merge(builtin_defaults(), user_rules or [], project_rules or [], session_rules or [])
 
     if tool == "bash":
-        dec = _decide_bash(mode, str(args.get("command", "")), ruleset, hardline_extra)
+        dec = _decide_bash(mode, str(args.get("command", "")), ruleset, hardline_extra, roots, cwd_s)
     elif tool in EDIT_TOOLS or tool in READ_TOOLS:
         dec = _decide_path(mode, tool, _abs(str(args.get("path") or args.get("file") or "."), cwd_s), roots, ruleset)
     elif tool == EXIT_PLAN_TOOL:
@@ -154,12 +166,55 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
     return dec
 
 
-def _decide_bash(mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None) -> Decision:
+#: Redirections that are harmless next to any command (they do not write or read an arbitrary file).
+_HARMLESS_REDIRECT = re.compile(r"(?:\d*>&\d+|&>\s*/dev/null|\d*>>?\s*/dev/null)")
+_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*(?:>>?|<)\s*([^\s;&|<>()]+)")
+_SUBSTITUTION = re.compile(r"\$\(|`")
+#: Redirect targets that are code or credentials even inside the project.
+_SENSITIVE_TARGET = re.compile(r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
+                               r"\.zsh(?:rc|env)|\.profile|\.zprofile|authorized_keys|\.netrc|\.npmrc|\.env)(?:/|$)")
+
+
+def _redirects_ok(plain: str, roots: list[str], cwd: str) -> bool:
+    """Every redirect target is a plain path inside the project roots and not a credential/startup file."""
+    for target in _REDIRECT.findall(plain):
+        target = target.strip("'\"")
+        if not target or any(ch in target for ch in "$*?[{~") and not target.startswith("~/"):
+            return False  # a variable or glob: unknown target
+        path = _abs(target, cwd)
+        if not _inside(path, roots) or _SENSITIVE_TARGET.search(path):
+            return False
+    return True
+
+
+def _voids_allow(sub: str, rule: Rule, ruleset: list[Rule], roots: list[str], cwd: str) -> bool:
+    """A redirect or command substitution turns an allowed prefix into something else (``ls > ~/.bashrc``,
+    ``git commit -m "$(evil)"``). Builtin read-only allows never cover either. A rule the user approved (session /
+    project / user layer) still covers redirects into the project and substitutions whose contents are themselves
+    allowed. Before, an "always allow git commit" also allowed ``git commit > ~/.bashrc`` and ``git commit -m
+    "$(evil)"``."""
+    plain = _HARMLESS_REDIRECT.sub("", sub)
+    has_redirect = bool(_REDIRECT.search(plain))
+    has_subst = bool(_SUBSTITUTION.search(plain))
+    if rule.layer == 0:
+        return has_redirect or has_subst
+    if has_redirect and not _redirects_ok(plain, roots, cwd):
+        return True
+    if not has_subst:
+        return False
+    nested = hardline.parse(sub).nested
+    return not nested or any(
+        evaluate("bash", n, ruleset, default="ask").action != "allow" or hardline.is_launcher(n) for n in nested
+    )
+
+
+def _decide_bash(
+    mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
+) -> Decision:
+    hit = hardline.check(command, extra)
+    if hit:
+        return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     subs = hardline.split_commands(command)
-    for text in (command, *subs):
-        hit = hardline.check(text, extra)
-        if hit:
-            return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     prefixes = [hardline.command_prefix(s) or s for s in subs]
     if mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=prefixes, message=PLAN_MSG)
@@ -168,7 +223,7 @@ def _decide_bash(mode: PermissionMode, command: str, ruleset: list[Rule], extra:
     worst: Rule | None = None
     for sub in subs:
         rule = evaluate("bash", sub, ruleset, default="ask")
-        if rule.action == "allow" and rule.layer == 0 and _UNSAFE_SHELL.search(sub):
+        if rule.action == "allow" and _voids_allow(sub, rule, ruleset, roots, cwd):
             rule = Rule(tool="bash", pattern="*", action="ask")
         if worst is None or _RANK[rule.action] > _RANK[worst.action]:
             worst = rule
@@ -198,6 +253,12 @@ def suggest_rules(tool: str, dec: Decision) -> list[Rule]:
     """Narrowest rules to persist for an ``always``/``session`` approval."""
     if tool == "bash":
         # "<prefix> *" matches "git commit" and "git commit -m x" but not "git commit-tree"/"shutdown".
-        return [Rule(tool="bash", pattern=f"{p} *", action="allow") for p in dict.fromkeys(dec.patterns) if p]
+        # Never for launchers (shells, ssh, interpreters, xargs, find, sudo ...): "always allow `python3 *`" would
+        # allow every command the user will ever be asked about.
+        return [
+            Rule(tool="bash", pattern=f"{p} *", action="allow")
+            for p in dict.fromkeys(dec.patterns)
+            if p and not hardline.is_launcher(p)
+        ]
     name = "edit" if tool in EDIT_TOOLS else "read" if tool in READ_TOOLS else tool
     return [Rule(tool=name, pattern=p, action="allow") for p in dec.patterns]

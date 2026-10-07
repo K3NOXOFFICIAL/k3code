@@ -314,7 +314,9 @@ class AgentLoop:
         self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
         try:
             if tool_call.name == "bash":
-                result = await handler(args, cwd=self.cwd, sandbox=self._sandbox_argv())
+                # the bwrap probe runs a subprocess (up to 10 s): never on the event loop that serves every session
+                argv = await asyncio.to_thread(self._sandbox_argv)
+                result = await handler(args, cwd=self.cwd, sandbox=argv)
             else:
                 result = await handler(args, cwd=self.cwd)
         except Exception as e:

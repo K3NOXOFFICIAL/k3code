@@ -304,3 +304,41 @@ async def test_model_chain_command_shows_cooldown(chain_home):
     assert "1. omni/a [cooldown]" in text and "2. omni/b" in text and "3. direct/c" in text
     out = (await server.dispatch_command("model", "chain move direct 1", None))["message"]
     assert out.startswith("Chain updated") and "1. direct/c" in out
+
+
+def test_sandbox_argv_drops_the_daemon_environment():
+    argv = sandbox.build_argv("/tmp", bwrap="/usr/bin/bwrap")
+    assert "--clearenv" in argv and "--unshare-ipc" in argv
+    assert "--setenv" in argv and argv[argv.index("--setenv") + 1] in sandbox.ENV_ALLOW
+    assert all(name in sandbox.ENV_ALLOW for name in (argv[i + 1] for i, a in enumerate(argv) if a == "--setenv"))
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_sandboxed_bash_does_not_see_provider_api_keys(tmp_path, monkeypatch):
+    """The daemon's environment holds the provider keys; a prompt-injected `echo $KEY` must find nothing."""
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "sk-secret-value")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-secret")
+    argv = sandbox.build_argv(tmp_path)
+    res = await tool_bash({"command": "env; echo path=$PATH"}, cwd=tmp_path, sandbox=argv)
+    assert "sk-secret-value" not in res["stdout"] and "sk-ant-secret" not in res["stdout"]
+    assert "OMNIROUTE_API_KEY" not in res["stdout"] and "path=/" in res["stdout"]  # PATH survives
+
+
+def test_a_failed_bwrap_probe_is_retried_not_latched(monkeypatch):
+    calls = []
+
+    def fake_probe() -> bool:
+        calls.append(1)
+        return len(calls) > 1  # first probe fails (a transient timeout), the second succeeds
+
+    sandbox.reset_probe()
+    monkeypatch.setattr(sandbox, "_probe_bwrap", fake_probe)
+    clock = [1000.0]
+    monkeypatch.setattr(sandbox.time, "monotonic", lambda: clock[0])
+    assert sandbox.usable() is False
+    assert sandbox.usable() is False and len(calls) == 1  # inside the back-off window: no new probe
+    clock[0] += sandbox.REPROBE_AFTER_S + 1
+    assert sandbox.usable() is True and len(calls) == 2  # re-probed, and now positive
+    clock[0] += 10_000
+    assert sandbox.usable() is True and len(calls) == 2  # a positive result is cached
+    sandbox.reset_probe()

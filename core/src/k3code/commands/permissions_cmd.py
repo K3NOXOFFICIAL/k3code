@@ -10,7 +10,7 @@ import yaml
 from k3code.commands._util import pop_flag, reply, session_cwd
 from k3code.paths import project_config_path, user_config_path
 from k3code.permissions.engine import PermissionMode, builtin_defaults
-from k3code.permissions.hardline import HARDLINE_PATTERNS
+from k3code.permissions.hardline import HARDLINE_NAMES
 from k3code.permissions.rules import Rule, expand
 from k3code.permissions.state import PermissionState, persist_rules
 
@@ -36,7 +36,7 @@ def format_overview(perms: PermissionState) -> str:
     for rid, src, r in effective_rules(perms):
         lines.append(f"  {rid:<4} {r.action:<5} {r.tool} {r.pattern}  [{src}]")
     lines += ["", "Hardline (always denied, any mode):"]
-    lines += [f"  - {name}" for name, _ in HARDLINE_PATTERNS]
+    lines += [f"  - {name}" for name in HARDLINE_NAMES]
     lines += [f"  - (config) {h}" for h in perms.hardline_extra]
     return "\n".join(lines)
 

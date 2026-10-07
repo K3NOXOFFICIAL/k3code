@@ -7,11 +7,11 @@ callers fall back to running unsandboxed and ``/doctor`` warns.
 
 from __future__ import annotations
 
-import functools
 import os
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -21,6 +21,11 @@ from k3code.permissions import PermissionMode
 HOME_CACHE = ".cache"
 HOME_UV = ".local/share/uv"
 SANDBOXED_MODES = (PermissionMode.AUTO, PermissionMode.YOLO)
+#: Environment variables the sandboxed command inherits (everything else, in particular API keys, is dropped).
+ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "NO_COLOR", "COLORTERM")
+#: A failed probe is retried after this many seconds (one slow probe used to disable the sandbox for the whole
+#: daemon lifetime: every unattended session then ran bash on the real $HOME).
+REPROBE_AFTER_S = 60.0
 
 
 def bwrap_path() -> str | None:
@@ -41,7 +46,14 @@ def build_argv(
 ) -> list[str]:
     """The ``bwrap`` argv *prefix*; append the command (e.g. ``/bin/sh -c "..."``)."""
     home = Path(home or Path.home())
-    argv = [bwrap or bwrap_path() or "bwrap", "--die-with-parent", "--new-session", "--unshare-pid"]
+    argv = [bwrap or bwrap_path() or "bwrap", "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc"]
+    # The command gets a minimal environment, not the daemon's: it carries the provider API keys (OMNIROUTE_API_KEY,
+    # ANTHROPIC_API_KEY, ...), so any command run by a prompt-injected turn could print them.
+    argv.append("--clearenv")
+    for name in ENV_ALLOW:
+        value = os.environ.get(name)
+        if value is not None:
+            argv += ["--setenv", name, value]
     # System: read-only. /bin, /lib* are usually symlinks into /usr; recreate them as symlinks.
     for path in ("/usr", "/etc"):
         if os.path.isdir(path):
@@ -74,9 +86,31 @@ def build_argv(
     return argv
 
 
-@functools.cache
+_probe: tuple[bool, float] | None = None  # (result, monotonic time)
+
+
+def reset_probe() -> None:
+    """Forget the cached probe result (tests, ``/doctor``)."""
+    global _probe
+    _probe = None
+
+
 def usable() -> bool:
-    """True when bwrap exists and can really create the sandbox here (user namespaces enabled)."""
+    """True when bwrap exists and can really create the sandbox here (user namespaces enabled).
+
+    A positive result is cached; a negative one is re-probed after ``REPROBE_AFTER_S`` so a transient failure
+    (a timeout under IO pressure, EAGAIN) does not latch the sandbox off.
+    """
+    global _probe
+    now = time.monotonic()
+    if _probe is not None and (_probe[0] or now - _probe[1] < REPROBE_AFTER_S):
+        return _probe[0]
+    ok = _probe_bwrap()
+    _probe = (ok, now)
+    return ok
+
+
+def _probe_bwrap() -> bool:
     path = bwrap_path()
     if path is None:
         return False
