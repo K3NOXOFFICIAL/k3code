@@ -30,6 +30,42 @@ class ProviderEntry(BaseModel):
         return v
 
 
+class McpServerConfig(BaseModel):
+    """One ``mcp.servers.<name>`` entry: stdio (command) or streamable HTTP (url)."""
+
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str | None = None
+    url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class McpConfig(BaseModel):
+    servers: dict[str, McpServerConfig] = Field(default_factory=dict)
+
+
+class SkillsConfig(BaseModel):
+    roots: list[str] = Field(default_factory=list)
+
+
+class Mem0Config(BaseModel):
+    url: str = ""
+    api_key_env: str = ""
+    user_id: str = ""
+
+
+class DisplayConfig(BaseModel):
+    theme: str = ""
+    focus_mode: bool = False
+
+
+class GoalConfig(BaseModel):
+    max_turns: int = 30
+    judge_model: str = "cheap"
+
+
 class Settings(BaseModel):
     """Runtime settings for k3code."""
 
@@ -45,6 +81,14 @@ class Settings(BaseModel):
     #                 flags: {netwatch: true, journal: true, ...},
     #                 session_tokens: 2000000, session_usd: 5.0}
     reliability: dict[str, Any] = Field(default_factory=dict)
+    # permissions: {<tool>: "allow"|"ask"|"deny" | {<pattern>: action}, hardline: [regex]}
+    permissions: dict[str, Any] = Field(default_factory=dict)
+    output_style: str = "default"
+    display: DisplayConfig = Field(default_factory=DisplayConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
+    mem0: Mem0Config = Field(default_factory=Mem0Config)
+    goal: GoalConfig = Field(default_factory=GoalConfig)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:

@@ -220,10 +220,10 @@ async def test_command_dispatch_unknown_is_message():
     await server.close()
 
 
-async def test_slash_exec_passthrough_without_slash():
+async def test_slash_exec_accepts_command_without_slash():
     server = make_server()
-    frame = await rpc(server, "slash.exec", {"command": "plain text"})
-    assert frame["result"] == {"type": "send", "text": "plain text"}
+    frame = await rpc(server, "slash.exec", {"command": "help"})
+    assert "Commands:" in frame["result"]["output"]
     await server.close()
 
 

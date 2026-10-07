@@ -30,6 +30,7 @@ from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
+from k3code.extratools import register_mcp_tools, register_skill_tool
 from k3code.gateway.protocol import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -44,8 +45,10 @@ from k3code.gateway.protocol import (
     next_request_id,
 )
 from k3code.gateway.sessions import SessionStore
+from k3code.mcpclient import McpManager
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, suggest_rules
 from k3code.permissions.state import PermissionState, log_decision, persist_rules, project_config_path
+from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
 from k3code.providers.types import Message, StreamEvent, Usage
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
@@ -74,7 +77,7 @@ class LiveSession:
         self.session_id = session_id
         self.stored = stored
         self.server = server
-        self.system_prompt = _load_system_prompt()
+        self.system_prompt = _load_system_prompt()  # base prompt; per-turn extras via build_system_prompt
         self.loop: AgentLoop | None = None
         self.turn_task: asyncio.Task[None] | None = None
         self.streaming = False
@@ -157,6 +160,8 @@ class GatewayServer:
         self._stdin = stdin
         self._stdout = stdout
         self.commands: CommandRegistry = build_commands()
+        self.mcp = McpManager(self.config.mcp.servers)
+        self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
         self.session: LiveSession | None = None
         self.providers: list[Any] = []
         self.router: Router | None = None
@@ -235,6 +240,7 @@ class GatewayServer:
         self._server_request_futures.clear()
 
     async def close(self) -> None:
+        await self.mcp.close()
         for p in self.providers:
             await p.aclose()
         self.store.close()
@@ -354,9 +360,16 @@ class GatewayServer:
         assert self.router is not None
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
+        await self.mcp.ensure_started()
         loop = AgentLoop(
             self.router,
-            system_prompt=session.system_prompt,
+            system_prompt=build_system_prompt(
+                session.system_prompt,
+                cwd=session.perms.cwd,
+                config=self.config,
+                session_meta=session.stored.meta,
+                mcp=self.mcp,
+            ),
             max_turns=self.config.max_turns,
             headless=False,
             on_event=self._on_router_event,
@@ -369,6 +382,8 @@ class GatewayServer:
             ),
             permissions=session.perms,
         )
+        register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
+        register_mcp_tools(loop.tools, self.mcp)
         session.loop = loop
 
         config = self.config
@@ -830,11 +845,10 @@ async def _command_dispatch(server: GatewayServer, params: dict[str, Any]) -> di
 
 
 async def _slash_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    command = str(_require(params, "command")).strip()
+    # The TUI sends the command without its leading slash ("model foo"); accept both.
+    command = str(_require(params, "command")).strip().lstrip("/")
     session_id = params.get("session_id")
-    if not command.startswith("/"):
-        return {"type": "send", "text": command}
-    parts = command[1:].split(None, 1)
+    parts = command.split(None, 1)
     name, arg = parts[0], parts[1] if len(parts) > 1 else ""
     return await server.dispatch_command(name, arg, session_id)
 

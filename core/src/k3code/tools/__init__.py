@@ -21,15 +21,25 @@ class ToolRegistry:
 
     def __init__(self) -> None:
         self._tools: dict[str, tuple[ToolSpec, callable]] = {}
+        self._deferred: set[str] = set()  # registered + callable, but schema hidden until activated
+        self._active: set[str] = set()
 
-    def register(self, spec: ToolSpec, handler: callable) -> None:
+    def register(self, spec: ToolSpec, handler: callable, *, deferred: bool = False) -> None:
         self._tools[spec.name] = (spec, handler)
+        if deferred:
+            self._deferred.add(spec.name)
+        else:
+            self._deferred.discard(spec.name)
+
+    def activate(self, names: list[str]) -> None:
+        """Start advertising the schemas of deferred tools (``mcp_tool_search``)."""
+        self._active.update(n for n in names if n in self._deferred)
 
     def get(self, name: str) -> tuple[ToolSpec, callable] | None:
         return self._tools.get(name)
 
     def specs(self) -> list[ToolSpec]:
-        return [spec for spec, _ in self._tools.values()]
+        return [spec for n, (spec, _) in self._tools.items() if n not in self._deferred or n in self._active]
 
     def names(self) -> list[str]:
         return list(self._tools.keys())
