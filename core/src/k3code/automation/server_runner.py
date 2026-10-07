@@ -167,7 +167,8 @@ class ServerRunner:
         if denied:
             return 126, f"denied by hardline rule: {denied}"
         workdir = cwd or str(Path.cwd())
-        argv = sandbox.build_argv(workdir) if sandbox.usable() else None
+        # usable() spawns bwrap (up to 10 s on first use): keep it off the event loop
+        argv = sandbox.build_argv(workdir) if await asyncio.to_thread(sandbox.usable) else None
         res = await tool_bash({"command": command, "timeout": SHELL_TIMEOUT_S}, cwd=Path(workdir), sandbox=argv)
         out = (res.get("stdout") or "") + (res.get("stderr") or "") + (res.get("error") or "")
         note = "" if argv else "\n[note: bwrap unavailable, ran unsandboxed]"
