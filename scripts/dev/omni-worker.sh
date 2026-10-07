@@ -104,16 +104,21 @@ resume_prompt() {
 }
 if [ "$RESUMING" = 1 ]; then PROMPT=$(resume_prompt); else PROMPT=$(base_prompt); fi
 
-SESSION=""; attempt=0; status=fail; omni_errors=0
+SESSION=""; attempt=0; status=fail; omni_errors=0; LAST_BACKEND=""; KEY_QUOTA_UNTIL=0
 while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
   attempt=$((attempt + 1))
+  # While the OmniRoute key itself is out of quota, stay on Claude until the reset.
+  [ "$(date +%s)" -lt "$KEY_QUOTA_UNTIL" ] && USE_CLAUDE=1
   [ "$USE_CLAUDE" = 1 ] || wait_online
   if [ "$USE_CLAUDE" = 1 ]; then
     MODEL=$CLAUDE_FALLBACK_MODEL; FB=(); SET=("${LEAN[@]}")   # default settings = native Claude account
     # Never resume a session written by other models on Claude: foreign thinking blocks fail
-    # signature checks (HTTP 400). Start fresh and continue from the worktree state instead.
-    SESSION=""; PROMPT=$(resume_prompt)
+    # signature checks (HTTP 400). Start fresh from the worktree state; resume only Claude's own.
+    if [ "$LAST_BACKEND" != claude ]; then SESSION=""; PROMPT=$(resume_prompt); fi
+    LAST_BACKEND=claude
   else
+    if [ "$LAST_BACKEND" = claude ]; then SESSION=""; PROMPT=$(resume_prompt); fi
+    LAST_BACKEND=omniroute
     MODEL=${MODEL_LIST[$midx]}
     FALLBACK=${MODEL_LIST[$(( (midx + 1) % ${#MODEL_LIST[@]} ))]}
     FB=(); [ "$FALLBACK" != "$MODEL" ] && FB=(--fallback-model "$FALLBACK")
@@ -165,8 +170,14 @@ try: print(json.load(sys.stdin).get("is_error",True))
 except Exception: print(True)')
   if [ $rc -eq 0 ] && [ "$iserr" = "False" ] && [ "$WT/REPORT.md" -nt "$stamp" ]; then status=ok; break; fi
   echo "$(date -Is) attempt $attempt rc=$rc is_error=$iserr report=$([ -f "$WT/REPORT.md" ] && echo y || echo n)" >> "$RUNS/driver.log"
+  # The OmniRoute key's own daily quota is exhausted: no combo can work until the reset.
+  if printf '%s' "$json" | grep -qiE 'API key reached its daily usage quota|key.{0,20}quota'; then
+    h=$(printf '%s' "$json" | grep -oE 'Resets in [0-9]+h' | grep -oE '[0-9]+' | head -1)
+    KEY_QUOTA_UNTIL=$(( $(date +%s) + ${h:-1} * 3600 ))
+    echo "$(date -Is) OmniRoute key quota exhausted — Claude fallback for ${h:-1}h" >> "$RUNS/driver.log"
+  fi
   if [ "$USE_CLAUDE" = 1 ]; then
-    # One Claude attempt done; go back to OmniRoute next time.
+    # One Claude attempt done; go back to OmniRoute next time (unless the key quota is still out).
     USE_CLAUDE=0; omni_errors=0
     sleep 30; continue
   fi
