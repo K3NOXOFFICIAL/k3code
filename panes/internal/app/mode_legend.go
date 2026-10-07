@@ -27,9 +27,18 @@ import (
 // glance, and a frame that is redrawn to move it costs an idle session its
 // sleep.
 
+// k3: LegendOverride hook for k3keys keymap
+var LegendOverride func(*OS) []overlay.Hint
+
 // modeLegend is the legend of the mode the keyboard is in, or nil when the
 // keyboard is in no mode with keys of its own.
 func (m *OS) modeLegend() []overlay.Hint {
+	// k3: LegendOverride hook for k3keys keymap
+	if LegendOverride != nil {
+		if h := LegendOverride(m); h != nil {
+			return h
+		}
+	}
 	if m.hints != nil {
 		return m.hintsLegend()
 	}
