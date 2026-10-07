@@ -9,9 +9,12 @@ never loses a turn to transient infrastructure failures:
 - ``AllProvidersUnreachable`` with all registered provider endpoints down (net
   itself fine) → ``park``: exponential backoff 30 s up to 10 min, emitting
   ``reliability.parked(next_retry_at=...)`` / ``reliability.unparked``.
-- ``ChainExhausted`` with ``last_reason`` ``rate_limit``/``quota`` → park until
-  the provider-declared Retry-After/reset window when known (tracked from
-  ``router.retry`` events), otherwise the same backoff ladder.
+- ``ChainExhausted`` with every entry cooling down (the router fails over past long
+  Retry-After / quota windows instead of sleeping) → park until the earliest reset
+  (``exc.retry_after``), emitting ``reliability.parked`` with the wall-clock time.
+- Other ``ChainExhausted`` with ``last_reason`` ``rate_limit``/``quota`` → park until the
+  provider-declared window when known (tracked from ``router.retry`` events), otherwise
+  the same backoff ladder.
 
 There is no retry cap by default; ``max_wait`` bounds the total time spent
 waiting per ``stream()`` call (None = wait forever, the default). A
@@ -153,6 +156,9 @@ class PersistentRetry:
         return True
 
     async def _handle_exhausted(self, exc: ChainExhausted, deadline: float | None) -> bool:
+        if exc.retry_after is not None:  # every entry is cooling down: park until the earliest reset
+            await self._park(str(exc), deadline, delay=exc.retry_after, until=exc.until)
+            return True
         if exc.last_reason in RATE_LIMIT_REASONS:
             retry_after = self._last_retry_after
             detail = (
@@ -178,7 +184,9 @@ class PersistentRetry:
             self._raise_if_cancelled()
         self.events.emit(ev.RESUMED, detail=f"network {self.netwatch.state.value if self.netwatch else 'up'}")
 
-    async def _park(self, detail: str, deadline: float | None, *, delay: float | None = None) -> None:
+    async def _park(
+        self, detail: str, deadline: float | None, *, delay: float | None = None, until: float | None = None
+    ) -> None:
         """Emit parked, wait out the backoff window, emit unparked."""
         if delay is None:
             delay = min(
@@ -190,7 +198,8 @@ class PersistentRetry:
             delay = max(0.0, float(delay))
             self._park_step = 0
         next_retry_at = self._monotonic() + delay
-        self.events.emit(ev.PARKED, detail=detail, next_retry_at=next_retry_at, delay=delay)
+        extra = {} if until is None else {"until": until}
+        self.events.emit(ev.PARKED, detail=detail, next_retry_at=next_retry_at, delay=delay, **extra)
         try:
             await self._wait_until(lambda: False, deadline, until_ts=next_retry_at)
         finally:

@@ -24,6 +24,7 @@ import { ActiveWidgetSlot, AmbientDock, AmbientRail, useAmbientRailWidth } from 
 
 import { AgentsOverlay } from './agentsOverlay.js'
 import { AgentStrip } from '../k3/agentStrip.js'
+import { ProposalCards } from '../k3/proposalCards.js'
 import { $stripNav } from '../k3/agentStripStore.js'
 import { focusVisibleMessages } from '../k3/focusPolicy.js'
 import { GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } from './appChrome.js'
@@ -406,6 +407,8 @@ const ComposerPane = memo(function ComposerPane({
       {nativeMode && composer.input === '?' && !composer.inputBuf.length && <HelpHint nativeMode t={ui.theme} />}
 
       {!composer.empty && !ui.sid && <Text color={ui.theme.color.muted}>☤ {ui.status}</Text>}
+
+      {!isBlocked && <ProposalCards cols={Math.max(1, composer.cols - 2)} />}
 
       {!isBlocked && <AgentStrip cols={Math.max(1, composer.cols - 2)} />}
 

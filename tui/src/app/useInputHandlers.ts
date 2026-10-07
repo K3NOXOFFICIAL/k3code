@@ -12,6 +12,7 @@ import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
 import { closeWidget, dispatchWidgetInput } from '../sdk/host.js'
 
 import { toggleFocusMode } from '../k3/focusPolicy.js'
+import { handleProposalKey } from '../k3/proposalsStore.js'
 import {
   $stripNav,
   $stripRows,
@@ -500,6 +501,11 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
 
     if (key.escape && terminal.hasSelection) {
       return clearSelection()
+    }
+
+    // Proposal cards: `a` accepts, `d` dismisses the top card (only while the composer is empty).
+    if (!key.ctrl && !key.meta && handleProposalKey(ch, !cState.input && !cState.inputBuf.length)) {
+      return
     }
 
     // Agent strip (below the composer). Precedence: a focused strip owns ↑/↓/Enter/Esc/x;

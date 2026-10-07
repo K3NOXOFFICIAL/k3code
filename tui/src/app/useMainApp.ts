@@ -50,6 +50,7 @@ import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
 import { $stripSessions, setStripHandlers } from '../k3/agentStripStore.js'
+import { setProposalHandlers } from '../k3/proposalsStore.js'
 
 import { applyAgentSnapshot } from './agentRoster.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
@@ -702,6 +703,22 @@ export function useMainApp(gw: GatewayClient) {
 
     return () => setStripHandlers(null)
   }, [gw, session.activateLiveSession])
+
+  // Proposal cards: accept sends the suggested action as a new prompt; both tell the gateway so it persists.
+  useEffect(() => {
+    const dispatch = (verb: string, id: string) =>
+      gw.request('command.dispatch', { arg: `${verb} ${id}`, name: 'proposals', session_id: getUiState().sid }).catch(() => {})
+
+    setProposalHandlers({
+      accept: p => {
+        void dispatch('accept', p.id)
+        submitLiteralRef.current(p.action)
+      },
+      dismiss: p => void dispatch('dismiss', p.id)
+    })
+
+    return () => setProposalHandlers(null)
+  }, [gw])
 
   // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
   // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.

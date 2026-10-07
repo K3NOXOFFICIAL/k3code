@@ -44,12 +44,13 @@ def bash(cmd: str, id: str = "c1") -> ToolCall:
     return ToolCall(id=id, name="bash", arguments={"command": cmd})
 
 
-def make_server(tmp: Path, turns: list[ToolCall | str], monkeypatch, mode: str = "default"):
+def make_server(tmp: Path, turns: list[ToolCall | str], monkeypatch, mode: str = "default", **cfg):
     monkeypatch.setenv("K3CODE_HOME", str(tmp / "home"))
     store = SessionStore(tmp / "sessions.db")
     config = Settings(
         providers=[ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE")],
         permission_mode=mode,
+        **cfg,
     )
     server = GatewayServer(config=config, store=store)
     frames: list[str] = []
@@ -218,7 +219,9 @@ async def test_outside_roots_asks_without_add_dir(tmp_path, monkeypatch):
 
 
 async def test_auto_mode_logs_side_effects_to_event_stream(tmp_path, monkeypatch):
-    server, _ = make_server(tmp_path, [bash("echo hi > a.txt"), "ok"], monkeypatch, mode="auto")
+    server, _ = make_server(
+        tmp_path, [bash("echo hi > a.txt"), "ok"], monkeypatch, mode="auto", autonomy={"plan_first": False}
+    )  # scripted turns, no classifier call
     await call(server, "session.create", {"cwd": str(tmp_path)})
     seen = await run_turn(server, "go", [])
     assert seen == [] and (tmp_path / "a.txt").exists()

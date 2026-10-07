@@ -6,9 +6,13 @@ Rules (from the M0 task spec):
 - auth, quota or bad_request: no retries, fail over immediately to the next
   entry (a bad request/unknown model is entry-specific; a different
   model/provider may still work).
+- A Retry-After longer than ``max_inline_wait`` (default 20 s) never sleeps inline: the entry goes
+  into cooldown until the reset and the walk fails over at once. Quota errors do the same, with
+  ``quota_cooldown`` (default 1 h) when the provider declares no reset.
 - context_overflow: raise :class:`ContextOverflow` — the loop compacts later.
 - When every entry in the chain has failed: :class:`AllProvidersUnreachable` if
-  every failure was a network error, otherwise :class:`ChainExhausted`.
+  every failure was a network error, otherwise :class:`ChainExhausted` (carrying
+  ``retry_after``/``until`` when every entry is cooling down).
 
 Events go through the ``on_event`` callback (v0: dict payloads; structured
 schemas come in M1+):
@@ -23,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -136,8 +141,17 @@ class Router:
         cooldowns: CooldownStore | None = None,
         on_event: EventCallback | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        tier: str = "main",
+        max_inline_wait: float = 20.0,
+        quota_cooldown: float = 3600.0,
     ) -> None:
         self.chain = list(chain)
+        #: longest Retry-After (seconds) worth sleeping on; longer ones cool the entry down and fail over
+        self.max_inline_wait = max_inline_wait
+        #: cooldown for quota errors that declare no reset
+        self.quota_cooldown = quota_cooldown
+        #: M4a: model tier this router serves; tagged on every event.
+        self.tier = tier
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
@@ -211,6 +225,12 @@ class Router:
                     "skipping %s/%s: cooldown %.0fs remaining (%s)",
                     entry.provider_name, entry.model, skip_reason, "cooldown",
                 )
+                cooled = self.cooldowns.reason_of(
+                    provider=entry.provider_name, model=entry.model, base_url=entry.base_url
+                )
+                if cooled is not None:
+                    last_reason = cooled
+                    all_network = all_network and cooled is FailoverReason.network
                 entry_index += 1
                 continue
             attempt = 0
@@ -229,8 +249,12 @@ class Router:
                     all_network = all_network and classified.reason is FailoverReason.network
                     if classified.reason is FailoverReason.context_overflow:
                         raise ContextOverflow(summarize(exc, limit=500)) from exc
-                    if classified.immediate_failover:
-                        self._failover(entry, target_model, classified.reason, attempt, exc, entry_index=entry_index)
+                    cooldown = self._cooldown_seconds(classified)
+                    if cooldown is not None or classified.immediate_failover:
+                        self._failover(
+                            entry, target_model, classified.reason, attempt, exc,
+                            entry_index=entry_index, retry_after=cooldown,
+                        )
                         break
                     # retryable: same entry with backoff, max_retries times, then fail over
                     if attempt >= self.max_retries:
@@ -254,20 +278,52 @@ class Router:
             entry_index += 1
         # every entry exhausted
         self._emit_exhausted(last_reason)
-        if all_network:
+        if all_network and last_reason is not None:
             raise AllProvidersUnreachable(
                 "all provider entries are unreachable (network errors)", attempts=len(self.chain)
             )
-        raise ChainExhausted(
-            f"all provider entries failed (last reason: {last_reason.value if last_reason else 'unknown'})",
-            last_reason=last_reason.value if last_reason else "unknown",
-        )
+        reason_name = last_reason.value if last_reason else "unknown"
+        wait = self.earliest_reset()
+        if wait is not None:
+            until = self.cooldowns.wall() + wait
+            clock = time.strftime("%H:%M", time.localtime(until))
+            raise ChainExhausted(
+                f"all providers rate-limited until {clock} ({reason_name})",
+                last_reason=reason_name, retry_after=wait, until=until,
+            )
+        raise ChainExhausted(f"all provider entries failed (last reason: {reason_name})", last_reason=reason_name)
 
     # ── helpers ──
 
+    def _cooldown_seconds(self, classified) -> float | None:
+        """Cooldown to arm (and fail over immediately) instead of retrying inline; None = retry as usual."""
+        declared = classified.retry_after
+        if classified.reason is FailoverReason.quota:
+            return float(declared) if declared and declared > 0 else self.quota_cooldown
+        if classified.reason is FailoverReason.rate_limit and declared and declared > self.max_inline_wait:
+            return float(declared)
+        return None
+
+    def earliest_reset(self) -> float | None:
+        """Seconds until the first chain entry leaves cooldown, when *every* entry is cooling down."""
+        if not self.chain or self.cooldowns is None:
+            return None
+        remaining = []
+        for entry in self.chain:
+            if not self.cooldowns.in_cooldown(
+                provider=entry.provider_name, model=entry.model, base_url=entry.base_url
+            ):
+                return None
+            remaining.append(
+                self.cooldowns.remaining_seconds(
+                    provider=entry.provider_name, model=entry.model, base_url=entry.base_url
+                )
+            )
+        return min(remaining)
+
     def _backoff_for(self, classified, attempt: int) -> float:
-        """Jittered backoff, or the full Retry-After window when the provider declares one."""
-        if classified.retry_after is not None:
+        """Jittered backoff, or the Retry-After window (when short enough to sleep on)."""
+        if classified.retry_after is not None and classified.retry_after <= self.max_inline_wait:
             return max(0.0, float(classified.retry_after))
         return jittered_backoff(attempt, base_delay=self.base_delay, max_delay=self.max_delay)
 
@@ -289,14 +345,23 @@ class Router:
         exc: BaseException,
         *,
         entry_index: int,
+        retry_after: float | None = None,
     ) -> None:
-        self.cooldowns.arm(
+        # Without a declared long window jittered_backoff already separated the retries; the cooldown
+        # then uses its own ladder.
+        armed = self.cooldowns.arm(
             reason,
             provider=entry.provider_name,
             model=target_model,
             base_url=entry.base_url,
-            retry_after=None,  # jittered_backoff already separates retries; cooldown uses its own ladder
+            retry_after=retry_after,
         )
+        if retry_after is not None and armed:
+            self._emit(
+                "router.cooldown", entry, attempt=attempt + 1, reason=reason.value,
+                detail=f"cooling down {armed:.0f}s: {summarize(exc)}",
+                extra={"seconds": armed, "until": self.cooldowns.wall() + armed},
+            )
         next_index = entry_index + 1
         next_entry = self.chain[next_index] if next_index < len(self.chain) else None
         self._emit(
@@ -337,7 +402,7 @@ class Router:
                 attempt=attempt,
                 reason=reason,
                 detail=detail,
-                extra=extra or {},
+                extra={**(extra or {}), "tier": self.tier},
             )
         )
 

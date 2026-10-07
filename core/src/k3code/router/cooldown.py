@@ -17,13 +17,19 @@ provider declares nothing. The router skips entries still in cooldown.
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from k3code.router.classifier import FailoverReason
+
+logger = logging.getLogger(__name__)
 
 # rate_limit/quota use the exponential reset ladder below; network uses a flat
 # window (same provider being unreachable is chain-wide news) — still configurable.
@@ -59,6 +65,8 @@ class EntryCooldown:
     until: float
     seconds: float
     reason: FailoverReason
+    #: wall-clock epoch of the reset (what survives a restart in ``cooldowns.json``)
+    until_wall: float = 0.0
 
     @property
     def remaining(self) -> float:
@@ -71,6 +79,52 @@ class CooldownStore:
     Hermes' agent-object fields."""
 
     entries: dict[tuple[str, str, str], EntryCooldown] = field(default_factory=dict)
+    #: when set, rate-limit/quota cooldowns are persisted here so a restart does not hammer the provider
+    path: Path | None = None
+    #: wall-clock source (injectable for tests)
+    wall: Callable[[], float] = time.time
+
+    def __post_init__(self) -> None:
+        if self.path is not None:
+            self.path = Path(self.path)
+            self._load()
+
+    # ── persistence ──
+
+    def _load(self) -> None:
+        assert self.path is not None
+        try:
+            raw = json.loads(self.path.read_text())
+        except (OSError, ValueError):
+            return
+        now_wall, now_mono = self.wall(), time.monotonic()
+        for row in raw.get("entries", []) if isinstance(raw, dict) else []:
+            try:
+                key = _identity(row["provider"], row["model"], row.get("base_url", ""))
+                until_wall = float(row["until"])
+                reason = FailoverReason(row["reason"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            remaining = until_wall - now_wall
+            if remaining > 0:
+                self.entries[key] = EntryCooldown(now_mono + remaining, remaining, reason, until_wall)
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        now_wall, now_mono = self.wall(), time.monotonic()
+        rows = [
+            {"provider": k[0], "model": k[1], "base_url": k[2], "reason": e.reason.value, "until": e.until_wall}
+            for k, e in self.entries.items()
+            if e.reason is not FailoverReason.network and e.until > now_mono and e.until_wall > now_wall
+        ]
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"entries": rows}))
+            tmp.replace(self.path)
+        except OSError as e:
+            logger.warning("could not persist cooldowns to %s: %s", self.path, e)
 
     def arm(
         self,
@@ -105,7 +159,9 @@ class CooldownStore:
             until=monotonic_now + seconds,
             seconds=seconds,
             reason=reason,
+            until_wall=self.wall() + seconds,
         )
+        self._save()
         return seconds
 
     def in_cooldown(self, *, provider: str, model: str, base_url: str = "", now: float | None = None) -> bool:
@@ -127,8 +183,13 @@ class CooldownStore:
         monotonic_now = time.monotonic() if now is None else now
         return max(0.0, entry.until - monotonic_now)
 
+    def reason_of(self, *, provider: str, model: str, base_url: str = "") -> FailoverReason | None:
+        entry = self.entries.get(_identity(provider, model, base_url))
+        return entry.reason if entry is not None else None
+
     def clear(self, *, provider: str, model: str, base_url: str = "") -> None:
         self.entries.pop(_identity(provider, model, base_url), None)
+        self._save()
 
 
 def _provider_reset_delay(retry_after: Any) -> float | None:
