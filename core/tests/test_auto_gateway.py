@@ -268,3 +268,24 @@ async def test_two_unattended_runs_on_one_session_do_not_overlap(tmp_path, monke
     assert [r.status for r in results] == ["completed", "completed"]
     assert live.background is False  # restored, not left True by the second caller
     assert sum(1 for m in live.stored.messages if m["role"] == "user") == 2  # neither tick's history was lost
+
+
+async def test_automation_shell_probes_bwrap_off_the_event_loop(tmp_path, monkeypatch):
+    """ServerRunner.run_shell called sandbox.usable() on the event loop; that probe spawns bwrap (up to 10 s)."""
+    import threading
+
+    from k3code.automation.server_runner import ServerRunner
+    from k3code.reliability import sandbox
+
+    probed_on: list[threading.Thread] = []
+
+    def fake_usable() -> bool:
+        probed_on.append(threading.current_thread())
+        return False  # bwrap unusable: the command runs unsandboxed and says so
+
+    monkeypatch.setattr(sandbox, "usable", fake_usable)
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    code, out = await ServerRunner(server).run_shell("echo shell-ok", str(tmp_path))
+    assert code == 0 and "shell-ok" in out and "bwrap unavailable" in out
+    assert probed_on and probed_on[0] is not threading.main_thread()
+    await server.close()

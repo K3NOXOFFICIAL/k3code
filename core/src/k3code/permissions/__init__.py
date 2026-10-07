@@ -22,9 +22,11 @@ from .engine import (
     PURE_TOOLS,
     READ_TOOLS,
     Decision,
+    InvalidPermissionMode,
     PermissionMode,
     builtin_defaults,
     decide,
+    permission_mode_from_config,
     suggest_rules,
 )
 from .rules import Action, Rule
@@ -43,8 +45,10 @@ __all__ = [
     "EXIT_PLAN_TOOL",
     "PURE_TOOLS",
     "READ_TOOLS",
+    "InvalidPermissionMode",
     "PermissionMode",
     "Rule",
+    "permission_mode_from_config",
     "arity",
     "builtin_defaults",
     "check_permission",

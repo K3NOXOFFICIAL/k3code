@@ -139,26 +139,51 @@ async def run(a: argparse.Namespace) -> int:
 
     log(f"# soak start {time.strftime('%F %T')} duration={total_s}s interval={a.interval}s home={d.root}")
     samples: list[dict] = []
-    # SIGTERM/SIGINT must stop the daemon too (a bare kill of this driver used to orphan it) and must not produce a
-    # verdict: a stopped 72 h run would otherwise be judged on whatever samples it had and could report PASS.
+    # SIGTERM/SIGINT/SIGQUIT (and SIGHUP unless nohup ignores it) must stop the daemon too (a bare kill of this driver
+    # used to orphan it) and must not produce a verdict: a stopped 72 h run would otherwise be judged on whatever
+    # samples it had and could report PASS.
     stop = asyncio.Event()
-    for sig in (signal.SIGTERM, signal.SIGINT):
+    stop_signals = [signal.SIGTERM, signal.SIGINT, signal.SIGQUIT]
+    # nohup starts the driver with SIGHUP ignored: keep that, or the `nohup soak.sh --hours 72 &` recipe dies when the
+    # terminal hangs up. A plain run still stops on HUP.
+    if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+        stop_signals.append(signal.SIGHUP)
+    for sig in stop_signals:
         asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+
+    class _Stopped(Exception):
+        """A stop signal arrived during startup: unwind to the daemon cleanup below."""
+
+    def check_stop() -> None:
+        # Startup used to ignore a SIGTERM for minutes (only the sampling loop looked at the flag).
+        if stop.is_set():
+            raise _Stopped
+
+    peer = None
     try:
         d.start()
+        check_stop()
         peer = await d.peer()
+        check_stop()
         await peer.wait_for("gateway.ready", 30)
+        check_stop()
         wall0 = time.time()
         t_start = time.monotonic()
         sid = (await peer.call("session.create", cwd=str(d.proj)))["result"]["session_id"]
+        check_stop()
         await peer.call("session.mode.set", session_id=sid, mode="yolo")
+        check_stop()
         r = await peer.call("command.dispatch", name="loop", session_id=sid,
                             arg=f"{LOOP_EVERY:g}s --max-ticks 10000000 soak loop tick")
         log(f"# loop: {json.dumps(r.get('result') or r.get('error'))[:200]}")
         for name, expr, _ in JOBS:
-            p = subprocess.run([cl.k3code_bin(), "schedule", "add", expr, "--name", name, "--cwd", str(d.proj),
-                                f"{name} tick"], env=d.env, capture_output=True, text=True, timeout=60)
+            check_stop()
+            # in a thread: a blocking run would hold the loop, so a signal could not be seen until it returned
+            p = await asyncio.to_thread(subprocess.run, [cl.k3code_bin(), "schedule", "add", expr, "--name", name,
+                                                         "--cwd", str(d.proj), f"{name} tick"],
+                                        env=d.env, capture_output=True, text=True, timeout=60)
             log(f"# schedule add {expr!r}: {(p.stdout + p.stderr).strip()[:150]}")
+        check_stop()
         samples.append(sample(d, t_start, wall0))
         log(fmt(samples[-1]))
         while time.monotonic() - t_start < total_s and d.alive() and not stop.is_set():
@@ -170,8 +195,11 @@ async def run(a: argparse.Namespace) -> int:
                 break
             samples.append(sample(d, t_start, wall0))
             log(fmt(samples[-1]))
-        peer.close()
+    except _Stopped:
+        pass
     finally:
+        if peer is not None:
+            peer.close()
         procs.close()
     if stop.is_set():
         log(f"# stopped early by a signal after {len(samples)} samples; daemon stopped; no verdict, no exit row")

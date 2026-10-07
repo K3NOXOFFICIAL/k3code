@@ -41,6 +41,20 @@ class PermissionMode(StrEnum):
         return None
 
 
+class InvalidPermissionMode(ValueError):
+    """A configured permission mode that is not a known name (a usage error for the CLI, a reply for the gateway)."""
+
+
+def permission_mode_from_config(key: str, value: str) -> PermissionMode:
+    """The PermissionMode for a config string; an unknown value raises InvalidPermissionMode naming the key."""
+    try:
+        return PermissionMode(value)
+    except ValueError:
+        raise InvalidPermissionMode(
+            f"{key} {value!r} is not one of: ask, auto-edit, yolo (set in config.yaml or K3CODE_{key.upper()})"
+        ) from None
+
+
 #: Builtin read-only bash allowlist: safe to run without asking.
 BUILTIN_BASH_ALLOW = [
     "ls *",
