@@ -4,7 +4,7 @@ import { useStore } from '@nanostores/react'
 import { $uiState } from '../app/uiStore.js'
 import { compactPreview } from '../lib/text.js'
 
-import { $proposals, GLYPH } from './proposalsStore.js'
+import { $proposals, glyphFor } from './proposalsStore.js'
 
 /** Small card list above the agent strip: the gateway's `proposal.show` suggestions. */
 export function ProposalCards({ cols }: { cols: number }) {
@@ -22,7 +22,7 @@ export function ProposalCards({ cols }: { cols: number }) {
       </Text>
       {items.map((p, i) => (
         <Text color={i === 0 ? t.color.accent : t.color.muted} key={p.id} wrap="truncate-end">
-          {GLYPH[p.kind]} {compactPreview(p.text, Math.max(10, cols - 4))}
+          {glyphFor(p.kind)} {compactPreview(p.text, Math.max(10, cols - 4))}
         </Text>
       ))}
     </Box>

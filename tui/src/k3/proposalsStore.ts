@@ -1,6 +1,14 @@
 import { atom } from 'nanostores'
 
-export type ProposalKind = 'also_setup' | 'consequence' | 'improvement'
+export type ProposalKind =
+  | 'also_setup'
+  | 'consequence'
+  | 'improvement'
+  | 'optimizer'
+  | 'permission_rule'
+  | 'preference'
+  | 'project_setup'
+  | 'skill'
 
 export interface Proposal {
   action: string
@@ -51,4 +59,16 @@ export function handleProposalKey(ch: string, inputEmpty: boolean): boolean {
   return true
 }
 
-export const GLYPH: Record<ProposalKind, string> = { also_setup: '＋', consequence: '⚠', improvement: '↑' }
+export const GLYPH: Record<ProposalKind, string> = {
+  also_setup: '＋',
+  consequence: '⚠',
+  improvement: '↑',
+  optimizer: '⚙',
+  permission_rule: '🔑',
+  preference: '♥',
+  project_setup: '📁',
+  skill: '✦'
+}
+
+/** Fallback for kinds a newer gateway may send. */
+export const glyphFor = (kind: string): string => (GLYPH as Record<string, string>)[kind] ?? '•'

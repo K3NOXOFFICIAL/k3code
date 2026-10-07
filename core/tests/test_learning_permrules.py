@@ -82,7 +82,7 @@ def test_dismiss_latches(tmp_path):
 def test_auto_do_for_always_approved_high_risk_plans(tmp_path, monkeypatch):
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
     log = DecisionLog(tmp_path)
-    for i in range(3):
+    for _ in range(3):
         log.record("plan", subject="confirm", choice="approved", detail={"risk": "high"})
     (c,) = [c for c in permrules.mine(log) if c.auto_do]
     assert "automatically in auto mode" in c.text()

@@ -169,3 +169,39 @@ local_path = "core/src/k3code/automation/suggestions.py"
 sha256_upstream = "71c64068ea6d785e5a453a8abbbc7a642af991ad95f315116894bddd9ac351b0"
 modified = true
 port = true  # design port, no line copy: CatalogEntry shape; entries are k3code-specific
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "hermes_cli/approvals_suggest.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/learning/permrules.py"
+sha256_upstream = "3de348d6ca3bbd18da6700abd7895dbb6831803ea9136616092c26afe266172f"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/background_review.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/learning/review.py"
+sha256_upstream = "0457a5110f1afb4a9fcbe32fcd02eda8fb7d160f7e44a2c10109a320fd23656e"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/curator.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/learning/curator.py"
+sha256_upstream = "45075cbdb2c06d6c38f24309853a07384fc93f1f08c2d88ed6ce5bfdc6c38b9c"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "tools/skill_manager_tool.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/learning/curator.py"
+sha256_upstream = "9a60291505ec597cb72a1cd10467846bc84a62a3175855ab7f8c6c497bc2bbbb"
+modified = true
