@@ -194,15 +194,19 @@ def check_systemd() -> Check:
 
 
 def find_repo_root() -> Path | None:
+    from k3code.paths import data_dir
+
     here = Path(__file__).resolve()
-    for candidate in (Path.cwd(), *here.parents):
+    for candidate in (Path.cwd(), *here.parents, data_dir() / "current"):
         if (candidate / "tui" / "package.json").is_file() or (candidate / "tui" / "dist" / "entry.js").is_file():
             return candidate
     return None
 
 
 def check_tui() -> Check:
-    node = shutil.which("node")
+    from k3code.paths import find_node
+
+    node = find_node()
     root = find_repo_root()
     entry = root / "tui" / "dist" / "entry.js" if root else None
     version = ""

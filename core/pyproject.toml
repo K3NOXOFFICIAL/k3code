@@ -1,6 +1,6 @@
 [project]
 name = "k3code"
-version = "0.0.1"
+dynamic = ["version"]
 description = "k3code core: provider router, agent loop, tool registry and CLI"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -10,6 +10,7 @@ dependencies = [
     "mcp>=2.3.0",
     "pydantic>=2.7",
     "pyyaml>=6.0",
+    "prompt_toolkit>=3.0",
 ]
 
 [project.scripts]
@@ -27,6 +28,10 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "../VERSION"
+pattern = "(?P<version>[0-9][^\\s]*)"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/k3code"]
