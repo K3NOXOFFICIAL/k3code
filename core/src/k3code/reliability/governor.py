@@ -202,6 +202,7 @@ class Governor:
     def _stats_snapshot(self) -> dict[str, int]:
         return {"io": self._counters.io, "total": self._counters.total}
 
+    @contextlib.asynccontextmanager
     async def slot(self, kind: str = "cpu", provider: str | None = None) -> AsyncIterator[None]:
         """Admission-controlled slot: ``async with governor.slot("io")``.
 
