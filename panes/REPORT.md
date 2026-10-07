@@ -15,9 +15,10 @@ exactly **two upstream seams** (19 added lines total, verified via
 
 New code (no upstream impact): `internal/k3keys/` (`keymap.go` mode enum /
 default bindings / `KeyState.Handle` state machine / `MergeBindings`,
-`hints.go` pure-Go hint strips, `hook.go` `Install` wiring
-`input.RunActionByName`, `config.go` TOML overrides from
-`~/.config/k3/keys.toml`) plus the `cmd/k3` entry point.
+`hints.go` pure-Go hint strips, `hook.go` `Install` wiring both hooks
+(`input.RunActionByName` for keys, `app.LegendOverride` for the dock legend),
+`config.go` TOML overrides from `~/.config/k3/keys.toml`) plus the `cmd/k3`
+entry point.
 
 Key behaviors per spec: leader `ctrl+g` → Chooser (`p/t/s/r///a/?`);
 one-shot actions auto-return to Typing with `enter_terminal_mode` appended;
@@ -69,12 +70,11 @@ ok  github.com/Gaurav-Gosain/tuios/internal/input  5.040s
 $ go test ./internal/app/ -run TestNoEmojiInSourceStrings -count=1
 ok  github.com/Gaurav-Gosain/tuios/internal/app  0.676s
 
-$ go test ./internal/app/  (full suite, ~5-7 min per run)
-FAIL  github.com/Gaurav-Gosain/tuios/internal/app  327.817s
-  --- FAIL: TestNoEmojiInSourceStrings  (only failure; fixed as above)
-  Baseline on pristine HEAD (git archive, no k3 changes): pass (baseline
-  `--- FAIL` list was empty; after-fix list matches it).
-  The full app suite's other tests were green both before and after the fix.
+$ go test ./internal/app/  (full suite, final run after all fixes)
+ok    github.com/Gaurav-Gosain/tuios/internal/app  479.572s (exit 0, zero failures)
+  Earlier failure (TestNoEmojiInSourceStrings, 🔒 in hints.go) fixed with
+  ASCII `[locked]`; baseline on pristine HEAD (git archive, no k3 changes)
+  had been green, and the final full-suite run confirms zero regressions.
 ```
 
 Smoke checks: `go build -o /tmp/k3-bin ./cmd/k3` succeeds; the binary starts
@@ -99,3 +99,36 @@ New (untracked, intended): `K3_CHANGES.md`, `cmd/k3/main.go`,
 - None blocking. Possible follow-ups: an E2E tape test driving `cmd/k3`
   through leader → mode → action; agent-mode (`a`) bindings are currently a
   locked placeholder per spec.
+
+## Legend visibility analysis (spec line 45)
+
+The spec's conditional third hook ("If the legend is not always visible in
+typing/terminal mode, find the single place that decides visibility") does
+not apply. The full chain, verified by reading each link:
+
+- `render_dock.go:386`: `legend := m.dockModeLegend()` — the only assignment;
+  drawn whenever it is non-empty and no live notification block holds the
+  right-hand end.
+- `dock_helpers.go:762`: `dockModeLegend()` returns nil **only** when the dock
+  plan lacks the `copy-help` component. The default plan
+  (`config/dock.go`, `defaultDockRight`) lists `copy-help`, so a session with
+  no `[dock]` table lets the legend through.
+- `modeLegend()`: `LegendOverride` sits at the very top, before any mode
+  checks, so it returns the k3 hints unconditionally — including in
+  typing/terminal mode, where upstream returns nil and shows nothing. This is
+  intended: `TYPING ctrl+g modes · alt+←→ focus · …` is spec line 60's
+  example strip.
+
+Conclusion: one hook (`LegendOverride`) fully controls visibility; no second
+hook was added, staying under the spec's budget of two upstream files.
+
+## Hook-functor consolidation (spec line 46)
+
+The spec requires `k3keys.Install()` to set **both** hooks. Initially
+`Install` set only `input.PreHandler` and `cmd/k3/main.go` set
+`app.LegendOverride` (a mistaken belief that k3keys could not import `app`).
+Fixed: `Install` now sets both and imports `overlay` only to convert
+`k3keys.Hint` → `overlay.Hint` at the boundary (k3keys' own `Hint` type stays
+pure for unit tests). `cmd/k3/main.go` is now just config load + `Install` +
+program start. Remaining boundary rule honored: `input` and `app` never
+import `k3keys`; stock `cmd/tuios` is untouched.

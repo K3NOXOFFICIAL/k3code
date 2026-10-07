@@ -49,19 +49,28 @@ if LegendOverride != nil {
 If `LegendOverride` is nil (stock tuios), the upstream legend renders exactly
 as before. The k3 binary replaces the hint strip with the mode's keymap hints.
 
+The legend is visible in every k3 mode, including typing/terminal mode: the
+default dock plan lists the `copy-help` component (`config/dock.go`'s
+`defaultDockRight`), which is the one that carries every mode's keys, so
+`dockModeLegend()` (`internal/app/dock_helpers.go`) lets the legend through,
+and `render_dock.go` draws it whenever `modeLegend()` returns non-nil. No
+separate visibility hook is needed — the single `LegendOverride` hook is
+sufficient.
+
 ## New files (no upstream impact)
 
 | Path | Purpose |
 |---|---|
 | `internal/k3keys/keymap.go` | Mode enum, default bindings table, `KeyState` state machine (`Handle`), `MergeBindings` |
 | `internal/k3keys/hints.go` | Pure-Go `Hint` type, per-mode hint strips, `ModeLabel` |
-| `internal/k3keys/hook.go` | `Install` — wires `input.PreHandler` to run actions via `input.RunActionByName` |
+| `internal/k3keys/hook.go` | `Install` — wires `input.PreHandler` and `app.LegendOverride`, running actions via `input.RunActionByName` |
 | `internal/k3keys/config.go` | TOML user overrides from `~/.config/k3/keys.toml` (`go-toml/v2`) |
 | `internal/k3keys/keymap_test.go` | Table tests for the state machine and hints |
-| `cmd/k3/main.go` | Entry point: loads config, installs hooks, sets `LegendOverride`, runs the TUI |
+| `cmd/k3/main.go` | Entry point: loads config, calls `k3keys.Install`, runs the TUI |
 
 ## Package boundary
 
-`internal/k3keys` is pure Go with respect to tuios core logic — it imports
-`app`/`input` only in `hook.go` (the seam) and never imports `overlay`.
-Conversion from `k3keys.Hint` to `overlay.Hint` happens in `cmd/k3/main.go`.
+`internal/k3keys` never imports `overlay`: conversion from `k3keys.Hint` to
+`overlay.Hint` happens in `hook.go`'s `Install`, at the package boundary.
+Per the spec, `Install` sets **both** hooks. `k3keys` imports `app` and
+`input` (only in `hook.go`); neither imports `k3keys`.

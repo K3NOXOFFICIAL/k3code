@@ -16,7 +16,7 @@ const (
 
 // Hints returns the hint slice to display for the given mode and lock state.
 // This returns k3keys.Hint (pure Go type) for unit testability.
-// The caller (cmd/k3/main.go) converts to overlay.Hint for the LegendOverride hook.
+// hook.go's Install converts to overlay.Hint for the LegendOverride hook.
 func Hints(mode Mode, locked bool) []Hint {
 	var hints []Hint
 

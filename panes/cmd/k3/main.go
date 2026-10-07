@@ -16,7 +16,6 @@ import (
 	"github.com/Gaurav-Gosain/tuios/internal/debuglog"
 	"github.com/Gaurav-Gosain/tuios/internal/input"
 	"github.com/Gaurav-Gosain/tuios/internal/k3keys"
-	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 	"github.com/Gaurav-Gosain/tuios/internal/terminal"
 )
 
@@ -41,7 +40,7 @@ func main() {
 	parsedBindings := k3keys.ParseUserBindings(userBindings)
 	bindings := k3keys.MergeBindings(parsedBindings)
 
-	// Install k3keys hooks
+	// Install the k3 keys and both hooks (key handling and legend).
 	k3keys.Install(k3state, bindings)
 
 	if cpuProfile != "" {
@@ -58,7 +57,7 @@ func main() {
 
 	startPprofServer()
 
-	if err := runLocal(k3state); err != nil {
+	if err := runLocal(); err != nil {
 		log.Fatalf("program error: %v", err)
 	}
 }
@@ -82,7 +81,7 @@ func loadAndApplyConfig() *config.UserConfig {
 	return userConfig
 }
 
-func runLocal(k3state *k3keys.KeyState) error {
+func runLocal() error {
 	if err := checkTerminal(); err != nil {
 		return err
 	}
@@ -118,20 +117,6 @@ func runLocal(k3state *k3keys.KeyState) error {
 	})
 	initialOS.PostRenderWriter = prw
 	initialOS.ConnectFrameWriter(prw)
-
-	// Now that OS is created, set the LegendOverride
-	app.LegendOverride = func(os *app.OS) []overlay.Hint {
-		k3hints := k3keys.Hints(k3state.Mode, k3state.Locked)
-		hints := make([]overlay.Hint, len(k3hints))
-		for i, h := range k3hints {
-			hints[i] = overlay.Hint{
-				Key:      h.Key,
-				Label:    h.Label,
-				Priority: overlay.HintPriority(h.Priority),
-			}
-		}
-		return hints
-	}
 
 	p := tea.NewProgram(initialOS, append(app.ProgramOptions(), tea.WithOutput(prw))...)
 	initialOS.BindProgram(p)

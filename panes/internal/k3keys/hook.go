@@ -7,11 +7,14 @@ import (
 
 	"github.com/Gaurav-Gosain/tuios/internal/app"
 	"github.com/Gaurav-Gosain/tuios/internal/input"
+	"github.com/Gaurav-Gosain/tuios/internal/overlay"
 )
 
-// Install sets up the k3keys PreHandler hook into tuios input package.
-// It sets the PreHandler on input. The LegendOverride on app must be set
-// separately by the caller (in cmd/k3/main.go) since k3keys doesn't import app.
+// Install sets up the k3keys hooks into tuios: both of them, per the spec.
+// input.PreHandler intercepts key events before tuios processes them;
+// app.LegendOverride replaces the dock's mode legend with the k3 keys of the
+// current mode. k3keys touches app and input, but neither may import k3keys
+// (the reason this lives on hook variables rather than calls).
 func Install(state *KeyState, bindings map[Mode]map[string]string) {
 	// PreHandler intercepts key events before tuios processes them
 	input.PreHandler = func(msg tea.Msg, o *app.OS) (bool, tea.Model, tea.Cmd) {
@@ -46,5 +49,21 @@ func Install(state *KeyState, bindings map[Mode]map[string]string) {
 			return true, o, tea.Batch(cmds...)
 		}
 		return true, o, nil
+	}
+
+	// LegendOverride replaces the dock's mode legend with the k3 keys of the
+	// current mode. The conversion to overlay.Hint happens here, at the
+	// package boundary; the pure-Go Hint type stays overlay-free.
+	app.LegendOverride = func(o *app.OS) []overlay.Hint {
+		k3hints := Hints(state.Mode, state.Locked)
+		hints := make([]overlay.Hint, len(k3hints))
+		for i, h := range k3hints {
+			hints[i] = overlay.Hint{
+				Key:      h.Key,
+				Label:    h.Label,
+				Priority: overlay.HintPriority(h.Priority),
+			}
+		}
+		return hints
 	}
 }
