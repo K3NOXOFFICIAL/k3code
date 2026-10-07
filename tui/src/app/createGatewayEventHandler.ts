@@ -29,6 +29,7 @@ import { applyGoalSnapshot } from './goalStatus.js'
 import type { GatewayEventHandlerContext, NoticeLevel } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { flashGoodVibes } from './petFlashStore.js'
+import { addProposal } from '../k3/proposalsStore.js'
 import { forgetServerRequest } from './serverRequestStore.js'
 import { turnController } from './turnController.js'
 import { getTurnState } from './turnStore.js'
@@ -1181,6 +1182,45 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         return
       }
+
+      case 'plan.show': {
+        const p = ev.payload
+
+        // Show the plan once when it is proposed (or finally rejected); the approved update only adds the verdict.
+        if (!p || (p.status === 'approved' && !p.advisor && !p.auto_approved)) {
+          return
+        }
+
+        const head = `plan (${p.scope}, risk ${p.risk}) — ${p.status}${p.auto_approved ? ' automatically' : ''}`
+        const body = p.status === 'proposed' ? `\n${p.plan}` : ''
+        const note = p.fanout_candidate ? '\nlarge task: parallel fan-out comes later; running sequentially' : ''
+        const critique = p.advisor ? `\nadvisor: ${p.advisor}` : ''
+
+        sys(`${head}${body}${note}${critique}`)
+
+        return
+      }
+
+      case 'proposal.show':
+        if (ev.payload) {
+          addProposal(ev.payload)
+        }
+
+        return
+
+      case 'scope.verdict':
+        if (ev.payload) {
+          sys(`scope: ${ev.payload.scope}, risk ${ev.payload.risk}${ev.payload.needs_plan ? ', plan first' : ''}`)
+        }
+
+        return
+
+      case 'routing.escalated':
+        if (ev.payload) {
+          sys(`escalated ${ev.payload.task_kind}: ${ev.payload.from} → ${ev.payload.to} (${ev.payload.reason})`)
+        }
+
+        return
 
       case 'background.complete':
         if (!ev.payload) {

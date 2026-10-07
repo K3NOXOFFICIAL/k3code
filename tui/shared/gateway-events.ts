@@ -28,7 +28,24 @@ export interface ClientLocalGatewayEventMap {
   'gateway.stderr': { line: string }
 }
 
-export interface GatewayEventMap extends BackendGatewayEventMap, ClientLocalGatewayEventMap {}
+/** k3code autonomy events (M4a). The Python gateway is not the generated Hermes contract, so these are declared here. */
+export interface K3GatewayEventMap {
+  'plan.show': {
+    advisor?: string
+    auto_approved?: boolean
+    fanout_candidate?: boolean
+    plan: string
+    plan_id: string
+    risk: string
+    scope: string
+    status: 'approved' | 'proposed' | 'rejected'
+  }
+  'proposal.show': { action: string; id: string; kind: 'also_setup' | 'consequence' | 'improvement'; text: string }
+  'routing.escalated': { from: string; reason: string; task_kind: string; to: string }
+  'scope.verdict': { fanout_candidate?: boolean; needs_plan: boolean; reason: string; risk: string; scope: string; source: string }
+}
+
+export interface GatewayEventMap extends BackendGatewayEventMap, ClientLocalGatewayEventMap, K3GatewayEventMap {}
 
 export type GatewayEventName = keyof GatewayEventMap
 
