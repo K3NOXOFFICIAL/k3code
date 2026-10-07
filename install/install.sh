@@ -27,7 +27,22 @@ GO_VER="${K3_GO_VERSION:-1.26.6}"
 
 FROM_SOURCE=0 BUNDLE="" CHANNEL=stable WANT_VERSION="" YES=0 SETUP=1 ACTIVATE=1 PRINT_VERSION=0
 
-log() { printf '%s\n' "k3code-install: $*" >&2; }
+# Install log: everything `log` prints is also appended here, and a failure prints where to look.
+INSTALL_LOG="${K3_INSTALL_LOG:-$DATA/install.log}"
+mkdir -p "$(dirname "$INSTALL_LOG")" 2>/dev/null || true
+printf '\n==== %s install start (args: %s) ====\n' "$(date '+%F %T')" "$*" >>"$INSTALL_LOG" 2>/dev/null || true
+log() {
+  printf '%s\n' "k3code-install: $*" >&2
+  printf '%s\n' "k3code-install: $*" >>"$INSTALL_LOG" 2>/dev/null || true
+}
+on_exit() {
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '%s\n' "k3code-install: FAILED (exit $rc). Log: $INSTALL_LOG" >&2
+    printf '%s\n' "==== failed with exit $rc ====" >>"$INSTALL_LOG" 2>/dev/null || true
+  fi
+}
+trap on_exit EXIT
 die() { log "ERROR: $*"; exit 1; }
 
 usage() { sed -n '2,19p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0; }
@@ -216,7 +231,7 @@ if [ -f "$VERDIR/.complete" ]; then
 else
   log "installing version $VER into $VERDIR"
   rm -rf "$VERDIR"; mkdir -p "$VERDIR"
-  trap 'rm -rf "$VERDIR" ; [ -z "$DL" ] || rm -rf "$DL"' EXIT INT TERM
+  trap 'on_exit; rm -rf "$VERDIR" ; [ -z "$DL" ] || rm -rf "$DL"' EXIT INT TERM
   if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: fake core, no pip
     mkdir -p "$VERDIR/venv/bin"
     printf '#!/bin/sh\necho "k3code %s"\n' "$VER" >"$VERDIR/venv/bin/k3code"; chmod +x "$VERDIR/venv/bin/k3code"
@@ -247,7 +262,8 @@ else
     rm -rf "$DL"
   fi
   printf '%s\n' "$VER" >"$VERDIR/.complete"
-  trap - EXIT INT TERM
+  trap on_exit EXIT
+  trap - INT TERM
 fi
 
 if [ "$ACTIVATE" = 1 ]; then

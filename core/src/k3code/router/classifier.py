@@ -97,6 +97,7 @@ _QUOTA_PATTERNS = (
     "budget limit exceeded", "hard billing limit",
     "model_not_supported_on_free_tier", "not available on the free tier",
     "key limit exceeded", "spending limit",
+    "reached its daily usage quota", "daily usage quota", "usage quota",  # OmniRoute per-key quota (HTTP 400/429)
 )
 
 _QUOTA_ERROR_CODES = frozenset({
@@ -106,7 +107,7 @@ _QUOTA_ERROR_CODES = frozenset({
     "personal-team-blocked:spending-limit",
     "credit_balance_exhausted", "organization_spend_limit_exceeded",
     "organization_usage_limit_exceeded", "project_spend_limit_exceeded",
-    "insufficient_credits_for_paid_model",
+    "insufficient_credits_for_paid_model", "usage_limit_exceeded",
 })
 
 _RATE_LIMIT_PATTERNS = (

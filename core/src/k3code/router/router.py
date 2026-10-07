@@ -214,6 +214,7 @@ class Router:
         temperature: float | None,
     ) -> AsyncIterator[StreamEvent]:
         last_reason: FailoverReason | None = None
+        last_detail = ""
         all_network = True  # tracks "every failure so far was a network failure"
         entry_index = 0
         while entry_index < len(self.chain):
@@ -223,7 +224,10 @@ class Router:
             if skip_reason is not None:
                 logger.debug(
                     "skipping %s/%s: cooldown %.0fs remaining (%s)",
-                    entry.provider_name, entry.model, skip_reason, "cooldown",
+                    entry.provider_name,
+                    entry.model,
+                    skip_reason,
+                    "cooldown",
                 )
                 cooled = self.cooldowns.reason_of(
                     provider=entry.provider_name, model=entry.model, base_url=entry.base_url
@@ -246,14 +250,20 @@ class Router:
                 except Exception as exc:  # noqa: BLE001 - classified below
                     classified = classify_api_error(exc, provider=entry.provider_name, model=target_model)
                     last_reason = classified.reason
+                    last_detail = summarize(exc)
                     all_network = all_network and classified.reason is FailoverReason.network
                     if classified.reason is FailoverReason.context_overflow:
                         raise ContextOverflow(summarize(exc, limit=500)) from exc
                     cooldown = self._cooldown_seconds(classified)
                     if cooldown is not None or classified.immediate_failover:
                         self._failover(
-                            entry, target_model, classified.reason, attempt, exc,
-                            entry_index=entry_index, retry_after=cooldown,
+                            entry,
+                            target_model,
+                            classified.reason,
+                            attempt,
+                            exc,
+                            entry_index=entry_index,
+                            retry_after=cooldown,
                         )
                         break
                     # retryable: same entry with backoff, max_retries times, then fail over
@@ -264,7 +274,12 @@ class Router:
                     delay = self._backoff_for(classified, attempt)
                     logger.info(
                         "retry %d/%d on %s/%s in %.1fs (%s)",
-                        attempt, self.max_retries, entry.provider_name, target_model, delay, classified.reason.value,
+                        attempt,
+                        self.max_retries,
+                        entry.provider_name,
+                        target_model,
+                        delay,
+                        classified.reason.value,
                     )
                     self._emit(
                         "router.retry",
@@ -289,9 +304,14 @@ class Router:
             clock = time.strftime("%H:%M", time.localtime(until))
             raise ChainExhausted(
                 f"all providers rate-limited until {clock} ({reason_name})",
-                last_reason=reason_name, retry_after=wait, until=until,
+                last_reason=reason_name,
+                retry_after=wait,
+                until=until,
             )
-        raise ChainExhausted(f"all provider entries failed (last reason: {reason_name})", last_reason=reason_name)
+        detail = f": {last_detail}" if last_detail else ""
+        raise ChainExhausted(
+            f"all provider entries failed (last reason: {reason_name}){detail}", last_reason=reason_name
+        )
 
     # ── helpers ──
 
@@ -310,9 +330,7 @@ class Router:
             return None
         remaining = []
         for entry in self.chain:
-            if not self.cooldowns.in_cooldown(
-                provider=entry.provider_name, model=entry.model, base_url=entry.base_url
-            ):
+            if not self.cooldowns.in_cooldown(provider=entry.provider_name, model=entry.model, base_url=entry.base_url):
                 return None
             remaining.append(
                 self.cooldowns.remaining_seconds(
@@ -358,7 +376,10 @@ class Router:
         )
         if retry_after is not None and armed:
             self._emit(
-                "router.cooldown", entry, attempt=attempt + 1, reason=reason.value,
+                "router.cooldown",
+                entry,
+                attempt=attempt + 1,
+                reason=reason.value,
                 detail=f"cooling down {armed:.0f}s: {summarize(exc)}",
                 extra={"seconds": armed, "until": self.cooldowns.wall() + armed},
             )

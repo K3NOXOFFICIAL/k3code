@@ -185,8 +185,14 @@ def load_config(
 
     # Expand provider api_key_env -> api_key (api_key_env is a required field on
     # ProviderEntry, so look it up without popping it out of the dict).
+    # The process environment wins; otherwise fall back to the env file the setup wizard
+    # writes (~/.config/k3code/env), so a key stored there also works outside systemd.
+    from k3code.setup.state import read_env_file
+
+    file_env = read_env_file()
     for p in merged.get("providers", []):
-        p["api_key"] = os.environ.get(p.get("api_key_env", ""), "")
+        name = p.get("api_key_env", "")
+        p["api_key"] = os.environ.get(name) or file_env.get(name, "")
 
     return Settings(**merged)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,8 +16,9 @@ from k3code.paths import home
 from k3code.permissions.hardline import HARDLINE_PATTERNS
 from k3code.setup import detect, probe
 from k3code.setup.prompter import Prompter
-from k3code.setup.state import env_file_path, set_env_var
+from k3code.setup.state import env_file_path, read_env_file, set_env_var
 
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TIERS = ("main", "strong", "cheap", "fast")
 PERMISSION_MODES = ["ask", "auto-edit", "yolo"]
 USES = ["coding", "ops", "research", "mixed"]
@@ -137,11 +139,34 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
         spec = {"preset": preset}
         base = probe.PRESETS[preset]
         spec["base_url"] = c.p.text(f"providers.base_url{idx}", "Base URL", base["base_url"])
-        spec["api_key_env"] = c.p.text(f"providers.env{idx}", "API key env var name", base["api_key_env"])
-        if not os.environ.get(spec["api_key_env"]) and c.p.confirm(
-            f"providers.has_key{idx}", f"Enter a value for {spec['api_key_env']} now (stored 0600)?", True
-        ):
-            spec["api_key"] = c.p.text(f"providers.key{idx}", "API key", secret=True)
+        # Ask for the key itself first: pasting it is what most people mean. It is stored in the
+        # 0600 env file under the preset's variable name; the config only ever names the variable.
+        key = c.p.text(
+            f"providers.key{idx}",
+            f"API key for {preset} (paste it; hidden, stored 0600 in {env_file_path()}). "
+            "Leave empty to use an environment variable",
+            "",
+            secret=True,
+        )
+        spec["api_key_env"] = base["api_key_env"]
+        if key.strip():
+            spec["api_key"] = key.strip()
+        else:
+            while True:
+                name = c.p.text(
+                    f"providers.env{idx}",
+                    "Name of the environment variable that holds the key (letters, digits, _; e.g. OMNIROUTE_API_KEY)",
+                    base["api_key_env"],
+                ).strip()
+                if _ENV_NAME.match(name):
+                    spec["api_key_env"] = name
+                    break
+                c.say(
+                    f"  '{name}' is not a valid environment variable name (no '-' or spaces). "
+                    "Enter the variable NAME, not the key."
+                )
+            if not os.environ.get(spec["api_key_env"]) and not read_env_file().get(spec["api_key_env"]):
+                c.say(f"  NOTE: {spec['api_key_env']} is not set yet. Export it, or add it to {env_file_path()}.")
     base = probe.PRESETS.get(spec.get("preset", ""), {})
     entry = {
         "name": spec.get("name") or spec.get("preset") or f"provider{idx + 1}",

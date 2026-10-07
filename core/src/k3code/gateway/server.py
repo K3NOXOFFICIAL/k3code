@@ -283,7 +283,10 @@ class GatewayServer:
         #: (provider, model) of the most recent router attempt on any task (side calls read it).
         self.last_attempt: tuple[str, str] = ("", "")
         self.model_caller = ModelCaller(
-            self.tier_routers, self.config, self.usage, emit=lambda t, p: self.emit(t, p),
+            self.tier_routers,
+            self.config,
+            self.usage,
+            emit=lambda t, p: self.emit(t, p),
             last_attempt=lambda: self.last_attempt,
         )
         self.autonomy = PlanFirst(self)
@@ -364,7 +367,8 @@ class GatewayServer:
                 return  # already answered in the pane
             self._resolve_server_request(req_id, {"result": result})
             cancel = encode_server_request(
-                "request.cancel", {"id": req_id, "method": method, "reason": "answered in the Inbox"})
+                "request.cancel", {"id": req_id, "method": method, "reason": "answered in the Inbox"}
+            )
             for c in self.clients:
                 if c.session_id == sid and c is self._stdio_client:
                     self._send(c, cancel)
@@ -412,8 +416,13 @@ class GatewayServer:
         """Send a server→client event frame (and remember it for ``/debug``)."""
         payload = payload or {}
         sess = session or _ctx_session.get()
-        record = {"ts": time.time(), "type": event_type, "session": sess.session_id if sess else None,
-                  "importance": importance, "payload": payload}
+        record = {
+            "ts": time.time(),
+            "type": event_type,
+            "session": sess.session_id if sess else None,
+            "importance": importance,
+            "payload": payload,
+        }
         self.event_log.append(record)
         if self.debug:
             logger.info("event %s", json.dumps({k: v for k, v in record.items() if k != "ts"}, default=str)[:2000])
@@ -577,10 +586,20 @@ class GatewayServer:
                 continue
             rows.append(
                 {
-                    "current": False, "id": h.id, "last_active": h.started_at, "message_count": h.tool_count,
-                    "model": h.model or h.tier, "preview": h.description[:120], "session_key": h.id,
-                    "started_at": h.started_at, "status": h.status, "state": h.status, "paused": False,
-                    "background": True, "origin": "subagent", "parent_id": h.parent_sid,
+                    "current": False,
+                    "id": h.id,
+                    "last_active": h.started_at,
+                    "message_count": h.tool_count,
+                    "model": h.model or h.tier,
+                    "preview": h.description[:120],
+                    "session_key": h.id,
+                    "started_at": h.started_at,
+                    "status": h.status,
+                    "state": h.status,
+                    "paused": False,
+                    "background": True,
+                    "origin": "subagent",
+                    "parent_id": h.parent_sid,
                     "title": h.description[:60] or "Sub-agent",
                 }
             )
@@ -705,9 +724,7 @@ class GatewayServer:
                 {"text": "Request cancelled", "level": "info", "kind": "info", "key": req_id},
                 session=live,
             )
-            cancel = encode_server_request(
-                "request.cancel", {"id": req_id, "method": method, "reason": "interrupted"}
-            )
+            cancel = encode_server_request("request.cancel", {"id": req_id, "method": method, "reason": "interrupted"})
             for client in self.clients:
                 if client.session_id == session_id:
                     self._send(client, cancel)
@@ -872,8 +889,14 @@ class GatewayServer:
             self.automation.session_event(session.session_id, status, str(session.stored.meta.get("origin") or ""))
 
     def _build_loop(
-        self, session: LiveSession, reliability: Reliability, router: Router, kind: TaskKind, approval: Any,
-        *, max_tool_errors: int = 0,
+        self,
+        session: LiveSession,
+        reliability: Reliability,
+        router: Router,
+        kind: TaskKind,
+        approval: Any,
+        *,
+        max_tool_errors: int = 0,
     ) -> AgentLoop:
         loop = AgentLoop(
             router,
@@ -923,8 +946,10 @@ class GatewayServer:
         approval = await self._approval_callback_for(session)
 
         # M4a: which tier runs this turn; cheap/fast tiers escalate when the attempt stalls.
-        kind = TaskKind(session.task_kind) if session.task_kind and session.background else (
-            TaskKind.BACKGROUND_TURN if session.background else TaskKind.INTERACTIVE_TURN
+        kind = (
+            TaskKind(session.task_kind)
+            if session.task_kind and session.background
+            else (TaskKind.BACKGROUND_TURN if session.background else TaskKind.INTERACTIVE_TURN)
         )
         tier = tier_for(kind, self.config.task_tiers)
         cheap_start = tier in (Tier.FAST, Tier.CHEAP)
@@ -937,8 +962,9 @@ class GatewayServer:
         error: str | None = None
         status = "done"
         gate = GateResult(prompt=text)
-        loop = self._build_loop(session, reliability, self.tier_routers().get(tier), kind, approval,
-                                max_tool_errors=max_errors)
+        loop = self._build_loop(
+            session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
+        )
         session.loop = loop
 
         async def on_text_delta(chunk: str) -> None:
@@ -965,7 +991,8 @@ class GatewayServer:
                 if fan is not None and fan.ok:
                     gate.proceed, gate.message = False, fan.summary()
                     session.stored.messages = [
-                        *session.stored.messages, {"role": "user", "content": text},
+                        *session.stored.messages,
+                        {"role": "user", "content": text},
                         {"role": "assistant", "content": gate.message},
                     ]
                     self.store.save(session.stored)
@@ -999,8 +1026,9 @@ class GatewayServer:
                     f"The previous attempt stalled ({reason}). Continue the task from where it left off, "
                     "with a different approach if needed."
                 )
-                loop = self._build_loop(session, reliability, self.tier_routers().get(tier), kind, approval,
-                                        max_tool_errors=max_errors)
+                loop = self._build_loop(
+                    session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
+                )
                 loop.on_text_delta = on_text_delta
                 session.loop = loop
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
@@ -1051,8 +1079,13 @@ class GatewayServer:
 
         session.emit(
             "message.complete",
-            {"text": final_text, "usage": _usage_payload(usage), "status": status, "error": error,
-             "state": session.state},
+            {
+                "text": final_text,
+                "usage": _usage_payload(usage),
+                "status": status,
+                "error": error,
+                "state": session.state,
+            },
         )
         session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
         if status == "done" and not session.stored.title and autonomy_cfg(self.config)["auto_title"]:
@@ -1176,9 +1209,17 @@ class GatewayServer:
             choice = str(result.get("choice", "deny")).lower()
             target = {"once": "default", "session": "accept-edits"}.get(choice)
             self.learning.record(
-                "plan", session, subject="exit_plan", choice=choice,
-                detail={"has_verification": _has_verification(plan), "edited": bool(result.get("edited")),
-                        "risk": "", "plan_len": len(plan)})
+                "plan",
+                session,
+                subject="exit_plan",
+                choice=choice,
+                detail={
+                    "has_verification": _has_verification(plan),
+                    "edited": bool(result.get("edited")),
+                    "risk": "",
+                    "plan_len": len(plan),
+                },
+            )
             if target:
                 session.set_mode(PermissionMode(target))
             return target
@@ -1259,7 +1300,11 @@ class GatewayServer:
 
         async def complete(system: str, user: str) -> str:
             return await self.oneshot(
-                system, user, model_key=explicit, kind=TaskKind.GOAL_JUDGE, session_id=session.session_id,
+                system,
+                user,
+                model_key=explicit,
+                kind=TaskKind.GOAL_JUDGE,
+                session_id=session.session_id,
                 max_tokens=512,
             )
 
@@ -1273,7 +1318,9 @@ class GatewayServer:
 
         async def review(goal: str) -> tuple[bool, list[str]]:
             ctx = await advisor.condensed_context(
-                self.model_caller, session.stored.messages, threshold=int(cfg["advisor_compact_chars"]),
+                self.model_caller,
+                session.stored.messages,
+                threshold=int(cfg["advisor_compact_chars"]),
                 session_id=session.session_id,
             )
             return await advisor.review_done(self.model_caller, goal, ctx, session_id=session.session_id)
@@ -1321,9 +1368,13 @@ class GatewayServer:
         except (asyncio.CancelledError, RuntimeError):
             return False
         approved = str(result.get("choice", "deny")).lower() == "once"
-        self.learning.record("plan", session, subject="confirm", choice="approved" if approved else "rejected",
-                             detail={"has_verification": _has_verification(plan), "risk": risk,
-                                     "edited": bool(result.get("edited"))})
+        self.learning.record(
+            "plan",
+            session,
+            subject="confirm",
+            choice="approved" if approved else "rejected",
+            detail={"has_verification": _has_verification(plan), "risk": risk, "edited": bool(result.get("edited"))},
+        )
         return approved
 
     # ── commands ──────────────────────────────────────────────────────
@@ -1364,11 +1415,14 @@ class GatewayServer:
                 self.subagents.interrupt_session(session.session_id)  # nothing may outlive the job
             session.emit("message.delta", {"text": text})
             session.stored.messages = [
-                *session.stored.messages, {"role": "user", "content": label}, {"role": "assistant", "content": text},
+                *session.stored.messages,
+                {"role": "user", "content": label},
+                {"role": "assistant", "content": text},
             ]
             self.store.save(session.stored)
-            session.emit("message.complete", {"text": text, "usage": {}, "status": status, "error": None,
-                                              "state": session.state})
+            session.emit(
+                "message.complete", {"text": text, "usage": {}, "status": status, "error": None, "state": session.state}
+            )
             session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
 
         session.turn_task = asyncio.get_running_loop().create_task(runner())
@@ -1377,8 +1431,11 @@ class GatewayServer:
 
     def _fresh_session_like(self, src: LiveSession, *, background: bool = False) -> LiveSession:
         """A new session with ``src``'s cwd, model, permission mode and add-dirs."""
-        stored = self.store.create(model=src.stored.model or self.config.default_model,
-                                   provider=src.stored.provider or "", cwd=src.stored.cwd or str(Path.cwd()))
+        stored = self.store.create(
+            model=src.stored.model or self.config.default_model,
+            provider=src.stored.provider or "",
+            cwd=src.stored.cwd or str(Path.cwd()),
+        )
         stored.meta["mode"] = src.perms.mode.value
         stored.meta["add_dirs"] = list(src.perms.add_dirs)
         if background:
@@ -1435,14 +1492,22 @@ class GatewayServer:
                 last = next((m.get("content") for m in reversed(live.messages) if m.get("role") == "assistant"), "")
                 text, level = f"Background session '{title}' finished. {str(last or '')[:160]}".strip(), "info"
             target = self.live.get(notify_sid)
-            payload = {"text": text, "level": level, "kind": "background", "key": f"bg-{live.session_id}",
-                       "session_id": live.session_id}
+            payload = {
+                "text": text,
+                "level": level,
+                "kind": "background",
+                "key": f"bg-{live.session_id}",
+                "session_id": live.session_id,
+            }
             if target is not None:
                 target.emit("notification.show", payload, importance="essential")
             else:
                 self.emit("notification.show", payload, importance="essential")
-            self.emit("session.background_done", {"session_id": live.session_id, "state": live.state,
-                                                  "origin_session": notify_sid}, importance="essential")
+            self.emit(
+                "session.background_done",
+                {"session_id": live.session_id, "state": live.state, "origin_session": notify_sid},
+                importance="essential",
+            )
 
         task.add_done_callback(done)
 
@@ -1743,16 +1808,28 @@ async def _prompt_background(server: GatewayServer, params: dict[str, Any]) -> d
     if not session.streaming or session.turn_task is None or session.turn_task.done():
         raise _InvalidParams("nothing is running in this session; give a prompt: /bg <prompt>")
     fresh = server.background_current(session, _ctx_client.get())
-    return {"session_id": session.session_id, "new_session_id": fresh.session_id, "status": "backgrounded",
-            "info": fresh.live_info()}
+    return {
+        "session_id": session.session_id,
+        "new_session_id": fresh.session_id,
+        "status": "backgrounded",
+        "info": fresh.live_info(),
+    }
 
 
 async def _subagent_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     sid = params.get("session_id") or (server.session.session_id if server.session else "")
     rows = [
-        {"subagent_id": h.id, "parent_id": h.parent_child_id, "depth": h.depth - 1, "goal": h.description,
-         "model": h.model or h.tier, "started_at": h.started_at, "status": h.status, "tool_count": h.tool_count,
-         "last_tool": h.last_tool}
+        {
+            "subagent_id": h.id,
+            "parent_id": h.parent_child_id,
+            "depth": h.depth - 1,
+            "goal": h.description,
+            "model": h.model or h.tier,
+            "started_at": h.started_at,
+            "status": h.status,
+            "tool_count": h.tool_count,
+            "last_tool": h.last_tool,
+        }
         for h in server.subagents.for_session(sid)
     ]
     return {"subagents": rows, "delegations": []}
@@ -1898,6 +1975,75 @@ async def _system_battery(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"available": False}
 
 
+def _session_dir(server: GatewayServer, params: dict[str, Any]) -> Path:
+    """The directory completions resolve against: the session's cwd, else the process cwd."""
+    try:
+        live = server.live.get(params.get("session_id")) if params.get("session_id") else None
+        if live is not None and getattr(live.stored, "cwd", ""):
+            return Path(live.stored.cwd)
+    except Exception:  # noqa: BLE001 - completion must never fail the composer
+        pass
+    return Path.cwd()
+
+
+async def _complete_slash(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Slash-command completion for the composer; ``text`` is the input, starting with ``/``."""
+    text = str(params.get("text", ""))
+    if not text.startswith("/") or " " in text:
+        return {"items": [], "replace_from": 1}
+    prefix = text[1:].lower()
+    items: list[dict[str, str]] = []
+    for name in server.commands.names():
+        if name.lower().startswith(prefix):
+            cmd = server.commands.get(name)
+            items.append(
+                {"text": f"/{name}", "display": f"/{name}", "meta": (cmd.help if cmd else "") or "", "kind": "command"}
+            )
+    try:  # skills are offered too (kind="skill"); best effort
+        from k3code.skills import discover
+
+        for sk in discover(_session_dir(server, params), getattr(server.config.skills, "roots", None)):
+            if sk.name.lower().startswith(prefix):
+                items.append(
+                    {"text": f"/{sk.name}", "display": f"/{sk.name}", "meta": sk.description or "", "kind": "skill"}
+                )
+    except Exception:  # noqa: BLE001 - skills are optional
+        pass
+    return {"items": items[:50], "replace_from": 1}
+
+
+async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Path completion for ``@file`` / ``./x`` words, relative to the session's directory."""
+    word = str(params.get("word", ""))
+    raw = word.lstrip("@")
+    expanded = Path(raw).expanduser()
+    directory = expanded if raw.endswith("/") else expanded.parent
+    if not directory.is_absolute():
+        directory = _session_dir(server, params) / directory
+    stem = "" if raw.endswith("/") else expanded.name
+    items: list[dict[str, str]] = []
+    try:
+        for entry in sorted(directory.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+            if entry.name.startswith(".") and not stem.startswith("."):
+                continue
+            if not entry.name.lower().startswith(stem.lower()):
+                continue
+            shown = raw[: len(raw) - len(stem)] + entry.name + ("/" if entry.is_dir() else "")
+            items.append(
+                {
+                    "text": ("@" if word.startswith("@") else "") + shown,
+                    "display": shown,
+                    "meta": "dir" if entry.is_dir() else "file",
+                    "kind": "path",
+                }
+            )
+            if len(items) >= 50:
+                break
+    except OSError:
+        pass
+    return {"items": items}
+
+
 _HANDLERS: dict[str, Any] = {
     "session.create": _session_create,
     "session.list": _session_list,
@@ -1931,6 +2077,8 @@ _HANDLERS: dict[str, Any] = {
     "input.detect_drop": _input_detect_drop,
     "command.dispatch": _command_dispatch,
     "slash.exec": _slash_exec,
+    "complete.slash": _complete_slash,
+    "complete.path": _complete_path,
     "model.options": _model_options,
     "model.save_key": _model_save_key,
     "model.disconnect": _model_disconnect,

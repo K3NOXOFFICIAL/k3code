@@ -63,6 +63,13 @@ def redact(value: str | None) -> str:
 
 def request_headers(kind: str, api_key: str, *, anthropic_beta: str | None = None) -> dict[str, str]:
     """Headers for one API call. The key goes only here — never into logs."""
+    if not api_key.strip():
+        raise ProviderError(
+            "No API key configured for this provider: its api_key_env variable is empty. "
+            "Run `k3code setup --step providers`, or put KEY=value in ~/.config/k3code/env. "
+            "`k3code doctor` shows which variable is missing.",
+            status_code=401,
+        )
     if kind == "anthropic":
         headers = {
             "x-api-key": api_key,

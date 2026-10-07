@@ -30,8 +30,8 @@ def run(home: Path, script: Path, *args: str) -> subprocess.CompletedProcess[str
 def snapshot(home: Path) -> dict[str, tuple[float, str]]:
     out = {}
     for p in sorted(home.rglob("*")):
-        if ".k3code" in p.parts:
-            continue  # doctor may touch its own home dir
+        if ".k3code" in p.parts or p.name == "install.log":
+            continue  # doctor may touch its own home dir; the install log grows on every run by design
         out[str(p.relative_to(home))] = (p.lstat().st_mtime_ns, os.readlink(p) if p.is_symlink() else "")
     return out
 
