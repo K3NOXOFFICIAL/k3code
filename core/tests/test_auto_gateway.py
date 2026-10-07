@@ -208,3 +208,12 @@ def test_gate_unattended_option(tmp_path, monkeypatch):
     assert pf.gate_applies(s) is False
     server.config.autonomy = {"gate_unattended": True}
     assert pf.gate_applies(s) is True
+
+
+async def test_stats_command_with_days_filter(tmp_path, monkeypatch):
+    server, provider = make_server(tmp_path, monkeypatch, ["ok"])
+    sid = await new_session(server, tmp_path)
+    server.usage.record("call", session=sid, provider="p", model="m", tier="cheap", task_kind="cron_job")
+    out = await cmd(server, "/stats day 7", sid)
+    assert "cron_job" in out["output"] and "cheap" in out["output"]
+    assert server.usage.aggregate("session", days=1)

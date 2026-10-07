@@ -112,7 +112,7 @@ class UsageDB:
             sql += " WHERE " + " AND ".join(where)
         groups: dict[str, dict[str, Any]] = {}
         calls: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        rows = self._db.execute(sql + " ORDER BY ts")
+        rows = self._db.execute(sql + " ORDER BY ts", args)
         for ts, day, sess, kind, provider, model, t_in, t_out, cost, secs, tier, task_kind in rows:
             key = day if by == "day" else sess
             g = groups.setdefault(
