@@ -69,12 +69,36 @@ class AgentLoop:
         model: str | None = None,
         max_tokens: int = 8192,
         temperature: float | None = None,
+        resume: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         """Run the agent loop, yielding stream events."""
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
             Message(role="user", content=user_prompt),
         ]
+        if resume:
+            # M2: continue a crashed session from its persisted transcript.
+            saved = self.reliability.load_transcript()
+            if saved:
+                messages = saved
+                answered = {m.tool_call_id for m in messages if m.role == "tool"}
+                last = messages[-1]
+                open_calls = (
+                    [c for c in last.tool_calls if c.id not in answered]
+                    if last.role == "assistant" else []
+                )
+                for tc in open_calls:
+                    # Side-effect tools with an intent but no done are NOT re-run.
+                    result = self.reliability.interrupted_for(tc) or await self._execute_tool(tc)
+                    tool_msg = Message(
+                        role="tool", content=result.get("content") if "content" in result else str(result),
+                        tool_call_id=tc.id, name=tc.name,
+                    )
+                    messages.append(tool_msg)
+                    yield StreamEvent(type="done", message=tool_msg)
+                if not open_calls and last.role != "tool":
+                    messages.append(Message(role="user", content=user_prompt))
+        self.reliability.save_transcript(messages)
 
         for turn in range(self.max_turns):
             logger.info("Turn %d/%d", turn + 1, self.max_turns)
@@ -112,6 +136,7 @@ class AgentLoop:
 
             if final_message:
                 messages.append(final_message)
+                self.reliability.save_transcript(messages)
                 # The final message's tool_calls is the authoritative list (see note
                 # above); prefer it over whatever was accumulated from live events.
                 if final_message.tool_calls:
@@ -141,6 +166,7 @@ class AgentLoop:
                     name=tc.name,
                 )
                 messages.append(tool_msg)
+                self.reliability.save_transcript(messages)
                 # Yield the tool result as a stream event
                 yield StreamEvent(type="done", message=tool_msg)
 

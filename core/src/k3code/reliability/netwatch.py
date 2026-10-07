@@ -202,7 +202,7 @@ async def default_internet_probe(config: NetWatchConfig) -> InternetProbeResult:
         )
         if captive:
             return InternetProbeResult(ok=False, latency_ms=latency, captive=True)
-        return InternetProbeResult(ok=status in (200, 204), latency_ms=latency, captive=False)
+        return InternetProbeResult(ok=status < 500, latency_ms=latency, captive=False)
     except Exception:
         pass
     # HTTP failed: try raw TCP
@@ -214,7 +214,9 @@ async def default_internet_probe(config: NetWatchConfig) -> InternetProbeResult:
 
 
 def _default_provider_probe(base_url: str, timeout: float) -> Awaitable[ProbeHTTPStatus]:
-    return http_probe(base_url.rstrip("/") + "/v1/models", timeout)
+    base = base_url.rstrip("/")
+    # Provider base URLs usually already end in /v1 (OpenAI-compatible).
+    return http_probe(base + ("/models" if base.endswith("/v1") else "/v1/models"), timeout)
 
 
 async def default_nm_probe() -> str | None:

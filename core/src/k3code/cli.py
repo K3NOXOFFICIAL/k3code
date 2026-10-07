@@ -76,7 +76,7 @@ def _build_reliability(config: Any, session: str) -> Reliability:
     flags_raw = raw.pop("flags", None)
     flags = ReliabilityFlags(**flags_raw) if isinstance(flags_raw, dict) else None
     known = {"enabled", "flags", "max_wait", "max_park_seconds",
-             "session_tokens", "session_usd", "day_tokens", "day_usd"}
+             "session_tokens", "session_usd", "day_tokens", "day_usd", "netwatch"}
     settings = ReliabilitySettings(flags=flags) if flags else ReliabilitySettings()
     for key in known & set(raw):
         setattr(settings, key, raw[key])
@@ -90,6 +90,8 @@ async def _run_headless(
     permission_mode: PermissionMode,
     config: Any,
     json_output: bool,
+    session: str = "headless",
+    resume: bool = False,
 ) -> dict[str, Any] | None:
     """Run headless mode and return final result dict."""
     system_prompt = _load_system_prompt()
@@ -100,7 +102,7 @@ async def _run_headless(
     router = Router(chain, cooldowns=cooldowns, on_event=_print_event)
 
     # M2: reliability bundle (netwatch, persistent retry, journal, guards).
-    reliability = _build_reliability(config, session="headless")
+    reliability = _build_reliability(config, session=session)
     reliability.register_providers(chain)
 
     loop = AgentLoop(
@@ -112,6 +114,7 @@ async def _run_headless(
         on_event=_print_event,
         cwd=Path.cwd(),
         reliability=reliability,
+        session=session,
     )
 
     final_text = ""
@@ -128,7 +131,9 @@ async def _run_headless(
 
     try:
         await reliability.start()
-        async for _ in loop.run(prompt, model=model, max_tokens=config.max_tokens, temperature=config.temperature):
+        async for _ in loop.run(
+            prompt, model=model, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume
+        ):
             pass
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
@@ -259,12 +264,16 @@ async def _run_repl(
     help="Permission mode (default: ask)",
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
+@click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
+@click.option("--resume", is_flag=True, help="Resume the session's saved transcript after a crash (headless)")
 @click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
 def main(
     prompt: str | None,
     model: str | None,
     permission: str,
     json_output: bool,
+    session: str,
+    resume: bool,
     config_dir: Path | None,
 ) -> None:
     """k3code — terminal coding agent.
@@ -286,7 +295,8 @@ def main(
     if prompt:
         result = asyncio.run(
             _run_headless(
-                prompt, model=model, permission_mode=permission_mode, config=config, json_output=json_output
+                prompt, model=model, permission_mode=permission_mode, config=config, json_output=json_output,
+                session=session, resume=resume,
             )
         )
         if json_output and result:

@@ -12,7 +12,9 @@ has, using the ``reliability.*`` / ``net.state`` kinds from
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,6 +56,10 @@ class ReliabilitySettings:
     session_usd: float | None = None
     day_tokens: int | None = None
     day_usd: float | None = None
+    # Raw NetWatchConfig overrides (e.g. http_probe_url/tcp_probe_host/tcp_probe_port)
+    # so chaos tooling can point the generic internet probe at a local proxy
+    # instead of the real internet. Empty means NetWatchConfig defaults.
+    netwatch: dict[str, Any] = field(default_factory=dict)
 
 
 class Reliability:
@@ -72,13 +78,14 @@ class Reliability:
         home: Path | None = None,
         cancel_token: CancelToken | None = None,
         max_wait: float | None = None,
+        netwatch_config: dict[str, Any] | None = None,
     ) -> None:
         self.flags = flags or ReliabilityFlags()
         self.session = session
         self.home = home
         self.events = EventEmitter()
         self.cancel_token = cancel_token or CancelToken()
-        self.netwatch = NetWatch(NetWatchConfig()) if self.flags.netwatch else None
+        self.netwatch = NetWatch(NetWatchConfig(**(netwatch_config or {}))) if self.flags.netwatch else None
         self.retry_config = RetryConfig(max_wait=max_wait)
         self.governor = Governor(GovernorConfig(), events=self.events) if self.flags.budget_guard else None
         self.loop_guard = LoopGuard() if self.flags.loop_guard else None
@@ -109,6 +116,7 @@ class Reliability:
             session=session,
             home=home,
             max_wait=settings.max_wait if settings else None,
+            netwatch_config=settings.netwatch if settings else None,
         )
         if settings and r.governor is not None:
             if settings.session_tokens is not None or settings.session_usd is not None:
@@ -212,6 +220,69 @@ class Reliability:
         """M2: record a completion digest after the tool runs."""
         if self.journal is not None:
             self.journal.record_done(call_id, result)
+
+    # ── transcript persistence (resume after a crash) ──
+
+    def _transcript_path(self) -> Path | None:
+        if self.home is None:
+            return None
+        return self.home / "journal" / f"{self.session}.messages.json"
+
+    def save_transcript(self, messages: list[Message]) -> None:
+        """M2: atomically persist the conversation so a crashed run can resume."""
+        path = self._transcript_path()
+        if path is None or not self.flags.journal:
+            return
+        data = [
+            {
+                "role": m.role,
+                "content": m.content,
+                "tool_call_id": m.tool_call_id,
+                "name": m.name,
+                "tool_calls": [{"id": c.id, "name": c.name, "arguments": c.arguments} for c in m.tool_calls],
+            }
+            for m in messages
+        ]
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data))
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.debug("transcript not saved (%s)", e)
+
+    def load_transcript(self) -> list[Message] | None:
+        path = self._transcript_path()
+        if path is None or not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text())
+            return [
+                Message(
+                    role=d["role"],
+                    content=d.get("content"),
+                    tool_call_id=d.get("tool_call_id"),
+                    name=d.get("name"),
+                    tool_calls=[
+                        ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"])
+                        for c in d.get("tool_calls", [])
+                    ],
+                )
+                for d in raw
+            ]
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def interrupted_for(self, call: ToolCall) -> dict[str, Any] | None:
+        """INTERRUPTED result if this call has an intent without done and is side-effecting."""
+        journal = self._open_journal()
+        if journal is None:
+            return None
+        for pending in journal.resume_plan():
+            if pending.id == call.id and pending.side_effect:
+                self.events.emit(ev.INTERRUPTED_TOOL, detail=f"{pending.tool} ({pending.id})")
+                return interrupted_result(pending.tool)
+        return None
 
     def _open_journal(self) -> ToolJournal | None:
         if self.journal is None and self.home is not None:
