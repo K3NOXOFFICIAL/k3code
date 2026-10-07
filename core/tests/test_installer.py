@@ -53,9 +53,16 @@ def test_install_layout_and_idempotent(tmp_path: Path) -> None:
     assert snapshot(tmp_path) == before  # second run changes nothing
 
 
-def test_install_needs_yes_or_token(tmp_path: Path) -> None:
-    r = run(tmp_path, INSTALL)  # release mode without a token
-    assert r.returncode != 0 and "GITHUB_TOKEN" in r.stderr
+def test_from_git_fetch_failure_leaves_no_install(tmp_path: Path) -> None:
+    missing = tmp_path / "no-such-repo.git"  # a local path that is not a repository: fetch fails offline
+    r = run(tmp_path, INSTALL, "--yes", "--from-git", f"file://{missing}", "--ref", "Main")
+    assert r.returncode != 0
+    assert "could not fetch 'Main'" in r.stderr
+    assert not (tmp_path / ".local" / "share" / "k3code" / "versions").exists()
+    assert not (tmp_path / ".local" / "bin" / "k3code").exists()
+
+
+def test_unknown_option_is_rejected(tmp_path: Path) -> None:
     r = run(tmp_path, INSTALL, "--bogus")
     assert r.returncode != 0 and "unknown option" in r.stderr
 
