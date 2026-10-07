@@ -66,6 +66,19 @@ class GoalConfig(BaseModel):
     judge_model: str = "cheap"
 
 
+class AutomationConfig(BaseModel):
+    """/loop, /schedule and automations."""
+
+    #: Model key for cheap-tier work (NL→cron, --until judge). TODO(M4a): route via routing/tiers.py once merged.
+    cheap_model: str = ""  # empty → goal.judge_model
+    max_concurrent: int = 2  # unattended runs at once (governor slots)
+    grace_hours: float = 6.0  # missed cron runs fire once on recovery within this window
+    webhook_port: int | None = None  # None = webhook triggers disabled
+    git_poll_seconds: float = 15.0
+    idle_poll_seconds: float = 30.0
+    suggestions: bool = True
+
+
 class Settings(BaseModel):
     """Runtime settings for k3code."""
 
@@ -89,6 +102,7 @@ class Settings(BaseModel):
     mcp: McpConfig = Field(default_factory=McpConfig)
     mem0: Mem0Config = Field(default_factory=Mem0Config)
     goal: GoalConfig = Field(default_factory=GoalConfig)
+    automation: AutomationConfig = Field(default_factory=AutomationConfig)
 
 
 def _current_home() -> Path:

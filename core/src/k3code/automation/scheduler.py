@@ -246,3 +246,29 @@ class JobScheduler:
         if self.on_fire is not None:
             self.on_fire(job, result)
         self.on_change()
+
+
+def _ago(ts: float | None, now: float) -> str:
+    if not ts:
+        return "-"
+    d = int(now - ts)
+    if d < 0:
+        return f"in {-d // 60}m" if -d >= 60 else f"in {-d}s"
+    return f"{d // 3600}h ago" if d >= 3600 else (f"{d // 60}m ago" if d >= 60 else f"{d}s ago")
+
+
+def format_jobs(db: AutomationDB, now: float, runs_per_job: int = 3) -> str:
+    """The ``/schedule list`` table: one line per job plus its recent run history."""
+    jobs = db.rows("jobs")
+    if not jobs:
+        return "No scheduled jobs. Add one: /schedule add \"0 9 * * 1-5\" <prompt>"
+    lines: list[str] = []
+    for j in jobs:
+        sched = Schedule.from_dict(j["schedule"]).describe()
+        nxt = _ago(j["next_run_at"], now) if j["state"] == "active" else j["state"]
+        hold = " [quota hold]" if j["quota_hold_until"] and j["quota_hold_until"] > now else ""
+        lines.append(f"{j['id']}  {j['name']}  [{sched}]  {j['state']}  next: {nxt}  runs: {j['run_count']}{hold}")
+        for r in db.runs(j["id"], runs_per_job):
+            tail = f" — {r['note'] or r['summary'][-60:] or r['error'][:60]}".rstrip(" —")
+            lines.append(f"    #{r['id']} {r['status']:<9} {_ago(r['started_at'], now)}  api_calls={r['api_calls']}{tail}")
+    return "\n".join(lines)

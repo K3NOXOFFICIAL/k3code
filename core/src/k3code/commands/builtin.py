@@ -175,10 +175,12 @@ def build_registry() -> CommandRegistry:
     from k3code.commands.fork import ForkCommand
     from k3code.commands.goal import GoalCommand
     from k3code.commands.import_ import ImportCommand
+    from k3code.commands.loop import LoopCommand
     from k3code.commands.mcp_cmd import McpCommand
     from k3code.commands.memory_cmd import MemoryCommand
     from k3code.commands.output_style import OutputStyleCommand
     from k3code.commands.review import ReviewCommand
+    from k3code.commands.schedule import ScheduleCommand
     from k3code.commands.settings_cmd import SettingsCommand
     from k3code.commands.skills_cmd import SkillsCommand
 
@@ -186,6 +188,7 @@ def build_registry() -> CommandRegistry:
     for extra in (
         ExportCommand(), ImportCommand(), ForkCommand(), BranchCommand(), SettingsCommand(), ConfigCommand(),
         OutputStyleCommand(), MemoryCommand(), SkillsCommand(), McpCommand(), ReviewCommand(), GoalCommand(),
+        LoopCommand(), ScheduleCommand(),
     ):
         reg.register(extra)
     for cmd in (

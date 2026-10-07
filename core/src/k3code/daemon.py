@@ -98,6 +98,7 @@ async def run_daemon(
         if sock.exists() or serve.done():
             break
         await asyncio.sleep(0.05)
+    await server.ensure_automation()  # resume loops, start the cron scheduler and triggers
     sdnotify.ready()
     logger.info("daemon ready on %s", sock)
     if ready_event is not None:

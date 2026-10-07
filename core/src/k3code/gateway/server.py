@@ -121,13 +121,23 @@ class LiveSession:
         self.needs_input = False
         #: (provider, model) of the latest router attempt, for usage rows.
         self.last_entry: tuple[str, str] = ("", "")
+        #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
+        self.extra_tools: list[Callable[[Any], None]] = []
+        #: Outcome of the last unattended run (``completed`` / ``failed``); cleared when a new turn starts.
+        self.run_result: str | None = None
+        #: What the last turn ended with, for the cron/loop runners.
+        self.last_error = ""
+        self.last_exc: BaseException | None = None
+        self.last_api_calls = 0
 
     @property
     def state(self) -> str:
-        """``working`` (also while paused), ``needs_input`` or ``idle``."""
+        """``working`` (also while paused), ``needs_input``, ``completed``/``failed`` (unattended run) or ``idle``."""
         if self.needs_input:
             return "needs_input"
-        return "working" if self.streaming else "idle"
+        if self.streaming:
+            return "working"
+        return self.run_result or "idle"
 
     def emit(self, event_type: str, payload: dict[str, Any] | None = None, importance: str | None = None) -> None:
         """Send an event to every client attached to this session."""
@@ -241,6 +251,9 @@ class GatewayServer:
         self.safe_mode_notice = ""
         self._client_seq = 0
         self.usage = UsageDB(self._home() / "usage.db")
+        #: Automation engine (loops, cron, triggers); started by the daemon or on the first /loop|/schedule.
+        self.automation: Any = None
+        self.last_user_activity = time.time()
 
     # ── session registry ──────────────────────────────────────────────
 
@@ -339,6 +352,25 @@ class GatewayServer:
         line = encode_event(event_type, payload, importance)
         for client in self._targets(session):
             self._send(client, line)
+
+    def broadcast(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
+        """Send an event to every attached client, whatever session it is looking at (strip, status badge)."""
+        line = encode_event(event_type, payload or {}, None)
+        for client in self.clients:
+            if not client.closed:
+                self._send(client, line)
+
+    def broadcast_active_list(self) -> None:
+        self.broadcast("session.active_list", {"sessions": self._active_rows(None)})
+
+    async def ensure_automation(self) -> Any:
+        """The automation engine, started on first use (the daemon starts it eagerly)."""
+        if self.automation is None:
+            from k3code.automation.engine import AutomationEngine
+
+            self.automation = AutomationEngine(self)
+            await self.automation.start()
+        return self.automation
 
     def _reply(self, client: Client, line: str) -> None:
         self._send(client, line)
@@ -468,6 +500,7 @@ class GatewayServer:
                     "state": s.state,
                     "paused": s.paused,
                     "background": s.background,
+                    "origin": s.stored.meta.get("origin", ""),
                     "title": s.stored.title or "Session",
                 }
             )
@@ -484,6 +517,8 @@ class GatewayServer:
         self._open_requests.clear()
 
     async def close(self) -> None:
+        if self.automation is not None:
+            await self.automation.stop()
         for live in self.live.values():
             if live.turn_task is not None and not live.turn_task.done():
                 live.turn_task.cancel()
@@ -698,7 +733,7 @@ class GatewayServer:
 
     # ── turn lifecycle ────────────────────────────────────────────────
 
-    async def _run_turn(self, session: LiveSession, text: str) -> None:
+    async def _run_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget."""
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
         prompt = text
@@ -715,7 +750,8 @@ class GatewayServer:
                 if status == "error" and mgr.is_active():
                     mgr.pause("turn failed")
                     self.emit_goal(session)
-                return
+                self._session_finished(session, status)
+                return status, final_text
             judge = self.goal_judge or make_judge(self._goal_completer(session))
             decision = await mgr.evaluate_after_turn(final_text, judge, cwd=session.stored.cwd or None)
             self.emit_goal(session)
@@ -724,8 +760,14 @@ class GatewayServer:
                     "notification.show", {"text": decision.message, "level": "info", "kind": "info", "key": "goal"}
                 )
             if not decision.should_continue or not decision.prompt:
-                return
+                self._session_finished(session, status)
+                return status, final_text
             prompt = decision.prompt
+
+    def _session_finished(self, session: LiveSession, status: str) -> None:
+        """Tell the automation engine (``session_event`` triggers) that a session's run ended."""
+        if self.automation is not None:
+            self.automation.session_event(session.session_id, status, session.state)
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
@@ -734,6 +776,8 @@ class GatewayServer:
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
+        session.run_result = None
+        session.last_error, session.last_exc, session.last_api_calls = "", None, 0
         reliability = await self._reliability_for(session)
         await self.mcp.ensure_started()
         loop = AgentLoop(
@@ -762,6 +806,8 @@ class GatewayServer:
         )
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
+        for install in session.extra_tools:
+            install(loop.tools)
         session.loop = loop
 
         config = self.config
@@ -792,6 +838,7 @@ class GatewayServer:
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)
+            session.last_exc = e
             session.emit("error", {"message": str(e)})
         except BudgetExceeded as e:
             # The reliability event already told the client (error + needs_input).
@@ -807,6 +854,7 @@ class GatewayServer:
             logger.exception("turn failed")
             status = "error"
             error = str(e)
+            session.last_exc = e
             session.emit("error", {"message": str(e)})
         finally:
             session.streaming = False
@@ -819,6 +867,12 @@ class GatewayServer:
             session.stored.messages = _serialize_messages(loop.turn_messages)
             session.stored.model = session.stored.model or self._chain_key or self.config.default_model
             self.store.save(session.stored)
+        session.last_error = error or ""
+        session.last_api_calls = sum(1 for m in loop.turn_messages if m.role == "assistant")
+        if session.background:
+            session.run_result = {"done": "completed", "interrupted": "completed"}.get(status, "failed")
+            if status == "needs_input":
+                session.run_result = None
         for msg in reversed(loop.turn_messages):
             if msg.role == "assistant" and msg.usage:
                 usage = msg.usage
@@ -1296,6 +1350,7 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     if session is None:
         raise _InvalidParams("no active session")
     text = _require(params, "text")
+    server.last_user_activity = time.time()
     if session.streaming:
         return {"turn_id": "", "status": "queued"}
     if params.get("background"):
