@@ -106,3 +106,21 @@ def test_group_entry_headless_permission_and_flag(tmp_path, monkeypatch, seen):
     run(tmp_path, monkeypatch, cfg, command=cli_mod.cli)
     run(tmp_path, monkeypatch, cfg, "--permission", "yolo", command=cli_mod.cli)
     assert seen == ["accept-edits", "yolo"]
+
+
+async def test_bad_configured_permission_mode_fails_session_start_not_the_daemon(tmp_path, monkeypatch):
+    """The gateway built sessions with a bare PermissionMode(config value): 'bypass' raised ValueError inside the
+    request. Now session.create replies with an error naming the key, and the gateway keeps serving requests."""
+    import json
+
+    from m1cmd_helpers import frames_of, make_server
+
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"], permission_mode="bypass")
+    await server._handle_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session.create",
+                                          "params": {"cwd": str(tmp_path)}}))
+    reply = next(f for f in frames_of(server) if f.get("id") == 1)
+    assert reply["error"]["message"].startswith(
+        "InvalidPermissionMode: permission_mode 'bypass' is not one of: ask, auto-edit, yolo"), reply
+    await server._handle_line(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session.list", "params": {}}))
+    assert any(f.get("id") == 2 and "result" in f for f in frames_of(server))
+    await server.close()

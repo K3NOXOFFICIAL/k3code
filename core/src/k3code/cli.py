@@ -20,7 +20,7 @@ from k3code.agent.loop import AgentLoop
 from k3code.config import K3CODE_HOME, _current_home, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_skill_tool
-from k3code.permissions import PermissionMode
+from k3code.permissions import InvalidPermissionMode, PermissionMode, permission_mode_from_config
 from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
 from k3code.reliability import (
@@ -261,11 +261,9 @@ async def _run_repl(
 def _permission_from_config(key: str, value: str) -> PermissionMode:
     """The PermissionMode for a config string. An unknown value is a usage error, not a ValueError traceback."""
     try:
-        return PermissionMode(value)
-    except ValueError:
-        raise click.ClickException(
-            f"{key} {value!r} is not one of: ask, auto-edit, yolo (set in config.yaml or K3CODE_{key.upper()})"
-        ) from None
+        return permission_mode_from_config(key, value)
+    except InvalidPermissionMode as e:
+        raise click.ClickException(str(e)) from None
 
 
 @click.command()
