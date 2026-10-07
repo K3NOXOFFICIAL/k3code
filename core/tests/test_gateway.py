@@ -363,3 +363,116 @@ async def test_config_set_model_switches_session_model():
     bad = await rpc(server, "config.set", {"key": "model", "session_id": sid, "value": "nope"}, req_id=3)
     assert "error" in bad
     await server.close()
+
+
+async def test_a_stopped_turn_is_persisted_and_the_user_prompt_survives(tmp_path, monkeypatch):
+    """/stop or a shutdown cancels the turn task; the CancelledError used to skip the persist block entirely,
+    so the whole in-flight turn (prompt, tool calls, results) disappeared from the session store."""
+    import json as _json
+
+    from k3code.gateway.server import GatewayServer as _GS
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    script = tmp_path / "s.json"
+    script.write_text(_json.dumps([{"type": "tool_call", "name": "bash", "arguments": {"command": "echo one"}}]))
+    monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    srv = _GS(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+              store=SessionStore(tmp_path / "s.db"))
+    srv._write = lambda s: None
+    stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
+    live = srv.live_for(stored)
+
+    started = asyncio.Event()
+    real = srv._checkpoint_turn
+
+    async def hang_in_tool(*a, **k):
+        started.set()
+        await asyncio.sleep(60)
+
+    import k3code.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "tool_bash", hang_in_tool, raising=False)
+    task = asyncio.create_task(srv._run_turn(live, "do a long thing"))
+    await asyncio.sleep(0.5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    saved = srv.store.get(live.session_id).messages
+    assert any(m["role"] == "user" and m["content"] == "do a long thing" for m in saved), saved
+    assert real is not None
+
+
+async def test_tool_results_checkpoint_the_turn_before_it_ends(tmp_path, monkeypatch):
+    """kill -9 / an OOM kill / a reboot mid-turn lost the whole turn: the store was written once, at the end."""
+    import json as _json
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    script = tmp_path / "s.json"
+    script.write_text(_json.dumps([
+        {"type": "tool_call", "name": "bash", "arguments": {"command": "echo one"}, "when": "turn_first"},
+        {"type": "text", "text": "all done", "when": "turn_after_tool"},
+    ]))
+    monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    srv = GatewayServer(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+                        store=SessionStore(tmp_path / "s.db"))
+    srv._write = lambda s: None
+    srv.CHECKPOINT_EVERY_S = 0.0
+    stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
+    live = srv.live_for(stored)
+    saved_sizes: list[int] = []
+    real_save = srv.store.save
+    srv.store.save = lambda s: (saved_sizes.append(len(s.messages)), real_save(s))[1]  # type: ignore[method-assign]
+    status, text = await srv._run_turn(live, "run echo")
+    assert status == "done", (text, live.last_error)
+    final = len(live.stored.messages)
+    assert any(0 < n < final for n in saved_sizes), (saved_sizes, final)  # a checkpoint landed before the end
+
+
+async def test_idle_sessions_stop_their_netwatch_and_rearm_on_the_next_turn(tmp_path, monkeypatch):
+    """Every live session kept a started NetWatch (two forever-tasks) until the daemon exited."""
+    import json as _json
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    script = tmp_path / "s.json"
+    script.write_text(_json.dumps([{"type": "text", "text": "ok"}]))
+    monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    srv = GatewayServer(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+                        store=SessionStore(tmp_path / "s.db"))
+    srv._write = lambda s: None
+    stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
+    live = srv.live_for(stored)
+    await srv._run_turn(live, "hi")
+    assert live.reliability is not None and live.reliability._started  # armed for the turn
+    assert await srv.sweep_idle_reliability(now=live.idle_since + 10) == 0  # not idle long enough
+    assert await srv.sweep_idle_reliability(now=live.idle_since + srv.IDLE_RELIABILITY_S + 1) == 1
+    assert not live.reliability._started
+    await srv._run_turn(live, "again")  # the next turn re-arms it
+    assert live.reliability._started
+    await srv.close()
+
+
+async def test_alternating_model_keys_do_not_rebuild_the_provider_stack(tmp_path, monkeypatch):
+    """Sessions on different model keys (a cron job with model: next to an interactive one) rebuilt providers, the
+    cooldown store and every tier router on each alternating turn, closing none of the old ones."""
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", api_key="x",
+                         models={"default": "m", "alt": "m2"})
+    config = Settings(providers=[prov], default_model="default")
+    srv = GatewayServer(config=config, store=SessionStore(tmp_path / "s.db"))
+    srv._ensure_router("default")
+    providers, cooldowns, main = srv.providers, srv.cooldowns, srv.router
+    for _ in range(20):
+        srv._ensure_router("alt")
+        srv._ensure_router("default")
+    assert srv.providers is providers and srv.cooldowns is cooldowns
+    assert srv.router is main and srv._chain_key == "default"
+    assert len(srv._router_cache) == 2
+    # replacing the provider config (/config reload) does rebuild everything, once
+    srv.config.providers = [prov]
+    srv._chain_key = None
+    srv._ensure_router("default")
+    assert srv.providers is not providers and len(srv._router_cache) == 1
+    await srv.close()

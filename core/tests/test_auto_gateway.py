@@ -234,3 +234,37 @@ async def test_goal_automations_do_not_leak_sessions_or_netwatch_tasks(tmp_path,
         # none of them keeps polling the network while idle
         assert all(s.reliability is None or not s.reliability._started for s in unattended)
         await server.close()
+
+
+async def test_two_unattended_runs_on_one_session_do_not_overlap(tmp_path, monkeypatch):
+    """run_prompt's busy check and the turn's own `streaming` flag were separated by awaits: two callers both passed
+    it, two AgentLoops interleaved on one conversation and `background` was left stuck True."""
+    from k3code.automation.server_runner import ServerRunner
+
+    server, provider = make_server(tmp_path, monkeypatch, ["tick reply"])
+    sid = await new_session(server, tmp_path)
+    live = server.live[sid]
+    assert live.background is False
+    active = peak = 0
+    real = server._run_turn_locked
+
+    async def slow(session, text):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.05)
+            return await real(session, text)
+        finally:
+            active -= 1
+
+    server._run_turn_locked = slow  # type: ignore[method-assign]
+    runner = ServerRunner(server)
+    async with asyncio.timeout(30):
+        results = await asyncio.gather(
+            runner.run_prompt("task A", session_id=sid), runner.run_prompt("task B", session_id=sid)
+        )
+    assert peak == 1, "two turns ran at once on one session"
+    assert [r.status for r in results] == ["completed", "completed"]
+    assert live.background is False  # restored, not left True by the second caller
+    assert sum(1 for m in live.stored.messages if m["role"] == "user") == 2  # neither tick's history was lost

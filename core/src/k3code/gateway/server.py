@@ -108,6 +108,12 @@ class LiveSession:
         self.loop: AgentLoop | None = None
         self.turn_task: asyncio.Task[None] | None = None
         self.streaming = False
+        #: Serializes whole turns of this session (two prompts, a loop tick and a prompt, ... never interleave two
+        #: AgentLoops on one conversation) and unattended runs' set-up/tear-down (see ServerRunner.run_prompt).
+        self.turn_lock = asyncio.Lock()
+        self.run_lock = asyncio.Lock()
+        self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
+        self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
         self.reasoning_effort: str | None = None
         self.todos: list[dict[str, Any]] = []
         self.todo_revision = 0
@@ -286,7 +292,9 @@ class GatewayServer:
         self.usage = UsageDB(self._home() / "usage.db")
         self.artifacts = ArtifactStore(self._home() / "artifacts.db")
         self._tiers: TierRouters | None = None
+        self._router_cache: dict[str, TierRouters] = {}  # one TierRouters per model key (see _ensure_router)
         self._side_tasks: set[asyncio.Task[Any]] = set()  # fire-and-forget work (titles)
+        self._idle_sweeper: asyncio.Task[None] | None = None
         #: (provider, model) of the most recent router attempt on any task (side calls read it).
         self.last_attempt: tuple[str, str] = ("", "")
         self.model_caller = ModelCaller(
@@ -481,16 +489,20 @@ class GatewayServer:
         self._running = True
         if not stdio:
             self.clients.remove(self._stdio_client)
-        if socket_path is not None:
-            await self.start_socket(socket_path)
-        if stdio:
-            await self._serve_stdio()
-            if socket_path is None:
-                self.shutdown()
-                return
-        await self._stop.wait()
-        await self.stop_socket()
-        self.shutdown()
+        self._idle_sweeper = asyncio.get_running_loop().create_task(self._idle_sweep_loop(), name="k3-idle-sweeper")
+        try:
+            if socket_path is not None:
+                await self.start_socket(socket_path)
+            if stdio:
+                await self._serve_stdio()
+                if socket_path is None:
+                    self.shutdown()
+                    return
+            await self._stop.wait()
+            await self.stop_socket()
+            self.shutdown()
+        finally:
+            self._idle_sweeper.cancel()
 
     async def _serve_stdio(self) -> None:
         loop = asyncio.get_running_loop()
@@ -627,6 +639,36 @@ class GatewayServer:
             )
         return rows
 
+    #: A session idle this long stops its reliability bundle (netwatch tasks); the next turn re-arms it.
+    IDLE_RELIABILITY_S = 120.0
+    IDLE_SWEEP_EVERY_S = 30.0
+
+    async def _idle_sweep_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.IDLE_SWEEP_EVERY_S)
+            with contextlib.suppress(Exception):
+                await self.sweep_idle_reliability()
+
+    async def sweep_idle_reliability(self, now: float | None = None) -> int:
+        """Stop the NetWatch of sessions that have been idle for IDLE_RELIABILITY_S; returns how many were stopped.
+
+        Every live session owns a bundle with a started NetWatch (two forever-tasks: a probe loop and an nmcli
+        watcher). Sessions pile up in ``server.live`` (each TUI launch, each /new), so an idle daemon spent more
+        CPU and spawned more processes the longer it had served.
+        """
+        now = time.monotonic() if now is None else now
+        stopped = 0
+        for live in list(self.live.values()):
+            rel = live.reliability
+            if rel is None or not rel._started or live.streaming or live.pending_approval is not None:
+                continue
+            if now - live.idle_since < self.IDLE_RELIABILITY_S:
+                continue
+            with contextlib.suppress(Exception):
+                await rel.stop()  # re-armed by _reliability_for on the session's next turn
+                stopped += 1
+        return stopped
+
     def shutdown(self) -> None:
         self._running = False
         for live in self.live.values():
@@ -640,9 +682,14 @@ class GatewayServer:
     async def close(self) -> None:
         if self.automation is not None:
             await self.automation.stop()
+        cancelled = []
         for live in self.live.values():
             if live.turn_task is not None and not live.turn_task.done():
                 live.turn_task.cancel()
+                cancelled.append(live.turn_task)
+        if cancelled:  # let each turn persist what it has (its finally block) before the store is closed below
+            await asyncio.wait(cancelled, timeout=5.0)
+        for live in self.live.values():
             if live.reliability is not None:
                 with contextlib.suppress(Exception):
                     await live.reliability.stop()
@@ -755,21 +802,46 @@ class GatewayServer:
     # ── router wiring ─────────────────────────────────────────────────
 
     def _ensure_router(self, model: str | None = None) -> None:
-        """Build provider chain + router once (rebuilt on model change)."""
+        """Provider chain + routers, built once per provider config and once per model key.
+
+        Sessions with different model keys (a cron job with ``model:`` next to an interactive session) used to
+        rebuild the whole stack on every alternating turn: new httpx clients, a new cooldown store, a stray temp
+        dir per claude-cli provider, none of the old ones closed. Routers are now cached per key; the providers
+        and the cooldown store are rebuilt only when the provider config itself is replaced (/config reload).
+        """
         key = model or self.config.default_model
-        if self.router is not None and self._chain_key == key:
+        # _router_cfg None: a router injected from outside (tests) is taken as is
+        current = self._router_cfg is None or self._router_cfg is self.config.providers
+        if self.router is not None and self._chain_key == key and current:
             return
-        # Old provider clients are dropped for GC; chains are only replaced on
-        # a model change (rare), and httpx pools close with the objects.
-        self.providers = make_providers(self.config.providers)
-        self.cooldowns = CooldownStore(path=self._home() / "cooldowns.json")
-        self._tiers = TierRouters(
-            self.providers, self.config, cooldowns=self.cooldowns, on_event=self._on_router_event, main_key=key
-        )
-        self.router = self._tiers.get(Tier.MAIN)
+        if self._router_cfg is not self.config.providers:  # first build, or the provider config was replaced
+            self._retire_providers(self.providers)
+            self.providers = make_providers(self.config.providers)
+            self.cooldowns = CooldownStore(path=self._home() / "cooldowns.json")
+            self._router_cache = {}
+            self.__dict__.pop("_oneshot_routers", None)  # one-shot routers hold chains of the replaced providers
+            self._router_cfg = self.config.providers
+        tiers = self._router_cache.get(key)
+        if tiers is None:
+            tiers = self._router_cache[key] = TierRouters(
+                self.providers, self.config, cooldowns=self.cooldowns, on_event=self._on_router_event, main_key=key
+            )
+        self._tiers = tiers
+        self.router = tiers.get(Tier.MAIN)
         self._chain_key = key
 
+    def _retire_providers(self, providers: list[Any]) -> None:
+        """Close replaced providers in the background (their httpx pools / temp dirs would otherwise wait for GC)."""
+        for p in providers:
+            try:
+                task = asyncio.get_running_loop().create_task(p.aclose())
+            except RuntimeError:  # no running loop (sync setup in tests): nothing to await it on
+                continue
+            self._side_tasks.add(task)
+            task.add_done_callback(self._side_tasks.discard)
+
     _chain_key: str | None = None
+    _router_cfg: Any = None  # the config.providers object the cached providers/routers were built from
 
     def tier_routers(self) -> TierRouters:
         """The per-tier routers (built with the main router; rebuilt when the model key changes)."""
@@ -874,6 +946,10 @@ class GatewayServer:
 
     async def _run_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget."""
+        async with session.turn_lock:  # a second turn on this session waits instead of interleaving with the first
+            return await self._run_turn_locked(session, text)
+
+    async def _run_turn_locked(self, session: LiveSession, text: str) -> tuple[str, str]:
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
         prompt = text
         mgr = self.goal_manager(session)
@@ -1082,6 +1158,10 @@ class GatewayServer:
             session.emit("error", {"message": str(e)})
         finally:
             session.streaming = False
+            session.idle_since = time.monotonic()
+            # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
+            # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
+            self._persist_turn(session, loop)
             if session.paused:  # a cancelled wait never saw "resumed"
                 session.paused = False
                 session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")
@@ -1089,11 +1169,6 @@ class GatewayServer:
             if self.learning.enabled:
                 self.learning.spawn(self.learning.turn_finished(session, status))
 
-        # Persist whatever the loop accumulated (also on error/interrupt).
-        if loop.turn_messages:
-            session.stored.messages = _serialize_messages(loop.turn_messages)
-            session.stored.model = session.stored.model or self._chain_key or self.config.default_model
-            self.store.save(session.stored)
         session.last_error = error or ""
         session.last_api_calls = sum(1 for m in loop.turn_messages if m.role == "assistant")
         if session.background:
@@ -1122,6 +1197,28 @@ class GatewayServer:
             task.add_done_callback(self._side_tasks.discard)
         return status, final_text
 
+    #: Minimum seconds between mid-turn checkpoints (each one rewrites the session's message list).
+    CHECKPOINT_EVERY_S = 3.0
+
+    def _persist_turn(self, session: LiveSession, loop: AgentLoop) -> None:
+        """Write the loop's conversation so far to the session store. Never raises: it runs in ``finally``."""
+        try:
+            if loop.turn_messages:
+                session.stored.messages = _serialize_messages(loop.turn_messages)
+                session.stored.model = session.stored.model or self._chain_key or self.config.default_model
+                self.store.save(session.stored)
+            session.last_checkpoint = time.monotonic()
+        except Exception:  # noqa: BLE001 - a failed checkpoint must not mask the turn's own outcome
+            logger.exception("could not persist the session")
+
+    def _checkpoint_turn(self, session: LiveSession) -> None:
+        """After a tool result: persist the in-flight turn (throttled) so kill -9, an OOM kill or a reboot loses
+        seconds of work instead of the whole turn."""
+        loop = session.loop
+        if loop is None or time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+            return
+        self._persist_turn(session, loop)
+
     async def _auto_title(self, session: LiveSession, first_message: str) -> None:
         """Name a fresh session on the ``title`` task kind; best-effort, never surfaces errors."""
         title = await make_title(self.model_caller, first_message, session_id=session.session_id)
@@ -1145,6 +1242,7 @@ class GatewayServer:
         elif event.type == "done" and event.message:
             msg = event.message
             if msg.role == "tool":
+                self._checkpoint_turn(session)
                 session.emit(
                     "tool.complete",
                     {

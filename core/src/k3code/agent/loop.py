@@ -161,7 +161,9 @@ class AgentLoop:
             *(history or []),
             Message(role="user", content=user_prompt),
         ]
-        self.turn_messages = []
+        # The same list object the loop keeps appending to: a cancelled or crashed turn can still be persisted
+        # (turn_messages used to be assigned only when a step finished, so /stop or SIGTERM lost the whole turn).
+        self.turn_messages = messages
         if resume:
             # M2: continue a crashed session from its persisted transcript.
             saved = self.reliability.load_transcript()
@@ -184,6 +186,7 @@ class AgentLoop:
                     yield StreamEvent(type="done", message=tool_msg)
                 if not open_calls and last.role != "tool":
                     messages.append(Message(role="user", content=user_prompt))
+                self.turn_messages = messages  # the resumed transcript replaced the list
         self.reliability.save_transcript(messages)
 
         for turn in range(self.max_turns):

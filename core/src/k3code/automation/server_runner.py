@@ -93,31 +93,35 @@ class ServerRunner:
             srv.store.save(stored)
             live = srv.live_for(stored)
             live.background = True
-        while live.streaming:  # the user (or another run) is mid-turn in this session: wait for it
-            await asyncio.sleep(BUSY_POLL_S)
-        prev_background = live.background
-        live.background = True
-        live.extra_tools = [_schedule_next_installer(tick)] if tick is not None else []
-        live.task_kind = kind  # tier policy: loop_tick / cron_job / background_turn (cheap by default)
-        if model and not existing:
-            live.stored.model = model
-        task = asyncio.get_running_loop().create_task(srv._run_turn(live, prompt), name=f"auto-{live.session_id}")
-        live.turn_task = task
-        srv.broadcast_active_list()
-        try:
-            status, text = await task
-        except asyncio.CancelledError:
-            task.cancel()
-            raise
-        except Exception as e:  # noqa: BLE001
-            status, text = "error", str(e)
-        finally:
-            live.background = prev_background if existing else True
-            live.extra_tools = []
-            live.task_kind = ""
-            if not existing:
-                await self._release(live)
+        # One unattended run per session at a time: the busy check below and the point where the turn marks itself
+        # streaming are separated by awaits, so two callers (two /loop commands on one session, an overdue loop
+        # resumed twice) both passed it and ran concurrently, clobbering each other's background/tool flags.
+        async with live.run_lock:
+            while live.streaming:  # the user (or another run) is mid-turn in this session: wait for it
+                await asyncio.sleep(BUSY_POLL_S)
+            prev_background = live.background
+            live.background = True
+            live.extra_tools = [_schedule_next_installer(tick)] if tick is not None else []
+            live.task_kind = kind  # tier policy: loop_tick / cron_job / background_turn (cheap by default)
+            if model and not existing:
+                live.stored.model = model
+            task = asyncio.get_running_loop().create_task(srv._run_turn(live, prompt), name=f"auto-{live.session_id}")
+            live.turn_task = task
             srv.broadcast_active_list()
+            try:
+                status, text = await task
+            except asyncio.CancelledError:
+                task.cancel()
+                raise
+            except Exception as e:  # noqa: BLE001
+                status, text = "error", str(e)
+            finally:
+                live.background = prev_background if existing else True
+                live.extra_tools = []
+                live.task_kind = ""
+                if not existing:
+                    await self._release(live)
+                srv.broadcast_active_list()
         result = RunResult(
             status=_STATUS.get(status, "failed"),
             text=text,

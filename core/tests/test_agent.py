@@ -286,3 +286,35 @@ async def test_a_retry_after_partial_output_resets_the_consumers_copy(temp_cwd):
     assert [e.type for e in events].count("reset") == 1
     done = [e for e in events if e.type == "done"]
     assert done[-1].message.content == "Hello world"
+
+
+@pytest.mark.asyncio
+async def test_turn_messages_track_the_turn_in_flight(temp_cwd):
+    """A cancelled turn could not be persisted: turn_messages was only assigned when a step finished."""
+    import asyncio
+
+    class Slow:
+        name = "slow"
+        base_url = "https://slow.test"
+
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            await asyncio.sleep(30)
+            yield make_done_event(Message(role="assistant", content="never", tool_calls=[]))
+
+        async def aclose(self):
+            pass
+
+    router = Router(build_chain([Slow()], [["fake-model"]]), max_retries=0)
+    loop = AgentLoop(router, system_prompt="t", max_turns=3, permission_mode="yolo", cwd=temp_cwd)
+
+    async def drain():
+        async for _ in loop.run("please do the thing"):
+            pass
+
+    task = asyncio.create_task(drain())
+    await asyncio.sleep(0.2)
+    task.cancel()  # what /stop and a daemon shutdown do
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert [m.role for m in loop.turn_messages] == ["system", "user"]
+    assert loop.turn_messages[-1].content == "please do the thing"
