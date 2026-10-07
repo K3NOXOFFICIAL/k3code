@@ -1877,6 +1877,8 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         on = raw if isinstance(raw, bool) else str(raw).lower() in ("1", "true", "on", "yes")
         server.config.display.focus_mode = on
         return {"ok": True, "key": key, "value": "on" if server.config.display.focus_mode else "off"}
+    if key == "model":  # TUI /model <key> and the model picker: switch the session's model key
+        return await _config_set_model(server, params)
     if "." not in key:
         raise _InvalidParams(f"unsupported config key: {key}")
     section, field_name = key.split(".", 1)
@@ -1885,6 +1887,34 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         raise _InvalidParams(f"unknown config path: {key}")
     setattr(section_obj, field_name, params.get("value"))
     return {"ok": True, "key": key}
+
+
+async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``config.set model``: value is ``<model-key> [--provider p] [--session|--global]`` (picker flags ignored)."""
+    parts = str(params.get("value") or "").split()
+    keys: list[str] = []
+    skip = False
+    for part in parts:
+        if skip:
+            skip = False
+        elif part == "--provider":
+            skip = True
+        elif not part.startswith("--"):
+            keys.append(part)
+    if not keys:
+        raise _InvalidParams("model key required")
+    key = keys[0]
+    known = {m for p in server.config.providers for m in p.models} | {server.config.default_model}
+    if key not in known:
+        raise _InvalidParams(f"unknown model key: {key} (known: {', '.join(sorted(known))})")
+    session = server._session_for(params.get("session_id"))
+    if session is None:
+        server.config.default_model = key
+    else:
+        session.stored.model = key
+        server.store.save(session.stored)
+        session.emit("session.info", session.live_info())
+    return {"ok": True, "key": "model", "value": key}
 
 
 async def _setup_status(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
