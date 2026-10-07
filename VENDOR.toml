@@ -88,3 +88,24 @@ local_path = "core/src/k3code/permissions/rules.py"
 sha256_upstream = "5b9e4aa65290a39363722b9fae4c68080188d8ed76896afa0d96cd9dbfd2821d"
 modified = true
 port-to-python = true
+
+[[file]]
+project = "codex"
+upstream_path = "codex-rs/prompts/templates/review/rubric.md"
+commit = "81de4f251cfdaf32ecb85e2160ebfc11a562d44b"
+license = "Apache-2.0"
+local_path = "core/src/k3code/prompts/review_rubric.md"
+sha256_upstream = "ec60e7f36a1d1c2679ce095c0205ecc56f7dd8fb57707a13ef362072390f219f"
+modified = true
+notice = "NOTICE"
+license_file = "LICENSES/codex-Apache-2.0.txt"
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "hermes_cli/goals.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/goals.py"
+sha256_upstream = "49f45045769db7ee9b9fd87a4c873a5011ac574318a7762572473504ea0d86d6"
+modified = true
+port = true  # design port: GoalState/judge/continuation/budget/gate re-implemented (async, trimmed), not a line copy

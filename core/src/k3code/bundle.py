@@ -157,7 +157,7 @@ def merge_settings(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[s
             continue
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = merge_settings(out[k], v)
-        elif isinstance(v, dict) or isinstance(v, list):
+        elif isinstance(v, dict | list):
             out[k] = _strip_redacted(v)
         else:
             out[k] = v

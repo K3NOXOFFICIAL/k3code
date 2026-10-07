@@ -731,6 +731,29 @@ describe('createSlashHandler', () => {
     expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
   })
 
+  it('shows /settings (structured gateway result) in the pager overlay', async () => {
+    const ctx = buildCtx({
+      gateway: {
+        gw: {
+          getLogTail: vi.fn(() => ''),
+          request: vi.fn((method: string) =>
+            method === 'slash.exec'
+              ? Promise.resolve({
+                  output: 'model: default\neffort: default',
+                  settings: { effort: 'default' },
+                  type: 'settings'
+                })
+              : Promise.resolve({})
+          )
+        },
+        rpc: vi.fn(() => Promise.resolve({}))
+      }
+    })
+
+    expect(createSlashHandler(ctx)('/settings')).toBe(true)
+    await vi.waitFor(() => expect(ctx.transcript.page).toHaveBeenCalledWith('model: default\neffort: default', 'Settings'))
+  })
+
   it('falls through to command.dispatch for skill commands, sending the body but showing the invocation', async () => {
     const skillMessage =
       '[IMPORTANT: The user has invoked the "hermes-agent-dev" skill, indicating they want you to follow its instructions.\n' +
