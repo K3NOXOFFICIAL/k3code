@@ -167,14 +167,17 @@ def main() -> None:
          "non-typing mode, lock suffix, chooser lists all modes (TestHintsPerMode et al., -v)",
          "PASS" if rc == 0 and "--- PASS: TestHintsPerMode" in out else "FAIL",
          "\n".join(ln for ln in out.splitlines() if ln.startswith(("--- ", "ok", "FAIL"))))
-    # keymap=tuios: the stock cmd/tuios binary never installs k3keys (only cmd/k3 does), so the whole upstream tree
-    # runs with the tuios keymap. Everything except the k3-only package.
-    pk = run("go list ./... | grep -v internal/k3keys", cwd=PANES)[1].split()
+    # keymap=tuios: the stock cmd/tuios binary never installs k3keys (only cmd/k3 does).
+    # NOT the whole tree: upstream's cmd/tuios and internal/federation tests run `$SHELL -l -c "command -v tuios"`
+    # against a fake remote and recurse without bound (thousands of nested shells; it exhausted RAM twice).
+    # Only the packages that contain the k3 hooks (input handler, mode legend) and the harness registry run.
+    pk = ["./internal/input/", "./internal/app/", "./internal/harness/"]
     rc, out = go("-count=1 " + " ".join(pk), timeout=3000)
     fails = [ln for ln in out.splitlines() if ln.startswith(("FAIL", "--- FAIL"))]
     npass = sum(1 for ln in out.splitlines() if ln.startswith("ok"))
     emit(M, "Upstream tuios tests pass with keymap=tuios",
-         "cd panes && go test ./... (all packages but k3keys; cmd/tuios never installs k3keys so the tuios keymap is active)",
+         "cd panes && go test ./internal/input/ ./internal/app/ ./internal/harness/ (the packages the k3 hooks touch; "
+         "cmd/tuios and internal/federation are excluded: their remote-sync tests recurse without bound)",
          "PASS" if rc == 0 else "FAIL", f"{npass} packages ok, {len(fails)} failing\n" + "\n".join(fails[:5]) + "\n" + tail(out, 3))
     tmp = Path(tempfile.mkdtemp(prefix="m3-exit-"))
     try:
