@@ -140,19 +140,21 @@ def stats_tiers() -> None:
         server.automation = eng
         await eng.start()
         sid = await new_session(server, d)
-        provider = server.providers[0]
+        def ncalls() -> int:
+            return sum(len(p.log) for p in server.providers)
+
         # background turn
         await cmd(server, "/bg say hi in the background", sid)
-        await until(lambda: provider.calls >= 1)
+        await until(lambda: ncalls() >= 1)
         # cron job
-        n = provider.calls
+        n = ncalls()
         await cmd(server, '/schedule add "* * * * *" "cron says hi" --name hi', sid)
         await clock.advance(61)
-        await until(lambda: provider.calls > n)
+        await until(lambda: ncalls() > n)
         # loop tick
-        n = provider.calls
+        n = ncalls()
         await cmd(server, "/loop 5m watch the build --times 1", sid)
-        await until(lambda: provider.calls > n)
+        await until(lambda: ncalls() > n)
         await asyncio.sleep(0.3)
         out = (await cmd(server, "/stats day 1", sid))["output"]
         row = server.usage.aggregate("day")[0]
@@ -171,7 +173,8 @@ def stats_tiers() -> None:
         emit(M, crit, "gateway + AutomationEngine + fake provider: /bg, /schedule add (fake clock), /loop, then /stats",
              "PASS", ev)
     except Exception as e:  # noqa: BLE001
-        emit(M, crit, "gateway + AutomationEngine + fake provider", "FAIL", f"{type(e).__name__}: {e}")
+        import traceback
+        emit(M, crit, "gateway + AutomationEngine + fake provider", "FAIL", traceback.format_exc())
 
 
 # ---------------------------------------------------------------- 4. degradation cost
