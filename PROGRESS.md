@@ -26,6 +26,9 @@
   carry an added attribution header so they never byte-match the pristine
   upstream file; this is by design in the script).
 - Live smoke test against OmniRoute (see REPORT.md for the exact result).
+- REPORT.md written at repo root; this session re-verified all acceptance checks
+  (pytest 41 passed, ruff clean, vendor_check passes, live smoke test exit 0
+  with file created and "hi" confirmed).
 
 ## Bugs found and fixed this session (none were in the original test suite)
 
