@@ -59,7 +59,7 @@ RUNTIME_SETTINGS=""
 if curl -s -o /dev/null -m 5 "$DIRECT_URL/"; then
   RUNTIME_SETTINGS=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/k3dev-settings.XXXXXX.json")
   chmod 600 "$RUNTIME_SETTINGS"
-  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.setdefault("env",{})["ANTHROPIC_BASE_URL"]=sys.argv[2]; d["env"]["API_TIMEOUT_MS"]="900000"; json.dump(d,open(sys.argv[3],"w"))' \
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.setdefault("env",{})["ANTHROPIC_BASE_URL"]=sys.argv[2]; d["env"]["API_TIMEOUT_MS"]="900000"; d["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"]="1"; d["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]="110000"; json.dump(d,open(sys.argv[3],"w"))' \
     "$SETTINGS" "$DIRECT_URL" "$RUNTIME_SETTINGS"
   trap 'rm -f "$RUNTIME_SETTINGS"' EXIT
   trap 'exit 143' INT TERM HUP
@@ -75,6 +75,11 @@ echo "$(date -Is) gateway=$HEALTH_URL" >> "$RUNS/driver.log"
 CLAUDE_FALLBACK_MODEL=${K3DEV_CLAUDE_FALLBACK:-claude-sonnet-5-5}
 GATEWAY_DOWN_GRACE=${K3DEV_GATEWAY_DOWN_GRACE:-600}   # seconds of OmniRoute outage before using Claude
 USE_CLAUDE=0
+
+# Lean workers: no MCP servers and no skills (they cost ~30K tokens of context per call and
+# workers don't need them); auto-memory off and earlier compaction for the Claude path too.
+LEAN=(--strict-mcp-config --mcp-config '{"mcpServers":{}}' --disable-slash-commands)
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
 
 wait_online() {  # pause while offline; if only OmniRoute is down for long, switch to Claude
   local n=0 start
@@ -102,12 +107,12 @@ while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
   attempt=$((attempt + 1))
   [ "$USE_CLAUDE" = 1 ] || wait_online
   if [ "$USE_CLAUDE" = 1 ]; then
-    MODEL=$CLAUDE_FALLBACK_MODEL; FB=(); SET=()   # default settings = native Claude account
+    MODEL=$CLAUDE_FALLBACK_MODEL; FB=(); SET=("${LEAN[@]}")   # default settings = native Claude account
   else
     MODEL=${MODEL_LIST[$midx]}
     FALLBACK=${MODEL_LIST[$(( (midx + 1) % ${#MODEL_LIST[@]} ))]}
     FB=(); [ "$FALLBACK" != "$MODEL" ] && FB=(--fallback-model "$FALLBACK")
-    SET=(--settings "$SETTINGS")
+    SET=(--settings "$SETTINGS" "${LEAN[@]}")
   fi
   out="$RUNS/attempt-$attempt.json"; stamp="$RUNS/.attempt-start"; touch "$stamp"
   echo "$(date -Is) attempt $attempt model=$MODEL$([ "$USE_CLAUDE" = 1 ] && echo ' [CLAUDE FALLBACK]') (session=${SESSION:-new})" >> "$RUNS/driver.log"
