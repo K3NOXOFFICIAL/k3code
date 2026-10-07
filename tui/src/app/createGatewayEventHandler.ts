@@ -1193,13 +1193,57 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         const head = `plan (${p.scope}, risk ${p.risk}) — ${p.status}${p.auto_approved ? ' automatically' : ''}`
         const body = p.status === 'proposed' ? `\n${p.plan}` : ''
-        const note = p.fanout_candidate ? '\nlarge task: parallel fan-out comes later; running sequentially' : ''
+        const note = p.fanout_candidate ? '\nlarge task: independent steps fan out to parallel sub-agents' : ''
         const critique = p.advisor ? `\nadvisor: ${p.advisor}` : ''
 
         sys(`${head}${body}${note}${critique}`)
 
         return
       }
+
+      case 'fanout.plan':
+        if (ev.payload) {
+          const t = ev.payload.test_command ? `, tests: ${ev.payload.test_command}` : ''
+
+          sys(`fan-out: ${ev.payload.subtasks.length} subtasks, up to ${ev.payload.max_parallel} in parallel${t}`)
+        }
+
+        return
+
+      case 'fanout.progress':
+        if (ev.payload && ['merged', 'retrying', 'escalated', 'failed', 'skipped'].includes(ev.payload.state)) {
+          const d = ev.payload.detail ? ` — ${ev.payload.detail.split('\n')[0]}` : ''
+
+          sys(`fan-out ${ev.payload.done}/${ev.payload.total} · ${ev.payload.title}: ${ev.payload.state}${d}`)
+        }
+
+        return
+
+      case 'fanout.done':
+        if (ev.payload) {
+          sys(`fan-out done: ${ev.payload.merged}/${ev.payload.total} merged, tests ${ev.payload.tests}`)
+        }
+
+        return
+
+      case 'ultra.progress':
+        if (ev.payload) {
+          const b = ev.payload.max_agents ? ` [${ev.payload.agents ?? 0}/${ev.payload.max_agents} agents]` : ''
+
+          sys(`/${ev.payload.command}: ${ev.payload.phase}${ev.payload.detail ? ` — ${ev.payload.detail}` : ''}${b}`)
+        }
+
+        return
+
+      case 'research.progress':
+        if (ev.payload) {
+          sys(`/ultraresearch: ${ev.payload.phase}${ev.payload.detail ? ` — ${ev.payload.detail}` : ''}`)
+        }
+
+        return
+
+      case 'session.background_done':
+        return
 
       case 'proposal.show':
         if (ev.payload) {

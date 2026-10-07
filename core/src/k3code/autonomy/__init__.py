@@ -22,6 +22,8 @@ DEFAULTS: dict[str, Any] = {
     "auto_title": False,
     "preview_timeout": 30,
     "advisor_compact_chars": 24000,
+    #: M4b: parallel sub-agent execution of large/huge plans
+    "fanout": {"enabled": True, "max_parallel": 3, "require_tests": True, "test_command": "", "test_timeout": 600},
 }
 
 
@@ -30,4 +32,5 @@ def autonomy_cfg(config: Any) -> dict[str, Any]:
     user = dict(getattr(config, "autonomy", None) or {})
     out = {**DEFAULTS, **user}
     out["escalate"] = {**DEFAULTS["escalate"], **dict(user.get("escalate") or {})}
+    out["fanout"] = {**DEFAULTS["fanout"], **dict(user.get("fanout") or {})}
     return out
