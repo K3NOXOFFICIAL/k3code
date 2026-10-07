@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-k3code = "k3code.cli:main"
+k3code = "k3code.cli:cli"
 
 [dependency-groups]
 dev = [
