@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections import Counter, defaultdict
@@ -228,7 +229,8 @@ async def distill(log: DecisionLog, *, home: Path, user_md: Path, config: Any = 
     prefs = await polish(caller, prefs, session_id=session_id)
     write_auto_section(user_md, prefs)
     write_preferences_json(home, prefs)
-    store_mem0(config, prefs, mem0_post)
+    # blocking HTTP (up to 10 s per preference): never on the event loop that serves every session
+    await asyncio.to_thread(store_mem0, config, prefs, mem0_post)
     if proposals is not None:
         for s in suggestions:
             text = (f"You keep moving away from {s['model']} for {s['task_kind']} tasks ({s['evidence']}×) → "

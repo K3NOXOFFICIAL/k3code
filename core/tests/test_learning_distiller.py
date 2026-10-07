@@ -87,3 +87,16 @@ async def test_model_switches_propose_task_tier_override(tmp_path):
     assert p.payload == {"task_tiers": {"review": "strong"}}
     await distiller.distill(log, home=tmp_path, user_md=tmp_path / "U.md", proposals=store)
     assert len([x for x in store.all() if x.kind == "optimizer"]) == 1  # latched
+
+
+async def test_mem0_writes_do_not_block_the_event_loop_thread(tmp_path):
+    """store_mem0 does blocking HTTP (10 s timeout per preference); run on the loop it froze every session."""
+    import threading
+
+    log = DecisionLog(tmp_path)
+    seed(log)
+    threads: list[threading.Thread] = []
+    cfg = Settings(mem0=Mem0Config(url="http://mem0.test", api_key_env="NOPE", agent_id="a"))
+    await distiller.distill(log, home=tmp_path, user_md=tmp_path / "USER.md", config=cfg,
+                            mem0_post=lambda u, b, h: threads.append(threading.current_thread()))
+    assert threads and all(t is not threading.main_thread() for t in threads)
