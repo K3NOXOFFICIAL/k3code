@@ -188,7 +188,9 @@ class LoopManager:
         ctx = TickContext()
         prompt = row["prompt"] + (_FOOTER_PACED if paced else _FOOTER_FIXED).format(n=n)
         started = self.clock.now()
-        run_id = self.db.insert("job_runs", owner=loop_id, owner_kind="loop", started_at=started, scheduled_for=row["next_run_at"])
+        run_id = self.db.insert(
+            "job_runs", owner=loop_id, owner_kind="loop", started_at=started, scheduled_for=row["next_run_at"]
+        )
         try:
             result: RunResult = await self.runner.run_prompt(
                 prompt, session_id=row["session_id"], cwd=row["cwd"], model=row["model"], tick=ctx if paced else None
@@ -200,8 +202,14 @@ class LoopManager:
             result = RunResult(status="failed", error=str(e))
         now = self.clock.now()
         self.db.update(
-            "job_runs", run_id, status=result.status, finished_at=now, error=result.error,
-            api_calls=result.api_calls, summary=result.text[-300:], session_id=result.session_id,
+            "job_runs",
+            run_id,
+            status=result.status,
+            finished_at=now,
+            error=result.error,
+            api_calls=result.api_calls,
+            summary=result.text[-300:],
+            session_id=result.session_id,
         )
         self.db.update("loops", loop_id, ticks=n, last_run_at=now, last_result=result.text[-300:])
         self.on_change()

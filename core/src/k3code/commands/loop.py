@@ -1,4 +1,4 @@
-"""/loop [interval] <prompt> [--times N] [--until "<cond>"] [--max-ticks N] | status | stop [id] | list."""
+"""/loop [interval] <prompt> [--times N] [--until "<cond>"] [--max-ticks N] | status | stop [id] | list"""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ from k3code.commands import CommandDef
 from k3code.commands._util import pop_option, reply, split_args
 
 USAGE = (
-    '/loop [interval] <prompt> [--times N] [--until "<condition>"] [--max-ticks N]  |  /loop status | stop [id] | list\n'
+    '/loop [interval] <prompt> [--times N] [--until "<condition>"] [--max-ticks N]\n'
+    "/loop status | stop [id] | list\n"
     "interval: 5m, 1h, daily 09:00 — omit it for a self-paced loop (the model picks the next delay)."
 )
 
@@ -41,8 +42,10 @@ class LoopCommand(CommandDef):
         args = split_args(arg)
         sub = args[0] if args else "status"
         if sub in ("status", "list") and len(args) <= 1:
-            rows = eng.loops.list(active_only=(sub == "status")) if sub == "list" else (
-                [r for r in eng.loops.list(active_only=True) if not session_id or r["session_id"] == session_id]
+            rows = (
+                eng.loops.list(active_only=(sub == "status"))
+                if sub == "list"
+                else ([r for r in eng.loops.list(active_only=True) if not session_id or r["session_id"] == session_id])
             )
             if not rows:
                 return reply("No loops." if sub == "list" else "No active loops in this session.")
@@ -67,9 +70,16 @@ class LoopCommand(CommandDef):
             return reply(f"Usage: {USAGE}")
         live = ctx.sessions.get(session_id)
         row = eng.loops.create(
-            session_id=session_id, prompt=prompt, interval=interval, times=n_times, until=until, max_ticks=n_max,
+            session_id=session_id,
+            prompt=prompt,
+            interval=interval,
+            times=n_times,
+            until=until,
+            max_ticks=n_max,
             cwd=live.stored.cwd or "",
         )
         mode = f"every {interval}" if interval else "self-paced"
-        return reply(f"⟳ Loop {row['id']} started ({mode}, max {n_max} ticks). Stop it with /loop stop {row['id']}.",
-                     loop=row["id"])
+        return reply(
+            f"⟳ Loop {row['id']} started ({mode}, max {n_max} ticks). Stop it with /loop stop {row['id']}.",
+            loop=row["id"],
+        )

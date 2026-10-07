@@ -169,6 +169,7 @@ class _HelpCommand(CommandDef):
 
 
 def build_registry() -> CommandRegistry:
+    from k3code.commands.automations_cmd import AutomationsCommand
     from k3code.commands.branch import BranchCommand
     from k3code.commands.config_cmd import ConfigCommand
     from k3code.commands.export import ExportCommand
@@ -188,7 +189,7 @@ def build_registry() -> CommandRegistry:
     for extra in (
         ExportCommand(), ImportCommand(), ForkCommand(), BranchCommand(), SettingsCommand(), ConfigCommand(),
         OutputStyleCommand(), MemoryCommand(), SkillsCommand(), McpCommand(), ReviewCommand(), GoalCommand(),
-        LoopCommand(), ScheduleCommand(),
+        LoopCommand(), ScheduleCommand(), AutomationsCommand(),
     ):
         reg.register(extra)
     for cmd in (

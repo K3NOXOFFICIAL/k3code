@@ -588,3 +588,71 @@ def memory_cmd(action: str, user: bool) -> None:
 
 if __name__ == "__main__":
     cli()
+
+
+# ── schedule (cron jobs) ──────────────────────────────────────────────
+
+
+def _scheduler_db() -> Any:
+    from k3code.automation.clock import SystemClock
+    from k3code.automation.scheduler import JobScheduler
+    from k3code.automation.store import AutomationDB
+    from k3code.daemon import k3_home
+
+    db = AutomationDB(k3_home() / "automation.db")
+    return db, JobScheduler(db, None, SystemClock())  # type: ignore[arg-type]  # CRUD only; the daemon runs jobs
+
+
+@cli.group("schedule")
+def schedule_group() -> None:
+    """Manage cron jobs (the daemon runs them; changes are picked up within seconds)."""
+
+
+@schedule_group.command("add")
+@click.argument("expr")
+@click.argument("prompt", nargs=-1, required=True)
+@click.option("--cwd", type=click.Path(path_type=Path), default=None, help="Working directory for the run")
+@click.option("--model", default="", help="Model key / tier for the run")
+@click.option("--name", default="", help="Job name")
+def schedule_add(expr: str, prompt: tuple[str, ...], cwd: Path | None, model: str, name: str) -> None:
+    """Add a job: EXPR is a cron expression, an interval (30m) or `daily 09:00`."""
+    from k3code.automation.cronexpr import ScheduleError
+
+    db, sched = _scheduler_db()
+    try:
+        job = sched.add(prompt=" ".join(prompt), schedule=expr, name=name, model=model,
+                        cwd=str((cwd or Path.cwd()).expanduser().resolve()))
+    except ScheduleError as e:
+        hint = "For natural language ('every weekday at 9') use /schedule add inside k3code."
+        raise click.ClickException(f"{e}\n{hint}") from e
+    click.echo(f"Scheduled {job['id']} “{job['name']}” ({expr}).")
+    db.close()
+
+
+@schedule_group.command("list")
+def schedule_list() -> None:
+    """Show jobs with their recent run history."""
+    import time
+
+    from k3code.automation.scheduler import format_jobs
+
+    db, _ = _scheduler_db()
+    click.echo(format_jobs(db, time.time()))
+    db.close()
+
+
+def _schedule_action(name: str, ref: str) -> None:
+    db, sched = _scheduler_db()
+    fn = {"rm": sched.remove, "pause": sched.pause, "resume": sched.resume, "run": sched.run_now}[name]
+    ok = fn(ref)
+    db.close()
+    if not ok:
+        raise click.ClickException(f"No such job: {ref}")
+    done = {"rm": "Removed", "pause": "Paused", "resume": "Resumed", "run": "Queued (the daemon picks it up shortly)"}
+    click.echo(done[name])
+
+
+for _name in ("rm", "pause", "resume", "run"):
+    schedule_group.command(_name, help=f"{_name} a job by id or name")(
+        click.argument("ref")(lambda ref, _n=_name: _schedule_action(_n, ref))
+    )

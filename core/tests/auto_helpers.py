@@ -21,9 +21,13 @@ class FakeRunner:
         self.goals: list[str] = []
         self.pace: list[float | None] = []  # per-run: seconds the "model" asks for (self-paced)
 
-    async def run_prompt(self, prompt, *, session_id=None, cwd="", model="", name="", mode="auto", tick: TickContext | None = None):
+    async def run_prompt(
+        self, prompt, *, session_id=None, cwd="", model="", name="", mode="auto", tick: TickContext | None = None
+    ):
         i = len(self.prompts)
-        self.prompts.append({"prompt": prompt, "session_id": session_id, "cwd": cwd, "model": model, "name": name, "mode": mode})
+        self.prompts.append(
+            {"prompt": prompt, "session_id": session_id, "cwd": cwd, "model": model, "name": name, "mode": mode}
+        )
         if tick is not None and i < len(self.pace) and self.pace[i] is not None:
             tick.schedule_next(self.pace[i], "test")
         return self.results[min(i, len(self.results) - 1)]

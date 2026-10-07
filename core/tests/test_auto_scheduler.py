@@ -1,10 +1,10 @@
 import asyncio
 
+from auto_helpers import FakeRunner, clock, make_db
 from k3code.automation.retry_policy import classify_failure, plan_unreachable_retry
 from k3code.automation.runner import RunResult
 from k3code.automation.scheduler import JobScheduler
 from k3code.errors import AllProvidersUnreachable
-from auto_helpers import FakeRunner, clock, make_db
 
 UNREACH = RunResult(status="failed", error="all provider entries are unreachable", failure_kind="unreachable")
 OK = RunResult(status="completed", text="done", api_calls=2)
@@ -99,7 +99,9 @@ async def test_zero_api_call_guard(tmp_path):
 
 
 async def test_quota_hold_parks_until_reset(tmp_path):
-    quota = RunResult(status="failed", error="429 quota exhausted, retry after 7200s", failure_kind="quota", retry_after=7200)
+    quota = RunResult(
+        status="failed", error="429 quota exhausted, retry after 7200s", failure_kind="quota", retry_after=7200
+    )
     c, db, r, s = mk(tmp_path, [quota, OK])
     job = s.add(prompt="p", schedule="*/10 * * * *", name="q")
     await c.advance(job["next_run_at"] - c.now() + 1)

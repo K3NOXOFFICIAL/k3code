@@ -767,7 +767,7 @@ class GatewayServer:
     def _session_finished(self, session: LiveSession, status: str) -> None:
         """Tell the automation engine (``session_event`` triggers) that a session's run ended."""
         if self.automation is not None:
-            self.automation.session_event(session.session_id, status, session.state)
+            self.automation.session_event(session.session_id, status, str(session.stored.meta.get("origin") or ""))
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""

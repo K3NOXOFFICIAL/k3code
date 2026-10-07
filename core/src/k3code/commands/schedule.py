@@ -1,4 +1,4 @@
-"""/schedule add "<cron | natural language>" <prompt> [--cwd DIR] [--model KEY] [--name NAME] | list | rm|pause|resume|run <id>."""
+"""/schedule add "<cron | natural language>" <prompt> [--cwd DIR] [--model KEY] [--name NAME] | list | rm|... <id>"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from k3code.commands import CommandDef
 from k3code.commands._util import pop_option, reply, split_args
 
 USAGE = (
-    '/schedule add "<cron expr or text like \'every weekday at 9\'>" <prompt> [--cwd DIR] [--model KEY] [--name NAME]\n'
+    "/schedule add \"<cron expr or text like 'every weekday at 9'>\" <prompt> [--cwd DIR] [--model KEY] [--name NAME]\n"
     "/schedule list | rm <id> | pause <id> | resume <id> | run <id>"
 )
 
@@ -29,7 +29,9 @@ class ScheduleCommand(CommandDef):
         if sub == "list":
             return reply(format_jobs(eng.db, eng.clock.now()))
         if sub in ("rm", "pause", "resume", "run") and len(args) == 2:
-            fn = {"rm": eng.jobs.remove, "pause": eng.jobs.pause, "resume": eng.jobs.resume, "run": eng.jobs.run_now}[sub]
+            fn = {"rm": eng.jobs.remove, "pause": eng.jobs.pause, "resume": eng.jobs.resume, "run": eng.jobs.run_now}[
+                sub
+            ]
             ok = fn(args[1])
             done = {"rm": "Removed", "pause": "Paused", "resume": "Resumed", "run": "Running now:"}[sub]
             return reply(f"{done} {args[1]}." if ok else f"No such job: {args[1]}")
@@ -51,11 +53,11 @@ class ScheduleCommand(CommandDef):
                 sched = await nl_to_schedule(eng.runner.judge, when)
             except Exception as e:  # noqa: BLE001
                 return reply(f"/schedule: {e}")
-            answer = await ctx.clarify(
-                f"“{when}” → `{sched.describe()}`. Create this job?", ["Yes", "No"], session_id
-            )
+            answer = await ctx.clarify(f"“{when}” → `{sched.describe()}`. Create this job?", ["Yes", "No"], session_id)
             if str(answer.get("answer", "")).strip().lower() not in ("yes", "y"):
                 return reply("Cancelled.")
         job = eng.jobs.add(prompt=prompt, schedule=sched, name=name, cwd=workdir, model=model)
-        return reply(f"Scheduled {job['id']} “{job['name']}” ({sched.describe()}), runs as a background session in {workdir}.",
-                     job=job["id"])
+        return reply(
+            f"Scheduled {job['id']} “{job['name']}” ({sched.describe()}), runs as a background session in {workdir}.",
+            job=job["id"],
+        )

@@ -69,14 +69,30 @@ class JobScheduler:
 
     # ── job CRUD ─────────────────────────────────────────────────────
 
-    def add(self, *, prompt: str, schedule: str | Schedule, name: str = "", cwd: str = "", model: str = "",
-            grace_s: float | None = None) -> dict[str, Any]:
+    def add(
+        self,
+        *,
+        prompt: str,
+        schedule: str | Schedule,
+        name: str = "",
+        cwd: str = "",
+        model: str = "",
+        grace_s: float | None = None,
+    ) -> dict[str, Any]:
         sched = parse_schedule(schedule) if isinstance(schedule, str) else schedule
         now = self.clock.now()
         job_id = new_id()
         self.db.insert(
-            "jobs", id=job_id, name=name or prompt[:40], prompt=prompt, schedule=sched.to_dict(), cwd=cwd, model=model,
-            next_run_at=sched.next_after(now), created_at=now, grace_s=grace_s if grace_s is not None else self.grace_s,
+            "jobs",
+            id=job_id,
+            name=name or prompt[:40],
+            prompt=prompt,
+            schedule=sched.to_dict(),
+            cwd=cwd,
+            model=model,
+            next_run_at=sched.next_after(now),
+            created_at=now,
+            grace_s=grace_s if grace_s is not None else self.grace_s,
         )
         self.wake()
         self.on_change()
@@ -186,8 +202,13 @@ class JobScheduler:
             late_h = (now - scheduled_for) / 3600
             logger.warning("job %s missed its run by %.1fh (> grace): skipped", job_id, late_h)
             self.db.insert(
-                "job_runs", owner=job_id, started_at=now, finished_at=now, status="skipped",
-                scheduled_for=scheduled_for, note=f"missed by {late_h:.1f}h, outside the grace window",
+                "job_runs",
+                owner=job_id,
+                started_at=now,
+                finished_at=now,
+                status="skipped",
+                scheduled_for=scheduled_for,
+                note=f"missed by {late_h:.1f}h, outside the grace window",
             )
             self.db.update("jobs", job_id, next_run_at=sched.next_after(now), last_status="skipped")
             self.on_change()
@@ -197,7 +218,12 @@ class JobScheduler:
         try:
             async with self.slot():
                 result = await self.runner.run_prompt(
-                    job["prompt"], session_id=None, cwd=job["cwd"], model=job["model"], name=f"cron: {job['name']}", mode="auto"
+                    job["prompt"],
+                    session_id=None,
+                    cwd=job["cwd"],
+                    model=job["model"],
+                    name=f"cron: {job['name']}",
+                    mode="auto",
                 )
         except asyncio.CancelledError:
             self.db.update("job_runs", run_id, status="interrupted", finished_at=self.clock.now())
@@ -236,13 +262,23 @@ class JobScheduler:
         fields["next_run_at"] = nxt
         self.db.update("jobs", job["id"], **fields)
         self.db.update(
-            "job_runs", run_id, status=status, finished_at=now, api_calls=result.api_calls, error=result.error,
-            summary=result.text[-300:], session_id=result.session_id, note=note,
+            "job_runs",
+            run_id,
+            status=status,
+            finished_at=now,
+            api_calls=result.api_calls,
+            error=result.error,
+            summary=result.text[-300:],
+            session_id=result.session_id,
+            note=note,
         )
         if not quiet:
             body = result.text.strip().splitlines()[-1][:160] if result.text.strip() else result.error[:160]
-            self.runner.notify(f"cron “{job['name']}” {status}: {body}", "info" if status == "completed" else "warning",
-                               key=f"job-{job['id']}")
+            self.runner.notify(
+                f"cron “{job['name']}” {status}: {body}",
+                "info" if status == "completed" else "warning",
+                key=f"job-{job['id']}",
+            )
         if self.on_fire is not None:
             self.on_fire(job, result)
         self.on_change()
@@ -261,7 +297,7 @@ def format_jobs(db: AutomationDB, now: float, runs_per_job: int = 3) -> str:
     """The ``/schedule list`` table: one line per job plus its recent run history."""
     jobs = db.rows("jobs")
     if not jobs:
-        return "No scheduled jobs. Add one: /schedule add \"0 9 * * 1-5\" <prompt>"
+        return 'No scheduled jobs. Add one: /schedule add "0 9 * * 1-5" <prompt>'
     lines: list[str] = []
     for j in jobs:
         sched = Schedule.from_dict(j["schedule"]).describe()
@@ -270,5 +306,7 @@ def format_jobs(db: AutomationDB, now: float, runs_per_job: int = 3) -> str:
         lines.append(f"{j['id']}  {j['name']}  [{sched}]  {j['state']}  next: {nxt}  runs: {j['run_count']}{hold}")
         for r in db.runs(j["id"], runs_per_job):
             tail = f" — {r['note'] or r['summary'][-60:] or r['error'][:60]}".rstrip(" —")
-            lines.append(f"    #{r['id']} {r['status']:<9} {_ago(r['started_at'], now)}  api_calls={r['api_calls']}{tail}")
+            lines.append(
+                f"    #{r['id']} {r['status']:<9} {_ago(r['started_at'], now)}  api_calls={r['api_calls']}{tail}"
+            )
     return "\n".join(lines)

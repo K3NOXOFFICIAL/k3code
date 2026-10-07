@@ -71,18 +71,23 @@ class ServerRunner:
     ) -> RunResult:
         srv = self.server
         if srv.background_paused:
-            return RunResult(status="failed", error="background work is paused (restart-storm safe mode)", failure_kind="other")
+            return RunResult(
+                status="failed", error="background work is paused (restart-storm safe mode)", failure_kind="other"
+            )
         existing = session_id is not None
         if existing:
             live = srv.live.get(session_id or "")
             if live is None:
                 stored = srv.store.get(session_id or "")
                 if stored is None:
-                    return RunResult(status="failed", error=f"session {session_id} no longer exists", failure_kind="other")
+                    return RunResult(
+                        status="failed", error=f"session {session_id} no longer exists", failure_kind="other"
+                    )
                 live = srv.live_for(stored)
         else:
-            stored = srv.store.create(title=name or "automation", model=model or srv.config.default_model,
-                                      cwd=cwd or str(Path.cwd()))
+            stored = srv.store.create(
+                title=name or "automation", model=model or srv.config.default_model, cwd=cwd or str(Path.cwd())
+            )
             stored.meta.update({"background": True, "mode": mode, "origin": self.origin})
             srv.store.save(stored)
             live = srv.live_for(stored)
@@ -109,7 +114,10 @@ class ServerRunner:
             live.extra_tools = []
             srv.broadcast_active_list()
         result = RunResult(
-            status=_STATUS.get(status, "failed"), text=text, api_calls=live.last_api_calls, error=live.last_error,
+            status=_STATUS.get(status, "failed"),
+            text=text,
+            api_calls=live.last_api_calls,
+            error=live.last_error,
             session_id=live.session_id,
         )
         if result.status == "failed":
@@ -135,8 +143,9 @@ class ServerRunner:
         """Create (or reuse) a session, set a /goal on it and let the goal loop drive it."""
         srv = self.server
         if session_id is None:
-            stored = srv.store.create(title=f"goal: {objective[:40]}", model=srv.config.default_model,
-                                      cwd=cwd or str(Path.cwd()))
+            stored = srv.store.create(
+                title=f"goal: {objective[:40]}", model=srv.config.default_model, cwd=cwd or str(Path.cwd())
+            )
             stored.meta.update({"background": True, "mode": "auto", "origin": self.origin})
             srv.store.save(stored)
             live = srv.live_for(stored)

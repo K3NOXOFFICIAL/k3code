@@ -14,7 +14,8 @@ from typing import Any
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS loops (
-    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, prompt TEXT NOT NULL, schedule TEXT, self_paced INTEGER NOT NULL DEFAULT 0,
+    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, prompt TEXT NOT NULL, schedule TEXT,
+    self_paced INTEGER NOT NULL DEFAULT 0,
     times INTEGER, until_cond TEXT, max_ticks INTEGER NOT NULL DEFAULT 50, ticks INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'active', next_run_at REAL, last_run_at REAL, created_at REAL NOT NULL,
     cwd TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', last_result TEXT NOT NULL DEFAULT '',
@@ -30,8 +31,10 @@ CREATE TABLE IF NOT EXISTS job_runs (
     api_calls INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS automations (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, trigger TEXT NOT NULL, action TEXT NOT NULL, policy TEXT NOT NULL DEFAULT '{}',
-    state TEXT NOT NULL DEFAULT 'active', created_at REAL NOT NULL, last_fired_at REAL, fire_count INTEGER NOT NULL DEFAULT 0,
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, trigger TEXT NOT NULL, action TEXT NOT NULL,
+    policy TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'active', created_at REAL NOT NULL, last_fired_at REAL,
+    fire_count INTEGER NOT NULL DEFAULT 0,
     next_run_at REAL, cwd TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS suggestions (
     id TEXT PRIMARY KEY, dedup_key TEXT NOT NULL UNIQUE, title TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
@@ -107,7 +110,9 @@ class AutomationDB:
         rows = self._db.execute(f"SELECT * FROM {table} WHERE id LIKE ?", (prefix + "%",)).fetchall()  # noqa: S608
         return self._dec(rows[0]) if len(rows) == 1 else None
 
-    def rows(self, table: str, where: str = "", args: tuple[Any, ...] = (), order: str = "created_at", limit: int = 0) -> list[dict[str, Any]]:
+    def rows(
+        self, table: str, where: str = "", args: tuple[Any, ...] = (), order: str = "rowid", limit: int = 0
+    ) -> list[dict[str, Any]]:
         assert table in TABLES
         sql = f"SELECT * FROM {table}" + (f" WHERE {where}" if where else "") + f" ORDER BY {order}"  # noqa: S608
         if limit:
