@@ -75,6 +75,8 @@ echo "$(date -Is) gateway=$HEALTH_URL" >> "$RUNS/driver.log"
 CLAUDE_FALLBACK_MODEL=${K3DEV_CLAUDE_FALLBACK:-claude-sonnet-5-5}
 GATEWAY_DOWN_GRACE=${K3DEV_GATEWAY_DOWN_GRACE:-600}   # seconds of OmniRoute outage before using Claude
 USE_CLAUDE=0
+IDLE_KILL=${K3DEV_IDLE_KILL:-480}   # seconds without transcript activity before a call counts as hung
+PROJ_DIR="$HOME/.claude/projects/$(printf '%s' "$WT" | sed 's#[/.]#-#g')"
 
 # Lean workers: no MCP servers and no skills (they cost ~30K tokens of context per call and
 # workers don't need them); auto-memory off and earlier compaction for the Claude path too.
@@ -117,15 +119,30 @@ while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
   out="$RUNS/attempt-$attempt.json"; stamp="$RUNS/.attempt-start"; touch "$stamp"
   echo "$(date -Is) attempt $attempt model=$MODEL$([ "$USE_CLAUDE" = 1 ] && echo ' [CLAUDE FALLBACK]') (session=${SESSION:-new})" >> "$RUNS/driver.log"
   if [ -z "$SESSION" ]; then
-    (cd "$WT" && nice -n 10 ionice -c3 claude -p "${SET[@]}" --model "$MODEL" "${FB[@]}" \
-       --permission-mode auto --output-format json "$PROMPT") > "$out" 2> "$RUNS/attempt-$attempt.err"
+    MSG=$PROMPT; RES=()
   else
-    (cd "$WT" && nice -n 10 ionice -c3 claude -p "${SET[@]}" --model "$MODEL" "${FB[@]}" \
-       --permission-mode auto --output-format json --resume "$SESSION" \
-       "You stopped before finishing. Do NOT stop to announce next steps — keep calling tools until the whole task is done. Continue exactly where you left off, then verify the acceptance criteria, commit, and write REPORT.md.") \
-       > "$out" 2> "$RUNS/attempt-$attempt.err"
+    MSG="You stopped before finishing. Do NOT stop to announce next steps — keep calling tools until the whole task is done. Continue exactly where you left off, then verify the acceptance criteria, commit, and write REPORT.md."
+    RES=(--resume "$SESSION")
   fi
-  rc=$?
+  (cd "$WT" && exec nice -n 10 ionice -c3 claude -p "${SET[@]}" --model "$MODEL" "${FB[@]}" \
+     --permission-mode auto --output-format json "${RES[@]}" "$MSG") > "$out" 2> "$RUNS/attempt-$attempt.err" &
+  cpid=$!
+  # Idle watchdog: a hung model call leaves the session transcript untouched; kill and resume.
+  killed_idle=0
+  while kill -0 "$cpid" 2>/dev/null; do
+    sleep 30
+    newest=$(find "$PROJ_DIR" -maxdepth 1 -name '*.jsonl' -newer "$stamp" -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1)
+    last=${newest%% *}; last=${last%.*}; [ -z "$last" ] && last=$(stat -c %Y "$stamp")
+    if [ $(( $(date +%s) - last )) -ge "$IDLE_KILL" ]; then
+      echo "$(date -Is) worker idle >${IDLE_KILL}s (hung call) — killing and resuming" >> "$RUNS/driver.log"
+      kill "$cpid" 2>/dev/null; sleep 5; kill -9 "$cpid" 2>/dev/null
+      killed_idle=1
+      [ -n "$newest" ] && SESSION=$(basename "${newest#* }" .jsonl)
+      break
+    fi
+  done
+  wait "$cpid" 2>/dev/null
+  rc=$?; [ "$killed_idle" = 1 ] && rc=124
   json=$(grep -E '^\{' "$out" | tail -1)
   sid=$(printf '%s' "$json" | python3 -c 'import sys,json
 try: print(json.load(sys.stdin).get("session_id",""))
