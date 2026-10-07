@@ -283,7 +283,7 @@ if [ -n "$BUNDLE" ]; then
 fi
 if [ "$SETUP" = 1 ]; then
   if has_tty; then
-    if [ -n "$BUNDLE" ]; then K3CODE_DATA="$DATA" "$K3" setup --step providers </dev/tty
+    if [ -n "$BUNDLE" ]; then K3CODE_DATA="$DATA" "$K3" setup --step secrets </dev/tty
     else K3CODE_DATA="$DATA" "$K3" setup </dev/tty; fi
   else
     log "no terminal available: run \`k3code setup\` later"

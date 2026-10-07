@@ -283,11 +283,10 @@ def install_release(rel: Release, token: str | None, uv: str | None = None) -> P
     vdir = versions_dir() / rel.version
     if vdir.exists():
         shutil.rmtree(vdir)
-    stage = versions_dir() / f".{rel.version}.partial"
-    shutil.rmtree(stage, ignore_errors=True)
-    stage.mkdir(parents=True)
+    # Build in place: venvs are not relocatable (absolute shebangs). `.complete` is written last.
+    vdir.mkdir(parents=True)
     try:
-        dl = stage / "dl"
+        dl = vdir / ".dl"
         dl.mkdir()
         files: dict[str, Path] = {}
         for name, url in rel.assets.items():
@@ -305,30 +304,26 @@ def install_release(rel: Release, token: str | None, uv: str | None = None) -> P
         wheel = next((p for n, p in files.items() if n.endswith(".whl")), None)
         if wheel is None:
             raise ValueError("release has no wheel")
-        subprocess.run([uv, "venv", "--python", ">=3.12", str(stage / "venv")], check=True, capture_output=True)
-        subprocess.run(
-            [uv, "pip", "install", "--python", str(stage / "venv" / "bin" / "python"), str(wheel)],
-            check=True,
-            capture_output=True,
-        )
+        subprocess.run([uv, "venv", "--python", ">=3.12", str(vdir / "venv")], check=True, capture_output=True)
+        py = str(vdir / "venv" / "bin" / "python")
+        subprocess.run([uv, "pip", "install", "--python", py, str(wheel)], check=True, capture_output=True)
         tui = next((p for n, p in files.items() if n.startswith("k3code-tui") and n.endswith(".tar.gz")), None)
         if tui:
-            (stage / "tui").mkdir()
+            (vdir / "tui").mkdir()
             with tarfile.open(tui) as t:
-                t.extractall(stage / "tui", filter="data")
+                t.extractall(vdir / "tui", filter="data")
         import platform
 
         arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine(), platform.machine())
         k3 = files.get(f"k3-linux-{arch}")
         if k3:
-            (stage / "bin").mkdir()
-            shutil.copy2(k3, stage / "bin" / "k3")
-            (stage / "bin" / "k3").chmod(0o755)
+            (vdir / "bin").mkdir()
+            shutil.copy2(k3, vdir / "bin" / "k3")
+            (vdir / "bin" / "k3").chmod(0o755)
         shutil.rmtree(dl)
-        (stage / ".complete").write_text(rel.version + "\n")
-        os.replace(stage, vdir)
+        (vdir / ".complete").write_text(rel.version + "\n")
     except BaseException:
-        shutil.rmtree(stage, ignore_errors=True)
+        shutil.rmtree(vdir, ignore_errors=True)
         raise
     return vdir
 

@@ -2,7 +2,7 @@
 
 ## Built
 - `VERSION` (repo root, single source) → `core/src/k3code/_version.py` → `k3code.__version__`, hatch dynamic version, `k3code --version`.
-- `install/install.sh` (POSIX sh, idempotent, no root): OS/arch detect, uv (asks, or `--yes`), Node ≥22 (downloads official tarball + checksum into `~/.local/share/k3code/node/<ver>`), Go only for `--from-source` (downloaded if missing), versioned layout `versions/<ver>/{venv,tui,bin/k3}`, `current` symlink, `previous` file, `~/.local/bin/{k3code,k3}` links, doctor, setup (skipped by `--headless`/`--no-setup`), `--from-bundle` (uses `k3code import` then only `setup --step providers` for secrets), `--channel`, `--version`, `--no-activate`, `--print-version`. Release mode needs a GitHub token (`GITHUB_TOKEN`/`GH_TOKEN`/`gh auth token`), documented in the script header; assets are checksum-verified against `SHA256SUMS`.
+- `install/install.sh` (POSIX sh, idempotent, no root): OS/arch detect, uv (asks, or `--yes`), Node ≥22 (downloads official tarball + checksum into `~/.local/share/k3code/node/<ver>`), Go only for `--from-source` (downloaded if missing), versioned layout `versions/<ver>/{venv,tui,bin/k3}`, `current` symlink, `previous` file, `~/.local/bin/{k3code,k3}` links, doctor, setup (skipped by `--headless`/`--no-setup`), `--from-bundle` (uses `k3code import` then only the new `setup --step secrets` (asks just for `api_key_env` names from the config that are missing in the env file)), `--channel`, `--version`, `--no-activate`, `--print-version`. Release mode needs a GitHub token (`GITHUB_TOKEN`/`GH_TOKEN`/`gh auth token`), documented in the script header; assets are checksum-verified against `SHA256SUMS`.
 - `install/uninstall.sh` (keeps `~/.k3code` and `~/.config/k3code` unless `--purge`), `install/answers.sample.yaml`.
 - `core/src/k3code/setup/`: `state.py` (setup_state.json, 0600 env file), `detect.py`, `probe.py` (presets, live `/models` test with latency), `prompter.py` (prompt_toolkit arrow-key select / answers-file), `steps.py` (12 steps), `wizard.py` (resume, `--step`). CLI: `k3code setup [--step N] [--non-interactive --answers F] [--restart] [--no-probe]`; plain `k3code` on a tty with no config starts setup. `/settings` shows the re-run hint.
 - `core/src/k3code/update.py`, `k3code update [--check|--yes|--channel|--from-source|--rollback]`, `/update [now|rollback]` (shows current/latest/changelog; applying is a second explicit command): version dir staging, smoke test (`--version` + `doctor --json --no-probe` with 0 fails), atomic symlink switch, daemon restart + 120 s health wait, automatic rollback, prune (keep 3).
@@ -10,7 +10,7 @@
 - Tests: `test_setup.py`, `test_update.py`, `test_installer.py`, `test_ci_yaml.py`.
 
 ## Verification
-- `cd core && uv run pytest` (run to a file, stdin from /dev/null; piping hangs, the known pipe issue) → exit 0, 343 tests collected, all passed. `uv run ruff check . ../scripts` → All checks passed. `python3 scripts/vendor_check.py` → All checks passed. `cd panes && go test ./internal/k3keys/...` → ok.
+- `cd core && uv run pytest` (run to a file, stdin from /dev/null; piping hangs, the known pipe issue) → 344 passed (6 warnings), exit 0. `uv run ruff check . ../scripts` → All checks passed. `python3 scripts/vendor_check.py` → All checks passed. `cd panes && go test ./internal/k3keys/...` → ok.
 - `HOME=$(mktemp -d) sh install/install.sh --from-source --yes --no-setup` (real build: uv venv + editable core, `npm ci` + TUI build, `go build ./cmd/k3`) → exit 0. Tail:
 ```
 k3code-install: current -> 0.0.1-src.88a1497
@@ -37,6 +37,8 @@ mcp: {servers: {docs: {url: http://127.0.0.1:9/mcp}}}
 skills: {roots: [/opt/skills]}
 ```
 `~/.config/k3code/env` is mode `-rw-------` with `OMNIROUTE_API_KEY=<redacted>`, `ANTHROPIC_API_KEY=<redacted>`; `USER.md` written to `$K3CODE_HOME/memory/`.
+- `--step X` rewrites only the config keys that step owns (`setup/steps.py::OWNS`) from the saved step data; `test_single_step_rerun` asserts config.yaml changes (theme, tiers) while providers stay. State is kept after completion (`done: true`); a plain `k3code setup` afterwards starts a fresh run.
+- `cd core && uv build --wheel` works with the out-of-tree `../VERSION` (wheel metadata Version: 0.0.1). `update.install_release` builds the venv in its final dir (venvs are not relocatable).
 - Resume: `test_resume_after_interrupt` interrupts at step 5, state lists steps 1-4, rerun prints "Resuming at step 'providers'" and skips 1-4.
 - CI YAML parsed with PyYAML in `test_ci_yaml.py`. `actionlint` is not installed here, so it was not run.
 - Nothing touched the real `~/.k3code`, `~/.config`, `~/.local` or systemd; all runs used temp homes.

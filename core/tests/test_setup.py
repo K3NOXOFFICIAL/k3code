@@ -81,7 +81,7 @@ def test_non_interactive_writes_config_and_env(env: Path) -> None:
             assert "SECRET" not in f.read_text(errors="ignore"), f
     user_md = (env / ".k3code" / "memory" / "USER.md").read_text()
     assert "tester" in user_md and "de" in user_md
-    assert not st.state_path().exists()  # finished -> state cleared
+    assert st.load_state().get("done")
 
 
 class _Interrupt(AnswerPrompter):
@@ -113,6 +113,17 @@ def test_single_step_rerun(env: Path) -> None:
     run_setup(AnswerPrompter(changed), only_step="theme", do_probe=False)
     state = st.load_state()
     assert state["data"]["theme"]["theme"] == "mono"
+    cfg = yaml.safe_load((env / ".k3code" / "config.yaml").read_text())
+    assert cfg["display"] == {"theme": "mono", "focus_mode": False}
+    assert [p["name"] for p in cfg["providers"]] == ["gw", "anthropic"]  # untouched
+    assert cfg["providers"][0]["models"]["cheap"] == "m-cheap"
+    assert cfg["permissions"]["hardline"] == ["ssh \\S+ systemctl"]
+    # re-running tiers changes models only
+    new = {**ANSWERS, "tiers": {"main": "x-main", "cheap": "x-cheap"}}
+    run_setup(AnswerPrompter(new), only_step="tiers", do_probe=False)
+    cfg = yaml.safe_load((env / ".k3code" / "config.yaml").read_text())
+    assert cfg["providers"][0]["models"] == {"default": "x-main", "cheap": "x-cheap"}
+    assert cfg["display"]["theme"] == "mono"
     with pytest.raises(ValueError):
         run_setup(AnswerPrompter({}), only_step="nope")
 
@@ -160,3 +171,22 @@ def test_settings_hint_and_version_flag() -> None:
             "paths": {},
         }
     )
+
+
+def test_secrets_step_asks_only_for_missing(env: Path) -> None:
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    confio.write_yaml(
+        user_config_path(),
+        {
+            "providers": [
+                {"name": "a", "kind": "openai", "base_url": "http://x/v1", "api_key_env": "HAVE_KEY"},
+                {"name": "b", "kind": "openai", "base_url": "http://y/v1", "api_key_env": "NEED_KEY"},
+            ]
+        },
+    )
+    st.set_env_var("HAVE_KEY", "already")
+    run_setup(AnswerPrompter({"secrets": {"NEED_KEY": "sk-NEW", "HAVE_KEY": "ignored"}}), only_step="secrets")
+    assert st.read_env_file() == {"HAVE_KEY": "already", "NEED_KEY": "sk-NEW"}
+    assert stat.S_IMODE(st.env_file_path().stat().st_mode) == 0o600

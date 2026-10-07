@@ -351,31 +351,89 @@ def user_md(data: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def step_summary(c: Ctx) -> dict[str, Any]:
-    from k3code import confio
-    from k3code.memory import user_memory_path
-    from k3code.paths import user_config_path
+#: config keys each step owns (single-step re-runs only touch these)
+OWNS: dict[str, tuple[str, ...]] = {
+    "usage": ("output_style", "autonomy"),
+    "providers": ("providers",),
+    "tiers": ("providers", "tiers"),
+    "permissions": ("permission_mode", "permissions"),
+    "integrations": ("mcp", "skills", "mem0", "searxng"),
+    "theme": ("display", "panes"),
+}
 
-    cfg = build_config(c.data)
-    path = user_config_path()
-    existing = confio.read_yaml(path)
-    if not cfg["providers"]:  # e.g. imported bundle already carries them
-        cfg.pop("providers")
-    merged = {**existing, **cfg}
-    confio.validate(merged)
-    confio.write_yaml(path, merged)
+
+def write_user_md(data: dict[str, Any]) -> Path:
+    from k3code.memory import user_memory_path
+
     mem = user_memory_path()
     mem.parent.mkdir(parents=True, exist_ok=True)
-    mem.write_text("# About the user\n\n" + user_md(c.data), encoding="utf-8")
-    c.say(f"Wrote {path} and {mem}")
+    mem.write_text("# About the user\n\n" + user_md(data), encoding="utf-8")
+    return mem
+
+
+def write_config(data: dict[str, Any], only: str | None = None) -> Path:
+    """Write ``config.yaml`` from the step data. With ``only``, change just the keys that step owns."""
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    cfg = build_config(data)
+    path = user_config_path()
+    existing = confio.read_yaml(path)
+    if only is not None:
+        keys = OWNS.get(only, ())
+        cfg = {k: v for k, v in cfg.items() if k in keys}
+        if "providers" in cfg and "tiers" not in data:  # keep the models already configured
+            old = {p["name"]: p.get("models", {}) for p in existing.get("providers", [])}
+            cfg["providers"] = [{**p, "models": old.get(p["name"], {})} for p in cfg["providers"]]
+        # a key owned by the step but now empty (e.g. all MCP servers removed) is cleared
+        merged = {k: v for k, v in existing.items() if k not in keys or k in cfg}
+    else:
+        if not cfg["providers"]:  # e.g. imported bundle already carries them
+            cfg.pop("providers")
+        merged = existing
+    merged = {**merged, **cfg}
+    confio.validate(merged)
+    confio.write_yaml(path, merged)
+    return path
+
+
+def step_summary(c: Ctx) -> dict[str, Any]:
     import asyncio
 
     from k3code import doctor
     from k3code.config import load_config
 
+    path = write_config(c.data)
+    mem = write_user_md(c.data)
+    c.say(f"Wrote {path} and {mem}")
     checks = asyncio.run(doctor.run_checks(load_config(), probe=c.do_probe))
     c.say(doctor.format_report(checks))
     return {"config": str(path)}
+
+
+def step_secrets(c: Ctx) -> dict[str, Any]:
+    """Ask only for API keys that the (e.g. imported) config references but the env file lacks."""
+    from k3code import confio
+    from k3code.paths import user_config_path
+    from k3code.setup.state import read_env_file
+
+    have = read_env_file()
+    asked: list[str] = []
+    for prov in confio.read_yaml(user_config_path()).get("providers", []):
+        name = prov.get("api_key_env", "")
+        if not name or name in have or os.environ.get(name):
+            continue
+        value = c.p.raw(f"secrets.{name}")
+        if value is None:
+            value = c.p.text(
+                f"secrets.{name}", f"{name} (for provider {prov.get('name', '?')}; blank = skip)", secret=True
+            )
+        if value:
+            set_env_var(name, str(value))
+            os.environ[name] = str(value)
+            asked.append(name)
+    c.say(f"Stored {len(asked)} secret(s) in {env_file_path()} (0600)." if asked else "No missing secrets.")
+    return {"stored": asked}
 
 
 @dataclass
@@ -400,4 +458,14 @@ STEPS: list[Step] = [
     Step("summary", step_summary, "Summary"),
 ]
 STEP_NAMES = [s.name for s in STEPS]
-__all__ = ["STEPS", "STEP_NAMES", "Ctx", "build_config", "apply_import", "STYLE_PRESETS"]
+__all__ = [
+    "STEPS",
+    "STEP_NAMES",
+    "Ctx",
+    "build_config",
+    "write_config",
+    "write_user_md",
+    "step_secrets",
+    "apply_import",
+    "STYLE_PRESETS",
+]
