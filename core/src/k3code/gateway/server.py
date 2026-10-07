@@ -156,7 +156,7 @@ class LiveSession:
     @property
     def state(self) -> str:
         """``working`` (also while paused), ``needs_input``, ``completed``/``failed`` (unattended run) or ``idle``."""
-        if self.needs_input:
+        if self.needs_input or self.server.has_open_request(self.session_id):
             return "needs_input"
         if self.streaming:
             return "working"
@@ -317,13 +317,28 @@ class GatewayServer:
         self.live[live.session_id] = live
         self.attach(client, live)
 
-    def attach(self, client: Client, live: LiveSession) -> None:
-        """Point ``client`` at ``live`` and replay any approvals it is still waiting on."""
+    def has_open_request(self, session_id: str) -> bool:
+        """An approval/clarify request of this session is waiting for an answer (the session needs input)."""
+        return any(sid == session_id for sid, _ in self._open_requests.values())
+
+    def attach(self, client: Client, live: LiveSession, *, replay_delay: float = 0.0) -> None:
+        """Point ``client`` at ``live`` and replay any approvals it is still waiting on.
+
+        ``replay_delay`` > 0 sends them a moment later, so a client that resets its view when the
+        ``session.activate``/``session.resume`` response arrives does not drop the replayed dialog.
+        """
         client.session_id = live.session_id
-        for req_id, (sid, frame) in list(self._open_requests.items()):
-            if sid == live.session_id:
-                client.send(frame)
-                logger.debug("re-sent open request %s to %s", req_id, client.name)
+
+        def replay() -> None:
+            for req_id, (sid, frame) in list(self._open_requests.items()):
+                if sid == live.session_id and client.session_id == live.session_id:
+                    client.send(frame)
+                    logger.debug("re-sent open request %s to %s", req_id, client.name)
+
+        if replay_delay > 0:
+            asyncio.get_running_loop().call_later(replay_delay, replay)
+        else:
+            replay()
 
     def live_for(self, stored: Any) -> LiveSession:
         """The running LiveSession for a stored session (created on first use)."""
@@ -1662,18 +1677,45 @@ async def _session_active_list(server: GatewayServer, params: dict[str, Any]) ->
     return out
 
 
+def transcript_rows(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Stored (OpenAI-shaped) messages -> the ``{role, text, name, context}`` rows the TUI renders on resume.
+
+    System prompts and assistant tool-call stubs are dropped; a tool result becomes a ``tool`` row named after
+    the call that produced it.
+    """
+    names: dict[str, tuple[str, str]] = {}
+    rows: list[dict[str, Any]] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant":
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                names[str(tc.get("id"))] = (str(tc.get("name") or fn.get("name") or "tool"),
+                                            str(tc.get("arguments") or fn.get("arguments") or "")[:80])
+        content = m.get("content")
+        if isinstance(content, list):
+            content = "".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
+        if role == "tool":
+            name, ctx = names.get(str(m.get("tool_call_id")), (str(m.get("name") or "tool"), ""))
+            rows.append({"role": "tool", "name": name, "context": ctx})
+        elif role in ("user", "assistant") and isinstance(content, str) and content.strip():
+            rows.append({"role": role, "text": content})
+    return rows
+
+
 async def _session_resume(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     sid = _require(params, "session_id")
     stored = server.store.get(str(sid))
     if stored is None:
         raise _InvalidParams(f"unknown session: {sid}")
     live = server.live_for(stored)  # a background session keeps its running state
-    server.session = live
+    server.live[live.session_id] = live
+    server.attach(_ctx_client.get() or server._stdio_client, live, replay_delay=0.15)
     server.emit("session.resume_progress", {"phase": "done", "status": "done", "message_count": len(stored.messages)})
     return {
         "session_id": stored.session_id,
         "message_count": len(live.stored.messages),
-        "messages": live.stored.messages,
+        "messages": transcript_rows(live.stored.messages),
         "info": live.live_info(),
     }
 
@@ -1684,8 +1726,27 @@ async def _session_activate(server: GatewayServer, params: dict[str, Any]) -> di
     if stored is None:
         raise _InvalidParams(f"unknown session: {sid}")
     live = server.live_for(stored)
-    server.session = live
-    return {"session_id": stored.session_id, "info": live.live_info()}
+    server.live[live.session_id] = live
+    server.attach(_ctx_client.get() or server._stdio_client, live, replay_delay=0.15)
+    return {"session_id": stored.session_id, "info": live.live_info(), "status": live.state,
+            "running": live.streaming, "messages": transcript_rows(live.stored.messages)}
+
+
+async def _session_close(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """The TUI closes the session it just left (``/resume``, new session). An idle foreground session is dropped from
+    the live registry (its stored copy stays resumable); one that is running, backgrounded or waiting for an
+    answer keeps going, so it stays in the agent strip."""
+    sid = str(params.get("session_id") or "")
+    live = server.live.get(sid)
+    if live is None:
+        return {"closed": False, "reason": "not live"}
+    if (live.streaming or live.background or live.needs_input or server.has_open_request(sid)
+            or any(c.session_id == sid for c in server.clients)):
+        return {"closed": False, "reason": "still in use"}
+    server.live.pop(sid, None)
+    if live.reliability is not None:
+        await live.reliability.stop()
+    return {"closed": True}
 
 
 async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -1954,6 +2015,8 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         on = raw if isinstance(raw, bool) else str(raw).lower() in ("1", "true", "on", "yes")
         server.config.display.focus_mode = on
         return {"ok": True, "key": key, "value": "on" if server.config.display.focus_mode else "off"}
+    if key == "model":  # TUI /model <key> and the model picker: switch the session's model key
+        return await _config_set_model(server, params)
     if "." not in key:
         raise _InvalidParams(f"unsupported config key: {key}")
     section, field_name = key.split(".", 1)
@@ -1962,6 +2025,34 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         raise _InvalidParams(f"unknown config path: {key}")
     setattr(section_obj, field_name, params.get("value"))
     return {"ok": True, "key": key}
+
+
+async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``config.set model``: value is ``<model-key> [--provider p] [--session|--global]`` (picker flags ignored)."""
+    parts = str(params.get("value") or "").split()
+    keys: list[str] = []
+    skip = False
+    for part in parts:
+        if skip:
+            skip = False
+        elif part == "--provider":
+            skip = True
+        elif not part.startswith("--"):
+            keys.append(part)
+    if not keys:
+        raise _InvalidParams("model key required")
+    key = keys[0]
+    known = {m for p in server.config.providers for m in p.models} | {server.config.default_model}
+    if key not in known:
+        raise _InvalidParams(f"unknown model key: {key} (known: {', '.join(sorted(known))})")
+    session = server._session_for(params.get("session_id"))
+    if session is None:
+        server.config.default_model = key
+    else:
+        session.stored.model = key
+        server.store.save(session.stored)
+        session.emit("session.info", session.live_info())
+    return {"ok": True, "key": "model", "value": key}
 
 
 async def _setup_status(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -2050,6 +2141,7 @@ _HANDLERS: dict[str, Any] = {
     "session.active_list": _session_active_list,
     "session.resume": _session_resume,
     "session.activate": _session_activate,
+    "session.close": _session_close,
     "session.delete": _session_delete,
     "session.title": _session_title,
     "session.interrupt": _session_interrupt,

@@ -25,6 +25,15 @@ async def main():
     server.panes = PaneLink.from_env(server._pane_inject)
     assert server.panes is not None, "no TUIOS env"
     frames = server._frames
+    if os.environ.get("LIVE_TS"):  # exit check: log when each state is handed to tuios (wall clock, epoch seconds)
+        _orig_report = server.panes.reporter.report_tuios
+
+        def _logged_report(state, *a, **k):
+            with open(os.environ["LIVE_TS"], "a") as fh:
+                fh.write(f"{time.time():.4f} {state}\n")
+            return _orig_report(state, *a, **k)
+
+        server.panes.reporter.report_tuios = _logged_report
     server._write = lambda line: (frames.append(line), server.panes.on_server_line(line))
 
     async def rpc(method, params):

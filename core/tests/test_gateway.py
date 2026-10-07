@@ -346,3 +346,20 @@ def test_env_var_cleanup(monkeypatch):
     monkeypatch.delenv("K3CODE_NETWORK_COOLDOWN_SECONDS", raising=False)
     monkeypatch.delenv("K3CODE_FAKE_PROVIDER", raising=False)
     assert os.environ.get("K3CODE_FAKE_PROVIDER") is None
+
+
+async def test_config_set_model_switches_session_model():
+    """TUI /model <key> and the picker send config.set key=model; it must not be 'unsupported'."""
+    server = make_server(config=Settings(providers=[ProviderEntry(
+        name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "a", "cheap": "b"})]))
+    sid = (await rpc(server, "session.create", {"model": "default", "cwd": "/tmp"}))["result"]["session_id"]
+    n = len(server._frames)  # type: ignore[attr-defined]
+    line = {"jsonrpc": "2.0", "id": 2, "method": "config.set",
+            "params": {"key": "model", "session_id": sid, "value": "cheap --provider t --session"}}
+    await server._handle_line(json.dumps(line))
+    ok = next(f for f in frames_of(server)[n:] if f.get("id") == 2)
+    assert ok["result"]["value"] == "cheap"
+    assert server._session_for(sid).stored.model == "cheap"
+    bad = await rpc(server, "config.set", {"key": "model", "session_id": sid, "value": "nope"}, req_id=3)
+    assert "error" in bad
+    await server.close()

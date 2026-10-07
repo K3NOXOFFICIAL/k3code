@@ -7,3 +7,5 @@ dist/
 .pytest_cache/
 .ruff_cache/
 .k3code/
+scripts/exit/rows/
+tui/node_modules

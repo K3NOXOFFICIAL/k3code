@@ -187,7 +187,11 @@ class _HelpCommand(CommandDef):
         super().__init__(name="help", aliases=["h", "?"], help="List available commands")
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
-        lines = [f"/{name} — {cmd.help}" for name, cmd in sorted(ctx.commands._commands.items()) if name == cmd.name]
+        lines = [
+            f"/{name} — {cmd.help.splitlines()[0] if cmd.help else ''}"
+            for name, cmd in sorted(ctx.commands._commands.items())
+            if name == cmd.name
+        ]
         return {"type": "message", "message": "Commands:\n" + "\n".join(lines)}
 
 

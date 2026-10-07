@@ -21,6 +21,8 @@ the classifier, the planner and the executor differently. Every call is recorded
 
 Any step may carry ``"when": "first"`` (only before a tool result is in the conversation) or
 ``"when": "after_tool"`` (only after one), so a script can call a tool once and then finish.
+``"turn_first"`` / ``"turn_after_tool"`` do the same relative to the latest user message, so one script
+can serve several user turns.
 
 ``text``/``tool_call``/``usage`` accumulate into one assistant turn (a final
 done event); ``error`` aborts the stream with a ProviderError so the router
@@ -80,6 +82,8 @@ class FakeProvider(Provider):
         usage: tuple[int, int] | None = None
 
         has_tool_result = any(m.role == "tool" for m in messages)
+        last_user = max((i for i, m in enumerate(messages) if m.role == "user"), default=-1)
+        turn_tool_result = any(m.role == "tool" for m in messages[last_user + 1 :])
         haystack = "\n".join(str(m.content or "") for m in messages)
         self.log.append({"model": model, "tools": [t.name for t in tools], "text": haystack})
         for step in self.steps:
@@ -90,6 +94,8 @@ class FakeProvider(Provider):
             when = step.get("when")  # optional: "first" = before any tool result, "after_tool" = after one
             if (when == "first" and has_tool_result) or (when == "after_tool" and not has_tool_result):
                 continue
+            if (when == "turn_first" and turn_tool_result) or (when == "turn_after_tool" and not turn_tool_result):
+                continue  # same, but relative to the latest user message (multi-turn scripts)
             kind = step.get("type")
             if kind == "text":
                 text = str(step.get("text", ""))
