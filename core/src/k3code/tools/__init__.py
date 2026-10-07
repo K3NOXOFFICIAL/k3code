@@ -39,16 +39,14 @@ class ToolRegistry:
 
 
 def _resolve_path(path: str, cwd: Path | None = None) -> Path:
-    """Resolve a path relative to cwd, expand ~, and guard against traversal."""
+    """Resolve a path against the session cwd (never the process cwd) and expand ~.
+
+    Whether the path may be touched is decided by the permission engine
+    (project roots, add-dirs, approvals), not here.
+    """
     base = cwd or Path.cwd()
     p = Path(path).expanduser()
-    if not p.is_absolute():
-        p = (base / p).resolve()
-    try:
-        p.relative_to(base.resolve())
-    except ValueError:
-        raise ValueError(f"Path {path!r} escapes the working directory") from None
-    return p
+    return p if p.is_absolute() else (base / p).resolve()
 
 
 async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
@@ -201,6 +199,11 @@ async def tool_todo(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     return {"ok": True, "note": "todo is a no-op in M0; use agent's internal list"}
 
 
+async def tool_exit_plan(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
+    """Placeholder: the agent loop intercepts exit_plan and asks the user."""
+    return {"error": "exit_plan is only available in plan mode"}
+
+
 # ── Registry builder ───────────────────────────────────────────────────
 
 
@@ -324,5 +327,21 @@ def build_registry() -> ToolRegistry:
             side_effect=False,
         ),
         tool_todo,
+    )
+    reg.register(
+        ToolSpec(
+            name="exit_plan",
+            description=(
+                "Plan mode only: present your finished plan to the user for approval. "
+                "On approval the session leaves plan mode and you may start implementing."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"plan": {"type": "string", "description": "The full plan, markdown"}},
+                "required": ["plan"],
+            },
+            side_effect=False,
+        ),
+        tool_exit_plan,
     )
     return reg

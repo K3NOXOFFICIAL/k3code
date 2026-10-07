@@ -5,20 +5,39 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from k3code.permissions import PermissionMode, check_permission
+from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
+from k3code.permissions.state import PermissionState
 from k3code.providers.types import Message, StreamEvent, ToolCall
 from k3code.router import Router, RouterEvent
 from k3code.tools import build_registry
 
 logger = logging.getLogger(__name__)
 
-#: Callback asked when a side-effect tool needs interactive approval:
-#: (tool_name, arguments) → allowed?. ``None`` means "no prompter": ask-mode
-#: denials fall through to check_permission's message.
-ApprovalCallback = Callable[[str, dict[str, Any]], Awaitable[bool]]
+@dataclass
+class ApprovalResult:
+    """User's answer to an approval prompt."""
+
+    choice: str = "deny"  # once | session | always | deny
+    reason: str = ""
+
+    @property
+    def allowed(self) -> bool:
+        return self.choice != "deny"
+
+    def __bool__(self) -> bool:
+        return self.allowed
+
+
+#: Asked when the engine says "ask": (tool, arguments, decision) → answer.
+ApprovalCallback = Callable[[str, dict[str, Any], Decision], Awaitable[ApprovalResult]]
+#: exit_plan: (plan text) → mode to switch to ("default"/"accept-edits"), or None if rejected.
+PlanCallback = Callable[[str], Awaitable[str | None]]
+#: Told about every side effect the mode auto-allowed: (tool, arguments, decision).
+AutoAllowCallback = Callable[[str, dict[str, Any], Decision], None]
 
 
 class AgentLoop:
@@ -36,21 +55,39 @@ class AgentLoop:
         on_text_delta: Callable[[str], Awaitable[None]] | None = None,
         cwd: Path | None = None,
         approval_callback: ApprovalCallback | None = None,
+        plan_callback: PlanCallback | None = None,
+        on_auto_allow: AutoAllowCallback | None = None,
+        permissions: PermissionState | None = None,
     ) -> None:
         self.router = router
         self.system_prompt = system_prompt
         self.max_turns = max_turns
-        self.permission_mode = PermissionMode(permission_mode)
+        self.cwd = cwd or Path.cwd()
+        self.permissions = permissions or PermissionState(mode=PermissionMode(permission_mode), cwd=self.cwd)
+        self.plan_callback = plan_callback
+        self.on_auto_allow = on_auto_allow
         self.headless = headless
         self.on_event = on_event
         self.on_text_delta = on_text_delta
-        self.cwd = cwd or Path.cwd()
         self.approval_callback = approval_callback
         self.tools = build_registry()
         self._interrupt = asyncio.Event()
         #: Conversation messages of the most recent run(), in order (system first).
         #: The gateway persists these after each turn.
         self.turn_messages: list[Message] = []
+
+    @property
+    def permission_mode(self) -> PermissionMode:
+        return self.permissions.mode
+
+    @permission_mode.setter
+    def permission_mode(self, mode: PermissionMode | str) -> None:
+        self.permissions.mode = PermissionMode(mode)
+
+    def tool_specs(self) -> list[Any]:
+        """Tool specs for the model; ``exit_plan`` is only offered in plan mode."""
+        plan = self.permissions.mode == PermissionMode.PLAN
+        return [s for s in self.tools.specs() if plan or s.name != EXIT_PLAN_TOOL]
 
     def interrupt(self) -> None:
         """Request cancellation of the running turn (checked between steps)."""
@@ -90,7 +127,7 @@ class AgentLoop:
                 return
             logger.info("Turn %d/%d", turn + 1, self.max_turns)
             stream = self.router.stream(
-                messages, self.tools.specs(), model=model, max_tokens=max_tokens, temperature=temperature
+                messages, self.tool_specs(), model=model, max_tokens=max_tokens, temperature=temperature
             )
 
             tool_calls: list[ToolCall] = []
@@ -156,18 +193,44 @@ class AgentLoop:
         if not handler:
             return {"error": f"Unknown tool: {tool_call.name}"}
 
-        # Permission check; an interactive prompter may grant what the static
-        # policy denies (ask mode).
-        if spec.side_effect:
-            allowed, message = check_permission(self.permission_mode, tool_call.name, headless=self.headless)
-            if not allowed and self.approval_callback is not None and not self.headless:
-                allowed = await self.approval_callback(tool_call.name, tool_call.arguments)
-            if not allowed:
-                return {"error": message or f"Permission denied: {tool_call.name}"}
-
         args = tool_call.arguments
+        if tool_call.name == EXIT_PLAN_TOOL:
+            return await self._exit_plan(args)
+        decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
+        if decision.action == "deny":
+            return {"error": decision.message or f"Permission denied: {tool_call.name}"}
+        if decision.action == "ask":
+            if self.approval_callback is None:
+                return {"error": f"Permission denied: {tool_call.name} requires approval (no prompter)"}
+            answer = await self.approval_callback(tool_call.name, args, decision)
+            if not answer.allowed:
+                what = _preview(tool_call.name, args)
+                return {"error": f"User denied: {what}" + (f" — {answer.reason}" if answer.reason else "")}
+        elif decision.auto_allowed and self.on_auto_allow is not None:
+            self.on_auto_allow(tool_call.name, args, decision)
+
         try:
             return await handler(args, cwd=self.cwd)
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
             return {"error": f"Tool execution failed: {e}"}
+
+    async def _exit_plan(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.permissions.mode != PermissionMode.PLAN:
+            return {"error": "exit_plan is only available in plan mode"}
+        plan = str(args.get("plan", "")).strip()
+        if not plan:
+            return {"error": "exit_plan needs a non-empty plan"}
+        if self.plan_callback is None:
+            return {"error": "Plan not approved: no interactive approver (headless)"}
+        target = await self.plan_callback(plan)
+        if target is None:
+            return {"error": "User rejected the plan; revise it and call exit_plan again."}
+        self.permissions.mode = PermissionMode(target)
+        return {"content": f"Plan approved; mode is now {self.permissions.mode.value}. Implement it."}
+
+
+def _preview(tool: str, args: dict[str, Any]) -> str:
+    if tool == "bash":
+        return str(args.get("command", ""))[:200]
+    return f"{tool} {args.get('path', '')}".strip()

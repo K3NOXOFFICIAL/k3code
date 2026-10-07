@@ -9,6 +9,7 @@ kept in memory by the server; this store only persists what resume needs.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
@@ -29,6 +30,7 @@ class StoredSession:
     usage: dict[str, Any] = field(default_factory=dict)
     created_at: float = 0.0
     updated_at: float = 0.0
+    meta: dict[str, Any] = field(default_factory=dict)  # per-session extras: add_dirs, mode
 
 
 _SCHEMA = """
@@ -54,6 +56,8 @@ class SessionStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(self.path))
         self._db.execute(_SCHEMA)
+        with contextlib.suppress(sqlite3.OperationalError):  # column already exists
+            self._db.execute("ALTER TABLE sessions ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
         self._db.commit()
 
     def create(self, *, title: str = "", model: str = "", provider: str = "", cwd: str = "") -> StoredSession:
@@ -77,7 +81,7 @@ class SessionStore:
 
     def get(self, session_id: str) -> StoredSession | None:
         row = self._db.execute(
-            "SELECT session_id, title, model, provider, cwd, messages, usage, created_at, updated_at"
+            "SELECT session_id, title, model, provider, cwd, messages, usage, created_at, updated_at, meta"
             " FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
@@ -93,6 +97,7 @@ class SessionStore:
             usage=json.loads(row[6] or "{}"),
             created_at=row[7],
             updated_at=row[8],
+            meta=json.loads(row[9] or "{}"),
         )
 
     def list(self, *, limit: int = 50) -> list[StoredSession]:
@@ -122,7 +127,7 @@ class SessionStore:
     def save(self, sess: StoredSession) -> None:
         sess.updated_at = time.time()
         self._db.execute(
-            "UPDATE sessions SET title=?, model=?, provider=?, cwd=?, messages=?, usage=?, updated_at=?"
+            "UPDATE sessions SET title=?, model=?, provider=?, cwd=?, messages=?, usage=?, updated_at=?, meta=?"
             " WHERE session_id=?",
             (
                 sess.title,
@@ -132,6 +137,7 @@ class SessionStore:
                 json.dumps(sess.messages, ensure_ascii=False),
                 json.dumps(sess.usage, ensure_ascii=False),
                 sess.updated_at,
+                json.dumps(sess.meta, ensure_ascii=False),
                 sess.session_id,
             ),
         )
