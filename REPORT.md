@@ -24,7 +24,7 @@ All 12 remaining M1 commands are implemented as one module each in `core/src/k3c
 ## Verification
 
 ```
-cd core && uv run pytest -o addopts="" -q     → 285 passed in 12s   (was 213 before; +72 new)
+cd core && uv run pytest -o addopts="" -q     → 285 passed in 12s  
 cd core && uv run ruff check src tests        → All checks passed!
 cd tui  && npm run build                      → built dist/entry.js
 cd tui  && npm run typecheck                  → exit 0
