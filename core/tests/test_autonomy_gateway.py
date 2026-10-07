@@ -266,6 +266,19 @@ async def test_background_turn_escalates_after_repeated_tool_errors(tmp_path, mo
     assert rows["by_tier"]["cheap"]["calls"] == 1 and rows["by_tier"]["main"]["calls"] == 1
 
 
+async def test_background_turn_escalates_when_the_loop_guard_fires(tmp_path, monkeypatch):
+    same = {"type": "tool_call", "model": "m-cheap", "id": "c1", "name": "bash", "arguments": {"command": "echo hi"}}
+    steps = [same, {"type": "text", "model": "m-main", "text": "recovered"}]
+    server = make(tmp_path, monkeypatch, steps)
+    await start(server, tmp_path)
+    await run_turn(server, "do the thing", background=True)
+    esc = events(server, "routing.escalated")
+    assert [(e["from"], e["to"], e["reason"]) for e in esc] == [("cheap", "main", "loop_guard")]
+    assert models_called(server)[-1] == "m-main"
+    assert server.session.stored.messages[-1]["content"] == "recovered"
+    assert server.session.needs_input is False  # the escalated attempt cleared the stop
+
+
 async def test_background_turn_that_succeeds_stays_on_cheap(tmp_path, monkeypatch):
     server = make(tmp_path, monkeypatch, [{"type": "text", "text": "all good"}])
     await start(server, tmp_path)
