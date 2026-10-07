@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,8 @@ from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 
 KINDS = ("consequence", "also_setup", "improvement")
+#: M5 kinds created by the learning package (not by the LLM proposer); accepting them runs a handler.
+LEARNED_KINDS = ("permission_rule", "preference", "project_setup", "skill", "optimizer")
 
 PROPOSER_SYSTEM = (
     "You think one step ahead of a coding agent. Given the plan or the finished task, reply with ONE JSON "
@@ -39,6 +41,9 @@ class Proposal:
     status: str = "pending"  # pending | accepted | dismissed
     session: str = ""
     ts: float = 0.0
+    #: M5: structured data for kinds the gateway applies itself (permission_rule, skill, optimizer, ...)
+    payload: dict[str, Any] = field(default_factory=dict)
+    project: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -85,14 +90,15 @@ class ProposalStore:
     def get(self, pid: str) -> Proposal | None:
         return next((p for p in self.all() if p.id == pid), None)
 
-    def add(self, kind: str, text: str, action: str, session: str = "") -> Proposal | None:
+    def add(self, kind: str, text: str, action: str, session: str = "", *, payload: dict[str, Any] | None = None,
+            project: str = "", key: str | None = None) -> Proposal | None:
         """Store a new proposal; None when its dedup key was seen before (pending, accepted or dismissed)."""
         existing = self.all()
-        key = dedup_key(kind, text)
+        key = key or dedup_key(kind, text)
         if any(p.key == key for p in existing):
             return None
         p = Proposal(id=f"p{len(existing) + 1}", kind=kind, text=text, action=action, key=key,
-                     session=session, ts=time.time())
+                     session=session, ts=time.time(), payload=payload or {}, project=project)
         self._write(p)
         return p
 
@@ -105,12 +111,21 @@ class ProposalStore:
         return p
 
 
-async def propose(caller: Any, store: ProposalStore, context: str, *, session_id: str = "") -> list[Proposal]:
-    """Run the proposer on ``context`` and return the newly stored proposals (never raises)."""
+async def propose(caller: Any, store: ProposalStore, context: str, *, session_id: str = "",
+                  ranker: Any = None, preferences: list[str] | None = None, project: str = "") -> list[Proposal]:
+    """Run the proposer on ``context`` and return the newly stored proposals (never raises).
+
+    ``ranker(items) -> items`` (M5) orders/filters suggestions from decision history; ``preferences`` are the
+    top learned preferences handed to the proposer prompt.
+    """
+    system = PROPOSER_SYSTEM
+    if preferences:
+        system += "\nLearned user preferences (bias suggestions toward these):\n" + "\n".join(
+            f"- {p}" for p in preferences[:5])
     try:
         res = await caller.complete(
             TaskKind.CLASSIFICATION,
-            [Message(role="system", content=PROPOSER_SYSTEM), Message(role="user", content=context[-6000:])],
+            [Message(role="system", content=system), Message(role="user", content=context[-6000:])],
             session_id=session_id,
             max_tokens=500,
             timeout=30,
@@ -118,8 +133,11 @@ async def propose(caller: Any, store: ProposalStore, context: str, *, session_id
     except Exception:  # noqa: BLE001 - proposals are a nicety
         return []
     out: list[Proposal] = []
-    for item in parse_proposals(res.text):
-        p = store.add(item["kind"], item["text"], item["action"], session_id)
+    items = parse_proposals(res.text)
+    if ranker is not None:
+        items = ranker(items)
+    for item in items:
+        p = store.add(item["kind"], item["text"], item["action"], session_id, project=project)
         if p is not None:
             out.append(p)
     return out
