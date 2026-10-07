@@ -60,11 +60,67 @@ def sub(name: str) -> Path:
     return d
 
 
+def _score_scope(rows: list[dict]) -> tuple[int, list[str], list[str], dict[tuple[str, str], int]]:
+    """Run the product's classifier prompt + parser + danger floor over ``rows`` on the live backend.
+
+    Returns (hits, misses, errors, confusion) where confusion[(want, got)] counts rows; ``got`` is "unparsed" when the
+    reply was unusable (the product would then use the ``small`` fallback; here it counts as a miss).
+    """
+    from k3code.autonomy.scope import apply_floor, classifier_messages, parse_reply, repo_summary
+
+    summary = repo_summary(REPO)
+    hit, misses, errors = 0, [], []
+    matrix: dict[tuple[str, str], int] = {}
+    for r in rows:
+        msgs = classifier_messages(r["prompt"], summary, "")
+        try:
+            text = lib.live_chat(BACKEND, [{"role": m.role, "content": m.content} for m in msgs])
+        except Exception as e:  # noqa: BLE001 - a provider error must not abort the other rows
+            errors.append(f"#{r['id']} {type(e).__name__}: {str(e)[:80]}")
+            continue
+        v, why = parse_reply(text)
+        v = apply_floor(v, r["prompt"]) if v else None
+        got = v.scope if v else "unparsed"
+        matrix[(r["scope"], got)] = matrix.get((r["scope"], got), 0) + 1
+        if got == r["scope"]:
+            hit += 1
+        else:
+            misses.append(f"#{r['id']} want {r['scope']} got {got}" + ("" if v else f" ({why})"))
+    return hit, misses, errors, matrix
+
+
+def _fmt_matrix(matrix: dict[tuple[str, str], int]) -> str:
+    from k3code.autonomy.scope import SCOPES
+
+    cols = [*SCOPES, "unparsed"]
+    head = "want\\got  " + " ".join(f"{c[:8]:>8}" for c in cols)
+    lines = [head] + [f"{w:<9} " + " ".join(f"{matrix.get((w, c), 0):>8}" for c in cols) for w in SCOPES]
+    return "confusion matrix (rows = label, columns = classifier):\n" + "\n".join(lines)
+
+
+def scope_blind() -> None:
+    """Generalisation check on scope_eval_blind.jsonl (40 rows). Prints agreement; never an exit row.
+
+    The blind set was written before the classifier prompt was tuned; never tune the prompt against it.
+    """
+    from k3code.autonomy.scope import SCOPES
+
+    rows = [json.loads(x) for x in (HERE / "scope_eval_blind.jsonl").read_text().splitlines() if x.strip()]
+    assert len(rows) == 40 and all(r["scope"] in SCOPES for r in rows)
+    if not LIVE_OK:
+        print(f"scope blind: not run, no live backend: {LIVE_DETAIL}")
+        return
+    hit, misses, errors, matrix = _score_scope(rows)
+    scored = len(rows) - len(errors)
+    print(f"scope blind ({BACKEND['label']}): agreement {hit}/{scored} = {100 * hit / max(scored, 1):.0f}%"
+          f" (errors: {len(errors)})\nmisses: {'; '.join(misses) or 'none'}\n{_fmt_matrix(matrix)}")
+
+
 # ---------------------------------------------------------------- 1. scope eval
 def scope_eval() -> None:
     crit = "30-task scope eval: classifier agrees with labels on >=80%"
     rows = [json.loads(x) for x in (HERE / "scope_eval.jsonl").read_text().splitlines() if x.strip()]
-    from k3code.autonomy.scope import SCOPES, apply_floor, classifier_messages, parse_verdict, repo_summary
+    from k3code.autonomy.scope import SCOPES
 
     assert len(rows) == 30 and all(r["scope"] in SCOPES and r["label_source"] == "proposed-by-claude" for r in rows)
     dist = {s: sum(r["scope"] == s for r in rows) for s in SCOPES}
@@ -74,24 +130,11 @@ def scope_eval() -> None:
              f"eval set written and validated (30 rows, label dist {dist}); live classifier not run: {LIVE_DETAIL}",
              f"the owner confirms/edits the labels in scope_eval.jsonl, then re-run scripts/exit/m4_autonomy.py {RESET}")
         return
-    summary = repo_summary(REPO)
-    hit, misses, errors = 0, [], []
-    for r in rows:
-        msgs = classifier_messages(r["prompt"], summary, "")
-        try:
-            text = lib.live_chat(BACKEND, [{"role": m.role, "content": m.content} for m in msgs])
-        except Exception as e:  # noqa: BLE001 - a provider error must not abort the other 29 rows
-            errors.append(f"#{r['id']} {type(e).__name__}: {str(e)[:80]}")
-            continue
-        v = parse_verdict(text)
-        v = apply_floor(v, r["prompt"]) if v else None
-        if v and v.scope == r["scope"]:
-            hit += 1
-        else:
-            misses.append(f"#{r['id']} want {r['scope']} got {v.scope if v else 'unparsed'}")
+    hit, misses, errors, matrix = _score_scope(rows)
     scored = len(rows) - len(errors)
     pct = 100 * hit / max(scored, 1)
-    ev = (f"agreement {hit}/{scored} = {pct:.0f}% (target >=80%); misses: {'; '.join(misses) or 'none'}"
+    ev = (f"agreement {hit}/{scored} = {pct:.0f}% (target >=80%); misses: {'; '.join(misses) or 'none'}\n"
+          + _fmt_matrix(matrix)
           + (f"; provider errors on {len(errors)} rows: {'; '.join(errors[:3])}" if errors else ""))
     how_live = f"{how} (live: {BACKEND['label']})"
     if errors:
@@ -509,6 +552,9 @@ def mcp_context() -> None:
 def main() -> None:
     print(f"live backend: {BACKEND['kind']} ok={LIVE_OK} {LIVE_DETAIL[:120]}", file=sys.stderr)
     want = sys.argv[1:]  # e.g. `m4_autonomy.py preview scope_eval` runs only those rows
+    if want == ["blind"]:  # `m4_autonomy.py blind`: agreement on the blind scope set (not an exit row)
+        scope_blind()
+        return
     for name, fn in [("scope eval", scope_eval), ("fan-out", fanout), ("stats tiers", stats_tiers),
                      ("degradation", degradation), ("degradation live", degradation_live), ("preview", preview),
                      ("ultraresearch", ultraresearch),

@@ -1,0 +1,40 @@
+{"id": 1, "prompt": "in our Go service, what does `defer` do if the function panics?", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 2, "prompt": "add a retry with exponential backoff (max 3 tries) to fetch_user() in api/client.ts", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 3, "prompt": "add pagination to the list endpoints of the orders module (API, service, repository, and the React table that consumes it)", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 4, "prompt": "rename `Customer` to `Account` everywhere in the monorepo: models, API schemas, DB columns with migrations, docs and the frontend", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 5, "prompt": "build a complete e-commerce platform from scratch: catalog, cart, checkout with payments, admin dashboard, auth, deployment", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 6, "prompt": "change the default port in config.yaml from 8080 to 9090", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 7, "prompt": "the date picker in forms.py shows the wrong timezone, fix it", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 8, "prompt": "introduce a caching layer for the product lookups: pick a design, implement it in the catalog package and add invalidation on update", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 9, "prompt": "migrate the whole test suite from unittest to pytest, including fixtures, CI config and the 40 mock-heavy integration tests", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 10, "prompt": "rewrite our Python 2 monolith (about 300k lines) in Go as microservices, with a migration plan and parallel running", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 11, "prompt": "bump the version string in package.json to 2.4.1", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 12, "prompt": "write a bash script that backs up ~/notes to a dated tarball", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 13, "prompt": "replace our hand-rolled argument parsing in the CLI with click, covering all 6 subcommands, and keep help output working", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 14, "prompt": "add multi-tenant support: every table, query, cache key and API route has to be tenant-scoped, plus an admin tool to onboard tenants", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 15, "prompt": "create a full open-source Notion alternative: block editor, real-time collaboration, sync, mobile apps and a plugin API", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 16, "prompt": "which git command shows me the files changed in the last commit?", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 17, "prompt": "add input validation to the signup handler: email format and password length >= 8, with tests", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 18, "prompt": "add dark mode to the settings page and persist the choice per user", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 19, "prompt": "move our REST API from Express to Fastify across all route modules, middleware and the plugin system", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 20, "prompt": "implement a new programming language with a parser, type checker, bytecode VM, standard library and a language server", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 21, "prompt": "delete the unused `import os` at the top of server.py", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 22, "prompt": "make the logger in worker.js also write to a rotating file", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 23, "prompt": "implement OAuth login with GitHub for the Express app: routes, session storage, a user table migration, and tests", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 24, "prompt": "add an audit log feature that records every state-changing action across all services, with a viewer UI and retention policy", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 25, "prompt": "build a SaaS analytics product end to end: event ingestion at scale, storage, query engine, dashboards, billing and docs", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 26, "prompt": "fix the spelling of 'seperator' in the docstring of csvtools.rs", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 27, "prompt": "convert the `Config` class in settings.py to a dataclass", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 28, "prompt": "the importer is slow on big files, profile it and speed it up; it touches the reader, the transformer and the DB writer", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 29, "prompt": "upgrade from React 17 to 19 and fix everything that breaks, including class components and deprecated lifecycle usage", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 30, "prompt": "turn this single-player game prototype into a multiplayer MMO: networking, server infrastructure, matchmaking, persistence, anti-cheat, live ops tools", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 31, "prompt": "what's the difference between `let` and `const` in this codebase's style guide? just quote the doc", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 32, "prompt": "add a /healthz endpoint to our Flask app that checks the DB connection", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 33, "prompt": "add i18n support to the checkout flow (English and German), extracting the strings from the 8 components", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 34, "prompt": "implement role-based access control throughout the backend and frontend, replacing the current is_admin boolean checks", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 35, "prompt": "develop a complete ERP system for a small manufacturer: inventory, purchasing, production planning, accounting, HR and reporting", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 36, "prompt": "make the app title in index.html say 'Dashboard' instead of 'Untitled'", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 37, "prompt": "our CSV export drops the last row, find and fix the off-by-one", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 38, "prompt": "split the 1500-line utils.py into cohesive modules and update all imports in the package", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 39, "prompt": "port the data pipeline from pandas to polars: all 25 transform steps, their tests and the benchmarks", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 40, "prompt": "build our own CI/CD platform: runners, pipeline DSL, artifact storage, web UI, secrets management and multi-cloud deployment", "scope": "huge", "label_source": "proposed-by-claude"}
