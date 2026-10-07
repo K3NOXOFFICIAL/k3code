@@ -23,6 +23,10 @@ class ProviderEntry(BaseModel):
     models: dict[str, str | list[str]] = Field(default_factory=dict)  # {default, cheap, ...}
     #: M4a: model list per tier, e.g. {strong: [opus], cheap: haiku}; falls back to models[<tier>], then models.default.
     tiers: dict[str, str | list[str]] = Field(default_factory=dict)
+    #: claude-cli only: hidden "thinking" budget per call (MAX_THINKING_TOKENS). 0 turns it off; None keeps Claude
+    #: Code's own default. Left on, Haiku 4.5 spent ~20x more output tokens than it needed on mechanical tasks, which
+    #: ate most of the saving from routing unattended work to the cheap tier.
+    thinking_tokens: int | None = 0
 
     @field_validator("kind")
     @classmethod

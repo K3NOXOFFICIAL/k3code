@@ -372,7 +372,222 @@ def degradation_live() -> None:
                 "failed": failed, "calls": agg["calls"]}
 
     async def go():
-        base = await workload("deg-live-base", task_tiers={"classification": "main", "background_turn": "main"})
+        # "no degradation" = every kind on main, and trivial interactive tasks not routed to the cheap tier either
+        base = await workload("deg-live-base", task_tiers={"classification": "main", "background_turn": "main"},
+                              autonomy={"degrade_trivial": False})
+        deg = await workload("deg-live-on")
+        return base, deg
+
+    base, deg = asyncio.run(go())
+    cut = 100 * (1 - deg["cost"] / base["cost"]) if base["cost"] else 0.0
+    same = base["pass"] == deg["pass"]
+    table = ["tier   baseline(calls,tin,tout,list$)       degraded(calls,tin,tout,list$)"]
+    for t in sorted(set(base["by_tier"]) | set(deg["by_tier"])):
+        table.append(f"{t:<6} {base['by_tier'].get(t, '-')!s:<36} {deg['by_tier'].get(t, '-')}")
+    ev = "\n".join([  # exactly 6 lines: emit() keeps the last six
+        f"{base['tasks']} small tasks (5 interactive with scope gate, 5 unattended background), once per config on "
+        f"{BACKEND['label']}",
+        f"pass {base['pass']}/{base['tasks']} baseline (all main) vs {deg['pass']}/{deg['tasks']} degraded; list-price "
+        f"cost ${base['cost']:.4f} vs ${deg['cost']:.4f} = {cut:.0f}% cut; calls {base['calls']} vs {deg['calls']}",
+        f"failed tasks: baseline {base['failed'] or 'none'}; degraded {deg['failed'] or 'none'}",
+        *table,
+    ])
+    status = "PASS" if cut >= 30 and same else "FAIL"
+    emit(M, crit + " (fake provider)", "same scripted workload twice via gateway: task_tiers all-main vs default "
+         "tier policy; cost = usage.db tokens x illustrative price table", status, ev)
+    if LIVE_OK and BACKEND["kind"] == "claude-cli":
+        return  # degradation_live() emits the live row
+    emit(M, crit + " (live comparison with real models)", "needs real model quality at both tiers", "PENDING",
+         "fake comparison only proves routing/accounting; same-pass-rate on real tasks is untested: " + LIVE_DETAIL[:160],
+         f"run a real task benchmark twice (task_tiers all-main vs default) {RESET}, compare pass rate and /stats cost")
+
+
+LIVE_TASKS = [  # (background?, prompt, check(dir) -> bool); every task is tiny and mechanically checkable
+    (False, "Create sq.py that prints the square of 7, then run it with bash.", lambda d: _py(d, "sq.py") == "49"),
+    (False, "Create rev.py that prints the reverse of the string 'abc' (use slicing), then run it with bash.",
+     lambda d: _py(d, "rev.py") == "cba"),
+    (False, "Create fizz.py that prints FizzBuzz for 1 to 15, one item per line, then run it with bash.",
+     lambda d: _py(d, "fizz.py").splitlines()[-1:] == ["FizzBuzz"] and _py(d, "fizz.py").splitlines()[2] == "Fizz"),
+    (False, "Create wc.py that prints the number of words in the string 'one two three four', then run it with bash.",
+     lambda d: _py(d, "wc.py") == "4"),
+    (False, "Create fact.py that prints 6 factorial, then run it with bash.", lambda d: _py(d, "fact.py") == "720"),
+    (True, "Create a.txt containing exactly the word alpha.",
+     lambda d: (d / "a.txt").exists() and (d / "a.txt").read_text().strip() == "alpha"),
+    (True, "Create nums.txt with the numbers 1 to 5, one per line.",
+     lambda d: (d / "nums.txt").exists() and (d / "nums.txt").read_text().split() == list("12345")),
+    (True, "Create upper.py that prints HELLO by upper-casing the string 'hello', then run it with bash.",
+     lambda d: _py(d, "upper.py") == "HELLO"),
+    (True, "Create sum.py that prints the sum of the integers 1 to 10, then run it with bash.",
+     lambda d: _py(d, "sum.py") == "55"),
+    (True, "Create ver.txt containing exactly the text v1.2.3.",
+     lambda d: (d / "ver.txt").exists() and (d / "ver.txt").read_text().strip() == "v1.2.3"),
+]
+
+
+def _py(d: Path, name: str) -> str:
+    """Output of `python3 <name>` in d ('' when missing or failing): the check re-runs the file itself."""
+    if not (d / name).exists():
+        return ""
+    r = subprocess.run(["python3", name], cwd=d, capture_output=True, text=True, timeout=30)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def degradation_live() -> None:
+    """Real-model comparison: the same 10 small tasks with the default tier policy and with everything on `main`."""
+    if not (LIVE_OK and BACKEND["kind"] == "claude-cli"):
+        return
+    crit = "Degradation cuts cost >=30% at the same pass rate"
+    from test_autonomy_gateway import GatewayServer, ProviderEntry, SessionStore, Settings, call, run_turn
+
+    def live_server(d: Path, **cfg):
+        os.environ["K3CODE_HOME"] = str(d / "home")
+        os.environ.pop("K3CODE_FAKE_PROVIDER", None)  # an earlier fake row's shim leaves it set
+        provider = ProviderEntry(
+            name="claude-code", kind="claude-cli", models={"default": lib.LIVE_DEFAULT_MODEL},
+            tiers={"strong": lib.LIVE_DEFAULT_MODEL, "cheap": lib.LIVE_CHEAP_MODEL, "fast": lib.LIVE_CHEAP_MODEL})
+        server = GatewayServer(config=Settings(providers=[provider], permission_mode="auto", **cfg),
+                               store=SessionStore(d / "sessions.db"))
+        frames: list[str] = []
+        server._write = frames.append  # type: ignore[method-assign]
+        server._frames = frames  # type: ignore[attr-defined]
+        return server
+
+    tasks = [LIVE_TASKS[0], LIVE_TASKS[5]] if os.environ.get("M4_LIVE_SMOKE") == "1" else LIVE_TASKS  # 2-task dry run
+
+    async def workload(name: str, **cfg) -> dict:
+        root = sub(name)
+        server = live_server(root, **cfg)
+        passed, failed = 0, []
+        for i, (background, prompt, check) in enumerate(tasks):
+            d = root / f"task{i}"
+            d.mkdir()
+            await call(server, "session.create", {"cwd": str(d)})
+            try:
+                await asyncio.wait_for(run_turn(server, prompt, [{"choice": "once"}] * 30, background=background), 300)
+            except Exception as e:  # noqa: BLE001 - a stuck or failed task counts as not passed
+                failed.append(f"#{i} {type(e).__name__}: {str(e)[:60]}")
+                continue
+            if check(d):
+                passed += 1
+            else:
+                failed.append(f"#{i} check failed")
+        agg = server.usage.aggregate("day")[0]
+        tiers = {t: (c["calls"], c["tokens_in"], c["tokens_out"], round(c.get("cost_usd", 0.0), 4))
+                 for t, c in agg["by_tier"].items()}
+        return {"cost": agg["cost_usd"] or 0.0, "pass": passed, "tasks": len(tasks), "by_tier": tiers,
+                "failed": failed, "calls": agg["calls"]}
+
+    async def go():
+        # "no degradation" = every kind on main, and trivial interactive tasks not routed to the cheap tier either
+        base = await workload("deg-live-base", task_tiers={"classification": "main", "background_turn": "main"},
+                              autonomy={"degrade_trivial": False})
+        deg = await workload("deg-live-on")
+        return base, deg
+
+    base, deg = asyncio.run(go())
+    cut = 100 * (1 - deg["cost"] / base["cost"]) if base["cost"] else 0.0
+    same = base["pass"] == deg["pass"]
+    table = ["tier   baseline(calls,tin,tout,list$)       degraded(calls,tin,tout,list$)"]
+    for t in sorted(set(base["by_tier"]) | set(deg["by_tier"])):
+        table.append(f"{t:<6} {base['by_tier'].get(t, '-')!s:<36} {deg['by_tier'].get(t, '-')}")
+    ev = "\n".join([
+        f"{base['tasks']} small tasks (5 interactive with scope gate, 5 unattended background), once per config",
+        f"backend: {BACKEND['label']}",
+        f"pass {base['pass']}/{base['tasks']} baseline (all main) vs {deg['pass']}/{deg['tasks']} degraded",
+        f"list-price cost: baseline ${base['cost']:.4f} vs degraded ${deg['cost']:.4f} = {cut:.0f}% cut; "
+        f"model calls {base['calls']} vs {deg['calls']}",
+        f"failed tasks: baseline {base['failed'] or 'none'}; degraded {deg['failed'] or 'none'}",
+        *table,
+    ])
+    status = "PASS" if cut >= 30 and same else "FAIL"
+    emit(M, crit + " (fake provider)", "same scripted workload twice via gateway: task_tiers all-main vs default "
+         "tier policy; cost = usage.db tokens x illustrative price table", status, ev)
+    if LIVE_OK and BACKEND["kind"] == "claude-cli":
+        return  # degradation_live() emits the live row
+    emit(M, crit + " (live comparison with real models)", "needs real model quality at both tiers", "PENDING",
+         "fake comparison only proves routing/accounting; same-pass-rate on real tasks is untested: " + LIVE_DETAIL[:160],
+         f"run a real task benchmark twice (task_tiers all-main vs default) {RESET}, compare pass rate and /stats cost")
+
+
+LIVE_TASKS = [  # (background?, prompt, check(dir) -> bool); every task is tiny and mechanically checkable
+    (False, "Create sq.py that prints the square of 7, then run it with bash.", lambda d: _py(d, "sq.py") == "49"),
+    (False, "Create rev.py that prints the reverse of the string 'abc' (use slicing), then run it with bash.",
+     lambda d: _py(d, "rev.py") == "cba"),
+    (False, "Create fizz.py that prints FizzBuzz for 1 to 15, one item per line, then run it with bash.",
+     lambda d: _py(d, "fizz.py").splitlines()[-1:] == ["FizzBuzz"] and _py(d, "fizz.py").splitlines()[2] == "Fizz"),
+    (False, "Create wc.py that prints the number of words in the string 'one two three four', then run it with bash.",
+     lambda d: _py(d, "wc.py") == "4"),
+    (False, "Create fact.py that prints 6 factorial, then run it with bash.", lambda d: _py(d, "fact.py") == "720"),
+    (True, "Create a.txt containing exactly the word alpha.",
+     lambda d: (d / "a.txt").exists() and (d / "a.txt").read_text().strip() == "alpha"),
+    (True, "Create nums.txt with the numbers 1 to 5, one per line.",
+     lambda d: (d / "nums.txt").exists() and (d / "nums.txt").read_text().split() == list("12345")),
+    (True, "Create upper.py that prints HELLO by upper-casing the string 'hello', then run it with bash.",
+     lambda d: _py(d, "upper.py") == "HELLO"),
+    (True, "Create sum.py that prints the sum of the integers 1 to 10, then run it with bash.",
+     lambda d: _py(d, "sum.py") == "55"),
+    (True, "Create ver.txt containing exactly the text v1.2.3.",
+     lambda d: (d / "ver.txt").exists() and (d / "ver.txt").read_text().strip() == "v1.2.3"),
+]
+
+
+def _py(d: Path, name: str) -> str:
+    """Output of `python3 <name>` in d ('' when missing or failing): the check re-runs the file itself."""
+    if not (d / name).exists():
+        return ""
+    r = subprocess.run(["python3", name], cwd=d, capture_output=True, text=True, timeout=30)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def degradation_live() -> None:
+    """Real-model comparison: the same 10 small tasks with the default tier policy and with everything on `main`."""
+    if not (LIVE_OK and BACKEND["kind"] == "claude-cli"):
+        return
+    crit = "Degradation cuts cost >=30% at the same pass rate"
+    from test_autonomy_gateway import GatewayServer, ProviderEntry, SessionStore, Settings, call, run_turn
+
+    def live_server(d: Path, **cfg):
+        os.environ["K3CODE_HOME"] = str(d / "home")
+        os.environ.pop("K3CODE_FAKE_PROVIDER", None)  # an earlier fake row's shim leaves it set
+        provider = ProviderEntry(
+            name="claude-code", kind="claude-cli", models={"default": lib.LIVE_DEFAULT_MODEL},
+            tiers={"strong": lib.LIVE_DEFAULT_MODEL, "cheap": lib.LIVE_CHEAP_MODEL, "fast": lib.LIVE_CHEAP_MODEL})
+        server = GatewayServer(config=Settings(providers=[provider], permission_mode="auto", **cfg),
+                               store=SessionStore(d / "sessions.db"))
+        frames: list[str] = []
+        server._write = frames.append  # type: ignore[method-assign]
+        server._frames = frames  # type: ignore[attr-defined]
+        return server
+
+    tasks = [LIVE_TASKS[0], LIVE_TASKS[5]] if os.environ.get("M4_LIVE_SMOKE") == "1" else LIVE_TASKS  # 2-task dry run
+
+    async def workload(name: str, **cfg) -> dict:
+        root = sub(name)
+        server = live_server(root, **cfg)
+        passed, failed = 0, []
+        for i, (background, prompt, check) in enumerate(tasks):
+            d = root / f"task{i}"
+            d.mkdir()
+            await call(server, "session.create", {"cwd": str(d)})
+            try:
+                await asyncio.wait_for(run_turn(server, prompt, [{"choice": "once"}] * 30, background=background), 300)
+            except Exception as e:  # noqa: BLE001 - a stuck or failed task counts as not passed
+                failed.append(f"#{i} {type(e).__name__}: {str(e)[:60]}")
+                continue
+            if check(d):
+                passed += 1
+            else:
+                failed.append(f"#{i} check failed")
+        agg = server.usage.aggregate("day")[0]
+        tiers = {t: (c["calls"], c["tokens_in"], c["tokens_out"], round(c.get("cost_usd", 0.0), 4))
+                 for t, c in agg["by_tier"].items()}
+        return {"cost": agg["cost_usd"] or 0.0, "pass": passed, "tasks": len(tasks), "by_tier": tiers,
+                "failed": failed, "calls": agg["calls"]}
+
+    async def go():
+        # "no degradation" = every kind on main, and trivial interactive tasks not routed to the cheap tier either
+        base = await workload("deg-live-base", task_tiers={"classification": "main", "background_turn": "main"},
+                              autonomy={"degrade_trivial": False})
         deg = await workload("deg-live-on")
         return base, deg
 

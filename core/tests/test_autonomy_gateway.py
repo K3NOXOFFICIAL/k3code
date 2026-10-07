@@ -179,14 +179,48 @@ async def test_danger_prompt_forces_plan_even_if_classifier_says_trivial(tmp_pat
     assert v["needs_plan"] and v["risk"] == "high"
 
 
-async def test_trivial_executes_directly(tmp_path, monkeypatch):
-    server = make(tmp_path, monkeypatch, [verdict("trivial"), *DIRECT])
+async def test_trivial_executes_directly_on_the_cheap_tier(tmp_path, monkeypatch):
+    """GOAL B5: unimportant work goes to the cheap tier. A trivial interactive task starts there (the live benchmark
+    saved only 14 % while half of its tasks, all trivial, ran on main)."""
+    cheap_direct = [{"type": "text", "model": "m-cheap", "match": "TRIVIAL-TASK", "text": "done directly"},
+                    usage("m-cheap", "TRIVIAL-TASK", 20, 5)]
+    server = make(tmp_path, monkeypatch, [verdict("trivial"), *cheap_direct])
     await start(server, tmp_path)
     await run_turn(server, "TRIVIAL-TASK rename x")
-    # classifier, the turn itself (no planning), then the cheap post-task proposer
-    assert models_called(server) == ["m-cheap", "m-main", "m-cheap"]
+    # classifier, the turn itself (no planning) on the cheap tier, then the cheap post-task proposer
+    assert models_called(server) == ["m-cheap", "m-cheap", "m-cheap"]
     assert events(server, "plan.show") == []
     assert server.session.stored.messages[-1]["content"] == "done directly"
+
+
+async def test_trivial_task_that_stalls_on_the_cheap_tier_escalates_to_main(tmp_path, monkeypatch):
+    same = {"type": "tool_call", "model": "m-cheap", "match": "TRIVIAL-TASK", "id": "c1", "name": "bash",
+            "arguments": {"command": "echo hi"}}
+    steps = [verdict("trivial"), same, {"type": "text", "model": "m-main", "text": "recovered"}]
+    server = make(tmp_path, monkeypatch, steps)
+    await start(server, tmp_path)
+    await run_turn(server, "TRIVIAL-TASK rename x", [{"choice": "once"}] * 5)
+    esc = events(server, "routing.escalated")
+    assert [(e["from"], e["to"]) for e in esc] == [("cheap", "main")]
+    assert models_called(server)[-1] in ("m-main", "m-cheap") and "m-main" in models_called(server)
+    assert server.session.stored.messages[-1]["content"] == "recovered"
+
+
+async def test_degrade_trivial_can_be_switched_off(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [verdict("trivial"), *DIRECT], autonomy={"degrade_trivial": False})
+    await start(server, tmp_path)
+    await run_turn(server, "TRIVIAL-TASK rename x")
+    assert models_called(server) == ["m-cheap", "m-main", "m-cheap"]  # classifier, the turn on main, proposer
+
+
+async def test_a_pinned_interactive_tier_is_not_degraded(tmp_path, monkeypatch):
+    strong_direct = [{"type": "text", "model": "m-strong", "match": "TRIVIAL-TASK", "text": "done directly"},
+                     usage("m-strong", "TRIVIAL-TASK", 20, 5)]
+    server = make(tmp_path, monkeypatch, [verdict("trivial"), *strong_direct],
+                  task_tiers={"interactive_turn": "strong"})
+    await start(server, tmp_path)
+    await run_turn(server, "TRIVIAL-TASK rename x")
+    assert "m-strong" in models_called(server) and models_called(server)[1] == "m-strong"
 
 
 async def test_scope_override_forces_plan_for_next_task_only(tmp_path, monkeypatch):

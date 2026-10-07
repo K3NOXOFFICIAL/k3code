@@ -16,6 +16,9 @@ DEFAULTS: dict[str, Any] = {
     "advisor_modes": ["auto"],
     #: proposer pass after a plan and after a task
     "proposals": True,
+    #: an interactive task the scope gate calls "trivial" starts on the cheap tier and escalates when it stalls
+    #: (GOAL B5: route unimportant work to cheaper models, escalating when they struggle)
+    "degrade_trivial": True,
     #: failures per signal before a cheap-tier task escalates
     "escalate": {"tool_errors": 3, "loop_guard": 1, "judge_not_done": 2},
     #: name a new session from its first prompt (one cheap-tier call, background); opt-in

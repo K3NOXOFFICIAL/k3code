@@ -84,11 +84,13 @@ def _real_home() -> str:
         return os.path.expanduser("~")
 
 
-def _clean_env() -> dict[str, str]:
-    drop = ("ANTHROPIC_", "OMNIROUTE_")
+def _clean_env(thinking_tokens: int | None = 0) -> dict[str, str]:
+    drop = ("ANTHROPIC_", "OMNIROUTE_", "MAX_THINKING_TOKENS")
     env = {k: v for k, v in os.environ.items() if not k.startswith(drop)}
     env["HOME"] = _real_home()
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    if thinking_tokens is not None:
+        env["MAX_THINKING_TOKENS"] = str(max(0, int(thinking_tokens)))
     return env
 
 
@@ -121,6 +123,7 @@ class ClaudeCliProvider(Provider):
         timeout: float = 300.0,
         max_parallel: int = 2,
         setting_sources: str = "project",
+        thinking_tokens: int | None = 0,
     ) -> None:
         self.name = name
         self.base_url = ""  # nothing to probe over HTTP; the general internet probe covers reachability
@@ -128,6 +131,7 @@ class ClaudeCliProvider(Provider):
         self.command = command
         self.timeout = timeout
         self.setting_sources = setting_sources
+        self.thinking_tokens = thinking_tokens
         self._max_parallel = max(1, max_parallel)
         self._sem: asyncio.Semaphore | None = None
         self._workdir: str | None = None
@@ -175,7 +179,7 @@ class ClaudeCliProvider(Provider):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._cwd(),
-                env=_clean_env(),
+                env=_clean_env(self.thinking_tokens),
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
@@ -247,7 +251,14 @@ def _last_json(out: str) -> dict[str, Any] | None:
 
 
 def _reply_from_result(result: dict[str, Any], tools: list[ToolSpec]) -> tuple[str, list[ToolCall]]:
-    """Split the model's plain-text reply into (text for the user, tool calls from the final block)."""
+    """Split the model's plain-text reply into (text for the user, tool calls from every block, in order).
+
+    Cheap models follow the "ONE final block" rule loosely: Haiku 4.5 splits its calls over several blocks
+    ("write ... now let me run it: <tool_calls>bash"), so keeping only the last block silently dropped the write and the
+    task stalled and escalated. All blocks count, in order. When calls were made, only the text before the first block
+    is kept: what follows was written before the tools ran ("The script has been created. It prints 49") and is
+    invented, not a result.
+    """
     raw = str(result.get("result") or "")
     if not tools:
         return raw.strip(), []
@@ -256,8 +267,30 @@ def _reply_from_result(result: dict[str, Any], tools: list[ToolSpec]) -> tuple[s
         if "<tool_calls>" in raw:  # opened but never closed: the reply was cut off
             raise ProviderError("The model started a <tool_calls> block but did not finish it.", status_code=502)
         return raw.strip(), []
-    text = _TOOL_BLOCK.sub("", raw).strip()
-    return text, _parse_tool_calls(matches[-1].group(1))
+    calls = [c for m in matches for c in _parse_tool_calls(m.group(1))]
+    if not calls:
+        return _TOOL_BLOCK.sub("", raw).strip(), []
+    return raw[: matches[0].start()].strip(), calls
+
+
+_NOT_ARGUMENTS = frozenset({"name", "tool", "id", "type", "arguments", "parameters", "input", "args"})
+
+
+def _call_arguments(item: dict[str, Any]) -> dict[str, Any]:
+    """The arguments of one call object: ``arguments`` (asked for), its common aliases, or - for models that flatten
+    them next to the name (``{"name": "bash", "command": "ls"}``) - every other key."""
+    for key in ("arguments", "parameters", "input", "args"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):  # an OpenAI-style JSON string
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return {k: v for k, v in item.items() if k not in _NOT_ARGUMENTS}
 
 
 def _parse_tool_calls(body: str) -> list[ToolCall]:
@@ -270,14 +303,14 @@ def _parse_tool_calls(body: str) -> list[ToolCall]:
         items = items.get("tool_calls") or [items]
     calls: list[ToolCall] = []
     for item in items if isinstance(items, list) else []:
-        if not isinstance(item, dict) or not item.get("name"):
+        name = item.get("name") or item.get("tool") if isinstance(item, dict) else None
+        if not name:
             continue
-        args = item.get("arguments")
-        args = args if isinstance(args, dict) else {}
+        args = _call_arguments(item)
         calls.append(
             ToolCall(
                 id=f"call_{uuid.uuid4().hex[:12]}",
-                name=str(item["name"]),  # an unknown name is passed on: the agent loop answers "unknown tool"
+                name=str(name),  # an unknown name is passed on: the agent loop answers "unknown tool"
                 arguments=args,
                 raw_arguments=json.dumps(args, ensure_ascii=False),
             )

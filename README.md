@@ -58,7 +58,7 @@ sh install/install.sh --from-source
 
 This creates a versioned install under `~/.local/share/k3code/` and links `k3code` and `k3` into `~/.local/bin/` (put that on your `PATH`).
 
-**Keep the clone where it is.** A `--from-source` install is editable: the Python core runs directly from `core/` in your clone (its path is recorded in `~/.local/share/k3code/source_path`). Moving or deleting the clone breaks `k3code`, and `k3code update --from-source` pulls and rebuilds from it. Only release installs will be self-contained.
+A `--from-source` install is a regular, self-contained install: the Python core is copied into the version's own venv, so deleting a worktree or switching branches in the clone cannot break `k3code`. The clone's path is recorded in `~/.local/share/k3code/source_path`, and `k3code update --from-source` pulls it and builds a new version next to the old one (with automatic rollback). For development, `K3_EDITABLE=1 sh install/install.sh --from-source` keeps the old editable install (`pip install -e`), where your edits show up without re-installing.
 
 The installer's own progress messages and its final exit status are written to `~/.local/share/k3code/install.log`. Output from `uv`, `npm` and `go` appears on the terminal only; to capture everything: `sh install/install.sh --from-source 2>&1 | tee install-full.log`.
 
@@ -115,7 +115,7 @@ With a daemon running, `k3code attach <session-id>` opens the TUI on one of its 
 | `↓` (empty input) | Move into the agent list under the input; `↑`/`↓` select, `Enter` opens that session, `x` stops it (asks first), `Esc` returns |
 | `↑` / `↓` (in the input) | Walk through your previous inputs (kept per project) |
 | `Ctrl+B` | Send the running turn to the background |
-| `a` / `d` | Accept / dismiss a proposal card (with an empty input) |
+| `Alt+A` / `Alt+D` | Accept / dismiss the top proposal card (a bare `a`/`d` would steal the first letter of your message) |
 | `/` | Command completion; `@` completes file paths |
 
 ### Slash commands

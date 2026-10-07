@@ -34,7 +34,7 @@ with open(log, "w") as fh:
         "cwd": os.getcwd(),
         "system": open(sysfile).read(),
         "env": {{k: os.environ.get(k) for k in (
-            "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "OMNIROUTE_API_KEY", "HOME")}},
+            "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "OMNIROUTE_API_KEY", "HOME", "MAX_THINKING_TOKENS")}},
     }}, fh)
 mode = os.environ.get("SHIM_MODE", "text")
 usage = {{"input_tokens": 3, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50, "output_tokens": 7}}
@@ -256,3 +256,63 @@ def test_doctor_does_not_ask_for_a_key_for_claude_cli(monkeypatch: pytest.Monkey
 
     cfg = Settings(providers=[ProviderEntry(name="cc", kind="claude-cli", models={"default": "m"})])
     assert check_keys(cfg).status == "ok"
+
+
+async def test_hidden_thinking_is_off_by_default_and_configurable(
+    shim: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Left at Claude Code's default, Haiku 4.5 emitted ~1,570 output tokens for a one-line task (81 with thinking
+    off), which ate most of the saving from routing unattended work to the cheap tier."""
+    monkeypatch.setenv("MAX_THINKING_TOKENS", "31999")  # an inherited value must not leak into the call
+    p = ClaudeCliProvider(name="cc", command=str(shim))
+    await _collect(p, [Message(role="user", content="hi")])
+    assert _call(tmp_path)["env"]["MAX_THINKING_TOKENS"] == "0"
+    await p.aclose()
+    p = ClaudeCliProvider(name="cc", command=str(shim), thinking_tokens=2000)
+    await _collect(p, [Message(role="user", content="hi")])
+    assert _call(tmp_path)["env"]["MAX_THINKING_TOKENS"] == "2000"
+    await p.aclose()
+    p = ClaudeCliProvider(name="cc", command=str(shim), thinking_tokens=None)  # Claude Code's own default
+    await _collect(p, [Message(role="user", content="hi")])
+    assert _call(tmp_path)["env"]["MAX_THINKING_TOKENS"] is None
+    await p.aclose()
+
+
+def test_provider_entry_passes_the_thinking_budget_through() -> None:
+    entry = ProviderEntry(name="cc", kind="claude-cli", thinking_tokens=500)
+    (provider,) = make_providers([entry])
+    assert provider.thinking_tokens == 500
+    assert ProviderEntry(name="cc", kind="claude-cli").thinking_tokens == 0
+
+
+def _reply(result_text: str):
+    from k3code.providers.claude_cli import _reply_from_result
+
+    return _reply_from_result({"result": result_text}, TOOLS)
+
+
+def test_every_tool_block_counts_not_just_the_last() -> None:
+    """Haiku 4.5 splits calls over several blocks; keeping only the last dropped the `write` and the task stalled."""
+    block = '<tool_calls>[{"name": "read_file", "arguments": {"path": "%s"}}]</tool_calls>'
+    text, calls = _reply(
+        f"I'll create it.\n{block % 'sq.py'}\nNow let me run it:\n{block % 'b.py'}\nDone! It printed 49."
+    )
+    assert [c.arguments["path"] for c in calls] == ["sq.py", "b.py"]
+    assert text == "I'll create it."  # the narration after the block was written before anything ran: not kept
+
+
+def test_flattened_arguments_are_accepted() -> None:
+    """`{"name": "bash", "command": "ls"}` (arguments next to the name) used to become an empty argument dict, i.e. a
+    guaranteed tool error and a stalled task."""
+    _, calls = _reply(
+        '<tool_calls>[{"name": "read_file", "path": "a.py"}, {"name": "x", "parameters": {"k": 1}},'
+        ' {"tool": "y", "input": {"z": 2}}, {"name": "w", "args": "{\\"q\\": 3}"}]</tool_calls>'
+    )
+    assert [(c.name, c.arguments) for c in calls] == [
+        ("read_file", {"path": "a.py"}), ("x", {"k": 1}), ("y", {"z": 2}), ("w", {"q": 3}),
+    ]
+
+
+def test_an_empty_block_keeps_the_text_around_it() -> None:
+    text, calls = _reply("before <tool_calls>[]</tool_calls> after")
+    assert calls == [] and text == "before  after"

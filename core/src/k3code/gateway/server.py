@@ -1185,6 +1185,29 @@ class GatewayServer:
             except Exception:  # noqa: BLE001 - the autonomy layer must never block the user's task
                 logger.exception("autonomy gate failed; running the task directly")
             session.current_kind = kind.value
+            acfg = autonomy_cfg(config)
+            if (
+                kind is TaskKind.INTERACTIVE_TURN
+                and not cheap_start
+                and tier is Tier.MAIN
+                and (tier_for(kind, config.task_tiers) is Tier.MAIN)
+                and acfg.get("degrade_trivial", True)
+                and gate.proceed
+                and gate.verdict is not None
+                and gate.verdict.scope == "trivial"
+            ):
+                # A trivial task is "unimportant work": start it on the cheap tier. The loop escalates to main when the
+                # attempt stalls (tool errors, loop guard), so a task the cheap model cannot do still gets done.
+                tier, cheap_start = Tier.CHEAP, True
+                max_errors = int(acfg["escalate"]["tool_errors"])
+                escalation = Escalation(tier, thresholds={"tool_errors": 1, "loop_guard": 1})
+                loop = self._build_loop(
+                    session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
+                )
+                loop.on_text_delta = on_text_delta
+                loop.on_text_reset = on_text_reset
+                loop.on_checkpoint = lambda: self._checkpoint_turn(session)
+                session.loop = loop
             history = session.history
             prompt = gate.prompt
             if gate.proceed and (subtasks := self.fanout.applies(session, gate)):
