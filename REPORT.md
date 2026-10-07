@@ -72,6 +72,10 @@ Imported config kept `max_turns: 7` and gained the non-secret settings; `<redact
 - Session JSON in bundles gets credential-shaped substrings scrubbed (known prefixes/JWT/Bearer), not generic text.
 - `mcp` 2.x API differs from 1.x (snake_case fields, `streamable_http_client`, `httpx2`); the client handles both field
   spellings. Fake test server uses `mcp.server.mcpserver.MCPServer`.
+- **TUI-local shadowing removed:** the inherited Hermes TUI handled `/skills` (skills-hub overlay → `skills.manage` RPC) and
+  `/branch`/`/fork` (`session.branch` RPC) locally, before anything reached the gateway; neither RPC exists in this
+  gateway. Both local entries and their 4 vitest cases were deleted so these commands fall through to `slash.exec`.
+  (The `SkillsHub` component file remains, now unreachable from slash commands.)
 - `/settings` overlay reuses the **pager** overlay (simple text list) rather than a new component.
 - mem0 search assumes `POST {mem0.url}/search` with `{query, limit, user_id?}` and `Authorization: Token <key>`.
 - Large skill libraries: the prompt lists at most 60 skills (names + ≤110-char descriptions); the rest via `skill {query}`.

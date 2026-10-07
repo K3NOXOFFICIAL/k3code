@@ -363,37 +363,6 @@ describe('createSlashHandler', () => {
     })
   })
 
-  it('opens the skills hub locally for bare /skills', () => {
-    const ctx = buildCtx()
-
-    expect(createSlashHandler(ctx)('/skills')).toBe(true)
-    expect(getOverlayState().skillsHub).toBe(true)
-    expect(ctx.gateway.rpc).not.toHaveBeenCalled()
-    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
-  })
-
-  it('routes /skills install <name> to skills.manage without opening overlay', () => {
-    const ctx = buildCtx()
-
-    expect(createSlashHandler(ctx)('/skills install foo')).toBe(true)
-    expect(getOverlayState().skillsHub).toBe(false)
-    expect(ctx.gateway.rpc).toHaveBeenCalledWith('skills.manage', {
-      action: 'install',
-      query: 'foo'
-    })
-  })
-
-
-  it('routes /skills browse [page] to skills.manage with a numeric page', () => {
-    const ctx = buildCtx()
-
-    createSlashHandler(ctx)('/skills browse 3')
-    expect(ctx.gateway.rpc).toHaveBeenCalledWith('skills.manage', {
-      action: 'browse',
-      page: 3
-    })
-  })
-
   it('delegates non-native /skills subcommands to slash.exec', () => {
     const ctx = buildCtx()
 
@@ -445,21 +414,6 @@ describe('createSlashHandler', () => {
 
     expect(ctx.session.newSession).toHaveBeenCalledWith('new session started', undefined)
     expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
-  })
-
-  it('keeps visible scrollback when branching a TUI session', async () => {
-    patchUiState({ sid: 'sid-parent' })
-    const rpc = vi.fn(() => Promise.resolve({ session_id: 'sid-branch', title: 'branch title' }))
-    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
-
-    expect(createSlashHandler(ctx)('/branch branch title')).toBe(true)
-
-    expect(rpc).toHaveBeenCalledWith('session.branch', { name: 'branch title', session_id: 'sid-parent' })
-    await vi.waitFor(() => {
-      expect(getUiState().sid).toBe('sid-branch')
-      expect(ctx.transcript.sys).toHaveBeenCalledWith(expect.stringContaining('branch title'))
-    })
-    expect(ctx.transcript.setHistoryItems).not.toHaveBeenCalled()
   })
 
   it('reloads skills in the live gateway and refreshes the catalog', async () => {
