@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from types import SimpleNamespace
@@ -510,10 +511,35 @@ def test_research_counts_are_clamped_to_at_least_one():
     from k3code.research.flow import research_cfg
 
     cfg = research_cfg(SimpleNamespace(research={"sources_per_topic": 0, "min_sources": -2, "sub_questions": "0",
-                                                 "results_per_query": 0}))
-    assert {k: cfg[k] for k in ("sources_per_topic", "min_sources", "sub_questions", "results_per_query")} == {
-        "sources_per_topic": 1, "min_sources": 1, "sub_questions": 1, "results_per_query": 1}
+                                                 "results_per_query": 0, "concurrency": 0}))
+    counts = ("sources_per_topic", "min_sources", "sub_questions", "results_per_query", "concurrency")
+    assert {k: cfg[k] for k in counts} == {k: 1 for k in counts}
     assert research_cfg(SimpleNamespace(research={}))["sources_per_topic"] == 4  # unset keys keep their defaults
+
+
+async def test_concurrency_zero_still_completes_a_run(tmp_path, monkeypatch):
+    """concurrency 0 is asyncio.Semaphore(0): every search and read waited forever. The run must finish."""
+    from k3code.research.tools import Hit, ResearchTools
+
+    class Tools(ResearchTools):
+        name = "stub"
+
+        async def search(self, query, n=5):
+            return [Hit(f"t{i}", f"https://example.org/{i}", snippet=f"snippet {i}") for i in range(2)]
+
+        async def fetch(self, url):
+            return "page", "page text"
+
+    server = make(tmp_path, monkeypatch, [
+        {"type": "text", "match": "Number of sub-topics", "text": '{"sub_topics":[{"name":"A","queries":["a"]}]}'},
+        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+        {"type": "text", "text": "ok"},
+    ], mode="auto", research={"concurrency": 0, "min_sources": 1, "sub_questions": 1})
+    server.research_tools = Tools()
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    async with asyncio.timeout(60):  # a hang here used to be the failure mode
+        res = await server.research.run(server.session, "q", n_sub=1)
+    assert res.state.sources
 
 
 async def test_sources_per_topic_zero_still_produces_sources(tmp_path, monkeypatch):

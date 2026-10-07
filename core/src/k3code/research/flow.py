@@ -47,8 +47,9 @@ class ResearchUnavailable(Exception):
     """No search tool is reachable; the message says what to configure."""
 
 
-#: Counts that must stay positive: sources_per_topic <= 0 spilled every hit, so the run reported "no results" anyway.
-_AT_LEAST_ONE = ("sub_questions", "results_per_query", "sources_per_topic", "min_sources")
+#: Counts that must stay positive: sources_per_topic <= 0 spilled every hit, so the run reported "no results" anyway,
+#: and concurrency <= 0 is an asyncio.Semaphore(0) that blocks every search and read forever.
+_AT_LEAST_ONE = ("sub_questions", "results_per_query", "sources_per_topic", "min_sources", "concurrency")
 
 
 def research_cfg(config: Any) -> dict[str, Any]:
