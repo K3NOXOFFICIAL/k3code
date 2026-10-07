@@ -673,7 +673,7 @@ def update_cmd(check: bool, yes: bool, channel: str | None, from_source: bool, d
         if rel is None:
             raise click.ClickException("no releases found on this channel")
         click.echo(f"current: {cur}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
-        if check or (cur and upd.version_key(rel.version) <= upd.version_key(cur.split("-src")[0])):
+        if check or not upd.is_newer(rel.version, cur):
             if not check:
                 click.echo("Already up to date.")
             return

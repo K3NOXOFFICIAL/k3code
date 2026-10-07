@@ -50,7 +50,7 @@ import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
 import { $stripSessions, setStripHandlers } from '../k3/agentStripStore.js'
-import { setProposalHandlers } from '../k3/proposalsStore.js'
+import { clearProposals, setProposalHandlers } from '../k3/proposalsStore.js'
 
 import { applyAgentSnapshot } from './agentRoster.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
@@ -710,21 +710,42 @@ export function useMainApp(gw: GatewayClient) {
     return () => setStripHandlers(null)
   }, [gw, session.activateLiveSession])
 
-  // Proposal cards: accept sends the suggested action as a new prompt; both tell the gateway so it persists.
+  // Proposal cards: both verbs go to the gateway, which owns the outcome. Only a proposal whose action is a prompt
+  // (`type: send`) is submitted here; the learned kinds (permission rule, preference, skill, optimizer) are applied by
+  // the gateway itself, so the TUI just shows what it did. It used to also send the card's action text to the model as
+  // a user turn for every kind (and a dismissed or accepted card was gone even if the dispatch failed).
   useEffect(() => {
     const dispatch = (verb: string, id: string) =>
-      gw.request('command.dispatch', { arg: `${verb} ${id}`, name: 'proposals', session_id: getUiState().sid }).catch(() => {})
+      gw.request('command.dispatch', { arg: `${verb} ${id}`, name: 'proposals', session_id: getUiState().sid })
 
     setProposalHandlers({
       accept: p => {
-        void dispatch('accept', p.id)
-        submitLiteralRef.current(p.action)
+        dispatch('accept', p.id)
+          .then(raw => {
+            const r = asRpcResult<{ message?: string; notice?: string; output?: string; text?: string; type?: string }>(raw)
+
+            if (r?.type === 'send' && (r.message || r.text)) {
+              return submitLiteralRef.current(r.message ?? r.text ?? '')
+            }
+
+            const note = r?.output ?? r?.message ?? r?.notice
+
+            if (note) {
+              sys(note)
+            }
+          })
+          .catch((e: Error) => sys(`proposal not accepted: ${e.message}`))
       },
-      dismiss: p => void dispatch('dismiss', p.id)
+      dismiss: p => void dispatch('dismiss', p.id).catch(() => {})
     })
 
     return () => setProposalHandlers(null)
-  }, [gw])
+  }, [gw, sys])
+
+  // A card belongs to the session that produced it.
+  useEffect(() => {
+    clearProposals()
+  }, [ui.sid])
 
   // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
   // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.

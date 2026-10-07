@@ -45,11 +45,16 @@ export const setProposalHandlers = (h: ProposalHandlers | null) => {
   handlers = h
 }
 
-/** `a` accepts and `d` dismisses the top card. Returns true when the key was consumed. */
-export function handleProposalKey(ch: string, inputEmpty: boolean): boolean {
+/**
+ * Alt+A accepts and Alt+D dismisses the top card. Returns true when the key was consumed.
+ *
+ * A bare `a`/`d` on an empty composer used to do this, which hijacked the first letter of every message typed while
+ * a card was showing ("add a test ..." accepted the card, "do ..." dismissed it for good). A modifier is unambiguous.
+ */
+export function handleProposalKey(ch: string, meta: boolean): boolean {
   const top = $proposals.get()[0]
 
-  if (!top || !inputEmpty || (ch !== 'a' && ch !== 'd')) {
+  if (!top || !meta || (ch !== 'a' && ch !== 'd')) {
     return false
   }
 
@@ -58,6 +63,9 @@ export function handleProposalKey(ch: string, inputEmpty: boolean): boolean {
 
   return true
 }
+
+/** Cards belong to the session that produced them: drop them when the active session changes. */
+export const clearProposals = () => $proposals.set([])
 
 export const GLYPH: Record<ProposalKind, string> = {
   also_setup: '＋',

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import time
 from collections.abc import Callable
@@ -277,12 +278,27 @@ def _sha256(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def is_newer(candidate: str, current: str | None) -> bool:
+    """True when ``candidate`` is newer than the installed ``current`` (``X.Y.Z-src.<sha>`` counts as ``X.Y.Z``)."""
+    if not current:
+        return True
+    return version_key(candidate) > version_key(current.split("-src")[0])
+
+
 def install_release(rel: Release, token: str | None, uv: str | None = None) -> Path:
-    """Download + verify the release assets and build ``versions/<ver>`` (not yet activated)."""
+    """Download + verify the release assets and build ``versions/<ver>`` (not yet activated).
+
+    Never touches a version that is installed and complete, nor the current or previous one: ``/update now`` used
+    to rmtree ``versions/<ver>`` even when it was the live install, deleting the running k3code.
+    """
     uv = uv or shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
     vdir = versions_dir() / rel.version
     if vdir.exists():
-        shutil.rmtree(vdir)
+        if (vdir / ".complete").is_file():
+            return vdir  # already installed: nothing to download or rebuild
+        if rel.version in (current_version(), previous_version()):
+            raise ValueError(f"refusing to rebuild {rel.version}: it is the active or the previous version")
+        shutil.rmtree(vdir)  # an interrupted earlier download
     # Build in place: venvs are not relocatable (absolute shebangs). `.complete` is written last.
     vdir.mkdir(parents=True)
     try:
@@ -326,6 +342,30 @@ def install_release(rel: Release, token: str | None, uv: str | None = None) -> P
         shutil.rmtree(vdir, ignore_errors=True)
         raise
     return vdir
+
+
+def apply_detached() -> str:
+    """Run ``k3code update --yes`` outside this process's service unit, so the update can restart the unit.
+
+    The daemon used to install, restart its own unit from a worker thread and then poll for health *inside* the unit
+    it was restarting: systemd SIGTERMed the whole cgroup (the poller included), so the auto-rollback branch could
+    never run and the shutdown hung on the executor thread. A transient ``systemd-run --user`` unit survives it.
+    """
+    exe = shutil.which("k3code") or str(Path(sys.argv[0]).resolve())
+    runner = shutil.which("systemd-run")
+    if runner is None:
+        return ("systemd-run is not available: run `k3code update --yes` from a terminal "
+                "(the daemon cannot safely update the unit it is running in).")
+    unit = f"k3code-update-{int(time.time())}"
+    r = subprocess.run(
+        [runner, "--user", "--collect", "--quiet", f"--unit={unit}", exe, "update", "--yes"],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    if r.returncode != 0:
+        return f"Could not start the update: {(r.stderr or r.stdout).strip()[:300]}"
+    return (f"Update started in the background ({unit}). The daemon restarts when it is installed and smoke-tested; "
+            f"it is rolled back automatically if the new version does not come up. Follow it with "
+            f"`journalctl --user -u {unit}`.")
 
 
 def source_checkout() -> Path | None:

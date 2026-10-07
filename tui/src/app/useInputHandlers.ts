@@ -503,8 +503,9 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return clearSelection()
     }
 
-    // Proposal cards: `a` accepts, `d` dismisses the top card (only while the composer is empty).
-    if (!key.ctrl && !key.meta && handleProposalKey(ch, !cState.input && !cState.inputBuf.length)) {
+    // Proposal cards: Alt+A accepts, Alt+D dismisses the top card (a bare letter would steal the first character
+    // of every message typed while a card is showing).
+    if (key.meta && !key.ctrl && handleProposalKey(ch, true)) {
       return
     }
 

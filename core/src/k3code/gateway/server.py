@@ -112,6 +112,8 @@ class LiveSession:
         #: AgentLoops on one conversation) and unattended runs' set-up/tear-down (see ServerRunner.run_prompt).
         self.turn_lock = asyncio.Lock()
         self.run_lock = asyncio.Lock()
+        #: Prompts submitted while a turn was running; each runs as its own turn when the current one ends.
+        self.pending_prompts: list[str] = []
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
         self.reasoning_effort: str | None = None
@@ -1016,7 +1018,11 @@ class GatewayServer:
     async def _run_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget."""
         async with session.turn_lock:  # a second turn on this session waits instead of interleaving with the first
-            return await self._run_turn_locked(session, text)
+            result = await self._run_turn_locked(session, text)
+            # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
+            while session.pending_prompts and result[0] != "interrupted":
+                result = await self._run_turn_locked(session, session.pending_prompts.pop(0))
+            return result
 
     async def _run_turn_locked(self, session: LiveSession, text: str) -> tuple[str, str]:
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
@@ -1714,6 +1720,7 @@ class GatewayServer:
         session = self._session_for(session_id)
         if session is None or session.turn_task is None or session.turn_task.done():
             return False
+        session.pending_prompts.clear()  # /stop means stop: what was queued behind the turn does not run either
         session.loop.interrupt() if session.loop else None
         self.subagents.interrupt_session(session.session_id)
         self.learning.record("interrupt", session, subject=_running_tool(session), choice="stop")
@@ -1900,6 +1907,10 @@ async def _session_resume(server: GatewayServer, params: dict[str, Any]) -> dict
         "message_count": len(live.stored.messages),
         "messages": transcript_rows(live.stored.messages),
         "info": live.live_info(),
+        # like session.activate: attaching to (or reconnecting into) a session mid-turn must show it busy, or the
+        # composer looks idle and the next prompt is typed into a running turn
+        "running": live.streaming,
+        "status": live.state,
     }
 
 
@@ -2029,6 +2040,7 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     text = _require(params, "text")
     server.last_user_activity = time.time()
     if session.streaming:
+        session.pending_prompts.append(str(text))  # really queued: it runs when the current turn ends
         return {"turn_id": "", "status": "queued"}
     if params.get("background"):
         session.background = True

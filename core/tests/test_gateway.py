@@ -505,3 +505,60 @@ async def test_the_prompt_and_the_tool_call_are_on_disk_before_the_first_tool_ru
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+async def test_a_prompt_submitted_mid_turn_is_queued_and_runs_after_it(tmp_path, monkeypatch):
+    """prompt.submit during a turn answered {"status": "queued"} and discarded the text: nothing ran, no error."""
+    import json as _json
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    script = tmp_path / "s.json"
+    script.write_text(_json.dumps([{"type": "text", "text": "done"}]))
+    monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    server = make_server(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"))
+    created = await rpc(server, "session.create", {"cwd": str(tmp_path)})
+    live = server.session
+    assert live is not None and created["result"]["session_id"] == live.session_id
+    gate = asyncio.Event()
+    real = server._run_turn_locked
+    texts: list[str] = []
+
+    async def gated(session, text):
+        texts.append(text)
+        if len(texts) == 1:
+            await gate.wait()  # hold the first turn open
+        return await real(session, text)
+
+    server._run_turn_locked = gated  # type: ignore[method-assign]
+    first = await rpc(server, "prompt.submit", {"text": "first"}, req_id=2)
+    assert first["result"]["status"] == "streaming"
+    for _ in range(100):
+        if live.streaming or texts:
+            break
+        await asyncio.sleep(0.01)
+    live.streaming = True  # the turn is running
+    second = await rpc(server, "prompt.submit", {"text": "second"}, req_id=3)
+    assert second["result"]["status"] == "queued" and live.pending_prompts == ["second"]
+    live.streaming = False
+    gate.set()
+    await asyncio.wait_for(live.turn_task, 20)
+    assert texts == ["first", "second"] and live.pending_prompts == []
+    users = [m["content"] for m in live.stored.messages if m["role"] == "user"]
+    assert users == ["first", "second"] or users[-2:] == ["first", "second"]
+    await server.close()
+
+
+async def test_session_resume_reports_a_running_turn(tmp_path, monkeypatch):
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE")
+    server = make_server(config=Settings(providers=[prov]))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    stored = server.store.create(title="t", model="m", cwd=str(tmp_path))
+    live = server.live_for(stored)
+    live.streaming = True
+    line = {"jsonrpc": "2.0", "id": 7, "method": "session.resume", "params": {"session_id": stored.session_id}}
+    await server._handle_line(json.dumps(line))  # resume also emits progress events: pick our response by id
+    res = next(f for f in frames_of(server) if f.get("id") == 7)
+    assert res["result"]["running"] is True and "status" in res["result"]
+    live.streaming = False
+    await server.close()

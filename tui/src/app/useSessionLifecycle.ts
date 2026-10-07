@@ -200,10 +200,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
       const previousSid = getUiState().sid
 
-      if (!keepCurrent) {
-        await closeSession(previousSid)
-      }
-
       const r = await rpc<SessionCreateResponse>('session.create', {
         cols: colsRef.current,
         ...(STARTUP_WORKSPACE_CWD ? { cwd: STARTUP_WORKSPACE_CWD } : {})
@@ -213,6 +209,13 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         patchUiState({ status: 'ready' })
 
         return null
+      }
+
+      // Close the old session only now that this client is attached to the new one: the daemon refuses to close a
+      // session a client is still looking at ("still in use"), and the result used to be ignored, so every /new
+      // and /clear left one more live session behind for the daemon's lifetime.
+      if (!keepCurrent && previousSid && previousSid !== r.session_id) {
+        await closeSession(previousSid)
       }
 
       // The durable id lives on the create result; the lazy-create `info` does

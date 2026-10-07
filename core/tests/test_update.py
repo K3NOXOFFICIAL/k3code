@@ -117,3 +117,60 @@ def test_version_ordering() -> None:
     k = upd.version_key
     assert k("0.10.0") > k("0.9.0") > k("0.9.0-dev.1")
     assert k("v1.0.0") == k("1.0.0")
+
+
+# ── regressions from the long-run audit ──
+
+
+def _release(ver: str) -> upd.Release:
+    return upd.Release(tag=f"v{ver}", version=ver, body="", prerelease=False, assets={})
+
+
+def test_install_release_never_deletes_the_live_install(data: Path) -> None:
+    """`/update now` called install_release() with no version check; it rmtree'd versions/<ver> even when that was the
+    current version, deleting the running k3code before the (failing) rebuild."""
+    live = make_version(data, "1.0.0")
+    (live / ".complete").write_text("1.0.0\n")
+    upd.switch_to("1.0.0")
+    marker = live / "venv" / "keep.me"
+    marker.write_text("x")
+    rel = _release("1.0.0")
+    assert upd.install_release(rel, None) == live  # complete: returned as is, nothing downloaded or rebuilt
+    assert marker.exists()
+    (live / ".complete").unlink()  # even incomplete, the active version is protected
+    with pytest.raises(ValueError, match="active or the previous"):
+        upd.install_release(rel, None)
+    assert marker.exists()
+
+
+def test_is_newer_compares_against_the_installed_version(data: Path) -> None:
+    assert upd.is_newer("1.2.0", "1.1.0") and not upd.is_newer("1.1.0", "1.1.0") and not upd.is_newer("1.0.9", "1.1.0")
+    assert not upd.is_newer("0.0.1", "0.0.1-src.abc1234")  # a source install of 0.0.1 is that release
+    assert upd.is_newer("0.0.2", "0.0.1-src.abc1234") and upd.is_newer("0.0.1", None)
+
+
+async def test_update_now_when_up_to_date_changes_nothing(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.commands.update_cmd import UpdateCommand
+
+    make_version(data, "1.0.0")
+    upd.switch_to("1.0.0")
+    monkeypatch.setattr(upd, "github_token", lambda: None)
+    monkeypatch.setattr(upd, "fetch_latest", lambda *a, **k: _release("1.0.0"))
+    monkeypatch.setattr(upd, "apply_detached", lambda: pytest.fail("must not update when already current"))
+    out = await UpdateCommand().handle(None, None, "now")
+    assert "Already up to date" in out["output"]
+
+
+def test_apply_detached_runs_outside_the_service_unit(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[list[str]] = []
+
+    class R:
+        returncode, stdout, stderr = 0, "", ""
+
+    monkeypatch.setattr(upd.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(upd.subprocess, "run", lambda argv, **k: seen.append(list(argv)) or R())
+    msg = upd.apply_detached()
+    assert seen and seen[0][:3] == ["/usr/bin/systemd-run", "--user", "--collect"]
+    assert seen[0][-2:] == ["update", "--yes"] and "background" in msg
+    monkeypatch.setattr(upd.shutil, "which", lambda name: None if name == "systemd-run" else "/x/k3code")
+    assert "systemd-run is not available" in upd.apply_detached()

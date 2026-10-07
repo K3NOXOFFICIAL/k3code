@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   $proposals,
   addProposal,
+  clearProposals,
   glyphFor,
   handleProposalKey,
   PROPOSALS_MAX,
@@ -24,20 +25,33 @@ describe('proposal cards', () => {
     expect($proposals.get().length).toBeLessThanOrEqual(PROPOSALS_MAX)
   })
 
-  it('a accepts and d dismisses the top card, only with an empty composer', () => {
+  it('alt+a accepts and alt+d dismisses the top card; a bare letter never does', () => {
     const accept = vi.fn()
     const dismiss = vi.fn()
     setProposalHandlers({ accept, dismiss })
     addProposal(card('p1'))
     addProposal(card('p2'))
 
-    expect(handleProposalKey('a', false)).toBe(false) // typing a message: never hijacked
+    // the first letter of "add a test ..." / "do ..." must reach the composer, not the card
+    expect(handleProposalKey('a', false)).toBe(false)
+    expect(handleProposalKey('d', false)).toBe(false)
     expect(handleProposalKey('x', true)).toBe(false)
+    expect(accept).not.toHaveBeenCalled()
+    expect(dismiss).not.toHaveBeenCalled()
+    expect($proposals.get().map(p => p.id)).toEqual(['p1', 'p2'])
+
     expect(handleProposalKey('a', true)).toBe(true)
     expect(accept).toHaveBeenCalledWith(card('p1'))
     expect(handleProposalKey('d', true)).toBe(true)
     expect(dismiss).toHaveBeenCalledWith(card('p2'))
     expect(handleProposalKey('a', true)).toBe(false) // no cards left
+  })
+
+  it('clearProposals drops every card (cards belong to the session that produced them)', () => {
+    addProposal(card('p1'))
+    addProposal(card('p2'))
+    clearProposals()
+    expect($proposals.get()).toEqual([])
   })
 
   it('removeProposal drops one card', () => {

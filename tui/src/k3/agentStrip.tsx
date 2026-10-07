@@ -28,7 +28,7 @@ const color = (state: StripState, t: Theme): string =>
 const sessionState = (s: LiveSessionStatus | string): StripState =>
   s === 'waiting' || s === 'needs_input'
     ? 'input'
-    : s === 'working' || s === 'starting'
+    : s === 'working' || s === 'starting' || s === 'running' || s === 'queued'
       ? 'working'
       : s === 'failed'
         ? 'failed'
@@ -51,7 +51,10 @@ export function buildStripRows(
   const rows: StripRow[] = []
 
   for (const s of sessions) {
-    if (s.current || s.id === currentSid) {
+    // Sub-agents of the current turn already come from the in-turn roster (`subagents`); as session rows they were
+    // drawn a second time as "completed", and Enter / x on them hit session.activate / session.interrupt with a
+    // sub-agent id ("unknown session", a stop that silently did nothing).
+    if (s.current || s.id === currentSid || s.origin === 'subagent') {
       continue
     }
 

@@ -18,7 +18,7 @@ export function ProposalCards({ cols }: { cols: number }) {
   return (
     <Box flexDirection="column">
       <Text color={t.color.muted}>
-        proposals — <Text color={t.color.accent}>a</Text> accept · <Text color={t.color.accent}>d</Text> dismiss
+        proposals — <Text color={t.color.accent}>alt+a</Text> accept · <Text color={t.color.accent}>alt+d</Text> dismiss
       </Text>
       {items.map((p, i) => (
         <Text color={i === 0 ? t.color.accent : t.color.muted} key={p.id} wrap="truncate-end">

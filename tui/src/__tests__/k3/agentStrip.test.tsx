@@ -146,3 +146,17 @@ describe('strip keyboard', () => {
     expect(no.nav.focused).toBe(true)
   })
 })
+
+describe('buildStripRows: sub-agent session rows', () => {
+  it('skips the daemon\'s sub-agent rows (the in-turn roster already shows them) and maps running/queued to working', () => {
+    const sessions = [
+      { id: 'sa-1', origin: 'subagent', status: 'running', title: 'child' },
+      { id: 'bg-1', origin: 'automation', status: 'running', title: 'cron' },
+      { id: 'q-1', status: 'queued', title: 'queued job' }
+    ] as unknown as Parameters<typeof buildStripRows>[1]
+    const rows = buildStripRows([], sessions, Date.now(), 'current')
+
+    expect(rows.map(r => r.id)).toEqual(['bg-1', 'q-1'])
+    expect(rows.every(r => r.state === 'working')).toBe(true)
+  })
+})

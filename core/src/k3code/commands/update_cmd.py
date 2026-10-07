@@ -34,11 +34,6 @@ class UpdateCommand(CommandDef):
                 "Run `/update now` to install it (smoke-tested, auto-rollback; the daemon restarts)."
             )
 
-        def _apply() -> str:
-            upd.install_release(rel, token)
-            res = upd.activate(rel.version)
-            if res.ok:
-                upd.prune()
-            return res.message
-
-        return reply(await asyncio.to_thread(_apply))
+        if not upd.is_newer(rel.version, upd.current_version()):
+            return reply(f"current: {cur}\nAlready up to date (latest is {rel.version}).")
+        return reply(await asyncio.to_thread(upd.apply_detached))

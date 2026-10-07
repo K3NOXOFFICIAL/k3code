@@ -114,7 +114,13 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
 
 
 def check_keys(config: Settings) -> Check:
-    missing = [p.api_key_env for p in config.providers if p.kind != "claude-cli" and not os.environ.get(p.api_key_env)]
+    # p.api_key is what load_config resolved from the process environment *or* ~/.config/k3code/env, where the setup
+    # wizard stores keys: checking os.environ alone failed every shell run, and so did the update smoke test.
+    missing = [
+        p.api_key_env
+        for p in config.providers
+        if p.kind != "claude-cli" and not (p.api_key or os.environ.get(p.api_key_env))
+    ]
     if not config.providers:
         return Check("api-keys", WARN, "no providers, nothing to check")
     if missing:

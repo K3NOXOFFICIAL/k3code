@@ -192,6 +192,8 @@ export interface SessionActiveItem {
   last_active?: number
   message_count?: number
   model?: string
+  /** "subagent" for fan-out / task() children (they also arrive through the in-turn roster), else who started it. */
+  origin?: string
   preview?: string
   session_key?: string
   started_at?: number
