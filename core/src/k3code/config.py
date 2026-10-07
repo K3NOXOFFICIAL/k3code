@@ -1,0 +1,120 @@
+"""Configuration loading with precedence: CLI > env > project config > user config > defaults."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+import yaml
+from pydantic import BaseModel, Field, field_validator
+
+K3CODE_HOME = Path(os.environ.get("K3CODE_HOME", Path.home() / ".k3code")).expanduser()
+
+
+class ProviderEntry(BaseModel):
+    """One provider block in the fallback chain."""
+
+    name: str
+    kind: str  # "openai" or "anthropic"
+    base_url: str
+    api_key_env: str
+    api_key: str = ""  # populated by load_config() from the api_key_env var; never set this directly
+    models: dict[str, str | list[str]] = Field(default_factory=dict)  # {default, cheap, ...}
+
+    @field_validator("kind")
+    @classmethod
+    def validate_kind(cls, v: str) -> str:
+        if v not in ("openai", "anthropic"):
+            raise ValueError("kind must be 'openai' or 'anthropic'")
+        return v
+
+
+class Settings(BaseModel):
+    """Runtime settings for k3code."""
+
+    providers: list[ProviderEntry] = Field(default_factory=list)
+    default_model: str = "default"  # key into provider.models
+    max_turns: int = 20
+    max_tokens: int = 8192
+    temperature: float | None = None
+    permission_mode: str = "ask"  # ask | auto-edit | yolo
+    headless_permission: str | None = None  # overrides permission_mode in -p mode
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    if path.is_file():
+        with path.open() as f:
+            return yaml.safe_load(f) or {}
+    return {}
+
+
+def _merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Shallow merge for top-level keys; providers list is replaced, not merged."""
+    result = base.copy()
+    result.update(override)
+    return result
+
+
+def load_config(
+    *,
+    project_dir: Path | None = None,
+    cli_overrides: dict[str, Any] | None = None,
+) -> Settings:
+    """Load settings with full precedence chain.
+
+    Order (later wins): defaults < user config < project config < env < CLI flags.
+    """
+    # 1. Defaults
+    defaults = Settings().model_dump()
+
+    # 2. User config (~/.k3code/config.yaml)
+    user_config = _load_yaml(K3CODE_HOME / "config.yaml")
+
+    # 3. Project config (<project_dir>/.k3code/config.yaml)
+    project_config = {}
+    if project_dir:
+        project_config = _load_yaml(project_dir / ".k3code" / "config.yaml")
+
+    # 4. Environment variables (only top-level keys that exist in Settings)
+    env_overrides: dict[str, Any] = {}
+    for key in defaults:
+        env_key = f"K3CODE_{key.upper()}"
+        if env_key in os.environ:
+            env_overrides[key] = _parse_env_value(os.environ[env_key], defaults[key])
+
+    # 5. CLI overrides
+    cli = cli_overrides or {}
+
+    # Merge in order
+    merged = defaults
+    merged = _merge_dicts(merged, user_config)
+    merged = _merge_dicts(merged, project_config)
+    merged = _merge_dicts(merged, env_overrides)
+    merged = _merge_dicts(merged, cli)
+
+    # Parse providers list specially (replace, don't merge)
+    for src in (user_config, project_config, cli):
+        if "providers" in src:
+            merged["providers"] = src["providers"]
+            break
+
+    # Expand provider api_key_env -> api_key (api_key_env is a required field on
+    # ProviderEntry, so look it up without popping it out of the dict).
+    for p in merged.get("providers", []):
+        p["api_key"] = os.environ.get(p.get("api_key_env", ""), "")
+
+    return Settings(**merged)
+
+
+def _parse_env_value(value: str, default: Any) -> Any:
+    """Coerce env string to the type of the default."""
+    if isinstance(default, bool):
+        return value.lower() in ("1", "true", "yes", "on")
+    if isinstance(default, int):
+        return int(value)
+    if isinstance(default, float):
+        return float(value)
+    if isinstance(default, list):
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return value

@@ -1,11 +1,43 @@
-# VENDOR.toml - Inventory of vendored code
-# Format: each entry is either a [[tree]] (directory) or [[file]] (single file)
-# project: upstream project name
-# upstream_path: path within the upstream project
-# commit: git commit hash
-# license: SPDX license identifier
-# local_path: path in this repo
+# VENDOR.toml - Vendored files from upstream projects
+# Each entry documents the source, license, and verification info.
 
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/retry_utils.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/providers/retry_utils.py"
+sha256_upstream = "c51c7fca5d9ce2bfd4cc5722a0f1a371a645d3839cd56646f372f9070c0f62f0"
+modified = false
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/error_classifier.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/router/classifier.py"
+sha256_upstream = "47385d2d2b37e3e0e18c1a1d281014de6e763f7b9c8c4c41aac70227da1eddd5"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/fallback_cooldown.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/router/cooldown.py"
+sha256_upstream = "ebcb372b5fd7ec9d5c8970f9521ff2fdcc2adca563b3d4b05b8e1a11c02ea00a"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "tools/fuzzy_match.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/tools/fuzzy_match.py"
+sha256_upstream = "fd66dc9008ca5eb059bbdb2ddc3f164cf77e96f620ae805abd3f97c8017a0987"
+modified = false
+
+# --- vendored directory trees ---
 [[tree]]
 project = "hermes-agent"
 upstream_path = "ui-tui"
@@ -23,6 +55,6 @@ local_path = "tui/shared"
 [[tree]]
 project = "tuios"
 upstream_path = "."
-commit = "f3d8929"
+commit = "f3d892942bfb45a0a0775d14895ae77ff9c06468"
 license = "MIT"
 local_path = "panes"
