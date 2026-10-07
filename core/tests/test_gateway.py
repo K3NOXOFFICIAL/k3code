@@ -167,7 +167,7 @@ async def test_approval_round_trip_allows_tool():
 
     approve = await server._approval_callback_for(server.session)
     _, allowed = await asyncio.gather(client(), approve("bash", {"command": "echo hi"}))
-    assert allowed is True  # gather order: (client None, approve bool)
+    assert allowed  # gather order: (client None, ApprovalResult)
     assert answered["id"].startswith("approval-")
     await server.close()
 
@@ -190,7 +190,7 @@ async def test_approval_deny_blocks_tool():
 
     approve = await server._approval_callback_for(server.session)
     _, allowed = await asyncio.gather(client(), approve("bash", {"command": "rm -rf /"}))
-    assert allowed is False
+    assert not allowed
     await server.close()
 
 

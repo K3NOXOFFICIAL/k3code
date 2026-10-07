@@ -24,7 +24,7 @@ def temp_dir():
 def test_registry_has_all_tools():
     reg = build_registry()
     names = reg.names()
-    assert set(names) == {"read", "write", "edit", "bash", "grep", "glob", "todo"}
+    assert set(names) == {"read", "write", "edit", "bash", "grep", "glob", "todo", "exit_plan"}
     for name in names:
         spec, handler = reg.get(name)
         assert spec.name == name
@@ -34,7 +34,7 @@ def test_registry_has_all_tools():
 
 def test_side_effect_flags():
     reg = build_registry()
-    pure = {"read", "grep", "glob", "todo"}
+    pure = {"read", "grep", "glob", "todo", "exit_plan"}
     side_effect = {"write", "edit", "bash"}
     for name in pure:
         spec, _ = reg.get(name)

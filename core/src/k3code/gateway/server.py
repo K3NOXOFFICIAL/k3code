@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from k3code.agent.loop import AgentLoop
+from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, load_config
@@ -44,6 +44,8 @@ from k3code.gateway.protocol import (
     next_request_id,
 )
 from k3code.gateway.sessions import SessionStore
+from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, suggest_rules
+from k3code.permissions.state import PermissionState, log_decision, persist_rules, project_config_path
 from k3code.providers import make_providers
 from k3code.providers.types import Message, StreamEvent, Usage
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
@@ -81,7 +83,27 @@ class LiveSession:
         self.todo_revision = 0
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
         self.pending_request_id: str | None = None
+        self.perms = PermissionState(
+            mode=PermissionMode(stored.meta.get("mode") or server.config.permission_mode),
+            cwd=Path(stored.cwd or Path.cwd()),
+            add_dirs=list(stored.meta.get("add_dirs") or []),
+        )
         self.control = {"goal": "", "loop": "", "heartbeat": "", "revision": 0, "updated_at": 0.0}
+
+    @property
+    def messages(self) -> list[dict[str, Any]]:
+        return self.stored.messages
+
+    @messages.setter
+    def messages(self, value: list[dict[str, Any]]) -> None:
+        self.stored.messages = value
+
+    def set_mode(self, mode: PermissionMode) -> None:
+        """Switch permission mode, persist it, and tell the client."""
+        self.perms.mode = mode
+        self.stored.meta["mode"] = mode.value
+        self.server.store.save(self.stored)
+        self.server.emit("session.info", self.live_info())
 
     @property
     def history(self) -> list[Message]:
@@ -108,8 +130,10 @@ class LiveSession:
             "model": self.stored.model or config.default_model,
             "provider": self.stored.provider,
             "reasoning_effort": self.reasoning_effort,
-            "approval_mode": config.permission_mode,
-            "yolo": config.permission_mode == "yolo",
+            "approval_mode": self.perms.mode.value,
+            "mode": self.perms.mode.value,
+            "yolo": self.perms.mode == PermissionMode.YOLO,
+            "add_dirs": list(self.perms.add_dirs),
             "cwd": self.stored.cwd,
             "title": self.stored.title,
             "stored_session_id": self.session_id,
@@ -139,6 +163,17 @@ class GatewayServer:
         self.cooldowns = CooldownStore()
         self._running = False
         self._server_request_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
+
+    @property
+    def sessions(self) -> Any:
+        """Mapping-like view over live sessions (``get(session_id)``) for command handlers."""
+        server = self
+
+        class _View:
+            def get(self, session_id: str | None) -> LiveSession | None:
+                return server._session_for(session_id)
+
+        return _View()
 
     @staticmethod
     def _home() -> Path:
@@ -317,15 +352,22 @@ class GatewayServer:
         """Execute one user prompt end-to-end, emitting wire events."""
         self._ensure_router(session.stored.model or None)
         assert self.router is not None
+        session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
+        session.perms.reload()
         loop = AgentLoop(
             self.router,
             system_prompt=session.system_prompt,
             max_turns=self.config.max_turns,
-            permission_mode=self.config.permission_mode,
             headless=False,
             on_event=self._on_router_event,
-            cwd=Path(session.stored.cwd or Path.cwd()),
-            approval_callback=self._approval_callback_for(session),
+            cwd=session.perms.cwd,
+            approval_callback=await self._approval_callback_for(session),
+            plan_callback=self._plan_callback_for(session),
+            on_auto_allow=lambda tool, args, dec: self.emit(
+                "permission.auto_allowed",
+                {"session_id": session.session_id, "tool": tool, "command": _command_for_tool(tool, args)},
+            ),
+            permissions=session.perms,
         )
         session.loop = loop
 
@@ -415,14 +457,18 @@ class GatewayServer:
                 self.emit("session.usage", {"usage": _usage_payload(msg.usage)})
 
     async def _approval_callback_for(self, session: LiveSession) -> Any:
-        async def approve(tool_name: str, arguments: dict[str, Any]) -> bool:
+        async def approve(tool_name: str, arguments: dict[str, Any], decision: Any = None) -> ApprovalResult:
+            decision = decision or session.perms.decide(tool_name, arguments)
+            rules = suggest_rules(tool_name, decision)
+            pattern = ", ".join(r.pattern for r in rules)
             try:
                 result = await self._ask_client(
                     "approval",
                     {
                         "request_id": next_request_id("approval"),
                         "command": _command_for_tool(tool_name, arguments),
-                        "description": arguments.get("description")
+                        "description": decision.message
+                        or arguments.get("description")
                         or arguments.get("path")
                         or arguments.get("pattern")
                         or "",
@@ -430,14 +476,70 @@ class GatewayServer:
                         "allow_permanent": True,
                         "allow_session": True,
                         "tool_name": tool_name,
+                        "pattern": pattern,
                     },
                     session.session_id,
                 )
             except (asyncio.CancelledError, RuntimeError):
-                return False
-            return str(result.get("choice", "deny")).lower() != "deny"
+                return ApprovalResult("deny", "approval request cancelled")
+            choice = str(result.get("choice", "deny")).lower()
+            if choice not in ("once", "session", "always"):
+                choice = "deny"
+            reason = str(result.get("reason") or result.get("text") or "").strip()
+            if choice in ("session", "always"):
+                session.perms.session_rules.extend(rules)
+            if choice == "always" and rules:
+                persist_rules(project_config_path(session.perms.cwd), rules)
+            log_decision(
+                session=session.session_id,
+                tool=tool_name,
+                pattern=pattern,
+                choice=choice,
+                cwd=str(session.perms.cwd),
+                home=self._home(),
+            )
+            return ApprovalResult(choice, reason)
 
         return approve
+
+    def _plan_callback_for(self, session: LiveSession) -> Any:
+        async def approve_plan(plan: str) -> str | None:
+            try:
+                result = await self._ask_client(
+                    "approval",
+                    {
+                        "request_id": next_request_id("approval"),
+                        "command": "Approve this plan?",
+                        "description": plan,
+                        "choices": ["once", "session", "deny"],
+                        "labels": {
+                            "once": "Approve plan (ask before edits)",
+                            "session": "Approve plan + accept edits",
+                            "deny": "Keep planning",
+                        },
+                        "allow_permanent": False,
+                        "allow_session": True,
+                        "tool_name": "exit_plan",
+                    },
+                    session.session_id,
+                )
+            except (asyncio.CancelledError, RuntimeError):
+                return None
+            choice = str(result.get("choice", "deny")).lower()
+            target = {"once": "default", "session": "accept-edits"}.get(choice)
+            log_decision(
+                session=session.session_id,
+                tool="exit_plan",
+                pattern="*",
+                choice=choice,
+                cwd=str(session.perms.cwd),
+                home=self._home(),
+            )
+            if target:
+                session.set_mode(PermissionMode(target))
+            return target
+
+        return approve_plan
 
     # ── commands ──────────────────────────────────────────────────────
 
@@ -762,6 +864,30 @@ async def _model_disconnect(server: GatewayServer, params: dict[str, Any]) -> di
     return {"disconnected": False}
 
 
+async def _mode_session(server: GatewayServer, params: dict[str, Any]) -> LiveSession:
+    session = server._session_for(params.get("session_id"))
+    if session is None:
+        raise _InvalidParams("no active session")
+    return session
+
+
+async def _session_mode_cycle(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    session = await _mode_session(server, params)
+    session.set_mode(session.perms.cycle_mode())
+    return {"mode": session.perms.mode.value, "info": session.live_info()}
+
+
+async def _session_mode_set(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    session = await _mode_session(server, params)
+    raw = str(_require(params, "mode"))
+    try:
+        mode = PermissionMode(raw)
+    except ValueError:
+        raise _InvalidParams(f"unknown mode: {raw} (one of {', '.join(MODE_CYCLE_NAMES)}, yolo)") from None
+    session.set_mode(mode)
+    return {"mode": mode.value, "info": session.live_info()}
+
+
 async def _config_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     key = str(_require(params, "key"))
     if key == "full":
@@ -778,6 +904,11 @@ async def _config_get(server: GatewayServer, params: dict[str, Any]) -> dict[str
 
 async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     key = str(_require(params, "key"))
+    if key == "yolo":  # TUI /yolo toggle
+        session = await _mode_session(server, params)
+        yolo = session.perms.mode != PermissionMode.YOLO
+        session.set_mode(PermissionMode.YOLO if yolo else PermissionMode.DEFAULT)
+        return {"ok": True, "key": key, "value": "1" if yolo else "0"}
     if "." not in key:
         raise _InvalidParams(f"unsupported config key: {key}")
     section, field_name = key.split(".", 1)
@@ -816,6 +947,8 @@ _HANDLERS: dict[str, Any] = {
     "session.most_recent": _session_most_recent,
     "session.events.since": _session_events_since,
     "session.events.stats": _session_events_stats,
+    "session.mode.cycle": _session_mode_cycle,
+    "session.mode.set": _session_mode_set,
     "prompt.submit": _prompt_submit,
     "clipboard.paste": _clipboard_paste,
     "image.attach": _image_attach,

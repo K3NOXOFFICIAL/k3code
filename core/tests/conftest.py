@@ -18,3 +18,9 @@ def mock_transport():
 def httpx_mock():
     """Alternative: httpx.MockTransport for lower-level control."""
     return httpx.MockTransport
+
+
+@pytest.fixture(autouse=True)
+def _isolated_k3code_home(tmp_path_factory, monkeypatch):
+    """Never let tests write decisions/sessions into the real ~/.k3code."""
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path_factory.mktemp("k3home")))

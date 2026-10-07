@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from k3code.commands import CommandDef, CommandRegistry
@@ -89,6 +90,29 @@ class _ResumeCommand(CommandDef):
         return {"type": "message", "message": f"Resumed session {arg} ({len(stored.messages)} messages)."}
 
 
+class _AddDirCommand(CommandDef):
+    def __init__(self) -> None:
+        super().__init__(name="add-dir", help="Add a readable/writable root to this session: /add-dir <path>")
+
+    async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+        live = ctx.sessions.get(session_id) if session_id else None
+        if live is None:
+            return {"type": "message", "message": "No active session."}
+        if not arg:
+            dirs = live.perms.add_dirs
+            return {"type": "message", "message": "Added dirs: " + (", ".join(dirs) if dirs else "(none)")}
+        base = Path(live.stored.cwd or ".")
+        path = Path(arg).expanduser()
+        path = (path if path.is_absolute() else base / path).resolve()
+        if not path.is_dir():
+            return {"type": "message", "message": f"Not a directory: {path}"}
+        if str(path) not in live.perms.add_dirs:
+            live.perms.add_dirs.append(str(path))
+        live.stored.meta["add_dirs"] = list(live.perms.add_dirs)
+        ctx.store.save(live.stored)
+        return {"type": "message", "message": f"Added {path} to this session's roots."}
+
+
 class _StopCommand(CommandDef):
     def __init__(self) -> None:
         super().__init__(name="stop", help="Interrupt the running turn")
@@ -126,6 +150,7 @@ def build_registry() -> CommandRegistry:
         _CompactCommand(),
         _RenameCommand(),
         _ResumeCommand(),
+        _AddDirCommand(),
         _StopCommand(),
         _ExitCommand(),
         _HelpCommand(),
