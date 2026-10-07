@@ -25,6 +25,7 @@ import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, K3CodeError
 from k3code.providers.types import Message, StreamEvent, ToolSpec
@@ -234,13 +235,16 @@ class PersistentRetry:
         if on_event is None:
             return
 
-        def observed(event: dict) -> None:
-            if (
-                isinstance(event, dict)
-                and event.get("event") == "router.retry"
-                and event.get("reason") in RATE_LIMIT_REASONS
-            ):
-                delay = (event.get("extra") or {}).get("delay")
+        def observed(event: Any) -> None:
+            # RouterEvent payloads: kind "router.retry", reason rate_limit/quota,
+            # extra {"delay": seconds} (the provider's Retry-After when declared).
+            kind = getattr(event, "kind", None) or (event.get("event") if isinstance(event, dict) else None)
+            reason = getattr(event, "reason", None) or (event.get("reason") if isinstance(event, dict) else "")
+            if kind == "router.retry" and reason in RATE_LIMIT_REASONS:
+                extra = getattr(event, "extra", None)
+                if extra is None and isinstance(event, dict):
+                    extra = event.get("extra")
+                delay = (extra or {}).get("delay")
                 if isinstance(delay, (int, float)):
                     self._last_retry_after = float(delay)
             on_event(event)

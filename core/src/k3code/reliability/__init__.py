@@ -33,6 +33,7 @@ from k3code.reliability.governor import (
     parse_pressure,
     read_psi,
 )
+from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings
 from k3code.reliability.journal import (
     INTERRUPTED_TEMPLATE,
     PendingIntent,
@@ -78,7 +79,10 @@ __all__ = [
     "NetWatchConfig",
     "PendingIntent",
     "PersistentRetry",
+    "Reliability",
     "ReliabilityEvent",
+    "ReliabilityFlags",
+    "ReliabilitySettings",
     "RetryConfig",
     "ToolJournal",
     "TurnCancelled",
