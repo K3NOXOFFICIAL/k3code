@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 
-from test_gateway import frames_of, make_server
-
 from k3code.gateway.server import LiveSession
 from k3code.reliability import events as ev
 from k3code.reliability.events import ReliabilityEvent
+from test_gateway import frames_of, make_server
 
 
 def _live(server):
@@ -81,7 +80,9 @@ def test_budget_and_loop_become_error_events_and_needs_input():
 def test_raw_event_is_forwarded_and_encoded_with_importance():
     server = make_server()
     live = _live(server)
-    server._on_reliability_event(live, ReliabilityEvent(ev.NET_STATE, detail="online -> offline", data={"new": "offline"}))
+    server._on_reliability_event(
+        live, ReliabilityEvent(ev.NET_STATE, detail="online -> offline", data={"new": "offline"})
+    )
     raw = next(e for e in _events(server) if e["type"] == "net.state")
     assert raw["payload"]["new"] == "offline" and raw["importance"] == "essential"
     json.dumps(raw)

@@ -94,20 +94,37 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     return {"ok": True, "replacements": count, "strategy": strategy}
 
 
-async def tool_bash(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Run a shell command with timeout and process-group kill."""
+async def tool_bash(
+    arguments: dict[str, Any], *, cwd: Path | None = None, sandbox: list[str] | None = None
+) -> dict[str, Any]:
+    """Run a shell command with timeout and process-group kill.
+
+    ``sandbox`` is a bwrap argv prefix (see ``reliability.sandbox``); the command then runs inside it.
+    """
     cmd = arguments["command"]
     timeout = arguments.get("timeout", 30.0)
     workdir = _resolve_path(arguments.get("cwd", "."), cwd)
     # Security: only allow a reasonable subset; shell=True for pipes/redirects
     try:
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            cwd=workdir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            preexec_fn=os.setsid,  # new process group for kill
-        )
+        if sandbox:
+            proc = await asyncio.create_subprocess_exec(
+                *sandbox,
+                "/bin/sh",
+                "-c",
+                cmd,
+                cwd=workdir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=os.setsid,  # new process group for kill
+            )
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                cwd=workdir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                preexec_fn=os.setsid,  # new process group for kill
+            )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError:

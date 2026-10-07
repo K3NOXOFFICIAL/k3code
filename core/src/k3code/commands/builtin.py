@@ -5,7 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from k3code import chain_config
 from k3code.commands import CommandDef, CommandRegistry
+from k3code.commands.daemon import DaemonCommand
+from k3code.commands.debug import DebugCommand
+from k3code.commands.doctor import DoctorCommand
+from k3code.commands.stats import StatsCommand
+from k3code.config import load_config
 
 
 class _ModelCommand(CommandDef):
@@ -13,10 +19,31 @@ class _ModelCommand(CommandDef):
         super().__init__(name="model", help="Show or switch the model: /model [key]", aliases=["m"])
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+        if arg.split()[:1] == ["chain"]:
+            return self._chain(ctx, session_id, arg.split()[1:])
         if not arg:
             return {"type": "message", "message": f"Current model key: {ctx.config.default_model}"}
         ctx.config.default_model = arg
         return {"type": "message", "message": f"Model key set to: {arg}"}
+
+
+    def _chain(self, ctx: Any, session_id: str | None, args: list[str]) -> dict[str, Any]:
+        """/model chain [add|remove|move …]: show the fallback chain, or edit the user config."""
+        if not args:
+            return {"type": "message", "message": chain_config.format_chain(chain_config.chain_rows(ctx, session_id))}
+        try:
+            backup = chain_config.edit_config(args[0], args[1:])
+        except chain_config.ChainEditError as e:
+            return {"type": "message", "message": f"/model chain: {e}"}
+        reloaded = load_config(project_dir=Path.cwd())
+        ctx.config.providers = reloaded.providers
+        if hasattr(ctx, "_chain_key"):
+            ctx._chain_key = None  # rebuild the router on the next turn
+        note = f" (backup: {backup})" if backup else ""
+        return {
+            "type": "message",
+            "message": f"Chain updated{note}.\n" + chain_config.format_chain(chain_config.chain_rows(ctx, session_id)),
+        }
 
 
 class _EffortCommand(CommandDef):
@@ -154,6 +181,10 @@ def build_registry() -> CommandRegistry:
         _StopCommand(),
         _ExitCommand(),
         _HelpCommand(),
+        DoctorCommand(),
+        StatsCommand(),
+        DebugCommand(),
+        DaemonCommand(),
     ):
         reg.register(cmd)
     return reg

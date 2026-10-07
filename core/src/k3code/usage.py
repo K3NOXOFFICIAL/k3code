@@ -65,8 +65,19 @@ class UsageDB:
             "INSERT INTO events (ts, day, session, kind, provider, model, tokens_in, tokens_out, cost_usd,"
             " seconds, detail)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (ts, time.strftime("%Y-%m-%d", time.localtime(ts)), session, kind, provider, model,
-             tokens_in, tokens_out, cost_usd, seconds, detail[:500]),
+            (
+                ts,
+                time.strftime("%Y-%m-%d", time.localtime(ts)),
+                session,
+                kind,
+                provider,
+                model,
+                tokens_in,
+                tokens_out,
+                cost_usd,
+                seconds,
+                detail[:500],
+            ),
         )
         self._db.commit()
 
@@ -92,9 +103,21 @@ class UsageDB:
             key = day if by == "day" else sess
             g = groups.setdefault(
                 key,
-                {"key": key, "tokens_in": 0, "tokens_out": 0, "cost_usd": None, "calls": 0, "failovers": 0,
-                 "retries": 0, "pauses": 0, "paused_seconds": 0.0, "tool_calls": 0, "approvals": 0,
-                 "last_ts": 0.0, "by_model": {}},
+                {
+                    "key": key,
+                    "tokens_in": 0,
+                    "tokens_out": 0,
+                    "cost_usd": None,
+                    "calls": 0,
+                    "failovers": 0,
+                    "retries": 0,
+                    "pauses": 0,
+                    "paused_seconds": 0.0,
+                    "tool_calls": 0,
+                    "approvals": 0,
+                    "last_ts": 0.0,
+                    "by_model": {},
+                },
             )
             g["last_ts"] = max(g["last_ts"], ts)
             g["tokens_in"] += t_in

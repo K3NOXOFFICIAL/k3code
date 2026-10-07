@@ -224,6 +224,7 @@ class GatewayServer:
         self.debug = False
         #: Set by the daemon in restart-storm safe mode: no background work starts.
         self.background_paused = False
+        self.safe_mode_notice = ""
         self.usage = UsageDB(self._home() / "usage.db")
 
     # ── session registry ──────────────────────────────────────────────
@@ -402,6 +403,15 @@ class GatewayServer:
             self._send_ready(client)
             # The attach snapshot: every live session and its state, as an event for this client only.
             self._send(client, encode_event("session.active_list", {"sessions": self._active_rows(None)}))
+            if self.safe_mode_notice:
+                self._send(
+                    client,
+                    encode_event(
+                        "notification.show",
+                        {"text": self.safe_mode_notice, "level": "warning", "kind": "daemon", "key": "k3.safe_mode"},
+                        "essential",
+                    ),
+                )
             while True:
                 line = await reader.readline()
                 if not line:
