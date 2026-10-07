@@ -115,7 +115,7 @@ With a daemon running, `k3code attach <session-id>` opens the TUI on one of its 
 | `↓` (empty input) | Move into the agent list under the input; `↑`/`↓` select, `Enter` opens that session, `x` stops it (asks first), `Esc` returns |
 | `↑` / `↓` (in the input) | Walk through your previous inputs (kept per project) |
 | `Ctrl+B` | Send the running turn to the background |
-| `Alt+A` / `Alt+D` | Accept / dismiss the top proposal card (a bare `a`/`d` would steal the first letter of your message) |
+| `Alt+Y` / `Alt+N` | Accept / dismiss the top proposal card (a bare letter would steal the first character of your message) |
 | `/` | Command completion; `@` completes file paths |
 
 ### Slash commands

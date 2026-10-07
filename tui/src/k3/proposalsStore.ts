@@ -46,20 +46,21 @@ export const setProposalHandlers = (h: ProposalHandlers | null) => {
 }
 
 /**
- * Alt+A accepts and Alt+D dismisses the top card. Returns true when the key was consumed.
+ * Alt+Y accepts ("yes") and Alt+N dismisses ("no") the top card. Returns true when the key was consumed.
  *
  * A bare `a`/`d` on an empty composer used to do this, which hijacked the first letter of every message typed while
- * a card was showing ("add a test ..." accepted the card, "do ..." dismissed it for good). A modifier is unambiguous.
+ * a card was showing ("add a test ..." accepted the card, "do ..." dismissed it for good). A modifier is unambiguous;
+ * Alt+D is taken (the text input's readline kill-word), Alt+Y / Alt+N are not.
  */
 export function handleProposalKey(ch: string, meta: boolean): boolean {
   const top = $proposals.get()[0]
 
-  if (!top || !meta || (ch !== 'a' && ch !== 'd')) {
+  if (!top || !meta || (ch !== 'y' && ch !== 'n')) {
     return false
   }
 
   removeProposal(top.id)
-  ch === 'a' ? handlers?.accept(top) : handlers?.dismiss(top)
+  ch === 'y' ? handlers?.accept(top) : handlers?.dismiss(top)
 
   return true
 }

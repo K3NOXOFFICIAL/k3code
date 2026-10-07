@@ -25,7 +25,7 @@ describe('proposal cards', () => {
     expect($proposals.get().length).toBeLessThanOrEqual(PROPOSALS_MAX)
   })
 
-  it('alt+a accepts and alt+d dismisses the top card; a bare letter never does', () => {
+  it('alt+y accepts and alt+n dismisses the top card; a bare letter never does', () => {
     const accept = vi.fn()
     const dismiss = vi.fn()
     setProposalHandlers({ accept, dismiss })
@@ -33,18 +33,20 @@ describe('proposal cards', () => {
     addProposal(card('p2'))
 
     // the first letter of "add a test ..." / "do ..." must reach the composer, not the card
-    expect(handleProposalKey('a', false)).toBe(false)
-    expect(handleProposalKey('d', false)).toBe(false)
+    expect(handleProposalKey('y', false)).toBe(false)
+    expect(handleProposalKey('n', false)).toBe(false)
+    expect(handleProposalKey('a', true)).toBe(false) // not the keys
+    expect(handleProposalKey('d', true)).toBe(false) // alt+d is the input's kill-word
     expect(handleProposalKey('x', true)).toBe(false)
     expect(accept).not.toHaveBeenCalled()
     expect(dismiss).not.toHaveBeenCalled()
     expect($proposals.get().map(p => p.id)).toEqual(['p1', 'p2'])
 
-    expect(handleProposalKey('a', true)).toBe(true)
+    expect(handleProposalKey('y', true)).toBe(true)
     expect(accept).toHaveBeenCalledWith(card('p1'))
-    expect(handleProposalKey('d', true)).toBe(true)
+    expect(handleProposalKey('n', true)).toBe(true)
     expect(dismiss).toHaveBeenCalledWith(card('p2'))
-    expect(handleProposalKey('a', true)).toBe(false) // no cards left
+    expect(handleProposalKey('y', true)).toBe(false) // no cards left
   })
 
   it('clearProposals drops every card (cards belong to the session that produced them)', () => {

@@ -503,7 +503,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return clearSelection()
     }
 
-    // Proposal cards: Alt+A accepts, Alt+D dismisses the top card (a bare letter would steal the first character
+    // Proposal cards: Alt+Y accepts, Alt+N dismisses the top card (a bare letter would steal the first character
     // of every message typed while a card is showing).
     if (key.meta && !key.ctrl && handleProposalKey(ch, true)) {
       return

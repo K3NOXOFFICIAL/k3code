@@ -56,7 +56,7 @@ def headless_fake() -> None:
 
 
 def headless_live() -> None:
-    crit = "k3code finishes a read/edit/bash task through OmniRoute (live model)"
+    crit = "k3code finishes a read/edit/bash task with a live model (the plan said: through OmniRoute)"
     backend = live_backend()
     if not backend["ok"]:
         emit(M, crit, f"live `k3code -p`; {backend['label']}", "PENDING", f"live model unavailable: {backend['detail']}",

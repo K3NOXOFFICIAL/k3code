@@ -126,7 +126,10 @@ async def run(a: argparse.Namespace) -> int:
     d.env["K3CODE_FAKE_LOG"] = "0"  # the double records every request in full: it would be the leak we measure
     d.write_config("providers:\n  - {name: fake, kind: openai, base_url: 'http://fake', api_key_env: FAKE_KEY,"
                    " models: {default: m}}\ndefault_model: default\nheadless_permission: yolo\n"
-                   "reliability: {flags: {netwatch: false}}\n")
+                   "reliability: {flags: {netwatch: false}}\n"
+                   # a /loop lives in ONE session: without compaction its history (memory, DB rewrite, model context)
+                   # grows for the whole run and the RSS bound would measure that, not leaks
+                   "context: {compact_at_tokens: 4000, keep_messages: 6}\n")
 
     def log(line: str) -> None:
         print(line, flush=True)

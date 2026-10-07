@@ -258,22 +258,23 @@ def test_doctor_does_not_ask_for_a_key_for_claude_cli(monkeypatch: pytest.Monkey
     assert check_keys(cfg).status == "ok"
 
 
-async def test_hidden_thinking_is_off_by_default_and_configurable(
+async def test_hidden_thinking_is_off_for_haiku_only_and_configurable(
     shim: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Left at Claude Code's default, Haiku 4.5 emitted ~1,570 output tokens for a one-line task (81 with thinking
-    off), which ate most of the saving from routing unattended work to the cheap tier."""
-    monkeypatch.setenv("MAX_THINKING_TOKENS", "31999")  # an inherited value must not leak into the call
+    off), which ate most of the saving from routing unattended work to the cheap tier. The strong tier keeps its
+    thinking (plans, reviews and the advisor use it)."""
+    monkeypatch.setenv("MAX_THINKING_TOKENS", "31999")  # an inherited value must never leak into the call
     p = ClaudeCliProvider(name="cc", command=str(shim))
-    await _collect(p, [Message(role="user", content="hi")])
+    await _collect(p, [Message(role="user", content="hi")], model="claude-haiku-4-5-20251001")
     assert _call(tmp_path)["env"]["MAX_THINKING_TOKENS"] == "0"
+    await _collect(p, [Message(role="user", content="hi")], model="claude-sonnet-5-5")
+    assert _call(tmp_path)["env"]["MAX_THINKING_TOKENS"] is None  # Claude Code's own default
     await p.aclose()
-    p = ClaudeCliProvider(name="cc", command=str(shim), thinking_tokens=2000)
-    await _collect(p, [Message(role="user", content="hi")])
+    p = ClaudeCliProvider(name="cc", command=str(shim), thinking_tokens=2000, thinking_models=["sonnet"])
+    await _collect(p, [Message(role="user", content="hi")], model="claude-sonnet-5-5")
     assert _call(tmp_path)["env"]["MAX_THINKING_TOKENS"] == "2000"
-    await p.aclose()
-    p = ClaudeCliProvider(name="cc", command=str(shim), thinking_tokens=None)  # Claude Code's own default
-    await _collect(p, [Message(role="user", content="hi")])
+    await _collect(p, [Message(role="user", content="hi")], model="claude-haiku-4-5-20251001")
     assert _call(tmp_path)["env"]["MAX_THINKING_TOKENS"] is None
     await p.aclose()
 
@@ -281,7 +282,7 @@ async def test_hidden_thinking_is_off_by_default_and_configurable(
 def test_provider_entry_passes_the_thinking_budget_through() -> None:
     entry = ProviderEntry(name="cc", kind="claude-cli", thinking_tokens=500)
     (provider,) = make_providers([entry])
-    assert provider.thinking_tokens == 500
+    assert provider.thinking_tokens == 500 and provider.thinking_models == ("haiku",)
     assert ProviderEntry(name="cc", kind="claude-cli").thinking_tokens == 0
 
 

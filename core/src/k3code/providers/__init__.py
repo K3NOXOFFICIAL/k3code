@@ -40,7 +40,11 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                 )
             )
         elif entry.kind == "claude-cli":
-            providers.append(ClaudeCliProvider(name=entry.name, thinking_tokens=entry.thinking_tokens))
+            providers.append(
+                ClaudeCliProvider(
+                    name=entry.name, thinking_tokens=entry.thinking_tokens, thinking_models=entry.thinking_models
+                )
+            )
     return providers
 
 

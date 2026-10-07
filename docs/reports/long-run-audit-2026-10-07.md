@@ -49,7 +49,7 @@ what was fixed (every fix has a regression test that fails on the old code), and
 - park ladder and Retry-After never reset in a session's life (every later blip parked 10 min).
 - automation: `/stop` on an unattended turn killed its own supervisor (cron job re-fired at once, loops died while "active"); webhook actions were cancelled after 10 s; goal automations leaked a session and a NetWatch per fire; two runs on one session interleaved; supervisors died on one exception; run history and unattended sessions grew without bound; `cron_next` went 55 min into the past in the DST fall-back hour (2026-10-25).
 - sub-agents: `/stop` ignored (`wait()` swallowed the waiter's cancellation), failed children leaked a checkout.
-- TUI: proposal cards were accepted/dismissed by the first letter `a`/`d` of any message (now Alt+A / Alt+D) and accept also sent the action to the model for already-applied kinds; `/new` and `/clear` never released the old session; the agent strip drew running sub-agents as "completed".
+- TUI: proposal cards were accepted/dismissed by the first letter `a`/`d` of any message (now Alt+Y / Alt+N; Alt+D is the input's kill-word) and accept also sent the action to the model for already-applied kinds; `/new` and `/clear` never released the old session; the agent strip drew running sub-agents as "completed".
 
 ## Still open (known, not fixed)
 

@@ -27,6 +27,8 @@ class ProviderEntry(BaseModel):
     #: Code's own default. Left on, Haiku 4.5 spent ~20x more output tokens than it needed on mechanical tasks, which
     #: ate most of the saving from routing unattended work to the cheap tier.
     thinking_tokens: int | None = 0
+    #: ...for models whose name contains one of these (default: Haiku, the cheap tier); the others keep the CLI default
+    thinking_models: list[str] = Field(default_factory=lambda: ["haiku"])
 
     @field_validator("kind")
     @classmethod
@@ -133,6 +135,8 @@ class Settings(BaseModel):
     # M4b: ultracode: {max_tokens, max_agents}; research: {searxng_url, max_subquestions, ...}
     ultracode: dict[str, Any] = Field(default_factory=dict)
     research: dict[str, Any] = Field(default_factory=dict)
+    # Context management: {compact_at_tokens: 80000, keep_messages: 8}; see GatewayServer._maybe_compact
+    context: dict[str, Any] = Field(default_factory=dict)
 
 
 def _current_home() -> Path:

@@ -124,6 +124,7 @@ class ClaudeCliProvider(Provider):
         max_parallel: int = 2,
         setting_sources: str = "project",
         thinking_tokens: int | None = 0,
+        thinking_models: tuple[str, ...] | list[str] = ("haiku",),
     ) -> None:
         self.name = name
         self.base_url = ""  # nothing to probe over HTTP; the general internet probe covers reachability
@@ -132,6 +133,7 @@ class ClaudeCliProvider(Provider):
         self.timeout = timeout
         self.setting_sources = setting_sources
         self.thinking_tokens = thinking_tokens
+        self.thinking_models = tuple(m.lower() for m in thinking_models)
         self._max_parallel = max(1, max_parallel)
         self._sem: asyncio.Semaphore | None = None
         self._workdir: str | None = None
@@ -171,7 +173,13 @@ class ClaudeCliProvider(Provider):
             system_file,
         ]
 
-    async def _run(self, argv: list[str], prompt: str) -> tuple[int, str, str]:
+    def _thinking_for(self, model: str) -> int | None:
+        """MAX_THINKING_TOKENS for this model: ``thinking_tokens`` for the models named in ``thinking_models`` (Haiku:
+        the cheap tier, where hidden thinking cost ~20x the output of the task), Claude Code's own default otherwise
+        (the strong tier plans, reviews and advises with its thinking intact)."""
+        return self.thinking_tokens if any(m in model.lower() for m in self.thinking_models) else None
+
+    async def _run(self, argv: list[str], prompt: str, model: str = "") -> tuple[int, str, str]:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -179,7 +187,7 @@ class ClaudeCliProvider(Provider):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self._cwd(),
-                env=_clean_env(self.thinking_tokens),
+                env=_clean_env(self._thinking_for(model)),
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
@@ -218,7 +226,7 @@ class ClaudeCliProvider(Provider):
             fh.write(system or _SYSTEM_FALLBACK)
         try:
             async with self._sem:
-                rc, out, err = await self._run(self._command_line(model, system_file), prompt)
+                rc, out, err = await self._run(self._command_line(model, system_file), prompt, model)
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(system_file)

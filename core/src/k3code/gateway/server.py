@@ -75,7 +75,7 @@ from k3code.research.tools import register_web_tools
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 from k3code.routing.caller import ModelCaller
 from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router_options, tier_for
-from k3code.session_ai import make_title
+from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
 from k3code.usage import UsageDB
@@ -233,6 +233,21 @@ class LiveSession:
             "paused": self.paused,
             "background": self.background,
         }
+
+
+#: Conversation size at which a session's older messages are folded into a summary, and how many recent ones stay.
+CONTEXT_DEFAULTS: dict[str, Any] = {"compact_at_tokens": 80_000, "keep_messages": 8}
+
+
+def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
+    """Rough size of a stored conversation (~4 characters per token), tool calls included."""
+    chars = 0
+    for m in messages:
+        c = m.get("content")
+        chars += len(c) if isinstance(c, str) else len(json.dumps(c, ensure_ascii=False)) if c else 0
+        if m.get("tool_calls"):
+            chars += len(json.dumps(m["tool_calls"], ensure_ascii=False))
+    return chars // 4
 
 
 def _socket_is_live(path: Path) -> bool:
@@ -1052,7 +1067,15 @@ class GatewayServer:
         mgr = self.goal_manager(session)
         while True:
             try:
+                await self._maybe_compact(session)
+                n_before = len(session.stored.messages)
                 status, final_text = await self._run_one_turn(session, prompt)
+                if status == "error" and isinstance(session.last_exc, ContextOverflow):
+                    # The provider says the conversation does not fit: drop this attempt's messages, fold the older
+                    # history into a summary, and run the prompt once more.
+                    session.stored.messages = session.stored.messages[:n_before]
+                    if await self._maybe_compact(session, force=True):
+                        status, final_text = await self._run_one_turn(session, prompt)
             except asyncio.CancelledError:
                 if mgr.is_active():
                     mgr.pause("interrupted")
@@ -1339,6 +1362,33 @@ class GatewayServer:
         if loop is None or time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
             return
         self._persist_turn(session, loop)
+
+    async def _maybe_compact(self, session: LiveSession, *, force: bool = False) -> int:
+        """Fold the older part of the conversation into a summary once it is large; returns how many messages folded.
+
+        Nothing compacted automatically, so a `/loop` living in one session grew its history forever: every tick
+        re-sent and re-stored all of it, and on a real model the context window was exceeded after a few hundred ticks
+        and every later tick failed with ContextOverflow. Runs on the cheap ``compaction`` tier; failures are logged and
+        the turn goes on.
+        """
+        cfg = {**CONTEXT_DEFAULTS, **dict(getattr(self.config, "context", None) or {})}
+        messages = session.stored.messages
+        if not force and _estimate_tokens(messages) < int(cfg["compact_at_tokens"]):
+            return 0
+        try:
+            new, folded = await compact_messages(
+                self.model_caller, list(messages), keep=int(cfg["keep_messages"]), session_id=session.session_id
+            )
+        except Exception:  # noqa: BLE001 - e.g. every provider rate-limited: the turn proceeds with the long history
+            logger.warning("automatic compaction failed", exc_info=True)
+            return 0
+        if folded:
+            session.stored.messages = new
+            self.store.save(session.stored)
+            logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
+            session.emit("notification.show", {"text": f"Context compacted: {folded} older messages summarized",
+                                               "level": "info", "kind": "info", "key": "k3.compact"})
+        return folded
 
     async def _auto_title(self, session: LiveSession, first_message: str) -> None:
         """Name a fresh session on the ``title`` task kind; best-effort, never surfaces errors."""
