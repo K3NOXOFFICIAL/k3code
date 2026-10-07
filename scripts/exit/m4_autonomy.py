@@ -304,7 +304,9 @@ LIVE_TASKS = [  # (background?, prompt, check(dir) -> bool); every task is tiny 
      lambda d: _py(d, "fizz.py").splitlines()[-1:] == ["FizzBuzz"] and _py(d, "fizz.py").splitlines()[2] == "Fizz"),
     (False, "Create wc.py that prints the number of words in the string 'one two three four', then run it with bash.",
      lambda d: _py(d, "wc.py") == "4"),
-    (False, "Create fact.py that prints 6 factorial, then run it with bash.", lambda d: _py(d, "fact.py") == "720"),
+    # "prints 6 factorial" does not fix the format: "720" and "6! = 720" are both right, so the check looks for the value
+    (False, "Create fact.py that prints 6 factorial, then run it with bash.",
+     lambda d: "720" in _py(d, "fact.py").replace("=", " ").split()),
     (True, "Create a.txt containing exactly the word alpha.",
      lambda d: (d / "a.txt").exists() and (d / "a.txt").read_text().strip() == "alpha"),
     (True, "Create nums.txt with the numbers 1 to 5, one per line.",

@@ -25,7 +25,8 @@ from k3code.routing.tiers import TaskKind, Tier
 logger = logging.getLogger(__name__)
 
 CITE_RE = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\]")
-DEFAULTS = {"sub_questions": 5, "results_per_query": 6, "sources_per_topic": 4, "concurrency": 4, "max_claims": 60}
+DEFAULTS = {"sub_questions": 5, "results_per_query": 6, "sources_per_topic": 4, "min_sources": 14, "concurrency": 4,
+            "max_claims": 60}
 
 
 class ResearchUnavailable(Exception):
@@ -142,12 +143,24 @@ class Research:
         found = await asyncio.gather(*(one_search(t, q) for t, q in pairs))
         picks: list[tuple[SubTopic, Hit]] = []
         per_topic: dict[str, int] = {}
+        spare: list[tuple[SubTopic, Hit]] = []  # unused hits: topics overlap, so URLs repeat across topics
         for topic, hits in found:
             for h in hits:
-                if h.url in state.urls_seen or per_topic.get(topic.name, 0) >= int(cfg["sources_per_topic"]):
+                if h.url in state.urls_seen:
+                    continue
+                if per_topic.get(topic.name, 0) >= int(cfg["sources_per_topic"]):
+                    spare.append((topic, h))
                     continue
                 state.urls_seen.add(h.url)
                 per_topic[topic.name] = per_topic.get(topic.name, 0) + 1
+                picks.append((topic, h))
+        # Top up to min_sources from the spare hits: after cross-topic de-duplication a run used to read ~12 sources,
+        # and a report cites only the sources that contributed claims, which left it at 8-10 citations.
+        for topic, h in spare:
+            if len(picks) >= int(cfg["min_sources"]):
+                break
+            if h.url not in state.urls_seen:
+                state.urls_seen.add(h.url)
                 picks.append((topic, h))
         if not picks:
             raise RuntimeError("the searches returned no results; nothing to research from")

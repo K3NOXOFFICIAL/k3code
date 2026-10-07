@@ -342,3 +342,29 @@ async def test_builtin_tools_fall_back_to_duckduckgo_only_when_searxng_is_down()
     assert [h.url for h in await bt.search("asyncio taskgroup", 5)][0].startswith("https://docs.python.org/")
     off = tools.BuiltinTools("http://127.0.0.1:9", keyless_fallback=False)
     assert "SearXNG" in await off.unavailable_reason()
+
+
+async def test_sources_are_topped_up_from_spare_hits_to_min_sources(tmp_path, monkeypatch):
+    """Topics overlap, so URLs repeat across topics and the per-topic cap strands good hits: a run read ~12 sources
+    and cited 8-10. It now tops up to research.min_sources from the unused hits."""
+    from k3code.research.tools import Hit, ResearchTools
+
+    class Tools(ResearchTools):
+        name = "stub"
+
+        async def search(self, query, n=5):
+            return [Hit(f"t {query} {i}", f"https://example.org/{i}") for i in range(12)]  # every query: same 12 URLs
+
+        async def fetch(self, url):
+            return url, "page text"
+
+    plan = '{"sub_topics":[{"name":"A","queries":["a"]},{"name":"B","queries":["b"]},{"name":"C","queries":["c"]}]}'
+    server = make(tmp_path, monkeypatch, [
+        {"type": "text", "match": "Number of sub-topics", "text": plan},
+        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+        {"type": "text", "text": "ok"},
+    ], mode="auto", research={"sources_per_topic": 2, "min_sources": 9, "sub_questions": 3})
+    server.research_tools = Tools()
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    res = await server.research.run(server.session, "q", n_sub=3)
+    assert len(res.state.sources) >= 9, len(res.state.sources)
