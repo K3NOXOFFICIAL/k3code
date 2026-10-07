@@ -1,0 +1,76 @@
+package session
+
+import (
+	"github.com/Gaurav-Gosain/tuios/internal/shot"
+	"github.com/Gaurav-Gosain/tuios/internal/vt"
+)
+
+// Cell-grid capture for the screenshot verb.
+//
+// It reads the emulator straight into a shot.Grid rather than going through
+// CaptureContent's ANSI string. Both would work, but the string route resolves
+// colours to SGR and then asks the renderer to parse them back, which loses
+// the colour kind: an indexed cell would come back as whatever RGB this
+// process guessed, and --theme could no longer re-map it. Reading the cells is
+// also shorter.
+
+// screenshotGrid builds the render grid for a pane. scrollbackRows rows of
+// history are prepended above the visible screen, bounded by what the pane
+// actually holds. cursor draws the cursor cell as a block.
+//
+// It takes the same read lock GetTerminalState takes, and holds it for the
+// walk only: the render happens after, off the lock.
+func (p *PTY) screenshotGrid(palette *shot.Palette, scrollbackRows int, cursor bool) *shot.Grid {
+	p.terminalMu.RLock()
+	defer p.terminalMu.RUnlock()
+	if p.terminal == nil {
+		return nil
+	}
+	return gridOf(p.terminal, palette, scrollbackRows, cursor)
+}
+
+// gridOf is screenshotGrid without the lock, so a test can drive it against a
+// bare emulator.
+func gridOf(t vt.Terminal, palette *shot.Palette, scrollbackRows int, cursor bool) *shot.Grid {
+	if palette == nil {
+		palette = shot.XTermPalette()
+	}
+	cols, rows := t.Width(), t.Height()
+	if cols <= 0 || rows <= 0 {
+		return nil
+	}
+
+	held := t.ScrollbackLen()
+	if scrollbackRows < 0 || scrollbackRows > held {
+		scrollbackRows = held
+	}
+	g := shot.NewGrid(cols, rows+scrollbackRows, palette.FG, palette.BG)
+
+	for i := range scrollbackRows {
+		// A wide rune across the last column of a line written when the
+		// pane was wider is clipped, so the row stays as wide as the grid.
+		line := vt.ClipHistoryRow(t.ScrollbackLine(held-scrollbackRows+i), cols)
+		row := g.Cells[i]
+		for x := 0; x < cols && x < len(line); x++ {
+			cell := line[x]
+			row[x] = shot.MakeCell(cell.Content, cell.Width, cell.Style, cell.Link, palette)
+		}
+	}
+
+	for y := range rows {
+		row := g.Cells[scrollbackRows+y]
+		for x := range cols {
+			cell := t.CellAt(x, y)
+			if cell == nil {
+				continue
+			}
+			row[x] = shot.MakeCell(cell.Content, cell.Width, cell.Style, cell.Link, palette)
+		}
+	}
+
+	if cursor {
+		pos := t.CursorPosition()
+		g.ReverseCursor(pos.X, scrollbackRows+pos.Y)
+	}
+	return g
+}

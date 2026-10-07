@@ -1,0 +1,1398 @@
+// Package tuie2e drives a real tuios binary inside a real pseudo-terminal and
+// asserts on what a user would actually see on screen.
+//
+// # Why this is a separate, nested Go module
+//
+// The harness (github.com/Gaurav-Gosain/tuitest) is a test-only dependency that
+// spawns PTYs and vendors a VT emulator. tuitest is public, so requiring it
+// would work, but it would land in the dependency graph of everyone who imports
+// tuios, for code that only ever runs under `go test`. A nested module keeps the
+// tests versioned alongside the code they guard while leaving the main module's
+// go.mod and go.sum untouched.
+//
+// It is nested under e2e/ rather than placed beside it because e2e/ already
+// holds the build-tagged control-plane suite, which belongs to the main module.
+// A nested module is invisible to the parent, so `go test -tags e2e ./e2e/...`
+// at the repo root still runs exactly what it ran before and does not descend
+// here.
+//
+// # Running
+//
+//	cd e2e/tui && TUIOS_E2E=1 go test -count=1 ./...
+//
+// Without TUIOS_E2E the whole package skips, because every test here forks a
+// full multiplexer plus its shell children. TestMain builds the binary under
+// test once into a temporary directory; set TUIOS_E2E_BIN to point the same
+// assertions at a prebuilt binary, which is how the negative controls described
+// in NEGATIVE_CONTROLS.md are run.
+//
+// # Always pass -count=1
+//
+// This is not a style preference. Go caches test results, and a cached result
+// survives a change of TUIOS_E2E_BIN, so re-running the suite against a
+// deliberately broken binary can replay the previous PASS and report that a
+// regression test caught nothing when in fact it was never executed. That
+// happened while writing this suite and briefly made a genuine negative control
+// look like a false one. Every documented command here passes -count=1, and any
+// new verification run must too.
+//
+// # -race is not useful here
+//
+// The race detector instruments the test process, and the code under test runs
+// in a separate tuios process, so -race on this package costs time and detects
+// nothing. Race coverage for tuios's own internals belongs in the main module's
+// unit tests, which is where the emulator-resize race is pinned.
+//
+// # Isolation
+//
+// Every tuios instance gets a private set of XDG directories under the test's
+// own TempDir, so the daemon socket, session state, and config file never touch
+// the developer's real ~/.config, ~/.local/state, or /run/user/$UID. tuitest
+// starts the child with setsid and tears down the whole process group, so the
+// daemon and its panes are reaped even when a test fails.
+//
+// # Two harness footguns this file works around
+//
+//  1. WaitStable can report stability against a pre-action frame: called right
+//     after sending input, its quiet window can elapse before tuios has reacted.
+//     Everything here waits on expected content instead.
+//
+//  2. tuios boots into window-management mode, where plain characters are
+//     window-manager commands rather than shell input, and for 150ms after
+//     entering terminal mode it deliberately swallows unmodified single-character
+//     keys. enterTerminalMode handles both. An *attached* client is the other way
+//     round and boots into terminal mode; windowManagementMode is the fix.
+//
+//  3. tuitest's own emulator panics on a scroll region wider than the screen,
+//     which takes the whole test binary with it. Three lines reproduce it:
+//
+//     term := tuitest.StartT(t, []string{"/bin/sh"}, tuitest.WithSize(80, 24))
+//     term.Resize(80, 10)
+//     term.SendKeys(`printf '\033[1;24r\033[3S'`, tuitest.Enter)
+//
+//     internal/vt/screen.go setVerticalMargins stores DECSTBM's bottom margin
+//     without clamping it to the buffer, and ultraviolet's DeleteLineArea limits
+//     the delete count against the region but then indexes b.Lines[src] without
+//     limiting it against the buffer, so the next scroll up runs off the end.
+//     A real terminal clamps DECSTBM to the screen.
+//
+//     This is not exotic. A client renders a frame for the size it last knew
+//     about, the PTY shrinks, and the frame lands afterwards; tuios is entitled
+//     to emit that and every real terminal tolerates it. It killed an 850 second
+//     fuzz campaign and took every finding in it, because a panic in the pump
+//     goroutine cannot be recovered by the test. Until tuitest clamps, a long
+//     campaign has to be run in seed batches so one crash costs one batch: see
+//     TUIOS_FUZZ_FIRST on TestFuzzPTY.
+package tuie2e
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"crypto/sha256"
+	"encoding/hex"
+	"github.com/Gaurav-Gosain/tuitest"
+)
+
+const (
+	welcomeText = "Terminal UI Operating System"
+	welcomeHint = "new window"
+
+	// insertGuard is tuios's post-terminal-mode suppression window for
+	// unmodified single-character keys (internal/input/keyboard_terminal.go).
+	insertGuard = 150 * time.Millisecond
+
+	// bootTimeout is generous because the first run also starts the daemon.
+	bootTimeout = 20 * time.Second
+	// uiTimeout covers an ordinary UI reaction to a keystroke.
+	uiTimeout = 10 * time.Second
+	// shellTimeout covers a whole shell command: typed in, forked, run, and its
+	// output back on screen through the daemon. That is why it is longer than an
+	// ordinary UI reaction, and it is the budget behind every `echo MARKER`
+	// assertion in the suite.
+	shellTimeout = 20 * time.Second
+	// soakTimeout is shellTimeout for the tests that keep the pane busy while
+	// the assertion waits (soak, freeze), where the output being waited for is
+	// queued behind everything else those tests are generating.
+	soakTimeout = 30 * time.Second
+	// bulkTimeout covers a pane producing thousands of lines of scrollback,
+	// which is bounded by how fast the emulator can consume them rather than by
+	// any UI reaction.
+	bulkTimeout = 60 * time.Second
+	// terminalModeProbe is the per-attempt budget in enterTerminalMode, which
+	// retries. It is deliberately short: a swallowed 'i' is worth retrying
+	// rather than waiting out.
+	terminalModeProbe = 3 * time.Second
+)
+
+// tuiosBin is the binary under test, resolved once by TestMain.
+var tuiosBin string
+
+// TestMain exists only to turn runE2E's return into an exit status. The build
+// directory is removed by a defer inside runE2E, and os.Exit runs no defers, so
+// every statement that needs cleaning up lives in the function below rather
+// than here. A build directory holds a linked tuios binary, and on a machine
+// where /tmp is a tmpfs each leaked one is memory that never comes back.
+func TestMain(m *testing.M) {
+	runRelayClientIfAsked()
+	os.Exit(runE2E(m))
+}
+
+func runE2E(m *testing.M) int {
+	if os.Getenv("TUIOS_E2E") == "" {
+		fmt.Fprintln(os.Stderr, "e2e: skipping, set TUIOS_E2E=1 to run (spawns real multiplexer daemons)")
+		return 0
+	}
+	// The runtime directories that had to be moved out of the isolation roots
+	// live under one root, removed once here rather than per test: a test's own
+	// cleanup runs while another test may still be deriving the same path.
+	sweepShortRuntimeRoots()
+	// A run started from a tuios pane inherits the pane's TUIOS_SOCKET, which
+	// names the person's daemon, and tuiosCLI passes the environment on. The
+	// commands would dial it to check it; the suite has no business there.
+	_ = os.Unsetenv("TUIOS_SOCKET")
+	// The harnesses' own directory overrides. HOME is redirected per test, but
+	// each of these names a directory outright, so one set in the developer's
+	// shell would point an integration install or uninstall at their real
+	// agent config. Every tuios this suite spawns inherits the environment.
+	for _, key := range harnessDirKeys {
+		_ = os.Unsetenv(key)
+	}
+	defer func() { _ = os.RemoveAll(shortRuntimeRoot) }()
+
+	if bin := os.Getenv("TUIOS_E2E_BIN"); bin != "" {
+		abs, err := filepath.Abs(bin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "e2e: resolve TUIOS_E2E_BIN: %v\n", err)
+			return 1
+		}
+		tuiosBin = abs
+	} else {
+		dir, err := os.MkdirTemp("", "tuios-e2e-bin")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "e2e: temp dir: %v\n", err)
+			return 1
+		}
+		defer os.RemoveAll(dir)
+		tuiosBin = filepath.Join(dir, "tuios")
+		build := exec.Command("go", "build", "-o", tuiosBin, "./cmd/tuios")
+		build.Dir = "../.."
+		build.Stderr = os.Stderr
+		build.Stdout = os.Stderr
+		if err := build.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "e2e: build tuios: %v\n", err)
+			return 1
+		}
+	}
+
+	return m.Run()
+}
+
+// startOpts configures a tuios instance for a test.
+type startOpts struct {
+	// cols and rows size the PTY. Zero means 120x40.
+	cols, rows int
+	// args are extra tuios command-line flags, e.g. "--shared-borders".
+	args []string
+	// env are extra KEY=VALUE entries layered over the isolated defaults.
+	env []string
+	// out receives a copy of what tuios wrote to the PTY, so a test can assert
+	// on output that never reaches the grid. OSC 52 clipboard writes are the
+	// reason it exists: a copy is invisible on screen but unmistakable on the
+	// wire.
+	//
+	// It carries the host direction only. It used to be fed from the debug
+	// log, which mirrors both directions, and the test goroutine's keystrokes
+	// were then written into the stream between two reads of the child's
+	// output, which is the middle of whatever escape sequence straddled that
+	// read boundary. An arrow key landing inside a kitty graphics delete left
+	// that delete unparseable, and the launcher icon tests then reported a
+	// placement the host had in fact taken down. A stream a test replays as
+	// the host's has to be the host's.
+	out io.Writer
+	// animations keeps the UI animations on. The default passes
+	// --no-animations, because animations make frames non-deterministic; a
+	// test of what an animation leaves behind needs them.
+	animations bool
+	// daemonDefault runs tuios with the shipped startup.daemon, so a bare
+	// "tuios" attaches to a daemon. Every other test here holds the standalone
+	// TUI still with TUIOS_NO_DAEMON=1; see startIn.
+	daemonDefault bool
+	// shippedLooks runs tuios with the appearance defaults as they ship. Every
+	// other test here runs with the looks from before v0.8.0 pinned in its
+	// config; see pinPreV080Looks.
+	shippedLooks bool
+	// logPath, when set, receives the path of the raw PTY log, for a test
+	// that reads what tuios printed after the TUI gave the screen back.
+	logPath *string
+	// logLimit caps the raw PTY log in bytes. Zero means ptyLogLimit.
+	logLimit int64
+	// wrap runs tuios under another program: argv is wrap followed by the
+	// tuios command line. The host colour tests put a stand-in host terminal
+	// there (testdata/hostterm).
+	wrap []string
+}
+
+// start spawns tuios in a hermetic environment and returns the terminal plus
+// the isolation directory root, which multi-client tests reuse so a second
+// client reaches the same daemon.
+func start(t *testing.T, o startOpts) (*tuitest.Terminal, string) {
+	t.Helper()
+	base := t.TempDir()
+	term := startIn(t, base, o)
+	return term, base
+}
+
+// xdgKeys is the set of directories redirected per test. XDG_RUNTIME_DIR is the
+// important one: the daemon's unix socket lives there, and leaving it pointing
+// at /run/user/$UID would attach every test to the developer's live session.
+var xdgKeys = []string{
+	"XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
+	"XDG_CACHE_HOME", "XDG_DATA_HOME",
+	// The search lists, and they are not optional on macOS.
+	//
+	// A config file is looked up with xdg.SearchConfigFile, which walks the
+	// home and then the dirs. On Linux the dirs are /etc/xdg and a redirected
+	// home is the whole story, which is why this was not missed. On macOS the
+	// dirs include ~/.config whatever the home is set to, so every test read
+	// the developer's own config: their theme, their rail, their hosts. The
+	// rail in a failing frame listed machines that belong to the person
+	// running the suite.
+	//
+	// That made local runs untrustworthy in the worst way, by passing and
+	// failing for reasons that had nothing to do with the change under test,
+	// and it left CI as the only honest signal.
+	"XDG_CONFIG_DIRS", "XDG_DATA_DIRS",
+	// HOME, which is not an XDG key but is read the same way. The harness
+	// integrations install into and look for files under the home (~/.claude,
+	// ~/.codex and the rest), and tuios counts an installed integration as a
+	// sign that agents run here. With the real home, a developer who had
+	// installed one saw the suite behave as if an agent had been seen, and
+	// the tests of what shows before the first agent failed on that machine
+	// alone.
+	"HOME",
+}
+
+// harnessDirKeys are the variables that move a harness's configuration
+// directory away from the home (internal/integration's targets read them).
+// runE2E clears them for the whole suite. TestE2EClearsEveryDirOverride in
+// internal/integration fails when that package reads one missing here.
+var harnessDirKeys = []string{
+	"CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME", "CURSOR_CONFIG_DIR",
+	"GROK_HOME", "HERMES_HOME", "KIMI_CODE_HOME", "PI_CODING_AGENT_DIR",
+	"QODER_CONFIG_DIR", "QWEN_HOME", "ANTIGRAVITY_CLI_CONFIG_DIR",
+	// Windows only, cleared all the same. Hermes and Devin read them there.
+	"APPDATA", "LOCALAPPDATA",
+}
+
+// startIn spawns tuios against an explicit isolation root, so two clients can
+// share one daemon by sharing the root.
+func startIn(t *testing.T, base string, o startOpts) *tuitest.Terminal {
+	t.Helper()
+
+	// Registered before the child is spawned so cleanup order is: tear the
+	// client down first (tuitest's Close, registered inside StartT below), then
+	// kill whatever daemon it left behind. Registering it here rather than
+	// leaving it to each test means a test that starts creating a detached
+	// daemon later cannot forget.
+	killDaemon(t, base)
+
+	env := make([]string, 0, len(xdgKeys)+len(o.env)+2)
+	for _, key := range xdgKeys {
+		env = append(env, key+"="+xdgDir(base, key))
+	}
+	// fish generates its man-page completions the first time it starts
+	// interactively against an empty cache: it forks a python that reads every
+	// manual page on the machine into XDG_CACHE_HOME/fish/generated_completions,
+	// several seconds of CPU, and it orphans that process on purpose so the
+	// shell exiting does not stop it. Nothing here can reap an orphan it never
+	// saw spawned, and t.TempDir removes the directory while the python is
+	// still filling it, which fails with "directory not empty" on whichever
+	// fish test finished first. The directory already existing is fish's own
+	// record that the work was done, so it is created up front and the
+	// generator never starts. Both places are made because fish moved the
+	// directory from the data home to the cache home between major versions.
+	for _, key := range []string{"XDG_CACHE_HOME", "XDG_DATA_HOME"} {
+		dir := filepath.Join(base, key, "fish", "generated_completions")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatalf("start: mkdir %s: %v", dir, err)
+		}
+	}
+	// A predictable POSIX shell, and no user rc files changing the prompt.
+	env = append(env, "SHELL=/bin/sh", "ENV=", "PS1=$ ")
+	// startup.daemon ships on, so a bare "tuios" is a daemon client. Every test
+	// in this package that passes no subcommand was written against the
+	// standalone TUI and asserts on it, so keep them standalone rather than let
+	// a hundred assertions quietly change what they run. The variable is read
+	// in exactly one place, the bare-"tuios" decision, so it leaves `attach`,
+	// `new` and every other subcommand alone. daemonDefault opts back in, and
+	// the test of the shipped default is the one caller that sets it.
+	if !o.daemonDefault {
+		env = append(env, "TUIOS_NO_DAEMON=1")
+	}
+	// The same reasoning for the looks v0.8.0 changed: the tests were written
+	// against the dock at the bottom, no rail, full-screen zoom and a click
+	// that starts typing, so that is what they get unless they ask otherwise.
+	if o.shippedLooks {
+		useShippedLooks(base)
+	}
+	// A client given its own config home reads that one, so that is the
+	// one pinned.
+	configHome := xdgDir(base, "XDG_CONFIG_HOME")
+	for _, kv := range o.env {
+		if v, ok := strings.CutPrefix(kv, "XDG_CONFIG_HOME="); ok {
+			configHome = v
+		}
+	}
+	pinPreV080LooksIn(t, base, configHome)
+	// GORACE is forwarded so a tuios built with -race can be driven through this
+	// suite and have its findings survive. tuitest replaces the child's whole
+	// environment, so without this the child runs with GORACE unset and the race
+	// detector writes to stderr, which is the PTY the assertions read: the report
+	// is painted into the terminal, shredded across the emulator's line wrapping,
+	// and lost. With log_path set, each process writes its own file instead.
+	if gorace := os.Getenv("GORACE"); gorace != "" {
+		env = append(env, "GORACE="+gorace)
+	}
+	env = append(env, o.env...)
+
+	cols, rows := o.cols, o.rows
+	if cols == 0 {
+		cols, rows = 120, 40
+	}
+
+	argv := append(append(append([]string{}, o.wrap...), tuiosBin), o.args...)
+	// Animations make frames non-deterministic without testing anything these
+	// assertions care about.
+	if !o.animations {
+		argv = append(argv, "--no-animations")
+	}
+
+	// The log keeps only its newest bytes. A client attached to a pane that
+	// streams kitty graphics writes hundreds of megabytes a minute, and an
+	// unbounded log filled a RAM-backed /tmp.
+	logPath := filepath.Join(t.TempDir(), "pty.log")
+	limit := o.logLimit
+	if limit == 0 {
+		limit = ptyLogLimit
+	}
+	logFile, err := newBoundedLog(logPath, limit)
+	if err != nil {
+		t.Fatalf("start: create pty log: %v", err)
+	}
+	t.Cleanup(func() { _ = logFile.Close() })
+	// Registered before the client starts, so it runs after the client's
+	// teardown and the tail includes the last thing the client wrote.
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("last bytes of the pty log:\n%q", logFile.Tail(ptyLogTailOnFailure))
+		}
+	})
+	if o.logPath != nil {
+		*o.logPath = logPath
+	}
+
+	// Registered before the client starts, so it runs after the client's
+	// teardown and can say what that teardown could not kill. See
+	// logSurvivors.
+	t.Cleanup(func() {
+		if t.Failed() {
+			logSurvivors(t, base)
+		}
+	})
+
+	opts := []tuitest.Option{
+		tuitest.WithSize(cols, rows),
+		tuitest.WithTerm("xterm-256color"),
+		tuitest.WithEnv(env...),
+		tuitest.WithLog(logFile),
+		tuitest.WithDir(workDirIn(t, base)),
+	}
+	if o.out != nil {
+		opts = append(opts, tuitest.WithOutputMirror(o.out))
+	}
+	return tuitest.StartT(t, argv, opts...)
+}
+
+// describeProc names a process for a failure message: its name, state, parent,
+// thread count, kernel wait channel and argv. Linux only: it reads /proc.
+func describeProc(pid int) string {
+	dir := filepath.Join("/proc", strconv.Itoa(pid))
+	var fields []string
+	if status, err := os.ReadFile(filepath.Join(dir, "status")); err == nil {
+		for _, line := range strings.Split(string(status), "\n") {
+			for _, key := range []string{"Name:", "State:", "PPid:", "Threads:"} {
+				if strings.HasPrefix(line, key) {
+					fields = append(fields, strings.Join(strings.Fields(line), " "))
+				}
+			}
+		}
+	}
+	wchan, _ := os.ReadFile(filepath.Join(dir, "wchan"))
+	cmdline, _ := os.ReadFile(filepath.Join(dir, "cmdline"))
+	return fmt.Sprintf("pid %d, %s, wchan %q, argv %q", pid,
+		strings.Join(fields, ", "), wchan, strings.ReplaceAll(string(cmdline), "\x00", " "))
+}
+
+// logSurvivors names every process still running in the isolation root base,
+// with the state and the kernel wait channel it is in.
+//
+// Every process the suite starts runs in workDirIn(base) or below it, so the
+// working directory finds them. A daemon this client did not start is still
+// running at this point by design and is listed too; its parent pid tells it
+// apart. A process that has begun to exit has already given up its working
+// directory, and one owned by another user does not show it, so neither is
+// listed; tuitest's teardown check names those by pid. Linux only: it reads /proc.
+func logSurvivors(t *testing.T, base string) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		return
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		cwd, err := os.Readlink(filepath.Join("/proc", e.Name(), "cwd"))
+		if err != nil || !strings.HasPrefix(cwd, base) {
+			continue
+		}
+		t.Logf("still running in %s after the client's teardown: %s", base, describeProc(pid))
+	}
+}
+
+// attachIn starts a client attached to an existing daemon session and returns
+// once it has rehydrated and settled in window-management mode.
+//
+// It exists because every daemon-backed test in this package had to know two
+// things nothing here wrote down. The first is the argv: the session name is a
+// positional argument to `attach`, not a `-s` flag, and plain `tuios` in this
+// package is not a client but the standalone TUI, because startIn holds it
+// there with TUIOS_NO_DAEMON=1; a test that used it was testing a tuios with no
+// daemon behind it. The second is the mode, which windowManagementMode
+// explains.
+func attachIn(t *testing.T, base, session string, o startOpts) *tuitest.Terminal {
+	t.Helper()
+	o.args = append(append([]string{}, o.args...), "attach", session)
+	term := startIn(t, base, o)
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return countWindows(s) >= 0
+	}, bootTimeout); err != nil {
+		t.Fatalf("client never rehydrated session %q: %v\n%s", session, err, term.Snapshot())
+	}
+	windowManagementMode(t, term)
+	return term
+}
+
+// windowManagementMode settles a client in window-management mode.
+//
+// An attached client boots into terminal mode, where a plain character is input
+// to the shell. Every bare-key helper in this file is a window-manager command:
+// newWindow presses 'n', enableTiling presses 't', renameWindow presses 'r'. A
+// test that attaches and then calls one of them is reading its own keystroke
+// back out of a shell, and the failure looks like the binding not working.
+//
+// Nothing on screen announces which mode a fresh client is in, so this is not
+// something a reader can be expected to notice.
+func windowManagementMode(t *testing.T, term *tuitest.Terminal) {
+	t.Helper()
+	if err := term.SendKeys(tuitest.Alt(tuitest.Esc)); err != nil {
+		t.Fatalf("normalise to window management mode: %v", err)
+	}
+	if err := term.WaitForText("Window management mode", uiTimeout); err != nil {
+		t.Fatalf("never settled in window management mode: %v\n%s", err, term.Snapshot())
+	}
+	// The mode switch re-arms input handling; give it the same beat a mode
+	// change gets everywhere else.
+	time.Sleep(insertGuard)
+}
+
+// killDaemonNow shuts the daemon under base down immediately rather than at the
+// end of the test.
+//
+// killDaemon registers a cleanup, which is right for a test that starts one
+// daemon and wrong for anything that starts hundreds: a fuzz campaign builds a
+// fresh isolation root per replay, and leaving every one of them to t.Cleanup
+// means every daemon and every shell it forked is alive at once until the test
+// ends. The registered cleanup still runs afterwards and finds nothing to do.
+func killDaemonNow(t *testing.T, base string) {
+	t.Helper()
+	if out, err := tuiosCLI(t, base, "kill-server"); err != nil {
+		t.Logf("kill-server under %s (best effort): %v: %s", base, err, strings.TrimSpace(out))
+	}
+}
+
+// waitBoot blocks until the welcome screen is up.
+func waitBoot(t *testing.T, term *tuitest.Terminal) {
+	t.Helper()
+	if err := term.WaitForText(welcomeText, bootTimeout); err != nil {
+		t.Fatalf("tuios never reached the welcome screen: %v", err)
+	}
+}
+
+// newWindow presses 'n' and waits until the dock reports one more window than
+// before. Waiting on the count rather than on "the frame changed" avoids
+// WaitStable's documented pre-action-frame trap, and it is a real assertion
+// that the window exists rather than that something was repainted.
+func newWindow(t *testing.T, term *tuitest.Terminal) {
+	t.Helper()
+	before := settledWindowCount(t, term)
+	if err := term.SendKeys("n"); err != nil {
+		t.Fatalf("send 'n': %v", err)
+	}
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return countWindows(s) == before+1 && !strings.Contains(s.Text(), welcomeHint)
+	}, uiTimeout); err != nil {
+		t.Fatalf("no new window after 'n' (count %d -> %d): %v\n%s",
+			before, countWindows(term.Screen()), err, term.Snapshot())
+	}
+}
+
+// settledWindowCount reads the dock's window count only once the same value has
+// been observed twice in a row.
+//
+// A single read can catch a half-drawn dock. That is not hypothetical: taking
+// the "before" count straight off the screen immediately after a resize read 0
+// while three windows existed, and newWindow then waited forever for a count of
+// 1. Because the number is used as a baseline for a later equality check, a
+// transient misread does not self-correct, it poisons the assertion.
+func settledWindowCount(t *testing.T, term *tuitest.Terminal) int {
+	t.Helper()
+	prev := -2
+	deadline := time.Now().Add(uiTimeout)
+	for time.Now().Before(deadline) {
+		n := countWindows(term.Screen())
+		if n >= 0 && n == prev {
+			return n
+		}
+		prev = n
+		time.Sleep(60 * time.Millisecond)
+	}
+	t.Fatalf("dock window count never settled\n%s", term.Snapshot())
+	return -1
+}
+
+// dockStatus matches the dock bar's leftmost status field, "<workspace>:<count>",
+// e.g. "1:2" for two windows on workspace one.
+//
+// Renamed windows also put a "1:name" pill on the same row, so this insists on
+// digits after the colon and only the first match on the row is used; the status
+// field is leftmost, and a name pill can never match an all-digit second group
+// unless the user names a window a bare number, which countWindows tolerates by
+// preferring the leftmost match.
+var dockStatus = regexp.MustCompile(`([0-9]+):([0-9]+)`)
+
+// countWindows reads the live window count out of the dock status field. Tests
+// use it to wait for a window to actually exist rather than for a frame to
+// merely change, which is what makes create/close assertions trustworthy.
+// It returns -1 when the dock is not on screen, so callers can distinguish
+// "no windows" from "could not tell".
+//
+// The bottom rows are read first, where the suite's pinned dock sits. The top
+// row is read only when the rule a top dock draws under itself is on row 1,
+// for a test on the shipped looks: before the first frame the screen holds
+// the client's log lines, whose timestamps would otherwise read as a count.
+func countWindows(s tuitest.Screen) int {
+	_, rows := s.Size()
+	var order []int
+	for r := rows - 1; r >= max(0, rows-3); r-- {
+		order = append(order, r)
+	}
+	if rows > 1 && strings.HasPrefix(strings.TrimSpace(s.Line(1)), "────") {
+		order = append(order, 0)
+	}
+	for _, r := range order {
+		if m := dockStatus.FindStringSubmatch(s.Line(r)); m != nil {
+			n, err := strconv.Atoi(m[2])
+			if err != nil {
+				continue
+			}
+			return n
+		}
+	}
+	return -1
+}
+
+// waitWindowCount blocks until the dock reports exactly n windows.
+func waitWindowCount(t *testing.T, term *tuitest.Terminal, n int, what string) {
+	t.Helper()
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return countWindows(s) == n
+	}, uiTimeout); err != nil {
+		t.Fatalf("%s: window count never reached %d (last %d): %v\n%s",
+			what, n, countWindows(term.Screen()), err, term.Snapshot())
+	}
+}
+
+// enterTerminalMode switches the focused window into terminal mode and waits out
+// the 150ms single-character suppression guard, after which typed text reaches
+// the shell instead of being eaten as a window-manager binding.
+//
+// The "i" is retried because a single one is not reliably delivered: tuios
+// suppresses unmodified single-character keys for a window after several mode
+// transitions, and a keystroke that lands inside one of those windows is
+// silently dropped with no feedback. Retrying is what a user does, and it keeps
+// the tests from failing for a reason that has nothing to do with what they are
+// asserting. Terminal mode is idempotent, so a duplicate "i" that does arrive
+// costs nothing.
+func enterTerminalMode(t *testing.T, term *tuitest.Terminal) {
+	t.Helper()
+	const attempts = 4
+	for range attempts {
+		if err := term.SendKeys("i"); err != nil {
+			t.Fatalf("send 'i': %v", err)
+		}
+		if err := term.WaitForText("Terminal mode", terminalModeProbe); err == nil {
+			time.Sleep(insertGuard + 150*time.Millisecond)
+			return
+		}
+		if _, exited := term.ExitCode(); exited {
+			t.Fatalf("tuios exited while entering terminal mode\n%s", term.Snapshot())
+		}
+	}
+	t.Fatalf("did not enter terminal mode after %d attempts\n%s", attempts, term.Snapshot())
+}
+
+// leaveTerminalMode returns to window management mode via Alt+Esc.
+func leaveTerminalMode(t *testing.T, term *tuitest.Terminal) {
+	t.Helper()
+	if err := term.SendKeys(tuitest.Alt(tuitest.Esc)); err != nil {
+		t.Fatalf("send alt+esc: %v", err)
+	}
+	if err := term.WaitForText("Window management mode", uiTimeout); err != nil {
+		t.Fatalf("did not return to window management mode: %v", err)
+	}
+	// The mode switch also re-arms input handling; give it the same beat.
+	time.Sleep(insertGuard)
+}
+
+// runInShell types a command into the focused pane's shell and waits for a
+// marker the shell itself must compute, so the assertion cannot pass on a mere
+// echo of the keystrokes.
+func runInShell(t *testing.T, term *tuitest.Terminal, cmd, want string, timeout time.Duration) {
+	t.Helper()
+	// An empty marker would make this a fire-and-forget helper that passes
+	// whatever the shell did, including nothing. It is a programming error
+	// rather than a test outcome, so it fails loudly instead of returning.
+	if want == "" {
+		t.Fatalf("runInShell(%q) was given no marker to wait for; "+
+			"a command with nothing to assert on cannot fail", cmd)
+	}
+	// The typed command is echoed to the screen before it runs. A marker
+	// that appears in the command itself matches that echo, and the wait
+	// ends before the shell has done anything. Split it in the command, for
+	// example echo IMAGE""PANE, so only the shell's output can match.
+	if strings.Contains(cmd, want) {
+		t.Fatalf("runInShell(%q): the marker %q is in the command, so the "+
+			"echo of the keystrokes satisfies the wait", cmd, want)
+	}
+	if err := term.SendKeys(cmd, tuitest.Enter); err != nil {
+		t.Fatalf("type %q: %v", cmd, err)
+	}
+	if err := term.WaitForText(want, timeout); err != nil {
+		t.Fatalf("command %q never produced %q: %v", cmd, want, err)
+	}
+}
+
+// splitMarker returns m with an empty shell string in its middle, for example
+// IMAGE""PANE for IMAGEPANE. The shell prints m, but the typed command does not
+// hold it, so runInShell can only match the output. m must not be put inside
+// single quotes, where the "" would print as two quote marks.
+func splitMarker(m string) string {
+	return m[:len(m)/2] + `""` + m[len(m)/2:]
+}
+
+// renameDialogUp reports whether the rename micro-dialog is on screen.
+func renameDialogUp(s tuitest.Screen) bool {
+	text := s.Text()
+	return strings.Contains(text, "rename") && strings.Contains(text, "esc cancel")
+}
+
+// renameWindow renames the focused window through the rename keybinding and
+// only returns once the name is committed.
+//
+// Two things here were previously guessed at.
+//
+// The editor is the rename micro-dialog, which names itself in its own top
+// border and carries its keys in its bottom one. Waiting for that frame is a
+// wait on the dialog and nothing else; the previous wait counted underscores,
+// and an underscore is an ordinary character any shell output can put on
+// screen.
+//
+// The commit still requires the dialog gone as well as the name present: the
+// dialog renders the buffer as you type, so the name alone was satisfied by the
+// harness's own keystrokes and said nothing about enter.
+func renameWindow(t *testing.T, term *tuitest.Terminal, name string) {
+	t.Helper()
+
+	if err := term.SendKeys("r"); err != nil {
+		t.Fatalf("open rename editor: %v", err)
+	}
+	if err := term.WaitFor(renameDialogUp, uiTimeout); err != nil {
+		t.Fatalf("the rename dialog never opened: %v\n%s", err, term.Snapshot())
+	}
+
+	if err := term.SendKeys(name, tuitest.Enter); err != nil {
+		t.Fatalf("type the new name %q: %v", name, err)
+	}
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return strings.Contains(s.Text(), name) && !renameDialogUp(s)
+	}, uiTimeout); err != nil {
+		t.Fatalf("the window never committed the name %q: %v\n%s", name, err, term.Snapshot())
+	}
+}
+
+// alive fails the test if tuios has exited, attaching the last screen.
+func alive(t *testing.T, term *tuitest.Terminal, when string) {
+	t.Helper()
+	if code, exited := term.ExitCode(); exited {
+		t.Fatalf("tuios exited with code %d %s\n%s", code, when, term.Snapshot())
+	}
+}
+
+// altScreenCmd builds a shell command that enters the alternate screen, paints
+// marker lines with a DELIBERATELY BLANK FIRST ROW, and then sits idle emitting
+// nothing at all.
+//
+// The blank first row is the whole point. clipWindowContent used to measure a
+// window's width from lines[0] alone; an unfocused tiled pane under shared
+// borders is composited from raw, right-trimmed lines, so an application whose
+// top row is empty measured as zero columns wide and the leftmost tile at x=0
+// tripped the "entirely offscreen" guard and was discarded. Emitting nothing
+// afterwards matters too: it means only the cached layer can keep the pane on
+// screen, which is exactly the path that used to serve an empty layer forever.
+//
+// The escape is written as the POSIX \0ddd octal form, "\033" being \0 followed
+// by the two octal digits 33 (decimal 27, ESC). Writing "\0033" instead is a
+// trap: printf reads three octal digits, emits ESC, and leaves a stray literal
+// '3' that breaks the sequence, which is silent because the pane then shows the
+// escape as text rather than acting on it.
+//
+// The pane execs sleep so the shell is replaced and the process emits nothing
+// further, which is the idle-alt-screen state the cache bug lived in.
+func altScreenCmd(markers ...string) string {
+	var b strings.Builder
+	// Enter alt screen, clear it, home the cursor, then a bare newline so row
+	// one is blank.
+	b.WriteString(`printf '\033[?1049h\033[2J\033[H\n`)
+	for _, m := range markers {
+		b.WriteString("  " + m + `\n`)
+	}
+	b.WriteString(`'; exec sleep 120`)
+	return b.String()
+}
+
+// screenHas reports whether the rendered screen contains every marker.
+func screenHas(s tuitest.Screen, markers ...string) bool {
+	text := s.Text()
+	for _, m := range markers {
+		if !strings.Contains(text, m) {
+			return false
+		}
+	}
+	return true
+}
+
+// waitForAll blocks until every marker is on screen at the same time.
+func waitForAll(t *testing.T, term *tuitest.Terminal, timeout time.Duration, what string, markers ...string) {
+	t.Helper()
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return screenHas(s, markers...)
+	}, timeout); err != nil {
+		t.Fatalf("%s: markers %v never all on screen together: %v", what, markers, err)
+	}
+}
+
+// tuiosCLI runs a tuios subcommand (ls, send-keys, ...) against the daemon
+// living under an isolation root, and returns its combined output.
+func tuiosCLI(t *testing.T, base string, args ...string) (string, error) {
+	t.Helper()
+	// A subcommand that loads the config writes the default file when there
+	// is none, and a file written with the shipped values would read as the
+	// test's own choice when the client starts. So the pins go in first here
+	// too.
+	pinPreV080Looks(t, base)
+	cmd := exec.Command(tuiosBin, args...)
+	cmd.Dir = workDirIn(t, base)
+	cmd.Env = append(os.Environ(), "SHELL=/bin/sh")
+	for _, key := range xdgKeys {
+		cmd.Env = append(cmd.Env, key+"="+xdgDir(base, key))
+	}
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// workDirIn is the directory every tuios this suite spawns starts in, and so
+// the directory the daemon and every shell under it start in: a plain
+// directory under the isolation root, never the checkout the suite runs from.
+//
+// The suite used to inherit the test binary's directory, which is a checkout
+// of tuios. That was invisible until the daemon started reading a session's
+// directory: run from a linked worktree, every session the suite made became a
+// worktree session of tuios, grouped under a "tuios" row and labelled by the
+// branch instead of its name, and nine rail tests failed for anyone working in
+// a worktree while passing for anyone working in the main checkout. A suite
+// whose result depends on where the repository sits is not hermetic.
+func workDirIn(t *testing.T, base string) string {
+	t.Helper()
+	dir := filepath.Join(base, "cwd")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("workDirIn: mkdir %s: %v", dir, err)
+	}
+	return dir
+}
+
+// daemonKey identifies one (test, isolation root) pair so killDaemon registers
+// at most one cleanup per root even when a test and startIn both ask for it.
+type daemonKey struct {
+	t    *testing.T
+	base string
+}
+
+var registeredKills sync.Map
+
+// killDaemon shuts down the daemon rooted at base and then checks it is really
+// gone. Every start registers this, so a test that grows a detached daemon
+// later cannot silently leak one; the maintainer's machine has been flooded by
+// leaked test daemons before.
+//
+// kill-server's own error is still best effort, because it legitimately fails
+// when no daemon was ever started. What is not best effort is the state
+// afterwards: if `ls` still answers with sessions, the daemon outlived the test
+// and that is reported rather than swallowed. A swallowed teardown error is how
+// one test ends up running against another's daemon, and a suite where that can
+// happen cannot claim its tests are isolated.
+func killDaemon(t *testing.T, base string) {
+	t.Helper()
+	if _, already := registeredKills.LoadOrStore(daemonKey{t, base}, true); already {
+		return
+	}
+	t.Cleanup(func() {
+		if out, err := tuiosCLI(t, base, "kill-server"); err != nil {
+			t.Logf("kill-server (best effort): %v: %s", err, strings.TrimSpace(out))
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			out, err := tuiosCLI(t, base, "ls", "--json")
+			var sessions []struct {
+				Name string `json:"name"`
+			}
+			if err != nil || json.Unmarshal([]byte(out), &sessions) != nil || len(sessions) == 0 {
+				return
+			}
+			if !time.Now().Before(deadline) {
+				names := make([]string, 0, len(sessions))
+				for _, s := range sessions {
+					names = append(names, s.Name)
+				}
+				t.Errorf("daemon under %s survived kill-server with sessions %v still listed; "+
+					"a leaked daemon can serve the next test", base, names)
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Mouse input
+//
+// A real terminal reports a pointer gesture as a strictly paired stream: one
+// press report per button-down, one motion report for each cell the pointer
+// crosses while a button is held, and one release report per button-up. A
+// helper that takes a shortcut here does not merely test less than it claims.
+// It puts tuios into a state no user can reach, and every assertion made after
+// that runs against that state.
+//
+// Two shortcuts this suite used to take, both fixed here:
+//
+//  1. clickAt sent n presses and one trailing release. tuios copies a selection
+//     on release, so a triple click produced a single clipboard write where a
+//     real mouse produces three releases and two writes. Anything that happens
+//     on an intermediate release was structurally unobservable, which is how a
+//     clipboard bug survived review of the assertions: no assertion could have
+//     caught it, because the harness could not generate the input.
+//
+//  2. leftClick and shiftRightClick sent a press and no release at all. A left
+//     press inside a pane sets OS.InteractionMode, and while that flag is set
+//     tuios deliberately stops polling pane content (internal/app/os_render.go
+//     returns early on it). A press with no release therefore freezes every
+//     pane for the remainder of the test, so any later wait for shell output is
+//     waiting on a program that has stopped reading its panes.
+//     TestClickInPaneDoesNotFreezeOutput is the standing guard on that.
+//
+// What this cannot simulate is documented in NEGATIVE_CONTROLS.md under
+// "What this harness structurally cannot observe"; the short version is that
+// cmd/tuios/run.go installs a whitelist filter that drops motion events unless
+// a drag, a resize, an overlay drag, the scrollback browser or a mouse-tracking
+// application is active, so motion sent outside those states is dropped before
+// the model sees it and asserting on its effect would assert on nothing.
+
+const (
+	// mouseGap is the pause after each mouse report. Real reports arrive one at
+	// a time with human-scale gaps between them, and tuios coalesces motion to
+	// a frame budget, so back-to-back writes are not the input a user produces.
+	mouseGap = 30 * time.Millisecond
+	// multiClickHold is how long a button of a multi-click gesture stays down,
+	// and multiClickGap is the pause before the next one goes down. Together
+	// they set the press-to-press interval, which is the figure that has to stay
+	// inside internal/input.multiClickInterval for tuios to read the clicks as
+	// one gesture: 40ms against a 300ms window.
+	//
+	// They are shorter than mouseGap, and deliberately so. mouseGap is spaced
+	// for motion, which tuios coalesces to a frame budget; presses and releases
+	// pass through untouched (cmd/tuios/run.go filters motion and nothing else),
+	// and the harness was measured sending all six reports of a triple click
+	// with no pause at all and having every one of them counted, 10 times out of
+	// 10. So the pause between the clicks of one gesture buys no fidelity, and
+	// what it costs is margin: tuios measures the interval when it processes the
+	// press, not when the byte arrives, so every millisecond of nominal spacing
+	// is a millisecond less stall it takes to push the third click outside the
+	// window and turn the gesture into a double click plus a single one.
+	//
+	// Measured on this machine: with the interval widened deliberately, the
+	// gesture was still read as three clicks at 295ms and never at 300ms, so
+	// there is no fixed overhead to leave room for, only the stall. What is left
+	// is a hold short enough to be cheap and long enough to be a real button
+	// press.
+	multiClickHold = 15 * time.Millisecond
+	multiClickGap  = 25 * time.Millisecond
+	// gestureGap is long enough to guarantee the next press starts a fresh
+	// gesture rather than continuing the previous one.
+	gestureGap = 800 * time.Millisecond
+)
+
+// sendMouse writes one SGR mouse report and then pauses, so tuios sees a
+// sequence of separate events rather than one burst.
+func sendMouse(t *testing.T, term *tuitest.Terminal, what string, ev tuitest.MouseEvent) {
+	t.Helper()
+	sendMouseThenWait(t, term, what, ev, mouseGap)
+}
+
+// sendMouseThenWait is sendMouse with the pause named by the caller, for the
+// one gesture whose whole meaning is how fast its reports arrive.
+func sendMouseThenWait(t *testing.T, term *tuitest.Terminal, what string, ev tuitest.MouseEvent, pause time.Duration) {
+	t.Helper()
+	if err := term.SendMouse(ev); err != nil {
+		t.Fatalf("%s at (%d,%d): %v", what, ev.Col, ev.Row, err)
+	}
+	time.Sleep(pause)
+}
+
+// mousePress sends a button-down. Every mousePress in a test must be matched by
+// a mouseRelease, exactly as a physical button is.
+func mousePress(t *testing.T, term *tuitest.Terminal, col, row int, button tuitest.MouseButton, mods tuitest.KeyMods) {
+	t.Helper()
+	sendMouse(t, term, "press", tuitest.MouseEvent{
+		Col: col, Row: row, Button: button, Action: tuitest.MousePress, Mods: mods,
+	})
+}
+
+// mouseRelease sends a button-up. SGR reports a release with the same button
+// and modifier bits as the press that opened the gesture and a lowercase final
+// byte, which is what tuitest encodes.
+func mouseRelease(t *testing.T, term *tuitest.Terminal, col, row int, button tuitest.MouseButton, mods tuitest.KeyMods) {
+	t.Helper()
+	sendMouse(t, term, "release", tuitest.MouseEvent{
+		Col: col, Row: row, Button: button, Action: tuitest.MouseRelease, Mods: mods,
+	})
+}
+
+// mouseMotion sends a drag report: the motion bit plus the held button's code,
+// which is what mode 1002 emits for each cell the pointer crosses with a button
+// down.
+//
+// The action is MouseDrag rather than MouseMove. tuitest used to encode a
+// MouseMove carrying a button as a drag, so the two spelled the same wire
+// report; it now takes MouseMove at its word and drops the button, which turns
+// every report here into a bare hover. tuios reads a press, a run of hovers and
+// a release as a click, so a drag stopped moving anything at all.
+func mouseMotion(t *testing.T, term *tuitest.Terminal, col, row int, button tuitest.MouseButton, mods tuitest.KeyMods) {
+	t.Helper()
+	sendMouse(t, term, "motion", tuitest.MouseEvent{
+		Col: col, Row: row, Button: button, Action: tuitest.MouseDrag, Mods: mods,
+	})
+}
+
+// clickToType clicks a pane's content and waits for terminal mode. Under the
+// harness config one click focuses the pane and starts typing in it, so an
+// enterTerminalMode after the click would send its "i" to the shell, where it
+// prefixes the next command ("iwhile ...") and the command fails.
+func clickToType(t *testing.T, term *tuitest.Terminal, col, row int) {
+	t.Helper()
+	mouseClick(t, term, col, row, tuitest.MouseLeft, 0)
+	if err := term.WaitForText("Terminal mode", uiTimeout); err != nil {
+		t.Fatalf("a click at %d,%d did not start typing in the pane: %v\n%s", col, row, err, term.Snapshot())
+	}
+	time.Sleep(insertGuard + 150*time.Millisecond)
+}
+
+// mouseClick is one complete click: press then release at the same cell.
+func mouseClick(t *testing.T, term *tuitest.Terminal, col, row int, button tuitest.MouseButton, mods tuitest.KeyMods) {
+	t.Helper()
+	mousePress(t, term, col, row, button, mods)
+	mouseRelease(t, term, col, row, button, mods)
+}
+
+// mouseDrag is one complete drag: press, a motion report for every cell between
+// the two points, then release at the far end.
+//
+// The intermediate reports are not decoration. tuios tracks a selection, a
+// window move and a resize from motion, and a press-then-release with nothing
+// in between is a click, not a drag: the drag-distance threshold in
+// handleMouseRelease treats it as one and snaps the window back.
+func mouseDrag(t *testing.T, term *tuitest.Terminal, fromCol, fromRow, toCol, toRow int, button tuitest.MouseButton, mods tuitest.KeyMods) {
+	t.Helper()
+	mousePress(t, term, fromCol, fromRow, button, mods)
+	steps := max(abs(toCol-fromCol), abs(toRow-fromRow))
+	for i := 1; i <= steps; i++ {
+		col := fromCol + (toCol-fromCol)*i/steps
+		row := fromRow + (toRow-fromRow)*i/steps
+		mouseMotion(t, term, col, row, button, mods)
+	}
+	mouseRelease(t, term, toCol, toRow, button, mods)
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// mouseHover sends a bare pointer motion with no button held: SGR button code
+// 35, which is the no-button value 3 plus the motion bit 32. MouseNone is what
+// spells that now; it used to be written out by hand, because the MouseButton
+// zero value is the left button and there was no way to say "no button".
+//
+// Read the doc comment on the mouse section before using this. tuios's motion
+// filter drops bare motion in every state except an active drag, resize,
+// overlay drag, scrollback browser, a pane running a mouse-tracking
+// application, the sidebar band, and pane content while appearance.links is on.
+// In every other state this is delivered to the program and dropped before
+// Update sees it, so hover-driven behaviour there, including the context menu's
+// own hover highlight, cannot be observed from here at all.
+//
+// Pane content is the exception link hover added, and it is why
+// link_hover_test.go can see an underline appear: a link's target is not a
+// rectangle the chrome recorded, so the filter has to pass motion over the
+// whole content box. That clause is off with appearance.links = off.
+func mouseHover(t *testing.T, term *tuitest.Terminal, col, row int) {
+	t.Helper()
+	sendMouse(t, term, "hover", tuitest.MouseEvent{
+		Col: col, Row: row, Button: tuitest.MouseNone, Action: tuitest.MouseMove,
+	})
+}
+
+// tilingModeIcon is the dock mode chip's tiling glyph, config.DockModeIconTiling
+// (nf-fa-th). The chip carries it for as long as the session is tiled and drops
+// it the moment tiling goes off, so it is a state, not an event, and it is what
+// this file reads to answer "is this session tiled" without pressing anything.
+//
+// It is spelled out rather than imported because this module does not depend on
+// the one under test. Nothing else in the app draws it, and no notification
+// contains it, so a plain search of the screen is unambiguous.
+// TestTheDockChipTracksTiling pins it against the real binary.
+const tilingModeIcon = "\uf00a"
+
+// tilingIsOn reports whether the dock says the session is tiled.
+func tilingIsOn(s tuitest.Screen) bool {
+	return strings.Contains(s.Text(), tilingModeIcon)
+}
+
+// settledTiling reads the tiling state once the same answer has come back
+// twice, because a single read can catch a half-drawn dock. That is the trap
+// settledWindowCount documents, and it matters more here: the answer decides
+// whether a key is pressed at all, so a transient misread does not correct
+// itself, it toggles the session the wrong way.
+func settledTiling(t *testing.T, term *tuitest.Terminal) bool {
+	t.Helper()
+	prev, seen := false, false
+	deadline := time.Now().Add(uiTimeout)
+	for time.Now().Before(deadline) {
+		now := tilingIsOn(term.Screen())
+		if seen && now == prev {
+			return now
+		}
+		prev, seen = now, true
+		time.Sleep(60 * time.Millisecond)
+	}
+	t.Fatalf("the dock never settled on a tiling state\n%s", term.Snapshot())
+	return false
+}
+
+// enableTiling leaves the session tiled and waits for the layout to actually be
+// tiled, which with markers it establishes by requiring every pane's marker to
+// be on screen at the same time. Floating windows overlap, so only the topmost
+// one's content shows; tiled windows all show at once.
+//
+// It is not a toggle. startup.tiled ships on, so a session can already be tiled
+// when this is called, and pressing the key would turn it off; no caller ever
+// wanted that. Every caller wants to be tiled when this returns, which is what
+// it now promises and checks.
+//
+// When markers are given this deliberately does not wait for the "Tiling Mode
+// Enabled" message: with several windows open the relayout is the thing under
+// test, and the markers say the relayout happened.
+//
+// With no markers it waits for the message instead of sleeping, but only after
+// first waiting for any earlier tiling message to leave the dock. Without that
+// pre-wait the condition could be satisfied by a message an earlier step
+// produced, which is the stale-message trap that already cost this suite a
+// silently vacuous assertion in TestFocusCycleWithRapidKeyRepeat.
+func enableTiling(t *testing.T, term *tuitest.Terminal, markers ...string) {
+	t.Helper()
+	if !settledTiling(t, term) {
+		if len(markers) == 0 {
+			// notifications linger for config.NotificationDuration (6s), so this is
+			// the budget for an earlier one to expire. In practice it is already
+			// gone and this returns immediately.
+			if err := term.WaitFor(func(s tuitest.Screen) bool {
+				return !strings.Contains(s.Text(), "Tiling o")
+			}, 10*time.Second); err != nil {
+				t.Fatalf("a tiling message from an earlier step never cleared, so waiting "+
+					"for this one would prove nothing: %v\n%s", err, term.Snapshot())
+			}
+		}
+		if err := term.SendKeys("t"); err != nil {
+			t.Fatalf("toggle tiling: %v", err)
+		}
+		if len(markers) == 0 {
+			if err := term.WaitForText("Tiling on", uiTimeout); err != nil {
+				t.Fatalf("tiling was never enabled: %v\n%s", err, term.Snapshot())
+			}
+		}
+	}
+	if len(markers) > 0 {
+		if err := term.WaitFor(func(s tuitest.Screen) bool {
+			return screenHas(s, markers...)
+		}, uiTimeout); err != nil {
+			t.Fatalf("layout never became tiled (markers %v not all visible together): %v\n%s",
+				markers, err, term.Snapshot())
+		}
+	}
+	if !settledTiling(t, term) {
+		t.Fatalf("the dock still says the session is not tiled\n%s", term.Snapshot())
+	}
+}
+
+// disableTiling is enableTiling's other half: it leaves the session floating,
+// and presses nothing when it already is. A test that wants to watch the "t"
+// key turn tiling on calls this first, so the press it then makes starts from a
+// state it chose rather than from the shipped default.
+func disableTiling(t *testing.T, term *tuitest.Terminal) {
+	t.Helper()
+	if !settledTiling(t, term) {
+		return
+	}
+	if err := term.SendKeys("t"); err != nil {
+		t.Fatalf("toggle tiling: %v", err)
+	}
+	if err := term.WaitForText("Tiling off", uiTimeout); err != nil {
+		t.Fatalf("tiling was never turned off: %v\n%s", err, term.Snapshot())
+	}
+	// And the message has to clear, or the caller's own wait for the next
+	// tiling message would be satisfied by this one.
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return !strings.Contains(s.Text(), "Tiling o")
+	}, 10*time.Second); err != nil {
+		t.Fatalf("the tiling-off message never cleared: %v\n%s", err, term.Snapshot())
+	}
+}
+
+// unixSocketPathMax is the longest socket path the suite lets tuios bind. The
+// kernel's own cap is 104 bytes on darwin and 108 on linux, both counting the
+// terminator, so this is the smaller one less the terminator.
+const unixSocketPathMax = 103
+
+// longestRuntimeSocket is the longest socket tuios binds under its runtime
+// directory, relative to it: a tmux shim wait-for socket, a channel hash of
+// eight hex digits and a locker named by the time in thirteen base 36
+// digits. A pane holder's socket (tmux/p/2147483647.sock), the daemon's
+// tuios.sock and its link sockets (tuios.sock.link-human is the longest) are
+// shorter. A runtime directory is measured against this one, since measuring
+// it against tuios.sock alone let a root through whose daemon bound and whose
+// pane holders could not.
+var longestRuntimeSocket = filepath.Join("tuios", "tmux", "w", "ffffffff", "l1y2p0ij32e8e7")
+
+// shortRuntimeRoot is where a runtime directory goes when the isolation root
+// is too long to hold one. Per user and per test process. It was per user
+// only, and the suite removes it on exit, so a second run on the same machine
+// (one package run beside a full one, say) deleted the sockets of every daemon
+// the first run still had up: the first run's tests then read "the daemon is
+// not running", and its cleanups could not reach those daemons to stop them.
+// sweepShortRuntimeRoots removes the roots of runs that are gone.
+var shortRuntimeRoot = filepath.Join("/tmp", fmt.Sprintf("tuios-e2e-%d-%d", os.Getuid(), os.Getpid()))
+
+// sweepShortRuntimeRoots removes the short runtime roots of this user's test
+// processes that no longer exist, which a killed run leaves behind. The root
+// of a process still running is left alone.
+func sweepShortRuntimeRoots() {
+	prefix := fmt.Sprintf("tuios-e2e-%d-", os.Getuid())
+	entries, err := os.ReadDir("/tmp")
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		pid, err := strconv.Atoi(strings.TrimPrefix(e.Name(), prefix))
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), prefix) || err != nil || pid == os.Getpid() {
+			continue
+		}
+		if processAlive(pid) {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join("/tmp", e.Name()))
+	}
+}
+
+// processAlive reports whether a process with this pid exists. EPERM means it
+// exists under another user, which counts.
+func processAlive(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+// commandLinesContaining returns the full command line of every running
+// process whose command line contains needle.
+//
+// It reads ps rather than pgrep. `pgrep -af` prints command lines on linux,
+// where -a means "list the full command line", but on macOS and the BSDs -a
+// means "include the ancestors of each match" and the output is bare pids. A
+// test that searched pgrep's output for a command line therefore found nothing
+// on a Mac, whatever was running, so a positive assertion failed every time and
+// a negative one could never fail. `ps -A -ww -o args=` prints the same thing
+// on both: every process, untruncated, one command line per row.
+func commandLinesContaining(t *testing.T, needle string) []string {
+	t.Helper()
+	out, err := exec.Command("ps", "-A", "-ww", "-o", "args=").Output()
+	if err != nil {
+		t.Fatalf("list processes: %v", err)
+	}
+	var lines []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.Contains(line, needle) {
+			lines = append(lines, strings.TrimSpace(line))
+		}
+	}
+	return lines
+}
+
+// redirected remembers the isolation roots whose runtime directory has already
+// been moved, so the move and its cleanup happen once per root rather than
+// once per lookup.
+var redirected sync.Map
+
+// xdgDir is the directory one XDG variable points at for an isolation root,
+// and the only reason it is a function is the socket.
+//
+// The daemon binds <XDG_RUNTIME_DIR>/tuios/tuios.sock, and a unix socket path
+// is capped by the kernel at about a hundred bytes. t.TempDir names its
+// directory after the test, and on macOS the temp root is already
+// /var/folders/<16 chars>/<16 chars>/T/, so a test with a long name spends the
+// whole budget before tuios adds a byte: the bind fails, the daemon exits 1,
+// and the test reports that tuios never reached its welcome screen. Every test
+// in the suite fails that way, which reads like a broken harness rather than a
+// path length.
+//
+// So the suite only really ran on linux. That is the worst shape it could have
+// taken, because the one open bug that reproduces on macOS and not on linux is
+// about keyboard focus resizing a pane, and the harness built to investigate
+// it could not be run on the machine it happens on.
+//
+// A runtime directory that would not fit is put under a short root instead,
+// and base/XDG_RUNTIME_DIR is left as a symlink to it, because a few tests
+// read the pid file by joining the base themselves. The variable carries the
+// short path and not the symlink: a bind is measured against the path it is
+// handed, not the path that path resolves to.
+func xdgDir(base, key string) string {
+	dir := filepath.Join(base, key)
+	if key != "XDG_RUNTIME_DIR" || len(filepath.Join(dir, longestRuntimeSocket)) <= unixSocketPathMax {
+		mustMkdir(dir)
+		return dir
+	}
+
+	// Named from the root it stands in for, so every caller that asks about one
+	// isolation root gets one answer without passing anything between them.
+	sum := sha256.Sum256([]byte(base))
+	short := filepath.Join(shortRuntimeRoot, hex.EncodeToString(sum[:6]))
+	mustMkdir(short)
+	if _, already := redirected.LoadOrStore(short, true); !already {
+		// Best effort, and only so a test that opens a file by joining the base
+		// itself still finds it. A test that compares the path as a string is
+		// not covered by a symlink and asks xdgDir for the answer instead.
+		_ = os.Symlink(short, dir)
+	}
+	return short
+}
+
+// mustMkdir makes a directory the suite cannot run without. A test helper that
+// cannot create its own isolation directory has nothing to fall back to and
+// nothing useful to report later, so it says so here rather than letting the
+// daemon fail twenty lines on with a message about a socket.
+func mustMkdir(dir string) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		panic("e2e: mkdir " + dir + ": " + err.Error())
+	}
+}
+
+// TestTheSuiteReadsNoConfigButItsOwn.
+//
+// The isolation is what makes every other test in this package mean anything,
+// and on macOS it was not isolating. A config file is looked up with
+// xdg.SearchConfigFile, which walks the config home and then the config dirs.
+// Redirecting the home is the whole story on Linux, where the dirs are
+// /etc/xdg. On macOS the dirs include ~/.config whatever the home is set to,
+// so every test read the developer's own config and their theme, rail and
+// hosts came with it.
+//
+// That is the worst shape a test-harness fault can take: it passed in CI,
+// failed locally for reasons unrelated to the change under test, and taught
+// whoever was running it to stop believing local runs.
+//
+// Negative control: dropping XDG_CONFIG_DIRS from xdgKeys fails this on macOS
+// and passes on Linux, which is exactly how it went unnoticed.
+func TestTheSuiteReadsNoConfigButItsOwn(t *testing.T) {
+	base := t.TempDir()
+
+	// Every directory the child is told about has to be inside the root this
+	// test owns, whether it is a single path or a list of them.
+	for _, key := range xdgKeys {
+		dir := xdgDir(base, key)
+		if dir == "" {
+			t.Errorf("%s is redirected to nothing", key)
+			continue
+		}
+		// The runtime dir may be moved to a short path on macOS, where the
+		// unix socket name has a length cap; it is still not the user's.
+		if strings.HasPrefix(dir, base) || strings.HasPrefix(dir, shortRuntimeRoot) {
+			continue
+		}
+		t.Errorf("%s points at %s, which is outside the test's own root", key, dir)
+	}
+
+	// And the two search lists are redirected at all, which is the half that
+	// was missing.
+	for _, key := range []string{"XDG_CONFIG_DIRS", "XDG_DATA_DIRS"} {
+		if !slices.Contains(xdgKeys, key) {
+			t.Errorf("%s is not redirected, so a config outside the test can be read", key)
+		}
+	}
+}

@@ -1,0 +1,207 @@
+package session
+
+import (
+	"strings"
+	"time"
+
+	"github.com/Gaurav-Gosain/tuios/internal/harness"
+)
+
+// screenScanInterval bounds how often output drives a screen scan, so a pane
+// printing a build log pays for one scan per interval rather than one per chunk.
+const screenScanInterval = 250 * time.Millisecond
+
+// screenSettleDelay is how long after output stops before the settle scan runs.
+//
+// This is the whole reason the throttle alone is not enough. The state a rule
+// most wants to see is a blocking prompt, and a blocking prompt is painted by
+// the LAST chunk a pane emits before it goes silent: the throttle can swallow
+// exactly that chunk and then nothing else ever arrives to trigger a scan. One
+// timer, armed on output and disarmed when it fires, closes that hole without a
+// ticker, so a pane that stays silent costs nothing.
+const screenSettleDelay = 400 * time.Millisecond
+
+// scanScreenForAgent matches the harness's screen rules against the bottom of a
+// pane and reports what they say.
+//
+// It is the last-resort tier and reports as AgentSourceScreen, so it does not
+// write over a harness reporting for itself or an escape sequence the pane
+// emitted. What it can do is see a state those two never mention: a harness
+// sitting on a blocking prompt paints it once and then emits nothing at all, no
+// title and no progress sequence, so the screen is the only channel carrying the
+// fact that a human is being waited for.
+//
+// That is also why it carries the one exception to the ranking. A source that
+// has gone quiet while the pane painted a prompt over it is stale rather than
+// authoritative, so a matched blocker may take its claim; see
+// blockerOverridesClaim. The claim goes back the moment a later look finds the
+// prompt gone.
+//
+// It reports whether a rule matched, which is a different question from whether
+// the report was accepted: a matching rule means the screen carries an answer
+// even when a higher-ranked source owns the window, and the silence timer needs
+// that fact to know it must not call the pane idle.
+func (s *Session) scanScreenForAgent(ptyID string, reg *harness.Registry) bool {
+	return s.lookAtPane(ptyID, reg, paneLook{screen: true})
+}
+
+// screenVerdict matches the harness's screen rules against the bottom of the
+// pane. looked is false when there was nothing to read at all: no rules, or an
+// empty screen.
+func screenVerdict(pty *PTY, hid string, reg *harness.Registry) (v agentVerdict, looked bool) {
+	lines := reg.ScreenLines(hid)
+	if lines <= 0 {
+		return agentVerdict{}, false
+	}
+	tail := pty.tailText(lines)
+	if len(tail) == 0 {
+		return agentVerdict{}, false
+	}
+	state, rule, ok := reg.Classify(hid, tail)
+	if !ok {
+		return agentVerdict{}, true
+	}
+	return agentVerdict{
+		ok:      true,
+		state:   AgentState(state),
+		message: screenRuleMessage(reg, hid, rule, tail),
+		kind:    reg.RuleKind(hid, rule),
+		source:  AgentSourceScreen,
+	}, true
+}
+
+// releaseScreenIdle stops defending an idle state the screen tier took, once a
+// look finds no rule matching: the prompt box that proved rest is off the
+// screen. The state stays where it is and the claim is yielded, so the pane is
+// back under the tiers that handled it before, and the detector can move it to
+// working on the next output from the agent.
+func (s *Session) releaseScreenIdle(windowID string) {
+	if claim, held := s.agentClaimHeld(windowID); !held || claim.source != AgentSourceScreen {
+		return
+	}
+	if state, _ := s.windowAgentState(windowID); state != AgentStateIdle {
+		return
+	}
+	s.yieldAgentClaim(windowID, AgentSourceScreen)
+}
+
+// screenRuleMessage is what a screen claim says about itself: the prompt line
+// the rule matched, fronted by whether it is an approval or a question, so the
+// alert and the rail can say what the agent asked rather than only that it
+// asked. A rule whose match carried no readable line falls back to the
+// manifest's own sentence, which is what every claim said before the line was
+// read.
+//
+// Only the screen tier builds a message this way. A report or an OSC claim
+// carries its own words and nothing here touches them.
+func screenRuleMessage(reg *harness.Registry, hid string, rule int, tail []string) string {
+	if prompt := reg.RulePrompt(hid, rule, tail); prompt != "" {
+		// A dialog rule's message is already in the form tuios's hooks
+		// report an approval in ("approve <tool>: <what>"). It says its
+		// kind, and the risk rules read it in that form.
+		if kind := reg.RuleKind(hid, rule); kind != "" && !(reg.RuleShowsDialog(hid, rule) && strings.HasPrefix(prompt, "approve ")) {
+			return kind + ": " + prompt
+		}
+		return prompt
+	}
+	return reg.RuleMessage(hid, rule)
+}
+
+// agentHarnessOf names the window backed by ptyID and the harness running in it,
+// under the state read lock. An empty harness means nothing has claimed the pane
+// as an agent, and a screen rule has nothing to match with.
+func (s *Session) agentHarnessOf(ptyID string) (windowID, harnessID string) {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	for i := range s.state.Windows {
+		if s.state.Windows[i].PTYID == ptyID {
+			return s.state.Windows[i].ID, s.state.Windows[i].AgentHarness
+		}
+	}
+	return "", ""
+}
+
+// tailText reads the bottom of the pane's emulator under the terminal lock, the
+// same lock GetTerminalState takes.
+func (p *PTY) tailText(lines int) []string {
+	p.terminalMu.RLock()
+	defer p.terminalMu.RUnlock()
+	if p.terminal == nil {
+		return nil
+	}
+	return p.terminal.TailText(lines)
+}
+
+// screenScanDue reports whether enough time has passed since the last
+// output-driven screen scan to run another, and claims the slot if so. Called
+// only from the single PTY read goroutine, so a plain load/store is race-free.
+func (p *PTY) screenScanDue(now int64) bool {
+	if now-p.lastScreenScan.Load() < int64(screenScanInterval) {
+		return false
+	}
+	p.lastScreenScan.Store(now)
+	return true
+}
+
+// hasScreenLook reports whether the look has been installed, so the caller can
+// skip building the closure that installs it. The check is worth having because
+// the caller runs per chunk and the install runs once.
+func (p *PTY) hasScreenLook() bool {
+	p.screenSettleMu.Lock()
+	defer p.screenSettleMu.Unlock()
+	return p.screenLook != nil
+}
+
+// setScreenLook installs the look this pane runs, both on the throttled path
+// and when it settles. Both callers run it through runScreenLook, so the
+// closure is built once per pane rather than once per chunk.
+func (p *PTY) setScreenLook(f func()) {
+	p.screenSettleMu.Lock()
+	defer p.screenSettleMu.Unlock()
+	p.screenLook = f
+}
+
+// armScreenSettle schedules the one scan that runs after a pane goes quiet.
+// Re-arming while output is still flowing pushes the scan out, so a busy pane
+// runs it once when it finally stops rather than once per chunk.
+//
+// The timer is created on the first arm and reset afterwards. Building a fresh
+// time.AfterFunc per arm allocated a runtime timer on every chunk a flooding
+// pane emitted, for a scan that by design runs only once, after the flood ends.
+// A Reset that races the fire simply runs the scan twice, and the scan reads the
+// screen and reports what it finds, so a second look costs a scan and decides
+// the same thing.
+func (p *PTY) armScreenSettle() {
+	p.screenSettleMu.Lock()
+	defer p.screenSettleMu.Unlock()
+	if p.screenLook == nil {
+		return
+	}
+	if p.screenSettle == nil {
+		p.screenSettle = time.AfterFunc(screenSettleDelay, p.runScreenLook)
+		return
+	}
+	p.screenSettle.Reset(screenSettleDelay)
+}
+
+// runScreenLook runs the installed look. It is also what the timer fires, and it
+// reads the look under the lock rather than closing over it, so the timer built
+// on the first arm is never holding a stale callback.
+func (p *PTY) runScreenLook() {
+	p.screenSettleMu.Lock()
+	f := p.screenLook
+	p.screenSettleMu.Unlock()
+	if f != nil {
+		f()
+	}
+}
+
+// stopScreenSettle disarms the settle timer, for a pane being closed.
+func (p *PTY) stopScreenSettle() {
+	p.screenSettleMu.Lock()
+	defer p.screenSettleMu.Unlock()
+	if p.screenSettle != nil {
+		p.screenSettle.Stop()
+		p.screenSettle = nil
+	}
+}

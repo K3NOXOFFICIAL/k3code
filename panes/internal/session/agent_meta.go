@@ -1,0 +1,362 @@
+package session
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+	"unicode"
+	"unicode/utf8"
+)
+
+// Agent metadata is a short list of key and value pairs a pane reports about
+// the agent in it: the model, how full its context is, what the turn cost, a
+// one-line summary of the task. The rail draws them under the agent's row.
+//
+// It is display only. Nothing reads it to decide a state, a wait, an alert or
+// a message: a harness can put anything here, and a value that could steer
+// tuios would be an input nobody validated. That is also why it has hard
+// limits and a TTL: a statusline feed that stops writing leaves nothing stale
+// behind for longer than it said.
+
+// Limits on agent metadata. They bound what one pane can make every attached
+// client store and draw.
+const (
+	// AgentMetaMaxPerCall is how many keys one set-agent-meta call may touch.
+	AgentMetaMaxPerCall = 16
+	// AgentMetaMaxPerPane is how many keys one pane may hold at once.
+	AgentMetaMaxPerPane = 32
+	// AgentMetaMaxKey is the longest key, in bytes. Keys are ASCII.
+	AgentMetaMaxKey = 24
+	// AgentMetaMaxValue is the longest value, in characters. A longer value is
+	// cut, not refused, because a harness writing a summary cannot know how
+	// long this build lets one be.
+	AgentMetaMaxValue = 80
+	// AgentMetaMaxTTL is the longest TTL a call may ask for.
+	AgentMetaMaxTTL = 24 * time.Hour
+)
+
+// AgentMetaToken is one key and value a pane reported about its agent.
+//
+// It rides WindowState, so an older peer that does not know the field drops it
+// on decode, and a state with no metadata carries nil, which every reader
+// takes as "the pane said nothing".
+type AgentMetaToken struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+	// Source names who wrote it ("claude-statusline", "hook"), so a writer can
+	// clear its own keys without touching another's. Empty when unstated.
+	Source string `json:"source,omitempty"`
+	// Expires is when the daemon drops it, as Unix nanoseconds, or 0 for a
+	// token that lives until it is cleared or the agent leaves the pane.
+	Expires int64 `json:"expires,omitempty"`
+}
+
+// AgentMetaUpdate is one set-agent-meta call, already validated.
+type AgentMetaUpdate struct {
+	// Keys and Values are the tokens to set, in the order the caller wrote
+	// them. A nil value removes the key.
+	Keys   []string
+	Values []*string
+	// Source is recorded on every token set, and scopes Clear.
+	Source string
+	// TTL is how long the tokens set live. Zero means until cleared.
+	TTL time.Duration
+	// Clear removes every token the source wrote, or every token when Source
+	// is empty, before the new ones are applied.
+	Clear bool
+	// Protect names keys Clear leaves in place. set-agent-meta protects the
+	// reserved keys, which only the daemon writes.
+	Protect []string
+}
+
+// errAgentMetaFull is the per-pane limit, reported to the caller.
+var errAgentMetaFull = fmt.Errorf("a pane holds at most %d metadata keys", AgentMetaMaxPerPane)
+
+// errNoAgentMetaChange tells mutateState a prune found nothing to drop, or a
+// write found nothing to change, so it neither bumps the version nor pushes to
+// clients.
+var errNoAgentMetaChange = errors.New("no agent metadata change")
+
+// ValidAgentMetaKey reports whether k can be a metadata key: 1 to 24 bytes of
+// lower-case letters, digits, '_' and '-', starting with a letter. Keys end up
+// in config (the rail's $name tokens), so they are held to what a config key
+// can spell.
+func ValidAgentMetaKey(k string) bool {
+	if k == "" || len(k) > AgentMetaMaxKey {
+		return false
+	}
+	for i := 0; i < len(k); i++ {
+		c := k[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+		case i > 0 && (c >= '0' && c <= '9' || c == '_' || c == '-'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// CleanAgentMetaValue makes a value safe to draw: control characters (which
+// include the escape that starts a terminal sequence) and line separators
+// become spaces, invisible characters (InvisibleFormatRune) go, runs of
+// space fold to one, the ends are trimmed, and the result is cut to
+// AgentMetaMaxValue characters. It reports whether it cut anything.
+func CleanAgentMetaValue(v string) (string, bool) {
+	var b strings.Builder
+	b.Grow(len(v))
+	space := false
+	n := 0
+	cut := false
+	for _, r := range v {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+			r = ' '
+		} else if InvisibleFormatRune(r) {
+			// Format characters and variation selectors draw nothing and
+			// can hide words in the value.
+			continue
+		}
+		if unicode.IsSpace(r) {
+			if space || b.Len() == 0 {
+				continue
+			}
+			space = true
+			r = ' '
+		} else {
+			space = false
+		}
+		if n == AgentMetaMaxValue {
+			cut = true
+			break
+		}
+		b.WriteRune(r)
+		n++
+	}
+	return strings.TrimRight(b.String(), " "), cut
+}
+
+// liveAgentMeta returns the tokens of cur that have not expired at now. It
+// returns cur itself when nothing has, so the common case copies nothing.
+func liveAgentMeta(cur []AgentMetaToken, now int64) []AgentMetaToken {
+	expired := 0
+	for _, t := range cur {
+		if t.Expires != 0 && t.Expires <= now {
+			expired++
+		}
+	}
+	if expired == 0 {
+		return cur
+	}
+	if expired == len(cur) {
+		return nil
+	}
+	out := make([]AgentMetaToken, 0, len(cur)-expired)
+	for _, t := range cur {
+		if t.Expires == 0 || t.Expires > now {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// applyAgentMeta returns cur with u applied at now, and whether that changed
+// anything. It never writes into cur: state snapshots share a window's slice,
+// so a token list is replaced whole and never edited in place. A key already
+// present keeps its position, and a new key goes at the end, so the rail's
+// order is the order keys first arrived in and does not reshuffle on every
+// update.
+//
+// A key set to the value it holds, by the source that wrote it, is a change
+// only for its expiry: a write with no TTL makes a token that had one
+// permanent, and a write with a TTL renews it only once less than half of that
+// TTL remains. So a feed that rewrites the same values several times a second
+// changes nothing, and its caller pushes nothing to clients.
+func applyAgentMeta(cur []AgentMetaToken, u AgentMetaUpdate, now int64) ([]AgentMetaToken, bool, error) {
+	live := liveAgentMeta(cur, now)
+	changed := len(live) != len(cur)
+	next := make([]AgentMetaToken, 0, len(live)+len(u.Keys))
+	for _, t := range live {
+		if u.Clear && (u.Source == "" || t.Source == u.Source) && !slices.Contains(u.Protect, t.Key) {
+			changed = true
+			continue
+		}
+		next = append(next, t)
+	}
+	var expires int64
+	if u.TTL > 0 {
+		expires = now + int64(u.TTL)
+	}
+	for i, key := range u.Keys {
+		at := -1
+		for j := range next {
+			if next[j].Key == key {
+				at = j
+				break
+			}
+		}
+		v := u.Values[i]
+		if v == nil {
+			if at >= 0 {
+				next = append(next[:at], next[at+1:]...)
+				changed = true
+			}
+			continue
+		}
+		tok := AgentMetaToken{Key: key, Value: *v, Source: u.Source, Expires: expires}
+		if at < 0 {
+			next = append(next, tok)
+			changed = true
+			continue
+		}
+		if old := next[at]; old.Value == tok.Value && old.Source == tok.Source && !metaExpiryMoves(old.Expires, u.TTL, now) {
+			continue
+		}
+		next[at] = tok
+		changed = true
+	}
+	if len(next) > AgentMetaMaxPerPane {
+		return nil, false, errAgentMetaFull
+	}
+	if len(next) == 0 {
+		return nil, changed, nil
+	}
+	return next, changed, nil
+}
+
+// metaExpiryMoves reports whether rewriting a token that expires at expires
+// (0 for never) with ttl (0 for none) at now changes when it expires.
+func metaExpiryMoves(expires int64, ttl time.Duration, now int64) bool {
+	if ttl <= 0 {
+		return expires != 0
+	}
+	if expires == 0 {
+		return true
+	}
+	return expires-now < int64(ttl)/2
+}
+
+// earliestAgentMetaExpiry is the soonest a token in the session expires, or 0
+// when none will.
+func earliestAgentMetaExpiry(windows []WindowState) int64 {
+	var at int64
+	for i := range windows {
+		for _, t := range windows[i].AgentMeta {
+			if t.Expires != 0 && (at == 0 || t.Expires < at) {
+				at = t.Expires
+			}
+		}
+	}
+	return at
+}
+
+// SetAgentMeta applies u to the window target resolves to and returns the
+// tokens the window holds afterwards. A call that changes nothing (see
+// applyAgentMeta) leaves the session's version alone and pushes nothing.
+func (s *Session) SetAgentMeta(target string, u AgentMetaUpdate) ([]AgentMetaToken, error) {
+	var out []AgentMetaToken
+	var next int64
+	err := s.mutateState(func(st *SessionState) error {
+		idx, err := findWindowStateIndex(st.Windows, target)
+		if err != nil {
+			return err
+		}
+		w := &st.Windows[idx]
+		tokens, changed, err := applyAgentMeta(w.AgentMeta, u, time.Now().UnixNano())
+		if err != nil {
+			return err
+		}
+		out = tokens
+		if !changed {
+			// Nothing a client draws moved, so the version stays and
+			// nothing is pushed.
+			return errNoAgentMetaChange
+		}
+		w.AgentMeta = tokens
+		next = earliestAgentMetaExpiry(st.Windows)
+		return nil
+	})
+	if errors.Is(err, errNoAgentMetaChange) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.armAgentMetaPrune(next)
+	return out, nil
+}
+
+// armAgentMetaPrune makes sure a prune runs by at. A timer already due sooner
+// stands. The prune is what makes a TTL mean something to a client: clients
+// only draw what the state sync hands them, so the daemon drops the token and
+// pushes, and no client has to keep a clock of its own for it.
+func (s *Session) armAgentMetaPrune(at int64) { s.agentMetaPrune.arm(at, s.pruneAgentMeta) }
+
+// pruneAgentMeta drops every expired token in the session and arms the next
+// prune.
+func (s *Session) pruneAgentMeta() {
+	var next int64
+	_ = s.mutateState(func(st *SessionState) error {
+		now := time.Now().UnixNano()
+		changed := false
+		for i := range st.Windows {
+			w := &st.Windows[i]
+			if live := liveAgentMeta(w.AgentMeta, now); len(live) != len(w.AgentMeta) {
+				w.AgentMeta = live
+				changed = true
+			}
+		}
+		next = earliestAgentMetaExpiry(st.Windows)
+		if !changed {
+			return errNoAgentMetaChange
+		}
+		return nil
+	})
+	s.armAgentMetaPrune(next)
+}
+
+// decodeAgentMetaTokens reads the tokens object of a set-agent-meta call in
+// the order it was written, which a map would lose. Each value is a string or
+// null. Keys repeated in one object keep the last value, in the first one's
+// place.
+func decodeAgentMetaTokens(raw json.RawMessage) ([]string, []*string, error) {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, nil, nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, nil, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return nil, nil, errors.New("tokens must be an object of key to value")
+	}
+	var keys []string
+	var values []*string
+	seen := map[string]int{}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return nil, nil, err
+		}
+		key, _ := kt.(string)
+		var v *string
+		if err := dec.Decode(&v); err != nil {
+			return nil, nil, fmt.Errorf("tokens.%s must be a string or null", key)
+		}
+		if i, ok := seen[key]; ok {
+			values[i] = v
+			continue
+		}
+		seen[key] = len(keys)
+		keys = append(keys, key)
+		values = append(values, v)
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, nil, err
+	}
+	return keys, values, nil
+}

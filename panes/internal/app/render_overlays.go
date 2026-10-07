@@ -1,0 +1,665 @@
+package app
+
+import (
+	"fmt"
+	"strings"
+	"time"
+
+	"charm.land/lipgloss/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/overlay"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+	"github.com/Gaurav-Gosain/tuios/internal/theme"
+)
+
+func (m *OS) renderOverlays() []*lipgloss.Layer {
+	var layers []*lipgloss.Layer
+
+	// The screen saver covers everything and nothing else is worth drawing
+	// under it, so it returns alone. Hit geometry is cleared first: the panels
+	// below are not drawn this frame, so last frame's rectangles would make
+	// dead regions clickable behind an animation.
+	if m.screensaver.active && m.screensaver.frame != "" {
+		m.OverlayHits = m.OverlayHits[:0]
+		return append(layers, lipgloss.NewLayer(m.screensaver.frame).
+			X(0).Y(0).Z(config.ZIndexScreensaver).ID("screensaver"))
+	}
+
+	// A capture for the effect preview draws no panels. See
+	// captureEffectPreview: the animation is of the screen under them.
+	if m.effectPreview.capturing {
+		m.OverlayHits = m.OverlayHits[:0]
+		return layers
+	}
+
+	// Clear last frame's hit geometry; each panel that renders below re-records
+	// itself. The ASCII glyph set is synced at the top of GetCanvas, ahead of
+	// every layer that reads it.
+	m.OverlayHits = m.OverlayHits[:0]
+	m.reconcileOverlayZOrder()
+
+	isRecording := m.TapeRecorder != nil && m.TapeRecorder.IsRecording()
+
+	// The badge is the recording light and the prefix light. It used to carry
+	// the clock as well, which is why show_clock appeared to do nothing to the
+	// dock: the option drew this instead. The clock is a dock component now,
+	// placed beside the meters it behaves like, so the two cannot double up.
+	if isRecording || m.PrefixActive {
+		// The reading comes from the clock component, so the badge and a clock
+		// cell on the dock can never disagree, and so the format is the one
+		// [dock.clock] asked for rather than the one that used to be spelled
+		// here in a string literal.
+		currentTime := m.DockClockText()
+		var statusText string
+
+		if isRecording {
+			statusText = config.TapeRecordingIndicator + " | " + currentTime
+		} else if m.PrefixActive {
+			statusText = "PREFIX | " + currentTime
+		} else {
+			statusText = currentTime
+		}
+
+		// The badge rests on the same Panel step the rest of the chrome does and
+		// only lights up for a state the user is holding: the prefix is a mode
+		// waiting for a key, and recording is the one that writes to disk.
+		pal := theme.UI()
+		timeStyle := lipgloss.NewStyle().
+			Foreground(pal.FgDim).
+			Background(pal.Panel).
+			Bold(true).
+			Padding(0, 1)
+
+		switch {
+		case isRecording:
+			timeStyle = timeStyle.Background(pal.Warn).Foreground(theme.ContrastText(pal.Warn))
+		case m.PrefixActive:
+			timeStyle = timeStyle.Background(pal.Warning).Foreground(theme.ContrastText(pal.Warning))
+		}
+
+		renderedTime := timeStyle.Render(statusText)
+
+		timeX := 1
+		timeLayer := lipgloss.NewLayer(renderedTime).
+			X(timeX).
+			Y(m.GetTimeYPosition()).
+			Z(config.ZIndexTime).
+			ID("time")
+
+		layers = append(layers, timeLayer)
+	}
+
+	if len(m.GetVisibleWindows()) == 0 && m.ViewContentWidth() > 0 && m.ViewUsableHeight() > 0 {
+		asciiArt := `████████╗██╗   ██╗██╗ ██████╗ ███████╗
+╚══██╔══╝██║   ██║██║██╔═══██╗██╔════╝
+   ██║   ██║   ██║██║██║   ██║███████╗
+   ██║   ██║   ██║██║██║   ██║╚════██║
+   ██║   ╚██████╔╝██║╚██████╔╝███████║
+   ╚═╝    ╚═════╝ ╚═╝ ╚═════╝ ╚══════╝`
+
+		// The splash is the first thing anyone sees, at whatever width. Its
+		// three parts have fixed widths (38 columns of block letters, a 28
+		// column subtitle and a 44 column hint line), and the box adds a border
+		// and two columns of padding on each side. All of it needs 74 columns,
+		// so on anything narrower it would run off the right edge with the
+		// border cut away. Drop to what fits instead.
+		const (
+			artCols      = 38
+			subtitleCols = 28
+			boxCols      = 6 // both borders, both paddings
+			boxRows      = 4 // border and padding, top and bottom
+		)
+		// The splash belongs to the content region: the sidebar's reserved
+		// columns and the dock's rows are drawn by someone else, and centering
+		// on the whole screen both overdrew the rail and put the box off-centre
+		// in the part of the screen the user can actually see.
+		contentW, contentH := m.ViewContentWidth(), m.ViewUsableHeight()
+		avail := contentW - boxCols
+		// The same argument applies to the height: the block letters are six
+		// rows of a box that also carries a border, padding, a subtitle and up
+		// to three stacked hints, which is more than a short terminal has.
+		availRows := max(contentH-boxRows, 1)
+
+		ui := theme.UI()
+		titleText := asciiArt
+		if avail < artCols || availRows < 12 {
+			titleText = "TUIOS"
+		}
+		title := lipgloss.NewStyle().
+			Foreground(ui.Accent).
+			Bold(true).
+			Render(titleText)
+
+		parts := []string{title}
+
+		if avail >= subtitleCols && availRows >= 8 {
+			parts = append(parts, "", lipgloss.NewStyle().
+				Foreground(ui.AccentBright).
+				Render("Terminal UI Operating System"))
+		}
+
+		// The hints are packed into as many rows as the width needs, so no
+		// width loses a hint entirely. They are key chips and lowercase
+		// labels, the same shape every overlay footer uses: the quoted
+		// Title-case prose was the only surface speaking that way.
+		//
+		// Packed rather than all-or-nothing. It used to be one line if they
+		// all fitted and one line each if they did not, so adding a fourth
+		// chip took the splash from three rows of hints to four on a narrow
+		// terminal, and the box then squeezed out the subtitle to fit.
+		hints := make([]string, 0, 4)
+		for _, h := range []overlay.Hint{
+			{Key: "n", Label: "new window"},
+			// The splash is what somebody with no session is looking at, so
+			// the way to make one belongs on it. It was on neither the splash
+			// nor any key: a person who had just arrived could make a pane and
+			// had no way to find out that sessions existed.
+			{Key: "N", Label: "new session"},
+			{Key: "?", Label: "help"},
+			{Key: ",", Label: "settings"},
+		} {
+			hints = append(hints, overlay.KeyBadge(h.Key, ui)+
+				lipgloss.NewStyle().Foreground(ui.FgDim).Render(" "+h.Label))
+		}
+		parts = append(parts, "", lipgloss.NewStyle().
+			Align(lipgloss.Center).
+			Render(packHints(hints, avail)))
+
+		content := lipgloss.JoinVertical(lipgloss.Center, squeezeLines(parts, availRows)...)
+
+		boxStyle := lipgloss.NewStyle().
+			Border(getNormalBorder(&m.Settings)).
+			BorderForeground(ui.Accent).
+			Padding(1, 2).
+			MaxWidth(contentW)
+
+		box := boxStyle.Render(content)
+		if lipgloss.Width(box) > contentW || lipgloss.Height(box) > contentH {
+			// A wide enough rail, or a short enough screen, leaves no room for
+			// the box even after squeezing. One clipped hint line still says
+			// what to press, which beats drawing a border over the rail or the
+			// dock.
+			box = lipgloss.NewStyle().
+				Foreground(ui.FgDim).
+				MaxWidth(contentW).
+				Render("n new window")
+		}
+
+		centeredContent := lipgloss.Place(
+			contentW, contentH,
+			lipgloss.Center, lipgloss.Center,
+			box,
+		)
+
+		welcomeLayer := lipgloss.NewLayer(centeredContent).
+			X(m.viewReserve().Left).Y(m.viewReserve().Top).Z(1).ID("welcome")
+
+		layers = append(layers, welcomeLayer)
+	}
+
+	if m.ShowCommandPalette {
+		content, geo, rows := m.renderCommandPalette()
+		layers = m.placeOverlayPanel(layers, "palette", content, geo, rows)
+	}
+
+	if m.ShowLauncher {
+		content, geo, rows := m.renderLauncher()
+		layers = m.placeOverlayPanel(layers, "launcher", content, geo, rows)
+	}
+
+	if m.ShowSessionSwitcher {
+		content, geo, rows := m.renderSessionSwitcher()
+		layers = m.placeOverlayPanel(layers, "session", content, geo, rows)
+	}
+
+	if m.ShowAgentMail {
+		content, geo, rows := m.renderAgentMail()
+		layers = m.placeOverlayPanel(layers, "agentmail", content, geo, rows)
+	}
+
+	if m.ShowInbox {
+		content, geo, rows := m.renderInbox()
+		layers = m.placeOverlayPanel(layers, "inbox", content, geo, rows)
+	}
+
+	if m.ShowWorkspaceSwitcher {
+		content, geo, rows := m.renderWorkspaceSwitcher()
+		layers = m.placeOverlayPanel(layers, "workspace", content, geo, rows)
+	}
+
+	if m.navigator.open {
+		content, geo, rows := m.renderNavigator()
+		layers = m.placeOverlayPanel(layers, "navigator", content, geo, rows)
+	}
+
+	if m.ShowLayoutPicker {
+		content, geo, rows := m.renderLayoutPicker()
+		layers = m.placeOverlayPanel(layers, "layout", content, geo, rows)
+	}
+
+	if m.ShowHostPicker {
+		content, geo, rows := m.renderHostPicker()
+		layers = m.placeOverlayPanel(layers, "hostpicker", content, geo, rows)
+	}
+
+	if m.ShowSettings {
+		content, geo, rows := m.renderSettings()
+		layers = m.placeOverlayPanel(layers, "settings", content, geo, rows)
+	}
+
+	if m.ShowKeybindManager {
+		content, geo, rows := m.renderKeybindManager()
+		layers = m.placeOverlayPanel(layers, "keybinds", content, geo, rows)
+	}
+
+	if m.ShowThemePicker {
+		content, geo, rows := m.renderThemePicker()
+		layers = m.placeOverlayPanel(layers, "themepicker", content, geo, rows)
+	}
+
+	if m.ShowDockEditor {
+		content, geo, rows := m.renderDockEditor()
+		layers = m.placeOverlayPanel(layers, "dockeditor", content, geo, rows)
+	}
+
+	if m.ShowSectionEditor {
+		content, geo, rows := m.renderSectionEditor()
+		layers = m.placeOverlayPanel(layers, "sectioneditor", content, geo, rows)
+	}
+
+	if m.ShowGlyphPicker {
+		content, geo, rows := m.renderGlyphPicker()
+		layers = m.placeOverlayPanel(layers, "glyphpicker", content, geo, rows)
+	}
+
+	// The effect preview is a full-screen animation of the screen the picker
+	// opened over, so it goes under every draggable panel and over everything
+	// else. One below the overlay base rather than a constant of its own: the
+	// only thing it has to be is above the dock and below the panels, and both
+	// of those are already spelled here.
+	if m.ShowEffectPicker && m.effectPreview.frame != "" {
+		layers = append(layers, lipgloss.NewLayer(m.effectPreview.frame).
+			X(0).Y(0).Z(config.ZIndexOverlayBase-1).ID("effectpreview"))
+	}
+
+	if m.ShowEffectPicker {
+		content, geo, rows := m.renderEffectPicker()
+		layers = m.placeOverlayPanel(layers, "effectpicker", content, geo, rows)
+	}
+
+	if m.ShowAccentPicker {
+		content, geo, rows := m.renderAccentPicker()
+		layers = m.placeOverlayPanel(layers, "accent", content, geo, rows)
+	}
+
+	// The rename dialog is modal and not draggable, so it is placed directly
+	// rather than through the overlay panel stack. It is centred like the rest.
+	if content, geo, x, y, ok := m.renderRenameDialog(); ok {
+		m.renameHit = overlay.Rect{X0: x, Y0: y, X1: x + geo.Width, Y1: y + geo.Height}
+		layers = append(layers, lipgloss.NewLayer(content).
+			X(x).Y(y).Z(config.ZIndexOverlayBase).ID("rename"))
+	}
+
+	if m.ShowAggregateView {
+		content, geo, rows := m.renderAggregateView()
+		layers = m.placeOverlayPanel(layers, "aggregate", content, geo, rows)
+	}
+
+	if m.ShowScrollbackBrowser {
+		browserContent := m.renderScrollbackBrowser()
+		if browserContent != "" {
+			browserLayer := lipgloss.NewLayer(browserContent).
+				X(0).Y(0).Z(config.ZIndexScrollbackBrowser).ID("scrollback-browser")
+			layers = append(layers, browserLayer)
+		}
+	}
+
+	// The review covers the whole screen, over the Inbox and the rail it may
+	// have been opened from, which are still there when it closes.
+	if content := m.renderReview(); content != "" {
+		layers = append(layers, lipgloss.NewLayer(content).
+			X(0).Y(0).Z(config.ZIndexReview).ID("review"))
+	}
+
+	if m.ShotPreview.Open {
+		content, geo, rows := m.renderScreenshotPreview()
+		layers = m.placeOverlayPanel(layers, overlayKindShot, content, geo, rows)
+	}
+
+	// Capture mode draws above every panel: it is a gesture over the whole
+	// screen, and its marquee has to be visible on top of whatever is open.
+	layers = append(layers, m.renderCaptureMode()...)
+
+	if m.ShowQuitMenu {
+		content, geo, rows := m.renderQuitMenu()
+		layers = m.placeOverlayPanel(layers, "quit", content, geo, rows)
+	}
+
+	if m.ShowSessionClose {
+		content, geo, rows := m.renderSessionClose()
+		layers = m.placeOverlayPanel(layers, "sessionclose", content, geo, rows)
+	}
+
+	if m.FilePromptOpen() {
+		content, geo, rows := m.renderFileDialog()
+		layers = m.placeOverlayPanel(layers, "filedialog", content, geo, rows)
+	}
+
+	if m.ShowHelp {
+		content, geo := m.RenderHelpMenu()
+		layers = m.placeOverlayPanel(layers, "help", content, geo, nil)
+	}
+
+	if m.ShowTapeManager {
+		tapeContent := m.RenderTapeManager()
+		layers = append(layers, m.centeredBoxLayer(tapeContent, config.ZIndexHelp, "tape-manager"))
+	}
+
+	if m.ShowTapeReview {
+		reviewContent := m.RenderTapeReview()
+		layers = append(layers, m.centeredBoxLayer(reviewContent, config.ZIndexHelp+1, "tape-review"))
+	}
+
+	if m.ShowCacheStats {
+		stats := GetGlobalStyleCache().GetStats()
+
+		pal := theme.UI()
+		bg := pal.Surface
+		labelStyle := overlay.Style(bg).Foreground(pal.FgDim).Render
+		valueStyle := overlay.Style(bg).Foreground(pal.Fg).Bold(true).Render
+
+		var statsLines []string
+		statsLines = append(statsLines, labelStyle("Hit Rate:      ")+valueStyle(fmt.Sprintf("%.2f%%", stats.HitRate)))
+		statsLines = append(statsLines, labelStyle("Cache Hits:    ")+valueStyle(fmt.Sprintf("%d", stats.Hits)))
+		statsLines = append(statsLines, labelStyle("Cache Misses:  ")+valueStyle(fmt.Sprintf("%d", stats.Misses)))
+		statsLines = append(statsLines, labelStyle("Total Lookups: ")+valueStyle(fmt.Sprintf("%d", stats.Hits+stats.Misses)))
+		statsLines = append(statsLines, labelStyle("Evictions:     ")+valueStyle(fmt.Sprintf("%d", stats.Evicts)))
+		statsLines = append(statsLines, "")
+		statsLines = append(statsLines, labelStyle("Cache Size:    ")+valueStyle(fmt.Sprintf("%d / %d entries", stats.Size, stats.Capacity)))
+		statsLines = append(statsLines, labelStyle("Fill Rate:     ")+valueStyle(fmt.Sprintf("%.1f%%", float64(stats.Size)/float64(stats.Capacity)*100.0)))
+		statsLines = append(statsLines, "")
+
+		// The verdict is a status word, so it takes a status token: the same
+		// three the logs and the message block are read by.
+		perfText, perfColor := "Poor", pal.Warn
+		switch {
+		case stats.HitRate >= 95.0:
+			perfText, perfColor = "Excellent", pal.Success
+		case stats.HitRate >= 85.0:
+			perfText, perfColor = "Good", pal.Success
+		case stats.HitRate >= 70.0:
+			perfText, perfColor = "Fair", pal.Warning
+		}
+		statsLines = append(statsLines,
+			labelStyle("Performance:   ")+overlay.Style(bg).Foreground(perfColor).Bold(true).Render(perfText))
+
+		width := m.panelWidth(60)
+		hints := []overlay.Hint{{Key: "r", Label: "reset"}, {Key: "esc", Label: "close"}}
+		rows, hints := m.panelBody(len(statsLines), 0, width, nil, hints)
+		panel := overlay.Panel{
+			Title: "cache stats",
+			Width: width,
+			Body:  clipStyledLines(strings.Join(squeezeLines(statsLines, rows), "\n"), width),
+			Hints: hints,
+		}
+		content, _ := panel.Render(pal)
+
+		layers = append(layers, m.centeredBoxLayer(content, config.ZIndexLogs, "cache-stats"))
+	}
+
+	if m.ShowLogs {
+		content, geo, rows := m.renderListOverlay(m.logViewerList())
+		layers = m.placeOverlayPanel(layers, overlayKindLogs, content, geo, rows)
+	}
+
+	// The message view is drawn after the log viewer, which opens it.
+	layers = m.renderMessageView(layers)
+
+	showScriptIndicator := true
+	if m.ScriptMode && !m.ScriptFinishedTime.IsZero() {
+		elapsed := time.Since(m.ScriptFinishedTime)
+		if elapsed > scriptDoneLinger {
+			showScriptIndicator = false
+		}
+	}
+
+	if m.ScriptMode && showScriptIndicator {
+		var scriptStatus string
+
+		// tuios tape play, tuios tape exec and the tape manager all play
+		// through the one player.
+		var currentCmd, totalCmds, progress int
+		var isFinished bool
+
+		if player := m.ScriptPlayer; player != nil {
+			progress = player.Progress()
+			currentCmd = player.CurrentIndex()
+			totalCmds = player.TotalCommands()
+			isFinished = player.IsFinished()
+		}
+
+		if totalCmds > 0 {
+			if isFinished && m.ScriptFailure != "" {
+				// Where it stopped. The notification carries why.
+				where, _, _ := strings.Cut(m.ScriptFailure, ": ")
+				scriptStatus = "FAILED • " + where
+			} else if isFinished {
+				scriptStatus = fmt.Sprintf("DONE • %d/%d commands", totalCmds, totalCmds)
+			} else {
+				barWidth := 15
+				filledWidth := (progress * barWidth) / 100
+				full, empty := "█", "░"
+				if m.Settings.UseASCIIOnly {
+					full, empty = "#", "-"
+				}
+				var bar strings.Builder
+				for i := range barWidth {
+					if i < filledWidth {
+						bar.WriteString(full)
+					} else {
+						bar.WriteString(empty)
+					}
+				}
+
+				// Display 1-based index for human readability (command 1 of N, not 0 of N)
+				displayCmd := min(currentCmd+1, totalCmds)
+
+				if m.ScriptPaused {
+					scriptStatus = fmt.Sprintf("PAUSED • %s %d%% • %d/%d", bar.String(), progress, displayCmd, totalCmds)
+				} else {
+					scriptStatus = fmt.Sprintf("RUNNING • %s %d%% • %d/%d", bar.String(), progress, displayCmd, totalCmds)
+				}
+			}
+		} else {
+			scriptStatus = "TAPE"
+		}
+
+		pal := theme.UI()
+		scriptStyle := lipgloss.NewStyle().
+			Foreground(theme.ContrastText(pal.Accent)).
+			Background(pal.Accent).
+			Padding(0, 1)
+
+		scriptIndicator := scriptStyle.Render(scriptStatus)
+		scriptLayer := lipgloss.NewLayer(scriptIndicator).
+			X(m.GetRenderWidth() - lipgloss.Width(scriptIndicator) - 2).
+			Y(1).
+			Z(config.ZIndexNotifications).
+			ID("script-mode")
+
+		layers = append(layers, scriptLayer)
+	}
+
+	if m.PrefixActive && !m.ShowHelp && m.Settings.WhichKeyEnabled && time.Since(m.LastPrefixTime) > config.WhichKeyDelay {
+		renderedOverlay, overlayWidth, overlayHeight := m.renderWhichKey()
+		var overlayX, overlayY int
+
+		renderWidth := m.GetRenderWidth()
+		renderHeight := m.GetRenderHeight()
+		// The corners are the panes' corners when the overlay fits beside the
+		// rail, so it does not sit over the rail with two of the rail's
+		// columns showing past its edge. When it does not fit, it is placed on
+		// the screen and then covers the rail whole.
+		regionX, regionW := 0, renderWidth
+		if room := m.ViewContentWidth(); overlayWidth+4 <= room {
+			regionX, regionW = m.viewReserve().Left, room
+		}
+		switch m.Settings.WhichKeyPosition {
+		case "top-left":
+			overlayX = regionX + 2
+			overlayY = 1
+		case "top-right":
+			overlayX = regionX + regionW - overlayWidth - 2
+			overlayY = 1
+		case "bottom-left":
+			overlayX = regionX + 2
+			overlayY = renderHeight - overlayHeight - 2
+		case "center":
+			overlayX = regionX + (regionW-overlayWidth)/2
+			overlayY = (renderHeight - overlayHeight) / 2
+		default:
+			overlayX = regionX + regionW - overlayWidth - 2
+			overlayY = renderHeight - overlayHeight - 2
+		}
+		if regionW == renderWidth {
+			overlayX = m.railCoverX(overlayX, overlayWidth, renderWidth)
+		}
+		// A binding list taller than the screen would otherwise be positioned
+		// off the top, hiding the first entries with no way to reach them.
+		overlayX = max(min(overlayX, renderWidth-overlayWidth), 0)
+		overlayY = max(min(overlayY, renderHeight-overlayHeight), m.viewReserve().Top, 0)
+
+		whichKeyLayer := lipgloss.NewLayer(renderedOverlay).
+			X(overlayX).
+			Y(overlayY).
+			Z(config.ZIndexWhichKey).
+			ID("whichkey")
+
+		layers = append(layers, whichKeyLayer)
+	}
+
+	// Notifications are no longer drawn here. They live in the dock's right-hand
+	// block (see renderNotificationBlock), which is the placement decision: a
+	// message never covers a pane, and it is never retired by a frame being
+	// composed. Retiring one used to happen right here, inside render
+	// composition, which is why a toast could sit on screen for seventeen seconds
+	// after it expired whenever the session went quiet enough that no further
+	// frame was drawn. Expiry belongs to the tick now.
+
+	focusedWindow := m.GetFocusedWindow()
+	if focusedWindow != nil && focusedWindow.CopyMode != nil &&
+		focusedWindow.CopyMode.Active &&
+		focusedWindow.CopyMode.State == terminal.CopyModeSearch {
+
+		searchQuery := focusedWindow.CopyMode.SearchQuery
+		matchCount := len(focusedWindow.CopyMode.SearchMatches)
+		currentMatch := focusedWindow.CopyMode.CurrentMatch
+
+		// The rename dialog's canon: text on Surface, a reverse-video cell for
+		// the cursor rather than a block glyph drawn in the foreground colour,
+		// and the match count in the accent because it is the answer the search
+		// is for.
+		pal := theme.UI()
+		bg := pal.Surface
+		// The prompt names the direction the way vim and tmux do: / searches
+		// down, ? searches up.
+		prompt := "/"
+		if focusedWindow.CopyMode.SearchBackward {
+			prompt = "?"
+		}
+		body := overlay.Style(bg).Foreground(pal.Fg).Render(prompt+searchQuery) +
+			overlay.Cursor(" ", bg, pal.Fg)
+		switch {
+		case matchCount > 0:
+			body += overlay.Style(bg).Foreground(pal.AccentBright).Bold(true).
+				Render(fmt.Sprintf(" [%d/%s]", currentMatch+1, terminal.SearchMatchCount(matchCount)))
+		case searchQuery != "":
+			body += overlay.Style(bg).Foreground(pal.FgMute).Render(" [0]")
+		}
+
+		pad := overlay.Style(bg).Render(" ")
+		renderedSearch := pad + body + pad
+
+		searchOff := focusedWindow.BorderOffset()
+		searchX, searchY := m.paneChromeAt(
+			focusedWindow.X+searchOff+1, focusedWindow.Y+focusedWindow.Height-searchOff-1,
+			lipgloss.Width(renderedSearch), 1)
+
+		searchLayer := lipgloss.NewLayer(renderedSearch).
+			X(searchX).
+			Y(searchY).
+			Z(config.ZIndexHelp + 1).
+			ID("copy-mode-search")
+
+		layers = append(layers, searchLayer)
+	}
+
+	if l := m.multiCopySaveLayer(); l != nil {
+		layers = append(layers, l)
+	}
+
+	if m.ShowKeys && len(m.RecentKeys) > 0 {
+		m.CleanupExpiredKeys(3 * time.Second)
+		if len(m.RecentKeys) > 0 {
+			rightMargin := 2
+			// The strip grows to the left from the right edge, so on a narrow
+			// screen it would start off the left edge; drop the oldest keys
+			// until what is left fits instead.
+			showkeysContent := m.renderShowkeysFitted(max(m.GetRenderWidth()-rightMargin, 1))
+			contentWidth := lipgloss.Width(showkeysContent)
+			contentHeight := lipgloss.Height(showkeysContent)
+
+			dockOffset := 0
+			if m.Settings.DockbarPosition == "bottom" {
+				dockOffset = m.Settings.DockHeight()
+			}
+
+			x := max(m.GetRenderWidth()-contentWidth-rightMargin, 0)
+			y := max(m.GetRenderHeight()-contentHeight-dockOffset, 0)
+
+			zIndex := config.ZIndexNotifications + 1
+			if m.ShowHelp {
+				zIndex = config.ZIndexHelp + 1
+			}
+
+			showkeysLayer := lipgloss.NewLayer(showkeysContent).
+				X(x).
+				Y(y).
+				Z(zIndex).
+				ID("showkeys")
+
+			layers = append(layers, showkeysLayer)
+		}
+	}
+
+	// The context menu is placed last so it sits above everything else it may
+	// have been opened on top of, and so its recorded bounds are from the frame
+	// the user is actually looking at.
+	layers = m.placeContextMenu(layers)
+	m.forgetClosedOverlayAnchors()
+
+	return layers
+}
+
+// packHints lays key hints out in as few rows as the width allows.
+//
+// The splash is squeezed to fit its box, and what a squeeze drops is the
+// middle: the subtitle goes before the hints do. So the hints have to be as
+// short as they can be rather than as tall as the narrowest chip demands.
+func packHints(hints []string, avail int) string {
+	if len(hints) == 0 {
+		return ""
+	}
+	const gap = "   "
+	var rows []string
+	cur := hints[0]
+	for _, h := range hints[1:] {
+		if w := lipgloss.Width(cur) + lipgloss.Width(gap) + lipgloss.Width(h); w <= avail {
+			cur += gap + h
+			continue
+		}
+		rows = append(rows, cur)
+		cur = h
+	}
+	return strings.Join(append(rows, cur), "\n")
+}

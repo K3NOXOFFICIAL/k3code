@@ -1,0 +1,161 @@
+// Package pool provides object pooling for reusable components to reduce memory allocations.
+package pool
+
+import (
+	"sync"
+
+	"charm.land/lipgloss/v2"
+)
+
+var (
+	layerPool = sync.Pool{
+		New: func() any {
+			layers := make([]*lipgloss.Layer, 0, 16)
+			return &layers
+		},
+	}
+
+	// Pool for byte slices used in I/O operations
+	byteSlicePool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, 32*1024)
+			return &buf
+		},
+	}
+
+	// Pool for highlight grids used in terminal rendering
+	highlightGridPool = sync.Pool{
+		New: func() any {
+			return &HighlightGrid{}
+		},
+	}
+)
+
+// HighlightGrid is a sparse grid for tracking cell highlights.
+// It uses a slice of slices instead of nested maps to reduce allocations.
+type HighlightGrid struct {
+	rows   [][]bool
+	maxY   int
+	maxX   int
+	inited bool
+}
+
+// Init initializes the grid for the given dimensions.
+// This should be called before using the grid.
+func (g *HighlightGrid) Init(maxY, maxX int) {
+	g.maxY = maxY
+	g.maxX = maxX
+	g.inited = true
+
+	// Reuse existing slices if possible
+	if cap(g.rows) >= maxY {
+		g.rows = g.rows[:maxY]
+		for i := range g.rows {
+			row := g.rows[i]
+			if row == nil {
+				continue
+			}
+			if cap(row) >= maxX {
+				// Reuse the backing array at the new width and clear it. A
+				// pooled grid can be reused by windows of different widths, so
+				// the stored row length may differ from maxX.
+				g.rows[i] = row[:maxX]
+				clear(g.rows[i])
+			} else {
+				// Backing is too small for the new width; drop it so Set
+				// reallocates at the correct size on first touch.
+				g.rows[i] = nil
+			}
+		}
+	} else {
+		g.rows = make([][]bool, maxY)
+	}
+}
+
+// Set marks a cell as highlighted.
+func (g *HighlightGrid) Set(y, x int) {
+	if y < 0 || y >= g.maxY || x < 0 || x >= g.maxX {
+		return
+	}
+
+	if g.rows[y] == nil {
+		g.rows[y] = make([]bool, g.maxX)
+	}
+	g.rows[y][x] = true
+}
+
+// Get returns whether a cell is highlighted.
+func (g *HighlightGrid) Get(y, x int) bool {
+	if y < 0 || y >= g.maxY || x < 0 || x >= g.maxX {
+		return false
+	}
+	if g.rows[y] == nil {
+		return false
+	}
+	return g.rows[y][x]
+}
+
+// HasRow returns whether a row has any highlights.
+func (g *HighlightGrid) HasRow(y int) bool {
+	if y < 0 || y >= g.maxY {
+		return false
+	}
+	row := g.rows[y]
+	if row == nil {
+		return false
+	}
+	// Reset keeps cleared rows non-nil so their backing arrays can be reused, so
+	// a non-nil row is no longer proof of a highlight. Scan for an actual set
+	// cell instead. Only reached in visual copy-mode, a cold path.
+	for x := 0; x < g.maxX && x < len(row); x++ {
+		if row[x] {
+			return true
+		}
+	}
+	return false
+}
+
+// Reset clears the grid for reuse.
+func (g *HighlightGrid) Reset() {
+	// Clear each row in place instead of nilling it so the backing []bool
+	// arrays survive for the next Init/Set cycle. Nilling forced Set to
+	// reallocate make([]bool, maxX) for every touched row on each reuse,
+	// defeating the pool. Init resizes reused rows to the next maxX.
+	for i := range g.rows {
+		if g.rows[i] != nil {
+			clear(g.rows[i])
+		}
+	}
+	g.inited = false
+}
+
+// GetHighlightGrid retrieves a highlight grid from the pool.
+func GetHighlightGrid() *HighlightGrid {
+	return highlightGridPool.Get().(*HighlightGrid)
+}
+
+// PutHighlightGrid returns a highlight grid to the pool after resetting it.
+func PutHighlightGrid(g *HighlightGrid) {
+	g.Reset()
+	highlightGridPool.Put(g)
+}
+
+// GetLayerSlice retrieves a layer slice from the pool.
+func GetLayerSlice() *[]*lipgloss.Layer {
+	return layerPool.Get().(*[]*lipgloss.Layer)
+}
+
+// PutLayerSlice returns a layer slice to the pool.
+func PutLayerSlice(layers *[]*lipgloss.Layer) {
+	layerPool.Put(layers)
+}
+
+// GetByteSlice retrieves a byte slice from the pool.
+func GetByteSlice() *[]byte {
+	return byteSlicePool.Get().(*[]byte)
+}
+
+// PutByteSlice returns a byte slice to the pool.
+func PutByteSlice(b *[]byte) {
+	byteSlicePool.Put(b)
+}

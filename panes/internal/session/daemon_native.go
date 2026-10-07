@@ -1,0 +1,461 @@
+package session
+
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
+
+// This file implements the headless execution path for the mutating control
+// verbs. When a session has a TUI client attached the daemon keeps routing verbs
+// to it (unchanged behavior); when none is attached these functions act directly
+// on the daemon-owned canonical state so control works with no client.
+
+// errNeedsClient is returned for verbs that genuinely require a live renderer
+// (tiling geometry, animations, theming) and so cannot run headless.
+type errNeedsClient struct{ verb string }
+
+func (e errNeedsClient) Error() string {
+	return fmt.Sprintf("command %q requires an attached client (the headless daemon has no renderer)", e.verb)
+}
+
+// focusedWindowID returns the focused window's ID, falling back to the first
+// window on the current workspace, or an error when the session has no windows.
+func focusedWindowID(state *SessionState) (string, error) {
+	if state.FocusedWindowID != "" {
+		return state.FocusedWindowID, nil
+	}
+	for i := range state.Windows {
+		if state.Windows[i].Workspace == state.CurrentWorkspace {
+			return state.Windows[i].ID, nil
+		}
+	}
+	if len(state.Windows) > 0 {
+		return state.Windows[0].ID, nil
+	}
+	return "", fmt.Errorf("session has no windows")
+}
+
+// executeDaemonCommand runs a structural tape command against daemon-owned
+// session state with no TUI client. onExit is wired into any PTY it spawns so
+// the daemon can notify clients when that shell exits. It returns result data
+// (for read verbs and NewWindow) or an error. Rendering-dependent verbs return
+// errNeedsClient.
+func (d *Daemon) executeDaemonCommand(sess *Session, commandType string, args []string, onExit func(ptyID string)) (map[string]any, error) {
+	return d.executeDaemonCommandIn(sess, commandType, args, "", onExit)
+}
+
+// executeDaemonCommandIn is executeDaemonCommand with the directory a
+// NewWindow starts in. Other commands ignore cwd.
+func (d *Daemon) executeDaemonCommandIn(sess *Session, commandType string, args []string, cwd string, onExit func(ptyID string)) (map[string]any, error) {
+	return d.executeDaemonCommandAt(sess, commandType, args, cwd, 0, onExit)
+}
+
+// executeDaemonCommandAt is executeDaemonCommandIn with the workspace a
+// NewWindow goes on. Zero is the session's current one.
+func (d *Daemon) executeDaemonCommandAt(sess *Session, commandType string, args []string, cwd string, workspace int, onExit func(ptyID string)) (map[string]any, error) {
+	return d.executeDaemonCommandEnv(sess, commandType, args, cwd, workspace, nil, onExit)
+}
+
+// executeDaemonCommandEnv is executeDaemonCommandAt with environment entries
+// a NewWindow's process gets on top of an ordinary pane's. An ssh split uses
+// it for the agent socket; see SSHFollowArgv.
+func (d *Daemon) executeDaemonCommandEnv(sess *Session, commandType string, args []string, cwd string, workspace int, env []string, onExit func(ptyID string)) (map[string]any, error) {
+	switch commandType {
+	case "NewWindow":
+		name := ""
+		if len(args) > 0 {
+			name = args[0]
+		}
+		// args after the name are an argv to exec as the window's process. The
+		// launcher sends them so the daemon, the side that spawns the PTY, is
+		// the side that runs the program; typing into the shell instead made
+		// the command mean whatever that shell's parser decided.
+		var command []string
+		if len(args) > 1 {
+			command = args[1:]
+		}
+		win, err := sess.AddDaemonWindowWith(
+			NewWindowOptions{Focus: true, Command: command, Name: name, Cwd: cwd, Workspace: workspace, Env: env}, onExit)
+		if err != nil {
+			return nil, err
+		}
+		displayName := win.Title
+		if name != "" {
+			displayName = name
+		}
+		return map[string]any{"window_id": win.ID, "name": displayName}, nil
+
+	case "CloseWindow":
+		target := ""
+		if len(args) > 0 {
+			target = args[0]
+		} else {
+			id, err := focusedWindowID(sess.GetState())
+			if err != nil {
+				return nil, err
+			}
+			target = id
+		}
+		if _, err := sess.CloseDaemonWindow(target); err != nil {
+			return nil, err
+		}
+		return nil, nil
+
+	case "NextWindow":
+		return nil, sess.CycleDaemonFocus(1)
+
+	case "PrevWindow":
+		return nil, sess.CycleDaemonFocus(-1)
+
+	case "FocusWindow":
+		if len(args) < 1 {
+			return nil, fmt.Errorf("FocusWindow requires a window name or ID")
+		}
+		return nil, sess.FocusDaemonWindow(args[0])
+
+	case "RenameWindow":
+		switch len(args) {
+		case 1:
+			id, err := focusedWindowID(sess.GetState())
+			if err != nil {
+				return nil, err
+			}
+			return nil, sess.RenameDaemonWindow(id, args[0])
+		case 2:
+			return nil, sess.RenameDaemonWindow(args[0], args[1])
+		default:
+			return nil, fmt.Errorf("RenameWindow requires <new-name> or <target> <new-name>")
+		}
+
+	case "MinimizeWindow", "RestoreWindow":
+		minimize := commandType == "MinimizeWindow"
+		target := ""
+		if len(args) > 0 {
+			target = args[0]
+		} else {
+			id, err := focusedWindowID(sess.GetState())
+			if err != nil {
+				return nil, err
+			}
+			target = id
+		}
+		return nil, sess.SetDaemonWindowMinimized(target, minimize)
+
+	case "SwitchWorkspace":
+		ws, err := parseWorkspaceArg(args)
+		if err != nil {
+			return nil, err
+		}
+		return nil, sess.SwitchDaemonWorkspace(ws)
+
+	case "MoveToWorkspace", "MoveAndFollowWorkspace":
+		ws, err := parseWorkspaceArg(args)
+		if err != nil {
+			return nil, err
+		}
+		id, err := focusedWindowID(sess.GetState())
+		if err != nil {
+			return nil, err
+		}
+		if err := sess.MoveDaemonWindowToWorkspace(id, ws); err != nil {
+			return nil, err
+		}
+		if commandType == "MoveAndFollowWorkspace" {
+			return nil, sess.SwitchDaemonWorkspace(ws)
+		}
+		return nil, nil
+
+	// Read-only verbs answerable from state without a client.
+	case "ListWindows":
+		return buildWindowListData(sess.GetState()), nil
+	case "GetSessionInfo":
+		return buildSessionInfoData(sess, sess.GetState(), false, HostFocusUnknown), nil
+	case "GetWindow":
+		state := sess.GetState()
+		target := ""
+		if len(args) > 0 {
+			target = args[0]
+		} else {
+			id, err := focusedWindowID(state)
+			if err != nil {
+				return nil, err
+			}
+			target = id
+		}
+		idx, err := findWindowStateIndex(state.Windows, target)
+		if err != nil {
+			return nil, err
+		}
+		return windowStateToData(state, idx), nil
+
+	default:
+		return nil, errNeedsClient{verb: commandType}
+	}
+}
+
+// parseWorkspaceArg extracts a 1-9 workspace number from a command's args.
+func parseWorkspaceArg(args []string) (int, error) {
+	if len(args) < 1 {
+		return 0, fmt.Errorf("workspace number required")
+	}
+	ws, err := strconv.Atoi(strings.TrimSpace(args[0]))
+	if err != nil {
+		return 0, fmt.Errorf("invalid workspace number %q", args[0])
+	}
+	return ws, nil
+}
+
+// keysToBytes translates a send-keys request into the raw bytes to write to a
+// PTY whose application has not turned on application cursor keys. literal or
+// raw modes pass the text through unchanged. Otherwise the input is parsed by
+// parseSendKeys; the prefix has no headless meaning and is an error.
+func keysToBytes(keys string, literal, raw bool) ([]byte, error) {
+	if literal || raw {
+		return []byte(keys), nil
+	}
+	parsed, err := parseSendKeys(keys, 1)
+	if err != nil {
+		return nil, err
+	}
+	return sendKeysBytes(parsed, paneKeyModes{})
+}
+
+// resolvePTYForTarget resolves a window target (name/ID, or empty for the
+// focused window) to its live PTY within the session.
+func (d *Daemon) resolvePTYForTarget(sess *Session, target string) (*PTY, error) {
+	state := sess.GetState()
+	if target == "" {
+		id, err := focusedWindowID(state)
+		if err != nil {
+			return nil, err
+		}
+		target = id
+	}
+	idx, err := findWindowStateIndex(state.Windows, target)
+	if err != nil {
+		return nil, err
+	}
+	ptyID := state.Windows[idx].PTYID
+	if ptyID == "" {
+		return nil, fmt.Errorf("window %q has no PTY", target)
+	}
+	pty := sess.GetPTY(ptyID)
+	if pty == nil {
+		return nil, fmt.Errorf("PTY for window %q is gone", target)
+	}
+	return pty, nil
+}
+
+// writeKeysToWindow writes keys to the terminal of the window target names,
+// or of the focused window when target is empty, and returns the window it
+// wrote to. parsed is the sequence parseSendKeys made of keys, or nil to parse
+// it here; literal and raw write keys as they are. Named keys are encoded for
+// the pane's current modes, so an arrow reaches an application that turned on
+// application cursor keys as the SS3 form it asked for, and ctrl+h reaches one
+// that asked for the kitty keyboard protocol as CSI 104;5u.
+func (d *Daemon) writeKeysToWindow(sess *Session, target, keys string, literal, raw bool, parsed []sendKey) (WindowState, error) {
+	state := sess.GetState()
+	resolved := target
+	if resolved == "" {
+		id, err := focusedWindowID(state)
+		if err != nil {
+			return WindowState{}, err
+		}
+		resolved = id
+	}
+	idx, err := findWindowStateIndex(state.Windows, resolved)
+	if err != nil {
+		return WindowState{}, err
+	}
+	win := state.Windows[idx]
+	pty, err := d.resolvePTYForTarget(sess, win.ID)
+	if err != nil {
+		return win, err
+	}
+	var data []byte
+	switch {
+	case literal || raw:
+		data = []byte(keys)
+	default:
+		if parsed == nil {
+			if parsed, err = parseSendKeys(keys, 1); err != nil {
+				return win, err
+			}
+		}
+		if data, err = sendKeysBytes(parsed, pty.keyModes()); err != nil {
+			return win, err
+		}
+	}
+	_, err = pty.Write(data)
+	return win, err
+}
+
+// buildWindowListData builds the window-list result map from session state. It
+// is shared by the list-windows JSON verb and the headless ListWindows command.
+func buildWindowListData(state *SessionState) map[string]any {
+	windows := make([]map[string]any, 0, len(state.Windows))
+	for i := range state.Windows {
+		windows = append(windows, windowStateToData(state, i))
+	}
+
+	workspaceWindows := make([]int, state.workspaceBound())
+	for i := range state.Windows {
+		ws := state.Windows[i].Workspace
+		if ws >= 1 && ws <= state.workspaceBound() {
+			workspaceWindows[ws-1]++
+		}
+	}
+
+	focusedIndex := -1
+	for i := range state.Windows {
+		if state.Windows[i].ID == state.FocusedWindowID {
+			focusedIndex = i
+			break
+		}
+	}
+
+	return map[string]any{
+		"windows":           windows,
+		"total":             len(state.Windows),
+		"focused_index":     focusedIndex,
+		"focused_window_id": state.FocusedWindowID,
+		"current_workspace": state.CurrentWorkspace,
+		"workspace_windows": workspaceWindows,
+	}
+}
+
+// windowStateToData renders one window (by index) to a result map.
+func windowStateToData(state *SessionState, idx int) map[string]any {
+	w := state.Windows[idx]
+	displayName := w.Title
+	if w.CustomName != "" {
+		displayName = w.CustomName
+	}
+	info := map[string]any{
+		"window_id":    w.ID,
+		"index":        idx,
+		"title":        w.Title,
+		"display_name": displayName,
+		"workspace":    w.Workspace,
+		"minimized":    w.Minimized,
+		"focused":      w.ID == state.FocusedWindowID,
+		"x":            w.X,
+		"y":            w.Y,
+		"width":        w.Width,
+		"height":       w.Height,
+		"pty_id":       w.PTYID,
+	}
+	if w.CustomName != "" {
+		info["custom_name"] = w.CustomName
+	}
+	// A zoomed window fills its workspace. Omitted when it is not.
+	if w.Zoomed {
+		info["zoomed"] = true
+	}
+	// The scratch terminal is listed, marked, so a script can tell it from
+	// the panes the user placed. minimized true on it means hidden.
+	if w.Scratch {
+		info["scratch"] = true
+		info["scratch_name"] = w.ScratchKey()
+	}
+	// Where the window's process is, when it is known. A shell that never
+	// announces and a machine that cannot be reached both leave it empty, so
+	// it is omitted rather than reported as the root.
+	if w.Cwd != "" {
+		info["cwd"] = w.Cwd
+	}
+	// The machine the window's process runs on, omitted when it is this one.
+	// A listing that cannot say where a window runs is incomplete once a
+	// session can hold windows from more than one machine, and the listing is
+	// what scripts and agents read.
+	if w.Host != "" {
+		info["host"] = w.Host
+	}
+	// What the pane runs in the foreground, omitted at a shell prompt. The
+	// agent detector reads it; the tmux shim reports it as
+	// pane_current_command.
+	if w.ForegroundCmd != "" {
+		info["foreground_cmd"] = w.ForegroundCmd
+	}
+	// Set only while the link to that machine is lost and the pane is being
+	// reattached: reconnecting, and when the far machine stops keeping it.
+	if w.HostLink != "" {
+		info["host_link"] = w.HostLink
+		info["host_link_until"] = w.HostLinkUntil
+	}
+	// Always report the agent state (as "none" when unset) so a consumer building
+	// an attention view can read every pane's state in one list-windows call.
+	info["agent_state"] = w.AgentState.Name()
+	if w.AgentMessage != "" {
+		info["agent_message"] = w.AgentMessage
+	}
+	if w.AgentStateAt != 0 {
+		info["agent_state_at"] = w.AgentStateAt
+	}
+	// The grants the pane was given, omitted for a pane that holds the
+	// default, so the person sees in one listing which panes were narrowed.
+	// pane-grants says what the default is. See pane_grants.go.
+	if w.Grants != nil {
+		info["grants"] = w.Grants
+	}
+	return info
+}
+
+// buildSessionInfoData builds the session-info result map from session state.
+// It is shared by the session-info JSON verb and the headless GetSessionInfo
+// command.
+//
+// hostFocus is the session's host focus (see sessionHostFocus), which only
+// the daemon's client table can say.
+func buildSessionInfoData(sess *Session, state *SessionState, hasClient bool, hostFocus string) map[string]any {
+	tilingMode := "floating"
+	if state.AutoTiling {
+		tilingMode = "tiling"
+	}
+	// layout_mode names which tiling layout is in use, which tiling_mode cannot
+	// say: it reports only whether tiling is on at all, and has to keep doing so
+	// because callers already dispatch on its two values.
+	layoutMode := state.LayoutMode
+	if layoutMode == "" {
+		layoutMode = "unknown"
+	}
+	// Only named workspaces appear. A workspace missing from the map is unnamed
+	// and its number is its label, so an all-default session reports an empty
+	// object rather than a row of numbers repeated back as names.
+	workspaceNames := make(map[string]string, len(state.WorkspaceNames))
+	for ws, name := range state.WorkspaceNames {
+		workspaceNames[strconv.Itoa(ws)] = name
+	}
+	// The size the daemon settled on and the window_size policy it used, as
+	// distinct from width and height, which are the last size a client
+	// pushed with its state. See window_size.go.
+	sessionWidth, sessionHeight := sess.Size()
+	return map[string]any{
+		"window_size":    sess.WindowSizePolicy(),
+		"session_width":  sessionWidth,
+		"session_height": sessionHeight,
+		"session_name":   state.Name,
+		"session_id":     sess.ID,
+		// display_name and accent are the session's label, empty when it was never
+		// set. A reader that wants one string falls back to session_name, which is
+		// what it read before these existed.
+		"display_name":      state.DisplayName,
+		"accent":            state.Accent,
+		"mode":              "unknown",
+		"current_workspace": state.CurrentWorkspace,
+		"num_workspaces":    state.workspaceBound(),
+		"workspace_names":   workspaceNames,
+		// Empty when the workspaces are in their plain ascending order, which is
+		// what a session that has never been rearranged reports.
+		"workspace_order": state.WorkspaceOrder,
+		"layout_mode":     layoutMode,
+		"window_count":    len(state.Windows),
+		"tiling_mode":     tilingMode,
+		"master_ratio":    state.MasterRatio,
+		"width":           state.Width,
+		"height":          state.Height,
+		"tui_attached":    hasClient,
+		"host_focus":      hostFocus,
+	}
+}

@@ -1,0 +1,281 @@
+package federation
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Transport is one open pipe to a remote proxy. Diagnostic carries whatever the
+// transport captured that explains a failure, bounded; for the ssh transport it
+// is ssh's own stderr, which is the only place the real reason ever appears
+// ("Permission denied", "Host key verification failed", "command not found").
+type Transport interface {
+	io.ReadWriteCloser
+	Diagnostic() string
+}
+
+// exitReporter is implemented by a transport that runs a child process. It
+// separates two failures that look identical from the pipe: the program gave up
+// (ssh could not reach the machine, or the remote tuios is missing), and the
+// program is running but is not a tuios link. Both end the read with no
+// preamble; only one of them is the machine's fault.
+type exitReporter interface {
+	// Exited reports whether the child has already finished, and its wait
+	// error when it has.
+	Exited() (bool, error)
+}
+
+// Dialer opens a transport to one host. It is an interface point so tests drive
+// the whole link, framing, proxy and all, over a subprocess that is not ssh.
+type Dialer func(ctx context.Context, h Host) (Transport, error)
+
+// SSHDialer is the production transport: `ssh <opts> <addr> <command>
+// stdio-proxy`, per section 4.
+//
+// Two options are forced and they are worth stating.
+//
+// BatchMode=yes is a deliberate departure from the design document, which lists
+// known_hosts prompting among the things running the ssh binary inherits for
+// free. A hub daemon has no terminal. A prompt it cannot answer does not ask
+// the user anything, it hangs the link forever, which is the exact failure
+// section 7 forbids. So the daemon's links never prompt: an unknown host key or
+// a missing key fails immediately and `tuios hosts` reports it with ssh's own
+// words. The user resolves it once by running ssh themselves.
+//
+// ConnectTimeout makes the child give up on a dead machine on its own, so a
+// powered-off host is reported rather than leaving a process parked until the
+// context expires.
+//
+// The keepalive options are defaults rather than forced settings, which is why
+// they are appended after the host's own SSHOptions: ssh takes the first value
+// it obtains for a keyword, so a user who sets ServerAliveInterval themselves
+// still wins.
+func SSHDialer(sshBinary string) Dialer {
+	if sshBinary == "" {
+		sshBinary = "ssh"
+	}
+	return func(ctx context.Context, h Host) (Transport, error) {
+		return CommandDialer(sshBinary, linkArgs(h)...)(ctx, h)
+	}
+}
+
+// linkArgs is the argv SSHDialer runs, split out so a test can read it.
+func linkArgs(h Host) []string {
+	return SSHArgs(h, h.remoteCommand(true, "stdio-proxy"))
+}
+
+// SSHArgs is the ssh argv, without the program name, that runs remoteCmd on
+// h with the options every link uses: BatchMode, the host's connect timeout,
+// no pseudo-terminal, the host's own SSHOptions and the keepalives. tuios
+// hosts sync runs its own commands through it, so they reach the host exactly
+// the way the link does.
+func SSHArgs(h Host, remoteCmd string) []string {
+	secs := max(int(h.connectTimeout().Seconds()), 1)
+	args := []string{
+		"-o", "BatchMode=yes",
+		"-o", "ConnectTimeout=" + strconv.Itoa(secs),
+		// No pseudo-terminal: the pipe carries frames, and a pty would
+		// translate them.
+		"-T",
+	}
+	args = append(args, h.SSHOptions...)
+	args = append(args, sharingOptions(h)...)
+	args = append(args, keepaliveOptions()...)
+	// One string: ssh joins its command words with spaces and the far
+	// side's login shell re-parses them, so what is sent is what that
+	// shell reads. See remote.go for what it says when no command is
+	// configured.
+	// -- ends ssh's options. Without it ssh reads options after the host
+	// name as well, so a command starting with a dash would be one.
+	return append(args, "--", h.Addr, remoteCmd)
+}
+
+// sharingPersist is how long a shared master connection outlives its last
+// ssh. It covers the gaps of a run, such as the build of a binary between the
+// probe and the install, and it is the limit on a master the run did not stop.
+const sharingPersist = "10m"
+
+// sharingOptions are the options that make ssh share the connection at
+// h.ControlPath, or none when the host has no path.
+func sharingOptions(h Host) []string {
+	if h.ControlPath == "" {
+		return nil
+	}
+	return []string{
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=" + h.ControlPath,
+		"-o", "ControlPersist=" + sharingPersist,
+	}
+}
+
+// StopSharingArgs is the ssh argv, without the program name, that stops the
+// master connection at h.ControlPath.
+func StopSharingArgs(h Host) []string {
+	return []string{"-o", "ControlPath=" + h.ControlPath, "-O", "exit", "--", h.Addr}
+}
+
+// The keepalive settings.
+//
+// A link to a cloud host sits idle whenever nobody types, and an idle TCP
+// connection through a NAT or a stateful firewall is dropped without either end
+// being told. ssh notices only when something tries to write, which for an
+// attached session is the next keystroke: the person types, and the link they
+// were using turns out to have been dead for twenty minutes. That is the
+// failure these three options exist to stop.
+//
+// ServerAliveInterval sends an encrypted probe when the connection has been
+// quiet that long. Fifteen seconds is chosen against the two numbers that
+// matter. Middlebox idle timeouts start around thirty seconds at the
+// aggressive end, so the probe has to be comfortably under that to hold the
+// mapping open. And the cost is four small packets a minute per host, which a
+// laptop radio does not notice; going to sixty seconds would save nothing worth
+// having and would sit above the timeouts that cause this.
+//
+// ServerAliveCountMax is how many unanswered probes end the connection, so the
+// pair decides how long a dead path stays undetected: 15 x 3 is forty-five
+// seconds. Detection is what starts the client's reconnect, so it is a floor on
+// how long a person stares at a frozen pane. Three is the smallest count that
+// still rides out a couple of lost packets on a mobile link, which is what
+// stops a brief drop-out from being reported as a dead host.
+//
+// TCPKeepAlive is the kernel's own probe. It is redundant with the two above
+// while the link is up and it is not redundant when ssh is blocked writing:
+// it is what makes the socket fail rather than block forever.
+const (
+	sshServerAliveInterval = 15
+	sshServerAliveCountMax = 3
+)
+
+// keepaliveOptions is the -o list that keeps an idle link alive and reports a
+// dead one.
+func keepaliveOptions() []string {
+	return []string{
+		"-o", "ServerAliveInterval=" + strconv.Itoa(sshServerAliveInterval),
+		"-o", "ServerAliveCountMax=" + strconv.Itoa(sshServerAliveCountMax),
+		"-o", "TCPKeepAlive=yes",
+	}
+}
+
+// KeepaliveWindow is how long a dead path can go unnoticed by ssh. The client's
+// reconnect budget is measured against it: a budget shorter than this would
+// give up before ssh had even reported the link gone.
+const KeepaliveWindow = sshServerAliveInterval * sshServerAliveCountMax * time.Second
+
+// CommandDialer runs any command and speaks the link over its stdio. SSHDialer
+// is built on it, and a test uses it to run the real `tuios stdio-proxy`
+// directly, which exercises the framing, the proxy and the daemon socket
+// without needing an ssh server or touching the user's ssh configuration.
+func CommandDialer(name string, args ...string) Dialer {
+	return func(ctx context.Context, _ Host) (Transport, error) {
+		// The context is not attached to the command: a dial context expires
+		// once the handshake is done, and CommandContext would kill the child
+		// at that moment. Close ends the process.
+		cmd := exec.Command(name, args...)
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			return nil, err
+		}
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, err
+		}
+		t := &cmdTransport{cmd: cmd, in: stdin, out: stdout, done: make(chan struct{})}
+		cmd.Stderr = &boundedBuffer{limit: diagnosticLimit}
+		if err := cmd.Start(); err != nil {
+			return nil, fmt.Errorf("could not run %s: %w", name, err)
+		}
+		go func() {
+			t.exitErr = cmd.Wait()
+			close(t.done)
+		}()
+		return t, nil
+	}
+}
+
+// diagnosticLimit bounds captured stderr. The far side is untrusted and stderr
+// is unframed, so it gets a ceiling like everything else that crosses.
+const diagnosticLimit = 4 << 10
+
+type cmdTransport struct {
+	cmd *exec.Cmd
+	in  io.WriteCloser
+	out io.ReadCloser
+
+	// done closes when the child has been reaped. exitErr is its wait error,
+	// read only after done is closed, so Exited never blocks and Close never
+	// calls Wait twice.
+	done    chan struct{}
+	exitErr error
+	once    sync.Once
+}
+
+func (t *cmdTransport) Read(p []byte) (int, error)  { return t.out.Read(p) }
+func (t *cmdTransport) Write(p []byte) (int, error) { return t.in.Write(p) }
+
+func (t *cmdTransport) Close() error {
+	t.once.Do(func() {
+		_ = t.in.Close()
+		_ = t.out.Close()
+		if t.cmd.Process != nil {
+			_ = t.cmd.Process.Kill()
+		}
+		// Wait is owned by the goroutine started at dial, so Close waits on it
+		// rather than calling Wait a second time.
+		select {
+		case <-t.done:
+		case <-time.After(2 * time.Second):
+		}
+	})
+	return nil
+}
+
+// Exited reports whether the child process has already finished. It never
+// blocks: a still-running child is reported as running.
+func (t *cmdTransport) Exited() (bool, error) {
+	select {
+	case <-t.done:
+		return true, t.exitErr
+	default:
+		return false, nil
+	}
+}
+
+func (t *cmdTransport) Diagnostic() string {
+	if b, ok := t.cmd.Stderr.(*boundedBuffer); ok {
+		return WithoutApprovedBanner(b.String())
+	}
+	return ""
+}
+
+// boundedBuffer keeps at most limit bytes of what is written to it and drops
+// the rest. It is what stops a remote that writes forever on stderr from
+// growing the hub's memory.
+type boundedBuffer struct {
+	mu    sync.Mutex
+	buf   []byte
+	limit int
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if room := b.limit - len(b.buf); room > 0 {
+		if len(p) < room {
+			room = len(p)
+		}
+		b.buf = append(b.buf, p[:room]...)
+	}
+	return len(p), nil
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.TrimSpace(string(b.buf))
+}

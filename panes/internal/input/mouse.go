@@ -1,0 +1,131 @@
+package input
+
+import (
+	"github.com/Gaurav-Gosain/tuios/internal/app"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+	uv "github.com/charmbracelet/ultraviolet"
+)
+
+// sendMouseToWindow forwards a mouse event to a window's terminal.
+// In daemon mode, the event is encoded as an escape sequence and written via PTY.
+// In local mode, the event is sent directly to the emulator.
+//
+// The event carries the pane cell. A guest in SGR-pixel mode is also told the
+// pixel inside the pane, when the host reported the pointer in pixels.
+func sendMouseToWindow(o *app.OS, win *terminal.Window, event uv.MouseEvent) {
+	if win.Terminal == nil {
+		return
+	}
+	mouse := event.Mouse()
+	at := o.PointerPixelIn(win.CellPixelWidth, win.CellPixelHeight, mouse.X, mouse.Y)
+	// SendMouseAt/EncodeMouseEventAt read the emulator mode map, which the
+	// emulator guards internally against the PTY reader goroutine.
+	if win.DaemonMode {
+		seq := win.Terminal.EncodeMouseEventAt(event, at)
+		if seq != "" {
+			_ = win.SendInput([]byte(seq))
+		}
+	} else {
+		win.Terminal.SendMouseAt(event, at)
+	}
+}
+
+// Hit testing helpers
+
+// pipOwns reports whether the picture-in-picture view is what the pointer is
+// over: the view is drawn there and no floating pane covers it. A mouse event
+// the view owns never reaches the pane under it.
+func pipOwns(x, y int, o *app.OS) bool {
+	if !o.PiPAt(x, y) {
+		return false
+	}
+	idx := findClickedWindow(x, y, o)
+	return idx < 0 || app.HitZ(o.Windows[idx]) < config.ZIndexPiP
+}
+
+// findClickedWindow finds the topmost window at the given coordinates
+func findClickedWindow(x, y int, o *app.OS) int {
+	// Find the topmost window (highest Z) that contains the click point
+	topWindow := -1
+	topZ := -1
+
+	for i, window := range o.Windows {
+		// Skip windows not in current workspace
+		if window.Workspace != o.CurrentWorkspace {
+			continue
+		}
+		// Skip minimized windows
+		if window.Minimized {
+			continue
+		}
+		// Check if click is within window bounds
+		if x >= window.X && x < window.X+window.Width &&
+			y >= window.Y && y < window.Y+window.Height {
+			// This window contains the click: check if it's the topmost so far
+			if z := app.HitZ(window); z > topZ {
+				topZ = z
+				topWindow = i
+			}
+		}
+	}
+
+	return topWindow
+}
+
+// abs returns the absolute value of an integer
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// scrollbarGrab answers a press on the bar and returns the offset the drag that
+// follows holds: the rows between the pointer and the thumb's first row. A press
+// on the bare track jumps the thumb under the pointer first and takes its offset
+// from where the thumb landed, after opentui's Slider. Taking it before the
+// jump makes the thumb leap a second time on the first pixel of the drag.
+func scrollbarGrab(win *terminal.Window, rect app.ScrollbarRect, mouseY int, s *config.Settings) int {
+	if rect.OnThumb(mouseY) {
+		return mouseY - rect.ThumbY
+	}
+	scrollToThumbRow(win, mouseY-rect.ThumbH/2, s)
+	return mouseY - app.ScrollbarThumbRow(win, s)
+}
+
+// scrollToThumbRow scrolls a window's copy mode so the scrollbar thumb's first
+// row lands on the given screen row.
+func scrollToThumbRow(win *terminal.Window, row int, s *config.Settings) {
+	if win.Terminal == nil {
+		return
+	}
+	win.RLockIO()
+	scrollbackLen := win.Terminal.ScrollbackLen()
+	win.RUnlockIO()
+	if scrollbackLen <= 0 {
+		return
+	}
+
+	// Dragging the scrollbar is a scroll gesture like the wheel, so it enters
+	// copy mode the same silent way: the scrollback has to be rendered by
+	// something, but the user did not ask to be put in a mode.
+	if !win.InCopyMode() {
+		win.EnterCopyModeImplicit()
+	}
+	if win.CopyMode == nil {
+		return
+	}
+
+	// The renderer owns the thumb's travel, so the drag inverts its arithmetic
+	// rather than keeping a second copy of it.
+	scrollOffset := app.ScrollbarOffsetForThumbRow(win, row, s)
+
+	win.CopyMode.ScrollOffset = scrollOffset
+	win.ScrollbackOffset = scrollOffset // Sync for rendering
+	win.InvalidateCache()
+
+	// Dragged all the way to the bottom is the same as scrolling there with the
+	// wheel: back to live output, with nothing left over.
+	leaveCopyModeAtBottom(win)
+}

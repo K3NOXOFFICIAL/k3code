@@ -1,0 +1,2993 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"maps"
+	"os"
+	"os/signal"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2/table"
+	"github.com/Gaurav-Gosain/tuios/internal/capture"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/harness"
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
+	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"github.com/Gaurav-Gosain/tuios/internal/shot"
+	"github.com/Gaurav-Gosain/tuios/internal/tape"
+	"github.com/google/uuid"
+	"github.com/spf13/cobra"
+)
+
+// runListVerbs prints the control protocol's verb catalog. It is the discovery
+// entry point the daemon's own error hints point at, so it must work whenever
+// the daemon does, and say why when it does not.
+func runListVerbs(verb string, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	var params any
+	if verb != "" {
+		params = map[string]any{"verb": verb}
+	}
+	raw, err := client.Call("list-verbs", params)
+	if err != nil {
+		return explainVerbError("list-verbs", err)
+	}
+
+	if jsonOutput {
+		var pretty any
+		if err := json.Unmarshal(raw, &pretty); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+		outputJSON(pretty)
+		return nil
+	}
+
+	var catalog struct {
+		Version       int    `json:"version"`
+		MinVersion    int    `json:"min_version"`
+		DaemonVersion string `json:"daemon_version"`
+		Verbs         []struct {
+			Verb        string `json:"verb"`
+			Description string `json:"description"`
+			Params      []struct {
+				Name        string   `json:"name"`
+				Type        string   `json:"type"`
+				Required    bool     `json:"required"`
+				Description string   `json:"description"`
+				Accepted    []string `json:"accepted"`
+				Default     string   `json:"default"`
+			} `json:"params"`
+			Examples []string `json:"examples"`
+		} `json:"verbs"`
+		ErrorCodes []struct {
+			Code        string `json:"code"`
+			Description string `json:"description"`
+		} `json:"error_codes"`
+	}
+	if err := json.Unmarshal(raw, &catalog); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	fmt.Printf("Control protocol version %d (daemon %s, oldest supported %d)\n\n",
+		catalog.Version, catalog.DaemonVersion, catalog.MinVersion)
+
+	for _, v := range catalog.Verbs {
+		fmt.Printf("%s\n  %s\n", v.Verb, v.Description)
+		for _, p := range v.Params {
+			required := ""
+			if p.Required {
+				required = " (required)"
+			}
+			fmt.Printf("    %-10s %-8s%s %s\n", p.Name, p.Type, required, p.Description)
+			if len(p.Accepted) > 0 {
+				fmt.Printf("    %-10s %s\n", "", "one of: "+strings.Join(p.Accepted, ", "))
+			}
+			if p.Default != "" {
+				fmt.Printf("    %-10s %s\n", "", "default: "+p.Default)
+			}
+		}
+		for _, ex := range v.Examples {
+			fmt.Printf("    example: %s\n", ex)
+		}
+		fmt.Println()
+	}
+
+	// The error vocabulary only makes sense alongside the whole catalog, so it
+	// is omitted when a single verb was requested.
+	if verb == "" && len(catalog.ErrorCodes) > 0 {
+		fmt.Println("Error codes:")
+		for _, e := range catalog.ErrorCodes {
+			fmt.Printf("  %-18s %s\n", e.Code, e.Description)
+		}
+	}
+	return nil
+}
+
+// printVerbResult renders a verb result in the CLI's --json contract shape
+// (success/message plus the result fields), or a short human line otherwise.
+func printVerbResult(raw json.RawMessage, jsonOutput bool) error {
+	if !jsonOutput {
+		fmt.Println("Command executed successfully")
+		return nil
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	out := map[string]any{"success": true, "message": "command executed"}
+	for k, v := range fields {
+		if k == "type" {
+			continue
+		}
+		out[k] = v
+	}
+	outputJSON(out)
+	return nil
+}
+
+// reportVerbError renders a failed verb call, honoring --json by printing a
+// {success:false,error} object and exiting non-zero.
+//
+// An error another machine answered carries host and untrusted, as a result
+// from there does.
+func reportVerbError(err error, jsonOutput bool) error {
+	if jsonOutput {
+		outputJSON(verbErrorJSON(err))
+		os.Exit(1)
+	}
+	return err
+}
+
+// verbErrorJSON is the object reportVerbError prints for err under --json.
+func verbErrorJSON(err error) map[string]any {
+	out := map[string]any{"success": false, "error": err.Error()}
+	// The agents-off answer carries the daemon's code, so a program can tell
+	// it from a failure worth retrying.
+	if call, ok := errors.AsType[*session.VerbCallError](err); ok && call.Code == session.ErrVerbAgentsDisabled {
+		out["error"] = config.AgentsOffMessage
+		out["code"] = call.Code
+	}
+	if here, ok := errors.AsType[*session.AgentsOffHereError](err); ok {
+		out["error"] = here.Error()
+		out["code"] = here.ErrorCode()
+	}
+	if h, ok := errors.AsType[*hostError](err); ok {
+		markUntrusted(out, h.host)
+	}
+	return out
+}
+
+// runSendKeys sends keystrokes to a running TUIOS session over the verb
+// protocol, and says where they went: the window the daemon wrote them to, or
+// the attached client. repeat 0 or 1 sends the sequence once.
+func runSendKeys(sessionName, keys string, literal bool, raw bool, windowTarget string, repeat int, jsonOutput bool) error {
+	t, err := dialTarget(sessionName, windowTarget)
+	if err != nil {
+		return reportVerbError(err, jsonOutput)
+	}
+	defer t.Close()
+
+	params := map[string]any{
+		"session": sessionName,
+		"window":  windowTarget,
+		"keys":    keys,
+		"literal": literal,
+		"raw":     raw,
+	}
+	// Sent only when asked for, so a daemon from before repeat existed still
+	// takes a call that does not use it.
+	if repeat > 1 {
+		params["repeat"] = repeat
+	}
+	raw2, err := t.client.Call("send-keys", t.params(params))
+	if err != nil {
+		return reportVerbError(t.explain("send-keys", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResultOn(t, raw2, true)
+	}
+	var res struct {
+		SentTo   string `json:"sent_to"`
+		WindowID string `json:"window_id"`
+		Window   string `json:"window"`
+		Keys     int    `json:"keys"`
+	}
+	if err := json.Unmarshal(raw2, &res); err != nil || res.SentTo == "" {
+		// An older daemon answers {"type":"ok"} and nothing else.
+		return nil
+	}
+	fmt.Println(sendKeysSummary(res.SentTo, res.WindowID, res.Window, res.Keys))
+	return nil
+}
+
+// sendKeysSummary is the line send-keys prints: how many keys went where.
+func sendKeysSummary(sentTo, windowID, window string, keys int) string {
+	noun := "keys"
+	if keys == 1 {
+		noun = "key"
+	}
+	if sentTo == "client" {
+		return fmt.Sprintf("sent %d %s to the attached client (the focused window, or the window manager)", keys, noun)
+	}
+	if window == "" {
+		return fmt.Sprintf("sent %d %s to window %s", keys, noun, shortWindowID(windowID))
+	}
+	return fmt.Sprintf("sent %d %s to window %s (%s)", keys, noun, window, shortWindowID(windowID))
+}
+
+// runNewWindow opens a window in a session and reports its id, which is the
+// handle every later call needs. workspace 0 means the current one, an empty
+// cwd means the daemon's own directory, and a non-empty command is an argv the
+// window execs as its process instead of a shell. A non-empty host puts the
+// window's process on another machine; the window is still this session's.
+// Non-empty grants are what the window's process may do through tuios.
+func runNewWindow(sessionName, name string, workspace int, cwd string, focus bool, command []string, host string, grants []string, jsonOutput, printID bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	params := map[string]any{
+		"session":   sessionName,
+		"name":      name,
+		"workspace": workspace,
+		"cwd":       cwd,
+		"focus":     focus,
+	}
+	if len(command) > 0 {
+		params["command"] = command
+	}
+	if host != "" {
+		params["host"] = host
+	}
+	if len(grants) > 0 {
+		params["grants"] = grants
+	}
+	raw, err := client.Call("new-window", params)
+	if err != nil {
+		return reportVerbError(explainVerbError("new-window", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	var res struct {
+		WindowID string `json:"window_id"`
+		Name     string `json:"name"`
+		Host     string `json:"host"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	// The full id and nothing else, for id=$(tuios new-window --print-id).
+	if printID {
+		fmt.Println(res.WindowID)
+		return nil
+	}
+	// The machine is printed only when it is not this one, so the ordinary
+	// line keeps the shape every script that already reads it expects.
+	if res.Host != "" {
+		fmt.Printf("%s  %s  on %s\n", shortWindowID(res.WindowID), res.Name, res.Host)
+		return nil
+	}
+	fmt.Printf("%s  %s\n", shortWindowID(res.WindowID), res.Name)
+	return nil
+}
+
+// runSplitWindow divides a pane and reports the id of the one the split made,
+// which is the only way to address it without diffing two window lists.
+func runSplitWindow(sessionName, windowTarget, direction, name string, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("split-window", map[string]any{
+		"session":   sessionName,
+		"window":    windowTarget,
+		"direction": direction,
+		"name":      name,
+	})
+	if err != nil {
+		return reportVerbError(explainVerbError("split-window", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	var res struct {
+		WindowID string `json:"window_id"`
+		Name     string `json:"name"`
+		Note     string `json:"note"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if res.WindowID == "" {
+		fmt.Println(res.Note)
+		return nil
+	}
+	fmt.Printf("%s  %s\n", shortWindowID(res.WindowID), res.Name)
+	return nil
+}
+
+// runFocusWindow moves the focus and says where it landed. A relative or
+// directional move does not name its pane in advance, so echoing the request
+// would confirm nothing.
+func runFocusWindow(sessionName, windowTarget, relative, direction string, jsonOutput bool) error {
+	t, err := dialTarget(sessionName, windowTarget)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+
+	raw, err := t.client.Call("focus-window", t.params(map[string]any{
+		"session":   sessionName,
+		"window":    windowTarget,
+		"relative":  relative,
+		"direction": direction,
+	}))
+	if err != nil {
+		return reportVerbError(t.explain("focus-window", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResultOn(t, raw, jsonOutput)
+	}
+	var res struct {
+		FocusedWindowID string    `json:"focused_window_id"`
+		Window          windowRow `json:"window"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if res.FocusedWindowID == "" {
+		fmt.Println("No window has the focus.")
+		return nil
+	}
+	fmt.Printf("%s  %s%s\n", shortWindowID(res.FocusedWindowID), windowLabel(res.Window), t.on())
+	return nil
+}
+
+// runMoveWindow moves a window to another workspace.
+func runMoveWindow(sessionName, windowTarget string, workspace int, follow, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("move-window", map[string]any{
+		"session":   sessionName,
+		"window":    windowTarget,
+		"workspace": workspace,
+		"follow":    follow,
+	})
+	if err != nil {
+		return reportVerbError(explainVerbError("move-window", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	var res struct {
+		WindowID string `json:"window_id"`
+		From     int    `json:"from_workspace"`
+		To       int    `json:"workspace"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	fmt.Printf("moved %s from workspace %d to %d\n", shortWindowID(res.WindowID), res.From, res.To)
+	return nil
+}
+
+// runSetWindow changes a window's name or its minimized state. Both are
+// pointers because an unset one is left alone, and an empty name is a request
+// to clear it rather than a request to do nothing.
+func runSetWindow(sessionName, windowTarget string, name *string, minimized *bool, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	params := map[string]any{
+		"session": sessionName,
+		"window":  windowTarget,
+	}
+	if name != nil {
+		params["name"] = *name
+	}
+	if minimized != nil {
+		params["minimized"] = *minimized
+	}
+
+	raw, err := client.Call("set-window", params)
+	if err != nil {
+		return reportVerbError(explainVerbError("set-window", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	var res windowRow
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	state := "restored"
+	if res.Minimized {
+		state = "minimized"
+	}
+	fmt.Printf("%s  %s  %s\n", shortWindowID(res.WindowID), windowLabel(res), state)
+	return nil
+}
+
+// runSelectWorkspace shows a workspace.
+func runSelectWorkspace(sessionName string, workspace int, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("select-workspace", map[string]any{
+		"session":   sessionName,
+		"workspace": workspace,
+	})
+	if err != nil {
+		return reportVerbError(explainVerbError("select-workspace", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	var res struct {
+		Current     int `json:"current_workspace"`
+		WindowCount int `json:"window_count"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	fmt.Printf("workspace %d, %s\n", res.Current, plural.Count(res.WindowCount, "window"))
+	return nil
+}
+
+// runListWorkspaces lists every workspace with what is on it.
+func runListWorkspaces(sessionName string, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("list-workspaces", map[string]any{"session": sessionName})
+	if err != nil {
+		return reportVerbError(explainVerbError("list-workspaces", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	return printWorkspaceList(raw)
+}
+
+// printWorkspaceList renders the workspace list in the same table shape as the
+// window list, so the two read as one tool.
+func printWorkspaceList(raw json.RawMessage) error {
+	var res struct {
+		Workspaces []struct {
+			Workspace   int    `json:"workspace"`
+			Name        string `json:"name"`
+			WindowCount int    `json:"window_count"`
+			Current     bool   `json:"current"`
+		} `json:"workspaces"`
+		Current int `json:"current_workspace"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if len(res.Workspaces) == 0 {
+		fmt.Println("No workspaces.")
+		return nil
+	}
+
+	rows := make([][]string, 0, len(res.Workspaces))
+	for _, ws := range res.Workspaces {
+		marker := ""
+		if ws.Current {
+			marker = "*"
+		}
+		rows = append(rows, []string{
+			marker + fmt.Sprintf("%d", ws.Workspace),
+			ws.Name,
+			fmt.Sprintf("%d", ws.WindowCount),
+		})
+	}
+
+	t := table.New().
+		Border(lipgloss.RoundedBorder()).
+		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("8"))).
+		Headers("WS", "NAME", "WINDOWS").
+		Rows(rows...).
+		StyleFunc(func(row, col int) lipgloss.Style {
+			base := lipgloss.NewStyle().Padding(0, 1)
+			if row == table.HeaderRow {
+				return base.Bold(true).Foreground(lipgloss.Color("12"))
+			}
+			switch col {
+			case 1:
+				return base.Foreground(lipgloss.Color("3")).Bold(true)
+			case 2:
+				return base.Foreground(lipgloss.Color("8"))
+			default:
+				return base
+			}
+		})
+
+	fmt.Println(t.Render())
+	fmt.Printf("\n%s. * marks the one showing.\n", plural.Count(len(res.Workspaces), "workspace"))
+	return nil
+}
+
+// checkSetLayoutMaster refuses a master position or count set-layout cannot
+// take, before anything is sent.
+func checkSetLayoutMaster(position string, masters int, mastersSet bool) error {
+	if position != "" && !config.IsMasterPosition(position) {
+		return fmt.Errorf("--master-position takes %s, got %q", strings.Join(config.MasterPositions, ", "), position)
+	}
+	if mastersSet && !config.ValidMasterCount(masters) {
+		return fmt.Errorf("--masters takes a number from %d to %d, got %d", config.MasterCountMin, config.MasterCountMax, masters)
+	}
+	return nil
+}
+
+// masterCountNames is the accepted master counts, as completions.
+func masterCountNames() []string {
+	names := make([]string, 0, config.MasterCountMax-config.MasterCountMin+1)
+	for n := config.MasterCountMin; n <= config.MasterCountMax; n++ {
+		names = append(names, strconv.Itoa(n))
+	}
+	return names
+}
+
+// runSetLayout turns tiling on or off and tidies the splits. tiling is a
+// pointer so a call that only equalizes leaves the tiling mode alone.
+func runSetLayout(sessionName string, tiling *bool, equalize, rotate bool, masterPosition string, masters int, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	params := map[string]any{
+		"session":  sessionName,
+		"equalize": equalize,
+		"rotate":   rotate,
+	}
+	if tiling != nil {
+		params["tiling"] = *tiling
+	}
+	if masterPosition != "" {
+		params["master_position"] = masterPosition
+	}
+	if masters != 0 {
+		params["master_count"] = masters
+	}
+
+	raw, err := client.Call("set-layout", params)
+	if err != nil {
+		return reportVerbError(explainVerbError("set-layout", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	var res struct {
+		TilingMode     string  `json:"tiling_mode"`
+		LayoutMode     string  `json:"layout_mode"`
+		MasterRatio    float64 `json:"master_ratio"`
+		MasterPosition string  `json:"master_position"`
+		MasterCount    int     `json:"master_count"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	fmt.Printf("%s  layout %s  master %.2f", res.TilingMode, res.LayoutMode, res.MasterRatio)
+	if res.MasterCount > 0 {
+		fmt.Printf("  %s  masters %d", res.MasterPosition, res.MasterCount)
+	}
+	fmt.Println()
+	return nil
+}
+
+// runSendText writes text verbatim to a pane's PTY. Unlike send-keys it parses
+// nothing, so a trailing newline in the argument is the Enter that submits the
+// line, and one call is enough to type and run a command.
+func runSendText(sessionName, windowTarget, text string, jsonOutput bool) error {
+	t, err := dialTarget(sessionName, windowTarget)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+
+	raw, err := t.client.Call("send-text", t.params(map[string]any{
+		"session": sessionName,
+		"window":  windowTarget,
+		"text":    text,
+	}))
+	if err != nil {
+		return t.explain("send-text", err)
+	}
+	if jsonOutput {
+		var pretty any
+		if err := json.Unmarshal(raw, &pretty); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+		return printJSON(pretty)
+	}
+	return nil
+}
+
+// runCapturePane captures the content of a pane and prints to stdout. lines
+// keeps only the last N lines when positive, which is what bounds a capture of a
+// long scrollback to something a caller can actually read.
+//
+// A capture from another machine is fenced as untrusted content, like mail,
+// because it is text a program there wrote. Control characters are removed
+// from it unless the caller asked for escape codes with --ansi or --resolved.
+func runCapturePane(sessionName, windowTarget string, scrollback, ansi, resolved bool, palette []string, lines int, lastCommand, jsonOutput bool) error {
+	t, err := dialTarget(sessionName, windowTarget)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+
+	params := map[string]any{
+		"session":    sessionName,
+		"window":     windowTarget,
+		"scrollback": scrollback,
+		"ansi":       ansi,
+		"resolved":   resolved,
+		"palette":    palette,
+		"lines":      lines,
+	}
+	// Sent only when asked for, so a capture against an older daemon keeps
+	// working: it would refuse a source it does not know.
+	if lastCommand {
+		params["source"] = "last-command-output"
+	}
+	raw, err := t.client.Call("capture-pane", t.params(params))
+	if err != nil {
+		return reportVerbError(t.explain("capture-pane", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResultOn(t, raw, jsonOutput)
+	}
+	return printCapture(os.Stdout, raw, t.host, t.window, ansi || resolved)
+}
+
+// printCapture writes a capture-pane result. A capture from this machine is
+// the content as it is. A capture from host is fenced with
+// session.UntrustedFence, with control and invisible format characters
+// removed (plainText). keepEscapes says the
+// caller asked for escape codes, and then SGR alone is kept (hostStyledText).
+func printCapture(w io.Writer, raw json.RawMessage, host, window string, keepEscapes bool) error {
+	var res struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if host == "" {
+		fmt.Fprint(w, res.Content)
+		return nil
+	}
+	who := "the focused pane on " + plainLine(host)
+	if window != "" {
+		who = "pane " + plainLine(window) + " on " + plainLine(host)
+	}
+	content := plainText(res.Content)
+	if keepEscapes {
+		content = hostStyledText(res.Content)
+	}
+	// The gutter on every line keeps a line the far pane printed, the close
+	// line included, inside the fence.
+	fmt.Fprintln(w, session.UntrustedFence(who, strings.TrimRight(content, "\n")))
+	return nil
+}
+
+// runCommand executes a tape command in a running TUIOS session.
+func runCommand(sessionName, command string, args []string, jsonOutput bool) error {
+	return runCommandRendered(sessionName, command, args, jsonOutput, nil)
+}
+
+// runCommandRendered is runCommand with a printer for the human output. A
+// command that answers with data, rather than only succeeding, passes one so the
+// answer is shown instead of thrown away; render is nil for the rest.
+func runCommandRendered(sessionName, command string, args []string, jsonOutput bool, render resultRenderer) error {
+	if err := requireDaemon(); err != nil {
+		return err
+	}
+
+	client := session.NewClient(&session.ClientConfig{
+		Version: version,
+	})
+
+	if err := client.Connect(); err != nil {
+		return explainDialError(err)
+	}
+	defer func() { _ = client.Close() }()
+
+	requestID := uuid.New().String()
+
+	// Send the execute command
+	msg, err := session.NewMessage(session.MsgExecuteCommand, &session.ExecuteCommandPayload{
+		SessionName: sessionName,
+		CommandType: command,
+		Args:        args,
+		RequestID:   requestID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create message: %w", err)
+	}
+
+	if err := sendAndWaitForResultWithFormat(client, msg, requestID, jsonOutput, render); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// queryWindows queries the window list over the verb protocol (no TUI required).
+func queryWindows(sessionName string, jsonOutput bool) error {
+	t, err := dialSessionTarget(sessionName)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+
+	raw, err := t.client.Call("list-windows", t.params(map[string]any{"session": sessionName}))
+	if err != nil {
+		return reportVerbError(t.explain("list-windows", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResultOn(t, raw, jsonOutput)
+	}
+	return printWindowList(raw, t.on())
+}
+
+// queryWindow describes one window with the get-window verb, so tuios
+// get-window is a read that a pane holding the read grant may make, like
+// list-windows. It used to send the client protocol's GetWindow, which only a
+// pane holding admin may send. A daemon older than the verb answers
+// unknown_verb, and the command then falls back to GetWindow as before. The
+// JSON keeps the shape GetWindow gave it: success and message, then the
+// window's fields.
+func queryWindow(sessionName string, args []string, jsonOutput bool) error {
+	window := ""
+	if len(args) > 0 {
+		window = args[0]
+	}
+	t, err := dialTarget(sessionName, window)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+
+	raw, err := t.client.Call("get-window", t.params(map[string]any{"session": sessionName, "window": window}))
+	if err != nil {
+		var call *session.VerbCallError
+		if t.host == "" && errors.As(err, &call) && call.Code == session.ErrVerbUnknownVerb {
+			return runCommandRendered(sessionName, "GetWindow", args, jsonOutput, printWindowDetail)
+		}
+		return reportVerbError(t.explain("get-window", err), jsonOutput)
+	}
+	var data map[string]any
+	if err := json.Unmarshal(t.result(raw), &data); err != nil {
+		return reportVerbError(fmt.Errorf("failed to parse response: %w", err), jsonOutput)
+	}
+	delete(data, "type")
+	if jsonOutput {
+		out := map[string]any{"success": true, "message": "command executed"}
+		maps.Copy(out, data)
+		outputJSON(out)
+		return nil
+	}
+	return printWindowDetail(data)
+}
+
+// windowRow is the subset of a listed window both the table and the single
+// window view render.
+type windowRow struct {
+	WindowID   string `json:"window_id"`
+	Index      int    `json:"index"`
+	Title      string `json:"title"`
+	Display    string `json:"display_name"`
+	CustomName string `json:"custom_name"`
+	Workspace  int    `json:"workspace"`
+	Focused    bool   `json:"focused"`
+	Minimized  bool   `json:"minimized"`
+	// Scratch marks a pane of a scratch group. The table leaves it out, as
+	// the dock and the rail do. --json keeps it, marked.
+	Scratch    bool   `json:"scratch"`
+	AgentState string `json:"agent_state"`
+	AgentMsg   string `json:"agent_message"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+}
+
+// printWindowList renders the window list as a table. Without this the command
+// printed only that it had succeeded, which told a reader nothing they asked
+// for and made --json the only way to see a window.
+func printWindowList(raw json.RawMessage, on string) error {
+	var res struct {
+		Windows []windowRow `json:"windows"`
+		Total   int         `json:"total"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	shown := res.Windows[:0]
+	for _, w := range res.Windows {
+		if w.Scratch {
+			continue
+		}
+		shown = append(shown, w)
+	}
+	res.Windows = shown
+	if len(res.Windows) == 0 {
+		fmt.Println("No windows. Create one with 'tuios new-window'.")
+		return nil
+	}
+
+	rows := make([][]string, 0, len(res.Windows))
+	for _, w := range res.Windows {
+		marker := ""
+		if w.Focused {
+			marker = "*"
+		}
+		rows = append(rows, []string{
+			marker + fmt.Sprintf("%d", w.Index),
+			shortWindowID(w.WindowID),
+			windowLabel(w),
+			fmt.Sprintf("%d", w.Workspace),
+			fmt.Sprintf("%dx%d", w.Width, w.Height),
+			w.AgentState,
+		})
+	}
+
+	t := table.New().
+		Border(lipgloss.RoundedBorder()).
+		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("8"))).
+		Headers("IDX", "ID", "NAME", "WS", "SIZE", "AGENT").
+		Rows(rows...).
+		StyleFunc(func(row, col int) lipgloss.Style {
+			base := lipgloss.NewStyle().Padding(0, 1)
+			if row == table.HeaderRow {
+				return base.Bold(true).Foreground(lipgloss.Color("12"))
+			}
+			switch col {
+			case 2:
+				return base.Foreground(lipgloss.Color("3")).Bold(true)
+			case 1, 3, 4:
+				return base.Foreground(lipgloss.Color("8"))
+			default:
+				return base
+			}
+		})
+
+	fmt.Println(t.Render())
+	fmt.Printf("\n%s%s. * marks the focused one.\n", plural.Count(len(res.Windows), "window"), on)
+	return nil
+}
+
+// windowLabel is the name to show for a window: the name it was given, else
+// whatever its shell set as the title.
+func windowLabel(w windowRow) string {
+	switch {
+	case w.CustomName != "":
+		return w.CustomName
+	case w.Display != "":
+		return w.Display
+	default:
+		return w.Title
+	}
+}
+
+// shortWindowID trims a window uuid to the prefix that addresses it. The verb
+// protocol resolves a window from 8 or more leading characters, so this is the
+// shortest form that can be pasted back into another command.
+func shortWindowID(id string) string {
+	const prefix = 8
+	if len(id) <= prefix {
+		return id
+	}
+	return id[:prefix]
+}
+
+// printWindowDetail renders one window as labelled lines.
+func printWindowDetail(data map[string]any) error {
+	encoded, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	var w windowRow
+	if err := json.Unmarshal(encoded, &w); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	fields := [][2]string{
+		{"name", windowLabel(w)},
+		{"id", w.WindowID},
+		{"index", fmt.Sprintf("%d", w.Index)},
+		{"title", w.Title},
+		{"workspace", fmt.Sprintf("%d", w.Workspace)},
+		{"size", fmt.Sprintf("%dx%d", w.Width, w.Height)},
+		{"focused", fmt.Sprintf("%t", w.Focused)},
+		{"minimized", fmt.Sprintf("%t", w.Minimized)},
+		{"agent", w.AgentState},
+	}
+	if w.AgentMsg != "" {
+		fields = append(fields, [2]string{"agent message", w.AgentMsg})
+	}
+	for _, f := range fields {
+		fmt.Printf("%-14s %s\n", f[0], f[1])
+	}
+	return nil
+}
+
+// querySession queries session info over the verb protocol (no TUI required).
+func querySession(sessionName string, jsonOutput bool) error {
+	t, err := dialSessionTarget(sessionName)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+
+	raw, err := t.client.Call("session-info", t.params(map[string]any{"session": sessionName}))
+	if err != nil {
+		return reportVerbError(t.explain("session-info", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResultOn(t, raw, jsonOutput)
+	}
+	return printSessionInfo(raw)
+}
+
+// printSessionInfo renders session details as labelled lines, for the same
+// reason printWindowList exists.
+func printSessionInfo(raw json.RawMessage) error {
+	var res struct {
+		Name             string         `json:"session_name"`
+		DisplayName      string         `json:"display_name"`
+		Accent           string         `json:"accent"`
+		CurrentWorkspace int            `json:"current_workspace"`
+		NumWorkspaces    int            `json:"num_workspaces"`
+		WorkspaceNames   map[string]any `json:"workspace_names"`
+		WorkspaceOrder   []int          `json:"workspace_order"`
+		WindowCount      int            `json:"window_count"`
+		TilingMode       string         `json:"tiling_mode"`
+		Width            int            `json:"width"`
+		Height           int            `json:"height"`
+		TUIAttached      bool           `json:"tui_attached"`
+		HostFocus        string         `json:"host_focus"`
+		WindowSize       string         `json:"window_size"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	fields := [][2]string{
+		{"session", res.Name},
+	}
+	if res.DisplayName != "" {
+		fields = append(fields, [2]string{"display name", res.DisplayName})
+	}
+	if res.Accent != "" {
+		fields = append(fields, [2]string{"accent", res.Accent})
+	}
+	fields = append(fields,
+		[2]string{"windows", fmt.Sprintf("%d", res.WindowCount)},
+		[2]string{"workspace", fmt.Sprintf("%d of %d", res.CurrentWorkspace, res.NumWorkspaces)},
+		[2]string{"tiling", res.TilingMode},
+		[2]string{"size", fmt.Sprintf("%dx%d", res.Width, res.Height)},
+		[2]string{"attached", fmt.Sprintf("%t", res.TUIAttached)},
+	)
+	// Only a daemon that tracks it sends host_focus, and it says nothing
+	// useful with no client attached.
+	if res.HostFocus != "" && res.TUIAttached {
+		fields = append(fields, [2]string{"host focus", res.HostFocus})
+	}
+	// Only a daemon that has the option sends window_size.
+	if res.WindowSize != "" {
+		fields = append(fields, [2]string{"window size", res.WindowSize})
+	}
+	for _, f := range fields {
+		fmt.Printf("%-14s %s\n", f[0], f[1])
+	}
+
+	if len(res.WorkspaceNames) > 0 {
+		named := make([]string, 0, len(res.WorkspaceNames))
+		for num, name := range res.WorkspaceNames {
+			named = append(named, fmt.Sprintf("%s=%v", num, name))
+		}
+		sort.Strings(named)
+		fmt.Printf("%-14s %s\n", "named", strings.Join(named, " "))
+	}
+	// Only a rearranged session prints a row here. The order is presentation, so
+	// the workspaces keep the numbers everything else addresses them by whatever
+	// this says.
+	if len(res.WorkspaceOrder) > 0 {
+		shown := make([]string, 0, len(res.WorkspaceOrder))
+		for _, ws := range res.WorkspaceOrder {
+			shown = append(shown, strconv.Itoa(ws))
+		}
+		fmt.Printf("%-14s %s\n", "order", strings.Join(shown, " "))
+	}
+	return nil
+}
+
+// optionRow is one settable configuration path as list-options reports it.
+type optionRow struct {
+	Path        string   `json:"path"`
+	Type        string   `json:"type"`
+	Section     string   `json:"section"`
+	Description string   `json:"description"`
+	Default     string   `json:"default"`
+	Accepted    []string `json:"accepted"`
+	Min         int      `json:"min"`
+	Max         int      `json:"max"`
+	Auto        bool     `json:"auto"`
+	Deprecated  string   `json:"deprecated"`
+	SessionVal  string   `json:"session_value"`
+}
+
+// runListOptions lists the settable configuration paths. It is the command that
+// answers "what can I set", so the human form prints the whole contract of each
+// option rather than a bare path a caller would still have to look up.
+func runListOptions(sessionName, section, prefix, search string, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("list-options", map[string]any{
+		"session": sessionName,
+		"section": section,
+		"prefix":  prefix,
+	})
+	if err != nil {
+		return reportVerbError(explainVerbError("list-options", err), jsonOutput)
+	}
+	if search != "" {
+		return printOptionSearch(os.Stdout, raw, search, jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	var res struct {
+		Options  []optionRow `json:"options"`
+		Sections []string    `json:"sections"`
+		Total    int         `json:"total"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	printOptionList(os.Stdout, res.Options, res.Sections, res.Total)
+	return nil
+}
+
+// printOptionList writes the options grouped by section, then the section names
+// so a reader who found the list too long can narrow it without a second guess.
+func printOptionList(w io.Writer, options []optionRow, sections []string, total int) {
+	if len(options) == 0 {
+		fmt.Fprintln(w, "No options match that filter.")
+		return
+	}
+
+	// A section is a display group, not a path prefix, so regroup a clone
+	// rather than reprint a heading each time path order crosses back into one.
+	options = slices.Clone(options)
+	slices.SortFunc(options, func(a, b optionRow) int {
+		if c := strings.Compare(a.Section, b.Section); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Path, b.Path)
+	})
+
+	// One width across every group, so the paths line up down the whole page
+	// rather than shifting at each section heading.
+	width := 0
+	for _, opt := range options {
+		if len(opt.Path) > width {
+			width = len(opt.Path)
+		}
+	}
+
+	current := ""
+	for _, opt := range options {
+		if opt.Section != current {
+			if current != "" {
+				fmt.Fprintln(w)
+			}
+			current = opt.Section
+			fmt.Fprintf(w, "[%s]\n", current)
+		}
+		deprecated := ""
+		if opt.Deprecated != "" {
+			deprecated = "  (deprecated)"
+		}
+		fmt.Fprintf(w, "  %-*s  %-6s  default %s%s\n", width, opt.Path, opt.Type, orNone(opt.Default), deprecated)
+		fmt.Fprintf(w, "  %-*s  %s\n", width, "", opt.Description)
+		if len(opt.Accepted) > 0 {
+			fmt.Fprintf(w, "  %-*s  one of: %s\n", width, "", strings.Join(opt.Accepted, ", "))
+		}
+		if opt.Max > 0 {
+			auto := ""
+			if opt.Auto {
+				auto = ", or auto"
+			}
+			fmt.Fprintf(w, "  %-*s  range: %d to %d%s\n", width, "", opt.Min, opt.Max, auto)
+		}
+		if opt.SessionVal != "" {
+			fmt.Fprintf(w, "  %-*s  this session: %s\n", width, "", opt.SessionVal)
+		}
+		if opt.Deprecated != "" {
+			fmt.Fprintf(w, "  %-*s  %s\n", width, "", opt.Deprecated)
+		}
+	}
+
+	fmt.Fprintf(w, "\n%s. Set one with 'tuios set-config <path> <value>'.\n", plural.Count(total, "option"))
+	if len(sections) > 0 {
+		fmt.Fprintf(w, "Sections: %s\n", strings.Join(sections, ", "))
+		fmt.Fprintln(w, "Narrow with --section <name>, or pass a path prefix as the argument.")
+	}
+}
+
+// runSetConfig sets a session option over the verb protocol. The value is
+// recorded in daemon-owned state and, when a TUI is attached, applied live.
+func runSetConfig(sessionName, path, value string, jsonOutput bool) error {
+	raw, err := setConfigOption(sessionName, path, value)
+	if err != nil {
+		return err
+	}
+	if jsonOutput {
+		var pretty any
+		if err := json.Unmarshal(raw, &pretty); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+		return printJSON(pretty)
+	}
+	// The line on stdout stays as it was, for scripts. What the daemon says
+	// about a value it only recorded goes to stderr, so a person sees why the
+	// screen did not change.
+	fmt.Printf("Set %s = %s\n", path, value)
+	if note := setConfigNote(raw); note != "" {
+		fmt.Fprintln(os.Stderr, note)
+	}
+	return nil
+}
+
+// setConfigNote is what set-config says on stderr about the daemon's answer:
+// a value only recorded, and a deprecated path. It is empty when there is
+// nothing to say.
+func setConfigNote(raw json.RawMessage) string {
+	var res struct {
+		Applied    bool   `json:"applied"`
+		Reason     string `json:"reason"`
+		Deprecated string `json:"deprecated"`
+	}
+	if json.Unmarshal(raw, &res) != nil {
+		return ""
+	}
+	var lines []string
+	if !res.Applied && res.Reason != "" {
+		lines = append(lines, "Not applied: "+strings.TrimSuffix(res.Reason, ".")+".")
+	}
+	if res.Deprecated != "" {
+		lines = append(lines, "Deprecated: "+res.Deprecated)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// setConfigOption is the set-option call behind set-config, and returns the
+// daemon's answer. tuios config browse sets a value through it too, so the
+// explorer has the same refusals as the command.
+func setConfigOption(sessionName, path, value string) (json.RawMessage, error) {
+	client, err := dialVerb()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("set-option", map[string]any{
+		"session": sessionName,
+		"key":     path,
+		"value":   value,
+	})
+	if err != nil {
+		return nil, explainVerbError("set-option", err)
+	}
+	return raw, nil
+}
+
+// runGetConfig reads a session option over the verb protocol.
+func runGetConfig(sessionName, path string, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("get-option", map[string]any{
+		"session": sessionName,
+		"key":     path,
+	})
+	if err != nil {
+		return explainVerbError("get-option", err)
+	}
+	// The bare value stays the default output: it is what a shell substitution
+	// wants, and printing anything else there would break every script using it.
+	if jsonOutput {
+		var pretty any
+		if err := json.Unmarshal(raw, &pretty); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+		out, err := json.MarshalIndent(pretty, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to render response: %w", err)
+		}
+		fmt.Println(string(out))
+		return nil
+	}
+	var res struct {
+		Value string `json:"value"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	fmt.Println(getConfigText(path, res.Value))
+	return nil
+}
+
+// getConfigText is what get-config prints for value at path. An unset option
+// that follows another says so, since an empty line reads as no value at all.
+func getConfigText(path, value string) string {
+	if value == "" {
+		if o, ok := config.LookupOption(path); ok && o.Follows != "" {
+			return o.UnsetText()
+		}
+	}
+	return value
+}
+
+// runSetAgentState reports a pane's agent state to the daemon over the verb
+// protocol. It is what the reference shim calls, and what a user runs to mark a
+// pane by hand.
+//
+// A report the daemon declines because a higher-ranked source already owns the
+// window comes back as applied:false, not as an error. Saying so matters: the
+// caller otherwise believes it set a state that never took.
+func runSetAgentState(sessionName, windowTarget, state, message, source, harness string, extra setAgentStateExtras) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	// Run in a pane with no --window, the report is about that pane, not the
+	// focused one. A daemon that places the caller does the same. This covers
+	// one that does not.
+	if windowTarget == "" && (sessionName == "" || sessionName == os.Getenv("TUIOS_SESSION")) {
+		if pane := os.Getenv("TUIOS_PANE_ID"); pane != "" && os.Getenv("TUIOS_SESSION") != "" {
+			windowTarget, sessionName = pane, os.Getenv("TUIOS_SESSION")
+		}
+	}
+	params := map[string]any{
+		"session": sessionName,
+		"window":  windowTarget,
+		"state":   state,
+		"message": message,
+		"source":  source,
+		"harness": harness,
+	}
+	// Sent only when set, so a call that uses none of them works against a
+	// daemon that predates them. Such a daemon ignores a param it does not
+	// know instead of refusing it, so --if-state is checked first: applied
+	// without its condition, the report would do what the caller ruled out.
+	if extra.ifState != "" {
+		if err := requireIfState(client); err != nil {
+			return err
+		}
+	}
+	for k, v := range map[string]string{
+		"kind":             extra.kind,
+		"agent_session_id": extra.sessionID,
+		"transcript_path":  extra.transcriptPath,
+		"if_state":         extra.ifState,
+	} {
+		if v != "" {
+			params[k] = v
+		}
+	}
+	raw, err := client.Call("set-agent-state", params)
+	if err != nil {
+		return explainVerbError("set-agent-state", err)
+	}
+
+	var res struct {
+		Applied bool   `json:"applied"`
+		State   string `json:"state"`
+		Source  string `json:"source"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if !res.Applied {
+		fmt.Fprintf(os.Stderr, "Not applied: %s It still reports %s.\n", agentRefusalText(res.Reason), res.State)
+	}
+	return nil
+}
+
+// runSetAgentSession stores a pane's conversation id without touching its
+// state. A refused report is said on stderr, as set-agent-state does.
+func runSetAgentSession(sessionName, windowTarget, harness, sessionID string) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+	raw, err := client.Call("set-agent-session", map[string]any{
+		"session":          sessionName,
+		"window":           windowTarget,
+		"harness":          harness,
+		"agent_session_id": sessionID,
+	})
+	if err != nil {
+		return explainVerbError("set-agent-session", err)
+	}
+	var res struct {
+		Applied bool   `json:"applied"`
+		ID      string `json:"agent_session_id"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if !res.Applied {
+		fmt.Fprintf(os.Stderr, "Not applied: %s The pane keeps %q.\n", agentRefusalText(res.Reason), res.ID)
+	}
+	return nil
+}
+
+// setAgentStateExtras are the set-agent-state fields a hook reporter adds.
+type setAgentStateExtras struct {
+	kind           string
+	sessionID      string
+	transcriptPath string
+	ifState        string
+}
+
+// agentRefusalText says in words why a report was not applied.
+func agentRefusalText(reason string) string {
+	switch reason {
+	case "if_state":
+		return "the pane was not in any of the --if-state states."
+	case "foreign_session":
+		return "the pane's agent is mid-turn in another conversation, so this looks like a nested run."
+	case "foreign_harness":
+		return "another harness reported this pane mid-turn, so this looks like a nested run."
+	default:
+		// outranked, or a daemon that predates reasons.
+		return "a higher-ranked source owns this pane."
+	}
+}
+
+// agentMetaTokensJSON turns key=value arguments into the tokens object of a
+// set-agent-meta call, in argument order, which the rail keeps. "key=" removes
+// the key.
+func agentMetaTokensJSON(args []string) (json.RawMessage, error) {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, arg := range args {
+		key, value, ok := strings.Cut(arg, "=")
+		if !ok || key == "" {
+			return nil, fmt.Errorf("%q is not key=value. Write key= to remove a key", arg)
+		}
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		k, _ := json.Marshal(key)
+		b.Write(k)
+		b.WriteByte(':')
+		if value == "" {
+			b.WriteString("null")
+			continue
+		}
+		v, _ := json.Marshal(value)
+		b.Write(v)
+	}
+	b.WriteByte('}')
+	return json.RawMessage(b.String()), nil
+}
+
+// runSetAgentMeta records display metadata about a pane's agent. It prints
+// nothing on success, like set-agent-state, except the keys whose values were
+// cut to the length limit, on stderr.
+func runSetAgentMeta(sessionName, windowTarget string, args []string, source string, ttl time.Duration, clearFirst, jsonOutput bool) error {
+	tokens, err := agentMetaTokensJSON(args)
+	if err != nil {
+		return err
+	}
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	params := map[string]any{
+		"session": sessionName,
+		"window":  windowTarget,
+		"source":  source,
+		"ttl_ms":  ttl.Milliseconds(),
+		"clear":   clearFirst,
+	}
+	if len(args) > 0 {
+		params["tokens"] = tokens
+	}
+	raw, err := client.Call("set-agent-meta", params)
+	if err != nil {
+		return explainVerbError("set-agent-meta", err)
+	}
+	if jsonOutput {
+		var pretty any
+		if err := json.Unmarshal(raw, &pretty); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+		out, err := json.MarshalIndent(pretty, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to render response: %w", err)
+		}
+		fmt.Println(string(out))
+		return nil
+	}
+	var res struct {
+		Truncated []string `json:"truncated"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if len(res.Truncated) > 0 {
+		fmt.Fprintf(os.Stderr, "Cut to %d characters: %s\n", session.AgentMetaMaxValue, strings.Join(res.Truncated, ", "))
+	}
+	return nil
+}
+
+// runRenameSession changes a session's name through the daemon. With no
+// session given it renames the session of the pane it runs in, and never
+// guesses one outside a pane.
+func runRenameSession(target, name string) error {
+	if target == "" {
+		target = os.Getenv("TUIOS_SESSION")
+	}
+	if target == "" {
+		return errors.New("name the session to rename: tuios rename-session <session> <new-name>")
+	}
+	return callAndReport("rename-session", map[string]any{
+		"session": target,
+		"name":    name,
+	}, func(res map[string]any) {
+		fmt.Printf("Renamed session %v to %v.\n", res["old_name"], res["session"])
+	})
+}
+
+// runSetSessionName sets a session's display label. The session keeps its own
+// name for addressing, so renaming the label never breaks a script.
+func runSetSessionName(sessionName, name string) error {
+	return callAndReport("set-session-name", map[string]any{
+		"session": sessionName,
+		"name":    name,
+	}, func(res map[string]any) {
+		if name == "" {
+			fmt.Printf("Cleared the display name of session %v.\n", res["session"])
+			return
+		}
+		fmt.Printf("Session %v now shows as %q.\n", res["session"], res["display_name"])
+	})
+}
+
+// runSetSessionAccent sets a session's accent slot, shared by every attached
+// client.
+func runSetSessionAccent(sessionName, accent string) error {
+	return callAndReport("set-session-accent", map[string]any{
+		"session": sessionName,
+		"accent":  accent,
+	}, func(res map[string]any) {
+		if accent == "" {
+			fmt.Printf("Cleared the accent of session %v.\n", res["session"])
+			return
+		}
+		fmt.Printf("Session %v now uses accent %v.\n", res["session"], res["accent"])
+	})
+}
+
+// runSetWorkspaceName labels a workspace. The number stays its identity.
+func runSetWorkspaceName(sessionName string, workspace int, name string) error {
+	return callAndReport("set-workspace-name", map[string]any{
+		"session":   sessionName,
+		"workspace": workspace,
+		"name":      name,
+	}, func(res map[string]any) {
+		if name == "" {
+			fmt.Printf("Cleared the name of workspace %v.\n", res["workspace"])
+			return
+		}
+		fmt.Printf("Workspace %v is now named %q.\n", res["workspace"], res["name"])
+	})
+}
+
+// callAndReport makes a one-shot verb call and hands the decoded result to a
+// printer, so the small setter commands do not each repeat the dial, the error
+// wrapping, and the decode.
+func callAndReport(verb string, params map[string]any, report func(map[string]any)) error {
+	sessionName, _ := params["session"].(string)
+	t, err := dialSessionTarget(sessionName)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+
+	raw, err := t.client.Call(verb, t.params(params))
+	if err != nil {
+		return t.explain(verb, err)
+	}
+	var res map[string]any
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	report(res)
+	return nil
+}
+
+// runWaitFor blocks until a daemon-side condition matches, so a caller can stop
+// polling a pane and sleeping between captures.
+//
+// The read deadline is stretched past the requested timeout because the daemon
+// only answers once the wait resolves: a client deadline shorter than the wait
+// would report a connection failure for a wait that was still perfectly healthy.
+func runWaitFor(sessionName, windowTarget, condition, pattern, until string, idle int, thread uint64, timeout int, anySession bool, selector string, every, jsonOutput bool, commandSeq *uint64) error {
+	if anySession && (sessionName != "" || windowTarget != "") {
+		return errors.New("--any-session watches every session, so it takes no --session or --window. Drop one or the other")
+	}
+	if selector != "" {
+		if sessionName != "" || windowTarget != "" || anySession {
+			return errors.New("--select watches the panes it matches in every session, so it takes no --session, --window or --any-session. Put a session: term in the selector instead")
+		}
+		return runWaitForSelect(condition, until, selector, every, timeout, jsonOutput)
+	}
+	if every {
+		return errors.New("--every goes with --select")
+	}
+	t, err := dialTarget(sessionName, windowTarget)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+
+	params := map[string]any{
+		"session":   sessionName,
+		"window":    windowTarget,
+		"condition": condition,
+		"pattern":   pattern,
+		"timeout":   timeout,
+	}
+	if until != "" {
+		params["until"] = until
+	}
+	if idle > 0 {
+		params["idle"] = idle
+	}
+	if thread > 0 {
+		params["thread"] = thread
+	}
+	if anySession {
+		params["any_session"] = true
+	}
+	if commandSeq != nil {
+		params["command_seq"] = *commandSeq
+	}
+
+	grace := time.Duration(timeout)*time.Millisecond + 10*time.Second
+	raw, err := t.client.CallWithTimeout("wait-for", t.params(params), grace)
+	if err != nil {
+		return reportVerbError(t.explain("wait-for", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResultOn(t, raw, jsonOutput)
+	}
+
+	var res struct {
+		Condition string `json:"condition"`
+		Window    string `json:"window"`
+		Session   string `json:"session"`
+		ExitCode  *int   `json:"exit_code"`
+		Cmdline   string `json:"cmdline"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if res.Condition == "command-finished" {
+		status := "no exit status"
+		if res.ExitCode != nil {
+			status = fmt.Sprintf("exit %d", *res.ExitCode)
+		}
+		fmt.Printf("%s matched on %s%s: %s, %s\n", res.Condition, plainLine(res.Window), t.on(), status, plainLine(res.Cmdline))
+		return nil
+	}
+	if res.Window != "" && anySession && res.Session != "" {
+		fmt.Printf("%s matched on %s in session %s%s\n", res.Condition, plainLine(res.Window), plainLine(res.Session), t.on())
+		return nil
+	}
+	if res.Window != "" {
+		fmt.Printf("%s matched on %s%s\n", res.Condition, plainLine(res.Window), t.on())
+		return nil
+	}
+	fmt.Printf("%s matched%s\n", res.Condition, t.on())
+	return nil
+}
+
+// runWaitForSelect is wait-for agent-state over the panes a selector matches,
+// on this machine. The call names no session, whatever TUIOS_SESSION says: a
+// selector reaches every session.
+func runWaitForSelect(condition, until, selector string, every bool, timeout int, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+	params := map[string]any{"condition": condition, "until": until, "select": selector, "timeout": timeout}
+	if every {
+		params["every"] = true
+	}
+	grace := time.Duration(timeout)*time.Millisecond + 10*time.Second
+	raw, err := client.CallWithTimeout("wait-for", params, grace)
+	if err != nil {
+		return reportVerbError(explainVerbError("wait-for", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, true)
+	}
+	var res struct {
+		Window  string `json:"window"`
+		Session string `json:"session"`
+		State   string `json:"state"`
+		Panes   []struct {
+			Session string `json:"session"`
+			Window  string `json:"window"`
+			State   string `json:"state"`
+		} `json:"panes"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	if every {
+		fmt.Printf("all %d panes matching %q reached %s\n", len(res.Panes), selector, until)
+		for _, p := range res.Panes {
+			fmt.Printf("  %s in session %s: %s\n", shortWindowID(p.Window), p.Session, p.State)
+		}
+		return nil
+	}
+	fmt.Printf("agent-state matched on %s in session %s: %s\n", shortWindowID(res.Window), res.Session, res.State)
+	return nil
+}
+
+// runGetAgentState reads a pane's reported agent state and prints it. With
+// jsonOutput it prints the full result; otherwise it prints the state name.
+func runGetAgentState(sessionName, windowTarget string, jsonOutput bool) error {
+	t, err := dialTarget(sessionName, windowTarget)
+	if err != nil {
+		return err
+	}
+	defer t.Close()
+
+	raw, err := t.client.Call("get-agent-state", t.params(map[string]any{
+		"session": sessionName,
+		"window":  windowTarget,
+	}))
+	if err != nil {
+		return reportVerbError(t.explain("get-agent-state", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResultOn(t, raw, jsonOutput)
+	}
+	var res struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	fmt.Println(res.State)
+	return nil
+}
+
+// detectExplanation is the explain-agent-detect result, decoded for printing.
+type detectExplanation struct {
+	WindowID       string                 `json:"window_id"`
+	State          string                 `json:"state"`
+	Source         string                 `json:"source"`
+	HarnessID      string                 `json:"harness_id"`
+	AutoDetected   bool                   `json:"auto_detected"`
+	Identity       string                 `json:"identity"`
+	Confidence     string                 `json:"confidence"`
+	NeedsYou       bool                   `json:"needs_you"`
+	Activity       string                 `json:"activity"`
+	Running        bool                   `json:"running"`
+	Reason         string                 `json:"reason"`
+	Verdict        string                 `json:"verdict"`
+	Evidence       []string               `json:"evidence"`
+	Ignored        []string               `json:"ignored"`
+	Process        harness.ProcReport     `json:"process"`
+	Manifests      []harness.DetectReport `json:"manifests"`
+	Group          []detectGroupMember    `json:"group"`
+	NameList       string                 `json:"name_list"`
+	Matched        bool                   `json:"matched"`
+	MatchedHarness string                 `json:"matched_harness"`
+	MatchedRule    string                 `json:"matched_rule"`
+	MatchedVia     []string               `json:"matched_via"`
+	Note           string                 `json:"note"`
+}
+
+// detectGroupMember is one process the detector read behind a wrapper.
+type detectGroupMember struct {
+	PID     int      `json:"pid"`
+	Depth   int      `json:"depth"`
+	Comm    string   `json:"comm"`
+	Argv    []string `json:"argv"`
+	Exe     string   `json:"exe"`
+	Matched bool     `json:"matched"`
+}
+
+// runExplainAgentDetect prints what the detector saw in a pane and what every
+// manifest made of it.
+func runExplainAgentDetect(sessionName, windowTarget string, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("explain-agent-detect", map[string]any{
+		"session": sessionName,
+		"window":  windowTarget,
+	})
+	if err != nil {
+		return reportVerbError(explainVerbError("explain-agent-detect", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	var res detectExplanation
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	printDetectExplanation(os.Stdout, res)
+	return nil
+}
+
+// printDetectExplanation writes the human form. It leads with the verdict and
+// the evidence, because that is the answer; what the detector read and what
+// each manifest did with it follow, for the person writing a rule.
+func printDetectExplanation(w io.Writer, res detectExplanation) {
+	fmt.Fprintln(w, res.Verdict)
+	for _, line := range res.Evidence {
+		fmt.Fprintf(w, "  %s\n", line)
+	}
+	if len(res.Ignored) > 0 {
+		fmt.Fprintln(w, "\nwords tuios saw and did not count:")
+		for _, line := range res.Ignored {
+			fmt.Fprintf(w, "  %s\n", line)
+		}
+	}
+
+	harnessName := res.HarnessID
+	if harnessName == "" {
+		harnessName = "none"
+	}
+	state := res.State
+	if res.Source != "" {
+		state += " (" + res.Source + ")"
+	}
+	fmt.Fprintf(w, "\npane %s  state %s  needs you: %s\n", res.WindowID, state, yesNo(res.NeedsYou))
+	fmt.Fprintf(w, "harness %s  confidence %s", harnessName, orNone(res.Confidence))
+	if res.Identity != "" {
+		fmt.Fprintf(w, " (%s)", res.Identity)
+	}
+	if res.AutoDetected {
+		fmt.Fprint(w, "  held by auto-detection")
+	}
+	fmt.Fprintln(w)
+
+	if !res.Running {
+		fmt.Fprintf(w, "\n%s\n", res.Reason)
+		return
+	}
+
+	p := res.Process
+	fmt.Fprintln(w, "\nwhat the detector read:")
+	fmt.Fprintf(w, "  comm   %s\n", orNone(p.Comm))
+	fmt.Fprintf(w, "  argv   %s\n", orNone(strings.Join(p.Argv, " ")))
+	fmt.Fprintf(w, "  exe    %s\n", orNone(p.Exe))
+	fmt.Fprintf(w, "  argv0  %s\n", orNone(p.Argv0))
+	switch {
+	case p.RunToken != "":
+		fmt.Fprintf(w, "  run    %s  (an interpreter, so this one token may name an agent)\n", p.RunToken)
+	case p.Interpreter:
+		fmt.Fprintln(w, "  run    (none: an interpreter, but it was given nothing to run)")
+	default:
+		fmt.Fprintln(w, "  run    (none: not an interpreter, so no argument is read as identity)")
+	}
+
+	if len(res.Group) > 0 {
+		fmt.Fprintln(w, "\nprocesses behind the wrapper:")
+		for _, m := range res.Group {
+			mark := " "
+			if m.Matched {
+				mark = "*"
+			}
+			fmt.Fprintf(w, "  %s %*spid %d  %s  %s\n", mark, 2*(m.Depth-1), "", m.PID, orNone(m.Comm), strings.Join(m.Argv, " "))
+		}
+	}
+
+	fmt.Fprintln(w, "\nmanifests, in lookup order:")
+	for _, m := range res.Manifests {
+		if m.Matched {
+			fmt.Fprintf(w, "  * %-14s matched on %s\n", m.ID, m.Rule)
+			continue
+		}
+		fmt.Fprintf(w, "    %-14s %s\n", m.ID, m.Reason)
+	}
+
+	fmt.Fprintln(w)
+	switch {
+	case res.Matched && res.MatchedHarness != "":
+		fmt.Fprintf(w, "result: %s, on %s\n", res.MatchedHarness, res.MatchedRule)
+	case res.Matched:
+		fmt.Fprintf(w, "result: an agent, on %s\n", res.MatchedRule)
+		if res.Note != "" {
+			fmt.Fprintf(w, "        %s\n", res.Note)
+		}
+	default:
+		fmt.Fprintln(w, "result: not an agent")
+		if res.NameList != "" {
+			fmt.Fprintf(w, "        the name list alone would have matched: %s\n", res.NameList)
+		}
+	}
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "(none)"
+	}
+	return s
+}
+
+// screenExplanation is the explain-agent-screen result, decoded for printing.
+type screenExplanation struct {
+	WindowID  string               `json:"window_id"`
+	HarnessID string               `json:"harness_id"`
+	State     string               `json:"state"`
+	Source    string               `json:"source"`
+	Enabled   bool                 `json:"enabled"`
+	Lines     int                  `json:"lines"`
+	Tail      []string             `json:"tail"`
+	Matched   bool                 `json:"matched"`
+	Rule      int                  `json:"rule"`
+	RuleState string               `json:"rule_state"`
+	Rules     []harness.RuleReport `json:"rules"`
+	// ManifestSource is "bundled" or the user file in force, and
+	// ReplacesBundled says that file took a bundled manifest's place.
+	ManifestSource  string `json:"manifest_source"`
+	ReplacesBundled bool   `json:"replaces_bundled"`
+	// The title block: the pane's title, its last progress report, and what
+	// each title rule made of them.
+	Title          string               `json:"title"`
+	Progress       string               `json:"progress"`
+	TitleMatched   bool                 `json:"title_matched"`
+	TitleRule      int                  `json:"title_rule"`
+	TitleRuleState string               `json:"title_rule_state"`
+	TitleRules     []harness.RuleReport `json:"title_rules"`
+}
+
+// runExplainAgentScreen prints what a harness's screen rules make of a pane.
+func runExplainAgentScreen(sessionName, windowTarget, harnessID string, lines int, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("explain-agent-screen", map[string]any{
+		"session": sessionName,
+		"window":  windowTarget,
+		"harness": harnessID,
+		"lines":   lines,
+	})
+	if err != nil {
+		return reportVerbError(explainVerbError("explain-agent-screen", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	var res screenExplanation
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	printScreenExplanation(os.Stdout, res)
+	return nil
+}
+
+// printScreenExplanation writes the human form: what the pane is, what the
+// classifier read, and what each rule did with it.
+func printScreenExplanation(w io.Writer, res screenExplanation) {
+	harnessName := res.HarnessID
+	if harnessName == "" {
+		harnessName = "none"
+	}
+	fmt.Fprintf(w, "pane %s  state %s (%s)\nharness %s", res.WindowID, res.State, res.Source, harnessName)
+	if res.HarnessID != "" {
+		if res.Enabled {
+			fmt.Fprintf(w, "  screen rules on, reading %d lines", res.Lines)
+		} else {
+			fmt.Fprint(w, "  screen rules off in the manifest")
+		}
+	}
+	fmt.Fprintln(w)
+	if res.ManifestSource != "" && res.ManifestSource != "bundled" {
+		if res.ReplacesBundled {
+			fmt.Fprintf(w, "manifest %s, which replaces the bundled one\n", res.ManifestSource)
+		} else {
+			fmt.Fprintf(w, "manifest %s\n", res.ManifestSource)
+		}
+	}
+
+	fmt.Fprintln(w, "\ntail, as the classifier sees it:")
+	if len(res.Tail) == 0 {
+		fmt.Fprintln(w, "  (nothing: the pane's visible screen is empty)")
+	}
+	for i, line := range res.Tail {
+		fmt.Fprintf(w, "  %2d | %s\n", i+1, line)
+	}
+
+	if res.HarnessID == "" {
+		fmt.Fprintln(w, "\nno harness is attributed to this pane, so no rules ran.")
+		fmt.Fprintln(w, "pass --harness to try one's rules against the tail above.")
+		return
+	}
+	if len(res.Rules) == 0 {
+		fmt.Fprintf(w, "\n%s declares no screen rules.\n", res.HarnessID)
+		return
+	}
+	fmt.Fprintln(w, "\nrules:")
+	printRuleReports(w, res.Rules, res.Rule, "tail")
+	// The leading mark is only readable next to what it means.
+	fmt.Fprintln(w, "\n  > the rule that decided, * matched but outranked")
+	if res.Matched {
+		fmt.Fprintf(w, "  rule %d would report %s\n", res.Rule, res.RuleState)
+	} else {
+		fmt.Fprintln(w, "  no rule matched, so the screen rules report nothing")
+	}
+
+	if len(res.TitleRules) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\ntitle %s\n", strconv.Quote(res.Title))
+	if res.Progress != "" {
+		fmt.Fprintf(w, "progress %s\n", res.Progress)
+	}
+	fmt.Fprintln(w, "title rules:")
+	printRuleReports(w, res.TitleRules, res.TitleRule, "osc_title")
+	if res.TitleMatched {
+		fmt.Fprintf(w, "  title rule %d would report %s\n", res.TitleRule, res.TitleRuleState)
+	} else {
+		fmt.Fprintln(w, "  no title rule matched")
+	}
+}
+
+// printRuleReports writes one block per rule: its mark, state and priority,
+// the region it reads when that is not the block's default, the text it read
+// there, and why it refused.
+func printRuleReports(w io.Writer, reports []harness.RuleReport, decided int, defaultRegion string) {
+	for _, r := range reports {
+		mark := " "
+		if r.Matched {
+			mark = "*"
+			if r.Index == decided {
+				mark = ">"
+			}
+		}
+		region := ""
+		if r.Region != "" && r.Region != defaultRegion {
+			region = "  region " + r.Region
+		}
+		fmt.Fprintf(w, " %s rule %d  %s  priority %d%s\n", mark, r.Index, r.State, r.Priority, region)
+		if r.NoRegion {
+			fmt.Fprintf(w, "     region %s is not on the screen\n", orNone(r.Region))
+		} else if r.NoDialog {
+			fmt.Fprintf(w, "     no dialog box on the screen holds all its words\n")
+		} else if r.Text != "" {
+			for line := range strings.SplitSeq(r.Text, "\n") {
+				fmt.Fprintf(w, "     | %s\n", line)
+			}
+		}
+		for _, why := range ruleRefusals(r) {
+			fmt.Fprintf(w, "     %s\n", why)
+		}
+	}
+}
+
+// ruleRefusals turns a rule's report into the lines saying why it refused.
+func ruleRefusals(r harness.RuleReport) []string {
+	var out []string
+	if r.Empty {
+		out = append(out, "names no strings, so it is refused rather than matching every pane")
+	}
+	for _, s := range r.Missing {
+		out = append(out, "all: "+strconv.Quote(s)+" is not on the screen")
+	}
+	if len(r.NoneOf) > 0 {
+		quoted := make([]string, 0, len(r.NoneOf))
+		for _, s := range r.NoneOf {
+			quoted = append(quoted, strconv.Quote(s))
+		}
+		out = append(out, "any: none of "+strings.Join(quoted, ", ")+" is on the screen")
+	}
+	for _, s := range r.Blocked {
+		out = append(out, "not: "+strconv.Quote(s)+" is on the screen and vetoes the rule")
+	}
+	for _, s := range r.MissingRegex {
+		out = append(out, "regex: "+strconv.Quote(s)+" matches nothing on the screen")
+	}
+	for _, s := range r.BlockedRegex {
+		out = append(out, "not_regex: "+strconv.Quote(s)+" matches the screen and vetoes the rule")
+	}
+	out = append(out, r.Groups...)
+	return out
+}
+
+// runTapeExec plays a tape file in a running TUIOS session and returns when
+// the tape has ended. A tape that fails returns the failure, placed at the
+// file and line it came from.
+func runTapeExec(sessionName, filePath string, timeout time.Duration) error {
+	if err := requireDaemon(); err != nil {
+		return err
+	}
+
+	script, err := tape.LoadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read tape file: %w", err)
+	}
+	if len(script.Errors) > 0 {
+		for _, e := range script.Errors {
+			fmt.Fprintf(os.Stderr, "%s: %s\n", filePath, e)
+		}
+		return fmt.Errorf("the tape has errors, listed above. Run 'tuios tape validate %s' after you fix them", filePath)
+	}
+	if len(script.Commands) == 0 {
+		return fmt.Errorf("the tape has no commands")
+	}
+
+	client := session.NewClient(&session.ClientConfig{
+		Version: version,
+	})
+
+	if err := client.Connect(); err != nil {
+		return explainDialError(err)
+	}
+	defer func() { _ = client.Close() }()
+
+	requestID := uuid.New().String()
+
+	// The tape goes with its Source lines resolved: the session cannot read
+	// the files they name.
+	msg, err := session.NewMessage(session.MsgExecuteCommand, &session.ExecuteCommandPayload{
+		SessionName: sessionName,
+		TapeScript:  script.Text,
+		RequestID:   requestID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create message: %w", err)
+	}
+
+	resp, err := client.SendControlMessageWait(msg, timeout)
+	if err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return fmt.Errorf("the tape did not finish in %s. It may still be playing. Use --timeout to wait longer", timeout)
+		}
+		return fmt.Errorf("failed to run the tape: %w", err)
+	}
+	switch resp.Type {
+	case session.MsgCommandResult:
+		var result session.CommandResultPayload
+		if err := resp.ParsePayload(&result); err != nil {
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+		if !result.Success {
+			return fmt.Errorf("the tape failed: %s", script.Locate(result.Message))
+		}
+		fmt.Printf("Tape finished: %d commands\n", len(script.Commands))
+		return nil
+	case session.MsgError:
+		var errPayload session.ErrorPayload
+		if err := resp.ParsePayload(&errPayload); err == nil && errPayload.Message != "" {
+			return fmt.Errorf("the tape did not run: %s", errPayload.Message)
+		}
+		return fmt.Errorf("the tape did not run, and the daemon did not say why. Run 'tuios logs' to read what it logged")
+	default:
+		return fmt.Errorf("unexpected response from the daemon: %v", resp.Type)
+	}
+}
+
+// resultRenderer prints a command result's data for a human reader.
+type resultRenderer func(map[string]any) error
+
+// sendAndWaitForResultWithFormat sends a message and waits for the result.
+// If jsonOutput is true, outputs machine-readable JSON.
+func sendAndWaitForResultWithFormat(client *session.Client, msg *session.Message, requestID string, jsonOutput bool, render resultRenderer) error {
+	resp, err := client.SendControlMessage(msg)
+	if err != nil {
+		if jsonOutput {
+			outputJSON(map[string]any{
+				"success": false,
+				"error":   fmt.Sprintf("failed to send command: %v", err),
+			})
+			return nil // Don't return error, we already output JSON
+		}
+		return fmt.Errorf("failed to send command: %w", err)
+	}
+
+	// Check response type
+	switch resp.Type {
+	case session.MsgCommandResult:
+		var result session.CommandResultPayload
+		if err := resp.ParsePayload(&result); err != nil {
+			if jsonOutput {
+				outputJSON(map[string]any{
+					"success": false,
+					"error":   fmt.Sprintf("failed to parse response: %v", err),
+				})
+				return nil
+			}
+			return fmt.Errorf("failed to parse response: %w", err)
+		}
+		if jsonOutput {
+			output := map[string]any{
+				"success": result.Success,
+				"message": result.Message,
+			}
+			// Merge any additional data from the result
+			maps.Copy(output, result.Data)
+			outputJSON(output)
+			if !result.Success {
+				os.Exit(1)
+			}
+			return nil
+		}
+		if !result.Success {
+			return fmt.Errorf("command failed: %s", result.Message)
+		}
+		if render != nil {
+			return render(result.Data)
+		}
+		fmt.Printf("Command executed successfully: %s\n", result.Message)
+		return nil
+
+	case session.MsgError:
+		var errPayload session.ErrorPayload
+		if err := resp.ParsePayload(&errPayload); err != nil {
+			if jsonOutput {
+				outputJSON(map[string]any{
+					"success": false,
+					"error":   "command failed with unknown error",
+				})
+				return nil
+			}
+			return fmt.Errorf("the command failed, and the daemon did not say why. Run 'tuios logs' to read what it logged")
+		}
+		if jsonOutput {
+			outputJSON(map[string]any{
+				"success": false,
+				"error":   errPayload.Message,
+			})
+			os.Exit(1)
+			return nil
+		}
+		return fmt.Errorf("command failed: %s", errPayload.Message)
+
+	default:
+		// Command was sent, we got some response
+		if jsonOutput {
+			outputJSON(map[string]any{
+				"success":    true,
+				"request_id": requestID[:8],
+			})
+			return nil
+		}
+		fmt.Printf("Command sent (request ID: %s)\n", requestID[:8])
+		return nil
+	}
+}
+
+// outputJSON outputs a value as JSON to stdout.
+func outputJSON(v any) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(v)
+}
+
+// runCommandEntry is one row of 'tuios run-command --list'.
+type runCommandEntry struct {
+	name        string
+	description string
+	example     string
+}
+
+// runCommandCatalog is what 'tuios run-command --list' prints. A closed set of
+// values is spelled from the list the executor checks against, so the listing
+// cannot offer a value the command refuses.
+func runCommandCatalog() []runCommandEntry {
+	return []runCommandEntry{
+		// Window management
+		{"NewWindow [name]", "Create a new terminal window", "tuios run-command NewWindow \"My Terminal\""},
+		{"CloseWindow [name]", "Close window(s) - all matching if name given", "tuios run-command CloseWindow \"Build\""},
+		{"NextWindow", "Focus the next window", "tuios run-command NextWindow"},
+		{"PrevWindow", "Focus the previous window", "tuios run-command PrevWindow"},
+		{"FocusWindow <name>", "Focus a window by name", "tuios run-command FocusWindow \"Server\""},
+		{"RenameWindow <name> | <old> <new>", "Rename focused or named window", "tuios run-command RenameWindow \"Old\" \"New\""},
+		{"MinimizeWindow [name]", "Minimize focused or named window", "tuios run-command MinimizeWindow \"Server\""},
+		{"RestoreWindow [name]", "Restore focused or named window", "tuios run-command RestoreWindow \"Server\""},
+
+		// Mode switching
+		{"TerminalMode", "Switch to terminal mode", "tuios run-command TerminalMode"},
+		{"WindowManagementMode", "Switch to window management mode", "tuios run-command WindowManagementMode"},
+
+		// Tiling
+		{"ToggleTiling", "Toggle tiling mode", "tuios run-command ToggleTiling"},
+		{"EnableTiling", "Enable tiling mode", "tuios run-command EnableTiling"},
+		{"DisableTiling", "Disable tiling mode", "tuios run-command DisableTiling"},
+		{"SnapLeft", "Snap focused window to left", "tuios run-command SnapLeft"},
+		{"SnapRight", "Snap focused window to right", "tuios run-command SnapRight"},
+		{"SnapFullscreen", "Snap focused window to fullscreen", "tuios run-command SnapFullscreen"},
+
+		// BSP Tiling
+		{"Split horizontal", "Split focused window horizontally", "tuios run-command Split horizontal"},
+		{"Split vertical", "Split focused window vertically", "tuios run-command Split vertical"},
+		{"RotateSplit", "Rotate the split direction", "tuios run-command RotateSplit"},
+		{"EqualizeSplits", "Equalize all split ratios", "tuios run-command EqualizeSplits"},
+		{"ArrangePanes tiled|even-horizontal|even-vertical [workspace [window...]]", "Lay out the panes of the workspace again", "tuios run-command ArrangePanes tiled 2"},
+		{"SetMultifocus [window...]", "Put exactly these windows in multifocus, or clear it", "tuios run-command SetMultifocus build tests"},
+		{"Screenshot", "Save the focused window as an image", "tuios run-command Screenshot"},
+
+		// Master-stack
+		{"SetMasterPosition " + strings.Join(config.MasterPositions, "|"), "Put the master panes on one side of the workspace", "tuios run-command SetMasterPosition center"},
+		{"SetMasterCount 1-9", "Set how many panes are master panes", "tuios run-command SetMasterCount 2"},
+		{"CycleMasterPosition", "Move the master panes to the next side", "tuios run-command CycleMasterPosition"},
+		{"AddMaster", "Make one more pane a master pane", "tuios run-command AddMaster"},
+		{"RemoveMaster", "Make one pane fewer a master pane", "tuios run-command RemoveMaster"},
+		{"SwapWithMaster", "Swap the focused pane with the master pane", "tuios run-command SwapWithMaster"},
+		{"FocusMaster", "Focus the master pane", "tuios run-command FocusMaster"},
+
+		// Workspace
+		{"SwitchWorkspace 1-9", "Switch to workspace N", "tuios run-command SwitchWorkspace 2"},
+		{"MoveToWorkspace 1-9", "Move focused window to workspace N", "tuios run-command MoveToWorkspace 3"},
+
+		// Animations
+		{"EnableAnimations", "Enable UI animations", "tuios run-command EnableAnimations"},
+		{"DisableAnimations", "Disable UI animations", "tuios run-command DisableAnimations"},
+		{"ToggleAnimations", "Toggle UI animations", "tuios run-command ToggleAnimations"},
+
+		// Config commands
+		{"SetDockbarPosition " + strings.Join(config.DockbarPositions, "|"), "Change dockbar position", "tuios run-command SetDockbarPosition top"},
+		{"SetBorderStyle style", "Change window border style", "tuios run-command SetBorderStyle rounded"},
+		{"SetTheme themename", "Change the color theme", "tuios run-command SetTheme dracula"},
+		{"ShowNotification message [type]", "Show a notification", "tuios run-command ShowNotification \"Hello!\" info"},
+
+		// Any keybinding action, and keys through tuios's own key handling
+		{"<action>", "Run a keybinding action by name (tuios keybinds list prints them)", "tuios run-command toggle_spotlight"},
+		{"Action <action>", "The same, spelled as a tape writes it", "tuios run-command Action toggle_scratch"},
+		{"Press <keys>", "Press keys as a person would: prefixes, copy mode, dialogs", "tuios run-command Press \"ctrl+b ?\""},
+		{"Run <command line>", "Type a command line into the focused window and press Enter", "tuios run-command Run \"make test\""},
+
+		// Inspection commands
+		{"ListWindows", "List all windows (use --json)", "tuios list-windows --json"},
+		{"GetWindow [id-or-name]", "Get window info (use --json)", "tuios get-window --json"},
+		{"GetSessionInfo", "Get session info (use --json)", "tuios session-info --json"},
+	}
+}
+
+// listAvailableCommands lists all available tape commands that can be executed remotely.
+func listAvailableCommands() {
+	commands := runCommandCatalog()
+
+	fmt.Println("Available commands for 'tuios run-command':")
+	fmt.Println()
+
+	width := 0
+	for _, cmd := range commands {
+		width = max(width, len(cmd.name))
+	}
+	for _, cmd := range commands {
+		fmt.Printf("  %-*s  %s\n", width, cmd.name, cmd.description)
+	}
+
+	fmt.Println()
+	fmt.Println("Examples:")
+	for _, cmd := range commands {
+		if cmd.example != "" {
+			fmt.Printf("  %s\n", cmd.example)
+		}
+	}
+}
+
+// Completion functions for shell autocompletion
+
+// fixedCompletions completes a flag whose values are a closed set the daemon
+// will reject anything outside of, so the shell can offer them all.
+func fixedCompletions(values ...string) func(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+	return func(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+		return values, cobra.ShellCompDirectiveNoFileComp
+	}
+}
+
+// getSendKeysCompletions returns completions for send-keys key names.
+func getSendKeysCompletions(toComplete string) []string {
+	keys := []string{
+		// Special tokens
+		"$PREFIX\tConfigured leader/prefix key",
+		"PREFIX\tConfigured leader/prefix key",
+		// Special keys
+		"Enter\tPress Enter/Return",
+		"Return\tPress Enter/Return",
+		"Space\tPress Space",
+		"Tab\tPress Tab",
+		"Escape\tPress Escape",
+		"Esc\tPress Escape",
+		"Backspace\tPress Backspace",
+		"Delete\tPress Delete",
+		// Arrow keys
+		"Up\tPress Up arrow",
+		"Down\tPress Down arrow",
+		"Left\tPress Left arrow",
+		"Right\tPress Right arrow",
+		// Navigation
+		"Home\tPress Home",
+		"End\tPress End",
+		"PageUp\tPress Page Up",
+		"PageDown\tPress Page Down",
+		"Insert\tPress Insert",
+		// Function keys
+		"F1\tPress F1",
+		"F2\tPress F2",
+		"F3\tPress F3",
+		"F4\tPress F4",
+		"F5\tPress F5",
+		"F6\tPress F6",
+		"F7\tPress F7",
+		"F8\tPress F8",
+		"F9\tPress F9",
+		"F10\tPress F10",
+		"F11\tPress F11",
+		"F12\tPress F12",
+		// Common key combos
+		"ctrl+b\tPrefix key (default)",
+		"ctrl+c\tInterrupt/cancel",
+		"ctrl+d\tEOF/logout",
+		"ctrl+z\tSuspend",
+		"alt+1\tWorkspace 1",
+		"alt+2\tWorkspace 2",
+		"alt+3\tWorkspace 3",
+		// Mode keys
+		"i\tEnter terminal mode",
+		"n\tNew window (in window mode)",
+		"q\tQuit (in window mode)",
+		"h\tMove left",
+		"j\tMove down",
+		"k\tMove up",
+		"l\tMove right",
+	}
+
+	var filtered []string
+	toComplete = strings.ToLower(toComplete)
+	for _, key := range keys {
+		if toComplete == "" || strings.HasPrefix(strings.ToLower(key), toComplete) {
+			filtered = append(filtered, key)
+		}
+	}
+	return filtered
+}
+
+// getRunCommandCompletions returns completions for run-command command names.
+func getRunCommandCompletions(toComplete string) []string {
+	commands := []string{
+		"NewWindow\tCreate a new terminal window",
+		"CloseWindow\tClose the focused window",
+		"NextWindow\tFocus the next window",
+		"PrevWindow\tFocus the previous window",
+		"RenameWindow\tRename the focused window",
+		"MinimizeWindow\tMinimize the focused window",
+		"RestoreWindow\tRestore the focused window",
+		"TerminalMode\tSwitch to terminal mode",
+		"WindowManagementMode\tSwitch to window management mode",
+		"ToggleTiling\tToggle tiling mode",
+		"EnableTiling\tEnable tiling mode",
+		"DisableTiling\tDisable tiling mode",
+		"SnapLeft\tSnap window to left",
+		"SnapRight\tSnap window to right",
+		"SnapFullscreen\tSnap window fullscreen",
+		"Split\tSplit window (horizontal/vertical)",
+		"RotateSplit\tRotate split direction",
+		"EqualizeSplits\tEqualize all splits",
+		"ArrangePanes\tLay out the panes again (tiled/even-horizontal/even-vertical)",
+		"SetMultifocus\tSet the multifocus windows",
+		"SwitchWorkspace\tSwitch to workspace N",
+		"MoveToWorkspace\tMove window to workspace N",
+		"MoveAndFollowWorkspace\tMove and follow to workspace N",
+		"EnableAnimations\tEnable animations",
+		"DisableAnimations\tDisable animations",
+		"ToggleAnimations\tToggle animations",
+		"SetConfig\tSet a config option",
+		"SetTheme\tChange theme",
+		"SetDockbarPosition\tChange dockbar position",
+		"SetBorderStyle\tChange border style",
+		"ShowNotification\tShow a notification",
+		"FocusDirection\tFocus window in direction",
+		"Screenshot\tSave the focused window as an image",
+		"SetMasterPosition\tPut the master panes on one side",
+		"SetMasterCount\tSet how many panes are master panes",
+		"CycleMasterPosition\tMove the master panes to the next side",
+		"AddMaster\tMake one more pane a master pane",
+		"RemoveMaster\tMake one pane fewer a master pane",
+		"SwapWithMaster\tSwap the focused pane with the master pane",
+		"FocusMaster\tFocus the master pane",
+	}
+
+	var filtered []string
+	toComplete = strings.ToLower(toComplete)
+	for _, cmd := range commands {
+		if toComplete == "" || strings.HasPrefix(strings.ToLower(cmd), toComplete) {
+			filtered = append(filtered, cmd)
+		}
+	}
+	return filtered
+}
+
+// getRunCommandArgCompletions returns completions for run-command arguments.
+func getRunCommandArgCompletions(command string, argIndex int, toComplete string) []string {
+	switch command {
+	case "Split":
+		if argIndex == 1 {
+			return []string{"horizontal\tSplit top/bottom", "vertical\tSplit left/right"}
+		}
+	case "SwitchWorkspace", "MoveToWorkspace", "MoveAndFollowWorkspace":
+		if argIndex == 1 {
+			return []string{"1", "2", "3", "4", "5", "6", "7", "8", "9"}
+		}
+	case "SetDockbarPosition":
+		if argIndex == 1 {
+			return slices.Clone(config.DockbarPositions)
+		}
+	case "SetMasterPosition":
+		if argIndex == 1 {
+			return slices.Clone(config.MasterPositions)
+		}
+	case "SetMasterCount":
+		if argIndex == 1 {
+			return masterCountNames()
+		}
+	case "SetBorderStyle":
+		if argIndex == 1 {
+			return slices.Clone(config.BorderStyles)
+		}
+	case "FocusDirection":
+		if argIndex == 1 {
+			return []string{"left", "right", "up", "down"}
+		}
+	case "ShowNotification":
+		if argIndex == 2 {
+			return []string{"info", "success", "warning", "error"}
+		}
+	case "SetConfig":
+		if argIndex == 1 {
+			return getConfigPathCompletions(toComplete)
+		}
+		if argIndex == 2 {
+			// Would need the first arg to determine values
+			return nil
+		}
+	}
+	return nil
+}
+
+// getConfigPathCompletions returns completions for set-config paths.
+func getConfigPathCompletions(toComplete string) []string {
+	paths := []string{
+		"dockbar_position\tDockbar position (top/bottom/hidden)",
+		"border_style\tWindow border style",
+		"animations\tEnable/disable animations (true/false/toggle)",
+		"hide_window_buttons\tHide window buttons (true/false)",
+		"window_button_style\tWindow control style (pill/dots)",
+		"window_button_position\tWhich end the window controls sit on (right/left)",
+	}
+
+	var filtered []string
+	toComplete = strings.ToLower(toComplete)
+	for _, path := range paths {
+		if toComplete == "" || strings.HasPrefix(strings.ToLower(path), toComplete) {
+			filtered = append(filtered, path)
+		}
+	}
+	return filtered
+}
+
+// getConfigValueCompletions returns completions for set-config values.
+func getConfigValueCompletions(path, _ string) []string {
+	switch path {
+	case "dockbar_position", "appearance.dockbar_position":
+		return []string{"top", "bottom", "hidden"}
+	case "border_style", "appearance.border_style":
+		return []string{"rounded", "normal", "thick", "double", "hidden", "block", "ascii"}
+	case "animations", "appearance.animations_enabled", "animations_enabled":
+		return []string{"true", "false", "toggle", "on", "off"}
+	case "motion", "appearance.motion":
+		return config.MotionLevels
+	case "hide_window_buttons", "appearance.hide_window_buttons":
+		return []string{"true", "false"}
+	case "window_button_style", "appearance.window_button_style":
+		return []string{"pill", "dots"}
+	case "window_button_position", "appearance.window_button_position":
+		return []string{"right", "left"}
+	}
+	return nil
+}
+
+// runGetLogs retrieves and displays daemon logs.
+func runGetLogs(count int, clear bool, follow bool) error {
+	if err := requireDaemon(); err != nil {
+		return err
+	}
+
+	client := session.NewClient(&session.ClientConfig{
+		Version: version,
+	})
+
+	if err := client.Connect(); err != nil {
+		return explainDialError(err)
+	}
+	defer func() { _ = client.Close() }()
+
+	if follow {
+		// Follow mode: continuously poll for new logs
+		return followLogs(client, count)
+	}
+
+	// Single retrieval
+	_, err := displayLogs(client, count, clear)
+	return err
+}
+
+// displayLogs fetches and displays logs once.
+// displayLogs prints up to count entries and returns the newest timestamp shown
+// (0 when none), which follow mode uses to seed its poll cursor.
+func displayLogs(client *session.Client, count int, clear bool) (int64, error) {
+	msg, err := session.NewMessage(session.MsgGetLogs, &session.GetLogsPayload{
+		Count: count,
+		Clear: clear,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("failed to create message: %w", err)
+	}
+
+	resp, err := client.SendControlMessage(msg)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get logs: %w", err)
+	}
+
+	if resp.Type == session.MsgError {
+		var errPayload session.ErrorPayload
+		if err := resp.ParsePayload(&errPayload); err != nil {
+			return 0, fmt.Errorf("failed to get logs")
+		}
+		return 0, fmt.Errorf("failed to get logs: %s", errPayload.Message)
+	}
+
+	if resp.Type != session.MsgLogsData {
+		return 0, fmt.Errorf("unexpected response type: %d", resp.Type)
+	}
+
+	var logsData session.LogsDataPayload
+	if err := resp.ParsePayload(&logsData); err != nil {
+		return 0, fmt.Errorf("failed to parse logs: %w", err)
+	}
+
+	if len(logsData.Entries) == 0 {
+		fmt.Println("No log entries")
+		return 0, nil
+	}
+
+	var newest int64
+	for _, entry := range logsData.Entries {
+		ts := time.UnixMilli(entry.Timestamp)
+		fmt.Printf("[%s] [%s] %s\n", ts.Format("15:04:05.000"), entry.Level, entry.Message)
+		if entry.Timestamp > newest {
+			newest = entry.Timestamp
+		}
+	}
+
+	fmt.Printf("\n--- %d log entries ---\n", len(logsData.Entries))
+
+	if clear {
+		fmt.Println("(logs cleared)")
+	}
+
+	return newest, nil
+}
+
+// followLogs continuously polls for new logs.
+func followLogs(client *session.Client, initialCount int) error {
+	// First, display existing logs and seed the poll cursor from the newest one
+	// shown, so the first tick does not reprint what we just displayed.
+	lastTimestamp, err := displayLogs(client, initialCount, false)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("\n--- Following logs (Ctrl+C to stop) ---")
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	// Handle Ctrl+C
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+
+	for {
+		select {
+		case <-sigChan:
+			fmt.Println("\nStopped following logs")
+			return nil
+		case <-ticker.C:
+			// Fetch new logs
+			msg, err := session.NewMessage(session.MsgGetLogs, &session.GetLogsPayload{
+				Count: 100, // Fetch last 100 entries to check for new ones
+				Clear: false,
+			})
+			if err != nil {
+				continue
+			}
+
+			resp, err := client.SendControlMessage(msg)
+			if err != nil {
+				continue
+			}
+
+			if resp.Type != session.MsgLogsData {
+				continue
+			}
+
+			var logsData session.LogsDataPayload
+			if err := resp.ParsePayload(&logsData); err != nil {
+				continue
+			}
+
+			// Display only new entries
+			for _, entry := range logsData.Entries {
+				if entry.Timestamp > lastTimestamp {
+					ts := time.UnixMilli(entry.Timestamp)
+					fmt.Printf("[%s] [%s] %s\n", ts.Format("15:04:05.000"), entry.Level, entry.Message)
+					lastTimestamp = entry.Timestamp
+				}
+			}
+		}
+	}
+}
+
+// completeSessionNames returns available session names for shell completion.
+func completeSessionNames(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+	if !session.IsDaemonRunning() {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	client := session.NewClient(&session.ClientConfig{
+		Version: version,
+	})
+
+	if err := client.Connect(); err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	defer func() { _ = client.Close() }()
+
+	sessions, err := client.ListSessions()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	var names []string
+	for _, s := range sessions {
+		status := "detached"
+		if s.Attached {
+			status = "attached"
+		}
+		names = append(names, fmt.Sprintf("%s\t%s (%d windows)", s.Name, status, s.WindowCount))
+	}
+
+	return names, cobra.ShellCompDirectiveNoFileComp
+}
+
+// screenshotRequest is the CLI's resolved screenshot call.
+type screenshotRequest struct {
+	session    string
+	window     string
+	format     string
+	theme      string
+	frame      string
+	out        string
+	lines      int
+	scrollback bool
+	cursor     bool
+	copy       bool
+	noCopy     bool
+	jsonOutput bool
+}
+
+// runScreenshot renders a window to an image file through the daemon and then
+// says where the file is.
+//
+// The daemon writes the file, not the CLI. They talk over a unix socket, so
+// they are the same machine and the path the daemon reports is a path the
+// caller can open. That is also why a clipboard copy is attempted here: this
+// process is on the user's own machine, which is the rule an image copy has to
+// obey.
+func runScreenshot(req screenshotRequest) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("screenshot", map[string]any{
+		"session":    req.session,
+		"window":     req.window,
+		"format":     req.format,
+		"theme":      req.theme,
+		"frame":      req.frame,
+		"scrollback": req.scrollback,
+		"lines":      req.lines,
+		"cursor":     req.cursor,
+		"out":        req.out,
+	})
+	if err != nil {
+		return reportVerbError(explainVerbError("screenshot", err), req.jsonOutput)
+	}
+
+	var res struct {
+		Path     string   `json:"path"`
+		Host     string   `json:"host"`
+		Format   string   `json:"format"`
+		Cols     int      `json:"cols"`
+		Rows     int      `json:"rows"`
+		Bytes    int      `json:"bytes"`
+		Warnings []string `json:"warnings"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	copied, copyNote := maybeCopyScreenshot(res.Path, res.Format, req)
+
+	if req.jsonOutput {
+		out := map[string]any{
+			"success": true, "path": res.Path, "host": res.Host,
+			"format": res.Format, "cols": res.Cols, "rows": res.Rows,
+			"bytes": res.Bytes, "copied": copied,
+			"warnings": append(append([]string{}, res.Warnings...), copyNote...),
+		}
+		outputJSON(out)
+		return nil
+	}
+	fmt.Println(res.Path)
+	for _, w := range res.Warnings {
+		fmt.Fprintln(os.Stderr, w)
+	}
+	for _, w := range copyNote {
+		fmt.Fprintln(os.Stderr, w)
+	}
+	return nil
+}
+
+// maybeCopyScreenshot attempts the clipboard copy the flags asked for and
+// reports, in plain words, what actually happened.
+func maybeCopyScreenshot(path, format string, req screenshotRequest) (bool, []string) {
+	if req.noCopy || !req.copy || path == "" {
+		return false, nil
+	}
+	f, ok := shot.ParseFormat(format)
+	if !ok {
+		return false, nil
+	}
+	data, err := os.ReadFile(path) // #nosec G304 - the daemon just wrote this path
+	if err != nil {
+		return false, []string{"The file was written but could not be read back to copy it."}
+	}
+	if _, err := capture.CopyImage(path, data, f.MediaType()); err != nil {
+		return false, []string{"The file was saved. " + err.Error()}
+	}
+	return true, nil
+}
+
+// defaultPopupCallTimeout is the read deadline of a popup call that does not
+// wait, the verb client's own default.
+const defaultPopupCallTimeout = 30 * time.Second
+
+// printPopupResult prints a waited popup's captured output as it was printed,
+// and returns the command's status as this process's.
+func printPopupResult(w io.Writer, raw json.RawMessage) error {
+	var res struct {
+		ExitCode int    `json:"exit_code"`
+		Stdout   string `json:"stdout"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	fmt.Fprint(w, res.Stdout)
+	if res.ExitCode != 0 {
+		code := res.ExitCode
+		if code < 0 {
+			// Ended by a signal, which is how closing the popup ends it.
+			code = 130
+		}
+		return &statusError{code: code}
+	}
+	return nil
+}
+
+// popupOptions is the `tuios popup` command line, gathered so the runner reads
+// as one thing rather than as seven positional arguments.
+type popupOptions struct {
+	session   string
+	name      string
+	cwd       string
+	width     string
+	height    string
+	workspace int
+	command   []string
+	jsonOut   bool
+	// wait keeps the call open until the command exits; capture returns its
+	// standard output; timeout bounds the wait in milliseconds, 0 for none.
+	wait    bool
+	capture bool
+	timeout int
+}
+
+// runPopup opens a popup and reports its id, which is the handle every later
+// call needs.
+//
+// The command is refused here as well as in the daemon so the message names the
+// flag the user typed rather than the parameter the wire carries.
+func runPopup(o popupOptions) error {
+	if len(o.command) == 0 {
+		return fmt.Errorf("popup needs a command to run, e.g. tuios popup -- fzf")
+	}
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	params := map[string]any{
+		"session": o.session,
+		"command": o.command,
+	}
+	// Only the parameters the user named are sent. The daemon refuses a params
+	// key a verb does not declare and fills its own defaults for the rest, so
+	// sending an empty width would ask for a size nobody chose.
+	if o.width != "" {
+		params["width"] = o.width
+	}
+	if o.height != "" {
+		params["height"] = o.height
+	}
+	if o.name != "" {
+		params["name"] = o.name
+	}
+	if o.cwd != "" {
+		params["cwd"] = o.cwd
+	}
+	if o.workspace != 0 {
+		params["workspace"] = o.workspace
+	}
+	callTimeout := defaultPopupCallTimeout
+	if o.wait {
+		params["wait"] = true
+		if o.capture {
+			params["capture_stdout"] = true
+		}
+		if o.timeout > 0 {
+			params["timeout"] = o.timeout
+		}
+		// The daemon answers when the popup's command exits, which is when
+		// the person is done with it. With no timeout there is no bound worth
+		// guessing, so the call waits a day.
+		callTimeout = 24 * time.Hour
+		if o.timeout > 0 {
+			callTimeout = time.Duration(o.timeout)*time.Millisecond + 10*time.Second
+		}
+	}
+	raw, err := client.CallWithTimeout("popup", params, callTimeout)
+	if err != nil {
+		return reportVerbError(explainVerbError("popup", err), o.jsonOut)
+	}
+	if o.jsonOut {
+		return printVerbResult(raw, o.jsonOut)
+	}
+	if o.wait {
+		return printPopupResult(os.Stdout, raw)
+	}
+	var res struct {
+		WindowID string `json:"window_id"`
+		Name     string `json:"name"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+	fmt.Printf("%s  %s\n", shortWindowID(res.WindowID), res.Name)
+	return nil
+}
+
+// completeHostNames offers the machines in the [hosts] table, each with the
+// state of its link, so a completion does not silently suggest a machine that
+// is down. A daemon that is not running, or one with no hosts, offers nothing
+// rather than an error: a completion is not the place to report a problem.
+func completeHostNames(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
+	if !session.IsDaemonRunning() {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	client, err := dialVerb()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("list-hosts", map[string]any{})
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	var res struct {
+		Hosts []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		} `json:"hosts"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	names := make([]string, 0, len(res.Hosts))
+	for _, h := range res.Hosts {
+		names = append(names, fmt.Sprintf("%s\t%s", h.Name, h.Status))
+	}
+	return names, cobra.ShellCompDirectiveNoFileComp
+}

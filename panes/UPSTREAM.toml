@@ -1,0 +1,4 @@
+upstream = "https://github.com/Gaurav-Gosain/tuios"
+commit = "f3d892942bfb45a0a0775d14895ae77ff9c06468"
+license = "MIT"
+imported = "2026-10-07"

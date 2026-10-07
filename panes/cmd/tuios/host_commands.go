@@ -1,0 +1,468 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"image/color"
+	"io"
+	"net"
+	"os"
+	"strconv"
+
+	"charm.land/lipgloss/v2"
+	"charm.land/lipgloss/v2/table"
+	"github.com/Gaurav-Gosain/tuios/internal/federation"
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
+	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"golang.org/x/term"
+)
+
+// The CLI half of federation: `tuios hosts`, the --all-hosts listings, and the
+// stdio-proxy subcommand the far side of every link runs.
+//
+// Everything here reads. Attaching and creating a session on a host is in
+// host_open.go, over a connection the daemon opens on the same link.
+
+// hostReport is one row of the list-hosts result.
+type hostReport struct {
+	Host          string `json:"host"`
+	Addr          string `json:"addr"`
+	Status        string `json:"status"`
+	Reason        string `json:"reason"`
+	Detail        string `json:"detail"`
+	DaemonVersion string `json:"daemon_version"`
+	Protocol      int    `json:"protocol"`
+	MinProtocol   int    `json:"min_protocol"`
+	Sessions      int    `json:"sessions"`
+	LastOK        int64  `json:"last_ok"`
+	LastTry       int64  `json:"last_try"`
+	Drops         int    `json:"drops"`
+	DropReason    string `json:"drop_reason"`
+	Stalls        int    `json:"stalls"`
+	Events        string `json:"events"`
+	EventsNote    string `json:"events_note"`
+	Queued        int    `json:"queued"`
+}
+
+// runListHosts prints the configured hosts and the state of each link.
+func runListHosts(jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Call("list-hosts", nil)
+	if err != nil {
+		return reportVerbError(explainVerbError("list-hosts", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(raw, jsonOutput)
+	}
+	return printHostList(os.Stdout, raw)
+}
+
+func printHostList(w io.Writer, raw json.RawMessage) error {
+	var res struct {
+		Hosts          []hostReport `json:"hosts"`
+		Total          int          `json:"total"`
+		ConfigProblems []string     `json:"config_problems"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	if len(res.Hosts) == 0 {
+		fmt.Fprintln(w, "No hosts are configured.")
+		fmt.Fprintln(w, "Add a machine with 'tuios hosts add NAME ADDRESS'.")
+		fmt.Fprintln(w, "The daemon opens the link at once. No restart is needed.")
+		printConfigProblems(w, res.ConfigProblems)
+		return nil
+	}
+
+	rows := make([][]string, 0, len(res.Hosts))
+	for _, h := range res.Hosts {
+		version := h.DaemonVersion
+		if version == "" {
+			version = "-"
+		}
+		protocol := "-"
+		if h.Protocol > 0 {
+			protocol = strconv.Itoa(h.Protocol)
+		}
+		sessions := "-"
+		if h.Status == string(federation.StatusUp) {
+			sessions = strconv.Itoa(h.Sessions)
+		}
+		rows = append(rows, []string{
+			h.Host,
+			h.Addr,
+			hostStatusWord(h.Status),
+			version,
+			protocol,
+			sessions,
+			formatTimeAgo(h.LastOK),
+		})
+	}
+
+	t := table.New().
+		Border(lipgloss.RoundedBorder()).
+		BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("8"))).
+		Headers("HOST", "ADDRESS", "STATUS", "VERSION", "PROTO", "SESSIONS", "LAST OK").
+		Rows(rows...).
+		StyleFunc(func(row, col int) lipgloss.Style {
+			base := lipgloss.NewStyle().Padding(0, 1)
+			if row == table.HeaderRow {
+				return base.Bold(true).Foreground(lipgloss.Color("12"))
+			}
+			switch col {
+			case 0:
+				return base.Foreground(lipgloss.Color("3")).Bold(true)
+			case 2:
+				return base.Foreground(hostStatusColor(res.Hosts[row].Status))
+			case 1, 3, 4:
+				return base.Foreground(lipgloss.Color("8"))
+			default:
+				return base
+			}
+		})
+	lipgloss.Fprintln(w, t.Render())
+	fmt.Fprintf(w, "\n%s. Attach a session on a host with 'tuios attach --host NAME SESSION'.\n", plural.Count(res.Total, "host"))
+
+	// The reason a host is not usable is the only thing the table cannot say in
+	// a column, so it goes below, one line per host that has one.
+	for _, h := range res.Hosts {
+		if h.Status == string(federation.StatusUp) || h.Reason == "" {
+			continue
+		}
+		fmt.Fprintf(w, "%s: %s\n", h.Host, h.Reason)
+		if h.Detail != "" {
+			// The detail comes from ssh or from the other machine. It is
+			// labelled so a reader cannot mistake it for something tuios said.
+			fmt.Fprintf(w, "  the link reported: %s\n", h.Detail)
+		}
+		if h.Status == string(federation.StatusNoBinary) {
+			fmt.Fprintf(w, "  Run 'tuios hosts test %s' to see where the link looked.\n", h.Host)
+		}
+		if h.Status == string(federation.StatusApproval) {
+			fmt.Fprintf(w, "  Run 'tuios hosts signin %s' to open the sign-in page.\n", h.Host)
+		}
+	}
+
+	// A link that keeps dropping and coming back reports "up" every time it is
+	// asked, so the count is the only place a person can see it happening.
+	for _, h := range res.Hosts {
+		if h.Drops == 0 && h.Stalls == 0 {
+			continue
+		}
+		if h.Drops > 0 {
+			fmt.Fprintf(w, "%s: the link dropped %s. %s\n", h.Host, timesWord(h.Drops), h.DropReason)
+		}
+		if h.Stalls > 0 {
+			fmt.Fprintf(w, "%s: a stream stopped being read %s. The link stayed up.\n", h.Host, timesWord(h.Stalls))
+		}
+	}
+
+	// A host the daemon cannot stream is polled, and what waits there is not
+	// in the Inbox. That is version skew, and the note says what to update.
+	for _, h := range res.Hosts {
+		if h.Events != "polling" {
+			continue
+		}
+		note := h.EventsNote
+		if note == "" {
+			note = "Its agents are polled rather than streamed."
+		}
+		fmt.Fprintf(w, "%s: %s\n", h.Host, note)
+	}
+	// Mail kept here for a machine whose link is down goes when it is back.
+	for _, h := range res.Hosts {
+		if h.Queued > 0 {
+			fmt.Fprintf(w, "%s: %s here for the link. The Inbox shows %s; dismissing the item there discards %s.\n", h.Host, plural.Count(h.Queued, "message")+" "+plural.Word(h.Queued, "waits", "wait"), plural.Word(h.Queued, "it", "them"), plural.Word(h.Queued, "it", "them"))
+		}
+	}
+	printConfigProblems(w, res.ConfigProblems)
+	return nil
+}
+
+func printConfigProblems(w io.Writer, problems []string) {
+	for _, p := range problems {
+		fmt.Fprintf(w, "config: %s\n", p)
+	}
+}
+
+func hostStatusColor(status string) color.Color {
+	switch federation.Status(status) {
+	case federation.StatusUp:
+		return lipgloss.Color("2")
+	case federation.StatusUnreachable:
+		return lipgloss.Color("1")
+	case federation.StatusIncompatible, federation.StatusNoBinary, federation.StatusReconnecting, federation.StatusApproval:
+		return lipgloss.Color("3")
+	default:
+		return lipgloss.Color("8")
+	}
+}
+
+// hostSessionsEntry is one host's slice of an aggregated session listing.
+type hostSessionsEntry struct {
+	Host   string `json:"host"`
+	Status string `json:"status"`
+	Reason string `json:"reason"`
+	Error  string `json:"error"`
+	// Stale says the host did not answer and the sessions are the last ones
+	// it gave, at FetchedAt (unix seconds).
+	Stale     bool  `json:"stale"`
+	FetchedAt int64 `json:"fetched_at"`
+	Sessions  []struct {
+		Name        string `json:"name"`
+		DisplayName string `json:"display_name"`
+		WindowCount int    `json:"window_count"`
+		Attached    bool   `json:"attached"`
+		Restored    bool   `json:"restored"`
+		LastActive  int64  `json:"last_active"`
+		Created     int64  `json:"created"`
+	} `json:"sessions"`
+}
+
+// runListSessionsAllHosts is `tuios ls --all-hosts`. One dead host costs its own
+// row and nothing else.
+func runListSessionsAllHosts(host string, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	params := map[string]any{}
+	if host != "" {
+		params["host"] = host
+	}
+	raw, err := client.Call("list-host-sessions", params)
+	if err != nil {
+		return reportVerbError(explainVerbError("list-host-sessions", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(markHostRows(raw), jsonOutput)
+	}
+
+	var res struct {
+		Hosts []hostSessionsEntry `json:"hosts"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	total, reachable := 0, 0
+	for _, h := range res.Hosts {
+		if h.Error != "" {
+			fmt.Printf("%s: %s\n", h.Host, hostTrouble(h.Status, h.Reason))
+			if !h.Stale || len(h.Sessions) == 0 {
+				fmt.Println()
+				continue
+			}
+			// The rows it gave last, said as such: nobody can check them now.
+			fmt.Printf("  As of %s, when it last answered:\n", formatTimeAgo(h.FetchedAt))
+		} else {
+			reachable++
+			fmt.Printf("%s\n", h.Host)
+		}
+		if len(h.Sessions) == 0 {
+			fmt.Println("  No sessions.")
+			fmt.Println()
+			continue
+		}
+		rows := make([][]string, 0, len(h.Sessions))
+		for _, s := range h.Sessions {
+			if !h.Stale {
+				total++
+			}
+			status := "detached"
+			if s.Attached {
+				status = "attached"
+			}
+			if s.Restored {
+				status = session.RestoredTag
+			}
+			name := s.Name
+			if s.DisplayName != "" {
+				name = s.DisplayName
+			}
+			rows = append(rows, []string{
+				name,
+				strconv.Itoa(s.WindowCount),
+				status,
+				formatTimeAgo(s.Created),
+				formatTimeAgo(s.LastActive),
+			})
+		}
+		fmt.Println(renderSessionTable(rows))
+		fmt.Println()
+	}
+	fmt.Printf("%s on %s.\n", plural.Count(total, "session"), plural.Count(reachable, "host"))
+	return nil
+}
+
+// hostAgentsEntry is one host's slice of an aggregated agent listing.
+type hostAgentsEntry struct {
+	Host    string `json:"host"`
+	Status  string `json:"status"`
+	Reason  string `json:"reason"`
+	Error   string `json:"error"`
+	Session string `json:"session"`
+	// Stale says the host did not answer and the rows are the last ones it
+	// gave, at FetchedAt (unix seconds).
+	Stale     bool  `json:"stale"`
+	FetchedAt int64 `json:"fetched_at"`
+	Agents    []struct {
+		// Session is the row's own session. Every session on a host is
+		// listed, so a row says which one it is in.
+		Session   string `json:"session"`
+		WindowID  string `json:"window_id"`
+		Name      string `json:"name"`
+		State     string `json:"state"`
+		Message   string `json:"message"`
+		HarnessID string `json:"harness_id"`
+		Unread    int    `json:"unread"`
+	} `json:"agents"`
+}
+
+// runListAgentsAllHosts is `tuios list-agents --all-hosts`.
+func runListAgentsAllHosts(host string, all bool, selector string, jsonOutput bool) error {
+	client, err := dialVerb()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = client.Close() }()
+
+	params := map[string]any{"all": all}
+	if host != "" {
+		params["host"] = host
+	}
+	if selector != "" {
+		params["select"] = selector
+	}
+	raw, err := client.Call("list-host-agents", params)
+	if err != nil {
+		return reportVerbError(explainVerbError("list-host-agents", err), jsonOutput)
+	}
+	if jsonOutput {
+		return printVerbResult(markHostRows(raw), jsonOutput)
+	}
+
+	var res struct {
+		Hosts []hostAgentsEntry `json:"hosts"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	total := 0
+	for _, h := range res.Hosts {
+		if h.Error != "" {
+			fmt.Printf("%s: %s\n", h.Host, hostTrouble(h.Status, h.Reason))
+			if !h.Stale || len(h.Agents) == 0 {
+				fmt.Println()
+				continue
+			}
+			// The rows it gave last, said as such: nobody can check them now.
+			fmt.Printf("  As of %s, when it last answered:\n", formatTimeAgo(h.FetchedAt))
+		} else {
+			fmt.Println(h.Host)
+		}
+		if len(h.Agents) == 0 {
+			fmt.Println("  No agent panes.")
+			fmt.Println()
+			continue
+		}
+		rows := make([][]string, 0, len(h.Agents))
+		for _, a := range h.Agents {
+			if !h.Stale {
+				total++
+			}
+			unread := ""
+			if a.Unread > 0 {
+				unread = strconv.Itoa(a.Unread)
+			}
+			// Every name here was written on another machine.
+			rows = append(rows, []string{
+				plainLine(firstNonEmptyString(a.Session, h.Session)),
+				shortWindowID(a.WindowID),
+				plainLine(a.Name),
+				plainLine(a.State),
+				orNone(plainLine(a.HarnessID)),
+				unread,
+				plainLine(a.Message),
+			})
+		}
+		t := table.New().
+			Border(lipgloss.RoundedBorder()).
+			BorderStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("8"))).
+			Headers("SESSION", "ID", "NAME", "STATE", "HARNESS", "MAIL", "NOTE").
+			Rows(rows...).
+			StyleFunc(func(row, _ int) lipgloss.Style {
+				base := lipgloss.NewStyle().Padding(0, 1)
+				if row == table.HeaderRow {
+					return base.Bold(true).Foreground(lipgloss.Color("12"))
+				}
+				return base
+			})
+		lipgloss.Println(t.Render())
+		fmt.Println()
+	}
+	fmt.Printf("%s. A pane on another host is read only in this release.\n", plural.Count(total, "agent pane"))
+	return nil
+}
+
+// hostTrouble is the one line a host that did not answer gets.
+func hostTrouble(status, reason string) string {
+	if reason == "" {
+		return status
+	}
+	return status + ". " + reason
+}
+
+// stdioProxyAs is stdio-proxy's --as flag.
+var stdioProxyAs string
+
+// runStdioProxy is the far side of a link.
+//
+// It connects the link framing on stdin and stdout to this machine's daemon
+// socket. It is meant to be run by the hub over ssh, never by hand, so it is
+// hidden. It refuses to run on a terminal: frames written to a tty would be
+// interpreted as escape sequences by whatever is watching.
+//
+// It does not start a daemon. Starting one restores that machine's saved
+// sessions, which is a change to remote state nobody on that machine asked
+// for. A machine with no daemon running is reported as such by 'tuios hosts'.
+//
+// pinnedPeer is the --as flag: the name this machine's link policy is resolved
+// for, whatever the hub says it is called. Set in a forced command in
+// authorized_keys, it is the one name the hub cannot choose. See
+// session.DialForLink.
+func runStdioProxy(pinnedPeer string) error {
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		return fmt.Errorf("stdio-proxy is not meant to be run by hand. " +
+			"The tuios daemon runs it over ssh to read another machine's listings")
+	}
+	if pinnedPeer != "" {
+		if err := session.ValidLinkPeerName(pinnedPeer); err != nil {
+			return err
+		}
+	}
+	socketPath, err := session.GetSocketPath()
+	if err != nil {
+		return err
+	}
+	return federation.ServeProxyFor(os.Stdin, os.Stdout, func(open federation.StreamOpen) (net.Conn, error) {
+		return session.DialForLink(socketPath, open, pinnedPeer)
+	})
+}
+
+// timesWord counts events in words, so a report reads as a sentence.
+func timesWord(n int) string {
+	if n == 1 {
+		return "once"
+	}
+	return strconv.Itoa(n) + " times"
+}
