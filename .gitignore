@@ -1,0 +1,8 @@
+.k3dev/
+__pycache__/
+.venv/
+node_modules/
+dist/
+*.pyc
+.pytest_cache/
+.ruff_cache/
