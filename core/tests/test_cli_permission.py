@@ -92,3 +92,17 @@ def test_unknown_config_permission_fails_the_repl_path_too(tmp_path, monkeypatch
     res = invoke(tmp_path, monkeypatch, PROV + "permission_mode: bypass\n", prompt=False)
     assert_usage_error(res, "permission_mode 'bypass' is not one of: ask, auto-edit, yolo "
                             "(set in config.yaml or K3CODE_PERMISSION_MODE)")
+
+
+def test_group_entry_applies_config_permission_mode(tmp_path, monkeypatch, seen):
+    """Plain `k3code -p` goes through the click group, which forwards to main with ctx.invoke. Its --permission
+    default must not shadow the configured mode (testing main alone missed a group default of "ask")."""
+    run(tmp_path, monkeypatch, PROV + "permission_mode: yolo\n", command=cli_mod.cli)
+    assert seen == ["yolo"]
+
+
+def test_group_entry_headless_permission_and_flag(tmp_path, monkeypatch, seen):
+    cfg = PROV + "permission_mode: ask\nheadless_permission: auto-edit\n"
+    run(tmp_path, monkeypatch, cfg, command=cli_mod.cli)
+    run(tmp_path, monkeypatch, cfg, "--permission", "yolo", command=cli_mod.cli)
+    assert seen == ["accept-edits", "yolo"]
