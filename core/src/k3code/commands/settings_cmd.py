@@ -95,7 +95,7 @@ class FocusCommand(CommandDef):
     """Gateway twin of the TUI's /focus: shows in /help and toggles ``display.focus`` (``config.set``)."""
 
     def __init__(self) -> None:
-        super().__init__(name="focus", help="Toggle focus mode (prompts, questions, errors, final answers) [on|off|status]")
+        super().__init__(name="focus", help="Toggle focus mode: only prompts, errors, final answers [on|off|status]")
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         mode = arg.strip().lower()
