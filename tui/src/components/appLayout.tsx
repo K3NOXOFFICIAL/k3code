@@ -23,7 +23,9 @@ import { composerPromptText } from '../lib/prompt.js'
 import { ActiveWidgetSlot, AmbientDock, AmbientRail, useAmbientRailWidth } from '../sdk/host.js'
 
 import { AgentsOverlay } from './agentsOverlay.js'
-import { LiveAgentsPanel } from './agentsPanel.js'
+import { AgentStrip } from '../k3/agentStrip.js'
+import { $stripNav } from '../k3/agentStripStore.js'
+import { focusVisibleMessages } from '../k3/focusPolicy.js'
 import { GoodVibesHeart, StatusRule, StickyPromptTracker, TranscriptScrollbar } from './appChrome.js'
 import { FloatingOverlays, PromptZone } from './appOverlays.js'
 import { Banner, Panel, SessionPanel } from './branding.js'
@@ -96,6 +98,12 @@ const TranscriptPane = memo(function TranscriptPane({
     [transcript.historyItems]
   )
 
+  // Focus mode: only user msgs, final answers, errors/warnings; everything else collapses to nothing.
+  const focusKeep = useMemo(
+    () => (ui.focusView ? focusVisibleMessages(transcript.historyItems) : null),
+    [ui.focusView, transcript.historyItems]
+  )
+
   const clearBlankSelection = (e: { cellIsBlank?: boolean }) => {
     if (e.cellIsBlank) {
       actions.clearSelection()
@@ -114,7 +122,7 @@ const TranscriptPane = memo(function TranscriptPane({
             </Box>
           )}
 
-          {row.msg.kind === 'intro' ? (
+          {focusKeep && !focusKeep[row.index] ? null : row.msg.kind === 'intro' ? (
             nativeMode ? null : (
               <Box flexDirection="column" paddingTop={1}>
                 <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
@@ -149,7 +157,7 @@ const TranscriptPane = memo(function TranscriptPane({
             />
           )}
 
-          {row.index === lastUserIdx && <LiveTodoPanel />}
+          {row.index === lastUserIdx && !focusKeep && <LiveTodoPanel />}
         </Box>
       ))}
 
@@ -162,7 +170,7 @@ const TranscriptPane = memo(function TranscriptPane({
         detailsModeCommandOverride={ui.detailsModeCommandOverride}
         prevMsg={transcript.historyItems[transcript.historyItems.length - 1]}
         progress={progress}
-        sections={ui.sections}
+        sections={ui.focusView ? { activity: 'hidden', subagents: 'hidden', thinking: 'hidden', tools: 'hidden' } : ui.sections}
       />
 
     </Box>
@@ -217,6 +225,7 @@ const ComposerPane = memo(function ComposerPane({
 }) {
   const ui = useStore($uiState)
   const isBlocked = useStore($isBlocked)
+  const stripNav = useStore($stripNav)
   const sh = (composer.inputBuf[0] ?? composer.input).startsWith('!')
 
   const promptText = composerPromptText(
@@ -316,7 +325,6 @@ const ComposerPane = memo(function ComposerPane({
       )}
 
       <GoalBar cols={Math.max(1, composer.cols - 2)} />
-      <LiveAgentsPanel cols={Math.max(1, composer.cols - 2)} />
       <StatusRulePane at="top" composer={composer} nativeMode={nativeMode} status={status} />
       <AmbientDock placement="dock-top" />
 
@@ -365,6 +373,7 @@ const ComposerPane = memo(function ComposerPane({
               <Box flexGrow={0} flexShrink={0} height={inputHeight} width={inputColumns}>
                 {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
                 <TextInput
+                  focus={!stripNav.focused}
                   accentColor={ui.theme.color.accent}
                   color={ui.theme.color.text}
                   columns={inputColumns}
@@ -397,6 +406,8 @@ const ComposerPane = memo(function ComposerPane({
       {nativeMode && composer.input === '?' && !composer.inputBuf.length && <HelpHint nativeMode t={ui.theme} />}
 
       {!composer.empty && !ui.sid && <Text color={ui.theme.color.muted}>☤ {ui.status}</Text>}
+
+      {!isBlocked && <AgentStrip cols={Math.max(1, composer.cols - 2)} />}
 
       <AmbientDock placement="dock-bottom" />
       <StatusRulePane at="bottom" composer={composer} nativeMode={nativeMode} status={status} />

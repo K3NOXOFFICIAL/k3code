@@ -1,6 +1,8 @@
 import { getUiState, patchUiState } from '../app/uiStore.js'
 import type { GatewayEvent } from '@k3code/shared/gateway-events'
 
+import type { Msg } from '../types.js'
+
 /** Event importance levels — events may carry this field to override type-based defaults. */
 export type Importance = 'essential' | 'progress' | 'debug'
 
@@ -163,4 +165,51 @@ export async function initFocusMode(gateway?: { rpc: (method: string, params: an
   } catch {
     // Config not available - keep default (false)
   }
+}
+
+const NEEDS_ATTENTION = /^\s*(error|warn(ing)?|failed|✗|⚠)/i
+
+/**
+ * Which transcript messages survive focus mode. Pure: input is the whole list so the
+ * "final assistant answer of each turn" (last assistant text before the next user msg)
+ * can be picked out; earlier assistant text in a turn is interim chatter.
+ * An explicit `importance` on the message wins.
+ */
+export function focusVisibleMessages(msgs: readonly Msg[]): boolean[] {
+  const keep = msgs.map(() => false)
+  let lastAssistant = -1
+
+  const flush = () => {
+    if (lastAssistant >= 0) {
+      keep[lastAssistant] = true
+    }
+
+    lastAssistant = -1
+  }
+
+  msgs.forEach((m, i) => {
+    const importance = (m as Msg & { importance?: Importance }).importance
+
+    if (importance) {
+      keep[i] = importance === 'essential'
+
+      return
+    }
+
+    if (m.role === 'user') {
+      flush()
+      keep[i] = true
+    } else if (m.role === 'assistant' && m.kind === undefined && m.text.trim()) {
+      lastAssistant = i
+    } else if (m.role === 'system' && (NEEDS_ATTENTION.test(m.text) || m.kind === 'slash' || m.kind === 'panel')) {
+      // errors/warnings, and output the user explicitly asked for (slash/panel)
+      keep[i] = true
+    } else if (m.kind === 'intro') {
+      keep[i] = true
+    }
+  })
+
+  flush()
+
+  return keep
 }

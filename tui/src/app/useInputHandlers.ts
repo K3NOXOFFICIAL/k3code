@@ -11,6 +11,16 @@ import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionW
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
 import { closeWidget, dispatchWidgetInput } from '../sdk/host.js'
 
+import { toggleFocusMode } from '../k3/focusPolicy.js'
+import {
+  $stripNav,
+  $stripRows,
+  getStripHandlers,
+  IDLE_NAV,
+  reduceStripKey,
+  shouldEnterStrip
+} from '../k3/agentStripStore.js'
+
 import { $agentDockCollapsed } from './agentRoster.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import {
@@ -302,7 +312,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
   useInput((ch, key, event) => {
     const live = getUiState()
 
-    if (key.escape) {
+    if (key.escape && !$stripNav.get().focused) {
       const now = Date.now()
       const isDouble = now - lastEscRef.current <= DOUBLE_ESC_MS
 
@@ -491,6 +501,49 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     if (key.escape && terminal.hasSelection) {
       return clearSelection()
     }
+
+    // Agent strip (below the composer). Precedence: a focused strip owns ↑/↓/Enter/Esc/x;
+    // ↓ enters it only from an empty input with no history cycle in progress.
+    const strip = $stripNav.get()
+
+    if (strip.focused) {
+      const r = reduceStripKey(strip, $stripRows.get(), {
+        ch,
+        down: key.downArrow,
+        escape: key.escape,
+        return: key.return,
+        up: key.upArrow
+      })
+
+      if (r.consumed) {
+        $stripNav.set(r.nav)
+
+        if (r.effect) {
+          getStripHandlers()?.[r.effect.type]?.(r.effect.row)
+        }
+
+        return
+      }
+    } else if (
+      key.downArrow &&
+      !key.shift &&
+      shouldEnterStrip({ historyIdx: cState.historyIdx, input: cState.input, rows: $stripRows.get().length }) &&
+      !cState.inputBuf.length &&
+      cState.queueEditIdx === null
+    ) {
+      $stripNav.set({ ...IDLE_NAV, focused: true })
+
+      return
+    }
+
+    if (isCtrl(key, ch, 'f') && !key.meta && !key.shift) {
+      void toggleFocusMode({ rpc: (method, params) => gateway.gw.request(method, params) })
+
+      return
+    }
+
+    // TODO(M2): Ctrl+B should background a running foreground turn (/bg semantics); the gateway
+    // contract has no foreground→background handoff yet (only prompt.background for new tasks).
 
     if (key.upArrow && !cState.inputBuf.length) {
       const inputSel = getInputSelection()

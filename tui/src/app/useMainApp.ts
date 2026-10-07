@@ -49,6 +49,8 @@ import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
 import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
+import { $stripSessions, setStripHandlers } from '../k3/agentStripStore.js'
+
 import { applyAgentSnapshot } from './agentRoster.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createServerRequestHandler } from './createServerRequestHandler.js'
@@ -647,6 +649,8 @@ export function useMainApp(gw: GatewayClient) {
           if (!stopped && result?.sessions) {
             const liveSessionCount = result.sessions.length
 
+            $stripSessions.set(result.sessions)
+
             // Surface the current session's (auto-)title for the terminal
             // titlebar. The active_list poll already carries it, so no extra
             // round-trip is needed.
@@ -676,6 +680,28 @@ export function useMainApp(gw: GatewayClient) {
       clearInterval(timer)
     }
   }, [gw, ui.sid])
+
+  // Agent strip actions: Enter attaches a background session, `x` stops a row.
+  useEffect(() => {
+    setStripHandlers({
+      activate: row => {
+        if (row.kind === 'session') {
+          session.activateLiveSession(row.id)
+        }
+      },
+      stop: row => {
+        const sid = getUiState().sid
+
+        if (row.kind === 'agent') {
+          gw.request('subagent.interrupt', { session_id: sid, subagent_id: row.id }).catch(() => {})
+        } else {
+          gw.request('session.interrupt', { session_id: row.id }).catch(() => {})
+        }
+      }
+    })
+
+    return () => setStripHandlers(null)
+  }, [gw, session.activateLiveSession])
 
   // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
   // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.

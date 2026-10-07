@@ -568,7 +568,7 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    help: 'toggle focus view — show only your prompt and the final response [on|off|status]',
+    help: 'toggle focus mode (Ctrl+F) — show only prompts, questions, errors and final answers [on|off|status]',
     name: 'focus',
     run: (arg, ctx) => {
       const mode = arg.trim().toLowerCase()
