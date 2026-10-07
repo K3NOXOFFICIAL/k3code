@@ -50,6 +50,9 @@ class Tui:
         (home / "h").mkdir(parents=True, exist_ok=True)
         # keep uv/cargo caches working with the fake HOME
         e["UV_CACHE_DIR"] = os.environ.get("UV_CACHE_DIR", str(Path(os.environ["HOME"]) / ".cache" / "uv"))
+        # script=False means a live session: never inherit a fake-provider setting (m4's test shim sets
+        # K3CODE_FAKE_PROVIDER in the process environment, which would silently turn a "live" row into a fake one).
+        e.pop("K3CODE_FAKE_PROVIDER", None)
         if script:
             e["K3CODE_FAKE_PROVIDER"] = str(home / "fake.json")
         e.update(env or {})

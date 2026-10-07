@@ -1,4 +1,4 @@
-"""The claude-cli provider: stateless `claude -p` per turn, built-in tools off, schema-shaped reply.
+"""The claude-cli provider: stateless `claude -p` per turn, built-in tools off, plain text + a final tool block.
 
 A shim script stands in for the `claude` binary: it records its argv, stdin, cwd and a few env
 variables, then prints a canned CLI JSON result chosen by the SHIM_MODE variable.
@@ -20,7 +20,7 @@ from k3code.config import ProviderEntry
 from k3code.doctor import check_keys
 from k3code.providers import ClaudeCliProvider, make_providers
 from k3code.providers.base import ProviderError
-from k3code.providers.claude_cli import output_schema, render_prompt
+from k3code.providers.claude_cli import render_prompt
 from k3code.providers.types import Message, ToolCall, ToolSpec
 
 SHIM = r"""#!{python}
@@ -38,13 +38,18 @@ with open(log, "w") as fh:
     }}, fh)
 mode = os.environ.get("SHIM_MODE", "text")
 usage = {{"input_tokens": 3, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50, "output_tokens": 7}}
-if mode == "text":
-    print(json.dumps({{"is_error": False, "usage": usage, "structured_output": {{"text": "hello", "tool_calls": []}}}}))
-elif mode == "tool":
-    print(json.dumps({{"is_error": False, "usage": usage, "structured_output": {{"text": "", "tool_calls": [
-        {{"name": "read_file", "arguments": {{"path": "a.py"}}}}, {{"name": "nope", "arguments": {{}}}}]}}}}))
-elif mode == "plain":
-    print(json.dumps({{"is_error": False, "usage": usage, "result": "just words"}}))
+CALLS = '[{{"name": "read_file", "arguments": {{"path": "a.py"}}}}, {{"name": "nope", "arguments": {{}}}}]'
+replies = {{
+    "text": "hello",
+    "long": "line one\n```\n[ todo ]\n```\nRisks:\n- a\n- b\n- c",
+    "tool": "Let me read it.\n<tool_calls>" + CALLS + "</tool_calls>",
+    "fenced": "<tool_calls>\n```json\n" + CALLS + "\n```\n</tool_calls>",
+    "twice": "<tool_calls>[]</tool_calls> oops <tool_calls>" + CALLS + "</tool_calls>",
+    "bad": "<tool_calls>[{{not json</tool_calls>",
+    "cut": "start <tool_calls>[{{\"name\": \"read_file\"",
+}}
+if mode in replies:
+    print(json.dumps({{"is_error": False, "usage": usage, "result": replies[mode]}}))
 elif mode == "login":
     print(json.dumps({{"is_error": True, "result": "Not logged in · Please run /login"}})); sys.exit(1)
 elif mode == "limit":
@@ -105,18 +110,40 @@ async def test_tool_calls_become_k3code_tool_calls(shim: Path, monkeypatch: pyte
     monkeypatch.setenv("SHIM_MODE", "tool")
     p = ClaudeCliProvider(name="cc", command=str(shim))
     events = await _collect(p, [Message(role="user", content="read a.py")])
+    assert [e.type for e in events] == ["text_delta", "tool_call", "tool_call", "done"]
+    assert events[0].text == "Let me read it."  # prose kept, the block removed
     calls = [e.tool_call for e in events if e.type == "tool_call"]
-    assert [(c.name, c.arguments) for c in calls] == [("read_file", {"path": "a.py"})]  # unknown tool "nope" dropped
-    assert calls[0].id.startswith("call_")
+    # an unknown name ("nope") is passed on: the agent loop answers "Unknown tool" and the model corrects itself
+    assert [(c.name, c.arguments) for c in calls] == [("read_file", {"path": "a.py"}), ("nope", {})]
+    assert calls[0].id.startswith("call_") and calls[0].id != calls[1].id
     assert events[-1].message.tool_calls[0].id == calls[0].id
     await p.aclose()
 
 
-async def test_plain_text_fallback(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SHIM_MODE", "plain")
+@pytest.mark.parametrize("mode", ["fenced", "twice"])
+async def test_tolerant_block_forms(shim: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    monkeypatch.setenv("SHIM_MODE", mode)  # fenced JSON inside the block; two blocks -> the last one wins
     p = ClaudeCliProvider(name="cc", command=str(shim))
     events = await _collect(p, [Message(role="user", content="x")])
-    assert events[0].text == "just words"
+    assert [e.tool_call.name for e in events if e.type == "tool_call"] == ["read_file", "nope"]
+    await p.aclose()
+
+
+async def test_long_reply_is_returned_whole_without_tools(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHIM_MODE", "long")  # /preview-style answer: nothing may be lost or summarised
+    p = ClaudeCliProvider(name="cc", command=str(shim))
+    events = await _collect(p, [Message(role="user", content="x")], tools=[])
+    assert events[0].text.endswith("- c") and "[ todo ]" in events[0].text
+    await p.aclose()
+
+
+@pytest.mark.parametrize("mode", ["bad", "cut"])
+async def test_malformed_tool_block_is_a_provider_error(shim: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    monkeypatch.setenv("SHIM_MODE", mode)
+    p = ClaudeCliProvider(name="cc", command=str(shim))
+    with pytest.raises(ProviderError) as ei:
+        await _collect(p, [Message(role="user", content="x")])
+    assert ei.value.status_code == 502 and "tool_calls" in ei.value.message
     await p.aclose()
 
 
@@ -136,8 +163,7 @@ async def test_isolation_flags_env_and_cwd(shim: Path, tmp_path: Path, monkeypat
     for flag in ("-p", "--no-session-persistence", "--strict-mcp-config", "--disable-slash-commands"):
         assert flag in argv
     assert argv[argv.index("--setting-sources") + 1] == "project"
-    schema = json.loads(argv[argv.index("--json-schema") + 1])
-    assert schema["required"] == ["text", "tool_calls"]
+    assert "--json-schema" not in argv  # plain-text protocol: one model turn per call
     assert seen["system"] == "SYS RULES"
     assert seen["env"]["ANTHROPIC_BASE_URL"] is None and seen["env"]["ANTHROPIC_AUTH_TOKEN"] is None
     assert seen["env"]["OMNIROUTE_API_KEY"] is None
@@ -165,10 +191,11 @@ async def test_prompt_carries_tools_history_and_tool_results(shim: Path, tmp_pat
     await p.aclose()
 
 
-def test_no_tools_schema_is_text_only() -> None:
-    assert output_schema([])["required"] == ["text"]
+def test_no_tools_prompt_has_no_tool_protocol() -> None:
     system, prompt = render_prompt([Message(role="system", content="S"), Message(role="user", content="u")], [])
-    assert system == "S" and "Tools you can call" not in prompt
+    assert system == "S" and "Tools you can call" not in prompt and "<tool_calls>" not in prompt
+    _, with_tools = render_prompt([Message(role="user", content="u")], TOOLS)
+    assert "<tool_calls>" in with_tools and "Tools you can call" in with_tools
 
 
 @pytest.mark.parametrize(

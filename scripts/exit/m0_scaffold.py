@@ -13,7 +13,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import chaoslib as cl  # noqa: E402
-from lib import REPO, emit, omniroute_quota, run  # noqa: E402
+from lib import REPO, emit, live_backend, live_providers_yaml, run, tail  # noqa: E402
 
 M = "M0"
 START = float(os.environ.get("EXIT_RUN_START") or time.time())
@@ -57,24 +57,26 @@ def headless_fake() -> None:
 
 def headless_live() -> None:
     crit = "k3code finishes a read/edit/bash task through OmniRoute (live model)"
-    ok, detail = omniroute_quota()
-    if not ok:
-        emit(M, crit, "live `k3code -p` through OmniRoute", "PENDING", f"OmniRoute unusable now: {detail}",
-             "After the OmniRoute daily quota resets (see Retry-After above), rerun `scripts/exit/run_all.sh --only m0`")
+    backend = live_backend()
+    if not backend["ok"]:
+        emit(M, crit, f"live `k3code -p`; {backend['label']}", "PENDING", f"live model unavailable: {backend['detail']}",
+             "Log in to Claude Code (`claude`), or set K3_ALLOW_OMNIROUTE=1 with a working OmniRoute key; "
+             "then rerun `scripts/exit/run_all.sh --only m0`")
         return
     home, proj = TMP / "live-home", TMP / "live-proj"
     home.mkdir(parents=True)
     proj.mkdir(parents=True)
     (proj / "app.py").write_text('def greet():\n    return "hello"\n\nprint(greet())\n')
     (home / "config.yaml").write_text(
-        'providers:\n  - {name: omniroute, kind: openai, base_url: "http://<omniroute-host>:20128/v1", '
-        "api_key_env: OMNIROUTE_API_KEY, models: {default: [auto/coding-manual, auto/best-coding], "
-        "cheap: auto/coding-cheap}}\n")
-    rc, out = run([K3, "-p", "Read app.py, edit greet() to return 'hello, k3', then run it with bash and "
-                   "tell me the output.", "--permission", "yolo"], cwd=proj, env=base_env(home), timeout=300)
-    done = rc == 0 and "hello, k3" in (proj / "app.py").read_text()
-    emit(M, crit, "`k3code -p` live via OmniRoute auto/coding-* in a temp project", "PASS" if done else "FAIL",
-         f"rc={rc} app.py={(proj / 'app.py').read_text()!r}\n{out}")
+        live_providers_yaml(backend, ["auto/coding-manual", "auto/best-coding"], "auto/coding-cheap"))
+    rc, out = run([K3, "-p", "Read app.py, edit greet() to return 'hello, k3', then run it with bash as "
+                   "`python3 app.py > out.txt` and tell me the output.", "--permission", "yolo"],
+                  cwd=proj, env=base_env(home), timeout=420)
+    out_txt = (proj / "out.txt").read_text() if (proj / "out.txt").exists() else "MISSING"
+    done = rc == 0 and "hello, k3" in (proj / "app.py").read_text() and "hello, k3" in out_txt
+    emit(M, crit, f"`k3code -p` in a temp project (read + edit + bash); {backend['label']}; asserts app.py edited and "
+         "out.txt written by the bash step", "PASS" if done else "FAIL",
+         f"{tail(out, 3)}\nrc={rc} app.py={(proj / 'app.py').read_text()!r} out.txt={out_txt!r}")
 
 
 def failover() -> None:
@@ -127,6 +129,8 @@ def hermes_untouched() -> None:
 
 
 for fn in (headless_fake, headless_live, failover, vendor, hermes_untouched):
+    if sys.argv[1:] and fn.__name__ not in sys.argv[1:]:  # `m0_scaffold.py headless_live` runs one row
+        continue
     try:
         fn()
     except Exception as e:  # noqa: BLE001

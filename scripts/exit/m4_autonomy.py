@@ -37,8 +37,9 @@ M = "M4"
 TMP = Path(tempfile.mkdtemp(prefix="exit-m4-"))
 os.environ["K3CODE_HOME"] = str(TMP / "home")  # never touch the real home
 os.environ.pop("K3CODE_FAKE_PROVIDER", None)
-LIVE_OK, LIVE_DETAIL = lib.omniroute_quota()  # one probe call, shared by every live row
-RESET = "after the OmniRoute daily quota resets (2026-10-08T03:00Z per the 429 response)"
+BACKEND = lib.live_backend()  # Claude Code login by default (OmniRoute paused by owner); shared by every live row
+LIVE_OK, LIVE_DETAIL = BACKEND["ok"], BACKEND["detail"]
+RESET = "once a live model is available (Claude Code login, or K3_ALLOW_OMNIROUTE=1 with a working key)"
 
 
 def safe(name: str, fn):
@@ -73,27 +74,38 @@ def scope_eval() -> None:
              f"eval set written and validated (30 rows, label dist {dist}); live classifier not run: {LIVE_DETAIL}",
              f"the owner confirms/edits the labels in scope_eval.jsonl, then re-run scripts/exit/m4_autonomy.py {RESET}")
         return
-    key = os.environ["OMNIROUTE_API_KEY"]
     summary = repo_summary(REPO)
-    hit, misses = 0, []
+    hit, misses, errors = 0, [], []
     for r in rows:
         msgs = classifier_messages(r["prompt"], summary, "")
-        body = {"model": "auto/coding-cheap", "max_tokens": 400,
-                "messages": [{"role": m.role, "content": m.content} for m in msgs]}
-        req = urllib.request.Request("http://<omniroute-host>:20128/v1/chat/completions", data=json.dumps(body).encode(),
-                                     headers={"Authorization": f"Bearer {key}", "content-type": "application/json"})
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            text = json.load(resp)["choices"][0]["message"]["content"]
+        try:
+            text = lib.live_chat(BACKEND, [{"role": m.role, "content": m.content} for m in msgs])
+        except Exception as e:  # noqa: BLE001 - a provider error must not abort the other 29 rows
+            errors.append(f"#{r['id']} {type(e).__name__}: {str(e)[:80]}")
+            continue
         v = parse_verdict(text)
         v = apply_floor(v, r["prompt"]) if v else None
         if v and v.scope == r["scope"]:
             hit += 1
         else:
             misses.append(f"#{r['id']} want {r['scope']} got {v.scope if v else 'unparsed'}")
-    pct = 100 * hit / len(rows)
-    emit(M, crit, how + " (live, auto/coding-cheap)", "PASS" if pct >= 80 else "FAIL",
-         f"agreement {hit}/30 = {pct:.0f}% (target >=80%); labels are proposed-by-claude, the owner must confirm. "
-         f"misses: {'; '.join(misses)}")
+    scored = len(rows) - len(errors)
+    pct = 100 * hit / max(scored, 1)
+    ev = (f"agreement {hit}/{scored} = {pct:.0f}% (target >=80%); misses: {'; '.join(misses) or 'none'}"
+          + (f"; provider errors on {len(errors)} rows: {'; '.join(errors[:3])}" if errors else ""))
+    how_live = f"{how} (live: {BACKEND['label']})"
+    if errors:
+        emit(M, crit, how_live, "PENDING", "incomplete live run: " + ev,
+             f"re-run scripts/exit/m4_autonomy.py {RESET}")
+    elif pct < 80:
+        emit(M, crit, how_live, "FAIL", ev)
+    else:
+        # The labels were proposed by Claude and a Claude classifier agreeing with them is circular until the owner
+        # confirms them, so a good score stays PENDING.
+        emit(M, crit, how_live, "PENDING",
+             ev + ". Provisional PASS: the labels in scope_eval.jsonl are proposed-by-claude and not yet confirmed.",
+             "the owner confirms/edits the 30 labels in scripts/exit/scope_eval.jsonl; then re-run "
+             "scripts/exit/m4_autonomy.py and this row counts")
 
 
 # ---------------------------------------------------------------- 2. HUGE fan-out
@@ -257,10 +269,26 @@ def preview() -> None:
         return time.monotonic() - t
 
     dt = asyncio.run(go())
-    emit(M, crit, how, "PENDING",
-         f"fake-provider /preview harness overhead {dt * 1000:.0f} ms (30 s hard timeout in preview.py); live not run: "
-         f"{LIVE_DETAIL[:160]}",
-         f"run `/preview a CLI todo app` against live OmniRoute fast tier and time it {RESET}")
+    overhead = f"fake-provider /preview harness overhead {dt * 1000:.0f} ms (30 s hard timeout in preview.py)"
+    if not LIVE_OK:
+        emit(M, crit, how, "PENDING", f"{overhead}; live not run: {LIVE_DETAIL[:160]}",
+             f"run `/preview a CLI todo app` against the live fast tier and time it {RESET}")
+        return
+    # The real-TUI timing needs pexpect + pyte, which this uv env lacks: run it as its own script.
+    rc, out = lib.run(["python3", str(HERE / "preview_live.py")], timeout=240)
+    try:
+        res = json.loads(out.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        emit(M, crit, how, "FAIL", f"{overhead}\npreview_live.py rc={rc}: {tail(out, 4)}")
+        return
+    if "skipped" in res:
+        emit(M, crit, how, "PENDING", f"{overhead}; live not run: {res['skipped']}",
+             f"run `/preview a CLI todo app` against the live fast tier and time it {RESET}")
+        return
+    status = "PASS" if res["ok"] and res["sketch"] and res["secs"] < 30 else "FAIL"
+    emit(M, crit, f"real TUI session, `/preview a CLI todo app` timed from Enter to the finished sketch; "
+         f"fast tier = {res['label']}", status,
+         f"{overhead}\n{res['tail']}\n/preview took {res['secs']} s (limit 30 s); sketch with Risks shown: {res['sketch']}")
 
 
 # ---------------------------------------------------------------- 6. /ultraresearch
@@ -381,10 +409,13 @@ def mcp_context() -> None:
 
 
 def main() -> None:
-    print(f"quota probe: {LIVE_OK} {LIVE_DETAIL[:120]}", file=sys.stderr)
+    print(f"live backend: {BACKEND['kind']} ok={LIVE_OK} {LIVE_DETAIL[:120]}", file=sys.stderr)
+    want = sys.argv[1:]  # e.g. `m4_autonomy.py preview scope_eval` runs only those rows
     for name, fn in [("scope eval", scope_eval), ("fan-out", fanout), ("stats tiers", stats_tiers),
                      ("degradation", degradation), ("preview", preview), ("ultraresearch", ultraresearch),
                      ("missed cron", missed_cron), ("mcp context", mcp_context)]:
+        if want and name.replace(" ", "_").replace("-", "_") not in want:
+            continue
         safe(f"M4 {name}", fn)
     with contextlib.suppress(OSError):
         subprocess.run(["rm", "-rf", str(TMP)], check=False)

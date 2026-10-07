@@ -41,6 +41,76 @@ def run(cmd: str | list[str], cwd: Path | str | None = None, env: dict | None = 
         return 124, f"TIMEOUT after {timeout}s\n{(e.stdout or b'')[-500:]!r}"
 
 
+LIVE_DEFAULT_MODEL = "claude-sonnet-5-5"
+LIVE_CHEAP_MODEL = "claude-haiku-4-5-20251001"
+CLAUDE_CLI_LABEL = "live Claude Sonnet 5.5 (cheap tier: Haiku 4.5) via the claude-cli provider; OmniRoute paused by owner"
+
+
+def live_backend() -> dict:
+    """Which model backs the live-model checks: {kind, ok, detail, label}.
+
+    Default is the claude-cli provider (the owner's Claude Code login: Sonnet 5.5, cheap tier Haiku 4.5), because the
+    owner paused all OmniRoute use on 2026-10-07. K3_ALLOW_OMNIROUTE=1 selects the original OmniRoute path.
+    """
+    if os.environ.get("K3_ALLOW_OMNIROUTE") == "1":
+        ok, detail = omniroute_quota()
+        return {"kind": "omniroute", "ok": ok, "detail": detail, "label": "live OmniRoute auto/coding-*"}
+    import shutil
+
+    path = shutil.which("claude")
+    if not path:
+        return {"kind": "claude-cli", "ok": False, "detail": "claude CLI not found on PATH", "label": CLAUDE_CLI_LABEL}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("ANTHROPIC_", "OMNIROUTE_"))}
+    rc, out = run([path, "auth", "status"], env=env, timeout=30)
+    try:
+        logged = rc == 0 and json.loads(out).get("loggedIn") is True
+    except json.JSONDecodeError:
+        logged = False
+    return {"kind": "claude-cli", "ok": logged, "label": CLAUDE_CLI_LABEL,
+            "detail": "Claude Code login ok" if logged else f"Claude Code is not logged in ({tail(out, 1)})"}
+
+
+def live_providers_yaml(backend: dict, omni_default: str | list[str] = "auto/coding-cheap",
+                        omni_cheap: str = "auto/coding-cheap") -> str:
+    """The `providers:` block of a k3code config for the live backend (no secrets, only the key variable name)."""
+    if backend["kind"] == "omniroute":
+        default = f"[{', '.join(omni_default)}]" if isinstance(omni_default, list) else omni_default
+        return ("providers:\n  - {name: omniroute, kind: openai, base_url: 'http://<omniroute-host>:20128/v1', "
+                f"api_key_env: OMNIROUTE_API_KEY, models: {{default: {default}, cheap: {omni_cheap}, "
+                f"fast: {omni_cheap}}}}}\n")
+    return (f"providers:\n  - {{name: claude-code, kind: claude-cli, models: {{default: {LIVE_DEFAULT_MODEL}, "
+            f"strong: {LIVE_DEFAULT_MODEL}, cheap: {LIVE_CHEAP_MODEL}, fast: {LIVE_CHEAP_MODEL}}}}}\n")
+
+
+def live_chat(backend: dict, messages: list[dict], max_tokens: int = 400) -> str:
+    """One bare completion on the cheap tier of the live backend (for checks that need a model call, not a session)."""
+    if backend["kind"] == "omniroute":
+        import urllib.request
+
+        req = urllib.request.Request(
+            "http://<omniroute-host>:20128/v1/chat/completions",
+            data=json.dumps({"model": "auto/coding-cheap", "max_tokens": max_tokens, "messages": messages}).encode(),
+            headers={"Authorization": f"Bearer {os.environ['OMNIROUTE_API_KEY']}", "content-type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.load(resp)["choices"][0]["message"]["content"]
+    import asyncio
+
+    from k3code.providers import ClaudeCliProvider
+    from k3code.providers.types import Message
+
+    async def go() -> str:
+        provider = ClaudeCliProvider(name="claude-code")
+        try:
+            events = [e async for e in provider.stream([Message(role=m["role"], content=m["content"]) for m in messages],
+                                                       [], LIVE_CHEAP_MODEL)]
+        finally:
+            await provider.aclose()
+        done = events[-1].message
+        return (done.content if done else "") or ""
+
+    return asyncio.run(go())
+
+
 def omniroute_quota() -> tuple[bool, str]:
     """(usable, detail). 429 'daily usage quota' -> (False, reset info). Never prints the key.
 

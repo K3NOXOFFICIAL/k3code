@@ -3,8 +3,10 @@
 For people who have a Claude Code login but no API key. Every turn k3code sends the whole
 conversation again, so the call is stateless: no session is saved, no project files or memory are
 read, no MCP servers or skills load, and **all of Claude Code's own tools are switched off**
-(``--tools ""``). The model answers through a JSON schema (``{text, tool_calls}``) and k3code's own
-loop executes the tools, so permissions, sandbox, journal and approvals still apply.
+(``--tools ""``). The model answers in plain text and asks for tools with one final
+``<tool_calls>[...]</tool_calls>`` block; k3code's own loop executes them, so permissions, sandbox,
+journal and approvals still apply. (``--json-schema`` was tried first: it forces a second model turn and
+the model then writes its real answer outside the schema and a one-line summary inside it.)
 
 The subprocess runs in a private empty directory with the ``ANTHROPIC_*`` / ``OMNIROUTE_*``
 environment removed (so it always uses the Claude Code login, never a relay) and never reads the
@@ -18,6 +20,7 @@ import contextlib
 import json
 import os
 import pwd
+import re
 import shutil
 import tempfile
 import uuid
@@ -28,7 +31,8 @@ from k3code.providers.base import Provider, ProviderError
 from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec, Usage
 
 DEFAULT_COMMAND = "claude"
-_SYSTEM_FALLBACK = "You are the model behind a coding agent. Answer only through the JSON output schema."
+_SYSTEM_FALLBACK = "You are the model behind a coding agent."
+_TOOL_BLOCK = re.compile(r"<tool_calls>\s*(.*?)\s*</tool_calls>", re.DOTALL)
 
 _PREAMBLE = (
     "You are the language-model backend of a coding agent called k3code. The environment your host reports to you "
@@ -37,10 +41,12 @@ _PREAMBLE = (
     "the tool results below. You have no tools of your own here; use only the tools listed below."
 )
 
-_FOOTER = (
-    "Write the assistant's next turn. Answer ONLY through the JSON output schema: put prose for the user in "
-    '"text"; to use tools, list the calls in "tool_calls" (independent calls may be listed together) and leave '
-    '"text" empty. Never describe a tool call in prose instead of making it.'
+_FOOTER_PLAIN = "Write the assistant's next turn as plain text for the user."
+_FOOTER_TOOLS = (
+    "Write the assistant's next turn as plain text for the user. To call tools, finish your reply with ONE block "
+    '<tool_calls>[{"name": "<tool>", "arguments": {...}}, ...]</tool_calls> holding valid JSON (independent calls '
+    "may be listed together) and write nothing after it. Use only the tools listed above, and never describe a tool "
+    "call in prose instead of making it. If you need no tool, answer normally without the block."
 )
 
 
@@ -66,28 +72,8 @@ def render_prompt(messages: list[Message], tools: list[ToolSpec]) -> tuple[str, 
         elif m.role == "tool":
             label = f"tool result id={m.tool_call_id or '?'}" + (f" tool={m.name}" if m.name else "")
             parts.append(f"[{label}]\n{m.content or ''}")
-    parts.append(_FOOTER)
+    parts.append(_FOOTER_TOOLS if tools else _FOOTER_PLAIN)
     return system, "\n\n".join(parts)
-
-
-def output_schema(tools: list[ToolSpec]) -> dict[str, Any]:
-    """JSON schema of the reply: prose in ``text`` and, when tools exist, a ``tool_calls`` list."""
-    props: dict[str, Any] = {"text": {"type": "string", "description": "Reply to the user; empty when calling tools."}}
-    required = ["text"]
-    if tools:
-        props["tool_calls"] = {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "enum": [t.name for t in tools]},
-                    "arguments": {"type": "object"},
-                },
-                "required": ["name", "arguments"],
-            },
-        }
-        required.append("tool_calls")
-    return {"type": "object", "properties": props, "required": required}
 
 
 def _real_home() -> str:
@@ -159,7 +145,7 @@ class ClaudeCliProvider(Provider):
             self._workdir = tempfile.mkdtemp(prefix="k3code-claude-cli.")
         return self._workdir
 
-    def _command_line(self, model: str, schema: dict[str, Any], system_file: str) -> list[str]:
+    def _command_line(self, model: str, system_file: str) -> list[str]:
         binary = shutil.which(self.command) or self.command
         return [
             binary,
@@ -179,8 +165,6 @@ class ClaudeCliProvider(Provider):
             "",
             "--system-prompt-file",
             system_file,
-            "--json-schema",
-            json.dumps(schema, separators=(",", ":")),
         ]
 
     async def _run(self, argv: list[str], prompt: str) -> tuple[int, str, str]:
@@ -223,7 +207,6 @@ class ClaudeCliProvider(Provider):
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
         system, prompt = render_prompt(messages, tools)
-        schema = output_schema(tools)
         if self._sem is None:
             self._sem = asyncio.Semaphore(self._max_parallel)
         system_file = os.path.join(self._cwd(), f"system-{uuid.uuid4().hex[:8]}.txt")
@@ -231,7 +214,7 @@ class ClaudeCliProvider(Provider):
             fh.write(system or _SYSTEM_FALLBACK)
         try:
             async with self._sem:
-                rc, out, err = await self._run(self._command_line(model, schema, system_file), prompt)
+                rc, out, err = await self._run(self._command_line(model, system_file), prompt)
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(system_file)
@@ -264,35 +247,42 @@ def _last_json(out: str) -> dict[str, Any] | None:
 
 
 def _reply_from_result(result: dict[str, Any], tools: list[ToolSpec]) -> tuple[str, list[ToolCall]]:
-    structured = result.get("structured_output")
-    if not isinstance(structured, dict):
-        raw = (result.get("result") or "").strip()
-        try:
-            structured = json.loads(raw) if raw.startswith("{") else None
-        except json.JSONDecodeError:
-            structured = None
-    if not isinstance(structured, dict):  # plain-text answer (no schema honoured): treat it as the reply
-        return (result.get("result") or "").strip(), []
-    text = str(structured.get("text") or "")
-    known = {t.name for t in tools}
+    """Split the model's plain-text reply into (text for the user, tool calls from the final block)."""
+    raw = str(result.get("result") or "")
+    if not tools:
+        return raw.strip(), []
+    matches = list(_TOOL_BLOCK.finditer(raw))
+    if not matches:
+        if "<tool_calls>" in raw:  # opened but never closed: the reply was cut off
+            raise ProviderError("The model started a <tool_calls> block but did not finish it.", status_code=502)
+        return raw.strip(), []
+    text = _TOOL_BLOCK.sub("", raw).strip()
+    return text, _parse_tool_calls(matches[-1].group(1))
+
+
+def _parse_tool_calls(body: str) -> list[ToolCall]:
+    body = re.sub(r"^```(?:json)?\s*|\s*```$", "", body.strip())  # tolerate a fenced block
+    try:
+        items = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(f"The model wrote an invalid <tool_calls> block: {exc}", status_code=502) from exc
+    if isinstance(items, dict):
+        items = items.get("tool_calls") or [items]
     calls: list[ToolCall] = []
-    for item in structured.get("tool_calls") or []:
+    for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict) or not item.get("name"):
             continue
         args = item.get("arguments")
         args = args if isinstance(args, dict) else {}
-        name = str(item["name"])
-        if known and name not in known:
-            continue
         calls.append(
             ToolCall(
                 id=f"call_{uuid.uuid4().hex[:12]}",
-                name=name,
+                name=str(item["name"]),  # an unknown name is passed on: the agent loop answers "unknown tool"
                 arguments=args,
                 raw_arguments=json.dumps(args, ensure_ascii=False),
             )
         )
-    return text, calls
+    return calls
 
 
 def _usage(result: dict[str, Any]) -> Usage:

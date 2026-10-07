@@ -24,7 +24,7 @@ try:
 except ImportError:
     os.execvp("uv", ["uv", "run", "--with", "pexpect", "--with", "pyte", "python", __file__, *sys.argv[1:]])
 
-from lib import emit, omniroute_quota, run  # noqa: E402
+from lib import emit, live_backend, live_providers_yaml, run  # noqa: E402
 from tui_harness import Tui, core_python, write_home  # noqa: E402
 
 M = "M1"
@@ -274,11 +274,12 @@ def focus() -> str:
 
 def review_live() -> None:
     crit = "/review finds a seeded off-by-one bug (live model)"
-    how = "git repo with an unstaged diff seeding `range(1, len(xs))`; TUI `/review` on OmniRoute auto/coding-cheap"
-    ok, detail = omniroute_quota()
-    if not ok:
-        emit(M, crit, how, "PENDING", f"OmniRoute unavailable: {detail}",
-             "Re-run `scripts/exit/m1_tui.py review` after the OmniRoute daily quota resets (see Retry-After above)")
+    backend = live_backend()
+    how = f"git repo with an unstaged diff seeding `range(1, len(xs))`; TUI `/review`; {backend['label']}"
+    if not backend["ok"]:
+        emit(M, crit, how, "PENDING", f"live model unavailable: {backend['detail']}",
+             "Log in to Claude Code (`claude`), or set K3_ALLOW_OMNIROUTE=1 with a working key; "
+             "then re-run `scripts/exit/m1_tui.py review`")
         return
     cwd, home = TMP / "rev-cwd", TMP / "rev-home"
     cwd.mkdir(parents=True)
@@ -286,9 +287,7 @@ def review_live() -> None:
     run("git init -q -b main . && git config user.email t@t && git config user.name t && git add . && git commit -qm init", cwd=cwd)
     (cwd / "total.py").write_text("def total(xs):\n    s = 0\n    for i in range(1, len(xs)):\n        s += xs[i]\n    return s\n")
     home.mkdir(parents=True)
-    (home / "config.yaml").write_text(
-        "permission_mode: default\nproviders:\n  - {name: omniroute, kind: openai, base_url: 'http://<omniroute-host>:20128/v1', "
-        "api_key_env: OMNIROUTE_API_KEY, models: {default: auto/coding-cheap, cheap: auto/coding-cheap}}\n")
+    (home / "config.yaml").write_text("permission_mode: default\n" + live_providers_yaml(backend))
     t = Tui(home, cwd, script=False)
     try:
         t.boot(); t.pump(1.5)
