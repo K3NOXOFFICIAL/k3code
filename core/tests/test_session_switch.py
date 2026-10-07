@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from k3code.gateway.server import transcript_rows
-
 from test_permissions_gateway import call, make_server
 
 
