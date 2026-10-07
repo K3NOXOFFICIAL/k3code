@@ -74,7 +74,7 @@ def load_config(
     defaults = Settings().model_dump()
 
     # 2. User config (~/.k3code/config.yaml)
-    user_config = _load_yaml(K3CODE_HOME / "config.yaml")
+    user_config = _load_yaml(Path(os.environ.get("K3CODE_HOME") or K3CODE_HOME).expanduser() / "config.yaml")
 
     # 3. Project config (<project_dir>/.k3code/config.yaml)
     project_config = {}

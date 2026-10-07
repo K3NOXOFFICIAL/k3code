@@ -33,7 +33,7 @@ from k3code.reliability.governor import (
     parse_pressure,
     read_psi,
 )
-from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings
+from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings, build_reliability
 from k3code.reliability.journal import (
     INTERRUPTED_TEMPLATE,
     PendingIntent,
@@ -88,6 +88,7 @@ __all__ = [
     "TurnCancelled",
     "Verdict",
     "args_digest",
+    "build_reliability",
     "interrupted_result",
     "normalize_args",
     "parse_pressure",

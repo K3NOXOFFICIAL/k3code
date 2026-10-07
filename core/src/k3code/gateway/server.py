@@ -18,10 +18,15 @@ All logging goes to stderr; stdout carries only JSON-RPC frames.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import logging
+import os
 import sys
 import time
+from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +53,11 @@ from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, suggest_rules
 from k3code.permissions.state import PermissionState, log_decision, persist_rules, project_config_path
 from k3code.providers import make_providers
 from k3code.providers.types import Message, StreamEvent, Usage
+from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
+from k3code.reliability import events as rev
+from k3code.reliability.persistent_retry import TurnCancelled
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
+from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
 
@@ -89,6 +98,28 @@ class LiveSession:
             add_dirs=list(stored.meta.get("add_dirs") or []),
         )
         self.control = {"goal": "", "loop": "", "heartbeat": "", "revision": 0, "updated_at": 0.0}
+        #: Background/cron/loop sessions run bash inside the sandbox.
+        self.background = bool(stored.meta.get("background"))
+        self.reliability: Reliability | None = None
+        #: paused = waiting on the network/provider; the session still counts as working.
+        self.paused = False
+        self.paused_since = 0.0
+        self.pause_text = ""
+        #: Set when the loop guard or a budget stopped the turn; cleared on the next prompt.
+        self.needs_input = False
+        #: (provider, model) of the latest router attempt, for usage rows.
+        self.last_entry: tuple[str, str] = ("", "")
+
+    @property
+    def state(self) -> str:
+        """``working`` (also while paused), ``needs_input`` or ``idle``."""
+        if self.needs_input:
+            return "needs_input"
+        return "working" if self.streaming else "idle"
+
+    def emit(self, event_type: str, payload: dict[str, Any] | None = None, importance: str | None = None) -> None:
+        """Send an event to every client attached to this session."""
+        self.server.emit(event_type, payload, session=self, importance=importance)
 
     @property
     def messages(self) -> list[dict[str, Any]]:
@@ -103,7 +134,7 @@ class LiveSession:
         self.perms.mode = mode
         self.stored.meta["mode"] = mode.value
         self.server.store.save(self.stored)
-        self.server.emit("session.info", self.live_info())
+        self.emit("session.info", self.live_info())
 
     @property
     def history(self) -> list[Message]:
@@ -138,11 +169,30 @@ class LiveSession:
             "title": self.stored.title,
             "stored_session_id": self.session_id,
             "running": self.streaming,
+            "state": self.state,
+            "paused": self.paused,
+            "background": self.background,
         }
 
 
+class Client:
+    """One attached JSON-RPC peer (the stdio pipe, or one Unix-socket connection)."""
+
+    def __init__(self, send: Callable[[str], None], name: str = "stdio") -> None:
+        self.send = send
+        self.name = name
+        self.session_id: str | None = None
+        self.closed = False
+
+
+#: The client whose request is being handled (so replies and "current session" resolve per client).
+_ctx_client: contextvars.ContextVar[Client | None] = contextvars.ContextVar("k3_client", default=None)
+#: The session a turn task is running, so router/reliability events reach its clients.
+_ctx_session: contextvars.ContextVar[LiveSession | None] = contextvars.ContextVar("k3_session", default=None)
+
+
 class GatewayServer:
-    """Owns the stdio loop, the live session, the router and the session store."""
+    """Owns the transports (stdio and/or Unix socket), the live sessions, the router and the session store."""
 
     def __init__(
         self,
@@ -157,12 +207,59 @@ class GatewayServer:
         self._stdin = stdin
         self._stdout = stdout
         self.commands: CommandRegistry = build_commands()
-        self.session: LiveSession | None = None
+        self.live: dict[str, LiveSession] = {}
         self.providers: list[Any] = []
         self.router: Router | None = None
         self.cooldowns = CooldownStore()
         self._running = False
         self._server_request_futures: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        #: Server→client requests still unanswered: id → (session_id, frame). Re-sent on attach.
+        self._open_requests: dict[str, tuple[str, str]] = {}
+        self._stdio_client = Client(lambda line: self._write(line))
+        self.clients: list[Client] = [self._stdio_client]
+        self._socket_server: asyncio.AbstractServer | None = None
+        self._stop = asyncio.Event()
+        #: Ring buffer of recent events (for /debug dump); ``debug`` also logs each one.
+        self.event_log: deque[dict[str, Any]] = deque(maxlen=500)
+        self.debug = False
+        #: Set by the daemon in restart-storm safe mode: no background work starts.
+        self.background_paused = False
+        self.safe_mode_notice = ""
+        self._client_seq = 0
+        self.usage = UsageDB(self._home() / "usage.db")
+
+    # ── session registry ──────────────────────────────────────────────
+
+    @property
+    def session(self) -> LiveSession | None:
+        """The current client's session."""
+        client = _ctx_client.get() or self._stdio_client
+        return self.live.get(client.session_id) if client.session_id else None
+
+    @session.setter
+    def session(self, live: LiveSession | None) -> None:
+        client = _ctx_client.get() or self._stdio_client
+        if live is None:
+            client.session_id = None
+            return
+        self.live[live.session_id] = live
+        self.attach(client, live)
+
+    def attach(self, client: Client, live: LiveSession) -> None:
+        """Point ``client`` at ``live`` and replay any approvals it is still waiting on."""
+        client.session_id = live.session_id
+        for req_id, (sid, frame) in list(self._open_requests.items()):
+            if sid == live.session_id:
+                client.send(frame)
+                logger.debug("re-sent open request %s to %s", req_id, client.name)
+
+    def live_for(self, stored: Any) -> LiveSession:
+        """The running LiveSession for a stored session (created on first use)."""
+        live = self.live.get(stored.session_id)
+        if live is None:
+            live = LiveSession(stored.session_id, stored, self)
+            self.live[stored.session_id] = live
+        return live
 
     @property
     def sessions(self) -> Any:
@@ -177,14 +274,12 @@ class GatewayServer:
 
     @staticmethod
     def _home() -> Path:
-        import os
-
         return Path(os.environ.get("K3CODE_HOME", str(Path.home() / ".k3code"))).expanduser()
 
     # ── transport ─────────────────────────────────────────────────────
 
     def _write(self, line: str) -> None:
-        """One JSON frame to stdout. Only frames ever land here."""
+        """One JSON frame to stdout (the stdio client's sink). Only frames ever land here."""
         out = self._stdout
         if out is None:
             sys.stdout.write(line + "\n")
@@ -193,27 +288,78 @@ class GatewayServer:
             out.write(line + "\n")
             out.flush()
 
-    def emit(self, event_type: str, payload: dict[str, Any] | None = None) -> None:
-        """Send a server→client event frame."""
-        self._write(encode_event(event_type, payload))
+    def _send(self, client: Client, line: str) -> None:
+        if client.closed:
+            return
+        try:
+            client.send(line)
+        except Exception:  # noqa: BLE001 - a dead peer must never break the sender
+            logger.debug("send to %s failed", client.name)
+
+    def _targets(self, session: LiveSession | None) -> list[Client]:
+        """Who should see an event: the session's clients; else the requester; else everyone."""
+        session = session or _ctx_session.get()
+        if session is not None:
+            return [c for c in self.clients if c.session_id == session.session_id and not c.closed]
+        current = _ctx_client.get()
+        if current is not None and not current.closed:
+            return [current]
+        return [c for c in self.clients if not c.closed]
+
+    def emit(
+        self,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        session: LiveSession | None = None,
+        importance: str | None = None,
+    ) -> None:
+        """Send a server→client event frame (and remember it for ``/debug``)."""
+        payload = payload or {}
+        sess = session or _ctx_session.get()
+        record = {"ts": time.time(), "type": event_type, "session": sess.session_id if sess else None,
+                  "importance": importance, "payload": payload}
+        self.event_log.append(record)
+        if self.debug:
+            logger.info("event %s", json.dumps({k: v for k, v in record.items() if k != "ts"}, default=str)[:2000])
+        line = encode_event(event_type, payload, importance)
+        for client in self._targets(session):
+            self._send(client, line)
+
+    def _reply(self, client: Client, line: str) -> None:
+        self._send(client, line)
 
     # ── lifecycle ─────────────────────────────────────────────────────
 
-    async def serve(self) -> None:
-        """Read frames from stdin until EOF, dispatching each."""
+    async def serve(self, *, stdio: bool = True, socket_path: Path | str | None = None) -> None:
+        """Serve stdio until EOF and/or a Unix socket until :meth:`request_stop`."""
         self._running = True
+        if not stdio:
+            self.clients.remove(self._stdio_client)
+        if socket_path is not None:
+            await self.start_socket(socket_path)
+        if stdio:
+            await self._serve_stdio()
+            if socket_path is None:
+                self.shutdown()
+                return
+        await self._stop.wait()
+        await self.stop_socket()
+        self.shutdown()
+
+    async def _serve_stdio(self) -> None:
         loop = asyncio.get_running_loop()
         reader = self._stdin
         if reader is None:
             reader = asyncio.StreamReader()
             await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
 
-        self._send_ready()
+        self._send_ready(self._stdio_client)
 
         while self._running:
             line = await reader.readline()
             if not line:
-                logger.info("stdin EOF; gateway exiting")
+                logger.info("stdin EOF; gateway stdio detached")
                 break
             text = line.decode("utf-8", errors="replace").strip()
             if not text:
@@ -223,35 +369,139 @@ class GatewayServer:
             except Exception:
                 logger.exception("unhandled error processing frame")
 
-        self.shutdown()
+    async def start_socket(self, path: Path | str) -> None:
+        """Listen on a Unix socket: one JSON-RPC connection per client, sessions shared."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            path.unlink()  # stale socket from a crashed daemon
+        self._socket_server = await asyncio.start_unix_server(self._on_connect, path=str(path))
+        os.chmod(path, 0o600)
+        self.socket_path = path
+
+    async def stop_socket(self) -> None:
+        if self._socket_server is not None:
+            self._socket_server.close()
+            with contextlib.suppress(Exception):
+                await self._socket_server.wait_closed()
+            self._socket_server = None
+        with contextlib.suppress(Exception):
+            Path(getattr(self, "socket_path", "")).unlink()
+
+    socket_path: Path
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    async def _on_connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        def send(line: str) -> None:
+            writer.write((line + "\n").encode("utf-8"))
+
+        self._client_seq += 1
+        client = Client(send, name=f"socket#{self._client_seq}")
+        self.clients.append(client)
+        logger.info("client %s attached", client.name)
+        try:
+            self._send_ready(client)
+            # The attach snapshot: every live session and its state, as an event for this client only.
+            self._send(client, encode_event("session.active_list", {"sessions": self._active_rows(None)}))
+            if self.safe_mode_notice:
+                self._send(
+                    client,
+                    encode_event(
+                        "notification.show",
+                        {"text": self.safe_mode_notice, "level": "warning", "kind": "daemon", "key": "k3.safe_mode"},
+                        "essential",
+                    ),
+                )
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    await self._handle_line(text, client)
+                except Exception:
+                    logger.exception("unhandled error processing frame")
+                with contextlib.suppress(Exception):
+                    await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            client.closed = True
+            if client in self.clients:
+                self.clients.remove(client)
+            logger.info("client %s detached; its sessions keep running", client.name)
+            with contextlib.suppress(Exception):
+                writer.close()
+
+    def _active_rows(self, current: str | None) -> list[dict[str, Any]]:
+        rows = []
+        for s in sorted(self.live.values(), key=lambda x: x.stored.updated_at, reverse=True):
+            rows.append(
+                {
+                    "current": s.session_id == current,
+                    "id": s.session_id,
+                    "last_active": s.stored.updated_at,
+                    "message_count": len(s.stored.messages),
+                    "model": s.stored.model,
+                    "preview": (s.stored.title or "")[:120],
+                    "session_key": s.session_id,
+                    "started_at": s.stored.created_at,
+                    "status": s.state,
+                    "state": s.state,
+                    "paused": s.paused,
+                    "background": s.background,
+                    "title": s.stored.title or "Session",
+                }
+            )
+        return rows
 
     def shutdown(self) -> None:
         self._running = False
-        if self.session is not None:
-            self.session.pending_approval = None
+        for live in self.live.values():
+            live.pending_approval = None
         for fut in self._server_request_futures.values():
             if not fut.done():
                 fut.cancel()
         self._server_request_futures.clear()
+        self._open_requests.clear()
 
     async def close(self) -> None:
+        for live in self.live.values():
+            if live.turn_task is not None and not live.turn_task.done():
+                live.turn_task.cancel()
+            if live.reliability is not None:
+                with contextlib.suppress(Exception):
+                    await live.reliability.stop()
         for p in self.providers:
             await p.aclose()
         self.store.close()
+        self.usage.close()
 
-    def _send_ready(self) -> None:
-        self.emit(
-            "gateway.ready",
-            {"skin": _DEFAULT_SKIN, "change_events": [], "replay_epoch": 1},
+    def _send_ready(self, client: Client) -> None:
+        self._send(
+            client,
+            encode_event("gateway.ready", {"skin": _DEFAULT_SKIN, "change_events": [], "replay_epoch": 1}),
         )
 
     # ── frame handling ────────────────────────────────────────────────
 
-    async def _handle_line(self, text: str) -> None:
+    async def _handle_line(self, text: str, client: Client | None = None) -> None:
+        client = client or self._stdio_client
+        token = _ctx_client.set(client)
+        try:
+            await self._dispatch_line(text, client)
+        finally:
+            _ctx_client.reset(token)
+
+    async def _dispatch_line(self, text: str, client: Client) -> None:
         obj, err = decode_frame(text)
         if err is not None:
             kind = PARSE_ERROR if err.startswith("parse error") else INVALID_REQUEST
-            self._write(encode_error(None, kind, err))
+            self._reply(client, encode_error(None, kind, err))
             return
         assert obj is not None
         req_id = obj.get("id")
@@ -270,20 +520,21 @@ class GatewayServer:
 
         handler = _HANDLERS.get(method)
         if handler is None:
-            self._write(encode_error(req_id, METHOD_NOT_FOUND, f"Method not found: {method}"))
+            self._reply(client, encode_error(req_id, METHOD_NOT_FOUND, f"Method not found: {method}"))
             return
 
         try:
             result = await handler(self, params)
         except _InvalidParams as e:
-            self._write(encode_error(req_id, INVALID_PARAMS, str(e)))
+            self._reply(client, encode_error(req_id, INVALID_PARAMS, str(e)))
         except Exception as e:  # noqa: BLE001 - one bad method must not kill the gateway
             logger.exception("method %s failed", method)
-            self._write(encode_error(req_id, INTERNAL_ERROR, f"{type(e).__name__}: {e}"))
+            self._reply(client, encode_error(req_id, INTERNAL_ERROR, f"{type(e).__name__}: {e}"))
         else:
-            self._write(encode_response(req_id, result))
+            self._reply(client, encode_response(req_id, result))
 
     def _resolve_server_request(self, req_id: Any, obj: dict[str, Any]) -> None:
+        self._open_requests.pop(str(req_id), None)
         fut = self._server_request_futures.pop(str(req_id), None)
         if fut is None or fut.done():
             return
@@ -295,26 +546,38 @@ class GatewayServer:
     # ── server→client requests ────────────────────────────────────────
 
     async def _ask_client(self, method: str, params: dict[str, Any], session_id: str) -> dict[str, Any]:
-        """Send an approval/clarify/sudo/secret request and await the client's result."""
+        """Send an approval/clarify/sudo/secret request to the session's clients and await the answer.
+
+        With nobody attached the request stays open (a detached background session
+        waits) and is re-sent when a client attaches to the session.
+        """
         req_id = next_request_id(method)
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._server_request_futures[req_id] = fut
         params = {"session_id": session_id, **params}
-        self._write(encode_server_request(method, params, req_id=req_id))
+        frame = encode_server_request(method, params, req_id=req_id)
+        self._open_requests[req_id] = (session_id, frame)
+        for client in self.clients:
+            if client.session_id == session_id:
+                self._send(client, frame)
         try:
             return await fut
         except asyncio.CancelledError:
+            self._open_requests.pop(req_id, None)
+            self._server_request_futures.pop(req_id, None)
             # The turn was interrupted while waiting: tell the client to stop showing it.
+            live = self.live.get(session_id)
             self.emit(
                 "notification.show",
                 {"text": "Request cancelled", "level": "info", "kind": "info", "key": req_id},
+                session=live,
             )
-            self._write(
-                encode_server_request(
-                    "request.cancel",
-                    {"id": req_id, "method": method, "reason": "interrupted"},
-                )
+            cancel = encode_server_request(
+                "request.cancel", {"id": req_id, "method": method, "reason": "interrupted"}
             )
+            for client in self.clients:
+                if client.session_id == session_id:
+                    self._send(client, cancel)
             raise
 
     # ── router wiring ─────────────────────────────────────────────────
@@ -334,8 +597,28 @@ class GatewayServer:
 
     _chain_key: str | None = None
 
+    async def _reliability_for(self, session: LiveSession) -> Reliability:
+        """One Reliability bundle per session: netwatch runs while the session lives, events go to its clients."""
+        if session.reliability is None:
+            rel = build_reliability(self.config, session=session.session_id, home=self._home())
+            rel.events.add(lambda e: self._on_reliability_event(session, e), key="gateway")
+            session.reliability = rel
+        assert self.router is not None
+        session.reliability.register_providers(self.router.chain)
+        with contextlib.suppress(Exception):
+            await session.reliability.start()
+        return session.reliability
+
     def _on_router_event(self, event: RouterEvent) -> None:
-        if event.kind == "router.failover":
+        """Router events: failover/retry/exhausted → TUI + usage rows. Reliability kinds go via the session sink."""
+        sess = _ctx_session.get()
+        sid = sess.session_id if sess else ""
+        if event.kind == "router.attempt" and sess is not None:
+            sess.last_entry = (event.provider, event.model)
+        elif event.kind == "router.retry":
+            self.usage.record("retry", session=sid, provider=event.provider, model=event.model, detail=event.reason)
+        elif event.kind == "router.failover":
+            self.usage.record("failover", session=sid, provider=event.provider, model=event.model, detail=event.reason)
             self.emit(
                 "status.update",
                 {
@@ -346,14 +629,69 @@ class GatewayServer:
         elif event.kind == "router.exhausted":
             self.emit("error", {"message": f"All providers failed: {event.detail}"})
 
+    #: Notification key shared by pause/park toasts so ``resumed`` can clear them.
+    PAUSE_KEY = "k3.reliability.pause"
+
+    def _on_reliability_event(self, session: LiveSession, event: Any) -> None:
+        """Map a ``reliability.*`` / ``net.state`` loop event onto the TUI events that display it.
+
+        Every event emitted here is ``importance: essential`` so focus mode keeps it.
+        """
+        kind: str = event.kind
+        detail: str = event.detail
+        data: dict[str, Any] = dict(event.data)
+        ess = "essential"
+        # Raw forward (the TUI ignores types it has no handler for).
+        session.emit(kind, {"detail": detail, **data}, importance=ess)
+        if kind in (rev.PAUSED, rev.PARKED):
+            if kind == rev.PARKED:
+                until = time.strftime("%H:%M", time.localtime(time.time() + float(data.get("delay") or 0)))
+                text = f"⏸ waiting for provider until {until}"
+            else:
+                text = "⏸ offline — will resume automatically"
+            session.paused = True
+            session.paused_since = time.monotonic()
+            session.pause_text = text
+            session.emit("status.update", {"kind": "status", "text": text, "state": session.state}, importance=ess)
+            session.emit(
+                "notification.show",
+                {"text": text, "level": "warning", "kind": "reliability", "key": self.PAUSE_KEY},
+                importance=ess,
+            )
+        elif kind in (rev.RESUMED, rev.UNPARKED):
+            if session.paused:
+                secs = time.monotonic() - session.paused_since
+                self.usage.record("pause", session=session.session_id, seconds=secs, detail=session.pause_text)
+            session.paused = False
+            session.pause_text = ""
+            session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance=ess)
+            session.emit(
+                "status.update", {"kind": "status", "text": "thinking", "state": session.state}, importance=ess
+            )
+        elif kind == rev.INTERRUPTED_TOOL:
+            session.emit(
+                "notification.show",
+                {"text": f"Tool interrupted by a restart: {detail}", "level": "warning", "kind": "reliability"},
+                importance=ess,
+            )
+        elif kind in (rev.BUDGET_EXCEEDED, rev.LOOP_DETECTED):
+            session.needs_input = True
+            label = "Budget exceeded" if kind == rev.BUDGET_EXCEEDED else "Loop detected"
+            session.emit("error", {"message": f"{label}: {detail}"}, importance=ess)
+        elif kind == rev.NEEDS_INPUT:
+            session.needs_input = True
+
     # ── turn lifecycle ────────────────────────────────────────────────
 
     async def _run_turn(self, session: LiveSession, text: str) -> None:
-        """Execute one user prompt end-to-end, emitting wire events."""
+        """Execute one user prompt end-to-end, emitting wire events to the session's clients."""
+        _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
         self._ensure_router(session.stored.model or None)
         assert self.router is not None
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
+        session.needs_input = False
+        reliability = await self._reliability_for(session)
         loop = AgentLoop(
             self.router,
             system_prompt=session.system_prompt,
@@ -363,11 +701,14 @@ class GatewayServer:
             cwd=session.perms.cwd,
             approval_callback=await self._approval_callback_for(session),
             plan_callback=self._plan_callback_for(session),
-            on_auto_allow=lambda tool, args, dec: self.emit(
+            on_auto_allow=lambda tool, args, dec: session.emit(
                 "permission.auto_allowed",
                 {"session_id": session.session_id, "tool": tool, "command": _command_for_tool(tool, args)},
             ),
             permissions=session.perms,
+            reliability=reliability,
+            session=session.session_id,
+            background=session.background,
         )
         session.loop = loop
 
@@ -380,12 +721,12 @@ class GatewayServer:
         async def on_text_delta(chunk: str) -> None:
             nonlocal final_text
             final_text += chunk
-            self.emit("message.delta", {"text": chunk})
+            session.emit("message.delta", {"text": chunk})
 
         loop.on_text_delta = on_text_delta
 
-        self.emit("message.start", {})
-        self.emit("status.update", {"kind": "status", "text": "thinking"})
+        session.emit("message.start", {})
+        session.emit("status.update", {"kind": "status", "text": "thinking", "state": "working"})
         session.streaming = True
         try:
             async for event in loop.run(
@@ -396,10 +737,17 @@ class GatewayServer:
                 history=session.history,
             ):
                 self._on_stream_event(session, event)
-        except (AllProvidersUnreachable, ChainExhausted, ContextOverflow) as e:
+        except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)
-            self.emit("error", {"message": str(e)})
+            session.emit("error", {"message": str(e)})
+        except BudgetExceeded as e:
+            # The reliability event already told the client (error + needs_input).
+            status = "needs_input"
+            error = str(e)
+            session.needs_input = True
+        except TurnCancelled:
+            status = "interrupted"
         except asyncio.CancelledError:
             status = "interrupted"
             raise
@@ -407,9 +755,12 @@ class GatewayServer:
             logger.exception("turn failed")
             status = "error"
             error = str(e)
-            self.emit("error", {"message": str(e)})
+            session.emit("error", {"message": str(e)})
         finally:
             session.streaming = False
+            if session.paused:  # a cancelled wait never saw "resumed"
+                session.paused = False
+                session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")
 
         # Persist whatever the loop accumulated (also on error/interrupt).
         if loop.turn_messages:
@@ -421,19 +772,17 @@ class GatewayServer:
                 usage = msg.usage
                 break
 
-        self.emit(
+        session.emit(
             "message.complete",
-            {"text": final_text, "usage": _usage_payload(usage), "status": status, "error": error},
+            {"text": final_text, "usage": _usage_payload(usage), "status": status, "error": error,
+             "state": session.state},
         )
-        self.emit("status.update", {"kind": "status", "text": ""})
+        session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
 
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
-            self.emit(
-                "tool.generating",
-                {"name": event.tool_call.name},
-            )
-            self.emit(
+            session.emit("tool.generating", {"name": event.tool_call.name})
+            session.emit(
                 "tool.start",
                 {
                     "tool_id": event.tool_call.id,
@@ -441,10 +790,11 @@ class GatewayServer:
                     "args": event.tool_call.arguments,
                 },
             )
+            self.usage.record("tool", session=session.session_id, detail=event.tool_call.name)
         elif event.type == "done" and event.message:
             msg = event.message
             if msg.role == "tool":
-                self.emit(
+                session.emit(
                     "tool.complete",
                     {
                         "tool_id": msg.tool_call_id or "",
@@ -453,14 +803,26 @@ class GatewayServer:
                         "result": {"content": msg.content},
                     },
                 )
-            elif msg.usage:
-                self.emit("session.usage", {"usage": _usage_payload(msg.usage)})
+            elif msg.role == "assistant":
+                provider, model = session.last_entry
+                u = msg.usage
+                self.usage.record(
+                    "call",
+                    session=session.session_id,
+                    provider=provider,
+                    model=model,
+                    tokens_in=u.prompt_tokens if u else 0,
+                    tokens_out=u.completion_tokens if u else 0,
+                )
+                if u:
+                    session.emit("session.usage", {"usage": _usage_payload(u)})
 
     async def _approval_callback_for(self, session: LiveSession) -> Any:
         async def approve(tool_name: str, arguments: dict[str, Any], decision: Any = None) -> ApprovalResult:
             decision = decision or session.perms.decide(tool_name, arguments)
             rules = suggest_rules(tool_name, decision)
             pattern = ", ".join(r.pattern for r in rules)
+            self.usage.record("approval", session=session.session_id, detail=tool_name)
             try:
                 result = await self._ask_client(
                     "approval",
@@ -504,6 +866,7 @@ class GatewayServer:
 
     def _plan_callback_for(self, session: LiveSession) -> Any:
         async def approve_plan(plan: str) -> str | None:
+            self.usage.record("approval", session=session.session_id, detail="exit_plan")
             try:
                 result = await self._ask_client(
                     "approval",
@@ -557,14 +920,14 @@ class GatewayServer:
         if session is None or session.turn_task is None or session.turn_task.done():
             return False
         session.loop.interrupt() if session.loop else None
+        if session.reliability is not None:
+            session.reliability.cancel()  # abort a paused/parked wait too
         session.turn_task.cancel()
         return True
 
     def _session_for(self, session_id: str | None) -> LiveSession | None:
-        if self.session is None:
-            return None
-        if session_id and session_id != self.session.session_id:
-            return None
+        if session_id:
+            return self.live.get(session_id)
         return self.session
 
     # ── logging ───────────────────────────────────────────────────────
@@ -639,9 +1002,13 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
         provider=params.get("provider") or "",
         cwd=params.get("cwd") or str(Path.cwd()),
     )
-    server.session = LiveSession(stored.session_id, stored, server)
-    server.session.reasoning_effort = params.get("effort")
-    return {"session_id": stored.session_id, "info": server.session.live_info()}
+    if params.get("background"):
+        stored.meta["background"] = True
+        server.store.save(stored)
+    live = LiveSession(stored.session_id, stored, server)
+    live.reasoning_effort = params.get("effort")
+    server.session = live
+    return {"session_id": stored.session_id, "info": live.live_info()}
 
 
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -653,6 +1020,8 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
             if m.get("role") == "user" and m.get("content"):
                 preview = str(m["content"])[:120]
                 break
+        live = server.live.get(s.session_id)
+        state = live.state if live is not None else ("completed" if s.messages else "new")
         rows.append(
             {
                 "id": s.session_id,
@@ -660,30 +1029,16 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
                 "preview": preview,
                 "started_at": s.created_at,
                 "message_count": len(s.messages),
+                "status": state,
+                "state": state,
             }
         )
     return {"sessions": rows}
 
 
 async def _session_active_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    items: list[dict[str, Any]] = []
-    s = server.session
-    if s is not None:
-        items.append(
-            {
-                "current": True,
-                "id": s.session_id,
-                "last_active": s.stored.updated_at,
-                "message_count": len(s.stored.messages),
-                "model": s.stored.model,
-                "preview": (s.stored.title or "")[:120],
-                "session_key": s.session_id,
-                "started_at": s.stored.created_at,
-                "status": "streaming" if s.streaming else "idle",
-                "title": s.stored.title or "Session",
-            }
-        )
-    return {"sessions": items}
+    current = server.session
+    return {"sessions": server._active_rows(current.session_id if current else None)}
 
 
 async def _session_resume(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -691,13 +1046,14 @@ async def _session_resume(server: GatewayServer, params: dict[str, Any]) -> dict
     stored = server.store.get(str(sid))
     if stored is None:
         raise _InvalidParams(f"unknown session: {sid}")
-    server.session = LiveSession(stored.session_id, stored, server)
+    live = server.live_for(stored)  # a background session keeps its running state
+    server.session = live
     server.emit("session.resume_progress", {"phase": "done", "status": "done", "message_count": len(stored.messages)})
     return {
         "session_id": stored.session_id,
-        "message_count": len(stored.messages),
-        "messages": stored.messages,
-        "info": server.session.live_info(),
+        "message_count": len(live.stored.messages),
+        "messages": live.stored.messages,
+        "info": live.live_info(),
     }
 
 
@@ -706,15 +1062,23 @@ async def _session_activate(server: GatewayServer, params: dict[str, Any]) -> di
     stored = server.store.get(str(sid))
     if stored is None:
         raise _InvalidParams(f"unknown session: {sid}")
-    server.session = LiveSession(stored.session_id, stored, server)
-    return {"session_id": stored.session_id, "info": server.session.live_info()}
+    live = server.live_for(stored)
+    server.session = live
+    return {"session_id": stored.session_id, "info": live.live_info()}
 
 
 async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     sid = _require(params, "session_id")
     deleted = server.store.delete(str(sid))
-    if server.session is not None and server.session.session_id == sid:
-        server.session = None
+    live = server.live.pop(str(sid), None)
+    if live is not None:
+        if live.turn_task is not None and not live.turn_task.done():
+            live.turn_task.cancel()
+        if live.reliability is not None:
+            await live.reliability.stop()
+    for client in server.clients:
+        if client.session_id == sid:
+            client.session_id = None
     return {"deleted": deleted}
 
 
@@ -800,6 +1164,11 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     text = _require(params, "text")
     if session.streaming:
         return {"turn_id": "", "status": "queued"}
+    if params.get("background"):
+        session.background = True
+        session.stored.meta["background"] = True
+    if session.background and server.background_paused:
+        raise _InvalidParams("background work is paused (restart-storm safe mode); resume with /daemon resume")
     session.stored.model = params.get("model") or session.stored.model
     session.turn_task = asyncio.get_running_loop().create_task(server._run_turn(session, str(text)))
     return {"turn_id": session.turn_task.get_name(), "status": "streaming"}

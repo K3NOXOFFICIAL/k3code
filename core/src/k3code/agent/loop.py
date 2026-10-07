@@ -13,7 +13,7 @@ from k3code.config import K3CODE_HOME
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.providers.types import Message, StreamEvent, ToolCall
-from k3code.reliability import Reliability, ReliabilitySettings
+from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
 from k3code.tools import build_registry
@@ -63,6 +63,7 @@ class AgentLoop:
         plan_callback: PlanCallback | None = None,
         on_auto_allow: AutoAllowCallback | None = None,
         permissions: PermissionState | None = None,
+        background: bool = False,
     ) -> None:
         self.router = router
         self.system_prompt = system_prompt
@@ -72,6 +73,9 @@ class AgentLoop:
         self.plan_callback = plan_callback
         self.on_auto_allow = on_auto_allow
         self.headless = headless
+        #: Background/cron/loop sessions run bash sandboxed (like auto/yolo mode).
+        self.background = background
+        self._sandbox_warned = False
         self.on_event = on_event
         self.on_text_delta = on_text_delta
         self.approval_callback = approval_callback
@@ -88,7 +92,7 @@ class AgentLoop:
             reliability = Reliability.from_settings(reliability, session=session, home=K3CODE_HOME)
         self.reliability = reliability
         self.reliability.attach_router(router)
-        self.reliability.events.add(self._forward_reliability_event)
+        self.reliability.events.add(self._forward_reliability_event, key="loop")
 
     @property
     def permission_mode(self) -> PermissionMode:
@@ -280,13 +284,27 @@ class AgentLoop:
         # M2: fsync a journal intent before the tool runs.
         self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
         try:
-            result = await handler(args, cwd=self.cwd)
+            if tool_call.name == "bash":
+                result = await handler(args, cwd=self.cwd, sandbox=self._sandbox_argv())
+            else:
+                result = await handler(args, cwd=self.cwd)
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
             result = {"error": f"Tool execution failed: {e}"}
         # M2: completion digest, so resume knows this call finished.
         self.reliability.journal_done(tool_call.id, result)
         return result
+
+    def _sandbox_argv(self) -> list[str] | None:
+        """bwrap prefix for bash in auto/yolo/background sessions; None = run unsandboxed."""
+        if not sandbox.should_sandbox(self.permissions.mode, self.background):
+            return None
+        if not sandbox.usable():
+            if not self._sandbox_warned:
+                self._sandbox_warned = True
+                logger.warning("bwrap unavailable: running bash without the sandbox (see /doctor)")
+            return None
+        return sandbox.build_argv(self.cwd, self.permissions.add_dirs)
 
     # ── M2 reliability helpers ──
 

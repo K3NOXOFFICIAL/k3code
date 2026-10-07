@@ -24,8 +24,7 @@ from k3code.reliability import (
     BudgetExceeded,
     DiskGuardFull,
     Reliability,
-    ReliabilityFlags,
-    ReliabilitySettings,
+    build_reliability,
 )
 from k3code.reliability.persistent_retry import TurnCancelled
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
@@ -75,15 +74,7 @@ def _print_event(event: RouterEvent) -> None:
 
 def _build_reliability(config: Any, session: str) -> Reliability:
     """M2: build the reliability bundle from the config's reliability dict."""
-    raw = dict(getattr(config, "reliability", None) or {})
-    flags_raw = raw.pop("flags", None)
-    flags = ReliabilityFlags(**flags_raw) if isinstance(flags_raw, dict) else None
-    known = {"enabled", "flags", "max_wait", "max_park_seconds",
-             "session_tokens", "session_usd", "day_tokens", "day_usd", "netwatch"}
-    settings = ReliabilitySettings(flags=flags) if flags else ReliabilitySettings()
-    for key in known & set(raw):
-        setattr(settings, key, raw[key])
-    return Reliability.from_settings(settings, session=session, home=K3CODE_HOME)
+    return build_reliability(config, session=session, home=K3CODE_HOME)
 
 
 async def _run_headless(
@@ -422,9 +413,83 @@ def cli(
 
 @cli.command("gateway")
 @click.option("--stdio", "stdio_flag", is_flag=True, default=True, help="Serve JSON-RPC 2.0 on stdin/stdout")
-def gateway(stdio_flag: bool) -> None:
-    """Run the JSON-RPC gateway (what the TUI spawns)."""
+@click.option("--attach", is_flag=True, help="Bridge stdin/stdout to a running daemon's socket")
+@click.option("--socket", "socket_opt", type=click.Path(path_type=Path), help="Daemon socket path")
+def gateway(stdio_flag: bool, attach: bool, socket_opt: Path | None) -> None:
+    """Run the JSON-RPC gateway (what the TUI spawns), or attach to the daemon with --attach."""
+    if attach:
+        from k3code.daemon import attach_bridge
+
+        sys.exit(asyncio.run(attach_bridge(socket_opt)))
     _run_gateway()
+
+
+@cli.command("daemon")
+def daemon_cmd() -> None:
+    """Run the long-lived host: sessions keep running while no TUI is attached (systemd: Type=notify)."""
+    from k3code.daemon import run_daemon
+
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    with contextlib.suppress(KeyboardInterrupt):
+        asyncio.run(run_daemon())
+
+
+@cli.group("service")
+def service_group() -> None:
+    """Manage the systemd user unit for the daemon."""
+
+
+@service_group.command("install")
+@click.option("--dry-run", is_flag=True, help="Print what would happen; change nothing")
+def service_install(dry_run: bool) -> None:
+    from k3code import service
+
+    click.echo("\n".join(service.install(dry_run=dry_run)))
+
+
+@service_group.command("uninstall")
+@click.option("--dry-run", is_flag=True, help="Print what would happen; change nothing")
+def service_uninstall(dry_run: bool) -> None:
+    from k3code import service
+
+    click.echo("\n".join(service.uninstall(dry_run=dry_run)))
+
+
+@service_group.command("status")
+def service_status() -> None:
+    from k3code import service
+
+    click.echo("\n".join(service.status()))
+
+
+@cli.command("doctor")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
+@click.option("--no-probe", is_flag=True, help="Skip network probes")
+def doctor_cmd(as_json: bool, no_probe: bool) -> None:
+    """Health checks with fix hints. Exit status 1 when any check fails."""
+    from k3code import doctor
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    checks = asyncio.run(doctor.run_checks(load_config(project_dir=Path.cwd()), probe=not no_probe))
+    click.echo(doctor.to_json(checks) if as_json else doctor.format_report(checks))
+    sys.exit(1 if doctor.summary(checks)[doctor.FAIL] else 0)
+
+
+@cli.command("stats")
+@click.option("--by", type=click.Choice(["day", "session"]), default="day")
+@click.option("--days", type=int, default=None, help="Only the last N days")
+@click.option("--json", "as_json", is_flag=True)
+def stats_cmd(by: str, days: int | None, as_json: bool) -> None:
+    """Usage per day or session from $K3CODE_HOME/usage.db."""
+    from k3code.daemon import k3_home
+    from k3code.usage import UsageDB, format_stats
+
+    rows = UsageDB(k3_home() / "usage.db").aggregate(by, days=days)
+    click.echo(json.dumps(rows, indent=2) if as_json else format_stats(rows, by))
 
 
 if __name__ == "__main__":

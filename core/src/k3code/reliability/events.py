@@ -47,13 +47,18 @@ class EventEmitter:
 
     def __init__(self, *sinks: EventSink) -> None:
         self._sinks: list[EventSink] = list(sinks)
+        self._keyed: dict[str, EventSink] = {}
 
-    def add(self, sink: EventSink) -> None:
-        self._sinks.append(sink)
+    def add(self, sink: EventSink, *, key: str | None = None) -> None:
+        """Subscribe ``sink``; a ``key`` makes it replace any earlier sink with that key."""
+        if key is None:
+            self._sinks.append(sink)
+        else:
+            self._keyed[key] = sink
 
     def emit(self, kind: str, detail: str = "", **data: Any) -> ReliabilityEvent:
         event = ReliabilityEvent(kind=kind, detail=detail, data=data)
-        for sink in list(self._sinks):
+        for sink in [*self._sinks, *self._keyed.values()]:
             with contextlib.suppress(Exception):
                 sink(event)
         return event

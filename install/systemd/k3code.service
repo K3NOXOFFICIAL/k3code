@@ -1,0 +1,23 @@
+[Unit]
+Description=k3code daemon (keeps coding-agent sessions running 24/7)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/bin/k3code daemon
+Restart=always
+RestartSec=5
+WatchdogSec=120
+Nice=5
+IOSchedulingClass=idle
+MemoryHigh=2G
+Environment=K3CODE_LOG_LEVEL=INFO
+# Provider API keys (K3CODE_API_KEY=..., OMNIROUTE_API_KEY=...) go here, chmod 600:
+EnvironmentFile=-%h/.config/k3code/env
+
+[Install]
+WantedBy=default.target
