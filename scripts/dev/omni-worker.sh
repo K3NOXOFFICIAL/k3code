@@ -14,16 +14,25 @@
 # resuming the same session after API/network failures. Logs: .k3dev/runs/<name>/
 set -uo pipefail
 
+# Run from a private snapshot so edits to this file never disturb running drivers
+# (bash reads scripts incrementally while executing them).
+if [ -z "${K3DEV_SNAPSHOT:-}" ]; then
+  snap=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/omni-worker.XXXXXX.sh")
+  cp "$0" "$snap"
+  K3DEV_SNAPSHOT=$snap K3DEV_SELF_DIR=$(dirname "$(readlink -f "$0")") exec bash "$snap" "$@"
+fi
+SELF_DIR=${K3DEV_SELF_DIR:-$(dirname "$(readlink -f "$0")")}
+
 TASK=${1:?task file}; NAME=${2:?name}; BASE=${3:-}; MODELS=${4:-auto/muse,auto/pro-coding,auto/coding-manual}
 SETTINGS=${K3DEV_SETTINGS:-$HOME/.claude/settings.omniroute.json}
 MAX_ATTEMPTS=${K3DEV_MAX_ATTEMPTS:-30}
 ROTATE_AFTER=${K3DEV_ROTATE_AFTER:-2}
 IFS=, read -r -a MODEL_LIST <<< "$MODELS"
 midx=0; stalls=0
-REPO=$(git -C "$(dirname "$0")" rev-parse --path-format=absolute --git-common-dir | sed 's#/\.git$##')
+REPO=$(git -C "$SELF_DIR" rev-parse --path-format=absolute --git-common-dir | sed 's#/\.git$##')
 WT="$REPO/.claude/worktrees/w-$NAME"
 RUNS="$REPO/.k3dev/runs/$NAME"
-PREAMBLE="$(dirname "$(readlink -f "$0")")/worker-preamble.md"
+PREAMBLE="$SELF_DIR/worker-preamble.md"
 mkdir -p "$RUNS"
 TASK=$(readlink -f "$TASK")
 
@@ -114,6 +123,11 @@ except Exception: print(True)')
   if [ $rc -eq 0 ] && [ "$iserr" = "False" ] && [ "$WT/REPORT.md" -nt "$stamp" ]; then status=ok; break; fi
   echo "$(date -Is) attempt $attempt rc=$rc is_error=$iserr report=$([ -f "$WT/REPORT.md" ] && echo y || echo n)" >> "$RUNS/driver.log"
   stalls=$((stalls + 1))
+  # Quota / rate-limit on this combo (e.g. "429 … reset after 20h"): rotate right away.
+  if printf '%s' "$json" | grep -qiE '\(429\)|rate.?limit|quota|reset after|all targets were skipped'; then
+    stalls=$ROTATE_AFTER
+    echo "$(date -Is) $MODEL rate-limited/quota — rotating now" >> "$RUNS/driver.log"
+  fi
   if [ "$stalls" -ge "$ROTATE_AFTER" ] && [ "${#MODEL_LIST[@]}" -gt 1 ]; then
     midx=$(( (midx + 1) % ${#MODEL_LIST[@]} )); stalls=0
     echo "$(date -Is) rotating to ${MODEL_LIST[$midx]}" >> "$RUNS/driver.log"
