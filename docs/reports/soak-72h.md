@@ -1,7 +1,8 @@
 # The 72-hour soak (M2 exit criterion (f))
 
-**Status: RUNNING.** It started on **2026-10-08 00:21:36 (Europe/Berlin)** and ends about **2026-10-11 00:21** (72 h).
-An earlier start at 00:06 on commit `ab0c4ce` was stopped after 15 minutes and restarted, because a last research fix landed.
+**Status: RUNNING.** It started on **2026-10-08 00:51:34 (Europe/Berlin)** and ends about **2026-10-11 00:51** (72 h), as the systemd user
+unit `k3code-soak-72h.service` (own cgroup; lingering is on, so it survives closing the terminal and logging out).
+Two earlier starts (00:06, 00:21) were stopped and restarted because last fixes landed in the frozen code.
 
 What it runs: a `k3code daemon` in a throwaway home on the scripted fake provider, with a `/loop 30s` in one session
 and two cron jobs (every minute), sampled every 5 minutes: runs completed, lost turns (failed/stuck/skipped ticks),
@@ -13,14 +14,14 @@ daemon stayed alive and RSS growth after warm-up stays below 25 % of the warm RS
 
 | What | Path |
 |---|---|
-| frozen code (detached worktree at commit `ab0c4ce`, own venv) | `~/src/k3code/.k3dev/soak/src` (**do not touch**: any change to the daemon code restarts the 72 h) |
-| sample log (one line per 5 min) | `~/src/k3code/.k3dev/soak/src/scripts/exit/rows/soak/soak-20261008-002136.log` |
+| frozen code (detached worktree at commit `7680c51`, own venv) | `~/src/k3code/.k3dev/soak/src` (**do not touch**: any change to the daemon code restarts the 72 h) |
+| sample log (one line per 5 min) | `~/src/k3code/.k3dev/soak/src/scripts/exit/rows/soak/soak-20261008-005134.log` |
 | stdout of the run | `~/src/k3code/.k3dev/soak/soak-72h.out` |
 | the exit row, written when it ends | `~/src/k3code/.k3dev/soak/rows-72h.jsonl` |
-| the daemon | `pgrep -af 'k3code daemon'` (cwd-independent; its home is `/tmp/k3exit.*`) |
+| the unit | `systemctl --user status k3code-soak-72h` (the daemon's home is `/tmp/k3exit.*`) |
 
 ```
-tail -n 3 ~/src/k3code/.k3dev/soak/src/scripts/exit/rows/soak/soak-20261008-002136.log
+tail -n 3 ~/src/k3code/.k3dev/soak/src/scripts/exit/rows/soak/soak-20261008-005134.log
 cat ~/src/k3code/.k3dev/soak/rows-72h.jsonl          # when it has finished: status + evidence
 ```
 
