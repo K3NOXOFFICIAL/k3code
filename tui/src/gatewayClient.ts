@@ -489,7 +489,8 @@ export class GatewayClient extends EventEmitter {
   private startSpawnedGateway(root: string) {
     const cmdOverride = resolveGatewayCmd()
     const python = resolvePython()
-    const cwd = process.env.HERMES_CWD || root
+    // k3: the k3code gateway works in the user's directory, not the TUI source root.
+    const cwd = process.env.K3CODE_CWD || (cmdOverride ? process.cwd() : process.env.HERMES_CWD || root)
     const env = { ...process.env }
     const pyPath = env.PYTHONPATH?.trim()
 
