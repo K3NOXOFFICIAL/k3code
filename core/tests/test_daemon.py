@@ -294,3 +294,53 @@ async def test_gateway_attach_without_daemon_fails_clearly(tmp_path):
     )
     _out, err = await asyncio.wait_for(proc.communicate(), 15)
     assert proc.returncode == 1 and b"Start it with `k3code daemon`" in err
+
+
+async def test_in_flight_turn_survives_client_disconnect(tmp_path, monkeypatch):
+    """The turn is still inside a slow bash call when the only client goes away."""
+    home = tmp_path / "home"
+    _write_fake_config(
+        home,
+        [
+            {
+                "type": "tool_call",
+                "id": "c1",
+                "name": "bash",
+                "when": "first",
+                "arguments": {"command": "sleep 1.5; echo slept > marker.txt"},
+            },
+            {"type": "text", "text": "all done", "when": "after_tool"},
+        ],
+    )
+    monkeypatch.setenv("K3CODE_HOME", str(home))
+    monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(home / "fake.json"))
+    monkeypatch.setenv("FAKE_KEY", "x")
+    ready, holder = asyncio.Event(), []
+    task = asyncio.create_task(
+        daemon.run_daemon(home=home, install_signals=False, ready_event=ready, server_out=holder, watchdog_interval=5)
+    )
+    await asyncio.wait_for(ready.wait(), 10)
+    server = holder[0]
+    sock = daemon.socket_path(home)
+    work = tmp_path / "work"
+    work.mkdir()
+    a = await Peer.connect(sock)
+    sid = (await a.call("session.create", cwd=str(work), background=True))["result"]["session_id"]
+    await a.call("session.mode.set", mode="yolo")  # no approval prompt; bash runs in the sandbox when usable
+    await a.call("prompt.submit", text="run the slow command")
+    await a.read_until("tool.start")
+    assert server.live[sid].state == "working" and not (work / "marker.txt").exists()
+    a.close()  # detach mid-turn
+    b = await Peer.connect(sock)
+    await b.call("session.resume", session_id=sid)
+    assert server.live[sid].state == "working"  # still running with nobody attached
+    for _ in range(100):
+        row = next(r for r in (await b.call("session.list"))["result"]["sessions"] if r["id"] == sid)
+        if row["state"] == "idle" and row["message_count"] >= 4:
+            break
+        await asyncio.sleep(0.1)
+    assert row["state"] == "idle" and row["message_count"] >= 4, row  # system, user, assistant(tool), tool, assistant
+    assert (work / "marker.txt").read_text().strip() == "slept"
+    b.close()
+    server.request_stop()
+    await asyncio.wait_for(task, 10)

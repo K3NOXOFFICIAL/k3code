@@ -70,7 +70,7 @@ async def run_daemon(
     *,
     home: Path | None = None,
     sock: Path | None = None,
-    watchdog_interval: float = WATCHDOG_INTERVAL_S,
+    watchdog_interval: float | None = None,
     install_signals: bool = True,
     ready_event: asyncio.Event | None = None,
     server_out: list | None = None,
@@ -102,7 +102,8 @@ async def run_daemon(
     logger.info("daemon ready on %s", sock)
     if ready_event is not None:
         ready_event.set()
-    dog = asyncio.create_task(sdnotify.watchdog_loop(watchdog_interval))
+    interval = sdnotify.watchdog_interval(WATCHDOG_INTERVAL_S) if watchdog_interval is None else watchdog_interval
+    dog = asyncio.create_task(sdnotify.watchdog_loop(interval))
     try:
         await serve
     finally:
