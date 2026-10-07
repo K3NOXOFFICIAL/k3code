@@ -22,6 +22,8 @@ class ToolCall:
 class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    #: List-price cost reported by the provider itself (only the claude-cli provider does); None = unknown.
+    cost_usd: float | None = None
 
 
 @dataclass

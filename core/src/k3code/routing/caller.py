@@ -104,6 +104,6 @@ class ModelCaller:
         if self.usage is not None:
             self.usage.record(
                 "call", session=session_id, provider=provider, model=model, tokens_in=pt, tokens_out=ct,
-                tier=tier.value, task_kind=kind.value,
+                cost_usd=usage.cost_usd if usage else None, tier=tier.value, task_kind=kind.value,
             )
         return CallResult(final.content or "", tier, model, provider, pt, ct)

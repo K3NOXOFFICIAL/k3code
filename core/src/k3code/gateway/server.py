@@ -1151,6 +1151,7 @@ class GatewayServer:
                     model=model,
                     tokens_in=u.prompt_tokens if u else 0,
                     tokens_out=u.completion_tokens if u else 0,
+                    cost_usd=u.cost_usd if u else None,
                     tier=session.last_tier,
                     task_kind=session.current_kind,
                 )

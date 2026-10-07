@@ -38,6 +38,7 @@ with open(log, "w") as fh:
     }}, fh)
 mode = os.environ.get("SHIM_MODE", "text")
 usage = {{"input_tokens": 3, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50, "output_tokens": 7}}
+COST = 0.0125
 CALLS = '[{{"name": "read_file", "arguments": {{"path": "a.py"}}}}, {{"name": "nope", "arguments": {{}}}}]'
 replies = {{
     "text": "hello",
@@ -49,7 +50,7 @@ replies = {{
     "cut": "start <tool_calls>[{{\"name\": \"read_file\"",
 }}
 if mode in replies:
-    print(json.dumps({{"is_error": False, "usage": usage, "result": replies[mode]}}))
+    print(json.dumps({{"is_error": False, "usage": usage, "total_cost_usd": COST, "result": replies[mode]}}))
 elif mode == "login":
     print(json.dumps({{"is_error": True, "result": "Not logged in · Please run /login"}})); sys.exit(1)
 elif mode == "limit":
@@ -103,6 +104,7 @@ async def test_text_reply_and_usage(shim: Path, tmp_path: Path) -> None:
     done = events[-1]
     assert done.message.content == "hello" and not done.message.tool_calls
     assert done.usage.prompt_tokens == 153 and done.usage.completion_tokens == 7  # input + cache read + cache write
+    assert done.usage.cost_usd == 0.0125  # Claude Code's own list-price figure, recorded in /stats
     await p.aclose()
 
 

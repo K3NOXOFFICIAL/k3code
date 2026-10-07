@@ -2,8 +2,9 @@
 
 Rows are appended from router/loop events (model calls with token counts,
 failovers, retries, pauses with the time they lasted, tool calls, approval
-prompts). ``cost_usd`` stays NULL unless a price is known; stats then report
-cost as unknown instead of inventing a number.
+prompts). ``cost_usd`` stays NULL unless the provider reports a cost (the claude-cli provider passes on
+Claude Code's own list-price figure, which is not what a Claude plan bills); stats then report cost as
+unknown instead of inventing a number.
 """
 
 from __future__ import annotations
@@ -156,6 +157,8 @@ class UsageDB:
                     t["calls"] += 1
                     t["tokens_in"] += t_in
                     t["tokens_out"] += t_out
+                    if cost is not None:  # only providers that report a cost (claude-cli) add this key
+                        t["cost_usd"] = t.get("cost_usd", 0.0) + cost
                 if task_kind:
                     g["by_kind"][task_kind] = g["by_kind"].get(task_kind, 0) + 1
             elif kind == "failover":

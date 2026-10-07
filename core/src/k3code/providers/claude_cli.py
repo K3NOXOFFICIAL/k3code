@@ -288,4 +288,9 @@ def _parse_tool_calls(body: str) -> list[ToolCall]:
 def _usage(result: dict[str, Any]) -> Usage:
     u = result.get("usage") or {}
     prompt = sum(int(u.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
-    return Usage(prompt_tokens=prompt, completion_tokens=int(u.get("output_tokens") or 0))
+    cost = result.get("total_cost_usd")  # Claude Code's own list-price figure (a plan is not billed this)
+    return Usage(
+        prompt_tokens=prompt,
+        completion_tokens=int(u.get("output_tokens") or 0),
+        cost_usd=float(cost) if isinstance(cost, int | float) else None,
+    )
