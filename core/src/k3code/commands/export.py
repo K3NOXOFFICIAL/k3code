@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from k3code.artifacts import register_artifact
 from k3code.bundle import BundleError, write_bundle
 from k3code.commands import CommandDef
 from k3code.commands._util import pop_flag, pop_option, reply, session_cwd, split_args
@@ -66,6 +67,7 @@ class ExportCommand(CommandDef):
             )
         except BundleError as e:
             return reply(f"Export failed: {e}")
+        register_artifact(ctx, "export", out, title=out.name, session=session_id or "")
         c = manifest["contents"]
         return reply(
             f"Exported {len(c['sessions'])} session(s), {len(c['settings'])} settings file(s) to {out} "

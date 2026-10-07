@@ -40,6 +40,26 @@ export interface K3GatewayEventMap {
     scope: string
     status: 'approved' | 'proposed' | 'rejected'
   }
+  'fanout.plan': {
+    fanout_id: string
+    max_parallel: number
+    require_tests: boolean
+    subtasks: { id: string; state: string; title: string }[]
+    test_command?: string
+  }
+  'fanout.progress': {
+    detail?: string
+    done: number
+    fanout_id: string
+    state: string
+    subtask_id: string
+    title: string
+    total: number
+  }
+  'fanout.done': { escalated: number; fanout_id: string; merged: number; ok: boolean; summary: string; tests: string; total: number }
+  'ultra.progress': { agents?: number; command: string; detail?: string; max_agents?: number; phase: string; tokens?: number }
+  'research.progress': { detail?: string; phase: string }
+  'session.background_done': { origin_session: string; session_id: string; state: string }
   'proposal.show': { action: string; id: string; kind: 'also_setup' | 'consequence' | 'improvement'; text: string }
   'routing.escalated': { from: string; reason: string; task_kind: string; to: string }
   'scope.verdict': { fanout_candidate?: boolean; needs_plan: boolean; reason: string; risk: string; scope: string; source: string }

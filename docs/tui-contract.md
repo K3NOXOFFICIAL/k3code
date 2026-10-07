@@ -345,3 +345,20 @@ These components should be hidden/stubbed in k3code M1. The pet/voice/wake/billi
 4. Hide/stub the 76 cut methods and 34 cut events
 5. Wire stdio transport in `core/gateway_entry.py` matching `tui_gateway/entry.py`
 6. Add `k3codeMode` flag to TUI to hide cut components
+
+## k3code M4b additions (Python gateway; not part of the Hermes contract)
+
+RPC: `prompt.background {session_id, text?}` (with `text`: new background session; without: hand the running turn
+to a background session and attach the client to a fresh one → `{session_id, new_session_id, status, info}`),
+`subagent.list`, `subagent.interrupt`, `subagent.tail` (served for the children of the `task` tool, fan-out and the
+ultra commands). Slash commands: `/bg`, `/ultraplan`, `/ultracode`, `/ultraresearch`, `/artifacts`.
+
+Events (all carry `session_id`): `subagent.spawn_requested|start|tool|progress|complete` (payload: `subagent_id`,
+`parent_id`, `depth` (0-based), `goal`, `model`, `task_index`, `task_count`, `tool_count`, `status`, `agent_type`,
+`tier`, `tool_name`/`tool_preview`, `summary`, `duration_seconds`),
+`fanout.plan {fanout_id, subtasks[], max_parallel, io_heavy, require_tests, test_command}`,
+`fanout.progress {fanout_id, subtask_id, title, state, detail, done, total, subagent_ids}` (states: running, reviewing,
+retrying, merging, testing, merged, escalated, failed, skipped), `fanout.done {fanout_id, ok, merged, escalated, total,
+tests, summary}`, `ultra.progress {command, phase, detail, agents, tokens, max_agents, max_tokens}`,
+`research.progress {phase, detail}`, `session.background_done {session_id, state, origin_session}`; background
+sessions also notify through `notification.show {kind: "background"}`.

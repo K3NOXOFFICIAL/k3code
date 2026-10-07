@@ -67,7 +67,7 @@ def test_non_interactive_writes_config_and_env(env: Path) -> None:
         "fast": "m-fast",
     }
     assert cfg["permission_mode"] == "ask" and cfg["output_style"] == "concise"
-    assert cfg["autonomy"] == {"plan_first": True, "fanout_cap": 2}
+    assert cfg["autonomy"] == {"plan_first": True, "fanout": {"max_parallel": 2}}
     assert cfg["display"] == {"theme": "midnight", "focus_mode": True}
     assert cfg["panes"]["keymap"] == "tuios"
     assert cfg["permissions"]["hardline"] == ["ssh \\S+ systemctl"]

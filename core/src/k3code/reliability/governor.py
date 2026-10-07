@@ -112,6 +112,7 @@ class GovernorConfig:
     psi_path: str = "/proc/pressure"  # overridable in tests
     max_io_heavy: int = 2
     max_total: int = 4
+    max_parallel_agents: int = 3  # sub-agent fan-out width; IO-heavy work is capped at max_io_heavy
     per_provider_streams: int = 4
     min_free_bytes: int = 2 * 1024 * 1024 * 1024  # 2 GB
     home: Path = Path.home() / ".k3code"  # disk-guard target ($K3CODE_HOME)
@@ -152,6 +153,11 @@ class Governor:
         """IO ``some avg10``; 0 when PSI is unavailable (do not block on unknown)."""
         psi = self.read_psi("io")
         return psi.get("some_avg10", 0.0)
+
+    def agent_cap(self, requested: int, *, io_heavy: bool = False) -> int:
+        """How many sub-agents may run at once: the request, bounded by ``max_parallel_agents`` (and the IO cap)."""
+        cap = min(max(1, requested), self.config.max_parallel_agents)
+        return min(cap, self.config.max_io_heavy) if io_heavy else cap
 
     def io_admission_ok(self) -> bool:
         return self.io_pressure() < self.config.psi_io_threshold

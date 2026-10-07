@@ -52,7 +52,7 @@ BUILTIN_BASH_ALLOW = [
     "git log*",
 ]
 
-PURE_TOOLS = frozenset({"read", "grep", "glob", "todo", "skill", "mcp_tool_search"})
+PURE_TOOLS = frozenset({"read", "grep", "glob", "todo", "skill", "mcp_tool_search", "task", "task_result"})
 EDIT_TOOLS = frozenset({"write", "edit"})
 READ_TOOLS = frozenset({"read", "grep", "glob"})  # path-taking read-only tools
 EXIT_PLAN_TOOL = "exit_plan"

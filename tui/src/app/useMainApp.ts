@@ -933,6 +933,7 @@ export function useMainApp(gw: GatewayClient) {
       dispatchSubmission,
       guardBusySessionSwitch: session.guardBusySessionSwitch,
       newSession: session.newSession,
+      resumeById: session.resumeById,
       sys
     },
     composer: { actions: composerActions, refs: composerRefs, state: composerState },

@@ -32,8 +32,11 @@ from typing import Any
 
 from k3code import confio
 from k3code.agent.loop import AgentLoop, ApprovalResult
+from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, autonomy_cfg
+from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
+from k3code.autonomy.ultra import Ultra
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, load_config
@@ -66,10 +69,14 @@ from k3code.redact import redact
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
 from k3code.reliability.persistent_retry import TurnCancelled
+from k3code.research.flow import Research
+from k3code.research.tools import register_web_tools
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 from k3code.routing.caller import ModelCaller
 from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router_options, tier_for
 from k3code.session_ai import make_title
+from k3code.subagents import SubagentManager
+from k3code.subagents.tools import register_task_tools
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -142,6 +149,8 @@ class LiveSession:
         self.last_api_calls = 0
         #: Task kind for the next unattended turn (``loop_tick`` / ``cron_job`` / ``background_turn``).
         self.task_kind: str = ""
+        #: /go after /ultraplan: {task, plan, path}; consumed by the next turn's scope gate.
+        self.preapproved_plan: dict[str, Any] | None = None
 
     @property
     def state(self) -> str:
@@ -264,6 +273,7 @@ class GatewayServer:
         self.safe_mode_notice = ""
         self._client_seq = 0
         self.usage = UsageDB(self._home() / "usage.db")
+        self.artifacts = ArtifactStore(self._home() / "artifacts.db")
         self._tiers: TierRouters | None = None
         self._side_tasks: set[asyncio.Task[Any]] = set()  # fire-and-forget work (titles)
         #: (provider, model) of the most recent router attempt on any task (side calls read it).
@@ -276,6 +286,11 @@ class GatewayServer:
         #: Automation engine (loops, cron, triggers); started by the daemon or on the first /loop|/schedule.
         self.automation: Any = None
         self.last_user_activity = time.time()
+        self.subagents = SubagentManager(self)
+        self.fanout = FanoutExecutor(self)
+        self.ultra = Ultra(self)
+        self.research = Research(self)
+        self.research_tools: Any = None  # test seam: replaces the MCP/built-in search+fetch provider
 
     # ── session registry ──────────────────────────────────────────────
 
@@ -524,6 +539,18 @@ class GatewayServer:
                     "background": s.background,
                     "origin": s.stored.meta.get("origin", ""),
                     "title": s.stored.title or "Session",
+                }
+            )
+        for h in self.subagents.handles.values():  # sub-agent / fan-out children share the strip
+            if h.status not in ("queued", "running"):
+                continue
+            rows.append(
+                {
+                    "current": False, "id": h.id, "last_active": h.started_at, "message_count": h.tool_count,
+                    "model": h.model or h.tier, "preview": h.description[:120], "session_key": h.id,
+                    "started_at": h.started_at, "status": h.status, "state": h.status, "paused": False,
+                    "background": True, "origin": "subagent", "parent_id": h.parent_sid,
+                    "title": h.description[:60] or "Sub-agent",
                 }
             )
         return rows
@@ -844,6 +871,8 @@ class GatewayServer:
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
             install(loop.tools)
+        register_task_tools(loop.tools, self, session, depth=1)
+        register_web_tools(loop.tools, self.config)
         return loop
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
@@ -897,6 +926,17 @@ class GatewayServer:
             session.current_kind = kind.value
             history = session.history
             prompt = gate.prompt
+            if gate.proceed and (subtasks := self.fanout.applies(session, gate)):
+                fan = await self.fanout.run(session, text, gate.plan, subtasks)  # M4b: parallel worktree children
+                if fan is not None and fan.ok:
+                    gate.proceed, gate.message = False, fan.summary()
+                    session.stored.messages = [
+                        *session.stored.messages, {"role": "user", "content": text},
+                        {"role": "assistant", "content": gate.message},
+                    ]
+                    self.store.save(session.stored)
+                elif fan is not None:
+                    prompt = fan.escalation_prompt(text)  # the parent finishes what the children could not
             if not gate.proceed:
                 final_text = gate.message
                 session.emit("message.delta", {"text": gate.message})
@@ -1265,12 +1305,123 @@ class GatewayServer:
             self._running = False
         return result
 
+    # ── long-running command jobs (/ultraplan, /ultracode, /ultraresearch) ──
+
+    def start_job(self, session: LiveSession, label: str, make_coro: Callable[[], Any]) -> None:
+        """Run ``make_coro()`` as the session's turn: it shows as working, /stop interrupts it, and its returned
+        text becomes the assistant message."""
+        if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
+            raise _InvalidParams("a turn is already running in this session; /stop it or wait")
+
+        async def runner() -> None:
+            _ctx_session.set(session)
+            session.needs_input = False
+            session.streaming = True
+            session.emit("message.start", {})
+            session.emit("status.update", {"kind": "status", "text": label, "state": "working"})
+            status, text = "done", ""
+            try:
+                text = await make_coro()
+            except asyncio.CancelledError:
+                status, text = "interrupted", f"{label} interrupted."
+            except Exception as e:  # noqa: BLE001 - a failed job is reported, never crashes the gateway
+                logger.exception("%s failed", label)
+                status, text = "error", f"{label} failed: {e}"
+                session.emit("error", {"message": text})
+            finally:
+                session.streaming = False
+                self.subagents.interrupt_session(session.session_id)  # nothing may outlive the job
+            session.emit("message.delta", {"text": text})
+            session.stored.messages = [
+                *session.stored.messages, {"role": "user", "content": label}, {"role": "assistant", "content": text},
+            ]
+            self.store.save(session.stored)
+            session.emit("message.complete", {"text": text, "usage": {}, "status": status, "error": None,
+                                              "state": session.state})
+            session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+
+        session.turn_task = asyncio.get_running_loop().create_task(runner())
+
+    # ── background sessions (/bg, Ctrl+B) ─────────────────────────────
+
+    def _fresh_session_like(self, src: LiveSession, *, background: bool = False) -> LiveSession:
+        """A new session with ``src``'s cwd, model, permission mode and add-dirs."""
+        stored = self.store.create(model=src.stored.model or self.config.default_model,
+                                   provider=src.stored.provider or "", cwd=src.stored.cwd or str(Path.cwd()))
+        stored.meta["mode"] = src.perms.mode.value
+        stored.meta["add_dirs"] = list(src.perms.add_dirs)
+        if background:
+            stored.meta["background"] = True
+            stored.meta["origin_session"] = src.session_id
+        self.store.save(stored)
+        live = LiveSession(stored.session_id, stored, self)
+        live.reasoning_effort = src.reasoning_effort
+        self.live[live.session_id] = live
+        return live
+
+    def start_background(self, origin: LiveSession, prompt: str) -> LiveSession:
+        """``/bg <prompt>``: run ``prompt`` in a new background session; notify ``origin`` when it ends."""
+        if self.background_paused:
+            raise _InvalidParams("background work is paused (restart-storm safe mode); resume with /daemon resume")
+        live = self._fresh_session_like(origin, background=True)
+        live.stored.title = live.stored.title or " ".join(prompt.split())[:60]
+        self.store.save(live.stored)
+        live.turn_task = asyncio.get_running_loop().create_task(self._run_turn(live, prompt))
+        self._watch_background(live, origin.session_id)
+        return live
+
+    def background_current(self, session: LiveSession, client: Client | None) -> LiveSession:
+        """Ctrl+B: the running turn keeps going as a background session; the client gets a fresh foreground one."""
+        session.background = True
+        session.stored.meta["background"] = True
+        session.stored.meta["origin_session"] = session.session_id
+        if session.loop is not None:
+            session.loop.background = True  # bash is sandboxed from now on
+        self.store.save(session.stored)
+        fresh = self._fresh_session_like(session)
+        if client is not None:
+            self.attach(client, fresh)
+        session.emit("session.info", session.live_info())
+        if session.turn_task is not None:
+            self._watch_background(session, fresh.session_id)
+        return fresh
+
+    def _watch_background(self, live: LiveSession, notify_sid: str) -> None:
+        """Tell ``notify_sid``'s clients when the background session finishes or needs input."""
+        task = live.turn_task
+        if task is None:
+            return
+
+        def done(t: asyncio.Task[Any]) -> None:
+            title = live.stored.title or live.session_id[:8]
+            if t.cancelled():
+                text, level = f"Background session '{title}' was stopped.", "warning"
+            elif live.needs_input:
+                text, level = f"Background session '{title}' needs your input.", "warning"
+            elif t.exception() is not None:
+                text, level = f"Background session '{title}' failed: {t.exception()}", "error"
+            else:
+                last = next((m.get("content") for m in reversed(live.messages) if m.get("role") == "assistant"), "")
+                text, level = f"Background session '{title}' finished. {str(last or '')[:160]}".strip(), "info"
+            target = self.live.get(notify_sid)
+            payload = {"text": text, "level": level, "kind": "background", "key": f"bg-{live.session_id}",
+                       "session_id": live.session_id}
+            if target is not None:
+                target.emit("notification.show", payload, importance="essential")
+            else:
+                self.emit("notification.show", payload, importance="essential")
+            self.emit("session.background_done", {"session_id": live.session_id, "state": live.state,
+                                                  "origin_session": notify_sid}, importance="essential")
+
+        task.add_done_callback(done)
+
     async def interrupt_turn(self, session_id: str | None = None) -> bool:
         """Interrupt the running turn (session.interrupt, /stop)."""
         session = self._session_for(session_id)
         if session is None or session.turn_task is None or session.turn_task.done():
             return False
         session.loop.interrupt() if session.loop else None
+        self.subagents.interrupt_session(session.session_id)
         if session.reliability is not None:
             session.reliability.cancel()  # abort a paused/parked wait too
         session.turn_task.cancel()
@@ -1530,6 +1681,43 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     return {"turn_id": session.turn_task.get_name(), "status": "streaming"}
 
 
+async def _prompt_background(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``/bg``/Ctrl+B. With ``text``: new background session. Without: hand the running turn off."""
+    session = server._session_for(params.get("session_id")) or server.session
+    if session is None:
+        raise _InvalidParams("no active session")
+    text = str(params.get("text") or "").strip()
+    if text:
+        live = server.start_background(session, text)
+        return {"session_id": live.session_id, "status": "started", "info": live.live_info()}
+    if not session.streaming or session.turn_task is None or session.turn_task.done():
+        raise _InvalidParams("nothing is running in this session; give a prompt: /bg <prompt>")
+    fresh = server.background_current(session, _ctx_client.get())
+    return {"session_id": session.session_id, "new_session_id": fresh.session_id, "status": "backgrounded",
+            "info": fresh.live_info()}
+
+
+async def _subagent_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    sid = params.get("session_id") or (server.session.session_id if server.session else "")
+    rows = [
+        {"subagent_id": h.id, "parent_id": h.parent_child_id, "depth": h.depth - 1, "goal": h.description,
+         "model": h.model or h.tier, "started_at": h.started_at, "status": h.status, "tool_count": h.tool_count,
+         "last_tool": h.last_tool}
+        for h in server.subagents.for_session(sid)
+    ]
+    return {"subagents": rows, "delegations": []}
+
+
+async def _subagent_interrupt(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    hid = str(_require(params, "subagent_id"))
+    return {"found": server.subagents.interrupt(hid), "subagent_id": hid}
+
+
+async def _subagent_tail(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    h = server.subagents.handles.get(str(_require(params, "subagent_id")))
+    return {"text": "\n".join(h.tail[-30:]) + (("\n" + h.result) if h and h.done else "") if h else ""}
+
+
 async def _clipboard_paste(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     # M1: no clipboard integration; the TUI pastes text inline instead.
     return {"text": "", "images": [], "files": []}
@@ -1674,6 +1862,10 @@ _HANDLERS: dict[str, Any] = {
     "session.mode.cycle": _session_mode_cycle,
     "session.mode.set": _session_mode_set,
     "prompt.submit": _prompt_submit,
+    "prompt.background": _prompt_background,
+    "subagent.list": _subagent_list,
+    "subagent.interrupt": _subagent_interrupt,
+    "subagent.tail": _subagent_tail,
     "clipboard.paste": _clipboard_paste,
     "image.attach": _image_attach,
     "image.attach_bytes": _image_attach,
