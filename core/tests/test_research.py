@@ -7,12 +7,14 @@ import re
 from types import SimpleNamespace
 
 import httpx
+import pytest
 import respx
 
-from k3code.research.flow import finalize_report, loose_json
+from k3code.research.flow import finalize_report, is_dead_link, loose_json
 from k3code.research.state import ResearchState
 from k3code.research.tools import (
     BuiltinTools,
+    DeadLink,
     Hit,
     McpTools,
     ResearchTools,
@@ -209,33 +211,91 @@ def test_parse_search_text_json_and_plain():
     assert [h.url for h in parse_search_text(plain)] == ["http://one.test/page", "http://two.test"]
 
 
+def mcp_tool(name: str) -> SimpleNamespace:
+    return SimpleNamespace(name=name, qualified=f"mcp__k3nox__{name}", schema={"properties": {"query": {}, "url": {}}})
+
+
+class FakeMcp:
+    """MCP client stub: the search tool answers with ``hits`` as JSON results, the fetch tool with ``fetch_reply``
+    (a dict, or a callable taking the URL)."""
+
+    def __init__(self, tools=(), hits=None, fetch_reply=None):
+        self._t = list(tools)
+        self.calls: list[tuple[str, dict]] = []
+        self.hits = hits if hits is not None else [{"title": "H", "url": "http://h.test", "content": ""}]
+        self.fetch_reply = fetch_reply if fetch_reply is not None else {"content": "fetched text"}
+
+    def tools(self):
+        return self._t
+
+    async def call(self, q, args):
+        self.calls.append((q, args))
+        if "search" in q:
+            return {"content": json.dumps({"results": self.hits})}
+        return self.fetch_reply(args["url"]) if callable(self.fetch_reply) else self.fetch_reply
+
+
 async def test_pick_tools_prefers_mcp_search_and_fetch():
-    class FakeMcp:
-        def __init__(self, tools):
-            self._t = tools
-            self.calls = []
-
-        def tools(self):
-            return self._t
-
-        async def call(self, q, args):
-            self.calls.append((q, args))
-            if "search" in q:
-                return {"content": json.dumps({"results": [{"title": "H", "url": "http://h.test", "content": ""}]})}
-            return {"content": "fetched text"}
-
-    def tool(name):
-        return SimpleNamespace(
-            name=name, qualified=f"mcp__k3nox__{name}", schema={"properties": {"query": {}, "url": {}}}
-        )
-
-    mcp = FakeMcp([tool("hub_searxng__search"), tool("hub_fetch__fetch")])
+    mcp = FakeMcp([mcp_tool("hub_searxng__search"), mcp_tool("hub_fetch__fetch")])
     picked = pick_tools(SimpleNamespace(research={}), mcp)
     assert isinstance(picked, McpTools) and "hub_searxng__search" in picked.name
     assert [h.url for h in await picked.search("q")] == ["http://h.test"]
     assert await picked.fetch("http://h.test") == ("http://h.test", "fetched text")
     assert mcp.calls[0][1] == {"query": "q"} and mcp.calls[1][1] == {"url": "http://h.test"}
     assert isinstance(pick_tools(SimpleNamespace(research={}), FakeMcp([])), BuiltinTools)
+
+
+@pytest.mark.parametrize(
+    ("error", "dead"),
+    [
+        ("404 Not Found", True),
+        ("410 Gone", True),
+        ("HTTP 503 Service Unavailable", True),
+        ("getaddrinfo ENOTFOUND example.org", True),
+        ("connection refused", True),
+        ("timeout", False),
+        ("connection timed out", False),
+        ("403 Forbidden", False),
+    ],
+)
+async def test_mcp_fetch_errors_are_dead_links_only_when_the_page_is_gone(error, dead):
+    mcp = FakeMcp(fetch_reply={"error": error})
+    tools = McpTools(mcp, mcp_tool("hub_searxng__search"), mcp_tool("hub_fetch__fetch"),
+                     BuiltinTools(None, keyless_fallback=False))
+    with pytest.raises(RuntimeError) as info:
+        await tools.fetch("https://example.org/x")
+    assert isinstance(info.value, DeadLink) is dead
+    assert is_dead_link(info.value) is dead
+    assert dead or type(info.value) is RuntimeError  # anything else stays a plain RuntimeError
+
+
+@pytest.mark.parametrize(("error", "dead"), [("404 Not Found", True), ("timeout", False)])
+async def test_mcp_404_drops_the_source_and_backfill_reads_a_replacement(tmp_path, monkeypatch, error, dead):
+    """A 404 from the MCP fetch drops that source and the backfill reads a spare hit instead; a timeout keeps the
+    search snippet as the source's text, so the source stays."""
+    hits = [{"title": f"t{i}", "url": f"https://example.org/{i}", "content": f"snippet {i}"} for i in range(6)]
+
+    def reply(url):
+        return {"error": error} if url.endswith("/0") else {"content": "page text"}
+
+    mcp = FakeMcp(hits=hits, fetch_reply=reply)
+    server = make(tmp_path, monkeypatch, [
+        {"type": "text", "match": "Number of sub-topics", "text": '{"sub_topics":[{"name":"A","queries":["a"]}]}'},
+        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+        {"type": "text", "text": "ok"},
+    ], mode="auto", research={"sources_per_topic": 4, "min_sources": 4, "sub_questions": 1})
+    server.research_tools = McpTools(mcp, mcp_tool("hub_searxng__search"), mcp_tool("hub_fetch__fetch"),
+                                     BuiltinTools(None, keyless_fallback=False))
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    res = await server.research.run(server.session, "q", n_sub=1)
+    urls = {s.url for s in res.state.sources}
+    fetched = [args["url"] for q, args in mcp.calls if q.endswith("__fetch")]
+    assert len(urls) == 4
+    if dead:
+        assert "https://example.org/0" not in urls
+        assert "https://example.org/4" in urls and "https://example.org/4" in fetched  # the spare hit replaced it
+    else:
+        assert "https://example.org/0" in urls  # the snippet is still real content from a page that exists
 
 
 def test_finalize_report_and_loose_json():

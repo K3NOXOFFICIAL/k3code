@@ -21,7 +21,7 @@ from k3code.artifacts import write_artifact_file
 from k3code.providers.types import Message
 from k3code.research import prompts
 from k3code.research.state import Learning, ResearchState, SubTopic
-from k3code.research.tools import Hit, ResearchTools, pick_tools
+from k3code.research.tools import DeadLink, Hit, ResearchTools, pick_tools
 from k3code.routing.tiers import TaskKind, Tier
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,8 @@ def is_dead_link(exc: BaseException) -> bool:
     """True when the page is gone (404/410, any 5xx, no connection), so citing it would hand the reader a dead link.
     A 401/403/429 (the site refuses a script, e.g. StackOverflow) or a timeout means the page exists: the search
     snippet is still real content from it."""
+    if isinstance(exc, DeadLink):  # the MCP fetch path reports the same conditions as a DeadLink
+        return True
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
         return code in (404, 410) or code >= 500
