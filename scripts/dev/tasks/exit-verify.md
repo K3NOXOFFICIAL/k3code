@@ -90,3 +90,8 @@ Chaos, via the proxy:
 
 ## Also fix
 - `/help` lists `/loop` and `/schedule` twice (duplicate registration after the merges): dedupe the registry and add a test that `/help` has no duplicates.
+
+## Hard rules for this run
+- NEVER run `go test ./...` (or any broad `go test`) in `panes/`: the upstream tuios remote-sync tests recurse (`$SHELL -l -c "command -v tuios"`) and exhausted this laptop's memory. Run only `go test ./internal/k3keys/... ./internal/harness/... ./internal/input/ ./internal/app/`, never `./cmd/...`, `./internal/federation/...` or `./...`.
+- Before every long command, check `free -g` (>= 4 GB available) and abort a check as PENDING if memory is short.
+- Never run more than one heavy process (go test, npm test, podman) at a time.

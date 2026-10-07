@@ -75,6 +75,12 @@ echo "$(date -Is) gateway=$HEALTH_URL" >> "$RUNS/driver.log"
 CLAUDE_FALLBACK_MODEL=${K3DEV_CLAUDE_FALLBACK:-claude-sonnet-5-5}
 GATEWAY_DOWN_GRACE=${K3DEV_GATEWAY_DOWN_GRACE:-600}   # seconds of OmniRoute outage before using Claude
 USE_CLAUDE=0
+# Every worker (and everything it spawns: tests, builds, daemons) runs in its own cgroup scope, so a
+# runaway process tree cannot take the laptop down (a recursing shell loop did exactly that once).
+SCOPE=()
+if [ "${K3DEV_NO_SCOPE:-0}" != 1 ] && command -v systemd-run >/dev/null 2>&1; then
+  SCOPE=(systemd-run --user --scope -q -p "MemoryMax=${K3DEV_MEM_MAX:-6G}" -p "TasksMax=${K3DEV_TASKS_MAX:-1500}" --)
+fi
 IDLE_KILL=${K3DEV_IDLE_KILL:-480}   # seconds without transcript activity before a call counts as hung
 PROJ_DIR="$HOME/.claude/projects/$(printf '%s' "$WT" | sed 's#[/.]#-#g')"
 
@@ -133,7 +139,7 @@ while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
     MSG="You stopped before finishing. Do NOT stop to announce next steps — keep calling tools until the whole task is done. Continue exactly where you left off, then verify the acceptance criteria, commit, and write REPORT.md."
     RES=(--resume "$SESSION")
   fi
-  (cd "$WT" && exec nice -n 10 ionice -c3 claude -p "${SET[@]}" --model "$MODEL" "${FB[@]}" \
+  (cd "$WT" && exec "${SCOPE[@]}" nice -n 10 ionice -c3 claude -p "${SET[@]}" --model "$MODEL" "${FB[@]}" \
      --permission-mode auto --output-format json "${RES[@]}" "$MSG") > "$out" 2> "$RUNS/attempt-$attempt.err" &
   cpid=$!
   # Idle watchdog: a hung model call leaves the session transcript untouched; kill and resume.
