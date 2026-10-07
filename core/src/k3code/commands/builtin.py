@@ -12,6 +12,7 @@ from k3code.commands.daemon import DaemonCommand
 from k3code.commands.debug import DebugCommand
 from k3code.commands.doctor import DoctorCommand
 from k3code.commands.stats import StatsCommand
+from k3code.commands.update_cmd import UpdateCommand
 from k3code.config import load_config
 from k3code.session_ai import compact_messages
 
@@ -219,6 +220,7 @@ def build_registry() -> CommandRegistry:
         _ExitCommand(),
         _HelpCommand(),
         DoctorCommand(),
+        UpdateCommand(),
         StatsCommand(),
         DebugCommand(),
         DaemonCommand(),

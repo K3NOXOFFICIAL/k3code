@@ -77,6 +77,7 @@ def render_text(v: dict[str, Any]) -> str:
         "providers:    " + (provs or "none"),
         "paths:",
         *(f"  {k}: {p}" for k, p in v["paths"].items()),
+        "hint: re-run any setup step with `k3code setup --step <name>` (providers, tiers, permissions, theme, ...)",
     ]
     return "\n".join(lines)
 

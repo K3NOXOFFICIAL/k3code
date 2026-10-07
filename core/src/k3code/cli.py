@@ -7,7 +7,6 @@ import contextlib
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +14,7 @@ from typing import Any
 
 import click
 
+from k3code import __version__
 from k3code.agent.loop import AgentLoop
 from k3code.config import K3CODE_HOME, _current_home, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
@@ -348,7 +348,9 @@ def _run_gateway() -> None:
 
 def _launch_tui(*, model: str | None = None) -> None:
     """Spawn the built TUI (tui/dist/entry.js) with this process as its gateway."""
-    node = shutil.which("node")
+    from k3code.paths import find_node
+
+    node = find_node()
     repo_root = _find_repo_root()
     entry = repo_root / "tui" / "dist" / "entry.js" if repo_root else None
     if node is None or entry is None or not entry.is_file():
@@ -371,14 +373,17 @@ def _launch_tui(*, model: str | None = None) -> None:
 
 def _find_repo_root() -> Path | None:
     """Walk up from cwd for a tui/dist/entry.js (works from the repo or installed)."""
+    from k3code.paths import data_dir
+
     here = Path(__file__).resolve()
-    for candidate in (Path.cwd(), *here.parents):
+    for candidate in (Path.cwd(), *here.parents, data_dir() / "current"):
         if (candidate / "tui" / "dist" / "entry.js").is_file():
             return candidate
     return None
 
 
 @click.group(invoke_without_command=True)
+@click.version_option(__version__, "--version", prog_name="k3code")
 @click.pass_context
 @click.option("-p", "--prompt", help="Headless prompt; omit for TUI/REPL")
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
@@ -406,6 +411,19 @@ def cli(
 ) -> None:
     """k3code — terminal coding agent."""
     if ctx.invoked_subcommand is None:
+        if prompt is None and sys.stdin.isatty() and sys.stdout.isatty():
+            from k3code.setup.wizard import needs_setup
+
+            if needs_setup():
+                click.echo("No k3code config found: starting guided setup.")
+                from k3code.setup.prompter import InteractivePrompter
+                from k3code.setup.wizard import run_setup
+
+                try:
+                    run_setup(InteractivePrompter())
+                except (KeyboardInterrupt, EOFError):
+                    click.echo("\nSetup interrupted; re-run `k3code setup` to resume.")
+                    raise SystemExit(130) from None
         ctx.invoke(
             main,
             prompt=prompt,
@@ -565,6 +583,81 @@ def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool) -
     finally:
         store.close()
     click.echo("Imported.\n" + rep.describe())
+
+
+@cli.command("setup")
+@click.option("--step", "step", help="Re-run a single step (welcome, about, system, usage, providers, tiers, ...)")
+@click.option("--non-interactive", is_flag=True, help="Take every answer from --answers")
+@click.option("--answers", type=click.Path(path_type=Path, exists=True, dir_okay=False), help="YAML answers file")
+@click.option("--restart", is_flag=True, help="Ignore saved progress and start over")
+@click.option("--no-probe", is_flag=True, help="Skip live provider/integration tests")
+def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, restart: bool, no_probe: bool) -> None:
+    """Guided, resumable first-run setup."""
+    from k3code.setup.prompter import AnswerPrompter, InteractivePrompter
+    from k3code.setup.wizard import run_setup
+
+    if non_interactive:
+        if answers is None:
+            raise click.UsageError("--non-interactive needs --answers FILE")
+        p: Any = AnswerPrompter.from_file(answers)
+    else:
+        p = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
+    try:
+        run_setup(p, only_step=step, restart=restart, do_probe=not no_probe)
+    except ValueError as e:
+        raise click.ClickException(str(e)) from e
+    except (KeyboardInterrupt, EOFError):
+        click.echo("\nInterrupted; progress saved. Re-run `k3code setup` to resume.")
+        raise SystemExit(130) from None
+
+
+@cli.command("update")
+@click.option("--check", is_flag=True, help="Only report current and latest version")
+@click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation")
+@click.option("--channel", type=click.Choice(["stable", "dev"]), help="Release channel (default: update.channel)")
+@click.option("--from-source", is_flag=True, help="git pull the source checkout and rebuild")
+@click.option("--rollback", "do_rollback", is_flag=True, help="Switch back to the previous version")
+def update_cmd(check: bool, yes: bool, channel: str | None, from_source: bool, do_rollback: bool) -> None:
+    """Update to the latest release (smoke-tested, auto-rollback) or roll back."""
+    from k3code import update as upd
+
+    if do_rollback:
+        res = upd.rollback()
+        click.echo(res.message)
+        raise SystemExit(0 if res.ok else 1)
+    cfg = upd.update_settings()
+    cur = upd.current_version()
+    if from_source:
+        src = upd.source_checkout()
+        if src is None or not (src / ".git").exists():
+            raise click.ClickException("no source checkout known; set update.source in config.yaml")
+        click.echo(f"current: {cur}\nsource: {src}")
+        if check:
+            return
+        if not yes:
+            click.confirm("git pull and rebuild?", abort=True)
+        ver = upd.update_from_source(src)
+    else:
+        try:
+            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token())
+        except (PermissionError, Exception) as e:  # noqa: BLE001
+            raise click.ClickException(str(e)) from e
+        if rel is None:
+            raise click.ClickException("no releases found on this channel")
+        click.echo(f"current: {cur}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
+        if check or (cur and upd.version_key(rel.version) <= upd.version_key(cur.split("-src")[0])):
+            if not check:
+                click.echo("Already up to date.")
+            return
+        if not yes:
+            click.confirm(f"Update to {rel.version}?", abort=True)
+        upd.install_release(rel, upd.github_token())
+        ver = rel.version
+    res = upd.activate(ver)
+    click.echo(res.message)
+    if res.ok:
+        upd.prune()
+    raise SystemExit(0 if res.ok else 1)
 
 
 @cli.command("config-edit")
