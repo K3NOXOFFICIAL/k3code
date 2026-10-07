@@ -2,6 +2,7 @@ import { compactNumber } from '@k3code/shared/format'
 
 import { introMsg, toTranscriptMessages } from '../../../domain/messages.js'
 import { sessionScopedModelArg, TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
+import { parsePetCommand } from '../../../lib/terminalPet.js'
 import type {
   BackgroundStartResponse,
   ConfigGetValueResponse,
@@ -15,6 +16,7 @@ import type { PanelSection } from '../../../types.js'
 import { applyConfiguredTuiTheme } from '../../createGatewayEventHandler.js'
 import { DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES, type IndicatorStyle } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
+import { $petEnabled, $petName, setPetEnabled, setPetName } from '../../petStore.js'
 import { patchUiState } from '../../uiStore.js'
 import type { SlashCommand } from '../types.js'
 
@@ -330,6 +332,25 @@ export const sessionCommands: SlashCommand[] = [
       ctx.gateway
         .rpc<ConfigSetResponse>('config.set', { key: 'skin', value: arg })
         .then(ctx.guarded<ConfigSetResponse>(r => r.value && ctx.transcript.sys(`skin → ${r.value}`)))
+    }
+  },
+
+  {
+    help: 'terminal pet: /pet [on|off|toggle|status|random|<name>]',
+    name: 'pet',
+    usage: '/pet [on|off|toggle|status|random|<name>]',
+    run: (arg, ctx) => {
+      const result = parsePetCommand(arg, { enabled: $petEnabled.get(), name: $petName.get() })
+
+      if (result.enabled !== undefined) {
+        setPetEnabled(result.enabled)
+      }
+
+      if (result.name !== undefined) {
+        setPetName(result.name)
+      }
+
+      ctx.transcript.sys(result.message)
     }
   },
 

@@ -28,6 +28,7 @@ import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import { applyGoalSnapshot } from './goalStatus.js'
 import type { GatewayEventHandlerContext, NoticeLevel } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
+import { addOutputTokens, completionTokensOf } from './outputTokensStore.js'
 import { flashGoodVibes } from './petFlashStore.js'
 import { addProposal } from '../k3/proposalsStore.js'
 import { forgetServerRequest } from './serverRequestStore.js'
@@ -835,6 +836,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (usage) {
           patchUiState(state => ({ ...state, usage: { ...state.usage, ...usage } }))
+          // One completed LLM call's output tokens; the working line sums them per turn.
+          addOutputTokens(completionTokensOf(usage))
         }
 
         return
