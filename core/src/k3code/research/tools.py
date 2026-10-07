@@ -258,14 +258,30 @@ class McpTools(ResearchTools):
         return url, text[:MAX_FETCH_CHARS]
 
 
+#: Names that are searches/fetches of something other than the web (memory, sessions, skills, tool discovery, files).
+_NOT_WEB = ("memory", "session", "skill", "tool_search", "fleet", "mem0", "nc_", "file", "repo", "code")
+
+
+def rank_tool(tools: list[Any], strong: tuple[str, ...], generic: tuple[str, ...], exclude: tuple[str, ...]) -> Any:
+    """Best MCP tool for a web job: names with a ``strong`` marker first, then ``generic`` ones minus ``exclude``."""
+    for t in tools:
+        if any(m in t.qualified.lower() for m in strong):
+            return t
+    for t in tools:
+        name = t.qualified.lower()
+        if any(m in name for m in generic) and not any(x in name for x in exclude):
+            return t
+    return None
+
+
 def pick_tools(config: Any, mcp: Any) -> ResearchTools:
     """MCP search/fetch when connected, else the built-ins."""
     cfg = dict(getattr(config, "research", None) or {})
     builtin = BuiltinTools(cfg.get("searxng_url", DEFAULT_SEARXNG))
     tools = list(mcp.tools()) if mcp is not None else []
-    search = next((t for t in tools if "search" in t.name.lower() and "tool_search" not in t.name.lower()), None)
+    search = rank_tool(tools, ("searxng", "web_search", "websearch", "web-search"), ("search",), _NOT_WEB)
     if search is not None:
-        fetch = next((t for t in tools if "fetch" in t.name.lower() or "scrape" in t.name.lower()), None)
+        fetch = rank_tool(tools, ("hub_fetch", "web_fetch", "webfetch", "fetch_url"), ("fetch", "scrape"), _NOT_WEB)
         return McpTools(mcp, search, fetch, builtin)
     return builtin
 

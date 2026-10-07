@@ -1,3 +1,5 @@
+# Vendored from Eigenwise/atomic-agents@d2b61b90b2816dbdf9f42f8638b7d375bf08cd11:atomic-examples/deep-research/deep_research/main.py (MIT)
+# Design port: pipeline reimplemented over ModelCaller tiers; no code copied. See VENDOR.toml.
 """The research pipeline: plan sub-questions -> search (parallel, cheap) -> read+extract (parallel, cheap) ->
 cross-check claims (cheap) -> synthesize with numbered citations (strong). Flow adapted from atomic-agents
 deep-research (see ``prompts.py``); sources/learnings state in ``state.py``."""

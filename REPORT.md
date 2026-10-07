@@ -19,7 +19,7 @@
 **TUI/contract**: event types + handlers for `fanout.*`, `ultra.progress`, `research.progress`; `docs/tui-contract.md` section; `plan.show` note updated.
 
 ## Verification (exact commands)
-- `cd core && uv run pytest -q -o addopts=""` → `433 passed` (was 386; +47: `test_subagents` 10, `test_artifacts` 4, `test_bg` 5, `test_fanout` 11, `test_ultra` 9, `test_research` 8). `uv run ruff check src tests scripts` → All checks passed. `python3 scripts/vendor_check.py` → All checks passed.
+- `cd core && uv run pytest -q -o addopts=""` → `434 passed` (was 386; +47: `test_subagents` 10, `test_artifacts` 4, `test_bg` 5, `test_fanout` 11, `test_ultra` 9, `test_research` 8). `uv run ruff check src tests scripts` → All checks passed. `python3 scripts/vendor_check.py` → All checks passed.
 - `cd tui && npm ci && npm run build:ink && npm run build && npx tsc --noEmit && npx vitest run` → build OK, tsc clean, `Test Files 1 failed | 174 passed`, `Tests 1 failed | 1589 passed | 2 skipped` — the only failure is the known `textInputFastEcho`.
 - Fake-provider demo: `cd core && uv run python scripts/demo_ultracode.py` (`/ultracode` on a temp git repo, 3 parallel subtasks):
 
@@ -84,6 +84,9 @@ Final report line: `Budget used: 12/12 agents, 450/2000000 tokens`; tests passed
 - `/ultracode` cross-checks findings with two strong-tier model calls (one per lens) rather than two more child agents, to stay inside the default 12-agent budget (3 planners + 3 workers + 3 reviewers + 2 panel + 1 fixer = 12).
 - Reviewer verdict without a `VERDICT:` line counts as pass. Children inherit the parent's approval callback; in `default` mode their approvals reach the user's client.
 - `/artifacts open` prints the path and the `$EDITOR` command; it does not spawn the editor (the gateway has no terminal).
+- `child_reliability` drops `reliability.session_tokens`/`day_tokens`: children's usage is not counted against those budgets (only `ultracode.max_tokens` sees it).
+- Children run with netwatch off, so on network loss they retry/fail through the router instead of pausing like the parent.
+- MCP search/fetch tool choice is ranked (`searxng`/`web_search` first; memory/session/skill/file tools excluded) so k3nox `search_memory` etc. are never used for web queries.
 - Commit trailer is `Claude Sonnet 5.5` (harness attribution), as in earlier reports.
 
 ## Open TODOs

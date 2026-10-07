@@ -1,4 +1,5 @@
-# Design informed by hermes-agent hermes_cli/kanban_swarm.py + kanban_decompose.py (MIT); see VENDOR.toml.
+# Vendored from hermes-agent@4127d78da84b1eee105f298979cc57cc7457f98d:hermes_cli/kanban_swarm.py (MIT)
+# Design port only (decompose -> parallel workers -> review -> sequential merge); no code copied. See VENDOR.toml.
 """Automatic fan-out: run the parallelizable subtasks of a large plan as worktree children.
 
 Per subtask: worker child (own worktree) -> reviewer child against the acceptance criteria -> sequential

@@ -247,3 +247,20 @@ def test_finalize_report_and_loose_json():
     none, cited = finalize_report("No cites here.", st)
     assert cited == [] and "no verifiable citations" in none
     assert loose_json('prefix {"a": 1} suffix') == {"a": 1} and loose_json("zzz") is None
+
+
+async def test_pick_tools_ignores_non_web_search_decoys():
+    def tool(name):
+        return SimpleNamespace(name=name, qualified=f"mcp__k3nox__{name}", schema={})
+
+    decoys = [tool("search_memory"), tool("fleet_sessions_search"), tool("nc_search_files"), tool("fleet_fetch"),
+              tool("mcp_tool_search")]
+    mcp = SimpleNamespace(tools=lambda: [*decoys, tool("hub_searxng__search"), tool("hub_fetch__fetch")])
+    picked = pick_tools(SimpleNamespace(research={}), mcp)
+    assert isinstance(picked, McpTools)
+    assert picked.search_tool.name == "hub_searxng__search" and picked.fetch_tool.name == "hub_fetch__fetch"
+    # decoys alone: no web tool at all -> built-ins
+    assert isinstance(pick_tools(SimpleNamespace(research={}), SimpleNamespace(tools=lambda: decoys)), BuiltinTools)
+    # a generic web search tool is still found when no searxng marker exists
+    generic = SimpleNamespace(tools=lambda: [*decoys, tool("brave_search")])
+    assert pick_tools(SimpleNamespace(research={}), generic).search_tool.name == "brave_search"

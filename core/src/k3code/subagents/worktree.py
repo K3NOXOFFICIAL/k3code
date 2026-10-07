@@ -1,4 +1,5 @@
-# Design ported from hermes-agent tools/subagent_worktree.py (MIT), rewritten; see VENDOR.toml.
+# Vendored from hermes-agent@4127d78da84b1eee105f298979cc57cc7457f98d:tools/subagent_worktree.py (MIT)
+# Design port, rewritten (async, k3/<id> branches); no code copied verbatim. See VENDOR.toml.
 """Git worktree isolation for sub-agents: one worktree + branch per child, diff back, merge or leave the branch."""
 
 from __future__ import annotations
