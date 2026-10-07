@@ -16,10 +16,18 @@ from typing import Any
 import click
 
 from k3code.agent.loop import AgentLoop
-from k3code.config import load_config
+from k3code.config import K3CODE_HOME, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.permissions import PermissionMode
 from k3code.providers import make_providers
+from k3code.reliability import (
+    BudgetExceeded,
+    DiskGuardFull,
+    Reliability,
+    ReliabilityFlags,
+    ReliabilitySettings,
+)
+from k3code.reliability.persistent_retry import TurnCancelled
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -60,6 +68,22 @@ def _print_event(event: RouterEvent) -> None:
         logger.info("Failover: %s/%s (reason: %s) — %s", event.provider, event.model, event.reason, event.detail)
     elif event.kind == "router.exhausted":
         logger.warning("Chain exhausted: %s", event.detail)
+    elif event.kind.startswith(("reliability.", "net.state")):
+        # M2: reliability events surface as info lines.
+        logger.info("%s %s", event.kind, event.detail)
+
+
+def _build_reliability(config: Any, session: str) -> Reliability:
+    """M2: build the reliability bundle from the config's reliability dict."""
+    raw = dict(getattr(config, "reliability", None) or {})
+    flags_raw = raw.pop("flags", None)
+    flags = ReliabilityFlags(**flags_raw) if isinstance(flags_raw, dict) else None
+    known = {"enabled", "flags", "max_wait", "max_park_seconds",
+             "session_tokens", "session_usd", "day_tokens", "day_usd", "netwatch"}
+    settings = ReliabilitySettings(flags=flags) if flags else ReliabilitySettings()
+    for key in known & set(raw):
+        setattr(settings, key, raw[key])
+    return Reliability.from_settings(settings, session=session, home=K3CODE_HOME)
 
 
 async def _run_headless(
@@ -69,6 +93,8 @@ async def _run_headless(
     permission_mode: PermissionMode,
     config: Any,
     json_output: bool,
+    session: str = "headless",
+    resume: bool = False,
 ) -> dict[str, Any] | None:
     """Run headless mode and return final result dict."""
     system_prompt = _load_system_prompt()
@@ -78,6 +104,10 @@ async def _run_headless(
     cooldowns = CooldownStore()
     router = Router(chain, cooldowns=cooldowns, on_event=_print_event)
 
+    # M2: reliability bundle (netwatch, persistent retry, journal, guards).
+    reliability = _build_reliability(config, session=session)
+    reliability.register_providers(chain)
+
     loop = AgentLoop(
         router,
         system_prompt=system_prompt,
@@ -86,6 +116,8 @@ async def _run_headless(
         headless=True,
         on_event=_print_event,
         cwd=Path.cwd(),
+        reliability=reliability,
+        session=session,
     )
 
     final_text = ""
@@ -101,7 +133,10 @@ async def _run_headless(
     loop.on_text_delta = on_text_delta
 
     try:
-        async for _ in loop.run(prompt, model=model, max_tokens=config.max_tokens, temperature=config.temperature):
+        await reliability.start()
+        async for _ in loop.run(
+            prompt, model=model, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume
+        ):
             pass
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
@@ -110,9 +145,17 @@ async def _run_headless(
         return {"error": "chain_exhausted", "message": str(e), "last_reason": e.last_reason}
     except ContextOverflow as e:
         return {"error": "context_overflow", "message": str(e)}
+    except TurnCancelled as e:
+        return {"error": "cancelled", "message": str(e)}
+    except BudgetExceeded as e:
+        return {"error": "budget_exceeded", "message": str(e), "scope": e.scope, "kind": e.kind}
+    except DiskGuardFull as e:
+        return {"error": "disk_guard", "message": str(e)}
     except Exception as e:
         logger.exception("Agent failed")
         return {"error": "agent_error", "message": str(e)}
+    finally:
+        await reliability.stop()
 
 
 async def _run_repl(
@@ -129,6 +172,10 @@ async def _run_repl(
     cooldowns = CooldownStore()
     router = Router(chain, cooldowns=cooldowns, on_event=_print_event)
 
+    # M2: reliability bundle; one journal/session per REPL process.
+    reliability = _build_reliability(config, session="repl")
+    reliability.register_providers(chain)
+
     loop = AgentLoop(
         router,
         system_prompt=system_prompt,
@@ -137,12 +184,18 @@ async def _run_repl(
         headless=False,
         on_event=_print_event,
         cwd=Path.cwd(),
+        reliability=reliability,
     )
 
-    print("k3code REPL (type /exit to quit, /model <name> to switch)")
+    print("k3code REPL (type /exit to quit, /model <name> to switch, /stop to cancel a stuck turn)")
     print(f"Permission mode: {permission_mode.value}")
     if model:
         print(f"Model override: {model}")
+
+    try:
+        await reliability.start()
+    except Exception:
+        logger.debug("netwatch start failed; continuing without it")
 
     while True:
         try:
@@ -154,6 +207,12 @@ async def _run_repl(
             continue
         if user_input == "/exit":
             break
+        if user_input == "/stop":
+            # M2: abort a paused/parked wait in another turn (best effort here:
+            # the REPL is single-threaded, so /stop mainly guards the next turn).
+            reliability.cancel()
+            print("Stop requested.")
+            continue
         if user_input.startswith("/model "):
             model = user_input[7:].strip()
             print(f"Model set to: {model}")
@@ -182,9 +241,20 @@ async def _run_repl(
             print(f"\n[Error] Chain exhausted: {e}")
         except ContextOverflow as e:
             print(f"\n[Error] Context overflow: {e}")
+        except TurnCancelled as e:
+            print(f"\n[Stopped] {e}")
+        except BudgetExceeded as e:
+            print(f"\n[Budget] {e} — raise the limit in config (reliability.session_*) to continue.")
+        except DiskGuardFull as e:
+            print(f"\n[Disk] {e}")
+        except KeyboardInterrupt:
+            # M2: Ctrl-C mid-turn cancels any parked/paused wait.
+            reliability.cancel()
+            print("\n[Interrupted] turn cancelled (/stop semantics).")
         except Exception as e:
             logger.exception("REPL turn failed")
             print(f"\n[Error] {e}")
+    await reliability.stop()
 
 
 @click.command()
@@ -197,6 +267,8 @@ async def _run_repl(
     help="Permission mode (default: ask)",
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
+@click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
+@click.option("--resume", is_flag=True, help="Resume the session's saved transcript after a crash (headless)")
 @click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
 @click.option("--repl", is_flag=True, help="Force the legacy line REPL instead of the TUI")
 @click.option(
@@ -210,6 +282,8 @@ def main(
     model: str | None,
     permission: str,
     json_output: bool,
+    session: str,
+    resume: bool,
     config_dir: Path | None,
     repl: bool,
     stdio_flag: bool,
@@ -237,7 +311,10 @@ def main(
 
     if prompt:
         result = asyncio.run(
-            _run_headless(prompt, model=model, permission_mode=permission_mode, config=config, json_output=json_output)
+            _run_headless(
+                prompt, model=model, permission_mode=permission_mode, config=config, json_output=json_output,
+                session=session, resume=resume,
+            )
         )
         if json_output and result:
             print(json.dumps(result, ensure_ascii=False))
@@ -312,6 +389,8 @@ def _find_repo_root() -> Path | None:
     help="Permission mode (default: ask)",
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
+@click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
+@click.option("--resume", is_flag=True, help="Resume the session's saved transcript after a crash (headless)")
 @click.option("--config-dir", type=click.Path(path_type=Path), help="Project directory for config")
 @click.option("--repl", is_flag=True, help="Force the legacy line REPL instead of the TUI")
 def cli(
@@ -320,6 +399,8 @@ def cli(
     model: str | None,
     permission: str,
     json_output: bool,
+    session: str,
+    resume: bool,
     config_dir: Path | None,
     repl: bool,
 ) -> None:
@@ -331,6 +412,8 @@ def cli(
             model=model,
             permission=permission,
             json_output=json_output,
+            session=session,
+            resume=resume,
             config_dir=config_dir,
             repl=repl,
             stdio_flag=False,

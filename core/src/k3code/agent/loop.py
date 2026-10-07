@@ -8,8 +8,11 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from k3code.config import K3CODE_HOME
 from k3code.permissions import PermissionMode, check_permission
 from k3code.providers.types import Message, StreamEvent, ToolCall
+from k3code.reliability import Reliability, ReliabilitySettings
+from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
 from k3code.tools import build_registry
 
@@ -36,6 +39,8 @@ class AgentLoop:
         on_text_delta: Callable[[str], Awaitable[None]] | None = None,
         cwd: Path | None = None,
         approval_callback: ApprovalCallback | None = None,
+        reliability: Reliability | ReliabilitySettings | None = None,
+        session: str = "default",
     ) -> None:
         self.router = router
         self.system_prompt = system_prompt
@@ -51,6 +56,15 @@ class AgentLoop:
         #: Conversation messages of the most recent run(), in order (system first).
         #: The gateway persists these after each turn.
         self.turn_messages: list[Message] = []
+        # M2: reliability stack; on by default, off via ReliabilitySettings(enabled=False).
+        # Journal writes to $K3CODE_HOME unless the passed bundle set another home.
+        if reliability is None:
+            reliability = Reliability.from_settings(None, session=session, home=K3CODE_HOME)
+        elif isinstance(reliability, ReliabilitySettings):
+            reliability = Reliability.from_settings(reliability, session=session, home=K3CODE_HOME)
+        self.reliability = reliability
+        self.reliability.attach_router(router)
+        self.reliability.events.add(self._forward_reliability_event)
 
     def interrupt(self) -> None:
         """Request cancellation of the running turn (checked between steps)."""
@@ -63,6 +77,14 @@ class AgentLoop:
     def interrupted(self) -> bool:
         return self._interrupt.is_set()
 
+    def _forward_reliability_event(self, event: Any) -> None:
+        """M2: forward reliability.* / net.state events through the loop's on_event."""
+        if self.on_event is not None:
+            try:
+                self.on_event(event)  # type: ignore[arg-type]
+            except Exception:
+                logger.debug("reliability event sink failed")
+
     async def run(
         self,
         user_prompt: str,
@@ -71,6 +93,7 @@ class AgentLoop:
         max_tokens: int = 8192,
         temperature: float | None = None,
         history: list[Message] | None = None,
+        resume: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         """Run the agent loop, yielding stream events.
 
@@ -83,21 +106,50 @@ class AgentLoop:
             Message(role="user", content=user_prompt),
         ]
         self.turn_messages = []
+        if resume:
+            # M2: continue a crashed session from its persisted transcript.
+            saved = self.reliability.load_transcript()
+            if saved:
+                messages = saved
+                answered = {m.tool_call_id for m in messages if m.role == "tool"}
+                last = messages[-1]
+                open_calls = (
+                    [c for c in last.tool_calls if c.id not in answered]
+                    if last.role == "assistant" else []
+                )
+                for tc in open_calls:
+                    # Side-effect tools with an intent but no done are NOT re-run.
+                    result = self.reliability.interrupted_for(tc) or await self._execute_tool(tc)
+                    tool_msg = Message(
+                        role="tool", content=result.get("content") if "content" in result else str(result),
+                        tool_call_id=tc.id, name=tc.name,
+                    )
+                    messages.append(tool_msg)
+                    yield StreamEvent(type="done", message=tool_msg)
+                if not open_calls and last.role != "tool":
+                    messages.append(Message(role="user", content=user_prompt))
+        self.reliability.save_transcript(messages)
 
         for turn in range(self.max_turns):
             if self.interrupted:
                 logger.info("Turn %d interrupted before start", turn + 1)
                 return
             logger.info("Turn %d/%d", turn + 1, self.max_turns)
-            stream = self.router.stream(
-                messages, self.tools.specs(), model=model, max_tokens=max_tokens, temperature=temperature
+            # M2: disk guard + budget check before starting new work.
+            self._check_disk_guard()
+            self._check_budgets("turn start")
+            # M2: the stream goes through persistent retry (pause/park/resume).
+            stream = self.reliability.stream(
+                self.router, messages, self.tools.specs(), model=model, max_tokens=max_tokens, temperature=temperature
             )
 
             tool_calls: list[ToolCall] = []
             final_message: Message | None = None
+            text_parts: list[str] = []
 
             async for event in stream:
                 if event.type == "text_delta" and event.text:
+                    text_parts.append(event.text)
                     if self.on_text_delta:
                         await self.on_text_delta(event.text)
                 elif event.type == "tool_call" and event.tool_call:
@@ -110,10 +162,14 @@ class AgentLoop:
                     tool_calls.append(event.tool_call)
                 elif event.type == "done" and event.message:
                     final_message = event.message
+                    # M2: usage accounting + budget check from every completion.
+                    self._record_usage(event)
+                    self._check_budgets("after model completion")
                 yield event
 
             if final_message:
                 messages.append(final_message)
+                self.reliability.save_transcript(messages)
                 # The final message's tool_calls is the authoritative list (see note
                 # above); prefer it over whatever was accumulated from live events.
                 if final_message.tool_calls:
@@ -121,11 +177,22 @@ class AgentLoop:
                 else:
                     logger.info("Agent finished (no tool calls)")
                     self.turn_messages = messages
+                    # M2: loop guard on repeated assistant messages.
+                    if self._guard_assistant("".join(text_parts), messages):
+                        for stop_event in self._stop_for_input(messages):
+                            yield stop_event
                     return
             elif self.interrupted:
                 # Stream aborted without a final message (e.g. interrupt during
                 # streaming): nothing more to execute.
                 self.turn_messages = messages
+                return
+
+            # M2: loop guard on tool calls (corrective note once, then stop).
+            stop = await self._guard_tool_calls(tool_calls, messages)
+            if stop:
+                for stop_event in self._stop_for_input(messages):
+                    yield stop_event
                 return
 
             # Execute tool calls sequentially and yield results
@@ -142,6 +209,7 @@ class AgentLoop:
                     name=tc.name,
                 )
                 messages.append(tool_msg)
+                self.reliability.save_transcript(messages)
                 # Yield the tool result as a stream event
                 yield StreamEvent(type="done", message=tool_msg)
 
@@ -165,9 +233,62 @@ class AgentLoop:
             if not allowed:
                 return {"error": message or f"Permission denied: {tool_call.name}"}
 
+        # M2: fsync a journal intent before the tool runs.
+        self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
         args = tool_call.arguments
         try:
-            return await handler(args, cwd=self.cwd)
+            result = await handler(args, cwd=self.cwd)
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
-            return {"error": f"Tool execution failed: {e}"}
+            result = {"error": f"Tool execution failed: {e}"}
+        # M2: completion digest, so resume knows this call finished.
+        self.reliability.journal_done(tool_call.id, result)
+        return result
+
+    # ── M2 reliability helpers ──
+
+    def _check_budgets(self, where: str) -> None:
+        err = self.reliability.check_budgets()
+        if err is not None:
+            raise err
+
+    def _check_disk_guard(self) -> None:
+        err = self.reliability.check_disk()
+        if err is not None:
+            raise err
+
+    def _record_usage(self, event: StreamEvent) -> None:
+        msg = event.message
+        self.reliability.record_usage(msg.usage if msg is not None else None)
+
+    async def _guard_tool_calls(self, tool_calls: list[ToolCall], messages: list[Message]) -> bool:
+        """Observe tool calls; inject one corrective note, or True to stop the turn."""
+        for tc in tool_calls:
+            outcome = self.reliability.observe_tool_request(tc)
+            if outcome is None:
+                continue
+            if outcome.verdict is Verdict.NOTE and outcome.note:
+                messages.append(Message(role="system", content=outcome.note))
+                return False
+            if outcome.verdict is Verdict.STOP:
+                return True
+        return False
+
+    def _guard_assistant(self, text: str, messages: list[Message]) -> bool:
+        """Observe a no-tool assistant message; note once, or True to stop."""
+        outcome = self.reliability.observe_assistant(text)
+        if outcome is None:
+            return False
+        if outcome.verdict is Verdict.NOTE and outcome.note:
+            messages.append(Message(role="system", content=outcome.note))
+            return False
+        return outcome.verdict is Verdict.STOP
+
+    def _stop_for_input(self, messages: list[Message]) -> Any:
+        """Yield a final assistant message marking the turn stopped (needs_input)."""
+        stop_msg = Message(
+            role="assistant",
+            content="I stopped because I was repeating myself (loop guard). Please give me more input to proceed.",
+        )
+        messages.append(stop_msg)
+        yield StreamEvent(type="done", message=stop_msg)
