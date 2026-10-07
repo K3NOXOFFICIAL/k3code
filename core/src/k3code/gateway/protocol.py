@@ -44,11 +44,11 @@ def encode_error(req_id: Any, code: int, message: str, data: Any = None) -> str:
     return json.dumps({"jsonrpc": "2.0", "id": req_id, "error": err}, ensure_ascii=False)
 
 
-def encode_event(event_type: str, payload: dict[str, Any] | None = None) -> str:
-    return json.dumps(
-        {"jsonrpc": "2.0", "method": "event", "params": {"type": event_type, "payload": payload or {}}},
-        ensure_ascii=False,
-    )
+def encode_event(event_type: str, payload: dict[str, Any] | None = None, importance: str | None = None) -> str:
+    params: dict[str, Any] = {"type": event_type, "payload": payload or {}}
+    if importance:
+        params["importance"] = importance  # the TUI's focusPolicy reads it beside type/payload
+    return json.dumps({"jsonrpc": "2.0", "method": "event", "params": params}, ensure_ascii=False)
 
 
 def encode_server_request(method: str, params: dict[str, Any], req_id: str | None = None) -> str:

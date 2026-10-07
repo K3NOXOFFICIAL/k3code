@@ -63,6 +63,7 @@ class AgentLoop:
         plan_callback: PlanCallback | None = None,
         on_auto_allow: AutoAllowCallback | None = None,
         permissions: PermissionState | None = None,
+        background: bool = False,
     ) -> None:
         self.router = router
         self.system_prompt = system_prompt
@@ -72,6 +73,8 @@ class AgentLoop:
         self.plan_callback = plan_callback
         self.on_auto_allow = on_auto_allow
         self.headless = headless
+        #: Background/cron/loop sessions run bash sandboxed (like auto/yolo mode).
+        self.background = background
         self.on_event = on_event
         self.on_text_delta = on_text_delta
         self.approval_callback = approval_callback
@@ -88,7 +91,7 @@ class AgentLoop:
             reliability = Reliability.from_settings(reliability, session=session, home=K3CODE_HOME)
         self.reliability = reliability
         self.reliability.attach_router(router)
-        self.reliability.events.add(self._forward_reliability_event)
+        self.reliability.events.add(self._forward_reliability_event, key="loop")
 
     @property
     def permission_mode(self) -> PermissionMode:

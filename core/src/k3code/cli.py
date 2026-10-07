@@ -24,8 +24,7 @@ from k3code.reliability import (
     BudgetExceeded,
     DiskGuardFull,
     Reliability,
-    ReliabilityFlags,
-    ReliabilitySettings,
+    build_reliability,
 )
 from k3code.reliability.persistent_retry import TurnCancelled
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
@@ -75,15 +74,7 @@ def _print_event(event: RouterEvent) -> None:
 
 def _build_reliability(config: Any, session: str) -> Reliability:
     """M2: build the reliability bundle from the config's reliability dict."""
-    raw = dict(getattr(config, "reliability", None) or {})
-    flags_raw = raw.pop("flags", None)
-    flags = ReliabilityFlags(**flags_raw) if isinstance(flags_raw, dict) else None
-    known = {"enabled", "flags", "max_wait", "max_park_seconds",
-             "session_tokens", "session_usd", "day_tokens", "day_usd", "netwatch"}
-    settings = ReliabilitySettings(flags=flags) if flags else ReliabilitySettings()
-    for key in known & set(raw):
-        setattr(settings, key, raw[key])
-    return Reliability.from_settings(settings, session=session, home=K3CODE_HOME)
+    return build_reliability(config, session=session, home=K3CODE_HOME)
 
 
 async def _run_headless(

@@ -362,3 +362,16 @@ class Reliability:
     def needs_input(self) -> bool:
         """True when the loop guard stopped a turn waiting for user input."""
         return self.loop_guard is not None and self.loop_guard.needs_input
+
+
+def build_reliability(config: Any, session: str, home: Path | None = None) -> Reliability:
+    """Build the reliability bundle from ``config.reliability`` (a dict shaped like ReliabilitySettings)."""
+    raw = dict(getattr(config, "reliability", None) or {})
+    flags_raw = raw.pop("flags", None)
+    flags = ReliabilityFlags(**flags_raw) if isinstance(flags_raw, dict) else None
+    known = {"enabled", "max_wait", "max_park_seconds", "session_tokens", "session_usd", "day_tokens",
+             "day_usd", "netwatch"}
+    settings = ReliabilitySettings(flags=flags) if flags else ReliabilitySettings()
+    for key in known & set(raw):
+        setattr(settings, key, raw[key])
+    return Reliability.from_settings(settings, session=session, home=home)
