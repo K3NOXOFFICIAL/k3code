@@ -10,6 +10,7 @@ failures arm the configurable cooldown.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import tempfile
@@ -476,3 +477,31 @@ async def test_alternating_model_keys_do_not_rebuild_the_provider_stack(tmp_path
     srv._ensure_router("default")
     assert srv.providers is not providers and len(srv._router_cache) == 1
     await srv.close()
+
+
+async def test_the_prompt_and_the_tool_call_are_on_disk_before_the_first_tool_runs(tmp_path, monkeypatch):
+    """A kill -9 during the first long tool lost the whole turn, user prompt included: checkpoints only followed tool
+    results. The assistant's tool call now triggers one too."""
+    import json as _json
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    script = tmp_path / "s.json"
+    script.write_text(_json.dumps([{"type": "tool_call", "name": "bash", "arguments": {"command": "sleep 30"}}]))
+    monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    db = tmp_path / "s.db"
+    srv = GatewayServer(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+                        store=SessionStore(db))
+    srv._write = lambda s: None
+    stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
+    live = srv.live_for(stored)
+    task = asyncio.create_task(srv._run_turn(live, "run the long thing"))
+    try:
+        await asyncio.sleep(1.5)  # the turn is inside `sleep 30`
+        other = SessionStore(db)  # a separate connection: what a restarted daemon would read
+        roles = [m["role"] for m in other.get(live.session_id).messages]
+        assert "user" in roles and "assistant" in roles, roles
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

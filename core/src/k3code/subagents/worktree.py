@@ -24,7 +24,28 @@ async def git(cwd: str | Path, *args: str, timeout: float = 60) -> tuple[int, st
         proc.kill()
         await proc.wait()
         return 124, f"git {' '.join(args)} timed out"
+    except asyncio.CancelledError:
+        proc.kill()  # /stop mid-git: the process must not outlive the turn (a half-done merge, a held index lock)
+        await asyncio.shield(proc.wait())
+        raise
     return proc.returncode or 0, out.decode("utf-8", "replace")
+
+
+#: One lock per repository checkout: every merge touches the one shared working tree and index, so two merges (two
+#: finishing children, a fan-out merge and a child's own) must never overlap.
+_REPO_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def repo_lock(repo: str | Path) -> asyncio.Lock:
+    return _REPO_LOCKS.setdefault(str(Path(repo).resolve()), asyncio.Lock())
+
+
+async def merge_in_progress(repo: str | Path) -> bool:
+    rc, _ = await git(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+    return rc == 0
+
+
+_BUSY = "a merge is already in progress in this checkout; it was left untouched"
 
 
 async def repo_root(path: str | Path) -> Path | None:
@@ -87,13 +108,25 @@ async def diff_stat(wt: Worktree) -> str:
 
 
 async def merge(wt: Worktree) -> tuple[bool, str]:
-    """Merge the child's branch into the parent checkout. On conflict: abort and leave the branch."""
-    rc, out = await git(wt.repo, "-c", "user.name=k3code", "-c", "user.email=k3code@localhost",
-                        "merge", "--no-ff", "-m", f"Merge {wt.branch}", wt.branch)
-    if rc == 0:
-        return True, out.strip()
-    await git(wt.repo, "merge", "--abort")
-    return False, out.strip()
+    """Merge the child's branch into the parent checkout. On conflict: abort and leave the branch.
+
+    Serialized per repo, and refuses to start while another merge is in progress: the unconditional ``merge --abort``
+    below used to destroy the *other* merge (the user's own, or a trial another task was testing) and the failure
+    was reported as a conflict of this child's branch.
+    """
+    async with repo_lock(wt.repo):
+        if await merge_in_progress(wt.repo):
+            return False, _BUSY
+        try:
+            rc, out = await git(wt.repo, "-c", "user.name=k3code", "-c", "user.email=k3code@localhost",
+                                "merge", "--no-ff", "-m", f"Merge {wt.branch}", wt.branch)
+        except asyncio.CancelledError:
+            await asyncio.shield(git(wt.repo, "merge", "--abort"))  # ours: leave the checkout as we found it
+            raise
+        if rc == 0:
+            return True, out.strip()
+        await git(wt.repo, "merge", "--abort")
+        return False, out.strip()
 
 
 async def remove(wt: Worktree, *, keep_branch: bool) -> None:
@@ -111,13 +144,21 @@ async def head_sha(repo: str | Path) -> str:
 async def merge_trial(wt: Worktree) -> tuple[bool, str]:
     """Merge the branch into the parent checkout WITHOUT committing, so tests can run on the result.
 
-    On conflict the merge is aborted. Follow with :func:`commit_merge` or :func:`abort_merge`.
+    On conflict the merge is aborted. Follow with :func:`commit_merge` or :func:`abort_merge`. While a trial is
+    open (MERGE_HEAD exists) no other merge starts; it is not aborted by anyone but its owner.
     """
-    rc, out = await git(wt.repo, "merge", "--no-ff", "--no-commit", wt.branch)
-    if rc == 0:
-        return True, out.strip()
-    await git(wt.repo, "merge", "--abort")
-    return False, out.strip()
+    async with repo_lock(wt.repo):
+        if await merge_in_progress(wt.repo):
+            return False, _BUSY
+        try:
+            rc, out = await git(wt.repo, "merge", "--no-ff", "--no-commit", wt.branch)
+        except asyncio.CancelledError:
+            await asyncio.shield(git(wt.repo, "merge", "--abort"))
+            raise
+        if rc == 0:
+            return True, out.strip()
+        await git(wt.repo, "merge", "--abort")
+        return False, out.strip()
 
 
 async def commit_merge(wt: Worktree, message: str | None = None) -> tuple[bool, str]:

@@ -94,6 +94,7 @@ class Reliability:
         self.journal: ToolJournal | None = None  # opened lazily in _open_journal
         self.retry: PersistentRetry | None = None  # built in attach_router
         self._started = False
+        self._net_forwarded = False
 
     # ── construction ──
 
@@ -366,6 +367,9 @@ class Reliability:
 
     def _forward_net_states(self) -> None:
         assert self.netwatch is not None
+        if self._net_forwarded:  # start() runs again after every idle stop(): subscribe once, not once per re-arm
+            return
+        self._net_forwarded = True
 
         def on_change(old: NetState, new: NetState) -> None:
             self.events.emit(ev.NET_STATE, detail=f"{old.value} -> {new.value}", old=old.value, new=new.value)

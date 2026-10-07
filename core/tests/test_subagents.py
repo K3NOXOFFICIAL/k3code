@@ -185,3 +185,81 @@ def test_agent_type_files_and_override(tmp_path, monkeypatch):
     assert types["explorer"].tools == ["read"] and types["explorer"].source == "project"  # project overrides built-in
     assert types["reviewer"].tier == "strong" and "VERDICT" in types["reviewer"].prompt
     assert parse_agent_md("no frontmatter", "x").name == "x"
+
+
+async def test_a_failed_worktree_child_releases_its_checkout_and_keeps_its_work_on_the_branch(tmp_path, monkeypatch):
+    """_finish_worktree only ran on the success path: a child that died (provider error, budget, hook failure) left a
+    full checkout in .k3code/worktrees and its branch behind, unmentioned."""
+    from k3code.subagents.runner import SubagentManager
+
+    repo = git_repo(tmp_path / "repo")
+    steps = [task_call("CHILD-F write", isolation="worktree"), final("parent done"),
+             {"type": "tool_call", "match": "CHILD-F", "when": "first", "name": "write",
+              "arguments": {"path": "partial.txt", "content": "half done\n"}},
+             {"type": "text", "match": "CHILD-F", "when": "after_tool", "text": "wrote"}]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    await call(server, "session.create", {"cwd": str(repo)})
+    real_drive = SubagentManager._drive
+
+    async def die_after_writing(self, parent, h, atype, prompt, cwd):
+        await real_drive(self, parent, h, atype, prompt, cwd)
+        raise RuntimeError("boom after the child already wrote a file")
+
+    monkeypatch.setattr(SubagentManager, "_drive", die_after_writing)
+    await run_turn(server, "PARENT")
+    (h,) = server.subagents.handles.values()
+    assert h.status == "failed" and h.worktree is not None
+    assert not h.worktree.path.exists(), "the failed child's checkout directory leaked"
+    branches = subprocess.run(["git", "branch"], cwd=repo, capture_output=True, text=True).stdout
+    assert h.branch in branches  # its work is on the branch
+    assert "partial.txt" in subprocess.run(["git", "show", "--stat", h.branch], cwd=repo, capture_output=True,
+                                           text=True).stdout
+
+
+async def test_waiting_on_a_child_does_not_swallow_a_stop(tmp_path, monkeypatch):
+    """SubagentManager.wait() suppressed every CancelledError: /stop cancelled the parent turn while it sat in wait()
+    and was lost, so ultracode/ultraplan/fan-out chains carried on."""
+    import asyncio
+
+    from k3code.subagents.runner import Handle, SubagentManager
+
+    mgr = SubagentManager(server=None)
+    h = Handle(id="sa-x", description="d", agent_type="worker", tier="main", depth=1, parent_sid="p",
+               parent_child_id=None, isolation="none", index=0, count=1)
+    child_cancelled: list[bool] = []
+
+    async def long_child() -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            child_cancelled.append(True)
+            raise
+
+    h.task = asyncio.create_task(long_child())
+    waiter = asyncio.create_task(mgr.wait(h))
+    await asyncio.sleep(0.05)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await asyncio.sleep(0.05)
+    assert child_cancelled == [True]  # the child went down with the stopped parent
+    # ...whereas the child's own interruption is just its result
+    h2 = Handle(id="sa-y", description="d", agent_type="worker", tier="main", depth=1, parent_sid="p",
+                parent_child_id=None, isolation="none", index=0, count=1)
+    h2.task = asyncio.create_task(long_child())
+    waiter2 = asyncio.create_task(mgr.wait(h2))
+    await asyncio.sleep(0.05)
+    h2.task.cancel()
+    assert await waiter2 is h2
+
+
+def test_child_reliability_keeps_the_configured_budgets(tmp_path):
+    from k3code.config import Settings
+    from k3code.subagents.runner import child_reliability
+
+    cfg = Settings(providers=[], reliability={"session_tokens": 1000, "day_usd": 5.0})
+    rel = child_reliability(cfg, "child-1", tmp_path)
+    assert rel.governor is not None
+    scopes = {b.scope: b for b in rel.governor._budgets.values()}
+    assert scopes["session"].tokens == 1000 and scopes["day"].usd == 5.0
+    assert rel.flags.netwatch is False  # still no netwatch per child

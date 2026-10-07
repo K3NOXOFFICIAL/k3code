@@ -89,6 +89,8 @@ class AgentLoop:
         self.on_text_delta = on_text_delta
         #: called when a retry makes the streamed text so far void (the consumer clears its copy)
         self.on_text_reset: Callable[[], Awaitable[None]] | None = None
+        #: called when the assistant's tool call joined the conversation, before the tool runs (the gateway persists)
+        self.on_checkpoint: Callable[[], None] | None = None
         self.approval_callback = approval_callback
         self.tools = build_registry()
         self._interrupt = asyncio.Event()
@@ -235,6 +237,8 @@ class AgentLoop:
             if final_message:
                 messages.append(final_message)
                 self.reliability.save_transcript(messages)
+                if final_message.tool_calls and self.on_checkpoint:
+                    self.on_checkpoint()  # the tool call is about to run (maybe for an hour): persist what exists
                 # The final message's tool_calls is the authoritative list (see note
                 # above); prefer it over whatever was accumulated from live events.
                 if final_message.tool_calls:

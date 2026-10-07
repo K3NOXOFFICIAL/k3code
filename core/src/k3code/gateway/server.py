@@ -241,6 +241,8 @@ class Client:
         self.name = name
         self.session_id: str | None = None
         self.closed = False
+        self.pending_bytes = 0  # queued for the peer but not yet accepted by its socket (see MAX_CLIENT_BACKLOG)
+        self.close_peer: Callable[[], None] | None = None  # drops the connection (socket clients)
 
 
 #: The client whose request is being handled (so replies and "current session" resolve per client).
@@ -521,10 +523,12 @@ class GatewayServer:
             text = line.decode("utf-8", errors="replace").strip()
             if not text:
                 continue
-            try:
-                await self._handle_line(text)
-            except Exception:
-                logger.exception("unhandled error processing frame")
+            if self._is_concurrent_request(text):  # may wait for this very pipe's answer (clarify): don't block reading
+                task = asyncio.get_running_loop().create_task(self._guarded_handle(text, None))
+                self._side_tasks.add(task)
+                task.add_done_callback(self._side_tasks.discard)
+                continue
+            await self._guarded_handle(text, None)
 
     async def start_socket(self, path: Path | str) -> None:
         """Listen on a Unix socket: one JSON-RPC connection per client, sessions shared."""
@@ -539,8 +543,16 @@ class GatewayServer:
     async def stop_socket(self) -> None:
         if self._socket_server is not None:
             self._socket_server.close()
+            # wait_closed() blocks until every accepted connection has finished (CPython >= 3.12), and close() does
+            # not touch existing ones: a graceful stop hung while any TUI was attached, systemd SIGKILLed the daemon
+            # after 90 s and the shutdown work (persisting turns, stopping automations) never ran.
+            for client in list(self.clients):
+                if client.close_peer is not None:
+                    client.closed = True
+                    with contextlib.suppress(Exception):
+                        client.close_peer()
             with contextlib.suppress(Exception):
-                await self._socket_server.wait_closed()
+                await asyncio.wait_for(self._socket_server.wait_closed(), timeout=3.0)
             self._socket_server = None
         with contextlib.suppress(Exception):
             Path(getattr(self, "socket_path", "")).unlink()
@@ -550,14 +562,53 @@ class GatewayServer:
     def request_stop(self) -> None:
         self._stop.set()
 
-    async def _on_connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        def send(line: str) -> None:
-            writer.write((line + "\n").encode("utf-8"))
+    #: A peer that stopped reading (SIGSTOPped TUI, hung ssh) is dropped once this many bytes are queued for it.
+    MAX_CLIENT_BACKLOG = 8 * 1024 * 1024
+    #: Methods whose handler may wait for the client's own answer (clarify / approval): run as tasks, so the read loop
+    #: keeps reading and can deliver that answer. Awaited inline they deadlocked their own connection.
+    CONCURRENT_METHODS = frozenset({"command.dispatch", "slash.exec"})
 
+    async def _on_connect(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        client = Client(lambda line: None, name=f"socket#{self._client_seq + 1}")
+
+        def drop(reason: str) -> None:
+            if not client.closed:
+                logger.warning("dropping client %s: %s", client.name, reason)
+            client.closed = True
+            if client in self.clients:
+                self.clients.remove(client)
+            with contextlib.suppress(Exception):
+                # abort(), not close(): close() flushes the buffered data first, which a stalled peer never allows
+                writer.transport.abort()
+
+        def send(line: str) -> None:
+            if client.closed:
+                return
+            data = (line + "\n").encode("utf-8")
+            client.pending_bytes += len(data)
+            if client.pending_bytes > self.MAX_CLIENT_BACKLOG:
+                # transport.write() on a stalled peer is O(backlog) per call (CPython 3.12) and its buffer never
+                # shrinks: every emit of every session got slower until the daemon was restarted.
+                drop(f"{client.pending_bytes // 1024} KiB of events queued, the peer is not reading")
+                return
+            queue.put_nowait(data)
+
+        async def pump() -> None:
+            while True:
+                data = await queue.get()
+                writer.write(data)
+                await writer.drain()  # waits while the peer is slow: the backlog then grows in `queue` (cheap, bounded)
+                client.pending_bytes -= len(data)
+
+        client.send = send
+        client.close_peer = lambda: drop("daemon stopping")
         self._client_seq += 1
-        client = Client(send, name=f"socket#{self._client_seq}")
+        client.name = f"socket#{self._client_seq}"
         self.clients.append(client)
         logger.info("client %s attached", client.name)
+        pump_task = asyncio.get_running_loop().create_task(pump(), name=f"k3-pump-{client.name}")
+        tasks: set[asyncio.Task[None]] = set()
         try:
             self._send_ready(client)
             # The attach snapshot: every live session and its state, as an event for this client only.
@@ -571,28 +622,46 @@ class GatewayServer:
                         "essential",
                     ),
                 )
-            while True:
+            while not client.closed:
                 line = await reader.readline()
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").strip()
                 if not text:
                     continue
-                try:
-                    await self._handle_line(text, client)
-                except Exception:
-                    logger.exception("unhandled error processing frame")
-                with contextlib.suppress(Exception):
-                    await writer.drain()
+                if self._is_concurrent_request(text):
+                    task = asyncio.get_running_loop().create_task(self._guarded_handle(text, client))
+                    tasks.add(task)
+                    task.add_done_callback(tasks.discard)
+                    continue
+                await self._guarded_handle(text, client)
         except (ConnectionError, asyncio.IncompleteReadError):
             pass
         finally:
             client.closed = True
+            for task in list(tasks):
+                task.cancel()
+            pump_task.cancel()
             if client in self.clients:
                 self.clients.remove(client)
             logger.info("client %s detached; its sessions keep running", client.name)
             with contextlib.suppress(Exception):
                 writer.close()
+
+    def _is_concurrent_request(self, text: str) -> bool:
+        try:
+            frame = json.loads(text)
+        except ValueError:
+            return False
+        return isinstance(frame, dict) and frame.get("method") in self.CONCURRENT_METHODS
+
+    async def _guarded_handle(self, text: str, client: Client | None) -> None:
+        try:
+            await self._handle_line(text, client)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("unhandled error processing frame")
 
     def _active_rows(self, current: str | None) -> list[dict[str, Any]]:
         rows = []
@@ -1022,6 +1091,7 @@ class GatewayServer:
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
         )
+        loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:

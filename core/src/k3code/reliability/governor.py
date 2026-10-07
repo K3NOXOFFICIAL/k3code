@@ -222,6 +222,17 @@ class Governor:
             b.used_tokens += prompt_tokens + completion_tokens
             b.used_usd += cost
 
+    def charge(self, prompt_tokens: int, completion_tokens: int, *, usd: float | None = None) -> None:
+        """Charge spend that happened elsewhere (a sub-agent's) to this session's own budgets.
+
+        The day ledger is not touched: the child's Governor already counted it there.
+        """
+        cost = usd if usd is not None else (prompt_tokens + completion_tokens) / self.config.tokens_per_usd
+        for b in self._budgets.values():
+            if b.scope != "day":
+                b.used_tokens += prompt_tokens + completion_tokens
+                b.used_usd += cost
+
     def check_budgets(self) -> BudgetExceeded | None:
         """First budget violation, or None."""
         self.day_ledger.roll(self.today())

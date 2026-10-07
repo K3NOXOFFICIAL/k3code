@@ -272,3 +272,21 @@ async def test_start_stop_lifecycle():
     # start again works (idempotent-ish, fresh tasks)
     await nw.start()
     await nw.stop()
+
+
+async def test_rearming_a_bundle_subscribes_the_net_state_forwarder_once():
+    """start() ran _forward_net_states() again after every stop(): each idle-sweep re-arm stacked one more
+    subscriber, so one connectivity change was delivered N times to the session's clients."""
+    from k3code.reliability import Reliability
+    from k3code.reliability import events as ev
+
+    rel = Reliability.from_settings(None, session="s")
+    assert rel.netwatch is not None
+    delivered = []
+    rel.events.add(lambda e: delivered.append(e) if e.kind == ev.NET_STATE else None)
+    for _ in range(10):
+        await rel.start()
+        await rel.stop()
+    for cb in list(rel.netwatch._callbacks):
+        cb(NetState.ONLINE, NetState.OFFLINE)
+    assert len(delivered) == 1

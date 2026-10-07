@@ -115,7 +115,9 @@ def child_reliability(config: Any, child_id: str, home: Path) -> Reliability:
     flags_raw = dict(raw.get("flags") or {})
     flags_raw["netwatch"] = False
     settings = ReliabilitySettings(flags=ReliabilityFlags(**flags_raw))
-    for key in ("max_wait", "max_park_seconds"):
+    # The budget caps too: a child's bundle used to be built without them, so sub-agents (the biggest spenders:
+    # ultracode fans out dozens) ran with no budget guard at all. The day budget is the process-wide ledger.
+    for key in ("max_wait", "max_park_seconds", "session_tokens", "session_usd", "day_tokens", "day_usd"):
         if key in raw:
             setattr(settings, key, raw[key])
     return Reliability.from_settings(settings, session=child_id, home=home)
@@ -199,9 +201,17 @@ class SubagentManager:
         return h
 
     async def wait(self, h: Handle) -> Handle:
+        """Wait for the child. A cancellation of the *child* (interrupt) is its result; a cancellation of the
+        *waiter* (/stop on the parent turn) is not swallowed, and takes the child down with it. The old
+        ``suppress(CancelledError)`` ate both, so /stop was ignored by every ultracode/ultraplan/fan-out chain."""
         if h.task is not None:
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await asyncio.shield(h.task)
+            except asyncio.CancelledError:
+                if h.task.cancelled() or h.task.done():
+                    return h  # the child itself was interrupted
+                h.task.cancel()  # we were cancelled while the child still runs: stop it too
+                raise
         return h
 
     async def run(self, parent: Any, **kw: Any) -> Handle:
@@ -211,6 +221,9 @@ class SubagentManager:
         h = self.handles.get(hid)
         if h is None or h.done:
             return False
+        for child in list(self.handles.values()):  # a child's own sub-agents go down with it
+            if child.parent_child_id == h.id and not child.done:
+                self.interrupt(child.id)
         if h.loop is not None:
             h.loop.interrupt()
         if h.task is not None:
@@ -270,12 +283,18 @@ class SubagentManager:
             logger.exception("sub-agent %s failed", h.id)
             h.status = "failed"
             h.error = str(e)
+            if h.worktree is not None:  # the checkout and branch of a dead child used to stay forever
+                with contextlib.suppress(Exception):
+                    await self._finish_worktree(h, False)
         finally:
             h.finished_at = time.monotonic()
             dur = h.finished_at - h.started_at
             self._emit(parent, "subagent.complete", h, duration_seconds=dur,
                        summary=(h.result or h.error)[:2000], text=(h.result or h.error)[:2000])
             self._record_usage(h)
+            rel = getattr(parent, "reliability", None)
+            if rel is not None and rel.governor is not None:  # the parent's session budget includes its children
+                rel.governor.charge(h.tokens_in, h.tokens_out)
 
     async def _finish_worktree(self, h: Handle, auto_merge: bool) -> None:
         wt = h.worktree
@@ -289,6 +308,9 @@ class SubagentManager:
             return
         if not auto_merge:
             h.merge = "pending"
+            if h.status in ("failed", "interrupted"):
+                # nobody continues in this checkout: free the directory, the work stays on the branch
+                await wt_mod.remove(wt, keep_branch=True)
             return
         ok, out = await wt_mod.merge(wt)
         h.merge_output = out
