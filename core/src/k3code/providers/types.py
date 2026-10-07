@@ -65,10 +65,34 @@ ContentPart = str | None
 _ROLE_OPENAI = {"system", "user", "assistant", "tool"}
 
 
+def normalize_tool_pairs(messages: list[Message]) -> list[Message]:
+    """Make tool calls and tool results pair up, which both wire formats require (else HTTP 400).
+
+    A ``tool`` message is kept only when an earlier assistant message made that call; a call is kept only when a
+    later ``tool`` message answers it. Sessions reach providers through storage, bundle import, compaction and
+    crash recovery, any of which can leave one half behind. Input messages are not modified.
+    """
+    answered = {m.tool_call_id for m in messages if m.role == "tool" and m.tool_call_id}
+    called: set[str] = set()
+    out: list[Message] = []
+    for m in messages:
+        if m.role == "assistant" and m.tool_calls:
+            kept = [tc for tc in m.tool_calls if tc.id in answered]
+            called.update(tc.id for tc in kept)
+            if len(kept) != len(m.tool_calls):
+                if not kept and not (m.content or "").strip():
+                    continue  # nothing left of this message
+                m = Message(role=m.role, content=m.content, tool_calls=kept, usage=m.usage)
+        elif m.role == "tool" and m.tool_call_id not in called:
+            continue
+        out.append(m)
+    return out
+
+
 def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
     """Serialize messages for chat-completions-compatible providers."""
     out: list[dict[str, Any]] = []
-    for m in messages:
+    for m in normalize_tool_pairs(messages):
         if m.role not in _ROLE_OPENAI:
             raise ValueError(f"unknown role: {m.role}")
         entry: dict[str, Any] = {"role": m.role, "content": m.content if m.content is not None else ""}
@@ -95,7 +119,7 @@ def messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str, 
     """Split messages into (system, rest) for the Anthropic messages API."""
     system_parts: list[str] = []
     rest: list[dict[str, Any]] = []
-    for m in messages:
+    for m in normalize_tool_pairs(messages):
         if m.role == "system":
             if m.content:
                 system_parts.append(m.content)

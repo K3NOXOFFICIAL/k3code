@@ -24,6 +24,24 @@ OPTS: dict = {"good_key": None, "ratelimit": 0.0, "log": None, "window_end": Non
 LOCK = threading.Lock()
 
 
+def pairing_error(msgs: list[dict]) -> str | None:
+    """The chat-completions rule real upstreams enforce (HTTP 400): tool results answer the nearest assistant's
+    tool_calls, and every call is answered before the next assistant/user message. None when valid."""
+    open_calls: set[str] = set()
+    for m in msgs:
+        role = m.get("role")
+        if role == "tool":
+            if m.get("tool_call_id") not in open_calls:
+                return ("messages with role 'tool' must be a response to a preceeding message with 'tool_calls'."
+                        f" (tool_call_id={m.get('tool_call_id')!r})")
+            open_calls.discard(m.get("tool_call_id"))
+        elif role in ("assistant", "user"):
+            if open_calls:
+                return f"An assistant message with 'tool_calls' must be followed by tool messages: {sorted(open_calls)}"
+            open_calls = {tc.get("id") for tc in m.get("tool_calls") or []} if role == "assistant" else set()
+    return None
+
+
 def sse(obj: dict) -> bytes:
     return f"data: {json.dumps(obj)}\n\n".encode()
 
@@ -73,8 +91,12 @@ class H(BaseHTTPRequestHandler):
                 self._log(429)
                 return self._reject(429, {"Retry-After": str(max(1, round(left)))},
                                     {"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}})
-        self._log(200)
         msgs = req.get("messages", [])
+        bad = pairing_error(msgs)
+        if bad:
+            self._log(400)
+            return self._reject(400, {}, {"error": {"message": bad, "type": "invalid_request_error"}})
+        self._log(200)
         first = next((m["content"] for m in msgs if m["role"] == "user"), "") or ""
         cmds = re.findall(r"RUN\[(.*?)\]", first, re.S)
         tools = [m for m in msgs if m["role"] == "tool"]

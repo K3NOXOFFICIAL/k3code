@@ -65,7 +65,7 @@ from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
-from k3code.providers.types import Message, StreamEvent, Usage
+from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
@@ -195,6 +195,13 @@ class LiveSession:
                     content=m.get("content"),
                     tool_call_id=m.get("tool_call_id"),
                     name=m.get("name"),
+                    # Without these the next turn sent `tool` results with no assistant tool_calls: HTTP 400 on
+                    # OpenAI-compatible and Anthropic providers, for every session that had used a tool.
+                    tool_calls=[
+                        ToolCall(id=str(tc.get("id") or ""), name=str(tc.get("name") or ""),
+                                 arguments=dict(tc.get("arguments") or {}))
+                        for tc in (m.get("tool_calls") or [])
+                    ],
                 )
             )
         return out
