@@ -27,6 +27,7 @@ USE_DEFAULTS: dict[str, tuple[str, bool, int, str]] = {
     "research": ("ask", False, 6, "explanatory"),
     "mixed": ("ask", True, 3, "default"),
 }
+_GATEWAYS: set[str] = set()  # names of entries created from the self-hosted gateway preset
 BASE_THEMES = ["default", "midnight", "light", "solarized", "mono"]
 
 
@@ -148,6 +149,8 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
         "base_url": spec.get("base_url") or base.get("base_url", ""),
         "api_key_env": spec.get("api_key_env") or base.get("api_key_env", "K3CODE_API_KEY"),
     }
+    if spec.get("preset") == "omniroute":
+        _GATEWAYS.add(entry["name"])
     key = spec.get("api_key")
     if key:
         set_env_var(entry["api_key_env"], str(key))
@@ -177,7 +180,7 @@ def step_providers(c: Ctx) -> dict[str, Any]:
             ok, ms, _ids, detail = probe.list_models(e, os.environ.get(e["api_key_env"], ""))
             c.say(f"  {e['name']}: {'OK' if ok else 'FAIL'} {ms:.0f} ms ({detail})")
             results[e["name"]] = ok
-    if entries and not any(not probe.is_gateway(e) for e in entries):
+    if entries and all(probe.is_gateway(e) or e["name"] in _GATEWAYS for e in entries):
         c.say("  WARNING: every entry goes through a self-hosted gateway; add a direct provider as a bypass.")
     elif not entries:
         c.say("  WARNING: no provider configured; k3code cannot run models.")
@@ -365,14 +368,13 @@ def step_summary(c: Ctx) -> dict[str, Any]:
     mem.parent.mkdir(parents=True, exist_ok=True)
     mem.write_text("# About the user\n\n" + user_md(c.data), encoding="utf-8")
     c.say(f"Wrote {path} and {mem}")
-    if c.do_probe:
-        import asyncio
+    import asyncio
 
-        from k3code import doctor
-        from k3code.config import load_config
+    from k3code import doctor
+    from k3code.config import load_config
 
-        checks = asyncio.run(doctor.run_checks(load_config(), probe=False))
-        c.say(doctor.format_report(checks))
+    checks = asyncio.run(doctor.run_checks(load_config(), probe=c.do_probe))
+    c.say(doctor.format_report(checks))
     return {"config": str(path)}
 
 

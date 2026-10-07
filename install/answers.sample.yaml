@@ -1,0 +1,45 @@
+welcome:
+  mode: fresh
+about:
+  name: tester
+  language: de
+  experience: expert
+  verbosity: terse
+system:
+  confirm: true
+usage:
+  primary: ops
+  languages: []
+  frameworks: []
+providers:
+  entries:
+  - preset: omniroute
+    name: gw
+    base_url: http://127.0.0.1:9/v1
+    api_key: sk-SECRET-1
+  - preset: anthropic
+    api_key: sk-ant-SECRET-2
+  test: false
+tiers:
+  main: m-main
+  strong: m-strong
+  cheap: m-cheap
+  fast: m-fast
+permissions:
+  mode: ask
+  extra_hardline:
+  - ssh \S+ systemctl
+integrations:
+  mcp:
+  - name: docs
+    url: http://127.0.0.1:9/mcp
+  mem0_url: ''
+  skills_roots:
+  - /opt/skills
+  searxng_url: ''
+theme:
+  theme: midnight
+  focus_mode: true
+  keymap: tuios
+service:
+  install: false
