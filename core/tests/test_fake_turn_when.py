@@ -26,5 +26,7 @@ async def test_turn_relative_when():
     # a tool result exists in history, but not in the current turn -> still "turn_first"
     t, c = await _text(steps, [*old_tool, Message(role="user", content="b")])
     assert c == ["bash"] and t == []
-    t, c = await _text(steps, [*old_tool, Message(role="user", content="b"), Message(role="tool", content="r", tool_call_id="2")])
+    t, c = await _text(
+        steps, [*old_tool, Message(role="user", content="b"), Message(role="tool", content="r", tool_call_id="2")]
+    )
     assert c == [] and t == ["done"]

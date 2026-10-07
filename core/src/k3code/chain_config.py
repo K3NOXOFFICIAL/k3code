@@ -136,6 +136,13 @@ def chain_rows(ctx: Any, session_id: str | None) -> list[dict[str, Any]]:
             if cooldowns is not None:
                 remaining = cooldowns.remaining_seconds(provider=p.name, model=model, base_url=p.base_url)
             state = netwatch.provider_state(p.name) if netwatch is not None else None
+            # A connectivity verdict (provider_down / offline / captive) says *why* the entry is cooling down.
+            if state is not None and state.value in ("provider_down", "offline", "captive"):
+                health = state.value
+            elif remaining > 0:
+                health = "cooldown"
+            else:
+                health = state.value if state is not None else "unknown"
             rows.append(
                 {
                     "position": len(rows) + 1,
@@ -143,7 +150,7 @@ def chain_rows(ctx: Any, session_id: str | None) -> list[dict[str, Any]]:
                     "model": model,
                     "base_url": p.base_url,
                     "cooldown_s": round(remaining, 1),
-                    "health": "cooldown" if remaining > 0 else (state.value if state is not None else "unknown"),
+                    "health": health,
                 }
             )
     return rows

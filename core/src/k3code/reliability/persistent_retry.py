@@ -25,6 +25,7 @@ waiting per ``stream()`` call (None = wait forever, the default). A
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -35,6 +36,9 @@ from k3code.providers.types import Message, StreamEvent, ToolSpec
 from k3code.reliability import events as ev
 from k3code.reliability.events import EventEmitter
 from k3code.reliability.netwatch import NetState, NetWatch
+from k3code.router.classifier import FailoverReason
+
+logger = logging.getLogger(__name__)
 
 #: ChainExhausted reasons that mean "the provider is rate-limiting / quota'd us".
 RATE_LIMIT_REASONS = frozenset({"rate_limit", "quota"})
@@ -146,18 +150,24 @@ class PersistentRetry:
     async def _handle_unreachable(self, exc: AllProvidersUnreachable, deadline: float | None) -> bool:
         """Pause (offline/captive) or park (all providers down); True when it should retry."""
         state = self.netwatch.state if self.netwatch is not None else None
+        logger.info(
+            "all providers unreachable; connectivity monitor: %s", state.value if state is not None else "not running"
+        )
         if state is not None and not state.usable_for_llm:
             # Global connectivity lost: pause until the network is back.
             await self._pause_until_usable(state, deadline)
             return True
         # Net is fine(ish) — every provider endpoint is down, or netwatch is
         # unavailable: park with the backoff ladder.
-        await self._park(f"all {exc.attempts or 'available'} provider(s) unreachable", deadline)
+        await self._park(f"all {exc.attempts or 'available'} provider(s) unreachable", deadline, wake_on_recovery=True)
         return True
 
     async def _handle_exhausted(self, exc: ChainExhausted, deadline: float | None) -> bool:
         if exc.retry_after is not None:  # every entry is cooling down: park until the earliest reset
-            await self._park(str(exc), deadline, delay=exc.retry_after, until=exc.until)
+            # Network-caused cooldowns end when connectivity returns; rate-limit/quota ones only at their reset.
+            cooldowns = getattr(self.router, "cooldowns", None)
+            network_only = cooldowns is not None and cooldowns.only_network_cooling()
+            await self._park(str(exc), deadline, delay=exc.retry_after, until=exc.until, wake_on_recovery=network_only)
             return True
         if exc.last_reason in RATE_LIMIT_REASONS:
             retry_after = self._last_retry_after
@@ -182,12 +192,31 @@ class PersistentRetry:
             )
         finally:
             self._raise_if_cancelled()
+        # The failures that armed these cooldowns happened while the network was down; the next attempt must
+        # go straight to the provider, not be skipped for the rest of a fixed window.
+        self._clear_network_cooldowns()
         self.events.emit(ev.RESUMED, detail=f"network {self.netwatch.state.value if self.netwatch else 'up'}")
 
+    def _clear_network_cooldowns(self) -> None:
+        cooldowns = getattr(self.router, "cooldowns", None)
+        if cooldowns is not None:
+            cooldowns.clear_reason(FailoverReason.network)
+
     async def _park(
-        self, detail: str, deadline: float | None, *, delay: float | None = None, until: float | None = None
+        self,
+        detail: str,
+        deadline: float | None,
+        *,
+        delay: float | None = None,
+        until: float | None = None,
+        wake_on_recovery: bool = False,
     ) -> None:
-        """Emit parked, wait out the backoff window, emit unparked."""
+        """Emit parked, wait out the backoff window (or until connectivity recovers), emit unparked.
+
+        With ``wake_on_recovery`` the wait ends early when the connectivity monitor reports that the
+        network (or the providers) came back, and the network cooldowns are cleared so the very next
+        attempt reaches the provider instead of being skipped for the rest of a fixed cooldown window.
+        """
         if delay is None:
             delay = min(
                 self.config.park_base * (self.config.backoff_factor**self._park_step),
@@ -200,11 +229,23 @@ class PersistentRetry:
         next_retry_at = self._monotonic() + delay
         extra = {} if until is None else {"until": until}
         self.events.emit(ev.PARKED, detail=detail, next_retry_at=next_retry_at, delay=delay, **extra)
+        recoveries_at_park = getattr(self.netwatch, "recoveries", 0) if self.netwatch is not None else 0
+
+        def recovered() -> bool:
+            return (
+                wake_on_recovery
+                and self.netwatch is not None
+                and getattr(self.netwatch, "recoveries", 0) != recoveries_at_park
+            )
+
         try:
-            await self._wait_until(lambda: False, deadline, until_ts=next_retry_at)
+            await self._wait_until(recovered, deadline, until_ts=next_retry_at)
         finally:
             self._raise_if_cancelled()
-        self.events.emit(ev.UNPARKED, detail="retrying")
+        woke = recovered()
+        if woke:
+            self._clear_network_cooldowns()
+        self.events.emit(ev.UNPARKED, detail="network recovered; retrying" if woke else "retrying")
 
     async def _wait_until(
         self,
@@ -222,9 +263,7 @@ class PersistentRetry:
             self._raise_if_cancelled()
             now = self._monotonic()
             if deadline is not None and now >= deadline:
-                raise _MaxWaitExceeded(
-                    f"max_wait of {self.config.max_wait:.0f}s exceeded while waiting"
-                )
+                raise _MaxWaitExceeded(f"max_wait of {self.config.max_wait:.0f}s exceeded while waiting")
             if ready() or (until_ts is not None and now >= until_ts):
                 return
             chunk = min(step, until_ts - now) if until_ts is not None else step

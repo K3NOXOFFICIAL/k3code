@@ -292,3 +292,95 @@ class _RetryEvent:
         self.kind = "router.retry"
         self.reason = "rate_limit"
         self.extra = {"delay": delay}
+
+
+# ── wake on recovery (regression: a 60 s network cooldown delayed the resume after the network came back) ──
+
+
+class RecoveringNetWatch(FakeNetWatch):
+    def __init__(self, state: NetState) -> None:
+        super().__init__(state)
+        self.recoveries = 0
+
+
+class FakeCooldowns:
+    def __init__(self, only_network: bool) -> None:
+        self._only_network = only_network
+        self.cleared: list[Any] = []
+
+    def only_network_cooling(self) -> bool:
+        return self._only_network
+
+    def clear_reason(self, reason) -> int:
+        self.cleared.append(reason)
+        return 1
+
+
+async def test_network_park_wakes_when_connectivity_recovers():
+    """All providers unreachable while the net looks fine: park; a recovery ends the park early."""
+    from k3code.router.classifier import FailoverReason
+
+    nw = RecoveringNetWatch(NetState.ONLINE)
+    router = FakeRouter(fails=1, error=AllProvidersUnreachable("down", attempts=1))
+    router.cooldowns = FakeCooldowns(only_network=True)
+    retry, clock, events, seen = _retry(
+        router, netwatch=nw, config=RetryConfig(park_base=60.0, park_max=60.0, poll_interval=0.5)
+    )
+
+    orig_sleep = clock.sleep
+
+    async def sleep_then_recover(delay: float):
+        nw.recoveries += 1  # the monitor reports the network came back
+        await orig_sleep(delay)
+
+    retry._sleep = sleep_then_recover
+    out = await _drain(retry.stream([Message(role="user", content="hi")], []))
+
+    assert any(e.type == "text_delta" for e in out)
+    assert clock.now - 1000.0 < 5.0, "must not sit out the 60 s park once the network is back"
+    assert [e.kind for e in seen] == [PARKED, UNPARKED]
+    assert router.cooldowns.cleared == [FailoverReason.network]
+
+
+async def test_quota_park_does_not_wake_on_recovery():
+    """A park for a rate-limit/quota reset waits for the real reset even if the network recovered."""
+    nw = RecoveringNetWatch(NetState.ONLINE)
+    router = FakeRouter(fails=1, error=ChainExhausted("all providers rate-limited", retry_after=10.0, until=None))
+    router.cooldowns = FakeCooldowns(only_network=False)
+    retry, clock, events, seen = _retry(
+        router, netwatch=nw, config=RetryConfig(park_base=1.0, park_max=8.0, poll_interval=0.5)
+    )
+
+    orig_sleep = clock.sleep
+
+    async def sleep_then_recover(delay: float):
+        nw.recoveries += 1
+        await orig_sleep(delay)
+
+    retry._sleep = sleep_then_recover
+    await _drain(retry.stream([Message(role="user", content="hi")], []))
+
+    assert clock.now - 1000.0 >= 10.0, "a quota reset must be waited out"
+    assert router.cooldowns.cleared == []
+
+
+async def test_pause_end_clears_network_cooldowns():
+    """Regression: after OFFLINE -> resumed, stale network cooldowns must not park the retry again."""
+    from k3code.router.classifier import FailoverReason
+
+    nw = RecoveringNetWatch(NetState.OFFLINE)
+    router = FakeRouter(fails=1, error=AllProvidersUnreachable("down", attempts=1))
+    router.cooldowns = FakeCooldowns(only_network=True)
+    retry, clock, events, seen = _retry(router, netwatch=nw)
+
+    orig_sleep = clock.sleep
+
+    async def sleep_and_flip(delay: float):
+        nw.set(NetState.ONLINE)
+        await orig_sleep(delay)
+
+    retry._sleep = sleep_and_flip
+    await _drain(retry.stream([Message(role="user", content="hi")], []))
+
+    assert [e.kind for e in seen] == [PAUSED, RESUMED]  # no park after the resume
+    assert router.cooldowns.cleared == [FailoverReason.network]

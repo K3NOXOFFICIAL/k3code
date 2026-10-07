@@ -13,18 +13,28 @@ from test_permissions_gateway import call, make_server
 GOAL = Path(__file__).resolve().parents[2] / "GOAL.md"
 
 
-def _parse(line: str) -> list[str]:
-    out: list[str] = []
-    for chunk in re.findall(r"`([^`]+)`", line):
-        out += [c.strip() for c in chunk.split(",") if re.fullmatch(r"[a-z][a-z-]*", c.strip())]
-    return out
+def _goal_commands() -> list[str]:
+    """The required commands: the first backticked ``/name`` of each row of GOAL.md's command table (§4)."""
+    names: list[str] = []
+    for ln in GOAL.read_text(encoding="utf-8").splitlines():
+        m = re.match(r"^\| `/([a-z][a-z-]*)`", ln)
+        if m:
+            names.append(m.group(1))
+    return names
+
+
+def _goal_extra_commands() -> list[str]:
+    """Commands the design adds on top of the required ones (the 'Additional commands' line under the table)."""
+    line = next(ln for ln in GOAL.read_text(encoding="utf-8").splitlines() if ln.startswith("Additional commands"))
+    return re.findall(r"`/([a-z][a-z-]*)`", line)
 
 
 def test_every_goal_command_registered_and_in_help(tmp_path, monkeypatch):
-    names = _parse(next(ln for ln in GOAL.read_text(encoding="utf-8").splitlines() if "`goal, loop," in ln))
+    names = _goal_commands()
     assert len(names) >= 36 and "permissions" in names and "advisor" in names
+    assert len(names) == len(set(names)), "duplicate row in GOAL.md's command table"
     reg = build_registry()
-    missing = [n for n in names if reg.get(n) is None]
+    missing = [n for n in [*names, *_goal_extra_commands()] if reg.get(n) is None]
     assert not missing, missing
 
 
@@ -32,8 +42,7 @@ async def test_help_lists_goal_commands_and_focus(tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, ["ok"], monkeypatch)
     out = await call(server, "command.dispatch", {"name": "help", "arg": ""})
     text = out["output"]
-    names = _parse(next(ln for ln in GOAL.read_text(encoding="utf-8").splitlines() if "`goal, loop," in ln))
-    for n in [*names, "focus"]:
+    for n in [*_goal_commands(), *_goal_extra_commands()]:
         assert re.search(rf"/{re.escape(n)}\b", text), n
 
 

@@ -138,7 +138,11 @@ async def nmcli_state(timeout: float = 2.0) -> str | None:
     proc: asyncio.subprocess.Process | None = None
     try:
         proc = await asyncio.create_subprocess_exec(
-            "nmcli", "-t", "-f", "STATE", "general",
+            "nmcli",
+            "-t",
+            "-f",
+            "STATE",
+            "general",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -261,6 +265,8 @@ class NetWatch:
         self._state = NetState.ONLINE
         self._providers: dict[str, ProviderProbeState] = {}
         self._callbacks: list[Callable[[NetState, NetState], Any]] = []
+        #: how many times connectivity came back (OFFLINE/CAPTIVE/PROVIDER_DOWN -> ONLINE/DEGRADED)
+        self.recoveries = 0
         self._running = False
         self._tasks: list[asyncio.Task[None]] = []
         self._interval = self.config.base_interval
@@ -400,6 +406,12 @@ class NetWatch:
         if new_state is not self._state:
             old, self._state = self._state, new_state
             logger.info("NetWatch state: %s -> %s", old.value, new_state.value)
+            if new_state in (NetState.ONLINE, NetState.DEGRADED) and old in (
+                NetState.OFFLINE,
+                NetState.CAPTIVE,
+                NetState.PROVIDER_DOWN,
+            ):
+                self.recoveries += 1  # parked retries wake on this (see PersistentRetry._park)
             for cb in list(self._callbacks):
                 try:
                     res = cb(old, new_state)
@@ -412,9 +424,7 @@ class NetWatch:
         results: dict[str, NetState] = {}
         for name, prov in self._providers.items():
             try:
-                status, _body, _final = await self._probes.provider(
-                    prov.base_url, self.config.provider_probe_timeout
-                )
+                status, _body, _final = await self._probes.provider(prov.base_url, self.config.provider_probe_timeout)
                 if 0 < status < 500:
                     prov.state = NetState.ONLINE
                     prov.last_ok = time.monotonic()
