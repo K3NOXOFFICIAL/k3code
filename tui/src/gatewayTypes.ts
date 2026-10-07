@@ -116,13 +116,6 @@ export interface ConfigDisplayConfig {
   tui_theme?: string
 }
 
-export interface ConfigVoiceConfig {
-  // Raw `yaml.safe_load()` values from config may be non-string if hand-edited.
-  // Callers must normalize/validate at runtime.
-  record_key?: unknown
-  submit_mode?: unknown
-}
-
 export interface ConfigApprovalsConfig {
   // Raw config value: only the explicit boolean false disables the safety gate.
   destructive_slash_confirm?: unknown
@@ -132,7 +125,6 @@ export interface ConfigFullResponse {
   config?: {
     approvals?: ConfigApprovalsConfig
     display?: ConfigDisplayConfig
-    voice?: ConfigVoiceConfig
     paste_collapse_threshold?: number
     paste_collapse_char_threshold?: number
   }
@@ -312,9 +304,6 @@ export interface SessionSteerResponse {
 
 export interface PromptSubmitResponse {
   ok?: boolean
-  /** Set when the submitted text was a bare voice stop phrase consumed
-   *  server-side to end the voice chat instead of starting a turn. */
-  voice_stopped?: boolean
 }
 
 export interface BackgroundStartResponse {
@@ -366,56 +355,6 @@ export interface ImageAttachResponse {
   remainder?: string
   token_estimate?: number
   width?: number
-}
-
-// ── Voice ────────────────────────────────────────────────────────────
-
-export interface VoiceToggleResponse {
-  audio_available?: boolean
-  available?: boolean
-  details?: string
-  enabled?: boolean
-  record_key?: string
-  stop_hint?: string
-  stt_available?: boolean
-  tts?: boolean
-}
-
-export interface VoiceRecordResponse {
-  status?: 'busy' | 'recording' | 'stopped'
-  text?: string
-}
-
-// ── Wake word ────────────────────────────────────────────────────────
-
-export interface WakeStartResponse {
-  enabled_persisted?: boolean
-  hint?: string
-  owner_surface?: null | string
-  phrase?: string
-  provider?: string
-  reason?: string
-  started?: boolean
-}
-
-export interface WakeStopResponse {
-  disabled_persisted?: boolean
-  reason?: null | string
-  stopped?: boolean
-}
-
-export interface WakeStatusResponse {
-  /** Armed but the mic delivers only silence (macOS backend-permission gap). */
-  audio_silent?: boolean
-  available?: boolean
-  /** Config truth (wake_word.enabled). */
-  enabled?: boolean
-  hint?: string
-  listening?: boolean
-  owned_by_caller?: boolean
-  owner_surface?: null | string
-  phrase?: string
-  provider?: string
 }
 
 // ── Tools (TS keeps configure since it resets local history) ─────────

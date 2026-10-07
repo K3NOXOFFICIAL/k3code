@@ -292,51 +292,6 @@ describe('applyDisplay → tui_status_indicator', () => {
   })
 })
 
-// Regressions from Copilot review on #19835: the config-hydration path
-// for voice.record_key was untested, so a future regression in the
-// hydration or mtime-reapply wiring would slip past the suite.
-describe('applyDisplay → voice.record_key (#18994)', () => {
-  beforeEach(() => {
-    resetUiState()
-  })
-
-  it('parses voice.record_key and pushes it through the setter', () => {
-    const setBell = vi.fn()
-    const setVoiceRecordKey = vi.fn()
-
-    applyDisplay({ config: { display: {}, voice: { record_key: 'ctrl+space' } } }, setBell, setVoiceRecordKey)
-
-    expect(setVoiceRecordKey).toHaveBeenCalledWith(
-      expect.objectContaining({ ch: 'space', mod: 'ctrl', named: 'space', raw: 'ctrl+space' })
-    )
-  })
-
-  it('falls back to the documented default when voice.record_key is missing', () => {
-    const setBell = vi.fn()
-    const setVoiceRecordKey = vi.fn()
-
-    applyDisplay({ config: { display: {} } }, setBell, setVoiceRecordKey)
-
-    expect(setVoiceRecordKey).toHaveBeenCalledWith(expect.objectContaining({ ch: 'b', mod: 'ctrl', raw: 'ctrl+b' }))
-  })
-
-  it('does not reset voiceRecordKey when cfg is null (transient RPC failure)', () => {
-    const setBell = vi.fn()
-    const setVoiceRecordKey = vi.fn()
-
-    // quietRpc() collapses request failures to null. Resetting the
-    // cached shortcut on every null would clobber a custom binding
-    // after one transient error until the next successful poll
-    // (Copilot round-8 review on #19835).
-    applyDisplay(null, setBell, setVoiceRecordKey)
-
-    expect(setVoiceRecordKey).not.toHaveBeenCalled()
-    // bell is still applied (defaults to false on null), so the setter
-    // runs — we specifically only skip voiceRecordKey.
-    expect(setBell).toHaveBeenCalledWith(false)
-  })
-})
-
 // Review on #20379 (finding 1): an MCP config revision must never be acked
 // before the server confirms it was LOADED. The old poll advanced its
 // accepted revision first and fired reload.mcp second — a reload that failed
@@ -451,58 +406,56 @@ describe('hydrateFullConfig', () => {
       off: vi.fn()
     }) as any
 
-  it('re-applies voice.record_key from a fresh config.get full response', async () => {
-    const gw = makeFakeGw({ config: { display: {}, voice: { record_key: 'ctrl+o' } } })
+  it('re-applies focus_view from a fresh config.get full response', async () => {
+    const gw = makeFakeGw({ config: { display: { focus_view: true } } })
     const setBell = vi.fn()
-    const setVoiceRecordKey = vi.fn()
+    const setBellOnPrompt = vi.fn()
 
-    await hydrateFullConfig(gw, setBell, setVoiceRecordKey)
+    await hydrateFullConfig(gw, setBell, setBellOnPrompt)
 
     expect(gw.request).toHaveBeenCalledWith('config.get', { key: 'full' })
-    expect(setVoiceRecordKey).toHaveBeenCalledWith(expect.objectContaining({ ch: 'o', mod: 'ctrl', raw: 'ctrl+o' }))
+    expect($uiState.get().focusView).toBe(true)
     expect(setBell).toHaveBeenCalledWith(false)
   })
 
   it('reapplies the latest value on each invocation (mtime-reload semantics)', async () => {
-    const gw = makeFakeGw({ config: { display: {}, voice: { record_key: 'ctrl+b' } } })
+    const gw = makeFakeGw({ config: { display: { focus_view: false } } })
     const setBell = vi.fn()
-    const setVoiceRecordKey = vi.fn()
 
-    await hydrateFullConfig(gw, setBell, setVoiceRecordKey)
-    expect(setVoiceRecordKey).toHaveBeenLastCalledWith(expect.objectContaining({ ch: 'b' }))
+    await hydrateFullConfig(gw, setBell)
+    expect($uiState.get().focusView).toBe(false)
 
-    // Simulate a config edit: gw now returns a new shortcut.
-    gw.request = vi.fn(() => Promise.resolve({ config: { display: {}, voice: { record_key: 'alt+space' } } }))
+    // Simulate a config edit: gw now returns focus on.
+    gw.request = vi.fn(() => Promise.resolve({ config: { display: { focus_view: true } } }))
 
-    await hydrateFullConfig(gw, setBell, setVoiceRecordKey)
-    expect(setVoiceRecordKey).toHaveBeenLastCalledWith(
-      expect.objectContaining({ ch: 'space', mod: 'alt', named: 'space' })
-    )
+    await hydrateFullConfig(gw, setBell)
+    expect($uiState.get().focusView).toBe(true)
   })
 
-  it('leaves cached voiceRecordKey untouched when the RPC fails', async () => {
+  it('leaves ui state untouched when the RPC fails', async () => {
     const gw = { request: vi.fn(() => Promise.reject(new Error('boom'))), on: vi.fn(), off: vi.fn() } as any
     const setBell = vi.fn()
-    const setVoiceRecordKey = vi.fn()
 
-    const result = await hydrateFullConfig(gw, setBell, setVoiceRecordKey)
+    const result = await hydrateFullConfig(gw, setBell)
 
     // quietRpc() swallows the error and returns null; applyDisplay
-    // sees cfg=null and skips the voice setter (Copilot round-8).
+    // sees cfg=null and still runs its documented null-cfg defaults.
     expect(result).toBeNull()
-    expect(setVoiceRecordKey).not.toHaveBeenCalled()
     // bell setter still fires — applyDisplay's null-cfg path applies
     // the documented bell default (false).
     expect(setBell).toHaveBeenCalledWith(false)
+    // focusView falls back to false on null, same as before the failure
+    // (it was already false in this suite's fresh state).
+    expect($uiState.get().focusView).toBe(false)
   })
 
-  it('threads through without a voice setter (back-compat call sites)', async () => {
-    const gw = makeFakeGw({ config: { display: { bell_on_complete: true } } })
+  it('threads through without a bell-on-prompt setter (back-compat call sites)', async () => {
+    const gw = makeFakeGw({ config: { display: { bell_on_prompt: true } } })
     const setBell = vi.fn()
 
     // No third arg — applyDisplay must not throw and must still apply
     // display flags (round-2 / round-8 invariant).
     await expect(hydrateFullConfig(gw, setBell)).resolves.toBeTruthy()
-    expect(setBell).toHaveBeenCalledWith(true)
+    expect(setBell).toHaveBeenCalledWith(false)
   })
 })

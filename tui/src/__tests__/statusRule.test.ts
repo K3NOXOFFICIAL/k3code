@@ -66,11 +66,11 @@ describe('statusBarSegments', () => {
   })
 
   it('sheds cache/latency/tps read-outs first as the terminal narrows', () => {
-    // 96/104/110-col breakpoints: these are the lowest-priority perf
+    // 92/100/106-col breakpoints: these are the lowest-priority perf
     // read-outs, so they disappear before any pre-existing segment.
-    expect(statusBarSegments(108)).toMatchObject({ cacheHit: true, latency: true, tps: false })
-    expect(statusBarSegments(100)).toMatchObject({ cacheHit: true, latency: false, tps: false })
-    expect(statusBarSegments(94)).toMatchObject({ cacheHit: false, latency: false, tps: false, subagents: true })
+    expect(statusBarSegments(102)).toMatchObject({ cacheHit: true, latency: true, tps: false })
+    expect(statusBarSegments(96)).toMatchObject({ cacheHit: true, latency: false, tps: false })
+    expect(statusBarSegments(90)).toMatchObject({ cacheHit: false, latency: false, tps: false, subagents: true })
   })
 
   it('collapses the context bar to a token count on narrow terminals', () => {
@@ -87,7 +87,6 @@ describe('statusBarSegments', () => {
       'bar',
       'duration',
       'compressions',
-      'voice',
       'bg',
       'subagents'
     ]

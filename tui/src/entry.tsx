@@ -16,7 +16,7 @@ import { recordParentLifecycle } from './lib/parentLog.js'
 import { clearNativeTuiFrame, resetTerminalModes } from './lib/terminalModes.js'
 
 if (!process.stdin.isTTY) {
-  console.log('hermes-tui: no TTY')
+  console.log('k3code-tui: no TTY')
   process.exit(0)
 }
 
@@ -60,7 +60,7 @@ setRpcErrorLogSink(line => gw.recordLog(line))
 gw.start()
 
 const dumpNotice = (snap: MemorySnapshot, dump: HeapDumpResult | null) =>
-  `hermes-tui: ${snap.level} memory (${formatBytes(snap.heapUsed)}) — auto heap dump → ${dump?.heapPath ?? dump?.diagPath ?? '(failed)'}\n`
+  `k3code-tui: ${snap.level} memory (${formatBytes(snap.heapUsed)}) — auto heap dump → ${dump?.heapPath ?? dump?.diagPath ?? '(failed)'}\n`
 
 let consecutiveDeadStreamErrors = 0
 
@@ -97,7 +97,7 @@ setupGracefulExit({
     consecutiveDeadStreamErrors = 0
 
     try {
-      process.stderr.write(`hermes-tui lifecycle ${scope}: ${message.slice(0, 2000)}\n`)
+      process.stderr.write(`k3code-tui lifecycle ${scope}: ${message.slice(0, 2000)}\n`)
     } catch {
       // stderr may be the dead stream itself.
     }
@@ -108,7 +108,7 @@ setupGracefulExit({
     // what tells SIGHUP (terminal/SSH dropped) apart from a real SIGTERM.
     recordParentLifecycle(`graceful-exit received signal=${signal} → killing gateway`)
     resetTerminalModes()
-    process.stderr.write(`hermes-tui lifecycle: received ${signal}\n`)
+    process.stderr.write(`k3code-tui lifecycle: received ${signal}\n`)
   },
   // The dashboard chat tab has no in-page restart path after the PTY child
   // exits. Ignore SIGINT there so Ctrl+C cannot kill the embedded TUI if raw
@@ -127,10 +127,10 @@ const stopMemoryMonitor = startMemoryMonitor({
     )
     resetTerminalModes()
     process.stderr.write(
-      `hermes-tui lifecycle: memory critical exit heap=${formatBytes(snap.heapUsed)} rss=${formatBytes(snap.rss)}\n`
+      `k3code-tui lifecycle: memory critical exit heap=${formatBytes(snap.heapUsed)} rss=${formatBytes(snap.rss)}\n`
     )
     process.stderr.write(dumpNotice(snap, dump))
-    process.stderr.write('hermes-tui: exiting to avoid OOM; restart to recover\n')
+    process.stderr.write('k3code-tui: exiting to avoid OOM; restart to recover\n')
     process.exit(137)
   },
   onHigh: (snap, dump) => process.stderr.write(dumpNotice(snap, dump)),
@@ -143,12 +143,12 @@ const stopMemoryMonitor = startMemoryMonitor({
       `memory-warning fast heap growth heap=${formatBytes(snap.heapUsed)} rss=${formatBytes(snap.rss)}`
     )
     process.stderr.write(
-      `hermes-tui: heap climbing fast (${formatBytes(snap.heapUsed)}) — a large tool output or long session may be straining memory\n`
+      `k3code-tui: heap climbing fast (${formatBytes(snap.heapUsed)}) — a large tool output or long session may be straining memory\n`
     )
   }
 })
 
-if (process.env.HERMES_HEAPDUMP_ON_START === '1') {
+if (process.env.K3CODE_HEAPDUMP_ON_START === '1') {
   void performHeapDump('manual')
 }
 

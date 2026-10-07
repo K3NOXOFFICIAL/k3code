@@ -1,6 +1,5 @@
 import { compactNumber } from '@k3code/shared/format'
 
-import { usageBarsText } from '../../../components/overlayPrimitives.js'
 import { introMsg, toTranscriptMessages } from '../../../domain/messages.js'
 import { sessionScopedModelArg, TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
 import type {
@@ -9,19 +8,14 @@ import type {
   ConfigSetResponse,
   SessionBranchResponse,
   SessionCompressResponse,
-  SessionUsageResponse,
-  SlashExecResponse,
-  VoiceToggleResponse
+  SessionUsageResponse
 } from '../../../gatewayTypes.js'
-import { formatVoiceRecordKey, parseVoiceRecordKey } from '../../../lib/platform.js'
 import type { PanelSection } from '../../../types.js'
 import { applyConfiguredTuiTheme } from '../../createGatewayEventHandler.js'
 import { DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES, type IndicatorStyle } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
 import { patchUiState } from '../../uiStore.js'
 import type { SlashCommand } from '../types.js'
-
-const USAGE_CTA = 'Run /subscription to change plan · /topup to add to your balance'
 
 const TUI_SESSION_MODEL_RE = new RegExp(`(?:^|\\s)${TUI_SESSION_MODEL_FLAG}(?:\\s|$)`)
 const REASONING_SESSION_FLAGS = new Set(['--session'])
@@ -313,128 +307,6 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: 'voice mode: [on|off|tts|status]',
-    name: 'voice',
-    run: (arg, ctx) => {
-      const normalized = (arg ?? '').trim().toLowerCase()
-
-      const action =
-        normalized === 'on' || normalized === 'off' || normalized === 'tts' || normalized === 'status'
-          ? normalized
-          : 'status'
-
-      ctx.gateway.rpc<VoiceToggleResponse>('voice.toggle', { action }).then(
-        ctx.guarded<VoiceToggleResponse>(r => {
-          ctx.voice.setVoiceEnabled(!!r.enabled)
-          ctx.voice.setVoiceTts(!!r.tts)
-
-          // Render the configured record key (config.yaml ``voice.record_key``)
-          // instead of hardcoded "Ctrl+B" — the gateway response carries the
-          // current value so /voice status and /voice on stay in sync with
-          // both the CLI and the TUI's actual binding (#18994).
-          //
-          // Copilot review on #19835 caught that rendering from the fresh
-          // backend response WITHOUT updating the frontend ``voice.recordKey``
-          // state would skew display and binding between config-edit and
-          // the next ``mtime`` poll (~5s). Parse once, push into state so
-          // ``useInputHandlers()`` picks up the new binding immediately.
-          //
-          // Round-2 follow-up: only push state when the response actually
-          // carries ``record_key`` — otherwise an older gateway (or a future
-          // branch that forgets to include it) would clobber a custom user
-          // binding back to the default on every /voice invocation. The
-          // label still falls back to the documented default for display.
-          const parsed = r.record_key ? parseVoiceRecordKey(r.record_key) : undefined
-
-          if (parsed) {
-            ctx.voice.setVoiceRecordKey(parsed)
-          }
-
-          const recordKeyLabel = formatVoiceRecordKey(parsed ?? parseVoiceRecordKey('ctrl+b'))
-
-          // Match CLI's _show_voice_status / _enable_voice_mode /
-          // _toggle_voice_tts output shape so users don't have to learn
-          // two vocabularies.
-          if (action === 'status') {
-            const mode = r.enabled ? 'ON' : 'OFF'
-            const tts = r.tts ? 'ON' : 'OFF'
-            ctx.transcript.sys('Voice Mode Status')
-            ctx.transcript.sys(`  Mode:       ${mode}`)
-            ctx.transcript.sys(`  TTS:        ${tts}`)
-            ctx.transcript.sys(`  Record key: ${recordKeyLabel}`)
-
-            // CLI's "Requirements:" block — surfaces STT/audio setup issues
-            // so the user sees "STT provider: MISSING ..." instead of
-            // silently failing on every record-key press.
-            if (r.details) {
-              ctx.transcript.sys('')
-              ctx.transcript.sys('  Requirements:')
-
-              for (const line of r.details.split('\n')) {
-                if (line.trim()) {
-                  ctx.transcript.sys(`    ${line}`)
-                }
-              }
-            }
-
-            return
-          }
-
-          if (action === 'tts') {
-            ctx.transcript.sys(`Voice TTS ${r.tts ? 'enabled' : 'disabled'}.`)
-
-            return
-          }
-
-          // on/off — mirror cli.py:_enable_voice_mode's 3-line output
-          if (r.enabled) {
-            const tts = r.tts ? ' (TTS enabled)' : ''
-            ctx.transcript.sys(`Voice mode enabled${tts}`)
-            ctx.transcript.sys(`  ${recordKeyLabel} to start/stop recording`)
-
-            // Spoken-stop hint — backend-sourced from voice.stop_phrases so a
-            // custom phrase renders correctly; absent/empty means the feature
-            // is disabled (stop_phrases: []) and no hint is shown.
-            if (r.stop_hint) {
-              ctx.transcript.sys(`  ${r.stop_hint}`)
-            }
-
-            ctx.transcript.sys('  /voice tts  to toggle speech output')
-            ctx.transcript.sys('  /voice off  to disable voice mode')
-          } else {
-            ctx.transcript.sys('Voice mode disabled.')
-          }
-        })
-      )
-    }
-  },
-
-  {
-    help: 'toggle / adopt / resize an animated pet',
-    name: 'pet',
-    usage: '/pet [toggle | list | scale <n> | <slug>]',
-    run: (arg, ctx, cmd) => {
-      const sub = arg.trim().toLowerCase()
-
-      // Gallery picker — the interactive browse surface.
-      if (sub === 'list') {
-        return patchOverlayState({ petPicker: true })
-      }
-
-      // Bare /pet and /pet toggle flip display.pet.enabled via the slash worker.
-      ctx.gateway.gw
-        .request<SlashExecResponse>('slash.exec', { command: cmd.slice(1), session_id: ctx.sid })
-        .then(
-          ctx.guarded<SlashExecResponse>(r => {
-            const body = r.output || '/pet: no output'
-            ctx.transcript.sys(r.warning ? `warning: ${r.warning}\n${body}` : body)
-          })
-        )
-        .catch(ctx.guardedErr)
-    }
-  },
-
-  {
     help: 'pin light/dark mode or trust auto-detection (usage: /theme [auto|light|dark])',
     name: 'theme',
     usage: '/theme [auto|light|dark]',
@@ -664,7 +536,7 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: 'session usage + Nous credits',
+    help: 'session usage',
     name: 'usage',
     run: (_arg, ctx) => {
       ctx.gateway.rpc<SessionUsageResponse>('session.usage', { session_id: ctx.sid }).then(r => {
@@ -680,53 +552,11 @@ export const sessionCommands: SlashCommand[] = [
           })
         }
 
-        // Nous balance block is agent-independent (a portal fetch), so it shows
-        // even with zero API calls or on a resumed session. Prefer the shared
-        // dollar usage model (two-bar view, dollars-only); fall back to the
-        // legacy text lines only when the model is unavailable.
-        const usageModel = r?.usage
-        const barLines = usageBarsText(usageModel)
-        let showedBalance = false
-
-        if (usageModel?.available && (barLines.length || usageModel.status === 'free')) {
-          const sections: PanelSection[] = []
-          const plan = usageModel.plan_name ?? (usageModel.status === 'free' ? 'Free' : null)
-
-          if (plan) {
-            sections.push({
-              text: `Plan: ${plan}${usageModel.renews_display ? ` · renews ${usageModel.renews_display}` : ''}`
-            })
-          }
-
-          if (barLines.length) {
-            sections.push({ text: barLines.join('\n') })
-          }
-
-          if (usageModel.status === 'free') {
-            sections.push({ text: '> Free · free models only. Run /subscription to reach paid models.' })
-          } else if (usageModel.status === 'low') {
-            sections.push({
-              text: `! Low balance · ${usageModel.total_spendable_display ?? 'under $5'} left. Run /topup or /subscription.`
-            })
-          }
-
-          ctx.transcript.panel('Balance', sections)
-          showedBalance = true
-        } else {
-          const creditsLines = r?.credits_lines ?? []
-
-          if (creditsLines.length) {
-            ctx.transcript.panel('Nous balance', [{ text: creditsLines.join('\n') }])
-            showedBalance = true
-          }
-        }
-
+        // k3code M1 cut: the billing/subscription "balance" panel (plan name,
+        // credits, low-balance nudges toward /subscription and /topup) is
+        // removed — this command now shows only token/call usage.
         if (!r?.calls) {
-          if (!showedBalance) {
-            sys('no API calls yet')
-          }
-
-          sys(USAGE_CTA)
+          sys('no API calls yet')
 
           return
         }
@@ -755,8 +585,6 @@ export const sessionCommands: SlashCommand[] = [
         }
 
         ctx.transcript.panel('Usage', sections)
-
-        sys(USAGE_CTA)
       })
     }
   }

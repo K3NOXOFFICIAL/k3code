@@ -200,7 +200,7 @@ describe('slash.exec fallback policy', () => {
 })
 
 describe('backend lifecycle copy', () => {
-  it('names the exit code, the last real stderr line, /logs and hermes doctor', () => {
+  it('names the exit code, the last real stderr line, /logs and k3code doctor', () => {
     const tail =
       '[lifecycle] child exit code=1\nModuleNotFoundError: No module named pydantic\n[lifecycle] scheduling gateway reconnect in 1000ms (attempt 1)'
 
@@ -210,7 +210,7 @@ describe('backend lifecycle copy', () => {
     expect(text).toContain('Details: ModuleNotFoundError: No module named pydantic')
     expect(text).not.toContain('[lifecycle]')
     expect(text).toContain('/logs')
-    expect(text).toContain('hermes doctor')
+    expect(text).toContain('k3code doctor')
     expect(text).toContain('/resume')
     expect(text).not.toMatch(/\bgateway\b/)
   })
@@ -235,13 +235,13 @@ describe('backend lifecycle copy', () => {
 })
 
 describe('promptTimeoutNotice', () => {
-  it('explains a timed-out password/vault prompt and stays silent for other reasons', () => {
+  it('explains a timed-out password prompt and stays silent for other reasons', () => {
     const sudo = promptTimeoutNotice('sudo', 'timeout')
 
     expect(sudo).toBeTruthy()
     // The timeout lengths live in Python (agent_callbacks.py); the copy must not hard-code them.
     expect(sudo).not.toMatch(/\d+ minutes?/)
-    expect(promptTimeoutNotice('vault.code', 'timeout')).not.toMatch(/\d+ minutes?/)
+    expect(promptTimeoutNotice('secret', 'timeout')).not.toMatch(/\d+ minutes?/)
     expect(promptTimeoutNotice('sudo', 'interrupted')).toBeNull()
     expect(promptTimeoutNotice('approval', 'timeout')).toBeNull()
   })

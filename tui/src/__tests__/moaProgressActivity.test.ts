@@ -40,11 +40,6 @@ const buildCtx = (appended: Msg[]) =>
       appendMessage: (msg: Msg) => appended.push(msg),
       panel: () => undefined,
       setHistoryItems: () => undefined
-    },
-    voice: {
-      setProcessing: () => undefined,
-      setRecording: () => undefined,
-      setVoiceEnabled: () => undefined
     }
   }) as any
 

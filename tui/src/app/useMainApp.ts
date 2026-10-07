@@ -34,7 +34,7 @@ import { useGitBranch } from '../hooks/useGitBranch.js'
 import { pruneVirtualHeightCache, useVirtualHistory } from '../hooks/useVirtualHistory.js'
 import { composerPromptWidth } from '../lib/inputMetrics.js'
 import { appendTranscriptMessage, capTranscriptHistory } from '../lib/messages.js'
-import { DEFAULT_VOICE_RECORD_KEY, isMac, type ParsedVoiceRecordKey } from '../lib/platform.js'
+import { isMac } from '../lib/platform.js'
 import { createResizeCoalescer } from '../lib/resizeCoalescer.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
 import { terminalParityHints } from '../lib/terminalParity.js'
@@ -48,6 +48,8 @@ import {
 import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
 import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
+
+import { $stripSessions, setStripHandlers } from '../k3/agentStripStore.js'
 
 import { applyAgentSnapshot } from './agentRoster.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
@@ -212,11 +214,6 @@ export function useMainApp(gw: GatewayClient) {
   const [lastUserMsg, setLastUserMsg] = useState('')
   const [stickyPrompt, setStickyPrompt] = useState('')
   const [catalog, setCatalog] = useState<null | SlashCatalog>(null)
-  const [voiceEnabled, setVoiceEnabled] = useState(false)
-  const [voiceTts, setVoiceTts] = useState(false)
-  const [voiceRecording, setVoiceRecording] = useState(false)
-  const [voiceProcessing, setVoiceProcessing] = useState(false)
-  const [voiceRecordKey, setVoiceRecordKey] = useState<ParsedVoiceRecordKey>(DEFAULT_VOICE_RECORD_KEY)
   const [sessionStartedAt, setSessionStartedAt] = useState(() => Date.now())
   const [dashboardFreshSessionId, setDashboardFreshSessionId] = useState<null | string>(null)
   const [turnStartedAt, setTurnStartedAt] = useState<null | number>(null)
@@ -256,7 +253,7 @@ export function useMainApp(gw: GatewayClient) {
   const lastUserMsgRef = useRef(lastUserMsg)
   const recoverSidRef = useRef<null | string>(null)
   const recoveryAtRef = useRef<number[]>([])
-  // "Hermes stopped and could not be restarted" is said once per outage; reset on gateway.ready.
+  // "k3code stopped and could not be restarted" is said once per outage; reset on gateway.ready.
   const gaveUpRef = useRef(false)
   const msgIdsRef = useRef(new WeakMap<Msg, string>())
   const msgIdSeqRef = useRef(0)
@@ -577,8 +574,6 @@ export function useMainApp(gw: GatewayClient) {
     setLastUserMsg,
     setSessionStartedAt,
     setStickyPrompt,
-    setVoiceProcessing,
-    setVoiceRecording,
     sys
   })
 
@@ -600,7 +595,7 @@ export function useMainApp(gw: GatewayClient) {
     }
   }, [ui.busy, turnStartedAt])
 
-  useConfigSync({ gw, setBellOnComplete, setBellOnPrompt, setVoiceEnabled, setVoiceRecordKey, sid: ui.sid })
+  useConfigSync({ gw, setBellOnComplete, setBellOnPrompt, sid: ui.sid })
   useBatteryPoll(gw)
 
   useEffect(() => {
@@ -654,6 +649,8 @@ export function useMainApp(gw: GatewayClient) {
           if (!stopped && result?.sessions) {
             const liveSessionCount = result.sessions.length
 
+            $stripSessions.set(result.sessions)
+
             // Surface the current session's (auto-)title for the terminal
             // titlebar. The active_list poll already carries it, so no extra
             // round-trip is needed.
@@ -684,16 +681,34 @@ export function useMainApp(gw: GatewayClient) {
     }
   }, [gw, ui.sid])
 
+  // Agent strip actions: Enter attaches a background session, `x` stops a row.
+  useEffect(() => {
+    setStripHandlers({
+      activate: row => {
+        if (row.kind === 'session') {
+          session.activateLiveSession(row.id)
+        }
+      },
+      stop: row => {
+        const sid = getUiState().sid
+
+        if (row.kind === 'agent') {
+          gw.request('subagent.interrupt', { session_id: sid, subagent_id: row.id }).catch(() => {})
+        } else {
+          gw.request('session.interrupt', { session_id: row.id }).catch(() => {})
+        }
+      }
+    })
+
+    return () => setStripHandlers(null)
+  }, [gw, session.activateLiveSession])
+
   // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
   // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.
   const model = ui.info?.model?.replace(/^.*\//, '') ?? ''
 
   const marker =
-    overlay.approval || overlay.sudo || overlay.secret || overlay.vaultUnlock || overlay.clarify
-      ? '⚠'
-      : ui.busy
-        ? '⏳'
-        : '✓'
+    overlay.approval || overlay.sudo || overlay.secret || overlay.clarify ? '⚠' : ui.busy ? '⏳' : '✓'
 
   const tabCwd = ui.info?.cwd
 
@@ -703,7 +718,7 @@ export function useMainApp(gw: GatewayClient) {
           tab: composeTabTitle(marker, ui.sessionTitle, '', ''),
           window: composeTabTitle(marker, ui.sessionTitle, model, tabCwd ? shortCwd(tabCwd, 24) : '')
         }
-      : 'Hermes'
+      : 'k3code'
   )
 
   useEffect(() => {
@@ -900,15 +915,6 @@ export function useMainApp(gw: GatewayClient) {
     composer: { actions: composerActions, refs: composerRefs, state: composerState },
     gateway,
     terminal: { hasSelection, scrollRef, scrollWithSelection, selection, stdout },
-    voice: {
-      enabled: voiceEnabled,
-      recordKey: voiceRecordKey,
-      recording: voiceRecording,
-      setProcessing: setVoiceProcessing,
-      setRecording: setVoiceRecording,
-      setVoiceEnabled,
-      setVoiceTts
-    },
     wheelStep: WHEEL_SCROLL_STEP
   })
 
@@ -928,13 +934,7 @@ export function useMainApp(gw: GatewayClient) {
         },
         submission: { submitLiteralRef, submitRef },
         system: { bellOnComplete, bellOnPrompt, stdout, sys },
-        transcript: { appendMessage, panel, setHistoryItems },
-        voice: {
-          setProcessing: setVoiceProcessing,
-          setRecording: setVoiceRecording,
-          setVoiceEnabled,
-          setVoiceTts
-        }
+        transcript: { appendMessage, panel, setHistoryItems }
       }),
     [
       appendMessage,
@@ -947,9 +947,6 @@ export function useMainApp(gw: GatewayClient) {
       session.resetSession,
       session.resumeById,
       setHistoryItems,
-      setVoiceEnabled,
-      setVoiceProcessing,
-      setVoiceRecording,
       stdout,
       submitLiteralRef,
       submitRef,
@@ -1096,8 +1093,7 @@ export function useMainApp(gw: GatewayClient) {
           setSessionStartedAt
         },
         slashFlightRef,
-        transcript: { page, panel, send, setHistoryItems, sys, trimLastExchange: session.trimLastExchange },
-        voice: { setVoiceEnabled, setVoiceRecordKey, setVoiceTts }
+        transcript: { page, panel, send, setHistoryItems, sys, trimLastExchange: session.trimLastExchange }
       }),
     [
       catalog,
@@ -1180,26 +1176,6 @@ export function useMainApp(gw: GatewayClient) {
       })
     },
     [overlay.secret, respondWith]
-  )
-
-  const answerVaultUnlock = useCallback(
-    (password: string) => {
-      if (!overlay.vaultUnlock) {
-        return
-      }
-
-      const requestId = overlay.vaultUnlock.requestId
-
-      if (!password) {
-        patchOverlayState({ vaultUnlock: null })
-      }
-
-      respondWith(requestId, { value: password }, () => {
-        patchOverlayState({ vaultUnlock: null })
-        patchUiState({ status: 'running…' })
-      })
-    },
-    [overlay.vaultUnlock, respondWith]
   )
 
   const onModelSelect = useCallback((value: string) => {
@@ -1312,7 +1288,6 @@ export function useMainApp(gw: GatewayClient) {
       answerClarifyQuestion,
       answerSecret,
       answerSudo,
-      answerVaultUnlock,
       clearSelection,
       newLiveSession: () => session.newLiveSession(),
       newPromptSession,
@@ -1336,7 +1311,6 @@ export function useMainApp(gw: GatewayClient) {
       answerClarifyQuestion,
       answerSecret,
       answerSudo,
-      answerVaultUnlock,
       clearSelection,
       closeLiveSession,
       newPromptSession,
@@ -1381,10 +1355,9 @@ export function useMainApp(gw: GatewayClient) {
       queueEditIdx: composerState.queueEditIdx,
       queuedDisplay: composerState.queuedDisplay,
       submit,
-      updateInput,
-      voiceRecordKey
+      updateInput
     }),
-    [cols, composerActions, composerState, empty, pagerPageSize, submit, updateInput, voiceRecordKey]
+    [cols, composerActions, composerState, empty, pagerPageSize, submit, updateInput]
   )
 
   // Pass current progress through unfrozen — streaming update throttling
@@ -1392,7 +1365,7 @@ export function useMainApp(gw: GatewayClient) {
   // randomly disappear when the live tail scrolls offscreen.
   const appProgress = useMemo(() => ({ showProgressArea }), [showProgressArea])
 
-  const cwd = ui.info?.cwd || process.env.HERMES_CWD || process.cwd()
+  const cwd = ui.info?.cwd || process.env.K3CODE_CWD || process.cwd()
   const gitBranch = useGitBranch(cwd)
 
   const appStatus = useMemo(
@@ -1408,29 +1381,9 @@ export function useMainApp(gw: GatewayClient) {
       showStickyPrompt: !!stickyPrompt,
       statusColor: statusColorOf(ui.status, ui.theme.color),
       stickyPrompt,
-      turnStartedAt: ui.sid ? turnStartedAt : null,
-      // CLI parity: the classic prompt_toolkit status bar shows a red dot
-      // on REC (cli.py:_get_voice_status_fragments line 2344).
-      voiceLabel: voiceRecording
-        ? '● REC'
-        : voiceProcessing
-          ? '◉ STT'
-          : `voice ${voiceEnabled ? 'on' : 'off'}${voiceTts ? ' [tts]' : ''}`
+      turnStartedAt: ui.sid ? turnStartedAt : null
     }),
-    [
-      cwd,
-      gitBranch,
-      goodVibesTick,
-      lastTurnEndedAt,
-      sessionStartedAt,
-      stickyPrompt,
-      turnStartedAt,
-      ui,
-      voiceEnabled,
-      voiceProcessing,
-      voiceRecording,
-      voiceTts
-    ]
+    [cwd, gitBranch, goodVibesTick, lastTurnEndedAt, sessionStartedAt, stickyPrompt, turnStartedAt, ui]
   )
 
   const appTranscript = useMemo(

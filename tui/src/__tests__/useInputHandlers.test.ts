@@ -3,7 +3,6 @@ import { describe, expect, it, vi } from 'vitest'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { rememberServerRequest, resetServerRequestsForTests } from '../app/serverRequestStore.js'
 import {
-  applyVoiceRecordResponse,
   composerHasDraft,
   dismissSensitivePrompt,
   handleIdleHotkeyExit,
@@ -118,40 +117,6 @@ describe('handleIdleHotkeyExit', () => {
     expect(actions.die).not.toHaveBeenCalled()
     expect(requestDashboardNewSession).toHaveBeenCalledTimes(1)
     expect(actions.sys).toHaveBeenCalled()
-  })
-})
-
-describe('applyVoiceRecordResponse', () => {
-  it('reverts optimistic REC state when the gateway reports voice busy', () => {
-    const setProcessing = vi.fn()
-    const setRecording = vi.fn()
-    const sys = vi.fn()
-
-    applyVoiceRecordResponse({ status: 'busy' }, true, { setProcessing, setRecording }, sys)
-
-    expect(setRecording).toHaveBeenCalledWith(false)
-    expect(setProcessing).toHaveBeenCalledWith(true)
-    expect(sys).toHaveBeenCalled()
-  })
-
-  it('keeps optimistic REC state for successful recording starts', () => {
-    const setProcessing = vi.fn()
-    const setRecording = vi.fn()
-
-    applyVoiceRecordResponse({ status: 'recording' }, true, { setProcessing, setRecording }, vi.fn())
-
-    expect(setRecording).not.toHaveBeenCalled()
-    expect(setProcessing).not.toHaveBeenCalled()
-  })
-
-  it('reverts optimistic REC state when the gateway returns null', () => {
-    const setProcessing = vi.fn()
-    const setRecording = vi.fn()
-
-    applyVoiceRecordResponse(null, true, { setProcessing, setRecording }, vi.fn())
-
-    expect(setRecording).toHaveBeenCalledWith(false)
-    expect(setProcessing).toHaveBeenCalledWith(false)
   })
 })
 

@@ -3,18 +3,16 @@ import { debugCommands } from './commands/debug.js'
 import { opsCommands } from './commands/ops.js'
 import { sessionCommands } from './commands/session.js'
 import { setupCommands } from './commands/setup.js'
-import { subscriptionCommands } from './commands/subscription.js'
-import { topupCommands } from './commands/topup.js'
-import { wakeCommands } from './commands/wake.js'
 import type { SlashCommand } from './types.js'
 
+// k3code M1 cut: subscription/topup (billing) and wake (wake-word) slash
+// commands are removed — those surfaces and their gateway methods
+// (subscription.*, billing.*, wake.*) are out of scope for k3code. See
+// docs/tui-contract.md.
 export const SLASH_COMMANDS: SlashCommand[] = [
   ...coreCommands,
-  ...topupCommands,
   ...sessionCommands,
-  ...subscriptionCommands,
   ...opsCommands,
-  ...wakeCommands,
   ...setupCommands,
   ...debugCommands
 ]

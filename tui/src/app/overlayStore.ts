@@ -7,22 +7,17 @@ const buildOverlayState = (): OverlayState => ({
   agents: false,
   agentsInitialHistoryIndex: 0,
   approval: null,
-  billing: null,
   clarify: null,
   confirm: null,
-  connection: null,
   ambient: [],
   widget: null,
   journey: false,
   modelPicker: false,
   pager: null,
-  petPicker: false,
   pluginsHub: false,
   secret: null,
-  vaultUnlock: null,
   sessions: false,
   skillsHub: false,
-  subscription: null,
   sudo: null
 })
 
@@ -30,44 +25,20 @@ export const $overlayState = atom<OverlayState>(buildOverlayState())
 
 export const $isBlocked = computed(
   $overlayState,
-  ({
-    agents,
-    approval,
-    billing,
-    clarify,
-    confirm,
-    connection,
-    journey,
-    modelPicker,
-    pager,
-    petPicker,
-    pluginsHub,
-    secret,
-    sessions,
-    skillsHub,
-    subscription,
-    sudo,
-    vaultUnlock,
-    widget
-  }) =>
+  ({ agents, approval, clarify, confirm, journey, modelPicker, pager, pluginsHub, secret, sessions, skillsHub, sudo, widget }) =>
     Boolean(
       agents ||
       approval ||
-      billing ||
       clarify ||
       confirm ||
-      connection ||
       journey ||
       modelPicker ||
       pager ||
-      petPicker ||
       pluginsHub ||
       secret ||
       sessions ||
       skillsHub ||
-      subscription ||
       sudo ||
-      vaultUnlock ||
       widget
     )
 )
@@ -87,7 +58,7 @@ export const $isBlocked = computed(
  *   (`ActiveWidgetSlot`, `sdk/host.tsx:209`, outside the ComposerPane
  *   subtree) so it can anchor the full-screen absolute `Overlay`
  *   (`components/overlay.tsx`) against the whole terminal.
- * - The FloatingOverlays set — `modelPicker`, `pager`, `petPicker`,
+ * - The FloatingOverlays set — `modelPicker`, `pager`,
  *   `sessions`, `skillsHub`, `pluginsHub` — but ONLY when the rule sits at
  *   the top.  That panel is `position="absolute" bottom="100%"` inside
  *   ComposerPane's relative Box (`appOverlays.tsx:387`), so it grows UPWARD
@@ -95,7 +66,7 @@ export const $isBlocked = computed(
  *
  * NOT occluding (deliberately excluded):
  *
- * - The PromptZone flow states — `approval`, `billing`, `subscription`,
+ * - The PromptZone flow states — `approval`,
  *   `confirm`, `clarify`, `sudo`, `secret` (`appOverlays.tsx:58-162`).  They
  *   render in NORMAL FLOW above ComposerPane (`appLayout.tsx:553-568`): they
  *   push content down, they do not cover it.  The rule stays on screen and
@@ -124,14 +95,7 @@ export const $isBlocked = computed(
  * panels HERE so the timer gate can't silently miss them.
  */
 export const hasFloatingPanel = (overlay: OverlayState): boolean =>
-  Boolean(
-    overlay.modelPicker ||
-    overlay.pager ||
-    overlay.petPicker ||
-    overlay.pluginsHub ||
-    overlay.sessions ||
-    overlay.skillsHub
-  )
+  Boolean(overlay.modelPicker || overlay.pager || overlay.pluginsHub || overlay.sessions || overlay.skillsHub)
 
 export const $isStatusRuleOccluded = computed([$overlayState, $uiState], (overlay, ui) =>
   Boolean(overlay.widget || (ui.statusBar === 'top' && hasFloatingPanel(overlay)))
@@ -152,9 +116,6 @@ export const resetOverlayState = () => $overlayState.set(buildOverlayState())
  * shouldn't vanish when a turn ends.  Called from turnController.idle() on
  * every turn completion / interrupt; the old "reset everything" behaviour
  * silently closed /agents the moment delegation finished.
- *
- * `connection` is preserved too: the card belongs to a backend operation that outlives the turn's
- * idle edge, and only the operation's own settlement may close it.
  */
 export const resetFlowOverlays = () =>
   $overlayState.set({
@@ -162,11 +123,9 @@ export const resetFlowOverlays = () =>
     agents: $overlayState.get().agents,
     agentsInitialHistoryIndex: $overlayState.get().agentsInitialHistoryIndex,
     ambient: $overlayState.get().ambient,
-    connection: $overlayState.get().connection,
     widget: $overlayState.get().widget,
     journey: $overlayState.get().journey,
     modelPicker: $overlayState.get().modelPicker,
-    petPicker: $overlayState.get().petPicker,
     pluginsHub: $overlayState.get().pluginsHub,
     sessions: $overlayState.get().sessions,
     skillsHub: $overlayState.get().skillsHub

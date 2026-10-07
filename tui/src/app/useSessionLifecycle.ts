@@ -20,7 +20,6 @@ import type {
 import { asRpcResult } from '../lib/rpc.js'
 import type { Msg, PanelSection, SessionInfo } from '../types.js'
 
-import { applyConnectionRequest, clearConnectionOperation } from './connectionOperationStore.js'
 import type { ComposerActions, GatewayRpc, StateSetter } from './interfaces.js'
 import { patchOverlayState } from './overlayStore.js'
 import { scheduleResumeScrollToBottom } from './sessionResumeView.js'
@@ -45,7 +44,7 @@ const statusFromLiveSession = (status?: string, running = false) => {
   return running || status === 'working' ? 'running…' : 'ready'
 }
 
-export const writeActiveSessionFile = (sessionId: null | string, file = process.env.HERMES_TUI_ACTIVE_SESSION_FILE) => {
+export const writeActiveSessionFile = (sessionId: null | string, file = process.env.K3CODE_TUI_ACTIVE_SESSION_FILE) => {
   if (!file || !sessionId) {
     return
   }
@@ -122,8 +121,6 @@ export interface UseSessionLifecycleOptions {
   setLastUserMsg: StateSetter<string>
   setSessionStartedAt: StateSetter<number>
   setStickyPrompt: StateSetter<string>
-  setVoiceProcessing: StateSetter<boolean>
-  setVoiceRecording: StateSetter<boolean>
   sys: (text: string) => void
 }
 
@@ -140,8 +137,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     setLastUserMsg,
     setSessionStartedAt,
     setStickyPrompt,
-    setVoiceProcessing,
-    setVoiceRecording,
     sys
   } = opts
 
@@ -157,8 +152,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     cancelResumeScrollRef.current?.()
     cancelResumeScrollRef.current = null
     turnController.fullReset()
-    setVoiceRecording(false)
-    setVoiceProcessing(false)
     patchUiState({ bgTasks: new Set(), info: null, sid: null, storedSid: null, usage: ZERO })
     setHistoryItems([])
     setLastUserMsg('')
@@ -167,7 +160,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     // Half-prune: new session has new keys, but keep a warm pool in case
     // the user resumes back to the prior session.
     evictInkCaches('half')
-  }, [composerActions, setHistoryItems, setLastUserMsg, setStickyPrompt, setVoiceProcessing, setVoiceRecording])
+  }, [composerActions, setHistoryItems, setLastUserMsg, setStickyPrompt])
 
   useEffect(
     () => () => {
@@ -306,8 +299,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     (id: string) => {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'switching session…' })
-      // The card belongs to the session being left; the activated one answers with its own.
-      clearConnectionOperation()
 
       gw.request<SessionActivateResponse>('session.activate', { session_id: id })
         .then(raw => {
@@ -339,10 +330,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             usage: usageFrom(info)
           })
           hydrateLiveSessionInflight(r.inflight)
-
-          if (r.pending_connection) {
-            applyConnectionRequest(r.pending_connection)
-          }
 
           cancelResumeScrollRef.current?.()
           cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
@@ -402,12 +389,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               usage: usageFrom(info)
             })
             hydrateLiveSessionInflight(r.inflight)
-
-            if (r.pending_connection) {
-              applyConnectionRequest(r.pending_connection)
-            } else {
-              clearConnectionOperation()
-            }
 
             cancelResumeScrollRef.current?.()
             cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)

@@ -1,11 +1,5 @@
-import type { ConnectionOperationTarget } from '@k3code/shared/gateway-events'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import {
-  $connectionOperation,
-  dismissConnectionOperation,
-  resetConnectionOperationsForTests
-} from '../app/connectionOperationStore.js'
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
 import { createServerRequestHandler } from '../app/createServerRequestHandler.js'
 import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/overlayStore.js'
@@ -16,13 +10,6 @@ import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import { ZERO } from '../domain/usage.js'
 import { estimateTokensRough } from '../lib/text.js'
 import type { Msg } from '../types.js'
-
-// Mock the external-URL opener so the billing.step_up.verification test can
-// assert it's invoked without spawning a real browser process.
-const openExternalUrlMock = vi.fn((_url: string) => true)
-vi.mock('../lib/openExternalUrl.js', () => ({
-  openExternalUrl: (url: string) => openExternalUrlMock(url)
-}))
 
 const ref = <T>(current: T) => ({ current })
 
@@ -58,11 +45,6 @@ const buildCtx = (appended: Msg[]) =>
       panel: (title: string, sections: any[]) =>
         appended.push({ kind: 'panel', panelData: { sections, title }, role: 'system', text: '' }),
       setHistoryItems: vi.fn()
-    },
-    voice: {
-      setProcessing: vi.fn(),
-      setRecording: vi.fn(),
-      setVoiceEnabled: vi.fn()
     }
   }) as any
 
@@ -90,7 +72,6 @@ describe('createGatewayEventHandler', () => {
     resetUiState()
     resetTurnState()
     resetServerRequestsForTests()
-    resetConnectionOperationsForTests()
     turnController.fullReset()
     patchUiState({ showReasoning: true })
   })
@@ -115,63 +96,6 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('ready')
     expect(getOverlayState().approval).toBeNull()
     expect(getTurnState().tools).toEqual([])
-
-    const target: ConnectionOperationTarget = { action: 'install', kind: 'mcp', name: 'asana', state: 'pending' }
-    onEvent({
-      session_id: 'focused',
-      payload: {
-        deadline_at: 10,
-        op_id: 'op-1',
-        seq: 2,
-        targets: [target],
-        timeout_seconds: 30
-      },
-      type: 'connection.request'
-    })
-    expect($connectionOperation.get()).toMatchObject({ opId: 'op-1', seq: 2, targets: [target] })
-    expect(getOverlayState().connection).toEqual({ opId: 'op-1' })
-
-    onEvent({
-      session_id: 'focused',
-      payload: {
-        deadline_at: 11,
-        op_id: 'op-1',
-        seq: 1,
-        settled: false,
-        targets: [{ ...target, state: 'failed' }]
-      },
-      type: 'connection.update'
-    })
-    expect($connectionOperation.get()).toMatchObject({ seq: 2, targets: [target] })
-
-    // Esc on the "Finishing…" card drops it and it must not come back on a replay, but the settling
-    // frame that follows still records how each app ended.
-    const request = {
-      deadline_at: 10,
-      op_id: 'op-1',
-      seq: 2,
-      targets: [target],
-      timeout_seconds: 30
-    }
-
-    dismissConnectionOperation('op-1')
-    expect($connectionOperation.get()).toBeNull()
-    onEvent({ session_id: 'focused', payload: request, type: 'connection.request' })
-    expect($connectionOperation.get()).toBeNull()
-    expect(getOverlayState().connection).toBeNull()
-
-    onEvent({
-      session_id: 'focused',
-      payload: {
-        deadline_at: 12,
-        op_id: 'op-1',
-        seq: 3,
-        settled: true,
-        targets: [{ ...target, state: 'connected' }]
-      },
-      type: 'connection.update'
-    })
-    expect(ctx.system.sys.mock.calls.map((call: unknown[]) => call[0])).toEqual(['asana: connected'])
   })
 
   it('keeps the durable session id when a session.info payload omits it', () => {
@@ -223,59 +147,6 @@ describe('createGatewayEventHandler', () => {
     // doesn't visibly jump across the final answer at end-of-turn.
     expect(appended.indexOf(trail!)).toBeLessThan(appended.indexOf(finalText!))
     expect(getTurnState().todos).toEqual([])
-  })
-
-  it('opens a billing confirm dialog routing Nous to /topup', () => {
-    const appended: Msg[] = []
-    const ctx = buildCtx(appended)
-    const onEvent = createGatewayEventHandler(ctx)
-
-    onEvent({
-      payload: {
-        billing: {
-          billing_url: null,
-          is_nous: true,
-          message: 'out of credits',
-          model: 'm',
-          provider: 'nous',
-          provider_label: 'Nous Portal'
-        },
-        text: 'Billing or credits exhausted: ...'
-      },
-      type: 'message.complete'
-    } as any)
-
-    const { confirm } = getOverlayState()
-
-    confirm!.onConfirm()
-    expect(ctx.submission.submitRef.current).toHaveBeenCalledWith('/topup')
-  })
-
-  it('deep-links a third-party provider billing page from the confirm dialog', () => {
-    const appended: Msg[] = []
-    const ctx = buildCtx(appended)
-    const onEvent = createGatewayEventHandler(ctx)
-    openExternalUrlMock.mockClear()
-
-    onEvent({
-      payload: {
-        billing: {
-          billing_url: 'https://openrouter.ai/settings/credits',
-          is_nous: false,
-          message: 'out of credits',
-          model: 'm',
-          provider: 'openrouter',
-          provider_label: 'OpenRouter'
-        },
-        text: 'Billing or credits exhausted: ...'
-      },
-      type: 'message.complete'
-    } as any)
-
-    const { confirm } = getOverlayState()
-
-    confirm!.onConfirm()
-    expect(openExternalUrlMock).toHaveBeenCalledWith('https://openrouter.ai/settings/credits')
   })
 
   it('archives completed todos into transcript flow at end of turn', () => {
@@ -663,7 +534,7 @@ describe('createGatewayEventHandler', () => {
         cwd: '/repo',
         python: '/opt/venv/bin/python',
         stderr_tail:
-          '[startup] timed out\nModuleNotFoundError: No module named openai\nFileNotFoundError: ~/.hermes/config.yaml'
+          '[startup] timed out\nModuleNotFoundError: No module named openai\nFileNotFoundError: ~/.k3code/config.yaml'
       },
       type: 'gateway.start_timeout'
     } as any)
@@ -924,7 +795,7 @@ describe('createGatewayEventHandler', () => {
     onEvent({
       payload: {
         message:
-          'agent init failed: No LLM provider configured. Run `hermes model` to select a provider, or run `hermes setup` for first-time configuration.'
+          'agent init failed: No LLM provider configured. Run `k3code model` to select a provider, or run `k3code setup` for first-time configuration.'
       },
       type: 'error'
     } as any)
@@ -953,12 +824,12 @@ describe('createGatewayEventHandler', () => {
     }
 
     // Dark terminal (clean env): the dark-authored `colors` block wins.
-    vi.stubEnv('HERMES_TUI_BACKGROUND', '')
+    vi.stubEnv('K3CODE_TUI_BACKGROUND', '')
     createGatewayEventHandler(buildCtx(appended))({ payload: skin, type: 'skin.changed' } as any)
     expect(getUiState().theme.color.primary).toBe('#00FF88')
 
     // Light terminal: the hand-tuned light_colors block wins over adaptation.
-    vi.stubEnv('HERMES_TUI_BACKGROUND', '#ffffff')
+    vi.stubEnv('K3CODE_TUI_BACKGROUND', '#ffffff')
     createGatewayEventHandler(buildCtx(appended))({ payload: skin, type: 'skin.changed' } as any)
     expect(getUiState().theme.color.primary).toBe('#8B0000')
     vi.unstubAllEnvs()
@@ -1014,130 +885,6 @@ describe('createGatewayEventHandler', () => {
     expect(polarityBackgroundFromForeground('#ffffff')).toBeUndefined()
     expect(polarityBackgroundFromForeground('#808080')).toBeUndefined()
     expect(polarityBackgroundFromForeground('not-a-color')).toBeUndefined()
-  })
-
-  it('claims wake-word ownership when the gateway becomes ready', () => {
-    const ctx = buildCtx([])
-
-    createGatewayEventHandler(ctx)({ payload: {}, type: 'gateway.ready' } as any)
-
-    expect(ctx.gateway.rpc).toHaveBeenCalledWith('wake.start', { surface: 'tui' })
-  })
-
-  it('ends voice mode on a stop-phrase transcript without submitting a turn', () => {
-    const ctx = buildCtx([])
-    const onEvent = createGatewayEventHandler(ctx)
-
-    onEvent({ payload: { stop_phrase: true, text: 'stop' }, type: 'voice.transcript' } as any)
-
-    expect(ctx.voice.setVoiceEnabled).toHaveBeenCalledWith(false)
-    expect(ctx.voice.setRecording).toHaveBeenCalledWith(false)
-    expect(ctx.voice.setProcessing).toHaveBeenCalledWith(false)
-    // The stop phrase is user intent to END the chat — never a turn.
-    expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
-  })
-
-  it('ends voice mode on a typed stop phrase consumed server-side', () => {
-    const ctx = buildCtx([])
-    const onEvent = createGatewayEventHandler(ctx)
-
-    onEvent({ payload: { stop_phrase: true, typed: true }, type: 'voice.transcript' } as any)
-
-    expect(ctx.voice.setVoiceEnabled).toHaveBeenCalledWith(false)
-    expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
-  })
-
-  it('still submits ordinary voice transcripts as turns', async () => {
-    const ctx = buildCtx([])
-    const onEvent = createGatewayEventHandler(ctx)
-
-    onEvent({ payload: { text: 'stop the docker container' }, type: 'voice.transcript' } as any)
-
-    await vi.waitFor(() => expect(ctx.submission.submitRef.current).toHaveBeenCalledWith('stop the docker container'))
-    expect(ctx.voice.setVoiceEnabled).not.toHaveBeenCalled()
-  })
-
-  it('leaves voice transcripts editable when voice.submit_mode is draft', async () => {
-    const ctx = buildCtx([])
-    let composerInput = 'existing draft'
-
-    ctx.gateway.rpc = vi.fn(async (method: string) =>
-      method === 'config.get' ? { config: { voice: { submit_mode: 'draft' } } } : null
-    )
-    ctx.composer.setInput = vi.fn((next: string | ((current: string) => string)) => {
-      composerInput = typeof next === 'function' ? next(composerInput) : next
-    })
-    const onEvent = createGatewayEventHandler(ctx)
-
-    onEvent({ payload: { text: '  edit this first  ' }, type: 'voice.transcript' } as any)
-
-    await vi.waitFor(() => expect(composerInput).toBe('existing draft edit this first'))
-    expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
-  })
-
-  it('falls back to direct submit for an invalid voice.submit_mode', async () => {
-    const ctx = buildCtx([])
-
-    ctx.gateway.rpc = vi.fn(async (method: string) =>
-      method === 'config.get' ? { config: { voice: { submit_mode: 'refine' } } } : null
-    )
-    const onEvent = createGatewayEventHandler(ctx)
-
-    onEvent({ payload: { text: 'send safely' }, type: 'voice.transcript' } as any)
-
-    await vi.waitFor(() => expect(ctx.submission.submitRef.current).toHaveBeenCalledWith('send safely'))
-    expect(ctx.composer.setInput).toHaveBeenCalledWith('')
-  })
-
-  it('opens a fresh session before starting voice after wake detection', async () => {
-    const ctx = buildCtx([])
-    ctx.session.newSession = vi.fn(async () => patchUiState({ sid: 'wake-session' }))
-    patchUiState({ sid: 'old-session' })
-
-    createGatewayEventHandler(ctx)({
-      payload: { phrase: 'hey hermes', start_new_session: true },
-      type: 'wake.detected'
-    } as any)
-
-    await vi.waitFor(() =>
-      expect(ctx.gateway.rpc).toHaveBeenCalledWith('voice.record', {
-        action: 'start',
-        session_id: 'wake-session'
-      })
-    )
-    expect(ctx.session.newSession).toHaveBeenCalledOnce()
-    expect(ctx.voice.setVoiceEnabled).toHaveBeenCalledWith(true)
-  })
-
-  it('keeps the current session when wake detection disables session creation', async () => {
-    const ctx = buildCtx([])
-    patchUiState({ sid: 'current-session' })
-
-    createGatewayEventHandler(ctx)({
-      payload: { phrase: 'hey hermes', start_new_session: false },
-      type: 'wake.detected'
-    } as any)
-
-    await vi.waitFor(() =>
-      expect(ctx.gateway.rpc).toHaveBeenCalledWith('voice.record', {
-        action: 'start',
-        session_id: 'current-session'
-      })
-    )
-    expect(ctx.session.newSession).not.toHaveBeenCalled()
-  })
-
-  it('rearms wake detection when no session is available', async () => {
-    const ctx = buildCtx([])
-    patchUiState({ sid: '' })
-
-    createGatewayEventHandler(ctx)({
-      payload: { start_new_session: false },
-      type: 'wake.detected'
-    } as any)
-
-    await vi.waitFor(() => expect(ctx.gateway.rpc).toHaveBeenCalledWith('wake.resume', {}))
-    expect(ctx.gateway.rpc).not.toHaveBeenCalledWith('voice.record', expect.anything())
   })
 
   it('on gateway.ready with no STARTUP_RESUME_ID and auto_resume off, forges a new session', async () => {
@@ -1375,7 +1122,7 @@ describe('createGatewayEventHandler', () => {
   })
 
   it('declines the requests a terminal cannot answer so the channel fails them fast', () => {
-    for (const method of ['preview.act', 'window.read', 'tour', 'mcp.setup', 'vault.code']) {
+    for (const method of ['preview.act', 'window.read', 'tour', 'mcp.setup', 'unknown.method']) {
       expect(serverRequest(method, {}).handled).toBe(false)
     }
   })
@@ -2256,36 +2003,6 @@ describe('createGatewayEventHandler', () => {
 
       onEvent({ payload: { key: 'credits.90', level: 'warn' }, type: 'notification.show' } as any)
       expect(getUiState().notice).toBeNull()
-    })
-  })
-
-  describe('billing.step_up.verification', () => {
-    beforeEach(() => {
-      openExternalUrlMock.mockClear()
-    })
-
-    it('renders the verification link + code and opens the browser', () => {
-      const ctx = buildCtx([])
-      const onEvent = createGatewayEventHandler(ctx)
-
-      onEvent({
-        payload: { user_code: 'WXYZ-9999', verification_url: 'https://portal.example/device?code=WXYZ' },
-        type: 'billing.step_up.verification'
-      } as any)
-
-      const printed = (ctx.system.sys as ReturnType<typeof vi.fn>).mock.calls.map(c => c[0]).join('\n')
-      expect(printed).toContain('https://portal.example/device?code=WXYZ')
-      expect(printed).toContain('WXYZ-9999')
-      expect(openExternalUrlMock).toHaveBeenCalledWith('https://portal.example/device?code=WXYZ')
-    })
-
-    it('no-ops on a missing verification_url (never opens a browser)', () => {
-      const ctx = buildCtx([])
-      const onEvent = createGatewayEventHandler(ctx)
-
-      onEvent({ payload: { verification_url: '' }, type: 'billing.step_up.verification' } as any)
-
-      expect(openExternalUrlMock).not.toHaveBeenCalled()
     })
   })
 

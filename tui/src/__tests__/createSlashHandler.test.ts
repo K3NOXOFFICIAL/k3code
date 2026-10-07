@@ -11,7 +11,7 @@ import * as ClipboardModule from '../lib/clipboard.js'
 import * as Osc52Module from '../lib/osc52.js'
 import * as TerminalSetupModule from '../lib/terminalSetup.js'
 
-// DASHBOARD_TUI_MODE resolves once at module load from HERMES_TUI_DASHBOARD,
+// DASHBOARD_TUI_MODE resolves once at module load from K3CODE_TUI_DASHBOARD,
 // so toggling process.env in a test body can't move it. Mock just that one
 // export (everything else stays real) and flip the holder per test.
 const envState = { dashboardTuiMode: false }
@@ -383,26 +383,6 @@ describe('createSlashHandler', () => {
     })
   })
 
-  it('opens the pet picker for /pet list only', () => {
-    const ctx = buildCtx()
-
-    expect(createSlashHandler(ctx)('/pet list')).toBe(true)
-    expect(getOverlayState().petPicker).toBe(true)
-    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
-
-    resetOverlayState()
-    expect(createSlashHandler(ctx)('/pet')).toBe(true)
-    expect(getOverlayState().petPicker).toBe(false)
-    expect(ctx.gateway.gw.request).toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: 'pet' }))
-
-    resetOverlayState()
-    expect(createSlashHandler(ctx)('/pet toggle')).toBe(true)
-    expect(getOverlayState().petPicker).toBe(false)
-    expect(ctx.gateway.gw.request).toHaveBeenCalledWith(
-      'slash.exec',
-      expect.objectContaining({ command: 'pet toggle' })
-    )
-  })
 
   it('routes /skills browse [page] to skills.manage with a numeric page', () => {
     const ctx = buildCtx()
@@ -507,51 +487,6 @@ describe('createSlashHandler', () => {
       )
     })
     expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
-  })
-
-  // Regressions from Copilot review on #19835: /voice output + frontend
-  // binding state must both track the gateway's fresh ``record_key`` on
-  // every response, or a config edit shows the new shortcut in text
-  // while push-to-talk still fires the old one until the next mtime
-  // poll (~5s).
-  it('/voice status renders the gateway record_key and pushes it into frontend state', async () => {
-    const rpc = vi.fn(() => Promise.resolve({ enabled: true, record_key: 'ctrl+space', tts: false }))
-    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
-
-    expect(createSlashHandler(ctx)('/voice status')).toBe(true)
-    await vi.waitFor(() => {
-      expect(ctx.transcript.sys).toHaveBeenCalledWith('  Record key: Ctrl+Space')
-    })
-    expect(ctx.voice.setVoiceRecordKey).toHaveBeenCalledWith(
-      expect.objectContaining({ ch: 'space', mod: 'ctrl', named: 'space' })
-    )
-  })
-
-  it('/voice on renders the configured binding for the start/stop hint', async () => {
-    const rpc = vi.fn(() => Promise.resolve({ enabled: true, record_key: 'alt+r', tts: false }))
-    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
-
-    expect(createSlashHandler(ctx)('/voice on')).toBe(true)
-    await vi.waitFor(() => {
-      expect(ctx.transcript.sys).toHaveBeenCalledWith('  Alt+R to start/stop recording')
-    })
-    expect(ctx.voice.setVoiceRecordKey).toHaveBeenCalledWith(expect.objectContaining({ ch: 'r', mod: 'alt' }))
-  })
-
-  // Round-2 Copilot review on #19835: a response missing ``record_key``
-  // (e.g. the old tts branch, or any future branch that forgets to
-  // include it) MUST NOT clobber the user's cached binding back to
-  // Ctrl+B. The label still renders the default for display; the
-  // frontend state keeps whatever was last authoritatively set.
-  it('/voice tts without record_key does not clobber cached frontend binding', async () => {
-    const rpc = vi.fn(() => Promise.resolve({ enabled: true, tts: true }))
-    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
-
-    expect(createSlashHandler(ctx)('/voice tts')).toBe(true)
-    await vi.waitFor(() => {
-      expect(ctx.transcript.sys).toHaveBeenCalled()
-    })
-    expect(ctx.voice.setVoiceRecordKey).not.toHaveBeenCalled()
   })
 
   it('cycles details mode and persists it', async () => {
@@ -1098,8 +1033,7 @@ const buildCtx = (overrides: Partial<Ctx> = {}): Ctx => ({
   gateway: { ...buildGateway(), ...overrides.gateway },
   local: { ...buildLocal(), ...overrides.local },
   session: { ...buildSession(), ...overrides.session },
-  transcript: { ...buildTranscript(), ...overrides.transcript },
-  voice: { ...buildVoice(), ...overrides.voice }
+  transcript: { ...buildTranscript(), ...overrides.transcript }
 })
 
 const buildComposer = () => ({
@@ -1150,12 +1084,6 @@ const buildTranscript = () => ({
   trimLastExchange: vi.fn(items => items)
 })
 
-const buildVoice = () => ({
-  setVoiceEnabled: vi.fn(),
-  setVoiceRecordKey: vi.fn(),
-  setVoiceTts: vi.fn()
-})
-
 interface Ctx {
   slashFlightRef: { current: number }
   composer: ReturnType<typeof buildComposer>
@@ -1163,5 +1091,4 @@ interface Ctx {
   local: ReturnType<typeof buildLocal>
   session: ReturnType<typeof buildSession>
   transcript: ReturnType<typeof buildTranscript>
-  voice: ReturnType<typeof buildVoice>
 }

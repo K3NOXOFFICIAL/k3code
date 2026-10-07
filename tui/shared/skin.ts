@@ -1,7 +1,7 @@
 /**
  * Canonical Hermes skin — the theme SDK's cross-surface contract.
  *
- * A skin is authored once as YAML in `$HERMES_HOME/skins/<name>.yaml` (or a
+ * A skin is authored once as YAML in `$K3CODE_HOME/skins/<name>.yaml` (or a
  * built-in), resolved by the Python skin engine (`hermes_cli/skin_engine.py`),
  * and pushed to every surface over JSON-RPC (`gateway.ready`, `skin.changed`,
  * `config.get skin`). This is the ONE shape every TypeScript surface consumes;
@@ -108,7 +108,7 @@ export interface HermesSkin {
   tool_prefix?: string
   help_header?: string
   /** Raw CSS injected as a scoped <style> tag on theme apply.
-   *  Persists across updates because it lives in ~/.hermes/skins/,
+   *  Persists across updates because it lives in ~/.k3code/skins/,
    *  not inside app.asar.  Clipped to 32 KiB by the Python normaliser. */
   customCSS?: string
 }
