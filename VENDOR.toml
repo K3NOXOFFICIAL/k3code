@@ -109,3 +109,13 @@ local_path = "core/src/k3code/goals.py"
 sha256_upstream = "49f45045769db7ee9b9fd87a4c873a5011ac574318a7762572473504ea0d86d6"
 modified = true
 port = true  # design port: GoalState/judge/continuation/budget/gate re-implemented (async, trimmed), not a line copy
+
+# Design ports (no code copied verbatim): the behaviour was re-implemented, not vendored.
+[[file]]
+project = "hermes-agent"
+upstream_path = "tools/subagent_worktree.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/subagents/worktree.py"
+modified = true
+note = "design port: one git worktree + branch per child, finalize/diff, non-interactive git env; rewritten async"

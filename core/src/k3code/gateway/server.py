@@ -70,6 +70,8 @@ from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 from k3code.routing.caller import ModelCaller
 from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router_options, tier_for
 from k3code.session_ai import make_title
+from k3code.subagents import SubagentManager
+from k3code.subagents.tools import register_task_tools
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -261,6 +263,7 @@ class GatewayServer:
             last_attempt=lambda: self.last_attempt,
         )
         self.autonomy = PlanFirst(self)
+        self.subagents = SubagentManager(self)
 
     # ── session registry ──────────────────────────────────────────────
 
@@ -798,6 +801,7 @@ class GatewayServer:
         )
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
+        register_task_tools(loop.tools, self, session, depth=1)
         return loop
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
@@ -1213,6 +1217,7 @@ class GatewayServer:
         if session is None or session.turn_task is None or session.turn_task.done():
             return False
         session.loop.interrupt() if session.loop else None
+        self.subagents.interrupt_session(session.session_id)
         if session.reliability is not None:
             session.reliability.cancel()  # abort a paused/parked wait too
         session.turn_task.cancel()
@@ -1467,6 +1472,27 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     return {"turn_id": session.turn_task.get_name(), "status": "streaming"}
 
 
+async def _subagent_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    sid = params.get("session_id") or (server.session.session_id if server.session else "")
+    rows = [
+        {"subagent_id": h.id, "parent_id": h.parent_child_id, "depth": h.depth - 1, "goal": h.description,
+         "model": h.model or h.tier, "started_at": h.started_at, "status": h.status, "tool_count": h.tool_count,
+         "last_tool": h.last_tool}
+        for h in server.subagents.for_session(sid)
+    ]
+    return {"subagents": rows, "delegations": []}
+
+
+async def _subagent_interrupt(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    hid = str(_require(params, "subagent_id"))
+    return {"found": server.subagents.interrupt(hid), "subagent_id": hid}
+
+
+async def _subagent_tail(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    h = server.subagents.handles.get(str(_require(params, "subagent_id")))
+    return {"text": "\n".join(h.tail[-30:]) + (("\n" + h.result) if h and h.done else "") if h else ""}
+
+
 async def _clipboard_paste(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     # M1: no clipboard integration; the TUI pastes text inline instead.
     return {"text": "", "images": [], "files": []}
@@ -1611,6 +1637,9 @@ _HANDLERS: dict[str, Any] = {
     "session.mode.cycle": _session_mode_cycle,
     "session.mode.set": _session_mode_set,
     "prompt.submit": _prompt_submit,
+    "subagent.list": _subagent_list,
+    "subagent.interrupt": _subagent_interrupt,
+    "subagent.tail": _subagent_tail,
     "clipboard.paste": _clipboard_paste,
     "image.attach": _image_attach,
     "image.attach_bytes": _image_attach,

@@ -98,6 +98,9 @@ class Settings(BaseModel):
     task_tiers: dict[str, str] = Field(default_factory=dict)
     # M4a autonomy: plan_first, gate_modes, advisor_auto, proposals, escalate_after, ...
     autonomy: dict[str, Any] = Field(default_factory=dict)
+    # M4b: ultracode: {max_tokens, max_agents}; research: {searxng_url, max_subquestions, ...}
+    ultracode: dict[str, Any] = Field(default_factory=dict)
+    research: dict[str, Any] = Field(default_factory=dict)
 
 
 def _current_home() -> Path:
