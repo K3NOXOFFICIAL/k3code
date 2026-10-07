@@ -9,10 +9,15 @@ import pytest
 from k3code.autonomy import autonomy_cfg
 from k3code.autonomy.proposals import ProposalStore, dedup_key, parse_proposals
 from k3code.autonomy.scope import (
+    CLASSIFIER_SYSTEM,
+    SCOPES,
     ScopeLog,
     ScopeVerdict,
     apply_floor,
+    classify,
+    fallback_verdict,
     from_override,
+    parse_reply,
     parse_verdict,
     prompt_hash,
     repo_summary,
@@ -100,6 +105,83 @@ def test_parse_verdict_tolerates_fences_and_rejects_garbage():
 
 
 @pytest.mark.parametrize(
+    ("text", "scope", "needs_plan", "risk"),
+    [
+        ('```json\n{"scope":"Medium","risk":"LOW"}\n```', "medium", False, "low"),  # fence, case, missing fields
+        ('Sure! Here you go: {"scope":"large","needs_plan":"true",} hope that helps', "large", True, "low"),
+        ('thinking {not json} so: {"scope":"huge","risk":"med"}', "huge", False, "med"),  # junk object first
+        ('{"Scope": "BIG", "NEEDS_PLAN": true}', "large", True, "low"),  # key case + alias
+        ('{"scope":"small","risk":"extreme"}', "small", False, "med"),  # unknown risk -> med
+        ("The scope: small, one file.", "small", False, "low"),  # no JSON, prose label
+        ('{"scope":"small"', "small", False, "low"),  # truncated reply
+    ],
+)
+def test_parse_reply_recovers_messy_replies(text, scope, needs_plan, risk):
+    v, _why = parse_reply(text)
+    assert v is not None
+    assert (v.scope, v.needs_plan, v.risk) == (scope, needs_plan, risk)
+
+
+@pytest.mark.parametrize(
+    ("text", "why"),
+    [("", "empty"), ("hello there", "no JSON"), ('{"scope":"gigantic"}', "unknown scope"), ('{"risk":"low"}', "scope")],
+)
+def test_parse_reply_unusable_records_why(text, why):
+    v, reason = parse_reply(text)
+    assert v is None and why in reason
+    assert parse_verdict(text) is None
+
+
+def test_parse_reply_notes_repairs():
+    _v, why = parse_reply('{"scope":"Small"}')
+    assert "normalised" in why and "missing" in why
+
+
+def test_fallback_verdict_is_safe_and_explains():
+    v = fallback_verdict("empty reply")
+    assert v.scope == "small" and v.source == "fallback" and "empty reply" in v.reason and not v.wants_plan
+
+
+class _Caller:
+    def __init__(self, text=None, exc=None):
+        self.text, self.exc = text, exc
+
+    async def complete(self, *a, **k):
+        if self.exc:
+            raise self.exc
+        return type("R", (), {"text": self.text})()
+
+
+@pytest.mark.parametrize(
+    ("caller", "expect"),
+    [(_Caller("garbage"), "no JSON"), (_Caller(exc=TimeoutError()), "TimeoutError"), (_Caller(""), "empty")],
+)
+def test_classify_falls_back_with_reason(tmp_path, caller, expect):
+    import asyncio
+
+    v = asyncio.run(classify(caller, "tidy up", tmp_path))
+    assert v.source == "fallback" and v.scope == "small" and expect in v.reason
+
+
+def test_classify_uses_a_messy_reply(tmp_path):
+    import asyncio
+
+    v = asyncio.run(classify(_Caller('ok:\n```json\n{"scope":"LARGE"}\n```'), "add a plugin system", tmp_path))
+    assert v.source == "classifier" and v.scope == "large" and v.fanout_candidate
+
+
+def test_classifier_prompt_defines_every_level_and_examples_are_valid_json():
+    import json
+    import re
+
+    for level in SCOPES:
+        assert re.search(rf"^- {level}:", CLASSIFIER_SYSTEM, re.M), level
+    examples = re.findall(r"-> (\{.*\})$", CLASSIFIER_SYSTEM, re.M)
+    assert [json.loads(e)["scope"] for e in examples] == list(SCOPES)
+    assert all(parse_verdict(e) for e in examples)
+
+
+@pytest.mark.parametrize(
     "prompt",
     ["delete the old build dir", "run the db migration", "deploy to prod", "rotate the credentials",
      "git push --force origin main", "rm -rf /tmp/x"],
@@ -168,3 +250,16 @@ def test_parse_proposals_limits_and_validates():
     assert len(parse_proposals("Sure: " + raw)) == 3
     assert parse_proposals("nothing") == []
     assert parse_proposals("[]") == []
+
+
+def test_prompt_examples_are_not_taken_from_the_eval_sets():
+    import json
+    import re
+    from pathlib import Path
+
+    exit_dir = Path(__file__).resolve().parents[2] / "scripts" / "exit"
+    evals = [json.loads(x)["prompt"].lower() for f in ("scope_eval.jsonl", "scope_eval_blind.jsonl")
+             for x in (exit_dir / f).read_text().splitlines() if x.strip()]
+    assert len(evals) == 70
+    for ex in re.findall(r'^Task: "(.*?)" ->', CLASSIFIER_SYSTEM, re.M):
+        assert ex.lower() not in evals
