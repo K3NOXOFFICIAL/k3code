@@ -18,7 +18,9 @@ import click
 from k3code.agent.loop import AgentLoop
 from k3code.config import K3CODE_HOME, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
+from k3code.extratools import register_skill_tool
 from k3code.permissions import PermissionMode
+from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
 from k3code.reliability import (
     BudgetExceeded,
@@ -97,7 +99,7 @@ async def _run_headless(
     resume: bool = False,
 ) -> dict[str, Any] | None:
     """Run headless mode and return final result dict."""
-    system_prompt = _load_system_prompt()
+    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
@@ -119,6 +121,7 @@ async def _run_headless(
         reliability=reliability,
         session=session,
     )
+    register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
 
     final_text = ""
     tool_results: list[dict[str, Any]] = []
@@ -165,7 +168,7 @@ async def _run_repl(
     config: Any,
 ) -> None:
     """Run minimal REPL."""
-    system_prompt = _load_system_prompt()
+    system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
@@ -186,6 +189,7 @@ async def _run_repl(
         cwd=Path.cwd(),
         reliability=reliability,
     )
+    register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
 
     print("k3code REPL (type /exit to quit, /model <name> to switch, /stop to cancel a stuck turn)")
     print(f"Permission mode: {permission_mode.value}")

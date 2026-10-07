@@ -1,11 +1,9 @@
 # PROGRESS (M1-commands)
 
 ## Done
-- mcp dependency, Settings sections (mcp/skills/mem0/display/goal/output_style/permissions)
-- paths.py, confio.py (yaml io + backups + validation), memory/skills/outputstyle/prompting modules
-- tools registry deferred support, extratools (skill, mcp_tool_search, mcp__*), mcpclient manager
-- slash.exec accepts no-slash commands; results carry `output` for the TUI
+Everything in the task: /export /import /fork /branch /settings /config /output-style /memory /skills (+skill tool)
+/mcp (+deferred search) /review (codex rubric vendored) /goal (Hermes port), CLI export/import/memory/config-edit,
+TUI /settings pager, tests (285 passing), ruff clean, npm build+typecheck OK, REPORT.md written.
 
-## In progress / next (in order)
-/config, /settings, /output-style, /memory, /skills, /fork, /branch, /export+/import+CLI, /mcp, /review, /goal,
-TUI settings overlay, tests, VENDOR.toml/LICENSES, REPORT.md
+## Next (not started)
+See REPORT.md "Open TODOs" (MCP in CLI paths, TUI session-switch event, mem0 endpoint check).
