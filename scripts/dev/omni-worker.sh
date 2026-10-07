@@ -70,9 +70,21 @@ else
 fi
 echo "$(date -Is) gateway=$HEALTH_URL" >> "$RUNS/driver.log"
 
-wait_online() {  # pause while offline / gateway unreachable, resume automatically
-  local n=0
+# Last resort: native Claude Code (Claude account) when OmniRoute cannot serve the work —
+# better to keep working on Claude than to stop entirely.
+CLAUDE_FALLBACK_MODEL=${K3DEV_CLAUDE_FALLBACK:-claude-sonnet-5-5}
+GATEWAY_DOWN_GRACE=${K3DEV_GATEWAY_DOWN_GRACE:-600}   # seconds of OmniRoute outage before using Claude
+USE_CLAUDE=0
+
+wait_online() {  # pause while offline; if only OmniRoute is down for long, switch to Claude
+  local n=0 start
+  start=$(date +%s)
   until curl -s -o /dev/null -m 10 "$HEALTH_URL"; do
+    if curl -s -o /dev/null -m 10 https://api.anthropic.com/ \
+       && [ $(( $(date +%s) - start )) -ge "$GATEWAY_DOWN_GRACE" ]; then
+      echo "$(date -Is) OmniRoute down >${GATEWAY_DOWN_GRACE}s but internet up — Claude fallback" >> "$RUNS/driver.log"
+      USE_CLAUDE=1; return
+    fi
     [ $((n % 6)) -eq 0 ] && echo "$(date -Is) offline/gateway down — waiting" >> "$RUNS/driver.log"
     n=$((n + 1)); sleep 20
   done
@@ -85,19 +97,25 @@ resume_prompt() {
 }
 if [ "$RESUMING" = 1 ]; then PROMPT=$(resume_prompt); else PROMPT=$(base_prompt); fi
 
-SESSION=""; attempt=0; status=fail
+SESSION=""; attempt=0; status=fail; omni_errors=0
 while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
-  attempt=$((attempt + 1)); wait_online
-  MODEL=${MODEL_LIST[$midx]}
-  FALLBACK=${MODEL_LIST[$(( (midx + 1) % ${#MODEL_LIST[@]} ))]}
-  FB=(); [ "$FALLBACK" != "$MODEL" ] && FB=(--fallback-model "$FALLBACK")
+  attempt=$((attempt + 1))
+  [ "$USE_CLAUDE" = 1 ] || wait_online
+  if [ "$USE_CLAUDE" = 1 ]; then
+    MODEL=$CLAUDE_FALLBACK_MODEL; FB=(); SET=()   # default settings = native Claude account
+  else
+    MODEL=${MODEL_LIST[$midx]}
+    FALLBACK=${MODEL_LIST[$(( (midx + 1) % ${#MODEL_LIST[@]} ))]}
+    FB=(); [ "$FALLBACK" != "$MODEL" ] && FB=(--fallback-model "$FALLBACK")
+    SET=(--settings "$SETTINGS")
+  fi
   out="$RUNS/attempt-$attempt.json"; stamp="$RUNS/.attempt-start"; touch "$stamp"
-  echo "$(date -Is) attempt $attempt model=$MODEL (session=${SESSION:-new})" >> "$RUNS/driver.log"
+  echo "$(date -Is) attempt $attempt model=$MODEL$([ "$USE_CLAUDE" = 1 ] && echo ' [CLAUDE FALLBACK]') (session=${SESSION:-new})" >> "$RUNS/driver.log"
   if [ -z "$SESSION" ]; then
-    (cd "$WT" && nice -n 10 ionice -c3 claude -p --settings "$SETTINGS" --model "$MODEL" "${FB[@]}" \
+    (cd "$WT" && nice -n 10 ionice -c3 claude -p "${SET[@]}" --model "$MODEL" "${FB[@]}" \
        --permission-mode auto --output-format json "$PROMPT") > "$out" 2> "$RUNS/attempt-$attempt.err"
   else
-    (cd "$WT" && nice -n 10 ionice -c3 claude -p --settings "$SETTINGS" --model "$MODEL" "${FB[@]}" \
+    (cd "$WT" && nice -n 10 ionice -c3 claude -p "${SET[@]}" --model "$MODEL" "${FB[@]}" \
        --permission-mode auto --output-format json --resume "$SESSION" \
        "You stopped before finishing. Do NOT stop to announce next steps — keep calling tools until the whole task is done. Continue exactly where you left off, then verify the acceptance criteria, commit, and write REPORT.md.") \
        > "$out" 2> "$RUNS/attempt-$attempt.err"
@@ -122,11 +140,23 @@ try: print(json.load(sys.stdin).get("is_error",True))
 except Exception: print(True)')
   if [ $rc -eq 0 ] && [ "$iserr" = "False" ] && [ "$WT/REPORT.md" -nt "$stamp" ]; then status=ok; break; fi
   echo "$(date -Is) attempt $attempt rc=$rc is_error=$iserr report=$([ -f "$WT/REPORT.md" ] && echo y || echo n)" >> "$RUNS/driver.log"
+  if [ "$USE_CLAUDE" = 1 ]; then
+    # One Claude attempt done; go back to OmniRoute next time.
+    USE_CLAUDE=0; omni_errors=0
+    sleep 30; continue
+  fi
   stalls=$((stalls + 1))
-  # Quota / rate-limit on this combo (e.g. "429 … reset after 20h"): rotate right away.
-  if printf '%s' "$json" | grep -qiE '\(429\)|rate.?limit|quota|reset after|all targets were skipped'; then
-    stalls=$ROTATE_AFTER
-    echo "$(date -Is) $MODEL rate-limited/quota — rotating now" >> "$RUNS/driver.log"
+  # API error / quota / rate-limit on this combo (e.g. "429 … reset after 20h"): rotate right away.
+  if [ "$iserr" != "False" ] || printf '%s' "$json" | grep -qiE '\(429\)|rate.?limit|quota|reset after|all targets were skipped'; then
+    stalls=$ROTATE_AFTER; omni_errors=$((omni_errors + 1))
+    echo "$(date -Is) $MODEL errored (${omni_errors} in a row) — rotating now" >> "$RUNS/driver.log"
+  else
+    omni_errors=0
+  fi
+  # Every OmniRoute combo errored in a row: last resort is native Claude Code.
+  if [ "$omni_errors" -ge "${#MODEL_LIST[@]}" ]; then
+    USE_CLAUDE=1
+    echo "$(date -Is) all OmniRoute combos failing — next attempt on Claude ($CLAUDE_FALLBACK_MODEL)" >> "$RUNS/driver.log"
   fi
   if [ "$stalls" -ge "$ROTATE_AFTER" ] && [ "${#MODEL_LIST[@]}" -gt 1 ]; then
     midx=$(( (midx + 1) % ${#MODEL_LIST[@]} )); stalls=0
