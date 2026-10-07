@@ -4,6 +4,7 @@ You run unattended in your own git worktree (the current directory). Read `GOAL.
 Rules:
 - Stay inside the current directory, plus read-only access to the reference checkouts named in the task. Never touch `~/.hermes`, `~/.claude`, any system service, or other repos.
 - Never print, log, commit or hard-code secrets. Read API keys from environment variables only, and default to `K3CODE_API_KEY` / `OMNIROUTE_API_KEY`.
+- **Do not call OmniRoute** (`<omniroute-host>:20128`, `<omniroute-public-host>`) in any way: the owner paused all use of it on 2026-10-07 because the key's daily usage limit is shared and used up. Use the fake provider (`K3CODE_FAKE_PROVIDER`, `E2E_FAKE=1`, the chaos suite's fake upstream) for every test. A live-model check that needs it stays PENDING; say so in `REPORT.md` instead of working around the pause.
 - Licensing:
   - Only copy code from MIT- or Apache-2.0-licensed projects named in the task.
   - Keep their copyright headers. Add a header line `# Vendored from <project>@<commit>:<path> (<license>)`, or `//` for TS/Go.
@@ -16,7 +17,7 @@ Rules:
 - Write tests for what you build. Run them and make them pass before finishing.
 - Keep the code style consistent: Python 3.12+, type hints, `ruff`-clean, small modules.
 - Do not push and do not create PRs. Commit your work on the current branch with clear messages, ending with:
-  `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
+  `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`
 - When finished, write `REPORT.md` at the repo root covering:
   - what you built (files);
   - how you verified it (the exact commands, plus their pass/fail output summary);

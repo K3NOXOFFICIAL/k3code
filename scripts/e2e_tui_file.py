@@ -42,6 +42,9 @@ if FAKE:
         "api_key_env: PATH, models: {default: m}}\nreliability: {flags: {netwatch: false}}\n"
     )
 else:
+    if os.environ.get("K3_ALLOW_OMNIROUTE") != "1":
+        sys.exit("OmniRoute use is paused by the owner (2026-10-07): run with E2E_FAKE=1, "
+                 "or set K3_ALLOW_OMNIROUTE=1 to go live")
     (home / "config.yaml").write_text(
         "providers:\n"
         '  - {name: omniroute, kind: openai, base_url: "http://<omniroute-host>:20128/v1", '

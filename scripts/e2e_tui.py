@@ -89,6 +89,9 @@ def main() -> int:
         print("FAIL: pexpect is not installed (uv sync in core/ to get it)")
         return 2
 
+    if os.environ.get("K3_ALLOW_OMNIROUTE") != "1":
+        print("SKIP: OmniRoute use is paused by the owner (2026-10-07); set K3_ALLOW_OMNIROUTE=1 to go live")
+        return 2
     api_key = os.environ.get("OMNIROUTE_API_KEY", "").strip()
     if not api_key:
         print("FAIL: OMNIROUTE_API_KEY is not set")

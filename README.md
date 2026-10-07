@@ -289,7 +289,7 @@ Verification as of 2026-10-07 (51 exit checks: 41 pass, 0 fail, 10 pending). The
 
 | | Milestone | Built | Verified so far |
 |---|---|---|---|
-| **M0** | Scaffold, core skeleton, vendored TUI and panes | ✅ | Passes; the live-model row is pending (provider quota) |
+| **M0** | Scaffold, core skeleton, vendored TUI and panes | ✅ | Passes; the live-model row is pending (live provider calls are paused) |
 | **M1** | Daily-driver agent: gateway, TUI (agent list, focus mode, history), permissions, commands | ✅ | Nine scripted real-TUI flows pass; the live `/review` check is pending, and so is 3 days of real use |
 | **M2** | 24/7 reliability: offline pause/resume, retry, journal, governor, daemon, doctor, stats | ✅ | All five chaos checks and a 30-minute soak (119 turns, none lost, memory flat) pass; the 72-hour soak is pending |
 | **M3** | `k3` keymap, agent states and approvals in panes | ✅ | Keymap tests and the live pane-badge check pass; the first-time-user test is pending |

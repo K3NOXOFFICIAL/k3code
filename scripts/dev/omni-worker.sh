@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# omni-worker.sh — run one k3code build task with a headless Claude Code worker
-# whose model calls go through OmniRoute (not the Claude account).
+# omni-worker.sh — run one k3code build task with a headless Claude Code worker.
+# Default (since 2026-10-07): native Claude Code, Sonnet 5.5, no OmniRoute traffic at all.
+# With K3DEV_ALLOW_OMNIROUTE=1 the model calls go through OmniRoute first (saves Claude tokens)
+# and Claude is only the last resort.
 #
 # usage: scripts/dev/omni-worker.sh <task.md> <name> [base-branch] [model]
 #   task.md      task spec (self-contained; see scripts/dev/tasks/)
@@ -25,6 +27,10 @@ SELF_DIR=${K3DEV_SELF_DIR:-$(dirname "$(readlink -f "$0")")}
 
 TASK=${1:?task file}; NAME=${2:?name}; BASE=${3:-}; MODELS=${4:-auto/muse,auto/pro-coding,auto/coding-manual}
 SETTINGS=${K3DEV_SETTINGS:-$HOME/.claude/settings.omniroute.json}
+# OmniRoute is OFF by default (owner decision 2026-10-07: the key's daily usage limit was used up).
+# Workers then run on native Claude Code (Sonnet 5.5) and never read or send the OmniRoute key.
+# Opt back in with K3DEV_ALLOW_OMNIROUTE=1.
+ALLOW_OMNI=${K3DEV_ALLOW_OMNIROUTE:-0}
 MAX_ATTEMPTS=${K3DEV_MAX_ATTEMPTS:-30}
 ROTATE_AFTER=${K3DEV_ROTATE_AFTER:-2}
 IFS=, read -r -a MODEL_LIST <<< "$MODELS"
@@ -36,11 +42,17 @@ PREAMBLE="$SELF_DIR/worker-preamble.md"
 mkdir -p "$RUNS"
 TASK=$(readlink -f "$TASK")
 
-[ -f "$SETTINGS" ] || { echo "missing $SETTINGS" >&2; exit 2; }
-# Same OmniRoute key, exposed to the worker's tools for live smoke tests (never printed).
-if [ -z "${OMNIROUTE_API_KEY:-}" ]; then
-  OMNIROUTE_API_KEY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["env"].get("ANTHROPIC_AUTH_TOKEN",""))' "$SETTINGS")
-  export OMNIROUTE_API_KEY
+if [ "$ALLOW_OMNI" = 1 ]; then
+  [ -f "$SETTINGS" ] || { echo "missing $SETTINGS" >&2; exit 2; }
+  # Same OmniRoute key, exposed to the worker's tools for live smoke tests (never printed).
+  if [ -z "${OMNIROUTE_API_KEY:-}" ]; then
+    OMNIROUTE_API_KEY=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["env"].get("ANTHROPIC_AUTH_TOKEN",""))' "$SETTINGS")
+    export OMNIROUTE_API_KEY
+  fi
+else
+  # Make sure nothing the worker runs can pick up an OmniRoute key from this shell.
+  unset OMNIROUTE_API_KEY K3_ALLOW_OMNIROUTE
+  export K3_ALLOW_OMNIROUTE=0
 fi
 
 RESUMING=0
@@ -56,7 +68,9 @@ fi
 # and is removed on exit; it holds the same key as the source profile.
 DIRECT_URL=${K3DEV_DIRECT_URL:-http://<omniroute-host>:20128}
 RUNTIME_SETTINGS=""
-if curl -s -o /dev/null -m 5 "$DIRECT_URL/"; then
+if [ "$ALLOW_OMNI" != 1 ]; then
+  HEALTH_URL="https://api.anthropic.com/"   # Claude only: wait for Anthropic, never contact OmniRoute
+elif curl -s -o /dev/null -m 5 "$DIRECT_URL/"; then
   RUNTIME_SETTINGS=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/k3dev-settings.XXXXXX.json")
   chmod 600 "$RUNTIME_SETTINGS"
   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d.setdefault("env",{})["ANTHROPIC_BASE_URL"]=sys.argv[2]; d["env"]["API_TIMEOUT_MS"]="900000"; d["env"]["CLAUDE_CODE_DISABLE_AUTO_MEMORY"]="1"; d["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]="110000"; d["env"]["CLAUDE_CODE_DISABLE_THINKING"]="1"; d["env"]["DISABLE_PROMPT_CACHING"]="1"; json.dump(d,open(sys.argv[3],"w"))' \
@@ -116,7 +130,9 @@ while [ $attempt -lt "$MAX_ATTEMPTS" ]; do
   attempt=$((attempt + 1))
   # While the OmniRoute key itself is out of quota, stay on Claude until the reset.
   [ "$(date +%s)" -lt "$KEY_QUOTA_UNTIL" ] && USE_CLAUDE=1
-  [ "$USE_CLAUDE" = 1 ] || wait_online
+  [ "$ALLOW_OMNI" = 1 ] || USE_CLAUDE=1
+  # OmniRoute mode waits for the gateway; Claude-only mode waits for api.anthropic.com (offline pause).
+  if [ "$USE_CLAUDE" != 1 ] || [ "$ALLOW_OMNI" != 1 ]; then wait_online; fi
   if [ "$USE_CLAUDE" = 1 ]; then
     MODEL=$CLAUDE_FALLBACK_MODEL; FB=(); SET=("${LEAN[@]}")   # default settings = native Claude account
     # Never resume a session written by other models on Claude: foreign thinking blocks fail

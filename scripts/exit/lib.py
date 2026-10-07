@@ -42,10 +42,17 @@ def run(cmd: str | list[str], cwd: Path | str | None = None, env: dict | None = 
 
 
 def omniroute_quota() -> tuple[bool, str]:
-    """(usable, detail). 429 'daily usage quota' -> (False, reset info). Never prints the key."""
+    """(usable, detail). 429 'daily usage quota' -> (False, reset info). Never prints the key.
+
+    Off by default: the owner paused all OmniRoute use on 2026-10-07 (the key's daily usage limit is
+    shared by everything that uses it). Set K3_ALLOW_OMNIROUTE=1 to run the live-model checks; until
+    then they stay PENDING and no request leaves the machine.
+    """
     import urllib.error
     import urllib.request
 
+    if os.environ.get("K3_ALLOW_OMNIROUTE") != "1":
+        return False, "OmniRoute use paused by the owner (2026-10-07); live-model checks wait for K3_ALLOW_OMNIROUTE=1"
     key = os.environ.get("OMNIROUTE_API_KEY", "")
     if not key:
         return False, "OMNIROUTE_API_KEY not set"

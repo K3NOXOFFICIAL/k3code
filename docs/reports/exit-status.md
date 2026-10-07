@@ -1,7 +1,9 @@
 # Exit-criteria status
 
-Generated 2026-10-07 17:07:39 +0200 by `scripts/exit/run_all.sh`.
+Generated 2026-10-07 17:19:49 +0200 by `scripts/exit/run_all.sh`.
 **41 PASS, 0 FAIL, 10 PENDING** (51 rows).
+
+> Live-model checks (the PENDING rows that mention OmniRoute) are **paused by the owner** since 2026-10-07: no request is sent until `K3_ALLOW_OMNIROUTE=1` is set. Evidence text recorded before that date talks about the daily usage quota and its reset time; the pause supersedes it, so waiting for the reset does not close them.
 
 | Milestone | Criterion | How checked | Status | Evidence (output tail) |
 |---|---|---|---|---|

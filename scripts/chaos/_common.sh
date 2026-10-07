@@ -6,7 +6,15 @@ CORE="$HERE/../../core"
 UPSTREAM="${UPSTREAM:-<omniroute-host>:20128}"
 PORT="${PROXY_PORT:-18080}"
 MODEL="${CHAOS_MODEL:-auto/coding-cheap}"
-: "${OMNIROUTE_API_KEY:?OMNIROUTE_API_KEY not set}"
+# OmniRoute is paused by the owner (2026-10-07): the suite runs against the deterministic fake
+# upstream unless K3_ALLOW_OMNIROUTE=1 is set. The proxy needs *a* key value; "x" works for the fake.
+if [ "${K3_ALLOW_OMNIROUTE:-0}" = 1 ]; then
+  : "${OMNIROUTE_API_KEY:?OMNIROUTE_API_KEY not set}"
+else
+  OMNIROUTE_API_KEY=x; export OMNIROUTE_API_KEY
+  case "${CHAOS_UPSTREAM:-auto}" in real) echo "[chaos] CHAOS_UPSTREAM=real refused: OmniRoute is paused (set K3_ALLOW_OMNIROUTE=1)" >&2; exit 2;; esac
+  CHAOS_UPSTREAM=fake
+fi
 WORK="$(mktemp -d /tmp/k3code-chaos.XXXXXX)"
 export K3CODE_HOME="$WORK/home"
 mkdir -p "$K3CODE_HOME" "$WORK/proj/.k3code"

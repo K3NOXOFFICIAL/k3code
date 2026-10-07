@@ -27,7 +27,7 @@ It is assembled from the best parts of existing open-source harnesses rather tha
 
 1. **Assemble, don't reinvent.** Take designs and code from open-source harnesses where that is cheaper than writing them; record every copied or ported file in `VENDOR.toml` with its origin, commit and license.
 2. **License hygiene.** Only permissive licenses (MIT, Apache-2.0) are used. Proprietary or leaked code (for example, the leaked Claude Code source republished as "Open-ClaudeCode") is never used, and closed binaries are never used as a base. `scripts/vendor_check.py` checks the license and the banned-project label of every listed file entry.
-3. **Spend the owner's Claude tokens sparingly.** Build work is done mainly by headless coding agents on the owner's OmniRoute gateway; Claude orchestrates and reviews. If no OmniRoute model works, falling back to Claude Code (Sonnet 5.5) is preferred over stopping.
+3. **Spend the owner's Claude tokens sparingly.** Build work was first done by headless coding agents on the owner's OmniRoute gateway, with Claude orchestrating and reviewing. Since 2026-10-07 OmniRoute is **paused by the owner**, and the build continues on Claude Code (Sonnet 5.5) directly; the OmniRoute path stays in the tooling behind an explicit opt-in (`K3DEV_ALLOW_OMNIROUTE=1`, `K3_ALLOW_OMNIROUTE=1`).
 4. **One branch per task, milestone-named**, merged into an integration branch with a pull request into `Main`; each task leaves a report in `docs/reports/`.
 5. **Test what you claim.** Features are verified with automated tests, scripted runs of the real TUI, chaos tests, and, where models are involved, live runs. Anything not yet verified is marked as such, never assumed.
 
@@ -214,10 +214,11 @@ The goal is complete when **every milestone M0–M6 meets its exit criteria**, v
 
 - Confirm or correct the 30 proposed task-size labels in `scripts/exit/scope_eval.jsonl`.
 - Run the first-time-user test of `k3`, and use k3code for real for three days and then two weeks.
-- Provide a working provider key (and a quota) for the live-model checks.
+- Allow live-model checks again: they need a provider key with its own usage limit (OmniRoute is paused, see the decision below), then `K3_ALLOW_OMNIROUTE=1`.
 - Choose the final name.
 - Decide when to merge the integration branch into `Main` and when to make the repository public.
 - Decided 2026-10-07: the Hermes TUI is a frozen fork (see [`docs/UPSTREAM.md`](docs/UPSTREAM.md)).
+- Decided 2026-10-07: no further OmniRoute use for the build. The key's daily usage limit ($40 per day, counted at list price, shared by everything on the key) was reached; the build, the exit checks and the chaos suite now run on Claude Code (Sonnet 5.5) and fake providers, and every live-model check stays PENDING until the owner re-enables it.
 
 ---
 
@@ -235,3 +236,4 @@ The request as written on 2026-10-07 (typos kept), followed by the additions mad
 - The model tiers for automatic degradation are chosen in the guided setup.
 - Use OmniRoute-based agents to build it, so the owner's Claude account is not drained; if no OmniRoute model works, fall back to Claude Code (Sonnet 5.5) rather than stopping.
 - Later: a proper README, and a more detailed and structured goal document (this file).
+- Later (2026-10-07): stop using OmniRoute for the build so the key's usage does not grow; continuing on Claude Code (Sonnet 5.5) is fine.
