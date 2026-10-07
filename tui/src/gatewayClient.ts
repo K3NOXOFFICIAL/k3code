@@ -86,6 +86,54 @@ const resolvePython = () => {
   return process.platform === 'win32' ? 'python' : 'python3'
 }
 
+// k3code: the launcher may override the spawned gateway command entirely
+// (K3CODE_GATEWAY_CMD, e.g. "python -m k3code.cli gateway --stdio"). Parsed
+// with shell-style quoting so paths with spaces survive; null when unset or
+// when it would produce an empty argv.
+const resolveGatewayCmd = (): string[] | null => {
+  const raw = process.env.K3CODE_GATEWAY_CMD?.trim()
+
+  if (!raw) {
+    return null
+  }
+
+  const argv: string[] = []
+  let current = ''
+  let quote: '"' | "'" | null = null
+  let hasToken = false
+
+  for (const ch of raw) {
+    if (quote) {
+      if (ch === quote) {
+        quote = null
+      } else {
+        current += ch
+      }
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      hasToken = true
+      continue
+    }
+    if (/\s/.test(ch)) {
+      if (hasToken) {
+        argv.push(current)
+        current = ''
+        hasToken = false
+      }
+      continue
+    }
+    current += ch
+    hasToken = true
+  }
+  if (hasToken) {
+    argv.push(current)
+  }
+
+  return argv.length > 0 ? argv : null
+}
+
 // Matches `<scheme>://user:pass@host…` style user-info segments in
 // otherwise-malformed URLs that the WHATWG `URL` parser can't accept.
 // Used by the `redactUrl` fallback so embedded credentials are
@@ -439,6 +487,7 @@ export class GatewayClient extends EventEmitter {
   }
 
   private startSpawnedGateway(root: string) {
+    const cmdOverride = resolveGatewayCmd()
     const python = resolvePython()
     const cwd = process.env.HERMES_CWD || root
     const env = { ...process.env }
@@ -448,8 +497,9 @@ export class GatewayClient extends EventEmitter {
     // Tell the gateway child where the Hermes source root is so its import
     // guard can force it ahead of any same-named package in the launch cwd.
     env.HERMES_PYTHON_SRC_ROOT = root
-    this.startReadyTimer(python, cwd)
-    this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    const [cmd, ...cmdArgs] = cmdOverride ?? [python, '-m', 'tui_gateway.entry']
+    this.startReadyTimer(cmd, cwd)
+    this.proc = spawn(cmd, cmdArgs, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
     this.lifecycle(`[lifecycle] spawned gateway child ${describeChild(this.proc)} python=${python} cwd=${cwd}`)
 
     const stdin = this.proc.stdin!
