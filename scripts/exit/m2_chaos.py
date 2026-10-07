@@ -106,7 +106,10 @@ async def check_b(procs: cl.Procs) -> None:
     cl.start_fake_upstream(procs, up)
     cl.start_fake_upstream(procs, web)
     cl.start_proxy(procs, px, up, mode)
-    d, peer, sid = await start(procs, config(provider("omni", px, "K") , web), env={"K": "x"})
+    # Real offline: the connectivity probe goes through the same proxy, so it goes down together with the
+    # provider (as `nmcli networking off` would). A provider down while the probe stays up is PROVIDER_DOWN
+    # (failover/park, never a pause); that case is check (e).
+    d, peer, sid = await start(procs, config(provider("omni", px, "K"), px), env={"K": "x"})
     prompt = ("Do these steps in order, one bash tool call each, then reply DONE: RUN[echo one > a.txt] "
               "RUN[sleep 2; echo two > b.txt] RUN[echo three > c.txt] RUN[cat a.txt b.txt c.txt]")
     t0 = time.monotonic()

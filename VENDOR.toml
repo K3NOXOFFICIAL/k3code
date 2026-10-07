@@ -237,6 +237,15 @@ modified = true
 
 [[file]]
 project = "hermes-agent"
+upstream_path = "agent/background_review.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/learning/distiller.py"
+sha256_upstream = "0457a5110f1afb4a9fcbe32fcd02eda8fb7d160f7e44a2c10109a320fd23656e"
+modified = true
+
+[[file]]
+project = "hermes-agent"
 upstream_path = "agent/curator.py"
 commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
 license = "MIT"

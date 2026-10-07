@@ -8,7 +8,8 @@ import type {
   ConfigSetResponse,
   SessionBranchResponse,
   SessionCompressResponse,
-  SessionUsageResponse
+  SessionUsageResponse,
+  SlashExecResponse
 } from '../../../gatewayTypes.js'
 import type { PanelSection } from '../../../types.js'
 import { applyConfiguredTuiTheme } from '../../createGatewayEventHandler.js'
@@ -72,27 +73,8 @@ const reasoningConfigPayload = (arg: string, sid: string) => {
 }
 
 export const sessionCommands: SlashCommand[] = [
-  {
-    aliases: ['background'],
-    help: 'launch a background prompt',
-    name: 'bg',
-    run: (arg, ctx) => {
-      if (!arg) {
-        return ctx.transcript.sys('/bg <prompt>')
-      }
-
-      ctx.gateway.rpc<BackgroundStartResponse>('prompt.background', { session_id: ctx.sid, text: arg }).then(
-        ctx.guarded<BackgroundStartResponse>(r => {
-          if (!r.task_id) {
-            return
-          }
-
-          patchUiState(state => ({ ...state, bgTasks: new Set(state.bgTasks).add(r.task_id!) }))
-          ctx.transcript.sys(`bg ${r.task_id} started`)
-        })
-      )
-    }
-  },
+  // k3: no local /bg. The gateway's /bg handles `/bg <prompt>`, `/bg --pane <prompt>` and a bare `/bg`
+  // (send the running turn to the background); the old local handler only knew `/bg <prompt>`.
 
   {
     help: 'ask a side question about this conversation',
@@ -117,7 +99,21 @@ export const sessionCommands: SlashCommand[] = [
   {
     help: 'change or show model',
     name: 'model',
-    run: (arg, ctx) => {
+    run: (arg, ctx, cmd) => {
+      // k3: `/model chain [add|remove|move …]` is the gateway's fallback-chain view, not a model switch.
+      if (/^chain(\s|$)/.test(arg.trim())) {
+        return ctx.gateway.gw
+          .request<SlashExecResponse>('slash.exec', { command: cmd.slice(1), session_id: ctx.sid })
+          .then(r => {
+            if (ctx.stale()) {
+              return
+            }
+
+            ctx.transcript.page(r?.output || '/model chain: no output', 'Fallback chain')
+          })
+          .catch(ctx.guardedErr)
+      }
+
       // No busy guard here (unlike session switching). A model change is a
       // session-scoped config.set: idle it switches immediately; mid-turn the
       // gateway QUEUES it and applies it at the next turn start (returning

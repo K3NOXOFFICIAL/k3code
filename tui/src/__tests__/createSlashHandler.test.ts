@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createSlashHandler } from '../app/createSlashHandler.js'
 import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
-import { DASHBOARD_EXIT_DISABLED_MESSAGE, DASHBOARD_UPDATE_DISABLED_MESSAGE } from '../app/slash/commands/core.js'
+import { DASHBOARD_EXIT_DISABLED_MESSAGE } from '../app/slash/commands/core.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import type * as EnvModule from '../config/env.js'
 import { TUI_SESSION_MODEL_FLAG } from '../domain/slash.js'
@@ -125,34 +125,32 @@ describe('createSlashHandler', () => {
     expect(ctx.transcript.sys).toHaveBeenCalledWith(DASHBOARD_EXIT_DISABLED_MESSAGE)
   })
 
-  it('handles /update locally and exits with code 42 via dieWithCode', () => {
-    vi.useFakeTimers()
+  // k3: /update, /stop and /bg are owned by the gateway. The TUI must hand them over (slash.exec) and must
+  // never quit itself or call Hermes-only RPCs (the old /update exited with code 42, /stop called process.stop).
+  it.each([['/update'], ['/update now'], ['/stop'], ['/bg --pane write the tests'], ['/bg']])(
+    'hands %s to the gateway instead of handling it locally',
+    command => {
+      vi.useFakeTimers()
+      const rpc = vi.fn(() => Promise.resolve({}))
+      const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+      expect(createSlashHandler(ctx)(command)).toBe(true)
+      vi.advanceTimersByTime(300)
+      expect(ctx.session.dieWithCode).not.toHaveBeenCalled()
+      expect(ctx.session.die).not.toHaveBeenCalled()
+      expect(rpc).not.toHaveBeenCalledWith('process.stop', expect.anything())
+      expect(rpc).not.toHaveBeenCalledWith('prompt.background', expect.anything())
+      expect(ctx.gateway.gw.request).toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: command.slice(1) }))
+
+      vi.useRealTimers()
+    }
+  )
+
+  it('sends /model chain to the gateway instead of opening the model picker', () => {
     const ctx = buildCtx()
 
-    expect(createSlashHandler(ctx)('/update')).toBe(true)
-    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
-
-    // Advance past the 100ms setTimeout
-    vi.advanceTimersByTime(150)
-    expect(ctx.session.dieWithCode).toHaveBeenCalledWith(42)
-
-    vi.useRealTimers()
-  })
-
-  it('refuses /update in hosted dashboard chat instead of killing the PTY', () => {
-    vi.useFakeTimers()
-    envState.dashboardTuiMode = true
-    const ctx = buildCtx()
-
-    expect(createSlashHandler(ctx)('/update')).toBe(true)
-    expect(ctx.session.dieWithCode).not.toHaveBeenCalled()
-    expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
-    expect(ctx.transcript.sys).toHaveBeenCalledWith(DASHBOARD_UPDATE_DISABLED_MESSAGE)
-
-    vi.advanceTimersByTime(150)
-    expect(ctx.session.dieWithCode).not.toHaveBeenCalled()
-
-    vi.useRealTimers()
+    expect(createSlashHandler(ctx)('/model chain')).toBe(true)
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: 'model chain' }))
   })
 
   it('routes /status to live session.status instead of slash worker', async () => {
@@ -497,7 +495,6 @@ describe('createSlashHandler', () => {
     ['/browser connect', 'browser.manage', { action: 'connect', session_id: null, url: 'http://127.0.0.1:9222' }],
     ['/reload-mcp', 'reload.mcp', { session_id: null }],
     ['/reload', 'reload.env', {}],
-    ['/stop', 'process.stop', {}],
     ['/fast status', 'config.get', { key: 'fast', session_id: null }],
     ['/busy status', 'config.get', { key: 'busy' }],
     ['/indicator', 'config.get', { key: 'indicator' }]

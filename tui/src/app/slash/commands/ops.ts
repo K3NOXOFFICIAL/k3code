@@ -63,22 +63,8 @@ interface SkillsReloadResponse {
 }
 
 export const opsCommands: SlashCommand[] = [
-  {
-    help: 'stop background processes',
-    name: 'stop',
-    run: (_arg, ctx) => {
-      ctx.gateway
-        .rpc<ProcessStopResponse>('process.stop', {})
-        .then(
-          ctx.guarded<ProcessStopResponse>(r => {
-            const killed = Number(r.killed ?? 0)
-            const noun = killed === 1 ? 'process' : 'processes'
-            ctx.transcript.sys(`stopped ${killed} background ${noun}`)
-          })
-        )
-        .catch(ctx.guardedErr)
-    }
-  },
+  // k3: no local /stop. The gateway's /stop interrupts the running turn; the old handler called the Hermes-only
+  // `process.stop` RPC, which the k3code gateway does not have (so it always errored).
 
   {
     aliases: ['reload_mcp'],

@@ -146,22 +146,8 @@ export const coreCommands: SlashCommand[] = [
     }
   },
 
-  {
-    help: 'update k3code to the latest version (exits TUI)',
-    name: 'update',
-    run: (_arg, ctx) => {
-      if (DASHBOARD_TUI_MODE) {
-        ctx.transcript.sys(DASHBOARD_UPDATE_DISABLED_MESSAGE)
-
-        return
-      }
-
-      ctx.transcript.sys('exiting TUI to run update...')
-      // Exit code 42 signals the Python wrapper to exec `k3code update`.
-      // Use dieWithCode for proper cleanup (gateway kill + Ink unmount).
-      setTimeout(() => ctx.session.dieWithCode(42), 100)
-    }
-  },
+  // k3: no local /update. The gateway owns it (shows current/latest/changelog, asks before applying, rolls back).
+  // The old Hermes handler quit the TUI with exit code 42 expecting a wrapper that does not exist here.
 
   {
     aliases: ['scroll'],
