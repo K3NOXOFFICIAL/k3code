@@ -1739,8 +1739,16 @@ class GatewayServer:
         if len(mgr.recent_kicks(now)) >= MAX_KICKS_PER_WINDOW:
             mgr.pause(f"parked: {MAX_KICKS_PER_WINDOW} automatic kicks in 1 h")
             self.emit_goal(live)
+            self.notify_session(
+                live,
+                f"Goal parked after {MAX_KICKS_PER_WINDOW} automatic restarts within an hour ({source}). "
+                "Check it, then /goal resume.",
+                level="warning",
+                key=f"k3.goal.parked.{live.session_id}",
+            )
             return False
         mgr.record_kick(now)
+        logger.info("goal in session %s kicked (%s)", live.session_id, source)
         live.turn_task = asyncio.get_running_loop().create_task(
             self._run_turn(live, mgr.kick_prompt() or goal.goal), name=f"kick-{live.session_id}"
         )
@@ -1754,18 +1762,35 @@ class GatewayServer:
         """
         if self.halted or self.background_paused:
             return 0
-        started = 0
         for stored in self.store.with_meta_key("goal"):
-            live = self.live_for(stored)
-            mgr = self.goal_manager(live)
-            goal = mgr.state
-            if goal is None:
+            goal = stored.meta.get("goal") or {}
+            if goal.get("status") == "paused" and goal.get("paused_reason") == "daemon restart":
+                self.goal_manager(self.live_for(stored)).resume(reset_budget=False)
+        return len(await self.watchdog_tick(source="boot"))
+
+    async def watchdog_tick(self, *, source: str = "watchdog") -> list[str]:
+        """Re-kick every goal persisted active that has no live turn (through kick_goal, so the kick counter and the
+        halt and storm guards apply). Returns the session ids kicked."""
+        if self.halted or self.background_paused:
+            return []
+        kicked: list[str] = []
+        for stored in self.store.with_meta_key("goal"):
+            if (stored.meta.get("goal") or {}).get("status") != "active":
                 continue
-            if goal.status == "paused" and goal.paused_reason == "daemon restart":
-                mgr.resume(reset_budget=False)
-            if await self.kick_goal(live, source="boot"):
-                started += 1
-        return started
+            if await self.kick_goal(self.live_for(stored), source=source):
+                kicked.append(stored.session_id)
+        return kicked
+
+    def notify_session(self, live: LiveSession, text: str, *, level: str = "info", key: str = "") -> None:
+        """A notification to the clients attached to ``live`` (essential, so focus mode keeps it)."""
+        payload = {
+            "text": text,
+            "level": level,
+            "kind": "goal",
+            "key": key or f"k3.goal.{live.session_id}",
+            "session_id": live.session_id,
+        }
+        live.emit("notification.show", payload, importance="essential")
 
     def emit_goal(self, session: LiveSession) -> None:
         """Push the goal snapshot to the TUI goal bar (``session.control.update``)."""

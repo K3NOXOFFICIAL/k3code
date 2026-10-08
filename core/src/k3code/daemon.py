@@ -120,11 +120,13 @@ def maybe_auto_clear(server: Any, home: Path | None = None, now: float | None = 
 
 
 async def _housekeeping(server: Any, home: Path) -> None:
-    """Once a minute: the safe-mode auto-clear (more periodic checks join here)."""
+    """Once a minute: the safe-mode auto-clear, then the goal watchdog (which re-kicks goals with no live turn)."""
     while True:
         await asyncio.sleep(HOUSEKEEPING_EVERY_S)
         with contextlib.suppress(Exception):
             maybe_auto_clear(server, home)
+        with contextlib.suppress(Exception):
+            await server.watchdog_tick()
 
 
 SAFE_MODE_NOTICE = (
