@@ -284,6 +284,35 @@ async def test_ultracode_token_budget_stops_it(tmp_path, monkeypatch):
     assert not (repo / "f1.txt").exists()
 
 
+async def test_a_budget_stop_cancels_the_sibling_children():
+    """asyncio.gather re-raised BudgetStop and left the siblings running: their sub-agents kept spending."""
+    import asyncio
+
+    from k3code.autonomy.ultra import gather_or_cancel
+    from k3code.subagents.budget import BudgetStop
+
+    cancelled = []
+
+    async def long_child():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    async def over_budget():
+        await asyncio.sleep(0.01)
+        raise BudgetStop("agent budget exhausted")
+
+    try:
+        await asyncio.wait_for(gather_or_cancel(long_child(), over_budget(), long_child()), 5)
+        raise AssertionError("expected BudgetStop")
+    except BudgetStop:
+        pass
+    assert cancelled == [True, True]
+    assert await gather_or_cancel(asyncio.sleep(0, "a"), asyncio.sleep(0, "b")) == ["a", "b"]
+
+
 def test_parsers():
     scores, plan = parse_judge('blah SCORES: {"a": 3, "b": "7"}\n## Goal\nx')
     assert scores == {"a": 3.0, "b": 7.0} and plan.startswith("## Goal")

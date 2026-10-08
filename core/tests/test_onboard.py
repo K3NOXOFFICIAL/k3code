@@ -90,7 +90,7 @@ def test_onboard_fast_claude_cli_writes_a_config_that_loads(root) -> None:
     assert r.exit_code == 0, r.output
     cfg = load_config(project_dir=root)
     assert [(p.name, p.kind) for p in cfg.providers] == [("claude-cli", "claude-cli")]
-    assert cfg.providers[0].models == {"default": "sonnet"}
+    assert cfg.providers[0].models == {"default": "sonnet", "strong": "opus", "cheap": "haiku", "fast": "haiku"}
     assert cfg.permission_mode == "ask"
     assert ob.question_answered()
 
@@ -178,3 +178,30 @@ def test_interactive_launch_asks_once_and_ctrl_c_counts_as_the_answer(root, monk
     assert second.exit_code == 0, second.output
     assert scripted.asked == ["onboard.mode"]
     assert launched == ["tui"]
+
+
+def test_fast_anthropic_uses_the_key_already_in_the_environment(root, monkeypatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-env")
+    p = Scripted({"onboard": {"mode": "fast", "provider": "anthropic"}})
+    ob.run_fast(p, do_probe=False)
+    assert "onboard.key" not in p.asked
+    cfg = load_config(project_dir=root)
+    prov = cfg.providers[0]
+    assert (prov.name, prov.kind, prov.api_key_env) == ("anthropic", "anthropic", "ANTHROPIC_API_KEY")
+    assert prov.models["default"] == "claude-sonnet-5-5" and prov.models["cheap"] == "claude-haiku-5-5"
+
+
+def test_detect_prefers_what_is_already_set_up(root, monkeypatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or")
+    monkeypatch.setattr(ob.shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+    monkeypatch.setattr(ob.probe, "probe_url", lambda *a, **k: (False, 0.0, "down"))
+    found = ob.detect_providers()
+    assert set(found) == {"openrouter", "claude-cli"}
+    assert ob._default_provider(found) == "openrouter"
+    assert ob._default_provider({}) == "anthropic"
+
+
+def test_fast_api_without_endpoint_is_an_error_not_a_loop(root) -> None:
+    answers = _answers(root, {"onboard": {"mode": "fast", "provider": "api", "model": "m"}})
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code != 0

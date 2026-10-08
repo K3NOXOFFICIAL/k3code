@@ -188,6 +188,20 @@ def test_cooldowns_persist_across_restart(tmp_path):
     assert not reborn.in_cooldown(provider="n", model="m", base_url="http://n")
 
 
+async def test_rate_limit_cooldown_ladder_climbs_and_resets_on_success():
+    """arm() always used backoff_count=0: an entry rate-limited again and again cooled down 60 s every time."""
+    store = CooldownStore()
+    arm = [store.arm(FailoverReason.rate_limit, provider="a", model="m", base_url="http://a") for _ in range(3)]
+    assert arm == [60, 120, 240]
+    store.arm(FailoverReason.rate_limit, provider="b", model="m", base_url="http://b")  # per entry
+    assert store.strikes[("b", "m", "http://b")] == 1
+    a = Scripted("a", ["ok"])
+    router, _, _, _ = make([a], store=store)
+    store.entries.clear()
+    assert (await router.complete(MSGS, [])).content == "ok"
+    assert store.arm(FailoverReason.rate_limit, provider="a", model="m", base_url="http://a") == 60
+
+
 def test_expired_cooldowns_are_dropped_on_load(tmp_path):
     path = tmp_path / "cooldowns.json"
     wall = {"t": 1_000_000.0}

@@ -32,6 +32,8 @@ from pathlib import Path
 from typing import Any
 
 from k3code import confio
+from k3code import skills as skills_mod
+from k3code._version import __version__
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, autonomy_cfg
@@ -44,6 +46,7 @@ from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
+from k3code.gateway import tui_display
 from k3code.gateway.protocol import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -67,6 +70,7 @@ from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.prompting import build_system_prompt
+from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
@@ -83,10 +87,14 @@ from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router
 from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
+from k3code.tools import build_registry as build_tool_registry
 from k3code.tools import clip_head_tail
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
+
+#: Longest JSON-RPC line read from a client (a pasted prompt can be megabytes); asyncio's default is 64 KiB.
+MAX_FRAME_BYTES = 1 << 26
 
 #: Emitted for gateway.ready; the TUI repaints its palette from this.
 _DEFAULT_SKIN = {
@@ -115,6 +123,8 @@ class LiveSession:
         self.system_prompt = _load_system_prompt()  # base prompt; per-turn extras via build_system_prompt
         self.loop: AgentLoop | None = None
         self.turn_task: asyncio.Task[None] | None = None
+        self._tools_cache: dict[str, list[str]] | None = None  # banner info, see live_info
+        self._skills_cache: dict[str, list[str]] | None = None
         self.streaming = False
         #: Serializes whole turns of this session (two prompts, a loop tick and a prompt, ... never interleave two
         #: AgentLoops on one conversation) and unattended runs' set-up/tear-down (see ServerRunner.run_prompt).
@@ -122,9 +132,14 @@ class LiveSession:
         self.run_lock = asyncio.Lock()
         #: Prompts submitted while a turn was running; each runs as its own turn when the current one ends.
         self.pending_prompts: list[str] = []
+        #: session.steer messages for the running turn: the live AgentLoop takes them before its next model call;
+        #: what no loop took (a job ran, or the loop had already answered) runs as the next prompt.
+        self.steer_queue: list[str] = []
+        #: tool call ids of the model call in flight already announced with tool.start (see _announce_tool)
+        self.announced_tools: set[str] = set()
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
-        self.reasoning_effort: str | None = None
+        self.reasoning_effort: str | None = stored.meta.get("reasoning_effort")  # /effort
         self.todos: list[dict[str, Any]] = []
         self.todo_revision = 0
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
@@ -237,8 +252,13 @@ class LiveSession:
     def live_info(self) -> dict[str, Any]:
         """SessionLiveInfo payload for session.create/resume/activate results."""
         config = self.server.config
+        key = self.stored.model or config.default_model
         return {
-            "model": self.stored.model or config.default_model,
+            "model": _model_label(config, key),
+            "model_key": key,
+            "version": __version__,
+            "tools": self._tools_info(),
+            "skills": self._skills_info(),
             "provider": self.stored.provider,
             "reasoning_effort": self.reasoning_effort,
             "approval_mode": self.perms.mode.value,
@@ -253,6 +273,85 @@ class LiveSession:
             "paused": self.paused,
             "background": self.background,
         }
+
+
+    def _tools_info(self) -> dict[str, list[str]]:
+        """Tool names by group for the TUI's banner (built once per session; MCP tools are added live)."""
+        if self._tools_cache is None:
+            reg = build_tool_registry()
+            register_skill_tool(reg, self.perms.cwd, list(self.server.config.skills.roots))
+            register_web_tools(reg, self.server.config)
+            register_task_tools(reg, self.server, self, depth=1)
+            groups: dict[str, list[str]] = {}
+            for name in reg.names():
+                groups.setdefault(_TOOL_GROUPS.get(name, "agent"), []).append(name)
+            self._tools_cache = groups
+        out = dict(self._tools_cache)
+        mcp = [t.qualified for t in self.server.mcp.tools()] if self.server.mcp else []
+        if mcp:
+            out["mcp"] = mcp
+        return out
+
+    def _skills_info(self) -> dict[str, list[str]]:
+        if self._skills_cache is None:
+            try:
+                found = skills_mod.discover(self.perms.cwd, list(self.server.config.skills.roots))
+            except OSError:
+                found = []
+            self._skills_cache = {"skills": sorted(sk.name for sk in found)} if found else {}
+        return self._skills_cache
+
+
+#: ChainExhausted.last_reason -> the TUI's turn-failure code (tui/src/app/userMessages.ts TURN_CODE_COPY).
+_FAILURE_CODES = {
+    "auth": "auth",
+    "quota": "billing",
+    "rate_limit": "rate_limit",
+    "bad_request": "model_not_found",
+    "timeout": "timeout",
+    "server": "server_error",
+    "context_overflow": "context_overflow",
+}
+
+
+def _error_surface(exc: BaseException | None) -> dict[str, Any] | None:
+    """What the TUI needs to explain a failed turn: a code it has copy for, and whether /retry can help."""
+    if isinstance(exc, AllProvidersUnreachable):
+        return {"layer": "endpoint", "retryable": True}
+    if isinstance(exc, ContextOverflow):
+        return {"code": "context_overflow", "retryable": True}
+    if isinstance(exc, ChainExhausted):
+        reason = exc.last_reason or "unknown"
+        surface: dict[str, Any] = {"layer": "provider", "retryable": reason not in ("auth", "bad_request")}
+        if reason in _FAILURE_CODES:
+            surface["code"] = _FAILURE_CODES[reason]
+        return surface
+    if isinstance(exc, DiskGuardFull):
+        return {"layer": "disk", "retryable": True}
+    return {"layer": "gateway", "retryable": True} if exc is not None else None
+
+
+_TOOL_GROUPS = {
+    "read": "files",
+    "write": "files",
+    "edit": "files",
+    "glob": "files",
+    "grep": "files",
+    "bash": "shell",
+    "todo": "planning",
+    "exit_plan": "planning",
+    "web_search": "web",
+    "web_fetch": "web",
+}
+
+
+def _model_label(config: Any, key: str) -> str:
+    """The model id the first provider uses for ``key`` (what the user recognises), else the key itself."""
+    specs = _resolve_model_specs(config, key) if config.providers else []
+    first = specs[0] if specs else ""
+    if isinstance(first, list):
+        first = first[0] if first else ""
+    return str(first or key)
 
 
 #: Conversation size at which a session's older messages are folded into a summary, and how many recent ones stay.
@@ -583,13 +682,15 @@ class GatewayServer:
         loop = asyncio.get_running_loop()
         reader = self._stdin
         if reader is None:
-            reader = asyncio.StreamReader()
+            reader = asyncio.StreamReader(limit=MAX_FRAME_BYTES)
             await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
 
         self._send_ready(self._stdio_client)
 
         while self._running:
-            line = await reader.readline()
+            line = await self._read_frame(reader, self._stdio_client)
+            if line is None:
+                continue
             if not line:
                 logger.info("stdin EOF; gateway stdio detached")
                 break
@@ -611,7 +712,7 @@ class GatewayServer:
             if _socket_is_live(path):
                 raise RuntimeError(f"{path} is served by another process; not taking it over")
             path.unlink()  # stale socket from a crashed daemon
-        self._socket_server = await asyncio.start_unix_server(self._on_connect, path=str(path))
+        self._socket_server = await asyncio.start_unix_server(self._on_connect, path=str(path), limit=MAX_FRAME_BYTES)
         os.chmod(path, 0o600)
         self.socket_path = path
         self._socket_ino = os.stat(path).st_ino  # so stop_socket only removes the socket this process created
@@ -764,7 +865,9 @@ class GatewayServer:
                 self._send(client, encode_event("notification.show", payload, "essential"))
                 self.blockers.mark_delivered(row["id"])
             while not client.closed:
-                line = await reader.readline()
+                line = await self._read_frame(reader, client)
+                if line is None:
+                    continue
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").strip()
@@ -788,6 +891,16 @@ class GatewayServer:
             logger.info("client %s detached; its sessions keep running", client.name)
             with contextlib.suppress(Exception):
                 writer.close()
+
+    async def _read_frame(self, reader: asyncio.StreamReader, client: Client) -> bytes | None:
+        """The next line from ``reader`` (b"" at EOF), or None for one longer than MAX_FRAME_BYTES: that frame is
+        answered with an error and dropped, the connection stays up. Before, any line over asyncio's 64 KiB default
+        (a pasted log as a prompt) raised out of the read loop: the stdio gateway exited, a socket client was cut."""
+        try:
+            return await reader.readline()
+        except (ValueError, asyncio.LimitOverrunError):
+            self._reply(client, encode_error(None, INVALID_REQUEST, f"frame longer than {MAX_FRAME_BYTES} bytes"))
+            return None
 
     def _is_concurrent_request(self, text: str) -> bool:
         try:
@@ -960,13 +1073,14 @@ class GatewayServer:
 
         try:
             result = await handler(self, params)
+            reply = encode_response(req_id, result)  # inside the try: a result that does not encode still answers
         except _InvalidParams as e:
             self._reply(client, encode_error(req_id, INVALID_PARAMS, str(e)))
         except Exception as e:  # noqa: BLE001 - one bad method must not kill the gateway
             logger.exception("method %s failed", method)
             self._reply(client, encode_error(req_id, INTERNAL_ERROR, f"{type(e).__name__}: {e}"))
         else:
-            self._reply(client, encode_response(req_id, result))
+            self._reply(client, reply)
 
     def _resolve_server_request(self, req_id: Any, obj: dict[str, Any]) -> None:
         self._open_requests.pop(str(req_id), None)
@@ -1081,6 +1195,13 @@ class GatewayServer:
     _chain_key: str | None = None
     _router_cfg: Any = None  # the config.providers object the cached providers/routers were built from
 
+    def reset_tier_routers(self) -> None:
+        """Rebuild the routers on next use, over the same providers (task tiers / router options changed live)."""
+        self._router_cache = {}
+        if self._router_cfg is not None:  # built here; a router injected from outside (tests) stays as is
+            self.router = None
+            self._tiers = None
+
     def tier_routers(self) -> TierRouters:
         """The per-tier routers (built with the main router; rebuilt when the model key changes)."""
         if self._tiers is None:
@@ -1124,7 +1245,9 @@ class GatewayServer:
                 },
             )
         elif event.kind == "router.exhausted":
-            self.emit("error", {"message": f"All providers failed: {event.detail}"})
+            # No error event here: the failed turn's message.complete reports it once, with the next step
+            # (error_surface). A walk that is retried after a pause or park must not leave a stale error behind.
+            self.emit("status.update", {"kind": "status", "text": f"all providers failed ({event.reason})"})
 
     #: Notification key shared by pause/park toasts so ``resumed`` can clear them.
     PAUSE_KEY = "k3.reliability.pause"
@@ -1189,14 +1312,22 @@ class GatewayServer:
                 result = await self._run_turn_locked(session, text)
                 # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
                 # halted: keep the queued prompts for after /daemon resume
-                while session.pending_prompts and result[0] not in ("interrupted", "halted"):
-                    result = await self._run_turn_locked(session, session.pending_prompts.pop(0))
+                while (pending := self._pending_prompts(session)) and result[0] not in ("interrupted", "halted"):
+                    result = await self._run_turn_locked(session, pending.pop(0))
                 return result
             finally:
                 session.goal_continuation = False
 
+    @staticmethod
+    def _pending_prompts(session: LiveSession) -> list[str]:
+        """Queued prompts, steering messages no loop took first (they were typed earlier)."""
+        if session.steer_queue:
+            session.pending_prompts[:0] = _take_all(session.steer_queue)
+        return session.pending_prompts
+
     async def _run_turn_locked(self, session: LiveSession, text: str) -> tuple[str, str]:
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
+        effort_mod.REASONING_EFFORT.set(session.reasoning_effort)  # /effort, read by the providers
         prompt = text
         mgr = self.goal_manager(session)
         session.goal_continuation = False  # the prompt the user sent is not a continuation
@@ -1311,6 +1442,7 @@ class GatewayServer:
             tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
+        loop.take_steer = lambda: _take_all(session.steer_queue)
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
@@ -1456,8 +1588,7 @@ class GatewayServer:
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)
-            session.last_exc = e
-            session.emit("error", {"message": str(e)})
+            session.last_exc = e  # message.complete carries it with error_surface; no separate error toast
         except BudgetExceeded as e:
             # The reliability event already told the client (error + needs_input).
             status = "needs_input"
@@ -1510,6 +1641,7 @@ class GatewayServer:
                 "usage": _usage_payload(usage),
                 "status": status,
                 "error": error,
+                "error_surface": _error_surface(session.last_exc) if status == "error" else None,
                 "state": session.state,
             },
         )
@@ -1580,18 +1712,18 @@ class GatewayServer:
             self.store.save(session.stored)
             session.emit("session.title", {"session_id": session.session_id, "title": title})
 
+    def _announce_tool(self, session: LiveSession, tc: ToolCall) -> None:
+        """tool.generating + tool.start and the usage row, once per call id."""
+        if tc.id in session.announced_tools:
+            return
+        session.announced_tools.add(tc.id)
+        session.emit("tool.generating", {"name": tc.name})
+        session.emit("tool.start", {"tool_id": tc.id, "name": tc.name, "args": tc.arguments})
+        self.usage.record("tool", session=session.session_id, detail=tc.name)
+
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
-            session.emit("tool.generating", {"name": event.tool_call.name})
-            session.emit(
-                "tool.start",
-                {
-                    "tool_id": event.tool_call.id,
-                    "name": event.tool_call.name,
-                    "args": event.tool_call.arguments,
-                },
-            )
-            self.usage.record("tool", session=session.session_id, detail=event.tool_call.name)
+            self._announce_tool(session, event.tool_call)
         elif event.type == "done" and event.message:
             msg = event.message
             if msg.role == "tool":
@@ -1622,6 +1754,10 @@ class GatewayServer:
                 )
                 if u:
                     session.emit("session.usage", {"usage": _usage_payload(u)})
+                # openai_compat and anthropic stream no tool_call events: their calls arrive on this message only
+                for tc in msg.tool_calls:
+                    self._announce_tool(session, tc)
+                session.announced_tools.clear()
 
     async def _approval_callback_for(self, session: LiveSession) -> Any:
         async def approve(tool_name: str, arguments: dict[str, Any], decision: Any = None) -> ApprovalResult:
@@ -2006,6 +2142,9 @@ class GatewayServer:
                 "message.complete", {"text": text, "usage": {}, "status": status, "error": None, "state": session.state}
             )
             session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+            # prompts typed while the job ran were queued: run them now, like _run_turn does after a turn
+            if status != "interrupted" and (pending := self._pending_prompts(session)):
+                await self._run_turn(session, pending.pop(0))
 
         session.turn_task = asyncio.get_running_loop().create_task(runner())
 
@@ -2101,6 +2240,7 @@ class GatewayServer:
         if session is None or session.turn_task is None or session.turn_task.done():
             return False
         session.pending_prompts.clear()  # /stop means stop: what was queued behind the turn does not run either
+        session.steer_queue.clear()
         session.loop.interrupt() if session.loop else None
         self.subagents.interrupt_session(session.session_id)
         self.learning.record("interrupt", session, subject=_running_tool(session), choice="stop")
@@ -2118,6 +2258,13 @@ class GatewayServer:
 
     def log(self, message: str) -> None:
         logger.info(message)
+
+
+def _take_all(queue: list[str]) -> list[str]:
+    """Empty ``queue`` in place and return what it held."""
+    taken = queue[:]
+    queue.clear()
+    return taken
 
 
 def _running_tool(session: Any) -> str:
@@ -2383,9 +2530,9 @@ async def _session_steer(server: GatewayServer, params: dict[str, Any]) -> dict[
     session = server.session
     if session is None or not session.streaming:
         return {"steered": False}
-    # M1: queue as a follow-up user message for the next turn.
-    session.stored.messages.append({"role": "user", "content": str(text)})
-    server.store.save(session.stored)
+    # The running loop adds it before its next model call. Appending to stored.messages lost it: the loop never saw
+    # it and the turn's persist overwrote the list.
+    session.steer_queue.append(str(text))
     return {"steered": True}
 
 
@@ -2445,8 +2592,10 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     if server.halted:
         raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
     server.last_user_activity = time.time()
-    if session.streaming:
-        session.pending_prompts.append(str(text))  # really queued: it runs when the current turn ends
+    if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
+        # really queued: it runs when the current turn ends. The task check covers a turn that has not reached
+        # `streaming = True` yet (compaction, MCP start): a second task there overwrote turn_task, so /stop missed one.
+        session.pending_prompts.append(str(text))
         return {"turn_id": "", "status": "queued"}
     if params.get("background"):
         session.background = True
@@ -2592,13 +2741,18 @@ async def _session_mode_set(server: GatewayServer, params: dict[str, Any]) -> di
 
 async def _config_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     key = str(_require(params, "key"))
-    if key == "full":
-        return {"config": redact(server.config.model_dump())}  # provider api_key never goes to clients
     if key == "mtime":
         return {"mtime": 0.0}
-    value: Any = server.config
+    if tui_display.handles(key):
+        return tui_display.get(server.config.display, key)
+    # Every key is looked up in the redacted JSON dump: provider api_key, mcp server env/headers never go to clients,
+    # and a section ("providers", "mcp.servers") is plain JSON. Before, a sub-key returned the pydantic object (the
+    # reply failed to encode and never came) or a secret unredacted ("mcp.servers.x.headers").
+    value: Any = redact(server.config.model_dump(mode="json"))
+    if key == "full":
+        return {"config": value}
     for part in key.split("."):
-        value = getattr(value, part, None) if not isinstance(value, dict) else value.get(part)
+        value = value.get(part) if isinstance(value, dict) else None
         if value is None:
             break
     return {"value": value}
@@ -2618,6 +2772,13 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         return {"ok": True, "key": key, "value": "on" if server.config.display.focus_mode else "off"}
     if key == "model":  # TUI /model <key> and the model picker: switch the session's model key
         return await _config_set_model(server, params)
+    if key == "reasoning":  # TUI /reasoning show|hide|<level>
+        return await _config_set_reasoning(server, params)
+    if tui_display.handles(key):  # TUI /theme /indicator /statusbar /battery /pet ...: saved to display.*
+        try:
+            return tui_display.set_(server.config.display, key, params.get("value"))
+        except tui_display.DisplayValueError as e:
+            raise _InvalidParams(f"{key}: {e}") from None
     if "." not in key:
         raise _InvalidParams(f"unsupported config key: {key}")
     section, field_name = key.split(".", 1)
@@ -2626,6 +2787,31 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         raise _InvalidParams(f"unknown config path: {key}")
     setattr(section_obj, field_name, params.get("value"))
     return {"ok": True, "key": key}
+
+
+async def _config_set_reasoning(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``config.set reasoning``: ``show``/``hide`` toggles the thinking display (saved); a level sets /effort."""
+    words = [w for w in str(params.get("value") or "").lower().split() if not w.startswith("--")]
+    value = words[0] if words else ""
+    if value in ("show", "on", "hide", "off"):
+        show = value in ("show", "on")
+        server.config.display.show_reasoning = show  # type: ignore[attr-defined]  # DisplayConfig allows extras
+        tui_display._persist("display.show_reasoning", show)
+        return {"ok": True, "key": "reasoning", "value": "show" if show else "hide"}
+    if not value:  # bare /reasoning: report the session's effort
+        session = server._session_for(params.get("session_id"))
+        return {"ok": True, "key": "reasoning", "value": (session and session.reasoning_effort) or "default"}
+    if value not in (*effort_mod.LEVELS, "default"):
+        raise _InvalidParams(f"reasoning: expected show, hide or one of {', '.join(effort_mod.LEVELS)}, default")
+    live = await _mode_session(server, params)
+    live.reasoning_effort = None if value == "default" else value
+    if live.reasoning_effort is None:
+        live.stored.meta.pop("reasoning_effort", None)
+    else:
+        live.stored.meta["reasoning_effort"] = live.reasoning_effort
+    server.store.save(live.stored)
+    live.emit("session.info", live.live_info())
+    return {"ok": True, "key": "reasoning", "value": value}
 
 
 async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

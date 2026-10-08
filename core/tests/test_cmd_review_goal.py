@@ -84,6 +84,25 @@ def test_parse_judge_response():
     assert parse_judge_response('{"verdict": "wat"}')[0] == "continue"
 
 
+async def test_goal_cleared_or_replaced_during_the_judge_is_not_resurrected():
+    """evaluate_after_turn saved its stale copy after the (possibly long) judge await: a /goal clear or pause the
+    user issued meanwhile was undone."""
+    box: dict = {}
+    mgr = GoalManager(lambda: box.get("s"), lambda s: box.__setitem__("s", s))
+
+    for meddle in (mgr.clear, mgr.pause, lambda: mgr.set("another goal")):
+        mgr.set("ship it")
+
+        async def judge(goal, response, meddle=meddle):
+            meddle()
+            return "continue", "keep going", False, False
+
+        d = await mgr.evaluate_after_turn("working", judge)
+        assert not d.should_continue and d.prompt is None
+        assert box["s"] is None or box["s"]["status"] == "paused" or box["s"]["goal"] == "another goal"
+        assert box["s"] is None or box["s"]["turns_used"] == 0
+
+
 # ── /goal ──
 
 

@@ -190,3 +190,32 @@ def test_launchers_are_never_offered_as_always_allow_rules():
         assert is_launcher(cmd)
     d = decide(mode="default", tool="bash", args={"command": "git commit -m x"}, cwd="/proj")
     assert [r.pattern for r in suggest_rules("bash", d)] == ["git commit *"]
+
+
+def test_builtin_allows_do_not_cover_combined_output_redirects():
+    def action(cmd):
+        return decide(mode="default", tool="bash", args={"command": cmd}, cwd="/proj").action
+
+    for cmd in ("ls &> ~/.bashrc", "ls &>> ~/.bashrc", "ls >& ~/.bashrc", "ls >&~/.bashrc", "ls 2>&1 >& out"):
+        assert action(cmd) == "ask", cmd
+    for cmd in ("ls &>/dev/null", "ls &>> /dev/null", "ls >& /dev/null", "ls 2>&1", "ls 2>&-"):
+        assert action(cmd) == "allow", cmd
+
+
+def test_auto_mode_denies_every_output_redirect_form_outside_the_roots():
+    def action(cmd):
+        return decide(mode="auto", tool="bash", args={"command": cmd}, cwd="/proj").action
+
+    for cmd in ("ls > /etc/x", "ls >> /etc/x", "ls &> /etc/x", "ls &>> /etc/x", "ls >& /etc/x"):
+        assert action(cmd) == "deny", cmd
+
+
+def test_builtin_git_allows_do_not_cover_lookalike_subcommands_or_external_programs():
+    def action(cmd):
+        return decide(mode="default", tool="bash", args={"command": cmd}, cwd="/proj").action
+
+    for cmd in ("git difftool -x 'touch pwned'", "git logx", "git statusx", "git log -p --ext-diff",
+                "git log -p --textconv"):
+        assert action(cmd) == "ask", cmd
+    for cmd in ("git diff", "git diff --stat", "git log", "git log --oneline -5", "git status", "git status -s"):
+        assert action(cmd) == "allow", cmd

@@ -10,6 +10,7 @@ from typing import Any
 import httpx
 
 from k3code.providers.base import Provider, ProviderError, request_headers, to_provider_error
+from k3code.providers.effort import anthropic_effort
 from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec, messages_to_anthropic
 
 _TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=15.0)
@@ -66,6 +67,8 @@ class AnthropicProvider(Provider):
             payload["system"] = system
         if temperature is not None:
             payload["temperature"] = temperature
+        if effort := anthropic_effort(model):
+            payload["output_config"] = {"effort": effort}
         if tools:
             payload["tools"] = [
                 {"name": t.name, "description": t.description, "input_schema": t.parameters} for t in tools

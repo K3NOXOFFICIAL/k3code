@@ -122,3 +122,42 @@ async def test_graceful_stop_finishes_while_a_client_is_attached(tmp_path, monke
     await asyncio.wait_for(server.stop_socket(), 10)
     assert (await asyncio.wait_for(peer.reader.read(), 5)) is not None  # EOF reached: the daemon hung up on us
     await server.close()
+
+
+async def test_a_frame_over_64_kib_is_read_and_an_over_limit_one_is_answered_not_fatal(tmp_path, monkeypatch):
+    """asyncio's default 64 KiB line limit made a pasted prompt raise out of the read loop: the client was cut."""
+    import k3code.gateway.server as gateway_server
+
+    monkeypatch.setattr(gateway_server, "MAX_FRAME_BYTES", 512 * 1024)
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    sock = tmp_path / "big.sock"
+    await server.start_socket(sock)
+    server._running = True
+    peer = await Peer.connect(sock)
+    await peer.frame()
+    big = await peer.send("no.such.method", {"pad": "x" * 200_000})
+    assert (await peer.until(lambda f: f.get("id") == big))["error"]
+    await peer.send("no.such.method", {"pad": "x" * 600_000})  # over the limit: an error frame, no hang-up
+    assert "longer than" in (await peer.until(lambda f: "error" in f and f.get("id") is None))["error"]["message"]
+    after = await peer.send("no.such.method", {})
+    assert (await peer.until(lambda f: f.get("id") == after))["error"]
+    await server.stop_socket()
+    await server.close()
+
+
+async def test_stdio_survives_an_over_limit_frame(tmp_path, monkeypatch):
+    import k3code.gateway.server as gateway_server
+
+    monkeypatch.setattr(gateway_server, "MAX_FRAME_BYTES", 1024)
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    stdin = asyncio.StreamReader(limit=1024)
+    server._stdin = stdin
+    server._running = True
+    stdin.feed_data(b'{"jsonrpc":"2.0","id":1,"method":"x","params":{"pad":"' + b"x" * 4096 + b'"}}\n')
+    stdin.feed_data(b'{"jsonrpc":"2.0","id":2,"method":"no.such.method","params":{}}\n')
+    stdin.feed_eof()
+    await asyncio.wait_for(server._serve_stdio(), 10)
+    frames = [json.loads(x) for x in server._frames]
+    assert any("longer than" in json.dumps(f) for f in frames)
+    assert any(f.get("id") == 2 for f in frames)  # the loop kept reading after the over-long frame
+    await server.close()

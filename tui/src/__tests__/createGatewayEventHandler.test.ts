@@ -1570,7 +1570,7 @@ describe('createGatewayEventHandler', () => {
     expect(title).not.toMatch(/^Error(?: code)?:/)
     expect(title).toMatch(/API key/)
     expect(details).toMatch(/^Details: .*Incorrect API key provided/)
-    expect(assistant[0]!.text).toContain('/model')
+    expect(assistant[0]!.text).toContain('k3code onboard')
     expect(assistant[0]!.text).toContain('/retry')
   })
 

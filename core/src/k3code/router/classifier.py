@@ -457,11 +457,24 @@ def _by_transport(c: _Ctx) -> FailoverReason | None:
         return _R.network
     if any(p in msg for p in _SERVER_DISCONNECT_PATTERNS) and not c.status_code:
         return _R.server
-    if c.error_type in _TIMEOUT_ERROR_TYPES or isinstance(c.error, TimeoutError):
+    # A provider wraps the transport error (ProviderError("ReadTimeout") from httpx.ReadTimeout): look at the
+    # whole cause chain, not only the outer type, or every dropped connection classified as unknown.
+    chain = _cause_chain(c.error)
+    if any(type(e).__name__ in _TIMEOUT_ERROR_TYPES or isinstance(e, TimeoutError) for e in chain):
         return _R.timeout
-    if c.error_type in _NETWORK_ERROR_TYPES or isinstance(c.error, (ConnectionError, OSError)):
+    if any(type(e).__name__ in _NETWORK_ERROR_TYPES or isinstance(e, (ConnectionError, OSError)) for e in chain):
         return _R.network
     return None
+
+
+def _cause_chain(error: BaseException, limit: int = 8) -> list[BaseException]:
+    """``error`` and its ``__cause__`` ancestors (bounded, cycle-safe)."""
+    out: list[BaseException] = []
+    cur: BaseException | None = error
+    while cur is not None and len(out) < limit and all(cur is not e for e in out):
+        out.append(cur)
+        cur = cur.__cause__
+    return out
 
 
 _STAGES = (_by_status, _by_error_code, _by_message, _by_transport)

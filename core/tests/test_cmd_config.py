@@ -76,6 +76,39 @@ async def test_rpc_config_get_full_redacts_api_keys(tmp_path, monkeypatch):
     await server.close()
 
 
+async def test_rpc_config_get_sections_are_json_and_redacted(tmp_path, monkeypatch):
+    from k3code.config import McpServerConfig
+
+    server, _ = make_server(tmp_path, monkeypatch)
+    server.config.providers[0].api_key = "sk-SECRETSECRETSECRET123456"
+    server.config.mcp.servers["x"] = McpServerConfig(
+        url="https://mcp.example", headers={"X-Team": "abc-plain"}, env={"PLAIN": "value"}
+    )
+    providers = (await rpc(server, "config.get", {"key": "providers"}))["result"]["value"]
+    assert providers[0]["api_key"] == "<redacted>" and providers[0]["api_key_env"] == "NOPE"
+    servers = (await rpc(server, "config.get", {"key": "mcp.servers"}))["result"]["value"]
+    assert servers["x"]["url"] == "https://mcp.example" and servers["x"]["headers"]["X-Team"] == "<redacted>"
+    assert (await rpc(server, "config.get", {"key": "mcp.servers.x.headers"}))["result"]["value"] == {
+        "X-Team": "<redacted>"
+    }
+    assert (await rpc(server, "config.get", {"key": "mcp.servers.x.env.PLAIN"}))["result"]["value"] == "<redacted>"
+    assert (await rpc(server, "config.get", {"key": "no.such.key"}))["result"]["value"] is None
+    await server.close()
+
+
+async def test_a_result_that_does_not_encode_still_gets_an_error_reply(tmp_path, monkeypatch):
+    from k3code.gateway import server as gateway_server
+
+    async def bad(server, params):
+        return {"value": object()}
+
+    monkeypatch.setitem(gateway_server._HANDLERS, "test.bad", bad)
+    server, _ = make_server(tmp_path, monkeypatch)
+    res = await rpc(server, "test.bad")
+    assert res["error"]["message"].startswith("TypeError")
+    await server.close()
+
+
 async def test_settings_view(tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, monkeypatch)
     sid = await new_session(server, tmp_path)

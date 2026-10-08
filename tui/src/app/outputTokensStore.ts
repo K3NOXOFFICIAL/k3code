@@ -6,6 +6,13 @@ import { atom } from 'nanostores'
  *  takes a per-turn delta from it. */
 export const $sessionOutputTokens = atom(0)
 
+/** The session total when the current turn started. Kept outside the working
+ *  line, which unmounts while an approval or other overlay is open, so the
+ *  per-turn count survives a remount. */
+export const $turnTokenBaseline = atom(0)
+
+export const markTurnStart = () => $turnTokenBaseline.set($sessionOutputTokens.get())
+
 export const addOutputTokens = (count: number) => {
   if (Number.isFinite(count) && count > 0) {
     $sessionOutputTokens.set($sessionOutputTokens.get() + count)

@@ -227,8 +227,8 @@ export const shouldFallbackToDispatch = (err: unknown): boolean => {
 // ── Turn failures (message.complete status=error) ─────────────────────────
 
 const TURN_CODE_COPY: Record<string, [string, string]> = {
-  auth: ['The model provider rejected the API key', 'Fix the key with /model, then /retry.'],
-  auth_permanent: ['The model provider rejected the API key', 'Fix the key with /model, then /retry.'],
+  auth: ['The model provider rejected the API key', 'Set a new key with `k3code onboard`, then /retry.'],
+  auth_permanent: ['The model provider rejected the API key', 'Set a new key with `k3code onboard`, then /retry.'],
   billing: ['The model provider reports no credit left', 'Top up the account or switch with /model.'],
   billing_unverified: ['The model provider reports no credit left', 'Top up the account or switch with /model.'],
   content_policy_blocked: ['The model provider refused this request (content policy)', 'Rephrase and send again.'],

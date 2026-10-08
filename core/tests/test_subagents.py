@@ -165,6 +165,17 @@ async def test_worktree_outside_git_repo_shares_cwd(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
 async def test_child_of_a_foreground_default_mode_parent_runs_bash_sandboxed(tmp_path, monkeypatch):
+    from k3code.subagents import runner
+
+    built = []
+    real_build = runner.SubagentManager.build_loop
+
+    def spy(self, *args, **kwargs):  # a finished child drops its loop (its history): keep a reference to check it
+        loop = real_build(self, *args, **kwargs)
+        built.append(loop)
+        return loop
+
+    monkeypatch.setattr(runner.SubagentManager, "build_loop", spy)
     steps = [task_call("CHILD-S run a shell command"), final("ok"), {"type": "text", "match": "CHILD-S", "text": "s"}]
     server = make(tmp_path, monkeypatch, steps, mode="default", **NO_GATE)
     (tmp_path / "proj").mkdir()  # the k3code home lives under tmp_path: a project must not contain it
@@ -172,20 +183,42 @@ async def test_child_of_a_foreground_default_mode_parent_runs_bash_sandboxed(tmp
     await run_turn(server, "PARENT: delegate it")
     assert not server.session.background and server.session.perms.mode == PermissionMode.DEFAULT
     assert server.session.loop._sandbox_argv() is None  # the parent's own foreground bash is unchanged
-    (h,) = server.subagents.handles.values()
-    assert h.loop.unattended  # a sub-agent never has a human watching it
-    assert h.loop._sandbox_argv()[0] == sandbox.bwrap_path()
+    assert len(server.subagents.handles) == 1
+    (child,) = built
+    assert child.unattended  # a sub-agent never has a human watching it
+    assert child._sandbox_argv()[0] == sandbox.bwrap_path()
 
 
 async def test_children_get_own_reliability_and_do_not_share_parents(tmp_path, monkeypatch):
     steps = [task_call("CHILD-R go"), final("ok"), {"type": "text", "match": "CHILD-R", "text": "r"}]
+    from k3code.subagents import runner
+
+    built = []
+    real = runner.child_reliability
+    monkeypatch.setattr(runner, "child_reliability", lambda *a: built.append(real(*a)) or built[-1])
     server = make(tmp_path, monkeypatch, steps, **NO_GATE)
     await start(server, tmp_path)
     await run_turn(server, "PARENT")
     (h,) = server.subagents.handles.values()
-    assert h.loop.reliability is not server.session.reliability
-    assert h.loop.reliability.netwatch is None  # no probe per child
+    (rel,) = built
+    assert rel is not server.session.reliability
+    assert rel.netwatch is None  # no probe per child
     assert models_called(server)  # sanity
+    assert h.done and h.loop is None and h.task is None  # a finished child keeps no loop (history) or task
+
+
+async def test_finished_handles_are_evicted_beyond_the_cap(monkeypatch):
+    """self.handles was never pruned: every child of the daemon's life stayed, with its loop and history."""
+    from k3code.subagents import runner
+
+    monkeypatch.setattr(runner, "KEEP_FINISHED_HANDLES", 2)
+    mgr = runner.SubagentManager(server=None)
+    for i in range(5):
+        h = runner.Handle(id=f"h{i}", description="", agent_type="worker", tier="main", depth=1, parent_sid="s",
+                          status="completed" if i != 1 else "running", finished_at=float(i))
+        mgr.handles[h.id] = h
+    mgr._prune()
+    assert sorted(mgr.handles) == ["h1", "h3", "h4"]  # running ones stay; the newest finished are kept
 
 
 def test_agent_type_files_and_override(tmp_path, monkeypatch):

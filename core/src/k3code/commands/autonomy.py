@@ -87,6 +87,8 @@ class PreviewCommand(CommandDef):
             return _msg("No active session.")
         if not arg:
             return _msg("Usage: /preview <task>")
+        if getattr(live, "streaming", False):  # the running turn's persist would overwrite the transcript rows
+            return _msg("A turn is running in this session; /preview when it ends (or /stop it).")
         timeout = float(autonomy_cfg(ctx.config)["preview_timeout"])
         try:
             text = await preview_mod.preview(ctx.model_caller, arg, session_id=live.session_id, timeout=timeout)
@@ -137,6 +139,11 @@ class AdvisorCommand(CommandDef):
         if arg.strip() == "accept":
             if not live.pending_advisor:
                 return _msg("No advisor review waiting; run /advisor first.")
+            if getattr(live, "streaming", False):
+                # mid-turn the loop owns the transcript (its persist overwrites stored rows): steer it in instead
+                live.steer_queue.append(f"Advisor review:\n{live.pending_advisor}")
+                live.pending_advisor = ""
+                return _msg("Advisor review added to the running turn.")
             live.messages = [*live.messages, {"role": "user", "content": f"Advisor review:\n{live.pending_advisor}"}]
             ctx.store.save(live.stored)
             live.pending_advisor = ""

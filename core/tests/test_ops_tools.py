@@ -41,7 +41,6 @@ async def test_doctor_json_shape(tmp_path, monkeypatch):
     names = {c["name"] for c in data["checks"]}
     for want in (
         "provider:p1",
-        "omniroute-bypass",
         "api-keys",
         "netwatch",
         "disk",
@@ -59,6 +58,17 @@ async def test_doctor_json_shape(tmp_path, monkeypatch):
     assert all(c["status"] in ("ok", "warn", "fail") and {"detail", "fix"} <= set(c) for c in data["checks"])
     assert sum(data["summary"].values()) == len(data["checks"])
     assert "sk-should-never-appear-123" not in doctor.to_json(checks)
+    assert "omniroute-bypass" not in names  # only shown when the chain has an OmniRoute entry
+
+
+async def test_doctor_fails_a_rejected_key(tmp_path, monkeypatch):
+    from k3code.setup import probe as setup_probe
+
+    monkeypatch.setenv("K3_TEST_KEY", "sk-bad")
+    monkeypatch.setattr(setup_probe, "list_models", lambda entry, key, timeout=8.0: (False, 12.0, [], "HTTP 401"))
+    checks = await doctor.check_providers(_config(_entry()), probe=True)
+    prov = next(c for c in checks if c.name == "provider:p1")
+    assert prov.status == doctor.FAIL and "rejected" in prov.detail and "k3code onboard" in prov.fix
 
 
 async def test_doctor_omniroute_bypass_and_missing_key(tmp_path, monkeypatch):
@@ -181,6 +191,28 @@ def test_bwrap_argv_policy(tmp_path):
     assert f"--ro-bind {home}/.local/share/uv {home}/.local/share/uv" in joined
     assert f"--bind {proj.resolve()} {proj.resolve()}" in joined and f"--bind {extra.resolve()}" in joined
     assert argv.index("--tmpfs") < argv.index(f"{proj.resolve()}")  # project is bound after the home tmpfs
+
+
+def test_bwrap_never_rebinds_home_and_masks_secrets(tmp_path, monkeypatch):
+    """cwd = $HOME (or /) was bound read-write after the home tmpfs: unattended bash saw ~/.config/k3code/env and
+    ~/.ssh. Such a root is refused (fail closed); a project inside $HOME is bound, and the secrets are masked after
+    every bind."""
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    home = tmp_path / "home"
+    (home / ".config/k3code").mkdir(parents=True)
+    (home / ".ssh").mkdir()
+    for cwd in (home, "/"):
+        with pytest.raises(sandbox.SandboxRefused):
+            sandbox.build_argv(cwd, [home / ".config"], home=home, bwrap="/usr/bin/bwrap")
+    argv = sandbox.build_argv(home / "proj", [home / ".config"], home=home, bwrap="/usr/bin/bwrap")
+    joined = " ".join(argv)
+    assert f"--bind {home} " not in joined
+    assert f"--bind {home}/.config {home}/.config" in joined  # a dir inside $HOME is still bound …
+    last_bind = max(i for i, a in enumerate(argv) if a == "--bind")
+    for secret in (home / ".config/k3code", home / ".ssh"):  # … but the secrets are masked after every bind
+        assert argv.index(str(secret)) > last_bind and argv[argv.index(str(secret)) - 1] == "--tmpfs"
+    assert sandbox.exposes_home(home, home) and sandbox.exposes_home("/", home)
+    assert not sandbox.exposes_home(home / "proj", home)
 
 
 def test_sandbox_policy_by_mode():

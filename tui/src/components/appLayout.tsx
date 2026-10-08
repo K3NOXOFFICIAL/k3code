@@ -344,7 +344,13 @@ const ComposerPane = memo(function ComposerPane({
         {!nativeMode && composer.input === '?' && !composer.inputBuf.length && <HelpHint t={ui.theme} />}
 
         {!isBlocked && (
-          <WorkingLine busy={ui.busy} effort={ui.info?.reasoning_effort} startedAt={status.turnStartedAt} t={ui.theme} />
+          <WorkingLine
+            ascii={ui.indicatorStyle === 'ascii'}
+            busy={ui.busy}
+            effort={ui.info?.reasoning_effort}
+            startedAt={status.turnStartedAt}
+            t={ui.theme}
+          />
         )}
 
         {!isBlocked && (
@@ -456,6 +462,7 @@ const StatusRulePane = memo(function StatusRulePane({
   status
 }: Pick<AppLayoutProps, 'composer' | 'status'> & { at: 'bottom' | 'top'; nativeMode: boolean }) {
   const ui = useStore($uiState)
+  const isBlocked = useStore($isBlocked)
 
   if (ui.statusBar === 'off' || (nativeMode ? at !== 'top' : ui.statusBar !== at)) {
     return null
@@ -490,6 +497,7 @@ const StatusRulePane = memo(function StatusRulePane({
         t={ui.theme}
         turnStartedAt={status.turnStartedAt}
         usage={ui.usage}
+        workingLineVisible={!isBlocked}
       />
     </Box>
   )

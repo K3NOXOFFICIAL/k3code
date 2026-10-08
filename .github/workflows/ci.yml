@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main, "w/**"]
+    branches: [Main, main, "w/**"]
   pull_request:
 
 jobs:
@@ -56,6 +56,12 @@ jobs:
         run: npm run build:ink
       - working-directory: tui
         run: npm run build
+      - name: typecheck
+        working-directory: tui
+        run: npm run typecheck
+      - name: eslint
+        working-directory: tui
+        run: npm run lint
       - name: vitest (known failures excluded)
         working-directory: tui
         # known-failing upstream tests go in .ci-test-excludes (one vitest --exclude glob per line)
@@ -77,7 +83,12 @@ jobs:
       - working-directory: panes
         run: go build ./cmd/k3
       - working-directory: panes
-        run: go test ./internal/k3keys/...
+        run: go vet ./internal/k3keys/... ./internal/harness/... ./cmd/k3/
+      - working-directory: panes
+        run: go test -race ./internal/k3keys/... ./internal/harness/...
+      - name: upstream packages the k3 hooks touch
+        working-directory: panes
+        run: go test ./internal/input/ ./internal/app/
 
   vendor_check:
     runs-on: ubuntu-latest

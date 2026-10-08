@@ -10,12 +10,17 @@ import {
   nextPetPhase,
   PET_COLUMN_WIDTH,
   PET_DONE_HOLD_MS,
+  PET_IDLE_BLINK_EVERY_MS,
+  PET_IDLE_BLINK_MS,
   PET_TICK_MS,
   type PetPhase,
   petColumnWidth,
   petLines
 } from '../lib/terminalPet.js'
 import type { Theme } from '../theme.js'
+
+/** Every pet's idle frames end with its blink pose. */
+const IDLE_BLINK_FRAME = -1
 
 /** Corner column for the pet. Hidden when `/pet off` or the terminal is narrow. */
 export function PetCorner({ busy, cols, t }: { busy: boolean; cols: number; t: Theme }) {
@@ -80,8 +85,7 @@ export function TerminalPet({
     return () => clearTimeout(id)
   }, [phase])
 
-  // Animate only while the pet is doing something. Idle is a still pose (frame 0), so an
-  // idle pet arms no timer and repaints nothing.
+  // Animate only while the pet is doing something; idle only blinks (below).
   const animating = !reduced && phase !== 'idle'
 
   useEffect(() => {
@@ -94,11 +98,38 @@ export function TerminalPet({
     return () => clearInterval(id)
   }, [animating])
 
+  // Idle is a still pose that blinks now and then: one slow timer, no per-frame repaints.
+  const [blink, setBlink] = useState(false)
+  const idleBlinks = !reduced && phase === 'idle'
+
+  useEffect(() => {
+    if (!idleBlinks) {
+      return
+    }
+
+    let open: ReturnType<typeof setTimeout> | undefined
+
+    const id = setInterval(() => {
+      setBlink(true)
+      open = setTimeout(() => setBlink(false), PET_IDLE_BLINK_MS)
+    }, PET_IDLE_BLINK_EVERY_MS)
+
+    return () => {
+      clearInterval(id)
+
+      if (open !== undefined) {
+        clearTimeout(open)
+      }
+
+      setBlink(false)
+    }
+  }, [idleBlinks])
+
   const color = phase === 'needs_input' ? t.color.warn : phase === 'done' ? t.color.accent : t.color.muted
 
   return (
     <Box flexDirection="column">
-      {petLines(name, phase, phase === 'idle' ? 0 : tick, reduced).map((line, i) => (
+      {petLines(name, phase, phase === 'idle' ? (blink ? IDLE_BLINK_FRAME : 0) : tick, reduced).map((line, i) => (
         <Text color={color} key={i}>
           {line}
         </Text>

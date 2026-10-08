@@ -119,6 +119,13 @@ def test_version_ordering() -> None:
     assert k("v1.0.0") == k("1.0.0")
 
 
+def test_prerelease_identifiers_compare_numerically() -> None:
+    assert upd.is_newer("1.0.0-dev.10", "1.0.0-dev.9")  # compared as strings, "10" < "9"
+    k = upd.version_key
+    assert k("1.0.0-alpha") < k("1.0.0-alpha.1") < k("1.0.0-alpha.beta") < k("1.0.0-beta") < k("1.0.0-beta.2")
+    assert k("1.0.0-beta.2") < k("1.0.0-beta.11") < k("1.0.0-rc.1") < k("1.0.0")
+
+
 # ── regressions from the long-run audit ──
 
 

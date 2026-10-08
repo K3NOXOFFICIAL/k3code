@@ -2,7 +2,7 @@ import { compactNumber } from '@k3code/shared/format'
 
 import { introMsg, toTranscriptMessages } from '../../../domain/messages.js'
 import { sessionScopedModelArg, TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
-import { parsePetCommand } from '../../../lib/terminalPet.js'
+import { parsePetCommand, PET_MIN_COLS } from '../../../lib/terminalPet.js'
 import type {
   BackgroundStartResponse,
   ConfigGetValueResponse,
@@ -15,7 +15,7 @@ import type { PanelSection } from '../../../types.js'
 import { applyConfiguredTuiTheme } from '../../createGatewayEventHandler.js'
 import { DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES, type IndicatorStyle } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
-import { $petEnabled, $petName, setPetEnabled, setPetName } from '../../petStore.js'
+import { $petEnabled, $petName, petConfigValue, setPetEnabled, setPetName } from '../../petStore.js'
 import { patchUiState } from '../../uiStore.js'
 import type { SlashCommand } from '../types.js'
 
@@ -339,6 +339,7 @@ export const sessionCommands: SlashCommand[] = [
     name: 'pet',
     usage: '/pet [on|off|toggle|status|random|<name>]',
     run: (arg, ctx) => {
+      const word = arg.trim().toLowerCase()
       const result = parsePetCommand(arg, { enabled: $petEnabled.get(), name: $petName.get() })
 
       if (result.enabled !== undefined) {
@@ -349,7 +350,16 @@ export const sessionCommands: SlashCommand[] = [
         setPetName(result.name)
       }
 
-      ctx.transcript.sys(result.message)
+      if (result.enabled !== undefined || result.name !== undefined) {
+        // Pin the species only when the user named one; `random` re-rolls on every launch.
+        const value = petConfigValue($petEnabled.get(), word === result.name ? result.name : null)
+
+        ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'pet', value }).catch(() => {})
+      }
+
+      const narrow = $petEnabled.get() && (process.stdout.columns ?? 0) < PET_MIN_COLS
+
+      ctx.transcript.sys(narrow ? `${result.message} (shown at ${PET_MIN_COLS}+ columns)` : result.message)
     }
   },
 
@@ -401,7 +411,7 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: 'inspect or set reasoning effort (updates live agent)',
+    help: 'show or hide reasoning, or set effort [show|hide|low|medium|high|xhigh|max|default]',
     name: 'reasoning',
     run: (arg, ctx) => {
       if (!arg) {

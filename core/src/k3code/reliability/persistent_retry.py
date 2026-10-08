@@ -45,6 +45,8 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_REASONS = frozenset({"rate_limit", "quota"})
 #: ChainExhausted reasons that are transient: an unattended run parks on them instead of failing its turn.
 UNATTENDED_PARK_REASONS = frozenset({"server", "timeout", "network", "unknown"})
+#: ChainExhausted reasons that waiting cannot fix.
+PERMANENT_REASONS = frozenset({"auth", "bad_request"})
 
 
 class TurnCancelled(K3CodeError):
@@ -207,6 +209,10 @@ class PersistentRetry:
         return True
 
     async def _handle_exhausted(self, exc: ChainExhausted, deadline: float | None) -> bool:
+        if exc.last_reason in PERMANENT_REASONS:
+            # A rejected key or an unknown model does not fix itself: the cooldown the router armed would only
+            # make the user wait for the same error. Fail now with the reason.
+            return False
         if exc.retry_after is not None:  # every entry is cooling down: park until the earliest reset
             # Network-caused cooldowns end when connectivity returns; rate-limit/quota ones only at their reset.
             cooldowns = getattr(self.router, "cooldowns", None)

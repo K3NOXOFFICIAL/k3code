@@ -25,7 +25,7 @@ k3code (CLI entry)
 
 1. **`resolvePython()`** (line ~180) — Determines the Python interpreter:
    ```typescript
-   const configured = process.env.HERMES_PYTHON?.trim()
+   const configured = process.env.K3CODE_PYTHON?.trim()
    if (configured) return configured
    return process.platform === 'win32' ? 'python' : 'python3'
    ```
@@ -39,7 +39,7 @@ k3code (CLI entry)
 
 4. **`resolveGatewayAttachUrl()`** (line ~160) — Checks for attach mode:
    ```typescript
-   const raw = process.env.HERMES_TUI_GATEWAY_URL?.trim()
+   const raw = process.env.K3CODE_TUI_GATEWAY_URL?.trim()
    return raw ? raw : null
    ```
 
@@ -60,7 +60,7 @@ this.startSpawnedGateway(root)           // Stdio spawn mode (DEFAULT)
 
 ## For k3code: Stdio Mode (Default)
 
-The TUI **defaults to spawning the gateway** when `HERMES_TUI_GATEWAY_URL` is not set.
+The TUI **defaults to spawning the gateway** when `K3CODE_TUI_GATEWAY_URL` is not set.
 
 ### What k3code Needs to Do
 
@@ -81,20 +81,20 @@ The TUI **defaults to spawning the gateway** when `HERMES_TUI_GATEWAY_URL` is no
      stdio: ['inherit', 'inherit', 'inherit', 'ipc'], // or pipe for control
      env: {
        ...process.env,
-       HERMES_PYTHON: '/path/to/k3code-gateway-python',  // Optional: explicit python
-       HERMES_CWD: process.cwd(),                         // Working dir for gateway
-       HERMES_PYTHON_SRC_ROOT: '/path/to/k3code/core',   // Python source root
-       // DO NOT SET: HERMES_TUI_GATEWAY_URL (leave unset for stdio mode)
+       K3CODE_PYTHON: '/path/to/k3code-gateway-python',  // Optional: explicit python
+       K3CODE_CWD: process.cwd(),                         // Working dir for gateway
+       K3CODE_PYTHON_SRC_ROOT: '/path/to/k3code/core',   // Python source root
+       // DO NOT SET: K3CODE_TUI_GATEWAY_URL (leave unset for stdio mode)
      }
    })
    
    // 2. The TUI will spawn: python -m tui_gateway.entry
-   //    You need to ensure the gateway module is importable from HERMES_PYTHON_SRC_ROOT
+   //    You need to ensure the gateway module is importable from K3CODE_PYTHON_SRC_ROOT
    ```
 
 3. **Gateway Module Structure Expected by TUI:**
    ```
-   HERMES_PYTHON_SRC_ROOT/
+   K3CODE_PYTHON_SRC_ROOT/
    └── tui_gateway/
        ├── entry.py          # <-- spawned as `python -m tui_gateway.entry`
        ├── server.py         # JSON-RPC handlers
@@ -114,7 +114,7 @@ When `k3code-host` is running, the CLI can attach the TUI to it:
 k3code host start  # Listens on ws://127.0.0.1:PORT
 
 # Terminal 2: Attach TUI
-HERMES_TUI_GATEWAY_URL=ws://127.0.0.1:PORT k3code-tui
+K3CODE_TUI_GATEWAY_URL=ws://127.0.0.1:PORT k3code-tui
 ```
 
 The TUI will connect via WebSocket instead of spawning a child.
@@ -152,13 +152,14 @@ The TUI expects the gateway to implement these **33 methods** and emit **24 even
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `HERMES_TUI_GATEWAY_URL` | No | (unset) | WebSocket URL to attach to existing gateway. If unset, TUI spawns gateway. |
-| `HERMES_TUI_SIDECAR_URL` | No | (unset) | WebSocket URL to mirror events to (dashboard). |
-| `HERMES_PYTHON` | No | `python3` / `python` | Python interpreter for spawned gateway. |
-| `HERMES_CWD` | No | `process.cwd()` | Working directory for gateway process. |
-| `HERMES_PYTHON_SRC_ROOT` | **Yes** (for spawn) | `import.meta.dirname + '/../../'` | Root where `tui_gateway` package is importable. |
-| `HERMES_TUI_STARTUP_TIMEOUT_MS` | No | `15000` | Max wait for `gateway.ready`. |
-| `HERMES_TUI_RPC_TIMEOUT_MS` | No | `120000` | RPC request timeout. |
+| `K3CODE_TUI_GATEWAY_URL` | No | (unset) | WebSocket URL to attach to existing gateway. If unset, TUI spawns gateway. |
+| `K3CODE_GATEWAY_CMD` | No | (unset) | Full command for the spawned gateway (shell-style quoting), e.g. `python -m k3code.cli gateway --stdio`. Overrides `K3CODE_PYTHON`. |
+| `K3CODE_TUI_SIDECAR_URL` | No | (unset) | WebSocket URL to mirror events to (dashboard). |
+| `K3CODE_PYTHON` | No | `python3` / `python` | Python interpreter for spawned gateway. |
+| `K3CODE_CWD` | No | `process.cwd()` | Working directory for gateway process. |
+| `K3CODE_PYTHON_SRC_ROOT` | **Yes** (for spawn) | `import.meta.dirname + '/../../'` | Root where `tui_gateway` package is importable. |
+| `K3CODE_TUI_STARTUP_TIMEOUT_MS` | No | `15000` | Max wait for `gateway.ready`. |
+| `K3CODE_TUI_RPC_TIMEOUT_MS` | No | `120000` | RPC request timeout. |
 | `HERMES_VOICE` | No | `0` | Set to `1` to enable voice features. |
 
 ---
@@ -195,7 +196,7 @@ for line in sys.stdin:
 PYEOF
 
 # 3. Run TUI against mock
-HERMES_PYTHON=python3 HERMES_PYTHON_SRC_ROOT=/tmp node dist/entry.js
+K3CODE_PYTHON=python3 K3CODE_PYTHON_SRC_ROOT=/tmp node dist/entry.js
 ```
 
 ---

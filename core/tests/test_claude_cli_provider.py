@@ -237,6 +237,33 @@ async def test_timeout_kills_the_process(shim: Path, monkeypatch: pytest.MonkeyP
     await p.aclose()
 
 
+async def test_cancel_kills_and_reaps_the_process(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """On cancel the process group was killed but never waited for: a zombie and its pipes were left behind."""
+    import asyncio
+
+    procs = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spy(*a, **kw):
+        procs.append(await real_exec(*a, **kw))
+        return procs[-1]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    monkeypatch.setenv("SHIM_MODE", "sleep")
+    p = ClaudeCliProvider(name="cc", command=str(shim), timeout=30)
+    task = asyncio.create_task(_collect(p, [Message(role="user", content="x")]))
+    for _ in range(100):
+        if procs:
+            break
+        await asyncio.sleep(0.02)
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert procs and procs[0].returncode is not None  # killed and reaped before the cancel propagated
+    await p.aclose()
+
+
 def test_config_and_factory_accept_claude_cli() -> None:
     entry = ProviderEntry(name="cc", kind="claude-cli", models={"default": "claude-sonnet-5-5"})
     assert entry.base_url == "" and entry.api_key_env == ""

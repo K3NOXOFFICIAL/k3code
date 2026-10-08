@@ -282,6 +282,35 @@ async def test_gateway_attach_bridge_pumps_stdio_to_the_socket(running_daemon):
         await asyncio.wait_for(proc.wait(), 10)
 
 
+async def test_readonly_attach_outside_a_pane_still_refuses_changes(running_daemon):
+    """The read-only filter lived in PaneLink only: outside a k3 pane stdin went to the daemon unfiltered."""
+    import sys
+
+    home, _server = running_daemon
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TUIOS_")}
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "k3code.cli", "gateway", "--attach", "--readonly",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env={**env, "K3CODE_GATEWAY_SOCKET": str(daemon.socket_path(home))},
+    )
+    try:
+        proc.stdin.write(b'{"jsonrpc":"2.0","id":8,"method":"session.delete","params":{"session_id":"x"}}\n')
+        proc.stdin.write(b'{"jsonrpc":"2.0","id":9,"method":"session.list","params":{}}\n')
+        await proc.stdin.drain()
+        got: dict = {}
+        while 9 not in got:
+            frame = json.loads(await asyncio.wait_for(proc.stdout.readline(), 15))
+            if frame.get("id") in (8, 9):
+                got[frame["id"]] = frame
+        assert got[8]["error"]["message"] == "this pane is read-only"
+        assert "sessions" in got[9]["result"]  # reads still go through
+    finally:
+        proc.stdin.close()
+        await asyncio.wait_for(proc.wait(), 10)
+
+
 async def test_gateway_attach_without_daemon_fails_clearly(tmp_path):
     import sys
 

@@ -15,6 +15,7 @@ model-controlled and runs with hooks and fsmonitor disabled (see :func:`harness_
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -26,6 +27,8 @@ from pathlib import Path
 
 from k3code import paths
 from k3code.permissions import PermissionMode
+
+logger = logging.getLogger(__name__)
 
 #: ``$HOME`` entries that stay visible inside the sandbox (rw cache, ro uv-managed pythons).
 HOME_CACHE = ".cache"
@@ -50,6 +53,10 @@ class SandboxRefused(RuntimeError):
 
 class SandboxUnavailable(SandboxRefused):
     """bwrap cannot create the sandbox here. Unattended work is refused, never run unsandboxed."""
+
+
+#: ``$HOME`` entries masked again after the project binds (a project bind can re-expose them: credentials, keys).
+HOME_SECRETS = (".config/k3code", ".ssh")
 
 
 def bwrap_path() -> str | None:
@@ -148,6 +155,12 @@ def _git_metadata(root: Path) -> list[Path]:
     return [p for p in found if p.exists()]
 
 
+def exposes_home(path: Path | str, home: Path | None = None) -> bool:
+    """True when binding ``path`` would bring back all of ``$HOME``: it is ``$HOME`` or contains it (``/``)."""
+    home = Path(home or Path.home()).resolve()
+    return home.is_relative_to(Path(path).resolve())
+
+
 def build_argv(
     cwd: Path | str,
     add_dirs: Iterable[Path | str] = (),
@@ -157,6 +170,9 @@ def build_argv(
     network: bool = True,
 ) -> list[str]:
     """The ``bwrap`` argv *prefix*; append the command (e.g. ``/bin/sh -c "..."``).
+
+    A project dir that is ``$HOME`` or contains it (``/``) is not bound: that would undo the home tmpfs and hand the
+    command ``~/.config/k3code/env`` and ``~/.ssh``. Those two are masked again after the binds in any case.
 
     Raises :class:`SandboxRefused` when the cwd or an added dir is ``$HOME``, a directory above it, or a directory
     above ``~/.ssh`` or the k3code home.
@@ -202,10 +218,19 @@ def build_argv(
         p = str(root)
         if p not in seen and os.path.isdir(p):
             seen.add(p)
+            if exposes_home(p, home):
+                logger.warning("sandbox: not binding %s (it would expose $HOME)", p)
+                continue
             argv += ["--bind", p, p]
             # git metadata is read-only: a sandboxed command cannot write a hook or change core.* config
             for meta in _git_metadata(root):
                 argv += ["--ro-bind", str(meta), str(meta)]
+    # $HOME secrets are masked again after the project binds: a bind above them would re-expose them
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    secrets = [home / s for s in HOME_SECRETS] + ([Path(xdg) / "k3code"] if xdg else [])
+    for path in dict.fromkeys(str(p) for p in secrets):
+        if os.path.isdir(path):
+            argv += ["--tmpfs", path]
     argv += ["--chdir", str(roots[0])]
     return argv
 

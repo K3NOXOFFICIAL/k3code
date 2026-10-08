@@ -93,7 +93,10 @@ class ToolJournal:
         *,
         raw_args: bool = True,
     ) -> float:
-        """Append + fsync an ``intent`` record before the tool runs."""
+        """Append + fsync an ``intent`` record before the tool runs.
+
+        Raw args are kept only for side-effect-free tools (re-run verbatim on resume). A side-effect tool is never
+        re-run, only reported INTERRUPTED, so its args (file contents, commands with tokens) stay out of the file."""
         h = args_digest(args)
         rec = {
             "type": "intent",
@@ -104,7 +107,7 @@ class ToolJournal:
             "side_effect": side_effect,
             "ts": time.time(),
         }
-        if raw_args:
+        if raw_args and not side_effect:
             # Store args for pure tools so they can be re-run verbatim on resume.
             rec["args"] = args
         self._append(rec)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -220,7 +221,7 @@ def repo_summary(cwd: Path, *, max_files: int = 5000) -> str:
         from k3code.reliability.sandbox import child_env, harness_git_argv
 
         out = subprocess.run(harness_git_argv("status", "--porcelain"), cwd=cwd, capture_output=True, text=True,
-                             timeout=5, env=child_env())
+                             timeout=5, env=child_env(), stdin=subprocess.DEVNULL)
         git = f"{len(out.stdout.splitlines())} changed files" if out.returncode == 0 else "not a git repo"
     except (OSError, subprocess.SubprocessError):
         git = "git unavailable"
@@ -238,9 +239,10 @@ def classifier_messages(prompt: str, summary: str, recent: str) -> list[Message]
 async def classify(caller: Any, prompt: str, cwd: Path, recent: str = "", session_id: str = "") -> ScopeVerdict:
     """Classify with the ``classification`` tier; classifier failure falls back to a heuristic ``small``."""
     try:
+        summary = await asyncio.to_thread(repo_summary, cwd)  # os.walk + git status: off the event loop
         res = await caller.complete(
             TaskKind.CLASSIFICATION,
-            classifier_messages(prompt, repo_summary(cwd), recent),
+            classifier_messages(prompt, summary, recent),
             session_id=session_id,
             max_tokens=400,
             timeout=20,
@@ -276,4 +278,12 @@ class ScopeLog:
     def read(self) -> list[dict[str, Any]]:
         if not self.path.is_file():
             return []
-        return [json.loads(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        out = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line) if line.strip() else None
+            except ValueError:
+                continue  # a torn or corrupt line must not break every read
+            if isinstance(rec, dict):
+                out.append(rec)
+        return out

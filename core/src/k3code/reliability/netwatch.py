@@ -271,7 +271,8 @@ class NetWatch:
         self._tasks: list[asyncio.Task[None]] = []
         self._interval = self.config.base_interval
         self._last_nm_verdict: str = "unknown"
-        self._wakeup: asyncio.Event | None = None
+        self._wakeup: asyncio.Event | None = None  # kicks the monitor loop
+        self._nm_wakeup: asyncio.Event | None = None  # the NM poll loop's own (stop only): a shared one lost kicks
 
     # ── public API ──
 
@@ -329,14 +330,17 @@ class NetWatch:
         self._running = True
         if self._wakeup is None:
             self._wakeup = asyncio.Event()
+        if self._nm_wakeup is None:
+            self._nm_wakeup = asyncio.Event()
         # Immediate initial probe (synchronous, but fast).
         self._tasks.append(asyncio.create_task(self._monitor_loop()))
         self._tasks.append(asyncio.create_task(self._nm_watch_loop()))
 
     async def stop(self) -> None:
         self._running = False
-        if self._wakeup:
-            self._wakeup.set()
+        for ev in (self._wakeup, self._nm_wakeup):
+            if ev:
+                ev.set()
         for t in self._tasks:
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -379,23 +383,22 @@ class NetWatch:
 
     async def _nm_watch_loop(self) -> None:
         """Poll nmcli for NetworkManager state changes; re-probe immediately on change."""
-        assert self._wakeup is not None
+        assert self._nm_wakeup is not None
         while self._running:
             try:
                 state = await self._probes.nm_state()
                 verdict = _nm_verdict(state)
                 if verdict != self._last_nm_verdict:
-                    changed_from_ok = self._last_nm_verdict == "ok"
                     self._last_nm_verdict = verdict
-                    if verdict in ("bad", "portal") or (changed_from_ok and verdict != "unknown"):
+                    if verdict != "unknown":  # bad→ok (network back) as much as ok→bad
                         self._kick()  # immediate re-probe
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
                 logger.debug("NetWatch NM watch error: %s", e)
             try:
-                await asyncio.wait_for(self._wakeup.wait(), timeout=self.config.nm_poll_interval)
-                self._wakeup.clear()
+                await asyncio.wait_for(self._nm_wakeup.wait(), timeout=self.config.nm_poll_interval)
+                self._nm_wakeup.clear()
             except TimeoutError:
                 pass
 

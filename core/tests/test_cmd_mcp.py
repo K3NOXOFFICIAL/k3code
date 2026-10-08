@@ -171,3 +171,18 @@ async def test_ensure_started_is_single_flight():
         assert len([r for r in mgr._runners.values() if r.task and not r.task.done()]) == 1
     finally:
         await mgr.close()
+
+
+async def test_an_inflight_call_returns_when_the_server_is_reloaded():
+    """A reload (or config change / transport error) cancelled the in-flight _call tasks without resolving their
+    futures: McpManager.call() awaited forever and the turn hung."""
+    mgr = McpManager({"fake": fake_cfg()})
+    try:
+        await mgr.ensure_started()
+        slow = asyncio.create_task(mgr.call("mcp__fake__sleep", {"seconds": 30.0}))
+        await asyncio.sleep(0.3)
+        await mgr.reload()
+        res = await asyncio.wait_for(slow, 5)
+        assert "error" in res and "stopped" in res["error"]
+    finally:
+        await mgr.close()

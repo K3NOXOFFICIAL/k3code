@@ -226,7 +226,7 @@ async def attach_bridge(sock: Path | None = None, *, readonly: bool = False) -> 
     """
     import sys
 
-    from k3code.integrations.panes import PaneLink
+    from k3code.integrations.panes import PaneLink, readonly_verdict
 
     sock = sock or socket_path()
     try:
@@ -254,15 +254,23 @@ async def attach_bridge(sock: Path | None = None, *, readonly: bool = False) -> 
     if link is not None:
         link.reporter.report("idle")
 
+    def filter_line(text: str) -> str | None:
+        if link is not None:
+            return link.on_client_line(text)
+        try:  # read-only outside a k3 pane: the same filter (before, stdin was forwarded raw there)
+            return readonly_verdict(json.loads(text))
+        except ValueError:
+            return None
+
     async def up() -> None:
-        if link is None:
+        if link is None and not readonly:
             while chunk := await stdin.read(65536):
                 writer.write(chunk)
                 await writer.drain()
         else:
             while raw := await stdin.readline():
                 text = raw.decode("utf-8", errors="replace").strip()
-                verdict = link.on_client_line(text) if text else None
+                verdict = filter_line(text) if text else None
                 if verdict is not None:  # read-only pane: answer it ourselves, never forward
                     if verdict:
                         emit(verdict)
@@ -346,7 +354,7 @@ async def slash_via_daemon(command: str, *, cwd: str, sock: Path | None = None, 
     Uses a throwaway session when ``session_id`` is not given. Answers any ``clarify`` request with its first choice.
     """
     sock = sock or socket_path()
-    reader, writer = await asyncio.open_unix_connection(str(sock))
+    reader, writer = await asyncio.open_unix_connection(str(sock), limit=1 << 26)  # a long output is one line
     pending: dict[int, asyncio.Future[dict]] = {}
     seq = 0
 

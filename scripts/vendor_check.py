@@ -48,13 +48,13 @@ def check_vendor() -> int:
 
         # Verify sha256 if provided
         sha256 = entry.get("sha256_upstream")
-        if sha256:
+        # A file marked modified = true is expected to differ from its upstream hash.
+        if sha256 and not entry.get("modified", False):
             actual = hashlib.sha256(local_path.read_bytes()).hexdigest()
             if actual != sha256:
-                print(f"WARN: [{i}] SHA256 mismatch for {local_path}")
+                print(f"WARN: [{i}] SHA256 mismatch for {local_path} (not marked modified)")
                 print(f"  expected: {sha256}")
                 print(f"  actual:   {actual}")
-                # Not an error since upstream may have been modified
 
         print(f"OK: [{i}] {project}@{commit[:8]} {upstream_path} -> {local_path} ({license_})")
 

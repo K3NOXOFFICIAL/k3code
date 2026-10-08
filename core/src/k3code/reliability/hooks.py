@@ -50,7 +50,7 @@ class ReliabilitySettings:
     enabled: bool = True
     flags: ReliabilityFlags = field(default_factory=ReliabilityFlags)
     max_wait: float | None = None  # persistent-retry total wait bound; None = forever
-    max_park_seconds: float = 600.0  # park ladder cap mirror (informational; RetryConfig owns it)
+    max_park_seconds: float = 600.0  # park ladder cap (RetryConfig.park_max)
     # Optional session budget caps, enforced from router usage reports.
     session_tokens: int | None = None
     session_usd: float | None = None
@@ -78,6 +78,7 @@ class Reliability:
         home: Path | None = None,
         cancel_token: CancelToken | None = None,
         max_wait: float | None = None,
+        max_park_seconds: float | None = None,
         netwatch_config: dict[str, Any] | None = None,
     ) -> None:
         self.flags = flags or ReliabilityFlags()
@@ -87,6 +88,8 @@ class Reliability:
         self.cancel_token = cancel_token or CancelToken()
         self.netwatch = NetWatch(NetWatchConfig(**(netwatch_config or {}))) if self.flags.netwatch else None
         self.retry_config = RetryConfig(max_wait=max_wait)
+        if max_park_seconds is not None:  # reliability.max_park_seconds used to be read and then dropped
+            self.retry_config.park_max = float(max_park_seconds)
         self.governor = (
             Governor(GovernorConfig(), events=self.events, day_ledger=DAY_LEDGER) if self.flags.budget_guard else None
         )
@@ -120,6 +123,7 @@ class Reliability:
             session=session,
             home=home,
             max_wait=settings.max_wait if settings else None,
+            max_park_seconds=settings.max_park_seconds if settings else None,
             netwatch_config=settings.netwatch if settings else None,
         )
         if settings and r.governor is not None:

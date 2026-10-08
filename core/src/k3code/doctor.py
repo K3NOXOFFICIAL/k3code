@@ -58,6 +58,22 @@ async def _probe_provider(base_url: str, timeout: float = 5.0) -> tuple[bool, fl
     return status < 500, ms, f"HTTP {status}"  # unauthenticated: 401/403 still means "reachable"
 
 
+async def _probe_key(p: Any) -> tuple[bool, float | None, str]:
+    """With a key: list the provider's models, so a rejected key fails here instead of on the first turn."""
+    from k3code.setup import probe as setup_probe
+
+    entry = {"kind": p.kind, "base_url": p.base_url}
+    key = p.api_key or os.environ.get(p.api_key_env, "")
+    ok, ms, _ids, detail = await asyncio.to_thread(setup_probe.list_models, entry, key, 8.0)
+    if ok:
+        return True, ms, detail
+    if detail in ("HTTP 401", "HTTP 403"):
+        return False, ms, f"{detail}: the API key ({p.api_key_env}) was rejected"
+    if detail.startswith("HTTP 4"):  # reachable, but no models endpoint at this path: fall back to reachability
+        return await _probe_provider(p.base_url)
+    return False, ms, detail
+
+
 async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     checks: list[Check] = []
     if not config.providers:
@@ -65,7 +81,14 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     results: list[tuple[bool, float | None, str]] = []
     if probe:
         results = await asyncio.gather(
-            *(_probe_provider(p.base_url) if p.kind != "claude-cli" else _noop_probe() for p in config.providers)
+            *(
+                _noop_probe()
+                if p.kind == "claude-cli"
+                else _probe_key(p)
+                if p.api_key or (p.api_key_env and os.environ.get(p.api_key_env))
+                else _probe_provider(p.base_url)
+                for p in config.providers
+            )
         )
     for i, p in enumerate(config.providers):
         if p.kind == "claude-cli":  # local binary, nothing to reach over HTTP
@@ -94,11 +117,17 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
                 f"provider:{p.name}",
                 status,
                 detail,
-                "" if ok else f"check the network and {p.base_url}",
+                ""
+                if ok
+                else "set a new key with `k3code onboard`"
+                if "rejected" in detail
+                else f"check the network and {p.base_url}",
                 {"base_url": p.base_url, "latency_ms": None if ms is None else round(ms, 1)},
             )
         )
     direct = [p.name for p in config.providers if not _is_omniroute(p.name, p.base_url)]
+    if len(direct) == len(config.providers):  # no OmniRoute in the chain: nothing to say
+        return checks
     if direct:
         checks.append(Check("omniroute-bypass", OK, f"direct entries: {', '.join(direct)}"))
     else:
@@ -179,11 +208,10 @@ def check_psi() -> Check:
 async def check_daemon(sock: Path | None = None) -> Check:
     sock = sock or socket_path()
     if not sock.exists():
-        return Check(
-            "daemon", WARN, f"not running (no socket at {sock})", "k3code daemon  (or: k3code service install)"
-        )
+        # Optional: the TUI starts its own gateway. The daemon only matters for /bg, cron and attach across terminals.
+        return Check("daemon", OK, "not running (optional; `k3code daemon` keeps background work going)")
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(sock)), 3)
+        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(sock), limit=1 << 26), 3)
     except (OSError, TimeoutError) as e:
         return Check(
             "daemon", FAIL, f"socket exists but refuses connections: {e}", f"remove {sock} and restart the daemon"
