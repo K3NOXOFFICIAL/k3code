@@ -77,6 +77,28 @@ async def test_a_prompt_before_the_turn_streams_is_queued_not_a_second_task(tmp_
     assert users == ["first", "second"]
 
 
+async def test_prompts_queued_behind_a_job_run_when_it_ends(tmp_path, monkeypatch):
+    """/ultraplan etc. run through start_job; prompts typed meanwhile were queued and never run."""
+    server, provider = gated_server(tmp_path, monkeypatch, ["answer"])
+    provider.gate.set()
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    live = server.session
+    release = asyncio.Event()
+
+    async def job() -> str:
+        await release.wait()
+        return "plan ready"
+
+    server.start_job(live, "/ultraplan x", job)
+    await asyncio.sleep(0.05)
+    assert (await call(server, "prompt.submit", {"text": "after the job"}))["status"] == "queued"
+    release.set()
+    await asyncio.wait_for(live.turn_task, 20)
+    rows = [(m["role"], m["content"]) for m in live.stored.messages]
+    assert rows[-2:] == [("user", "after the job"), ("assistant", "answer")]
+    assert live.pending_prompts == []
+
+
 async def test_transcript_edits_are_refused_or_steered_mid_turn(tmp_path, monkeypatch):
     """/clear, /compact and /advisor accept rewrote stored.messages while the turn's persist overwrote them."""
     server, _ = gated_server(tmp_path, monkeypatch, [])

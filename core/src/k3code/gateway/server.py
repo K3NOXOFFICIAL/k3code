@@ -1749,6 +1749,9 @@ class GatewayServer:
                 "message.complete", {"text": text, "usage": {}, "status": status, "error": None, "state": session.state}
             )
             session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+            # prompts typed while the job ran were queued: run them now, like _run_turn does after a turn
+            if status != "interrupted" and (pending := self._pending_prompts(session)):
+                await self._run_turn(session, pending.pop(0))
 
         session.turn_task = asyncio.get_running_loop().create_task(runner())
 
