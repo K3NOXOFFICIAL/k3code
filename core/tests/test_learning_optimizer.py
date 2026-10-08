@@ -342,3 +342,14 @@ def test_a_replayed_candidate_that_fails_the_gate_becomes_a_proposal_for_a_human
     (p,) = optimizer.propose_replayed([cand], store)
     assert p.kind == "optimizer" and p.payload["overlay"]["patch"] == {"context": {"tool_output_chars": 6000}}
     assert optimizer.propose_replayed([cand], store) == []  # dedup: a dismissed or pending candidate stays put
+
+
+def test_a_main_tier_kind_without_escalations_is_proposed_one_tier_down(tmp_path):
+    m = optimizer.collect(tiered(0, 12, 0, 300, 0, kind="title"), DecisionLog(tmp_path), [], since=0)
+    down = [c for c in optimizer.suggest(m, Settings()) if c["patch"] == {"task_tiers": {"title": "cheap"}}]
+    assert len(down) == 1 and down[0]["evidence"]["main_calls"] == 12
+    # the user's own work is never moved down, and an escalated kind is not
+    mine = optimizer.collect(tiered(0, 12, 0, 300, 0, kind="interactive_turn"), DecisionLog(tmp_path), [], since=0)
+    assert not [c for c in optimizer.suggest(mine, Settings()) if "cheap" in str(c["patch"])]
+    esc = optimizer.collect(tiered(0, 12, 0, 300, 2, kind="title"), DecisionLog(tmp_path), [], since=0)
+    assert not [c for c in optimizer.suggest(esc, Settings()) if "cheap" in str(c["patch"])]

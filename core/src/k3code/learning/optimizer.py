@@ -20,6 +20,9 @@ ROLLBACK_MARGIN = 0.02
 #: "interrupted" (the user stopped it) and "needs_input" (a budget or loop guard paused it) say nothing about
 #: correctness, so they are not judged.
 VERIFIED_OUTCOMES = ("done", "error")
+#: Kinds never moved down a tier by the optimizer (the user's own work), and the calls a kind needs first.
+TIER_DOWN_EXCLUDED = frozenset({"interactive_turn", "subagent", "plan", "review", "advisor"})
+TIER_DOWN_MIN_CALLS = 10
 #: Cost term: a change must buy this many quality points (as a fraction: 0.005 = half a point) per percent of extra
 #: tokens. +1 point for +30% tokens is rejected (0.01 < 0.15); +10 points for +5% tokens is kept (0.10 >= 0.025).
 COST_WEIGHT = 0.5
@@ -219,6 +222,17 @@ def suggest(m: dict[str, Any], config: Any) -> list[dict[str, Any]]:
                         "patch": {"autonomy": {"gate_modes": ["auto", "default"]}},
                         "evidence": {"scope_accuracy": m["scope_accuracy"], "judged": m["scope_judged"],
                                      "quality_gain": round(gain, 3), "token_increase_pct": round(cost_pct, 1)}})
+    # a task kind that ran on the main tier without a single escalation can run one tier down (a human accepts it: a
+    # lower tier saves cost, not tokens, so the replay gate never applies it automatically)
+    for kind, cells in sorted((m.get("kind_tier") or {}).items()):
+        main = cells.get("main")
+        if kind in TIER_DOWN_EXCLUDED or not main or m["escalated_kinds"].get(kind):
+            continue
+        if main["calls"] < TIER_DOWN_MIN_CALLS:
+            continue
+        out.append({"title": f"Run {kind} on the cheap tier ({main['calls']} main-tier calls, no escalation)",
+                    "patch": {"task_tiers": {kind: "cheap"}},
+                    "evidence": {"kind": kind, "main_calls": main["calls"], "escalations": 0}})
     if m["waits_per_session"] >= 3:
         cur_wait = float((getattr(config, "router", None) or {}).get("max_inline_wait", 20))
         out.append({"title": f"Raise router.max_inline_wait {cur_wait:g}s → {cur_wait * 2:g}s "
