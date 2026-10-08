@@ -4,7 +4,7 @@
 
 k3code plans before it acts, can run several agents in parallel, retries through dropped connections and provider outages, and sends cheap background work to cheaper models. It has a Python core, a terminal UI (TypeScript, Ink) and an optional multi-window terminal (`k3`, a fork of TUIOS). It works with OpenAI-compatible and Anthropic providers, and with a local Claude Code login.
 
-> **Status: alpha, version 0.0.1 (unreleased).** The core is built and its test suite passes, and most exit criteria have scripted evidence. Live-model behaviour, the 72-hour daemon soak and multi-day use are not verified yet. Read [Safety](#safety) before you add a provider key or let it run unattended, and [Status](#status) for what has been tested.
+> **Status: alpha, version 0.1.0 (not tagged).** The core is built and its test suite passes, and most exit criteria have scripted evidence. Live-model behaviour, the 72-hour daemon soak and multi-day use are not verified yet. Read [Safety](#safety) before you add a provider key or let it run unattended, and [Status](#status) for what has been tested.
 > The repository is private for now. Install with the command in [Install](#install): it uses the latest `v*` tag, or `Main` until a tag exists. There is no tagged release yet.
 
 ---
@@ -341,7 +341,7 @@ python3 scripts/vendor_check.py
 
 ## Status
 
-**Alpha, version 0.0.1 (unreleased).** This is the first version meant for people other than its author. Expect rough edges, and expect the config format and some commands to change.
+**Alpha, version 0.1.0 (not tagged).** This is the first version meant for people other than its author. Expect rough edges, and expect the config format and some commands to change.
 
 As of 2026-10-08, 51 exit-criteria checks have been run: 46 pass, none fail, and 5 are pending. The pending rows need a live model, a person or days of real use. The table with the evidence behind every row is [`docs/reports/exit-status.md`](docs/reports/exit-status.md). The core test suite passes.
 
