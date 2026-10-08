@@ -147,7 +147,17 @@ async def _run_headless(
             sys.stdout.write(text)
             sys.stdout.flush()
 
+    async def on_text_reset() -> None:
+        # a retry after partial output streams the answer again: the result keeps one copy, the terminal a line break
+        nonlocal final_text
+        final_text = ""
+        if not json_output:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            sys.stderr.write("[k3code] the reply was cut off; retrying (the partial text above is discarded)\n")
+
     loop.on_text_delta = on_text_delta
+    loop.on_text_reset = on_text_reset
 
     try:
         await reliability.start()
@@ -268,7 +278,13 @@ async def _run_repl(
             sys.stdout.write(text)
             sys.stdout.flush()
 
+        async def on_text_reset() -> None:
+            nonlocal final_text
+            final_text = ""
+            print("\n[retrying: the partial reply above was discarded]")
+
         loop.on_text_delta = on_text_delta
+        loop.on_text_reset = on_text_reset
 
         try:
             async for _ in loop.run(user_input, max_tokens=config.max_tokens, temperature=config.temperature):
@@ -401,7 +417,7 @@ def main(
     else:
         if model and (err := _use_model_key(config, model)):
             raise click.ClickException(err)
-        _launch_tui(model=model)
+        _launch_tui(model=model, permission_mode=permission_mode if permission else None, project_dir=project_dir)
 
 
 def _is_interactive() -> bool:
@@ -446,8 +462,20 @@ def _run_gateway() -> None:
         asyncio.run(_serve())
 
 
-def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = None, require: bool = False) -> None:
-    """Spawn the built TUI (tui/dist/entry.js) with this process as its gateway."""
+def _launch_tui(
+    *,
+    model: str | None = None,
+    permission_mode: PermissionMode | None = None,
+    project_dir: Path | None = None,
+    env_extra: dict[str, str] | None = None,
+    require: bool = False,
+) -> None:
+    """Spawn the built TUI (tui/dist/entry.js) with this process as its gateway.
+
+    ``permission_mode`` (the --permission flag) and ``project_dir`` (--config-dir, else the cwd: the directory whose
+    project config the user was asked to trust) reach the spawned gateway through K3CODE_PERMISSION_MODE and
+    K3CODE_PROJECT_DIR.
+    """
     from k3code.paths import find_node
 
     node = find_node()
@@ -462,12 +490,13 @@ def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = 
 
         from k3code.config import load_config
 
-        config = load_config(project_dir=Path.cwd())
+        config = load_config(project_dir=project_dir or Path.cwd())
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(
                 _run_repl(
                     model=model,
-                    permission_mode=_permission_from_config("permission_mode", config.permission_mode),
+                    permission_mode=permission_mode
+                    or _permission_from_config("permission_mode", config.permission_mode),
                     config=config,
                 )
             )
@@ -480,17 +509,20 @@ def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = 
     env.setdefault("K3CODE_LOG_LEVEL", "INFO")
     if model:
         env["K3CODE_DEFAULT_MODEL"] = model  # load_config maps it to default_model in the spawned gateway
+    if permission_mode is not None:
+        env["K3CODE_PERMISSION_MODE"] = permission_mode.value  # flag > config in the gateway's load_config
+    if project_dir is not None:
+        env["K3CODE_PROJECT_DIR"] = str(project_dir.resolve())  # config.default_project_dir() in the gateway
     logger.info("launching TUI: %s %s", node, entry)
     result = subprocess.run([node, str(entry)], env=env, check=False)
     sys.exit(result.returncode)
 
 
 def _find_repo_root() -> Path | None:
-    """Walk up from cwd for a tui/dist/entry.js (works from the repo or installed)."""
-    from k3code.paths import data_dir
+    """The k3code root holding tui/dist/entry.js: our own source tree or install, never the cwd (see install_roots)."""
+    from k3code.paths import install_roots
 
-    here = Path(__file__).resolve()
-    for candidate in (Path.cwd(), *here.parents, data_dir() / "current"):
+    for candidate in install_roots():
         if (candidate / "tui" / "dist" / "entry.js").is_file():
             return candidate
     return None

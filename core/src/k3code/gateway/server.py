@@ -43,7 +43,7 @@ from k3code.autonomy.ultra import Ultra
 from k3code.blockers import BlockerStore
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
-from k3code.config import Settings, load_config
+from k3code.config import Settings, default_project_dir, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
 from k3code.gateway import tui_display
@@ -430,9 +430,9 @@ class GatewayServer:
         config: Settings | None = None,
         store: SessionStore | None = None,
     ) -> None:
-        self.config = config or load_config(project_dir=Path.cwd())
+        self.config = config or load_config(project_dir=default_project_dir())
         #: config keys the files held at the last read (apply_file_config resets the ones that have since gone)
-        self._file_keys: set[str] = _file_keys(Path.cwd())
+        self._file_keys: set[str] = _file_keys(default_project_dir())
         self.store = store or SessionStore(self._home() / "sessions.db")
         self._stdin = stdin
         self._stdout = stdout
@@ -1906,7 +1906,7 @@ class GatewayServer:
         Keys present in a file are replaced by the file's value. A key that was in a file at the previous read and is
         gone now (removed by hand or rolled back by an experiment) is reset to its fresh value, not left as it was.
         """
-        base = Path(cwd) if cwd else Path.cwd()
+        base = Path(cwd) if cwd else default_project_dir()
         fresh = load_config(project_dir=base)
         keys = _file_keys(base)
         changed = (keys | self._file_keys) & set(Settings.model_fields)
