@@ -1,5 +1,6 @@
+import { afterAll, describe, expect, it, vi } from 'vitest'
+
 import { colorize } from '@k3code/ink'
-import { describe, expect, it } from 'vitest'
 
 import {
   canFastAppendShape,
@@ -9,6 +10,47 @@ import {
   hintCursorCell,
   supportsFastEchoTerminal
 } from '../components/textInput.js'
+
+// chalk fixes its colour level when it is first imported, and Ink's colorize.ts
+// adjusts that level from TERM / TERM_PROGRAM / TMUX at import time too. So the
+// colour environment is cleared here, before the imports above load: vitest
+// runs vi.hoisted above the static imports. The values are put back in
+// afterAll. The assertions in this file therefore see chalk level 0 whatever
+// the shell exports.
+const colorEnv = vi.hoisted(() => {
+  const keys = [
+    'CI',
+    'COLORTERM',
+    'FORCE_COLOR',
+    'HERMES_TUI_TRUECOLOR',
+    'K3CODE_TUI_TRUECOLOR',
+    'NO_COLOR',
+    'TERM',
+    'TERM_PROGRAM',
+    'TERM_PROGRAM_VERSION',
+    'TMUX'
+  ]
+  const saved: Record<string, string | undefined> = {}
+
+  for (const key of keys) {
+    saved[key] = process.env[key]
+    delete process.env[key]
+  }
+
+  return { keys, saved }
+})
+
+afterAll(() => {
+  for (const key of colorEnv.keys) {
+    const value = colorEnv.saved[key]
+
+    if (value === undefined) {
+      delete process.env[key]
+    } else {
+      process.env[key] = value
+    }
+  }
+})
 
 // The fast-echo path bypasses Ink and writes characters directly to stdout
 // for the common case of typing plain English at the end of the line. These
