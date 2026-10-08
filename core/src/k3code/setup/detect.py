@@ -25,8 +25,24 @@ def _git(key: str) -> str:
     return r.stdout.strip()
 
 
-def detect() -> dict[str, Any]:
+def sandbox_state(probe: bool = True) -> str:
+    """``usable``, ``unusable`` (bwrap present but blocked), ``missing``, or ``unknown`` (not probed or the probe
+    failed). Never raises: the setup wizard must not fail on a sandbox probe."""
+    try:
+        from k3code.reliability import sandbox
+
+        if sandbox.bwrap_path() is None:
+            return "missing"
+        if not probe:
+            return "unknown"
+        return "usable" if sandbox.usable() else "unusable"
+    except Exception:  # noqa: BLE001 - reported as unknown, the wizard goes on
+        return "unknown"
+
+
+def detect(probe: bool = True) -> dict[str, Any]:
     return {
+        "sandbox": sandbox_state(probe),
         "os": f"{platform.system()} {platform.machine()}",
         "shell": Path(os.environ.get("SHELL", "")).name,
         "terminal": os.environ.get("TERM_PROGRAM") or os.environ.get("TERM", ""),

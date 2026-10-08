@@ -341,6 +341,56 @@ def check_isolation() -> Check:
     return Check("hermes-isolation", OK, "no Hermes env; k3code reads only its own config and environment")
 
 
+def check_browser() -> Check:
+    """The optional browser tool: Playwright importable and Chromium where presetup puts it (local probe only)."""
+    import importlib.util
+
+    from k3code.paths import data_dir
+
+    has_playwright = importlib.util.find_spec("playwright") is not None
+    location = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or data_dir() / "browsers")
+    has_chromium = location.is_dir() and any(location.glob("chromium*"))
+    if has_playwright and has_chromium:
+        return Check("browser", OK, f"Playwright and Chromium at {location}", data={"path": str(location)})
+    if has_playwright or has_chromium:
+        missing = "Chromium" if has_playwright else "Playwright"
+        return Check(
+            "browser", WARN, f"{missing} is missing; the browser tool is off", "re-run the installer without --minimal"
+        )
+    return Check(
+        "browser",
+        WARN,
+        "not installed (optional: the browser tool needs Playwright and Chromium)",
+        "re-run the installer without --minimal, or set K3CODE_SKIP_CHROMIUM only if you do not want it",
+    )
+
+
+def check_searxng() -> Check:
+    """Web search through a SearXNG instance: the research setting, the legacy top-level key, or an MCP server."""
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    raw = confio.read_yaml(user_config_path())
+    url = str(((raw.get("research") or {}).get("searxng_url")) or ((raw.get("searxng") or {}).get("url")) or "")
+    if url:
+        return Check("searxng", OK, f"SearXNG at {url}", data={"url": url})
+    servers = (raw.get("mcp") or {}).get("servers") or {}
+    if any("searxng" in str(name).lower() for name in servers):
+        return Check("searxng", OK, "a SearXNG MCP server is configured")
+    return Check("searxng", OK, "not configured (optional: set research.searxng_url or connect a SearXNG MCP server)")
+
+
+def install_subset(home: Path | None = None) -> list[Check]:
+    """What the installer prints after activation. Warnings only: no check here can fail an install.
+
+    Providers, the daemon and the network probes are left out (a fresh install has none of them yet), and the
+    sandbox is reported by the installer's own presetup step.
+    """
+    home = home or k3_home()
+    checks = [check_home(home), check_disk(home), check_tui(), check_browser(), check_searxng()]
+    return [Check(c.name, WARN if c.status == FAIL else c.status, c.detail, c.fix, c.data) for c in checks]
+
+
 async def run_checks(config: Settings | None = None, *, probe: bool = True, home: Path | None = None) -> list[Check]:
     home = home or k3_home()
     config = config or load_config(project_dir=Path.cwd())
