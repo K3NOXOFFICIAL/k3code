@@ -1599,6 +1599,11 @@ class GatewayServer:
                 loop.on_text_delta = on_text_delta
                 loop.on_text_reset = on_text_reset
                 session.loop = loop
+            if session.needs_input:
+                # The loop guard stopped the turn (the escalation above clears the flag when a higher tier takes
+                # over). Ending it 'done' let an active goal judge it and continue into the same loop, and reported a
+                # /loop tick as completed.
+                status = "needs_input"
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)
