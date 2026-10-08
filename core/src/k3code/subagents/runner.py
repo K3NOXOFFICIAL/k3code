@@ -345,7 +345,7 @@ class SubagentManager:
         loop = AgentLoop(
             router, system_prompt=system, max_turns=server.config.max_turns, headless=False,
             on_event=server._on_router_event, cwd=cwd, permissions=perms, reliability=reliability,
-            session=h.id, background=parent.background, task_kind=TaskKind.SUBAGENT.value,
+            session=h.id, background=parent.background, unattended=True, task_kind=TaskKind.SUBAGENT.value,
             approval_callback=getattr(parent, "_approval_cb", None),
         )
         from k3code.extratools import register_skill_tool

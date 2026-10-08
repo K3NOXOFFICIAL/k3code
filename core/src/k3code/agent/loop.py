@@ -64,6 +64,7 @@ class AgentLoop:
         on_auto_allow: AutoAllowCallback | None = None,
         permissions: PermissionState | None = None,
         background: bool = False,
+        unattended: bool = False,
         task_kind: str = "interactive_turn",
         max_tool_errors: int = 0,
     ) -> None:
@@ -84,6 +85,8 @@ class AgentLoop:
         self.headless = headless
         #: Background/cron/loop sessions run bash sandboxed (like auto/yolo mode).
         self.background = background
+        #: No human is watching this run (goal continuation, sub-agent): bash is sandboxed whatever the mode.
+        self.unattended = unattended
         self._sandbox_warned = False
         self.on_event = on_event
         self.on_text_delta = on_text_delta
@@ -338,7 +341,7 @@ class AgentLoop:
 
     def _sandbox_argv(self) -> list[str] | None:
         """bwrap prefix for bash in auto/yolo/background sessions; None = run unsandboxed."""
-        if not sandbox.should_sandbox(self.permissions.mode, self.background):
+        if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return None
         if not sandbox.usable():
             if not self._sandbox_warned:

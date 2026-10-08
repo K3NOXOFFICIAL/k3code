@@ -158,6 +158,11 @@ async def test_debug_command_toggles_and_dumps(tmp_path, monkeypatch):
 # ── sandbox ──
 
 
+def test_unattended_sessions_are_sandboxed_in_any_mode():
+    assert sandbox.should_sandbox(PermissionMode.DEFAULT, False, unattended=True)  # e.g. goal continuation, sub-agent
+    assert not sandbox.should_sandbox(PermissionMode.DEFAULT, False, unattended=False)
+
+
 def test_bwrap_argv_policy(tmp_path):
     home = tmp_path / "home"
     (home / ".cache").mkdir(parents=True)
@@ -430,3 +435,17 @@ def test_mcp_stdio_children_get_the_scrubbed_env(monkeypatch):
     env = mcpclient.stdio_env({"MY_SERVER_SETTING": "x"})
     assert "OMNIROUTE_API_KEY" not in env and env["MY_SERVER_SETTING"] == "x" and "PATH" in env
 
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_goal_continuation_bash_is_sandboxed_in_a_foreground_session(tmp_path, monkeypatch):
+    from k3code.routing.tiers import TaskKind
+    from test_autonomy_gateway import make, start
+
+    server = make(tmp_path, monkeypatch, [], mode="default", autonomy={"plan_first": False, "proposals": False})
+    await start(server, tmp_path)
+    session = server.session
+    user_turn = server._build_loop(session, None, None, TaskKind.INTERACTIVE_TURN, None)
+    assert user_turn._sandbox_argv() is None  # the user's own turn in default mode stays unsandboxed
+    session.goal_continuation = True
+    continuation = server._build_loop(session, None, None, TaskKind.INTERACTIVE_TURN, None)
+    assert continuation.unattended and continuation._sandbox_argv()[0] == sandbox.bwrap_path()

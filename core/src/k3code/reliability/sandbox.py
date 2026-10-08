@@ -41,9 +41,10 @@ def bwrap_path() -> str | None:
     return shutil.which("bwrap")
 
 
-def should_sandbox(mode: PermissionMode | str, background: bool) -> bool:
-    """auto/yolo permission modes and background/cron/loop sessions run sandboxed."""
-    return background or PermissionMode(mode) in SANDBOXED_MODES
+def should_sandbox(mode: PermissionMode | str, background: bool, unattended: bool = False) -> bool:
+    """auto/yolo permission modes run sandboxed; so does every unattended session (background run, loop tick,
+    cron job, goal continuation, sub-agent), whatever its permission mode."""
+    return background or unattended or PermissionMode(mode) in SANDBOXED_MODES
 
 
 def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
