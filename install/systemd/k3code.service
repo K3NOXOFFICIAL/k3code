@@ -3,7 +3,8 @@ Description=k3code daemon (keeps coding-agent sessions running 24/7)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=600
-StartLimitBurst=20
+StartLimitBurst=6
+OnFailure=k3code-recover.service
 
 [Service]
 Type=notify

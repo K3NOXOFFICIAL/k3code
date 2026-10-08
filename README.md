@@ -52,7 +52,7 @@ k3code plans before it acts, can run several agents in parallel, retries through
   - [`uv`](https://docs.astral.sh/uv/), which provides Python ≥ 3.12;
   - a private Node 22, from nodejs.org and checked against its published checksums, to build and run the TUI;
   - the Go toolchain `panes/go.mod` asks for, from the Go module proxy, to build the `k3` binary. Its module cache is deleted after the build.
-- `bubblewrap` (`bwrap`), which sandboxes unattended runs on Linux, comes from your package manager. The installer installs it only when that needs no password (root or passwordless sudo); otherwise it prints the command to run. `--no-install-deps` turns all fetching off.
+- `bubblewrap` (`bwrap`), which sandboxes unattended runs on Linux, comes from your package manager. The installer installs it only when that needs no password (root or passwordless sudo); otherwise it prints the command to run (presetup repeats it after the install). `--no-install-deps` turns all fetching off.
 - Optional: `systemd --user` for the 24/7 service.
 
 ### Install
@@ -75,7 +75,7 @@ git clone https://github.com/K3NOXOFFICIAL/k3code.git; cd k3code
 powershell -ExecutionPolicy Bypass -File install\install.ps1
 ```
 
-If WSL has no Linux distribution yet, `install.ps1` first runs `wsl --install -d Ubuntu`. Windows asks for administrator approval, and Ubuntu opens once in the same window so you can choose a Linux user name. If Windows asks for a restart, restart and run the installer again. After that, `install.ps1` runs `install/install.sh` in your default WSL distribution (`-Distro NAME` picks another), so the install lives in WSL under `~/.local/share/k3code/`. It then writes `k3code.cmd` and `k3.cmd` to `%LOCALAPPDATA%\k3code\bin` and adds that folder to your user `PATH` (`-NoModifyPath` skips that). Open a new terminal and `k3code` starts in WSL, in the folder you ran it from. Every other argument goes to `install.sh` unchanged, so `--from-source`, `--ref`, `--yes` and `--check` work as below. Building from a checkout on the Windows drive is slow; cloning inside WSL and running `sh install/install.sh` there works too, but then you get no Windows commands. Uninstall with `install\uninstall.ps1` (`-Purge` also deletes your k3code data in WSL).
+If WSL has no Linux distribution yet, `install.ps1` first runs `wsl --install -d Ubuntu`. Windows asks for administrator approval, and Ubuntu opens once in the same window so you can choose a Linux user name. If Windows asks for a restart, restart and run the installer again. After that, `install.ps1` runs `install/install.sh` in your default WSL distribution (`-Distro NAME` picks another), so the install lives in WSL under `~/.local/share/k3code/`. It then writes `k3code.cmd` and `k3.cmd` to `%LOCALAPPDATA%\k3code\bin` and adds that folder to your user `PATH` (`-NoModifyPath` skips that). Open a new terminal and `k3code` starts in WSL, in the folder you ran it from. Every other argument goes to `install.sh` unchanged, so `--from-source`, `--ref`, `--yes`, `--minimal` and `--check` work as below. Presetup runs inside WSL too, since that is where the Linux install happens. Building from a checkout on the Windows drive is slow; cloning inside WSL and running `sh install/install.sh` there works too, but then you get no Windows commands. Uninstall with `install\uninstall.ps1` (`-Purge` also deletes your k3code data in WSL).
 
 **All platforms**
 
@@ -83,7 +83,9 @@ To install from the checkout you already have, use `sh install/install.sh --from
 
 The installer creates a versioned install under `~/.local/share/k3code/` and links `k3code` into `~/.local/bin/` (put that on your `PATH`), and links `k3` too. It never runs onboarding; it ends by telling you to run `k3code onboard`. Re-running it upgrades in place and keeps the previous version for rollback.
 
-Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--no-install-deps` (fetch nothing; fail or skip with hints instead), `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`). Uninstall with `sh install/uninstall.sh`; it keeps your data unless you pass `--purge`.
+Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--no-install-deps` (fetch nothing; fail or skip with hints instead), `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`), `--minimal` (skips presetup, below). Uninstall with `sh install/uninstall.sh`; it removes the versions, the links and the Chromium location under `~/.local/share/k3code`, and keeps your data (`~/.k3code`, `~/.config/k3code`) unless you pass `--purge`.
+
+**Presetup** runs after the install and is on by default; it never fails the install. It checks the sandbox (`bwrap`): when it is missing, it prints the install command for your distribution and runs nothing (it asks for a `sudo` run only on an interactive terminal, never with `--yes`). It installs Chromium for the browser tool (the headless shell, about 115 MiB download and about 266 MB on disk; `K3CODE_SKIP_CHROMIUM=1` skips only this), and prints a health subset (`k3code doctor --install`, warnings only). `--minimal` skips all of it.
 
 ### First run
 

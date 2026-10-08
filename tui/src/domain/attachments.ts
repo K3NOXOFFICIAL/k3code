@@ -42,7 +42,11 @@ export const expandTokens = (tokens: ComposerToken[]) => {
 
   for (const token of tokens) {
     const hit = byLabel.get(token.label)
-    hit ? hit.push(token) : byLabel.set(token.label, [token])
+    if (hit) {
+      hit.push(token)
+    } else {
+      byLabel.set(token.label, [token])
+    }
   }
 
   return (value: string) =>

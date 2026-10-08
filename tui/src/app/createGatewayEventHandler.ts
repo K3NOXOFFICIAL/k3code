@@ -33,7 +33,6 @@ import { flashGoodVibes } from './petFlashStore.js'
 import { addProposal } from '../k3/proposalsStore.js'
 import { forgetServerRequest } from './serverRequestStore.js'
 import { turnController } from './turnController.js'
-import { getTurnState } from './turnStore.js'
 import { getUiState, patchUiState } from './uiStore.js'
 import {
   BACKEND_SLOW_START,
@@ -431,19 +430,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
   const { rpc } = ctx.gateway
   const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
-  const { bellOnComplete, bellOnPrompt, stdout, sys } = ctx.system
-
-  // display.bell_on_prompt — BEL whenever a blocking prompt modal opens
-  // (same mechanism as bell_on_complete; works over SSH, triggers tmux bell-action).
-  const ringPromptBell = () => {
-    if (bellOnPrompt && stdout?.isTTY) {
-      stdout.write('\x07')
-    }
-  }
+  const { bellOnComplete, stdout, sys } = ctx.system
 
   const { appendMessage, panel, setHistoryItems } = ctx.transcript
-  const { setInput } = ctx.composer
-  const { submitLiteralRef, submitRef } = ctx.submission
+  const { submitLiteralRef } = ctx.submission
 
   let pendingThinkingStatus = ''
   let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null

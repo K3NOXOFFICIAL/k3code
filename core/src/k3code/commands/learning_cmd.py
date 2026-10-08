@@ -53,9 +53,7 @@ class OptimizerCommand(CommandDef):
         if sub == "run":
             live = ctx.sessions.get(session_id) if session_id else None
             m = hub.metrics(since=hub.clock() - 7 * 86400)
-            made = optimizer.propose(m, ctx.config, hub.store)
-            if live is not None:
-                hub.emit(live, made)
+            made = await hub.run_optimizer(live)  # metric proposals, replayed token candidates, gated auto-apply
             return reply(f"Analysed {m['sessions']} sessions (score {optimizer.score(m)}); "
                          f"{len(made)} new overlay proposal(s).")
         if sub == "rollback":

@@ -60,7 +60,17 @@ class McpServerConfig(BaseModel):
     cwd: str | None = None
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
+    #: name of an environment variable (or of a key in ~/.config/k3code/env) whose value is sent as a bearer token;
+    #: read when the server connects, so the secret itself never appears in config.yaml
+    bearer_env: str = ""
     enabled: bool = True
+
+
+def env_value(name: str) -> str:
+    """A variable from the process environment, else from the env file the setup wizard writes. Never logged."""
+    from k3code.setup.state import read_env_file
+
+    return os.environ.get(name) or read_env_file().get(name, "")
 
 
 class McpConfig(BaseModel):
@@ -140,6 +150,22 @@ class Settings(BaseModel):
     research: dict[str, Any] = Field(default_factory=dict)
     # Context management: {compact_at_tokens: 80000, keep_messages: 8}; see GatewayServer._maybe_compact
     context: dict[str, Any] = Field(default_factory=dict)
+    # Browser for web tools: {cdp_url: ""} (empty = off, never attach to a running browser by default)
+    browser: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lift_legacy_searxng(cls, data: Any) -> Any:
+        """The setup wizard used to write a top-level ``searxng: {url}``, which no code read. Move it to
+        ``research.searxng_url`` so existing configs keep working; an explicit research value wins."""
+        if isinstance(data, dict) and isinstance(data.get("searxng"), dict):
+            data = dict(data)
+            legacy = data.pop("searxng")
+            research = dict(data.get("research") or {})
+            if legacy.get("url") and not research.get("searxng_url"):
+                research["searxng_url"] = legacy["url"]
+            data["research"] = research
+        return data
 
 
 def _current_home() -> Path:
@@ -204,6 +230,8 @@ def load_config(
     merged = _merge_dicts(merged, env_overrides)
     merged = _merge_dicts(merged, cli)
 
+    _warn_unknown_escalate_keys(merged)
+
     # Parse providers list specially (replace, don't merge)
     for src in (user_config, project_config, cli):
         if "providers" in src:
@@ -222,6 +250,16 @@ def load_config(
         p["api_key"] = os.environ.get(name) or file_env.get(name, "")
 
     return Settings(**merged)
+
+
+def _warn_unknown_escalate_keys(merged: dict[str, Any]) -> None:
+    """A key under ``autonomy.escalate`` that nothing reads would be ignored without a word: say so."""
+    from k3code.autonomy import ESCALATE_KEYS
+
+    section = (merged.get("autonomy") or {}).get("escalate") or {}
+    for key in sorted(set(section) - ESCALATE_KEYS):
+        logger.warning("autonomy.escalate.%s is not used and is ignored (known keys: %s)", key,
+                       ", ".join(sorted(ESCALATE_KEYS)))
 
 
 def _is_scalar(default: Any) -> bool:

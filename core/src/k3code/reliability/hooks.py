@@ -93,6 +93,7 @@ class Reliability:
         self.loop_guard = LoopGuard() if self.flags.loop_guard else None
         self.journal: ToolJournal | None = None  # opened lazily in _open_journal
         self.retry: PersistentRetry | None = None  # built in attach_router
+        self.unattended = False  # see set_unattended
         self._started = False
         self._net_forwarded = False
 
@@ -144,7 +145,14 @@ class Reliability:
                 events=self.events,
                 cancel_token=self.cancel_token,
             )
+            self.retry.unattended = self.unattended
             self.retry_config = self.retry.config
+
+    def set_unattended(self, flag: bool) -> None:
+        """Unattended runs (background, goals, loops) park on provider exhaustion; interactive turns fail fast."""
+        self.unattended = bool(flag)
+        if self.retry is not None:
+            self.retry.unattended = self.unattended
 
     async def start(self) -> None:
         """Begin NetWatch polling (providers should already be registered)."""

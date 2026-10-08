@@ -25,6 +25,11 @@ logger = logging.getLogger("k3code.daemon")
 RESTART_WINDOW_S = 600.0
 RESTART_LIMIT = 5
 WATCHDOG_INTERVAL_S = 30.0
+#: Safe mode lifts itself after this long with no daemon start, at most SAFE_MODE_MAX_AUTO_CLEARS times per day.
+SAFE_MODE_QUIET_S = 1800.0
+SAFE_MODE_MAX_AUTO_CLEARS = 3
+SAFE_MODE_CLEAR_WINDOW_S = 86400.0
+HOUSEKEEPING_EVERY_S = 60.0
 
 
 def k3_home() -> Path:
@@ -60,6 +65,68 @@ def record_restart(home: Path | None = None, now: float | None = None) -> int:
 
 def storm_active(count: int) -> bool:
     return count > RESTART_LIMIT
+
+
+def _stamps(path: Path) -> list[float]:
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        return [float(t) for t in json.loads(path.read_text())]
+    return []
+
+
+def auto_clears_file(home: Path | None = None) -> Path:
+    return (home or k3_home()) / "run" / "safe_mode_clears.json"
+
+
+def maybe_auto_clear(server: Any, home: Path | None = None, now: float | None = None) -> bool:
+    """Leave restart-storm safe mode once the daemon has been quiet for SAFE_MODE_QUIET_S.
+
+    Limited to SAFE_MODE_MAX_AUTO_CLEARS per SAFE_MODE_CLEAR_WINDOW_S: after that the daemon stays paused until a
+    human runs ``/daemon resume``. A halt (``/daemon pause``) overrides this. Returns whether it cleared safe mode.
+    """
+    home = home or k3_home()
+    now = time.time() if now is None else now
+    if not server.background_paused or server.halted:
+        return False
+    starts = _stamps(restarts_file(home))
+    if now - max(starts, default=0.0) < SAFE_MODE_QUIET_S:
+        return False
+    clears_path = auto_clears_file(home)
+    clears = [t for t in _stamps(clears_path) if now - t < SAFE_MODE_CLEAR_WINDOW_S]
+    if len(clears) >= SAFE_MODE_MAX_AUTO_CLEARS:
+        server.safe_mode_notice = (
+            f"{SAFE_MODE_NOTICE} The automatic clear limit ({SAFE_MODE_MAX_AUTO_CLEARS} per 24 h) is reached: "
+            "background work stays paused until /daemon resume."
+        )
+        return False
+    clears.append(now)
+    clears_path.parent.mkdir(parents=True, exist_ok=True)
+    clears_path.write_text(json.dumps(clears))
+    server.background_paused = False
+    server.safe_mode_notice = ""
+    server.emit("notification.clear", {"key": "k3.safe_mode"}, importance="essential")
+    server.emit(
+        "notification.show",
+        {
+            "text": f"Safe mode cleared automatically after {int(SAFE_MODE_QUIET_S // 60)} min without a restart.",
+            "level": "info",
+            "kind": "daemon",
+            "key": "k3.safe_mode.cleared",
+        },
+        importance="essential",
+    )
+    logger.warning("restart-storm safe mode cleared automatically (%d of %d in 24 h)", len(clears),
+                   SAFE_MODE_MAX_AUTO_CLEARS)
+    return True
+
+
+async def _housekeeping(server: Any, home: Path) -> None:
+    """Once a minute: the safe-mode auto-clear, then the goal watchdog (which re-kicks goals with no live turn)."""
+    while True:
+        await asyncio.sleep(HOUSEKEEPING_EVERY_S)
+        with contextlib.suppress(Exception):
+            maybe_auto_clear(server, home)
+        with contextlib.suppress(Exception):
+            await server.watchdog_tick()
 
 
 SAFE_MODE_NOTICE = (
@@ -127,19 +194,24 @@ async def run_daemon(
     if serve.done():
         serve.result()  # the server failed to come up: raise its error instead of announcing READY=1
     await server.ensure_automation()  # resume loops, start the cron scheduler and triggers
+    await server.resume_goals()  # goals that were active (or paused by a graceful stop) continue
     sdnotify.ready()
     logger.info("daemon ready on %s", sock)
     if ready_event is not None:
         ready_event.set()
     interval = sdnotify.watchdog_interval(WATCHDOG_INTERVAL_S) if watchdog_interval is None else watchdog_interval
     dog = asyncio.create_task(sdnotify.watchdog_loop(interval))
+    housekeeping = asyncio.create_task(_housekeeping(server, home))
     try:
         await serve
     finally:
         sdnotify.stopping()
         dog.cancel()
+        housekeeping.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await dog
+        with contextlib.suppress(asyncio.CancelledError):
+            await housekeeping
         await server.close()
         with contextlib.suppress(OSError):
             os.close(lock_fd)

@@ -13,7 +13,7 @@ const guarded =
 const runSteer = async (arg: string, steerResult: unknown, busy = true) => {
   const sys = vi.fn()
   const enqueue = vi.fn()
-  const rpc = vi.fn((_method: string, _params: unknown) => Promise.resolve(steerResult))
+  const rpc = vi.fn(() => Promise.resolve(steerResult))
 
   const ctx = {
     composer: { enqueue },

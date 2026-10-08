@@ -488,7 +488,11 @@ export const coreCommands: SlashCommand[] = [
     run: (arg, ctx) => {
       const text = ctx.gateway.gw.getLogTail(Math.min(80, Math.max(1, parseInt(arg, 10) || 20)))
 
-      text ? ctx.transcript.page(text, 'Logs') : ctx.transcript.sys('no gateway logs')
+      if (text) {
+        ctx.transcript.page(text, 'Logs')
+      } else {
+        ctx.transcript.sys('no gateway logs')
+      }
     }
   },
 

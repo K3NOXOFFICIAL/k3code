@@ -60,7 +60,11 @@ export function handleProposalKey(ch: string, meta: boolean): boolean {
   }
 
   removeProposal(top.id)
-  ch === 'y' ? handlers?.accept(top) : handlers?.dismiss(top)
+  if (ch === 'y') {
+    handlers?.accept(top)
+  } else {
+    handlers?.dismiss(top)
+  }
 
   return true
 }

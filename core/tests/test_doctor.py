@@ -25,7 +25,7 @@ def test_sandbox_warns_when_bwrap_is_installed_but_unusable(monkeypatch):
     chk = doctor.check_sandbox()
     assert chk.status == doctor.WARN
     assert chk.detail.startswith("bubblewrap is installed but unusable (user namespaces blocked?)")
-    assert "unattended bash runs unsandboxed" in chk.detail
+    assert "unattended bash is refused" in chk.detail
 
 
 def test_sandbox_is_ok_when_bwrap_is_usable(monkeypatch):
@@ -48,3 +48,51 @@ def test_sandbox_no_probe_does_not_run_bwrap(monkeypatch):
     monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
     monkeypatch.setattr(sandbox, "usable", must_not_probe)
     assert doctor.check_sandbox(probe=False).status == doctor.OK
+
+
+def test_install_subset_never_fails_and_covers_browser_and_searxng(monkeypatch):
+    """Warnings only: a fresh install (no providers, no daemon, no node) must still report every check as ok or warn."""
+    from k3code import doctor
+
+    monkeypatch.setattr(doctor, "check_tui", lambda: doctor.Check("tui", doctor.FAIL, "node not found", "install node"))
+    checks = doctor.install_subset()
+    names = {c.name for c in checks}
+    assert {"browser", "searxng", "k3code-home", "disk", "tui"} <= names
+    assert "providers" not in names and "daemon" not in names
+    assert all(c.status in (doctor.OK, doctor.WARN) for c in checks)
+    assert next(c for c in checks if c.name == "tui").status == doctor.WARN
+
+
+def test_browser_check_reports_playwright_and_chromium(monkeypatch, tmp_path):
+    import importlib.util
+
+    from k3code import doctor
+
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    assert doctor.check_browser().status == doctor.WARN
+    (tmp_path / "data" / "browsers" / "chromium-1").mkdir(parents=True)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "playwright" else None)
+    chk = doctor.check_browser()
+    assert chk.status == doctor.OK and "Playwright and Chromium" in chk.detail
+
+
+def test_searxng_check_reads_the_research_setting(monkeypatch, tmp_path):
+    from k3code import doctor
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    assert "not configured" in doctor.check_searxng().detail
+    (tmp_path / "home" / "config.yaml").write_text("research:\n  searxng_url: https://search.example.invalid\n")
+    assert "search.example.invalid" in doctor.check_searxng().detail
+
+
+def test_doctor_install_flag_exits_zero_with_no_providers(monkeypatch):
+    from click.testing import CliRunner
+
+    from k3code.cli import cli
+
+    result = CliRunner().invoke(cli, ["doctor", "--install"])
+    assert result.exit_code == 0, result.output
+    assert "browser" in result.output and "searxng" in result.output

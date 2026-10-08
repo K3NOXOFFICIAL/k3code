@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest'
 
 import { STREAM_DEFS } from '../components/gridStreamsDemo.js'
 import { GridAreas, type GridAreaWidget, WidgetGrid, type WidgetGridWidget } from '../components/widgetGrid.js'
-import { GRID_STREAM_COUNT, type GridTestState } from '../sdk/apps/gridTestState.js'
+import { GRID_STREAM_COUNT } from '../sdk/apps/gridTestState.js'
 
 function StatefulCell({ label }: { label: string }) {
   const [value] = useState(label)
@@ -108,21 +108,6 @@ describe('GridAreas component', () => {
 })
 
 describe('GridStreamsDemo', () => {
-  const streamsState: GridTestState = {
-    activeCol: 0,
-    activeRow: 0,
-    areas: false,
-    cols: 4,
-    gap: null,
-    nested: false,
-    paddingX: null,
-    rows: 3,
-    streamFocus: 1,
-    streamMain: 2,
-    streams: true,
-    zoomed: false
-  }
-
   it('keeps the panel count in lockstep with the input handler focus wrap', () => {
     expect(STREAM_DEFS.length).toBe(GRID_STREAM_COUNT)
   })

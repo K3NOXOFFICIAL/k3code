@@ -25,6 +25,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
@@ -37,6 +38,7 @@ from k3code.autonomy import advisor, autonomy_cfg
 from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.ultra import Ultra
+from k3code.blockers import BlockerStore
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, load_config
@@ -56,7 +58,8 @@ from k3code.gateway.protocol import (
     next_request_id,
 )
 from k3code.gateway.sessions import SessionStore
-from k3code.goals import GoalManager, make_judge
+from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
+from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
 from k3code.paths import project_config_path as _proj_cfg
@@ -66,10 +69,12 @@ from k3code.permissions.state import PermissionState, persist_rules, project_con
 from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
-from k3code.redact import redact
+from k3code.redact import redact, scrub_text
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
 from k3code.reliability.persistent_retry import TurnCancelled
+from k3code.research.browser import BrowserManager
+from k3code.research.fetch import WebFetcher
 from k3code.research.flow import Research
 from k3code.research.tools import register_web_tools
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
@@ -90,6 +95,8 @@ _DEFAULT_SKIN = {
 }
 
 _SYSTEM_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "system.md"
+#: How long an approval, plan or clarify request may wait for an answer before it is denied and the goal pauses.
+APPROVAL_TIMEOUT_S = 1800.0
 
 
 def _load_system_prompt() -> str:
@@ -141,6 +148,8 @@ class LiveSession:
             self.control["goal"] = GoalState.from_dict(stored.meta["goal"]).snapshot()
         #: Background/cron/loop sessions run bash inside the sandbox.
         self.background = bool(stored.meta.get("background"))
+        #: True while a /goal continuation runs: nobody is watching, so bash is sandboxed even in a foreground session.
+        self.goal_continuation = False
         self.reliability: Reliability | None = None
         #: paused = waiting on the network/provider; the session still counts as working.
         self.paused = False
@@ -153,6 +162,8 @@ class LiveSession:
         #: M4a: tier and task kind of the call in flight (for usage rows); /scope override for the next task.
         self.last_tier = "main"
         self.current_kind = "interactive_turn"
+        #: M1: id of the turn in flight (usage rows carry it, so per-turn totals add up); "" between turns.
+        self.turn_id = ""
         self.scope_override: str | None = None
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
@@ -245,7 +256,7 @@ class LiveSession:
 
 
 #: Conversation size at which a session's older messages are folded into a summary, and how many recent ones stay.
-CONTEXT_DEFAULTS: dict[str, Any] = {"compact_at_tokens": 80_000, "keep_messages": 8}
+CONTEXT_DEFAULTS: dict[str, Any] = {"compact_at_tokens": 80_000, "keep_messages": 8, "compact_input_chars": 60_000}
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -312,12 +323,17 @@ class GatewayServer:
         store: SessionStore | None = None,
     ) -> None:
         self.config = config or load_config(project_dir=Path.cwd())
+        #: config keys the files held at the last read (apply_file_config resets the ones that have since gone)
+        self._file_keys: set[str] = _file_keys(Path.cwd())
         self.store = store or SessionStore(self._home() / "sessions.db")
         self._stdin = stdin
         self._stdout = stdout
         self.commands: CommandRegistry = build_commands()
         self.live: dict[str, LiveSession] = {}
         self.mcp = McpManager(self.config.mcp.servers)
+        # one pooled client, cache and rate budget per gateway, shared by every session's web tools
+        self.web_fetcher = WebFetcher.from_config(self.config.research)
+        self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
         self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
         self.providers: list[Any] = []
         self.router: Router | None = None
@@ -339,6 +355,13 @@ class GatewayServer:
         #: Set by the daemon in restart-storm safe mode: no background work starts.
         self.background_paused = False
         self.safe_mode_notice = ""
+        #: ``/daemon pause``: a persisted global halt (k3code.halt); loaded here so it survives a restart.
+        self.halt: Halt | None = load_halt(self._home())
+        #: Waits for a person (approvals, paused goals) survive a restart here until a client takes them.
+        self.blockers = BlockerStore(self._home() / "blockers.db")
+        self.approval_timeout_s = APPROVAL_TIMEOUT_S
+        #: Set by a graceful stop: a turn cancelled now pauses its goal as "daemon restart" (boot resumes it).
+        self.stopping = False
         self._client_seq = 0
         self.usage = UsageDB(self._home() / "usage.db")
         self.artifacts = ArtifactStore(self._home() / "artifacts.db")
@@ -354,6 +377,7 @@ class GatewayServer:
             self.usage,
             emit=lambda t, p: self.emit(t, p),
             last_attempt=lambda: self.last_attempt,
+            turn_of=self._turn_of,
         )
         self.autonomy = PlanFirst(self)
         self.learning = LearningHub(self, self.autonomy.proposals)
@@ -614,7 +638,57 @@ class GatewayServer:
     socket_path: Path
 
     def request_stop(self) -> None:
+        self.stopping = True
         self._stop.set()
+
+    @property
+    def halted(self) -> bool:
+        """True while ``/daemon pause`` holds: no model turn, loop tick, job or sub-agent may start."""
+        return self.halt is not None
+
+    def _halt_payload(self) -> dict[str, Any]:
+        return {
+            "text": "Daemon halted (/daemon pause): turns, loops, jobs and sub-agents are stopped. "
+            "/daemon resume to continue.",
+            "level": "warning",
+            "kind": "daemon",
+            "key": "k3.halt",
+        }
+
+    async def halt_daemon(self, reason: str = "/daemon pause") -> int:
+        """Global halt: persist it, pause every active goal, stop running turns and sub-agents.
+
+        Returns how many running turns were stopped. Loops and jobs are not cancelled; they wait (see
+        AutomationEngine._online) and continue after ``/daemon resume``.
+        """
+        self.halt = set_halt(self._home(), reason)
+        stopped = 0
+        for live in list(self.live.values()):
+            mgr = self.goal_manager(live)
+            if mgr.is_active():  # paused first, so the cancelled turn's own handler does not overwrite the reason
+                mgr.pause("halted")
+                self.emit_goal(live)
+            if live.turn_task is not None and not live.turn_task.done():
+                await self.interrupt_turn(live.session_id)
+                stopped += 1
+        for h in list(self.subagents.handles.values()):
+            self.subagents.interrupt(h.id)
+        self.broadcast("notification.show", self._halt_payload())
+        return stopped
+
+    def resume_daemon(self) -> bool:
+        """``/daemon resume``: clear the halt and the restart-storm safe mode; returns whether either was set.
+
+        Goals that the halt paused stay paused (``/goal resume``): nothing restarts unattended work by itself.
+        """
+        was_set = self.halted or self.background_paused
+        clear_halt(self._home())
+        self.halt = None
+        self.background_paused = False
+        self.safe_mode_notice = ""
+        self.broadcast("notification.clear", {"key": "k3.safe_mode"})
+        self.broadcast("notification.clear", {"key": "k3.halt"})
+        return was_set
 
     #: A peer that stopped reading (SIGSTOPped TUI, hung ssh) is dropped once this many bytes are queued for it.
     MAX_CLIENT_BACKLOG = 8 * 1024 * 1024
@@ -676,6 +750,19 @@ class GatewayServer:
                         "essential",
                     ),
                 )
+            if self.halted:
+                self._send(client, encode_event("notification.show", self._halt_payload(), "essential"))
+            for row in self.blockers.pending():  # blockers no client has taken yet: hand them over now
+                payload = {
+                    "text": row["text"],
+                    "level": row["level"],
+                    "kind": row["kind"],
+                    "key": f"k3.blocker.{row['id']}",
+                    "session_id": row["session_id"],
+                    "blocker_id": row["id"],
+                }
+                self._send(client, encode_event("notification.show", payload, "essential"))
+                self.blockers.mark_delivered(row["id"])
             while not client.closed:
                 line = await reader.readline()
                 if not line:
@@ -803,8 +890,11 @@ class GatewayServer:
         self._open_requests.clear()
 
     async def close(self) -> None:
+        self.stopping = True
         if self.automation is not None:
             await self.automation.stop()
+        await self.web_fetcher.aclose()
+        await self.browser.close()
         cancelled = []
         for live in self.live.values():
             if live.turn_task is not None and not live.turn_task.done():
@@ -821,6 +911,7 @@ class GatewayServer:
             await p.aclose()
         self.store.close()
         self.usage.close()
+        self.blockers.close()
 
     def _send_ready(self, client: Client) -> None:
         self._send(
@@ -901,11 +992,23 @@ class GatewayServer:
         params = {"session_id": session_id, **params}
         frame = encode_server_request(method, params, req_id=req_id)
         self._open_requests[req_id] = (session_id, frame)
-        for client in self.clients:
-            if client.session_id == session_id:
-                self._send(client, frame)
+        attached = [c for c in self.clients if c.session_id == session_id]
+        for client in attached:
+            self._send(client, frame)
+        if not attached:  # nobody can answer right now: keep the request visible across a restart
+            self.notify_blocker(session_id, f"Waiting for an answer: {params.get('command') or method}",
+                                level="info", kind="approval", key=f"k3.approval.{req_id}")
         try:
-            return await fut
+            return await asyncio.wait_for(fut, self.approval_timeout_s)
+        except TimeoutError:
+            self._open_requests.pop(req_id, None)
+            self._server_request_futures.pop(req_id, None)
+            cancel = encode_server_request("request.cancel", {"id": req_id, "method": method, "reason": "timeout"})
+            for client in self.clients:
+                if client.session_id == session_id:
+                    self._send(client, cancel)
+            self._block_on_timeout(session_id, method)
+            raise ApprovalTimeout(f"no answer to {method} within {int(self.approval_timeout_s)} s") from None
         except asyncio.CancelledError:
             self._open_requests.pop(req_id, None)
             self._server_request_futures.pop(req_id, None)
@@ -921,6 +1024,18 @@ class GatewayServer:
                 if client.session_id == session_id:
                     self._send(client, cancel)
             raise
+
+    def _block_on_timeout(self, session_id: str, method: str) -> None:
+        """An unanswered request timed out: the goal of that session pauses with the reason, and a blocker is stored."""
+        live = self.live.get(session_id)
+        minutes = int(self.approval_timeout_s // 60) or 1
+        text = f"No answer to the {method} request within {minutes} min. Answer it, then /goal resume."
+        if live is not None:
+            mgr = self.goal_manager(live)
+            if mgr.is_active():
+                mgr.pause(f"{method} timeout")
+                self.emit_goal(live)
+        self.notify_blocker(session_id, text, level="warning", kind="approval", key=f"k3.approval.timeout.{session_id}")
 
     # ── router wiring ─────────────────────────────────────────────────
 
@@ -1070,16 +1185,21 @@ class GatewayServer:
     async def _run_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget."""
         async with session.turn_lock:  # a second turn on this session waits instead of interleaving with the first
-            result = await self._run_turn_locked(session, text)
-            # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
-            while session.pending_prompts and result[0] != "interrupted":
-                result = await self._run_turn_locked(session, session.pending_prompts.pop(0))
-            return result
+            try:
+                result = await self._run_turn_locked(session, text)
+                # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
+                # halted: keep the queued prompts for after /daemon resume
+                while session.pending_prompts and result[0] not in ("interrupted", "halted"):
+                    result = await self._run_turn_locked(session, session.pending_prompts.pop(0))
+                return result
+            finally:
+                session.goal_continuation = False
 
     async def _run_turn_locked(self, session: LiveSession, text: str) -> tuple[str, str]:
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
         prompt = text
         mgr = self.goal_manager(session)
+        session.goal_continuation = False  # the prompt the user sent is not a continuation
         while True:
             try:
                 await self._maybe_compact(session)
@@ -1092,14 +1212,12 @@ class GatewayServer:
                     if await self._maybe_compact(session, force=True):
                         status, final_text = await self._run_one_turn(session, prompt)
             except asyncio.CancelledError:
-                if mgr.is_active():
-                    mgr.pause("interrupted")
-                    self.emit_goal(session)
+                self._block_goal_for(session, "interrupted")
                 raise
+            if self.halted and mgr.is_active() and status == "done":
+                status = "halted"  # the halt arrived while the turn ran: no judge call, no continuation
             if status != "done" or not mgr.is_active():
-                if status == "error" and mgr.is_active():
-                    mgr.pause("turn failed")
-                    self.emit_goal(session)
+                self._block_goal_for(session, status)  # an active goal never ends silently
                 self._session_finished(session, status)
                 return status, final_text
             judge = self.goal_judge or make_judge(self._goal_completer(session))
@@ -1115,6 +1233,38 @@ class GatewayServer:
                 self._session_finished(session, status)
                 return status, final_text
             prompt = decision.prompt
+            session.goal_continuation = True  # unattended from here on: the goal drives the next turn
+
+    def _block_goal_for(self, session: LiveSession, status: str) -> None:
+        """A turn that did not finish leaves its active goal paused, with the reason and one notification.
+
+        ``needs_input`` (budget, loop guard, a question), ``interrupted`` (/stop, a graceful stop), ``halted``
+        (/daemon pause) and ``error`` each get their own pause reason, so nothing waits in the background silently.
+        """
+        mgr = self.goal_manager(session)
+        if not mgr.is_active():
+            return
+        if status == "needs_input":
+            reason, text = "needs_input", "Goal needs your input before it can continue. Answer, then /goal resume."
+        elif status == "interrupted" and self.stopping:
+            reason, text = "daemon restart", "Goal stopped by the daemon restart; it resumes on the next boot."
+        elif status == "interrupted":
+            reason, text = "interrupted", "Goal interrupted. /goal resume to continue."
+        elif status == "halted":
+            reason, text = "halted", "Goal paused: the daemon is halted (/daemon pause). /goal resume after resume."
+        elif status == "error" and isinstance(session.last_exc, (ChainExhausted, AllProvidersUnreachable)):
+            detail = scrub_text(session.last_error or "no provider answered")[:160]
+            reason = "provider unavailable"
+            text = f"Goal paused: no provider answered after the retries ({detail}). /goal resume to retry."
+        elif status == "error":
+            detail = scrub_text(session.last_error or "see the error above")[:160]
+            reason, text = "turn failed", f"Goal paused: the turn failed ({detail}). /goal resume to retry."
+        else:
+            return
+        mgr.pause(reason)
+        self.emit_goal(session)
+        self.notify_blocker(session.session_id, text, level="warning", kind="goal",
+                            key=f"k3.goal.blocked.{session.session_id}")
 
     def _session_finished(self, session: LiveSession, status: str) -> None:
         """Tell the automation engine (``session_event`` triggers) that a session's run ended."""
@@ -1154,8 +1304,11 @@ class GatewayServer:
             reliability=reliability,
             session=session.session_id,
             background=session.background,
+            unattended=session.goal_continuation,
+            unattended_network=bool(autonomy_cfg(self.config)["unattended_network"]),
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
+            tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
@@ -1163,19 +1316,23 @@ class GatewayServer:
         for install in session.extra_tools:
             install(loop.tools)
         register_task_tools(loop.tools, self, session, depth=1)
-        register_web_tools(loop.tools, self.config)
+        register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher, mcp=self.mcp, browser=self.browser)
         return loop
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
+        if self.halted:  # /daemon pause: nothing reaches a provider; the caller pauses the goal (status 'halted')
+            return "halted", ""
         self._ensure_router(session.stored.model or None)
         assert self.router is not None
+        session.turn_id = uuid.uuid4().hex[:12]
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
         session.run_result = None
         session.last_error, session.last_exc, session.last_api_calls = "", None, 0
         reliability = await self._reliability_for(session)
+        reliability.set_unattended(session.background)  # unattended: provider exhaustion parks instead of failing
         await self.mcp.ensure_started()
         approval = await self._approval_callback_for(session)
 
@@ -1271,13 +1428,15 @@ class GatewayServer:
                     history=history,
                 ):
                     self._on_stream_event(session, event)
-                new_tier = escalation.record(loop.escalation_reason) if cheap_start and loop.escalation_reason else None
+                attempt_reason = loop.escalation_reason or ""
+                if "loop_guard" in attempt_reason:  # counted on every tier, not only when a cheap start escalates
+                    self.usage.record("loop_guard", session=session.session_id, detail=attempt_reason,
+                                      tier=tier.value, task_kind=kind.value, turn=session.turn_id)
+                new_tier = escalation.record(attempt_reason) if cheap_start and attempt_reason else None
                 if new_tier is None or loop.interrupted:
                     break
                 # The attempt stalled on a cheap tier: continue the same task one tier up.
-                reason = loop.escalation_reason or "unknown"
-                if "loop_guard" in reason:
-                    self.usage.record("loop_guard", session=session.session_id, detail=reason)
+                reason = attempt_reason or "unknown"
                 self.model_caller.note_escalation(kind, tier, new_tier, reason, session.session_id)
                 tier = new_tier
                 session.needs_input = False
@@ -1321,10 +1480,15 @@ class GatewayServer:
             # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
             # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
             self._persist_turn(session, loop)
+            self.learning.record_turn_replay(session, list(loop.turn_messages), status, tier.value, kind.value,
+                                             session.turn_id, history_len=len(history))
             if session.paused:  # a cancelled wait never saw "resumed"
                 session.paused = False
                 session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")
-            self.autonomy.finish(session, gate, status, final_text, text)
+            # a provider outage is not a correctness failure: the scope log keeps it apart from "error"
+            scope_outcome = "outage" if isinstance(session.last_exc, (AllProvidersUnreachable, ChainExhausted)) \
+                and status == "error" else status
+            self.autonomy.finish(session, gate, scope_outcome, final_text, text)
             if self.learning.enabled:
                 self.learning.spawn(self.learning.turn_finished(session, status))
 
@@ -1386,13 +1550,16 @@ class GatewayServer:
         and every later tick failed with ContextOverflow. Runs on the cheap ``compaction`` tier; failures are logged and
         the turn goes on.
         """
+        if self.halted:  # the compaction call is a model call too
+            return 0
         cfg = {**CONTEXT_DEFAULTS, **dict(getattr(self.config, "context", None) or {})}
         messages = session.stored.messages
         if not force and _estimate_tokens(messages) < int(cfg["compact_at_tokens"]):
             return 0
         try:
             new, folded = await compact_messages(
-                self.model_caller, list(messages), keep=int(cfg["keep_messages"]), session_id=session.session_id
+                self.model_caller, list(messages), keep=int(cfg["keep_messages"]), session_id=session.session_id,
+                max_input_chars=int(cfg["compact_input_chars"]),
             )
         except Exception:  # noqa: BLE001 - e.g. every provider rate-limited: the turn proceeds with the long history
             logger.warning("automatic compaction failed", exc_info=True)
@@ -1451,6 +1618,7 @@ class GatewayServer:
                     cost_usd=u.cost_usd if u else None,
                     tier=session.last_tier,
                     task_kind=session.current_kind,
+                    turn=session.turn_id,
                 )
                 if u:
                     session.emit("session.usage", {"usage": _usage_payload(u)})
@@ -1545,19 +1713,25 @@ class GatewayServer:
         """Ask the client a multiple-choice question (``clarify`` server request)."""
         return await self._ask_client("clarify", {"question": question, "choices": choices}, session_id or "")
 
+    def _turn_of(self, session_id: str) -> str:
+        """The turn id in flight for a live session ("" when it is idle or unknown)."""
+        live = self.live.get(session_id)
+        return live.turn_id if live is not None else ""
+
     def apply_file_config(self, cwd: str | Path | None = None) -> None:
-        """Re-read config files into the live settings (only keys present in a file are replaced)."""
+        """Re-read config files into the live settings.
+
+        Keys present in a file are replaced by the file's value. A key that was in a file at the previous read and is
+        gone now (removed by hand or rolled back by an experiment) is reset to its fresh value, not left as it was.
+        """
         base = Path(cwd) if cwd else Path.cwd()
         fresh = load_config(project_dir=base)
-        keys: set[str] = set()
-        for path in (_user_cfg(), _proj_cfg(base)):
-            try:
-                keys |= set(confio.read_yaml(path))
-            except confio.ConfigError:
-                continue
-        for key in keys & set(Settings.model_fields):
+        keys = _file_keys(base)
+        changed = (keys | self._file_keys) & set(Settings.model_fields)
+        for key in changed:
             setattr(self.config, key, getattr(fresh, key))
-        if "providers" in keys:
+        self._file_keys = keys
+        if "providers" in changed:
             self.router = None
             self._tiers = None
         self.mcp.configure(self.config.mcp.servers)
@@ -1654,6 +1828,98 @@ class GatewayServer:
 
         return GoalManager(load, save, default_max_turns=self.config.goal.max_turns)
 
+    async def kick_goal(self, live: LiveSession, *, source: str) -> bool:
+        """Start the next turn of an active goal that has no live turn. Boot resume and the watchdog both use this.
+
+        Refused while halted or in restart-storm safe mode. Every kick is counted: once MAX_KICKS_PER_WINDOW kicks
+        happened within KICK_WINDOW_S, the goal is parked (paused) instead of kicked again.
+        """
+        if self.halted or self.background_paused:
+            return False
+        mgr = self.goal_manager(live)
+        goal = mgr.state
+        if goal is None or goal.status != "active":
+            return False
+        if live.streaming or (live.turn_task is not None and not live.turn_task.done()):
+            return False  # a live turn is working on it already
+        now = time.time()
+        if len(mgr.recent_kicks(now)) >= MAX_KICKS_PER_WINDOW:
+            mgr.pause(f"parked: {MAX_KICKS_PER_WINDOW} automatic kicks in 1 h")
+            self.emit_goal(live)
+            self.notify_blocker(
+                live.session_id,
+                f"Goal parked after {MAX_KICKS_PER_WINDOW} automatic restarts within an hour ({source}). "
+                "Check it, then /goal resume.",
+                level="warning",
+                kind="goal",
+                key=f"k3.goal.parked.{live.session_id}",
+            )
+            return False
+        mgr.record_kick(now)
+        logger.info("goal in session %s kicked (%s)", live.session_id, source)
+        live.turn_task = asyncio.get_running_loop().create_task(
+            self._run_turn(live, mgr.kick_prompt() or goal.goal), name=f"kick-{live.session_id}"
+        )
+        self.emit_goal(live)
+        return True
+
+    async def resume_goals(self) -> int:
+        """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.
+
+        Returns how many turns were started. Nothing starts while halted or in restart-storm safe mode.
+        """
+        if self.halted or self.background_paused:
+            return 0
+        for stored in self.store.with_goal_status("paused"):
+            if (stored.meta.get("goal") or {}).get("paused_reason") == "daemon restart":
+                self.goal_manager(self.live_for(stored)).resume(reset_budget=False)
+        return len(await self.watchdog_tick(source="boot"))
+
+    async def watchdog_tick(self, *, source: str = "watchdog") -> list[str]:
+        """Re-kick every goal persisted active that has no live turn (through kick_goal, so the kick counter and the
+        halt and storm guards apply). Returns the session ids kicked."""
+        if self.halted or self.background_paused:
+            return []
+        kicked: list[str] = []
+        for stored in self.store.with_goal_status("active"):  # only active goals get a live session (and a kick)
+            if await self.kick_goal(self.live_for(stored), source=source):
+                kicked.append(stored.session_id)
+        return kicked
+
+    def notify_session(self, live: LiveSession, text: str, *, level: str = "info", key: str = "") -> None:
+        """A transient notification to the clients attached to ``live`` (essential, so focus mode keeps it)."""
+        payload = {
+            "text": text,
+            "level": level,
+            "kind": "goal",
+            "key": key or f"k3.goal.{live.session_id}",
+            "session_id": live.session_id,
+        }
+        live.emit("notification.show", payload, importance="essential")
+
+    def notify_blocker(self, session_id: str, text: str, *, level: str = "warning", kind: str = "goal",
+                       key: str = "") -> int:
+        """A blocker: stored until a client takes it (so it survives a restart), and shown to attached clients now.
+
+        The text is scrubbed first: it can carry an approval command with credentials in it (S8).
+        """
+        text = scrub_text(text)
+        blocker_id = self.blockers.add(session_id=session_id, kind=kind, text=text, level=level)
+        payload = {
+            "text": text,
+            "level": level,
+            "kind": kind,
+            "key": key or f"k3.blocker.{blocker_id}",
+            "session_id": session_id,
+            "blocker_id": blocker_id,
+        }
+        live = self.live.get(session_id)
+        if live is not None:
+            live.emit("notification.show", payload, importance="essential")
+        if any(c.session_id == session_id and not c.closed for c in self.clients):
+            self.blockers.mark_delivered(blocker_id)
+        return blocker_id
+
     def emit_goal(self, session: LiveSession) -> None:
         """Push the goal snapshot to the TUI goal bar (``session.control.update``)."""
         session.control["goal"] = self.goal_manager(session).snapshot() or ""
@@ -1706,6 +1972,8 @@ class GatewayServer:
     def start_job(self, session: LiveSession, label: str, make_coro: Callable[[], Any]) -> None:
         """Run ``make_coro()`` as the session's turn: it shows as working, /stop interrupts it, and its returned
         text becomes the assistant message."""
+        if self.halted:
+            raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
         if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
             raise _InvalidParams("a turn is already running in this session; /stop it or wait")
 
@@ -1763,6 +2031,8 @@ class GatewayServer:
 
     def start_background(self, origin: LiveSession, prompt: str) -> LiveSession:
         """``/bg <prompt>``: run ``prompt`` in a new background session; notify ``origin`` when it ends."""
+        if self.halted:
+            raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
         if self.background_paused:
             raise _InvalidParams("background work is paused (restart-storm safe mode); resume with /daemon resume")
         live = self._fresh_session_like(origin, background=True)
@@ -1866,6 +2136,10 @@ def _has_verification(plan: str) -> bool:
     return bool(m and m.group(1).strip())
 
 
+class ApprovalTimeout(RuntimeError):
+    """A server→client request (approval, plan, clarify) went unanswered past ``approval_timeout_s``."""
+
+
 class _InvalidParams(Exception):
     """Raised by handlers for schema-invalid params (JSON-RPC -32602)."""
 
@@ -1915,6 +2189,17 @@ def _command_for_tool(tool_name: str, arguments: dict[str, Any]) -> str:
     if tool_name == "read":
         return f"read {arguments.get('path', '')}"
     return f"{tool_name} {json.dumps(arguments, ensure_ascii=False)[:120]}"
+
+
+def _file_keys(base: Path) -> set[str]:
+    """Top-level keys of the user and project config files (none when a file is absent or unreadable)."""
+    keys: set[str] = set()
+    for path in (_user_cfg(), _proj_cfg(base)):
+        try:
+            keys |= set(confio.read_yaml(path))
+        except confio.ConfigError:
+            continue
+    return keys
 
 
 def _usage_payload(usage: Usage) -> dict[str, Any]:
@@ -2157,6 +2442,8 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     if session is None:
         raise _InvalidParams("no active session")
     text = _require(params, "text")
+    if server.halted:
+        raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
     server.last_user_activity = time.time()
     if session.streaming:
         session.pending_prompts.append(str(text))  # really queued: it runs when the current turn ends
@@ -2449,6 +2736,15 @@ async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[
     return {"items": items}
 
 
+async def _browser_manage(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Inspect, attach to the configured ``browser.cdp_url``, or drop the browser the browser tools use."""
+    action = str(params.get("action") or "status").strip().lower()
+    if action not in ("status", "connect", "disconnect"):
+        raise _InvalidParams(f"browser.manage action must be status, connect or disconnect, not {action!r}")
+    url = params.get("url")
+    return await server.browser.manage(action, url=str(url) if url else None)
+
+
 _HANDLERS: dict[str, Any] = {
     "session.create": _session_create,
     "session.list": _session_list,
@@ -2492,6 +2788,7 @@ _HANDLERS: dict[str, Any] = {
     "config.set": _config_set,
     "setup.status": _setup_status,
     "system.battery": _system_battery,
+    "browser.manage": _browser_manage,
 }
 
 _HANDLERS["session.branch_stored"] = _session_resume  # M1: fork == resume the source

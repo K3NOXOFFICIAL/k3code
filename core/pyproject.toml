@@ -14,6 +14,10 @@ dependencies = [
     "prompt_toolkit>=3.0",
 ]
 
+[project.optional-dependencies]
+# the browser tool (research/browser.py): optional, the tool reports when it is missing; `playwright install chromium`
+browser = ["playwright>=1.63"]
+
 [project.scripts]
 k3code = "k3code.cli:cli"
 

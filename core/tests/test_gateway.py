@@ -373,7 +373,7 @@ async def test_a_stopped_turn_is_persisted_and_the_user_prompt_survives(tmp_path
 
     from k3code.gateway.server import GatewayServer as _GS
 
-    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path.parent / f"{tmp_path.name}-k3home"))  # beside the project
     script = tmp_path / "s.json"
     script.write_text(_json.dumps([{"type": "tool_call", "name": "bash", "arguments": {"command": "echo one"}}]))
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))

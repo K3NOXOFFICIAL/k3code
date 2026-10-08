@@ -5,18 +5,20 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass
 from pathlib import Path
+
+from k3code.reliability.sandbox import child_env, harness_git_argv
 
 _GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true", "GIT_CONFIG_NOSYSTEM": "1"}
 
 
 async def git(cwd: str | Path, *args: str, timeout: float = 60) -> tuple[int, str]:
     """Run git non-interactively; returns (returncode, stdout+stderr). Never raises on a non-zero exit."""
+    # harness git: hooks and fsmonitor disabled, scrubbed env (no provider keys reach git)
     proc = await asyncio.create_subprocess_exec(
-        "git", *args, cwd=str(cwd), stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env={**os.environ, **_GIT_ENV},
+        *harness_git_argv(*args), cwd=str(cwd), stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=child_env(_GIT_ENV),
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)

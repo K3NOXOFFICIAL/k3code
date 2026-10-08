@@ -227,6 +227,8 @@ _UPSTREAM_BLOCKED_PATTERNS = (
     "enable javascript and cookies to continue", "cdn-cgi/challenge-platform", "cf-browser-verification",
     "challenge-error-text", "__cf_chl", "cf-error-details", "attention required! | cloudflare",
 )
+#: the same challenge markers, public for the browser tool, which escalates a page that shows one (research/browser.py)
+UPSTREAM_BLOCKED_PATTERNS = _UPSTREAM_BLOCKED_PATTERNS
 
 # httpx / stdlib transport exception type names. A connect failure is ``network``;
 # a read/pool timeout is ``timeout``.

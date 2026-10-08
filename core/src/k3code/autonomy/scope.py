@@ -216,7 +216,11 @@ def repo_summary(cwd: Path, *, max_files: int = 5000) -> str:
             break
     top = ", ".join(f"{e}×{n}" for e, n in sorted(exts.items(), key=lambda kv: -kv[1])[:5]) or "none"
     try:
-        out = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, timeout=5)
+        # harness git: hooks and fsmonitor off, scrubbed env (the repo may hold a hook a sandboxed command wrote)
+        from k3code.reliability.sandbox import child_env, harness_git_argv
+
+        out = subprocess.run(harness_git_argv("status", "--porcelain"), cwd=cwd, capture_output=True, text=True,
+                             timeout=5, env=child_env())
         git = f"{len(out.stdout.splitlines())} changed files" if out.returncode == 0 else "not a git repo"
     except (OSError, subprocess.SubprocessError):
         git = "git unavailable"

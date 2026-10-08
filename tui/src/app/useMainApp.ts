@@ -688,12 +688,14 @@ export function useMainApp(gw: GatewayClient) {
     }
   }, [gw, ui.sid])
 
+  const { activateLiveSession } = session
+
   // Agent strip actions: Enter attaches a background session, `x` stops a row.
   useEffect(() => {
     setStripHandlers({
       activate: row => {
         if (row.kind === 'session') {
-          session.activateLiveSession(row.id)
+          activateLiveSession(row.id)
         }
       },
       stop: row => {
@@ -708,7 +710,7 @@ export function useMainApp(gw: GatewayClient) {
     })
 
     return () => setStripHandlers(null)
-  }, [gw, session.activateLiveSession])
+  }, [gw, activateLiveSession])
 
   // Proposal cards: both verbs go to the gateway, which owns the outcome. Only a proposal whose action is a prompt
   // (`type: send`) is submitted here; the learned kinds (permission rule, preference, skill, optimizer) are applied by

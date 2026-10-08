@@ -93,7 +93,7 @@ def step_about(c: Ctx) -> dict[str, Any]:
 
 
 def step_system(c: Ctx) -> dict[str, Any]:
-    det = detect.detect()
+    det = detect.detect(probe=c.do_probe)
     c.say("Detected: " + ", ".join(f"{k}={v}" for k, v in det.items() if v not in ("", [], False)))
     if c.p.confirm("system.confirm", "Is this correct?", True):
         out = dict(det)
@@ -252,11 +252,31 @@ def step_permissions(c: Ctx) -> dict[str, Any]:
     return {"mode": mode, "extra_hardline": [str(x) for x in extra]}
 
 
+#: The k3nox hub is one MCP endpoint: its search, fetch and browser tools all come through it, as hub_* tools.
+HUB_URL = "https://<memory-host>/mcp"
+#: Variables that may hold the hub key, in order. The config only ever names one of them.
+HUB_KEY_ENVS = ("K3NOX_KEY", "OMNIROUTE_API_KEY")
+
+
+def hub_key_env() -> str:
+    """The name of the variable that holds the hub key, or '' when no key is set. The value is never returned."""
+    from k3code.config import env_value
+
+    return next((name for name in HUB_KEY_ENVS if env_value(name)), "")
+
+
 def step_integrations(c: Ctx) -> dict[str, Any]:
     out: dict[str, Any] = {"mcp": {}, "mem0_url": "", "skills_roots": [], "searxng_url": ""}
     mcp = c.p.raw("integrations.mcp")
     if mcp is None:
         mcp = []
+        key_env = hub_key_env()
+        if key_env and c.p.confirm(
+            "integrations.hub_mcp",
+            f"Add the k3nox hub (web search, fetch and browser tools), authenticated with ${key_env}?",
+            True,
+        ):
+            mcp.append({"name": "k3nox", "url": HUB_URL, "bearer_env": key_env})
         while c.p.interactive and c.p.confirm("integrations.addmcp", "Add an MCP server?", False):
             name = c.p.text("integrations.mcp_name", "Name")
             target = c.p.text("integrations.mcp_target", "URL (http…) or stdio command")
@@ -361,7 +381,8 @@ def build_config(data: dict[str, Any]) -> dict[str, Any]:
     if integ.get("mem0_url"):
         cfg["mem0"] = {"url": integ["mem0_url"]}
     if integ.get("searxng_url"):
-        cfg["searxng"] = {"url": integ["searxng_url"]}
+        # research.searxng_url is the key the research tools read (a top-level "searxng" was silently dropped)
+        cfg["research"] = {"searxng_url": integ["searxng_url"]}
     return cfg
 
 
@@ -385,7 +406,7 @@ OWNS: dict[str, tuple[str, ...]] = {
     "providers": ("providers",),
     "tiers": ("providers", "tiers"),
     "permissions": ("permission_mode", "permissions"),
-    "integrations": ("mcp", "skills", "mem0", "searxng"),
+    "integrations": ("mcp", "skills", "mem0", "research"),
     "theme": ("display", "panes"),
 }
 
@@ -420,6 +441,17 @@ def write_config(data: dict[str, Any], only: str | None = None) -> Path:
             cfg.pop("providers")
         merged = existing
     merged = {**merged, **cfg}
+    if only in (None, "integrations") and "integrations" in data:
+        # the integrations answer owns searxng_url only: the user's other research.* keys (max_subquestions, ...)
+        # survive a re-run, and a blank answer clears the URL. The legacy top-level searxng key is migrated away.
+        research = {k: v for k, v in dict(existing.get("research") or {}).items() if k != "searxng_url"}
+        if url := (data.get("integrations") or {}).get("searxng_url"):
+            research["searxng_url"] = url
+        merged.pop("searxng", None)
+        if research:
+            merged["research"] = research
+        else:
+            merged.pop("research", None)
     confio.validate(merged)
     confio.write_yaml(path, merged)
     return path
