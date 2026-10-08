@@ -273,3 +273,25 @@ def test_check_reports_the_node_floor_of_20(tmp_path: Path) -> None:
     assert r.returncode == 0, r.stderr
     assert "node 20+ with npm" in r.stderr
     assert "node 18" not in r.stderr
+
+
+def test_uninstall_removes_presetup_leftovers_and_keeps_user_data(tmp_path: Path) -> None:
+    assert run(tmp_path, INSTALL, "--from-source", "--yes").returncode == 0
+    data = tmp_path / ".local" / "share" / "k3code"
+    (data / "presetup").mkdir()
+    (data / "presetup" / "chromium-marker").write_text("ok\n")
+    (data / "browsers" / "chromium-1").mkdir(parents=True)
+    (data / "browsers" / "chromium-1" / "chrome").write_text("binary\n")
+    (tmp_path / ".k3code").mkdir(exist_ok=True)
+    (tmp_path / ".k3code" / "config.yaml").write_text("x: 1\n")
+    (tmp_path / ".config" / "k3code").mkdir(parents=True)
+    (tmp_path / ".config" / "k3code" / "env").write_text("EXAMPLE_NAME=placeholder\n")
+
+    r = run(tmp_path, UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert not data.exists()  # presetup markers and the browser location go with the install
+    assert (tmp_path / ".k3code" / "config.yaml").is_file()
+    assert (tmp_path / ".config" / "k3code" / "env").is_file()
+    assert run(tmp_path, UNINSTALL, "--purge").returncode == 0
+    assert not (tmp_path / ".k3code").exists()
+    assert not (tmp_path / ".config" / "k3code").exists()
