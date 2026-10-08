@@ -13,7 +13,7 @@ def load(name: str) -> dict:
 
 def test_ci_jobs() -> None:
     wf = load("ci.yml")
-    assert set(wf["jobs"]) == {"core", "tui", "panes", "vendor_check"}
+    assert set(wf["jobs"]) == {"core", "installer-macos", "installer-windows", "tui", "panes", "vendor_check"}
     for job in wf["jobs"].values():
         assert job["runs-on"] and job["steps"]
 
@@ -22,5 +22,5 @@ def test_release_triggers_on_tags_and_ships_assets() -> None:
     wf = load("release.yml")
     assert wf[True]["push"]["tags"] == ["v*"]  # PyYAML parses the key `on` as True
     text = (WF / "release.yml").read_text()
-    for needle in ("SHA256SUMS", "k3-linux-$arch", "k3code-tui-", "uv build --wheel", "gh release create"):
+    for needle in ("SHA256SUMS", "k3-$os-$arch", "k3code-tui-", "uv build --wheel", "gh release create"):
         assert needle in text

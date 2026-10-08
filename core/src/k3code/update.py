@@ -331,7 +331,7 @@ def install_release(rel: Release, token: str | None, uv: str | None = None) -> P
         import platform
 
         arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine(), platform.machine())
-        k3 = files.get(f"k3-linux-{arch}")
+        k3 = files.get(f"k3-{sys.platform}-{arch}")  # linux or darwin
         if k3:
             (vdir / "bin").mkdir()
             shutil.copy2(k3, vdir / "bin" / "k3")

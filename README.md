@@ -47,10 +47,13 @@ k3code plans before it acts, can run several agents in parallel, retries through
 
 - **Linux** on x86_64 is the tested platform: a clean install was tested in a Fedora 44 container. aarch64 (arm64) is accepted but untested.
 - **macOS** (Intel and Apple silicon) uses the same installer. It is untested; the 24/7 service and the bubblewrap sandbox are Linux-only.
-- **Windows** runs k3code inside [WSL 2](https://learn.microsoft.com/windows/wsl/install) with a Linux distribution such as Ubuntu. `install\install.ps1` drives the Linux installer in WSL and adds `k3code` and `k3` commands to Windows. Native Windows, Git Bash and Cygwin are not supported. Untested on a real Windows machine so far.
-- `git` (for the default `--from-git` install), `curl` or `wget`, and a POSIX shell. Network access is needed during install.
-- [`uv`](https://docs.astral.sh/uv/) is required and manages Python ≥ 3.12. If `uv` is missing, the installer asks before installing it into your home directory (`--yes` answers yes). The installer needs no root.
-- Optional: `bubblewrap` (`bwrap`) to sandbox unattended runs, `systemd --user` for the 24/7 service, Node 18+ with npm (builds the TUI; without it k3code uses the line REPL), and Go (builds the `k3` binary). The installer never installs Node or Go.
+- **Windows** runs k3code inside [WSL 2](https://learn.microsoft.com/windows/wsl/install). `install\install.ps1` sets up WSL with Ubuntu if needed, runs the Linux installer there and adds `k3code` and `k3` commands to Windows. Native Windows, Git Bash and Cygwin are not supported. Untested on a real Windows machine so far.
+- You need `git`, `curl` or `wget`, a POSIX shell and network access during install. Everything else is fetched into your home directory without root, when it is not already installed:
+  - [`uv`](https://docs.astral.sh/uv/), which provides Python ≥ 3.12;
+  - a private Node 22, from nodejs.org and checked against its published checksums, to build and run the TUI;
+  - the Go toolchain `panes/go.mod` asks for, from the Go module proxy, to build the `k3` binary. Its module cache is deleted after the build.
+- `bubblewrap` (`bwrap`), which sandboxes unattended runs on Linux, comes from your package manager. The installer installs it only when that needs no password (root or passwordless sudo); otherwise it prints the command to run. `--no-install-deps` turns all fetching off.
+- Optional: `systemd --user` for the 24/7 service.
 
 ### Install
 
@@ -63,25 +66,24 @@ git clone https://github.com/K3NOXOFFICIAL/k3code.git && cd k3code
 sh install/install.sh          # the latest v* tag, or Main until a tag exists
 ```
 
-On macOS, `xcode-select --install` provides `git`; `brew install uv node go` covers the rest if you use Homebrew (the installer offers to install `uv` itself).
+On macOS, `xcode-select --install` provides `git`; the installer fetches the rest.
 
 **Windows** (PowerShell, from a clone on Windows)
 
 ```powershell
-wsl --install -d Ubuntu        # once, if WSL has no distribution yet; restart, open Ubuntu, create your user
 git clone https://github.com/K3NOXOFFICIAL/k3code.git; cd k3code
 powershell -ExecutionPolicy Bypass -File install\install.ps1
 ```
 
-`install.ps1` runs `install/install.sh` in your default WSL distribution (`-Distro NAME` picks another), so the install lives in WSL under `~/.local/share/k3code/`. It then writes `k3code.cmd` and `k3.cmd` to `%LOCALAPPDATA%\k3code\bin` and adds that folder to your user `PATH` (`-NoModifyPath` skips that). Open a new terminal and `k3code` starts in WSL, in the folder you ran it from. Every other argument goes to `install.sh` unchanged, so `--from-source`, `--ref`, `--yes` and `--check` work as below. Building from a checkout on the Windows drive is slow; cloning inside WSL and running `sh install/install.sh` there works too, but then you get no Windows commands. Uninstall with `install\uninstall.ps1` (`-Purge` also deletes your k3code data in WSL).
+If WSL has no Linux distribution yet, `install.ps1` first runs `wsl --install -d Ubuntu`. Windows asks for administrator approval, and Ubuntu opens once in the same window so you can choose a Linux user name. If Windows asks for a restart, restart and run the installer again. After that, `install.ps1` runs `install/install.sh` in your default WSL distribution (`-Distro NAME` picks another), so the install lives in WSL under `~/.local/share/k3code/`. It then writes `k3code.cmd` and `k3.cmd` to `%LOCALAPPDATA%\k3code\bin` and adds that folder to your user `PATH` (`-NoModifyPath` skips that). Open a new terminal and `k3code` starts in WSL, in the folder you ran it from. Every other argument goes to `install.sh` unchanged, so `--from-source`, `--ref`, `--yes` and `--check` work as below. Building from a checkout on the Windows drive is slow; cloning inside WSL and running `sh install/install.sh` there works too, but then you get no Windows commands. Uninstall with `install\uninstall.ps1` (`-Purge` also deletes your k3code data in WSL).
 
 **All platforms**
 
 To install from the checkout you already have, use `sh install/install.sh --from-source` (on Windows: `install\install.ps1 --from-source`).
 
-The installer creates a versioned install under `~/.local/share/k3code/` and links `k3code` into `~/.local/bin/` (put that on your `PATH`), and links `k3` too when Go was available to build it. It never runs onboarding; it ends by telling you to run `k3code onboard`. Re-running it upgrades in place and keeps the previous version for rollback.
+The installer creates a versioned install under `~/.local/share/k3code/` and links `k3code` into `~/.local/bin/` (put that on your `PATH`), and links `k3` too. It never runs onboarding; it ends by telling you to run `k3code onboard`. Re-running it upgrades in place and keeps the previous version for rollback.
 
-Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--yes` (installs `uv` without asking), `--no-install-deps`, `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`). Uninstall with `sh install/uninstall.sh`; it keeps your data unless you pass `--purge`.
+Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--no-install-deps` (fetch nothing; fail or skip with hints instead), `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`). Uninstall with `sh install/uninstall.sh`; it keeps your data unless you pass `--purge`.
 
 ### First run
 

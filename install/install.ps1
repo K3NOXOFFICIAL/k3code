@@ -1,8 +1,9 @@
 <#
 k3code installer for Windows. k3code runs in WSL (Windows Subsystem for Linux): this script runs
 install/install.sh inside a WSL distribution and adds k3code.cmd and k3.cmd to Windows, so `k3code`
-works from PowerShell and cmd and opens in the current directory. No administrator rights are needed
-unless WSL itself still has to be installed.
+works from PowerShell and cmd and opens in the current directory. When WSL has no Linux distribution yet,
+it runs `wsl --install -d Ubuntu` first (Windows asks for administrator approval once). Everything else
+k3code needs inside WSL (uv, Python, Node, Go) is fetched by install.sh without root.
 
   powershell -ExecutionPolicy Bypass -File install\install.ps1                 # the latest v* tag, else Main
   powershell -ExecutionPolicy Bypass -File install\install.ps1 --from-source   # this checkout
@@ -80,13 +81,25 @@ if (-not $env:K3_WSL -and $env:OS -ne 'Windows_NT') {
   Die 'install.ps1 is for Windows. On Linux and macOS run: sh install/install.sh'
 }
 if (-not (Get-Command $Wsl -ErrorAction SilentlyContinue)) {
-  Die ("WSL is not installed. In an administrator PowerShell run 'wsl --install', restart Windows, " +
-    'open Ubuntu once to create your Linux user, then run this installer again.')
+  Die 'this Windows has no wsl.exe: k3code needs Windows 10 version 2004 or later, or Windows 11, for WSL'
 }
 $distros = @(Get-Distros)
 if ($distros.Count -eq 0) {
-  Die ("WSL has no Linux distribution yet. Run 'wsl --install -d Ubuntu', open Ubuntu once to create " +
-    'your Linux user, then run this installer again.')
+  if ($InstallArgs -contains '--no-install-deps') {
+    Die "WSL has no Linux distribution yet and --no-install-deps is set. Run 'wsl --install -d Ubuntu', then this installer again."
+  }
+  # wsl --install turns WSL on (Windows asks for administrator approval), installs Ubuntu and opens it once
+  # in this window to choose a Linux user name. Some machines need a restart before Ubuntu can start.
+  Say 'WSL has no Linux distribution yet: installing Ubuntu (Windows may ask for administrator approval)'
+  & $Wsl --install -d Ubuntu
+  if ($LASTEXITCODE -ne 0) {
+    Die "wsl --install failed (exit $LASTEXITCODE). Run 'wsl --install -d Ubuntu' in an administrator PowerShell, restart, then run this installer again."
+  }
+  $distros = @(Get-Distros)
+  if ($distros.Count -eq 0) {
+    Say 'WSL is set up. Restart Windows if it asked you to, open Ubuntu from the Start menu once to choose your Linux user name, then run this installer again.'
+    exit 0
+  }
 }
 if ($Distro) {
   $picked = @($distros | Where-Object { $_.Name -eq $Distro })

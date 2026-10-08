@@ -158,3 +158,53 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path) -> 
     assert r.returncode == 0, r.stderr
     assert not (tmp_path / ".local" / "share" / "k3code").exists()
     assert not (appdata / "k3code").exists()
+
+
+def test_relative_prefix_gives_absolute_links(tmp_path: Path) -> None:
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "K3_STUB_VENV": "1", "K3_SKIP_TUI": "1"}
+    env |= {"K3_SKIP_GO": "1", "K3_NO_DOWNLOAD": "1"}
+    cmd = ["sh", str(INSTALL), "--from-source", "--prefix", "rel"]
+    r = subprocess.run(cmd, env=env, cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert r.returncode == 0, r.stderr
+    link = tmp_path / "rel" / "bin" / "k3code"
+    assert os.readlink(link).startswith(str(tmp_path / "rel")), os.readlink(link)
+    assert link.resolve().is_file()
+
+
+def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> None:
+    src = tmp_path / "src"
+    (src / "core").mkdir(parents=True)
+    (src / "install").mkdir()
+    (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (src / "VERSION").write_text("9.9.9\n")
+    shutil.copy(INSTALL, src / "install" / "install.sh")
+    git = ["git", "-C", str(src), "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q"], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    def version() -> str:
+        r = run(home, src / "install" / "install.sh", "--from-source", "--print-version")
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip()
+
+    clean = version()
+    assert ".dirty" not in clean
+    (src / "core" / "pyproject.toml").write_text("[project]\nname = 'y'\n")
+    dirty = version()
+    assert dirty.startswith(clean + ".dirty")
+    (src / "core" / "new.py").write_text("x = 1\n")  # an untracked file changes it again
+    assert version() not in (clean, dirty)
+
+
+def test_uninstall_removes_the_unit_under_xdg_config_home(tmp_path: Path) -> None:
+    xdg = tmp_path / "xdg"
+    unit = xdg / "systemd" / "user" / "k3code.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Unit]\n")
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CONFIG_HOME": str(xdg)}
+    r = subprocess.run(["sh", str(UNINSTALL)], env=env, capture_output=True, text=True, check=False)
+    assert r.returncode == 0, r.stderr
+    assert not unit.exists()  # removed even though no k3code is installed to do it
