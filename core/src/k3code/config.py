@@ -156,6 +156,9 @@ class Settings(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
     # Browser for web tools: {cdp_url: ""} (empty = off, never attach to a running browser by default)
     browser: dict[str, Any] = Field(default_factory=dict)
+    # /artifacts publish: {publish_dir: "" (default <home>/published), publish_url: "" (template, e.g.
+    # https://example.com/{name}; nothing is uploaded, the link is only printed)}
+    artifacts: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod

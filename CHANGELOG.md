@@ -24,7 +24,6 @@ The first version meant for people other than its author. It is alpha: the core 
 - Live-model behaviour. Most exit checks use a scripted fake provider. The live-model rows ran through the `claude-cli` provider (a local Claude Code login).
 - The 72-hour daemon soak. A 30-minute soak passed.
 - Automatic resumption of interrupted turns in the daemon. `k3code doctor` flags unresolved journal entries.
-- `/artifacts publish`. It reports that publishing is not implemented.
 - Platforms other than Linux on x86_64. macOS and Windows (through WSL) are untested on real machines. The installer is untested on Debian and on aarch64.
 - The browser tool needs Playwright, which `presetup` installs. That path is untested on a clean machine.
 - The update path against published releases. There are none yet, so the update and rollback path was only tested against local version directories.

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from k3code.config import K3CODE_HOME
+from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.providers.types import Message, StreamEvent, ToolCall
@@ -109,11 +109,12 @@ class AgentLoop:
         #: The gateway persists these after each turn.
         self.turn_messages: list[Message] = []
         # M2: reliability stack; on by default, off via ReliabilitySettings(enabled=False).
-        # Journal writes to $K3CODE_HOME unless the passed bundle set another home.
+        # Journal writes to $K3CODE_HOME unless the passed bundle set another home. Read at call time: a module
+        # constant would freeze the import-time home (the real ~/.k3code under test imports).
         if reliability is None:
-            reliability = Reliability.from_settings(None, session=session, home=K3CODE_HOME)
+            reliability = Reliability.from_settings(None, session=session, home=k3code_home())
         elif isinstance(reliability, ReliabilitySettings):
-            reliability = Reliability.from_settings(reliability, session=session, home=K3CODE_HOME)
+            reliability = Reliability.from_settings(reliability, session=session, home=k3code_home())
         self.reliability = reliability
         self.reliability.attach_router(router)
         self.reliability.events.add(self._forward_reliability_event, key="loop")
