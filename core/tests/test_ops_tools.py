@@ -39,7 +39,6 @@ async def test_doctor_json_shape(tmp_path, monkeypatch):
     names = {c["name"] for c in data["checks"]}
     for want in (
         "provider:p1",
-        "omniroute-bypass",
         "api-keys",
         "netwatch",
         "disk",
@@ -57,6 +56,17 @@ async def test_doctor_json_shape(tmp_path, monkeypatch):
     assert all(c["status"] in ("ok", "warn", "fail") and {"detail", "fix"} <= set(c) for c in data["checks"])
     assert sum(data["summary"].values()) == len(data["checks"])
     assert "sk-should-never-appear-123" not in doctor.to_json(checks)
+    assert "omniroute-bypass" not in names  # only shown when the chain has an OmniRoute entry
+
+
+async def test_doctor_fails_a_rejected_key(tmp_path, monkeypatch):
+    from k3code.setup import probe as setup_probe
+
+    monkeypatch.setenv("K3_TEST_KEY", "sk-bad")
+    monkeypatch.setattr(setup_probe, "list_models", lambda entry, key, timeout=8.0: (False, 12.0, [], "HTTP 401"))
+    checks = await doctor.check_providers(_config(_entry()), probe=True)
+    prov = next(c for c in checks if c.name == "provider:p1")
+    assert prov.status == doctor.FAIL and "rejected" in prov.detail and "k3code onboard" in prov.fix
 
 
 async def test_doctor_omniroute_bypass_and_missing_key(tmp_path, monkeypatch):
