@@ -97,3 +97,31 @@ def test_uninstall_keeps_user_data_unless_purge(tmp_path: Path) -> None:
     assert (tmp_path / ".k3code" / "config.yaml").is_file()
     assert run(tmp_path, UNINSTALL, "--purge").returncode == 0
     assert not (tmp_path / ".k3code").exists()
+
+
+def test_unit_files_share_one_restart_budget_and_a_recovery_unit(tmp_path, monkeypatch):
+    """P1-2: the repo copies, the rendered unit and the recovery unit agree; systemd gives up one start after the
+    daemon's own storm guard (safe mode), and the recovery unit starts the daemon again after a cooldown."""
+    from k3code import daemon, service
+
+    main_repo = (REPO / "install" / "systemd" / "k3code.service").read_text()
+    recover_repo = (REPO / "install" / "systemd" / "k3code-recover.service").read_text()
+    policy = ("StartLimitIntervalSec=", "StartLimitBurst=", "Restart=", "RestartSec=", "OnFailure=")
+
+    def lines(text: str) -> list[str]:
+        return [ln for ln in text.splitlines() if ln.startswith(policy)]
+
+    assert lines(main_repo) == lines(service.render_unit("/usr/bin/k3code daemon"))
+    assert service.START_LIMIT_BURST == daemon.RESTART_LIMIT + 1
+    assert service.START_LIMIT_INTERVAL_S == int(daemon.RESTART_WINDOW_S)  # noqa: SIM300
+    assert "OnFailure=k3code-recover.service" in main_repo
+    assert recover_repo == service.render_recover_unit()
+    assert "reset-failed k3code.service" in recover_repo and "systemctl --user start k3code.service" in recover_repo
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    monkeypatch.setattr(service, "_systemctl", lambda *a: subprocess.CompletedProcess(a, 0, "", ""))  # no real manager
+    service.install()
+    recover = tmp_path / "cfg" / "systemd" / "user" / "k3code-recover.service"
+    assert recover.read_text() == service.render_recover_unit()
+    service.uninstall()
+    assert not recover.exists()
