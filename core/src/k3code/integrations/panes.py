@@ -211,6 +211,20 @@ class _Hold:
 Inject = Callable[[str, str, dict[str, Any]], None]
 
 
+def readonly_verdict(obj: Any) -> str | None:
+    """For a read-only attach: the error frame to answer a client frame that would change the session with ("" to
+    drop it silently: a response to a server request), or ``None`` to forward it."""
+    if not isinstance(obj, dict):
+        return None
+    m = obj.get("method")
+    if m in READONLY_BLOCKED or (m is None and "id" in obj):
+        if m is None:
+            return ""  # a response frame: drop silently
+        return json.dumps({"jsonrpc": "2.0", "id": obj.get("id"),
+                           "error": {"code": -32000, "message": "this pane is read-only"}})
+    return None
+
+
 class PaneLink:
     """Watches the frames of one TUI<->gateway connection and mirrors them into the pane's tuios state."""
 
@@ -273,14 +287,7 @@ class PaneLink:
             return None
         if obj.get("method") is None and "id" in obj:  # the TUI answered a server request: stop any hold
             self._cancel(str(obj["id"]))
-        if self.readonly:
-            m = obj.get("method")
-            if m in READONLY_BLOCKED or (m is None and "id" in obj):
-                if m is None:
-                    return ""  # a response frame: drop silently
-                return json.dumps({"jsonrpc": "2.0", "id": obj.get("id"),
-                                   "error": {"code": -32000, "message": "this pane is read-only"}})
-        return None
+        return readonly_verdict(obj) if self.readonly else None
 
     def _on_event(self, etype: str, payload: dict[str, Any]) -> None:
         if etype == "status.update" and isinstance(payload.get("state"), str):
