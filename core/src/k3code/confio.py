@@ -59,15 +59,23 @@ def latest_backup(path: Path) -> Path | None:
     return found[-1] if found else None
 
 
-def write_yaml(path: Path, data: dict[str, Any], *, backup: bool = True) -> Path | None:
-    """Write ``data`` as YAML; the previous file is copied to ``.bak-<ts>`` first. Returns the backup."""
+def write_yaml(path: Path, data: dict[str, Any], *, backup: bool = True, keep_trust: bool = True) -> Path | None:
+    """Write ``data`` as YAML; the previous file is copied to ``.bak-<ts>`` first. Returns the backup.
+
+    ``keep_trust=False`` for content someone else wrote (an imported bundle): a project config written that way is
+    left untrusted until the user approves it with `k3code trust`.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     bak: Path | None = None
     if backup and path.is_file():
         bak = backup_path(path)
         bak.write_bytes(path.read_bytes())
-    with trust.keeping_trust(path):
-        path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+    if keep_trust:
+        with trust.keeping_trust(path):
+            path.write_text(text, encoding="utf-8")
+    else:
+        path.write_text(text, encoding="utf-8")
     return bak
 
 

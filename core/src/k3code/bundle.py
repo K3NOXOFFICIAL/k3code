@@ -14,7 +14,7 @@ from typing import Any
 import yaml
 
 from k3code import __version__ as k3_version
-from k3code import confio
+from k3code import confio, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
 from k3code.redact import REDACTED, redact, redact_session_json
@@ -172,6 +172,8 @@ class ImportReport:
     settings_written: list[str] = field(default_factory=list)
     backups: list[str] = field(default_factory=list)
     sessions: dict[str, str] = field(default_factory=dict)  # original id → imported id
+    #: the project config the bundle wrote; it is not trusted until the user runs `k3code trust`
+    untrusted_project: str | None = None
 
     def describe(self) -> str:
         lines = []
@@ -181,6 +183,10 @@ class ImportReport:
             lines.append(f"backup: {b}")
         for old, new in self.sessions.items():
             lines.append(f"session {old}" + (f" → {new} (id collided)" if old != new else " imported"))
+        if self.untrusted_project:
+            lines.append(
+                f"{self.untrusted_project} is not trusted yet: `k3code trust` shows what it changes and applies it"
+            )
         return "\n".join(lines) or "nothing imported"
 
 
@@ -198,8 +204,11 @@ def apply_bundle(
             target = user_config_path() if kind == "user" else project_config_path(cwd)
             merged = merge_settings(confio.read_yaml(target), incoming)
             confio.validate(merged)
-            bak = confio.write_yaml(target, merged)
+            # the bundle's project settings are its author's: never trusted on the user's behalf (see k3code.trust)
+            bak = confio.write_yaml(target, merged, keep_trust=kind == "user")
             rep.settings_written.append(str(target))
+            if kind != "user" and trust.decision(cwd) not in (trust.TRUSTED, trust.NONE):
+                rep.untrusted_project = str(target)
             if bak:
                 rep.backups.append(str(bak))
     if sessions:
