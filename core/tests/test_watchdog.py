@@ -96,3 +96,19 @@ async def test_kicks_older_than_an_hour_do_not_count(tmp_path, monkeypatch):
     await asyncio.wait_for(live.turn_task, 20)
     assert provider.n == 1
     await server.close()
+
+
+async def test_finished_or_paused_goals_never_become_live_sessions(tmp_path, monkeypatch):
+    from k3code.goals import GoalState
+
+    server, provider = make_server(tmp_path, monkeypatch, replies=["x"], autonomy=NO_ADVISOR)
+    done = server.store.create(cwd=str(tmp_path))
+    done.meta["goal"] = GoalState(goal="finished", status="done").to_dict()
+    server.store.save(done)
+    paused = server.store.create(cwd=str(tmp_path))
+    paused.meta["goal"] = GoalState(goal="held", status="paused", paused_reason="needs_input").to_dict()
+    server.store.save(paused)
+    assert await server.watchdog_tick() == []
+    assert done.session_id not in server.live and paused.session_id not in server.live  # no strip clutter
+    assert provider.n == 0
+    await server.close()

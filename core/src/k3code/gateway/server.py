@@ -1830,9 +1830,8 @@ class GatewayServer:
         """
         if self.halted or self.background_paused:
             return 0
-        for stored in self.store.with_meta_key("goal"):
-            goal = stored.meta.get("goal") or {}
-            if goal.get("status") == "paused" and goal.get("paused_reason") == "daemon restart":
+        for stored in self.store.with_goal_status("paused"):
+            if (stored.meta.get("goal") or {}).get("paused_reason") == "daemon restart":
                 self.goal_manager(self.live_for(stored)).resume(reset_budget=False)
         return len(await self.watchdog_tick(source="boot"))
 
@@ -1842,9 +1841,7 @@ class GatewayServer:
         if self.halted or self.background_paused:
             return []
         kicked: list[str] = []
-        for stored in self.store.with_meta_key("goal"):
-            if (stored.meta.get("goal") or {}).get("status") != "active":
-                continue
+        for stored in self.store.with_goal_status("active"):  # only active goals get a live session (and a kick)
             if await self.kick_goal(self.live_for(stored), source=source):
                 kicked.append(stored.session_id)
         return kicked
