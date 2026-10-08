@@ -42,6 +42,7 @@ from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
+from k3code.gateway import tui_display
 from k3code.gateway.protocol import (
     INTERNAL_ERROR,
     INVALID_PARAMS,
@@ -55,7 +56,6 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
-from k3code.gateway import tui_display
 from k3code.gateway.sessions import SessionStore
 from k3code.goals import GoalManager, make_judge
 from k3code.learning.hub import LearningHub
