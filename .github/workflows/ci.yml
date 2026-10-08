@@ -1,7 +1,7 @@
 name: ci
 on:
   push:
-    branches: [main, "w/**"]
+    branches: [Main, main, "w/**"]
   pull_request:
 
 jobs:
@@ -32,6 +32,12 @@ jobs:
         run: npm run build:ink
       - working-directory: tui
         run: npm run build
+      - name: typecheck
+        working-directory: tui
+        run: npm run typecheck
+      - name: eslint
+        working-directory: tui
+        run: npm run lint
       - name: vitest (known failures excluded)
         working-directory: tui
         # known-failing upstream tests go in .ci-test-excludes (one vitest --exclude glob per line)

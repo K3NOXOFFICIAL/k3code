@@ -8,7 +8,7 @@ commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
 license = "MIT"
 local_path = "core/src/k3code/providers/retry_utils.py"
 sha256_upstream = "c51c7fca5d9ce2bfd4cc5722a0f1a371a645d3839cd56646f372f9070c0f62f0"
-modified = false
+modified = true
 
 [[file]]
 project = "hermes-agent"
@@ -35,7 +35,7 @@ commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
 license = "MIT"
 local_path = "core/src/k3code/tools/fuzzy_match.py"
 sha256_upstream = "fd66dc9008ca5eb059bbdb2ddc3f164cf77e96f620ae805abd3f97c8017a0987"
-modified = false
+modified = true
 
 # --- vendored directory trees ---
 [[tree]]

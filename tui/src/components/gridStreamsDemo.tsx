@@ -50,7 +50,6 @@ const useHistory = (tick: number, sample: () => number, cap = 240) => {
       historyRef.current.splice(0, historyRef.current.length - cap)
     }
     // The sampler is intentionally re-run per tick, not per identity.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tick])
 
   return historyRef.current
