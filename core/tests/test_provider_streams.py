@@ -74,6 +74,33 @@ async def test_openai_in_band_error_chunk_raises_with_the_upstream_message():
     assert classify_api_error(exc.value, provider="o", model="m").reason == FailoverReason.server
 
 
+@pytest.mark.parametrize(
+    ("exc", "reason"),
+    [
+        (httpx.ReadTimeout(""), FailoverReason.timeout),
+        (httpx.ConnectTimeout(""), FailoverReason.timeout),
+        (httpx.ConnectError(""), FailoverReason.network),
+        (httpx.ReadError(""), FailoverReason.network),
+    ],
+)
+async def test_wrapped_transport_errors_classify_by_their_cause(exc, reason):
+    """httpx errors with an empty message became ProviderError("ReadTimeout") and classified as unknown."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise exc
+
+    def failing() -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    for provider in (
+        OpenAICompatProvider(name="o", base_url="https://o.test/v1", api_key="k", client=failing()),
+        AnthropicProvider(name="a", base_url="https://a.test", api_key="k", client=failing()),
+    ):
+        with pytest.raises(ProviderError) as err:
+            await run(provider)
+        assert classify_api_error(err.value, provider="o", model="m").reason == reason
+
+
 HI_DELTA = '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}'
 OK_ANTHROPIC = (
     'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":5}}}\n\n'

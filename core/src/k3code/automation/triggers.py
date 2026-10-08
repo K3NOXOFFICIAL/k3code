@@ -100,6 +100,7 @@ class CronTrigger(Trigger):
     async def run(self) -> None:
         now = self.clock.now()
         due = self.first_due if self.first_due is not None else self.schedule.next_after(now)
+        self.first_due = None  # used once: a restart after a crash must not fire the missed run again
         if due <= now and now - due > self.grace_s:
             logger.warning("cron automation missed its run by >%ss: skipped", self.grace_s)
             due = self.schedule.next_after(now)
@@ -150,7 +151,8 @@ class FileChangeTrigger(Trigger):
 
 async def git_out(cwd: str, *args: str) -> str:
     proc = await asyncio.create_subprocess_exec(
-        "git", *args, cwd=cwd or None, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+        "git", *args, cwd=cwd or None, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
     out, _ = await proc.communicate()
     return out.decode().strip() if proc.returncode == 0 else ""

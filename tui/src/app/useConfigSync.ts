@@ -14,6 +14,7 @@ import {
   type IndicatorStyle,
   type StatusBarMode
 } from './interfaces.js'
+import { applyPetConfig } from './petStore.js'
 import { turnController } from './turnController.js'
 import { patchUiState } from './uiStore.js'
 
@@ -268,6 +269,10 @@ export const applyDisplay = (
 
   applyConfiguredTuiTheme(d.tui_theme)
 
+  if (cfg) {
+    applyPetConfig(d.pet)
+  }
+
   patchUiState({
     battery: !!d.battery,
     busyInputMode: normalizeBusyInputMode(d.busy_input_mode),
@@ -278,7 +283,7 @@ export const applyDisplay = (
     ...(cfg ? { destructiveSlashConfirm: approvals?.destructive_slash_confirm !== false } : {}),
     detailsMode: resolveDetailsMode(d),
     detailsModeCommandOverride: false,
-    focusView: !!d.focus_view,
+    focusView: !!(d.focus_view ?? d.focus_mode),
     indicatorStyle: normalizeIndicatorStyle(d.tui_status_indicator),
     inlineDiffs: d.inline_diffs !== false,
     mouseTracking: normalizeMouseTracking(d),

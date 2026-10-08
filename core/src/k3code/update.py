@@ -71,11 +71,16 @@ def switch_to(version: str) -> None:
 
 
 def version_key(v: str) -> tuple[Any, ...]:
-    """Sortable key: numeric core, a pre-release (``-dev.3``) sorts before the release."""
+    """Sortable key: numeric core, a pre-release (``-dev.3``) sorts before the release.
+
+    Pre-release identifiers compare as semver says: numeric ones as integers (``dev.10`` > ``dev.9``; as one string
+    it was smaller), numeric before alphanumeric, and a shorter list first when it is a prefix of the other.
+    """
     v = v.lstrip("v").split("+")[0]
     core, _, pre = v.partition("-")
     nums = tuple(int(x) if x.isdigit() else 0 for x in re.split(r"[.]", core))
-    return (nums, 0 if pre else 1, pre)
+    pre_key = tuple((0, int(p), "") if p.isdigit() else (1, 0, p) for p in pre.split(".")) if pre else ()
+    return (nums, 0 if pre else 1, pre_key)
 
 
 # -- smoke test / daemon health -------------------------------------------------

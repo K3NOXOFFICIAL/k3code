@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.autonomy.proposals import Proposal, ProposalStore
+from k3code.config import Settings, load_config
 from k3code.learning import curator, distiller, learning_cfg, optimizer, permrules, projectprep, ranking, review
 from k3code.learning.decisions import DecisionLog, project_id
 
@@ -28,6 +29,7 @@ class LearningHub:
         self.log = DecisionLog(self.home, clock)
         self.store = store
         self.experiments = optimizer.Experiments(self.home, clock)
+        self.experiments.on_config_rollback = self._config_rolled_back
         self._state_path = self.home / "learning" / "state.json"
         self._tasks: set[asyncio.Task[Any]] = set()
 
@@ -148,8 +150,29 @@ class LearningHub:
                 cur = getattr(self.server.config, k, None)
                 if isinstance(cur, dict) and isinstance(v, dict):
                     cur.update(v)
+            self._reset_routers()
         return (f"Experiment {exp['id']} started: active for {exp['target_sessions']} sessions, then compared "
                 f"(auto-rollback if worse). /optimizer status")
+
+    def _config_rolled_back(self, exp: dict[str, Any]) -> None:
+        """rollback() restored the config file only: the live config kept the experiment's values until a restart."""
+        fresh = load_config(project_dir=Path.cwd())
+        for k in exp.get("patch") or {}:
+            if k not in Settings.model_fields:
+                continue
+            cur, new = getattr(self.server.config, k, None), getattr(fresh, k)
+            if isinstance(cur, dict) and isinstance(new, dict):
+                cur.clear()  # in place, like _apply_overlay: holders of the dict see the restored values
+                cur.update(new)
+            else:
+                setattr(self.server.config, k, new)
+        self._reset_routers()
+
+    def _reset_routers(self) -> None:
+        """Tier routers capture task tiers and router options when built: rebuild them on next use."""
+        reset = getattr(self.server, "reset_tier_routers", None)
+        if reset is not None:
+            reset()
 
     # ── project prep ──
 
@@ -184,8 +207,12 @@ class LearningHub:
                 config=self.server.config, min_turns=minimum, session_id=session.session_id,
                 project=project_id(session.stored.cwd or "."))
             self.emit(session, r["proposals"])
-        if self.experiments.active():
-            self.experiments.session_done(lambda since: self.metrics(since=since), notify=self._notify)
+        # Once per session and experiment (this ran on every turn), and never for background/cron/loop runs.
+        counted = set(meta.get("experiments_counted") or [])
+        fresh = {x["id"] for x in self.experiments.active()} - counted
+        if fresh and not session.background:
+            meta["experiments_counted"] = sorted(counted | fresh)
+            self.experiments.session_done(lambda since: self.metrics(since=since), notify=self._notify, ids=fresh)
         await self.maintenance(session)
 
     def _notify(self, text: str) -> None:

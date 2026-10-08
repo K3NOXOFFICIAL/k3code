@@ -82,9 +82,13 @@ class ProposalStore:
             return []
         latest: dict[str, Proposal] = {}
         for line in self.path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
+            if not line.strip():
+                continue
+            try:
                 p = Proposal(**json.loads(line))
-                latest[p.id] = p
+            except (ValueError, TypeError):
+                continue  # a torn or corrupt line must not break every read
+            latest[p.id] = p
         return list(latest.values())
 
     def get(self, pid: str) -> Proposal | None:
@@ -97,7 +101,8 @@ class ProposalStore:
         key = key or dedup_key(kind, text)
         if any(p.key == key for p in existing):
             return None
-        p = Proposal(id=f"p{len(existing) + 1}", kind=kind, text=text, action=action, key=key,
+        n = max([len(existing), *(int(x.id[1:]) for x in existing if x.id[1:].isdigit())])  # skipped lines keep ids
+        p = Proposal(id=f"p{n + 1}", kind=kind, text=text, action=action, key=key,
                      session=session, ts=time.time(), payload=payload or {}, project=project)
         self._write(p)
         return p

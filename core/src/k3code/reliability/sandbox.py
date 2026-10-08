@@ -7,6 +7,7 @@ callers fall back to running unsandboxed and ``/doctor`` warns.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -17,6 +18,8 @@ from pathlib import Path
 
 from k3code.permissions import PermissionMode
 
+logger = logging.getLogger(__name__)
+
 #: ``$HOME`` entries that stay visible inside the sandbox (rw cache, ro uv-managed pythons).
 HOME_CACHE = ".cache"
 HOME_UV = ".local/share/uv"
@@ -26,6 +29,8 @@ ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "T
 #: A failed probe is retried after this many seconds (one slow probe used to disable the sandbox for the whole
 #: daemon lifetime: every unattended session then ran bash on the real $HOME).
 REPROBE_AFTER_S = 60.0
+#: ``$HOME`` entries masked again after the project binds (a project bind can re-expose them: credentials, keys).
+HOME_SECRETS = (".config/k3code", ".ssh")
 
 
 def bwrap_path() -> str | None:
@@ -37,6 +42,12 @@ def should_sandbox(mode: PermissionMode | str, background: bool) -> bool:
     return background or PermissionMode(mode) in SANDBOXED_MODES
 
 
+def exposes_home(path: Path | str, home: Path | None = None) -> bool:
+    """True when binding ``path`` would bring back all of ``$HOME``: it is ``$HOME`` or contains it (``/``)."""
+    home = Path(home or Path.home()).resolve()
+    return home.is_relative_to(Path(path).resolve())
+
+
 def build_argv(
     cwd: Path | str,
     add_dirs: Iterable[Path | str] = (),
@@ -44,7 +55,10 @@ def build_argv(
     home: Path | None = None,
     bwrap: str | None = None,
 ) -> list[str]:
-    """The ``bwrap`` argv *prefix*; append the command (e.g. ``/bin/sh -c "..."``)."""
+    """The ``bwrap`` argv *prefix*; append the command (e.g. ``/bin/sh -c "..."``).
+
+    A project dir that is ``$HOME`` or contains it (``/``) is not bound: that would undo the home tmpfs and hand the
+    command ``~/.config/k3code/env`` and ``~/.ssh``. Those two are masked again after the binds in any case."""
     home = Path(home or Path.home())
     argv = [bwrap or bwrap_path() or "bwrap", "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc"]
     # The command gets a minimal environment, not the daemon's: it carries the provider API keys (OMNIROUTE_API_KEY,
@@ -81,7 +95,15 @@ def build_argv(
         p = str(Path(d).resolve())
         if p not in seen and os.path.isdir(p):
             seen.add(p)
+            if exposes_home(p, home):
+                logger.warning("sandbox: not binding %s (it would expose $HOME)", p)
+                continue
             argv += ["--bind", p, p]
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    secrets = [home / s for s in HOME_SECRETS] + ([Path(xdg) / "k3code"] if xdg else [])
+    for path in dict.fromkeys(str(p) for p in secrets):
+        if os.path.isdir(path):
+            argv += ["--tmpfs", path]
     argv += ["--chdir", str(Path(cwd).resolve())]
     return argv
 

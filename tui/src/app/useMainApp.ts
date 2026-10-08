@@ -60,6 +60,7 @@ import { planGatewayRecovery } from './gatewayRecovery.js'
 import { applyGoalSnapshot } from './goalStatus.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type StateSetter, type TranscriptRow } from './interfaces.js'
+import { markTurnStart } from './outputTokensStore.js'
 import { $overlayState, patchOverlayState } from './overlayStore.js'
 import { $goodVibesTick } from './petFlashStore.js'
 import { applyProcessSnapshot, type ProcessEntry } from './processRoster.js'
@@ -586,6 +587,10 @@ export function useMainApp(gw: GatewayClient) {
 
   useEffect(() => {
     if (ui.busy) {
+      if (turnStartedAt == null) {
+        markTurnStart()
+      }
+
       setTurnStartedAt(prev => prev ?? Date.now())
     } else if (turnStartedAt != null) {
       // Only stamp the idle marker when a turn was actually live — busy is

@@ -65,6 +65,24 @@ async def test_read_line_range(temp_dir):
     assert result["lines"] == "2-4 of 5"
 
 
+async def test_read_of_a_huge_file_is_refused_or_streamed_as_a_range(temp_dir, monkeypatch):
+    import k3code.tools as tools
+
+    monkeypatch.setattr(tools, "MAX_READ_BYTES", 100)
+    f = temp_dir / "big.log"
+    f.write_text("".join(f"line{i}\n" for i in range(1, 51)))  # ~340 bytes
+    result = await tool_read({"path": str(f)}, cwd=temp_dir)
+    assert "start and end" in result["error"]
+    result = await tool_read({"path": str(f), "start": 10, "end": 12}, cwd=temp_dir)
+    assert result["content"] == "line10\nline11\nline12"
+    assert result["lines"] == "10-12"
+    assert "error" in await tool_read({"path": str(f), "start": 1, "end": 50}, cwd=temp_dir)
+    f.write_text("x" * 500 + "\nafter\n")  # one line longer than the limit is skipped, not loaded
+    result = await tool_read({"path": str(f), "start": 2, "end": 2}, cwd=temp_dir)
+    assert result["content"] == "after"
+    assert "error" in await tool_read({"path": str(f), "start": 1, "end": 1}, cwd=temp_dir)
+
+
 async def test_write_file(temp_dir):
     f = temp_dir / "new.txt"
     result = await tool_write({"path": str(f), "content": "hello"}, cwd=temp_dir)
@@ -135,6 +153,31 @@ async def test_grep_finds(temp_dir):
     result = await tool_grep({"pattern": "def foo", "path": "."}, cwd=temp_dir)
     assert "a.py" in result["matches"]
     assert "foo" in result["matches"]
+
+
+def test_bash_does_not_read_the_gateways_stdin(temp_dir):
+    # In stdio mode the gateway's stdin is the TUI's JSON-RPC stream: a command must never consume it.
+    import subprocess
+    import sys
+
+    script = (
+        "import asyncio, pathlib, sys\n"
+        "from k3code.tools import tool_bash\n"
+        "r = asyncio.run(tool_bash({'command': 'head -c 40'}, cwd=pathlib.Path(sys.argv[1])))\n"
+        "print(repr(r['stdout']))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", script, str(temp_dir)], input='{"jsonrpc":"2.0","method":"x"}\n',
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert out.stdout.strip() == "''"
+
+
+async def test_grep_pattern_starting_with_a_dash(temp_dir):
+    (temp_dir / "a.txt").write_text("x\n--force here\n")
+    result = await tool_grep({"pattern": "--force", "path": "."}, cwd=temp_dir)
+    assert "--force here" in result["matches"]
+    assert "error" not in result
 
 
 async def test_grep_no_matches(temp_dir):

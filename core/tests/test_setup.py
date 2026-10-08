@@ -136,6 +136,16 @@ def test_env_file_merge_keeps_other_lines_and_mode(env: Path) -> None:
     assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
 
 
+def test_env_file_accepts_export_and_quoted_values(env: Path) -> None:
+    """`export KEY="value"` (the shell form people paste) was read as key `export KEY` with the quotes kept."""
+    p = st.env_file_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("export A_KEY=\"sk-1\"\nB_KEY='sk 2'\nC_KEY=\"half\nexport D_KEY=plain\n")
+    assert st.read_env_file(p) == {"A_KEY": "sk-1", "B_KEY": "sk 2", "C_KEY": '"half', "D_KEY": "plain"}
+    st.set_env_var("A_KEY", "sk-3")  # replaces the export line instead of adding a second A_KEY
+    assert p.read_text().count("A_KEY") == 1 and st.read_env_file(p)["A_KEY"] == "sk-3"
+
+
 def test_build_config_never_contains_key_value() -> None:
     cfg = build_config(
         {"providers": {"entries": [{"name": "x", "kind": "openai", "base_url": "u", "api_key_env": "K"}]}}

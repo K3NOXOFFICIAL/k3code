@@ -15,6 +15,9 @@ export const SPINNER_FRAMES: readonly string[] = ['·', '✢', '✳', '✶', '�
 /** Glyph shown instead of the cycle under reduced motion. */
 export const STATIC_GLYPH = '✻'
 
+/** Plain-ASCII cycle for `/indicator ascii` (terminals without these dingbats). */
+export const ASCII_SPINNER_FRAMES: readonly string[] = ['-', '\\', '|', '/']
+
 /** The working line's own timer period. Never below the animation floor. */
 export const WORKING_TICK_MS = MIN_ANIMATION_TICK_MS
 
@@ -23,8 +26,19 @@ export const WORKING_ROTATE_MS = 3500
 
 const mod = (n: number, m: number) => ((n % m) + m) % m
 
-export const workingGlyph = (tick: number, reduced: boolean): string =>
-  reduced ? STATIC_GLYPH : (SPINNER_FRAMES[mod(tick, SPINNER_FRAMES.length)] ?? STATIC_GLYPH)
+export const workingGlyph = (tick: number, reduced: boolean, ascii = false): string => {
+  const frames = ascii ? ASCII_SPINNER_FRAMES : SPINNER_FRAMES
+  const still = ascii ? '*' : STATIC_GLYPH
+
+  return reduced ? still : (frames[mod(tick, frames.length)] ?? still)
+}
+
+/** Like `fmtDuration`, but keeps the seconds past an hour so a long turn's clock visibly ticks. */
+export const workingDuration = (ms: number): string => {
+  const t = Math.max(0, Math.floor(ms / 1000))
+
+  return t >= 3600 ? `${Math.floor(t / 3600)}h ${Math.floor((t % 3600) / 60)}m ${t % 60}s` : fmtDuration(ms)
+}
 
 /** Pick an index in [0, count). With `exclude`, never returns that index (when count > 1). */
 export const pickMessageIndex = (rng: Rng, count: number, exclude = -1): number => {
@@ -94,6 +108,8 @@ export interface WorkingLineParts {
   glyph: string
   /** The message text, without the trailing ellipsis. */
   message: string
+  /** ASCII only (`/indicator ascii`): `...` and no arrow. */
+  ascii?: boolean
 }
 
 /** `✢ Deciphering… (41m 1s · ↓ 135.2k tokens · thinking with xhigh effort)`.
@@ -103,17 +119,20 @@ export const formatWorkingLine = ({
   outputTokens = 0,
   effort = '',
   glyph,
-  message
+  message,
+  ascii = false
 }: WorkingLineParts): string => {
-  const detail: string[] = [fmtDuration(elapsedMs)]
+  const detail: string[] = [workingDuration(elapsedMs)]
 
   if (outputTokens > 0) {
-    detail.push(`↓ ${compactNumber(outputTokens)} tokens`)
+    detail.push(`${ascii ? '' : '↓ '}${compactNumber(outputTokens)} tokens`)
   }
 
   if (effort) {
     detail.push(`thinking with ${effort} effort`)
   }
 
-  return `${glyph} ${message}… (${detail.join(' · ')})`
+  return ascii
+    ? `${glyph} ${message}... (${detail.join(', ')})`
+    : `${glyph} ${message}… (${detail.join(' · ')})`
 }

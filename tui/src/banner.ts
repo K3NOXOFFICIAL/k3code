@@ -59,19 +59,19 @@ const HERO_ART = [
   '⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣶⣶⣶⣤⣤⣤⣤⣄⣄⣄',
   '⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣶⣶⣶⣤⣤⣤',
   '⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣷⣶⣶',
-  '              ',
-  '  ██╗  █████╗ ',
-  '  ██║ ██╔██╗',
-  '  ██║█████╔╝',
-  '  ██║██╔═██╗',
-  '  ██║██║ ██║',
-  '  ██║██║ ██║',
-  '  ╚═╝╚═╝ ╚═╝',
-  '              '
+  '',
+  '  ██╗  ██╗ ██████╗',
+  '  ██║ ██╔╝ ╚════██╗',
+  '  █████╔╝   █████╔╝',
+  '  ██╔═██╗   ╚═══██╗',
+  '  ██║  ██╗ ██████╔╝',
+  '  ╚═╝  ╚═╝ ╚═════╝',
+  ''
 ]
 
 const LOGO_GRADIENT = [0, 0, 1, 1, 2, 2] as const
-const HERO_GRADIENT = [2, 2, 1, 1, 0, 0, 3, 3, 1, 1, 1, 1, 1, 1, 3] as const
+// Braille swoosh, blank, the K3 mark (same face as the logo, primary to accent), blank.
+const HERO_GRADIENT = [2, 2, 1, 1, 0, 0, 3, 0, 0, 0, 1, 1, 1, 3] as const
 
 const colorize = (art: string[], gradient: readonly number[], c: ThemeColors): Line[] => {
   const p = [c.primary, c.accent, c.border, c.muted]

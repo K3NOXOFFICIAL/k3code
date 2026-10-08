@@ -210,6 +210,35 @@ def test_override_keeps_the_danger_floor():
     assert v.source == "override" and v.risk == "high" and v.needs_plan
 
 
+def test_classify_builds_the_repo_summary_off_the_event_loop(tmp_path, monkeypatch):
+    """repo_summary (os.walk + git status) ran on the event loop and froze every session on a big tree."""
+    import asyncio
+    import threading
+
+    from k3code.autonomy import scope
+
+    threads = []
+    monkeypatch.setattr(scope, "repo_summary", lambda cwd: threads.append(threading.current_thread()) or "0 files")
+    asyncio.run(classify(_Caller('{"scope":"small"}'), "tidy up", tmp_path))
+    assert threads and threads[0] is not threading.main_thread()
+
+
+def test_corrupt_jsonl_lines_are_skipped(tmp_path):
+    """One torn or corrupt line made ScopeLog.read and ProposalStore.all raise for every later read."""
+    log = ScopeLog(tmp_path)
+    log.verdict("do x", ScopeVerdict(scope="small"))
+    with log.path.open("a") as f:
+        f.write('{"ts": 1, "type": "outc\n[1, 2]\n')
+    log.outcome("h", "done")
+    assert [r["type"] for r in log.read()] == ["verdict", "outcome"]
+    store = ProposalStore(tmp_path)
+    store.add("improvement", "first", "a")
+    with store.path.open("a") as f:
+        f.write('{"id": "p2", "kind": "improvement", "te\n{"unknown_field": 1}\n')
+    assert [p.text for p in store.all()] == ["first"]
+    assert store.add("improvement", "second", "b").id == "p2"
+
+
 def test_scope_log_roundtrip(tmp_path):
     log = ScopeLog(tmp_path)
     h = log.verdict("do x", ScopeVerdict(scope="small"), "s1")

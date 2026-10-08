@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { PET_NAMES, PETS } from '../content/pets.js'
 import { TerminalPet } from '../components/terminalPet.js'
 import { WorkingLine } from '../components/workingLine.js'
-import { PET_DONE_HOLD_MS, PET_TICK_MS } from '../lib/terminalPet.js'
+import { PET_DONE_HOLD_MS, PET_IDLE_BLINK_EVERY_MS, PET_IDLE_BLINK_MS, PET_TICK_MS } from '../lib/terminalPet.js'
 import { WORKING_TICK_MS } from '../lib/workingLine.js'
 import { DEFAULT_THEME } from '../theme.js'
 
@@ -154,7 +154,7 @@ describe('animated timers', () => {
     view.unmount()
   })
 
-  it('a finished turn keeps the pet timer through done, then stops it once the hold has passed', async () => {
+  it('a finished turn keeps the pet timer through done, then drops to the slow idle blink', async () => {
     const before = vi.getTimerCount()
     const view = mount(<TerminalPet busy name="owl" needsInput={false} t={DEFAULT_THEME} />)
 
@@ -168,7 +168,16 @@ describe('animated timers', () => {
     vi.advanceTimersByTime(PET_DONE_HOLD_MS + PET_TICK_MS)
     await settle()
 
-    expect(vi.getTimerCount()).toBe(before)
+    // Only the idle blink timer is left (one interval every PET_IDLE_BLINK_EVERY_MS).
+    expect(vi.getTimerCount()).toBe(before + 1)
+    expect(view.output()).toContain(PETS.owl.idle[0][1].trimEnd())
+
+    vi.advanceTimersByTime(PET_IDLE_BLINK_EVERY_MS)
+    await settle()
+    expect(view.output()).toContain(PETS.owl.idle[2][1].trimEnd())
+
+    vi.advanceTimersByTime(PET_IDLE_BLINK_MS)
+    await settle()
     expect(view.output()).toContain(PETS.owl.idle[0][1].trimEnd())
 
     view.unmount()

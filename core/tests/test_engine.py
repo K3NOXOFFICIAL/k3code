@@ -153,6 +153,34 @@ def test_read_outside_roots_asks() -> None:
     assert d.action == "ask"
 
 
+def test_symlink_out_of_the_project_is_outside_roots(tmp_path) -> None:
+    proj, outside = tmp_path / "proj", tmp_path / "outside"
+    proj.mkdir()
+    outside.mkdir()
+    (proj / "docs").symlink_to("../outside")
+    d = decide(mode="accept-edits", tool="write", args={"path": "docs/evil.txt"}, cwd=str(proj))
+    assert d.action == "ask"
+    d = decide(mode="accept-edits", tool="write", args={"path": "src/new/x.py"}, cwd=str(proj))
+    assert d.action == "allow"  # a path that does not exist yet is still inside
+    d = decide(mode="default", tool="bash", args={"command": "ls > docs/x"}, cwd=str(proj),
+               session_rules=[_r("bash", "ls *", "allow")])
+    assert d.action == "ask"
+
+
+def test_bash_cwd_resolves_redirects_and_outside_cwd_asks() -> None:
+    session = [_r("bash", "echo *", "allow")]
+
+    def action(command: str, cwd: str) -> str:
+        return decide(mode="default", tool="bash", args={"command": command, "cwd": cwd}, cwd=CWD,
+                      session_rules=session).action
+
+    assert action("echo hi > out.txt", "sub") == "allow"
+    assert action("echo hi > out.txt", "/etc") == "ask"  # writes /etc/out.txt
+    assert action("echo hi > .bashrc", "..") == "ask"
+    assert action("ls", "/") == "ask"  # a read-only command run outside the project asks too
+    assert action("ls", ".") == "allow"
+
+
 def test_explicit_rule_allows_outside_path() -> None:
     user = [_r("read", "/etc/passwd", "allow")]
     d = decide(mode="default", tool="read", args={"path": "/etc/passwd"}, cwd=CWD, user_rules=user)

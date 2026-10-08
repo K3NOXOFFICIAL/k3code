@@ -78,9 +78,13 @@ export interface ConfigDisplayConfig {
   bell_on_prompt?: boolean
   busy_input_mode?: string
   details_mode?: string
+  /** k3code stores /focus as `focus_mode`; `focus_view` is the Hermes name. */
+  focus_mode?: boolean
   /** Focus view (/focus) — display-only reduced-output mode. */
   focus_view?: boolean
   inline_diffs?: boolean
+  /** Terminal pet: `off`, `on`, or a pet name (saved by /pet). */
+  pet?: string
   mouse_tracking?: boolean | null | number | string
   sections?: Record<string, string>
   show_cost?: boolean

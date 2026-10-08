@@ -153,6 +153,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 | **Review and learning** | `/review` · `/proposals` · `/learn` · `/optimizer` · `/self-improve` |
 | **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
 | **Operations** | `/doctor` · `/stats` · `/debug` · `/daemon` · `/update` · `/help` |
+| **Look and feel** (TUI) | `/pet` (`on`, `off`, `random` or a pet name: blob, cat, crab, duck, ghost, hamster, owl, robot; shown at 100+ columns) · `/indicator` (`ascii` for terminals without Unicode glyphs) · `/theme` · `/statusbar` · `/focus`. These choices are saved to `display` in `~/.k3code/config.yaml`. Set `K3_NO_ANIMATION=1` to stop the spinner, messages and pet from moving. |
 
 ### Permission modes
 
@@ -187,7 +188,7 @@ k3        # the multi-window terminal (built from panes/ by the installer)
 | (typing) | Everything goes to the focused pane, like a normal terminal |
 | `Ctrl+G` | Leader: then `p` panes, `t` tabs, `s` sessions, `r` resize, `/` search, `a` agents, `?` help |
 | `Esc` | Always back to typing |
-| `Alt+←↑↓→` | Focus a neighbouring pane (in typing mode; the leader modes ignore it) |
+| `Alt+←↑↓→` | Focus a neighbouring pane (works in every mode) |
 | `Alt+n` / `Alt+1…9` / `Alt+z` | New pane / jump to workspace / zoom |
 | `Ctrl+P` | Command palette (a searchable list of actions; its right-hand column shows the underlying TUIOS keys, not the k3 keys above) |
 

@@ -30,6 +30,38 @@ async def test_every_minute_two_runs_with_history(tmp_path):
     await s.close()
 
 
+async def test_a_restart_mid_run_does_not_rerun_the_job(tmp_path):
+    """next_run_at only advanced when the run finished: a daemon restart mid-run found the job still due and ran it
+    again at once."""
+    c, db = clock(), make_db(tmp_path)
+    release = asyncio.Event()
+
+    class SlowRunner(FakeRunner):
+        async def run_prompt(self, prompt, **kw):
+            self.prompts.append({"prompt": prompt, **kw})
+            await release.wait()
+            return OK
+
+    r = SlowRunner()
+    s = JobScheduler(db, r, c)
+    s.start()
+    job = s.add(prompt="p", schedule="*/10 * * * *", name="j")
+    due = db.get("jobs", job["id"])["next_run_at"]
+    await c.advance(due - c.now() + 1)
+    for _ in range(100):
+        if r.prompts:
+            break
+        await asyncio.sleep(0.01)
+    assert len(r.prompts) == 1 and db.get("jobs", job["id"])["next_run_at"] > c.now()  # advanced at start
+    await s.close()  # the daemon dies mid-run
+    r2 = FakeRunner([OK])
+    s2 = JobScheduler(db, r2, c)
+    s2.start()
+    await c.advance(5)
+    assert r2.prompts == []
+    await s2.close()
+
+
 async def test_pause_resume_rm_run_now(tmp_path):
     c, db, r, s = mk(tmp_path, [OK])
     job = s.add(prompt="p", schedule="5m", name="j")

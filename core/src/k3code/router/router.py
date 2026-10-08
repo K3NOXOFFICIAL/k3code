@@ -246,6 +246,10 @@ class Router:
                         messages, tools, target_model, max_tokens=max_tokens, temperature=temperature
                     ):
                         streamed = True
+                        if event.type == "done":  # the consumer stops reading here: record the success first
+                            self.cooldowns.record_success(
+                                provider=entry.provider_name, model=target_model, base_url=entry.base_url
+                            )
                         yield event
                     # The provider yields its "done" event then closes normally.
                     return
@@ -299,7 +303,7 @@ class Router:
                     await self._sleep(delay)
             entry_index += 1
         # every entry exhausted
-        self._emit_exhausted(last_reason)
+        self._emit_exhausted(last_reason, last_detail)
         if all_network and last_reason is not None:
             raise AllProvidersUnreachable(
                 "all provider entries are unreachable (network errors)", attempts=len(self.chain)
@@ -401,13 +405,14 @@ class Router:
             extra={"model": next_entry.model} if next_entry is not None else {},
         )
 
-    def _emit_exhausted(self, last_reason: FailoverReason | None) -> None:
+    def _emit_exhausted(self, last_reason: FailoverReason | None, last_detail: str = "") -> None:
+        tried = f"{len(self.chain)} provider{'s' if len(self.chain) != 1 else ''} tried"
         self._emit(
             "router.exhausted",
             None,  # walk-level event, no single entry
             attempt=len(self.chain),
             reason=last_reason.value if last_reason else "unknown",
-            detail=f"{len(self.chain)} chain entries exhausted",
+            detail=f"{tried}; last error: {last_detail}" if last_detail else tried,
         )
 
     def _emit(

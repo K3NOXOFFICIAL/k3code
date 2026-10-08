@@ -206,6 +206,10 @@ class ClaudeCliProvider(Provider):
         except asyncio.CancelledError:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, 9)
+            # Reap it (a zombie and its pipe transports otherwise linger); shielded so the cancel cannot skip it,
+            # bounded so a stuck process cannot hold the cancellation up.
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(asyncio.shield(proc.wait()), 5)
             raise
         return proc.returncode or 0, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
 

@@ -17,7 +17,7 @@ Press `ctrl+g` anywhere to open the **Chooser** (MODES). Then press one letter:
 | `s` | SESSIONS | Session management |
 | `r` | RESIZE | Resize pane splits |
 | `/` | SEARCH | Scrollback search & inbox |
-| `a` | AGENTS | Agent placeholder (reserved) |
+| `a` | AGENTS | Agents: Inbox, next waiting pane, agent settings |
 | `?` | — | Toggle help |
 | `esc` | — | Back to typing |
 
@@ -140,8 +140,11 @@ any session: prompts and approvals from that pane are refused.
 
 ## User overrides: `~/.config/k3/keys.toml`
 
-Flat `key = "action"` pairs; prefix with `mode:` to bind in a mode other than
-typing. Unknown modes are ignored; user bindings win over defaults.
+Flat `key = "action"` pairs (a `[panes]` table with the same pairs also works);
+prefix with `mode:` to bind in a mode other than typing. Entries with an unknown
+mode are skipped with a warning on startup, as is a file that does not parse.
+User bindings win over defaults, and overriding a global key changes it in every
+mode.
 
 ```toml
 # typing mode (no prefix)

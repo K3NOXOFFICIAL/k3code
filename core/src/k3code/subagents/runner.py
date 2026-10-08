@@ -21,6 +21,7 @@ from k3code.agent.loop import AgentLoop
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.prompting import build_system_prompt
+from k3code.providers.types import ToolCall
 from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings
 from k3code.routing.tiers import TaskKind, Tier, tier_for
 from k3code.subagents import worktree as wt_mod
@@ -29,6 +30,8 @@ from k3code.subagents.types import AgentType, load_agent_types
 logger = logging.getLogger(__name__)
 
 MAX_DEPTH = 2
+#: finished handles kept for /agents and the strip; older ones are evicted (the registry grew for the daemon's life)
+KEEP_FINISHED_HANDLES = 200
 
 
 class DepthLimit(Exception):
@@ -204,13 +207,14 @@ class SubagentManager:
         """Wait for the child. A cancellation of the *child* (interrupt) is its result; a cancellation of the
         *waiter* (/stop on the parent turn) is not swallowed, and takes the child down with it. The old
         ``suppress(CancelledError)`` ate both, so /stop was ignored by every ultracode/ultraplan/fan-out chain."""
-        if h.task is not None:
+        task = h.task  # a finished child drops its task ref (see _run)
+        if task is not None:
             try:
-                await asyncio.shield(h.task)
+                await asyncio.shield(task)
             except asyncio.CancelledError:
-                if h.task.cancelled() or h.task.done():
+                if task.cancelled() or task.done():
                     return h  # the child itself was interrupted
-                h.task.cancel()  # we were cancelled while the child still runs: stop it too
+                task.cancel()  # we were cancelled while the child still runs: stop it too
                 raise
         return h
 
@@ -295,6 +299,15 @@ class SubagentManager:
             rel = getattr(parent, "reliability", None)
             if rel is not None and rel.governor is not None:  # the parent's session budget includes its children
                 rel.governor.charge(h.tokens_in, h.tokens_out)
+            h.loop = None  # the loop holds the child's whole history; the handle keeps only what /agents shows
+            h.task = None
+            self._prune()
+
+    def _prune(self) -> None:
+        """Evict the oldest finished handles beyond ``KEEP_FINISHED_HANDLES``."""
+        finished = sorted((x for x in self.handles.values() if x.done), key=lambda x: x.finished_at)
+        for old in finished[: max(0, len(finished) - KEEP_FINISHED_HANDLES)]:
+            self.handles.pop(old.id, None)
 
     async def _finish_worktree(self, h: Handle, auto_merge: bool) -> None:
         wt = h.worktree
@@ -374,18 +387,29 @@ class SubagentManager:
         final = ""
         try:
             stream = loop.run(prompt, max_tokens=server.config.max_tokens, temperature=server.config.temperature)
+            seen: set[str] = set()  # call ids already counted (claude_cli streams them, then repeats them on done)
+
+            def on_tool(tc: ToolCall) -> None:
+                if tc.id in seen:
+                    return
+                seen.add(tc.id)
+                h.tool_count += 1
+                h.last_tool = tc.name
+                args = tc.arguments or {}
+                preview = str(args.get("command") or args.get("path") or args.get("pattern")
+                              or args.get("description") or "")[:120]
+                h.tail.append(f"{tc.name} {preview}".strip())
+                self._emit(parent, "subagent.tool", h, tool_name=tc.name, tool_preview=preview, text=preview)
+
             async for ev in stream:
                 if ev.type == "tool_call" and ev.tool_call:
-                    h.tool_count += 1
-                    h.last_tool = ev.tool_call.name
-                    args = ev.tool_call.arguments or {}
-                    preview = str(args.get("command") or args.get("path") or args.get("pattern")
-                                  or args.get("description") or "")[:120]
-                    h.tail.append(f"{ev.tool_call.name} {preview}".strip())
-                    self._emit(parent, "subagent.tool", h, tool_name=ev.tool_call.name, tool_preview=preview,
-                               text=preview)
+                    on_tool(ev.tool_call)
                 elif ev.type == "done" and ev.message and ev.message.role == "assistant":
                     msg = ev.message
+                    # openai_compat and anthropic stream no tool_call events: their calls arrive on this message
+                    for tc in msg.tool_calls:
+                        on_tool(tc)
+                    seen.clear()
                     if msg.usage:
                         h.tokens_in += msg.usage.prompt_tokens
                         h.tokens_out += msg.usage.completion_tokens

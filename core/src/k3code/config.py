@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +79,10 @@ class Mem0Config(BaseModel):
 
 
 class DisplayConfig(BaseModel):
+    # TUI-only settings (tui_theme, tui_status_indicator, tui_statusbar, battery, pet, ...) are kept as extra
+    # fields: the gateway stores them for the TUI (gateway/tui_display.py) and config.full hands them back.
+    model_config = ConfigDict(extra="allow")
+
     theme: str = ""
     focus_mode: bool = False
 

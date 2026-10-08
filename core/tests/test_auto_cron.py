@@ -79,3 +79,17 @@ def test_cron_next_is_strictly_after_inside_the_dst_fall_back_hour():
                 assert datetime.fromtimestamp(nxt, berlin).minute == minute
     # second pass, 02:45 CET: "50 2" is 02:50 CET (five minutes later), not 02:50 CEST (an hour ago)
     assert cron_next("50 2 * * *", at(2, 45, 1), berlin) == at(2, 50, 1)
+
+
+def test_cron_fires_once_across_the_dst_spring_forward_gap():
+    """Europe/Berlin skips 02:00-03:00 on 2026-03-29. For the nonexistent 02:30, fold=1 is the pre-gap reading
+    (01:30 CET), so `daily 02:30` fired at 01:30 and again at 03:30 the same night."""
+    from zoneinfo import ZoneInfo
+
+    berlin = ZoneInfo("Europe/Berlin")
+    t = datetime(2026, 3, 28, 12, 0, tzinfo=berlin).timestamp()
+    fires = []
+    for _ in range(3):
+        t = cron_next("30 2 * * *", t, berlin)
+        fires.append(datetime.fromtimestamp(t, berlin).strftime("%m-%d %H:%M"))
+    assert fires == ["03-29 03:30", "03-30 02:30", "03-31 02:30"]
