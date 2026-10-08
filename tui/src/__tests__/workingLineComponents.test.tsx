@@ -5,6 +5,13 @@ import React from 'react'
 import stripAnsi from 'strip-ansi'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import {
+  $sessionOutputTokens,
+  $turnTokenBaseline,
+  addStreamedText,
+  markTurnStart,
+  settleOutput
+} from '../app/outputTokensStore.js'
 import { PET_NAMES, PETS } from '../content/pets.js'
 import { TerminalPet } from '../components/terminalPet.js'
 import { WorkingLine } from '../components/workingLine.js'
@@ -219,6 +226,24 @@ describe('animated timers', () => {
     expect(parentRenders).toBe(1)
 
     view.unmount()
+  })
+
+  it('the working line counts streamed text while the reply streams, then the real usage', async () => {
+    $sessionOutputTokens.set(0)
+    markTurnStart()
+    const view = mount(<WorkingLine busy startedAt={Date.now()} t={DEFAULT_THEME} />)
+
+    addStreamedText('x'.repeat(400))
+    await settle()
+    expect(view.output()).toContain('↓ 100 tokens')
+
+    settleOutput(87)
+    await settle()
+    // Frames stream out in order: the newest one comes last.
+    expect(view.output().lastIndexOf('↓ 87 tokens')).toBeGreaterThan(view.output().lastIndexOf('↓ 100 tokens'))
+
+    view.unmount()
+    $turnTokenBaseline.set(0)
   })
 
   it('renders nothing for the working line while idle', () => {

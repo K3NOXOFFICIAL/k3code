@@ -2,7 +2,12 @@ import { Text } from '@k3code/ink'
 import { useStore } from '@nanostores/react'
 import { useEffect, useState } from 'react'
 
-import { $sessionOutputTokens, $turnTokenBaseline } from '../app/outputTokensStore.js'
+import {
+  $sessionOutputTokens,
+  $streamedOutputChars,
+  $turnTokenBaseline,
+  liveTurnOutputTokens
+} from '../app/outputTokensStore.js'
 import { isReducedMotion } from '../lib/animation.js'
 import {
   advanceRotation,
@@ -49,6 +54,8 @@ function ActiveWorkingLine({ ascii = false, effort, startedAt, t }: Omit<Working
   // Session total when the turn started; set by the app, so an overlay that
   // unmounts this row mid-turn does not reset the count.
   const tokenBaseline = useStore($turnTokenBaseline)
+  // Text streamed in the call still running: estimated until its real count lands.
+  const pendingChars = useStore($streamedOutputChars)
 
   useEffect(() => {
     // Animated: one timer drives the glyph, the clock and the message rotation.
@@ -78,7 +85,7 @@ function ActiveWorkingLine({ ascii = false, effort, startedAt, t }: Omit<Working
     elapsedMs,
     glyph: workingGlyph(tick, reduced, ascii),
     message: workingMessage(rotation.index),
-    outputTokens: Math.max(0, sessionTokens - tokenBaseline)
+    outputTokens: liveTurnOutputTokens(sessionTokens, tokenBaseline, pendingChars)
   })
 
   return (

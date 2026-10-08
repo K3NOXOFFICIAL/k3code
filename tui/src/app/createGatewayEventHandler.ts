@@ -28,7 +28,7 @@ import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
 import { applyGoalSnapshot } from './goalStatus.js'
 import type { GatewayEventHandlerContext, NoticeLevel } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
-import { addOutputTokens, completionTokensOf } from './outputTokensStore.js'
+import { addStreamedText, completionTokensOf, settleOutput } from './outputTokensStore.js'
 import { flashGoodVibes } from './petFlashStore.js'
 import { addProposal } from '../k3/proposalsStore.js'
 import { forgetServerRequest } from './serverRequestStore.js'
@@ -826,8 +826,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (usage) {
           patchUiState(state => ({ ...state, usage: { ...state.usage, ...usage } }))
-          // One completed LLM call's output tokens; the working line sums them per turn.
-          addOutputTokens(completionTokensOf(usage))
+          // One completed LLM call's real output tokens replace the streamed estimate for that call.
+          settleOutput(completionTokensOf(usage))
         }
 
         return
@@ -1419,6 +1419,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.delta':
+        // Estimates the working line's token count while the reply streams.
+        addStreamedText(ev.payload?.text)
         turnController.recordMessageDelta(ev.payload ?? ({} as StreamDeltaPayload))
 
         return
@@ -1433,6 +1435,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       }
 
       case 'message.complete': {
+        // The turn is over: text whose call never reported usage keeps its estimate.
+        settleOutput(0)
+
         const { finalMessages, finalText, interruptedReply, wasInterrupted } = turnController.recordMessageComplete(
           ev.payload ?? {}
         )
