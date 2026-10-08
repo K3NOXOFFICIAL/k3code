@@ -166,7 +166,8 @@ async def test_worktree_outside_git_repo_shares_cwd(tmp_path, monkeypatch):
 async def test_child_of_a_foreground_default_mode_parent_runs_bash_sandboxed(tmp_path, monkeypatch):
     steps = [task_call("CHILD-S run a shell command"), final("ok"), {"type": "text", "match": "CHILD-S", "text": "s"}]
     server = make(tmp_path, monkeypatch, steps, mode="default", **NO_GATE)
-    await start(server, tmp_path)
+    (tmp_path / "proj").mkdir()  # the k3code home lives under tmp_path: a project must not contain it
+    await start(server, tmp_path / "proj")
     await run_turn(server, "PARENT: delegate it")
     assert not server.session.background and server.session.perms.mode == PermissionMode.DEFAULT
     assert server.session.loop._sandbox_argv() is None  # the parent's own foreground bash is unchanged

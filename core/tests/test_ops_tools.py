@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import subprocess
 import tarfile
 from pathlib import Path
 
@@ -339,8 +340,8 @@ async def test_model_chain_command_shows_cooldown(chain_home):
     assert out.startswith("Chain updated") and "1. direct/c" in out
 
 
-def test_sandbox_argv_drops_the_daemon_environment():
-    argv = sandbox.build_argv("/tmp", bwrap="/usr/bin/bwrap")
+def test_sandbox_argv_drops_the_daemon_environment(tmp_path):
+    argv = sandbox.build_argv(tmp_path, bwrap="/usr/bin/bwrap")
     assert "--clearenv" in argv and "--unshare-ipc" in argv
     assert "--setenv" in argv and argv[argv.index("--setenv") + 1] in sandbox.ENV_ALLOW
     assert all(name in sandbox.ENV_ALLOW for name in (argv[i + 1] for i, a in enumerate(argv) if a == "--setenv"))
@@ -469,10 +470,75 @@ async def test_goal_continuation_bash_is_sandboxed_in_a_foreground_session(tmp_p
     from test_autonomy_gateway import make, start
 
     server = make(tmp_path, monkeypatch, [], mode="default", autonomy={"plan_first": False, "proposals": False})
-    await start(server, tmp_path)
+    (tmp_path / "proj").mkdir()  # the k3code home lives under tmp_path: a project must not contain it
+    await start(server, tmp_path / "proj")
     session = server.session
     user_turn = server._build_loop(session, None, None, TaskKind.INTERACTIVE_TURN, None)
     assert user_turn._sandbox_argv() is None  # the user's own turn in default mode stays unsandboxed
     session.goal_continuation = True
     continuation = server._build_loop(session, None, None, TaskKind.INTERACTIVE_TURN, None)
     assert continuation.unattended and continuation._sandbox_argv()[0] == sandbox.bwrap_path()
+
+
+# ── sandbox roots, git metadata, network, cwd (P2-4) ──
+
+
+def test_sandbox_refuses_roots_that_expose_home_ssh_or_the_k3code_home(tmp_path, monkeypatch):
+    home, k3 = tmp_path / "home", tmp_path / "k3"
+    (home / ".ssh").mkdir(parents=True)
+    monkeypatch.setenv("K3CODE_HOME", str(k3))
+    for bad in (home, tmp_path, home / ".ssh", k3):  # $HOME, a parent of it, ~/.ssh, the k3code home
+        with pytest.raises(sandbox.SandboxRefused):
+            sandbox.build_argv(bad, home=home, bwrap="/usr/bin/bwrap")
+    assert sandbox.build_argv(home / "project", home=home, bwrap="/usr/bin/bwrap")[0] == "/usr/bin/bwrap"
+
+
+def test_git_metadata_is_bound_read_only(tmp_path):
+    from m1cmd_helpers import git_repo
+
+    repo = git_repo(tmp_path / "repo").resolve()
+    joined = " ".join(sandbox.build_argv(repo, home=tmp_path / "home", bwrap="/usr/bin/bwrap"))
+    assert f"--bind {repo} {repo}" in joined
+    assert f"--ro-bind {repo / '.git'} {repo / '.git'}" in joined
+
+
+def test_linked_worktree_gitdir_and_common_dir_are_bound_read_only(tmp_path):
+    from m1cmd_helpers import git_repo
+
+    repo = git_repo(tmp_path / "repo").resolve()
+    wt = repo / ".k3code" / "worktrees" / "child1"
+    subprocess.run(["git", "worktree", "add", "-q", str(wt), "-b", "k3/child1"], cwd=repo, check=True,
+                   capture_output=True)
+    joined = " ".join(sandbox.build_argv(wt, home=tmp_path / "home", bwrap="/usr/bin/bwrap"))
+    gitdir = (repo / ".git" / "worktrees" / "child1").resolve()
+    assert f"--ro-bind {gitdir} {gitdir}" in joined  # the linked worktree's admin dir lives outside the checkout
+    assert f"--ro-bind {repo / '.git'} {repo / '.git'}" in joined  # the common dir holds the objects
+
+
+def test_unattended_sandbox_has_no_network_unless_allowed(tmp_path, monkeypatch):
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    assert "--unshare-net" in sandbox.build_argv(tmp_path, network=False, bwrap="/usr/bin/bwrap")
+    assert "--unshare-net" not in sandbox.build_argv(tmp_path, bwrap="/usr/bin/bwrap")
+    assert "--unshare-net" in sandbox.unattended_prefix(tmp_path)
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_sandboxed_bash_starts_in_the_requested_cwd(tmp_path):
+    proj = tmp_path / "proj"
+    (proj / "sub").mkdir(parents=True)
+    res = await tool_bash({"command": "pwd", "cwd": "sub"}, cwd=proj, sandbox=sandbox.build_argv(proj))
+    assert res["stdout"].strip() == str((proj / "sub").resolve())
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_sandboxed_bash_cannot_write_git_hooks(tmp_path):
+    from m1cmd_helpers import git_repo
+
+    repo = git_repo(tmp_path / "repo").resolve()
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    cmd = f"echo 'touch pwned' > {hook}; echo ok > inside.txt"
+    res = await tool_bash({"command": cmd}, cwd=repo, sandbox=sandbox.build_argv(repo))
+    assert not hook.exists()
+    assert (repo / "inside.txt").read_text().strip() == "ok"  # the working tree itself stays writable
+    assert "Read-only file system" in res["stderr"]  # the hook write was refused by the sandbox
+

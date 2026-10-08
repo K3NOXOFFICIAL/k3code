@@ -1162,6 +1162,7 @@ class GatewayServer:
             session=session.session_id,
             background=session.background,
             unattended=session.goal_continuation,
+            unattended_network=bool(autonomy_cfg(self.config)["unattended_network"]),
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
         )

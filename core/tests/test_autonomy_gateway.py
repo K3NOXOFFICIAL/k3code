@@ -48,8 +48,13 @@ def sub(tmp: Path, name: str) -> Path:
     return d
 
 
+def k3home(tmp: Path) -> Path:
+    """The k3code home sits beside the test's project dir, never inside it: a sandboxed project may not contain it."""
+    return tmp.parent / f"{tmp.name}-k3home"
+
+
 def make(tmp: Path, monkeypatch, steps: list[dict], mode: str = "auto", **cfg: Any):
-    monkeypatch.setenv("K3CODE_HOME", str(tmp / "home"))
+    monkeypatch.setenv("K3CODE_HOME", str(k3home(tmp)))
     script = tmp / "script.json"
     script.write_text(json.dumps(steps))
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
@@ -112,7 +117,7 @@ async def start(server: GatewayServer, tmp: Path) -> None:
 
 
 def scope_rows(tmp: Path) -> list[dict]:
-    path = tmp / "home" / "scope_log.jsonl"
+    path = k3home(tmp) / "scope_log.jsonl"
     return [json.loads(x) for x in path.read_text().splitlines()]
 
 
@@ -359,7 +364,7 @@ async def test_dismissed_proposal_never_returns(tmp_path, monkeypatch):
     await run_turn(server, "add another flag")
     assert len(events(server, "proposal.show")) == 1  # the same suggestion was not re-emitted
     assert "(dismissed)" in (await call(server, "command.dispatch", {"name": "proposals", "arg": "all"}))["message"]
-    lines = (tmp_path / "home" / "proposals.jsonl").read_text().splitlines()
+    lines = (k3home(tmp_path) / "proposals.jsonl").read_text().splitlines()
     assert json.loads(lines[-1])["status"] == "dismissed"
 
 

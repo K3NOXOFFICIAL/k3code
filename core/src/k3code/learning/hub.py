@@ -60,6 +60,9 @@ class LearningHub:
     async def drain(self) -> None:
         while self._tasks:
             await asyncio.gather(*list(self._tasks), return_exceptions=True)
+            # gather() of finished tasks does not yield, and their discard callbacks only run on a loop pass:
+            # without this the loop spun forever on a finished task still in the set
+            await asyncio.sleep(0)
 
     # ── recording ──
 

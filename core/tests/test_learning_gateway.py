@@ -44,7 +44,7 @@ async def test_three_approvals_across_sessions_propose_rule_and_accept_writes_co
     server4, _ = make_server(tmp_path, [bash("echo run-9"), "ok"], monkeypatch)
     await call(server4, "session.create", {"cwd": str(tmp_path)})
     assert await run_turn(server4, "go", []) == []
-    rows = DecisionLog(tmp_path / "home").query()
+    rows = DecisionLog(tmp_path.parent / f"{tmp_path.name}-k3home").query()
     assert [r["kind"] for r in rows].count("approval") == 3 and rows[-1]["kind"] == "proposal"
 
 
@@ -58,7 +58,8 @@ async def test_dismissed_rule_proposal_never_returns(tmp_path, monkeypatch):
         assert not shown(server, "permission_rule")
     await call(server, "command.dispatch", {"name": "permissions", "arg": "suggest", "session_id": sid})
     assert not shown(server, "permission_rule")
-    assert [r["choice"] for r in DecisionLog(tmp_path / "home").query("proposal")] == ["dismiss"]
+    log = DecisionLog(tmp_path.parent / f"{tmp_path.name}-k3home")
+    assert [r["choice"] for r in log.query("proposal")] == ["dismiss"]
 
 
 async def test_other_decisions_are_logged(tmp_path, monkeypatch):
@@ -68,7 +69,7 @@ async def test_other_decisions_are_logged(tmp_path, monkeypatch):
     await call(server, "command.dispatch", {"name": "config", "arg": "set max_turns 9", "session_id": sid})
     await call(server, "command.dispatch", {"name": "config", "arg": "set max_turns 8", "session_id": sid})
     await call(server, "command.dispatch", {"name": "config", "arg": "rollback", "session_id": sid})
-    log = DecisionLog(tmp_path / "home")
+    log = DecisionLog(tmp_path.parent / f"{tmp_path.name}-k3home")
     assert log.query("approval")[0]["choice"] == "deny"
     ms = log.query("model_switch")[0]
     assert ms["detail"]["to"] == "fast-one" and ms["detail"]["reason"] == "too slow"

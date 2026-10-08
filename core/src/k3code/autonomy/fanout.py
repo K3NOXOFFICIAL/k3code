@@ -76,7 +76,7 @@ async def run_tests(cmd: str, cwd: str | Path, timeout: float = 600) -> tuple[bo
 
     try:
         proc = await sandbox.spawn_unattended_shell(cmd, cwd=cwd)
-    except sandbox.SandboxUnavailable as exc:
+    except sandbox.SandboxRefused as exc:
         return False, str(exc)
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)

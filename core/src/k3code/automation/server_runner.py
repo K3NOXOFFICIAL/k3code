@@ -170,7 +170,7 @@ class ServerRunner:
         try:
             # usable() spawns bwrap (up to 10 s on first use): unattended_prefix runs off the event loop
             argv = await asyncio.to_thread(sandbox.unattended_prefix, workdir)
-        except sandbox.SandboxUnavailable as exc:
+        except sandbox.SandboxRefused as exc:
             return 126, f"refused: {exc}"
         res = await tool_bash({"command": command, "timeout": SHELL_TIMEOUT_S}, cwd=Path(workdir), sandbox=argv)
         out = (res.get("stdout") or "") + (res.get("stderr") or "") + (res.get("error") or "")

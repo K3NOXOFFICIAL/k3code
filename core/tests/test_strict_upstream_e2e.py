@@ -34,7 +34,7 @@ def upstream():
 
 
 async def test_second_turn_of_a_tool_session_is_accepted_by_a_strict_upstream(tmp_path, monkeypatch, upstream):
-    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path.parent / f"{tmp_path.name}-k3home"))  # beside the project
     monkeypatch.setenv("STRICT_KEY", "x")
     monkeypatch.delenv("K3CODE_FAKE_PROVIDER", raising=False)
     prov = ProviderEntry(name="strict", kind="openai", base_url=upstream, api_key_env="STRICT_KEY", api_key="x",

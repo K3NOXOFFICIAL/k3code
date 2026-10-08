@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.providers.types import Message, ToolSpec
-from k3code.reliability.sandbox import child_env
+from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
     format_no_match_hint,
     fuzzy_find_and_replace,
@@ -167,6 +167,8 @@ async def tool_bash(
     timeout = arguments.get("timeout", 30.0)
     workdir = _resolve_path(arguments.get("cwd", "."), cwd)
     proc: asyncio.subprocess.Process | None = None
+    if sandbox:
+        sandbox = with_chdir(sandbox, workdir)  # the command starts in the requested cwd, not the session's
     try:
         # start_new_session: its own process group, so the whole tree can be killed (setsid, without preexec_fn)
         if sandbox:

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.agent.loop import AgentLoop
+from k3code.autonomy import autonomy_cfg
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.prompting import build_system_prompt
@@ -345,7 +346,9 @@ class SubagentManager:
         loop = AgentLoop(
             router, system_prompt=system, max_turns=server.config.max_turns, headless=False,
             on_event=server._on_router_event, cwd=cwd, permissions=perms, reliability=reliability,
-            session=h.id, background=parent.background, unattended=True, task_kind=TaskKind.SUBAGENT.value,
+            session=h.id, background=parent.background, unattended=True,
+            unattended_network=bool(autonomy_cfg(server.config)["unattended_network"]),
+            task_kind=TaskKind.SUBAGENT.value,
             approval_callback=getattr(parent, "_approval_cb", None),
         )
         from k3code.extratools import register_skill_tool
