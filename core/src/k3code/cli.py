@@ -579,13 +579,18 @@ def service_status() -> None:
 @cli.command("doctor")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
 @click.option("--no-probe", is_flag=True, help="Skip network probes")
-def doctor_cmd(as_json: bool, no_probe: bool) -> None:
+@click.option("--install", "install_subset", is_flag=True, help="Install-time subset: warnings only, always exit 0")
+def doctor_cmd(as_json: bool, no_probe: bool, install_subset: bool) -> None:
     """Health checks with fix hints. Exit status 1 when any check fails."""
     import asyncio
 
     from k3code import doctor
     from k3code.config import load_config
 
+    if install_subset:
+        checks = doctor.install_subset()
+        click.echo(doctor.to_json(checks) if as_json else doctor.format_report(checks))
+        return
     logging.getLogger("httpx").setLevel(logging.WARNING)
     checks = asyncio.run(doctor.run_checks(load_config(project_dir=Path.cwd()), probe=not no_probe))
     click.echo(doctor.to_json(checks) if as_json else doctor.format_report(checks))

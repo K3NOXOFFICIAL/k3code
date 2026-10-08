@@ -60,7 +60,17 @@ class McpServerConfig(BaseModel):
     cwd: str | None = None
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
+    #: name of an environment variable (or of a key in ~/.config/k3code/env) whose value is sent as a bearer token;
+    #: read when the server connects, so the secret itself never appears in config.yaml
+    bearer_env: str = ""
     enabled: bool = True
+
+
+def env_value(name: str) -> str:
+    """A variable from the process environment, else from the env file the setup wizard writes. Never logged."""
+    from k3code.setup.state import read_env_file
+
+    return os.environ.get(name) or read_env_file().get(name, "")
 
 
 class McpConfig(BaseModel):

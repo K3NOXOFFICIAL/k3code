@@ -179,6 +179,8 @@ class SubagentManager:
         worktree: wt_mod.Worktree | None = None,
     ) -> Handle:
         """Create the child and start it as a task; the caller awaits :meth:`wait` or polls."""
+        if getattr(self.server, "halted", False):  # /daemon pause: no new child runs anywhere
+            raise RuntimeError("daemon is halted (/daemon pause): sub-agents are not started")
         if depth > MAX_DEPTH:
             raise DepthLimit(f"sub-agent depth limit ({MAX_DEPTH}) reached")
         if isolation not in ("none", "worktree"):

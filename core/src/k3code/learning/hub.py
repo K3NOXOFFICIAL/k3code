@@ -58,11 +58,17 @@ class LearningHub:
         task.add_done_callback(self._tasks.discard)
 
     async def drain(self) -> None:
-        while self._tasks:
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
-            # gather() of finished tasks does not yield, and their discard callbacks only run on a loop pass:
-            # without this the loop spun forever on a finished task still in the set
-            await asyncio.sleep(0)
+        """Wait until every spawned task has finished.
+
+        Finished tasks are dropped here rather than left to their done-callbacks: gather() returns at once for finished
+        tasks, so a finished task whose discard callback had not run yet made the old loop spin without yielding.
+        """
+        while True:
+            self._tasks.difference_update({t for t in self._tasks if t.done()})
+            pending = list(self._tasks)
+            if not pending:
+                return
+            await asyncio.gather(*pending, return_exceptions=True)
 
     # ── recording ──
 

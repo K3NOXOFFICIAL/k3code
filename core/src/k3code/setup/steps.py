@@ -93,7 +93,7 @@ def step_about(c: Ctx) -> dict[str, Any]:
 
 
 def step_system(c: Ctx) -> dict[str, Any]:
-    det = detect.detect()
+    det = detect.detect(probe=c.do_probe)
     c.say("Detected: " + ", ".join(f"{k}={v}" for k, v in det.items() if v not in ("", [], False)))
     if c.p.confirm("system.confirm", "Is this correct?", True):
         out = dict(det)
@@ -252,11 +252,31 @@ def step_permissions(c: Ctx) -> dict[str, Any]:
     return {"mode": mode, "extra_hardline": [str(x) for x in extra]}
 
 
+#: The k3nox hub is one MCP endpoint: its search, fetch and browser tools all come through it, as hub_* tools.
+HUB_URL = "https://<memory-host>/mcp"
+#: Variables that may hold the hub key, in order. The config only ever names one of them.
+HUB_KEY_ENVS = ("K3NOX_KEY", "OMNIROUTE_API_KEY")
+
+
+def hub_key_env() -> str:
+    """The name of the variable that holds the hub key, or '' when no key is set. The value is never returned."""
+    from k3code.config import env_value
+
+    return next((name for name in HUB_KEY_ENVS if env_value(name)), "")
+
+
 def step_integrations(c: Ctx) -> dict[str, Any]:
     out: dict[str, Any] = {"mcp": {}, "mem0_url": "", "skills_roots": [], "searxng_url": ""}
     mcp = c.p.raw("integrations.mcp")
     if mcp is None:
         mcp = []
+        key_env = hub_key_env()
+        if key_env and c.p.confirm(
+            "integrations.hub_mcp",
+            f"Add the k3nox hub (web search, fetch and browser tools), authenticated with ${key_env}?",
+            True,
+        ):
+            mcp.append({"name": "k3nox", "url": HUB_URL, "bearer_env": key_env})
         while c.p.interactive and c.p.confirm("integrations.addmcp", "Add an MCP server?", False):
             name = c.p.text("integrations.mcp_name", "Name")
             target = c.p.text("integrations.mcp_target", "URL (http…) or stdio command")

@@ -1,5 +1,6 @@
 #!/bin/sh
-# Remove a k3code install: its versions, the k3code/k3 links and the systemd unit.
+# Remove a k3code install: its versions, the k3code/k3 links, the systemd unit, and what presetup added under
+# the install root (the Chromium location $DATA/browsers and the $DATA/presetup markers).
 # Your data (~/.k3code, ~/.config/k3code) is kept unless you pass --purge. uv is shared, so it stays.
 #   sh uninstall.sh [--prefix DIR] [--purge]
 set -eu
@@ -56,7 +57,7 @@ main() {
   else
     echo "kept ${K3CODE_HOME:-$HOME/.k3code} and ${XDG_CONFIG_HOME:-$HOME/.config}/k3code (use --purge to delete)"
   fi
-  echo "k3code uninstalled"
+  echo "k3code uninstalled (system packages such as bubblewrap, node and go were left alone)"
 }
 
 main "$@"

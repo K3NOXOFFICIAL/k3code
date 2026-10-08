@@ -25,6 +25,9 @@ DEFAULT_MAX_TURNS = 30
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
 DEFAULT_GATE_MAX_RETRIES = 3
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
+#: Automatic kicks (boot resume, watchdog): this many within KICK_WINDOW_S, the next one parks the goal instead.
+MAX_KICKS_PER_WINDOW = 3
+KICK_WINDOW_S = 3600.0
 MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 _GATE_OUTPUT_TAIL_CHARS = 3000
@@ -131,6 +134,8 @@ class GoalState:
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
     gates: list[GoalGate] = field(default_factory=list)
+    #: Wall-clock times of automatic kicks (see GatewayServer.kick_goal); pruned to KICK_WINDOW_S.
+    kick_times: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -303,6 +308,17 @@ class GoalManager:
 
     def clear(self) -> None:
         self._save_raw(None)
+
+    def recent_kicks(self, now: float) -> list[float]:
+        s = self.state
+        return [t for t in (s.kick_times if s else []) if now - t < KICK_WINDOW_S]
+
+    def record_kick(self, now: float) -> GoalState | None:
+        s = self.state
+        if s is None:
+            return None
+        s.kick_times = [t for t in s.kick_times if now - t < KICK_WINDOW_S] + [now]
+        return self._save(s)
 
     def status_line(self) -> str:
         s = self.state
