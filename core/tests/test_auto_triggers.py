@@ -152,6 +152,16 @@ def test_render():
     assert render("changed {{path}} / {{nope}}", {"path": "a.py"}) == "changed a.py / {{nope}}"
 
 
+def test_render_shell_quotes_trigger_data(tmp_path):
+    """Trigger data (file names, commit subjects, webhook bodies) went raw into the `shell` command: injection."""
+    import subprocess
+
+    evil = "x'; touch pwned; echo \"$(id)\" `id` $HOME"
+    cmd = render("printf '%s|' {{path}} \"$K3_PATH\" {{nope}}", {"path": evil, "bad-key": "y"}, shell=True)
+    out = subprocess.run(["bash", "-c", cmd], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    assert out == f"{evil}|{evil}|{{{{nope}}}}|" and not (tmp_path / "pwned").exists()
+
+
 async def test_manager_actions_policy_and_events(tmp_path):
     c, db, r, m = mgr_for(tmp_path)
     for bad in (
@@ -187,7 +197,7 @@ async def test_manager_actions_policy_and_events(tmp_path):
     assert r.shells == []
     m.session_event("s1", "needs_input")
     await until(lambda: r.shells)
-    assert r.shells[0] == ("echo s1", "/tmp")
+    assert r.shells[0][0].splitlines()[-1] == "echo s1" and r.shells[0][1] == "/tmp"
     m.session_event("s2", "needs_input")  # cooldown
     await c.settle()
     assert len(r.shells) == 1
