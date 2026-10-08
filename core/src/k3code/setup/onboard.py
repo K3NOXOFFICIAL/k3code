@@ -184,11 +184,39 @@ def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
         "providers": {"entries": [entry]},
         "tiers": {"models": {entry["name"]: tiers} if tiers else {}},
     }
+    from k3code import confio
+
+    before = confio.read_yaml(user_config_path()).get("providers") or []
     path = write_config(data, only="providers")  # keeps the rest of an existing config untouched
     p.say(f"Wrote {path}: provider {entry['name']} ({entry['kind']}), default model {model or '(not set yet)'}.")
+    if kept := _keep_other_providers(path, before, entry):
+        p.say(f"  kept as fallback (after {entry['name']}): {', '.join(kept)}")
     if not model:
         p.say("  No model set yet: add providers[0].models.default with `k3code config-edit`.")
     p.say("Ready. `k3code onboard` (choose full) adds more providers, MCP servers and more any time.")
+
+
+def _keep_other_providers(path: Path, before: list[Any], entry: dict[str, Any]) -> list[str]:
+    """Re-append the chain entries fast setup replaced: adding a key used to drop every fallback provider.
+
+    An old entry with the new entry's name or endpoint is the one being replaced and is not kept."""
+    from k3code import confio
+
+    base = str(entry.get("base_url") or "").rstrip("/")
+    others = [
+        e
+        for e in before
+        if isinstance(e, dict)
+        and e.get("name") != entry["name"]
+        and not (base and str(e.get("base_url") or "").rstrip("/") == base)
+    ]
+    if not others:
+        return []
+    cfg = confio.read_yaml(path)
+    cfg["providers"] = [*(cfg.get("providers") or []), *others]
+    confio.validate(cfg)
+    confio.write_yaml(path, cfg, backup=False)  # write_config already backed up the file as it was
+    return [str(e.get("name")) for e in others]
 
 
 def _run(p: Prompter, answer: str, *, do_probe: bool) -> None:

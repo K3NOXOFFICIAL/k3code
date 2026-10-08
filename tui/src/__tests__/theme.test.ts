@@ -454,31 +454,115 @@ const channelDelta = (a: string, b: string) => {
   );
 };
 
+describe("pink identity", () => {
+  it("defaults to hot pink while errors, ok and the shell prompt stay distinct", async () => {
+    const { DARK_SEEDS, LIGHT_SEEDS, contrastRatio } =
+      await importThemeWithCleanEnv();
+
+    expect(DARK_SEEDS.primary).toBe("#FF1493");
+    expect(DARK_SEEDS.accent).toBe("#FF69B4");
+
+    // Pink hue is ~320-345°; error must sit in red-orange, ok in green, shell in violet.
+    const hue = (hex: string) => {
+      const [r, g, b] = [1, 3, 5].map(
+        (i) => parseInt(hex.slice(i, i + 2), 16) / 255,
+      );
+      const max = Math.max(r, g, b);
+      const d = max - Math.min(r, g, b);
+      const h =
+        max === r
+          ? ((g - b) / d) % 6
+          : max === g
+            ? (b - r) / d + 2
+            : (r - g) / d + 4;
+
+      return (h * 60 + 360) % 360;
+    };
+
+    for (const seeds of [DARK_SEEDS, LIGHT_SEEDS]) {
+      const errorHue = hue(seeds.error);
+
+      expect(errorHue < 20 || errorHue > 355).toBe(true);
+      expect(hue(seeds.ok)).toBeGreaterThan(90);
+      expect(hue(seeds.ok)).toBeLessThan(150);
+      expect(hue(seeds.shellDollar)).toBeGreaterThan(240);
+      expect(hue(seeds.shellDollar)).toBeLessThan(290);
+    }
+
+    for (const key of ["accent", "primary", "border", "error"] as const) {
+      expect(
+        contrastRatio(LIGHT_SEEDS[key], "#ffffff"),
+        key,
+      ).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+});
+
 describe("derived tone ladder", () => {
   it("reproduces the original hand-tuned tones from seeds (reverse-engineered knobs)", async () => {
     // The ladder's knobs were grid-search fitted so the MATH lands on the
     // pre-refactor hand-tuned literals. Contract: every derived tone stays
     // within a-few-RGB-units of the original (imperceptible), so knob edits
     // that drift the classic look fail here instead of shipping as vibes.
-    const dark = await importThemeWithCleanEnv();
-    const light = await importThemeWithEnv({
-      K3CODE_TUI_BACKGROUND: "#ffffff",
-    });
+    // The default palette is pink now; the ladder is still checked against the
+    // classic gold seeds it was fitted to, since the math is what this pins.
+    const { buildPalette } = await importThemeWithCleanEnv();
+    const classicDark = buildPalette(
+      {
+        accent: "#FFBF00",
+        activeRow: "#333355",
+        bg: "#101014",
+        border: "#CD7F32",
+        error: "#ef5350",
+        ok: "#4caf50",
+        primary: "#FFD700",
+        prompt: "#FFF8DC",
+        selection: "#3a3a55",
+        shellDollar: "#4dabf7",
+        statusBad: "#FF8C00",
+        statusCritical: "#FF6B6B",
+        statusGood: "#8FBC8F",
+        statusWarn: "#FFD700",
+        surface: "#1a1a2e",
+        text: "#FFF8DC",
+        warn: "#ffa726",
+      },
+      false,
+    );
+    const classicLight = buildPalette(
+      {
+        accent: "#956E00",
+        bg: "#ffffff",
+        border: "#A56628",
+        error: "#C14240",
+        ok: "#367E39",
+        primary: "#867000",
+        prompt: "#2B2014",
+        shellDollar: "#377BB3",
+        statusBad: "#A65A00",
+        statusCritical: "#B94D4D",
+        statusGood: "#5C7A5C",
+        statusWarn: "#867000",
+        text: "#3D2F13",
+        warn: "#956115",
+      },
+      true,
+    );
 
     const cases: Array<[string, string, string]> = [
-      [dark.DARK_THEME.color.muted, "#CC9B1F", "dark muted"],
-      [dark.DARK_THEME.color.label, "#DAA520", "dark label"],
-      [dark.DARK_THEME.color.statusFg, "#C0C0C0", "dark statusFg"],
-      [dark.DARK_THEME.color.completionBg, "#1a1a2e", "dark surface"],
-      [dark.DARK_THEME.color.completionCurrentBg, "#333355", "dark chip"],
-      [dark.DARK_THEME.color.selectionBg, "#3a3a55", "dark selection"],
+      [classicDark.muted, "#CC9B1F", "dark muted"],
+      [classicDark.label, "#DAA520", "dark label"],
+      [classicDark.statusFg, "#C0C0C0", "dark statusFg"],
+      [classicDark.completionBg, "#1a1a2e", "dark surface"],
+      [classicDark.completionCurrentBg, "#333355", "dark chip"],
+      [classicDark.selectionBg, "#3a3a55", "dark selection"],
       // Light canon = liftForContrast(dark literal, white, 4.5): the exact
       // colors xterm's minimumContrastRatio rendered on light hosts.
-      [light.LIGHT_THEME.color.muted, "#946C08", "light muted"],
-      [light.LIGHT_THEME.color.statusFg, "#6F6F6F", "light statusFg"],
-      [light.LIGHT_THEME.color.completionBg, "#F5F5F5", "light surface"],
-      [light.LIGHT_THEME.color.completionCurrentBg, "#e0d1bf", "light chip"],
-      [light.LIGHT_THEME.color.selectionBg, "#D4E4F7", "light selection"],
+      [classicLight.muted, "#946C08", "light muted"],
+      [classicLight.statusFg, "#6F6F6F", "light statusFg"],
+      [classicLight.completionBg, "#F5F5F5", "light surface"],
+      [classicLight.completionCurrentBg, "#e0d1bf", "light chip"],
+      [classicLight.selectionBg, "#D4E4F7", "light selection"],
     ];
 
     for (const [got, original, label] of cases) {

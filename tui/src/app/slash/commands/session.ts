@@ -1,16 +1,11 @@
-import { compactNumber } from "@k3code/shared/format";
-
-import { introMsg, toTranscriptMessages } from "../../../domain/messages.js";
 import {
   sessionScopedModelArg,
   TUI_SESSION_MODEL_FLAG,
 } from "../../../domain/slash.js";
 import { parsePetCommand, PET_MIN_COLS } from "../../../lib/terminalPet.js";
 import type {
-  BackgroundStartResponse,
   ConfigGetValueResponse,
   ConfigSetResponse,
-  SessionCompressResponse,
   SessionUsageResponse,
   SlashExecResponse,
 } from "../../../gatewayTypes.js";
@@ -93,33 +88,6 @@ const reasoningConfigPayload = (arg: string, sid: string) => {
 export const sessionCommands: SlashCommand[] = [
   // k3: no local /bg. The gateway's /bg handles `/bg <prompt>`, `/bg --pane <prompt>` and a bare `/bg`
   // (send the running turn to the background); the old local handler only knew `/bg <prompt>`.
-
-  {
-    help: "ask a side question about this conversation",
-    name: "btw",
-    run: (arg, ctx) => {
-      if (!arg) {
-        return ctx.transcript.sys("/btw <question>");
-      }
-
-      ctx.gateway
-        .rpc<BackgroundStartResponse>("prompt.btw", {
-          session_id: ctx.sid,
-          text: arg,
-        })
-        .then(
-          ctx.guarded<BackgroundStartResponse>((r) => {
-            if (!r.task_id) {
-              return;
-            }
-
-            ctx.transcript.sys(
-              `btw ${r.task_id} — answering from a conversation snapshot`,
-            );
-          }),
-        );
-    },
-  },
 
   {
     help: "change or show model",
@@ -248,94 +216,6 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: "switch personality for this session",
-    name: "personality",
-    run: (arg, ctx) => {
-      if (!arg) {
-        return;
-      }
-
-      ctx.gateway
-        .rpc<ConfigSetResponse>("config.set", {
-          key: "personality",
-          session_id: ctx.sid,
-          value: arg,
-        })
-        .then(
-          ctx.guarded<ConfigSetResponse>((r) => {
-            if (r.history_reset) {
-              ctx.session.resetVisibleHistory(r.info ?? null);
-            }
-
-            ctx.transcript.sys(
-              `personality: ${r.value || "default"}${r.history_reset ? " · transcript cleared" : ""}`,
-            );
-            ctx.local.maybeWarn(r);
-          }),
-        );
-    },
-  },
-
-  {
-    help: "compress transcript",
-    name: "compress",
-    run: (arg, ctx) => {
-      ctx.gateway
-        .rpc<SessionCompressResponse>("session.compress", {
-          session_id: ctx.sid,
-          ...(arg ? { focus_topic: arg } : {}),
-        })
-        .then(
-          ctx.guarded<SessionCompressResponse>((r) => {
-            if (Array.isArray(r.messages)) {
-              const rows = toTranscriptMessages(r.messages);
-
-              ctx.transcript.setHistoryItems(
-                r.info ? [introMsg(r.info), ...rows] : rows,
-              );
-            }
-
-            if (r.info) {
-              patchUiState({ info: r.info });
-            }
-
-            if (r.usage) {
-              patchUiState((state) => ({
-                ...state,
-                usage: { ...state.usage, ...r.usage },
-              }));
-            }
-
-            if (r.summary?.headline) {
-              const prefix = r.summary.noop ? "" : "✓ ";
-
-              ctx.transcript.sys(`${prefix}${r.summary.headline}`);
-
-              if (r.summary.token_line) {
-                ctx.transcript.sys(`  ${r.summary.token_line}`);
-              }
-
-              if (r.summary.note) {
-                ctx.transcript.sys(`  ${r.summary.note}`);
-              }
-
-              return;
-            }
-
-            if ((r.removed ?? 0) <= 0) {
-              return ctx.transcript.sys("nothing to compress");
-            }
-
-            ctx.transcript.sys(
-              `compressed ${r.removed} messages${r.usage?.total ? ` · ${compactNumber(r.usage.total)} tok` : ""}`,
-            );
-          }),
-        )
-        .catch(ctx.guardedErr);
-    },
-  },
-
-  {
     help: "pin light/dark mode or trust auto-detection (usage: /theme [auto|light|dark])",
     name: "theme",
     usage: "/theme [auto|light|dark]",
@@ -373,30 +253,6 @@ export const sessionCommands: SlashCommand[] = [
           }),
         )
         .catch(ctx.guardedErr);
-    },
-  },
-
-  {
-    help: "switch theme skin (fires skin.changed)",
-    name: "skin",
-    run: (arg, ctx) => {
-      if (!arg) {
-        return ctx.gateway
-          .rpc<ConfigGetValueResponse>("config.get", { key: "skin" })
-          .then(
-            ctx.guarded<ConfigGetValueResponse>((r) =>
-              ctx.transcript.sys(`skin: ${r.value || "default"}`),
-            ),
-          );
-      }
-
-      ctx.gateway
-        .rpc<ConfigSetResponse>("config.set", { key: "skin", value: arg })
-        .then(
-          ctx.guarded<ConfigSetResponse>(
-            (r) => r.value && ctx.transcript.sys(`skin → ${r.value}`),
-          ),
-        );
     },
   },
 
@@ -565,69 +421,6 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: "toggle fast mode [normal|fast|status|on|off|toggle]",
-    name: "fast",
-    run: (arg, ctx) => {
-      const mode = arg.trim().toLowerCase();
-      const valid = new Set([
-        "",
-        "status",
-        "normal",
-        "fast",
-        "on",
-        "off",
-        "toggle",
-      ]);
-
-      if (!valid.has(mode)) {
-        return ctx.transcript.sys(
-          "usage: /fast [normal|fast|status|on|off|toggle]",
-        );
-      }
-
-      if (!mode || mode === "status") {
-        return ctx.gateway
-          .rpc<ConfigGetValueResponse>("config.get", {
-            key: "fast",
-            session_id: ctx.sid,
-          })
-          .then(
-            ctx.guarded<ConfigGetValueResponse>((r) =>
-              ctx.transcript.sys(
-                `fast mode: ${r.value === "fast" ? "fast" : "normal"}`,
-              ),
-            ),
-          )
-          .catch(ctx.guardedErr);
-      }
-
-      ctx.gateway
-        .rpc<ConfigSetResponse>("config.set", {
-          key: "fast",
-          session_id: ctx.sid,
-          value: mode,
-        })
-        .then(
-          ctx.guarded<ConfigSetResponse>((r) => {
-            const next = r.value === "fast" ? "fast" : "normal";
-            ctx.transcript.sys(`fast mode: ${next}`);
-            patchUiState((state) => ({
-              ...state,
-              info: state.info
-                ? {
-                    ...state.info,
-                    fast: next === "fast",
-                    service_tier: next === "fast" ? "priority" : "",
-                  }
-                : state.info,
-            }));
-          }),
-        )
-        .catch(ctx.guardedErr);
-    },
-  },
-
-  {
     help: "control busy enter mode [queue|steer|interrupt|status]",
     name: "busy",
     run: (arg, ctx) => {
@@ -661,24 +454,6 @@ export const sessionCommands: SlashCommand[] = [
           }),
         )
         .catch(ctx.guardedErr);
-    },
-  },
-
-  {
-    help: "cycle verbose tool-output mode (updates live agent)",
-    name: "verbose",
-    run: (arg, ctx) => {
-      ctx.gateway
-        .rpc<ConfigSetResponse>("config.set", {
-          key: "verbose",
-          session_id: ctx.sid,
-          value: arg || "cycle",
-        })
-        .then(
-          ctx.guarded<ConfigSetResponse>(
-            (r) => r.value && ctx.transcript.sys(`verbose: ${r.value}`),
-          ),
-        );
     },
   },
 

@@ -50,7 +50,7 @@ Each command is one module in the registry, with help text, and works via the ga
     - `/memory edit` opens `$EDITOR` in the CLI, and in the TUI returns the path;
     - `/memory mem0 <query>` searches mem0 if configured (`mem0.url` + `api_key_env`); otherwise it says that mem0 isn't configured.
 - **`/skills`**
-  - Skills are directories containing a `SKILL.md` with frontmatter (`name`, `description`), searched in `$K3CODE_HOME/skills`, `.k3code/skills`, and any extra roots from config (`skills.roots`, e.g. `~/.local/share/k3nox/skills-library`).
+  - Skills are directories containing a `SKILL.md` with frontmatter (`name`, `description`), searched in `$K3CODE_HOME/skills`, `.k3code/skills`, and any extra roots from config (`skills.roots`, e.g. `~/.local/share/skills-library`).
   - `/skills` lists them. `/skills show <name>` shows the full text.
   - Add a `skill` tool the model can call to load a skill's full text on demand. Put only the names and descriptions in the system prompt.
 - **`/mcp`**

@@ -207,3 +207,38 @@ def test_fast_api_without_endpoint_is_an_error_not_a_loop(root) -> None:
     answers = _answers(root, {"onboard": {"mode": "fast", "provider": "api", "model": "m"}})
     r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
     assert r.exit_code != 0
+
+
+def test_fast_onboard_over_an_existing_chain_keeps_the_other_providers_as_fallback(root) -> None:
+    """Fast setup used to replace the whole chain: adding a gateway key dropped the claude-cli fallback.
+
+    The entry on the same endpoint is the one being replaced; the others stay, after the new one."""
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    user_config_path().write_text(
+        yaml.safe_dump(
+            {
+                "providers": [
+                    {"name": "claude-cli", "kind": "claude-cli", "models": {"default": "sonnet"}},
+                    {
+                        "name": "gw",
+                        "kind": "openai",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "api_key_env": "OLD_GW_KEY",
+                        "models": {"default": "old"},
+                    },
+                ],
+                "permission_mode": "yolo",
+            }
+        )
+    )
+    answers = _answers(
+        root,
+        {"onboard": {"mode": "fast", "provider": "api", "endpoint": "http://127.0.0.1:9/v1", "key": "k", "model": "m"}},
+    )
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    assert "kept as fallback (after endpoint): claude-cli" in r.output
+    cfg = load_config(project_dir=root)
+    assert [p.name for p in cfg.providers] == ["endpoint", "claude-cli"]
+    assert cfg.providers[1].models == {"default": "sonnet"}
+    assert cfg.permission_mode == "yolo"

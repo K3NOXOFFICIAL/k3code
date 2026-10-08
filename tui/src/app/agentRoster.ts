@@ -3,6 +3,8 @@ import { atom } from "nanostores";
 import { useMemo } from "react";
 
 import type { SubagentListResponse } from "../gatewayTypes.js";
+import type { SubagentStatus } from "@k3code/shared/gateway-events";
+
 import type { SubagentProgress } from "../types.js";
 
 import { useTurnSelector } from "./turnStore.js";
@@ -12,6 +14,16 @@ import { $uiState } from "./uiStore.js";
 export const $agentDockCollapsed = atom(false);
 
 const EMPTY: SubagentListResponse = { subagents: [], delegations: [] };
+
+const SNAPSHOT_STATUSES = new Set<SubagentStatus>([
+  "completed",
+  "error",
+  "failed",
+  "interrupted",
+  "queued",
+  "running",
+  "timeout",
+]);
 export const $agentSnapshot = atom<{
   sid: string | null;
   data: SubagentListResponse;
@@ -53,12 +65,14 @@ export function mergeAgentRoster(
       model: s.model ?? previous?.model,
       startedAt:
         s.started_at != null ? s.started_at * 1000 : previous?.startedAt,
-      // Snapshot replies may predate progress/completion events already rendered.
+      // Snapshot replies may predate progress/completion events already rendered. A finished child keeps its
+      // final status: mapping everything but "queued" to "running" showed last turn's agents as working forever
+      // once the turn's own events were cleared.
       status:
         previous && previous.status !== "queued"
           ? previous.status
-          : s.status === "queued"
-            ? "queued"
+          : SNAPSHOT_STATUSES.has(s.status as SubagentStatus)
+            ? (s.status as SubagentStatus)
             : "running",
       toolCount: Math.max(s.tool_count ?? 0, previous?.toolCount ?? 0),
       tools: previous?.tools.length

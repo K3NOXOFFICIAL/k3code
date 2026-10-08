@@ -5,7 +5,7 @@
 k3code plans before it acts, can run several agents in parallel, retries through dropped connections and provider outages, and sends cheap background work to cheaper models. It has a Python core, a terminal UI (TypeScript, Ink) and an optional multi-window terminal (`k3`, a fork of TUIOS). It works with OpenAI-compatible and Anthropic providers, and with a local Claude Code login.
 
 > **Status: alpha, version 0.1.0 (not tagged).** The core is built and its test suite passes, and most exit criteria have scripted evidence. Live-model behaviour, the 72-hour daemon soak and multi-day use are not verified yet. Read [Safety](#safety) before you add a provider key or let it run unattended, and [Status](#status) for what has been tested.
-> The repository is private for now. Install with the command in [Install](#install): it uses the latest `v*` tag, or `Main` until a tag exists. There is no tagged release yet. The steps for making it public are in [docs/PUBLIC-RELEASE.md](docs/PUBLIC-RELEASE.md).
+> Install with the command in [Install](#install): it uses the latest `v*` tag, or `Main` until a tag exists. There is no tagged release yet.
 
 ---
 
@@ -57,7 +57,7 @@ k3code plans before it acts, can run several agents in parallel, retries through
 
 ### Install
 
-The repository is private, so authenticate once with `gh auth login` and `gh auth setup-git` (on Windows, do this inside WSL, where the install runs). A Windows clone made with Windows git also installs without that: when WSL cannot reach the repository and nothing is installed yet, the installer builds the checkout it runs from (as `--from-source` does).
+If you install from a private fork or mirror, authenticate once first with `gh auth login` and `gh auth setup-git` (on Windows, do this inside WSL, where the install runs). A Windows clone made with Windows git also installs without that: when WSL cannot reach the repository and nothing is installed yet, the installer builds the checkout it runs from (as `--from-source` does).
 
 **Linux and macOS**
 
@@ -95,7 +95,7 @@ k3code doctor     # health checks with fix hints
 k3code            # start the TUI
 ```
 
-A plain interactive start with no provider configured asks once, "fast or full setup?", and does not ask again (the answer is kept in `$K3CODE_HOME/onboarding.json`). Fast asks only for an API endpoint and key (or the `claude-cli` provider). Full runs the whole setup wizard. Nothing is forced: `k3code onboard` works at any time, and a headless `-p` or piped run without a provider prints one hint and exits with code 78 instead of prompting.
+A plain interactive start with no provider configured asks once, "fast or full setup?", and does not ask again (the answer is kept in `$K3CODE_HOME/onboarding.json`). Fast asks only for an API endpoint and key (or the `claude-cli` provider); run over an existing config, it puts that provider first and keeps your other providers behind it as fallbacks. Full runs the whole setup wizard. Nothing is forced: `k3code onboard` works at any time, and a headless `-p` or piped run without a provider prints one hint and exits with code 78 instead of prompting.
 
 The full wizard has 12 steps: `welcome`, `about`, `system`, `usage`, `providers`, `tiers`, `permissions`, `integrations`, `theme`, `service`, `tour`, `summary`. It asks about you, your system, what you mainly use k3code for, your provider chain, model tiers, permissions, optional integrations (MCP, mem0, skills), the theme, and whether to install the 24/7 service. When asked for a provider key, the input is hidden and the key is saved in `~/.config/k3code/env` (mode 0600); the config only names the variable. Run one step again with `k3code setup --step NAME`.
 
@@ -113,7 +113,7 @@ k3code update                                    # smoke-tested update; rolls ba
 k3code update --rollback                         # switch back to the previous version
 ```
 
-There is no release yet, so `update --check` has nothing to find; `k3code update --from-source` pulls your clone and rebuilds.
+There is no release yet. An install built from a checkout (`install.sh --from-source`) therefore updates from that checkout: `k3code update` (also `/update` in the TUI) pulls it with `git pull --ff-only` and rebuilds whenever there is no release to fetch, including a private repository without a GitHub token. On Windows the clone is pulled with Windows git, which has your GitHub credentials. If git still cannot sign in, pull the clone yourself and run `k3code update --from-source --no-pull`.
 
 ### Three ways to run it
 

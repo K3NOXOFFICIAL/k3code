@@ -86,5 +86,5 @@ Imported config kept `max_turns: 7` and gained the non-secret settings; `<redact
 - `/config set` rewrites YAML via `yaml.safe_dump` (comments in the file are lost; a `.bak` is always kept).
 - `/fork --activate`/`/branch --activate` swap the gateway's live session (`session.info` emitted) but the TUI has no
   dedicated "session switched" event; the user should `/resume <id>` in the TUI to view it.
-- mem0 endpoint shape unverified against the real k3nox mem0 server.
+- mem0 endpoint shape unverified against a real mem0 server.
 - `textInputFastEcho` vitest failure is pre-existing/environmental.

@@ -847,6 +847,13 @@ export function StatusRule({
 
   return (
     <Box height={1}>
+      {/* The rule behind the whole line: segments paint over it, every cell they leave empty shows ─, so the status
+          line reads as one divider between transcript and composer at any width. */}
+      <Box height={1} left={0} position="absolute" top={0}>
+        <Text color={t.color.border}>
+          {"─".repeat(Math.max(1, Math.floor(cols) - 2))}
+        </Text>
+      </Box>
       <Box
         flexDirection="row"
         flexShrink={1}
@@ -1018,6 +1025,8 @@ export function StatusRule({
             renders last — any overflow truncates the HUD itself rather than the
             budgeted segments before it. It self-hides when no delegation runs. */}
         <SpawnHud t={t} />
+        {/* one blank cell between the last segment and the rule drawn behind the line */}
+        <Text> </Text>
       </Box>
 
       {rightWidth > 0 ? (

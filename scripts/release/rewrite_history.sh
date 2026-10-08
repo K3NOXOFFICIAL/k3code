@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Rewrite the repository's history for going public (see docs/PUBLIC-RELEASE.md), verify it, and optionally push it.
 #
-#   scripts/release/rewrite_history.sh [--rules DIR] [--work DIR] [--push URL]
+#   scripts/release/rewrite_history.sh [--rules DIR] [--work DIR] [--source URL] [--main-only] [--push URL]
 #
+# --main-only publishes just Main (and tags): the milestone, worker and agent branches stay in the old repository.
 # Without --push nothing leaves the machine: it is a dry run that leaves the result in --work for inspection.
 # DIR (default ~/.config/k3code-release) holds three files kept OUT of the repository, since they name what is removed:
 #   replacements.txt  git-filter-repo --replace-text rules for file contents
@@ -14,12 +15,14 @@ set -euo pipefail
 RULES=${HOME}/.config/k3code-release
 WORK=${TMPDIR:-/tmp}/k3code-rewrite
 PUSH=""
+MAIN_ONLY=""
 SRC=https://github.com/K3NOXOFFICIAL/k3code
 while [ $# -gt 0 ]; do
   case $1 in
     --rules) RULES=$2; shift 2 ;;
     --work) WORK=$2; shift 2 ;;
     --push) PUSH=$2; shift 2 ;;
+    --main-only) MAIN_ONLY=1; shift ;;
     --source) SRC=$2; shift 2 ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -36,6 +39,11 @@ mkdir -p "$WORK"
 git init -q --bare "$WORK/repo.git"
 git -C "$WORK/repo.git" fetch -q "$SRC" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
 git -C "$WORK/repo.git" symbolic-ref HEAD refs/heads/Main
+if [ -n "$MAIN_ONLY" ]; then
+  # Commits reachable only from the other branches are neither rewritten nor pushed.
+  git -C "$WORK/repo.git" for-each-ref --format='%(refname)' refs/heads | grep -v '^refs/heads/Main$' |
+    xargs -r -n1 git -C "$WORK/repo.git" update-ref -d
+fi
 
 (cd "$WORK/repo.git" && uv tool run --from git-filter-repo git-filter-repo --force \
   --path panes/k3 --invert-paths \

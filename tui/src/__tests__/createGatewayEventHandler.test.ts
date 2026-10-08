@@ -1403,6 +1403,10 @@ describe("createGatewayEventHandler", () => {
     ctx.gateway.rpc = vi.fn(async () => {
       throw new Error("cold start");
     });
+    // the optional command catalog goes straight to the client (not the transcript-printing rpc wrapper)
+    (ctx.gateway.gw as any).request = vi.fn(async () => {
+      throw new Error("cold start");
+    });
 
     const onEvent = createGatewayEventHandler(ctx);
 
@@ -1420,8 +1424,8 @@ describe("createGatewayEventHandler", () => {
     });
     onEvent({ payload: {}, type: "gateway.ready" } as any);
 
-    await Promise.resolve();
-    await Promise.resolve();
+    // let the catalog request's rejection settle (several promise hops)
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(getOverlayState().approval).toMatchObject({
       description: "dangerous command",

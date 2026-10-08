@@ -199,6 +199,12 @@ def _merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, An
     return result
 
 
+def default_project_dir() -> Path:
+    """The project whose config the gateway applies: K3CODE_PROJECT_DIR (set by `k3code --config-dir` for the TUI's
+    gateway), else the cwd."""
+    return Path(os.environ.get("K3CODE_PROJECT_DIR") or Path.cwd())
+
+
 def load_config(
     *,
     project_dir: Path | None = None,

@@ -167,8 +167,9 @@ def accept_change(quality_gain: float, token_increase_pct: float) -> bool:
 
 
 def quality(m: dict[str, Any]) -> float:
-    """Quality part of the score (higher is better), from the headline rates."""
-    s = 1.0 - m["escalation_rate"] - m["failure_rate"] - 0.5 * min(1.0, m["loop_guard_per_session"])
+    """Quality part of the score (higher is better), from the headline rates. ``failure_rate`` (provider failovers)
+    is an availability event, not quality, and is left out like the outage rate."""
+    s = 1.0 - m["escalation_rate"] - 0.5 * min(1.0, m["loop_guard_per_session"])
     s -= 0.02 * min(10.0, m["approval_prompts_per_session"])
     if m.get("proposal_accept_rate") is not None:
         s += 0.2 * (m["proposal_accept_rate"] - 0.5)

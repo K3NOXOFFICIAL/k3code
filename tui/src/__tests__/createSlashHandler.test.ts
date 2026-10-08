@@ -484,17 +484,21 @@ describe("createSlashHandler", () => {
         return Promise.resolve({ output: "42 skill(s) available" });
       }
 
-      if (method === "commands.catalog") {
-        return Promise.resolve({
-          canon: { "/new-skill": "/new-skill" },
-          pairs: [["/new-skill", "demo"]],
-        });
-      }
-
       return Promise.resolve({});
     });
-
-    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } });
+    // the optional catalog refresh goes straight to the client, so a gateway without it stays silent
+    const request = vi.fn((method: string) =>
+      method === "commands.catalog"
+        ? Promise.resolve({
+            canon: { "/new-skill": "/new-skill" },
+            pairs: [["/new-skill", "demo"]],
+          })
+        : Promise.resolve({}),
+    );
+    const base = buildGateway();
+    const ctx = buildCtx({
+      gateway: { ...base, gw: { ...base.gw, request } as any, rpc },
+    });
 
     createSlashHandler(ctx)("/reload-skills");
 
@@ -511,7 +515,7 @@ describe("createSlashHandler", () => {
         }),
       );
     });
-    expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
+    expect(rpc).not.toHaveBeenCalledWith("commands.catalog", expect.anything());
   });
 
   it("cycles details mode and persists it", async () => {
@@ -576,7 +580,6 @@ describe("createSlashHandler", () => {
     ],
     ["/reload-mcp", "reload.mcp", { session_id: null }],
     ["/reload", "reload.env", {}],
-    ["/fast status", "config.get", { key: "fast", session_id: null }],
     ["/busy status", "config.get", { key: "busy" }],
     ["/indicator", "config.get", { key: "indicator" }],
   ])(
@@ -617,18 +620,6 @@ describe("createSlashHandler", () => {
         "browser connect failed",
       );
     });
-  });
-
-  it("routes /rollback through native RPC when a session is active", () => {
-    patchUiState({ sid: "sid-abc" });
-    const rpc = vi.fn(() => Promise.resolve({}));
-    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } });
-
-    expect(createSlashHandler(ctx)("/rollback")).toBe(true);
-    expect(rpc).toHaveBeenCalledWith("rollback.list", {
-      session_id: "sid-abc",
-    });
-    expect(ctx.gateway.gw.request).not.toHaveBeenCalled();
   });
 
   it("hot-swaps the live indicator when /indicator <style> succeeds", async () => {
@@ -1068,14 +1059,44 @@ describe("createSlashHandler", () => {
     expect(ctx.transcript.sys).toHaveBeenCalled();
   });
 
-  it("/rollback without an active session tells the user instead of hitting the RPC", () => {
+  it("has no local handler for commands the k3code backend never had (they reach the gateway instead)", () => {
+    // each called an RPC the gateway does not implement and printed "TUI and backend out of sync"
     const rpc = vi.fn(() => Promise.resolve({}));
     const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } });
 
-    createSlashHandler(ctx)("/rollback");
+    for (const cmd of [
+      "/rollback",
+      "/journey",
+      "/plugins",
+      "/tools disable x",
+      "/btw hi",
+      "/compress",
+      "/fast on",
+      "/skin ares",
+      "/personality pirate",
+      "/verbose",
+    ]) {
+      createSlashHandler(ctx)(cmd);
+    }
 
-    expect(rpc).not.toHaveBeenCalled();
-    expect(ctx.transcript.sys).toHaveBeenCalled();
+    for (const method of [
+      "rollback.list",
+      "tools.configure",
+      "prompt.btw",
+      "session.compress",
+    ]) {
+      expect(rpc).not.toHaveBeenCalledWith(method, expect.anything());
+    }
+
+    // the config-key commands too: the gateway answers "unsupported config key" for each of these
+    for (const key of ["fast", "skin", "personality", "verbose"]) {
+      for (const method of ["config.get", "config.set"]) {
+        expect(rpc).not.toHaveBeenCalledWith(
+          method,
+          expect.objectContaining({ key }),
+        );
+      }
+    }
   });
 
   // A pasted PR thread / diff / log reaches a skill command as its argument.

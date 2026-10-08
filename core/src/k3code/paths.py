@@ -23,6 +23,27 @@ def data_dir() -> Path:
     return Path(os.environ.get("K3CODE_DATA", str(Path.home() / ".local" / "share" / "k3code"))).expanduser()
 
 
+def install_roots(module_file: Path | None = None) -> list[Path]:
+    """Directories k3code may run its own code from (tui/dist/entry.js, scripts/vendor_check.py), best first.
+
+    Never the cwd or an arbitrary parent of the package: a repo you clone (or a venv inside it) could ship those
+    files. ``K3CODE_ROOT`` names a dev checkout explicitly; otherwise the source tree this package was imported
+    from (core/src/k3code), the installed version dir (``<data>/versions/<ver>``) and ``<data>/current``.
+    """
+    here = (module_file or Path(__file__)).resolve()
+    roots: list[Path] = []
+    if explicit := os.environ.get("K3CODE_ROOT"):
+        roots.append(Path(explicit).expanduser())
+    if len(here.parents) > 3 and here.parents[0].name == "k3code" and here.parents[1].name == "src":
+        source = here.parents[3]
+        if here.parents[2] == source / "core" and (source / "core" / "pyproject.toml").is_file():
+            roots.append(source)
+    versions = (data_dir() / "versions").resolve()
+    roots.extend(p for p in here.parents if p.parent == versions)
+    roots.append(data_dir() / "current")
+    return roots
+
+
 def find_node() -> str | None:
     """``node`` on PATH, else the one the installer put in ``<data>/node/<ver>/bin``."""
     import shutil

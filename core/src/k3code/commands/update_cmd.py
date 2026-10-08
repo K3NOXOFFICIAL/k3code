@@ -21,11 +21,26 @@ class UpdateCommand(CommandDef):
             return reply(res.message)
         cfg = upd.update_settings()
         cur = upd.current_version() or "(not a versioned install)"
+        src = upd.source_checkout()
+        built_from_source = src is not None and (src / ".git").exists()
+        why = ""
+        rel = None
         try:
             token = upd.github_token()
             rel = await asyncio.to_thread(upd.fetch_latest, cfg["channel"], cfg["repo"], token)
         except Exception as e:  # noqa: BLE001
-            return reply(f"current: {cur}\nCould not check releases: {e}")
+            if not built_from_source:
+                return reply(f"current: {cur}\nCould not check releases: {e}")
+            why = str(e)
+        if rel is None and built_from_source:
+            # nothing to download (no release yet, or a private repository and no token): the checkout is the source
+            if sub != "now":
+                return reply(
+                    f"current: {cur}\n{why or 'No release has been published yet'}.\n"
+                    f"This install is built from {src}. Run `/update now` to pull it and rebuild "
+                    "(smoke-tested, auto-rollback; the daemon restarts)."
+                )
+            return reply(await asyncio.to_thread(upd.apply_detached))
         if rel is None:
             return reply(f"current: {cur}\nNo releases on channel '{cfg['channel']}'.")
         if sub != "now":

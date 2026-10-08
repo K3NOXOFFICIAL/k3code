@@ -3,6 +3,7 @@ import { useStore } from "@nanostores/react";
 import { useEffect, useMemo, useState } from "react";
 
 import { useAgentRoster } from "../app/agentRoster.js";
+import { SectionRule } from "../components/sectionRule.js";
 import { $uiState } from "../app/uiStore.js";
 import type { LiveSessionStatus, SessionActiveItem } from "../gatewayTypes.js";
 import { fmtDuration } from "../lib/subagentTree.js";
@@ -18,6 +19,9 @@ import {
   type StripRow,
   type StripState,
 } from "./agentStripStore.js";
+
+/** How long a finished sub-agent stays in the strip after it ends. */
+export const FINISHED_LINGER_MS = 60_000;
 
 const GLYPH: Record<StripState, string> = {
   done: "✓",
@@ -97,6 +101,17 @@ export function buildStripRows(
   for (const a of subagents) {
     const state = agentState(a.status);
 
+    // Like Claude Code, a finished agent leaves the list shortly after it ends; the gateway keeps finished handles
+    // for /agents, so without this every past turn's children piled up here as "done".
+    if (
+      (state === "done" || state === "failed") &&
+      a.startedAt != null &&
+      a.durationSeconds != null &&
+      nowMs - (a.startedAt + a.durationSeconds * 1000) > FINISHED_LINGER_MS
+    ) {
+      continue;
+    }
+
     rows.push({
       activity:
         a.notes.at(-1) ||
@@ -153,8 +168,20 @@ export function AgentStripView({
   const shown = rows.slice(0, STRIP_MAX_ROWS);
   const more = rows.length - shown.length;
 
+  const count = `agents (${rows.length})`;
+
   return (
     <Box flexDirection="column" flexShrink={0} width={cols}>
+      {/* The section header doubles as the key hint, like Claude Code's "↓ to select" under the prompt. */}
+      <SectionRule
+        cols={cols}
+        label={
+          focused
+            ? `${count} · ↑↓ move · ⏎ open · x stop · esc back`
+            : `${count} · ↓ to select`
+        }
+        t={t}
+      />
       {shown.map((row, i) => {
         const selected = focused && i === index;
         const elapsed =
@@ -191,11 +218,6 @@ export function AgentStripView({
         );
       })}
       {more > 0 ? <Text color={t.color.muted}>{`  +${more} more`}</Text> : null}
-      {focused ? (
-        <Text color={t.color.muted}>
-          {"  ↑↓ move · ⏎ attach · x stop · esc back"}
-        </Text>
-      ) : null}
     </Box>
   );
 }
@@ -211,7 +233,10 @@ export function AgentStrip({ cols }: { cols: number }) {
     () => buildStripRows(subagents, sessions, now, sid),
     [subagents, sessions, now, sid],
   );
-  const live = rows.some((r) => r.state === "working");
+  // tick while something runs, and while a finished agent row still has to expire (FINISHED_LINGER_MS)
+  const live = rows.some(
+    (r) => r.state === "working" || (r.kind === "agent" && r.state !== "input"),
+  );
 
   useEffect(() => {
     if (!live) {

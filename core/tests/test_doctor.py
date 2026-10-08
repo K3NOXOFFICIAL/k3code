@@ -94,3 +94,47 @@ def test_doctor_install_flag_exits_zero_with_no_providers(monkeypatch):
     result = CliRunner().invoke(cli, ["doctor", "--install"])
     assert result.exit_code == 0, result.output
     assert "browser" in result.output and "searxng" in result.output
+
+
+def test_a_missing_key_behind_a_working_entry_is_a_warning_not_a_failure(monkeypatch):
+    """claude-cli first, a keyless gateway as fallback: the chain still runs, so doctor must not report a failure."""
+    from k3code.config import ProviderEntry, Settings
+    from k3code.doctor import FAIL, WARN, check_keys
+
+    monkeypatch.delenv("SOME_PROVIDER_KEY", raising=False)
+    monkeypatch.delenv("K3CODE_FAKE_PROVIDER", raising=False)
+    gateway = ProviderEntry(name="gw", kind="openai", base_url="http://gw", api_key_env="SOME_PROVIDER_KEY")
+    chain = Settings(providers=[ProviderEntry(name="claude-cli", kind="claude-cli"), gateway])
+    chk = check_keys(chain)
+    assert chk.status == WARN and "SOME_PROVIDER_KEY" in chk.detail
+    assert check_keys(Settings(providers=[gateway])).status == FAIL
+
+
+async def test_a_keyless_provider_that_answers_401_is_not_reported_ok(monkeypatch):
+    """Without a key doctor only probes reachability; HTTP 401 there showed as a green check."""
+    from k3code import doctor
+    from k3code.config import ProviderEntry, Settings
+
+    monkeypatch.delenv("SOME_PROVIDER_KEY", raising=False)
+
+    async def reachable(base_url, timeout=5.0):
+        return True, 12.0, "HTTP 401"
+
+    monkeypatch.setattr(doctor, "_probe_provider", reachable)
+    gateway = ProviderEntry(name="gw", kind="openai", base_url="http://gw", api_key_env="SOME_PROVIDER_KEY")
+    checks = await doctor.check_providers(Settings(providers=[gateway]))
+    row = next(c for c in checks if c.name == "provider:gw")
+    assert row.status == doctor.WARN
+    assert "no key in SOME_PROVIDER_KEY" in row.detail and "setup --step providers" in row.fix
+
+
+def test_the_key_count_leaves_out_claude_cli(monkeypatch):
+    from k3code.config import ProviderEntry, Settings
+    from k3code.doctor import OK, check_keys
+
+    gateway = ProviderEntry(name="gw", kind="openai", base_url="http://gw", api_key_env="K", api_key="x")
+    chk = check_keys(Settings(providers=[gateway, ProviderEntry(name="claude-cli", kind="claude-cli")]))
+    assert (chk.status, chk.detail) == (OK, "1 key env var(s) present")
+    assert (
+        check_keys(Settings(providers=[ProviderEntry(name="c", kind="claude-cli")])).detail == "no provider needs a key"
+    )

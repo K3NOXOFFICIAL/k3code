@@ -6,6 +6,7 @@ import { $uiState } from "./uiStore.js";
 const buildOverlayState = (): OverlayState => ({
   agents: false,
   agentsInitialHistoryIndex: 0,
+  agentsInitialAgentId: null,
   approval: null,
   clarify: null,
   confirm: null,
@@ -152,6 +153,7 @@ export const resetFlowOverlays = () =>
     ...buildOverlayState(),
     agents: $overlayState.get().agents,
     agentsInitialHistoryIndex: $overlayState.get().agentsInitialHistoryIndex,
+    agentsInitialAgentId: $overlayState.get().agentsInitialAgentId,
     ambient: $overlayState.get().ambient,
     widget: $overlayState.get().widget,
     journey: $overlayState.get().journey,

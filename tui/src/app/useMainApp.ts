@@ -39,7 +39,6 @@ import type {
   ConfigSetResponse,
   SessionActiveListResponse,
   SessionCloseResponse,
-  TerminalResizeResponse,
 } from "../gatewayTypes.js";
 import { useGitBranch } from "../hooks/useGitBranch.js";
 import {
@@ -66,7 +65,12 @@ import { estimatedMsgHeight, messageHeightKey } from "../lib/virtualHeights.js";
 import { onUserWidgets } from "../sdk/userWidgets.js";
 import type { Msg, PanelSection, SlashCatalog } from "../types.js";
 
-import { $stripSessions, setStripHandlers } from "../k3/agentStripStore.js";
+import {
+  $stripNav,
+  $stripSessions,
+  IDLE_NAV,
+  setStripHandlers,
+} from "../k3/agentStripStore.js";
 import { clearProposals, setProposalHandlers } from "../k3/proposalsStore.js";
 
 import { applyAgentSnapshot } from "./agentRoster.js";
@@ -795,12 +799,20 @@ export function useMainApp(gw: GatewayClient) {
 
   const { activateLiveSession } = session;
 
-  // Agent strip actions: Enter attaches a background session, `x` stops a row.
+  // Agent strip actions: Enter attaches a background session or opens a sub-agent's detail view, `x` stops a row.
   useEffect(() => {
     setStripHandlers({
       activate: (row) => {
         if (row.kind === "session") {
           activateLiveSession(row.id);
+        } else {
+          // like Claude Code: Enter on a running agent shows what it is doing; Esc goes back to the prompt
+          $stripNav.set(IDLE_NAV);
+          patchOverlayState({
+            agents: true,
+            agentsInitialAgentId: row.id,
+            agentsInitialHistoryIndex: 0,
+          });
         }
       },
       stop: (row) => {
@@ -913,14 +925,11 @@ export function useMainApp(gw: GatewayClient) {
       timer = setTimeout(() => {
         timer = undefined;
 
+        // (no terminal.resize: the k3code gateway never needs the width, and the call printed
+        // "out of sync" into the transcript on every resize)
         if (scrollRef.current?.isSticky()) {
           scrollRef.current.scrollToBottom();
         }
-
-        void rpc<TerminalResizeResponse>("terminal.resize", {
-          cols: stdout.columns ?? 80,
-          session_id: ui.sid,
-        });
       }, 100);
     };
 

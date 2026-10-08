@@ -43,7 +43,7 @@ from k3code.autonomy.ultra import Ultra
 from k3code.blockers import BlockerStore
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
-from k3code.config import Settings, load_config
+from k3code.config import Settings, default_project_dir, load_config
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
 from k3code.gateway import tui_display
@@ -194,6 +194,13 @@ class LiveSession:
         self.task_kind: str = ""
         #: /go after /ultraplan: {task, plan, path}; consumed by the next turn's scope gate.
         self.preapproved_plan: dict[str, Any] | None = None
+
+    @property
+    def turn_in_flight(self) -> bool:
+        """A turn owns this session: it streams, or its task still runs (scope gate, compaction, the goal judge, the
+        goal check, the advisor: ``streaming`` is False there). Anything that starts a turn, or evicts or idles the
+        session, must test this, not ``streaming``."""
+        return self.streaming or (self.turn_task is not None and not self.turn_task.done())
 
     @property
     def state(self) -> str:
@@ -423,9 +430,9 @@ class GatewayServer:
         config: Settings | None = None,
         store: SessionStore | None = None,
     ) -> None:
-        self.config = config or load_config(project_dir=Path.cwd())
+        self.config = config or load_config(project_dir=default_project_dir())
         #: config keys the files held at the last read (apply_file_config resets the ones that have since gone)
-        self._file_keys: set[str] = _file_keys(Path.cwd())
+        self._file_keys: set[str] = _file_keys(default_project_dir())
         self.store = store or SessionStore(self._home() / "sessions.db")
         self._stdin = stdin
         self._stdout = stdout
@@ -947,12 +954,12 @@ class GatewayServer:
                 {
                     "current": False,
                     "id": h.id,
-                    "last_active": h.started_at,
+                    "last_active": h.started_wall,
                     "message_count": h.tool_count,
                     "model": h.model or h.tier,
                     "preview": h.description[:120],
                     "session_key": h.id,
-                    "started_at": h.started_at,
+                    "started_at": h.started_wall,
                     "status": h.status,
                     "state": h.status,
                     "paused": False,
@@ -985,7 +992,7 @@ class GatewayServer:
         stopped = 0
         for live in list(self.live.values()):
             rel = live.reliability
-            if rel is None or not rel._started or live.streaming or live.pending_approval is not None:
+            if rel is None or not rel._started or live.turn_in_flight or live.pending_approval is not None:
                 continue
             if now - live.idle_since < self.IDLE_RELIABILITY_S:
                 continue
@@ -1312,14 +1319,19 @@ class GatewayServer:
 
     # ── turn lifecycle ────────────────────────────────────────────────
 
-    async def _run_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
-        """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget."""
+    async def _run_turn(self, session: LiveSession, text: str, *, drain: bool = True) -> tuple[str, str]:
+        """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget.
+
+        ``drain=False`` leaves prompts queued behind this turn for the caller: an unattended tick must not answer the
+        user's own prompt with its background flag, cheap tier and extra tools (see ServerRunner.run_prompt)."""
         async with session.turn_lock:  # a second turn on this session waits instead of interleaving with the first
             try:
                 result = await self._run_turn_locked(session, text)
                 # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
                 # halted: keep the queued prompts for after /daemon resume
-                while (pending := self._pending_prompts(session)) and result[0] not in ("interrupted", "halted"):
+                while (
+                    drain and (pending := self._pending_prompts(session)) and result[0] not in ("interrupted", "halted")
+                ):
                     result = await self._run_turn_locked(session, pending.pop(0))
                 return result
             finally:
@@ -1599,6 +1611,11 @@ class GatewayServer:
                 loop.on_text_delta = on_text_delta
                 loop.on_text_reset = on_text_reset
                 session.loop = loop
+            if session.needs_input:
+                # The loop guard stopped the turn (the escalation above clears the flag when a higher tier takes
+                # over). Ending it 'done' let an active goal judge it and continue into the same loop, and reported a
+                # /loop tick as completed.
+                status = "needs_input"
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)
@@ -1894,7 +1911,7 @@ class GatewayServer:
         Keys present in a file are replaced by the file's value. A key that was in a file at the previous read and is
         gone now (removed by hand or rolled back by an experiment) is reset to its fresh value, not left as it was.
         """
-        base = Path(cwd) if cwd else Path.cwd()
+        base = Path(cwd) if cwd else default_project_dir()
         fresh = load_config(project_dir=base)
         keys = _file_keys(base)
         changed = (keys | self._file_keys) & set(Settings.model_fields)
@@ -2010,7 +2027,7 @@ class GatewayServer:
         goal = mgr.state
         if goal is None or goal.status != "active":
             return False
-        if live.streaming or (live.turn_task is not None and not live.turn_task.done()):
+        if live.turn_in_flight:
             return False  # a live turn is working on it already
         now = time.time()
         if len(mgr.recent_kicks(now)) >= MAX_KICKS_PER_WINDOW:
@@ -2145,7 +2162,7 @@ class GatewayServer:
         text becomes the assistant message."""
         if self.halted:
             raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
-        if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
+        if session.turn_in_flight:
             raise _InvalidParams("a turn is already running in this session; /stop it or wait")
 
         async def runner() -> None:
@@ -2528,7 +2545,7 @@ async def _session_close(server: GatewayServer, params: dict[str, Any]) -> dict[
     if live is None:
         return {"closed": False, "reason": "not live"}
     if (
-        live.streaming
+        live.turn_in_flight
         or live.background
         or live.needs_input
         or server.has_open_request(sid)
@@ -2639,7 +2656,7 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     if server.halted:
         raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
     server.last_user_activity = time.time()
-    if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
+    if session.turn_in_flight:
         # really queued: it runs when the current turn ends. The task check covers a turn that has not reached
         # `streaming = True` yet (compaction, MCP start): a second task there overwrote turn_task, so /stop missed one.
         session.pending_prompts.append(str(text))
@@ -2683,7 +2700,7 @@ async def _subagent_list(server: GatewayServer, params: dict[str, Any]) -> dict[
             "depth": h.depth - 1,
             "goal": h.description,
             "model": h.model or h.tier,
-            "started_at": h.started_at,
+            "started_at": h.started_wall,
             "status": h.status,
             "tool_count": h.tool_count,
             "last_tool": h.last_tool,
@@ -2698,10 +2715,20 @@ async def _subagent_interrupt(server: GatewayServer, params: dict[str, Any]) -> 
     return {"found": server.subagents.interrupt(hid), "subagent_id": hid}
 
 
+TAIL_LINES = 30
+
+
 async def _subagent_tail(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     h = server.subagents.handles.get(str(_require(params, "subagent_id")))
-    text = "\n".join(h.tail[-30:]) + (("\n" + h.result) if h and h.done else "") if h else ""
-    return {"text": text, "status": h.status if h else "unknown", "done": bool(h and h.done)}
+    text = "\n".join(h.tail[-TAIL_LINES:]) + (("\n" + h.result) if h and h.done else "") if h else ""
+    return {
+        # the TUI's live view shows "unavailable" unless this is true: a known child always has a transcript to show
+        "available": h is not None,
+        "truncated": bool(h and len(h.tail) > TAIL_LINES),
+        "text": text,
+        "status": h.status if h else "unknown",
+        "done": bool(h and h.done),
+    }
 
 
 async def _clipboard_paste(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -2790,6 +2817,8 @@ async def _config_get(server: GatewayServer, params: dict[str, Any]) -> dict[str
     key = str(_require(params, "key"))
     if key == "mtime":
         return {"mtime": 0.0}
+    if key == "focus_view":  # the TUI reads display.focus_mode (setup: "Focus mode on by default?") under this name
+        return {"value": "1" if server.config.display.focus_mode else "0"}
     if tui_display.handles(key):
         return tui_display.get(server.config.display, key)
     # Every key is looked up in the redacted JSON dump: provider api_key, mcp server env/headers never go to clients,
@@ -2978,6 +3007,202 @@ async def _browser_manage(server: GatewayServer, params: dict[str, Any]) -> dict
     return await server.browser.manage(action, url=str(url) if url else None)
 
 
+# ── TUI conveniences the Ink UI calls directly (each used to answer "Method not found", shown as "out of sync") ──
+
+#: `!cmd` and `{!cmd}`: the user's own command, so it gets a terminal's timeout, not an agent tool's
+USER_SHELL_TIMEOUT_S = 300
+
+
+async def _shell_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """`!cmd` in the composer and `{!cmd}` inside a prompt: run the user's own command in the session's directory.
+
+    Not sandboxed (the user typed it, as in a terminal), but the hardline rules, including the user's own
+    ``permissions.hardline`` patterns, still refuse it."""
+    from k3code.permissions import hardline
+    from k3code.tools import tool_bash
+
+    command = str(_require(params, "command"))
+    session = server._session_for(params.get("session_id"))
+    cwd = Path(session.perms.cwd) if session is not None else Path.cwd()
+    extra = list(session.perms.hardline_extra) if session is not None else []
+    if denied := hardline.check(command, extra):
+        return {"code": 126, "stdout": "", "stderr": f"denied by hardline rule: {denied}"}
+    res = await tool_bash({"command": command, "timeout": USER_SHELL_TIMEOUT_S}, cwd=cwd)
+    code = res.get("exit_code")
+    return {
+        "code": int(code) if code is not None else 1,
+        "stdout": res.get("stdout") or "",
+        "stderr": (res.get("stderr") or "") + (res.get("error") or ""),
+    }
+
+
+async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/undo and /retry: drop the last user message and everything after it."""
+    session = server._session_for(params.get("session_id"))
+    if session is None:
+        raise _InvalidParams("no active session")
+    if session.turn_in_flight:
+        raise _InvalidParams("a turn is running in this session; /undo when it ends")
+    messages = list(session.messages)
+    last_user = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), None)
+    if last_user is None:
+        return {"removed": 0}
+    session.messages = messages[:last_user]
+    server.store.save(session.stored)
+    return {"removed": len(messages) - last_user}
+
+
+async def _session_usage(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/usage: this session's model calls and tokens (``/stats`` covers every session)."""
+    session = server._session_for(params.get("session_id"))
+    if session is None:
+        return {"calls": 0}
+    rows = server.usage.aggregate(by="session", session=session.session_id)
+    row = rows[0] if rows else {}
+    t_in, t_out = int(row.get("tokens_in") or 0), int(row.get("tokens_out") or 0)
+    return {
+        "model": session.stored.model or server.config.default_model,
+        "input": t_in,
+        "output": t_out,
+        "total": t_in + t_out,
+        "calls": int(row.get("calls") or 0),
+    }
+
+
+async def _session_status(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/status: the same view as /settings (model, tiers, providers, permissions, theme)."""
+    from k3code.commands.settings_cmd import build_settings_view, render_text
+
+    session = server._session_for(params.get("session_id"))
+    return {"output": render_text(build_settings_view(server, session.session_id if session else None))}
+
+
+async def _session_save(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/save: write the session's transcript as JSON into its working directory."""
+    session = server._session_for(params.get("session_id"))
+    if session is None:
+        raise _InvalidParams("no active session")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = Path(session.perms.cwd) / f"k3code-session-{session.session_id[:8]}-{stamp}.json"
+    payload = {
+        "session_id": session.session_id,
+        "title": session.stored.title,
+        "model": session.stored.model,
+        "messages": list(session.messages),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"file": str(path)}
+
+
+def _session_cwd(server: GatewayServer, params: dict[str, Any]) -> str | None:
+    session = server._session_for(params.get("session_id"))
+    return str(session.perms.cwd) if session is not None else None
+
+
+async def _reload_mcp(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/reload-mcp: re-read the config and restart the MCP servers (the gateway's `/mcp reload`)."""
+    server.apply_file_config(_session_cwd(server, params))
+    await server.mcp.reload(server.config.mcp.servers)
+    return {"status": "reloaded"}
+
+
+async def _reload_env(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/reload: re-read config.yaml and the key file (~/.config/k3code/env) into the running gateway."""
+    from k3code.setup.state import read_env_file
+
+    server.apply_file_config(_session_cwd(server, params))
+    return {"updated": len(read_env_file())}
+
+
+async def _skills_reload(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/reload-skills: skill discovery is never cached, so this lists what a fresh scan finds."""
+    res = await server.dispatch_command("skills", "", params.get("session_id"))
+    return {"output": str(res.get("message") or res.get("output") or "")}
+
+
+#: How /help groups the gateway's commands. A command missing here still shows up, under "Other".
+HELP_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "Session",
+        ("clear", "compact", "rename", "resume", "fork", "branch", "export", "import", "add-dir", "stop", "bg", "exit"),
+    ),
+    (
+        "Model and settings",
+        ("model", "effort", "settings", "config", "output-style", "permissions", "update-config", "focus"),
+    ),
+    (
+        "Autonomy",
+        ("goal", "loop", "schedule", "automations", "go", "scope", "proposals", "advisor", "preview", "review"),
+    ),
+    ("Orchestration", ("ultraplan", "ultracode", "ultraresearch", "artifacts")),
+    ("Knowledge", ("memory", "skills", "mcp", "learn", "optimizer", "self-improve")),
+    ("System", ("help", "doctor", "update", "stats", "debug", "daemon")),
+)
+
+
+async def _commands_catalog(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """The command list the TUI's /help shows and its slash completion resolves aliases against.
+
+    Without it ``/help`` listed only the TUI's own commands, and `/goal`, `/loop`, `/review`, ... were
+    undiscoverable."""
+    from k3code import skills as skills_mod
+    from k3code.commands._util import session_cwd
+
+    registry = server.commands
+    defs = {name: registry.get(name) for name in registry.names()}
+    pair = {name: [f"/{name}", (cmd.help.splitlines()[0] if cmd and cmd.help else "")] for name, cmd in defs.items()}
+    canon: dict[str, str] = {}
+    for name, cmd in defs.items():
+        canon[f"/{name}"] = f"/{name}"
+        for alias in cmd.aliases if cmd else []:
+            canon[f"/{alias}"] = f"/{name}"
+    grouped: set[str] = set()
+    categories: list[dict[str, Any]] = []
+    for title, names in HELP_GROUPS:
+        rows = [pair[n] for n in names if n in pair]
+        grouped.update(n for n in names if n in pair)
+        if rows:
+            categories.append({"name": title, "pairs": rows})
+    if rest := [pair[n] for n in pair if n not in grouped]:
+        categories.append({"name": "Other", "pairs": rest})
+    skills = skills_mod.discover(session_cwd(server, params.get("session_id")), list(server.config.skills.roots))
+    return {
+        "pairs": list(pair.values()),
+        "canon": canon,
+        "categories": categories,
+        "skill_count": len(skills),
+        "sub": {},
+    }
+
+
+async def _delegation_status(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    from k3code.autonomy import autonomy_cfg
+    from k3code.subagents.runner import MAX_DEPTH
+
+    return {
+        "paused": server.subagents.paused,
+        "max_spawn_depth": MAX_DEPTH,
+        "max_concurrent_children": int(autonomy_cfg(server.config)["fanout"]["max_parallel"]),
+    }
+
+
+async def _delegation_pause(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """`p` in the agents overlay, `/agents pause|resume`: stop or allow new sub-agents (running ones finish)."""
+    server.subagents.paused = bool(params.get("paused", not server.subagents.paused))
+    return {"paused": server.subagents.paused}
+
+
+async def _subagent_steer(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """`e` in the agents overlay: a message the running child reads before its next model call."""
+    sub_id = str(_require(params, "subagent_id"))
+    text = str(_require(params, "text")).strip()
+    handle = server.subagents.handles.get(sub_id)
+    if handle is None or handle.status != "running":
+        return {"status": "not_queued", "message": "that agent is not running"}
+    handle.steer_queue.append(text)
+    return {"status": "queued"}
+
+
 _HANDLERS: dict[str, Any] = {
     "session.create": _session_create,
     "session.list": _session_list,
@@ -3022,6 +3247,18 @@ _HANDLERS: dict[str, Any] = {
     "setup.status": _setup_status,
     "system.battery": _system_battery,
     "browser.manage": _browser_manage,
+    "commands.catalog": _commands_catalog,
+    "shell.exec": _shell_exec,
+    "session.undo": _session_undo,
+    "session.usage": _session_usage,
+    "session.status": _session_status,
+    "session.save": _session_save,
+    "reload.mcp": _reload_mcp,
+    "reload.env": _reload_env,
+    "skills.reload": _skills_reload,
+    "delegation.status": _delegation_status,
+    "delegation.pause": _delegation_pause,
+    "subagent.steer": _subagent_steer,
 }
 
 _HANDLERS["session.branch_stored"] = _session_resume  # M1: fork == resume the source

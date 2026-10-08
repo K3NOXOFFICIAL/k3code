@@ -4,13 +4,6 @@ import type {
   DelegationPauseResponse,
   ReloadEnvResponse,
   ReloadMcpResponse,
-  RollbackDiffResponse,
-  RollbackListResponse,
-  RollbackRestoreResponse,
-  SlashExecResponse,
-  SpawnTreeListResponse,
-  SpawnTreeLoadResponse,
-  ToolsConfigureResponse,
 } from "../../../gatewayTypes.js";
 import {
   applyDelegationStatus,
@@ -19,7 +12,6 @@ import {
 import { patchOverlayState } from "../../overlayStore.js";
 import {
   getSpawnHistory,
-  pushDiskSnapshot,
   setDiffPair,
   type SpawnSnapshot,
 } from "../../spawnHistoryStore.js";
@@ -87,7 +79,7 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    help: "re-read ~/.k3code/.env into the running gateway (CLI parity)",
+    help: "re-read config.yaml and ~/.config/k3code/env into the running gateway",
     name: "reload",
     run: (_arg, ctx) => {
       ctx.gateway
@@ -97,7 +89,7 @@ export const opsCommands: SlashCommand[] = [
             const n = Number(r.updated ?? 0);
             const noun = n === 1 ? "var" : "vars";
 
-            ctx.transcript.sys(`reloaded .env (${n} ${noun} updated)`);
+            ctx.transcript.sys(`reloaded config and env file (${n} ${noun})`);
           }),
         )
         .catch(ctx.guardedErr);
@@ -174,106 +166,6 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    help: "list, diff, or restore checkpoints",
-    name: "rollback",
-    run: (arg, ctx) => {
-      if (!ctx.sid) {
-        return ctx.transcript.sys("no active session — nothing to rollback");
-      }
-
-      const trimmed = arg.trim();
-      const [first = "", ...rest] = trimmed.split(/\s+/).filter(Boolean);
-      const lower = first.toLowerCase();
-
-      if (!trimmed || lower === "list" || lower === "ls") {
-        return ctx.gateway
-          .rpc<RollbackListResponse>("rollback.list", { session_id: ctx.sid })
-          .then(
-            ctx.guarded<RollbackListResponse>((r) => {
-              if (!r.enabled) {
-                return ctx.transcript.sys("checkpoints are not enabled");
-              }
-
-              const checkpoints = r.checkpoints ?? [];
-
-              if (!checkpoints.length) {
-                return ctx.transcript.sys("no checkpoints found");
-              }
-
-              ctx.transcript.panel("Rollback checkpoints", [
-                {
-                  rows: checkpoints.map((c, idx) => [
-                    `${idx + 1}. ${c.hash.slice(0, 10)}`,
-                    [c.timestamp, c.message].filter(Boolean).join(" · ") ||
-                      "(no metadata)",
-                  ]),
-                },
-              ]);
-            }),
-          )
-          .catch(ctx.guardedErr);
-      }
-
-      if (lower === "diff") {
-        const hash = rest[0];
-
-        if (!hash) {
-          return ctx.transcript.sys("usage: /rollback diff <checkpoint>");
-        }
-
-        return ctx.gateway
-          .rpc<RollbackDiffResponse>("rollback.diff", {
-            hash,
-            session_id: ctx.sid,
-          })
-          .then(
-            ctx.guarded<RollbackDiffResponse>((r) => {
-              const body = (r.rendered || r.diff || "").trim();
-
-              if (!body && !r.stat) {
-                return ctx.transcript.sys("no changes since this checkpoint");
-              }
-
-              const text = [r.stat || "", body].filter(Boolean).join("\n\n");
-              ctx.transcript.page(text, "Rollback diff");
-            }),
-          )
-          .catch(ctx.guardedErr);
-      }
-
-      const hash = first;
-      const filePath = rest.join(" ").trim();
-
-      return ctx.gateway
-        .rpc<RollbackRestoreResponse>("rollback.restore", {
-          ...(filePath ? { file_path: filePath } : {}),
-          hash,
-          session_id: ctx.sid,
-        })
-        .then(
-          ctx.guarded<RollbackRestoreResponse>((r) => {
-            if (!r.success) {
-              return ctx.transcript.sys(
-                `rollback failed: ${r.error || r.message || "unknown error"}`,
-              );
-            }
-
-            const target = filePath || "workspace";
-            const detail = r.reason || r.message || r.restored_to || "restored";
-            ctx.transcript.sys(`rollback restored ${target}: ${detail}`);
-
-            if ((r.history_removed ?? 0) > 0) {
-              ctx.transcript.setHistoryItems((prev) =>
-                ctx.transcript.trimLastExchange(prev),
-              );
-            }
-          }),
-        )
-        .catch(ctx.guardedErr);
-    },
-  },
-
-  {
     aliases: ["tasks"],
     help: "open the spawn-tree dashboard (live audit + kill/pause controls)",
     name: "agents",
@@ -312,89 +204,16 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    aliases: ["learning", "memory-graph"],
-    help: "open your learning journey — skills + memories on a timeline",
-    name: "journey",
-    run: (_arg, ctx) => {
-      void ctx;
-      patchOverlayState({ journey: true });
-    },
-  },
-
-  {
-    help: "replay a completed spawn tree · `/replay [N|last|list|load <path>]`",
+    help: "replay a completed spawn tree · `/replay [N|last]`",
     name: "replay",
     run: (arg, ctx) => {
       const history = getSpawnHistory();
       const raw = arg.trim();
       const lower = raw.toLowerCase();
 
-      // ── Disk-backed listing ─────────────────────────────────────
-      if (lower === "list" || lower === "ls") {
-        ctx.gateway
-          .rpc<SpawnTreeListResponse>("spawn_tree.list", {
-            limit: 30,
-            session_id: ctx.sid ?? "default",
-          })
-          .then(
-            ctx.guarded<SpawnTreeListResponse>((r) => {
-              const entries = r.entries ?? [];
-
-              if (!entries.length) {
-                return ctx.transcript.sys(
-                  "no archived spawn trees on disk for this session",
-                );
-              }
-
-              const rows: [string, string][] = entries.map((e) => {
-                const ts = e.finished_at
-                  ? new Date(e.finished_at * 1000).toLocaleString()
-                  : "?";
-                const label = e.label || `${e.count} subagents`;
-
-                return [`${ts} · ${e.count}×`, `${label}\n  ${e.path}`];
-              });
-
-              ctx.transcript.panel("Archived spawn trees", [{ rows }]);
-            }),
-          )
-          .catch(ctx.guardedErr);
-
-        return;
-      }
-
-      // ── Disk-backed load by path ─────────────────────────────────
-      if (lower.startsWith("load ")) {
-        const path = raw.slice(5).trim();
-
-        if (!path) {
-          return ctx.transcript.sys("usage: /replay load <path>");
-        }
-
-        ctx.gateway
-          .rpc<SpawnTreeLoadResponse>("spawn_tree.load", { path })
-          .then(
-            ctx.guarded<SpawnTreeLoadResponse>((r) => {
-              if (!r.subagents?.length) {
-                return ctx.transcript.sys("snapshot empty or unreadable");
-              }
-
-              // Push onto the in-memory history so the overlay picks it up
-              // by index 1 just like any other snapshot.
-              pushDiskSnapshot(r, path);
-              patchOverlayState({ agents: true, agentsInitialHistoryIndex: 1 });
-            }),
-          )
-          .catch(ctx.guardedErr);
-
-        return;
-      }
-
       // ── In-memory nav (same-session) ─────────────────────────────
       if (!history.length) {
-        return ctx.transcript.sys(
-          "no completed spawn trees this session · try /replay list",
-        );
+        return ctx.transcript.sys("no completed spawn trees this session");
       }
 
       let index = 1;
@@ -404,7 +223,7 @@ export const opsCommands: SlashCommand[] = [
 
         if (Number.isNaN(parsed) || parsed < 1 || parsed > history.length) {
           return ctx.transcript.sys(
-            `replay: index out of range 1..${history.length} · use /replay list for disk`,
+            `replay: index out of range 1..${history.length}`,
           );
         }
 
@@ -416,7 +235,7 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    help: "diff two completed spawn trees · `/replay-diff <baseline> <candidate>` (indexes from /replay list or history N)",
+    help: "diff two completed spawn trees · `/replay-diff <baseline> <candidate>` (history indexes, 1 = last)",
     name: "replay-diff",
     run: (arg, ctx) => {
       const parts = arg.trim().split(/\s+/).filter(Boolean);
@@ -468,8 +287,9 @@ export const opsCommands: SlashCommand[] = [
         .then(
           ctx.guarded<SkillsReloadResponse>((r) => {
             ctx.transcript.page(r.output || "skills reloaded", "Reload Skills");
-            ctx.gateway
-              .rpc<CommandsCatalogResponse>("commands.catalog", params)
+            // optional (the gateway may not offer a catalog): straight to the client, so a miss stays silent
+            ctx.gateway.gw
+              .request<CommandsCatalogResponse>("commands.catalog", params)
               .then(
                 ctx.guarded<CommandsCatalogResponse>((catalog) => {
                   if (!catalog?.pairs) {
@@ -486,125 +306,6 @@ export const opsCommands: SlashCommand[] = [
                 }),
               )
               .catch(() => {});
-          }),
-        )
-        .catch(ctx.guardedErr);
-    },
-  },
-
-  {
-    help: "view & toggle plugins (no arg opens the hub; enable/disable <name> for direct toggle)",
-    name: "plugins",
-    run: (arg, ctx, cmd) => {
-      // No argument → open the interactive Plugins Hub overlay. Any
-      // subcommand (enable/disable/list/install/…) falls through to the
-      // text slash worker so it stays at parity with `k3code plugins`.
-      if (!arg.trim()) {
-        return patchOverlayState({ pluginsHub: true });
-      }
-
-      ctx.gateway.gw
-        .request<SlashExecResponse>("slash.exec", {
-          command: cmd.slice(1),
-          session_id: ctx.sid,
-        })
-        .then((r) => {
-          if (ctx.stale()) {
-            return;
-          }
-
-          const body = r?.output || "/plugins: no output";
-          const text = r?.warning ? `warning: ${r.warning}\n${body}` : body;
-          const long =
-            text.length > 180 || text.split("\n").filter(Boolean).length > 2;
-
-          if (long) {
-            ctx.transcript.page(text, "Plugins");
-          } else {
-            ctx.transcript.sys(text);
-          }
-        })
-        .catch(ctx.guardedErr);
-    },
-  },
-
-  {
-    help: "enable or disable tools (client-side history reset on change)",
-    name: "tools",
-    run: (arg, ctx, cmd) => {
-      const [subcommand, ...names] = arg.trim().split(/\s+/).filter(Boolean);
-
-      if (subcommand !== "disable" && subcommand !== "enable") {
-        ctx.gateway.gw
-          .request<SlashExecResponse>("slash.exec", {
-            command: cmd.slice(1),
-            session_id: ctx.sid,
-          })
-          .then((r) => {
-            if (ctx.stale()) {
-              return;
-            }
-
-            const body = r?.output || "/tools: no output";
-            const text = r?.warning ? `warning: ${r.warning}\n${body}` : body;
-            const long =
-              text.length > 180 || text.split("\n").filter(Boolean).length > 2;
-
-            if (long) {
-              ctx.transcript.page(text, "Tools");
-            } else {
-              ctx.transcript.sys(text);
-            }
-          })
-          .catch(ctx.guardedErr);
-
-        return;
-      }
-
-      if (!names.length) {
-        ctx.transcript.sys(`usage: /tools ${subcommand} <name> [name ...]`);
-        ctx.transcript.sys(`built-in toolset: /tools ${subcommand} web`);
-        ctx.transcript.sys(
-          `MCP tool: /tools ${subcommand} github:create_issue`,
-        );
-
-        return;
-      }
-
-      ctx.gateway
-        .rpc<ToolsConfigureResponse>("tools.configure", {
-          action: subcommand,
-          names,
-          session_id: ctx.sid,
-        })
-        .then(
-          ctx.guarded<ToolsConfigureResponse>((r) => {
-            if (r.info) {
-              ctx.session.setSessionStartedAt(Date.now());
-              ctx.session.resetVisibleHistory(r.info);
-            }
-
-            if (r.changed?.length) {
-              ctx.transcript.sys(
-                `${subcommand === "disable" ? "disabled" : "enabled"}: ${r.changed.join(", ")}`,
-              );
-            }
-
-            if (r.unknown?.length) {
-              ctx.transcript.sys(`unknown toolsets: ${r.unknown.join(", ")}`);
-            }
-
-            if (r.missing_servers?.length) {
-              ctx.transcript.sys(
-                `missing MCP servers: ${r.missing_servers.join(", ")}`,
-              );
-            }
-
-            if (r.reset) {
-              ctx.transcript.sys(
-                "session reset. new tool configuration is active.",
-              );
-            }
           }),
         )
         .catch(ctx.guardedErr);

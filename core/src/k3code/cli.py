@@ -21,7 +21,9 @@ if TYPE_CHECKING:  # annotations only: the engine is imported inside the functio
     from k3code.reliability import Reliability
     from k3code.router import RouterEvent
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+# WARNING by default: at INFO, httpx request lines and "Turn N/20" were interleaved with the answer of every `-p` run.
+# The gateway and the daemon set their own level (force=True) because this runs first, at import.
+logging.basicConfig(level=os.environ.get("K3CODE_LOG_LEVEL", "WARNING").upper(), format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -147,7 +149,17 @@ async def _run_headless(
             sys.stdout.write(text)
             sys.stdout.flush()
 
+    async def on_text_reset() -> None:
+        # a retry after partial output streams the answer again: the result keeps one copy, the terminal a line break
+        nonlocal final_text
+        final_text = ""
+        if not json_output:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            sys.stderr.write("[k3code] the reply was cut off; retrying (the partial text above is discarded)\n")
+
     loop.on_text_delta = on_text_delta
+    loop.on_text_reset = on_text_reset
 
     try:
         await reliability.start()
@@ -268,7 +280,13 @@ async def _run_repl(
             sys.stdout.write(text)
             sys.stdout.flush()
 
+        async def on_text_reset() -> None:
+            nonlocal final_text
+            final_text = ""
+            print("\n[retrying: the partial reply above was discarded]")
+
         loop.on_text_delta = on_text_delta
+        loop.on_text_reset = on_text_reset
 
         try:
             async for _ in loop.run(user_input, max_tokens=config.max_tokens, temperature=config.temperature):
@@ -394,6 +412,11 @@ def main(
         )
         if json_output and result:
             print(json.dumps(result, ensure_ascii=False))
+        elif result:
+            if result.get("text") and not result["text"].endswith("\n"):
+                sys.stdout.write("\n")  # the streamed answer: end it so the shell prompt starts on its own line
+            if "error" in result:
+                click.echo(f"k3code: error: {result.get('message') or result['error']}", err=True)
         sys.exit(0 if result and "error" not in result else 1)
     elif repl or not _is_interactive():
         with contextlib.suppress(KeyboardInterrupt):
@@ -401,7 +424,7 @@ def main(
     else:
         if model and (err := _use_model_key(config, model)):
             raise click.ClickException(err)
-        _launch_tui(model=model)
+        _launch_tui(model=model, permission_mode=permission_mode if permission else None, project_dir=project_dir)
 
 
 def _is_interactive() -> bool:
@@ -432,6 +455,7 @@ def _run_gateway() -> None:
         stream=sys.stderr,
         level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,  # the import-time basicConfig above already installed a handler
     )
     from k3code.gateway.server import GatewayServer
 
@@ -446,8 +470,20 @@ def _run_gateway() -> None:
         asyncio.run(_serve())
 
 
-def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = None, require: bool = False) -> None:
-    """Spawn the built TUI (tui/dist/entry.js) with this process as its gateway."""
+def _launch_tui(
+    *,
+    model: str | None = None,
+    permission_mode: PermissionMode | None = None,
+    project_dir: Path | None = None,
+    env_extra: dict[str, str] | None = None,
+    require: bool = False,
+) -> None:
+    """Spawn the built TUI (tui/dist/entry.js) with this process as its gateway.
+
+    ``permission_mode`` (the --permission flag) and ``project_dir`` (--config-dir, else the cwd: the directory whose
+    project config the user was asked to trust) reach the spawned gateway through K3CODE_PERMISSION_MODE and
+    K3CODE_PROJECT_DIR.
+    """
     from k3code.paths import find_node
 
     node = find_node()
@@ -462,12 +498,13 @@ def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = 
 
         from k3code.config import load_config
 
-        config = load_config(project_dir=Path.cwd())
+        config = load_config(project_dir=project_dir or Path.cwd())
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(
                 _run_repl(
                     model=model,
-                    permission_mode=_permission_from_config("permission_mode", config.permission_mode),
+                    permission_mode=permission_mode
+                    or _permission_from_config("permission_mode", config.permission_mode),
                     config=config,
                 )
             )
@@ -480,17 +517,20 @@ def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = 
     env.setdefault("K3CODE_LOG_LEVEL", "INFO")
     if model:
         env["K3CODE_DEFAULT_MODEL"] = model  # load_config maps it to default_model in the spawned gateway
+    if permission_mode is not None:
+        env["K3CODE_PERMISSION_MODE"] = permission_mode.value  # flag > config in the gateway's load_config
+    if project_dir is not None:
+        env["K3CODE_PROJECT_DIR"] = str(project_dir.resolve())  # config.default_project_dir() in the gateway
     logger.info("launching TUI: %s %s", node, entry)
     result = subprocess.run([node, str(entry)], env=env, check=False)
     sys.exit(result.returncode)
 
 
 def _find_repo_root() -> Path | None:
-    """Walk up from cwd for a tui/dist/entry.js (works from the repo or installed)."""
-    from k3code.paths import data_dir
+    """The k3code root holding tui/dist/entry.js: our own source tree or install, never the cwd (see install_roots)."""
+    from k3code.paths import install_roots
 
-    here = Path(__file__).resolve()
-    for candidate in (Path.cwd(), *here.parents, data_dir() / "current"):
+    for candidate in install_roots():
         if (candidate / "tui" / "dist" / "entry.js").is_file():
             return candidate
     return None
@@ -599,6 +639,7 @@ def daemon_cmd() -> None:
         stream=sys.stderr,
         level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,  # the import-time basicConfig above already installed a handler
     )
     try:
         with contextlib.suppress(KeyboardInterrupt):
@@ -789,9 +830,15 @@ def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation")
 @click.option("--channel", type=click.Choice(["stable", "dev"]), help="Release channel (default: update.channel)")
 @click.option("--from-source", is_flag=True, help="git pull the source checkout and rebuild")
+@click.option("--no-pull", is_flag=True, help="With --from-source: rebuild without git pull (you pulled the clone)")
 @click.option("--rollback", "do_rollback", is_flag=True, help="Switch back to the previous version")
-def update_cmd(check: bool, yes: bool, channel: str | None, from_source: bool, do_rollback: bool) -> None:
-    """Update to the latest release (smoke-tested, auto-rollback) or roll back."""
+def update_cmd(
+    check: bool, yes: bool, channel: str | None, from_source: bool, no_pull: bool, do_rollback: bool
+) -> None:
+    """Update to the latest release (smoke-tested, auto-rollback) or roll back.
+
+    An install built from a checkout (`install.sh --from-source`) updates from that checkout whenever there is no
+    release to fetch: none published yet, or a private repository and no token."""
     from k3code import update as upd
 
     if do_rollback:
@@ -800,6 +847,21 @@ def update_cmd(check: bool, yes: bool, channel: str | None, from_source: bool, d
         raise SystemExit(0 if res.ok else 1)
     cfg = upd.update_settings()
     cur = upd.current_version()
+    rel = None
+    if not from_source:
+        denied = ""
+        try:
+            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token())
+        except PermissionError as e:
+            denied = str(e)
+        except Exception as e:  # noqa: BLE001
+            raise click.ClickException(str(e)) from e
+        if rel is None:
+            src = upd.source_checkout()
+            if src is None or not (src / ".git").exists():
+                raise click.ClickException(denied or "no releases found on this channel")
+            click.echo(f"{denied or 'No release has been published yet'}.\nThis install is built from {src}: using it.")
+            from_source = True
     if from_source:
         src = upd.source_checkout()
         if src is None or not (src / ".git").exists():
@@ -808,15 +870,13 @@ def update_cmd(check: bool, yes: bool, channel: str | None, from_source: bool, d
         if check:
             return
         if not yes:
-            click.confirm("git pull and rebuild?", abort=True)
-        ver = upd.update_from_source(src)
-    else:
+            click.confirm("rebuild from the checkout?" if no_pull else "git pull and rebuild?", abort=True)
         try:
-            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token())
-        except (PermissionError, Exception) as e:  # noqa: BLE001
+            ver = upd.update_from_source(src, pull=not no_pull)
+        except upd.SourceUpdateError as e:
             raise click.ClickException(str(e)) from e
-        if rel is None:
-            raise click.ClickException("no releases found on this channel")
+    else:
+        assert rel is not None
         click.echo(f"current: {cur}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
         if check or not upd.is_newer(rel.version, cur):
             if not check:
