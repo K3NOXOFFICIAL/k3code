@@ -48,7 +48,7 @@ k3code plans before it acts, can run several agents in parallel, retries through
 - Linux on x86_64 is the tested platform: a clean install was tested in a Fedora 44 container. The installer also accepts macOS and aarch64 (arm64); those are untested.
 - `git` (for the default `--from-git` install), `curl` or `wget`, and a POSIX shell. Network access is needed during install.
 - [`uv`](https://docs.astral.sh/uv/) is required and manages Python ≥ 3.12. If `uv` is missing, the installer asks before installing it into your home directory (`--yes` answers yes). The installer needs no root.
-- Optional: `bubblewrap` (`bwrap`) to sandbox unattended runs, `systemd --user` for the 24/7 service, Node 18+ with npm (builds the TUI; without it k3code uses the line REPL), and Go (builds the `k3` binary). The installer never installs Node or Go.
+- Optional: `bubblewrap` (`bwrap`) to sandbox unattended runs, `systemd --user` for the 24/7 service, Node 20+ with npm (builds the TUI; without it k3code uses the line REPL), and Go (builds the `k3` binary). The installer never installs Node or Go.
 
 ### Install
 

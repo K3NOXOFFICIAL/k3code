@@ -46,7 +46,7 @@ def run(
 def stub_bin(root: Path, name: str, body: str) -> Path:
     """A directory holding one executable stub (a shell script) named ``name``; put it first on PATH."""
     d = root / "stubbin"
-    d.mkdir(exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True)
     p = d / name
     p.write_text("#!/bin/sh\n" + body)
     p.chmod(0o755)
@@ -184,3 +184,90 @@ def test_bwrap_usable_is_reported_ok(tmp_path: Path) -> None:
     r = run(tmp_path, INSTALL, "--from-source", "--yes", env_extra={"K3_BWRAP": str(bwrap / "bwrap")})
     assert r.returncode == 0, r.stderr
     assert "sandbox ok" in r.stderr
+
+
+def _source_repo(root: Path) -> Path:
+    """A minimal k3code-shaped git repository (VERSION, core/pyproject.toml) with a tag v0.0.1 and branch main."""
+    src = root / "srcrepo"
+    (src / "core").mkdir(parents=True)
+    (src / "VERSION").write_text("0.0.1\n")
+    (src / "core" / "pyproject.toml").write_text("[project]\nname = 'k3code'\nversion = '0.0.1'\n")
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(src)]
+    subprocess.run(["git", "-c", "init.defaultBranch=main", "init", "-q", str(src)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "init"], check=True)
+    subprocess.run([*git, "tag", "v0.0.1"], check=True)
+    return src
+
+
+def test_from_git_tag_reruns_without_network(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    first = run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", "v0.0.1")
+    assert first.returncode == 0, first.stderr
+    # the remote is gone now: a complete tag install must not touch it
+    gone = f"file://{tmp_path / 'gone.git'}"
+    again = run(home, INSTALL, "--yes", "--from-git", gone, "--ref", "v0.0.1")
+    assert again.returncode == 0, again.stderr
+    assert "already installed" in again.stderr
+    assert "fetching" not in again.stderr
+
+
+def test_from_git_branch_falls_back_to_the_installed_build_when_offline(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    assert run(home, INSTALL, "--yes", "--from-git", f"file://{src}", "--ref", "main").returncode == 0
+    gone = f"file://{tmp_path / 'gone.git'}"
+    again = run(home, INSTALL, "--yes", "--from-git", gone, "--ref", "main")
+    assert again.returncode == 0, again.stderr
+    assert "could not fetch 'main'" in again.stderr
+    assert "Using the installed version" in again.stderr
+    assert (home / ".local" / "bin" / "k3code").is_symlink()
+
+
+def test_fetch_errors_separate_no_network_from_private_repo(tmp_path: Path) -> None:
+    real_git = shutil.which("git")
+    assert real_git is not None
+    cases = {
+        "fatal: unable to access 'https://example.invalid/x.git/': Could not resolve host: example.invalid": "no network",
+        "fatal: could not read Username for 'https://github.com': terminal prompts disabled": "private or needs credentials",
+    }
+    for i, (text, phrase) in enumerate(cases.items()):
+        stubs = stub_bin(tmp_path / f"case{i}", "git", f'case "$*" in *fetch*) echo "{text}" >&2; exit 128 ;; esac\nexec {real_git} "$@"\n')
+        home = tmp_path / f"home{i}"
+        home.mkdir()
+        r = run(home, INSTALL, "--yes", "--from-git", "https://example.invalid/x.git", "--ref", "main", path_front=stubs)
+        assert r.returncode != 0
+        assert "could not fetch 'main'" in r.stderr
+        assert phrase in r.stderr, r.stderr
+
+
+def test_uv_temp_file_is_removed_when_the_uv_download_fails(tmp_path: Path) -> None:
+    # uv is only found in ~/.local/bin here: drop that PATH entry so the installer tries to fetch uv itself
+    path = os.pathsep.join(d for d in os.environ["PATH"].split(os.pathsep) if not (Path(d) / "uv").exists())
+    tmpdir = tmp_path / "tmp"
+    tmpdir.mkdir()
+    curl = stub_bin(tmp_path, "curl", "exit 22\n")
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(
+        home,
+        INSTALL,
+        "--from-source",
+        "--yes",
+        env_extra={"PATH": path, "TMPDIR": str(tmpdir)},
+        drop=("K3_NO_DOWNLOAD",),  # that flag means --no-install-deps, which never downloads uv
+        path_front=curl,
+    )
+    assert r.returncode != 0
+    assert "could not download the uv installer" in r.stderr
+    assert list(tmpdir.glob("uv-install.*")) == []
+
+
+def test_check_reports_the_node_floor_of_20(tmp_path: Path) -> None:
+    r = run(tmp_path, INSTALL, "--check")
+    assert r.returncode == 0, r.stderr
+    assert "node 20+ with npm" in r.stderr
+    assert "node 18" not in r.stderr

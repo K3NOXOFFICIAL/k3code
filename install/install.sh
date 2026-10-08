@@ -23,6 +23,8 @@ INSTALL_LOG=""
 TMP=""
 BUILDING=""
 REQS=""
+UV_TMP=""
+GIT_ERR=""
 
 usage() {
   cat <<EOF
@@ -49,7 +51,7 @@ Options:
 Presetup (on by default, after the version is activated; never fails the install): checks the sandbox,
 installs Chromium for the browser tool (K3CODE_SKIP_CHROMIUM=1 skips only that), and prints a health subset.
 
-Optional and never installed by this script: node 18+ with npm (builds the TUI), go (builds the
+Optional and never installed by this script: node 20+ with npm (builds the TUI), go (builds the
 k3 pane binary), bubblewrap (sandbox). k3code runs without them.
 EOF
 }
@@ -70,6 +72,8 @@ cleanup() {
   if [ -n "$BUILDING" ]; then rm -rf "$BUILDING"; fi
   if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
   if [ -n "$REQS" ]; then rm -f "$REQS"; fi
+  if [ -n "$UV_TMP" ]; then rm -f "$UV_TMP"; fi
+  if [ -n "$GIT_ERR" ]; then rm -f "$GIT_ERR"; fi
   if [ "$rc" -ne 0 ]; then say "k3code-install: FAILED (exit $rc)${INSTALL_LOG:+. Log: $INSTALL_LOG}"; fi
   exit "$rc"
 }
@@ -201,15 +205,15 @@ find_python() { # sets PY_FOUND to the first python3 that is 3.12 or newer
   return 0
 }
 
-find_node() { # sets NODE_OK=1 when node 18+ and npm work (also accepts a node from an older install)
+find_node() { # sets NODE_OK=1 when node 20+ and npm work (also accepts a node from an older install)
   NODE_OK=0
-  if have node && have npm && [ "$(node_major node)" -ge 18 ] 2>/dev/null; then
+  if have node && have npm && [ "$(node_major node)" -ge 20 ] 2>/dev/null; then
     NODE_OK=1
     return 0
   fi
   for n in "$DATA"/node/*/bin/node; do
     [ -x "$n" ] || continue
-    if [ "$(node_major "$n")" -ge 18 ] 2>/dev/null && [ -x "$(dirname "$n")/npm" ]; then
+    if [ "$(node_major "$n")" -ge 20 ] 2>/dev/null && [ -x "$(dirname "$n")/npm" ]; then
       PATH="$(dirname "$n"):$PATH"
       export PATH
       NODE_OK=1
@@ -244,8 +248,8 @@ report() {
     item missing "git" "needed for --from-git, the default"
     say "      $(hint_cmd git)"
   fi
-  if [ "$NODE_OK" = 1 ]; then item ok "node 18+ with npm"; else
-    item missing "node 18+ with npm" "optional: builds the TUI; without it k3code uses the line REPL"
+  if [ "$NODE_OK" = 1 ]; then item ok "node 20+ with npm"; else
+    item missing "node 20+ with npm" "optional: builds the TUI; without it k3code uses the line REPL"
     say "      $(hint_cmd node)"
   fi
   if have go; then item ok "go"; else
@@ -267,21 +271,69 @@ ensure_uv() {
   if ! have curl && ! have wget; then die "curl or wget is needed to install uv: $(hint_cmd curl)"; fi
   log "uv is missing. Installing it into $BIN with its official installer (https://astral.sh/uv/install.sh)."
   ask "Install uv now?" || die "uv is required: install it with '$(hint_cmd uv)' and re-run this installer"
-  tmp=$(mktemp "${TMPDIR:-/tmp}/uv-install.XXXXXX")
-  fetch https://astral.sh/uv/install.sh "$tmp"
-  UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$BIN" sh "$tmp" >&2 || die "the uv installer failed (output above); install uv yourself: $(hint_cmd uv)"
-  rm -f "$tmp"
+  UV_TMP=$(mktemp "${TMPDIR:-/tmp}/uv-install.XXXXXX")
+  fetch https://astral.sh/uv/install.sh "$UV_TMP" ||
+    die "could not download the uv installer (no network?); install uv yourself: $(hint_cmd uv)"
+  UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$BIN" sh "$UV_TMP" >&2 || die "the uv installer failed (output above); install uv yourself: $(hint_cmd uv)"
+  rm -f "$UV_TMP"
+  UV_TMP=""
   find_uv || die "uv installation failed"
 }
 
-default_ref() { # latest v* tag on the remote, else Main
+default_ref() { # latest v* tag on the remote, else Main; fails (prints nothing) when the remote cannot be reached
   if [ "$CHANNEL" = dev ]; then
     echo Main
     return 0
   fi
-  t=$(git ls-remote --tags --refs --sort=-v:refname "$GIT_URL" 2>/dev/null |
-    sed -n 's#.*refs/tags/\(v[0-9][^/]*\)$#\1#p' | head -n 1)
+  out=$(git ls-remote --tags --refs --sort=-v:refname "$GIT_URL" 2>"$GIT_ERR") || return 1
+  t=$(printf '%s\n' "$out" | sed -n 's#.*refs/tags/\(v[0-9][^/]*\)$#\1#p' | head -n 1)
   echo "${t:-Main}"
+}
+
+# Network failures are told apart from private-repo failures: the git error text decides.
+git_error_reason() { # prints private, offline or other, from the last git error in GIT_ERR
+  if grep -qiE 'terminal prompts disabled|could not read username|authentication failed|repository not found|returned error: (401|403)' "$GIT_ERR" 2>/dev/null; then
+    echo private
+  elif grep -qiE 'could not resolve host|temporary failure in name resolution|failed to connect|network is unreachable|connection (timed out|refused|reset)|operation timed out' "$GIT_ERR" 2>/dev/null; then
+    echo offline
+  else
+    echo other
+  fi
+}
+
+git_error_hint() { # git_error_hint REASON: what to tell the user after "could not fetch"
+  case "$1" in
+    offline) echo "no network: check the connection and re-run" ;;
+    private) echo "the repo is private or needs credentials: gh auth login && gh auth setup-git (or check --ref)" ;;
+    *) echo "git said: $(tail -n 1 "$GIT_ERR" 2>/dev/null)" ;;
+  esac
+}
+
+# The installed version built from REF (a complete one; the active version wins), empty when there is none.
+recorded_version() {
+  if [ -f "$DATA/current/.complete" ] && [ "$(cat "$DATA/current/.ref" 2>/dev/null)" = "$1" ]; then
+    basename "$(readlink "$DATA/current")"
+    return 0
+  fi
+  found=""
+  for d in "$DATA"/versions/*; do
+    [ -f "$d/.complete" ] && [ "$(cat "$d/.ref" 2>/dev/null)" = "$1" ] && found=$(basename "$d")
+  done
+  printf '%s' "$found"
+}
+
+installed_ref() { # the ref the active version was built from, if it was recorded
+  if [ -f "$DATA/current/.ref" ]; then cat "$DATA/current/.ref"; fi
+  return 0
+}
+
+pick_default_ref() { # sets REF: the latest tag on the remote, else Main; offline, the ref of the active version
+  if REF=$(default_ref); then return 0; fi
+  REF=$(installed_ref)
+  if [ -z "$REF" ]; then
+    die "could not reach $GIT_URL to find the latest version: $(git_error_hint "$(git_error_reason)"). Pass --ref to choose one"
+  fi
+  log "could not reach $GIT_URL for the latest version: keeping the installed $REF"
 }
 
 # ---- source ----------------------------------------------------------------
@@ -299,14 +351,34 @@ acquire_source() {
     SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD 2>/dev/null || true)
   else
     [ -n "$GIT_URL" ] || GIT_URL=$DEFAULT_URL
-    [ -n "$REF" ] || REF=$(default_ref)
+    GIT_ERR=$(mktemp "${TMPDIR:-/tmp}/k3code-giterr.XXXXXX")
+    if [ -z "$REF" ]; then pick_default_ref; fi
+    # A tag never moves, so a complete install of it needs no network at all (this works offline).
+    case "$REF" in
+      v[0-9]*)
+        VER=$(recorded_version "$REF")
+        if [ -n "$VER" ]; then
+          VERDIR=$DATA/versions/$VER
+          SRC_ROOT=""
+          return 0
+        fi
+        ;;
+    esac
     TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-src.XXXXXX")
     SRC_ROOT=$TMP/src
     mkdir "$SRC_ROOT"
     log "fetching $REF from $GIT_URL"
     git -c init.defaultBranch=main init -q "$SRC_ROOT"
-    git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" ||
-      die "could not fetch '$REF' from $GIT_URL. If the repo is private and git has no credentials: gh auth login && gh auth setup-git (or check --ref)"
+    if ! git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" 2>"$GIT_ERR"; then
+      msg="could not fetch '$REF' from $GIT_URL: $(git_error_hint "$(git_error_reason)")"
+      # A branch moves, so it is always fetched first; the installed build of it is the fallback when that fails.
+      VER=$(recorded_version "$REF")
+      if [ -z "$VER" ]; then die "$msg"; fi
+      log "$msg. Using the installed version $VER"
+      VERDIR=$DATA/versions/$VER
+      SRC_ROOT=""
+      return 0
+    fi
     git -C "$SRC_ROOT" checkout -q FETCH_HEAD
     SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD)
   fi
@@ -330,7 +402,7 @@ acquire_source() {
 build_tui() {
   if [ "${K3_SKIP_TUI:-0}" = 1 ]; then return 0; fi
   if [ "$NODE_OK" != 1 ]; then
-    log "TUI skipped: node 18+ with npm not found (k3code falls back to the line REPL)"
+    log "TUI skipped: node 20+ with npm not found (k3code falls back to the line REPL)"
     return 0
   fi
   log "building the TUI (npm ci; this takes a minute)"
@@ -409,6 +481,7 @@ install_version() {
     "$VERDIR/venv/bin/k3code" --version >&2 || die "the new version does not start (k3code --version failed); nothing was activated"
   fi
   if [ "$FROM" = source ]; then printf '%s\n' "$SOURCE_PATH" >"$DATA/source_path"; fi
+  if [ "$FROM" = git ]; then printf '%s\n' "$REF" >"$VERDIR/.ref"; fi
   printf '%s\n' "$VER" >"$VERDIR/.complete"
   BUILDING=""
   return 0
