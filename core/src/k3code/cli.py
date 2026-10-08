@@ -830,9 +830,15 @@ def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation")
 @click.option("--channel", type=click.Choice(["stable", "dev"]), help="Release channel (default: update.channel)")
 @click.option("--from-source", is_flag=True, help="git pull the source checkout and rebuild")
+@click.option("--no-pull", is_flag=True, help="With --from-source: rebuild without git pull (you pulled the clone)")
 @click.option("--rollback", "do_rollback", is_flag=True, help="Switch back to the previous version")
-def update_cmd(check: bool, yes: bool, channel: str | None, from_source: bool, do_rollback: bool) -> None:
-    """Update to the latest release (smoke-tested, auto-rollback) or roll back."""
+def update_cmd(
+    check: bool, yes: bool, channel: str | None, from_source: bool, no_pull: bool, do_rollback: bool
+) -> None:
+    """Update to the latest release (smoke-tested, auto-rollback) or roll back.
+
+    An install built from a checkout (`install.sh --from-source`) updates from that checkout whenever there is no
+    release to fetch: none published yet, or a private repository and no token."""
     from k3code import update as upd
 
     if do_rollback:
@@ -841,6 +847,21 @@ def update_cmd(check: bool, yes: bool, channel: str | None, from_source: bool, d
         raise SystemExit(0 if res.ok else 1)
     cfg = upd.update_settings()
     cur = upd.current_version()
+    rel = None
+    if not from_source:
+        denied = ""
+        try:
+            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token())
+        except PermissionError as e:
+            denied = str(e)
+        except Exception as e:  # noqa: BLE001
+            raise click.ClickException(str(e)) from e
+        if rel is None:
+            src = upd.source_checkout()
+            if src is None or not (src / ".git").exists():
+                raise click.ClickException(denied or "no releases found on this channel")
+            click.echo(f"{denied or 'No release has been published yet'}.\nThis install is built from {src}: using it.")
+            from_source = True
     if from_source:
         src = upd.source_checkout()
         if src is None or not (src / ".git").exists():
@@ -849,15 +870,13 @@ def update_cmd(check: bool, yes: bool, channel: str | None, from_source: bool, d
         if check:
             return
         if not yes:
-            click.confirm("git pull and rebuild?", abort=True)
-        ver = upd.update_from_source(src)
-    else:
+            click.confirm("rebuild from the checkout?" if no_pull else "git pull and rebuild?", abort=True)
         try:
-            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token())
-        except (PermissionError, Exception) as e:  # noqa: BLE001
+            ver = upd.update_from_source(src, pull=not no_pull)
+        except upd.SourceUpdateError as e:
             raise click.ClickException(str(e)) from e
-        if rel is None:
-            raise click.ClickException("no releases found on this channel")
+    else:
+        assert rel is not None
         click.echo(f"current: {cur}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
         if check or not upd.is_newer(rel.version, cur):
             if not check:

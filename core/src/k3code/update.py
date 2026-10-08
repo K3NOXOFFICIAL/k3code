@@ -249,7 +249,10 @@ def fetch_latest(channel: str = "stable", repo: str = DEFAULT_REPO, token: str |
     """Newest release on ``channel`` (``stable`` skips prereleases; ``dev`` takes anything)."""
     r = httpx.get(f"https://api.github.com/repos/{repo}/releases?per_page=30", headers=_headers(token), timeout=15)
     if r.status_code in (401, 403, 404):
-        raise PermissionError(f"GitHub API {r.status_code}: the repo is private, set GITHUB_TOKEN (or `gh auth login`)")
+        raise PermissionError(
+            f"GitHub API {r.status_code}: {repo} is private or does not exist; set GITHUB_TOKEN (or `gh auth login`) "
+            "to read its releases"
+        )
     r.raise_for_status()
     rels = [
         Release(
@@ -388,9 +391,64 @@ def source_checkout() -> Path | None:
     return Path(f.read_text().strip()) if f.is_file() else None
 
 
-def update_from_source(checkout: Path) -> str:
+class SourceUpdateError(RuntimeError):
+    """The source checkout could not be updated; the message says what to do about it."""
+
+
+#: What git prints when it needs credentials it does not have (private repository, no helper, prompts disabled).
+_AUTH_HINTS = (
+    "could not read username",
+    "authentication failed",
+    "terminal prompts disabled",
+    "permission denied (publickey)",
+    "repository not found",
+    "invalid username or password",
+)
+
+
+def _in_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text().lower()
+    except OSError:
+        return False
+
+
+def git_pull_command(checkout: Path) -> list[str]:
+    """The command that fast-forwards ``checkout``.
+
+    A checkout on a Windows drive (``/mnt/c/...``) seen from WSL was cloned with Windows git, which holds the user's
+    GitHub credentials. WSL's own git has none and cannot pull a private repository, so use ``git.exe`` there."""
+    path = str(checkout)
+    if _in_wsl() and re.match(r"^/mnt/[a-z]/", path) and (exe := shutil.which("git.exe")):
+        win = subprocess.run(["wslpath", "-w", path], capture_output=True, text=True, check=False).stdout.strip()
+        if win:
+            return [exe, "-C", win, "pull", "--ff-only"]
+    return ["git", "-C", path, "pull", "--ff-only"]
+
+
+def pull_checkout(checkout: Path) -> None:
+    """``git pull --ff-only`` in ``checkout``; fails with advice instead of a traceback or a hung credential prompt."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    r = subprocess.run(git_pull_command(checkout), capture_output=True, text=True, check=False, env=env)
+    if r.returncode == 0:
+        return
+    err = (r.stderr or r.stdout or "").strip()
+    if any(hint in err.lower() for hint in _AUTH_HINTS):
+        last = err.splitlines()[-1][:140] if err else ""
+        raise SourceUpdateError(
+            f"git could not reach GitHub from here ({last}).\n"
+            f"Pull the checkout yourself with a git that has your credentials (on Windows: in PowerShell, "
+            f"`cd` into the clone and run `git pull`), then run `k3code update --from-source --no-pull`."
+        )
+    raise SourceUpdateError(f"git pull failed in {checkout}:\n{err[:600]}")
+
+
+def update_from_source(checkout: Path, *, pull: bool = True) -> str:
     """``git pull --ff-only`` then stage a new version via the installer (``--no-activate``); returns its name."""
-    subprocess.run(["git", "-C", str(checkout), "pull", "--ff-only"], check=True)
+    if pull:
+        pull_checkout(checkout)
     r = subprocess.run(
         [
             "sh",
@@ -401,8 +459,11 @@ def update_from_source(checkout: Path) -> str:
             "--no-activate",
             "--print-version",
         ],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
     )
+    if r.returncode:
+        tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
+        raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
     return r.stdout.strip().splitlines()[-1]
