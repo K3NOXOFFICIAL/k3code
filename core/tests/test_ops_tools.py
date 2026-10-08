@@ -220,7 +220,7 @@ async def test_agent_loop_sandboxes_only_unattended(tmp_path):
     assert loop._sandbox_argv() is not None
 
 
-def test_loop_falls_back_when_bwrap_missing(tmp_path, monkeypatch):
+def test_interactive_loop_runs_unsandboxed_with_a_warning_when_bwrap_missing(tmp_path, monkeypatch, caplog):
     from k3code.agent.loop import AgentLoop
 
     class _R:
@@ -228,7 +228,34 @@ def test_loop_falls_back_when_bwrap_missing(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sandbox, "usable", lambda: False)
     loop = AgentLoop(_R(), system_prompt="x", cwd=tmp_path, permission_mode="yolo")  # type: ignore[arg-type]
-    assert loop._sandbox_argv() is None  # runs unsandboxed; /doctor warns
+    assert loop._sandbox_argv() is None  # a user is watching: runs unsandboxed, /doctor warns
+    assert "bwrap unavailable" in caplog.text
+
+
+async def test_unattended_bash_is_refused_when_bwrap_is_unusable(tmp_path, monkeypatch):
+    """Background, goal and sub-agent bash fail closed: the model gets an error and no process is started."""
+    import asyncio
+
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import ToolCall
+
+    class _R:
+        chain: list = []
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    spawned: list[tuple] = []
+
+    async def refuse_spawn(*argv, **kwargs):
+        spawned.append(argv)
+        raise AssertionError("an unattended command must not be spawned without bwrap")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", refuse_spawn)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse_spawn)
+    for kwargs in ({"background": True}, {"unattended": True}):
+        loop = AgentLoop(_R(), system_prompt="x", cwd=tmp_path, permission_mode="yolo", **kwargs)  # type: ignore[arg-type]
+        result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "touch made.txt"}))
+        assert "bash refused" in result["error"] and "bubblewrap is unusable" in result["error"]
+    assert spawned == [] and not (tmp_path / "made.txt").exists()
 
 
 def test_doctor_warns_without_bwrap(monkeypatch):

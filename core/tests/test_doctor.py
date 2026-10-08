@@ -25,7 +25,7 @@ def test_sandbox_warns_when_bwrap_is_installed_but_unusable(monkeypatch):
     chk = doctor.check_sandbox()
     assert chk.status == doctor.WARN
     assert chk.detail.startswith("bubblewrap is installed but unusable (user namespaces blocked?)")
-    assert "unattended bash runs unsandboxed" in chk.detail
+    assert "unattended bash is refused" in chk.detail
 
 
 def test_sandbox_is_ok_when_bwrap_is_usable(monkeypatch):

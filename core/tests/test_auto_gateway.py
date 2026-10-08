@@ -281,11 +281,11 @@ async def test_automation_shell_probes_bwrap_off_the_event_loop(tmp_path, monkey
 
     def fake_usable() -> bool:
         probed_on.append(threading.current_thread())
-        return False  # bwrap unusable: the command runs unsandboxed and says so
+        return False  # bwrap unusable: an unattended shell command is refused
 
     monkeypatch.setattr(sandbox, "usable", fake_usable)
     server, _ = make_server(tmp_path, monkeypatch, ["ok"])
     code, out = await ServerRunner(server).run_shell("echo shell-ok", str(tmp_path))
-    assert code == 0 and "shell-ok" in out and "bwrap unavailable" in out
+    assert code == 126 and "bubblewrap is unusable" in out and "shell-ok" not in out  # unattended: fails closed
     assert probed_on and probed_on[0] is not threading.main_thread()
     await server.close()

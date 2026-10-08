@@ -332,6 +332,8 @@ class AgentLoop:
                 result = await handler(args, cwd=self.cwd, sandbox=argv)
             else:
                 result = await handler(args, cwd=self.cwd)
+        except sandbox.SandboxUnavailable as exc:  # raised before the handler: nothing was spawned
+            result = {"error": f"bash refused: {exc}"}
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
             result = {"error": f"Tool execution failed: {e}"}
@@ -340,10 +342,17 @@ class AgentLoop:
         return result
 
     def _sandbox_argv(self) -> list[str] | None:
-        """bwrap prefix for bash in auto/yolo/background sessions; None = run unsandboxed."""
+        """bwrap prefix for bash in sandboxed sessions.
+
+        None = run unsandboxed: interactive auto/yolo sessions when bwrap is unusable (warned once). An unattended
+        session (background, goal continuation, sub-agent) has no human to see a warning, so it raises
+        :class:`sandbox.SandboxUnavailable` instead: fail closed, nothing runs.
+        """
         if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return None
         if not sandbox.usable():
+            if self.background or self.unattended:
+                raise sandbox.SandboxUnavailable("bubblewrap is unusable here: unattended bash is refused; see /doctor")
             if not self._sandbox_warned:
                 self._sandbox_warned = True
                 logger.warning("bwrap unavailable: running bash without the sandbox (see /doctor)")

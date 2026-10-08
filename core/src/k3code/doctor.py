@@ -312,14 +312,16 @@ def check_sandbox(probe: bool = True) -> Check:
             return Check(
                 "sandbox",
                 WARN,
-                "bubblewrap is installed but unusable (user namespaces blocked?); unattended bash runs unsandboxed",
+                "bubblewrap is installed but unusable (user namespaces blocked?); unattended bash is refused, "
+                "interactive auto/yolo bash runs unsandboxed",
                 "allow unprivileged user namespaces for bwrap (try: bwrap --ro-bind / / true)",
             )
         return Check("sandbox", OK, f"bubblewrap at {path}")
     return Check(
         "sandbox",
         WARN,
-        "bwrap not found: auto/yolo/background bash runs WITHOUT a sandbox",
+        "bwrap not found: unattended bash (background, goal, sub-agent) is refused; auto/yolo bash runs WITHOUT a "
+        "sandbox",
         "install bubblewrap (dnf/apt install bubblewrap)",
     )
 
