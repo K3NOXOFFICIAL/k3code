@@ -119,7 +119,8 @@ class ServerRunner:
         # streaming are separated by awaits, so two callers (two /loop commands on one session, an overdue loop
         # resumed twice) both passed it and ran concurrently, clobbering each other's background/tool flags.
         async with live.run_lock:
-            while live.streaming:  # the user (or another run) is mid-turn in this session: wait for it
+            # turn_in_flight, not streaming: a user turn that is still compacting or starting MCP does not stream yet
+            while live.turn_in_flight:  # the user (or another run) is mid-turn in this session: wait for it
                 await asyncio.sleep(BUSY_POLL_S)
             prev_background = live.background
             live.background = True
@@ -127,9 +128,12 @@ class ServerRunner:
             live.task_kind = kind  # tier policy: loop_tick / cron_job / background_turn (cheap by default)
             if model and not existing:
                 live.stored.model = model
-            task = asyncio.get_running_loop().create_task(srv._run_turn(live, prompt), name=f"auto-{live.session_id}")
+            task = asyncio.get_running_loop().create_task(
+                srv._run_turn(live, prompt, drain=not existing), name=f"auto-{live.session_id}"
+            )
             live.turn_task = task
             srv.broadcast_active_list()
+            status, text = "interrupted", ""  # unless the turn returns; read by the finally below
             try:
                 status, text = await task
             except asyncio.CancelledError:
@@ -150,6 +154,11 @@ class ServerRunner:
                 live.task_kind = ""
                 if not existing:
                     await self._release(live)
+                elif status not in ("interrupted", "halted") and srv._pending_prompts(live) and not live.turn_in_flight:
+                    # the user queued prompts behind this run: they start now as their own, attended turn
+                    live.turn_task = asyncio.get_running_loop().create_task(
+                        srv._run_turn(live, live.pending_prompts.pop(0))
+                    )
                 srv.broadcast_active_list()
         result = RunResult(
             status=_STATUS.get(status, "failed"),

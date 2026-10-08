@@ -127,3 +127,76 @@ async def test_releasing_finished_runs_never_evicts_one_whose_turn_is_still_runn
     await ServerRunner(server)._release(live)
     assert stored.session_id not in server.live  # finished now: evictable as before
     await server.close()
+
+
+class GatedText:
+    """Text replies; the first call waits for `release`. Records whether the session ran unattended per call."""
+
+    name = "fake"
+    base_url = "fake://"
+
+    def __init__(self, live_ref) -> None:
+        self.live_ref = live_ref
+        self.entered, self.release = asyncio.Event(), asyncio.Event()
+        self.background: list[bool] = []
+
+    async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+        self.background.append(bool(self.live_ref().background))
+        if len(self.background) == 1:
+            self.entered.set()
+            await self.release.wait()
+        yield StreamEvent(type="text_delta", text="ok")
+        yield StreamEvent(type="done", message=Message(role="assistant", content="ok", tool_calls=[]), usage=Usage())
+
+    @property
+    def n(self) -> int:
+        return len(self.background)
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_a_loop_tick_waits_for_a_user_turn_that_is_not_streaming_yet(tmp_path, monkeypatch):
+    """run_prompt waited only on `streaming`: in a user turn's pre-streaming window (compaction, MCP start) the tick
+    replaced turn_task and flipped background=True under the user's turn, so /stop hit the wrong task."""
+    from k3code.automation import server_runner
+
+    monkeypatch.setattr(server_runner, "BUSY_POLL_S", 0.01)
+    server, provider = make_server(tmp_path, monkeypatch, ["tick reply"])
+    sid = await new_session(server, tmp_path)
+    live = server.live[sid]
+    user_turn_go = asyncio.Event()
+    user_turn = asyncio.create_task(user_turn_go.wait())  # the user's turn, still compacting: not streaming
+    live.turn_task = user_turn
+    run = asyncio.create_task(ServerRunner(server).run_prompt("tick", session_id=sid, kind="loop_tick"))
+    await asyncio.sleep(0.2)
+    assert live.turn_task is user_turn and live.background is False and provider.n == 0
+    user_turn_go.set()
+    res = await asyncio.wait_for(run, 20)
+    assert res.status == "completed" and provider.n == 1
+    await server.close()
+
+
+async def test_a_prompt_queued_during_a_loop_tick_runs_as_an_attended_turn(tmp_path, monkeypatch):
+    """A prompt the user queued behind a tick was drained inside the tick's own turn, with the tick's background flag
+    and tools: the user's prompt ran sandboxed, on the cheap tier, as an unattended loop_tick."""
+    from m1cmd_helpers import rpc
+
+    server, _ = make_server(tmp_path, monkeypatch)
+    sid = await new_session(server, tmp_path)
+    live = server.live[sid]
+    provider = GatedText(lambda: live)
+    _use(server, provider)
+    server._tiers = None
+    run = asyncio.create_task(ServerRunner(server).run_prompt("tick", session_id=sid, kind="loop_tick"))
+    await asyncio.wait_for(provider.entered.wait(), 20)
+    queued = (await rpc(server, "prompt.submit", {"text": "my own question"}))["result"]
+    assert queued["status"] == "queued"
+    provider.release.set()
+    res = await asyncio.wait_for(run, 20)
+    assert res.status == "completed"
+    await asyncio.wait_for(live.turn_task, 20)
+    assert provider.background == [True, False]  # the tick unattended, the user's prompt attended
+    assert live.background is False
+    assert [m["content"] for m in live.stored.messages if m["role"] == "user"] == ["tick", "my own question"]
+    await server.close()

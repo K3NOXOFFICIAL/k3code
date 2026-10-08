@@ -1319,14 +1319,21 @@ class GatewayServer:
 
     # ── turn lifecycle ────────────────────────────────────────────────
 
-    async def _run_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
-        """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget."""
+    async def _run_turn(self, session: LiveSession, text: str, *, drain: bool = True) -> tuple[str, str]:
+        """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget.
+
+        ``drain=False`` leaves prompts queued behind this turn for the caller: an unattended tick must not answer the
+        user's own prompt with its background flag, cheap tier and extra tools (see ServerRunner.run_prompt)."""
         async with session.turn_lock:  # a second turn on this session waits instead of interleaving with the first
             try:
                 result = await self._run_turn_locked(session, text)
                 # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
                 # halted: keep the queued prompts for after /daemon resume
-                while (pending := self._pending_prompts(session)) and result[0] not in ("interrupted", "halted"):
+                while (
+                    drain
+                    and (pending := self._pending_prompts(session))
+                    and result[0] not in ("interrupted", "halted")
+                ):
                     result = await self._run_turn_locked(session, pending.pop(0))
                 return result
             finally:
