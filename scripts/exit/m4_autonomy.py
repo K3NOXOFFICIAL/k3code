@@ -135,7 +135,7 @@ def scope_eval() -> None:
             how,
             "PENDING",
             f"eval set written and validated (30 rows, label dist {dist}); live classifier not run: {LIVE_DETAIL}",
-            f"the owner confirms/edits the labels in scope_eval.jsonl, then re-run scripts/exit/m4_autonomy.py {RESET}",
+            f"The owner confirms/edits the labels in scope_eval.jsonl, then re-run scripts/exit/m4_autonomy.py {RESET}",
         )
         return
     hit, misses, errors, matrix = _score_scope(rows)
@@ -160,7 +160,7 @@ def scope_eval() -> None:
             how_live,
             "PENDING",
             ev + ". Provisional PASS: the labels in scope_eval.jsonl are proposed-by-claude and not yet confirmed.",
-            "the owner confirms/edits the 30 labels in scripts/exit/scope_eval.jsonl; then re-run "
+            "The owner confirms/edits the 30 labels in scripts/exit/scope_eval.jsonl; then re-run "
             "scripts/exit/m4_autonomy.py and this row counts",
         )
 
@@ -684,8 +684,9 @@ def ultraresearch() -> None:
             ev,
         )
         return
-    dns = lib.run("getent hosts <searxng-host> || echo '<searxng-host>: no DNS answer'")[1].strip()
-    mcp_note = "k3nox hub_searxng MCP is not configured in this temp home"
+    host = os.environ.get("K3_SEARXNG_HOST", "searxng.invalid")  # your SearXNG host, if you run one
+    dns = lib.run(f"getent hosts {host} || echo '{host}: no DNS answer'")[1].strip()
+    mcp_note = "a hub_searxng MCP server is not configured in this temp home"
     reasons = []
     if not LIVE_OK:
         reasons.append(f"OmniRoute quota: {LIVE_DETAIL[:130]}")
@@ -697,7 +698,8 @@ def ultraresearch() -> None:
         how,
         "PENDING",
         f"fake-tools research tests rc={rc}: {tail(out, 1)}; blockers: {' | '.join(reasons) or 'none'}",
-        f"on a host that resolves <searxng-host> (or set research.searxng_url / connect hub_searxng MCP) {RESET}, "
+        f"on a host that resolves {host} (K3_SEARXNG_HOST; or set research.searxng_url / connect hub_searxng MCP) "
+        f"{RESET}, "
         "run /ultraresearch on a real topic and curl each cited URL (expect >=10 HTTP 2xx/3xx)",
     )
 

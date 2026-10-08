@@ -10,7 +10,7 @@
 
 Read `docs/reports/m2-ops.md`, `docs/reports/m1-commands.md` and `docs/reports/merge-m1-commands.md` first.
 
-Reference, read-only, MIT: Hermes Agent at `/home/user/.hermes/hermes-agent`:
+Reference, read-only, MIT: Hermes Agent at `~/.hermes/hermes-agent`:
 - `hermes_cli/loops.py`
 - `cron/jobs.py` (schedule math: `compute_next_run`)
 - `cron/unreachable_retry.py`

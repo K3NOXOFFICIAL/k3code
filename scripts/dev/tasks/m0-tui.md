@@ -2,7 +2,7 @@
 
 k3code's terminal UI reuses Hermes Agent's Ink/React TUI. The new Python core (`core/`, built separately) will implement the subset of the gateway JSON-RPC contract that the TUI needs.
 
-Reference checkout, read-only: Hermes Agent at `/home/user/.hermes/hermes-agent`, MIT, commit 4127d78da84b1eee105f298979cc57cc7457f98d.
+Reference checkout, read-only: Hermes Agent at `~/.hermes/hermes-agent`, MIT, commit 4127d78da84b1eee105f298979cc57cc7457f98d.
 - The TUI is `ui-tui/`, including `ui-tui/packages/hermes-ink`.
 - The shared TS protocol code is `apps/shared/src`.
 - The Python gateway is `tui_gateway/`, with its contracts in `tui_gateway/contracts/*.py`.
