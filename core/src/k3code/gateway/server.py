@@ -315,6 +315,8 @@ class GatewayServer:
         store: SessionStore | None = None,
     ) -> None:
         self.config = config or load_config(project_dir=Path.cwd())
+        #: config keys the files held at the last read (apply_file_config resets the ones that have since gone)
+        self._file_keys: set[str] = _file_keys(Path.cwd())
         self.store = store or SessionStore(self._home() / "sessions.db")
         self._stdin = stdin
         self._stdout = stdout
@@ -1562,18 +1564,19 @@ class GatewayServer:
         return live.turn_id if live is not None else ""
 
     def apply_file_config(self, cwd: str | Path | None = None) -> None:
-        """Re-read config files into the live settings (only keys present in a file are replaced)."""
+        """Re-read config files into the live settings.
+
+        Keys present in a file are replaced by the file's value. A key that was in a file at the previous read and is
+        gone now (removed by hand or rolled back by an experiment) is reset to its fresh value, not left as it was.
+        """
         base = Path(cwd) if cwd else Path.cwd()
         fresh = load_config(project_dir=base)
-        keys: set[str] = set()
-        for path in (_user_cfg(), _proj_cfg(base)):
-            try:
-                keys |= set(confio.read_yaml(path))
-            except confio.ConfigError:
-                continue
-        for key in keys & set(Settings.model_fields):
+        keys = _file_keys(base)
+        changed = (keys | self._file_keys) & set(Settings.model_fields)
+        for key in changed:
             setattr(self.config, key, getattr(fresh, key))
-        if "providers" in keys:
+        self._file_keys = keys
+        if "providers" in changed:
             self.router = None
             self._tiers = None
         self.mcp.configure(self.config.mcp.servers)
@@ -1931,6 +1934,17 @@ def _command_for_tool(tool_name: str, arguments: dict[str, Any]) -> str:
     if tool_name == "read":
         return f"read {arguments.get('path', '')}"
     return f"{tool_name} {json.dumps(arguments, ensure_ascii=False)[:120]}"
+
+
+def _file_keys(base: Path) -> set[str]:
+    """Top-level keys of the user and project config files (none when a file is absent or unreadable)."""
+    keys: set[str] = set()
+    for path in (_user_cfg(), _proj_cfg(base)):
+        try:
+            keys |= set(confio.read_yaml(path))
+        except confio.ConfigError:
+            continue
+    return keys
 
 
 def _usage_payload(usage: Usage) -> dict[str, Any]:

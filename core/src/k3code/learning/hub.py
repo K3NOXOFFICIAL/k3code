@@ -27,7 +27,7 @@ class LearningHub:
         self.clock = clock
         self.log = DecisionLog(self.home, clock)
         self.store = store
-        self.experiments = optimizer.Experiments(self.home, clock)
+        self.experiments = optimizer.Experiments(self.home, clock, live=server.config)
         self._state_path = self.home / "learning" / "state.json"
         self._tasks: set[asyncio.Task[Any]] = set()
 
@@ -143,11 +143,6 @@ class LearningHub:
             exp = self.experiments.start(overlay, baseline, sessions=int(self.cfg["optimizer"]["ab_sessions"]))
         except Exception as e:  # noqa: BLE001
             return f"overlay not applied: {e}"
-        if "patch" in overlay:
-            for k, v in overlay["patch"].items():
-                cur = getattr(self.server.config, k, None)
-                if isinstance(cur, dict) and isinstance(v, dict):
-                    cur.update(v)
         return (f"Experiment {exp['id']} started: active for {exp['target_sessions']} sessions, then compared "
                 f"(auto-rollback if worse). /optimizer status")
 

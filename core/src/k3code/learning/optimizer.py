@@ -154,13 +154,18 @@ def suggest(m: dict[str, Any], config: Any) -> list[dict[str, Any]]:
 # ── experiments ────────────────────────────────────────────────────────────
 
 class Experiments:
-    """A/B experiments persisted in ``$K3CODE_HOME/learning/experiments.json``."""
+    """A/B experiments persisted in ``$K3CODE_HOME/learning/experiments.json``.
 
-    def __init__(self, home_: Path | None = None, clock: Callable[[], float] = time.time) -> None:
+    ``live`` is the running :class:`~k3code.config.Settings`: a config overlay changes it when it starts and the
+    rollback restores it, so the running process and the YAML never disagree (before, only the YAML was restored).
+    """
+
+    def __init__(self, home_: Path | None = None, clock: Callable[[], float] = time.time, live: Any = None) -> None:
         self.home = Path(home_ or home())
         self.path = self.home / "learning" / "experiments.json"
         self.overlays = self.home / "overlays"
         self.clock = clock
+        self.live = live
 
     def all(self) -> list[dict[str, Any]]:
         try:
@@ -195,6 +200,7 @@ class Experiments:
             merged = merge_patch(cur, overlay["patch"])
             confio.validate(merged)
             confio.write_yaml(path, merged)
+            self._sync_live(merged, overlay["patch"])
         else:
             exp.update(kind="prompt", name=overlay["name"])
             self.overlays.mkdir(parents=True, exist_ok=True)
@@ -211,8 +217,9 @@ class Experiments:
             return False
         if exp["kind"] == "config":
             path = config_path or user_config_path()
-            cur = confio.read_yaml(path)
-            confio.write_yaml(path, _restore(cur, exp["patch"], exp["prev"]))
+            restored = _restore(confio.read_yaml(path), exp["patch"], exp["prev"])
+            confio.write_yaml(path, restored)
+            self._sync_live(restored, exp["patch"])
         else:
             f = self.overlays / f"{xid}-{exp['name']}.md"
             if f.is_file():
@@ -221,6 +228,16 @@ class Experiments:
         exp["ended"] = self.clock()
         self._save(items)
         return True
+
+    def _sync_live(self, data: dict[str, Any], patch: dict[str, Any]) -> None:
+        """Copy the patched top-level keys from a config mapping onto the live settings (defaults where absent)."""
+        if self.live is None:
+            return
+        from k3code.config import Settings  # local: learning is imported by the gateway before config is needed
+
+        validated = Settings.model_validate(data)
+        for key in patch:
+            setattr(self.live, key, getattr(validated, key))
 
     def session_done(self, current_metrics: Callable[[float], dict[str, Any]], notify: Callable[[str], None] | None
                      = None, config_path: Path | None = None) -> list[dict[str, Any]]:

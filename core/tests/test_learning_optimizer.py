@@ -170,3 +170,40 @@ def test_scope_accuracy_is_scored_from_the_verifier_outcome(tmp_path):
         scope.append({"ts": 2, "type": "outcome", "hash": h, "outcome": outcome})
     m = optimizer.collect([], DecisionLog(tmp_path), scope, since=0)
     assert m["scope_judged"] == 2 and m["scope_accuracy"] == 0.5 and m["verifier_pass_rate"] == 0.5
+
+
+def test_rollback_restores_the_live_settings_not_only_the_yaml(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text("max_turns: 7\ntask_tiers:\n  title: fast\n")
+    live = Settings(max_turns=7, task_tiers={"title": "fast"})
+    xp = optimizer.Experiments(tmp_path, FakeClock(), live=live)
+    xp.start({"title": "t", "patch": {"max_turns": 9, "task_tiers": {"classification": "main"}}}, metrics_for(0.1),
+             sessions=1, config_path=cfg)
+    assert live.max_turns == 9 and live.task_tiers == {"title": "fast", "classification": "main"}
+    xp.rollback("x1", config_path=cfg)
+    assert live.max_turns == 7 and live.task_tiers == {"title": "fast"}
+    assert confio.read_yaml(cfg)["max_turns"] == 7
+
+
+def test_rollback_of_a_key_that_was_absent_resets_the_live_value_to_its_default(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    live = Settings()
+    xp = optimizer.Experiments(tmp_path, FakeClock(), live=live)
+    xp.start({"title": "t", "patch": {"max_turns": 9}}, metrics_for(0.1), sessions=1, config_path=cfg)
+    assert live.max_turns == 9
+    xp.rollback("x1", config_path=cfg)
+    assert live.max_turns == Settings().max_turns and "max_turns" not in confio.read_yaml(cfg)
+
+
+async def test_a_key_removed_from_the_config_file_is_reset_on_reload(tmp_path, monkeypatch):
+    from k3code.paths import user_config_path
+    from test_permissions_gateway import make_server
+
+    server, _ = make_server(tmp_path, ["x"], monkeypatch)
+    user_config_path().write_text("max_turns: 9\n", encoding="utf-8")
+    server.apply_file_config(tmp_path)
+    assert server.config.max_turns == 9
+    user_config_path().write_text("output_style: concise\n", encoding="utf-8")  # max_turns removed by hand
+    server.apply_file_config(tmp_path)
+    assert server.config.max_turns == Settings().max_turns
+    await server.close()
