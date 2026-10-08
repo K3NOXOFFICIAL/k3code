@@ -246,10 +246,9 @@ def check_systemd() -> Check:
 
 
 def find_repo_root() -> Path | None:
-    from k3code.paths import data_dir
+    from k3code.paths import install_roots
 
-    here = Path(__file__).resolve()
-    for candidate in (Path.cwd(), *here.parents, data_dir() / "current"):
+    for candidate in install_roots():
         if (candidate / "tui" / "package.json").is_file() or (candidate / "tui" / "dist" / "entry.js").is_file():
             return candidate
     return None

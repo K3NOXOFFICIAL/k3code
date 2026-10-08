@@ -486,11 +486,10 @@ def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = 
 
 
 def _find_repo_root() -> Path | None:
-    """Walk up from cwd for a tui/dist/entry.js (works from the repo or installed)."""
-    from k3code.paths import data_dir
+    """The k3code root holding tui/dist/entry.js: our own source tree or install, never the cwd (see install_roots)."""
+    from k3code.paths import install_roots
 
-    here = Path(__file__).resolve()
-    for candidate in (Path.cwd(), *here.parents, data_dir() / "current"):
+    for candidate in install_roots():
         if (candidate / "tui" / "dist" / "entry.js").is_file():
             return candidate
     return None
