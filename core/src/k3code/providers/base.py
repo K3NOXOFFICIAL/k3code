@@ -117,4 +117,6 @@ def to_provider_error(exc: BaseException, *, kind: str) -> ProviderError:
             body = {}
     type_name = type(exc).__name__
     message = f"{type_name}: {exc}" if str(exc) else type_name
-    return ProviderError(message=message, status_code=status, headers=headers, body=body)
+    err = ProviderError(message=message, status_code=status, headers=headers, body=body)
+    err.__cause__ = exc  # the classifier reads the transport type from the chain
+    return err
