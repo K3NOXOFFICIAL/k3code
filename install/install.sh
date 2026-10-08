@@ -462,7 +462,7 @@ install_version() {
     mkdir -p "$VERDIR/venv/bin"
     # the stub answers --version, and fails on `doctor` so the tests show that presetup ignores the doctor's status
     # shellcheck disable=SC2016 # the $1 belongs to the stub script, not to this shell
-    printf '#!/bin/sh\ncase "$1" in\ndoctor) echo "! browser: stub (K3_STUB_VENV)"; exit 1 ;;\n*) echo "k3code %s" ;;\nesac\n' "$VER" \
+    printf '#!/bin/sh\ncase "$1" in\ndoctor) echo "! browser: stub (K3_STUB_VENV) data=$K3CODE_DATA"; exit 1 ;;\n*) echo "k3code %s" ;;\nesac\n' "$VER" \
       >"$VERDIR/venv/bin/k3code"
     chmod +x "$VERDIR/venv/bin/k3code"
   else
@@ -596,6 +596,8 @@ PLAYWRIGHT_VERSION=1.63.0
 chromium_present() { # the marker from an earlier run and the browser it names are both still there
   [ -f "$DATA/presetup/chromium-$PLAYWRIGHT_VERSION" ] || return 1
   if [ "${K3_STUB_VENV:-0}" = 1 ]; then return 0; fi
+  # the Playwright package lives in the version's venv: a new version without it repeats only the cheap pip step
+  "$VERDIR/venv/bin/python" -c "import playwright" >/dev/null 2>&1 || return 1
   for d in "$DATA"/browsers/chromium_headless_shell-*; do
     [ -d "$d" ] && return 0
   done
@@ -641,7 +643,7 @@ presetup_doctor() {
     return 0
   fi
   log "presetup: health subset (warnings only; 'k3code doctor' gives the full report)"
-  out=$("$BIN/k3code" doctor --install 2>/dev/null) || true
+  out=$(K3CODE_DATA="$DATA" "$BIN/k3code" doctor --install 2>/dev/null) || true
   if [ -n "$out" ]; then say "$out"; fi
   return 0
 }

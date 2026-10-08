@@ -338,3 +338,11 @@ def test_uninstall_removes_the_chromium_location(tmp_path: Path) -> None:
     assert (data / CHROMIUM_MARKER).is_file()
     assert run(tmp_path, UNINSTALL).returncode == 0
     assert not data.exists()
+
+
+def test_presetup_doctor_sees_a_custom_prefix_data_dir(tmp_path: Path) -> None:
+    # with --prefix the browser location is under that prefix, so the doctor must be told the data dir explicitly
+    prefix = tmp_path / "custom"
+    r = run(tmp_path, INSTALL, "--from-source", "--yes", "--prefix", str(prefix))
+    assert r.returncode == 0, r.stderr
+    assert f"data={prefix / 'share' / 'k3code'}" in r.stderr
