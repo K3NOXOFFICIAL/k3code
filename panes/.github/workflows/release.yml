@@ -1,0 +1,183 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Re-runs the release for a tag that already exists, with this workflow file
+  # instead of the one at the tag. A tag is never moved once pushed: the Go
+  # module proxy caches it at first sight.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release, for example v0.8.0
+        required: true
+      ghostty_darwin_only:
+        description: Skip GoReleaser and add only the darwin ghostty archives
+        type: boolean
+        default: false
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+# Both jobs write to the GitHub release. Nothing in .goreleaser.yml publishes a
+# package or image (the dockers section is commented out, and the image is
+# docker-publish.yml's job), so the token no longer carries packages: write.
+# The Homebrew tap and the AUR use their own secrets.
+permissions:
+  contents: write
+
+# One release per tag, and never cancelled halfway: a half-published release
+# is worse than a slow one.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  goreleaser:
+    # A dispatch with ghostty_darwin_only set leaves the published release,
+    # the Homebrew tap and the AUR alone.
+    if: ${{ !inputs.ghostty_darwin_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          # Track go.mod rather than a literal. Pinning "1.24" here while go.mod
+          # asked for a newer language version meant the release build resolved
+          # its own toolchain at build time instead of using the one set up
+          # above, which is slower and makes the pin a lie.
+          go-version-file: go.mod
+
+      # setup-zig has no release on the Node 24 runtime yet, so the runner
+      # warns that it forces it onto Node 24. It works there.
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      # setup-zig points Zig's caches at .zig-cache in the checkout, and
+      # GoReleaser refuses to release from a tree with untracked files in it.
+      - name: Move the Zig caches out of the checkout
+        run: |
+          echo "ZIG_GLOBAL_CACHE_DIR=$RUNNER_TEMP/zig-global-cache" >> "$GITHUB_ENV"
+          echo "ZIG_LOCAL_CACHE_DIR=$RUNNER_TEMP/zig-local-cache" >> "$GITHUB_ENV"
+
+      - name: Cache libghostty-vt
+        uses: actions/cache@v6
+        with:
+          path: .ghostty-vt
+          key: ghostty-vt-${{ hashFiles('scripts/ghostty-lib.sh') }}-linux-windows
+
+      - name: Build libghostty-vt for the cgo targets
+        run: |
+          for t in x86_64-linux-gnu aarch64-linux-gnu x86_64-windows-gnu aarch64-windows-gnu; do
+            ./scripts/ghostty-lib.sh "$t"
+          done
+
+      # A tag with hand-written notes at docs/release-notes/<tag>.md publishes
+      # them as the release body. Without one, GoReleaser's grouped changelog
+      # is the body, as before.
+      - name: Pick the release notes
+        id: notes
+        run: |
+          if [ -f "docs/release-notes/${TAG}.md" ]; then
+            echo "args=release --clean --release-notes docs/release-notes/${TAG}.md" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=release --clean" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: ${{ steps.notes.outputs.args }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GORELEASER_CURRENT_TAG: ${{ env.TAG }}
+          # .goreleaser.yml builds the ghostty CC and PKG_CONFIG_PATH paths
+          # from .Env.PWD. The action starts GoReleaser without a shell, so
+          # nothing sets PWD unless it is given here.
+          PWD: ${{ github.workspace }}
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+  # Darwin cannot be cross-compiled with cgo from Linux without macOS SDK
+  # hacks, so the ghostty-tagged darwin artifacts build natively on a mac
+  # runner and attach to the same release.
+  ghostty-darwin:
+    runs-on: macos-14
+    needs: goreleaser
+    # Runs after GoReleaser, or alone when a dispatch skipped it.
+    if: ${{ !cancelled() && (needs.goreleaser.result == 'success' || needs.goreleaser.result == 'skipped') }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: refs/tags/${{ env.TAG }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Cache libghostty-vt
+        uses: actions/cache@v6
+        with:
+          path: .ghostty-vt
+          key: ghostty-vt-${{ hashFiles('scripts/ghostty-lib.sh') }}-darwin
+
+      - name: Build and upload darwin ghostty binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          version="${TAG#v}"
+          ldflags="-s -w -X main.version=${version} -X main.commit=$(git rev-parse HEAD) -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ) -X main.builtBy=goreleaser"
+          # The archive names follow .goreleaser.yml's name_template, which
+          # spells amd64 as x86_64. tuios update and the install script look
+          # assets up by that name, so the two must not differ.
+          #
+          # Zig builds libghostty-vt, but Xcode's clang links the binary. zig cc
+          # has no macOS SDK, so the cgo link fails on the -lresolv that Go's
+          # net package asks for on darwin. clang finds the SDK itself, and Go
+          # passes it -arch for each GOARCH, so one runner links both arches.
+          # netgo would also avoid -lresolv, but it ignores the system
+          # resolver, which breaks VPN and split DNS for ssh host names.
+          for triple in arm64:arm64:aarch64-macos amd64:x86_64:x86_64-macos; do
+            arch="${triple%%:*}"
+            rest="${triple#*:}"
+            label="${rest%%:*}"
+            target="${rest#*:}"
+            ./scripts/ghostty-lib.sh "$target"
+            CGO_ENABLED=1 GOARCH="$arch" CC=clang \
+              PKG_CONFIG_PATH="$PWD/.ghostty-vt/$target/pkgconfig" \
+              go build -tags ghostty -trimpath -ldflags "$ldflags" -o tuios ./cmd/tuios
+            # The runner is arm64. Rosetta runs the x86_64 binary.
+            arch -"$label" ./tuios --version
+            tar czf "tuios-ghostty_${version}_Darwin_${label}.tar.gz" tuios README.md LICENSE*
+            rm tuios
+          done
+          # GoReleaser wrote checksums.txt before these archives existed. tuios
+          # update refuses an archive checksums.txt does not list, so their
+          # digests are appended and the file replaced.
+          gh release download "${TAG}" --pattern checksums.txt --clobber
+          grep -v 'tuios-ghostty_.*_Darwin_' checksums.txt > checksums.new || true
+          shasum -a 256 tuios-ghostty_*_Darwin_*.tar.gz >> checksums.new
+          mv checksums.new checksums.txt
+          gh release upload "${TAG}" tuios-ghostty_*.tar.gz checksums.txt --clobber

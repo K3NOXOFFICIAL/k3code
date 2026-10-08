@@ -1,0 +1,127 @@
+package session
+
+import (
+	"strings"
+	"time"
+
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/federation"
+)
+
+// DaemonConfigFromUser maps the parts of the user's config file the daemon
+// owns onto the daemon's own config: the [daemon] section, the [hosts] table
+// and the hooks the daemon fires.
+//
+// Every starter calls it: `tuios daemon`, and the SSH and web servers when
+// they start a daemon in-process. It used to be three hand-written subsets,
+// and a daemon started by `tuios ssh` ran with no agent detection settings and
+// no hosts while the same file gave both to a daemon started by `tuios
+// attach`. The fields the starter owns (Version, Foreground, LogFile,
+// DisableAutoRestore) stay the starter's to fill.
+//
+// The log level is applied here as well, when nothing set it first: a flag or
+// the environment wins over the file. It is a process global, so it is set
+// once whoever starts the daemon.
+//
+// TestEveryDaemonKeyReachesTheDaemon holds this to every key in the section.
+func DaemonConfigFromUser(uc *config.UserConfig) *DaemonConfig {
+	cfg := &DaemonConfig{}
+	if uc == nil {
+		// No file was read, which is not the same as a file turning the
+		// risk rules off: the approval table's defaults stand, the shipped
+		// rules among them, so a protocol pane's held call is still marked.
+		// Fail closed.
+		cfg.Approvals = ApprovalPolicyFromConfig(config.ApprovalsConfig{})
+		return cfg
+	}
+	if GetDebugLevel() == DebugOff && uc.Daemon.LogLevel != "" {
+		SetDebugLevel(ParseDebugLevel(uc.Daemon.LogLevel))
+	}
+	// [agents] enabled = false turns every agent feature off.
+	cfg.AgentsOff = !uc.Agents.On()
+	cfg.AgentAutoDetect = uc.Daemon.AgentAutoDetect
+	cfg.AgentDetectInterval = time.Duration(uc.Daemon.AgentDetectSeconds) * time.Second
+	cfg.AgentBinaries = uc.Daemon.AgentBinaries
+	cfg.RespondFromShell = uc.Daemon.RespondFromShell
+	cfg.ResumeAgents = uc.Daemon.ResumeAgents
+	cfg.WindowSize = uc.Daemon.WindowSize
+	cfg.History = ResolveHistoryPolicy(uc.Daemon.PersistScrollback, uc.Daemon.PersistScrollbackLines, uc.Daemon.PersistScrollbackKB)
+	cfg.Hosts = HostsFromConfig(uc)
+	// The same table says what each machine linked to this one may do here.
+	cfg.LinkPolicies = uc.Hosts
+	// The path, not the table, is what lets the daemon follow later edits to
+	// [hosts]. Every real starter goes through here, so every real daemon
+	// watches the file; a daemon built from a hand-made config in a test does
+	// not, and neither does one whose config file could not be loaded at all.
+	// LoadUserConfig writes a default file when there is none, so the machine
+	// that has never saved a setting still arrives here with a path.
+	if path, err := config.GetConfigPath(); err == nil {
+		cfg.ConfigPath = path
+	}
+	// The daemon owns every pane's history, so the depth the user asked for
+	// has to reach it: the client's emulator honoured the setting and the
+	// daemon's kept ten thousand lines whatever it said.
+	cfg.ScrollbackLines = uc.Appearance.ScrollbackLines
+	// The daemon spawns every pane, so where a new one starts is its decision
+	// to make. Absent from the file means the default, which is to inherit.
+	cfg.NewWindowInheritCwd = uc.Appearance.NewWindowInheritCwd == nil || *uc.Appearance.NewWindowInheritCwd
+	// The daemon spawns every pane, so the shell the user asked for has to
+	// reach it: only standalone panes used to honour it.
+	cfg.PreferredShell = uc.Appearance.PreferredShell
+	// The daemon owns the window set, so it sees the workspace on screen
+	// lose its last pane, with or without a client attached.
+	cfg.StayOnEmptyWorkspace = !uc.Workspaces.ReturnsWhenEmpty()
+	// The daemon runs the hooks for the facts it owns, so a session with
+	// nobody attached still runs them. The client keeps the hooks that need a
+	// terminal.
+	cfg.ApplyUserHooks(uc)
+	// The daemon holds a harness's approval hook for the Inbox, so it is the
+	// side that has to know which harnesses asked for that.
+	cfg.Approvals = ApprovalPolicyFromConfig(uc.Agents.Approvals)
+	// The daemon checks every call from a pane, so it is the side that has
+	// to know what a pane given no grants of its own may do.
+	cfg.Permissions = PanePermissionsFromConfig(uc.Agents.Permissions)
+	// The daemon computes the activity recap, so it reads what a test run
+	// looks like.
+	cfg.RecapTestPatterns = uc.Agents.Recap.Resolved().TestPatterns
+	// The daemon holds every pane's delivery queue, so it bounds them.
+	cfg.QueueMax = uc.Agents.Queue.MaxEntries()
+	// The daemon takes every checkpoint, so it reads whether to.
+	cfg.Checkpoints = uc.Agents.Checkpoints
+	// The daemon runs the herdr plugins, so it reads which ones.
+	cfg.Plugins = uc.Plugins
+	// The daemon spawns every pane, so it decides which are told about the
+	// herdr protocol socket.
+	cfg.HerdrProtocol = uc.Agents.HerdrProtocol
+	// The daemon runs when nobody is attached, which is when a phone is the
+	// way to reach the person, so it sends the push notifications.
+	cfg.Notify = uc.Notify
+	return cfg
+}
+
+// HostsFromConfig turns the [hosts] config table into the daemon's host list.
+// Nothing is validated here; the federation table does that and reports what it
+// dropped, so the reason reaches 'tuios hosts' rather than only the log.
+func HostsFromConfig(cfg *config.UserConfig) []federation.Host {
+	if cfg == nil || len(cfg.Hosts) == 0 {
+		return nil
+	}
+	out := make([]federation.Host, 0, len(cfg.Hosts))
+	for name, h := range cfg.Hosts {
+		// [hosts."*"] and an entry with a policy and no address say what a
+		// machine linking in may do here. Neither is a machine to dial, so
+		// neither is reported as a host with no addr.
+		if name == config.LinkPolicyDefaultName || (strings.TrimSpace(h.Addr) == "" && h.HasLinkPolicy()) {
+			continue
+		}
+		out = append(out, federation.Host{
+			Name:           name,
+			Addr:           h.Addr,
+			ConnectTimeout: time.Duration(h.ConnectTimeout) * time.Second,
+			Command:        h.Command,
+			SSHOptions:     h.SSHOptions,
+			TailscaleLogin: h.TailscaleLogin,
+		})
+	}
+	return out
+}

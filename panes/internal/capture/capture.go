@@ -1,0 +1,450 @@
+// Package capture is the glue between a screenshot request and the shot
+// renderer: it turns the [screenshot] config section, a theme id and a glyph
+// set id into the concrete palette and frame that shot.Render wants, and it
+// names and writes the file.
+//
+// It sits outside internal/shot on purpose. shot is a leaf: it knows cells,
+// colours and geometry and nothing about tuios. This package knows tuios and
+// nothing about rasterisation, so the daemon and the client can both ask for
+// the same picture without either of them re-deriving a default.
+package capture
+
+import (
+	"errors"
+	"fmt"
+	"image/color"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/shot"
+	"github.com/Gaurav-Gosain/tuios/internal/theme"
+)
+
+// Settings is one resolved screenshot request: the config section with any
+// per-call overrides already applied, so nothing downstream has to know which
+// value came from where.
+type Settings struct {
+	Format shot.Format
+	// ThemeID is the palette to render in. Empty means no theme is set and
+	// the render falls back to the xterm guess, which Warnings names.
+	ThemeID string
+	// GlyphSetID supplies the window control marks for controls = glyphs.
+	GlyphSetID string
+	// Frame, Background, Controls, Title carry the config spellings straight
+	// through to shot.BuildFrame.
+	Frame      string
+	Background string
+	Controls   string
+	Title      string
+	Padding    int
+	Radius     int
+	Shadow     bool
+	FontFamily string
+	FontFile   string
+	// HostFontFamily and HostBoldFamily are what the terminal answered when
+	// asked which font it draws with. They are PostScript names, they are only
+	// ever set by a client with a host to ask, and they are what makes a
+	// default capture come out with the user's own icons in it.
+	HostFontFamily string
+	HostBoldFamily string
+	// HostCellW and HostCellH are one cell of the host terminal, in pixels, as
+	// the host itself answered. They are the shape the picture has to come out
+	// in: a capture is a picture of a terminal, and a terminal's cell is not
+	// the font's line box. Only a client with a host to ask sets them.
+	HostCellW, HostCellH int
+	Scale                int
+	Cursor               bool
+	// PaneBackground is the background the session paints behind pane
+	// content, after the precedence between appearance.pane_background and
+	// appearance.background (config.ResolveBackground): off, theme, or a
+	// #RRGGBB literal. See WithPaneBackground.
+	PaneBackground string
+	// Directory is where a generated filename lands.
+	Directory string
+}
+
+// SettingsFrom resolves the config section into a request, before overrides.
+func SettingsFrom(c config.ScreenshotConfig, themeID, glyphSetID string) Settings {
+	format, ok := shot.ParseFormat(c.EffectiveFormat())
+	if !ok {
+		format = shot.FormatPNG
+	}
+	return Settings{
+		Format:     format,
+		ThemeID:    themeID,
+		GlyphSetID: glyphSetID,
+		Frame:      orDefault(c.Frame, config.ScreenshotDefaultFrame),
+		Background: orDefault(c.Background, config.ScreenshotDefaultBackground),
+		Controls:   orDefault(c.Controls, config.ScreenshotDefaultControls),
+		Title:      orDefault(c.TitleFormat, config.ScreenshotDefaultTitleFormat),
+		Padding:    c.PaddingPx(),
+		Radius:     c.RadiusPx(),
+		Shadow:     c.ShadowEnabled(),
+		FontFamily: orDefault(c.FontFamily, config.ScreenshotDefaultFontFamily),
+		FontFile:   c.FontFile,
+		Scale:      c.ScaleFactor(),
+		Cursor:     c.Cursor,
+		Directory:  c.ResolveDirectory(),
+	}
+}
+
+func orDefault(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+// XTermNotice is the one line a render carries when no theme is set. tuios can
+// never read the host terminal's palette, so basic and indexed colours in an
+// unthemed session are a guess; this says which guess, once, instead of
+// letting the picture pass for the host's own colours.
+const XTermNotice = "No theme is set. Basic colors use the xterm defaults."
+
+// Palette resolves the session's theme into concrete colours for the renderer.
+//
+// It takes a theme id rather than reading the process theme because the daemon
+// is a caller: the daemon never selects a tint of its own, so its idea of the
+// "current" theme answers for nobody. warn is empty when a theme resolved and
+// carries XTermNotice when the render fell back to the guess.
+func Palette(themeID string) (p *shot.Palette, warn string) {
+	ansiPalette, fg, bg, _, ok := theme.Colors(themeID)
+	if !ok {
+		return shot.XTermPalette(), XTermNotice
+	}
+	fallback := shot.XTermPalette()
+	out := &shot.Palette{FG: toShot(fg, fallback.FG), BG: toShot(bg, fallback.BG)}
+	for i, c := range ansiPalette {
+		out.ANSI[i] = toShot(c, fallback.ANSI[i])
+	}
+	return out, ""
+}
+
+// WithPaneBackground returns the palette a capture of one pane is drawn in
+// when appearance.pane_background paints a ground behind it, so the picture
+// shows the pane as tuios draws it.
+//
+// A capture already draws a cell with no background of its own in the
+// palette's background, since it has no terminal behind it to show through.
+// For off and for theme that is already right: the palette is the theme's,
+// and with no theme there is no theme background to paint. Only a colour
+// literal changes anything. It becomes the background, and when a theme is set
+// the theme's foreground is lifted until it reads on it, which is the same
+// foreground the live pane gives text left in the default colour.
+//
+// The palette passed in is not modified.
+func WithPaneBackground(p *shot.Palette, setting, themeID string) *shot.Palette {
+	if p == nil || !config.IsHexColor(setting) {
+		return p
+	}
+	bg, ok := shot.ParseHex(setting)
+	if !ok {
+		return p
+	}
+	out := *p
+	out.BG = bg
+	if themeID != "" {
+		fg := theme.ReadableAt(p.FG, bg, theme.ContrastFloor)
+		out.FG = toShot(fg, p.FG)
+	}
+	return &out
+}
+
+// toShot converts a theme colour to a shot colour, falling back when the value
+// carries no channels of its own. A tint entry is normally a concrete hex, but
+// an unthemed palette holds bare ansi indices, which resolve to nothing here.
+func toShot(c color.Color, def shot.Color) shot.Color {
+	if c == nil {
+		return def
+	}
+	switch c.(type) {
+	case ansi.BasicColor, ansi.IndexedColor:
+		// A palette index cannot say what colour it is; only the host can.
+		return def
+	}
+	r, g, b, a := c.RGBA()
+	if a == 0 {
+		return def
+	}
+	return shot.RGB(uint8(r>>8), uint8(g>>8), uint8(b>>8))
+}
+
+// Frame builds the resolved dressing for a render. plain forces the bare card
+// with no title bar, which is what a region or full-screen capture gets: it is
+// not a window, so a window title bar would be a claim about it that is not
+// true.
+func Frame(s Settings, p *shot.Palette, plain bool) (*shot.Frame, []string) {
+	var warnings []string
+	spec := shot.FrameSpec{
+		Frame:      s.Frame,
+		Background: s.Background,
+		Padding:    s.Padding,
+		Radius:     s.Radius,
+		Shadow:     s.Shadow,
+		Controls:   s.Controls,
+		Title:      s.Title,
+		FontFamily: s.FontFamily,
+		Scale:      s.Scale,
+	}
+	if plain && spec.Frame == "window" {
+		spec.Frame = "plain"
+	}
+	regular, bold, fontWarn := resolveFontFiles(s)
+	warnings = append(warnings, fontWarn...)
+	spec.FontData, spec.FontIndex = regular.Data, regular.Index
+	spec.BoldFontData, spec.BoldFontIndex = bold.Data, bold.Index
+	// Only a font the user named by file is written into SVG and HTML output.
+	// A font found by asking the terminal was found so the raster has icons in
+	// it; copying three megabytes of it into every exported SVG is a different
+	// decision, and one nobody made.
+	spec.EmbedFont = s.FontFile != "" && len(regular.Data) > 0
+	in := shot.FrameInputs{Palette: p, Accents: accentsOf(p)}
+	if s.HostCellW > 0 && s.HostCellH > 0 {
+		in.CellAspect = float64(s.HostCellW) / float64(s.HostCellH)
+	}
+	if set := theme.ResolveGlyphSet(s.GlyphSetID); set != nil {
+		in.Close, in.Minimize, in.Maximize = set.Close, set.Minimize, set.Maximize
+	}
+	if spec.Controls == "glyphs" && in.Close == "" && in.Minimize == "" && in.Maximize == "" {
+		warnings = append(warnings, "The glyph set has no window marks. The macOS lights were drawn.")
+		spec.Controls = "auto"
+	}
+	return shot.BuildFrame(spec, in), warnings
+}
+
+// FontFallbackNotice is the one line a capture carries when it was drawn in the
+// built-in face and the content needed more than that face has. It names the
+// cure rather than the symptom, because "some glyphs are missing" is a thing
+// the user can already see.
+const FontFallbackNotice = "Icons need your terminal font. Set screenshot.font_family."
+
+// resolveFontFiles picks the faces to rasterize with, in order of how much the
+// user asked for them: an explicit font_file first, then the font the host
+// terminal says it draws with, then the configured family, then nothing, which
+// leaves the renderer on its embedded face.
+//
+// A file that will not read is a warning and a fallthrough, not a failure. The
+// capture is the point; the font is how it looks.
+func resolveFontFiles(s Settings) (regular, bold fontBytes, warnings []string) {
+	if s.FontFile != "" {
+		data, err := os.ReadFile(s.FontFile) // #nosec G304 - the path is the operator's own config
+		if err == nil {
+			return fontBytes{Data: data}, fontBytes{}, nil
+		}
+		warnings = append(warnings, "The font file could not be read. Another font was used.")
+	}
+	if face, ok := FontByPostScriptName(s.HostFontFamily); ok {
+		if data, err := os.ReadFile(face.File); err == nil { // #nosec G304 - a font file the resolver found
+			boldFace, boldOK := FontByPostScriptName(s.HostBoldFamily)
+			// Two faces of one collection share a path, so the file being the
+			// same no longer means the font is. The index is what tells the
+			// bold cut apart from the regular one it lives beside.
+			if boldOK && (boldFace.File != face.File || boldFace.Index != face.Index) {
+				bold = readFontBytes(boldFace)
+			}
+			return fontBytes{Data: data, Index: face.Index}, bold, warnings
+		}
+	}
+	if face, ok := FontByFamily(s.FontFamily); ok {
+		if data, err := os.ReadFile(face.File); err == nil { // #nosec G304 - a font file the resolver found
+			if boldFace, boldOK := BoldFontByFamily(s.FontFamily, face); boldOK {
+				bold = readFontBytes(boldFace)
+			}
+			return fontBytes{Data: data, Index: face.Index}, bold, warnings
+		}
+	}
+	return fontBytes{}, fontBytes{}, warnings
+}
+
+// fontBytes is a font file's contents and the face to take from it.
+type fontBytes struct {
+	Data  []byte
+	Index int
+}
+
+// readFontBytes loads a resolved face, or nothing when the file will not read.
+func readFontBytes(face FontFace) fontBytes {
+	data, err := os.ReadFile(face.File) // #nosec G304 - a font file the resolver found
+	if err != nil {
+		return fontBytes{}
+	}
+	return fontBytes{Data: data, Index: face.Index}
+}
+
+// accentsOf picks the wash seeds: the theme's blue and magenta, the two
+// entries a palette author treats as accent rather than as status. The wash
+// derivation quiets them against the pane background, so a loud theme gets a
+// quiet version of its own colours rather than a house gradient.
+func accentsOf(p *shot.Palette) []shot.Color {
+	return []shot.Color{p.ANSI[4], p.ANSI[5]}
+}
+
+// FileName is the generated name for a capture: a sortable timestamp plus the
+// format's extension. label is the window or region name, cleaned to something
+// a filesystem accepts, and is left out when it cleans away to nothing.
+func FileName(label string, format shot.Format, now time.Time) string {
+	stamp := now.Format("2006-01-02-150405")
+	label = cleanLabel(label)
+	if label == "" {
+		return "tuios-" + stamp + "." + format.Ext()
+	}
+	return "tuios-" + label + "-" + stamp + "." + format.Ext()
+}
+
+// cleanLabel reduces a window title to a short filename-safe slug.
+func cleanLabel(s string) string {
+	var b strings.Builder
+	lastDash := true
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			lastDash = false
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r - 'A' + 'a')
+			lastDash = false
+		case !lastDash && b.Len() > 0:
+			b.WriteByte('-')
+			lastDash = true
+		}
+		if b.Len() >= 32 {
+			break
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// Save writes bytes to path, creating the parent directory. An empty path is
+// an error rather than a guess: every caller resolves one first.
+//
+// The bytes go to a hidden temporary file in the same directory, which is then
+// renamed onto path. A reader (a file manager, a watcher, the preview, a test)
+// that sees path appear therefore sees the whole capture: os.WriteFile creates
+// the file empty and fills it after, and anything that opened it in between
+// read nothing. A capture that fails part way leaves no half-written file.
+func Save(path string, data []byte) error {
+	if path == "" {
+		return fmt.Errorf("no output path")
+	}
+	// The name's claim goes once the capture is in place, or when it could not
+	// be written and holds nothing. An explicit path was never claimed, and
+	// removing a claim that is not there does nothing.
+	defer func() { _ = os.Remove(claimPath(path)) }()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return fmt.Errorf("could not create %s: %w", dir, err)
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("could not write %s: %w", path, err)
+	}
+	tmpPath := tmp.Name()
+	_, werr := tmp.Write(data)
+	cerr := tmp.Close()
+	if werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Rename(tmpPath, path)
+	}
+	if werr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("could not write %s: %w", path, werr)
+	}
+	return nil
+}
+
+// ResolvePath turns an optional explicit path and the configured directory
+// into the file to write. A relative --out is relative to the process's own
+// working directory, which is what a person at a shell means by it; an empty
+// one lands a generated name in the configured directory.
+//
+// A generated name never lands on a file that already exists. The stamp in it
+// has one-second resolution, and a person taking captures to compare them takes
+// them faster than that, so without this the second capture of a second deleted
+// the first with nothing said. An explicit --out is left exactly as given: that
+// path is the caller's instruction, not a suggestion.
+func ResolvePath(out, dir, label string, format shot.Format, now time.Time) (string, error) {
+	if out != "" {
+		abs, err := filepath.Abs(out)
+		if err != nil {
+			return "", fmt.Errorf("could not resolve %s: %w", out, err)
+		}
+		return abs, nil
+	}
+	if dir == "" {
+		dir = config.ScreenshotConfig{}.ResolveDirectory()
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return "", fmt.Errorf("could not create %s: %w", dir, err)
+	}
+	return freeName(dir, FileName(label, format, now)), nil
+}
+
+// freeNameLimit is how many same-second captures get a name of their own. Past
+// it the name repeats, because a directory scan that never ends is worse than
+// an overwritten file, and nobody takes a thousand captures in one second.
+const freeNameLimit = 1000
+
+// freeName returns name, or name with a counter before its extension when the
+// directory already holds it.
+//
+// The name is claimed as it is chosen, with an exclusive create, rather than
+// tested for absence and used a moment later. Two captures now overlap on
+// purpose: the preview panel opens on the gesture and the write finishes in a
+// command, so a second capture can be started while the first is still being
+// written. Looking and then writing would let both look at the same empty
+// second and both pick the same name, and the second write would silently take
+// the first one's file.
+//
+// The claim is a hidden file beside the name, not the name itself. A claim on
+// the name was an empty file under the capture's own name until Save filled
+// it, and a reader that found it in that moment (a file manager, a watcher, a
+// test) read an empty capture. Save removes the claim once the capture is in
+// place.
+func freeName(dir, name string) string {
+	path := filepath.Join(dir, name)
+	if claimName(path) {
+		return path
+	}
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for n := 2; n < freeNameLimit; n++ {
+		candidate := filepath.Join(dir, fmt.Sprintf("%s-%d%s", stem, n, ext))
+		if claimName(candidate) {
+			return candidate
+		}
+	}
+	return path
+}
+
+// claimPath is the hidden file that holds path for a capture being written.
+func claimPath(path string) string {
+	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".claim")
+}
+
+// claimName takes path for one capture and reports whether it could. It fails
+// when a finished capture holds the name, or another capture is writing it.
+//
+// The claim is taken before the name is checked, and it is released only after
+// Save has renamed the capture into place. So a capture that checks the name
+// while another is writing it fails on the claim, and one that checks it after
+// finds the finished file.
+func claimName(path string) bool {
+	f, err := os.OpenFile(claimPath(path), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
+		_ = os.Remove(claimPath(path))
+		return false
+	}
+	return true
+}

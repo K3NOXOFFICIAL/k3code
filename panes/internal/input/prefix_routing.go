@@ -1,0 +1,221 @@
+package input
+
+import (
+	"strings"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/app"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+)
+
+// dispatchAction runs the handler for action, if there is one. The third result
+// reports whether anything ran, so callers can fall back (forward the key to the
+// PTY, or ignore it) when the key is not bound.
+func dispatchAction(action string, msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd, bool) {
+	if action == "" {
+		return o, nil, false
+	}
+	dispatcher := GetDispatcher()
+	if !dispatcher.HasAction(action) {
+		return o, nil, false
+	}
+	m, cmd := dispatcher.Dispatch(action, msg, o)
+	return m, cmd, true
+}
+
+// sectionLookup is one of the registry's per-section lookups, named as a method
+// expression at the call site. Each prefix reads its own section, so the same
+// key can mean different things under different prefixes.
+type sectionLookup func(*config.KeybindRegistry, string) string
+
+// runPrefix dispatches the key through one prefix section. An unbound key is
+// simply dropped, which is what dismissing a prefix chord should do.
+func runPrefix(msg tea.KeyPressMsg, o *app.OS, lookup sectionLookup) (*app.OS, tea.Cmd) {
+	if o.KeybindRegistry == nil {
+		return o, nil
+	}
+	action := lookupAction(msg, func(key string) string { return lookup(o.KeybindRegistry, key) })
+	m, cmd, _ := dispatchAction(action, msg, o)
+	return m, cmd
+}
+
+// HandlePrefixCommand handles the key pressed after the leader key, in either
+// mode. An unbound key falls through to the terminal in terminal mode (so the
+// leader key does not swallow shell input) and is ignored in window-management
+// mode.
+func HandlePrefixCommand(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.PrefixActive = false
+
+	if o.KeybindRegistry != nil {
+		action := lookupAction(msg, o.KeybindRegistry.GetPrefixAction)
+		if app.PrefixWorkActions[action] {
+			if cmd, handled := runPrefixWork(action, o); handled {
+				armIfRepeatable(o, action)
+				return o, cmd
+			}
+			// Not built yet: the key is treated as unbound below.
+			o.ClearPrefixRepeat()
+			action = ""
+		}
+		if m, cmd, ok := dispatchAction(action, msg, o); ok {
+			armIfRepeatable(m, action)
+			return m, cmd
+		}
+	}
+
+	// ctrl+c cancels a prefix everywhere: the way out when a chord was started by
+	// accident. Checked after the prefix lookup above, so a ctrl+c the user bound
+	// to a prefix action still runs; what cannot be taken away is the escape.
+	if msg.String() == "ctrl+c" {
+		return o, nil
+	}
+
+	if o.Mode == app.TerminalMode {
+		// The leader asked the host for every key as an escape code. A
+		// non-ASCII key that still came as bare text beat that switch, so its
+		// base-layout key is missing and the key it was meant as is unknown.
+		// It was typed after the leader, so it is dropped, not typed into the
+		// pane, and the prefix stays pending so the key can be typed again.
+		if o.AllKeysPending() && isLayoutTextWithoutBase(msg) {
+			o.PrefixActive = true
+			return o, nil
+		}
+		forwardKeyToFocusedWindow(msg, o)
+	}
+	return o, nil
+}
+
+// runPrefixWork runs one of the review and triage prefix actions, which say
+// whether they did anything. Only one that did is recorded as run, the way
+// the Inbox's own work keys are, so until its work lands the key is exactly
+// the unbound key it was before: forwarded to the pane in terminal mode.
+func runPrefixWork(action string, o *app.OS) (tea.Cmd, bool) {
+	cmd, handled := o.PrefixWorkAction(action)
+	if handled {
+		o.NoteAction(action)
+		if o.OnAction != nil {
+			o.OnAction(action)
+		}
+	}
+	return cmd, handled
+}
+
+// HandleWorkspacePrefixCommand handles the key after leader+w.
+func HandleWorkspacePrefixCommand(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.WorkspacePrefixActive = false
+	o.PrefixActive = false
+	return runPrefix(msg, o, (*config.KeybindRegistry).GetWorkspacePrefixAction)
+}
+
+// HandleMinimizePrefixCommand handles the key after leader+m.
+func HandleMinimizePrefixCommand(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.MinimizePrefixActive = false
+	o.PrefixActive = false
+	return runPrefix(msg, o, (*config.KeybindRegistry).GetMinimizePrefixAction)
+}
+
+// HandleTilingPrefixCommand handles the key after leader+t (the window prefix).
+func HandleTilingPrefixCommand(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.TilingPrefixActive = false
+	o.PrefixActive = false
+	return runPrefix(msg, o, (*config.KeybindRegistry).GetWindowPrefixAction)
+}
+
+// HandleDebugPrefixCommand handles the key after leader+D.
+func HandleDebugPrefixCommand(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.DebugPrefixActive = false
+	o.PrefixActive = false
+	return runPrefix(msg, o, (*config.KeybindRegistry).GetDebugPrefixAction)
+}
+
+// HandleTapePrefixCommand handles the key after leader+T.
+func HandleTapePrefixCommand(msg tea.KeyPressMsg, o *app.OS) (*app.OS, tea.Cmd) {
+	o.TapePrefixActive = false
+	o.PrefixActive = false
+	return runPrefix(msg, o, (*config.KeybindRegistry).GetTapePrefixAction)
+}
+
+// handleTerminalModeBinds dispatches the direct (prefix-less) binds from the
+// [keybindings.terminal_mode] section, plus the handful of main-section actions
+// that must keep working while typing into a shell. It reports whether the key
+// was consumed.
+func handleTerminalModeBinds(msg tea.KeyPressMsg, o *app.OS) bool {
+	if o.KeybindRegistry == nil {
+		return false
+	}
+	action := lookupAction(msg, o.KeybindRegistry.GetTerminalModeAction)
+	if o.Mode == app.TerminalMode && isTerminalFocusAction(action) && o.ArmNvimNavigation(nvimNavigationDirection(action)) {
+		return false
+	}
+	if _, _, ok := dispatchAction(action, msg, o); ok {
+		return true
+	}
+
+	// Workspace switching is bound in the main section and has to work from
+	// terminal mode too, but that section also binds plain letters that belong
+	// to the shell. Only reserved chords (a real Alt/Ctrl modifier, or a macOS
+	// Option glyph, which arrives with no modifier at all) are eligible, so
+	// rebinding a workspace onto a bare letter cannot start swallowing input.
+	if !isReservedTerminalChord(msg) {
+		return false
+	}
+	action = lookupAction(msg, o.KeybindRegistry.GetAction)
+	if !isTerminalSafeAction(action) {
+		return false
+	}
+	_, _, ok := dispatchAction(action, msg, o)
+	return ok
+}
+
+func isTerminalFocusAction(action string) bool {
+	return action == "terminal_focus_left" || action == "terminal_focus_right" ||
+		action == "terminal_focus_up" || action == "terminal_focus_down"
+}
+
+func nvimNavigationDirection(action string) string {
+	return strings.TrimPrefix(action, "terminal_focus_")
+}
+
+// isReservedTerminalChord reports whether a key press is a chord the shell will
+// never want as literal input.
+func isReservedTerminalChord(msg tea.KeyPressMsg) bool {
+	if msg.Mod&(tea.ModAlt|tea.ModCtrl) != 0 {
+		return true
+	}
+	// macOS delivers Option chords as their composed glyph with no modifier
+	// set. Those glyphs are ordinary typed characters on other layouts, so this
+	// only applies on darwin (macOptionChord enforces that).
+	_, ok := macOptionChord(msg)
+	return ok
+}
+
+// isTerminalSafeAction reports whether a main-section action may be triggered
+// from terminal mode. Only navigation between workspaces and sessions qualifies:
+// everything else in that section is a window-management verb whose keys must
+// reach the shell.
+func isTerminalSafeAction(action string) bool {
+	return strings.HasPrefix(action, "switch_workspace_") ||
+		strings.HasPrefix(action, "move_and_follow_") ||
+		strings.HasPrefix(action, "switch_session_") ||
+		action == "next_workspace" || action == "prev_workspace" ||
+		action == "next_session" || action == "prev_session"
+}
+
+// forwardKeyToFocusedWindow sends a key to the focused window's PTY, using CSI u
+// encoding when the client has the kitty keyboard protocol enabled.
+func forwardKeyToFocusedWindow(msg tea.KeyPressMsg, o *app.OS) {
+	focused := o.GetFocusedWindow()
+	if focused == nil {
+		return
+	}
+
+	// The pane gets the key as the host sent it, on either encoding, with its
+	// release when the host will send none (see paneKeyBytes).
+	rawInput, released := paneKeyBytes(paneMsg(msg, o), focused, o, true)
+	if len(rawInput) > 0 {
+		if !released {
+			o.NotePaneKeyDown(msg.Code, focused.ID)
+		}
+		_ = focused.SendInput(rawInput)
+	}
+}

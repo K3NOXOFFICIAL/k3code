@@ -1,0 +1,155 @@
+# Vendored: none. k3code-original, first-party MIT.
+"""Scripted fake provider for tests and offline smoke runs.
+
+Set ``K3CODE_FAKE_PROVIDER`` to a JSON script file (absolute, or relative to
+cwd) and every provider built from config becomes a FakeProvider that plays
+the script back. The script is a list of steps applied in order to *every*
+``stream()`` call:
+
+    [
+      {"type": "text", "text": "Hello"},
+      {"type": "tool_call", "id": "call_1", "name": "bash",
+       "arguments": {"command": "echo hi"}},
+      {"type": "usage", "prompt_tokens": 12, "completion_tokens": 3},
+      {"type": "error", "status_code": 500,
+       "message": "provider on fire", "headers": {"retry-after": "1"}}
+    ]
+
+A step may also carry ``"model": "<name>"`` (only when called with that model) and
+``"match": "<text>"`` (only when the text appears in some message), so one script can answer
+the classifier, the planner and the executor differently. Every call is recorded in ``log``.
+
+Any step may carry ``"when": "first"`` (only before a tool result is in the conversation) or
+``"when": "after_tool"`` (only after one), so a script can call a tool once and then finish.
+``"turn_first"`` / ``"turn_after_tool"`` do the same relative to the latest user message, so one script
+can serve several user turns.
+
+``text``/``tool_call``/``usage`` accumulate into one assistant turn (a final
+done event); ``error`` aborts the stream with a ProviderError so the router
+classifies and fails over. This makes full agent-loop runs testable with zero
+network: the bash tool really executes, the loop really persists, and the
+gateway really streams — only the model is canned.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+from k3code.providers.base import Provider, ProviderError
+from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec
+
+logger = logging.getLogger(__name__)
+
+FAKE_PROVIDER_ENV = "K3CODE_FAKE_PROVIDER"
+
+
+class FakeProvider(Provider):
+    """Replays a scripted step list instead of calling a network endpoint."""
+
+    def __init__(self, *, name: str = "fake", steps: list[dict[str, Any]]) -> None:
+        self.name = name
+        self.base_url = "fake://script"
+        self.api_key = ""
+        self.steps = steps
+        self.calls = 0
+        #: one entry per stream() call: {"model", "tools": [names], "text": joined message contents}
+        self.log: list[dict[str, Any]] = []
+        #: K3CODE_FAKE_LOG=0 stops recording: every entry holds the whole conversation text, so a long soak on
+        #: the fake provider would otherwise grow quadratically (that measured the double, not the daemon).
+        self.record = os.environ.get("K3CODE_FAKE_LOG", "1") != "0"
+
+    def __repr__(self) -> str:
+        return f"FakeProvider(name={self.name!r}, steps={len(self.steps)})"
+
+    async def aclose(self) -> None:
+        return None
+
+    async def stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolSpec],
+        model: str,
+        *,
+        max_tokens: int = 8192,
+        temperature: float | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self.calls += 1
+        logger.info("fake provider: replaying %d steps (call %d)", len(self.steps), self.calls)
+        content: list[str] = []
+        tool_calls: list[ToolCall] = []
+        usage: tuple[int, int] | None = None
+
+        has_tool_result = any(m.role == "tool" for m in messages)
+        last_user = max((i for i, m in enumerate(messages) if m.role == "user"), default=-1)
+        turn_tool_result = any(m.role == "tool" for m in messages[last_user + 1 :])
+        haystack = "\n".join(str(m.content or "") for m in messages)
+        if self.record:
+            self.log.append({"model": model, "tools": [t.name for t in tools], "text": haystack})
+        for step in self.steps:
+            if step.get("model") not in (None, model):
+                continue
+            if step.get("match") is not None and str(step["match"]) not in haystack:
+                continue
+            when = step.get("when")  # optional: "first" = before any tool result, "after_tool" = after one
+            if (when == "first" and has_tool_result) or (when == "after_tool" and not has_tool_result):
+                continue
+            if (when == "turn_first" and turn_tool_result) or (when == "turn_after_tool" and not turn_tool_result):
+                continue  # same, but relative to the latest user message (multi-turn scripts)
+            kind = step.get("type")
+            if kind == "text":
+                text = str(step.get("text", ""))
+                content.append(text)
+                yield StreamEvent(type="text_delta", text=text)
+            elif kind == "tool_call":
+                tool_calls.append(
+                    ToolCall(
+                        id=str(step.get("id") or f"call_{len(tool_calls) + 1}"),
+                        name=str(step.get("name") or "bash"),
+                        arguments=dict(step.get("arguments") or {}),
+                        raw_arguments=step.get("raw_arguments"),
+                    )
+                )
+                yield StreamEvent(type="tool_call", tool_call=tool_calls[-1])
+            elif kind == "usage":
+                usage = (int(step.get("prompt_tokens") or 0), int(step.get("completion_tokens") or 0))
+            elif kind == "error":
+                raise ProviderError(
+                    message=str(step.get("message") or "fake provider error"),
+                    status_code=step.get("status_code"),
+                    headers={str(k): str(v) for k, v in (step.get("headers") or {}).items()},
+                    body=dict(step.get("body") or {}),
+                )
+            else:
+                raise ValueError(f"fake provider script: unknown step type {kind!r}")
+
+        prompt, completion = usage or (0, 0)
+        from k3code.providers.types import Usage
+
+        final = Message(
+            role="assistant",
+            content="".join(content) or None,
+            tool_calls=tool_calls,
+            usage=Usage(prompt_tokens=prompt, completion_tokens=completion) if usage else None,
+        )
+        yield StreamEvent(type="done", message=final, usage=final.usage)
+
+
+def load_fake_steps(path: str | Path) -> list[dict[str, Any]]:
+    """Read a fake-provider script; raises FileNotFoundError/ValueError loudly."""
+    script = Path(path).expanduser()
+    if not script.is_file():
+        raise FileNotFoundError(f"{FAKE_PROVIDER_ENV} points at a missing file: {script}")
+    data = json.loads(script.read_text(encoding="utf-8"))
+    if not isinstance(data, list) or not all(isinstance(step, dict) for step in data):
+        raise ValueError(f"{FAKE_PROVIDER_ENV} script must be a JSON list of step objects: {script}")
+    return data
+
+
+def fake_provider_requested() -> str | None:
+    """The K3CODE_FAKE_PROVIDER path, when set and non-empty."""
+    return os.environ.get(FAKE_PROVIDER_ENV, "").strip() or None

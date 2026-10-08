@@ -1,0 +1,34 @@
+# k3code's own agent-detection manifest. k3code reports its state to the pane
+# itself (core/src/k3code/integrations/panes.py sends set-agent-state and holds
+# approvals with request-approval), so this manifest needs no screen rules.
+
+schema_version = 1
+id             = "k3code"
+display_name   = "k3code"
+priority       = 50
+
+# `k3code` is a Python console script, so comm is the script name (or python)
+# and argv carries the script path. The Ink TUI it launches is a Node process
+# running tui/dist/entry.js; it is a child of the launcher, which is what is
+# detected. `k3code-tui` is the stand-alone launcher name.
+[detect]
+comm      = ["k3code", "k3code-tui"]
+argv0     = ["k3code", "k3code-tui"]
+argv_path = ["k3code"]
+
+# No screen rules: k3code reports its own state, and a screen rule needs a
+# fixture measured from a live pane. Without a socket the pane reads as none.
+[screen]
+enabled = false
+
+# How a prompt is typed in: the Ink composer reads Enter as CR and takes
+# bracketed paste. Not measured against a live pane.
+[input]
+submit          = "cr"
+bracketed_paste = true
+source          = "default: Enter sends CR in raw mode; not measured"
+
+# `k3code attach` reopens a session on the daemon (or the local store).
+[resume]
+argv   = ["k3code", "attach", "{session_id}"]
+source = "k3code attach <session-id> (core/src/k3code/cli.py)"

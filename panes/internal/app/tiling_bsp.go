@@ -1,0 +1,920 @@
+package app
+
+import (
+	"slices"
+
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/layout"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+	"github.com/Gaurav-Gosain/tuios/internal/ui"
+)
+
+// ============================================================================
+// BSP (Binary Space Partitioning) Tiling Functions
+// ============================================================================
+
+// GetOrCreateBSPTree returns the BSP tree for the current workspace, creating
+// it if needed.
+//
+// A tree created here starts with the configured default scheme
+// (appearance.tiling_scheme, read live off m.Settings so a change takes hold
+// on the next workspace that needs one). Once a workspace has a tree its
+// scheme lives on the tree itself (see layout.BSPTree.AutoScheme), which is
+// what keeps a config change from moving a workspace that is already tiled,
+// and it travels with the tree through session state and the daemon's
+// layout-tree ops.
+func (m *OS) GetOrCreateBSPTree() *layout.BSPTree {
+	if m.WorkspaceTrees == nil {
+		m.WorkspaceTrees = make(map[int]*layout.BSPTree)
+	}
+
+	tree, exists := m.WorkspaceTrees[m.CurrentWorkspace]
+	if !exists || tree == nil {
+		tree = layout.NewBSPTree()
+		scheme := m.Settings.TilingScheme
+		if scheme == "" {
+			scheme = config.TilingSchemeSpiral
+		}
+		tree.AutoScheme = layout.ParseAutoScheme(scheme)
+		m.WorkspaceTrees[m.CurrentWorkspace] = tree
+		m.LogInfo("BSP: Created new tree for workspace %d with scheme %s", m.CurrentWorkspace, tree.AutoScheme.String())
+	}
+
+	return tree
+}
+
+// GetBSPBounds returns the bounds for BSP layout calculation
+func (m *OS) GetBSPBounds() layout.Rect {
+	// Tiling fills the content region, which starts after the left reserved
+	// margin (the sidebar, when on the left) and is narrowed by both margins.
+	// This alone re-tiles every pane into the reduced box.
+	return layout.Rect{
+		X: m.PaneLeft(),
+		Y: m.PaneTop(),
+		W: m.PaneWidth(),
+		H: m.PaneHeight(),
+	}
+}
+
+// GetWindowIntID returns a stable integer ID for a window string ID.
+// Uses a direct map lookup for reliable ID assignment.
+func (m *OS) GetWindowIntID(stringID string) int {
+	if stringID == "" {
+		return 0
+	}
+
+	// Initialize the map if needed
+	if m.WindowToBSPID == nil {
+		m.WindowToBSPID = make(map[string]int)
+	}
+
+	// Check if we already have an ID for this window
+	if id, exists := m.WindowToBSPID[stringID]; exists {
+		return id
+	}
+
+	// Assign a new ID
+	if m.NextBSPWindowID == 0 {
+		m.NextBSPWindowID = 1 // Start from 1, 0 is reserved for "no window"
+	}
+	newID := m.NextBSPWindowID
+	m.NextBSPWindowID++
+	m.WindowToBSPID[stringID] = newID
+	if m.BSPIDToWindowID == nil {
+		m.BSPIDToWindowID = make(map[int]string)
+	}
+	m.BSPIDToWindowID[newID] = stringID
+
+	return newID
+}
+
+// GetWindowByIntID returns the window for a given integer ID
+func (m *OS) GetWindowByIntID(intID int) *terminal.Window {
+	if intID <= 0 {
+		return nil
+	}
+
+	// Fast path: reverse-map lookup. Verify against the forward map so a stale
+	// or missing reverse entry (e.g. after a session restore that rebuilt only
+	// WindowToBSPID) can never return the wrong window.
+	if stringID, ok := m.BSPIDToWindowID[intID]; ok {
+		if id, exists := m.WindowToBSPID[stringID]; exists && id == intID {
+			for _, w := range m.Windows {
+				if w.ID == stringID {
+					return w
+				}
+			}
+		}
+	}
+
+	// Fallback: resolve via the forward map on a reverse-map miss or mismatch.
+	for stringID, id := range m.WindowToBSPID {
+		if id == intID {
+			for _, w := range m.Windows {
+				if w.ID == stringID {
+					return w
+				}
+			}
+			break
+		}
+	}
+	return nil
+}
+
+// openStartRect is the box a pane opens from: its own destination, halved about
+// that destination's centre, so the pane grows outward into the space it is
+// about to occupy.
+//
+// Without it, a new pane is parked at NewWindowPlacement's box first (half the
+// screen, centred on it) and the snap animation captures that as its start, so
+// the pane travels from a half-screen rectangle to a tile. The box is far
+// larger than a tile, so its top-left corner sits up and to the left of any
+// tile but the middle one, and what the eye reads is a window flying in from
+// the corner and shrinking, not a window appearing.
+//
+// Growing from the destination rather than from the centre of the screen is a
+// deliberate choice between two fixes that both remove the corner. A pane
+// belongs to its tile, and opening in place says so, while a small box crossing
+// half the screen from the middle is motion that means nothing, and under
+// shared borders it also passes over two neighbours on the way. The exception
+// proves it: the first pane on a workspace has the whole screen as its tile, so
+// it does grow from the centre of the screen, because there its tile is the
+// screen.
+//
+// The floor is the size the minimize animation shrinks to, which is the smallest
+// box the renderer is known to draw a border into. A tile at or below it opens
+// from its full size (the caller checks for that and skips the start entirely),
+// which is the pre-existing behaviour for a pane too small to animate.
+func openStartRect(rect layout.Rect) (x, y, w, h int) {
+	w = min(max(rect.W/2, ui.MinAnimatedWidth), rect.W)
+	h = min(max(rect.H/2, ui.MinAnimatedHeight), rect.H)
+	return rect.X + (rect.W-w)/2, rect.Y + (rect.H-h)/2, w, h
+}
+
+// ApplyBSPLayout applies the BSP tree layout to all windows in the current workspace
+func (m *OS) ApplyBSPLayout() {
+	tree := m.GetOrCreateBSPTree()
+	if tree == nil || tree.IsEmpty() {
+		return
+	}
+
+	bounds := m.GetBSPBounds()
+	layouts := tree.ApplyLayout(bounds, m.separatorGap())
+
+	// Asked once for the whole layout, not per pane: it is what decides between
+	// the two branches below, and it ends a stale deferral as a side effect.
+	deferring := m.resizeDeferralActive()
+
+	// Read alongside the gap the rectangles above were partitioned with, so the
+	// border every pane draws and the column the layout left between them are
+	// the same decision. A pane given a bordered box inside a rectangle that
+	// still holds a separator gap wastes that column; given a borderless one
+	// where no gap was reserved, its neighbour's line lands on its own content.
+	borderless := m.panesBorderless()
+
+	// A zoom of part of the screen is a camera over this layout rather than one
+	// pane's own rectangle. The layout is computed again in a larger box and
+	// the screen is panned over it; see zoom_canvas.go for why it is laid out
+	// again rather than stretched.
+	canvas, zoomBounds, ok := m.bspZoomCanvas(tree, bounds, layouts)
+	if ok {
+		bounds = zoomBounds
+		layouts = tree.ApplyLayout(bounds, m.separatorGap())
+	}
+	m.zoomCanvasNow = canvas
+
+	// Whether this retile is the one a zoom asked for, which is the only thing
+	// appearance.zoom_animation gets a say over. Read once for the whole
+	// layout, since it is one answer for all of it.
+	zoomRetile := m.takeZoomRelayout()
+
+	for windowIntID, rect := range layouts {
+		win := m.GetWindowByIntID(windowIntID)
+		if win == nil || win.Workspace != m.CurrentWorkspace || win.Minimized || win.IsFloating {
+			continue
+		}
+		rect = canvas.apply(rect)
+		// A zoomed pane keeps its slot in the tree and loses its rectangle to the
+		// zoom box, so the tiler leaves the rectangle alone. Zoom is shared, so
+		// a peer's sync can bring a pane, close one or move the box while
+		// somebody else holds the zoom. Each of those retiles, and a retile
+		// that placed the zoomed pane would drop the zoom on every client at
+		// once.
+		//
+		// Under a camera it is placed like every other pane: it is not holding
+		// a box of its own, it is simply the pane the camera is on.
+		if win.Zoomed && !m.zoomUsesLayout(win) {
+			continue
+		}
+		// A pane the pointer is dragging keeps its rectangle; the slot is
+		// recorded for the drop. See LiveWindowDrag.
+		if m.noteDragSlot(win, rect) {
+			continue
+		}
+
+		wasTiled := win.Tiled
+
+		// Read and clear in the same breath, before any of the branches below
+		// can leave the loop: a pane opens once, and a flag that survives its
+		// placement makes the next retile play the open animation again.
+		opening := win.Opening
+		win.Opening = false
+
+		// Cancel any existing snap animation for this window to prevent
+		// animation pileup during continuous resize.
+		m.CancelSnapAnimation(win)
+
+		// A live resize drag reapplies this layout on every composed frame, to
+		// keep the separator overlay's ratios in step with the geometry the
+		// pointer is producing. Set that geometry directly.
+		//
+		// A resize is direct manipulation: the edge is where the pointer is,
+		// so there is nothing to ease toward. Animating instead built a fresh
+		// 300ms snap per window per frame, each one discarded and restarted by
+		// the next frame before it could finish, so the panes never arrived
+		// anywhere and trailed the cursor on a curve that kept resetting. That
+		// costs almost no CPU, which is why it read as mush rather than as a
+		// slow frame, and why no timing measurement found it.
+		//
+		// The normal path is also what tells the PTY, and in daemon mode the
+		// daemon over its socket, about the new size: one round trip per window
+		// per frame for a size the user is still in the middle of choosing.
+		// Resize visually instead and record it in PendingResizes, which mouse
+		// release already drains into one real resize per window.
+		// A terminal resize is the same kind of event, one step removed: the
+		// browser or the terminal emulator delivers a size per frame for as long
+		// as the user drags the window edge, and easing toward each one would
+		// build a fresh 300ms snap per pane per step. The panes would still be
+		// easing when the next size arrived, so they never arrive anywhere, and
+		// after the pointer stops the layout keeps moving for the rest of the
+		// last animation. The size
+		// is not a destination to travel to; it is where the panes already are.
+		//
+		// Only while the resize is actually live, though. See
+		// resize_deferral.go: a deferral that outlives its gesture leaves every
+		// later retile placing panes visually and never giving them a real size.
+		if deferring {
+			win.X, win.Y = rect.X, rect.Y
+			borderChanged := win.Tiled != borderless
+			if borderChanged {
+				win.Tiled = borderless
+				win.InvalidateCache()
+			}
+			// A changed border allowance owes the guest a new box even at the
+			// same rectangle: the drawable area is the rectangle less the border
+			// cells, and those just appeared or went away.
+			if borderChanged || win.Width != rect.W || win.Height != rect.H {
+				win.ResizeVisual(rect.W, rect.H)
+				// IsBeingManipulated freezes a pane's content at its cached
+				// frame, which is right for a pane the pointer is dragging and
+				// wrong for a terminal resize: nothing is being manipulated, and
+				// the panes should keep drawing their live contents.
+				if m.Resizing {
+					win.IsBeingManipulated = true
+				}
+				m.PendingResizes[win.ID] = [2]int{rect.W, rect.H}
+			}
+			win.MarkPositionDirty()
+			continue
+		}
+
+		// Border mode is settled here, with the rest of the layout, so that one
+		// value decides it for the whole frame. A pane used to keep the old mode
+		// until its snap completed, which let a frame draw both border systems at
+		// once: the separator overlay reads the shared-borders state live, so it
+		// filled the gaps the new layout had already reserved while every pane
+		// still drew a box of its own. Any path that retired a snap early then
+		// made that permanent, since the flag was waiting on an animation that no
+		// longer existed.
+		//
+		// Before the placement, not after, and for the same reason the deferred
+		// branch above does it first: the allowance decides how much of the
+		// rectangle the guest gets, so settling it afterwards announces the
+		// rectangle twice, once at each allowance.
+		win.Tiled = borderless
+		if borderless != wasTiled {
+			win.InvalidateCache()
+		}
+
+		// A pane being placed for the first time starts from a box inside its own
+		// destination rather than from wherever it was parked, so it grows into
+		// place. See openStartRect. At zero duration there is no animation to
+		// give a start to, and NewSnapAnimation lands the pane on the target in
+		// one step, so the geometry is left exactly as the un-animated path had
+		// it.
+		dur := m.layoutAnimationDuration()
+		if zoomRetile && !m.Settings.ZoomAnimation {
+			// The retile a zoom asked for, from somebody who does not want the
+			// zoom to slide.
+			dur = 0
+		}
+		if opening && dur > 0 {
+			if x, y, w, h := openStartRect(rect); w != rect.W || h != rect.H {
+				win.X, win.Y = x, y
+				// Assigned, not resized: the emulator keeps the size the pane was
+				// created at for the length of the animation, the way every other
+				// frame of a snap leaves it, and Update's completion resizes it
+				// once at the destination.
+				win.Width, win.Height = w, h
+			}
+		}
+
+		// Create animation for smooth transition
+		anim := m.newSnapAnimation(win, rect.X, rect.Y, rect.W, rect.H, dur)
+
+		if anim != nil {
+			m.Animations = append(m.Animations, anim)
+		} else if borderless != wasTiled {
+			// A pane already at its target rectangle is left alone by
+			// NewSnapAnimation unless it is daemon-backed, and a changed
+			// allowance owes the guest a new box even at the same rectangle.
+			win.Resize(rect.W, rect.H)
+		}
+	}
+}
+
+// bspZoomCanvas works the camera out for a BSP layout.
+//
+// It needs two passes: the rectangle the tiler gave the zoomed pane at the
+// screen's own size says how big the box has to be, and the rectangle it gets
+// in that box says where to point the screen. So the layout is run again here
+// to answer the second question, and the caller runs it once more to place the
+// panes. Both passes are the tree walking its own nodes, which is cheap, and
+// they only happen while something is zoomed to part of the screen.
+func (m *OS) bspZoomCanvas(tree *layout.BSPTree, bounds layout.Rect, layouts map[int]layout.Rect) (zoomCanvas, layout.Rect, bool) {
+	zw := m.zoomedWindow()
+	if zw == nil {
+		return zoomCanvas{}, bounds, false
+	}
+	id := m.GetWindowIntID(zw.ID)
+	tile, ok := layouts[id]
+	if !ok {
+		return zoomCanvas{}, bounds, false
+	}
+	zoomBounds, ok := m.zoomCanvasBounds(zw, tile)
+	if !ok {
+		return zoomCanvas{}, bounds, false
+	}
+	grown := tree.ApplyLayout(zoomBounds, m.separatorGap())
+	zoomedRect, ok := grown[id]
+	if !ok {
+		return zoomCanvas{}, bounds, false
+	}
+	return m.zoomCanvasAt(zoomBounds, zoomedRect), zoomBounds, true
+}
+
+// CancelSnapAnimation drops any in-flight snap animation for win.
+//
+// A snap animation owns its window's geometry until it finishes: every tick it
+// writes an interpolated rectangle, ignoring whatever else has set X, Y, Width
+// or Height in the meantime. So anything that positions a window directly has
+// to retire the animation first, or the next tick will overwrite it with a
+// frame of a transition the user has already moved past. Starting a resize
+// drag while a window is still animating into place is the ordinary way to hit
+// that: the drag sets geometry per motion event, the animation stamps its own
+// back over all of it on the next tick, and the layout jumps to wherever the
+// old transition had got to.
+func (m *OS) CancelSnapAnimation(win *terminal.Window) {
+	for i := len(m.Animations) - 1; i >= 0; i-- {
+		if m.Animations[i].Window == win && m.Animations[i].Type == ui.AnimationSnap {
+			m.Animations = append(m.Animations[:i], m.Animations[i+1:]...)
+		}
+	}
+}
+
+// landSnapAnimations finishes every snap in flight at its own destination and
+// retires it, leaving the other animation kinds alone.
+//
+// Cancelling is right for a caller that is about to place the window itself.
+// A caller that is not (a structural change that settles the layout by some
+// other route) has to land the snap instead: a snap deliberately leaves the
+// emulator at the size the pane had when it started and catches up in one
+// resize at the end, so dropping it mid-flight leaves the pane at an
+// interpolated rectangle with an emulator that matches neither end. Turning
+// tiling off while the scrolling strip was still sliding did exactly that, and
+// a tick later the panes were back at the strip's rectangles with their guests
+// writing at the old size.
+func (m *OS) landSnapAnimations() {
+	if len(m.Animations) == 0 {
+		return
+	}
+	kept := m.Animations[:0]
+	for _, anim := range m.Animations {
+		if anim.Type != ui.AnimationSnap || anim.Window == nil {
+			kept = append(kept, anim)
+			continue
+		}
+		win := anim.Window
+		win.X, win.Y = anim.EndX, anim.EndY
+		win.Resize(anim.EndWidth, anim.EndHeight)
+		win.InvalidateCache()
+		win.MarkPositionDirty()
+	}
+	m.Animations = kept
+}
+
+// AddWindowToBSPTree adds a window to the BSP tree and applies the layout.
+// This should be called when a new window is created in tiling mode.
+func (m *OS) AddWindowToBSPTree(window *terminal.Window) {
+	// A new pane is a structural change, not a resize step. Whatever resize was
+	// in flight, the layout this produces is what the user is left looking at,
+	// so it has to be a real one.
+	m.requireRealLayout()
+
+	tree := m.GetOrCreateBSPTree()
+	windowIntID := m.GetWindowIntID(window.ID)
+
+	if verboseLog {
+		m.LogInfo("BSP: AddWindowToBSPTree for window %s (int ID %d)", shortID(window.ID), windowIntID)
+	}
+
+	// The pane to split: an explicit split's target, else the focused pane.
+	// AddWindow focuses the new pane only after this, so the focus is still
+	// the pane the user was on.
+	targetID := m.SplitTargetWindowID
+	if targetID == "" {
+		if fw := m.GetFocusedWindow(); fw != nil && fw.ID != window.ID {
+			targetID = fw.ID
+		}
+	}
+	targetIntID := m.bspSplitTarget(tree, targetID)
+	if verboseLog {
+		m.LogInfo("BSP: Splitting int ID %d", targetIntID)
+	}
+
+	bounds := m.GetBSPBounds()
+
+	// Check for preselection
+	if m.PreselectionDir != layout.PreselectionNone {
+		m.LogInfo("BSP: Inserting with preselection %d", m.PreselectionDir)
+		tree.InsertWindowWithPreselection(windowIntID, targetIntID, m.PreselectionDir, bounds, m.separatorGap())
+		m.PreselectionDir = layout.PreselectionNone // Clear preselection
+	} else {
+		tree.InsertWindow(windowIntID, targetIntID, layout.SplitNone, 0.5, bounds, m.separatorGap())
+	}
+
+	m.LogInfo("BSP: Tree now has %d windows", tree.WindowCount())
+
+	// No pre-positioning here. A pane being created carries Opening and
+	// ApplyBSPLayout starts it from its own tile; a pane arriving from
+	// ToggleFloating does not, and animates from where the user last left it
+	// floating, which this used to throw away by teleporting it to the middle of
+	// the screen first.
+	m.ApplyBSPLayout()
+}
+
+// bspSplitTarget is the tree leaf a new window splits: the pane named by
+// windowID when the tree holds it, else the last leaf. A new window splits the
+// focused pane, as in bspwm. The last leaf is only the fallback for a window
+// that arrives with no focused pane in this tree.
+func (m *OS) bspSplitTarget(tree *layout.BSPTree, windowID string) int {
+	if windowID != "" {
+		if id := m.GetWindowIntID(windowID); tree.HasWindow(id) {
+			return id
+		}
+	}
+	if ids := tree.GetAllWindowIDs(); len(ids) > 0 {
+		return ids[len(ids)-1]
+	}
+	return 0
+}
+
+// RemoveWindowFromBSPTree removes a window from the BSP tree and reapplies the layout.
+// This should be called when a window is closed in tiling mode.
+func (m *OS) RemoveWindowFromBSPTree(window *terminal.Window) {
+	// Closing a pane is structural too; the panes that inherit its space must
+	// end up at real sizes. See AddWindowToBSPTree.
+	m.requireRealLayout()
+
+	tree := m.WorkspaceTrees[m.CurrentWorkspace]
+	if tree == nil {
+		return
+	}
+
+	windowIntID := m.GetWindowIntID(window.ID)
+	tree.RemoveWindow(windowIntID)
+
+	// Apply the new layout
+	m.ApplyBSPLayout()
+}
+
+// MarkBSPSyncPending records that window geometry moved during a drag and the
+// BSP tree's ratios no longer match it. The sync itself is deferred to the next
+// composed frame by FlushPendingBSPSync, because its only job during a drag is
+// to keep the separator overlay under the pointer, and a frame that is never
+// drawn cannot show a stale separator.
+//
+// The deferral is only safe because it is bounded on both ends: the interaction
+// tick composes a frame for as long as a drag is live, so a pending sync is
+// never held for more than one frame interval, and mouse release calls
+// SyncBSPTreeFromGeometry unconditionally. That last one cannot be skipped:
+// the tree ratios, not the window rectangles, are what survives a retile, so a
+// drag that ended without a final sync would have its result discarded the next
+// time the layout was applied.
+func (m *OS) MarkBSPSyncPending() {
+	m.pendingBSPSync = true
+}
+
+// FlushPendingBSPSync runs a deferred ratio sync if one is outstanding. Its one
+// caller is View, immediately before it composes, and that is the only correct
+// place for it: the overlay mixes tree ratios with live window geometry, so the
+// sync has to happen on every frame that is composed rather than on the paths
+// that change geometry. Frames arrive from elsewhere too, PTY output most of
+// all, and one composed between a motion event and its sync draws the divider
+// where the drag has already left.
+func (m *OS) FlushPendingBSPSync() {
+	if m.pendingBSPSync {
+		m.SyncBSPTreeFromGeometry()
+	}
+}
+
+// SyncBSPTreeFromGeometry updates the BSP tree's split ratios to match current window positions.
+// This should be called after mouse resize operations complete.
+func (m *OS) SyncBSPTreeFromGeometry() {
+	m.pendingBSPSync = false
+
+	tree := m.WorkspaceTrees[m.CurrentWorkspace]
+	if tree == nil || tree.IsEmpty() {
+		return
+	}
+
+	// Build geometry map from current window positions
+	geometry := make(map[int]layout.Rect)
+	for _, win := range m.Windows {
+		if win.Workspace == m.CurrentWorkspace && !win.Minimized {
+			windowIntID := m.GetWindowIntID(win.ID)
+			geometry[windowIntID] = layout.Rect{
+				X: win.X,
+				Y: win.Y,
+				W: win.Width,
+				H: win.Height,
+			}
+		}
+	}
+
+	bounds := m.GetBSPBounds()
+	tree.SyncRatiosFromGeometry(geometry, bounds, m.separatorGap())
+
+	// In shared borders mode, re-apply layout after sync to enforce separator gaps
+	if m.SharedBorders {
+		m.ApplyBSPLayout()
+	}
+}
+
+// SplitFocusedHorizontal splits the focused window horizontally (top/bottom) and creates a new terminal
+func (m *OS) SplitFocusedHorizontal() {
+	m.splitFocused(layout.PreselectionDown, false)
+}
+
+// SplitFocusedVertical splits the focused window vertically (left/right) and creates a new terminal
+func (m *OS) SplitFocusedVertical() {
+	m.splitFocused(layout.PreselectionRight, false)
+}
+
+// splitFocused splits the focused window toward dir and creates a new
+// terminal. With followSSH, a focused pane that runs ssh gets a new pane that
+// runs the same ssh; see ssh_split.go.
+func (m *OS) splitFocused(dir layout.PreselectionDir, followSSH bool) {
+	if !m.AutoTiling {
+		return
+	}
+
+	focusedWin := m.GetFocusedWindow()
+	if focusedWin == nil {
+		return
+	}
+
+	// In a daemon session the new pane is created daemon-side and arrives through
+	// a later state sync, so the preselection set here would never be consumed
+	// (AddWindow only asks the daemon and returns). Record the forced direction so
+	// the sync path applies it; see adoptSyncedWindows.
+	if m.IsDaemonSession && m.DaemonClient != nil {
+		m.pendingSplitDir = dir
+		m.pendingSplitTarget = focusedWin.ID
+		// The split's own direction replaces a preselection, as it does on
+		// the local path below.
+		m.PreselectionDir = layout.PreselectionNone
+		// Through NewWindowHere rather than straight to AddWindow, so a split
+		// in a global session asks which machine the pane runs on the same way
+		// every other way of making one does. The recorded direction outlives
+		// the question: the window still arrives through a state sync, and
+		// adoptSyncedWindows still applies it.
+		if followSSH {
+			m.newWindowFollowingSSH(focusedWin)
+		} else {
+			m.NewWindowHere()
+		}
+		return
+	}
+
+	// Store the target window ID BEFORE creating new window (which will change focus)
+	m.SplitTargetWindowID = focusedWin.ID
+
+	// Set preselection direction for the next window
+	m.PreselectionDir = dir
+
+	// Create a new window. It will be added with the preselection.
+	if followSSH {
+		m.newWindowFollowingSSH(focusedWin)
+	} else {
+		m.AddWindow("")
+	}
+
+	// Clear the split target
+	m.SplitTargetWindowID = ""
+}
+
+// SmartSplitFocused splits the focused window using the smart split algorithm:
+// it chooses horizontal or vertical based on the focused window's aspect ratio.
+func (m *OS) SmartSplitFocused() {
+	if !m.AutoTiling {
+		return
+	}
+
+	focusedWin := m.GetFocusedWindow()
+	if focusedWin == nil {
+		return
+	}
+
+	// Store the target window ID so AddWindowToBSPTree splits at the focused window
+	m.SplitTargetWindowID = focusedWin.ID
+
+	// No preselection: let determineAutoSplit (SchemeSmartSplit) pick the direction
+	m.PreselectionDir = layout.PreselectionNone
+
+	// Create a new window. AddWindowToBSPTree will use SplitNone which triggers auto split
+	m.AddWindow("")
+
+	// Clear the split target
+	m.SplitTargetWindowID = ""
+}
+
+// SetPreselection sets the preselection direction for the next window insertion
+func (m *OS) SetPreselection(dir layout.PreselectionDir) {
+	m.PreselectionDir = dir
+	// Show notification about preselection
+	var dirName string
+	switch dir {
+	case layout.PreselectionLeft:
+		dirName = "left"
+	case layout.PreselectionRight:
+		dirName = "right"
+	case layout.PreselectionUp:
+		dirName = "up"
+	case layout.PreselectionDown:
+		dirName = "down"
+	default:
+		m.PreselectionDir = layout.PreselectionNone
+		return
+	}
+	m.ShowNotification("Preselection: "+dirName, "info", m.Settings.NotificationDuration)
+}
+
+// ClearPreselection clears any active preselection
+func (m *OS) ClearPreselection() {
+	m.PreselectionDir = layout.PreselectionNone
+}
+
+// RotateFocusedSplit toggles the split direction at the focused window's parent
+func (m *OS) RotateFocusedSplit() {
+	if !m.AutoTiling {
+		m.LogInfo("BSP: RotateSplit ignored, tiling not active")
+		return
+	}
+
+	tree := m.WorkspaceTrees[m.CurrentWorkspace]
+	if tree == nil {
+		m.LogInfo("BSP: RotateSplit ignored, no tree for workspace %d", m.CurrentWorkspace)
+		return
+	}
+
+	focusedWin := m.GetFocusedWindow()
+	if focusedWin == nil {
+		m.LogInfo("BSP: RotateSplit ignored, no focused window")
+		return
+	}
+
+	windowIntID := m.GetWindowIntID(focusedWin.ID)
+
+	// Check if window is in the tree
+	if !tree.HasWindow(windowIntID) {
+		m.LogInfo("BSP: RotateSplit: window %d not in tree, has %d windows", windowIntID, tree.WindowCount())
+		// Window not in tree. This can happen if tiling was enabled after windows were created
+		// but the tree wasn't properly built. Let's rebuild it.
+		m.LogInfo("BSP: Rebuilding tree to include all windows")
+		m.TileAllWindows()
+		return
+	}
+
+	node := tree.FindNode(windowIntID)
+	if node == nil || node.Parent == nil {
+		m.LogInfo("BSP: RotateSplit: window has no parent (is root), cannot rotate")
+		m.ShowNotification("Cannot rotate: window has no parent split", "warning", 2000000000)
+		return
+	}
+
+	tree.RotateSplit(windowIntID)
+	m.LogInfo("BSP: Rotated split for window %d", windowIntID)
+
+	// Reapply layout
+	m.ApplyBSPLayout()
+}
+
+// EqualizeSplits resets the splits of the layout on screen: every BSP split
+// ratio to 0.5, or the master-stack splits to the configured master ratio and
+// equal shares for every other pane.
+func (m *OS) EqualizeSplits() {
+	if !m.AutoTiling {
+		return
+	}
+	if m.inMasterStack() {
+		m.equalizeMasterStack()
+		return
+	}
+	// The scrolling layout keeps no splits to reset. A BSP tree left from
+	// before the layout changed is not on screen, and laying it out here
+	// would put the panes in the wrong layout.
+	if !m.UseBSPLayout {
+		return
+	}
+
+	tree := m.WorkspaceTrees[m.CurrentWorkspace]
+	if tree == nil {
+		return
+	}
+
+	tree.EqualizeRatios()
+
+	// Reapply layout
+	m.ApplyBSPLayout()
+}
+
+// equalizeMasterStack is EqualizeSplits for the master-stack layout. It
+// looked only for a BSP tree, which master-stack does not use, so it did
+// nothing there.
+//
+// Each value is written rather than deleted. The session merges these maps
+// by union and keeps an entry a push leaves out, so a deleted entry would
+// come back from the daemon. A zero stack ratio and empty splits both mean
+// equal shares.
+func (m *OS) equalizeMasterStack() {
+	ws := m.CurrentWorkspace
+	m.setMasterRatio(m.Settings.MasterRatioFraction())
+	m.setWorkspaceStackRatio(ws, 0)
+	m.setWorkspaceMasterSplits(ws, layout.MasterSplits{})
+	m.TileAllWindows()
+	m.SyncStateToDaemon()
+}
+
+// tilingSchemeCycle is the fixed order cycle_tiling_scheme steps through,
+// spiral first since it is the default. It matches config.TilingSchemes.
+var tilingSchemeCycle = []layout.AutoScheme{
+	layout.SchemeSpiral,
+	layout.SchemeLongestSide,
+	layout.SchemeAlternate,
+	layout.SchemeSmartSplit,
+}
+
+// CycleTilingScheme moves the current workspace's tree to the next insertion
+// scheme in tilingSchemeCycle and returns its name, or "" when there is no
+// tiled workspace to change.
+//
+// This changes only the scheme, which decides where the next split goes; it
+// never reflows the windows already on screen. GetOrCreateBSPTree creates the
+// tree with the configured default when the workspace has none yet, so this
+// always has a tree to turn.
+func (m *OS) CycleTilingScheme() string {
+	if !m.AutoTiling {
+		return ""
+	}
+	tree := m.GetOrCreateBSPTree()
+	idx := slices.Index(tilingSchemeCycle, tree.AutoScheme)
+	tree.AutoScheme = tilingSchemeCycle[(idx+1)%len(tilingSchemeCycle)]
+	return tree.AutoScheme.String()
+}
+
+// SetTilingScheme sets the current workspace's insertion scheme directly. It
+// reports whether it applied, which is false only when tiling is off.
+func (m *OS) SetTilingScheme(scheme layout.AutoScheme) bool {
+	if !m.AutoTiling {
+		return false
+	}
+	m.GetOrCreateBSPTree().AutoScheme = scheme
+	return true
+}
+
+// TilingSchemeLabel names an insertion scheme the way the dock message and
+// the command palette show it, matching config.TilingSchemes.
+func TilingSchemeLabel(scheme string) string {
+	switch scheme {
+	case config.TilingSchemeSpiral:
+		return "spiral"
+	case config.TilingSchemeLongestSide:
+		return "longest side"
+	case config.TilingSchemeAlternate:
+		return "alternate"
+	case config.TilingSchemeSmartSplit:
+		return "smart split"
+	default:
+		return scheme
+	}
+}
+
+// SwapWindowsInBSPTree swaps two windows in the BSP tree
+func (m *OS) SwapWindowsInBSPTree(window1, window2 *terminal.Window) {
+	tree := m.WorkspaceTrees[m.CurrentWorkspace]
+	if tree == nil {
+		return
+	}
+
+	id1 := m.GetWindowIntID(window1.ID)
+	id2 := m.GetWindowIntID(window2.ID)
+	tree.SwapWindows(id1, id2)
+}
+
+// tiledLayoutStale reports whether the tiled panes no longer fill the box
+// tiling is supposed to partition, so the layout has to be recomputed.
+//
+// Tiling covers GetBSPBounds exactly: every visible, non-floating pane sits
+// inside it, and together they reach its right and bottom edges. Either half of
+// that failing means the rectangles were computed against some other box (a
+// peer client's, at its own size), and this client has to lay them out again.
+//
+// Checked in both directions on purpose. Asking only whether a pane overflows
+// finds a peer that is larger and is blind to one that is smaller, and a
+// session shrinking and growing back produces exactly the smaller case.
+func (m *OS) tiledLayoutStale() bool {
+	// The scrolling strip is asked a different question, because it is not a
+	// partition of the box and never claims to be: it is longer than the screen
+	// and the columns either side of the viewport are meant to be off it. Every
+	// test below reads a settled strip as stale, so a state sync would retile
+	// in that layout whatever it said. A retile brings the focused column back
+	// on screen, so a strip somebody had deliberately scrolled away from would
+	// be pulled back by the next broadcast anybody made.
+	if m.UseScrollingLayout {
+		return m.scrollingLayoutStale()
+	}
+
+	bounds := m.GetBSPBounds()
+	if bounds.W <= 0 || bounds.H <= 0 {
+		return false
+	}
+
+	// A zoomed pane is one rectangle the tiler did not choose, and the test
+	// below is a test of the rectangles: the panes have to cover the box
+	// exactly. One of them covering it on its own passes that test whatever the
+	// others are doing, so with a zoom on the workspace the check is blind, and
+	// blind is not a licence to answer "settled". A shared zoom can be somebody
+	// else's and can stand for as long as they leave it. Measured: three clients holding a
+	// peer's zoom kept three different widths for the pane behind it, because
+	// nothing looked while the zoom was up.
+	//
+	// So the rectangles are recomputed rather than judged. The tiler skips the
+	// zoomed pane and lays out the rest, which is idempotent for a client that
+	// already agrees, so the cost of saying "stale" here is one retile per sync
+	// for as long as a zoom is up.
+	if m.zoomedWindow() != nil {
+		return true
+	}
+
+	// The near edges start at the far corner so the minima below need no first
+	// pass; any is what says whether they were ever taken.
+	left, top := bounds.X+bounds.W, bounds.Y+bounds.H
+	right, bottom := 0, 0
+	any := false
+	for _, w := range m.Windows {
+		if w == nil || w.Workspace != m.CurrentWorkspace || w.Minimized || w.IsFloating {
+			continue
+		}
+		// A pane in mid-drag is read at the slot it left, not where the
+		// pointer has it. See dragSlotOf.
+		wx, wy, ww, wh := m.dragSlotOf(w)
+		// Outside the box on any side: unambiguously stale.
+		if wx < bounds.X || wy < bounds.Y ||
+			wx+ww > bounds.X+bounds.W || wy+wh > bounds.Y+bounds.H {
+			return true
+		}
+		any = true
+		left = min(left, wx)
+		top = min(top, wy)
+		right = max(right, wx+ww)
+		bottom = max(bottom, wy+wh)
+	}
+	if !any {
+		return false
+	}
+	// Inside the box but not filling it. A separator gap between panes is taken
+	// out of the space between them, never off the far edge, so a settled
+	// layout always reaches all four.
+	//
+	// All four, not two. Measuring the far edges alone misses a layout inset
+	// from the near ones, and that is not a hypothetical shape. A client attaching is handed the session's reserve as it stands,
+	// lays the panes out against it and pushes; if the reserve then shrinks
+	// because that same client asks for less chrome than the one already there,
+	// the pushed rectangles start too far in and still reach the far edges
+	// exactly. A peer that had already retiled against the smaller reserve
+	// adopted them and had no reason to look again, so it drew every shared
+	// shell narrower than the shell was actually running.
+	return left != bounds.X || top != bounds.Y ||
+		right != bounds.X+bounds.W || bottom != bounds.Y+bounds.H
+}

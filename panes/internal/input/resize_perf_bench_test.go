@@ -1,0 +1,125 @@
+package input
+
+import (
+	"fmt"
+	"testing"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/app"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+	uv "github.com/charmbracelet/ultraviolet"
+)
+
+const (
+	benchCols = 207
+	benchRows = 55
+)
+
+// benchResizeOS builds a tiled BSP workspace of n windows with painted content,
+// already in the middle of a bottom-right resize drag on the focused window.
+// This is the exact state the model is in between two motion events of a drag.
+func benchResizeOS(tb testing.TB, n int) *app.OS {
+	tb.Helper()
+
+	m := &app.OS{
+		Settings:         config.Global,
+		NumWorkspaces:    9,
+		CurrentWorkspace: 1,
+		WorkspaceFocus:   make(map[int]int),
+		Width:            benchCols,
+		Height:           benchRows,
+		AutoTiling:       true,
+		UseBSPLayout:     true,
+		FocusedWindow:    0,
+		PendingResizes:   make(map[string][2]int),
+		// The layout reads the model's session-settled value, not the global;
+		// seed it from the global the caller just set. NewOS does the same.
+		SharedBorders: config.Global.SharedBorders,
+	}
+
+	for i := range n {
+		id := fmt.Sprintf("bench-resize-%d-%d", n, i)
+		ptyData := make(chan struct{}, 1)
+		done := make(chan struct{})
+		go func() {
+			for {
+				select {
+				case <-ptyData:
+				case <-done:
+					return
+				}
+			}
+		}()
+		tb.Cleanup(func() { close(done) })
+
+		win := terminal.NewDaemonWindow(id, "test", 0, 0, benchCols, benchRows, 0, "pty-"+id, ptyData, config.DefaultScrollbackLines)
+		if win == nil {
+			tb.Fatal("NewDaemonWindow returned nil")
+		}
+		tb.Cleanup(win.Close)
+
+		win.LockIO()
+		for y := 1; y <= benchRows; y++ {
+			line := fmt.Sprintf("line %03d ", y)
+			for len(line) < benchCols-12 {
+				line += "content "
+			}
+			_, _ = win.Terminal.Write(fmt.Appendf(nil, "\x1b[%d;1H\x1b[38;5;%dm%s\x1b[m", y, 16+(y%200), line))
+		}
+		win.UnlockIO()
+
+		win.Workspace = 1
+		win.Tiled = true
+		m.Windows = append(m.Windows, win)
+	}
+
+	m.TileAllWindows()
+	tree := m.WorkspaceTrees[m.CurrentWorkspace]
+	if tree == nil {
+		tb.Fatal("benchResizeOS: no BSP tree")
+	}
+	for intID, rect := range tree.ApplyLayout(m.GetBSPBounds(), sharedGap()) {
+		if win := m.GetWindowByIntID(intID); win != nil {
+			win.X, win.Y, win.Width, win.Height = rect.X, rect.Y, rect.W, rect.H
+		}
+	}
+
+	// Arm a bottom-right resize drag on the focused window, the way
+	// handleMouseClick would have on press.
+	focused := m.GetFocusedWindow()
+	m.Resizing = true
+	m.ResizeCorner = app.BottomRight
+	m.PreResizeState = terminal.Window{
+		Width:  focused.Width,
+		Height: focused.Height,
+		X:      focused.X,
+		Y:      focused.Y,
+		Z:      focused.Z,
+		ID:     focused.ID,
+	}
+	m.ResizeStartX = focused.X + focused.Width
+	m.ResizeStartY = focused.Y + focused.Height
+	m.InteractionMode = true
+
+	return m
+}
+
+// motionAt is the message bubbletea delivers for one pointer move during a drag.
+func motionAt(x, y int) tea.MouseMotionMsg {
+	return tea.MouseMotionMsg(uv.MouseMotionEvent{
+		X:      x,
+		Y:      y,
+		Button: uv.MouseButton(tea.MouseLeft),
+	})
+}
+
+// sharedGap is the column the layout keeps between panes for the divider, on
+// the same terms app.OS.separatorGap does. benchResizeOS drives the layout
+// directly, so it answers the question the app would answer for it.
+func sharedGap() int {
+	if config.Global.SharedBorders {
+		return 1
+	}
+	return 0
+}

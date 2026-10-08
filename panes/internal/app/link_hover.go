@@ -1,0 +1,383 @@
+package app
+
+import (
+	"strings"
+
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/hints"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+	uv "github.com/charmbracelet/ultraviolet"
+)
+
+// A pane already knows where its links are. The emulator records OSC 8 on every
+// cell it paints, so the address of a marked link is a field read away, and a
+// bare URL is found by reading one row of text. What the pane did not do until
+// now is say so: a link looked like every other run of characters and a click on
+// it selected text.
+//
+// This file is the "say so". It resolves the run of cells under the pointer into
+// a PaneLink, and everything else in the feature reads that one value: the
+// render loop underlines it, the pointer turns into a hand over it, the label
+// names its target, and a click acts on it.
+//
+// It runs on arriving motion and nowhere else. A frame never calls it, so a pane
+// that nobody is pointing at costs exactly what it cost before.
+
+// PaneLink is the link under the pointer, in the coordinates the render loop
+// draws in.
+//
+// The run is viewport-relative and inclusive at both ends, in row-major order:
+// a cell (x, y) is inside it when it is at or after (X0, Y0) and at or before
+// (X1, Y1). A marked link wraps across rows, which is why the run needs two
+// corners rather than one row and two columns.
+type PaneLink struct {
+	// WindowID is the pane the run belongs to. The pointer can only be over one
+	// pane, and a run is meaningless against any other.
+	WindowID string
+	// URL is the address the link points at, exactly as the program wrote it.
+	// For a marked link it is the OSC 8 target, never the visible text.
+	URL string
+	// Params are the OSC 8 parameters of a marked link, id= included. Two
+	// runs with the same URL and an id= in the same Params are one link.
+	Params string
+	// Marked says the address came from OSC 8, so the program declared it. A
+	// bare URL found in plain text is not marked, and the two are treated
+	// differently by nothing except this field and the config that finds them.
+	Marked bool
+	// The inclusive run, row-major, in viewport cells.
+	Y0, X0, Y1, X1 int
+	// Row and Col are the cell the pointer was actually on, which is what the
+	// label is positioned against.
+	Row, Col int
+}
+
+// Contains reports whether viewport cell (x, y) is inside the run.
+func (l PaneLink) Contains(x, y int) bool {
+	if y < l.Y0 || y > l.Y1 {
+		return false
+	}
+	if y == l.Y0 && x < l.X0 {
+		return false
+	}
+	if y == l.Y1 && x > l.X1 {
+		return false
+	}
+	return true
+}
+
+// Same reports whether two resolutions describe the same run of the same pane.
+// The pointer moving from one cell of a link to the next must not repaint the
+// pane, and this is what tells the two apart.
+func (l PaneLink) Same(o PaneLink) bool {
+	return l.WindowID == o.WindowID && l.URL == o.URL && l.Params == o.Params &&
+		l.Y0 == o.Y0 && l.X0 == o.X0 && l.Y1 == o.Y1 && l.X1 == o.X1
+}
+
+// linksEnabled reports whether the pointer picks links up at all.
+func linksEnabled(s *config.Settings) bool { return s.Links != config.LinksOff }
+
+// resolvePaneLink returns the link covering viewport cell (x, y) of window, or
+// ok=false when there is none.
+//
+// The caller must not hold the window's I/O read lock; this takes it itself, and
+// gives up rather than waiting. A pane printing thousands of lines a second
+// holds the write side almost continuously, and blocking a mouse move on it
+// would stall the whole input loop for a hover highlight. Motion arrives many
+// times a second, so a skipped resolution costs one frame of a stale underline
+// and nothing else.
+func resolvePaneLink(window *terminal.Window, x, y int, s *config.Settings) (PaneLink, bool) {
+	if window == nil || window.Terminal == nil || !linksEnabled(s) {
+		return PaneLink{}, false
+	}
+	if !window.TryRLockIO() {
+		return PaneLink{}, false
+	}
+	defer window.RUnlockIO()
+
+	maxX := min(window.ContentWidth(), window.Terminal.Width())
+	if x < 0 || y < 0 || x >= maxX || y >= window.ContentHeight() {
+		return PaneLink{}, false
+	}
+
+	if link, ok := markedLinkAt(window, x, y, maxX); ok {
+		return link, true
+	}
+	if s.Links != config.LinksAll {
+		return PaneLink{}, false
+	}
+	return bareLinkAt(window, x, y, maxX)
+}
+
+// markedLinkAt finds the OSC 8 run covering (x, y).
+//
+// Two cells belong to the same marked link when they carry the same URL and the
+// same parameters and nothing between them carries anything else. The id= a
+// program may put in the parameters exists to join runs that are not adjacent,
+// which would let a link split by a window's edge highlight as one thing; that
+// is deliberately not done here, because the run this returns is also the run
+// that gets underlined, and underlining cells the pointer is nowhere near reads
+// as a bug rather than as a feature.
+func markedLinkAt(window *terminal.Window, x, y, maxX int) (PaneLink, bool) {
+	cell := paneCellAt(window, x, y)
+	if cell == nil || cell.Link.URL == "" {
+		return PaneLink{}, false
+	}
+	want := cell.Link
+
+	same := func(cx, cy int) bool {
+		c := paneCellAt(window, cx, cy)
+		return c != nil && c.Link == want
+	}
+
+	// Walk backwards through the run, wrapping to the end of the row above.
+	x0, y0 := x, y
+	for {
+		px, py := x0-1, y0
+		if px < 0 {
+			px, py = maxX-1, y0-1
+		}
+		if py < 0 || !same(px, py) {
+			break
+		}
+		x0, y0 = px, py
+	}
+
+	// And forwards, wrapping to the start of the row below.
+	x1, y1 := x, y
+	h := window.ContentHeight()
+	for {
+		nx, ny := x1+1, y1
+		if nx >= maxX {
+			nx, ny = 0, y1+1
+		}
+		if ny >= h || !same(nx, ny) {
+			break
+		}
+		x1, y1 = nx, ny
+	}
+
+	return PaneLink{
+		WindowID: window.ID,
+		URL:      want.URL,
+		Params:   want.Params,
+		Marked:   true,
+		Y0:       y0, X0: x0, Y1: y1, X1: x1,
+		Row: y, Col: x,
+	}, true
+}
+
+// linkWrapRows bounds how far a bare URL is followed across a wrap, in rows
+// each way. A URL long enough to fill sixteen rows of a pane is not one anybody
+// is about to click, and the bound is what keeps a screen of solid text from
+// being joined end to end on every mouse move.
+const linkWrapRows = 16
+
+// linkCellRef is a viewport cell, used to map a byte in the joined text of a
+// wrapped line back to the cell that drew it.
+type linkCellRef struct{ X, Y int }
+
+// bareLinkAt finds a plain-text URL covering (x, y), following it across a soft
+// wrap.
+//
+// A guest that prints a URL wider than the pane gets it broken across rows with
+// no character between the halves, and until now each half was scanned on its
+// own: hovering the first half offered to open a truncated address, and the
+// second half was not a link at all.
+//
+// The rows are joined when the emulator says the row above wrapped onto this
+// one (see paneRowWraps). A line that fills the pane and then ends is not
+// joined to the next, however full its last column is.
+//
+// The line is read from the emulator, not from the viewport: a URL that wraps
+// past the top or the bottom of what is shown, as one does in a pane scrolled
+// back to the middle of it, still opens its whole address. Only the run that
+// gets underlined stops at the viewport's edge.
+func bareLinkAt(window *terminal.Window, x, y, maxX int) (PaneLink, bool) {
+	h := window.ContentHeight()
+
+	// Walk up to the first row of the wrapped line, then collect it and every
+	// row the wrap carried it onto.
+	top := y
+	for top > y-linkWrapRows && paneRowWraps(window, top-1) {
+		top--
+	}
+
+	var b strings.Builder
+	var refs []linkCellRef
+	var byteAt []int
+	cursor := -1
+	for row := top; row <= y+linkWrapRows; row++ {
+		text, rowBytes := paneRowText(window, row, maxX)
+		base := b.Len()
+		b.WriteString(text)
+		for col, off := range rowBytes {
+			if off < 0 {
+				continue
+			}
+			if row == y && col == x {
+				cursor = base + off
+			}
+			refs = append(refs, linkCellRef{X: col, Y: row})
+			byteAt = append(byteAt, base+off)
+		}
+		// The line ends here unless the emulator wrapped this row.
+		if !paneRowWraps(window, row) {
+			break
+		}
+	}
+	if cursor < 0 {
+		return PaneLink{}, false
+	}
+
+	s, e, ok := hints.URLAt(b.String(), cursor)
+	if !ok {
+		return PaneLink{}, false
+	}
+
+	// Map the byte range back to the cells that drew it.
+	first, last := -1, -1
+	for i, off := range byteAt {
+		if off >= s && off < e {
+			if first < 0 {
+				first = i
+			}
+			last = i
+		}
+	}
+	if first < 0 {
+		return PaneLink{}, false
+	}
+
+	link := PaneLink{
+		WindowID: window.ID,
+		URL:      b.String()[s:e],
+		Y0:       refs[first].Y, X0: refs[first].X,
+		Y1: refs[last].Y, X1: refs[last].X,
+		Row: y, Col: x,
+	}
+	// The run is what gets underlined, so it stops at the viewport's edge.
+	if link.Y0 < 0 {
+		link.Y0, link.X0 = 0, 0
+	}
+	if link.Y1 >= h {
+		link.Y1, link.X1 = h-1, maxX-1
+	}
+	return link, true
+}
+
+// paneRowSource maps viewport row y to the row of the emulator that holds
+// it: a scrollback line (sbIdx >= 0) or a row of the live screen (screenY >=
+// 0). y may lie outside the viewport, above its first row or below its last,
+// so a reader can follow a wrapped line past the edge of what is shown. ok is
+// false when no such row exists.
+//
+// Above the live screen is the scrollback, except on the alternate screen,
+// which has none of its own: the main screen's history is not the line the
+// alternate screen's first row continues.
+//
+// The caller must hold the window's I/O read lock.
+func paneRowSource(window *terminal.Window, y int) (sbIdx, screenY int, ok bool) {
+	if window.Terminal == nil {
+		return -1, -1, false
+	}
+	offset := max(window.ScrollbackOffset, 0)
+	if y >= offset {
+		screenY = y - offset
+		if screenY >= window.Terminal.Height() {
+			return -1, -1, false
+		}
+		return -1, screenY, true
+	}
+	if offset == 0 && window.Terminal.IsAltScreen() {
+		return -1, -1, false
+	}
+	n := window.ScrollbackLen()
+	sbIdx = n - offset + y
+	if sbIdx < 0 || sbIdx >= n {
+		return -1, -1, false
+	}
+	return sbIdx, -1, true
+}
+
+// paneRowWraps reports whether viewport row y carries on to row y+1 because
+// the emulator wrapped it, as opposed to a line that filled the row and then
+// ended. It asks the emulator, which records every soft wrap, rather than
+// reading a full last column as a wrap: a line exactly as wide as the pane
+// followed by a newline fills the row the same way, and joining it to the
+// next line made one address out of two.
+//
+// y may lie outside the viewport (see paneRowSource). The newest scrollback
+// line reports whether it wrapped onto the screen's first row.
+//
+// The caller must hold the window's I/O read lock.
+func paneRowWraps(window *terminal.Window, y int) bool {
+	sbIdx, screenY, ok := paneRowSource(window, y)
+	if !ok {
+		return false
+	}
+	var wrapped, known bool
+	if sbIdx >= 0 {
+		wrapped, known = window.Terminal.ScrollbackSoftWrapped(sbIdx)
+	} else {
+		wrapped, known = window.Terminal.RowSoftWrapped(screenY)
+	}
+	return known && wrapped
+}
+
+// paneCellAt reads one viewport cell, from the scrollback ring when the pane is
+// scrolled back and from the live screen otherwise. It is the same mapping the
+// render loop walks, kept here so the cells the pointer lands on are the cells
+// the user is looking at. y may lie outside the viewport (see paneRowSource).
+//
+// The caller must hold the window's I/O read lock.
+func paneCellAt(window *terminal.Window, x, y int) *uv.Cell {
+	sbIdx, screenY, ok := paneRowSource(window, y)
+	if !ok || x < 0 {
+		return nil
+	}
+	if sbIdx >= 0 {
+		line := window.ScrollbackLine(sbIdx)
+		if x >= len(line) {
+			return nil
+		}
+		return &line[x]
+	}
+	return window.Terminal.CellAt(x, screenY)
+}
+
+// paneRowText renders one viewport row as plain text and returns, per column,
+// the byte offset of the cell that drew it. A column covered by the second half
+// of a wide glyph, or past the end of the row, gets -1.
+//
+// The two are built together on purpose: a row holding a wide glyph or a
+// combining mark has no fixed relationship between columns and bytes, and
+// deriving one from the other afterwards is where an off-by-one in a URL's last
+// character comes from.
+//
+// The caller must hold the window's I/O read lock.
+func paneRowText(window *terminal.Window, y, maxX int) (string, []int) {
+	var b strings.Builder
+	b.Grow(maxX)
+	byteAt := make([]int, maxX)
+	for i := range byteAt {
+		byteAt[i] = -1
+	}
+
+	for x := 0; x < maxX; {
+		cell := paneCellAt(window, x, y)
+		content := " "
+		width := 1
+		if cell != nil {
+			if cell.Width > 1 {
+				width = cell.Width
+			}
+			if cell.Content != "" {
+				content = cell.Content
+			}
+		}
+		byteAt[x] = b.Len()
+		b.WriteString(content)
+		x += width
+	}
+	return b.String(), byteAt
+}

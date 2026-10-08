@@ -1,0 +1,65 @@
+name: ci
+on:
+  push:
+    branches: [main, "w/**"]
+  pull_request:
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: ruff
+        working-directory: core
+        run: uv run ruff check .   # scripts/ lint debt (about 110 pre-existing findings) is tracked separately
+      - name: pytest
+        working-directory: core
+        run: uv run pytest -q
+
+  tui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tui/package-lock.json
+      - working-directory: tui
+        run: npm ci --no-audit --no-fund
+      - working-directory: tui
+        run: npm run build:ink
+      - working-directory: tui
+        run: npm run build
+      - name: vitest (known failures excluded)
+        working-directory: tui
+        # known-failing upstream tests go in .ci-test-excludes (one vitest --exclude glob per line)
+        run: |
+          set -eu
+          args=""
+          if [ -f .ci-test-excludes ]; then
+            while read -r g; do [ -z "$g" ] || args="$args --exclude $g"; done < .ci-test-excludes
+          fi
+          npx vitest run $args
+
+  panes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: panes/go.mod
+      - working-directory: panes
+        run: go build ./cmd/k3
+      - working-directory: panes
+        run: go test ./internal/k3keys/...
+
+  vendor_check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/vendor_check.py

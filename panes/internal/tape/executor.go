@@ -1,0 +1,608 @@
+package tape
+
+import (
+	"fmt"
+	"runtime"
+	"strconv"
+	"strings"
+	"unicode"
+)
+
+// Executor executes tape commands by directly manipulating the app state
+// This bridges the gap between tape commands and tuios functionality
+type Executor interface {
+	// ExecuteCommand executes a single tape command
+	ExecuteCommand(cmd *Command) error
+
+	// GetFocusedWindowID returns the ID of the focused window
+	GetFocusedWindowID() string
+
+	// SendToWindow sends bytes to a window's PTY
+	SendToWindow(windowID string, data []byte) error
+
+	// Mode switching
+	SetMode(mode string) error // "terminal" or "window"
+
+	// Window management
+	CreateNewWindow() error
+	CreateNewWindowWithName(name string) error
+	CloseWindow(windowID string) error
+	CloseWindowByName(name string) error // Closes all windows with matching name
+	NextWindow() error
+	PrevWindow() error
+	FocusWindowByID(windowID string) error
+	FocusWindowByName(name string) error // Errors if multiple matches
+	RenameWindowByID(windowID, name string) error
+	RenameWindowByName(oldName, newName string) error // Errors if multiple matches
+	MinimizeWindowByID(windowID string) error
+	MinimizeWindowByName(name string) error // Errors if multiple matches
+	RestoreWindowByID(windowID string) error
+	RestoreWindowByName(name string) error // Errors if multiple matches
+
+	// Tiling
+	ToggleTiling() error
+	EnableTiling() error
+	DisableTiling() error
+	SnapByDirection(direction string) error // "left", "right", "fullscreen"
+
+	// BSP Tiling
+	SplitHorizontal() error
+	SplitVertical() error
+	RotateSplit() error
+	EqualizeSplitsExec() error
+	Preselect(direction string) error                       // "left", "right", "up", "down"
+	ArrangePanesExec(layout string, windows []string) error // "tiled", "even-horizontal", "even-vertical"
+	SetMultifocusExec(windows []string) error
+
+	// Workspace
+	SwitchWorkspace(workspace int) error
+	MoveWindowToWorkspaceByID(windowID string, workspace int) error
+	MoveAndFollowWorkspaceByID(windowID string, workspace int) error
+
+	// Animations
+	EnableAnimations() error
+	DisableAnimations() error
+	ToggleAnimations() error
+
+	// New feature commands
+	ToggleZoomExec() error
+	ScreenshotExec() error
+	SmartSplitFocusedExec() error
+	ShowCommandPaletteExec() error
+	SaveLayoutExec(name string) error
+	LoadLayoutExec(name string) error
+
+	// Config commands for runtime configuration
+	SetConfig(path, value string) error
+	SetTheme(themeName string) error
+	SetDockbarPosition(position string) error
+	SetBorderStyle(style string) error
+	ShowNotificationCmd(message, notificationType string) error
+	FocusDirection(direction string) error
+	// MasterLayoutExec runs one of the master-stack commands
+	// (CommandTypeSetMasterPosition and the others) with its arguments.
+	MasterLayoutExec(command CommandType, args []string) error
+
+	// RunAction runs a keybinding action by its registry name.
+	RunAction(name string) error
+	// PressKeys presses keys through the app's own key handling. Each
+	// argument is one key or a sequence of them split by spaces or commas.
+	PressKeys(keys []string) error
+	// CheckCondition reports whether c holds now. The error says what was
+	// seen instead when it does not hold.
+	CheckCondition(c Condition) error
+}
+
+// CommandExecutor provides a default implementation
+type CommandExecutor struct {
+	executor Executor
+}
+
+// NewCommandExecutor creates a new command executor
+func NewCommandExecutor(executor Executor) *CommandExecutor {
+	return &CommandExecutor{executor: executor}
+}
+
+// Execute executes a command
+func (ce *CommandExecutor) Execute(cmd *Command) error {
+	if ce.executor == nil {
+		return nil
+	}
+
+	// sendRepeated sends data to the focused window once per repeat count. Basic
+	// key commands carry an optional trailing count (e.g. Down 5, Backspace 10).
+	sendRepeated := func(data []byte) error {
+		id := ce.executor.GetFocusedWindowID()
+		for i := 0; i < repeatCount(cmd); i++ {
+			if err := ce.executor.SendToWindow(id, data); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	switch cmd.Type {
+	case CommandTypeType:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("Type", "the text to type")
+		}
+		return ce.executor.SendToWindow(ce.executor.GetFocusedWindowID(), []byte(cmd.Args[0]))
+
+	case CommandTypeEnter:
+		return sendRepeated(enterBytes())
+
+	case CommandTypeSpace:
+		return sendRepeated([]byte{' '})
+
+	case CommandTypeBackspace:
+		return sendRepeated([]byte{'\b'})
+
+	case CommandTypeTab:
+		return sendRepeated([]byte{'\t'})
+
+	case CommandTypeEscape:
+		return sendRepeated([]byte{0x1b})
+
+	case CommandTypeDelete:
+		return sendRepeated([]byte{0x1b, '[', '3', '~'})
+
+	case CommandTypeUp:
+		return sendRepeated([]byte{0x1b, '[', 'A'})
+
+	case CommandTypeDown:
+		return sendRepeated([]byte{0x1b, '[', 'B'})
+
+	case CommandTypeRight:
+		return sendRepeated([]byte{0x1b, '[', 'C'})
+
+	case CommandTypeLeft:
+		return sendRepeated([]byte{0x1b, '[', 'D'})
+
+	case CommandTypeHome:
+		return sendRepeated([]byte{0x1b, '[', 'H'})
+
+	case CommandTypeEnd:
+		return sendRepeated([]byte{0x1b, '[', 'F'})
+
+	// Mode switching
+	case CommandTypeTerminalMode:
+		return ce.executor.SetMode("terminal")
+
+	case CommandTypeWindowManagementMode:
+		return ce.executor.SetMode("window")
+
+	// Window management
+	case CommandTypeNewWindow:
+		if len(cmd.Args) > 0 && cmd.Args[0] != "" {
+			return ce.executor.CreateNewWindowWithName(cmd.Args[0])
+		}
+		return ce.executor.CreateNewWindow()
+
+	case CommandTypeCloseWindow:
+		if len(cmd.Args) > 0 && cmd.Args[0] != "" {
+			return ce.executor.CloseWindowByName(cmd.Args[0])
+		}
+		return ce.executor.CloseWindow(ce.executor.GetFocusedWindowID())
+
+	case CommandTypeNextWindow:
+		return ce.executor.NextWindow()
+
+	case CommandTypePrevWindow:
+		return ce.executor.PrevWindow()
+
+	case CommandTypeFocusWindow, CommandTypeFocus:
+		if len(cmd.Args) == 0 || cmd.Args[0] == "" {
+			return errMissingArg("Focus", "a window name or id")
+		}
+		// Try as name first (more user-friendly), fall back to ID
+		if err := ce.executor.FocusWindowByName(cmd.Args[0]); err != nil {
+			// If name lookup fails, try as ID
+			return ce.executor.FocusWindowByID(cmd.Args[0])
+		}
+		return nil
+
+	case CommandTypeRenameWindow:
+		switch len(cmd.Args) {
+		case 0:
+			return errMissingArg("RenameWindow", "a new name")
+		case 1:
+			// One arg: rename focused window
+			return ce.executor.RenameWindowByID(ce.executor.GetFocusedWindowID(), cmd.Args[0])
+		default:
+			// Two args: old name, new name
+			return ce.executor.RenameWindowByName(cmd.Args[0], cmd.Args[1])
+		}
+
+	case CommandTypeMinimizeWindow:
+		if len(cmd.Args) > 0 && cmd.Args[0] != "" {
+			return ce.executor.MinimizeWindowByName(cmd.Args[0])
+		}
+		return ce.executor.MinimizeWindowByID(ce.executor.GetFocusedWindowID())
+
+	case CommandTypeRestoreWindow:
+		if len(cmd.Args) > 0 && cmd.Args[0] != "" {
+			return ce.executor.RestoreWindowByName(cmd.Args[0])
+		}
+		return ce.executor.RestoreWindowByID(ce.executor.GetFocusedWindowID())
+
+	// Tiling
+	case CommandTypeToggleTiling:
+		return ce.executor.ToggleTiling()
+
+	case CommandTypeEnableTiling:
+		return ce.executor.EnableTiling()
+
+	case CommandTypeDisableTiling:
+		return ce.executor.DisableTiling()
+
+	case CommandTypeSnapLeft:
+		return ce.executor.SnapByDirection("left")
+
+	case CommandTypeSnapRight:
+		return ce.executor.SnapByDirection("right")
+
+	case CommandTypeSnapFullscreen:
+		return ce.executor.SnapByDirection("fullscreen")
+
+	// BSP Tiling
+	case CommandTypeSplit:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("Split", "horizontal or vertical")
+		}
+		switch strings.ToLower(cmd.Args[0]) {
+		case "horizontal", "h":
+			return ce.executor.SplitHorizontal()
+		case "vertical", "v":
+			return ce.executor.SplitVertical()
+		default:
+			return fmt.Errorf("unknown Split direction %q (use horizontal or vertical)", cmd.Args[0])
+		}
+
+	case CommandTypeRotateSplit:
+		return ce.executor.RotateSplit()
+
+	case CommandTypeEqualizeSplits:
+		return ce.executor.EqualizeSplitsExec()
+
+	case CommandTypePreselect:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("Preselect", "left, right, up or down")
+		}
+		return ce.executor.Preselect(strings.ToLower(cmd.Args[0]))
+
+	case CommandTypeArrangePanes:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("ArrangePanes", "tiled, even-horizontal or even-vertical")
+		}
+		return ce.executor.ArrangePanesExec(strings.ToLower(cmd.Args[0]), cmd.Args[1:])
+
+	case CommandTypeSetMultifocus:
+		return ce.executor.SetMultifocusExec(cmd.Args)
+
+	// Workspace
+	case CommandTypeSwitchWS:
+		ws, err := workspaceArg("Switch", cmd)
+		if err != nil {
+			return err
+		}
+		return ce.executor.SwitchWorkspace(ws)
+
+	case CommandTypeMoveToWS:
+		ws, err := workspaceArg("MoveToWorkspace", cmd)
+		if err != nil {
+			return err
+		}
+		return ce.executor.MoveWindowToWorkspaceByID(ce.executor.GetFocusedWindowID(), ws)
+
+	case CommandTypeMoveAndFollowWS:
+		ws, err := workspaceArg("MoveAndFollow", cmd)
+		if err != nil {
+			return err
+		}
+		return ce.executor.MoveAndFollowWorkspaceByID(ce.executor.GetFocusedWindowID(), ws)
+
+	case CommandTypeKeyCombo:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("key combo", "a combination such as ctrl+b")
+		}
+		comboStr := cmd.Args[0]
+		// Handle Alt+N / alt+N for workspace switching (case-insensitive)
+		lowerCombo := strings.ToLower(comboStr)
+		if len(lowerCombo) >= 5 && (lowerCombo[:4] == "alt+" || lowerCombo[:4] == "opt+") {
+			ws := 0
+			if _, err := fmt.Sscanf(comboStr[4:], "%d", &ws); err == nil && ws >= 1 && ws <= 9 {
+				return ce.executor.SwitchWorkspace(ws)
+			}
+		}
+		// For other key combos, convert to proper bytes and send to the focused window
+		return ce.executor.SendToWindow(ce.executor.GetFocusedWindowID(), convertKeyComboToBytes(comboStr))
+
+	case CommandTypeWait, CommandTypeWaitUntilRegex:
+		// Wait (a Sleep alias) and WaitUntilRegex are handled by the interactive
+		// playback loop (internal/app/update.go), which needs to block across
+		// ticks while checking timers and screen contents. They are intentionally
+		// no-ops here so the remote/daemon exec path (which is fire-and-forget)
+		// simply skips them.
+		return nil
+
+	case CommandTypeEnableAnimations:
+		return ce.executor.EnableAnimations()
+
+	case CommandTypeDisableAnimations:
+		return ce.executor.DisableAnimations()
+
+	case CommandTypeToggleAnimations:
+		return ce.executor.ToggleAnimations()
+
+	// New feature commands
+	case CommandTypeToggleZoom:
+		return ce.executor.ToggleZoomExec()
+
+	case CommandTypeSetMasterPosition:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("SetMasterPosition", "left, right, top, bottom or center")
+		}
+		return ce.executor.MasterLayoutExec(cmd.Type, cmd.Args)
+	case CommandTypeSetMasterCount:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("SetMasterCount", "a number of master panes")
+		}
+		return ce.executor.MasterLayoutExec(cmd.Type, cmd.Args)
+	case CommandTypeCycleMasterPosition, CommandTypeAddMaster, CommandTypeRemoveMaster,
+		CommandTypeSwapWithMaster, CommandTypeFocusMaster:
+		return ce.executor.MasterLayoutExec(cmd.Type, cmd.Args)
+	case CommandTypeScreenshot:
+		return ce.executor.ScreenshotExec()
+
+	case CommandTypeSmartSplit:
+		return ce.executor.SmartSplitFocusedExec()
+
+	case CommandTypeCommandPalette:
+		return ce.executor.ShowCommandPaletteExec()
+
+	case CommandTypeSaveLayout:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("SaveLayout", "a layout name")
+		}
+		return ce.executor.SaveLayoutExec(cmd.Args[0])
+
+	case CommandTypeLoadLayout:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("LoadLayout", "a layout name")
+		}
+		return ce.executor.LoadLayoutExec(cmd.Args[0])
+
+	// Config commands
+	case CommandTypeSetConfig:
+		if len(cmd.Args) < 2 {
+			return errMissingArg("Set", "a config path and a value")
+		}
+		return ce.executor.SetConfig(cmd.Args[0], cmd.Args[1])
+
+	case CommandTypeSetTheme:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("SetTheme", "a theme name")
+		}
+		return ce.executor.SetTheme(cmd.Args[0])
+
+	case CommandTypeSetDockbarPosition:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("SetDockbarPosition", "top, bottom or hidden")
+		}
+		return ce.executor.SetDockbarPosition(cmd.Args[0])
+
+	case CommandTypeSetBorderStyle:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("SetBorderStyle", "a border style name")
+		}
+		return ce.executor.SetBorderStyle(cmd.Args[0])
+
+	case CommandTypeShowNotification:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("Notify", "a message")
+		}
+		notifType := "info"
+		if len(cmd.Args) > 1 {
+			notifType = cmd.Args[1]
+		}
+		return ce.executor.ShowNotificationCmd(cmd.Args[0], notifType)
+
+	case CommandTypeFocusDirection:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("FocusDirection", "left, right, up or down")
+		}
+		return ce.executor.FocusDirection(strings.ToLower(cmd.Args[0]))
+
+	case CommandTypeAction:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("Action", "an action name")
+		}
+		return ce.executor.RunAction(cmd.Args[0])
+
+	case CommandTypePress:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("Press", "keys to press")
+		}
+		return ce.executor.PressKeys(cmd.Args)
+
+	case CommandTypeRun:
+		if len(cmd.Args) == 0 {
+			return errMissingArg("Run", "a command line")
+		}
+		id := ce.executor.GetFocusedWindowID()
+		if err := ce.executor.SendToWindow(id, []byte(cmd.Args[0])); err != nil {
+			return err
+		}
+		return ce.executor.SendToWindow(id, enterBytes())
+
+	case CommandTypeExpect:
+		cond, err := ParseCondition(cmd)
+		if err != nil {
+			return err
+		}
+		if err := ce.executor.CheckCondition(cond); err != nil {
+			return fmt.Errorf("the condition %s does not hold: %w", cond, err)
+		}
+		return nil
+
+	case CommandTypeWaitFor:
+		// The player waits across ticks and never hands WaitFor to Execute.
+		// Anything that does is running one command on its own, with nothing
+		// to wait in.
+		return fmt.Errorf("a WaitFor line works only in a tape. From a shell, use tuios wait-for")
+
+	case CommandTypeSet:
+		if len(cmd.Args) < 2 {
+			return errMissingArg("Set", "a config path and a value")
+		}
+		return ce.executor.SetConfig(cmd.Args[0], cmd.Args[1])
+
+	case CommandTypeSource:
+		// A tape loaded from a file has its Source lines replaced by the file
+		// they name (see LoadFile). One that reaches here came as text, with
+		// no directory to find the file in.
+		return fmt.Errorf("a Source line works only in a tape file run with tuios tape play or tuios tape exec")
+
+	case CommandTypeSleep, CommandTypeComment:
+		return nil
+
+	default:
+		// Every command the parser produces has a case above. A new one
+		// that does not is reported, never run as nothing.
+		return fmt.Errorf("%s cannot run here", cmd.Type)
+	}
+}
+
+// enterBytes is the Enter key as the focused pane's shell expects it.
+func enterBytes() []byte {
+	if runtime.GOOS == "windows" {
+		return []byte{'\r', '\n'}
+	}
+	return []byte{'\n'}
+}
+
+// errMissingArg reports a tape command that was given no argument to act on.
+// Returning nil instead would make a mistyped or truncated command do nothing
+// and report nothing, which is indistinguishable from the command having
+// worked.
+func errMissingArg(command, want string) error {
+	return fmt.Errorf("%s needs %s", command, want)
+}
+
+// workspaceArg parses a workspace number argument. It returns the parse error
+// rather than discarding it, because a non-numeric argument would otherwise
+// become workspace 0 and be silently dropped by the range check downstream.
+func workspaceArg(command string, cmd *Command) (int, error) {
+	if len(cmd.Args) == 0 {
+		return 0, errMissingArg(command, "a workspace number")
+	}
+	ws, err := strconv.Atoi(strings.TrimSpace(cmd.Args[0]))
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a workspace number", command, cmd.Args[0])
+	}
+	return ws, nil
+}
+
+// repeatCount returns the trailing repeat count of a basic key command, taken
+// from its first argument. It defaults to 1 when absent or not a positive int.
+func repeatCount(cmd *Command) int {
+	if len(cmd.Args) == 0 {
+		return 1
+	}
+	n, err := strconv.Atoi(cmd.Args[0])
+	if err != nil || n < 1 {
+		return 1
+	}
+	return n
+}
+
+// convertKeyComboToBytes converts a key combination string to actual bytes to send to the PTY
+// Examples: "Ctrl+b" -> [0x02], "Alt+x" -> [0x1b, 'x']
+func convertKeyComboToBytes(comboStr string) []byte {
+	parts := strings.Split(comboStr, "+")
+	if len(parts) < 2 {
+		return []byte(comboStr)
+	}
+
+	var result []byte
+	var ctrlModifier, altModifier, shiftModifier bool
+	var keyStr string
+
+	// Parse modifiers and key
+	for i := range len(parts) {
+		part := strings.TrimSpace(parts[i])
+		switch strings.ToLower(part) {
+		case "ctrl":
+			ctrlModifier = true
+		case "alt", "opt":
+			altModifier = true
+		case "shift":
+			shiftModifier = true
+		default:
+			keyStr = part
+		}
+	}
+
+	if keyStr == "" {
+		return []byte(comboStr)
+	}
+
+	// Convert the key string to bytes
+	if len(keyStr) == 1 {
+		keyChar := keyStr[0]
+
+		// Apply Ctrl modifier: produces ASCII control characters (0x00-0x1F)
+		if ctrlModifier {
+			// Ctrl+letter: subtract 64 from uppercase, or use bitwise AND with 0x1F
+			if unicode.IsLetter(rune(keyChar)) {
+				// Convert to uppercase equivalent and apply Ctrl
+				upperChar := byte(unicode.ToUpper(rune(keyChar)))
+				result = append(result, upperChar&0x1F)
+			} else if unicode.IsDigit(rune(keyChar)) {
+				// Ctrl+digit
+				result = append(result, keyChar&0x1F)
+			}
+		} else if altModifier {
+			// Alt modifier: send ESC followed by the character
+			result = append(result, 0x1b) // ESC
+			result = append(result, keyChar)
+		} else if shiftModifier {
+			// Shift without Ctrl/Alt: send the upper-case form of the key
+			result = append(result, byte(unicode.ToUpper(rune(keyChar))))
+		} else {
+			result = append(result, keyChar)
+		}
+	} else {
+		// Multi-character key (like "space", "enter", etc.)
+		lowerKey := strings.ToLower(keyStr)
+
+		// Shift+Tab is the back-tab sequence ESC [ Z
+		if lowerKey == "tab" && shiftModifier && !ctrlModifier && !altModifier {
+			return []byte{0x1b, '[', 'Z'}
+		}
+
+		// Map special keys
+		specialKeys := map[string][]byte{
+			"space":     {' '},
+			"enter":     {'\n'},
+			"return":    {'\n'},
+			"tab":       {'\t'},
+			"escape":    {0x1b},
+			"esc":       {0x1b},
+			"backspace": {'\b'},
+			"delete":    {0x7f},
+		}
+
+		if keyBytes, exists := specialKeys[lowerKey]; exists {
+			if altModifier {
+				result = append(result, 0x1b) // ESC prefix for Alt
+			}
+			result = append(result, keyBytes...)
+		} else {
+			// Unknown key, just send it as-is
+			result = append(result, []byte(keyStr)...)
+		}
+	}
+
+	return result
+}

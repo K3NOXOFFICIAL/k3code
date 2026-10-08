@@ -1,0 +1,41 @@
+tuios
+tuios-web
+tuios.exe
+dist/
+*.mov
+.DS_Store
+!tuios/
+!cmd/tuios/
+!cmd/tuios-web/
+.direnv/
+result
+*.backup
+*.prof
+cpu.prof
+mem.prof
+
+# Packaged demo output from web/package.sh: a copy of tracked files plus the built guest, regenerable.
+/artifacts/
+
+# Netlify CLI local link state, per-machine.
+.netlify/
+
+# The WebAssembly demo lives on feat/wasm-demo; its working copy (source plus a 125MB built guest) is stray on main. Ignore it here so status stays clean; tracked files still merge normally if the branch lands.
+/web/
+
+# Agent worktrees: transient checkouts, never part of the tree.
+.claude/worktrees/
+
+# Agent scratch capture files, never part of the tree.
+zz_*_test.go
+
+# Browser test dependencies and output, installed per machine by npm.
+/clienttests/node_modules
+/clienttests/test-results
+.ghostty-vt/
+
+# Test binaries left behind by go test -cpuprofile
+*.test
+.wasm-build/
+/learn-web/
+.zig-cache/

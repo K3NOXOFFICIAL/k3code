@@ -1,0 +1,432 @@
+package app
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/Gaurav-Gosain/tuios/internal/layout"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+	"github.com/adrg/xdg"
+)
+
+// LayoutTemplate is the v2 layout specification.
+//
+// A layout template captures everything needed to recreate a terminal
+// workspace: window positions, BSP tree structure, per-window startup
+// commands, working directories, and tiling configuration.
+//
+// Templates are stored as JSON in ~/.config/tuios/layouts/.
+//
+// Integration points:
+//   - Command palette: "Save Layout", "Load Layout"
+//   - Keybinding: prefix+L l (load), prefix+L s (save)
+//   - Tape scripting: SaveLayout/LoadLayout commands
+//   - CLI: tuios layout list/delete/dir/export (no save or load, since
+//     both need a running session)
+type LayoutTemplate struct {
+	// Metadata
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	Version     int       `json:"version"` // Schema version (2)
+
+	// Tiling configuration
+	AutoTiling   bool    `json:"auto_tiling"`
+	TilingScheme string  `json:"tiling_scheme,omitempty"` // "spiral", "alternate", "smart_split", etc.
+	MasterRatio  float64 `json:"master_ratio,omitempty"`
+
+	// Windows holds each window's configuration.
+	Windows []LayoutWindow `json:"windows"`
+
+	// Screen dimensions at save time (for proportional scaling on different screens)
+	ScreenWidth  int `json:"screen_width,omitempty"`
+	ScreenHeight int `json:"screen_height,omitempty"`
+}
+
+// LayoutWindow stores per-window configuration.
+type LayoutWindow struct {
+	// Position and size (used in free-float mode or as fallback)
+	X      int `json:"x"`
+	Y      int `json:"y"`
+	Width  int `json:"width"`
+	Height int `json:"height"`
+
+	// Window identity
+	Title      string `json:"title,omitempty"`       // Custom name
+	CustomName string `json:"custom_name,omitempty"` // User-set name
+
+	// Startup configuration
+	Command    string   `json:"command,omitempty"`     // Shell command to run on creation (e.g., "vim", "htop")
+	Args       []string `json:"args,omitempty"`        // Command arguments
+	WorkingDir string   `json:"working_dir,omitempty"` // Working directory for the shell
+	Shell      string   `json:"shell,omitempty"`       // Override shell (empty = default)
+
+	// State
+	Minimized bool `json:"minimized,omitempty"`
+}
+
+// GetTemplatesDir returns the directory path for layout template files.
+func GetTemplatesDir() string {
+	return filepath.Join(xdg.ConfigHome, "tuios", "layouts")
+}
+
+func ensureTemplatesDir() error {
+	return os.MkdirAll(GetTemplatesDir(), 0750)
+}
+
+func templateFilePath(name string) string {
+	safe := strings.ReplaceAll(name, string(os.PathSeparator), "_")
+	safe = strings.ReplaceAll(safe, " ", "_")
+	safe = strings.ReplaceAll(safe, "..", "_")
+	if safe == "" {
+		safe = "unnamed"
+	}
+	return filepath.Join(GetTemplatesDir(), safe+".json")
+}
+
+// SaveLayoutTemplate saves the current workspace layout.
+func SaveLayoutTemplate(name string, m *OS) error {
+	// A layout is a workspace's, and a scratch group is not one: saved from
+	// inside the box it would be empty, loaded there it would fill the box
+	// with panes of the workspace's size.
+	if m.InScratchView() {
+		return errLayoutInScratch
+	}
+	if err := ensureTemplatesDir(); err != nil {
+		return fmt.Errorf("create layouts dir: %w", err)
+	}
+
+	tmpl := LayoutTemplate{
+		Name:         name,
+		CreatedAt:    time.Now(),
+		Version:      2,
+		AutoTiling:   m.AutoTiling,
+		MasterRatio:  m.MasterRatio,
+		ScreenWidth:  m.GetRenderWidth(),
+		ScreenHeight: m.GetRenderHeight(),
+	}
+
+	// Save tiling scheme
+	if tree := m.WorkspaceTrees[m.CurrentWorkspace]; tree != nil {
+		tmpl.TilingScheme = tree.AutoScheme.String()
+	}
+
+	// Collect windows
+	for _, w := range m.Windows {
+		// The scratch terminal is not a pane of the layout. A template that
+		// stored it would open it as an ordinary pane.
+		if w.Workspace != m.CurrentWorkspace || isScratch(w) {
+			continue
+		}
+		lw := LayoutWindow{
+			X: w.X, Y: w.Y,
+			Width: w.Width, Height: w.Height,
+			Title:      w.Title(),
+			CustomName: w.CustomName,
+			Minimized:  w.Minimized,
+		}
+
+		// Where the pane is, so loading the template puts it back there.
+		//
+		// Through the platform's own reader rather than straight at /proc: this
+		// read was Linux-only, so every layout saved on macOS recorded no
+		// directory at all and every window it restored opened wherever the
+		// daemon happened to be.
+		if w.Terminal != nil {
+			lw.WorkingDir = layoutPaneDir(w)
+		}
+
+		tmpl.Windows = append(tmpl.Windows, lw)
+	}
+
+	data, err := json.MarshalIndent(tmpl, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+	return os.WriteFile(templateFilePath(name), data, 0600)
+}
+
+// LoadLayoutTemplates reads all templates from the layouts directory.
+func LoadLayoutTemplates() ([]LayoutTemplate, error) {
+	dir := GetTemplatesDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var templates []LayoutTemplate
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		// #nosec G304
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		var tmpl LayoutTemplate
+		if err := json.Unmarshal(data, &tmpl); err != nil {
+			continue
+		}
+		templates = append(templates, tmpl)
+	}
+	return templates, nil
+}
+
+// ApplyLayoutTemplate recreates a workspace from a template.
+func ApplyLayoutTemplate(tmpl LayoutTemplate, m *OS) {
+	if m.InScratchView() {
+		m.ShowNotification(errLayoutInScratch.Error(), "warning", m.Settings.NotificationDuration)
+		return
+	}
+	// Collect existing windows in current workspace (reuse them instead of killing)
+	var existingWindows []*terminal.Window
+	for _, w := range m.Windows {
+		// The scratch terminal keeps its popup. It never fills a slot.
+		if w.Workspace == m.CurrentWorkspace && !w.Minimized && !isScratch(w) {
+			existingWindows = append(existingWindows, w)
+		}
+	}
+
+	// Count non-minimized template slots
+	var templateSlots []LayoutWindow
+	for _, tw := range tmpl.Windows {
+		if !tw.Minimized {
+			templateSlots = append(templateSlots, tw)
+		}
+	}
+
+	// Disable auto-tiling during layout to prevent retiling
+	m.AutoTiling = false
+
+	// Scale factor for different screen sizes
+	scaleX, scaleY := 1.0, 1.0
+	if tmpl.ScreenWidth > 0 && tmpl.ScreenHeight > 0 {
+		scaleX = float64(m.GetRenderWidth()) / float64(tmpl.ScreenWidth)
+		scaleY = float64(m.GetRenderHeight()) / float64(tmpl.ScreenHeight)
+	}
+
+	// Panes whose folder tuios would not type a cd for. See cdLine.
+	refused := 0
+
+	// Assign existing windows to template slots
+	for i, tw := range templateSlots {
+		var win *terminal.Window
+		dir := layoutLoadDir(tw.WorkingDir)
+		if i < len(existingWindows) {
+			// Reuse existing window
+			win = existingWindows[i]
+			// An existing pane is moved with a typed cd, and only when tuios
+			// can see that its shell is at a prompt: into an editor or an agent
+			// the line would be keys or a prompt. A pane it cannot see into (a
+			// daemon pane, or a platform that does not say) stays where it is.
+			if dir != "" {
+				_, ok := cdLine(dir)
+				_, idle := paneBusyReason(win)
+				switch {
+				case !ok:
+					refused++
+				case idle:
+					m.cdAtPrompt(win, dir, true, "")
+				}
+			}
+		} else {
+			// Need more windows than we have, so create new ones.
+			title := tw.CustomName
+			if title == "" {
+				title = tw.Title
+			}
+			before := len(m.Windows)
+			// A new pane starts in the directory, so nothing is typed.
+			m.AddWindowIn(dir, title)
+			// In a daemon session the window does not exist yet: the daemon is
+			// creating it and will push it back. Only take the new window when
+			// one actually appeared, or this would grab the last existing window
+			// and move it to the template slot meant for a window that is not
+			// here yet.
+			if len(m.Windows) > before {
+				win = m.Windows[len(m.Windows)-1]
+			}
+		}
+		if win == nil {
+			continue
+		}
+
+		// Apply scaled positions
+		win.X = int(float64(tw.X) * scaleX)
+		win.Y = int(float64(tw.Y) * scaleY)
+		win.Resize(
+			max(int(float64(tw.Width)*scaleX), 10),
+			max(int(float64(tw.Height)*scaleY), 5),
+		)
+		win.Minimized = false
+
+		if tw.CustomName != "" {
+			win.CustomName = tw.CustomName
+		}
+
+		// If template specifies a startup command, run it (only for newly created windows)
+		if i >= len(existingWindows) && tw.Command != "" {
+			cmd := tw.Command
+			if len(tw.Args) > 0 {
+				cmd += " " + strings.Join(tw.Args, " ")
+			}
+			if win.Pty != nil {
+				_, _ = win.Pty.Write([]byte(cmd + "\n"))
+			} else if win.DaemonWriteFunc != nil {
+				_ = win.DaemonWriteFunc([]byte(cmd + "\n"))
+			}
+		}
+
+		win.InvalidateCache()
+	}
+
+	if refused > 0 {
+		m.ShowNotification(cdRefusedMessage, "warning", m.Settings.NotificationDuration)
+	}
+
+	// If we have MORE existing windows than template slots, minimize the extras
+	for i := len(templateSlots); i < len(existingWindows); i++ {
+		existingWindows[i].Minimized = true
+	}
+
+	// Restore tiling configuration
+	m.AutoTiling = tmpl.AutoTiling
+	if tmpl.MasterRatio > 0 {
+		m.MasterRatio = tmpl.MasterRatio
+	}
+
+	// If tiled, rebuild BSP tree from the loaded window positions
+	// instead of retiling (which would override the loaded layout)
+	if m.AutoTiling {
+		if m.UseScrollingLayout {
+			m.TileAllWindows()
+		} else {
+			if tmpl.TilingScheme != "" {
+				if tree := m.GetOrCreateBSPTree(); tree != nil {
+					tree.AutoScheme = layout.ParseAutoScheme(tmpl.TilingScheme)
+				}
+			}
+			m.RebuildBSPTreeFromPositions()
+		}
+	} else {
+		// Always clamp windows after loading, to handle resolution differences.
+		m.ClampWindowsToView()
+	}
+
+	if len(m.Windows) > 0 {
+		m.FocusWindow(0)
+	}
+
+	m.MarkAllDirty()
+}
+
+// DeleteLayoutTemplate removes a template file.
+func DeleteLayoutTemplate(name string) error {
+	err := os.Remove(templateFilePath(name))
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// FilterLayoutTemplates filters by name substring.
+func FilterLayoutTemplates(templates []LayoutTemplate, query string) []LayoutTemplate {
+	if query == "" {
+		return templates
+	}
+	q := strings.ToLower(query)
+	var filtered []LayoutTemplate
+	for _, tmpl := range templates {
+		if strings.Contains(strings.ToLower(tmpl.Name), q) {
+			filtered = append(filtered, tmpl)
+		}
+	}
+	return filtered
+}
+
+// GenerateTapeScript converts a layout template to a tape script that
+// recreates the layout. This enables layout templates to be shared,
+// version-controlled, and executed in CI/headless environments.
+func GenerateTapeScript(tmpl LayoutTemplate) string {
+	var sb strings.Builder
+	sb.WriteString("# Auto-generated layout script: " + tmpl.Name + "\n")
+	sb.WriteString("# Created: " + tmpl.CreatedAt.Format(time.RFC3339) + "\n\n")
+
+	if tmpl.AutoTiling {
+		sb.WriteString("EnableTiling\n")
+	} else {
+		sb.WriteString("DisableTiling\n")
+	}
+
+	for i, w := range tmpl.Windows {
+		if i > 0 {
+			sb.WriteString("NewWindow\n")
+		}
+		if w.CustomName != "" {
+			// Quoted, because a name may hold spaces and the tape lexer splits an
+			// unquoted argument on them: an unquoted "my project" replayed as "my".
+			fmt.Fprintf(&sb, "RenameWindow %q\n", w.CustomName)
+		}
+		if dir := layoutLoadDir(w.WorkingDir); dir != "" {
+			if line, ok := cdLine(dir); ok {
+				// Quoted twice: for the shell that runs the cd, then for the
+				// tape lexer that reads the Type line.
+				fmt.Fprintf(&sb, "Type %q\nEnter\n", line)
+			} else {
+				sb.WriteString("# No cd: the folder name holds a quote, a backslash or a control character.\n")
+			}
+		}
+		if w.Command != "" {
+			cmd := w.Command
+			if len(w.Args) > 0 {
+				cmd += " " + strings.Join(w.Args, " ")
+			}
+			// Quoted: Type takes a string, and an unquoted command line did
+			// not parse, so an exported layout with a command never played.
+			fmt.Fprintf(&sb, "Run %q\n", cmd)
+		}
+		sb.WriteString("Sleep 200ms\n")
+	}
+
+	return sb.String()
+}
+
+// layoutPaneDir is the directory a saved layout records for a pane.
+//
+// It is the directory the kernel reports for the pane's shell. The pane's
+// OSC 7 announcement is any text a program printed, and where the kernel
+// cannot be asked (no shell pid, a pane on another machine, a platform with
+// no answer) nothing checks it, so no directory is recorded at all.
+func layoutPaneDir(w *terminal.Window) string {
+	if w.ShellPgid <= 0 {
+		return ""
+	}
+	dir, _ := terminal.ShellCWD(w.ShellPgid)
+	return dir
+}
+
+// layoutLoadDir is the directory a layout entry may move a pane to, or "".
+// A template is a file anyone can edit, and an older tuios saved whatever a
+// pane announced, so the path is checked again when it is used: it must be
+// absolute and hold no control characters.
+func layoutLoadDir(dir string) string {
+	if dir == "" || !filepath.IsAbs(dir) {
+		return ""
+	}
+	if strings.ContainsFunc(dir, func(r rune) bool { return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) }) {
+		return ""
+	}
+	return dir
+}
+
+// errLayoutInScratch refuses a layout save or load inside a scratch group.
+var errLayoutInScratch = errors.New("hide the scratch terminal first. A layout belongs to a workspace")

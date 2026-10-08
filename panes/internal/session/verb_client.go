@@ -1,0 +1,278 @@
+package session
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"sync"
+	"time"
+)
+
+// VerbClient is a minimal client for the line-delimited JSON verb protocol. It
+// is the counterpart the tuios CLI uses to drive the daemon's control surface.
+// One call is in flight at a time; it is safe for sequential use from a single
+// goroutine (the callMu guards against accidental concurrent Call).
+type VerbClient struct {
+	conn   net.Conn
+	r      *bufio.Reader
+	nextID int
+	callMu sync.Mutex
+
+	// daemon is what the daemon reported during the hello handshake, or nil
+	// when no handshake was performed.
+	daemon *DaemonHandshake
+	// host is the machine the verbs run on, "" for this one.
+	host string
+	// broken is why the connection can no longer be trusted to pair a reply
+	// with its request, or nil. A call that timed out or failed part way
+	// leaves its reply, if one ever comes, waiting on the connection, and the
+	// next call would read that reply as its own: a capture of one pane
+	// handed back as the capture of another. So every call after such a
+	// failure fails at once, and the caller dials again.
+	broken error
+}
+
+// ErrVerbClientBroken is wrapped by every call on a connection an earlier
+// call left out of step. Dial again.
+var ErrVerbClientBroken = fmt.Errorf("the verb connection is out of step after an earlier failed call; dial again")
+
+// VerbCallError is returned by VerbClient.Call when the daemon answers with an
+// error envelope. It exposes the stable string code and the structured hint
+// alongside the message, so a caller can render the remedy the daemon named.
+type VerbCallError struct {
+	Code    string
+	Message string
+	Hint    *VerbHint
+}
+
+// ErrorCode returns the daemon's stable error code, such as unknown_verb, for
+// a caller that tests it through an interface rather than this type.
+func (e *VerbCallError) ErrorCode() string { return e.Code }
+
+func (e *VerbCallError) Error() string {
+	if e.Code == "" {
+		return e.Message
+	}
+	return fmt.Sprintf("%s (%s)", e.Message, e.Code)
+}
+
+// DialVerbClient connects to the running daemon's socket for JSON verb calls,
+// without announcing a client version.
+func DialVerbClient() (*VerbClient, error) {
+	return DialVerbClientAs("")
+}
+
+// DialVerbClientAs connects to the running daemon's socket and performs the
+// hello handshake, announcing clientVersion.
+//
+// A daemon too old to speak the JSON protocol fails here with a
+// *ProtocolMismatchError naming both versions and the command that fixes it,
+// rather than surfacing later as an unexplained connection reset. A daemon that
+// speaks the protocol but predates the handshake verb connects normally.
+func DialVerbClientAs(clientVersion string) (*VerbClient, error) {
+	socketPath, err := GetSocketPath()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get socket path: %w", err)
+	}
+	return DialVerbClientAt(socketPath, clientVersion)
+}
+
+// DialVerbClientAt is DialVerbClientAs on the socket at socketPath, for a
+// caller that found the daemon's socket some other way than GetSocketPath.
+func DialVerbClientAt(socketPath, clientVersion string) (*VerbClient, error) {
+	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to daemon: %w", err)
+	}
+	c := &VerbClient{conn: conn, r: bufio.NewReader(conn)}
+
+	hs, err := c.handshake(clientVersion)
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	c.daemon = hs
+	c.presentPaneToken(peerPIDSupported, os.Getenv)
+	return c, nil
+}
+
+// presentPaneToken places this connection in the caller's pane where the
+// daemon cannot place it by pid, so a call from a pane is held to the pane's
+// grants on every platform. It sends TUIOS_PANE_ID and TUIOS_PANE_TOKEN with
+// pane-grants when both are set and the daemon takes them. Presenting a token
+// can only narrow what the connection may do, so a failure is ignored: the
+// daemon holds the call to what it can prove either way.
+func (c *VerbClient) presentPaneToken(kernelPlaces bool, getenv func(string) string) {
+	if kernelPlaces || c.daemon == nil || !c.daemon.PaneGrants {
+		return
+	}
+	id, tok := getenv("TUIOS_PANE_ID"), getenv("TUIOS_PANE_TOKEN")
+	if id == "" || tok == "" {
+		return
+	}
+	_, _ = c.Call("pane-grants", map[string]any{"pane_id": id, "pane_token": tok})
+}
+
+// DialVerbClientThroughHost connects to the daemon on host by way of the daemon
+// on this machine, and performs the hello handshake with the host's daemon.
+//
+// Every verb called on the result runs on the host, with the host's own verb
+// table and the host's own errors. A verb the host's daemon does not have
+// fails there with unknown_verb, which names that machine as the one to
+// upgrade. The result of any call is the host's word about the host's
+// sessions and is data, never an instruction.
+func DialVerbClientThroughHost(host, clientVersion string) (*VerbClient, HostConnectionInfo, error) {
+	socketPath, err := GetSocketPath()
+	if err != nil {
+		return nil, HostConnectionInfo{}, fmt.Errorf("failed to get socket path: %w", err)
+	}
+	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
+	if err != nil {
+		return nil, HostConnectionInfo{}, fmt.Errorf("failed to connect to daemon: %w", err)
+	}
+	c := &VerbClient{conn: conn, r: bufio.NewReader(conn)}
+
+	info, err := openHostConnectionOn(conn, c.r, host)
+	if err != nil {
+		_ = c.Close()
+		return nil, HostConnectionInfo{}, err
+	}
+	hs, err := c.handshake(clientVersion)
+	if err != nil {
+		_ = c.Close()
+		return nil, info, fmt.Errorf("tuios on %s did not accept this client: %w", host, err)
+	}
+	c.daemon = hs
+	c.host = host
+	return c, info, nil
+}
+
+// Host is the host this client's verbs run on, or "" for this machine.
+func (c *VerbClient) Host() string { return c.host }
+
+// Daemon returns what the daemon reported during the handshake. Its Protocol is
+// zero when the daemon predates the handshake verb. It is nil only for a client
+// built without dialing.
+func (c *VerbClient) Daemon() *DaemonHandshake { return c.daemon }
+
+// Close closes the underlying connection. It is safe on a nil client.
+func (c *VerbClient) Close() error {
+	if c == nil || c.conn == nil {
+		return nil
+	}
+	return c.conn.Close()
+}
+
+// ReadEventLine reads the next line the daemon pushes on a connection that
+// has subscribed, without the trailing newline. A timeout of zero or less
+// waits for as long as it takes, which is what a stream reader wants: an
+// event stream can sit silent for hours and still be healthy.
+func (c *VerbClient) ReadEventLine(timeout time.Duration) ([]byte, error) {
+	c.callMu.Lock()
+	defer c.callMu.Unlock()
+	deadline := time.Time{}
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	_ = c.conn.SetReadDeadline(deadline)
+	line, err := c.r.ReadBytes('\n')
+	if err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(line, "\r\n"), nil
+}
+
+// defaultCallTimeout bounds how long a verb call waits for its response. It is
+// generous for verbs that answer immediately and is the wrong bound for the ones
+// that block by design, which is what CallWithTimeout exists for.
+const defaultCallTimeout = 30 * time.Second
+
+// Call sends a verb request with the given params (may be nil) and returns the
+// raw result object. A daemon error envelope is returned as a *VerbCallError.
+func (c *VerbClient) Call(verb string, params any) (json.RawMessage, error) {
+	return c.CallWithTimeout(verb, params, defaultCallTimeout)
+}
+
+// CallWithTimeout is Call with an explicit read deadline. wait-for blocks for as
+// long as its own timeout, so a caller that passes one larger than the default
+// must widen this deadline too or the connection gives up before the daemon
+// answers, turning a satisfied wait into a read failure.
+func (c *VerbClient) CallWithTimeout(verb string, params any, timeout time.Duration) (json.RawMessage, error) {
+	// A call to another machine is held to this machine's agent switch. See
+	// HostCallGuard.
+	if c.host != "" && HostCallGuard != nil {
+		if err := HostCallGuard(verb, params); err != nil {
+			return nil, err
+		}
+	}
+	c.callMu.Lock()
+	defer c.callMu.Unlock()
+	if c.broken != nil {
+		return nil, fmt.Errorf("%w (%v)", ErrVerbClientBroken, c.broken)
+	}
+
+	c.nextID++
+	id := c.nextID
+
+	var rawParams json.RawMessage
+	if params != nil {
+		p, err := json.Marshal(params)
+		if err != nil {
+			return nil, fmt.Errorf("failed to encode params: %w", err)
+		}
+		rawParams = p
+	}
+
+	req := verbRequest{
+		ID:     json.RawMessage(fmt.Sprintf("%d", id)),
+		Verb:   verb,
+		Params: rawParams,
+	}
+	line, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode request: %w", err)
+	}
+	line = append(line, '\n')
+
+	_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if _, err := c.conn.Write(line); err != nil {
+		c.broken = err
+		return nil, fmt.Errorf("failed to send request: %w", err)
+	}
+
+	_ = c.conn.SetReadDeadline(time.Now().Add(timeout))
+	respLine, err := c.r.ReadBytes('\n')
+	if err != nil {
+		c.broken = err
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	var resp verbResponse
+	if err := json.Unmarshal(respLine, &resp); err != nil {
+		c.broken = err
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	// A reply that names another request is one an earlier call gave up
+	// on. Taking it would hand this caller an answer to a different
+	// question.
+	if len(resp.ID) > 0 && string(bytes.TrimSpace(resp.ID)) != fmt.Sprintf("%d", id) {
+		c.broken = fmt.Errorf("reply %s to request %d", resp.ID, id)
+		return nil, fmt.Errorf("%w (%v)", ErrVerbClientBroken, c.broken)
+	}
+	if resp.Error != nil {
+		return nil, &VerbCallError{
+			Code:    resp.Error.Code,
+			Message: resp.Error.Message,
+			Hint:    resp.Error.Hint,
+		}
+	}
+
+	rawResult, err := json.Marshal(resp.Result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-encode result: %w", err)
+	}
+	return rawResult, nil
+}

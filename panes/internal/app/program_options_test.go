@@ -1,0 +1,245 @@
+package app
+
+import (
+	"fmt"
+	"go/ast"
+	"strings"
+	"testing"
+
+	tea "charm.land/bubbletea/v2"
+
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+)
+
+// TestEveryProgramTakesTheSharedOptions holds every tea.NewProgram in the
+// module to ProgramOptions. Both sides come from the source: the construction
+// sites are every call to tea.NewProgram, and the options a site may add on
+// its own are the ones that differ by transport, which is the output writer.
+//
+// Three things are checked at each site:
+//
+//   - The function that calls tea.NewProgram calls ProgramOptions. A site that
+//     types its own list is the bug this exists for: the motion filter shipped
+//     on the local client only, and a served client composed a frame for every
+//     pointer move.
+//   - No tea.With* option outside ProgramOptions itself except WithOutput.
+//   - Where a transport's MakeOptions is used, it comes before ProgramOptions.
+//     WithFilter is a single slot and the last one set wins, and both wish and
+//     sip set one.
+func TestEveryProgramTakesTheSharedOptions(t *testing.T) {
+	fset, files := moduleSource(t)
+
+	sites := 0
+	for path, file := range files {
+		forEachFuncBody(file, func(fn string, body *ast.BlockStmt) {
+			var newProgram, shared, makeOpts *ast.CallExpr
+			for _, call := range directCalls(body) {
+				pkg, name, ok := selectorCall(call)
+				if !ok {
+					if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "ProgramOptions" {
+						shared = call
+					}
+					continue
+				}
+				switch {
+				case pkg == "tea" && name == "NewProgram":
+					newProgram = call
+				case name == "ProgramOptions":
+					shared = call
+				case name == "MakeOptions":
+					makeOpts = call
+				}
+			}
+			if newProgram == nil {
+				return
+			}
+			// The explorers behind tuios help -i, config browse and keybinds
+			// browse are not clients. They draw no panes, run their own small
+			// model, and keep Bubble Tea's signal handler, so a kill still
+			// gives the terminal back. ProgramOptions removes that handler,
+			// because a client's command owns its signals.
+			if path == "internal/explore/explore.go" {
+				return
+			}
+			sites++
+			where := fmt.Sprintf("%s:%d", path, fset.Position(newProgram.Pos()).Line)
+			if shared == nil {
+				t.Errorf("%s: tea.NewProgram in %s does not take app.ProgramOptions(); an option added there is missing here", where, fn)
+				return
+			}
+			if makeOpts != nil && makeOpts.Pos() > shared.Pos() {
+				t.Errorf("%s: MakeOptions comes after ProgramOptions in %s; its WithFilter replaces the motion filter", where, fn)
+			}
+		})
+
+		if path == "internal/app/program_options.go" {
+			continue
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			pkg, name, ok := selectorCall(call)
+			if !ok || pkg != "tea" || !strings.HasPrefix(name, "With") {
+				return true
+			}
+			if name == "WithOutput" {
+				return true
+			}
+			// The browser build is its own transport, with no sip or wish
+			// to supply the input and size, and it runs a wrapper model the
+			// shared filter does not recognise, so it installs one that
+			// unwraps and calls FilterMouseMotion.
+			if path == "cmd/tuios-wasm/main_js.go" &&
+				(name == "WithInput" || name == "WithWindowSize" || name == "WithFilter") {
+				return true
+			}
+			t.Errorf("%s:%d: tea.%s set outside ProgramOptions; the other clients do not get it",
+				path, fset.Position(call.Pos()).Line, name)
+			return true
+		})
+	}
+	if sites < 5 {
+		t.Fatalf("found %d tea.NewProgram sites, expected the local, attach, tape, SSH and web ones", sites)
+	}
+}
+
+// TestRemoteClientCannotBeSuspended pins what the filter took over from wish
+// and sip when it replaced theirs: a served client has nothing to suspend, so
+// a SuspendMsg comes back as a ResumeMsg. A local client keeps its suspend.
+func TestRemoteClientCannotBeSuspended(t *testing.T) {
+	o := filterOS(t)
+	o.RemoteClient = true
+	if _, ok := FilterMouseMotion(o, tea.SuspendMsg{}).(tea.ResumeMsg); !ok {
+		t.Error("a remote client's SuspendMsg was passed through; the transport's filter used to turn it into a resume")
+	}
+	o.RemoteClient = false
+	if _, ok := FilterMouseMotion(o, tea.SuspendMsg{}).(tea.SuspendMsg); !ok {
+		t.Error("a local client's SuspendMsg was rewritten; ctrl+z must still suspend it")
+	}
+}
+
+// TestMotionFilterFollowsTheBeam gives follow = "mouse" its own clause. The
+// beam reads the pointer off LastMouseX/Y, which only a motion that reached
+// Update sets, and it used to ride the link clause, so it stopped following over
+// chrome and with links off.
+func TestMotionFilterFollowsTheBeam(t *testing.T) {
+	o := filterOS(t)
+	o.UserConfig.Appearance.Links = "off"
+	o.UserConfig.Spotlight.Follow = config.SpotlightFollowMouse
+	// A pane's border: chrome, not pane content, so no other clause claims it.
+	// (The dock band has a clause of its own now, for its controls' hover.)
+	overChrome := tea.MouseMotionMsg{X: 31, Y: 10}
+
+	if FilterMouseMotion(o, overChrome) != nil {
+		t.Fatal("motion over chrome passed with the beam off; the CPU guard is gone")
+	}
+	o.SetSpotlight(true)
+	if FilterMouseMotion(o, overChrome) == nil {
+		t.Error("motion over chrome was dropped with follow = mouse; the beam cannot follow")
+	}
+	o.LastMouseX, o.LastMouseY = overChrome.X, overChrome.Y
+	if FilterMouseMotion(o, overChrome) != nil {
+		t.Error("a motion inside the beam's current cell passed; it composes the same frame")
+	}
+}
+
+// sweepOS is a served client with four tiled panes, the shape a pointer sweep
+// meets on a remote desktop.
+func sweepOS(tb testing.TB) *OS {
+	tb.Helper()
+	cfg := config.DefaultConfig()
+	o := NewOS(OSOptions{Client: ClientSSH, UserConfig: cfg, KeybindRegistry: config.NewKeybindRegistry(cfg)})
+	o.Width, o.Height = 120, 40
+	o.EffectiveWidth, o.EffectiveHeight = 120, 40
+	for i := range 4 {
+		o.Windows = append(o.Windows, &terminal.Window{
+			ID: fmt.Sprintf("pane-%d", i), X: (i % 2) * 60, Y: (i / 2) * 19, Width: 60, Height: 19, Workspace: 1,
+		})
+	}
+	o.CurrentWorkspace, o.FocusedWindow = 1, 0
+	return o
+}
+
+// BenchmarkPointerSweep is what the motion filter saves a served client, per
+// motion event, measured rather than asserted. "unfiltered" is what the SSH
+// and web servers did: every event reached Update and the renderer composed
+// the frame after it. "filtered" is the shared list. The two rows are the two
+// things a pointer crosses: chrome, which no clause claims, and pane content,
+// which the link clause passes once per cell so links can underline.
+func BenchmarkPointerSweep(b *testing.B) {
+	rows := []struct {
+		name string
+		y    int
+	}{
+		{"chrome", 39},
+		{"content", 5},
+	}
+	for _, row := range rows {
+		for _, filtered := range []bool{false, true} {
+			name := row.name + "/unfiltered"
+			if filtered {
+				name = row.name + "/filtered"
+			}
+			b.Run(name, func(b *testing.B) {
+				o := sweepOS(b)
+				frames := 0
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := range b.N {
+					var msg tea.Msg = tea.MouseMotionMsg{X: i % 120, Y: row.y}
+					if filtered {
+						msg = FilterMouseMotion(o, msg)
+					}
+					if msg == nil {
+						continue
+					}
+					o.Update(msg)
+					o.View()
+					frames++
+				}
+				b.ReportMetric(float64(frames)/float64(b.N), "frames/event")
+			})
+		}
+	}
+}
+
+// TestPointerSweepOverTheDockPassesOnlyItsTargets is BenchmarkPointerSweep's
+// chrome row held as an assertion. A pointer swept along the dock passes the
+// filter when it reaches or leaves a control or a clipped pill, and not for
+// the cells of bare bar between, each of which composed a whole frame
+// identical to the last: one frame per cell crossed, on every served client.
+//
+// Negative control: passing every motion over the dock band again, as the
+// filter did before dockHoverChangesAt, fails this with one pass per cell.
+func TestPointerSweepOverTheDockPassesOnlyItsTargets(t *testing.T) {
+	o := sweepOS(t)
+	o.View()
+	const row = 39
+	if !o.InDockBand(row) {
+		t.Fatalf("setup: row %d is not the dock band", row)
+	}
+	targets := len(o.dockSessionHits)
+	for _, h := range o.dockWorkspaceHits {
+		if h.Workspace > 0 && o.workspacePillClipped(h.Workspace) {
+			targets++
+		}
+	}
+	passed := 0
+	for x := range o.Width {
+		msg := FilterMouseMotion(o, tea.MouseMotionMsg{X: x, Y: row})
+		if msg == nil {
+			continue
+		}
+		passed++
+		o.Update(msg)
+		o.View()
+	}
+	// Onto and off each target, and the one motion that leaves the last.
+	if limit := 2*targets + 1; passed > limit {
+		t.Errorf("a sweep across %d dock cells passed %d motions; %d targets allow at most %d",
+			o.Width, passed, targets, limit)
+	}
+}

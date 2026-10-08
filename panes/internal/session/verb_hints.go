@@ -1,0 +1,371 @@
+package session
+
+import (
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+)
+
+// This file carries the machine-readable remedy surface of the verb protocol.
+//
+// Every error envelope may carry a "hint" object alongside its stable code and
+// human message. The hint names the thing that resolves the failure: the verb to
+// call, the CLI command to run, the parameter that was wrong and what it
+// accepts, the closest spelling to what the caller asked for, and the set of
+// values that do exist. All fields are omitempty, so an existing consumer that
+// only reads code and message is unaffected.
+
+// The closed value sets the protocol accepts. They are the single source of
+// truth for both the list-verbs parameter schema and the "accepted" field on an
+// invalid_params hint, so the two can never drift apart.
+var (
+	// captureSources are the buffers capture-pane can read. last-command-output
+	// is what the last finished command printed, read between its OSC 133
+	// marks (shell_commands.go).
+	captureSources = []string{"visible", "recent", captureLastCommand}
+	// waitOutputSources are the buffers wait-for window-output matches
+	// against. last-command-output is not one: a wait for a command to finish
+	// is command-finished.
+	waitOutputSources = []string{"visible", "recent"}
+	// screenshotFormats and screenshotFrames are the screenshot verb's closed
+	// sets. They are the config registry's own lists rather than copies, so a
+	// format added to one place cannot be missing from the other.
+	screenshotFormats = config.ScreenshotFormats
+	screenshotFrames  = config.ScreenshotFrames
+	// retiredCaptureSources maps a capture source that was once accepted to the
+	// reason it no longer is, so the rejection can say what happened rather than
+	// only listing what is allowed. "recent-unwrapped" was documented as reserved
+	// and behaved as a silent alias for "recent"; the emulator does not record
+	// which rows are soft wrapped (the scrollback wrap flag is written as a
+	// constant and the live screen carries none), so unwrapping cannot be
+	// implemented without guessing at row boundaries.
+	// WaitConditionNames are the conditions wait-for understands. It is exported
+	// so the CLI offers exactly this set and cannot drift from the daemon's.
+	WaitConditionNames = []string{"session-exists", "window-output", "window-exit", "window-idle", "agent-state", "agent-message", waitCommandFinished}
+
+	retiredCaptureSources = map[string]string{
+		"recent-unwrapped": "unwrapped capture is not implemented. It returned the same physical rows as \"recent\" without unwrapping them",
+	}
+	// waitConditions are the conditions wait-for understands.
+	waitConditions = WaitConditionNames
+	// EventTypeNames are the event types a subscribe filter can name. It is
+	// exported so the CLI completes exactly this set.
+	EventTypeNames = []string{
+		EventWindowCreated, EventWindowClosed, EventWindowExit, EventWindowRetitled,
+		EventWindowFocused, EventWindowMoved, EventWindowMinimized, EventWindowRestored,
+		EventWorkspaceSwitched, EventWorkspaceRenamed, EventAgentState, EventAgentMessage,
+		EventOutput, EventBell, EventNotification, EventModeChanged,
+		EventSessionCreated, EventSessionClosed, EventClientSessionChanged, EventGap, EventAttention,
+		EventHostChanged, EventPrompt, EventCommandStarted, EventCommandFinished,
+		EventAgentActivity,
+	}
+	// knownEventTypes are the event types a subscribe filter can name.
+	knownEventTypes = EventTypeNames
+)
+
+// errorCodeCatalog documents every stable error code for the list-verbs result,
+// so an agent can learn the failure vocabulary without reading the docs. Keep it
+// in sync with the ErrVerb* constants.
+var errorCodeCatalog = []struct {
+	Code        string `json:"code"`
+	Description string `json:"description"`
+}{
+	{ErrVerbInvalidRequest, "The line was not a valid request envelope, or the connection is in the wrong state for the verb."},
+	{ErrVerbUnknownVerb, "No such verb. The hint carries the closest match and the full verb list."},
+	{ErrVerbInvalidParams, "A parameter was missing, malformed, or outside its accepted set. The hint names the parameter."},
+	{ErrVerbSessionNotFound, "The named session does not exist. The hint lists the sessions that do."},
+	{ErrVerbSessionExists, "new-session was given a name the daemon already holds. Choose another name or omit it to have one generated."},
+	{ErrVerbWindowNotFound, "The window target did not resolve. The hint lists the addressable windows."},
+	{ErrVerbNoWindows, "The session exists but holds no windows to act on."},
+	{ErrVerbPTYNotFound, "The target window has no live PTY. Its shell has already exited."},
+	{ErrVerbNeedsClient, "The verb needs an attached client to render it, and none is attached."},
+	{ErrVerbOptionNotFound, "No option by that path exists. The hint carries the closest match and the full path list. list-options describes them."},
+	{ErrVerbCommandFailed, "The verb was routed to the attached client and came back failed."},
+	{ErrVerbTimeout, "A wait-for condition did not match before its timeout elapsed."},
+	{ErrVerbNotReady, "The target agent was mid-turn, so the call declined to type at it. Wait for it, leave a message instead, or force it. resume-agent raises it for a pane whose shell is not at its prompt."},
+	{ErrVerbAgentBlocked, "The target agent is on needs_input, waiting on an approval or a question, and text typed now would answer it. Nothing was typed. Read the prompt with capture-pane, then answer it yourself or ask the person. allow_blocked overrides it."},
+	{ErrVerbLoopRefused, "The call was refused because it would loop: a pane addressing itself, or an ask that closes a cycle with one in flight."},
+	{ErrVerbRateLimited, "The sender is over the cross-agent message rate cap."},
+	{ErrVerbPromptStalled, "The prompt was pasted and Enter was sent, and within the stall window the pane did not turn working or needs_input, or, for an agent that cannot show working, print anything. The text was typed. Look at the pane with capture-pane before doing anything else: if the prompt sits in the input box, press Enter there with send-keys; if the agent is still starting, wait for it and ask again. Sending the prompt again without looking can type it twice."},
+	{ErrVerbForbidden, "The caller may not do what it asked. A process inside a pane of this daemon cannot send or ask as human, because only the person at an attached client can. Nothing was done. Send as your own pane instead, and ask the person with send-agent-message -w human."},
+	{ErrVerbNotHuman, "Only the person at an attached client may make this call, and it carried no nonce from a live attach. dismiss-attention, respond and reply-approval raise it."},
+	{ErrVerbPromptChanged, "respond pressed nothing: the pane is not on needs_input, no rule reads its prompt now, the prompt is not the one prompt_id names, or another client already answered it. Read it again with peek-prompt."},
+	{ErrVerbNotResumable, "resume-agent found no conversation it can resume in the pane: none was recorded by a hook, the harness has no resume command, the recorded id is not one plain shell token, or the pane runs on another machine. Nothing was typed."},
+	{ErrVerbConfirmRequired, "A write addressed by selector, or a ship-push or ship-pr, was not sent, because it carried no confirm token or the token names something other than what would be sent now. Nothing was sent. The hint lists the panes the selector matches, or what the push would send, and carries the token in confirm: check the list, then call again with that token."},
+	{ErrVerbNoKeyboard, "The target is the person's inbox, human, which has no pane to type into. Leave a message with send-agent-message -w human and wait for the reply on your own inbox."},
+	{ErrVerbNoShellIntegration, "The pane's shell has not sent the OSC 133 marks that say where a command starts and ends, so the daemon cannot run a command in it and report its exit code, or say what the last command printed. Nothing was typed. Enable the shell's prompt integration, or use send-text and wait-for window-output."},
+	{ErrVerbNotAtPrompt, "run typed nothing because the pane's shell is not at its prompt: a command is running in it. The message names the command. Wait for it with wait-for command-finished, or run in another pane."},
+	{ErrVerbProtocolMismatch, "The caller's protocol version is outside the range this daemon accepts."},
+	{ErrVerbUnknownHost, "No host by that name is configured. The hint lists the hosts that are. A host name is matched exactly, so nothing is guessed."},
+	{ErrVerbHostUnreachable, "The host is configured and is not answering. Nothing was queued. Read the host's status with list-hosts."},
+	{ErrVerbHostRefused, "The host's link is up and cannot take another connection. Close one of the connections to it and try again."},
+	{ErrVerbUnknownPane, "This daemon is not running a pane with that id. The pane was real and is gone, so drop it rather than correct it."},
+	{ErrVerbNotWorktree, "The session is not in a git worktree, so there is nothing to remove or diff."},
+	{ErrVerbWorktreeDirty, "remove-worktree refused: the worktree holds uncommitted changes and neither stash nor force was passed. Nothing was removed."},
+	{ErrVerbGitFailed, "A git command failed. The message is git's own. The repository is as it was."},
+	{ErrVerbRepoNotFound, "No checkout on this machine has the origin repo_url names, and clone was not passed. Pass clone to clone it, repos_root to look somewhere else, or repo to name the directory."},
+	{ErrVerbNotRepo, "No git repository is under the pane or session named, so there is nothing to review. Nothing was read."},
+	{ErrVerbNothingToCommit, "ship-commit found no change in the work tree, so nothing was committed. ship-push and ship-pr raise it for a branch with no commit."},
+	{ErrVerbMergeConflict, "ship-merge stopped on conflicts and aborted the merge. The main checkout is as it was. The hint lists the conflicting files. Rebase the branch in the worktree, resolve them there, and merge again."},
+	{ErrVerbCheckoutDirty, "ship-merge refused: the main checkout has uncommitted changes, a merge or rebase in progress, or is not on the branch to merge into. Nothing was merged."},
+	{ErrVerbNoRemote, "ship-push or ship-pr found no remote to push to, or not the one named. Nothing was pushed. Add a remote, or name one with remote."},
+	{ErrVerbGhUnavailable, "ship-pr or ship-status needs the gh CLI, and it is not installed or not logged in. Nothing was pushed or opened. Install gh and run gh auth login."},
+	{ErrVerbNoCheckpoint, "The pane has no checkpoint by that number, or none at all. Nothing was read or changed. The hint lists the checkpoints it has. list-checkpoints lists them too."},
+	{ErrVerbNoNotes, "send-review found no unsent review notes for the pane, so nothing was sent. Add one with review-note first."},
+	{ErrVerbQueueFull, "The pane's delivery queue holds as many messages as [agents.queue] max allows. Nothing was queued. Wait for the agent to take one, or drop one with cancel-queued."},
+	{ErrVerbRiskUnacknowledged, "An allow for an approval that matches a risk rule was refused because risk_ack did not name exactly the rules it matched. Nothing was answered. Read the rules with get-approval, or answer in the pane."},
+	{ErrVerbAgentsDisabled, "The verb is an agent feature, and the agent features are off: [agents] enabled = false. Nothing was done. Set agents.enabled = true in the config to use it."},
+	{ErrVerbInternal, "Unexpected server-side failure."},
+}
+
+// VerbHint is the structured remedy attached to an error envelope. Every field
+// is optional; a hint is only attached when at least one field is meaningful.
+type VerbHint struct {
+	// Verb names the protocol verb that resolves or explains the failure, e.g.
+	// "list-verbs" for an unknown verb or "new-window" for an empty session.
+	Verb string `json:"verb,omitempty"`
+	// Command is the exact CLI invocation that resolves the failure, written so
+	// it can be copied and run as-is (placeholders are in <angle brackets>).
+	Command string `json:"command,omitempty"`
+	// Param names the offending parameter for invalid_params.
+	Param string `json:"param,omitempty"`
+	// Accepted lists the values Param will take, when that set is closed.
+	Accepted []string `json:"accepted,omitempty"`
+	// DidYouMean is the closest match to what the caller asked for, when one is
+	// close enough to be worth suggesting.
+	DidYouMean string `json:"did_you_mean,omitempty"`
+	// Available lists what does exist (session names, window ids, verb names),
+	// so an agent can pick a valid target without a second round trip.
+	Available []string `json:"available,omitempty"`
+	// Detail is one sentence of extra context that does not fit the fields
+	// above, such as why a wait-for timed out.
+	Detail string `json:"detail,omitempty"`
+	// Confirm is the token a selector write takes to go ahead, on a
+	// confirm_required error. It is the hash of the set Available lists: pass
+	// it back as confirm and the write goes to that set, or is refused again
+	// if the set changed. See selector.go.
+	Confirm string `json:"confirm,omitempty"`
+}
+
+// empty reports whether the hint carries nothing worth serializing.
+func (h *VerbHint) empty() bool {
+	return h == nil || (h.Verb == "" && h.Command == "" && h.Param == "" &&
+		len(h.Accepted) == 0 && h.DidYouMean == "" && len(h.Available) == 0 && h.Detail == "" && h.Confirm == "")
+}
+
+// hintedVerbError builds a *verbError carrying a hint. A hint with no populated
+// field is dropped so the envelope stays clean.
+func hintedVerbError(code, message string, hint *VerbHint) *verbError {
+	e := newVerbError(code, message)
+	if !hint.empty() {
+		e.Hint = hint
+	}
+	return e
+}
+
+// invalidParam builds an invalid_params error naming the offending parameter and
+// the values it accepts (accepted may be nil when the set is open).
+func invalidParam(param, message string, accepted ...string) *verbError {
+	return hintedVerbError(ErrVerbInvalidParams, message, &VerbHint{
+		Param:    param,
+		Accepted: accepted,
+		Verb:     "list-verbs",
+	})
+}
+
+// validateCaptureSource checks a capture-pane source against the accepted set.
+// An empty source is valid and means the default. A source that was once
+// accepted is rejected with the reason it went away, so a caller that was
+// relying on it learns why rather than only what to use instead.
+func validateCaptureSource(source string) *verbError {
+	if source == "" || slices.Contains(captureSources, source) {
+		return nil
+	}
+	msg := "unknown capture source " + strconv.Quote(source)
+	hint := &VerbHint{
+		Param:    "source",
+		Accepted: captureSources,
+		Verb:     "list-verbs",
+	}
+	if reason, retired := retiredCaptureSources[source]; retired {
+		// A retired value is a closed-set miss with history: name the successor
+		// directly instead of relying on edit distance, which would not connect
+		// "recent-unwrapped" to "recent".
+		hint.DidYouMean = "recent"
+		hint.Detail = reason
+	} else {
+		hint.DidYouMean = closestMatch(source, captureSources)
+	}
+	return hintedVerbError(ErrVerbInvalidParams, msg, hint)
+}
+
+// maxEchoedName bounds a caller-supplied name echoed back in an error message.
+// The request line cap is 16 MiB, so echoing the name verbatim let a client
+// amplify a small request into a large response. A name this long is already
+// far past anything the caller could have meant.
+const maxEchoedName = 128
+
+// echoName renders a caller-supplied name for an error message, truncating it
+// so the response stays proportional to the request. An empty name comes back
+// as "", so a message about it does not end in a blank.
+func echoName(name string) string {
+	if name == "" {
+		return `""`
+	}
+	if len(name) <= maxEchoedName {
+		return name
+	}
+	return name[:maxEchoedName] + "... (" + strconv.Itoa(len(name)) + " bytes)"
+}
+
+// ClosestMatch is closestMatch for the CLI, so a misspelled name gets the
+// same suggestion whether the daemon or the command line is the one refusing
+// it.
+func ClosestMatch(target string, candidates []string) string {
+	return closestMatch(target, candidates)
+}
+
+// closestMatch returns the candidate closest to target by edit distance, or ""
+// when nothing is close enough to suggest. The threshold scales with the length
+// of the target so short names do not match everything: a 3-character target
+// tolerates one edit, a 10-character target tolerates three.
+func closestMatch(target string, candidates []string) string {
+	if target == "" || len(candidates) == 0 {
+		return ""
+	}
+	// Scale the tolerance with the length of the target so a short name does not
+	// match everything, and cap it so two long but genuinely different names
+	// ("list-windows" and "close-window") are never suggested for each other.
+	limit := min(len(target)/4+1, 3)
+
+	// The Levenshtein distance between two strings is at least the difference in
+	// their lengths, so a candidate whose length is further than the tolerance
+	// can never win and is skipped before the O(n*m) comparison. Without this,
+	// the verb name from a socket client sizes the work: the request line cap is
+	// 16 MiB, and a name that long cost about five seconds of CPU per request,
+	// on the connection's own goroutine, for a suggestion that was always empty.
+	targetLen := utf8.RuneCountInString(target)
+
+	// A name that is a verb is not a typo. The caller failed for some other
+	// reason, and both "did you mean the thing you typed" and "did you mean
+	// this other verb" are noise on top of the real error.
+	//
+	// This used to skip the exact match and keep looking, which held only for
+	// as long as no other verb was within the tolerance of any real one.
+	// Adding pane-agent put a neighbour next to ask-agent and the hint started
+	// proposing it to callers who had spelled ask-agent correctly.
+	if slices.Contains(candidates, target) {
+		return ""
+	}
+
+	best := ""
+	bestDist := limit + 1
+	for _, c := range candidates {
+		if diff := targetLen - utf8.RuneCountInString(c); diff > limit || diff < -limit {
+			continue
+		}
+		d := editDistance(strings.ToLower(target), strings.ToLower(c))
+		if d < bestDist || (d == bestDist && c < best) {
+			bestDist = d
+			best = c
+		}
+	}
+	if bestDist > limit {
+		return ""
+	}
+	return best
+}
+
+// editDistance returns the Levenshtein distance between a and b using a single
+// rolling row, which is enough for the short identifiers compared here.
+func editDistance(a, b string) int {
+	ar := []rune(a)
+	br := []rune(b)
+	if len(ar) == 0 {
+		return len(br)
+	}
+	if len(br) == 0 {
+		return len(ar)
+	}
+
+	prev := make([]int, len(br)+1)
+	cur := make([]int, len(br)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+
+	for i := 1; i <= len(ar); i++ {
+		cur[0] = i
+		for j := 1; j <= len(br); j++ {
+			cost := 1
+			if ar[i-1] == br[j-1] {
+				cost = 0
+			}
+			cur[j] = min(cur[j-1]+1, prev[j]+1, prev[j-1]+cost)
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(br)]
+}
+
+// knownVerbNames returns every registered verb name in sorted order.
+func knownVerbNames() []string {
+	names := make([]string, 0, len(verbRegistry))
+	for name := range verbRegistry {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// sessionNames returns the names of every live session, sorted, for the
+// available list on a session_not_found hint.
+func (d *Daemon) sessionNames() []string {
+	infos := d.manager.ListSessions()
+	names := make([]string, 0, len(infos))
+	for _, info := range infos {
+		names = append(names, info.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// windowTargets returns the addressable identifiers of a session's windows (id
+// and display name for each), sorted, for a window_not_found hint. Ids and names
+// are both accepted by the window parameter, so both belong in the list.
+func windowTargets(state *SessionState) []string {
+	if state == nil {
+		return nil
+	}
+	targets := make([]string, 0, len(state.Windows)*2)
+	for _, w := range state.Windows {
+		if w.ID != "" {
+			targets = append(targets, w.ID)
+		}
+		name := w.CustomName
+		if name == "" {
+			name = w.Title
+		}
+		if name != "" && name != w.ID {
+			targets = append(targets, name)
+		}
+	}
+	sort.Strings(targets)
+	return targets
+}
+
+// VerbErrorCodes returns every stable error code in the protocol's catalogue,
+// in the order list-verbs publishes them. It is exported so a caller matching on
+// codes, and the skill's own test, can check against the set rather than a copy
+// of it that goes stale.
+func VerbErrorCodes() []string {
+	out := make([]string, 0, len(errorCodeCatalog))
+	for _, e := range errorCodeCatalog {
+		out = append(out, e.Code)
+	}
+	return out
+}

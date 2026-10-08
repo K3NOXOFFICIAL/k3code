@@ -1,0 +1,263 @@
+# VENDOR.toml - Vendored files from upstream projects
+# Each entry documents the source, license, and verification info.
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/retry_utils.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/providers/retry_utils.py"
+sha256_upstream = "c51c7fca5d9ce2bfd4cc5722a0f1a371a645d3839cd56646f372f9070c0f62f0"
+modified = false
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/error_classifier.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/router/classifier.py"
+sha256_upstream = "47385d2d2b37e3e0e18c1a1d281014de6e763f7b9c8c4c41aac70227da1eddd5"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/fallback_cooldown.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/router/cooldown.py"
+sha256_upstream = "ebcb372b5fd7ec9d5c8970f9521ff2fdcc2adca563b3d4b05b8e1a11c02ea00a"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "tools/fuzzy_match.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/tools/fuzzy_match.py"
+sha256_upstream = "fd66dc9008ca5eb059bbdb2ddc3f164cf77e96f620ae805abd3f97c8017a0987"
+modified = false
+
+# --- vendored directory trees ---
+[[tree]]
+project = "hermes-agent"
+upstream_path = "ui-tui"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "tui"
+
+[[tree]]
+project = "hermes-agent"
+upstream_path = "apps/shared/src"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "tui/shared"
+
+[[tree]]
+project = "tuios"
+upstream_path = "."
+commit = "f3d892942bfb45a0a0775d14895ae77ff9c06468"
+license = "MIT"
+local_path = "panes"
+
+[[file]]
+project = "opencode"
+upstream_path = "packages/opencode/src/util/wildcard.ts"
+commit = "ecc4916b5a9608c30e6dd58a67f2137b594407ca"
+license = "MIT"
+local_path = "core/src/k3code/permissions/wildcard.py"
+sha256_upstream = "f05b06c9e850eeaf3f039c58b1f2159157dd70e72f875d53045bf7fb5e119ad2"
+modified = true
+port-to-python = true
+
+[[file]]
+project = "opencode"
+upstream_path = "packages/opencode/src/permission/arity.ts"
+commit = "ecc4916b5a9608c30e6dd58a67f2137b594407ca"
+license = "MIT"
+local_path = "core/src/k3code/permissions/arity.py"
+sha256_upstream = "4200d3074fa8b6b6a63100fa93deb201be16f92c655721401d47c2ca0a109832"
+modified = true
+port-to-python = true
+
+[[file]]
+project = "opencode"
+upstream_path = "packages/opencode/src/permission/index.ts"
+commit = "ecc4916b5a9608c30e6dd58a67f2137b594407ca"
+license = "MIT"
+local_path = "core/src/k3code/permissions/rules.py"
+sha256_upstream = "5b9e4aa65290a39363722b9fae4c68080188d8ed76896afa0d96cd9dbfd2821d"
+modified = true
+port-to-python = true
+
+[[file]]
+project = "codex"
+upstream_path = "codex-rs/prompts/templates/review/rubric.md"
+commit = "81de4f251cfdaf32ecb85e2160ebfc11a562d44b"
+license = "Apache-2.0"
+local_path = "core/src/k3code/prompts/review_rubric.md"
+sha256_upstream = "ec60e7f36a1d1c2679ce095c0205ecc56f7dd8fb57707a13ef362072390f219f"
+modified = true
+notice = "NOTICE"
+license_file = "LICENSES/codex-Apache-2.0.txt"
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "hermes_cli/goals.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/goals.py"
+sha256_upstream = "49f45045769db7ee9b9fd87a4c873a5011ac574318a7762572473504ea0d86d6"
+modified = true
+port = true  # design port: GoalState/judge/continuation/budget/gate re-implemented (async, trimmed), not a line copy
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "hermes_cli/loops.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/loops.py"
+sha256_upstream = "0a094df000134279cd9473ed955bf8985e1e0b0a683cb5eac7481296a2005c95"
+modified = true
+port = true  # design port, no line copy: /loop: tick loop, stop/status/list, sentinel and self-paced ideas re-implemented on the k3code gateway
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "cron/jobs.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/cronexpr.py"
+sha256_upstream = "3a3f78b89dbdd08bffd0f0f34082bcde3b2faaf9f1900e5c15d6efeae0d35260"
+modified = true
+port = true  # design port, no line copy: compute_next_run schedule shape (cron/interval) re-implemented without croniter
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "cron/unreachable_retry.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/retry_policy.py"
+sha256_upstream = "00d5865d618341f51a38ca6fe6d827b92fa3eefbe60176f4a1550cb3aa55f667"
+modified = true
+port = true  # design port, no line copy: 5/15/30 min zero-API-call retry ladder re-implemented; shared with quota hold
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "cron/quota_hold.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/retry_policy.py"
+sha256_upstream = "7146487f391ffddfbb894ddf37b444cbf370168606086177575dc9156b296b31"
+modified = true
+port = true  # design port, no line copy: retry-after quota hold re-implemented (boundary + slack)
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "cron/suggestions.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/suggestions.py"
+sha256_upstream = "c7726fa20e619fd4653b85ec3dc1a80f75e687f07bd6acd834e77693b8de416c"
+modified = true
+port = true  # design port, no line copy: dedup-key latch, MAX_PENDING cap, accept/dismiss re-implemented on sqlite
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "cron/suggestion_catalog.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/automation/suggestions.py"
+sha256_upstream = "71c64068ea6d785e5a453a8abbbc7a642af991ad95f315116894bddd9ac351b0"
+modified = true
+port = true  # design port, no line copy: CatalogEntry shape; entries are k3code-specific
+
+# Design ports (no code copied verbatim): the behaviour was re-implemented, not vendored.
+[[file]]
+project = "hermes-agent"
+upstream_path = "tools/subagent_worktree.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/subagents/worktree.py"
+modified = true
+note = "design port: one git worktree + branch per child, finalize/diff, non-interactive git env; rewritten async"
+
+[[file]]
+project = "atomic-agents"
+upstream_path = "atomic-examples/deep-research/deep_research/state.py"
+commit = "d2b61b90b2816dbdf9f42f8638b7d375bf08cd11"
+license = "MIT"
+local_path = "core/src/k3code/research/state.py"
+sha256_upstream = "c9f1f92b8f02f4f39bbcb19497f9f813543f099df19ff11c2f7a290ee80730d9"
+modified = true
+note = "Eigenwise/atomic-agents; research state design (Source/Learning/SubTopic, stable S-ids) adapted"
+
+[[file]]
+project = "atomic-agents"
+upstream_path = "atomic-examples/deep-research/deep_research/agents/planner_agent.py"
+commit = "d2b61b90b2816dbdf9f42f8638b7d375bf08cd11"
+license = "MIT"
+local_path = "core/src/k3code/research/prompts.py"
+sha256_upstream = "e11d9784e8e56ba5b2087f4c45284d86e5ce1ebf22c0de53cf2a3c918ec504cb"
+modified = true
+note = "planner/extractor/reflector/writer system prompts adapted (instructor/pydantic schemas replaced by JSON replies; no instructor dependency)"
+
+[[file]]
+project = "atomic-agents"
+upstream_path = "atomic-examples/deep-research/deep_research/main.py"
+commit = "d2b61b90b2816dbdf9f42f8638b7d375bf08cd11"
+license = "MIT"
+local_path = "core/src/k3code/research/flow.py"
+modified = true
+note = "design port: plan -> search -> extract -> reflect -> write pipeline reimplemented over ModelCaller tiers"
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "hermes_cli/kanban_swarm.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/autonomy/fanout.py"
+modified = true
+note = "design port only: decompose -> parallel workers -> review -> sequential merge; rewritten, no code copied"
+[[file]]
+project = "hermes-agent"
+upstream_path = "hermes_cli/approvals_suggest.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/learning/permrules.py"
+sha256_upstream = "3de348d6ca3bbd18da6700abd7895dbb6831803ea9136616092c26afe266172f"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/background_review.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/learning/review.py"
+sha256_upstream = "0457a5110f1afb4a9fcbe32fcd02eda8fb7d160f7e44a2c10109a320fd23656e"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/background_review.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/learning/distiller.py"
+sha256_upstream = "0457a5110f1afb4a9fcbe32fcd02eda8fb7d160f7e44a2c10109a320fd23656e"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "agent/curator.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/learning/curator.py"
+sha256_upstream = "45075cbdb2c06d6c38f24309853a07384fc93f1f08c2d88ed6ce5bfdc6c38b9c"
+modified = true
+
+[[file]]
+project = "hermes-agent"
+upstream_path = "tools/skill_manager_tool.py"
+commit = "4127d78da84b1eee105f298979cc57cc7457f98d"
+license = "MIT"
+local_path = "core/src/k3code/learning/curator.py"
+sha256_upstream = "9a60291505ec597cb72a1cd10467846bc84a62a3175855ab7f8c6c497bc2bbbb"
+modified = true

@@ -1,0 +1,231 @@
+package main
+
+import (
+	"bytes"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/Gaurav-Gosain/sip"
+	"github.com/spf13/cobra"
+)
+
+// certFlags is the TLS half of the command line, set for one test and put back
+// afterwards. The flags are package globals because cobra writes into them, so
+// a test that forgot to restore one would decide the next test's outcome.
+type certFlags struct {
+	host     string
+	port     string
+	cert     string
+	key      string
+	autoTLS  bool
+	insecure bool
+	dir      string
+	hosts    []string
+	days     int
+	force    bool
+}
+
+func applyCertFlags(t *testing.T, f certFlags) {
+	t.Helper()
+	saved := certFlags{webHost, webPort, webTLSCert, webTLSKey, webAutoTLS, webInsecure, webCertDir, webCertHosts, webCertDays, webCertForce}
+	t.Cleanup(func() {
+		webHost, webPort = saved.host, saved.port
+		webTLSCert, webTLSKey = saved.cert, saved.key
+		webAutoTLS, webInsecure = saved.autoTLS, saved.insecure
+		webCertDir, webCertHosts, webCertDays = saved.dir, saved.hosts, saved.days
+		webCertForce = saved.force
+	})
+	if f.port == "" {
+		f.port = "7681"
+	}
+	webHost, webPort = f.host, f.port
+	webTLSCert, webTLSKey = f.cert, f.key
+	webAutoTLS, webInsecure = f.autoTLS, f.insecure
+	webCertDir, webCertHosts, webCertDays = f.dir, f.hosts, f.days
+	webCertForce = f.force
+}
+
+// writeKeypair drops a real keypair somewhere other than the managed cert dir,
+// standing in for one the user brought themselves.
+func writeKeypair(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+	dir := t.TempDir()
+	cert, err := sip.CreateManagedCert(sip.CertOptions{Dir: dir})
+	if err != nil {
+		t.Fatalf("create keypair: %v", err)
+	}
+	return cert.CertFile, cert.KeyFile
+}
+
+func TestCheckTransportSecurity(t *testing.T) {
+	ownCert, ownKey := writeKeypair(t)
+
+	tests := []struct {
+		name    string
+		flags   certFlags
+		wantErr bool
+	}{
+		{"loopback needs nothing", certFlags{host: "localhost"}, false},
+		{"empty host listens on every interface and refuses", certFlags{host: ""}, true},
+		{"127.0.0.1 needs nothing", certFlags{host: "127.0.0.1"}, false},
+		{"LAN bind in clear text refuses", certFlags{host: "192.168.1.31"}, true},
+		{"wildcard bind in clear text refuses", certFlags{host: "0.0.0.0"}, true},
+		{"auto-tls satisfies it", certFlags{host: "192.168.1.31", autoTLS: true}, false},
+		{"own keypair satisfies it", certFlags{host: "192.168.1.31", cert: ownCert, key: ownKey}, false},
+		{"insecure satisfies it", certFlags{host: "192.168.1.31", insecure: true}, false},
+		{"cert without key refuses", certFlags{host: "localhost", cert: ownCert}, true},
+		{"key without cert refuses", certFlags{host: "localhost", key: ownKey}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			applyCertFlags(t, tt.flags)
+			var out bytes.Buffer
+			err := checkTransportSecurity(&out)
+			if tt.wantErr && err == nil {
+				t.Fatalf("expected a refusal, got none")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("expected no refusal, got %v", err)
+			}
+			if !tt.wantErr && out.Len() > 0 {
+				t.Fatalf("printed advice for a bind it accepted: %q", out.String())
+			}
+		})
+	}
+}
+
+func TestResolveTLSFilesCoversTheBindAddress(t *testing.T) {
+	dir := t.TempDir()
+	applyCertFlags(t, certFlags{host: "192.168.1.31", autoTLS: true, dir: dir, hosts: []string{"tuios.lan"}})
+
+	if _, _, err := resolveTLSFiles(&bytes.Buffer{}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	cert, err := sip.LoadManagedCert(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	for _, host := range []string{"192.168.1.31", "tuios.lan", "localhost", "127.0.0.1"} {
+		if !cert.Covers(host) {
+			t.Errorf("certificate does not sign for %s (DNS %v, IP %v)", host, cert.DNSNames, cert.IPs)
+		}
+	}
+}
+
+func TestResolveTLSFilesGeneratesOnce(t *testing.T) {
+	dir := t.TempDir()
+	applyCertFlags(t, certFlags{host: "127.0.0.1", autoTLS: true, dir: dir})
+
+	var out bytes.Buffer
+	certFile, keyFile, err := resolveTLSFiles(&out)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	wantCert, wantKey, err := sip.CertPaths(dir)
+	if err != nil {
+		t.Fatalf("cert paths: %v", err)
+	}
+	if certFile != wantCert || keyFile != wantKey {
+		t.Fatalf("served from %s/%s, want %s/%s", certFile, keyFile, wantCert, wantKey)
+	}
+	if _, err := os.Stat(certFile); err != nil {
+		t.Fatalf("certificate was not written: %v", err)
+	}
+	if !strings.Contains(out.String(), sip.SelfSignedWarning) {
+		t.Errorf("first generation never warned about the browser warning:\n%s", out.String())
+	}
+
+	// A second run reuses it, and says nothing: the warning is only news once.
+	before, err := os.ReadFile(certFile)
+	if err != nil {
+		t.Fatalf("read certificate: %v", err)
+	}
+	out.Reset()
+	if _, _, err := resolveTLSFiles(&out); err != nil {
+		t.Fatalf("second resolve: %v", err)
+	}
+	after, err := os.ReadFile(certFile)
+	if err != nil {
+		t.Fatalf("read certificate: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("second run replaced a certificate that was still good")
+	}
+	if out.Len() > 0 {
+		t.Errorf("second run repeated the warning:\n%s", out.String())
+	}
+}
+
+func TestResolveTLSFilesDefersToOwnKeypair(t *testing.T) {
+	dir := t.TempDir()
+	ownCert, ownKey := writeKeypair(t)
+	applyCertFlags(t, certFlags{host: "192.168.1.31", cert: ownCert, key: ownKey, autoTLS: true, dir: dir})
+
+	certFile, keyFile, err := resolveTLSFiles(&bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if certFile != ownCert || keyFile != ownKey {
+		t.Fatalf("served from %s/%s, want the keypair passed with --cert/--key", certFile, keyFile)
+	}
+	if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+		t.Fatalf("generated a certificate anyway: %v %v", entries, err)
+	}
+}
+
+func TestCertNewRefusesToReplaceWithoutForce(t *testing.T) {
+	dir := t.TempDir()
+	applyCertFlags(t, certFlags{host: "localhost", dir: dir})
+
+	if _, err := runCert(t, "cert", "new", "--cert-dir", dir); err != nil {
+		t.Fatalf("cert new: %v", err)
+	}
+	first, err := sip.LoadManagedCert(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+
+	_, err = runCert(t, "cert", "new", "--cert-dir", dir)
+	if err == nil {
+		t.Fatal("replaced an existing certificate without --force")
+	}
+	if !strings.Contains(err.Error(), "--force") {
+		t.Errorf("error %q never names --force", err)
+	}
+	unchanged, err := sip.LoadManagedCert(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if unchanged.Fingerprint != first.Fingerprint {
+		t.Error("the refused run replaced the certificate anyway")
+	}
+
+	if _, err := runCert(t, "cert", "new", "--cert-dir", dir, "--force"); err != nil {
+		t.Fatalf("cert new --force: %v", err)
+	}
+	replaced, err := sip.LoadManagedCert(dir)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if replaced.Fingerprint == first.Fingerprint {
+		t.Error("--force did not replace the certificate")
+	}
+}
+
+// runCert drives the cert group the way a shell does, so the flag wiring is
+// under test and not just the functions behind it.
+func runCert(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	root := &cobra.Command{Use: "tuios-web", SilenceUsage: true, SilenceErrors: true}
+	registerCertFlags(root)
+	root.AddCommand(newCertCmd())
+
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs(args)
+	err := root.Execute()
+	return out.String(), err
+}

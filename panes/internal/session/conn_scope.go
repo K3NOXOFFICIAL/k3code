@@ -1,0 +1,694 @@
+package session
+
+import (
+	"encoding/json"
+	"slices"
+	"strings"
+)
+
+// Restricted connections: the minimal form of scoped callers.
+//
+// Every connection on the daemon socket can call every verb. That is right for
+// the person's own CLI and wrong for an agent that a file it read or a page it
+// fetched has talked into acting on other panes. restrict-connection lets a
+// client give up authority on its own connection, and the daemon then holds
+// the connection to what is left for as long as it is open. A second call can
+// narrow further and never widen.
+//
+// Two restrictions exist:
+//
+//   - scope own. The connection reaches only its own session: the session of
+//     the pane the caller runs in, the sessions that share its fan group (the
+//     siblings a fan started together), and the sessions a fan run from it
+//     started. Every other session is invisible to it: reads fail with
+//     forbidden, and its event stream carries nothing from them. The pane is
+//     found by the kernel's record of the caller's pid first, and only when
+//     that places the caller in no pane by TUIOS_PANE_ID plus the
+//     TUIOS_PANE_TOKEN only that pane was started with (pane_token.go). A
+//     caller placed in no pane reaches no session at all: the restriction
+//     fails closed.
+//   - read_only. The connection may read, report its own pane's state and
+//     meta, and leave mail, and may not type into any pane: send-text,
+//     send-keys, ask-agent, respond and fan are refused.
+//
+// Verbs outside the table below are refused on any restricted connection. The
+// table has to name every verb, which a test checks, so a new verb is refused
+// here until someone decides what a restricted caller may do with it.
+//
+// tuios mcp restricts every connection it opens before its first call, so an
+// agent that drives tuios through MCP holds exactly what the server was
+// started with. This does not stop a process in a pane from opening its own
+// unrestricted connection with the tuios CLI; it bounds the MCP surface, which
+// is the one an agent reaches without writing a shell command. docs/protocol.md
+// has the whole contract.
+
+// connScope is what a connection was restricted to.
+type connScope struct {
+	// own restricts the connection to its own session and fan group.
+	own bool
+	// readOnly refuses every verb that types into a pane or starts one.
+	readOnly bool
+	// sessionID and window are the caller's pane, empty when the caller runs
+	// in no pane of this daemon. The session is kept by ID, not name, so a
+	// rename leaves the connection held to the same session.
+	sessionID string
+	window    string
+	// via says how the pane was found: "pid" from the kernel, "token" from
+	// TUIOS_PANE_TOKEN, or "" when it was not.
+	via string
+}
+
+// Scope values restrict-connection accepts.
+const (
+	ScopeOwn = "own"
+	ScopeAll = "all"
+)
+
+var scopeNames = []string{ScopeOwn, ScopeAll}
+
+// scopeKind is what a verb does, for a restricted connection.
+type scopeKind int
+
+const (
+	// scopeDeny: refused on any restricted connection.
+	scopeDeny scopeKind = iota
+	// scopeOpen touches no session: always allowed.
+	scopeOpen
+	// scopeGlobal reads across sessions. Allowed under read_only alone,
+	// refused under scope own.
+	scopeGlobal
+	// scopeRead reads one session.
+	scopeRead
+	// scopeSelf writes the caller's own pane's record: its state, meta or
+	// conversation id. Under scope own the window must be the caller's.
+	scopeSelf
+	// scopeMail leaves something in a session's store as the caller: mail or
+	// a stashed file. Nothing is typed.
+	scopeMail
+	// scopeWrite types into a pane. Refused under read_only.
+	scopeWrite
+	// scopeLaunch starts new sessions. Refused under read_only, and under
+	// scope own for a caller in no pane, whose launches it could not reach.
+	scopeLaunch
+)
+
+// verbScopes classifies every verb. A verb missing here is treated as
+// scopeDeny, and TestVerbScopesNameEveryVerb fails until it is added.
+var verbScopes = map[string]scopeKind{
+	"hello":               scopeOpen,
+	"list-verbs":          scopeOpen,
+	"list-keys":           scopeOpen,
+	"unsubscribe":         scopeOpen,
+	"restrict-connection": scopeOpen,
+	// pane-grants reports the caller's own grants and touches no session.
+	// set-pane-grants changes what a pane may do, which is not for a
+	// restricted caller.
+	"pane-grants":     scopeOpen,
+	"set-pane-grants": scopeDeny,
+	// apply-config is for the person, outside every pane.
+	"apply-config": scopeDeny,
+
+	"list-sessions":      scopeGlobal,
+	"list-clients":       scopeGlobal,
+	"list-attention":     scopeGlobal,
+	"list-worktrees":     scopeGlobal,
+	"list-hosts":         scopeGlobal,
+	"list-host-sessions": scopeGlobal,
+	"list-host-agents":   scopeGlobal,
+	"list-themes":        scopeGlobal,
+	"list-glyphs":        scopeGlobal,
+	"list-hooks":         scopeGlobal,
+
+	"session-info":         scopeRead,
+	"list-windows":         scopeRead,
+	"get-window":           scopeRead,
+	"list-workspaces":      scopeRead,
+	"capture-pane":         scopeRead,
+	"get-agent-state":      scopeRead,
+	"list-agents":          scopeRead,
+	"wait-for":             scopeRead,
+	"subscribe":            scopeRead,
+	"peek-prompt":          scopeRead,
+	"read-agent-messages":  scopeRead,
+	"explain-agent-screen": scopeRead,
+	"list-options":         scopeRead,
+	"get-option":           scopeRead,
+	"stash-list":           scopeRead,
+	"stash-get":            scopeRead,
+
+	"set-agent-state":   scopeSelf,
+	"set-agent-meta":    scopeSelf,
+	"set-agent-session": scopeSelf,
+	// set-agent-state's activity with no state: the same record.
+	"report-agent-activity": scopeSelf,
+
+	"send-agent-message": scopeMail,
+	"stash-put":          scopeMail,
+
+	"send-text": scopeWrite,
+	"send-keys": scopeWrite,
+	"ask-agent": scopeWrite,
+	"respond":   scopeWrite,
+
+	"fan":         scopeLaunch,
+	"start-agent": scopeLaunch,
+
+	"list-dock-components": scopeDeny,
+	"refresh-dock":         scopeDeny,
+	"pip":                  scopeDeny,
+	"new-session":          scopeDeny,
+	// switch-session moves a client: a client-level action, like attach.
+	"switch-session":       scopeDeny,
+	"new-worktree":         scopeDeny,
+	"remove-worktree":      scopeDeny,
+	"open-host-connection": scopeDeny,
+	// retry-host is the person's act from the rail or from 'tuios hosts
+	// signin'. A restricted caller has no reason to make a link dial.
+	"retry-host":  scopeDeny,
+	"open-pane":   scopeDeny,
+	"resize-pane": scopeDeny,
+	"pane-cwd":    scopeDeny,
+	"pane-agent":  scopeDeny,
+	"pane-calls":  scopeDeny,
+	// paste-image is the person's act and paste-pane-image the owning
+	// daemon's. Neither is for a restricted caller.
+	"paste-image":          scopeDeny,
+	"paste-pane-image":     scopeDeny,
+	"read-dir":             scopeDeny,
+	"wait-dir":             scopeDeny,
+	"new-window":           scopeDeny,
+	"popup":                scopeDeny,
+	"split-window":         scopeDeny,
+	"focus-window":         scopeDeny,
+	"move-window":          scopeDeny,
+	"set-window":           scopeDeny,
+	"select-workspace":     scopeDeny,
+	"set-layout":           scopeDeny,
+	"run-command":          scopeDeny,
+	"close-window":         scopeDeny,
+	"close-workspace":      scopeDeny,
+	"screenshot":           scopeDeny,
+	"resize":               scopeDeny,
+	"kill-session":         scopeDeny,
+	"set-option":           scopeDeny,
+	"set-session-name":     scopeDeny,
+	"rename-session":       scopeDeny,
+	"set-session-accent":   scopeDeny,
+	"set-workspace-name":   scopeDeny,
+	"set-workspace-order":  scopeDeny,
+	"resume-agent":         scopeDeny,
+	"resolve-pane":         scopeDeny,
+	"explain-agent-detect": scopeDeny,
+	"dismiss-attention":    scopeDeny,
+	"request-approval":     scopeDeny,
+	"reply-approval":       scopeDeny,
+
+	// From the host policy and dropped-link work: the link handshake,
+	// ending a hosted pane, and passing on held mail are for a link
+	// connection or the person's client, never a restricted caller.
+	"link-peer":             scopeDeny,
+	"close-pane":            scopeDeny,
+	"release-agent-message": scopeDeny,
+
+	// From the shell command and ask-human work. run types a line at a
+	// prompt. ask-human asks the person as the caller's own pane, which
+	// is a report about that pane, like set-agent-state. answer-ask
+	// answers for the person, which no restricted caller does.
+	"run":        scopeWrite,
+	"ask-human":  scopeSelf,
+	"answer-ask": scopeDeny,
+
+	// From the host targeting work: reading a worktree's files out is for
+	// the person's own CLI (worktree pull), not a restricted caller.
+	"bundle-worktree": scopeDeny,
+
+	// From the agent review, triage, queue and approval work
+	// (verb_protocol_agents.go). Reads of one session and its fan group: a
+	// pane's diff, a fan's comparison, an agent's activity, its queue and a
+	// held approval. Writes: review notes, the queue, and sending notes,
+	// which types. verify-fan starts a window in each attempt, which is a
+	// launch. keep-fan removes worktrees and mark-attention is the person's
+	// act on the Inbox, so neither is for a restricted caller.
+	"review-diff":    scopeRead,
+	"compare-fan":    scopeRead,
+	"agent-activity": scopeRead,
+	"list-queued":    scopeRead,
+	"get-approval":   scopeRead,
+	"review-note":    scopeWrite,
+	"send-review":    scopeWrite,
+	"queue-prompt":   scopeWrite,
+	"cancel-queued":  scopeWrite,
+	"verify-fan":     scopeLaunch,
+	"keep-fan":       scopeDeny,
+	"mark-attention": scopeDeny,
+
+	// From the checkpoint work (verb_checkpoint.go). Listing and reading a
+	// pane's checkpoints are reads of its session. A restore writes the
+	// files the pane's agent works on, which the handler holds to the panes
+	// the caller could type into.
+	"list-checkpoints":   scopeRead,
+	"checkpoint-diff":    scopeRead,
+	"restore-checkpoint": scopeWrite,
+
+	// From the ship work (verb_ship.go). A commit and a merge write the
+	// files a pane's agent works on, as a restore does. A push and a pull
+	// request send work off this machine: they are writes here, and the
+	// handler also asks the person in the Inbox for any caller on a
+	// restricted connection. The status is a read.
+	"ship-commit": scopeWrite,
+	"ship-merge":  scopeWrite,
+	"ship-push":   scopeWrite,
+	"ship-pr":     scopeWrite,
+	"ship-status": scopeRead,
+}
+
+// verbRestrictConnection narrows what this connection may do from now on.
+func (d *Daemon) verbRestrictConnection(cs *connState, params json.RawMessage) (any, *verbError) {
+	var p struct {
+		Scope     string `json:"scope"`
+		ReadOnly  bool   `json:"read_only"`
+		PaneID    string `json:"pane_id"`
+		PaneToken string `json:"pane_token"`
+	}
+	if verr := decodeParams(params, &p); verr != nil {
+		return nil, verr
+	}
+	if p.Scope == "" {
+		p.Scope = ScopeOwn
+	}
+	if !slices.Contains(scopeNames, p.Scope) {
+		return nil, invalidParam("scope", "scope must be own or all", scopeNames...)
+	}
+
+	prev := cs.scope.Load()
+	next := &connScope{own: p.Scope == ScopeOwn, readOnly: p.ReadOnly}
+	if prev != nil {
+		if prev.own && !next.own {
+			return nil, scopeWidenError("scope", "this connection is already restricted to its own session, and a restriction cannot be lifted")
+		}
+		if prev.readOnly && !next.readOnly {
+			return nil, scopeWidenError("read_only", "this connection is already read-only, and a restriction cannot be lifted")
+		}
+		// The pane was settled by the first call. A later claim may only
+		// repeat it.
+		if p.PaneID != "" && p.PaneID != prev.window {
+			return nil, scopeWidenError("pane_id", "this connection's pane was settled by its first restrict-connection call")
+		}
+		next.sessionID, next.window, next.via = prev.sessionID, prev.window, prev.via
+	} else {
+		window, via, verr := d.placeCaller(cs, p.PaneID, p.PaneToken)
+		if verr != nil {
+			return nil, verr
+		}
+		next.window, next.via = window, via
+		if sess := d.sessionHoldingWindow(window); sess != nil {
+			next.sessionID = sess.ID
+		} else {
+			next.window, next.via = "", ""
+		}
+	}
+	cs.scope.Store(next)
+	LogBasic("Client %s restricted: scope=%s read_only=%v pane=%q via=%q", cs.clientID, scopeName(next), next.readOnly, shortWindowID(next.window), next.via)
+
+	res := map[string]any{
+		"type":      "connection_restricted",
+		"scope":     scopeName(next),
+		"read_only": next.readOnly,
+		"window":    next.window,
+		"session":   d.sessionNameByID(next.sessionID),
+		"via":       next.via,
+	}
+	if next.own {
+		res["sessions"] = d.scopeSessionNames(d.sessionNameByID(next.sessionID))
+	}
+	return res, nil
+}
+
+func scopeName(s *connScope) string {
+	if s.own {
+		return ScopeOwn
+	}
+	return ScopeAll
+}
+
+func scopeWidenError(param, msg string) *verbError {
+	return hintedVerbError(ErrVerbForbidden, msg, &VerbHint{
+		Param:  param,
+		Detail: "Open a new connection for a different restriction. Nothing was changed.",
+	})
+}
+
+// placeCaller finds the pane the process on cs runs in. The kernel's answer
+// comes first; a pane_id claim that disagrees with it is refused. Only when the
+// kernel places the caller in no pane is the claim checked against its token.
+// A caller placed nowhere gets an empty window and no error: its restriction
+// then reaches no session.
+func (d *Daemon) placeCaller(cs *connState, paneID, token string) (window, via string, verr *verbError) {
+	if !cs.viaLink && !cs.paneOnly {
+		if _, win := d.peerPane(cs); win != "" {
+			if paneID != "" && paneID != win {
+				return "", "", hintedVerbError(ErrVerbForbidden, "pane_id names another pane than the one this process runs in", &VerbHint{
+					Param:  "pane_id",
+					Detail: "The daemon reads the caller's pane from the kernel, and that answer wins. Omit pane_id, or pass the caller's own.",
+				})
+			}
+			return win, "pid", nil
+		}
+	}
+	if paneID == "" {
+		return "", "", nil
+	}
+	if cs.viaLink || !d.manager.VerifyPaneToken(paneID, token) {
+		return "", "", hintedVerbError(ErrVerbForbidden, "pane_token does not prove pane_id", &VerbHint{
+			Param:  "pane_token",
+			Detail: "Pass the TUIOS_PANE_TOKEN of the pane named by TUIOS_PANE_ID, from the same pane's environment. A token is good for one pane of one daemon start.",
+		})
+	}
+	return paneID, "token", nil
+}
+
+// sessionOfWindow names the local session holding a window, "" for none.
+func (d *Daemon) sessionOfWindow(id string) string {
+	if sess := d.sessionHoldingWindow(id); sess != nil {
+		return sess.Name()
+	}
+	return ""
+}
+
+// sessionHoldingWindow is the local session holding a window, nil for none.
+func (d *Daemon) sessionHoldingWindow(id string) *Session {
+	if id == "" {
+		return nil
+	}
+	for _, sess := range d.manager.AllSessions() {
+		st := sess.GetState()
+		for i := range st.Windows {
+			if st.Windows[i].ID == id {
+				return sess
+			}
+		}
+	}
+	return nil
+}
+
+// sessionNameByID is the current name of the session with this ID, "" when
+// there is none. Callers that keep a session across calls keep its ID and
+// read the name here, so a rename does not cut them off from it.
+func (d *Daemon) sessionNameByID(id string) string {
+	if id == "" {
+		return ""
+	}
+	if sess := d.manager.GetSessionByID(id); sess != nil {
+		return sess.Name()
+	}
+	return ""
+}
+
+// callerSession is the session of the pane the caller on cs runs in, "" when it
+// runs in none or cannot be placed.
+func (d *Daemon) callerSession(cs *connState) string {
+	if cs == nil {
+		return ""
+	}
+	if sc := cs.scope.Load(); sc != nil {
+		return d.sessionNameByID(sc.sessionID)
+	}
+	// A connection that presented its pane's token is in that pane.
+	if w := cs.paneBound.Load(); w != nil {
+		return d.sessionOfWindow(*w)
+	}
+	if cs.viaLink || cs.paneOnly || cs.peerPID <= 0 {
+		return ""
+	}
+	if _, win := d.peerPane(cs); win != "" {
+		return d.sessionOfWindow(win)
+	}
+	return ""
+}
+
+// sessionInScope reports whether a connection whose pane is in session own may
+// reach session target: target is own, or it was launched from own, or it
+// shares own's fan group in the same repository.
+func (d *Daemon) sessionInScope(own, target string) bool {
+	if own == "" || target == "" {
+		return false
+	}
+	// Either name may be one a session was renamed from: a pane started
+	// before the rename still sends it.
+	if o, _ := d.manager.ResolveSession(own); o != nil {
+		own = o.Name()
+	}
+	t, _ := d.manager.ResolveSession(target)
+	if t != nil {
+		target = t.Name()
+	}
+	if target == own {
+		return true
+	}
+	if t == nil {
+		return false
+	}
+	tw := t.Worktree()
+	if tw == nil {
+		return false
+	}
+	if tw.LaunchedFrom == own {
+		return true
+	}
+	if tw.Group == "" || !tw.Managed {
+		return false
+	}
+	o := d.manager.GetSession(own)
+	if o == nil {
+		return false
+	}
+	ow := o.Worktree()
+	return ow != nil && ow.Managed && ow.Group == tw.Group && ow.RepoRoot == tw.RepoRoot
+}
+
+// scopeSessionNames lists the sessions own reaches, sorted.
+func (d *Daemon) scopeSessionNames(own string) []string {
+	out := []string{}
+	for _, sess := range d.manager.AllSessions() {
+		if d.sessionInScope(own, sess.Name()) {
+			out = append(out, sess.Name())
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// eventInScope reports whether an event may be written to cs. Gap markers
+// always may. Under scope own an event reaches the stream only when its
+// session is one the connection reaches; an event with no session, such as
+// host-changed, does not.
+//
+// A pane without the admin grant is held the same way to the sessions it may
+// read, as they stood at its last call, which for a stream is its subscribe.
+// See pane_grants.go.
+func (d *Daemon) eventInScope(cs *connState, ev streamEvent) bool {
+	if ev.Type == EventGap {
+		return true
+	}
+	var owners []string
+	if sc := cs.scope.Load(); sc != nil && sc.own {
+		owners = append(owners, d.sessionNameByID(sc.sessionID))
+	}
+	if pa := cs.paneView.Load(); pa != nil && !pa.grants.Has(GrantAdmin) {
+		// The pane's session as it is named now: the view was taken at the
+		// stream's subscribe, and the session may have been renamed since.
+		own := pa.session
+		if pa.sessionID != "" {
+			own = d.sessionNameByID(pa.sessionID)
+		}
+		owners = append(owners, own)
+	}
+	if len(owners) == 0 {
+		return true
+	}
+	if ev.Host != "" {
+		return false
+	}
+	session := ev.Session
+	if session == "" && ev.Attention != nil {
+		session = ev.Attention.Session
+	}
+	for _, own := range owners {
+		if !d.sessionInScope(own, session) {
+			return false
+		}
+	}
+	return true
+}
+
+// scopeForbidden is the refusal for a verb or target outside a restriction.
+func scopeForbidden(verb, why string) *verbError {
+	return hintedVerbError(ErrVerbForbidden, verb+" is refused on this connection: "+why, &VerbHint{
+		Verb:   "restrict-connection",
+		Detail: "This connection was restricted with restrict-connection, and a restriction lasts as long as the connection. tuios mcp restricts its connections as its flags say: --write allows typing into panes, and --scope all reaches every session.",
+	})
+}
+
+// checkScope holds a call on a restricted connection to its restriction. It
+// returns the params the handler should see, which under scope own have the
+// caller's session, window and sender filled in where the call left them out,
+// or the refusal. A connection that was never restricted passes unchanged.
+func (d *Daemon) checkScope(cs *connState, verb string, params json.RawMessage) (json.RawMessage, *verbError) {
+	sc := cs.scope.Load()
+	if sc == nil {
+		return params, nil
+	}
+	kind, ok := verbScopes[verb]
+	if !ok || kind == scopeDeny {
+		return nil, scopeForbidden(verb, "a restricted connection may not call it")
+	}
+	if kind == scopeOpen {
+		return params, nil
+	}
+	if sc.readOnly && (kind == scopeWrite || kind == scopeLaunch) {
+		return nil, scopeForbidden(verb, "the connection is read-only, and "+verb+" types into a pane or starts one")
+	}
+	if !sc.own {
+		return params, nil
+	}
+	if kind == scopeGlobal {
+		return nil, scopeForbidden(verb, "it reads every session, and the connection is restricted to its own")
+	}
+	own := d.sessionNameByID(sc.sessionID)
+	if own == "" {
+		return nil, scopeForbidden(verb, "the connection is restricted to its own session, and the caller runs in no pane of this daemon")
+	}
+	reach := func(target string) string {
+		if d.sessionInScope(own, target) {
+			return ""
+		}
+		return "session " + echoName(target) + " is not the caller's own session or in its fan group"
+	}
+	deny := func(why string) *verbError { return scopeForbidden(verb, why) }
+	return d.holdToPane(verb, kind, params, own, sc.window, "the connection is restricted to its own", reach, deny)
+}
+
+// holdToPane holds one call from a caller whose pane is window in session own
+// to the sessions reach allows, and fills in what the call left out: the
+// caller's own session where it named none, and its own window where a
+// parameter names the caller (window on a self report, from on mail and
+// typing). reach returns "" for a session the call may touch and the reason
+// it may not otherwise. bound ends the refusals for a parameter that reaches
+// every session, such as "the connection is restricted to its own". It is
+// shared by restrict-connection (checkScope) and pane grants (checkGrants),
+// which differ only in which sessions they reach and how they refuse.
+func (d *Daemon) holdToPane(verb string, kind scopeKind, params json.RawMessage, own, window, bound string, reach func(target string) string, deny func(why string) *verbError) (json.RawMessage, *verbError) {
+	var m map[string]json.RawMessage
+	if len(strings.TrimSpace(string(params))) > 0 {
+		if err := json.Unmarshal(params, &m); err != nil {
+			// Not an object: the handler reports it as invalid_params. The
+			// session cannot be checked, so the call is refused here instead.
+			return nil, invalidParam("params", "params must be an object")
+		}
+	}
+	if m == nil {
+		m = map[string]json.RawMessage{}
+	}
+	declares := func(name string) bool {
+		entry, ok := verbRegistry[verb]
+		return ok && slices.ContainsFunc(entry.params, func(p verbParam) bool { return p.Name == name })
+	}
+	str := func(name string) string {
+		var s string
+		if raw, ok := m[name]; ok {
+			_ = json.Unmarshal(raw, &s)
+		}
+		return s
+	}
+	flag := func(name string) bool {
+		var b bool
+		if raw, ok := m[name]; ok {
+			_ = json.Unmarshal(raw, &b)
+		}
+		return b
+	}
+	set := func(name, value string) {
+		raw, _ := json.Marshal(value)
+		m[name] = raw
+	}
+
+	// The session. subscribe with none streams every session the connection
+	// reaches, and is filtered event by event (eventInScope). Every other
+	// verb gets the caller's own session when it names none, rather than the
+	// most recently active one, which could be anybody's.
+	session := str("session")
+	switch {
+	case session != "":
+		if why := reach(session); why != "" {
+			return nil, deny(why)
+		}
+	case verb == "subscribe":
+	case declares("session"):
+		session = own
+		set("session", session)
+		// The caller's own session can still be out of reach, for a pane
+		// that holds no grant for this kind of call there.
+		if why := reach(session); why != "" {
+			return nil, deny(why)
+		}
+	}
+
+	for _, wide := range []string{"all_sessions", "any_session", "hosts"} {
+		if flag(wide) {
+			return nil, deny(wide + " reaches every session, and " + bound)
+		}
+	}
+	// A selector reaches every session, except on list-agents, where the
+	// session filled in above narrows it to the caller's own.
+	if str("select") != "" && verb != "list-agents" {
+		return nil, deny("select reaches every session, and " + bound)
+	}
+	// A session on another machine is never in reach: send-agent-message's
+	// host sends there over this machine's link.
+	if h := str("host"); h != "" && h != "local" {
+		return nil, deny("host " + echoName(h) + " is another machine, and " + bound + " session")
+	}
+
+	mine := func(name string) *verbError {
+		switch v := str(name); v {
+		case "":
+			set(name, window)
+		case window:
+		default:
+			return deny(name + " must be the caller's own window " + shortWindowID(window) + ", or omitted")
+		}
+		return nil
+	}
+	switch kind {
+	case scopeSelf:
+		if session != own {
+			return nil, deny("it writes a pane's own record, and the caller's pane is in session " + own)
+		}
+		if verr := mine("window"); verr != nil {
+			return nil, verr
+		}
+	case scopeRead:
+		if verb == "read-agent-messages" && str("to") != "" && str("to") != window {
+			return nil, deny("to must be the caller's own window " + shortWindowID(window) + ", or omitted to read the session's ring without marking anything read")
+		}
+	case scopeMail, scopeWrite:
+		// from names a window of the target session. It is filled in only
+		// when that is the caller's own session, where the caller's window
+		// resolves; elsewhere a from the caller passes must still be its own.
+		if declares("from") {
+			if session == own {
+				if verr := mine("from"); verr != nil {
+					return nil, verr
+				}
+			} else if f := str("from"); f != "" && f != window {
+				return nil, deny("from must be the caller's own window " + shortWindowID(window) + ", or omitted")
+			}
+		}
+	}
+
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil, newVerbError(ErrVerbInternal, "could not encode params")
+	}
+	return out, nil
+}

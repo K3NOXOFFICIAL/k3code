@@ -1,0 +1,118 @@
+# The ghostty build tag swaps the terminal emulator for libghostty-vt. This
+# job keeps that build compiling and its differential harness honest: the
+# same bytes must produce the same state on both emulators. It also runs the
+# tests of every package built on the emulator, because scripts/install.sh
+# ships this backend by default and the go-test workflow only covers the
+# pure one. The renderer tests in internal/app failed here for weeks while
+# this job ran only the emulator's own packages.
+#
+# The paths below are every package that imports internal/vt, directly or
+# through another one. A change to one of them can break it on this backend,
+# and the job body already tests them all; the trigger has to see them too.
+name: ghostty-vt
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "internal/vt/**"
+      - "internal/session/**"
+      - "internal/terminal/**"
+      - "internal/app/**"
+      - "internal/input/**"
+      - "internal/scrollback/**"
+      - "internal/tmuxcompat/**"
+      - "internal/served/**"
+      - "internal/server/**"
+      - "internal/ui/**"
+      - "internal/learn/**"
+      - "pkg/tuios/**"
+      - "cmd/tuios/**"
+      - "cmd/tuios-web/**"
+      - "scripts/ghostty-lib.sh"
+      - ".github/workflows/ghostty-vt.yml"
+      - "go.mod"
+      - "go.sum"
+  pull_request:
+    paths:
+      - "internal/vt/**"
+      - "internal/session/**"
+      - "internal/terminal/**"
+      - "internal/app/**"
+      - "internal/input/**"
+      - "internal/scrollback/**"
+      - "internal/tmuxcompat/**"
+      - "internal/served/**"
+      - "internal/server/**"
+      - "internal/ui/**"
+      - "internal/learn/**"
+      - "pkg/tuios/**"
+      - "cmd/tuios/**"
+      - "cmd/tuios-web/**"
+      - "scripts/ghostty-lib.sh"
+      - ".github/workflows/ghostty-vt.yml"
+      - "go.mod"
+      - "go.sum"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request supersedes the run in
+# progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  differential:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          # The workflow file is in the key so this cgo build gets a cache of
+          # its own rather than whichever workflow saved the go.sum key first.
+          cache-dependency-path: |
+            go.sum
+            .github/workflows/ghostty-vt.yml
+
+      # setup-zig has no release on the Node 24 runtime yet, so the runner
+      # warns that it forces it onto Node 24. It works there.
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Cache libghostty-vt
+        uses: actions/cache@v6
+        with:
+          path: .ghostty-vt
+          key: ghostty-vt-${{ hashFiles('scripts/ghostty-lib.sh') }}-native
+
+      - name: Build libghostty-vt
+        run: ./scripts/ghostty-lib.sh
+
+      - name: Tagged build compiles everywhere
+        run: PKG_CONFIG_PATH="$PWD/.ghostty-vt/native/pkgconfig" go build -tags ghostty ./...
+
+      # Every package whose tests link the emulator, found from the import
+      # graph so a new one is covered without editing this list: the
+      # differential and wire fidelity tests in internal/vt and
+      # internal/session, and the renderer, input and CLI tests above them.
+      - name: Tests on the ghostty backend
+        run: |
+          pkgs=$(go list -tags ghostty -test -f '{{.ForTest}} {{join .Deps " "}}' ./... |
+            awk '$1 ~ /^github.com\/Gaurav-Gosain\/tuios\// &&
+                 / github.com\/Gaurav-Gosain\/tuios\/internal\/vt( |$)/ {print $1}' |
+            sort -u)
+          echo "$pkgs"
+          # $pkgs is split on purpose: one argument per package.
+          # shellcheck disable=SC2086
+          PKG_CONFIG_PATH="$PWD/.ghostty-vt/native/pkgconfig" \
+            go test -tags ghostty -count=1 -short $pkgs
+
+      - name: Pure build unaffected
+        run: CGO_ENABLED=0 go build ./...

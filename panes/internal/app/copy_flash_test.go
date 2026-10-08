@@ -1,0 +1,649 @@
+package app
+
+import (
+	"image/color"
+	"strings"
+	"testing"
+	"time"
+
+	"charm.land/lipgloss/v2"
+
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/overlay"
+	"github.com/Gaurav-Gosain/tuios/internal/pool"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+)
+
+// The band of light that crosses text after a copy.
+//
+// Copying is the one gesture in a terminal with no result to look at: the text
+// does not change and the selection usually disappears. The sweep puts the
+// feedback where the text was.
+
+func flashOS(t *testing.T) *OS {
+	t.Helper()
+	m := sidebarTestOS(t, 120, 40, "left")
+	m.Settings.CopyFlash = true
+	m.Settings.Motion = config.MotionFull
+	m.Settings.CopyFlashMs = config.CopyFlashMsDefault
+	m.Settings.CopyFlashColor = config.DefaultCopyFlashColor
+	return m
+}
+
+// TestTheSweepEndsAndIsForgotten, so an idle client holds nothing and asks for
+// no frames on its account.
+func TestTheSweepEndsAndIsForgotten(t *testing.T) {
+	m := flashOS(t)
+	m.Settings.CopyFlashMs = 1
+	m.copyFlash = &copyFlash{WindowID: "w1", At: time.Now()}
+
+	if !m.CopyFlashActive() {
+		t.Fatal("ASSERTION: the sweep is not running, so there is nothing to end")
+	}
+	time.Sleep(5 * time.Millisecond)
+
+	if m.CopyFlashActive() {
+		t.Error("the sweep outlived the time it was given")
+	}
+	if m.copyFlash != nil {
+		t.Error("the finished sweep was not forgotten")
+	}
+}
+
+// TestACopyAsksForAFrame.
+//
+// The sweep was invisible and this is why: a pane's render is cached against
+// its content, a copy changes nothing in the pane, so the cached frame was
+// returned unchanged for as long as the pane stayed quiet. The light was being
+// computed every frame and drawn into a frame nobody looked at.
+//
+// Negative control: dropping the ContentDirty line from NoteCopyFlash leaves
+// the pane clean and this fails.
+func TestACopyAsksForAFrame(t *testing.T) {
+	m := flashOS(t)
+	w := selectedWindow()
+	w.ContentDirty = false
+
+	m.NoteCopyFlash(w)
+
+	if !w.ContentDirty {
+		t.Error("a copy did not ask the pane for a frame, so the sweep is drawn into a cached one")
+	}
+	if m.copyFlash == nil {
+		t.Fatal("the copy recorded no sweep")
+	}
+	if m.copyFlash.WindowID != w.ID {
+		t.Errorf("the sweep is recorded against %q, want %q", m.copyFlash.WindowID, w.ID)
+	}
+}
+
+// selectedWindow is a pane holding a visual selection, which is what a copy
+// takes its region from.
+func selectedWindow() *terminal.Window {
+	return &terminal.Window{
+		ID: "w1", Width: 80, Height: 24,
+		CopyMode: &terminal.CopyMode{
+			Active:      true,
+			State:       terminal.CopyModeVisualChar,
+			VisualStart: terminal.Position{X: 0, Y: 0},
+			VisualEnd:   terminal.Position{X: 10, Y: 0},
+		},
+	}
+}
+
+// TestOnlyLitCellsArePainted.
+//
+// The sweep used to paint the whole block in the selection colour for its
+// whole run, because the effect it copies keeps its selection. There, the
+// selection is still there because the app leaves it; here a copy clears it,
+// so painting it back put a block of colour on screen that read as the
+// selection having come back. Worse, the last frame of the sweep stayed there
+// until the pane changed for some other reason.
+//
+// Negative control: returning a painted style for an unlit cell fails here.
+func TestOnlyLitCellsArePainted(t *testing.T) {
+	m := flashOS(t)
+	ground := lipgloss.Color("#101010")
+	band := m.copyFlashBandFor(0.5, copyFlashBox{left: 0, right: 80, top: 20, bottom: 20})
+
+	// A cell the light is nowhere near.
+	if _, lit := band.styleFor(80, 0, false, ground); lit {
+		t.Error("a cell the light has not reached is painted, so the block is a slab")
+	}
+	// And one it is on.
+	centre := int(band.peakColumn(0))
+	if _, lit := band.styleFor(centre, 0, false, ground); !lit {
+		t.Error("the centre of the band is not painted")
+	}
+}
+
+// TestTheSweepIsSizedToWhatWasCopied.
+//
+// The sweep used to cross the pane, so the light was only over the copied text
+// for the fraction of the run the block occupied. A twenty column selection on
+// a two hundred column pane was lit for about a twentieth of the duration, and
+// what reached the screen was a blink.
+//
+// Negative control: sizing the band to the pane instead of the block puts the
+// light outside the block at the halfway point and this fails.
+func TestTheSweepIsSizedToWhatWasCopied(t *testing.T) {
+	m := flashOS(t)
+	// A short block near the left of a wide pane, which is the case that
+	// showed the fault.
+	box := copyFlashBox{left: 4, right: 23, top: 20, bottom: 20}
+
+	// At the halfway point the light has to be inside the block.
+	mid := m.copyFlashBandFor(0.5, box)
+	lit := false
+	for x := box.left; x <= box.right; x++ {
+		if mid.intensity(x, box.top) > 0.2 {
+			lit = true
+		}
+	}
+	if !lit {
+		t.Error("halfway through the sweep, nothing in the copied block is lit")
+	}
+
+	// And it has to be lit for most of the run, not a sliver of it.
+	runs := 0
+	const steps = 20
+	for i := range steps {
+		band := m.copyFlashBandFor(float64(i)/steps, box)
+		for x := box.left; x <= box.right; x++ {
+			if band.intensity(x, box.top) > 0.2 {
+				runs++
+				break
+			}
+		}
+	}
+	if runs < steps/2 {
+		t.Errorf("the block is lit in %d of %d frames, so the sweep is mostly off the text", runs, steps)
+	}
+}
+
+// TestEveryShapeCrossesTheWholeBlock.
+//
+// Four shapes, one rule: whatever the block is, the light starts off one end
+// of it, passes over every part, and leaves off the other. A shape that ran
+// out of span would leave part of the block dark, and one whose span was too
+// long would spend the run off the text, which is the fault that made the
+// sweep look like a blink.
+//
+// Negative control: taking the axis range from the block's columns for every
+// shape leaves the vertical one lit in almost no frames.
+func TestEveryShapeCrossesTheWholeBlock(t *testing.T) {
+	box := copyFlashBox{left: 10, right: 40, top: 20, bottom: 25}
+
+	for _, shape := range config.CopyFlashStyles {
+		t.Run(shape, func(t *testing.T) {
+			m := flashOS(t)
+			m.Settings.CopyFlashStyle = shape
+			ground := lipgloss.Color("#101010")
+
+			// Every cell of the block is lit at some point in the run.
+			const steps = 40
+			for row := box.top; row <= box.bottom; row++ {
+				for x := box.left; x <= box.right; x++ {
+					everLit := false
+					for i := range steps {
+						band := m.copyFlashBandFor(float64(i)/steps, box)
+						if _, lit := band.styleFor(x, row, false, ground); lit {
+							everLit = true
+							break
+						}
+					}
+					if !everLit {
+						t.Fatalf("cell %d,%d is never lit", x, row)
+					}
+				}
+			}
+
+			// And something in the block is lit in most frames, not a
+			// handful. Any cell counts: a horizontal sweep lights every row
+			// at once and passes a given column in a moment, so asking about
+			// one column would say it was mostly dark when it was not.
+			runs := 0
+			for i := range steps {
+				band := m.copyFlashBandFor(float64(i)/steps, box)
+				if blockLit(band, box, ground) {
+					runs++
+				}
+			}
+			if runs < steps/3 {
+				t.Errorf("the block is lit in %d of %d frames", runs, steps)
+			}
+		})
+	}
+}
+
+// blockLit reports whether any cell of the block is lit on this frame.
+func blockLit(band copyFlashBand, box copyFlashBox, ground color.Color) bool {
+	for row := box.top; row <= box.bottom; row++ {
+		for x := box.left; x <= box.right; x++ {
+			if _, lit := band.styleFor(x, row, false, ground); lit {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestEveryShapeLightsABlockThatIsNotAtTheTopOfThePane.
+//
+// This is the fault that made three of the four shapes do nothing. The band's
+// travel was worked out over rows zero to n, while the cells were drawn at the
+// pane's real row numbers. For a block twenty rows down, the diagonal was off
+// by twenty times its slope and the light passed to one side of the text, and
+// the vertical sweep travelled over rows zero to n and never reached row
+// twenty at all. Only the horizontal shape worked, because it is the one with
+// no row term, which is exactly what was reported.
+//
+// One row, because a single-line selection is the case that showed it and the
+// case with the least margin for error.
+//
+// Negative control: measuring the axis range from zero rather than from the
+// block's own rows fails every shape here but horizontal.
+func TestEveryShapeLightsABlockThatIsNotAtTheTopOfThePane(t *testing.T) {
+	ground := lipgloss.Color("#101010")
+
+	for _, shape := range config.CopyFlashStyles {
+		t.Run(shape, func(t *testing.T) {
+			m := flashOS(t)
+			m.Settings.CopyFlashStyle = shape
+
+			// A short selection on one row, a long way down a tall pane.
+			box := copyFlashBox{left: 12, right: 30, top: 34, bottom: 34}
+
+			lit := 0
+			const steps = 40
+			for i := range steps {
+				if blockLit(m.copyFlashBandFor(float64(i)/steps, box), box, ground) {
+					lit++
+				}
+			}
+			if lit == 0 {
+				t.Fatal("the block is never lit, so this shape does nothing")
+			}
+			if lit < steps/3 {
+				t.Errorf("the block is lit in %d of %d frames, so the sweep is mostly off the text", lit, steps)
+			}
+
+			// And every cell of it is reached.
+			for x := box.left; x <= box.right; x++ {
+				ever := false
+				for i := range steps {
+					if _, on := m.copyFlashBandFor(float64(i)/steps, box).styleFor(x, box.top, false, ground); on {
+						ever = true
+						break
+					}
+				}
+				if !ever {
+					t.Errorf("column %d is never lit", x)
+				}
+			}
+		})
+	}
+}
+
+// TestAnythingTheUserDoesEndsTheSweep.
+//
+// The sweep is a short acknowledgement of a copy. Once a key has been pressed
+// or a click has landed, the user is no longer looking at what was copied, and
+// a sweep left running carried on painting a region whose text had moved
+// underneath it. That is what leaving copy mode mid-sweep looked like.
+//
+// Negative control: without CancelCopyFlash the sweep is still running here
+// and this fails.
+func TestAnythingTheUserDoesEndsTheSweep(t *testing.T) {
+	m := flashOS(t)
+	w := selectedWindow()
+	m.Windows = []*terminal.Window{w}
+	m.NoteCopyFlash(w)
+
+	if !m.CopyFlashActive() {
+		t.Fatal("ASSERTION: no sweep is running, so there is nothing to cancel")
+	}
+	w.ContentDirty = false
+
+	m.CancelCopyFlash()
+
+	if m.CopyFlashActive() {
+		t.Error("the sweep survived the thing that should have ended it")
+	}
+	if !w.ContentDirty {
+		t.Error("the pane was not asked for the frame without the sweep in it")
+	}
+}
+
+// TestTheSweepNeverRepaintsTheText.
+//
+// The worst fault the sweep had, and the reason it read as an effect behaving
+// strangely: it carried the cell's foreground toward the same colour as its
+// background, so at the centre of the band the two were equal and the
+// characters were gone. Eleven to one down to one to one on a dark theme.
+//
+// Light passing over text does not repaint the text.
+//
+// Negative control: setting a foreground in styleFor fails this at the centre
+// of the band.
+func TestTheSweepNeverRepaintsTheText(t *testing.T) {
+	m := flashOS(t)
+	ground := lipgloss.Color("#1E1E2E")
+	box := copyFlashBox{left: 0, right: 60, top: 10, bottom: 10}
+	band := m.copyFlashBandFor(0.5, box)
+
+	centre := int(band.peakColumn(box.top))
+	st, lit := band.styleFor(centre, box.top, true, ground)
+	if !lit {
+		t.Fatal("ASSERTION: the centre of the band is not lit, so there is nothing to check")
+	}
+	if got := st.Render("x"); strings.Contains(got, "38;2;") {
+		t.Errorf("the brightest cell repaints its text: %q", got)
+	}
+}
+
+// TestTheTintIsDerivedFromTheGround.
+//
+// One literal cannot serve both ends of the theme range: the pale gold this
+// shipped with measures fourteen to one against a dark ground and one point oh
+// three against a light one, so it was a strobe on one theme and invisible on
+// the other.
+//
+// Negative control: going back to a fixed colour fails the light theme's floor
+// and the dark theme's ceiling at once.
+func TestTheTintIsDerivedFromTheGround(t *testing.T) {
+	for _, tc := range []struct{ name, bg string }{
+		{"a dark theme", "#1E1E2E"},
+		{"a light theme", "#FDF6E3"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bg := lipgloss.Color(tc.bg)
+			tint := overlay.Tone(bg, copyFlashLift)
+
+			got := overlay.ContrastRatio(tint, bg)
+			if got < 1.3 {
+				t.Errorf("the tint measures %.2f against the ground, too little to see", got)
+			}
+			if got > copyFlashLift+0.05 {
+				t.Errorf("the tint measures %.2f against the ground, louder than the selection", got)
+			}
+		})
+	}
+}
+
+// TestTheSweepMeasuresTheBlock. The bounds come from the marked cells, so a
+// block that is narrower than the pane is swept at its own width.
+func TestTheSweepMeasuresTheBlock(t *testing.T) {
+	g := pool.GetHighlightGrid()
+	defer pool.PutHighlightGrid(g)
+	g.Init(4, 60)
+	// One row, so the block's bounds are that row's bounds. A selection over
+	// several rows reaches column zero on every row after the first, which is
+	// what a selection is, so its left edge is zero and says nothing.
+	fillPaneRegion(g, terminal.Position{X: 5, Y: 0}, terminal.Position{X: 20, Y: 0}, 0, 0, 4, 60, nil)
+
+	box, ok := copyFlashBoxOf(g, 4, 60)
+	if !ok {
+		t.Fatal("the marked region measured as nothing")
+	}
+	if box.left != 5 || box.right != 20 {
+		t.Errorf("the block spans columns %d to %d, want 5 to 20", box.left, box.right)
+	}
+	if box.rows() != 1 {
+		t.Errorf("the block is %d rows, want 1", box.rows())
+	}
+}
+
+// TestAnEmptyRegionIsNotSwept, which is what a copied block scrolled out of
+// view leaves behind.
+func TestAnEmptyRegionIsNotSwept(t *testing.T) {
+	g := pool.GetHighlightGrid()
+	defer pool.PutHighlightGrid(g)
+	g.Init(4, 60)
+
+	if _, ok := copyFlashBoxOf(g, 4, 60); ok {
+		t.Error("an empty region measured as a block to sweep")
+	}
+}
+
+// TestAWholeRowSelectionIsSweptOverItsText. A selection over several lines
+// covers every row to the pane's edge, and the block used to be measured
+// from that, so on short lines the band spent most of its run crossing empty
+// cells. The rows are clamped to where their text ends first.
+//
+// Negative control: passing nil for textEnd measures the block to column 59
+// and fails here.
+func TestAWholeRowSelectionIsSweptOverItsText(t *testing.T) {
+	g := pool.GetHighlightGrid()
+	defer pool.PutHighlightGrid(g)
+	g.Init(4, 60)
+	ends := []int{11, 11, -1, 11}
+	fillPaneRegion(g, terminal.Position{X: 0, Y: 0}, terminal.Position{X: 59, Y: 3}, 0, 0, 4, 60,
+		func(y int) int { return ends[y] })
+
+	box, ok := copyFlashBoxOf(g, 4, 60)
+	if !ok {
+		t.Fatal("the marked region measured as nothing")
+	}
+	if box.left != 0 || box.right != 11 {
+		t.Errorf("the block spans columns %d to %d, want 0 to 11", box.left, box.right)
+	}
+	if g.HasRow(2) {
+		t.Error("a blank row was marked for the sweep")
+	}
+}
+
+// TestTheSweepRunsOnTheMotionClock. The sweep used to be drawn only when the
+// maintenance tick happened to compose a frame, and after the dock message
+// stopped composing one per tick that was four frames a second. A running
+// sweep now keeps the motion clock at the frame rate, and each of its frames
+// marks the pane and draws.
+//
+// Negative control: dropping the copyFlash term from motionInterval fails the
+// first check, and dropping the flash term from handleMotionFrame the second.
+func TestTheSweepRunsOnTheMotionClock(t *testing.T) {
+	m := flashOS(t)
+	w := selectedWindow()
+	m.Windows = []*terminal.Window{w}
+	m.NoteCopyFlash(w)
+
+	if got := m.motionInterval(); got != config.OverlayFadeFrame {
+		t.Fatalf("a running sweep asks the motion clock for a frame every %v, want %v", got, config.OverlayFadeFrame)
+	}
+	w.ContentDirty = false
+	m.renderSkipped = true
+	m.handleMotionFrame(motionFrameMsg{gen: m.motion.gen})
+	if m.renderSkipped || !w.ContentDirty {
+		t.Errorf("a motion frame during the sweep did not draw the pane (skipped=%v, dirty=%v)",
+			m.renderSkipped, w.ContentDirty)
+	}
+
+	// The frame after the sweep ends draws once more, without the light, and
+	// then the clock stops.
+	m.copyFlash.At = time.Now().Add(-time.Hour)
+	m.renderSkipped = true
+	m.handleMotionFrame(motionFrameMsg{gen: m.motion.gen})
+	if m.renderSkipped {
+		t.Error("the frame that ends the sweep was skipped, so its light stays on the screen")
+	}
+	if got := m.motionInterval(); got != 0 {
+		t.Errorf("the motion clock still runs every %v after the sweep", got)
+	}
+}
+
+// TestMotionNoneDrawsNoSweep. appearance.motion = none draws every change in
+// one frame, and the sweep is nothing but frames.
+func TestMotionNoneDrawsNoSweep(t *testing.T) {
+	m := flashOS(t)
+	m.Settings.Motion = config.MotionNone
+	m.NoteCopyFlash(selectedWindow())
+	if m.copyFlash != nil {
+		t.Error("a copy with motion none recorded a sweep")
+	}
+	m.Settings.Motion = config.MotionBasic
+	m.NoteCopyFlash(selectedWindow())
+	if m.copyFlash == nil {
+		t.Error("a copy with motion basic recorded no sweep")
+	}
+}
+
+// flashPane is a live pane of short lines with history above the screen. Two
+// lines end in a wide character: one lands in the scrollback and one on the
+// screen. It returns the window and the text of every line, oldest first,
+// indexed by the absolute row the copy region uses.
+func flashPane(t *testing.T, id string) (*terminal.Window, []string) {
+	t.Helper()
+	win := newTestWindow(t, id, 40, 10)
+	rows := win.Terminal.Height()
+	n := rows + 5
+	lines := make([]string, n)
+	for k := range lines {
+		lines[k] = strings.Repeat("a", k%7+1)
+	}
+	lines[3] = "ab世"
+	lines[n-2] = "cd世"
+	win.LockIO()
+	_, _ = win.Terminal.Write([]byte(strings.Join(lines, "\r\n")))
+	win.UnlockIO()
+	if got := win.ScrollbackLen(); got != n-rows {
+		t.Fatalf("setup: %d lines on a %d-row screen left %d in the scrollback, want %d", n, rows, got, n-rows)
+	}
+	return win, lines
+}
+
+// wantTextEnd is the last column a line's text covers, counting the one wide
+// character these lines use as two.
+func wantTextEnd(line string) int {
+	w := 0
+	for _, r := range line {
+		if r == '世' {
+			w += 2
+		} else {
+			w++
+		}
+	}
+	return w - 1
+}
+
+// TestPaneRowTextEndReadsTheRowTheFrameDraws. Scrolled back, the top rows of
+// the view are scrollback lines and the rest are the screen shifted down, so
+// the row where the two meet is the one an off-by-one gets wrong. A wide
+// character at the end of a line counts to its second column.
+//
+// Negative control: reading screen row y instead of y-offset on a scrolled
+// view fails every screen row below the seam, and returning the lead column
+// of a wide character fails the two rows that end in one.
+func TestPaneRowTextEndReadsTheRowTheFrameDraws(t *testing.T) {
+	win, lines := flashPane(t, "flash-ends-01")
+	sb := win.ScrollbackLen()
+	maxY, maxX := win.Terminal.Height(), win.Terminal.Width()
+	for _, offset := range []int{0, 2, sb} {
+		win.ScrollbackOffset = offset
+		for y := range maxY {
+			abs := sb - offset + y
+			where := "screen"
+			switch {
+			case y < offset:
+				where = "scrollback"
+			case y == offset && offset > 0:
+				where = "seam"
+			}
+			got := paneRowTextEnd(win, win.Terminal, y, maxX, sb)
+			if want := wantTextEnd(lines[abs]); got != want {
+				t.Errorf("offset %d, row %d (%s, %q): text ends at %d, want %d", offset, y, where, lines[abs], got, want)
+			}
+		}
+	}
+}
+
+// TestTheSweptRegionStopsWhereEachRowsTextEnds is the renderer's half: the
+// grid copyFlashGrid hands the cell loop marks every copied row from its
+// first column to its text end and no further, across the scrollback, the
+// seam and the screen.
+//
+// Negative control: passing nil for textEnd in copyFlashGrid marks every row
+// to column maxX-1 and fails here.
+func TestTheSweptRegionStopsWhereEachRowsTextEnds(t *testing.T) {
+	win, lines := flashPane(t, "flash-clamp-01")
+	m := newTestOS(win)
+	m.Settings.CopyFlash, m.Settings.CopyFlashMs = true, config.CopyFlashMsDefault
+	sb := win.ScrollbackLen()
+	maxY, maxX := win.Terminal.Height(), win.Terminal.Width()
+	win.ScrollbackOffset = 3
+	top := sb - win.ScrollbackOffset
+	// Whole rows, from two scrollback rows to two screen rows past the seam.
+	first, last := top+1, top+win.ScrollbackOffset+2
+	m.copyFlash = &copyFlash{
+		WindowID: win.ID, At: time.Now(),
+		Start: terminal.Position{X: 0, Y: first},
+		End:   terminal.Position{X: maxX - 1, Y: last},
+	}
+
+	grid, _ := m.copyFlashGrid(win, win.Terminal, sb, maxY, maxX)
+	if grid == nil {
+		t.Fatal("a copied region on screen produced no grid")
+	}
+	defer pool.PutHighlightGrid(grid)
+	for y := range maxY {
+		abs := top + y
+		wantEnd := -1
+		if abs >= first && abs <= last {
+			wantEnd = wantTextEnd(lines[abs])
+		}
+		gotEnd := -1
+		for x := range maxX {
+			if grid.Get(y, x) {
+				if x != gotEnd+1 {
+					t.Errorf("row %d: the marked cells have a gap before column %d", y, x)
+				}
+				gotEnd = x
+			}
+		}
+		if gotEnd != wantEnd {
+			t.Errorf("row %d (%q): marked to column %d, want %d", y, lines[abs], gotEnd, wantEnd)
+		}
+	}
+}
+
+// TestASweepWithNothingToLightEnds. A copy of blank rows, or a block that has
+// scrolled out of view, leaves nothing to light. The sweep ends on the frame
+// that finds that, so the motion clock stops rather than drawing nothing at
+// the frame rate until the time runs out.
+//
+// Negative control: returning without clearing copyFlash in copyFlashGrid
+// fails both cases.
+func TestASweepWithNothingToLightEnds(t *testing.T) {
+	for _, blank := range []bool{false, true} {
+		t.Run(map[bool]string{false: "out of view", true: "blank rows"}[blank], func(t *testing.T) {
+			var win *terminal.Window
+			var start, end terminal.Position
+			if blank {
+				// Rows below the prompt of a pane that has hardly been used.
+				win = newTestWindow(t, "flash-blank-01", 40, 10)
+				start, end = terminal.Position{X: 0, Y: 2}, terminal.Position{X: 39, Y: 4}
+			} else {
+				// The oldest scrollback rows, with the view at the bottom.
+				win, _ = flashPane(t, "flash-gone-01")
+				start, end = terminal.Position{X: 0, Y: 0}, terminal.Position{X: 39, Y: 1}
+			}
+			m := newTestOS(win)
+			m.Settings.CopyFlash, m.Settings.CopyFlashMs = true, config.CopyFlashMsDefault
+			m.copyFlash = &copyFlash{WindowID: win.ID, At: time.Now(), Start: start, End: end}
+			if m.motionInterval() == 0 {
+				t.Fatal("ASSERTION: a running sweep does not hold the motion clock")
+			}
+
+			maxY, maxX := win.Terminal.Height(), win.Terminal.Width()
+			if grid, _ := m.copyFlashGrid(win, win.Terminal, win.ScrollbackLen(), maxY, maxX); grid != nil {
+				pool.PutHighlightGrid(grid)
+				t.Fatal("an empty region produced a grid to light")
+			}
+			if m.copyFlash != nil {
+				t.Error("the sweep kept running with nothing to light")
+			}
+			if got := m.motionInterval(); got != 0 {
+				t.Errorf("the motion clock still runs every %v", got)
+			}
+		})
+	}
+}

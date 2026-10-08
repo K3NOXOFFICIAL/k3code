@@ -1,0 +1,1376 @@
+package app
+
+import (
+	"slices"
+	"strings"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/layout"
+	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"github.com/Gaurav-Gosain/tuios/pkg/fuzzy"
+)
+
+// paletteCategoryAgents is the palette's section for the agent entries.
+const paletteCategoryAgents = "Agents"
+
+// paletteReviewName is the palette row of the review of the focused pane.
+const paletteReviewName = "Agents: Review changes of the focused pane"
+
+// ConfigReloadedMsg carries a config parsed by the file watcher goroutine so it
+// can be applied on the Bubble Tea goroutine. The watcher must not touch the
+// appearance globals directly (the render loop reads them concurrently); it
+// delivers this message via the program's Send instead, and Update applies it
+// with ApplyReloadedConfig.
+type ConfigReloadedMsg struct {
+	Config *config.UserConfig
+}
+
+// ConfigReloadFailedMsg says the config file on disk cannot be used. The
+// running config stands, and the client says so on screen.
+//
+// The watcher used to write this to the log and stop there, so a typo in the
+// file meant every later save was ignored for a reason nobody could see.
+type ConfigReloadFailedMsg struct {
+	Err error
+}
+
+// ApplyReloadedConfig puts a config read from disk into force. It is the one
+// path for both ways in: the file watcher and the palette's "Reload config".
+//
+// The file wins. Everything the file names replaces what is running, including
+// a beam somebody switched on with a key, because that is what the sidebar and
+// the pane gap on this same path already do and two rules would be worse than
+// one. What the file does not name is untouched: the focused pane, the mode,
+// where the beam is pointing, and whether this session may write the file at
+// all.
+func (m *OS) ApplyReloadedConfig(cfg *config.UserConfig) tea.Cmd {
+	if cfg == nil {
+		return nil
+	}
+	// Runs on the Bubble Tea goroutine, so applying it to this session's
+	// settings is single-threaded and reaches nobody else's session.
+	config.ApplyAppearanceConfig(cfg, &m.Settings)
+	// A reload is the one time the display's rate is looked for again, after
+	// startup: the person may have changed the monitor's mode. Started before
+	// applyAppearanceLive below, which would otherwise keep the first answer.
+	m.detectDisplayRate(true)
+	// Whether the rail is shown is the session's once the session has a
+	// value. The file's value is what a new session starts with, so a reload
+	// does not show or hide the rail on every client. See keepSessionSidebar.
+	m.keepSessionSidebar(false)
+	// Retiled, not just repainted. The sidebar's width and side, the dock's
+	// position and the pane gap all change how much room the panes have, and
+	// this path had only ever repainted them: a gap edited in the file moved
+	// the global and left the rectangles where they were.
+	m.applyAppearanceLive(true)
+	// The file can move the sidebar and the dock, which is the chrome the
+	// session's reserve is settled from. settleChrome announces it.
+	// The dock section is rebuilt here too rather than only at startup. A
+	// feature whose distribution story is "copy a file" that then needed a
+	// restart to see the file would be most of the story missing. This is also
+	// what puts the new config on the model, which every section outside
+	// [appearance] is read from live.
+	cmd := m.ReloadDockComponents(cfg)
+	// A scratch entry the new file renamed or removed has no key any more.
+	m.pruneOrphanScratches()
+	// Keybindings reload the same way, minus the write-back: the edit came
+	// from the file, so persisting it would be the tail wagging the dog.
+	if m.KeybindRegistry != nil {
+		m.KeybindRegistry.Reload(cfg)
+		m.keybinds.report = m.buildKeybindReport()
+		m.keybinds.filtered = nil
+	}
+	// The beam is client-local, so nothing else carries it: without this the
+	// screen and the config disagree about whether it is on, and the next
+	// toggle writes the disagreement back to the file.
+	m.SetSpotlight(cfg.Spotlight.IsEnabled())
+	// The agent switch, which the file can flip as well as the settings page.
+	cmd = tea.Batch(cmd, m.applyAgentsSwitch())
+	m.MarkAllDirty()
+	return cmd
+}
+
+// CommandPaletteItem represents a single command in the command palette.
+type CommandPaletteItem struct {
+	Name string // Display name: "Split horizontal"
+	// Shortcut is the row's right-hand meta slot, in muted ink. For a command it
+	// is the key that runs it ("prefix+v"); for a row whose consequence is
+	// heavier than the palette's usual jump it is that consequence in words
+	// ("switches session"), since a row with no key still owes the user a warning.
+	Shortcut string
+	Category string // "Window", "Layout", "Session", "Navigation", "Clipboard"
+	// Match holds the byte offsets in Name that the live query matched, filled
+	// in by FilterCommandPalette so the renderer can underline them without
+	// running the matcher a second time. Nil when nothing was typed, and for a
+	// row admitted on its Category alone.
+	Match []int
+	// AgentState marks a session/window entry whose Name carries an agent-state
+	// glyph (sessionPaletteLabel), so the renderer can color the glyph without
+	// putting ANSI into Name, which the fuzzy filter matches raw.
+	AgentState string
+	// AgentSeen is the unread bit behind a done AgentState: true once the
+	// person has looked at the pane, which draws idle's mark (agentMark).
+	AgentSeen bool
+	// Keybind marks a row that names one action to rebind. Those rows are
+	// reached only behind the "#" token and are hidden from every other query,
+	// which is what keeps a few hundred of them out of a list of twenty
+	// commands. See splitPaletteKeybinds.
+	Keybind bool
+	// Setting marks a row that opens the settings page on one row. There is
+	// one per settings row, so they are left out of the empty palette and
+	// ranked after every command, and a query that names a setting still
+	// reaches it: "pane background" or "settings: pane background".
+	Setting bool
+	Action  func(m *OS) (*OS, tea.Cmd)
+}
+
+// GetCommandPaletteItems returns all available commands for the command palette.
+func GetCommandPaletteItems(s *config.Settings) []CommandPaletteItem {
+	items := []CommandPaletteItem{
+		// The launcher is its own overlay, and this is the row that opens it.
+		// It is the bridge that keeps "one box finds everything" true as an
+		// entry point without the two lists having to be ranked against each
+		// other (see launcher.go).
+		{
+			Name:     "Run a program",
+			Shortcut: "alt+space",
+			Category: PaletteCategoryRun,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.OpenLauncher()
+			},
+		},
+
+		// Screenshots. Three rows, because the three things a person means by
+		// "take a screenshot" want different gestures and only the first needs
+		// one.
+		{
+			Name:     "Start the screen saver",
+			Shortcut: "S",
+			Category: "View",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.StartScreensaverNow()
+			},
+		},
+		{
+			Name:     "Screenshot this window",
+			Shortcut: "prefix+C",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.ScreenshotFocusedWindow()
+			},
+		},
+		{
+			Name:     "Screenshot a region",
+			Shortcut: "drag to select",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.BeginCapture(false)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Screenshot the screen",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.ScreenshotScreen()
+			},
+		},
+		{
+			Name:     "Paste the clipboard image as a file path",
+			Shortcut: "prefix+V",
+			Category: "Clipboard",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.RequestImagePaste()
+			},
+		},
+
+		// Window management
+		{
+			Name:     "New window",
+			Shortcut: "prefix+c",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.FollowSSHOnNewWindow() {
+					m.NewWindowSSH()
+					return m, nil
+				}
+				m.NewWindowHere()
+				return m, nil
+			},
+		},
+		{
+			Name:     "New window that runs the focused pane's ssh",
+			Shortcut: "",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.NewWindowSSH()
+				return m, nil
+			},
+		},
+		{
+			Name:     "New window on another machine",
+			Shortcut: "",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenHostPicker()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Close window",
+			Shortcut: "prefix+x",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if len(m.Windows) > 0 && m.FocusedWindow >= 0 {
+					m.CloseWindowByHand(m.FocusedWindow)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Rename window",
+			Shortcut: "prefix+r",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				// The editor is a centred dialog, so hidden titles are no reason
+				// for the palette to offer a row that does nothing.
+				if focused := m.GetFocusedWindow(); focused != nil {
+					m.Mode = WindowManagementMode
+					m.BeginRenameWindow(focused)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Toggle zoom",
+			Shortcut: "prefix+z",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ToggleZoom()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Minimize window",
+			Shortcut: "prefix+m m",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if len(m.Windows) > 0 && m.FocusedWindow >= 0 {
+					focusedWindow := m.GetFocusedWindow()
+					if focusedWindow != nil && !focusedWindow.Minimized {
+						m.MinimizeWindow(m.FocusedWindow)
+					}
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Restore all minimized",
+			Shortcut: "prefix+m M",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				for i := range m.Windows {
+					if m.Windows[i].Minimized && m.Windows[i].Workspace == m.CurrentWorkspace {
+						m.RestoreWindow(i)
+					}
+				}
+				if m.AutoTiling {
+					m.TileAllWindows()
+				}
+				return m, nil
+			},
+		},
+
+		// Layout
+		{
+			Name:     "Toggle tiling",
+			Shortcut: "prefix+space",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ToggleAutoTiling()
+				if m.AutoTiling {
+					m.ShowNotification("Tiling on", "success", s.NotificationDuration)
+				} else {
+					m.ShowNotification("Tiling off", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Split horizontal",
+			Shortcut: "prefix+-",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.AutoTiling {
+					m.splitFocused(layout.PreselectionDown, m.FollowSSHOnNewWindow())
+					m.ShowNotification("Split horizontal", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Split horizontal, and run the focused pane's ssh",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.AutoTiling {
+					m.SplitFocusedHorizontalSSH()
+					m.ShowNotification("Split horizontal", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Split vertical",
+			Shortcut: "prefix+|",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.AutoTiling {
+					m.splitFocused(layout.PreselectionRight, m.FollowSSHOnNewWindow())
+					m.ShowNotification("Split vertical", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Split vertical, and run the focused pane's ssh",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.AutoTiling {
+					m.SplitFocusedVerticalSSH()
+					m.ShowNotification("Split vertical", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Smart split",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.AutoTiling {
+					m.SmartSplitFocused()
+					m.ShowNotification("Smart split", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Toggle shared borders",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				// Flip the session's value, not the config global: after a
+				// peer's setting has been adopted the two can differ, and the
+				// toggle has to move the one the layout is using.
+				m.SetSharedBordersSetting(!m.SharedBorders)
+				save := m.persistSettings()
+				if m.SharedBorders {
+					m.ShowNotification("Shared borders on", "success", s.NotificationDuration)
+				} else {
+					m.ShowNotification("Shared borders off", "info", s.NotificationDuration)
+				}
+				return m, save
+			},
+		},
+		{
+			Name:     "Rotate split",
+			Shortcut: "prefix+R",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.AutoTiling {
+					m.RotateFocusedSplit()
+					m.ShowNotification("Split rotated", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Equalize splits",
+			Shortcut: "prefix+=",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.AutoTiling {
+					m.EqualizeSplits()
+					m.ShowNotification("Splits equalized", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Cycle tiling scheme",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if scheme := m.CycleTilingScheme(); scheme != "" {
+					m.ShowNotification("Tiling scheme: "+TilingSchemeLabel(scheme), "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Set tiling scheme: spiral",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.SetTilingScheme(layout.SchemeSpiral) {
+					m.ShowNotification("Tiling scheme: spiral", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Set tiling scheme: longest side",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.SetTilingScheme(layout.SchemeLongestSide) {
+					m.ShowNotification("Tiling scheme: longest side", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Set tiling scheme: alternate",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.SetTilingScheme(layout.SchemeAlternate) {
+					m.ShowNotification("Tiling scheme: alternate", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Set tiling scheme: smart split",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.SetTilingScheme(layout.SchemeSmartSplit) {
+					m.ShowNotification("Tiling scheme: smart split", "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Cycle master position",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if pos := m.CycleMasterPosition(); pos != "" {
+					m.ShowNotification(MasterPositionMessage(m, pos), "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+	}
+	for _, pos := range config.MasterPositions {
+		items = append(items, CommandPaletteItem{
+			Name:     "Set master position: " + pos,
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.SetMasterPosition(pos) {
+					m.ShowNotification(MasterPositionMessage(m, pos), "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		})
+	}
+	return append(items, []CommandPaletteItem{
+		{
+			Name:     "Add a master pane",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if n := m.AddMaster(); n > 0 {
+					m.ShowNotification(MasterCountMessage(m, n), "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Remove a master pane",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if n := m.RemoveMaster(); n > 0 {
+					m.ShowNotification(MasterCountMessage(m, n), "info", s.NotificationDuration)
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Swap with master pane",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.SwapWithMaster()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Focus master pane",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.FocusMaster()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Snap fullscreen",
+			Shortcut: "prefix+z",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if !m.AutoTiling && len(m.Windows) > 0 && m.FocusedWindow >= 0 {
+					m.Snap(m.FocusedWindow, SnapFullScreen)
+				}
+				return m, nil
+			},
+		},
+
+		// Layout templates
+		{
+			Name:     "Save layout",
+			Shortcut: "",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ShowLayoutPicker = true
+				m.LayoutPickerMode = "save"
+				m.LayoutSaveBuffer = ""
+				return m, nil
+			},
+		},
+		{
+			Name:     "Load layout",
+			Shortcut: "prefix+L",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				templates, _ := LoadLayoutTemplates()
+				m.ShowLayoutPicker = true
+				m.LayoutPickerMode = "load"
+				m.LayoutPickerItems = templates
+				m.LayoutPickerQuery = ""
+				m.LayoutPickerSelected = 0
+				m.LayoutPickerScroll = 0
+				return m, nil
+			},
+		},
+
+		// Navigation
+		{
+			Name:     "Next window",
+			Shortcut: "prefix+n",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.CycleToNextVisibleWindow()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Previous window",
+			Shortcut: "prefix+p",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.CycleToPreviousVisibleWindow()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Workspace 1",
+			Shortcut: "prefix+w 1",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.SwitchToWorkspace(1)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Workspace 2",
+			Shortcut: "prefix+w 2",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.SwitchToWorkspace(2)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Workspace 3",
+			Shortcut: "prefix+w 3",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.SwitchToWorkspace(3)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Workspace 4",
+			Shortcut: "prefix+w 4",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.SwitchToWorkspace(4)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Workspace 5",
+			Shortcut: "prefix+w 5",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.SwitchToWorkspace(5)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Workspace 6",
+			Shortcut: "prefix+w 6",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.SwitchToWorkspace(6)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Workspace 7",
+			Shortcut: "prefix+w 7",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.SwitchToWorkspace(7)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Workspace 8",
+			Shortcut: "prefix+w 8",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.SwitchToWorkspace(8)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Workspace 9",
+			Shortcut: "prefix+w 9",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.SwitchToWorkspace(9)
+				return m, nil
+			},
+		},
+
+		// Layout
+		{
+			Name:     "Next layout",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.NextLayout()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Previous layout",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.PrevLayout()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Toggle multifocus",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ToggleMultifocus(m.FocusedWindow)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Toggle multifocus on all panes",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ToggleMultifocusAll()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Close workspace",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenWorkspaceClose()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Clear multifocus",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ClearMultifocus()
+				return m, nil
+			},
+		},
+		// Layout mode: individual commands
+		{
+			Name:     "Layout: BSP tiling",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.EnableBSPLayout()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Layout: master-stack",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.EnableMasterStackLayout()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Layout: scrolling (niri-style)",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.EnableScrollingLayout()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Layout: disable tiling",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.DisableAllTiling()
+				return m, nil
+			},
+		},
+		// Scrolling-specific actions
+		{
+			Name:     "Scroll: cycle column width",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.UseScrollingLayout {
+					m.ScrollingCycleWidth()
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Scroll: maximize column width",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.UseScrollingLayout {
+					m.ScrollingMaximizeColumn()
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Scroll: move window into the column below",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.UseScrollingLayout {
+					m.ScrollingConsumeWindow()
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Scroll: move window out to its own column",
+			Category: "Layout",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				if m.UseScrollingLayout {
+					m.ScrollingExpelWindow()
+				}
+				return m, nil
+			},
+		},
+		// Scrollback
+		{
+			Name:     "Edit scrollback in $EDITOR",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.EditScrollbackInEditor()
+			},
+		},
+		// Floating
+		{
+			Name:     "Toggle floating",
+			Category: "Window",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ToggleFloating()
+				return m, nil
+			},
+		},
+		// Navigation
+		{
+			// No Shortcut: the aggregate view has no default binding and is
+			// reached from this palette (or a user binding) only.
+			Name:     "All windows",
+			Category: "Navigation",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ShowAggregateView = true
+				m.AggregateViewQuery = ""
+				m.AggregateViewSelected = 0
+				m.AggregateViewScroll = 0
+				return m, nil
+			},
+		},
+		// Session & Config
+		{
+			// The palette's own way in to making a session, which had none.
+			// It was a one-cell "+" on a rail heading, and the rail is not
+			// always open.
+			Name:     "New session",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenNewSessionPicker()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Settings",
+			Shortcut: "prefix+,",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenSettings()
+				return m, nil
+			},
+		},
+		{
+			// The Agents tab, where each harness's integration is shown,
+			// installed and updated. Left out while the tab is.
+			Name:     paletteAgentsSettingsName,
+			Shortcut: "prefix+A",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenAgentsSettings()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Theme picker",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenThemePicker()
+				return m, nil
+			},
+		},
+		// Keybinds. Three rows onto one overlay, because "change a key" and
+		// "stop tuios taking a key" are the two things people come here for and
+		// neither of them is spelled "keybind manager". Two of the three spend
+		// their meta slot on the "#" token, which is the part nothing else
+		// would ever tell the user about.
+		{
+			Name:     "Keybind manager",
+			Shortcut: "prefix+k",
+			Category: PaletteCategoryKeybind,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenKeybindManager()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Rebind a key",
+			Shortcut: "or type #close",
+			Category: PaletteCategoryKeybind,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenKeybindManager()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Unbind a key",
+			Shortcut: "or type #close",
+			Category: PaletteCategoryKeybind,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenKeybindManager()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Reload config",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				configPath, err := config.GetConfigPath()
+				if err != nil {
+					m.ShowNotification("Config path error: "+err.Error(), "error", 0)
+					return m, nil
+				}
+				newCfg, err := config.ReloadConfig(configPath)
+				if err != nil {
+					// The running config stands. Saying so is the point: a
+					// reload that quietly did nothing reads as a reload that
+					// worked.
+					m.ShowNotification("Config not reloaded: "+err.Error(), "error", 0)
+					return m, nil
+				}
+				cmd := m.ApplyReloadedConfig(newCfg)
+				m.ShowNotification("Config reloaded", "success", 0)
+				return m, cmd
+			},
+		},
+		{
+			Name:     "Toggle sidebar",
+			Shortcut: "prefix+b",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ToggleSidebar()
+				state := "off"
+				if s.SidebarEnabled {
+					state = "on"
+				}
+				m.ShowNotification("Sidebar "+state, "success", s.NotificationDuration)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Toggle focus follows mouse",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				save := m.ToggleFocusFollowsMouse()
+				state := "off"
+				if s.FocusFollowsMouse {
+					state = "on"
+				}
+				m.ShowNotification("Focus follows mouse "+state, "success", s.NotificationDuration)
+				return m, save
+			},
+		},
+		{
+			Name:     "Switch session",
+			Shortcut: "prefix+S",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenSessionSwitcher()
+				return m, nil
+			},
+		},
+		{
+			// The agent mailbox: the messages agents leave for each other and
+			// for the person, and the place to answer one.
+			// It was "Mail: open inbox" on prefix+M; the Inbox is its own thing
+			// now, and prefix+M opens it on its mail.
+			//
+			// The agent rows lead with "Agents:" so typing "agent" finds them.
+			// It found "Window management mode", which fuzzy-matches the
+			// letters, and nothing to do with agents. Each keeps the word its
+			// overlay is called by (Inbox, mailbox), so those still find them.
+			Name:     "Agents: open mailbox",
+			Category: paletteCategoryAgents,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.OpenAgentMail()
+			},
+		},
+		{
+			// The Inbox: everything waiting for the person, in every session.
+			Name:     "Agents: Inbox, what is waiting for you",
+			Shortcut: "prefix+i",
+			Category: paletteCategoryAgents,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenInbox("")
+				return m, nil
+			},
+		},
+		{
+			Name:     "Agents: go to the oldest waiting",
+			Shortcut: "prefix+o",
+			Category: paletteCategoryAgents,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.JumpToNextAttention()
+			},
+		},
+		{
+			// The review overlay on the focused pane's changes. The word
+			// "review" finds it, like "Review changes" in the prefix menu.
+			Name:     paletteReviewName,
+			Shortcut: "prefix+v",
+			Category: paletteCategoryAgents,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				cmd, _ := m.ReviewFocusedPane()
+				return m, cmd
+			},
+		},
+		{
+			// prefix+M had no palette row; "open mailbox" above opens a
+			// different view, every thread rather than mail for you.
+			Name:     "Agents: Inbox, mail for you",
+			Shortcut: "prefix+M",
+			Category: paletteCategoryAgents,
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenInbox(session.AttentionMail)
+				return m, nil
+			},
+		},
+		{
+			Name:     "Show help",
+			Shortcut: "prefix+?",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ShowHelp = !m.ShowHelp
+				if m.ShowHelp {
+					m.HelpScrollOffset = 0
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Show logs",
+			Shortcut: "prefix+D l",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ToggleLogViewer()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Toggle scrollback browser",
+			Shortcut: "prefix+s",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ShowScrollbackBrowser = !m.ShowScrollbackBrowser
+				return m, nil
+			},
+		},
+		{
+			Name:     "Panes: find a pane in every session",
+			Shortcut: "prefix+/",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.OpenNavigator()
+			},
+		},
+		{
+			Name:     "Hints: label text on the pane to copy it",
+			Shortcut: "prefix+F",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenHints()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Scratch: show or hide the scratch terminal",
+			Shortcut: "prefix+g",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				return m, m.ToggleScratch()
+			},
+		},
+		{
+			Name:     "Panes: label the panes and focus one",
+			Shortcut: "prefix+Q",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenPaneLabels()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Hints: label text on all panes to copy it",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenHintsAllPanes()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Toggle show keys",
+			Shortcut: "prefix+D k",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				save := m.ToggleShowKeys()
+				state := "off"
+				if m.ShowKeys {
+					state = "on"
+				}
+				m.ShowNotification("Show keys "+state, "success", s.NotificationDuration)
+				return m, save
+			},
+		},
+		{
+			Name:     "Picture in picture: pin or unpin the focused pane",
+			Shortcut: "p",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.TogglePiP()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Toggle spotlight",
+			Shortcut: "B",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				save := m.ToggleSpotlight()
+				m.AnnounceSpotlight()
+				return m, save
+			},
+		},
+		{
+			Name:     "Toggle animations",
+			Shortcut: "prefix+D a",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				_ = m.ToggleAnimations()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Window management mode",
+			Shortcut: "prefix+esc",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.Mode = WindowManagementMode
+				m.ShowNotification("Window management mode", "info", s.NotificationDuration)
+				if focusedWindow := m.GetFocusedWindow(); focusedWindow != nil {
+					focusedWindow.InvalidateCache()
+				}
+				return m, nil
+			},
+		},
+		{
+			Name:     "Tape: review the project tape",
+			Shortcut: "prefix+T t",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.OpenTapeReview()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Open the tape manager",
+			Shortcut: "prefix+T m",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.ToggleTapeManager()
+				return m, nil
+			},
+		},
+		{
+			Name:     "Enter copy mode",
+			Shortcut: "prefix+[",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.EnterCopyModeFocused()
+				return m, nil
+			},
+		},
+		{
+			// No Shortcut: copy_mode_search_forward has no default binding.
+			Name:     "Copy mode: search forward",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.EnterCopyModeSearch(false)
+				return m, nil
+			},
+		},
+		{
+			// No Shortcut: copy_mode_search_backward has no default binding.
+			Name:     "Copy mode: search backward",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.EnterCopyModeSearch(true)
+				return m, nil
+			},
+		},
+		{
+			Name:     paletteMultiCopyName,
+			Shortcut: "prefix+[ with multifocus",
+			Category: "Session",
+			Action: func(m *OS) (*OS, tea.Cmd) {
+				m.EnterMultiCopyMode()
+				return m, nil
+			},
+		},
+	}...)
+}
+
+// paletteStateTokens are the states a leading "@" token narrows the palette to.
+// Resolved by prefix in this order, so "@a" is attention, "@w" working, "@n"
+// needs input, "@d" done, "@i" idle and "@e" errored: one keystroke past the
+// "@", which is what makes "who needs me" worth typing at all.
+//
+// attention is first and is the reason the mechanism exists. It is the rail's
+// own definition of a state that wants a human (sidebarAttention), so the
+// palette and the rail's gutter mark can never come to mean different things.
+var paletteStateTokens = []struct {
+	name   string
+	states []string
+}{
+	{"attention", []string{"needs_input", "errored"}},
+	{"working", []string{"working"}},
+	{"needs_input", []string{"needs_input"}},
+	{"done", []string{"done"}},
+	{"idle", []string{"idle"}},
+	{"errored", []string{"errored"}},
+}
+
+// splitPaletteQuery pulls a leading "@state" token off a query and reports the
+// states it admits, whether one was present at all, and the text left to match
+// on. A bare "@" names no state and admits every entry that carries one, which
+// is the halfway house the user is in while typing the next character.
+//
+// An "@" naming nothing (a typo, or a state this build does not have) admits
+// nothing: a filter the user typed and that quietly did not apply is worse than
+// an empty list, which at least says so.
+func splitPaletteQuery(query string) (states []string, filtered bool, rest string) {
+	tok, after, _ := strings.Cut(strings.TrimSpace(query), " ")
+	if !strings.HasPrefix(tok, "@") {
+		return nil, false, query
+	}
+	rest = strings.TrimSpace(after)
+	name := strings.ToLower(tok[1:])
+	if name == "" {
+		return nil, true, rest
+	}
+	for _, t := range paletteStateTokens {
+		if strings.HasPrefix(t.name, name) {
+			return t.states, true, rest
+		}
+	}
+	return []string{}, true, rest
+}
+
+// paletteStateMatches reports whether an entry survives a state filter. Only the
+// session and window entries carry a state, so filtering by one is also what
+// drops every static command: "@attention" is a question about panes.
+func paletteStateMatches(item CommandPaletteItem, states []string) bool {
+	if item.AgentState == "" {
+		return false
+	}
+	if states == nil {
+		return true // a bare "@": anything running an agent
+	}
+	return slices.Contains(states, item.AgentState)
+}
+
+// FilterCommandPalette filters command palette items by a query string, best
+// match first, after an optional leading "@state" token narrows the list to the
+// panes in that state (see splitPaletteQuery).
+//
+// Matching is the shared scored matcher, so one box ranks static commands and
+// panes against each other. Name is matched on its own and Category is a weaker
+// fallback, so a row admitted only by its section name can never outrank one
+// that matched what it actually says.
+func FilterCommandPalette(items []CommandPaletteItem, query string) []CommandPaletteItem {
+	// The keybind token is resolved first and it is exclusive both ways: "#" is
+	// a search over actions, so it admits nothing else, and every other query
+	// admits no action rows. A few hundred actions leaking into an ordinary
+	// search would bury the commands the palette is for.
+	keybinds, keybindRest := splitPaletteKeybinds(query)
+	kept := make([]CommandPaletteItem, 0, len(items))
+	for _, item := range items {
+		if item.Keybind == keybinds {
+			kept = append(kept, item)
+		}
+	}
+	items = kept
+	if keybinds {
+		// Straight to the matcher rather than back through this function: the
+		// text after the token carries no token of its own, and re-entering
+		// would partition the list a second time and throw away every row.
+		return matchPaletteItems(items, keybindRest)
+	}
+	if states, filtered, rest := splitPaletteQuery(query); filtered {
+		kept := make([]CommandPaletteItem, 0, len(items))
+		for _, item := range items {
+			if paletteStateMatches(item, states) {
+				kept = append(kept, item)
+			}
+		}
+		// The scored matcher runs over what is left, so "@a server" still ranks a
+		// prefix hit above a mid-word one.
+		return matchPaletteItems(kept, rest)
+	}
+	// The setting rows are matched on their own and put after everything
+	// else, so the few hundred of them never bury a command, and an empty
+	// query does not list them at all.
+	commands := make([]CommandPaletteItem, 0, len(items))
+	var settings []CommandPaletteItem
+	for _, item := range items {
+		if item.Setting {
+			settings = append(settings, item)
+		} else {
+			commands = append(commands, item)
+		}
+	}
+	if paletteGrouped(query) {
+		return groupPaletteItems(commands)
+	}
+	out := matchPaletteItems(commands, query)
+	if strings.TrimSpace(query) == "" || len(settings) == 0 {
+		return out
+	}
+	// A setting row is matched as "Settings: <name>", so typing the word the
+	// row is tagged with reaches it, and drawn as its name alone beside the
+	// [Settings] tag. The highlight is moved back by the prefix it was matched
+	// with.
+	var m fuzzy.Matcher
+	for _, h := range m.FilterIndex(query, len(settings), func(i int) string { return paletteSettingPrefix + settings[i].Name }) {
+		item := settings[h.Index]
+		item.Match = nil
+		for _, p := range h.Positions {
+			if p >= len(paletteSettingPrefix) {
+				item.Match = append(item.Match, p-len(paletteSettingPrefix))
+			}
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+// paletteGrouped reports whether the palette lists its commands under category
+// headers: only while nothing is typed. A typed query ranks the rows by how
+// well they match, and headers over a ranked list would split it into runs
+// that each restart the ranking.
+func paletteGrouped(query string) bool { return query == "" }
+
+// groupPaletteItems orders items by category, the categories in the order
+// they first appear and the items inside each in the order they were given,
+// so each category is one run under one header.
+func groupPaletteItems(items []CommandPaletteItem) []CommandPaletteItem {
+	rank := map[string]int{}
+	for _, it := range items {
+		if _, ok := rank[it.Category]; !ok {
+			rank[it.Category] = len(rank)
+		}
+	}
+	out := slices.Clone(items)
+	slices.SortStableFunc(out, func(a, b CommandPaletteItem) int { return rank[a.Category] - rank[b.Category] })
+	return out
+}
+
+// paletteSettingPrefix is what a setting row is matched with ahead of its name.
+const paletteSettingPrefix = "Settings: "
+
+// matchPaletteItems is the scored pass, with no token handling: names first,
+// then rows admitted only by their category.
+func matchPaletteItems(items []CommandPaletteItem, query string) []CommandPaletteItem {
+	if query == "" {
+		return items
+	}
+	var m fuzzy.Matcher
+	hits := m.FilterIndex(query, len(items), func(i int) string {
+		return printableTitle(items[i].Name)
+	})
+
+	named := make([]bool, len(items))
+	out := make([]CommandPaletteItem, 0, len(items))
+	for _, h := range hits {
+		named[h.Index] = true
+		item := items[h.Index]
+		item.Match = h.Positions
+		out = append(out, item)
+	}
+
+	// Category hits land after every name hit rather than being scored beside
+	// them. That is the old scoring's intent without its magic numbers: typing
+	// "layout" should list the Layout section, below anything actually called
+	// layout.
+	for i, item := range items {
+		if named[i] || item.Category == "" || !fuzzy.Match(query, item.Category) {
+			continue
+		}
+		item.Match = nil
+		out = append(out, item)
+	}
+	return out
+}

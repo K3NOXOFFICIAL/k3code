@@ -1,0 +1,203 @@
+package app
+
+import (
+	"testing"
+	"time"
+
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+)
+
+// idleOS builds an OS holding n idle daemon windows: live emulators, no pending
+// output, no animations, nothing in flight. It is the fixture for the idle-cost
+// guard, mirroring one attached client with a handful of quiet shells.
+func idleOS(t testing.TB, n int) *OS {
+	t.Helper()
+	wins := make([]*terminal.Window, 0, n)
+	for i := range n {
+		wins = append(wins, newTestWindow(t, "idle-"+string(rune('a'+i)), 80, 24))
+	}
+	return &OS{
+		Settings:       config.Global,
+		Windows:        wins,
+		FocusedWindow:  0,
+		WorkspaceFocus: map[int]int{},
+		NumWorkspaces:  9,
+		Width:          120,
+		Height:         40,
+	}
+}
+
+// BenchmarkIdleTick measures the work and allocations of one maintenance tick
+// when nothing is animating and no process is exiting. This is the number every
+// future milestone's Gate defends: a regression here means the idle path grew a
+// cost. See docs/perf.md for recorded baselines.
+func BenchmarkIdleTick(b *testing.B) {
+	m := idleOS(b, 3)
+	// Prime the frame-skip state the idle path relies on.
+	m.Update(TickerMsg(time.Now()))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.Update(TickerMsg(time.Now()))
+	}
+	b.StopTimer()
+
+	_, work, render := m.TickStats()
+	b.ReportMetric(float64(work)/float64(b.N), "work/tick")
+	b.ReportMetric(float64(render)/float64(b.N), "render/tick")
+}
+
+// TestIdleTickSkipsScans is the idle diet's precise guard: once the model is
+// idle, a run of maintenance ticks must take the fast path and do no scan work,
+// so the Work counter stays flat while Ticks climbs. A regression that puts a
+// full-window scan back on the idle path trips this.
+func TestIdleTickSkipsScans(t *testing.T) {
+	m := idleOS(t, 3)
+	// Settle any first-frame output so the model reaches true idle.
+	for range 5 {
+		m.Update(TickerMsg(time.Now()))
+	}
+	_, work0, _ := m.TickStats()
+
+	const ticks = 100
+	for range ticks {
+		m.Update(TickerMsg(time.Now()))
+	}
+
+	gotTicks, work, _ := m.TickStats()
+	if work != work0 {
+		t.Fatalf("idle ticks did %d units of scan work; the diet must skip them", work-work0)
+	}
+	if gotTicks < ticks {
+		t.Fatalf("Ticks did not advance past %d", ticks)
+	}
+}
+
+// foldConfiguredIdleOS is idleOS with the rail on and the fold of agent rows
+// at rest configured, on a clock that moves a minute every read, and no agent
+// ever seen: the setup of someone with no agents who kept the defaults.
+func foldConfiguredIdleOS(tb testing.TB) *OS {
+	tb.Helper()
+	m := idleOS(tb, 3)
+	m.Settings.SidebarEnabled = true
+	m.Settings.SidebarAgentRestFold = time.Hour
+	clock := time.Unix(1_800_000_000, 0)
+	prev := sidebarFoldClock
+	sidebarFoldClock = func() time.Time {
+		clock = clock.Add(time.Minute)
+		return clock
+	}
+	tb.Cleanup(func() { sidebarFoldClock = prev })
+	return m
+}
+
+// BenchmarkIdleTickFoldConfigured is BenchmarkIdleTick with the rail on and
+// the agent fold configured but no agent present. The fold must add nothing
+// to the idle path: no scan, no frame, whatever the clock does.
+func BenchmarkIdleTickFoldConfigured(b *testing.B) {
+	m := foldConfiguredIdleOS(b)
+	m.Update(TickerMsg(time.Now()))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.Update(TickerMsg(time.Now()))
+	}
+	b.StopTimer()
+
+	_, work, render := m.TickStats()
+	b.ReportMetric(float64(work)/float64(b.N), "work/tick")
+	b.ReportMetric(float64(render)/float64(b.N), "render/tick")
+}
+
+// railCustomIdleOS is idleOS with the rail on and its custom section placed
+// and loaded in a real dock engine, with a command on an event refresh. The
+// focused pane reports a folder, which is the case that would stat. It
+// returns once the run at start has landed, so a measurement sees only the
+// idle path and not a subprocess starting beside it.
+func railCustomIdleOS(tb testing.TB) *OS {
+	tb.Helper()
+	m := idleOS(tb, 3)
+	m.Settings.SidebarEnabled = true
+	m.Settings.SidebarSections = "sessions,terminals,custom:40"
+	cfg := config.DefaultConfig()
+	cfg.Appearance.Sidebar.Custom = config.SidebarCustomConfig{Command: "true", Refresh: "event:window-focused"}
+	m.UserConfig = cfg
+	m.Windows[0].Cwd = "file://" + tb.TempDir()
+	m.InitDockComponents()
+	tb.Cleanup(m.StopDockComponents)
+	if !m.railCustom.on {
+		tb.Fatal("the engine was built without the rail's custom section")
+	}
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case u := <-m.dockEngine.Updates():
+			if u.Name == railCustomComponent {
+				return m
+			}
+		case <-deadline:
+			tb.Fatal("the section's run at start never landed")
+		}
+	}
+}
+
+// BenchmarkIdleTickRailCustom is BenchmarkIdleTick with the rail's custom
+// section placed and running. Its sync runs on every message, on the update
+// goroutine, so it must cost an idle tick no allocation and no stat beyond
+// what BenchmarkIdleTick pays.
+func BenchmarkIdleTickRailCustom(b *testing.B) {
+	m := railCustomIdleOS(b)
+	m.Update(TickerMsg(time.Now()))
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m.Update(TickerMsg(time.Now()))
+	}
+	b.StopTimer()
+
+	_, work, render := m.TickStats()
+	b.ReportMetric(float64(work)/float64(b.N), "work/tick")
+	b.ReportMetric(float64(render)/float64(b.N), "render/tick")
+}
+
+// TestIdleTickRailCustomAllocatesNoMore guards the same budget: an idle tick
+// with the section running allocates no more than one without it. A parse of
+// the refresh or a resolve of the pane's folder that crept back into the
+// per-message sync would be paid ten times a second by an idle client.
+func TestIdleTickRailCustomAllocatesNoMore(t *testing.T) {
+	off, on := idleOS(t, 3), railCustomIdleOS(t)
+	for range 5 {
+		off.Update(TickerMsg(time.Now()))
+		on.Update(TickerMsg(time.Now()))
+	}
+	offAllocs := testing.AllocsPerRun(500, func() { off.Update(TickerMsg(time.Now())) })
+	onAllocs := testing.AllocsPerRun(500, func() { on.Update(TickerMsg(time.Now())) })
+	if onAllocs > offAllocs {
+		t.Fatalf("an idle tick allocates %v times with the rail's custom section running and %v without it", onAllocs, offAllocs)
+	}
+}
+
+// TestIdleTickFoldConfiguredWithoutAgents guards the zero-agent promise of
+// the fold: with it configured and minutes passing, idle ticks with no agent
+// ever seen do no scan work and draw no frame.
+func TestIdleTickFoldConfiguredWithoutAgents(t *testing.T) {
+	m := foldConfiguredIdleOS(t)
+	for range 5 {
+		m.Update(TickerMsg(time.Now()))
+	}
+	_, work0, render0 := m.TickStats()
+	for range 100 {
+		m.Update(TickerMsg(time.Now()))
+	}
+	_, work, render := m.TickStats()
+	if work != work0 || render != render0 {
+		t.Fatalf("idle ticks with the fold configured and no agent did %d work and drew %d frames", work-work0, render-render0)
+	}
+	if m.SidebarAgentsSeen {
+		t.Fatal("idle ticks marked an agent seen")
+	}
+}

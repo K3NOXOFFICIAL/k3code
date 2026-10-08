@@ -1,0 +1,49 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag matches VERSION
+        run: |
+          test "v$(tr -d '[:space:]' < VERSION)" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != VERSION"; exit 1; }
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: panes/go.mod
+      - name: core wheel
+        working-directory: core
+        run: uv build --wheel --out-dir ../dist
+      - name: TUI dist tarball
+        run: |
+          cd tui
+          npm ci --no-audit --no-fund
+          npm run build:ink
+          npm run build
+          tar -czf "../dist/k3code-tui-${GITHUB_REF_NAME#v}.tar.gz" dist
+      - name: k3 binaries
+        run: |
+          cd panes
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -o "../dist/k3-linux-$arch" ./cmd/k3
+          done
+      - name: checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=""
+          case "${GITHUB_REF_NAME}" in *-*) flags="--prerelease" ;; esac
+          gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --generate-notes $flags

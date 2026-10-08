@@ -1,0 +1,701 @@
+package tuie2e
+
+// Perf measurements: the numbers a user actually feels.
+//
+// These live beside the behavioural e2e tests because they need the same thing
+// those tests need, a real binary in a real PTY with a real daemon behind it.
+// A Go benchmark in the main module can time a render function; it cannot time
+// the path from a keypress to the character on screen, which crosses a socket,
+// a PTY, a shell and a compositor before it gets there.
+//
+// They are gated behind TUIOS_PERF on top of TUIOS_E2E because they are
+// measurements rather than assertions: they take minutes, they report numbers
+// instead of passing or failing, and a number that moved is a thing for a human
+// to read rather than for CI to reject. Wall-clock thresholds in CI would be
+// flaky in exactly the way that trains people to ignore a red build.
+//
+//	cd e2e/tui && TUIOS_E2E=1 TUIOS_PERF=1 go test -count=1 -v -run TestPerf ./...
+//
+// Every number is reported as a distribution, not a mean. Startup and latency
+// both have long right tails (a scheduler hiccup, a cold page fault), and a mean
+// hides which of "usually fast" and "always fast" is true. The median is what a
+// user feels most of the time and p90 is what they complain about.
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/Gaurav-Gosain/tuios/internal/perf"
+	"github.com/Gaurav-Gosain/tuitest"
+)
+
+const (
+	// perfEnv gates the whole file on top of TUIOS_E2E.
+	perfEnv = "TUIOS_PERF"
+
+	// perfCols and perfRows are the maintainer's real host size, the same one
+	// the render benchmarks in internal/app use. Per-frame cost scales with
+	// total cells, so measuring at the default 120x40 would flatter every
+	// number here by a factor of about 2.4.
+	perfCols, perfRows = 207, 55
+
+	// perfPromptMark is the pane shell's prompt, overridden so "the pane is
+	// usable" is a string on screen rather than a guess about a border being
+	// drawn. It has to be a token no chrome would ever paint.
+	perfPromptMark = "TUIOSRDY"
+
+	// perfStartRuns is how many times a startup path is measured. Startup is
+	// seconds-scale work with a wide spread, and each run forks a whole
+	// multiplexer, so this trades resolution against a suite that finishes.
+	perfStartRuns = 7
+
+	// perfKeyRuns is how many keystrokes a latency sample is taken over. It is
+	// the count a p99 has to be an observation rather than an extrapolation: at
+	// 200 the 99th percentile is the second-slowest keystroke, where at the
+	// previous 16 a "p99" would have been the maximum wearing a different name.
+	perfKeyRuns = 200
+
+	// perfLineLen is how many characters are typed onto one comment line before
+	// a fresh one is started. The line must stay inside the narrowest pane the
+	// multi-pane cases produce, or it wraps, the prefix being matched acquires
+	// a newline, and every later sample fails.
+	perfLineLen = 20
+)
+
+// perfGate skips unless perf measurement was asked for explicitly.
+func perfGate(t *testing.T) {
+	t.Helper()
+	if os.Getenv(perfEnv) == "" {
+		t.Skipf("perf: skipping, set %s=1 to measure (minutes, not seconds)", perfEnv)
+	}
+}
+
+// perfEnvVars is the environment every perf instance runs with: a prompt that
+// announces itself, so "usable pane" is observable.
+func perfEnvVars() []string {
+	return []string{"PS1=" + perfPromptMark + "$ "}
+}
+
+// dist is a set of timings and the shape they came out in.
+//
+// The reduction comes from internal/perf so these numbers and the in-process
+// ones are the same quantiles computed the same way, which is what makes the
+// two harnesses comparable. This module sits under that import path, so the
+// internal rule allows it.
+type dist = perf.Dist
+
+func report(t *testing.T, d dist, what string) {
+	t.Helper()
+	if len(d) == 0 {
+		t.Errorf("%s: no samples", what)
+		return
+	}
+	t.Log(d.Line(what))
+}
+
+// round trims a duration to a resolution worth printing. Sub-millisecond digits
+// on a wall-clock measurement of a process starting are noise dressed as
+// precision.
+func round(d time.Duration) time.Duration {
+	if d < time.Millisecond {
+		return d.Round(10 * time.Microsecond)
+	}
+	return d.Round(100 * time.Microsecond)
+}
+
+// waitTextAt blocks until substr is on screen and returns how long that took,
+// measured from the moment the caller says the clock started. tuitest wakes its
+// waiters when the emulator consumes output rather than on a poll tick, so the
+// resolution here is the read, not a polling interval.
+func waitTextAt(t *testing.T, term *tuitest.Terminal, start time.Time, substr string, timeout time.Duration) time.Duration {
+	t.Helper()
+	if err := term.WaitForText(substr, timeout); err != nil {
+		t.Fatalf("perf: never saw %q: %v\n%s", substr, err, term.Snapshot())
+	}
+	return time.Since(start)
+}
+
+// ---------------------------------------------------------------------------
+// Startup
+
+// TestPerfStartupCold measures `tuios new` from a machine with no daemon: fork,
+// exec, daemon spawn, socket handshake, first frame. This is the slowest path a
+// user ever takes and the first impression the program makes.
+func TestPerfStartupCold(t *testing.T) {
+	perfGate(t)
+	var boot dist
+	for i := range perfStartRuns {
+		t.Run(fmt.Sprintf("run%d", i), func(t *testing.T) {
+			t0 := time.Now()
+			term, _ := start(t, startOpts{
+				cols: perfCols, rows: perfRows,
+				args: []string{"new", fmt.Sprintf("perf%d", i)},
+				env:  perfEnvVars(),
+			})
+			boot = append(boot, waitTextAt(t, term, t0, welcomeText, bootTimeout))
+		})
+	}
+	report(t, boot, "startup/cold: exec -> first frame")
+}
+
+// da1Query is the primary device attributes request tuios ends its capability
+// probe with, and da1Reply is what a terminal supporting sixel answers.
+const (
+	da1Query = "\x1b[c"
+	da1Reply = "\x1b[?62;4c"
+)
+
+// da1Watcher spots the capability probe in the PTY stream and says so, once.
+// The harness mirrors both directions of the PTY through this writer, which is
+// the only place a test can see a query that never reaches the grid.
+type da1Watcher struct {
+	seen chan struct{}
+}
+
+func (w *da1Watcher) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), da1Query) {
+		select {
+		case w.seen <- struct{}{}:
+		default:
+		}
+	}
+	return len(p), nil
+}
+
+// TestPerfStartupAnsweringHost is the startup number for a terminal that
+// answers, which is every real one: DA1 is universally implemented.
+//
+// The other startup tests measure the opposite extreme, because the harness's
+// emulator replies to nothing, so what they report is the probe's backstop
+// rather than its cost. This one plays the part of a real terminal by watching
+// for the probe on the wire and answering it, which is the difference between
+// measuring a timeout and measuring a round trip.
+func TestPerfStartupAnsweringHost(t *testing.T) {
+	perfGate(t)
+	var boot dist
+	for i := range perfStartRuns {
+		t.Run(fmt.Sprintf("run%d", i), func(t *testing.T) {
+			// Buffered, so a probe that goes out before the terminal handle
+			// exists is remembered rather than dropped.
+			watcher := &da1Watcher{seen: make(chan struct{}, 1)}
+			t0 := time.Now()
+			term, _ := start(t, startOpts{
+				cols: perfCols, rows: perfRows,
+				args: []string{"new", fmt.Sprintf("answer%d", i)},
+				env:  perfEnvVars(),
+				out:  watcher,
+			})
+
+			replied := make(chan struct{})
+			go func() {
+				defer close(replied)
+				select {
+				case <-watcher.seen:
+					_ = term.Type(da1Reply)
+				case <-time.After(bootTimeout):
+				}
+			}()
+
+			boot = append(boot, waitTextAt(t, term, t0, welcomeText, bootTimeout))
+			<-replied
+		})
+	}
+	report(t, boot, "startup/answering host: exec -> first frame")
+}
+
+// TestPerfStartupWarm measures the same thing against a daemon that is already
+// up, which is every launch after the first. The gap between this and the cold
+// number is what starting the daemon costs.
+func TestPerfStartupWarm(t *testing.T) {
+	perfGate(t)
+	base := t.TempDir()
+
+	// The first client is the one that pays for the daemon; it is warmup, not a
+	// sample, and it stays alive so the daemon it started stays up.
+	warm := startIn(t, base, startOpts{cols: perfCols, rows: perfRows, args: []string{"new", "keeper"}, env: perfEnvVars()})
+	waitBoot(t, warm)
+
+	var boot dist
+	for i := range perfStartRuns {
+		t0 := time.Now()
+		term := startIn(t, base, startOpts{
+			cols: perfCols, rows: perfRows,
+			args: []string{"new", fmt.Sprintf("warm%d", i)},
+			env:  perfEnvVars(),
+		})
+		boot = append(boot, waitTextAt(t, term, t0, welcomeText, bootTimeout))
+		// Closed here rather than left to the test's cleanup so only one client
+		// at a time is attached; a pile of live clients would make each later
+		// run measure a daemon fanning state out to all of them.
+		_ = term.Close()
+	}
+	report(t, boot, "startup/warm: exec -> first frame")
+}
+
+// TestPerfFirstPane measures the other half of "new to a usable pane": from the
+// welcome screen, the keystroke that creates a window through to that window's
+// shell having printed its prompt. Forking a PTY and a shell is in here, so it
+// is a floor set partly by the OS.
+func TestPerfFirstPane(t *testing.T) {
+	perfGate(t)
+	var pane dist
+	for i := range perfStartRuns {
+		t.Run(fmt.Sprintf("run%d", i), func(t *testing.T) {
+			term, _ := start(t, startOpts{
+				cols: perfCols, rows: perfRows,
+				args: []string{"new", fmt.Sprintf("pane%d", i)},
+				env:  perfEnvVars(),
+			})
+			waitBoot(t, term)
+			t0 := time.Now()
+			if err := term.SendKeys("n"); err != nil {
+				t.Fatalf("send 'n': %v", err)
+			}
+			pane = append(pane, waitTextAt(t, term, t0, perfPromptMark, uiTimeout))
+		})
+	}
+	report(t, pane, "startup/first pane: 'n' -> prompt")
+}
+
+// TestPerfAttach measures `tuios attach` to a session that already exists and
+// already has content: the client's cost to fetch state and paint a screen,
+// with no session creation in it. Measured with one pane and with eight,
+// because what the daemon sends on attach scales with the session and this is
+// where that shows up.
+func TestPerfAttach(t *testing.T) {
+	perfGate(t)
+	for _, panes := range []int{1, 8} {
+		t.Run(fmt.Sprintf("panes%d", panes), func(t *testing.T) {
+			base := t.TempDir()
+			seed := startIn(t, base, startOpts{cols: perfCols, rows: perfRows, args: []string{"new", "attachme"}, env: perfEnvVars()})
+			waitBoot(t, seed)
+			for range panes {
+				newWindow(t, seed)
+			}
+			// Detach the seeding client so attach is measured against a session
+			// nobody is watching, which is what reattaching after a detach is.
+			_ = seed.Close()
+
+			var att dist
+			for range perfStartRuns {
+				t0 := time.Now()
+				term := startIn(t, base, startOpts{
+					cols: perfCols, rows: perfRows,
+					args: []string{"attach", "attachme"},
+					env:  perfEnvVars(),
+				})
+				att = append(att, waitTextAt(t, term, t0, perfPromptMark, bootTimeout))
+				_ = term.Close()
+			}
+			report(t, att, fmt.Sprintf("attach/%d panes: exec -> rendered", panes))
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Input latency
+
+// typeLatency measures the echo round trip of single keystrokes into the
+// focused pane: client to daemon to PTY, the shell's own echo back, and the
+// compositor painting it.
+//
+// The keys are typed onto a line that starts with '#', so the shell treats the
+// whole accumulated line as a comment and nothing typed here ever runs. Each
+// keystroke is matched on the whole prefix typed so far, which is unique at
+// every length, so a match cannot be satisfied by an earlier iteration's
+// character. That is also why the run count is capped: the line must not wrap
+// inside the pane, or the prefix acquires a newline and stops matching.
+func typeLatency(t *testing.T, term *tuitest.Terminal) dist {
+	t.Helper()
+	const alphabet = "abcdefghijklmnopqrstuvwxyz"
+
+	var d dist
+	var line string
+	for i := range perfKeyRuns {
+		// A line can only grow so far before it wraps, so the run is broken
+		// into several. Each new line opens with a marker letter unique to its
+		// cycle, which is what keeps the growing prefixes from colliding: the
+		// finished lines stay on screen above, and a fresh "#a" would otherwise
+		// be matched by the first line that ever started that way.
+		if i%perfLineLen == 0 {
+			marker := fmt.Sprintf("#%c", 'A'+i/perfLineLen)
+			if i > 0 {
+				// Leave the finished line behind. It is a comment, so the shell
+				// runs nothing and simply prints a fresh prompt.
+				if err := term.SendKeys(tuitest.Enter); err != nil {
+					t.Fatalf("end line: %v", err)
+				}
+			}
+			if err := term.SendKeys(marker); err != nil {
+				t.Fatalf("send marker %q: %v", marker, err)
+			}
+			if err := term.WaitForText(marker, uiTimeout); err != nil {
+				t.Fatalf("marker %q never echoed: %v\n%s", marker, err, term.Snapshot())
+			}
+			line = marker
+		}
+
+		ch := string(alphabet[i%len(alphabet)])
+		line += ch
+		t0 := time.Now()
+		if err := term.SendKeys(ch); err != nil {
+			t.Fatalf("send %q: %v", ch, err)
+		}
+		d = append(d, waitTextAt(t, term, t0, line, uiTimeout))
+	}
+	return d
+}
+
+// TestPerfInputLatency is the number that decides whether an editor in a pane
+// feels native. It is measured with one pane and with eight, because every open
+// pane is work the compositor does on the frame that carries the keystroke, and
+// if that cost is on the critical path it shows up as a slower echo.
+func TestPerfInputLatency(t *testing.T) {
+	perfGate(t)
+	for _, panes := range []int{1, 4, 8} {
+		t.Run(fmt.Sprintf("panes%d", panes), func(t *testing.T) {
+			term, _ := start(t, startOpts{
+				cols: perfCols, rows: perfRows,
+				args: []string{"new", fmt.Sprintf("lat%d", panes)},
+				env:  perfEnvVars(),
+			})
+			waitBoot(t, term)
+			for range panes {
+				newWindow(t, term)
+			}
+			if panes > 1 {
+				// Tiling is on by default, and the spiral gives the newest
+				// window the smallest tile: at eight panes it is 11 columns,
+				// too narrow for the typed line. Tab wraps focus to the first
+				// window, which holds the largest tile. Every pane is still
+				// drawn on each frame.
+				if err := term.SendKeys(tuitest.Tab); err != nil {
+					t.Fatalf("tab: %v", err)
+				}
+			}
+			enterTerminalMode(t, term)
+			report(t, typeLatency(t, term), fmt.Sprintf("input latency/%d panes", panes))
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Throughput under load
+
+// floodCmd keeps a pane producing output as fast as the emulator will take it.
+// `yes` is used rather than a loop with a sleep because the interesting
+// question is what happens when a pane is saturating the pipe, not what happens
+// when it is polite.
+const floodCmd = "yes tuiosflood"
+
+// TestPerfTypeWhileFlooding is the case that makes a multiplexer feel bad and
+// the one nobody benchmarks: one pane is dumping output at full speed while the
+// user types in another. If output handling and input handling share a critical
+// section, or if a flooded pane forces frames the typed pane has to wait behind,
+// it shows up here as a latency far worse than the idle number from
+// TestPerfInputLatency, which is the comparison this test exists to make.
+func TestPerfTypeWhileFlooding(t *testing.T) {
+	perfGate(t)
+	for _, floods := range []int{1, 3} {
+		t.Run(fmt.Sprintf("flooding%d", floods), func(t *testing.T) {
+			term, _ := start(t, startOpts{
+				cols: perfCols, rows: perfRows,
+				args: []string{"new", fmt.Sprintf("flood%d", floods)},
+				env:  perfEnvVars(),
+			})
+			waitBoot(t, term)
+
+			// One pane to type in plus the flooding ones. The typing pane is
+			// created first so Tab lands back on it after the floods are armed.
+			for range floods + 1 {
+				newWindow(t, term)
+			}
+
+			for range floods {
+				if err := term.SendKeys(tuitest.Tab); err != nil {
+					t.Fatalf("tab: %v", err)
+				}
+				enterTerminalMode(t, term)
+				if err := term.SendKeys(floodCmd, tuitest.Enter); err != nil {
+					t.Fatalf("start flood: %v", err)
+				}
+				if err := term.WaitForText("tuiosflood", shellTimeout); err != nil {
+					t.Fatalf("flood never started: %v\n%s", err, term.Snapshot())
+				}
+				leaveTerminalMode(t, term)
+			}
+
+			// Back to the pane that is not flooding.
+			if err := term.SendKeys(tuitest.Tab); err != nil {
+				t.Fatalf("tab back: %v", err)
+			}
+			enterTerminalMode(t, term)
+			report(t, typeLatency(t, term), fmt.Sprintf("input latency/%d panes flooding", floods))
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Memory
+
+// perfBase makes an isolation root with its XDG directories already in place,
+// for the tests that drive the CLI without ever starting a TUI client.
+func perfBase(t *testing.T) string {
+	t.Helper()
+	base := t.TempDir()
+	for _, key := range xdgKeys {
+		xdgDir(base, key)
+	}
+	killDaemon(t, base)
+	return base
+}
+
+// daemonRSS reads the resident set size of the daemon rooted at base, in KiB.
+// The daemon is the process worth watching: it owns every pane's PTY, VT
+// emulator and scrollback ring, so both pane count and pane output land here
+// rather than in the client.
+func daemonRSS(t *testing.T, base string) int {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(base, "XDG_RUNTIME_DIR", "tuios", "tuios.sock.pid"))
+	if err != nil {
+		t.Fatalf("read daemon pid: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatalf("parse daemon pid %q: %v", raw, err)
+	}
+	return rssOf(t, pid)
+}
+
+// rssOf reads a process's resident set size in KiB.
+func rssOf(t *testing.T, pid int) int {
+	t.Helper()
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		t.Fatalf("read status of %d: %v", pid, err)
+	}
+	for line := range strings.SplitSeq(string(status), "\n") {
+		if !strings.HasPrefix(line, "VmRSS:") {
+			continue
+		}
+		if fields := strings.Fields(line); len(fields) >= 2 {
+			kib, err := strconv.Atoi(fields[1])
+			if err == nil {
+				return kib
+			}
+		}
+		break
+	}
+	t.Fatalf("no VmRSS in daemon status")
+	return 0
+}
+
+// TestPerfMemoryPanes reports daemon resident size as panes are added, which is
+// what decides whether a session with a lot of panes open is a problem.
+//
+// Panes are created headlessly through the CLI, so no TUI client's own memory
+// is in the figure and the growth per pane is the honest marginal cost.
+func TestPerfMemoryPanes(t *testing.T) {
+	perfGate(t)
+	base := perfBase(t)
+	if out, err := tuiosCLI(t, base, "new", "mem", "--detach"); err != nil {
+		t.Fatalf("create session: %v: %s", err, out)
+	}
+
+	// A detached session starts with one window, so the pane count runs one
+	// ahead of the number of new-window calls made.
+	panes := 1
+	report := func() {
+		// Panes are forked shells; give them a beat to finish starting before
+		// their pages are counted, or the reading is of a half-built pane.
+		time.Sleep(750 * time.Millisecond)
+		rss := daemonRSS(t, base)
+		t.Logf("PERF memory/daemon %2d panes: %6d KiB resident, %4d KiB/pane", panes, rss, rss/panes)
+	}
+	report()
+
+	for _, target := range []int{8, 32} {
+		for panes < target {
+			if out, err := tuiosCLI(t, base, "new-window", "-s", "mem"); err != nil {
+				t.Fatalf("new-window: %v: %s", err, out)
+			}
+			panes++
+		}
+		report()
+	}
+}
+
+// TestPerfMemorySoak asks whether a pane producing a great deal of output
+// settles or keeps growing. Scrollback is capped by config, so a bounded
+// emulator reaches a plateau and stays there; a resident size still climbing
+// after the ring is full is a leak rather than a buffer filling up.
+func TestPerfMemorySoak(t *testing.T) {
+	perfGate(t)
+	base := perfBase(t)
+	if out, err := tuiosCLI(t, base, "new", "soak", "--detach"); err != nil {
+		t.Fatalf("create session: %v: %s", err, out)
+	}
+	time.Sleep(750 * time.Millisecond)
+	t.Logf("PERF memory/soak round 0 (idle): %6d KiB resident", daemonRSS(t, base))
+
+	// Each round is well past the default 10000-line scrollback cap, so the
+	// ring is full from the first round on and later growth is not it filling.
+	for round := 1; round <= 4; round++ {
+		if out, err := tuiosCLI(t, base, "send-text", "-s", "soak", "seq 1 40000\n"); err != nil {
+			t.Fatalf("round %d: %v: %s", round, err, out)
+		}
+		time.Sleep(4 * time.Second)
+		t.Logf("PERF memory/soak round %d (40k lines): %6d KiB resident", round, daemonRSS(t, base))
+	}
+}
+
+// pprofHeapHeld is pprofHeapInUse after a collection, so the figure is what
+// the process holds rather than what it has not swept yet.
+func pprofHeapHeld(addr string) (uint64, error) {
+	body, err := httpGet(fmt.Sprintf("http://%s/debug/pprof/heap?gc=1&debug=1", addr))
+	if err != nil {
+		return 0, err
+	}
+	m := heapInUseRe.FindStringSubmatch(body)
+	if m == nil {
+		return 0, fmt.Errorf("no HeapInuse in profile")
+	}
+	return strconv.ParseUint(m[1], 10, 64)
+}
+
+// startDaemonWithPprof runs the daemon under base with --pprof and returns
+// the address it profiles on, so a client started afterwards attaches to a
+// daemon that can answer for its heap.
+func startDaemonWithPprof(t *testing.T, base string) string {
+	t.Helper()
+	env := os.Environ()
+	for _, key := range xdgKeys {
+		env = append(env, key+"="+xdgDir(base, key))
+	}
+	// The daemon spawns the panes, so it needs the shell startIn gives a
+	// client. Without it the panes run the login shell from the caller's
+	// environment, which on a zsh machine with an isolated home stops at
+	// zsh-newuser-install and never runs a typed command.
+	env = append(env, "SHELL=/bin/sh", "ENV=", "PS1="+perfPromptMark+"$ ")
+	addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	daemon := exec.Command(tuiosBin, "daemon", "--pprof", addr)
+	daemon.Env = env
+	daemon.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := daemon.Start(); err != nil {
+		t.Fatalf("start daemon: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = daemon.Process.Kill()
+		_, _ = daemon.Process.Wait()
+	})
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if _, err := pprofHeapInUse(addr); err == nil {
+			return addr
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the daemon never served /debug/pprof on %s", addr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// windowIDs lists the session's window ids through the CLI.
+func windowIDs(t *testing.T, base, session string) []string {
+	t.Helper()
+	out, err := tuiosCLI(t, base, "list-windows", "-s", session, "--json")
+	if err != nil {
+		t.Fatalf("list-windows: %v: %s", err, out)
+	}
+	var reply struct {
+		Windows []struct {
+			ID string `json:"window_id"`
+		} `json:"windows"`
+	}
+	if err := json.Unmarshal([]byte(out), &reply); err != nil {
+		t.Fatalf("list-windows json: %v: %s", err, out)
+	}
+	ids := make([]string, 0, len(reply.Windows))
+	for _, w := range reply.Windows {
+		ids = append(ids, w.ID)
+	}
+	return ids
+}
+
+// TestPerfMemoryClientAndDaemon reports the resident size and Go heap of an
+// attached client and its daemon at the maintainer's terminal size, as panes
+// open and then fill their scrollback. Both processes hold an emulator per
+// pane, so both are in the figure: the number a user reads off top is the
+// sum. The heap is read after a collection. Resident size runs ahead of it
+// because the runtime lets the heap double between collections and hands
+// pages back slowly.
+func TestPerfMemoryClientAndDaemon(t *testing.T) {
+	perfGate(t)
+	base := perfBase(t)
+	daemonAddr := startDaemonWithPprof(t, base)
+	clientAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	term := startIn(t, base, startOpts{
+		cols: perfCols, rows: perfRows,
+		args: []string{"new", "mem", "--pprof", clientAddr},
+		env:  perfEnvVars(),
+	})
+	waitBoot(t, term)
+
+	report := func(what string) {
+		t.Helper()
+		time.Sleep(750 * time.Millisecond)
+		clientHeap, err := pprofHeapHeld(clientAddr)
+		if err != nil {
+			t.Fatalf("client heap: %v", err)
+		}
+		daemonHeap, err := pprofHeapHeld(daemonAddr)
+		if err != nil {
+			t.Fatalf("daemon heap: %v", err)
+		}
+		t.Logf("PERF memory/%s: client %6d KiB resident (%6d KiB heap), daemon %6d KiB resident (%6d KiB heap)",
+			what, rssOf(t, term.Pid()), clientHeap/1024, daemonRSS(t, base), daemonHeap/1024)
+	}
+	report("boot")
+
+	const panes = 8
+	for i := 1; i <= panes; i++ {
+		newWindow(t, term)
+		if i == 1 {
+			enableTiling(t, term)
+		}
+	}
+	report(fmt.Sprintf("%d panes", panes))
+
+	// Past the default 10000-line ring in every pane. The marker is computed
+	// by the shell so the echo of the command cannot satisfy the wait.
+	ids := windowIDs(t, base, "mem")
+	for _, id := range ids {
+		if out, err := tuiosCLI(t, base, "send-text", "-s", "mem", "-w", id, "seq 1 20000; echo FLOOD$((1+1))DONE\n"); err != nil {
+			t.Fatalf("send-text: %v: %s", err, out)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Minute)
+	for _, id := range ids {
+		for {
+			out, _ := tuiosCLI(t, base, "capture-pane", "-s", "mem", "-w", id, "--lines", "3")
+			// A narrow tile wraps the marker across two rows, and
+			// capture-pane prints each row on its own line.
+			if strings.Contains(strings.ReplaceAll(out, "\n", ""), "FLOOD2DONE") {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("window %s never finished its flood:\n%s", id, out)
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}
+	report(fmt.Sprintf("%d panes, scrollback full", panes))
+}

@@ -1,0 +1,662 @@
+package session
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/Gaurav-Gosain/tuios/internal/plural"
+	"github.com/Gaurav-Gosain/tuios/internal/sessiontree"
+	"github.com/Gaurav-Gosain/tuios/internal/worktree"
+)
+
+// The worktree verbs: a git worktree as a session, and one prompt fanned out
+// across several of them.
+//
+// new-worktree makes the worktree and the session in one call, so a caller
+// never holds a worktree with no session or a session in a directory that is
+// not there. list-worktrees is the listing the CLI and an orchestrating agent
+// read. remove-worktree is the one destructive verb, and it refuses to
+// discard uncommitted work unless told to in so many words. fan is
+// new-worktree n times with an agent started in each and the prompt typed at
+// it once the agent is ready to read.
+
+// Error codes the worktree verbs raise, on top of the shared ones.
+const (
+	// ErrVerbNotWorktree reports a session that is not in a git worktree, so
+	// there is nothing to remove or diff.
+	ErrVerbNotWorktree = "not_worktree"
+	// ErrVerbWorktreeDirty reports a removal refused because the worktree holds
+	// uncommitted changes and the caller did not say what to do with them.
+	// Nothing was removed. The remedy is stash or force, and the hint says so.
+	ErrVerbWorktreeDirty = "worktree_dirty"
+	// ErrVerbGitFailed reports a git command that failed, with git's own
+	// message. It is final: the repository is as it was.
+	ErrVerbGitFailed = "git_failed"
+)
+
+// fanDefaultReadyTimeout bounds how long a fan-out waits for an agent to be
+// ready before it gives up on typing the prompt. It is long because the wait
+// covers a person answering a first-run question in the pane.
+const fanDefaultReadyTimeout = 10 * time.Minute
+
+// fanMaxCount bounds a fan-out. Every worktree is a full checkout and every
+// agent is a process, and a count typed by mistake should not fill a disk.
+const fanMaxCount = 16
+
+// fanReadyStates are the states in which the fan-out types its prompt. idle
+// and done are an agent at its prompt. unknown is not here: it is what the
+// silence timer writes when nothing on the screen said what the agent is
+// doing, and a quiet agent that has not proved it is at its prompt may be
+// mid-startup or mid-call. That holds for the harnesses whose manifests carry
+// an idle rule (harness.Registry.CanProveIdle), which reach idle from their
+// prompt box or title. A harness without one can never show that evidence, so for it
+// agentReady counts unknown as ready, as fan did before idle rules existed.
+// needs_input is not here either: an agent asking to trust the
+// folder must be answered by the person, and the prompt is typed after.
+var fanReadyStates = map[string]bool{
+	AgentStateIdle.Name(): true,
+	AgentStateDone.Name(): true,
+}
+
+// worktreeTarget is what every worktree verb needs from a session: the
+// session itself and its record, or the error saying it has none.
+func (d *Daemon) worktreeTarget(name string) (*Session, *WorktreeInfo, *verbError) {
+	sess, verr := d.resolveVerbSession(name)
+	if verr != nil {
+		return nil, nil, verr
+	}
+	info := sess.Worktree()
+	if info == nil {
+		return nil, nil, hintedVerbError(ErrVerbNotWorktree, "session "+sess.Name()+" is not in a git worktree", &VerbHint{
+			Param:     "session",
+			Verb:      "list-worktrees",
+			Command:   "tuios worktree ls",
+			Available: d.worktreeSessionNames(),
+		})
+	}
+	return sess, info, nil
+}
+
+// worktreeSessionNames lists the sessions that are in a worktree.
+func (d *Daemon) worktreeSessionNames() []string {
+	var out []string
+	for _, s := range d.manager.ListSessions() {
+		if s.Worktree != nil {
+			out = append(out, s.Name)
+		}
+	}
+	return out
+}
+
+// repoRootParam resolves the repo parameter, a directory inside the
+// repository, to the main checkout.
+func repoRootParam(dir string) (string, *verbError) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return "", invalidParam("repo", "repo is required: a directory inside the git repository")
+	}
+	root, err := worktree.Root(dir)
+	if err != nil {
+		return "", hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
+			Param:  "repo",
+			Detail: "repo must be a directory inside a git repository, in its main checkout or in one of its worktrees.",
+		})
+	}
+	return root, nil
+}
+
+// createWorktreeSession is what new-worktree and fan share: the worktree, then
+// the session in it, then the record that ties them. The worktree is never
+// removed on a later failure. It exists on disk and git lists it, and taking
+// it away because a session failed to start would be removing something the
+// caller asked for and can still use.
+func (d *Daemon) createWorktreeSession(root, branch, base, sessionName string, command, env []string, grants *Grants, record func(*WorktreeInfo)) (map[string]any, *verbError) {
+	path := worktree.PathFor(worktree.DefaultDir(), root, branch)
+	if _, err := os.Lstat(path); err == nil {
+		return nil, hintedVerbError(ErrVerbGitFailed, path+" already exists", &VerbHint{
+			Param:  "branch",
+			Detail: "A worktree for this branch is already there. Attach to its session, or remove it with remove-worktree first.",
+		})
+	}
+	if sessionName == "" {
+		sessionName = worktree.SessionName(filepath.Base(root), branch)
+	}
+	if err := ValidateSessionName(sessionName); err != nil {
+		return nil, invalidParam("name", err.Error())
+	}
+	if d.manager.GetSession(sessionName) != nil {
+		return nil, hintedVerbError(ErrVerbSessionExists, "session "+sessionName+" already exists", &VerbHint{
+			Param:     "name",
+			Command:   "tuios ls",
+			Available: d.sessionNames(),
+			Detail:    "Choose another session name with name, or attach to the session that exists.",
+		})
+	}
+
+	created, err := worktree.Add(root, path, branch, base)
+	if err != nil {
+		return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
+			Param:  "branch",
+			Detail: "git refused to add the worktree. The repository is as it was.",
+		})
+	}
+
+	sess, err := d.manager.CreateSession(sessionName, &SessionConfig{}, defaultVerbSessionWidth, defaultVerbSessionHeight)
+	if err != nil {
+		return nil, hintedVerbError(ErrVerbInternal, "the worktree was created at "+path+" but its session could not: "+err.Error(), &VerbHint{
+			Detail: "The worktree is kept. Start a session in it with: tuios new-window --cwd " + path,
+		})
+	}
+	info := &WorktreeInfo{
+		Info: worktree.Info{
+			Repo:     filepath.Base(root),
+			RepoRoot: root,
+			Branch:   branch,
+			Path:     path,
+		},
+		Base:    base,
+		Managed: true,
+	}
+	if record != nil {
+		record(info)
+	}
+	// The record goes on before the window, so a client that adopts the
+	// session on the window's push already sees it under its repository.
+	_ = sess.SetWorktree(info)
+
+	sessionID := sess.ID
+	onExit := func(ptyID string) { d.notifyPTYClosed(sessionID, ptyID) }
+	win, err := sess.AddDaemonWindowWith(NewWindowOptions{
+		Cwd:     path,
+		Focus:   true,
+		Command: command,
+		Env:     env,
+		Grants:  grants,
+	}, onExit)
+	if err != nil {
+		return nil, hintedVerbError(ErrVerbInternal, "the worktree and session were created but the first window could not start: "+err.Error(), &VerbHint{
+			Detail: "Both are kept. Open a window in the session with: tuios new-window -s " + sessionName + " --cwd " + path,
+		})
+	}
+	return map[string]any{
+		"session":        sess.Name(),
+		"session_id":     sess.ID,
+		"repo":           info.Repo,
+		"repo_root":      root,
+		"branch":         branch,
+		"created_branch": created,
+		"path":           path,
+		"window_id":      win.ID,
+		"pty_id":         win.PTYID,
+	}, nil
+}
+
+func (d *Daemon) verbNewWorktree(cs *connState, params json.RawMessage) (any, *verbError) {
+	var p struct {
+		repoSource
+		Branch  string   `json:"branch"`
+		Base    string   `json:"base"`
+		Name    string   `json:"name"`
+		Command []string `json:"command"`
+	}
+	if verr := decodeParams(params, &p); verr != nil {
+		return nil, verr
+	}
+	branch := strings.TrimSpace(p.Branch)
+	if err := worktree.ValidBranch(branch); err != nil {
+		return nil, invalidParam("branch", err.Error())
+	}
+	if len(p.Command) > 0 && p.Command[0] == "" {
+		return nil, invalidParam("command", "command[0] is the program to exec and cannot be empty")
+	}
+	root, cloned, verr := d.resolveRepoSource(cs, "new-worktree", p.repoSource, nil)
+	if verr != nil {
+		return nil, verr
+	}
+	out, verr := d.createWorktreeSession(root, branch, strings.TrimSpace(p.Base), strings.TrimSpace(p.Name), p.Command, nil, nil, nil)
+	if verr != nil {
+		return nil, verr
+	}
+	out["type"] = "worktree_created"
+	if cloned {
+		out["cloned"] = true
+	}
+	return out, nil
+}
+
+func (d *Daemon) verbListWorktrees(_ *connState, params json.RawMessage) (any, *verbError) {
+	var p struct {
+		Repo    string `json:"repo"`
+		Group   string `json:"group"`
+		Changes bool   `json:"changes"`
+	}
+	if verr := decodeParams(params, &p); verr != nil {
+		return nil, verr
+	}
+	rows := make([]map[string]any, 0)
+	for _, s := range d.listSessions() {
+		wt := s.Worktree
+		if wt == nil {
+			continue
+		}
+		if p.Repo != "" && wt.Repo != p.Repo {
+			continue
+		}
+		if p.Group != "" && wt.Group != p.Group {
+			continue
+		}
+		states := make([]string, 0, len(s.Windows))
+		harnessID := ""
+		for _, w := range s.Windows {
+			states = append(states, w.AgentState)
+			if harnessID == "" {
+				harnessID = w.AgentHarness
+			}
+		}
+		state := sessiontree.RollUpState(states)
+		if state == "" {
+			state = AgentStateNone.Name()
+		}
+		row := map[string]any{
+			"session":       s.Name,
+			"repo":          wt.Repo,
+			"repo_root":     wt.RepoRoot,
+			"branch":        wt.Branch,
+			"path":          wt.Path,
+			"base":          wt.Base,
+			"group":         wt.Group,
+			"managed":       wt.Managed,
+			"gone":          wt.Gone,
+			"state":         state,
+			"harness":       harnessID,
+			"windows":       s.WindowCount,
+			"attached":      s.Attached,
+			"prompt_status": wt.PromptStatus,
+			"prompt_note":   wt.PromptNote,
+			// What the agent showed when its prompt was typed, and the agent
+			// the fan-out started here, as it was named.
+			"prompt_ready_by": wt.PromptReadyBy,
+			"agent":           wt.Agent,
+		}
+		if wt.LaunchedFrom != "" {
+			row["launched_from"] = wt.LaunchedFrom
+		}
+		if wt.PR != nil {
+			row["pr"] = wt.PR
+		}
+		if p.Changes && !wt.Gone {
+			// A git status per worktree, only when asked for: the rail never
+			// asks, and a listing an agent polls should not run git it did not
+			// want.
+			if n, err := worktree.Changes(wt.Path); err == nil {
+				row["changes"] = n
+			} else {
+				row["changes"] = -1
+			}
+			if wt.Base != "" {
+				if n, err := worktree.Ahead(wt.Path, wt.Base); err == nil {
+					row["ahead"] = n
+				}
+			}
+		}
+		rows = append(rows, row)
+	}
+	return map[string]any{
+		"type":      "worktree_list",
+		"worktrees": rows,
+		"total":     len(rows),
+	}, nil
+}
+
+func (d *Daemon) verbRemoveWorktree(_ *connState, params json.RawMessage) (any, *verbError) {
+	var p struct {
+		Session     string `json:"session"`
+		Force       bool   `json:"force"`
+		Stash       bool   `json:"stash"`
+		KeepSession bool   `json:"keep_session"`
+	}
+	if verr := decodeParams(params, &p); verr != nil {
+		return nil, verr
+	}
+	if p.Session == "" {
+		return nil, hintedVerbError(ErrVerbInvalidParams,
+			"session is required (remove-worktree never guesses which worktree to remove)",
+			&VerbHint{Param: "session", Command: "tuios worktree ls", Available: d.worktreeSessionNames()})
+	}
+	sess, info, verr := d.worktreeTarget(p.Session)
+	if verr != nil {
+		return nil, verr
+	}
+	// Resolved now, while the directory is there to resolve.
+	notesRoot := canonRoot(info.Path)
+
+	out := map[string]any{
+		"type":        "worktree_removed",
+		"session":     sess.Name(),
+		"branch":      info.Branch,
+		"path":        info.Path,
+		"repo":        info.Repo,
+		"branch_kept": true,
+		"changes":     0,
+		"stashed":     false,
+		"discarded":   false,
+	}
+
+	if _, err := os.Stat(info.Path); err != nil {
+		// The directory is already gone. Git still lists the worktree, and
+		// forgetting it is "git worktree prune", which this daemon never runs:
+		// prune forgets every worktree whose directory is missing, not only
+		// this one, and a directory can be missing because it is being moved.
+		out["gone"] = true
+		out["note"] = "The directory was already gone. Git still lists the worktree. Run 'git worktree prune' in " + info.RepoRoot + " to forget it."
+	} else {
+		changes, err := worktree.Changes(info.Path)
+		if err != nil {
+			return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
+				Detail: "git could not read the worktree's status, so nothing was removed.",
+			})
+		}
+		out["changes"] = changes
+		if changes > 0 && !p.Force && !p.Stash {
+			return nil, hintedVerbError(ErrVerbWorktreeDirty,
+				fmt.Sprintf("%s holds %d uncommitted %s. Nothing was removed.", info.Path, changes, plural.Word(changes, "change", "changes")),
+				&VerbHint{
+					Param:   "stash",
+					Command: "tuios worktree rm " + sess.Name() + " --stash",
+					Detail:  "Pass stash to keep the changes in git stash, or force to discard them. The branch " + info.Branch + " is kept either way.",
+				})
+		}
+		if changes > 0 && p.Stash {
+			if err := worktree.Stash(info.Path, "tuios: "+info.Branch); err != nil {
+				return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
+					Detail: "git could not stash the changes, so nothing was removed.",
+				})
+			}
+			out["stashed"] = true
+			out["stash_message"] = "tuios: " + info.Branch
+		}
+		discard := changes > 0 && !p.Stash
+		if err := worktree.Remove(info.RepoRoot, info.Path, discard); err != nil {
+			return nil, hintedVerbError(ErrVerbGitFailed, err.Error(), &VerbHint{
+				Detail: "git refused to remove the worktree. It is still there.",
+			})
+		}
+		out["discarded"] = discard
+	}
+	// The notes on the worktree's changes go with it.
+	d.reviewNotes.dropRoot(notesRoot)
+	// So do the checkpoints taken in it. The refs are the repository's, so
+	// git runs in the main checkout, which is still there.
+	d.dropCheckpointsOf(info.RepoRoot, notesRoot)
+
+	out["session_killed"] = false
+	if !p.KeepSession {
+		if err := d.manager.DeleteSession(sess.Name()); err == nil {
+			out["session_killed"] = true
+		}
+	}
+	return out, nil
+}
+
+// fanStopWords are the words a branch stem drops. They carry no meaning on
+// their own, and a stem has room for four words.
+var fanStopWords = map[string]bool{
+	"a": true, "an": true, "the": true, "to": true, "of": true, "in": true, "on": true,
+	"for": true, "with": true, "and": true, "or": true, "is": true, "it": true, "this": true,
+	"that": true, "please": true, "into": true, "from": true, "by": true, "at": true,
+}
+
+// fanStem turns a prompt into a branch stem a person can read: "fan/" and the
+// first content words of the prompt. "Add a retry to the client" is
+// fan/add-retry-client.
+func fanStem(prompt string) string {
+	var words []string
+	for _, w := range regexp.MustCompile(`[A-Za-z0-9]+`).FindAllString(strings.ToLower(prompt), -1) {
+		if fanStopWords[w] {
+			continue
+		}
+		words = append(words, w)
+		if len(words) == 4 {
+			break
+		}
+	}
+	stem := strings.Join(words, "-")
+	if len(stem) > 32 {
+		stem = stem[:32]
+		if i := strings.LastIndex(stem, "-"); i > 8 {
+			stem = stem[:i]
+		}
+	}
+	if stem == "" {
+		stem = "prompt"
+	}
+	return "fan/" + stem
+}
+
+// fanBranches picks count branch names from stem that are free in the
+// repository and on disk: stem, then stem-2, stem-3, and so on, skipping any
+// that exist. Numbering from 2 keeps the first name bare, so a fan of one
+// reads like a worktree made by hand.
+func fanBranches(root, stem string, count int) []string {
+	dir := worktree.DefaultDir()
+	names := make([]string, 0, count)
+	for i := 1; len(names) < count && i < count+100; i++ {
+		name := stem
+		if i > 1 {
+			name = stem + "-" + strconv.Itoa(i)
+		}
+		if worktree.BranchExists(root, name) {
+			continue
+		}
+		if _, err := os.Lstat(worktree.PathFor(dir, root, name)); err == nil {
+			continue
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+func (d *Daemon) verbFan(cs *connState, params json.RawMessage) (any, *verbError) {
+	var p struct {
+		repoSource
+		Count        int               `json:"count"`
+		Agent        string            `json:"agent"`
+		Agents       []string          `json:"agents"`
+		Prompt       string            `json:"prompt"`
+		Prompts      []string          `json:"prompts"`
+		Base         string            `json:"base"`
+		Name         string            `json:"name"`
+		ReadyTimeout int               `json:"ready_timeout"`
+		Env          map[string]string `json:"env"`
+		Grants       []string          `json:"grants"`
+	}
+	if verr := decodeParams(params, &p); verr != nil {
+		return nil, verr
+	}
+	// What every new pane may do through tuios, decided before anything is
+	// made. See pane_grants.go.
+	grants, verr := d.launchGrants(cs, p.Grants)
+	if verr != nil {
+		return nil, verr
+	}
+	// One prompt for every session, or one per session: prompts sets the
+	// count when count is left out.
+	if len(p.Prompts) > 0 {
+		if p.Prompt != "" {
+			return nil, invalidParam("prompts", "prompt is the same for every session and prompts is one per session. Pass one or the other")
+		}
+		if p.Count == 0 {
+			p.Count = len(p.Prompts)
+		}
+		if p.Count != len(p.Prompts) {
+			return nil, invalidParam("prompts", fmt.Sprintf("prompts has %d entries and count is %d: there is one prompt per session", len(p.Prompts), p.Count))
+		}
+		for i, pr := range p.Prompts {
+			if strings.TrimSpace(pr) == "" {
+				return nil, invalidParam("prompts", fmt.Sprintf("prompts[%d] is empty", i))
+			}
+		}
+	} else if strings.TrimSpace(p.Prompt) == "" {
+		return nil, invalidParam("prompt", "prompt is required: it is what every agent is asked")
+	}
+	if p.Count < 1 || p.Count > fanMaxCount {
+		return nil, invalidParam("count", fmt.Sprintf("count must be between 1 and %d", fanMaxCount))
+	}
+	promptFor := func(i int) string {
+		if len(p.Prompts) > 0 {
+			return p.Prompts[i]
+		}
+		return p.Prompt
+	}
+	// One agent for every session, or several cycled across them.
+	specs := p.Agents
+	switch {
+	case p.Agent != "" && len(p.Agents) > 0:
+		return nil, invalidParam("agents", "agent names one agent for every session and agents several. Pass one or the other")
+	case len(p.Agents) == 0:
+		specs = []string{p.Agent}
+	case len(p.Agents) > fanMaxCount:
+		return nil, invalidParam("agents", fmt.Sprintf("agents names at most %d agents", fanMaxCount))
+	}
+	// Every agent is resolved before anything is created, so a missing one
+	// costs no worktree.
+	var env []string
+	var launches []agentLaunch
+	resolveAgents := func() *verbError {
+		var pathList string
+		var verr *verbError
+		if env, pathList, verr = callerEnv(cs, p.Env); verr != nil {
+			return verr
+		}
+		launches = make([]agentLaunch, len(specs))
+		for i, spec := range specs {
+			param := "agent"
+			if len(p.Agents) > 0 {
+				param = "agents"
+			}
+			if launches[i], verr = d.resolveAgentLaunch(param, spec, pathList); verr != nil {
+				return verr
+			}
+		}
+		return nil
+	}
+	// The repository is checked first, as it always was, except that the
+	// agents are also checked before a clone, so a missing agent does not
+	// cost a clone.
+	root, cloned, verr := d.resolveRepoSource(cs, "fan", p.repoSource, resolveAgents)
+	if verr != nil {
+		return nil, verr
+	}
+	if launches == nil {
+		if verr := resolveAgents(); verr != nil {
+			return nil, verr
+		}
+	}
+	stem := strings.TrimSpace(p.Name)
+	if stem == "" {
+		stem = fanStem(promptFor(0))
+	}
+	if err := worktree.ValidBranch(stem); err != nil {
+		return nil, invalidParam("name", err.Error())
+	}
+	branches := fanBranches(root, stem, p.Count)
+	if len(branches) < p.Count {
+		return nil, invalidParam("name", "could not find "+strconv.Itoa(p.Count)+" free branch names from "+stem)
+	}
+	readyTimeout := durationOr(p.ReadyTimeout, fanDefaultReadyTimeout)
+	// The session of the pane that asked, so a connection restricted to that
+	// session reaches the agents it started. See conn_scope.go.
+	launchedFrom := d.callerSession(cs)
+
+	sessions := make([]map[string]any, 0, p.Count)
+	for i, branch := range branches {
+		launch, prompt := launches[i%len(launches)], promptFor(i)
+		out, verr := d.createWorktreeSession(root, branch, strings.TrimSpace(p.Base), "", launch.argv, env, grants, func(info *WorktreeInfo) {
+			info.Group = stem
+			info.LaunchedFrom = launchedFrom
+			info.Prompt = prompt
+			info.PromptStatus = PromptPending
+			info.Agent = launch.spec
+		})
+		if verr != nil {
+			if len(sessions) > 0 {
+				names := make([]string, 0, len(sessions))
+				for _, s := range sessions {
+					names = append(names, s["session"].(string))
+				}
+				if verr.Hint == nil {
+					verr.Hint = &VerbHint{}
+				}
+				verr.Hint.Available = names
+				verr.Message = "fan stopped at " + branch + ": " + verr.Message + " Sessions already started are kept."
+			}
+			return nil, verr
+		}
+		sess := d.manager.GetSession(out["session"].(string))
+		windowID := out["window_id"].(string)
+		go d.deliverFanPrompt(sess, windowID, launch.harness, prompt, readyTimeout)
+		sessions = append(sessions, map[string]any{
+			"session":   out["session"],
+			"branch":    branch,
+			"path":      out["path"],
+			"window_id": windowID,
+			"agent":     launch.harness,
+			"command":   launch.command(),
+		})
+	}
+	// agent, command and prompt name the first session's, which for a fan of
+	// one agent and one prompt is every session's, as they always were. The
+	// sessions say which agent and command each got.
+	out := map[string]any{
+		"type":      "fan_started",
+		"group":     stem,
+		"repo":      filepath.Base(root),
+		"repo_root": root,
+		"agent":     launches[0].harness,
+		"command":   launches[0].command(),
+		"prompt":    promptFor(0),
+		"sessions":  sessions,
+		"total":     len(sessions),
+	}
+	if cloned {
+		out["cloned"] = true
+	}
+	return out, nil
+}
+
+// deliverFanPrompt types the prompt into the agent's pane once the agent is
+// ready to read it, and records what happened on the session's record.
+//
+// The wait is waitAgentStart's: positive evidence the agent is at its prompt
+// (fanReadyStates), with a needs_input the person answers first. An agent that
+// has not been ready for a while turns the status to held and puts a question
+// in the Inbox; the prompt is still typed as soon as it is ready. It runs
+// detached from the verb, so fan returns as soon as the sessions exist and the
+// person watches the rail rather than a blocked command.
+func (d *Daemon) deliverFanPrompt(sess *Session, windowID, harness, text string, timeout time.Duration) {
+	w, outcome := d.waitAgentStart(sess, windowID, harness, timeout, false, false, func(WindowState) {
+		sess.setPromptStatus(PromptHeld, "The agent is not at a prompt tuios recognises. Look at the pane: it may be showing a first-run choice. The prompt is typed as soon as the agent is ready.", 0)
+	})
+	switch outcome {
+	case agentStartReady:
+	case agentStartTimeout:
+		sess.setPromptStatus(PromptNotSent, "The agent was not ready before the wait ended. Send the prompt with send-text.", 0)
+		return
+	case agentStartWindowClosed:
+		sess.setPromptStatus(PromptNotSent, "The agent's window closed before it was ready.", 0)
+		return
+	default:
+		return
+	}
+	sess.setPromptReadyBy(readyBy(w))
+	// The prompt stays pending for the few seconds the agent takes to show it
+	// took it. See prompt_gate.go.
+	status, note, at := d.typeFirstPrompt(sess, windowID, text)
+	sess.setPromptStatus(status, note, at)
+}

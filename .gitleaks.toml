@@ -1,0 +1,10 @@
+# gitleaks configuration for k3code.
+#
+# Extends gitleaks' default rules. There is deliberately no [allowlist]: a secret-looking
+# finding is either fixed (remove the value, or build a fake one at run time) or reviewed
+# case by case. Do not add broad path or regex exemptions here to make a scan pass.
+
+title = "k3code"
+
+[extend]
+useDefault = true

@@ -1,0 +1,180 @@
+"""Onboarding: the wizard never starts on its own, `k3code onboard` writes a loadable config, the first-run
+question is asked once, and headless or piped runs without a provider print one hint and exit non-zero."""
+
+from __future__ import annotations
+
+import stat
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+from click.testing import CliRunner
+
+from k3code import cli as cli_mod
+from k3code.cli import cli
+from k3code.config import load_config
+from k3code.paths import user_config_path
+from k3code.setup import onboard as ob
+from k3code.setup import prompter as prompter_mod
+from k3code.setup.prompter import AnswerPrompter
+
+
+class Scripted(AnswerPrompter):
+    """Answers from a mapping, records every question asked, and can simulate Ctrl+C at the first-run question."""
+
+    interactive = True
+
+    def __init__(self, answers: dict[str, Any], *, interrupt: bool = False) -> None:
+        super().__init__(answers)
+        self.asked: list[str] = []
+        self.interrupt = interrupt
+
+    def select(self, key: str, message: str, choices: list[str], default: str | None = None) -> str:
+        self.asked.append(key)
+        if self.interrupt and key == "onboard.mode":
+            raise KeyboardInterrupt
+        return super().select(key, message, choices, default)
+
+    def text(self, key: str, message: str, default: str = "", secret: bool = False) -> str:
+        self.asked.append(key)
+        return super().text(key, message, default, secret)
+
+
+def _boom(*_args: Any, **_kwargs: Any) -> None:
+    raise AssertionError("must not run here")
+
+
+@pytest.fixture
+def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """HOME, K3CODE_HOME, the XDG env file and the working directory all live under tmp_path."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "k3home"))
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.chdir(tmp_path)
+    for name in ("K3CODE_API_KEY", "OMNIROUTE_API_KEY", "ANTHROPIC_API_KEY"):
+        # set-then-delete makes teardown restore the variable even though the flows export keys into os.environ
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+    return tmp_path
+
+
+def _answers(root: Path, answers: dict[str, Any]) -> Path:
+    path = root / "answers.yaml"
+    path.write_text(yaml.safe_dump(answers))
+    return path
+
+
+def test_plain_noninteractive_launch_without_config_never_starts_setup(root, monkeypatch) -> None:
+    monkeypatch.setattr(ob, "run_setup", _boom)
+    monkeypatch.setattr(prompter_mod, "InteractivePrompter", _boom)
+    r = CliRunner().invoke(cli, [])
+    assert r.exit_code == 78, r.output
+    lines = r.output.strip().splitlines()
+    assert len(lines) == 1 and "k3code onboard" in lines[0]
+
+
+def test_headless_without_config_prints_one_hint_and_never_prompts(root, monkeypatch) -> None:
+    monkeypatch.setattr(cli_mod, "_run_headless", _boom)
+    monkeypatch.setattr(prompter_mod, "InteractivePrompter", _boom)
+    r = CliRunner().invoke(cli, ["-p", "hi"])
+    assert r.exit_code == 78, r.output
+    lines = r.output.strip().splitlines()
+    assert len(lines) == 1 and "k3code onboard" in lines[0]
+
+
+def test_onboard_fast_claude_cli_writes_a_config_that_loads(root) -> None:
+    answers = _answers(root, {"onboard": {"mode": "fast", "provider": "claude-cli"}})
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    cfg = load_config(project_dir=root)
+    assert [(p.name, p.kind) for p in cfg.providers] == [("claude-cli", "claude-cli")]
+    assert cfg.providers[0].models == {"default": "sonnet"}
+    assert cfg.permission_mode == "ask"
+    assert ob.question_answered()
+
+
+def test_onboard_fast_api_writes_a_loadable_config_and_keeps_the_key_out_of_it(root) -> None:
+    answers = _answers(
+        root,
+        {
+            "onboard": {
+                "mode": "fast",
+                "provider": "api",
+                "endpoint": "http://127.0.0.1:9/v1/",
+                "key": "sk-SECRET-FAST",
+                "model": "m-fast",
+            }
+        },
+    )
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    assert "SECRET" not in user_config_path().read_text()
+    cfg = load_config(project_dir=root)
+    prov = cfg.providers[0]
+    assert (prov.name, prov.kind, prov.base_url, prov.api_key_env) == (
+        "endpoint",
+        "openai",
+        "http://127.0.0.1:9/v1",
+        "K3CODE_API_KEY",
+    )
+    assert prov.models == {"default": "m-fast"}
+    assert prov.api_key == "sk-SECRET-FAST"  # read back from the 0600 env file, as a later run would
+    env_file = root / "xdg" / "k3code" / "env"
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+
+
+def test_onboard_full_runs_the_wizard_and_records_the_answer(root, monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(ob, "run_setup", lambda p, **kw: calls.append(kw))
+    answers = _answers(root, {"onboard": {"mode": "full"}})
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    assert calls == [{"do_probe": False}]
+    assert ob.question_answered()
+
+
+def test_onboard_without_terminal_or_answers_refuses_to_prompt(root) -> None:
+    r = CliRunner().invoke(cli, ["onboard"])
+    assert r.exit_code == 2 and "needs a terminal" in r.output
+
+
+def test_first_run_question_is_not_repeated_after_it_is_answered(root, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(ob, "run_setup", _boom)
+    first = Scripted({"onboard": {"mode": "fast", "provider": "claude-cli"}})
+    ob.first_run(first, do_probe=False)
+    assert first.asked == ["onboard.mode", "onboard.provider"]
+    assert user_config_path().is_file()
+
+    user_config_path().unlink()  # no config again, but the question was already answered
+    again = Scripted({"onboard": {"mode": "fast"}})
+    ob.first_run(again, do_probe=False)
+    assert again.asked == []
+    assert "k3code onboard" in capsys.readouterr().out
+
+
+def test_first_run_full_answer_starts_the_wizard_once(root, monkeypatch) -> None:
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(ob, "run_setup", lambda p, **kw: calls.append(kw))
+    ob.first_run(Scripted({"onboard": {"mode": "full"}}), do_probe=False)
+    assert calls == [{"do_probe": False}]
+    assert ob.question_answered()
+
+
+def test_interactive_launch_asks_once_and_ctrl_c_counts_as_the_answer(root, monkeypatch) -> None:
+    scripted = Scripted({}, interrupt=True)
+    launched: list[str] = []
+    monkeypatch.setattr(ob, "run_setup", _boom)
+    monkeypatch.setattr(cli_mod, "_is_interactive", lambda: True)
+    monkeypatch.setattr(prompter_mod, "InteractivePrompter", lambda: scripted)
+    monkeypatch.setattr(cli_mod, "_launch_tui", lambda **_kw: launched.append("tui"))
+
+    first = CliRunner().invoke(cli, [])
+    assert first.exit_code == 130
+    assert scripted.asked == ["onboard.mode"] and launched == []
+
+    second = CliRunner().invoke(cli, [])  # no config, but answered: the TUI still starts, without the question
+    assert second.exit_code == 0, second.output
+    assert scripted.asked == ["onboard.mode"]
+    assert launched == ["tui"]

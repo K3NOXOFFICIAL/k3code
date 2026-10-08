@@ -1,0 +1,433 @@
+# GoReleaser configuration for TUIOS
+# Documentation: https://goreleaser.com
+
+version: 2
+
+before:
+  hooks:
+    # Ensure dependencies are up to date
+    - go mod tidy
+    # Run tests before building
+    # - go test ./...
+
+builds:
+  - id: tuios
+    main: ./cmd/tuios
+    binary: tuios
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+      - freebsd
+      - openbsd
+    goarch:
+      - amd64
+      - arm64
+      - arm
+      - "386"
+    goarm:
+      - "6"
+      - "7"
+    ignore:
+      # Windows ARM builds are not commonly needed
+      - goos: windows
+        goarch: arm
+      - goos: windows
+        goarch: arm64
+      # FreeBSD/OpenBSD ARM builds
+      - goos: freebsd
+        goarch: arm
+      - goos: openbsd
+        goarch: arm
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+      - -X main.builtBy=goreleaser
+    flags:
+      - -trimpath
+
+  - id: tuios-web
+    main: ./cmd/tuios-web
+    binary: tuios-web
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+      - freebsd
+      - openbsd
+    goarch:
+      - amd64
+      - arm64
+      - arm
+      - "386"
+    goarm:
+      - "6"
+      - "7"
+    ignore:
+      # Windows ARM builds are not commonly needed
+      - goos: windows
+        goarch: arm
+      - goos: windows
+        goarch: arm64
+      # FreeBSD/OpenBSD ARM builds
+      - goos: freebsd
+        goarch: arm
+      - goos: openbsd
+        goarch: arm
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+      - -X main.builtBy=goreleaser
+    flags:
+      - -trimpath
+
+  # The ghostty builds link libghostty-vt (static, built by
+  # scripts/ghostty-lib.sh at a pinned commit) behind the ghostty build tag.
+  # One build per target because cgo needs a per-target compiler; zig is the
+  # cross C compiler for all of them. Pure-Go builds above stay the default
+  # and keep go install working with no toolchain.
+  - id: tuios-ghostty-linux-amd64
+    main: ./cmd/tuios
+    binary: tuios
+    tags:
+      - ghostty
+    env:
+      - CGO_ENABLED=1
+      - CC={{ .Env.PWD }}/scripts/zigcc/x86_64-linux-gnu
+      - PKG_CONFIG_PATH={{ .Env.PWD }}/.ghostty-vt/x86_64-linux-gnu/pkgconfig
+    goos:
+      - linux
+    goarch:
+      - amd64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+      - -X main.builtBy=goreleaser
+    flags:
+      - -trimpath
+
+  - id: tuios-ghostty-linux-arm64
+    main: ./cmd/tuios
+    binary: tuios
+    tags:
+      - ghostty
+    env:
+      - CGO_ENABLED=1
+      - CC={{ .Env.PWD }}/scripts/zigcc/aarch64-linux-gnu
+      - PKG_CONFIG_PATH={{ .Env.PWD }}/.ghostty-vt/aarch64-linux-gnu/pkgconfig
+    goos:
+      - linux
+    goarch:
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+      - -X main.builtBy=goreleaser
+    flags:
+      - -trimpath
+
+  - id: tuios-ghostty-windows-amd64
+    main: ./cmd/tuios
+    binary: tuios
+    tags:
+      - ghostty
+    env:
+      - CGO_ENABLED=1
+      - CC={{ .Env.PWD }}/scripts/zigcc/x86_64-windows-gnu
+      - PKG_CONFIG_PATH={{ .Env.PWD }}/.ghostty-vt/x86_64-windows-gnu/pkgconfig
+    goos:
+      - windows
+    goarch:
+      - amd64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+      - -X main.builtBy=goreleaser
+    flags:
+      - -trimpath
+
+  # The ghostty builds link libghostty-vt (static, built by
+  # scripts/ghostty-lib.sh at a pinned commit) behind the ghostty build tag.
+  # One build per target because cgo needs a per-target compiler; zig is the
+  # cross C compiler for all of them. Pure-Go builds above stay the default
+  # and keep go install working with no toolchain.
+  - id: tuios-ghostty-windows-arm64
+    main: ./cmd/tuios
+    binary: tuios
+    tags:
+      - ghostty
+    env:
+      - CGO_ENABLED=1
+      - CC={{ .Env.PWD }}/scripts/zigcc/aarch64-windows-gnu
+      - PKG_CONFIG_PATH={{ .Env.PWD }}/.ghostty-vt/aarch64-windows-gnu/pkgconfig
+    goos:
+      - windows
+    goarch:
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+      - -X main.builtBy=goreleaser
+    flags:
+      - -trimpath
+
+archives:
+  - id: tuios-archive
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    ids:
+      - tuios
+    files:
+      - README.md
+      - LICENSE*
+
+  - id: tuios-web-archive
+    name_template: >-
+      {{ .ProjectName }}-web_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    ids:
+      - tuios-web
+    files:
+      - README.md
+      - LICENSE*
+
+  - id: tuios-ghostty-archive
+    name_template: >-
+      {{ .ProjectName }}-ghostty_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    ids:
+      - tuios-ghostty-linux-amd64
+      - tuios-ghostty-linux-arm64
+      - tuios-ghostty-windows-amd64
+      - tuios-ghostty-windows-arm64
+    files:
+      - README.md
+      - LICENSE*
+
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - Merge pull request
+      - Merge remote-tracking branch
+      - Merge branch
+  groups:
+    - title: "New Features"
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: "Bug Fixes"
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: "Performance Improvements"
+      regexp: '^.*?perf(\([[:word:]]+\))??!?:.+$'
+      order: 2
+    - title: "Documentation"
+      regexp: '^.*?docs(\([[:word:]]+\))??!?:.+$'
+      order: 3
+    - title: "Other Changes"
+      order: 999
+
+release:
+  github:
+    owner: Gaurav-Gosain
+    name: tuios
+  draft: false
+  prerelease: auto
+  mode: replace
+  # The body is docs/release-notes/<tag>.md when that file exists (see
+  # .github/workflows/release.yml), and the install instructions live there.
+  footer: |
+    ---
+
+    **Full Changelog**: https://github.com/Gaurav-Gosain/tuios/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+# AUR (Arch User Repository)
+aurs:
+  - name: tuios-bin
+    ids:
+      - tuios-archive
+    homepage: https://github.com/Gaurav-Gosain/tuios
+    description: "Terminal UI Operating System - A terminal-based window manager with tmux-style keybindings"
+    maintainers:
+      - "Gaurav Gosain <itsgauravgosain@gmail.com>"
+    license: MIT
+    private_key: "{{ .Env.AUR_SSH_KEY }}"
+    git_url: "ssh://aur@aur.archlinux.org/tuios-bin.git"
+    provides:
+      - tuios
+    conflicts:
+      - tuios
+    package: |
+      # bin
+      install -Dm755 "./tuios" "${pkgdir}/usr/bin/tuios"
+
+      # license
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+      # documentation
+      install -Dm644 "./README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+
+  - name: tuios-web-bin
+    ids:
+      - tuios-web-archive
+    homepage: https://github.com/Gaurav-Gosain/tuios
+    description: "Web terminal server for TUIOS - Serves TUIOS through the browser"
+    maintainers:
+      - "Gaurav Gosain <itsgauravgosain@gmail.com>"
+    license: MIT
+    private_key: "{{ .Env.AUR_SSH_KEY }}"
+    git_url: "ssh://aur@aur.archlinux.org/tuios-web-bin.git"
+    provides:
+      - tuios-web
+    conflicts:
+      - tuios-web
+    package: |
+      # bin
+      install -Dm755 "./tuios-web" "${pkgdir}/usr/bin/tuios-web"
+
+      # license
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+      # documentation
+      install -Dm644 "./README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+
+# Homebrew tap (using casks for pre-compiled binaries)
+homebrew_casks:
+  - name: tuios
+    ids:
+      - tuios-archive
+    repository:
+      owner: Gaurav-Gosain
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/Gaurav-Gosain/tuios
+    description: "Terminal UI Operating System - A terminal-based window manager with tmux-style keybindings"
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "Brew cask update for {{ .ProjectName }} version {{ .Tag }}"
+    # Both casks install a `tuios` binary, so only one can be installed.
+    conflicts:
+      - cask: tuios-ghostty
+    # The binaries are not signed, so Gatekeeper would refuse to run a
+    # quarantined one. GoReleaser (as of v2.18) can only emit Homebrew's
+    # `postflight do ... end` stanza via hooks.post.install, and Homebrew 7
+    # deprecated that stanza in favor of `postflight_steps`. custom_block
+    # renders before the other stanzas, so it carries the step instead,
+    # until GoReleaser ships native `hooks.post.install_steps` support
+    # (goreleaser/goreleaser#6870, fixed by goreleaser/goreleaser#6873).
+    # `{{ "{{staged_path}}" }}` escapes Homebrew's own `{{staged_path}}`
+    # token past GoReleaser's own template pass over the rendered cask.
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/tuios"]
+        end
+      end
+
+  # The libghostty-vt build for Linux. The ghostty archive also holds Windows
+  # builds, which a cask ignores. There is no darwin ghostty build, so the cask
+  # has no macOS download. The binary inside the archive is named `tuios`.
+  - name: tuios-ghostty
+    ids:
+      - tuios-ghostty-archive
+    repository:
+      owner: Gaurav-Gosain
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/Gaurav-Gosain/tuios
+    description: "TUIOS built with the libghostty-vt terminal engine. Linux only."
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "Brew cask update for {{ .ProjectName }}-ghostty version {{ .Tag }}"
+    binaries:
+      - tuios
+    conflicts:
+      - cask: tuios
+
+  - name: tuios-web
+    ids:
+      - tuios-web-archive
+    repository:
+      owner: Gaurav-Gosain
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: https://github.com/Gaurav-Gosain/tuios
+    description: "Web terminal server for TUIOS - Serves TUIOS through the browser"
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "Brew cask update for {{ .ProjectName }}-web version {{ .Tag }}"
+    # See the tuios cask above: custom_block stands in for
+    # hooks.post.install_steps until GoReleaser ships it natively.
+    custom_block: |
+      postflight_steps do
+        on_macos do
+          run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/tuios-web"]
+        end
+      end
+
+# Docker images (optional - uncomment if you want automated Docker builds)
+# dockers:
+#   - image_templates:
+#       - "ghcr.io/gaurav-gosain/tuios:{{ .Tag }}"
+#       - "ghcr.io/gaurav-gosain/tuios:v{{ .Major }}"
+#       - "ghcr.io/gaurav-gosain/tuios:v{{ .Major }}.{{ .Minor }}"
+#       - "ghcr.io/gaurav-gosain/tuios:latest"
+#     dockerfile: Dockerfile
+#     build_flag_templates:
+#       - "--pull"
+#       - "--label=org.opencontainers.image.created={{.Date}}"
+#       - "--label=org.opencontainers.image.title={{.ProjectName}}"
+#       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+#       - "--label=org.opencontainers.image.version={{.Version}}"
+
+# Announce releases (optional - uncomment to enable)
+# announce:
+#   twitter:
+#     enabled: true
+#     message_template: "TUIOS {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}"

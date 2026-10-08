@@ -1,0 +1,30 @@
+{"id": 1, "prompt": "What does the `-r` flag of grep do?", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 2, "prompt": "Rename the variable `tmp` to `buffer` on line 42 of utils.py", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 3, "prompt": "Fix the typo 'recieve' in README.md", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 4, "prompt": "Add a --verbose flag to cli.py that sets logging to DEBUG", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 5, "prompt": "Write a unit test for parse_duration() in timeutil.py", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 6, "prompt": "Convert config.py from os.environ lookups to a dataclass with defaults", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 7, "prompt": "Fix the off-by-one in paginate() in api/list.py", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 8, "prompt": "Add retry with exponential backoff to the HTTP client in net/client.py and its tests", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 9, "prompt": "Add a /health endpoint to the server, wire it into the router and add tests plus a docs entry", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 10, "prompt": "Extract the duplicated validation logic from three handlers into a shared module", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 11, "prompt": "Replace print statements with the logging module across the cli/ package", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 12, "prompt": "Add dark mode support to the settings page: theme toggle component, CSS variables, persistence in localStorage", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 13, "prompt": "Implement user authentication with sessions: login/logout endpoints, password hashing, middleware, DB table, tests", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 14, "prompt": "Add an offline-first sync feature to the mobile client with conflict resolution and a server API", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 15, "prompt": "Port the data-processing module from callbacks to async/await throughout the backend (about 40 files)", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 16, "prompt": "Add internationalisation to the whole UI: extract all strings, add German and English catalogs, language switcher", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 17, "prompt": "Introduce a plugin system: loader, manifest schema, sandboxing, three example plugins, docs and tests", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 18, "prompt": "Migrate the whole codebase from JavaScript to TypeScript, including build tooling and CI", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 19, "prompt": "Rewrite the monolith into microservices with separate deployables, shared auth and a message bus", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 20, "prompt": "Build a complete CRM web application from scratch: backend, database, frontend, auth, reports, deployment", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 21, "prompt": "Upgrade the project from Django 3 to Django 5 and fix every deprecation across all apps and tests", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 22, "prompt": "Design and implement a new rendering engine for the editor with GPU acceleration and port all existing widgets", "scope": "huge", "label_source": "proposed-by-claude"}
+{"id": 23, "prompt": "Explain what the main() function in server.py does", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 24, "prompt": "What Python version does this project require?", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 25, "prompt": "Add type hints to every function in the models/ package (about 15 files)", "scope": "large", "label_source": "proposed-by-claude"}
+{"id": 26, "prompt": "Update the copyright year in LICENSE", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 27, "prompt": "Change the default timeout in settings.toml from 30 to 60 seconds", "scope": "trivial", "label_source": "proposed-by-claude"}
+{"id": 28, "prompt": "Add a CSV export button to the reports table and the backend route that produces it", "scope": "medium", "label_source": "proposed-by-claude"}
+{"id": 29, "prompt": "Fix the failing test test_parse_empty in tests/test_parser.py", "scope": "small", "label_source": "proposed-by-claude"}
+{"id": 30, "prompt": "Create a complete test suite for the billing subsystem: unit, integration and property tests across all modules", "scope": "large", "label_source": "proposed-by-claude"}

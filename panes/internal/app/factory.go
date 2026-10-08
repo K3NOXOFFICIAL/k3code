@@ -1,0 +1,372 @@
+package app
+
+import (
+	"io"
+	"strings"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/hooks"
+	"github.com/Gaurav-Gosain/tuios/internal/layout"
+	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+	"github.com/Gaurav-Gosain/tuios/pkg/applist"
+)
+
+// OSOptions configures the creation of an OS instance.
+type OSOptions struct {
+	// Client says where the person looking at the screen is sitting. NewOS
+	// derives the per-client flags below from it (see applyClientKind), so an
+	// entry point names its kind and does not set them by hand. Zero is a
+	// model nobody named, which is what the tests build.
+	Client ClientKind
+
+	// ViewOnly marks a client whose input is dropped, such as a tuios-web
+	// viewer started with --read-only. served.Attach tells the daemon, which
+	// leaves such a client out of the session's size under the largest and
+	// latest window_size policies.
+	ViewOnly bool
+
+	// KeybindRegistry is required for keybinding support.
+	KeybindRegistry *config.KeybindRegistry
+
+	// UserConfig is the already-loaded user configuration. When set, NewOS uses
+	// it directly instead of re-reading config.toml, so it never re-applies file
+	// values over CLI flags (or races other sessions) via a second load. Callers
+	// are responsible for applying the appearance globals once (via ApplyOverrides
+	// and/or ApplyAppearanceConfig) before constructing the OS.
+	UserConfig *config.UserConfig
+
+	// BrowserClient says the far end is a browser tab rather than a terminal.
+	// It gates the alert sinks a browser cannot deliver, and the warning that
+	// says so. See browser_client.go.
+	BrowserClient bool
+
+	// LearnMode runs the session as the guided tour in the browser build
+	// (cmd/tuios-wasm): quitting shows a note instead of ending the program,
+	// and actions the demo cannot do say so instead of failing. See
+	// learn_mode.go.
+	LearnMode bool
+
+	// GuestApps, when set, is what the launcher offers instead of scanning
+	// $PATH and .desktop files. The browser build has no filesystem to scan,
+	// and lists the fake shell's programs here, which its guest pty runs.
+	GuestApps []applist.Entry
+
+	// ConfigReadOnly makes the settings page apply changes to this session only
+	// and never write the config file. Set it wherever the person driving the
+	// session is not the person whose config file it is: tuios-web serves a
+	// network client, and several of them at once, each holding the snapshot it
+	// loaded when it connected, so a save would write one client's stale view
+	// of the whole file over the operator's and over every other client's.
+	ConfigReadOnly bool
+
+	// OpenInboxItem opens the Inbox on this item once attached. tuios-web
+	// sets it from a notification's link. See OS.OpenInboxOn.
+	OpenInboxItem string
+
+	// ShowKeys enables the key display overlay.
+	ShowKeys bool
+	// StartInTerminalMode starts the client in terminal mode on the focused
+	// pane, whatever [startup] says and whether the session is new or not.
+	StartInTerminalMode bool
+
+	// NumWorkspaces sets the number of workspaces (default: 9).
+	NumWorkspaces int
+
+	// Width and Height set the initial terminal size.
+	Width  int
+	Height int
+
+	// AttachedHost is the host DaemonClient reaches its daemon through, ""
+	// for this machine.
+	AttachedHost string
+	// IsDaemonSession indicates this is a daemon-attached session.
+	IsDaemonSession bool
+
+	// DaemonClient is the client for daemon communication (required if IsDaemonSession).
+	DaemonClient *session.TUIClient
+
+	// SessionName is the name of the daemon session.
+	SessionName string
+
+	// IsSSHMode indicates this is an SSH session.
+	IsSSHMode bool
+
+	// SSHIsLoopback marks an SSH session that arrived over loopback (the
+	// same machine), so its native clipboard is the operator's. See
+	// OS.SSHIsLoopback.
+	SSHIsLoopback bool
+
+	// SSHSession is the SSH session reference (nil in local mode).
+	SSHSession SSHConn
+
+	// ForceGraphicsEnabled skips capability detection for the graphics
+	// passthroughs. Use this in web mode where stdin isn't a real TTY so
+	// GetHostCapabilities can't detect terminal support, but the browser
+	// terminal (xterm.js kitty addon) actually supports the protocol.
+	ForceGraphicsEnabled bool
+
+	// GraphicsOutput is the writer that kitty/sixel APC sequences are written
+	// to. If nil, the passthroughs fall back to /dev/tty / os.Stdout (the
+	// native TTY path). Web mode supplies the sip session's PTY slave and SSH
+	// mode supplies the ssh.Session so graphics bytes flow through the same
+	// pipe as bubbletea's text output and reach the client's terminal.
+	GraphicsOutput io.Writer
+
+	// GraphicsRemoteClient marks the graphics host as a network client (SSH)
+	// that does not share the server's filesystem, so file-medium kitty
+	// transmissions are re-encoded as direct data. See
+	// KittyPassthroughOptions.RemoteClient.
+	GraphicsRemoteClient bool
+
+	// RemoteClient marks a client process that is not on the user's machine:
+	// the tuios ssh server and tuios-web both run the TUI beside the daemon,
+	// with the user at the far end of a network. Anything that would touch the
+	// host's own desktop, a clipboard helper or a file viewer, has to know,
+	// because doing it here would act on the server's desktop and not on the
+	// user's. See screenshot.go.
+	RemoteClient bool
+
+	// TouchClient says the pointer driving this session is a finger, which
+	// widens the gestures that are aimed at a single cell. Only tuios-web can
+	// know this, and only from the browser that connected.
+	TouchClient bool
+
+	// Caps describes the terminal this session draws to. The servers detect it
+	// per connection, because one process holds several connections and the
+	// terminal that has to render a forwarded image is the one at the far end
+	// of this session and not the one at the far end of the last.
+	//
+	// Nil means "this process's own terminal", which is what a local attach
+	// wants and what a server falls back to when it detected nothing.
+	Caps *HostCapabilities
+
+	// Settings is the appearance seed this session starts from. Nil uses
+	// config.Global, which is what every entrypoint that applies the file and
+	// the flags to the globals before building a session wants: the local
+	// client, and the tests.
+	//
+	// A server that holds several sessions across config edits builds a fresh
+	// seed per connection instead (see config.AppearanceFrom), so a session that
+	// connects after an edit follows the file rather than the copy the server
+	// loaded when it started.
+	Settings *config.Settings
+}
+
+// NewOS creates a new OS instance with the given options.
+// This is the preferred way to create an OS instance, ensuring all required
+// fields are properly initialized.
+func NewOS(opts OSOptions) *OS {
+	opts.applyClientKind()
+
+	numWorkspaces := opts.NumWorkspaces
+	if numWorkspaces <= 0 {
+		numWorkspaces = 9
+	}
+
+	// Snapshot the terminal this connection is on, once. Everything downstream
+	// reads the snapshot, so nothing in this session can be re-decided by the
+	// next client to connect.
+	caps := opts.Caps
+	if caps == nil {
+		caps = GetHostCapabilities()
+	}
+
+	// The appearance seed for this session. Nil means the process globals; a
+	// server hands in a seed built per connection so a session that connects
+	// after a config edit follows the file. See OSOptions.Settings.
+	seed := config.Global
+	if opts.Settings != nil {
+		seed = *opts.Settings
+	}
+
+	os := &OS{
+		// Core state
+		FocusedWindow:   -1,
+		WindowExitChan:  make(chan string, 10),
+		PTYDataChan:     make(chan struct{}, 1),
+		StateSyncChan:   make(chan StateSyncMsg, 10),
+		ClientEventChan: make(chan ClientEvent, 10),
+		// The two daemon events that end this client. Made here rather than on
+		// first use because the SSH and web hosts write to it from the daemon
+		// read loop, which starts before Init runs. See daemon_exit.go.
+		DaemonExitChan: make(chan tea.Msg, daemonExitQueue),
+		// Routed verbs, for the hosts that cannot Send into the program. The
+		// local attach client leaves this unused. See dock_remote.go.
+		RemoteCommandChan: make(chan RemoteCommandMsg, remoteCommandQueue),
+		MasterRatio:       seed.MasterRatioFraction(),
+		CurrentWorkspace:  1,
+		NumWorkspaces:     numWorkspaces,
+
+		// Workspace state maps
+		WorkspaceFocus:        make(map[int]int),
+		FocusHistory:          make(map[int][]string),
+		WorkspaceLayouts:      make(map[int][]WindowLayout),
+		WorkspaceHasCustom:    make(map[int]bool),
+		WorkspaceMasterRatio:  make(map[int]float64),
+		WorkspaceStackRatio:   make(map[int]float64),
+		WorkspaceMasterSplits: make(map[int]layout.MasterSplits),
+
+		// Resize tracking
+		PendingResizes: make(map[string][2]int),
+
+		// Keybindings
+		KeybindRegistry:   opts.KeybindRegistry,
+		ConfigReadOnly:    opts.ConfigReadOnly,
+		BrowserClient:     opts.BrowserClient,
+		LearnMode:         opts.LearnMode,
+		ShowKeys:          opts.ShowKeys,
+		forceTerminalMode: opts.StartInTerminalMode,
+		RecentKeys:        []KeyEvent{},
+		KeyHistoryMaxSize: 5,
+
+		// Dimensions
+		Width:  opts.Width,
+		Height: opts.Height,
+
+		// Mode flags
+		Client:          opts.Client,
+		IsDaemonSession: opts.IsDaemonSession,
+		IsSSHMode:       opts.IsSSHMode,
+		SSHSession:      opts.SSHSession,
+		SSHIsLoopback:   opts.SSHIsLoopback,
+		TouchClient:     opts.TouchClient,
+		RemoteClient:    opts.RemoteClient,
+		Caps:            caps,
+
+		// One struct copy of the process seed, and from here on this session's
+		// own. The entrypoints have already applied the config file and the
+		// flags to config.Global, single-threaded, before any connection was
+		// served; nothing writes it after that.
+		Settings: seed,
+
+		// Daemon connection
+		DaemonClient: opts.DaemonClient,
+		SessionName:  opts.SessionName,
+		AttachedHost: opts.AttachedHost,
+
+		// Pane geometry inputs start at this client's config and are settled
+		// across the session by state sync; see the field comment in os.go.
+		SharedBorders:           seed.SharedBorders,
+		PaneGap:                 seed.PaneGap,
+		ScrollColumnWidth:       seed.ScrollColumnWidth,
+		lastConfigSharedBorders: seed.SharedBorders,
+		lastConfigPaneGap:       seed.PaneGap,
+		lastConfigScrollWidth:   seed.ScrollColumnWidth,
+		lastConfigMaster: normalMasterLayout(session.MasterLayoutState{
+			Position: seed.MasterPosition, Count: seed.MasterCount, NoGrid: seed.MasterNoGrid,
+		}),
+	}
+
+	// Sidebar order and expand/collapse state survive restarts; a load failure
+	// just means the defaults (creation order, current session expanded).
+	os.loadSidebarState()
+
+	// The $PATH cache starts empty and is filled by the first palette open, so
+	// startup pays nothing for a launcher the user may never reach for. Launch
+	// history is read here because it is one small file and the first open wants
+	// it already ranked.
+	os.pathApps = applist.NewCache()
+	os.desktopApps = newDesktopCache()
+	os.guestApps = opts.GuestApps
+	os.launchHistory = applist.LoadFrecency(applist.DefaultPath())
+
+	// Initialize graphics passthrough. The passthroughs decide for themselves
+	// whether the host can display anything; a pane's emulator never emulates
+	// graphics locally.
+	os.KittyPassthrough = NewKittyPassthroughWithOptions(KittyPassthroughOptions{
+		ForceEnable:  opts.ForceGraphicsEnabled,
+		Output:       opts.GraphicsOutput,
+		RemoteClient: opts.GraphicsRemoteClient,
+		Caps:         caps,
+	})
+	os.SixelPassthrough = NewSixelPassthroughWithOptions(SixelPassthroughOptions{
+		ForceEnable: opts.ForceGraphicsEnabled,
+		Output:      opts.GraphicsOutput,
+		Caps:        caps,
+	})
+
+	// Tell the terminal package what tuios can forward, so shells spawned
+	// locally advertise a terminal identity their image tools recognise. The
+	// passthroughs are the source of truth here: they already fold detection
+	// and the force flag together, and a nil passthrough means no forwarding.
+	terminal.SetGraphicsCapabilities(
+		os.KittyPassthrough != nil && os.KittyPassthrough.IsEnabled(),
+		os.SixelPassthrough != nil && os.SixelPassthrough.IsEnabled(),
+		caps.KittyAnimation,
+	)
+
+	// Initialize hooks manager and load user-defined hooks from config. Prefer
+	// the config the caller already loaded so we never trigger a second load
+	// (which used to re-apply appearance globals over CLI flags and, on the
+	// per-connection server paths, race other sessions). Loading is now pure and
+	// has no package-global side effects, so the fallback is safe too.
+	os.HookManager = hooks.NewManager()
+	// One log line per firing, at the same verbosity that records INFO logs. It
+	// is what answers "did my hook run at all".
+	hooks.SetVerbose(verboseLog)
+	cfg := opts.UserConfig
+	if cfg == nil {
+		if loaded, err := config.LoadUserConfig(); err == nil {
+			cfg = loaded
+		}
+	}
+	if cfg != nil {
+		// Hold the loaded config so the in-app settings page can persist live
+		// changes back to disk.
+		os.UserConfig = cfg
+		// Collected here and reported from Init, once there is a TUI to report
+		// them in.
+		os.ConfigWarnings = config.ConfigWarnings(cfg)
+		// A sink the client cannot deliver is a config problem like any other,
+		// and it is only knowable here, where the client is known.
+		if opts.BrowserClient {
+			os.ConfigWarnings = append(os.ConfigWarnings, browserAlertWarnings(cfg)...)
+			os.ConfigWarnings = append(os.ConfigWarnings,
+				remoteDockComponentWarning(cfg, "tuios-web")...)
+		}
+		if opts.IsSSHMode {
+			os.ConfigWarnings = append(os.ConfigWarnings,
+				remoteDockComponentWarning(cfg, "over SSH")...)
+		}
+		if opts.IsSSHMode {
+			os.ConfigWarnings = append(os.ConfigWarnings, sshAlertWarnings(cfg)...)
+		}
+		if cfg.Debug.ShowKeyEvents {
+			os.ShowKeys = true
+		}
+		if cfg.Spotlight.IsEnabled() {
+			os.spotlight.on = true
+		}
+		if cfg.Hooks != nil {
+			os.HookManager.LoadFromConfig(cfg.Hooks)
+		}
+		// [notifications.agent].command is shorthand for the after-agent-state
+		// hook, so it is discoverable beside the toggles that gate it. Registering
+		// rather than replacing means a user who wrote both spellings gets both,
+		// which is what [hooks] does for two commands on any other event.
+		if cmd := strings.TrimSpace(cfg.Notifications.Agent.Command); cmd != "" {
+			os.HookManager.Register(hooks.AfterAgentState, cmd)
+		}
+	}
+
+	// Default to BSP layout mode
+	os.UseBSPLayout = true
+
+	// What the startup probe learned about the terminal's own colours, as the
+	// first answer panes and the chrome get. See host_colors.go.
+	if os.asksHostColors() {
+		os.seedHostColors(caps)
+	}
+
+	// Initialize clipboard channel for OSC 52 propagation
+	os.PendingClipboardSet = make(chan ClipboardSetMsg, 1)
+
+	// Initialize PTY subscription tracking for daemon sessions
+	if opts.IsDaemonSession {
+		os.SubscribedPTYs = make(map[string]bool)
+	}
+
+	return os
+}

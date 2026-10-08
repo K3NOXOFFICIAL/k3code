@@ -1,0 +1,380 @@
+// Session resurrection: the ability to restore session state after a daemon
+// crash or restart.
+
+package session
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/adrg/xdg"
+)
+
+const (
+	resurrectionDir = "tuios/sessions"
+	// resurrectionInterval is how often a session is saved regardless of whether
+	// anything changed, which is what keeps each window's captured working
+	// directory current: a user typing cd changes no session structure.
+	resurrectionInterval = 30 * time.Second
+	// resurrectionDirtyInterval is how often the saver looks for a structural
+	// change, and so the most a SIGKILL can cost. It is a poll of a flag, not a
+	// write: a tick that finds nothing changed does nothing at all.
+	resurrectionDirtyInterval = 2 * time.Second
+
+	// ResurrectionVersion is the current on-disk resurrection schema version.
+	// It is bumped only when the schema changes in a way older daemons cannot
+	// read. State whose ResurrectionVersion is greater than this is treated as
+	// incompatible and archived rather than loaded. Version 0 (files written
+	// before versioning existed) is a structural subset of the current schema
+	// and loads without issue.
+	ResurrectionVersion = 1
+
+	// RestoredTag is the marker every surface shows on a session that came back
+	// from saved state, and RestoredNote is the sentence that says what came back
+	// with it. Both live here so the rail, the switcher, `tuios ls` and the
+	// attach path cannot word the same fact differently.
+	RestoredTag  = "restored"
+	RestoredNote = "the layout came back from saved state, and the shells are new"
+
+	// SavedTag and SavedNote word the state before that one: state that is on
+	// disk with no daemon holding it. A saved session is not a restored session
+	// and must not borrow its wording, or a listing would claim sessions are
+	// back when nothing has started them yet.
+	SavedTag  = "saved"
+	SavedNote = "on disk only, with no daemon running to hold it"
+)
+
+// resurrectionDirOverride is set during tests to use a temp directory. It is an
+// atomic because the periodic saver reads it from its own goroutine, which keeps
+// running while a test sets or restores it.
+var resurrectionDirOverride atomic.Value // string
+
+// setResurrectionDirOverride redirects resurrection state, and returns the value
+// it replaced. Test-only.
+func setResurrectionDirOverride(dir string) string {
+	prev, _ := resurrectionDirOverride.Swap(dir).(string)
+	return prev
+}
+
+// getResurrectionDir returns the directory for session resurrection files.
+func getResurrectionDir() string {
+	if override, _ := resurrectionDirOverride.Load().(string); override != "" {
+		return override
+	}
+	return filepath.Join(xdg.StateHome, resurrectionDir)
+}
+
+// getResurrectionPath returns the path for a specific session's resurrection file.
+// Callers are responsible for having validated the name (see ValidateSessionName);
+// this is a plain join and cannot defend itself.
+func getResurrectionPath(sessionName string) string {
+	return filepath.Join(getResurrectionDir(), sessionName+".json")
+}
+
+// ValidateSessionName rejects a name a session could never be saved under. The
+// name is also the name of its state file, so a name carrying a path separator
+// produced a session that ran perfectly and silently never persisted: the write
+// went to a directory that does not exist, and the error was thrown away. The
+// only place the user can still be told is when they choose the name.
+//
+// An empty name is allowed: the manager generates one.
+func ValidateSessionName(name string) error {
+	if name == "" {
+		return nil
+	}
+	if strings.TrimSpace(name) != name {
+		return fmt.Errorf("session name %q has leading or trailing whitespace", name)
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("session name %q is reserved", name)
+	}
+	if strings.ContainsAny(name, `/\`) {
+		return fmt.Errorf("session name %q contains a path separator; a session name is also the name of its state file", name)
+	}
+	if strings.ContainsFunc(name, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+		return fmt.Errorf("session name %q contains a control character", name)
+	}
+	return nil
+}
+
+// ResurrectionStateDir returns the directory holding saved session state, so a
+// message can name where sessions are persisted.
+func ResurrectionStateDir() string {
+	return getResurrectionDir()
+}
+
+// ResurrectionArchiveDir returns the directory where corrupt or incompatible
+// state files are moved instead of being deleted, so they can be inspected. It
+// is exported so an error message can tell the user where their session went
+// rather than only that it is gone.
+func ResurrectionArchiveDir() string {
+	return filepath.Join(getResurrectionDir(), "archive")
+}
+
+// archiveResurrectionFile moves a bad state file into the archive directory,
+// tagging it with a timestamp, and returns where it landed. Best effort: on any
+// failure the original file is removed so it is not retried on every load, and
+// an empty path is returned. Never returns an error to callers because the load
+// must continue regardless.
+func archiveResurrectionFile(path string) string {
+	archiveDir := ResurrectionArchiveDir()
+	if err := os.MkdirAll(archiveDir, 0700); err != nil {
+		_ = os.Remove(path)
+		return ""
+	}
+	base := filepath.Base(path)
+	dest := filepath.Join(archiveDir, fmt.Sprintf("%s.%d.bak", base, time.Now().UnixNano()))
+	if err := os.Rename(path, dest); err != nil {
+		_ = os.Remove(path)
+		return ""
+	}
+	return dest
+}
+
+// archivedNote renders where an archived state file was moved to, for inclusion
+// in the error that reports it. It degrades to naming the archive directory when
+// the move itself failed.
+func archivedNote(dest string) string {
+	if dest == "" {
+		return "it could not be archived and was removed"
+	}
+	return "archived to " + dest
+}
+
+// archiveRetention is how long an archived state file is kept. The archive
+// exists so a user can look at state that would not load; a file nobody has
+// looked at in two weeks is not going to be, and nothing else bounds the
+// directory's growth.
+const archiveRetention = 14 * 24 * time.Hour
+
+// CleanResurrectionDir removes what the save and archive paths leave behind:
+// temp files from writes that died before their rename, and archived state past
+// archiveRetention. Neither had anything cleaning it, so both grew forever.
+//
+// Best effort and never fatal. It runs on daemon start, which is the one moment
+// no save of this daemon's can be in flight, and only one daemon runs at a time.
+func CleanResurrectionDir() {
+	dir := getResurrectionDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		// A completed write renames the temp file into place, so one still sitting
+		// here is the residue of a write that never finished.
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json.tmp") {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
+			LogError("Failed to remove leftover resurrection temp file %s: %v", entry.Name(), err)
+		}
+	}
+
+	cleanOrphanHistory()
+
+	archiveDir := ResurrectionArchiveDir()
+	archived, err := os.ReadDir(archiveDir)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-archiveRetention)
+	for _, entry := range archived {
+		if entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(archiveDir, entry.Name())); err != nil {
+			LogError("Failed to prune archived session state %s: %v", entry.Name(), err)
+		}
+	}
+}
+
+// SaveSessionForResurrection persists the session state to disk.
+func SaveSessionForResurrection(state *SessionState) error {
+	if state == nil || state.Name == "" {
+		return nil
+	}
+
+	// Stamp the current schema version on every write regardless of caller, so
+	// the file is always self-describing even though clients that build the
+	// state do not set this field.
+	state.ResurrectionVersion = ResurrectionVersion
+
+	dir := getResurrectionDir()
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("failed to create resurrection dir: %w", err)
+	}
+
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal session state: %w", err)
+	}
+
+	path := getResurrectionPath(state.Name)
+	// Write to temp file then rename for atomicity
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return fmt.Errorf("failed to write resurrection file: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to rename resurrection file: %w", err)
+	}
+
+	return nil
+}
+
+// LoadResurrectionState loads a saved session state from disk. Corrupt or
+// version-incompatible files are archived (not deleted) and returned as an
+// error, so a single bad file can never crash the daemon or block startup.
+func LoadResurrectionState(sessionName string) (*SessionState, error) {
+	path := getResurrectionPath(sessionName)
+	data, err := os.ReadFile(path) // #nosec G304
+	if err != nil {
+		return nil, fmt.Errorf("no resurrection data for session %q: %w", sessionName, err)
+	}
+
+	var state SessionState
+	if err := json.Unmarshal(data, &state); err != nil {
+		dest := archiveResurrectionFile(path)
+		return nil, fmt.Errorf("saved state for session %q is corrupt and cannot be restored (%s): %w",
+			sessionName, archivedNote(dest), err)
+	}
+
+	if state.ResurrectionVersion > ResurrectionVersion {
+		dest := archiveResurrectionFile(path)
+		return nil, fmt.Errorf("saved state for session %q was written by a newer TUIOS (state version %d, this build reads up to %d) and cannot be restored (%s)",
+			sessionName, state.ResurrectionVersion, ResurrectionVersion, archivedNote(dest))
+	}
+
+	return &state, nil
+}
+
+// ResurrectableInfo summarizes a resurrectable session for listing.
+type ResurrectableInfo struct {
+	Name        string    // Session name
+	WindowCount int       // Number of windows saved
+	SavedAt     time.Time // Modification time of the state file
+}
+
+// ListResurrectableInfos returns metadata for every resurrectable session,
+// sorted by name. Corrupt/incompatible files are skipped (and archived).
+func ListResurrectableInfos() ([]ResurrectableInfo, error) {
+	names, err := ListResurrectableSessions()
+	if err != nil {
+		return nil, err
+	}
+
+	infos := make([]ResurrectableInfo, 0, len(names))
+	for _, name := range names {
+		state, err := LoadResurrectionState(name)
+		if err != nil {
+			continue
+		}
+		info := ResurrectableInfo{Name: name, WindowCount: len(state.Windows)}
+		if fi, statErr := os.Stat(getResurrectionPath(name)); statErr == nil {
+			info.SavedAt = fi.ModTime()
+		}
+		infos = append(infos, info)
+	}
+	return infos, nil
+}
+
+// ListResurrectableSessions returns names of sessions that can be restored.
+func ListResurrectableSessions() ([]string, error) {
+	dir := getResurrectionDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	var names []string
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		name := entry.Name()[:len(entry.Name())-5] // strip .json
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+// RemoveResurrectionState deletes the resurrection file for a session, and
+// its saved pane history.
+func RemoveResurrectionState(sessionName string) {
+	path := getResurrectionPath(sessionName)
+	_ = os.Remove(path)
+	// The session's pane history goes with it. It is only ever read back into
+	// a restore of this state, and it holds whatever the panes printed.
+	RemoveHistory(sessionName)
+}
+
+// StartPeriodicSave starts a goroutine that saves session state, and returns a
+// stop function to halt it.
+//
+// takeDirty reports whether the session's structure changed since the last save
+// and clears the mark; nil means every tick is a full save. It is what makes the
+// SIGKILL window small without making the saves frequent: the ticker runs at the
+// short interval but a tick that finds nothing changed does no work, so an idle
+// session still writes only once per resurrectionInterval (which is what keeps
+// each shell's working directory current) and a changed one reaches disk within
+// a couple of seconds. Before this, a session created less than a full interval
+// before a SIGKILL was lost entirely, which is the worst case there is: it is the
+// session the user just made.
+func StartPeriodicSave(getState func() *SessionState, takeDirty func() bool) func() {
+	return startPeriodicSaveWith(getState, takeDirty, SaveSessionForResurrection)
+}
+
+// startPeriodicSaveWith is StartPeriodicSave with the write it makes. A session
+// passes its own, which drops a snapshot taken under a name the session has
+// since been renamed from (see Session.persist).
+func startPeriodicSaveWith(getState func() *SessionState, takeDirty func() bool, save func(*SessionState) error) func() {
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(resurrectionDirtyInterval)
+		defer ticker.Stop()
+		lastSave := time.Now()
+
+		for {
+			select {
+			case now := <-ticker.C:
+				dirty := takeDirty == nil || takeDirty()
+				if !dirty && now.Sub(lastSave) < resurrectionInterval {
+					continue
+				}
+				lastSave = now
+				state := getState()
+				if state == nil {
+					continue
+				}
+				if err := save(state); err != nil {
+					LogError("Resurrection save for session %q failed: %v", state.Name, err)
+				}
+			case <-stopCh:
+				return
+			}
+		}
+	}()
+
+	// Waits for the saver to return. Session.Stop stops saving and then writes
+	// the state itself, and both writes go through the same fixed <name>.json.tmp
+	// path, so a stop that did not wait let the two interleave on it.
+	return func() {
+		close(stopCh)
+		<-done
+	}
+}

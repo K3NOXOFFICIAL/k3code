@@ -1,0 +1,122 @@
+package app
+
+import (
+	"testing"
+
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+)
+
+// ptySpy records the size the daemon PTY has actually been told, the way the
+// real ResizePTY round trip would leave it.
+type ptySpy struct {
+	w, h  int
+	calls int
+}
+
+func (p *ptySpy) install(win *terminal.Window) {
+	p.w, p.h = win.ContentWidth(), win.ContentHeight()
+	win.DaemonResizeFunc = func(w, h int) error {
+		p.w, p.h = w, h
+		p.calls++
+		return nil
+	}
+}
+
+// newTilingClient is an attached client with a known viewport, tiling on, BSP.
+func newTilingClient(width, height, workspace int) *OS {
+	return &OS{
+		Settings:             config.Global,
+		NumWorkspaces:        9,
+		CurrentWorkspace:     workspace,
+		WorkspaceFocus:       make(map[int]int),
+		WorkspaceLayouts:     make(map[int][]WindowLayout),
+		WorkspaceMasterRatio: make(map[int]float64),
+		WorkspaceHasCustom:   make(map[int]bool),
+		Width:                width,
+		Height:               height,
+		AutoTiling:           true,
+		UseBSPLayout:         true,
+	}
+}
+
+// daemonNewWindow appends the box AddDaemonWindow produces: a nominal full-size
+// window flagged Unplaced, because the daemon has no viewport to place it in.
+func daemonNewWindow(state *session.SessionState, id string, width, height, workspace int) {
+	state.Windows = append(state.Windows, session.WindowState{
+		ID:        id,
+		PTYID:     "pty-" + id,
+		Title:     id,
+		X:         0,
+		Y:         0,
+		Width:     width,
+		Height:    height,
+		Workspace: workspace,
+		Unplaced:  true,
+	})
+	state.FocusedWindowID = id
+	state.Version++
+}
+
+// TestNewWindowPTYMatchesPaneAfterRepeatedUnplacedSync is the reported bug: a
+// pane that is a whole screen wide runs its shell at a fraction of that size, so
+// a full-screen program paints only the top-left corner of it.
+//
+// The daemon re-broadcasts the creating state more than once, and the repeats
+// still carry Unplaced until this client's placing push lands (the case
+// placeUnplacedWindows and the `placed` retile in ApplyStateSync exist for). A
+// repeat therefore resizes the real PTY back down to the raw placement box, and
+// the retile that follows puts the window back at full size. If that retile
+// decides it has nothing to announce, the emulator goes to full size and the PTY
+// is left at the placement box: the pane and its shell disagree, permanently,
+// because nothing resizes again until the user does.
+func TestNewWindowPTYMatchesPaneAfterRepeatedUnplacedSync(t *testing.T) {
+	prevAnim := config.Global.Motion
+	config.Global.Motion = config.MotionNone
+	t.Cleanup(func() { config.Global.Motion = prevAnim })
+
+	const width, height = 130, 55
+
+	m := newTilingClient(width, height, 1)
+	daemonState := &session.SessionState{
+		Name:             "tiling",
+		CurrentWorkspace: 1,
+		AutoTiling:       true,
+		WorkspaceFocus:   map[int]string{},
+		Version:          1,
+	}
+	daemonNewWindow(daemonState, "win-00000000000000000000000000000001", width, height, 1)
+
+	if err := m.ApplyStateSync(daemonState); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+	if len(m.Windows) != 1 {
+		t.Fatalf("client holds %d windows, want 1", len(m.Windows))
+	}
+	win := m.Windows[0]
+
+	// The client has placed and tiled the window; the daemon PTY carries that
+	// size. Start watching from there.
+	var pty ptySpy
+	pty.install(win)
+
+	// The daemon re-broadcasts the creating state: same window, still Unplaced,
+	// newer version.
+	daemonState.Version++
+	if err := m.ApplyStateSync(daemonState); err != nil {
+		t.Fatalf("echo sync: %v", err)
+	}
+
+	wantW, wantH := win.ContentWidth(), win.ContentHeight()
+	if pty.w != wantW || pty.h != wantH {
+		t.Fatalf("daemon PTY is %dx%d but the pane is %dx%d: the shell paints into a corner of its pane",
+			pty.w, pty.h, wantW, wantH)
+	}
+	if got, want := win.Terminal.Width(), wantW; got != want {
+		t.Fatalf("local emulator width %d, want %d", got, want)
+	}
+	if got, want := win.Terminal.Height(), wantH; got != want {
+		t.Fatalf("local emulator height %d, want %d", got, want)
+	}
+}

@@ -1,0 +1,1153 @@
+# Sessions
+
+TUIOS runs in one of two modes: a daemon session that lives in a background
+process and survives the client that draws it, and a local session that lives
+and dies with the process you started. A plain `tuios` gives you a daemon
+session. This document covers both, what attaching and detaching do, and exactly
+what does and does not come back after each kind of interruption.
+
+> **Note:** `Ctrl+B` is the default leader key throughout. It is configurable via
+> `leader_key`, see [CONFIGURATION.md](CONFIGURATION.md).
+
+## Table of Contents
+
+- [Local Sessions](#local-sessions)
+- [Daemon Sessions](#daemon-sessions)
+- [Attaching and Detaching](#attaching-and-detaching)
+- [Sessionizer](#sessionizer)
+- [The Scratch Terminal](#the-scratch-terminal)
+- [Picture in Picture](#picture-in-picture)
+- [What Survives](#what-survives)
+- [Resurrection](#resurrection)
+- [The resurrect Command](#the-resurrect-command)
+- [Windows on Another Machine](#windows-on-another-machine)
+- [Agents and Worktrees on Another Machine](#agents-and-worktrees-on-another-machine)
+- [Global Sessions](#global-sessions)
+- [Keeping Hosts on One Version](#keeping-hosts-on-one-version)
+- [Starting the Daemon on a Host](#starting-the-daemon-on-a-host)
+- [Machines on a Tailnet](#machines-on-a-tailnet)
+- [Where State Lives](#where-state-lives)
+- [Limitations](#limitations)
+- [Related Documentation](#related-documentation)
+
+## Local Sessions
+
+```bash
+tuios --standalone
+```
+
+A local session keeps everything, the window manager, the terminal emulators and
+the shell processes, inside one process. No daemon is started, no socket is
+created and no state is written to disk. When the process exits, for any reason,
+the session is gone: there is nothing to attach to and nothing to restore.
+
+Local sessions are the right choice when you want a window manager for the
+lifetime of one terminal window. Everything in this document from
+[Attaching and Detaching](#attaching-and-detaching) onward applies only to
+daemon sessions.
+
+Ask for a local session in one of three ways:
+
+```bash
+tuios --standalone           # this one run
+TUIOS_NO_DAEMON=1 tuios      # every tuios in this shell
+```
+
+```toml
+[startup]
+daemon = false               # every tuios, from the config file
+```
+
+The flag and the environment variable both beat the config file. They are the
+way back to a terminal when the daemon is the thing that will not start.
+
+## Daemon Sessions
+
+```bash
+tuios
+```
+
+Running `tuios` with no subcommand attaches to a daemon-backed session, and
+starts the daemon first if none is running. This is `startup.daemon`, and it
+ships on. A daemon that will not start does not leave you without a terminal:
+`tuios` says so and runs the session standalone for that one run.
+
+An install that already has a config file keeps what that file says. The
+`[startup]` booleans are only read from the file, so `tuios` on an existing
+machine goes on doing what it did.
+
+A daemon session lives in a separate `tuios` daemon process. The daemon owns the
+shell processes (PTYs) and runs a terminal emulator for each one, so output keeps
+being parsed whether or not anyone is watching. A client is only a viewer: it
+subscribes to PTY output, draws it, and forwards your keystrokes back.
+
+```bash
+tuios new mysession          # create a persistent session and attach to it
+tuios new mysession --detach # create it headless, attach later
+tuios attach mysession       # attach to an existing session
+tuios attach                 # attach to the most recent session
+tuios attach mysession -c    # attach, creating the session if it is missing
+tuios ls                     # list live sessions
+tuios ls --json              # the same list, machine readable
+tuios kill-session mysession # terminate a session and all its windows
+```
+
+The daemon starts automatically when you create or attach to a session. You can
+also run it explicitly:
+
+```bash
+tuios daemon                 # run in the foreground (useful for debugging)
+tuios daemon --log-level=messages
+tuios kill-server            # stop the daemon and all its sessions
+```
+
+`tuios kill-server` is synchronous. It returns only after every session's state
+has been written and the daemon's socket has been removed, so a new daemon can
+be started as soon as it returns.
+
+More than one client can be attached to the same session at once. All of them
+see the same windows and output. `window_size` in `[daemon]` sets the size of
+the session. See [Session size with more than one client](#session-size-with-more-than-one-client).
+
+Every attached client has full control: it sees all output, sends input, and
+manipulates windows. There is no per-client permission tier, so share a session
+only with people you would hand the keyboard to. Local clients are gated by the
+socket's Unix permissions (same user only), SSH clients by SSH authentication,
+and web clients by whatever stands in front of `tuios-web`. See
+[Multi-client sessions](https://tuios.dev/docs/sessions) on the site for
+the full picture.
+
+### Session size with more than one client
+
+A pane has one size, so a session has one size for all of its clients.
+`window_size` in `[daemon]` selects the client that sets it. The values are
+the values of the tmux `window-size` option.
+
+- `smallest` is the default. The session uses the smallest client. Every
+  client shows the full session. A larger client shows empty space around it.
+- `largest`: the session uses the largest client.
+- `latest`: the session uses the client that last had input.
+
+For `latest`, input is a key, a paste, a click, a drag or a turn of the mouse
+wheel. A resize is not input. A focus change is not input. A reply that your
+terminal sends without you, such as a colour reply, is not input. tmux counts a
+resize and a focus change. tuios does not, so a phone that only attaches does
+not take the session from the person who types on a laptop.
+
+A client keeps the session for 1 second after its last input. If two people
+type at the same time, the session does not change size on each key. When one
+person stops, the session goes to the other client 1 second after the last
+key of the first.
+
+The first client that attaches sets the size until another client has input.
+When the latest client detaches, the session goes to the client with the most
+recent input.
+
+A client that is smaller than the session shows a part of it, the part around
+the cursor of the focused pane. This is the rule that tmux uses. In copy mode
+the client follows the copy-mode cursor. If a program hides its cursor, the
+client follows the place where the program left it. An agent CLI hides its
+cursor and leaves it in its input box, so you see the input box. tmux shows
+the top left corner of the window instead.
+
+A mark at the right end of the line above the dock shows the size of the
+session, with arrows that point to the parts you cannot see. This line covers
+no pane. With the dock hidden, the mark is in the bottom right corner of the
+panes. The rail and the dock stay at the edges of your screen. A click on a
+pane goes to the pane under the pointer, also in capture mode. The copy-mode
+search prompt and the multi copy "Save to" prompt stay on your screen.
+
+To change the value for one session while it runs:
+
+```bash
+tuios set-config daemon.window_size latest -s mysession
+tuios session-info -s mysession --json   # window_size, session_width, session_height
+```
+
+Under the tmux shim, `tmux set -g window-size latest` does the same.
+
+A client from a version of tuios before `window_size` cannot show a part of a
+session. While such a client is attached, the session uses `smallest`, and
+`session-info` reports `window_size` as `smallest`. A new client attached to
+an older daemon works as before, at the smallest size.
+
+Native clients, `tuios-web` clients and clients through the SSH server all
+report input in the same way, so each of them can be the latest client.
+
+A client that cannot send input, such as `tuios-web --read-only`, does not set
+the size under `largest` or `latest`. A viewer with a large browser window
+does not make the session larger than the people who type can see. Under
+`smallest` it counts like every other client, so the default does not change.
+If only viewers are attached, they set the size. A tool
+that uses the verb socket only, such as Collie, is not a client with a size.
+It does not change the size of the session.
+
+### The sidebar with more than one client
+
+The sidebar is part of the session. When you show or hide it on one client,
+every client of the session shows or hides it. The panes then take the new
+space on every client.
+
+A new session takes the sidebar setting of the first client that attaches,
+from `appearance.sidebar.enabled`. A later client with a different setting
+uses the session's value. When you toggle the sidebar, tuios also keeps the
+new value in your config for the next new session. A reload of the config
+file does not change the sidebar of a session that is running.
+
+The width of the sidebar stays per client. A client too narrow to show the
+sidebar does not change it for the session. When the clients use different
+widths, the panes use the space next to the widest sidebar. A client with a
+narrower sidebar shows the difference as empty space.
+
+A client from a version of tuios before this change keeps its sidebar to
+itself. A new client attached to an older daemon also keeps its sidebar to
+itself.
+
+### In-app session switching
+
+`Ctrl+B` `S` opens the session switcher. Type to fuzzy-filter, `Enter` to switch
+to the highlighted session, `Ctrl+D` to delete one (with a confirmation prompt,
+and never the session you are currently on). If your query matches no existing
+session, `Enter` creates a session with that name and switches to it.
+
+`Ctrl+R` renames the highlighted session. The rename changes the session's
+name in the daemon, so `tuios ls`, `tuios attach` and every client show the
+new name. The rail's rename and the `tuios rename-session` command do the
+same. Panes that already run keep the old name in `TUIOS_SESSION`, and tuios
+commands from them still reach the session. `tuios attach` and
+`tuios kill-session` with the old name fail and name the new one. An event
+stream on the session keeps its events under the new name. A name that another
+session has is refused. A name that a saved session has is refused too.
+
+With remote hosts in `[hosts]`, the switcher also lists the sessions on your
+other machines. A remote session shows as `name @ host`, and the filter
+matches that text. `Enter` switches to it, and back again, in either
+direction. The rail, the palette and session cycling switch across machines
+the same way. Rename and delete work only on sessions on the machine you are
+on.
+
+`tuios switch-session` switches a client from the command line, also from a
+pane. See [Sessionizer](#sessionizer).
+
+Switching is not the same as detaching and reattaching: the client tears down
+its view of the current session and builds a view of the target, in place. The
+session you left keeps running.
+
+## Attaching and Detaching
+
+**Detach:** `Ctrl+B` `d`. The client pushes its current state to the daemon so
+the session you come back to is the one you left, then quits. The session, its
+windows and its shell processes keep running.
+
+**Quit:** `Ctrl+B` `q`. This is not a detach. In a daemon session, quitting kills
+the session, on the reasoning that quitting is the user saying the session is
+over. A confirmation dialog appears first if a window is running a foreground
+process; set `confirm_quit = true` to always show it.
+
+**Exit terminal mode:** `Ctrl+B` `Esc`, or `Alt+Esc` as a direct shortcut. A
+bare `Esc` in terminal mode is forwarded to the shell, as it must be for vim and
+friends to work. Note that `Ctrl+B` `d` exits terminal mode only when there is no
+daemon session to detach from; in a daemon session it detaches.
+
+A client that dies without detaching (its terminal is closed, the SSH connection
+drops, the process is killed) is equivalent to a detach as far as the session is
+concerned. The daemon notices the connection go away and keeps the session
+running. Nothing is lost, because nothing the session needs lived in the client.
+
+## Sessionizer
+
+A sessionizer opens a project as a session. You pick a folder, and tuios
+shows its session. When the session does not exist, tuios makes it in that
+folder first.
+
+Add this command key to `config.toml`. It opens a popup with `fzf` over the
+folders in `~/dev`:
+
+```toml
+[[keybindings.command]]
+key = "prefix+alt+s"
+type = "popup"
+command = 'dir=$(find ~/dev -mindepth 1 -maxdepth 1 -type d | fzf) && tuios switch-session --create --cwd "$dir" "$(basename "$dir")"'
+description = "Open a project"
+```
+
+Press `Ctrl+B` `Alt+S`, pick a folder, and press `Enter`. The client switches
+to the session of that folder. Its windows start in the folder.
+
+- [`tuios switch-session`](CLI_REFERENCE.md#tuios-switch-session) switches
+  the client that shows the popup. Nothing is nested.
+- `--create` makes the session when it is missing. `--cwd` sets the folder
+  of its windows. The session keeps this folder after a daemon restart.
+- With `startup.tiled = true`, the new session is tiled. tuios reads this
+  setting from the config of the client that switches. This is also true
+  for a session on a host.
+- To open a project on a host, put the host before the name:
+  `tuios switch-session --create --cwd "$dir" "build:$(basename "$dir")"`.
+  The folder is a path on that host.
+
+From a shell outside tuios, name the client with `-s`:
+
+```sh
+tuios switch-session -s work --create --cwd ~/dev/api api
+```
+
+To make a session without a switch, run `tuios new NAME --detach --cwd DIR`.
+
+## The Scratch Terminal
+
+`Ctrl+B` `g` shows the scratch terminal in a box over the current layout.
+Press `Ctrl+B` `g` again to hide it. tmux-floax does the same for tmux.
+
+The scratch terminal is a small layout of its own. It starts as one shell. You
+can split it into more panes, and move, resize and zoom them, as on a
+workspace. The key shows and hides all of its panes together. For example, keep
+log tails of three services and a shell for tests in the scratch terminal, and
+go back to your code with one key.
+
+Hiding does not close a pane. Each shell keeps running with its scrollback. The
+next `Ctrl+B` `g` shows the panes as you left them. The keyboard goes to the
+pane that had the focus, in terminal mode.
+
+- Each session has one scratch terminal. tuios creates it the first time you
+  press the key.
+- The first shell starts in the folder of the focused pane, or in your home
+  folder.
+- The box shows over the workspace you are on. Its frame shows the name.
+- When you hide it, the focus goes back to the pane you used before, in the
+  mode you used before.
+- The window keys act inside the box while a pane of the scratch terminal has
+  the focus: split, focus movement, resize, swap, zoom, close and multifocus.
+  `tuios xpanes` that you run in a pane of the scratch terminal opens its panes
+  in the scratch terminal.
+- A pane of the scratch terminal is not minimized, not floated and not moved
+  to a workspace. The dock shows a message for a move.
+- Closing a pane closes it. When you close the last pane, the scratch terminal
+  ends and the box goes away. The next `Ctrl+B` `g` starts a new one.
+- A focus on a pane of the hidden scratch terminal, for example with
+  `tuios focus-window`, shows the box first.
+- A click outside the box hides it and focuses the pane under the pointer. The
+  click does nothing else. A focus on a pane outside the box, by a key or from
+  the sidebar, also hides it.
+- The mouse acts on the panes inside the box, as on a workspace. The box
+  itself does not move or change size. Its size comes from `[scratch]`.
+- The key works from inside the box. tuios reads `Ctrl+B` before the shell
+  gets it.
+- The sidebar, the window list, the window count and the workspace list do not
+  show the panes of the scratch terminal. The `tuios list-windows` table does
+  not show them. `tuios list-windows --json` shows each with `"scratch": true`,
+  its `"scratch_name"`, and a workspace number of 1000 or more.
+- The focus is part of the session. When a client shows the scratch terminal,
+  every client of the session shows it.
+- When you detach, the scratch terminal stays as it is. It is there when you
+  attach again.
+- After a daemon restart, the scratch terminal comes back hidden. Each pane has
+  a new shell in its own folder, under its saved history, in the same layout.
+- In a session on a different machine, the key does not open a scratch
+  terminal. The dock shows a message.
+- Until the daemon restarts after an upgrade, and while a client of an older
+  tuios is attached to the session, the scratch terminal is one pane in a
+  popup, as in older versions. The key shows and hides it the same way.
+
+```toml
+[scratch]
+width = "80%"  # cells (100) or percent (80%)
+height = "80%"
+```
+
+The `session` key is no longer used. tuios ignores it, and the config
+warnings tell you to remove it.
+
+The scratch terminal is part of the current session. It does not make a
+separate session, so it does not change the session that a bare
+`tuios attach` picks.
+
+The first version of this key made a session called `scratch`. tuios does not
+use that session any more. To remove it, run `tuios kill-session scratch`.
+
+To add more scratch terminals, each on its own key and with its own command,
+add `[[keybindings.command]]` entries of type `scratch`. See
+[KEYBINDINGS.md](KEYBINDINGS.md#command-keys). Each one has its own layout,
+and the rules above apply to each of them. One box is on the screen at a
+time: a show replaces the other. After a daemon restart, the first pane of an
+entry has a shell, not the command of the entry. To start the command again,
+close the pane.
+
+The action is `toggle_scratch`. To use a different key, bind the action in
+`[keybindings.prefix_mode]` or in a different section. If your config puts `g`
+on a different prefix action, `toggle_scratch` has no key.
+`tuios keybinds doctor` shows this.
+
+## Picture in Picture
+
+The picture-in-picture view is a small live copy of one pane in a corner of
+the screen. Use it to watch a pane, such as a coding agent, while you work in a
+different pane.
+
+To pin the focused pane, press `p` in window mode. Press `p` again, on any
+pane, to unpin it. The command palette has the same command. From a shell, run
+`tuios pip <window>` to pin a pane by ID or name, and `tuios pip --off` to
+unpin it.
+
+- The view is not the pane. The pane stays where it is in the layout. It keeps
+  running when it is on a different workspace, minimized or in a hidden
+  scratch terminal.
+- The view shows the last rows of the pane that hold text, from the left edge,
+  at one cell for each cell. Its border shows the pane name and the agent
+  state mark. It shows text only. Images do not show in it.
+- The view is on top of the tiled panes and a zoomed pane. Popups, the scratch
+  terminal, menus and panels are on top of the view.
+- The view never takes the focus or a key.
+- A click on the view focuses the pane. tuios goes to the workspace of the
+  pane, restores a minimized pane and shows a hidden scratch terminal.
+- The view does not show while its pane has the focus.
+- The view does not cover the cursor of the focused pane or the text to the
+  left of the cursor. When that text reaches the view, the view moves to a
+  different corner.
+- When the pane closes, the view closes and the dock shows a message.
+- Each client has its own view. The view is not in the session state, so a
+  different client does not see it. A detach or a switch to a different
+  session removes it.
+- `tuios pip` reaches one client. With more than one client attached, it acts
+  on the client that `tuios run-command` reaches. When you attach to a session
+  on a different machine, that machine cannot pin a pane on your screen.
+- A kitty image in a pane under the view is cut around the view. A sixel image
+  is not, so it can draw over the view. Floating panes have the same limit.
+- One pane at a time is pinned. A pin replaces the previous one.
+- The view reads the cells that the pane already holds. It adds no timer and
+  does no work while the pane is quiet.
+
+```toml
+[pip]
+width = 40               # cells, border included
+height = 12
+corner = "bottom-right"  # bottom-right, bottom-left, top-right or top-left
+```
+
+The action is `toggle_pip`. If your config puts `p` on a different window
+mode action, `toggle_pip` has no key. `tuios keybinds doctor` shows this.
+
+## What Survives
+
+Four tiers of interruption, and what comes back after each. "Structure" means
+window count, geometry, workspace assignment, custom names, minimize state, the
+BSP tree and the layout mode.
+
+| | Client exits (detach, crash, SSH drop) | Daemon restart (`kill-server`, `SIGTERM`) | Daemon crash (`SIGKILL`, OOM) | Reboot |
+|---|---|---|---|---|
+| Session exists afterwards | Yes | Yes, restored on daemon start | Yes, restored on daemon start | Yes, restored on daemon start |
+| Session id | Yes | Yes | Yes | Yes |
+| Window structure | Yes | Yes | Partial: as of the last save, a couple of seconds stale | Partial: as of the last save |
+| Shell processes | Yes, they keep running | No, fresh shells are spawned | No, fresh shells are spawned | No, fresh shells are spawned |
+| Working directories | Yes | Yes, on Linux and macOS (see below) | Partial: the cwd from the last save | Partial: the cwd from the last save |
+| Screen contents | Yes | Yes, as history above a divider (see below) | Partial: as of the pane's last save, up to 30 seconds stale | Yes, as for a daemon restart |
+| Scrollback | Yes | Yes, the last 1000 lines by default | Partial: as of the pane's last save | Yes, as for a daemon restart |
+| Running programs (vim, tail, a build) | Yes | No | No | No |
+| Agent conversations (resumable harnesses) | Yes, the agent keeps running | The conversation, not the process: see below | Same | Same |
+| Sidebar shown or hidden | Yes | Yes | Partial: as of the last save | Partial: as of the last save |
+| Copy-mode position, selection | No, per-client | No | No | No |
+| Input mode (window vs terminal) | No, per-client | No | No | No |
+
+The client column is the important one: a detach costs you nothing, because the
+daemon holds the PTYs and keeps a terminal emulator fed for each. On reattach the
+client asks the daemon for each window's screen and scrollback and repaints it.
+Copy-mode state and input mode are deliberately per-client and are not restored,
+so that one client entering terminal mode does not change what another client is
+doing.
+
+The three daemon columns are all resurrection, described next. Nothing survives
+a daemon exit except what was written to disk.
+
+The session id is saved in the state file, so a restored session keeps its id
+and a client that stored the id still finds the session. A state file from a
+build before ids were saved has none, and that session gets a new id once.
+
+## Resurrection
+
+Resurrection is how a session comes back after the daemon that held it is gone.
+
+Each live session writes its state to a JSON file within a couple of seconds of
+any change to its structure, again every 30 seconds whether or not anything
+changed (which is how each window's working directory stays current, since
+typing `cd` changes no structure), and once more on a clean shutdown
+(`kill-server`, `SIGTERM` or `SIGINT`). A session nothing has changed costs one
+write per 30 seconds, as it always did. The final save happens
+while the shells are still alive, which is what makes the working directories in
+it accurate. The write is atomic: a temp file is renamed into place, so a crash
+mid-write cannot leave a half-written file where a good one used to be.
+
+The state file holds the session's structure: its windows with their geometry,
+titles, custom names, workspace, minimize state, its focus, its BSP trees, its
+layout mode, and each window's working directory. It does not hold anything
+about the processes that were running. Each pane's history is saved in a
+separate file. See [Pane history](#pane-history).
+
+When the daemon starts, it restores every session it finds saved state for. For
+each window it spawns a **fresh shell** in that window's saved working directory
+(falling back to the shell's default directory if the saved path no longer
+exists), and writes a dim one-line notice into it:
+
+```
+-- tuios: session restored, fresh shell in /home/you/project --
+```
+
+When the pane has saved history, the notice is a divider under that history:
+
+```
+$ make
+...the last lines of the build...
+$
+-- tuios: restored from Sep 30 14:02, fresh shell in /home/you/project --
+$ _
+```
+
+Restored shells get `TUIOS_RESTORED=1` in their environment, so your shell rc can
+react to a restore without relying on the banner.
+
+The session itself is marked too, so you can tell a session that just came back
+from one that has been running for days without opening a pane. A restored
+session shows a `restored` tag in `tuios ls`, in the sidebar and in the session
+switcher, and `tuios attach` says so before it hands over the screen:
+
+```
+Session "work" was restored: layout came back from saved state; the shells are new.
+```
+
+The mark is cleared by the first attach, on the reasoning that once you have
+looked at the session the question has been answered. It never comes back for
+that session unless the daemon restores it again.
+
+What this means in practice: your layout comes back and each pane is sitting in
+the right directory, but whatever was running in those panes is not. A `vim` you
+had open is closed and a build you had running is dead. The output they left
+is still there to read, above the divider.
+
+Agents are the exception worth knowing about. An agent's process ends like any
+other, and whatever turn it was running does not finish. But a coding agent
+keeps its conversation on disk, and a pane whose harness reported the
+conversation id (the hooks `tuios integration install` sets up do) keeps that
+id in the state file. For such a pane, when its harness has a resume command
+(Claude Code, Codex, opencode and more), the restore offers to start the
+harness again on the same conversation, as `daemon.resume_agents` says: `ask`
+(the default) puts a Resume row in the Inbox that you answer with `y`, `auto`
+types `claude --resume <id>` (or the harness's own form) into the new shell,
+and `off` does neither. `tuios resume-agent -w <pane>` does it by hand. See
+[Agent state](AGENT_STATE.md#resuming-after-a-restart).
+
+Start the daemon with `--no-restore` to skip automatic restoration; saved state
+is left on disk and can still be restored on demand with `tuios resurrect`.
+
+A session killed with `tuios kill-session` has its saved state deleted, because
+an explicit kill is a deliberate teardown and must not leave the session
+restorable. Quitting a daemon session from inside the client (`Ctrl+B` `q`) kills
+the session and so does the same.
+
+If a state file is corrupt, or was written by a newer TUIOS whose format this
+build does not understand, it is moved into an archive directory rather than
+deleted, and skipped. One bad file can never block the daemon from starting or
+prevent other sessions from being restored.
+
+### Pane history
+
+The daemon saves each pane's history next to the session's state file, and a
+restore shows it again. The history comes back as text to read. It is not
+replayed into the new shell, and no command in it runs again.
+
+What comes back:
+
+- The pane's scrollback, up to 1000 lines by default, and the screen it
+  showed. Colors, bold and other styles, wide characters and wrapped lines
+  come back as they were.
+- The shell's screen when a full-screen program such as `vim` or `htop` was
+  open. The program's own screen does not come back.
+- The scratch terminal's history. Other popups do not come back, so their
+  history is not saved.
+
+A pane that ran on another machine through `[hosts]` comes back as a shell on
+this machine, without history. That machine keeps its own copy.
+
+Copy mode, search and hints reach the restored lines like any other history.
+An agent pane keeps its resume offer. The resumed agent starts under the
+divider.
+
+When the history is saved:
+
+- On a clean stop (`kill-server`, `SIGTERM`, a reboot that stops the daemon),
+  for every pane with new output.
+- During the session, with the periodic save, for a pane with new output. One
+  pane is saved at most once in 30 seconds, so a pane that prints without end
+  costs one write in 30 seconds. An idle pane is not written again.
+
+After a crash (`SIGKILL`, an out-of-memory kill), a pane comes back with its
+history as of its last save, which can be up to 30 seconds old.
+
+Where it goes and how big it gets:
+
+- One file for each pane in
+  `$XDG_STATE_HOME/tuios/sessions/scrollback/<session>/`. The directory is
+  mode 0700 and each file is mode 0600.
+- Each file is compressed. It is at most 2 MiB by default. A pane with more
+  saves fewer lines.
+- All the files of one session are at most 16 MiB together. A pane that does
+  not fit saves fewer lines.
+- The daemon deletes a pane's file when the pane closes, and a session's
+  files when the session is killed. A renamed session keeps its files.
+- When the daemon starts, it deletes history that has no saved session.
+
+> **Privacy.** The history files hold what your panes printed, which can
+> include passwords, tokens and other secrets. They stay on your disk until
+> the pane or the session goes. To stop this, set `persist_scrollback = false`
+> in `[daemon]`. The next time the daemon starts, it deletes the history it
+> saved before.
+
+```toml
+[daemon]
+persist_scrollback = true         # save each pane's history (default true)
+persist_scrollback_lines = 1000   # most history lines one pane saves (0 = 1000)
+persist_scrollback_kb = 2048      # most KiB one pane's file takes (0 = 2048)
+```
+
+The daemon reads these settings when it starts.
+
+## The resurrect Command
+
+```bash
+tuios resurrect              # list the sessions that can be restored
+tuios resurrect mysession    # restore that session and attach to it
+```
+
+With no arguments, `tuios resurrect` prints a table of every saved session with
+its window count, whether it is already live, and how long ago its state was
+saved.
+
+With a name, it starts the daemon if necessary, asks it to restore that session
+from saved state, and attaches. It is a no-op if the daemon already restored the
+session on start, in which case you simply attach to the live one. `restore` is
+an alias for the same command.
+
+If the restore fails, the command says which of the reasons applies: there is no
+saved state under that name, the state is corrupt, or the state was written by a
+newer TUIOS. In the last two cases it also prints where the file was archived.
+
+## Windows on Another Machine
+
+A window's process does not have to run on the machine the session is on.
+
+```bash
+tuios new-window deploy --host build
+```
+
+The window belongs to the session it was created in. It is drawn here, sized by
+the layout here, and closed here; only the process is on `build`. The machine
+comes from the `[hosts]` table, the same one `tuios hosts` lists, and a name
+that is not in it is refused before anything is started.
+
+A session holding such a window is still an ordinary session, so `tuios ls`, the
+verbs, the mailbox, hooks and resurrection keep working on it with no special
+case. What makes the window different is one field recording where its process
+is.
+
+Panes on two machines can sit side by side in one layout, because each pane is
+a window of this session and the layout does not care where any of their
+processes are.
+
+### What it looks like
+
+A pane whose shell is elsewhere says so on its title bar, as `build:name`. This
+is not optional: two panes side by side are otherwise identical, and the same
+typed line is a different act depending on which machine answers it.
+
+### Agents in a pane on another machine
+
+Agent detection works. The daemon that owns the window cannot do it alone: the
+pane's process is on the other machine, so the pid it would read means nothing
+here and every tier of detection starts from that process. It asks the other
+machine what the pane is running, through the `pane-agent` verb, and decides
+what the answer means itself. The rules, the manifests and your configuration
+stay with the window.
+
+An agent in such a pane also reports its own state and reads its mail, with the
+same commands and hooks as anywhere. The pane has `TUIOS_PANE_ID`, the window's
+id on the machine holding it, and `TUIOS_PANE_HOSTED=1`, and no `TUIOS_SOCKET`.
+A report the agent sends naming `$TUIOS_PANE_ID` goes to the daemon on the
+machine it runs on, which sends it back over a channel the daemon holding the
+window opened, since the link is dialled one way. The daemon holding the window
+runs it as that window and nothing else. Only the process in the pane is
+forwarded for, and only state, meta, session id, its own mail and a wait for its
+own mail cross. See [A pane on another machine](AGENT_STATE.md#a-pane-on-another-machine).
+With a machine holding the window from before this, the pane has no
+`TUIOS_PANE_ID` and a report fails with `protocol_mismatch`; the agent is still
+detected.
+
+`TUIOS_SESSION` is deliberately not set in such a pane. It would name a session
+on the other machine, and every tool that reads it addresses a session on the
+machine it is running on. `TUIOS_SESSION_REMOTE` carries the name for anything
+that wants to know where the pane came from.
+
+Sending mail between machines is a different thing and it does work: see
+`tuios send-agent-message -s build:api -w 1 'text'`. When `build`'s link is
+down the message waits on this machine and goes when the link is back; see
+[Mail waiting for another machine](AGENT_STATE.md#mail-waiting-for-another-machine). A reply from the person
+over a link is verified on the far machine only when this machine vouched for
+the process that sent it: one outside every pane here. The far daemon hears
+that from the link itself, not from the request, and an agent in a pane here
+that attaches or sends through the link cannot be verified there. See [Who
+can act as the person](AGENT_STATE.md#who-can-act-as-the-person).
+
+### What crosses, and what does not
+
+The machine supplying the process supplies a process and a pty, and nothing
+else. It runs no terminal emulator for the pane and keeps no scrollback for it,
+and it does not know which session the pane belongs to. All of that is here, on
+the daemon that owns the window, exactly as it is for a pane of its own.
+
+That division has a consequence worth knowing: the pane is **not** a window of
+any session on the other machine. It will not appear in `tuios ls` there, and
+it is not enrolled in that machine's size negotiation, so a layout here can
+never shrink a session someone is working in there.
+
+### Pasting an image
+
+`Ctrl+B V` pastes the image on your clipboard into the focused pane. tuios
+reads the image on your machine and sends it over the link. The other machine
+writes it to a file and tuios pastes the path of that file into the pane. An
+agent in the pane, such as Claude Code, can then read the image. The file is
+8 MB or less, only you can read it, and it is deleted after one hour. The
+other machine needs a tuios with `paste-pane-image`. See [Paste an
+image](KEYBINDINGS.md#paste-an-image).
+
+### What it needs
+
+Both machines need a tuios new enough to speak `open-pane`. An older one
+refuses by name and says to update it.
+
+### What the other machine may do here
+
+The machine a link arrives at decides what the machine at the other end may
+do there, from its own `[hosts]` table: read listings, send mail, open
+sessions, windows and panes, write into panes, and answer prompts. By default
+it may do everything but answer prompts for you. Opening a window on a host
+needs `open` there; what is typed into that window travels on the pane's own
+connection and needs nothing more. See [What another machine
+may do here](CONFIGURATION.md#what-another-machine-may-do-here) for the table,
+`hold_mail`, and pinning the name with a forced command.
+
+### Limits
+
+- **The window outlives a dropped link for a while.** When the link drops, the
+  other machine keeps the process running for its `hosted_grace` (ten minutes
+  unless its `[hosts]` table says otherwise, see [What another machine may do
+  here](CONFIGURATION.md#what-another-machine-may-do-here)) and keeps its last
+  64 KB of output. The window stays, its title bar reads
+  `[reconnecting] build:name`, the rail row reads `build reconnecting`, and
+  keystrokes are refused rather than queued. When the link comes back the pane
+  is reattached, what the process printed meanwhile is written to it, and it is
+  live again. If more was printed than 64 KB, the whole 64 KB is written and the
+  pane is resized a row and back, so a full screen program draws its screen
+  again. If the grace runs out first, or the process exits meanwhile, the
+  window closes the way it closes when its shell exits. With `hosted_grace =
+  "0"` on the other machine, or a tuios there too old to keep a pane, the
+  window ends when the link does, as it always did.
+- **Closing the window ends the process at once.** A window closed on purpose
+  tells the other machine with `close-pane`, so its process does not wait out
+  the grace. If the link is down when it is closed, the grace ends it.
+- **A restart of this daemon does not reattach.** The panes on the other
+  machine wait out their grace and end.
+- **A resurrected session brings the window back on this machine.** Resurrection
+  respawns a shell from saved state, and it does not redial a host to do it.
+- **A resurrected window runs a local shell.** The layout comes back and the
+  pane in it is on this machine, whatever it said before.
+
+## Agents and Worktrees on Another Machine
+
+A hosted window keeps the window here and the process there, and ends when the
+link stays down past the far machine's `hosted_grace`. For agent work that
+should outlive the link for good, start the whole session on the other machine
+instead. `tuios fan --host build`, `tuios worktree new --host
+build` and `tuios start-agent -s build:SESSION` make the sessions on build,
+where they run and survive like any of build's sessions, and they show in the
+rail under build.
+
+The repository is named by the origin URL of the checkout you run the command
+in. build finds its own checkout of it under `repos_root` in `[hosts.build]`:
+
+```toml
+[hosts.build]
+addr = "gaurav@buildbox"
+repos_root = "~/src"   # a path on build, as build reads it
+```
+
+With no `repos_root`, build looks under `~/src`, `~/dev`, `~/code`,
+`~/projects`, `~/repos`, `~/git`, `~/work` and `~/go/src` there. `--clone`
+clones the repository there when build has none.
+
+`tuios worktree pull build:SESSION` brings a worktree session's commits and its
+uncommitted work into a new worktree session here, on a new branch. Nothing on
+build changes. See [CLI Reference](CLI_REFERENCE.md#tuios-worktree).
+
+## Global Sessions
+
+A session whose panes are all on one machine is that machine's session. A
+session holding panes from several is not, and the rail says so: once a second
+machine is reachable, it draws a group called `global` above the machines.
+
+```
+global                +
+  deploy
+local                 +
+  work
+build                 +
+  api
+```
+
+Sessions in the global group work like any other. What is different is that
+every way of making a window in one asks which machine it should run on, by
+every route: the key, the rail's `+`, the command palette. That question has one
+sensible answer in an ordinary session and is worth asking in this one, which is
+why the picker appears here and nowhere else.
+
+Make one from the `+` on the group header, or from the shell:
+
+```bash
+tuios new deploy --global
+```
+
+A global session is created with no windows, since the first pane is the one you
+pick a machine for.
+
+The group holds as many sessions as you make. It is drawn above the machines
+because a global session is not any machine's: it is held by a daemon, the way
+any session is, but where it is held says nothing about where its panes run.
+
+Turn the group off with `global_session = false` in the config. Sessions that
+already exist stay listed.
+
+## Keeping Hosts on One Version
+
+`tuios hosts sync` installs the tuios version of this machine on every host in
+the `[hosts]` table that runs another one. A release build sends its own
+release, `--dev` sends a build of the checkout, and `--binary` sends a file.
+
+```sh
+tuios hosts sync --dry-run    # see what would change
+tuios hosts sync --dev        # install a build of this checkout everywhere
+```
+
+The daemon on a host keeps running the old version, and its sessions keep
+running. The row for the host gives the command to restart it. Add
+`--restart` to restart them in the same run: sync lists the sessions and the
+programs that a restart ends, and asks first. The sessions come back after the
+restart with their layouts and new shells. See
+[`tuios hosts sync`](CLI_REFERENCE.md#tuios-hosts-sync).
+
+## Starting the Daemon on a Host
+
+A link reaches a host only when a tuios daemon runs there. When none runs,
+`tuios hosts test NAME` reports `no_daemon` and prints the command to run on
+the host. To start the daemon from this machine, add `--start`:
+
+```sh
+tuios hosts test build --start    # start the daemon on build if it does not run
+tuios hosts sync build --start    # install tuios on build if needed, then start it
+```
+
+`hosts test --start` does not install tuios. On a host with no tuios, use
+`hosts sync --start`. See [`tuios hosts test`](CLI_REFERENCE.md#tuios-hosts-test).
+
+## Machines on a Tailnet
+
+If this machine is on a [Tailscale](https://tailscale.com) tailnet, tuios can
+list the machines on it and offer them as addresses:
+
+```bash
+tuios hosts tailnet
+```
+
+```
+   arch-btw          arch-btw.example.ts.net          offline
+ + ente              ente.example.ts.net
+ = forgejo           forgejo.example.ts.net           already the host forgejo
+   my-phone          my-phone.example.ts.net          cannot run tuios (iOS)
+```
+
+Add one:
+
+```bash
+tuios hosts add ente --tailnet
+```
+
+**Nothing is added on its own.** This is the same rule the ssh_config aliases
+follow: a host exists because you named it. What is discovered is what to type,
+not what to connect to.
+
+**Nothing new is dialled either.** A host added this way is reached over ssh like
+every other host. A MagicDNS name resolves like any other name, so the tailnet is
+how the name resolves and how the traffic is carried, and tuios does not open a
+tailnet connection itself. That also means ssh over a tailnet already worked
+before this existed: you could always write the MagicDNS name as an address by
+hand. This saves you the typing and tells you what is there.
+
+tuios asks the `tailscaled` already running on this machine, through the local
+API, which is the same thing `tailscale status` asks. It needs no root, no
+auth key, and no operator setting. A machine with no tailscale on it gets an
+empty list and behaves exactly as it did before.
+
+Every machine is listed, offered or not, and one that is not offered says why.
+By default a machine is left out when it is offline, when it is this machine,
+when it was shared in from another tailnet, or when it runs an operating system
+that cannot host a tuios daemon.
+
+Change any of that in the `[tailscale]` table:
+
+```toml
+[tailscale]
+# Offer tailnet machines as addresses at all.
+enabled = true
+# Which form of address: "dns" is the MagicDNS name and works anywhere on the
+# tailnet, "name" is the short name and needs a search domain, "ip" is the
+# 100.x address and needs no DNS.
+addr = "dns"
+# An ssh login put in front of every address.
+user = "ubuntu"
+# The operating systems to offer. An empty list offers every machine.
+os = ["linux", "macOS", "windows"]
+# Offer machines that are offline, this machine, and machines shared in.
+offline = false
+self = false
+shared = false
+# Glob patterns matched against the short name and the MagicDNS name.
+# exclude wins over include.
+include = ["*"]
+exclude = ["*-pad-*"]
+# How many to offer.
+max = 50
+# Where the tailscaled local API socket is, if it is not in the usual place.
+socket = ""
+
+# Per-machine logins, which win over the user above. This has to come last,
+# because everything after a sub-table heading belongs to it.
+[tailscale.users]
+build = "root"
+```
+
+For a script or an agent, `tuios hosts tailnet --json` gives every machine with
+`offered` and, when it is false, `skipped` saying which rule left it out.
+
+### Tailscale SSH check mode
+
+Tailscale SSH can hold a login until you approve it in a browser. This is
+"check" mode. ssh then waits, and Tailscale prints a link to open:
+
+```
+# Tailscale SSH requires an additional check.
+# To authenticate, visit: https://login.tailscale.com/a/l1d9c7e392d3020
+```
+
+tuios reads this link and shows it.
+
+- **The rail** shows "sign in" beside the host, in the colour of an agent that
+  needs you. Click "sign in", or move the cursor to it and press Enter, to open
+  the sign-in page in your browser. The notice names the domain of the page and
+  the host. A click on the name of the host still folds its group. Hover the
+  host to see why it waits. On an ssh or web client, tuios cannot start your
+  browser. It shows the address in a notice and puts it on your clipboard.
+- **Only a Tailscale address opens.** The link comes from ssh's error output,
+  and anything on the host can print there. tuios shows and opens it only when
+  it is https on `login.tailscale.com` or `controlplane.tailscale.com`, matched
+  exactly. For any other address, the rail says "The sign-in link from NAME is
+  not a Tailscale address, so tuios did not open it." Run ssh to the host in a
+  terminal to see it. With Headscale, give the origin of your server for that
+  host: `tailscale_login = "https://headscale.example"` in `[hosts.NAME]`.
+- **The daemon's link** waits up to 10 minutes on one page. It goes on when you
+  sign in, and the host comes up on the rail with no other step. When Tailscale
+  ends the wait, the link asks again and shows a new page. After you open a
+  page from the rail or with `tuios hosts signin`, the link asks again every few
+  seconds for two minutes.
+- **`tuios hosts`** shows the status "sign in", with the page to open and the
+  command that opens it. In `--json` the status stays `tailscale_check`, with
+  `approval_url`.
+- **`tuios hosts signin [NAME]`** opens the sign-in page of each host that
+  waits, or of the named host. With no desktop, as over ssh, it prints the
+  address. `--print` prints it and opens nothing. `--json` prints
+  `{"hosts":[{"host","url","opened","note"}]}`.
+- **`tuios hosts test`** and **`tuios hosts add`** report `tailscale_check`
+  with the link. Open it, approve the login, then run the command again.
+- **`tuios hosts sync`** on a terminal lists the link of each host that waits.
+  Then it asks to wait up to 5 minutes. Each host continues when you approve
+  its login. Without a terminal, or with `--json`, the host fails at once.
+  Its row has `"error_kind": "tailscale_check"` and `approval_url`.
+
+All ssh calls of one `hosts sync` run to a host use one shared connection.
+Thus one approval covers the whole run. The connection uses a private socket
+in `$XDG_RUNTIME_DIR` and stops when the run ends.
+
+If the tailnet policy refuses the login, tuios names the user it refused. The
+row has `"error_kind": "tailscale_policy"`. Change the user in the `addr` of the
+host in `[hosts]`, for example `addr = "ubuntu@ente"`.
+
+## Copying
+
+Copying is the one gesture in a terminal with no result to look at: the text
+does not change, and the selection usually disappears. So a copy sweeps a band
+of light across the cells that were taken, once, and then it is gone.
+Set `appearance.motion` to `none` to turn the sweep off.
+
+```toml
+[appearance.selection]
+flash = true
+flash_ms = 420
+flash_color = "#FFF3C4"
+# diagonal, diagonal-reverse, horizontal, vertical
+flash_style = "diagonal"
+```
+
+The shape is a choice because which one reads best depends on what you copy.
+A diagonal falls across a paragraph. A horizontal one crosses a single long
+line properly, where a diagonal barely leans at all over one row. A vertical
+one moves down a tall narrow block, which the other three cross in an instant.
+
+The same table holds the colours a pane marks text with: the selection, search
+matches, the match under the cursor, and the copy mode cursor. They follow the
+theme nowhere else in tuios, because they are the one part of a pane's colours
+tuios chooses rather than the program running in it, so they are settings. A
+text colour left empty keeps the colour the program wrote, and tints only the
+background behind it.
+
+`multi_format` is the format that multi copy mode starts with: `plain`,
+`markdown` or `json`. Multi copy mode copies the selection of each pane in the
+multifocus set. See [Multi copy mode](LAYOUT_MODES.md#multi-copy-mode).
+
+```toml
+[appearance.selection]
+multi_format = "plain"
+```
+
+`copy_entry` sets where the copy cursor starts when copy mode starts. `cursor`
+is the terminal cursor, usually the prompt line, as in tmux. `center` is the
+first column of the middle row. In multi copy mode, each pane starts at its own
+cursor. See [Copy mode](KEYBINDINGS.md#copy-mode) for the search keys.
+
+```toml
+[appearance.selection]
+copy_entry = "cursor"
+```
+
+`copy_command` is a command that gets each yank in copy mode on stdin. The
+clipboard gets what the command writes to stdout. When the value is empty,
+the default, `y` copies the selection as it is. See
+[Pipe a yank through a command](KEYBINDINGS.md#pipe-a-yank-through-a-command).
+
+```toml
+[appearance.selection]
+copy_command = "tr -s ' '"
+```
+
+`osc52_write` controls what happens when a program in a pane sets the
+clipboard with OSC 52. An editor uses OSC 52 to yank over ssh. Any output can
+also carry OSC 52, for example a file that a program prints.
+
+| Value | What happens |
+|---|---|
+| `off` | The host clipboard does not change. |
+| `ask` | The dock shows a message. Click the message to copy the text. |
+| `focused` | The focused pane copies. Other panes ask. This is the default. |
+| `on` | Every pane copies. |
+
+When the focused pane copies text with a line break or a control character,
+the dock shows one line for that pane. A one-line copy shows nothing. A click
+on an ask copies only the text that the dock showed. If the text changes
+first, click the new message.
+
+A pane that runs without the daemon keeps its own copy of the text. The
+program reads it back with an OSC 52 query. A pane under the daemon keeps no
+copy. An OSC 52 query in that pane always gets an empty answer.
+
+```toml
+[appearance.selection]
+osc52_write = "focused"
+```
+
+A paste into a pane drops ESC and the other control characters from the text.
+Tabs and line breaks stay. Text that holds `ESC[201~` cannot end a bracketed
+paste early.
+
+The scrollback browser draws from the same two places: the theme for its
+chrome, and these settings for its search and selection, so a match there and
+a match in a pane are the same colour.
+
+## Where State Lives
+
+| What | Path |
+|---|---|
+| Saved session state | `$XDG_STATE_HOME/tuios/sessions/<name>.json` (typically `~/.local/state/tuios/sessions/`) |
+| Archived bad state | `$XDG_STATE_HOME/tuios/sessions/archive/`, pruned after 14 days |
+| Daemon socket | `$XDG_RUNTIME_DIR/tuios/tuios.sock`, falling back to `/tmp/tuios-<uid>/tuios.sock` |
+| Daemon PID file | the socket path with `.pid` appended |
+
+The socket lives in the runtime directory and does not survive a reboot, which is
+correct: the daemon does not either. Saved session state lives in the state
+directory and does survive, which is why a session can be resurrected after a
+reboot.
+
+### Running a separate daemon
+
+`XDG_RUNTIME_DIR` chooses the daemon every `tuios` command reaches (on Windows,
+`LOCALAPPDATA`). To run a second daemon, for a test or a script, give it its own
+runtime and state directories, so it has its own socket and keeps its own saved
+sessions:
+
+```bash
+export XDG_RUNTIME_DIR=/tmp/scratch/run XDG_STATE_HOME=/tmp/scratch/state
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+tuios new scratch --detach      # starts a daemon at /tmp/scratch/run/tuios/tuios.sock
+tuios ls                        # that daemon's sessions
+tuios kill-server               # stops it
+```
+
+`TUIOS_SOCKET` does not choose a daemon. tuios sets it in every pane to the
+socket of the daemon that runs the pane, so a program can find that daemon, and
+every process started from the pane inherits it. A command that finds
+`TUIOS_SOCKET` naming a different socket where no daemon is listening refuses
+and says what to set, because that is someone expecting it to select a daemon.
+When it names the socket the command uses, or another live daemon (a script in
+a pane that set its own `XDG_RUNTIME_DIR`), the command runs against the daemon
+`XDG_RUNTIME_DIR` names.
+
+## Limitations
+
+- **Screen contents and scrollback survive a daemon restart only as saved
+  history.** The daemon keeps them in memory and saves them to disk. A restored
+  pane shows the saved history above a divider, with a new shell under it. After
+  a crash, the history is as old as the last save. The setting
+  `persist_scrollback = false` turns the save off, and then only a detach keeps
+  them. A running program and its live screen never survive the daemon.
+- **Working directory capture needs Linux or macOS.** The daemon reads where
+  each shell is from the process itself: `/proc/<pid>/cwd` on Linux, and
+  `proc_pidinfo` (libproc) on macOS, which needs no cgo. On other platforms
+  (Windows, the BSDs) the read has no answer and restoration falls back to
+  spawning the shell in its default directory. Everything else about the
+  restore is unaffected.
+- **A crash loses the last couple of seconds of structural change, and up to 30
+  seconds of working-directory drift.** Structural changes are saved within a
+  couple of seconds; the directory each shell is sitting in is captured on the
+  30-second tick, so a `cd` immediately before a `SIGKILL` may not survive.
+- **Restored shells use the daemon's environment.** No client is connected at
+  restore time, so the shell comes from the daemon process's `$SHELL` and
+  inherits the daemon's environment, not that of whichever terminal you later
+  attach from.
+- **Panes never inherit `TMUX` or `TMUX_PANE`.** Every pane starts from the
+  environment of the process that spawns it, less these two, whether it is a
+  daemon pane, a pane hosted for another machine, or a standalone pane. A tuios
+  started from inside tmux used to pass them on, and a program in the pane then
+  believed it was in a tmux pane: Codex wrapped its notifications in tmux
+  passthrough, which tuios drops, and an agent that opens panes through tmux
+  reached the outer tmux. Running tmux inside a tuios pane still works, and no
+  longer warns about nesting.
+- **Resurrection restores structure, not work.** It is a way to get your layout
+  and directories back, not a way to survive a crash without losing anything.
+
+## Related Documentation
+
+- [CLI_REFERENCE.md](CLI_REFERENCE.md): every command-line option
+- [protocol.md](protocol.md): the JSON verb protocol for controlling the daemon
+- [KEYBINDINGS.md](KEYBINDINGS.md): default keybindings
+- [HOOKS.md](HOOKS.md): shell commands run on session and window events

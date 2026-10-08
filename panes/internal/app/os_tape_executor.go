@@ -1,0 +1,1581 @@
+package app
+
+import (
+	"errors"
+	"fmt"
+	"image/color"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
+	"github.com/Gaurav-Gosain/tuios/internal/config"
+	"github.com/Gaurav-Gosain/tuios/internal/layout"
+	"github.com/Gaurav-Gosain/tuios/internal/session"
+	"github.com/Gaurav-Gosain/tuios/internal/tape"
+	"github.com/Gaurav-Gosain/tuios/internal/terminal"
+	"github.com/Gaurav-Gosain/tuios/internal/theme"
+	"github.com/Gaurav-Gosain/tuios/internal/vt"
+	uv "github.com/charmbracelet/ultraviolet"
+)
+
+// scriptDoneLinger is how long the "DONE" completion indicator stays on screen
+// after a tape script finishes. Once it elapses, script mode is left entirely
+// (see maybeExitFinishedScript). It matches the auto-hide window used by the
+// script indicator renderer.
+const scriptDoneLinger = 2 * time.Second
+
+// maybeExitFinishedScript leaves script mode once a finished tape's completion
+// indicator has been shown for scriptDoneLinger. This is what re-arms Ctrl+P:
+// while ScriptMode is set, Ctrl+P is intercepted for script pause/resume
+// (internal/input/handler.go) and never reaches the command palette. Neither the
+// local playback finish path nor the remote-exec done path cleared ScriptMode,
+// so after any in-session tape ran, Ctrl+P silently toggled pause forever
+// instead of opening the palette. Resetting here, keyed off ScriptFinishedTime,
+// covers both the local (ScriptPlayer) and remote (RemoteScript*) paths because
+// both stamp ScriptFinishedTime on completion.
+//
+// It returns true when it actually left script mode, so the caller can force a
+// render to clear the indicator.
+func (m *OS) maybeExitFinishedScript() bool {
+	if !m.ScriptMode || m.ScriptFinishedTime.IsZero() {
+		return false
+	}
+	if time.Since(m.ScriptFinishedTime) < scriptDoneLinger {
+		return false
+	}
+	m.exitScriptMode()
+	return true
+}
+
+// exitScriptMode clears all tape-playback state so the session behaves as if no
+// script were running: notably, the Ctrl+P pause/resume intercept is disabled
+// and the command palette binding works again.
+func (m *OS) exitScriptMode() {
+	m.ScriptMode = false
+	m.ScriptPaused = false
+	m.ScriptPlayer = nil
+	m.ScriptExecutor = nil
+	m.ScriptSleepUntil = time.Time{}
+	m.ScriptFinishedTime = time.Time{}
+	m.ScriptWaitRegex = nil
+	m.ScriptWaitDeadline = time.Time{}
+	m.ScriptAwaitWindows = 0
+	m.ScriptAwaitDeadline = time.Time{}
+	m.ScriptWait = nil
+	m.scriptInFlight = false
+	m.scriptCmds = nil
+	// A tape left while a tuios tape exec still waits on it has ended, and
+	// the caller is told so rather than left to time out.
+	if m.scriptRequestID != "" {
+		m.reportScriptResult(false, "the tape was stopped before it finished")
+	}
+}
+
+// The following methods implement the tape.Executor interface for
+// scripted automation and tape playback functionality.
+
+// getWindowDisplayName returns the display name for a window (CustomName if set, else Title).
+func (m *OS) getWindowDisplayName(w *terminal.Window) string {
+	if w.CustomName != "" {
+		return w.CustomName
+	}
+	return w.Title()
+}
+
+// findWindowsByName returns all windows matching the given name (checks CustomName first, then Title).
+func (m *OS) findWindowsByName(name string) []*terminal.Window {
+	var matches []*terminal.Window
+	for _, w := range m.Windows {
+		displayName := m.getWindowDisplayName(w)
+		if displayName == name {
+			matches = append(matches, w)
+		}
+	}
+	return matches
+}
+
+// findSingleWindowByName returns a single window by name, or an error if not found or ambiguous.
+func (m *OS) findSingleWindowByName(name string) (*terminal.Window, error) {
+	matches := m.findWindowsByName(name)
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("no window found with name: %s", name)
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("multiple windows (%d) found with name: %s", len(matches), name)
+	}
+	return matches[0], nil
+}
+
+// ExecuteCommand executes a tape command.
+func (m *OS) ExecuteCommand(_ *tape.Command) error {
+	return nil
+}
+
+// GetFocusedWindowID returns the ID of the focused window.
+func (m *OS) GetFocusedWindowID() string {
+	if m.FocusedWindow >= 0 && m.FocusedWindow < len(m.Windows) {
+		return m.Windows[m.FocusedWindow].ID
+	}
+	return ""
+}
+
+// resolveWindowTarget resolves a window target string to a window ID.
+// If target is empty, returns the focused window ID.
+// Matching order: exact ID, the position list-windows prints (all-digit
+// targets), window name (CustomName then Title), a unique ID prefix. The
+// order matches the daemon-side findWindowStateIndex so a target means the
+// same thing whether or not a client is attached.
+func (m *OS) resolveWindowTarget(target string) (string, error) {
+	if target == "" {
+		windowID := m.GetFocusedWindowID()
+		if windowID == "" {
+			return "", fmt.Errorf("no focused window")
+		}
+		return windowID, nil
+	}
+
+	// Try exact ID match
+	for _, w := range m.Windows {
+		if w.ID == target {
+			return w.ID, nil
+		}
+	}
+
+	// The index list-windows prints, which is the position in m.Windows.
+	if idx, ok := session.WindowIndexTarget(target, len(m.Windows)); ok {
+		return m.Windows[idx].ID, nil
+	}
+
+	// Window name (CustomName first, then Title), before the id prefix: a
+	// name made of hex digits is also a prefix of some window's uuid now and
+	// then, and the name is the one the caller meant. See findWindowStateIndex.
+	matches := m.findWindowsByName(target)
+	if len(matches) == 1 {
+		return matches[0].ID, nil
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("ambiguous window name %q matches %d windows", target, len(matches))
+	}
+
+	// Try unique ID prefix match
+	var prefixMatch *terminal.Window
+	prefixCount := 0
+	for _, w := range m.Windows {
+		if strings.HasPrefix(w.ID, target) {
+			prefixMatch = w
+			prefixCount++
+		}
+	}
+	if prefixCount == 1 {
+		return prefixMatch.ID, nil
+	}
+	if prefixCount > 1 {
+		return "", fmt.Errorf("ambiguous window ID prefix %q matches %d windows", target, prefixCount)
+	}
+
+	return "", fmt.Errorf("no window found matching %q", target)
+}
+
+// SendToWindow sends bytes to a window's PTY.
+// This works in both local and daemon mode.
+func (m *OS) SendToWindow(windowID string, data []byte) error {
+	for _, w := range m.Windows {
+		if w.ID == windowID {
+			return w.SendInput(data)
+		}
+	}
+	return fmt.Errorf("window not found: %s", windowID)
+}
+
+// scriptWindowWait is how long tape playback will wait for a pane it asked for
+// to actually exist before giving up on it. It is generous because the pane is
+// created by the daemon on a loaded machine, and bounded because a tape that
+// stalls forever is worse than one that reports what went wrong.
+const scriptWindowWait = 5 * time.Second
+
+// awaitNewWindow arms the pane-readiness gate for a pane this command just
+// asked for. Playback holds the next command until the window set has grown or
+// the deadline passes; see the ScriptAwaitWindows field and its use in Update.
+//
+// It is armed after the request rather than inside AddWindow so it measures the
+// growth caused by this command only, and so the non-tape paths that create
+// windows never touch playback state.
+func (m *OS) awaitNewWindow(before int) {
+	m.ScriptAwaitWindows = before + 1
+	m.ScriptAwaitDeadline = time.Now().Add(scriptWindowWait)
+}
+
+// scriptPaneReady reports whether tape playback may dispatch its next command.
+// It is false only while a pane an earlier command asked for has not turned up
+// yet, and it stops being false either when the pane arrives or when the wait
+// runs out of time.
+//
+// The timeout is reported, not swallowed: a tape that carries on typing into
+// the pane it meant to split away from produces a layout that looks built and
+// is not, and the only way anyone finds out is if something says so.
+func (m *OS) scriptPaneReady() bool {
+	if m.ScriptAwaitWindows == 0 {
+		return true
+	}
+	if len(m.Windows) >= m.ScriptAwaitWindows {
+		m.ScriptAwaitWindows = 0
+		return true
+	}
+	if time.Now().Before(m.ScriptAwaitDeadline) {
+		return false
+	}
+	m.ScriptAwaitWindows = 0
+	m.ShowNotification(
+		"Tape: the new pane never appeared. The rest runs in the current pane",
+		"error", m.Settings.NotificationDuration*2)
+	return true
+}
+
+// CreateNewWindow creates a new window with an optional name.
+func (m *OS) CreateNewWindow() error {
+	before := len(m.Windows)
+	m.AddWindow("")
+	m.awaitNewWindow(before)
+	m.MarkAllDirty()
+	return nil
+}
+
+// CreateNewWindowWithName creates a new window with a specific name.
+//
+// The name is passed to AddWindow rather than written onto the last window
+// afterwards. In a daemon session the window does not exist yet when this
+// returns (the daemon creates it and pushes it back), so naming it by position
+// would name whatever happened to be last.
+func (m *OS) CreateNewWindowWithName(name string) error {
+	before := len(m.Windows)
+	m.AddWindow(name)
+	m.awaitNewWindow(before)
+	m.MarkAllDirty()
+	return nil
+}
+
+// getWindowInfo returns detailed information about a window.
+func (m *OS) getWindowInfo(w *terminal.Window, isFocused bool) map[string]any {
+	info := map[string]any{
+		"id":             w.ID,
+		"title":          w.Title(),
+		"display_name":   m.getWindowDisplayName(w),
+		"workspace":      w.Workspace,
+		"focused":        isFocused,
+		"minimized":      w.Minimized,
+		"fullscreen":     w.Width == m.Width && w.Height == m.GetUsableHeight(),
+		"x":              w.X,
+		"y":              w.Y,
+		"width":          w.Width,
+		"height":         w.Height,
+		"cursor_x":       0,
+		"cursor_y":       0,
+		"cursor_visible": true,
+	}
+
+	if w.CustomName != "" {
+		info["custom_name"] = w.CustomName
+	}
+	// Marked as list-windows marks it. See session.windowStateToData.
+	if w.IsScratch {
+		info["scratch"] = true
+	}
+
+	if w.PTYID != "" {
+		info["pty_id"] = w.PTYID
+	}
+
+	// Get cursor info from terminal emulator
+	if w.Terminal != nil {
+		cursorPos := w.Terminal.CursorPosition()
+		info["cursor_x"] = cursorPos.X
+		info["cursor_y"] = cursorPos.Y
+		info["cursor_visible"] = !w.Terminal.IsCursorHidden()
+		// Get scrollback info from the terminal's screen
+		info["scrollback_lines"] = w.Terminal.ScrollbackLen()
+	}
+
+	// Get process info (Unix only, will be 0 on Windows)
+	if w.Cmd != nil && w.Cmd.Process != nil {
+		info["shell_pid"] = w.Cmd.Process.Pid
+	}
+	if w.ShellPgid > 0 {
+		info["shell_pgid"] = w.ShellPgid
+	}
+
+	// Check if there's a foreground process running
+	info["has_foreground_process"] = w.HasForegroundProcess()
+
+	return info
+}
+
+// GetWindowListData returns data about all windows.
+func (m *OS) GetWindowListData() map[string]any {
+	windows := make([]map[string]any, 0, len(m.Windows))
+
+	for i, w := range m.Windows {
+		isFocused := i == m.FocusedWindow
+		windows = append(windows, m.getWindowInfo(w, isFocused))
+	}
+
+	// Count windows per workspace
+	workspaceWindows := make([]int, m.NumWorkspaces)
+	for _, w := range m.Windows {
+		if w.Workspace >= 1 && w.Workspace <= m.NumWorkspaces {
+			workspaceWindows[w.Workspace-1]++
+		}
+	}
+
+	focusedWindowID := ""
+	if m.FocusedWindow >= 0 && m.FocusedWindow < len(m.Windows) {
+		focusedWindowID = m.Windows[m.FocusedWindow].ID
+	}
+
+	return map[string]any{
+		"windows":           windows,
+		"total":             len(m.Windows),
+		"focused_index":     m.FocusedWindow,
+		"focused_window_id": focusedWindowID,
+		"current_workspace": m.dockWorkspace(),
+		"workspace_windows": workspaceWindows,
+	}
+}
+
+// GetSessionInfoData returns data about the current session.
+func (m *OS) GetSessionInfoData() map[string]any {
+	// Determine mode
+	mode := "window_management"
+	if m.Mode == TerminalMode {
+		mode = "terminal"
+	}
+
+	// The same two words the daemon's session-info uses, so a caller can
+	// dispatch on the field without caring which side answered. This copy
+	// used to say "bsp" for every tiling layout, scrolling included.
+	tilingMode := "floating"
+	if m.AutoTiling {
+		tilingMode = "tiling"
+	}
+
+	// Get dockbar position. It's stored as a string in config
+	dockbarPosition := m.Settings.DockbarPosition
+	if dockbarPosition == "" {
+		dockbarPosition = "bottom"
+	}
+
+	// Count windows per workspace
+	workspaceWindows := make([]int, m.NumWorkspaces)
+	for _, w := range m.Windows {
+		if w.Workspace >= 1 && w.Workspace <= m.NumWorkspaces {
+			workspaceWindows[w.Workspace-1]++
+		}
+	}
+
+	focusedWindowID := ""
+	if m.FocusedWindow >= 0 && m.FocusedWindow < len(m.Windows) {
+		focusedWindowID = m.Windows[m.FocusedWindow].ID
+	}
+
+	// Get current theme name from theme package
+	themeName := ""
+	if theme.IsEnabled() {
+		if current := theme.Current(); current != nil {
+			themeName = current.ID
+		}
+	}
+
+	info := map[string]any{
+		"current_workspace":  m.dockWorkspace(),
+		"total_windows":      len(m.Windows),
+		"focused_window_id":  focusedWindowID,
+		"mode":               mode,
+		"tiling_enabled":     m.AutoTiling,
+		"tiling_mode":        tilingMode,
+		"layout_mode":        m.LayoutModeName(),
+		"theme":              themeName,
+		"dockbar_position":   dockbarPosition,
+		"animations_enabled": m.Settings.AnimationsOn(),
+		"motion":             m.Settings.Motion,
+		"width":              m.Width,
+		"height":             m.Height,
+		"workspace_windows":  workspaceWindows,
+		"num_workspaces":     m.NumWorkspaces,
+		// Workspaces a switch asked a pane for that has not arrived. See
+		// workspaces.new_window_when_empty.
+		"pane_requests": m.PaneRequestsInFlight(),
+	}
+
+	// Script playback info
+	if m.ScriptMode {
+		info["script_mode"] = true
+		info["script_paused"] = m.ScriptPaused
+		if player := m.ScriptPlayer; player != nil {
+			info["script_progress"] = player.Progress()
+			info["script_current"] = player.CurrentIndex()
+			info["script_total"] = player.TotalCommands()
+		}
+	} else {
+		info["script_mode"] = false
+	}
+
+	// Add prefix key state
+	info["prefix_active"] = m.PrefixActive
+
+	return info
+}
+
+// GetWindowData returns data about a specific window by ID or name.
+func (m *OS) GetWindowData(identifier string) (map[string]any, error) {
+	// First try by ID
+	for i, w := range m.Windows {
+		if w.ID == identifier {
+			return m.getWindowInfo(w, i == m.FocusedWindow), nil
+		}
+	}
+
+	// Then try by name
+	matches := m.findWindowsByName(identifier)
+	if len(matches) == 0 {
+		return nil, fmt.Errorf("no window found with ID or name: %s", identifier)
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("multiple windows (%d) found with name: %s", len(matches), identifier)
+	}
+
+	// Find the index to check if focused
+	for i, w := range m.Windows {
+		if w.ID == matches[0].ID {
+			return m.getWindowInfo(w, i == m.FocusedWindow), nil
+		}
+	}
+
+	return m.getWindowInfo(matches[0], false), nil
+}
+
+// GetFocusedWindowData returns data about the currently focused window.
+func (m *OS) GetFocusedWindowData() (map[string]any, error) {
+	if m.FocusedWindow < 0 || m.FocusedWindow >= len(m.Windows) {
+		return nil, fmt.Errorf("no window is focused")
+	}
+	return m.getWindowInfo(m.Windows[m.FocusedWindow], true), nil
+}
+
+// CloseWindow closes a window.
+func (m *OS) CloseWindow(windowID string) error {
+	for i, w := range m.Windows {
+		if w.ID == windowID {
+			m.DeleteWindow(i)
+			m.MarkAllDirty()
+			return nil
+		}
+	}
+	return nil
+}
+
+// CloseWindowByName closes all windows with the given name.
+func (m *OS) CloseWindowByName(name string) error {
+	matches := m.findWindowsByName(name)
+	if len(matches) == 0 {
+		return fmt.Errorf("no window found with name: %s", name)
+	}
+
+	// Close in reverse order to avoid index shifting issues
+	for i := len(m.Windows) - 1; i >= 0; i-- {
+		displayName := m.getWindowDisplayName(m.Windows[i])
+		if displayName == name {
+			m.DeleteWindow(i)
+		}
+	}
+	m.MarkAllDirty()
+	return nil
+}
+
+// SwitchWorkspace switches to a workspace. An out-of-range workspace is an
+// error rather than a silent no-op, so a tape asking for workspace 12 in a
+// nine-workspace session says so instead of appearing to work.
+func (m *OS) SwitchWorkspace(workspace int) error {
+	if workspace < 1 || workspace > m.NumWorkspaces {
+		return fmt.Errorf("workspace %d is out of range (1-%d)", workspace, m.NumWorkspaces)
+	}
+	recorder := m.TapeRecorder
+	m.TapeRecorder = nil
+	// A script brings its own panes, so this is not a switch that opens a
+	// pane on an empty workspace. See SwitchToWorkspace.
+	m.switchToWorkspace(workspace, -1)
+	m.TapeRecorder = recorder
+	m.MarkAllDirty()
+	return nil
+}
+
+// ToggleTiling toggles tiling mode.
+func (m *OS) ToggleTiling() error {
+	m.ToggleAutoTiling()
+	m.MarkAllDirty()
+	return nil
+}
+
+// SetMode sets the interaction mode.
+func (m *OS) SetMode(mode string) error {
+	switch mode {
+	case "terminal", "Terminal", "TerminalMode":
+		m.Mode = TerminalMode
+		if m.FocusedWindow < 0 || m.FocusedWindow >= len(m.Windows) {
+			for i, w := range m.Windows {
+				if w.Workspace == m.CurrentWorkspace && !w.Minimized {
+					m.FocusWindow(i)
+					break
+				}
+			}
+		}
+	case "window", "Window", "WindowManagementMode":
+		m.Mode = WindowManagementMode
+	}
+	return nil
+}
+
+// NextWindow focuses the next window.
+func (m *OS) NextWindow() error {
+	if len(m.Windows) == 0 {
+		return nil
+	}
+	m.CycleToNextVisibleWindow()
+	m.MarkAllDirty()
+	return nil
+}
+
+// PrevWindow focuses the previous window.
+func (m *OS) PrevWindow() error {
+	if len(m.Windows) == 0 {
+		return nil
+	}
+	m.CycleToPreviousVisibleWindow()
+	m.MarkAllDirty()
+	return nil
+}
+
+// FocusWindowByID focuses a specific window by ID.
+func (m *OS) FocusWindowByID(windowID string) error {
+	for i, w := range m.Windows {
+		if w.ID == windowID {
+			m.FocusWindow(i)
+			m.MarkAllDirty()
+			return nil
+		}
+	}
+	return nil
+}
+
+// FocusWindowByName focuses a window by name. Errors if multiple windows match.
+func (m *OS) FocusWindowByName(name string) error {
+	win, err := m.findSingleWindowByName(name)
+	if err != nil {
+		return err
+	}
+	return m.FocusWindowByID(win.ID)
+}
+
+// RenameWindowByID renames a window by its ID (sets CustomName).
+//
+// In a daemon session the name is the daemon's: it is what every read verb
+// answers with and what survives a detach, so renaming locally and hoping a
+// later sync carried it is how a rename could report success while list-windows
+// kept the old name. The client redraws when the daemon pushes the change back.
+func (m *OS) RenameWindowByID(windowID, name string) error {
+	if m.IsDaemonSession && m.DaemonClient != nil {
+		return m.DaemonClient.SendIntent("RenameWindow", windowID, name)
+	}
+
+	for _, w := range m.Windows {
+		if w.ID == windowID {
+			w.CustomName = name
+			m.MarkAllDirty()
+			return nil
+		}
+	}
+	return nil
+}
+
+// RenameWindowByName renames a window by its current name. Errors if multiple windows match.
+func (m *OS) RenameWindowByName(oldName, newName string) error {
+	win, err := m.findSingleWindowByName(oldName)
+	if err != nil {
+		return err
+	}
+	return m.RenameWindowByID(win.ID, newName)
+}
+
+// MinimizeWindowByID minimizes a window.
+func (m *OS) MinimizeWindowByID(windowID string) error {
+	for i, w := range m.Windows {
+		if w.ID == windowID {
+			m.MinimizeWindow(i)
+			m.MarkAllDirty()
+			return nil
+		}
+	}
+	return nil
+}
+
+// MinimizeWindowByName minimizes a window by name. Errors if multiple windows match.
+func (m *OS) MinimizeWindowByName(name string) error {
+	win, err := m.findSingleWindowByName(name)
+	if err != nil {
+		return err
+	}
+	return m.MinimizeWindowByID(win.ID)
+}
+
+// RestoreWindowByID restores a minimized window.
+func (m *OS) RestoreWindowByID(windowID string) error {
+	for i, w := range m.Windows {
+		if w.ID == windowID {
+			m.RestoreWindow(i)
+			m.MarkAllDirty()
+			return nil
+		}
+	}
+	return nil
+}
+
+// RestoreWindowByName restores a minimized window by name. Errors if multiple windows match.
+func (m *OS) RestoreWindowByName(name string) error {
+	win, err := m.findSingleWindowByName(name)
+	if err != nil {
+		return err
+	}
+	return m.RestoreWindowByID(win.ID)
+}
+
+// EnableTiling enables tiling mode.
+func (m *OS) EnableTiling() error {
+	m.SetAutoTiling(true)
+	m.MarkAllDirty()
+	return nil
+}
+
+// DisableTiling disables tiling mode.
+func (m *OS) DisableTiling() error {
+	m.SetAutoTiling(false)
+	m.MarkAllDirty()
+	return nil
+}
+
+// SnapByDirection snaps the focused window to a direction with tiling off.
+// With tiling on the tiler owns every rectangle and there is nothing to snap,
+// so left and right move focus to the neighbour that way instead. That is one
+// answer for every door onto the action: the h and l keys, a recorded tape,
+// and run-command SnapLeft.
+func (m *OS) SnapByDirection(direction string) error {
+	if m.AutoTiling {
+		switch direction {
+		case "left", "right":
+			return m.focusTiledNeighbour(direction)
+		}
+		return fmt.Errorf("cannot snap windows while tiling mode is enabled")
+	}
+
+	if m.FocusedWindow < 0 || m.FocusedWindow >= len(m.Windows) {
+		return errNoFocusedWindow
+	}
+
+	// An unrecognized direction used to fall through to SnapTopLeft, so a typo
+	// snapped the window somewhere the tape never asked for.
+	var quarter SnapQuarter
+	switch direction {
+	case "left":
+		quarter = SnapLeft
+	case "right":
+		quarter = SnapRight
+	case "fullscreen":
+		// It snapped to the top-left quarter, which is what the key's
+		// snap_fullscreen action has never done.
+		m.Snap(m.FocusedWindow, SnapFullScreen)
+		m.MarkAllDirty()
+		return nil
+	default:
+		return fmt.Errorf("invalid snap direction: %s (use: left, right, fullscreen)", direction)
+	}
+
+	m.Snap(m.FocusedWindow, quarter)
+	m.MarkAllDirty()
+	return nil
+}
+
+// MoveWindowToWorkspaceByID moves a window to a workspace.
+func (m *OS) MoveWindowToWorkspaceByID(windowID string, workspace int) error {
+	if workspace < 1 || workspace > m.NumWorkspaces {
+		return fmt.Errorf("workspace %d out of range (1-%d)", workspace, m.NumWorkspaces)
+	}
+
+	for i, w := range m.Windows {
+		if w.ID == windowID {
+			m.MoveWindowToWorkspace(i, workspace)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("window not found: %s", windowID)
+}
+
+// MoveAndFollowWorkspaceByID moves a window to a workspace and switches to it.
+func (m *OS) MoveAndFollowWorkspaceByID(windowID string, workspace int) error {
+	if workspace < 1 || workspace > m.NumWorkspaces {
+		return fmt.Errorf("workspace %d out of range (1-%d)", workspace, m.NumWorkspaces)
+	}
+
+	for i, w := range m.Windows {
+		if w.ID == windowID {
+			m.MoveWindowToWorkspaceAndFollow(i, workspace)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("window not found: %s", windowID)
+}
+
+// errTilingOff is what the BSP commands report when tiling is off. They used to
+// return nil and do nothing, so a tape whose EnableTiling had not taken effect
+// silently skipped every Split and then typed the next command into whatever
+// pane happened to be focused. A tape command that quietly does nothing is the
+// worst kind of failure to debug, so it says so instead.
+var errTilingOff = errors.New("tiling is not enabled; run EnableTiling before this command")
+
+// errNoFocusedWindow is what the commands that act on the focused window report
+// when there is not one, rather than returning nil and doing nothing.
+var errNoFocusedWindow = errors.New("no focused window")
+
+// SplitHorizontal splits the focused window horizontally.
+func (m *OS) SplitHorizontal() error {
+	if !m.AutoTiling {
+		return errTilingOff
+	}
+	if m.GetFocusedWindow() == nil {
+		return errNoFocusedWindow
+	}
+	before := len(m.Windows)
+	m.SplitFocusedHorizontal()
+	m.awaitNewWindow(before)
+	m.MarkAllDirty()
+	return nil
+}
+
+// SplitVertical splits the focused window vertically.
+func (m *OS) SplitVertical() error {
+	if !m.AutoTiling {
+		return errTilingOff
+	}
+	if m.GetFocusedWindow() == nil {
+		return errNoFocusedWindow
+	}
+	before := len(m.Windows)
+	m.SplitFocusedVertical()
+	m.awaitNewWindow(before)
+	m.MarkAllDirty()
+	return nil
+}
+
+// RotateSplit rotates the split direction at the focused window.
+func (m *OS) RotateSplit() error {
+	if !m.AutoTiling {
+		return errTilingOff
+	}
+	m.RotateFocusedSplit()
+	m.MarkAllDirty()
+	return nil
+}
+
+// EqualizeSplitsExec equalizes all split ratios.
+func (m *OS) EqualizeSplitsExec() error {
+	if !m.AutoTiling {
+		return errTilingOff
+	}
+	m.EqualizeSplits()
+	m.MarkAllDirty()
+	return nil
+}
+
+// Preselect sets the preselection direction for the next window.
+func (m *OS) Preselect(direction string) error {
+	if !m.AutoTiling {
+		return errTilingOff
+	}
+	switch direction {
+	case "left":
+		m.SetPreselection(layout.PreselectionLeft)
+	case "right":
+		m.SetPreselection(layout.PreselectionRight)
+	case "up":
+		m.SetPreselection(layout.PreselectionUp)
+	case "down":
+		m.SetPreselection(layout.PreselectionDown)
+	default:
+		m.ClearPreselection()
+	}
+	return nil
+}
+
+// remember records a live appearance change in the config struct the registry
+// setter re-applies from.
+//
+// The setters below reach straight for the global the renderer reads, which is
+// enough right up until the next registry option is set: that path funnels
+// m.UserConfig through ApplyAppearanceConfig, and the struct still holds what
+// it held at startup. So setting a theme put the border style back to rounded,
+// and get-option went on reporting the thick the caller had asked for. Every
+// hand-written setter has to leave the struct saying what the global says.
+//
+// A path the registry cannot hold is not an error worth failing a set over: the
+// global is already written and the display is already correct. Only the
+// re-apply would drift, and there is nothing better to do about it here.
+func (m *OS) remember(path, value string) {
+	if m.UserConfig == nil {
+		return
+	}
+	_ = config.SetOptionValue(m.UserConfig, path, value)
+}
+
+// SetMotion puts this client's motion level at one of config.MotionLevels and
+// records it in the config the registry re-applies from. It is the one place a
+// level is set at runtime, so it also lifts --no-animations: a level somebody
+// chose after starting outranks the flag they started with.
+func (m *OS) SetMotion(level string) error {
+	if !slices.Contains(config.MotionLevels, level) {
+		return fmt.Errorf("unknown motion level: %s (want %s)", level, strings.Join(config.MotionLevels, ", "))
+	}
+	m.Settings.NoAnimationsFlag = false
+	m.Settings.Motion = level
+	m.remember("appearance.motion", level)
+	return nil
+}
+
+// EnableAnimations sets the motion level to full.
+func (m *OS) EnableAnimations() error {
+	_ = m.SetMotion(config.MotionFull)
+	m.ShowNotification("Animations on", "info", m.Settings.NotificationDuration)
+	return nil
+}
+
+// DisableAnimations sets the motion level to none.
+func (m *OS) DisableAnimations() error {
+	_ = m.SetMotion(config.MotionNone)
+	m.ShowNotification("Animations off", "info", m.Settings.NotificationDuration)
+	return nil
+}
+
+// ToggleAnimations switches between no motion and full motion.
+func (m *OS) ToggleAnimations() error {
+	if m.Settings.AnimationsOn() {
+		return m.DisableAnimations()
+	}
+	return m.EnableAnimations()
+}
+
+// SetConfig sets a configuration option at runtime.
+//
+// The cases below are the paths with a live effect beyond writing a value: an
+// animation switch that has to start or stop the running animations, a dockbar
+// move that repositions it. Everything else the config registry describes is
+// handled generically by setConfigFromRegistry.
+func (m *OS) SetConfig(path, value string) error {
+	switch path {
+	case "appearance.dockbar_position", "dockbar_position":
+		return m.SetDockbarPosition(value)
+	case "appearance.border_style", "border_style":
+		return m.SetBorderStyle(value)
+	case "appearance.motion", "motion":
+		return m.SetMotion(value)
+	case "appearance.animations_enabled", "animations_enabled", "animations":
+		switch value {
+		case "true", "on", "1", "enabled":
+			return m.EnableAnimations()
+		case "false", "off", "0", "disabled":
+			return m.DisableAnimations()
+		default:
+			return m.ToggleAnimations()
+		}
+	case "appearance.hide_window_buttons", "hide_window_buttons":
+		switch value {
+		case "true", "on", "1":
+			m.Settings.HideWindowButtons = true
+		case "false", "off", "0":
+			m.Settings.HideWindowButtons = false
+		}
+		m.remember("appearance.hide_window_buttons", value)
+		m.MarkAllDirty()
+		return nil
+	case "appearance.window_button_style", "window_button_style":
+		if !slices.Contains(config.WindowButtonStyles, value) {
+			return fmt.Errorf("unknown window button style: %s (want %s)",
+				value, strings.Join(config.WindowButtonStyles, " or "))
+		}
+		m.Settings.WindowButtonStyle = value
+		m.remember("appearance.window_button_style", value)
+		m.MarkAllDirty()
+		return nil
+	case "appearance.window_button_position", "window_button_position":
+		if !slices.Contains(config.WindowButtonPositions, value) {
+			return fmt.Errorf("unknown window button position: %s (want %s)",
+				value, strings.Join(config.WindowButtonPositions, " or "))
+		}
+		m.Settings.WindowButtonPosition = value
+		m.remember("appearance.window_button_position", value)
+		m.MarkAllDirty()
+		return nil
+	default:
+		return m.setConfigFromRegistry(path, value)
+	}
+}
+
+// setConfigFromRegistry applies any option the config registry knows.
+//
+// The switch above is six paths, hand-written, and it was the whole of what a
+// running tuios could be told to change. Everything else in the file, which is
+// most of the sidebar and all but one of the dock's settings, could be written
+// into a config file and not changed while running. The registry already
+// describes every settable path and can set one on a UserConfig, so the live
+// path is that plus the funnel that pushes a config onto the globals the
+// renderer reads.
+func (m *OS) setConfigFromRegistry(path, value string) error {
+	if _, ok := config.LookupOption(path); !ok {
+		// The bare spelling of an appearance key is accepted here for the same
+		// reason the switch above accepts it: callers use both.
+		if !strings.Contains(path, ".") {
+			if _, ok := config.LookupOption("appearance." + path); ok {
+				return m.setConfigFromRegistry("appearance."+path, value)
+			}
+		}
+		if msg, retired := config.RetiredOption(path); retired {
+			return errors.New(msg)
+		}
+		return fmt.Errorf("unknown config path: %s", path)
+	}
+	if m.UserConfig == nil {
+		return fmt.Errorf("cannot set %s: no configuration is loaded", path)
+	}
+	if err := config.SetOptionValue(m.UserConfig, path, value); err != nil {
+		return err
+	}
+	// The window size policy is the daemon's to apply, so the session this
+	// client shows is told as well as the file. See session/window_size.go.
+	if path == "daemon.window_size" {
+		m.sendWindowSizeToDaemon(value)
+	}
+	// A level chosen now outranks --no-animations. See SetMotion.
+	if path == "appearance.motion" {
+		m.Settings.NoAnimationsFlag = false
+	}
+
+	// ApplyAppearanceConfig is the one funnel from the config struct to the
+	// settings the render path reads, so going through it means a registry
+	// option lands exactly where the same key from the config file would.
+	//
+	// It lands in THIS session's settings and nowhere else. A server holds a
+	// session per connection, and this is the call every keypress in the
+	// settings panel comes through: writing the process seed here is what used
+	// to give one client's border style to every other client attached.
+	config.ApplyAppearanceConfig(m.UserConfig, &m.Settings)
+	// Whether the rail is shown is the session's, and only its own option
+	// changes it. See keepSessionSidebar.
+	m.keepSessionSidebar(path == "appearance.sidebar.enabled" || path == "appearance.sidebar_enabled")
+	// Retile unconditionally: most of what is reachable here changes how much
+	// room the panes have (the sidebar's width and side, the dock's position),
+	// and a retile on a change that did not need one costs a frame.
+	m.applyAppearanceLive(true)
+	return nil
+}
+
+// SetTheme changes the active theme.
+func (m *OS) SetTheme(themeName string) error {
+	// Initialize the new theme
+	if err := theme.Initialize(themeName); err != nil {
+		return fmt.Errorf("failed to set theme: %w", err)
+	}
+
+	// Update terminal colors for all windows
+	for _, w := range m.Windows {
+		if w != nil && w.Terminal != nil {
+			if theme.IsEnabled() {
+				w.Terminal.SetThemeColors(
+					theme.TerminalFg(),
+					nil, // Always use transparent background
+					theme.TerminalCursor(),
+					theme.GetANSIPalette(),
+				)
+			} else {
+				// Disable theme colors
+				w.Terminal.SetThemeColors(nil, nil, nil, [16]color.Color{})
+			}
+			w.InvalidateCache()
+		}
+	}
+
+	m.ShowNotification(fmt.Sprintf("Theme: %s", themeName), "info", m.Settings.NotificationDuration)
+	m.MarkAllDirty()
+	return nil
+}
+
+// SetDockbarPosition changes the dockbar position.
+func (m *OS) SetDockbarPosition(position string) error {
+	// Checked against config.DockbarPositions, the list set-config, the
+	// config validator and 'run-command --list' all read.
+	if !slices.Contains(config.DockbarPositions, position) {
+		return fmt.Errorf("invalid dockbar position: %s (use: %s)",
+			position, strings.Join(config.DockbarPositions, ", "))
+	}
+	m.Settings.DockbarPosition = position
+	m.remember("appearance.dockbar_position", position)
+	m.ShowNotification(fmt.Sprintf("Dockbar: %s", position), "info", m.Settings.NotificationDuration)
+	m.MarkAllDirty()
+	return nil
+}
+
+// SetBorderStyle changes the window border style.
+func (m *OS) SetBorderStyle(style string) error {
+	// Checked against config.BorderStyles rather than a list written here. The
+	// list written here was seven of the styles the app has, and it was the
+	// runtime gate: outer-half-block and inner-half-block worked from the config
+	// file and were refused by set-config, which reported the refusal as a
+	// client that would not take the change rather than as a style that does
+	// not exist.
+	if !slices.Contains(config.BorderStyles, style) {
+		return fmt.Errorf("invalid border style: %s (use: %s)",
+			style, strings.Join(config.BorderStyles, ", "))
+	}
+	m.Settings.BorderStyle = style
+	m.remember("appearance.border_style", style)
+	m.ShowNotification(fmt.Sprintf("Border: %s", style), "info", m.Settings.NotificationDuration)
+	m.MarkAllDirty()
+	return nil
+}
+
+// ShowNotificationCmd displays a notification in the UI.
+func (m *OS) ShowNotificationCmd(message, notificationType string) error {
+	m.ShowNotification(message, notificationType, m.Settings.NotificationDuration)
+	return nil
+}
+
+// focusTiledNeighbour moves focus one pane left or right under tiling. The
+// scrolling layout steps along its strip, which also brings the column on
+// screen; every other layout asks the geometry.
+func (m *OS) focusTiledNeighbour(direction string) error {
+	if m.UseScrollingLayout {
+		if direction == "left" {
+			m.ScrollingFocusLeft()
+		} else {
+			m.ScrollingFocusRight()
+		}
+		return nil
+	}
+	return m.FocusDirection(direction)
+}
+
+// FocusDirection focuses the nearest window in a direction, in any layout. See
+// layout.Neighbour for what counts as nearest.
+func (m *OS) FocusDirection(direction string) error {
+	if m.FocusedWindow < 0 || m.FocusedWindow >= len(m.Windows) {
+		return errNoFocusedWindow
+	}
+	side, ok := layout.ParseSide(direction)
+	if !ok {
+		return fmt.Errorf("invalid direction: %s (use: left, right, up, down)", direction)
+	}
+	targetIndex := m.findWindowInDirection(m.Windows[m.FocusedWindow], side)
+	if targetIndex < 0 {
+		return fmt.Errorf("no window %s of the focused one", direction)
+	}
+	m.FocusWindow(targetIndex)
+	m.MarkAllDirty()
+
+	return nil
+}
+
+// MasterLayoutExec runs a master-stack command (tape executor interface). An
+// error says what was wrong and what the command takes, because run-command
+// shows it to the caller.
+func (m *OS) MasterLayoutExec(command tape.CommandType, args []string) error {
+	if !m.AutoTiling {
+		return fmt.Errorf("%s needs tiling. Turn tiling on first", command)
+	}
+	switch command {
+	case tape.CommandTypeSetMasterPosition:
+		if !m.SetMasterPosition(args[0]) {
+			return fmt.Errorf("%q is not a master position. Use %s", args[0], strings.Join(config.MasterPositions, ", "))
+		}
+	case tape.CommandTypeSetMasterCount:
+		n, err := strconv.Atoi(args[0])
+		if err != nil || !config.ValidMasterCount(n) {
+			return fmt.Errorf("%q is not a master count. Use a number from %d to %d", args[0], config.MasterCountMin, config.MasterCountMax)
+		}
+		m.SetMasterCount(n)
+	case tape.CommandTypeCycleMasterPosition:
+		m.CycleMasterPosition()
+	case tape.CommandTypeAddMaster:
+		m.AddMaster()
+	case tape.CommandTypeRemoveMaster:
+		m.RemoveMaster()
+	case tape.CommandTypeSwapWithMaster:
+		if !m.SwapWithMaster() {
+			return fmt.Errorf("%s needs the master-stack layout and a pane to swap with", command)
+		}
+	case tape.CommandTypeFocusMaster:
+		if !m.FocusMaster() {
+			return fmt.Errorf("%s needs the master-stack layout and a pane", command)
+		}
+	}
+	m.MarkAllDirty()
+	return nil
+}
+
+// ToggleZoomExec toggles zoom on the focused window (tape executor interface).
+func (m *OS) ToggleZoomExec() error {
+	m.ToggleZoom()
+	return nil
+}
+
+// ScreenshotExec renders the focused window to a file (tape executor
+// interface).
+func (m *OS) ScreenshotExec() error {
+	cmd := m.ScreenshotFocusedWindow()
+	if cmd == nil {
+		return errors.New("no window to screenshot")
+	}
+	// The tape executor already runs on the Update goroutine, and a tape wants
+	// its steps in order: running the render here rather than handing back a
+	// command means the file exists before the next line of the tape runs, so
+	// a tape can screenshot and then act on the file.
+	msg, ok := cmd().(screenshotResultMsg)
+	if !ok {
+		return nil
+	}
+	m.HandleScreenshotResult(msg)
+	return msg.err
+}
+
+// SmartSplitFocusedExec performs a smart split on the focused window (tape executor interface).
+func (m *OS) SmartSplitFocusedExec() error {
+	if !m.AutoTiling {
+		return errTilingOff
+	}
+	if m.GetFocusedWindow() == nil {
+		return errNoFocusedWindow
+	}
+	before := len(m.Windows)
+	m.SmartSplitFocused()
+	m.awaitNewWindow(before)
+	return nil
+}
+
+// ShowCommandPaletteExec opens the command palette (tape executor interface).
+// The $PATH rescan it returns is dropped: the tape executor has no channel
+// back to Bubble Tea, and a tape asserting on the palette wants the rows that
+// were already there, not ones that arrive mid-assertion.
+func (m *OS) ShowCommandPaletteExec() error {
+	_ = m.OpenCommandPalette()
+	return nil
+}
+
+// SaveLayoutExec saves the current layout with the given name (tape executor interface).
+func (m *OS) SaveLayoutExec(name string) error {
+	return SaveLayoutTemplate(name, m)
+}
+
+// LoadLayoutExec loads a saved layout by name (tape executor interface).
+func (m *OS) LoadLayoutExec(name string) error {
+	templates, err := LoadLayoutTemplates()
+	if err != nil {
+		return fmt.Errorf("failed to load layout templates: %w", err)
+	}
+	for _, t := range templates {
+		if t.Name == name {
+			ApplyLayoutTemplate(t, m)
+			return nil
+		}
+	}
+	return fmt.Errorf("layout template not found: %s", name)
+}
+
+// startRemoteSendKeys initiates sequential key processing for remote send-keys.
+// Keys are processed one at a time via RemoteKeyMsg to allow proper UI updates between keys.
+// Animations are disabled during remote key processing to ensure immediate layout updates.
+//
+// When literal=true, keys are sent directly to the target terminal PTY (the
+// focused one when there is no target). When raw=true, each character is
+// treated as a separate key (no splitting on space/comma). When both are false,
+// keys are parsed as space/comma separated tokens:
+//   - Single keys: "i", "n", "Enter", "Escape", "Space"
+//   - Key combos: "ctrl+b", "alt+1", "shift+Enter"
+//   - Sequences (space or comma-separated): "ctrl+b,n" or "ctrl+b n"
+//
+// Special key names: Enter, Return, Space, Tab, Escape, Esc, Backspace, Delete,
+// Up, Down, Left, Right, Home, End, PageUp, PageDown, F1-F12
+func (m *OS) startRemoteSendKeys(keys string, literal bool, raw bool, windowTarget string, requestID string) (tea.Cmd, error) {
+	if literal {
+		// Send directly to the target terminal PTY (or focused if no target)
+		windowID, err := m.resolveWindowTarget(windowTarget)
+		if err != nil {
+			return nil, err
+		}
+		if err := m.SendToWindow(windowID, []byte(keys)); err != nil {
+			return nil, err
+		}
+		// Nothing follows to report the result for this path, unlike the
+		// parsed one whose last key does, so report it here. Without this the
+		// daemon waited out its timeout on a send that had worked.
+		if m.DaemonClient != nil && requestID != "" {
+			_ = m.DaemonClient.SendCommandResult(requestID, true, "keys sent")
+		}
+		return nil, nil
+	}
+
+	// Parse and synthesize TUIOS key events
+	var keyMsgs []tea.KeyPressMsg
+	if raw {
+		// Raw mode: each character is a separate key, no splitting
+		keyMsgs = m.parseKeysToMessagesRaw(keys)
+	} else {
+		// Normal mode: split by space/comma
+		keyMsgs = m.parseKeysToMessages(keys)
+	}
+	if len(keyMsgs) == 0 {
+		return nil, fmt.Errorf("no valid keys in sequence: %s", keys)
+	}
+
+	// Disable animations during remote key processing
+	// This ensures immediate layout updates instead of animations that might not complete
+	m.ProcessingRemoteKeys = true
+	m.Settings.AnimationsSuppressed = true
+
+	// Start processing the first key, remaining keys will be processed sequentially
+	firstKey := keyMsgs[0]
+	remaining := keyMsgs[1:]
+
+	return func() tea.Msg {
+		return RemoteKeyMsg{
+			Key:           firstKey,
+			RemainingKeys: remaining,
+			RequestID:     requestID,
+		}
+	}, nil
+}
+
+// parseKeysToMessagesRaw parses a key sequence treating each character as a separate key.
+// No splitting on spaces or commas, which is useful for typing literal text with spaces.
+func (m *OS) parseKeysToMessagesRaw(keys string) []tea.KeyPressMsg {
+	var msgs []tea.KeyPressMsg
+	for _, char := range keys {
+		msg := m.parseKeyToMessage(string(char))
+		msgs = append(msgs, msg)
+	}
+	return msgs
+}
+
+// parseKeysToMessages parses a key sequence string into tea.KeyPressMsg events.
+// Supports multiple separators: comma, space, or both.
+// Special tokens:
+//   - $PREFIX or PREFIX: expands to the configured leader key (default: ctrl+b)
+func (m *OS) parseKeysToMessages(keys string) []tea.KeyPressMsg {
+	var msgs []tea.KeyPressMsg
+
+	// Normalize: replace commas with spaces, then split by whitespace
+	// This allows "ctrl+b,q", "ctrl+b q", or "ctrl+b, q" to all work
+	normalized := strings.ReplaceAll(keys, ",", " ")
+
+	for part := range strings.FieldsSeq(normalized) {
+
+		// Handle $PREFIX or PREFIX special token
+		if strings.EqualFold(part, "$PREFIX") || strings.EqualFold(part, "PREFIX") {
+			// Get the configured leader key
+			leaderKey := m.Settings.LeaderKey
+			if leaderKey == "" {
+				leaderKey = "ctrl+b"
+			}
+			// The leader comes from config.toml, where option+ and command+
+			// are accepted too. The canonical spelling only uses the names
+			// parseKeyToMessage reads.
+			msg := m.parseKeyToMessage(config.CanonicalKey(leaderKey))
+			msgs = append(msgs, msg)
+			continue
+		}
+
+		msg := m.parseKeyToMessage(part)
+		msgs = append(msgs, msg)
+	}
+
+	return msgs
+}
+
+// parseKeyToMessage parses a single key or key combo into a tea.KeyPressMsg.
+func (m *OS) parseKeyToMessage(key string) tea.KeyPressMsg {
+	var mod tea.KeyMod
+	var code rune
+	var text string
+
+	// Check if it's a key combo (contains +)
+	if strings.Contains(key, "+") {
+		parts := strings.Split(key, "+")
+		keyPart := ""
+
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			switch strings.ToLower(part) {
+			case "ctrl":
+				mod |= tea.ModCtrl
+			case "alt", "opt":
+				mod |= tea.ModAlt
+			case "shift":
+				mod |= tea.ModShift
+			case "super", "cmd", "win":
+				mod |= tea.ModSuper
+			case "meta":
+				mod |= tea.ModMeta
+			default:
+				keyPart = part
+			}
+		}
+		key = keyPart
+	}
+
+	// Parse the key itself
+	lowerKey := strings.ToLower(key)
+	// Comma is the name send-keys gives ",", which it splits keys on.
+	if lowerKey == "comma" {
+		key, lowerKey = ",", ","
+	}
+
+	// Check for special keys
+	switch lowerKey {
+	case "enter", "return":
+		code = tea.KeyEnter
+	case "space":
+		code = tea.KeySpace
+		// Only set Text when there are no modifiers, otherwise String() drops
+		// the modifier (matching the regular-character branch below).
+		if mod == 0 {
+			text = " "
+		}
+	case "tab":
+		code = tea.KeyTab
+	case "escape", "esc":
+		code = tea.KeyEscape
+	case "backspace":
+		code = tea.KeyBackspace
+	case "delete":
+		code = tea.KeyDelete
+	case "up":
+		code = tea.KeyUp
+	case "down":
+		code = tea.KeyDown
+	case "left":
+		code = tea.KeyLeft
+	case "right":
+		code = tea.KeyRight
+	case "home":
+		code = tea.KeyHome
+	case "end":
+		code = tea.KeyEnd
+	case "pageup", "pgup":
+		code = tea.KeyPgUp
+	case "pagedown", "pgdown":
+		code = tea.KeyPgDown
+	case "insert":
+		code = tea.KeyInsert
+	case "f1":
+		code = tea.KeyF1
+	case "f2":
+		code = tea.KeyF2
+	case "f3":
+		code = tea.KeyF3
+	case "f4":
+		code = tea.KeyF4
+	case "f5":
+		code = tea.KeyF5
+	case "f6":
+		code = tea.KeyF6
+	case "f7":
+		code = tea.KeyF7
+	case "f8":
+		code = tea.KeyF8
+	case "f9":
+		code = tea.KeyF9
+	case "f10":
+		code = tea.KeyF10
+	case "f11":
+		code = tea.KeyF11
+	case "f12":
+		code = tea.KeyF12
+	default:
+		// Regular character
+		if len(key) == 1 {
+			char := rune(key[0])
+			// Normalize to lowercase for the code (consistent with how bubbletea handles keys)
+			if char >= 'A' && char <= 'Z' {
+				code = char - 'A' + 'a' // Convert to lowercase
+			} else {
+				code = char
+			}
+			// Only set Text if there are no modifiers (otherwise String() ignores modifiers)
+			if mod == 0 {
+				text = string(code)
+			}
+		} else {
+			// Unknown key, try as-is
+			if len(key) > 0 {
+				code = rune(strings.ToLower(key)[0])
+				if mod == 0 {
+					text = strings.ToLower(key)
+				}
+			}
+		}
+	}
+
+	return tea.KeyPressMsg{
+		Code: code,
+		Text: text,
+		Mod:  mod,
+	}
+}
+
+// findWindowInDirection is the index of the window focus moves to from from
+// toward side, or -1. It looks at the visible windows of the current workspace.
+// Floating windows need not line up, so with tiling off a window that lies that
+// way without facing from is still reachable.
+func (m *OS) findWindowInDirection(from *terminal.Window, side layout.Side) int {
+	var cands []layout.Rect
+	var index []int
+	for i, win := range m.Windows {
+		if win == from || win.Workspace != m.CurrentWorkspace || win.Minimized {
+			continue
+		}
+		cands = append(cands, layout.Rect{X: win.X, Y: win.Y, W: win.Width, H: win.Height})
+		index = append(index, i)
+	}
+	origin := layout.Rect{X: from.X, Y: from.Y, W: from.Width, H: from.Height}
+	if n := layout.Neighbour(origin, cands, side, !m.AutoTiling); n >= 0 {
+		return index[n]
+	}
+	return -1
+}
+
+// startScriptWaitRegex arms a WaitUntilRegex condition for tape playback. It
+// compiles Args[0] as the pattern and Args[1] (optional, milliseconds) as the
+// timeout, defaulting to 5000ms. A bad or missing pattern is reported and the
+// command is skipped without arming a wait.
+func (m *OS) startScriptWaitRegex(cmd *tape.Command) {
+	if len(cmd.Args) == 0 {
+		m.ShowNotification("WaitUntilRegex: missing pattern", "error", m.Settings.NotificationDuration)
+		return
+	}
+	re, err := regexp.Compile(cmd.Args[0])
+	if err != nil {
+		m.ShowNotification(fmt.Sprintf("WaitUntilRegex: invalid pattern: %v", err), "error", m.Settings.NotificationDuration)
+		return
+	}
+	timeout := 5000 * time.Millisecond
+	if len(cmd.Args) > 1 {
+		if ms, convErr := strconv.Atoi(cmd.Args[1]); convErr == nil && ms > 0 {
+			timeout = time.Duration(ms) * time.Millisecond
+		}
+	}
+	m.ScriptWaitRegex = re
+	m.ScriptWaitDeadline = time.Now().Add(timeout)
+}
+
+// checkScriptWaitRegex reports whether a pending WaitUntilRegex condition is
+// satisfied, so playback may resume. It returns true (clearing the wait state)
+// on a match against the focused window's visible screen or once the deadline
+// passes, warning on timeout. It returns false while still waiting.
+func (m *OS) checkScriptWaitRegex() bool {
+	if m.ScriptWaitRegex == nil {
+		return true
+	}
+
+	matched := false
+	if win := m.GetFocusedWindow(); win != nil && win.Terminal != nil {
+		win.RLockIO()
+		content := win.Terminal.String()
+		win.RUnlockIO()
+		matched = m.ScriptWaitRegex.MatchString(content)
+	}
+
+	if matched {
+		m.ScriptWaitRegex = nil
+		m.ScriptWaitDeadline = time.Time{}
+		return true
+	}
+
+	if !m.ScriptWaitDeadline.IsZero() && time.Now().After(m.ScriptWaitDeadline) {
+		m.ShowNotification("WaitUntilRegex: timed out", "warning", m.Settings.NotificationDuration)
+		m.ScriptWaitRegex = nil
+		m.ScriptWaitDeadline = time.Time{}
+		return true
+	}
+
+	return false
+}
+
+// capturePane captures the content of a pane.
+// flags is a comma-separated string of options: "scrollback", "ansi".
+func (m *OS) capturePane(windowTarget, flags string) (string, error) {
+	// Resolve target window
+	var win *terminal.Window
+	if windowTarget == "" {
+		win = m.GetFocusedWindow()
+	} else {
+		windowID, err := m.resolveWindowTarget(windowTarget)
+		if err != nil {
+			return "", err
+		}
+		for _, w := range m.Windows {
+			if w.ID == windowID {
+				win = w
+				break
+			}
+		}
+	}
+
+	if win == nil {
+		return "", fmt.Errorf("no window found")
+	}
+	if win.Terminal == nil {
+		return "", fmt.Errorf("window has no terminal")
+	}
+
+	includeScrollback := strings.Contains(flags, "scrollback")
+	includeANSI := strings.Contains(flags, "ansi")
+
+	win.RLockIO()
+	defer win.RUnlockIO()
+
+	var content string
+	if includeANSI {
+		content = win.Terminal.Render()
+	} else {
+		content = win.Terminal.String()
+	}
+
+	if includeScrollback {
+		// Prepend scrollback content
+		scrollbackLen := win.Terminal.ScrollbackLen()
+		if scrollbackLen > 0 {
+			var sb strings.Builder
+			win.Terminal.ScrollbackRows(0, scrollbackLen, func(_ int, line uv.Line) bool {
+				if includeANSI {
+					sb.WriteString(line.Render())
+				} else {
+					sb.WriteString(vt.StripSixelMarkers(line.String()))
+				}
+				sb.WriteByte('\n')
+				return true
+			})
+			sb.WriteString(content)
+			content = sb.String()
+		}
+	}
+
+	// A pane on a host that draws kitty placeholders keeps them in its
+	// grid; a capture is text and gets blanks in their place.
+	return vt.StripKittyPlaceholders(content), nil
+}

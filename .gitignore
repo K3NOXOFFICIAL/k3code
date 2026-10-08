@@ -1,0 +1,11 @@
+.k3dev/
+__pycache__/
+.venv/
+node_modules/
+dist/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.k3code/
+scripts/exit/rows/
+tui/node_modules

@@ -1,0 +1,312 @@
+package session
+
+import (
+	"hash/fnv"
+	"math"
+	"sort"
+	"strconv"
+)
+
+// StateFingerprint reduces a session state to a 64-bit value that changes when
+// the state changes and does not change when it does not.
+//
+// It exists so both ends of a state sync can tell a push that says something
+// from a push that says nothing. A client sends its whole state after every
+// keystroke and every click, and the daemon forwards every one of those to
+// every peer, which rebuilds its window list, prunes its maps and redraws. When
+// nothing moved, that whole round is spent arriving at the state everyone
+// already held: measured on two attached clients, thirty-one keystrokes
+// produced thirty-two peer broadcasts and all thirty-two were identical to the
+// one before.
+//
+// Written by hand rather than by hashing an encoding, because gob and JSON both
+// walk a Go map in the map's own iteration order, which is deliberately not
+// stable between passes. A fingerprint built that way would differ for a state
+// that had not changed, which is precisely the case this has to recognise. Map
+// keys are sorted here for that reason.
+//
+// Every field a peer acts on is covered. Fields the daemon owns and rewrites on
+// the way through (Version, BaseVersion) are covered too: the fingerprint
+// describes the state that is about to be sent, not the state a client meant to
+// send.
+func StateFingerprint(s *SessionState) uint64 {
+	if s == nil {
+		return 0
+	}
+	h := fnv.New64a()
+
+	str := func(v string) {
+		_, _ = h.Write([]byte(v))
+		_, _ = h.Write([]byte{0})
+	}
+	num := func(v int) { str(strconv.Itoa(v)) }
+	flag := func(v bool) {
+		if v {
+			str("1")
+		} else {
+			str("0")
+		}
+	}
+	// Bit pattern rather than a decimal rendering, so two ratios that print the
+	// same but are not equal do not fingerprint the same.
+	f64 := func(v float64) { str(strconv.FormatUint(math.Float64bits(v), 16)) }
+
+	str(s.Name)
+	str(s.DisplayName)
+	str(s.Accent)
+	flag(s.Restored)
+	str(s.FocusedWindowID)
+	num(s.CurrentWorkspace)
+	f64(s.MasterRatio)
+	flag(s.AutoTiling)
+	num(s.Width)
+	num(s.Height)
+	num(s.NextBSPWindowID)
+	num(s.TilingScheme)
+	str(s.LayoutMode)
+	num(s.NumWorkspaces)
+	num(s.SidebarWidth)
+	flag(s.SidebarCollapsed)
+	str(s.Sidebar)
+	str(strconv.FormatUint(s.LayoutGen, 10))
+	num(s.ResurrectionVersion)
+	num(s.Version)
+	num(s.BaseVersion)
+	// The daemon acts on these rather than a peer: they are what its emulators
+	// answer OSC 11 and OSC 10 with, so a push that changes them has news.
+	str(s.PaneReportBg)
+	str(s.PaneReportFg)
+	str(s.PaneReportPalette)
+
+	// Windows are ordered, and the order is meaningful (it is the z-order the
+	// peer rebuilds its list in), so they are hashed as they stand.
+	num(len(s.Windows))
+	for i := range s.Windows {
+		w := &s.Windows[i]
+		str(w.ID)
+		str(w.Title)
+		str(w.CustomName)
+		num(w.X)
+		num(w.Y)
+		num(w.Width)
+		num(w.Height)
+		num(w.Z)
+		num(w.Workspace)
+		flag(w.Minimized)
+		num(w.PreMinimizeX)
+		num(w.PreMinimizeY)
+		num(w.PreMinimizeW)
+		num(w.PreMinimizeH)
+		str(w.PTYID)
+		flag(w.IsAltScreen)
+		flag(w.IsFloating)
+		flag(w.Zoomed)
+		num(w.PreZoomX)
+		num(w.PreZoomY)
+		num(w.PreZoomW)
+		num(w.PreZoomH)
+		str(w.Cwd)
+		flag(w.Unplaced)
+		str(string(w.AgentState))
+		str(w.AgentMessage)
+		num(int(w.AgentStateAt))
+		str(w.AgentHarness)
+		num(int(w.CompletionSeq))
+		str(w.AgentKind)
+		str(w.AgentSessionID)
+		str(w.AgentSessionHarness)
+		num(len(w.AgentMeta))
+		for _, t := range w.AgentMeta {
+			str(t.Key)
+			str(t.Value)
+		}
+		num(w.AgentQueued)
+		num(w.AgentSubagents)
+		flag(w.Popup)
+		str(w.PopupWidth)
+		str(w.PopupHeight)
+		flag(w.Scratch)
+		str(w.ScratchName)
+		str(w.ForegroundCmd)
+		num(w.ShellPID)
+		num(len(w.Grants))
+		for _, g := range w.Grants {
+			str(g)
+		}
+	}
+
+	hashIntStr := func(m map[int]string) {
+		num(len(m))
+		for _, k := range sortedIntKeys(m) {
+			num(k)
+			str(m[k])
+		}
+	}
+	hashIntStr(s.WorkspaceFocus)
+	// Focus history decides where the daemon sends focus when a pane closes, so
+	// it must not be mistaken for an otherwise identical state-sync repeat.
+	num(len(s.FocusHistory))
+	for _, workspace := range sortedIntKeys(s.FocusHistory) {
+		num(workspace)
+		for _, id := range s.FocusHistory[workspace] {
+			str(id)
+		}
+	}
+	hashIntStr(s.WorkspaceNames)
+
+	// The per-workspace master ratios, folded in the same way and for the same
+	// reason as the flat one above: a peer acts on them, so a push that changes
+	// one has something to say and must not be suppressed.
+	num(len(s.WorkspaceMasterRatio))
+	for _, k := range sortedIntKeys(s.WorkspaceMasterRatio) {
+		num(k)
+		f64(s.WorkspaceMasterRatio[k])
+	}
+	num(len(s.WorkspaceStackRatio))
+	for _, k := range sortedIntKeys(s.WorkspaceStackRatio) {
+		num(k)
+		f64(s.WorkspaceStackRatio[k])
+	}
+	num(len(s.WorkspaceMasterSplits))
+	for _, k := range sortedIntKeys(s.WorkspaceMasterSplits) {
+		num(k)
+		sp := s.WorkspaceMasterSplits[k]
+		for _, list := range [][]float64{sp.Masters, sp.Stack, sp.Rows, sp.Cells} {
+			num(len(list))
+			for _, v := range list {
+				f64(v)
+			}
+		}
+	}
+	num(len(s.WorkspaceMasterLayout))
+	for _, k := range sortedIntKeys(s.WorkspaceMasterLayout) {
+		num(k)
+		ml := s.WorkspaceMasterLayout[k]
+		str(ml.Position)
+		num(ml.Count)
+		flag(ml.NoGrid)
+	}
+
+	// The custom-layout flags, folded in for the reason the ratios above are: a
+	// peer acts on them, so a push that changes one has something to say and must
+	// not be suppressed as a repeat.
+	num(len(s.WorkspaceHasCustom))
+	for _, k := range sortedIntKeys(s.WorkspaceHasCustom) {
+		num(k)
+		flag(s.WorkspaceHasCustom[k])
+	}
+
+	num(len(s.WorkspaceOrder))
+	for _, v := range s.WorkspaceOrder {
+		num(v)
+	}
+
+	num(len(s.WorkspaceTrees))
+	for _, k := range sortedIntKeys(s.WorkspaceTrees) {
+		num(k)
+		hashBSPNode(h, s.WorkspaceTrees[k])
+	}
+
+	num(len(s.WindowToBSPID))
+	for _, k := range sortedStringKeys(s.WindowToBSPID) {
+		str(k)
+		num(s.WindowToBSPID[k])
+	}
+
+	num(len(s.Options))
+	for _, k := range sortedStringKeys(s.Options) {
+		str(k)
+		str(s.Options[k])
+	}
+
+	// Nil and the zero value are distinguished here too, and for the same
+	// reason: a strip scrolled home is not a peer with nothing to say about it.
+	if s.ScrollStrip == nil {
+		str("nil-strip")
+	} else {
+		str("strip")
+		num(s.ScrollStrip.ViewportX)
+	}
+
+	// The scrolling layout's columns, for the reason the trees above are here:
+	// a peer acts on them. Left out, widening a column changed nothing a push
+	// was compared on, so the push was suppressed as a repeat and the width
+	// lived on this client alone.
+	num(len(s.WorkspaceScrollColumns))
+	for _, k := range sortedIntKeys(s.WorkspaceScrollColumns) {
+		num(k)
+		cols := s.WorkspaceScrollColumns[k]
+		num(len(cols))
+		for _, c := range cols {
+			num(len(c.Windows))
+			for _, id := range c.Windows {
+				str(id)
+			}
+			f64(c.Proportion)
+			num(c.FixedWidth)
+			num(c.Active)
+		}
+	}
+
+	// Nil and the zero value are distinguished: nil is a peer that has not said,
+	// and a peer adopting on receipt has to see the difference.
+	if s.PaneGeometry == nil {
+		str("nil-geometry")
+	} else {
+		str("geometry")
+		flag(s.PaneGeometry.SharedBorders)
+		num(s.PaneGeometry.PaneGap)
+		num(s.PaneGeometry.ScrollColumnWidth)
+	}
+
+	return h.Sum64()
+}
+
+// hashBSPNode folds a serialized tree in, shape and all. A nil tree and an
+// empty one are distinguished, because they mean different things to a peer.
+func hashBSPNode(h interface{ Write([]byte) (int, error) }, t *SerializedBSPTree) {
+	write := func(v string) {
+		_, _ = h.Write([]byte(v))
+		_, _ = h.Write([]byte{0})
+	}
+	if t == nil {
+		write("nil-tree")
+		return
+	}
+	write("tree")
+	write(strconv.Itoa(t.AutoScheme))
+	write(strconv.FormatUint(math.Float64bits(t.DefaultRatio), 16))
+
+	var walk func(n *SerializedBSPNode)
+	walk = func(n *SerializedBSPNode) {
+		if n == nil {
+			write("nil")
+			return
+		}
+		write("n")
+		write(strconv.Itoa(n.WindowID))
+		write(strconv.Itoa(n.SplitType))
+		write(strconv.FormatUint(math.Float64bits(n.SplitRatio), 16))
+		walk(n.Left)
+		walk(n.Right)
+	}
+	walk(t.Root)
+}
+
+func sortedIntKeys[V any](m map[int]V) []int {
+	keys := make([]int, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Ints(keys)
+	return keys
+}
+
+func sortedStringKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}

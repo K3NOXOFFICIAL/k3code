@@ -1,0 +1,191 @@
+package overlay
+
+import (
+	"image/color"
+	"strings"
+	"sync/atomic"
+
+	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
+)
+
+// ascii, when true, makes the controls avoid non-ASCII glyphs (arrows,
+// ellipsis) for terminals without a capable font. It is a package-level toggle
+// because it is a rendering-environment property, not a per-call concern.
+// Atomic because every session's render loop mirrors the config value into it
+// (see the app package) while other sessions' renders read it.
+var ascii atomic.Bool
+
+// SetASCII records whether rendering must avoid non-ASCII glyphs.
+func SetASCII(v bool) {
+	ascii.Store(v)
+}
+
+// UseASCII reports whether rendering must avoid non-ASCII glyphs.
+func UseASCII() bool {
+	return ascii.Load()
+}
+
+// Style returns a fresh lipgloss style already backgrounded with bg. Every
+// fragment on a panel row must carry that row's background, otherwise a bare
+// foreground style emits an ANSI reset that punches a transparent hole through
+// the solid fill when the panel is composited over other content.
+func Style(bg color.Color) lipgloss.Style {
+	return lipgloss.NewStyle().Background(bg)
+}
+
+// Fill pads s with bg-colored spaces so it spans width cells.
+func Fill(s string, width int, bg color.Color) string {
+	w := lipgloss.Width(s)
+	if w >= width {
+		return s
+	}
+	return s + Style(bg).Render(strings.Repeat(" ", width-w))
+}
+
+// Chip renders a small inset pill (used for titles and tags).
+//
+// At 16 colours a chip on a slot is drawn in reverse video: the slot becomes
+// the chip and the terminal's own background becomes its text, which reads in
+// any palette where a fixed ink would only read in some.
+func Chip(label string, bg, fg color.Color) string {
+	if _, ok := bg.(ansi.BasicColor); ok && CurrentDepth() == Depth16 {
+		return lipgloss.NewStyle().Foreground(bg).Reverse(true).Bold(true).Render(" " + label + " ")
+	}
+	return lipgloss.NewStyle().
+		Background(bg).
+		Foreground(fg).
+		Bold(true).
+		Padding(0, 1).
+		Render(label)
+}
+
+// KeyBadge renders a single key combo as a subtle card-backed chip. The chip
+// carries its own background so it reads on any row.
+//
+// The accent follows the terminal theme and the card does not, so the key is
+// measured against the card before it is written on it. Unmeasured it read
+// 2.45:1 with no theme at all, and this badge is what the splash, every panel
+// footer and every dialog tell the user to press.
+func KeyBadge(key string, pal Palette) string {
+	return lipgloss.NewStyle().
+		Background(pal.Card).
+		Foreground(Readable(pal.AccentBright, pal.Card)).
+		Bold(true).
+		Padding(0, 1).
+		Render(key)
+}
+
+// KeyBadges joins several key badges with a bg-colored space.
+func KeyBadges(keys []string, bg color.Color, pal Palette) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	badges := make([]string, 0, len(keys))
+	for _, k := range keys {
+		badges = append(badges, KeyBadge(k, pal))
+	}
+	return strings.Join(badges, Style(bg).Render(" "))
+}
+
+// Cycler renders an enum value as a ‹ value › control on the given row
+// background. The returned left/right arrow widths are two cells each, which
+// hosts use to hit-test decrement/increment clicks.
+func Cycler(value string, selected bool, bg color.Color, pal Palette) string {
+	arrowColor := pal.FgMute
+	valColor := pal.FgDim
+	if selected {
+		arrowColor = pal.AccentBright
+		valColor = pal.Fg
+	}
+	left, right := ArrowLeft(), ArrowRight()
+	arrow := Style(bg).Foreground(arrowColor)
+	return arrow.Render(left+" ") +
+		Style(bg).Foreground(valColor).Bold(selected).Render(value) +
+		arrow.Render(" "+right)
+}
+
+// Toggle renders a boolean as an [ on ] / [ off ] control on the given row
+// background.
+func Toggle(on, selected bool, bg color.Color, pal Palette) string {
+	label := "off"
+	fg := pal.FgMute
+	if on {
+		label = "on"
+		fg = pal.Success
+	}
+	bracketColor := pal.FgMute
+	if selected {
+		bracketColor = pal.AccentBright
+	}
+	bracket := Style(bg).Foreground(bracketColor)
+	return bracket.Render("[ ") +
+		Style(bg).Foreground(fg).Bold(true).Render(label) +
+		bracket.Render(" ]")
+}
+
+// Rule returns a full-width muted horizontal rule on the given background. It
+// degrades like DashRule does: a panel's own separator was the last unguarded
+// glyph the family drew in ASCII mode.
+func Rule(width int, bg color.Color, pal Palette) string {
+	ch := "─"
+	if UseASCII() {
+		ch = "-"
+	}
+	ch = chromeOr(func(c *Chrome) string { return c.Rule }, ch)
+	return Style(bg).Foreground(pal.FgMute).Render(strings.Repeat(ch, max(width, 0)))
+}
+
+// ArrowLeft and ArrowRight are the pair a cycler and an overflowing tab strip
+// point back and on with.
+func ArrowLeft() string {
+	def := "‹"
+	if UseASCII() {
+		def = "<"
+	}
+	return chromeOr(func(c *Chrome) string { return c.ArrowLeft }, def)
+}
+
+// ArrowRight is ArrowLeft pointing the other way.
+func ArrowRight() string {
+	def := "›"
+	if UseASCII() {
+		def = ">"
+	}
+	return chromeOr(func(c *Chrome) string { return c.ArrowRight }, def)
+}
+
+// Ellipsis returns the truncation marker for the current ASCII setting.
+func Ellipsis() string {
+	def := "…"
+	if UseASCII() {
+		def = "..."
+	}
+	return chromeOr(func(c *Chrome) string { return c.Ellipsis }, def)
+}
+
+// Truncate shortens s to fit within maxWidth display cells, appending an
+// ellipsis when it overflows.
+func Truncate(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= maxWidth {
+		return s
+	}
+	ell := Ellipsis()
+	// A glyph set names the ellipsis and the role takes any width, so the
+	// marker can be wider than the budget it is meant to fit inside. Dropped
+	// rather than appended in that case: a caller asking for four cells has
+	// four cells, and returning five to say "this was cut" pushes every label
+	// after it out of the layout that measured it.
+	if lipgloss.Width(ell) >= maxWidth {
+		ell = ""
+	}
+	target := max(maxWidth-lipgloss.Width(ell), 0)
+	runes := []rune(s)
+	for len(runes) > 0 && lipgloss.Width(string(runes)) > target {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + ell
+}

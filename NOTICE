@@ -1,0 +1,32 @@
+k3code
+Copyright (c) k3nox. MIT License (see LICENSE).
+
+Third-party material included in this repository. Every vendored or ported file or tree is listed in
+VENDOR.toml with its origin, commit, license and whether it was modified; the license texts are in LICENSES/.
+
+* Hermes Agent (Nous Research), MIT License: LICENSES/hermes-agent-MIT.txt
+  - tui/ and tui/shared/ are derived from ui-tui/ and apps/shared/src (commit 4127d78da84b1eee105f298979cc57cc7457f98d).
+  - core/src/k3code/providers/retry_utils.py, router/classifier.py, router/cooldown.py and tools/fuzzy_match.py are
+    copied or adapted from agent/retry_utils.py, agent/error_classifier.py, agent/fallback_cooldown.py and
+    tools/fuzzy_match.py.
+  - goals, loops, cron expressions and retry policy, suggestions, sub-agent worktrees, fan-out, permission-rule
+    mining, background review, the preference distiller and the skills curator are ports of the design of the
+    corresponding Hermes modules (see VENDOR.toml).
+
+* TUIOS (Gaurav Gosain), MIT License: LICENSES/tuios-MIT.txt
+  panes/ is a copy of the TUIOS source (commit f3d892942bfb45a0a0775d14895ae77ff9c06468), modified: the k3 keymap in
+  panes/internal/k3keys and two small hooks (see panes/K3_CHANGES.md). Its own LICENSE is kept at panes/LICENSE.
+
+* opencode (anomalyco/opencode), MIT License: LICENSES/opencode-MIT.txt
+  core/src/k3code/permissions/wildcard.py, arity.py and rules.py are Python ports of opencode's permission rule
+  matching, wildcard handling and command-arity table.
+
+* Atomic Agents (Eigenwise), MIT License: LICENSES/atomic-agents-MIT.txt
+  core/src/k3code/research/state.py, prompts.py and flow.py are adapted from atomic-examples/deep-research.
+
+* OpenAI Codex (https://github.com/openai/codex), Apache License 2.0: LICENSES/codex-Apache-2.0.txt
+  core/src/k3code/prompts/review_rubric.md is adapted from codex-rs/prompts/templates/review/rubric.md
+  (commit 81de4f251cfdaf32ecb85e2160ebfc11a562d44b). Copyright OpenAI. The file was modified (output schema replaced).
+
+Studied for design only, nothing copied: openclaw, pi, and the public protocol documentation of Ante.
+No proprietary or leaked source is used anywhere (scripts/vendor_check.py refuses listed entries from banned sources).

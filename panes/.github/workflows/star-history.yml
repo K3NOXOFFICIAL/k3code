@@ -1,0 +1,72 @@
+# The README's star chart is a generated asset rather than a hotlinked image,
+# because star-history.com stopped rendering charts and its mirrors go stale.
+# This job redraws it from the stargazers API and publishes it on the
+# `star-history` branch, which holds one commit that each run replaces. The
+# chart can then refresh often without adding a commit to main's history.
+name: star-history
+
+on:
+  schedule:
+    # Every 6 hours, off the hour.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# A manual run while a scheduled one is going would race it to push. The
+# second waits instead of cancelling the first halfway through a push.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  redraw:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Redraw the chart
+        env:
+          # gh reads the token from the environment; the default one is enough,
+          # since stargazers is a public read.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/star-history.sh "${GITHUB_REPOSITORY}" "${RUNNER_TEMP}/star-history.svg"
+
+      - name: Publish it on the star-history branch if the count moved
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          new="${RUNNER_TEMP}/star-history.svg"
+
+          # The SVG carries no timestamp, so an unchanged count gives a
+          # byte-identical file and there is nothing to publish.
+          if git fetch --quiet --depth=1 origin star-history 2>/dev/null &&
+            git show FETCH_HEAD:star-history.svg 2>/dev/null | cmp -s - "$new"; then
+            echo "star count unchanged"
+            exit 0
+          fi
+
+          STARS=$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.stargazers_count')
+
+          # Build the one commit through the API, so the job needs no git
+          # identity: blob, tree, a commit with no parent, then point the
+          # branch at it, creating the branch on the first run.
+          blob=$(base64 -w0 "$new" | gh api "repos/${GITHUB_REPOSITORY}/git/blobs" \
+            -f encoding=base64 -F content=@- --jq .sha)
+          tree=$(gh api "repos/${GITHUB_REPOSITORY}/git/trees" \
+            -f 'tree[][path]=star-history.svg' -f 'tree[][mode]=100644' \
+            -f 'tree[][type]=blob' -f "tree[][sha]=${blob}" --jq .sha)
+          commit=$(gh api "repos/${GITHUB_REPOSITORY}/git/commits" \
+            -f "message=chore: redraw the star history chart at ${STARS} stars" \
+            -f "tree=${tree}" --jq .sha)
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/star-history" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/star-history" \
+              -f "sha=${commit}" -F force=true >/dev/null
+          else
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref=refs/heads/star-history -f "sha=${commit}" >/dev/null
+          fi
+          echo "published ${STARS} stars as ${commit}"

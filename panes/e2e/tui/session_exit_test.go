@@ -1,0 +1,312 @@
+package tuie2e
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/Gaurav-Gosain/tuitest"
+)
+
+// startInLogged is startIn returning the path of the raw PTY log as well, so a
+// test can read what tuios printed to stdout after the TUI exited (the
+// detach/kill message lands there, past the alt-screen reset).
+//
+// It used to be a second copy of startIn's environment, and a copy is where a
+// harness fix goes missing: the seven tests that start here ran without the
+// output-only host stream and without fish's completion directory. Every
+// caller attaches, and TUIOS_NO_DAEMON only decides what a bare "tuios" does,
+// so daemonDefault keeps their environment exactly what it was.
+func startInLogged(t *testing.T, base string, o startOpts) (*tuitest.Terminal, string) {
+	t.Helper()
+	var logPath string
+	o.logPath = &logPath
+	o.daemonDefault = true
+	term := startIn(t, base, o)
+	return term, logPath
+}
+
+func waitExit(t *testing.T, term *tuitest.Terminal, what string) int {
+	t.Helper()
+	deadline := time.Now().Add(uiTimeout)
+	for time.Now().Before(deadline) {
+		if code, exited := term.ExitCode(); exited {
+			return code
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("%s: tuios never exited\n%s", what, term.Snapshot())
+	return -1
+}
+
+// sessionListed reports whether a daemon is holding the named session. Rows
+// marked saved are skipped: with no daemon the listing shows what is on disk,
+// and a session that only exists there is not one anybody can talk to.
+func sessionListed(t *testing.T, base, name string) bool {
+	t.Helper()
+	out, _ := tuiosCLI(t, base, "ls", "--json")
+	var sessions []struct {
+		Name  string `json:"name"`
+		Saved bool   `json:"saved"`
+	}
+	if err := json.Unmarshal([]byte(out), &sessions); err != nil {
+		t.Fatalf("parse ls --json: %v\noutput:\n%s", err, out)
+	}
+	for _, s := range sessions {
+		if s.Name == name && !s.Saved {
+			return true
+		}
+	}
+	return false
+}
+
+// TestLeaderQuitKillsSession: leader q in a daemon-attached session opens the
+// quit menu (detach is the default; killing must be asked for), and the kill
+// row (accelerator x) kills the session.
+func TestLeaderQuitKillsSession(t *testing.T) {
+	base := t.TempDir()
+	killDaemon(t, base)
+
+	if out, err := tuiosCLI(t, base, "new", "repro-kill", "--detach"); err != nil {
+		t.Fatalf("create detached session: %v: %s", err, out)
+	}
+
+	term, logPath := startInLogged(t, base, startOpts{args: []string{"attach", "repro-kill"}})
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return countWindows(s) == 1
+	}, bootTimeout); err != nil {
+		t.Fatalf("never attached: %v\n%s", err, term.Snapshot())
+	}
+	time.Sleep(insertGuard + 150*time.Millisecond)
+
+	// leader q opens the quit menu; x runs the kill row (the only session, so
+	// the row is "Kill and quit").
+	if err := term.SendKeys(tuitest.Ctrl('b'), "q"); err != nil {
+		t.Fatalf("send leader q: %v", err)
+	}
+	if err := term.WaitForText("Kill and quit", uiTimeout); err != nil {
+		t.Fatalf("quit menu never appeared: %v\n%s", err, term.Snapshot())
+	}
+	if err := term.SendKeys("x"); err != nil {
+		t.Fatalf("send x: %v", err)
+	}
+	waitExit(t, term, "after leader q, x")
+
+	// Give the daemon a moment to process the kill.
+	time.Sleep(300 * time.Millisecond)
+	if sessionListed(t, base, "repro-kill") {
+		out, _ := tuiosCLI(t, base, "ls")
+		t.Fatalf("BUG1: session 'repro-kill' still exists after leader q (q did not kill)\nls:\n%s", out)
+	}
+
+	// The exit message must say the session was killed, not detached: the row
+	// run was "Kill and quit", and reporting a detach after a kill is what
+	// made the old kill path look like it only detached.
+	logBytes, _ := os.ReadFile(logPath)
+	msg := exitLine(string(logBytes))
+	t.Logf("leader q killed the session (repro-kill gone); exit line: %q", msg)
+	if !strings.HasPrefix(msg, "Killed session 'repro-kill'") {
+		t.Fatalf("BUG1: exit message after leader q should report a kill, got %q\nlog tail:\n%s",
+			msg, tailMessage(string(logBytes)))
+	}
+}
+
+// TestLeaderQuitConfirm exercises the quit menu: leader q raises it;
+// cancelling leaves the session alive; the kill row kills it and reports a
+// kill. (In a daemon session the menu always opens; confirm_quit is set so
+// the standalone path would behave the same.)
+func TestLeaderQuitConfirm(t *testing.T) {
+	base := t.TempDir()
+	killDaemon(t, base)
+
+	// Turn on the always-confirm-quit preference through the config file, which
+	// the attach path reads via ApplyAppearanceConfig.
+	cfgPath := filepath.Join(base, "XDG_CONFIG_HOME", "tuios", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.WriteFile(cfgPath, []byte("[appearance]\nconfirm_quit = true\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	if out, err := tuiosCLI(t, base, "new", "repro-confirm", "--detach"); err != nil {
+		t.Fatalf("create detached session: %v: %s", err, out)
+	}
+
+	term, logPath := startInLogged(t, base, startOpts{args: []string{"attach", "repro-confirm"}})
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return countWindows(s) == 1
+	}, bootTimeout); err != nil {
+		t.Fatalf("never attached: %v\n%s", err, term.Snapshot())
+	}
+	time.Sleep(insertGuard + 150*time.Millisecond)
+
+	// leader q raises the quit menu, with detach first as the safe default.
+	if err := term.SendKeys(tuitest.Ctrl('b'), "q"); err != nil {
+		t.Fatalf("send leader q: %v", err)
+	}
+	if err := term.WaitForText("Detach", uiTimeout); err != nil {
+		t.Fatalf("quit menu never appeared: %v\n%s", err, term.Snapshot())
+	}
+
+	// Cancel: the client keeps running and the session survives.
+	if err := term.SendKeys(tuitest.Esc); err != nil {
+		t.Fatalf("send esc: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+	alive(t, term, "after cancelling quit")
+	if !sessionListed(t, base, "repro-confirm") {
+		t.Fatalf("session was killed after cancelling the quit dialog")
+	}
+
+	// Now kill: leader q, then the kill row's accelerator.
+	if err := term.SendKeys(tuitest.Ctrl('b'), "q"); err != nil {
+		t.Fatalf("send leader q (second time): %v", err)
+	}
+	if err := term.WaitForText("Kill and quit", uiTimeout); err != nil {
+		t.Fatalf("quit menu never reappeared: %v\n%s", err, term.Snapshot())
+	}
+	if err := term.SendKeys("x"); err != nil {
+		t.Fatalf("send x: %v", err)
+	}
+	waitExit(t, term, "after confirming quit")
+	time.Sleep(300 * time.Millisecond)
+
+	if sessionListed(t, base, "repro-confirm") {
+		t.Fatalf("session 'repro-confirm' still exists after confirming quit")
+	}
+	logBytes, _ := os.ReadFile(logPath)
+	msg := exitLine(string(logBytes))
+	t.Logf("confirmed quit; exit line: %q", msg)
+	if !strings.HasPrefix(msg, "Killed session 'repro-confirm'") {
+		t.Fatalf("exit message after confirmed quit should report a kill, got %q", msg)
+	}
+}
+
+// TestLeaderDetachKeepsSession: leader d should DETACH (session survives).
+func TestLeaderDetachKeepsSession(t *testing.T) {
+	base := t.TempDir()
+	killDaemon(t, base)
+
+	if out, err := tuiosCLI(t, base, "new", "repro-detach", "--detach"); err != nil {
+		t.Fatalf("create detached session: %v: %s", err, out)
+	}
+
+	term, logPath := startInLogged(t, base, startOpts{args: []string{"attach", "repro-detach"}})
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return countWindows(s) == 1
+	}, bootTimeout); err != nil {
+		t.Fatalf("never attached: %v\n%s", err, term.Snapshot())
+	}
+	time.Sleep(insertGuard + 150*time.Millisecond)
+
+	if err := term.SendKeys(tuitest.Ctrl('b'), "d"); err != nil {
+		t.Fatalf("send leader d: %v", err)
+	}
+	waitExit(t, term, "after leader d")
+	time.Sleep(300 * time.Millisecond)
+
+	if !sessionListed(t, base, "repro-detach") {
+		out, _ := tuiosCLI(t, base, "ls")
+		t.Fatalf("leader d killed the session (should detach)\nls:\n%s", out)
+	}
+	logBytes, _ := os.ReadFile(logPath)
+	t.Logf("leader d detached, session survives. Exit message tail:\n%s", tailMessage(string(logBytes)))
+}
+
+// TestExitMessageNamesCurrentSession: after switching to 'myproj', the exit
+// message must name myproj, not the original session.
+func TestExitMessageNamesCurrentSession(t *testing.T) {
+	base := t.TempDir()
+	killDaemon(t, base)
+
+	if out, err := tuiosCLI(t, base, "new", "session-0", "--detach"); err != nil {
+		t.Fatalf("create session-0: %v: %s", err, out)
+	}
+	if out, err := tuiosCLI(t, base, "new", "myproj", "--detach"); err != nil {
+		t.Fatalf("create myproj: %v: %s", err, out)
+	}
+
+	term, logPath := startInLogged(t, base, startOpts{args: []string{"attach", "session-0"}})
+	if err := term.WaitFor(func(s tuitest.Screen) bool {
+		return countWindows(s) == 1
+	}, bootTimeout); err != nil {
+		t.Fatalf("never attached: %v\n%s", err, term.Snapshot())
+	}
+	time.Sleep(insertGuard + 150*time.Millisecond)
+
+	// Open session switcher (leader S), type myproj, enter.
+	if err := term.SendKeys(tuitest.Ctrl('b'), "S"); err != nil {
+		t.Fatalf("send leader S: %v", err)
+	}
+	if err := term.WaitForText("myproj", uiTimeout); err != nil {
+		t.Fatalf("session switcher never showed myproj: %v\n%s", err, term.Snapshot())
+	}
+	// Type the name to filter, then Enter to switch.
+	if err := term.SendKeys("myproj"); err != nil {
+		t.Fatalf("type myproj: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if err := term.SendKeys(tuitest.Enter); err != nil {
+		t.Fatalf("enter: %v", err)
+	}
+	// Wait until we are on myproj (notification "Session: myproj").
+	if err := term.WaitForText("Session: myproj", uiTimeout); err != nil {
+		t.Fatalf("never switched to myproj: %v\n%s", err, term.Snapshot())
+	}
+	time.Sleep(insertGuard + 150*time.Millisecond)
+
+	// Detach now.
+	if err := term.SendKeys(tuitest.Ctrl('b'), "d"); err != nil {
+		t.Fatalf("send leader d: %v", err)
+	}
+	waitExit(t, term, "after switch+detach")
+	time.Sleep(200 * time.Millisecond)
+
+	logBytes, _ := os.ReadFile(logPath)
+	msg := exitLine(string(logBytes))
+	t.Logf("exit line: %q", msg)
+	if msg == "" {
+		t.Fatalf("BUG2: no 'Detached/Killed session' exit line found\nlog tail:\n%s", tailMessage(string(logBytes)))
+	}
+	if strings.Contains(msg, "session-0") {
+		t.Fatalf("BUG2: exit line names original session-0, not current myproj:\n%s", msg)
+	}
+	if !strings.Contains(msg, "myproj") {
+		t.Fatalf("BUG2: exit line does not name current session myproj:\n%s", msg)
+	}
+}
+
+// exitLine returns the client's final "Detached from session ..." or "Killed
+// session ..." line printed to stdout after the alt-screen reset. It ignores
+// the alt-screen render (which can contain session names from overlays like the
+// session switcher) by matching only the literal message prefixes.
+func exitLine(raw string) string {
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Detached from session '") ||
+			strings.HasPrefix(line, "Killed session '") {
+			return line
+		}
+	}
+	return ""
+}
+
+// tailMessage extracts printable lines mentioning session from raw PTY bytes,
+// for diagnostics only.
+func tailMessage(raw string) string {
+	var out []string
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.Contains(line, "session") || strings.Contains(line, "detached") ||
+			strings.Contains(line, "Killed") || strings.Contains(line, "myproj") {
+			out = append(out, strings.TrimSpace(line))
+		}
+	}
+	if len(out) > 6 {
+		out = out[len(out)-6:]
+	}
+	return strings.Join(out, "\n")
+}

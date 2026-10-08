@@ -1,0 +1,70 @@
+# Rules after herdr's agent-detection manifest for antigravity
+# (github.com/herdrdev/herdr, src/detect/manifests/antigravity.toml, herdr id
+# "agy", manifest version 2026.06.24.1, Apache-2.0; see LICENSE-herdr).
+# Regenerate a draft with
+#   go run ./internal/harness/herdrconv
+# herdr has no idle rule for it, so none ships: an idle Antigravity pane is
+# left to the other tiers.
+
+schema_version = 1
+id             = "antigravity"
+display_name   = "Antigravity"
+priority       = 50
+
+# Google Antigravity's CLI is a native binary named agy; there is no npm or
+# pip channel, so the name is the whole identity.
+[detect]
+comm  = ["agy"]
+argv0 = ["agy"]
+
+# "agy" is three letters, so the bare name only counts when the executable
+# really is a binary named agy sitting in a bin directory. That still refuses
+# a shell function, an alias, or a renamed process, which is what the
+# corroboration policy is for.
+[detect.require]
+exe_glob = ["**/bin/agy"]
+
+[screen]
+enabled   = true
+fold_case = true
+lines     = 8
+
+# herdr rule: permission_prompt. The permission banner with the proceed
+# question, or with the amend-command hints.
+[[screen.rule]]
+state    = "needs_input"
+priority = 300
+kind     = "approval"
+message  = "Waits for permission."
+all      = ["requesting permission for:"]
+any_of   = [ { all = ["do you want to proceed?"] }, { all = ["tab amend", "edit command"] } ]
+
+# herdr rule: spinner_working. A braille spinner in front of a verb ending in
+# -ing.
+#
+#   ⠹ Thinking
+[[screen.rule]]
+state    = "working"
+priority = 100
+message  = "Works on a turn."
+regex    = ['^\s*[\x{2800}-\x{28FF}]+[ \t]+\pL+\w*ing\b']
+
+# herdr rule: background_tasks_working. The status line counting tasks still
+# running.
+[[screen.rule]]
+state    = "working"
+priority = 90
+message  = "Runs background tasks."
+region   = "bottom_non_empty_lines(5)"
+regex    = ['(?i)·[ \t]*[1-9][0-9]*[ \t]+task']
+
+# How a prompt is typed in. Not measured: Antigravity is not installed on the
+# machine these values were written on.
+[input]
+submit          = "cr"
+bracketed_paste = true
+source          = "default: Enter sends CR in raw mode; not measured"
+
+[resume]
+argv   = ["agy", "--conversation", "{session_id}"]
+source = "herdr src/agent_resume.rs; not measured"
