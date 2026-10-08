@@ -67,6 +67,25 @@ def test_unknown_option_is_rejected(tmp_path: Path) -> None:
     assert r.returncode != 0 and "unknown option" in r.stderr
 
 
+@pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv")
+def test_installed_requirements_are_the_locked_runtime_set() -> None:
+    # install_core_copy installs `uv export --locked --no-dev`; the stubbed installer tests never run that path.
+    uv = shutil.which("uv") or "uv"
+    core = str(REPO / "core")
+    lock = subprocess.run([uv, "lock", "--check", "--offline", "--project", core], capture_output=True)
+    assert lock.returncode == 0, lock.stderr
+    export = subprocess.run(
+        [uv, "export", "--project", core, "--locked", "--no-dev", "--no-hashes", "--no-emit-project"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [ln for ln in export.stdout.splitlines() if "==" in ln and not ln.startswith(" ")]
+    names = {ln.split("==")[0].strip().lower() for ln in lines}
+    assert {"mcp", "pydantic", "click", "pyyaml", "prompt-toolkit"} <= names
+    assert not names & {"pytest", "pytest-asyncio", "ruff", "respx", "pexpect"}
+
+
 def test_uninstall_keeps_user_data_unless_purge(tmp_path: Path) -> None:
     assert run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup").returncode == 0
     (tmp_path / ".k3code").mkdir(exist_ok=True)

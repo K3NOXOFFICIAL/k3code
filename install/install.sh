@@ -21,6 +21,7 @@ BIN=""
 INSTALL_LOG=""
 TMP=""
 BUILDING=""
+REQS=""
 
 usage() {
   cat <<EOF
@@ -63,6 +64,7 @@ cleanup() {
   rc=$?
   if [ -n "$BUILDING" ]; then rm -rf "$BUILDING"; fi
   if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
+  if [ -n "$REQS" ]; then rm -f "$REQS"; fi
   if [ "$rc" -ne 0 ]; then say "k3code-install: FAILED (exit $rc)${INSTALL_LOG:+. Log: $INSTALL_LOG}"; fi
   exit "$rc"
 }
@@ -322,6 +324,8 @@ build_tui() {
   if (cd "$SRC_ROOT/tui" && npm ci --no-audit --no-fund >&2 && npm run build:ink >&2 && npm run build >&2) &&
     [ -d "$SRC_ROOT/tui/dist" ]; then
     cp -R "$SRC_ROOT/tui/dist" "$VERDIR/tui/dist"
+    # Build receipts belong to the build tooling; nothing at runtime reads them.
+    rm -f "$VERDIR/tui/dist/hermes-build.json" "$VERDIR/tui/dist/.k3code-product"
   else
     log "WARNING: the TUI did not build (output above); k3code will use the line REPL"
   fi
@@ -335,10 +339,29 @@ build_panes() {
     return 0
   fi
   log "building the k3 pane binary"
-  if ! (cd "$SRC_ROOT/panes" && CGO_ENABLED=0 go build -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
+  if ! (cd "$SRC_ROOT/panes" && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
     log "WARNING: the k3 pane binary did not build (output above); the multi-window binary is missing"
   fi
   return 0
+}
+
+# The installed core is a regular copy (it must not depend on a checkout that can be switched or deleted).
+# Its runtime dependencies are the locked set from core/uv.lock without the dev group, so the install is the
+# set CI tested. --locked fails on a stale lock (a missing dependency) instead of installing the stale set.
+# A checkout without a lock file (an older tag) resolves the dependencies as before.
+install_core_copy() {
+  if [ ! -f "$SRC_ROOT/core/uv.lock" ]; then
+    log "no core/uv.lock in this checkout: resolving the dependencies"
+    "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" "$SRC_ROOT/core" >&2
+    return 0
+  fi
+  REQS=$(mktemp "${TMPDIR:-/tmp}/k3code-reqs.XXXXXX")
+  "$UV" export --quiet --project "$SRC_ROOT/core" --locked --no-dev --no-hashes --no-emit-project -o "$REQS" >/dev/null ||
+    die "could not export the locked runtime dependencies (core/uv.lock is stale?): run 'uv lock' in core/"
+  "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" -r "$REQS" >&2
+  "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" --no-deps "$SRC_ROOT/core" >&2
+  rm -f "$REQS"
+  REQS=""
 }
 
 install_version() {
@@ -362,8 +385,7 @@ install_version() {
       if [ "${K3_EDITABLE:-0}" = 1 ]; then
         "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" -e "$SRC_ROOT/core" >&2
       else
-        # A regular copy: the installed k3code must not depend on a checkout that can be switched or deleted.
-        "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" "$SRC_ROOT/core" >&2
+        install_core_copy
       fi
     fi
   fi
