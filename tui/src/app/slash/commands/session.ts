@@ -412,7 +412,7 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: 'inspect or set reasoning effort (updates live agent)',
+    help: 'show or hide reasoning, or set effort [show|hide|low|medium|high|xhigh|max|default]',
     name: 'reasoning',
     run: (arg, ctx) => {
       if (!arg) {

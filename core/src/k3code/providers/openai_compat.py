@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 
 from k3code.providers.base import Provider, ProviderError, request_headers, to_provider_error
+from k3code.providers.effort import openai_effort
 from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec, messages_to_openai
 
 _TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=15.0)
@@ -59,6 +60,8 @@ class OpenAICompatProvider(Provider):
         }
         if temperature is not None:
             payload["temperature"] = temperature
+        if effort := openai_effort(model):
+            payload["reasoning_effort"] = effort
         if tools:
             payload["tools"] = [
                 {

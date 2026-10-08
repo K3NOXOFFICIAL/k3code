@@ -14,6 +14,7 @@ from k3code.commands.doctor import DoctorCommand
 from k3code.commands.stats import StatsCommand
 from k3code.commands.update_cmd import UpdateCommand
 from k3code.config import load_config
+from k3code.providers.effort import LEVELS as EFFORT_LEVELS
 from k3code.session_ai import compact_messages
 
 
@@ -68,22 +69,29 @@ class _ModelCommand(CommandDef):
 
 
 class _EffortCommand(CommandDef):
+    _USAGE = "/effort [low|medium|high|xhigh|max|default]"
+
     def __init__(self) -> None:
-        super().__init__(name="effort", help="Show or set reasoning effort: /effort [low|medium|high]")
+        super().__init__(name="effort", help=f"Show or set reasoning effort: {self._USAGE}")
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         live = ctx.sessions.get(session_id) if session_id else None
+        arg = arg.strip().lower()
         if not arg:
             current = getattr(live, "reasoning_effort", None) or "default"
-            return {"type": "message", "message": f"Reasoning effort: {current}. Usage: /effort [low|medium|high]"}
-        if arg not in ("low", "medium", "high"):
-            return {"type": "message", "message": f"Unknown effort: {arg} (low|medium|high)"}
+            return {"type": "message", "message": f"Reasoning effort: {current}. Usage: {self._USAGE}"}
+        if arg not in (*EFFORT_LEVELS, "default"):
+            return {"type": "message", "message": f"Unknown effort: {arg}. Usage: {self._USAGE}"}
         if live is None:
             return {"type": "message", "message": "No active session."}
-        # Stored on the session and shown in session.info. No provider takes a reasoning-effort parameter yet, so
-        # it does not change the requests (it used to be acknowledged and dropped).
-        live.reasoning_effort = arg
-        live.stored.meta["reasoning_effort"] = arg
+        # Sent from the next turn on: as output_config.effort to Claude models that take it, and as
+        # reasoning_effort to OpenAI reasoning models. Other models ignore it.
+        value = None if arg == "default" else arg
+        live.reasoning_effort = value
+        if value is None:
+            live.stored.meta.pop("reasoning_effort", None)
+        else:
+            live.stored.meta["reasoning_effort"] = value
         ctx.store.save(live.stored)
         live.emit("session.info", live.live_info())
         return {"type": "message", "message": f"Reasoning effort set to: {arg}"}

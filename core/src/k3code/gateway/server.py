@@ -67,6 +67,7 @@ from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 from k3code.prompting import build_system_prompt
+from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact
@@ -1200,6 +1201,7 @@ class GatewayServer:
 
     async def _run_turn_locked(self, session: LiveSession, text: str) -> tuple[str, str]:
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
+        effort_mod.REASONING_EFFORT.set(session.reasoning_effort)  # /effort, read by the providers
         prompt = text
         mgr = self.goal_manager(session)
         while True:
@@ -2476,6 +2478,8 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         return {"ok": True, "key": key, "value": "on" if server.config.display.focus_mode else "off"}
     if key == "model":  # TUI /model <key> and the model picker: switch the session's model key
         return await _config_set_model(server, params)
+    if key == "reasoning":  # TUI /reasoning show|hide|<level>
+        return await _config_set_reasoning(server, params)
     if tui_display.handles(key):  # TUI /theme /indicator /statusbar /battery /pet ...: saved to display.*
         try:
             return tui_display.set_(server.config.display, key, params.get("value"))
@@ -2489,6 +2493,31 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         raise _InvalidParams(f"unknown config path: {key}")
     setattr(section_obj, field_name, params.get("value"))
     return {"ok": True, "key": key}
+
+
+async def _config_set_reasoning(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``config.set reasoning``: ``show``/``hide`` toggles the thinking display (saved); a level sets /effort."""
+    words = [w for w in str(params.get("value") or "").lower().split() if not w.startswith("--")]
+    value = words[0] if words else ""
+    if value in ("show", "on", "hide", "off"):
+        show = value in ("show", "on")
+        server.config.display.show_reasoning = show  # type: ignore[attr-defined]  # DisplayConfig allows extras
+        tui_display._persist("display.show_reasoning", show)
+        return {"ok": True, "key": "reasoning", "value": "show" if show else "hide"}
+    if not value:  # bare /reasoning: report the session's effort
+        session = server._session_for(params.get("session_id"))
+        return {"ok": True, "key": "reasoning", "value": (session and session.reasoning_effort) or "default"}
+    if value not in (*effort_mod.LEVELS, "default"):
+        raise _InvalidParams(f"reasoning: expected show, hide or one of {', '.join(effort_mod.LEVELS)}, default")
+    live = await _mode_session(server, params)
+    live.reasoning_effort = None if value == "default" else value
+    if live.reasoning_effort is None:
+        live.stored.meta.pop("reasoning_effort", None)
+    else:
+        live.stored.meta["reasoning_effort"] = live.reasoning_effort
+    server.store.save(live.stored)
+    live.emit("session.info", live.live_info())
+    return {"ok": True, "key": "reasoning", "value": value}
 
 
 async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

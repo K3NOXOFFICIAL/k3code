@@ -49,3 +49,17 @@ async def test_bad_bool_is_an_error(tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, ["ok"], monkeypatch)
     with pytest.raises(Exception):  # noqa: B017 - the helper raises on a JSON-RPC error reply
         await call(server, "config.set", {"key": "battery", "value": "maybe"})
+
+
+async def test_reasoning_show_hide_and_level(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    r = await call(server, "config.set", {"key": "reasoning", "value": "hide"})
+    assert r["value"] == "hide"
+    assert read_yaml(user_config_path())["display"]["show_reasoning"] is False
+    sid = (await call(server, "session.create", {"cwd": str(tmp_path)}))["session_id"]
+    r = await call(server, "config.set", {"key": "reasoning", "value": "xhigh", "session_id": sid})
+    assert r["value"] == "xhigh"
+    assert server._session_for(sid).reasoning_effort == "xhigh"
+    assert (await call(server, "config.set", {"key": "reasoning", "value": "", "session_id": sid}))["value"] == "xhigh"
+    with pytest.raises(Exception):  # noqa: B017
+        await call(server, "config.set", {"key": "reasoning", "value": "loud", "session_id": sid})

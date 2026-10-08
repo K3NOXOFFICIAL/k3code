@@ -32,5 +32,7 @@ async def test_effort_is_stored_on_the_session_and_reported_in_session_info(tmp_
     assert live.reasoning_effort == "high" and live.live_info()["reasoning_effort"] == "high"
     server.live.pop(sid, None)
     assert server.live_for(server.store.get(sid)).reasoning_effort == "high"  # survives a resume
-    out = await call(server, "command.dispatch", {"name": "effort", "arg": "max", "session_id": sid})
+    out = await call(server, "command.dispatch", {"name": "effort", "arg": "turbo", "session_id": sid})
     assert "Unknown effort" in out["message"]
+    await call(server, "command.dispatch", {"name": "effort", "arg": "default", "session_id": sid})
+    assert server._session_for(sid).reasoning_effort is None
