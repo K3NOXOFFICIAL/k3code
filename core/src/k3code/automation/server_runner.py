@@ -205,7 +205,14 @@ class ServerRunner:
             live.background = True
             session_id = stored.session_id
         else:
-            live = srv.live.get(session_id) or srv.live_for(srv.store.get(session_id))
+            live = srv.live.get(session_id)
+            if live is None:
+                stored = srv.store.get(session_id)
+                if stored is None:  # deleted since the automation was set up: live_for(None) crashed
+                    return RunResult(
+                        status="failed", error=f"session {session_id} no longer exists", failure_kind="other"
+                    )
+                live = srv.live_for(stored)
         mgr = srv.goal_manager(live)
         mgr.set(objective, max_turns=None, check=None)
         srv.emit_goal(live)

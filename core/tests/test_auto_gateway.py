@@ -291,6 +291,16 @@ async def test_automation_shell_probes_bwrap_off_the_event_loop(tmp_path, monkey
     await server.close()
 
 
+async def test_start_goal_on_a_vanished_session_fails_cleanly(tmp_path, monkeypatch):
+    """start_goal with a session id that no longer exists passed None to live_for() and crashed."""
+    from k3code.automation.server_runner import ServerRunner
+
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    res = await ServerRunner(server).start_goal("fix it", "no-such-session", str(tmp_path))
+    assert res.status == "failed" and "no longer exists" in res.error
+    await server.close()
+
+
 async def test_unattended_runs_refuse_to_default_to_the_daemons_home_cwd(tmp_path, monkeypatch):
     """A daemon started in $HOME gave every job without a cwd the whole home directory as its project."""
     from k3code.automation.server_runner import ServerRunner
