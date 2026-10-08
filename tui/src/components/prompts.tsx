@@ -193,6 +193,7 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, onQuestionAnswer,
       setCustom('')
       setTyping(false)
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- keyed on req.answers only: cursor moves must not pull it back
   }, [req.answers])
 
   const heading = (
