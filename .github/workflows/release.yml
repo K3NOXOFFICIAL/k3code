@@ -7,7 +7,25 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: ruff
+        working-directory: core
+        run: uv run ruff check . ../scripts
+      - name: pytest
+        working-directory: core
+        run: uv run pytest -q
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: panes/go.mod
+      - working-directory: panes
+        run: go test ./internal/k3keys/...
+
   build:
+    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -34,8 +52,10 @@ jobs:
       - name: k3 binaries
         run: |
           cd panes
-          for arch in amd64 arm64; do
-            GOOS=linux GOARCH=$arch CGO_ENABLED=0 go build -o "../dist/k3-linux-$arch" ./cmd/k3
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "../dist/k3-$os-$arch" ./cmd/k3
+            done
           done
       - name: checksums
         working-directory: dist

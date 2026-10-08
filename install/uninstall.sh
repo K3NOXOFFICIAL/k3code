@@ -1,5 +1,5 @@
 #!/bin/sh
-# Remove a k3code install: its versions, the k3code/k3 links and the systemd unit.
+# Remove a k3code install: its versions, the private Node and Go, the k3code/k3 links and the systemd unit.
 # Your data (~/.k3code, ~/.config/k3code) is kept unless you pass --purge. uv is shared, so it stays.
 #   sh uninstall.sh [--prefix DIR] [--purge]
 set -eu
@@ -31,12 +31,20 @@ main() {
     esac
     shift
   done
+  case "$PREFIX" in /*) ;; *) PREFIX="$(pwd)/$PREFIX" ;; esac
   DATA="${K3CODE_DATA:-$PREFIX/share/k3code}"
   BIN="${K3_BIN_DIR:-$PREFIX/bin}"
 
-  unit="$HOME/.config/systemd/user/k3code.service"
-  if [ -f "$unit" ] && [ -x "$BIN/k3code" ]; then
-    "$BIN/k3code" service uninstall || echo "could not remove the systemd unit; remove $unit by hand" >&2
+  unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/k3code.service" # where `k3code service install` writes it
+  if [ -f "$unit" ]; then
+    if [ -x "$BIN/k3code" ] && "$BIN/k3code" service uninstall; then
+      :
+    else # k3code is broken or gone: do what `k3code service uninstall` does
+      systemctl --user disable --now k3code.service 2>/dev/null || true
+      rm -f "$unit"
+      systemctl --user daemon-reload 2>/dev/null || true
+    fi
+    if [ -f "$unit" ]; then echo "could not remove the systemd unit; remove $unit by hand" >&2; fi
   fi
   for l in k3code k3; do
     t=$(readlink "$BIN/$l" 2>/dev/null || true)

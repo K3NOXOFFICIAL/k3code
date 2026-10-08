@@ -5,12 +5,19 @@
 #   sh install/install.sh --from-source                 # the checkout this script belongs to
 #   sh install/install.sh --from-git URL --ref REF      # a clone (default: the latest v* tag, else Main)
 #
+# Runs on Linux and macOS (x86_64, arm64). On Windows, run install\install.ps1 from PowerShell: it installs
+# k3code into WSL with this script and adds k3code/k3 commands to Windows.
+#
 # Each run builds the requested version next to the existing ones, switches to it and keeps the version
 # before it for rollback. Layout under PREFIX (default ~/.local):
 #   PREFIX/bin/{k3code,k3}                                  links into share/k3code/current
 #   PREFIX/share/k3code/versions/<ver>/{venv,tui,bin}
 #   PREFIX/share/k3code/current -> versions/<ver>           previous: a file with the name of the version before
-# The installer never runs onboarding; it ends by telling you to run `k3code onboard`.
+# Everything k3code needs is fetched into your home directory, without root: uv (and through it Python),
+# a private Node runtime (PREFIX/share/k3code/node, for the TUI) and a Go toolchain (PREFIX/share/k3code/go,
+# to build the k3 pane binary) when they are not on PATH. bubblewrap is installed through the system package
+# manager only when that works without a password (root or passwordless sudo). --no-install-deps fetches
+# nothing. The installer never runs onboarding; it ends by telling you to run `k3code onboard`.
 # Env (mostly for tests): K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG, K3_NO_DOWNLOAD (= --no-install-deps),
 #   K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv), K3_EDITABLE (--from-source only).
 set -eu
@@ -37,15 +44,15 @@ Source (default: --from-git $DEFAULT_URL):
 Options:
   --prefix DIR          install into DIR/bin and DIR/share/k3code (default: ~/.local)
   --from-bundle FILE    after installing, import a k3code export (settings and sessions)
-  --yes, -y             do not ask (installs uv without asking)
-  --no-install-deps     install nothing (no uv, no Python); fail with the hints instead
+  --yes, -y             accepted for older callers; the installer never asks
+  --no-install-deps     install nothing (no uv, Python, Node, Go); fail or skip with the hints instead
   --check               print the platform and dependency report, change nothing
   --no-activate         build the version without switching to it (used by k3code update)
   --print-version       print the version name on stdout (used by k3code update)
   -h, --help
 
-Optional and never installed by this script: node 18+ with npm (builds the TUI), go (builds the
-k3 pane binary), bubblewrap (sandbox). k3code runs without them.
+Fetched when missing (into PREFIX/share/k3code, no root): uv, Python 3.12+, Node 22 (the TUI), Go (the k3
+pane binary). bubblewrap (sandbox, Linux) is installed only when root or passwordless sudo is available.
 EOF
 }
 
@@ -72,19 +79,18 @@ cleanup() {
 # ---- helpers ---------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
 
-ask() { # ask QUESTION: --yes answers yes; otherwise ask on the terminal
-  if [ "$YES" = 1 ]; then return 0; fi
-  if (: </dev/tty) 2>/dev/null; then
-    printf '%s [y/N] ' "$1" >/dev/tty
-    read -r ans </dev/tty || ans=""
-    case "$ans" in y | Y | yes | YES) return 0 ;; esac
-    return 1
-  fi
-  die "$1 (no terminal to ask on: re-run with --yes, or --no-install-deps)"
+fetch() { # fetch URL FILE
+  if have curl; then curl -fsSL --retry 3 "$1" -o "$2"; else wget -q --tries=3 -O "$2" "$1"; fi
 }
 
-fetch() { # fetch URL FILE
-  if have curl; then curl -fsSL "$1" -o "$2"; else wget -qO "$2" "$1"; fi
+sha256_of() { # sha256_of FILE
+  if have sha256sum; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+can_fetch() { have curl || have wget; }
+
+as_root() { # as_root CMD...: run CMD as root when that needs no password; fails otherwise
+  if [ "$(id -u)" = 0 ]; then "$@"; elif have sudo && sudo -n true 2>/dev/null; then sudo -n "$@"; else return 1; fi
 }
 
 node_major() { "$1" --version 2>/dev/null | sed 's/^v//; s/\..*//'; }
@@ -97,18 +103,26 @@ detect_platform() {
       PLATFORM=Linux
       # shellcheck source=/dev/null
       DISTRO=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-Linux}") || DISTRO=Linux
+      if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then DISTRO="$DISTRO, WSL"; fi
       ;;
     Darwin)
       PLATFORM=macOS
       DISTRO="macOS $(sw_vers -productVersion 2>/dev/null || true)"
       ;;
-    *) die "unsupported OS: $OS_NAME (k3code runs on Linux and macOS; on Windows use WSL)" ;;
+    MINGW* | MSYS* | CYGWIN* | Windows_NT)
+      die "this is a Windows shell ($OS_NAME). k3code runs in WSL on Windows: in PowerShell run install\\install.ps1"
+      ;;
+    *) die "unsupported OS: $OS_NAME (k3code runs on Linux and macOS; on Windows use install\\install.ps1)" ;;
   esac
   ARCH=$(uname -m)
   case "$ARCH" in
     x86_64 | amd64 | aarch64 | arm64) ;;
     *) die "unsupported architecture: $ARCH (x86_64 and arm64/aarch64 are supported)" ;;
   esac
+  case "$ARCH" in x86_64 | amd64) NODE_ARCH=x64 GO_ARCH=amd64 ;; *) NODE_ARCH=arm64 GO_ARCH=arm64 ;; esac
+  case "$PLATFORM" in Linux) NODE_OS=linux GO_OS=linux ;; *) NODE_OS=darwin GO_OS=darwin ;; esac
+  MUSL=0
+  if [ "$PLATFORM" = Linux ] && ls /lib/ld-musl-* >/dev/null 2>&1; then MUSL=1; fi # Alpine: no official Node build
 }
 
 detect_pm() {
@@ -123,6 +137,12 @@ detect_pm() {
 }
 
 hint_cmd() { # hint_cmd NAME: the command that installs NAME here (run it yourself; no root is used)
+  if [ "$PLATFORM" = macOS ]; then
+    case "$1" in
+      git) echo "xcode-select --install" && return 0 ;;
+      curl) echo "curl ships with macOS; check your PATH" && return 0 ;;
+    esac
+  fi
   case "$1:$PM" in
     uv:brew) echo "brew install uv" ;;
     uv:*) echo "curl -LsSf https://astral.sh/uv/install.sh | sh" ;;
@@ -133,7 +153,6 @@ hint_cmd() { # hint_cmd NAME: the command that installs NAME here (run it yourse
     curl:zypper) echo "sudo zypper install -y curl ca-certificates" ;;
     curl:apk) echo "sudo apk add curl ca-certificates" ;;
     curl:*) echo "install curl (or wget) with your system package manager" ;;
-    git:brew) echo "xcode-select --install" ;;
     git:dnf) echo "sudo dnf install -y git" ;;
     git:apt-get) echo "sudo apt-get install -y git" ;;
     git:pacman) echo "sudo pacman -S --needed git" ;;
@@ -232,12 +251,20 @@ report() {
     say "      $(hint_cmd git)"
   fi
   if [ "$NODE_OK" = 1 ]; then item ok "node 18+ with npm"; else
-    item missing "node 18+ with npm" "optional: builds the TUI; without it k3code uses the line REPL"
-    say "      $(hint_cmd node)"
+    if [ "$NO_DEPS" != 1 ] && [ "$MUSL" != 1 ] && can_fetch; then
+      item missing "node 18+ with npm" "a private Node 22 is fetched into $DATA/node for the TUI"
+    else
+      item missing "node 18+ with npm" "optional: builds the TUI; without it k3code uses the line REPL"
+      say "      $(hint_cmd node)"
+    fi
   fi
-  if have go; then item ok "go"; else
-    item missing "go" "optional: builds the k3 pane binary"
-    say "      $(hint_cmd go)"
+  if find_go; then item ok "go" "$GO"; else
+    if [ "$NO_DEPS" != 1 ] && can_fetch; then
+      item missing "go" "a Go toolchain is fetched into $DATA/go to build the k3 pane binary"
+    else
+      item missing "go" "optional: builds the k3 pane binary"
+      say "      $(hint_cmd go)"
+    fi
   fi
   if [ "$PLATFORM" = Linux ]; then
     if have bwrap; then item ok "bubblewrap"; else
@@ -252,13 +279,108 @@ ensure_uv() {
   if find_uv; then return 0; fi
   if [ "$NO_DEPS" = 1 ]; then die "uv is missing and --no-install-deps is set; install it: $(hint_cmd uv)"; fi
   if ! have curl && ! have wget; then die "curl or wget is needed to install uv: $(hint_cmd curl)"; fi
-  log "uv is missing. Installing it into $BIN with its official installer (https://astral.sh/uv/install.sh)."
-  ask "Install uv now?" || die "uv is required: install it with '$(hint_cmd uv)' and re-run this installer"
+  log "uv is missing: installing it into $BIN with its official installer (https://astral.sh/uv/install.sh)"
   tmp=$(mktemp "${TMPDIR:-/tmp}/uv-install.XXXXXX")
   fetch https://astral.sh/uv/install.sh "$tmp"
   UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$BIN" sh "$tmp" >&2 || die "the uv installer failed (output above); install uv yourself: $(hint_cmd uv)"
   rm -f "$tmp"
   find_uv || die "uv installation failed"
+}
+
+find_go() { # sets GO to a go on PATH, else the newest one fetched into DATA/go
+  GO=""
+  if have go; then
+    GO=$(command -v go)
+    return 0
+  fi
+  for g in "$DATA"/go/go*/bin/go; do
+    if [ -x "$g" ]; then GO=$g; fi
+  done
+  [ -n "$GO" ]
+}
+
+ensure_node() { # a private Node 22 LTS in DATA/node/<ver>, checked against nodejs.org's SHASUMS256.txt
+  find_node
+  if [ "$NODE_OK" = 1 ] || [ "$NO_DEPS" = 1 ] || [ "${K3_SKIP_TUI:-0}" = 1 ]; then return 0; fi
+  if [ "$MUSL" = 1 ] || ! can_fetch; then return 0; fi
+  base=https://nodejs.org/dist/latest-v22.x
+  t=$(mktemp -d "${TMPDIR:-/tmp}/k3code-node.XXXXXX")
+  if ! fetch "$base/SHASUMS256.txt" "$t/SHASUMS256.txt"; then
+    log "WARNING: could not reach nodejs.org; the TUI is skipped (k3code uses the line REPL)"
+    rm -rf "$t"
+    return 0
+  fi
+  line=$(grep " node-v[0-9.]*-$NODE_OS-$NODE_ARCH\.tar\.gz\$" "$t/SHASUMS256.txt" | head -n 1)
+  name=${line##* }
+  want=${line%% *}
+  nver=${name%-"$NODE_OS"-*}
+  log "fetching $nver ($NODE_OS-$NODE_ARCH) into $DATA/node for the TUI"
+  if fetch "$base/$name" "$t/$name" && [ "$(sha256_of "$t/$name")" = "$want" ] &&
+    mkdir -p "$DATA/node" && tar -xzf "$t/$name" -C "$t" && rm -rf "${DATA:?}/node/$nver" &&
+    mv "$t/${name%.tar.gz}" "$DATA/node/$nver"; then
+    for d in "$DATA"/node/*; do # keep only this Node
+      if [ "$d" != "$DATA/node/$nver" ]; then rm -rf "$d"; fi
+    done
+  else
+    log "WARNING: the Node download failed or did not match its checksum; the TUI is skipped"
+  fi
+  rm -rf "$t"
+  find_node
+}
+
+ensure_go() { # the Go toolchain panes/go.mod asks for, from the Go module proxy, in DATA/go/go<ver>
+  if [ "${K3_SKIP_GO:-0}" = 1 ] || find_go || [ "$NO_DEPS" = 1 ] || ! can_fetch; then return 0; fi
+  gv=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$SRC_ROOT/panes/go.mod" | head -n 1)
+  [ -n "$gv" ] || return 0
+  name="v0.0.1-go$gv.$GO_OS-$GO_ARCH"
+  t=$(mktemp -d "${TMPDIR:-/tmp}/k3code-go.XXXXXX")
+  log "fetching Go $gv ($GO_OS-$GO_ARCH) into $DATA/go to build the k3 pane binary"
+  if fetch "https://proxy.golang.org/golang.org/toolchain/@v/$name.zip" "$t/go.zip" && unpack_zip "$t/go.zip" "$t"; then
+    mkdir -p "$DATA/go"
+    rm -rf "$DATA/go/go$gv"
+    mv "$t/golang.org/toolchain@$name" "$DATA/go/go$gv"
+    for d in "$DATA"/go/go*; do # keep only this toolchain
+      if [ "$d" != "$DATA/go/go$gv" ]; then rm -rf "$d"; fi
+    done
+  else
+    log "WARNING: the Go download failed; the k3 pane binary is skipped"
+  fi
+  rm -rf "$t"
+  find_go || true
+}
+
+unpack_zip() { # unpack_zip ZIP DIR: unzip, else Python's zipfile (which drops the exec bits: restore them)
+  if have unzip; then
+    unzip -q "$1" -d "$2"
+    return $?
+  fi
+  py=$PY_FOUND
+  if [ -z "$py" ] && [ -x "$VERDIR/venv/bin/python" ]; then py=$VERDIR/venv/bin/python; fi
+  [ -n "$py" ] || return 1
+  "$py" -m zipfile -e "$1" "$2" || return 1
+  for x in "$2"/golang.org/toolchain@*/bin "$2"/golang.org/toolchain@*/pkg/tool; do
+    if [ -d "$x" ]; then chmod -R u+x "$x"; fi
+  done
+}
+
+ensure_bwrap() { # Linux sandbox: only through the package manager, and only when that needs no password
+  if [ "$PLATFORM" != Linux ] || have bwrap || [ "$NO_DEPS" = 1 ] || [ -z "$PM" ] || [ "$PM" = brew ]; then return 0; fi
+  if ! as_root true 2>/dev/null; then
+    log "bubblewrap (the sandbox for unattended runs) needs root to install: $(hint_cmd bwrap)"
+    return 0
+  fi
+  log "installing bubblewrap with $PM (the sandbox for unattended runs)"
+  case "$PM" in
+    dnf) as_root dnf install -y bubblewrap >&2 ;;
+    apt-get) # a fresh image has no package index yet
+      as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y bubblewrap >&2 ||
+        { as_root apt-get update -q >&2 && as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y bubblewrap >&2; }
+      ;;
+    pacman) as_root pacman -S --needed --noconfirm bubblewrap >&2 ;;
+    zypper) as_root zypper --non-interactive install bubblewrap >&2 ;;
+    apk) as_root apk add bubblewrap >&2 ;;
+  esac || log "WARNING: bubblewrap did not install; k3code runs unattended commands without the sandbox"
+  return 0
 }
 
 default_ref() { # latest v* tag on the remote, else Main
@@ -284,6 +406,13 @@ acquire_source() {
     fi
     SOURCE_PATH=$SRC_ROOT
     SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD 2>/dev/null || true)
+    # Uncommitted edits get their own version (a checksum of the changes), so they are not hidden by the
+    # build of the clean HEAD.
+    if [ -n "$SHA" ] && [ -n "$(git -C "$SRC_ROOT" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+      dirty=$( (git -C "$SRC_ROOT" diff HEAD && git -C "$SRC_ROOT" ls-files --others --exclude-standard |
+        while IFS= read -r f; do cat "$SRC_ROOT/$f"; done) 2>/dev/null | cksum | cut -d' ' -f1)
+      SHA="$SHA.dirty$dirty"
+    fi
   else
     [ -n "$GIT_URL" ] || GIT_URL=$DEFAULT_URL
     [ -n "$REF" ] || REF=$(default_ref)
@@ -334,14 +463,19 @@ build_tui() {
 
 build_panes() {
   if [ "${K3_SKIP_GO:-0}" = 1 ]; then return 0; fi
-  if ! have go; then
+  if ! find_go; then
     log "k3 pane binary skipped: go not found (optional)"
     return 0
   fi
   log "building the k3 pane binary"
-  if ! (cd "$SRC_ROOT/panes" && CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
+  case "$GO" in
+    "$DATA"/*) set -- env GOPATH="$DATA/go/path" GOFLAGS=-modcacherw GOTOOLCHAIN=local ;; # keep ~/go untouched
+    *) set -- env ;;
+  esac
+  if ! (cd "$SRC_ROOT/panes" && "$@" CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
     log "WARNING: the k3 pane binary did not build (output above); the multi-window binary is missing"
   fi
+  if [ -d "$DATA/go/path" ]; then rm -rf "$DATA/go/path"; fi # the module cache is only needed during the build
   return 0
 }
 
@@ -449,7 +583,7 @@ import_bundle() {
 main() {
   export GIT_TERMINAL_PROMPT=0
   FROM="" GIT_URL="" REF="" CHANNEL=stable WANT_VERSION="" PREFIX="$HOME/.local" BUNDLE=""
-  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0
+  NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0
   if [ "${K3_NO_DOWNLOAD:-0}" = 1 ]; then NO_DEPS=1; fi
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -491,7 +625,7 @@ main() {
         BUNDLE=$2
         shift
         ;;
-      --yes | -y) YES=1 ;;
+      --yes | -y) ;; # older callers; nothing is asked any more
       --no-install-deps) NO_DEPS=1 ;;
       --check) CHECK=1 ;;
       --no-activate) ACTIVATE=0 ;;
@@ -512,8 +646,11 @@ main() {
   if [ "${K3_EDITABLE:-0}" = 1 ] && [ "$FROM" = git ]; then
     die "K3_EDITABLE=1 needs --from-source (a --from-git build comes from a temporary clone)"
   fi
+  case "$PREFIX" in /*) ;; *) PREFIX="$(pwd)/$PREFIX" ;; esac # links must not be relative to the cwd
   DATA="${K3CODE_DATA:-$PREFIX/share/k3code}"
   BIN="${K3_BIN_DIR:-$PREFIX/bin}"
+  case "$DATA" in /*) ;; *) DATA="$(pwd)/$DATA" ;; esac
+  case "$BIN" in /*) ;; *) BIN="$(pwd)/$BIN" ;; esac
   trap cleanup EXIT
   trap 'exit 1' INT TERM
   detect_platform
@@ -532,7 +669,12 @@ main() {
   if [ -z "$PY_FOUND" ] && [ "$NO_DEPS" != 1 ]; then
     log "no Python 3.12+ here: uv will download a managed one (kept in uv's own data directory)"
   fi
+  ensure_bwrap
   acquire_source
+  if [ ! -f "$VERDIR/.complete" ]; then
+    ensure_node
+    ensure_go
+  fi
   install_version
   if [ "$ACTIVATE" = 1 ]; then activate; fi
   if [ "$PRINT_VERSION" = 1 ]; then
@@ -543,7 +685,13 @@ main() {
   if [ -n "$BUNDLE" ]; then import_bundle; fi
   case ":$PATH:" in
     *":$BIN:"*) ;;
-    *) say "Add $BIN to your PATH:  export PATH=\"$BIN:\$PATH\"   (in ~/.bashrc or ~/.zshrc)" ;;
+    *)
+      case "${SHELL:-}" in
+        */zsh) say "Add $BIN to your PATH:  echo 'export PATH=\"$BIN:\$PATH\"' >>~/.zshrc" ;;
+        */fish) say "Add $BIN to your PATH:  fish_add_path $BIN" ;;
+        *) say "Add $BIN to your PATH:  echo 'export PATH=\"$BIN:\$PATH\"' >>~/.bashrc" ;;
+      esac
+      ;;
   esac
   if [ "$DATA" != "$HOME/.local/share/k3code" ]; then
     say "For a non-default prefix, 'k3code update' needs:  export K3CODE_DATA=\"$DATA\""
