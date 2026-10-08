@@ -381,7 +381,8 @@ def build_config(data: dict[str, Any]) -> dict[str, Any]:
     if integ.get("mem0_url"):
         cfg["mem0"] = {"url": integ["mem0_url"]}
     if integ.get("searxng_url"):
-        cfg["searxng"] = {"url": integ["searxng_url"]}
+        # research.searxng_url is the key the research tools read (a top-level "searxng" was silently dropped)
+        cfg["research"] = {"searxng_url": integ["searxng_url"]}
     return cfg
 
 
@@ -405,7 +406,7 @@ OWNS: dict[str, tuple[str, ...]] = {
     "providers": ("providers",),
     "tiers": ("providers", "tiers"),
     "permissions": ("permission_mode", "permissions"),
-    "integrations": ("mcp", "skills", "mem0", "searxng"),
+    "integrations": ("mcp", "skills", "mem0", "research"),
     "theme": ("display", "panes"),
 }
 
@@ -440,6 +441,17 @@ def write_config(data: dict[str, Any], only: str | None = None) -> Path:
             cfg.pop("providers")
         merged = existing
     merged = {**merged, **cfg}
+    if only in (None, "integrations") and "integrations" in data:
+        # the integrations answer owns searxng_url only: the user's other research.* keys (max_subquestions, ...)
+        # survive a re-run, and a blank answer clears the URL. The legacy top-level searxng key is migrated away.
+        research = {k: v for k, v in dict(existing.get("research") or {}).items() if k != "searxng_url"}
+        if url := (data.get("integrations") or {}).get("searxng_url"):
+            research["searxng_url"] = url
+        merged.pop("searxng", None)
+        if research:
+            merged["research"] = research
+        else:
+            merged.pop("research", None)
     confio.validate(merged)
     confio.write_yaml(path, merged)
     return path

@@ -72,6 +72,8 @@ from k3code.redact import redact, scrub_text
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
 from k3code.reliability.persistent_retry import TurnCancelled
+from k3code.research.browser import BrowserManager
+from k3code.research.fetch import WebFetcher
 from k3code.research.flow import Research
 from k3code.research.tools import register_web_tools
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
@@ -324,6 +326,9 @@ class GatewayServer:
         self.commands: CommandRegistry = build_commands()
         self.live: dict[str, LiveSession] = {}
         self.mcp = McpManager(self.config.mcp.servers)
+        # one pooled client, cache and rate budget per gateway, shared by every session's web tools
+        self.web_fetcher = WebFetcher.from_config(self.config.research)
+        self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
         self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
         self.providers: list[Any] = []
         self.router: Router | None = None
@@ -882,6 +887,8 @@ class GatewayServer:
         self.stopping = True
         if self.automation is not None:
             await self.automation.stop()
+        await self.web_fetcher.aclose()
+        await self.browser.close()
         cancelled = []
         for live in self.live.values():
             if live.turn_task is not None and not live.turn_task.done():
@@ -1302,7 +1309,7 @@ class GatewayServer:
         for install in session.extra_tools:
             install(loop.tools)
         register_task_tools(loop.tools, self, session, depth=1)
-        register_web_tools(loop.tools, self.config)
+        register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher, mcp=self.mcp, browser=self.browser)
         return loop
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
@@ -2695,6 +2702,15 @@ async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[
     return {"items": items}
 
 
+async def _browser_manage(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Inspect, attach to the configured ``browser.cdp_url``, or drop the browser the browser tools use."""
+    action = str(params.get("action") or "status").strip().lower()
+    if action not in ("status", "connect", "disconnect"):
+        raise _InvalidParams(f"browser.manage action must be status, connect or disconnect, not {action!r}")
+    url = params.get("url")
+    return await server.browser.manage(action, url=str(url) if url else None)
+
+
 _HANDLERS: dict[str, Any] = {
     "session.create": _session_create,
     "session.list": _session_list,
@@ -2738,6 +2754,7 @@ _HANDLERS: dict[str, Any] = {
     "config.set": _config_set,
     "setup.status": _setup_status,
     "system.battery": _system_battery,
+    "browser.manage": _browser_manage,
 }
 
 _HANDLERS["session.branch_stored"] = _session_resume  # M1: fork == resume the source

@@ -126,7 +126,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 |--------|-------|
 | `display.status` / `display.thumbnail` / `display.start` / `display.stop` / `display.observe` / `display.install` | Desktop display |
 | `display.lease.acquire` / `display.lease.release` | Display lease |
-| `browser.manage` | CDP browser |
+| `browser.manage` | CDP browser. k3code: `_browser_manage` in `core/src/k3code/gateway/server.py`; attaches only to `browser.cdp_url` (off by default) |
 | `preview.open` / `preview.close` / `preview.act` / `preview.read` | Desktop preview |
 | `layout.apply` / `pane.reveal` / `tour` / `window.read` / `terminal.read` | Desktop layout |
 

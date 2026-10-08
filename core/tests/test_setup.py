@@ -257,3 +257,35 @@ def test_hub_bearer_is_read_when_connecting(env: Path, monkeypatch: pytest.Monke
     assert request_headers(cfg) == {"Authorization": f"Bearer {_FAKE_HUB_KEY}"}
     monkeypatch.delenv("K3NOX_KEY")
     assert request_headers(cfg) == {}  # unset: no header, and never the literal variable name
+def test_wizard_searxng_answer_reaches_the_research_setting(env: Path) -> None:
+    """The integrations answer used to land under a top-level ``searxng`` key that Settings dropped."""
+    from k3code import confio
+    from k3code.config import load_config
+    from k3code.paths import user_config_path
+
+    run_setup(AnswerPrompter({**ANSWERS, "integrations": {**ANSWERS["integrations"], "searxng_url": "http://searx.test"}}),
+              do_probe=False)
+    assert "searxng" not in confio.read_yaml(user_config_path())
+    assert load_config().research["searxng_url"] == "http://searx.test"
+
+    # a re-run of only the integrations step keeps the user's other research keys and can clear the URL
+    confio.write_yaml(user_config_path(), {**confio.read_yaml(user_config_path()),
+                                           "research": {"searxng_url": "http://searx.test", "max_subquestions": 3}})
+    run_setup(AnswerPrompter({**ANSWERS, "integrations": {**ANSWERS["integrations"], "searxng_url": "http://new.test"}}),
+              only_step="integrations", do_probe=False)
+    assert load_config().research == {"searxng_url": "http://new.test", "max_subquestions": 3}
+    run_setup(AnswerPrompter({**ANSWERS, "integrations": {**ANSWERS["integrations"], "searxng_url": ""}}),
+              only_step="integrations", do_probe=False)
+    assert load_config().research == {"max_subquestions": 3}
+
+
+def test_legacy_top_level_searxng_key_is_lifted_on_load(env: Path) -> None:
+    from k3code import confio
+    from k3code.config import load_config
+    from k3code.paths import user_config_path
+
+    confio.write_yaml(user_config_path(), {"searxng": {"url": "http://old.test"}})
+    assert load_config().research["searxng_url"] == "http://old.test"
+    confio.write_yaml(user_config_path(), {"searxng": {"url": "http://old.test"},
+                                           "research": {"searxng_url": "http://new.test"}})
+    assert load_config().research["searxng_url"] == "http://new.test"
