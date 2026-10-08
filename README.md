@@ -45,21 +45,39 @@ k3code plans before it acts, can run several agents in parallel, retries through
 
 ### Requirements
 
-- Linux on x86_64 is the tested platform: a clean install was tested in a Fedora 44 container. The installer also accepts macOS and aarch64 (arm64); those are untested.
+- **Linux** on x86_64 is the tested platform: a clean install was tested in a Fedora 44 container. aarch64 (arm64) is accepted but untested.
+- **macOS** (Intel and Apple silicon) uses the same installer. It is untested; the 24/7 service and the bubblewrap sandbox are Linux-only.
+- **Windows** runs k3code inside [WSL 2](https://learn.microsoft.com/windows/wsl/install) with a Linux distribution such as Ubuntu. `install\install.ps1` drives the Linux installer in WSL and adds `k3code` and `k3` commands to Windows. Native Windows, Git Bash and Cygwin are not supported. Untested on a real Windows machine so far.
 - `git` (for the default `--from-git` install), `curl` or `wget`, and a POSIX shell. Network access is needed during install.
 - [`uv`](https://docs.astral.sh/uv/) is required and manages Python ≥ 3.12. If `uv` is missing, the installer asks before installing it into your home directory (`--yes` answers yes). The installer needs no root.
 - Optional: `bubblewrap` (`bwrap`) to sandbox unattended runs, `systemd --user` for the 24/7 service, Node 18+ with npm (builds the TUI; without it k3code uses the line REPL), and Go (builds the `k3` binary). The installer never installs Node or Go.
 
 ### Install
 
-The repository is private, so authenticate once with `gh auth login` and `gh auth setup-git`. Then:
+The repository is private, so authenticate once with `gh auth login` and `gh auth setup-git` (on Windows, do this inside WSL, where the install runs).
+
+**Linux and macOS**
 
 ```sh
 git clone https://github.com/K3NOXOFFICIAL/k3code.git && cd k3code
 sh install/install.sh          # the latest v* tag, or Main until a tag exists
 ```
 
-To install from the checkout you already have, use `sh install/install.sh --from-source`.
+On macOS, `xcode-select --install` provides `git`; `brew install uv node go` covers the rest if you use Homebrew (the installer offers to install `uv` itself).
+
+**Windows** (PowerShell, from a clone on Windows)
+
+```powershell
+wsl --install -d Ubuntu        # once, if WSL has no distribution yet; restart, open Ubuntu, create your user
+git clone https://github.com/K3NOXOFFICIAL/k3code.git; cd k3code
+powershell -ExecutionPolicy Bypass -File install\install.ps1
+```
+
+`install.ps1` runs `install/install.sh` in your default WSL distribution (`-Distro NAME` picks another), so the install lives in WSL under `~/.local/share/k3code/`. It then writes `k3code.cmd` and `k3.cmd` to `%LOCALAPPDATA%\k3code\bin` and adds that folder to your user `PATH` (`-NoModifyPath` skips that). Open a new terminal and `k3code` starts in WSL, in the folder you ran it from. Every other argument goes to `install.sh` unchanged, so `--from-source`, `--ref`, `--yes` and `--check` work as below. Building from a checkout on the Windows drive is slow; cloning inside WSL and running `sh install/install.sh` there works too, but then you get no Windows commands. Uninstall with `install\uninstall.ps1` (`-Purge` also deletes your k3code data in WSL).
+
+**All platforms**
+
+To install from the checkout you already have, use `sh install/install.sh --from-source` (on Windows: `install\install.ps1 --from-source`).
 
 The installer creates a versioned install under `~/.local/share/k3code/` and links `k3code` into `~/.local/bin/` (put that on your `PATH`), and links `k3` too when Go was available to build it. It never runs onboarding; it ends by telling you to run `k3code onboard`. Re-running it upgrades in place and keeps the previous version for rollback.
 
@@ -266,7 +284,7 @@ Tip: keep at least one chain entry that does not go through a self-hosted gatewa
 | [`core/`](core) | The Python core (`k3code`): gateway, agent loop, tools, router, reliability, autonomy, automation, learning, setup. A `uv` project. |
 | [`tui/`](tui) | The terminal UI (TypeScript, Ink): a modified fork of the Hermes Agent TUI. |
 | [`panes/`](panes) | `k3`, the multi-window terminal: a TUIOS fork (Go) plus the `internal/k3keys` keymap. |
-| [`install/`](install) | `install.sh`, `uninstall.sh`, the systemd unit, a sample answers file. |
+| [`install/`](install) | `install.sh`, `uninstall.sh` (Linux, macOS, WSL), `install.ps1`, `uninstall.ps1` (Windows, via WSL), the systemd unit, a sample answers file. |
 | [`scripts/`](scripts) | `dev/` (build-worker driver and task specs), `chaos/` (failure-injection tests), `exit/` (exit-criteria runner), vendor and upstream-sync tools. |
 | [`docs/`](docs) | [`PLAN.md`](docs/PLAN.md) (roadmap), [`tui-contract.md`](docs/tui-contract.md) (core ↔ TUI protocol), [`reports/`](docs/reports) (one report per milestone and merge). |
 | [`VENDOR.toml`](VENDOR.toml) | Ledger of every file or tree taken from another project: origin, commit, license, whether modified. |
@@ -326,7 +344,7 @@ What is not verified yet:
 
 - **Live models.** Many scripted checks use a scripted fake provider. The live-model rows ran through the `claude-cli` provider (a local Claude Code login), not through a gateway.
 - **Long unattended runs.** A 30-minute daemon soak passed. The 72-hour soak is pending.
-- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container.
+- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. CI runs the installer tests on macOS; Windows (`install.ps1` via WSL) is tested only against a stand-in for `wsl.exe` on Linux.
 - **Updates.** There is no release yet, so the update and rollback path has only been tested against local version directories.
 
 | | Milestone | Built | Verified so far |

@@ -16,7 +16,7 @@ The first version meant for people other than its author. It is alpha: the core 
 - **Autonomy.** Task scope classification, a planning turn for larger tasks, fan-out of independent parts into git worktrees with review and tests, `/goal`, `/loop`, `/ultracode` and `/ultraresearch`.
 - **Automation.** Cron schedules and file, git, webhook, session, network and idle triggers, run by the daemon.
 - **Learning.** A decision log, permission-rule suggestions, proposals, project preparation, and proposed changes to its own configuration, which can be A/B tested.
-- **Setup and operations.** An installer, guided and resumable setup, `k3code doctor`, export and import bundles with secrets redacted, and an update command with rollback.
+- **Setup and operations.** An installer for Linux and macOS, `install.ps1` for Windows (installs into WSL and adds `k3code` and `k3` commands to Windows), guided and resumable setup, `k3code doctor`, export and import bundles with secrets redacted, and an update command with rollback.
 - **`k3`.** A multi-window terminal (a TUIOS fork) that shows agent states and pending approvals in its inbox.
 
 ### Not yet
@@ -25,7 +25,7 @@ The first version meant for people other than its author. It is alpha: the core 
 - The 72-hour daemon soak. A 30-minute soak passed.
 - Automatic resumption of interrupted turns in the daemon. `k3code doctor` flags unresolved journal entries.
 - `/artifacts publish`. It reports that publishing is not implemented.
-- Platforms other than Linux on x86_64. macOS is untested.
+- Platforms other than Linux on x86_64. macOS and Windows (through WSL) are untested on real machines.
 - The update path against published releases. There are none yet, so the update and rollback path was only tested against local version directories.
 
 ### Changed before publication

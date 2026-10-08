@@ -5,6 +5,9 @@
 #   sh install/install.sh --from-source                 # the checkout this script belongs to
 #   sh install/install.sh --from-git URL --ref REF      # a clone (default: the latest v* tag, else Main)
 #
+# Runs on Linux and macOS (x86_64, arm64). On Windows, run install\install.ps1 from PowerShell: it installs
+# k3code into WSL with this script and adds k3code/k3 commands to Windows.
+#
 # Each run builds the requested version next to the existing ones, switches to it and keeps the version
 # before it for rollback. Layout under PREFIX (default ~/.local):
 #   PREFIX/bin/{k3code,k3}                                  links into share/k3code/current
@@ -97,12 +100,16 @@ detect_platform() {
       PLATFORM=Linux
       # shellcheck source=/dev/null
       DISTRO=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-Linux}") || DISTRO=Linux
+      if grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then DISTRO="$DISTRO, WSL"; fi
       ;;
     Darwin)
       PLATFORM=macOS
       DISTRO="macOS $(sw_vers -productVersion 2>/dev/null || true)"
       ;;
-    *) die "unsupported OS: $OS_NAME (k3code runs on Linux and macOS; on Windows use WSL)" ;;
+    MINGW* | MSYS* | CYGWIN* | Windows_NT)
+      die "this is a Windows shell ($OS_NAME). k3code runs in WSL on Windows: in PowerShell run install\\install.ps1"
+      ;;
+    *) die "unsupported OS: $OS_NAME (k3code runs on Linux and macOS; on Windows use install\\install.ps1)" ;;
   esac
   ARCH=$(uname -m)
   case "$ARCH" in
@@ -123,6 +130,12 @@ detect_pm() {
 }
 
 hint_cmd() { # hint_cmd NAME: the command that installs NAME here (run it yourself; no root is used)
+  if [ "$PLATFORM" = macOS ]; then
+    case "$1" in
+      git) echo "xcode-select --install" && return 0 ;;
+      curl) echo "curl ships with macOS; check your PATH" && return 0 ;;
+    esac
+  fi
   case "$1:$PM" in
     uv:brew) echo "brew install uv" ;;
     uv:*) echo "curl -LsSf https://astral.sh/uv/install.sh | sh" ;;
@@ -133,7 +146,6 @@ hint_cmd() { # hint_cmd NAME: the command that installs NAME here (run it yourse
     curl:zypper) echo "sudo zypper install -y curl ca-certificates" ;;
     curl:apk) echo "sudo apk add curl ca-certificates" ;;
     curl:*) echo "install curl (or wget) with your system package manager" ;;
-    git:brew) echo "xcode-select --install" ;;
     git:dnf) echo "sudo dnf install -y git" ;;
     git:apt-get) echo "sudo apt-get install -y git" ;;
     git:pacman) echo "sudo pacman -S --needed git" ;;
@@ -543,7 +555,13 @@ main() {
   if [ -n "$BUNDLE" ]; then import_bundle; fi
   case ":$PATH:" in
     *":$BIN:"*) ;;
-    *) say "Add $BIN to your PATH:  export PATH=\"$BIN:\$PATH\"   (in ~/.bashrc or ~/.zshrc)" ;;
+    *)
+      case "${SHELL:-}" in
+        */zsh) say "Add $BIN to your PATH:  echo 'export PATH=\"$BIN:\$PATH\"' >>~/.zshrc" ;;
+        */fish) say "Add $BIN to your PATH:  fish_add_path $BIN" ;;
+        *) say "Add $BIN to your PATH:  echo 'export PATH=\"$BIN:\$PATH\"' >>~/.bashrc" ;;
+      esac
+      ;;
   esac
   if [ "$DATA" != "$HOME/.local/share/k3code" ]; then
     say "For a non-default prefix, 'k3code update' needs:  export K3CODE_DATA=\"$DATA\""

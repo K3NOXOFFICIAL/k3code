@@ -1,2 +1,4 @@
 panes/internal/vt/testdata/** binary
 *.bin binary
+# install.sh runs in WSL from a Windows checkout: keep LF even with core.autocrlf=true
+*.sh text eol=lf
