@@ -95,7 +95,7 @@ k3code doctor     # health checks with fix hints
 k3code            # start the TUI
 ```
 
-A plain interactive start with no provider configured asks once, "fast or full setup?", and does not ask again (the answer is kept in `$K3CODE_HOME/onboarding.json`). Fast asks only for an API endpoint and key (or the `claude-cli` provider). Full runs the whole setup wizard. Nothing is forced: `k3code onboard` works at any time, and a headless `-p` or piped run without a provider prints one hint and exits with code 78 instead of prompting.
+A plain interactive start with no provider configured asks once, "fast or full setup?", and does not ask again (the answer is kept in `$K3CODE_HOME/onboarding.json`). Fast asks only for an API endpoint and key (or the `claude-cli` provider); run over an existing config, it puts that provider first and keeps your other providers behind it as fallbacks. Full runs the whole setup wizard. Nothing is forced: `k3code onboard` works at any time, and a headless `-p` or piped run without a provider prints one hint and exits with code 78 instead of prompting.
 
 The full wizard has 12 steps: `welcome`, `about`, `system`, `usage`, `providers`, `tiers`, `permissions`, `integrations`, `theme`, `service`, `tour`, `summary`. It asks about you, your system, what you mainly use k3code for, your provider chain, model tiers, permissions, optional integrations (MCP, mem0, skills), the theme, and whether to install the 24/7 service. When asked for a provider key, the input is hidden and the key is saved in `~/.config/k3code/env` (mode 0600); the config only names the variable. Run one step again with `k3code setup --step NAME`.
 
