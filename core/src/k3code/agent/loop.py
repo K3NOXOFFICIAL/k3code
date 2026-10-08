@@ -16,7 +16,7 @@ from k3code.providers.types import Message, StreamEvent, ToolCall
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
-from k3code.tools import build_registry, clip_tool_results
+from k3code.tools import MAX_TOOL_RESULT_CHARS, build_registry, clip_tool_results
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,11 @@ class AgentLoop:
         unattended_network: bool = False,
         task_kind: str = "interactive_turn",
         max_tool_errors: int = 0,
+        tool_output_chars: int | None = None,
     ) -> None:
         self.router = router
+        #: M1: how much of one tool result the model is sent (the transcript keeps all of it); None = the default
+        self.tool_output_chars = tool_output_chars
         #: M4a: what this loop is for (routes to a tier; tagged on usage rows).
         self.task_kind = task_kind
         #: Stop the loop once this many tool calls in a row failed (0 = never); see escalation_reason.
@@ -209,7 +212,7 @@ class AgentLoop:
             # long tool results; ``messages`` (transcript, session, gateway) keeps every full result.
             stream = self.reliability.stream(
                 self.router,
-                clip_tool_results(messages),
+                clip_tool_results(messages, self.tool_output_chars or MAX_TOOL_RESULT_CHARS),
                 self.tool_specs(),
                 model=model,
                 max_tokens=max_tokens,

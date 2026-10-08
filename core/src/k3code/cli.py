@@ -598,7 +598,7 @@ def doctor_cmd(as_json: bool, no_probe: bool, install_subset: bool) -> None:
 
 
 @cli.command("stats")
-@click.option("--by", type=click.Choice(["day", "session"]), default="day")
+@click.option("--by", type=click.Choice(["day", "session", "turn"]), default="day")
 @click.option("--days", type=int, default=None, help="Only the last N days")
 @click.option("--json", "as_json", is_flag=True)
 def stats_cmd(by: str, days: int | None, as_json: bool) -> None:

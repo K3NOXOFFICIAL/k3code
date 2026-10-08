@@ -40,12 +40,15 @@ class ModelCaller:
         usage: Any,
         emit: Callable[[str, dict[str, Any]], None] | None = None,
         last_attempt: Callable[[], tuple[str, str]] | None = None,
+        turn_of: Callable[[str], str] | None = None,
     ) -> None:
         self._routers = routers
         self.config = config
         self.usage = usage
         self.emit = emit
         self._last_attempt = last_attempt
+        #: session id -> the turn id in flight, so side calls (titles, compaction, judges) join that turn's totals
+        self._turn_of = turn_of
 
     async def complete(
         self,
@@ -69,18 +72,23 @@ class ModelCaller:
                 nxt = next_tier(tier) if escalate else None
                 if nxt is None:
                     raise
-                self.note_escalation(kind, tier, nxt, f"chain exhausted: {exc}", session_id)
+                # every provider of this tier was unreachable: an outage, not a sign the tier is too weak
+                self.note_escalation(kind, tier, nxt, f"chain exhausted: {exc}", session_id, cause="outage")
                 tier = nxt
 
-    def note_escalation(self, kind: TaskKind, old: Tier, new: Tier, reason: str, session_id: str = "") -> None:
-        logger.info("routing.escalated %s: %s -> %s (%s)", kind.value, old.value, new.value, reason)
+    def note_escalation(self, kind: TaskKind, old: Tier, new: Tier, reason: str, session_id: str = "", *,
+                        cause: str = "quality") -> None:
+        """Record a move up the ladder. ``cause``: "quality" (the attempt stalled; counts toward the optimizer's
+        escalation rate) or "outage" (the tier's providers were unreachable; not read as quality)."""
+        logger.info("routing.escalated %s: %s -> %s (%s, %s)", kind.value, old.value, new.value, cause, reason)
         if self.usage is not None:
-            self.usage.record("escalated", session=session_id, tier=new.value, task_kind=kind.value,
-                              detail=f"{old.value}->{new.value}: {reason}")
+            self.usage.record("outage" if cause == "outage" else "escalated", session=session_id, tier=new.value,
+                              task_kind=kind.value, detail=f"{old.value}->{new.value}: {reason}",
+                              turn=self._turn_of(session_id) if self._turn_of else "")
         if self.emit is not None:
             self.emit(
                 "routing.escalated",
-                {"task_kind": kind.value, "from": old.value, "to": new.value, "reason": reason,
+                {"task_kind": kind.value, "from": old.value, "to": new.value, "reason": reason, "cause": cause,
                  "session_id": session_id},
             )
 
@@ -105,5 +113,6 @@ class ModelCaller:
             self.usage.record(
                 "call", session=session_id, provider=provider, model=model, tokens_in=pt, tokens_out=ct,
                 cost_usd=usage.cost_usd if usage else None, tier=tier.value, task_kind=kind.value,
+                turn=self._turn_of(session_id) if self._turn_of else "",
             )
         return CallResult(final.content or "", tier, model, provider, pt, ct)

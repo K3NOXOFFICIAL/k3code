@@ -25,6 +25,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
@@ -161,6 +162,8 @@ class LiveSession:
         #: M4a: tier and task kind of the call in flight (for usage rows); /scope override for the next task.
         self.last_tier = "main"
         self.current_kind = "interactive_turn"
+        #: M1: id of the turn in flight (usage rows carry it, so per-turn totals add up); "" between turns.
+        self.turn_id = ""
         self.scope_override: str | None = None
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
@@ -253,7 +256,7 @@ class LiveSession:
 
 
 #: Conversation size at which a session's older messages are folded into a summary, and how many recent ones stay.
-CONTEXT_DEFAULTS: dict[str, Any] = {"compact_at_tokens": 80_000, "keep_messages": 8}
+CONTEXT_DEFAULTS: dict[str, Any] = {"compact_at_tokens": 80_000, "keep_messages": 8, "compact_input_chars": 60_000}
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -320,6 +323,8 @@ class GatewayServer:
         store: SessionStore | None = None,
     ) -> None:
         self.config = config or load_config(project_dir=Path.cwd())
+        #: config keys the files held at the last read (apply_file_config resets the ones that have since gone)
+        self._file_keys: set[str] = _file_keys(Path.cwd())
         self.store = store or SessionStore(self._home() / "sessions.db")
         self._stdin = stdin
         self._stdout = stdout
@@ -372,6 +377,7 @@ class GatewayServer:
             self.usage,
             emit=lambda t, p: self.emit(t, p),
             last_attempt=lambda: self.last_attempt,
+            turn_of=self._turn_of,
         )
         self.autonomy = PlanFirst(self)
         self.learning = LearningHub(self, self.autonomy.proposals)
@@ -1302,6 +1308,7 @@ class GatewayServer:
             unattended_network=bool(autonomy_cfg(self.config)["unattended_network"]),
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
+            tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
@@ -1318,6 +1325,7 @@ class GatewayServer:
             return "halted", ""
         self._ensure_router(session.stored.model or None)
         assert self.router is not None
+        session.turn_id = uuid.uuid4().hex[:12]
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
@@ -1420,13 +1428,15 @@ class GatewayServer:
                     history=history,
                 ):
                     self._on_stream_event(session, event)
-                new_tier = escalation.record(loop.escalation_reason) if cheap_start and loop.escalation_reason else None
+                attempt_reason = loop.escalation_reason or ""
+                if "loop_guard" in attempt_reason:  # counted on every tier, not only when a cheap start escalates
+                    self.usage.record("loop_guard", session=session.session_id, detail=attempt_reason,
+                                      tier=tier.value, task_kind=kind.value, turn=session.turn_id)
+                new_tier = escalation.record(attempt_reason) if cheap_start and attempt_reason else None
                 if new_tier is None or loop.interrupted:
                     break
                 # The attempt stalled on a cheap tier: continue the same task one tier up.
-                reason = loop.escalation_reason or "unknown"
-                if "loop_guard" in reason:
-                    self.usage.record("loop_guard", session=session.session_id, detail=reason)
+                reason = attempt_reason or "unknown"
                 self.model_caller.note_escalation(kind, tier, new_tier, reason, session.session_id)
                 tier = new_tier
                 session.needs_input = False
@@ -1470,10 +1480,15 @@ class GatewayServer:
             # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
             # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
             self._persist_turn(session, loop)
+            self.learning.record_turn_replay(session, list(loop.turn_messages), status, tier.value, kind.value,
+                                             session.turn_id, history_len=len(history))
             if session.paused:  # a cancelled wait never saw "resumed"
                 session.paused = False
                 session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")
-            self.autonomy.finish(session, gate, status, final_text, text)
+            # a provider outage is not a correctness failure: the scope log keeps it apart from "error"
+            scope_outcome = "outage" if isinstance(session.last_exc, (AllProvidersUnreachable, ChainExhausted)) \
+                and status == "error" else status
+            self.autonomy.finish(session, gate, scope_outcome, final_text, text)
             if self.learning.enabled:
                 self.learning.spawn(self.learning.turn_finished(session, status))
 
@@ -1543,7 +1558,8 @@ class GatewayServer:
             return 0
         try:
             new, folded = await compact_messages(
-                self.model_caller, list(messages), keep=int(cfg["keep_messages"]), session_id=session.session_id
+                self.model_caller, list(messages), keep=int(cfg["keep_messages"]), session_id=session.session_id,
+                max_input_chars=int(cfg["compact_input_chars"]),
             )
         except Exception:  # noqa: BLE001 - e.g. every provider rate-limited: the turn proceeds with the long history
             logger.warning("automatic compaction failed", exc_info=True)
@@ -1602,6 +1618,7 @@ class GatewayServer:
                     cost_usd=u.cost_usd if u else None,
                     tier=session.last_tier,
                     task_kind=session.current_kind,
+                    turn=session.turn_id,
                 )
                 if u:
                     session.emit("session.usage", {"usage": _usage_payload(u)})
@@ -1696,19 +1713,25 @@ class GatewayServer:
         """Ask the client a multiple-choice question (``clarify`` server request)."""
         return await self._ask_client("clarify", {"question": question, "choices": choices}, session_id or "")
 
+    def _turn_of(self, session_id: str) -> str:
+        """The turn id in flight for a live session ("" when it is idle or unknown)."""
+        live = self.live.get(session_id)
+        return live.turn_id if live is not None else ""
+
     def apply_file_config(self, cwd: str | Path | None = None) -> None:
-        """Re-read config files into the live settings (only keys present in a file are replaced)."""
+        """Re-read config files into the live settings.
+
+        Keys present in a file are replaced by the file's value. A key that was in a file at the previous read and is
+        gone now (removed by hand or rolled back by an experiment) is reset to its fresh value, not left as it was.
+        """
         base = Path(cwd) if cwd else Path.cwd()
         fresh = load_config(project_dir=base)
-        keys: set[str] = set()
-        for path in (_user_cfg(), _proj_cfg(base)):
-            try:
-                keys |= set(confio.read_yaml(path))
-            except confio.ConfigError:
-                continue
-        for key in keys & set(Settings.model_fields):
+        keys = _file_keys(base)
+        changed = (keys | self._file_keys) & set(Settings.model_fields)
+        for key in changed:
             setattr(self.config, key, getattr(fresh, key))
-        if "providers" in keys:
+        self._file_keys = keys
+        if "providers" in changed:
             self.router = None
             self._tiers = None
         self.mcp.configure(self.config.mcp.servers)
@@ -2166,6 +2189,17 @@ def _command_for_tool(tool_name: str, arguments: dict[str, Any]) -> str:
     if tool_name == "read":
         return f"read {arguments.get('path', '')}"
     return f"{tool_name} {json.dumps(arguments, ensure_ascii=False)[:120]}"
+
+
+def _file_keys(base: Path) -> set[str]:
+    """Top-level keys of the user and project config files (none when a file is absent or unreadable)."""
+    keys: set[str] = set()
+    for path in (_user_cfg(), _proj_cfg(base)):
+        try:
+            keys |= set(confio.read_yaml(path))
+        except confio.ConfigError:
+            continue
+    return keys
 
 
 def _usage_payload(usage: Usage) -> dict[str, Any]:

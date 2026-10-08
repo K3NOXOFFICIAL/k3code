@@ -152,13 +152,12 @@ class TierRouters:
 class Escalation:
     """Tracks failures of a task on a tier; after ``threshold`` of them moves to the next tier.
 
-    Failure signals: ``tool_errors`` (repeated tool errors), ``loop_guard`` (the loop guard
-    fired) and ``judge_not_done`` (the goal judge said "not done"). Each ``record`` counts one
-    failure; ``record`` returns the new tier when it escalates, else None.
+    Failure signals: ``tool_errors`` (repeated tool errors) and ``loop_guard`` (the loop guard fired). Each
+    ``record`` counts one failure; ``record`` returns the new tier when it escalates, else None.
     """
 
     #: failures of a signal that trigger escalation
-    DEFAULT_THRESHOLDS = {"tool_errors": 3, "loop_guard": 1, "judge_not_done": 2}
+    DEFAULT_THRESHOLDS = {"tool_errors": 3, "loop_guard": 1}
 
     def __init__(
         self,

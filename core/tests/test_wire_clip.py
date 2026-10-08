@@ -134,10 +134,10 @@ async def test_each_request_starts_with_the_exact_bytes_of_the_one_before(tmp_pa
 
 def test_the_volatile_part_of_the_system_prompt_comes_last(tmp_path, monkeypatch):
     cfg = SimpleNamespace(skills=SimpleNamespace(roots=[]), output_style="default")
-    monkeypatch.setattr(prompting, "skills_prompt", lambda cwd, roots: "## Skills\n\n- deploy: ship it")
-    monkeypatch.setattr(prompting, "memory_prompt", lambda cwd: "## User memory\n\nold preference")
+    monkeypatch.setattr(prompting, "skills_prompt", lambda cwd, roots, **kw: "## Skills\n\n- deploy: ship it")
+    monkeypatch.setattr(prompting, "memory_prompt", lambda cwd, **kw: "## User memory\n\nold preference")
     before = prompting.build_system_prompt("BASE PROMPT", cwd=tmp_path, config=cfg)
-    monkeypatch.setattr(prompting, "memory_prompt", lambda cwd: "## User memory\n\nnew preference")
+    monkeypatch.setattr(prompting, "memory_prompt", lambda cwd, **kw: "## User memory\n\nnew preference")
     after = prompting.build_system_prompt("BASE PROMPT", cwd=tmp_path, config=cfg)
     assert before.startswith("BASE PROMPT")
     assert before.index("## Skills") < before.index("## User memory")

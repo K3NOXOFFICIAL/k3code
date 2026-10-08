@@ -22,8 +22,9 @@ DEFAULTS: dict[str, Any] = {
     #: an interactive task the scope gate calls "trivial" starts on the cheap tier and escalates when it stalls
     #: (GOAL B5: route unimportant work to cheaper models, escalating when they struggle)
     "degrade_trivial": True,
-    #: failures per signal before a cheap-tier task escalates
-    "escalate": {"tool_errors": 3, "loop_guard": 1, "judge_not_done": 2},
+    #: failed tool calls in a row before a cheap-tier task escalates. A loop-guard hit always escalates at once (the
+    #: attempt stops there), so it has no key; M1 removed the unread ``loop_guard`` and ``judge_not_done`` keys.
+    "escalate": {"tool_errors": 3},
     #: name a new session from its first prompt (one cheap-tier call, background); opt-in
     "auto_title": False,
     "preview_timeout": 30,
@@ -33,6 +34,10 @@ DEFAULTS: dict[str, Any] = {
     "fanout": {"enabled": True, "panes": False, "max_parallel": 3, "require_tests": True, "test_command": "",
                "test_timeout": 600},
 }
+
+
+#: The keys ``autonomy.escalate`` reads; config load warns about any other key (it would be silently ignored).
+ESCALATE_KEYS = frozenset(DEFAULTS["escalate"])
 
 
 def autonomy_cfg(config: Any) -> dict[str, Any]:

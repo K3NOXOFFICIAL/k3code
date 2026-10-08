@@ -51,11 +51,11 @@ def load_memory(cwd: str | Path) -> list[MemoryFile]:
     return out
 
 
-def memory_prompt(cwd: str | Path) -> str:
+def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS) -> str:
     parts = []
     for m in load_memory(cwd):
         label = "User memory" if m.scope == "user" else f"Project memory ({m.path.name})"
-        body = m.text if len(m.text) <= MAX_MEMORY_CHARS else m.text[:MAX_MEMORY_CHARS] + "\n…(truncated)"
+        body = m.text if len(m.text) <= limit else m.text[:limit] + "\n…(truncated)"
         parts.append(f"## {label}\n\n{body}")
     return "\n\n".join(parts)
 

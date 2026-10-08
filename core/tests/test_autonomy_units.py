@@ -80,16 +80,10 @@ def test_escalation_ladder_and_thresholds():
     assert esc.record("loop_guard") is None  # nowhere to go
 
 
-def test_escalation_judge_not_done_twice():
-    esc = Escalation(Tier.CHEAP)
-    assert esc.record("judge_not_done") is None
-    assert esc.record("judge_not_done") is Tier.MAIN
-
-
 def test_autonomy_cfg_defaults_and_overrides():
     cfg = autonomy_cfg(Settings(autonomy={"plan_first": False, "escalate": {"tool_errors": 5}}))
     assert cfg["plan_first"] is False and cfg["gate_modes"] == ["auto"]
-    assert cfg["escalate"] == {"tool_errors": 5, "loop_guard": 1, "judge_not_done": 2}
+    assert cfg["escalate"] == {"tool_errors": 5}
 
 
 # ── scope ──

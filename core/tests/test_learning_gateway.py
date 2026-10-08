@@ -6,7 +6,16 @@ import json
 
 from k3code.confio import read_yaml
 from k3code.learning.decisions import DecisionLog
-from test_permissions_gateway import bash, call, make_server, run_turn
+from test_permissions_gateway import bash, call, run_turn
+from test_permissions_gateway import make_server as _make_server
+
+
+def make_server(tmp_path, turns, monkeypatch):
+    """A test server whose daily distill is marked as done: the background turn end then makes no model call (the
+    distill polishes preferences with a model, and that call waited on retries, so the drain could hang)."""
+    server, provider = _make_server(tmp_path, turns, monkeypatch)
+    server.learning._set_state(distilled=server.learning.clock())
+    return server, provider
 
 
 def shown(server, kind=None):
