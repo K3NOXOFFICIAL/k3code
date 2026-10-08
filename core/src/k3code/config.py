@@ -204,6 +204,8 @@ def load_config(
     merged = _merge_dicts(merged, env_overrides)
     merged = _merge_dicts(merged, cli)
 
+    _warn_unknown_escalate_keys(merged)
+
     # Parse providers list specially (replace, don't merge)
     for src in (user_config, project_config, cli):
         if "providers" in src:
@@ -222,6 +224,16 @@ def load_config(
         p["api_key"] = os.environ.get(name) or file_env.get(name, "")
 
     return Settings(**merged)
+
+
+def _warn_unknown_escalate_keys(merged: dict[str, Any]) -> None:
+    """A key under ``autonomy.escalate`` that nothing reads would be ignored without a word: say so."""
+    from k3code.autonomy import ESCALATE_KEYS
+
+    section = (merged.get("autonomy") or {}).get("escalate") or {}
+    for key in sorted(set(section) - ESCALATE_KEYS):
+        logger.warning("autonomy.escalate.%s is not used and is ignored (known keys: %s)", key,
+                       ", ".join(sorted(ESCALATE_KEYS)))
 
 
 def _is_scalar(default: Any) -> bool:

@@ -248,7 +248,7 @@ class LiveSession:
 
 
 #: Conversation size at which a session's older messages are folded into a summary, and how many recent ones stay.
-CONTEXT_DEFAULTS: dict[str, Any] = {"compact_at_tokens": 80_000, "keep_messages": 8}
+CONTEXT_DEFAULTS: dict[str, Any] = {"compact_at_tokens": 80_000, "keep_messages": 8, "compact_input_chars": 60_000}
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -1404,7 +1404,8 @@ class GatewayServer:
             return 0
         try:
             new, folded = await compact_messages(
-                self.model_caller, list(messages), keep=int(cfg["keep_messages"]), session_id=session.session_id
+                self.model_caller, list(messages), keep=int(cfg["keep_messages"]), session_id=session.session_id,
+                max_input_chars=int(cfg["compact_input_chars"]),
             )
         except Exception:  # noqa: BLE001 - e.g. every provider rate-limited: the turn proceeds with the long history
             logger.warning("automatic compaction failed", exc_info=True)
