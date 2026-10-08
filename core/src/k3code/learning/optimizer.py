@@ -24,6 +24,25 @@ VERIFIED_OUTCOMES = ("done", "error")
 #: tokens. +1 point for +30% tokens is rejected (0.01 < 0.15); +10 points for +5% tokens is kept (0.10 >= 0.025).
 COST_WEIGHT = 0.5
 
+#: What the optimizer may change: an allowlist of settings it tunes. Every config overlay must stay inside it.
+TUNABLE_PATHS = (
+    "task_tiers",
+    "learning.rank_threshold",
+    "router.max_inline_wait",
+    "autonomy.gate_modes",
+    "context.tool_output_chars",
+    "context.memory_chars",
+    "context.skill_prompt_limit",
+    "context.compact_input_chars",
+)
+#: Hard exclusions, checked first and never overridden: permissions, the sandbox, halt, spend and turn caps and
+#: deadlines, notification channels, and the optimizer's own gates (learning.optimizer.*, learning.enabled).
+EXCLUDED_SEGMENTS = frozenset({
+    "permissions", "permission_mode", "headless_permission", "hardline", "sandbox", "daemon", "halt", "budget",
+    "budgets", "max_turns", "deadline", "reliability", "notify", "notification", "notifications", "channel", "ntfy",
+    "telegram", "optimizer", "enabled",
+})
+
 
 # ── metrics ────────────────────────────────────────────────────────────────
 
@@ -250,17 +269,22 @@ class Experiments:
 
     def start(self, overlay: dict[str, Any], baseline: dict[str, Any], *, sessions: int = 20,
               config_path: Path | None = None) -> dict[str, Any]:
-        """Apply an accepted overlay. Config overlays patch the user config (old values kept for rollback)."""
+        """Apply an accepted overlay. Config overlays patch the user config (old values kept for rollback).
+
+        ``overlay["auto"]`` marks a change the optimizer made by itself (replay gate); it is logged and rolled back
+        like any experiment when the A/B window says it made things worse.
+        """
         items = self.all()
         xid = f"x{len(items) + 1}"
         exp: dict[str, Any] = {"id": xid, "title": overlay.get("title", ""), "status": "active",
                                "started": self.clock(), "target_sessions": sessions, "sessions_done": 0,
                                "baseline": baseline, "baseline_score": score(baseline), "evidence":
-                               overlay.get("evidence", {})}
+                               overlay.get("evidence", {}), "auto": bool(overlay.get("auto"))}
         if "patch" in overlay:
             path = config_path or user_config_path()
             cur = confio.read_yaml(path)
             check_patch(overlay["patch"], cur)
+            check_optimizer_patch(overlay["patch"])
             exp.update(kind="config", patch=overlay["patch"], prev=_prev_values(cur, overlay["patch"]))
             merged = merge_patch(cur, overlay["patch"])
             confio.validate(merged)
@@ -380,16 +404,54 @@ def _restore(cur: dict[str, Any], patch: dict[str, Any], prev: dict[str, Any]) -
     return out
 
 
+def check_optimizer_patch(patch: dict[str, Any]) -> None:
+    """Raise :class:`PatchRejected` unless every leaf of ``patch`` is a tunable setting and none is excluded."""
+    for path in _leaf_paths(patch):
+        segments = path.split(".")
+        if EXCLUDED_SEGMENTS.intersection(segments):
+            raise PatchRejected(f"{path}: the optimizer may not change permissions, the sandbox, halt, caps, "
+                                "notification channels or its own gates")
+        if not any(path == t or path.startswith(t + ".") for t in TUNABLE_PATHS):
+            raise PatchRejected(f"{path}: not a setting the optimizer may tune")
+
+
+def _leaf_paths(patch: Any, prefix: str = "") -> list[str]:
+    if isinstance(patch, dict):
+        out: list[str] = []
+        for k, v in patch.items():
+            out += _leaf_paths(v, f"{prefix}.{k}" if prefix else str(k))
+        return out or ([prefix] if prefix else [])
+    return [prefix]
+
+
 def propose(m: dict[str, Any], config: Any, store: ProposalStore) -> list[Proposal]:
     out = []
     for c in suggest(m, config):
         try:
             if "patch" in c:
                 check_patch(c["patch"], {})
+                check_optimizer_patch(c["patch"])
         except PatchRejected:
             continue
         p = store.add("optimizer", c["title"], "apply overlay as an A/B experiment", payload={"overlay": c},
                       key=dedup_key("optimizer", json.dumps(c.get("patch") or c.get("name"), sort_keys=True)))
+        if p:
+            out.append(p)
+    return out
+
+
+def propose_replayed(candidates: list[dict[str, Any]], store: ProposalStore) -> list[Proposal]:
+    """Proposals (human accept) for replayed candidates that did not pass the auto-apply gate."""
+    out = []
+    for c in candidates:
+        try:
+            check_patch(c["patch"], {})
+            check_optimizer_patch(c["patch"])
+        except PatchRejected:
+            continue
+        p = store.add("optimizer", c["title"], "apply overlay as an A/B experiment",
+                      payload={"overlay": {"title": c["title"], "patch": c["patch"], "evidence": c["evidence"]}},
+                      key=dedup_key("optimizer", json.dumps(c["patch"], sort_keys=True)))
         if p:
             out.append(p)
     return out

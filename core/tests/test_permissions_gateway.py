@@ -48,7 +48,8 @@ def make_server(tmp: Path, turns: list[ToolCall | str], monkeypatch, mode: str =
     monkeypatch.setenv("K3CODE_HOME", str(tmp / "home"))
     store = SessionStore(tmp / "sessions.db")
     config = Settings(
-        providers=[ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE")],
+        # a closed localhost port: background calls fail at once (no DNS lookup of a made-up host)
+        providers=[ProviderEntry(name="t", kind="openai", base_url="http://127.0.0.1:9", api_key_env="NOPE")],
         permission_mode=mode,
         **cfg,
     )

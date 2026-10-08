@@ -188,25 +188,27 @@ def test_scope_accuracy_is_scored_from_the_verifier_outcome(tmp_path):
 
 def test_rollback_restores_the_live_settings_not_only_the_yaml(tmp_path):
     cfg = tmp_path / "config.yaml"
-    cfg.write_text("max_turns: 7\ntask_tiers:\n  title: fast\n")
-    live = Settings(max_turns=7, task_tiers={"title": "fast"})
+    cfg.write_text("context:\n  compact_input_chars: 7000\ntask_tiers:\n  title: fast\n")
+    live = Settings(context={"compact_input_chars": 7000}, task_tiers={"title": "fast"})
     xp = optimizer.Experiments(tmp_path, FakeClock(), live=live)
-    xp.start({"title": "t", "patch": {"max_turns": 9, "task_tiers": {"classification": "main"}}}, metrics_for(0.1),
-             sessions=1, config_path=cfg)
-    assert live.max_turns == 9 and live.task_tiers == {"title": "fast", "classification": "main"}
+    xp.start({"title": "t", "patch": {"context": {"compact_input_chars": 9000},
+                                      "task_tiers": {"classification": "main"}}},
+             metrics_for(0.1), sessions=1, config_path=cfg)
+    assert live.context == {"compact_input_chars": 9000} and live.task_tiers["classification"] == "main"
     xp.rollback("x1", config_path=cfg)
-    assert live.max_turns == 7 and live.task_tiers == {"title": "fast"}
-    assert confio.read_yaml(cfg)["max_turns"] == 7
+    assert live.context == {"compact_input_chars": 7000} and live.task_tiers == {"title": "fast"}
+    assert confio.read_yaml(cfg)["context"]["compact_input_chars"] == 7000
 
 
 def test_rollback_of_a_key_that_was_absent_resets_the_live_value_to_its_default(tmp_path):
     cfg = tmp_path / "config.yaml"
     live = Settings()
     xp = optimizer.Experiments(tmp_path, FakeClock(), live=live)
-    xp.start({"title": "t", "patch": {"max_turns": 9}}, metrics_for(0.1), sessions=1, config_path=cfg)
-    assert live.max_turns == 9
+    xp.start({"title": "t", "patch": {"context": {"compact_input_chars": 9000}}}, metrics_for(0.1), sessions=1,
+             config_path=cfg)
+    assert live.context == {"compact_input_chars": 9000}
     xp.rollback("x1", config_path=cfg)
-    assert live.max_turns == Settings().max_turns and "max_turns" not in confio.read_yaml(cfg)
+    assert live.context == Settings().context and "context" not in confio.read_yaml(cfg)
 
 
 async def test_a_key_removed_from_the_config_file_is_reset_on_reload(tmp_path, monkeypatch):
@@ -273,3 +275,70 @@ def test_ab_judgement_scores_tokens_as_well_as_quality(tmp_path):
              config_path=cfg)
     xp.session_done(lambda since: base_metrics(0.10, 1050), lambda text: None, cfg)  # +10 points, +5% tokens
     assert xp.get("x2")["status"] == "kept"
+
+
+def test_the_optimizer_allowlist_rejects_permissions_sandbox_caps_halt_channels_and_its_own_gates():
+    import pytest
+
+    from k3code.learning.optimizer import check_optimizer_patch
+    from k3code.learning.updateconfig import PatchRejected
+
+    for bad in ({"permissions": {"bash": {"rm *": "allow"}}}, {"permission_mode": "yolo"},
+                {"sandbox": {"network": True}}, {"reliability": {"budget": {"tokens": 0}}},
+                {"max_turns": 500}, {"daemon": {"background_paused": False}}, {"halt": False},
+                {"budget_usd": 1000}, {"notify": {"ntfy": "x"}}, {"telegram": {"chat": 1}},
+                {"learning": {"optimizer": {"enabled": True}}}, {"learning": {"enabled": False}},
+                {"mcp": {"servers": []}}, {"providers": []}, {"output_style": "x"}):
+        with pytest.raises(PatchRejected):
+            check_optimizer_patch(bad)
+    for ok in ({"task_tiers": {"classification": "main"}}, {"learning": {"rank_threshold": 0.3}},
+               {"router": {"max_inline_wait": 40}}, {"autonomy": {"gate_modes": ["auto", "default"]}},
+               {"context": {"tool_output_chars": 6000, "memory_chars": 8000}}):
+        check_optimizer_patch(ok)
+
+
+def test_an_auto_applied_change_that_regresses_is_rolled_back_and_the_live_value_restored(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    live = Settings()
+    xp = optimizer.Experiments(tmp_path, FakeClock(), live=live)
+    xp.start({"title": "clip", "patch": {"context": {"tool_output_chars": 6000}}, "auto": True}, metrics_for(0.1),
+             sessions=1, config_path=cfg)
+    assert live.context == {"tool_output_chars": 6000} and xp.get("x1")["auto"] is True
+    notes: list[str] = []
+    xp.session_done(lambda since: metrics_for(0.9), notes.append, cfg)
+    assert xp.get("x1")["status"] == "rolled_back" and "rolled back automatically" in notes[0]
+    assert live.context == Settings().context and "context" not in confio.read_yaml(cfg)
+
+
+async def test_a_gate_passing_token_candidate_is_applied_as_an_experiment_and_logged(tmp_path, monkeypatch):
+    from test_learning_replay import turn
+    from test_permissions_gateway import make_server
+
+    server, _ = make_server(tmp_path, ["x"], monkeypatch, learning={"optimizer": {"enabled": True, "min_sessions": 5}})
+    for i in range(6):  # six sessions this week, so the optimizer runs
+        server.usage.record("call", session=f"s{i}", tokens_in=100, tokens_out=10, tier="main",
+                            task_kind="interactive_turn", turn=f"u{i}")
+    turns = [turn(i) for i in range(300)] + [turn(1000, tool_chars=60_000, tools=5)]  # one large turn in 301
+    for rec in turns:
+        assert server.learning.replays.append(rec)
+
+    await server.learning.run_optimizer()
+    assert server.config.context == {"tool_output_chars": 6000}  # live, not only the YAML
+    (exp,) = server.learning.experiments.all()
+    assert exp["auto"] is True and exp["status"] == "active"
+    (row,) = server.learning.log.query("auto_apply", since=0, actor=None)  # logged as an automatic decision
+    assert row["detail"]["experiment"] == exp["id"] and row["choice"] == "applied"
+    await server.learning.run_optimizer()  # already in effect: no second experiment
+    assert len(server.learning.experiments.all()) == 1
+    await server.close()
+
+
+def test_a_replayed_candidate_that_fails_the_gate_becomes_a_proposal_for_a_human(tmp_path):
+    from k3code.autonomy.proposals import ProposalStore
+
+    store = ProposalStore(tmp_path)
+    cand = {"title": "Clip tool results", "patch": {"context": {"tool_output_chars": 6000}},
+            "evidence": {"token_reduction_pct": 30.0, "pass_drop_points": 9.0}, "auto_ok": False}
+    (p,) = optimizer.propose_replayed([cand], store)
+    assert p.kind == "optimizer" and p.payload["overlay"]["patch"] == {"context": {"tool_output_chars": 6000}}
+    assert optimizer.propose_replayed([cand], store) == []  # dedup: a dismissed or pending candidate stays put

@@ -227,7 +227,8 @@ MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 _KEEP_HEAD_BYTES = 40_000
 _KEEP_TAIL_BYTES = 10_000
 #: The most of one tool result the model is sent, in chars (see clip_tool_results). The bash cap as before.
-_MAX_CHARS = 10_000
+MAX_TOOL_RESULT_CHARS = 10_000  # the default for what the model is sent of one tool result (context.tool_output_chars)
+_MAX_CHARS = MAX_TOOL_RESULT_CHARS
 
 
 class _Capture:

@@ -7,8 +7,8 @@ from typing import Any
 
 from k3code import outputstyle
 from k3code.extratools import mcp_prompt
-from k3code.memory import memory_prompt
-from k3code.skills import skills_prompt
+from k3code.memory import MAX_MEMORY_CHARS, memory_prompt
+from k3code.skills import PROMPT_LIMIT, skills_prompt
 
 _BASE_PATH = Path(__file__).parent / "prompts" / "system.md"
 
@@ -38,11 +38,12 @@ def build_system_prompt(
     style = outputstyle.style_text(effective_style(config, session_meta), cwd)
     if style:
         parts.append(style)
-    if skills := skills_prompt(cwd, list(config.skills.roots)):
+    ctx = getattr(config, "context", None) or {}  # M1: prompt-size knobs the optimizer may tune (defaults unchanged)
+    if skills := skills_prompt(cwd, list(config.skills.roots), limit=int(ctx.get("skill_prompt_limit", PROMPT_LIMIT))):
         parts.append(skills)
     if mcp is not None and (m := mcp_prompt(mcp)):
         parts.append(m)
-    if mem := memory_prompt(cwd):
+    if mem := memory_prompt(cwd, limit=int(ctx.get("memory_chars", MAX_MEMORY_CHARS))):
         parts.append(mem)
     from k3code.learning.optimizer import overlay_prompt
 

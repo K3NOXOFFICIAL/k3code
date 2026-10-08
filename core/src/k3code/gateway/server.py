@@ -1162,6 +1162,7 @@ class GatewayServer:
             background=session.background,
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
+            tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
@@ -1330,6 +1331,8 @@ class GatewayServer:
             # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
             # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
             self._persist_turn(session, loop)
+            self.learning.record_turn_replay(session, list(loop.turn_messages), status, tier.value, kind.value,
+                                             session.turn_id, history_len=len(history))
             if session.paused:  # a cancelled wait never saw "resumed"
                 session.paused = False
                 session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")

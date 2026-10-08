@@ -94,15 +94,15 @@ def search(query: str, cwd: str | Path, extra_roots: list[str] | None = None, li
     return [s for _, s in scored[:limit]]
 
 
-def skills_prompt(cwd: str | Path, extra_roots: list[str] | None = None) -> str:
+def skills_prompt(cwd: str | Path, extra_roots: list[str] | None = None, limit: int = PROMPT_LIMIT) -> str:
     """Names + descriptions only; full text is loaded on demand via the ``skill`` tool."""
     skills = discover(cwd, extra_roots)
     if not skills:
         return ""
     lines = ["## Skills", "", "Load a skill's full instructions with the `skill` tool (`name`, or `query` to search)."]
-    for s in skills[:PROMPT_LIMIT]:
+    for s in skills[:limit]:
         desc = s.description if len(s.description) <= 110 else s.description[:107] + "..."
         lines.append(f"- {s.name}: {desc}")
-    if len(skills) > PROMPT_LIMIT:
-        lines.append(f"- …and {len(skills) - PROMPT_LIMIT} more; use `skill` with a `query` to find them.")
+    if len(skills) > limit:
+        lines.append(f"- …and {len(skills) - limit} more; use `skill` with a `query` to find them.")
     return "\n".join(lines)

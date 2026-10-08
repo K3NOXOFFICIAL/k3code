@@ -203,6 +203,15 @@ class UsageDB:
             g["by_model"] = dict(calls[key])
         return sorted(groups.values(), key=lambda g: g["last_ts"], reverse=True)
 
+    def turn_tokens(self, turn: str) -> tuple[int, int]:
+        """(tokens in, tokens out) of every model call written for one turn id."""
+        row = self._db.execute(
+            "SELECT COALESCE(SUM(tokens_in), 0), COALESCE(SUM(tokens_out), 0) FROM events"
+            " WHERE kind = 'call' AND turn = ?",
+            (turn,),
+        ).fetchone()
+        return int(row[0]), int(row[1])
+
     def close(self) -> None:
         self._db.close()
 

@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-KINDS = ("approval", "model_switch", "proposal", "plan", "interrupt", "undo", "scope", "config")
+KINDS = ("approval", "model_switch", "proposal", "plan", "interrupt", "undo", "scope", "config", "auto_apply")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
