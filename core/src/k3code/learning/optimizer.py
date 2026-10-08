@@ -20,6 +20,9 @@ ROLLBACK_MARGIN = 0.02
 #: "interrupted" (the user stopped it) and "needs_input" (a budget or loop guard paused it) say nothing about
 #: correctness, so they are not judged.
 VERIFIED_OUTCOMES = ("done", "error")
+#: Cost term: a change must buy this many quality points (as a fraction: 0.005 = half a point) per percent of extra
+#: tokens. +1 point for +30% tokens is rejected (0.01 < 0.15); +10 points for +5% tokens is kept (0.10 >= 0.025).
+COST_WEIGHT = 0.5
 
 
 # ── metrics ────────────────────────────────────────────────────────────────
@@ -51,12 +54,17 @@ def collect(usage_rows: list[dict[str, Any]], log: DecisionLog, scope_rows: list
     # M1: tokens per tier, per task kind and per turn (every call row counts, whatever the provider reported)
     tokens_by_tier: dict[str, int] = {}
     tokens_by_kind: dict[str, int] = {}
+    kind_tier: dict[str, dict[str, dict[str, int]]] = {}  # kind -> tier -> {"calls", "tokens"}
     turns: set[str] = set()
     for r in calls:
         n = int(r.get("tokens_in") or 0) + int(r.get("tokens_out") or 0)
-        tokens_by_tier[r["tier"] or "main"] = tokens_by_tier.get(r["tier"] or "main", 0) + n
+        tier = r["tier"] or "main"
+        tokens_by_tier[tier] = tokens_by_tier.get(tier, 0) + n
         if r["task_kind"]:
             tokens_by_kind[r["task_kind"]] = tokens_by_kind.get(r["task_kind"], 0) + n
+            cell = kind_tier.setdefault(r["task_kind"], {}).setdefault(tier, {"calls": 0, "tokens": 0})
+            cell["calls"] += 1
+            cell["tokens"] += n
         if r.get("turn"):
             turns.add(r["turn"])
     call_tokens = sum(tokens_by_tier.values())
@@ -94,6 +102,7 @@ def collect(usage_rows: list[dict[str, Any]], log: DecisionLog, scope_rows: list
         "tokens_per_turn": round(call_tokens / len(turns), 1) if turns else None,
         "tokens_by_tier": tokens_by_tier,
         "tokens_by_kind": tokens_by_kind,
+        "kind_tier": kind_tier,
     }
 
 
@@ -101,18 +110,66 @@ def _tier_row() -> dict[str, int]:
     return {"calls": 0, "escalated": 0, "loop_guard": 0}
 
 
-def score(m: dict[str, Any]) -> float:
-    """One comparable number (higher is better) from the headline rates."""
+def accept_change(quality_gain: float, token_increase_pct: float) -> bool:
+    """A tier-up or a gate-widening is kept only when its quality gain beats its cost.
+
+    ``quality_gain`` is a fraction (0.10 = ten points); ``token_increase_pct`` is the extra tokens in percent.
+    """
+    return quality_gain >= COST_WEIGHT * max(0.0, token_increase_pct) / 100.0
+
+
+def quality(m: dict[str, Any]) -> float:
+    """Quality part of the score (higher is better), from the headline rates."""
     s = 1.0 - m["escalation_rate"] - m["failure_rate"] - 0.5 * min(1.0, m["loop_guard_per_session"])
     s -= 0.02 * min(10.0, m["approval_prompts_per_session"])
     if m.get("proposal_accept_rate") is not None:
         s += 0.2 * (m["proposal_accept_rate"] - 0.5)
     if m.get("scope_accuracy") is not None:
         s += 0.2 * (m["scope_accuracy"] - 0.5)
+    return s
+
+
+def score(m: dict[str, Any], baseline: dict[str, Any] | None = None) -> float:
+    """One comparable number (higher is better): the quality, minus a cost term against ``baseline``.
+
+    The cost term is ``COST_WEIGHT`` for every 100% that tokens per turn grew over the baseline; without a baseline
+    (or without token data) the score is quality alone.
+    """
+    s = quality(m)
+    if baseline is not None and m.get("tokens_per_turn") and baseline.get("tokens_per_turn"):
+        growth = m["tokens_per_turn"] / baseline["tokens_per_turn"] - 1.0
+        s -= COST_WEIGHT * max(0.0, growth)
     return round(s, 4)
 
 
 # ── candidates ─────────────────────────────────────────────────────────────
+
+def _tier_up_gain_and_cost(m: dict[str, Any], kind: str, escalated: int) -> tuple[float | None, float]:
+    """Quality gain and token cost of moving ``kind`` from the cheap tier to main, from measured calls.
+
+    Gain: the share of the kind's cheap-tier calls that stalled and would be rescued. Cost: the extra tokens the
+    kind's cheap calls would cost at the main tier's measured tokens per call, as a share of all tokens. Without main-
+    tier calls for the kind there is nothing measured to weigh, so the change is not proposed (None).
+    """
+    cells = (m.get("kind_tier") or {}).get(kind, {})
+    cheap, main = cells.get("cheap"), cells.get("main")
+    if not cheap or not main or not cheap["calls"] or not main["calls"]:
+        return None, 0.0
+    total = m.get("tokens") or 0
+    if not total:
+        return None, 0.0
+    cheap_per = cheap["tokens"] / cheap["calls"]
+    main_per = main["tokens"] / main["calls"]
+    extra = cheap["calls"] * max(0.0, main_per - cheap_per)
+    return min(1.0, escalated / cheap["calls"]), 100.0 * extra / total
+
+
+def _planning_cost_pct(m: dict[str, Any]) -> float | None:
+    """Share of all tokens spent on planning (the plan task kind); None when no planning was measured."""
+    plan = (m.get("tokens_by_kind") or {}).get("plan", 0)
+    total = m.get("tokens") or 0
+    return 100.0 * plan / total if plan and total else None
+
 
 def suggest(m: dict[str, Any], config: Any) -> list[dict[str, Any]]:
     """Overlay candidates ``{title, patch|prompt, evidence}`` from the metrics."""
@@ -120,10 +177,13 @@ def suggest(m: dict[str, Any], config: Any) -> list[dict[str, Any]]:
     cfg = learning_cfg(config)
     if m["escalation_rate"] >= 0.25 and m["escalated_kinds"]:
         kind, n = max(m["escalated_kinds"].items(), key=lambda kv: kv[1])
-        if kind:
-            out.append({"title": f"Route {kind} to the main tier (cheap tier escalated {n}×)",
+        gain, cost_pct = _tier_up_gain_and_cost(m, kind, n)
+        if kind and gain is not None and accept_change(gain, cost_pct):
+            out.append({"title": f"Route {kind} to the main tier (cheap tier escalated {n}×; quality "
+                                 f"+{gain:.0%} for +{cost_pct:.0f}% tokens)",
                         "patch": {"task_tiers": {kind: "main"}},
-                        "evidence": {"escalation_rate": m["escalation_rate"], "kind": kind, "count": n}})
+                        "evidence": {"escalation_rate": m["escalation_rate"], "kind": kind, "count": n,
+                                     "quality_gain": round(gain, 3), "token_increase_pct": round(cost_pct, 1)}})
     if m["proposals_decided"] >= 10 and (m["proposal_accept_rate"] or 0) < 0.2:
         cur = float(cfg["rank_threshold"])
         out.append({"title": f"Raise the proposer threshold {cur} → {round(min(0.6, cur + 0.1), 2)} "
@@ -131,10 +191,15 @@ def suggest(m: dict[str, Any], config: Any) -> list[dict[str, Any]]:
                     "patch": {"learning": {"rank_threshold": round(min(0.6, cur + 0.1), 2)}},
                     "evidence": {"accept_rate": m["proposal_accept_rate"], "decided": m["proposals_decided"]}})
     if m["scope_judged"] >= 10 and (m["scope_accuracy"] or 1) < 0.7:
-        out.append({"title": "Plan more often: also run the scope gate in default mode "
-                             f"(scope verdict accuracy {m['scope_accuracy']})",
-                    "patch": {"autonomy": {"gate_modes": ["auto", "default"]}},
-                    "evidence": {"scope_accuracy": m["scope_accuracy"], "judged": m["scope_judged"]}})
+        gain = 1.0 - float(m["scope_accuracy"])  # share of judged verdicts the gate got wrong
+        cost_pct = _planning_cost_pct(m)  # planning tokens today; widening the gate roughly adds that much again
+        if cost_pct is not None and accept_change(gain, cost_pct):
+            out.append({"title": "Plan more often: also run the scope gate in default mode "
+                                 f"(scope verdict accuracy {m['scope_accuracy']}; quality +{gain:.0%} for "
+                                 f"+{cost_pct:.0f}% tokens)",
+                        "patch": {"autonomy": {"gate_modes": ["auto", "default"]}},
+                        "evidence": {"scope_accuracy": m["scope_accuracy"], "judged": m["scope_judged"],
+                                     "quality_gain": round(gain, 3), "token_increase_pct": round(cost_pct, 1)}})
     if m["waits_per_session"] >= 3:
         cur_wait = float((getattr(config, "router", None) or {}).get("max_inline_wait", 20))
         out.append({"title": f"Raise router.max_inline_wait {cur_wait:g}s → {cur_wait * 2:g}s "
@@ -253,7 +318,7 @@ class Experiments:
         self._save(items)
         for x in finished:
             m = current_metrics(x["started"])
-            after = score(m)
+            after = score(m, x.get("baseline"))
             x["after"], x["after_score"] = m, after
             if after < x["baseline_score"] - ROLLBACK_MARGIN:
                 self._store_result(x, "rolled_back")

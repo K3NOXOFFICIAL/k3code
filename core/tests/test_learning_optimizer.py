@@ -39,11 +39,25 @@ def test_collect_metrics(tmp_path):
     assert m["proposal_accept_rate"] == round(1 / 3, 3) and m["scope_accuracy"] == 0.5
 
 
+def tiered(cheap_calls, main_calls, cheap_tok, main_tok, escalations, kind="classification", plan_tok=0):
+    """Measured call rows per tier (with tokens), the cheap-tier escalations, and optional planning tokens."""
+    out = []
+    for i in range(cheap_calls):
+        out.append({**ev(i, "call", "s1", "cheap", kind), "tokens_in": cheap_tok, "tokens_out": 0, "turn": f"c{i}"})
+    for i in range(main_calls):
+        out.append({**ev(100 + i, "call", "s1", "main", kind), "tokens_in": main_tok, "tokens_out": 0, "turn": f"m{i}"})
+    out += [ev(200 + i, "escalated", "s1", "main", kind, "cheap->main: x") for i in range(escalations)]
+    if plan_tok:
+        out.append({**ev(300, "call", "s1", "strong", "plan"), "tokens_in": plan_tok, "tokens_out": 0, "turn": "p"})
+    return out
+
+
 def test_suggest_from_metrics(tmp_path):
     log = DecisionLog(tmp_path)
-    m = optimizer.collect(rows(0, 10, 5), log, [], since=0)
+    m = optimizer.collect(tiered(10, 10, 500, 550, 5), log, [], since=0)
     (c,) = optimizer.suggest(m, Settings())
     assert c["patch"] == {"task_tiers": {"classification": "main"}} and c["evidence"]["count"] == 5
+    assert c["evidence"]["token_increase_pct"] == 4.8 and c["evidence"]["quality_gain"] == 0.5
     store = ProposalStore(tmp_path)
     (p,) = optimizer.propose(m, Settings(), store)
     assert p.kind == "optimizer" and p.payload["overlay"]["evidence"]
@@ -207,3 +221,55 @@ async def test_a_key_removed_from_the_config_file_is_reset_on_reload(tmp_path, m
     server.apply_file_config(tmp_path)
     assert server.config.max_turns == Settings().max_turns
     await server.close()
+
+
+def base_metrics(esc, tpt):
+    return {"escalation_rate": esc, "failure_rate": 0.0, "loop_guard_per_session": 0.0,
+            "approval_prompts_per_session": 0.0, "proposal_accept_rate": None, "scope_accuracy": None,
+            "tokens_per_turn": tpt}
+
+
+def test_accept_change_needs_the_quality_gain_to_beat_the_token_cost():
+    assert not optimizer.accept_change(0.01, 30)  # +1 point for +30% tokens: rejected
+    assert optimizer.accept_change(0.10, 5)  # +10 points for +5% tokens: kept
+
+
+def test_tier_up_is_not_proposed_when_the_main_tier_costs_more_than_it_gains(tmp_path):
+    # escalation rate 3/12 = 0.25 (proposed at all); gain 3/10 = 0.3; main costs 2.5x per call: +125% tokens, need 0.625
+    m = optimizer.collect(tiered(10, 2, 500, 1500, 3), DecisionLog(tmp_path), [], since=0)
+    assert m["escalation_rate"] == 0.25 and optimizer.suggest(m, Settings()) == []
+    # no main-tier calls for the kind: nothing measured to weigh, so no tier-up
+    m0 = optimizer.collect(tiered(10, 0, 500, 0, 5), DecisionLog(tmp_path), [], since=0)
+    assert optimizer.suggest(m0, Settings()) == []
+
+
+def scope_rows(wrong, right):
+    out = []
+    for i in range(wrong + right):
+        out.append({"ts": 1, "type": "verdict", "hash": f"h{i}", "verdict": {"scope": "small"}})
+        out.append({"ts": 2, "type": "outcome", "hash": f"h{i}", "outcome": "error" if i < wrong else "done"})
+    return out
+
+
+def test_gate_widening_is_accepted_only_when_the_planning_cost_is_small(tmp_path):
+    cheap = optimizer.collect(tiered(0, 0, 0, 0, 0, plan_tok=50) + [
+        {**ev(1, "call", "s1", "main", "other"), "tokens_in": 950, "tokens_out": 0, "turn": "o"}],
+        DecisionLog(tmp_path), scope_rows(4, 6), since=0)  # accuracy 0.6 (gain 0.4), planning 5% of tokens
+    assert any("Plan more often" in c["title"] for c in optimizer.suggest(cheap, Settings()))
+    dear = optimizer.collect(tiered(0, 0, 0, 0, 0, plan_tok=900) + [
+        {**ev(1, "call", "s1", "main", "other"), "tokens_in": 100, "tokens_out": 0, "turn": "o"}],
+        DecisionLog(tmp_path), scope_rows(4, 6), since=0)  # gain 0.4 needs planning under 80% of tokens; it is 90%
+    assert not any("Plan more often" in c["title"] for c in optimizer.suggest(dear, Settings()))
+
+
+def test_ab_judgement_scores_tokens_as_well_as_quality(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    xp = optimizer.Experiments(tmp_path, FakeClock())
+    xp.start({"title": "a", "patch": {"router": {"max_inline_wait": 40}}}, base_metrics(0.2, 1000), sessions=1,
+             config_path=cfg)
+    xp.session_done(lambda since: base_metrics(0.19, 1300), lambda text: None, cfg)  # +1 point, +30% tokens
+    assert xp.get("x1")["status"] == "rolled_back"
+    xp.start({"title": "b", "patch": {"router": {"max_inline_wait": 40}}}, base_metrics(0.2, 1000), sessions=1,
+             config_path=cfg)
+    xp.session_done(lambda since: base_metrics(0.10, 1050), lambda text: None, cfg)  # +10 points, +5% tokens
+    assert xp.get("x2")["status"] == "kept"
