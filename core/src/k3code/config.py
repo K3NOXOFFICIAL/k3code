@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 K3CODE_HOME = Path(os.environ.get("K3CODE_HOME", Path.home() / ".k3code")).expanduser()
 
@@ -178,12 +181,18 @@ def load_config(
     if project_dir:
         project_config = _load_yaml(project_dir / ".k3code" / "config.yaml")
 
-    # 4. Environment variables (only top-level keys that exist in Settings)
+    # 4. Environment variables (only scalar top-level keys that exist in Settings; an empty value counts as unset)
     env_overrides: dict[str, Any] = {}
     for key in defaults:
         env_key = f"K3CODE_{key.upper()}"
-        if env_key in os.environ:
-            env_overrides[key] = _parse_env_value(os.environ[env_key], defaults[key])
+        raw = os.environ.get(env_key, "")
+        if not raw.strip():
+            continue
+        if not _is_scalar(defaults[key]):
+            # Sections only come from a YAML file. The value is not echoed: env values can hold secrets.
+            logger.warning("ignoring %s: %s is a config section, not a scalar; set it in config.yaml", env_key, key)
+            continue
+        env_overrides[key] = _parse_env_value(raw, defaults[key])
 
     # 5. CLI overrides
     cli = cli_overrides or {}
@@ -215,14 +224,24 @@ def load_config(
     return Settings(**merged)
 
 
+def _is_scalar(default: Any) -> bool:
+    """A plain value (str, bool, int, float or None). Mappings and lists are sections of the config."""
+    return default is None or isinstance(default, (str, bool, int, float))
+
+
 def _parse_env_value(value: str, default: Any) -> Any:
-    """Coerce env string to the type of the default."""
+    """Coerce env string to the type of the default. A number that does not parse is passed on as text,
+    so pydantic reports it with the field name, the same as a bad value in config.yaml."""
     if isinstance(default, bool):
         return value.lower() in ("1", "true", "yes", "on")
     if isinstance(default, int):
-        return int(value)
+        try:
+            return int(value)
+        except ValueError:
+            return value
     if isinstance(default, float):
-        return float(value)
-    if isinstance(default, list):
-        return [v.strip() for v in value.split(",") if v.strip()]
+        try:
+            return float(value)
+        except ValueError:
+            return value
     return value
