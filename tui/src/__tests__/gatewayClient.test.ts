@@ -427,14 +427,15 @@ describe('GatewayClient websocket attach mode', () => {
     gw.kill()
   })
 
-  it('uses the undici WebSocket fallback when global WebSocket is unavailable', () => {
+  it('uses the undici WebSocket fallback when global WebSocket is unavailable', async () => {
     process.env.K3CODE_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=hunter2&channel=secret'
     delete (globalThis as { WebSocket?: unknown }).WebSocket
 
     const gw = new GatewayClient()
 
     gw.start()
-    expect(FakeWebSocket.instances).toHaveLength(1)
+    // The fallback is imported on demand (Node 20 only), so the socket appears once the import resolves.
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1))
     expect(FakeWebSocket.instances[0]?.url).toBe('ws://gateway.test/api/ws?token=hunter2&channel=secret')
 
     gw.kill()

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from importlib import metadata
 from pathlib import Path
 
 
@@ -11,6 +10,9 @@ def _read() -> str:
     f = core.parent / "VERSION"
     if (core / "pyproject.toml").is_file() and f.is_file():
         return f.read_text().strip()
+    # Lazy: only an installed copy (no checkout files) needs importlib.metadata.
+    from importlib import metadata
+
     try:
         return metadata.version("k3code")
     except metadata.PackageNotFoundError:

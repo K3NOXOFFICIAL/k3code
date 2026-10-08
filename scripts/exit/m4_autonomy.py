@@ -14,7 +14,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -25,8 +24,9 @@ sys.path.insert(0, str(CORE / "tests"))
 sys.path.insert(0, str(CORE / "src"))
 
 try:
-    import k3code  # noqa: F401
     import mcp  # noqa: F401
+
+    import k3code  # noqa: F401
 except ImportError:
     os.execvp("uv", ["uv", "run", "--project", str(CORE), "python", __file__, *sys.argv[1:]])
 
@@ -227,7 +227,7 @@ def stats_tiers() -> None:
         ev = asyncio.run(go())
         emit(M, crit, "gateway + AutomationEngine + fake provider: /bg, /schedule add (fake clock), /loop, then /stats",
              "PASS", ev)
-    except Exception as e:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         import traceback
         emit(M, crit, "gateway + AutomationEngine + fake provider", "FAIL", traceback.format_exc())
 
@@ -292,7 +292,8 @@ def degradation() -> None:
     if LIVE_OK and BACKEND["kind"] == "claude-cli":
         return  # degradation_live() emits the live row
     emit(M, crit + " (live comparison with real models)", "needs real model quality at both tiers", "PENDING",
-         "fake comparison only proves routing/accounting; same-pass-rate on real tasks is untested: " + LIVE_DETAIL[:160],
+         "fake comparison only proves routing/accounting; "
+         "same-pass-rate on real tasks is untested: " + LIVE_DETAIL[:160],
          f"run a real task benchmark twice (task_tiers all-main vs default) {RESET}, compare pass rate and /stats cost")
 
 
@@ -304,7 +305,8 @@ LIVE_TASKS = [  # (background?, prompt, check(dir) -> bool); every task is tiny 
      lambda d: _py(d, "fizz.py").splitlines()[-1:] == ["FizzBuzz"] and _py(d, "fizz.py").splitlines()[2] == "Fizz"),
     (False, "Create wc.py that prints the number of words in the string 'one two three four', then run it with bash.",
      lambda d: _py(d, "wc.py") == "4"),
-    # "prints 6 factorial" does not fix the format: "720" and "6! = 720" are both right, so the check looks for the value
+    # "prints 6 factorial" does not fix the format: "720" and "6! = 720" are both right,
+    # so the check looks for the value
     (False, "Create fact.py that prints 6 factorial, then run it with bash.",
      lambda d: "720" in _py(d, "fact.py").replace("=", " ").split()),
     (True, "Create a.txt containing exactly the word alpha.",
@@ -447,7 +449,8 @@ def preview() -> None:
     status = "PASS" if res["ok"] and res["sketch"] and res["secs"] < 30 else "FAIL"
     emit(M, crit, f"real TUI session, `/preview a CLI todo app` timed from Enter to the finished sketch; "
          f"fast tier = {res['label']}", status,
-         f"{overhead}\n{res['tail']}\n/preview took {res['secs']} s (limit 30 s); sketch with Risks shown: {res['sketch']}")
+         f"{overhead}\n{res['tail']}\n/preview took {res['secs']} s (limit 30 s); "
+         f"sketch with Risks shown: {res['sketch']}")
 
 
 # ---------------------------------------------------------------- 6. /ultraresearch
@@ -562,7 +565,8 @@ def missed_cron() -> None:
         await s2.close()
         if (first, again) != (1, 1) or [x["status"] for x in runs] != ["completed"]:
             raise AssertionError(f"fired {first} then {again}, runs={[x['status'] for x in runs]}")
-        return f"24 slots missed (2 h of */5), after restart fired {first} time, still {again} after more ticks; run rows: {len(runs)}"
+        return (f"24 slots missed (2 h of */5), after restart fired {first} time, "
+                f"still {again} after more ticks; run rows: {len(runs)}")
 
     emit(M, crit, "JobScheduler on a persisted automation.db: stop, jump fake clock 2 h, restart", "PASS",
          asyncio.run(go()))
@@ -576,7 +580,8 @@ def make(i):
     def f(path: str, count: int = 1, recursive: bool = False, pattern: str = "*") -> str:
         return "ok"
     f.__name__ = f"tool_{i:03d}"
-    f.__doc__ = f"Tool number {i}: performs operation {i} on a path, optionally recursive, with a glob pattern and a repeat count, returning a status string."
+    f.__doc__ = f"Tool number {i}: performs operation {i} on a path, optionally recursive, \
+with a glob pattern and a repeat count, returning a status string."
     return f
 for i in range(300):
     mcp.tool()(make(i))

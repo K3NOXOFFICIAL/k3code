@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import re
 import signal
@@ -187,10 +188,9 @@ async def run(a: argparse.Namespace) -> int:
         samples.append(sample(d, t_start, wall0))
         log(fmt(samples[-1]))
         while time.monotonic() - t_start < total_s and d.alive() and not stop.is_set():
-            try:
-                await asyncio.wait_for(stop.wait(), max(0.0, min(a.interval, total_s - (time.monotonic() - t_start))))
-            except TimeoutError:
-                pass
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop.wait(),
+                                       max(0.0, min(a.interval, total_s - (time.monotonic() - t_start))))
             if stop.is_set():
                 break
             samples.append(sample(d, t_start, wall0))

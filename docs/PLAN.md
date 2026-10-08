@@ -1,5 +1,7 @@
 # k3code: a new coding harness assembled from OSS parts
 
+> Status note (2026-10-08): this is the original design. Where it differs from the tree, README.md and the code are authoritative: the core is Python 3.12+ in `core/src/k3code/`, the transport is stdio or a unix socket, and file names in the reuse map are design names.
+
 ## Context
 The owner wants their own terminal coding harness, **k3code** (working name). It should feel like Claude Code (slash commands, an agent list under the input, ↑ history), run unattended 24/7, keep retrying when offline and pause/resume work, route to fallback providers and cheaper models, improve itself, learn the user's decisions, plan before it acts, fan out agents on its own, and ship with a multi-window terminal (a tuios fork) and a guided installer.
 
@@ -41,19 +43,19 @@ Research (2026-10-07):
 
 | Component | Language | What it is |
 |---|---|---|
-| `core/` k3coded | Python 3.13 (uv) | New agent loop + tool registry + provider router + scheduler; vendored modules sit behind ports |
-| `tui/` | TS/Ink | Vendored Hermes `ui-tui` + `hermes-ink`, talking to k3coded over the Hermes tui_gateway JSON-RPC contract (WS/stdio) |
+| `core/` k3coded | Python 3.12+ (uv) | New agent loop + tool registry + provider router + scheduler; vendored modules sit behind ports |
+| `tui/` | TS/Ink | Vendored Hermes `ui-tui` + `hermes-ink`, talking to k3coded over the Hermes tui_gateway JSON-RPC contract (stdio or a unix socket) |
 | `panes/` `k3` | Go | tuios subtree with the new `internal/k3keys` keymap |
 
 **Processes** (systemd --user, linger):
-- `k3code-host`: sessions, WS on 127.0.0.1, plus the tailnet with a token.
+- `k3code-host`: sessions, WS on 127.0.0.1, plus the tailnet with a token (design only: the tree has one `k3code daemon`, reached over a unix socket, and no WebSocket or tailnet listener).
 - `k3code-sched`: cron, events, netwatch, learner, governor.
 - `k3code` TUI clients attach to the host. If the host is down, they fall back to a stdio child.
 
 **Discipline**:
 - Every non-new file is listed in `VENDOR.toml` (project, path, commit, license, sha256).
 - `scripts/vendor_check.py` enforces the license allowlist and the banned sources.
-- Core code reaches vendored code only through `core/k3/ports/*`.
+- Core code reaches vendored code only through `core/k3/ports/*` (design rule; this tree has no such directory).
 
 ### Reuse map (vendor = copy + adapt; ref = reimplement from design)
 
@@ -67,21 +69,21 @@ Research (2026-10-07):
 | Automations / /schedule | hermes `cron/jobs` schedule math, `suggestions.py` + catalog | ref: `cron/scheduler`; NEW event bus (file/git/webhook) |
 | Self-improvement | hermes `background_review`, `curator`, `skill_manager_tool` | NEW weekly optimizer (A/B overlays, rollback, PRs) |
 | Learning decisions / permission suggestions | hermes `approvals_suggest.py`, mem0 plugin | NEW `decisions.py` + `distiller.py` → USER.md / preferences / mem0 |
-| Proactive proposals | openclaw task-suggestion tools (ported), hermes suggestions dedup latch | NEW post-turn proposer |
-| Degradation to cheaper models | litellm complexity-router heuristics (ported, no dependency) | NEW `degrade.py` tiers, chosen in the wizard |
-| Plan-first auto mode + scope decision + auto fan-out | hermes `delegate_tool` batch, `subagent_worktree`, `kanban_decompose` prompts; pi planner/worker/reviewer prompts | NEW `scope_gate`, `complexity`, `fanout` with governor |
+| Proactive proposals | openclaw task-suggestion tools (design reference), hermes suggestions dedup latch | NEW post-turn proposer |
+| Degradation to cheaper models | litellm complexity-router heuristics (design reference; no code copied) | NEW `degrade.py` tiers, chosen in the wizard |
+| Plan-first auto mode + scope decision + auto fan-out | hermes `delegate_tool` batch, `subagent_worktree`, `kanban_decompose` prompts; pi planner/worker/reviewer prompts (design reference) | NEW `scope_gate`, `complexity`, `fanout` with governor |
 | Agent strip under the input, ↑ history, states | hermes ui-tui `agentsPanel`, `agentControls`, `activeSessionSwitcher` (moved below the composer, cross-session rows) | NEW `tui/src/k3/agentStrip.tsx` |
 | Focus mode (only questions, input, results) | hermes `/focus` + details | NEW importance tag on every event + `focusPolicy.ts` |
 | Compaction, MCP (deferred tools), memory, skills | hermes `context_compressor`, `mcp_tool`, `memory_manager`, skills; opencode compaction template | gateway MCP + mem0 + skills-library preconfigured |
 | Sessions: export/import/fork/branch/resume/rename | hermes `hermes_state_portability`, `session_export`, `rewind` | NEW `.k3bundle` (settings + session, redacted) |
-| Install + guided setup + doctor + update | openclaw onboard flow (resumable) + systemd policy + health-check contract; hermes setup/doctor | NEW `install.sh`, 12-step wizard (user, system, main use, theme, provider chain, degradation tiers, keymap tour), versioned update with rollback |
+| Install + guided setup + doctor + update | openclaw onboard flow (resumable), systemd policy and health-check contract (design references); hermes setup/doctor | NEW `install.sh`, 12-step wizard (user, system, main use, theme, provider chain, degradation tiers, keymap tour), versioned update with rollback |
 | /review, /ultraresearch | codex `review/rubric.md` (Apache NOTICE); atomic-agents deep-research prompts | runs on gateway searxng/fetch |
 | Multi-window | tuios subtree | NEW `internal/k3keys` |
 
 **Commands.** All 36 are mapped:
 - goal, loop, compact, bg, effort, model, ultracode, ultraplan, preview, stats, branch, clear, exit, stop, update, settings, export, fork, import, mcp, memory, output-style, permissions, rename, resume, skills, ultraresearch, review, debug, doctor, schedule, config, update-config, add-dir, artifacts, advisor.
-- The full map goes in `docs/command-map.md`.
-- `/preview` produces a fast cheap-tier sketch (ASCII mockup, file tree, rough diff) before any real work.
+- No separate map file exists in this tree; the command list is in README.md (Slash commands).
+- `/preview` produces a fast-tier sketch (ASCII mockup, file tree, rough diff) before any real work.
 - `/advisor` is a stronger-model reviewer, also called automatically at plan commit and at goal-done.
 
 **k3 panes keymap** (zellij-style, replacing tuios' modes):
@@ -129,7 +131,7 @@ Research (2026-10-07):
 - Back up before touching configs. Never push to main directly.
 
 ## Verification
-- **CI:** pytest (core), vitest (tui), go test (panes), contract-drift check, vendor_check, banned-import lint.
+- **CI (as implemented):** ruff and pytest (core), vitest (tui), go build and `go test ./internal/k3keys/...` (panes), vendor_check, and gitleaks. A contract-drift check and a banned-import lint are not in CI.
 - **Per milestone:** the exit checks above, run on the laptop. The M2 chaos suite runs as `scripts/chaos/*.sh`.
 - **Token check:** after each milestone, compare OmniRoute usage against Claude usage in `/stats` and the OmniRoute insights. The goal is that most build tokens go through OmniRoute.
 - **End of each milestone:** a mem0 summary memory with open TODOs.

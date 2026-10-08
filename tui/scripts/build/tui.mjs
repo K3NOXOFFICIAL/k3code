@@ -49,6 +49,12 @@ export async function buildTui(options) {
       //     circular async chain that hung the TUI at startup with only ANSI
       //     reset bytes on screen (#31227).
       alias: { '@k3code/ink': resolve(root, 'packages/hermes-ink/src/entry-exports.ts') },
+      // Bake React's production build into dist/ (react-reconciler's dev build alone is ~1.1 MB
+      // of source). NODE_ENV is fixed at build time, so the bundle never switches to dev mode.
+      define: { 'process.env.NODE_ENV': '"production"' },
+      // keepNames: function/class names stay readable in stack traces written to the logs.
+      minify: true,
+      keepNames: true,
       plugins: [stubDevtools],
       // Some transitive deps use CommonJS `require(...)` at runtime. ESM bundles
       // don't get a `require` binding automatically, so we inject one.

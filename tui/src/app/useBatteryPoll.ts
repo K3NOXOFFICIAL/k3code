@@ -6,7 +6,7 @@ import type { SystemBatteryResponse } from '../gatewayTypes.js'
 import { asRpcResult } from '../lib/rpc.js'
 
 import type { BatteryCategory, BatteryInfo } from './interfaces.js'
-import { $uiState, patchUiState } from './uiStore.js'
+import { $uiState, getUiState, patchUiState } from './uiStore.js'
 
 const BATTERY_POLL_MS = 30_000
 
@@ -14,6 +14,16 @@ const CATEGORIES: ReadonlySet<BatteryCategory> = new Set(['bad', 'critical', 'di
 
 const normalizeCategory = (raw: unknown): BatteryCategory =>
   typeof raw === 'string' && CATEGORIES.has(raw as BatteryCategory) ? (raw as BatteryCategory) : 'dim'
+
+/** True when two readings show the same thing (field-by-field; `toBatteryInfo` makes a fresh object each poll). */
+export const sameBatteryInfo = (a: BatteryInfo | null, b: BatteryInfo | null): boolean =>
+  a === b ||
+  (a !== null &&
+    b !== null &&
+    a.available === b.available &&
+    a.category === b.category &&
+    a.percent === b.percent &&
+    a.plugged === b.plugged)
 
 /** Coerce a `system.battery` RPC payload into the UI's BatteryInfo shape. */
 export const toBatteryInfo = (r: null | SystemBatteryResponse): BatteryInfo | null => {
@@ -57,9 +67,12 @@ export function useBatteryPoll(gw: GatewayClient) {
     const poll = async () => {
       try {
         const r = asRpcResult<SystemBatteryResponse>(await gw.request<SystemBatteryResponse>('system.battery', {}))
+        const next = toBatteryInfo(r)
 
-        if (!cancelled) {
-          patchUiState({ batteryStatus: toBatteryInfo(r) })
+        // Patch only a changed reading: every patch re-renders all $uiState subscribers,
+        // and the reading is usually the same as the last poll.
+        if (!cancelled && !sameBatteryInfo(getUiState().batteryStatus, next)) {
+          patchUiState({ batteryStatus: next })
         }
       } catch {
         // Keep the last-good reading on a transient RPC failure.

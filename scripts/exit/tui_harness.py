@@ -36,7 +36,8 @@ def write_home(home: Path, script: list[dict[str, Any]] | None, config_extra: st
         (home / "fake.json").write_text(json.dumps(script))
     (home / "config.yaml").write_text(
         f"permission_mode: {permission_mode}\nproviders:\n  - {{name: fake, kind: openai, base_url: 'http://fake', "
-        "api_key_env: PATH, models: {default: m, cheap: " + cheap + "}}\nreliability: {flags: {netwatch: false}}\n" + config_extra)
+        "api_key_env: PATH, models: {default: m, cheap: " + cheap + "}}\n"
+        "reliability: {flags: {netwatch: false}}\n" + config_extra)
 
 
 class Tui:

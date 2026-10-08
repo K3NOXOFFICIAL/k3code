@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import logging
@@ -11,27 +10,16 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import click
 
 from k3code import __version__
-from k3code.agent.loop import AgentLoop
-from k3code.config import K3CODE_HOME, _current_home, load_config
-from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
-from k3code.extratools import register_skill_tool
-from k3code.permissions import InvalidPermissionMode, PermissionMode, permission_mode_from_config
-from k3code.prompting import build_system_prompt
-from k3code.providers import make_providers
-from k3code.reliability import (
-    BudgetExceeded,
-    DiskGuardFull,
-    Reliability,
-    build_reliability,
-)
-from k3code.reliability.persistent_retry import TurnCancelled
-from k3code.router import CooldownStore, Router, RouterEvent, build_chain
-from k3code.routing.tiers import router_options
+
+if TYPE_CHECKING:  # annotations only: the engine is imported inside the functions, so --version and --help stay cheap
+    from k3code.permissions import PermissionMode
+    from k3code.reliability import Reliability
+    from k3code.router import RouterEvent
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -65,6 +53,8 @@ def _resolve_model_specs(config: Any) -> list[str | list[str]]:
 
 
 def _cooldown_path() -> Path:
+    from k3code.config import _current_home
+
     return _current_home() / "cooldowns.json"
 
 
@@ -82,6 +72,9 @@ def _print_event(event: RouterEvent) -> None:
 
 def _build_reliability(config: Any, session: str) -> Reliability:
     """M2: build the reliability bundle from the config's reliability dict."""
+    from k3code.config import K3CODE_HOME
+    from k3code.reliability import build_reliability
+
     return build_reliability(config, session=session, home=K3CODE_HOME)
 
 
@@ -96,6 +89,16 @@ async def _run_headless(
     resume: bool = False,
 ) -> dict[str, Any] | None:
     """Run headless mode and return final result dict."""
+    from k3code.agent.loop import AgentLoop
+    from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
+    from k3code.extratools import register_skill_tool
+    from k3code.prompting import build_system_prompt
+    from k3code.providers import make_providers
+    from k3code.reliability import BudgetExceeded, DiskGuardFull
+    from k3code.reliability.persistent_retry import TurnCancelled
+    from k3code.router import CooldownStore, Router, build_chain
+    from k3code.routing.tiers import router_options
+
     system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
@@ -165,6 +168,16 @@ async def _run_repl(
     config: Any,
 ) -> None:
     """Run minimal REPL."""
+    from k3code.agent.loop import AgentLoop
+    from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
+    from k3code.extratools import register_skill_tool
+    from k3code.prompting import build_system_prompt
+    from k3code.providers import make_providers
+    from k3code.reliability import BudgetExceeded, DiskGuardFull
+    from k3code.reliability.persistent_retry import TurnCancelled
+    from k3code.router import CooldownStore, Router, build_chain
+    from k3code.routing.tiers import router_options
+
     system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
@@ -260,6 +273,8 @@ async def _run_repl(
 
 def _permission_from_config(key: str, value: str) -> PermissionMode:
     """The PermissionMode for a config string. An unknown value is a usage error, not a ValueError traceback."""
+    from k3code.permissions import InvalidPermissionMode, permission_mode_from_config
+
     try:
         return permission_mode_from_config(key, value)
     except InvalidPermissionMode as e:
@@ -309,6 +324,11 @@ def main(
         _run_gateway()
         return
 
+    import asyncio
+
+    from k3code.config import load_config
+    from k3code.permissions import PermissionMode
+
     # Load config
     config = load_config(project_dir=config_dir or Path.cwd())
     if not config.providers and (prompt or not _is_interactive()):
@@ -349,6 +369,8 @@ def _is_interactive() -> bool:
 
 def _run_gateway() -> None:
     """Serve the JSON-RPC gateway on stdio (stdout = frames, stderr = logs)."""
+    import asyncio
+
     logging.basicConfig(
         stream=sys.stderr,
         level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
@@ -379,6 +401,10 @@ def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = 
             click.echo("The TUI is not available (need node + tui/dist/entry.js).", err=True)
             sys.exit(1)
         logger.warning("TUI not available (need node + tui/dist/entry.js); falling back to REPL")
+        import asyncio
+
+        from k3code.config import load_config
+
         config = load_config(project_dir=Path.cwd())
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(_run_repl(
@@ -470,6 +496,8 @@ def cli(
 def gateway(stdio_flag: bool, attach: bool, socket_opt: Path | None, readonly: bool) -> None:
     """Run the JSON-RPC gateway (what the TUI spawns), or attach to the daemon with --attach."""
     if attach:
+        import asyncio
+
         from k3code.daemon import attach_bridge
 
         sys.exit(asyncio.run(attach_bridge(socket_opt, readonly=readonly)))
@@ -493,6 +521,8 @@ def attach_cmd(session_id: str, readonly: bool, socket_opt: Path | None) -> None
 @click.option("--socket", "socket_opt", type=click.Path(path_type=Path), help="Daemon socket path")
 def tail_cmd(subagent_id: str, socket_opt: Path | None) -> None:
     """Follow a sub-agent of the daemon, read-only (what fan-out opens per child with autonomy.fanout.panes)."""
+    import asyncio
+
     from k3code.daemon import tail_subagent
 
     sys.exit(asyncio.run(tail_subagent(subagent_id, socket_opt)))
@@ -501,6 +531,8 @@ def tail_cmd(subagent_id: str, socket_opt: Path | None) -> None:
 @cli.command("daemon")
 def daemon_cmd() -> None:
     """Run the long-lived host: sessions keep running while no TUI is attached (systemd: Type=notify)."""
+    import asyncio
+
     from k3code.daemon import DaemonAlreadyRunning, run_daemon
 
     logging.basicConfig(
@@ -549,7 +581,10 @@ def service_status() -> None:
 @click.option("--no-probe", is_flag=True, help="Skip network probes")
 def doctor_cmd(as_json: bool, no_probe: bool) -> None:
     """Health checks with fix hints. Exit status 1 when any check fails."""
+    import asyncio
+
     from k3code import doctor
+    from k3code.config import load_config
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
     checks = asyncio.run(doctor.run_checks(load_config(project_dir=Path.cwd()), probe=not no_probe))
@@ -757,10 +792,6 @@ def memory_cmd(action: str, user: bool) -> None:
         click.echo(f"{scope}: {p}  " + (f"{p.stat().st_size} bytes" if p.is_file() else "(missing)"))
 
 
-if __name__ == "__main__":
-    cli()
-
-
 # ── schedule (cron jobs) ──────────────────────────────────────────────
 
 
@@ -834,6 +865,8 @@ for _name in ("rm", "pause", "resume", "run"):
 @click.option("--socket", "socket_opt", type=click.Path(path_type=Path), help="Daemon socket path")
 def slash_cmd(command: tuple[str, ...], socket_opt: Path | None) -> None:
     """Run a slash command against the running daemon, e.g. `k3code slash /automations list`."""
+    import asyncio
+
     from k3code.daemon import slash_via_daemon
 
     try:
@@ -841,3 +874,8 @@ def slash_cmd(command: tuple[str, ...], socket_opt: Path | None) -> None:
     except OSError as e:
         raise click.ClickException(f"cannot reach the daemon ({e}); start it with `k3code daemon`") from e
     click.echo(out)
+
+
+# Keep the guard last: every @cli.command / @cli.group above must be registered before cli() runs.
+if __name__ == "__main__":
+    cli()

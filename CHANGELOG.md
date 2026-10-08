@@ -27,11 +27,10 @@ The first version meant for people other than its author. It is alpha: the core 
 - `/artifacts publish`. It reports that publishing is not implemented.
 - Platforms other than Linux on x86_64. macOS is untested.
 - The update path against published releases. There are none yet, so the update and rollback path was only tested against local version directories.
-- One upstream TUI test is known to fail. CI excludes it.
 
 ### Changed before publication
 
-- Hard-coded defaults that pointed at the author's own servers were replaced with neutral values. Web search has no default SearXNG instance, so the keyless DuckDuckGo fallback is used until `research.searxng_url` is set. The OmniRoute preset points at `localhost:20128`. The hardline list names placeholder hosts.
+- Hard-coded defaults that pointed at the author's own servers were replaced with neutral values. Web search has no default SearXNG instance, so the keyless DuckDuckGo fallback is used until `research.searxng_url` is set, and whenever that SearXNG is unreachable. The OmniRoute preset points at `localhost:20128`. The hardline list names placeholder hosts.
 - If you relied on the old defaults, set your own values in your config. To keep protecting your own hosts from remote service restarts, add patterns under `permissions.hardline`.
 - Pull requests and pushes are checked for secrets (`.github/workflows/gitleaks.yml`).
 

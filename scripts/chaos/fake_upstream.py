@@ -14,7 +14,6 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-
 #: Chaos knobs (set from the command line in __main__):
 #:   --good-key K     only ``Authorization: Bearer K`` is accepted, anything else gets 401
 #:   --ratelimit S    the first chat request opens a rate-limit window: it and every request during the next S

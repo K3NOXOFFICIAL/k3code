@@ -78,6 +78,7 @@ from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router
 from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
+from k3code.tools import clip_head_tail
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -214,7 +215,8 @@ class LiveSession:
                     # OpenAI-compatible and Anthropic providers, for every session that had used a tool.
                     tool_calls=[
                         ToolCall(id=str(tc.get("id") or ""), name=str(tc.get("name") or ""),
-                                 arguments=dict(tc.get("arguments") or {}))
+                                 arguments=dict(tc.get("arguments") or {}),
+                                 raw_arguments=tc.get("raw_arguments"))
                         for tc in (m.get("tool_calls") or [])
                     ],
                 )
@@ -247,10 +249,16 @@ CONTEXT_DEFAULTS: dict[str, Any] = {"compact_at_tokens": 80_000, "keep_messages"
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
-    """Rough size of a stored conversation (~4 characters per token), tool calls included."""
+    """Rough size of what a conversation sends (~4 characters per token), tool calls included.
+
+    Tool results are counted as the model receives them (head+tail clip), so the stored full text does not trigger
+    compaction early; everything else is counted as stored.
+    """
     chars = 0
     for m in messages:
         c = m.get("content")
+        if m.get("role") == "tool" and isinstance(c, str):
+            c = clip_head_tail(c)
         chars += len(c) if isinstance(c, str) else len(json.dumps(c, ensure_ascii=False)) if c else 0
         if m.get("tool_calls"):
             chars += len(json.dumps(m["tool_calls"], ensure_ascii=False))
@@ -1884,9 +1892,18 @@ def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
         if m.name:
             entry["name"] = m.name
         if m.tool_calls:
-            entry["tool_calls"] = [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in m.tool_calls]
+            entry["tool_calls"] = [_stored_tool_call(tc) for tc in m.tool_calls]
         out.append(entry)
     return out
+
+
+def _stored_tool_call(tc: ToolCall) -> dict[str, Any]:
+    """A tool call as stored. ``raw_arguments`` (the model's own argument text) is kept: a turn rebuilt from storage
+    must re-send the same bytes as the turn that made the call, or the provider's prompt cache misses from there."""
+    stored: dict[str, Any] = {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+    if tc.raw_arguments is not None:
+        stored["raw_arguments"] = tc.raw_arguments
+    return stored
 
 
 def _command_for_tool(tool_name: str, arguments: dict[str, Any]) -> str:

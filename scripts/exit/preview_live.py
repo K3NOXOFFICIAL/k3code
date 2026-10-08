@@ -2,7 +2,8 @@
 """Time `/preview` on the live fast tier in the real TUI (pexpect + pyte on `node tui/dist/entry.js`).
 
 Prints one JSON line: {"ok": bool, "secs": float, "sketch": bool, "tail": str} or {"skipped": reason}.
-Used by m4_autonomy.py (which runs under a uv env without pexpect/pyte). Re-execs under `uv run --with pexpect --with pyte`.
+Used by m4_autonomy.py (which runs under a uv env without pexpect/pyte). \
+Re-execs under `uv run --with pexpect --with pyte`.
 """
 from __future__ import annotations
 

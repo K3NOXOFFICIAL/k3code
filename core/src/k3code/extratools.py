@@ -93,8 +93,8 @@ def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
         ToolSpec(
             name="mcp_tool_search",
             description=(
-                "Load full schemas of deferred MCP tools. Pass exact names (mcp__server__tool) or keywords; "
-                "matching tools become callable."
+                "Load full schemas of deferred MCP tools by exact name (mcp__server__tool) or keywords; "
+                "they become callable."
             ),
             parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
             side_effect=False,

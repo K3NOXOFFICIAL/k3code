@@ -31,16 +31,19 @@ def build_system_prompt(
     session_meta: dict[str, Any] | None = None,
     mcp: Any = None,
 ) -> str:
+    # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
+    # come first and the learned ones (USER.md's auto section is rewritten by the distiller) come last: a rewrite
+    # then invalidates only its own tail. Nothing here may depend on the time, a counter or the turn.
     parts = [base.rstrip()]
     style = outputstyle.style_text(effective_style(config, session_meta), cwd)
     if style:
         parts.append(style)
-    if mem := memory_prompt(cwd):
-        parts.append(mem)
     if skills := skills_prompt(cwd, list(config.skills.roots)):
         parts.append(skills)
     if mcp is not None and (m := mcp_prompt(mcp)):
         parts.append(m)
+    if mem := memory_prompt(cwd):
+        parts.append(mem)
     from k3code.learning.optimizer import overlay_prompt
 
     if overlay := overlay_prompt():
