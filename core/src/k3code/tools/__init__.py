@@ -140,8 +140,10 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     if size > MAX_READ_BYTES:
         # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
         if end is None:
-            return {"error": f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB): "
-                             "pass start and end to read a line range, or use grep to find what you need"}
+            return {
+                "error": f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB): "
+                "pass start and end to read a line range, or use grep to find what you need"
+            }
         return _read_range(path, max(1, start), end)
     text = path.read_bytes().decode("utf-8", errors="replace")  # reading may show U+FFFD; it never writes back
     lines = _split_lines(text)
@@ -174,8 +176,10 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     try:
         content = raw.decode("utf-8")  # strict: errors="replace" wrote U+FFFD over latin-1/binary bytes for good
     except UnicodeDecodeError:
-        return {"error": f"{path} is not valid UTF-8; refusing to edit it (that would destroy its bytes). "
-                         "Use bash (sed/iconv/python) for this file."}
+        return {
+            "error": f"{path} is not valid UTF-8; refusing to edit it (that would destroy its bytes). "
+            "Use bash (sed/iconv/python) for this file."
+        }
     # Match against LF text, write back with the file's own line endings (a pure-CRLF file stays CRLF).
     crlf = "\r\n" in content and content.count("\r\n") == content.count("\n")
     crlf = crlf and "\r" not in content.replace("\r\n", "")  # no lone CR either: every line end is CRLF
@@ -376,10 +380,10 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     try:
         cmd = ["rg", "--line-number", "--no-heading", "--color=never"]
         if include:
-            for inc in (include if isinstance(include, list) else [include]):
+            for inc in include if isinstance(include, list) else [include]:
                 cmd += ["-g", inc]
         if exclude:
-            for exc in (exclude if isinstance(exclude, list) else [exclude]):
+            for exc in exclude if isinstance(exclude, list) else [exclude]:
                 cmd += ["-g", f"!{exc}"]
         # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
         cmd += ["-e", pattern, "--", str(path)]
@@ -407,6 +411,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     except (FileNotFoundError, RuntimeError):
         # Python fallback
         import re
+
         matches = []
         for root, _dirs, files in os.walk(path):
             for f in files:

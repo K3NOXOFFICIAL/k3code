@@ -1,5 +1,3 @@
-
-
 def test_api_key_check_accepts_a_key_loaded_from_the_env_file(monkeypatch):
     """The wizard stores keys in ~/.config/k3code/env; load_config fills p.api_key from it. check_keys only looked at
     os.environ, so `k3code doctor` and the update smoke test failed in every shell that did not export the key."""

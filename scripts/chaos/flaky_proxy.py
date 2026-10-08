@@ -7,6 +7,7 @@ The mode file holds one word, re-read on every connection and every second:
   up    forward traffic to the upstream
   down  stop listening (connection refused); live connections are cut on next data
 """
+
 from __future__ import annotations
 
 import argparse

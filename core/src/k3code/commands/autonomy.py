@@ -97,8 +97,9 @@ class PreviewCommand(CommandDef):
         except ChainExhausted as e:  # e.g. "all providers rate-limited until HH:MM"
             return _msg(f"Preview unavailable: {e}")
         live.stored.meta["preview_task"] = arg
-        write_artifact_file(ctx, "preview", ctx._home() / "artifacts" / "preview", f"preview {arg}", text,
-                            session=live.session_id)
+        write_artifact_file(
+            ctx, "preview", ctx._home() / "artifacts" / "preview", f"preview {arg}", text, session=live.session_id
+        )
         live.messages = [
             *live.messages,
             {"role": "user", "content": f"/preview {arg}"},
@@ -150,7 +151,9 @@ class AdvisorCommand(CommandDef):
             return _msg("Advisor review added to the conversation.")
         cfg = autonomy_cfg(ctx.config)
         context = await advisor.condensed_context(
-            ctx.model_caller, live.stored.messages, threshold=int(cfg["advisor_compact_chars"]),
+            ctx.model_caller,
+            live.stored.messages,
+            threshold=int(cfg["advisor_compact_chars"]),
             session_id=live.session_id,
         )
         text = await advisor.advise(ctx.model_caller, context, arg, session_id=live.session_id)

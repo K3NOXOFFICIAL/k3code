@@ -44,18 +44,21 @@ async def test_cancel_leaves_config_untouched(tmp_path):
     assert confio.latest_backup(path) is None
 
 
-@pytest.mark.parametrize("patch", [
-    {"providers": [{"name": "x"}]},
-    {"mem0": {"api_key_env": "X"}},
-    {"mem0": {"url": "http://m", "password": "hunter2"}},
-    {"output_style": "Bearer abcdef123456"},
-    {"permission_mode": "yolo"},
-    {"headless_permission": "yolo"},
-    {"permissions": {"hardline": []}},
-    {"permissions": {"bash": "allow"}},
-    {"autonomy": {"gate_modes": []}},
-    {"nonsense_key": 1},
-])
+@pytest.mark.parametrize(
+    "patch",
+    [
+        {"providers": [{"name": "x"}]},
+        {"mem0": {"api_key_env": "X"}},
+        {"mem0": {"url": "http://m", "password": "hunter2"}},
+        {"output_style": "Bearer abcdef123456"},
+        {"permission_mode": "yolo"},
+        {"headless_permission": "yolo"},
+        {"permissions": {"hardline": []}},
+        {"permissions": {"bash": "allow"}},
+        {"autonomy": {"gate_modes": []}},
+        {"nonsense_key": 1},
+    ],
+)
 async def test_secrets_and_hardline_relaxations_rejected(tmp_path, patch):
     path = tmp_path / "config.yaml"
     path.write_text("permissions:\n  hardline: ['foo']\n")

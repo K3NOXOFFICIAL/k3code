@@ -5,11 +5,19 @@ from k3code.learning import curator, distiller, review
 from k3code.skills import discover
 from learn_helpers import FakeCaller, FakeClock
 
-REPLY = json.dumps({
-    "facts": ["tests run with `uv run pytest -q`", "api_key=hunter2 is used"],
-    "skills": [{"name": "release-notes", "description": "write release notes",
-                "body": "1. list commits\n2. group by type"}, {"name": "Bad Name", "description": "x", "body": "y"}],
-})
+REPLY = json.dumps(
+    {
+        "facts": ["tests run with `uv run pytest -q`", "api_key=hunter2 is used"],
+        "skills": [
+            {
+                "name": "release-notes",
+                "description": "write release notes",
+                "body": "1. list commits\n2. group by type",
+            },
+            {"name": "Bad Name", "description": "x", "body": "y"},
+        ],
+    }
+)
 
 
 def convo(n):
@@ -31,8 +39,15 @@ async def test_review_creates_drafts_facts_then_proposal_and_accept_saves(tmp_pa
     from k3code.config import Mem0Config, Settings
 
     cfg = Settings(mem0=Mem0Config(url="http://m"))
-    r = await review.review_session(FakeCaller(REPLY), convo(8), store=store, cwd=tmp_path / "repo", config=cfg,
-                                    min_turns=6, mem0_post=lambda u, b, h: sent.append(b))
+    r = await review.review_session(
+        FakeCaller(REPLY),
+        convo(8),
+        store=store,
+        cwd=tmp_path / "repo",
+        config=cfg,
+        min_turns=6,
+        mem0_post=lambda u, b, h: sent.append(b),
+    )
     draft = tmp_path / "home" / "skills" / "_drafts" / "release-notes" / "SKILL.md"
     assert draft.is_file() and "group by type" in draft.read_text()
     assert not (tmp_path / "home" / "skills" / "Bad Name").exists()

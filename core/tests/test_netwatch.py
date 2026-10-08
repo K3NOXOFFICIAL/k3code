@@ -213,9 +213,7 @@ async def test_wait_until_usable_named_provider_up():
         nm_probe=_nm_probe,
         sleep=sleep,
     )
-    nw._providers["p"] = ProviderProbeState(
-        name="p", base_url="http://x.test", state=NetState.ONLINE
-    )
+    nw._providers["p"] = ProviderProbeState(name="p", base_url="http://x.test", state=NetState.ONLINE)
     st = await nw.wait_until_usable("p")
     assert st.usable_for_llm
     assert slept == []

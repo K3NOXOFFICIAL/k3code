@@ -119,8 +119,9 @@ class PlanFirst:
 
             session.preapproved_plan = None
             plan = str(pre["plan"])
-            return GateResult(prompt=f"{text}\n\nApproved plan (follow it):\n{plan}", verdict=plan_verdict(plan),
-                              plan=plan)
+            return GateResult(
+                prompt=f"{text}\n\nApproved plan (follow it):\n{plan}", verdict=plan_verdict(plan), plan=plan
+            )
         if not self.gate_applies(session):
             return GateResult(prompt=text)
         sid = session.session_id
@@ -130,8 +131,11 @@ class PlanFirst:
             verdict = scope.from_override(override, text)
         else:
             verdict = await scope.classify(
-                self.server.model_caller, text, Path(session.stored.cwd or "."),
-                recent=advisor_mod.transcript_text(session.stored.messages[-6:], per_message=400), session_id=sid,
+                self.server.model_caller,
+                text,
+                Path(session.stored.cwd or "."),
+                recent=advisor_mod.transcript_text(session.stored.messages[-6:], per_message=400),
+                session_id=sid,
             )
         h = self.scope_log.verdict(text, verdict, sid)
         session.emit("scope.verdict", {"session_id": sid, "hash": h, **verdict.as_dict()})
@@ -141,7 +145,10 @@ class PlanFirst:
         captured = await self._planning_turn(session, text, verdict)
         if not captured.approved:
             return GateResult(
-                prompt=text, proceed=False, verdict=verdict, scope_hash=h,
+                prompt=text,
+                proceed=False,
+                verdict=verdict,
+                scope_hash=h,
                 message="Plan not approved; nothing was executed. Rephrase the task or send it again.",
             )
         prompt = f"{text}\n\nApproved plan (follow it):\n{captured.plan}"
@@ -161,10 +168,19 @@ class PlanFirst:
         def show(status: str, **extra: Any) -> None:
             session.emit(
                 "plan.show",
-                {"session_id": sid, "plan_id": plan_id, "status": status, "plan": cap.plan,
-                 "sections": parse_plan(cap.plan), "scope": verdict.scope, "risk": verdict.risk,
-                 "fanout_candidate": verdict.fanout_candidate,
-                 "parallelizable": verdict.parallelizable, "subtasks": verdict.suggested_subtasks, **extra},
+                {
+                    "session_id": sid,
+                    "plan_id": plan_id,
+                    "status": status,
+                    "plan": cap.plan,
+                    "sections": parse_plan(cap.plan),
+                    "scope": verdict.scope,
+                    "risk": verdict.risk,
+                    "fanout_candidate": verdict.fanout_candidate,
+                    "parallelizable": verdict.parallelizable,
+                    "subtasks": verdict.suggested_subtasks,
+                    **extra,
+                },
                 importance="essential",
             )
 
@@ -223,8 +239,12 @@ class PlanFirst:
         if self.advisor_applies(session, "advisor_on_plan"):
             try:
                 extra["advisor"] = await advisor_mod.advise(
-                    server.model_caller, f"Task: {text}\n\nPlan:\n{cap.plan}", "Critique this approved plan.",
-                    session_id=sid, brief=True, timeout=60,
+                    server.model_caller,
+                    f"Task: {text}\n\nPlan:\n{cap.plan}",
+                    "Critique this approved plan.",
+                    session_id=sid,
+                    brief=True,
+                    timeout=60,
                 )
             except Exception:  # noqa: BLE001 - a missing critique must not stop the task
                 logger.warning("advisor critique after plan failed", exc_info=True)
@@ -245,16 +265,28 @@ class PlanFirst:
             self.emit_proposal(session, p)
 
     def emit_proposal(self, session: Any, p: Any) -> None:
-        session.emit("proposal.show", {"session_id": session.session_id, "id": p.id, "kind": p.kind,
-                                       "text": p.text, "action": p.action, "key": p.key})
+        session.emit(
+            "proposal.show",
+            {
+                "session_id": session.session_id,
+                "id": p.id,
+                "kind": p.kind,
+                "text": p.text,
+                "action": p.action,
+                "key": p.key,
+            },
+        )
 
     # ── after the task ──
 
     def finish(self, session: Any, result: GateResult, status: str, final_text: str, text: str) -> None:
         """Record the outcome and (when it went well) spawn the post-task proposer."""
         if result.scope_hash:
-            self.scope_log.outcome(result.scope_hash, status,
-                                   planned=bool(result.plan), fanout_candidate=bool(
-                                       result.verdict and result.verdict.fanout_candidate))
+            self.scope_log.outcome(
+                result.scope_hash,
+                status,
+                planned=bool(result.plan),
+                fanout_candidate=bool(result.verdict and result.verdict.fanout_candidate),
+            )
         if status == "done" and self.cfg["proposals"] and self.gate_applies(session) and final_text:
             self.spawn(self.propose_from(session, f"Task: {text}\n\nResult:\n{final_text[-3000:]}"))

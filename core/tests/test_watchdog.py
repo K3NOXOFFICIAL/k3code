@@ -77,8 +77,11 @@ async def test_a_fourth_kick_within_an_hour_parks_the_goal_and_notifies(tmp_path
     assert await server.watchdog_tick() == []
     assert provider.n == 0
     assert mgr.state.status == "paused" and mgr.state.paused_reason.startswith("parked:")
-    parked = [e["payload"] for e in server.event_log if e["type"] == "notification.show"
-              and "parked" in str(e["payload"].get("key"))]
+    parked = [
+        e["payload"]
+        for e in server.event_log
+        if e["type"] == "notification.show" and "parked" in str(e["payload"].get("key"))
+    ]
     assert len(parked) == 1 and parked[0]["level"] == "warning"
     await server.close()
 

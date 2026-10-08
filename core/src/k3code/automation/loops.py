@@ -193,7 +193,11 @@ class LoopManager:
         )
         try:
             result: RunResult = await self.runner.run_prompt(
-                prompt, session_id=row["session_id"], cwd=row["cwd"], model=row["model"], tick=ctx if paced else None,
+                prompt,
+                session_id=row["session_id"],
+                cwd=row["cwd"],
+                model=row["model"],
+                tick=ctx if paced else None,
                 kind="loop_tick",
             )
         except asyncio.CancelledError:

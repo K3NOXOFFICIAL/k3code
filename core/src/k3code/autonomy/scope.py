@@ -90,8 +90,16 @@ def prompt_hash(prompt: str) -> str:
     return hashlib.sha256(prompt.strip().encode()).hexdigest()[:16]
 
 
-_SCOPE_ALIASES = {"tiny": "trivial", "minor": "small", "moderate": "medium", "big": "large",
-                  "xl": "huge", "massive": "huge", "enormous": "huge", "project": "huge"}
+_SCOPE_ALIASES = {
+    "tiny": "trivial",
+    "minor": "small",
+    "moderate": "medium",
+    "big": "large",
+    "xl": "huge",
+    "massive": "huge",
+    "enormous": "huge",
+    "project": "huge",
+}
 _SCOPE_LINE_RE = re.compile(r"\bscope\W{0,6}(trivial|small|medium|large|huge)\b", re.IGNORECASE)
 
 
@@ -196,8 +204,13 @@ def apply_floor(verdict: ScopeVerdict, prompt: str) -> ScopeVerdict:
 
 def from_override(level: str, prompt: str) -> ScopeVerdict:
     """``/scope <level>``: skip the classifier; the danger floor still applies."""
-    v = ScopeVerdict(scope=level, needs_plan=level in ("large", "huge"), source="override",
-                     reason=f"/scope {level} override", parallelizable=level in ("large", "huge"))
+    v = ScopeVerdict(
+        scope=level,
+        needs_plan=level in ("large", "huge"),
+        source="override",
+        reason=f"/scope {level} override",
+        parallelizable=level in ("large", "huge"),
+    )
     return apply_floor(v, prompt)
 
 
@@ -220,8 +233,15 @@ def repo_summary(cwd: Path, *, max_files: int = 5000) -> str:
         # harness git: hooks and fsmonitor off, scrubbed env (the repo may hold a hook a sandboxed command wrote)
         from k3code.reliability.sandbox import child_env, harness_git_argv
 
-        out = subprocess.run(harness_git_argv("status", "--porcelain"), cwd=cwd, capture_output=True, text=True,
-                             timeout=5, env=child_env(), stdin=subprocess.DEVNULL)
+        out = subprocess.run(
+            harness_git_argv("status", "--porcelain"),
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=child_env(),
+            stdin=subprocess.DEVNULL,
+        )
         git = f"{len(out.stdout.splitlines())} changed files" if out.returncode == 0 else "not a git repo"
     except (OSError, subprocess.SubprocessError):
         git = "git unavailable"
@@ -268,8 +288,9 @@ class ScopeLog:
 
     def verdict(self, prompt: str, verdict: ScopeVerdict, session_id: str = "") -> str:
         h = prompt_hash(prompt)
-        self._append({"ts": time.time(), "type": "verdict", "hash": h, "session": session_id,
-                      "verdict": verdict.as_dict()})
+        self._append(
+            {"ts": time.time(), "type": "verdict", "hash": h, "session": session_id, "verdict": verdict.as_dict()}
+        )
         return h
 
     def outcome(self, h: str, outcome: str, **extra: Any) -> None:

@@ -4,6 +4,7 @@ The gateway runs with the scripted fake provider (K3CODE_FAKE_PROVIDER) so flows
 Assertions are made on the rendered screen (pyte terminal emulation), not on raw escape streams.
 Needs pexpect + pyte: m1_tui.py re-execs itself under `uv run --with pexpect --with pyte` when missing.
 """
+
 from __future__ import annotations
 
 import json
@@ -19,34 +20,70 @@ import pyte
 
 REPO = Path(__file__).resolve().parents[2]
 ROWS, COLS = 50, 160
-KEYS = {"enter": "\r", "esc": "\x1b", "shift_tab": "\x1b[Z", "tab": "\t", "up": "\x1b[A", "down": "\x1b[B",
-        "ctrl_c": "\x03", "ctrl_f": "\x06", "ctrl_d": "\x04"}
+KEYS = {
+    "enter": "\r",
+    "esc": "\x1b",
+    "shift_tab": "\x1b[Z",
+    "tab": "\t",
+    "up": "\x1b[A",
+    "down": "\x1b[B",
+    "ctrl_c": "\x03",
+    "ctrl_f": "\x06",
+    "ctrl_d": "\x04",
+}
 
 
 def core_python() -> str:
-    out = subprocess.run(["uv", "run", "python", "-c", "import sys;print(sys.executable)"],
-                         cwd=REPO / "core", capture_output=True, text=True).stdout.strip().splitlines()
+    out = (
+        subprocess.run(
+            ["uv", "run", "python", "-c", "import sys;print(sys.executable)"],
+            cwd=REPO / "core",
+            capture_output=True,
+            text=True,
+        )
+        .stdout.strip()
+        .splitlines()
+    )
     return out[-1]
 
 
-def write_home(home: Path, script: list[dict[str, Any]] | None, config_extra: str = "",
-               permission_mode: str = "default", cheap: str = "m") -> None:
+def write_home(
+    home: Path,
+    script: list[dict[str, Any]] | None,
+    config_extra: str = "",
+    permission_mode: str = "default",
+    cheap: str = "m",
+) -> None:
     home.mkdir(parents=True, exist_ok=True)
     if script is not None:
         (home / "fake.json").write_text(json.dumps(script))
     (home / "config.yaml").write_text(
         f"permission_mode: {permission_mode}\nproviders:\n  - {{name: fake, kind: openai, base_url: 'http://fake', "
         "api_key_env: PATH, models: {default: m, cheap: " + cheap + "}}\n"
-        "reliability: {flags: {netwatch: false}}\n" + config_extra)
+        "reliability: {flags: {netwatch: false}}\n" + config_extra
+    )
 
 
 class Tui:
-    def __init__(self, home: Path, cwd: Path, *, script: bool = True, env: dict[str, str] | None = None,
-                 gateway_args: str = "--stdio") -> None:
+    def __init__(
+        self,
+        home: Path,
+        cwd: Path,
+        *,
+        script: bool = True,
+        env: dict[str, str] | None = None,
+        gateway_args: str = "--stdio",
+    ) -> None:
         self.home, self.cwd = home, cwd
         cwd.mkdir(parents=True, exist_ok=True)
-        e = dict(os.environ, K3CODE_GATEWAY_CMD=f"{core_python()} -m k3code.cli gateway {gateway_args}",
-                 K3CODE_HOME=str(home), HOME=str(home / "h"), TERM="xterm-256color", NO_COLOR="")
+        e = dict(
+            os.environ,
+            K3CODE_GATEWAY_CMD=f"{core_python()} -m k3code.cli gateway {gateway_args}",
+            K3CODE_HOME=str(home),
+            HOME=str(home / "h"),
+            TERM="xterm-256color",
+            NO_COLOR="",
+        )
         e.pop("NO_COLOR")
         (home / "h").mkdir(parents=True, exist_ok=True)
         # keep uv/cargo caches working with the fake HOME
@@ -62,8 +99,16 @@ class Tui:
         self.stream = pyte.Stream(self.screen)
         self.ever: list[str] = []  # every distinct non-empty screen line, in first-seen order
         self._seen: set[str] = set()
-        self.child = pexpect.spawn("node", [str(REPO / "tui/dist/entry.js")], cwd=str(cwd), env=e,
-                                   dimensions=(ROWS, COLS), encoding="utf-8", codec_errors="replace", timeout=5)
+        self.child = pexpect.spawn(
+            "node",
+            [str(REPO / "tui/dist/entry.js")],
+            cwd=str(cwd),
+            env=e,
+            dimensions=(ROWS, COLS),
+            encoding="utf-8",
+            codec_errors="replace",
+            timeout=5,
+        )
 
     # --- screen -------------------------------------------------------------------------------
     def pump(self, sec: float = 0.5) -> None:

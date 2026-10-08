@@ -54,13 +54,21 @@ def list_skills(root: Path | None = None) -> list[dict[str, Any]]:
         if d.is_dir() and not d.name.startswith((".", "_")) and md.is_file():
             text = md.read_text(encoding="utf-8", errors="replace")
             fm = parse_frontmatter(text[:4000])
-            out.append({"name": fm.get("name") or d.name, "dir": d, "desc": fm.get("description", ""), "text": text,
-                        "mtime": md.stat().st_mtime})
+            out.append(
+                {
+                    "name": fm.get("name") or d.name,
+                    "dir": d,
+                    "desc": fm.get("description", ""),
+                    "text": text,
+                    "mtime": md.stat().st_mtime,
+                }
+            )
     return out
 
 
-def find_stale(skills: list[dict[str, Any]], usage: dict[str, dict[str, Any]], now: float, days: int = 30) -> list[
-        tuple[str, str]]:
+def find_stale(
+    skills: list[dict[str, Any]], usage: dict[str, dict[str, Any]], now: float, days: int = 30
+) -> list[tuple[str, str]]:
     stale = []
     for s in skills:
         u = usage.get(s["name"], {})
@@ -75,16 +83,19 @@ def find_stale(skills: list[dict[str, Any]], usage: dict[str, dict[str, Any]], n
 def find_duplicates(skills: list[dict[str, Any]]) -> list[tuple[str, str, float]]:
     pairs = []
     for i, a in enumerate(skills):
-        for b in skills[i + 1:]:
-            sim = jaccard(tokens(a["name"] + " " + a["desc"] + " " + a["text"][:1500]),
-                          tokens(b["name"] + " " + b["desc"] + " " + b["text"][:1500]))
+        for b in skills[i + 1 :]:
+            sim = jaccard(
+                tokens(a["name"] + " " + a["desc"] + " " + a["text"][:1500]),
+                tokens(b["name"] + " " + b["desc"] + " " + b["text"][:1500]),
+            )
             if sim >= DUP_THRESHOLD:
                 pairs.append((a["name"], b["name"], round(sim, 2)))
     return pairs
 
 
-def curate(store: ProposalStore, *, now: float | None = None, stale_days: int = 30, root: Path | None = None
-           ) -> dict[str, Any]:
+def curate(
+    store: ProposalStore, *, now: float | None = None, stale_days: int = 30, root: Path | None = None
+) -> dict[str, Any]:
     """Mark stale skills (``.curator.json``) and propose merges for duplicates. Never deletes."""
     now = time.time() if now is None else now
     root = root or skills_dir()
@@ -96,14 +107,23 @@ def curate(store: ProposalStore, *, now: float | None = None, stale_days: int = 
         (root / ".curator.json").write_text(json.dumps(marks, indent=1), encoding="utf-8")
     proposals: list[Proposal] = []
     for keep, drop, sim in find_duplicates(skills):
-        p = store.add("skill", f"Skills '{keep}' and '{drop}' overlap ({int(sim * 100)}%) → merge (archive '{drop}')?",
-                      f"archive skill {drop}", payload={"op": "merge", "keep": keep, "drop": drop, "similarity": sim},
-                      key=dedup_key("skill", f"merge {keep} {drop}"))
+        p = store.add(
+            "skill",
+            f"Skills '{keep}' and '{drop}' overlap ({int(sim * 100)}%) → merge (archive '{drop}')?",
+            f"archive skill {drop}",
+            payload={"op": "merge", "keep": keep, "drop": drop, "similarity": sim},
+            key=dedup_key("skill", f"merge {keep} {drop}"),
+        )
         if p:
             proposals.append(p)
     for name, why in stale:
-        p = store.add("skill", f"Skill '{name}' looks stale ({why}) → archive it?", f"archive skill {name}",
-                      payload={"op": "archive", "drop": name}, key=dedup_key("skill", f"stale {name}"))
+        p = store.add(
+            "skill",
+            f"Skill '{name}' looks stale ({why}) → archive it?",
+            f"archive skill {name}",
+            payload={"op": "archive", "drop": name},
+            key=dedup_key("skill", f"stale {name}"),
+        )
         if p:
             proposals.append(p)
     return {"stale": stale, "proposals": proposals}

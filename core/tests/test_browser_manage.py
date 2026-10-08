@@ -19,8 +19,9 @@ TUI_DEFAULT = "http://127.0.0.1:9222"  # what tui/src/app/slash/commands/ops.ts 
 
 async def error_of(server, method: str, params: dict) -> dict:
     await server._handle_line(json.dumps({"jsonrpc": "2.0", "id": 9, "method": method, "params": params}))
-    return next(json.loads(x)["error"] for x in server._frames if json.loads(x).get("id") == 9
-                and "error" in json.loads(x))
+    return next(
+        json.loads(x)["error"] for x in server._frames if json.loads(x).get("id") == 9 and "error" in json.loads(x)
+    )
 
 
 def _fake_attach(server, attached: list[str]):
@@ -38,7 +39,10 @@ async def test_status_with_no_browser_running_starts_nothing(tmp_path, monkeypat
     monkeypatch.setattr(b, "playwright_module", must_not_start)
     server = make(tmp_path, monkeypatch, [])
     assert await call(server, "browser.manage", {"action": "status", "session_id": None}) == {
-        "connected": False, "url": None, "messages": []}
+        "connected": False,
+        "url": None,
+        "messages": [],
+    }
 
 
 async def test_connect_with_default_settings_never_attaches_to_an_existing_browser(tmp_path, monkeypatch):
@@ -59,7 +63,9 @@ async def test_connect_attaches_only_to_the_configured_cdp_url(tmp_path, monkeyp
     assert "not the configured" in refused["messages"][0]
 
     done = await call(server, "browser.manage", {"action": "connect", "url": "http://127.0.0.1:9333"})
-    assert done["connected"] is True and done["url"] == "http://127.0.0.1:9333" and attached == ["http://127.0.0.1:9333"]
+    assert (
+        done["connected"] is True and done["url"] == "http://127.0.0.1:9333" and attached == ["http://127.0.0.1:9333"]
+    )
     assert (await call(server, "browser.manage", {"action": "status"}))["connected"] is True
 
     gone = await call(server, "browser.manage", {"action": "disconnect"})
@@ -90,8 +96,10 @@ def test_browser_manage_matches_the_generated_typescript_contract():
     assert "'browser.manage': { params: BrowserManageParams; result: BrowserManageResult }" in text
     assert "browser.manage" in srv._HANDLERS
     assert "export type BrowserAction = 'status' | 'connect' | 'disconnect'" in text
-    for iface, fields in (("BrowserManageParams", ("action", "url", "session_id", "profile")),
-                          ("BrowserManageResult", ("connected", "url", "messages"))):
+    for iface, fields in (
+        ("BrowserManageParams", ("action", "url", "session_id", "profile")),
+        ("BrowserManageResult", ("connected", "url", "messages")),
+    ):
         body = re.search(rf"export interface {iface} \{{(.*?)\n\}}", text, re.S)
         assert body, iface
         for field in fields:

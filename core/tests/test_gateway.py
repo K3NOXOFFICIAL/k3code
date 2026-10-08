@@ -351,12 +351,27 @@ def test_env_var_cleanup(monkeypatch):
 
 async def test_config_set_model_switches_session_model():
     """TUI /model <key> and the picker send config.set key=model; it must not be 'unsupported'."""
-    server = make_server(config=Settings(providers=[ProviderEntry(
-        name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "a", "cheap": "b"})]))
+    server = make_server(
+        config=Settings(
+            providers=[
+                ProviderEntry(
+                    name="t",
+                    kind="openai",
+                    base_url="http://t",
+                    api_key_env="NOPE",
+                    models={"default": "a", "cheap": "b"},
+                )
+            ]
+        )
+    )
     sid = (await rpc(server, "session.create", {"model": "default", "cwd": "/tmp"}))["result"]["session_id"]
     n = len(server._frames)  # type: ignore[attr-defined]
-    line = {"jsonrpc": "2.0", "id": 2, "method": "config.set",
-            "params": {"key": "model", "session_id": sid, "value": "cheap --provider t --session"}}
+    line = {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "config.set",
+        "params": {"key": "model", "session_id": sid, "value": "cheap --provider t --session"},
+    }
     await server._handle_line(json.dumps(line))
     ok = next(f for f in frames_of(server)[n:] if f.get("id") == 2)
     assert ok["result"]["value"] == "cheap"
@@ -378,8 +393,10 @@ async def test_a_stopped_turn_is_persisted_and_the_user_prompt_survives(tmp_path
     script.write_text(_json.dumps([{"type": "tool_call", "name": "bash", "arguments": {"command": "echo one"}}]))
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
     prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
-    srv = _GS(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
-              store=SessionStore(tmp_path / "s.db"))
+    srv = _GS(
+        config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+        store=SessionStore(tmp_path / "s.db"),
+    )
     srv._write = lambda s: None
     stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
     live = srv.live_for(stored)
@@ -410,14 +427,20 @@ async def test_tool_results_checkpoint_the_turn_before_it_ends(tmp_path, monkeyp
 
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
     script = tmp_path / "s.json"
-    script.write_text(_json.dumps([
-        {"type": "tool_call", "name": "bash", "arguments": {"command": "echo one"}, "when": "turn_first"},
-        {"type": "text", "text": "all done", "when": "turn_after_tool"},
-    ]))
+    script.write_text(
+        _json.dumps(
+            [
+                {"type": "tool_call", "name": "bash", "arguments": {"command": "echo one"}, "when": "turn_first"},
+                {"type": "text", "text": "all done", "when": "turn_after_tool"},
+            ]
+        )
+    )
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
     prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
-    srv = GatewayServer(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
-                        store=SessionStore(tmp_path / "s.db"))
+    srv = GatewayServer(
+        config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+        store=SessionStore(tmp_path / "s.db"),
+    )
     srv._write = lambda s: None
     srv.CHECKPOINT_EVERY_S = 0.0
     stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
@@ -440,8 +463,10 @@ async def test_idle_sessions_stop_their_netwatch_and_rearm_on_the_next_turn(tmp_
     script.write_text(_json.dumps([{"type": "text", "text": "ok"}]))
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
     prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
-    srv = GatewayServer(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
-                        store=SessionStore(tmp_path / "s.db"))
+    srv = GatewayServer(
+        config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+        store=SessionStore(tmp_path / "s.db"),
+    )
     srv._write = lambda s: None
     stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
     live = srv.live_for(stored)
@@ -459,8 +484,14 @@ async def test_alternating_model_keys_do_not_rebuild_the_provider_stack(tmp_path
     """Sessions on different model keys (a cron job with model: next to an interactive one) rebuilt providers, the
     cooldown store and every tier router on each alternating turn, closing none of the old ones."""
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
-    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", api_key="x",
-                         models={"default": "m", "alt": "m2"})
+    prov = ProviderEntry(
+        name="t",
+        kind="openai",
+        base_url="http://t",
+        api_key_env="NOPE",
+        api_key="x",
+        models={"default": "m", "alt": "m2"},
+    )
     config = Settings(providers=[prov], default_model="default")
     srv = GatewayServer(config=config, store=SessionStore(tmp_path / "s.db"))
     srv._ensure_router("default")
@@ -490,8 +521,9 @@ async def test_the_prompt_and_the_tool_call_are_on_disk_before_the_first_tool_ru
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
     prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
     db = tmp_path / "s.db"
-    srv = GatewayServer(config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
-                        store=SessionStore(db))
+    srv = GatewayServer(
+        config=Settings(providers=[prov], default_model="default", permission_mode="yolo"), store=SessionStore(db)
+    )
     srv._write = lambda s: None
     stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
     live = srv.live_for(stored)

@@ -68,9 +68,7 @@ async def test_router_retries_then_fails_over(sample_messages, sample_tools, pro
 
     # Secondary: succeeds
     success_chunk = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\ndata: {"choices":[{"delta":{}}]}\ndata: [DONE]\n'
-    secondary_responses = [
-        httpx.Response(200, text=success_chunk, headers={"content-type": "text/event-stream"})
-    ]
+    secondary_responses = [httpx.Response(200, text=success_chunk, headers={"content-type": "text/event-stream"})]
     secondary, _ = provider_factory(secondary_responses)
 
     chain = build_chain([primary, secondary], [["model-1"], ["model-2"]])
@@ -102,9 +100,7 @@ async def test_router_401_immediate_failover(sample_messages, sample_tools, prov
     primary, _ = provider_factory(primary_responses)
 
     success_chunk = 'data: {"choices":[{"delta":{"content":"OK"}}]}\ndata: {"choices":[{"delta":{}}]}\ndata: [DONE]\n'
-    secondary_responses = [
-        httpx.Response(200, text=success_chunk, headers={"content-type": "text/event-stream"})
-    ]
+    secondary_responses = [httpx.Response(200, text=success_chunk, headers={"content-type": "text/event-stream"})]
     secondary, _ = provider_factory(secondary_responses)
 
     chain = build_chain([primary, secondary], [["model-1"], ["model-2"]])
@@ -262,6 +258,7 @@ def test_cooldown_arms_and_expires():
 
     # Advance time
     import time
+
     time.sleep(1.1)
     assert not store.in_cooldown(provider="test", model="model-1", base_url="https://api.test.com")
 

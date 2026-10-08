@@ -23,14 +23,27 @@ class FakeRunner:
         self.pace: list[float | None] = []  # per-run: seconds the "model" asks for (self-paced)
 
     async def run_prompt(
-        self, prompt, *, session_id=None, cwd="", model="", name="", mode="auto", tick: TickContext | None = None,
+        self,
+        prompt,
+        *,
+        session_id=None,
+        cwd="",
+        model="",
+        name="",
+        mode="auto",
+        tick: TickContext | None = None,
         kind="background_turn",
     ):
         i = len(self.prompts)
         self.prompts.append(
             {
-                "prompt": prompt, "session_id": session_id, "cwd": cwd, "model": model,
-                "name": name, "mode": mode, "kind": kind,
+                "prompt": prompt,
+                "session_id": session_id,
+                "cwd": cwd,
+                "model": model,
+                "name": name,
+                "mode": mode,
+                "kind": kind,
             }
         )
         if tick is not None and i < len(self.pace) and self.pace[i] is not None:

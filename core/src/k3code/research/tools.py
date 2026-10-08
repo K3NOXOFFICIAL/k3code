@@ -199,8 +199,10 @@ class SearxngSearch:
             self._ok = True
         except Exception as e:  # noqa: BLE001
             self._ok = False
-            self.reason = (f"SearXNG at {self.url} is unreachable or not returning JSON ({type(e).__name__}); "
-                           "set research.searxng_url to a working instance")
+            self.reason = (
+                f"SearXNG at {self.url} is unreachable or not returning JSON ({type(e).__name__}); "
+                "set research.searxng_url to a working instance"
+            )
         return self._ok
 
     async def search(self, query: str, n: int = 5) -> list[Hit]:
@@ -281,8 +283,14 @@ class ResearchTools:
 class BuiltinTools(ResearchTools):
     name = "builtin web_search/web_fetch"
 
-    def __init__(self, searxng_url: str | None, *, keyless_fallback: bool = True,
-                 fetcher: WebFetcher | None = None, browser: BrowserManager | None = None) -> None:
+    def __init__(
+        self,
+        searxng_url: str | None,
+        *,
+        keyless_fallback: bool = True,
+        fetcher: WebFetcher | None = None,
+        browser: BrowserManager | None = None,
+    ) -> None:
         self.searx = SearxngSearch(searxng_url)
         self.ddg = DuckDuckGoSearch() if keyless_fallback else None
         self.fetcher = fetcher
@@ -405,8 +413,12 @@ def rank_tool(tools: list[Any], strong: tuple[str, ...], generic: tuple[str, ...
 
     for t in tools:
         name = t.qualified.lower()
-        if (any(m in name for m in strong) and any(g in name for g in generic)
-                and not is_helper(t) and not is_excluded(t)):
+        if (
+            any(m in name for m in strong)
+            and any(g in name for g in generic)
+            and not is_helper(t)
+            and not is_excluded(t)
+        ):
             return t
     for t in tools:
         name = t.qualified.lower()
@@ -424,13 +436,16 @@ def mcp_search_tool(mcp: Any) -> Any:
     return rank_tool(tools, _SEARCH_MARKERS, ("search",), _NOT_WEB)
 
 
-def pick_tools(config: Any, mcp: Any, fetcher: WebFetcher | None = None,
-               browser: BrowserManager | None = None) -> ResearchTools:
+def pick_tools(
+    config: Any, mcp: Any, fetcher: WebFetcher | None = None, browser: BrowserManager | None = None
+) -> ResearchTools:
     """MCP search/fetch when connected, else the built-ins."""
     cfg = dict(getattr(config, "research", None) or {})
     builtin = BuiltinTools(
-        cfg.get("searxng_url", DEFAULT_SEARXNG), keyless_fallback=bool(cfg.get("keyless_fallback", True)),
-        fetcher=fetcher, browser=browser,
+        cfg.get("searxng_url", DEFAULT_SEARXNG),
+        keyless_fallback=bool(cfg.get("keyless_fallback", True)),
+        fetcher=fetcher,
+        browser=browser,
     )
     tools = list(mcp.tools()) if mcp is not None else []
     search = mcp_search_tool(mcp)
@@ -490,8 +505,9 @@ async def fallback_search(
     return [], notes, answered
 
 
-def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None, mcp: Any = None,
-                       browser: BrowserManager | None = None) -> None:
+def register_web_tools(
+    reg: Any, config: Any, fetcher: WebFetcher | None = None, mcp: Any = None, browser: BrowserManager | None = None
+) -> None:
     """``web_fetch`` (escalates to the browser on a 403 or a challenge), ``web_browse`` (renders a page in the browser),
     and ``web_search`` over SearXNG, then keyless DuckDuckGo, then a connected MCP search tool."""
     cfg = dict(getattr(config, "research", None) or {})
@@ -536,8 +552,9 @@ def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None,
         query = str(arguments.get("query") or "").strip()
         if not query:
             return {"error": "web_search needs a query"}
-        hits, notes, answered = await fallback_search(query, int(arguments.get("limit") or 5),
-                                                      searx=searx, ddg=ddg, mcp=mcp)
+        hits, notes, answered = await fallback_search(
+            query, int(arguments.get("limit") or 5), searx=searx, ddg=ddg, mcp=mcp
+        )
         if hits:
             return {"content": "\n".join(f"- {h.title}\n  {h.url}\n  {h.snippet[:200]}" for h in hits)}
         if answered:
@@ -545,25 +562,37 @@ def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None,
         return {"error": f"web_search is disabled: {'; '.join(notes)}"}
 
     reg.register(
-        ToolSpec(name="web_fetch", description="Fetch a web page and return its readable text. A page that blocks "
-                                               "plain HTTP is read in a browser; CAPTCHAs, logins and paywalls stop.",
-                 parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
-                 side_effect=False),
+        ToolSpec(
+            name="web_fetch",
+            description="Fetch a web page and return its readable text. A page that blocks "
+            "plain HTTP is read in a browser; CAPTCHAs, logins and paywalls stop.",
+            parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+            side_effect=False,
+        ),
         tool_fetch,
     )
     reg.register(
-        ToolSpec(name="web_browse", description="Render a page in a real Chromium (for pages that need JavaScript) "
-                                                "and return its readable text. Reads only: it never clicks, types or "
-                                                "logs in. Needs the optional Playwright install.",
-                 parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
-                 side_effect=False),
+        ToolSpec(
+            name="web_browse",
+            description="Render a page in a real Chromium (for pages that need JavaScript) "
+            "and return its readable text. Reads only: it never clicks, types or "
+            "logs in. Needs the optional Playwright install.",
+            parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+            side_effect=False,
+        ),
         tool_browse,
     )
     reg.register(
-        ToolSpec(name="web_search", description="Search the web: SearXNG if configured, else keyless DuckDuckGo, "
-                                                "else a connected MCP search tool. Returns titles, URLs and snippets.",
-                 parameters={"type": "object", "properties": {"query": {"type": "string"},
-                                                              "limit": {"type": "integer"}}, "required": ["query"]},
-                 side_effect=False),
+        ToolSpec(
+            name="web_search",
+            description="Search the web: SearXNG if configured, else keyless DuckDuckGo, "
+            "else a connected MCP search tool. Returns titles, URLs and snippets.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                "required": ["query"],
+            },
+            side_effect=False,
+        ),
         tool_search,
     )

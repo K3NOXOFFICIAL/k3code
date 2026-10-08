@@ -63,11 +63,13 @@ async def test_agent_loop_write_then_read(temp_cwd):
     # Third turn: model answers
     msg3 = Message(role="assistant", content="The file contains 'hi'", tool_calls=[])
 
-    provider = FakeProvider([
-        [make_tool_call_event(write_call), make_done_event(msg1)],
-        [make_tool_call_event(read_call), make_done_event(msg2)],
-        [make_text_event("The file contains 'hi'"), make_done_event(msg3)],
-    ])
+    provider = FakeProvider(
+        [
+            [make_tool_call_event(write_call), make_done_event(msg1)],
+            [make_tool_call_event(read_call), make_done_event(msg2)],
+            [make_text_event("The file contains 'hi'"), make_done_event(msg3)],
+        ]
+    )
 
     chain = build_chain([provider], [["fake-model"]])
     router = Router(chain, max_retries=0)
@@ -103,10 +105,12 @@ async def test_agent_loop_tool_calls_only_on_final_message(temp_cwd):
     msg2 = Message(role="assistant", content="Wrote the file", tool_calls=[])
 
     # Note: no make_tool_call_event(...) here, matching the real providers' contract.
-    provider = FakeProvider([
-        [make_done_event(msg1)],
-        [make_done_event(msg2)],
-    ])
+    provider = FakeProvider(
+        [
+            [make_done_event(msg1)],
+            [make_done_event(msg2)],
+        ]
+    )
 
     chain = build_chain([provider], [["fake-model"]])
     router = Router(chain, max_retries=0)
@@ -131,9 +135,12 @@ async def test_agent_loop_max_turns(temp_cwd):
     tool_call = ToolCall(id="call_1", name="write", arguments={"path": str(test_file), "content": "x"})
     msg = Message(role="assistant", content=None, tool_calls=[tool_call])
 
-    provider = FakeProvider([
-        [make_tool_call_event(tool_call), make_done_event(msg)],
-    ] * 10)  # Repeat enough times
+    provider = FakeProvider(
+        [
+            [make_tool_call_event(tool_call), make_done_event(msg)],
+        ]
+        * 10
+    )  # Repeat enough times
 
     chain = build_chain([provider], [["fake-model"]])
     router = Router(chain, max_retries=0)
@@ -158,10 +165,12 @@ async def test_agent_permission_denied_headless(temp_cwd):
     # Second turn: model gets the error and responds
     msg2 = Message(role="assistant", content="Permission denied, cannot write", tool_calls=[])
 
-    provider = FakeProvider([
-        [make_tool_call_event(write_call), make_done_event(msg)],
-        [make_text_event("Permission denied, cannot write"), make_done_event(msg2)],
-    ])
+    provider = FakeProvider(
+        [
+            [make_tool_call_event(write_call), make_done_event(msg)],
+            [make_text_event("Permission denied, cannot write"), make_done_event(msg2)],
+        ]
+    )
 
     chain = build_chain([provider], [["fake-model"]])
     router = Router(chain, max_retries=0)
@@ -342,7 +351,11 @@ async def test_loop_guard_note_follows_the_tool_results(temp_cwd):
     provider = Recording([call(1), call(2), call(3), done])
     router = Router(build_chain([provider], [["fake-model"]]), max_retries=0)
     loop = AgentLoop(
-        router, system_prompt="t", max_turns=10, permission_mode="yolo", cwd=temp_cwd,
+        router,
+        system_prompt="t",
+        max_turns=10,
+        permission_mode="yolo",
+        cwd=temp_cwd,
         reliability=Reliability.from_settings(None, session="s"),
     )
     async for _event in loop.run("go"):

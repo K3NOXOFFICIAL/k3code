@@ -75,9 +75,7 @@ _JUDGE_SYSTEM = (
 
 async def judge_condition(runner: Runner, condition: str, text: str) -> tuple[bool, str]:
     """Cheap-tier check of a ``--until`` condition against the latest tick output."""
-    reply = await runner.judge(
-        _JUDGE_SYSTEM, f"Condition: {condition}\n\nLatest output:\n{text[-4000:]}", "goal_judge"
-    )
+    reply = await runner.judge(_JUDGE_SYSTEM, f"Condition: {condition}\n\nLatest output:\n{text[-4000:]}", "goal_judge")
     m = re.match(r"\s*(yes|no)\b[:\- ]*(.*)", reply, re.I | re.S)
     if not m:
         return False, f"unparseable judge reply: {reply[:80]!r}"

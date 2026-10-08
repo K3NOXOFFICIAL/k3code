@@ -29,22 +29,27 @@ from typing import Any
 class FailoverReason(enum.Enum):
     """Why an API call failed — determines the router's recovery strategy."""
 
-    rate_limit = "rate_limit"              # 429 / throttling — backoff, then fail over
-    quota = "quota"                        # credits or plan exhausted — fail over immediately
-    auth = "auth"                          # 401/403 bad or missing key — fail over immediately
+    rate_limit = "rate_limit"  # 429 / throttling — backoff, then fail over
+    quota = "quota"  # credits or plan exhausted — fail over immediately
+    auth = "auth"  # 401/403 bad or missing key — fail over immediately
     context_overflow = "context_overflow"  # prompt too large — raise ContextOverflow, compact
-    network = "network"                    # connect/DNS failure — retry, then fail over
-    server = "server"                      # 5xx / overloaded — retry, then fail over
-    timeout = "timeout"                    # read/connect timeout — retry, then fail over
-    bad_request = "bad_request"            # malformed request/model — fail over, no retry
-    ssl_cert = "ssl_cert"                  # certificate does not verify (missing CA, proxy) — fail over, never park
-    unknown = "unknown"                    # unclassifiable — retry with backoff, then fail over
+    network = "network"  # connect/DNS failure — retry, then fail over
+    server = "server"  # 5xx / overloaded — retry, then fail over
+    timeout = "timeout"  # read/connect timeout — retry, then fail over
+    bad_request = "bad_request"  # malformed request/model — fail over, no retry
+    ssl_cert = "ssl_cert"  # certificate does not verify (missing CA, proxy) — fail over, never park
+    unknown = "unknown"  # unclassifiable — retry with backoff, then fail over
 
 
 #: Reasons for which the router retries the same entry before failing over.
 RETRYABLE_REASONS = frozenset(
-    {FailoverReason.network, FailoverReason.timeout, FailoverReason.server,
-     FailoverReason.rate_limit, FailoverReason.unknown}
+    {
+        FailoverReason.network,
+        FailoverReason.timeout,
+        FailoverReason.server,
+        FailoverReason.rate_limit,
+        FailoverReason.unknown,
+    }
 )
 
 #: Reasons that skip retries and move straight to the next entry. ``bad_request``
@@ -99,67 +104,150 @@ class ClassifiedError:
 # Carried over from Hermes' tables; ``billing`` there maps to ``quota`` here.
 
 _QUOTA_PATTERNS = (
-    "insufficient credits", "insufficient_quota", "insufficient balance", "credit balance",
-    "credits exhausted", "credits have been exhausted", "requires available credits",
-    "account balance is too low", "no usable credits", "top up your credits", "payment required",
-    "billing hard limit", "exceeded your current quota", "account is deactivated", "plan does not include",
-    "out of extra usage", "out of funds", "run out of funds", "balance_depleted",
-    "budget limit exceeded", "hard billing limit",
-    "model_not_supported_on_free_tier", "not available on the free tier",
-    "key limit exceeded", "spending limit",
-    "reached its daily usage quota", "daily usage quota", "usage quota",  # OmniRoute per-key quota (HTTP 400/429)
+    "insufficient credits",
+    "insufficient_quota",
+    "insufficient balance",
+    "credit balance",
+    "credits exhausted",
+    "credits have been exhausted",
+    "requires available credits",
+    "account balance is too low",
+    "no usable credits",
+    "top up your credits",
+    "payment required",
+    "billing hard limit",
+    "exceeded your current quota",
+    "account is deactivated",
+    "plan does not include",
+    "out of extra usage",
+    "out of funds",
+    "run out of funds",
+    "balance_depleted",
+    "budget limit exceeded",
+    "hard billing limit",
+    "model_not_supported_on_free_tier",
+    "not available on the free tier",
+    "key limit exceeded",
+    "spending limit",
+    "reached its daily usage quota",
+    "daily usage quota",
+    "usage quota",  # OmniRoute per-key quota (HTTP 400/429)
 )
 
-_QUOTA_ERROR_CODES = frozenset({
-    "insufficient_quota", "billing_not_active", "payment_required", "insufficient_credits",
-    "no_usable_credits", "balance_depleted", "model_not_supported_on_free_tier",
-    "member_spend_cap_exceeded", "terminal_quota_exhausted",
-    "personal-team-blocked:spending-limit",
-    "credit_balance_exhausted", "organization_spend_limit_exceeded",
-    "organization_usage_limit_exceeded", "project_spend_limit_exceeded",
-    "insufficient_credits_for_paid_model", "usage_limit_exceeded",
-})
+_QUOTA_ERROR_CODES = frozenset(
+    {
+        "insufficient_quota",
+        "billing_not_active",
+        "payment_required",
+        "insufficient_credits",
+        "no_usable_credits",
+        "balance_depleted",
+        "model_not_supported_on_free_tier",
+        "member_spend_cap_exceeded",
+        "terminal_quota_exhausted",
+        "personal-team-blocked:spending-limit",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "organization_usage_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "insufficient_credits_for_paid_model",
+        "usage_limit_exceeded",
+    }
+)
 
 _RATE_LIMIT_PATTERNS = (
-    "rate limit", "rate_limit", "too many requests", "throttled", "requests per minute",
-    "tokens per minute", "requests per day", "try again in", "please retry after",
-    "resource exhausted", "resource_exhausted", "resource-exhausted", "resourceexhausted",
-    "rate increased too quickly", "throttlingexception", "too many concurrent requests",
-    "servicequotaexceededexception", "throttling",
+    "rate limit",
+    "rate_limit",
+    "too many requests",
+    "throttled",
+    "requests per minute",
+    "tokens per minute",
+    "requests per day",
+    "try again in",
+    "please retry after",
+    "resource exhausted",
+    "resource_exhausted",
+    "resource-exhausted",
+    "resourceexhausted",
+    "rate increased too quickly",
+    "throttlingexception",
+    "too many concurrent requests",
+    "servicequotaexceededexception",
+    "throttling",
 )
 
 # Server busy, credential fine: back off on the same entry. Z.AI/Zhipu reuse
 # HTTP 429 for this, so the 429 path checks these first.
 _OVERLOADED_PATTERNS = (
-    "overloaded", "temporarily overloaded", "service is temporarily overloaded",
-    "service may be temporarily overloaded", "server is overloaded", "server overloaded",
-    "server overload", "server_overload",
-    "service overloaded", "service is overloaded", "upstream overloaded", "currently overloaded",
+    "overloaded",
+    "temporarily overloaded",
+    "service is temporarily overloaded",
+    "service may be temporarily overloaded",
+    "server is overloaded",
+    "server overloaded",
+    "server overload",
+    "server_overload",
+    "service overloaded",
+    "service is overloaded",
+    "upstream overloaded",
+    "currently overloaded",
     "upstream model provider is temporarily unavailable. please try again in a moment.",
-    "at capacity", "over capacity",
+    "at capacity",
+    "over capacity",
 )
 
 # Usage-limit phrases needing disambiguation (quota OR rate_limit), and the
 # signals that mark such a limit as a periodic window rather than a hard wall.
 _USAGE_LIMIT_PATTERNS = ("usage limit", "quota", "limit exceeded", "key limit exceeded")
 _USAGE_LIMIT_TRANSIENT_SIGNALS = (
-    "try again", "retry", "resets at", "reset in", "resets in", "reset after", "available in",
-    "wait", "requests remaining", "periodic", "window", "per minute", "per second",
+    "try again",
+    "retry",
+    "resets at",
+    "reset in",
+    "resets in",
+    "reset after",
+    "available in",
+    "wait",
+    "requests remaining",
+    "periodic",
+    "window",
+    "per minute",
+    "per second",
 )
 
 _CONTEXT_OVERFLOW_PATTERNS = (
-    "context length", "context size", "maximum context", "token limit", "too many tokens",
-    "reduce the length", "exceeds the limit", "context window", "prompt is too long",
-    "prompt exceeds max length", "maximum number of tokens",
-    "exceeds the max_model_len", "max_model_len", "prompt length", "input is too long",
-    "maximum model length", "context length exceeded", "truncating input",
-    "slot context", "n_ctx_slot",
-    "超过最大长度", "上下文长度",
+    "context length",
+    "context size",
+    "maximum context",
+    "token limit",
+    "too many tokens",
+    "reduce the length",
+    "exceeds the limit",
+    "context window",
+    "prompt is too long",
+    "prompt exceeds max length",
+    "maximum number of tokens",
+    "exceeds the max_model_len",
+    "max_model_len",
+    "prompt length",
+    "input is too long",
+    "maximum model length",
+    "context length exceeded",
+    "truncating input",
+    "slot context",
+    "n_ctx_slot",
+    "超过最大长度",
+    "上下文长度",
     "tokens in request more than max tokens allowed",
-    "max input token", "input token", "exceeds the maximum number of input tokens",
+    "max input token",
+    "input token",
+    "exceeds the maximum number of input tokens",
     "maximum allowed input length",
     # 413 wordings land here too: k3code has no separate payload-compression path in M0.
-    "request entity too large", "payload too large", "error code: 413", "request_too_large",
+    "request entity too large",
+    "payload too large",
+    "error code: 413",
+    "request_too_large",
     "request exceeds the maximum size",
 )
 
@@ -171,94 +259,185 @@ _OUTPUT_CAP_PATTERNS = ("max_tokens", "max_completion_tokens", "output tokens", 
 _CONTEXT_OVERFLOW_ERROR_CODES = frozenset({"context_length_exceeded", "max_tokens_exceeded"})
 
 _MODEL_NOT_FOUND_PATTERNS = (
-    "is not a valid model", "invalid model", "model not found", "model_not_found", "does not exist",
-    "no such model", "unknown model", "unsupported model", "no endpoints found that support tool use",
+    "is not a valid model",
+    "invalid model",
+    "model not found",
+    "model_not_found",
+    "does not exist",
+    "no such model",
+    "unknown model",
+    "unsupported model",
+    "no endpoints found that support tool use",
 )
 
 _MODEL_NOT_FOUND_ERROR_CODES = frozenset({"model_not_found", "model_not_available", "invalid_model"})
 
 # Deterministic rejections of the request shape: identical on every retry.
 _REQUEST_VALIDATION_PATTERNS = (
-    "unknown parameter", "unsupported parameter", "unrecognized request argument",
-    "invalid_request_error", "unknown_parameter", "unsupported_parameter",
+    "unknown parameter",
+    "unsupported parameter",
+    "unrecognized request argument",
+    "invalid_request_error",
+    "unknown_parameter",
+    "unsupported_parameter",
 )
 
 _INVALID_MESSAGE_BODY_PATTERNS = (
-    "must have non-empty content", "messages must have non-empty", "invalid_request_body",
-    "text content blocks must be non-empty", "content field is required",
-    "messages: at least one message is required", "no user query found",
+    "must have non-empty content",
+    "messages must have non-empty",
+    "invalid_request_body",
+    "text content blocks must be non-empty",
+    "content field is required",
+    "messages: at least one message is required",
+    "no user query found",
 )
 
 _AUTH_PATTERNS = (
-    "invalid api key", "invalid_api_key", "gateway_auth_failed", "authentication", "unauthorized",
-    "forbidden", "invalid token", "token expired", "token revoked", "access denied",
+    "invalid api key",
+    "invalid_api_key",
+    "gateway_auth_failed",
+    "authentication",
+    "unauthorized",
+    "forbidden",
+    "invalid token",
+    "token expired",
+    "token revoked",
+    "access denied",
     "failed to extract accountid from token",
 )
 
 _EMPTY_PROVIDER_RESPONSE_PATTERNS = (
-    "returned an empty response", "empty response despite retries", "provider returned an empty response",
-    "model returning empty responses", "empty response stream",
+    "returned an empty response",
+    "empty response despite retries",
+    "provider returned an empty response",
+    "model returning empty responses",
+    "empty response stream",
 )
 
 _TIMEOUT_MESSAGE_PATTERNS = (
-    "timed out", "turn timed out", "request timed out", "deadline exceeded", "operation timed out",
+    "timed out",
+    "turn timed out",
+    "request timed out",
+    "deadline exceeded",
+    "operation timed out",
     "upstream timed out",
 )
 
 # Connect/DNS failures with no status. EXCLUDES mid-stream disconnects.
 _CONNECTION_MESSAGE_PATTERNS = (
-    "connection refused", "econnrefused", "no route to host", "network is unreachable",
-    "network unreachable", "name or service not known", "temporary failure in name resolution",
-    "nodename nor servname provided", "getaddrinfo failed", "getaddrinfo enotfound", "eai_again",
-    "fetch failed", "failed to fetch", "upstream connect error",
+    "connection refused",
+    "econnrefused",
+    "no route to host",
+    "network is unreachable",
+    "network unreachable",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "nodename nor servname provided",
+    "getaddrinfo failed",
+    "getaddrinfo enotfound",
+    "eai_again",
+    "fetch failed",
+    "failed to fetch",
+    "upstream connect error",
     "all connection attempts failed",
 )
 
 _SERVER_DISCONNECT_PATTERNS = (
-    "server disconnected", "peer closed connection", "connection reset by peer", "connection was closed",
-    "network connection lost", "unexpected eof", "incomplete chunked read",
+    "server disconnected",
+    "peer closed connection",
+    "connection reset by peer",
+    "connection was closed",
+    "network connection lost",
+    "unexpected eof",
+    "incomplete chunked read",
 )
 
 _SSL_CERT_VERIFY_PATTERNS = (
-    "certificate verify failed", "certificate_verify_failed", "unable to get local issuer certificate",
-    "self-signed certificate", "self signed certificate", "certificate has expired",
-    "hostname mismatch, certificate is not valid", "unable to verify the first certificate",
+    "certificate verify failed",
+    "certificate_verify_failed",
+    "unable to get local issuer certificate",
+    "self-signed certificate",
+    "self signed certificate",
+    "certificate has expired",
+    "hostname mismatch, certificate is not valid",
+    "unable to verify the first certificate",
 )
 
 _SSL_TRANSIENT_PATTERNS = (
-    "bad record mac", "ssl alert", "tls alert", "ssl handshake failure", "tlsv1 alert", "sslv3 alert",
-    "bad_record_mac", "ssl_alert", "tls_alert", "tls_alert_internal_error", "[ssl:",
+    "bad record mac",
+    "ssl alert",
+    "tls alert",
+    "ssl handshake failure",
+    "tlsv1 alert",
+    "sslv3 alert",
+    "bad_record_mac",
+    "ssl_alert",
+    "tls_alert",
+    "tls_alert_internal_error",
+    "[ssl:",
 )
 
 # A 403 written by a WAF/CDN rather than the provider's API: the credential never
 # reached the provider, so another entry (another host) can still work.
 _UPSTREAM_BLOCKED_PATTERNS = (
-    "your request was blocked", "request blocked", "sorry, you have been blocked",
-    "enable javascript and cookies to continue", "cdn-cgi/challenge-platform", "cf-browser-verification",
-    "challenge-error-text", "__cf_chl", "cf-error-details", "attention required! | cloudflare",
+    "your request was blocked",
+    "request blocked",
+    "sorry, you have been blocked",
+    "enable javascript and cookies to continue",
+    "cdn-cgi/challenge-platform",
+    "cf-browser-verification",
+    "challenge-error-text",
+    "__cf_chl",
+    "cf-error-details",
+    "attention required! | cloudflare",
 )
 #: the same challenge markers, public for the browser tool, which escalates a page that shows one (research/browser.py)
 UPSTREAM_BLOCKED_PATTERNS = _UPSTREAM_BLOCKED_PATTERNS
 
 # httpx / stdlib transport exception type names. A connect failure is ``network``;
 # a read/pool timeout is ``timeout``.
-_NETWORK_ERROR_TYPES = frozenset({
-    "ConnectError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
-    "ConnectionAbortedError", "BrokenPipeError", "RemoteProtocolError", "ReadError", "WriteError",
-    "NetworkError", "ProxyError", "UnsupportedProtocol", "ServerDisconnectedError",
-    "APIConnectionError",
-})
+_NETWORK_ERROR_TYPES = frozenset(
+    {
+        "ConnectError",
+        "ConnectionError",
+        "ConnectionRefusedError",
+        "ConnectionResetError",
+        "ConnectionAbortedError",
+        "BrokenPipeError",
+        "RemoteProtocolError",
+        "ReadError",
+        "WriteError",
+        "NetworkError",
+        "ProxyError",
+        "UnsupportedProtocol",
+        "ServerDisconnectedError",
+        "APIConnectionError",
+    }
+)
 
-_TIMEOUT_ERROR_TYPES = frozenset({
-    "ReadTimeout", "ConnectTimeout", "PoolTimeout", "WriteTimeout", "TimeoutException",
-    "TimeoutError", "APITimeoutError",
-})
+_TIMEOUT_ERROR_TYPES = frozenset(
+    {
+        "ReadTimeout",
+        "ConnectTimeout",
+        "PoolTimeout",
+        "WriteTimeout",
+        "TimeoutException",
+        "TimeoutError",
+        "APITimeoutError",
+    }
+)
 
 # A certificate that does not verify is ``ssl_cert``, not one of these (see _by_tls_cert).
-_SSL_ERROR_TYPES = frozenset({
-    "SSLError", "SSLZeroReturnError", "SSLWantReadError", "SSLWantWriteError", "SSLEOFError",
-    "SSLSyscallError",
-})
+_SSL_ERROR_TYPES = frozenset(
+    {
+        "SSLError",
+        "SSLZeroReturnError",
+        "SSLWantReadError",
+        "SSLWantWriteError",
+        "SSLEOFError",
+        "SSLSyscallError",
+    }
+)
 _SSL_CERT_ERROR_TYPE = "SSLCertVerificationError"
 
 _RESET_FIELDS = ("resets_in_seconds", "resets_at", "reset_at", "retry_after")

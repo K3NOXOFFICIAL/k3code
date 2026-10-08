@@ -37,8 +37,17 @@ def _has(root: Path, *names: str) -> bool:
 def detect(root: Path) -> dict[str, Any]:
     """Detect language, package manager and the test/lint/build commands."""
     root = Path(root)
-    info: dict[str, Any] = {"language": "unknown", "package_manager": "", "test": "", "lint": "", "build": "",
-                            "ci": "", "monorepo": False, "docker": False, "makefile": (root / "Makefile").is_file()}
+    info: dict[str, Any] = {
+        "language": "unknown",
+        "package_manager": "",
+        "test": "",
+        "lint": "",
+        "build": "",
+        "ci": "",
+        "monorepo": False,
+        "docker": False,
+        "makefile": (root / "Makefile").is_file(),
+    }
     if _has(root, "pyproject.toml", "setup.py", "requirements.txt"):
         info["language"] = "python"
         pyp = root / "pyproject.toml"
@@ -67,11 +76,13 @@ def detect(root: Path) -> dict[str, Any]:
         if pkg.get("workspaces"):
             info["monorepo"] = True
     elif (root / "go.mod").is_file():
-        info.update(language="go", package_manager="go", test="go test ./...", build="go build ./...",
-                    lint="go vet ./...")
+        info.update(
+            language="go", package_manager="go", test="go test ./...", build="go build ./...", lint="go vet ./..."
+        )
     elif (root / "Cargo.toml").is_file():
-        info.update(language="rust", package_manager="cargo", test="cargo test", build="cargo build",
-                    lint="cargo clippy")
+        info.update(
+            language="rust", package_manager="cargo", test="cargo test", build="cargo build", lint="cargo clippy"
+        )
         if "[workspace]" in (root / "Cargo.toml").read_text(encoding="utf-8", errors="ignore"):
             info["monorepo"] = True
     if info["makefile"] and not info["test"]:
@@ -97,8 +108,12 @@ def scan_risks(root: Path, info: dict[str, Any], limit: int = 300) -> list[str]:
     if not info.get("test"):
         risks.append("no test command detected")
     else:
-        has_tests = any(p.name.startswith("test") or p.name.endswith(("_test.go", ".test.ts", ".test.js", ".spec.ts"))
-                        or p.parent.name in ("tests", "test", "__tests__") for p in _walk(root, 400))
+        has_tests = any(
+            p.name.startswith("test")
+            or p.name.endswith(("_test.go", ".test.ts", ".test.js", ".spec.ts"))
+            or p.parent.name in ("tests", "test", "__tests__")
+            for p in _walk(root, 400)
+        )
         if not has_tests:
             risks.append("test command exists but no test files were found")
     if not info.get("ci"):
@@ -175,9 +190,13 @@ async def draft_memory(caller: Any, root: Path, info: dict[str, Any], session_id
     try:
         res = await caller.complete(
             TaskKind.CLASSIFICATION,
-            [Message(role="system", content=DRAFT_SYSTEM),
-             Message(role="user", content=f"Facts: {json.dumps(info)}\n\n{_excerpts(root)}")],
-            session_id=session_id, max_tokens=700, timeout=40,
+            [
+                Message(role="system", content=DRAFT_SYSTEM),
+                Message(role="user", content=f"Facts: {json.dumps(info)}\n\n{_excerpts(root)}"),
+            ],
+            session_id=session_id,
+            max_tokens=700,
+            timeout=40,
         )
         text = (res.text or "").strip()
         return text + "\n" if len(text) > 20 else template_memory(info)
@@ -195,8 +214,15 @@ def safe_commands(info: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(out))
 
 
-async def prepare(root: Path, *, store: ProposalStore, caller: Any = None, preferences: list[str] | None = None,
-                  session_id: str = "", clock: Any = time.time) -> list[Proposal]:
+async def prepare(
+    root: Path,
+    *,
+    store: ProposalStore,
+    caller: Any = None,
+    preferences: list[str] | None = None,
+    session_id: str = "",
+    clock: Any = time.time,
+) -> list[Proposal]:
     """Detect + write ``project.json`` (the only unconditional write), then create proposals."""
     root = Path(root)
     info = detect(root)
@@ -211,28 +237,47 @@ async def prepare(root: Path, *, store: ProposalStore, caller: Any = None, prefe
     out: list[Proposal] = []
 
     def add(kind: str, text: str, action: str, payload: dict[str, Any]) -> None:
-        p = store.add(kind, text, action, session_id, payload=payload, project=pid,
-                      key=dedup_key(kind, f"{pid} {text}"))
+        p = store.add(
+            kind, text, action, session_id, payload=payload, project=pid, key=dedup_key(kind, f"{pid} {text}")
+        )
         if p is not None:
             out.append(p)
 
     if not any((root / n).is_file() for n in ("K3CODE.md", "AGENTS.md")):
         # drafted on the cheap tier when accepted (no model call on session start)
-        add("project_setup", "Create a K3CODE.md with this project's build/test commands and conventions?",
-            "write K3CODE.md", {"op": "draft_memory", "path": str(root / "K3CODE.md"), "root": str(root),
-                                "info": info})
+        add(
+            "project_setup",
+            "Create a K3CODE.md with this project's build/test commands and conventions?",
+            "write K3CODE.md",
+            {"op": "draft_memory", "path": str(root / "K3CODE.md"), "root": str(root), "info": info},
+        )
     pats = safe_commands(info)
     if pats:
-        add("project_setup", f"Allow the detected safe commands without asking ({', '.join(pats)})?",
-            "add allow rules", {"op": "allow_rules", "cwd": str(root),
-                                "rules": [{"tool": "bash", "pattern": p, "action": "allow"} for p in pats]})
+        add(
+            "project_setup",
+            f"Allow the detected safe commands without asking ({', '.join(pats)})?",
+            "add allow rules",
+            {
+                "op": "allow_rules",
+                "cwd": str(root),
+                "rules": [{"tool": "bash", "pattern": p, "action": "allow"} for p in pats],
+            },
+        )
     if info.get("test"):
-        add("project_setup", f"Run `{info['test']}` every night and report failures?",
-            f"/schedule add nightly tests: run {info['test']} at 02:00", {"op": "send"})
+        add(
+            "project_setup",
+            f"Run `{info['test']}` every night and report failures?",
+            f"/schedule add nightly tests: run {info['test']} at 02:00",
+            {"op": "send"},
+        )
     if preferences and any("makefile" in p.lower() for p in preferences) and not info["makefile"]:
         targets = [f"{k}:\n\t{info[k]}" for k in ("test", "lint", "build") if info.get(k)]
-        add("project_setup", "You usually add a Makefile; create one with test/lint/build targets?", "write Makefile",
-            {"op": "write_file", "path": str(root / "Makefile"), "content": "\n\n".join(targets) + "\n"})
+        add(
+            "project_setup",
+            "You usually add a Makefile; create one with test/lint/build targets?",
+            "write Makefile",
+            {"op": "write_file", "path": str(root / "Makefile"), "content": "\n\n".join(targets) + "\n"},
+        )
     if risks:
         add("project_setup", "Project risks found: " + "; ".join(risks[:4]), "acknowledge", {"op": "ack"})
     return out
@@ -242,8 +287,11 @@ async def apply(payload: dict[str, Any], caller: Any = None, session_id: str = "
     """Run the accepted project_setup operation (writes only after acceptance)."""
     op = payload.get("op")
     if op == "draft_memory":
-        payload = {"op": "write_file", "path": payload["path"],
-                   "content": await draft_memory(caller, Path(payload["root"]), payload["info"], session_id)}
+        payload = {
+            "op": "write_file",
+            "path": payload["path"],
+            "content": await draft_memory(caller, Path(payload["root"]), payload["info"], session_id),
+        }
         op = "write_file"
     if op == "write_file":
         path = Path(payload["path"])

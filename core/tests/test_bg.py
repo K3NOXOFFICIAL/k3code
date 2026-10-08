@@ -42,12 +42,16 @@ async def test_bg_without_prompt_and_nothing_running(tmp_path, monkeypatch):
 
 async def test_prompt_background_hands_running_turn_off(tmp_path, monkeypatch):
     steps = [
-        {"type": "tool_call", "match": "SLOWJOB", "when": "first", "name": "bash",
-         "arguments": {"command": "sleep 0.4", "timeout": 5}},
+        {
+            "type": "tool_call",
+            "match": "SLOWJOB",
+            "when": "first",
+            "name": "bash",
+            "arguments": {"command": "sleep 0.4", "timeout": 5},
+        },
         {"type": "text", "match": "SLOWJOB", "when": "after_tool", "text": "slow finished"},
     ]
-    server = make(
-        tmp_path, monkeypatch, steps, mode="yolo", **NO_GATE)
+    server = make(tmp_path, monkeypatch, steps, mode="yolo", **NO_GATE)
     await start(server, tmp_path)
     fg = server.session
     await call(server, "prompt.submit", {"text": "SLOWJOB please"})

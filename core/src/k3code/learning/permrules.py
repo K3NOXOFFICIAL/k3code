@@ -19,11 +19,47 @@ from k3code.permissions.state import load_permissions_config, persist_rules, pro
 APPROVED = ("once", "session", "always")
 
 #: Never anchor a proposed allow rule on these, however often they were approved.
-UNSAFE_ROOTS = frozenset({
-    "rm", "rmdir", "unlink", "shred", "dd", "fdisk", "parted", "wipefs", "sudo", "doas", "su", "chmod", "chown",
-    "chgrp", "kill", "killall", "pkill", "halt", "shutdown", "reboot", "poweroff", "init", "del", "format",
-    "truncate", "mkswap", "sh", "bash", "zsh", "eval", "exec", "curl", "wget", "ssh", "scp", "xargs", "find",
-})
+UNSAFE_ROOTS = frozenset(
+    {
+        "rm",
+        "rmdir",
+        "unlink",
+        "shred",
+        "dd",
+        "fdisk",
+        "parted",
+        "wipefs",
+        "sudo",
+        "doas",
+        "su",
+        "chmod",
+        "chown",
+        "chgrp",
+        "kill",
+        "killall",
+        "pkill",
+        "halt",
+        "shutdown",
+        "reboot",
+        "poweroff",
+        "init",
+        "del",
+        "format",
+        "truncate",
+        "mkswap",
+        "sh",
+        "bash",
+        "zsh",
+        "eval",
+        "exec",
+        "curl",
+        "wget",
+        "ssh",
+        "scp",
+        "xargs",
+        "find",
+    }
+)
 UNSAFE_PREFIXES = ("mkfs",)
 
 
@@ -48,8 +84,10 @@ class Candidate:
     def text(self) -> str:
         where = "in this project" if self.scope == "project" else "across projects"
         if self.auto_do:
-            return (f"You approved `{self.pattern}` {self.approvals}× {where} and never denied it. "
-                    f"Do it automatically in auto mode in future?")
+            return (
+                f"You approved `{self.pattern}` {self.approvals}× {where} and never denied it. "
+                f"Do it automatically in auto mode in future?"
+            )
         if self.action == "allow":
             return f"You always allow `{self.pattern}` {where} ({self.approvals}×) → add an allow rule?"
         return f"You keep denying `{self.pattern}` {where} ({self.denials}×) → add a deny rule?"
@@ -78,11 +116,19 @@ def _existing(cwd: str) -> set[tuple[str, str]]:
     return have
 
 
-def mine(log: DecisionLog, *, min_approvals: int = 3, min_denials: int = 2, user_projects: int = 2,
-         cwd: str = "", since: float | None = None) -> list[Candidate]:
+def mine(
+    log: DecisionLog,
+    *,
+    min_approvals: int = 3,
+    min_denials: int = 2,
+    user_projects: int = 2,
+    cwd: str = "",
+    since: float | None = None,
+) -> list[Candidate]:
     """Candidates from the approval history. Narrowest pattern = the arity-aware pattern that was logged."""
     stats: dict[tuple[str, str], dict[str, Any]] = defaultdict(
-        lambda: {"ok": defaultdict(int), "no": defaultdict(int), "cwd": {}, "ids": []})
+        lambda: {"ok": defaultdict(int), "no": defaultdict(int), "cwd": {}, "ids": []}
+    )
     for row in log.query("approval", since=since):
         tool = row["detail"].get("tool") or "bash"
         if tool != "bash":  # edit/write patterns are exact paths: too narrow to generalise safely
@@ -102,13 +148,37 @@ def mine(log: DecisionLog, *, min_approvals: int = 3, min_denials: int = 2, user
         if ok >= min_approvals and no == 0 and not unsafe_pattern(pat):
             multi = len(e["ok"]) >= user_projects
             proj = "" if multi else max(e["ok"], key=lambda k: e["ok"][k])
-            out.append(Candidate(tool, pat, "allow", "user" if multi else "project", proj,
-                                 e["cwd"].get(proj, "") if proj else "", ok, 0, len(e["ok"]), evidence=e["ids"][-10:]))
+            out.append(
+                Candidate(
+                    tool,
+                    pat,
+                    "allow",
+                    "user" if multi else "project",
+                    proj,
+                    e["cwd"].get(proj, "") if proj else "",
+                    ok,
+                    0,
+                    len(e["ok"]),
+                    evidence=e["ids"][-10:],
+                )
+            )
         elif no >= min_denials and ok == 0:
             multi = len(e["no"]) >= user_projects
             proj = "" if multi else max(e["no"], key=lambda k: e["no"][k])
-            out.append(Candidate(tool, pat, "deny", "user" if multi else "project", proj,
-                                 e["cwd"].get(proj, "") if proj else "", 0, no, len(e["no"]), evidence=e["ids"][-10:]))
+            out.append(
+                Candidate(
+                    tool,
+                    pat,
+                    "deny",
+                    "user" if multi else "project",
+                    proj,
+                    e["cwd"].get(proj, "") if proj else "",
+                    0,
+                    no,
+                    len(e["no"]),
+                    evidence=e["ids"][-10:],
+                )
+            )
     out.extend(_auto_do(log, min_approvals, since))
     return out
 
@@ -119,19 +189,46 @@ def _auto_do(log: DecisionLog, n: int, since: float | None) -> list[Candidate]:
     ok = sum(1 for r in rows if r["choice"] in APPROVED or r["choice"] == "approved")
     bad = len(rows) - ok
     if ok >= n and bad == 0:
-        return [Candidate("plan", "high-risk plans", "allow", "user", "", "", ok, 0, 1, auto_do=True,
-                          evidence=[r["id"] for r in rows[-10:]])]
+        return [
+            Candidate(
+                "plan",
+                "high-risk plans",
+                "allow",
+                "user",
+                "",
+                "",
+                ok,
+                0,
+                1,
+                auto_do=True,
+                evidence=[r["id"] for r in rows[-10:]],
+            )
+        ]
     return []
 
 
 def to_proposals(cands: list[Candidate], store: ProposalStore, session: str = "") -> list[Proposal]:
     out = []
     for c in cands:
-        p = store.add("permission_rule", c.text(), f"/proposals accept (adds {c.action} rule {c.pattern})", session,
-                      payload={"tool": c.tool, "pattern": c.pattern, "action": c.action, "scope": c.scope,
-                               "cwd": c.cwd, "auto_do": c.auto_do, "approvals": c.approvals, "denials": c.denials,
-                               "evidence": c.evidence},
-                      project=c.project, key=c.key)
+        p = store.add(
+            "permission_rule",
+            c.text(),
+            f"/proposals accept (adds {c.action} rule {c.pattern})",
+            session,
+            payload={
+                "tool": c.tool,
+                "pattern": c.pattern,
+                "action": c.action,
+                "scope": c.scope,
+                "cwd": c.cwd,
+                "auto_do": c.auto_do,
+                "approvals": c.approvals,
+                "denials": c.denials,
+                "evidence": c.evidence,
+            },
+            project=c.project,
+            key=c.key,
+        )
         if p is not None:
             out.append(p)
     return out
@@ -164,8 +261,10 @@ def format_candidates(cands: list[Candidate]) -> str:
     lines = ["Permission rule candidates:"]
     for c in cands:
         tag = "auto-do" if c.auto_do else c.action
-        lines.append(f"  [{tag}] {c.tool}: {c.pattern}  — {c.approvals} approved, {c.denials} denied, "
-                     f"{c.projects} project(s) → {c.scope} config")
+        lines.append(
+            f"  [{tag}] {c.tool}: {c.pattern}  — {c.approvals} approved, {c.denials} denied, "
+            f"{c.projects} project(s) → {c.scope} config"
+        )
     lines.append("Candidates are also offered as proposals; accept with /proposals accept <id>.")
     return "\n".join(lines)
 

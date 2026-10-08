@@ -51,8 +51,14 @@ class ArtifactStore:
         self._db.commit()
 
     def register(self, kind: str, path: Path | str, *, title: str = "", session: str = "") -> Artifact:
-        art = Artifact(uuid.uuid4().hex[:8], time.time(), session, kind if kind in KINDS else "other", title,
-                       str(Path(path).resolve()))
+        art = Artifact(
+            uuid.uuid4().hex[:8],
+            time.time(),
+            session,
+            kind if kind in KINDS else "other",
+            title,
+            str(Path(path).resolve()),
+        )
         self._db.execute(
             "INSERT INTO artifacts (id, ts, session, kind, title, path) VALUES (?,?,?,?,?,?)",
             (art.id, art.ts, art.session, art.kind, art.title, art.path),

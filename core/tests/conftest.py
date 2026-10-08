@@ -18,18 +18,42 @@ _CHECKOUT = Path(__file__).resolve().parents[2]  # the repo / worktree root: pyc
 _XDG_VARS = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME")
 # uv keeps its download cache under the real home; tests that run uv need it (an empty cache breaks `uv lock --offline`)
 _REAL_UV_CACHE = os.environ.get("UV_CACHE_DIR") or str(
-    Path(os.environ.get("XDG_CACHE_HOME") or _REAL_HOME / ".cache") / "uv")
-_REAL_ROOTS = tuple(sorted({str(_REAL_HOME), *(os.path.abspath(os.environ[v]) for v in
-                                              ("K3CODE_HOME", "K3CODE_DATA", *_XDG_VARS)
-                                              if os.path.isabs(os.environ.get(v, "")))}))
+    Path(os.environ.get("XDG_CACHE_HOME") or _REAL_HOME / ".cache") / "uv"
+)
+_REAL_ROOTS = tuple(
+    sorted(
+        {
+            str(_REAL_HOME),
+            *(
+                os.path.abspath(os.environ[v])
+                for v in ("K3CODE_HOME", "K3CODE_DATA", *_XDG_VARS)
+                if os.path.isabs(os.environ.get(v, ""))
+            ),
+        }
+    )
+)
 _ALLOWED_ROOTS: list[str] = [str(_CHECKOUT)]  # the session fixture adds pytest's basetemp (it may sit under HOME)
 _HOME_WRITES: list[str] = []  # writes that reached the real home; counted and reported, never printed
 
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
-_PATH_WRITE_EVENTS = frozenset({
-    "os.mkdir", "os.rename", "os.replace", "os.remove", "os.unlink", "os.rmdir", "os.symlink", "os.link",
-    "os.chmod", "os.chown", "os.truncate", "os.utime", "shutil.rmtree", "sqlite3.connect",
-})
+_PATH_WRITE_EVENTS = frozenset(
+    {
+        "os.mkdir",
+        "os.rename",
+        "os.replace",
+        "os.remove",
+        "os.unlink",
+        "os.rmdir",
+        "os.symlink",
+        "os.link",
+        "os.chmod",
+        "os.chown",
+        "os.truncate",
+        "os.utime",
+        "shutil.rmtree",
+        "sqlite3.connect",
+    }
+)
 
 
 def _under(path: str, root: str) -> bool:
@@ -45,7 +69,8 @@ def _audit(event: str, args: tuple) -> None:
         mode = args[1] if len(args) > 1 else None
         flags = args[2] if len(args) > 2 else None
         writes = (isinstance(mode, str) and any(c in mode for c in "wax+")) or (
-            isinstance(flags, int) and bool(flags & _WRITE_FLAGS))
+            isinstance(flags, int) and bool(flags & _WRITE_FLAGS)
+        )
         candidates = args[:1] if writes else ()
     elif event in _PATH_WRITE_EVENTS:
         candidates = args[:2]
@@ -79,8 +104,10 @@ def home_sentinel(tmp_path_factory):
 def pytest_sessionfinish(session, exitstatus):
     if _HOME_WRITES:
         session.exitstatus = 1
-        sys.stderr.write(f"\nHOME SENTINEL: {len(_HOME_WRITES)} write(s) reached the real home outside tmp_path "
-                         "(paths withheld; see tests/conftest.py)\n")
+        sys.stderr.write(
+            f"\nHOME SENTINEL: {len(_HOME_WRITES)} write(s) reached the real home outside tmp_path "
+            "(paths withheld; see tests/conftest.py)\n"
+        )
 
 
 @pytest.fixture(autouse=True)

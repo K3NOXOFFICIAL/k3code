@@ -219,8 +219,6 @@ async def test_outside_roots_asks_without_add_dir(tmp_path, monkeypatch):
     assert len(seen) == 1 and not (extra / "f.txt").exists()
 
 
-
-
 async def test_auto_mode_logs_side_effects_to_event_stream(tmp_path, monkeypatch):
     server, _ = make_server(
         tmp_path, [bash("echo hi > a.txt"), "ok"], monkeypatch, mode="auto", autonomy={"plan_first": False}

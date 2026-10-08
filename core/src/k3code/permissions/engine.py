@@ -198,8 +198,10 @@ _REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:>>?|<)&?)\s*([^\s;&|<>()]+)
 _WRITE_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*>>?&?)\s*([^\s;&|<>()]+)")
 _SUBSTITUTION = re.compile(r"\$\(|`")
 #: Redirect targets that are code or credentials even inside the project.
-_SENSITIVE_TARGET = re.compile(r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
-                               r"\.zsh(?:rc|env)|\.profile|\.zprofile|authorized_keys|\.netrc|\.npmrc|\.env)(?:/|$)")
+_SENSITIVE_TARGET = re.compile(
+    r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
+    r"\.zsh(?:rc|env)|\.profile|\.zprofile|authorized_keys|\.netrc|\.npmrc|\.env)(?:/|$)"
+)
 
 
 def _writes_outside_roots(sub: str, roots: list[str], cwd: str) -> bool:
@@ -262,8 +264,9 @@ def _decide_bash(
         return Decision(action="allow", patterns=prefixes)
     if mode == PermissionMode.AUTO and any(_writes_outside_roots(sub, roots, cwd) for sub in subs):
         # auto mode writes only inside the project roots; no allow rule overrides this
-        return Decision(action="deny", patterns=prefixes,
-                        message=f"Auto mode writes only inside the project roots: {command[:120]}")
+        return Decision(
+            action="deny", patterns=prefixes, message=f"Auto mode writes only inside the project roots: {command[:120]}"
+        )
     worst: Rule | None = None
     for sub in subs:
         rule = evaluate("bash", sub, ruleset, default="ask")

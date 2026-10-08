@@ -53,8 +53,11 @@ class FakeTuios:
     def _blocked(self, params: dict[str, Any]) -> bool:
         """tuios holds a pane only when it was last reported needs_input with kind approval."""
         with self._lock:
-            last = [r["params"] for r in self.requests
-                    if r["verb"] == "set-agent-state" and r["params"].get("window") == params.get("window")]
+            last = [
+                r["params"]
+                for r in self.requests
+                if r["verb"] == "set-agent-state" and r["params"].get("window") == params.get("window")
+            ]
         return bool(last) and last[-1].get("state") == "needs_input" and last[-1].get("kind") == "approval"
 
     def verbs(self, verb: str) -> list[dict[str, Any]]:

@@ -22,8 +22,12 @@ _SRC = {"builtin": "b", "user": "u", "project": "p", "session": "s"}
 
 
 def _layers(perms: PermissionState) -> list[tuple[str, list[Rule]]]:
-    return [("builtin", builtin_defaults()), ("user", perms.user_rules), ("project", perms.project_rules),
-            ("session", perms.session_rules)]
+    return [
+        ("builtin", builtin_defaults()),
+        ("user", perms.user_rules),
+        ("project", perms.project_rules),
+        ("session", perms.session_rules),
+    ]
 
 
 def effective_rules(perms: PermissionState) -> list[tuple[str, str, Rule]]:

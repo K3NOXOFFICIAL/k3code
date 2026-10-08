@@ -20,6 +20,7 @@ from k3code.tools import MAX_TOOL_RESULT_CHARS, build_registry, clip_tool_result
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class ApprovalResult:
     """User's answer to an approval prompt."""
@@ -185,16 +186,15 @@ class AgentLoop:
                 messages = saved
                 answered = {m.tool_call_id for m in messages if m.role == "tool"}
                 last = messages[-1]
-                open_calls = (
-                    [c for c in last.tool_calls if c.id not in answered]
-                    if last.role == "assistant" else []
-                )
+                open_calls = [c for c in last.tool_calls if c.id not in answered] if last.role == "assistant" else []
                 for tc in open_calls:
                     # Side-effect tools with an intent but no done are NOT re-run.
                     result = self.reliability.interrupted_for(tc) or await self._execute_tool(tc)
                     tool_msg = Message(
-                        role="tool", content=result.get("content") if "content" in result else str(result),
-                        tool_call_id=tc.id, name=tc.name,
+                        role="tool",
+                        content=result.get("content") if "content" in result else str(result),
+                        tool_call_id=tc.id,
+                        name=tc.name,
                     )
                     messages.append(tool_msg)
                     yield StreamEvent(type="done", message=tool_msg)
@@ -369,9 +369,7 @@ class AgentLoop:
         unattended = self.background or self.unattended
         if not sandbox.usable():
             if unattended:
-                raise sandbox.SandboxUnavailable(
-                    "bubblewrap is unusable here: unattended bash is refused; see /doctor"
-                )
+                raise sandbox.SandboxUnavailable("bubblewrap is unusable here: unattended bash is refused; see /doctor")
             if not self._sandbox_warned:
                 self._sandbox_warned = True
                 logger.warning("bwrap unavailable: running bash without the sandbox (see /doctor)")

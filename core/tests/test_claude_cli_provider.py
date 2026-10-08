@@ -337,7 +337,10 @@ def test_flattened_arguments_are_accepted() -> None:
         ' {"tool": "y", "input": {"z": 2}}, {"name": "w", "args": "{\\"q\\": 3}"}]</tool_calls>'
     )
     assert [(c.name, c.arguments) for c in calls] == [
-        ("read_file", {"path": "a.py"}), ("x", {"k": 1}), ("y", {"z": 2}), ("w", {"q": 3}),
+        ("read_file", {"path": "a.py"}),
+        ("x", {"k": 1}),
+        ("y", {"z": 2}),
+        ("w", {"q": 3}),
     ]
 
 

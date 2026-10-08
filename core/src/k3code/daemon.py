@@ -114,8 +114,9 @@ def maybe_auto_clear(server: Any, home: Path | None = None, now: float | None = 
         },
         importance="essential",
     )
-    logger.warning("restart-storm safe mode cleared automatically (%d of %d in 24 h)", len(clears),
-                   SAFE_MODE_MAX_AUTO_CLEARS)
+    logger.warning(
+        "restart-storm safe mode cleared automatically (%d of %d in 24 h)", len(clears), SAFE_MODE_MAX_AUTO_CLEARS
+    )
     return True
 
 
@@ -245,8 +246,16 @@ async def attach_bridge(sock: Path | None = None, *, readonly: bool = False) -> 
     def inject(req_id: str, method: str, result: dict) -> None:  # the Inbox answered (called from a thread)
         def go() -> None:
             writer.write((json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}) + "\n").encode())
-            emit(json.dumps({"jsonrpc": "2.0", "id": f"cancel-{req_id}", "method": "request.cancel",
-                             "params": {"id": req_id, "method": method, "reason": "answered in the Inbox"}}))
+            emit(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": f"cancel-{req_id}",
+                        "method": "request.cancel",
+                        "params": {"id": req_id, "method": method, "reason": "answered in the Inbox"},
+                    }
+                )
+            )
 
         loop.call_soon_threadsafe(go)
 
@@ -334,7 +343,7 @@ async def tail_subagent(subagent_id: str, sock: Path | None = None, *, interval:
                 return 1
             text = str(resp.get("text") or "")
             if text.startswith(shown):
-                out.write(text[len(shown):])
+                out.write(text[len(shown) :])
             elif text != shown:  # the 30-line window moved on: show what is new at the end
                 out.write("\n" + text)
             out.flush()

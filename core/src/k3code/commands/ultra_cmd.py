@@ -31,8 +31,10 @@ class UltraPlanCommand(CommandDef):
             ctx.ultra.show_plan(live, up)
             scores = ", ".join(f"{k} {v:g}" for k, v in up.scores.items())
             head = f"Plan for: {arg}\n(planners: {', '.join(up.angles)}{'; judge scores: ' + scores if scores else ''})"
-            tail = (f"\n\nSaved to {up.path}. Run /go to execute it (independent steps fan out to parallel "
-                    "sub-agents in worktrees).")
+            tail = (
+                f"\n\nSaved to {up.path}. Run /go to execute it (independent steps fan out to parallel "
+                "sub-agents in worktrees)."
+            )
             return f"{head}\n\n{up.plan}{tail}" + (f"\n\nNote: {up.judge_note}" if up.judge_note else "")
 
         try:

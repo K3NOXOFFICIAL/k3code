@@ -178,7 +178,7 @@ def test_render_shell_quotes_trigger_data(tmp_path):
     """Trigger data (file names, commit subjects, webhook bodies) went raw into the `shell` command: injection."""
     import subprocess
 
-    evil = "x'; touch pwned; echo \"$(id)\" `id` $HOME"
+    evil = 'x\'; touch pwned; echo "$(id)" `id` $HOME'
     cmd = render("printf '%s|' {{path}} \"$K3_PATH\" {{nope}}", {"path": evil, "bad-key": "y"}, shell=True)
     out = subprocess.run(["bash", "-c", cmd], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
     assert out == f"{evil}|{evil}|{{{{nope}}}}|" and not (tmp_path / "pwned").exists()

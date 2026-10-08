@@ -63,6 +63,4 @@ def _match_sequence(items: list[str], patterns: list[str]) -> bool:
     first, rest = patterns[0], patterns[1:]
     if first == "*":
         return _match_sequence(items, rest)
-    return any(
-        match(item, first) and _match_sequence(items[i + 1 :], rest) for i, item in enumerate(items)
-    )
+    return any(match(item, first) and _match_sequence(items[i + 1 :], rest) for i, item in enumerate(items))

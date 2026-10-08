@@ -240,9 +240,12 @@ class LiveSession:
                     # Without these the next turn sent `tool` results with no assistant tool_calls: HTTP 400 on
                     # OpenAI-compatible and Anthropic providers, for every session that had used a tool.
                     tool_calls=[
-                        ToolCall(id=str(tc.get("id") or ""), name=str(tc.get("name") or ""),
-                                 arguments=dict(tc.get("arguments") or {}),
-                                 raw_arguments=tc.get("raw_arguments"))
+                        ToolCall(
+                            id=str(tc.get("id") or ""),
+                            name=str(tc.get("name") or ""),
+                            arguments=dict(tc.get("arguments") or {}),
+                            raw_arguments=tc.get("raw_arguments"),
+                        )
                         for tc in (m.get("tool_calls") or [])
                     ],
                 )
@@ -273,7 +276,6 @@ class LiveSession:
             "paused": self.paused,
             "background": self.background,
         }
-
 
     def _tools_info(self) -> dict[str, list[str]]:
         """Tool names by group for the TUI's banner (built once per session; MCP tools are added live)."""
@@ -1110,8 +1112,13 @@ class GatewayServer:
         for client in attached:
             self._send(client, frame)
         if not attached:  # nobody can answer right now: keep the request visible across a restart
-            self.notify_blocker(session_id, f"Waiting for an answer: {params.get('command') or method}",
-                                level="info", kind="approval", key=f"k3.approval.{req_id}")
+            self.notify_blocker(
+                session_id,
+                f"Waiting for an answer: {params.get('command') or method}",
+                level="info",
+                kind="approval",
+                key=f"k3.approval.{req_id}",
+            )
         try:
             return await asyncio.wait_for(fut, self.approval_timeout_s)
         except TimeoutError:
@@ -1394,8 +1401,9 @@ class GatewayServer:
             return
         mgr.pause(reason)
         self.emit_goal(session)
-        self.notify_blocker(session.session_id, text, level="warning", kind="goal",
-                            key=f"k3.goal.blocked.{session.session_id}")
+        self.notify_blocker(
+            session.session_id, text, level="warning", kind="goal", key=f"k3.goal.blocked.{session.session_id}"
+        )
 
     def _session_finished(self, session: LiveSession, status: str) -> None:
         """Tell the automation engine (``session_event`` triggers) that a session's run ended."""
@@ -1562,8 +1570,14 @@ class GatewayServer:
                     self._on_stream_event(session, event)
                 attempt_reason = loop.escalation_reason or ""
                 if "loop_guard" in attempt_reason:  # counted on every tier, not only when a cheap start escalates
-                    self.usage.record("loop_guard", session=session.session_id, detail=attempt_reason,
-                                      tier=tier.value, task_kind=kind.value, turn=session.turn_id)
+                    self.usage.record(
+                        "loop_guard",
+                        session=session.session_id,
+                        detail=attempt_reason,
+                        tier=tier.value,
+                        task_kind=kind.value,
+                        turn=session.turn_id,
+                    )
                 new_tier = escalation.record(attempt_reason) if cheap_start and attempt_reason else None
                 if new_tier is None or loop.interrupted:
                     break
@@ -1611,14 +1625,24 @@ class GatewayServer:
             # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
             # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
             self._persist_turn(session, loop)
-            self.learning.record_turn_replay(session, list(loop.turn_messages), status, tier.value, kind.value,
-                                             session.turn_id, history_len=len(history))
+            self.learning.record_turn_replay(
+                session,
+                list(loop.turn_messages),
+                status,
+                tier.value,
+                kind.value,
+                session.turn_id,
+                history_len=len(history),
+            )
             if session.paused:  # a cancelled wait never saw "resumed"
                 session.paused = False
                 session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")
             # a provider outage is not a correctness failure: the scope log keeps it apart from "error"
-            scope_outcome = "outage" if isinstance(session.last_exc, (AllProvidersUnreachable, ChainExhausted)) \
-                and status == "error" else status
+            scope_outcome = (
+                "outage"
+                if isinstance(session.last_exc, (AllProvidersUnreachable, ChainExhausted)) and status == "error"
+                else status
+            )
             self.autonomy.finish(session, gate, scope_outcome, final_text, text)
             if self.learning.enabled:
                 self.learning.spawn(self.learning.turn_finished(session, status))
@@ -1690,7 +1714,10 @@ class GatewayServer:
             return 0
         try:
             new, folded = await compact_messages(
-                self.model_caller, list(messages), keep=int(cfg["keep_messages"]), session_id=session.session_id,
+                self.model_caller,
+                list(messages),
+                keep=int(cfg["keep_messages"]),
+                session_id=session.session_id,
                 max_input_chars=int(cfg["compact_input_chars"]),
             )
         except Exception:  # noqa: BLE001 - e.g. every provider rate-limited: the turn proceeds with the long history
@@ -1700,8 +1727,15 @@ class GatewayServer:
             session.stored.messages = new
             self.store.save(session.stored)
             logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
-            session.emit("notification.show", {"text": f"Context compacted: {folded} older messages summarized",
-                                               "level": "info", "kind": "info", "key": "k3.compact"})
+            session.emit(
+                "notification.show",
+                {
+                    "text": f"Context compacted: {folded} older messages summarized",
+                    "level": "info",
+                    "kind": "info",
+                    "key": "k3.compact",
+                },
+            )
         return folded
 
     async def _auto_title(self, session: LiveSession, first_message: str) -> None:
@@ -2033,8 +2067,9 @@ class GatewayServer:
         }
         live.emit("notification.show", payload, importance="essential")
 
-    def notify_blocker(self, session_id: str, text: str, *, level: str = "warning", kind: str = "goal",
-                       key: str = "") -> int:
+    def notify_blocker(
+        self, session_id: str, text: str, *, level: str = "warning", kind: str = "goal", key: str = ""
+    ) -> int:
         """A blocker: stored until a client takes it (so it survives a restart), and shown to attached clients now.
 
         The text is scrubbed first: it can carry an approval command with credentials in it (S8).
@@ -2431,8 +2466,10 @@ def transcript_rows(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if role == "assistant":
             for tc in m.get("tool_calls") or []:
                 fn = tc.get("function") or {}
-                names[str(tc.get("id"))] = (str(tc.get("name") or fn.get("name") or "tool"),
-                                            str(tc.get("arguments") or fn.get("arguments") or "")[:80])
+                names[str(tc.get("id"))] = (
+                    str(tc.get("name") or fn.get("name") or "tool"),
+                    str(tc.get("arguments") or fn.get("arguments") or "")[:80],
+                )
         content = m.get("content")
         if isinstance(content, list):
             content = "".join(str(p.get("text", "")) for p in content if isinstance(p, dict))
@@ -2473,8 +2510,13 @@ async def _session_activate(server: GatewayServer, params: dict[str, Any]) -> di
     live = server.live_for(stored)
     server.live[live.session_id] = live
     server.attach(_ctx_client.get() or server._stdio_client, live, replay_delay=0.15)
-    return {"session_id": stored.session_id, "info": live.live_info(), "status": live.state,
-            "running": live.streaming, "messages": transcript_rows(live.stored.messages)}
+    return {
+        "session_id": stored.session_id,
+        "info": live.live_info(),
+        "status": live.state,
+        "running": live.streaming,
+        "messages": transcript_rows(live.stored.messages),
+    }
 
 
 async def _session_close(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -2485,8 +2527,13 @@ async def _session_close(server: GatewayServer, params: dict[str, Any]) -> dict[
     live = server.live.get(sid)
     if live is None:
         return {"closed": False, "reason": "not live"}
-    if (live.streaming or live.background or live.needs_input or server.has_open_request(sid)
-            or any(c.session_id == sid for c in server.clients)):
+    if (
+        live.streaming
+        or live.background
+        or live.needs_input
+        or server.has_open_request(sid)
+        or any(c.session_id == sid for c in server.clients)
+    ):
         return {"closed": False, "reason": "still in use"}
     server.live.pop(sid, None)
     if live.reliability is not None:

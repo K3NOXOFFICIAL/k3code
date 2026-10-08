@@ -142,6 +142,4 @@ class LoopGuard:
                 key=key,
             )
         self._note_injected = True
-        return GuardOutcome(
-            Verdict.NOTE, note=CORRECTIVE_NOTE.format(what=what, n=run), key=key
-        )
+        return GuardOutcome(Verdict.NOTE, note=CORRECTIVE_NOTE.format(what=what, n=run), key=key)

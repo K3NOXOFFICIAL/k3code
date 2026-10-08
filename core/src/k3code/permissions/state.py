@@ -70,9 +70,7 @@ def persist_rules(path: Path, rules: list[Rule]) -> None:
         path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
-def log_decision(
-    *, session: str, tool: str, pattern: str, choice: str, cwd: str, home: Path | None = None
-) -> None:
+def log_decision(*, session: str, tool: str, pattern: str, choice: str, cwd: str, home: Path | None = None) -> None:
     """Append one approval decision to ``$K3CODE_HOME/decisions.jsonl`` (learning hook for M5)."""
     path = (home or _home()) / "decisions.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)

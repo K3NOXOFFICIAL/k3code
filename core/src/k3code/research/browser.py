@@ -41,17 +41,39 @@ class Verdict(StrEnum):
 STOP_VERDICTS = frozenset({Verdict.CAPTCHA, Verdict.LOGIN, Verdict.PAYWALL})
 
 CAPTCHA_PATTERNS = (
-    "g-recaptcha", "grecaptcha", "h-captcha", "hcaptcha.com", "recaptcha/api", "captcha-container",
-    "verify you are human", "prove you are human", "are you a robot", "i'm not a robot", "i am not a robot",
-    "complete the captcha", "solve the captcha",
+    "g-recaptcha",
+    "grecaptcha",
+    "h-captcha",
+    "hcaptcha.com",
+    "recaptcha/api",
+    "captcha-container",
+    "verify you are human",
+    "prove you are human",
+    "are you a robot",
+    "i'm not a robot",
+    "i am not a robot",
+    "complete the captcha",
+    "solve the captcha",
 )
 LOGIN_PATTERNS = (
-    "sign in to continue", "log in to continue", "login to continue", "sign in to read", "log in to read",
-    "please log in to", "please sign in to", "you must be logged in", "you need to log in to",
+    "sign in to continue",
+    "log in to continue",
+    "login to continue",
+    "sign in to read",
+    "log in to read",
+    "please log in to",
+    "please sign in to",
+    "you must be logged in",
+    "you need to log in to",
 )
 PAYWALL_PATTERNS = (
-    "subscribe to continue", "subscribe to read", "subscribers only", "for subscribers only",
-    "this article is for subscribers", "to continue reading, subscribe", "become a member to continue",
+    "subscribe to continue",
+    "subscribe to read",
+    "subscribers only",
+    "for subscribers only",
+    "this article is for subscribers",
+    "to continue reading, subscribe",
+    "become a member to continue",
     "you have reached your free article limit",
 )
 CHALLENGE_PATTERNS = UPSTREAM_BLOCKED_PATTERNS + ("just a moment...", "checking your browser before accessing")
@@ -107,11 +129,15 @@ def classify(status: int, body: str) -> Verdict:
 def stop_report(verdict: Verdict, url: str) -> str:
     """The report for a stop: what was found, what was not done."""
     if verdict is Verdict.CAPTCHA:
-        return (f"stopped at a CAPTCHA on {url}: k3code does not solve CAPTCHAs. Open the page in your own browser, "
-                "or use another source.")
+        return (
+            f"stopped at a CAPTCHA on {url}: k3code does not solve CAPTCHAs. Open the page in your own browser, "
+            "or use another source."
+        )
     if verdict is Verdict.LOGIN:
-        return (f"stopped at a login wall on {url}: k3code does not log in to sites. Use another source, or read it "
-                "in your own session.")
+        return (
+            f"stopped at a login wall on {url}: k3code does not log in to sites. Use another source, or read it "
+            "in your own session."
+        )
     return f"stopped at a paywall on {url}: k3code does not bypass paywalls. Use another source."
 
 
@@ -208,10 +234,12 @@ class BrowserManager:
             await self.close()
             return self._state(["browser disconnected"])
         if not self.cdp_url:
-            return self._state([
-                "CDP attach is off by default: set browser.cdp_url in config.yaml to a Chromium started with "
-                "--remote-debugging-port. k3code's own browser starts on the first web_browse or escalated fetch."
-            ])
+            return self._state(
+                [
+                    "CDP attach is off by default: set browser.cdp_url in config.yaml to a Chromium started with "
+                    "--remote-debugging-port. k3code's own browser starts on the first web_browse or escalated fetch."
+                ]
+            )
         wanted = (url or "").strip().rstrip("/")
         if wanted and wanted != self.cdp_url.rstrip("/"):
             return self._state(["refused: the endpoint is not the configured browser.cdp_url"])

@@ -298,9 +298,7 @@ class Governor:
                     if kind == "io":
                         self._counters.io += 1
                     if kind == "llm" and provider is not None:
-                        self._counters.by_provider[provider] = (
-                            self._counters.by_provider.get(provider, 0) + 1
-                        )
+                        self._counters.by_provider[provider] = self._counters.by_provider.get(provider, 0) + 1
                     return
             # Caps are full (or the provider stream cap): back off briefly.
             await asyncio.sleep(0.05)

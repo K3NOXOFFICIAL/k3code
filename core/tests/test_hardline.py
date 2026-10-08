@@ -181,7 +181,12 @@ def test_an_approved_prefix_does_not_cover_writes_outside_the_project_or_unvette
 
 def test_launchers_are_never_offered_as_always_allow_rules():
     launchers = (
-        "python3 script.py", "ssh protected-host-a ls", "sudo ls", "bash run.sh", "xargs rm", "find . -delete",
+        "python3 script.py",
+        "ssh protected-host-a ls",
+        "sudo ls",
+        "bash run.sh",
+        "xargs rm",
+        "find . -delete",
         "env X=1 ls",
     )
     for cmd in launchers:
@@ -214,8 +219,13 @@ def test_builtin_git_allows_do_not_cover_lookalike_subcommands_or_external_progr
     def action(cmd):
         return decide(mode="default", tool="bash", args={"command": cmd}, cwd="/proj").action
 
-    for cmd in ("git difftool -x 'touch pwned'", "git logx", "git statusx", "git log -p --ext-diff",
-                "git log -p --textconv"):
+    for cmd in (
+        "git difftool -x 'touch pwned'",
+        "git logx",
+        "git statusx",
+        "git log -p --ext-diff",
+        "git log -p --textconv",
+    ):
         assert action(cmd) == "ask", cmd
     for cmd in ("git diff", "git diff --stat", "git log", "git log --oneline -5", "git status", "git status -s"):
         assert action(cmd) == "allow", cmd

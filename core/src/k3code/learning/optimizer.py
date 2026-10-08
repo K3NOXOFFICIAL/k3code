@@ -40,17 +40,43 @@ TUNABLE_PATHS = (
 )
 #: Hard exclusions, checked first and never overridden: permissions, the sandbox, halt, spend and turn caps and
 #: deadlines, notification channels, and the optimizer's own gates (learning.optimizer.*, learning.enabled).
-EXCLUDED_SEGMENTS = frozenset({
-    "permissions", "permission_mode", "headless_permission", "hardline", "sandbox", "daemon", "halt", "budget",
-    "budgets", "max_turns", "deadline", "reliability", "notify", "notification", "notifications", "channel", "ntfy",
-    "telegram", "optimizer", "enabled",
-})
+EXCLUDED_SEGMENTS = frozenset(
+    {
+        "permissions",
+        "permission_mode",
+        "headless_permission",
+        "hardline",
+        "sandbox",
+        "daemon",
+        "halt",
+        "budget",
+        "budgets",
+        "max_turns",
+        "deadline",
+        "reliability",
+        "notify",
+        "notification",
+        "notifications",
+        "channel",
+        "ntfy",
+        "telegram",
+        "optimizer",
+        "enabled",
+    }
+)
 
 
 # ── metrics ────────────────────────────────────────────────────────────────
 
-def collect(usage_rows: list[dict[str, Any]], log: DecisionLog, scope_rows: list[dict[str, Any]], *,
-            since: float = 0.0, until: float | None = None) -> dict[str, Any]:
+
+def collect(
+    usage_rows: list[dict[str, Any]],
+    log: DecisionLog,
+    scope_rows: list[dict[str, Any]],
+    *,
+    since: float = 0.0,
+    until: float | None = None,
+) -> dict[str, Any]:
     """Aggregate raw rows in [since, until) into rates. ``usage_rows`` are dicts with the usage ``events`` columns."""
     until = until if until is not None else float("inf")
     ev = [r for r in usage_rows if since <= r["ts"] < until]
@@ -166,6 +192,7 @@ def score(m: dict[str, Any], baseline: dict[str, Any] | None = None) -> float:
 
 # ── candidates ─────────────────────────────────────────────────────────────
 
+
 def _tier_up_gain_and_cost(m: dict[str, Any], kind: str, escalated: int) -> tuple[float | None, float]:
     """Quality gain and token cost of moving ``kind`` from the cheap tier to main, from measured calls.
 
@@ -201,27 +228,48 @@ def suggest(m: dict[str, Any], config: Any) -> list[dict[str, Any]]:
         kind, n = max(m["escalated_kinds"].items(), key=lambda kv: kv[1])
         gain, cost_pct = _tier_up_gain_and_cost(m, kind, n)
         if kind and gain is not None and accept_change(gain, cost_pct):
-            out.append({"title": f"Route {kind} to the main tier (cheap tier escalated {n}×; quality "
-                                 f"+{gain:.0%} for +{cost_pct:.0f}% tokens)",
-                        "patch": {"task_tiers": {kind: "main"}},
-                        "evidence": {"escalation_rate": m["escalation_rate"], "kind": kind, "count": n,
-                                     "quality_gain": round(gain, 3), "token_increase_pct": round(cost_pct, 1)}})
+            out.append(
+                {
+                    "title": f"Route {kind} to the main tier (cheap tier escalated {n}×; quality "
+                    f"+{gain:.0%} for +{cost_pct:.0f}% tokens)",
+                    "patch": {"task_tiers": {kind: "main"}},
+                    "evidence": {
+                        "escalation_rate": m["escalation_rate"],
+                        "kind": kind,
+                        "count": n,
+                        "quality_gain": round(gain, 3),
+                        "token_increase_pct": round(cost_pct, 1),
+                    },
+                }
+            )
     if m["proposals_decided"] >= 10 and (m["proposal_accept_rate"] or 0) < 0.2:
         cur = float(cfg["rank_threshold"])
-        out.append({"title": f"Raise the proposer threshold {cur} → {round(min(0.6, cur + 0.1), 2)} "
-                             f"(accept rate {m['proposal_accept_rate']})",
-                    "patch": {"learning": {"rank_threshold": round(min(0.6, cur + 0.1), 2)}},
-                    "evidence": {"accept_rate": m["proposal_accept_rate"], "decided": m["proposals_decided"]}})
+        out.append(
+            {
+                "title": f"Raise the proposer threshold {cur} → {round(min(0.6, cur + 0.1), 2)} "
+                f"(accept rate {m['proposal_accept_rate']})",
+                "patch": {"learning": {"rank_threshold": round(min(0.6, cur + 0.1), 2)}},
+                "evidence": {"accept_rate": m["proposal_accept_rate"], "decided": m["proposals_decided"]},
+            }
+        )
     if m["scope_judged"] >= 10 and (m["scope_accuracy"] or 1) < 0.7:
         gain = 1.0 - float(m["scope_accuracy"])  # share of judged verdicts the gate got wrong
         cost_pct = _planning_cost_pct(m)  # planning tokens today; widening the gate roughly adds that much again
         if cost_pct is not None and accept_change(gain, cost_pct):
-            out.append({"title": "Plan more often: also run the scope gate in default mode "
-                                 f"(scope verdict accuracy {m['scope_accuracy']}; quality +{gain:.0%} for "
-                                 f"+{cost_pct:.0f}% tokens)",
-                        "patch": {"autonomy": {"gate_modes": ["auto", "default"]}},
-                        "evidence": {"scope_accuracy": m["scope_accuracy"], "judged": m["scope_judged"],
-                                     "quality_gain": round(gain, 3), "token_increase_pct": round(cost_pct, 1)}})
+            out.append(
+                {
+                    "title": "Plan more often: also run the scope gate in default mode "
+                    f"(scope verdict accuracy {m['scope_accuracy']}; quality +{gain:.0%} for "
+                    f"+{cost_pct:.0f}% tokens)",
+                    "patch": {"autonomy": {"gate_modes": ["auto", "default"]}},
+                    "evidence": {
+                        "scope_accuracy": m["scope_accuracy"],
+                        "judged": m["scope_judged"],
+                        "quality_gain": round(gain, 3),
+                        "token_increase_pct": round(cost_pct, 1),
+                    },
+                }
+            )
     # a task kind that ran on the main tier without a single escalation can run one tier down (a human accepts it: a
     # lower tier saves cost, not tokens, so the replay gate never applies it automatically)
     for kind, cells in sorted((m.get("kind_tier") or {}).items()):
@@ -230,26 +278,39 @@ def suggest(m: dict[str, Any], config: Any) -> list[dict[str, Any]]:
             continue
         if main["calls"] < TIER_DOWN_MIN_CALLS:
             continue
-        out.append({"title": f"Run {kind} on the cheap tier ({main['calls']} main-tier calls, no escalation)",
-                    "patch": {"task_tiers": {kind: "cheap"}},
-                    "evidence": {"kind": kind, "main_calls": main["calls"], "escalations": 0}})
+        out.append(
+            {
+                "title": f"Run {kind} on the cheap tier ({main['calls']} main-tier calls, no escalation)",
+                "patch": {"task_tiers": {kind: "cheap"}},
+                "evidence": {"kind": kind, "main_calls": main["calls"], "escalations": 0},
+            }
+        )
     if m["waits_per_session"] >= 3:
         cur_wait = float((getattr(config, "router", None) or {}).get("max_inline_wait", 20))
-        out.append({"title": f"Raise router.max_inline_wait {cur_wait:g}s → {cur_wait * 2:g}s "
-                             f"({m['waits_per_session']} waits/session)",
-                    "patch": {"router": {"max_inline_wait": cur_wait * 2}},
-                    "evidence": {"waits_per_session": m["waits_per_session"]}})
+        out.append(
+            {
+                "title": f"Raise router.max_inline_wait {cur_wait:g}s → {cur_wait * 2:g}s "
+                f"({m['waits_per_session']} waits/session)",
+                "patch": {"router": {"max_inline_wait": cur_wait * 2}},
+                "evidence": {"waits_per_session": m["waits_per_session"]},
+            }
+        )
     if m["loop_guard_per_session"] >= 0.3:
-        out.append({"title": "Add a prompt overlay against repeating identical tool calls "
-                             f"(loop guard fired {m['loop_guard_per_session']}/session)",
-                    "prompt": "If a tool call fails twice with the same arguments, change the approach or ask the "
-                              "user instead of retrying it.",
-                    "name": "no-repeat-calls",
-                    "evidence": {"loop_guard_per_session": m["loop_guard_per_session"]}})
+        out.append(
+            {
+                "title": "Add a prompt overlay against repeating identical tool calls "
+                f"(loop guard fired {m['loop_guard_per_session']}/session)",
+                "prompt": "If a tool call fails twice with the same arguments, change the approach or ask the "
+                "user instead of retrying it.",
+                "name": "no-repeat-calls",
+                "evidence": {"loop_guard_per_session": m["loop_guard_per_session"]},
+            }
+        )
     return out
 
 
 # ── experiments ────────────────────────────────────────────────────────────
+
 
 class Experiments:
     """A/B experiments persisted in ``$K3CODE_HOME/learning/experiments.json``.
@@ -283,8 +344,9 @@ class Experiments:
     def active(self) -> list[dict[str, Any]]:
         return [x for x in self.all() if x["status"] == "active"]
 
-    def start(self, overlay: dict[str, Any], baseline: dict[str, Any], *, sessions: int = 20,
-              config_path: Path | None = None) -> dict[str, Any]:
+    def start(
+        self, overlay: dict[str, Any], baseline: dict[str, Any], *, sessions: int = 20, config_path: Path | None = None
+    ) -> dict[str, Any]:
         """Apply an accepted overlay. Config overlays patch the user config (old values kept for rollback).
 
         ``overlay["auto"]`` marks a change the optimizer made by itself (replay gate); it is logged and rolled back
@@ -292,10 +354,18 @@ class Experiments:
         """
         items = self.all()
         xid = f"x{len(items) + 1}"
-        exp: dict[str, Any] = {"id": xid, "title": overlay.get("title", ""), "status": "active",
-                               "started": self.clock(), "target_sessions": sessions, "sessions_done": 0,
-                               "baseline": baseline, "baseline_score": score(baseline), "evidence":
-                               overlay.get("evidence", {}), "auto": bool(overlay.get("auto"))}
+        exp: dict[str, Any] = {
+            "id": xid,
+            "title": overlay.get("title", ""),
+            "status": "active",
+            "started": self.clock(),
+            "target_sessions": sessions,
+            "sessions_done": 0,
+            "baseline": baseline,
+            "baseline_score": score(baseline),
+            "evidence": overlay.get("evidence", {}),
+            "auto": bool(overlay.get("auto")),
+        }
         if "patch" in overlay:
             path = config_path or user_config_path()
             cur = confio.read_yaml(path)
@@ -309,8 +379,9 @@ class Experiments:
         else:
             exp.update(kind="prompt", name=overlay["name"])
             self.overlays.mkdir(parents=True, exist_ok=True)
-            (self.overlays / f"{xid}-{overlay['name']}.md").write_text(overlay["prompt"].strip() + "\n",
-                                                                       encoding="utf-8")
+            (self.overlays / f"{xid}-{overlay['name']}.md").write_text(
+                overlay["prompt"].strip() + "\n", encoding="utf-8"
+            )
         items.append(exp)
         self._save(items)
         return exp
@@ -351,8 +422,13 @@ class Experiments:
             else:
                 setattr(self.live, key, new)
 
-    def session_done(self, current_metrics: Callable[[float], dict[str, Any]], notify: Callable[[str], None] | None
-                     = None, config_path: Path | None = None, ids: set[str] | None = None) -> list[dict[str, Any]]:
+    def session_done(
+        self,
+        current_metrics: Callable[[float], dict[str, Any]],
+        notify: Callable[[str], None] | None = None,
+        config_path: Path | None = None,
+        ids: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Count one finished session for every active experiment (or only ``ids``); judge the ones that reached
         their target."""
         items = self.all()
@@ -371,8 +447,10 @@ class Experiments:
             if after < x["baseline_score"] - ROLLBACK_MARGIN:
                 self._store_result(x, "rolled_back")
                 self.rollback(x["id"], config_path=config_path)
-                msg = (f"Optimizer experiment {x['id']} ({x['title']}) rolled back automatically: score "
-                       f"{x['baseline_score']} → {after}.")
+                msg = (
+                    f"Optimizer experiment {x['id']} ({x['title']}) rolled back automatically: score "
+                    f"{x['baseline_score']} → {after}."
+                )
             else:
                 self._store_result(x, "kept")
                 msg = f"Optimizer experiment {x['id']} ({x['title']}) kept: score {x['baseline_score']} → {after}."
@@ -396,8 +474,9 @@ class Experiments:
         lines = []
         for x in items:
             extra = f"  score {x['baseline_score']} → {x.get('after_score', '?')}" if x["status"] != "active" else ""
-            lines.append(f"{x['id']} [{x['status']}] {x['title']}  ({x['sessions_done']}/{x['target_sessions']} "
-                         f"sessions){extra}")
+            lines.append(
+                f"{x['id']} [{x['status']}] {x['title']}  ({x['sessions_done']}/{x['target_sessions']} sessions){extra}"
+            )
         return "\n".join(lines)
 
 
@@ -433,8 +512,10 @@ def check_optimizer_patch(patch: dict[str, Any]) -> None:
     for path in _leaf_paths(patch):
         segments = path.split(".")
         if EXCLUDED_SEGMENTS.intersection(segments):
-            raise PatchRejected(f"{path}: the optimizer may not change permissions, the sandbox, halt, caps, "
-                                "notification channels or its own gates")
+            raise PatchRejected(
+                f"{path}: the optimizer may not change permissions, the sandbox, halt, caps, "
+                "notification channels or its own gates"
+            )
         if not any(path == t or path.startswith(t + ".") for t in TUNABLE_PATHS):
             raise PatchRejected(f"{path}: not a setting the optimizer may tune")
 
@@ -457,8 +538,13 @@ def propose(m: dict[str, Any], config: Any, store: ProposalStore) -> list[Propos
                 check_optimizer_patch(c["patch"])
         except PatchRejected:
             continue
-        p = store.add("optimizer", c["title"], "apply overlay as an A/B experiment", payload={"overlay": c},
-                      key=dedup_key("optimizer", json.dumps(c.get("patch") or c.get("name"), sort_keys=True)))
+        p = store.add(
+            "optimizer",
+            c["title"],
+            "apply overlay as an A/B experiment",
+            payload={"overlay": c},
+            key=dedup_key("optimizer", json.dumps(c.get("patch") or c.get("name"), sort_keys=True)),
+        )
         if p:
             out.append(p)
     return out
@@ -473,9 +559,13 @@ def propose_replayed(candidates: list[dict[str, Any]], store: ProposalStore) -> 
             check_optimizer_patch(c["patch"])
         except PatchRejected:
             continue
-        p = store.add("optimizer", c["title"], "apply overlay as an A/B experiment",
-                      payload={"overlay": {"title": c["title"], "patch": c["patch"], "evidence": c["evidence"]}},
-                      key=dedup_key("optimizer", json.dumps(c["patch"], sort_keys=True)))
+        p = store.add(
+            "optimizer",
+            c["title"],
+            "apply overlay as an A/B experiment",
+            payload={"overlay": {"title": c["title"], "patch": c["patch"], "evidence": c["evidence"]}},
+            key=dedup_key("optimizer", json.dumps(c["patch"], sort_keys=True)),
+        )
         if p:
             out.append(p)
     return out

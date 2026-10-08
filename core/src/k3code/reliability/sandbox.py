@@ -85,9 +85,7 @@ def harness_git_argv(*args: str) -> list[str]:
     return ["git", *HARNESS_GIT_CONFIG, *args]
 
 
-def unattended_prefix(
-    cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, network: bool = False
-) -> list[str]:
+def unattended_prefix(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, network: bool = False) -> list[str]:
     """The bwrap prefix for an unattended child. Raises :class:`SandboxUnavailable` when bwrap is unusable.
 
     Unattended work (goal gates, fan-out tests, ultra, automation shells, sub-agents) has no human to see a warning,
@@ -118,8 +116,15 @@ async def spawn_unattended_shell(
     """
     prefix = await asyncio.to_thread(unattended_prefix, cwd, add_dirs)
     return await asyncio.create_subprocess_exec(
-        *prefix, "/bin/sh", "-c", command,
-        cwd=str(cwd), env=child_env(extra_env), stdin=stdin, stdout=stdout, stderr=stderr,
+        *prefix,
+        "/bin/sh",
+        "-c",
+        command,
+        cwd=str(cwd),
+        env=child_env(extra_env),
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
     )
 
 

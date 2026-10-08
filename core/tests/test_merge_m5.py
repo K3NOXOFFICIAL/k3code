@@ -1,4 +1,3 @@
-
 """merge-m5: GOAL.md command set, /permissions, /focus, actor tagging of unattended decisions."""
 
 from __future__ import annotations

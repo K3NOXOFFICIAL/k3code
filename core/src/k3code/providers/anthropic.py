@@ -16,9 +16,9 @@ from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec, mes
 _TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=15.0)
 
 
-
 #: Anthropic reports cache reads and cache writes apart from input_tokens; they are prompt tokens too.
 _INPUT_USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
 
 class AnthropicProvider(Provider):
     """Talks to the Anthropic messages API (also most Claude-compatible relays)."""

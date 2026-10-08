@@ -9,21 +9,29 @@ from m1cmd_helpers import cmd, frames_of, make_server, new_session, submit_and_w
 
 
 def kinds(server):
-    return server.usage._db.execute(
-        "SELECT task_kind, tier FROM events WHERE kind='call'"
-    ).fetchall()
+    return server.usage._db.execute("SELECT task_kind, tier FROM events WHERE kind='call'").fetchall()
 
 
 def test_clean_title_and_split():
     assert clean_title('"Fix the login bug."\nextra') == "Fix the login bug"
-    msgs = [{"role": "user"}, {"role": "assistant"}, {"role": "user"}, {"role": "assistant", "tool_calls": []},
-            {"role": "tool"}, {"role": "assistant"}]
+    msgs = [
+        {"role": "user"},
+        {"role": "assistant"},
+        {"role": "user"},
+        {"role": "assistant", "tool_calls": []},
+        {"role": "tool"},
+        {"role": "assistant"},
+    ]
     assert split_for_compaction(msgs, keep=2) == 2  # never cuts between a tool call and its result
 
 
 async def test_auto_title_uses_title_kind_when_enabled(tmp_path, monkeypatch):
-    server, provider = make_server(tmp_path, monkeypatch, replies=["done", '"Refactor the parser."'],
-                                   autonomy={"auto_title": True, "advisor_on_goal": False})
+    server, provider = make_server(
+        tmp_path,
+        monkeypatch,
+        replies=["done", '"Refactor the parser."'],
+        autonomy={"auto_title": True, "advisor_on_goal": False},
+    )
     sid = await new_session(server, tmp_path)
     await submit_and_wait(server, "please refactor the parser")
     await asyncio.gather(*list(server._side_tasks))
@@ -45,9 +53,7 @@ async def test_compact_summarizes_old_messages_via_compaction_kind(tmp_path, mon
     server, provider = make_server(tmp_path, monkeypatch, replies=["SUMMARY: did a and b"])
     sid = await new_session(server, tmp_path)
     live = server.sessions.get(sid)
-    live.messages = [
-        {"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i}"} for i in range(12)
-    ]
+    live.messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i}"} for i in range(12)]
     res = await cmd(server, "/compact", sid)
     assert "Compacted" in res["message"]
     msgs = server.sessions.get(sid).messages

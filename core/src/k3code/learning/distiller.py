@@ -67,8 +67,9 @@ def derive(log: DecisionLog, *, min_evidence: int = 3) -> tuple[list[Preference]
 
     # plans
     plans = log.query("plan")
-    no_verif = sum(1 for r in plans if r["choice"] in ("deny", "rejected")
-                   and r["detail"].get("has_verification") is False)
+    no_verif = sum(
+        1 for r in plans if r["choice"] in ("deny", "rejected") and r["detail"].get("has_verification") is False
+    )
     if no_verif >= max(2, min_evidence - 1):
         add("plan:verification", "rejects plans without verification steps", no_verif)
     edited = sum(1 for r in plans if r["detail"].get("edited"))
@@ -125,7 +126,9 @@ async def polish(caller: Any, prefs: list[Preference], *, session_id: str = "") 
         res = await caller.complete(
             TaskKind.CLASSIFICATION,
             [Message(role="system", content=DISTILL_SYSTEM), Message(role="user", content=payload)],
-            session_id=session_id, max_tokens=700, timeout=30,
+            session_id=session_id,
+            max_tokens=700,
+            timeout=30,
         )
         m = re.search(r"\[.*\]", res.text or "", re.S)
         items = json.loads(m.group(0)) if m else []
@@ -166,7 +169,7 @@ def read_auto_section(path: Path, heading: str = HEADING) -> list[str]:
     except StopIteration:
         return []
     out = []
-    for ln in lines[i + 1:]:
+    for ln in lines[i + 1 :]:
         if re.match(r"#{1,2} ", ln):
             break
         if ln.startswith("- ") and "(nothing learned" not in ln:
@@ -177,8 +180,14 @@ def read_auto_section(path: Path, heading: str = HEADING) -> list[str]:
 def write_preferences_json(home: Path, prefs: list[Preference]) -> Path:
     path = home / "learning" / "preferences.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({p.key or p.text: {"text": p.text, "confidence": p.confidence, "evidence": p.evidence}
-                                for p in prefs}, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {p.key or p.text: {"text": p.text, "confidence": p.confidence, "evidence": p.evidence} for p in prefs},
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -193,8 +202,9 @@ def load_preferences(home: Path, top: int = 5) -> list[Preference]:
     return prefs[:top]
 
 
-def store_mem0(config: Any, prefs: list[Preference], post: Callable[[str, dict[str, Any], dict[str, str]], None]
-               | None = None) -> int:
+def store_mem0(
+    config: Any, prefs: list[Preference], post: Callable[[str, dict[str, Any], dict[str, str]], None] | None = None
+) -> int:
     """Store each preference as a mem0 memory when mem0 is configured. The key comes from the env only."""
     import os
 
@@ -209,11 +219,15 @@ def store_mem0(config: Any, prefs: list[Preference], post: Callable[[str, dict[s
 
         def post(url: str, body: dict[str, Any], hdrs: dict[str, str]) -> None:  # noqa: F811
             httpx.post(url, json=body, headers=hdrs, timeout=10).raise_for_status()
+
     n = 0
     for p in prefs:
-        body = {"messages": [{"role": "user", "content": f"User preference (learned by k3code): {p.text}"}],
-                "agent_id": m.agent_id, **({"user_id": m.user_id} if m.user_id else {}),
-                "metadata": {"confidence": p.confidence, "evidence": p.evidence, "source": "k3code-distiller"}}
+        body = {
+            "messages": [{"role": "user", "content": f"User preference (learned by k3code): {p.text}"}],
+            "agent_id": m.agent_id,
+            **({"user_id": m.user_id} if m.user_id else {}),
+            "metadata": {"confidence": p.confidence, "evidence": p.evidence, "source": "k3code-distiller"},
+        }
         try:
             post(m.url.rstrip("/") + "/memories", body, headers)
             n += 1
@@ -222,9 +236,18 @@ def store_mem0(config: Any, prefs: list[Preference], post: Callable[[str, dict[s
     return n
 
 
-async def distill(log: DecisionLog, *, home: Path, user_md: Path, config: Any = None, caller: Any = None,
-                  proposals: ProposalStore | None = None, mem0_post: Any = None, min_evidence: int = 3,
-                  session_id: str = "") -> list[Preference]:
+async def distill(
+    log: DecisionLog,
+    *,
+    home: Path,
+    user_md: Path,
+    config: Any = None,
+    caller: Any = None,
+    proposals: ProposalStore | None = None,
+    mem0_post: Any = None,
+    min_evidence: int = 3,
+    session_id: str = "",
+) -> list[Preference]:
     prefs, suggestions = derive(log, min_evidence=min_evidence)
     prefs = await polish(caller, prefs, session_id=session_id)
     write_auto_section(user_md, prefs)
@@ -233,8 +256,15 @@ async def distill(log: DecisionLog, *, home: Path, user_md: Path, config: Any = 
     await asyncio.to_thread(store_mem0, config, prefs, mem0_post)
     if proposals is not None:
         for s in suggestions:
-            text = (f"You keep moving away from {s['model']} for {s['task_kind']} tasks ({s['evidence']}×) → "
-                    f"route {s['task_kind']} to the '{s['tier']}' tier?")
-            proposals.add("optimizer", text, "update task_tiers", payload={"task_tiers": {s["task_kind"]: s["tier"]}},
-                          key=dedup_key("optimizer", f"task_tiers {s['task_kind']} {s['tier']}"))
+            text = (
+                f"You keep moving away from {s['model']} for {s['task_kind']} tasks ({s['evidence']}×) → "
+                f"route {s['task_kind']} to the '{s['tier']}' tier?"
+            )
+            proposals.add(
+                "optimizer",
+                text,
+                "update task_tiers",
+                payload={"task_tiers": {s["task_kind"]: s["tier"]}},
+                key=dedup_key("optimizer", f"task_tiers {s['task_kind']} {s['tier']}"),
+            )
     return prefs

@@ -271,8 +271,9 @@ def _warn_unknown_escalate_keys(merged: dict[str, Any]) -> None:
 
     section = (merged.get("autonomy") or {}).get("escalate") or {}
     for key in sorted(set(section) - ESCALATE_KEYS):
-        logger.warning("autonomy.escalate.%s is not used and is ignored (known keys: %s)", key,
-                       ", ".join(sorted(ESCALATE_KEYS)))
+        logger.warning(
+            "autonomy.escalate.%s is not used and is ignored (known keys: %s)", key, ", ".join(sorted(ESCALATE_KEYS))
+        )
 
 
 def _is_scalar(default: Any) -> bool:

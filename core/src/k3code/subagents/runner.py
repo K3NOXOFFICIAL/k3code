@@ -79,10 +79,19 @@ class Handle:
 
     def summary(self) -> dict[str, Any]:
         return {
-            "id": self.id, "status": self.status, "agent_type": self.agent_type, "tier": self.tier,
-            "description": self.description, "result": self.result, "error": self.error,
-            "tool_count": self.tool_count, "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
-            "branch": self.branch, "merge": self.merge, "diff_stat": self.diff_stat,
+            "id": self.id,
+            "status": self.status,
+            "agent_type": self.agent_type,
+            "tier": self.tier,
+            "description": self.description,
+            "result": self.result,
+            "error": self.error,
+            "tool_count": self.tool_count,
+            "tokens_in": self.tokens_in,
+            "tokens_out": self.tokens_out,
+            "branch": self.branch,
+            "merge": self.merge,
+            "diff_stat": self.diff_stat,
         }
 
     def render(self) -> str:
@@ -195,9 +204,16 @@ class SubagentManager:
         except ValueError as e:
             raise ValueError(f"unknown tier {chosen!r}") from e
         h = Handle(
-            id=f"sa-{uuid.uuid4().hex[:8]}", description=description, agent_type=atype.name, tier=chosen,
-            depth=depth, parent_sid=parent.session_id, parent_child_id=parent_child_id, isolation=isolation,
-            index=index, count=count,
+            id=f"sa-{uuid.uuid4().hex[:8]}",
+            description=description,
+            agent_type=atype.name,
+            tier=chosen,
+            depth=depth,
+            parent_sid=parent.session_id,
+            parent_child_id=parent_child_id,
+            isolation=isolation,
+            index=index,
+            count=count,
         )
         if worktree is not None:  # a rework round continues in the same worktree
             h.worktree, h.isolation, h.branch = worktree, "worktree", worktree.branch
@@ -245,10 +261,21 @@ class SubagentManager:
 
     def _payload(self, h: Handle, **extra: Any) -> dict[str, Any]:
         return {
-            "subagent_id": h.id, "parent_id": h.parent_child_id, "depth": h.depth - 1, "goal": h.description,
-            "model": h.model or h.tier, "task_index": h.index, "task_count": h.count, "tool_count": h.tool_count,
-            "status": h.status, "agent_type": h.agent_type, "tier": h.tier, "session_id": h.parent_sid,
-            "input_tokens": h.tokens_in, "output_tokens": h.tokens_out, **extra,
+            "subagent_id": h.id,
+            "parent_id": h.parent_child_id,
+            "depth": h.depth - 1,
+            "goal": h.description,
+            "model": h.model or h.tier,
+            "task_index": h.index,
+            "task_count": h.count,
+            "tool_count": h.tool_count,
+            "status": h.status,
+            "agent_type": h.agent_type,
+            "tier": h.tier,
+            "session_id": h.parent_sid,
+            "input_tokens": h.tokens_in,
+            "output_tokens": h.tokens_out,
+            **extra,
         }
 
     def _emit(self, parent: Any, kind: str, h: Handle, **extra: Any) -> None:
@@ -296,8 +323,14 @@ class SubagentManager:
         finally:
             h.finished_at = time.monotonic()
             dur = h.finished_at - h.started_at
-            self._emit(parent, "subagent.complete", h, duration_seconds=dur,
-                       summary=(h.result or h.error)[:2000], text=(h.result or h.error)[:2000])
+            self._emit(
+                parent,
+                "subagent.complete",
+                h,
+                duration_seconds=dur,
+                summary=(h.result or h.error)[:2000],
+                text=(h.result or h.error)[:2000],
+            )
             self._record_usage(h)
             rel = getattr(parent, "reliability", None)
             if rel is not None and rel.governor is not None:  # the parent's session budget includes its children
@@ -336,8 +369,14 @@ class SubagentManager:
     def _record_usage(self, h: Handle) -> None:
         try:
             self.server.usage.record(
-                "subagent", session=h.parent_sid, model=h.model, tokens_in=h.tokens_in, tokens_out=h.tokens_out,
-                seconds=h.finished_at - h.started_at, tier=h.tier, task_kind=TaskKind.SUBAGENT.value,
+                "subagent",
+                session=h.parent_sid,
+                model=h.model,
+                tokens_in=h.tokens_in,
+                tokens_out=h.tokens_out,
+                seconds=h.finished_at - h.started_at,
+                tier=h.tier,
+                task_kind=TaskKind.SUBAGENT.value,
                 detail=f"{h.agent_type}: {h.description[:80]}",
             )
         except Exception:  # noqa: BLE001
@@ -345,23 +384,35 @@ class SubagentManager:
 
     def build_loop(self, parent: Any, h: Handle, atype: AgentType, cwd: Path, reliability: Reliability) -> AgentLoop:
         server = self.server
-        perms = PermissionState(
-            mode=PermissionMode(parent.perms.mode), cwd=cwd, add_dirs=list(parent.perms.add_dirs)
-        )
+        perms = PermissionState(mode=PermissionMode(parent.perms.mode), cwd=cwd, add_dirs=list(parent.perms.add_dirs))
         base = build_system_prompt(
-            parent.system_prompt, cwd=cwd, config=server.config, session_meta=parent.stored.meta, mcp=server.mcp,
+            parent.system_prompt,
+            cwd=cwd,
+            config=server.config,
+            session_meta=parent.stored.meta,
+            mcp=server.mcp,
         )
         note = ""
         if h.isolation == "worktree":
-            note = (f"\n\nYou work in an isolated git worktree ({cwd}) on branch {h.branch}. Edit freely there; "
-                    "your changes are committed and merged back by the harness. Do not run git commands that "
-                    "change branches.")
+            note = (
+                f"\n\nYou work in an isolated git worktree ({cwd}) on branch {h.branch}. Edit freely there; "
+                "your changes are committed and merged back by the harness. Do not run git commands that "
+                "change branches."
+            )
         system = f"[agent:{atype.name}] {h.description}\n\n{base}\n\n{atype.prompt}{note}"
         router = server.tier_routers().get(Tier(h.tier))
         loop = AgentLoop(
-            router, system_prompt=system, max_turns=server.config.max_turns, headless=False,
-            on_event=server._on_router_event, cwd=cwd, permissions=perms, reliability=reliability,
-            session=h.id, background=parent.background, unattended=True,
+            router,
+            system_prompt=system,
+            max_turns=server.config.max_turns,
+            headless=False,
+            on_event=server._on_router_event,
+            cwd=cwd,
+            permissions=perms,
+            reliability=reliability,
+            session=h.id,
+            background=parent.background,
+            unattended=True,
             unattended_network=bool(autonomy_cfg(server.config)["unattended_network"]),
             task_kind=TaskKind.SUBAGENT.value,
             approval_callback=getattr(parent, "_approval_cb", None),
@@ -401,8 +452,9 @@ class SubagentManager:
                 h.tool_count += 1
                 h.last_tool = tc.name
                 args = tc.arguments or {}
-                preview = str(args.get("command") or args.get("path") or args.get("pattern")
-                              or args.get("description") or "")[:120]
+                preview = str(
+                    args.get("command") or args.get("path") or args.get("pattern") or args.get("description") or ""
+                )[:120]
                 h.tail.append(f"{tc.name} {preview}".strip())
                 self._emit(parent, "subagent.tool", h, tool_name=tc.name, tool_preview=preview, text=preview)
 

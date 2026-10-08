@@ -21,17 +21,21 @@ def register_task_tools(
             return {"error": "task needs a prompt"}
         try:
             h = mgr.spawn(
-                parent, description=description or prompt[:60], prompt=prompt,
-                agent_type=arguments.get("agent_type") or None, tier=arguments.get("tier") or None,
-                isolation=str(arguments.get("isolation") or "none"), depth=depth, parent_child_id=parent_child_id,
+                parent,
+                description=description or prompt[:60],
+                prompt=prompt,
+                agent_type=arguments.get("agent_type") or None,
+                tier=arguments.get("tier") or None,
+                isolation=str(arguments.get("isolation") or "none"),
+                depth=depth,
+                parent_child_id=parent_child_id,
             )
         except DepthLimit as e:
             return {"error": str(e)}
         except ValueError as e:
             return {"error": str(e)}
         if arguments.get("background"):
-            return {"content": (
-                f"Started sub-agent {h.id} in the background. Poll with task_result(id=\"{h.id}\").")}
+            return {"content": (f'Started sub-agent {h.id} in the background. Poll with task_result(id="{h.id}").')}
         await mgr.wait(h)
         return {"content": h.render()}
 

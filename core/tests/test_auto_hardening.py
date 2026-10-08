@@ -111,11 +111,23 @@ def test_run_history_is_pruned_and_stale_runs_are_reconciled(tmp_path):
     day = 86400.0
     db.insert("jobs", id="j1", name="job", prompt="p", schedule="* * * * *", created_at=now)
     for i in range(300):  # a minutely job for ~5 hours long ago
-        db.insert("job_runs", owner="j1", owner_kind="job", started_at=now - 60 * day + i * 60, status="completed",
-                  session_id=f"s{i}")
+        db.insert(
+            "job_runs",
+            owner="j1",
+            owner_kind="job",
+            started_at=now - 60 * day + i * 60,
+            status="completed",
+            session_id=f"s{i}",
+        )
     for i in range(5):
-        db.insert("job_runs", owner="j1", owner_kind="job", started_at=now - i * 3600, status="completed",
-                  session_id=f"new{i}")
+        db.insert(
+            "job_runs",
+            owner="j1",
+            owner_kind="job",
+            started_at=now - i * 3600,
+            status="completed",
+            session_id=f"new{i}",
+        )
     db.insert("job_runs", owner="gone", owner_kind="job", started_at=now - 3600, status="completed", session_id="orph")
     removed = db.prune_runs(now, max_age_days=30, keep_per_owner=50)
     assert "orph" in removed  # the owner was deleted: its history goes regardless of age
@@ -140,8 +152,14 @@ async def test_engine_prune_deletes_finished_unattended_sessions_only(tmp_path, 
     eng.db.insert("jobs", id="gone-job-owner", name="x", prompt="p", schedule="* * * * *", created_at=0.0)
     eng.db.delete("jobs", "gone-job-owner")  # the job was removed: its runs are orphans
     for sid in (old.session_id, mine.session_id):
-        eng.db.insert("job_runs", owner="gone-job-owner", owner_kind="job", started_at=eng.clock.now(),
-                      status="completed", session_id=sid)
+        eng.db.insert(
+            "job_runs",
+            owner="gone-job-owner",
+            owner_kind="job",
+            started_at=eng.clock.now(),
+            status="completed",
+            session_id=sid,
+        )
     assert eng.prune() == 1
     assert server.store.get(old.session_id) is None and server.store.get(mine.session_id) is not None
     # and the session to continue is never an unattended one

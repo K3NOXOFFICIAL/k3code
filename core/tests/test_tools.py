@@ -167,8 +167,12 @@ def test_bash_does_not_read_the_gateways_stdin(temp_dir):
         "print(repr(r['stdout']))\n"
     )
     out = subprocess.run(
-        [sys.executable, "-c", script, str(temp_dir)], input='{"jsonrpc":"2.0","method":"x"}\n',
-        capture_output=True, text=True, timeout=30, check=True,
+        [sys.executable, "-c", script, str(temp_dir)],
+        input='{"jsonrpc":"2.0","method":"x"}\n',
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
     )
     assert out.stdout.strip() == "''"
 

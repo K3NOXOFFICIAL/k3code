@@ -151,9 +151,7 @@ async def _run_headless(
 
     try:
         await reliability.start()
-        async for _ in loop.run(
-            prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume
-        ):
+        async for _ in loop.run(prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume):
             pass
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
@@ -202,8 +200,12 @@ async def _run_repl(
     cooldowns = CooldownStore(path=_cooldown_path())
 
     def make_router() -> Router:
-        return Router(build_chain(providers, _resolve_model_specs(config)), cooldowns=cooldowns,
-                      on_event=_print_event, **router_options(config))
+        return Router(
+            build_chain(providers, _resolve_model_specs(config)),
+            cooldowns=cooldowns,
+            on_event=_print_event,
+            **router_options(config),
+        )
 
     router = make_router()
 
@@ -269,9 +271,7 @@ async def _run_repl(
         loop.on_text_delta = on_text_delta
 
         try:
-            async for _ in loop.run(
-                user_input, max_tokens=config.max_tokens, temperature=config.temperature
-            ):
+            async for _ in loop.run(user_input, max_tokens=config.max_tokens, temperature=config.temperature):
                 pass
             print()  # newline after streaming
         except AllProvidersUnreachable as e:
@@ -383,8 +383,13 @@ def main(
     if prompt:
         result = asyncio.run(
             _run_headless(
-                prompt, model=model, permission_mode=permission_mode, config=config, json_output=json_output,
-                session=session, resume=resume,
+                prompt,
+                model=model,
+                permission_mode=permission_mode,
+                config=config,
+                json_output=json_output,
+                session=session,
+                resume=resume,
             )
         )
         if json_output and result:
@@ -459,10 +464,13 @@ def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = 
 
         config = load_config(project_dir=Path.cwd())
         with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(_run_repl(
-                model=model, permission_mode=_permission_from_config("permission_mode", config.permission_mode),
-                config=config,
-            ))
+            asyncio.run(
+                _run_repl(
+                    model=model,
+                    permission_mode=_permission_from_config("permission_mode", config.permission_mode),
+                    config=config,
+                )
+            )
         return
 
     env = os.environ.copy()
@@ -912,8 +920,13 @@ def schedule_add(expr: str, prompt: tuple[str, ...], cwd: Path | None, model: st
 
     db, sched = _scheduler_db()
     try:
-        job = sched.add(prompt=" ".join(prompt), schedule=expr, name=name, model=model,
-                        cwd=str((cwd or Path.cwd()).expanduser().resolve()))
+        job = sched.add(
+            prompt=" ".join(prompt),
+            schedule=expr,
+            name=name,
+            model=model,
+            cwd=str((cwd or Path.cwd()).expanduser().resolve()),
+        )
     except ScheduleError as e:
         hint = "For natural language ('every weekday at 9') use /schedule add inside k3code."
         raise click.ClickException(f"{e}\n{hint}") from e

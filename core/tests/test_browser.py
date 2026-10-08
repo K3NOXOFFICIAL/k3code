@@ -24,11 +24,16 @@ from k3code.research.fetch import FetchStatus, WebFetcher
 from k3code.research.tools import fetch_page, register_web_tools
 
 ARTICLE = "<html><head><title>Real Title</title></head><body><main>" + ("word " * 400) + "</main></body></html>"
-CHALLENGE = ("<html><head><title>Attention Required! | Cloudflare</title></head><body>"
-             "<h1>Attention Required! | Cloudflare</h1></body></html>")
+CHALLENGE = (
+    "<html><head><title>Attention Required! | Cloudflare</title></head><body>"
+    "<h1>Attention Required! | Cloudflare</h1></body></html>"
+)
 CAPTCHA = '<html><body><form><div class="g-recaptcha" data-sitekey="x"></div></form></body></html>'
-PAYWALL = ("<html><body><main>" + ("teaser words " * 120) +
-           "<p>Subscribe to continue reading this article.</p></main></body></html>")
+PAYWALL = (
+    "<html><body><main>"
+    + ("teaser words " * 120)
+    + "<p>Subscribe to continue reading this article.</p></main></body></html>"
+)
 LOGIN = "<html><body><h1>Please log in to view this page</h1><input type=password></body></html>"
 
 
@@ -173,8 +178,11 @@ def test_the_grep_guard_no_captcha_solver_login_automation_or_stealth_module_is_
     hits = [str(p) for p in src.rglob("*.py") if forbidden.search(p.read_text(encoding="utf-8"))]
     assert hits == []
     # no definition of a solver, a stealth layer, a paywall bypass or a proxy pool anywhere in the package
-    defs = re.compile(r"^\s*(?:def|class)\s+_*(?:solve|stealth|spoof|bypass|residential|proxy_?pool)\w*"
-                      r"|^\s*(?:def|class)\s+\w*(?:captcha|solver)\w*", re.I | re.MULTILINE)
+    defs = re.compile(
+        r"^\s*(?:def|class)\s+_*(?:solve|stealth|spoof|bypass|residential|proxy_?pool)\w*"
+        r"|^\s*(?:def|class)\s+\w*(?:captcha|solver)\w*",
+        re.I | re.MULTILINE,
+    )
     assert not [str(p) for p in src.rglob("*.py") if defs.search(p.read_text(encoding="utf-8"))]
 
 
@@ -377,9 +385,7 @@ async def test_real_browser_saves_a_download_under_the_k3code_home_only(tmp_path
 @respx.mock
 async def test_web_browse_refuses_a_robots_disallowed_page_before_the_browser_starts():
     """robots.txt is honoured by the browser tool too: a disallowed page never reaches the browser."""
-    respx.get("https://rules.test/robots.txt").mock(
-        return_value=httpx.Response(200, text="User-agent: *\nDisallow: /")
-    )
+    respx.get("https://rules.test/robots.txt").mock(return_value=httpx.Response(200, text="User-agent: *\nDisallow: /"))
     browser, log = fake_browser({"https://rules.test/private": (200, ARTICLE)})
     reg = _Registry()
     register_web_tools(reg, SimpleNamespace(research={}), browser=browser)

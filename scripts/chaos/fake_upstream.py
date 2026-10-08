@@ -5,6 +5,7 @@ Used when the real OmniRoute is unavailable (e.g. its API key hit its daily quot
 Stateless script: the first user message holds ``RUN[<shell command>]`` markers; turn N
 issues the Nth bash tool call, and once all ran it answers with a final text.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -31,8 +32,10 @@ def pairing_error(msgs: list[dict]) -> str | None:
         role = m.get("role")
         if role == "tool":
             if m.get("tool_call_id") not in open_calls:
-                return ("messages with role 'tool' must be a response to a preceeding message with 'tool_calls'."
-                        f" (tool_call_id={m.get('tool_call_id')!r})")
+                return (
+                    "messages with role 'tool' must be a response to a preceeding message with 'tool_calls'."
+                    f" (tool_call_id={m.get('tool_call_id')!r})"
+                )
             open_calls.discard(m.get("tool_call_id"))
         elif role in ("assistant", "user"):
             if open_calls:
@@ -88,8 +91,11 @@ class H(BaseHTTPRequestHandler):
                 left = OPTS["window_end"] - now
             if left > 0:
                 self._log(429)
-                return self._reject(429, {"Retry-After": str(max(1, round(left)))},
-                                    {"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}})
+                return self._reject(
+                    429,
+                    {"Retry-After": str(max(1, round(left)))},
+                    {"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}},
+                )
         msgs = req.get("messages", [])
         bad = pairing_error(msgs)
         if bad:
@@ -104,8 +110,12 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         usage = {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60}
         if len(tools) < len(cmds):
-            call = {"index": 0, "id": f"call_{len(tools)}", "type": "function",
-                    "function": {"name": "bash", "arguments": json.dumps({"command": cmds[len(tools)]})}}
+            call = {
+                "index": 0,
+                "id": f"call_{len(tools)}",
+                "type": "function",
+                "function": {"name": "bash", "arguments": json.dumps({"command": cmds[len(tools)]})},
+            }
             self.wfile.write(sse({"choices": [{"delta": {"tool_calls": [call]}}]}))
             self.wfile.write(sse({"choices": [{"delta": {}, "finish_reason": "tool_calls"}], "usage": usage}))
         else:

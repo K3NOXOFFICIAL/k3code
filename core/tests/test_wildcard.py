@@ -69,9 +69,14 @@ def test_all_length_then_key_order() -> None:
 
 
 def test_all_structured_head_tail() -> None:
-    rules = {"git commit *": "allow", "git *": "ask",
-             "find *": "allow", "find * -delete*": "ask",
-             "sort*": "allow", "sort -o *": "ask"}
+    rules = {
+        "git commit *": "allow",
+        "git *": "ask",
+        "find *": "allow",
+        "find * -delete*": "ask",
+        "sort*": "allow",
+        "sort -o *": "ask",
+    }
     assert wildcard.all_structured(("git", ["commit", "-m", "x"]), rules) == "allow"
     assert wildcard.all_structured(("git", ["push"]), rules) == "ask"
     assert wildcard.all_structured(("find", ["src", "-delete"]), rules) == "ask"

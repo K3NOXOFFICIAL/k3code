@@ -37,8 +37,9 @@ def accept_rate(log: DecisionLog, kind: str, project: str = "") -> tuple[float, 
     return (acc + 1) / (acc + dis + 2), acc + dis, last
 
 
-def score(text: str, kind: str, *, log: DecisionLog, store: ProposalStore | None, project: str = "",
-          now: float | None = None) -> float:
+def score(
+    text: str, kind: str, *, log: DecisionLog, store: ProposalStore | None, project: str = "", now: float | None = None
+) -> float:
     now = time.time() if now is None else now
     rate, n, last = accept_rate(log, kind, project)
     if n == 0 and project:  # fall back to the all-projects rate
@@ -51,12 +52,20 @@ def score(text: str, kind: str, *, log: DecisionLog, store: ProposalStore | None
     return round(rate * (0.6 + 0.4 * recency) * (1 - sim) ** 2, 4)
 
 
-def rank(items: list[dict[str, str]], *, log: DecisionLog, store: ProposalStore | None, project: str = "",
-         threshold: float = 0.15, now: float | None = None,
-         clock: Callable[[], float] | None = None) -> list[dict[str, Any]]:
+def rank(
+    items: list[dict[str, str]],
+    *,
+    log: DecisionLog,
+    store: ProposalStore | None,
+    project: str = "",
+    threshold: float = 0.15,
+    now: float | None = None,
+    clock: Callable[[], float] | None = None,
+) -> list[dict[str, Any]]:
     """Sort proposer suggestions best first and drop those below ``threshold`` (each gains a ``score``)."""
     now = now if now is not None else (clock() if clock else None)
-    scored = [{**it, "score": score(it["text"], it["kind"], log=log, store=store, project=project, now=now)}
-              for it in items]
+    scored = [
+        {**it, "score": score(it["text"], it["kind"], log=log, store=store, project=project, now=now)} for it in items
+    ]
     scored.sort(key=lambda d: -d["score"])
     return [d for d in scored if d["score"] >= threshold]

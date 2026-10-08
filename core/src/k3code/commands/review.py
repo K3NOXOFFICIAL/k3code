@@ -19,8 +19,12 @@ _SEVERITIES = ("P0", "P1", "P2", "P3")
 
 async def _git(cwd: Path, *args: str) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
-        "git", *args, cwd=str(cwd), stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        "git",
+        *args,
+        cwd=str(cwd),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
     )
     out, _ = await proc.communicate()
     return proc.returncode or 0, out.decode(errors="replace")
@@ -155,6 +159,7 @@ class ReviewCommand(CommandDef):
         out = render_findings(result, desc) + ("\n(input truncated)" if truncated else "")
         home = getattr(ctx, "_home", None)
         if home is not None and getattr(ctx, "artifacts", None) is not None:
-            write_artifact_file(ctx, "review", home() / "artifacts" / "review", f"review {desc}", out,
-                                session=session_id or "")
+            write_artifact_file(
+                ctx, "review", home() / "artifacts" / "review", f"review {desc}", out, session=session_id or ""
+            )
         return reply(out, review=result)

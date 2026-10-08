@@ -73,8 +73,11 @@ def test_unanswered_call_is_dropped_but_text_is_kept():
 
 
 def test_assistant_with_only_unanswered_calls_vanishes():
-    msgs = [Message(role="user", content="go"), Message(role="assistant", content=None, tool_calls=[call("a")]),
-            Message(role="user", content="next")]
+    msgs = [
+        Message(role="user", content="go"),
+        Message(role="assistant", content=None, tool_calls=[call("a")]),
+        Message(role="user", content="next"),
+    ]
     assert [m.role for m in normalize_tool_pairs(msgs)] == ["user", "user"]
 
 

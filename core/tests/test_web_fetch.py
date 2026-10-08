@@ -154,8 +154,9 @@ async def test_stalled_headers_hit_the_real_deadline():
         await asyncio.sleep(5)  # never answers in time
         return httpx.Response(200, content=PAGE)
 
-    web = WebFetcher(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), respect_robots=False,
-                     deadline=0.05)
+    web = WebFetcher(
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)), respect_robots=False, deadline=0.05
+    )
     with pytest.raises(FetchDeadline):
         await web.get("https://stall.test/page")
 

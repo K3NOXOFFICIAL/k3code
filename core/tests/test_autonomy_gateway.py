@@ -12,15 +12,25 @@ from k3code.gateway.server import GatewayServer
 from k3code.gateway.sessions import SessionStore
 
 PLAN = (
-    "## Goal\nAdd flag\n## Steps\n1. edit\n## Files\na.py\n## Risks\nnone\n## Verification\npytest\n"
-    "## Estimate\nsmall"
+    "## Goal\nAdd flag\n## Steps\n1. edit\n## Files\na.py\n## Risks\nnone\n## Verification\npytest\n## Estimate\nsmall"
 )
 
 
 def verdict(scope: str, *, risk: str = "low", needs_plan: bool = False, reason: str = "r") -> dict:
-    return {"type": "text", "match": "You classify a coding task",
-            "text": json.dumps({"scope": scope, "needs_plan": needs_plan, "risk": risk, "parallelizable": False,
-                                "suggested_subtasks": [], "reason": reason})}
+    return {
+        "type": "text",
+        "match": "You classify a coding task",
+        "text": json.dumps(
+            {
+                "scope": scope,
+                "needs_plan": needs_plan,
+                "risk": risk,
+                "parallelizable": False,
+                "suggested_subtasks": [],
+                "reason": reason,
+            }
+        ),
+    }
 
 
 def usage(model: str, match: str, p: int = 10, c: int = 5) -> dict:
@@ -28,18 +38,37 @@ def usage(model: str, match: str, p: int = 10, c: int = 5) -> dict:
 
 
 PLANNER = [
-    {"type": "tool_call", "model": "m-strong", "match": "PLANNING mode", "when": "first", "name": "exit_plan",
-     "arguments": {"plan": PLAN}},
+    {
+        "type": "tool_call",
+        "model": "m-strong",
+        "match": "PLANNING mode",
+        "when": "first",
+        "name": "exit_plan",
+        "arguments": {"plan": PLAN},
+    },
     usage("m-strong", "PLANNING mode", 40, 20),
 ]
-ADVISOR_BRIEF = [{"type": "text", "model": "m-strong", "match": "brief critique", "text": "- watch edge case X"},
-                 usage("m-strong", "brief critique", 30, 10)]
-EXECUTOR = [{"type": "text", "model": "m-main", "match": "Approved plan", "text": "implemented"},
-            usage("m-main", "Approved plan", 50, 15)]
-DIRECT = [{"type": "text", "model": "m-main", "match": "TRIVIAL-TASK", "text": "done directly"},
-          usage("m-main", "TRIVIAL-TASK", 20, 5)]
-PROPOSER = [{"type": "text", "match": "one step ahead", "text": json.dumps(
-    [{"kind": "also_setup", "text": "Do you want me to also set up CI?", "action": "set up CI for this repo"}])}]
+ADVISOR_BRIEF = [
+    {"type": "text", "model": "m-strong", "match": "brief critique", "text": "- watch edge case X"},
+    usage("m-strong", "brief critique", 30, 10),
+]
+EXECUTOR = [
+    {"type": "text", "model": "m-main", "match": "Approved plan", "text": "implemented"},
+    usage("m-main", "Approved plan", 50, 15),
+]
+DIRECT = [
+    {"type": "text", "model": "m-main", "match": "TRIVIAL-TASK", "text": "done directly"},
+    usage("m-main", "TRIVIAL-TASK", 20, 5),
+]
+PROPOSER = [
+    {
+        "type": "text",
+        "match": "one step ahead",
+        "text": json.dumps(
+            [{"kind": "also_setup", "text": "Do you want me to also set up CI?", "action": "set up CI for this repo"}]
+        ),
+    }
+]
 
 
 def sub(tmp: Path, name: str) -> Path:
@@ -59,12 +88,16 @@ def make(tmp: Path, monkeypatch, steps: list[dict], mode: str = "auto", **cfg: A
     script.write_text(json.dumps(steps))
     monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
     provider = ProviderEntry(
-        name="t", kind="openai", base_url="http://t", api_key_env="NOPE",
+        name="t",
+        kind="openai",
+        base_url="http://t",
+        api_key_env="NOPE",
         models={"default": "m-main"},
         tiers={"strong": "m-strong", "cheap": "m-cheap", "fast": "m-fast"},
     )
-    server = GatewayServer(config=Settings(providers=[provider], permission_mode=mode, **cfg),
-                           store=SessionStore(tmp / "sessions.db"))
+    server = GatewayServer(
+        config=Settings(providers=[provider], permission_mode=mode, **cfg), store=SessionStore(tmp / "sessions.db")
+    )
     frames: list[str] = []
     server._write = frames.append  # type: ignore[method-assign]
     server._frames = frames  # type: ignore[attr-defined]
@@ -187,8 +220,10 @@ async def test_danger_prompt_forces_plan_even_if_classifier_says_trivial(tmp_pat
 async def test_trivial_executes_directly_on_the_cheap_tier(tmp_path, monkeypatch):
     """GOAL B5: unimportant work goes to the cheap tier. A trivial interactive task starts there (the live benchmark
     saved only 14 % while half of its tasks, all trivial, ran on main)."""
-    cheap_direct = [{"type": "text", "model": "m-cheap", "match": "TRIVIAL-TASK", "text": "done directly"},
-                    usage("m-cheap", "TRIVIAL-TASK", 20, 5)]
+    cheap_direct = [
+        {"type": "text", "model": "m-cheap", "match": "TRIVIAL-TASK", "text": "done directly"},
+        usage("m-cheap", "TRIVIAL-TASK", 20, 5),
+    ]
     server = make(tmp_path, monkeypatch, [verdict("trivial"), *cheap_direct])
     await start(server, tmp_path)
     await run_turn(server, "TRIVIAL-TASK rename x")
@@ -199,8 +234,14 @@ async def test_trivial_executes_directly_on_the_cheap_tier(tmp_path, monkeypatch
 
 
 async def test_trivial_task_that_stalls_on_the_cheap_tier_escalates_to_main(tmp_path, monkeypatch):
-    same = {"type": "tool_call", "model": "m-cheap", "match": "TRIVIAL-TASK", "id": "c1", "name": "bash",
-            "arguments": {"command": "echo hi"}}
+    same = {
+        "type": "tool_call",
+        "model": "m-cheap",
+        "match": "TRIVIAL-TASK",
+        "id": "c1",
+        "name": "bash",
+        "arguments": {"command": "echo hi"},
+    }
     steps = [verdict("trivial"), same, {"type": "text", "model": "m-main", "text": "recovered"}]
     server = make(tmp_path, monkeypatch, steps)
     await start(server, tmp_path)
@@ -219,10 +260,13 @@ async def test_degrade_trivial_can_be_switched_off(tmp_path, monkeypatch):
 
 
 async def test_a_pinned_interactive_tier_is_not_degraded(tmp_path, monkeypatch):
-    strong_direct = [{"type": "text", "model": "m-strong", "match": "TRIVIAL-TASK", "text": "done directly"},
-                     usage("m-strong", "TRIVIAL-TASK", 20, 5)]
-    server = make(tmp_path, monkeypatch, [verdict("trivial"), *strong_direct],
-                  task_tiers={"interactive_turn": "strong"})
+    strong_direct = [
+        {"type": "text", "model": "m-strong", "match": "TRIVIAL-TASK", "text": "done directly"},
+        usage("m-strong", "TRIVIAL-TASK", 20, 5),
+    ]
+    server = make(
+        tmp_path, monkeypatch, [verdict("trivial"), *strong_direct], task_tiers={"interactive_turn": "strong"}
+    )
     await start(server, tmp_path)
     await run_turn(server, "TRIVIAL-TASK rename x")
     assert "m-strong" in models_called(server) and models_called(server)[1] == "m-strong"
@@ -244,8 +288,13 @@ async def test_scope_override_forces_plan_for_next_task_only(tmp_path, monkeypat
 
 
 async def test_default_mode_uses_exit_plan_approval_when_gated(tmp_path, monkeypatch):
-    server = make(tmp_path, monkeypatch, [verdict("large"), *PLANNER, *EXECUTOR], mode="default",
-                  autonomy={"gate_modes": ["default", "auto"]})
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [verdict("large"), *PLANNER, *EXECUTOR],
+        mode="default",
+        autonomy={"gate_modes": ["default", "auto"]},
+    )
     await start(server, tmp_path)
     seen = await run_turn(server, "build the feature", [{"choice": "session"}])
     assert len(seen) == 1 and seen[0]["params"]["choices"] == ["once", "session", "deny"]
@@ -279,8 +328,11 @@ async def test_classifier_failure_falls_back_to_direct(tmp_path, monkeypatch):
 
 
 async def test_cheap_classification_escalates_to_main_on_chain_exhausted(tmp_path, monkeypatch):
-    steps = [{"type": "error", "model": "m-cheap", "status_code": 400, "message": "bad model"},
-             {**verdict("small"), "model": "m-main"}, *DIRECT]
+    steps = [
+        {"type": "error", "model": "m-cheap", "status_code": 400, "message": "bad model"},
+        {**verdict("small"), "model": "m-main"},
+        *DIRECT,
+    ]
     server = make(tmp_path, monkeypatch, steps)
     await start(server, tmp_path)
     await run_turn(server, "TRIVIAL-TASK x")
@@ -290,8 +342,10 @@ async def test_cheap_classification_escalates_to_main_on_chain_exhausted(tmp_pat
 
 
 async def test_background_turn_escalates_after_repeated_tool_errors(tmp_path, monkeypatch):
-    bogus = [{"type": "tool_call", "model": "m-cheap", "id": f"c{i}", "name": f"no_such_tool_{i}", "arguments": {}}
-             for i in range(3)]
+    bogus = [
+        {"type": "tool_call", "model": "m-cheap", "id": f"c{i}", "name": f"no_such_tool_{i}", "arguments": {}}
+        for i in range(3)
+    ]
     steps = [*bogus, {"type": "text", "model": "m-main", "text": "recovered"}]
     server = make(tmp_path, monkeypatch, steps)
     await start(server, tmp_path)
@@ -330,8 +384,13 @@ async def test_interactive_turn_uses_main_and_config_can_override_policy(tmp_pat
     await start(server, tmp_path)
     await run_turn(server, "hello")
     assert models_called(server) == ["m-main"]
-    server2 = make(sub(tmp_path, "x"), monkeypatch, [{"type": "text", "text": "hi"}], mode="default",
-                   task_tiers={"interactive_turn": "strong"})
+    server2 = make(
+        sub(tmp_path, "x"),
+        monkeypatch,
+        [{"type": "text", "text": "hi"}],
+        mode="default",
+        task_tiers={"interactive_turn": "strong"},
+    )
     await start(server2, tmp_path / "x")
     await run_turn(server2, "hello")
     assert models_called(server2) == ["m-strong"]
@@ -371,8 +430,9 @@ async def test_dismissed_proposal_never_returns(tmp_path, monkeypatch):
 # ── /preview and /go ──
 
 
-PREVIEW = [{"type": "text", "model": "m-fast", "match": "sketch what the result",
-            "text": "```\n[ todo ]\n```\nRisks:\n- a"}]
+PREVIEW = [
+    {"type": "text", "model": "m-fast", "match": "sketch what the result", "text": "```\n[ todo ]\n```\nRisks:\n- a"}
+]
 
 
 async def test_preview_has_no_tools_runs_on_fast_and_go_executes(tmp_path, monkeypatch):
@@ -424,13 +484,16 @@ async def test_advisor_is_a_side_message_until_accepted(tmp_path, monkeypatch):
 
 
 async def test_advisor_compacts_large_conversations_with_cheap_tier(tmp_path, monkeypatch):
-    steps = [{"type": "text", "model": "m-cheap", "match": "Summarize this coding conversation", "text": "SUMMARY"},
-             *ADVISOR]
+    steps = [
+        {"type": "text", "model": "m-cheap", "match": "Summarize this coding conversation", "text": "SUMMARY"},
+        *ADVISOR,
+    ]
     server = make(tmp_path, monkeypatch, steps, mode="default", autonomy={"advisor_compact_chars": 500})
     await start(server, tmp_path)
     live = server.session
-    live.messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i} " + "x" * 300}
-                     for i in range(10)]
+    live.messages = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i} " + "x" * 300} for i in range(10)
+    ]
     await call(server, "command.dispatch", {"name": "advisor", "arg": ""})
     log = server.providers[0].log
     assert [c["model"] for c in log] == ["m-cheap", "m-strong"]
@@ -439,8 +502,12 @@ async def test_advisor_compacts_large_conversations_with_cheap_tier(tmp_path, mo
 
 async def test_advisor_auto_hooks_follow_config(tmp_path, monkeypatch):
     # off in config: the plan event carries no critique
-    server = make(tmp_path, monkeypatch, [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR],
-                  autonomy={"advisor_on_plan": False})
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR],
+        autonomy={"advisor_on_plan": False},
+    )
     await start(server, tmp_path)
     await run_turn(server, "add a flag")
     assert "advisor" not in events(server, "plan.show")[-1]
@@ -454,13 +521,19 @@ async def test_advisor_auto_hooks_follow_config(tmp_path, monkeypatch):
 class _FakeSession:
     def __init__(self, mode: str) -> None:
         from types import SimpleNamespace
+
         self.perms = SimpleNamespace(mode=SimpleNamespace(value=mode))
 
 
 async def test_review_done_blocks_goal_only_on_blocking_issues(tmp_path, monkeypatch):
     from k3code.autonomy import advisor as adv
-    blocking = {"type": "text", "model": "m-strong", "match": "decide whether a goal is really done",
-                "text": json.dumps({"blocking": True, "issues": ["tests fail"]})}
+
+    blocking = {
+        "type": "text",
+        "model": "m-strong",
+        "match": "decide whether a goal is really done",
+        "text": json.dumps({"blocking": True, "issues": ["tests fail"]}),
+    }
     server = make(tmp_path, monkeypatch, [blocking])
     await start(server, tmp_path)
     b, issues = await adv.review_done(server.model_caller, "ship it", "assistant: done")

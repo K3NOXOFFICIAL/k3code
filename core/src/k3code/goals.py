@@ -364,7 +364,10 @@ class GoalManager:
 
         if verdict == "blocked":
             return self._pause_decision(
-                s, f"judged unachievable: {reason}", "blocked", reason,
+                s,
+                f"judged unachievable: {reason}",
+                "blocked",
+                reason,
                 f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal <objective>, or /goal resume.",
             )
 
@@ -382,7 +385,9 @@ class GoalManager:
                 s.last_reason = f"check failed (exit {code}): $ {gate.command}"
                 if gate.attempts > gate.max_retries:
                     return self._pause_decision(
-                        s, f"check exhausted {gate.max_retries} retries: $ {gate.command}", "gate_failed",
+                        s,
+                        f"check exhausted {gate.max_retries} retries: $ {gate.command}",
+                        "gate_failed",
                         s.last_reason,
                         f"⏸ Goal paused — check still failing after {gate.max_retries} retries: $ {gate.command}",
                     )
@@ -390,11 +395,19 @@ class GoalManager:
                     return self._budget_pause(s, "gate_failed", s.last_reason)
                 self._save(s)
                 prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
-                    goal=s.goal, command=gate.command, exit_code=code, attempt=gate.attempts,
-                    max_retries=gate.max_retries, output=tail or "(no output)",
+                    goal=s.goal,
+                    command=gate.command,
+                    exit_code=code,
+                    attempt=gate.attempts,
+                    max_retries=gate.max_retries,
+                    output=tail or "(no output)",
                 )
                 return Decision(
-                    "active", True, prompt, "gate_failed", s.last_reason,
+                    "active",
+                    True,
+                    prompt,
+                    "gate_failed",
+                    s.last_reason,
                     f"✗ Check failed ({s.turns_used}/{s.max_turns} turns, attempt {gate.attempts}/{gate.max_retries}): "
                     f"$ {gate.command}",
                 )
@@ -412,7 +425,11 @@ class GoalManager:
                         f"{listed}\nFix them, then confirm the goal is complete. Goal: {s.goal}"
                     )
                     return Decision(
-                        "active", True, prompt, "advisor_blocked", s.last_reason,
+                        "active",
+                        True,
+                        prompt,
+                        "advisor_blocked",
+                        s.last_reason,
                         f"⚠ Advisor found blocking issues ({s.turns_used}/{s.max_turns} turns): {issues[0][:120]}",
                     )
             s.status = "done"
@@ -422,20 +439,30 @@ class GoalManager:
         if s.consecutive_transport_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES:
             n = s.consecutive_transport_failures
             return self._pause_decision(
-                s, f"judge model unreachable {n} turns in a row", "continue", reason,
+                s,
+                f"judge model unreachable {n} turns in a row",
+                "continue",
+                reason,
                 f"⏸ Goal paused — the judge model returned errors {n} turns in a row (check goal.judge_model).",
             )
         if s.consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
             n = s.consecutive_parse_failures
             return self._pause_decision(
-                s, f"judge returned unparseable output {n} turns in a row", "continue", reason,
+                s,
+                f"judge returned unparseable output {n} turns in a row",
+                "continue",
+                reason,
                 f"⏸ Goal paused — the judge isn't returning the required JSON verdict ({n} turns).",
             )
         if s.turns_used >= s.max_turns:
             return self._budget_pause(s, "continue", reason)
         self._save(s)
         return Decision(
-            "active", True, self.continuation_prompt(), "continue", reason,
+            "active",
+            True,
+            self.continuation_prompt(),
+            "continue",
+            reason,
             f"↻ Continuing toward goal ({s.turns_used}/{s.max_turns}): {reason}",
         )
 
@@ -449,6 +476,9 @@ class GoalManager:
 
     def _budget_pause(self, s: GoalState, verdict: str, reason: str) -> Decision:
         return self._pause_decision(
-            s, f"turn budget exhausted ({s.turns_used}/{s.max_turns})", verdict, reason,
+            s,
+            f"turn budget exhausted ({s.turns_used}/{s.max_turns})",
+            verdict,
+            reason,
             f"⏸ Goal paused — {s.turns_used}/{s.max_turns} turns used. /goal resume keeps going, /goal clear stops.",
         )

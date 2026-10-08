@@ -195,7 +195,7 @@ def describe(text: str) -> list[str]:
 
     mcp = data.get("mcp")
     servers = mcp.get("servers") if isinstance(mcp, dict) else None
-    for name, spec in (servers.items() if isinstance(servers, dict) else []):
+    for name, spec in servers.items() if isinstance(servers, dict) else []:
         spec = spec if isinstance(spec, dict) else {}
         args = spec.get("args") if isinstance(spec.get("args"), list) else []
         if spec.get("command"):
@@ -220,8 +220,10 @@ def describe(text: str) -> list[str]:
     if isinstance(providers, list):
         entries = [p for p in providers if isinstance(p, dict)]
         if entries:
-            parts = [f"{p.get('name', '?')} ({p.get('kind', '?')}) at {_short(str(p.get('base_url', '-')), 80)}"
-                     for p in entries]
+            parts = [
+                f"{p.get('name', '?')} ({p.get('kind', '?')}) at {_short(str(p.get('base_url', '-')), 80)}"
+                for p in entries
+            ]
             lines.append("providers: " + "; ".join(parts))
 
     others = sorted(str(k) for k in data if k not in ("mcp", "permissions", "providers"))

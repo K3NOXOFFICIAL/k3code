@@ -44,7 +44,9 @@ async def condensed_context(caller: Any, messages: list[Any], *, threshold: int,
         res = await caller.complete(
             TaskKind.COMPACTION,
             [Message(role="system", content=SUMMARY_SYSTEM), Message(role="user", content=head)],
-            session_id=session_id, max_tokens=600, timeout=45,
+            session_id=session_id,
+            max_tokens=600,
+            timeout=45,
         )
         return f"[summary of earlier conversation]\n{res.text}\n\n[recent messages]\n{tail}"
     except Exception:  # noqa: BLE001 - fall back to a hard truncation
@@ -62,7 +64,9 @@ async def advise(
             Message(role="system", content=BRIEF_SYSTEM if brief else ADVISOR_SYSTEM),
             Message(role="user", content=f"Conversation:\n{context}\n\nQuestion: {ask}"),
         ],
-        session_id=session_id, max_tokens=900, timeout=timeout,
+        session_id=session_id,
+        max_tokens=900,
+        timeout=timeout,
     )
     return res.text.strip()
 
@@ -76,7 +80,9 @@ async def review_done(caller: Any, goal: str, context: str, *, session_id: str =
                 Message(role="system", content=DONE_SYSTEM),
                 Message(role="user", content=f"Goal: {goal}\n\nConversation:\n{context}"),
             ],
-            session_id=session_id, max_tokens=500, timeout=60,
+            session_id=session_id,
+            max_tokens=500,
+            timeout=60,
         )
     except Exception:  # noqa: BLE001
         return False, []

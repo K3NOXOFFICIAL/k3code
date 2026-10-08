@@ -117,7 +117,9 @@ async def translate(caller: Any, request: str, *, session_id: str = "") -> dict[
     res = await caller.complete(
         TaskKind.CLASSIFICATION,
         [Message(role="system", content=SYSTEM + schema_hint()), Message(role="user", content=request[:1500])],
-        session_id=session_id, max_tokens=600, timeout=30,
+        session_id=session_id,
+        max_tokens=600,
+        timeout=30,
     )
     return parse_patch(res.text)
 
@@ -153,8 +155,7 @@ async def run(ctx: Any, session_id: str | None, request: str, path: Path) -> str
     bak = confio.write_yaml(path, merged)
     if getattr(ctx, "learning", None) is not None:
         live = ctx.sessions.get(session_id) if session_id else None
-        ctx.learning.record("config", live, subject="update-config", choice="apply",
-                            detail={"keys": sorted(patch)})
+        ctx.learning.record("config", live, subject="update-config", choice="apply", detail={"keys": sorted(patch)})
     for k, v in patch.items():  # live config object picks the change up
         if hasattr(ctx.config, k) and v is not None and not isinstance(v, dict):
             setattr(ctx.config, k, v)

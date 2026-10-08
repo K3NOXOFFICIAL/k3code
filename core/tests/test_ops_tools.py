@@ -539,8 +539,9 @@ def test_linked_worktree_gitdir_and_common_dir_are_bound_read_only(tmp_path):
 
     repo = git_repo(tmp_path / "repo").resolve()
     wt = repo / ".k3code" / "worktrees" / "child1"
-    subprocess.run(["git", "worktree", "add", "-q", str(wt), "-b", "k3/child1"], cwd=repo, check=True,
-                   capture_output=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-q", str(wt), "-b", "k3/child1"], cwd=repo, check=True, capture_output=True
+    )
     joined = " ".join(sandbox.build_argv(wt, home=tmp_path / "home", bwrap="/usr/bin/bwrap"))
     gitdir = (repo / ".git" / "worktrees" / "child1").resolve()
     assert f"--ro-bind {gitdir} {gitdir}" in joined  # the linked worktree's admin dir lives outside the checkout
@@ -606,8 +607,9 @@ async def test_escape_a_hook_planted_from_the_sandbox_never_runs_under_harness_g
     marker = tmp_path / "hook-ran.txt"
     hook = repo / ".git" / "hooks" / "pre-commit"
     body = f"#!/bin/sh\ntouch {marker}\n"
-    await tool_bash({"command": f"printf '{body}' > {hook}; chmod +x {hook}"}, cwd=repo,
-                    sandbox=sandbox.build_argv(repo))
+    await tool_bash(
+        {"command": f"printf '{body}' > {hook}; chmod +x {hook}"}, cwd=repo, sandbox=sandbox.build_argv(repo)
+    )
     (repo / "change.txt").write_text("x\n")
     await worktree.git(repo, "add", "-A")
     await worktree.git(repo, "commit", "-qm", "harness commit")  # the harness's own git
@@ -631,4 +633,3 @@ async def test_escape_auto_mode_write_outside_the_project_is_denied(tmp_path):
     )
     assert "project roots" in result.get("error", "")
     assert not target.exists(), "auto mode wrote outside the project roots"
-

@@ -36,16 +36,25 @@ async def test_anthropic_and_claude_cli_count_the_same_turn_equally():
     provider = AnthropicProvider(name="a", base_url="https://a.test", api_key="k", client=client)
     events = [e async for e in provider.stream([Message(role="user", content="hi")], [], "m")]
     api = events[-1].usage
-    cli = _usage({"usage": {"input_tokens": 3, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50,
-                            "output_tokens": 7}})
+    cli = _usage(
+        {
+            "usage": {
+                "input_tokens": 3,
+                "cache_read_input_tokens": 100,
+                "cache_creation_input_tokens": 50,
+                "output_tokens": 7,
+            }
+        }
+    )
     assert (api.prompt_tokens, api.completion_tokens) == (cli.prompt_tokens, cli.completion_tokens) == (153, 7)
 
 
 def test_per_turn_totals_add_up_to_the_session_total(tmp_path):
     db = UsageDB(tmp_path / "usage.db")
     for turn, tin, tout in (("t1", 100, 10), ("t1", 120, 12), ("t2", 300, 30)):
-        db.record("call", session="s1", tokens_in=tin, tokens_out=tout, tier="main", task_kind="interactive_turn",
-                  turn=turn)
+        db.record(
+            "call", session="s1", tokens_in=tin, tokens_out=tout, tier="main", task_kind="interactive_turn", turn=turn
+        )
     db.record("call", session="s1", tokens_in=5, tokens_out=1, tier="cheap", task_kind="title")  # side call, no turn
     (session,) = db.aggregate("session")
     turns = {g["key"]: g for g in db.aggregate("turn")}
@@ -58,8 +67,9 @@ def test_per_turn_totals_add_up_to_the_session_total(tmp_path):
 
 def test_stats_and_collect_report_tokens_per_tier_kind_and_turn(tmp_path):
     db = UsageDB(tmp_path / "usage.db")
-    db.record("call", session="s1", tokens_in=1000, tokens_out=100, tier="main", task_kind="interactive_turn",
-              turn="t1")
+    db.record(
+        "call", session="s1", tokens_in=1000, tokens_out=100, tier="main", task_kind="interactive_turn", turn="t1"
+    )
     db.record("call", session="s1", tokens_in=200, tokens_out=20, tier="cheap", task_kind="title", turn="t2")
     text = format_stats(db.aggregate("session"), "session")
     assert "1000/100" in text and "kinds: interactive_turn 1 calls (1000/100 tok)" in text

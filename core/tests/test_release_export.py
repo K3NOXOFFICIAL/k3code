@@ -35,9 +35,7 @@ def _scan(directory: Path) -> subprocess.CompletedProcess[str]:
 @pytest.fixture(scope="module")
 def export(tmp_path_factory: pytest.TempPathFactory) -> Export:
     out = tmp_path_factory.mktemp("release-out")
-    built = subprocess.run(
-        ["sh", str(SCRIPT), "-o", str(out)], capture_output=True, text=True, cwd=REPO, check=False
-    )
+    built = subprocess.run(["sh", str(SCRIPT), "-o", str(out)], capture_output=True, text=True, cwd=REPO, check=False)
     assert built.returncode == 0, built.stderr
     tarball = next(out.glob("k3code-*.tar.gz"))
     unpacked = tmp_path_factory.mktemp("release-unpacked")

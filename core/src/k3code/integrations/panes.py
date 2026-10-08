@@ -50,12 +50,31 @@ _CALL_TIMEOUT = 5.0
 _HOLD_TIMEOUT = 310.0
 
 #: JSON-RPC methods a read-only pane may not send
-READONLY_BLOCKED = frozenset({
-    "prompt.submit", "prompt.background", "session.interrupt", "session.steer", "session.delete",
-    "session.title", "session.control", "session.mode.cycle", "session.mode.set", "command.dispatch",
-    "slash.exec", "config.set", "clipboard.paste", "image.attach", "image.attach_bytes", "file.attach",
-    "pdf.attach", "session.branch_stored", "model.save_key", "model.disconnect", "subagent.interrupt",
-})
+READONLY_BLOCKED = frozenset(
+    {
+        "prompt.submit",
+        "prompt.background",
+        "session.interrupt",
+        "session.steer",
+        "session.delete",
+        "session.title",
+        "session.control",
+        "session.mode.cycle",
+        "session.mode.set",
+        "command.dispatch",
+        "slash.exec",
+        "config.set",
+        "clipboard.paste",
+        "image.attach",
+        "image.attach_bytes",
+        "file.attach",
+        "pdf.attach",
+        "session.branch_stored",
+        "model.save_key",
+        "model.disconnect",
+        "subagent.interrupt",
+    }
+)
 
 
 _SERVER_TOKENS = ("status.update", "approval", "clarify", "sudo", "secret", "request.cancel", "pane.open", "open_pane")
@@ -109,8 +128,13 @@ class TuiosSocket:
             raise TuiosError(str(err.get("code", "error")), str(err.get("message", "")))
         return resp.get("result")
 
-    def call(self, verb: str, params: dict[str, Any], timeout: float = _CALL_TIMEOUT,
-             conn_hook: Callable[[socket.socket], None] | None = None) -> Any:
+    def call(
+        self,
+        verb: str,
+        params: dict[str, Any],
+        timeout: float = _CALL_TIMEOUT,
+        conn_hook: Callable[[socket.socket], None] | None = None,
+    ) -> Any:
         s = self._connect(timeout)
         try:
             if conn_hook is not None:
@@ -173,8 +197,12 @@ class PaneReporter:
                 item.set()
                 continue
             state, message, kind = item
-            params: dict[str, Any] = {"session": self.sock.session, "window": self.sock.pane_id, "state": state,
-                                      "harness": HARNESS}
+            params: dict[str, Any] = {
+                "session": self.sock.session,
+                "window": self.sock.pane_id,
+                "state": state,
+                "harness": HARNESS,
+            }
             if message:
                 params["message"] = message
             if kind:
@@ -220,16 +248,24 @@ def readonly_verdict(obj: Any) -> str | None:
     if m in READONLY_BLOCKED or (m is None and "id" in obj):
         if m is None:
             return ""  # a response frame: drop silently
-        return json.dumps({"jsonrpc": "2.0", "id": obj.get("id"),
-                           "error": {"code": -32000, "message": "this pane is read-only"}})
+        return json.dumps(
+            {"jsonrpc": "2.0", "id": obj.get("id"), "error": {"code": -32000, "message": "this pane is read-only"}}
+        )
     return None
 
 
 class PaneLink:
     """Watches the frames of one TUI<->gateway connection and mirrors them into the pane's tuios state."""
 
-    def __init__(self, sock: TuiosSocket, inject: Inject | None = None, *, readonly: bool = False,
-                 env: Mapping[str, str] | None = None, sync: bool = False) -> None:
+    def __init__(
+        self,
+        sock: TuiosSocket,
+        inject: Inject | None = None,
+        *,
+        readonly: bool = False,
+        env: Mapping[str, str] | None = None,
+        sync: bool = False,
+    ) -> None:
         self.sock = sock
         self.reporter = PaneReporter(sock)
         self.inject = inject
@@ -240,8 +276,9 @@ class PaneLink:
         self._threads: list[threading.Thread] = []
 
     @classmethod
-    def from_env(cls, inject: Inject | None = None, *, readonly: bool = False,
-                 environ: Mapping[str, str] | None = None) -> PaneLink | None:
+    def from_env(
+        cls, inject: Inject | None = None, *, readonly: bool = False, environ: Mapping[str, str] | None = None
+    ) -> PaneLink | None:
         env = os.environ if environ is None else environ
         path, pane = env.get("TUIOS_SOCKET", ""), env.get("TUIOS_PANE_ID", "")
         if not path or not pane:
@@ -317,8 +354,11 @@ class PaneLink:
     def approval_params(self, params: dict[str, Any], summary: str) -> dict[str, Any]:
         options = [o for o in ("once", "always", "deny") if o in (params.get("choices") or ["once", "always", "deny"])]
         out: dict[str, Any] = {
-            "session": self.sock.session, "window": self.sock.pane_id, "harness": HARNESS,
-            "options": options, "summary": summary,
+            "session": self.sock.session,
+            "window": self.sock.pane_id,
+            "harness": HARNESS,
+            "options": options,
+            "summary": summary,
         }
         if params.get("tool_name"):
             out["tool"] = str(params["tool_name"])
@@ -336,8 +376,9 @@ class PaneLink:
         # tuios only holds a pane that is already on needs_input/approval: send that report first.
         self.reporter.flush()
         try:
-            res = self.sock.call("request-approval", self.approval_params(params, summary),
-                                 timeout=_HOLD_TIMEOUT, conn_hook=hold.attach)
+            res = self.sock.call(
+                "request-approval", self.approval_params(params, summary), timeout=_HOLD_TIMEOUT, conn_hook=hold.attach
+            )
         except Exception as e:  # noqa: BLE001
             logger.debug("request-approval failed: %s", e)
             return
@@ -380,9 +421,11 @@ class PaneLink:
         argv = k3code_argv(spec, self.env)
         assert argv is not None
         params: dict[str, Any] = {
-            "session": self.sock.session, "agent": " ".join(shlex.quote(a) for a in argv),
+            "session": self.sock.session,
+            "agent": " ".join(shlex.quote(a) for a in argv),
             "name": str(spec.get("name") or spec.get("session_id") or spec.get("subagent_id") or "k3code")[:40],
-            "focus": bool(spec.get("focus", False)), "ready_timeout": 2000,
+            "focus": bool(spec.get("focus", False)),
+            "ready_timeout": 2000,
         }
         if spec.get("cwd"):
             params["cwd"] = str(spec["cwd"])

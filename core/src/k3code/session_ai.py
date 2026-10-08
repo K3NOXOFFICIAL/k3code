@@ -35,7 +35,9 @@ async def make_title(caller: Any, first_message: str, *, session_id: str = "") -
         res = await caller.complete(
             TaskKind.TITLE,
             [Message(role="system", content=TITLE_SYSTEM), Message(role="user", content=first_message[:2000])],
-            session_id=session_id, max_tokens=24, timeout=20,
+            session_id=session_id,
+            max_tokens=24,
+            timeout=20,
         )
     except Exception:  # noqa: BLE001
         logger.debug("title generation failed", exc_info=True)
@@ -58,7 +60,7 @@ def head_and_tail(text: str, limit: int, head: int) -> str:
     """``text`` if it fits ``limit``; otherwise its first ``head`` characters and the last ``limit - head``."""
     if len(text) <= limit:
         return text
-    return text[:head] + "\n…[middle of the conversation omitted]…\n" + text[-(limit - head):]
+    return text[:head] + "\n…[middle of the conversation omitted]…\n" + text[-(limit - head) :]
 
 
 def task_anchor(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -71,7 +73,11 @@ def task_anchor(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 async def compact_messages(
-    caller: Any, messages: list[dict[str, Any]], *, keep: int = 6, session_id: str = "",
+    caller: Any,
+    messages: list[dict[str, Any]],
+    *,
+    keep: int = 6,
+    session_id: str = "",
     max_input_chars: int = COMPACT_INPUT_CHARS,
 ) -> tuple[list[dict[str, Any]], int]:
     """Summarize the old part of the transcript. Returns (new messages, number of messages folded).
@@ -83,15 +89,18 @@ async def compact_messages(
     old = [m for m in messages[:cut] if m.get("role") != "system"]
     if not old:
         return messages, 0
-    text = head_and_tail(transcript_text(old, per_message=3000), max_input_chars,
-                         min(COMPACT_HEAD_CHARS, max_input_chars // 4))
+    text = head_and_tail(
+        transcript_text(old, per_message=3000), max_input_chars, min(COMPACT_HEAD_CHARS, max_input_chars // 4)
+    )
     res = await caller.complete(
         TaskKind.COMPACTION,
         [
             Message(role="system", content=SUMMARY_SYSTEM),
             Message(role="user", content=text),
         ],
-        session_id=session_id, max_tokens=700, timeout=90,
+        session_id=session_id,
+        max_tokens=700,
+        timeout=90,
     )
     summary = {"role": "user", "content": SUMMARY_PREFIX + res.text.strip()}
     system = [m for m in messages[:cut] if m.get("role") == "system"]

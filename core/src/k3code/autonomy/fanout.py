@@ -107,8 +107,13 @@ class Subtask:
     worktree: wt_mod.Worktree | None = None
 
     def row(self) -> dict[str, Any]:
-        return {"id": self.id, "title": self.title, "state": self.state, "attempts": self.attempts,
-                "detail": self.detail[:300]}
+        return {
+            "id": self.id,
+            "title": self.title,
+            "state": self.state,
+            "attempts": self.attempts,
+            "detail": self.detail[:300],
+        }
 
 
 @dataclass
@@ -169,13 +174,21 @@ class FanoutExecutor:
     # ── the run ──
 
     async def run(
-        self, session: Any, task: str, plan: str, subtasks: list[str], *, budget: AgentBudget | None = None,
+        self,
+        session: Any,
+        task: str,
+        plan: str,
+        subtasks: list[str],
+        *,
+        budget: AgentBudget | None = None,
         require_tests: bool | None = None,
     ) -> FanoutResult | None:
         cwd = Path(session.perms.cwd)
         if await wt_mod.repo_root(cwd) is None or not await wt_mod.head_sha(cwd):
-            session.emit("notification.show", {"text": "fan-out skipped: not a git repository with a commit",
-                                               "level": "info", "kind": "fanout"})
+            session.emit(
+                "notification.show",
+                {"text": "fan-out skipped: not a git repository with a commit", "level": "info", "kind": "fanout"},
+            )
             return None
         cfg = self.cfg
         repo = await wt_mod.repo_root(cwd)
@@ -186,18 +199,37 @@ class FanoutExecutor:
         gov = session.reliability.governor if session.reliability and session.reliability.governor else Governor()
         cap = gov.agent_cap(int(cfg["max_parallel"]), io_heavy=io_heavy)
         fid = f"fo-{uuid.uuid4().hex[:6]}"
-        result = FanoutResult(fid, [Subtask(f"t{i + 1}", t) for i, t in enumerate(subtasks)],
-                              test_command=test_cmd if need_tests else "")
+        result = FanoutResult(
+            fid, [Subtask(f"t{i + 1}", t) for i, t in enumerate(subtasks)], test_command=test_cmd if need_tests else ""
+        )
         sid = session.session_id
-        session.emit("fanout.plan", {
-            "session_id": sid, "fanout_id": fid, "max_parallel": cap, "io_heavy": io_heavy,
-            "require_tests": need_tests, "test_command": test_cmd,
-            "subtasks": [s.row() for s in result.subtasks],
-        }, importance="essential")
+        session.emit(
+            "fanout.plan",
+            {
+                "session_id": sid,
+                "fanout_id": fid,
+                "max_parallel": cap,
+                "io_heavy": io_heavy,
+                "require_tests": need_tests,
+                "test_command": test_cmd,
+                "subtasks": [s.row() for s in result.subtasks],
+            },
+            importance="essential",
+        )
         sem = asyncio.Semaphore(cap)
         merge_lock = asyncio.Lock()
-        ctx = _Ctx(session, task, plan, result, budget, test_cmd if need_tests else "", float(cfg["test_timeout"]),
-                   sem, merge_lock, self)
+        ctx = _Ctx(
+            session,
+            task,
+            plan,
+            result,
+            budget,
+            test_cmd if need_tests else "",
+            float(cfg["test_timeout"]),
+            sem,
+            merge_lock,
+            self,
+        )
         try:
             await asyncio.gather(*(self._one(ctx, st) for st in result.subtasks))
         except asyncio.CancelledError:
@@ -208,29 +240,54 @@ class FanoutExecutor:
         if need_tests and test_cmd:
             escalated_on_tests = any(s.state == "escalated" and "tests failed" in s.detail for s in result.subtasks)
             result.tests = "fail" if escalated_on_tests else "pass" if result.tests_passed else "none"
-        session.emit("fanout.done", {
-            "session_id": sid, "fanout_id": fid, "ok": result.ok, "merged": len(result.by_state("merged")),
-            "escalated": len(result.by_state("escalated", "failed", "skipped")), "total": len(result.subtasks),
-            "tests": result.tests, "summary": result.summary(),
-        }, importance="essential")
+        session.emit(
+            "fanout.done",
+            {
+                "session_id": sid,
+                "fanout_id": fid,
+                "ok": result.ok,
+                "merged": len(result.by_state("merged")),
+                "escalated": len(result.by_state("escalated", "failed", "skipped")),
+                "total": len(result.subtasks),
+                "tests": result.tests,
+                "summary": result.summary(),
+            },
+            importance="essential",
+        )
         return result
 
     def progress(self, ctx: _Ctx, st: Subtask, state: str, detail: str = "") -> None:
         st.state, st.detail = state, detail or st.detail
         done = len(ctx.result.by_state("merged", "escalated", "failed", "skipped"))
-        ctx.session.emit("fanout.progress", {
-            "session_id": ctx.session.session_id, "fanout_id": ctx.result.fanout_id, "subtask_id": st.id,
-            "title": st.title, "state": state, "detail": detail[:300], "done": done,
-            "total": len(ctx.result.subtasks), "subagent_ids": [h.id for h in st.handles],
-        })
+        ctx.session.emit(
+            "fanout.progress",
+            {
+                "session_id": ctx.session.session_id,
+                "fanout_id": ctx.result.fanout_id,
+                "subtask_id": st.id,
+                "title": st.title,
+                "state": state,
+                "detail": detail[:300],
+                "done": done,
+                "total": len(ctx.result.subtasks),
+                "subagent_ids": [h.id for h in st.handles],
+            },
+        )
 
     async def _spawn(self, ctx: _Ctx, st: Subtask, agent_type: str, prompt: str, description: str, **kw: Any) -> Handle:
         if ctx.budget is not None:
             ctx.budget.take_agent()
         mgr = self.server.subagents
         idx = int(st.id[1:]) - 1
-        h = mgr.spawn(ctx.session, description=description, prompt=prompt, agent_type=agent_type,
-                      index=idx, count=len(ctx.result.subtasks), **kw)
+        h = mgr.spawn(
+            ctx.session,
+            description=description,
+            prompt=prompt,
+            agent_type=agent_type,
+            index=idx,
+            count=len(ctx.result.subtasks),
+            **kw,
+        )
         st.handles.append(h)
         if self.cfg.get("panes"):  # k3 panes: one read-only pane per child (the pane's process opens it)
             ctx.session.emit("pane.open", {"subagent_id": h.id, "name": f"fan {st.id} {st.title}"[:40]})
@@ -255,11 +312,22 @@ class FanoutExecutor:
         try:
             async with ctx.sem:
                 self.progress(ctx, st, "running")
-                h = await self._spawn(ctx, st, "worker", self.worker_prompt(ctx, st), st.title[:60],
-                                      isolation="worktree", auto_merge=False)
+                h = await self._spawn(
+                    ctx,
+                    st,
+                    "worker",
+                    self.worker_prompt(ctx, st),
+                    st.title[:60],
+                    isolation="worktree",
+                    auto_merge=False,
+                )
                 if h.status != "completed" or h.worktree is None:
-                    self.progress(ctx, st, "failed", h.error or f"worker {h.status}" +
-                                  ("" if h.worktree is not None else " (no worktree)"))
+                    self.progress(
+                        ctx,
+                        st,
+                        "failed",
+                        h.error or f"worker {h.status}" + ("" if h.worktree is not None else " (no worktree)"),
+                    )
                     return
                 st.worktree = h.worktree
                 if h.merge == "no_changes":
@@ -300,10 +368,20 @@ class FanoutExecutor:
 
     async def _rework(self, ctx: _Ctx, st: Subtask, problem: str) -> Handle:
         assert st.worktree is not None
-        prompt = (f"{self.worker_prompt(ctx, st)}\n\n--- REWORK ---\nYou already worked on this in your worktree "
-                  f"(branch {st.worktree.branch}). Fix this problem and finish:\n{problem}")
-        return await self._spawn(ctx, st, "worker", prompt, f"fix: {st.title}"[:60], isolation="worktree",
-                                 auto_merge=False, worktree=st.worktree)
+        prompt = (
+            f"{self.worker_prompt(ctx, st)}\n\n--- REWORK ---\nYou already worked on this in your worktree "
+            f"(branch {st.worktree.branch}). Fix this problem and finish:\n{problem}"
+        )
+        return await self._spawn(
+            ctx,
+            st,
+            "worker",
+            prompt,
+            f"fix: {st.title}"[:60],
+            isolation="worktree",
+            auto_merge=False,
+            worktree=st.worktree,
+        )
 
     async def _merge(self, ctx: _Ctx, st: Subtask) -> None:
         wt = st.worktree
@@ -341,9 +419,11 @@ class FanoutExecutor:
             problem = error
             if not clean:
                 files = await wt_mod.conflicted_files(wt.path)
-                problem += (f"\n\nI merged the current main state into your worktree and it conflicts in: "
-                            f"{', '.join(files) or '(see git status)'}. Resolve the conflict markers, keep both "
-                            "sides' intent, and save the files.")
+                problem += (
+                    f"\n\nI merged the current main state into your worktree and it conflicts in: "
+                    f"{', '.join(files) or '(see git status)'}. Resolve the conflict markers, keep both "
+                    "sides' intent, and save the files."
+                )
             h = await self._rework(ctx, st, problem)
             if h.status != "completed":
                 self.progress(ctx, st, "escalated", f"{error}\n(retry {h.status}: {h.error})")

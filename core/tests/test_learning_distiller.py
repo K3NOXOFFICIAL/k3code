@@ -9,8 +9,12 @@ from learn_helpers import FakeCaller
 
 def seed(log: DecisionLog) -> None:
     for _ in range(3):
-        log.record("model_switch", subject="m-x -> m-y", choice="m-y",
-                   detail={"from": "m-x", "to": "m-y", "task_kind": "review", "to_tier": "strong"})
+        log.record(
+            "model_switch",
+            subject="m-x -> m-y",
+            choice="m-y",
+            detail={"from": "m-x", "to": "m-y", "task_kind": "review", "to_tier": "strong"},
+        )
         log.record("plan", subject="exit_plan", choice="deny", detail={"has_verification": False})
         log.record("proposal", subject="t", choice="dismiss", detail={"kind": "improvement"})
     for _ in range(5):
@@ -54,8 +58,9 @@ async def test_mem0_stored_per_preference_and_no_secrets(tmp_path, monkeypatch):
     sent: list[tuple[str, dict, dict]] = []
     cfg = Settings(mem0=Mem0Config(url="http://mem0.test", api_key_env="MEM0_KEY", agent_id="agent-7"))
     md = tmp_path / "USER.md"
-    prefs = await distiller.distill(log, home=tmp_path, user_md=md, config=cfg,
-                                    mem0_post=lambda u, b, h: sent.append((u, b, h)))
+    prefs = await distiller.distill(
+        log, home=tmp_path, user_md=md, config=cfg, mem0_post=lambda u, b, h: sent.append((u, b, h))
+    )
     assert len(sent) == len(prefs) > 0
     assert sent[0][0] == "http://mem0.test/memories" and sent[0][1]["agent_id"] == "agent-7"
     blob = md.read_text() + (tmp_path / "learning" / "preferences.json").read_text() + json.dumps(sent[0][1])
@@ -97,6 +102,11 @@ async def test_mem0_writes_do_not_block_the_event_loop_thread(tmp_path):
     seed(log)
     threads: list[threading.Thread] = []
     cfg = Settings(mem0=Mem0Config(url="http://mem0.test", api_key_env="NOPE", agent_id="a"))
-    await distiller.distill(log, home=tmp_path, user_md=tmp_path / "USER.md", config=cfg,
-                            mem0_post=lambda u, b, h: threads.append(threading.current_thread()))
+    await distiller.distill(
+        log,
+        home=tmp_path,
+        user_md=tmp_path / "USER.md",
+        config=cfg,
+        mem0_post=lambda u, b, h: threads.append(threading.current_thread()),
+    )
     assert threads and all(t is not threading.main_thread() for t in threads)

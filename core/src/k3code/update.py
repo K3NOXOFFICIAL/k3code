@@ -359,18 +359,25 @@ def apply_detached() -> str:
     exe = shutil.which("k3code") or str(Path(sys.argv[0]).resolve())
     runner = shutil.which("systemd-run")
     if runner is None:
-        return ("systemd-run is not available: run `k3code update --yes` from a terminal "
-                "(the daemon cannot safely update the unit it is running in).")
+        return (
+            "systemd-run is not available: run `k3code update --yes` from a terminal "
+            "(the daemon cannot safely update the unit it is running in)."
+        )
     unit = f"k3code-update-{int(time.time())}"
     r = subprocess.run(
         [runner, "--user", "--collect", "--quiet", f"--unit={unit}", exe, "update", "--yes"],
-        capture_output=True, text=True, check=False, timeout=30,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
     )
     if r.returncode != 0:
         return f"Could not start the update: {(r.stderr or r.stdout).strip()[:300]}"
-    return (f"Update started in the background ({unit}). The daemon restarts when it is installed and smoke-tested; "
-            f"it is rolled back automatically if the new version does not come up. Follow it with "
-            f"`journalctl --user -u {unit}`.")
+    return (
+        f"Update started in the background ({unit}). The daemon restarts when it is installed and smoke-tested; "
+        f"it is rolled back automatically if the new version does not come up. Follow it with "
+        f"`journalctl --user -u {unit}`."
+    )
 
 
 def source_checkout() -> Path | None:

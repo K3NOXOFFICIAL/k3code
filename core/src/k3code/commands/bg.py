@@ -32,16 +32,19 @@ class BgCommand(CommandDef):
             if pane:
                 # The process that sits in the pane (the stdio gateway or the attach bridge) opens it when it is in
                 # k3 panes; anywhere else this is a plain /bg.
-                extra["open_pane"] = open_pane_spec(new.session_id, name=f"bg {new.session_id[:6]}",
-                                                    cwd=new.stored.cwd)
+                extra["open_pane"] = open_pane_spec(new.session_id, name=f"bg {new.session_id[:6]}", cwd=new.stored.cwd)
                 where = "opening it in a new pane (a plain background session outside k3 panes)."
-            return reply(f"Started background session {new.session_id[:8]}; {where}", session_id=new.session_id,
-                         **extra)
+            return reply(
+                f"Started background session {new.session_id[:8]}; {where}", session_id=new.session_id, **extra
+            )
         if live.streaming and live.turn_task is not None and not live.turn_task.done():
             from k3code.gateway.server import _ctx_client
 
             fresh = ctx.background_current(live, _ctx_client.get())
-            return reply(f"Sent the running turn to the background ({live.session_id[:8]}). You are now in a "
-                         f"fresh session ({fresh.session_id[:8]}).", session_id=fresh.session_id,
-                         backgrounded=live.session_id)
+            return reply(
+                f"Sent the running turn to the background ({live.session_id[:8]}). You are now in a "
+                f"fresh session ({fresh.session_id[:8]}).",
+                session_id=fresh.session_id,
+                backgrounded=live.session_id,
+            )
         return reply("Nothing is running. Usage: /bg <prompt>")

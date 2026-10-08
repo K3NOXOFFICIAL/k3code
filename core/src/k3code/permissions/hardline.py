@@ -42,7 +42,10 @@ HARDLINE_SIMPLE_PATTERNS: list[tuple[str, str]] = [
 #: Every hardline rule by name, for display (/permissions, the setup wizard): the regex ones, the token-based rm check
 #: (see _rm_check) and the per-command ssh checks.
 HARDLINE_NAMES: list[str] = [
-    "rm-rf-root", "rm-rf-home", *(n for n, _ in HARDLINE_PATTERNS), *(n for n, _ in HARDLINE_SIMPLE_PATTERNS),
+    "rm-rf-root",
+    "rm-rf-home",
+    *(n for n, _ in HARDLINE_PATTERNS),
+    *(n for n, _ in HARDLINE_SIMPLE_PATTERNS),
 ]
 
 _COMPILED: list[tuple[str, re.Pattern[str]]] = [(name, re.compile(rx)) for name, rx in HARDLINE_PATTERNS]
@@ -50,18 +53,78 @@ _COMPILED_SIMPLE: list[tuple[str, re.Pattern[str]]] = [(n, re.compile(r)) for n,
 
 #: Wrappers that run what follows (skipped when looking for the real command).
 _WRAPPERS = frozenset(
-    {"sudo", "doas", "env", "nohup", "time", "nice", "ionice", "command", "builtin", "exec", "timeout", "stdbuf",
-     "setsid", "chrt"}
+    {
+        "sudo",
+        "doas",
+        "env",
+        "nohup",
+        "time",
+        "nice",
+        "ionice",
+        "command",
+        "builtin",
+        "exec",
+        "timeout",
+        "stdbuf",
+        "setsid",
+        "chrt",
+    }
 )
 #: Commands that run arbitrary code from their arguments: an "always allow <prefix>" rule must never be offered for
 #: them (one click on `python3 *` or `ssh *` would otherwise allow everything).
 LAUNCHERS = frozenset(
-    {"sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "ssh", "xargs", "su", "watch", "find", "python", "python3",
-     "node", "perl", "ruby", "php", "lua", "awk", "gawk", "sed", "tee", "source", ".", *_WRAPPERS}
+    {
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "fish",
+        "eval",
+        "ssh",
+        "xargs",
+        "su",
+        "watch",
+        "find",
+        "python",
+        "python3",
+        "node",
+        "perl",
+        "ruby",
+        "php",
+        "lua",
+        "awk",
+        "gawk",
+        "sed",
+        "tee",
+        "source",
+        ".",
+        *_WRAPPERS,
+    }
 )
 _DANGEROUS_RM_TARGETS = frozenset(
-    {"/", "/*", "~", "~/*", "$HOME", "${HOME}", "$HOME/*", "${HOME}/*", "/home", "/etc", "/usr", "/var", "/boot",
-     "/bin", "/lib", "/lib64", "/sbin", "/root", "/opt", "/srv"}
+    {
+        "/",
+        "/*",
+        "~",
+        "~/*",
+        "$HOME",
+        "${HOME}",
+        "$HOME/*",
+        "${HOME}/*",
+        "/home",
+        "/etc",
+        "/usr",
+        "/var",
+        "/boot",
+        "/bin",
+        "/lib",
+        "/lib64",
+        "/sbin",
+        "/root",
+        "/opt",
+        "/srv",
+    }
 )
 
 

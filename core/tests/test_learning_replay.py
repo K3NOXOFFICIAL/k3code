@@ -9,17 +9,43 @@ from k3code.learning.replay import Candidate, ReplayStore, auto_ok, build_record
 from k3code.providers.types import Message, ToolCall
 
 
-def turn(i: int, *, tool_chars: int = 200, tier: str = "main", status: str = "done", kind: str = "interactive_turn",
-         tools: int = 1, memory: int = 500, skills: list[int] | None = None, user: str | None = None):
-    msgs = [Message(role="system", content="system " + "s" * 100),
-            Message(role="user", content=user or f"task {i}")]
+def turn(
+    i: int,
+    *,
+    tool_chars: int = 200,
+    tier: str = "main",
+    status: str = "done",
+    kind: str = "interactive_turn",
+    tools: int = 1,
+    memory: int = 500,
+    skills: list[int] | None = None,
+    user: str | None = None,
+):
+    msgs = [Message(role="system", content="system " + "s" * 100), Message(role="user", content=user or f"task {i}")]
     for k in range(tools):
-        msgs.append(Message(role="assistant", content=None,
-                            tool_calls=[ToolCall(id=f"c{k}", name="read", arguments={"path": f"f{k}.py"})]))
+        msgs.append(
+            Message(
+                role="assistant",
+                content=None,
+                tool_calls=[ToolCall(id=f"c{k}", name="read", arguments={"path": f"f{k}.py"})],
+            )
+        )
         msgs.append(Message(role="tool", content="x" * tool_chars, tool_call_id=f"c{k}", name="read"))
     msgs.append(Message(role="assistant", content=f"answer {i}"))
-    return build_record(turn=f"t{i}", session="s1", kind=kind, tier=tier, status=status, messages=msgs, first=1,
-                        tokens_in=0, tokens_out=0, memory_chars=memory, skill_lines=skills or [80] * 5, ts=float(i))
+    return build_record(
+        turn=f"t{i}",
+        session="s1",
+        kind=kind,
+        tier=tier,
+        status=status,
+        messages=msgs,
+        first=1,
+        tokens_in=0,
+        tokens_out=0,
+        memory_chars=memory,
+        skill_lines=skills or [80] * 5,
+        ts=float(i),
+    )
 
 
 def test_replaying_the_same_records_gives_identical_token_totals():

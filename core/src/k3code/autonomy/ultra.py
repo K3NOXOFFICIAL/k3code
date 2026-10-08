@@ -39,6 +39,7 @@ async def gather_or_cancel[T](*aws: Awaitable[T]) -> list[T]:
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
 
+
 ANGLES = {
     "mvp-first": "Find the smallest slice that delivers the goal end to end; defer everything else.",
     "risk-first": "Start from what could go wrong (unknowns, data loss, regressions) and retire risk early.",
@@ -57,7 +58,7 @@ DEFAULT_MAX_AGENTS = 12
 JUDGE_SYSTEM = (
     "You are the plan judge. You get several independent plans for one task. Score each from 1 to 10 "
     "(feasibility, completeness, risk handling), then write ONE final plan that grafts the best ideas of the "
-    "others onto the strongest. Reply with a first line `SCORES: {\"<angle>\": <score>, ...}` (JSON) and then the "
+    'others onto the strongest. Reply with a first line `SCORES: {"<angle>": <score>, ...}` (JSON) and then the '
     "final plan in markdown with exactly the sections: " + ", ".join(f"## {s}" for s in PLAN_SECTIONS) + ". "
     "In Steps, prefer independent steps that can run in parallel and mark them (parallel)."
 )
@@ -78,7 +79,8 @@ def planner_prompt(task: str, angle: str) -> str:
     return (
         f"ANGLE: {angle}\nWrite an implementation plan for this task from one angle only: {ANGLES[angle]}\n\n"
         f"Task:\n{task}\n\nStudy the repository first (read-only). Return the plan as markdown with the sections "
-        + ", ".join(PLAN_SECTIONS) + ". Mark steps that are independent of each other with (parallel)."
+        + ", ".join(PLAN_SECTIONS)
+        + ". Mark steps that are independent of each other with (parallel)."
     )
 
 
@@ -91,7 +93,7 @@ def parse_judge(text: str) -> tuple[dict[str, float], str]:
             scores = {str(k): float(v) for k, v in json.loads(m.group(1)).items()}
         except (ValueError, TypeError):
             scores = {}
-    body = text[m.end():] if m else text
+    body = text[m.end() :] if m else text
     return scores, body.strip()
 
 
@@ -140,19 +142,28 @@ class Ultra:
     def __init__(self, server: Any) -> None:
         self.server = server
 
-    def progress(self, session: Any, command: str, phase: str, detail: str = "",
-                 budget: AgentBudget | None = None) -> None:
+    def progress(
+        self, session: Any, command: str, phase: str, detail: str = "", budget: AgentBudget | None = None
+    ) -> None:
         payload = {"session_id": session.session_id, "command": command, "phase": phase, "detail": detail}
         if budget is not None:
-            payload.update(agents=budget.agents, tokens=budget.tokens, max_agents=budget.max_agents,
-                           max_tokens=budget.max_tokens)
+            payload.update(
+                agents=budget.agents, tokens=budget.tokens, max_agents=budget.max_agents, max_tokens=budget.max_tokens
+            )
         session.emit("ultra.progress", payload, importance="essential")
         session.emit("status.update", {"kind": "status", "text": f"/{command}: {phase}", "state": "working"})
 
     # ── /ultraplan ──
 
-    async def ultraplan(self, session: Any, task: str, *, budget: AgentBudget | None = None,
-                        command: str = "ultraplan", angles: list[str] | None = None) -> UltraPlan:
+    async def ultraplan(
+        self,
+        session: Any,
+        task: str,
+        *,
+        budget: AgentBudget | None = None,
+        command: str = "ultraplan",
+        angles: list[str] | None = None,
+    ) -> UltraPlan:
         angles = list(angles or ANGLES)
         mgr = self.server.subagents
         self.progress(session, command, "planning", f"{len(angles)} independent planners", budget)
@@ -160,8 +171,15 @@ class Ultra:
         async def one(i: int, angle: str) -> tuple[str, Handle | None]:
             if budget is not None:
                 budget.take_agent()
-            h = mgr.spawn(session, description=f"plan: {angle}", prompt=planner_prompt(task, angle),
-                          agent_type="planner", tier="strong", index=i, count=len(angles))
+            h = mgr.spawn(
+                session,
+                description=f"plan: {angle}",
+                prompt=planner_prompt(task, angle),
+                agent_type="planner",
+                tier="strong",
+                index=i,
+                count=len(angles),
+            )
             await mgr.wait(h)
             if budget is not None:
                 budget.charge(h)
@@ -174,15 +192,16 @@ class Ultra:
             raise
         plans = [(a, h.result) for a, h in done if h and h.status == "completed" and h.result.strip()]
         if not plans:
-            raise RuntimeError("no planner produced a plan: " + "; ".join(
-                f"{a}: {h.error or h.status}" for a, h in done if h))
+            raise RuntimeError(
+                "no planner produced a plan: " + "; ".join(f"{a}: {h.error or h.status}" for a, h in done if h)
+            )
         self.progress(session, command, "judging", f"{len(plans)} plans", budget)
         body = "\n\n".join(f"=== Plan ({a}) ===\n{p}" for a, p in plans)
         result = await self.server.model_caller.complete(
             TaskKind.PLAN,
-            [Message(role="system", content=JUDGE_SYSTEM),
-             Message(role="user", content=f"Task:\n{task}\n\n{body}")],
-            session_id=session.session_id, max_tokens=4096,
+            [Message(role="system", content=JUDGE_SYSTEM), Message(role="user", content=f"Task:\n{task}\n\n{body}")],
+            session_id=session.session_id,
+            max_tokens=4096,
         )
         if budget is not None:
             budget.tokens += result.prompt_tokens + result.completion_tokens
@@ -204,20 +223,31 @@ class Ultra:
             gi.write_text("*\n", encoding="utf-8")
         scores = ", ".join(f"{k}: {v:g}" for k, v in up.scores.items()) or "n/a"
         header = f"# Plan: {up.task}\n\n_ultraplan — angles: {', '.join(up.angles)}; judge scores: {scores}_\n\n"
-        path = write_artifact_file(self.server, "plan", d, up.task, header + up.plan + "\n",
-                                   session=session.session_id)
+        path = write_artifact_file(self.server, "plan", d, up.task, header + up.plan + "\n", session=session.session_id)
         row = self.server.artifacts.list(session=session.session_id, kind="plan", limit=1)
         return path, (row[0].id if row else None)
 
     def show_plan(self, session: Any, up: UltraPlan, *, status: str = "proposed") -> None:
         verdict = plan_verdict(up.plan)
-        session.emit("plan.show", {
-            "session_id": session.session_id, "plan_id": f"ultraplan-{int(time.time())}", "status": status,
-            "plan": up.plan, "sections": parse_plan(up.plan), "scope": verdict.scope, "risk": verdict.risk,
-            "fanout_candidate": verdict.fanout_candidate, "parallelizable": verdict.parallelizable,
-            "subtasks": verdict.suggested_subtasks, "path": str(up.path or ""), "source": "ultraplan",
-            "scores": up.scores,
-        }, importance="essential")
+        session.emit(
+            "plan.show",
+            {
+                "session_id": session.session_id,
+                "plan_id": f"ultraplan-{int(time.time())}",
+                "status": status,
+                "plan": up.plan,
+                "sections": parse_plan(up.plan),
+                "scope": verdict.scope,
+                "risk": verdict.risk,
+                "fanout_candidate": verdict.fanout_candidate,
+                "parallelizable": verdict.parallelizable,
+                "subtasks": verdict.suggested_subtasks,
+                "path": str(up.path or ""),
+                "source": "ultraplan",
+                "scores": up.scores,
+            },
+            importance="essential",
+        )
 
     # ── /ultracode ──
 
@@ -258,19 +288,22 @@ class Ultra:
             self.progress(session, "ultracode", "stopped", str(e), budget)
         report.budget = budget.summary()
         text = report.render()
-        path = write_artifact_file(self.server, "review", cwd / ".k3code" / "reports", f"ultracode {task}", text,
-                                   session=session.session_id)
+        path = write_artifact_file(
+            self.server, "review", cwd / ".k3code" / "reports", f"ultracode {task}", text, session=session.session_id
+        )
         return text + f"\n\nReport saved: {path}"
 
-    async def run_child(self, session: Any, budget: AgentBudget, agent_type: str, prompt: str, desc: str,
-                        **kw: Any) -> Handle:
+    async def run_child(
+        self, session: Any, budget: AgentBudget, agent_type: str, prompt: str, desc: str, **kw: Any
+    ) -> Handle:
         budget.take_agent()
         h = await self.server.subagents.run(session, description=desc, prompt=prompt, agent_type=agent_type, **kw)
         budget.charge(h)
         return h
 
-    async def review_and_fix(self, session: Any, budget: AgentBudget, report: _Report, task: str, plan: str,
-                             base: str) -> None:
+    async def review_and_fix(
+        self, session: Any, budget: AgentBudget, report: _Report, task: str, plan: str, base: str
+    ) -> None:
         cwd = Path(session.perms.cwd)
         diff = ""
         if base:
@@ -304,12 +337,22 @@ class Ultra:
             budget.check()
             res = await self.server.model_caller.complete(
                 TaskKind.REVIEW,
-                [Message(role="system", content=(
-                    f"You are a skeptical reviewer with the {desc} lens. For each candidate finding decide if it is a "
-                    'REAL problem in the diff. Reply with JSON only: {"votes": {"<id>": true|false, ...}}.')),
-                 Message(role="user", content=f"VOTE LENS: {lens}\nTask:\n{task}\n\nCandidates:\n{listing}\n\n"
-                                             f"Diff:\n```diff\n{diff}\n```")],
-                session_id=session.session_id, max_tokens=1024,
+                [
+                    Message(
+                        role="system",
+                        content=(
+                            f"You are a skeptical reviewer with the {desc} lens. For each candidate finding decide if it is a "
+                            'REAL problem in the diff. Reply with JSON only: {"votes": {"<id>": true|false, ...}}.'
+                        ),
+                    ),
+                    Message(
+                        role="user",
+                        content=f"VOTE LENS: {lens}\nTask:\n{task}\n\nCandidates:\n{listing}\n\n"
+                        f"Diff:\n```diff\n{diff}\n```",
+                    ),
+                ],
+                session_id=session.session_id,
+                max_tokens=1024,
             )
             budget.tokens += res.prompt_tokens + res.completion_tokens
             votes[lens] = parse_votes(res.text)
@@ -319,8 +362,10 @@ class Ultra:
             report.notes.append("no finding was confirmed by both reviewers")
             return
         self.progress(session, "ultracode", "fixing", f"{len(confirmed)} confirmed findings", budget)
-        fix_prompt = (f"Fix these confirmed review findings (both reviewers agreed they are real). "
-                      f"Task context:\n{task}\n\nFindings:\n{json.dumps(confirmed, indent=1)}\n\nKeep changes minimal.")
+        fix_prompt = (
+            f"Fix these confirmed review findings (both reviewers agreed they are real). "
+            f"Task context:\n{task}\n\nFindings:\n{json.dumps(confirmed, indent=1)}\n\nKeep changes minimal."
+        )
         h = await self.run_child(session, budget, "worker", fix_prompt, "fix findings", isolation="worktree")
         report.fix = f"{h.status}; merge: {h.merge}" + (f" ({h.branch})" if h.merge == "conflict" else "")
 
@@ -345,8 +390,10 @@ class _Report:
         if self.fanout is not None:
             out.append("\n## Implementation\n" + self.fanout.summary())
         rejected = len(self.candidates) - len(self.confirmed)
-        out.append(f"\n## Review panel\n{len(self.candidates)} candidate finding(s); {len(self.confirmed)} confirmed "
-                   f"by both reviewers, {rejected} rejected.")
+        out.append(
+            f"\n## Review panel\n{len(self.candidates)} candidate finding(s); {len(self.confirmed)} confirmed "
+            f"by both reviewers, {rejected} rejected."
+        )
         for f in self.confirmed:
             out.append(f"- [{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')} {f['issue']}")
         if self.fix:
@@ -361,7 +408,13 @@ class _Report:
 
 def plan_verdict(plan: str) -> ScopeVerdict:
     """A large, parallelizable verdict for an ultraplan'd plan (subtasks come from its Steps)."""
-    v = ScopeVerdict(scope="large", needs_plan=True, parallelizable=True, source="ultraplan",
-                     reason="/ultraplan", fanout_candidate=True)
+    v = ScopeVerdict(
+        scope="large",
+        needs_plan=True,
+        parallelizable=True,
+        source="ultraplan",
+        reason="/ultraplan",
+        fanout_candidate=True,
+    )
     v.suggested_subtasks = extract_subtasks(v, plan)
     return v

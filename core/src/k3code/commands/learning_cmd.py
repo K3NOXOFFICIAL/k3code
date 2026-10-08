@@ -21,9 +21,13 @@ class PermissionsCommand(CommandDef):
         hub = ctx.learning
         c = hub.cfg
         cwd = str(session_cwd(ctx, session_id))
-        cands = permrules.mine(hub.log, min_approvals=int(c["perm_min_approvals"]),
-                               min_denials=int(c["perm_min_denials"]),
-                               user_projects=int(c["user_scope_projects"]), cwd=cwd)
+        cands = permrules.mine(
+            hub.log,
+            min_approvals=int(c["perm_min_approvals"]),
+            min_denials=int(c["perm_min_denials"]),
+            user_projects=int(c["user_scope_projects"]),
+            cwd=cwd,
+        )
         live = ctx.sessions.get(session_id) if session_id else None
         made = permrules.to_proposals(cands, hub.store, session_id or "")
         if live is not None:
@@ -54,8 +58,9 @@ class OptimizerCommand(CommandDef):
             live = ctx.sessions.get(session_id) if session_id else None
             m = hub.metrics(since=hub.clock() - 7 * 86400)
             made = await hub.run_optimizer(live)  # metric proposals, replayed token candidates, gated auto-apply
-            return reply(f"Analysed {m['sessions']} sessions (score {optimizer.score(m)}); "
-                         f"{len(made)} new overlay proposal(s).")
+            return reply(
+                f"Analysed {m['sessions']} sessions (score {optimizer.score(m)}); {len(made)} new overlay proposal(s)."
+            )
         if sub == "rollback":
             if len(parts) < 2:
                 return reply("Usage: /optimizer rollback <id>")

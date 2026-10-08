@@ -289,7 +289,12 @@ async def test_readonly_attach_outside_a_pane_still_refuses_changes(running_daem
     home, _server = running_daemon
     env = {k: v for k, v in os.environ.items() if not k.startswith("TUIOS_")}
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "k3code.cli", "gateway", "--attach", "--readonly",
+        sys.executable,
+        "-m",
+        "k3code.cli",
+        "gateway",
+        "--attach",
+        "--readonly",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,

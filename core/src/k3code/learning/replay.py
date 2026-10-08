@@ -65,7 +65,7 @@ class ReplayStore:
             f.write(line + "\n")
         if self.path.stat().st_size > MAX_FILE_BYTES:
             lines = self.path.read_text(encoding="utf-8").splitlines()
-            self.path.write_text("\n".join(lines[len(lines) // 2:]) + "\n", encoding="utf-8")
+            self.path.write_text("\n".join(lines[len(lines) // 2 :]) + "\n", encoding="utf-8")
         return True
 
     def load(self) -> list[dict[str, Any]]:
@@ -82,9 +82,21 @@ class ReplayStore:
         return out
 
 
-def build_record(*, turn: str, session: str, kind: str, tier: str, status: str, messages: Sequence[Message],
-                 first: int, tokens_in: int, tokens_out: int, memory_chars: int, skill_lines: list[int],
-                 ts: float) -> dict[str, Any]:
+def build_record(
+    *,
+    turn: str,
+    session: str,
+    kind: str,
+    tier: str,
+    status: str,
+    messages: Sequence[Message],
+    first: int,
+    tokens_in: int,
+    tokens_out: int,
+    memory_chars: int,
+    skill_lines: list[int],
+    ts: float,
+) -> dict[str, Any]:
     """One turn as the replay reads it: the size of every message (never its text), the request boundaries and the
     answer sizes. Request ``k`` of the turn saw ``entries[:boundaries[k]]``; its answer is the assistant message there.
 
@@ -94,10 +106,22 @@ def build_record(*, turn: str, session: str, kind: str, tier: str, status: str, 
     entries = [_entry(m) for m in messages]
     boundaries = [i for i, m in enumerate(messages) if m.role == "assistant" and i >= first]
     completions = [_entry_chars(entries[i]) for i in boundaries]
-    return {"turn": turn, "session": session, "ts": ts, "kind": kind, "tier": tier, "status": status,
-            "passed": status == "done", "tokens_in": tokens_in, "tokens_out": tokens_out,
-            "memory_chars": memory_chars, "skill_lines": list(skill_lines), "entries": entries,
-            "boundaries": boundaries, "completions": completions}
+    return {
+        "turn": turn,
+        "session": session,
+        "ts": ts,
+        "kind": kind,
+        "tier": tier,
+        "status": status,
+        "passed": status == "done",
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "memory_chars": memory_chars,
+        "skill_lines": list(skill_lines),
+        "entries": entries,
+        "boundaries": boundaries,
+        "completions": completions,
+    }
 
 
 def _entry(m: Message) -> dict[str, Any]:
@@ -131,8 +155,9 @@ class Candidate:
     skill_limit: int | None = None  # skills named in the system prompt
 
 
-def _apply(cand: Candidate | None, entries: list[dict[str, Any]], turn: dict[str, Any]
-           ) -> tuple[list[dict[str, Any]], bool, int]:
+def _apply(
+    cand: Candidate | None, entries: list[dict[str, Any]], turn: dict[str, Any]
+) -> tuple[list[dict[str, Any]], bool, int]:
     """The request as the candidate sends it: (entries, changed, characters removed from the system prompt)."""
     if cand is None:
         return entries, False, 0
@@ -147,7 +172,7 @@ def _apply(cand: Candidate | None, entries: list[dict[str, Any]], turn: dict[str
     if cand.memory_chars is not None and turn["memory_chars"] > cand.memory_chars:
         cut += turn["memory_chars"] - cand.memory_chars
     if cand.skill_limit is not None and len(turn["skill_lines"]) > cand.skill_limit:
-        cut += sum(turn["skill_lines"][cand.skill_limit:])
+        cut += sum(turn["skill_lines"][cand.skill_limit :])
     if cut:
         changed = True
     return out, changed, cut
@@ -163,8 +188,9 @@ async def _replay_turn(provider: FakeProvider, turn: dict[str, Any], cand: Candi
         chars = sum(_entry_chars(e) for e in sent) - cut
         # the messages carry roles only: the fake provider needs their shape, the sizes come from the usage step
         messages = [Message(role=e["r"]) for e in sent]
-        provider.steps = [{"type": "usage", "prompt_tokens": est_tokens(chars),
-                           "completion_tokens": est_tokens(answer_chars)}]
+        provider.steps = [
+            {"type": "usage", "prompt_tokens": est_tokens(chars), "completion_tokens": est_tokens(answer_chars)}
+        ]
         done = None
         async for event in provider.stream(messages, [], "replay"):
             if event.type == "done":
@@ -216,8 +242,12 @@ def evaluate_sync(turns: list[dict[str, Any]], cand: Candidate) -> dict[str, Any
 def auto_ok(result: dict[str, Any]) -> bool:
     """The auto-apply gate: a real token reduction, a bounded pass-rate drop, and something actually changed."""
     drop = result.get("pass_drop_points")
-    return (result["token_reduction_pct"] >= AUTO_MIN_TOKEN_REDUCTION_PCT and drop is not None
-            and drop <= AUTO_MAX_PASS_DROP_POINTS and result["changed_turns"] > 0)
+    return (
+        result["token_reduction_pct"] >= AUTO_MIN_TOKEN_REDUCTION_PCT
+        and drop is not None
+        and drop <= AUTO_MAX_PASS_DROP_POINTS
+        and result["changed_turns"] > 0
+    )
 
 
 def tier_pass_delta(turns: list[dict[str, Any]], kind: str, to_tier: str) -> dict[str, Any]:
@@ -233,8 +263,14 @@ def tier_pass_delta(turns: list[dict[str, Any]], kind: str, to_tier: str) -> dic
         rate_to = sum(t["passed"] for t in on_to) / len(on_to)
         rate_else = sum(t["passed"] for t in elsewhere) / len(elsewhere)
         delta = round(100.0 * (rate_to - rate_else), 2)
-    return {"kind": kind, "to_tier": to_tier, "token_delta_pct": 0.0, "pass_delta_points": delta,
-            "observed_on_tier": len(on_to), "observed_elsewhere": len(elsewhere)}
+    return {
+        "kind": kind,
+        "to_tier": to_tier,
+        "token_delta_pct": 0.0,
+        "pass_delta_points": delta,
+        "observed_on_tier": len(on_to),
+        "observed_elsewhere": len(elsewhere),
+    }
 
 
 async def token_candidates(context: dict[str, Any], turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -245,17 +281,29 @@ async def token_candidates(context: dict[str, Any], turns: list[dict[str, Any]])
     now_skills = int(context.get("skill_prompt_limit", 60))
     specs: list[tuple[Candidate, dict[str, Any], str]] = []
     if now_clip > TOOL_CLIP_CANDIDATE:
-        specs.append((Candidate("tool_output_chars", clip_chars=TOOL_CLIP_CANDIDATE),
-                      {"context": {"tool_output_chars": TOOL_CLIP_CANDIDATE}},
-                      f"Clip tool results to {TOOL_CLIP_CANDIDATE} chars for the model (now {now_clip})"))
+        specs.append(
+            (
+                Candidate("tool_output_chars", clip_chars=TOOL_CLIP_CANDIDATE),
+                {"context": {"tool_output_chars": TOOL_CLIP_CANDIDATE}},
+                f"Clip tool results to {TOOL_CLIP_CANDIDATE} chars for the model (now {now_clip})",
+            )
+        )
     if now_memory > MEMORY_CANDIDATE and any(t["memory_chars"] > MEMORY_CANDIDATE for t in turns):
-        specs.append((Candidate("memory_chars", memory_chars=MEMORY_CANDIDATE),
-                      {"context": {"memory_chars": MEMORY_CANDIDATE}},
-                      f"Limit the memory in the prompt to {MEMORY_CANDIDATE} chars (now {now_memory})"))
+        specs.append(
+            (
+                Candidate("memory_chars", memory_chars=MEMORY_CANDIDATE),
+                {"context": {"memory_chars": MEMORY_CANDIDATE}},
+                f"Limit the memory in the prompt to {MEMORY_CANDIDATE} chars (now {now_memory})",
+            )
+        )
     if now_skills > SKILLS_CANDIDATE and any(len(t["skill_lines"]) > SKILLS_CANDIDATE for t in turns):
-        specs.append((Candidate("skill_prompt_limit", skill_limit=SKILLS_CANDIDATE),
-                      {"context": {"skill_prompt_limit": SKILLS_CANDIDATE}},
-                      f"List {SKILLS_CANDIDATE} skills in the prompt, not {now_skills}"))
+        specs.append(
+            (
+                Candidate("skill_prompt_limit", skill_limit=SKILLS_CANDIDATE),
+                {"context": {"skill_prompt_limit": SKILLS_CANDIDATE}},
+                f"List {SKILLS_CANDIDATE} skills in the prompt, not {now_skills}",
+            )
+        )
     out = []
     for cand, patch, title in specs:
         result = await evaluate(turns, cand, now_clip=now_clip)

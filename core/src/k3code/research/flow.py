@@ -27,8 +27,14 @@ from k3code.routing.tiers import TaskKind, Tier
 logger = logging.getLogger(__name__)
 
 CITE_RE = re.compile(r"\[(S\d+(?:\s*,\s*S\d+)*)\]")
-DEFAULTS = {"sub_questions": 5, "results_per_query": 6, "sources_per_topic": 4, "min_sources": 14, "concurrency": 4,
-            "max_claims": 60}
+DEFAULTS = {
+    "sub_questions": 5,
+    "results_per_query": 6,
+    "sources_per_topic": 4,
+    "min_sources": 14,
+    "concurrency": 4,
+    "max_claims": 60,
+}
 
 
 def is_dead_link(exc: BaseException) -> bool:
@@ -117,21 +123,30 @@ class Research:
 
     def tools(self) -> ResearchTools:
         override = getattr(self.server, "research_tools", None)  # test seam
-        return override or pick_tools(self.server.config, self.server.mcp,
-                                      fetcher=getattr(self.server, "web_fetcher", None),
-                                      browser=getattr(self.server, "browser", None))
+        return override or pick_tools(
+            self.server.config,
+            self.server.mcp,
+            fetcher=getattr(self.server, "web_fetcher", None),
+            browser=getattr(self.server, "browser", None),
+        )
 
     def progress(self, session: Any, phase: str, detail: str = "") -> None:
-        session.emit("research.progress", {"session_id": session.session_id, "phase": phase, "detail": detail},
-                     importance="essential")
+        session.emit(
+            "research.progress",
+            {"session_id": session.session_id, "phase": phase, "detail": detail},
+            importance="essential",
+        )
         session.emit("status.update", {"kind": "status", "text": f"/ultraresearch: {phase}", "state": "working"})
 
     async def _ask(
         self, session: Any, system: str, user: str, *, tier: Tier | None = None, max_tokens: int = 2048
     ) -> str:
         res = await self.server.model_caller.complete(
-            TaskKind.RESEARCH_SEARCH, [Message(role="system", content=system), Message(role="user", content=user)],
-            session_id=session.session_id, max_tokens=max_tokens, tier=tier,
+            TaskKind.RESEARCH_SEARCH,
+            [Message(role="system", content=system), Message(role="user", content=user)],
+            session_id=session.session_id,
+            max_tokens=max_tokens,
+            tier=tier,
         )
         return res.text
 
@@ -139,9 +154,11 @@ class Research:
         cfg = research_cfg(self.server.config)
         tools = self.tools()
         if reason := await tools.unavailable_reason():
-            raise ResearchUnavailable(f"/ultraresearch needs a search tool and none is available: {reason}. "
-                                      "Connect an MCP server with a web search tool (e.g. hub_searxng) or "
-                                      "set research.searxng_url.")
+            raise ResearchUnavailable(
+                f"/ultraresearch needs a search tool and none is available: {reason}. "
+                "Connect an MCP server with a web search tool (e.g. hub_searxng) or "
+                "set research.searxng_url."
+            )
         n_sub = int(n_sub or cfg["sub_questions"])
         state = ResearchState(question)
         sem = asyncio.Semaphore(int(cfg["concurrency"]))
@@ -162,8 +179,12 @@ class Research:
                     logger.warning("search %r failed: %s", query, e)
                     return topic, []
 
-        pairs = [(t, q) for t in state.plan for q in t.initial_queries if not (q in state.queries_seen
-                                                                              or state.queries_seen.add(q))]
+        pairs = [
+            (t, q)
+            for t in state.plan
+            for q in t.initial_queries
+            if not (q in state.queries_seen or state.queries_seen.add(q))
+        ]
         found = await asyncio.gather(*(one_search(t, q) for t, q in pairs))
         picks: list[tuple[SubTopic, Hit]] = []
         per_topic: dict[str, int] = {}
@@ -196,13 +217,17 @@ class Research:
                 if not text.strip():
                     return topic, hit, hit.title, []
                 reply = await self._ask(
-                    session, prompts.EXTRACTOR,
+                    session,
+                    prompts.EXTRACTOR,
                     f"Sub-topic: {topic.name}\nSource: {hit.url}\nTitle: {title}\n\nContent:\n{text}",
                     max_tokens=1024,
                 )
                 data = loose_json(reply)
-                claims = [str(c).strip() for c in (data or {}).get("claims", []) if str(c).strip()] \
-                    if isinstance(data, dict) else []
+                claims = (
+                    [str(c).strip() for c in (data or {}).get("claims", []) if str(c).strip()]
+                    if isinstance(data, dict)
+                    else []
+                )
                 return topic, hit, title or hit.title, claims
 
         # Read, then backfill from the spare hits until min_sources sources produced claims. A report cites only the
@@ -254,8 +279,11 @@ class Research:
         self.progress(session, "cross-checking", f"{len(state.learnings)} claims")
         items = state.learnings[:max_claims]
         listing = "\n".join(f"c{i} [{x.source_id}] {x.text}" for i, x in enumerate(items))
-        data = loose_json(await self._ask(session, prompts.CROSSCHECK,
-                                          f"Question: {state.question}\n\nClaims:\n{listing}", max_tokens=1024))
+        data = loose_json(
+            await self._ask(
+                session, prompts.CROSSCHECK, f"Question: {state.question}\n\nClaims:\n{listing}", max_tokens=1024
+            )
+        )
         if not isinstance(data, dict):
             return
         for cid in data.get("corroborated") or []:
@@ -291,7 +319,10 @@ class Research:
         gi = cwd / ".k3code" / ".gitignore"
         if not gi.exists():
             gi.write_text("*\n", encoding="utf-8")
-        head = (f"# Research: {state.question}\n\n_{time.strftime('%Y-%m-%d %H:%M')} — tools: {tool_name}; "
-                f"sub-topics: {', '.join(t.name for t in state.plan)}; {len(state.sources)} sources_\n\n")
-        return write_artifact_file(self.server, "research", d, state.question, head + report + "\n",
-                                   session=session.session_id)
+        head = (
+            f"# Research: {state.question}\n\n_{time.strftime('%Y-%m-%d %H:%M')} — tools: {tool_name}; "
+            f"sub-topics: {', '.join(t.name for t in state.plan)}; {len(state.sources)} sources_\n\n"
+        )
+        return write_artifact_file(
+            self.server, "research", d, state.question, head + report + "\n", session=session.session_id
+        )

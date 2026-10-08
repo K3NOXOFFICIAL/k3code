@@ -83,8 +83,7 @@ class LearningHub:
             cwd = kw.pop("cwd", None) or (str(session.perms.cwd) if session is not None else "")
             sid = session.session_id if session is not None else kw.pop("session_id", "")
             # unattended runs (bg, loop ticks, cron, sub-agents of those) are pre-approved, not user decisions
-            kw.setdefault("actor", "auto" if session is not None and getattr(session, "background", False)
-                          else "user")
+            kw.setdefault("actor", "auto" if session is not None and getattr(session, "background", False) else "user")
             self.log.record(kind, session=sid, cwd=cwd, **kw)
         except Exception:  # noqa: BLE001 - learning must never break a turn
             logger.warning("decision log write failed", exc_info=True)
@@ -103,8 +102,14 @@ class LearningHub:
         return [p.text for p in distiller.load_preferences(self.home, top)]
 
     def ranker(self, project: str) -> Callable[[list[dict[str, str]]], list[dict[str, str]]]:
-        return lambda items: ranking.rank(items, log=self.log, store=self.store, project=project,
-                                          threshold=float(self.cfg["rank_threshold"]), now=self.clock())
+        return lambda items: ranking.rank(
+            items,
+            log=self.log,
+            store=self.store,
+            project=project,
+            threshold=float(self.cfg["rank_threshold"]),
+            now=self.clock(),
+        )
 
     def emit(self, session: Any, proposals: list[Proposal]) -> None:
         for p in proposals:
@@ -112,17 +117,27 @@ class LearningHub:
 
     def mine_permissions(self, session: Any) -> list[Proposal]:
         c = self.cfg
-        cands = permrules.mine(self.log, min_approvals=int(c["perm_min_approvals"]),
-                               min_denials=int(c["perm_min_denials"]), user_projects=int(c["user_scope_projects"]),
-                               cwd=str(session.perms.cwd) if session is not None else "")
+        cands = permrules.mine(
+            self.log,
+            min_approvals=int(c["perm_min_approvals"]),
+            min_denials=int(c["perm_min_denials"]),
+            user_projects=int(c["user_scope_projects"]),
+            cwd=str(session.perms.cwd) if session is not None else "",
+        )
         made = permrules.to_proposals(cands, self.store, session.session_id if session else "")
         if session is not None:
             self.emit(session, made)
         return made
 
     def decide(self, p: Proposal, choice: str, session: Any = None) -> None:
-        self.record("proposal", session, subject=p.text[:200], choice=choice,
-                    detail={"kind": p.kind, "id": p.id}, project=p.project or None)
+        self.record(
+            "proposal",
+            session,
+            subject=p.text[:200],
+            choice=choice,
+            detail={"kind": p.kind, "id": p.id},
+            project=p.project or None,
+        )
 
     async def apply(self, p: Proposal, session: Any = None) -> str:
         """Run the handler of an accepted learned proposal; returns a human message."""
@@ -136,8 +151,9 @@ class LearningHub:
                 session.perms.reload()
             return msg
         if p.kind == "project_setup":
-            msg = await projectprep.apply(payload, self.server.model_caller,
-                                          session.session_id if session is not None else "")
+            msg = await projectprep.apply(
+                payload, self.server.model_caller, session.session_id if session is not None else ""
+            )
             if session is not None:
                 session.perms.reload()
             return msg
@@ -145,8 +161,9 @@ class LearningHub:
             return curator.apply(payload)
         if p.kind == "optimizer":
             if "task_tiers" in payload:
-                return self._apply_overlay({"title": p.text, "patch": {"task_tiers": payload["task_tiers"]},
-                                            "evidence": {}})
+                return self._apply_overlay(
+                    {"title": p.text, "patch": {"task_tiers": payload["task_tiers"]}, "evidence": {}}
+                )
             return self._apply_overlay(payload["overlay"])
         return "noted"
 
@@ -158,8 +175,10 @@ class LearningHub:
             return f"overlay not applied: {e}"
         if "patch" in overlay:
             self._reset_routers()
-        return (f"Experiment {exp['id']} started: active for {exp['target_sessions']} sessions, then compared "
-                f"(auto-rollback if worse). /optimizer status")
+        return (
+            f"Experiment {exp['id']} started: active for {exp['target_sessions']} sessions, then compared "
+            f"(auto-rollback if worse). /optimizer status"
+        )
 
     def _config_rolled_back(self, exp: dict[str, Any]) -> None:
         """rollback() restored the config file only: the live config kept the experiment's values until a restart."""
@@ -187,20 +206,35 @@ class LearningHub:
         root = Path(session.stored.cwd or ".")
         if not self.enabled or not projectprep.needs_prep(root) or session.background:
             return []
-        made = await projectprep.prepare(root, store=self.store, caller=self.server.model_caller,
-                                         preferences=self.preferences(), session_id=session.session_id,
-                                         clock=self.clock)
+        made = await projectprep.prepare(
+            root,
+            store=self.store,
+            caller=self.server.model_caller,
+            preferences=self.preferences(),
+            session_id=session.session_id,
+            clock=self.clock,
+        )
         self.emit(session, made)
         return made
 
     # ── turn end ──
 
     def metrics(self, since: float = 0.0, until: float | None = None) -> dict[str, Any]:
-        return optimizer.collect(self.server.usage.rows(since), self.log, self.server.autonomy.scope_log.read(),
-                                 since=since, until=until)
+        return optimizer.collect(
+            self.server.usage.rows(since), self.log, self.server.autonomy.scope_log.read(), since=since, until=until
+        )
 
-    def record_turn_replay(self, session: Any, messages: list[Any], status: str, tier: str, kind: str,
-                           turn_id: str, *, history_len: int = 0) -> None:
+    def record_turn_replay(
+        self,
+        session: Any,
+        messages: list[Any],
+        status: str,
+        tier: str,
+        kind: str,
+        turn_id: str,
+        *,
+        history_len: int = 0,
+    ) -> None:
         """Keep one finished turn's inputs and outcome for the replay harness. Never raises: it runs at turn end."""
         if not self.enabled:
             return
@@ -213,11 +247,19 @@ class LearningHub:
             tok_in, tok_out = self.server.usage.turn_tokens(turn_id) if turn_id else (0, 0)
             skill_text = skills_prompt(cwd, list(self.server.config.skills.roots), limit=PROMPT_LIMIT)
             record = replay.build_record(
-                turn=turn_id, session=session.session_id, kind=kind, tier=tier, status=status, messages=messages,
-                first=1 + history_len, tokens_in=tok_in, tokens_out=tok_out,
+                turn=turn_id,
+                session=session.session_id,
+                kind=kind,
+                tier=tier,
+                status=status,
+                messages=messages,
+                first=1 + history_len,
+                tokens_in=tok_in,
+                tokens_out=tok_out,
                 memory_chars=len(memory_prompt(cwd, limit=int(ctx.get("memory_chars", 20_000)))),
                 skill_lines=[len(line) for line in skill_text.splitlines() if line.startswith("- ")],
-                ts=self.clock())
+                ts=self.clock(),
+            )
             self.replays.append(record)
         except Exception:  # noqa: BLE001 - recording must never break a turn
             logger.warning("replay record failed", exc_info=True)
@@ -233,9 +275,15 @@ class LearningHub:
         if status == "done" and turns > minimum and turns > int(meta.get("reviewed_turns", 0)) + minimum - 1:
             meta["reviewed_turns"] = turns
             r = await review.review_session(
-                self.server.model_caller, msgs, store=self.store, cwd=Path(session.stored.cwd or "."),
-                config=self.server.config, min_turns=minimum, session_id=session.session_id,
-                project=project_id(session.stored.cwd or "."))
+                self.server.model_caller,
+                msgs,
+                store=self.store,
+                cwd=Path(session.stored.cwd or "."),
+                config=self.server.config,
+                min_turns=minimum,
+                session_id=session.session_id,
+                project=project_id(session.stored.cwd or "."),
+            )
             self.emit(session, r["proposals"])
         # Once per session and experiment (this ran on every turn), and never for background/cron/loop runs.
         counted = set(meta.get("experiments_counted") or [])
@@ -258,9 +306,15 @@ class LearningHub:
         if force or now - st.get("distilled", 0) > DAY:
             from k3code.memory import user_memory_path
 
-            prefs = await distiller.distill(self.log, home=self.home, user_md=user_memory_path(),
-                                            config=self.server.config, caller=self.server.model_caller,
-                                            proposals=self.store, session_id=session.session_id if session else "")
+            prefs = await distiller.distill(
+                self.log,
+                home=self.home,
+                user_md=user_memory_path(),
+                config=self.server.config,
+                caller=self.server.model_caller,
+                proposals=self.store,
+                session_id=session.session_id if session else "",
+            )
             done["preferences"] = len(prefs)
             r = curator.curate(self.store, now=now, stale_days=int(self.cfg["stale_days"]))
             done["curated"] = len(r["proposals"])
@@ -293,8 +347,9 @@ class LearningHub:
     def _already_in_effect(self, patch: dict[str, Any]) -> bool:
         if any(x["patch"] == patch for x in self.experiments.active() if x.get("kind") == "config"):
             return True
-        return merge_patch(dict(self.server.config.context or {}), patch.get("context", {})) == \
-            dict(self.server.config.context or {})
+        return merge_patch(dict(self.server.config.context or {}), patch.get("context", {})) == dict(
+            self.server.config.context or {}
+        )
 
     def _auto_apply(self, cand: dict[str, Any]) -> None:
         """Apply a gate-approved candidate as an experiment and log it; the A/B window judges and rolls it back."""
@@ -305,8 +360,15 @@ class LearningHub:
         except Exception as e:  # noqa: BLE001 - a rejected patch is logged as not applied, never half applied
             logger.warning("auto-apply refused for %r: %s", cand["title"], e)
             return
-        self.log.record("auto_apply", subject=cand["title"], choice="applied", actor="auto",
-                        detail={"experiment": exp["id"], "evidence": cand["evidence"]})
-        self._notify(f"Optimizer applied automatically (experiment {exp['id']}): {cand['title']}. Replay: tokens "
-                     f"-{cand['evidence']['token_reduction_pct']}%, pass drop at most "
-                     f"{cand['evidence']['pass_drop_points']} points. Rolled back automatically if worse.")
+        self.log.record(
+            "auto_apply",
+            subject=cand["title"],
+            choice="applied",
+            actor="auto",
+            detail={"experiment": exp["id"], "evidence": cand["evidence"]},
+        )
+        self._notify(
+            f"Optimizer applied automatically (experiment {exp['id']}): {cand['title']}. Replay: tokens "
+            f"-{cand['evidence']['token_reduction_pct']}%, pass drop at most "
+            f"{cand['evidence']['pass_drop_points']} points. Rolled back automatically if worse."
+        )

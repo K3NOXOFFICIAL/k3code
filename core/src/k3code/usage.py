@@ -104,7 +104,8 @@ class UsageDB:
         cur = self._db.execute(
             "SELECT ts, session, kind, provider, model, detail, tier, task_kind, turn, tokens_in, tokens_out,"
             " cost_usd FROM events WHERE ts >= ? ORDER BY ts",
-            (since,))
+            (since,),
+        )
         names = [c[0] for c in cur.description]
         return [dict(zip(names, r, strict=True)) for r in cur]
 
@@ -240,7 +241,11 @@ def format_stats(rows: list[dict[str, Any]], by: str) -> str:
         if tiers:
             out.append(f"    tiers: {tiers}")
         if g["tokens_by_kind"]:
-            out.append("    kinds: " + ", ".join(
-                f"{k} {v['calls']} calls ({v['tokens_in']}/{v['tokens_out']} tok)"
-                for k, v in sorted(g["tokens_by_kind"].items())))
+            out.append(
+                "    kinds: "
+                + ", ".join(
+                    f"{k} {v['calls']} calls ({v['tokens_in']}/{v['tokens_out']} tok)"
+                    for k, v in sorted(g["tokens_by_kind"].items())
+                )
+            )
     return "\n".join(out)
