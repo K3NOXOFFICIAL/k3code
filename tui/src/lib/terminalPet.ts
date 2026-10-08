@@ -17,6 +17,10 @@ export const PET_DONE_HOLD_MS = 3000
 /** Frame period. Never below the shared animation floor. */
 export const PET_TICK_MS = Math.max(MIN_ANIMATION_TICK_MS, 400)
 
+/** An idle pet blinks once every this many ms (one slow timer), for this long. */
+export const PET_IDLE_BLINK_EVERY_MS = 4500
+export const PET_IDLE_BLINK_MS = 180
+
 /** Art width in cells; every frame line is padded to this. */
 export const PET_ART_WIDTH = 9
 
