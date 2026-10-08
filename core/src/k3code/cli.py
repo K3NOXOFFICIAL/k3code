@@ -52,6 +52,18 @@ def _resolve_model_specs(config: Any) -> list[str | list[str]]:
     return resolved
 
 
+def _use_model_key(config: Any, key: str) -> str | None:
+    """Make ``key`` (``-m``, REPL ``/model``) the active model key; returns an error message for an unknown key.
+
+    A key ("cheap") used to go to the router as the literal model id, so the provider got model "cheap".
+    """
+    known = {m for p in config.providers for m in p.models} | {config.default_model}
+    if key not in known:
+        return f"unknown model key: {key} (known: {', '.join(sorted(known))})"
+    config.default_model = key
+    return None
+
+
 def _cooldown_path() -> Path:
     from k3code.config import _current_home
 
@@ -99,6 +111,8 @@ async def _run_headless(
     from k3code.router import CooldownStore, Router, build_chain
     from k3code.routing.tiers import router_options
 
+    if model and (err := _use_model_key(config, model)):
+        return {"error": "unknown_model", "message": err}
     system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
@@ -138,7 +152,7 @@ async def _run_headless(
     try:
         await reliability.start()
         async for _ in loop.run(
-            prompt, model=model, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume
+            prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume
         ):
             pass
         return {"text": final_text, "tools": tool_results}
@@ -178,12 +192,20 @@ async def _run_repl(
     from k3code.router import CooldownStore, Router, build_chain
     from k3code.routing.tiers import router_options
 
+    if model and (err := _use_model_key(config, model)):
+        print(f"[Error] {err}; using {config.default_model}")
+        model = None
     system_prompt = build_system_prompt(_load_system_prompt(), cwd=Path.cwd(), config=config)
 
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
     cooldowns = CooldownStore(path=_cooldown_path())
-    router = Router(chain, cooldowns=cooldowns, on_event=_print_event, **router_options(config))
+
+    def make_router() -> Router:
+        return Router(build_chain(providers, _resolve_model_specs(config)), cooldowns=cooldowns,
+                      on_event=_print_event, **router_options(config))
+
+    router = make_router()
 
     # M2: reliability bundle; one journal/session per REPL process.
     reliability = _build_reliability(config, session="repl")
@@ -228,8 +250,11 @@ async def _run_repl(
             print("Stop requested.")
             continue
         if user_input.startswith("/model "):
-            model = user_input[7:].strip()
-            print(f"Model set to: {model}")
+            if err := _use_model_key(config, user_input[7:].strip()):
+                print(f"[Error] {err}")
+            else:
+                loop.router = make_router()  # the chain resolves the key to each provider's model id
+                print(f"Model set to: {config.default_model}")
             continue
 
         print()  # spacing
@@ -245,7 +270,7 @@ async def _run_repl(
 
         try:
             async for _ in loop.run(
-                user_input, model=model, max_tokens=config.max_tokens, temperature=config.temperature
+                user_input, max_tokens=config.max_tokens, temperature=config.temperature
             ):
                 pass
             print()  # newline after streaming
@@ -360,6 +385,8 @@ def main(
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(_run_repl(model=model, permission_mode=permission_mode, config=config))
     else:
+        if model and (err := _use_model_key(config, model)):
+            raise click.ClickException(err)
         _launch_tui(model=model)
 
 
@@ -419,7 +446,7 @@ def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = 
     env.update(env_extra or {})
     env.setdefault("K3CODE_LOG_LEVEL", "INFO")
     if model:
-        env["K3CODE_MODEL"] = model
+        env["K3CODE_DEFAULT_MODEL"] = model  # load_config maps it to default_model in the spawned gateway
     logger.info("launching TUI: %s %s", node, entry)
     result = subprocess.run([node, str(entry)], env=env, check=False)
     sys.exit(result.returncode)

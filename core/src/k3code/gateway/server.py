@@ -124,9 +124,14 @@ class LiveSession:
         self.run_lock = asyncio.Lock()
         #: Prompts submitted while a turn was running; each runs as its own turn when the current one ends.
         self.pending_prompts: list[str] = []
+        #: session.steer messages for the running turn: the live AgentLoop takes them before its next model call;
+        #: what no loop took (a job ran, or the loop had already answered) runs as the next prompt.
+        self.steer_queue: list[str] = []
+        #: tool call ids of the model call in flight already announced with tool.start (see _announce_tool)
+        self.announced_tools: set[str] = set()
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
-        self.reasoning_effort: str | None = None
+        self.reasoning_effort: str | None = stored.meta.get("reasoning_effort")  # /effort
         self.todos: list[dict[str, Any]] = []
         self.todo_revision = 0
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
@@ -1182,9 +1187,16 @@ class GatewayServer:
         async with session.turn_lock:  # a second turn on this session waits instead of interleaving with the first
             result = await self._run_turn_locked(session, text)
             # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
-            while session.pending_prompts and result[0] != "interrupted":
-                result = await self._run_turn_locked(session, session.pending_prompts.pop(0))
+            while (pending := self._pending_prompts(session)) and result[0] != "interrupted":
+                result = await self._run_turn_locked(session, pending.pop(0))
             return result
+
+    @staticmethod
+    def _pending_prompts(session: LiveSession) -> list[str]:
+        """Queued prompts, steering messages no loop took first (they were typed earlier)."""
+        if session.steer_queue:
+            session.pending_prompts[:0] = _take_all(session.steer_queue)
+        return session.pending_prompts
 
     async def _run_turn_locked(self, session: LiveSession, text: str) -> tuple[str, str]:
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
@@ -1268,6 +1280,7 @@ class GatewayServer:
             max_tool_errors=max_tool_errors,
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
+        loop.take_steer = lambda: _take_all(session.steer_queue)
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
@@ -1523,18 +1536,18 @@ class GatewayServer:
             self.store.save(session.stored)
             session.emit("session.title", {"session_id": session.session_id, "title": title})
 
+    def _announce_tool(self, session: LiveSession, tc: ToolCall) -> None:
+        """tool.generating + tool.start and the usage row, once per call id."""
+        if tc.id in session.announced_tools:
+            return
+        session.announced_tools.add(tc.id)
+        session.emit("tool.generating", {"name": tc.name})
+        session.emit("tool.start", {"tool_id": tc.id, "name": tc.name, "args": tc.arguments})
+        self.usage.record("tool", session=session.session_id, detail=tc.name)
+
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
-            session.emit("tool.generating", {"name": event.tool_call.name})
-            session.emit(
-                "tool.start",
-                {
-                    "tool_id": event.tool_call.id,
-                    "name": event.tool_call.name,
-                    "args": event.tool_call.arguments,
-                },
-            )
-            self.usage.record("tool", session=session.session_id, detail=event.tool_call.name)
+            self._announce_tool(session, event.tool_call)
         elif event.type == "done" and event.message:
             msg = event.message
             if msg.role == "tool":
@@ -1564,6 +1577,10 @@ class GatewayServer:
                 )
                 if u:
                     session.emit("session.usage", {"usage": _usage_payload(u)})
+                # openai_compat and anthropic stream no tool_call events: their calls arrive on this message only
+                for tc in msg.tool_calls:
+                    self._announce_tool(session, tc)
+                session.announced_tools.clear()
 
     async def _approval_callback_for(self, session: LiveSession) -> Any:
         async def approve(tool_name: str, arguments: dict[str, Any], decision: Any = None) -> ApprovalResult:
@@ -1848,6 +1865,9 @@ class GatewayServer:
                 "message.complete", {"text": text, "usage": {}, "status": status, "error": None, "state": session.state}
             )
             session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+            # prompts typed while the job ran were queued: run them now, like _run_turn does after a turn
+            if status != "interrupted" and (pending := self._pending_prompts(session)):
+                await self._run_turn(session, pending.pop(0))
 
         session.turn_task = asyncio.get_running_loop().create_task(runner())
 
@@ -1941,6 +1961,7 @@ class GatewayServer:
         if session is None or session.turn_task is None or session.turn_task.done():
             return False
         session.pending_prompts.clear()  # /stop means stop: what was queued behind the turn does not run either
+        session.steer_queue.clear()
         session.loop.interrupt() if session.loop else None
         self.subagents.interrupt_session(session.session_id)
         self.learning.record("interrupt", session, subject=_running_tool(session), choice="stop")
@@ -1958,6 +1979,13 @@ class GatewayServer:
 
     def log(self, message: str) -> None:
         logger.info(message)
+
+
+def _take_all(queue: list[str]) -> list[str]:
+    """Empty ``queue`` in place and return what it held."""
+    taken = queue[:]
+    queue.clear()
+    return taken
 
 
 def _running_tool(session: Any) -> str:
@@ -2208,9 +2236,9 @@ async def _session_steer(server: GatewayServer, params: dict[str, Any]) -> dict[
     session = server.session
     if session is None or not session.streaming:
         return {"steered": False}
-    # M1: queue as a follow-up user message for the next turn.
-    session.stored.messages.append({"role": "user", "content": str(text)})
-    server.store.save(session.stored)
+    # The running loop adds it before its next model call. Appending to stored.messages lost it: the loop never saw
+    # it and the turn's persist overwrote the list.
+    session.steer_queue.append(str(text))
     return {"steered": True}
 
 
@@ -2268,8 +2296,10 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
         raise _InvalidParams("no active session")
     text = _require(params, "text")
     server.last_user_activity = time.time()
-    if session.streaming:
-        session.pending_prompts.append(str(text))  # really queued: it runs when the current turn ends
+    if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
+        # really queued: it runs when the current turn ends. The task check covers a turn that has not reached
+        # `streaming = True` yet (compaction, MCP start): a second task there overwrote turn_task, so /stop missed one.
+        session.pending_prompts.append(str(text))
         return {"turn_id": "", "status": "queued"}
     if params.get("background"):
         session.background = True

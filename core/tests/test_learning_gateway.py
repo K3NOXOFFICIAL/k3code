@@ -63,6 +63,7 @@ async def test_dismissed_rule_proposal_never_returns(tmp_path, monkeypatch):
 
 async def test_other_decisions_are_logged(tmp_path, monkeypatch):
     server, sid = await approve_in_new_session(tmp_path, monkeypatch, "echo x", choice="deny")
+    server.config.providers[0].models["fast-one"] = "f"  # /model only takes a configured key
     await call(server, "command.dispatch", {"name": "model", "arg": "fast-one too slow", "session_id": sid})
     await call(server, "command.dispatch", {"name": "scope", "arg": "small", "session_id": sid})
     await call(server, "command.dispatch", {"name": "config", "arg": "set max_turns 9", "session_id": sid})

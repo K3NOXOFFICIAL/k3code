@@ -318,3 +318,39 @@ async def test_turn_messages_track_the_turn_in_flight(temp_cwd):
         await task
     assert [m.role for m in loop.turn_messages] == ["system", "user"]
     assert loop.turn_messages[-1].content == "please do the thing"
+
+
+@pytest.mark.asyncio
+async def test_loop_guard_note_follows_the_tool_results(temp_cwd):
+    """The corrective note must not sit between an assistant tool_calls message and its tool results
+    (OpenAI-compatible providers reject that with a 400)."""
+    from k3code.reliability import Reliability
+
+    seen: list[list[Message]] = []
+
+    class Recording(FakeProvider):
+        async def stream(self, messages, tools, model, **kw):
+            seen.append(list(messages))
+            async for event in super().stream(messages, tools, model, **kw):
+                yield event
+
+    def call(i: int) -> list[StreamEvent]:
+        tc = ToolCall(id=f"c{i}", name="read", arguments={"path": str(temp_cwd / "x")})
+        return [make_done_event(Message(role="assistant", content=None, tool_calls=[tc]))]
+
+    done = [make_done_event(Message(role="assistant", content="ok", tool_calls=[]))]
+    provider = Recording([call(1), call(2), call(3), done])
+    router = Router(build_chain([provider], [["fake-model"]]), max_retries=0)
+    loop = AgentLoop(
+        router, system_prompt="t", max_turns=10, permission_mode="yolo", cwd=temp_cwd,
+        reliability=Reliability.from_settings(None, session="s"),
+    )
+    async for _event in loop.run("go"):
+        pass
+    last = seen[-1]
+    notes = [i for i, m in enumerate(last) if m.role == "system" and i > 0]
+    assert notes, "the loop guard should have noted the repeated call"
+    for i, m in enumerate(last):
+        if m.role == "assistant" and m.tool_calls:
+            assert [x.role for x in last[i + 1 : i + 1 + len(m.tool_calls)]] == ["tool"] * len(m.tool_calls)
+    assert last[notes[0] - 1].role == "tool"

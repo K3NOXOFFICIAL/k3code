@@ -24,17 +24,28 @@ class _ModelCommand(CommandDef):
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         if arg.split()[:1] == ["chain"]:
             return self._chain(ctx, session_id, arg.split()[1:])
+        live = ctx.sessions.get(session_id) if session_id else None
         if not arg:
-            return {"type": "message", "message": f"Current model key: {ctx.config.default_model}"}
+            current = (live.stored.model if live is not None else "") or ctx.config.default_model
+            return {"type": "message", "message": f"Current model key: {current}"}
         key, _, reason = arg.partition(" ")
-        old = ctx.config.default_model
+        # like config.set model: a known key, set on the session (the next turn routes on stored.model); it used to
+        # change only config.default_model, which a session with its own model never reads, and took any typo
+        known = {m for p in ctx.config.providers for m in p.models} | {ctx.config.default_model}
+        if key not in known:
+            return {"type": "message", "message": f"Unknown model key: {key} (known: {', '.join(sorted(known))})"}
+        old = (live.stored.model if live is not None else "") or ctx.config.default_model
         if hasattr(ctx, "learning") and key != old:
-            live = ctx.sessions.get(session_id) if session_id else None
             kind = getattr(live, "current_kind", "") if live is not None else ""
             ctx.learning.record("model_switch", live, subject=f"{old} -> {key}", choice=key,
                                 detail={"from": old, "to": key, "reason": reason.strip(), "task_kind": kind or ""})
-        ctx.config.default_model = key if reason else arg
-        return {"type": "message", "message": f"Model key set to: {arg}"}
+        if live is None:
+            ctx.config.default_model = key
+        else:
+            live.stored.model = key
+            ctx.store.save(live.stored)
+            live.emit("session.info", live.live_info())
+        return {"type": "message", "message": f"Model key set to: {key}"}
 
 
     def _chain(self, ctx: Any, session_id: str | None, args: list[str]) -> dict[str, Any]:
@@ -61,10 +72,20 @@ class _EffortCommand(CommandDef):
         super().__init__(name="effort", help="Show or set reasoning effort: /effort [low|medium|high]")
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+        live = ctx.sessions.get(session_id) if session_id else None
         if not arg:
-            return {"type": "message", "message": "Usage: /effort [low|medium|high]"}
+            current = getattr(live, "reasoning_effort", None) or "default"
+            return {"type": "message", "message": f"Reasoning effort: {current}. Usage: /effort [low|medium|high]"}
         if arg not in ("low", "medium", "high"):
             return {"type": "message", "message": f"Unknown effort: {arg} (low|medium|high)"}
+        if live is None:
+            return {"type": "message", "message": "No active session."}
+        # Stored on the session and shown in session.info. No provider takes a reasoning-effort parameter yet, so
+        # it does not change the requests (it used to be acknowledged and dropped).
+        live.reasoning_effort = arg
+        live.stored.meta["reasoning_effort"] = arg
+        ctx.store.save(live.stored)
+        live.emit("session.info", live.live_info())
         return {"type": "message", "message": f"Reasoning effort set to: {arg}"}
 
 
@@ -76,6 +97,8 @@ class _ClearCommand(CommandDef):
         live = ctx.sessions.get(session_id) if session_id else None
         if live is None:
             return {"type": "message", "message": "No active session to clear."}
+        if getattr(live, "streaming", False):  # the running turn's persist would put the transcript right back
+            return {"type": "message", "message": "A turn is running in this session; /stop it first."}
         live.messages = []
         from k3code.gateway.sessions import StoredSession
 
@@ -94,6 +117,8 @@ class _CompactCommand(CommandDef):
         live = ctx.sessions.get(session_id) if session_id else None
         if live is None:
             return {"type": "message", "message": "No active session."}
+        if getattr(live, "streaming", False):  # the running turn's persist would overwrite the summary
+            return {"type": "message", "message": "A turn is running in this session; /compact when it ends."}
         before = len(live.messages)
         try:
             messages, folded = await compact_messages(
