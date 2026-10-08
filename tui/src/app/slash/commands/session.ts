@@ -216,35 +216,6 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: "switch personality for this session",
-    name: "personality",
-    run: (arg, ctx) => {
-      if (!arg) {
-        return;
-      }
-
-      ctx.gateway
-        .rpc<ConfigSetResponse>("config.set", {
-          key: "personality",
-          session_id: ctx.sid,
-          value: arg,
-        })
-        .then(
-          ctx.guarded<ConfigSetResponse>((r) => {
-            if (r.history_reset) {
-              ctx.session.resetVisibleHistory(r.info ?? null);
-            }
-
-            ctx.transcript.sys(
-              `personality: ${r.value || "default"}${r.history_reset ? " · transcript cleared" : ""}`,
-            );
-            ctx.local.maybeWarn(r);
-          }),
-        );
-    },
-  },
-
-  {
     help: "pin light/dark mode or trust auto-detection (usage: /theme [auto|light|dark])",
     name: "theme",
     usage: "/theme [auto|light|dark]",
@@ -282,30 +253,6 @@ export const sessionCommands: SlashCommand[] = [
           }),
         )
         .catch(ctx.guardedErr);
-    },
-  },
-
-  {
-    help: "switch theme skin (fires skin.changed)",
-    name: "skin",
-    run: (arg, ctx) => {
-      if (!arg) {
-        return ctx.gateway
-          .rpc<ConfigGetValueResponse>("config.get", { key: "skin" })
-          .then(
-            ctx.guarded<ConfigGetValueResponse>((r) =>
-              ctx.transcript.sys(`skin: ${r.value || "default"}`),
-            ),
-          );
-      }
-
-      ctx.gateway
-        .rpc<ConfigSetResponse>("config.set", { key: "skin", value: arg })
-        .then(
-          ctx.guarded<ConfigSetResponse>(
-            (r) => r.value && ctx.transcript.sys(`skin → ${r.value}`),
-          ),
-        );
     },
   },
 
@@ -474,69 +421,6 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: "toggle fast mode [normal|fast|status|on|off|toggle]",
-    name: "fast",
-    run: (arg, ctx) => {
-      const mode = arg.trim().toLowerCase();
-      const valid = new Set([
-        "",
-        "status",
-        "normal",
-        "fast",
-        "on",
-        "off",
-        "toggle",
-      ]);
-
-      if (!valid.has(mode)) {
-        return ctx.transcript.sys(
-          "usage: /fast [normal|fast|status|on|off|toggle]",
-        );
-      }
-
-      if (!mode || mode === "status") {
-        return ctx.gateway
-          .rpc<ConfigGetValueResponse>("config.get", {
-            key: "fast",
-            session_id: ctx.sid,
-          })
-          .then(
-            ctx.guarded<ConfigGetValueResponse>((r) =>
-              ctx.transcript.sys(
-                `fast mode: ${r.value === "fast" ? "fast" : "normal"}`,
-              ),
-            ),
-          )
-          .catch(ctx.guardedErr);
-      }
-
-      ctx.gateway
-        .rpc<ConfigSetResponse>("config.set", {
-          key: "fast",
-          session_id: ctx.sid,
-          value: mode,
-        })
-        .then(
-          ctx.guarded<ConfigSetResponse>((r) => {
-            const next = r.value === "fast" ? "fast" : "normal";
-            ctx.transcript.sys(`fast mode: ${next}`);
-            patchUiState((state) => ({
-              ...state,
-              info: state.info
-                ? {
-                    ...state.info,
-                    fast: next === "fast",
-                    service_tier: next === "fast" ? "priority" : "",
-                  }
-                : state.info,
-            }));
-          }),
-        )
-        .catch(ctx.guardedErr);
-    },
-  },
-
-  {
     help: "control busy enter mode [queue|steer|interrupt|status]",
     name: "busy",
     run: (arg, ctx) => {
@@ -570,24 +454,6 @@ export const sessionCommands: SlashCommand[] = [
           }),
         )
         .catch(ctx.guardedErr);
-    },
-  },
-
-  {
-    help: "cycle verbose tool-output mode (updates live agent)",
-    name: "verbose",
-    run: (arg, ctx) => {
-      ctx.gateway
-        .rpc<ConfigSetResponse>("config.set", {
-          key: "verbose",
-          session_id: ctx.sid,
-          value: arg || "cycle",
-        })
-        .then(
-          ctx.guarded<ConfigSetResponse>(
-            (r) => r.value && ctx.transcript.sys(`verbose: ${r.value}`),
-          ),
-        );
     },
   },
 

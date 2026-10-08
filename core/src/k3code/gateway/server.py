@@ -2715,10 +2715,20 @@ async def _subagent_interrupt(server: GatewayServer, params: dict[str, Any]) -> 
     return {"found": server.subagents.interrupt(hid), "subagent_id": hid}
 
 
+TAIL_LINES = 30
+
+
 async def _subagent_tail(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     h = server.subagents.handles.get(str(_require(params, "subagent_id")))
-    text = "\n".join(h.tail[-30:]) + (("\n" + h.result) if h and h.done else "") if h else ""
-    return {"text": text, "status": h.status if h else "unknown", "done": bool(h and h.done)}
+    text = "\n".join(h.tail[-TAIL_LINES:]) + (("\n" + h.result) if h and h.done else "") if h else ""
+    return {
+        # the TUI's live view shows "unavailable" unless this is true: a known child always has a transcript to show
+        "available": h is not None,
+        "truncated": bool(h and len(h.tail) > TAIL_LINES),
+        "text": text,
+        "status": h.status if h else "unknown",
+        "done": bool(h and h.done),
+    }
 
 
 async def _clipboard_paste(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -2807,6 +2817,8 @@ async def _config_get(server: GatewayServer, params: dict[str, Any]) -> dict[str
     key = str(_require(params, "key"))
     if key == "mtime":
         return {"mtime": 0.0}
+    if key == "focus_view":  # the TUI reads display.focus_mode (setup: "Focus mode on by default?") under this name
+        return {"value": "1" if server.config.display.focus_mode else "0"}
     if tui_display.handles(key):
         return tui_display.get(server.config.display, key)
     # Every key is looked up in the redacted JSON dump: provider api_key, mcp server env/headers never go to clients,
@@ -3108,14 +3120,69 @@ async def _skills_reload(server: GatewayServer, params: dict[str, Any]) -> dict[
     return {"output": str(res.get("message") or res.get("output") or "")}
 
 
+#: How /help groups the gateway's commands. A command missing here still shows up, under "Other".
+HELP_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "Session",
+        ("clear", "compact", "rename", "resume", "fork", "branch", "export", "import", "add-dir", "stop", "bg", "exit"),
+    ),
+    (
+        "Model and settings",
+        ("model", "effort", "settings", "config", "output-style", "permissions", "update-config", "focus"),
+    ),
+    (
+        "Autonomy",
+        ("goal", "loop", "schedule", "automations", "go", "scope", "proposals", "advisor", "preview", "review"),
+    ),
+    ("Orchestration", ("ultraplan", "ultracode", "ultraresearch", "artifacts")),
+    ("Knowledge", ("memory", "skills", "mcp", "learn", "optimizer", "self-improve")),
+    ("System", ("help", "doctor", "update", "stats", "debug", "daemon")),
+)
+
+
+async def _commands_catalog(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """The command list the TUI's /help shows and its slash completion resolves aliases against.
+
+    Without it ``/help`` listed only the TUI's own commands, and `/goal`, `/loop`, `/review`, ... were
+    undiscoverable."""
+    from k3code import skills as skills_mod
+    from k3code.commands._util import session_cwd
+
+    registry = server.commands
+    defs = {name: registry.get(name) for name in registry.names()}
+    pair = {name: [f"/{name}", (cmd.help.splitlines()[0] if cmd and cmd.help else "")] for name, cmd in defs.items()}
+    canon: dict[str, str] = {}
+    for name, cmd in defs.items():
+        canon[f"/{name}"] = f"/{name}"
+        for alias in cmd.aliases if cmd else []:
+            canon[f"/{alias}"] = f"/{name}"
+    grouped: set[str] = set()
+    categories: list[dict[str, Any]] = []
+    for title, names in HELP_GROUPS:
+        rows = [pair[n] for n in names if n in pair]
+        grouped.update(n for n in names if n in pair)
+        if rows:
+            categories.append({"name": title, "pairs": rows})
+    if rest := [pair[n] for n in pair if n not in grouped]:
+        categories.append({"name": "Other", "pairs": rest})
+    skills = skills_mod.discover(session_cwd(server, params.get("session_id")), list(server.config.skills.roots))
+    return {
+        "pairs": list(pair.values()),
+        "canon": canon,
+        "categories": categories,
+        "skill_count": len(skills),
+        "sub": {},
+    }
+
+
 async def _delegation_status(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    from k3code.autonomy import autonomy_cfg
     from k3code.subagents.runner import MAX_DEPTH
 
-    fanout = getattr(getattr(server.config, "autonomy", None), "fanout", None)
     return {
         "paused": server.subagents.paused,
         "max_spawn_depth": MAX_DEPTH,
-        "max_concurrent_children": int(getattr(fanout, "max_parallel", 0) or 0),
+        "max_concurrent_children": int(autonomy_cfg(server.config)["fanout"]["max_parallel"]),
     }
 
 
@@ -3180,6 +3247,7 @@ _HANDLERS: dict[str, Any] = {
     "setup.status": _setup_status,
     "system.battery": _system_battery,
     "browser.manage": _browser_manage,
+    "commands.catalog": _commands_catalog,
     "shell.exec": _shell_exec,
     "session.undo": _session_undo,
     "session.usage": _session_usage,

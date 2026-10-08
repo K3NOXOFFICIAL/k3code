@@ -580,7 +580,6 @@ describe("createSlashHandler", () => {
     ],
     ["/reload-mcp", "reload.mcp", { session_id: null }],
     ["/reload", "reload.env", {}],
-    ["/fast status", "config.get", { key: "fast", session_id: null }],
     ["/busy status", "config.get", { key: "busy" }],
     ["/indicator", "config.get", { key: "indicator" }],
   ])(
@@ -1072,6 +1071,10 @@ describe("createSlashHandler", () => {
       "/tools disable x",
       "/btw hi",
       "/compress",
+      "/fast on",
+      "/skin ares",
+      "/personality pirate",
+      "/verbose",
     ]) {
       createSlashHandler(ctx)(cmd);
     }
@@ -1083,6 +1086,16 @@ describe("createSlashHandler", () => {
       "session.compress",
     ]) {
       expect(rpc).not.toHaveBeenCalledWith(method, expect.anything());
+    }
+
+    // the config-key commands too: the gateway answers "unsupported config key" for each of these
+    for (const key of ["fast", "skin", "personality", "verbose"]) {
+      for (const method of ["config.get", "config.set"]) {
+        expect(rpc).not.toHaveBeenCalledWith(
+          method,
+          expect.objectContaining({ key }),
+        );
+      }
     }
   });
 

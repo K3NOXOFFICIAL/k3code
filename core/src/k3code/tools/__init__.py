@@ -270,6 +270,39 @@ async def tool_bash(
             await asyncio.shield(_kill_group(proc))
 
 
+def format_tool_result(result: dict[str, Any]) -> Any:
+    """What the model, the journal and the TUI see of one tool result.
+
+    ``bash``, ``grep`` and ``glob`` carry free text; they used to be sent as the Python repr of their dict, which
+    escapes every newline, quote and backslash: ``{'stdout': 'a\\nb\\n', 'stderr': '', 'exit_code': 0}``. The TUI
+    showed that as one unreadable line, and a model that copied a line it had read that way into an ``edit`` copied
+    the escapes too. They are plain text now (stdout as is; stderr, an error note and a non-zero exit code only when
+    there is something to say). Every other result is unchanged: ``read``'s ``content``, small ok/error dicts.
+    """
+    if "content" in result:
+        return result["content"]
+    if "stdout" in result or "stderr" in result:  # bash
+        out = str(result.get("stdout") or "").rstrip("\n")
+        err = str(result.get("stderr") or "").rstrip("\n")
+        code = result.get("exit_code")
+        parts = [out] if out else []
+        if err:
+            parts.append(f"[stderr]\n{err}")
+        if result.get("error"):  # timeout, output limit
+            parts.append(f"[{result['error']}]")
+        if code not in (0, None):
+            parts.append(f"[exit code {code}]")
+        return "\n".join(parts) if parts else "(no output)"
+    if "matches" in result:  # grep
+        text = str(result.get("matches") or "")
+        if result.get("warnings"):
+            text = f"{text}\n[{result['warnings']}]" if text else f"[{result['warnings']}]"
+        return text or "(no matches)"
+    if "files" in result and isinstance(result["files"], list):  # glob
+        return "\n".join(str(f) for f in result["files"]) or "(no files)"
+    return str(result)
+
+
 #: Per stream: bytes after which the command is killed.
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 #: What a command's output keeps (the first and the last bytes); the transcript stores exactly this.

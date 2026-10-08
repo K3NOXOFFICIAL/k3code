@@ -16,7 +16,7 @@ from k3code.providers.types import Message, StreamEvent, ToolCall
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
-from k3code.tools import MAX_TOOL_RESULT_CHARS, build_registry, clip_tool_results
+from k3code.tools import MAX_TOOL_RESULT_CHARS, build_registry, clip_tool_results, format_tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +192,7 @@ class AgentLoop:
                     result = self.reliability.interrupted_for(tc) or await self._execute_tool(tc)
                     tool_msg = Message(
                         role="tool",
-                        content=result.get("content") if "content" in result else str(result),
+                        content=format_tool_result(result),
                         tool_call_id=tc.id,
                         name=tc.name,
                     )
@@ -297,7 +297,7 @@ class AgentLoop:
                 result = await self._execute_tool(tc)
                 tool_msg = Message(
                     role="tool",
-                    content=result.get("content") if "content" in result else str(result),
+                    content=format_tool_result(result),
                     tool_call_id=tc.id,
                     name=tc.name,
                 )

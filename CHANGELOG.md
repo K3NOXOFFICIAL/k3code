@@ -2,6 +2,25 @@
 
 All notable changes are listed here. Until version 1.0, any release may change the config format, the commands or the on-disk state. Versions follow [semantic versioning](https://semver.org/) from 1.0 on.
 
+## Unreleased
+
+### Changed
+
+- **Look.** The default theme is hot pink (deep pink, hot pink, violet-red rules, plum fills; darker raspberry on a light terminal). Errors, success, warnings and shell mode keep their own colours. Turns are separated by a full-width rule, the status line is one continuous rule between the conversation and the input, and the agent list has a labelled header (`agents (N) · ↓ to select`).
+- **Agents.** ↓ from an empty prompt moves into the agent list; Enter on a sub-agent opens its live view, Esc goes back. Finished agents leave the list after a minute.
+- **Tool output.** `bash`, `grep` and `glob` results reach the model and the screen as plain text (stdout as it is; stderr, an error note and a non-zero exit code only when there is something to say), not as the Python repr of a dict with every newline and quote escaped.
+- **`/help`** lists the gateway's commands by category (it showed only the TUI's own commands).
+- **Logging.** `k3code -p` prints only warnings by default, ends the answer with a newline and says why on stderr when a run fails. `K3CODE_LOG_LEVEL=info` brings the log back.
+- **Setup.** Fast setup over an existing config puts the new provider first and keeps the others as fallbacks. `k3code doctor` reports a provider without a key as a warning while another provider can still answer.
+
+### Fixed
+
+- The TUI called 29 gateway methods that did not exist, and each printed "the terminal UI and the k3code backend are out of sync": window resize, `!cmd` shell mode (and `{!cmd}` inside a prompt), `/undo` and `/retry`, `/usage`, `/status`, `/save`, `/reload`, `/reload-mcp`, `/reload-skills`, pausing and steering sub-agents, and the command catalog. They exist now. `/rollback`, `/journey`, `/plugins`, `/tools`, `/btw`, `/skin`, `/personality`, `/fast`, `/verbose` and `/replay list|load` had no backend and are removed.
+- Sub-agents: finished ones showed as working, elapsed times of about 56 years, and the live view said "unavailable" for every agent.
+- A loop tick could start while a user turn was still preparing, and a prompt typed behind a tick ran unattended on the cheap tier.
+- Reading key files, `.env`, `~/.config/k3code` and `/proc/*/environ` is refused in every mode, and "always allow" no longer saves a command's inline `VAR=secret` in the rule.
+- The setup answer "focus mode on by default" is applied.
+
 ## [0.1.0] - 2026-10-08 (alpha, not tagged)
 
 The first version meant for people other than its author. It is alpha: the core works and is tested, but live-model behaviour, long unattended runs and multi-day use are not yet verified. The [Status section of the README](README.md#status) has the details.

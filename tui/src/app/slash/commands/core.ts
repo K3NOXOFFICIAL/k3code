@@ -131,14 +131,6 @@ export const coreCommands: SlashCommand[] = [
               "override one section (thinking/tools/subagents/activity)",
             ],
             ["/fortune [random|daily]", "show a random or daily local fortune"],
-            [
-              "/grid-test [cols]x[rows]",
-              "open the interactive widget-grid demo",
-            ],
-            [
-              "/dialog-test [zone]",
-              "open a sample dialog overlay with a faked backdrop",
-            ],
           ],
           title: "TUI",
         },

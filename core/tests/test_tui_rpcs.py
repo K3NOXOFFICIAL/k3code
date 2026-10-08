@@ -105,6 +105,53 @@ async def test_pausing_stops_new_sub_agents_and_steering_needs_a_running_one(tmp
     assert steer["status"] == "not_queued"
 
 
+async def test_the_live_tail_and_the_caps_have_the_shape_the_tui_reads(tmp_path, monkeypatch):
+    """The TUI's live view needs ``available: true`` (it said "unavailable" for every child, running or not), and
+    the spawn-tree header shows the real concurrency cap (it showed ``d2/0``)."""
+    from test_subagents import final, task_call
+
+    steps = [
+        task_call("CHILD-A find the answer"),
+        final("parent done"),
+        {"type": "text", "match": "[agent:worker]", "text": "the answer is 42"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    await start(server, tmp_path)
+    await run_turn(server, "PARENT: delegate it")
+    (row,) = (await call(server, "subagent.list", {"session_id": server.session.session_id}))["subagents"]
+    tail = await call(server, "subagent.tail", {"subagent_id": row["subagent_id"]})
+    assert tail["available"] is True and tail["done"] is True and "the answer is 42" in tail["text"]
+    assert tail["truncated"] is False
+    assert (await call(server, "subagent.tail", {"subagent_id": "nope"}))["available"] is False
+    caps = await call(server, "delegation.status", {})
+    assert caps["max_concurrent_children"] == 3 and caps["max_spawn_depth"] == 2
+
+
+async def test_the_command_catalog_lists_the_gateways_commands_for_help_and_alias_resolution(tmp_path, monkeypatch):
+    """/help builds its list from this; without it only the TUI's own commands showed and /goal, /loop, /review...
+    could not be discovered."""
+    server = await _server(tmp_path, monkeypatch)
+    cat = await call(server, "commands.catalog", {})
+    names = {p[0] for p in cat["pairs"]}
+    for command in ("/goal", "/loop", "/schedule", "/review", "/model", "/compact", "/mcp", "/skills", "/doctor"):
+        assert command in names, command
+    assert all(p[1] for p in cat["pairs"] if p[0] in ("/goal", "/loop")), "every row carries its help text"
+    assert cat["canon"]["/compress"] == "/compact" and cat["canon"]["/m"] == "/model"
+    assert cat["canon"]["/goal"] == "/goal"
+    titles = [c["name"] for c in cat["categories"]]
+    assert titles[0] == "Session" and "Autonomy" in titles
+    listed = {p[0] for c in cat["categories"] for p in c["pairs"]}
+    assert listed == names, "every command is in exactly one category"
+    assert isinstance(cat["skill_count"], int)
+
+
+async def test_focus_mode_from_the_config_reaches_the_tui(tmp_path, monkeypatch):
+    server = await _server(tmp_path, monkeypatch)
+    assert (await call(server, "config.get", {"key": "focus_view"}))["value"] == "0"
+    server.config.display.focus_mode = True  # setup: "Focus mode on by default?" -> yes
+    assert (await call(server, "config.get", {"key": "focus_view"}))["value"] == "1"
+
+
 async def test_undo_refuses_while_a_turn_runs(tmp_path, monkeypatch):
     import asyncio
 
