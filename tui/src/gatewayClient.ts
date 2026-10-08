@@ -12,7 +12,6 @@ import {
   wireFrameText
 } from '@k3code/shared/json-rpc-channel'
 import { reconnectBackoffDelayMs } from '@k3code/shared/reconnect-backoff'
-import { WebSocket as UndiciWebSocket } from 'undici'
 
 import type { AnyGatewayEvent } from './gatewayTypes.js'
 import { CircularBuffer } from './lib/circularBuffer.js'
@@ -40,8 +39,28 @@ export const WS_HEARTBEAT_DEAD_MS = DEFAULT_HEARTBEAT_DEADLINE_MS
 export const RECONNECT_BASE_MS = 1_000
 export const RECONNECT_MAX_MS = 30_000
 
-const getWebSocketCtor = (): typeof WebSocket =>
-  typeof WebSocket === 'undefined' ? (UndiciWebSocket as unknown as typeof WebSocket) : WebSocket
+type WsCtor = typeof WebSocket
+
+// Node 22+ has a global WebSocket. Node 20 (still supported, see `k3code doctor`) does not, and
+// only there is the undici fallback imported. A static import would pay its module init (~70 ms)
+// on every start, so the fallback loads on demand and is cached.
+const globalWebSocketCtor = (): undefined | WsCtor => (typeof WebSocket === 'undefined' ? undefined : WebSocket)
+let undiciWebSocketCtor: undefined | WsCtor
+
+const loadUndiciWebSocketCtor = async (): Promise<undefined | WsCtor> => {
+  if (!undiciWebSocketCtor) {
+    try {
+      undiciWebSocketCtor = (await import('undici')).WebSocket as unknown as WsCtor
+    } catch {
+      return undefined
+    }
+  }
+
+  return undiciWebSocketCtor
+}
+
+// Synchronous: the global, or the undici fallback once it has been loaded.
+const getWebSocketCtor = (): undefined | WsCtor => globalWebSocketCtor() ?? undiciWebSocketCtor
 
 const truncateLine = (line: string) =>
   line.length > MAX_LOG_LINE_BYTES ? `${line.slice(0, MAX_LOG_LINE_BYTES)}… [truncated ${line.length} bytes]` : line
@@ -208,6 +227,8 @@ export class GatewayClient extends EventEmitter {
   private reconnectAttempts = 0
   // Set on kill() so we never auto-reconnect after an intentional shutdown.
   private disposed = false
+  // Bumped by every start(); an attach waiting on the undici import drops itself if it is stale.
+  private attachGeneration = 0
 
   constructor() {
     super()
@@ -568,10 +589,26 @@ export class GatewayClient extends EventEmitter {
   }
 
   private startAttachedGateway(attachUrl: string) {
-    const safeAttachUrl = redactUrl(attachUrl)
-    this.startReadyTimer('websocket', safeAttachUrl)
+    this.startReadyTimer('websocket', redactUrl(attachUrl))
 
-    const WebSocketCtor = getWebSocketCtor()
+    if (globalWebSocketCtor() || undiciWebSocketCtor) {
+      this.openAttachedSocket(getWebSocketCtor(), attachUrl)
+
+      return
+    }
+
+    // Node 20 without a loaded fallback: import it, then attach unless a newer start() or kill() won.
+    const generation = this.attachGeneration
+
+    void loadUndiciWebSocketCtor().then(ctor => {
+      if (generation === this.attachGeneration && !this.disposed) {
+        this.openAttachedSocket(ctor, attachUrl)
+      }
+    })
+  }
+
+  private openAttachedSocket(WebSocketCtor: undefined | WsCtor, attachUrl: string) {
+    const safeAttachUrl = redactUrl(attachUrl)
 
     if (typeof WebSocketCtor === 'undefined') {
       const line = `[startup] WebSocket API unavailable; cannot attach to ${safeAttachUrl}`
@@ -692,6 +729,7 @@ export class GatewayClient extends EventEmitter {
     }
 
     this.disposed = false
+    this.attachGeneration += 1
     this.clearReconnect()
 
     const root = process.env.K3CODE_PYTHON_SRC_ROOT ?? resolve(import.meta.dirname, '../../')

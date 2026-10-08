@@ -1,6 +1,23 @@
 import { describe, expect, it } from 'vitest'
 
-import { toBatteryInfo } from '../app/useBatteryPoll.js'
+import { sameBatteryInfo, toBatteryInfo } from '../app/useBatteryPoll.js'
+
+describe('sameBatteryInfo', () => {
+  const reading = { available: true, category: 'warn' as const, percent: 44, plugged: false }
+
+  it('matches a fresh object with the same fields, so an unchanged poll is not a new state', () => {
+    expect(sameBatteryInfo(reading, { ...reading })).toBe(true)
+    expect(sameBatteryInfo(null, null)).toBe(true)
+  })
+
+  it('sees a change in any field, and null against a reading', () => {
+    expect(sameBatteryInfo(reading, { ...reading, percent: 43 })).toBe(false)
+    expect(sameBatteryInfo(reading, { ...reading, plugged: true })).toBe(false)
+    expect(sameBatteryInfo(reading, { ...reading, category: 'critical' })).toBe(false)
+    expect(sameBatteryInfo(reading, null)).toBe(false)
+    expect(sameBatteryInfo(null, reading)).toBe(false)
+  })
+})
 
 describe('toBatteryInfo', () => {
   it('returns null for a null payload', () => {

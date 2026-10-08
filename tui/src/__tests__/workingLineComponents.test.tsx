@@ -8,7 +8,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { PET_NAMES, PETS } from '../content/pets.js'
 import { TerminalPet } from '../components/terminalPet.js'
 import { WorkingLine } from '../components/workingLine.js'
+import { PET_DONE_HOLD_MS, PET_TICK_MS } from '../lib/terminalPet.js'
+import { WORKING_TICK_MS } from '../lib/workingLine.js'
 import { DEFAULT_THEME } from '../theme.js'
+
+// React schedules its work on the real setImmediate. Capture it before fake timers replace it, so a
+// test can let a fake-timer tick reach the screen: advance the clock, then `await settle()`.
+const realSetImmediate = globalThis.setImmediate
+const settle = async () => {
+  for (let i = 0; i < 6; i++) {
+    await new Promise<void>(resolve => realSetImmediate(() => resolve()))
+  }
+}
 
 const mount = (element: React.ReactElement) => {
   const stdout = Object.assign(new PassThrough(), { columns: 120, rows: 10 })
@@ -22,6 +33,7 @@ const mount = (element: React.ReactElement) => {
 
   return {
     output: () => stripAnsi(frames.join('')),
+    rerender: (next: React.ReactElement) => view.rerender(next),
     unmount: () => {
       view.unmount()
       view.cleanup()
@@ -122,13 +134,82 @@ describe('animated timers', () => {
 
   it('the pet timer is cleared on unmount', () => {
     const before = vi.getTimerCount()
-    const view = mount(<TerminalPet busy={false} name="owl" needsInput={false} t={DEFAULT_THEME} />)
+    const view = mount(<TerminalPet busy name="owl" needsInput={false} t={DEFAULT_THEME} />)
 
     expect(vi.getTimerCount()).toBeGreaterThan(before)
 
     view.unmount()
 
     expect(vi.getTimerCount()).toBe(before)
+  })
+
+  it('an idle pet arms no timer and shows its still frame', () => {
+    const { delays, view } = mountWithIntervals(
+      <TerminalPet busy={false} name="owl" needsInput={false} t={DEFAULT_THEME} />
+    )
+
+    expect(delays.filter(delay => delay < 1000)).toEqual([])
+    expect(view.output()).toContain(PETS.owl.idle[0][1].trimEnd())
+
+    view.unmount()
+  })
+
+  it('a finished turn keeps the pet timer through done, then stops it once the hold has passed', async () => {
+    const before = vi.getTimerCount()
+    const view = mount(<TerminalPet busy name="owl" needsInput={false} t={DEFAULT_THEME} />)
+
+    expect(vi.getTimerCount()).toBeGreaterThan(before)
+
+    view.rerender(<TerminalPet busy={false} name="owl" needsInput={false} t={DEFAULT_THEME} />)
+    await settle()
+
+    expect(vi.getTimerCount()).toBeGreaterThan(before)
+
+    vi.advanceTimersByTime(PET_DONE_HOLD_MS + PET_TICK_MS)
+    await settle()
+
+    expect(vi.getTimerCount()).toBe(before)
+    expect(view.output()).toContain(PETS.owl.idle[0][1].trimEnd())
+
+    view.unmount()
+  })
+
+  it('a pet tick re-renders the pet, not the component that holds it', async () => {
+    let parentRenders = 0
+    const Parent = () => {
+      parentRenders += 1
+
+      return <TerminalPet busy name="owl" needsInput={false} t={DEFAULT_THEME} />
+    }
+    const view = mount(<Parent />)
+    const first = view.output()
+
+    vi.advanceTimersByTime(PET_TICK_MS * 3)
+    await settle()
+
+    expect(view.output()).not.toBe(first)
+    expect(parentRenders).toBe(1)
+
+    view.unmount()
+  })
+
+  it('a working-line tick re-renders the line, not the component that holds it', async () => {
+    let parentRenders = 0
+    const Parent = () => {
+      parentRenders += 1
+
+      return <WorkingLine busy startedAt={Date.now()} t={DEFAULT_THEME} />
+    }
+    const view = mount(<Parent />)
+    const first = view.output()
+
+    vi.advanceTimersByTime(WORKING_TICK_MS * 3)
+    await settle()
+
+    expect(view.output()).not.toBe(first)
+    expect(parentRenders).toBe(1)
+
+    view.unmount()
   })
 
   it('renders nothing for the working line while idle', () => {
