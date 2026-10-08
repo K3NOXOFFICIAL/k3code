@@ -82,6 +82,55 @@ describe("AgentStripView", () => {
     expect(dump([])).toBe("");
   });
 
+  it("heads the list with a rule naming it and how to enter it", () => {
+    const idle = dump([row(1), row(2)]);
+
+    expect(idle.split("\n")[0]).toMatch(/^── agents \(2\) · ↓ to select ─+$/);
+
+    const focused = dump([row(1), row(2)], { focused: true, index: 1 });
+
+    expect(focused.split("\n")[0]).toContain(
+      "agents (2) · ↑↓ move · ⏎ open · x stop · esc back",
+    );
+    expect(focused).not.toContain("⏎ attach");
+  });
+
+  it("drops finished sub-agents a minute after they end; running ones stay", () => {
+    const agent = (
+      status: SubagentProgress["status"],
+      startedAt: number,
+      durationSeconds?: number,
+    ): SubagentProgress => ({
+      depth: 0,
+      durationSeconds,
+      goal: "helper",
+      id: `a-${status}-${startedAt}`,
+      index: 0,
+      notes: [],
+      parentId: null,
+      startedAt,
+      status,
+      taskCount: 1,
+      thinking: [],
+      toolCount: 0,
+      tools: [],
+    });
+    const now = 1_000_000_000;
+    const rows = buildStripRows(
+      [
+        agent("running", now - 5 * 60_000),
+        agent("completed", now - 3 * 60_000, 30),
+        agent("completed", now - 40_000, 30),
+        agent("failed", now - 10 * 60_000, 5),
+      ],
+      [],
+      now,
+    );
+
+    expect(rows.map((r) => r.state)).toEqual(["working", "done"]);
+    expect(rows[0]?.elapsedSeconds).toBe(300);
+  });
+
   it("marks the selected row and the stop confirmation", () => {
     const rows = [row(1), row(2)];
     const out = dump(rows, {

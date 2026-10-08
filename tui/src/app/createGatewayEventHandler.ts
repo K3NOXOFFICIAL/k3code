@@ -27,7 +27,7 @@ import type {
   GatewaySkin,
   SessionMostRecentResponse,
 } from "../gatewayTypes.js";
-import { rpcErrorMessage } from "../lib/rpc.js";
+import { asRpcResult, rpcErrorMessage } from "../lib/rpc.js";
 import { topLevelSubagents } from "../lib/subagentTree.js";
 import {
   isPaintableHex,
@@ -506,6 +506,20 @@ export function createGatewayEventHandler(
   syncThemeToTerminalBackground();
 
   const { rpc } = ctx.gateway;
+  // Optional calls (command catalog, spawn-tree persistence, delegation caps): the backend may not offer them, and
+  // `rpc` prints every failure into the transcript ("out of sync") — on connect and after every turn that used a
+  // sub-agent. `rawRpc` rejects instead, so the caller's own catch decides; `quietRpc` just yields null.
+  const rawRpc = <T extends Record<string, any>>(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<null | T> =>
+    Promise.resolve()
+      .then(() => ctx.gateway.gw.request<T>(method, params))
+      .then((r) => asRpcResult<T>(r) ?? null);
+  const quietRpc = <T extends Record<string, any>>(
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<null | T> => rawRpc<T>(method, params).catch(() => null);
   const {
     STARTUP_RESUME_ID,
     newSession,
@@ -582,7 +596,7 @@ export function createGatewayEventHandler(
         ? top.join(" · ")
         : `${subagents.length} subagents`;
 
-      await rpc("spawn_tree.save", {
+      await quietRpc("spawn_tree.save", {
         finished_at: Date.now() / 1000,
         label: label.slice(0, 120),
         session_id: sessionId ?? "default",
@@ -679,7 +693,7 @@ export function createGatewayEventHandler(
     }
 
     lastDelegationFetchAt = now;
-    rpc<DelegationStatusResponse>("delegation.status", {})
+    quietRpc<DelegationStatusResponse>("delegation.status", {})
       .then((r) => applyDelegationStatus(r))
       .catch(() => {});
   };
@@ -780,7 +794,7 @@ export function createGatewayEventHandler(
     // uses the same workspace it seeds a new session with.
     const catalogSid = getUiState().sid;
 
-    rpc<CommandsCatalogResponse>(
+    rawRpc<CommandsCatalogResponse>(
       "commands.catalog",
       catalogSid ? { session_id: catalogSid } : {},
     )

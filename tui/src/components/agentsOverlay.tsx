@@ -826,6 +826,7 @@ function DiffView({
 
 export function AgentsOverlay({
   gw,
+  initialAgentId = null,
   initialHistoryIndex = 0,
   onClose,
   t,
@@ -931,6 +932,23 @@ export function AgentsOverlay({
       setFlash("turn finished · inspect freely · q to close");
     }
   }, [history.length, historyIndex, liveSubagents.length]);
+
+  // Opened from the agent strip (↓ then Enter on a sub-agent row): land on that agent's detail view, once.
+  const openedAgentRef = useRef(false);
+
+  useEffect(() => {
+    if (openedAgentRef.current || !initialAgentId) {
+      return;
+    }
+
+    const idx = rows.findIndex((r) => r.item.id === initialAgentId);
+
+    if (idx >= 0) {
+      openedAgentRef.current = true;
+      setCursor(idx);
+      setMode("detail");
+    }
+  }, [initialAgentId, rows]);
 
   useEffect(() => {
     // Reset detail scroll on navigation so the top of the new node shows.
@@ -1338,6 +1356,8 @@ export function AgentsOverlay({
 
 interface AgentsOverlayProps {
   gw: GatewayClient;
+  /** Open straight into this sub-agent's detail view (Enter on its agent-strip row). */
+  initialAgentId?: null | string;
   initialHistoryIndex?: number;
   onClose: () => void;
   t: Theme;

@@ -56,6 +56,26 @@ async def test_task_sync_returns_child_answer_and_emits_events(tmp_path, monkeyp
     assert h.tier == "main" and h.agent_type == "worker"
 
 
+async def test_subagent_list_reports_a_wall_clock_start(tmp_path, monkeypatch):
+    """started_at was time.monotonic() (seconds since boot); the TUI read it as a Unix time and showed every
+    sub-agent as running for ~56 years."""
+    import time
+
+    steps = [
+        task_call("CHILD-A find the answer"),
+        final("parent done"),
+        {"type": "text", "match": "[agent:worker]", "text": "the answer is 42"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    await start(server, tmp_path)
+    before = time.time()
+    await run_turn(server, "PARENT: delegate it")
+    res = await call(server, "subagent.list", {"session_id": server.session.session_id})
+    (row,) = res["subagents"]
+    assert before - 1 <= row["started_at"] <= time.time() + 1
+    assert row["status"] == "completed"
+
+
 async def test_task_child_uses_agent_type_tier_and_readonly_tools(tmp_path, monkeypatch):
     steps = [
         task_call("CHILD-E look around", agent_type="explorer"),

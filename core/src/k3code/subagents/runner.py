@@ -56,8 +56,11 @@ class Handle:
     last_tool: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
-    started_at: float = 0.0
+    started_at: float = 0.0  # time.monotonic(): durations only
     finished_at: float = 0.0
+    #: wall clock (Unix seconds) at start: what clients get as ``started_at``; the TUI turned the monotonic value
+    #: (seconds since boot) into a date in 1970 and showed every sub-agent as running for ~56 years
+    started_wall: float = 0.0
     model: str = ""
     cwd: str = ""
     worktree: wt_mod.Worktree | None = None
@@ -290,6 +293,7 @@ class SubagentManager:
 
         _ctx_session.set(parent)  # router/reliability events reach the parent's clients
         h.started_at = time.monotonic()
+        h.started_wall = time.time()
         h.status = "running"
         cwd = Path(parent.perms.cwd)
         try:

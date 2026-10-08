@@ -72,3 +72,22 @@ it("merges one row per actual child and does not notify unchanged snapshots", ()
   applyAgentSnapshot("next");
   expect($agentSnapshot.get().data.subagents).toEqual([]);
 });
+
+it("keeps a finished child's status from the snapshot instead of showing it as running", () => {
+  // the turn's own events are cleared at the next turn; only the snapshot still knows last turn's children
+  for (const status of ["completed", "failed", "interrupted"] as const) {
+    const [row] = mergeAgentRoster([], {
+      subagents: [{ subagent_id: "old", status, goal: "earlier helper" }],
+      delegations: [],
+    });
+
+    expect(row?.status).toBe(status);
+  }
+
+  const [unknown] = mergeAgentRoster([], {
+    subagents: [{ subagent_id: "x", status: "weird" }],
+    delegations: [],
+  });
+
+  expect(unknown?.status).toBe("running");
+});
