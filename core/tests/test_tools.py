@@ -137,6 +137,31 @@ async def test_grep_finds(temp_dir):
     assert "foo" in result["matches"]
 
 
+def test_bash_does_not_read_the_gateways_stdin(temp_dir):
+    # In stdio mode the gateway's stdin is the TUI's JSON-RPC stream: a command must never consume it.
+    import subprocess
+    import sys
+
+    script = (
+        "import asyncio, pathlib, sys\n"
+        "from k3code.tools import tool_bash\n"
+        "r = asyncio.run(tool_bash({'command': 'head -c 40'}, cwd=pathlib.Path(sys.argv[1])))\n"
+        "print(repr(r['stdout']))\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", script, str(temp_dir)], input='{"jsonrpc":"2.0","method":"x"}\n',
+        capture_output=True, text=True, timeout=30, check=True,
+    )
+    assert out.stdout.strip() == "''"
+
+
+async def test_grep_pattern_starting_with_a_dash(temp_dir):
+    (temp_dir / "a.txt").write_text("x\n--force here\n")
+    result = await tool_grep({"pattern": "--force", "path": "."}, cwd=temp_dir)
+    assert "--force here" in result["matches"]
+    assert "error" not in result
+
+
 async def test_grep_no_matches(temp_dir):
     (temp_dir / "a.py").write_text("x = 1\n")
     result = await tool_grep({"pattern": "def foo", "path": "."}, cwd=temp_dir)

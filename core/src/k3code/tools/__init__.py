@@ -175,6 +175,7 @@ async def tool_bash(
                 "-c",
                 cmd,
                 cwd=workdir,
+                stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -183,6 +184,7 @@ async def tool_bash(
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 cwd=workdir,
+                stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -335,9 +337,10 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         if exclude:
             for exc in (exclude if isinstance(exclude, list) else [exclude]):
                 cmd += ["-g", f"!{exc}"]
-        cmd += [pattern, str(path)]
+        cmd += ["-e", pattern, "--", str(path)]  # -e: a pattern starting with "-" is not taken for a flag
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
