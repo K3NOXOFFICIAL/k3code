@@ -15,7 +15,7 @@ uv run ruff check src tests
 # TUI: Node 22+
 cd tui && npm ci
 npm run build:ink && npm run build
-npx vitest run                    # one upstream test is known to fail locally; CI excludes it
+npx vitest run                    # tui/.ci-test-excludes is empty, so CI runs every test
 
 # panes (the k3 multi-window terminal): Go, only the packages we depend on
 cd panes && go build ./cmd/k3
@@ -26,7 +26,7 @@ Do not run `go test ./...` in `panes/`. Its upstream remote-sync tests recurse w
 
 License bookkeeping is checked with `python3 scripts/vendor_check.py`.
 
-CI runs the core, TUI, panes and vendor checks on every pull request (`.github/workflows/ci.yml`). A secret scan runs too (`.github/workflows/gitleaks.yml`). The CI core job also lints `../scripts`, where some older scripts still have lint errors; `ruff check src tests` is the check to keep green for core changes.
+CI runs the core, TUI, panes and vendor checks on every pull request (`.github/workflows/ci.yml`). A secret scan runs too (`.github/workflows/gitleaks.yml`). The CI core job runs `uv run ruff check .` and `uv run pytest -q` in `core/`, so `core/scripts` is linted too.
 
 ## Before you open a pull request
 

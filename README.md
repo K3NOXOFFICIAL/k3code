@@ -4,8 +4,8 @@
 
 k3code plans before it acts, can run several agents in parallel, retries through dropped connections and provider outages, and sends cheap background work to cheaper models. It has a Python core, a terminal UI (TypeScript, Ink) and an optional multi-window terminal (`k3`, a fork of TUIOS). It works with OpenAI-compatible and Anthropic providers, and with a local Claude Code login.
 
-> **Status: alpha, version 0.1.0 (unreleased).** The core is built and its test suite passes, and most exit criteria have scripted evidence. Live-model behaviour, the 72-hour daemon soak and multi-day use are not verified yet. Read [Safety](#safety) before you add a provider key or let it run unattended, and [Status](#status) for what has been tested.
-> The repository is private for now. Install from the `m0-scaffold` branch (see [Install](#install)). There is no tagged release yet.
+> **Status: alpha, version 0.0.1 (unreleased).** The core is built and its test suite passes, and most exit criteria have scripted evidence. Live-model behaviour, the 72-hour daemon soak and multi-day use are not verified yet. Read [Safety](#safety) before you add a provider key or let it run unattended, and [Status](#status) for what has been tested.
+> The repository is private for now. Install with the command in [Install](#install): it uses the latest `v*` tag, or `Main` until a tag exists. There is no tagged release yet.
 
 ---
 
@@ -45,10 +45,10 @@ k3code plans before it acts, can run several agents in parallel, retries through
 
 ### Requirements
 
-- Linux, x86_64. Tested in containers on Fedora 44, Debian 13, Ubuntu 24.04, Arch and openSUSE Leap 16. aarch64 and macOS are untested.
-- `git`, `curl` or `wget`, `tar` (with `xz` and `gzip` support), and a POSIX shell. Network access is needed during install.
-- The installer fetches the rest into your home directory, with no root: [`uv`](https://docs.astral.sh/uv/) (it manages Python ≥ 3.12; it asks before installing `uv` unless you pass `--yes`), Node ≥ 22 for the TUI, and Go for the `k3` multi-window binary (an existing `go` on your `PATH` is used as is).
-- Optional: `bubblewrap` (`bwrap`) to sandbox unattended runs, `systemd --user` for the 24/7 service.
+- Linux on x86_64 is the tested platform: a clean install was tested in a Fedora 44 container. The installer also accepts macOS and aarch64 (arm64); those are untested.
+- `git` (for the default `--from-git` install), `curl` or `wget`, and a POSIX shell. Network access is needed during install.
+- [`uv`](https://docs.astral.sh/uv/) is required and manages Python ≥ 3.12. If `uv` is missing, the installer asks before installing it into your home directory (`--yes` answers yes). The installer needs no root.
+- Optional: `bubblewrap` (`bwrap`) to sandbox unattended runs, `systemd --user` for the 24/7 service, Node 18+ with npm (builds the TUI; without it k3code uses the line REPL), and Go (builds the `k3` binary). The installer never installs Node or Go.
 
 ### Install
 
@@ -61,7 +61,7 @@ sh install/install.sh          # the latest v* tag, or Main until a tag exists
 
 To install from the checkout you already have, use `sh install/install.sh --from-source`.
 
-The installer creates a versioned install under `~/.local/share/k3code/` and links `k3code` and `k3` into `~/.local/bin/` (put that on your `PATH`). It never runs onboarding; it ends by telling you to run `k3code onboard`. Re-running it upgrades in place and keeps the previous version for rollback.
+The installer creates a versioned install under `~/.local/share/k3code/` and links `k3code` into `~/.local/bin/` (put that on your `PATH`), and links `k3` too when Go was available to build it. It never runs onboarding; it ends by telling you to run `k3code onboard`. Re-running it upgrades in place and keeps the previous version for rollback.
 
 Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--yes` (installs `uv` without asking), `--no-install-deps`, `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`). Uninstall with `sh install/uninstall.sh`; it keeps your data unless you pass `--purge`.
 
@@ -73,9 +73,9 @@ k3code doctor     # health checks with fix hints
 k3code            # start the TUI
 ```
 
-The first interactive start asks once, "fast or full setup?". Fast asks only for an API endpoint and key (or the `claude-cli` provider). Full runs the whole setup wizard. Nothing is forced: `k3code onboard` works at any time, and a headless `-p` or piped run without a provider prints one hint and exits with code 78 instead of prompting.
+A plain interactive start with no provider configured asks once, "fast or full setup?", and does not ask again (the answer is kept in `$K3CODE_HOME/onboarding.json`). Fast asks only for an API endpoint and key (or the `claude-cli` provider). Full runs the whole setup wizard. Nothing is forced: `k3code onboard` works at any time, and a headless `-p` or piped run without a provider prints one hint and exits with code 78 instead of prompting.
 
-The full wizard has 12 steps: `welcome`, `about`, `system`, `usage`, `providers`, `tiers`, `permissions`, `integrations`, `theme`, `service`, `tour`, `summary`. It asks about you, your system, what you mainly use k3code for, your provider chain, model tiers, permissions, optional integrations (MCP, mem0, skills), the theme, and whether to install the 24/7 service. When asked for a provider key, paste it: it is stored hidden (mode 0600) in `~/.config/k3code/env`, and the config only names the variable. Run one step again with `k3code setup --step NAME`.
+The full wizard has 12 steps: `welcome`, `about`, `system`, `usage`, `providers`, `tiers`, `permissions`, `integrations`, `theme`, `service`, `tour`, `summary`. It asks about you, your system, what you mainly use k3code for, your provider chain, model tiers, permissions, optional integrations (MCP, mem0, skills), the theme, and whether to install the 24/7 service. When asked for a provider key, the input is hidden and the key is saved in `~/.config/k3code/env` (mode 0600); the config only names the variable. Run one step again with `k3code setup --step NAME`.
 
 ### Maintain
 
@@ -145,7 +145,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 | `yolo` | Skips every approval prompt. Only the hardline list and explicit `deny` rules for file and other non-shell tools still block; `deny` rules for shell commands are ignored. `Shift+Tab` never cycles into it; set it deliberately. |
 
 Approvals are *once*, *for this session*, *always* (writes a narrow rule such as `git commit *` to the project's `.k3code/config.yaml`; for file edits, the exact path) or *deny*.
-A short **hardline list** is refused in every mode, `yolo` included: `rm -rf /` and `rm -rf ~`, `mkfs`, `dd of=/dev/…`, `curl … | sh`, `env`/`printenv`, `cat` of `~/.ssh/` or `.env` files, `git push --force` to main, and stopping or restarting services on two configured home servers over ssh. These are pattern matches, not a sandbox, and they match specific spellings only; extend them with `permissions.hardline` in your config.
+A short **hardline list** is refused in every mode, `yolo` included: `rm -rf /` and `rm -rf ~`, `mkfs`, `dd of=/dev/…`, `curl … | sh`, `env`/`printenv`, `cat` of `~/.ssh/` or `.env` files, `git push --force` to `main` or `master`, and stopping or restarting services over ssh on the hosts named in `_REMOTE_HOSTS` (`protected-host-a` and `protected-host-b`, placeholders in this release). These are pattern matches, not a sandbox, and they match specific spellings only; extend them with `permissions.hardline` in your config.
 The command-line flag `--permission` takes `ask`, `auto-edit` or `yolo`.
 
 ### Plan-first and fan-out
@@ -167,7 +167,7 @@ k3        # the multi-window terminal (built from panes/ by the installer)
 | (typing) | Everything goes to the focused pane, like a normal terminal |
 | `Ctrl+G` | Leader: then `p` panes, `t` tabs, `s` sessions, `r` resize, `/` search, `a` agents, `?` help |
 | `Esc` | Always back to typing |
-| `Alt+←↑↓→` | Focus a neighbouring pane (works in every mode) |
+| `Alt+←↑↓→` | Focus a neighbouring pane (in typing mode; the leader modes ignore it) |
 | `Alt+n` / `Alt+1…9` / `Alt+z` | New pane / jump to workspace / zoom |
 | `Ctrl+P` | Command palette (a searchable list of actions; its right-hand column shows the underlying TUIOS keys, not the k3 keys above) |
 
@@ -200,10 +200,10 @@ What keeps it alive and safe when nobody is watching:
 
 k3code edits files and runs shell commands on your machine, as your user. Some modes do that without asking. Read this section before you choose a mode and before you add a provider key.
 
-- **Permission modes** are described under [Permission modes](#permission-modes). In short: `default` asks before edits and before shell commands that are not allowlisted; `plan` is read-only; `auto` runs everything that is not denied and logs each auto-approved side effect; `yolo` skips approval prompts. The config key `permission_mode` takes `ask` (the same as `default`), `auto-edit` (the same as `accept-edits`) or `yolo`, and the `--permission` flag takes the same three values.
+- **Permission modes** are described under [Permission modes](#permission-modes). In short: `default` asks before edits and before shell commands that are not allowlisted; `plan` is read-only; `auto` runs everything that is not denied and logs each auto-approved side effect; `yolo` skips approval prompts. The config key `permission_mode` accepts `ask` (the same as `default`), `auto-edit` (the same as `accept-edits`), `yolo`, `plan` and `auto`; the `--permission` flag takes `ask`, `auto-edit` or `yolo`.
 - **`yolo` does not ask.** Use it for scratch projects and for scripted runs you can throw away. Anything the agent reads (a file, a web page, a tool result) can try to steer it, and in `yolo` nothing stops it from acting on that. Start in `default` on anything you care about.
 - **Hardline list.** Refused in every mode, `yolo` included: `rm -rf /` and `rm -rf ~`, `mkfs`, `dd` to a device, `curl … | sh`, `env` and `printenv`, `cat` of `~/.ssh/` or `.env` files, `git push --force` to `main` or `master`, and stopping or restarting services over ssh on the hosts listed in `_REMOTE_HOSTS` (`core/src/k3code/permissions/hardline.py`). These are pattern matches, not a sandbox, and they only match the spellings they list. The host names in `_REMOTE_HOSTS` are placeholders in this release. Add your own patterns under `permissions.hardline` in your config.
-- **Sandbox, and where it fails open.** In `auto` and `yolo` modes, and in every background, cron and loop session, bash runs inside [bubblewrap](https://github.com/containers/bubblewrap). The system is read-only, only the project is writable, `$HOME` is hidden, and the command does not inherit your API keys. The network stays on. **If `bwrap` is missing or user namespaces are disabled, bash runs without the sandbox.** k3code logs a warning once, and `k3code doctor` reports it. Install bubblewrap before you run unattended.
+- **Sandbox, and where it fails open.** In `auto` and `yolo` modes, and in every background, cron and loop session, bash runs inside [bubblewrap](https://github.com/containers/bubblewrap). The system is read-only, the project (and any directory added with `/add-dir`) is writable, `$HOME` is hidden except `~/.cache` (writable) and `~/.local/share/uv` (read-only), `/tmp` is private, and the command does not inherit your API keys. The network stays on. **If `bwrap` is missing or user namespaces are disabled, bash runs without the sandbox.** k3code logs a warning once, and `k3code doctor` reports it. Install bubblewrap before you run unattended.
 - **Spend caps.** Off by default. `reliability.session_tokens`, `reliability.session_usd`, `reliability.day_tokens` and `reliability.day_usd` stop a turn, or the day's work, when a limit is reached. Dollar figures are estimates, not an invoice.
 - **Approvals write rules.** Choosing *always* writes a narrow rule (for example `git commit *`) into the project's `.k3code/config.yaml`. Review those rules before you commit that file.
 - **Secrets.** Keys live in `~/.config/k3code/env` (mode 0600) or in your environment. The config names an environment variable, never the value. `k3code export` redacts secrets.
@@ -215,7 +215,7 @@ To report a vulnerability, use the private route in [SECURITY.md](SECURITY.md).
 
 State lives in `~/.k3code/` (override with `K3CODE_HOME`): `config.yaml`, session and usage databases, the journal, memory, learned preferences, logs. Secrets live only in `~/.config/k3code/env` (mode 0600) or your environment. A project can add `.k3code/config.yaml`, read from the directory k3code was started in (or `--config-dir`).
 
-Precedence per top-level key: command-line flag > environment (`K3CODE_<KEY>`, scalar keys only, for example `K3CODE_PERMISSION_MODE`) > project config > user config > defaults. Nested sections are replaced as a whole, not merged. Change settings with `/config`, `/update-config` or `k3code setup --step <name>`; edits are backed up and `/config rollback` restores the last one.
+Precedence per top-level key: command-line flag > environment (`K3CODE_<KEY>`, scalar keys only, for example `K3CODE_PERMISSION_MODE`) > project config > user config > defaults. Nested sections are replaced as a whole, not merged. Known exception: `providers` comes from the user config whenever that file defines it, even if the project config does too. Change settings with `/config`, `/update-config` or `k3code setup --step <name>`; edits are backed up and `/config rollback` restores the last one.
 
 ```yaml
 providers:                          # the fallback chain, in order (add as many as you like)
@@ -283,7 +283,7 @@ Run each block from the repository root.
 # core
 (cd core && uv sync && uv run pytest -q -o addopts="" && uv run ruff check src tests)
 
-# TUI (one upstream test is known to fail)
+# TUI
 (cd tui && npm ci && npm run build:ink && npm run build && npx vitest run)
 
 # panes: only these packages. Do NOT run the whole upstream test tree: its remote-sync tests recurse without bound.
@@ -293,9 +293,9 @@ Run each block from the repository root.
 python3 scripts/vendor_check.py
 ```
 
-- **Exit checks:** `scripts/exit/run_all.sh [--soak-minutes N] [--only m0,m1,…]` runs every check (real-TUI scripted flows, daemon and chaos tests, the panes tests, a clean-install test in a Fedora 44 podman container, and a 30-minute daemon soak in the background) and **overwrites the tracked** [`docs/reports/exit-status.md`](docs/reports/exit-status.md). Expect 30–40 minutes and heavy CPU, RAM and disk use. It needs `bash`, `python3`, `uv`, `node` (with the TUI built first), `go`, and optionally `podman`. Live-model rows stay pending while the provider quota is exhausted.
+- **Exit checks:** `scripts/exit/run_all.sh [--soak-minutes N] [--only m0,m1,…]` runs every check (real-TUI scripted flows, daemon and chaos tests, the panes tests, a clean-install test in a Fedora 44 podman container, and a 30-minute daemon soak in the background) and **overwrites the tracked** [`docs/reports/exit-status.md`](docs/reports/exit-status.md). Expect 30–40 minutes (an untested estimate) and heavy CPU, RAM and disk use. It needs `bash`, `python3`, `uv`, `node` (with the TUI built first), `go`, and optionally `podman`. Live-model rows stay pending while the provider quota is exhausted.
 - **How it was built:** most of the code was written by headless coding agents driven by [`scripts/dev/omni-worker.sh`](scripts/dev/omni-worker.sh) from the task specs in [`scripts/dev/tasks/`](scripts/dev/tasks). Each task produced a branch and a report in `docs/reports/`. Those scripts are internal build tooling; you do not need them to build, test or use k3code.
-- **Branches:** named by milestone. `m0/…` scaffold pieces; `m1/…` gateway, tui, permissions, commands; `m2/…` reliability and ops; `m3/…` keymap and panes integration; `m4/…` autonomy, automation, fan-out; `m5/…` learning; `m6/…` install; `exit/verify`. The `*/merge-*` branches are integration merges. Everything is integrated on `m0-scaffold`, the branch to install from.
+- **Branches:** work branches are named by milestone, for example `w/m1-gateway`, `w/m2-ops`, `w/m4a-autonomy` or `w/m6-install`. The `w/merge-*` branches are integration merges. The exit checks are on `w/exit-verify` locally and `exit/verify` on `origin`. Integration happens on `m0-scaffold`.
 - **License hygiene:** `scripts/vendor_check.py` checks each file entry in `VENDOR.toml` (the file exists, the license is MIT or Apache-2.0, the project is not on a short banned list that includes the leaked Claude Code source and the closed Ante binary). It does not check the `[[tree]]` entries (`tui/`, `panes/`) or inspect the code itself.
 
 ---
@@ -318,9 +318,9 @@ python3 scripts/vendor_check.py
 
 ## Status
 
-**Alpha, version 0.1.0 (unreleased).** This is the first version meant for people other than its author. Expect rough edges, and expect the config format and some commands to change.
+**Alpha, version 0.0.1 (unreleased).** This is the first version meant for people other than its author. Expect rough edges, and expect the config format and some commands to change.
 
-As of 2026-10-08, 51 exit-criteria checks have been run: 46 pass, none fail, and 5 are pending. The pending rows need a live model, a person or days of real use. The table with the evidence behind every row is [`docs/reports/exit-status.md`](docs/reports/exit-status.md). The core test suite has 811 tests at this commit.
+As of 2026-10-08, 51 exit-criteria checks have been run: 46 pass, none fail, and 5 are pending. The pending rows need a live model, a person or days of real use. The table with the evidence behind every row is [`docs/reports/exit-status.md`](docs/reports/exit-status.md). The core test suite passes.
 
 What is not verified yet:
 
@@ -331,11 +331,11 @@ What is not verified yet:
 
 | | Milestone | Built | Verified so far |
 |---|---|---|---|
-| **M0** | Scaffold, core skeleton, vendored TUI and panes | ✅ | Passes; the live-model row is pending (needs a live model) |
-| **M1** | Daily-driver agent: gateway, TUI (agent list, focus mode, history), permissions, commands | ✅ | Nine scripted real-TUI flows pass; the live `/review` check is pending, and so is 3 days of real use |
-| **M2** | 24/7 reliability: offline pause/resume, retry, journal, governor, daemon, doctor, stats | ✅ | All five chaos checks and a 30-minute soak (119 turns, none lost, memory flat) pass; the 72-hour soak is pending |
+| **M0** | Scaffold, core skeleton, vendored TUI and panes | ✅ | All five exit rows pass, including the live-model row (through the `claude-cli` provider) |
+| **M1** | Daily-driver agent: gateway, TUI (agent list, focus mode, history), permissions, commands | ✅ | All 10 exit rows pass, including the live `/review` check; three days of real use is not verified |
+| **M2** | 24/7 reliability: offline pause/resume, retry, journal, governor, daemon, doctor, stats | ✅ | All five chaos checks and a 30-minute soak (119 turns, none lost, bounded memory growth) pass; the 72-hour soak is pending |
 | **M3** | `k3` keymap, agent states and approvals in panes | ✅ | Keymap tests and the live pane-badge check pass; the first-time-user test is pending |
-| **M4** | Plan-first and scope gate, tiers, fan-out, `/ultra*`, `/preview`, `/advisor`, loops, cron, automations | ✅ | Scripted checks pass; four checks need a live model or your task-size labels |
+| **M4** | Plan-first and scope gate, tiers, fan-out, `/ultra*`, `/preview`, `/advisor`, loops, cron, automations | ✅ | All exit rows pass except the 30-task scope eval: its 30 labels are proposed and not yet confirmed |
 | **M5** | Learning, proposals, project preparation, self-optimizer | ✅ | Demo and tests pass; live mem0 and 2 weeks of use are pending |
 | **M6** | Installer, guided setup, update with rollback, release CI | ✅ | A clean Fedora 44 container installs in about a minute; setup resume, `--from-bundle` and update rollback pass. The upstream-sync check passes under the agreed policy: TUIOS stays mergeable (0 conflicting files) and the heavily modified Hermes TUI is a documented frozen fork whose upstream fixes are cherry-picked by hand ([`docs/UPSTREAM.md`](docs/UPSTREAM.md)) |
 
