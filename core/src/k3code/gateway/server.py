@@ -57,6 +57,7 @@ from k3code.gateway.protocol import (
 )
 from k3code.gateway.sessions import SessionStore
 from k3code.goals import GoalManager, make_judge
+from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
 from k3code.paths import project_config_path as _proj_cfg
@@ -339,6 +340,8 @@ class GatewayServer:
         #: Set by the daemon in restart-storm safe mode: no background work starts.
         self.background_paused = False
         self.safe_mode_notice = ""
+        #: ``/daemon pause``: a persisted global halt (k3code.halt); loaded here so it survives a restart.
+        self.halt: Halt | None = load_halt(self._home())
         self._client_seq = 0
         self.usage = UsageDB(self._home() / "usage.db")
         self.artifacts = ArtifactStore(self._home() / "artifacts.db")
@@ -616,6 +619,55 @@ class GatewayServer:
     def request_stop(self) -> None:
         self._stop.set()
 
+    @property
+    def halted(self) -> bool:
+        """True while ``/daemon pause`` holds: no model turn, loop tick, job or sub-agent may start."""
+        return self.halt is not None
+
+    def _halt_payload(self) -> dict[str, Any]:
+        return {
+            "text": "Daemon halted (/daemon pause): turns, loops, jobs and sub-agents are stopped. "
+            "/daemon resume to continue.",
+            "level": "warning",
+            "kind": "daemon",
+            "key": "k3.halt",
+        }
+
+    async def halt_daemon(self, reason: str = "/daemon pause") -> int:
+        """Global halt: persist it, pause every active goal, stop running turns and sub-agents.
+
+        Returns how many running turns were stopped. Loops and jobs are not cancelled; they wait (see
+        AutomationEngine._online) and continue after ``/daemon resume``.
+        """
+        self.halt = set_halt(self._home(), reason)
+        stopped = 0
+        for live in list(self.live.values()):
+            mgr = self.goal_manager(live)
+            if mgr.is_active():  # paused first, so the cancelled turn's own handler does not overwrite the reason
+                mgr.pause("halted")
+                self.emit_goal(live)
+            if live.turn_task is not None and not live.turn_task.done():
+                await self.interrupt_turn(live.session_id)
+                stopped += 1
+        for h in list(self.subagents.handles.values()):
+            self.subagents.interrupt(h.id)
+        self.broadcast("notification.show", self._halt_payload())
+        return stopped
+
+    def resume_daemon(self) -> bool:
+        """``/daemon resume``: clear the halt and the restart-storm safe mode; returns whether either was set.
+
+        Goals that the halt paused stay paused (``/goal resume``): nothing restarts unattended work by itself.
+        """
+        was_set = self.halted or self.background_paused
+        clear_halt(self._home())
+        self.halt = None
+        self.background_paused = False
+        self.safe_mode_notice = ""
+        self.broadcast("notification.clear", {"key": "k3.safe_mode"})
+        self.broadcast("notification.clear", {"key": "k3.halt"})
+        return was_set
+
     #: A peer that stopped reading (SIGSTOPped TUI, hung ssh) is dropped once this many bytes are queued for it.
     MAX_CLIENT_BACKLOG = 8 * 1024 * 1024
     #: Methods whose handler may wait for the client's own answer (clarify / approval): run as tasks, so the read loop
@@ -676,6 +728,8 @@ class GatewayServer:
                         "essential",
                     ),
                 )
+            if self.halted:
+                self._send(client, encode_event("notification.show", self._halt_payload(), "essential"))
             while not client.closed:
                 line = await reader.readline()
                 if not line:
@@ -1096,9 +1150,14 @@ class GatewayServer:
                     mgr.pause("interrupted")
                     self.emit_goal(session)
                 raise
+            if self.halted and mgr.is_active() and status == "done":
+                status = "halted"  # the halt arrived while the turn ran: no judge call, no continuation
             if status != "done" or not mgr.is_active():
                 if status == "error" and mgr.is_active():
                     mgr.pause("turn failed")
+                    self.emit_goal(session)
+                if status == "halted" and mgr.is_active():
+                    mgr.pause("halted")
                     self.emit_goal(session)
                 self._session_finished(session, status)
                 return status, final_text
@@ -1168,6 +1227,8 @@ class GatewayServer:
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
+        if self.halted:  # /daemon pause: nothing reaches a provider; the caller pauses the goal (status 'halted')
+            return "halted", ""
         self._ensure_router(session.stored.model or None)
         assert self.router is not None
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
@@ -1386,6 +1447,8 @@ class GatewayServer:
         and every later tick failed with ContextOverflow. Runs on the cheap ``compaction`` tier; failures are logged and
         the turn goes on.
         """
+        if self.halted:  # the compaction call is a model call too
+            return 0
         cfg = {**CONTEXT_DEFAULTS, **dict(getattr(self.config, "context", None) or {})}
         messages = session.stored.messages
         if not force and _estimate_tokens(messages) < int(cfg["compact_at_tokens"]):
@@ -1706,6 +1769,8 @@ class GatewayServer:
     def start_job(self, session: LiveSession, label: str, make_coro: Callable[[], Any]) -> None:
         """Run ``make_coro()`` as the session's turn: it shows as working, /stop interrupts it, and its returned
         text becomes the assistant message."""
+        if self.halted:
+            raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
         if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
             raise _InvalidParams("a turn is already running in this session; /stop it or wait")
 
@@ -1763,6 +1828,8 @@ class GatewayServer:
 
     def start_background(self, origin: LiveSession, prompt: str) -> LiveSession:
         """``/bg <prompt>``: run ``prompt`` in a new background session; notify ``origin`` when it ends."""
+        if self.halted:
+            raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
         if self.background_paused:
             raise _InvalidParams("background work is paused (restart-storm safe mode); resume with /daemon resume")
         live = self._fresh_session_like(origin, background=True)
@@ -2157,6 +2224,8 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     if session is None:
         raise _InvalidParams("no active session")
     text = _require(params, "text")
+    if server.halted:
+        raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
     server.last_user_activity = time.time()
     if session.streaming:
         session.pending_prompts.append(str(text))  # really queued: it runs when the current turn ends
