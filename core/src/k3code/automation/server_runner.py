@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 _STATUS = {
     "done": "completed",
     "error": "failed",
-    "needs_input": "needs_input",
+    "needs_input": "blocked",  # waiting for a human: never reported as completed or silently stopped
     "interrupted": "interrupted",
     "halted": "interrupted",  # /daemon pause stopped the run: it is not a failure
 }

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 
+from k3code.agent.loop import AgentLoop
+from k3code.automation.server_runner import ServerRunner
 from k3code.gateway.sessions import SessionStore
 from k3code.goals import GoalManager, GoalState
+from k3code.reliability import BudgetExceeded
+from k3code.reliability.persistent_retry import TurnCancelled
 from m1cmd_helpers import git_repo, make_server, new_session
 
 NO_ADVISOR = {"advisor_on_goal": False}
@@ -89,3 +93,47 @@ async def test_boot_with_halt_set_runs_zero_turns(tmp_path, monkeypatch):
     assert await second.resume_goals() == 0
     assert provider.n == 0
     await second.close()
+
+
+def _notices(server, key_prefix: str) -> list[dict]:
+    shown = [e["payload"] for e in server.event_log if e["type"] == "notification.show"]
+    return [p for p in shown if str(p.get("key", "")).startswith(key_prefix)]
+
+
+async def test_budget_exceeded_pauses_goal_as_needs_input_and_the_run_is_blocked(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    server, _ = make_server(tmp_path, monkeypatch, replies=["x"], autonomy=NO_ADVISOR)
+    sid = await new_session(server, repo)
+    _goal(server, sid).set("spend the budget")
+
+    async def over_budget(self, *args, **kwargs):
+        raise BudgetExceeded("session token budget exceeded")
+        yield  # pragma: no cover - makes this an async generator
+
+    monkeypatch.setattr(AgentLoop, "run", over_budget)
+    result = await ServerRunner(server).run_prompt("go", session_id=sid)
+    assert result.status == "blocked"  # not "completed", not a silent stop
+    state = _goal(server, sid).state
+    assert state.status == "paused" and state.paused_reason == "needs_input"
+    assert len(_notices(server, "k3.goal.blocked")) == 1
+    await server.close()
+
+
+async def test_interrupted_turn_pauses_goal_with_a_reason_and_notifies(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    server, _ = make_server(tmp_path, monkeypatch, replies=["x"], autonomy=NO_ADVISOR)
+    sid = await new_session(server, repo)
+    _goal(server, sid).set("get interrupted")
+
+    async def cancelled(self, *args, **kwargs):
+        raise TurnCancelled("cancelled while parked")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(AgentLoop, "run", cancelled)
+    live = server.live_for(server.store.get(sid))
+    status, _ = await server._run_turn(live, "go")
+    assert status == "interrupted"
+    state = _goal(server, sid).state
+    assert state.status == "paused" and state.paused_reason == "interrupted"
+    assert len(_notices(server, "k3.goal.blocked")) == 1
+    await server.close()

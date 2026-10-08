@@ -67,7 +67,7 @@ from k3code.permissions.state import PermissionState, persist_rules, project_con
 from k3code.prompting import build_system_prompt
 from k3code.providers import make_providers
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
-from k3code.redact import redact
+from k3code.redact import redact, scrub_text
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
 from k3code.reliability.persistent_retry import TurnCancelled
@@ -1150,19 +1150,12 @@ class GatewayServer:
                     if await self._maybe_compact(session, force=True):
                         status, final_text = await self._run_one_turn(session, prompt)
             except asyncio.CancelledError:
-                if mgr.is_active():
-                    mgr.pause("daemon restart" if self.stopping else "interrupted")
-                    self.emit_goal(session)
+                self._block_goal_for(session, "interrupted")
                 raise
             if self.halted and mgr.is_active() and status == "done":
                 status = "halted"  # the halt arrived while the turn ran: no judge call, no continuation
             if status != "done" or not mgr.is_active():
-                if status == "error" and mgr.is_active():
-                    mgr.pause("turn failed")
-                    self.emit_goal(session)
-                if status == "halted" and mgr.is_active():
-                    mgr.pause("halted")
-                    self.emit_goal(session)
+                self._block_goal_for(session, status)  # an active goal never ends silently
                 self._session_finished(session, status)
                 return status, final_text
             judge = self.goal_judge or make_judge(self._goal_completer(session))
@@ -1178,6 +1171,32 @@ class GatewayServer:
                 self._session_finished(session, status)
                 return status, final_text
             prompt = decision.prompt
+
+    def _block_goal_for(self, session: LiveSession, status: str) -> None:
+        """A turn that did not finish leaves its active goal paused, with the reason and one notification.
+
+        ``needs_input`` (budget, loop guard, a question), ``interrupted`` (/stop, a graceful stop), ``halted``
+        (/daemon pause) and ``error`` each get their own pause reason, so nothing waits in the background silently.
+        """
+        mgr = self.goal_manager(session)
+        if not mgr.is_active():
+            return
+        if status == "needs_input":
+            reason, text = "needs_input", "Goal needs your input before it can continue. Answer, then /goal resume."
+        elif status == "interrupted" and self.stopping:
+            reason, text = "daemon restart", "Goal stopped by the daemon restart; it resumes on the next boot."
+        elif status == "interrupted":
+            reason, text = "interrupted", "Goal interrupted. /goal resume to continue."
+        elif status == "halted":
+            reason, text = "halted", "Goal paused: the daemon is halted (/daemon pause). /goal resume after resume."
+        elif status == "error":
+            detail = scrub_text(session.last_error or "see the error above")[:160]
+            reason, text = "turn failed", f"Goal paused: the turn failed ({detail}). /goal resume to retry."
+        else:
+            return
+        mgr.pause(reason)
+        self.emit_goal(session)
+        self.notify_session(session, text, level="warning", key=f"k3.goal.blocked.{session.session_id}")
 
     def _session_finished(self, session: LiveSession, status: str) -> None:
         """Tell the automation engine (``session_event`` triggers) that a session's run ended."""
