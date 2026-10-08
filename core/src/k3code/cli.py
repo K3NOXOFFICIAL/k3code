@@ -792,10 +792,6 @@ def memory_cmd(action: str, user: bool) -> None:
         click.echo(f"{scope}: {p}  " + (f"{p.stat().st_size} bytes" if p.is_file() else "(missing)"))
 
 
-if __name__ == "__main__":
-    cli()
-
-
 # ── schedule (cron jobs) ──────────────────────────────────────────────
 
 
@@ -878,3 +874,8 @@ def slash_cmd(command: tuple[str, ...], socket_opt: Path | None) -> None:
     except OSError as e:
         raise click.ClickException(f"cannot reach the daemon ({e}); start it with `k3code daemon`") from e
     click.echo(out)
+
+
+# Keep the guard last: every @cli.command / @cli.group above must be registered before cli() runs.
+if __name__ == "__main__":
+    cli()
