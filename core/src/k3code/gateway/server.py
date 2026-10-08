@@ -1859,7 +1859,11 @@ class GatewayServer:
 
     def notify_blocker(self, session_id: str, text: str, *, level: str = "warning", kind: str = "goal",
                        key: str = "") -> int:
-        """A blocker: stored until a client takes it (so it survives a restart), and shown to attached clients now."""
+        """A blocker: stored until a client takes it (so it survives a restart), and shown to attached clients now.
+
+        The text is scrubbed first: it can carry an approval command with credentials in it (S8).
+        """
+        text = scrub_text(text)
         blocker_id = self.blockers.add(session_id=session_id, kind=kind, text=text, level=level)
         payload = {
             "text": text,
