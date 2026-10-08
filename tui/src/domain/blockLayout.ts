@@ -22,7 +22,6 @@ export type BlockGroup = 'diff' | 'event' | 'intro' | 'model' | 'note' | 'slash'
 export const messageGroup = (msg: Pick<Msg, 'kind' | 'role'>): BlockGroup => {
   switch (msg.kind) {
     case 'intro':
-
     case 'panel':
       return 'intro'
 

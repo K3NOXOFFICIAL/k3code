@@ -402,9 +402,6 @@ const placeGridItems = (items: GridAreaItem[], columnCount: number): PlacedArea[
     } else {
       // Auto (or pinned col): scan row-major for the first fitting rect. New
       // rows are always empty, so the scan terminates.
-      row = 0
-      col = pinnedCol ?? 0
-
       for (let r = 0; ; r++) {
         const found =
           pinnedCol !== null

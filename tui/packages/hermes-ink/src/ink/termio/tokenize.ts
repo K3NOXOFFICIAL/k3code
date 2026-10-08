@@ -314,7 +314,6 @@ function tokenize(
         break
 
       case 'dcs':
-
       case 'apc':
         if (code === C0.BEL) {
           i++

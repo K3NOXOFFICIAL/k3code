@@ -7,7 +7,6 @@ import type {
   BackgroundStartResponse,
   ConfigGetValueResponse,
   ConfigSetResponse,
-  SessionBranchResponse,
   SessionCompressResponse,
   SessionUsageResponse,
   SlashExecResponse

@@ -10,21 +10,9 @@ const reactHooks = tuiRequire('eslint-plugin-react-hooks')
 
 const SOURCE_FILES = ['**/*.{js,mjs,cjs,ts,tsx,mts,cts}']
 
-// Recommended rules that fire on the existing code. They are switched off, not
-// fixed, so the lint stays green. The number is the finding count when this
-// config was written (388 errors in 59 of 480 files). Turn one back on once its
-// findings are fixed.
-const EXISTING_FINDINGS_OFF = {
-  '@typescript-eslint/no-explicit-any': 'off', // 306
-  '@typescript-eslint/no-unused-vars': 'off', // 43
-  '@typescript-eslint/no-unused-expressions': 'off', // 13
-  'no-fallthrough': 'off', // 12
-  'no-useless-assignment': 'off', // 7
-  'react-hooks/exhaustive-deps': 'off', // 3
-  '@typescript-eslint/triple-slash-reference': 'off', // 1
-  '@typescript-eslint/no-require-imports': 'off', // 1
-  'no-var': 'off', // 1
-  'prefer-const': 'off' // 1
+// Recommended rules kept switched off by policy. Only no-explicit-any is left.
+const POLICY_OFF = {
+  '@typescript-eslint/no-explicit-any': 'off' // Deliberate: gateway protocol carries untyped JSON; typing the ~306 uses is churn risk.
 }
 
 export default [
@@ -36,7 +24,12 @@ export default [
     plugins: { 'react-hooks': reactHooks },
     rules: {
       'react-hooks/rules-of-hooks': 'error',
-      ...EXISTING_FINDINGS_OFF
+      'react-hooks/exhaustive-deps': 'error',
+      'no-redeclare': 'error',
+      '@typescript-eslint/consistent-type-imports': 'error',
+      // Parameters named _x are intentionally unused where their position is fixed.
+      '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_', ignoreRestSiblings: true }],
+      ...POLICY_OFF
     }
   }
 ]

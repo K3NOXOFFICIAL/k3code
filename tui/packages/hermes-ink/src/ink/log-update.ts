@@ -545,7 +545,7 @@ function renderFrameSlice(
   let currentHyperlink: Hyperlink = undefined
   // Track the styleId of the last rendered cell on this line (-1 if none).
   // Passed to visibleCellAtIndex to enable fg-only space optimization.
-  let lastRenderedStyleId = -1
+  let lastRenderedStyleId: number
 
   const { width: screenWidth, cells, charPool, hyperlinkPool } = frame.screen
 

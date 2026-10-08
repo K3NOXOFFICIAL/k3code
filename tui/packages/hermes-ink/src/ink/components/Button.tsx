@@ -114,7 +114,7 @@ function Button(t0) {
   let t5
 
   if ($[11] !== onAction) {
-    t5 = _e => {
+    t5 = () => {
       onAction()
     }
 
@@ -128,7 +128,7 @@ function Button(t0) {
   let t6
 
   if ($[13] === Symbol.for('react.memo_cache_sentinel')) {
-    t6 = _e_0 => setIsFocused(true)
+    t6 = () => setIsFocused(true)
     $[13] = t6
   } else {
     t6 = $[13]
@@ -138,7 +138,7 @@ function Button(t0) {
   let t7
 
   if ($[14] === Symbol.for('react.memo_cache_sentinel')) {
-    t7 = _e_1 => setIsFocused(false)
+    t7 = () => setIsFocused(false)
     $[14] = t7
   } else {
     t7 = $[14]

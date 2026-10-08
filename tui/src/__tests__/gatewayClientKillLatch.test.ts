@@ -19,7 +19,7 @@ const { fakeSpawn, FakeChildProcess } = vi.hoisted(() => {
       return this
     }
 
-    write(_text: string) {
+    write() {
       return true
     }
 

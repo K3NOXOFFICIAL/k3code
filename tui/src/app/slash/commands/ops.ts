@@ -2,7 +2,6 @@ import type {
   BrowserManageResponse,
   CommandsCatalogResponse,
   DelegationPauseResponse,
-  ProcessStopResponse,
   ReloadEnvResponse,
   ReloadMcpResponse,
   RollbackDiffResponse,
@@ -13,50 +12,10 @@ import type {
   SpawnTreeLoadResponse,
   ToolsConfigureResponse
 } from '../../../gatewayTypes.js'
-import type { PanelSection } from '../../../types.js'
 import { applyDelegationStatus, getDelegationState } from '../../delegationStore.js'
 import { patchOverlayState } from '../../overlayStore.js'
 import { getSpawnHistory, pushDiskSnapshot, setDiffPair, type SpawnSnapshot } from '../../spawnHistoryStore.js'
-import { NO_SKILLS_INSTALLED } from '../../userMessages.js'
 import type { SlashCommand } from '../types.js'
-
-interface SkillInfo {
-  category?: string
-  description?: string
-  name?: string
-  path?: string
-}
-
-interface SkillsListResponse {
-  skills?: Record<string, string[]>
-}
-
-interface SkillsInspectResponse {
-  info?: SkillInfo
-}
-
-interface SkillsSearchResponse {
-  results?: { description?: string; name: string }[]
-}
-
-interface SkillsInstallResponse {
-  installed?: boolean
-  name?: string
-}
-
-interface SkillsBrowseItem {
-  description?: string
-  name: string
-  source?: string
-  trust?: string
-}
-
-interface SkillsBrowseResponse {
-  items?: SkillsBrowseItem[]
-  page?: number
-  total?: number
-  total_pages?: number
-}
 
 interface SkillsReloadResponse {
   output?: string
@@ -503,7 +462,11 @@ export const opsCommands: SlashCommand[] = [
           const text = r?.warning ? `warning: ${r.warning}\n${body}` : body
           const long = text.length > 180 || text.split('\n').filter(Boolean).length > 2
 
-          long ? ctx.transcript.page(text, 'Plugins') : ctx.transcript.sys(text)
+          if (long) {
+            ctx.transcript.page(text, 'Plugins')
+          } else {
+            ctx.transcript.sys(text)
+          }
         })
         .catch(ctx.guardedErr)
     }
@@ -527,7 +490,11 @@ export const opsCommands: SlashCommand[] = [
             const text = r?.warning ? `warning: ${r.warning}\n${body}` : body
             const long = text.length > 180 || text.split('\n').filter(Boolean).length > 2
 
-            long ? ctx.transcript.page(text, 'Tools') : ctx.transcript.sys(text)
+            if (long) {
+              ctx.transcript.page(text, 'Tools')
+            } else {
+              ctx.transcript.sys(text)
+            }
           })
           .catch(ctx.guardedErr)
 

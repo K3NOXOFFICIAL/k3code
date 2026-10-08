@@ -69,7 +69,7 @@ interface BunRuntime {
   wrapAnsi?(input: string, columns: number, options?: { hard?: boolean; wordWrap?: boolean; trim?: boolean }): string
 }
 
-declare var Bun: BunRuntime | undefined
+declare let Bun: BunRuntime | undefined
 
 declare namespace React {
   namespace JSX {

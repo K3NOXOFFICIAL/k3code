@@ -222,7 +222,7 @@ describe('flush-boundary SGR mouse reassembly', () => {
     expect(keys).toEqual([])
 
     // continuation arrives; the whole report reassembles, nothing leaks
-    ;[keys, state] = parseMultipleKeypresses(state, '46M')
+    ;[keys] = parseMultipleKeypresses(state, '46M')
     expect(keys).toEqual([expect.objectContaining({ kind: 'mouse', button: 0, col: 35, row: 46, action: 'press' })])
   })
 

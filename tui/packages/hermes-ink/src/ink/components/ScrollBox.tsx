@@ -1,6 +1,6 @@
 import '../global.d.ts'
 
-import React, { type PropsWithChildren, type Ref, useImperativeHandle, useRef, useState } from 'react'
+import React, { type PropsWithChildren, type Ref, useCallback, useImperativeHandle, useRef, useState } from 'react'
 import type { Except } from 'type-fest'
 
 import { markScrollActivity } from '../../bootstrap/state.js'
@@ -120,13 +120,14 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
   const manualScrollAtRef = useRef(0)
   const renderQueuedRef = useRef(false)
 
-  const notify = () => {
+  // Stable identity: reads only the listeners ref.
+  const notify = useCallback(() => {
     for (const l of listenersRef.current) {
       l()
     }
-  }
+  }, [])
 
-  function scrollMutated(el: DOMElement): void {
+  const scrollMutated = useCallback((el: DOMElement): void => {
     // Signal background intervals (IDE poll, LSP poll, GCS fetch, orphan
     // check) to skip their next tick — they compete for the event loop and
     // contributed to 1402ms max frame gaps during scroll drain.
@@ -144,7 +145,7 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
       renderQueuedRef.current = false
       scheduleRenderFrom(el)
     })
-  }
+  }, [notify])
 
   useImperativeHandle(
     ref,
@@ -310,11 +311,9 @@ function ScrollBox({ children, ref, stickyScroll, ...style }: PropsWithChildren<
         el.scrollClampMax = max
       }
     }),
-    // notify/scrollMutated are inline (no useCallback) but only close over
-    // refs + imports — stable. Empty deps avoids rebuilding the handle on
-    // every render (which re-registers the ref = churn).
-
-    []
+    // notify and scrollMutated are stable (useCallback over refs only), so the
+    // handle is built once instead of on every render.
+    [notify, scrollMutated]
   )
 
   // Structure: outer viewport (overflow:scroll, constrained height) >
