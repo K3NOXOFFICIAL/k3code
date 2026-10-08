@@ -76,6 +76,8 @@ class _ClearCommand(CommandDef):
         live = ctx.sessions.get(session_id) if session_id else None
         if live is None:
             return {"type": "message", "message": "No active session to clear."}
+        if getattr(live, "streaming", False):  # the running turn's persist would put the transcript right back
+            return {"type": "message", "message": "A turn is running in this session; /stop it first."}
         live.messages = []
         from k3code.gateway.sessions import StoredSession
 
@@ -94,6 +96,8 @@ class _CompactCommand(CommandDef):
         live = ctx.sessions.get(session_id) if session_id else None
         if live is None:
             return {"type": "message", "message": "No active session."}
+        if getattr(live, "streaming", False):  # the running turn's persist would overwrite the summary
+            return {"type": "message", "message": "A turn is running in this session; /compact when it ends."}
         before = len(live.messages)
         try:
             messages, folded = await compact_messages(

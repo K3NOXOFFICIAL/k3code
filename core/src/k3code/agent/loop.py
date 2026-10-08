@@ -91,6 +91,8 @@ class AgentLoop:
         self.on_text_reset: Callable[[], Awaitable[None]] | None = None
         #: called when the assistant's tool call joined the conversation, before the tool runs (the gateway persists)
         self.on_checkpoint: Callable[[], None] | None = None
+        #: returns user messages typed mid-turn (session.steer); they join the conversation before the next model call
+        self.take_steer: Callable[[], list[str]] | None = None
         self.approval_callback = approval_callback
         self.tools = build_registry()
         self._interrupt = asyncio.Event()
@@ -196,6 +198,7 @@ class AgentLoop:
                 logger.info("Turn %d interrupted before start", turn + 1)
                 return
             logger.info("Turn %d/%d", turn + 1, self.max_turns)
+            self._drain_steer(messages)
             # M2: disk guard + budget check before starting new work.
             self._check_disk_guard()
             self._check_budgets("turn start")
@@ -250,6 +253,8 @@ class AgentLoop:
                 if final_message.tool_calls:
                     tool_calls = final_message.tool_calls
                 else:
+                    if self._drain_steer(messages):
+                        continue  # the user steered while the model answered: answer that too, in this turn
                     logger.info("Agent finished (no tool calls)")
                     self.turn_messages = messages
                     # M2: loop guard on repeated assistant messages.
@@ -366,6 +371,15 @@ class AgentLoop:
     def _record_usage(self, event: StreamEvent) -> None:
         msg = event.message
         self.reliability.record_usage(msg.usage if msg is not None else None)
+
+    def _drain_steer(self, messages: list[Message]) -> bool:
+        """Append steering messages (never between an assistant tool_calls message and its results)."""
+        texts = self.take_steer() if self.take_steer is not None else []
+        for text in texts:
+            messages.append(Message(role="user", content=text))
+        if texts:
+            self.reliability.save_transcript(messages)
+        return bool(texts)
 
     async def _guard_tool_calls(self, tool_calls: list[ToolCall], notes: list[Message]) -> bool:
         """Observe tool calls; queue one corrective note into ``notes``, or True to stop the turn."""

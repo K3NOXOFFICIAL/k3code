@@ -31,6 +31,35 @@ def gated_server(tmp_path, monkeypatch, turns):
     return server, provider
 
 
+async def test_steer_reaches_the_running_loop_and_survives_the_persist(tmp_path, monkeypatch):
+    """session.steer appended to stored.messages: the running loop never saw it and the turn's persist overwrote it,
+    while the client was told steered: true."""
+    server, provider = gated_server(tmp_path, monkeypatch, [bash("echo hi"), "ok"])
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    await call(server, "prompt.submit", {"text": "do it"})
+    await asyncio.wait_for(provider.entered.wait(), 5)
+    assert (await call(server, "session.steer", {"text": "also say bye"}))["steered"] is True
+    provider.gate.set()
+    await asyncio.wait_for(server.session.turn_task, 20)
+    second = provider.seen[1]
+    i = next(i for i, m in enumerate(second) if m.role == "user" and m.content == "also say bye")
+    assert second[i - 1].role == "tool"  # after the tool result, never between tool_calls and results
+    users = [m["content"] for m in server.session.stored.messages if m["role"] == "user"]
+    assert users == ["do it", "also say bye"]
+
+
+async def test_steer_after_the_final_answer_is_answered_in_the_same_turn(tmp_path, monkeypatch):
+    server, provider = gated_server(tmp_path, monkeypatch, ["first answer", "second answer"])
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    await call(server, "prompt.submit", {"text": "q"})
+    await asyncio.wait_for(provider.entered.wait(), 5)
+    await call(server, "session.steer", {"text": "and another thing"})
+    provider.gate.set()
+    await asyncio.wait_for(server.session.turn_task, 20)
+    rows = [(m["role"], m["content"]) for m in server.session.stored.messages]
+    assert rows[-2:] == [("user", "and another thing"), ("assistant", "second answer")]
+
+
 async def test_a_prompt_before_the_turn_streams_is_queued_not_a_second_task(tmp_path, monkeypatch):
     """streaming only turns True after compaction/MCP start; a prompt in that window started a second task and
     overwrote turn_task, so /stop cancelled the wrong one."""
@@ -46,3 +75,25 @@ async def test_a_prompt_before_the_turn_streams_is_queued_not_a_second_task(tmp_
     await asyncio.wait_for(task, 20)
     users = [m["content"] for m in server.session.stored.messages if m["role"] == "user"]
     assert users == ["first", "second"]
+
+
+async def test_transcript_edits_are_refused_or_steered_mid_turn(tmp_path, monkeypatch):
+    """/clear, /compact and /advisor accept rewrote stored.messages while the turn's persist overwrote them."""
+    server, _ = gated_server(tmp_path, monkeypatch, [])
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    live = server.session
+    live.messages = [{"role": "user", "content": "keep"}]
+    live.streaming = True
+    try:
+        out = await call(server, "command.dispatch", {"name": "clear", "arg": ""})
+        assert "running" in out["message"] and live.messages == [{"role": "user", "content": "keep"}]
+        out = await call(server, "command.dispatch", {"name": "compact", "arg": ""})
+        assert "running" in out["message"]
+        out = await call(server, "command.dispatch", {"name": "preview", "arg": "a task"})
+        assert "running" in out["message"]
+        live.pending_advisor = "Risk: none."
+        out = await call(server, "command.dispatch", {"name": "advisor", "arg": "accept"})
+        assert live.steer_queue == ["Advisor review:\nRisk: none."]
+        assert live.messages == [{"role": "user", "content": "keep"}]
+    finally:
+        live.streaming = False
