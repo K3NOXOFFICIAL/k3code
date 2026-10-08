@@ -258,6 +258,24 @@ def test_presetup_is_the_default_and_minimal_skips_it(tmp_path: Path) -> None:
     assert "Installed k3code" in m.stderr
 
 
+def test_unreachable_private_repo_falls_back_to_this_checkout(tmp_path: Path) -> None:
+    # A Windows clone made with Windows git, installed through install.ps1: the WSL side has no GitHub credentials, so
+    # finding the latest version fails. With nothing installed yet, the installer builds the checkout it runs from.
+    real_git = shutil.which("git")
+    stubs = stub_bin(
+        tmp_path,
+        "git",
+        'if [ "$1" = ls-remote ]; then\n'
+        "  echo \"fatal: could not read Username for 'https://github.com'\" >&2; exit 128\n"
+        "fi\n"
+        f'exec "{real_git}" "$@"\n',
+    )
+    r = run(tmp_path, INSTALL, "--yes", "--minimal", path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    assert "installing this checkout instead (--from-source)" in r.stderr
+    assert "Installed k3code" in r.stderr
+
+
 def test_update_flags_print_only_the_version(tmp_path: Path) -> None:
     # k3code update runs the installer with these flags and reads the version from stdout: nothing else may land there.
     r = run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup", "--no-activate", "--print-version")

@@ -57,7 +57,7 @@ k3code plans before it acts, can run several agents in parallel, retries through
 
 ### Install
 
-If you install from a private fork or mirror, authenticate once first with `gh auth login` and `gh auth setup-git` (on Windows, do this inside WSL, where the install runs).
+If you install from a private fork or mirror, authenticate once first with `gh auth login` and `gh auth setup-git` (on Windows, do this inside WSL, where the install runs). A Windows clone made with Windows git also installs without that: when WSL cannot reach the repository and nothing is installed yet, the installer builds the checkout it runs from (as `--from-source` does).
 
 **Linux and macOS**
 
