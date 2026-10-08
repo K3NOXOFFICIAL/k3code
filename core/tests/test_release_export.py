@@ -39,13 +39,21 @@ def _scan(directory: Path, rules: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+# Invented names, assembled from parts so that this file does not match the rules built from them.
+HOST = "zor" + "gon"
+DOMAIN = "plugh-" + "host.test"
+FIRST = "Xyz" + "zy"
+
+
 @pytest.fixture(scope="module")
 def rules(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """The scan reads its names from files outside the repository; these invented ones test the mechanism, so no real
     name or host is written anywhere in the repository."""
     folder = tmp_path_factory.mktemp("rules")
-    (folder / "personal.re").write_text("# hosts and names\nzorgon\nplugh-host\\.test\n\n", encoding="utf-8")
-    (folder / "names.re").write_text("Xyzzy\n", encoding="utf-8")
+    (folder / "personal.re").write_text(
+        f"# hosts and names\n{HOST}\n{DOMAIN.replace('.', '\\.')}\n\n", encoding="utf-8"
+    )
+    (folder / "names.re").write_text(f"{FIRST}\n", encoding="utf-8")
     return folder
 
 
@@ -91,11 +99,11 @@ def test_scan_passes_on_the_export(export: Export, rules: Path) -> None:
 @pytest.mark.parametrize(
     "planted",
     [
-        "/home/" + "zorgon/notes.md",
-        "ssh zorgon@example.org",
-        "https://plugh-host.test/mcp",
+        "/home/" + HOST + "/notes.md",
+        f"ssh {HOST}@example.org",
+        f"https://{DOMAIN}/mcp",
         "peer at 100." + "64.0.7",
-        "Xyzzy CachedLayer",
+        f"{FIRST} CachedLayer",
         "/home/" + "newperson/project",
     ],
 )
@@ -108,7 +116,9 @@ def test_planted_personal_value_fails_the_scan(tmp_path: Path, rules: Path, plan
 
 
 def test_generic_examples_pass_the_scan(tmp_path: Path, rules: Path) -> None:
-    (tmp_path / "ok.txt").write_text("/home/user/x /home/u/y TokenOutput xyzzy 192.0.2.4\n", encoding="utf-8")
+    (tmp_path / "ok.txt").write_text(
+        f"/home/user/x /home/u/y TokenOutput {FIRST.lower()} 192.0.2.4\n", encoding="utf-8"
+    )
     assert _scan(tmp_path, rules).returncode == 0  # names.re is case-sensitive: the lower-case word is fine
 
 
@@ -117,10 +127,10 @@ def test_without_rule_files_only_the_generic_checks_run_and_it_says_so(tmp_path:
     empty.mkdir()
     tree = tmp_path / "tree"
     tree.mkdir()
-    (tree / "a.txt").write_text("zorgon is fine here, 100." + "64.0.7 is not\n", encoding="utf-8")
+    (tree / "a.txt").write_text(f"{HOST} is fine here, 100." + "64.0.7 is not\n", encoding="utf-8")
     result = _scan(tree, empty)
     assert result.returncode != 0 and "a.txt" in result.stderr  # the tailnet address still fails it
     assert "no name rules" in result.stderr
-    (tree / "a.txt").write_text("zorgon only\n", encoding="utf-8")
+    (tree / "a.txt").write_text(f"{HOST} only\n", encoding="utf-8")
     result = _scan(tree, empty)
     assert result.returncode == 0 and "no name rules" in result.stderr
