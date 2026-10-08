@@ -147,7 +147,17 @@ async def _run_headless(
             sys.stdout.write(text)
             sys.stdout.flush()
 
+    async def on_text_reset() -> None:
+        # a retry after partial output streams the answer again: the result keeps one copy, the terminal a line break
+        nonlocal final_text
+        final_text = ""
+        if not json_output:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            sys.stderr.write("[k3code] the reply was cut off; retrying (the partial text above is discarded)\n")
+
     loop.on_text_delta = on_text_delta
+    loop.on_text_reset = on_text_reset
 
     try:
         await reliability.start()
@@ -268,7 +278,13 @@ async def _run_repl(
             sys.stdout.write(text)
             sys.stdout.flush()
 
+        async def on_text_reset() -> None:
+            nonlocal final_text
+            final_text = ""
+            print("\n[retrying: the partial reply above was discarded]")
+
         loop.on_text_delta = on_text_delta
+        loop.on_text_reset = on_text_reset
 
         try:
             async for _ in loop.run(user_input, max_tokens=config.max_tokens, temperature=config.temperature):
