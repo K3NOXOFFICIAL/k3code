@@ -161,13 +161,34 @@ async def test_worktree_outside_git_repo_shares_cwd(tmp_path, monkeypatch):
 
 async def test_children_get_own_reliability_and_do_not_share_parents(tmp_path, monkeypatch):
     steps = [task_call("CHILD-R go"), final("ok"), {"type": "text", "match": "CHILD-R", "text": "r"}]
+    from k3code.subagents import runner
+
+    built = []
+    real = runner.child_reliability
+    monkeypatch.setattr(runner, "child_reliability", lambda *a: built.append(real(*a)) or built[-1])
     server = make(tmp_path, monkeypatch, steps, **NO_GATE)
     await start(server, tmp_path)
     await run_turn(server, "PARENT")
     (h,) = server.subagents.handles.values()
-    assert h.loop.reliability is not server.session.reliability
-    assert h.loop.reliability.netwatch is None  # no probe per child
+    (rel,) = built
+    assert rel is not server.session.reliability
+    assert rel.netwatch is None  # no probe per child
     assert models_called(server)  # sanity
+    assert h.done and h.loop is None and h.task is None  # a finished child keeps no loop (history) or task
+
+
+async def test_finished_handles_are_evicted_beyond_the_cap(monkeypatch):
+    """self.handles was never pruned: every child of the daemon's life stayed, with its loop and history."""
+    from k3code.subagents import runner
+
+    monkeypatch.setattr(runner, "KEEP_FINISHED_HANDLES", 2)
+    mgr = runner.SubagentManager(server=None)
+    for i in range(5):
+        h = runner.Handle(id=f"h{i}", description="", agent_type="worker", tier="main", depth=1, parent_sid="s",
+                          status="completed" if i != 1 else "running", finished_at=float(i))
+        mgr.handles[h.id] = h
+    mgr._prune()
+    assert sorted(mgr.handles) == ["h1", "h3", "h4"]  # running ones stay; the newest finished are kept
 
 
 def test_agent_type_files_and_override(tmp_path, monkeypatch):

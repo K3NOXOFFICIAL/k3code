@@ -29,6 +29,8 @@ from k3code.subagents.types import AgentType, load_agent_types
 logger = logging.getLogger(__name__)
 
 MAX_DEPTH = 2
+#: finished handles kept for /agents and the strip; older ones are evicted (the registry grew for the daemon's life)
+KEEP_FINISHED_HANDLES = 200
 
 
 class DepthLimit(Exception):
@@ -204,13 +206,14 @@ class SubagentManager:
         """Wait for the child. A cancellation of the *child* (interrupt) is its result; a cancellation of the
         *waiter* (/stop on the parent turn) is not swallowed, and takes the child down with it. The old
         ``suppress(CancelledError)`` ate both, so /stop was ignored by every ultracode/ultraplan/fan-out chain."""
-        if h.task is not None:
+        task = h.task  # a finished child drops its task ref (see _run)
+        if task is not None:
             try:
-                await asyncio.shield(h.task)
+                await asyncio.shield(task)
             except asyncio.CancelledError:
-                if h.task.cancelled() or h.task.done():
+                if task.cancelled() or task.done():
                     return h  # the child itself was interrupted
-                h.task.cancel()  # we were cancelled while the child still runs: stop it too
+                task.cancel()  # we were cancelled while the child still runs: stop it too
                 raise
         return h
 
@@ -295,6 +298,15 @@ class SubagentManager:
             rel = getattr(parent, "reliability", None)
             if rel is not None and rel.governor is not None:  # the parent's session budget includes its children
                 rel.governor.charge(h.tokens_in, h.tokens_out)
+            h.loop = None  # the loop holds the child's whole history; the handle keeps only what /agents shows
+            h.task = None
+            self._prune()
+
+    def _prune(self) -> None:
+        """Evict the oldest finished handles beyond ``KEEP_FINISHED_HANDLES``."""
+        finished = sorted((x for x in self.handles.values() if x.done), key=lambda x: x.finished_at)
+        for old in finished[: max(0, len(finished) - KEEP_FINISHED_HANDLES)]:
+            self.handles.pop(old.id, None)
 
     async def _finish_worktree(self, h: Handle, auto_merge: bool) -> None:
         wt = h.worktree
