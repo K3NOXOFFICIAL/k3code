@@ -11,13 +11,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from k3code.config import McpServerConfig, env_value
+from k3code.reliability.sandbox import child_env
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,15 @@ class McpServerState:
     status: str = "pending"  # pending | connected | failed | disabled
     error: str = ""
     tools: list[McpToolInfo] = field(default_factory=list)
+
+
+def stdio_env(extra: dict[str, str] | None) -> dict[str, str]:
+    """Environment for a stdio MCP server: the scrubbed daemon set plus the server's configured ``env``.
+
+    Documented sandbox exception: MCP servers run unsandboxed (they are long-lived, user-configured and need their
+    own files and network), but they never inherit the daemon's provider keys.
+    """
+    return child_env(extra)
 
 
 class _Runner:
@@ -112,7 +121,7 @@ class _Runner:
                     params = StdioServerParameters(
                         command=self.cfg.command,
                         args=self.cfg.args,
-                        env={**os.environ, **self.cfg.env} if self.cfg.env else None,
+                        env=stdio_env(self.cfg.env),
                         cwd=self.cfg.cwd,
                     )
                     read, write = await stack.enter_async_context(stdio_client(params))

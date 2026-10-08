@@ -16,7 +16,8 @@ async def test_blocker_with_no_client_attached_is_still_listed_after_restart(tmp
     server.notify_blocker(stored.session_id, "approve the deploy", kind="approval")
     assert [b["text"] for b in server.blockers.pending()] == ["approve the deploy"]
     await server.close()
-    restarted = BlockerStore(tmp_path / "home" / "blockers.db")  # what the next boot sees
+    # what the next boot sees: the k3code home sits beside the project dir (see m1cmd_helpers.make_server)
+    restarted = BlockerStore(tmp_path.parent / f"{tmp_path.name}-k3home" / "blockers.db")
     assert [b["text"] for b in restarted.pending()] == ["approve the deploy"]
     restarted.close()
 

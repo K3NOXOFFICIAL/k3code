@@ -194,3 +194,32 @@ def test_permission_mode_coversion() -> None:
     assert PermissionMode("ask") is PermissionMode.DEFAULT
     assert PermissionMode("auto_edit") is PermissionMode.ACCEPT_EDITS
     assert PermissionMode("yolo") is PermissionMode.YOLO
+
+
+# --- auto mode writes only inside the project roots -------------------------------
+
+
+def test_auto_mode_denies_writes_outside_the_project_roots() -> None:
+    assert decide(mode="auto", tool="write", args={"path": "/etc/motd"}, cwd=CWD).action == "deny"
+    assert decide(mode="auto", tool="edit", args={"path": "/home/user/notes.md"}, cwd=CWD).action == "deny"
+    d = decide(mode="auto", tool="bash", args={"command": "echo x > /home/user/x.txt"}, cwd=CWD)
+    assert d.action == "deny" and "project roots" in (d.message or "")
+
+
+def test_auto_mode_still_allows_project_writes_and_reads_outside() -> None:
+    assert decide(mode="auto", tool="write", args={"path": "a.txt"}, cwd=CWD).action == "allow"
+    assert decide(mode="auto", tool="bash", args={"command": "echo x > a.txt"}, cwd=CWD).action == "allow"
+    assert decide(mode="auto", tool="bash", args={"command": "cat < /etc/hosts"}, cwd=CWD).action == "allow"
+    assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD).action == "allow"
+
+
+def test_auto_mode_honours_an_explicit_user_allow_outside_the_roots() -> None:
+    user = [_r("edit", "/srv/notes/*", "allow")]
+    d = decide(mode="auto", tool="write", args={"path": "/srv/notes/a.md"}, cwd=CWD, user_rules=user)
+    assert d.action == "allow"
+
+
+def test_yolo_and_default_modes_are_not_restricted_to_the_roots() -> None:
+    assert decide(mode="yolo", tool="write", args={"path": "/etc/motd"}, cwd=CWD).action == "allow"
+    assert decide(mode="default", tool="write", args={"path": "/etc/motd"}, cwd=CWD).action == "ask"
+

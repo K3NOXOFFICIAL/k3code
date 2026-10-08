@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
+import subprocess
 import tarfile
 from pathlib import Path
 
@@ -157,6 +159,11 @@ async def test_debug_command_toggles_and_dumps(tmp_path, monkeypatch):
 # ── sandbox ──
 
 
+def test_unattended_sessions_are_sandboxed_in_any_mode():
+    assert sandbox.should_sandbox(PermissionMode.DEFAULT, False, unattended=True)  # e.g. goal continuation, sub-agent
+    assert not sandbox.should_sandbox(PermissionMode.DEFAULT, False, unattended=False)
+
+
 def test_bwrap_argv_policy(tmp_path):
     home = tmp_path / "home"
     (home / ".cache").mkdir(parents=True)
@@ -214,7 +221,7 @@ async def test_agent_loop_sandboxes_only_unattended(tmp_path):
     assert loop._sandbox_argv() is not None
 
 
-def test_loop_falls_back_when_bwrap_missing(tmp_path, monkeypatch):
+def test_interactive_loop_runs_unsandboxed_with_a_warning_when_bwrap_missing(tmp_path, monkeypatch, caplog):
     from k3code.agent.loop import AgentLoop
 
     class _R:
@@ -222,7 +229,34 @@ def test_loop_falls_back_when_bwrap_missing(tmp_path, monkeypatch):
 
     monkeypatch.setattr(sandbox, "usable", lambda: False)
     loop = AgentLoop(_R(), system_prompt="x", cwd=tmp_path, permission_mode="yolo")  # type: ignore[arg-type]
-    assert loop._sandbox_argv() is None  # runs unsandboxed; /doctor warns
+    assert loop._sandbox_argv() is None  # a user is watching: runs unsandboxed, /doctor warns
+    assert "bwrap unavailable" in caplog.text
+
+
+async def test_unattended_bash_is_refused_when_bwrap_is_unusable(tmp_path, monkeypatch):
+    """Background, goal and sub-agent bash fail closed: the model gets an error and no process is started."""
+    import asyncio
+
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import ToolCall
+
+    class _R:
+        chain: list = []
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    spawned: list[tuple] = []
+
+    async def refuse_spawn(*argv, **kwargs):
+        spawned.append(argv)
+        raise AssertionError("an unattended command must not be spawned without bwrap")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", refuse_spawn)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse_spawn)
+    for kwargs in ({"background": True}, {"unattended": True}):
+        loop = AgentLoop(_R(), system_prompt="x", cwd=tmp_path, permission_mode="yolo", **kwargs)  # type: ignore[arg-type]
+        result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "touch made.txt"}))
+        assert "bash refused" in result["error"] and "bubblewrap is unusable" in result["error"]
+    assert spawned == [] and not (tmp_path / "made.txt").exists()
 
 
 def test_doctor_warns_without_bwrap(monkeypatch):
@@ -306,8 +340,8 @@ async def test_model_chain_command_shows_cooldown(chain_home):
     assert out.startswith("Chain updated") and "1. direct/c" in out
 
 
-def test_sandbox_argv_drops_the_daemon_environment():
-    argv = sandbox.build_argv("/tmp", bwrap="/usr/bin/bwrap")
+def test_sandbox_argv_drops_the_daemon_environment(tmp_path):
+    argv = sandbox.build_argv(tmp_path, bwrap="/usr/bin/bwrap")
     assert "--clearenv" in argv and "--unshare-ipc" in argv
     assert "--setenv" in argv and argv[argv.index("--setenv") + 1] in sandbox.ENV_ALLOW
     assert all(name in sandbox.ENV_ALLOW for name in (argv[i + 1] for i, a in enumerate(argv) if a == "--setenv"))
@@ -342,3 +376,227 @@ def test_a_failed_bwrap_probe_is_retried_not_latched(monkeypatch):
     clock[0] += 10_000
     assert sandbox.usable() is True and len(calls) == 2  # a positive result is cached
     sandbox.reset_probe()
+
+
+# ── one gate for unattended children (P2-1) ──
+
+_SECRET_KEYS = {"K3CODE_API_KEY": "sk-k3-secret-111", "OMNIROUTE_API_KEY": "sk-omni-secret-222"}
+
+
+async def test_goal_gate_and_fanout_children_never_get_provider_keys(tmp_path, monkeypatch):
+    from k3code.autonomy.fanout import run_tests
+    from k3code.goals import GoalGate, run_gate
+
+    for name, value in _SECRET_KEYS.items():
+        monkeypatch.setenv(name, value)
+    _passed, _code, gate_out = await run_gate(GoalGate(command="env"), cwd=str(tmp_path))
+    _ok, fanout_out = await run_tests("env", tmp_path, 30)
+    for text in (gate_out, fanout_out):
+        assert "sk-k3-secret-111" not in text and "sk-omni-secret-222" not in text
+        assert "K3CODE_API_KEY" not in text and "OMNIROUTE_API_KEY" not in text
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_unattended_gate_and_fanout_argv_start_with_bwrap(tmp_path, monkeypatch):
+    from k3code.autonomy.fanout import run_tests
+    from k3code.goals import GoalGate, run_gate
+
+    spawned: list[tuple[str, ...]] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spy(*argv, **kwargs):
+        spawned.append(argv)
+        return await real_exec(*argv, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    passed, code, _ = await run_gate(GoalGate(command="true"), cwd=str(tmp_path))
+    ok, _ = await run_tests("true", tmp_path, 30)
+    assert passed and code == 0 and ok
+    assert len(spawned) == 2 and all(argv[0] == sandbox.bwrap_path() for argv in spawned)
+
+
+def test_unattended_prefix_refuses_when_bwrap_is_unusable(tmp_path, monkeypatch):
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    with pytest.raises(sandbox.SandboxUnavailable):
+        sandbox.unattended_prefix(tmp_path)
+
+
+async def test_goal_gate_fails_closed_without_bwrap(tmp_path, monkeypatch):
+    from k3code.goals import GoalGate, run_gate
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    marker = tmp_path / "ran.txt"
+    passed, code, text = await run_gate(GoalGate(command=f"touch {marker}"), cwd=str(tmp_path))
+    assert passed is False and code == -1 and "unusable" in text
+    assert not marker.exists()  # the check never ran unsandboxed
+
+
+def test_harness_git_disables_hooks_and_fsmonitor():
+    argv = sandbox.harness_git_argv("status", "--porcelain")
+    assert argv[0] == "git" and argv[-2:] == ["status", "--porcelain"]
+    configs = {argv[i + 1] for i, arg in enumerate(argv) if arg == "-c"}
+    assert {"core.hooksPath=/dev/null", "core.fsmonitor=false"} <= configs
+
+
+async def test_harness_git_children_get_hardened_argv_and_scrubbed_env(tmp_path, monkeypatch):
+    from k3code.subagents import worktree
+
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "sk-omni-secret-222")
+    seen: dict[str, object] = {}
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spy(*argv, **kwargs):
+        seen["argv"], seen["env"] = argv, kwargs.get("env") or {}
+        return await real_exec(*argv, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    await worktree.git(tmp_path, "--version")
+    argv, env = seen["argv"], seen["env"]
+    assert "core.hooksPath=/dev/null" in argv and "core.fsmonitor=false" in argv
+    assert "OMNIROUTE_API_KEY" not in env and "PATH" in env
+
+
+def test_mcp_stdio_children_get_the_scrubbed_env(monkeypatch):
+    from k3code import mcpclient
+
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "sk-omni-secret-222")
+    env = mcpclient.stdio_env({"MY_SERVER_SETTING": "x"})
+    assert "OMNIROUTE_API_KEY" not in env and env["MY_SERVER_SETTING"] == "x" and "PATH" in env
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_goal_continuation_bash_is_sandboxed_in_a_foreground_session(tmp_path, monkeypatch):
+    from k3code.routing.tiers import TaskKind
+    from test_autonomy_gateway import make, start
+
+    server = make(tmp_path, monkeypatch, [], mode="default", autonomy={"plan_first": False, "proposals": False})
+    (tmp_path / "proj").mkdir()  # the k3code home lives under tmp_path: a project must not contain it
+    await start(server, tmp_path / "proj")
+    session = server.session
+    user_turn = server._build_loop(session, None, None, TaskKind.INTERACTIVE_TURN, None)
+    assert user_turn._sandbox_argv() is None  # the user's own turn in default mode stays unsandboxed
+    session.goal_continuation = True
+    continuation = server._build_loop(session, None, None, TaskKind.INTERACTIVE_TURN, None)
+    assert continuation.unattended and continuation._sandbox_argv()[0] == sandbox.bwrap_path()
+
+
+# ── sandbox roots, git metadata, network, cwd (P2-4) ──
+
+
+def test_sandbox_refuses_roots_that_expose_home_ssh_or_the_k3code_home(tmp_path, monkeypatch):
+    home, k3 = tmp_path / "home", tmp_path / "k3"
+    (home / ".ssh").mkdir(parents=True)
+    monkeypatch.setenv("K3CODE_HOME", str(k3))
+    for bad in (home, tmp_path, home / ".ssh", k3):  # $HOME, a parent of it, ~/.ssh, the k3code home
+        with pytest.raises(sandbox.SandboxRefused):
+            sandbox.build_argv(bad, home=home, bwrap="/usr/bin/bwrap")
+    assert sandbox.build_argv(home / "project", home=home, bwrap="/usr/bin/bwrap")[0] == "/usr/bin/bwrap"
+
+
+def test_git_metadata_is_bound_read_only(tmp_path):
+    from m1cmd_helpers import git_repo
+
+    repo = git_repo(tmp_path / "repo").resolve()
+    joined = " ".join(sandbox.build_argv(repo, home=tmp_path / "home", bwrap="/usr/bin/bwrap"))
+    assert f"--bind {repo} {repo}" in joined
+    assert f"--ro-bind {repo / '.git'} {repo / '.git'}" in joined
+
+
+def test_linked_worktree_gitdir_and_common_dir_are_bound_read_only(tmp_path):
+    from m1cmd_helpers import git_repo
+
+    repo = git_repo(tmp_path / "repo").resolve()
+    wt = repo / ".k3code" / "worktrees" / "child1"
+    subprocess.run(["git", "worktree", "add", "-q", str(wt), "-b", "k3/child1"], cwd=repo, check=True,
+                   capture_output=True)
+    joined = " ".join(sandbox.build_argv(wt, home=tmp_path / "home", bwrap="/usr/bin/bwrap"))
+    gitdir = (repo / ".git" / "worktrees" / "child1").resolve()
+    assert f"--ro-bind {gitdir} {gitdir}" in joined  # the linked worktree's admin dir lives outside the checkout
+    assert f"--ro-bind {repo / '.git'} {repo / '.git'}" in joined  # the common dir holds the objects
+
+
+def test_unattended_sandbox_has_no_network_unless_allowed(tmp_path, monkeypatch):
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    assert "--unshare-net" in sandbox.build_argv(tmp_path, network=False, bwrap="/usr/bin/bwrap")
+    assert "--unshare-net" not in sandbox.build_argv(tmp_path, bwrap="/usr/bin/bwrap")
+    assert "--unshare-net" in sandbox.unattended_prefix(tmp_path)
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_sandboxed_bash_starts_in_the_requested_cwd(tmp_path):
+    proj = tmp_path / "proj"
+    (proj / "sub").mkdir(parents=True)
+    res = await tool_bash({"command": "pwd", "cwd": "sub"}, cwd=proj, sandbox=sandbox.build_argv(proj))
+    assert res["stdout"].strip() == str((proj / "sub").resolve())
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_sandboxed_bash_cannot_write_git_hooks(tmp_path):
+    from m1cmd_helpers import git_repo
+
+    repo = git_repo(tmp_path / "repo").resolve()
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    cmd = f"echo 'touch pwned' > {hook}; echo ok > inside.txt"
+    res = await tool_bash({"command": cmd}, cwd=repo, sandbox=sandbox.build_argv(repo))
+    assert not hook.exists()
+    assert (repo / "inside.txt").read_text().strip() == "ok"  # the working tree itself stays writable
+    assert "Read-only file system" in res["stderr"]  # the hook write was refused by the sandbox
+
+
+# ── escape regression suite (P2-5): each case fails on the pre-fix branch ──
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_escape_bash_with_home_as_cwd_cannot_write_into_home(tmp_path, monkeypatch):
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import ToolCall
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))  # the sandbox hides and binds Path.home()
+
+    class _R:
+        chain: list = []
+
+    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="yolo")  # type: ignore[arg-type]
+    touch = f"touch {home}/escaped.txt"
+    result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": touch}))
+    assert "bash refused" in result.get("error", "")
+    assert not (home / "escaped.txt").exists(), "sandboxed bash with cwd $HOME wrote into $HOME"
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_escape_a_hook_planted_from_the_sandbox_never_runs_under_harness_git(tmp_path):
+    from k3code.subagents import worktree
+    from m1cmd_helpers import git_repo
+
+    repo = git_repo(tmp_path / "repo").resolve()
+    marker = tmp_path / "hook-ran.txt"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    body = f"#!/bin/sh\ntouch {marker}\n"
+    await tool_bash({"command": f"printf '{body}' > {hook}; chmod +x {hook}"}, cwd=repo,
+                    sandbox=sandbox.build_argv(repo))
+    (repo / "change.txt").write_text("x\n")
+    await worktree.git(repo, "add", "-A")
+    await worktree.git(repo, "commit", "-qm", "harness commit")  # the harness's own git
+    assert not marker.exists(), "a hook written from the sandbox ran under harness git"
+
+
+async def test_escape_auto_mode_write_outside_the_project_is_denied(tmp_path):
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import ToolCall
+
+    project = tmp_path / "project"
+    project.mkdir()
+    target = tmp_path / "outside.txt"
+
+    class _R:
+        chain: list = []
+
+    loop = AgentLoop(_R(), system_prompt="x", cwd=project, permission_mode="auto")  # type: ignore[arg-type]
+    result = await loop._execute_tool(
+        ToolCall(id="c1", name="write", arguments={"path": str(target), "content": "pwned"})
+    )
+    assert "project roots" in result.get("error", "")
+    assert not target.exists(), "auto mode wrote outside the project roots"
+

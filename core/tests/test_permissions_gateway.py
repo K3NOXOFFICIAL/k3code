@@ -45,7 +45,7 @@ def bash(cmd: str, id: str = "c1") -> ToolCall:
 
 
 def make_server(tmp: Path, turns: list[ToolCall | str], monkeypatch, mode: str = "default", **cfg):
-    monkeypatch.setenv("K3CODE_HOME", str(tmp / "home"))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp.parent / f"{tmp.name}-k3home"))  # beside, not inside, the project
     store = SessionStore(tmp / "sessions.db")
     config = Settings(
         providers=[ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE")],
@@ -130,7 +130,7 @@ async def test_always_persists_project_rule_and_new_session_skips(tmp_path, monk
     # decisions log
     from k3code.learning.decisions import DecisionLog
 
-    rows = DecisionLog(tmp_path / "home").query("approval")
+    rows = DecisionLog(tmp_path.parent / f"{tmp_path.name}-k3home").query("approval")
     assert rows[0]["choice"] == "always" and rows[0]["detail"]["tool"] == "bash" and rows[0]["cwd"] == str(tmp_path)
 
 

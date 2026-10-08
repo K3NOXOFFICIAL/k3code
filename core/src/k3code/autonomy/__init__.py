@@ -10,6 +10,9 @@ DEFAULTS: dict[str, Any] = {
     "gate_modes": ["auto"],
     #: run the plan-first gate for unattended sessions too (cron, loop ticks, automations); off = pre-approved
     "gate_unattended": False,
+    #: unattended bash (goal continuations, sub-agents, background runs) keeps the network inside the sandbox;
+    #: off = no network (bwrap cannot filter by host, so this is all or nothing)
+    "unattended_network": False,
     #: advisor critique after plan approval / before a goal is declared done (auto mode)
     "advisor_on_plan": True,
     "advisor_on_goal": True,

@@ -88,7 +88,8 @@ def steps_for(subs: list[str], extra: list[dict] | None = None, reviews: list[di
 
 async def test_fanout_runs_children_in_parallel_reviews_merges_and_tests_each_merge(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
-    log = tmp_path / "testlog.txt"
+    # the test command runs sandboxed: it may write only inside the project, and .k3code/ is git-ignored
+    log = repo / ".k3code" / "testlog.txt"
     server = make_fan(tmp_path, monkeypatch, steps_for(SUBS), repo, test_command=f"echo ran >> {log}")
     await start_in(server, repo)
     await run_turn(server, "build the whole feature")

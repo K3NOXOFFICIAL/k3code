@@ -18,6 +18,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 DEFAULT_MAX_TURNS = 30
@@ -99,14 +100,14 @@ class GoalGate:
 
 
 async def run_gate(gate: GoalGate, *, cwd: str | None = None) -> tuple[bool, int, str]:
-    """Run the gate through the shell: ``(passed, exit_code, output_tail)``; a timeout is exit code -1."""
+    """Run the gate through the shell, sandboxed: ``(passed, exit_code, output_tail)``; a timeout is exit code -1.
+
+    A gate runs during an unattended goal turn, so it fails closed: no usable bwrap means the check did not pass.
+    """
+    from k3code.reliability import sandbox
+
     try:
-        proc = await asyncio.create_subprocess_shell(
-            gate.command,
-            cwd=cwd or None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        proc = await sandbox.spawn_unattended_shell(gate.command, cwd=cwd or str(Path.cwd()))
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), max(1, int(gate.timeout_seconds)))
         except TimeoutError:

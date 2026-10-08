@@ -167,7 +167,7 @@ class ServerRunner:
                     await old.reliability.stop()
 
     async def run_shell(self, command: str, cwd: str) -> tuple[int, str]:
-        """Run a shell command inside the bwrap sandbox (unsandboxed with a note when bwrap is unusable)."""
+        """Run a shell command inside the bwrap sandbox. Unattended, so it fails closed when bwrap is unusable."""
         from k3code.reliability import sandbox
         from k3code.tools import tool_bash
 
@@ -175,12 +175,14 @@ class ServerRunner:
         if denied:
             return 126, f"denied by hardline rule: {denied}"
         workdir = cwd or str(Path.cwd())
-        # usable() spawns bwrap (up to 10 s on first use): keep it off the event loop
-        argv = sandbox.build_argv(workdir) if await asyncio.to_thread(sandbox.usable) else None
+        try:
+            # usable() spawns bwrap (up to 10 s on first use): unattended_prefix runs off the event loop
+            argv = await asyncio.to_thread(sandbox.unattended_prefix, workdir)
+        except sandbox.SandboxRefused as exc:
+            return 126, f"refused: {exc}"
         res = await tool_bash({"command": command, "timeout": SHELL_TIMEOUT_S}, cwd=Path(workdir), sandbox=argv)
         out = (res.get("stdout") or "") + (res.get("stderr") or "") + (res.get("error") or "")
-        note = "" if argv else "\n[note: bwrap unavailable, ran unsandboxed]"
-        return int(res.get("exit_code") if res.get("exit_code") is not None else 1), out.strip() + note
+        return int(res.get("exit_code") if res.get("exit_code") is not None else 1), out.strip()
 
     async def start_goal(self, objective: str, session_id: str | None, cwd: str) -> RunResult:
         """Create (or reuse) a session, set a /goal on it and let the goal loop drive it."""

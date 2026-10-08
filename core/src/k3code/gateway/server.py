@@ -145,6 +145,8 @@ class LiveSession:
             self.control["goal"] = GoalState.from_dict(stored.meta["goal"]).snapshot()
         #: Background/cron/loop sessions run bash inside the sandbox.
         self.background = bool(stored.meta.get("background"))
+        #: True while a /goal continuation runs: nobody is watching, so bash is sandboxed even in a foreground session.
+        self.goal_continuation = False
         self.reliability: Reliability | None = None
         #: paused = waiting on the network/provider; the session still counts as working.
         self.paused = False
@@ -1170,16 +1172,21 @@ class GatewayServer:
     async def _run_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """One user prompt, then (while a /goal is active) judge + auto-continue until done/paused/budget."""
         async with session.turn_lock:  # a second turn on this session waits instead of interleaving with the first
-            result = await self._run_turn_locked(session, text)
-            # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
-            while session.pending_prompts and result[0] not in ("interrupted", "halted"):  # halted: keep them queued
-                result = await self._run_turn_locked(session, session.pending_prompts.pop(0))
-            return result
+            try:
+                result = await self._run_turn_locked(session, text)
+                # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
+                # halted: keep the queued prompts for after /daemon resume
+                while session.pending_prompts and result[0] not in ("interrupted", "halted"):
+                    result = await self._run_turn_locked(session, session.pending_prompts.pop(0))
+                return result
+            finally:
+                session.goal_continuation = False
 
     async def _run_turn_locked(self, session: LiveSession, text: str) -> tuple[str, str]:
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
         prompt = text
         mgr = self.goal_manager(session)
+        session.goal_continuation = False  # the prompt the user sent is not a continuation
         while True:
             try:
                 await self._maybe_compact(session)
@@ -1213,6 +1220,7 @@ class GatewayServer:
                 self._session_finished(session, status)
                 return status, final_text
             prompt = decision.prompt
+            session.goal_continuation = True  # unattended from here on: the goal drives the next turn
 
     def _block_goal_for(self, session: LiveSession, status: str) -> None:
         """A turn that did not finish leaves its active goal paused, with the reason and one notification.
@@ -1283,6 +1291,8 @@ class GatewayServer:
             reliability=reliability,
             session=session.session_id,
             background=session.background,
+            unattended=session.goal_continuation,
+            unattended_network=bool(autonomy_cfg(self.config)["unattended_network"]),
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
         )

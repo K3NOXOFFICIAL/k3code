@@ -68,11 +68,16 @@ def detect_test_command(repo: str | Path) -> str | None:
 
 
 async def run_tests(cmd: str, cwd: str | Path, timeout: float = 600) -> tuple[bool, str]:
-    """Run the test command; pytest's "no tests collected" (5) counts as a pass."""
-    proc = await asyncio.create_subprocess_shell(
-        cmd, cwd=str(cwd), stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-    )
+    """Run the test command in the sandbox; pytest's "no tests collected" (5) counts as a pass.
+
+    Fan-out and ultra run unattended: without a usable bwrap the tests are refused (a failure), never run bare.
+    """
+    from k3code.reliability import sandbox
+
+    try:
+        proc = await sandbox.spawn_unattended_shell(cmd, cwd=cwd)
+    except sandbox.SandboxRefused as exc:
+        return False, str(exc)
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
     except TimeoutError:

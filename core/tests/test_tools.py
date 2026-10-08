@@ -143,6 +143,13 @@ async def test_grep_no_matches(temp_dir):
     assert result["matches"] == ""
 
 
+async def test_grep_pattern_that_looks_like_a_flag_is_searched_as_text(temp_dir):
+    # Without -e/--, rg reads "--files" as its own option and lists file names instead of matching the line.
+    (temp_dir / "notes.txt").write_text("the flag --files is literal here\n")
+    result = await tool_grep({"pattern": "--files", "path": "."}, cwd=temp_dir)
+    assert "notes.txt:1:the flag --files is literal here" in result["matches"]
+
+
 async def test_glob_finds(temp_dir):
     (temp_dir / "a.py").write_text("")
     (temp_dir / "b.txt").write_text("")

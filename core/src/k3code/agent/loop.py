@@ -64,6 +64,8 @@ class AgentLoop:
         on_auto_allow: AutoAllowCallback | None = None,
         permissions: PermissionState | None = None,
         background: bool = False,
+        unattended: bool = False,
+        unattended_network: bool = False,
         task_kind: str = "interactive_turn",
         max_tool_errors: int = 0,
     ) -> None:
@@ -84,6 +86,10 @@ class AgentLoop:
         self.headless = headless
         #: Background/cron/loop sessions run bash sandboxed (like auto/yolo mode).
         self.background = background
+        #: No human is watching this run (goal continuation, sub-agent): bash is sandboxed whatever the mode.
+        self.unattended = unattended
+        #: Unattended bash keeps the network only when configured (``autonomy.unattended_network``).
+        self.unattended_network = unattended_network
         self._sandbox_warned = False
         self.on_event = on_event
         self.on_text_delta = on_text_delta
@@ -329,6 +335,8 @@ class AgentLoop:
                 result = await handler(args, cwd=self.cwd, sandbox=argv)
             else:
                 result = await handler(args, cwd=self.cwd)
+        except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
+            result = {"error": f"bash refused: {exc}"}
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
             result = {"error": f"Tool execution failed: {e}"}
@@ -337,15 +345,26 @@ class AgentLoop:
         return result
 
     def _sandbox_argv(self) -> list[str] | None:
-        """bwrap prefix for bash in auto/yolo/background sessions; None = run unsandboxed."""
-        if not sandbox.should_sandbox(self.permissions.mode, self.background):
+        """bwrap prefix for bash in sandboxed sessions.
+
+        None = run unsandboxed: interactive auto/yolo sessions when bwrap is unusable (warned once). An unattended
+        session (background, goal continuation, sub-agent) has no human to see a warning, so it raises
+        :class:`sandbox.SandboxUnavailable` instead: fail closed, nothing runs.
+        """
+        if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return None
+        unattended = self.background or self.unattended
         if not sandbox.usable():
+            if unattended:
+                raise sandbox.SandboxUnavailable(
+                    "bubblewrap is unusable here: unattended bash is refused; see /doctor"
+                )
             if not self._sandbox_warned:
                 self._sandbox_warned = True
                 logger.warning("bwrap unavailable: running bash without the sandbox (see /doctor)")
             return None
-        return sandbox.build_argv(self.cwd, self.permissions.add_dirs)
+        network = self.unattended_network if unattended else True
+        return sandbox.build_argv(self.cwd, self.permissions.add_dirs, network=network)
 
     # ── M2 reliability helpers ──
 

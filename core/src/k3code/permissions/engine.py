@@ -183,10 +183,25 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
 #: Redirections that are harmless next to any command (they do not write or read an arbitrary file).
 _HARMLESS_REDIRECT = re.compile(r"(?:\d*>&\d+|&>\s*/dev/null|\d*>>?\s*/dev/null)")
 _REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*(?:>>?|<)\s*([^\s;&|<>()]+)")
+#: Output redirections only (``>``, ``>>``): reading with ``<`` is never restricted by the write roots.
+_WRITE_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*>>?\s*([^\s;&|<>()]+)")
 _SUBSTITUTION = re.compile(r"\$\(|`")
 #: Redirect targets that are code or credentials even inside the project.
 _SENSITIVE_TARGET = re.compile(r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
                                r"\.zsh(?:rc|env)|\.profile|\.zprofile|authorized_keys|\.netrc|\.npmrc|\.env)(?:/|$)")
+
+
+def _writes_outside_roots(sub: str, roots: list[str], cwd: str) -> bool:
+    """A redirect in ``sub`` writes a file outside the project roots. Targets that are variables or globs are left to
+    the sandbox; the ``/dev`` sinks are not files."""
+    plain = _HARMLESS_REDIRECT.sub("", sub)
+    for target in _WRITE_REDIRECT.findall(plain):
+        target = target.strip("'\"")
+        if not target or target.startswith("/dev/") or any(ch in target for ch in "$`*?[{"):
+            continue
+        if not _inside(_abs(target, cwd), roots):
+            return True
+    return False
 
 
 def _redirects_ok(plain: str, roots: list[str], cwd: str) -> bool:
@@ -234,6 +249,10 @@ def _decide_bash(
         return Decision(action="deny", patterns=prefixes, message=PLAN_MSG)
     if mode == PermissionMode.YOLO:
         return Decision(action="allow", patterns=prefixes)
+    if mode == PermissionMode.AUTO and any(_writes_outside_roots(sub, roots, cwd) for sub in subs):
+        # auto mode writes only inside the project roots; no allow rule overrides this
+        return Decision(action="deny", patterns=prefixes,
+                        message=f"Auto mode writes only inside the project roots: {command[:120]}")
     worst: Rule | None = None
     for sub in subs:
         rule = evaluate("bash", sub, ruleset, default="ask")
@@ -258,8 +277,12 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         fallback = "allow"
     rule = evaluate("edit" if is_edit else "read", path, ruleset, default=fallback)
     dec = Decision(action=rule.action, patterns=[path], rule=rule)
-    if not inside and rule.layer == 0:
-        dec.message = f"Outside project roots: {path}"
+    if not inside:
+        if rule.layer == 0:
+            dec.message = f"Outside project roots: {path}"
+        if is_edit and mode == PermissionMode.AUTO and rule.action == "ask":
+            # auto mode writes only inside the project roots; an explicit user allow rule still applies
+            dec.action, dec.message = "deny", f"Auto mode writes only inside the project roots: {path}"
     return dec
 
 
