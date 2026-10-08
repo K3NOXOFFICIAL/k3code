@@ -30,7 +30,7 @@ var (
 	pprofAddr  string
 )
 
-const helpText = `k3 - TUIOS with the k3 modal keymap (full reference: docs/k3-keymap.md)
+const helpText = `k3 - TUIOS with the k3 modal keymap (full reference: panes/docs/k3-keymap.md in the k3code repo)
 
 Usage: k3 [-h|--help]
 

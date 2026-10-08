@@ -167,7 +167,7 @@ k3        # the multi-window terminal (built from panes/ by the installer)
 | (typing) | Everything goes to the focused pane, like a normal terminal |
 | `Ctrl+G` | Leader: then `p` panes, `t` tabs, `s` sessions, `r` resize, `/` search, `a` agents, `?` help |
 | `Esc` | Always back to typing |
-| `Alt+←↑↓→` | Focus a neighbouring pane (in typing mode; the leader modes ignore it) |
+| `Alt+←↑↓→` | Focus a neighbouring pane (works in every mode) |
 | `Alt+n` / `Alt+1…9` / `Alt+z` | New pane / jump to workspace / zoom |
 | `Ctrl+P` | Command palette (a searchable list of actions; its right-hand column shows the underlying TUIOS keys, not the k3 keys above) |
 

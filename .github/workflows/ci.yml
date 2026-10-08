@@ -59,7 +59,12 @@ jobs:
       - working-directory: panes
         run: go build ./cmd/k3
       - working-directory: panes
-        run: go test ./internal/k3keys/...
+        run: go vet ./internal/k3keys/... ./internal/harness/... ./cmd/k3/
+      - working-directory: panes
+        run: go test -race ./internal/k3keys/... ./internal/harness/...
+      - name: upstream packages the k3 hooks touch
+        working-directory: panes
+        run: go test ./internal/input/ ./internal/app/
 
   vendor_check:
     runs-on: ubuntu-latest

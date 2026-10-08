@@ -136,6 +136,14 @@ var defaultBindings = map[Mode]map[string]string{
 	},
 }
 
+// globalKeys are the typing-mode keys that also work in every other mode.
+var globalKeys = map[string]bool{
+	"alt+left": true, "alt+right": true, "alt+up": true, "alt+down": true,
+	"alt+n": true, "alt+z": true, "ctrl+p": true,
+	"alt+1": true, "alt+2": true, "alt+3": true, "alt+4": true, "alt+5": true,
+	"alt+6": true, "alt+7": true, "alt+8": true, "alt+9": true,
+}
+
 // KeyState holds the current keymap state.
 type KeyState struct {
 	Mode   Mode
@@ -156,47 +164,22 @@ func (s *KeyState) Handle(key string, bindings map[Mode]map[string]string) ([]st
 	// Normalize key
 	key = strings.ToLower(strings.TrimSpace(key))
 
-	// Global keys that work in ANY mode (including Typing)
-	// These are checked first before mode-specific bindings
-	switch key {
-	case "alt+left":
-		return []string{"terminal_focus_left"}, true
-	case "alt+right":
-		return []string{"terminal_focus_right"}, true
-	case "alt+up":
-		return []string{"terminal_focus_up"}, true
-	case "alt+down":
-		return []string{"terminal_focus_down"}, true
-	case "alt+n":
-		return []string{"new_window"}, true
-	case "alt+1":
-		return []string{"switch_workspace_1"}, true
-	case "alt+2":
-		return []string{"switch_workspace_2"}, true
-	case "alt+3":
-		return []string{"switch_workspace_3"}, true
-	case "alt+4":
-		return []string{"switch_workspace_4"}, true
-	case "alt+5":
-		return []string{"switch_workspace_5"}, true
-	case "alt+6":
-		return []string{"switch_workspace_6"}, true
-	case "alt+7":
-		return []string{"switch_workspace_7"}, true
-	case "alt+8":
-		return []string{"switch_workspace_8"}, true
-	case "alt+9":
-		return []string{"switch_workspace_9"}, true
-	case "alt+z":
-		return []string{"toggle_zoom"}, true
-	case "ctrl+p":
-		return []string{"command_palette"}, true
-	}
-
 	// Get bindings for current mode
 	modeBindings := bindings[s.Mode]
 	if modeBindings == nil {
 		modeBindings = map[string]string{}
+	}
+
+	// Global keys work in every mode. A binding in the current mode wins;
+	// otherwise the typing-mode binding runs (so user overrides apply) and the
+	// mode stays as it is.
+	if _, ok := modeBindings[key]; !ok && s.Mode != ModeTyping && globalKeys[key] {
+		if action, ok := bindings[ModeTyping][key]; ok && action != "" {
+			if strings.HasPrefix(action, "k3:") || action == "esc" {
+				return s.handleAction(action)
+			}
+			return []string{action}, true
+		}
 	}
 
 	// Check for action in current mode
