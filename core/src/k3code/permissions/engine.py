@@ -395,15 +395,25 @@ def _glob_base(path: str, pattern: str) -> str:
     return os.path.normpath(os.path.join(path, *literal)) if literal else path
 
 
+def _drop_assignments(prefix: str) -> str:
+    """``prefix`` without its leading ``NAME=value`` words (environment assignments, often secrets)."""
+    words = prefix.split(" ")
+    while words and "=" in words[0] and words[0].split("=", 1)[0].isidentifier():
+        words.pop(0)
+    return " ".join(words)
+
+
 def suggest_rules(tool: str, dec: Decision) -> list[Rule]:
     """Narrowest rules to persist for an ``always``/``session`` approval."""
     if tool == "bash":
         # "<prefix> *" matches "git commit" and "git commit -m x" but not "git commit-tree"/"shutdown".
         # Never for launchers (shells, ssh, interpreters, xargs, find, sudo ...): "always allow `python3 *`" would
         # allow every command the user will ever be asked about.
+        # A leading VAR=value is dropped: "always" on `API_KEY=sk-... curl x` wrote the key into config.yaml.
+        prefixes = (_drop_assignments(p) for p in dec.patterns)
         return [
             Rule(tool="bash", pattern=f"{p} *", action="allow")
-            for p in dict.fromkeys(dec.patterns)
+            for p in dict.fromkeys(prefixes)
             if p and not hardline.is_launcher(p)
         ]
     name = "edit" if tool in EDIT_TOOLS else "read" if tool in READ_TOOLS else tool

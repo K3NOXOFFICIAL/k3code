@@ -403,6 +403,8 @@ def command_prefix(sub_command: str) -> str:
         tokens = shlex.split(sub_command, posix=True)
     except ValueError:
         tokens = sub_command.split()
+    while tokens and "=" in tokens[0] and tokens[0].split("=", 1)[0].isidentifier():
+        tokens = tokens[1:]  # a leading VAR=value is not the command, and is often a secret
     tokens = [t for t in tokens if not t.startswith("-") or t in ("-", "--")]
     if not tokens:
         return ""

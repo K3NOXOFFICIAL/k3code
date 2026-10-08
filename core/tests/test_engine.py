@@ -317,3 +317,16 @@ def test_builtin_bash_readers_do_not_reach_outside_the_roots_or_secrets(tmp_path
     assert action("grep KEY .env") == "deny"
     assert action("ls src") == "allow" and action("grep -rn 'foo$' src tests") == "allow"
     assert action("cat README.md") == "allow" and action("git log --oneline -5") == "allow"
+
+
+def test_an_always_rule_never_carries_an_inline_environment_value() -> None:
+    """`always` on `API_KEY=sk-... curl x` persisted `API_KEY=sk-... *` (the secret) into config.yaml."""
+    from k3code.permissions.engine import suggest_rules
+
+    for command in ("API_KEY=sk-live-123 curl https://x", "A=1 B=sk-live-123 curl https://x"):
+        d = decide(mode="default", tool="bash", args={"command": command}, cwd=CWD)
+        patterns = [r.pattern for r in suggest_rules("bash", d)]
+        assert patterns == ["curl *"], patterns
+        assert not any("sk-live" in p for p in patterns)
+    d = decide(mode="default", tool="bash", args={"command": "API_KEY=sk-live-123"}, cwd=CWD)
+    assert all("sk-live" not in r.pattern for r in suggest_rules("bash", d))
