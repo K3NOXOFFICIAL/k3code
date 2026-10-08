@@ -19,13 +19,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 from k3code.providers.types import ToolSpec
+from k3code.research.fetch import UA, FetchStatus, WebFetcher
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SEARXNG = ""  # no default instance: web_search stays off until research.searxng_url is set
 MAX_FETCH_CHARS = 14_000
-MAX_FETCH_BYTES = 2 * 1024 * 1024  # how much of a response body is read at most
-UA = "k3code-research/0.1 (+https://github.com/K3NOXOFFICIAL/k3code)"
 
 
 @dataclass
@@ -107,32 +106,30 @@ def _safe_url(url: str) -> str | None:
     return url if u.scheme in ("http", "https") and u.netloc else None
 
 
-async def fetch_page(url: str, *, timeout: float = 20.0, client: httpx.AsyncClient | None = None) -> tuple[str, str]:
-    """(title, text) of a web page (text truncated). Raises ValueError/httpx errors for the caller to report."""
-    if _safe_url(url) is None:
-        raise ValueError(f"not an http(s) URL: {url}")
-    own = client is None
-    client = client or httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": UA})
+async def fetch_page(
+    url: str, *, timeout: float = 20.0, client: httpx.AsyncClient | None = None, fetcher: WebFetcher | None = None
+) -> tuple[str, str]:
+    """(title, text) of a web page through the shared fetch layer (cache, per-host rate, robots.txt, deadline).
+    Raises ``FetchStatus`` for a non-2xx answer, ``FetchRefused`` for robots.txt, and httpx errors for the caller."""
+    if fetcher is not None:
+        return await _read_page(fetcher, url)
+    own = WebFetcher(client=client, deadline=timeout)  # no shared fetcher: a short-lived one for this call
     try:
-        # Streamed and capped: client.get() buffered the whole body (a 1 GB download, a never-ending stream) in the
-        # shared daemon before the text was cut to MAX_FETCH_CHARS.
-        async with client.stream("GET", url) as r:
-            r.raise_for_status()
-            ctype = r.headers.get("content-type", "")
-            encoding = r.encoding or "utf-8"
-            buf = bytearray()
-            async for chunk in r.aiter_bytes():
-                buf += chunk
-                if len(buf) >= MAX_FETCH_BYTES:
-                    break
+        return await _read_page(own, url)
     finally:
-        if own:
-            await client.aclose()
-    body = bytes(buf[:MAX_FETCH_BYTES]).decode(encoding, errors="replace")
-    if "html" in ctype or body.lstrip().lower().startswith(("<!doctype", "<html")):
-        title, text = extract_text(body)
+        await own.aclose()
+
+
+async def _read_page(fetcher: WebFetcher, url: str) -> tuple[str, str]:
+    got = await fetcher.get(url)
+    if not 200 <= got.status < 300:
+        raise FetchStatus(got.status, url)
+    if "html" in got.content_type or got.body.lstrip().lower().startswith(("<!doctype", "<html")):
+        title, text = extract_text(got.body)
     else:
-        title, text = url, body
+        title, text = url, got.body
+    if got.truncated:
+        text += "\n[page cut: the fetch deadline or the size cap was reached]"
     return title or url, text[:MAX_FETCH_CHARS]
 
 
@@ -249,9 +246,11 @@ class ResearchTools:
 class BuiltinTools(ResearchTools):
     name = "builtin web_search/web_fetch"
 
-    def __init__(self, searxng_url: str | None, *, keyless_fallback: bool = True) -> None:
+    def __init__(self, searxng_url: str | None, *, keyless_fallback: bool = True,
+                 fetcher: WebFetcher | None = None) -> None:
         self.searx = SearxngSearch(searxng_url)
         self.ddg = DuckDuckGoSearch() if keyless_fallback else None
+        self.fetcher = fetcher
 
     async def unavailable_reason(self) -> str:
         if await self.searx.available() or self.ddg is not None:
@@ -266,7 +265,7 @@ class BuiltinTools(ResearchTools):
         return []
 
     async def fetch(self, url: str) -> tuple[str, str]:
-        return await fetch_page(url)
+        return await fetch_page(url, fetcher=self.fetcher)
 
 
 _URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
@@ -375,11 +374,12 @@ def rank_tool(tools: list[Any], strong: tuple[str, ...], generic: tuple[str, ...
     return None
 
 
-def pick_tools(config: Any, mcp: Any) -> ResearchTools:
+def pick_tools(config: Any, mcp: Any, fetcher: WebFetcher | None = None) -> ResearchTools:
     """MCP search/fetch when connected, else the built-ins."""
     cfg = dict(getattr(config, "research", None) or {})
     builtin = BuiltinTools(
-        cfg.get("searxng_url", DEFAULT_SEARXNG), keyless_fallback=bool(cfg.get("keyless_fallback", True))
+        cfg.get("searxng_url", DEFAULT_SEARXNG), keyless_fallback=bool(cfg.get("keyless_fallback", True)),
+        fetcher=fetcher,
     )
     tools = list(mcp.tools()) if mcp is not None else []
     search = rank_tool(tools, ("searxng", "web_search", "websearch", "web-search"), ("search",), _NOT_WEB)
@@ -392,15 +392,16 @@ def pick_tools(config: Any, mcp: Any) -> ResearchTools:
 # ── agent-facing tools ──
 
 
-def register_web_tools(reg: Any, config: Any) -> None:
+def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None) -> None:
     """``web_fetch`` always; ``web_search`` over SearXNG (probed lazily, disabled with a message if unreachable)."""
     cfg = dict(getattr(config, "research", None) or {})
     searx = SearxngSearch(cfg.get("searxng_url", DEFAULT_SEARXNG))
+    fetcher = fetcher or WebFetcher.from_config(cfg)
 
     async def tool_fetch(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         url = str(arguments.get("url") or "")
         try:
-            title, text = await fetch_page(url)
+            title, text = await fetch_page(url, fetcher=fetcher)
         except Exception as e:  # noqa: BLE001
             return {"error": f"web_fetch failed: {e}"}
         return {"content": f"# {title}\n{url}\n\n{text}"}

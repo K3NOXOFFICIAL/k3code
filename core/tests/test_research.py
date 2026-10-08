@@ -188,6 +188,7 @@ async def test_builtin_tools_against_a_mocked_searxng_and_pages(tmp_path):
     respx.get("http://p.test/1").mock(
         return_value=httpx.Response(200, text=html_doc, headers={"content-type": "text/html"})
     )
+    respx.get("http://p.test/robots.txt").mock(return_value=httpx.Response(404))  # fetches honour robots.txt
     tools = BuiltinTools("http://searx.test")
     assert await tools.unavailable_reason() == ""
     hits = await tools.search("anything", 5)
@@ -359,6 +360,7 @@ async def test_fetch_page_reads_a_capped_prefix_not_the_whole_body():
     import httpx
 
     from k3code.research import tools
+    from k3code.research.fetch import MAX_FETCH_BYTES
 
     served = {"bytes": 0}
 
@@ -375,7 +377,7 @@ async def test_fetch_page_reads_a_capped_prefix_not_the_whole_body():
     async with httpx.AsyncClient(transport=transport) as client:
         title, text = await tools.fetch_page("https://example.com/huge", client=client)
     assert len(text) <= tools.MAX_FETCH_CHARS and text.startswith("x")
-    assert served["bytes"] < 6 * tools.MAX_FETCH_BYTES  # stopped reading soon after the cap
+    assert served["bytes"] < 6 * MAX_FETCH_BYTES  # stopped reading soon after the cap
 
 
 # ── keyless fallback: DuckDuckGo's HTML endpoint when SearXNG is not reachable ──
