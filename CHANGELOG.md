@@ -2,7 +2,7 @@
 
 All notable changes are listed here. Until version 1.0, any release may change the config format, the commands or the on-disk state. Versions follow [semantic versioning](https://semver.org/) from 1.0 on.
 
-## [0.1.0] - unreleased
+## [0.0.1] - unreleased (not tagged)
 
 The first version meant for people other than its author. It is alpha: the core works and is tested, but live-model behaviour, long unattended runs and multi-day use are not yet verified. The [Status section of the README](README.md#status) has the details.
 

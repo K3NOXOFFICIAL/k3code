@@ -1,0 +1,17 @@
+# Historical gitleaks findings reviewed on 2026-10-08. Every entry is a test fixture or a false positive:
+# redaction-test inputs, a constant named *_KEY, an approval-test label, and one sequential placeholder
+# (AKIA + ABCDEFGH...) in a project-detection test. No value is stored here. Re-review before any new entry.
+1e89b9501789d11d7a51b7ab7f4d2ce539f4fecb:panes/cmd/tuios-web/access_test.go:generic-api-key:98
+1e89b9501789d11d7a51b7ab7f4d2ce539f4fecb:panes/internal/integration/hook_test.go:curl-auth-header:124
+1e89b9501789d11d7a51b7ab7f4d2ce539f4fecb:panes/internal/session/approvals_test.go:generic-api-key:456
+54d6e6b8bcf15ee5dd01ec817b8cd1e2a4051880:core/src/k3code/gateway/server.py:generic-api-key:621
+7e07f5e27c50ea1e0870eeeb0205b3181b9cc1e2:core/tests/test_learning_projectprep.py:aws-access-token:70
+aac91c4906443fdbe85692247a3319e6a07dd1dd:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:66
+b154abc4e7dab81e9f51d923e4f8f5f2bc35a0f6:scripts/dev/tasks/m3-panes.md:generic-api-key:5
+e33f119d1e64ba3f9ae612b2d7f45a13dd769030:core/tests/test_cmd_bundle.py:generic-api-key:19
+e33f119d1e64ba3f9ae612b2d7f45a13dd769030:core/tests/test_cmd_bundle.py:generic-api-key:20
+ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:14
+ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:22
+ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:23
+ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:55
+ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:75
