@@ -37,6 +37,7 @@ class FailoverReason(enum.Enum):
     server = "server"                      # 5xx / overloaded — retry, then fail over
     timeout = "timeout"                    # read/connect timeout — retry, then fail over
     bad_request = "bad_request"            # malformed request/model — fail over, no retry
+    ssl_cert = "ssl_cert"                  # certificate does not verify (missing CA, proxy) — fail over, never park
     unknown = "unknown"                    # unclassifiable — retry with backoff, then fail over
 
 
@@ -49,9 +50,16 @@ RETRYABLE_REASONS = frozenset(
 #: Reasons that skip retries and move straight to the next entry. ``bad_request``
 #: (e.g. an unknown model id) is entry-specific — identical on retry, but a
 #: different model/provider down the chain may well work — so it fails over
-#: rather than aborting the walk.
+#: rather than aborting the walk. ``ssl_cert`` is the same: another entry may not
+#: sit behind the proxy or CA bundle that broke this one.
 IMMEDIATE_FAILOVER_REASONS = frozenset(
-    {FailoverReason.auth, FailoverReason.quota, FailoverReason.bad_request}
+    {FailoverReason.auth, FailoverReason.quota, FailoverReason.bad_request, FailoverReason.ssl_cert}
+)
+
+#: What the user can do about a certificate failure; carried on :attr:`ClassifiedError.hint`.
+SSL_CERT_HINT = (
+    "TLS certificate verification failed: set SSL_CERT_FILE to the CA bundle that signs this endpoint's "
+    "certificate, or check the proxy (it may be re-signing HTTPS traffic)"
 )
 
 #: Reasons that abort the whole walk instead of trying the next entry:
@@ -70,6 +78,8 @@ class ClassifiedError:
     message: str = ""
     #: Seconds until the provider says its window reopens (Retry-After / body / prose).
     retry_after: float | None = None
+    #: What the user can do about this failure (empty when nothing specific applies).
+    hint: str = ""
     error_context: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -244,10 +254,12 @@ _TIMEOUT_ERROR_TYPES = frozenset({
     "TimeoutError", "APITimeoutError",
 })
 
+# A certificate that does not verify is ``ssl_cert``, not one of these (see _by_tls_cert).
 _SSL_ERROR_TYPES = frozenset({
     "SSLError", "SSLZeroReturnError", "SSLWantReadError", "SSLWantWriteError", "SSLEOFError",
-    "SSLSyscallError", "SSLCertVerificationError",
+    "SSLSyscallError",
 })
+_SSL_CERT_ERROR_TYPE = "SSLCertVerificationError"
 
 _RESET_FIELDS = ("resets_in_seconds", "resets_at", "reset_at", "retry_after")
 _RESET_HEADERS = ("retry-after", "Retry-After", "x-ratelimit-reset", "X-RateLimit-Reset")
@@ -446,13 +458,23 @@ def _by_message(c: _Ctx) -> FailoverReason | None:
     return _first_match(c.msg, _MESSAGE_RULES)
 
 
+def _by_tls_cert(c: _Ctx) -> FailoverReason | None:
+    """A certificate that does not verify: deterministic, so not ``network`` (waiting for connectivity never fixes it).
+
+    Runs before the message rules, and before the transient-TLS check (both contain "[ssl:"). The transport
+    error's type is read from the cause chain: httpx wraps ``ssl.SSLCertVerificationError`` without its text.
+    """
+    if any(p in c.msg for p in _SSL_CERT_VERIFY_PATTERNS) or any(
+        type(e).__name__ == _SSL_CERT_ERROR_TYPE for e in _cause_chain(c.error)
+    ):
+        return _R.ssl_cert
+    return None
+
+
 def _by_transport(c: _Ctx) -> FailoverReason | None:
-    """SSL, disconnect and transport-type heuristics, in that order."""
+    """Transient SSL, disconnect and transport-type heuristics, in that order."""
     msg = c.msg
-    # A cert failure is deterministic (fail the request shape); a transient TLS
-    # alert is worth a retry. Checked before disconnects: both contain "[ssl:".
-    if any(p in msg for p in _SSL_CERT_VERIFY_PATTERNS):
-        return _R.network
+    # A transient TLS alert is worth a retry. Checked before disconnects: both contain "[ssl:".
     if any(p in msg for p in _SSL_TRANSIENT_PATTERNS) or c.error_type in _SSL_ERROR_TYPES:
         return _R.network
     if any(p in msg for p in _SERVER_DISCONNECT_PATTERNS) and not c.status_code:
@@ -477,7 +499,7 @@ def _cause_chain(error: BaseException, limit: int = 8) -> list[BaseException]:
     return out
 
 
-_STAGES = (_by_status, _by_error_code, _by_message, _by_transport)
+_STAGES = (_by_status, _by_error_code, _by_tls_cert, _by_message, _by_transport)
 
 
 def classify_api_error(
@@ -513,6 +535,7 @@ def classify_api_error(
         model=model,
         message=_extract_message(error, body),
         retry_after=retry_after,
+        hint=SSL_CERT_HINT if reason is _R.ssl_cert else "",
     )
 
 
