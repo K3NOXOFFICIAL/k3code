@@ -265,6 +265,39 @@ def test_nm_verdict_mapping():
     assert _nm_verdict("connected") == "ok"
 
 
+async def test_network_manager_reconnect_kicks_a_probe():
+    """NM going bad→ok never re-probed (only ok→bad did), and the NM loop shared the monitor's wakeup event, so it
+    could swallow a kick: after an outage the state stayed offline for up to max_interval."""
+    import asyncio
+
+    nm, online, probes = ["disconnected"], [False], []
+
+    async def internet(config):
+        probes.append(nm[0])
+        return InternetProbeResult(ok=online[0], latency_ms=10.0)
+
+    async def nm_probe():
+        return nm[0]
+
+    cfg = _config(base_interval=30, max_interval=60, nm_poll_interval=0.05)
+    nw = _watch(config=cfg, internet_probe=internet, nm_probe=nm_probe)
+    await nw.start()
+    try:
+        for _ in range(100):
+            if nw.state == NetState.OFFLINE:
+                break
+            await asyncio.sleep(0.02)
+        assert nw.state == NetState.OFFLINE
+        nm[0], online[0] = "connected", True
+        for _ in range(100):
+            if nw.state == NetState.ONLINE:
+                break
+            await asyncio.sleep(0.02)
+        assert nw.state == NetState.ONLINE and "connected" in probes
+    finally:
+        await nw.stop()
+
+
 async def test_start_stop_lifecycle():
     nw = _watch()
     await nw.start()
