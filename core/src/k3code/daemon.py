@@ -274,7 +274,7 @@ async def slash_via_daemon(command: str, *, cwd: str, sock: Path | None = None, 
     Uses a throwaway session when ``session_id`` is not given. Answers any ``clarify`` request with its first choice.
     """
     sock = sock or socket_path()
-    reader, writer = await asyncio.open_unix_connection(str(sock))
+    reader, writer = await asyncio.open_unix_connection(str(sock), limit=1 << 26)  # a long output is one line
     pending: dict[int, asyncio.Future[dict]] = {}
     seq = 0
 

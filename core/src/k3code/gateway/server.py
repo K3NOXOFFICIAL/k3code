@@ -83,6 +83,9 @@ from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
 
+#: Longest JSON-RPC line read from a client (a pasted prompt can be megabytes); asyncio's default is 64 KiB.
+MAX_FRAME_BYTES = 1 << 26
+
 #: Emitted for gateway.ready; the TUI repaints its palette from this.
 _DEFAULT_SKIN = {
     "name": "k3code",
@@ -559,13 +562,15 @@ class GatewayServer:
         loop = asyncio.get_running_loop()
         reader = self._stdin
         if reader is None:
-            reader = asyncio.StreamReader()
+            reader = asyncio.StreamReader(limit=MAX_FRAME_BYTES)
             await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin)
 
         self._send_ready(self._stdio_client)
 
         while self._running:
-            line = await reader.readline()
+            line = await self._read_frame(reader, self._stdio_client)
+            if line is None:
+                continue
             if not line:
                 logger.info("stdin EOF; gateway stdio detached")
                 break
@@ -587,7 +592,7 @@ class GatewayServer:
             if _socket_is_live(path):
                 raise RuntimeError(f"{path} is served by another process; not taking it over")
             path.unlink()  # stale socket from a crashed daemon
-        self._socket_server = await asyncio.start_unix_server(self._on_connect, path=str(path))
+        self._socket_server = await asyncio.start_unix_server(self._on_connect, path=str(path), limit=MAX_FRAME_BYTES)
         os.chmod(path, 0o600)
         self.socket_path = path
         self._socket_ino = os.stat(path).st_ino  # so stop_socket only removes the socket this process created
@@ -677,7 +682,9 @@ class GatewayServer:
                     ),
                 )
             while not client.closed:
-                line = await reader.readline()
+                line = await self._read_frame(reader, client)
+                if line is None:
+                    continue
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").strip()
@@ -701,6 +708,16 @@ class GatewayServer:
             logger.info("client %s detached; its sessions keep running", client.name)
             with contextlib.suppress(Exception):
                 writer.close()
+
+    async def _read_frame(self, reader: asyncio.StreamReader, client: Client) -> bytes | None:
+        """The next line from ``reader`` (b"" at EOF), or None for one longer than MAX_FRAME_BYTES: that frame is
+        answered with an error and dropped, the connection stays up. Before, any line over asyncio's 64 KiB default
+        (a pasted log as a prompt) raised out of the read loop: the stdio gateway exited, a socket client was cut."""
+        try:
+            return await reader.readline()
+        except (ValueError, asyncio.LimitOverrunError):
+            self._reply(client, encode_error(None, INVALID_REQUEST, f"frame longer than {MAX_FRAME_BYTES} bytes"))
+            return None
 
     def _is_concurrent_request(self, text: str) -> bool:
         try:
