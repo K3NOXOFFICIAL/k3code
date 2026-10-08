@@ -37,6 +37,7 @@ from k3code.autonomy import advisor, autonomy_cfg
 from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.ultra import Ultra
+from k3code.blockers import BlockerStore
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, load_config
@@ -91,6 +92,8 @@ _DEFAULT_SKIN = {
 }
 
 _SYSTEM_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "system.md"
+#: How long an approval, plan or clarify request may wait for an answer before it is denied and the goal pauses.
+APPROVAL_TIMEOUT_S = 1800.0
 
 
 def _load_system_prompt() -> str:
@@ -342,6 +345,9 @@ class GatewayServer:
         self.safe_mode_notice = ""
         #: ``/daemon pause``: a persisted global halt (k3code.halt); loaded here so it survives a restart.
         self.halt: Halt | None = load_halt(self._home())
+        #: Waits for a person (approvals, paused goals) survive a restart here until a client takes them.
+        self.blockers = BlockerStore(self._home() / "blockers.db")
+        self.approval_timeout_s = APPROVAL_TIMEOUT_S
         #: Set by a graceful stop: a turn cancelled now pauses its goal as "daemon restart" (boot resumes it).
         self.stopping = False
         self._client_seq = 0
@@ -733,6 +739,17 @@ class GatewayServer:
                 )
             if self.halted:
                 self._send(client, encode_event("notification.show", self._halt_payload(), "essential"))
+            for row in self.blockers.pending():  # blockers no client has taken yet: hand them over now
+                payload = {
+                    "text": row["text"],
+                    "level": row["level"],
+                    "kind": row["kind"],
+                    "key": f"k3.blocker.{row['id']}",
+                    "session_id": row["session_id"],
+                    "blocker_id": row["id"],
+                }
+                self._send(client, encode_event("notification.show", payload, "essential"))
+                self.blockers.mark_delivered(row["id"])
             while not client.closed:
                 line = await reader.readline()
                 if not line:
@@ -879,6 +896,7 @@ class GatewayServer:
             await p.aclose()
         self.store.close()
         self.usage.close()
+        self.blockers.close()
 
     def _send_ready(self, client: Client) -> None:
         self._send(
@@ -959,11 +977,23 @@ class GatewayServer:
         params = {"session_id": session_id, **params}
         frame = encode_server_request(method, params, req_id=req_id)
         self._open_requests[req_id] = (session_id, frame)
-        for client in self.clients:
-            if client.session_id == session_id:
-                self._send(client, frame)
+        attached = [c for c in self.clients if c.session_id == session_id]
+        for client in attached:
+            self._send(client, frame)
+        if not attached:  # nobody can answer right now: keep the request visible across a restart
+            self.notify_blocker(session_id, f"Waiting for an answer: {params.get('command') or method}",
+                                level="info", kind="approval", key=f"k3.approval.{req_id}")
         try:
-            return await fut
+            return await asyncio.wait_for(fut, self.approval_timeout_s)
+        except TimeoutError:
+            self._open_requests.pop(req_id, None)
+            self._server_request_futures.pop(req_id, None)
+            cancel = encode_server_request("request.cancel", {"id": req_id, "method": method, "reason": "timeout"})
+            for client in self.clients:
+                if client.session_id == session_id:
+                    self._send(client, cancel)
+            self._block_on_timeout(session_id, method)
+            raise ApprovalTimeout(f"no answer to {method} within {int(self.approval_timeout_s)} s") from None
         except asyncio.CancelledError:
             self._open_requests.pop(req_id, None)
             self._server_request_futures.pop(req_id, None)
@@ -979,6 +1009,18 @@ class GatewayServer:
                 if client.session_id == session_id:
                     self._send(client, cancel)
             raise
+
+    def _block_on_timeout(self, session_id: str, method: str) -> None:
+        """An unanswered request timed out: the goal of that session pauses with the reason, and a blocker is stored."""
+        live = self.live.get(session_id)
+        minutes = int(self.approval_timeout_s // 60) or 1
+        text = f"No answer to the {method} request within {minutes} min. Answer it, then /goal resume."
+        if live is not None:
+            mgr = self.goal_manager(live)
+            if mgr.is_active():
+                mgr.pause(f"{method} timeout")
+                self.emit_goal(live)
+        self.notify_blocker(session_id, text, level="warning", kind="approval", key=f"k3.approval.timeout.{session_id}")
 
     # ── router wiring ─────────────────────────────────────────────────
 
@@ -1200,7 +1242,8 @@ class GatewayServer:
             return
         mgr.pause(reason)
         self.emit_goal(session)
-        self.notify_session(session, text, level="warning", key=f"k3.goal.blocked.{session.session_id}")
+        self.notify_blocker(session.session_id, text, level="warning", kind="goal",
+                            key=f"k3.goal.blocked.{session.session_id}")
 
     def _session_finished(self, session: LiveSession, status: str) -> None:
         """Tell the automation engine (``session_event`` triggers) that a session's run ended."""
@@ -1763,11 +1806,12 @@ class GatewayServer:
         if len(mgr.recent_kicks(now)) >= MAX_KICKS_PER_WINDOW:
             mgr.pause(f"parked: {MAX_KICKS_PER_WINDOW} automatic kicks in 1 h")
             self.emit_goal(live)
-            self.notify_session(
-                live,
+            self.notify_blocker(
+                live.session_id,
                 f"Goal parked after {MAX_KICKS_PER_WINDOW} automatic restarts within an hour ({source}). "
                 "Check it, then /goal resume.",
                 level="warning",
+                kind="goal",
                 key=f"k3.goal.parked.{live.session_id}",
             )
             return False
@@ -1806,7 +1850,7 @@ class GatewayServer:
         return kicked
 
     def notify_session(self, live: LiveSession, text: str, *, level: str = "info", key: str = "") -> None:
-        """A notification to the clients attached to ``live`` (essential, so focus mode keeps it)."""
+        """A transient notification to the clients attached to ``live`` (essential, so focus mode keeps it)."""
         payload = {
             "text": text,
             "level": level,
@@ -1815,6 +1859,25 @@ class GatewayServer:
             "session_id": live.session_id,
         }
         live.emit("notification.show", payload, importance="essential")
+
+    def notify_blocker(self, session_id: str, text: str, *, level: str = "warning", kind: str = "goal",
+                       key: str = "") -> int:
+        """A blocker: stored until a client takes it (so it survives a restart), and shown to attached clients now."""
+        blocker_id = self.blockers.add(session_id=session_id, kind=kind, text=text, level=level)
+        payload = {
+            "text": text,
+            "level": level,
+            "kind": kind,
+            "key": key or f"k3.blocker.{blocker_id}",
+            "session_id": session_id,
+            "blocker_id": blocker_id,
+        }
+        live = self.live.get(session_id)
+        if live is not None:
+            live.emit("notification.show", payload, importance="essential")
+        if any(c.session_id == session_id and not c.closed for c in self.clients):
+            self.blockers.mark_delivered(blocker_id)
+        return blocker_id
 
     def emit_goal(self, session: LiveSession) -> None:
         """Push the goal snapshot to the TUI goal bar (``session.control.update``)."""
@@ -2030,6 +2093,10 @@ def _has_verification(plan: str) -> bool:
 
     m = _re.search(r"^\s*#{1,4}\s*Verification\s*\n(.*?)(?=^\s*#{1,4}\s|\Z)", plan or "", _re.S | _re.M | _re.I)
     return bool(m and m.group(1).strip())
+
+
+class ApprovalTimeout(RuntimeError):
+    """A server→client request (approval, plan, clarify) went unanswered past ``approval_timeout_s``."""
 
 
 class _InvalidParams(Exception):
