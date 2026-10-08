@@ -7,6 +7,7 @@ unreachable ``web_search`` is disabled with a clear message instead of failing e
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -159,12 +160,14 @@ async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher)
     browser's own navigation is admitted like any other request: robots.txt, then a token of the host's bucket."""
     await fetcher.admit(url)
     page: RenderedPage = await browser.fetch(url)
-    verdict = classify(page.status, page.html)
+    verdict = await asyncio.to_thread(classify, page.status, page.html)
     if verdict in STOP_VERDICTS:
         raise Stopped(stop_report(verdict, url))
     if verdict is not Verdict.OK:
         raise RuntimeError(f"still blocked in the browser (HTTP {page.status}) at {url}; not solved, not retried")
-    title, text = extract_text(page.html)
+    title, text = await asyncio.to_thread(extract_text, page.html)  # off the event loop: parsing is CPU-bound
+    if page.truncated:
+        text += "\n[page cut: the size cap was reached]"
     return title or url, text[:MAX_FETCH_CHARS]
 
 
@@ -540,12 +543,14 @@ def register_web_tools(
             return {"error": f"web_browse failed: {e}"}
         if page.downloads:
             return {"content": "downloaded (saved under the k3code home): " + ", ".join(page.downloads)}
-        verdict = classify(page.status, page.html)
+        verdict = await asyncio.to_thread(classify, page.status, page.html)
         if verdict in STOP_VERDICTS:
             return {"error": stop_report(verdict, url)}
         if verdict is not Verdict.OK:
             return {"error": f"web_browse: still blocked (HTTP {page.status}) at {url}; not solved, not retried"}
-        title, text = extract_text(page.html)
+        title, text = await asyncio.to_thread(extract_text, page.html)
+        if page.truncated:
+            text += "\n[page cut: the size cap was reached]"
         return {"content": f"# {title or url}\n{page.url}\n\n{text[:MAX_FETCH_CHARS]}"}
 
     async def tool_search(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:

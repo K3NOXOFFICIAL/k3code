@@ -404,3 +404,31 @@ async def test_an_escalated_page_takes_a_token_of_the_hosts_rate_budget(monkeypa
         web = fetcher(now=clock.now, sleep=clock.sleep, per_host_rate=1.0, burst=1.0)
         await fetch_page(url, fetcher=web, browser=browser)  # the HTTP fetch takes the only token
     assert clock.t == 1.0  # the browser's navigation waited for the next token
+
+
+async def test_a_huge_dom_is_capped_and_parsed_off_the_event_loop(monkeypatch):
+    import threading
+
+    from k3code.research import tools as t
+
+    monkeypatch.setattr(b, "MAX_SNAPSHOT_CHARS", 1000)
+    big = "<html><body><main><p>" + "word " * 5000 + "</p></main></body></html>"
+    page = FakePage({"https://big.test/": (200, big)}, [])
+    rendered = await b.BrowserManager._read(SimpleNamespace(challenge_wait=0), page, "https://big.test/", [], [])
+    assert rendered.truncated and len(rendered.html) == 1000
+
+    seen: list[str] = []
+    real = t.extract_text
+    monkeypatch.setattr(t, "extract_text", lambda m: (seen.append(threading.current_thread().name), real(m))[1])
+
+    class Browser:
+        async def fetch(self, url):
+            return rendered
+
+    class Fetcher:
+        async def admit(self, url):
+            return None
+
+    _, text = await t._read_rendered(Browser(), "https://big.test/", Fetcher())
+    assert seen and seen[0] != threading.main_thread().name
+    assert "[page cut" in text
