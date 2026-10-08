@@ -351,11 +351,20 @@ def main(
 
     import asyncio
 
+    from k3code import trust
     from k3code.config import load_config
     from k3code.permissions import PermissionMode
 
-    # Load config
-    config = load_config(project_dir=config_dir or Path.cwd())
+    # Load config. A project config is applied only once the user trusted this exact file. Interactive opens are
+    # asked here, in this process (the TUI's gateway is a piped child and cannot ask); headless runs never ask.
+    project_dir = config_dir or Path.cwd()
+    if not prompt and _is_interactive():
+        _offer_project_trust(project_dir)
+    config = load_config(project_dir=project_dir)
+    if trust.decision(project_dir) in (trust.UNDECIDED, trust.DECLINED):
+        click.echo(
+            f"k3code: ignoring {trust.config_path(project_dir)} (not trusted; `k3code trust` applies it)", err=True
+        )
     if not config.providers and (prompt or not _is_interactive()):
         from k3code.setup.onboard import NO_CONFIG_HINT
 
@@ -392,6 +401,22 @@ def main(
 
 def _is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _offer_project_trust(project_dir: Path) -> None:
+    """Show what the project config changes and remember the answer; asked once per version of the file."""
+    from k3code import trust
+
+    if trust.decision(project_dir) != trust.UNDECIDED:
+        return
+    if (why := trust.problem(project_dir)) is not None:
+        click.echo(f"{trust.config_path(project_dir)} is ignored: {why}.", err=True)
+        return
+    click.echo(f"{trust.config_path(project_dir)} changes how k3code runs in this project:", err=True)
+    for line in trust.summary(project_dir) or []:
+        click.echo(f"  - {line}", err=True)
+    answer = click.confirm("Trust this project config?", default=False, err=True)
+    trust.record(project_dir, trusted=answer)
 
 
 def _run_gateway() -> None:
@@ -798,6 +823,39 @@ def update_cmd(check: bool, yes: bool, channel: str | None, from_source: bool, d
     if res.ok:
         upd.prune()
     raise SystemExit(0 if res.ok else 1)
+
+
+@cli.command("trust")
+@click.argument("path", required=False, type=click.Path(path_type=Path, file_okay=False))
+@click.option("--revoke", is_flag=True, help="Forget the answer: the project config is ignored again until trusted")
+def trust_cmd(path: Path | None, revoke: bool) -> None:
+    """Trust a project's .k3code/config.yaml (PATH, default: the current directory).
+
+    Its MCP servers, permission rules and providers apply from the next start. Headless and piped runs ignore a
+    project config that is not trusted; an interactive open asks again when the file changes.
+    """
+    from k3code import trust
+
+    project_dir = path or Path.cwd()
+    where = trust.config_path(project_dir)
+    if revoke:
+        if trust.revoke(project_dir):
+            click.echo(f"trust revoked for {where}: it is ignored until you trust it again")
+        else:
+            click.echo(f"no trust answer is recorded for {where}")
+        return
+    if (why := trust.problem(project_dir)) is not None:
+        click.echo(f"{where} cannot be trusted: {why}. Fix it first.", err=True)
+        raise SystemExit(1)
+    lines = trust.summary(project_dir)
+    if lines is None:
+        click.echo(f"no project settings in {where}; nothing to trust")
+        return
+    click.echo(f"{where} changes how k3code runs in this project:")
+    for line in lines:
+        click.echo(f"  - {line}")
+    trust.record(project_dir, trusted=True)
+    click.echo("trusted: the project config applies from the next start")
 
 
 @cli.command("config-edit")
