@@ -2456,6 +2456,15 @@ async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[
     return {"items": items}
 
 
+async def _browser_manage(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Inspect, attach to the configured ``browser.cdp_url``, or drop the browser the browser tools use."""
+    action = str(params.get("action") or "status").strip().lower()
+    if action not in ("status", "connect", "disconnect"):
+        raise _InvalidParams(f"browser.manage action must be status, connect or disconnect, not {action!r}")
+    url = params.get("url")
+    return await server.browser.manage(action, url=str(url) if url else None)
+
+
 _HANDLERS: dict[str, Any] = {
     "session.create": _session_create,
     "session.list": _session_list,
@@ -2499,6 +2508,7 @@ _HANDLERS: dict[str, Any] = {
     "config.set": _config_set,
     "setup.status": _setup_status,
     "system.battery": _system_battery,
+    "browser.manage": _browser_manage,
 }
 
 _HANDLERS["session.branch_stored"] = _session_resume  # M1: fork == resume the source

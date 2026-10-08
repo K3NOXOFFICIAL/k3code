@@ -160,14 +160,18 @@ class BrowserManager:
         headless: bool = True,
         executable_path: str = "",
         challenge_wait: float = 8.0,
+        cdp_url: str = "",
         launcher: Callable[[str], Awaitable[Any]] | None = None,
     ) -> None:
         self.home = home
         self.headless = headless
         self.executable_path = executable_path
         self.challenge_wait = challenge_wait
+        #: ``browser.cdp_url``: empty (the default) means k3code never attaches to a running browser
+        self.cdp_url = cdp_url
         self._launch = launcher or self._launch_playwright
         self._contexts: dict[str, Any] = {}
+        self._cdp: Any = None  # the browser attached over CDP, when browser.manage connected to browser.cdp_url
         self._pw: Any = None
 
     @classmethod
@@ -177,7 +181,53 @@ class BrowserManager:
             headless=bool(cfg.get("headless", True)),
             executable_path=str(cfg.get("executable_path") or ""),
             challenge_wait=float(cfg.get("challenge_wait", 8)),
+            cdp_url=str(cfg.get("cdp_url") or "").strip(),
         )
+
+    # ── browser.manage: inspect, attach to the configured CDP endpoint, or drop it ──
+
+    @property
+    def connected(self) -> bool:
+        return self._cdp is not None or bool(self._contexts)
+
+    def _state(self, messages: list[str]) -> dict[str, Any]:
+        if self._contexts and self._cdp is None:
+            messages = [*messages, f"k3code's own browser is running for {len(self._contexts)} site(s)"]
+        return {
+            "connected": self.connected,
+            "url": self.cdp_url if self._cdp is not None else None,
+            "messages": messages,
+        }
+
+    async def manage(self, action: str, url: str | None = None) -> dict[str, Any]:
+        """``status`` never starts a browser. ``connect`` attaches only to ``browser.cdp_url``, which is off by default:
+        a URL from the client that differs from it is refused. ``disconnect`` drops the attachment and the sites."""
+        if action == "status":
+            return self._state([])
+        if action == "disconnect":
+            await self.close()
+            return self._state(["browser disconnected"])
+        if not self.cdp_url:
+            return self._state([
+                "CDP attach is off by default: set browser.cdp_url in config.yaml to a Chromium started with "
+                "--remote-debugging-port. k3code's own browser starts on the first web_browse or escalated fetch."
+            ])
+        wanted = (url or "").strip().rstrip("/")
+        if wanted and wanted != self.cdp_url.rstrip("/"):
+            return self._state(["refused: the endpoint is not the configured browser.cdp_url"])
+        try:
+            await self.attach_cdp(self.cdp_url)
+        except BrowserUnavailable as e:
+            return self._state([str(e)])
+        except Exception as e:  # noqa: BLE001 - the endpoint is config: the message says what failed, not where
+            return self._state([f"could not attach to the configured browser ({type(e).__name__})"])
+        return self._state(["browser connected via CDP to browser.cdp_url"])
+
+    async def attach_cdp(self, endpoint: str) -> None:
+        mod = playwright_module()
+        if self._pw is None:
+            self._pw = await mod.async_playwright().start()
+        self._cdp = await self._pw.chromium.connect_over_cdp(endpoint)
 
     async def _launch_playwright(self, site: str) -> Any:
         mod = playwright_module()
@@ -201,6 +251,8 @@ class BrowserManager:
             raise
 
     async def context_for(self, site: str) -> Any:
+        if self._cdp is not None:  # attached by the user's own choice: the browser's own context, no k3code profile
+            return self._cdp.contexts[0] if self._cdp.contexts else await self._cdp.new_context()
         if site not in self._contexts:
             self._contexts[site] = await self._launch(site)
         return self._contexts[site]
@@ -256,6 +308,7 @@ class BrowserManager:
             with suppress(Exception):
                 await ctx.close()
         self._contexts.clear()
+        self._cdp = None  # the user's own browser keeps running: only the connection is dropped
         if self._pw is not None:
             with suppress(Exception):
                 await self._pw.stop()
