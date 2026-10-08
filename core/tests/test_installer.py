@@ -230,15 +230,17 @@ def test_from_git_branch_falls_back_to_the_installed_build_when_offline(tmp_path
 def test_fetch_errors_separate_no_network_from_private_repo(tmp_path: Path) -> None:
     real_git = shutil.which("git")
     assert real_git is not None
-    cases = {
-        "fatal: unable to access 'https://example.invalid/x.git/': Could not resolve host: example.invalid": "no network",
-        "fatal: could not read Username for 'https://github.com': terminal prompts disabled": "private or needs credentials",
-    }
+    offline = "fatal: unable to access 'https://example.invalid/x.git/': Could not resolve host: example.invalid"
+    private = "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+    cases = {offline: "no network", private: "private or needs credentials"}
     for i, (text, phrase) in enumerate(cases.items()):
-        stubs = stub_bin(tmp_path / f"case{i}", "git", f'case "$*" in *fetch*) echo "{text}" >&2; exit 128 ;; esac\nexec {real_git} "$@"\n')
+        body = f'case "$*" in *fetch*) echo "{text}" >&2; exit 128 ;; esac\nexec {real_git} "$@"\n'
+        stubs = stub_bin(tmp_path / f"case{i}", "git", body)
         home = tmp_path / f"home{i}"
         home.mkdir()
-        r = run(home, INSTALL, "--yes", "--from-git", "https://example.invalid/x.git", "--ref", "main", path_front=stubs)
+        r = run(
+            home, INSTALL, "--yes", "--from-git", "https://example.invalid/x.git", "--ref", "main", path_front=stubs
+        )
         assert r.returncode != 0
         assert "could not fetch 'main'" in r.stderr
         assert phrase in r.stderr, r.stderr
