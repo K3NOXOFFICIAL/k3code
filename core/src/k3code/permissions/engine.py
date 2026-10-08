@@ -61,9 +61,9 @@ BUILTIN_BASH_ALLOW = [
     "cat *",
     "grep *",
     "rg *",
-    "git status*",
-    "git diff*",
-    "git log*",
+    "git status *",
+    "git diff *",
+    "git log *",
 ]
 
 #: ``rg --pre CMD`` runs CMD on every file; ``git diff|log --output=FILE`` writes FILE; ``--ext-diff``/``--textconv``
@@ -75,6 +75,8 @@ BUILTIN_BASH_ASK = [
     "git log* --output*",
     "git diff* --ext-diff*",
     "git diff* --textconv*",
+    "git log* --ext-diff*",
+    "git log* --textconv*",
 ]
 
 PURE_TOOLS = frozenset({"read", "grep", "glob", "todo", "skill", "mcp_tool_search", "task", "task_result"})
@@ -181,8 +183,9 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
 
 
 #: Redirections that are harmless next to any command (they do not write or read an arbitrary file).
-_HARMLESS_REDIRECT = re.compile(r"(?:\d*>&\d+|&>\s*/dev/null|\d*>>?\s*/dev/null)")
-_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*(?:>>?|<)\s*([^\s;&|<>()]+)")
+_HARMLESS_REDIRECT = re.compile(r"(?:\d*[<>]&(?:\d+|-)|&>>?\s*/dev/null|\d*>>?&?\s*/dev/null)(?![^\s;&|<>()])")
+#: ``>f``, ``>>f``, ``<f``, ``&>f``, ``&>>f``, ``>&f`` (the last three send stdout+stderr to f).
+_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:>>?|<)&?)\s*([^\s;&|<>()]+)")
 _SUBSTITUTION = re.compile(r"\$\(|`")
 #: Redirect targets that are code or credentials even inside the project.
 _SENSITIVE_TARGET = re.compile(r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
