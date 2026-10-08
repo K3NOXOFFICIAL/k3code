@@ -344,7 +344,13 @@ const ComposerPane = memo(function ComposerPane({
         {!nativeMode && composer.input === '?' && !composer.inputBuf.length && <HelpHint t={ui.theme} />}
 
         {!isBlocked && (
-          <WorkingLine busy={ui.busy} effort={ui.info?.reasoning_effort} startedAt={status.turnStartedAt} t={ui.theme} />
+          <WorkingLine
+            ascii={ui.indicatorStyle === 'ascii'}
+            busy={ui.busy}
+            effort={ui.info?.reasoning_effort}
+            startedAt={status.turnStartedAt}
+            t={ui.theme}
+          />
         )}
 
         {!isBlocked && (

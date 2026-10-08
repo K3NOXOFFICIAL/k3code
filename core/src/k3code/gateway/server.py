@@ -55,6 +55,7 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
+from k3code.gateway import tui_display
 from k3code.gateway.sessions import SessionStore
 from k3code.goals import GoalManager, make_judge
 from k3code.learning.hub import LearningHub
@@ -2309,6 +2310,8 @@ async def _config_get(server: GatewayServer, params: dict[str, Any]) -> dict[str
         return {"config": redact(server.config.model_dump())}  # provider api_key never goes to clients
     if key == "mtime":
         return {"mtime": 0.0}
+    if tui_display.handles(key):
+        return tui_display.get(server.config.display, key)
     value: Any = server.config
     for part in key.split("."):
         value = getattr(value, part, None) if not isinstance(value, dict) else value.get(part)
@@ -2331,6 +2334,11 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         return {"ok": True, "key": key, "value": "on" if server.config.display.focus_mode else "off"}
     if key == "model":  # TUI /model <key> and the model picker: switch the session's model key
         return await _config_set_model(server, params)
+    if tui_display.handles(key):  # TUI /theme /indicator /statusbar /battery /pet ...: saved to display.*
+        try:
+            return tui_display.set_(server.config.display, key, params.get("value"))
+        except tui_display.DisplayValueError as e:
+            raise _InvalidParams(f"{key}: {e}") from None
     if "." not in key:
         raise _InvalidParams(f"unsupported config key: {key}")
     section, field_name = key.split(".", 1)
