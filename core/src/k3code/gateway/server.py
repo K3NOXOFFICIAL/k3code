@@ -1330,9 +1330,7 @@ class GatewayServer:
                 # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
                 # halted: keep the queued prompts for after /daemon resume
                 while (
-                    drain
-                    and (pending := self._pending_prompts(session))
-                    and result[0] not in ("interrupted", "halted")
+                    drain and (pending := self._pending_prompts(session)) and result[0] not in ("interrupted", "halted")
                 ):
                     result = await self._run_turn_locked(session, pending.pop(0))
                 return result

@@ -108,6 +108,20 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
             continue
         ok, ms, detail = results[i]
         status = OK if ok else FAIL
+        keyless = not (p.api_key or (p.api_key_env and os.environ.get(p.api_key_env)))
+        if ok and keyless:
+            # only reachability was probed: an endpoint that answers 401 is up, but every call to it fails over
+            checks.append(
+                Check(
+                    f"provider:{p.name}",
+                    WARN,
+                    f"reachable ({detail}, {ms:.0f} ms) but no key in {p.api_key_env}: calls to it fail over",
+                    f"add {p.api_key_env}=<key> to ~/.config/k3code/env (mode 0600) or run "
+                    "`k3code setup --step providers`",
+                    {"base_url": p.base_url, "latency_ms": None if ms is None else round(ms, 1)},
+                )
+            )
+            continue
         if ok and ms is not None and ms > 3000:
             status, detail = WARN, f"{detail}, slow ({ms:.0f} ms)"
         elif ok:
@@ -154,9 +168,11 @@ def check_keys(config: Settings) -> Check:
         return Check("api-keys", WARN, "no providers, nothing to check")
     if missing:
         fake = bool(os.environ.get("K3CODE_FAKE_PROVIDER"))
+        # FAIL only when no chain entry can run: a keyless fallback behind a working entry is a warning
+        usable = any(p.kind == "claude-cli" or p.api_key or os.environ.get(p.api_key_env) for p in config.providers)
         return Check(
             "api-keys",
-            WARN if fake else FAIL,
+            WARN if fake or usable else FAIL,
             "missing env vars: " + ", ".join(sorted(set(missing))),
             "export them, or put them in ~/.config/k3code/env for the systemd unit",
             {"missing": sorted(set(missing))},
