@@ -1189,6 +1189,10 @@ class GatewayServer:
             reason, text = "interrupted", "Goal interrupted. /goal resume to continue."
         elif status == "halted":
             reason, text = "halted", "Goal paused: the daemon is halted (/daemon pause). /goal resume after resume."
+        elif status == "error" and isinstance(session.last_exc, (ChainExhausted, AllProvidersUnreachable)):
+            detail = scrub_text(session.last_error or "no provider answered")[:160]
+            reason = "provider unavailable"
+            text = f"Goal paused: no provider answered after the retries ({detail}). /goal resume to retry."
         elif status == "error":
             detail = scrub_text(session.last_error or "see the error above")[:160]
             reason, text = "turn failed", f"Goal paused: the turn failed ({detail}). /goal resume to retry."
@@ -1260,6 +1264,7 @@ class GatewayServer:
         session.run_result = None
         session.last_error, session.last_exc, session.last_api_calls = "", None, 0
         reliability = await self._reliability_for(session)
+        reliability.set_unattended(session.background)  # unattended: provider exhaustion parks instead of failing
         await self.mcp.ensure_started()
         approval = await self._approval_callback_for(session)
 

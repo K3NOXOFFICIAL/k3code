@@ -6,6 +6,7 @@ import asyncio
 
 from k3code.agent.loop import AgentLoop
 from k3code.automation.server_runner import ServerRunner
+from k3code.errors import ChainExhausted
 from k3code.gateway.sessions import SessionStore
 from k3code.goals import GoalManager, GoalState
 from k3code.reliability import BudgetExceeded
@@ -135,5 +136,24 @@ async def test_interrupted_turn_pauses_goal_with_a_reason_and_notifies(tmp_path,
     assert status == "interrupted"
     state = _goal(server, sid).state
     assert state.status == "paused" and state.paused_reason == "interrupted"
+    assert len(_notices(server, "k3.goal.blocked")) == 1
+    await server.close()
+
+
+async def test_exhausted_providers_pause_the_goal_with_a_reason_and_one_notification(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    server, _ = make_server(tmp_path, monkeypatch, replies=["x"], autonomy=NO_ADVISOR)
+    sid = await new_session(server, repo)
+    _goal(server, sid).set("needs a provider")
+
+    async def down(self, *args, **kwargs):
+        raise ChainExhausted("all provider entries failed (last reason: server)", last_reason="server")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(AgentLoop, "run", down)
+    result = await ServerRunner(server).run_prompt("go", session_id=sid)
+    assert result.status == "failed"  # the run failed only after the retries the reliability layer allowed
+    state = _goal(server, sid).state
+    assert state.status == "paused" and state.paused_reason == "provider unavailable"
     assert len(_notices(server, "k3.goal.blocked")) == 1
     await server.close()
