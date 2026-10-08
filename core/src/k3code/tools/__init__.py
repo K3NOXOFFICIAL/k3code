@@ -335,7 +335,8 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         if exclude:
             for exc in (exclude if isinstance(exclude, list) else [exclude]):
                 cmd += ["-g", f"!{exc}"]
-        cmd += [pattern, str(path)]
+        # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
+        cmd += ["-e", pattern, "--", str(path)]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
