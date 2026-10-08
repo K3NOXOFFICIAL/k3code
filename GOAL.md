@@ -8,7 +8,7 @@ The roadmap and exit criteria are in [`docs/PLAN.md`](docs/PLAN.md), the evidenc
 | **Set** | 2026-10-07 |
 | **Owner** | the project owner |
 | **Name** | `k3code` (working name; a better one will be chosen later) |
-| **Repository** | `K3NOXOFFICIAL/k3code` (private) |
+| **Repository** | `K3NOXOFFICIAL/k3code` (public) |
 | **Done when** | Every milestone M0–M6 meets its exit criteria, verified on the owner's laptop (see [§8](#8-definition-of-done)) |
 
 ---
@@ -105,7 +105,7 @@ Each requirement has an ID, an acceptance statement, and the milestone that deli
 
 | ID | Requirement | Acceptance | Milestone |
 |---|---|---|---|
-| G1 | Private GitHub repository `k3code`, synced with a local checkout | Exists; branches named by milestone are pushed | M0 |
+| G1 | GitHub repository `k3code`, synced with a local checkout | Exists; branches named by milestone are pushed | M0 |
 | G2 | Documentation | A README that explains install, use, architecture and status; this goal document; milestone reports | ongoing |
 
 ---
@@ -169,7 +169,7 @@ Additional commands introduced by the design: `/focus`, `/go`, `/scope`, `/propo
 | Provider routing | Own fallback chain (providers and models), independent of any gateway's own routing | A gateway outage must still have a fallback |
 | Model tiers | Which models fill each tier is chosen by the user in the guided setup, with no hard-coded defaults | Provider and model choice is personal and changes often |
 | Task routing | Four tiers: `main` (default coding, interactive turns, sub-agents), `strong` (planning, review, advisor), `cheap` (background, loop and cron turns, titles, compaction, judges) and `fast` (previews, quick classification). A task kind maps to a tier by a policy table the user can override; a cheap-tier task that keeps failing escalates to the next tier | Cheap work must not run on expensive models, and hard work must not get stuck on cheap ones |
-| Visibility | Private repository; when to make it public is the owner's decision ([§9](#9-decisions-and-inputs-needed-from-the-owner)) | Explicit request: private |
+| Visibility | Private while it was built; public from the first release | Explicit request: private, then public when the owner decided |
 
 ---
 
@@ -232,7 +232,7 @@ The request as written on 2026-10-07 (typos kept), followed by the additions mad
 
 - Build it as a new harness from the parts of several harnesses (not a fork of one project), for example Hermes for the agents, openclaw for loops and the guided setup, opencode for other parts.
 - Multiple windows: fork TUIOS with a new, more intuitive keymap.
-- The GitHub repository is private.
+- The GitHub repository was private while it was built.
 - The model tiers for automatic degradation are chosen in the guided setup.
 - Use OmniRoute-based agents to build it, so the owner's Claude account is not drained; if no OmniRoute model works, fall back to Claude Code (Sonnet 5.5) rather than stopping.
 - Later: a proper README, and a more detailed and structured goal document (this file).

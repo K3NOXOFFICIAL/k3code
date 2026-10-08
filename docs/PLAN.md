@@ -7,7 +7,7 @@ The owner wants their own terminal coding harness, **k3code** (working name). It
 
 The owner chose **"a new harness built from the parts of other harnesses"** over a fork of a single project. The design judge's top-scored option was a whole-fork of Hermes (tied 35/35 with the small-core design). I did not take it, because it is the "Hermes fork" option the user already declined. The whole-fork stays the documented fallback if the M0 TUI spike shows that a new core is too costly.
 
-Repo: **`K3NOXOFFICIAL/k3code`**, private, MIT, upstream notices kept. Local checkout: a local clone. gh is already authenticated with `repo` scope.
+Repo: **`K3NOXOFFICIAL/k3code`**, MIT, upstream notices kept (private while it was built). Local checkout: a local clone.
 
 Research (2026-10-07):
 

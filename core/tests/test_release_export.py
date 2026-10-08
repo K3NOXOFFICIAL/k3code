@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -28,14 +29,32 @@ class Export(NamedTuple):
     out: Path  # the output directory with the tarball and SHA256SUMS
 
 
-def _scan(directory: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["sh", str(SCRIPT), "--scan", str(directory)], capture_output=True, text=True, check=False)
+def _env(rules: Path) -> dict[str, str]:
+    return {**os.environ, "K3_RELEASE_RULES": str(rules)}
+
+
+def _scan(directory: Path, rules: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["sh", str(SCRIPT), "--scan", str(directory)], capture_output=True, text=True, check=False, env=_env(rules)
+    )
 
 
 @pytest.fixture(scope="module")
-def export(tmp_path_factory: pytest.TempPathFactory) -> Export:
+def rules(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The scan reads its names from files outside the repository; these invented ones test the mechanism, so no real
+    name or host is written anywhere in the repository."""
+    folder = tmp_path_factory.mktemp("rules")
+    (folder / "personal.re").write_text("# hosts and names\nzorgon\nplugh-host\\.test\n\n", encoding="utf-8")
+    (folder / "names.re").write_text("Xyzzy\n", encoding="utf-8")
+    return folder
+
+
+@pytest.fixture(scope="module")
+def export(tmp_path_factory: pytest.TempPathFactory, rules: Path) -> Export:
     out = tmp_path_factory.mktemp("release-out")
-    built = subprocess.run(["sh", str(SCRIPT), "-o", str(out)], capture_output=True, text=True, cwd=REPO, check=False)
+    built = subprocess.run(
+        ["sh", str(SCRIPT), "-o", str(out)], capture_output=True, text=True, cwd=REPO, check=False, env=_env(rules)
+    )
     assert built.returncode == 0, built.stderr
     tarball = next(out.glob("k3code-*.tar.gz"))
     unpacked = tmp_path_factory.mktemp("release-unpacked")
@@ -63,31 +82,44 @@ def test_export_has_checksums_for_its_tarball(export: Export) -> None:
     assert sums[-1] == f"{export.top}.tar.gz"
 
 
-def test_scan_passes_on_the_export(export: Export) -> None:
-    result = _scan(export.tree)
+def test_scan_passes_on_the_export(export: Export, rules: Path) -> None:
+    result = _scan(export.tree, rules)
     assert result.returncode == 0, result.stderr
 
 
-# The planted values are assembled from parts, so this file does not match the scan it tests.
 @pytest.mark.parametrize(
     "planted",
     [
-        "/home/" + "ke" + "no/notes.md",
-        "ssh " + "ke" + "no@example.org",
-        "https://mcp." + "k3nox" + ".com/mcp",
-        "peer at 100." + "64.0.7",
-        "Ni" + "ls CachedLayer",
-        "/home/" + "newperson/project",
+        "/home/zorgon/notes.md",
+        "ssh zorgon@example.org",
+        "https://plugh-host.test/mcp",
+        "peer at 192.0.2.1",
+        "Xyzzy CachedLayer",
+        "/home/newperson/project",
     ],
 )
-def test_planted_personal_value_fails_the_scan(tmp_path: Path, planted: str) -> None:
+def test_planted_personal_value_fails_the_scan(tmp_path: Path, rules: Path, planted: str) -> None:
     (tmp_path / "notes.txt").write_text(f"{planted}\n", encoding="utf-8")
-    result = _scan(tmp_path)
+    result = _scan(tmp_path, rules)
     assert result.returncode != 0
     assert "notes.txt" in result.stderr  # the file list is printed ...
     assert planted not in result.stdout + result.stderr  # ... and the matched text is not
 
 
-def test_generic_examples_pass_the_scan(tmp_path: Path) -> None:
-    (tmp_path / "ok.txt").write_text("/home/user/x /home/u/y TokenOutput 192.0.2.4\n", encoding="utf-8")
-    assert _scan(tmp_path).returncode == 0
+def test_generic_examples_pass_the_scan(tmp_path: Path, rules: Path) -> None:
+    (tmp_path / "ok.txt").write_text("/home/user/x /home/u/y TokenOutput xyzzy 192.0.2.4\n", encoding="utf-8")
+    assert _scan(tmp_path, rules).returncode == 0  # names.re is case-sensitive: the lower-case word is fine
+
+
+def test_without_rule_files_only_the_generic_checks_run_and_it_says_so(tmp_path: Path) -> None:
+    empty = tmp_path / "no-rules"
+    empty.mkdir()
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "a.txt").write_text("zorgon is fine here, 192.0.2.1 is not\n", encoding="utf-8")
+    result = _scan(tree, empty)
+    assert result.returncode != 0 and "a.txt" in result.stderr  # the tailnet address still fails it
+    assert "no name rules" in result.stderr
+    (tree / "a.txt").write_text("zorgon only\n", encoding="utf-8")
+    result = _scan(tree, empty)
+    assert result.returncode == 0 and "no name rules" in result.stderr

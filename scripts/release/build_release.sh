@@ -12,11 +12,24 @@ set -eu
 # Internal paths: they stay in the repository and never reach an export. panes/k3 is a 36 MB Linux build output
 # that the repository tracks by mistake (since 30f66ef); it is left out until it is untracked.
 EXCLUDED="scripts/dev scripts/exit docs/reports GOAL.md panes/k3"
-# Personal names and hosts, matched as whole words and case-insensitively, and the owner's first name matched
-# case-sensitively. The literals are split with '' so that this file does not match its own scan.
-# Every tailnet (100.x) address is matched too.
-PERSONAL_RE='(^|[^A-Za-z])(ke''no|fenn''ec|nb''wg|nyew''cloud|han''na|k3nox\.com|kokad''ock|k3ser''ver|se''tsu)'
-NAME_RE='(^|[^A-Za-z])Ni''ls([^A-Za-z]|$)'
+# The names and hosts to keep out of an export are NOT listed in this file: a list would publish what it guards. They
+# are read from the owner's machine, outside the repository (default folder ~/.config/k3code-release, or
+# $K3_RELEASE_RULES):
+#   personal.re   extended regexes, one per line, matched case-insensitively after a non-letter
+#   names.re      extended regexes, one per line, matched case-sensitively (a first name that is also a word)
+# Blank lines and # comments are ignored. Without the files the scan still checks every tailnet (100.x) address and
+# every absolute home path, and it says that the name check did not run.
+RULES_DIR=${K3_RELEASE_RULES:-${HOME:-/nonexistent}/.config/k3code-release}
+join_rules() { # join_rules FILE: the file's regexes as a|b|c, or nothing
+  [ -s "$1" ] || return 0
+  grep -v -e '^[[:space:]]*#' -e '^[[:space:]]*$' "$1" | paste -sd '|' - || true
+}
+personal=$(join_rules "$RULES_DIR/personal.re")
+names=$(join_rules "$RULES_DIR/names.re")
+PERSONAL_RE=
+NAME_RE=
+[ -z "$personal" ] || PERSONAL_RE="(^|[^A-Za-z])($personal)"
+[ -z "$names" ] || NAME_RE="(^|[^A-Za-z])($names)([^A-Za-z]|\$)"
 TAILNET_RE='(^|[^0-9.])100\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}([^0-9]|$)'
 # Absolute home paths: any /home/<name> fails unless <name> is a generic placeholder used in upstream fixtures.
 HOME_RE='(^|[^A-Za-z0-9_.~])/home/[A-Za-z0-9_-]+'
@@ -40,14 +53,17 @@ USAGE
 # scan_dir DIR: print the file names that match, return 1 if any match.
 scan_dir() {
   hits="$work/hits"
+  if [ -z "$PERSONAL_RE$NAME_RE" ]; then
+    printf '%s\n' "build_release: warning: no name rules in $RULES_DIR; only tailnet addresses and home paths were checked" >&2
+  fi
   (
     cd "$1" || exit 2
     {
-      grep -rlaiE --exclude-dir=.git -e "$PERSONAL_RE" . || true
-      grep -rlaE --exclude-dir=.git -e "$NAME_RE" . || true
+      if [ -n "$PERSONAL_RE" ]; then grep -rlaiE --exclude-dir=.git -e "$PERSONAL_RE" . || true; fi
+      if [ -n "$NAME_RE" ]; then grep -rlaE --exclude-dir=.git -e "$NAME_RE" . || true; fi
       grep -rlaE --exclude-dir=.git -e "$TAILNET_RE" . || true
       grep -raoHE --exclude-dir=.git -e "$HOME_RE" . | grep -vaE -e "$HOME_ALLOW" | cut -d: -f1 || true
-      find . -name .git -prune -o -print | grep -iE -e "$PERSONAL_RE" || true
+      if [ -n "$PERSONAL_RE" ]; then find . -name .git -prune -o -print | grep -iE -e "$PERSONAL_RE" || true; fi
     } | sort -u
   ) > "$hits"
   if [ -s "$hits" ]; then

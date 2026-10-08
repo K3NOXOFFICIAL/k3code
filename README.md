@@ -5,7 +5,7 @@
 k3code plans before it acts, can run several agents in parallel, retries through dropped connections and provider outages, and sends cheap background work to cheaper models. It has a Python core, a terminal UI (TypeScript, Ink) and an optional multi-window terminal (`k3`, a fork of TUIOS). It works with OpenAI-compatible and Anthropic providers, and with a local Claude Code login.
 
 > **Status: alpha, version 0.1.0 (not tagged).** The core is built and its test suite passes, and most exit criteria have scripted evidence. Live-model behaviour, the 72-hour daemon soak and multi-day use are not verified yet. Read [Safety](#safety) before you add a provider key or let it run unattended, and [Status](#status) for what has been tested.
-> The repository is private for now. Install with the command in [Install](#install): it uses the latest `v*` tag, or `Main` until a tag exists. There is no tagged release yet. The steps for making it public are in [docs/PUBLIC-RELEASE.md](docs/PUBLIC-RELEASE.md).
+> Install with the command in [Install](#install): it uses the latest `v*` tag, or `Main` until a tag exists. There is no tagged release yet.
 
 ---
 
@@ -57,7 +57,7 @@ k3code plans before it acts, can run several agents in parallel, retries through
 
 ### Install
 
-The repository is private, so authenticate once with `gh auth login` and `gh auth setup-git` (on Windows, do this inside WSL, where the install runs).
+If you install from a private fork or mirror, authenticate once first with `gh auth login` and `gh auth setup-git` (on Windows, do this inside WSL, where the install runs).
 
 **Linux and macOS**
 
@@ -113,7 +113,7 @@ k3code update                                    # smoke-tested update; rolls ba
 k3code update --rollback                         # switch back to the previous version
 ```
 
-There is no release yet, so `update --check` has nothing to find; `k3code update --from-source` pulls your clone and rebuilds.
+There is no release yet. An install built from a checkout (`install.sh --from-source`) therefore updates from that checkout: `k3code update` (also `/update` in the TUI) pulls it with `git pull --ff-only` and rebuilds whenever there is no release to fetch, including a private repository without a GitHub token. On Windows the clone is pulled with Windows git, which has your GitHub credentials. If git still cannot sign in, pull the clone yourself and run `k3code update --from-source --no-pull`.
 
 ### Three ways to run it
 
