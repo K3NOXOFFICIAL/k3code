@@ -83,6 +83,8 @@ class CooldownStore:
     path: Path | None = None
     #: wall-clock source (injectable for tests)
     wall: Callable[[], float] = time.time
+    #: consecutive rate-limit/quota arms per entry (the exponential ladder's step), reset by ``record_success``
+    strikes: dict[tuple[str, str, str], int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.path is not None:
@@ -134,17 +136,23 @@ class CooldownStore:
         model: str,
         base_url: str = "",
         retry_after: float | None = None,
-        backoff_count: int = 0,
+        backoff_count: int | None = None,
         network_cooldown: float | None = None,
         now: float | None = None,
     ) -> float | None:
         """Put an entry into cooldown until its reset window. Returns the armed seconds.
 
         ``network_cooldown`` overrides the flat network window (0 disables arming
-        on network failures); rate_limit/quota keep the reset/exponential ladder.
+        on network failures); rate_limit/quota keep the reset/exponential ladder, whose step is the number of
+        consecutive arms of this entry unless ``backoff_count`` is given (it always was 0: the ladder never climbed).
         """
         if reason not in _COOLDOWN_REASONS:
             return None
+        key = _identity(provider, model, base_url)
+        if reason is not FailoverReason.network:
+            if backoff_count is None:
+                backoff_count = self.strikes.get(key, 0)
+            self.strikes[key] = backoff_count + 1
         if reason is FailoverReason.network:
             window = network_cooldown if network_cooldown is not None else network_cooldown_seconds()
             if window <= 0:
@@ -153,9 +161,9 @@ class CooldownStore:
         elif provider_delta := _provider_reset_delay(retry_after):
             seconds = math.ceil(provider_delta)
         else:
-            seconds = min(_BASE_COOLDOWN_SECONDS * (2**backoff_count), _MAX_COOLDOWN_SECONDS)
+            seconds = min(_BASE_COOLDOWN_SECONDS * (2 ** min(backoff_count or 0, 16)), _MAX_COOLDOWN_SECONDS)
         monotonic_now = time.monotonic() if now is None else now
-        self.entries[_identity(provider, model, base_url)] = EntryCooldown(
+        self.entries[key] = EntryCooldown(
             until=monotonic_now + seconds,
             seconds=seconds,
             reason=reason,
@@ -186,6 +194,10 @@ class CooldownStore:
     def reason_of(self, *, provider: str, model: str, base_url: str = "") -> FailoverReason | None:
         entry = self.entries.get(_identity(provider, model, base_url))
         return entry.reason if entry is not None else None
+
+    def record_success(self, *, provider: str, model: str, base_url: str = "") -> None:
+        """The entry answered: its next rate limit starts the ladder from the bottom again."""
+        self.strikes.pop(_identity(provider, model, base_url), None)
 
     def clear(self, *, provider: str, model: str, base_url: str = "") -> None:
         self.entries.pop(_identity(provider, model, base_url), None)

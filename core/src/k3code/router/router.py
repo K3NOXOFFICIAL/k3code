@@ -246,6 +246,10 @@ class Router:
                         messages, tools, target_model, max_tokens=max_tokens, temperature=temperature
                     ):
                         streamed = True
+                        if event.type == "done":  # the consumer stops reading here: record the success first
+                            self.cooldowns.record_success(
+                                provider=entry.provider_name, model=target_model, base_url=entry.base_url
+                            )
                         yield event
                     # The provider yields its "done" event then closes normally.
                     return
