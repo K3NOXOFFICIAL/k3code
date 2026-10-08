@@ -177,7 +177,8 @@ def check_keys(config: Settings) -> Check:
             "export them, or put them in ~/.config/k3code/env for the systemd unit",
             {"missing": sorted(set(missing))},
         )
-    return Check("api-keys", OK, f"{len(config.providers)} key env var(s) present")
+    keyed = sum(1 for p in config.providers if p.kind != "claude-cli")  # claude-cli uses the local login, no key
+    return Check("api-keys", OK, f"{keyed} key env var(s) present" if keyed else "no provider needs a key")
 
 
 async def check_netwatch_async() -> Check:
