@@ -462,6 +462,7 @@ const StatusRulePane = memo(function StatusRulePane({
   status
 }: Pick<AppLayoutProps, 'composer' | 'status'> & { at: 'bottom' | 'top'; nativeMode: boolean }) {
   const ui = useStore($uiState)
+  const isBlocked = useStore($isBlocked)
 
   if (ui.statusBar === 'off' || (nativeMode ? at !== 'top' : ui.statusBar !== at)) {
     return null
@@ -496,6 +497,7 @@ const StatusRulePane = memo(function StatusRulePane({
         t={ui.theme}
         turnStartedAt={status.turnStartedAt}
         usage={ui.usage}
+        workingLineVisible={!isBlocked}
       />
     </Box>
   )

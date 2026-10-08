@@ -112,22 +112,25 @@ export const MAX_DURATION_WIDTH = Math.max(
 // `unicode` is a bare 1-col braille spinner with no verb, while kaomoji/emoji/
 // ascii add a fixed-width verb; any style adds a bounded elapsed-time tail.
 // Mirrors FaceTicker's `frame + verbSegment + durationSegment` layout.
-export const busyIndicatorWidth = (style: IndicatorStyle, hasDuration: boolean): number => {
+export const busyIndicatorWidth = (style: IndicatorStyle, hasDuration: boolean, glyphOnly = false): number => {
   const { showVerb } = renderIndicator(style, 0)
-  const verb = showVerb ? 1 + VERB_PAD_LEN : 0
+  const verb = showVerb && !glyphOnly ? 1 + VERB_PAD_LEN : 0
   // ` · ` plus the bounded clock (e.g. `59m 59s`).
-  const duration = hasDuration ? stringWidth(' · ') + MAX_DURATION_WIDTH : 0
+  const duration = hasDuration && !glyphOnly ? stringWidth(' · ') + MAX_DURATION_WIDTH : 0
 
   return indicatorFrameWidth(style) + verb + duration
 }
 
 function FaceTicker({
   color,
+  glyphOnly = false,
   startedAt,
   style,
   verbOverride
 }: {
   color: string
+  /** The working line above the composer already shows the verb and clock: show only the glyph. */
+  glyphOnly?: boolean
   startedAt?: null | number
   style: IndicatorStyle
   verbOverride?: string
@@ -146,7 +149,7 @@ function FaceTicker({
   // verb so "compacting…" is visible even in unicode style (#97239).
   const { intervalMs, showVerb } = renderIndicator(style, 0)
   const freezeVerb = Boolean(verbOverride)
-  const displayVerb = freezeVerb || showVerb
+  const displayVerb = !glyphOnly && (freezeVerb || showVerb)
 
   useEffect(() => {
     // An overlay is painted OVER the status rule (the modal widget slot, or a
@@ -170,7 +173,7 @@ function FaceTicker({
     }
 
     const glyph = setInterval(() => setTick(n => n + 1), intervalMs)
-    const clock = setInterval(() => setNow(Date.now()), 1000)
+    const clock = glyphOnly ? null : setInterval(() => setNow(Date.now()), 1000)
     // Verb timer is gated on `displayVerb` — `unicode` style hides the verb
     // entirely, so cycling `verbTick` would be an avoidable re-render. A
     // frozen override does not rotate.
@@ -178,13 +181,16 @@ function FaceTicker({
 
     return () => {
       clearInterval(glyph)
-      clearInterval(clock)
+
+      if (clock !== null) {
+        clearInterval(clock)
+      }
 
       if (verb !== null) {
         clearInterval(verb)
       }
     }
-  }, [displayVerb, freezeVerb, intervalMs, isOccluded, reduced])
+  }, [displayVerb, freezeVerb, glyphOnly, intervalMs, isOccluded, reduced])
 
   const { frame } = renderIndicator(style, tick)
   const verb = verbOverride ?? VERBS[verbTick % VERBS.length] ?? ''
@@ -193,7 +199,7 @@ function FaceTicker({
   // verb segment is hidden (e.g. `unicode` spinner style).  When the verb
   // IS shown, its trailing padding already provides the gap, so the extra
   // space is harmless.
-  const durationSegment = startedAt ? ` · ${fmtDuration(now - startedAt)}` : ''
+  const durationSegment = startedAt && !glyphOnly ? ` · ${fmtDuration(now - startedAt)}` : ''
 
   return (
     <Text color={color}>
@@ -504,6 +510,7 @@ export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
 }
 
 export function StatusRule({
+  workingLineVisible = false,
   battery,
   focusView,
   cwdLabel,
@@ -573,6 +580,9 @@ export function StatusRule({
   // so short notices reserve exactly what they need.
   const NOTICE_RESERVE_MAX = 24
   const noticeReserve = showNotice ? Math.min(stringWidth(notice!.text), NOTICE_RESERVE_MAX) : 0
+  // appLayout renders the working line (verb, clock, tokens) under the same condition; the face then
+  // shows only its glyph so the turn is not described twice.
+  const workingLineShown = busy && workingLineVisible && !compacting
 
   // Width of the must-keep left segments (indicator + model + context). They
   // are pinned (never shrink) and reserved so the cwd/branch on the right
@@ -580,7 +590,7 @@ export function StatusRule({
   // (kaomoji is wide + verb; unicode is a bare 1-col spinner). When a notice
   // occupies the slot it reserves only `noticeReserve` (it shrinks/truncates).
   const slotWidth = busy
-    ? busyIndicatorWidth(indicatorStyle, turnStartedAt != null)
+    ? busyIndicatorWidth(indicatorStyle, turnStartedAt != null, workingLineShown)
     : showNotice
       ? noticeReserve
       : stringWidth(status)
@@ -707,6 +717,7 @@ export function StatusRule({
           {busy ? (
             <FaceTicker
               color={statusColor}
+              glyphOnly={workingLineShown}
               startedAt={turnStartedAt}
               style={indicatorStyle}
               verbOverride={compacting ? 'compacting' : undefined}
@@ -961,6 +972,8 @@ interface StatusRuleProps {
   // Active loops + cron jobs + automations (⟳ badge).
   automationCount?: number
   busy: boolean
+  /** The working line above the composer is on screen (busy and no dialog covers it). */
+  workingLineVisible?: boolean
   // Context compaction in progress — FaceTicker freezes on "compacting".
   compacting?: boolean
   cols: number
