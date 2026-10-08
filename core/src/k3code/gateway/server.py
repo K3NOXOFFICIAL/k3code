@@ -70,6 +70,7 @@ from k3code.redact import redact
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
 from k3code.reliability.persistent_retry import TurnCancelled
+from k3code.research.browser import BrowserManager
 from k3code.research.fetch import WebFetcher
 from k3code.research.flow import Research
 from k3code.research.tools import register_web_tools
@@ -321,6 +322,7 @@ class GatewayServer:
         self.mcp = McpManager(self.config.mcp.servers)
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
         self.web_fetcher = WebFetcher.from_config(self.config.research)
+        self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
         self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
         self.providers: list[Any] = []
         self.router: Router | None = None
@@ -809,6 +811,7 @@ class GatewayServer:
         if self.automation is not None:
             await self.automation.stop()
         await self.web_fetcher.aclose()
+        await self.browser.close()
         cancelled = []
         for live in self.live.values():
             if live.turn_task is not None and not live.turn_task.done():
@@ -1167,7 +1170,7 @@ class GatewayServer:
         for install in session.extra_tools:
             install(loop.tools)
         register_task_tools(loop.tools, self, session, depth=1)
-        register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher, mcp=self.mcp)
+        register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher, mcp=self.mcp, browser=self.browser)
         return loop
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:

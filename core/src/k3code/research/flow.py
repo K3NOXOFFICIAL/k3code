@@ -118,7 +118,8 @@ class Research:
     def tools(self) -> ResearchTools:
         override = getattr(self.server, "research_tools", None)  # test seam
         return override or pick_tools(self.server.config, self.server.mcp,
-                                      fetcher=getattr(self.server, "web_fetcher", None))
+                                      fetcher=getattr(self.server, "web_fetcher", None),
+                                      browser=getattr(self.server, "browser", None))
 
     def progress(self, session: Any, phase: str, detail: str = "") -> None:
         session.emit("research.progress", {"session_id": session.session_id, "phase": phase, "detail": detail},

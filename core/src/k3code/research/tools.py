@@ -19,6 +19,16 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 from k3code.providers.types import ToolSpec
+from k3code.research.browser import (
+    STOP_VERDICTS,
+    BrowserManager,
+    BrowserUnavailable,
+    RenderedPage,
+    Stopped,
+    Verdict,
+    classify,
+    stop_report,
+)
 from k3code.research.fetch import UA, FetchStatus, WebFetcher
 
 logger = logging.getLogger(__name__)
@@ -107,21 +117,32 @@ def _safe_url(url: str) -> str | None:
 
 
 async def fetch_page(
-    url: str, *, timeout: float = 20.0, client: httpx.AsyncClient | None = None, fetcher: WebFetcher | None = None
+    url: str,
+    *,
+    timeout: float = 20.0,
+    client: httpx.AsyncClient | None = None,
+    fetcher: WebFetcher | None = None,
+    browser: BrowserManager | None = None,
 ) -> tuple[str, str]:
     """(title, text) of a web page through the shared fetch layer (cache, per-host rate, robots.txt, deadline).
-    Raises ``FetchStatus`` for a non-2xx answer, ``FetchRefused`` for robots.txt, and httpx errors for the caller."""
+    A 403 or a challenge page is read in the browser when one is given. Raises ``Stopped`` at a CAPTCHA, a login
+    wall or a paywall; ``FetchStatus`` for other non-2xx answers; ``FetchRefused`` for robots.txt; httpx errors."""
     if fetcher is not None:
-        return await _read_page(fetcher, url)
+        return await _read_page(fetcher, url, browser)
     own = WebFetcher(client=client, deadline=timeout)  # no shared fetcher: a short-lived one for this call
     try:
-        return await _read_page(own, url)
+        return await _read_page(own, url, browser)
     finally:
         await own.aclose()
 
 
-async def _read_page(fetcher: WebFetcher, url: str) -> tuple[str, str]:
+async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | None) -> tuple[str, str]:
     got = await fetcher.get(url)
+    verdict = classify(got.status, got.body)
+    if verdict is Verdict.BLOCKED and browser is not None:
+        return await _read_rendered(browser, url)
+    if verdict in STOP_VERDICTS:
+        raise Stopped(stop_report(verdict, url))
     if not 200 <= got.status < 300:
         raise FetchStatus(got.status, url)
     if "html" in got.content_type or got.body.lstrip().lower().startswith(("<!doctype", "<html")):
@@ -130,6 +151,18 @@ async def _read_page(fetcher: WebFetcher, url: str) -> tuple[str, str]:
         title, text = url, got.body
     if got.truncated:
         text += "\n[page cut: the fetch deadline or the size cap was reached]"
+    return title or url, text[:MAX_FETCH_CHARS]
+
+
+async def _read_rendered(browser: BrowserManager, url: str) -> tuple[str, str]:
+    """A page the browser renders. The same stop rules apply: a CAPTCHA, a login or a paywall ends the read."""
+    page: RenderedPage = await browser.fetch(url)
+    verdict = classify(page.status, page.html)
+    if verdict in STOP_VERDICTS:
+        raise Stopped(stop_report(verdict, url))
+    if verdict is not Verdict.OK:
+        raise RuntimeError(f"still blocked in the browser (HTTP {page.status}) at {url}; not solved, not retried")
+    title, text = extract_text(page.html)
     return title or url, text[:MAX_FETCH_CHARS]
 
 
@@ -247,10 +280,11 @@ class BuiltinTools(ResearchTools):
     name = "builtin web_search/web_fetch"
 
     def __init__(self, searxng_url: str | None, *, keyless_fallback: bool = True,
-                 fetcher: WebFetcher | None = None) -> None:
+                 fetcher: WebFetcher | None = None, browser: BrowserManager | None = None) -> None:
         self.searx = SearxngSearch(searxng_url)
         self.ddg = DuckDuckGoSearch() if keyless_fallback else None
         self.fetcher = fetcher
+        self.browser = browser
 
     async def unavailable_reason(self) -> str:
         if await self.searx.available() or self.ddg is not None:
@@ -265,7 +299,7 @@ class BuiltinTools(ResearchTools):
         return []
 
     async def fetch(self, url: str) -> tuple[str, str]:
-        return await fetch_page(url, fetcher=self.fetcher)
+        return await fetch_page(url, fetcher=self.fetcher, browser=self.browser)
 
 
 _URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
@@ -388,12 +422,13 @@ def mcp_search_tool(mcp: Any) -> Any:
     return rank_tool(tools, _SEARCH_MARKERS, ("search",), _NOT_WEB)
 
 
-def pick_tools(config: Any, mcp: Any, fetcher: WebFetcher | None = None) -> ResearchTools:
+def pick_tools(config: Any, mcp: Any, fetcher: WebFetcher | None = None,
+               browser: BrowserManager | None = None) -> ResearchTools:
     """MCP search/fetch when connected, else the built-ins."""
     cfg = dict(getattr(config, "research", None) or {})
     builtin = BuiltinTools(
         cfg.get("searxng_url", DEFAULT_SEARXNG), keyless_fallback=bool(cfg.get("keyless_fallback", True)),
-        fetcher=fetcher,
+        fetcher=fetcher, browser=browser,
     )
     tools = list(mcp.tools()) if mcp is not None else []
     search = mcp_search_tool(mcp)
@@ -453,20 +488,43 @@ async def fallback_search(
     return [], notes, answered
 
 
-def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None, mcp: Any = None) -> None:
-    """``web_fetch`` always; ``web_search`` over SearXNG, then keyless DuckDuckGo, then a connected MCP search tool."""
+def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None, mcp: Any = None,
+                       browser: BrowserManager | None = None) -> None:
+    """``web_fetch`` (escalates to the browser on a 403 or a challenge), ``web_browse`` (renders a page in the browser),
+    and ``web_search`` over SearXNG, then keyless DuckDuckGo, then a connected MCP search tool."""
     cfg = dict(getattr(config, "research", None) or {})
     searx = SearxngSearch(cfg.get("searxng_url", DEFAULT_SEARXNG))
     ddg = DuckDuckGoSearch() if bool(cfg.get("keyless_fallback", True)) else None
     fetcher = fetcher or WebFetcher.from_config(cfg)
+    browser = browser or BrowserManager.from_config(config)
 
     async def tool_fetch(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         url = str(arguments.get("url") or "")
         try:
-            title, text = await fetch_page(url, fetcher=fetcher)
+            title, text = await fetch_page(url, fetcher=fetcher, browser=browser)
         except Exception as e:  # noqa: BLE001
             return {"error": f"web_fetch failed: {e}"}
         return {"content": f"# {title}\n{url}\n\n{text}"}
+
+    async def tool_browse(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
+        url = str(arguments.get("url") or "")
+        if _safe_url(url) is None:
+            return {"error": f"web_browse needs an http(s) URL: {url[:200]}"}
+        try:
+            page = await browser.fetch(url)
+        except BrowserUnavailable as e:
+            return {"error": f"web_browse is unavailable: {e}"}
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"web_browse failed: {e}"}
+        if page.downloads:
+            return {"content": "downloaded (saved under the k3code home): " + ", ".join(page.downloads)}
+        verdict = classify(page.status, page.html)
+        if verdict in STOP_VERDICTS:
+            return {"error": stop_report(verdict, url)}
+        if verdict is not Verdict.OK:
+            return {"error": f"web_browse: still blocked (HTTP {page.status}) at {url}; not solved, not retried"}
+        title, text = extract_text(page.html)
+        return {"content": f"# {title or url}\n{page.url}\n\n{text[:MAX_FETCH_CHARS]}"}
 
     async def tool_search(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         query = str(arguments.get("query") or "").strip()
@@ -481,10 +539,19 @@ def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None,
         return {"error": f"web_search is disabled: {'; '.join(notes)}"}
 
     reg.register(
-        ToolSpec(name="web_fetch", description="Fetch a web page and return its readable text.",
+        ToolSpec(name="web_fetch", description="Fetch a web page and return its readable text. A page that blocks "
+                                               "plain HTTP is read in a browser; CAPTCHAs, logins and paywalls stop.",
                  parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
                  side_effect=False),
         tool_fetch,
+    )
+    reg.register(
+        ToolSpec(name="web_browse", description="Render a page in a real Chromium (for pages that need JavaScript) "
+                                                "and return its readable text. Reads only: it never clicks, types or "
+                                                "logs in. Needs the optional Playwright install.",
+                 parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+                 side_effect=False),
+        tool_browse,
     )
     reg.register(
         ToolSpec(name="web_search", description="Search the web: SearXNG if configured, else keyless DuckDuckGo, "
