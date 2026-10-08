@@ -16,7 +16,7 @@ from k3code.providers.types import Message, StreamEvent, ToolCall
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
-from k3code.tools import build_registry
+from k3code.tools import build_registry, clip_tool_results
 
 logger = logging.getLogger(__name__)
 
@@ -199,9 +199,15 @@ class AgentLoop:
             # M2: disk guard + budget check before starting new work.
             self._check_disk_guard()
             self._check_budgets("turn start")
-            # M2: the stream goes through persistent retry (pause/park/resume).
+            # M2: the stream goes through persistent retry (pause/park/resume). The model gets head+tail clips of
+            # long tool results; ``messages`` (transcript, session, gateway) keeps every full result.
             stream = self.reliability.stream(
-                self.router, messages, self.tool_specs(), model=model, max_tokens=max_tokens, temperature=temperature
+                self.router,
+                clip_tool_results(messages),
+                self.tool_specs(),
+                model=model,
+                max_tokens=max_tokens,
+                temperature=temperature,
             )
 
             tool_calls: list[ToolCall] = []
