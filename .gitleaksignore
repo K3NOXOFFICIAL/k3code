@@ -15,3 +15,22 @@ ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-k
 ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:23
 ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:55
 ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:75
+
+# The same fixtures again, as they reappear in the m5 merge commits (23f0a8f6, fbf92c87); reviewed 2026-10-08.
+23f0a8f6ce23568ea3df193a59c6ec5c77436894:core/src/k3code/gateway/server.py:generic-api-key:781
+23f0a8f6ce23568ea3df193a59c6ec5c77436894:core/tests/test_learning_projectprep.py:aws-access-token:70
+23f0a8f6ce23568ea3df193a59c6ec5c77436894:core/tests/test_cmd_bundle.py:generic-api-key:19
+23f0a8f6ce23568ea3df193a59c6ec5c77436894:core/tests/test_cmd_bundle.py:generic-api-key:20
+23f0a8f6ce23568ea3df193a59c6ec5c77436894:panes/cmd/tuios-web/access_test.go:generic-api-key:98
+23f0a8f6ce23568ea3df193a59c6ec5c77436894:panes/internal/integration/hook_test.go:curl-auth-header:124
+23f0a8f6ce23568ea3df193a59c6ec5c77436894:panes/internal/session/approvals_test.go:generic-api-key:456
+23f0a8f6ce23568ea3df193a59c6ec5c77436894:scripts/dev/tasks/m3-panes.md:generic-api-key:5
+23f0a8f6ce23568ea3df193a59c6ec5c77436894:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:64
+fbf92c87922c932561ad35339a3480afc01cf786:core/src/k3code/gateway/server.py:generic-api-key:779
+fbf92c87922c932561ad35339a3480afc01cf786:core/tests/test_cmd_bundle.py:generic-api-key:19
+fbf92c87922c932561ad35339a3480afc01cf786:core/tests/test_cmd_bundle.py:generic-api-key:20
+fbf92c87922c932561ad35339a3480afc01cf786:panes/cmd/tuios-web/access_test.go:generic-api-key:98
+fbf92c87922c932561ad35339a3480afc01cf786:panes/internal/integration/hook_test.go:curl-auth-header:124
+fbf92c87922c932561ad35339a3480afc01cf786:panes/internal/session/approvals_test.go:generic-api-key:456
+fbf92c87922c932561ad35339a3480afc01cf786:scripts/dev/tasks/m3-panes.md:generic-api-key:5
+fbf92c87922c932561ad35339a3480afc01cf786:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:64
