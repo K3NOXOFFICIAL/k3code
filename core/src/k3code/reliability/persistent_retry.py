@@ -45,8 +45,9 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_REASONS = frozenset({"rate_limit", "quota"})
 #: ChainExhausted reasons that are transient: an unattended run parks on them instead of failing its turn.
 UNATTENDED_PARK_REASONS = frozenset({"server", "timeout", "network", "unknown"})
-#: ChainExhausted reasons that waiting cannot fix.
-PERMANENT_REASONS = frozenset({"auth", "bad_request"})
+#: ChainExhausted reasons that waiting cannot fix: a rejected key, an unknown model, a certificate that does not
+#: verify (set SSL_CERT_FILE or fix the proxy; connectivity coming back changes nothing).
+PERMANENT_REASONS = frozenset({"auth", "bad_request", "ssl_cert"})
 
 
 class TurnCancelled(K3CodeError):

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from k3code import trust
 from k3code.config import load_config
 from k3code.permissions import InvalidPermissionMode, permission_mode_from_config
 
@@ -19,6 +20,7 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     cfg_dir = tmp_path / "project" / ".k3code"
     cfg_dir.mkdir(parents=True)
     (cfg_dir / "config.yaml").write_text("permission_mode: ask\nmax_turns: 7\nautonomy:\n  plan_first: true\n")
+    trust.record(tmp_path / "project", trusted=True)  # an untrusted project config is ignored (k3code.trust)
     return tmp_path / "project"
 
 

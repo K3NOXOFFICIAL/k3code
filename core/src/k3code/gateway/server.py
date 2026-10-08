@@ -76,7 +76,7 @@ from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
-from k3code.reliability.persistent_retry import TurnCancelled
+from k3code.reliability.persistent_retry import PERMANENT_REASONS, TurnCancelled
 from k3code.research.browser import BrowserManager
 from k3code.research.fetch import WebFetcher
 from k3code.research.flow import Research
@@ -322,7 +322,7 @@ def _error_surface(exc: BaseException | None) -> dict[str, Any] | None:
         return {"code": "context_overflow", "retryable": True}
     if isinstance(exc, ChainExhausted):
         reason = exc.last_reason or "unknown"
-        surface: dict[str, Any] = {"layer": "provider", "retryable": reason not in ("auth", "bad_request")}
+        surface: dict[str, Any] = {"layer": "provider", "retryable": reason not in PERMANENT_REASONS}
         if reason in _FAILURE_CODES:
             surface["code"] = _FAILURE_CODES[reason]
         return surface

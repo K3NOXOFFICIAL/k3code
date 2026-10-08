@@ -215,6 +215,7 @@ class Router:
     ) -> AsyncIterator[StreamEvent]:
         last_reason: FailoverReason | None = None
         last_detail = ""
+        failure_hint = ""  # a TLS hint outlives the failovers that follow it: it is what the user must fix
         all_network = True  # tracks "every failure so far was a network failure"
         entry_index = 0
         while entry_index < len(self.chain):
@@ -257,6 +258,7 @@ class Router:
                     classified = classify_api_error(exc, provider=entry.provider_name, model=target_model)
                     last_reason = classified.reason
                     last_detail = summarize(exc)
+                    failure_hint = classified.hint or failure_hint
                     all_network = all_network and classified.reason is FailoverReason.network
                     if classified.reason is FailoverReason.context_overflow:
                         raise ContextOverflow(summarize(exc, limit=500)) from exc
@@ -320,8 +322,9 @@ class Router:
                 until=until,
             )
         detail = f": {last_detail}" if last_detail else ""
+        hint = f". Hint: {failure_hint}" if failure_hint else ""
         raise ChainExhausted(
-            f"all provider entries failed (last reason: {reason_name}){detail}", last_reason=reason_name
+            f"all provider entries failed (last reason: {reason_name}){detail}{hint}", last_reason=reason_name
         )
 
     # ── helpers ──

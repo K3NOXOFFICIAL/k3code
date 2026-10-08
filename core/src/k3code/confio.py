@@ -16,6 +16,7 @@ from typing import Any
 import yaml
 from pydantic import ValidationError
 
+from k3code import trust
 from k3code.config import Settings
 
 _BAK_RE = re.compile(r"\.bak-\d{8}T\d{12}(?:-\d+)?$")
@@ -65,7 +66,8 @@ def write_yaml(path: Path, data: dict[str, Any], *, backup: bool = True) -> Path
     if backup and path.is_file():
         bak = backup_path(path)
         bak.write_bytes(path.read_bytes())
-    path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    with trust.keeping_trust(path):
+        path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return bak
 
 

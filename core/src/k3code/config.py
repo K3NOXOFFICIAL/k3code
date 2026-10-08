@@ -10,6 +10,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from k3code import trust
+
 logger = logging.getLogger(__name__)
 
 K3CODE_HOME = Path(os.environ.get("K3CODE_HOME", Path.home() / ".k3code")).expanduser()
@@ -209,10 +211,14 @@ def load_config(
     # 2. User config (~/.k3code/config.yaml)
     user_config = _load_yaml(_current_home() / "config.yaml")
 
-    # 3. Project config (<project_dir>/.k3code/config.yaml)
+    # 3. Project config (<project_dir>/.k3code/config.yaml): applied only as the user trusted it (see k3code.trust)
     project_config = {}
     if project_dir:
-        project_config = _load_yaml(project_dir / ".k3code" / "config.yaml")
+        text = trust.trusted_text(project_dir)
+        if text is None:
+            logger.debug("project config %s not applied: not trusted (k3code trust applies it)", project_dir)
+        else:
+            project_config = yaml.safe_load(text) or {}
 
     # 4. Environment variables (only scalar top-level keys that exist in Settings; an empty value counts as unset)
     env_overrides: dict[str, Any] = {}

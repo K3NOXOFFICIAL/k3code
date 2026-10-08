@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from k3code import trust
 from k3code.config import load_config
 from k3code.providers import make_providers
 from k3code.providers.anthropic import AnthropicProvider
@@ -37,6 +38,7 @@ providers:
 default_model: default
 """
     )
+    trust.record(tmp_path, trusted=True)  # the providers of an untrusted project config are ignored (k3code.trust)
     return tmp_path
 
 
@@ -56,6 +58,7 @@ def test_load_config_missing_env_var_yields_empty_key(tmp_path: Path):
         "providers:\n  - name: x\n    kind: openai\n    base_url: https://x\n"
         "    api_key_env: K3_DOES_NOT_EXIST\n    models: {default: m}\n"
     )
+    trust.record(tmp_path, trusted=True)
     os.environ.pop("K3_DOES_NOT_EXIST", None)
     config = load_config(project_dir=tmp_path)
     assert config.providers[0].api_key == ""
