@@ -419,50 +419,47 @@ export function buildPalette(seeds: ThemeSeeds, isLight: boolean): ThemeColors {
 }
 
 export const DARK_SEEDS: ThemeSeeds = {
-  accent: "#FFBF00",
-  // The classic Hermes navy surfaces are IDENTITY, not derivation drift —
-  // keep them as explicit fill seeds (the ladder derives them for skins
-  // that don't care).
-  activeRow: "#333355",
+  // k3code's identity is hot pink: deep pink headings, hot pink accents,
+  // violet-red rules. Status colours stay outside the pink family (red-orange
+  // errors, green ok, amber warnings, lavender shell mode) so they keep their
+  // meaning next to the accents.
+  accent: "#FF69B4",
+  // Plum fills are identity, not derivation drift: explicit seeds (the ladder
+  // would land on gray).
+  activeRow: "#4A1838",
   bg: "#101014",
-  border: "#CD7F32",
-  error: "#ef5350",
+  border: "#C71585",
+  error: "#FF5F45",
   ok: "#4caf50",
-  primary: "#FFD700",
-  prompt: "#FFF8DC",
-  selection: "#3a3a55",
-  shellDollar: "#4dabf7",
+  primary: "#FF1493",
+  prompt: "#FFE4F1",
+  selection: "#5A1F45",
+  shellDollar: "#B39DDB",
   statusBad: "#FF8C00",
-  statusCritical: "#FF6B6B",
+  statusCritical: "#FF6B4A",
   statusGood: "#8FBC8F",
-  statusWarn: "#FFD700",
-  surface: "#1a1a2e",
-  text: "#FFF8DC",
+  statusWarn: "#FFC857",
+  surface: "#24101D",
+  text: "#FFF0F7",
   warn: "#ffa726",
 };
 
-// Light-terminal seeds: darker golds/ambers that stay legible on white.
-// The classic light-mode Hermes look was never hand-authored: for years the
-// TUI emitted the DARK golds and hosts with xterm's minimumContrastRatio
-// (Cursor defaults to 4.5) lifted them against white — hue and saturation
-// kept, luminance clamped. These seeds are those exact lifts
-// (liftForContrast(dark, '#ffffff', 4.5)), so hosts WITHOUT a contrast pass
-// render the same thing Cursor always showed. Text/prompt stay ink — body
-// copy historically rendered in the terminal's default near-black fg.
+// Light-terminal seeds: darker raspberry/magenta pinks that keep at least
+// 4.5:1 against white; body text and prompt stay near-black ink.
 export const LIGHT_SEEDS: ThemeSeeds = {
-  accent: "#956E00",
+  accent: "#C2185B",
   bg: "#ffffff",
-  border: "#A56628",
-  error: "#C14240",
+  border: "#9C1B6A",
+  error: "#B23A1E",
   ok: "#367E39",
-  primary: "#867000",
-  prompt: "#2B2014",
-  shellDollar: "#377BB3",
+  primary: "#AD1457",
+  prompt: "#2B1420",
+  shellDollar: "#5E35B1",
   statusBad: "#A65A00",
-  statusCritical: "#B94D4D",
+  statusCritical: "#B94D2D",
   statusGood: "#5C7A5C",
-  statusWarn: "#867000",
-  text: "#3D2F13",
+  statusWarn: "#8A6100",
+  text: "#3D1530",
   warn: "#956115",
 };
 
