@@ -485,13 +485,12 @@ async def test_sources_are_topped_up_from_spare_hits_to_min_sources(tmp_path, mo
 async def test_dead_links_are_not_cited_but_bot_blocked_pages_are(tmp_path, monkeypatch):
     """A page that 404s/5xx's must not be cited from its search snippet (the reader would get a dead link); a page
     that refuses a script (403) exists, so its snippet still counts."""
-    import httpx
-
+    from k3code.research.fetch import FetchStatus
     from k3code.research.tools import Hit, ResearchTools
 
+    # the built-in fetch path raises FetchStatus (tools._read_page), not httpx.HTTPStatusError
     def status_error(code):
-        req = httpx.Request("GET", "https://x")
-        return httpx.HTTPStatusError("e", request=req, response=httpx.Response(code, request=req))
+        return FetchStatus(code, "https://x")
 
     class Tools(ResearchTools):
         name = "stub"
@@ -529,8 +528,7 @@ async def test_dead_links_are_not_cited_but_bot_blocked_pages_are(tmp_path, monk
 async def test_dropped_sources_are_replaced_from_spare_hits(tmp_path, monkeypatch):
     """Dead links (and pages that yield no claims) are dropped after reading; the run reads spare hits until
     min_sources sources produced claims instead of finishing short."""
-    import httpx
-
+    from k3code.research.fetch import FetchStatus
     from k3code.research.tools import Hit, ResearchTools
 
     class Tools(ResearchTools):
@@ -541,8 +539,7 @@ async def test_dropped_sources_are_replaced_from_spare_hits(tmp_path, monkeypatc
 
         async def fetch(self, url):
             if int(url.rsplit("/", 1)[1]) < 4:  # the first four hits (the ones picked first) are dead
-                req = httpx.Request("GET", url)
-                raise httpx.HTTPStatusError("gone", request=req, response=httpx.Response(404, request=req))
+                raise FetchStatus(404, url)  # what the built-in fetch path raises
             return "page", "page text"
 
     plan = '{"sub_topics":[{"name":"A","queries":["a"]}]}'
@@ -563,6 +560,28 @@ async def test_dropped_sources_are_replaced_from_spare_hits(tmp_path, monkeypatc
     urls = {s.url for s in res.state.sources}
     assert len(urls) >= 6, urls
     assert not any(u.endswith(("/0", "/1", "/2", "/3")) for u in urls)
+
+
+@pytest.mark.parametrize(("status", "dead"), [(404, True), (410, True), (500, True), (503, True), (403, False), (429, False)])
+def test_fetch_status_from_the_builtin_fetch_path_is_a_dead_link(status, dead):
+    from k3code.research.fetch import FetchStatus
+
+    assert is_dead_link(FetchStatus(status, "https://example.org/x")) is dead
+
+
+async def test_builtin_fetch_404_is_a_dead_link_end_to_end():
+    """The production fetch path (BuiltinTools over a WebFetcher) must raise something is_dead_link recognises."""
+    import httpx
+
+    from k3code.research.fetch import WebFetcher
+    from k3code.research.tools import BuiltinTools
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(404, text="gone")))
+    tools = BuiltinTools(None, keyless_fallback=False, fetcher=WebFetcher(client=client, respect_robots=False))
+    with pytest.raises(Exception) as info:
+        await tools.fetch("https://example.org/gone")
+    assert is_dead_link(info.value)
+    await client.aclose()
 
 
 def test_research_counts_are_clamped_to_at_least_one():
