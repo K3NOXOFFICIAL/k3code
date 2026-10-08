@@ -65,6 +65,24 @@ async def test_read_line_range(temp_dir):
     assert result["lines"] == "2-4 of 5"
 
 
+async def test_read_of_a_huge_file_is_refused_or_streamed_as_a_range(temp_dir, monkeypatch):
+    import k3code.tools as tools
+
+    monkeypatch.setattr(tools, "MAX_READ_BYTES", 100)
+    f = temp_dir / "big.log"
+    f.write_text("".join(f"line{i}\n" for i in range(1, 51)))  # ~340 bytes
+    result = await tool_read({"path": str(f)}, cwd=temp_dir)
+    assert "start and end" in result["error"]
+    result = await tool_read({"path": str(f), "start": 10, "end": 12}, cwd=temp_dir)
+    assert result["content"] == "line10\nline11\nline12"
+    assert result["lines"] == "10-12"
+    assert "error" in await tool_read({"path": str(f), "start": 1, "end": 50}, cwd=temp_dir)
+    f.write_text("x" * 500 + "\nafter\n")  # one line longer than the limit is skipped, not loaded
+    result = await tool_read({"path": str(f), "start": 2, "end": 2}, cwd=temp_dir)
+    assert result["content"] == "after"
+    assert "error" in await tool_read({"path": str(f), "start": 1, "end": 1}, cwd=temp_dir)
+
+
 async def test_write_file(temp_dir):
     f = temp_dir / "new.txt"
     result = await tool_write({"path": str(f), "content": "hello"}, cwd=temp_dir)
