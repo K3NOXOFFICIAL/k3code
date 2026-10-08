@@ -111,7 +111,9 @@ class OpenAICompatProvider(Provider):
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(chunk, dict) and chunk.get("error") and not chunk.get("choices"):
+                if isinstance(chunk, dict) and chunk.get(
+                    "error"
+                ):  # also OpenRouter's error + finish_reason "error" shape
                     raise _inband_error(chunk)  # the upstream failed after answering 200
                 choices = chunk.get("choices") or []
                 if choices:

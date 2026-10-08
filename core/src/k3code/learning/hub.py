@@ -336,6 +336,11 @@ class LearningHub:
         # for a human to accept them.
         context = dict(self.server.config.context or {})
         cands = await replay.token_candidates(context, self.replays.load())
+        # a candidate the A/B window already judged worse and rolled back is never auto-applied again: it goes to
+        # the proposal store, whose dedup key latches it for the human path
+        for c in cands:
+            if c["auto_ok"] and self._rolled_back_before(c["patch"]):
+                c["auto_ok"] = False
         for c in cands:
             if c["auto_ok"] and not self._already_in_effect(c["patch"]):
                 self._auto_apply(c)
@@ -343,6 +348,13 @@ class LearningHub:
         if session is not None:
             self.emit(session, made)
         return made
+
+    def _rolled_back_before(self, patch: dict[str, Any]) -> bool:
+        return any(
+            x["patch"] == patch and x["status"] == "rolled_back"
+            for x in self.experiments.all()
+            if x.get("kind") == "config"
+        )
 
     def _already_in_effect(self, patch: dict[str, Any]) -> bool:
         if any(x["patch"] == patch for x in self.experiments.active() if x.get("kind") == "config"):

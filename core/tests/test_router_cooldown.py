@@ -249,3 +249,15 @@ def test_clear_reason_drops_only_that_reason():
     assert store.clear_reason(FailoverReason.network) == 1
     assert not store.in_cooldown(provider="a", model="m", base_url="u")
     assert store.in_cooldown(provider="b", model="m", base_url="u")
+
+
+async def test_a_cooldown_armed_under_a_model_override_is_honoured_on_the_next_call():
+    a = Scripted("a", [err429(120)])
+    router, store, _, _ = make([a])
+    with pytest.raises(ChainExhausted):
+        await router.complete(MSGS, [], model="override")
+    assert store.in_cooldown(provider="a", model="override", base_url="http://a")
+    with pytest.raises(ChainExhausted) as exc:
+        await router.complete(MSGS, [], model="override")
+    assert a.calls == 1  # skipped inside its window, not called again
+    assert exc.value.retry_after is not None and exc.value.retry_after > 100

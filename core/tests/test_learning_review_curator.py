@@ -112,3 +112,22 @@ def test_facts_section_roundtrip(tmp_path):
     distiller.write_auto_section(md, [distiller.Preference("f1", 1, 1)], review.FACTS_HEADING)
     distiller.write_auto_section(md, [distiller.Preference("f2", 1, 1)], review.FACTS_HEADING)
     assert md.read_text().startswith("# A\ntext\n") and distiller.read_auto_section(md, review.FACTS_HEADING) == ["f2"]
+
+
+async def test_review_mem0_writes_do_not_block_the_event_loop_thread(tmp_path):
+    import threading
+
+    from k3code.config import Mem0Config, Settings
+
+    (tmp_path / "repo").mkdir()
+    threads: list[threading.Thread] = []
+    await review.review_session(
+        FakeCaller(REPLY),
+        convo(8),
+        store=ProposalStore(tmp_path),
+        cwd=tmp_path / "repo",
+        config=Settings(mem0=Mem0Config(url="http://m")),
+        min_turns=6,
+        mem0_post=lambda u, b, h: threads.append(threading.current_thread()),
+    )
+    assert threads and all(t is not threading.main_thread() for t in threads)

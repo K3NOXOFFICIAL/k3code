@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -92,7 +93,10 @@ async def review_session(
         existing = distiller.read_auto_section(mem, FACTS_HEADING)
         merged = list(dict.fromkeys([*existing, *facts]))[-30:]
         distiller.write_auto_section(mem, [distiller.Preference(f, 0.6, 1) for f in merged], FACTS_HEADING)
-        distiller.store_mem0(config, [distiller.Preference(f, 0.6, 1) for f in facts], mem0_post)
+        # store_mem0 is blocking HTTP (10 s per fact): never on the gateway's event loop
+        await asyncio.to_thread(
+            distiller.store_mem0, config, [distiller.Preference(f, 0.6, 1) for f in facts], mem0_post
+        )
     drafts: list[str] = []
     props: list[Proposal] = []
     for s in data.get("skills") or []:

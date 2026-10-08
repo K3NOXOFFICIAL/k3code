@@ -431,3 +431,35 @@ def test_a_main_tier_kind_without_escalations_is_proposed_one_tier_down(tmp_path
     assert not [c for c in optimizer.suggest(mine, Settings()) if "cheap" in str(c["patch"])]
     esc = optimizer.collect(tiered(0, 12, 0, 300, 2, kind="title"), DecisionLog(tmp_path), [], since=0)
     assert not [c for c in optimizer.suggest(esc, Settings()) if "cheap" in str(c["patch"])]
+
+
+async def test_a_rolled_back_auto_candidate_is_not_applied_again_next_week(tmp_path, monkeypatch):
+    from test_learning_replay import turn
+    from test_permissions_gateway import make_server
+
+    server, _ = make_server(tmp_path, ["x"], monkeypatch, learning={"optimizer": {"enabled": True, "min_sessions": 5}})
+    for i in range(6):
+        server.usage.record(
+            "call",
+            session=f"s{i}",
+            tokens_in=100,
+            tokens_out=10,
+            tier="main",
+            task_kind="interactive_turn",
+            turn=f"u{i}",
+        )
+    for rec in [turn(i) for i in range(300)] + [turn(1000, tool_chars=60_000, tools=5)]:
+        assert server.learning.replays.append(rec)
+    await server.learning.run_optimizer()
+    (exp,) = server.learning.experiments.all()
+    assert server.learning.experiments.rollback(exp["id"])
+    assert server.config.context != {"tool_output_chars": 6000}
+    await server.learning.run_optimizer()  # the next weekly run sees the same records
+    assert len(server.learning.experiments.all()) == 1
+    assert server.config.context != {"tool_output_chars": 6000}
+    await server.close()
+
+
+def test_quality_ignores_provider_failovers():
+    base = metrics_for(0.2)
+    assert optimizer.quality({**base, "failure_rate": 0.05}) == optimizer.quality({**base, "failure_rate": 0.0})

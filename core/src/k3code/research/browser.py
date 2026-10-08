@@ -100,6 +100,11 @@ class RenderedPage:
     status: int  # the status of the navigation; 0 when there was no HTTP response (a download)
     html: str
     downloads: tuple[str, ...] = ()
+    truncated: bool = False  # the DOM was longer than MAX_SNAPSHOT_CHARS and was cut
+
+
+#: A rendered DOM is cut here, like the HTTP path's 2 MiB body cap, before anything parses or copies it.
+MAX_SNAPSHOT_CHARS = 2 * 1024 * 1024
 
 
 def _has(low: str, patterns: tuple[str, ...]) -> bool:
@@ -314,15 +319,25 @@ class BrowserManager:
         if pending:
             await asyncio.wait(pending, timeout=60)
         html = await page.content() if not saved else ""
+        truncated = len(html) > MAX_SNAPSHOT_CHARS
+        html = html[:MAX_SNAPSHOT_CHARS]
         if status >= 400 and _has(html.lower(), CHALLENGE_PATTERNS):
             # a JS challenge often clears by itself in a real browser: give it a few seconds, read nothing else
             for _ in range(int(self.challenge_wait)):
                 await asyncio.sleep(1.0)
                 html = await page.content()
+                truncated = len(html) > MAX_SNAPSHOT_CHARS
+                html = html[:MAX_SNAPSHOT_CHARS]
                 if not _has(html.lower(), CHALLENGE_PATTERNS):
                     status = 200  # the challenge passed; the document now is the page itself
                     break
-        return RenderedPage(url=str(getattr(page, "url", url) or url), status=status, html=html, downloads=tuple(saved))
+        return RenderedPage(
+            url=str(getattr(page, "url", url) or url),
+            status=status,
+            html=html,
+            downloads=tuple(saved),
+            truncated=truncated,
+        )
 
     async def _save_download(self, download: Any, saved: list[str]) -> None:
         name = re.sub(r"[^A-Za-z0-9._-]+", "_", str(download.suggested_filename or "download"))[:120] or "download"

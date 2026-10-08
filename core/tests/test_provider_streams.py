@@ -130,3 +130,16 @@ async def test_anthropic_in_band_overloaded_error_raises_as_overloaded():
         await run(anthropic(body))
     assert exc.value.status_code == 529
     assert classify_api_error(exc.value, provider="a", model="m").reason == FailoverReason.server
+
+
+async def test_openai_error_chunk_that_also_carries_choices_raises():
+    # OpenRouter: a top-level error next to choices[0].finish_reason == "error"
+    body = (
+        'data: {"choices":[{"index":0,"delta":{"content":"Half an ans"}}]}\n\n'
+        'data: {"choices":[{"index":0,"delta":{"content":""},"finish_reason":"error"}],'
+        '"error":{"message":"Provider returned error","code":502}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    with pytest.raises(ProviderError) as exc:
+        await run(openai(body))
+    assert "Provider returned error" in exc.value.message and exc.value.status_code == 502
