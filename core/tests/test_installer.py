@@ -295,3 +295,10 @@ def test_uninstall_removes_presetup_leftovers_and_keeps_user_data(tmp_path: Path
     assert run(tmp_path, UNINSTALL, "--purge").returncode == 0
     assert not (tmp_path / ".k3code").exists()
     assert not (tmp_path / ".config" / "k3code").exists()
+
+
+def test_presetup_shows_the_doctor_subset_and_ignores_its_status(tmp_path: Path) -> None:
+    r = run(tmp_path, INSTALL, "--from-source", "--yes")
+    assert r.returncode == 0, r.stderr  # the stub doctor exits 1; the install still succeeds
+    assert "health subset" in r.stderr
+    assert "browser: stub" in r.stderr

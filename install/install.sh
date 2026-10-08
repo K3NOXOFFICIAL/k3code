@@ -460,7 +460,10 @@ install_version() {
   BUILDING=$VERDIR
   if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: a fake core command, no uv, no network
     mkdir -p "$VERDIR/venv/bin"
-    printf '#!/bin/sh\necho "k3code %s"\n' "$VER" >"$VERDIR/venv/bin/k3code"
+    # the stub answers --version, and fails on `doctor` so the tests show that presetup ignores the doctor's status
+    # shellcheck disable=SC2016 # the $1 belongs to the stub script, not to this shell
+    printf '#!/bin/sh\ncase "$1" in\ndoctor) echo "! browser: stub (K3_STUB_VENV)"; exit 1 ;;\n*) echo "k3code %s" ;;\nesac\n' "$VER" \
+      >"$VERDIR/venv/bin/k3code"
     chmod +x "$VERDIR/venv/bin/k3code"
   else
     "$UV" venv --quiet --python '>=3.12' "$VERDIR/venv" >&2 ||
@@ -588,7 +591,16 @@ presetup_sandbox() {
   return 0
 }
 presetup_chromium() { :; }
-presetup_doctor() { :; }
+presetup_doctor() {
+  if [ ! -x "$BIN/k3code" ]; then
+    log "presetup: health subset skipped (k3code is not linked)"
+    return 0
+  fi
+  log "presetup: health subset (warnings only; 'k3code doctor' gives the full report)"
+  out=$("$BIN/k3code" doctor --install 2>/dev/null) || true
+  if [ -n "$out" ]; then say "$out"; fi
+  return 0
+}
 
 # ---- main ------------------------------------------------------------------
 main() {
