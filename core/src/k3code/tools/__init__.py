@@ -300,6 +300,14 @@ def format_tool_result(result: dict[str, Any]) -> Any:
         return text or "(no matches)"
     if "files" in result and isinstance(result["files"], list):  # glob
         return "\n".join(str(f) for f in result["files"]) or "(no files)"
+    if result.keys() == {"ok", "path"} and result["ok"] is True:  # write
+        return f"Wrote {result['path']}"
+    if result.keys() == {"ok", "replacements", "strategy"} and result["ok"] is True:  # edit
+        n = result["replacements"]
+        how = "" if result["strategy"] == "exact" else f" (matched by {result['strategy']}, not exactly)"
+        return f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
+    if result.keys() == {"error"}:
+        return f"Error: {result['error']}"
     return str(result)
 
 

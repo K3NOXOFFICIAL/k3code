@@ -36,11 +36,20 @@ def test_grep_and_glob_are_plain_lists_and_say_when_empty():
     assert format_tool_result({"files": []}) == "(no files)"
 
 
+def test_write_edit_and_plain_errors_are_one_readable_line():
+    assert format_tool_result({"ok": True, "path": "/p/a.txt"}) == "Wrote /p/a.txt"
+    assert format_tool_result({"ok": True, "replacements": 1, "strategy": "exact"}) == "Edited: 1 replacement"
+    assert format_tool_result({"ok": True, "replacements": 3, "strategy": "exact"}) == "Edited: 3 replacements"
+    fuzzy = format_tool_result({"ok": True, "replacements": 1, "strategy": "line_trimmed"})
+    assert fuzzy == "Edited: 1 replacement (matched by line_trimmed, not exactly)"
+    assert format_tool_result({"error": "File not found: x"}) == "Error: File not found: x"
+
+
 def test_everything_else_is_unchanged():
     assert format_tool_result({"content": "line 1\nline 2", "lines": "1-2"}) == "line 1\nline 2"
     assert format_tool_result({"content": ""}) == ""
-    assert format_tool_result({"error": "File not found: x"}) == "{'error': 'File not found: x'}"
-    assert format_tool_result({"ok": True, "path": "/p"}) == "{'ok': True, 'path': '/p'}"
+    assert format_tool_result({"ok": True, "note": "n"}) == "{'ok': True, 'note': 'n'}"  # todo: not a known shape
+    assert format_tool_result({"error": "x", "extra": 1}) == "{'error': 'x', 'extra': 1}"
 
 
 @pytest.mark.asyncio

@@ -124,7 +124,7 @@ async def test_agent_loop_tool_calls_only_on_final_message(temp_cwd):
     assert test_file.read_text() == "hi"
     tool_results = [e for e in events if e.type == "done" and e.message and e.message.role == "tool"]
     assert len(tool_results) == 1
-    assert "True" in tool_results[0].message.content  # str(result) of {"ok": True, "path": ...}
+    assert tool_results[0].message.content == f"Wrote {test_file}"  # what the model and the TUI see of a write
 
 
 @pytest.mark.asyncio
