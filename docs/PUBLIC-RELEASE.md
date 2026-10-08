@@ -21,6 +21,8 @@ until the switch: doing it earlier would diverge every clone and open branch whi
   self-hosted runners or secrets that a fork's pull request could reach.
 - Every text file is LF in the repo and in every checkout (`.gitattributes`).
 - LICENSE (MIT), NOTICE, `LICENSES/` and `VENDOR.toml` cover all vendored code; `scripts/vendor_check.py` passes.
+- Issue forms (bug report, feature request), a pull request template, and a contact link that sends security
+  reports to private vulnerability reporting are in `.github/`.
 - The wording no longer says the repository is private (README, GOAL.md, docs/PLAN.md).
 - Every CI job was run locally and passes (core, tui, panes, vendor_check, installer-windows via Windows
   PowerShell 5.1); GitHub Actions itself refused all jobs for a billing reason on 2026-10-08.
