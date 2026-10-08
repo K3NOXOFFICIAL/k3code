@@ -1,9 +1,10 @@
 # Making the repository public
 
 The repository is private. This is the checklist for the day it becomes public. Everything that could be done
-without rewriting history or deleting anything is already done (see [Already done](#already-done-2026-10-08)),
-and the history rewrite is scripted and dry-run verified. Publishing the rewrite waits until the switch: doing it
-earlier would diverge every clone and open branch while development continues.
+without rewriting history or deleting anything is already done (see [Already done](#already-done-2026-10-08)).
+The history rewrite is scripted, verified, and already applied to a private staging repository,
+`K3NOXOFFICIAL/k3code-public`, which is ready to be switched to public. Replacing this repository with it waits
+until the switch: doing it earlier would diverge every clone and open branch while development continues.
 
 ## Already done (2026-10-08)
 
@@ -57,14 +58,16 @@ purge the old refs, which takes longer).
    scripts/release/rewrite_history.sh          # needs git, uv, gitleaks; pushes nothing
    ```
 
-5. **Swap the repositories.** Rename the current one to `k3code-archive` (Settings → General; keep it private,
-   it holds the old history), create a new **private** `K3NOXOFFICIAL/k3code` with no README, then publish:
+5. **Refresh the staging repository and swap.** `K3NOXOFFICIAL/k3code-public` (private) already holds the
+   rewritten history as of 2026-10-08 (`Main` = PR #18, verified from a fresh clone: noreply authors only, every
+   removed value at 0, largest blob 301 KB, gitleaks clean, no `refs/pull/*`). Never open pull requests there
+   before the swap (they would pin commits again). Bring it up to date (`--push` mirrors, so it replaces what is
+   there), then rename the current repository to `k3code-archive` (keep it private, it holds the old history) and
+   rename `k3code-public` to `k3code`:
 
    ```bash
-   scripts/release/rewrite_history.sh --push https://github.com/K3NOXOFFICIAL/k3code
+   scripts/release/rewrite_history.sh --push https://github.com/K3NOXOFFICIAL/k3code-public
    ```
-
-   Set the default branch of the new repository to `Main`.
 6. **Re-clone everywhere** (laptop, desktop, servers). The install and release URLs keep working, since the name
    is unchanged. Old clones still hold the old history and must never be pushed to the new repository.
 7. **Switch visibility** in Settings → General, then enable: private vulnerability reporting (SECURITY.md relies
