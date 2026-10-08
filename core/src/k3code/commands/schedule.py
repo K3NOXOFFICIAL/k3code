@@ -9,6 +9,7 @@ from k3code.automation.cronexpr import ScheduleError, parse_schedule
 from k3code.automation.nlcron import nl_to_schedule
 from k3code.commands import CommandDef
 from k3code.commands._util import pop_option, reply, split_args
+from k3code.reliability import sandbox
 
 USAGE = (
     "/schedule add \"<cron expr or text like 'every weekday at 9'>\" <prompt> [--cwd DIR] [--model KEY] [--name NAME]\n"
@@ -46,6 +47,8 @@ class ScheduleCommand(CommandDef):
         when, prompt = args[0], " ".join(args[1:]).strip()
         live = ctx.sessions.get(session_id) if session_id else None
         workdir = str(Path(cwd).expanduser().resolve()) if cwd else (live.stored.cwd if live else str(Path.cwd()))
+        if not cwd and not live and sandbox.exposes_home(workdir):
+            return reply(f"/schedule: the daemon runs in {workdir}; pass --cwd <project dir> for this job.")
         try:
             sched = parse_schedule(when)
         except ScheduleError:

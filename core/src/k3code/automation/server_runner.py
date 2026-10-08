@@ -22,6 +22,19 @@ BUSY_POLL_S = 1.0
 SHELL_TIMEOUT_S = 600.0
 
 
+def _default_cwd(cwd: str) -> tuple[str, str]:
+    """``(workdir, error)``: an unset cwd falls back to the daemon's, unless that is ``$HOME`` (or ``/``): the run
+    would then work on the whole home directory, so it fails and asks for an explicit cwd instead."""
+    if cwd:
+        return cwd, ""
+    from k3code.reliability import sandbox
+
+    here = Path.cwd()
+    if sandbox.exposes_home(here):
+        return "", f"no working directory set and the daemon runs in {here}: give this job an explicit cwd"
+    return str(here), ""
+
+
 def _schedule_next_installer(tick: TickContext) -> Any:
     async def handler(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
         try:
@@ -86,9 +99,10 @@ class ServerRunner:
                     )
                 live = srv.live_for(stored)
         else:
-            stored = srv.store.create(
-                title=name or "automation", model=model or srv.config.default_model, cwd=cwd or str(Path.cwd())
-            )
+            cwd, err = _default_cwd(cwd)
+            if err:
+                return RunResult(status="failed", error=err, failure_kind="other")
+            stored = srv.store.create(title=name or "automation", model=model or srv.config.default_model, cwd=cwd)
             stored.meta.update({"background": True, "mode": mode, "origin": self.origin})
             srv.store.save(stored)
             live = srv.live_for(stored)
@@ -166,7 +180,9 @@ class ServerRunner:
         denied = hardline.check(command)
         if denied:
             return 126, f"denied by hardline rule: {denied}"
-        workdir = cwd or str(Path.cwd())
+        workdir, err = _default_cwd(cwd)
+        if err:
+            return 1, err
         # usable() spawns bwrap (up to 10 s on first use): keep it off the event loop
         argv = sandbox.build_argv(workdir) if await asyncio.to_thread(sandbox.usable) else None
         res = await tool_bash({"command": command, "timeout": SHELL_TIMEOUT_S}, cwd=Path(workdir), sandbox=argv)
@@ -179,9 +195,10 @@ class ServerRunner:
         srv = self.server
         created = session_id is None
         if session_id is None:
-            stored = srv.store.create(
-                title=f"goal: {objective[:40]}", model=srv.config.default_model, cwd=cwd or str(Path.cwd())
-            )
+            cwd, err = _default_cwd(cwd)
+            if err:
+                return RunResult(status="failed", error=err, failure_kind="other")
+            stored = srv.store.create(title=f"goal: {objective[:40]}", model=srv.config.default_model, cwd=cwd)
             stored.meta.update({"background": True, "mode": "auto", "origin": self.origin})
             srv.store.save(stored)
             live = srv.live_for(stored)
