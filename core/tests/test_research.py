@@ -562,7 +562,9 @@ async def test_dropped_sources_are_replaced_from_spare_hits(tmp_path, monkeypatc
     assert not any(u.endswith(("/0", "/1", "/2", "/3")) for u in urls)
 
 
-@pytest.mark.parametrize(("status", "dead"), [(404, True), (410, True), (500, True), (503, True), (403, False), (429, False)])
+@pytest.mark.parametrize(
+    ("status", "dead"), [(404, True), (410, True), (500, True), (503, True), (403, False), (429, False)]
+)
 def test_fetch_status_from_the_builtin_fetch_path_is_a_dead_link(status, dead):
     from k3code.research.fetch import FetchStatus
 

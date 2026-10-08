@@ -12,7 +12,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
@@ -29,9 +29,11 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.8",
 }
 ROBOTS_TTL = 3600.0
+MAX_REDIRECTS = 10
 ROBOTS_RETRY = 300.0  # an unreadable robots.txt is retried after this long
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[Any]]
+REDIRECTS = frozenset({301, 302, 303, 307, 308})
 
 
 class FetchRefused(RuntimeError):
@@ -58,6 +60,7 @@ class Fetched:
     body: str
     truncated: bool = False  # the deadline or the byte cap cut the body
     cached: bool = False
+    location: str = ""  # the Location header of a 3xx answer; get() follows it itself
 
 
 def _safe_url(url: str) -> str | None:
@@ -103,7 +106,7 @@ class WebFetcher:
         # created on first use, inside the running loop: a client made at import or in __init__ would be bound to the
         # wrong event loop once pytest (or a restarted gateway) runs another one
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(follow_redirects=True, timeout=self.deadline, headers=HEADERS)
+            self._client = httpx.AsyncClient(follow_redirects=False, timeout=self.deadline, headers=HEADERS)
             self._owns_client = True
         return self._client
 
@@ -130,10 +133,31 @@ class WebFetcher:
         if self.respect_robots and (reason := await self._robots_refusal(url, deadline_at)):
             raise FetchRefused(reason)
         await self._throttle(urlparse(url).netloc.lower())
-        got = await self._stream(url, deadline_at, self.max_bytes)
+        got = await self._follow(url, deadline_at, self.max_bytes, admit=True)
         if 200 <= got.status < 300 and not got.truncated:
             self._remember(url, got)
         return got
+
+    async def _follow(self, url: str, deadline_at: float, max_bytes: int, *, admit: bool) -> Fetched:
+        """``_stream`` with redirects followed by hand: every hop is re-checked (http(s) only, robots.txt and the
+        per-host bucket when ``admit``), the hop count is bounded and ``Fetched.url`` is the page the body came from.
+        The first hop was admitted by the caller."""
+        for hop in range(MAX_REDIRECTS + 1):
+            got = await self._stream(url, deadline_at, max_bytes)
+            got = replace(got, url=url)
+            if got.status not in REDIRECTS or not got.location:
+                return got
+            if hop == MAX_REDIRECTS:
+                break
+            nxt = urljoin(url, got.location)
+            if _safe_url(nxt) is None:
+                raise FetchRefused(f"redirect from {url} to a non-http(s) URL refused")
+            if admit:
+                if self.respect_robots and (reason := await self._robots_refusal(nxt, deadline_at)):
+                    raise FetchRefused(reason)
+                await self._throttle(urlparse(nxt).netloc.lower())
+            url = nxt
+        raise FetchRefused(f"more than {MAX_REDIRECTS} redirects from {url}")
 
     # ── per-domain token bucket ──
 
@@ -179,8 +203,8 @@ class WebFetcher:
         """(rules, unreadable). No robots.txt, or a 4xx other than 429, allows everything; an unreadable one (5xx,
         429, a timeout) refuses for a while, as the crawlers do."""
         try:
-            got = await self._stream(f"{origin}/robots.txt", deadline_at, ROBOTS_MAX_BYTES)
-        except (httpx.HTTPError, FetchDeadline, TimeoutError):
+            got = await self._follow(f"{origin}/robots.txt", deadline_at, ROBOTS_MAX_BYTES, admit=False)
+        except (httpx.HTTPError, FetchDeadline, FetchRefused, TimeoutError):
             return None, True
         if 200 <= got.status < 300:
             rules = RobotFileParser()
@@ -200,11 +224,12 @@ class WebFetcher:
             raise FetchDeadline(f"deadline reached before {url} was requested")
         client = self._http()
         buf = bytearray()
-        status, ctype, encoding, truncated = 0, "", "utf-8", False
+        status, ctype, encoding, truncated, location = 0, "", "utf-8", False, ""
         try:
             async with asyncio.timeout(remaining):  # a stalled read is cut here, not only between chunks
                 async with client.stream("GET", url) as r:
                     status, ctype = r.status_code, r.headers.get("content-type", "")
+                    location = r.headers.get("location", "")
                     encoding = r.encoding or "utf-8"
                     async for chunk in r.aiter_bytes():
                         buf += chunk
@@ -219,4 +244,4 @@ class WebFetcher:
                 raise FetchDeadline(f"deadline reached waiting for {url}") from e
             truncated = True
         body = bytes(buf[:max_bytes]).decode(encoding, errors="replace")
-        return Fetched(url=url, status=status, content_type=ctype, body=body, truncated=truncated)
+        return Fetched(url=url, status=status, content_type=ctype, body=body, truncated=truncated, location=location)
