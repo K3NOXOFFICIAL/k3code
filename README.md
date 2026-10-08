@@ -45,38 +45,37 @@ k3code plans before it acts, can run several agents in parallel, retries through
 
 ### Requirements
 
-- Linux. Only x86_64 has been tested; macOS is untested.
+- Linux, x86_64. Tested in containers on Fedora 44, Debian 13, Ubuntu 24.04, Arch and openSUSE Leap 16. aarch64 and macOS are untested.
 - `git`, `curl` or `wget`, `tar` (with `xz` and `gzip` support), and a POSIX shell. Network access is needed during install.
 - The installer fetches the rest into your home directory, with no root: [`uv`](https://docs.astral.sh/uv/) (it manages Python ≥ 3.12; it asks before installing `uv` unless you pass `--yes`), Node ≥ 22 for the TUI, and Go for the `k3` multi-window binary (an existing `go` on your `PATH` is used as is).
 - Optional: `bubblewrap` (`bwrap`) to sandbox unattended runs, `systemd --user` for the 24/7 service.
 
 ### Install
 
-The repository is private, so authenticate first (`gh auth login`, or use a GitHub token). Until pull request #1 is merged, the code is on the `m0-scaffold` branch:
+The repository is private, so authenticate once with `gh auth login` and `gh auth setup-git`. Then:
 
 ```sh
-gh repo clone K3NOXOFFICIAL/k3code -- -b m0-scaffold && cd k3code
-sh install/install.sh --from-source
+git clone https://github.com/K3NOXOFFICIAL/k3code.git && cd k3code
+sh install/install.sh          # the latest v* tag, or Main until a tag exists
 ```
 
-This creates a versioned install under `~/.local/share/k3code/` and links `k3code` and `k3` into `~/.local/bin/` (put that on your `PATH`).
+To install from the checkout you already have, use `sh install/install.sh --from-source`.
 
-A `--from-source` install is a regular, self-contained install: the Python core is copied into the version's own venv, so deleting a worktree or switching branches in the clone cannot break `k3code`. The clone's path is recorded in `~/.local/share/k3code/source_path`, and `k3code update --from-source` pulls it and builds a new version next to the old one (with automatic rollback). For development, `K3_EDITABLE=1 sh install/install.sh --from-source` keeps the old editable install (`pip install -e`), where your edits show up without re-installing.
+The installer creates a versioned install under `~/.local/share/k3code/` and links `k3code` and `k3` into `~/.local/bin/` (put that on your `PATH`). It never runs onboarding; it ends by telling you to run `k3code onboard`. Re-running it upgrades in place and keeps the previous version for rollback.
 
-The installer's own progress messages and its final exit status are written to `~/.local/share/k3code/install.log`. Output from `uv`, `npm` and `go` appears on the terminal only; to capture everything: `sh install/install.sh --from-source 2>&1 | tee install-full.log`.
-
-Flags: `--yes` (accept the installer's own prompt, i.e. installing `uv`), `--no-setup` or `--headless` (skip the setup wizard), `--from-bundle FILE` (restore settings and sessions from `k3code export`; it then asks only for secrets), `--channel`, `--version`. Uninstall with `install/uninstall.sh` (it keeps your data unless you pass `--purge`).
+Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--yes` (installs `uv` without asking), `--no-install-deps`, `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`). Uninstall with `sh install/uninstall.sh`; it keeps your data unless you pass `--purge`.
 
 ### First run
 
 ```sh
-k3code setup      # guided and resumable
+k3code onboard    # first-time setup: fast (endpoint and key) or full (every step)
 k3code doctor     # health checks with fix hints
 k3code            # start the TUI
 ```
 
-The setup wizard has 12 steps: `welcome`, `about`, `system`, `usage`, `providers`, `tiers`, `permissions`, `integrations`, `theme`, `service`, `tour`, `summary`. It asks about you, your system, what you mainly use k3code for, your provider chain, model tiers, permissions, optional integrations (MCP, mem0, skills), the theme, and whether to install the 24/7 service. When asked for a provider key, paste it: it is stored hidden (mode 0600) in `~/.config/k3code/env`, and the config only names the variable.
-Running `k3code` with no config starts the setup automatically.
+The first interactive start asks once, "fast or full setup?". Fast asks only for an API endpoint and key (or the `claude-cli` provider). Full runs the whole setup wizard. Nothing is forced: `k3code onboard` works at any time, and a headless `-p` or piped run without a provider prints one hint and exits with code 78 instead of prompting.
+
+The full wizard has 12 steps: `welcome`, `about`, `system`, `usage`, `providers`, `tiers`, `permissions`, `integrations`, `theme`, `service`, `tour`, `summary`. It asks about you, your system, what you mainly use k3code for, your provider chain, model tiers, permissions, optional integrations (MCP, mem0, skills), the theme, and whether to install the 24/7 service. When asked for a provider key, paste it: it is stored hidden (mode 0600) in `~/.config/k3code/env`, and the config only names the variable. Run one step again with `k3code setup --step NAME`.
 
 ### Maintain
 
