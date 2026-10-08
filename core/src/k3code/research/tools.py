@@ -29,7 +29,7 @@ from k3code.research.browser import (
     classify,
     stop_report,
 )
-from k3code.research.fetch import UA, FetchStatus, WebFetcher
+from k3code.research.fetch import UA, FetchRefused, FetchStatus, WebFetcher
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | No
     got = await fetcher.get(url)
     verdict = classify(got.status, got.body)
     if verdict is Verdict.BLOCKED and browser is not None:
-        return await _read_rendered(browser, url)
+        return await _read_rendered(browser, url, fetcher)
     if verdict in STOP_VERDICTS:
         raise Stopped(stop_report(verdict, url))
     if not 200 <= got.status < 300:
@@ -154,8 +154,10 @@ async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | No
     return title or url, text[:MAX_FETCH_CHARS]
 
 
-async def _read_rendered(browser: BrowserManager, url: str) -> tuple[str, str]:
-    """A page the browser renders. The same stop rules apply: a CAPTCHA, a login or a paywall ends the read."""
+async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher) -> tuple[str, str]:
+    """A page the browser renders. The same stop rules apply: a CAPTCHA, a login or a paywall ends the read. The
+    browser's own navigation is admitted like any other request: robots.txt, then a token of the host's bucket."""
+    await fetcher.admit(url)
     page: RenderedPage = await browser.fetch(url)
     verdict = classify(page.status, page.html)
     if verdict in STOP_VERDICTS:
@@ -510,6 +512,10 @@ def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None,
         url = str(arguments.get("url") or "")
         if _safe_url(url) is None:
             return {"error": f"web_browse needs an http(s) URL: {url[:200]}"}
+        try:
+            await fetcher.admit(url)
+        except FetchRefused as e:
+            return {"error": str(e)}
         try:
             page = await browser.fetch(url)
         except BrowserUnavailable as e:

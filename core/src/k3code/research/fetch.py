@@ -112,6 +112,14 @@ class WebFetcher:
             await self._client.aclose()
         self._client = None
 
+    async def admit(self, url: str) -> None:
+        """robots.txt and the per-host rate for a navigation made outside ``get()`` (the browser tool)."""
+        if _safe_url(url) is None:
+            raise ValueError(f"not an http(s) URL: {url}")
+        if self.respect_robots and (reason := await self._robots_refusal(url, self._now() + self.deadline)):
+            raise FetchRefused(reason)
+        await self._throttle(urlparse(url).netloc.lower())
+
     async def get(self, url: str) -> Fetched:
         """A page as text. Non-2xx answers come back as ``Fetched`` so the caller can escalate; a refused URL raises."""
         if _safe_url(url) is None:

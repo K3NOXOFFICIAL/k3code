@@ -32,6 +32,17 @@ PAYWALL = ("<html><body><main>" + ("teaser words " * 120) +
 LOGIN = "<html><body><h1>Please log in to view this page</h1><input type=password></body></html>"
 
 
+class FakeClock:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def now(self) -> float:
+        return self.t
+
+    async def sleep(self, seconds: float) -> None:
+        self.t += seconds
+
+
 class _Registry:
     def __init__(self) -> None:
         self.handlers: dict = {}
@@ -96,7 +107,8 @@ def fake_browser(pages: dict[str, tuple[int, str]]) -> tuple[BrowserManager, lis
 
 
 def fetcher(**kw) -> WebFetcher:
-    return WebFetcher(respect_robots=False, **kw)
+    kw.setdefault("respect_robots", False)
+    return WebFetcher(**kw)
 
 
 # ── classification: pure, no browser ──
@@ -210,7 +222,10 @@ async def test_a_captcha_met_in_the_browser_stops_the_read_and_is_never_solved()
     assert not [e for e in log if e[0] not in {"goto", "close", "launch", "context-close"}]
 
 
+@respx.mock
 async def test_the_agent_browse_tool_reports_stops_and_missing_playwright(monkeypatch):
+    for host in ("gated.test", "ok.test"):
+        respx.get(f"https://{host}/robots.txt").mock(return_value=httpx.Response(404))
     url = "https://gated.test/a"
     browser, _log = fake_browser({url: (200, CAPTCHA), "https://ok.test/a": (200, ARTICLE)})
     reg = _Registry()
@@ -357,3 +372,29 @@ async def test_real_browser_saves_a_download_under_the_k3code_home_only(tmp_path
     assert len(got.downloads) == 1
     saved = Path(got.downloads[0])
     assert saved.is_relative_to(k3home.resolve()) and saved.read_text() == "quarterly figures\n"
+
+
+@respx.mock
+async def test_web_browse_refuses_a_robots_disallowed_page_before_the_browser_starts():
+    """robots.txt is honoured by the browser tool too: a disallowed page never reaches the browser."""
+    respx.get("https://rules.test/robots.txt").mock(
+        return_value=httpx.Response(200, text="User-agent: *\nDisallow: /")
+    )
+    browser, log = fake_browser({"https://rules.test/private": (200, ARTICLE)})
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}), browser=browser)
+    out = await reg.handlers["web_browse"]({"url": "https://rules.test/private"})
+    assert "robots.txt disallows" in out["error"]
+    assert log == []  # no launch, no navigation
+
+
+async def test_an_escalated_page_takes_a_token_of_the_hosts_rate_budget(monkeypatch):
+    """The browser's own navigation to the same host is spaced like any request: one token, one second here."""
+    clock = FakeClock()
+    url = "https://budget.test/article"
+    with respx.mock:
+        respx.get(url).mock(return_value=httpx.Response(403, text=CHALLENGE))
+        browser, _log = fake_browser({url: (200, ARTICLE)})
+        web = fetcher(now=clock.now, sleep=clock.sleep, per_host_rate=1.0, burst=1.0)
+        await fetch_page(url, fetcher=web, browser=browser)  # the HTTP fetch takes the only token
+    assert clock.t == 1.0  # the browser's navigation waited for the next token
