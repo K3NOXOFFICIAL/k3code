@@ -109,8 +109,8 @@ sha256_of() { # sha256_of FILE
 
 can_fetch() { have curl || have wget; }
 
-as_root() { # as_root CMD...: run CMD as root when that needs no password; fails otherwise
-  if [ "$(id -u)" = 0 ]; then "$@"; elif have sudo && sudo -n true 2>/dev/null; then sudo -n "$@"; else return 1; fi
+as_root() { # as_root CMD...: root directly, or through sudo only after a person said yes at a terminal
+  if [ "$(id -u)" = 0 ]; then "$@"; elif [ "${ROOT_APPROVED:-0}" = 1 ]; then sudo "$@"; else return 1; fi
 }
 
 node_major() { "$1" --version 2>/dev/null | sed 's/^v//; s/\..*//'; }
@@ -385,9 +385,16 @@ unpack_zip() { # unpack_zip ZIP DIR: unzip, else Python's zipfile (which drops t
   done
 }
 
-ensure_bwrap() { # Linux sandbox: only through the package manager, and only when that needs no password
+ensure_bwrap() { # Linux sandbox: through the package manager, as root or after a yes at a terminal
   if [ "$PLATFORM" != Linux ] || have bwrap || [ "$NO_DEPS" = 1 ] || [ -z "$PM" ] || [ "$PM" = brew ]; then return 0; fi
-  if ! as_root true 2>/dev/null; then
+  # Never sudo unattended: a passwordless sudo is not consent. Root installs directly; anyone else is asked at a
+  # terminal (never with --yes, never without a tty), and sudo then asks for the password itself.
+  if [ "$(id -u)" != 0 ] && [ "${ROOT_APPROVED:-0}" != 1 ] && [ "$YES" != 1 ] && [ -t 0 ] && [ -t 1 ] && have sudo; then
+    printf 'Install bubblewrap now with sudo (it asks for your password)? [y/N] ' >&2
+    read -r ans || ans=
+    case "$ans" in y | Y | yes | YES) ROOT_APPROVED=1 ;; esac
+  fi
+  if [ "$(id -u)" != 0 ] && [ "${ROOT_APPROVED:-0}" != 1 ]; then
     log "bubblewrap (the sandbox for unattended runs) needs root to install: $(hint_cmd bwrap)"
     return 0
   fi

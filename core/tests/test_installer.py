@@ -485,3 +485,12 @@ def test_unit_files_share_one_restart_budget_and_a_recovery_unit(tmp_path, monke
     assert recover.read_text() == service.render_recover_unit()
     service.uninstall()
     assert not recover.exists()
+
+
+def test_passwordless_sudo_is_never_used_for_bubblewrap(tmp_path: Path) -> None:
+    # a passwordless sudo is not consent: no sudo call at all without a person saying yes at a terminal
+    sudo_log = tmp_path / "sudo.log"
+    sudo = stub_bin(tmp_path, "sudo", f'echo "sudo $*" >>"{sudo_log}"\nexit 0\n')
+    r = run(tmp_path, INSTALL, "--from-source", "--yes", env_extra={"K3_BWRAP": "/nonexistent/bwrap"}, path_front=sudo)
+    assert r.returncode == 0, r.stderr
+    assert not sudo_log.exists()
