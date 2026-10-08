@@ -5,10 +5,10 @@ This session resumed an already-substantially-complete M0-core worktree (see
 — `config.py`, `providers/`, `router/`, `tools/`, `agent/loop.py`,
 `permissions.py`, `cli.py`, `VENDOR.toml` + `scripts/vendor_check.py` +
 `LICENSES/hermes-agent-MIT.txt` — was already committed
-(`73f3036`, `48d09be`, `98111a0`). This session's job was to re-verify
+(`fb94a0a`, `b80b4db`, `7ad1b86`). This session's job was to re-verify
 everything still passes, run the live smoke test end-to-end (previously
 noted as pending), and write this report. No source changes were made; the
-working tree is identical to `HEAD` (98111a0) at both the start and end of
+working tree is identical to `HEAD` (7ad1b86) at both the start and end of
 this session.
 
 ## What was built (recap, all pre-existing in this worktree)

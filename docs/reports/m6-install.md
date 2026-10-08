@@ -13,14 +13,14 @@
 - `cd core && uv run pytest` (run to a file, stdin from /dev/null; piping hangs, the known pipe issue) → 344 passed (6 warnings), exit 0. `uv run ruff check . ../scripts` → All checks passed. `python3 scripts/vendor_check.py` → All checks passed. `cd panes && go test ./internal/k3keys/...` → ok.
 - `HOME=$(mktemp -d) sh install/install.sh --from-source --yes --no-setup` (real build: uv venv + editable core, `npm ci` + TUI build, `go build ./cmd/k3`) → exit 0. Tail:
 ```
-k3code-install: current -> 0.0.1-src.88a1497
+k3code-install: current -> 0.0.1-src.2a20ce4
 k3code-install: running k3code doctor
 ✗ providers: no providers configured     (expected before setup)
 ...
 11 ok, 1 warn, 1 fail
-k3code-install: done. Version 0.0.1-src.88a1497 installed. Run: k3code
+k3code-install: done. Version 0.0.1-src.2a20ce4 installed. Run: k3code
 ```
-`ls versions/` → `0.0.1-src.88a1497` containing `bin  tui  venv  .complete`; `current` → that dir; `~/.local/bin/k3code` and `k3` are symlinks into `current/`. A second run printed "already installed" and a before/after file+mtime snapshot was identical (also asserted in `test_installer.py`). `k3code --version` → `k3code, version 0.0.1`.
+`ls versions/` → `0.0.1-src.2a20ce4` containing `bin  tui  venv  .complete`; `current` → that dir; `~/.local/bin/k3code` and `k3` are symlinks into `current/`. A second run printed "already installed" and a before/after file+mtime snapshot was identical (also asserted in `test_installer.py`). `k3code --version` → `k3code, version 0.0.1`.
 - `k3code setup --non-interactive --answers install/answers.sample.yaml --no-probe` in a temp home → config.yaml (redacted by construction, only `api_key_env` names):
 ```yaml
 providers:

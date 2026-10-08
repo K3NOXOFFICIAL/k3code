@@ -12,7 +12,7 @@ daemon stayed alive and RSS growth after warm-up stays below 25 % of the warm RS
 
 | What | Path |
 |---|---|
-| frozen code (detached worktree at commit `d1a0a57`, own venv) | `~/src/k3code/.k3dev/soak/src` (**do not touch**: any change to the daemon code restarts the 72 h) |
+| frozen code (detached worktree at commit `4a884c9`, own venv) | `~/src/k3code/.k3dev/soak/src` (**do not touch**: any change to the daemon code restarts the 72 h) |
 | sample log (one line per 5 min) | `~/src/k3code/.k3dev/soak/src/scripts/exit/rows/soak/soak-20261008-234131.log` |
 | stdout of the run | `~/src/k3code/.k3dev/soak/soak-72h.out` |
 | the exit row, written when it ends | `~/src/k3code/.k3dev/soak/rows-72h.jsonl` |

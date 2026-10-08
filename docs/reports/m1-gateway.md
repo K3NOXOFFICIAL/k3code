@@ -25,17 +25,17 @@ reply text renders. Uses the real `OMNIROUTE_API_KEY` from the environment.
 
 ## What was built (branch `w/m1-gateway`, 6 commits)
 
-- `6079990` — `core/src/k3code/gateway/` package: asyncio JSON-RPC 2.0
+- `8f75b05` — `core/src/k3code/gateway/` package: asyncio JSON-RPC 2.0
   stdio server, all **33 M1-core methods**, event emission, approval
   request/response, SQLite sessions at `$K3CODE_HOME/sessions.db`.
   All logging to stderr; `-p` stdout stays the final answer.
-- `11509ce` — `core/src/k3code/commands/` slash registry
+- `3e7e886` — `core/src/k3code/commands/` slash registry
   (`/model /effort /clear /compact /rename /resume /stop /exit /help`);
   agent-loop gateway hooks; network failures → **60 s cooldown**,
   tunable via `K3CODE_NETWORK_COOLDOWN_SECONDS` (0 disables).
-- `79963fe` — `cli.py`: `gateway --stdio` subcommand; no-args + tty →
+- `0698bb8` — `cli.py`: `gateway --stdio` subcommand; no-args + tty →
   launches TUI with `K3CODE_GATEWAY_CMD`; `--repl` for the old REPL.
-- `34874c9` — `tui/src/gatewayClient.ts` honors `K3CODE_GATEWAY_CMD`
+- `f675118` — `tui/src/gatewayClient.ts` honors `K3CODE_GATEWAY_CMD`
   (safe argv split, no shell).
 - *(uncommitted at report time → commit below)* — `providers/fake.py`
   (`K3CODE_FAKE_PROVIDER=<script.json>` scripted offline provider),

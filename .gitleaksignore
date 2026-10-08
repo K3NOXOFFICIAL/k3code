@@ -1,42 +1,42 @@
 # Historical gitleaks findings reviewed on 2026-10-08. Every entry is a test fixture or a false positive:
 # redaction-test inputs, a constant named *_KEY, an approval-test label, and one sequential placeholder
 # (AKIA + ABCDEFGH...) in a project-detection test. No value is stored here. Re-review before any new entry.
-1e89b9501789d11d7a51b7ab7f4d2ce539f4fecb:panes/cmd/tuios-web/access_test.go:generic-api-key:98
-1e89b9501789d11d7a51b7ab7f4d2ce539f4fecb:panes/internal/integration/hook_test.go:curl-auth-header:124
-1e89b9501789d11d7a51b7ab7f4d2ce539f4fecb:panes/internal/session/approvals_test.go:generic-api-key:456
-54d6e6b8bcf15ee5dd01ec817b8cd1e2a4051880:core/src/k3code/gateway/server.py:generic-api-key:621
-7e07f5e27c50ea1e0870eeeb0205b3181b9cc1e2:core/tests/test_learning_projectprep.py:aws-access-token:70
-aac91c4906443fdbe85692247a3319e6a07dd1dd:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:66
-b154abc4e7dab81e9f51d923e4f8f5f2bc35a0f6:scripts/dev/tasks/m3-panes.md:generic-api-key:5
-e33f119d1e64ba3f9ae612b2d7f45a13dd769030:core/tests/test_cmd_bundle.py:generic-api-key:19
-e33f119d1e64ba3f9ae612b2d7f45a13dd769030:core/tests/test_cmd_bundle.py:generic-api-key:20
-ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:14
-ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:22
-ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:23
-ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:55
-ec3fe93ff575d929c91519053195d902b3adb127:core/tests/test_redact.py:generic-api-key:75
+4ef33f08f8ed0f94a9a600103e3df1e30e8a6f48:panes/cmd/tuios-web/access_test.go:generic-api-key:98
+4ef33f08f8ed0f94a9a600103e3df1e30e8a6f48:panes/internal/integration/hook_test.go:curl-auth-header:124
+4ef33f08f8ed0f94a9a600103e3df1e30e8a6f48:panes/internal/session/approvals_test.go:generic-api-key:456
+c55b0aff181696bb87c24bdaac93b53c7259dda9:core/src/k3code/gateway/server.py:generic-api-key:621
+e733c365b539e19e436852502473991e2bd068ca:core/tests/test_learning_projectprep.py:aws-access-token:70
+82ae7f1896cbb74923d0b90fdaaa96a4f87725ef:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:66
+ff1e22c031b8ca64e15e61b32285ad823e732178:scripts/dev/tasks/m3-panes.md:generic-api-key:5
+53c8b9b6f43c265b881b26528bd5a994795b3437:core/tests/test_cmd_bundle.py:generic-api-key:19
+53c8b9b6f43c265b881b26528bd5a994795b3437:core/tests/test_cmd_bundle.py:generic-api-key:20
+91a449b32f6aeecf054fec9ee2731294f090f388:core/tests/test_redact.py:generic-api-key:14
+91a449b32f6aeecf054fec9ee2731294f090f388:core/tests/test_redact.py:generic-api-key:22
+91a449b32f6aeecf054fec9ee2731294f090f388:core/tests/test_redact.py:generic-api-key:23
+91a449b32f6aeecf054fec9ee2731294f090f388:core/tests/test_redact.py:generic-api-key:55
+91a449b32f6aeecf054fec9ee2731294f090f388:core/tests/test_redact.py:generic-api-key:75
 
-# The same fixtures again, as they reappear in the m5 merge commits (23f0a8f6, fbf92c87); reviewed 2026-10-08.
-23f0a8f6ce23568ea3df193a59c6ec5c77436894:core/src/k3code/gateway/server.py:generic-api-key:781
-23f0a8f6ce23568ea3df193a59c6ec5c77436894:core/tests/test_learning_projectprep.py:aws-access-token:70
-23f0a8f6ce23568ea3df193a59c6ec5c77436894:core/tests/test_cmd_bundle.py:generic-api-key:19
-23f0a8f6ce23568ea3df193a59c6ec5c77436894:core/tests/test_cmd_bundle.py:generic-api-key:20
-23f0a8f6ce23568ea3df193a59c6ec5c77436894:panes/cmd/tuios-web/access_test.go:generic-api-key:98
-23f0a8f6ce23568ea3df193a59c6ec5c77436894:panes/internal/integration/hook_test.go:curl-auth-header:124
-23f0a8f6ce23568ea3df193a59c6ec5c77436894:panes/internal/session/approvals_test.go:generic-api-key:456
-23f0a8f6ce23568ea3df193a59c6ec5c77436894:scripts/dev/tasks/m3-panes.md:generic-api-key:5
-23f0a8f6ce23568ea3df193a59c6ec5c77436894:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:64
-fbf92c87922c932561ad35339a3480afc01cf786:core/src/k3code/gateway/server.py:generic-api-key:779
-fbf92c87922c932561ad35339a3480afc01cf786:core/tests/test_cmd_bundle.py:generic-api-key:19
-fbf92c87922c932561ad35339a3480afc01cf786:core/tests/test_cmd_bundle.py:generic-api-key:20
-fbf92c87922c932561ad35339a3480afc01cf786:panes/cmd/tuios-web/access_test.go:generic-api-key:98
-fbf92c87922c932561ad35339a3480afc01cf786:panes/internal/integration/hook_test.go:curl-auth-header:124
-fbf92c87922c932561ad35339a3480afc01cf786:panes/internal/session/approvals_test.go:generic-api-key:456
-fbf92c87922c932561ad35339a3480afc01cf786:scripts/dev/tasks/m3-panes.md:generic-api-key:5
-fbf92c87922c932561ad35339a3480afc01cf786:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:64
+# The same fixtures again, as they reappear in the m5 merge commits (974921d1, 71742d1f); reviewed 2026-10-08.
+974921d1acbd2a291898da433fb19bd739247a2d:core/src/k3code/gateway/server.py:generic-api-key:781
+974921d1acbd2a291898da433fb19bd739247a2d:core/tests/test_learning_projectprep.py:aws-access-token:70
+974921d1acbd2a291898da433fb19bd739247a2d:core/tests/test_cmd_bundle.py:generic-api-key:19
+974921d1acbd2a291898da433fb19bd739247a2d:core/tests/test_cmd_bundle.py:generic-api-key:20
+974921d1acbd2a291898da433fb19bd739247a2d:panes/cmd/tuios-web/access_test.go:generic-api-key:98
+974921d1acbd2a291898da433fb19bd739247a2d:panes/internal/integration/hook_test.go:curl-auth-header:124
+974921d1acbd2a291898da433fb19bd739247a2d:panes/internal/session/approvals_test.go:generic-api-key:456
+974921d1acbd2a291898da433fb19bd739247a2d:scripts/dev/tasks/m3-panes.md:generic-api-key:5
+974921d1acbd2a291898da433fb19bd739247a2d:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:64
+71742d1f26e9c8b8ae75157414638b0d65a429f2:core/src/k3code/gateway/server.py:generic-api-key:779
+71742d1f26e9c8b8ae75157414638b0d65a429f2:core/tests/test_cmd_bundle.py:generic-api-key:19
+71742d1f26e9c8b8ae75157414638b0d65a429f2:core/tests/test_cmd_bundle.py:generic-api-key:20
+71742d1f26e9c8b8ae75157414638b0d65a429f2:panes/cmd/tuios-web/access_test.go:generic-api-key:98
+71742d1f26e9c8b8ae75157414638b0d65a429f2:panes/internal/integration/hook_test.go:curl-auth-header:124
+71742d1f26e9c8b8ae75157414638b0d65a429f2:panes/internal/session/approvals_test.go:generic-api-key:456
+71742d1f26e9c8b8ae75157414638b0d65a429f2:scripts/dev/tasks/m3-panes.md:generic-api-key:5
+71742d1f26e9c8b8ae75157414638b0d65a429f2:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:64
 
 # The same kind of fixtures, re-reported under the 2026-10-08 formatting commits and the replay-harness commit
 # (reviewed 2026-10-08): a fake session key, the sequential AKIA test key, and the sk- string the replay store must not keep.
-510346574ef1963d6cbc957566c75edadaf902ef:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:67
-2255b4e9472fd9671a71cb94721d09871cf3e086:core/tests/test_learning_projectprep.py:aws-access-token:85
-7829fe13f20170bccfe88405a62bd99549cb318e:core/tests/test_learning_replay.py:generic-api-key:62
+505ad255b7151929208b7e0bddb997c749c8eaba:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:67
+e958b89b40f044e307f345cd8e128a8d2aa3420d:core/tests/test_learning_projectprep.py:aws-access-token:85
+58ba25c38e085f259826f4e831aabf59fc759e84:core/tests/test_learning_replay.py:generic-api-key:62

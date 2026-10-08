@@ -38,7 +38,7 @@ until the switch: doing it earlier would diverge every clone and open branch whi
 | What | Where | Fix |
 |---|---|---|
 | The owner's personal e-mail as author | 13 commits (the initial commit and the GitHub merge commits) | `--mailmap` |
-| A 37.5 MB built binary `panes/k3` | added in `30f66efe`, untracked in `cf85da5b` | `--path panes/k3 --invert-paths` |
+| A 37.5 MB built binary `panes/k3` | added in `556cfe82`, untracked in `e90211c3` | `--path panes/k3 --invert-paths` |
 | The tailnet IP, the owner's domains, SSH host names, first name, other people's names, a bootstrap-prompt phrase from the owner's gateway | earlier versions of the files scrubbed above, plus `GOAL.md` history and four commit messages | `--replace-text` |
 | `Claude-Session:` trailers | about 300 commit messages | `--replace-message` |
 

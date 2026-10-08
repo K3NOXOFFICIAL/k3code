@@ -10,7 +10,7 @@
 set -eu
 
 # Internal paths: they stay in the repository and never reach an export. panes/k3 is a 36 MB Linux build output
-# that the repository tracks by mistake (since 30f66ef); it is left out until it is untracked.
+# that the repository tracks by mistake (since 556cfe8); it is left out until it is untracked.
 EXCLUDED="scripts/dev scripts/exit docs/reports GOAL.md panes/k3"
 # The names and hosts to keep out of an export are NOT listed in this file: a list would publish what it guards. They
 # are read from the owner's machine, outside the repository (default folder ~/.config/k3code-release, or
