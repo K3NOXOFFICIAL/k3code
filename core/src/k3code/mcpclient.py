@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from k3code.config import McpServerConfig
+from k3code.config import McpServerConfig, env_value
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,16 @@ _SAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 def qualified_name(server: str, tool: str) -> str:
     return f"mcp__{_SAFE.sub('_', server)}__{_SAFE.sub('_', tool)}"
+
+
+def request_headers(cfg: McpServerConfig) -> dict[str, str]:
+    """Headers for an HTTP MCP server: the configured ones, plus a bearer token read from ``bearer_env`` now."""
+    headers = dict(cfg.headers)
+    if cfg.bearer_env:
+        token = env_value(cfg.bearer_env)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 @dataclass
@@ -88,7 +98,7 @@ class _Runner:
                     import httpx
                     from mcp.client.streamable_http import streamable_http_client  # type: ignore[attr-defined]
 
-                    http = httpx.AsyncClient(headers=self.cfg.headers or None, timeout=CALL_TIMEOUT)
+                    http = httpx.AsyncClient(headers=request_headers(self.cfg) or None, timeout=CALL_TIMEOUT)
                     await stack.enter_async_context(http)
                     read, write, _ = await stack.enter_async_context(
                         streamable_http_client(self.cfg.url, http_client=http)
