@@ -48,11 +48,11 @@ Options:
   --print-version       print the version name on stdout (used by k3code update)
   -h, --help
 
-Presetup (on by default, after the version is activated; never fails the install): checks the sandbox,
-installs Chromium for the browser tool (K3CODE_SKIP_CHROMIUM=1 skips only that), and prints a health subset.
+Presetup (on by default, after the version is activated; never fails the install): checks the sandbox, installs
+Chromium for the browser tool (about 115 MiB; K3CODE_SKIP_CHROMIUM=1 skips only that) and prints a health subset.
 
 Optional and never installed by this script: node 20+ with npm (builds the TUI), go (builds the
-k3 pane binary), bubblewrap (sandbox). k3code runs without them.
+k3 pane binary). bubblewrap (sandbox) is only ever offered as a command to run yourself. k3code runs without them.
 EOF
 }
 
@@ -590,7 +590,51 @@ presetup_sandbox() {
   esac
   return 0
 }
-presetup_chromium() { :; }
+# Chromium for the browser tool: the headless shell only (about 115 MiB download plus ffmpeg, about 266 MB on disk).
+# The full browser would add about 196 MB. It lives under $DATA/browsers, outside versions/, so an update keeps it.
+PLAYWRIGHT_VERSION=1.63.0
+chromium_present() { # the marker from an earlier run and the browser it names are both still there
+  [ -f "$DATA/presetup/chromium-$PLAYWRIGHT_VERSION" ] || return 1
+  if [ "${K3_STUB_VENV:-0}" = 1 ]; then return 0; fi
+  for d in "$DATA"/browsers/chromium_headless_shell-*; do
+    [ -d "$d" ] && return 0
+  done
+  return 1
+}
+
+presetup_chromium() {
+  if [ "${K3CODE_SKIP_CHROMIUM:-0}" = 1 ]; then
+    log "presetup: Chromium skipped (K3CODE_SKIP_CHROMIUM=1)"
+    return 0
+  fi
+  if chromium_present; then
+    log "presetup: Chromium already installed in $DATA/browsers"
+    return 0
+  fi
+  if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: nothing is downloaded; the marker records the decision
+    mkdir -p "$DATA/presetup"
+    printf 'stub\n' >"$DATA/presetup/chromium-$PLAYWRIGHT_VERSION"
+    log "presetup: Chromium stub (K3_STUB_VENV)"
+    return 0
+  fi
+  if [ "$NO_DEPS" = 1 ]; then
+    log "presetup: Chromium not installed (--no-install-deps; it downloads about 115 MiB)"
+    return 0
+  fi
+  log "presetup: installing Chromium for the browser tool (about 115 MiB download; K3CODE_SKIP_CHROMIUM=1 skips it)"
+  if ! "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" "playwright==$PLAYWRIGHT_VERSION" >&2; then
+    log "presetup: WARNING: could not install Playwright; the browser tool stays off"
+    return 0
+  fi
+  if ! PLAYWRIGHT_BROWSERS_PATH="$DATA/browsers" "$VERDIR/venv/bin/python" -m playwright install --only-shell chromium >&2; then
+    log "presetup: WARNING: Chromium did not install (output above); run the installer again to retry"
+    return 0
+  fi
+  mkdir -p "$DATA/presetup"
+  printf '%s\n' "$PLAYWRIGHT_VERSION" >"$DATA/presetup/chromium-$PLAYWRIGHT_VERSION"
+  log "presetup: Chromium installed in $DATA/browsers"
+  return 0
+}
 presetup_doctor() {
   if [ ! -x "$BIN/k3code" ]; then
     log "presetup: health subset skipped (k3code is not linked)"

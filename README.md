@@ -48,7 +48,7 @@ k3code plans before it acts, can run several agents in parallel, retries through
 - Linux on x86_64 is the tested platform: a clean install was tested in a Fedora 44 container. The installer also accepts macOS and aarch64 (arm64); those are untested.
 - `git` (for the default `--from-git` install), `curl` or `wget`, and a POSIX shell. Network access is needed during install.
 - [`uv`](https://docs.astral.sh/uv/) is required and manages Python ≥ 3.12. If `uv` is missing, the installer asks before installing it into your home directory (`--yes` answers yes). The installer needs no root.
-- Optional: `bubblewrap` (`bwrap`) to sandbox unattended runs, `systemd --user` for the 24/7 service, Node 20+ with npm (builds the TUI; without it k3code uses the line REPL), and Go (builds the `k3` binary). The installer never installs Node or Go.
+- Optional: `bubblewrap` (`bwrap`) to sandbox unattended runs (presetup prints the command for your distribution), `systemd --user` for the 24/7 service, Node 20+ with npm (builds the TUI; without it k3code uses the line REPL), and Go (builds the `k3` binary). The installer never installs Node or Go.
 
 ### Install
 
@@ -63,7 +63,9 @@ To install from the checkout you already have, use `sh install/install.sh --from
 
 The installer creates a versioned install under `~/.local/share/k3code/` and links `k3code` into `~/.local/bin/` (put that on your `PATH`), and links `k3` too when Go was available to build it. It never runs onboarding; it ends by telling you to run `k3code onboard`. Re-running it upgrades in place and keeps the previous version for rollback.
 
-Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--yes` (installs `uv` without asking), `--no-install-deps`, `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`). Uninstall with `sh install/uninstall.sh`; it keeps your data unless you pass `--purge`.
+Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--yes` (installs `uv` without asking), `--no-install-deps`, `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`), `--minimal` (skips presetup, below). Uninstall with `sh install/uninstall.sh`; it removes the versions, the links and the Chromium location under `~/.local/share/k3code`, and keeps your data (`~/.k3code`, `~/.config/k3code`) unless you pass `--purge`.
+
+**Presetup** runs after the install and is on by default; it never fails the install. It checks the sandbox (`bwrap`): when it is missing, it prints the install command for your distribution and runs nothing (it asks for a `sudo` run only on an interactive terminal, never with `--yes`). It installs Chromium for the browser tool (the headless shell, about 115 MiB download and about 266 MB on disk; `K3CODE_SKIP_CHROMIUM=1` skips only this), and prints a health subset (`k3code doctor --install`, warnings only). `--minimal` skips all of it.
 
 ### First run
 

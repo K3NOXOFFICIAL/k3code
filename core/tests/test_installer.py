@@ -278,9 +278,9 @@ def test_check_reports_the_node_floor_of_20(tmp_path: Path) -> None:
 def test_uninstall_removes_presetup_leftovers_and_keeps_user_data(tmp_path: Path) -> None:
     assert run(tmp_path, INSTALL, "--from-source", "--yes").returncode == 0
     data = tmp_path / ".local" / "share" / "k3code"
-    (data / "presetup").mkdir()
+    (data / "presetup").mkdir(exist_ok=True)
     (data / "presetup" / "chromium-marker").write_text("ok\n")
-    (data / "browsers" / "chromium-1").mkdir(parents=True)
+    (data / "browsers" / "chromium-1").mkdir(parents=True, exist_ok=True)
     (data / "browsers" / "chromium-1" / "chrome").write_text("binary\n")
     (tmp_path / ".k3code").mkdir(exist_ok=True)
     (tmp_path / ".k3code" / "config.yaml").write_text("x: 1\n")
@@ -302,3 +302,39 @@ def test_presetup_shows_the_doctor_subset_and_ignores_its_status(tmp_path: Path)
     assert r.returncode == 0, r.stderr  # the stub doctor exits 1; the install still succeeds
     assert "health subset" in r.stderr
     assert "browser: stub" in r.stderr
+
+
+CHROMIUM_MARKER = Path("presetup") / "chromium-1.63.0"
+
+
+def test_chromium_is_on_by_default_at_a_version_independent_location(tmp_path: Path) -> None:
+    r = run(tmp_path, INSTALL, "--from-source", "--yes")
+    assert r.returncode == 0, r.stderr
+    data = tmp_path / ".local" / "share" / "k3code"
+    assert (data / CHROMIUM_MARKER).is_file()
+    assert "Chromium stub" in r.stderr
+    # outside versions/: an update prunes old versions but keeps the browser
+    assert not any(p.name == "chromium-1.63.0" for p in (data / "versions").rglob("*"))
+
+
+def test_chromium_opt_outs_write_no_marker(tmp_path: Path) -> None:
+    skipped = tmp_path / "skip"
+    skipped.mkdir()
+    r = run(skipped, INSTALL, "--from-source", "--yes", env_extra={"K3CODE_SKIP_CHROMIUM": "1"})
+    assert r.returncode == 0, r.stderr
+    assert "Chromium skipped" in r.stderr
+    assert not (skipped / ".local" / "share" / "k3code" / CHROMIUM_MARKER).exists()
+
+    minimal = tmp_path / "minimal"
+    minimal.mkdir()
+    m = run(minimal, INSTALL, "--from-source", "--yes", "--minimal")
+    assert m.returncode == 0, m.stderr
+    assert not (minimal / ".local" / "share" / "k3code" / CHROMIUM_MARKER).exists()
+
+
+def test_uninstall_removes_the_chromium_location(tmp_path: Path) -> None:
+    assert run(tmp_path, INSTALL, "--from-source", "--yes").returncode == 0
+    data = tmp_path / ".local" / "share" / "k3code"
+    assert (data / CHROMIUM_MARKER).is_file()
+    assert run(tmp_path, UNINSTALL).returncode == 0
+    assert not data.exists()
