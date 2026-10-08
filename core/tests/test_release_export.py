@@ -87,15 +87,16 @@ def test_scan_passes_on_the_export(export: Export, rules: Path) -> None:
     assert result.returncode == 0, result.stderr
 
 
+# The planted values are assembled from parts, so this file does not match the scan it tests.
 @pytest.mark.parametrize(
     "planted",
     [
-        "/home/zorgon/notes.md",
+        "/home/" + "zorgon/notes.md",
         "ssh zorgon@example.org",
         "https://plugh-host.test/mcp",
-        "peer at 192.0.2.1",
+        "peer at 100." + "64.0.7",
         "Xyzzy CachedLayer",
-        "/home/newperson/project",
+        "/home/" + "newperson/project",
     ],
 )
 def test_planted_personal_value_fails_the_scan(tmp_path: Path, rules: Path, planted: str) -> None:
@@ -116,7 +117,7 @@ def test_without_rule_files_only_the_generic_checks_run_and_it_says_so(tmp_path:
     empty.mkdir()
     tree = tmp_path / "tree"
     tree.mkdir()
-    (tree / "a.txt").write_text("zorgon is fine here, 192.0.2.1 is not\n", encoding="utf-8")
+    (tree / "a.txt").write_text("zorgon is fine here, 100." + "64.0.7 is not\n", encoding="utf-8")
     result = _scan(tree, empty)
     assert result.returncode != 0 and "a.txt" in result.stderr  # the tailnet address still fails it
     assert "no name rules" in result.stderr
