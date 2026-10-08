@@ -1,4 +1,4 @@
-import { createContext } from 'react'
+import { createContext } from "react";
 
 /**
  * Notify Ink that the physical terminal cursor was advanced by an
@@ -28,8 +28,8 @@ import { createContext } from 'react'
  * negative = left/up). The caller is responsible for ensuring the
  * physical cursor really did move by that amount.
  */
-export type CursorAdvanceNotifier = (dx: number, dy?: number) => void
+export type CursorAdvanceNotifier = (dx: number, dy?: number) => void;
 
-const CursorAdvanceContext = createContext<CursorAdvanceNotifier>(() => {})
+const CursorAdvanceContext = createContext<CursorAdvanceNotifier>(() => {});
 
-export default CursorAdvanceContext
+export default CursorAdvanceContext;

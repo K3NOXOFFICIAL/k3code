@@ -1,22 +1,22 @@
-import { atom, computed } from 'nanostores'
+import { atom, computed } from "nanostores";
 
-import { MOUSE_TRACKING } from '../config/env.js'
-import { ZERO } from '../domain/usage.js'
-import { bootTheme } from '../lib/themeBoot.js'
-import { DEFAULT_THEME } from '../theme.js'
+import { MOUSE_TRACKING } from "../config/env.js";
+import { ZERO } from "../domain/usage.js";
+import { bootTheme } from "../lib/themeBoot.js";
+import { DEFAULT_THEME } from "../theme.js";
 
-import { DEFAULT_INDICATOR_STYLE, type UiState } from './interfaces.js'
+import { DEFAULT_INDICATOR_STYLE, type UiState } from "./interfaces.js";
 
 const buildUiState = (): UiState => ({
   battery: false,
   batteryStatus: null,
   bgTasks: new Set(),
   busy: false,
-  busyInputMode: 'queue',
+  busyInputMode: "queue",
   compact: false,
   compacting: false,
   destructiveSlashConfirm: true,
-  detailsMode: 'collapsed',
+  detailsMode: "collapsed",
   detailsModeCommandOverride: false,
   focusView: false,
   indicatorStyle: DEFAULT_INDICATOR_STYLE,
@@ -29,11 +29,11 @@ const buildUiState = (): UiState => ({
   pasteCollapseLines: 5,
   pasteCollapseChars: 2000,
   sections: {},
-  sessionTitle: '',
+  sessionTitle: "",
   showReasoning: false,
   sid: null,
-  status: 'starting k3code…',
-  statusBar: 'top',
+  status: "starting k3code…",
+  statusBar: "top",
   storedSid: null,
   statusBarFields: null,
   streaming: true,
@@ -41,17 +41,23 @@ const buildUiState = (): UiState => ({
   // Last session's resolved theme paints frame one (flash-free boot, like
   // the desktop's hermes-boot-* keys); DEFAULT_THEME only on first launch.
   theme: bootTheme ?? DEFAULT_THEME,
-  usage: ZERO
-})
+  usage: ZERO,
+});
 
-export const $uiState = atom<UiState>(buildUiState())
+export const $uiState = atom<UiState>(buildUiState());
 
-export const $uiTheme = computed($uiState, state => state.theme)
-export const $uiSessionId = computed($uiState, state => state.sid)
+export const $uiTheme = computed($uiState, (state) => state.theme);
+export const $uiSessionId = computed($uiState, (state) => state.sid);
 
-export const getUiState = () => $uiState.get()
+export const getUiState = () => $uiState.get();
 
-export const patchUiState = (next: Partial<UiState> | ((state: UiState) => UiState)) =>
-  $uiState.set(typeof next === 'function' ? next($uiState.get()) : { ...$uiState.get(), ...next })
+export const patchUiState = (
+  next: Partial<UiState> | ((state: UiState) => UiState),
+) =>
+  $uiState.set(
+    typeof next === "function"
+      ? next($uiState.get())
+      : { ...$uiState.get(), ...next },
+  );
 
-export const resetUiState = () => $uiState.set(buildUiState())
+export const resetUiState = () => $uiState.set(buildUiState());

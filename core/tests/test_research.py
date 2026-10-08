@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -187,6 +188,7 @@ async def test_builtin_tools_against_a_mocked_searxng_and_pages(tmp_path):
     respx.get("http://p.test/1").mock(
         return_value=httpx.Response(200, text=html_doc, headers={"content-type": "text/html"})
     )
+    respx.get("http://p.test/robots.txt").mock(return_value=httpx.Response(404))  # fetches honour robots.txt
     tools = BuiltinTools("http://searx.test")
     assert await tools.unavailable_reason() == ""
     hits = await tools.search("anything", 5)
@@ -267,8 +269,9 @@ async def test_pick_tools_prefers_mcp_search_and_fetch():
 )
 async def test_mcp_fetch_errors_are_dead_links_only_when_the_page_is_gone(error, dead):
     mcp = FakeMcp(fetch_reply={"error": error})
-    tools = McpTools(mcp, mcp_tool("hub_searxng__search"), mcp_tool("hub_fetch__fetch"),
-                     BuiltinTools(None, keyless_fallback=False))
+    tools = McpTools(
+        mcp, mcp_tool("hub_searxng__search"), mcp_tool("hub_fetch__fetch"), BuiltinTools(None, keyless_fallback=False)
+    )
     with pytest.raises(RuntimeError) as info:
         await tools.fetch("https://example.org/x")
     assert isinstance(info.value, DeadLink) is dead
@@ -286,13 +289,20 @@ async def test_mcp_404_drops_the_source_and_backfill_reads_a_replacement(tmp_pat
         return {"error": error} if url.endswith("/0") else {"content": "page text"}
 
     mcp = FakeMcp(hits=hits, fetch_reply=reply)
-    server = make(tmp_path, monkeypatch, [
-        {"type": "text", "match": "Number of sub-topics", "text": '{"sub_topics":[{"name":"A","queries":["a"]}]}'},
-        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
-        {"type": "text", "text": "ok"},
-    ], mode="auto", research={"sources_per_topic": 4, "min_sources": 4, "sub_questions": 1})
-    server.research_tools = McpTools(mcp, mcp_tool("hub_searxng__search"), mcp_tool("hub_fetch__fetch"),
-                                     BuiltinTools(None, keyless_fallback=False))
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [
+            {"type": "text", "match": "Number of sub-topics", "text": '{"sub_topics":[{"name":"A","queries":["a"]}]}'},
+            {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+            {"type": "text", "text": "ok"},
+        ],
+        mode="auto",
+        research={"sources_per_topic": 4, "min_sources": 4, "sub_questions": 1},
+    )
+    server.research_tools = McpTools(
+        mcp, mcp_tool("hub_searxng__search"), mcp_tool("hub_fetch__fetch"), BuiltinTools(None, keyless_fallback=False)
+    )
     await call(server, "session.create", {"cwd": str(tmp_path)})
     res = await server.research.run(server.session, "q", n_sub=1)
     urls = {s.url for s in res.state.sources}
@@ -321,8 +331,13 @@ async def test_pick_tools_ignores_non_web_search_decoys():
     def tool(name):
         return SimpleNamespace(name=name, qualified=f"mcp__example__{name}", schema={})
 
-    decoys = [tool("search_memory"), tool("fleet_sessions_search"), tool("nc_search_files"), tool("fleet_fetch"),
-              tool("mcp_tool_search")]
+    decoys = [
+        tool("search_memory"),
+        tool("fleet_sessions_search"),
+        tool("nc_search_files"),
+        tool("fleet_fetch"),
+        tool("mcp_tool_search"),
+    ]
     mcp = SimpleNamespace(tools=lambda: [*decoys, tool("hub_searxng__search"), tool("hub_fetch__fetch")])
     picked = pick_tools(SimpleNamespace(research={}), mcp)
     assert isinstance(picked, McpTools)
@@ -334,11 +349,31 @@ async def test_pick_tools_ignores_non_web_search_decoys():
     assert pick_tools(SimpleNamespace(research={}), generic).search_tool.name == "brave_search"
 
 
+def test_rank_tool_picks_the_explicit_search_tool_not_its_helpers():
+    """hub_searxng lists instance_info and search_suggestions beside searxng_web_search: the first 'searxng' match
+    used to win, so web_search was fed an instance description."""
+    from k3code.research.tools import _NOT_WEB, rank_tool
+
+    def tool(name):
+        return SimpleNamespace(name=name, qualified=f"hub_searxng__{name}", schema={})
+
+    strong = ("searxng", "web_search", "websearch", "web-search")
+    hub = [tool("searxng_instance_info"), tool("searxng_search_suggestions"), tool("searxng_web_search")]
+    assert rank_tool(hub, strong, ("search",), _NOT_WEB).name == "searxng_web_search"
+    reordered = [tool("searxng_search_suggestions"), tool("searxng_web_search"), tool("searxng_instance_info")]
+    assert rank_tool(reordered, strong, ("search",), _NOT_WEB).name == "searxng_web_search"
+    assert rank_tool([tool("searxng_instance_info")], strong, ("search",), _NOT_WEB) is None
+    # through pick_tools: only the instance helper connected -> the built-in tools, never the helper as search
+    helper_only = SimpleNamespace(tools=lambda: [tool("searxng_instance_info")])
+    assert isinstance(pick_tools(SimpleNamespace(research={}), helper_only), BuiltinTools)
+
+
 async def test_fetch_page_reads_a_capped_prefix_not_the_whole_body():
     """client.get() buffered the entire response in the shared daemon before truncating the text."""
     import httpx
 
     from k3code.research import tools
+    from k3code.research.fetch import MAX_FETCH_BYTES
 
     served = {"bytes": 0}
 
@@ -355,10 +390,11 @@ async def test_fetch_page_reads_a_capped_prefix_not_the_whole_body():
     async with httpx.AsyncClient(transport=transport) as client:
         title, text = await tools.fetch_page("https://example.com/huge", client=client)
     assert len(text) <= tools.MAX_FETCH_CHARS and text.startswith("x")
-    assert served["bytes"] < 6 * tools.MAX_FETCH_BYTES  # stopped reading soon after the cap
+    assert served["bytes"] < 6 * MAX_FETCH_BYTES  # stopped reading soon after the cap
 
 
 # ── keyless fallback: DuckDuckGo's HTML endpoint when SearXNG is not reachable ──
+
 
 def _ddg_result(target: str, title: str, snippet: str | None = None) -> str:
     wrapped = "//duckduckgo.com/l/?uddg=" + target + "&amp;rut=abc"
@@ -368,17 +404,20 @@ def _ddg_result(target: str, title: str, snippet: str | None = None) -> str:
     return out + "</div>"
 
 
-DDG_PAGE = "".join([
-    _ddg_result(
-        "https%3A%2F%2Fdocs.python.org%2F3%2Flibrary%2Fasyncio%2Dtask.html",
-        "asyncio &mdash; <b>Task</b> groups",
-        "A <b>TaskGroup</b> waits for all its tasks.",
-    ),
-    '<div class="result result--ad"><a rel="nofollow" class="result__a" '
-    'href="https://duckduckgo.com/y.js?ad_domain=ads.example&amp;u3=x">An ad</a></div>',  # an ad: no snippet, skipped
-    _ddg_result("https%3A%2F%2Fexample.org%2Fa%3Fb%3D1%26c%3D2", "Second result", "Second   snippet"),
-    '<div class="result"><a class="result__a" href="javascript:alert(1)">not http</a></div>',
-])
+DDG_PAGE = "".join(
+    [
+        _ddg_result(
+            "https%3A%2F%2Fdocs.python.org%2F3%2Flibrary%2Fasyncio%2Dtask.html",
+            "asyncio &mdash; <b>Task</b> groups",
+            "A <b>TaskGroup</b> waits for all its tasks.",
+        ),
+        '<div class="result result--ad"><a rel="nofollow" class="result__a" '
+        'href="https://duckduckgo.com/y.js?ad_domain=ads.example&amp;u3=x">'
+        "An ad</a></div>",  # an ad: no snippet, skipped
+        _ddg_result("https%3A%2F%2Fexample.org%2Fa%3Fb%3D1%26c%3D2", "Second result", "Second   snippet"),
+        '<div class="result"><a class="result__a" href="javascript:alert(1)">not http</a></div>',
+    ]
+)
 
 
 def test_duckduckgo_results_are_unwrapped_and_cleaned():
@@ -426,11 +465,17 @@ async def test_sources_are_topped_up_from_spare_hits_to_min_sources(tmp_path, mo
             return url, "page text"
 
     plan = '{"sub_topics":[{"name":"A","queries":["a"]},{"name":"B","queries":["b"]},{"name":"C","queries":["c"]}]}'
-    server = make(tmp_path, monkeypatch, [
-        {"type": "text", "match": "Number of sub-topics", "text": plan},
-        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
-        {"type": "text", "text": "ok"},
-    ], mode="auto", research={"sources_per_topic": 2, "min_sources": 9, "sub_questions": 3})
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [
+            {"type": "text", "match": "Number of sub-topics", "text": plan},
+            {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+            {"type": "text", "text": "ok"},
+        ],
+        mode="auto",
+        research={"sources_per_topic": 2, "min_sources": 9, "sub_questions": 3},
+    )
     server.research_tools = Tools()
     await call(server, "session.create", {"cwd": str(tmp_path)})
     res = await server.research.run(server.session, "q", n_sub=3)
@@ -462,11 +507,17 @@ async def test_dead_links_are_not_cited_but_bot_blocked_pages_are(tmp_path, monk
             return "page", "page text"
 
     plan = '{"sub_topics":[{"name":"A","queries":["a"]}]}'
-    server = make(tmp_path, monkeypatch, [
-        {"type": "text", "match": "Number of sub-topics", "text": plan},
-        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
-        {"type": "text", "text": "ok"},
-    ], mode="auto", research={"sources_per_topic": 3, "min_sources": 3, "sub_questions": 1})
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [
+            {"type": "text", "match": "Number of sub-topics", "text": plan},
+            {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+            {"type": "text", "text": "ok"},
+        ],
+        mode="auto",
+        research={"sources_per_topic": 3, "min_sources": 3, "sub_questions": 1},
+    )
     server.research_tools = Tools()
     await call(server, "session.create", {"cwd": str(tmp_path)})
     res = await server.research.run(server.session, "q", n_sub=1)
@@ -495,11 +546,17 @@ async def test_dropped_sources_are_replaced_from_spare_hits(tmp_path, monkeypatc
             return "page", "page text"
 
     plan = '{"sub_topics":[{"name":"A","queries":["a"]}]}'
-    server = make(tmp_path, monkeypatch, [
-        {"type": "text", "match": "Number of sub-topics", "text": plan},
-        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
-        {"type": "text", "text": "ok"},
-    ], mode="auto", research={"sources_per_topic": 4, "min_sources": 6, "sub_questions": 1})
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [
+            {"type": "text", "match": "Number of sub-topics", "text": plan},
+            {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+            {"type": "text", "text": "ok"},
+        ],
+        mode="auto",
+        research={"sources_per_topic": 4, "min_sources": 6, "sub_questions": 1},
+    )
     server.research_tools = Tools()
     await call(server, "session.create", {"cwd": str(tmp_path)})
     res = await server.research.run(server.session, "q", n_sub=1)
@@ -512,8 +569,17 @@ def test_research_counts_are_clamped_to_at_least_one():
     """sources_per_topic 0 made every hit spill, so a run with hits raised "the searches returned no results"."""
     from k3code.research.flow import research_cfg
 
-    cfg = research_cfg(SimpleNamespace(research={"sources_per_topic": 0, "min_sources": -2, "sub_questions": "0",
-                                                 "results_per_query": 0, "concurrency": 0}))
+    cfg = research_cfg(
+        SimpleNamespace(
+            research={
+                "sources_per_topic": 0,
+                "min_sources": -2,
+                "sub_questions": "0",
+                "results_per_query": 0,
+                "concurrency": 0,
+            }
+        )
+    )
     counts = ("sources_per_topic", "min_sources", "sub_questions", "results_per_query", "concurrency")
     assert {k: cfg[k] for k in counts} == {k: 1 for k in counts}
     assert research_cfg(SimpleNamespace(research={}))["sources_per_topic"] == 4  # unset keys keep their defaults
@@ -532,11 +598,17 @@ async def test_concurrency_zero_still_completes_a_run(tmp_path, monkeypatch):
         async def fetch(self, url):
             return "page", "page text"
 
-    server = make(tmp_path, monkeypatch, [
-        {"type": "text", "match": "Number of sub-topics", "text": '{"sub_topics":[{"name":"A","queries":["a"]}]}'},
-        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
-        {"type": "text", "text": "ok"},
-    ], mode="auto", research={"concurrency": 0, "min_sources": 1, "sub_questions": 1})
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [
+            {"type": "text", "match": "Number of sub-topics", "text": '{"sub_topics":[{"name":"A","queries":["a"]}]}'},
+            {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+            {"type": "text", "text": "ok"},
+        ],
+        mode="auto",
+        research={"concurrency": 0, "min_sources": 1, "sub_questions": 1},
+    )
     server.research_tools = Tools()
     await call(server, "session.create", {"cwd": str(tmp_path)})
     async with asyncio.timeout(60):  # a hang here used to be the failure mode
@@ -556,12 +628,99 @@ async def test_sources_per_topic_zero_still_produces_sources(tmp_path, monkeypat
         async def fetch(self, url):
             return "page", "page text"
 
-    server = make(tmp_path, monkeypatch, [
-        {"type": "text", "match": "Number of sub-topics", "text": '{"sub_topics":[{"name":"A","queries":["a"]}]}'},
-        {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
-        {"type": "text", "text": "ok"},
-    ], mode="auto", research={"sources_per_topic": 0, "min_sources": 1, "sub_questions": 1})
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [
+            {"type": "text", "match": "Number of sub-topics", "text": '{"sub_topics":[{"name":"A","queries":["a"]}]}'},
+            {"type": "text", "match": "Sub-topic:", "text": '{"claims": ["a claim"]}'},
+            {"type": "text", "text": "ok"},
+        ],
+        mode="auto",
+        research={"sources_per_topic": 0, "min_sources": 1, "sub_questions": 1},
+    )
     server.research_tools = Tools()
     await call(server, "session.create", {"cwd": str(tmp_path)})
     res = await server.research.run(server.session, "q", n_sub=1)
     assert res.state.sources, "sources_per_topic 0 spilled every hit"
+
+
+class _Registry:
+    """Records the agent tools that ``register_web_tools`` registers, by name."""
+
+    def __init__(self) -> None:
+        self.handlers: dict[str, Any] = {}
+
+    def register(self, spec, fn) -> None:
+        self.handlers[spec.name] = fn
+
+
+@respx.mock
+async def test_loaded_research_searxng_url_enables_agent_web_search(tmp_path, monkeypatch):
+    """The wizard's answer, read back by load_config(), must reach web_search (it used to say 'disabled')."""
+    from k3code import confio
+    from k3code.config import load_config
+    from k3code.paths import user_config_path
+    from k3code.research.tools import register_web_tools
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    confio.write_yaml(user_config_path(), {"research": {"searxng_url": "http://searx.test"}})
+    respx.get("http://searx.test/search").mock(
+        return_value=httpx.Response(200, json={"results": [{"title": "T", "url": "http://p.test/1", "content": "c"}]})
+    )
+    reg = _Registry()
+    register_web_tools(reg, load_config())
+    out = await reg.handlers["web_search"]({"query": "anything"})
+    assert "disabled" not in out.get("error", "")
+    assert "http://p.test/1" in out["content"]
+
+
+_NO_RESULTS = "<html><body>no results</body></html>"
+
+
+@respx.mock
+async def test_agent_web_search_without_searxng_uses_duckduckgo(tmp_path):
+    """No SearXNG URL: the agent's web_search answers from the keyless fallback instead of 'is disabled'."""
+    from k3code.research.tools import register_web_tools
+
+    respx.post("https://html.duckduckgo.com/html/").mock(return_value=httpx.Response(200, text=DDG_PAGE))
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}))
+    out = await reg.handlers["web_search"]({"query": "asyncio taskgroup"})
+    assert "error" not in out and "https://docs.python.org/3/library/asyncio-task.html" in out["content"]
+
+
+@respx.mock
+async def test_agent_web_search_chain_is_searxng_then_duckduckgo_then_mcp(tmp_path):
+    from k3code.research.tools import register_web_tools
+
+    ddg = respx.post("https://html.duckduckgo.com/html/").mock(return_value=httpx.Response(200, text=DDG_PAGE))
+    respx.get("http://searx.test/search").mock(
+        return_value=httpx.Response(200, json={"results": [{"title": "S", "url": "http://s.test/1", "content": ""}]})
+    )
+    reg = _Registry()
+    mcp = FakeMcp([mcp_tool("hub_searxng__search")])
+    register_web_tools(reg, SimpleNamespace(research={"searxng_url": "http://searx.test"}), mcp=mcp)
+    out = await reg.handlers["web_search"]({"query": "q"})
+    assert "http://s.test/1" in out["content"] and not ddg.called and not mcp.calls  # SearXNG answered first
+
+    # keyless DuckDuckGo is empty -> the connected MCP search tool answers
+    respx.post("https://html.duckduckgo.com/html/").mock(return_value=httpx.Response(200, text=_NO_RESULTS))
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}), mcp=FakeMcp([mcp_tool("hub_searxng__search")]))
+    out = await reg.handlers["web_search"]({"query": "q"})
+    assert "http://h.test" in out["content"]
+
+    # DuckDuckGo down (a 503) and no MCP tool: nothing answered, the error says why
+    respx.post("https://html.duckduckgo.com/html/").mock(return_value=httpx.Response(503))
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}), mcp=FakeMcp([]))
+    out = await reg.handlers["web_search"]({"query": "q"})
+    assert out["error"].startswith("web_search is disabled") and "DuckDuckGo failed" in out["error"]
+
+    # keyless fallback switched off: the MCP tool is the only source
+    reg = _Registry()
+    register_web_tools(
+        reg, SimpleNamespace(research={"keyless_fallback": False}), mcp=FakeMcp([mcp_tool("hub_searxng__search")])
+    )
+    assert "http://h.test" in (await reg.handlers["web_search"]({"query": "q"}))["content"]

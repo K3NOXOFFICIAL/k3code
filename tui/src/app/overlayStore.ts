@@ -1,7 +1,7 @@
-import { atom, computed } from 'nanostores'
+import { atom, computed } from "nanostores";
 
-import type { OverlayState } from './interfaces.js'
-import { $uiState } from './uiStore.js'
+import type { OverlayState } from "./interfaces.js";
+import { $uiState } from "./uiStore.js";
 
 const buildOverlayState = (): OverlayState => ({
   agents: false,
@@ -18,14 +18,28 @@ const buildOverlayState = (): OverlayState => ({
   secret: null,
   sessions: false,
   skillsHub: false,
-  sudo: null
-})
+  sudo: null,
+});
 
-export const $overlayState = atom<OverlayState>(buildOverlayState())
+export const $overlayState = atom<OverlayState>(buildOverlayState());
 
 export const $isBlocked = computed(
   $overlayState,
-  ({ agents, approval, clarify, confirm, journey, modelPicker, pager, pluginsHub, secret, sessions, skillsHub, sudo, widget }) =>
+  ({
+    agents,
+    approval,
+    clarify,
+    confirm,
+    journey,
+    modelPicker,
+    pager,
+    pluginsHub,
+    secret,
+    sessions,
+    skillsHub,
+    sudo,
+    widget,
+  }) =>
     Boolean(
       agents ||
       approval ||
@@ -39,9 +53,9 @@ export const $isBlocked = computed(
       sessions ||
       skillsHub ||
       sudo ||
-      widget
-    )
-)
+      widget,
+    ),
+);
 
 /**
  * Does an open overlay actually PAINT OVER the status rule?
@@ -95,19 +109,35 @@ export const $isBlocked = computed(
  * panels HERE so the timer gate can't silently miss them.
  */
 export const hasFloatingPanel = (overlay: OverlayState): boolean =>
-  Boolean(overlay.modelPicker || overlay.pager || overlay.pluginsHub || overlay.sessions || overlay.skillsHub)
+  Boolean(
+    overlay.modelPicker ||
+    overlay.pager ||
+    overlay.pluginsHub ||
+    overlay.sessions ||
+    overlay.skillsHub,
+  );
 
-export const $isStatusRuleOccluded = computed([$overlayState, $uiState], (overlay, ui) =>
-  Boolean(overlay.widget || (ui.statusBar === 'top' && hasFloatingPanel(overlay)))
-)
+export const $isStatusRuleOccluded = computed(
+  [$overlayState, $uiState],
+  (overlay, ui) =>
+    Boolean(
+      overlay.widget || (ui.statusBar === "top" && hasFloatingPanel(overlay)),
+    ),
+);
 
-export const getOverlayState = () => $overlayState.get()
+export const getOverlayState = () => $overlayState.get();
 
-export const patchOverlayState = (next: Partial<OverlayState> | ((state: OverlayState) => OverlayState)) =>
-  $overlayState.set(typeof next === 'function' ? next($overlayState.get()) : { ...$overlayState.get(), ...next })
+export const patchOverlayState = (
+  next: Partial<OverlayState> | ((state: OverlayState) => OverlayState),
+) =>
+  $overlayState.set(
+    typeof next === "function"
+      ? next($overlayState.get())
+      : { ...$overlayState.get(), ...next },
+  );
 
 /** Full reset — used by session/turn teardown and tests. */
-export const resetOverlayState = () => $overlayState.set(buildOverlayState())
+export const resetOverlayState = () => $overlayState.set(buildOverlayState());
 
 /**
  * Soft reset: drop FLOW-scoped overlays (approval / clarify / confirm / sudo
@@ -128,5 +158,5 @@ export const resetFlowOverlays = () =>
     modelPicker: $overlayState.get().modelPicker,
     pluginsHub: $overlayState.get().pluginsHub,
     sessions: $overlayState.get().sessions,
-    skillsHub: $overlayState.get().skillsHub
-  })
+    skillsHub: $overlayState.get().skillsHub,
+  });

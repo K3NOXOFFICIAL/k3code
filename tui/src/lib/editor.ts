@@ -1,26 +1,33 @@
-import { spawnSync } from 'node:child_process'
-import { accessSync, constants, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { spawnSync } from "node:child_process";
+import {
+  accessSync,
+  constants,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 
-import { withInkSuspended } from '@k3code/ink'
+import { withInkSuspended } from "@k3code/ink";
 
 /**
  * Editor fallback chain when neither $VISUAL nor $EDITOR is set. Mirrors
  * prompt_toolkit's `Buffer.open_in_editor()` picker so the classic CLI and
  * the TUI launch the same editor on a given box.
  */
-const FALLBACKS = ['editor', 'nano', 'pico', 'vi', 'emacs']
+const FALLBACKS = ["editor", "nano", "pico", "vi", "emacs"];
 
 const isExecutable = (path: string): boolean => {
   try {
-    accessSync(path, constants.X_OK)
+    accessSync(path, constants.X_OK);
 
-    return true
+    return true;
   } catch {
-    return false
+    return false;
   }
-}
+};
 
 /**
  * Resolve the editor invocation argv (without the file argument).
@@ -32,39 +39,44 @@ const isExecutable = (path: string): boolean => {
  */
 export const resolveEditor = (
   env: NodeJS.ProcessEnv = process.env,
-  platform: NodeJS.Platform = process.platform
+  platform: NodeJS.Platform = process.platform,
 ): string[] => {
-  const explicit = env.VISUAL ?? env.EDITOR
+  const explicit = env.VISUAL ?? env.EDITOR;
 
   if (explicit?.trim()) {
-    return explicit.trim().split(/\s+/)
+    return explicit.trim().split(/\s+/);
   }
 
-  if (platform === 'win32') {
-    return ['notepad.exe']
+  if (platform === "win32") {
+    return ["notepad.exe"];
   }
 
-  const dirs = (env.PATH ?? '').split(delimiter).filter(Boolean)
-  const found = FALLBACKS.flatMap(name => dirs.map(d => join(d, name))).find(isExecutable)
+  const dirs = (env.PATH ?? "").split(delimiter).filter(Boolean);
+  const found = FALLBACKS.flatMap((name) =>
+    dirs.map((d) => join(d, name)),
+  ).find(isExecutable);
 
-  return [found ?? 'vi']
-}
+  return [found ?? "vi"];
+};
 
 /** Suspend Ink, open ``initial`` in $EDITOR, return the edited text (null if aborted). */
-export async function openInEditor(initial: string, suffix = '.txt'): Promise<null | string> {
-  const dir = mkdtempSync(join(tmpdir(), 'k3code-edit-'))
-  const file = join(dir, `edit${suffix}`)
-  writeFileSync(file, initial)
-  const [cmd, ...args] = resolveEditor()
-  let status: null | number = null
+export async function openInEditor(
+  initial: string,
+  suffix = ".txt",
+): Promise<null | string> {
+  const dir = mkdtempSync(join(tmpdir(), "k3code-edit-"));
+  const file = join(dir, `edit${suffix}`);
+  writeFileSync(file, initial);
+  const [cmd, ...args] = resolveEditor();
+  let status: null | number = null;
 
   await withInkSuspended(async () => {
-    status = spawnSync(cmd!, [...args, file], { stdio: 'inherit' }).status
-  })
+    status = spawnSync(cmd!, [...args, file], { stdio: "inherit" }).status;
+  });
 
   try {
-    return status === 0 ? readFileSync(file, 'utf8') : null
+    return status === 0 ? readFileSync(file, "utf8") : null;
   } finally {
-    rmSync(dir, { force: true, recursive: true })
+    rmSync(dir, { force: true, recursive: true });
   }
 }

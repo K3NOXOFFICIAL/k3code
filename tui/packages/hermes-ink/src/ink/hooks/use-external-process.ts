@@ -1,27 +1,29 @@
-import { useCallback } from 'react'
+import { useCallback } from "react";
 
-import instances from '../instances.js'
+import instances from "../instances.js";
 
-export type RunExternalProcess = () => Promise<void>
+export type RunExternalProcess = () => Promise<void>;
 
 export async function withInkSuspended(run: RunExternalProcess): Promise<void> {
-  const ink = instances.get(process.stdout)
+  const ink = instances.get(process.stdout);
 
   if (!ink) {
-    await run()
+    await run();
 
-    return
+    return;
   }
 
-  ink.enterAlternateScreen()
+  ink.enterAlternateScreen();
 
   try {
-    await run()
+    await run();
   } finally {
-    ink.exitAlternateScreen()
+    ink.exitAlternateScreen();
   }
 }
 
-export function useExternalProcess(): (run: RunExternalProcess) => Promise<void> {
-  return useCallback((run: RunExternalProcess) => withInkSuspended(run), [])
+export function useExternalProcess(): (
+  run: RunExternalProcess,
+) => Promise<void> {
+  return useCallback((run: RunExternalProcess) => withInkSuspended(run), []);
 }

@@ -83,10 +83,7 @@ def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
         reg.activate([t.qualified for t in hits])
         if not hits:
             return {"content": "No matching MCP tools."}
-        body = [
-            {"name": t.qualified, "description": t.description, "input_schema": t.schema}
-            for t in hits
-        ]
+        body = [{"name": t.qualified, "description": t.description, "input_schema": t.schema} for t in hits]
         return {"content": json.dumps(body, indent=2) + "\n\nThese tools can now be called directly."}
 
     reg.register(

@@ -3,8 +3,10 @@ from k3code.learning import ranking
 from k3code.learning.decisions import DecisionLog
 from learn_helpers import FakeCaller, FakeClock
 
-ITEMS = [{"kind": "improvement", "text": "refactor the parser module", "action": "a"},
-         {"kind": "also_setup", "text": "set up pre-commit hooks", "action": "b"}]
+ITEMS = [
+    {"kind": "improvement", "text": "refactor the parser module", "action": "a"},
+    {"kind": "also_setup", "text": "set up pre-commit hooks", "action": "b"},
+]
 
 
 def decide(log, kind, choice, n, project="p"):
@@ -55,8 +57,10 @@ async def test_propose_uses_ranker_threshold_and_preferences(tmp_path):
     log = DecisionLog(tmp_path, clock)
     decide(log, "improvement", "dismiss", 12)
     store = ProposalStore(tmp_path)
-    caller = FakeCaller('[{"kind":"improvement","text":"tidy imports","action":"x"},'
-                        '{"kind":"also_setup","text":"add a Makefile","action":"y"}]')
+    caller = FakeCaller(
+        '[{"kind":"improvement","text":"tidy imports","action":"x"},'
+        '{"kind":"also_setup","text":"add a Makefile","action":"y"}]'
+    )
     ranker = lambda items: ranking.rank(items, log=log, store=store, threshold=0.15, now=clock())  # noqa: E731
     out = await propose(caller, store, "ctx", ranker=ranker, preferences=["prefers small PRs"])
     assert [p.kind for p in out] == ["also_setup"]

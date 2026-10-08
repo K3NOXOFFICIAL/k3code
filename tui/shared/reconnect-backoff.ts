@@ -17,42 +17,48 @@
 
 export interface ReconnectBackoffOptions {
   /** Delay for the first retry (attempt 0) before jitter is applied, in ms. */
-  baseDelayMs?: number
+  baseDelayMs?: number;
   /** Ceiling on the exponential delay before jitter is applied, in ms. */
-  capMs?: number
+  capMs?: number;
   /** Full jitter (default) or the bare ceiling. */
-  jitter?: boolean
+  jitter?: boolean;
 }
 
-const DEFAULT_BASE_DELAY_MS = 300
+const DEFAULT_BASE_DELAY_MS = 300;
 /**
  * A socket that opens and dies inside this window (an accept-then-close proxy, a gateway that
  * refuses the first frame) counts as a FAILED attempt: resetting the ladder on every such
  * "open" redials at attempt 0 forever (#83134: 55 sockets in 12 s).
  */
-export const RECONNECT_STABLE_OPEN_MS = 5_000
+export const RECONNECT_STABLE_OPEN_MS = 5_000;
 
 /** True when a socket opened at `openedAt` stayed up long enough to reset the backoff ladder. */
-export function isStableOpen(openedAt: number | null, now = Date.now()): boolean {
-  return openedAt !== null && now - openedAt >= RECONNECT_STABLE_OPEN_MS
+export function isStableOpen(
+  openedAt: number | null,
+  now = Date.now(),
+): boolean {
+  return openedAt !== null && now - openedAt >= RECONNECT_STABLE_OPEN_MS;
 }
 
-const DEFAULT_CAP_MS = 15_000
+const DEFAULT_CAP_MS = 15_000;
 // 2 ** attempt overflows to Infinity long before it matters (attempt would
 // need to be ~1024) and Math.min against a finite cap keeps the ceiling sane
 // regardless; the clamp just keeps the arithmetic in finite territory.
-const MAX_EXPONENT = 32
+const MAX_EXPONENT = 32;
 
 /**
  * Delay before reconnect attempt number `attempt` (0-indexed: the first retry
  * after the initial failure is `attempt = 0`). With jitter the value lies in
  * `[0, min(capMs, baseDelayMs * 2 ** attempt))`; without it, it IS that ceiling.
  */
-export function reconnectBackoffDelayMs(attempt: number, options: ReconnectBackoffOptions = {}): number {
-  const baseDelayMs = options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS
-  const capMs = options.capMs ?? DEFAULT_CAP_MS
-  const exponent = Math.min(Math.max(0, Math.trunc(attempt)), MAX_EXPONENT)
-  const ceiling = Math.min(capMs, baseDelayMs * 2 ** exponent)
+export function reconnectBackoffDelayMs(
+  attempt: number,
+  options: ReconnectBackoffOptions = {},
+): number {
+  const baseDelayMs = options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
+  const capMs = options.capMs ?? DEFAULT_CAP_MS;
+  const exponent = Math.min(Math.max(0, Math.trunc(attempt)), MAX_EXPONENT);
+  const ceiling = Math.min(capMs, baseDelayMs * 2 ** exponent);
 
-  return options.jitter === false ? ceiling : Math.random() * ceiling
+  return options.jitter === false ? ceiling : Math.random() * ceiling;
 }

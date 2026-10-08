@@ -16,8 +16,13 @@ from k3code.providers.fake import FakeProvider
 
 
 def _config() -> Settings:
-    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE",
-                         models={"default": "m-main", "cheap": "m-cheap"})
+    prov = ProviderEntry(
+        name="t",
+        kind="openai",
+        base_url="http://t",
+        api_key_env="NOPE",
+        models={"default": "m-main", "cheap": "m-cheap"},
+    )
     return Settings(providers=[prov], default_model="default")
 
 
@@ -38,16 +43,22 @@ def _fake(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[FakeProvider]
 
 def test_headless_model_key_resolves_to_the_providers_model(tmp_path, monkeypatch):
     made = _fake(monkeypatch, tmp_path)
-    result = asyncio.run(cli_mod._run_headless(
-        "hi", model="cheap", permission_mode=PermissionMode.YOLO, config=_config(), json_output=True))
+    result = asyncio.run(
+        cli_mod._run_headless(
+            "hi", model="cheap", permission_mode=PermissionMode.YOLO, config=_config(), json_output=True
+        )
+    )
     assert result == {"text": "ok", "tools": []}
     assert [c["model"] for c in made[0].log] == ["m-cheap"]
 
 
 def test_headless_unknown_model_key_is_an_error(tmp_path, monkeypatch):
     _fake(monkeypatch, tmp_path)
-    result = asyncio.run(cli_mod._run_headless(
-        "hi", model="nope", permission_mode=PermissionMode.YOLO, config=_config(), json_output=True))
+    result = asyncio.run(
+        cli_mod._run_headless(
+            "hi", model="nope", permission_mode=PermissionMode.YOLO, config=_config(), json_output=True
+        )
+    )
     assert result is not None and result["error"] == "unknown_model"
 
 
@@ -60,8 +71,9 @@ def test_tui_gets_the_model_key_through_k3code_default_model(tmp_path, monkeypat
     monkeypatch.setattr(paths_mod, "find_node", lambda: "node")
     monkeypatch.setattr(cli_mod, "_find_repo_root", lambda: tmp_path)
     envs: list[dict[str, str]] = []
-    monkeypatch.setattr(cli_mod.subprocess, "run",
-                        lambda argv, env, check: envs.append(env) or SimpleNamespace(returncode=0))
+    monkeypatch.setattr(
+        cli_mod.subprocess, "run", lambda argv, env, check: envs.append(env) or SimpleNamespace(returncode=0)
+    )
     with pytest.raises(SystemExit):
         cli_mod._launch_tui(model="cheap")
     assert envs[0]["K3CODE_DEFAULT_MODEL"] == "cheap"

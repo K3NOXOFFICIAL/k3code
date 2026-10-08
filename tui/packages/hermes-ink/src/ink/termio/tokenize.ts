@@ -6,23 +6,32 @@
  * identifies boundaries for use by keyboard input parsing.
  */
 
-import { C0, ESC_TYPE, isEscFinal } from './ansi.js'
-import { isCSIFinal, isCSIIntermediate, isCSIParam } from './csi.js'
+import { C0, ESC_TYPE, isEscFinal } from "./ansi.js";
+import { isCSIFinal, isCSIIntermediate, isCSIParam } from "./csi.js";
 
-export type Token = { type: 'text'; value: string } | { type: 'sequence'; value: string }
+export type Token =
+  { type: "text"; value: string } | { type: "sequence"; value: string };
 
-type State = 'ground' | 'escape' | 'escapeIntermediate' | 'csi' | 'ss3' | 'osc' | 'dcs' | 'apc'
+type State =
+  | "ground"
+  | "escape"
+  | "escapeIntermediate"
+  | "csi"
+  | "ss3"
+  | "osc"
+  | "dcs"
+  | "apc";
 
 export type Tokenizer = {
   /** Feed input and get resulting tokens */
-  feed(input: string): Token[]
+  feed(input: string): Token[];
   /** Flush any buffered incomplete sequences */
-  flush(): Token[]
+  flush(): Token[];
   /** Reset tokenizer state */
-  reset(): void
+  reset(): void;
   /** Get any buffered incomplete sequence */
-  buffer(): string
-}
+  buffer(): string;
+};
 
 type TokenizerOptions = {
   /**
@@ -30,13 +39,13 @@ type TokenizerOptions = {
    * Only enable for stdin input — `\x1b[M` is also CSI DL (Delete Lines) in
    * output streams, and enabling this there swallows display text. Default false.
    */
-  x10Mouse?: boolean
+  x10Mouse?: boolean;
   /**
    * Treat ESC followed by CR or LF as one legacy Alt+Enter key sequence.
    * Only enable for keyboard input; output streams must preserve line endings.
    */
-  legacyAltEnter?: boolean
-}
+  legacyAltEnter?: boolean;
+};
 
 /**
  * Create a streaming tokenizer for terminal input.
@@ -50,65 +59,79 @@ type TokenizerOptions = {
  * ```
  */
 export function createTokenizer(options?: TokenizerOptions): Tokenizer {
-  let currentState: State = 'ground'
-  let currentBuffer = ''
+  let currentState: State = "ground";
+  let currentBuffer = "";
   // The control-sequence buffer kept across the previous flush, if any. Used
   // as a one-tick truncation valve: a partial CSI mouse report normally
   // reassembles on the very next feed, so if a flush sees the exact same
   // buffer it kept last time (the continuation never arrived), we drop it.
-  let lastFlushedBuffer = ''
-  const x10Mouse = options?.x10Mouse ?? false
-  const legacyAltEnter = options?.legacyAltEnter ?? false
+  let lastFlushedBuffer = "";
+  const x10Mouse = options?.x10Mouse ?? false;
+  const legacyAltEnter = options?.legacyAltEnter ?? false;
 
   return {
     feed(input: string): Token[] {
       // Real bytes arrived — any kept partial is no longer stale.
-      lastFlushedBuffer = ''
+      lastFlushedBuffer = "";
 
-      const result = tokenize(input, currentState, currentBuffer, false, x10Mouse, legacyAltEnter)
+      const result = tokenize(
+        input,
+        currentState,
+        currentBuffer,
+        false,
+        x10Mouse,
+        legacyAltEnter,
+      );
 
-      currentState = result.state.state
-      currentBuffer = result.state.buffer
+      currentState = result.state.state;
+      currentBuffer = result.state.buffer;
 
-      return result.tokens
+      return result.tokens;
     },
 
     flush(): Token[] {
-      const result = tokenize('', currentState, currentBuffer, true, x10Mouse, legacyAltEnter)
-      currentState = result.state.state
-      currentBuffer = result.state.buffer
+      const result = tokenize(
+        "",
+        currentState,
+        currentBuffer,
+        true,
+        x10Mouse,
+        legacyAltEnter,
+      );
+      currentState = result.state.state;
+      currentBuffer = result.state.buffer;
 
       // tokenize() keeps (doesn't emit) an incomplete control sequence on
       // flush. If two consecutive flushes see the same buffer with no feed in
       // between, the continuation is never coming (truncated write / killed
       // process) — drop it so it can't fuse with the next keypress's bytes.
       if (currentBuffer && currentBuffer === lastFlushedBuffer) {
-        currentState = 'ground'
-        currentBuffer = ''
-        lastFlushedBuffer = ''
+        currentState = "ground";
+        currentBuffer = "";
+        lastFlushedBuffer = "";
       } else {
-        lastFlushedBuffer = currentBuffer
+        lastFlushedBuffer = currentBuffer;
       }
 
-      return result.tokens
+      return result.tokens;
     },
 
     reset(): void {
-      currentState = 'ground'
-      currentBuffer = ''
-      lastFlushedBuffer = ''
+      currentState = "ground";
+      currentBuffer = "";
+      lastFlushedBuffer = "";
     },
 
     buffer(): string {
-      return currentBuffer
-    }
-  }
+      return currentBuffer;
+    },
+  };
 }
 
 type InternalState = {
-  state: State
-  buffer: string
-}
+  state: State;
+  buffer: string;
+};
 
 function tokenize(
   input: string,
@@ -116,121 +139,121 @@ function tokenize(
   initialBuffer: string,
   flush: boolean,
   x10Mouse: boolean,
-  legacyAltEnter: boolean
+  legacyAltEnter: boolean,
 ): { tokens: Token[]; state: InternalState } {
-  const tokens: Token[] = []
+  const tokens: Token[] = [];
 
   const result: InternalState = {
     state: initialState,
-    buffer: ''
-  }
+    buffer: "",
+  };
 
-  const data = initialBuffer + input
-  let i = 0
-  let textStart = 0
-  let seqStart = 0
+  const data = initialBuffer + input;
+  let i = 0;
+  let textStart = 0;
+  let seqStart = 0;
 
   const flushText = (): void => {
     if (i > textStart) {
-      const text = data.slice(textStart, i)
+      const text = data.slice(textStart, i);
 
       if (text) {
-        tokens.push({ type: 'text', value: text })
+        tokens.push({ type: "text", value: text });
       }
     }
 
-    textStart = i
-  }
+    textStart = i;
+  };
 
   const emitSequence = (seq: string): void => {
     if (seq) {
-      tokens.push({ type: 'sequence', value: seq })
+      tokens.push({ type: "sequence", value: seq });
     }
 
-    result.state = 'ground'
-    textStart = i
-  }
+    result.state = "ground";
+    textStart = i;
+  };
 
   while (i < data.length) {
-    const code = data.charCodeAt(i)
+    const code = data.charCodeAt(i);
 
     switch (result.state) {
-      case 'ground':
+      case "ground":
         if (code === C0.ESC) {
-          flushText()
-          seqStart = i
-          result.state = 'escape'
-          i++
+          flushText();
+          seqStart = i;
+          result.state = "escape";
+          i++;
         } else {
-          i++
+          i++;
         }
 
-        break
+        break;
 
-      case 'escape':
+      case "escape":
         if (code === ESC_TYPE.CSI) {
-          result.state = 'csi'
-          i++
+          result.state = "csi";
+          i++;
         } else if (code === ESC_TYPE.OSC) {
-          result.state = 'osc'
-          i++
+          result.state = "osc";
+          i++;
         } else if (code === ESC_TYPE.DCS) {
-          result.state = 'dcs'
-          i++
+          result.state = "dcs";
+          i++;
         } else if (code === ESC_TYPE.APC) {
-          result.state = 'apc'
-          i++
+          result.state = "apc";
+          i++;
         } else if (code === 0x4f) {
           // 'O' - SS3
-          result.state = 'ss3'
-          i++
+          result.state = "ss3";
+          i++;
         } else if (legacyAltEnter && (code === C0.CR || code === C0.LF)) {
           // Legacy terminals encode Alt+Enter as ESC followed by CR or LF.
           // Keep both bytes in one token so the key parser can preserve Alt.
           // A standalone Escape is emitted by flush() before a later Enter;
           // without that timing boundary the legacy encoding is ambiguous.
-          i++
-          emitSequence(data.slice(seqStart, i))
+          i++;
+          emitSequence(data.slice(seqStart, i));
         } else if (isCSIIntermediate(code)) {
           // Intermediate byte (e.g., ESC ( for charset) - continue buffering
-          result.state = 'escapeIntermediate'
-          i++
+          result.state = "escapeIntermediate";
+          i++;
         } else if (isEscFinal(code)) {
           // Two-character escape sequence
-          i++
-          emitSequence(data.slice(seqStart, i))
+          i++;
+          emitSequence(data.slice(seqStart, i));
         } else if (code === C0.ESC) {
           // Double escape - emit first, start new
-          emitSequence(data.slice(seqStart, i))
-          seqStart = i
-          result.state = 'escape'
-          i++
+          emitSequence(data.slice(seqStart, i));
+          seqStart = i;
+          result.state = "escape";
+          i++;
         } else {
           // Invalid - treat ESC as text
-          result.state = 'ground'
-          textStart = seqStart
+          result.state = "ground";
+          textStart = seqStart;
         }
 
-        break
+        break;
 
-      case 'escapeIntermediate':
+      case "escapeIntermediate":
         // After intermediate byte(s), wait for final byte
         if (isCSIIntermediate(code)) {
           // More intermediate bytes
-          i++
+          i++;
         } else if (isEscFinal(code)) {
           // Final byte - complete the sequence
-          i++
-          emitSequence(data.slice(seqStart, i))
+          i++;
+          emitSequence(data.slice(seqStart, i));
         } else {
           // Invalid - treat as text
-          result.state = 'ground'
-          textStart = seqStart
+          result.state = "ground";
+          textStart = seqStart;
         }
 
-        break
+        break;
 
-      case 'csi':
+      case "csi":
         // X10 mouse: CSI M + 3 raw payload bytes (Cb+32, Cx+32, Cy+32).
         // M immediately after [ (offset 2) means no params — SGR mouse
         // (CSI < … M) has a `<` param byte first and reaches M at offset > 2.
@@ -263,87 +286,94 @@ function tokenize(
           (i + 3 >= data.length || data.charCodeAt(i + 3) >= 0x20)
         ) {
           if (i + 4 <= data.length) {
-            i += 4
-            emitSequence(data.slice(seqStart, i))
+            i += 4;
+            emitSequence(data.slice(seqStart, i));
           } else {
             // Incomplete — exit loop; end-of-input buffers from seqStart.
             // Re-entry re-tokenizes from ground via the invalid-CSI fallthrough.
-            i = data.length
+            i = data.length;
           }
 
-          break
+          break;
         }
 
         if (isCSIFinal(code)) {
-          i++
-          emitSequence(data.slice(seqStart, i))
+          i++;
+          emitSequence(data.slice(seqStart, i));
         } else if (isCSIParam(code) || isCSIIntermediate(code)) {
-          i++
+          i++;
         } else {
           // Invalid CSI - abort, treat as text
-          result.state = 'ground'
-          textStart = seqStart
+          result.state = "ground";
+          textStart = seqStart;
         }
 
-        break
+        break;
 
-      case 'ss3':
+      case "ss3":
         // SS3 sequences: ESC O followed by a single final byte
         if (code >= 0x40 && code <= 0x7e) {
-          i++
-          emitSequence(data.slice(seqStart, i))
+          i++;
+          emitSequence(data.slice(seqStart, i));
         } else {
           // Invalid - treat as text
-          result.state = 'ground'
-          textStart = seqStart
+          result.state = "ground";
+          textStart = seqStart;
         }
 
-        break
+        break;
 
-      case 'osc':
+      case "osc":
         if (code === C0.BEL) {
-          i++
-          emitSequence(data.slice(seqStart, i))
-        } else if (code === C0.ESC && i + 1 < data.length && data.charCodeAt(i + 1) === ESC_TYPE.ST) {
-          i += 2
-          emitSequence(data.slice(seqStart, i))
+          i++;
+          emitSequence(data.slice(seqStart, i));
+        } else if (
+          code === C0.ESC &&
+          i + 1 < data.length &&
+          data.charCodeAt(i + 1) === ESC_TYPE.ST
+        ) {
+          i += 2;
+          emitSequence(data.slice(seqStart, i));
         } else {
-          i++
+          i++;
         }
 
-        break
+        break;
 
-      case 'dcs':
-
-      case 'apc':
+      case "dcs":
+      case "apc":
         if (code === C0.BEL) {
-          i++
-          emitSequence(data.slice(seqStart, i))
-        } else if (code === C0.ESC && i + 1 < data.length && data.charCodeAt(i + 1) === ESC_TYPE.ST) {
-          i += 2
-          emitSequence(data.slice(seqStart, i))
+          i++;
+          emitSequence(data.slice(seqStart, i));
+        } else if (
+          code === C0.ESC &&
+          i + 1 < data.length &&
+          data.charCodeAt(i + 1) === ESC_TYPE.ST
+        ) {
+          i += 2;
+          emitSequence(data.slice(seqStart, i));
         } else {
-          i++
+          i++;
         }
 
-        break
+        break;
     }
   }
 
   // Handle end of input
-  if (result.state === 'ground') {
-    flushText()
-  } else if (flush && result.state === 'escape') {
+  if (result.state === "ground") {
+    flushText();
+  } else if (flush && result.state === "escape") {
     // A bare ESC with nothing after it is the Escape key — the one incomplete
     // state a flush should turn into input (the classic ESCDELAY lone-ESC
     // disambiguation: ESC alone vs. ESC as a sequence/meta prefix).
-    const remaining = data.slice(seqStart)
+    const remaining = data.slice(seqStart);
 
     if (remaining) {
-      tokens.push({ type: 'sequence', value: remaining })
+      tokens.push({ type: "sequence", value: remaining });
     }
 
-    result.state = 'ground'
+    result.state = "ground";
   } else {
     // Buffer the incomplete sequence. Two paths land here:
     //   - streaming (flush=false): normal carry-over to the next feed.
@@ -357,8 +387,8 @@ function tokenize(
     //     never become text). createTokenizer.flush() drops the buffer if it
     //     survives a second flush with no progress (a genuine truncation), so
     //     a stuck partial can never merge into the next keypress's bytes.
-    result.buffer = data.slice(seqStart)
+    result.buffer = data.slice(seqStart);
   }
 
-  return { tokens, state: result }
+  return { tokens, state: result };
 }

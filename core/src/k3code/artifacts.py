@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import sqlite3
 import time
 import uuid
@@ -50,8 +51,14 @@ class ArtifactStore:
         self._db.commit()
 
     def register(self, kind: str, path: Path | str, *, title: str = "", session: str = "") -> Artifact:
-        art = Artifact(uuid.uuid4().hex[:8], time.time(), session, kind if kind in KINDS else "other", title,
-                       str(Path(path).resolve()))
+        art = Artifact(
+            uuid.uuid4().hex[:8],
+            time.time(),
+            session,
+            kind if kind in KINDS else "other",
+            title,
+            str(Path(path).resolve()),
+        )
         self._db.execute(
             "INSERT INTO artifacts (id, ts, session, kind, title, path) VALUES (?,?,?,?,?,?)",
             (art.id, art.ts, art.session, art.kind, art.title, art.path),
@@ -94,6 +101,20 @@ def register_artifact(ctx: Any, kind: str, path: Path | str, *, title: str = "",
     except Exception:  # noqa: BLE001 - registering must never break the producer
         logger.warning("artifact registration failed", exc_info=True)
         return None
+
+
+class AlreadyPublished(Exception):
+    """The published folder already holds a file with that name; ``--force`` replaces it."""
+
+
+def publish_file(src: Path, dest_dir: Path, *, force: bool = False) -> Path:
+    """Copy ``src`` into ``dest_dir`` under its own name. A local copy only: nothing is uploaded anywhere."""
+    dest = dest_dir / src.name
+    if dest.exists() and not force:
+        raise AlreadyPublished(dest)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dest)
+    return dest
 
 
 def slugify(text: str, limit: int = 40) -> str:

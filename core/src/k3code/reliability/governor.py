@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from k3code.paths import home as k3code_home
 from k3code.reliability.events import EventEmitter
 
 # ── PSI parsing ────────────────────────────────────────────────────────
@@ -140,7 +141,7 @@ class GovernorConfig:
     max_parallel_agents: int = 3  # sub-agent fan-out width; IO-heavy work is capped at max_io_heavy
     per_provider_streams: int = 4
     min_free_bytes: int = 2 * 1024 * 1024 * 1024  # 2 GB
-    home: Path = Path.home() / ".k3code"  # disk-guard target ($K3CODE_HOME)
+    home: Path = field(default_factory=k3code_home)  # disk-guard target ($K3CODE_HOME), read per instance
     # USD costs: rough default per-token prices (input, output) for budgeting
     # when the router does not report cost directly.
     tokens_per_usd: float = 2_000_000.0  # blended; overridable per-budget
@@ -297,9 +298,7 @@ class Governor:
                     if kind == "io":
                         self._counters.io += 1
                     if kind == "llm" and provider is not None:
-                        self._counters.by_provider[provider] = (
-                            self._counters.by_provider.get(provider, 0) + 1
-                        )
+                        self._counters.by_provider[provider] = self._counters.by_provider.get(provider, 0) + 1
                     return
             # Caps are full (or the provider stream cap): back off briefly.
             await asyncio.sleep(0.05)

@@ -18,8 +18,11 @@
 # to build the k3 pane binary) when they are not on PATH. bubblewrap is installed through the system package
 # manager only when that works without a password (root or passwordless sudo). --no-install-deps fetches
 # nothing. The installer never runs onboarding; it ends by telling you to run `k3code onboard`.
-# Env (mostly for tests): K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG, K3_NO_DOWNLOAD (= --no-install-deps),
-#   K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv), K3_EDITABLE (--from-source only).
+# Presetup (after activation; --minimal skips it) checks the sandbox, installs Chromium for the browser tool and
+# prints a health subset. It never fails the install.
+# Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
+#   K3_NO_DOWNLOAD (= --no-install-deps), K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv,
+#   no network), K3_EDITABLE (--from-source only), K3_BWRAP (the bubblewrap binary to probe).
 set -eu
 
 DEFAULT_URL=https://github.com/K3NOXOFFICIAL/k3code.git
@@ -29,6 +32,8 @@ INSTALL_LOG=""
 TMP=""
 BUILDING=""
 REQS=""
+UV_TMP=""
+GIT_ERR=""
 
 usage() {
   cat <<EOF
@@ -44,8 +49,9 @@ Source (default: --from-git $DEFAULT_URL):
 Options:
   --prefix DIR          install into DIR/bin and DIR/share/k3code (default: ~/.local)
   --from-bundle FILE    after installing, import a k3code export (settings and sessions)
-  --yes, -y             accepted for older callers; the installer never asks
+  --yes, -y             accepted for older callers; with it, presetup never prompts for sudo
   --no-install-deps     install nothing (no uv, Python, Node, Go); fail or skip with the hints instead
+  --minimal             skip presetup: no sandbox check, no Chromium, no doctor subset
   --check               print the platform and dependency report, change nothing
   --no-activate         build the version without switching to it (used by k3code update)
   --print-version       print the version name on stdout (used by k3code update)
@@ -53,6 +59,10 @@ Options:
 
 Fetched when missing (into PREFIX/share/k3code, no root): uv, Python 3.12+, Node 22 (the TUI), Go (the k3
 pane binary). bubblewrap (sandbox, Linux) is installed only when root or passwordless sudo is available.
+
+Presetup (on by default, after the version is activated; never fails the install): checks the sandbox, installs
+Chromium for the browser tool (about 115 MiB; K3CODE_SKIP_CHROMIUM=1 skips only that) and prints a health subset.
+Without bubblewrap it prints the install command and runs nothing; it asks before a sudo run only on a terminal.
 EOF
 }
 
@@ -72,6 +82,8 @@ cleanup() {
   if [ -n "$BUILDING" ]; then rm -rf "$BUILDING"; fi
   if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
   if [ -n "$REQS" ]; then rm -f "$REQS"; fi
+  if [ -n "$UV_TMP" ]; then rm -f "$UV_TMP"; fi
+  if [ -n "$GIT_ERR" ]; then rm -f "$GIT_ERR"; fi
   if [ "$rc" -ne 0 ]; then say "k3code-install: FAILED (exit $rc)${INSTALL_LOG:+. Log: $INSTALL_LOG}"; fi
   exit "$rc"
 }
@@ -83,14 +95,22 @@ fetch() { # fetch URL FILE
   if have curl; then curl -fsSL --retry 3 "$1" -o "$2"; else wget -q --tries=3 -O "$2" "$1"; fi
 }
 
+ask_tty() { # ask_tty QUESTION: asks on the terminal only, never with --yes; no terminal means no
+  if [ "$YES" = 1 ] || ! (: </dev/tty) 2>/dev/null; then return 1; fi
+  printf '%s [y/N] ' "$1" >/dev/tty
+  read -r ans </dev/tty || ans=""
+  case "$ans" in y | Y | yes | YES) return 0 ;; esac
+  return 1
+}
+
 sha256_of() { # sha256_of FILE
   if have sha256sum; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
 can_fetch() { have curl || have wget; }
 
-as_root() { # as_root CMD...: run CMD as root when that needs no password; fails otherwise
-  if [ "$(id -u)" = 0 ]; then "$@"; elif have sudo && sudo -n true 2>/dev/null; then sudo -n "$@"; else return 1; fi
+as_root() { # as_root CMD...: root directly, or through sudo only after a person said yes at a terminal
+  if [ "$(id -u)" = 0 ]; then "$@"; elif [ "${ROOT_APPROVED:-0}" = 1 ]; then sudo "$@"; else return 1; fi
 }
 
 node_major() { "$1" --version 2>/dev/null | sed 's/^v//; s/\..*//'; }
@@ -207,15 +227,15 @@ find_python() { # sets PY_FOUND to the first python3 that is 3.12 or newer
   return 0
 }
 
-find_node() { # sets NODE_OK=1 when node 18+ and npm work (also accepts a node from an older install)
+find_node() { # sets NODE_OK=1 when node 20+ and npm work (also accepts a node from an older install)
   NODE_OK=0
-  if have node && have npm && [ "$(node_major node)" -ge 18 ] 2>/dev/null; then
+  if have node && have npm && [ "$(node_major node)" -ge 20 ] 2>/dev/null; then
     NODE_OK=1
     return 0
   fi
   for n in "$DATA"/node/*/bin/node; do
     [ -x "$n" ] || continue
-    if [ "$(node_major "$n")" -ge 18 ] 2>/dev/null && [ -x "$(dirname "$n")/npm" ]; then
+    if [ "$(node_major "$n")" -ge 20 ] 2>/dev/null && [ -x "$(dirname "$n")/npm" ]; then
       PATH="$(dirname "$n"):$PATH"
       export PATH
       NODE_OK=1
@@ -250,11 +270,11 @@ report() {
     item missing "git" "needed for --from-git, the default"
     say "      $(hint_cmd git)"
   fi
-  if [ "$NODE_OK" = 1 ]; then item ok "node 18+ with npm"; else
+  if [ "$NODE_OK" = 1 ]; then item ok "node 20+ with npm"; else
     if [ "$NO_DEPS" != 1 ] && [ "$MUSL" != 1 ] && can_fetch; then
-      item missing "node 18+ with npm" "a private Node 22 is fetched into $DATA/node for the TUI"
+      item missing "node 20+ with npm" "a private Node 22 is fetched into $DATA/node for the TUI"
     else
-      item missing "node 18+ with npm" "optional: builds the TUI; without it k3code uses the line REPL"
+      item missing "node 20+ with npm" "optional: builds the TUI; without it k3code uses the line REPL"
       say "      $(hint_cmd node)"
     fi
   fi
@@ -280,10 +300,12 @@ ensure_uv() {
   if [ "$NO_DEPS" = 1 ]; then die "uv is missing and --no-install-deps is set; install it: $(hint_cmd uv)"; fi
   if ! have curl && ! have wget; then die "curl or wget is needed to install uv: $(hint_cmd curl)"; fi
   log "uv is missing: installing it into $BIN with its official installer (https://astral.sh/uv/install.sh)"
-  tmp=$(mktemp "${TMPDIR:-/tmp}/uv-install.XXXXXX")
-  fetch https://astral.sh/uv/install.sh "$tmp"
-  UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$BIN" sh "$tmp" >&2 || die "the uv installer failed (output above); install uv yourself: $(hint_cmd uv)"
-  rm -f "$tmp"
+  UV_TMP=$(mktemp "${TMPDIR:-/tmp}/uv-install.XXXXXX")
+  fetch https://astral.sh/uv/install.sh "$UV_TMP" ||
+    die "could not download the uv installer (no network?); install uv yourself: $(hint_cmd uv)"
+  UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$BIN" sh "$UV_TMP" >&2 || die "the uv installer failed (output above); install uv yourself: $(hint_cmd uv)"
+  rm -f "$UV_TMP"
+  UV_TMP=""
   find_uv || die "uv installation failed"
 }
 
@@ -363,9 +385,16 @@ unpack_zip() { # unpack_zip ZIP DIR: unzip, else Python's zipfile (which drops t
   done
 }
 
-ensure_bwrap() { # Linux sandbox: only through the package manager, and only when that needs no password
+ensure_bwrap() { # Linux sandbox: through the package manager, as root or after a yes at a terminal
   if [ "$PLATFORM" != Linux ] || have bwrap || [ "$NO_DEPS" = 1 ] || [ -z "$PM" ] || [ "$PM" = brew ]; then return 0; fi
-  if ! as_root true 2>/dev/null; then
+  # Never sudo unattended: a passwordless sudo is not consent. Root installs directly; anyone else is asked at a
+  # terminal (never with --yes, never without a tty), and sudo then asks for the password itself.
+  if [ "$(id -u)" != 0 ] && [ "${ROOT_APPROVED:-0}" != 1 ] && [ "$YES" != 1 ] && [ -t 0 ] && [ -t 1 ] && have sudo; then
+    printf 'Install bubblewrap now with sudo (it asks for your password)? [y/N] ' >&2
+    read -r ans || ans=
+    case "$ans" in y | Y | yes | YES) ROOT_APPROVED=1 ;; esac
+  fi
+  if [ "$(id -u)" != 0 ] && [ "${ROOT_APPROVED:-0}" != 1 ]; then
     log "bubblewrap (the sandbox for unattended runs) needs root to install: $(hint_cmd bwrap)"
     return 0
   fi
@@ -383,14 +412,60 @@ ensure_bwrap() { # Linux sandbox: only through the package manager, and only whe
   return 0
 }
 
-default_ref() { # latest v* tag on the remote, else Main
+default_ref() { # latest v* tag on the remote, else Main; fails (prints nothing) when the remote cannot be reached
   if [ "$CHANNEL" = dev ]; then
     echo Main
     return 0
   fi
-  t=$(git ls-remote --tags --refs --sort=-v:refname "$GIT_URL" 2>/dev/null |
-    sed -n 's#.*refs/tags/\(v[0-9][^/]*\)$#\1#p' | head -n 1)
+  out=$(git ls-remote --tags --refs --sort=-v:refname "$GIT_URL" 2>"$GIT_ERR") || return 1
+  t=$(printf '%s\n' "$out" | sed -n 's#.*refs/tags/\(v[0-9][^/]*\)$#\1#p' | head -n 1)
   echo "${t:-Main}"
+}
+
+# Network failures are told apart from private-repo failures: the git error text decides.
+git_error_reason() { # prints private, offline or other, from the last git error in GIT_ERR
+  if grep -qiE 'terminal prompts disabled|could not read username|authentication failed|repository not found|returned error: (401|403)' "$GIT_ERR" 2>/dev/null; then
+    echo private
+  elif grep -qiE 'could not resolve host|temporary failure in name resolution|failed to connect|network is unreachable|connection (timed out|refused|reset)|operation timed out' "$GIT_ERR" 2>/dev/null; then
+    echo offline
+  else
+    echo other
+  fi
+}
+
+git_error_hint() { # git_error_hint REASON: what to tell the user after "could not fetch"
+  case "$1" in
+    offline) echo "no network: check the connection and re-run" ;;
+    private) echo "the repo is private or needs credentials: gh auth login && gh auth setup-git (or check --ref)" ;;
+    *) echo "git said: $(tail -n 1 "$GIT_ERR" 2>/dev/null)" ;;
+  esac
+}
+
+# The installed version built from REF (a complete one; the active version wins), empty when there is none.
+recorded_version() {
+  if [ -f "$DATA/current/.complete" ] && [ "$(cat "$DATA/current/.ref" 2>/dev/null)" = "$1" ]; then
+    basename "$(readlink "$DATA/current")"
+    return 0
+  fi
+  found=""
+  for d in "$DATA"/versions/*; do
+    [ -f "$d/.complete" ] && [ "$(cat "$d/.ref" 2>/dev/null)" = "$1" ] && found=$(basename "$d")
+  done
+  printf '%s' "$found"
+}
+
+installed_ref() { # the ref the active version was built from, if it was recorded
+  if [ -f "$DATA/current/.ref" ]; then cat "$DATA/current/.ref"; fi
+  return 0
+}
+
+pick_default_ref() { # sets REF: the latest tag on the remote, else Main; offline, the ref of the active version
+  if REF=$(default_ref); then return 0; fi
+  REF=$(installed_ref)
+  if [ -z "$REF" ]; then
+    die "could not reach $GIT_URL to find the latest version: $(git_error_hint "$(git_error_reason)"). Pass --ref to choose one"
+  fi
+  log "could not reach $GIT_URL for the latest version: keeping the installed $REF"
 }
 
 # ---- source ----------------------------------------------------------------
@@ -415,14 +490,34 @@ acquire_source() {
     fi
   else
     [ -n "$GIT_URL" ] || GIT_URL=$DEFAULT_URL
-    [ -n "$REF" ] || REF=$(default_ref)
+    GIT_ERR=$(mktemp "${TMPDIR:-/tmp}/k3code-giterr.XXXXXX")
+    if [ -z "$REF" ]; then pick_default_ref; fi
+    # A tag never moves, so a complete install of it needs no network at all (this works offline).
+    case "$REF" in
+      v[0-9]*)
+        VER=$(recorded_version "$REF")
+        if [ -n "$VER" ]; then
+          VERDIR=$DATA/versions/$VER
+          SRC_ROOT=""
+          return 0
+        fi
+        ;;
+    esac
     TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-src.XXXXXX")
     SRC_ROOT=$TMP/src
     mkdir "$SRC_ROOT"
     log "fetching $REF from $GIT_URL"
     git -c init.defaultBranch=main init -q "$SRC_ROOT"
-    git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" ||
-      die "could not fetch '$REF' from $GIT_URL. If the repo is private and git has no credentials: gh auth login && gh auth setup-git (or check --ref)"
+    if ! git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" 2>"$GIT_ERR"; then
+      msg="could not fetch '$REF' from $GIT_URL: $(git_error_hint "$(git_error_reason)")"
+      # A branch moves, so it is always fetched first; the installed build of it is the fallback when that fails.
+      VER=$(recorded_version "$REF")
+      if [ -z "$VER" ]; then die "$msg"; fi
+      log "$msg. Using the installed version $VER"
+      VERDIR=$DATA/versions/$VER
+      SRC_ROOT=""
+      return 0
+    fi
     git -C "$SRC_ROOT" checkout -q FETCH_HEAD
     SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD)
   fi
@@ -446,7 +541,7 @@ acquire_source() {
 build_tui() {
   if [ "${K3_SKIP_TUI:-0}" = 1 ]; then return 0; fi
   if [ "$NODE_OK" != 1 ]; then
-    log "TUI skipped: node 18+ with npm not found (k3code falls back to the line REPL)"
+    log "TUI skipped: node 20+ with npm not found (k3code falls back to the line REPL)"
     return 0
   fi
   log "building the TUI (npm ci; this takes a minute)"
@@ -509,7 +604,10 @@ install_version() {
   BUILDING=$VERDIR
   if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: a fake core command, no uv, no network
     mkdir -p "$VERDIR/venv/bin"
-    printf '#!/bin/sh\necho "k3code %s"\n' "$VER" >"$VERDIR/venv/bin/k3code"
+    # the stub answers --version, and fails on `doctor` so the tests show that presetup ignores the doctor's status
+    # shellcheck disable=SC2016 # the $1 belongs to the stub script, not to this shell
+    printf '#!/bin/sh\ncase "$1" in\ndoctor) echo "! browser: stub (K3_STUB_VENV) data=$K3CODE_DATA"; exit 1 ;;\n*) echo "k3code %s" ;;\nesac\n' "$VER" \
+      >"$VERDIR/venv/bin/k3code"
     chmod +x "$VERDIR/venv/bin/k3code"
   else
     "$UV" venv --quiet --python '>=3.12' "$VERDIR/venv" >&2 ||
@@ -530,6 +628,7 @@ install_version() {
     "$VERDIR/venv/bin/k3code" --version >&2 || die "the new version does not start (k3code --version failed); nothing was activated"
   fi
   if [ "$FROM" = source ]; then printf '%s\n' "$SOURCE_PATH" >"$DATA/source_path"; fi
+  if [ "$FROM" = git ]; then printf '%s\n' "$REF" >"$VERDIR/.ref"; fi
   printf '%s\n' "$VER" >"$VERDIR/.complete"
   BUILDING=""
   return 0
@@ -579,11 +678,125 @@ import_bundle() {
   "$BIN/k3code" import "$BUNDLE" --yes >&2 || die "import of $BUNDLE failed"
 }
 
+# ---- presetup ----------------------------------------------------------------
+# Optional extras after activation (--minimal skips them all). Never fails the install: each step runs in its own
+# `||` context, so a failing step is reported and the next one still runs. Every step is safe to re-run: it
+# writes a marker only when it did something, so a second run changes nothing.
+presetup() {
+  log "presetup (optional; --minimal skips it):"
+  presetup_step sandbox presetup_sandbox
+  presetup_step chromium presetup_chromium
+  presetup_step doctor presetup_doctor
+  return 0
+}
+
+presetup_step() { # presetup_step NAME FUNC
+  "$2" || log "presetup: $1 step did not finish; continuing"
+  return 0
+}
+
+# Same probe as k3code's sandbox.usable(): bwrap has to run a command inside its namespaces.
+bwrap_cmd() { printf '%s' "${K3_BWRAP:-bwrap}"; }
+bwrap_usable() {
+  b=$(command -v "$(bwrap_cmd)" 2>/dev/null) || return 1
+  if have timeout; then
+    timeout 10 "$b" --die-with-parent --unshare-pid --ro-bind / / --dev /dev --proc /proc /bin/true >/dev/null 2>&1
+  else
+    "$b" --die-with-parent --unshare-pid --ro-bind / / --dev /dev --proc /proc /bin/true >/dev/null 2>&1
+  fi
+}
+
+# Never runs sudo unattended: the install command is printed, and run only after a yes on a terminal.
+presetup_sandbox() {
+  if [ "$PLATFORM" != Linux ]; then return 0; fi
+  if bwrap_usable; then
+    log "presetup: sandbox ok (bubblewrap works here)"
+    return 0
+  fi
+  if have "$(bwrap_cmd)"; then
+    log "presetup: WARNING: bubblewrap is installed but cannot create a sandbox here (user namespaces blocked?)"
+    say "      unattended runs (auto, yolo, background) are not sandboxed until this is fixed"
+    return 0
+  fi
+  log "presetup: WARNING: bubblewrap is not installed; unattended runs (auto, yolo, background) are not sandboxed"
+  cmd=$(hint_cmd bwrap)
+  say "      install it:  $cmd"
+  case "$cmd" in
+    "sudo "*)
+      if ask_tty "Run that now? (sudo asks for your password)"; then
+        if sh -c "$cmd" </dev/tty >/dev/tty 2>&1 && bwrap_usable; then
+          log "presetup: sandbox ok (bubblewrap installed)"
+        else
+          log "presetup: bubblewrap still not usable; run the command above by hand"
+        fi
+      fi
+      ;;
+  esac
+  return 0
+}
+# Chromium for the browser tool: the headless shell only (about 115 MiB download plus ffmpeg, about 266 MB on disk).
+# The full browser would add about 196 MB. It lives under $DATA/browsers, outside versions/, so an update keeps it.
+PLAYWRIGHT_VERSION=1.63.0
+chromium_present() { # the marker from an earlier run and the browser it names are both still there
+  [ -f "$DATA/presetup/chromium-$PLAYWRIGHT_VERSION" ] || return 1
+  if [ "${K3_STUB_VENV:-0}" = 1 ]; then return 0; fi
+  # the Playwright package lives in the version's venv: a new version without it repeats only the cheap pip step
+  "$VERDIR/venv/bin/python" -c "import playwright" >/dev/null 2>&1 || return 1
+  for d in "$DATA"/browsers/chromium_headless_shell-*; do
+    [ -d "$d" ] && return 0
+  done
+  return 1
+}
+
+presetup_chromium() {
+  if [ "${K3CODE_SKIP_CHROMIUM:-0}" = 1 ]; then
+    log "presetup: Chromium skipped (K3CODE_SKIP_CHROMIUM=1)"
+    return 0
+  fi
+  if chromium_present; then
+    log "presetup: Chromium already installed in $DATA/browsers"
+    return 0
+  fi
+  if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: nothing is downloaded; the marker records the decision
+    mkdir -p "$DATA/presetup"
+    printf 'stub\n' >"$DATA/presetup/chromium-$PLAYWRIGHT_VERSION"
+    log "presetup: Chromium stub (K3_STUB_VENV)"
+    return 0
+  fi
+  if [ "$NO_DEPS" = 1 ]; then
+    log "presetup: Chromium not installed (--no-install-deps; it downloads about 115 MiB)"
+    return 0
+  fi
+  log "presetup: installing Chromium for the browser tool (about 115 MiB download; K3CODE_SKIP_CHROMIUM=1 skips it)"
+  if ! "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" "playwright==$PLAYWRIGHT_VERSION" >&2; then
+    log "presetup: WARNING: could not install Playwright; the browser tool stays off"
+    return 0
+  fi
+  if ! PLAYWRIGHT_BROWSERS_PATH="$DATA/browsers" "$VERDIR/venv/bin/python" -m playwright install --only-shell chromium >&2; then
+    log "presetup: WARNING: Chromium did not install (output above); run the installer again to retry"
+    return 0
+  fi
+  mkdir -p "$DATA/presetup"
+  printf '%s\n' "$PLAYWRIGHT_VERSION" >"$DATA/presetup/chromium-$PLAYWRIGHT_VERSION"
+  log "presetup: Chromium installed in $DATA/browsers"
+  return 0
+}
+presetup_doctor() {
+  if [ ! -x "$BIN/k3code" ]; then
+    log "presetup: health subset skipped (k3code is not linked)"
+    return 0
+  fi
+  log "presetup: health subset (warnings only; 'k3code doctor' gives the full report)"
+  out=$(K3CODE_DATA="$DATA" "$BIN/k3code" doctor --install 2>/dev/null) || true
+  if [ -n "$out" ]; then say "$out"; fi
+  return 0
+}
+
 # ---- main ------------------------------------------------------------------
 main() {
   export GIT_TERMINAL_PROMPT=0
   FROM="" GIT_URL="" REF="" CHANNEL=stable WANT_VERSION="" PREFIX="$HOME/.local" BUNDLE=""
-  NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0
+  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0 PRESETUP=1
   if [ "${K3_NO_DOWNLOAD:-0}" = 1 ]; then NO_DEPS=1; fi
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -625,8 +838,9 @@ main() {
         BUNDLE=$2
         shift
         ;;
-      --yes | -y) ;; # older callers; nothing is asked any more
+      --yes | -y) YES=1 ;; # older callers; nothing is asked, and presetup never prompts for sudo
       --no-install-deps) NO_DEPS=1 ;;
+      --minimal) PRESETUP=0 ;;
       --check) CHECK=1 ;;
       --no-activate) ACTIVATE=0 ;;
       --print-version) PRINT_VERSION=1 ;;
@@ -683,6 +897,7 @@ main() {
   fi
   if [ "$ACTIVATE" != 1 ]; then exit 0; fi
   if [ -n "$BUNDLE" ]; then import_bundle; fi
+  if [ "$PRESETUP" = 1 ]; then presetup || log "presetup did not finish; k3code is installed and works without it"; fi
   case ":$PATH:" in
     *":$BIN:"*) ;;
     *)

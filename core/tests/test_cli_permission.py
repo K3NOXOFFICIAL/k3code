@@ -23,8 +23,14 @@ def seen(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return modes
 
 
-def invoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str, *args: str,
-           command: object = cli_mod.main, prompt: bool = True) -> Result:
+def invoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config: str,
+    *args: str,
+    command: object = cli_mod.main,
+    prompt: bool = True,
+) -> Result:
     """Run the CLI with its own home and cwd, so the developer's shell env and project config cannot leak in."""
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
@@ -36,8 +42,9 @@ def invoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str, *args: 
     return CliRunner().invoke(command, ["-p", "hi", *args] if prompt else list(args))  # type: ignore[arg-type]
 
 
-def run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str, *args: str,
-        command: object = cli_mod.main) -> None:
+def run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str, *args: str, command: object = cli_mod.main
+) -> None:
     res = invoke(tmp_path, monkeypatch, config, *args, command=command)
     assert res.exit_code == 0, res.output
 
@@ -76,22 +83,29 @@ def test_modes_outside_the_three_named_ones_still_apply(tmp_path, monkeypatch, s
 
 def test_unknown_config_permission_is_a_usage_error_not_a_traceback(tmp_path, monkeypatch, seen):
     res = invoke(tmp_path, monkeypatch, PROV + "permission_mode: bypass\n")
-    assert_usage_error(res, "permission_mode 'bypass' is not one of: ask, auto-edit, yolo "
-                            "(set in config.yaml or K3CODE_PERMISSION_MODE)")
+    assert_usage_error(
+        res,
+        "permission_mode 'bypass' is not one of: ask, auto-edit, yolo (set in config.yaml or K3CODE_PERMISSION_MODE)",
+    )
     assert seen == []
 
 
 def test_unknown_headless_permission_names_its_own_key(tmp_path, monkeypatch, seen):
     res = invoke(tmp_path, monkeypatch, PROV + "headless_permission: bypass\n")
-    assert_usage_error(res, "headless_permission 'bypass' is not one of: ask, auto-edit, yolo "
-                            "(set in config.yaml or K3CODE_HEADLESS_PERMISSION)")
+    assert_usage_error(
+        res,
+        "headless_permission 'bypass' is not one of: ask, auto-edit, yolo "
+        "(set in config.yaml or K3CODE_HEADLESS_PERMISSION)",
+    )
     assert seen == []
 
 
 def test_unknown_config_permission_fails_the_repl_path_too(tmp_path, monkeypatch, seen):
     res = invoke(tmp_path, monkeypatch, PROV + "permission_mode: bypass\n", prompt=False)
-    assert_usage_error(res, "permission_mode 'bypass' is not one of: ask, auto-edit, yolo "
-                            "(set in config.yaml or K3CODE_PERMISSION_MODE)")
+    assert_usage_error(
+        res,
+        "permission_mode 'bypass' is not one of: ask, auto-edit, yolo (set in config.yaml or K3CODE_PERMISSION_MODE)",
+    )
 
 
 def test_group_entry_applies_config_permission_mode(tmp_path, monkeypatch, seen):
@@ -116,11 +130,13 @@ async def test_bad_configured_permission_mode_fails_session_start_not_the_daemon
     from m1cmd_helpers import frames_of, make_server
 
     server, _ = make_server(tmp_path, monkeypatch, ["ok"], permission_mode="bypass")
-    await server._handle_line(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session.create",
-                                          "params": {"cwd": str(tmp_path)}}))
+    await server._handle_line(
+        json.dumps({"jsonrpc": "2.0", "id": 1, "method": "session.create", "params": {"cwd": str(tmp_path)}})
+    )
     reply = next(f for f in frames_of(server) if f.get("id") == 1)
     assert reply["error"]["message"].startswith(
-        "InvalidPermissionMode: permission_mode 'bypass' is not one of: ask, auto-edit, yolo"), reply
+        "InvalidPermissionMode: permission_mode 'bypass' is not one of: ask, auto-edit, yolo"
+    ), reply
     await server._handle_line(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session.list", "params": {}}))
     assert any(f.get("id") == 2 and "result" in f for f in frames_of(server))
     await server.close()

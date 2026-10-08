@@ -1,10 +1,10 @@
-import { EventEmitter } from 'events'
+import { EventEmitter } from "events";
 
-import { renderSync } from '@k3code/ink'
-import React, { useState } from 'react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { renderSync } from "@k3code/ink";
+import React, { useState } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { TextInput } from '../components/textInput.js'
+import { TextInput } from "../components/textInput.js";
 
 // End-to-end regression coverage for Vietnamese Telex IME recomposition
 // (OpenKey / Unikey / EVKey). These IMEs commit a finished syllable by
@@ -21,49 +21,60 @@ import { TextInput } from '../components/textInput.js'
 //      instead of through the 16ms key-burst path that raced re-renders.
 
 class FakeTty extends EventEmitter {
-  chunks: string[] = []
-  columns = 80
-  rows = 24
-  isTTY = true
-  isRaw = false
-  private pendingReads: string[] = []
+  chunks: string[] = [];
+  columns = 80;
+  rows = 24;
+  isTTY = true;
+  isRaw = false;
+  private pendingReads: string[] = [];
   ref(): void {}
   unref(): void {}
   read(): string | null {
-    return this.pendingReads.shift() ?? null
+    return this.pendingReads.shift() ?? null;
   }
   send(chunk: string): void {
-    this.pendingReads.push(chunk)
-    this.emit('readable')
+    this.pendingReads.push(chunk);
+    this.emit("readable");
   }
   setEncoding(): this {
-    return this
+    return this;
   }
   setRawMode(mode: boolean): this {
-    this.isRaw = mode
+    this.isRaw = mode;
 
-    return this
+    return this;
   }
-  write(chunk: string | Uint8Array, cb?: (err?: Error | null) => void): boolean {
-    this.chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'))
-    cb?.()
+  write(
+    chunk: string | Uint8Array,
+    cb?: (err?: Error | null) => void,
+  ): boolean {
+    this.chunks.push(
+      typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"),
+    );
+    cb?.();
 
-    return true
+    return true;
   }
 }
 
-const tick = () => new Promise<void>(resolve => setImmediate(resolve))
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-function Harness({ initial = '', onValue }: { initial?: string; onValue: (value: string) => void }) {
-  const [value, setValue] = useState(initial)
+function Harness({
+  initial = "",
+  onValue,
+}: {
+  initial?: string;
+  onValue: (value: string) => void;
+}) {
+  const [value, setValue] = useState(initial);
 
   return React.createElement(TextInput, {
     onChange: (next: string) => {
-      setValue(next)
-      onValue(next)
+      setValue(next);
+      onValue(next);
     },
-    value
-  })
+    value,
+  });
 }
 
 // Core driver: feeds reads, optionally advancing fake timers between reads to
@@ -72,32 +83,35 @@ function Harness({ initial = '', onValue }: { initial?: string; onValue: (value:
 // wait) so a passing assertion proves the commit was synchronous, not deferred.
 async function drive(
   reads: string[],
-  { initial = '', gapMs = 0 }: { initial?: string; gapMs?: number } = {}
+  { initial = "", gapMs = 0 }: { initial?: string; gapMs?: number } = {},
 ): Promise<string> {
-  const stdout = new FakeTty()
-  const stdin = new FakeTty()
-  const stderr = new FakeTty()
-  const values: string[] = []
+  const stdout = new FakeTty();
+  const stdin = new FakeTty();
+  const stderr = new FakeTty();
+  const values: string[] = [];
 
-  const instance = renderSync(React.createElement(Harness, { initial, onValue: v => values.push(v) }), {
-    patchConsole: false,
-    stderr: stderr as unknown as NodeJS.WriteStream,
-    stdin: stdin as unknown as NodeJS.ReadStream,
-    stdout: stdout as unknown as NodeJS.WriteStream
-  })
+  const instance = renderSync(
+    React.createElement(Harness, { initial, onValue: (v) => values.push(v) }),
+    {
+      patchConsole: false,
+      stderr: stderr as unknown as NodeJS.WriteStream,
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream,
+    },
+  );
 
   try {
-    await tick()
+    await tick();
 
     for (const r of reads) {
-      stdin.send(r)
-      await tick()
+      stdin.send(r);
+      await tick();
 
       if (gapMs) {
         // Advance the fake clock to flush any pending FRAME_BATCH_MS timers
         // between reads (mirrors the real macrotask gap), then let microtasks run.
-        vi.advanceTimersByTime(gapMs)
-        await tick()
+        vi.advanceTimersByTime(gapMs);
+        await tick();
       }
     }
 
@@ -107,155 +121,170 @@ async function drive(
     // synchronously; the old deferred path (scheduleKeyBurstCommit, 16ms)
     // has NOT flushed yet, so a stale/dropped tail would still be visible.
 
-    return values.at(-1) ?? ''
+    return values.at(-1) ?? "";
   } finally {
-    instance.unmount()
-    instance.cleanup()
+    instance.unmount();
+    instance.cleanup();
   }
 }
 
-const NNBSP = '\u202f'
+const NNBSP = "\u202f";
 
-describe('Vietnamese Telex IME recomposition', () => {
+describe("Vietnamese Telex IME recomposition", () => {
   beforeEach(() => {
     // Only fake setTimeout/setInterval/Date — NOT setImmediate (used by tick()).
-    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'Date'] })
-  })
+    vi.useFakeTimers({ toFake: ["setTimeout", "setInterval", "Date"] });
+  });
 
   afterEach(() => {
-    vi.useRealTimers()
-  })
+    vi.useRealTimers();
+  });
 
-  it('applies a parser-split backspace plus composed character through useInput', async () => {
+  it("applies a parser-split backspace plus composed character through useInput", async () => {
     // OpenKey fuses the erase + recomposed glyph into a single stdin read.
-    expect(await drive(['\x7fô'], { initial: 'o' })).toBe('ô')
-  })
+    expect(await drive(["\x7fô"], { initial: "o" })).toBe("ô");
+  });
 
-  it('commits a multi-character recompose synchronously (no dropped tail)', async () => {
+  it("commits a multi-character recompose synchronously (no dropped tail)", async () => {
     // "hanhj" -> a U+202F marker, four backspaces, then the recomposed "ạnh".
     // Only a single microtask after the last read — the sync commit must have
     // already delivered the final value (the deferred path dropped "nh" here).
-    const reads = ['h', 'a', 'n', 'h', NNBSP, '\x7f\x7f', '\x7f\x7f', '\u1EA1nh']
+    const reads = [
+      "h",
+      "a",
+      "n",
+      "h",
+      NNBSP,
+      "\x7f\x7f",
+      "\x7f\x7f",
+      "\u1EA1nh",
+    ];
 
     // No gapMs, no advanceTimersMs — we assert BEFORE the 16ms FRAME_BATCH_MS could fire.
-    expect(await drive(reads)).toBe('h\u1EA1nh')
-  })
+    expect(await drive(reads)).toBe("h\u1EA1nh");
+  });
 
   it('reproduces the full phrase "vương sỹ hạnh" from a real OpenKey capture', async () => {
     // Captured byte stream for Telex "vuonwg syx hanhj": each syllable injects a
     // U+202F marker, erases, and re-emits. Verified across read timings.
     const reads = [
-      'v',
-      'u',
-      'o',
+      "v",
+      "u",
+      "o",
       NNBSP,
-      '\x7f\x7f',
-      '\x7f\u01B0\u01A1',
-      'n',
-      'g',
-      ' ',
-      's',
-      'y',
+      "\x7f\x7f",
+      "\x7f\u01B0\u01A1",
+      "n",
+      "g",
+      " ",
+      "s",
+      "y",
       NNBSP,
-      '\x7f',
-      '\x7f\u1EF9',
-      ' ',
-      'h',
-      'a',
-      'n',
-      'h',
+      "\x7f",
+      "\x7f\u1EF9",
+      " ",
+      "h",
+      "a",
+      "n",
+      "h",
       NNBSP,
-      '\x7f\x7f\x7f\x7f\u1EA1nh'
-    ]
+      "\x7f\x7f\x7f\x7f\u1EA1nh",
+    ];
 
     for (const gapMs of [0, 17, 25]) {
-      expect(await drive(reads, { gapMs })).toBe('vương sỹ hạnh')
+      expect(await drive(reads, { gapMs })).toBe("vương sỹ hạnh");
     }
-  })
+  });
 
   it('handles the EVKey capture (clean backspaces, no marker) for "hạnh"', async () => {
     // EVKey emits three clean backspaces and no U+202F; must also yield "hạnh".
-    const reads = ['h', 'a', 'n', 'h', '\x7f', '\x7f', '\x7f', '\u1EA1nh']
+    const reads = ["h", "a", "n", "h", "\x7f", "\x7f", "\x7f", "\u1EA1nh"];
 
-    expect(await drive(reads)).toBe('h\u1EA1nh')
-  })
-})
+    expect(await drive(reads)).toBe("h\u1EA1nh");
+  });
+});
 
-describe('Fast-echo suppression reset (60ms window)', () => {
+describe("Fast-echo suppression reset (60ms window)", () => {
   beforeEach(() => {
     // Only fake setTimeout/setInterval/Date — NOT setImmediate (used by tick()).
-    vi.useFakeTimers({ toFake: ['setTimeout', 'setInterval', 'Date'] })
-  })
+    vi.useFakeTimers({ toFake: ["setTimeout", "setInterval", "Date"] });
+  });
 
   afterEach(() => {
-    vi.useRealTimers()
-  })
+    vi.useRealTimers();
+  });
 
-  it('suppresses fast-echo backspace for one keystroke after an Ink repaint (IME recompose)', async () => {
+  it("suppresses fast-echo backspace for one keystroke after an Ink repaint (IME recompose)", async () => {
     // Simulate: user types "ha" -> Ink commits normally -> then IME recompose arrives
     // as NNBSP + backspaces + recomposed text. The first backspace after the Ink
     // repaint must NOT fast-echo (would strand the NNBSP marker as a stray space).
 
     // Type "ha" normally (each char goes through fast-echo append path)
-    let reads = ['h', 'a']
-    const stdout1 = new FakeTty()
-    const stdin1 = new FakeTty()
-    const stderr1 = new FakeTty()
-    const values1: string[] = []
+    const reads = ["h", "a"];
+    const stdout1 = new FakeTty();
+    const stdin1 = new FakeTty();
+    const stderr1 = new FakeTty();
+    const values1: string[] = [];
 
-    const instance1 = renderSync(React.createElement(Harness, { initial: '', onValue: v => values1.push(v) }), {
-      patchConsole: false,
-      stderr: stderr1 as unknown as NodeJS.WriteStream,
-      stdin: stdin1 as unknown as NodeJS.ReadStream,
-      stdout: stdout1 as unknown as NodeJS.WriteStream
-    })
+    const instance1 = renderSync(
+      React.createElement(Harness, {
+        initial: "",
+        onValue: (v) => values1.push(v),
+      }),
+      {
+        patchConsole: false,
+        stderr: stderr1 as unknown as NodeJS.WriteStream,
+        stdin: stdin1 as unknown as NodeJS.ReadStream,
+        stdout: stdout1 as unknown as NodeJS.WriteStream,
+      },
+    );
 
     try {
-      await tick()
+      await tick();
 
       for (const r of reads) {
-        stdin1.send(r)
-        await tick()
+        stdin1.send(r);
+        await tick();
       }
 
       // After "ha", fast-echo is enabled (inkRepaintedRef.current = false)
-      expect(values1.at(-1)).toBe('ha')
+      expect(values1.at(-1)).toBe("ha");
 
       // Now simulate an IME recompose burst that forces an Ink repaint:
       // NNBSP marker forces a full Ink render (syncParent=true in commit).
       // The next backspace should be SUPPRESSED (fast-echo backspace disabled).
-      stdin1.send(NNBSP + '\x7f\x7f\u1EA1nh') // fused chunk: marker + 2x backspace + "ạnh"
-      await tick()
+      stdin1.send(NNBSP + "\x7f\x7f\u1EA1nh"); // fused chunk: marker + 2x backspace + "ạnh"
+      await tick();
 
       // The recomposed value must be committed synchronously (no dropped tail).
       // The first backspace after the Ink repaint must NOT have written "\b \b" to stdout.
       // We can't directly inspect stdout here, but we verify the FINAL value is correct.
-      expect(values1.at(-1)).toBe('h\u1EA1nh')
+      expect(values1.at(-1)).toBe("h\u1EA1nh");
 
       // Advance fake timers past the 60ms suppression window so the
       // inkRepaintResetTimer fires and re-enables fast-echo backspace.
-      vi.advanceTimersByTime(60)
-      await tick()
+      vi.advanceTimersByTime(60);
+      await tick();
 
       // Now fast-echo backspace is RE-ENABLED. One backspace deletes exactly
       // one grapheme ("h") off the end of "hạnh" -> "hạn".
-      stdin1.send('\x7f')
-      await tick()
+      stdin1.send("\x7f");
+      await tick();
 
-      expect(values1.at(-1)).toBe('h\u1EA1n')
+      expect(values1.at(-1)).toBe("h\u1EA1n");
     } finally {
-      instance1.unmount()
-      instance1.cleanup()
+      instance1.unmount();
+      instance1.cleanup();
     }
-  })
+  });
 
-  it('does NOT suppress fast-echo backspace when no Ink repaint occurred (normal typing)', async () => {
+  it("does NOT suppress fast-echo backspace when no Ink repaint occurred (normal typing)", async () => {
     // Normal ASCII typing never triggers the Ink-repaint suppression.
-    const reads = ['h', 'e', 'l', 'l', 'o']
-    expect(await drive(reads)).toBe('hello')
+    const reads = ["h", "e", "l", "l", "o"];
+    expect(await drive(reads)).toBe("hello");
 
     // Two backspaces off "hello" -> "hel" via the fast-echo path.
-    const reads2 = [...reads, '\x7f', '\x7f']
-    expect(await drive(reads2)).toBe('hel')
-  })
-})
+    const reads2 = [...reads, "\x7f", "\x7f"];
+    expect(await drive(reads2)).toBe("hel");
+  });
+});

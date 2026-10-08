@@ -3,6 +3,7 @@
 
 Run: scripts/exit/m4_autonomy.py  (re-execs under `uv run --project core` when k3code is not importable).
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -112,8 +113,10 @@ def scope_blind() -> None:
         return
     hit, misses, errors, matrix = _score_scope(rows)
     scored = len(rows) - len(errors)
-    print(f"scope blind ({BACKEND['label']}): agreement {hit}/{scored} = {100 * hit / max(scored, 1):.0f}%"
-          f" (errors: {len(errors)})\nmisses: {'; '.join(misses) or 'none'}\n{_fmt_matrix(matrix)}")
+    print(
+        f"scope blind ({BACKEND['label']}): agreement {hit}/{scored} = {100 * hit / max(scored, 1):.0f}%"
+        f" (errors: {len(errors)})\nmisses: {'; '.join(misses) or 'none'}\n{_fmt_matrix(matrix)}"
+    )
 
 
 # ---------------------------------------------------------------- 1. scope eval
@@ -126,29 +129,40 @@ def scope_eval() -> None:
     dist = {s: sum(r["scope"] == s for r in rows) for s in SCOPES}
     how = "scripts/exit/scope_eval.jsonl (30 labels, proposed-by-claude) through the product's scope classifier prompt"
     if not LIVE_OK:
-        emit(M, crit, how, "PENDING",
-             f"eval set written and validated (30 rows, label dist {dist}); live classifier not run: {LIVE_DETAIL}",
-             f"the owner confirms/edits the labels in scope_eval.jsonl, then re-run scripts/exit/m4_autonomy.py {RESET}")
+        emit(
+            M,
+            crit,
+            how,
+            "PENDING",
+            f"eval set written and validated (30 rows, label dist {dist}); live classifier not run: {LIVE_DETAIL}",
+            f"the owner confirms/edits the labels in scope_eval.jsonl, then re-run scripts/exit/m4_autonomy.py {RESET}",
+        )
         return
     hit, misses, errors, matrix = _score_scope(rows)
     scored = len(rows) - len(errors)
     pct = 100 * hit / max(scored, 1)
-    ev = (f"agreement {hit}/{scored} = {pct:.0f}% (target >=80%); misses: {'; '.join(misses) or 'none'}\n"
-          + _fmt_matrix(matrix)
-          + (f"; provider errors on {len(errors)} rows: {'; '.join(errors[:3])}" if errors else ""))
+    ev = (
+        f"agreement {hit}/{scored} = {pct:.0f}% (target >=80%); misses: {'; '.join(misses) or 'none'}\n"
+        + _fmt_matrix(matrix)
+        + (f"; provider errors on {len(errors)} rows: {'; '.join(errors[:3])}" if errors else "")
+    )
     how_live = f"{how} (live: {BACKEND['label']})"
     if errors:
-        emit(M, crit, how_live, "PENDING", "incomplete live run: " + ev,
-             f"re-run scripts/exit/m4_autonomy.py {RESET}")
+        emit(M, crit, how_live, "PENDING", "incomplete live run: " + ev, f"re-run scripts/exit/m4_autonomy.py {RESET}")
     elif pct < 80:
         emit(M, crit, how_live, "FAIL", ev)
     else:
         # The labels were proposed by Claude and a Claude classifier agreeing with them is circular until the owner
         # confirms them, so a good score stays PENDING.
-        emit(M, crit, how_live, "PENDING",
-             ev + ". Provisional PASS: the labels in scope_eval.jsonl are proposed-by-claude and not yet confirmed.",
-             "the owner confirms/edits the 30 labels in scripts/exit/scope_eval.jsonl; then re-run "
-             "scripts/exit/m4_autonomy.py and this row counts")
+        emit(
+            M,
+            crit,
+            how_live,
+            "PENDING",
+            ev + ". Provisional PASS: the labels in scope_eval.jsonl are proposed-by-claude and not yet confirmed.",
+            "the owner confirms/edits the 30 labels in scripts/exit/scope_eval.jsonl; then re-run "
+            "scripts/exit/m4_autonomy.py and this row counts",
+        )
 
 
 # ---------------------------------------------------------------- 2. HUGE fan-out
@@ -163,9 +177,15 @@ def fanout() -> None:
     ok = bool(m) and rc == 0 and m.group(1) == m.group(2) and int(m.group(1)) >= 3 and m.group(3) == "pass"
     ok = ok and "Final tests\npass" in out and {"f1.txt", "f2.txt", "f3.txt"} <= set(files.split(","))
     ev = f"rc={rc}; {m.group(0) if m else 'no fanout.done line'}; files in merged repo: {files}\n" + tail(
-        "\n".join(ln for ln in out.splitlines() if "merged" in ln or "Final tests" in ln or "Budget" in ln), 4)
-    emit(M, crit, "cd core && uv run python scripts/demo_ultracode.py (fake provider, 3 parallel worktree workers)",
-         "PASS" if ok else "FAIL", ev)
+        "\n".join(ln for ln in out.splitlines() if "merged" in ln or "Final tests" in ln or "Budget" in ln), 4
+    )
+    emit(
+        M,
+        crit,
+        "cd core && uv run python scripts/demo_ultracode.py (fake provider, 3 parallel worktree workers)",
+        "PASS" if ok else "FAIL",
+        ev,
+    )
 
 
 # ---------------------------------------------------------------- 3. /stats tiers
@@ -188,13 +208,18 @@ def stats_tiers() -> None:
 
     async def go() -> str:
         d = sub("stats")
-        server = make(d, MP(), [{"type": "text", "text": "ok"}, {"type": "usage", "prompt_tokens": 100,
-                                                                   "completion_tokens": 10}], mode="auto")
+        server = make(
+            d,
+            MP(),
+            [{"type": "text", "text": "ok"}, {"type": "usage", "prompt_tokens": 100, "completion_tokens": 10}],
+            mode="auto",
+        )
         clock = FakeClock()
         eng = AutomationEngine(server, clock=clock, wait_online=noop)
         server.automation = eng
         await eng.start()
         sid = await new_session(server, d)
+
         def ncalls() -> int:
             return sum(len(p.log) for p in server.providers)
 
@@ -216,8 +241,9 @@ def stats_tiers() -> None:
         await eng.stop()
         want = {"background_turn", "cron_job", "loop_tick"}
         kinds = set(row["by_kind"])
-        calls = server.usage._db.execute("SELECT task_kind, tier, count(*) FROM events WHERE kind='call' "
-                                         "GROUP BY 1,2").fetchall()
+        calls = server.usage._db.execute(
+            "SELECT task_kind, tier, count(*) FROM events WHERE kind='call' GROUP BY 1,2"
+        ).fetchall()
         tiers = {k: t for k, t, _ in calls}
         if not (want <= kinds and all(tiers.get(k) == "cheap" for k in want) and "cheap" in out):
             raise AssertionError(f"kinds={kinds} tiers={tiers}\n{out}")
@@ -225,16 +251,26 @@ def stats_tiers() -> None:
 
     try:
         ev = asyncio.run(go())
-        emit(M, crit, "gateway + AutomationEngine + fake provider: /bg, /schedule add (fake clock), /loop, then /stats",
-             "PASS", ev)
+        emit(
+            M,
+            crit,
+            "gateway + AutomationEngine + fake provider: /bg, /schedule add (fake clock), /loop, then /stats",
+            "PASS",
+            ev,
+        )
     except Exception:  # noqa: BLE001
         import traceback
+
         emit(M, crit, "gateway + AutomationEngine + fake provider", "FAIL", traceback.format_exc())
 
 
 # ---------------------------------------------------------------- 4. degradation cost
 PRICES = {  # USD per 1M tokens (in, out): illustrative, labelled as such in the evidence
-    "cheap": (0.15, 0.60), "fast": (0.10, 0.40), "main": (3.0, 15.0), "strong": (15.0, 75.0)}
+    "cheap": (0.15, 0.60),
+    "fast": (0.10, 0.40),
+    "main": (3.0, 15.0),
+    "strong": (15.0, 75.0),
+}
 
 
 def degradation() -> None:
@@ -243,11 +279,25 @@ def degradation() -> None:
 
     from test_autonomy_gateway import call, make, run_turn
 
-    verdict = {"type": "text", "match": "You classify a coding task", "text": _j.dumps(
-        {"scope": "trivial", "needs_plan": False, "risk": "low", "parallelizable": False,
-         "suggested_subtasks": [], "reason": "tiny"})}
-    steps = [verdict, {"type": "text", "text": "DONE"}, {"type": "usage", "prompt_tokens": 1000,
-                                                          "completion_tokens": 200}]
+    verdict = {
+        "type": "text",
+        "match": "You classify a coding task",
+        "text": _j.dumps(
+            {
+                "scope": "trivial",
+                "needs_plan": False,
+                "risk": "low",
+                "parallelizable": False,
+                "suggested_subtasks": [],
+                "reason": "tiny",
+            }
+        ),
+    }
+    steps = [
+        verdict,
+        {"type": "text", "text": "DONE"},
+        {"type": "usage", "prompt_tokens": 1000, "completion_tokens": 200},
+    ]
     n_inter, n_bg = 5, 5
 
     async def workload(name: str, **cfg) -> dict:
@@ -282,43 +332,83 @@ def degradation() -> None:
     for t in PRICES:
         if t in base["by_tier"] or t in deg["by_tier"]:
             table.append(f"{t:<6} {PRICES[t]!s:<18} {base['by_tier'].get(t, '-')!s:<28} {deg['by_tier'].get(t, '-')}")
-    ev = (f"workload: {n_inter} interactive tasks (scope-gate classification + execution) + {n_bg} unattended "
-          f"background turns, 1000/200 tokens per call. pass {base['pass']}/{base['tasks']} baseline vs "
-          f"{deg['pass']}/{deg['tasks']} degraded. cost baseline(all main) ${base['cost']:.5f} vs degraded "
-          f"${deg['cost']:.5f} = {cut:.0f}% cut (prices illustrative)\n" + "\n".join(table))
+    ev = (
+        f"workload: {n_inter} interactive tasks (scope-gate classification + execution) + {n_bg} unattended "
+        f"background turns, 1000/200 tokens per call. pass {base['pass']}/{base['tasks']} baseline vs "
+        f"{deg['pass']}/{deg['tasks']} degraded. cost baseline(all main) ${base['cost']:.5f} vs degraded "
+        f"${deg['cost']:.5f} = {cut:.0f}% cut (prices illustrative)\n" + "\n".join(table)
+    )
     status = "PASS" if cut >= 30 and same else "FAIL"
-    emit(M, crit + " (fake provider)", "same scripted workload twice via gateway: task_tiers all-main vs default "
-         "tier policy; cost = usage.db tokens x illustrative price table", status, ev)
+    emit(
+        M,
+        crit + " (fake provider)",
+        "same scripted workload twice via gateway: task_tiers all-main vs default "
+        "tier policy; cost = usage.db tokens x illustrative price table",
+        status,
+        ev,
+    )
     if LIVE_OK and BACKEND["kind"] == "claude-cli":
         return  # degradation_live() emits the live row
-    emit(M, crit + " (live comparison with real models)", "needs real model quality at both tiers", "PENDING",
-         "fake comparison only proves routing/accounting; "
-         "same-pass-rate on real tasks is untested: " + LIVE_DETAIL[:160],
-         f"run a real task benchmark twice (task_tiers all-main vs default) {RESET}, compare pass rate and /stats cost")
+    emit(
+        M,
+        crit + " (live comparison with real models)",
+        "needs real model quality at both tiers",
+        "PENDING",
+        "fake comparison only proves routing/accounting; "
+        "same-pass-rate on real tasks is untested: " + LIVE_DETAIL[:160],
+        f"run a real task benchmark twice (task_tiers all-main vs default) {RESET}, compare pass rate and /stats cost",
+    )
 
 
 LIVE_TASKS = [  # (background?, prompt, check(dir) -> bool); every task is tiny and mechanically checkable
     (False, "Create sq.py that prints the square of 7, then run it with bash.", lambda d: _py(d, "sq.py") == "49"),
-    (False, "Create rev.py that prints the reverse of the string 'abc' (use slicing), then run it with bash.",
-     lambda d: _py(d, "rev.py") == "cba"),
-    (False, "Create fizz.py that prints FizzBuzz for 1 to 15, one item per line, then run it with bash.",
-     lambda d: _py(d, "fizz.py").splitlines()[-1:] == ["FizzBuzz"] and _py(d, "fizz.py").splitlines()[2] == "Fizz"),
-    (False, "Create wc.py that prints the number of words in the string 'one two three four', then run it with bash.",
-     lambda d: _py(d, "wc.py") == "4"),
+    (
+        False,
+        "Create rev.py that prints the reverse of the string 'abc' (use slicing), then run it with bash.",
+        lambda d: _py(d, "rev.py") == "cba",
+    ),
+    (
+        False,
+        "Create fizz.py that prints FizzBuzz for 1 to 15, one item per line, then run it with bash.",
+        lambda d: _py(d, "fizz.py").splitlines()[-1:] == ["FizzBuzz"] and _py(d, "fizz.py").splitlines()[2] == "Fizz",
+    ),
+    (
+        False,
+        "Create wc.py that prints the number of words in the string 'one two three four', then run it with bash.",
+        lambda d: _py(d, "wc.py") == "4",
+    ),
     # "prints 6 factorial" does not fix the format: "720" and "6! = 720" are both right,
     # so the check looks for the value
-    (False, "Create fact.py that prints 6 factorial, then run it with bash.",
-     lambda d: "720" in _py(d, "fact.py").replace("=", " ").split()),
-    (True, "Create a.txt containing exactly the word alpha.",
-     lambda d: (d / "a.txt").exists() and (d / "a.txt").read_text().strip() == "alpha"),
-    (True, "Create nums.txt with the numbers 1 to 5, one per line.",
-     lambda d: (d / "nums.txt").exists() and (d / "nums.txt").read_text().split() == list("12345")),
-    (True, "Create upper.py that prints HELLO by upper-casing the string 'hello', then run it with bash.",
-     lambda d: _py(d, "upper.py") == "HELLO"),
-    (True, "Create sum.py that prints the sum of the integers 1 to 10, then run it with bash.",
-     lambda d: _py(d, "sum.py") == "55"),
-    (True, "Create ver.txt containing exactly the text v1.2.3.",
-     lambda d: (d / "ver.txt").exists() and (d / "ver.txt").read_text().strip() == "v1.2.3"),
+    (
+        False,
+        "Create fact.py that prints 6 factorial, then run it with bash.",
+        lambda d: "720" in _py(d, "fact.py").replace("=", " ").split(),
+    ),
+    (
+        True,
+        "Create a.txt containing exactly the word alpha.",
+        lambda d: (d / "a.txt").exists() and (d / "a.txt").read_text().strip() == "alpha",
+    ),
+    (
+        True,
+        "Create nums.txt with the numbers 1 to 5, one per line.",
+        lambda d: (d / "nums.txt").exists() and (d / "nums.txt").read_text().split() == list("12345"),
+    ),
+    (
+        True,
+        "Create upper.py that prints HELLO by upper-casing the string 'hello', then run it with bash.",
+        lambda d: _py(d, "upper.py") == "HELLO",
+    ),
+    (
+        True,
+        "Create sum.py that prints the sum of the integers 1 to 10, then run it with bash.",
+        lambda d: _py(d, "sum.py") == "55",
+    ),
+    (
+        True,
+        "Create ver.txt containing exactly the text v1.2.3.",
+        lambda d: (d / "ver.txt").exists() and (d / "ver.txt").read_text().strip() == "v1.2.3",
+    ),
 ]
 
 
@@ -341,10 +431,14 @@ def degradation_live() -> None:
         os.environ["K3CODE_HOME"] = str(d / "home")
         os.environ.pop("K3CODE_FAKE_PROVIDER", None)  # an earlier fake row's shim leaves it set
         provider = ProviderEntry(
-            name="claude-code", kind="claude-cli", models={"default": lib.LIVE_DEFAULT_MODEL},
-            tiers={"strong": lib.LIVE_DEFAULT_MODEL, "cheap": lib.LIVE_CHEAP_MODEL, "fast": lib.LIVE_CHEAP_MODEL})
-        server = GatewayServer(config=Settings(providers=[provider], permission_mode="auto", **cfg),
-                               store=SessionStore(d / "sessions.db"))
+            name="claude-code",
+            kind="claude-cli",
+            models={"default": lib.LIVE_DEFAULT_MODEL},
+            tiers={"strong": lib.LIVE_DEFAULT_MODEL, "cheap": lib.LIVE_CHEAP_MODEL, "fast": lib.LIVE_CHEAP_MODEL},
+        )
+        server = GatewayServer(
+            config=Settings(providers=[provider], permission_mode="auto", **cfg), store=SessionStore(d / "sessions.db")
+        )
         frames: list[str] = []
         server._write = frames.append  # type: ignore[method-assign]
         server._frames = frames  # type: ignore[attr-defined]
@@ -370,24 +464,40 @@ def degradation_live() -> None:
             else:
                 failed.append(f"#{i} check failed")
         agg = server.usage.aggregate("day")[0]
-        tiers = {t: (c["calls"], c["tokens_in"], c["tokens_out"], round(c.get("cost_usd", 0.0), 4))
-                 for t, c in agg["by_tier"].items()}
-        return {"cost": agg["cost_usd"] or 0.0, "pass": passed, "tasks": len(tasks), "by_tier": tiers,
-                "failed": failed, "calls": agg["calls"]}
+        tiers = {
+            t: (c["calls"], c["tokens_in"], c["tokens_out"], round(c.get("cost_usd", 0.0), 4))
+            for t, c in agg["by_tier"].items()
+        }
+        return {
+            "cost": agg["cost_usd"] or 0.0,
+            "pass": passed,
+            "tasks": len(tasks),
+            "by_tier": tiers,
+            "failed": failed,
+            "calls": agg["calls"],
+        }
 
     def merged(a: dict, b: dict) -> dict:
         tiers = {}
         for t in set(a["by_tier"]) | set(b["by_tier"]):
             x, y = a["by_tier"].get(t, (0, 0, 0, 0.0)), b["by_tier"].get(t, (0, 0, 0, 0.0))
             tiers[t] = tuple(round(p + q, 4) for p, q in zip(x, y, strict=True))
-        return {"cost": a["cost"] + b["cost"], "pass": a["pass"] + b["pass"], "tasks": a["tasks"] + b["tasks"],
-                "by_tier": tiers, "failed": [*a["failed"], *b["failed"]], "calls": a["calls"] + b["calls"]}
+        return {
+            "cost": a["cost"] + b["cost"],
+            "pass": a["pass"] + b["pass"],
+            "tasks": a["tasks"] + b["tasks"],
+            "by_tier": tiers,
+            "failed": [*a["failed"], *b["failed"]],
+            "calls": a["calls"] + b["calls"],
+        }
 
     async def go():
         # two runs of the 10 tasks per config: with ~5 % per-task noise one run cannot tell "same pass rate".
         # "no degradation" = every kind on main, and trivial interactive tasks not routed to the cheap tier either
-        base_cfg = {"task_tiers": {"classification": "main", "background_turn": "main"},
-                    "autonomy": {"degrade_trivial": False}}
+        base_cfg = {
+            "task_tiers": {"classification": "main", "background_turn": "main"},
+            "autonomy": {"degrade_trivial": False},
+        }
         base = merged(await workload("deg-live-base-1", **base_cfg), await workload("deg-live-base-2", **base_cfg))
         deg = merged(await workload("deg-live-on-1"), await workload("deg-live-on-2"))
         return base, deg
@@ -399,18 +509,26 @@ def degradation_live() -> None:
     table = ["tier   baseline(calls,tin,tout,list$)       degraded(calls,tin,tout,list$)"]
     for t in sorted(set(base["by_tier"]) | set(deg["by_tier"])):
         table.append(f"{t:<6} {base['by_tier'].get(t, '-')!s:<36} {deg['by_tier'].get(t, '-')}")
-    ev = "\n".join([  # exactly 6 lines: emit() keeps the last six
-        f"{base['tasks']} task runs per config (the same 10 small tasks twice: 5 interactive with scope gate, 5 "
-        f"unattended background) on {BACKEND['label']}",
-        f"pass {base['pass']}/{base['tasks']} baseline (all main) vs {deg['pass']}/{deg['tasks']} degraded; list-price "
-        f"cost ${base['cost']:.4f} vs ${deg['cost']:.4f} = {cut:.0f}% cut; calls {base['calls']} vs {deg['calls']}",
-        f"failed tasks: baseline {base['failed'] or 'none'}; degraded {deg['failed'] or 'none'}",
-        *table,
-    ])
+    ev = "\n".join(
+        [  # exactly 6 lines: emit() keeps the last six
+            f"{base['tasks']} task runs per config (the same 10 small tasks twice: 5 interactive with scope gate, 5 "
+            f"unattended background) on {BACKEND['label']}",
+            f"pass {base['pass']}/{base['tasks']} baseline (all main) "
+            f"vs {deg['pass']}/{deg['tasks']} degraded; list-price "
+            f"cost ${base['cost']:.4f} vs ${deg['cost']:.4f} = {cut:.0f}% cut; calls {base['calls']} vs {deg['calls']}",
+            f"failed tasks: baseline {base['failed'] or 'none'}; degraded {deg['failed'] or 'none'}",
+            *table,
+        ]
+    )
     status = "PASS" if cut >= 30 and same and base["pass"] >= base["tasks"] - 2 else "FAIL"
-    emit(M, crit + " (live comparison with real models)",
-         "same 10 real tasks twice via the gateway (task_tiers all-main vs default policy), pass = the produced "
-         "file/output is checked by the script; cost = usage.db cost_usd (provider-reported list price)", status, ev)
+    emit(
+        M,
+        crit + " (live comparison with real models)",
+        "same 10 real tasks twice via the gateway (task_tiers all-main vs default policy), pass = the produced "
+        "file/output is checked by the script; cost = usage.db cost_usd (provider-reported list price)",
+        status,
+        ev,
+    )
 
 
 # ---------------------------------------------------------------- 5. /preview
@@ -421,8 +539,19 @@ def preview() -> None:
 
     async def go() -> float:
         d = sub("preview")
-        server = make(d, MP(), [{"type": "text", "model": "m-fast", "match": "sketch what the result",
-                                 "text": "```\n[ todo ]\n```\nRisks:\n- a"}], mode="default")
+        server = make(
+            d,
+            MP(),
+            [
+                {
+                    "type": "text",
+                    "model": "m-fast",
+                    "match": "sketch what the result",
+                    "text": "```\n[ todo ]\n```\nRisks:\n- a",
+                }
+            ],
+            mode="default",
+        )
         await call(server, "session.create", {"cwd": str(d)})
         t = time.monotonic()
         out = await call(server, "command.dispatch", {"name": "preview", "arg": "a CLI todo app"})
@@ -432,8 +561,14 @@ def preview() -> None:
     dt = asyncio.run(go())
     overhead = f"fake-provider /preview harness overhead {dt * 1000:.0f} ms (30 s hard timeout in preview.py)"
     if not LIVE_OK:
-        emit(M, crit, how, "PENDING", f"{overhead}; live not run: {LIVE_DETAIL[:160]}",
-             f"run `/preview a CLI todo app` against the live fast tier and time it {RESET}")
+        emit(
+            M,
+            crit,
+            how,
+            "PENDING",
+            f"{overhead}; live not run: {LIVE_DETAIL[:160]}",
+            f"run `/preview a CLI todo app` against the live fast tier and time it {RESET}",
+        )
         return
     # The real-TUI timing needs pexpect + pyte, which this uv env lacks: run it as its own script.
     rc, out = lib.run(["python3", str(HERE / "preview_live.py")], timeout=240)
@@ -443,14 +578,25 @@ def preview() -> None:
         emit(M, crit, how, "FAIL", f"{overhead}\npreview_live.py rc={rc}: {tail(out, 4)}")
         return
     if "skipped" in res:
-        emit(M, crit, how, "PENDING", f"{overhead}; live not run: {res['skipped']}",
-             f"run `/preview a CLI todo app` against the live fast tier and time it {RESET}")
+        emit(
+            M,
+            crit,
+            how,
+            "PENDING",
+            f"{overhead}; live not run: {res['skipped']}",
+            f"run `/preview a CLI todo app` against the live fast tier and time it {RESET}",
+        )
         return
     status = "PASS" if res["ok"] and res["sketch"] and res["secs"] < 30 else "FAIL"
-    emit(M, crit, f"real TUI session, `/preview a CLI todo app` timed from Enter to the finished sketch; "
-         f"fast tier = {res['label']}", status,
-         f"{overhead}\n{res['tail']}\n/preview took {res['secs']} s (limit 30 s); "
-         f"sketch with Risks shown: {res['sketch']}")
+    emit(
+        M,
+        crit,
+        f"real TUI session, `/preview a CLI todo app` timed from Enter to the finished sketch; "
+        f"fast tier = {res['label']}",
+        status,
+        f"{overhead}\n{res['tail']}\n/preview took {res['secs']} s (limit 30 s); "
+        f"sketch with Risks shown: {res['sketch']}",
+    )
 
 
 # ---------------------------------------------------------------- 6. /ultraresearch
@@ -468,11 +614,16 @@ def ultraresearch_live() -> tuple[str, str]:
     os.environ["K3CODE_HOME"] = str(d / "home")
     os.environ.pop("K3CODE_FAKE_PROVIDER", None)
     provider = ProviderEntry(
-        name="claude-code", kind="claude-cli", models={"default": lib.LIVE_DEFAULT_MODEL},
-        tiers={"strong": lib.LIVE_DEFAULT_MODEL, "cheap": lib.LIVE_CHEAP_MODEL, "fast": lib.LIVE_CHEAP_MODEL})
+        name="claude-code",
+        kind="claude-cli",
+        models={"default": lib.LIVE_DEFAULT_MODEL},
+        tiers={"strong": lib.LIVE_DEFAULT_MODEL, "cheap": lib.LIVE_CHEAP_MODEL, "fast": lib.LIVE_CHEAP_MODEL},
+    )
     # searxng_url "" = no SearXNG: the built-in tools search through the keyless DuckDuckGo fallback
-    server = GatewayServer(config=Settings(providers=[provider], permission_mode="auto", research={"searxng_url": ""}),
-                           store=SessionStore(d / "sessions.db"))
+    server = GatewayServer(
+        config=Settings(providers=[provider], permission_mode="auto", research={"searxng_url": ""}),
+        store=SessionStore(d / "sessions.db"),
+    )
     frames: list[str] = []
     server._write = frames.append  # type: ignore[method-assign]
     server._frames = frames  # type: ignore[attr-defined]
@@ -505,13 +656,16 @@ def ultraresearch_live() -> tuple[str, str]:
                 bad.append(f"{r.status_code} {u[:60]}")
     resolving = ok + blocked
     status = "PASS" if resolving >= 10 and not bad else "FAIL"
-    ev = "\n".join([
-        f"question: {question}",
-        f"{len(res.state.sources)} sources read, {len(urls)} cited, {resolving} resolve ({ok} HTTP 2xx/3xx + {blocked} "
-        f"answered 401/403/429 to a script) in a {secs:.0f} s run via {res.tools}",
-        f"broken (404/5xx/unreachable): {bad or 'none'}",
-        f"report saved: {res.path}",
-    ])
+    ev = "\n".join(
+        [
+            f"question: {question}",
+            f"{len(res.state.sources)} sources read, {len(urls)} cited, {resolving} resolve ("
+            f"{ok} HTTP 2xx/3xx + {blocked} "
+            f"answered 401/403/429 to a script) in a {secs:.0f} s run via {res.tools}",
+            f"broken (404/5xx/unreachable): {bad or 'none'}",
+            f"report saved: {res.path}",
+        ]
+    )
     return status, ev
 
 
@@ -521,8 +675,14 @@ def ultraresearch() -> None:
     rc, out = lib.run(["uv", "run", "pytest", "-q", "tests/test_research.py"], cwd=CORE, timeout=300)
     if LIVE_OK and BACKEND["kind"] == "claude-cli":
         status, ev = ultraresearch_live()
-        emit(M, crit, f"real /ultraresearch on a real question: {BACKEND['label']}; keyless DuckDuckGo search; "
-             f"every cited URL fetched (pipeline tests rc={rc})", status, ev)
+        emit(
+            M,
+            crit,
+            f"real /ultraresearch on a real question: {BACKEND['label']}; keyless DuckDuckGo search; "
+            f"every cited URL fetched (pipeline tests rc={rc})",
+            status,
+            ev,
+        )
         return
     dns = lib.run("getent hosts <searxng-host> || echo '<searxng-host>: no DNS answer'")[1].strip()
     mcp_note = "k3nox hub_searxng MCP is not configured in this temp home"
@@ -531,10 +691,15 @@ def ultraresearch() -> None:
         reasons.append(f"OmniRoute quota: {LIVE_DETAIL[:130]}")
     if "no DNS answer" in dns:
         reasons.append(f"SearXNG default URL unreachable ({dns}); {mcp_note}")
-    emit(M, crit, how, "PENDING",
-         f"fake-tools research tests rc={rc}: {tail(out, 1)}; blockers: {' | '.join(reasons) or 'none'}",
-         f"on a host that resolves <searxng-host> (or set research.searxng_url / connect hub_searxng MCP) {RESET}, "
-         "run /ultraresearch on a real topic and curl each cited URL (expect >=10 HTTP 2xx/3xx)")
+    emit(
+        M,
+        crit,
+        how,
+        "PENDING",
+        f"fake-tools research tests rc={rc}: {tail(out, 1)}; blockers: {' | '.join(reasons) or 'none'}",
+        f"on a host that resolves <searxng-host> (or set research.searxng_url / connect hub_searxng MCP) {RESET}, "
+        "run /ultraresearch on a real topic and curl each cited URL (expect >=10 HTTP 2xx/3xx)",
+    )
 
 
 # ---------------------------------------------------------------- 7. missed cron job
@@ -565,15 +730,22 @@ def missed_cron() -> None:
         await s2.close()
         if (first, again) != (1, 1) or [x["status"] for x in runs] != ["completed"]:
             raise AssertionError(f"fired {first} then {again}, runs={[x['status'] for x in runs]}")
-        return (f"24 slots missed (2 h of */5), after restart fired {first} time, "
-                f"still {again} after more ticks; run rows: {len(runs)}")
+        return (
+            f"24 slots missed (2 h of */5), after restart fired {first} time, "
+            f"still {again} after more ticks; run rows: {len(runs)}"
+        )
 
-    emit(M, crit, "JobScheduler on a persisted automation.db: stop, jump fake clock 2 h, restart", "PASS",
-         asyncio.run(go()))
+    emit(
+        M,
+        crit,
+        "JobScheduler on a persisted automation.db: stop, jump fake clock 2 h, restart",
+        "PASS",
+        asyncio.run(go()),
+    )
 
 
 # ---------------------------------------------------------------- 8. MCP schemas
-SERVER_SRC = '''
+SERVER_SRC = """
 from mcp.server.mcpserver import MCPServer
 mcp = MCPServer("big")
 def make(i):
@@ -587,7 +759,7 @@ for i in range(300):
     mcp.tool()(make(i))
 if __name__ == "__main__":
     mcp.run("stdio")
-'''
+"""
 
 
 def mcp_context() -> None:
@@ -630,12 +802,20 @@ def mcp_context() -> None:
 
     deferred, after3, eager, named = asyncio.run(go())
     pct = 100 * deferred / window
-    ev = (f"300 tools; MCP overhead (tool specs + prompt names) vs {window}-token window, ~4 chars/token estimate: "
-          f"deferred {deferred} tok = {pct:.1f}% (after loading 3 tools: {after3} tok = {100 * after3 / window:.1f}%); "
-          f"eager all-schemas would be {eager} tok = {100 * eager / window:.1f}%. prompt lists {named} of 300 names "
-          f"(limit 150; the rest are reachable via mcp_tool_search keywords)")
-    emit(M, crit, "real McpManager + stdio server with 300 generated tools; register_mcp_tools + mcp_prompt; "
-         "serialized spec size / window", "PASS" if pct < 15 and eager > deferred else "FAIL", ev)
+    ev = (
+        f"300 tools; MCP overhead (tool specs + prompt names) vs {window}-token window, ~4 chars/token estimate: "
+        f"deferred {deferred} tok = {pct:.1f}% (after loading 3 tools: {after3} tok = {100 * after3 / window:.1f}%); "
+        f"eager all-schemas would be {eager} tok = {100 * eager / window:.1f}%. prompt lists {named} of 300 names "
+        f"(limit 150; the rest are reachable via mcp_tool_search keywords)"
+    )
+    emit(
+        M,
+        crit,
+        "real McpManager + stdio server with 300 generated tools; register_mcp_tools + mcp_prompt; "
+        "serialized spec size / window",
+        "PASS" if pct < 15 and eager > deferred else "FAIL",
+        ev,
+    )
 
 
 def main() -> None:
@@ -644,10 +824,17 @@ def main() -> None:
     if want == ["blind"]:  # `m4_autonomy.py blind`: agreement on the blind scope set (not an exit row)
         scope_blind()
         return
-    for name, fn in [("scope eval", scope_eval), ("fan-out", fanout), ("stats tiers", stats_tiers),
-                     ("degradation", degradation), ("degradation live", degradation_live), ("preview", preview),
-                     ("ultraresearch", ultraresearch),
-                     ("missed cron", missed_cron), ("mcp context", mcp_context)]:
+    for name, fn in [
+        ("scope eval", scope_eval),
+        ("fan-out", fanout),
+        ("stats tiers", stats_tiers),
+        ("degradation", degradation),
+        ("degradation live", degradation_live),
+        ("preview", preview),
+        ("ultraresearch", ultraresearch),
+        ("missed cron", missed_cron),
+        ("mcp context", mcp_context),
+    ]:
         if want and name.replace(" ", "_").replace("-", "_") not in want:
             continue
         safe(f"M4 {name}", fn)

@@ -46,7 +46,10 @@ def test_policy_override_from_config():
 
 def _config(**kw) -> Settings:
     p = ProviderEntry(
-        name="a", kind="openai", base_url="http://a", api_key_env="X",
+        name="a",
+        kind="openai",
+        base_url="http://a",
+        api_key_env="X",
         models={"default": "m-def", "cheap": "m-cheapkey"},
         tiers={"strong": ["s1", "s2"], "fast": "f1"},
     )
@@ -62,8 +65,14 @@ def test_tier_model_specs_fall_back_to_models_then_default():
 
 
 def test_main_tier_prefers_tiers_main_for_default_key_only():
-    p = ProviderEntry(name="a", kind="openai", base_url="http://a", api_key_env="X",
-                      models={"default": "m-def", "alt": "m-alt"}, tiers={"main": "m-tier-main"})
+    p = ProviderEntry(
+        name="a",
+        kind="openai",
+        base_url="http://a",
+        api_key_env="X",
+        models={"default": "m-def", "alt": "m-alt"},
+        tiers={"main": "m-tier-main"},
+    )
     cfg = Settings(providers=[p])
     assert tier_model_specs(cfg, "main") == ["m-tier-main"]
     assert tier_model_specs(cfg, "main", key="alt") == ["m-alt"]  # explicit /model key wins
@@ -80,24 +89,20 @@ def test_escalation_ladder_and_thresholds():
     assert esc.record("loop_guard") is None  # nowhere to go
 
 
-def test_escalation_judge_not_done_twice():
-    esc = Escalation(Tier.CHEAP)
-    assert esc.record("judge_not_done") is None
-    assert esc.record("judge_not_done") is Tier.MAIN
-
-
 def test_autonomy_cfg_defaults_and_overrides():
     cfg = autonomy_cfg(Settings(autonomy={"plan_first": False, "escalate": {"tool_errors": 5}}))
     assert cfg["plan_first"] is False and cfg["gate_modes"] == ["auto"]
-    assert cfg["escalate"] == {"tool_errors": 5, "loop_guard": 1, "judge_not_done": 2}
+    assert cfg["escalate"] == {"tool_errors": 5}
 
 
 # ── scope ──
 
 
 def test_parse_verdict_tolerates_fences_and_rejects_garbage():
-    text = '```json\n{"scope":"medium","needs_plan":false,"risk":"low","parallelizable":true,' \
-           '"suggested_subtasks":["a","b"],"reason":"r"}\n```'
+    text = (
+        '```json\n{"scope":"medium","needs_plan":false,"risk":"low","parallelizable":true,'
+        '"suggested_subtasks":["a","b"],"reason":"r"}\n```'
+    )
     v = parse_verdict(text)
     assert v is not None and v.scope == "medium" and v.parallelizable and v.suggested_subtasks == ["a", "b"]
     assert parse_verdict("no json here") is None
@@ -183,8 +188,14 @@ def test_classifier_prompt_defines_every_level_and_examples_are_valid_json():
 
 @pytest.mark.parametrize(
     "prompt",
-    ["delete the old build dir", "run the db migration", "deploy to prod", "rotate the credentials",
-     "git push --force origin main", "rm -rf /tmp/x"],
+    [
+        "delete the old build dir",
+        "run the db migration",
+        "deploy to prod",
+        "rotate the credentials",
+        "git push --force origin main",
+        "rm -rf /tmp/x",
+    ],
 )
 def test_danger_classes_force_plan_and_high_risk(prompt):
     v = apply_floor(ScopeVerdict(scope="trivial", risk="low"), prompt)
@@ -274,8 +285,10 @@ def test_proposal_dedup_and_dismiss_persist(tmp_path):
 
 
 def test_parse_proposals_limits_and_validates():
-    raw = json.dumps([{"kind": "improvement", "text": f"t{i}", "action": f"a{i}"} for i in range(5)]
-                     + [{"kind": "bogus", "text": "x"}])
+    raw = json.dumps(
+        [{"kind": "improvement", "text": f"t{i}", "action": f"a{i}"} for i in range(5)]
+        + [{"kind": "bogus", "text": "x"}]
+    )
     assert len(parse_proposals("Sure: " + raw)) == 3
     assert parse_proposals("nothing") == []
     assert parse_proposals("[]") == []
@@ -287,8 +300,12 @@ def test_prompt_examples_are_not_taken_from_the_eval_sets():
     from pathlib import Path
 
     exit_dir = Path(__file__).resolve().parents[2] / "scripts" / "exit"
-    evals = [json.loads(x)["prompt"].lower() for f in ("scope_eval.jsonl", "scope_eval_blind.jsonl")
-             for x in (exit_dir / f).read_text().splitlines() if x.strip()]
+    evals = [
+        json.loads(x)["prompt"].lower()
+        for f in ("scope_eval.jsonl", "scope_eval_blind.jsonl")
+        for x in (exit_dir / f).read_text().splitlines()
+        if x.strip()
+    ]
     assert len(evals) == 70
     for ex in re.findall(r'^Task: "(.*?)" ->', CLASSIFIER_SYSTEM, re.M):
         assert ex.lower() not in evals

@@ -229,9 +229,7 @@ def test_disk_guard_stat_failure_does_not_block(psi_dir: Path, tmp_path: Path, m
     assert g.disk_stop() is None
 
 
-async def test_slot_raises_before_acquiring_when_disk_full(
-    psi_dir: Path, tmp_path: Path, monkeypatch
-):
+async def test_slot_raises_before_acquiring_when_disk_full(psi_dir: Path, tmp_path: Path, monkeypatch):
     import shutil
 
     class DU:

@@ -1,92 +1,103 @@
-import { stripAnsi } from '@k3code/shared/ansi'
-import { compactNumber } from '@k3code/shared/format'
-import type { ToolLabel } from '@k3code/shared/gateway-events'
+import { stripAnsi } from "@k3code/shared/ansi";
+import { compactNumber } from "@k3code/shared/format";
+import type { ToolLabel } from "@k3code/shared/gateway-events";
 
 import {
   LIVE_RENDER_MAX_CHARS,
   LIVE_RENDER_MAX_LINES,
   THINKING_COT_MAX,
   VERBOSE_TRAIL_MAX_CHARS,
-  VERBOSE_TRAIL_MAX_LINES
-} from '../config/limits.js'
-import { VERBS } from '../content/verbs.js'
-import type { ThinkingMode } from '../types.js'
+  VERBOSE_TRAIL_MAX_LINES,
+} from "../config/limits.js";
+import { VERBS } from "../content/verbs.js";
+import type { ThinkingMode } from "../types.js";
 
-const WS_RE = /\s+/g
+const WS_RE = /\s+/g;
 
 const renderEstimateLine = (line: string) => {
-  const trimmed = line.trim()
+  const trimmed = line.trim();
 
-  if (trimmed.startsWith('|')) {
+  if (trimmed.startsWith("|")) {
     return trimmed
-      .split('|')
+      .split("|")
       .filter(Boolean)
-      .map(cell => cell.trim())
-      .join('  ')
+      .map((cell) => cell.trim())
+      .join("  ");
   }
 
   return line
-    .replace(/!\[(.*?)\]\(([^)\s]+)\)/g, '[image: $1]')
-    .replace(/\[(.+?)\]\((https?:\/\/[^\s)]+)\)/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/\*\*(.+?)\*\*/g, '$1')
-    .replace(/(?<!\w)__(.+?)__(?!\w)/g, '$1')
-    .replace(/\*(.+?)\*/g, '$1')
-    .replace(/(?<!\w)_(.+?)_(?!\w)/g, '$1')
-    .replace(/~~(.+?)~~/g, '$1')
-    .replace(/==(.+?)==/g, '$1')
-    .replace(/\[\^([^\]]+)\]/g, '[$1]')
-    .replace(/^#{1,6}\s+/, '')
-    .replace(/^\s*[-*+]\s+\[( |x|X)\]\s+/, (_m, checked: string) => `• [${checked.toLowerCase() === 'x' ? 'x' : ' '}] `)
-    .replace(/^\s*[-*+]\s+/, '• ')
-    .replace(/^\s*(\d+)\.\s+/, '$1. ')
-    .replace(/^\s*(?:>\s*)+/, '│ ')
-}
+    .replace(/!\[(.*?)\]\(([^)\s]+)\)/g, "[image: $1]")
+    .replace(/\[(.+?)\]\((https?:\/\/[^\s)]+)\)/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/(?<!\w)__(.+?)__(?!\w)/g, "$1")
+    .replace(/\*(.+?)\*/g, "$1")
+    .replace(/(?<!\w)_(.+?)_(?!\w)/g, "$1")
+    .replace(/~~(.+?)~~/g, "$1")
+    .replace(/==(.+?)==/g, "$1")
+    .replace(/\[\^([^\]]+)\]/g, "[$1]")
+    .replace(/^#{1,6}\s+/, "")
+    .replace(
+      /^\s*[-*+]\s+\[( |x|X)\]\s+/,
+      (_m, checked: string) =>
+        `• [${checked.toLowerCase() === "x" ? "x" : " "}] `,
+    )
+    .replace(/^\s*[-*+]\s+/, "• ")
+    .replace(/^\s*(\d+)\.\s+/, "$1. ")
+    .replace(/^\s*(?:>\s*)+/, "│ ");
+};
 
 export const compactPreview = (s: string, max: number) => {
-  const one = s.replace(WS_RE, ' ').trim()
+  const one = s.replace(WS_RE, " ").trim();
 
-  return !one ? '' : one.length > max ? one.slice(0, max - 1) + '…' : one
-}
+  return !one ? "" : one.length > max ? one.slice(0, max - 1) + "…" : one;
+};
 
-export const estimateTokensRough = (text: string) => (!text ? 0 : (text.length + 3) >> 2)
+export const estimateTokensRough = (text: string) =>
+  !text ? 0 : (text.length + 3) >> 2;
 
 export const edgePreview = (s: string, head = 16, tail = 28) => {
-  const one = s.replace(WS_RE, ' ').trim().replace(/\]\]/g, '] ]')
+  const one = s.replace(WS_RE, " ").trim().replace(/\]\]/g, "] ]");
 
   return !one
-    ? ''
+    ? ""
     : one.length <= head + tail + 4
       ? one
-      : `${one.slice(0, head).trimEnd()}.. ${one.slice(-tail).trimStart()}`
-}
+      : `${one.slice(0, head).trimEnd()}.. ${one.slice(-tail).trimStart()}`;
+};
 
 export const pasteTokenLabel = (text: string, lineCount: number) => {
-  const preview = edgePreview(text)
+  const preview = edgePreview(text);
 
   if (!preview) {
-    return `[[ [${compactNumber(lineCount)} lines] ]]`
+    return `[[ [${compactNumber(lineCount)} lines] ]]`;
   }
 
-  const [head = preview, tail = ''] = preview.split('.. ', 2)
+  const [head = preview, tail = ""] = preview.split(".. ", 2);
 
   return tail
     ? `[[ ${head.trimEnd()}.. [${compactNumber(lineCount)} lines] .. ${tail.trimStart()} ]]`
-    : `[[ ${preview} [${compactNumber(lineCount)} lines] ]]`
-}
+    : `[[ ${preview} [${compactNumber(lineCount)} lines] ]]`;
+};
 
-const THINKING_STATUS_RE = new RegExp(`^(?:${VERBS.join('|')})\\.{0,3}$`, 'i')
-const THINKING_STATUS_CHUNK_RE = new RegExp(`[^A-Za-z\n]+\\s*(?:${VERBS.join('|')})\\.{0,3}\\s*`, 'giu')
+const THINKING_STATUS_RE = new RegExp(`^(?:${VERBS.join("|")})\\.{0,3}$`, "i");
+const THINKING_STATUS_CHUNK_RE = new RegExp(
+  `[^A-Za-z\n]+\\s*(?:${VERBS.join("|")})\\.{0,3}\\s*`,
+  "giu",
+);
 
 export const cleanThinkingText = (reasoning: string) =>
   reasoning
-    .split('\n')
-    .map(line => line.replace(THINKING_STATUS_CHUNK_RE, '').trim())
-    .filter(line => line && !THINKING_STATUS_RE.test(line.replace(/\.\.\.$/, '').trim()))
-    .join('\n')
-    .replace(/([^\n])(?=\*\*[^*\n][^\n]*?\*\*)/g, '$1\n\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim()
+    .split("\n")
+    .map((line) => line.replace(THINKING_STATUS_CHUNK_RE, "").trim())
+    .filter(
+      (line) =>
+        line && !THINKING_STATUS_RE.test(line.replace(/\.\.\.$/, "").trim()),
+    )
+    .join("\n")
+    .replace(/([^\n])(?=\*\*[^*\n][^\n]*?\*\*)/g, "$1\n\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 
 // cleanThinkingText runs several full-string regex passes (split/map/filter/join/replace).
 // reasoning grows on every streamed token, so without a pre-bound this re-cleans the whole
@@ -94,119 +105,146 @@ export const cleanThinkingText = (reasoning: string) =>
 // tail is ever displayed (boundedLiveRenderText caps it further downstream), so bound the
 // input here first. Headroom over LIVE_RENDER_MAX_CHARS keeps line-boundary trimming inside
 // cleanThinkingText accurate even after slicing mid-line.
-const THINKING_CLEAN_TAIL_BOUND = LIVE_RENDER_MAX_CHARS * 1.5
+const THINKING_CLEAN_TAIL_BOUND = LIVE_RENDER_MAX_CHARS * 1.5;
 
-export const thinkingPreview = (reasoning: string, mode: ThinkingMode, max: number = THINKING_COT_MAX) => {
-  const bounded = reasoning.length > THINKING_CLEAN_TAIL_BOUND ? reasoning.slice(-THINKING_CLEAN_TAIL_BOUND) : reasoning
-  const raw = cleanThinkingText(bounded)
+export const thinkingPreview = (
+  reasoning: string,
+  mode: ThinkingMode,
+  max: number = THINKING_COT_MAX,
+) => {
+  const bounded =
+    reasoning.length > THINKING_CLEAN_TAIL_BOUND
+      ? reasoning.slice(-THINKING_CLEAN_TAIL_BOUND)
+      : reasoning;
+  const raw = cleanThinkingText(bounded);
 
-  return !raw || mode === 'collapsed' ? '' : mode === 'full' ? raw : compactPreview(raw.replace(WS_RE, ' '), max)
-}
+  return !raw || mode === "collapsed"
+    ? ""
+    : mode === "full"
+      ? raw
+      : compactPreview(raw.replace(WS_RE, " "), max);
+};
 
 export const boundedLiveRenderText = (
   text: string,
-  { maxChars = LIVE_RENDER_MAX_CHARS, maxLines = LIVE_RENDER_MAX_LINES } = {}
-) => boundedRenderText(text, 'showing live tail', { maxChars, maxLines })
+  { maxChars = LIVE_RENDER_MAX_CHARS, maxLines = LIVE_RENDER_MAX_LINES } = {},
+) => boundedRenderText(text, "showing live tail", { maxChars, maxLines });
 
 const boundedRenderText = (
   text: string,
   labelPrefix: string,
-  { maxChars, maxLines }: { maxChars: number; maxLines: number }
+  { maxChars, maxLines }: { maxChars: number; maxLines: number },
 ) => {
-  if (text.length <= maxChars && text.split('\n', maxLines + 1).length <= maxLines) {
-    return text
+  if (
+    text.length <= maxChars &&
+    text.split("\n", maxLines + 1).length <= maxLines
+  ) {
+    return text;
   }
 
-  let start = 0
-  let idx = text.length
+  let start = 0;
+  let idx = text.length;
 
   for (let seen = 0; seen < maxLines && idx > 0; seen++) {
-    idx = text.lastIndexOf('\n', idx - 1)
-    start = idx < 0 ? 0 : idx + 1
+    idx = text.lastIndexOf("\n", idx - 1);
+    start = idx < 0 ? 0 : idx + 1;
 
     if (idx < 0) {
-      break
+      break;
     }
   }
 
-  const lineStart = start
-  start = Math.max(lineStart, text.length - maxChars)
+  const lineStart = start;
+  start = Math.max(lineStart, text.length - maxChars);
 
   if (start > lineStart) {
-    const nextBreak = text.indexOf('\n', start)
+    const nextBreak = text.indexOf("\n", start);
 
     if (nextBreak >= 0 && nextBreak < text.length - 1) {
-      start = nextBreak + 1
+      start = nextBreak + 1;
     }
   }
 
-  const tail = text.slice(start).trimStart()
-  const omittedLines = countNewlines(text, start)
-  const omittedChars = Math.max(0, text.length - tail.length)
+  const tail = text.slice(start).trimStart();
+  const omittedLines = countNewlines(text, start);
+  const omittedChars = Math.max(0, text.length - tail.length);
 
   const label =
     omittedLines > 0
       ? `[${labelPrefix}; omitted ${compactNumber(omittedLines)} lines / ${compactNumber(omittedChars)} chars]\n`
-      : `[${labelPrefix}; omitted ${compactNumber(omittedChars)} chars]\n`
+      : `[${labelPrefix}; omitted ${compactNumber(omittedChars)} chars]\n`;
 
-  return `${label}${tail}`
-}
+  return `${label}${tail}`;
+};
 
 const countNewlines = (text: string, end: number) => {
-  let count = 0
+  let count = 0;
 
   for (let i = 0; i < end; i++) {
     if (text.charCodeAt(i) === 10) {
-      count++
+      count++;
     }
   }
 
-  return count
-}
+  return count;
+};
 
-export const stripTrailingPasteNewlines = (text: string) => (/[^\n]/.test(text) ? text.replace(/\n+$/, '') : text)
+export const stripTrailingPasteNewlines = (text: string) =>
+  /[^\n]/.test(text) ? text.replace(/\n+$/, "") : text;
 
 export const toolTrailLabel = (name: string) =>
   name
-    .split('_')
+    .split("_")
     .filter(Boolean)
-    .map(p => p[0]!.toUpperCase() + p.slice(1))
-    .join(' ') || name
+    .map((p) => p[0]!.toUpperCase() + p.slice(1))
+    .join(" ") || name;
 
-export const formatToolCall = (name: string, context = '') => {
-  const label = toolTrailLabel(name)
-  const preview = compactPreview(context, 64)
+export const formatToolCall = (name: string, context = "") => {
+  const label = toolTrailLabel(name);
+  const preview = compactPreview(context, 64);
 
-  return preview ? `${label}("${preview}")` : label
-}
+  return preview ? `${label}("${preview}")` : label;
+};
 
 /** One row's worth of a bridged call: the gateway already phrased it, preview included. */
 export const formatToolLabel = (label: ToolLabel) =>
-  `${label.emoji} ${compactPreview(label.preview ? `${label.text}  ${label.preview}` : label.text, 72)}`
+  `${label.emoji} ${compactPreview(label.preview ? `${label.text}  ${label.preview}` : label.text, 72)}`;
 
 export const formatToolLabels = (labels: readonly ToolLabel[]) => {
-  const [first, ...rest] = labels
+  const [first, ...rest] = labels;
 
   if (first === undefined) {
-    return ''
+    return "";
   }
 
-  return rest.length > 0 ? `${formatToolLabel(first)} +${rest.length}` : formatToolLabel(first)
-}
+  return rest.length > 0
+    ? `${formatToolLabel(first)} +${rest.length}`
+    : formatToolLabel(first);
+};
 
 /** A finished trail row for an already-phrased call. */
-export const toolTrailLine = (call: string, error?: boolean, note?: string, duration?: number) => {
-  const detail = compactPreview(note ?? '', 72)
-  const took = duration !== undefined ? ` (${duration.toFixed(1)}s)` : ''
+export const toolTrailLine = (
+  call: string,
+  error?: boolean,
+  note?: string,
+  duration?: number,
+) => {
+  const detail = compactPreview(note ?? "", 72);
+  const took = duration !== undefined ? ` (${duration.toFixed(1)}s)` : "";
 
-  return `${call}${took}${detail ? ` :: ${detail}` : ''} ${error ? '✗' : '✓'}`
-}
+  return `${call}${took}${detail ? ` :: ${detail}` : ""} ${error ? "✗" : "✓"}`;
+};
 
-export const buildToolTrailLine = (name: string, context: string, error?: boolean, note?: string, duration?: number) =>
-  toolTrailLine(formatToolCall(name, context), error, note, duration)
+export const buildToolTrailLine = (
+  name: string,
+  context: string,
+  error?: boolean,
+  note?: string,
+  duration?: number,
+) => toolTrailLine(formatToolCall(name, context), error, note, duration);
 
 const verboseToolBlock = (label: string, text?: string) => {
-  const body = (text ?? '').trim()
+  const body = (text ?? "").trim();
 
   // Persisted trail blocks are kept all session and rendered expanded by
   // default — cap to a small readable preview (NOT the 16KB live-render
@@ -215,10 +253,10 @@ const verboseToolBlock = (label: string, text?: string) => {
   return body
     ? `${label}:\n${boundedLiveRenderText(body, {
         maxChars: VERBOSE_TRAIL_MAX_CHARS,
-        maxLines: VERBOSE_TRAIL_MAX_LINES
+        maxLines: VERBOSE_TRAIL_MAX_LINES,
       })}`
-    : ''
-}
+    : "";
+};
 
 /** The Args and Result blocks for an already-phrased call. */
 export const verboseToolTrailLine = (
@@ -226,16 +264,19 @@ export const verboseToolTrailLine = (
   error?: boolean,
   duration?: number,
   argsText?: string,
-  resultText?: string
+  resultText?: string,
 ) => {
-  const detail = [verboseToolBlock('Args', argsText), verboseToolBlock(error ? 'Error' : 'Result', resultText)]
+  const detail = [
+    verboseToolBlock("Args", argsText),
+    verboseToolBlock(error ? "Error" : "Result", resultText),
+  ]
     .filter(Boolean)
-    .join('\n')
+    .join("\n");
 
-  const took = duration !== undefined ? ` (${duration.toFixed(1)}s)` : ''
+  const took = duration !== undefined ? ` (${duration.toFixed(1)}s)` : "";
 
-  return `${call}${took}${detail ? ` :: ${detail}` : ''} ${error ? '✗' : '✓'}`
-}
+  return `${call}${took}${detail ? ` :: ${detail}` : ""} ${error ? "✗" : "✓"}`;
+};
 
 export const buildVerboseToolTrailLine = (
   name: string,
@@ -243,101 +284,116 @@ export const buildVerboseToolTrailLine = (
   error?: boolean,
   duration?: number,
   argsText?: string,
-  resultText?: string
-) => verboseToolTrailLine(formatToolCall(name, context), error, duration, argsText, resultText)
+  resultText?: string,
+) =>
+  verboseToolTrailLine(
+    formatToolCall(name, context),
+    error,
+    duration,
+    argsText,
+    resultText,
+  );
 
-export const isToolTrailResultLine = (line: string) => line.endsWith(' ✓') || line.endsWith(' ✗')
+export const isToolTrailResultLine = (line: string) =>
+  line.endsWith(" ✓") || line.endsWith(" ✗");
 
 export const parseToolTrailResultLine = (line: string) => {
   if (!isToolTrailResultLine(line)) {
-    return null
+    return null;
   }
 
-  const mark = line.endsWith(' ✗') ? '✗' : '✓'
-  const body = line.slice(0, -2)
-  const sep = body.indexOf(' :: ')
+  const mark = line.endsWith(" ✗") ? "✗" : "✓";
+  const body = line.slice(0, -2);
+  const sep = body.indexOf(" :: ");
 
   if (sep >= 0) {
-    return { call: body.slice(0, sep), detail: body.slice(sep + 4), mark }
+    return { call: body.slice(0, sep), detail: body.slice(sep + 4), mark };
   }
 
-  const legacy = body.indexOf(': ')
+  const legacy = body.indexOf(": ");
 
   if (legacy > 0) {
-    return { call: body.slice(0, legacy), detail: body.slice(legacy + 2), mark }
+    return {
+      call: body.slice(0, legacy),
+      detail: body.slice(legacy + 2),
+      mark,
+    };
   }
 
-  return { call: body, detail: '', mark }
-}
+  return { call: body, detail: "", mark };
+};
 
 export const splitToolDuration = (call: string) => {
-  const match = call.match(/^(.*?)( \(\d+(?:\.\d)?s\))$/)
+  const match = call.match(/^(.*?)( \(\d+(?:\.\d)?s\))$/);
 
-  return match ? { label: match[1]!, duration: match[2]! } : { label: call, duration: '' }
-}
+  return match
+    ? { label: match[1]!, duration: match[2]! }
+    : { label: call, duration: "" };
+};
 
-export const isTransientTrailLine = (line: string) => line.startsWith('drafting ') || line === 'analyzing tool output…'
+export const isTransientTrailLine = (line: string) =>
+  line.startsWith("drafting ") || line === "analyzing tool output…";
 
 export const sameToolTrailGroup = (label: string, entry: string) =>
   entry === `${label} ✓` ||
   entry === `${label} ✗` ||
   entry.startsWith(`${label}(`) ||
   entry.startsWith(`${label} ::`) ||
-  entry.startsWith(`${label}:`)
+  entry.startsWith(`${label}:`);
 
 export const lastCotTrailIndex = (trail: readonly string[]) => {
   for (let i = trail.length - 1; i >= 0; i--) {
     if (!isToolTrailResultLine(trail[i]!)) {
-      return i
+      return i;
     }
   }
 
-  return -1
-}
+  return -1;
+};
 
 export const estimateRows = (text: string, w: number, compact = false) => {
-  let fence: { char: '`' | '~'; len: number } | null = null
-  let rows = 0
+  let fence: { char: "`" | "~"; len: number } | null = null;
+  let rows = 0;
 
-  for (const raw of text.split('\n')) {
-    const line = stripAnsi(raw)
-    const maybeFence = line.match(/^\s*(`{3,}|~{3,})(.*)$/)
+  for (const raw of text.split("\n")) {
+    const line = stripAnsi(raw);
+    const maybeFence = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
 
     if (maybeFence) {
-      const marker = maybeFence[1]!
-      const lang = maybeFence[2]!.trim()
+      const marker = maybeFence[1]!;
+      const lang = maybeFence[2]!.trim();
 
       if (!fence) {
-        fence = { char: marker[0] as '`' | '~', len: marker.length }
+        fence = { char: marker[0] as "`" | "~", len: marker.length };
 
         if (lang) {
-          rows += Math.ceil((`─ ${lang}`.length || 1) / w)
+          rows += Math.ceil((`─ ${lang}`.length || 1) / w);
         }
       } else if (marker[0] === fence.char && marker.length >= fence.len) {
-        fence = null
+        fence = null;
       }
 
-      continue
+      continue;
     }
 
-    const inCode = Boolean(fence)
-    const trimmed = line.trim()
+    const inCode = Boolean(fence);
+    const trimmed = line.trim();
 
-    if (!inCode && trimmed.startsWith('|') && /^[|\s:-]+$/.test(trimmed)) {
-      continue
+    if (!inCode && trimmed.startsWith("|") && /^[|\s:-]+$/.test(trimmed)) {
+      continue;
     }
 
-    const rendered = inCode ? line : renderEstimateLine(line)
+    const rendered = inCode ? line : renderEstimateLine(line);
 
     if (compact && !rendered.trim()) {
-      continue
+      continue;
     }
 
-    rows += Math.ceil((rendered.length || 1) / w)
+    rows += Math.ceil((rendered.length || 1) / w);
   }
 
-  return Math.max(1, rows)
-}
+  return Math.max(1, rows);
+};
 
 /**
  * Render an unanswered clarify prompt (timed out, or cancelled with Esc/Ctrl+C)
@@ -348,12 +404,16 @@ export const estimateRows = (text: string, w: number, compact = false) => {
  * 1-based numbered list) so the persisted record reads identically to what was
  * on screen.  `reason` states why the prompt ended ("timed out", "cancelled").
  */
-export const formatAbandonedClarify = (question: string, choices: string[] | null, reason: string) => {
-  const head = `ask ${question.trim()}`
-  const opts = (choices ?? []).map((c, i) => `  ${i + 1}. ${c}`)
+export const formatAbandonedClarify = (
+  question: string,
+  choices: string[] | null,
+  reason: string,
+) => {
+  const head = `ask ${question.trim()}`;
+  const opts = (choices ?? []).map((c, i) => `  ${i + 1}. ${c}`);
 
-  return [head, ...opts, `  (${reason} — no selection)`].join('\n')
-}
+  return [head, ...opts, `  (${reason} — no selection)`].join("\n");
+};
 
 /**
  * Batch counterpart of `formatAbandonedClarify`: every question on its own
@@ -363,16 +423,22 @@ export const formatAbandonedClarify = (question: string, choices: string[] | nul
 export const formatAbandonedClarifyBatch = (
   questions: { qid: string; question: string }[],
   answers: Record<string, string>,
-  reason: string
+  reason: string,
 ) => {
-  const lines = questions.map(q => {
-    const answer = answers[q.qid]
+  const lines = questions.map((q) => {
+    const answer = answers[q.qid];
 
-    return answer ? `  ✓ ${q.question} → ${answer}` : `  · ${q.question} (no answer)`
-  })
+    return answer
+      ? `  ✓ ${q.question} → ${answer}`
+      : `  · ${q.question} (no answer)`;
+  });
 
-  return [`ask (${questions.length} questions)`, ...lines, `  (${reason})`].join('\n')
-}
+  return [
+    `ask (${questions.length} questions)`,
+    ...lines,
+    `  (${reason})`,
+  ].join("\n");
+};
 
 /**
  * Cursor/draft restore for re-visiting an answered batch clarify question
@@ -383,24 +449,26 @@ export const formatAbandonedClarifyBatch = (
  */
 export const clarifyBatchRevisitState = (
   choices: readonly string[],
-  answer: string | undefined
+  answer: string | undefined,
 ): { custom: string; sel: number } => {
-  if (answer === undefined || answer === '') {
-    return { custom: '', sel: 0 }
+  if (answer === undefined || answer === "") {
+    return { custom: "", sel: 0 };
   }
 
-  const choiceIndex = choices.indexOf(answer)
+  const choiceIndex = choices.indexOf(answer);
 
   if (choiceIndex >= 0) {
-    return { custom: '', sel: choiceIndex }
+    return { custom: "", sel: choiceIndex };
   }
 
-  return { custom: answer, sel: choices.length > 0 ? choices.length : 0 }
-}
+  return { custom: answer, sel: choices.length > 0 ? choices.length : 0 };
+};
 
-export const flat = (r: Record<string, string[]>) => Object.values(r).flat()
+export const flat = (r: Record<string, string[]>) => Object.values(r).flat();
 
-export const pick = <T>(a: T[]) => a[Math.floor(Math.random() * a.length)]!
+export const pick = <T>(a: T[]) => a[Math.floor(Math.random() * a.length)]!;
 
 export const isPasteBackedText = (text: string) =>
-  /\[\[paste:\d+(?:[^\n]*?)\]\]|\[paste #\d+ (?:attached|excerpt)(?:[^\n]*?)\]/.test(text)
+  /\[\[paste:\d+(?:[^\n]*?)\]\]|\[paste #\d+ (?:attached|excerpt)(?:[^\n]*?)\]/.test(
+    text,
+  );

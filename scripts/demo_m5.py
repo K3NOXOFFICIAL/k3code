@@ -22,8 +22,15 @@ from k3code.learning.decisions import DecisionLog  # noqa: E402
 log = DecisionLog(tmp / "home")
 store = ProposalStore(tmp / "home")
 for i in range(3):
-    log.record("approval", session=f"session-{i}", cwd=str(proj), subject="npm test *", choice="once",
-               detail={"tool": "bash"}, project=f"path:{proj}")
+    log.record(
+        "approval",
+        session=f"session-{i}",
+        cwd=str(proj),
+        subject="npm test *",
+        choice="once",
+        detail={"tool": "bash"},
+        project=f"path:{proj}",
+    )
 print("1. approved `npm test` in 3 separate sessions")
 
 (p,) = permrules.to_proposals(permrules.mine(log, cwd=str(proj)), store)
@@ -35,15 +42,29 @@ cfg = proj / ".k3code" / "config.yaml"
 print(f"4. {cfg.relative_to(tmp)}:\n{cfg.read_text()}")
 
 for i in range(2):
-    log.record("approval", session=f"d{i}", cwd=str(proj), subject="terraform apply *", choice="deny",
-               detail={"tool": "bash"}, project=f"path:{proj}")
+    log.record(
+        "approval",
+        session=f"d{i}",
+        cwd=str(proj),
+        subject="terraform apply *",
+        choice="deny",
+        detail={"tool": "bash"},
+        project=f"path:{proj}",
+    )
 (q,) = permrules.to_proposals(permrules.mine(log, cwd=str(proj)), store)
 print(f"5. new proposal: {q.text}")
 store.set_status(q.id, "dismissed")
 print("6. dismissed it")
 for run in (1, 2):
-    log.record("approval", session=f"later{run}", cwd=str(proj), subject="terraform apply *", choice="deny",
-               detail={"tool": "bash"}, project=f"path:{proj}")
+    log.record(
+        "approval",
+        session=f"later{run}",
+        cwd=str(proj),
+        subject="terraform apply *",
+        choice="deny",
+        detail={"tool": "bash"},
+        project=f"path:{proj}",
+    )
     again = permrules.to_proposals(permrules.mine(log, cwd=str(proj)), store)
     print(f"7.{run} proposer rerun -> {len(again)} new proposals (statuses: {[x.status for x in store.all()]})")
     assert again == []

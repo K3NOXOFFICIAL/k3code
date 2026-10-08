@@ -40,13 +40,13 @@ export const C0 = {
   GS: 0x1d,
   RS: 0x1e,
   US: 0x1f,
-  DEL: 0x7f
-} as const
+  DEL: 0x7f,
+} as const;
 
 // String constants for output generation
-export const ESC = '\x1b'
-export const BEL = '\x07'
-export const SEP = ';'
+export const ESC = "\x1b";
+export const BEL = "\x07";
+export const SEP = ";";
 
 /**
  * Escape sequence type introducers (byte after ESC)
@@ -58,12 +58,12 @@ export const ESC_TYPE = {
   APC: 0x5f, // _ - Application Program Command
   PM: 0x5e, // ^ - Privacy Message
   SOS: 0x58, // X - Start of String
-  ST: 0x5c // \ - String Terminator
-} as const
+  ST: 0x5c, // \ - String Terminator
+} as const;
 
 /** Check if a byte is a C0 control character */
 export function isC0(byte: number): boolean {
-  return byte < 0x20 || byte === 0x7f
+  return byte < 0x20 || byte === 0x7f;
 }
 
 /**
@@ -71,5 +71,5 @@ export function isC0(byte: number): boolean {
  * ESC sequences have a wider final byte range than CSI
  */
 export function isEscFinal(byte: number): boolean {
-  return byte >= 0x30 && byte <= 0x7e
+  return byte >= 0x30 && byte <= 0x7e;
 }

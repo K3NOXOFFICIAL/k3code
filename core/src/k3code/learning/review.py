@@ -57,9 +57,18 @@ def write_draft(name: str, description: str, body: str) -> Path:
     return md
 
 
-async def review_session(caller: Any, messages: list[dict[str, Any]], *, store: ProposalStore, cwd: Path,
-                         config: Any = None, min_turns: int = 6, session_id: str = "", mem0_post: Any = None,
-                         project: str = "") -> dict[str, Any]:
+async def review_session(
+    caller: Any,
+    messages: list[dict[str, Any]],
+    *,
+    store: ProposalStore,
+    cwd: Path,
+    config: Any = None,
+    min_turns: int = 6,
+    session_id: str = "",
+    mem0_post: Any = None,
+    project: str = "",
+) -> dict[str, Any]:
     """Returns {"skipped": bool, "facts": [...], "drafts": [paths], "proposals": [...]}."""
     if user_turns(messages) <= min_turns:
         return {"skipped": True, "facts": [], "drafts": [], "proposals": []}
@@ -67,7 +76,9 @@ async def review_session(caller: Any, messages: list[dict[str, Any]], *, store: 
         res = await caller.complete(
             TaskKind.CLASSIFICATION,
             [Message(role="system", content=SYSTEM), Message(role="user", content=transcript(messages))],
-            session_id=session_id, max_tokens=900, timeout=45,
+            session_id=session_id,
+            max_tokens=900,
+            timeout=45,
         )
     except Exception:  # noqa: BLE001
         return {"skipped": True, "facts": [], "drafts": [], "proposals": []}
@@ -94,8 +105,15 @@ async def review_session(caller: Any, messages: list[dict[str, Any]], *, store: 
         drafts.append(str(md))
         label = f"Save skill '{s['name']}'? ({str(s.get('description', ''))[:80]})"
         payload = {"op": "save", "name": s["name"], "draft": str(md)}
-        p = store.add("skill", label, f"save skill {s['name']}", session_id, payload=payload, project=project,
-                      key=dedup_key("skill", f"save {s['name']}"))
+        p = store.add(
+            "skill",
+            label,
+            f"save skill {s['name']}",
+            session_id,
+            payload=payload,
+            project=project,
+            key=dedup_key("skill", f"save {s['name']}"),
+        )
         if p:
             props.append(p)
     return {"skipped": False, "facts": facts, "drafts": drafts, "proposals": props}

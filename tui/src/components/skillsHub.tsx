@@ -1,199 +1,217 @@
-import { Box, Text, useInput, useStdout } from '@k3code/ink'
-import { useEffect, useState } from 'react'
+import { Box, Text, useInput, useStdout } from "@k3code/ink";
+import { useEffect, useState } from "react";
 
-import { NO_SKILLS_INSTALLED } from '../app/userMessages.js'
-import type { GatewayClient } from '../gatewayClient.js'
-import { rpcErrorMessage } from '../lib/rpc.js'
-import type { Theme } from '../theme.js'
+import { NO_SKILLS_INSTALLED } from "../app/userMessages.js";
+import type { GatewayClient } from "../gatewayClient.js";
+import { rpcErrorMessage } from "../lib/rpc.js";
+import type { Theme } from "../theme.js";
 
-import { OverlayHint, useOverlayKeys, windowItems, windowOffset } from './overlayControls.js'
-import { chipRowProps } from './overlayPrimitives.js'
-import { clampOverlayWidth } from './overlayPrimitives.js'
+import {
+  OverlayHint,
+  useOverlayKeys,
+  windowItems,
+  windowOffset,
+} from "./overlayControls.js";
+import { chipRowProps } from "./overlayPrimitives.js";
+import { clampOverlayWidth } from "./overlayPrimitives.js";
 
-const VISIBLE = 12
-const MIN_WIDTH = 40
-const MAX_WIDTH = 90
+const VISIBLE = 12;
+const MIN_WIDTH = 40;
+const MAX_WIDTH = 90;
 
 export function SkillsHub({ gw, maxWidth, onClose, t }: SkillsHubProps) {
-  const [skillsByCat, setSkillsByCat] = useState<Record<string, string[]>>({})
-  const [selectedCat, setSelectedCat] = useState('')
-  const [catIdx, setCatIdx] = useState(0)
-  const [skillIdx, setSkillIdx] = useState(0)
-  const [stage, setStage] = useState<'actions' | 'category' | 'skill'>('category')
-  const [info, setInfo] = useState<null | SkillInfo>(null)
-  const [installing, setInstalling] = useState(false)
-  const [err, setErr] = useState('')
-  const [loading, setLoading] = useState(true)
+  const [skillsByCat, setSkillsByCat] = useState<Record<string, string[]>>({});
+  const [selectedCat, setSelectedCat] = useState("");
+  const [catIdx, setCatIdx] = useState(0);
+  const [skillIdx, setSkillIdx] = useState(0);
+  const [stage, setStage] = useState<"actions" | "category" | "skill">(
+    "category",
+  );
+  const [info, setInfo] = useState<null | SkillInfo>(null);
+  const [installing, setInstalling] = useState(false);
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(true);
 
-  const { stdout } = useStdout()
-  const terminalWidth = Math.max(1, (stdout?.columns ?? 80) - 6)
-  const preferredWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, terminalWidth))
-  const width = clampOverlayWidth(preferredWidth, maxWidth)
+  const { stdout } = useStdout();
+  const terminalWidth = Math.max(1, (stdout?.columns ?? 80) - 6);
+  const preferredWidth = Math.max(
+    MIN_WIDTH,
+    Math.min(MAX_WIDTH, terminalWidth),
+  );
+  const width = clampOverlayWidth(preferredWidth, maxWidth);
 
   useEffect(() => {
-    gw.request<{ skills?: Record<string, string[]> }>('skills.manage', { action: 'list' })
-      .then(r => {
-        setSkillsByCat(r?.skills ?? {})
-        setErr('')
-        setLoading(false)
+    gw.request<{ skills?: Record<string, string[]> }>("skills.manage", {
+      action: "list",
+    })
+      .then((r) => {
+        setSkillsByCat(r?.skills ?? {});
+        setErr("");
+        setLoading(false);
       })
       .catch((e: unknown) => {
-        setErr(rpcErrorMessage(e))
-        setLoading(false)
-      })
-  }, [gw])
+        setErr(rpcErrorMessage(e));
+        setLoading(false);
+      });
+  }, [gw]);
 
-  const cats = Object.keys(skillsByCat).sort()
-  const skills = selectedCat ? (skillsByCat[selectedCat] ?? []) : []
-  const skillName = skills[skillIdx] ?? ''
+  const cats = Object.keys(skillsByCat).sort();
+  const skills = selectedCat ? (skillsByCat[selectedCat] ?? []) : [];
+  const skillName = skills[skillIdx] ?? "";
 
   const back = () => {
-    if (stage === 'actions') {
-      setStage('skill')
-      setInfo(null)
-      setErr('')
+    if (stage === "actions") {
+      setStage("skill");
+      setInfo(null);
+      setErr("");
 
-      return
+      return;
     }
 
-    if (stage === 'skill') {
-      setStage('category')
-      setSkillIdx(0)
+    if (stage === "skill") {
+      setStage("category");
+      setSkillIdx(0);
 
-      return
+      return;
     }
 
-    onClose()
-  }
+    onClose();
+  };
 
-  useOverlayKeys({ disabled: installing, onBack: back, onClose })
+  useOverlayKeys({ disabled: installing, onBack: back, onClose });
 
   const inspect = (name: string) => {
-    setInfo(null)
-    setErr('')
+    setInfo(null);
+    setErr("");
 
-    gw.request<{ info?: SkillInfo }>('skills.manage', { action: 'inspect', query: name })
-      .then(r => setInfo(r?.info ?? { name }))
-      .catch((e: unknown) => setErr(rpcErrorMessage(e)))
-  }
+    gw.request<{ info?: SkillInfo }>("skills.manage", {
+      action: "inspect",
+      query: name,
+    })
+      .then((r) => setInfo(r?.info ?? { name }))
+      .catch((e: unknown) => setErr(rpcErrorMessage(e)));
+  };
 
   const install = (name: string) => {
-    setInstalling(true)
-    setErr('')
+    setInstalling(true);
+    setErr("");
 
-    gw.request<{ installed?: boolean; name?: string }>('skills.manage', { action: 'install', query: name })
+    gw.request<{ installed?: boolean; name?: string }>("skills.manage", {
+      action: "install",
+      query: name,
+    })
       .then(() => onClose())
       .catch((e: unknown) => setErr(rpcErrorMessage(e)))
-      .finally(() => setInstalling(false))
-  }
+      .finally(() => setInstalling(false));
+  };
 
   useInput((ch, key) => {
     if (installing) {
-      return
+      return;
     }
 
-    if (stage === 'actions') {
+    if (stage === "actions") {
       if (key.return) {
-        setStage('skill')
-        setInfo(null)
-        setErr('')
+        setStage("skill");
+        setInfo(null);
+        setErr("");
 
-        return
+        return;
       }
 
-      if (ch.toLowerCase() === 'x' && skillName) {
-        install(skillName)
+      if (ch.toLowerCase() === "x" && skillName) {
+        install(skillName);
 
-        return
+        return;
       }
 
-      if (ch.toLowerCase() === 'i' && skillName) {
-        inspect(skillName)
+      if (ch.toLowerCase() === "i" && skillName) {
+        inspect(skillName);
       }
 
-      return
+      return;
     }
 
-    const count = stage === 'category' ? cats.length : skills.length
-    const sel = stage === 'category' ? catIdx : skillIdx
-    const setSel = stage === 'category' ? setCatIdx : setSkillIdx
+    const count = stage === "category" ? cats.length : skills.length;
+    const sel = stage === "category" ? catIdx : skillIdx;
+    const setSel = stage === "category" ? setCatIdx : setSkillIdx;
 
     if (key.upArrow && sel > 0) {
-      setSel(v => v - 1)
+      setSel((v) => v - 1);
 
-      return
+      return;
     }
 
     if (key.downArrow && sel < count - 1) {
-      setSel(v => v + 1)
+      setSel((v) => v + 1);
 
-      return
+      return;
     }
 
     if (key.return) {
-      if (stage === 'category') {
-        const cat = cats[catIdx]
+      if (stage === "category") {
+        const cat = cats[catIdx];
 
         if (!cat) {
-          return
+          return;
         }
 
-        setSelectedCat(cat)
-        setSkillIdx(0)
-        setStage('skill')
+        setSelectedCat(cat);
+        setSkillIdx(0);
+        setStage("skill");
 
-        return
+        return;
       }
 
-      const name = skills[skillIdx]
+      const name = skills[skillIdx];
 
       if (name) {
-        setStage('actions')
-        inspect(name)
+        setStage("actions");
+        inspect(name);
       }
 
-      return
+      return;
     }
 
-    const n = ch === '0' ? 10 : parseInt(ch, 10)
+    const n = ch === "0" ? 10 : parseInt(ch, 10);
 
     if (!Number.isNaN(n) && n >= 1 && n <= Math.min(10, count)) {
-      const next = windowOffset(count, sel, VISIBLE) + n - 1
+      const next = windowOffset(count, sel, VISIBLE) + n - 1;
 
-      if (stage === 'category') {
-        const cat = cats[next]
+      if (stage === "category") {
+        const cat = cats[next];
 
         if (cat) {
-          setSelectedCat(cat)
-          setCatIdx(next)
-          setSkillIdx(0)
-          setStage('skill')
+          setSelectedCat(cat);
+          setCatIdx(next);
+          setSkillIdx(0);
+          setStage("skill");
         }
 
-        return
+        return;
       }
 
-      const name = skills[next]
+      const name = skills[next];
 
       if (name) {
-        setSkillIdx(next)
-        setStage('actions')
-        inspect(name)
+        setSkillIdx(next);
+        setStage("actions");
+        inspect(name);
       }
     }
-  })
+  });
 
   if (loading) {
-    return <Text color={t.color.muted}>loading skills…</Text>
+    return <Text color={t.color.muted}>loading skills…</Text>;
   }
 
-  if (err && stage === 'category') {
+  if (err && stage === "category") {
     return (
       <Box flexDirection="column" width={width}>
         <Text color={t.color.label}>error: {err}</Text>
         <OverlayHint t={t}>Esc/q cancel</OverlayHint>
       </Box>
-    )
+    );
   }
 
   if (!cats.length) {
@@ -202,12 +220,14 @@ export function SkillsHub({ gw, maxWidth, onClose, t }: SkillsHubProps) {
         <Text color={t.color.muted}>{NO_SKILLS_INSTALLED}</Text>
         <OverlayHint t={t}>Esc/q cancel</OverlayHint>
       </Box>
-    )
+    );
   }
 
-  if (stage === 'category') {
-    const rows = cats.map(c => `${c} · ${skillsByCat[c]?.length ?? 0} skills`)
-    const { items, offset } = windowItems(rows, catIdx, VISIBLE)
+  if (stage === "category") {
+    const rows = cats.map(
+      (c) => `${c} · ${skillsByCat[c]?.length ?? 0} skills`,
+    );
+    const { items, offset } = windowItems(rows, catIdx, VISIBLE);
 
     return (
       <Box flexDirection="column" width={width}>
@@ -219,24 +239,36 @@ export function SkillsHub({ gw, maxWidth, onClose, t }: SkillsHubProps) {
         {offset > 0 && <Text color={t.color.muted}> ↑ {offset} more</Text>}
 
         {items.map((row, i) => {
-          const idx = offset + i
+          const idx = offset + i;
 
           return (
-            <Text color={t.color.muted} {...chipRowProps(t, catIdx === idx)} key={row} wrap="truncate-end">
-              {catIdx === idx ? '▸ ' : '  '}
+            <Text
+              color={t.color.muted}
+              {...chipRowProps(t, catIdx === idx)}
+              key={row}
+              wrap="truncate-end"
+            >
+              {catIdx === idx ? "▸ " : "  "}
               {i + 1}. {row}
             </Text>
-          )
+          );
         })}
 
-        {offset + VISIBLE < rows.length && <Text color={t.color.muted}> ↓ {rows.length - offset - VISIBLE} more</Text>}
-        <OverlayHint t={t}>↑/↓ select · Enter open · 1-9,0 quick · Esc/q cancel</OverlayHint>
+        {offset + VISIBLE < rows.length && (
+          <Text color={t.color.muted}>
+            {" "}
+            ↓ {rows.length - offset - VISIBLE} more
+          </Text>
+        )}
+        <OverlayHint t={t}>
+          ↑/↓ select · Enter open · 1-9,0 quick · Esc/q cancel
+        </OverlayHint>
       </Box>
-    )
+    );
   }
 
-  if (stage === 'skill') {
-    const { items, offset } = windowItems(skills, skillIdx, VISIBLE)
+  if (stage === "skill") {
+    const { items, offset } = windowItems(skills, skillIdx, VISIBLE);
 
     return (
       <Box flexDirection="column" width={width}>
@@ -245,28 +277,40 @@ export function SkillsHub({ gw, maxWidth, onClose, t }: SkillsHubProps) {
         </Text>
 
         <Text color={t.color.muted}>{skills.length} skill(s)</Text>
-        {!skills.length ? <Text color={t.color.muted}>no skills in this category</Text> : null}
+        {!skills.length ? (
+          <Text color={t.color.muted}>no skills in this category</Text>
+        ) : null}
         {offset > 0 && <Text color={t.color.muted}> ↑ {offset} more</Text>}
 
         {items.map((row, i) => {
-          const idx = offset + i
+          const idx = offset + i;
 
           return (
-            <Text color={t.color.muted} {...chipRowProps(t, skillIdx === idx)} key={row} wrap="truncate-end">
-              {skillIdx === idx ? '▸ ' : '  '}
+            <Text
+              color={t.color.muted}
+              {...chipRowProps(t, skillIdx === idx)}
+              key={row}
+              wrap="truncate-end"
+            >
+              {skillIdx === idx ? "▸ " : "  "}
               {i + 1}. {row}
             </Text>
-          )
+          );
         })}
 
         {offset + VISIBLE < skills.length && (
-          <Text color={t.color.muted}> ↓ {skills.length - offset - VISIBLE} more</Text>
+          <Text color={t.color.muted}>
+            {" "}
+            ↓ {skills.length - offset - VISIBLE} more
+          </Text>
         )}
         <OverlayHint t={t}>
-          {skills.length ? '↑/↓ select · Enter open · 1-9,0 quick · Esc back · q close' : 'Esc back · q close'}
+          {skills.length
+            ? "↑/↓ select · Enter open · 1-9,0 quick · Esc back · q close"
+            : "Esc back · q close"}
         </OverlayHint>
       </Box>
-    )
+    );
   }
 
   return (
@@ -276,27 +320,31 @@ export function SkillsHub({ gw, maxWidth, onClose, t }: SkillsHubProps) {
       </Text>
 
       <Text color={t.color.muted}>{info?.category ?? selectedCat}</Text>
-      {info?.description ? <Text color={t.color.text}>{info.description}</Text> : null}
+      {info?.description ? (
+        <Text color={t.color.text}>{info.description}</Text>
+      ) : null}
       {info?.path ? <Text color={t.color.muted}>path: {info.path}</Text> : null}
       {!info && !err ? <Text color={t.color.muted}>loading…</Text> : null}
       {err ? <Text color={t.color.label}>error: {err}</Text> : null}
       {installing ? <Text color={t.color.accent}>installing…</Text> : null}
 
-      <OverlayHint t={t}>i reinspect · x reinstall · Enter/Esc back · q close</OverlayHint>
+      <OverlayHint t={t}>
+        i reinspect · x reinstall · Enter/Esc back · q close
+      </OverlayHint>
     </Box>
-  )
+  );
 }
 
 interface SkillInfo {
-  category?: string
-  description?: string
-  name?: string
-  path?: string
+  category?: string;
+  description?: string;
+  name?: string;
+  path?: string;
 }
 
 interface SkillsHubProps {
-  gw: GatewayClient
-  maxWidth?: number
-  onClose: () => void
-  t: Theme
+  gw: GatewayClient;
+  maxWidth?: number;
+  onClose: () => void;
+  t: Theme;
 }

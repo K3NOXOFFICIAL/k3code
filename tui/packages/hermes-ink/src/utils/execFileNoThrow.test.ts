@@ -1,14 +1,20 @@
-import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import {
+  chmodSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { execFileNoThrow } from './execFileNoThrow.js'
+import { execFileNoThrow } from "./execFileNoThrow.js";
 
 // These tests shell out to /bin/sh, use chmodSync(0o755), and rely on
 // POSIX sleep/job control. They will not work on Windows.
-const onWindows = process.platform === 'win32'
+const onWindows = process.platform === "win32";
 
 // We simulate `wl-copy`'s daemonization behavior with a tiny shell script:
 //   1. Fork a short-lived background sleeper that inherits stdio (so the
@@ -20,17 +26,17 @@ const onWindows = process.platform === 'win32'
 // timeout — exactly the production wl-copy bug. With resolveOnExit, the
 // promise settles on `'exit'` regardless of the inherited pipes.
 
-let scriptDir: string
-let daemonScript: string
-let sleeperPids: number[]
+let scriptDir: string;
+let daemonScript: string;
+let sleeperPids: number[];
 
 /** Read the PID file the daemon script writes, and track it for afterEach cleanup. */
 function trackSleeperPid(pidFile: string): void {
   try {
-    const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10)
+    const pid = parseInt(readFileSync(pidFile, "utf8").trim(), 10);
 
     if (pid > 0) {
-      sleeperPids.push(pid)
+      sleeperPids.push(pid);
     }
   } catch {
     // PID file not written or unreadable — sleeper may have already exited.
@@ -38,33 +44,36 @@ function trackSleeperPid(pidFile: string): void {
 }
 
 beforeEach(() => {
-  sleeperPids = []
-  scriptDir = join(tmpdir(), `hermes-execfile-test-${process.pid}-${Date.now()}`)
-  mkdirSync(scriptDir, { recursive: true })
-  daemonScript = join(scriptDir, 'fake-daemonizer.sh')
+  sleeperPids = [];
+  scriptDir = join(
+    tmpdir(),
+    `hermes-execfile-test-${process.pid}-${Date.now()}`,
+  );
+  mkdirSync(scriptDir, { recursive: true });
+  daemonScript = join(scriptDir, "fake-daemonizer.sh");
   // Posix sh: the `sleep 3 &` child inherits stdin/stdout/stderr from the
   // shell, which inherited them from `spawn(stdio: 'pipe')`. The shell
   // exits but its child (the sleeper) keeps the pipes open. Mirrors how
   // wl-copy double-forks then exits while the daemon holds the selection.
   // The sleeper writes its PID to $1 so we can clean it up reliably.
-  writeFileSync(daemonScript, '#!/bin/sh\nsleep 3 &\necho $! > "$1"\nexit 0\n')
-  chmodSync(daemonScript, 0o755)
-})
+  writeFileSync(daemonScript, '#!/bin/sh\nsleep 3 &\necho $! > "$1"\nexit 0\n');
+  chmodSync(daemonScript, 0o755);
+});
 
 afterEach(() => {
   // Kill orphaned sleepers so they don't accumulate across watch runs.
   for (const pid of sleeperPids) {
     try {
-      process.kill(pid, 'SIGKILL')
+      process.kill(pid, "SIGKILL");
     } catch {
       // Already exited — fine.
     }
   }
 
-  rmSync(scriptDir, { recursive: true, force: true })
-})
+  rmSync(scriptDir, { recursive: true, force: true });
+});
 
-describe.skipIf(onWindows)('execFileNoThrow with daemon-style children', () => {
+describe.skipIf(onWindows)("execFileNoThrow with daemon-style children", () => {
   // Formerly a documented forever-hang: without resolveOnExit, the 'close'
   // event doesn't fire when the immediate child has exited but a forked
   // daemon still holds stdio open, and even the SIGTERM at timeout used to
@@ -73,69 +82,77 @@ describe.skipIf(onWindows)('execFileNoThrow with daemon-style children', () => {
   // The daemon script's sleeper lives 30s so it genuinely outlives the
   // timeout (and vitest's own 5s test timeout — before the fix this test
   // fails by timing out, not by asserting).
-  it('settles with code=124 on timeout when a daemon inherits stdio and resolveOnExit is off', async () => {
-    const pidFile = join(scriptDir, 'sleeper-skip.pid')
-    const longDaemonScript = join(scriptDir, 'fake-daemonizer-long.sh')
-    writeFileSync(longDaemonScript, '#!/bin/sh\nsleep 30 &\necho $! > "$1"\nexit 0\n')
-    chmodSync(longDaemonScript, 0o755)
-    const start = Date.now()
+  it("settles with code=124 on timeout when a daemon inherits stdio and resolveOnExit is off", async () => {
+    const pidFile = join(scriptDir, "sleeper-skip.pid");
+    const longDaemonScript = join(scriptDir, "fake-daemonizer-long.sh");
+    writeFileSync(
+      longDaemonScript,
+      '#!/bin/sh\nsleep 30 &\necho $! > "$1"\nexit 0\n',
+    );
+    chmodSync(longDaemonScript, 0o755);
+    const start = Date.now();
 
-    const result = await execFileNoThrow(longDaemonScript, [pidFile], { timeout: 300 })
-    trackSleeperPid(pidFile)
+    const result = await execFileNoThrow(longDaemonScript, [pidFile], {
+      timeout: 300,
+    });
+    trackSleeperPid(pidFile);
 
-    expect(result.code).toBe(124)
-    expect(Date.now() - start).toBeLessThan(2000)
-  })
+    expect(result.code).toBe(124);
+    expect(Date.now() - start).toBeLessThan(2000);
+  });
 
   it("settles immediately on 'exit' when resolveOnExit is true, regardless of daemon stdio", async () => {
-    const pidFile = join(scriptDir, 'sleeper-exit.pid')
-    const start = Date.now()
+    const pidFile = join(scriptDir, "sleeper-exit.pid");
+    const start = Date.now();
 
     const result = await execFileNoThrow(daemonScript, [pidFile], {
       timeout: 2000,
-      resolveOnExit: true
-    })
+      resolveOnExit: true,
+    });
 
-    trackSleeperPid(pidFile)
+    trackSleeperPid(pidFile);
 
-    const elapsed = Date.now() - start
+    const elapsed = Date.now() - start;
 
     // The shell exits in a few ms. resolveOnExit lets us return on exit
     // (code 0) instead of waiting for the orphaned sleeper to release
     // stdio. Should be well under 200ms even on slow CI.
-    expect(result.code).toBe(0)
-    expect(elapsed).toBeLessThan(500)
-  })
+    expect(result.code).toBe(0);
+    expect(elapsed).toBeLessThan(500);
+  });
 
   it("still surfaces the right code when resolveOnExit'd child exits non-zero", async () => {
-    const pidFile = join(scriptDir, 'sleeper-fail.pid')
-    const failScript = join(scriptDir, 'fail.sh')
-    writeFileSync(failScript, `#!/bin/sh\nsleep 3 &\necho $! > "${pidFile}"\nexit 7\n`)
-    chmodSync(failScript, 0o755)
+    const pidFile = join(scriptDir, "sleeper-fail.pid");
+    const failScript = join(scriptDir, "fail.sh");
+    writeFileSync(
+      failScript,
+      `#!/bin/sh\nsleep 3 &\necho $! > "${pidFile}"\nexit 7\n`,
+    );
+    chmodSync(failScript, 0o755);
 
     const result = await execFileNoThrow(failScript, [], {
       timeout: 2000,
-      resolveOnExit: true
-    })
+      resolveOnExit: true,
+    });
 
-    trackSleeperPid(pidFile)
+    trackSleeperPid(pidFile);
 
-    expect(result.code).toBe(7)
-  })
+    expect(result.code).toBe(7);
+  });
 
-  it('settles on timeout=124 when the child itself never exits, even with resolveOnExit', async () => {
-    const slowScript = join(scriptDir, 'slow.sh')
-    writeFileSync(slowScript, '#!/bin/sh\nsleep 30\n')
-    chmodSync(slowScript, 0o755)
+  it("settles on timeout=124 when the child itself never exits, even with resolveOnExit", async () => {
+    const slowScript = join(scriptDir, "slow.sh");
+    writeFileSync(slowScript, "#!/bin/sh\nsleep 30\n");
+    chmodSync(slowScript, 0o755);
 
     const result = await execFileNoThrow(slowScript, [], {
       timeout: 200,
-      resolveOnExit: true
-    })
+      resolveOnExit: true,
+    });
 
     // Child process never exits on its own → timer fires → SIGTERM →
     // child exits → 'exit' fires with non-null signal. The settle()
     // call from the timer registers code=124 first. Either way: 124.
-    expect(result.code).toBe(124)
-  })
-})
+    expect(result.code).toBe(124);
+  });
+});

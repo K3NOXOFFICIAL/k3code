@@ -9,11 +9,14 @@
  * copy an active TUI selection, matching common terminal selection behavior.
  */
 
-export const isMac = process.platform === 'darwin'
+export const isMac = process.platform === "darwin";
 
 /** True when the platform action-modifier is pressed (Cmd on macOS, Ctrl elsewhere). */
-export const isActionMod = (key: { ctrl: boolean; meta: boolean; super?: boolean }): boolean =>
-  isMac ? key.meta || key.super === true : key.ctrl
+export const isActionMod = (key: {
+  ctrl: boolean;
+  meta: boolean;
+  super?: boolean;
+}): boolean => (isMac ? key.meta || key.super === true : key.ctrl);
 
 /**
  * Accept raw Ctrl+<letter> as an action shortcut on macOS, where `isActionMod`
@@ -29,25 +32,33 @@ export const isActionMod = (key: { ctrl: boolean; meta: boolean; super?: boolean
 export const isMacActionFallback = (
   key: { ctrl: boolean; meta: boolean; super?: boolean },
   ch: string,
-  target: 'a' | 'd' | 'e' | 'u' | 'k' | 'w'
-): boolean => isMac && key.ctrl && !key.meta && key.super !== true && ch.toLowerCase() === target
+  target: "a" | "d" | "e" | "u" | "k" | "w",
+): boolean =>
+  isMac &&
+  key.ctrl &&
+  !key.meta &&
+  key.super !== true &&
+  ch.toLowerCase() === target;
 
 /** Match action-modifier + a single character (case-insensitive). */
-export const isAction = (key: { ctrl: boolean; meta: boolean; super?: boolean }, ch: string, target: string): boolean =>
-  isActionMod(key) && ch.toLowerCase() === target
+export const isAction = (
+  key: { ctrl: boolean; meta: boolean; super?: boolean },
+  ch: string,
+  target: string,
+): boolean => isActionMod(key) && ch.toLowerCase() === target;
 
 export const isRemoteShell = (env: NodeJS.ProcessEnv = process.env): boolean =>
-  Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY)
+  Boolean(env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY);
 
 export const isCopyShortcut = (
   key: { ctrl: boolean; meta: boolean; super?: boolean },
   ch: string,
-  env: NodeJS.ProcessEnv = process.env
+  env: NodeJS.ProcessEnv = process.env,
 ): boolean =>
-  ch.toLowerCase() === 'c' &&
-  (isAction(key, ch, 'c') ||
+  ch.toLowerCase() === "c" &&
+  (isAction(key, ch, "c") ||
     (isRemoteShell(env) && (key.meta || key.super === true)) ||
     // VS Code/Cursor/Windsurf terminal setup forwards Cmd+C as a CSI-u
     // sequence with the super bit plus a benign ctrl bit. Accept that shape
     // even though raw Ctrl+C should remain interrupt on local macOS.
-    (isMac && key.ctrl && (key.meta || key.super === true)))
+    (isMac && key.ctrl && (key.meta || key.super === true)));

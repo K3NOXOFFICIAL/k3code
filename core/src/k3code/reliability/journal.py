@@ -40,9 +40,7 @@ def args_digest(args: dict[str, Any]) -> str:
 
 def result_digest(result: Any) -> str:
     """Stable digest of a tool result."""
-    return hashlib.sha256(
-        json.dumps(result, sort_keys=True, default=str).encode()
-    ).hexdigest()[:16]
+    return hashlib.sha256(json.dumps(result, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 @dataclass

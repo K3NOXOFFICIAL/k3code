@@ -48,8 +48,9 @@ def parse_agent_md(text: str, default_name: str = "", source: str = "") -> Agent
     if tier and tier not in VALID_TIERS:
         logger.warning("agent %s: unknown tier %r ignored", name, tier)
         tier = ""
-    return AgentType(name=name, description=meta.get("description", ""), tools=tools, tier=tier,
-                     prompt=body.strip(), source=source)
+    return AgentType(
+        name=name, description=meta.get("description", ""), tools=tools, tier=tier, prompt=body.strip(), source=source
+    )
 
 
 def _load_dir(path: Path, source: str, into: dict[str, AgentType]) -> None:

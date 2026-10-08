@@ -1,7 +1,7 @@
-import { Box, Text } from '@k3code/ink'
-import { type ReactNode, useState } from 'react'
+import { Box, Text } from "@k3code/ink";
+import { type ReactNode, useState } from "react";
 
-import type { Theme } from '../theme.js'
+import type { Theme } from "../theme.js";
 
 /**
  * THE expand/collapse primitive — the session panel's tool/skill sections
@@ -18,41 +18,43 @@ export function Accordion({
   open,
   suffix,
   t,
-  title
+  title,
 }: {
-  children: ReactNode
-  count?: number
-  defaultOpen?: boolean
+  children: ReactNode;
+  count?: number;
+  defaultOpen?: boolean;
   /** Controlled open state; omit for internal (click-toggled) state. */
-  open?: boolean
-  onToggle?: () => void
-  suffix?: string
-  t: Theme
-  title: string
+  open?: boolean;
+  onToggle?: () => void;
+  suffix?: string;
+  t: Theme;
+  title: string;
 }) {
-  const [uncontrolled, setUncontrolled] = useState(defaultOpen)
-  const isOpen = open ?? uncontrolled
+  const [uncontrolled, setUncontrolled] = useState(defaultOpen);
+  const isOpen = open ?? uncontrolled;
 
   const toggle = () => {
-    onToggle?.()
+    onToggle?.();
 
     if (open === undefined) {
-      setUncontrolled(v => !v)
+      setUncontrolled((v) => !v);
     }
-  }
+  };
 
   return (
     <Box flexDirection="column">
       <Box onClick={toggle}>
-        <Text color={t.color.accent}>{isOpen ? '▾ ' : '▸ '}</Text>
+        <Text color={t.color.accent}>{isOpen ? "▾ " : "▸ "}</Text>
         <Text bold color={t.color.accent}>
           {title}
         </Text>
-        {typeof count === 'number' ? <Text color={t.color.muted}> ({count})</Text> : null}
+        {typeof count === "number" ? (
+          <Text color={t.color.muted}> ({count})</Text>
+        ) : null}
         {suffix ? <Text color={t.color.muted}> {suffix}</Text> : null}
       </Box>
 
       {isOpen ? children : null}
     </Box>
-  )
+  );
 }

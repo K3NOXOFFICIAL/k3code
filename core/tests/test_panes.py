@@ -31,12 +31,26 @@ def event(state: str, text: str = "") -> str:
 
 
 def approval_frame(req_id: str = "approval-7") -> str:
-    return json.dumps({"jsonrpc": "2.0", "id": req_id, "method": "approval", "params": {
-        "session_id": "s1", "request_id": "r", "command": "rm -rf build", "description": "delete",
-        "choices": ["once", "session", "always", "deny"], "tool_name": "bash", "pattern": "bash(rm:*)"}})
+    return json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "approval",
+            "params": {
+                "session_id": "s1",
+                "request_id": "r",
+                "command": "rm -rf build",
+                "description": "delete",
+                "choices": ["once", "session", "always", "deny"],
+                "tool_name": "bash",
+                "pattern": "bash(rm:*)",
+            },
+        }
+    )
 
 
 # ── state mapping and no-op ──────────────────────────────────────────
+
 
 def test_state_mapping():
     assert map_state("working") == "working"
@@ -68,6 +82,7 @@ def test_clean_summary_is_one_short_line():
 
 # ── reporter ─────────────────────────────────────────────────────────
 
+
 def test_reports_every_change_once(tuios):
     link = PaneLink.from_env(environ=tuios.env())
     for st in ("idle", "working", "working", "needs_input", "working", "idle", "idle", "completed"):
@@ -98,9 +113,14 @@ def test_pane_token_is_presented_first(tuios):
 
 # ── Inbox approval round trip ────────────────────────────────────────
 
+
 def test_approval_is_held_and_deny_resolves(tuios):
-    tuios.answers["request-approval"] = lambda p: {"request_id": "h1", "decision": "deny", "message": "no thanks",
-                                                   "reason": "answered"}
+    tuios.answers["request-approval"] = lambda p: {
+        "request_id": "h1",
+        "decision": "deny",
+        "message": "no thanks",
+        "reason": "answered",
+    }
     injected: list[tuple[str, str, dict]] = []
     link = PaneLink.from_env(lambda *a: injected.append(a), environ=tuios.env())
     link.sync = True
@@ -179,6 +199,7 @@ def test_answering_in_the_pane_cancels_the_hold(tuios):
 
 # ── new panes ────────────────────────────────────────────────────────
 
+
 async def test_bg_pane_sends_start_agent(tuios, tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, monkeypatch, replies=["done"])
     server.panes = PaneLink.from_env(environ=tuios.env())
@@ -222,8 +243,15 @@ async def test_fork_pane_sends_start_agent(tuios, tmp_path, monkeypatch):
 
 def test_fanout_child_pane_is_read_only_tail(tuios):
     link = PaneLink.from_env(environ=tuios.env())
-    link.on_server_line(json.dumps({"jsonrpc": "2.0", "method": "event", "params": {
-        "type": "pane.open", "payload": {"subagent_id": "sa-1234", "name": "fan s1 parser"}}}))
+    link.on_server_line(
+        json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {"type": "pane.open", "payload": {"subagent_id": "sa-1234", "name": "fan s1 parser"}},
+            }
+        )
+    )
     p = tuios.wait_for("start-agent")[0]
     assert " tail sa-1234" in p["agent"] and p["name"] == "fan s1 parser"
 
@@ -235,6 +263,7 @@ def test_argv_for_specs():
 
 
 # ── read-only ────────────────────────────────────────────────────────
+
 
 def test_readonly_refuses_changes(tuios):
     link = PaneLink.from_env(readonly=True, environ=tuios.env())
@@ -252,5 +281,3 @@ async def test_fanout_panes_config_emits_pane_open(tmp_path, monkeypatch):
     assert autonomy_cfg(server.config)["fanout"]["panes"] is True
     server2, _ = make_server(tmp_path, monkeypatch)
     assert autonomy_cfg(server2.config)["fanout"]["panes"] is False
-
-

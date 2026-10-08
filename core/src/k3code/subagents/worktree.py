@@ -5,18 +5,24 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from dataclasses import dataclass
 from pathlib import Path
+
+from k3code.reliability.sandbox import child_env, harness_git_argv
 
 _GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true", "GIT_CONFIG_NOSYSTEM": "1"}
 
 
 async def git(cwd: str | Path, *args: str, timeout: float = 60) -> tuple[int, str]:
     """Run git non-interactively; returns (returncode, stdout+stderr). Never raises on a non-zero exit."""
+    # harness git: hooks and fsmonitor disabled, scrubbed env (no provider keys reach git)
     proc = await asyncio.create_subprocess_exec(
-        "git", *args, cwd=str(cwd), stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env={**os.environ, **_GIT_ENV},
+        *harness_git_argv(*args),
+        cwd=str(cwd),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=child_env(_GIT_ENV),
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
@@ -38,6 +44,22 @@ _REPO_LOCKS: dict[str, asyncio.Lock] = {}
 
 def repo_lock(repo: str | Path) -> asyncio.Lock:
     return _REPO_LOCKS.setdefault(str(Path(repo).resolve()), asyncio.Lock())
+
+
+#: One lock per repository for ``git worktree add`` / ``remove``. Concurrent adds raced on the shared
+#: ``.git/worktrees`` admin dirs: one add read a sibling's half-written ``commondir``
+#: ("fatal: failed to read .git/worktrees/<id>/commondir"). Kept apart from ``_REPO_LOCKS`` so a worktree op never
+#: waits on a merge. Keyed per loop too: an asyncio lock binds to the loop it first waits on.
+_WORKTREE_LOCKS: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
+
+
+def worktree_lock(repo: str | Path) -> asyncio.Lock:
+    key = str(Path(repo).resolve())
+    loop = asyncio.get_running_loop()
+    held = _WORKTREE_LOCKS.get(key)
+    if held is None or held[0] is not loop:
+        held = _WORKTREE_LOCKS[key] = (loop, asyncio.Lock())
+    return held[1]
 
 
 async def merge_in_progress(repo: str | Path) -> bool:
@@ -71,14 +93,15 @@ async def create(parent_cwd: str | Path, child_id: str) -> Worktree | None:
     if rc != 0:  # no commits yet
         return None
     base = base.strip()
-    k3 = root / ".k3code"
-    k3.mkdir(exist_ok=True)
-    gi = k3 / ".gitignore"
-    if not gi.exists():
-        gi.write_text("*\n", encoding="utf-8")  # worktrees/plans/research never show up as untracked
-    path = k3 / "worktrees" / child_id
+    path = root / ".k3code" / "worktrees" / child_id
     branch = f"k3/{child_id}"
-    rc, out = await git(root, "worktree", "add", str(path), "-b", branch, base)
+    async with worktree_lock(root):  # parallel adds on one repo race on .git/worktrees (see worktree_lock)
+        k3 = root / ".k3code"
+        k3.mkdir(exist_ok=True)
+        gi = k3 / ".gitignore"
+        if not gi.exists():
+            gi.write_text("*\n", encoding="utf-8")  # worktrees/plans/research never show up as untracked
+        rc, out = await git(root, "worktree", "add", str(path), "-b", branch, base)
     if rc != 0:
         raise RuntimeError(f"git worktree add failed: {out.strip()}")
     return Worktree(child_id, root, path, branch, base)
@@ -90,8 +113,9 @@ async def commit_all(wt: Worktree, message: str) -> bool:
     rc, _ = await git(wt.path, "diff", "--cached", "--quiet")
     if rc == 0:
         return False
-    rc, out = await git(wt.path, "-c", "user.name=k3code", "-c", "user.email=k3code@localhost",
-                        "commit", "-q", "-m", message)
+    rc, out = await git(
+        wt.path, "-c", "user.name=k3code", "-c", "user.email=k3code@localhost", "commit", "-q", "-m", message
+    )
     if rc != 0:
         raise RuntimeError(f"commit in worktree failed: {out.strip()}")
     return True
@@ -118,8 +142,18 @@ async def merge(wt: Worktree) -> tuple[bool, str]:
         if await merge_in_progress(wt.repo):
             return False, _BUSY
         try:
-            rc, out = await git(wt.repo, "-c", "user.name=k3code", "-c", "user.email=k3code@localhost",
-                                "merge", "--no-ff", "-m", f"Merge {wt.branch}", wt.branch)
+            rc, out = await git(
+                wt.repo,
+                "-c",
+                "user.name=k3code",
+                "-c",
+                "user.email=k3code@localhost",
+                "merge",
+                "--no-ff",
+                "-m",
+                f"Merge {wt.branch}",
+                wt.branch,
+            )
         except asyncio.CancelledError:
             await asyncio.shield(git(wt.repo, "merge", "--abort"))  # ours: leave the checkout as we found it
             raise
@@ -131,9 +165,10 @@ async def merge(wt: Worktree) -> tuple[bool, str]:
 
 async def remove(wt: Worktree, *, keep_branch: bool) -> None:
     """Drop the worktree directory; delete the branch unless it must survive (conflict)."""
-    await git(wt.repo, "worktree", "remove", "--force", str(wt.path))
-    if not keep_branch:
-        await git(wt.repo, "branch", "-D", wt.branch)
+    async with worktree_lock(wt.repo):  # a remove rewrites .git/worktrees while a sibling add may be reading it
+        await git(wt.repo, "worktree", "remove", "--force", str(wt.path))
+        if not keep_branch:
+            await git(wt.repo, "branch", "-D", wt.branch)
 
 
 async def head_sha(repo: str | Path) -> str:
@@ -162,8 +197,18 @@ async def merge_trial(wt: Worktree) -> tuple[bool, str]:
 
 
 async def commit_merge(wt: Worktree, message: str | None = None) -> tuple[bool, str]:
-    rc, out = await git(wt.repo, "-c", "user.name=k3code", "-c", "user.email=k3code@localhost",
-                        "commit", "-q", "--no-edit", "-m", message or f"Merge {wt.branch}")
+    rc, out = await git(
+        wt.repo,
+        "-c",
+        "user.name=k3code",
+        "-c",
+        "user.email=k3code@localhost",
+        "commit",
+        "-q",
+        "--no-edit",
+        "-m",
+        message or f"Merge {wt.branch}",
+    )
     if rc != 0 and "nothing to commit" in out:
         return True, out.strip()  # fast-forward-like no-op merge
     return rc == 0, out.strip()
@@ -176,8 +221,9 @@ async def abort_merge(wt: Worktree) -> None:
 async def bring_parent_into(wt: Worktree, parent_sha: str) -> tuple[bool, str]:
     """Merge the parent's current HEAD into the child's worktree. On conflict the markers stay in the tree
     (the child resolves them); returns (clean, output)."""
-    rc, out = await git(wt.path, "-c", "user.name=k3code", "-c", "user.email=k3code@localhost",
-                        "merge", "--no-edit", parent_sha)
+    rc, out = await git(
+        wt.path, "-c", "user.name=k3code", "-c", "user.email=k3code@localhost", "merge", "--no-edit", parent_sha
+    )
     return rc == 0, out.strip()
 
 

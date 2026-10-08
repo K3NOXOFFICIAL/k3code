@@ -5,5 +5,5 @@ export function updateLastInteractionTime(): void {}
 export function markScrollActivity(): void {}
 
 export function getIsInteractive(): boolean {
-  return !!process.stdin.isTTY && !!process.stdout.isTTY
+  return !!process.stdin.isTTY && !!process.stdout.isTTY;
 }

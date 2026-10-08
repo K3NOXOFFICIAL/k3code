@@ -209,7 +209,8 @@ def apply_bundle(
                 session_id=str(obj["session_id"]),
             )
             sess.meta = {
-                k: v for k, v in (sess.meta if isinstance(sess.meta, dict) else {}).items()
+                k: v
+                for k, v in (sess.meta if isinstance(sess.meta, dict) else {}).items()
                 if k not in _UNTRUSTED_META and not k.startswith("origin")
             }
             old = sess.session_id

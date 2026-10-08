@@ -68,9 +68,7 @@ async def test_router_retries_then_fails_over(sample_messages, sample_tools, pro
 
     # Secondary: succeeds
     success_chunk = 'data: {"choices":[{"delta":{"content":"Hi"}}]}\ndata: {"choices":[{"delta":{}}]}\ndata: [DONE]\n'
-    secondary_responses = [
-        httpx.Response(200, text=success_chunk, headers={"content-type": "text/event-stream"})
-    ]
+    secondary_responses = [httpx.Response(200, text=success_chunk, headers={"content-type": "text/event-stream"})]
     secondary, _ = provider_factory(secondary_responses)
 
     chain = build_chain([primary, secondary], [["model-1"], ["model-2"]])
@@ -102,9 +100,7 @@ async def test_router_401_immediate_failover(sample_messages, sample_tools, prov
     primary, _ = provider_factory(primary_responses)
 
     success_chunk = 'data: {"choices":[{"delta":{"content":"OK"}}]}\ndata: {"choices":[{"delta":{}}]}\ndata: [DONE]\n'
-    secondary_responses = [
-        httpx.Response(200, text=success_chunk, headers={"content-type": "text/event-stream"})
-    ]
+    secondary_responses = [httpx.Response(200, text=success_chunk, headers={"content-type": "text/event-stream"})]
     secondary, _ = provider_factory(secondary_responses)
 
     chain = build_chain([primary, secondary], [["model-1"], ["model-2"]])
@@ -262,6 +258,7 @@ def test_cooldown_arms_and_expires():
 
     # Advance time
     import time
+
     time.sleep(1.1)
     assert not store.in_cooldown(provider="test", model="model-1", base_url="https://api.test.com")
 
@@ -316,3 +313,70 @@ def test_a_genuine_context_overflow_is_still_context_overflow():
     msg = "This model's maximum context length is 8192 tokens, however you requested 9000"
     err = ProviderError(msg, status_code=400)
     assert classify_api_error(err, provider="p", model="m").reason == FailoverReason.context_overflow
+
+
+# ── TLS certificate failures: permanent, hinted, never parked ─────────
+
+CERT_ERROR = (
+    "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1010)"
+)
+
+
+def test_certificate_verify_failure_is_permanent_and_hinted():
+    from k3code.providers.base import to_provider_error
+    from k3code.reliability.persistent_retry import PERMANENT_REASONS
+
+    err = to_provider_error(httpx.ConnectError(CERT_ERROR), kind="openai")
+    result = classify_api_error(err, provider="p", model="m")
+    assert result.reason is FailoverReason.ssl_cert
+    assert result.reason.value in PERMANENT_REASONS
+    assert not result.retryable
+    assert result.immediate_failover  # another entry may not sit behind this proxy
+    assert "SSL_CERT_FILE" in result.hint and "proxy" in result.hint
+
+
+def test_certificate_error_type_in_the_cause_chain_is_permanent():
+    import ssl
+
+    from k3code.providers.base import ProviderError
+
+    err = ProviderError("request failed")
+    err.__cause__ = ssl.SSLCertVerificationError(1, "unverifiable")
+    assert classify_api_error(err).reason is FailoverReason.ssl_cert
+
+
+def test_transient_tls_alert_is_still_network():
+    from k3code.providers.base import to_provider_error
+
+    transient = httpx.ConnectError("[SSL: TLSV1_ALERT_INTERNAL_ERROR] tlsv1 alert internal error")
+    err = to_provider_error(transient, kind="openai")
+    result = classify_api_error(err)
+    assert result.reason is FailoverReason.network
+    assert result.hint == ""
+
+
+async def test_certificate_failure_fails_the_turn_instead_of_parking(provider_factory, sample_messages, sample_tools):
+    """An unattended run parks on network failures and waits for connectivity; a certificate that does not verify
+    must end the turn at once, with the hint, and without inline retries."""
+    from k3code.errors import ChainExhausted
+    from k3code.reliability.events import PARKED, EventEmitter
+    from k3code.reliability.persistent_retry import PersistentRetry, RetryConfig
+
+    provider, client = provider_factory([httpx.ConnectError(CERT_ERROR) for _ in range(5)])
+    router = Router(build_chain([provider], [["model-1"]]), max_retries=2, base_delay=0.01, max_delay=0.05)
+    events, seen, slept = EventEmitter(), [], []
+    events.add(seen.append)
+
+    async def _no_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    retry = PersistentRetry(router, None, config=RetryConfig(poll_interval=0.01), events=events, sleep=_no_sleep)
+    retry.unattended = True
+    with pytest.raises(ChainExhausted) as raised:
+        async for _ in retry.stream(sample_messages, sample_tools):
+            pass
+    assert raised.value.last_reason == "ssl_cert"
+    assert "SSL_CERT_FILE" in str(raised.value)
+    assert client.send.await_count == 1
+    assert slept == []
+    assert not [e for e in seen if e.kind == PARKED]

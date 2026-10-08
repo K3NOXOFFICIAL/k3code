@@ -13,6 +13,9 @@ jobs:
       - name: ruff
         working-directory: core
         run: uv run ruff check . ../scripts
+      - name: ruff format
+        working-directory: core
+        run: uv run ruff format --check . ../scripts
       - name: pytest
         working-directory: core
         run: uv run pytest -q
@@ -62,6 +65,9 @@ jobs:
       - name: eslint
         working-directory: tui
         run: npm run lint
+      - name: prettier
+        working-directory: tui
+        run: npx prettier --check .
       - name: vitest (known failures excluded)
         working-directory: tui
         # known-failing upstream tests go in .ci-test-excludes (one vitest --exclude glob per line)

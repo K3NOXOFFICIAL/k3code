@@ -1,22 +1,30 @@
-import { watch } from 'fs'
-import { readdir } from 'fs/promises'
-import { homedir } from 'os'
-import { dirname, join } from 'path'
-import { pathToFileURL } from 'url'
+import { watch } from "fs";
+import { readdir } from "fs/promises";
+import { homedir } from "os";
+import { dirname, join } from "path";
+import { pathToFileURL } from "url";
 
-import { Box, Text } from '@k3code/ink'
-import * as React from 'react'
+import { Box, Text } from "@k3code/ink";
+import * as React from "react";
 
-import { Accordion } from '../components/accordion.js'
-import { Shimmer, ShimmerRows, useShimmerPhase } from '../components/loaders.js'
-import { Dialog, Overlay } from '../components/overlay.js'
-import { GridAreas, WidgetGrid } from '../components/widgetGrid.js'
-import { gauge, hbars, sparkline, sparkRows } from '../lib/charts.js'
-import { recordParentLifecycle } from '../lib/parentLog.js'
+import { Accordion } from "../components/accordion.js";
+import {
+  Shimmer,
+  ShimmerRows,
+  useShimmerPhase,
+} from "../components/loaders.js";
+import { Dialog, Overlay } from "../components/overlay.js";
+import { GridAreas, WidgetGrid } from "../components/widgetGrid.js";
+import { gauge, hbars, sparkline, sparkRows } from "../lib/charts.js";
+import { recordParentLifecycle } from "../lib/parentLog.js";
 
-import { openWidget, updateWidget } from './host.js'
-import { defineWidgetApp, listWidgetApps, removeWidgetApp } from './registry.js'
-import { isCtrl } from './types.js'
+import { openWidget, updateWidget } from "./host.js";
+import {
+  defineWidgetApp,
+  listWidgetApps,
+  removeWidgetApp,
+} from "./registry.js";
+import { isCtrl } from "./types.js";
 
 /**
  * User widget apps — k3code authors its own TUI widgets, mirroring the
@@ -53,107 +61,124 @@ export const widgetSdk = {
   sparkRows,
   sparkline,
   updateWidget,
-  useShimmerPhase
-} as const
+  useShimmerPhase,
+} as const;
 
-export type WidgetSdk = typeof widgetSdk
+export type WidgetSdk = typeof widgetSdk;
 
-const widgetsDir = () => join(process.env.K3CODE_HOME?.trim() || join(homedir(), '.k3code'), 'tui-widgets')
+const widgetsDir = () =>
+  join(
+    process.env.K3CODE_HOME?.trim() || join(homedir(), ".k3code"),
+    "tui-widgets",
+  );
 
 export interface UserWidgetLoadResult {
   /** App ids newly registered by this scan. */
-  added: string[]
-  errors: { file: string; message: string }[]
-  loaded: string[]
+  added: string[];
+  errors: { file: string; message: string }[];
+  loaded: string[];
   /** App ids unregistered because their file disappeared. */
-  removed: string[]
+  removed: string[];
 }
 
 /** Which app ids each user file registered — the delete-sync source of
  *  truth (file gone on the next scan ⇒ its apps unregister). */
-const fileApps = new Map<string, string[]>()
+const fileApps = new Map<string, string[]>();
 
-const listeners = new Set<(result: UserWidgetLoadResult) => void>()
+const listeners = new Set<(result: UserWidgetLoadResult) => void>();
 
 /** Subscribe to scan results — the app layer announces loads in the
  *  transcript so a hot-loaded widget is VISIBLY live (silent success is
  *  indistinguishable from failure). */
-export function onUserWidgets(listener: (result: UserWidgetLoadResult) => void): () => void {
-  listeners.add(listener)
+export function onUserWidgets(
+  listener: (result: UserWidgetLoadResult) => void,
+): () => void {
+  listeners.add(listener);
 
-  return () => listeners.delete(listener)
+  return () => listeners.delete(listener);
 }
 
 /** Scan + import + register, diffing the registry per file. Cache-busted so
  *  edits reload without restarting the TUI (last-writer-wins shadows stale
  *  definitions). Files that vanished unregister their apps. */
-export async function loadUserWidgets(dir = widgetsDir()): Promise<UserWidgetLoadResult> {
-  const result: UserWidgetLoadResult = { added: [], errors: [], loaded: [], removed: [] }
+export async function loadUserWidgets(
+  dir = widgetsDir(),
+): Promise<UserWidgetLoadResult> {
+  const result: UserWidgetLoadResult = {
+    added: [],
+    errors: [],
+    loaded: [],
+    removed: [],
+  };
 
-  let files: string[] = []
+  let files: string[] = [];
 
   try {
-    files = (await readdir(dir)).filter(f => f.endsWith('.mjs')).sort()
+    files = (await readdir(dir)).filter((f) => f.endsWith(".mjs")).sort();
   } catch {
     // No directory: fall through so previously-loaded files still delete-sync.
   }
 
   for (const [file, ids] of fileApps) {
     if (!files.includes(file)) {
-      fileApps.delete(file)
+      fileApps.delete(file);
 
       for (const id of ids) {
         if (removeWidgetApp(id)) {
-          result.removed.push(id)
+          result.removed.push(id);
         }
       }
     }
   }
 
   for (const file of files) {
-    const before = new Set(listWidgetApps().map(app => app.id))
+    const before = new Set(listWidgetApps().map((app) => app.id));
 
     try {
-      const mod = (await import(`${pathToFileURL(join(dir, file)).href}?t=${Date.now()}`)) as {
-        default?: (sdk: WidgetSdk) => void
+      const mod = (await import(
+        `${pathToFileURL(join(dir, file)).href}?t=${Date.now()}`
+      )) as {
+        default?: (sdk: WidgetSdk) => void;
+      };
+
+      if (typeof mod.default !== "function") {
+        throw new Error("default export must be register(sdk)");
       }
 
-      if (typeof mod.default !== 'function') {
-        throw new Error('default export must be register(sdk)')
-      }
-
-      mod.default(widgetSdk)
-      result.loaded.push(file)
+      mod.default(widgetSdk);
+      result.loaded.push(file);
 
       const ids = listWidgetApps()
-        .map(app => app.id)
-        .filter(id => !before.has(id))
+        .map((app) => app.id)
+        .filter((id) => !before.has(id));
 
       // Re-registrations of existing ids keep their prior file attribution.
       if (ids.length) {
-        fileApps.set(file, ids)
-        result.added.push(...ids)
+        fileApps.set(file, ids);
+        result.added.push(...ids);
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const message = error instanceof Error ? error.message : String(error);
 
-      result.errors.push({ file, message })
-      recordParentLifecycle(`user widget ${file} failed to load: ${message}`)
+      result.errors.push({ file, message });
+      recordParentLifecycle(`user widget ${file} failed to load: ${message}`);
     }
   }
 
   if (result.added.length) {
-    recordParentLifecycle(`user widgets registered: ${result.added.join(', ')}`)
+    recordParentLifecycle(
+      `user widgets registered: ${result.added.join(", ")}`,
+    );
   }
 
   for (const listener of listeners) {
-    listener(result)
+    listener(result);
   }
 
-  return result
+  return result;
 }
 
-let watching = false
+let watching = false;
 
 /** Generative-UI hot loading: watch the widgets directory and re-scan on
  *  every change, so a widget k3code writes appears within ~a second — no
@@ -162,28 +187,28 @@ let watching = false
  *  first widget ever written also hot-loads. */
 export function watchUserWidgets(dir = widgetsDir()): void {
   if (watching) {
-    return
+    return;
   }
 
-  watching = true
+  watching = true;
 
-  let timer: NodeJS.Timeout | undefined
+  let timer: NodeJS.Timeout | undefined;
 
   const attach = () => {
     try {
       const watcher = watch(dir, () => {
-        clearTimeout(timer)
-        timer = setTimeout(() => void loadUserWidgets(dir), 300)
-        timer.unref?.()
-      })
+        clearTimeout(timer);
+        timer = setTimeout(() => void loadUserWidgets(dir), 300);
+        timer.unref?.();
+      });
 
-      watcher.unref?.()
+      watcher.unref?.();
 
-      return true
+      return true;
     } catch {
-      return false // directory doesn't exist yet
+      return false; // directory doesn't exist yet
     }
-  }
+  };
 
   if (!attach()) {
     // Event-driven first-creation: watch the PARENT for the widgets dir to
@@ -193,21 +218,21 @@ export function watchUserWidgets(dir = widgetsDir()): void {
     try {
       const parent = watch(dirname(dir), () => {
         if (attach()) {
-          parent.close()
-          void loadUserWidgets(dir)
+          parent.close();
+          void loadUserWidgets(dir);
         }
-      })
+      });
 
-      parent.unref?.()
+      parent.unref?.();
     } catch {
       const poll = setInterval(() => {
         if (attach()) {
-          clearInterval(poll)
-          void loadUserWidgets(dir)
+          clearInterval(poll);
+          void loadUserWidgets(dir);
         }
-      }, 2_000)
+      }, 2_000);
 
-      poll.unref?.()
+      poll.unref?.();
     }
   }
 }

@@ -52,8 +52,13 @@ def make(providers, **kw):
 
     events: list[RouterEvent] = []
     store = kw.pop("store", None) or CooldownStore()
-    router = Router(build_chain(providers, [["m"]] * len(providers)), cooldowns=store, sleep=fake_sleep,
-                    on_event=events.append, **kw)
+    router = Router(
+        build_chain(providers, [["m"]] * len(providers)),
+        cooldowns=store,
+        sleep=fake_sleep,
+        on_event=events.append,
+        **kw,
+    )
     return router, store, sleeps, events
 
 
@@ -156,8 +161,14 @@ async def test_persistent_retry_parks_until_earliest_reset_and_emits_time():
     emitter = EventEmitter()
     seen: list[tuple[str, dict]] = []
     emitter.add(lambda e: seen.append((e.kind, {**e.data, "detail": e.detail})), key="t")
-    pr = PersistentRetry(router, None, config=RetryConfig(poll_interval=600.0), events=emitter,
-                         sleep=sleep, monotonic=lambda: clock["now"])
+    pr = PersistentRetry(
+        router,
+        None,
+        config=RetryConfig(poll_interval=600.0),
+        events=emitter,
+        sleep=sleep,
+        monotonic=lambda: clock["now"],
+    )
     texts = []
     async for ev in pr.stream(MSGS, []):
         if ev.type == "done" and ev.message:

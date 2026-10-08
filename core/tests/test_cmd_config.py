@@ -258,8 +258,18 @@ async def test_all_m1_commands_registered_with_help(tmp_path, monkeypatch):
 
     reg = build_registry()
     for name in (
-        "export", "import", "fork", "branch", "settings", "config", "output-style", "memory", "skills",
-        "mcp", "review", "goal",
+        "export",
+        "import",
+        "fork",
+        "branch",
+        "settings",
+        "config",
+        "output-style",
+        "memory",
+        "skills",
+        "mcp",
+        "review",
+        "goal",
     ):
         cmd_def = reg.get(name)
         assert cmd_def is not None and cmd_def.help, name

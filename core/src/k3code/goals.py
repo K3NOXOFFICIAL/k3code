@@ -18,12 +18,16 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
-DEFAULT_MAX_TURNS = 30
+DEFAULT_MAX_TURNS = 300  # a backstop for unattended goals; raised from 30 at the owner's request
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
 DEFAULT_GATE_MAX_RETRIES = 3
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
+#: Automatic kicks (boot resume, watchdog): this many within KICK_WINDOW_S, the next one parks the goal instead.
+MAX_KICKS_PER_WINDOW = 3
+KICK_WINDOW_S = 3600.0
 MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 _GATE_OUTPUT_TAIL_CHARS = 3000
@@ -96,15 +100,14 @@ class GoalGate:
 
 
 async def run_gate(gate: GoalGate, *, cwd: str | None = None) -> tuple[bool, int, str]:
-    """Run the gate through the shell: ``(passed, exit_code, output_tail)``; a timeout is exit code -1."""
+    """Run the gate through the shell, sandboxed: ``(passed, exit_code, output_tail)``; a timeout is exit code -1.
+
+    A gate runs during an unattended goal turn, so it fails closed: no usable bwrap means the check did not pass.
+    """
+    from k3code.reliability import sandbox
+
     try:
-        proc = await asyncio.create_subprocess_shell(
-            gate.command,
-            cwd=cwd or None,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        proc = await sandbox.spawn_unattended_shell(gate.command, cwd=cwd or str(Path.cwd()))
         try:
             out, _ = await asyncio.wait_for(proc.communicate(), max(1, int(gate.timeout_seconds)))
         except TimeoutError:
@@ -131,6 +134,8 @@ class GoalState:
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
     gates: list[GoalGate] = field(default_factory=list)
+    #: Wall-clock times of automatic kicks (see GatewayServer.kick_goal); pruned to KICK_WINDOW_S.
+    kick_times: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -304,6 +309,17 @@ class GoalManager:
     def clear(self) -> None:
         self._save_raw(None)
 
+    def recent_kicks(self, now: float) -> list[float]:
+        s = self.state
+        return [t for t in (s.kick_times if s else []) if now - t < KICK_WINDOW_S]
+
+    def record_kick(self, now: float) -> GoalState | None:
+        s = self.state
+        if s is None:
+            return None
+        s.kick_times = [t for t in s.kick_times if now - t < KICK_WINDOW_S] + [now]
+        return self._save(s)
+
     def status_line(self) -> str:
         s = self.state
         if s is None or s.status == "cleared":
@@ -348,7 +364,10 @@ class GoalManager:
 
         if verdict == "blocked":
             return self._pause_decision(
-                s, f"judged unachievable: {reason}", "blocked", reason,
+                s,
+                f"judged unachievable: {reason}",
+                "blocked",
+                reason,
                 f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal <objective>, or /goal resume.",
             )
 
@@ -366,7 +385,9 @@ class GoalManager:
                 s.last_reason = f"check failed (exit {code}): $ {gate.command}"
                 if gate.attempts > gate.max_retries:
                     return self._pause_decision(
-                        s, f"check exhausted {gate.max_retries} retries: $ {gate.command}", "gate_failed",
+                        s,
+                        f"check exhausted {gate.max_retries} retries: $ {gate.command}",
+                        "gate_failed",
                         s.last_reason,
                         f"⏸ Goal paused — check still failing after {gate.max_retries} retries: $ {gate.command}",
                     )
@@ -374,11 +395,19 @@ class GoalManager:
                     return self._budget_pause(s, "gate_failed", s.last_reason)
                 self._save(s)
                 prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
-                    goal=s.goal, command=gate.command, exit_code=code, attempt=gate.attempts,
-                    max_retries=gate.max_retries, output=tail or "(no output)",
+                    goal=s.goal,
+                    command=gate.command,
+                    exit_code=code,
+                    attempt=gate.attempts,
+                    max_retries=gate.max_retries,
+                    output=tail or "(no output)",
                 )
                 return Decision(
-                    "active", True, prompt, "gate_failed", s.last_reason,
+                    "active",
+                    True,
+                    prompt,
+                    "gate_failed",
+                    s.last_reason,
                     f"✗ Check failed ({s.turns_used}/{s.max_turns} turns, attempt {gate.attempts}/{gate.max_retries}): "
                     f"$ {gate.command}",
                 )
@@ -396,7 +425,11 @@ class GoalManager:
                         f"{listed}\nFix them, then confirm the goal is complete. Goal: {s.goal}"
                     )
                     return Decision(
-                        "active", True, prompt, "advisor_blocked", s.last_reason,
+                        "active",
+                        True,
+                        prompt,
+                        "advisor_blocked",
+                        s.last_reason,
                         f"⚠ Advisor found blocking issues ({s.turns_used}/{s.max_turns} turns): {issues[0][:120]}",
                     )
             s.status = "done"
@@ -406,20 +439,30 @@ class GoalManager:
         if s.consecutive_transport_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES:
             n = s.consecutive_transport_failures
             return self._pause_decision(
-                s, f"judge model unreachable {n} turns in a row", "continue", reason,
+                s,
+                f"judge model unreachable {n} turns in a row",
+                "continue",
+                reason,
                 f"⏸ Goal paused — the judge model returned errors {n} turns in a row (check goal.judge_model).",
             )
         if s.consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
             n = s.consecutive_parse_failures
             return self._pause_decision(
-                s, f"judge returned unparseable output {n} turns in a row", "continue", reason,
+                s,
+                f"judge returned unparseable output {n} turns in a row",
+                "continue",
+                reason,
                 f"⏸ Goal paused — the judge isn't returning the required JSON verdict ({n} turns).",
             )
         if s.turns_used >= s.max_turns:
             return self._budget_pause(s, "continue", reason)
         self._save(s)
         return Decision(
-            "active", True, self.continuation_prompt(), "continue", reason,
+            "active",
+            True,
+            self.continuation_prompt(),
+            "continue",
+            reason,
             f"↻ Continuing toward goal ({s.turns_used}/{s.max_turns}): {reason}",
         )
 
@@ -433,6 +476,9 @@ class GoalManager:
 
     def _budget_pause(self, s: GoalState, verdict: str, reason: str) -> Decision:
         return self._pause_decision(
-            s, f"turn budget exhausted ({s.turns_used}/{s.max_turns})", verdict, reason,
+            s,
+            f"turn budget exhausted ({s.turns_used}/{s.max_turns})",
+            verdict,
+            reason,
             f"⏸ Goal paused — {s.turns_used}/{s.max_turns} turns used. /goal resume keeps going, /goal clear stops.",
         )

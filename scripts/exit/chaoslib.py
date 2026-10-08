@@ -1,4 +1,5 @@
 """Helpers shared by m2_chaos.py and soak.py: temp homes, fake upstream/proxy, a daemon and a JSON-RPC peer."""
+
 from __future__ import annotations
 
 import asyncio
@@ -31,8 +32,9 @@ class Procs:
     def __init__(self) -> None:
         self.procs: list[subprocess.Popen] = []
 
-    def spawn(self, cmd: list[str], *, env: dict | None = None, cwd: Path | str | None = None,
-              log: Path | None = None) -> subprocess.Popen:
+    def spawn(
+        self, cmd: list[str], *, env: dict | None = None, cwd: Path | str | None = None, log: Path | None = None
+    ) -> subprocess.Popen:
         out = open(log, "ab") if log else subprocess.DEVNULL  # noqa: SIM115
         p = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
         self.procs.append(p)
@@ -72,8 +74,18 @@ def start_fake_upstream(procs: Procs, port: int, *args: str) -> subprocess.Popen
 
 
 def start_proxy(procs: Procs, listen: int, upstream: int, mode_file: Path) -> subprocess.Popen:
-    p = procs.spawn([sys.executable, str(CHAOS / "flaky_proxy.py"), "--listen", f"127.0.0.1:{listen}",
-                     "--upstream", f"127.0.0.1:{upstream}", "--mode-file", str(mode_file)])
+    p = procs.spawn(
+        [
+            sys.executable,
+            str(CHAOS / "flaky_proxy.py"),
+            "--listen",
+            f"127.0.0.1:{listen}",
+            "--upstream",
+            f"127.0.0.1:{upstream}",
+            "--mode-file",
+            str(mode_file),
+        ]
+    )
     wait_port(listen)
     return p
 
@@ -115,8 +127,9 @@ class Peer:
         self._n += 1
         fut = asyncio.get_running_loop().create_future()
         self._pending[self._n] = fut
-        self.w.write((json.dumps({"jsonrpc": "2.0", "id": self._n, "method": method,
-                                  "params": params}) + "\n").encode())
+        self.w.write(
+            (json.dumps({"jsonrpc": "2.0", "id": self._n, "method": method, "params": params}) + "\n").encode()
+        )
         await self.w.drain()
         return await asyncio.wait_for(fut, timeout)
 
@@ -153,9 +166,18 @@ class Daemon:
         self.home.mkdir(parents=True, exist_ok=True)
         self.proj.mkdir(parents=True, exist_ok=True)
         self.sock = self.home / "run" / "gateway.sock"
-        self.env = {k: v for k, v in os.environ.items()
-                    if k not in ("K3CODE_FAKE_PROVIDER", "NOTIFY_SOCKET", "K3CODE_GATEWAY_SOCKET",
-                                 "HERMES_TUI_GATEWAY_URL", "OMNIROUTE_API_KEY")}
+        self.env = {
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in (
+                "K3CODE_FAKE_PROVIDER",
+                "NOTIFY_SOCKET",
+                "K3CODE_GATEWAY_SOCKET",
+                "HERMES_TUI_GATEWAY_URL",
+                "OMNIROUTE_API_KEY",
+            )
+        }
         self.env.update(HOME=str(self.root), K3CODE_HOME=str(self.home), **(extra_env or {}))
         self.proc: subprocess.Popen | None = None
         self.log = self.root / "daemon.log"

@@ -39,7 +39,8 @@ class TextProvider:
 def make_server(
     tmp: Path, monkeypatch, replies: list[str] | None = None, **settings
 ) -> tuple[GatewayServer, TextProvider]:
-    monkeypatch.setenv("K3CODE_HOME", str(tmp / "home"))
+    # the k3code home sits beside the project dir: a sandboxed project may not contain it
+    monkeypatch.setenv("K3CODE_HOME", str(tmp.parent / f"{tmp.name}-k3home"))
     store = SessionStore(tmp / "sessions.db")
     config = Settings(
         providers=[ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE")], **settings

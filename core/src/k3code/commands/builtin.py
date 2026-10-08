@@ -38,8 +38,13 @@ class _ModelCommand(CommandDef):
         old = (live.stored.model if live is not None else "") or ctx.config.default_model
         if hasattr(ctx, "learning") and key != old:
             kind = getattr(live, "current_kind", "") if live is not None else ""
-            ctx.learning.record("model_switch", live, subject=f"{old} -> {key}", choice=key,
-                                detail={"from": old, "to": key, "reason": reason.strip(), "task_kind": kind or ""})
+            ctx.learning.record(
+                "model_switch",
+                live,
+                subject=f"{old} -> {key}",
+                choice=key,
+                detail={"from": old, "to": key, "reason": reason.strip(), "task_kind": kind or ""},
+            )
         if live is None:
             ctx.config.default_model = key
         else:
@@ -47,7 +52,6 @@ class _ModelCommand(CommandDef):
             ctx.store.save(live.stored)
             live.emit("session.info", live.live_info())
         return {"type": "message", "message": f"Model key set to: {key}"}
-
 
     def _chain(self, ctx: Any, session_id: str | None, args: list[str]) -> dict[str, Any]:
         """/model chain [add|remove|move …]: show the fallback chain, or edit the user config."""
@@ -129,9 +133,7 @@ class _CompactCommand(CommandDef):
             return {"type": "message", "message": "A turn is running in this session; /compact when it ends."}
         before = len(live.messages)
         try:
-            messages, folded = await compact_messages(
-                ctx.model_caller, list(live.messages), session_id=live.session_id
-            )
+            messages, folded = await compact_messages(ctx.model_caller, list(live.messages), session_id=live.session_id)
         except Exception as e:  # noqa: BLE001 - e.g. every provider rate-limited
             return {"type": "message", "message": f"Compact failed: {e}"}
         if not folded:
@@ -258,12 +260,31 @@ def build_registry() -> CommandRegistry:
 
     reg = CommandRegistry()
     for extra in (
-        ExportCommand(), ImportCommand(), ForkCommand(), BranchCommand(), SettingsCommand(), ConfigCommand(),
-        OutputStyleCommand(), MemoryCommand(), SkillsCommand(), McpCommand(), ReviewCommand(), GoalCommand(),
-        LoopCommand(), ScheduleCommand(), AutomationsCommand(),
-        ArtifactsCommand(), BgCommand(), UltraPlanCommand(), UltraCodeCommand(),
+        ExportCommand(),
+        ImportCommand(),
+        ForkCommand(),
+        BranchCommand(),
+        SettingsCommand(),
+        ConfigCommand(),
+        OutputStyleCommand(),
+        MemoryCommand(),
+        SkillsCommand(),
+        McpCommand(),
+        ReviewCommand(),
+        GoalCommand(),
+        LoopCommand(),
+        ScheduleCommand(),
+        AutomationsCommand(),
+        ArtifactsCommand(),
+        BgCommand(),
+        UltraPlanCommand(),
+        UltraCodeCommand(),
         UltraResearchCommand(),
-        PermissionsCommand(), FocusCommand(), UpdateConfigCommand(), OptimizerCommand(), SelfImproveCommand(),
+        PermissionsCommand(),
+        FocusCommand(),
+        UpdateConfigCommand(),
+        OptimizerCommand(),
+        SelfImproveCommand(),
         LearnCommand(),
     ):
         reg.register(extra)

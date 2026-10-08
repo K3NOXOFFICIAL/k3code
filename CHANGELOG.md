@@ -2,7 +2,7 @@
 
 All notable changes are listed here. Until version 1.0, any release may change the config format, the commands or the on-disk state. Versions follow [semantic versioning](https://semver.org/) from 1.0 on.
 
-## [0.0.1] - unreleased (not tagged)
+## [0.1.0] - 2026-10-08 (alpha, not tagged)
 
 The first version meant for people other than its author. It is alpha: the core works and is tested, but live-model behaviour, long unattended runs and multi-day use are not yet verified. The [Status section of the README](README.md#status) has the details.
 
@@ -24,13 +24,13 @@ The first version meant for people other than its author. It is alpha: the core 
 - Live-model behaviour. Most exit checks use a scripted fake provider. The live-model rows ran through the `claude-cli` provider (a local Claude Code login).
 - The 72-hour daemon soak. A 30-minute soak passed.
 - Automatic resumption of interrupted turns in the daemon. `k3code doctor` flags unresolved journal entries.
-- `/artifacts publish`. It reports that publishing is not implemented.
-- Platforms other than Linux on x86_64. macOS and Windows (through WSL) are untested on real machines.
+- Platforms other than Linux on x86_64. macOS and Windows (through WSL) are untested on real machines. The installer is untested on Debian and on aarch64.
+- The browser tool needs Playwright, which `presetup` installs. That path is untested on a clean machine.
 - The update path against published releases. There are none yet, so the update and rollback path was only tested against local version directories.
 
 ### Changed before publication
 
-- Hard-coded defaults that pointed at the author's own servers were replaced with neutral values. Web search has no default SearXNG instance, so the keyless DuckDuckGo fallback is used until `research.searxng_url` is set, and whenever that SearXNG is unreachable. The OmniRoute preset points at `localhost:20128`. The hardline list names placeholder hosts.
+- Hard-coded defaults that pointed at the author's own servers were replaced with neutral values. Web search has no default SearXNG instance, so the keyless DuckDuckGo fallback is used until `research.searxng_url` is set, and whenever that SearXNG is unreachable. The OmniRoute preset is no longer a default: the wizard offers Claude Code's own login when `claude` is installed, otherwise a custom endpoint. Existing configs that name it keep working. The hardline list names placeholder hosts.
 - If you relied on the old defaults, set your own values in your config. To keep protecting your own hosts from remote service restarts, add patterns under `permissions.hardline`.
 - Pull requests and pushes are checked for secrets (`.github/workflows/gitleaks.yml`).
 

@@ -1,15 +1,15 @@
-import { logForDebugging } from '../utils/debug.js'
+import { logForDebugging } from "../utils/debug.js";
 
 export function ifNotInteger(value: number | undefined, name: string): void {
   if (value === undefined) {
-    return
+    return;
   }
 
   if (Number.isInteger(value)) {
-    return
+    return;
   }
 
   logForDebugging(`${name} should be an integer, got ${value}`, {
-    level: 'warn'
-  })
+    level: "warn",
+  });
 }

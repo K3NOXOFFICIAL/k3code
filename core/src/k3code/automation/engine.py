@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("k3code.automation")
 
+HALT_POLL_S = 5.0
+
 
 class AutomationEngine:
     def __init__(
@@ -75,6 +77,9 @@ class AutomationEngine:
     # ── network gate ─────────────────────────────────────────────────
 
     async def _online(self) -> None:
+        # /daemon pause: loops and jobs wait here, before a tick is consumed, and continue after /daemon resume.
+        while getattr(self.server, "halted", False):
+            await self.clock.sleep(HALT_POLL_S)
         if self._wait_online is not None:
             await self._wait_online()
         elif self._rel is not None and self._rel.netwatch is not None:

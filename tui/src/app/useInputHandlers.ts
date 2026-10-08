@@ -1,79 +1,97 @@
-import { forceRedraw, useInput } from '@k3code/ink'
-import { useStore } from '@nanostores/react'
-import { useEffect, useRef } from 'react'
+import { forceRedraw, useInput } from "@k3code/ink";
+import { useStore } from "@nanostores/react";
+import { useEffect, useRef } from "react";
 
-import { DASHBOARD_TUI_MODE } from '../config/env.js'
-import { DOUBLE_ESC_MS, TYPING_IDLE_MS } from '../config/timing.js'
-import { applyCompletion } from '../domain/slash.js'
-import type { ConfigSetResponse } from '../gatewayTypes.js'
-import { isAction, isCopyShortcut, isMac, isMacActionFallback } from '../lib/platform.js'
-import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionWheel.js'
-import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
-import { closeWidget, dispatchWidgetInput } from '../sdk/host.js'
+import { DASHBOARD_TUI_MODE } from "../config/env.js";
+import { DOUBLE_ESC_MS, TYPING_IDLE_MS } from "../config/timing.js";
+import { applyCompletion } from "../domain/slash.js";
+import {
+  isAction,
+  isCopyShortcut,
+  isMac,
+  isMacActionFallback,
+} from "../lib/platform.js";
+import {
+  computePrecisionWheelStep,
+  initPrecisionWheel,
+} from "../lib/precisionWheel.js";
+import { computeWheelStep, initWheelAccelForHost } from "../lib/wheelAccel.js";
+import { closeWidget, dispatchWidgetInput } from "../sdk/host.js";
 
-import { toggleFocusMode } from '../k3/focusPolicy.js'
-import { handleProposalKey } from '../k3/proposalsStore.js'
+import { toggleFocusMode } from "../k3/focusPolicy.js";
+import { handleProposalKey } from "../k3/proposalsStore.js";
 import {
   $stripNav,
   $stripRows,
   getStripHandlers,
   IDLE_NAV,
   reduceStripKey,
-  shouldEnterStrip
-} from '../k3/agentStripStore.js'
+  shouldEnterStrip,
+} from "../k3/agentStripStore.js";
 
-import { $agentDockCollapsed } from './agentRoster.js'
-import { getInputSelection } from './inputSelectionStore.js'
+import { $agentDockCollapsed } from "./agentRoster.js";
+import { getInputSelection } from "./inputSelectionStore.js";
 import {
   type GatewayRpc,
   type InputHandlerActions,
   type InputHandlerContext,
   type InputHandlerResult,
-  type OverlayState
-} from './interfaces.js'
-import { $isBlocked, $overlayState, patchOverlayState } from './overlayStore.js'
-import { respondToServerRequest } from './serverRequestStore.js'
-import { turnController } from './turnController.js'
-import { patchTurnState } from './turnStore.js'
-import { getUiState } from './uiStore.js'
+  type OverlayState,
+} from "./interfaces.js";
+import {
+  $isBlocked,
+  $overlayState,
+  patchOverlayState,
+} from "./overlayStore.js";
+import { respondToServerRequest } from "./serverRequestStore.js";
+import { turnController } from "./turnController.js";
+import { patchTurnState } from "./turnStore.js";
+import { getUiState } from "./uiStore.js";
 
-const isCtrl = (key: { ctrl: boolean }, ch: string, target: string) => key.ctrl && ch.toLowerCase() === target
-const DASHBOARD_NEW_SESSION_MESSAGE = 'starting a fresh dashboard chat...'
+const isCtrl = (key: { ctrl: boolean }, ch: string, target: string) =>
+  key.ctrl && ch.toLowerCase() === target;
+const DASHBOARD_NEW_SESSION_MESSAGE = "starting a fresh dashboard chat...";
 
-export const shouldAllowIdleHotkeyExit = (dashboardTuiMode = DASHBOARD_TUI_MODE) => !dashboardTuiMode
+export const shouldAllowIdleHotkeyExit = (
+  dashboardTuiMode = DASHBOARD_TUI_MODE,
+) => !dashboardTuiMode;
 
 /** Text or attachments in the composer: Ctrl+D must not exit over an unsent draft (#116443). */
-export const composerHasDraft = (cState: { input: string; inputBuf: string[]; tokens?: unknown[] }): boolean =>
-  Boolean(cState.input || cState.inputBuf.length || cState.tokens?.length)
+export const composerHasDraft = (cState: {
+  input: string;
+  inputBuf: string[];
+  tokens?: unknown[];
+}): boolean =>
+  Boolean(cState.input || cState.inputBuf.length || cState.tokens?.length);
 
 export function handleInputSelectionClipboard(
   selection: ReturnType<typeof getInputSelection>,
-  action: 'copy' | 'cut'
+  action: "copy" | "cut",
 ): boolean {
   if (!selection || selection.end <= selection.start) {
-    return false
+    return false;
   }
 
-  selection[action]()
+  selection[action]();
 
-  return true
+  return true;
 }
 
 export function handleIdleHotkeyExit(
-  actions: Pick<InputHandlerActions, 'die' | 'sys'>,
+  actions: Pick<InputHandlerActions, "die" | "sys">,
   dashboardTuiMode = DASHBOARD_TUI_MODE,
-  requestDashboardNewSession?: () => void
+  requestDashboardNewSession?: () => void,
 ) {
   if (!shouldAllowIdleHotkeyExit(dashboardTuiMode)) {
-    requestDashboardNewSession?.()
+    requestDashboardNewSession?.();
 
-    return actions.sys(DASHBOARD_NEW_SESSION_MESSAGE)
+    return actions.sys(DASHBOARD_NEW_SESSION_MESSAGE);
   }
 
-  return actions.die()
+  return actions.die();
 }
 
-export type CtrlCComposerAction = 'clear' | 'interrupt' | 'exit'
+export type CtrlCComposerAction = "clear" | "interrupt" | "exit";
 
 /**
  * Ctrl+C (and terminals that rewrite Cmd+C to it) is clear / interrupt / exit
@@ -81,19 +99,19 @@ export type CtrlCComposerAction = 'clear' | 'interrupt' | 'exit'
  * used to interrupt the turn even when the user was trying to dump a draft.
  */
 export function resolveCtrlCComposerAction(opts: {
-  busy: boolean
-  hasDraft: boolean
-  hasSession: boolean
+  busy: boolean;
+  hasDraft: boolean;
+  hasSession: boolean;
 }): CtrlCComposerAction {
   if (opts.hasDraft) {
-    return 'clear'
+    return "clear";
   }
 
   if (opts.busy && opts.hasSession) {
-    return 'interrupt'
+    return "interrupt";
   }
 
-  return 'exit'
+  return "exit";
 }
 
 /**
@@ -109,224 +127,231 @@ export function resolveCtrlCComposerAction(opts: {
  * scroll a single line at a time during a prompt expects it to work.
  */
 export function shouldFallThroughForScroll(key: {
-  downArrow: boolean
-  pageDown: boolean
-  pageUp: boolean
-  shift: boolean
-  upArrow: boolean
-  wheelDown: boolean
-  wheelUp: boolean
+  downArrow: boolean;
+  pageDown: boolean;
+  pageUp: boolean;
+  shift: boolean;
+  upArrow: boolean;
+  wheelDown: boolean;
+  wheelUp: boolean;
 }): boolean {
   if (key.wheelUp || key.wheelDown) {
-    return true
+    return true;
   }
 
   if (key.pageUp || key.pageDown) {
-    return true
+    return true;
   }
 
   if (key.shift && (key.upArrow || key.downArrow)) {
-    return true
+    return true;
   }
 
-  return false
+  return false;
 }
 
 export function dismissSensitivePrompt(
-  overlay: Pick<OverlayState, 'secret' | 'sudo'>,
+  overlay: Pick<OverlayState, "secret" | "sudo">,
   rpc: GatewayRpc,
-  sys: (text: string) => void
+  sys: (text: string) => void,
 ) {
   if (overlay.sudo) {
-    const requestId = overlay.sudo.requestId
+    const requestId = overlay.sudo.requestId;
 
-    patchOverlayState({ sudo: null })
-    sys('sudo cancelled')
+    patchOverlayState({ sudo: null });
+    sys("sudo cancelled");
 
-    respondToServerRequest(requestId, { value: '' })
+    respondToServerRequest(requestId, { value: "" });
 
-    return
+    return;
   }
 
   if (overlay.secret) {
-    const requestId = overlay.secret.requestId
+    const requestId = overlay.secret.requestId;
 
-    patchOverlayState({ secret: null })
-    sys('secret entry cancelled')
+    patchOverlayState({ secret: null });
+    sys("secret entry cancelled");
 
-    respondToServerRequest(requestId, { value: '' })
+    respondToServerRequest(requestId, { value: "" });
   }
 }
 
-const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
-
-export function shouldDetachEditedHistoryInput(historyIdx: null | number, history: readonly string[], value: string) {
-  return historyIdx !== null && value !== history[historyIdx]
+export function shouldDetachEditedHistoryInput(
+  historyIdx: null | number,
+  history: readonly string[],
+  value: string,
+) {
+  return historyIdx !== null && value !== history[historyIdx];
 }
 
 export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
-  const { actions, composer, gateway, terminal, wheelStep } = ctx
-  const { actions: cActions, refs: cRefs, state: cState } = composer
+  const { actions, composer, gateway, terminal, wheelStep } = ctx;
+  const { actions: cActions, refs: cRefs, state: cState } = composer;
 
-  const overlay = useStore($overlayState)
-  const isBlocked = useStore($isBlocked)
-  const pagerPageSize = Math.max(5, (terminal.stdout?.rows ?? 24) - 6)
-  const scrollIdleTimer = useRef<null | ReturnType<typeof setTimeout>>(null)
+  const overlay = useStore($overlayState);
+  const isBlocked = useStore($isBlocked);
+  const pagerPageSize = Math.max(5, (terminal.stdout?.rows ?? 24) - 6);
+  const scrollIdleTimer = useRef<null | ReturnType<typeof setTimeout>>(null);
 
   // Wheel accel ported from claude-code: inter-event timing drives step size,
   // direction flips reset. wheelStep (WHEEL_SCROLL_STEP) is the base; final
   // rows = wheelStep × accelMult. State mutates in place across renders.
-  const wheelAccelRef = useRef(initWheelAccelForHost())
+  const wheelAccelRef = useRef(initWheelAccelForHost());
 
-  const precisionWheelRef = useRef(initPrecisionWheel())
+  const precisionWheelRef = useRef(initPrecisionWheel());
 
-  useEffect(() => () => clearTimeout(scrollIdleTimer.current ?? undefined), [])
+  useEffect(() => () => clearTimeout(scrollIdleTimer.current ?? undefined), []);
 
   const scrollTranscript = (delta: number) => {
     if (getUiState().busy) {
-      turnController.boostStreamingForScroll()
-      clearTimeout(scrollIdleTimer.current ?? undefined)
+      turnController.boostStreamingForScroll();
+      clearTimeout(scrollIdleTimer.current ?? undefined);
       scrollIdleTimer.current = setTimeout(() => {
-        scrollIdleTimer.current = null
-        turnController.relaxStreaming()
-      }, TYPING_IDLE_MS)
+        scrollIdleTimer.current = null;
+        turnController.relaxStreaming();
+      }, TYPING_IDLE_MS);
     }
 
-    terminal.scrollWithSelection(delta)
-  }
+    terminal.scrollWithSelection(delta);
+  };
 
   const copySelection = () => {
     // ink's copySelection() already calls setClipboard() which handles
     // pbcopy (macOS), wl-copy/xclip (Linux), tmux, and OSC 52 fallback.
-    terminal.selection.copySelection()
-  }
+    terminal.selection.copySelection();
+  };
 
   const clearSelection = () => {
-    terminal.selection.clearSelection()
-  }
+    terminal.selection.clearSelection();
+  };
 
   const cancelOverlayFromCtrlC = () => {
     if (overlay.clarify) {
-      return actions.answerClarify('')
+      return actions.answerClarify("");
     }
 
     if (overlay.approval) {
-      respondToServerRequest(overlay.approval.requestId, { choice: 'deny' })
-      patchOverlayState({ approval: null })
-      patchTurnState({ outcome: 'denied' })
+      respondToServerRequest(overlay.approval.requestId, { choice: "deny" });
+      patchOverlayState({ approval: null });
+      patchTurnState({ outcome: "denied" });
 
-      return
+      return;
     }
 
     if (overlay.sudo || overlay.secret) {
-      return dismissSensitivePrompt(overlay, gateway.rpc, actions.sys)
+      return dismissSensitivePrompt(overlay, gateway.rpc, actions.sys);
     }
 
     if (overlay.modelPicker) {
-      return patchOverlayState({ modelPicker: false })
+      return patchOverlayState({ modelPicker: false });
     }
 
     if (overlay.skillsHub) {
-      return patchOverlayState({ skillsHub: false })
+      return patchOverlayState({ skillsHub: false });
     }
 
     if (overlay.pluginsHub) {
-      return patchOverlayState({ pluginsHub: false })
+      return patchOverlayState({ pluginsHub: false });
     }
 
     if (overlay.sessions) {
-      return patchOverlayState({ sessions: false })
+      return patchOverlayState({ sessions: false });
     }
 
     if (overlay.agents) {
-      return patchOverlayState({ agents: false })
+      return patchOverlayState({ agents: false });
     }
 
     if (overlay.journey) {
-      return patchOverlayState({ journey: false })
+      return patchOverlayState({ journey: false });
     }
 
     if (overlay.widget) {
-      return closeWidget()
+      return closeWidget();
     }
-  }
+  };
 
   const cycleQueue = (dir: 1 | -1) => {
-    const len = cRefs.queueRef.current.length
+    const len = cRefs.queueRef.current.length;
 
     if (!len) {
-      return false
+      return false;
     }
 
-    const index = cState.queueEditIdx === null ? (dir > 0 ? 0 : len - 1) : (cState.queueEditIdx + dir + len) % len
+    const index =
+      cState.queueEditIdx === null
+        ? dir > 0
+          ? 0
+          : len - 1
+        : (cState.queueEditIdx + dir + len) % len;
 
-    cActions.setQueueEdit(index)
-    cActions.setHistoryIdx(null)
-    cActions.setInput(cRefs.queueRef.current[index]?.display ?? '')
+    cActions.setQueueEdit(index);
+    cActions.setHistoryIdx(null);
+    cActions.setInput(cRefs.queueRef.current[index]?.display ?? "");
 
-    return true
-  }
+    return true;
+  };
 
   const cycleHistory = (dir: 1 | -1) => {
-    const h = cRefs.historyRef.current
-    const cur = cState.historyIdx
+    const h = cRefs.historyRef.current;
+    const cur = cState.historyIdx;
 
     if (dir < 0) {
       if (!h.length) {
-        return
+        return;
       }
 
       if (cur === null) {
-        cRefs.historyDraftRef.current = cState.input
+        cRefs.historyDraftRef.current = cState.input;
       }
 
-      const index = cur === null ? h.length - 1 : Math.max(0, cur - 1)
+      const index = cur === null ? h.length - 1 : Math.max(0, cur - 1);
 
-      cActions.setHistoryIdx(index)
-      cActions.setQueueEdit(null)
-      cActions.setInput(h[index] ?? '')
+      cActions.setHistoryIdx(index);
+      cActions.setQueueEdit(null);
+      cActions.setInput(h[index] ?? "");
 
-      return
+      return;
     }
 
     if (cur === null) {
-      return
+      return;
     }
 
-    const next = cur + 1
+    const next = cur + 1;
 
     if (next >= h.length) {
-      cActions.setHistoryIdx(null)
-      cActions.setInput(cRefs.historyDraftRef.current)
+      cActions.setHistoryIdx(null);
+      cActions.setInput(cRefs.historyDraftRef.current);
     } else {
-      cActions.setHistoryIdx(next)
-      cActions.setInput(h[next] ?? '')
+      cActions.setHistoryIdx(next);
+      cActions.setInput(h[next] ?? "");
     }
-  }
+  };
 
   // Double-Esc discards the draft, matching Claude Code / Gemini CLI. It
   // sits above the isBlocked early-return so a prompt overlay cannot swallow
   // it. Ctrl+C now clears a non-empty composer even mid-stream; Esc Esc is
   // still the dedicated discard (pushes the draft to history so Up recalls it).
-  const lastEscRef = useRef(0)
+  const lastEscRef = useRef(0);
 
   useInput((ch, key, event) => {
-    const live = getUiState()
+    const live = getUiState();
 
     if (key.escape && !$stripNav.get().focused) {
-      const now = Date.now()
-      const isDouble = now - lastEscRef.current <= DOUBLE_ESC_MS
+      const now = Date.now();
+      const isDouble = now - lastEscRef.current <= DOUBLE_ESC_MS;
 
-      lastEscRef.current = isDouble ? 0 : now
+      lastEscRef.current = isDouble ? 0 : now;
 
       if (isDouble && (cState.input || cState.inputBuf.length)) {
         if (cState.input.trim()) {
-          cActions.pushHistory(cState.input)
+          cActions.pushHistory(cState.input);
         }
 
-        cActions.clearIn()
+        cActions.clearIn();
 
-        return
+        return;
       }
     }
 
@@ -343,76 +368,91 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       // answering felt like the prompt had locked the entire UI.  Explicitly
       // skip the prompt-overlay early-return for scroll keys so they fall
       // through to the wheel / PageUp / Shift+arrow handlers below.
-      const promptOverlay = overlay.approval || overlay.clarify || overlay.confirm
+      const promptOverlay =
+        overlay.approval || overlay.clarify || overlay.confirm;
 
-      const fallThroughForScroll = promptOverlay && shouldFallThroughForScroll(key)
+      const fallThroughForScroll =
+        promptOverlay && shouldFallThroughForScroll(key);
 
       if (promptOverlay && !fallThroughForScroll) {
-        if (isCtrl(key, ch, 'c')) {
-          cancelOverlayFromCtrlC()
+        if (isCtrl(key, ch, "c")) {
+          cancelOverlayFromCtrlC();
         }
 
-        return
+        return;
       }
 
       if (overlay.pager) {
-        if (key.escape || isCtrl(key, ch, 'c') || ch === 'q') {
-          return patchOverlayState({ pager: null })
+        if (key.escape || isCtrl(key, ch, "c") || ch === "q") {
+          return patchOverlayState({ pager: null });
         }
 
-        const move = (delta: number | 'top' | 'bottom') =>
-          patchOverlayState(prev => {
+        const move = (delta: number | "top" | "bottom") =>
+          patchOverlayState((prev) => {
             if (!prev.pager) {
-              return prev
+              return prev;
             }
 
-            const { lines, offset } = prev.pager
-            const max = Math.max(0, lines.length - pagerPageSize)
-            const step = delta === 'top' ? -lines.length : delta === 'bottom' ? lines.length : delta
-            const next = Math.max(0, Math.min(offset + step, max))
+            const { lines, offset } = prev.pager;
+            const max = Math.max(0, lines.length - pagerPageSize);
+            const step =
+              delta === "top"
+                ? -lines.length
+                : delta === "bottom"
+                  ? lines.length
+                  : delta;
+            const next = Math.max(0, Math.min(offset + step, max));
 
-            return next === offset ? prev : { ...prev, pager: { ...prev.pager, offset: next } }
-          })
+            return next === offset
+              ? prev
+              : { ...prev, pager: { ...prev.pager, offset: next } };
+          });
 
-        if (key.upArrow || ch === 'k') {
-          return move(-1)
+        if (key.upArrow || ch === "k") {
+          return move(-1);
         }
 
-        if (key.downArrow || ch === 'j') {
-          return move(1)
+        if (key.downArrow || ch === "j") {
+          return move(1);
         }
 
-        if (key.pageUp || ch === 'b') {
-          return move(-pagerPageSize)
+        if (key.pageUp || ch === "b") {
+          return move(-pagerPageSize);
         }
 
-        if (ch === 'g') {
-          return move('top')
+        if (ch === "g") {
+          return move("top");
         }
 
-        if (ch === 'G') {
-          return move('bottom')
+        if (ch === "G") {
+          return move("bottom");
         }
 
-        if (key.return || ch === ' ' || key.pageDown) {
-          patchOverlayState(prev => {
+        if (key.return || ch === " " || key.pageDown) {
+          patchOverlayState((prev) => {
             if (!prev.pager) {
-              return prev
+              return prev;
             }
 
-            const { lines, offset } = prev.pager
-            const max = Math.max(0, lines.length - pagerPageSize)
+            const { lines, offset } = prev.pager;
+            const max = Math.max(0, lines.length - pagerPageSize);
 
             // Auto-close only when already at the last page — otherwise clamp
             // to `max` so the offset matches what the line/page-back handlers
             // can reach (prevents a snap-back jump on the next ↑/↓/PgUp).
             return offset >= max
               ? { ...prev, pager: null }
-              : { ...prev, pager: { ...prev.pager, offset: Math.min(offset + pagerPageSize, max) } }
-          })
+              : {
+                  ...prev,
+                  pager: {
+                    ...prev.pager,
+                    offset: Math.min(offset + pagerPageSize, max),
+                  },
+                };
+          });
         }
 
-        return
+        return;
       }
 
       // Widget apps (SDK): the active app owns every key while open. This
@@ -420,13 +460,16 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       // — grid-test/dialog are now widget apps, so the topmost-modal-owns-
       // input contract is enforced structurally by the single active widget.
       if (overlay.widget && dispatchWidgetInput({ ch, key })) {
-        return
+        return;
       }
 
-      if (isCtrl(key, ch, 'c') || (key.escape && (overlay.secret || overlay.sudo))) {
-        cancelOverlayFromCtrlC()
+      if (
+        isCtrl(key, ch, "c") ||
+        (key.escape && (overlay.secret || overlay.sudo))
+      ) {
+        cancelOverlayFromCtrlC();
       } else if (key.escape && overlay.sessions) {
-        patchOverlayState({ sessions: false })
+        patchOverlayState({ sessions: false });
       }
 
       // When a prompt overlay is up and the user pressed a scroll key, fall
@@ -434,21 +477,28 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       // Otherwise nothing above this comment matched, and there's nothing
       // useful to do for an arbitrary key while blocked.
       if (!fallThroughForScroll) {
-        return
+        return;
       }
     }
 
-    if (cState.completions.length && cState.input && cState.historyIdx === null && (key.upArrow || key.downArrow)) {
-      const len = cState.completions.length
+    if (
+      cState.completions.length &&
+      cState.input &&
+      cState.historyIdx === null &&
+      (key.upArrow || key.downArrow)
+    ) {
+      const len = cState.completions.length;
 
-      cActions.setCompIdx(i => (key.upArrow ? (i - 1 + len) % len : (i + 1) % len))
+      cActions.setCompIdx((i) =>
+        key.upArrow ? (i - 1 + len) % len : (i + 1) % len,
+      );
 
-      return
+      return;
     }
 
     if (key.wheelUp || key.wheelDown) {
-      const dir: -1 | 1 = key.wheelUp ? -1 : 1
-      const now = Date.now()
+      const dir: -1 | 1 = key.wheelUp ? -1 : 1;
+      const now = Date.now();
       // Modifier-held wheel = precision mode: one row per frame, no accel.
       // Smooth mice / trackpads emit tiny same-frame bursts; coalesce those
       // without the old 80ms throttle that made opt-scroll feel stepped.
@@ -456,62 +506,69 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       // macOS is intercepted by the terminal, so we honor Option (meta) on
       // Mac / Alt (meta) on Win+Linux / Ctrl as a portable fallback. Shift
       // is reserved for selection extension.
-      const hasModifier = key.meta || key.ctrl
-      const precision = computePrecisionWheelStep(precisionWheelRef.current, dir, hasModifier, now)
+      const hasModifier = key.meta || key.ctrl;
+      const precision = computePrecisionWheelStep(
+        precisionWheelRef.current,
+        dir,
+        hasModifier,
+        now,
+      );
 
       if (precision.active) {
         // Entering precision mode must discard any accelerated wheel state;
         // otherwise the next normal wheel event inherits stale momentum.
         if (precision.entered) {
-          wheelAccelRef.current = initWheelAccelForHost()
+          wheelAccelRef.current = initWheelAccelForHost();
         }
 
-        return precision.rows ? scrollTranscript(dir * wheelStep) : undefined
+        return precision.rows ? scrollTranscript(dir * wheelStep) : undefined;
       }
 
       // 0 = direction-flip bounce deferred; skip the no-op scroll.
-      const rows = computeWheelStep(wheelAccelRef.current, dir, now)
+      const rows = computeWheelStep(wheelAccelRef.current, dir, now);
 
-      return rows ? scrollTranscript(dir * rows * wheelStep) : undefined
+      return rows ? scrollTranscript(dir * rows * wheelStep) : undefined;
     }
 
     if (key.shift && key.upArrow) {
-      return scrollTranscript(-1)
+      return scrollTranscript(-1);
     }
 
     if (key.shift && key.downArrow) {
-      return scrollTranscript(1)
+      return scrollTranscript(1);
     }
 
     if (key.pageUp || key.pageDown) {
       // Half-viewport keeps 50% continuity and stays under Ink's
       // `delta < innerHeight` DECSTBM fast-path threshold.
-      const viewport = terminal.scrollRef.current?.getViewportHeight() ?? Math.max(6, (terminal.stdout?.rows ?? 24) - 8)
-      const step = Math.max(4, Math.floor(viewport / 2))
+      const viewport =
+        terminal.scrollRef.current?.getViewportHeight() ??
+        Math.max(6, (terminal.stdout?.rows ?? 24) - 8);
+      const step = Math.max(4, Math.floor(viewport / 2));
 
-      return scrollTranscript(key.pageUp ? -step : step)
+      return scrollTranscript(key.pageUp ? -step : step);
     }
 
     // Queue-edit cancel beats selection-clear for plain Esc: the queue header
     // explicitly promises "Esc cancel", so honoring it takes priority over the
     // implicit selection-dismissal convention. Without an active edit, fall through.
     if (key.escape && cState.queueEditIdx !== null) {
-      return cActions.clearIn()
+      return cActions.clearIn();
     }
 
     if (key.escape && terminal.hasSelection) {
-      return clearSelection()
+      return clearSelection();
     }
 
     // Proposal cards: Alt+Y accepts, Alt+N dismisses the top card (a bare letter would steal the first character
     // of every message typed while a card is showing).
     if (key.meta && !key.ctrl && handleProposalKey(ch, true)) {
-      return
+      return;
     }
 
     // Agent strip (below the composer). Precedence: a focused strip owns ↑/↓/Enter/Esc/x;
     // ↓ enters it only from an empty input with no history cycle in progress.
-    const strip = $stripNav.get()
+    const strip = $stripNav.get();
 
     if (strip.focused) {
       const r = reduceStripKey(strip, $stripRows.get(), {
@@ -519,122 +576,147 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         down: key.downArrow,
         escape: key.escape,
         return: key.return,
-        up: key.upArrow
-      })
+        up: key.upArrow,
+      });
 
       if (r.consumed) {
-        $stripNav.set(r.nav)
+        $stripNav.set(r.nav);
 
         if (r.effect) {
-          getStripHandlers()?.[r.effect.type]?.(r.effect.row)
+          getStripHandlers()?.[r.effect.type]?.(r.effect.row);
         }
 
-        return
+        return;
       }
     } else if (
       key.downArrow &&
       !key.shift &&
-      shouldEnterStrip({ historyIdx: cState.historyIdx, input: cState.input, rows: $stripRows.get().length }) &&
+      shouldEnterStrip({
+        historyIdx: cState.historyIdx,
+        input: cState.input,
+        rows: $stripRows.get().length,
+      }) &&
       !cState.inputBuf.length &&
       cState.queueEditIdx === null
     ) {
-      $stripNav.set({ ...IDLE_NAV, focused: true })
+      $stripNav.set({ ...IDLE_NAV, focused: true });
 
-      return
+      return;
     }
 
-    if (isCtrl(key, ch, 'f') && !key.meta && !key.shift) {
-      void toggleFocusMode({ rpc: (method, params) => gateway.gw.request(method, params) })
+    if (isCtrl(key, ch, "f") && !key.meta && !key.shift) {
+      void toggleFocusMode({
+        rpc: (method, params) => gateway.gw.request(method, params),
+      });
 
-      return
+      return;
     }
 
     // Ctrl+B = /bg: hand the running turn to a background session and continue in a fresh one.
-    if (isCtrl(key, ch, 'b') && !key.meta && !key.shift) {
+    if (isCtrl(key, ch, "b") && !key.meta && !key.shift) {
       if (!live.busy || !live.sid) {
-        return void actions.sys('nothing is running to send to the background (use /bg <prompt>)')
+        return void actions.sys(
+          "nothing is running to send to the background (use /bg <prompt>)",
+        );
       }
 
       return void gateway
-        .rpc<{ new_session_id?: string }>('prompt.background', { session_id: live.sid })
-        .then(r => {
-          if (r?.new_session_id) {
-            actions.resumeById?.(r.new_session_id)
-            actions.sys('turn sent to the background; it appears in the agent strip')
-          }
+        .rpc<{ new_session_id?: string }>("prompt.background", {
+          session_id: live.sid,
         })
+        .then((r) => {
+          if (r?.new_session_id) {
+            actions.resumeById?.(r.new_session_id);
+            actions.sys(
+              "turn sent to the background; it appears in the agent strip",
+            );
+          }
+        });
     }
 
     if (key.upArrow && !cState.inputBuf.length) {
-      const inputSel = getInputSelection()
-      const cursor = inputSel && inputSel.start === inputSel.end ? inputSel.start : null
+      const inputSel = getInputSelection();
+      const cursor =
+        inputSel && inputSel.start === inputSel.end ? inputSel.start : null;
 
       const noLineAbove =
-        !cState.input || (cursor !== null && cState.input.lastIndexOf('\n', Math.max(0, cursor - 1)) < 0)
+        !cState.input ||
+        (cursor !== null &&
+          cState.input.lastIndexOf("\n", Math.max(0, cursor - 1)) < 0);
 
       if (noLineAbove) {
-        cycleQueue(1) || cycleHistory(-1)
+        if (!cycleQueue(1)) {
+          cycleHistory(-1);
+        }
 
-        return
+        return;
       }
     }
 
     if (key.downArrow && !cState.inputBuf.length) {
-      const inputSel = getInputSelection()
-      const cursor = inputSel && inputSel.start === inputSel.end ? inputSel.start : null
-      const noLineBelow = !cState.input || (cursor !== null && cState.input.indexOf('\n', cursor) < 0)
+      const inputSel = getInputSelection();
+      const cursor =
+        inputSel && inputSel.start === inputSel.end ? inputSel.start : null;
+      const noLineBelow =
+        !cState.input ||
+        (cursor !== null && cState.input.indexOf("\n", cursor) < 0);
 
       if (noLineBelow || cState.historyIdx !== null) {
-        cycleQueue(-1) || cycleHistory(1)
+        if (!cycleQueue(-1)) {
+          cycleHistory(1);
+        }
 
-        return
+        return;
       }
     }
 
     if (isCopyShortcut(key, ch)) {
       if (terminal.hasSelection) {
-        return copySelection()
+        return copySelection();
       }
 
-      const inputSel = getInputSelection()
+      const inputSel = getInputSelection();
 
-      if (handleInputSelectionClipboard(inputSel, 'copy')) {
-        return
+      if (handleInputSelectionClipboard(inputSel, "copy")) {
+        return;
       }
 
       // On macOS, Cmd+C with no selection is a no-op (Ctrl+C below handles interrupt).
       // On non-macOS, isAction uses Ctrl, so fall through to interrupt/clear/exit.
       if (isMac) {
-        return
+        return;
       }
     }
 
-    if (isCtrl(key, ch, 'x') && handleInputSelectionClipboard(getInputSelection(), 'cut')) {
-      return
+    if (
+      isCtrl(key, ch, "x") &&
+      handleInputSelectionClipboard(getInputSelection(), "cut")
+    ) {
+      return;
     }
 
-    if (isCtrl(key, ch, 'x') && cState.queueEditIdx !== null) {
-      cActions.removeQueue(cState.queueEditIdx)
+    if (isCtrl(key, ch, "x") && cState.queueEditIdx !== null) {
+      cActions.removeQueue(cState.queueEditIdx);
 
-      return cActions.clearIn()
+      return cActions.clearIn();
     }
 
-    if (isCtrl(key, ch, 'x')) {
-      return patchOverlayState({ sessions: true })
+    if (isCtrl(key, ch, "x")) {
+      return patchOverlayState({ sessions: true });
     }
 
     // Ctrl+R / F7 toggle only changes the live-work dock preview; it does not
     // open the monitor or move composer focus. Ctrl+R is the reliable fallback
     // on macOS terminals that reserve the function row for hardware controls.
     if (
-      ((event.keypress.name === 'f7' && !key.ctrl) || isCtrl(key, ch, 'r')) &&
+      ((event.keypress.name === "f7" && !key.ctrl) || isCtrl(key, ch, "r")) &&
       !key.meta &&
       !key.shift &&
       !key.super
     ) {
-      $agentDockCollapsed.set(!$agentDockCollapsed.get())
+      $agentDockCollapsed.set(!$agentDockCollapsed.get());
 
-      return
+      return;
     }
 
     // Ctrl+O opens the model picker without disturbing a typed draft — the
@@ -642,105 +724,116 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     // typed to run the command. Works mid-stream: picking a model writes the
     // session model (config.set), which the next turn reads while the in-flight
     // turn keeps streaming.
-    if (isCtrl(key, ch, 't')) {
-      return patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 })
+    if (isCtrl(key, ch, "t")) {
+      return patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 });
     }
 
-    if (isCtrl(key, ch, 'o')) {
-      return patchOverlayState({ modelPicker: true })
+    if (isCtrl(key, ch, "o")) {
+      return patchOverlayState({ modelPicker: true });
     }
 
-    if (key.ctrl && ch.toLowerCase() === 'c') {
+    if (key.ctrl && ch.toLowerCase() === "c") {
       const ctrlC = resolveCtrlCComposerAction({
         busy: live.busy,
         hasDraft: Boolean(cState.input || cState.inputBuf.length),
-        hasSession: Boolean(live.sid)
-      })
+        hasSession: Boolean(live.sid),
+      });
 
-      if (ctrlC === 'clear') {
-        return cActions.clearIn()
+      if (ctrlC === "clear") {
+        return cActions.clearIn();
       }
 
-      if (ctrlC === 'interrupt' && live.sid) {
+      if (ctrlC === "interrupt" && live.sid) {
         return turnController.interruptTurn({
           appendMessage: actions.appendMessage,
           gw: gateway.gw,
           sid: live.sid,
-          sys: actions.sys
-        })
+          sys: actions.sys,
+        });
       }
 
       return handleIdleHotkeyExit(actions, DASHBOARD_TUI_MODE, () => {
         gateway.gw.publishLocalEvent({
-          payload: { reason: 'idle_exit_hotkey' },
+          payload: { reason: "idle_exit_hotkey" },
           session_id: live.sid ?? undefined,
-          type: 'dashboard.new_session_requested'
-        })
-      })
+          type: "dashboard.new_session_requested",
+        });
+      });
     }
 
     // Ctrl+D is the terminal EOF convention: exit only from an empty composer, on every
     // platform (macOS's action modifier is Cmd, which Ghostty consumes for split panes).
-    if ((isAction(key, ch, 'd') || isMacActionFallback(key, ch, 'd')) && !composerHasDraft(cState)) {
+    if (
+      (isAction(key, ch, "d") || isMacActionFallback(key, ch, "d")) &&
+      !composerHasDraft(cState)
+    ) {
       return handleIdleHotkeyExit(actions, DASHBOARD_TUI_MODE, () => {
         gateway.gw.publishLocalEvent({
-          payload: { reason: 'idle_exit_hotkey' },
+          payload: { reason: "idle_exit_hotkey" },
           session_id: live.sid ?? undefined,
-          type: 'dashboard.new_session_requested'
-        })
-      })
+          type: "dashboard.new_session_requested",
+        });
+      });
     }
 
-    if (isAction(key, ch, 'l')) {
-      clearSelection()
-      forceRedraw(terminal.stdout ?? process.stdout)
+    if (isAction(key, ch, "l")) {
+      clearSelection();
+      forceRedraw(terminal.stdout ?? process.stdout);
 
-      return
+      return;
     }
 
     // Cmd/Ctrl+G, plus Alt+G fallback for VSCode/Cursor (they bind the
     // primary keystroke to "Find Next" before the TUI sees it; Alt+G
     // arrives as meta+g across platforms).
-    if (ch.toLowerCase() === 'g' && (isAction(key, ch, 'g') || key.meta)) {
+    if (ch.toLowerCase() === "g" && (isAction(key, ch, "g") || key.meta)) {
       return void cActions.openEditor().catch((err: unknown) => {
-        actions.sys(err instanceof Error ? `failed to open editor: ${err.message}` : 'failed to open editor')
-      })
+        actions.sys(
+          err instanceof Error
+            ? `failed to open editor: ${err.message}`
+            : "failed to open editor",
+        );
+      });
     }
 
     // shift-tab cycles the permission mode: default → accept-edits → plan → auto
     // (the gateway answers with the new mode and emits session.info for the status line).
     if (key.shift && key.tab && !cState.completions.length) {
       if (!live.sid) {
-        return void actions.sys('permission mode needs an active session')
+        return void actions.sys("permission mode needs an active session");
       }
 
       // gateway.rpc swallows errors with its own sys() message and resolves to null.
-      return void gateway.rpc<{ mode?: string }>('session.mode.cycle', { session_id: live.sid }).then(r => {
-        if (r?.mode) {
-          actions.sys(`mode: ${r.mode}`)
-        }
-      })
+      return void gateway
+        .rpc<{ mode?: string }>("session.mode.cycle", { session_id: live.sid })
+        .then((r) => {
+          if (r?.mode) {
+            actions.sys(`mode: ${r.mode}`);
+          }
+        });
     }
 
     if (key.tab && cState.completions.length) {
-      const row = cState.completions[cState.compIdx]
+      const row = cState.completions[cState.compIdx];
 
       if (row?.text) {
-        cActions.setInput(applyCompletion(cState.input, row.text, cState.compReplace))
+        cActions.setInput(
+          applyCompletion(cState.input, row.text, cState.compReplace),
+        );
       }
 
-      return
+      return;
     }
 
-    if (isAction(key, ch, 'k') && cRefs.queueRef.current.length && live.sid) {
-      const next = cActions.dequeue()
+    if (isAction(key, ch, "k") && cRefs.queueRef.current.length && live.sid) {
+      const next = cActions.dequeue();
 
       if (next) {
-        cActions.setQueueEdit(null)
-        actions.dispatchSubmission(next)
+        cActions.setQueueEdit(null);
+        actions.dispatchSubmission(next);
       }
     }
-  })
+  });
 
-  return { pagerPageSize }
+  return { pagerPageSize };
 }

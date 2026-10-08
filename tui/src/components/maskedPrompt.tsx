@@ -1,12 +1,19 @@
-import { Box, Text } from '@k3code/ink'
-import { useState } from 'react'
+import { Box, Text } from "@k3code/ink";
+import { useState } from "react";
 
-import type { Theme } from '../theme.js'
+import type { Theme } from "../theme.js";
 
-import { TextInput } from './textInput.js'
+import { TextInput } from "./textInput.js";
 
-export function MaskedPrompt({ cols = 80, icon, label, onSubmit, sub, t }: MaskedPromptProps) {
-  const [value, setValue] = useState('')
+export function MaskedPrompt({
+  cols = 80,
+  icon,
+  label,
+  onSubmit,
+  sub,
+  t,
+}: MaskedPromptProps) {
+  const [value, setValue] = useState("");
 
   return (
     <Box flexDirection="column">
@@ -17,7 +24,7 @@ export function MaskedPrompt({ cols = 80, icon, label, onSubmit, sub, t }: Maske
       {sub && <Text color={t.color.muted}> {sub}</Text>}
 
       <Box>
-        <Text color={t.color.label}>{'> '}</Text>
+        <Text color={t.color.label}>{"> "}</Text>
         <TextInput
           color={t.color.text}
           columns={Math.max(20, cols - 6)}
@@ -28,14 +35,14 @@ export function MaskedPrompt({ cols = 80, icon, label, onSubmit, sub, t }: Maske
         />
       </Box>
     </Box>
-  )
+  );
 }
 
 interface MaskedPromptProps {
-  cols?: number
-  icon: string
-  label: string
-  onSubmit: (v: string) => void
-  sub?: string
-  t: Theme
+  cols?: number;
+  icon: string;
+  label: string;
+  onSubmit: (v: string) => void;
+  sub?: string;
+  t: Theme;
 }

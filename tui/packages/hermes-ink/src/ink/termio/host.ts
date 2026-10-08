@@ -6,8 +6,9 @@
  * (hermes_cli/pty_bridge.py — keep the two constants in sync). Native
  * terminals never set it.
  */
-export const PTY_HOST_ENV = 'HERMES_PTY_HOST'
-export const PTY_HOST_DASHBOARD = 'dashboard'
+export const PTY_HOST_ENV = "HERMES_PTY_HOST";
+export const PTY_HOST_DASHBOARD = "dashboard";
 
-export const isDashboardHosted = (env: NodeJS.ProcessEnv = process.env): boolean =>
-  env[PTY_HOST_ENV] === PTY_HOST_DASHBOARD
+export const isDashboardHosted = (
+  env: NodeJS.ProcessEnv = process.env,
+): boolean => env[PTY_HOST_ENV] === PTY_HOST_DASHBOARD;

@@ -42,9 +42,7 @@ class ImportCommand(CommandDef):
             if str(answer.get("answer", "")).strip().lower() not in ("import", "yes", "y"):
                 return reply("Import cancelled.")
         try:
-            rep = apply_bundle(
-                bundle, store=ctx.store, cwd=cwd, settings=not session_only, sessions=not settings_only
-            )
+            rep = apply_bundle(bundle, store=ctx.store, cwd=cwd, settings=not session_only, sessions=not settings_only)
         except (BundleError, ValueError) as e:
             return reply(f"Import failed: {e}")
         ctx.apply_file_config(cwd)

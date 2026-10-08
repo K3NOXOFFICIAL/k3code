@@ -159,7 +159,11 @@ def test_import_drops_mode_roots_and_background_markers_from_session_meta(tmp_pa
 
     store = SessionStore(tmp_path / "s.db")
     meta = {
-        "mode": "yolo", "add_dirs": ["/"], "background": True, "origin": "automation", "origin_session": "abc",
+        "mode": "yolo",
+        "add_dirs": ["/"],
+        "background": True,
+        "origin": "automation",
+        "origin_session": "abc",
         "output_style": "concise",
     }
     bundle = Bundle(manifest={"version": 1}, sessions=[{"session_id": "s1", "title": "t", "meta": meta}])

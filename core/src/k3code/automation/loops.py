@@ -193,7 +193,11 @@ class LoopManager:
         )
         try:
             result: RunResult = await self.runner.run_prompt(
-                prompt, session_id=row["session_id"], cwd=row["cwd"], model=row["model"], tick=ctx if paced else None,
+                prompt,
+                session_id=row["session_id"],
+                cwd=row["cwd"],
+                model=row["model"],
+                tick=ctx if paced else None,
                 kind="loop_tick",
             )
         except asyncio.CancelledError:
@@ -218,8 +222,8 @@ class LoopManager:
         current = self.db.get("loops", loop_id)
         if current is None or current["state"] != "active":
             return  # stopped while the tick ran
-        if result.status == "needs_input":
-            self._finish(loop_id, "stopped", "session needs input")
+        if result.status in ("blocked", "needs_input"):
+            self._finish(loop_id, "blocked", "needs input: the session is waiting for you")  # notifies once
             return
         if LOOP_COMPLETE in result.text:
             self._finish(loop_id, "done", f"model signalled {LOOP_COMPLETE}")

@@ -5,6 +5,7 @@ Prints one JSON line: {"ok": bool, "secs": float, "sketch": bool, "tail": str} o
 Used by m4_autonomy.py (which runs under a uv env without pexpect/pyte). \
 Re-execs under `uv run --with pexpect --with pyte`.
 """
+
 from __future__ import annotations
 
 import json
@@ -53,8 +54,11 @@ def main() -> None:
         t.close()
         shutil.rmtree(root, ignore_errors=True)
     sketch = "Risks" in txt and ("nothing was changed" in txt or "Preview only" in txt)
-    print(json.dumps({"ok": bool(done), "secs": round(secs, 1), "sketch": sketch, "tail": txt[-500:],
-                      "label": backend["label"]}))
+    print(
+        json.dumps(
+            {"ok": bool(done), "secs": round(secs, 1), "sketch": sketch, "tail": txt[-500:], "label": backend["label"]}
+        )
+    )
 
 
 if __name__ == "__main__":

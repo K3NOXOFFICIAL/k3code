@@ -1,20 +1,20 @@
-import type { Writable } from 'stream'
+import type { Writable } from "stream";
 
-import { coerce } from 'semver'
+import { coerce } from "semver";
 
-import { env } from '../utils/env.js'
-import { gte } from '../utils/semver.js'
+import { env } from "../utils/env.js";
+import { gte } from "../utils/semver.js";
 
-import { getClearTerminalSequence } from './clearTerminal.js'
-import type { Diff } from './frame.js'
-import { cursorMove, cursorTo, eraseLines } from './termio/csi.js'
-import { BSU, ESU, HIDE_CURSOR, SHOW_CURSOR } from './termio/dec.js'
-import { link } from './termio/osc.js'
+import { getClearTerminalSequence } from "./clearTerminal.js";
+import type { Diff } from "./frame.js";
+import { cursorMove, cursorTo, eraseLines } from "./termio/csi.js";
+import { BSU, ESU, HIDE_CURSOR, SHOW_CURSOR } from "./termio/dec.js";
+import { link } from "./termio/osc.js";
 
 export type Progress = {
-  state: 'running' | 'completed' | 'error' | 'indeterminate'
-  percentage?: number
-}
+  state: "running" | "completed" | "error" | "indeterminate";
+  percentage?: number;
+};
 
 /**
  * Checks if the terminal supports OSC 9;4 progress reporting.
@@ -28,51 +28,57 @@ export type Progress = {
 export function isProgressReportingAvailable(): boolean {
   // Only available if we have a TTY (not piped)
   if (!process.stdout.isTTY) {
-    return false
+    return false;
   }
 
   // Explicitly exclude Windows Terminal, which interprets OSC 9;4 as
   // notifications rather than progress indicators
   if (process.env.WT_SESSION) {
-    return false
+    return false;
   }
 
   // ConEmu supports OSC 9;4 for progress (all versions)
-  if (process.env.ConEmuANSI || process.env.ConEmuPID || process.env.ConEmuTask) {
-    return true
+  if (
+    process.env.ConEmuANSI ||
+    process.env.ConEmuPID ||
+    process.env.ConEmuTask
+  ) {
+    return true;
   }
 
-  const version = coerce(process.env.TERM_PROGRAM_VERSION)
+  const version = coerce(process.env.TERM_PROGRAM_VERSION);
 
   if (!version) {
-    return false
+    return false;
   }
 
   // Ghostty 1.2.0+ supports OSC 9;4 for progress
   // https://ghostty.org/docs/install/release-notes/1-2-0
-  if (process.env.TERM_PROGRAM === 'ghostty') {
-    return gte(version.version, '1.2.0')
+  if (process.env.TERM_PROGRAM === "ghostty") {
+    return gte(version.version, "1.2.0");
   }
 
   // iTerm2 3.6.6+ supports OSC 9;4 for progress
   // https://iterm2.com/downloads.html
-  if (process.env.TERM_PROGRAM === 'iTerm.app') {
-    return gte(version.version, '3.6.6')
+  if (process.env.TERM_PROGRAM === "iTerm.app") {
+    return gte(version.version, "3.6.6");
   }
 
-  return false
+  return false;
 }
 
 /**
  * Checks if the terminal supports DEC mode 2026 (synchronized output).
  * When supported, BSU/ESU sequences prevent visible flicker during redraws.
  */
-export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.env): boolean {
+export function isSynchronizedOutputSupported(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
   // tmux parses and proxies every byte but doesn't implement DEC 2026.
   // BSU/ESU pass through to the outer terminal but tmux has already
   // broken atomicity by chunking. Skip to save 16 bytes/frame + parser work.
   if (env.TMUX) {
-    return false
+    return false;
   }
 
   // Zellij is the same class of hazard as tmux: it sits between us and the
@@ -82,67 +88,67 @@ export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.e
   // already broken atomicity on, repeating old frames into scrollback.
   // Zellij sets ZELLIJ to the session index (e.g. "0"), so guard on presence.
   if (env.ZELLIJ) {
-    return false
+    return false;
   }
 
-  const termProgram = env.TERM_PROGRAM
-  const term = env.TERM
+  const termProgram = env.TERM_PROGRAM;
+  const term = env.TERM;
 
   // Modern terminals with known DEC 2026 support
   if (
-    termProgram === 'iTerm.app' ||
-    termProgram === 'WezTerm' ||
-    termProgram === 'WarpTerminal' ||
-    termProgram === 'ghostty' ||
-    termProgram === 'contour' ||
-    termProgram === 'vscode' ||
-    termProgram === 'alacritty'
+    termProgram === "iTerm.app" ||
+    termProgram === "WezTerm" ||
+    termProgram === "WarpTerminal" ||
+    termProgram === "ghostty" ||
+    termProgram === "contour" ||
+    termProgram === "vscode" ||
+    termProgram === "alacritty"
   ) {
-    return true
+    return true;
   }
 
   // kitty sets TERM=xterm-kitty or KITTY_WINDOW_ID
-  if (term?.includes('kitty') || env.KITTY_WINDOW_ID) {
-    return true
+  if (term?.includes("kitty") || env.KITTY_WINDOW_ID) {
+    return true;
   }
 
   // Ghostty may set TERM=xterm-ghostty without TERM_PROGRAM
-  if (term === 'xterm-ghostty') {
-    return true
+  if (term === "xterm-ghostty") {
+    return true;
   }
 
   // foot sets TERM=foot or TERM=foot-extra
-  if (term?.startsWith('foot')) {
-    return true
+  if (term?.startsWith("foot")) {
+    return true;
   }
 
   // Alacritty may set TERM containing 'alacritty'
-  if (term?.includes('alacritty')) {
-    return true
+  if (term?.includes("alacritty")) {
+    return true;
   }
 
   // Zed uses the alacritty_terminal crate which supports DEC 2026
   if (env.ZED_TERM) {
-    return true
+    return true;
   }
 
   // Windows Terminal
   if (env.WT_SESSION) {
-    return true
+    return true;
   }
 
   // VTE-based terminals (GNOME Terminal, Tilix, etc.) since VTE 0.68
-  const vteVersion = env.VTE_VERSION
+  const vteVersion = env.VTE_VERSION;
 
   if (vteVersion) {
-    const version = parseInt(vteVersion, 10)
+    const version = parseInt(vteVersion, 10);
 
     if (version >= 6800) {
-      return true
+      return true;
     }
   }
 
-  return false
+  return false;
 }
 
 // -- XTVERSION-detected terminal name (populated async at startup) --
@@ -155,13 +161,13 @@ export function isSynchronizedOutputSupported(env: NodeJS.ProcessEnv = process.e
 // from the response handler. Readers should treat undefined as "not yet known"
 // and fall back to env-var detection.
 
-let xtversionName: string | undefined
+let xtversionName: string | undefined;
 
 /** Record the XTVERSION response. Called once from App.tsx when the reply
  *  arrives on stdin. No-op if already set (defend against re-probe). */
 export function setXtversionName(name: string): void {
   if (xtversionName === undefined) {
-    xtversionName = name
+    xtversionName = name;
   }
 }
 
@@ -171,15 +177,17 @@ export function setXtversionName(name: string): void {
  *  SSH — query/reply goes through the pty). Early calls may miss the probe
  *  reply — call lazily (e.g. in an event handler) if SSH detection matters. */
 export function isXtermJs(): boolean {
-  if (process.env.TERM_PROGRAM === 'vscode') {
-    return true
+  if (process.env.TERM_PROGRAM === "vscode") {
+    return true;
   }
 
-  return xtversionName?.startsWith('xterm.js') ?? false
+  return xtversionName?.startsWith("xterm.js") ?? false;
 }
 
-export function needsAltScreenResizeScrollbackClear(env: NodeJS.ProcessEnv = process.env): boolean {
-  return (env.TERM_PROGRAM ?? '').trim() === 'Apple_Terminal'
+export function needsAltScreenResizeScrollbackClear(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (env.TERM_PROGRAM ?? "").trim() === "Apple_Terminal";
 }
 
 // -- OSC-detected terminal colors (populated async at startup) --
@@ -196,66 +204,70 @@ export function needsAltScreenResizeScrollbackClear(env: NodeJS.ProcessEnv = pro
 // known / unsupported".
 
 interface ReportedColorSlot {
-  set(hex: string): void
-  get(): string | undefined
-  on(listener: (hex: string) => void): void
+  set(hex: string): void;
+  get(): string | undefined;
+  on(listener: (hex: string) => void): void;
 }
 
 function reportedColorSlot(): ReportedColorSlot {
-  let value: string | undefined
-  const listeners = new Set<(hex: string) => void>()
+  let value: string | undefined;
+  const listeners = new Set<(hex: string) => void>();
 
   return {
     // First writer wins (defend against re-probe).
     set(hex) {
       if (value !== undefined) {
-        return
+        return;
       }
 
-      value = hex
+      value = hex;
 
       for (const listener of listeners) {
-        listener(hex)
+        listener(hex);
       }
 
-      listeners.clear()
+      listeners.clear();
     },
     get: () => value,
     // Fires immediately when already known, otherwise once on the reply.
     on(listener) {
       if (value !== undefined) {
-        listener(value)
+        listener(value);
 
-        return
+        return;
       }
 
-      listeners.add(listener)
-    }
-  }
+      listeners.add(listener);
+    },
+  };
 }
 
-const background = reportedColorSlot()
-const foreground = reportedColorSlot()
+const background = reportedColorSlot();
+const foreground = reportedColorSlot();
 
 /** Record the OSC 11 response. */
-export const setTerminalBackgroundHex = (hex: string): void => background.set(hex)
+export const setTerminalBackgroundHex = (hex: string): void =>
+  background.set(hex);
 
 /** The terminal's reported background as `#rrggbb`, or undefined if the
  *  reply hasn't arrived (or the terminal ignored the query). */
-export const terminalBackgroundHex = (): string | undefined => background.get()
+export const terminalBackgroundHex = (): string | undefined => background.get();
 
 /** Subscribe to the background color. */
-export const onTerminalBackground = (listener: (hex: string) => void): void => background.on(listener)
+export const onTerminalBackground = (listener: (hex: string) => void): void =>
+  background.on(listener);
 
 /** Record the OSC 10 response. */
-export const setTerminalForegroundHex = (hex: string): void => foreground.set(hex)
+export const setTerminalForegroundHex = (hex: string): void =>
+  foreground.set(hex);
 
 /** The terminal's reported foreground as `#rrggbb`, or undefined if the
  *  reply hasn't arrived (or the terminal ignored the query). */
-export const terminalForegroundHex = (): string | undefined => foreground.get()
+export const terminalForegroundHex = (): string | undefined => foreground.get();
 
 /** Subscribe to the foreground color. */
-export const onTerminalForeground = (listener: (hex: string) => void): void => foreground.on(listener)
+export const onTerminalForeground = (listener: (hex: string) => void): void =>
+  foreground.on(listener);
 
 /**
  * Parse an OSC color reply payload into `#rrggbb`.
@@ -266,48 +278,53 @@ export const onTerminalForeground = (listener: (hex: string) => void): void => f
  * Returns undefined for anything unrecognized.
  */
 export function parseOscColor(data: string): string | undefined {
-  const value = data.trim().toLowerCase()
+  const value = data.trim().toLowerCase();
 
   const scaled = (component: string): null | number => {
     if (!/^[0-9a-f]{1,4}$/.test(component)) {
-      return null
+      return null;
     }
 
-    const max = 16 ** component.length - 1
+    const max = 16 ** component.length - 1;
 
-    return Math.round((parseInt(component, 16) / max) * 255)
-  }
+    return Math.round((parseInt(component, 16) / max) * 255);
+  };
 
-  const rgbMatch = /^rgba?:([0-9a-f]{1,4})\/([0-9a-f]{1,4})\/([0-9a-f]{1,4})(?:\/[0-9a-f]{1,4})?$/.exec(value)
+  const rgbMatch =
+    /^rgba?:([0-9a-f]{1,4})\/([0-9a-f]{1,4})\/([0-9a-f]{1,4})(?:\/[0-9a-f]{1,4})?$/.exec(
+      value,
+    );
 
   if (rgbMatch) {
-    const channels = [rgbMatch[1]!, rgbMatch[2]!, rgbMatch[3]!].map(scaled)
+    const channels = [rgbMatch[1]!, rgbMatch[2]!, rgbMatch[3]!].map(scaled);
 
-    if (channels.every(c => c !== null)) {
-      return '#' + channels.map(c => c!.toString(16).padStart(2, '0')).join('')
+    if (channels.every((c) => c !== null)) {
+      return (
+        "#" + channels.map((c) => c!.toString(16).padStart(2, "0")).join("")
+      );
     }
 
-    return undefined
+    return undefined;
   }
 
-  const hexMatch = /^#?([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{12})$/.exec(value)
+  const hexMatch = /^#?([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{12})$/.exec(value);
 
   if (!hexMatch) {
-    return undefined
+    return undefined;
   }
 
-  const hex = hexMatch[1]!
+  const hex = hexMatch[1]!;
 
   if (hex.length === 6) {
-    return `#${hex}`
+    return `#${hex}`;
   }
 
   if (hex.length === 3) {
-    return `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`
+    return `#${hex[0]}${hex[0]}${hex[1]}${hex[1]}${hex[2]}${hex[2]}`;
   }
 
   // 12-digit form: 4 digits per channel, take the top byte of each.
-  return `#${hex.slice(0, 2)}${hex.slice(4, 6)}${hex.slice(8, 10)}`
+  return `#${hex.slice(0, 2)}${hex.slice(4, 6)}${hex.slice(8, 10)}`;
 }
 
 // Terminals known to correctly implement the Kitty keyboard protocol
@@ -318,12 +335,20 @@ export function parseOscColor(data: string): string | undefined {
 // in xterm.js-based terminals like VS Code). tmux is allowlisted because it
 // accepts modifyOtherKeys and doesn't forward the kitty sequence to the outer
 // terminal.
-const EXTENDED_KEYS_TERMINALS = ['iTerm.app', 'kitty', 'WezTerm', 'ghostty', 'tmux', 'windows-terminal', 'vscode']
+const EXTENDED_KEYS_TERMINALS = [
+  "iTerm.app",
+  "kitty",
+  "WezTerm",
+  "ghostty",
+  "tmux",
+  "windows-terminal",
+  "vscode",
+];
 
 /** True if this terminal correctly handles extended key reporting
  *  (Kitty keyboard protocol + xterm modifyOtherKeys). */
 export function supportsExtendedKeys(): boolean {
-  return EXTENDED_KEYS_TERMINALS.includes(env.terminal ?? '')
+  return EXTENDED_KEYS_TERMINALS.includes(env.terminal ?? "");
 }
 
 /** True when the Kitty keyboard protocol push (CSI >1u) must be skipped for
@@ -333,7 +358,7 @@ export function supportsExtendedKeys(): boolean {
  *  breaking backward-kill-word. Ghostty implements modifyOtherKeys correctly,
  *  so it gets only that push (mirrors cli.py's Ghostty exception). */
 export function skipKittyKeyboardProtocol(): boolean {
-  return env.terminal === 'ghostty'
+  return env.terminal === "ghostty";
 }
 
 /** True if the terminal scrolls the viewport when it receives cursor-up
@@ -343,96 +368,96 @@ export function skipKittyKeyboardProtocol(): boolean {
  *  mid-stream. WT_SESSION catches WSL-in-Windows-Terminal where platform
  *  is linux but output still routes through conhost. */
 export function hasCursorUpViewportYankBug(): boolean {
-  return process.platform === 'win32' || !!process.env.WT_SESSION
+  return process.platform === "win32" || !!process.env.WT_SESSION;
 }
 
 // Computed once at module load — terminal capabilities don't change mid-session.
 // Exported so callers can pass a sync-skip hint gated to specific modes.
-export const SYNC_OUTPUT_SUPPORTED = isSynchronizedOutputSupported()
+export const SYNC_OUTPUT_SUPPORTED = isSynchronizedOutputSupported();
 
 export type Terminal = {
-  stdout: Writable
-  stderr: Writable
-}
+  stdout: Writable;
+  stderr: Writable;
+};
 
 export function writeDiffToTerminal(
   terminal: Terminal,
   diff: Diff,
   skipSyncMarkers = false,
-  onDrain?: () => void
+  onDrain?: () => void,
 ): { bytes: number; backpressure: boolean } {
   // No output if there are no patches
   if (diff.length === 0) {
-    return { bytes: 0, backpressure: false }
+    return { bytes: 0, backpressure: false };
   }
 
   // BSU/ESU wrapping is opt-out to keep main-screen behavior unchanged.
   // Callers pass skipSyncMarkers=true when the terminal doesn't support
   // DEC 2026 (e.g. tmux) AND the cost matters (high-frequency alt-screen).
-  const useSync = !skipSyncMarkers
+  const useSync = !skipSyncMarkers;
 
   // Buffer all writes into a single string to avoid multiple write calls
-  let buffer = useSync ? BSU : ''
+  let buffer = useSync ? BSU : "";
 
   for (const patch of diff) {
     switch (patch.type) {
-      case 'stdout':
-        buffer += patch.content
+      case "stdout":
+        buffer += patch.content;
 
-        break
+        break;
 
-      case 'clear':
+      case "clear":
         if (patch.count > 0) {
-          buffer += eraseLines(patch.count)
+          buffer += eraseLines(patch.count);
         }
 
-        break
+        break;
 
-      case 'clearTerminal':
-        buffer += getClearTerminalSequence()
+      case "clearTerminal":
+        buffer += getClearTerminalSequence();
 
-        break
+        break;
 
-      case 'cursorHide':
-        buffer += HIDE_CURSOR
+      case "cursorHide":
+        buffer += HIDE_CURSOR;
 
-        break
+        break;
 
-      case 'cursorShow':
-        buffer += SHOW_CURSOR
+      case "cursorShow":
+        buffer += SHOW_CURSOR;
 
-        break
+        break;
 
-      case 'cursorMove':
-        buffer += cursorMove(patch.x, patch.y)
+      case "cursorMove":
+        buffer += cursorMove(patch.x, patch.y);
 
-        break
+        break;
 
-      case 'cursorTo':
-        buffer += cursorTo(patch.col)
+      case "cursorTo":
+        buffer += cursorTo(patch.col);
 
-        break
+        break;
 
-      case 'carriageReturn':
-        buffer += '\r'
+      case "carriageReturn":
+        buffer += "\r";
 
-        break
+        break;
 
-      case 'hyperlink':
-        buffer += link(patch.uri)
+      case "hyperlink":
+        buffer += link(patch.uri);
 
-        break
+        break;
 
-      case 'styleStr':
-        buffer += patch.str
+      case "styleStr":
+        buffer += patch.str;
 
-        break
+        break;
     }
   }
 
   // Add synchronized update end and flush buffer
   if (useSync) {
-    buffer += ESU
+    buffer += ESU;
   }
 
   // Node's Writable.write returns false when the internal buffer is full
@@ -441,7 +466,9 @@ export function writeDiffToTerminal(
   // The 2-arg form attaches a drain callback that fires once the chunk
   // is actually flushed to the OS socket/pipe — giving us end-to-end
   // drain timing, not just "queued in Node".
-  const wrote = onDrain ? terminal.stdout.write(buffer, () => onDrain()) : terminal.stdout.write(buffer)
+  const wrote = onDrain
+    ? terminal.stdout.write(buffer, () => onDrain())
+    : terminal.stdout.write(buffer);
 
-  return { bytes: Buffer.byteLength(buffer, 'utf8'), backpressure: !wrote }
+  return { bytes: Buffer.byteLength(buffer, "utf8"), backpressure: !wrote };
 }

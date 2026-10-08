@@ -96,6 +96,7 @@ class Reliability:
         self.loop_guard = LoopGuard() if self.flags.loop_guard else None
         self.journal: ToolJournal | None = None  # opened lazily in _open_journal
         self.retry: PersistentRetry | None = None  # built in attach_router
+        self.unattended = False  # see set_unattended
         self._started = False
         self._net_forwarded = False
 
@@ -127,9 +128,7 @@ class Reliability:
         )
         if settings and r.governor is not None:
             if settings.session_tokens is not None or settings.session_usd is not None:
-                r.governor.add_budget(
-                    Budget(scope="session", tokens=settings.session_tokens, usd=settings.session_usd)
-                )
+                r.governor.add_budget(Budget(scope="session", tokens=settings.session_tokens, usd=settings.session_usd))
             if settings.day_tokens is not None or settings.day_usd is not None:
                 r.governor.add_budget(Budget(scope="day", tokens=settings.day_tokens, usd=settings.day_usd))
         return r
@@ -148,7 +147,14 @@ class Reliability:
                 events=self.events,
                 cancel_token=self.cancel_token,
             )
+            self.retry.unattended = self.unattended
             self.retry_config = self.retry.config
+
+    def set_unattended(self, flag: bool) -> None:
+        """Unattended runs (background, goals, loops) park on provider exhaustion; interactive turns fail fast."""
+        self.unattended = bool(flag)
+        if self.retry is not None:
+            self.retry.unattended = self.unattended
 
     async def start(self) -> None:
         """Begin NetWatch polling (providers should already be registered)."""
@@ -290,8 +296,9 @@ class Reliability:
                     tool_call_id=d.get("tool_call_id"),
                     name=d.get("name"),
                     tool_calls=[
-                        ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"],
-                                 raw_arguments=c.get("raw_arguments"))
+                        ToolCall(
+                            id=c["id"], name=c["name"], arguments=c["arguments"], raw_arguments=c.get("raw_arguments")
+                        )
                         for c in d.get("tool_calls", [])
                     ],
                 )
@@ -399,8 +406,16 @@ def build_reliability(config: Any, session: str, home: Path | None = None) -> Re
     raw = dict(getattr(config, "reliability", None) or {})
     flags_raw = raw.pop("flags", None)
     flags = ReliabilityFlags(**flags_raw) if isinstance(flags_raw, dict) else None
-    known = {"enabled", "max_wait", "max_park_seconds", "session_tokens", "session_usd", "day_tokens",
-             "day_usd", "netwatch"}
+    known = {
+        "enabled",
+        "max_wait",
+        "max_park_seconds",
+        "session_tokens",
+        "session_usd",
+        "day_tokens",
+        "day_usd",
+        "netwatch",
+    }
     settings = ReliabilitySettings(flags=flags) if flags else ReliabilitySettings()
     for key in known & set(raw):
         setattr(settings, key, raw[key])

@@ -326,6 +326,8 @@ class AutomationManager:
         )
         if result.status == "failed":
             self.runner.notify(f"automation “{row['name']}” failed: {result.error[:120]}", "warning", key=f"auto-{aid}")
+        elif result.status == "blocked":
+            self.runner.notify(f"automation “{row['name']}” needs your input", "warning", key=f"auto-{aid}")
         self.on_change()
         return result
 

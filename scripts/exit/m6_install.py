@@ -1,4 +1,5 @@
 """M6 exit checks: fresh-container install, --from-bundle, resumable setup, update rollback, upstream sync dry run."""
+
 from __future__ import annotations
 
 import contextlib
@@ -48,19 +49,42 @@ def k3(home: Path, *args: str, **kw: object) -> tuple[int, str]:
 
 
 def fresh_install() -> None:
-    how = (f"podman run {IMAGE}: dnf basics, cp /src to /tmp/k3code, install.sh --from-source --yes "
-           f"--no-setup, k3code setup --non-interactive --no-probe, k3code doctor")
+    how = (
+        f"podman run {IMAGE}: dnf basics, cp /src to /tmp/k3code, install.sh --from-source --yes "
+        f"--no-setup, k3code setup --non-interactive --no-probe, k3code doctor"
+    )
     if not shutil.which("podman"):
-        return emit("M6", "Fresh install in a fresh Fedora 44 container", how, "PENDING", "podman not installed",
-                    "run scripts/exit/m6_install.py on a host with podman")
+        return emit(
+            "M6",
+            "Fresh install in a fresh Fedora 44 container",
+            how,
+            "PENDING",
+            "podman not installed",
+            "run scripts/exit/m6_install.py on a host with podman",
+        )
     inner = Path(tempfile.mkdtemp(prefix="m6inner-")) / "inner.sh"
     inner.write_text(INNER)
     log = LOGS / "m6_container.log"
     with open(log, "w") as f:
         try:
-            p = subprocess.run(["podman", "run", "--rm", "-v", f"{REPO}:/src:ro,Z", "-v", f"{inner}:/inner.sh:ro,Z",
-                                IMAGE, "sh", "/inner.sh"], stdout=f, stderr=subprocess.STDOUT,
-                                timeout=2400, check=False)
+            p = subprocess.run(
+                [
+                    "podman",
+                    "run",
+                    "--rm",
+                    "-v",
+                    f"{REPO}:/src:ro,Z",
+                    "-v",
+                    f"{inner}:/inner.sh:ro,Z",
+                    IMAGE,
+                    "sh",
+                    "/inner.sh",
+                ],
+                stdout=f,
+                stderr=subprocess.STDOUT,
+                timeout=2400,
+                check=False,
+            )
             rc = p.returncode
         except subprocess.TimeoutExpired:
             rc = 124
@@ -68,9 +92,11 @@ def fresh_install() -> None:
     m = re.search(r"TOTAL_SECS=(\d+)", text)
     srcs = re.search(r"INSTALL_SECS=(\d+)", text)
     dr = re.search(r"DOCTOR_RC=(\d+)", text)
-    ev = (f"podman rc={rc}; "
-          + (f"install {srcs.group(1)}s, install+setup {m.group(1)}s; " if m and srcs else "")
-          + tail(text, 5))
+    ev = (
+        f"podman rc={rc}; "
+        + (f"install {srcs.group(1)}s, install+setup {m.group(1)}s; " if m and srcs else "")
+        + tail(text, 5)
+    )
     setup_ok = "SETUP_RC=0" in text and "INSTALL_RC=0" in text
     if m and setup_ok and dr:
         secs = int(m.group(1))
@@ -81,32 +107,54 @@ def fresh_install() -> None:
         unexpected = [f for f in failed if not (f.startswith("provider") or f == "api-keys")]
         ev += f"\ndoctor failures: {failed or 'none'}; unexpected: {unexpected or 'none'}"
         ok = secs < 600 and not unexpected
-        emit("M6", "Fresh install in a fresh Fedora 44 container (<10 min incl. setup, doctor passes)", how,
-             "PASS" if ok else "FAIL", ev)
-    elif re.search(r"(Could not resolve|Failed to download|curl: \(|Temporary failure|Cannot download|"
-                   r"No route)", text) or "DNF_FAIL" in text:
-        emit("M6", "Fresh install in a fresh Fedora 44 container", how, "PENDING", ev,
-             "rerun scripts/exit/m6_install.py with working network to the container "
-             "(dnf, astral.sh, nodejs.org, go.dev)")
+        emit(
+            "M6",
+            "Fresh install in a fresh Fedora 44 container (<10 min incl. setup, doctor passes)",
+            how,
+            "PASS" if ok else "FAIL",
+            ev,
+        )
+    elif (
+        re.search(
+            r"(Could not resolve|Failed to download|curl: \(|Temporary failure|Cannot download|"
+            r"No route)",
+            text,
+        )
+        or "DNF_FAIL" in text
+    ):
+        emit(
+            "M6",
+            "Fresh install in a fresh Fedora 44 container",
+            how,
+            "PENDING",
+            ev,
+            "rerun scripts/exit/m6_install.py with working network to the container "
+            "(dnf, astral.sh, nodejs.org, go.dev)",
+        )
     else:
         emit("M6", "Fresh install in a fresh Fedora 44 container", how, "FAIL", ev)
 
 
 def bundle_restore() -> None:
-    how = ("temp HOME A: setup+session+`k3code export`; temp HOME B: "
-           "`install.sh --from-source --from-bundle` (real venv, no tui/go build), "
-           "check config+session restored, secrets redacted")
+    how = (
+        "temp HOME A: setup+session+`k3code export`; temp HOME B: "
+        "`install.sh --from-source --from-bundle` (real venv, no tui/go build), "
+        "check config+session restored, secrets redacted"
+    )
     sys.path.insert(0, str(CORE / "src"))
     with tempfile.TemporaryDirectory(prefix="m6b-") as t:
         a, b = Path(t, "a"), Path(t, "b")
         a.mkdir()
         b.mkdir()
-        rc, out = k3(a, "setup", "--non-interactive", "--answers", str(REPO / "install/answers.sample.yaml"),
-                     "--no-probe")
+        rc, out = k3(
+            a, "setup", "--non-interactive", "--answers", str(REPO / "install/answers.sample.yaml"), "--no-probe"
+        )
         if rc != 0:
             return emit("M6", "--from-bundle restore", how, "FAIL", "setup in home A: " + out)
-        code = ("from k3code.gateway.sessions import SessionStore;from pathlib import Path;import os;"
-                "s=SessionStore(Path(os.environ['K3CODE_HOME'])/'sessions.db');x=s.create(title='m6-bundle-session',cwd=os.getcwd());print(x.session_id)")
+        code = (
+            "from k3code.gateway.sessions import SessionStore;from pathlib import Path;import os;"
+            "s=SessionStore(Path(os.environ['K3CODE_HOME'])/'sessions.db');x=s.create(title='m6-bundle-session',cwd=os.getcwd());print(x.session_id)"
+        )
         rc, sid = run(["uv", "run", "--project", str(CORE), "--quiet", "python", "-c", code], cwd=a, env=kenv(a))
         sid = sid.strip().splitlines()[-1] if rc == 0 and sid.strip() else ""
         bundle = Path(t, "x.k3bundle")
@@ -114,8 +162,20 @@ def bundle_restore() -> None:
         if rc != 0 or not bundle.exists():
             return emit("M6", "--from-bundle restore", how, "FAIL", "export: " + out)
         env = kenv(b, K3_SKIP_TUI="1", K3_SKIP_GO="1", PATH=f"{Path.home() / '.local/bin'}:{os.environ['PATH']}")
-        rc, out = run(["sh", str(REPO / "install/install.sh"), "--from-source", "--from-bundle", str(bundle), "--yes",
-                       "--no-setup"], cwd=b, env=env, timeout=900)
+        rc, out = run(
+            [
+                "sh",
+                str(REPO / "install/install.sh"),
+                "--from-source",
+                "--from-bundle",
+                str(bundle),
+                "--yes",
+                "--no-setup",
+            ],
+            cwd=b,
+            env=env,
+            timeout=900,
+        )
         cfg = b / ".k3code" / "config.yaml"
         env_k = b / "data" / "current" / "venv" / "bin" / "k3code"
         ok = rc == 0 and cfg.is_file() and bool(sid)
@@ -125,20 +185,28 @@ def bundle_restore() -> None:
             _, listing = run([str(env_k), "stats", "--json"], env=env)  # sanity that the installed CLI runs
         has_sess = False
         if ok:
-            chk = ("from k3code.gateway.sessions import SessionStore;from pathlib import Path;import os;"
-                   "print([x.title for x in SessionStore(Path(os.environ['K3CODE_HOME'])/'sessions.db').list()])")
+            chk = (
+                "from k3code.gateway.sessions import SessionStore;from pathlib import Path;import os;"
+                "print([x.title for x in SessionStore(Path(os.environ['K3CODE_HOME'])/'sessions.db').list()])"
+            )
             _, o2 = run([str(b / "data/current/venv/bin/python"), "-c", chk], env=env)
             has_sess = "m6-bundle-session" in o2
             listing = o2
-        emit("M6", "--from-bundle restore (config + sessions restored, secrets not in bundle)", how,
-             "PASS" if ok and has_sess and not secret else "FAIL",
-             f"install rc={rc}, config restored={cfg.is_file()}, secret leaked={secret}, "
-             f"sessions in B: {listing.strip()[:150]}\n{tail(out, 3)}")
+        emit(
+            "M6",
+            "--from-bundle restore (config + sessions restored, secrets not in bundle)",
+            how,
+            "PASS" if ok and has_sess and not secret else "FAIL",
+            f"install rc={rc}, config restored={cfg.is_file()}, secret leaked={secret}, "
+            f"sessions in B: {listing.strip()[:150]}\n{tail(out, 3)}",
+        )
 
 
 def interrupted_setup() -> None:
-    how = ("real CLI: interactive `k3code setup` killed with SIGINT mid-step (stdin held open), "
-           "then re-run with --answers; plus pytest test_resume_after_interrupt")
+    how = (
+        "real CLI: interactive `k3code setup` killed with SIGINT mid-step (stdin held open), "
+        "then re-run with --answers; plus pytest test_resume_after_interrupt"
+    )
     with tempfile.TemporaryDirectory(prefix="m6s-") as t:
         h = Path(t)
         # The real wizard needs a terminal (prompt_toolkit ignores piped stdin), so drive it through a pty:
@@ -148,9 +216,16 @@ def interrupted_setup() -> None:
         out1 = ""
         state_files: list[Path] = []
         saved = 0
-        child = pexpect.spawn("uv", ["run", "--project", str(CORE), "--quiet", "k3code", "setup", "--no-probe"],
-                              cwd=str(h), env=kenv(h), dimensions=(40, 140), encoding="utf-8", codec_errors="replace",
-                              timeout=5)
+        child = pexpect.spawn(
+            "uv",
+            ["run", "--project", str(CORE), "--quiet", "k3code", "setup", "--no-probe"],
+            cwd=str(h),
+            env=kenv(h),
+            dimensions=(40, 140),
+            encoding="utf-8",
+            codec_errors="replace",
+            timeout=5,
+        )
         try:
             deadline = time.time() + 180
             while time.time() < deadline and child.isalive():
@@ -184,34 +259,61 @@ def interrupted_setup() -> None:
 
         p = _P()
         interrupted = "Interrupted; progress saved" in out1 or p.returncode in (130, -2, 2, 128 + 2)
-        rc2, out2 = k3(h, "setup", "--non-interactive", "--answers",
-                       str(REPO / "install/answers.sample.yaml"), "--no-probe")
+        rc2, out2 = k3(
+            h, "setup", "--non-interactive", "--answers", str(REPO / "install/answers.sample.yaml"), "--no-probe"
+        )
         resumed = "Resuming at step" in out2
         cfg = (h / ".k3code" / "config.yaml").is_file()
-        rc3, out3 = run(["uv", "run", "--quiet", "pytest", "-q", "--color=no", "-p", "no:cacheprovider",
-                         "tests/test_setup.py", "-k", "resume"], cwd=CORE, timeout=300)
+        rc3, out3 = run(
+            [
+                "uv",
+                "run",
+                "--quiet",
+                "pytest",
+                "-q",
+                "--color=no",
+                "-p",
+                "no:cacheprovider",
+                "tests/test_setup.py",
+                "-k",
+                "resume",
+            ],
+            cwd=CORE,
+            timeout=300,
+        )
         ok = interrupted and saved >= 2 and resumed and rc2 == 0 and cfg and rc3 == 0
-        emit("M6", "Interrupted setup resumes", how, "PASS" if ok else "FAIL",
-             f"sigint rc={p.returncode} interrupted={interrupted} steps saved before the interrupt={saved}; "
-             f"rerun rc={rc2} resumed={resumed} config={cfg}; pytest rc={rc3}: {tail(out3, 1)}\n{tail(out2, 2)}")
+        emit(
+            "M6",
+            "Interrupted setup resumes",
+            how,
+            "PASS" if ok else "FAIL",
+            f"sigint rc={p.returncode} interrupted={interrupted} steps saved before the interrupt={saved}; "
+            f"rerun rc={rc2} resumed={resumed} config={cfg}; pytest rc={rc3}: {tail(out3, 1)}\n{tail(out2, 2)}",
+        )
 
 
 def broken_update() -> None:
-    how = ("real CLI `k3code update --from-source --yes` in temp K3CODE_DATA: staged version fails its "
-           "smoke test -> current untouched; `update --rollback`; plus pytest test_update.py "
-           "(daemon-unhealthy rollback)")
+    how = (
+        "real CLI `k3code update --from-source --yes` in temp K3CODE_DATA: staged version fails its "
+        "smoke test -> current untouched; `update --rollback`; plus pytest test_update.py "
+        "(daemon-unhealthy rollback)"
+    )
     with tempfile.TemporaryDirectory(prefix="m6u-") as t:
         h = Path(t, "home")
         h.mkdir()
         data = h / "data"
+
         def mk(ver: str, ok: bool) -> None:
             exe = data / "versions" / ver / "venv" / "bin" / "k3code"
             exe.parent.mkdir(parents=True)
             code = 0 if ok else 3
-            exe.write_text(f'#!/bin/sh\nif [ "$1" = "--version" ]; then '
-                           f'echo "k3code, version {ver}"; exit {code}; fi\n'
-                           f'echo \'{{"summary":{{"ok":1,"warn":0,"fail":0}},"checks":[]}}\'\n')
+            exe.write_text(
+                f'#!/bin/sh\nif [ "$1" = "--version" ]; then '
+                f'echo "k3code, version {ver}"; exit {code}; fi\n'
+                f'echo \'{{"summary":{{"ok":1,"warn":0,"fail":0}},"checks":[]}}\'\n'
+            )
             exe.chmod(0o755)
+
         mk("1.0.0", True)
         mk("2.0.0", False)
         (data / "current").symlink_to(data / "versions" / "1.0.0")
@@ -222,8 +324,12 @@ def broken_update() -> None:
         run(["git", "init", "-q", "-b", "main", str(src)])
         (src / "install").mkdir()
         (src / "install" / "install.sh").write_text("#!/bin/sh\necho 2.0.0\n")
-        for c in (["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"],
-                  ["remote", "add", "origin", str(origin)], ["push", "-q", "-u", "origin", "main"]):
+        for c in (
+            ["add", "."],
+            ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"],
+            ["remote", "add", "origin", str(origin)],
+            ["push", "-q", "-u", "origin", "main"],
+        ):
             run(["git", *c], cwd=src)
         (data / "source_path").write_text(str(src))
         rc, out = k3(h, "update", "--from-source", "--yes")
@@ -236,39 +342,64 @@ def broken_update() -> None:
         switched = (data / "current").resolve().name == "2.0.0"
         rc3, out3 = k3(h, "update", "--rollback")
         back = (data / "current").resolve().name == "1.0.0"
-    rc4, out4 = run(["uv", "run", "--quiet", "pytest", "-q", "--color=no", "-p", "no:cacheprovider",
-                     "tests/test_update.py"], cwd=CORE, timeout=300)
+    rc4, out4 = run(
+        ["uv", "run", "--quiet", "pytest", "-q", "--color=no", "-p", "no:cacheprovider", "tests/test_update.py"],
+        cwd=CORE,
+        timeout=300,
+    )
     ok = stayed and switched and back and rc4 == 0
-    emit("M6", "A broken update rolls back (broken version never becomes current; rollback restores previous)", how,
-         "PASS" if ok else "FAIL",
-         f"broken: rc={rc} current stayed 1.0.0={stayed} ({tail(out, 1)}); fixed update switched={switched}; "
-         f"rollback={back} ({tail(out3, 1)}); pytest rc={rc4}: {tail(out4, 1)}")
+    emit(
+        "M6",
+        "A broken update rolls back (broken version never becomes current; rollback restores previous)",
+        how,
+        "PASS" if ok else "FAIL",
+        f"broken: rc={rc} current stayed 1.0.0={stayed} ({tail(out, 1)}); fixed update switched={switched}; "
+        f"rollback={back} ({tail(out3, 1)}); pytest rc={rc4}: {tail(out4, 1)}",
+    )
 
 
 def upstream_sync() -> None:
-    crit = ("Upstream sync: mergeable subtrees have <10 conflicting files; the Hermes TUI is a documented frozen fork")
-    how = ("scripts/sync-upstream.sh --dry-run: git fetch tuios + hermes-agent upstream HEAD into temp "
-           "bare repos, 3-way "
-           "blob diff vs recorded base commits; the frozen fork (hermes-agent:tui) is reported, not counted; "
-           "docs/UPSTREAM.md must document the policy and the cherry-pick procedure")
+    crit = "Upstream sync: mergeable subtrees have <10 conflicting files; the Hermes TUI is a documented frozen fork"
+    how = (
+        "scripts/sync-upstream.sh --dry-run: git fetch tuios + hermes-agent upstream HEAD into temp "
+        "bare repos, 3-way "
+        "blob diff vs recorded base commits; the frozen fork (hermes-agent:tui) is reported, not counted; "
+        "docs/UPSTREAM.md must document the policy and the cherry-pick procedure"
+    )
     rc, out = run(["sh", str(REPO / "scripts/sync-upstream.sh"), "--dry-run"], timeout=1500)
     (LOGS / "m6_sync.log").write_text(out)
     if rc == 3:
-        return emit("M6", crit, how, "PENDING", out,
-                    "rerun scripts/sync-upstream.sh --dry-run with network access to github.com")
+        return emit(
+            "M6",
+            crit,
+            how,
+            "PENDING",
+            out,
+            "rerun scripts/sync-upstream.sh --dry-run with network access to github.com",
+        )
     doc = REPO / "docs" / "UPSTREAM.md"
     doc_ok = doc.is_file() and all(w in doc.read_text() for w in ("Frozen fork", "Cherry-picking", "Merging TUIOS"))
     frozen_reported = "FROZEN FORK" in out
-    emit("M6", crit, how, "PASS" if rc == 0 and doc_ok and frozen_reported else "FAIL",
-         "\n".join(ln for ln in out.splitlines() if ln.startswith("SUBTREE")) or out)
+    emit(
+        "M6",
+        crit,
+        how,
+        "PASS" if rc == 0 and doc_ok and frozen_reported else "FAIL",
+        "\n".join(ln for ln in out.splitlines() if ln.startswith("SUBTREE")) or out,
+    )
     if not doc_ok:
         print("docs/UPSTREAM.md missing or incomplete")
 
 
 if __name__ == "__main__":
     only = sys.argv[1:] or ["sync", "bundle", "resume", "update", "fresh"]
-    for name, fn in (("sync", upstream_sync), ("bundle", bundle_restore), ("resume", interrupted_setup),
-                     ("update", broken_update), ("fresh", fresh_install)):
+    for name, fn in (
+        ("sync", upstream_sync),
+        ("bundle", bundle_restore),
+        ("resume", interrupted_setup),
+        ("update", broken_update),
+        ("fresh", fresh_install),
+    ):
         if name in only:
             try:
                 fn()

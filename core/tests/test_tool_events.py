@@ -26,8 +26,10 @@ def tool_call_events(request, monkeypatch):
 
 
 async def test_every_tool_call_is_announced_and_counted_once(tmp_path, monkeypatch, tool_call_events):
-    steps = [{"type": "tool_call", "when": "first", "name": "bash", "arguments": {"command": "echo hi"}},
-             {"type": "text", "when": "after_tool", "text": "done"}]
+    steps = [
+        {"type": "tool_call", "when": "first", "name": "bash", "arguments": {"command": "echo hi"}},
+        {"type": "text", "when": "after_tool", "text": "done"},
+    ]
     server = make(tmp_path, monkeypatch, steps, mode="yolo", **NO_GATE)
     await start(server, tmp_path)
     await run_turn(server, "run it")
@@ -39,12 +41,24 @@ async def test_every_tool_call_is_announced_and_counted_once(tmp_path, monkeypat
 
 
 async def test_subagent_tool_count_without_tool_call_events(tmp_path, monkeypatch, tool_call_events):
-    steps = [{"type": "tool_call", "match": "PARENT", "when": "first", "name": "task",
-              "arguments": {"description": "child job", "prompt": "CHILD look", "agent_type": "explorer"}},
-             {"type": "text", "match": "PARENT", "when": "after_tool", "text": "parent done"},
-             {"type": "tool_call", "match": "[agent:explorer]", "when": "turn_first", "name": "glob",
-              "arguments": {"pattern": "*.md"}},
-             {"type": "text", "match": "[agent:explorer]", "when": "turn_after_tool", "text": "explored"}]
+    steps = [
+        {
+            "type": "tool_call",
+            "match": "PARENT",
+            "when": "first",
+            "name": "task",
+            "arguments": {"description": "child job", "prompt": "CHILD look", "agent_type": "explorer"},
+        },
+        {"type": "text", "match": "PARENT", "when": "after_tool", "text": "parent done"},
+        {
+            "type": "tool_call",
+            "match": "[agent:explorer]",
+            "when": "turn_first",
+            "name": "glob",
+            "arguments": {"pattern": "*.md"},
+        },
+        {"type": "text", "match": "[agent:explorer]", "when": "turn_after_tool", "text": "explored"},
+    ]
     server = make(tmp_path, monkeypatch, steps, mode="yolo", **NO_GATE)
     await start(server, tmp_path)
     await run_turn(server, "PARENT: explore")

@@ -32,8 +32,22 @@ class FakeCaller:
         return SimpleNamespace(text=text)
 
 
-def approve(log: DecisionLog, pattern: str, choice: str = "once", cwd: str = "/p/one", tool: str = "bash",
-            n: int = 1, session: str = "s") -> None:
+def approve(
+    log: DecisionLog,
+    pattern: str,
+    choice: str = "once",
+    cwd: str = "/p/one",
+    tool: str = "bash",
+    n: int = 1,
+    session: str = "s",
+) -> None:
     for i in range(n):
-        log.record("approval", session=f"{session}{i}", cwd=cwd, subject=pattern, choice=choice,
-                   detail={"tool": tool}, project=f"path:{cwd}")
+        log.record(
+            "approval",
+            session=f"{session}{i}",
+            cwd=cwd,
+            subject=pattern,
+            choice=choice,
+            detail={"tool": tool},
+            project=f"path:{cwd}",
+        )

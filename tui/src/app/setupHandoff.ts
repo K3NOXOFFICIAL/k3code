@@ -1,54 +1,60 @@
-import type { RunExternalProcess } from '@k3code/ink'
+import type { RunExternalProcess } from "@k3code/ink";
 
-import type { SetupStatusResponse } from '../gatewayTypes.js'
-import type { LaunchResult } from '../lib/externalCli.js'
+import type { SetupStatusResponse } from "../gatewayTypes.js";
+import type { LaunchResult } from "../lib/externalCli.js";
 
-import type { SlashHandlerContext } from './interfaces.js'
-import { patchUiState } from './uiStore.js'
+import type { SlashHandlerContext } from "./interfaces.js";
+import { patchUiState } from "./uiStore.js";
 
 export interface RunExternalSetupOptions {
-  args: string[]
-  ctx: Pick<SlashHandlerContext, 'gateway' | 'session' | 'transcript'>
-  done: string
-  launcher: (args: string[]) => Promise<LaunchResult>
-  suspend: (run: RunExternalProcess) => Promise<void>
+  args: string[];
+  ctx: Pick<SlashHandlerContext, "gateway" | "session" | "transcript">;
+  done: string;
+  launcher: (args: string[]) => Promise<LaunchResult>;
+  suspend: (run: RunExternalProcess) => Promise<void>;
 }
 
-export async function runExternalSetup({ args, ctx, done, launcher, suspend }: RunExternalSetupOptions) {
-  const { gateway, session, transcript } = ctx
+export async function runExternalSetup({
+  args,
+  ctx,
+  done,
+  launcher,
+  suspend,
+}: RunExternalSetupOptions) {
+  const { gateway, session, transcript } = ctx;
 
-  transcript.sys(`launching \`k3code ${args.join(' ')}\`…`)
-  patchUiState({ status: 'setup running…' })
+  transcript.sys(`launching \`k3code ${args.join(" ")}\`…`);
+  patchUiState({ status: "setup running…" });
 
-  let result: LaunchResult = { code: null }
+  let result: LaunchResult = { code: null };
 
   await suspend(async () => {
-    result = await launcher(args)
-  })
+    result = await launcher(args);
+  });
 
   if (result.error) {
-    transcript.sys(`error launching k3code: ${result.error}`)
-    patchUiState({ status: 'setup required' })
+    transcript.sys(`error launching k3code: ${result.error}`);
+    patchUiState({ status: "setup required" });
 
-    return
+    return;
   }
 
   if (result.code !== 0) {
-    transcript.sys(`k3code ${args[0]} exited with code ${result.code}`)
-    patchUiState({ status: 'setup required' })
+    transcript.sys(`k3code ${args[0]} exited with code ${result.code}`);
+    patchUiState({ status: "setup required" });
 
-    return
+    return;
   }
 
-  const setup = await gateway.rpc<SetupStatusResponse>('setup.status', {})
+  const setup = await gateway.rpc<SetupStatusResponse>("setup.status", {});
 
   if (setup?.provider_configured === false) {
-    transcript.sys('still no provider configured')
-    patchUiState({ status: 'setup required' })
+    transcript.sys("still no provider configured");
+    patchUiState({ status: "setup required" });
 
-    return
+    return;
   }
 
-  transcript.sys(done)
-  session.newSession()
+  transcript.sys(done);
+  session.newSession();
 }

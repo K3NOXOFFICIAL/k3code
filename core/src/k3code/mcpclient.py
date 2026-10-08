@@ -11,13 +11,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from k3code.config import McpServerConfig
+from k3code.config import McpServerConfig, env_value
+from k3code.reliability.sandbox import child_env
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,16 @@ _SAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 def qualified_name(server: str, tool: str) -> str:
     return f"mcp__{_SAFE.sub('_', server)}__{_SAFE.sub('_', tool)}"
+
+
+def request_headers(cfg: McpServerConfig) -> dict[str, str]:
+    """Headers for an HTTP MCP server: the configured ones, plus a bearer token read from ``bearer_env`` now."""
+    headers = dict(cfg.headers)
+    if cfg.bearer_env:
+        token = env_value(cfg.bearer_env)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 @dataclass
@@ -51,6 +61,15 @@ class McpServerState:
     status: str = "pending"  # pending | connected | failed | disabled
     error: str = ""
     tools: list[McpToolInfo] = field(default_factory=list)
+
+
+def stdio_env(extra: dict[str, str] | None) -> dict[str, str]:
+    """Environment for a stdio MCP server: the scrubbed daemon set plus the server's configured ``env``.
+
+    Documented sandbox exception: MCP servers run unsandboxed (they are long-lived, user-configured and need their
+    own files and network), but they never inherit the daemon's provider keys.
+    """
+    return child_env(extra)
 
 
 class _Runner:
@@ -92,7 +111,7 @@ class _Runner:
                     import httpx
                     from mcp.client.streamable_http import streamable_http_client  # type: ignore[attr-defined]
 
-                    http = httpx.AsyncClient(headers=self.cfg.headers or None, timeout=CALL_TIMEOUT)
+                    http = httpx.AsyncClient(headers=request_headers(self.cfg) or None, timeout=CALL_TIMEOUT)
                     await stack.enter_async_context(http)
                     read, write, _ = await stack.enter_async_context(
                         streamable_http_client(self.cfg.url, http_client=http)
@@ -106,7 +125,7 @@ class _Runner:
                     params = StdioServerParameters(
                         command=self.cfg.command,
                         args=self.cfg.args,
-                        env={**os.environ, **self.cfg.env} if self.cfg.env else None,
+                        env=stdio_env(self.cfg.env),
                         cwd=self.cfg.cwd,
                     )
                     read, write = await stack.enter_async_context(stdio_client(params))

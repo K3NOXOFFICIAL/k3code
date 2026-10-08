@@ -63,7 +63,9 @@ async def test_a_large_conversation_is_summarized_before_the_turn(tmp_path, monk
     assert status == "done"
     msgs = live.stored.messages
     assert len(msgs) < before // 2, (before, len(msgs))
-    assert msgs[0]["role"] == "system" and msgs[1]["content"].startswith(SUMMARY_PREFIX)
+    # system, the first task statement kept verbatim, the summary, then the recent tail
+    assert msgs[0]["role"] == "system" and msgs[1]["content"].startswith("request 0 ")
+    assert msgs[2]["content"].startswith(SUMMARY_PREFIX)
     assert msgs[-2]["content"] == "next request" and msgs[-1]["content"] == "ok"  # the turn itself was kept intact
     await server.close()
 

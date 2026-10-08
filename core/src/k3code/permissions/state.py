@@ -11,6 +11,8 @@ from typing import Any
 
 import yaml
 
+from k3code import trust
+
 from .engine import Decision, PermissionMode, decide
 from .rules import Rule, from_config
 
@@ -24,8 +26,17 @@ def _home() -> Path:
 def load_permissions_config(path: Path) -> tuple[list[Rule], list[str]]:
     """Read ``permissions:`` from a config.yaml: (rules, extra hardline regexes)."""
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else None
-    except (OSError, yaml.YAMLError):
+        text = path.read_text(encoding="utf-8") if path.is_file() else None
+    except OSError:
+        return [], []
+    return permissions_from_text(text)
+
+
+def permissions_from_text(text: str | None) -> tuple[list[Rule], list[str]]:
+    """The ``permissions:`` section of config text: (rules, extra hardline regexes)."""
+    try:
+        data = yaml.safe_load(text) if text is not None else None
+    except yaml.YAMLError:
         return [], []
     section = (data or {}).get("permissions") if isinstance(data, dict) else None
     if not isinstance(section, dict):
@@ -55,12 +66,11 @@ def persist_rules(path: Path, rules: list[Rule]) -> None:
             entry = {} if entry is None else {"*": entry}
             perms[r.tool] = entry
         entry[r.pattern] = r.action
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    with trust.keeping_trust(path):
+        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
-def log_decision(
-    *, session: str, tool: str, pattern: str, choice: str, cwd: str, home: Path | None = None
-) -> None:
+def log_decision(*, session: str, tool: str, pattern: str, choice: str, cwd: str, home: Path | None = None) -> None:
     """Append one approval decision to ``$K3CODE_HOME/decisions.jsonl`` (learning hook for M5)."""
     path = (home or _home()) / "decisions.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,7 +95,9 @@ class PermissionState:
     def reload(self) -> None:
         """Re-read user + project config (cheap; called per turn)."""
         user, user_hard = load_permissions_config(self.user_config or _home() / "config.yaml")
-        project, project_hard = load_permissions_config(project_config_path(self.cwd))
+        # A project config the user has not trusted contributes no rules and no hardline patterns.
+        text = trust.trusted_text(self.cwd)
+        project, project_hard = permissions_from_text(text) if text is not None else ([], [])
         self.user_rules, self.project_rules = user, project
         self.hardline_extra = [*user_hard, *project_hard]
 

@@ -1,12 +1,17 @@
 /** Appended by TUI pickers; converted to the backend's `--session` flag before `config.set`. */
-export const TUI_SESSION_MODEL_FLAG = '--tui-session'
+export const TUI_SESSION_MODEL_FLAG = "--tui-session";
 
 export const sessionScopedModelArg = (value: string) => {
-  const parts = value.trim().split(/\s+/).filter(Boolean)
-  const kept = parts.filter(part => part !== TUI_SESSION_MODEL_FLAG && part !== '--global' && part !== '--session')
+  const parts = value.trim().split(/\s+/).filter(Boolean);
+  const kept = parts.filter(
+    (part) =>
+      part !== TUI_SESSION_MODEL_FLAG &&
+      part !== "--global" &&
+      part !== "--session",
+  );
 
-  return kept.length ? `${kept.join(' ')} --session` : ''
-}
+  return kept.length ? `${kept.join(" ")} --session` : "";
+};
 
 // A `/` means two different things depending on where it sits:
 //
@@ -26,24 +31,26 @@ export const sessionScopedModelArg = (value: string) => {
 // `look at /usr/local/bin` and `check src/foo/bar` never match. A bare `/us` is
 // genuinely ambiguous with an absolute path, and resolves as a skill reference
 // — typing the next `/` flips it straight back to path completion.
-const INLINE_SLASH_RE = /\s\/([a-zA-Z][\w-]*)?$/
+const INLINE_SLASH_RE = /\s\/([a-zA-Z][\w-]*)?$/;
 
 /**
  * Locate an inline `/skill` reference at the end of `text`, or null when the
  * text isn't one. `start` is the index of the `/` itself, so a completion
  * replaces the typed token and leaves the prose in front of it untouched.
  */
-export const inlineSlashTrigger = (text: string): { query: string; start: number } | null => {
-  const match = INLINE_SLASH_RE.exec(text)
+export const inlineSlashTrigger = (
+  text: string,
+): { query: string; start: number } | null => {
+  const match = INLINE_SLASH_RE.exec(text);
 
   if (!match) {
-    return null
+    return null;
   }
 
-  const query = match[1] ?? ''
+  const query = match[1] ?? "";
 
-  return { query, start: text.length - query.length - 1 }
-}
+  return { query, start: text.length - query.length - 1 };
+};
 
 /**
  * Apply a completion row to the current input, mirroring the editor's
@@ -56,11 +63,18 @@ export const inlineSlashTrigger = (text: string): { query: string; start: number
  * input so a `/token` anywhere in the message behaves the same as one at
  * position 0 — an inline `run /cle` replaces from after its own slash.
  */
-export const applyCompletion = (value: string, rowText: string, compReplace: number): string => {
-  const text = value[compReplace - 1] === '/' && rowText.startsWith('/') ? rowText.slice(1) : rowText
+export const applyCompletion = (
+  value: string,
+  rowText: string,
+  compReplace: number,
+): string => {
+  const text =
+    value[compReplace - 1] === "/" && rowText.startsWith("/")
+      ? rowText.slice(1)
+      : rowText;
 
-  return value.slice(0, compReplace) + text
-}
+  return value.slice(0, compReplace) + text;
+};
 
 /**
  * Decide what Enter does when a completion is highlighted: returns the value
@@ -78,13 +92,13 @@ export const applyCompletion = (value: string, rowText: string, compReplace: num
 export const completionToApplyOnSubmit = (
   value: string,
   rowText: string | undefined,
-  compReplace: number
+  compReplace: number,
 ): string | null => {
   if (!rowText) {
-    return null
+    return null;
   }
 
-  const next = applyCompletion(value, rowText, compReplace)
+  const next = applyCompletion(value, rowText, compReplace);
 
-  return next !== value && next.trimEnd() !== value.trimEnd() ? next : null
-}
+  return next !== value && next.trimEnd() !== value.trimEnd() ? next : null;
+};

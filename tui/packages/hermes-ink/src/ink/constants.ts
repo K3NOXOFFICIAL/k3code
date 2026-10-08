@@ -1,9 +1,9 @@
 // Shared frame interval for render throttling and animations (~60fps).
-export const FRAME_INTERVAL_MS = 16
+export const FRAME_INTERVAL_MS = 16;
 
 // Keep clock-driven animations at full speed when terminal focus changes.
 // We still pause entirely when there are no keepAlive subscribers.
-export const BLURRED_FRAME_INTERVAL_MS = FRAME_INTERVAL_MS
+export const BLURRED_FRAME_INTERVAL_MS = FRAME_INTERVAL_MS;
 
 // Issue #31486 (stdout-backpressure strand): when the previous frame's
 // stdout.write has NOT drained yet (terminal parser overwhelmed by a wide
@@ -16,4 +16,4 @@ export const BLURRED_FRAME_INTERVAL_MS = FRAME_INTERVAL_MS
 // flush) can't wedge the renderer permanently — it self-heals once the pipe
 // recovers. ~10 frames at the drain-tick cadence is a few hundred ms of
 // breathing room, well under any human-perceptible render stall.
-export const MAX_COALESCED_BACKPRESSURE_FRAMES = 10
+export const MAX_COALESCED_BACKPRESSURE_FRAMES = 10;

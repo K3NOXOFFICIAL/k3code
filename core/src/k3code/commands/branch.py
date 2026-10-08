@@ -18,8 +18,12 @@ _NAME_OK = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 async def _git(cwd: Path, *args: str) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
-        "git", *args, cwd=str(cwd), stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        "git",
+        *args,
+        cwd=str(cwd),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
     )
     out, _ = await proc.communicate()
     return proc.returncode or 0, out.decode(errors="replace").strip()

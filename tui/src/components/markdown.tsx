@@ -1,11 +1,11 @@
-import { Box, Link, stringWidth, Text } from '@k3code/ink'
-import { Fragment, memo, type ReactNode, useMemo } from 'react'
+import { Box, Link, stringWidth, Text } from "@k3code/ink";
+import { Fragment, memo, type ReactNode, useMemo } from "react";
 
-import { ensureEmojiPresentation } from '../lib/emoji.js'
-import { normalizeExternalUrl } from '../lib/externalLink.js'
-import { BOX_CLOSE, BOX_OPEN, texToUnicode } from '../lib/mathUnicode.js'
-import { highlightLine, isHighlightable } from '../lib/syntax.js'
-import type { Theme } from '../theme.js'
+import { ensureEmojiPresentation } from "../lib/emoji.js";
+import { normalizeExternalUrl } from "../lib/externalLink.js";
+import { BOX_CLOSE, BOX_OPEN, texToUnicode } from "../lib/mathUnicode.js";
+import { highlightLine, isHighlightable } from "../lib/syntax.js";
+import type { Theme } from "../theme.js";
 
 // `\boxed{X}` regions in `texToUnicode` output are marked with the
 // non-printable U+0001 / U+0002 sentinels. Split on them and render the
@@ -16,78 +16,78 @@ import type { Theme } from '../theme.js'
 // block, not a hug.
 const renderMath = (text: string): ReactNode => {
   if (!text.includes(BOX_OPEN)) {
-    return text
+    return text;
   }
 
-  const out: ReactNode[] = []
-  let i = 0
-  let key = 0
+  const out: ReactNode[] = [];
+  let i = 0;
+  let key = 0;
 
   while (i < text.length) {
-    const start = text.indexOf(BOX_OPEN, i)
+    const start = text.indexOf(BOX_OPEN, i);
 
     if (start < 0) {
-      out.push(text.slice(i))
+      out.push(text.slice(i));
 
-      break
+      break;
     }
 
     if (start > i) {
-      out.push(text.slice(i, start))
+      out.push(text.slice(i, start));
     }
 
-    const end = text.indexOf(BOX_CLOSE, start + 1)
+    const end = text.indexOf(BOX_CLOSE, start + 1);
 
     if (end < 0) {
-      out.push(text.slice(start))
+      out.push(text.slice(start));
 
-      break
+      break;
     }
 
     out.push(
       <Text bold inverse key={key++}>
-        {' '}
-        {text.slice(start + 1, end)}{' '}
-      </Text>
-    )
+        {" "}
+        {text.slice(start + 1, end)}{" "}
+      </Text>,
+    );
 
-    i = end + 1
+    i = end + 1;
   }
 
-  return out
-}
+  return out;
+};
 
-const FENCE_RE = /^\s*(`{3,}|~{3,})(.*)$/
-const FENCE_CLOSE_RE = /^\s*(`{3,}|~{3,})\s*$/
-const HR_RE = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/
-const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+\s*)?$/
-const SETEXT_RE = /^\s{0,3}(=+|-+)\s*$/
-const FOOTNOTE_RE = /^\[\^([^\]]+)\]:\s*(.*)$/
-const DEF_RE = /^\s*:\s+(.+)$/
-const BULLET_RE = /^(\s*)[-+*]\s+(.*)$/
-const TASK_RE = /^\[( |x|X)\]\s+(.*)$/
-const NUMBERED_RE = /^(\s*)(\d+)[.)]\s+(.*)$/
-const QUOTE_RE = /^\s*(?:>\s*)+/
-const TABLE_DIVIDER_CELL_RE = /^:?-{3,}:?$/
-const MD_URL_RE = '((?:[^\\s()]|\\([^\\s()]*\\))+?)'
-const MD_IDENTIFIER_RE = '[A-Za-z_][A-Za-z0-9_]*'
-const MD_DUNDER_IDENTIFIER_RE = `(?:${MD_IDENTIFIER_RE}__(?!\\w))`
-const MD_UNDERSCORE_BOLD_RE = `(?<!\\w)__(?!${MD_DUNDER_IDENTIFIER_RE})(.+?)__(?!\\w)`
-const MD_UNDERSCORE_ITALIC_RE = `(?<![\\w_])_(?!_)(.+?)(?<!_)_(?![\\w_])`
-const STRIP_UNDERSCORE_BOLD_RE = new RegExp(MD_UNDERSCORE_BOLD_RE, 'g')
-const STRIP_UNDERSCORE_ITALIC_RE = new RegExp(MD_UNDERSCORE_ITALIC_RE, 'g')
+const FENCE_RE = /^\s*(`{3,}|~{3,})(.*)$/;
+const FENCE_CLOSE_RE = /^\s*(`{3,}|~{3,})\s*$/;
+const HR_RE = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/;
+const HEADING_RE = /^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+\s*)?$/;
+const SETEXT_RE = /^\s{0,3}(=+|-+)\s*$/;
+const FOOTNOTE_RE = /^\[\^([^\]]+)\]:\s*(.*)$/;
+const DEF_RE = /^\s*:\s+(.+)$/;
+const BULLET_RE = /^(\s*)[-+*]\s+(.*)$/;
+const TASK_RE = /^\[( |x|X)\]\s+(.*)$/;
+const NUMBERED_RE = /^(\s*)(\d+)[.)]\s+(.*)$/;
+const QUOTE_RE = /^\s*(?:>\s*)+/;
+const TABLE_DIVIDER_CELL_RE = /^:?-{3,}:?$/;
+const MD_URL_RE = "((?:[^\\s()]|\\([^\\s()]*\\))+?)";
+const MD_IDENTIFIER_RE = "[A-Za-z_][A-Za-z0-9_]*";
+const MD_DUNDER_IDENTIFIER_RE = `(?:${MD_IDENTIFIER_RE}__(?!\\w))`;
+const MD_UNDERSCORE_BOLD_RE = `(?<!\\w)__(?!${MD_DUNDER_IDENTIFIER_RE})(.+?)__(?!\\w)`;
+const MD_UNDERSCORE_ITALIC_RE = `(?<![\\w_])_(?!_)(.+?)(?<!_)_(?![\\w_])`;
+const STRIP_UNDERSCORE_BOLD_RE = new RegExp(MD_UNDERSCORE_BOLD_RE, "g");
+const STRIP_UNDERSCORE_ITALIC_RE = new RegExp(MD_UNDERSCORE_ITALIC_RE, "g");
 
 // Display math openers: `$$ ... $$` (TeX) and `\[ ... \]` (LaTeX). The
 // opener is matched only when `$$` / `\[` appears at the very start of the
 // trimmed line — `startsWith('$$')` used to fire on prose like
 // `$$x+y$$ followed by more`, opening a block that never closed because the
 // trailing `$$` on the same line was invisible to the close-scan loop.
-const MATH_BLOCK_OPEN_RE = /^\s*(\$\$|\\\[)(.*)$/
-const MATH_BLOCK_CLOSE_DOLLAR_RE = /^(.*?)\$\$\s*$/
-const MATH_BLOCK_CLOSE_BRACKET_RE = /^(.*?)\\\]\s*$/
+const MATH_BLOCK_OPEN_RE = /^\s*(\$\$|\\\[)(.*)$/;
+const MATH_BLOCK_CLOSE_DOLLAR_RE = /^(.*?)\$\$\s*$/;
+const MATH_BLOCK_CLOSE_BRACKET_RE = /^(.*?)\\\]\s*$/;
 
-export const MEDIA_LINE_RE = /^\s*[`"']?MEDIA:\s*(\S+?)[`"']?\s*$/
-export const AUDIO_DIRECTIVE_RE = /^\s*\[\[audio_as_voice\]\]\s*$/
+export const MEDIA_LINE_RE = /^\s*[`"']?MEDIA:\s*(\S+?)[`"']?\s*$/;
+export const AUDIO_DIRECTIVE_RE = /^\s*\[\[audio_as_voice\]\]\s*$/;
 
 // Inline markdown tokens, in priority order. The outer regex picks the
 // leftmost match at each position, preferring earlier alternatives on tie —
@@ -126,48 +126,53 @@ export const INLINE_RE = new RegExp(
     //                                MdInline dispatcher would treat them as
     //                                bare URLs and render them as autolinks.
     `(?<!\\$)\\$([^\\s$](?:[^$\\n]*?[^\\s$])?)\\$(?!\\$)`, // 17   inline math $...$
-    `\\\\\\(([^\\n]+?)\\\\\\)` // 18   inline math \(...\)
-  ].join('|'),
-  'g'
-)
+    `\\\\\\(([^\\n]+?)\\\\\\)`, // 18   inline math \(...\)
+  ].join("|"),
+  "g",
+);
 
-const indentDepth = (s: string) => Math.floor(s.replace(/\t/g, '  ').length / 2)
+const indentDepth = (s: string) =>
+  Math.floor(s.replace(/\t/g, "  ").length / 2);
 
 const splitRow = (row: string) =>
   row
     .trim()
-    .replace(/^\|/, '')
-    .replace(/\|$/, '')
-    .split('|')
-    .map(c => c.trim())
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((c) => c.trim());
 
 const isTableDivider = (row: string) => {
-  const cells = splitRow(row)
+  const cells = splitRow(row);
 
-  return cells.length > 1 && cells.every(c => TABLE_DIVIDER_CELL_RE.test(c))
-}
+  return cells.length > 1 && cells.every((c) => TABLE_DIVIDER_CELL_RE.test(c));
+};
 
 const autolinkUrl = (raw: string) =>
-  raw.startsWith('mailto:') || raw.startsWith('http') || !raw.includes('@') ? raw : `mailto:${raw}`
+  raw.startsWith("mailto:") || raw.startsWith("http") || !raw.includes("@")
+    ? raw
+    : `mailto:${raw}`;
 
 // A bare URL renders as itself. The target IS the message for connect links,
 // one-time tokens and signed URLs, so a derived slug label or a fetched page
 // title ("Composio") hides the only string the reader has to copy — and a
 // terminal that ignores OSC 8 leaves nothing behind at all. `mailto:` is the
 // one scheme whose useful text is the address, not the URL.
-const urlAsText = (url: string) => (url.startsWith('mailto:') ? url.replace(/^mailto:/, '') : url)
+const urlAsText = (url: string) =>
+  url.startsWith("mailto:") ? url.replace(/^mailto:/, "") : url;
 
 // An authored markdown label may stand in for the URL, because the OSC 8
 // wrapper below keeps the target reachable by click. A blank label
 // (`[](url)`) says nothing, so the URL itself becomes the text.
-const authoredLabel = (label: string | undefined): string | undefined => label?.trim() || undefined
+const authoredLabel = (label: string | undefined): string | undefined =>
+  label?.trim() || undefined;
 
 // `Link` emits the OSC 8 hyperlink unconditionally and the renderer also
 // records it per cell, so a label never strands its target: terminals that
 // speak OSC 8 make it clickable, and the in-process click dispatcher covers
 // the ones that don't.
 const renderLink = (k: number, t: Theme, rawUrl: string, label?: string) => {
-  const target = normalizeExternalUrl(rawUrl)
+  const target = normalizeExternalUrl(rawUrl);
 
   return (
     <Link key={k} url={target}>
@@ -175,207 +180,227 @@ const renderLink = (k: number, t: Theme, rawUrl: string, label?: string) => {
         {authoredLabel(label) ?? urlAsText(target)}
       </Text>
     </Link>
-  )
-}
+  );
+};
 
 export const stripInlineMarkup = (v: string) =>
   v
-    .replace(/!\[(.*?)\]\(((?:[^\s()]|\([^\s()]*\))+?)\)/g, '[image: $1] $2')
-    .replace(/\[(.+?)\]\(((?:[^\s()]|\([^\s()]*\))+?)\)/g, '$1')
-    .replace(/<((?:https?:\/\/|mailto:)[^>\s]+|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})>/g, '$1')
-    .replace(/~~(.+?)~~/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/\*\*(.+?)\*\*/g, '$1')
-    .replace(STRIP_UNDERSCORE_BOLD_RE, '$1')
-    .replace(/\*(.+?)\*/g, '$1')
-    .replace(STRIP_UNDERSCORE_ITALIC_RE, '$1')
-    .replace(/==(.+?)==/g, '$1')
-    .replace(/\[\^([^\]]+)\]/g, '[$1]')
-    .replace(/\^([^^\s][^^]*?)\^/g, '^$1')
-    .replace(/~([A-Za-z0-9]{1,8})~/g, '_$1')
-    .replace(/(?<!\$)\$([^\s$](?:[^$\n]*?[^\s$])?)\$(?!\$)/g, '$1')
-    .replace(/\\\(([^\n]+?)\\\)/g, '$1')
+    .replace(/!\[(.*?)\]\(((?:[^\s()]|\([^\s()]*\))+?)\)/g, "[image: $1] $2")
+    .replace(/\[(.+?)\]\(((?:[^\s()]|\([^\s()]*\))+?)\)/g, "$1")
+    .replace(
+      /<((?:https?:\/\/|mailto:)[^>\s]+|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})>/g,
+      "$1",
+    )
+    .replace(/~~(.+?)~~/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(STRIP_UNDERSCORE_BOLD_RE, "$1")
+    .replace(/\*(.+?)\*/g, "$1")
+    .replace(STRIP_UNDERSCORE_ITALIC_RE, "$1")
+    .replace(/==(.+?)==/g, "$1")
+    .replace(/\[\^([^\]]+)\]/g, "[$1]")
+    .replace(/\^([^^\s][^^]*?)\^/g, "^$1")
+    .replace(/~([A-Za-z0-9]{1,8})~/g, "_$1")
+    .replace(/(?<!\$)\$([^\s$](?:[^$\n]*?[^\s$])?)\$(?!\$)/g, "$1")
+    .replace(/\\\(([^\n]+?)\\\)/g, "$1");
 
-const SAFETY_MARGIN = 4
-const MIN_COL_WIDTH = 3
-const COL_GAP = 2 // the '  ' between columns
-const TABLE_PADDING_LEFT = 2 // paddingLeft={2} on the outer <Box>
+const SAFETY_MARGIN = 4;
+const MIN_COL_WIDTH = 3;
+const COL_GAP = 2; // the '  ' between columns
+const TABLE_PADDING_LEFT = 2; // paddingLeft={2} on the outer <Box>
 
 const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
   // Guard: empty table
   if (rows.length === 0 || rows[0]!.length === 0) {
-    return null
+    return null;
   }
 
-  const cellDisplayWidth = (raw: string) => stringWidth(stripInlineMarkup(raw))
+  const cellDisplayWidth = (raw: string) => stringWidth(stripInlineMarkup(raw));
 
   // Minimum width: longest word in a cell (to avoid breaking words)
   const minCellWidth = (raw: string) => {
-    const text = stripInlineMarkup(raw)
-    const words = text.split(/\s+/).filter(w => w.length > 0)
+    const text = stripInlineMarkup(raw);
+    const words = text.split(/\s+/).filter((w) => w.length > 0);
 
     if (words.length === 0) {
-      return MIN_COL_WIDTH
+      return MIN_COL_WIDTH;
     }
 
-    return Math.max(...words.map(w => stringWidth(w)), MIN_COL_WIDTH)
-  }
+    return Math.max(...words.map((w) => stringWidth(w)), MIN_COL_WIDTH);
+  };
 
-  const numCols = rows[0]!.length
+  const numCols = rows[0]!.length;
 
   // Normalize ragged rows: ensure every row has exactly numCols cells
-  const normalizedRows = rows.map(row => {
+  const normalizedRows = rows.map((row) => {
     if (row.length >= numCols) {
-      return row.slice(0, numCols)
+      return row.slice(0, numCols);
     }
 
-    return [...row, ...Array<string>(numCols - row.length).fill('')]
-  })
+    return [...row, ...Array<string>(numCols - row.length).fill("")];
+  });
 
   // Ideal widths: max cell content per column
   const idealWidths = normalizedRows[0]!.map((_, ci) =>
-    Math.max(...normalizedRows.map(r => cellDisplayWidth(r[ci] ?? '')), MIN_COL_WIDTH)
-  )
+    Math.max(
+      ...normalizedRows.map((r) => cellDisplayWidth(r[ci] ?? "")),
+      MIN_COL_WIDTH,
+    ),
+  );
 
   // Min widths: longest word per column
   const minWidths = normalizedRows[0]!.map((_, ci) =>
-    Math.max(...normalizedRows.map(r => minCellWidth(r[ci] ?? '')), MIN_COL_WIDTH)
-  )
+    Math.max(
+      ...normalizedRows.map((r) => minCellWidth(r[ci] ?? "")),
+      MIN_COL_WIDTH,
+    ),
+  );
 
   // Available width: cols minus table padding minus column gaps minus safety.
   // transcriptBodyWidth (source of cols) subtracts message gutter + scrollbar,
   // but NOT this table's paddingLeft — we subtract it here.
-  const gapOverhead = (numCols - 1) * COL_GAP
+  const gapOverhead = (numCols - 1) * COL_GAP;
 
   const availableWidth = cols
-    ? Math.max(cols - TABLE_PADDING_LEFT - gapOverhead - SAFETY_MARGIN, numCols * MIN_COL_WIDTH)
-    : Infinity
+    ? Math.max(
+        cols - TABLE_PADDING_LEFT - gapOverhead - SAFETY_MARGIN,
+        numCols * MIN_COL_WIDTH,
+      )
+    : Infinity;
 
-  const totalIdeal = idealWidths.reduce((a, b) => a + b, 0)
-  const totalMin = minWidths.reduce((a, b) => a + b, 0)
+  const totalIdeal = idealWidths.reduce((a, b) => a + b, 0);
+  const totalMin = minWidths.reduce((a, b) => a + b, 0);
 
-  let columnWidths: number[]
-  let needsWrap = false
+  let columnWidths: number[];
+  let needsWrap = false;
 
   if (totalIdeal <= availableWidth) {
     // Tier 1: everything fits at ideal widths
-    columnWidths = idealWidths
+    columnWidths = idealWidths;
   } else if (totalMin <= availableWidth) {
     // Tier 2: proportional shrink — distribute extra space beyond minimums
-    needsWrap = true
-    const extraSpace = availableWidth - totalMin
-    const overflows = idealWidths.map((ideal, i) => ideal - minWidths[i]!)
-    const totalOverflow = overflows.reduce((a, b) => a + b, 0)
+    needsWrap = true;
+    const extraSpace = availableWidth - totalMin;
+    const overflows = idealWidths.map((ideal, i) => ideal - minWidths[i]!);
+    const totalOverflow = overflows.reduce((a, b) => a + b, 0);
 
     if (totalOverflow === 0) {
-      columnWidths = [...minWidths]
+      columnWidths = [...minWidths];
     } else {
-      const rawAlloc = minWidths.map((min, i) => min + (overflows[i]! / totalOverflow) * extraSpace)
+      const rawAlloc = minWidths.map(
+        (min, i) => min + (overflows[i]! / totalOverflow) * extraSpace,
+      );
 
-      columnWidths = rawAlloc.map(v => Math.floor(v))
+      columnWidths = rawAlloc.map((v) => Math.floor(v));
       // Distribute rounding remainders to columns with largest fractional part
-      let remainder = availableWidth - columnWidths.reduce((a, b) => a + b, 0)
+      let remainder = availableWidth - columnWidths.reduce((a, b) => a + b, 0);
 
-      const fracs = rawAlloc.map((v, i) => ({ i, frac: v - Math.floor(v) })).sort((a, b) => b.frac - a.frac)
+      const fracs = rawAlloc
+        .map((v, i) => ({ i, frac: v - Math.floor(v) }))
+        .sort((a, b) => b.frac - a.frac);
 
       for (const { i } of fracs) {
         if (remainder <= 0) {
-          break
+          break;
         }
 
-        columnWidths[i]!++
-        remainder--
+        columnWidths[i]!++;
+        remainder--;
       }
     }
   } else {
     // Tier 3: even min-widths don't fit — scale proportionally, allow hard breaks.
     // NOTE: Math.max(..., MIN_COL_WIDTH) can push total above availableWidth when
     // many columns are scaled below 3. This is caught by safetyOverflow → vertical fallback.
-    needsWrap = true
-    const scaleFactor = availableWidth / totalMin
-    const rawAlloc = minWidths.map(w => w * scaleFactor)
-    columnWidths = rawAlloc.map(v => Math.max(Math.floor(v), MIN_COL_WIDTH))
-    let remainder = availableWidth - columnWidths.reduce((a, b) => a + b, 0)
+    needsWrap = true;
+    const scaleFactor = availableWidth / totalMin;
+    const rawAlloc = minWidths.map((w) => w * scaleFactor);
+    columnWidths = rawAlloc.map((v) => Math.max(Math.floor(v), MIN_COL_WIDTH));
+    let remainder = availableWidth - columnWidths.reduce((a, b) => a + b, 0);
 
-    const fracs = rawAlloc.map((v, i) => ({ i, frac: v - Math.floor(v) })).sort((a, b) => b.frac - a.frac)
+    const fracs = rawAlloc
+      .map((v, i) => ({ i, frac: v - Math.floor(v) }))
+      .sort((a, b) => b.frac - a.frac);
 
     for (const { i } of fracs) {
       if (remainder <= 0) {
-        break
+        break;
       }
 
-      columnWidths[i]!++
-      remainder--
+      columnWidths[i]!++;
+      remainder--;
     }
   }
 
   // Grapheme-safe hard-break: prefer Intl.Segmenter, fall back to code-point split
   const segmenter =
-    typeof Intl !== 'undefined' && 'Segmenter' in Intl
-      ? new (Intl as any).Segmenter(undefined, { granularity: 'grapheme' })
-      : null
+    typeof Intl !== "undefined" && "Segmenter" in Intl
+      ? new (Intl as any).Segmenter(undefined, { granularity: "grapheme" })
+      : null;
 
   const graphemes = (s: string): string[] =>
-    segmenter ? [...segmenter.segment(s)].map((seg: { segment: string }) => seg.segment) : [...s]
+    segmenter
+      ? [...segmenter.segment(s)].map((seg: { segment: string }) => seg.segment)
+      : [...s];
 
   // Word-wrap plain text to fit within `width` display columns.
   // Operates on stripped text for correct width measurement.
   const wrapCell = (raw: string, width: number, hard: boolean): string[] => {
-    const text = stripInlineMarkup(raw)
+    const text = stripInlineMarkup(raw);
 
     if (width <= 0) {
-      return [text]
+      return [text];
     }
 
     if (stringWidth(text) <= width) {
-      return [text]
+      return [text];
     }
 
-    const words = text.split(/\s+/).filter(w => w.length > 0)
-    const lines: string[] = []
-    let current = ''
-    let currentWidth = 0
+    const words = text.split(/\s+/).filter((w) => w.length > 0);
+    const lines: string[] = [];
+    let current = "";
+    let currentWidth = 0;
 
     for (const word of words) {
-      const w = stringWidth(word)
+      const w = stringWidth(word);
 
       if (currentWidth === 0) {
         if (hard && w > width) {
           for (const ch of graphemes(word)) {
-            const cw = stringWidth(ch)
+            const cw = stringWidth(ch);
 
             if (currentWidth + cw > width && current) {
-              lines.push(current)
-              current = ''
-              currentWidth = 0
+              lines.push(current);
+              current = "";
+              currentWidth = 0;
             }
 
-            current += ch
-            currentWidth += cw
+            current += ch;
+            currentWidth += cw;
           }
         } else {
-          current = word
-          currentWidth = w
+          current = word;
+          currentWidth = w;
         }
       } else if (currentWidth + 1 + w <= width) {
-        current += ' ' + word
-        currentWidth += 1 + w
+        current += " " + word;
+        currentWidth += 1 + w;
       } else {
-        lines.push(current)
-        current = word
-        currentWidth = w
+        lines.push(current);
+        current = word;
+        currentWidth = w;
       }
     }
 
     if (current) {
-      lines.push(current)
+      lines.push(current);
     }
 
-    return lines.length > 0 ? lines : ['']
-  }
+    return lines.length > 0 ? lines : [""];
+  };
 
-  const isHard = totalMin > availableWidth // tier 3 needs hard word breaks
-  const sep = columnWidths.map(w => '─'.repeat(Math.max(1, w))).join('  ')
+  const isHard = totalMin > availableWidth; // tier 3 needs hard word breaks
+  const sep = columnWidths.map((w) => "─".repeat(Math.max(1, w))).join("  ");
 
   // When wrapping isn't needed, build single-line strings per row.
   // All cells render as plain text via stripInlineMarkup.
@@ -385,19 +410,25 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
     const buildRowString = (row: string[]): string =>
       row
         .map((cell, ci) => {
-          const text = stripInlineMarkup(cell)
-          const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(text)))
-          const gap = ci < numCols - 1 ? '  ' : ''
+          const text = stripInlineMarkup(cell);
+          const pad = " ".repeat(
+            Math.max(0, columnWidths[ci]! - stringWidth(text)),
+          );
+          const gap = ci < numCols - 1 ? "  " : "";
 
-          return text + pad + gap
+          return text + pad + gap;
         })
-        .join('')
+        .join("");
 
     return (
       <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
         {normalizedRows.map((row, ri) => (
           <Fragment key={ri}>
-            <Text bold={ri === 0} color={ri === 0 ? t.color.accent : undefined} wrap="truncate-end">
+            <Text
+              bold={ri === 0}
+              color={ri === 0 ? t.color.accent : undefined}
+              wrap="truncate-end"
+            >
               {buildRowString(row)}
             </Text>
             {ri === 0 && normalizedRows.length > 1 ? (
@@ -408,64 +439,69 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
           </Fragment>
         ))}
       </Box>
-    )
+    );
   }
 
   // Wrapping path: build multi-line rows as complete strings.
-  type LineEntry = { text: string; kind: 'header' | 'separator' | 'body' }
+  type LineEntry = { text: string; kind: "header" | "separator" | "body" };
 
   const buildRowLines = (row: string[]): string[] => {
-    const cellLines = row.map((cell, ci) => wrapCell(cell, columnWidths[ci]!, isHard))
+    const cellLines = row.map((cell, ci) =>
+      wrapCell(cell, columnWidths[ci]!, isHard),
+    );
 
-    const maxLines = Math.max(...cellLines.map(l => l.length), 1)
+    const maxLines = Math.max(...cellLines.map((l) => l.length), 1);
 
-    const result: string[] = []
+    const result: string[] = [];
 
     for (let li = 0; li < maxLines; li++) {
-      let line = ''
+      let line = "";
 
       for (let ci = 0; ci < numCols; ci++) {
-        const cl = cellLines[ci] ?? ['']
-        const cellText = li < cl.length ? cl[li]! : ''
-        const pad = ' '.repeat(Math.max(0, columnWidths[ci]! - stringWidth(cellText)))
-        line += cellText + pad
+        const cl = cellLines[ci] ?? [""];
+        const cellText = li < cl.length ? cl[li]! : "";
+        const pad = " ".repeat(
+          Math.max(0, columnWidths[ci]! - stringWidth(cellText)),
+        );
+        line += cellText + pad;
 
         if (ci < numCols - 1) {
-          line += '  '
+          line += "  ";
         }
       }
 
-      result.push(line)
+      result.push(line);
     }
 
-    return result
-  }
+    return result;
+  };
 
   // Build all lines with metadata for styling, tracking tallest body row
-  const allEntries: LineEntry[] = []
-  let tallestBodyRow = 0
+  const allEntries: LineEntry[] = [];
+  let tallestBodyRow = 0;
   normalizedRows.forEach((row, ri) => {
-    const kind = ri === 0 ? ('header' as const) : ('body' as const)
-    const rowLines = buildRowLines(row)
-    rowLines.forEach(text => allEntries.push({ text, kind }))
+    const kind = ri === 0 ? ("header" as const) : ("body" as const);
+    const rowLines = buildRowLines(row);
+    rowLines.forEach((text) => allEntries.push({ text, kind }));
 
     if (ri > 0) {
-      tallestBodyRow = Math.max(tallestBodyRow, rowLines.length)
+      tallestBodyRow = Math.max(tallestBodyRow, rowLines.length);
     }
 
     if (ri === 0 && normalizedRows.length > 1) {
-      allEntries.push({ text: sep, kind: 'separator' })
+      allEntries.push({ text: sep, kind: "separator" });
     }
-  })
+  });
 
   // Post-render safety condition: compute max line width.
-  const maxLineWidth = Math.max(...allEntries.map(e => stringWidth(e.text)))
-  const safetyOverflow = cols != null && maxLineWidth > cols - TABLE_PADDING_LEFT - SAFETY_MARGIN
+  const maxLineWidth = Math.max(...allEntries.map((e) => stringWidth(e.text)));
+  const safetyOverflow =
+    cols != null && maxLineWidth > cols - TABLE_PADDING_LEFT - SAFETY_MARGIN;
 
   // Scaled vertical threshold — 2-3 col tables stay tabular even with tall cells
-  const maxRowLinesThreshold = numCols <= 3 ? 8 : numCols <= 6 ? 5 : 4
+  const maxRowLinesThreshold = numCols <= 3 ? 8 : numCols <= 6 ? 5 : 4;
 
-  const useVertical = tallestBodyRow > maxRowLinesThreshold || safetyOverflow
+  const useVertical = tallestBodyRow > maxRowLinesThreshold || safetyOverflow;
 
   if (useVertical) {
     // Edge case: header-only table
@@ -473,15 +509,18 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
       return (
         <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
           <Text bold color={t.color.accent} wrap="wrap-trim">
-            {normalizedRows[0]!.map(h => stripInlineMarkup(h)).join(' · ')}
+            {normalizedRows[0]!.map((h) => stripInlineMarkup(h)).join(" · ")}
           </Text>
         </Box>
-      )
+      );
     }
 
-    const headers = normalizedRows[0]!
-    const dataRows = normalizedRows.slice(1)
-    const sepWidth = Math.max(1, cols ? Math.min(cols - TABLE_PADDING_LEFT - 1, 40) : 40)
+    const headers = normalizedRows[0]!;
+    const dataRows = normalizedRows.slice(1);
+    const sepWidth = Math.max(
+      1,
+      cols ? Math.min(cols - TABLE_PADDING_LEFT - 1, 40) : 40,
+    );
 
     return (
       <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
@@ -489,26 +528,26 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
           <Fragment key={ri}>
             {ri > 0 ? (
               <Text color={t.color.muted} dimColor>
-                {'─'.repeat(sepWidth)}
+                {"─".repeat(sepWidth)}
               </Text>
             ) : null}
             {headers.map((header, ci) => {
-              const cell = row[ci] ?? ''
-              const label = stripInlineMarkup(header) || `Col ${ci + 1}`
+              const cell = row[ci] ?? "";
+              const label = stripInlineMarkup(header) || `Col ${ci + 1}`;
 
               return (
                 <Text key={ci} wrap="wrap-trim">
                   <Text bold color={t.color.accent}>
                     {label}:
-                  </Text>{' '}
+                  </Text>{" "}
                   {stripInlineMarkup(cell)}
                 </Text>
-              )
+              );
             })}
           </Fragment>
         ))}
       </Box>
-    )
+    );
   }
 
   // Render wrapped horizontal rows — one <Text> per visual line.
@@ -516,9 +555,15 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
     <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
       {allEntries.map((entry, i) => (
         <Text
-          bold={entry.kind === 'header'}
-          color={entry.kind === 'header' ? t.color.accent : entry.kind === 'separator' ? t.color.muted : undefined}
-          dimColor={entry.kind === 'separator'}
+          bold={entry.kind === "header"}
+          color={
+            entry.kind === "header"
+              ? t.color.accent
+              : entry.kind === "separator"
+                ? t.color.muted
+                : undefined
+          }
+          dimColor={entry.kind === "separator"}
           key={i}
           wrap="truncate-end"
         >
@@ -526,8 +571,8 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
         </Text>
       ))}
     </Box>
-  )
-}
+  );
+};
 
 // `color` anchors the prose runs to a palette tone. Block callers that
 // already wrap MdInline in a colored <Text> (headings, quotes, footnotes)
@@ -536,35 +581,50 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
 // the terminal's default foreground. Without it a single line mixes
 // themed spans (code, links, math) with unthemed prose — and because an
 // inline token can match mid-word, so can a single word.
-function MdInline({ color, t, text }: { color?: string; t: Theme; text: string }) {
-  const parts: ReactNode[] = []
+function MdInline({
+  color,
+  t,
+  text,
+}: {
+  color?: string;
+  t: Theme;
+  text: string;
+}) {
+  const parts: ReactNode[] = [];
 
-  let last = 0
+  let last = 0;
 
   for (const m of text.matchAll(INLINE_RE)) {
-    const i = m.index ?? 0
-    const k = parts.length
+    const i = m.index ?? 0;
+    const k = parts.length;
 
     if (i > last) {
-      parts.push(<Text key={k}>{text.slice(last, i)}</Text>)
+      parts.push(<Text key={k}>{text.slice(last, i)}</Text>);
     }
 
     if (m[1] && m[2]) {
       parts.push(
         <Text color={t.color.muted} key={parts.length}>
           [image: {m[1]}] {m[2]}
-        </Text>
-      )
+        </Text>,
+      );
     } else if (m[3] && m[4]) {
-      parts.push(renderLink(parts.length, t, m[4], m[3]))
+      parts.push(renderLink(parts.length, t, m[4], m[3]));
     } else if (m[5]) {
-      parts.push(renderLink(parts.length, t, autolinkUrl(m[5]), m[5].replace(/^mailto:/, '')))
+      parts.push(
+        renderLink(
+          parts.length,
+          t,
+          autolinkUrl(m[5]),
+          m[5].replace(/^mailto:/, ""),
+        ),
+      );
     } else if (m[6]) {
       parts.push(
         <Text key={parts.length} strikethrough>
           <MdInline t={t} text={m[6]} />
-        </Text>
-      )
+        </Text>,
+      );
     } else if (m[7]) {
       // Code is the one wrap that does NOT recurse — inline `code` spans
       // are verbatim by definition. Letting MdInline reprocess them
@@ -572,8 +632,8 @@ function MdInline({ color, t, text }: { color?: string; t: Theme; text: string }
       parts.push(
         <Text color={t.color.accent} dimColor key={parts.length}>
           {m[7]}
-        </Text>
-      )
+        </Text>,
+      );
     } else if (m[8] ?? m[9]) {
       // Recurse into bold / italic / strike / highlight so nested
       // `$...$` math (and other inline tokens) inside a `**bolded
@@ -583,47 +643,51 @@ function MdInline({ color, t, text }: { color?: string; t: Theme; text: string }
       parts.push(
         <Text bold key={parts.length}>
           <MdInline t={t} text={m[8] ?? m[9]!} />
-        </Text>
-      )
+        </Text>,
+      );
     } else if (m[10] ?? m[11]) {
       parts.push(
         <Text italic key={parts.length}>
           <MdInline t={t} text={m[10] ?? m[11]!} />
-        </Text>
-      )
+        </Text>,
+      );
     } else if (m[12]) {
       parts.push(
-        <Text backgroundColor={t.color.diffAdded} color={t.color.diffAddedWord} key={parts.length}>
+        <Text
+          backgroundColor={t.color.diffAdded}
+          color={t.color.diffAddedWord}
+          key={parts.length}
+        >
           <MdInline t={t} text={m[12]} />
-        </Text>
-      )
+        </Text>,
+      );
     } else if (m[13]) {
       parts.push(
         <Text color={t.color.muted} key={parts.length}>
           [{m[13]}]
-        </Text>
-      )
+        </Text>,
+      );
     } else if (m[14]) {
       parts.push(
         <Text color={t.color.muted} key={parts.length}>
           ^{m[14]}
-        </Text>
-      )
+        </Text>,
+      );
     } else if (m[15]) {
       parts.push(
         <Text color={t.color.muted} key={parts.length}>
           _{m[15]}
-        </Text>
-      )
+        </Text>,
+      );
     } else if (m[16]) {
       // Bare URL — trim trailing prose punctuation into a sibling text node
       // so `see https://x.com/, which…` keeps the comma outside the link.
-      const url = m[16].replace(/[),.;:!?]+$/g, '')
+      const url = m[16].replace(/[),.;:!?]+$/g, "");
 
-      parts.push(renderLink(parts.length, t, url))
+      parts.push(renderLink(parts.length, t, url));
 
       if (url.length < m[16].length) {
-        parts.push(<Text key={parts.length}>{m[16].slice(url.length)}</Text>)
+        parts.push(<Text key={parts.length}>{m[16].slice(url.length)}</Text>);
       }
     } else if (m[17] ?? m[18]) {
       // Inline math is run through `texToUnicode` (Greek letters, ℕℤℚℝ,
@@ -636,170 +700,184 @@ function MdInline({ color, t, text }: { color?: string; t: Theme; text: string }
       parts.push(
         <Text color={t.color.accent} italic key={parts.length}>
           {renderMath(texToUnicode(m[17] ?? m[18]!))}
-        </Text>
-      )
+        </Text>,
+      );
     }
 
-    last = i + m[0].length
+    last = i + m[0].length;
   }
 
   if (last < text.length) {
-    parts.push(<Text key={parts.length}>{text.slice(last)}</Text>)
+    parts.push(<Text key={parts.length}>{text.slice(last)}</Text>);
   }
 
   return (
     <Text {...(color ? { color } : {})} wrap="wrap-trim">
       {parts.length ? parts : text}
     </Text>
-  )
+  );
 }
 
 // Cross-instance parsed-children cache: useMemo's per-instance cache dies
 // on remount, so virtualization re-parses every row that scrolls back into
 // view. Theme-keyed WeakMap drops stale palettes; inner Map is LRU-bounded.
-const MD_CACHE_LIMIT = 512
-const mdCache = new WeakMap<Theme, Map<string, ReactNode[]>>()
+const MD_CACHE_LIMIT = 512;
+const mdCache = new WeakMap<Theme, Map<string, ReactNode[]>>();
 
 const cacheBucket = (t: Theme) => {
-  const b = mdCache.get(t)
+  const b = mdCache.get(t);
 
   if (b) {
-    return b
+    return b;
   }
 
-  const fresh = new Map<string, ReactNode[]>()
-  mdCache.set(t, fresh)
+  const fresh = new Map<string, ReactNode[]>();
+  mdCache.set(t, fresh);
 
-  return fresh
-}
+  return fresh;
+};
 
 const cacheGet = (b: Map<string, ReactNode[]>, key: string) => {
-  const v = b.get(key)
+  const v = b.get(key);
 
   if (v) {
-    b.delete(key)
-    b.set(key, v)
+    b.delete(key);
+    b.set(key, v);
   }
 
-  return v
-}
+  return v;
+};
 
 const cacheSet = (b: Map<string, ReactNode[]>, key: string, v: ReactNode[]) => {
-  b.set(key, v)
+  b.set(key, v);
 
   if (b.size > MD_CACHE_LIMIT) {
-    b.delete(b.keys().next().value!)
+    b.delete(b.keys().next().value!);
   }
-}
+};
 
 function MdImpl({ cols, compact, t, text }: MdProps) {
   const nodes = useMemo(() => {
-    const bucket = cacheBucket(t)
-    const cacheKey = `${compact ? '1' : '0'}|${cols ?? ''}|${text}`
-    const cached = cacheGet(bucket, cacheKey)
+    const bucket = cacheBucket(t);
+    const cacheKey = `${compact ? "1" : "0"}|${cols ?? ""}|${text}`;
+    const cached = cacheGet(bucket, cacheKey);
 
     if (cached) {
-      return cached
+      return cached;
     }
 
-    const lines = ensureEmojiPresentation(text).split('\n')
-    const nodes: ReactNode[] = []
+    const lines = ensureEmojiPresentation(text).split("\n");
+    const nodes: ReactNode[] = [];
 
-    let prevKind: Kind = null
-    let i = 0
+    let prevKind: Kind = null;
+    let i = 0;
 
     const gap = () => {
-      if (nodes.length && prevKind !== 'blank') {
-        nodes.push(<Text key={`gap-${nodes.length}`}> </Text>)
-        prevKind = 'blank'
+      if (nodes.length && prevKind !== "blank") {
+        nodes.push(<Text key={`gap-${nodes.length}`}> </Text>);
+        prevKind = "blank";
       }
-    }
+    };
 
-    const start = (kind: Exclude<Kind, null | 'blank'>) => {
-      if (prevKind && prevKind !== 'blank' && prevKind !== kind) {
-        gap()
+    const start = (kind: Exclude<Kind, null | "blank">) => {
+      if (prevKind && prevKind !== "blank" && prevKind !== kind) {
+        gap();
       }
 
-      prevKind = kind
-    }
+      prevKind = kind;
+    };
 
     while (i < lines.length) {
-      const line = lines[i]!
-      const key = nodes.length
+      const line = lines[i]!;
+      const key = nodes.length;
 
       if (!line.trim()) {
         if (!compact) {
-          gap()
+          gap();
         }
 
-        i++
+        i++;
 
-        continue
+        continue;
       }
 
       if (AUDIO_DIRECTIVE_RE.test(line)) {
-        i++
+        i++;
 
-        continue
+        continue;
       }
 
-      const media = line.match(MEDIA_LINE_RE)?.[1]
+      const media = line.match(MEDIA_LINE_RE)?.[1];
 
       if (media) {
-        start('paragraph')
+        start("paragraph");
         nodes.push(
           <Text color={t.color.muted} key={key} wrap="wrap-trim">
-            {'▸ '}
+            {"▸ "}
 
-            <Link url={/^(?:\/|[a-z]:[\\/])/i.test(media) ? `file://${media}` : media}>
+            <Link
+              url={
+                /^(?:\/|[a-z]:[\\/])/i.test(media) ? `file://${media}` : media
+              }
+            >
               <Text color={t.color.accent} underline>
                 {media}
               </Text>
             </Link>
-          </Text>
-        )
-        i++
+          </Text>,
+        );
+        i++;
 
-        continue
+        continue;
       }
 
-      const fence = line.match(FENCE_RE)
+      const fence = line.match(FENCE_RE);
 
       if (fence) {
-        const char = fence[1]![0] as '`' | '~'
-        const len = fence[1]!.length
-        const lang = fence[2]!.trim().toLowerCase()
-        const block: string[] = []
+        const char = fence[1]![0] as "`" | "~";
+        const len = fence[1]!.length;
+        const lang = fence[2]!.trim().toLowerCase();
+        const block: string[] = [];
 
         for (i++; i < lines.length; i++) {
-          const close = lines[i]!.match(FENCE_CLOSE_RE)?.[1]
+          const close = lines[i]!.match(FENCE_CLOSE_RE)?.[1];
 
           if (close && close[0] === char && close.length >= len) {
-            break
+            break;
           }
 
-          block.push(lines[i]!)
+          block.push(lines[i]!);
         }
 
         if (i < lines.length) {
-          i++
+          i++;
         }
 
-        if (['md', 'markdown'].includes(lang)) {
-          start('paragraph')
-          nodes.push(<Md cols={cols} compact={compact} key={key} t={t} text={block.join('\n')} />)
+        if (["md", "markdown"].includes(lang)) {
+          start("paragraph");
+          nodes.push(
+            <Md
+              cols={cols}
+              compact={compact}
+              key={key}
+              t={t}
+              text={block.join("\n")}
+            />,
+          );
 
-          continue
+          continue;
         }
 
-        start('code')
+        start("code");
 
-        const isDiff = lang === 'diff'
-        const highlighted = !isDiff && isHighlightable(lang)
+        const isDiff = lang === "diff";
+        const highlighted = !isDiff && isHighlightable(lang);
 
         nodes.push(
           <Box flexDirection="column" key={key} paddingLeft={2}>
-            {lang && !isDiff && <Text color={t.color.muted}>{'─ ' + lang}</Text>}
+            {lang && !isDiff && (
+              <Text color={t.color.muted}>{"─ " + lang}</Text>
+            )}
 
             {block.map((l, j) => {
               if (highlighted) {
@@ -812,97 +890,122 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
                         </Text>
                       ) : (
                         <Text key={kk}>{text}</Text>
-                      )
+                      ),
                     )}
                   </Text>
-                )
+                );
               }
 
-              const add = isDiff && l.startsWith('+')
-              const del = isDiff && l.startsWith('-')
-              const hunk = isDiff && l.startsWith('@@')
+              const add = isDiff && l.startsWith("+");
+              const del = isDiff && l.startsWith("-");
+              const hunk = isDiff && l.startsWith("@@");
 
               return (
                 <Text
-                  backgroundColor={add ? t.color.diffAdded : del ? t.color.diffRemoved : undefined}
-                  color={add ? t.color.diffAddedWord : del ? t.color.diffRemovedWord : hunk ? t.color.muted : undefined}
-                  dimColor={isDiff && !add && !del && !hunk && l.startsWith(' ')}
+                  backgroundColor={
+                    add
+                      ? t.color.diffAdded
+                      : del
+                        ? t.color.diffRemoved
+                        : undefined
+                  }
+                  color={
+                    add
+                      ? t.color.diffAddedWord
+                      : del
+                        ? t.color.diffRemovedWord
+                        : hunk
+                          ? t.color.muted
+                          : undefined
+                  }
+                  dimColor={
+                    isDiff && !add && !del && !hunk && l.startsWith(" ")
+                  }
                   key={j}
                 >
                   {l}
                 </Text>
-              )
+              );
             })}
-          </Box>
-        )
+          </Box>,
+        );
 
-        continue
+        continue;
       }
 
-      const mathOpen = line.match(MATH_BLOCK_OPEN_RE)
+      const mathOpen = line.match(MATH_BLOCK_OPEN_RE);
 
       if (mathOpen) {
-        const opener = mathOpen[1]!
-        const closeRe = opener === '$$' ? MATH_BLOCK_CLOSE_DOLLAR_RE : MATH_BLOCK_CLOSE_BRACKET_RE
-        const headRest = mathOpen[2] ?? ''
-        const block: string[] = []
+        const opener = mathOpen[1]!;
+        const closeRe =
+          opener === "$$"
+            ? MATH_BLOCK_CLOSE_DOLLAR_RE
+            : MATH_BLOCK_CLOSE_BRACKET_RE;
+        const headRest = mathOpen[2] ?? "";
+        const block: string[] = [];
 
         // Single-line block: `$$x + y = z$$` or `\[x\]`. Capture inner content
         // and emit the block immediately. Without this, the close-scan loop
         // skips line `i` and treats the next opener as our closer, swallowing
         // every paragraph in between.
-        const sameLineClose = headRest.match(closeRe)
+        const sameLineClose = headRest.match(closeRe);
 
         if (sameLineClose) {
-          const inner = sameLineClose[1]!.trim()
+          const inner = sameLineClose[1]!.trim();
 
-          start('code')
+          start("code");
           nodes.push(
             <Box flexDirection="column" key={key} paddingLeft={2}>
-              {inner ? <Text color={t.color.accent}>{renderMath(texToUnicode(inner))}</Text> : null}
-            </Box>
-          )
-          i++
+              {inner ? (
+                <Text color={t.color.accent}>
+                  {renderMath(texToUnicode(inner))}
+                </Text>
+              ) : null}
+            </Box>,
+          );
+          i++;
 
-          continue
+          continue;
         }
 
         // Multi-line block: scan ahead for a real closer before committing.
         // If none exists in the rest of the document, render this line as a
         // paragraph instead of consuming everything that follows.
-        let closeIdx = -1
+        let closeIdx = -1;
 
         for (let j = i + 1; j < lines.length; j++) {
           if (closeRe.test(lines[j]!)) {
-            closeIdx = j
+            closeIdx = j;
 
-            break
+            break;
           }
         }
 
         if (closeIdx < 0) {
-          start('paragraph')
-          nodes.push(<MdInline color={t.color.text} key={key} t={t} text={line} />)
-          i++
+          start("paragraph");
+          nodes.push(
+            <MdInline color={t.color.text} key={key} t={t} text={line} />,
+          );
+          i++;
 
-          continue
+          continue;
         }
 
         if (headRest.trim()) {
-          block.push(headRest)
+          block.push(headRest);
         }
 
         for (let j = i + 1; j < closeIdx; j++) {
-          block.push(lines[j]!)
+          block.push(lines[j]!);
         }
 
-        const tail = lines[closeIdx]!.match(closeRe)![1]!.trimEnd()
+        const tail = lines[closeIdx]!.match(closeRe)![1]!.trimEnd();
 
         if (tail.trim()) {
-          block.push(tail)
+          block.push(tail);
         }
 
-        start('code')
+        start("code");
         nodes.push(
           <Box flexDirection="column" key={key} paddingLeft={2}>
             {block.map((l, j) => (
@@ -910,61 +1013,61 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
                 {renderMath(texToUnicode(l))}
               </Text>
             ))}
-          </Box>
-        )
-        i = closeIdx + 1
+          </Box>,
+        );
+        i = closeIdx + 1;
 
-        continue
+        continue;
       }
 
-      const heading = line.match(HEADING_RE)?.[2]
+      const heading = line.match(HEADING_RE)?.[2];
 
       if (heading) {
-        start('heading')
+        start("heading");
         nodes.push(
           <Text bold color={t.color.accent} key={key} wrap="wrap-trim">
             <MdInline t={t} text={heading} />
-          </Text>
-        )
-        i++
+          </Text>,
+        );
+        i++;
 
-        continue
+        continue;
       }
 
       if (i + 1 < lines.length && SETEXT_RE.test(lines[i + 1]!)) {
-        start('heading')
+        start("heading");
         nodes.push(
           <Text bold color={t.color.accent} key={key} wrap="wrap-trim">
             <MdInline t={t} text={line.trim()} />
-          </Text>
-        )
-        i += 2
+          </Text>,
+        );
+        i += 2;
 
-        continue
+        continue;
       }
 
       if (HR_RE.test(line)) {
-        start('rule')
+        start("rule");
         nodes.push(
           <Text color={t.color.muted} key={key}>
-            {'─'.repeat(36)}
-          </Text>
-        )
-        i++
+            {"─".repeat(36)}
+          </Text>,
+        );
+        i++;
 
-        continue
+        continue;
       }
 
-      const footnote = line.match(FOOTNOTE_RE)
+      const footnote = line.match(FOOTNOTE_RE);
 
       if (footnote) {
-        start('list')
+        start("list");
         nodes.push(
           <Text color={t.color.muted} key={key} wrap="wrap-trim">
-            [{footnote[1]}] <MdInline t={t} text={footnote[2] ?? ''} />
-          </Text>
-        )
-        i++
+            [{footnote[1]}] <MdInline t={t} text={footnote[2] ?? ""} />
+          </Text>,
+        );
+        i++;
 
         while (i < lines.length && /^\s{2,}\S/.test(lines[i]!)) {
           nodes.push(
@@ -972,90 +1075,101 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
               <Text color={t.color.muted} wrap="wrap-trim">
                 <MdInline t={t} text={lines[i]!.trim()} />
               </Text>
-            </Box>
-          )
-          i++
+            </Box>,
+          );
+          i++;
         }
 
-        continue
+        continue;
       }
 
       if (i + 1 < lines.length && DEF_RE.test(lines[i + 1]!)) {
-        start('list')
+        start("list");
         nodes.push(
           <Text bold key={key} wrap="wrap-trim">
             {line.trim()}
-          </Text>
-        )
-        i++
+          </Text>,
+        );
+        i++;
 
         while (i < lines.length) {
-          const def = lines[i]!.match(DEF_RE)?.[1]
+          const def = lines[i]!.match(DEF_RE)?.[1];
 
           if (!def) {
-            break
+            break;
           }
 
           nodes.push(
             <Text key={`${key}-def-${i}`} wrap="wrap-trim">
               <Text color={t.color.muted}> · </Text>
               <MdInline color={t.color.text} t={t} text={def} />
-            </Text>
-          )
-          i++
+            </Text>,
+          );
+          i++;
         }
 
-        continue
+        continue;
       }
 
-      const bullet = line.match(BULLET_RE)
+      const bullet = line.match(BULLET_RE);
 
       if (bullet) {
-        start('list')
+        start("list");
 
-        const task = bullet[2]!.match(TASK_RE)
-        const marker = task ? (task[1]!.toLowerCase() === 'x' ? '☑' : '☐') : '•'
+        const task = bullet[2]!.match(TASK_RE);
+        const marker = task
+          ? task[1]!.toLowerCase() === "x"
+            ? "☑"
+            : "☐"
+          : "•";
 
         nodes.push(
           <Box key={key} paddingLeft={indentDepth(bullet[1]!) * 2}>
             <Text wrap="wrap-trim">
               <Text color={t.color.muted}>{marker} </Text>
-              <MdInline color={t.color.text} t={t} text={task ? task[2]! : bullet[2]!} />
+              <MdInline
+                color={t.color.text}
+                t={t}
+                text={task ? task[2]! : bullet[2]!}
+              />
             </Text>
-          </Box>
-        )
-        i++
+          </Box>,
+        );
+        i++;
 
-        continue
+        continue;
       }
 
-      const numbered = line.match(NUMBERED_RE)
+      const numbered = line.match(NUMBERED_RE);
 
       if (numbered) {
-        start('list')
+        start("list");
         nodes.push(
           <Box key={key} paddingLeft={indentDepth(numbered[1]!) * 2}>
             <Text wrap="wrap-trim">
               <Text color={t.color.muted}>{numbered[2]}. </Text>
               <MdInline color={t.color.text} t={t} text={numbered[3]!} />
             </Text>
-          </Box>
-        )
-        i++
+          </Box>,
+        );
+        i++;
 
-        continue
+        continue;
       }
 
       if (QUOTE_RE.test(line)) {
-        start('quote')
+        start("quote");
 
-        const quoteLines: Array<{ depth: number; text: string }> = []
+        const quoteLines: Array<{ depth: number; text: string }> = [];
 
         while (i < lines.length && QUOTE_RE.test(lines[i]!)) {
-          const prefix = lines[i]!.match(QUOTE_RE)?.[0] ?? ''
+          const prefix = lines[i]!.match(QUOTE_RE)?.[0] ?? "";
 
-          quoteLines.push({ depth: (prefix.match(/>/g) ?? []).length, text: lines[i]!.slice(prefix.length) })
-          i++
+          quoteLines.push({
+            depth: (prefix.match(/>/g) ?? []).length,
+            text: lines[i]!.slice(prefix.length),
+          });
+          i++;
         }
 
         nodes.push(
@@ -1067,100 +1181,117 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
                 </Text>
               </Box>
             ))}
-          </Box>
-        )
+          </Box>,
+        );
 
-        continue
+        continue;
       }
 
-      if (line.includes('|') && i + 1 < lines.length && isTableDivider(lines[i + 1]!)) {
-        start('table')
+      if (
+        line.includes("|") &&
+        i + 1 < lines.length &&
+        isTableDivider(lines[i + 1]!)
+      ) {
+        start("table");
 
-        const rows: string[][] = [splitRow(line)]
+        const rows: string[][] = [splitRow(line)];
 
-        for (i += 2; i < lines.length && lines[i]!.includes('|') && lines[i]!.trim(); i++) {
-          rows.push(splitRow(lines[i]!))
+        for (
+          i += 2;
+          i < lines.length && lines[i]!.includes("|") && lines[i]!.trim();
+          i++
+        ) {
+          rows.push(splitRow(lines[i]!));
         }
 
-        nodes.push(renderTable(key, rows, t, cols))
+        nodes.push(renderTable(key, rows, t, cols));
 
-        continue
+        continue;
       }
 
       if (/^<\/?details\b/i.test(line)) {
-        i++
+        i++;
 
-        continue
+        continue;
       }
 
-      const summary = line.match(/^<summary>(.*?)<\/summary>$/i)?.[1]
+      const summary = line.match(/^<summary>(.*?)<\/summary>$/i)?.[1];
 
       if (summary) {
-        start('paragraph')
+        start("paragraph");
         nodes.push(
           <Text color={t.color.muted} key={key} wrap="wrap-trim">
             ▶ {summary}
-          </Text>
-        )
-        i++
+          </Text>,
+        );
+        i++;
 
-        continue
+        continue;
       }
 
       if (/^<\/?[^>]+>$/.test(line.trim())) {
-        start('paragraph')
+        start("paragraph");
         nodes.push(
           <Text color={t.color.muted} key={key} wrap="wrap-trim">
             {line.trim()}
-          </Text>
-        )
-        i++
+          </Text>,
+        );
+        i++;
 
-        continue
+        continue;
       }
 
-      if (line.includes('|') && line.trim().startsWith('|')) {
-        start('table')
+      if (line.includes("|") && line.trim().startsWith("|")) {
+        start("table");
 
-        const rows: string[][] = []
+        const rows: string[][] = [];
 
-        while (i < lines.length && lines[i]!.trim().startsWith('|')) {
-          const row = lines[i]!.trim()
+        while (i < lines.length && lines[i]!.trim().startsWith("|")) {
+          const row = lines[i]!.trim();
 
           if (!/^[|\s:-]+$/.test(row)) {
-            rows.push(splitRow(row))
+            rows.push(splitRow(row));
           }
 
-          i++
+          i++;
         }
 
         if (rows.length) {
-          nodes.push(renderTable(key, rows, t, cols))
+          nodes.push(renderTable(key, rows, t, cols));
         }
 
-        continue
+        continue;
       }
 
-      start('paragraph')
-      nodes.push(<MdInline color={t.color.text} key={key} t={t} text={line} />)
-      i++
+      start("paragraph");
+      nodes.push(<MdInline color={t.color.text} key={key} t={t} text={line} />);
+      i++;
     }
 
-    cacheSet(bucket, cacheKey, nodes)
+    cacheSet(bucket, cacheKey, nodes);
 
-    return nodes
-  }, [cols, compact, t, text])
+    return nodes;
+  }, [cols, compact, t, text]);
 
-  return <Box flexDirection="column">{nodes}</Box>
+  return <Box flexDirection="column">{nodes}</Box>;
 }
 
-export const Md = memo(MdImpl)
+export const Md = memo(MdImpl);
 
-type Kind = 'blank' | 'code' | 'heading' | 'list' | 'paragraph' | 'quote' | 'rule' | 'table' | null
+type Kind =
+  | "blank"
+  | "code"
+  | "heading"
+  | "list"
+  | "paragraph"
+  | "quote"
+  | "rule"
+  | "table"
+  | null;
 
 interface MdProps {
-  cols?: number
-  compact?: boolean
-  t: Theme
-  text: string
+  cols?: number;
+  compact?: boolean;
+  t: Theme;
+  text: string;
 }

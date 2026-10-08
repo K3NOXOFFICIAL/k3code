@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.providers.types import Message, ToolSpec
+from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
     format_no_match_hint,
     fuzzy_find_and_replace,
@@ -139,8 +140,10 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     if size > MAX_READ_BYTES:
         # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
         if end is None:
-            return {"error": f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB): "
-                             "pass start and end to read a line range, or use grep to find what you need"}
+            return {
+                "error": f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB): "
+                "pass start and end to read a line range, or use grep to find what you need"
+            }
         return _read_range(path, max(1, start), end)
     text = path.read_bytes().decode("utf-8", errors="replace")  # reading may show U+FFFD; it never writes back
     lines = _split_lines(text)
@@ -173,8 +176,10 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     try:
         content = raw.decode("utf-8")  # strict: errors="replace" wrote U+FFFD over latin-1/binary bytes for good
     except UnicodeDecodeError:
-        return {"error": f"{path} is not valid UTF-8; refusing to edit it (that would destroy its bytes). "
-                         "Use bash (sed/iconv/python) for this file."}
+        return {
+            "error": f"{path} is not valid UTF-8; refusing to edit it (that would destroy its bytes). "
+            "Use bash (sed/iconv/python) for this file."
+        }
     # Match against LF text, write back with the file's own line endings (a pure-CRLF file stays CRLF).
     crlf = "\r\n" in content and content.count("\r\n") == content.count("\n")
     crlf = crlf and "\r" not in content.replace("\r\n", "")  # no lone CR either: every line end is CRLF
@@ -204,6 +209,8 @@ async def tool_bash(
     timeout = arguments.get("timeout", 30.0)
     workdir = _resolve_path(arguments.get("cwd", "."), cwd)
     proc: asyncio.subprocess.Process | None = None
+    if sandbox:
+        sandbox = with_chdir(sandbox, workdir)  # the command starts in the requested cwd, not the session's
     try:
         # start_new_session: its own process group, so the whole tree can be killed (setsid, without preexec_fn)
         if sandbox:
@@ -217,6 +224,7 @@ async def tool_bash(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                env=child_env(),  # the daemon's provider keys never reach a tool
             )
         else:
             proc = await asyncio.create_subprocess_shell(
@@ -226,6 +234,7 @@ async def tool_bash(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                env=child_env(),
             )
         out, err = _Capture(), _Capture()
         # Streams are read incrementally into bounded buffers: communicate() held every byte in the shared daemon's
@@ -267,7 +276,8 @@ MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 _KEEP_HEAD_BYTES = 40_000
 _KEEP_TAIL_BYTES = 10_000
 #: The most of one tool result the model is sent, in chars (see clip_tool_results). The bash cap as before.
-_MAX_CHARS = 10_000
+MAX_TOOL_RESULT_CHARS = 10_000  # the default for what the model is sent of one tool result (context.tool_output_chars)
+_MAX_CHARS = MAX_TOOL_RESULT_CHARS
 
 
 class _Capture:
@@ -370,17 +380,19 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     try:
         cmd = ["rg", "--line-number", "--no-heading", "--color=never"]
         if include:
-            for inc in (include if isinstance(include, list) else [include]):
+            for inc in include if isinstance(include, list) else [include]:
                 cmd += ["-g", inc]
         if exclude:
-            for exc in (exclude if isinstance(exclude, list) else [exclude]):
+            for exc in exclude if isinstance(exclude, list) else [exclude]:
                 cmd += ["-g", f"!{exc}"]
-        cmd += ["-e", pattern, "--", str(path)]  # -e: a pattern starting with "-" is not taken for a flag
+        # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
+        cmd += ["-e", pattern, "--", str(path)]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
@@ -399,6 +411,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     except (FileNotFoundError, RuntimeError):
         # Python fallback
         import re
+
         matches = []
         for root, _dirs, files in os.walk(path):
             for f in files:

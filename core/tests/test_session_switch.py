@@ -33,12 +33,17 @@ async def test_session_close_drops_idle_sessions_but_keeps_busy_ones(tmp_path, m
 
 
 def test_transcript_rows_shape():
-    rows = transcript_rows([
-        {"role": "system", "content": "sys"},
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "name": "bash", "arguments": "ls"}]},
-        {"role": "tool", "tool_call_id": "c1", "content": "out"},
-        {"role": "assistant", "content": "done"},
-    ])
-    assert rows == [{"role": "user", "text": "hi"}, {"role": "tool", "name": "bash", "context": "ls"},
-                    {"role": "assistant", "text": "done"}]
+    rows = transcript_rows(
+        [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "name": "bash", "arguments": "ls"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "out"},
+            {"role": "assistant", "content": "done"},
+        ]
+    )
+    assert rows == [
+        {"role": "user", "text": "hi"},
+        {"role": "tool", "name": "bash", "context": "ls"},
+        {"role": "assistant", "text": "done"},
+    ]

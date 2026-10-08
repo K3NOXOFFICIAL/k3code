@@ -13,24 +13,50 @@ from test_autonomy_gateway import PLAN, call, events, make, run_turn
 
 
 def classify(subs: list[str]) -> dict:
-    return {"type": "text", "match": "You classify a coding task",
-            "text": json.dumps({"scope": "large", "needs_plan": True, "risk": "low", "parallelizable": True,
-                                "suggested_subtasks": subs, "reason": "big"})}
+    return {
+        "type": "text",
+        "match": "You classify a coding task",
+        "text": json.dumps(
+            {
+                "scope": "large",
+                "needs_plan": True,
+                "risk": "low",
+                "parallelizable": True,
+                "suggested_subtasks": subs,
+                "reason": "big",
+            }
+        ),
+    }
 
 
-PLANNER = [{"type": "tool_call", "match": "PLANNING mode", "when": "first", "name": "exit_plan",
-            "arguments": {"plan": PLAN}}]
+PLANNER = [
+    {"type": "tool_call", "match": "PLANNING mode", "when": "first", "name": "exit_plan", "arguments": {"plan": PLAN}}
+]
 
 
 def worker(i: int, name: str, *, sleep: float = 0.0, content: str = "ok\n") -> list[dict]:
     key = f"YOUR subtask (t{i})"
     steps: list[dict] = []
     if sleep:
-        steps.append({"type": "tool_call", "id": "s", "match": key, "when": "first", "name": "bash",
-                      "arguments": {"command": f"sleep {sleep}"}})
+        steps.append(
+            {
+                "type": "tool_call",
+                "id": "s",
+                "match": key,
+                "when": "first",
+                "name": "bash",
+                "arguments": {"command": f"sleep {sleep}"},
+            }
+        )
     steps += [
-        {"type": "tool_call", "id": "w", "match": key, "when": "first", "name": "write",
-         "arguments": {"path": name, "content": content}},
+        {
+            "type": "tool_call",
+            "id": "w",
+            "match": key,
+            "when": "first",
+            "name": "write",
+            "arguments": {"path": name, "content": content},
+        },
         {"type": "text", "match": key, "when": "after_tool", "text": f"worker {i} done"},
     ]
     return steps
@@ -42,8 +68,12 @@ def reviewer(title: str, verdict: str = "pass", *, after: str = "") -> dict:
 
 
 def make_fan(tmp: Path, monkeypatch, steps: list[dict], repo: Path, **fan):
-    cfg = {"plan_first": True, "proposals": False, "advisor_on_plan": False,
-           "fanout": {"enabled": True, "max_parallel": 3, "require_tests": True, **fan}}
+    cfg = {
+        "plan_first": True,
+        "proposals": False,
+        "advisor_on_plan": False,
+        "fanout": {"enabled": True, "max_parallel": 3, "require_tests": True, **fan},
+    }
     server = make(tmp, monkeypatch, steps, mode="auto", autonomy=cfg)
     return server
 
@@ -76,8 +106,9 @@ def git(repo: Path, *a: str) -> str:
 SUBS = ["SUB-ONE add f1", "SUB-TWO add f2", "SUB-THREE add f3"]
 
 
-def steps_for(subs: list[str], extra: list[dict] | None = None, reviews: list[dict] | None = None,
-              sleep: float = 0.15) -> list[dict]:
+def steps_for(
+    subs: list[str], extra: list[dict] | None = None, reviews: list[dict] | None = None, sleep: float = 0.15
+) -> list[dict]:
     steps = [classify(subs), *PLANNER]
     for i, _ in enumerate(subs, 1):
         steps += worker(i, f"f{i}.txt", sleep=sleep)
@@ -88,7 +119,8 @@ def steps_for(subs: list[str], extra: list[dict] | None = None, reviews: list[di
 
 async def test_fanout_runs_children_in_parallel_reviews_merges_and_tests_each_merge(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
-    log = tmp_path / "testlog.txt"
+    # the test command runs sandboxed: it may write only inside the project, and .k3code/ is git-ignored
+    log = repo / ".k3code" / "testlog.txt"
     server = make_fan(tmp_path, monkeypatch, steps_for(SUBS), repo, test_command=f"echo ran >> {log}")
     await start_in(server, repo)
     await run_turn(server, "build the whole feature")
@@ -139,8 +171,14 @@ async def test_reviewer_rejection_sends_work_back_once(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     subs = ["SUB-ONE add f1", "SUB-TWO add f2"]
     rework = [
-        {"type": "tool_call", "id": "w2", "match": "REWORK", "when": "first", "name": "write",
-         "arguments": {"path": "f2.txt", "content": "better\n"}},
+        {
+            "type": "tool_call",
+            "id": "w2",
+            "match": "REWORK",
+            "when": "first",
+            "name": "write",
+            "arguments": {"path": "f2.txt", "content": "better\n"},
+        },
         {"type": "text", "match": "REWORK", "when": "after_tool", "text": "worker 2 fixed"},
     ]
     reviews = [
@@ -148,8 +186,15 @@ async def test_reviewer_rejection_sends_work_back_once(tmp_path, monkeypatch):
         {"type": "text", "match": "Subtask: SUB-TWO add f2", "text": "no tests added. VERDICT: fail"},
     ]
     # after the rework the reviewer sees "worker 2 fixed" in the worker report and passes it
-    steps = [classify(subs), *PLANNER, *worker(1, "f1.txt"), *worker(2, "f2.txt"), *rework, *reviews,
-             {"type": "text", "match": "worker 2 fixed", "text": "now fine. VERDICT: pass"}]
+    steps = [
+        classify(subs),
+        *PLANNER,
+        *worker(1, "f1.txt"),
+        *worker(2, "f2.txt"),
+        *rework,
+        *reviews,
+        {"type": "text", "match": "worker 2 fixed", "text": "now fine. VERDICT: pass"},
+    ]
     server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
     await start_in(server, repo)
     await run_turn(server, "do the big thing")
@@ -163,11 +208,23 @@ async def test_reviewer_rejection_sends_work_back_once(tmp_path, monkeypatch):
 async def test_failing_tests_are_sent_back_once_then_pass(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     subs = ["SUB-ONE add f1", "SUB-TWO add bad"]
-    steps = [classify(subs), *PLANNER, *worker(1, "f1.txt"), *worker(2, "bad.txt"),
-             reviewer(subs[0]), reviewer(subs[1]),
-             {"type": "tool_call", "id": "rm", "match": "tests failed after merging", "when": "first",
-              "name": "bash", "arguments": {"command": "rm bad.txt && echo fixed > f2.txt"}},
-             {"type": "text", "match": "tests failed after merging", "when": "after_tool", "text": "worker 2 fixed"}]
+    steps = [
+        classify(subs),
+        *PLANNER,
+        *worker(1, "f1.txt"),
+        *worker(2, "bad.txt"),
+        reviewer(subs[0]),
+        reviewer(subs[1]),
+        {
+            "type": "tool_call",
+            "id": "rm",
+            "match": "tests failed after merging",
+            "when": "first",
+            "name": "bash",
+            "arguments": {"command": "rm bad.txt && echo fixed > f2.txt"},
+        },
+        {"type": "text", "match": "tests failed after merging", "when": "after_tool", "text": "worker 2 fixed"},
+    ]
     server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="test ! -f bad.txt")
     await start_in(server, repo)
     await run_turn(server, "do the big thing")
@@ -182,11 +239,17 @@ async def test_failing_tests_are_sent_back_once_then_pass(tmp_path, monkeypatch)
 async def test_persistent_failure_escalates_to_parent_and_keeps_branch(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     subs = ["SUB-ONE add f1", "SUB-TWO add bad"]
-    steps = [classify(subs), *PLANNER, *worker(1, "f1.txt"), *worker(2, "bad.txt"),
-             reviewer(subs[0]), reviewer(subs[1]),
-             # the retry does not fix anything
-             {"type": "text", "match": "--- REWORK ---", "text": "I could not fix it"},
-             {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"}]
+    steps = [
+        classify(subs),
+        *PLANNER,
+        *worker(1, "f1.txt"),
+        *worker(2, "bad.txt"),
+        reviewer(subs[0]),
+        reviewer(subs[1]),
+        # the retry does not fix anything
+        {"type": "text", "match": "--- REWORK ---", "text": "I could not fix it"},
+        {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"},
+    ]
     server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="test ! -f bad.txt")
     await start_in(server, repo)
     await run_turn(server, "do the big thing")
@@ -251,12 +314,23 @@ def test_detect_test_command(tmp_path):
 async def test_merge_conflict_between_children_is_resolved_by_the_child(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     subs = ["SUB-ONE shared A", "SUB-TWO shared B"]
-    steps = [classify(subs), *PLANNER,
-             *worker(1, "shared.txt", content="from one\n"), *worker(2, "shared.txt", content="from two\n"),
-             reviewer(subs[0]), reviewer(subs[1]),
-             {"type": "tool_call", "id": "fix", "match": "conflicts in", "when": "first", "name": "write",
-              "arguments": {"path": "shared.txt", "content": "from one\nfrom two\n"}},
-             {"type": "text", "match": "conflicts in", "when": "after_tool", "text": "worker resolved"}]
+    steps = [
+        classify(subs),
+        *PLANNER,
+        *worker(1, "shared.txt", content="from one\n"),
+        *worker(2, "shared.txt", content="from two\n"),
+        reviewer(subs[0]),
+        reviewer(subs[1]),
+        {
+            "type": "tool_call",
+            "id": "fix",
+            "match": "conflicts in",
+            "when": "first",
+            "name": "write",
+            "arguments": {"path": "shared.txt", "content": "from one\nfrom two\n"},
+        },
+        {"type": "text", "match": "conflicts in", "when": "after_tool", "text": "worker resolved"},
+    ]
     server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
     await start_in(server, repo)
     await run_turn(server, "do the big thing")
@@ -274,8 +348,9 @@ def test_active_rows_include_running_children():
     from k3code.gateway.server import GatewayServer
     from k3code.subagents.runner import Handle
 
-    h = Handle(id="sa-1", description="do x", agent_type="worker", tier="cheap", depth=1, parent_sid="p",
-               status="running")
+    h = Handle(
+        id="sa-1", description="do x", agent_type="worker", tier="cheap", depth=1, parent_sid="p", status="running"
+    )
     fake = SimpleNamespace(live={}, subagents=SimpleNamespace(handles={"sa-1": h}))
     rows = GatewayServer._active_rows(fake, None)
     assert rows[0]["id"] == "sa-1" and rows[0]["origin"] == "subagent" and rows[0]["background"]

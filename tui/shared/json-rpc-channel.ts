@@ -1,19 +1,19 @@
-import type { GatewayEvent } from './gateway-events.js'
+import type { GatewayEvent } from "./gateway-events.js";
 
-export type GatewayRequestId = number | string
+export type GatewayRequestId = number | string;
 
 export interface JsonRpcErrorPayload {
-  code?: number
-  data?: unknown
-  message?: string
+  code?: number;
+  data?: unknown;
+  message?: string;
 }
 
 export interface JsonRpcFrame {
-  error?: JsonRpcErrorPayload
-  id?: GatewayRequestId | null
-  method?: string
-  params?: GatewayEvent | ServerRequestParams
-  result?: unknown
+  error?: JsonRpcErrorPayload;
+  id?: GatewayRequestId | null;
+  method?: string;
+  params?: GatewayEvent | ServerRequestParams;
+  result?: unknown;
 }
 
 /**
@@ -22,64 +22,81 @@ export interface JsonRpcFrame {
  * blocked on the answer; the rest is method-specific.
  */
 export interface ServerRequestParams extends Record<string, unknown> {
-  session_id?: string
+  session_id?: string;
 }
 
 /** One inbound server→client request, as handed to a `ServerRequestHandler`. */
-export interface ServerRequest<M extends string = string, P extends ServerRequestParams = ServerRequestParams> {
-  id: string
-  method: M
-  params: P
+export interface ServerRequest<
+  M extends string = string,
+  P extends ServerRequestParams = ServerRequestParams,
+> {
+  id: string;
+  method: M;
+  params: P;
   /**
    * Route the answer back to the backend that asked. Idempotent: the first
    * `respond` (or `fail`) wins; a request re-delivered after a reconnect
    * (`open_requests`) reuses the id, so a stale card answering twice is a
    * no-op on the wire.
    */
-  respond: (result: Record<string, unknown>) => void
+  respond: (result: Record<string, unknown>) => void;
   /** Answer with a JSON-RPC error (the backend treats it as unanswered). */
-  fail: (code: number, message: string) => void
+  fail: (code: number, message: string) => void;
   /**
    * Renderer-side tag set by the owner when a request arrives through a
    * replay (`open_requests`) rather than live; handlers that already show the
    * card can skip re-notifying.
    */
-  replayed?: boolean
+  replayed?: boolean;
 }
 
 /** Handles one inbound server→client request; return `false` to decline (next handler tries). */
-export type ServerRequestHandler = (request: ServerRequest) => boolean | void
+export type ServerRequestHandler = (request: ServerRequest) => boolean | void;
 
-const isServerRequestFrame = (frame: JsonRpcFrame): frame is JsonRpcFrame & { id: string; method: string } =>
-  typeof frame.id === 'string' && typeof frame.method === 'string' && frame.method !== 'event'
+const isServerRequestFrame = (
+  frame: JsonRpcFrame,
+): frame is JsonRpcFrame & { id: string; method: string } =>
+  typeof frame.id === "string" &&
+  typeof frame.method === "string" &&
+  frame.method !== "event";
 
 /** JSON-RPC error with optional structured `data` from the gateway. */
 export class JsonRpcGatewayError extends Error {
-  readonly code?: number
-  readonly data?: unknown
+  readonly code?: number;
+  readonly data?: unknown;
 
   constructor(message: string, options?: { code?: number; data?: unknown }) {
-    super(message)
-    this.name = 'JsonRpcGatewayError'
-    this.code = options?.code
-    this.data = options?.data
+    super(message);
+    this.name = "JsonRpcGatewayError";
+    this.code = options?.code;
+    this.data = options?.data;
   }
 }
 
 /** JSON-RPC "method not found" (tui_gateway/server.py::dispatch `_err(rid, -32601, …)`). */
-export const JSON_RPC_METHOD_NOT_FOUND = -32601
+export const JSON_RPC_METHOD_NOT_FOUND = -32601;
 
 /** JSON-RPC "internal error" — used when a server→client request handler throws. */
-export const JSON_RPC_INTERNAL_ERROR = -32603
+export const JSON_RPC_INTERNAL_ERROR = -32603;
 
 /** Map a raw `error` member of a response frame to the typed error every surface inspects. */
-export function jsonRpcErrorFromFrame(raw: unknown, fallbackMessage = 'Hermes RPC failed'): JsonRpcGatewayError {
-  const err = (raw && typeof raw === 'object' ? raw : {}) as JsonRpcErrorPayload
+export function jsonRpcErrorFromFrame(
+  raw: unknown,
+  fallbackMessage = "Hermes RPC failed",
+): JsonRpcGatewayError {
+  const err = (
+    raw && typeof raw === "object" ? raw : {}
+  ) as JsonRpcErrorPayload;
 
-  return new JsonRpcGatewayError(typeof err.message === 'string' && err.message ? err.message : fallbackMessage, {
-    code: typeof err.code === 'number' ? err.code : undefined,
-    data: err.data
-  })
+  return new JsonRpcGatewayError(
+    typeof err.message === "string" && err.message
+      ? err.message
+      : fallbackMessage,
+    {
+      code: typeof err.code === "number" ? err.code : undefined,
+      data: err.data,
+    },
+  );
 }
 
 /**
@@ -88,31 +105,38 @@ export function jsonRpcErrorFromFrame(raw: unknown, fallbackMessage = 'Hermes RP
  * test spy; the owner feeds inbound text back through `handleFrame`.
  */
 export interface JsonRpcTransport {
-  send(text: string): void
+  send(text: string): void;
 }
 
 export interface JsonRpcRequestChannelOptions {
-  createRequestId?: (nextId: number) => GatewayRequestId
-  heartbeatDeadlineMs?: number
-  heartbeatIntervalMs?: number
+  createRequestId?: (nextId: number) => GatewayRequestId;
+  heartbeatDeadlineMs?: number;
+  heartbeatIntervalMs?: number;
   /** Called when the heartbeat deadline passes or a heartbeat send throws; the owner drops the transport. */
-  onHeartbeatFailure?: (error: Error) => void
+  onHeartbeatFailure?: (error: Error) => void;
   /** Decoded `event` notification. */
-  onEvent?: (event: GatewayEvent) => void
+  onEvent?: (event: GatewayEvent) => void;
   /**
    * Inbound server→client request nobody handled: the owner logs it. The
    * channel has already answered `-32601` so the backend does not wait out
    * its deadline against a client with no handler.
    */
-  onUnhandledRequest?: (request: { id: string; method: string; params: ServerRequestParams }) => void
+  onUnhandledRequest?: (request: {
+    id: string;
+    method: string;
+    params: ServerRequestParams;
+  }) => void;
   /**
    * A server→client request handler threw: the owner logs it. The channel has
    * already answered `-32603` so the backend does not wait out its deadline
    * against a crashed client (clarify blocks 3600s).
    */
-  onRequestHandlerError?: (error: Error, request: { id: string; method: string; params: ServerRequestParams }) => void
-  requestIdPrefix?: string
-  requestTimeoutMs?: number
+  onRequestHandlerError?: (
+    error: Error,
+    request: { id: string; method: string; params: ServerRequestParams },
+  ) => void;
+  requestIdPrefix?: string;
+  requestTimeoutMs?: number;
   /**
    * What resets the heartbeat deadline. `'response'` (default): only a
    * `gateway.ping` pong or a response to one of our requests — a backend
@@ -121,50 +145,50 @@ export interface JsonRpcRequestChannelOptions {
    * `'any-inbound'`: every frame, notifications included (the desktop/web
    * WebSocket client's original contract).
    */
-  heartbeatLiveness?: HeartbeatLiveness
+  heartbeatLiveness?: HeartbeatLiveness;
   /** `setTimeout`/`setInterval` handles are `unref`'d when the runtime supports it (Node) so a pending call cannot pin the process. */
-  unrefTimers?: boolean
+  unrefTimers?: boolean;
 }
 
-export type HeartbeatLiveness = 'any-inbound' | 'response'
+export type HeartbeatLiveness = "any-inbound" | "response";
 
 interface PendingCall {
-  reject: (error: Error) => void
-  resolve: (value: unknown) => void
-  timer?: ReturnType<typeof setTimeout>
+  reject: (error: Error) => void;
+  resolve: (value: unknown) => void;
+  timer?: ReturnType<typeof setTimeout>;
 }
 
-const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
+const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 // Keepalive + dead-connection detection. A silent drop (macOS sleep, proxy
 // idle timeout, VPN reconnect) kills the TCP socket without a `close` event,
 // so the client hangs forever (issue #32997). Browser/undici WebSocket does
 // not expose an acknowledged ping/pong API, so this uses a small JSON-RPC
 // heartbeat that the TUI gateway explicitly answers.
-export const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000
-export const DEFAULT_HEARTBEAT_DEADLINE_MS = 45_000
-const MAX_OUTSTANDING_PINGS = 8
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 15_000;
+export const DEFAULT_HEARTBEAT_DEADLINE_MS = 45_000;
+const MAX_OUTSTANDING_PINGS = 8;
 
 // Hoisted decoder: attach mode can drive high-frequency binary frames (tool
 // deltas, reasoning streams) and a fresh TextDecoder per message is avoidable
 // GC pressure; UTF-8 is stateless and frames arrive whole.
-const wireDecoder = new TextDecoder()
+const wireDecoder = new TextDecoder();
 
 /** Decode a socket `message.data` (string / ArrayBuffer / view) to text; `null` for anything else. */
 export function wireFrameText(raw: unknown): string | null {
-  if (typeof raw === 'string') {
-    return raw
+  if (typeof raw === "string") {
+    return raw;
   }
 
   if (raw instanceof ArrayBuffer || ArrayBuffer.isView(raw)) {
-    return wireDecoder.decode(raw as ArrayBuffer)
+    return wireDecoder.decode(raw as ArrayBuffer);
   }
 
-  return null
+  return null;
 }
 
 const unrefTimer = (timer: unknown) => {
-  ;(timer as { unref?: () => void } | undefined)?.unref?.()
-}
+  (timer as { unref?: () => void } | undefined)?.unref?.();
+};
 
 /**
  * The transport-agnostic half of a JSON-RPC gateway connection: request ids,
@@ -175,60 +199,76 @@ const unrefTimer = (timer: unknown) => {
  * generation and call `handleFrame` for every inbound text frame.
  */
 export class JsonRpcRequestChannel {
-  private nextId = 0
-  private readonly pending = new Map<GatewayRequestId, PendingCall>()
-  private transport: JsonRpcTransport | null = null
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null
-  private heartbeatSequence = 0
-  private readonly outstandingPings = new Set<string>()
-  private lastLivenessAt = 0
-  private readonly requestHandlers: ServerRequestHandler[] = []
+  private nextId = 0;
+  private readonly pending = new Map<GatewayRequestId, PendingCall>();
+  private transport: JsonRpcTransport | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatSequence = 0;
+  private readonly outstandingPings = new Set<string>();
+  private lastLivenessAt = 0;
+  private readonly requestHandlers: ServerRequestHandler[] = [];
   private readonly options: Required<
-    Omit<JsonRpcRequestChannelOptions, 'onEvent' | 'onHeartbeatFailure' | 'onRequestHandlerError' | 'onUnhandledRequest'>
+    Omit<
+      JsonRpcRequestChannelOptions,
+      | "onEvent"
+      | "onHeartbeatFailure"
+      | "onRequestHandlerError"
+      | "onUnhandledRequest"
+    >
   > &
-    Pick<JsonRpcRequestChannelOptions, 'onEvent' | 'onHeartbeatFailure' | 'onRequestHandlerError' | 'onUnhandledRequest'>
+    Pick<
+      JsonRpcRequestChannelOptions,
+      | "onEvent"
+      | "onHeartbeatFailure"
+      | "onRequestHandlerError"
+      | "onUnhandledRequest"
+    >;
 
   constructor(options: JsonRpcRequestChannelOptions = {}) {
     this.options = {
-      createRequestId: options.createRequestId ?? ((nextId: number) => `${options.requestIdPrefix ?? 'r'}${nextId}`),
-      heartbeatDeadlineMs: options.heartbeatDeadlineMs ?? DEFAULT_HEARTBEAT_DEADLINE_MS,
-      heartbeatIntervalMs: options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
-      heartbeatLiveness: options.heartbeatLiveness ?? 'response',
+      createRequestId:
+        options.createRequestId ??
+        ((nextId: number) => `${options.requestIdPrefix ?? "r"}${nextId}`),
+      heartbeatDeadlineMs:
+        options.heartbeatDeadlineMs ?? DEFAULT_HEARTBEAT_DEADLINE_MS,
+      heartbeatIntervalMs:
+        options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
+      heartbeatLiveness: options.heartbeatLiveness ?? "response",
       onEvent: options.onEvent,
       onHeartbeatFailure: options.onHeartbeatFailure,
       onRequestHandlerError: options.onRequestHandlerError,
       onUnhandledRequest: options.onUnhandledRequest,
-      requestIdPrefix: options.requestIdPrefix ?? 'r',
+      requestIdPrefix: options.requestIdPrefix ?? "r",
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
-      unrefTimers: options.unrefTimers ?? false
-    }
+      unrefTimers: options.unrefTimers ?? false,
+    };
   }
 
   get defaultRequestTimeoutMs(): number {
-    return this.options.requestTimeoutMs
+    return this.options.requestTimeoutMs;
   }
 
   get connected(): boolean {
-    return this.transport !== null
+    return this.transport !== null;
   }
 
   /** Bind a new connection generation. Any previous generation's heartbeat stops; its pending calls are the owner's to reject. */
   attach(transport: JsonRpcTransport): void {
-    this.stopHeartbeat()
-    this.transport = transport
-    this.lastLivenessAt = Date.now()
+    this.stopHeartbeat();
+    this.transport = transport;
+    this.lastLivenessAt = Date.now();
   }
 
   /** Drop the transport and fail every in-flight call with `error`. */
   detach(error: Error): void {
-    this.stopHeartbeat()
-    this.transport = null
-    this.rejectAllPending(error)
+    this.stopHeartbeat();
+    this.transport = null;
+    this.rejectAllPending(error);
   }
 
   /** True while `transport` is the bound generation (owners gate stale socket callbacks on this). */
   owns(transport: JsonRpcTransport): boolean {
-    return this.transport === transport
+    return this.transport === transport;
   }
 
   request<T>(
@@ -236,54 +276,54 @@ export class JsonRpcRequestChannel {
     params: Record<string, unknown> = {},
     timeoutMs = this.options.requestTimeoutMs,
     signal?: AbortSignal,
-    notConnectedError: () => Error = () => new Error('gateway not connected')
+    notConnectedError: () => Error = () => new Error("gateway not connected"),
   ): Promise<T> {
-    const transport = this.transport
+    const transport = this.transport;
 
     if (!transport) {
-      return Promise.reject(notConnectedError())
+      return Promise.reject(notConnectedError());
     }
 
     if (signal?.aborted) {
-      return Promise.reject(new DOMException('Aborted', 'AbortError'))
+      return Promise.reject(new DOMException("Aborted", "AbortError"));
     }
 
-    const id = this.options.createRequestId(++this.nextId)
+    const id = this.options.createRequestId(++this.nextId);
 
     return new Promise<T>((resolve, reject) => {
-      let onAbort: (() => void) | undefined
+      let onAbort: (() => void) | undefined;
 
       const detachAbort = () => {
         if (onAbort && signal) {
-          signal.removeEventListener('abort', onAbort)
+          signal.removeEventListener("abort", onAbort);
         }
-      }
+      };
 
       const pending: PendingCall = {
-        resolve: value => {
-          detachAbort()
-          resolve(value as T)
+        resolve: (value) => {
+          detachAbort();
+          resolve(value as T);
         },
-        reject: error => {
-          detachAbort()
-          reject(error)
-        }
-      }
+        reject: (error) => {
+          detachAbort();
+          reject(error);
+        },
+      };
 
       if (timeoutMs > 0) {
         pending.timer = setTimeout(() => {
           if (this.pending.delete(id)) {
-            detachAbort()
+            detachAbort();
             // Include the configured timeout so a caller (or a user looking
             // at an error toast) can tell whether the default window fired
             // or a per-call override — e.g. /compress opts into 120s.
-            const seconds = Math.round(timeoutMs / 1000)
-            reject(new Error(`request timed out after ${seconds}s: ${method}`))
+            const seconds = Math.round(timeoutMs / 1000);
+            reject(new Error(`request timed out after ${seconds}s: ${method}`));
           }
-        }, timeoutMs)
+        }, timeoutMs);
 
         if (this.options.unrefTimers) {
-          unrefTimer(pending.timer)
+          unrefTimer(pending.timer);
         }
       }
 
@@ -291,24 +331,24 @@ export class JsonRpcRequestChannel {
       // server-side cancellation is a separate cooperative RPC where it matters.
       if (signal) {
         onAbort = () => {
-          this.clearPending(id)
-          detachAbort()
-          reject(new DOMException('Aborted', 'AbortError'))
-        }
+          this.clearPending(id);
+          detachAbort();
+          reject(new DOMException("Aborted", "AbortError"));
+        };
 
-        signal.addEventListener('abort', onAbort, { once: true })
+        signal.addEventListener("abort", onAbort, { once: true });
       }
 
-      this.pending.set(id, pending)
+      this.pending.set(id, pending);
 
       try {
-        transport.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+        transport.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
       } catch (error) {
-        this.clearPending(id)
-        detachAbort()
-        reject(error instanceof Error ? error : new Error(String(error)))
+        this.clearPending(id);
+        detachAbort();
+        reject(error instanceof Error ? error : new Error(String(error)));
       }
-    })
+    });
   }
 
   /**
@@ -318,15 +358,15 @@ export class JsonRpcRequestChannel {
    * backend never waits out its deadline against a client that cannot answer.
    */
   onRequest(handler: ServerRequestHandler): () => void {
-    this.requestHandlers.push(handler)
+    this.requestHandlers.push(handler);
 
     return () => {
-      const index = this.requestHandlers.indexOf(handler)
+      const index = this.requestHandlers.indexOf(handler);
 
       if (index >= 0) {
-        this.requestHandlers.splice(index, 1)
+        this.requestHandlers.splice(index, 1);
       }
-    }
+    };
   }
 
   /**
@@ -335,73 +375,94 @@ export class JsonRpcRequestChannel {
    * reconnect replay (`replayed: true`) so an unanswered question survives a
    * dropped socket.
    */
-  deliverRequest(id: string, method: string, params: ServerRequestParams, replayed = false): boolean {
-    let settled = false
+  deliverRequest(
+    id: string,
+    method: string,
+    params: ServerRequestParams,
+    replayed = false,
+  ): boolean {
+    let settled = false;
 
     const send = (frame: Record<string, unknown>) => {
       if (settled) {
-        return
+        return;
       }
 
-      settled = true
+      settled = true;
 
       try {
-        this.transport?.send(JSON.stringify({ jsonrpc: '2.0', id, ...frame }))
+        this.transport?.send(JSON.stringify({ jsonrpc: "2.0", id, ...frame }));
       } catch {
         // The generation is gone; the backend withdraws the request itself (timeout / reconnect replay).
       }
-    }
+    };
 
     const request: ServerRequest = {
       id,
       method,
       params,
       replayed,
-      respond: result => send({ result }),
-      fail: (code, message) => send({ error: { code, message } })
-    }
+      respond: (result) => send({ result }),
+      fail: (code, message) => send({ error: { code, message } }),
+    };
 
     for (const handler of this.requestHandlers) {
-      let accepted: boolean | void
+      let accepted: boolean | void;
 
       try {
-        accepted = handler(request)
+        accepted = handler(request);
       } catch (error) {
         // A crashing handler must not leave the backend waiting out its full
         // deadline (clarify blocks 3600s): answer -32603 and stop. The `send`
         // guard makes this a no-op if the handler already responded.
-        request.fail(JSON_RPC_INTERNAL_ERROR, `server request handler crashed: ${method}`)
-        this.options.onRequestHandlerError?.(error instanceof Error ? error : new Error(String(error)), {
-          id,
-          method,
-          params
-        })
+        request.fail(
+          JSON_RPC_INTERNAL_ERROR,
+          `server request handler crashed: ${method}`,
+        );
+        this.options.onRequestHandlerError?.(
+          error instanceof Error ? error : new Error(String(error)),
+          {
+            id,
+            method,
+            params,
+          },
+        );
 
-        return false
+        return false;
       }
 
       if (accepted !== false) {
-        return true
+        return true;
       }
     }
 
-    request.fail(JSON_RPC_METHOD_NOT_FOUND, `no handler for server request: ${method}`)
-    this.options.onUnhandledRequest?.({ id, method, params })
+    request.fail(
+      JSON_RPC_METHOD_NOT_FOUND,
+      `no handler for server request: ${method}`,
+    );
+    this.options.onUnhandledRequest?.({ id, method, params });
 
-    return false
+    return false;
   }
 
   private deliverOpenRequests(result: unknown): void {
-    const open = (result as { open_requests?: unknown } | null)?.open_requests
+    const open = (result as { open_requests?: unknown } | null)?.open_requests;
 
     if (!Array.isArray(open)) {
-      return
+      return;
     }
 
-    for (const entry of open as Array<{ id?: unknown; method?: unknown; params?: unknown }>) {
-      if (typeof entry?.id === 'string' && typeof entry.method === 'string') {
-        const params = entry.params && typeof entry.params === 'object' ? (entry.params as ServerRequestParams) : {}
-        this.deliverRequest(entry.id, entry.method, params, true)
+    for (const entry of open as Array<{
+      id?: unknown;
+      method?: unknown;
+      params?: unknown;
+    }>) {
+      if (typeof entry?.id === "string" && typeof entry.method === "string") {
+        const params =
+          entry.params && typeof entry.params === "object"
+            ? (entry.params as ServerRequestParams)
+            : {};
+        this.deliverRequest(entry.id, entry.method, params, true);
       }
     }
   }
@@ -414,44 +475,50 @@ export class JsonRpcRequestChannel {
    * JSON or not a JSON object (`null`, a scalar).
    */
   handleFrame(text: string): JsonRpcFrame | null {
-    let frame: JsonRpcFrame
+    let frame: JsonRpcFrame;
 
     try {
-      frame = JSON.parse(text) as JsonRpcFrame
+      frame = JSON.parse(text) as JsonRpcFrame;
     } catch {
-      return null
+      return null;
     }
 
-    if (!frame || typeof frame !== 'object') {
-      return null
+    if (!frame || typeof frame !== "object") {
+      return null;
     }
 
-    if (this.options.heartbeatLiveness === 'any-inbound') {
-      this.lastLivenessAt = Date.now()
+    if (this.options.heartbeatLiveness === "any-inbound") {
+      this.lastLivenessAt = Date.now();
     }
 
     if (isServerRequestFrame(frame)) {
-      const params = frame.params && typeof frame.params === 'object' ? (frame.params as ServerRequestParams) : {}
-      this.deliverRequest(frame.id, frame.method, params)
+      const params =
+        frame.params && typeof frame.params === "object"
+          ? (frame.params as ServerRequestParams)
+          : {};
+      this.deliverRequest(frame.id, frame.method, params);
 
-      return frame
+      return frame;
     }
 
     if (frame.id !== undefined && frame.id !== null) {
-      if (typeof frame.id === 'string' && this.outstandingPings.delete(frame.id)) {
-        this.lastLivenessAt = Date.now()
+      if (
+        typeof frame.id === "string" &&
+        this.outstandingPings.delete(frame.id)
+      ) {
+        this.lastLivenessAt = Date.now();
 
-        return frame
+        return frame;
       }
 
-      const call = this.pending.get(frame.id)
+      const call = this.pending.get(frame.id);
 
       if (call) {
-        this.lastLivenessAt = Date.now()
-        this.clearPending(frame.id)
+        this.lastLivenessAt = Date.now();
+        this.clearPending(frame.id);
 
         if (frame.error) {
-          call.reject(jsonRpcErrorFromFrame(frame.error))
+          call.reject(jsonRpcErrorFromFrame(frame.error));
         } else {
           // Reconnect contract: `session.resume` / `session.activate` /
           // `session.events.since` answer with `open_requests` — the server→
@@ -459,23 +526,27 @@ export class JsonRpcRequestChannel {
           // the event replay ring (they are not events), so they are re-
           // delivered here, before the caller sees the result, over the very
           // socket that owns them.
-          this.deliverOpenRequests(frame.result)
-          call.resolve(frame.result)
+          this.deliverOpenRequests(frame.result);
+          call.resolve(frame.result);
         }
       }
 
-      return frame
+      return frame;
     }
 
-    if (frame.method === 'event' && frame.params && typeof (frame.params as GatewayEvent).type === 'string') {
-      if ((frame.params as GatewayEvent).type === 'gateway.ready') {
-        this.advertiseCapabilities()
+    if (
+      frame.method === "event" &&
+      frame.params &&
+      typeof (frame.params as GatewayEvent).type === "string"
+    ) {
+      if ((frame.params as GatewayEvent).type === "gateway.ready") {
+        this.advertiseCapabilities();
       }
 
-      this.options.onEvent?.(frame.params as GatewayEvent)
+      this.options.onEvent?.(frame.params as GatewayEvent);
     }
 
-    return frame
+    return frame;
   }
 
   /**
@@ -487,7 +558,9 @@ export class JsonRpcRequestChannel {
    * that is ignored.
    */
   private advertiseCapabilities(): void {
-    this.request('client.capabilities', { server_requests: true }).catch(() => undefined)
+    this.request("client.capabilities", { server_requests: true }).catch(
+      () => undefined,
+    );
   }
 
   /**
@@ -497,80 +570,100 @@ export class JsonRpcRequestChannel {
    * `heartbeatLiveness`; a full deadline without it drops the transport.
    */
   startHeartbeat(): void {
-    this.stopHeartbeat()
-    this.lastLivenessAt = Date.now()
+    this.stopHeartbeat();
+    this.lastLivenessAt = Date.now();
 
-    const transport = this.transport
+    const transport = this.transport;
 
-    if (!transport || this.options.heartbeatIntervalMs <= 0 || this.options.heartbeatDeadlineMs <= 0) {
-      return
+    if (
+      !transport ||
+      this.options.heartbeatIntervalMs <= 0 ||
+      this.options.heartbeatDeadlineMs <= 0
+    ) {
+      return;
     }
 
     this.heartbeatTimer = setInterval(() => {
       if (this.transport !== transport) {
-        return
+        return;
       }
 
-      if (Date.now() - this.lastLivenessAt >= this.options.heartbeatDeadlineMs) {
-        this.failHeartbeat(new Error('WebSocket heartbeat acknowledgement timed out'))
+      if (
+        Date.now() - this.lastLivenessAt >=
+        this.options.heartbeatDeadlineMs
+      ) {
+        this.failHeartbeat(
+          new Error("WebSocket heartbeat acknowledgement timed out"),
+        );
 
-        return
+        return;
       }
 
-      const id = `heartbeat-${++this.heartbeatSequence}`
-      this.outstandingPings.add(id)
+      const id = `heartbeat-${++this.heartbeatSequence}`;
+      this.outstandingPings.add(id);
 
       // In 'any-inbound' mode a backend that streams but never pongs keeps
       // the transport alive indefinitely; forget stale ping ids so the set
       // cannot grow with it.
       if (this.outstandingPings.size > MAX_OUTSTANDING_PINGS) {
-        this.outstandingPings.delete(this.outstandingPings.values().next().value as string)
+        this.outstandingPings.delete(
+          this.outstandingPings.values().next().value as string,
+        );
       }
 
       try {
-        transport.send(JSON.stringify({ jsonrpc: '2.0', id, method: 'gateway.ping', params: {} }))
+        transport.send(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            method: "gateway.ping",
+            params: {},
+          }),
+        );
       } catch (error) {
-        this.failHeartbeat(error instanceof Error ? error : new Error(String(error)))
+        this.failHeartbeat(
+          error instanceof Error ? error : new Error(String(error)),
+        );
       }
-    }, this.options.heartbeatIntervalMs)
+    }, this.options.heartbeatIntervalMs);
 
     if (this.options.unrefTimers) {
-      unrefTimer(this.heartbeatTimer)
+      unrefTimer(this.heartbeatTimer);
     }
   }
 
   stopHeartbeat(): void {
-    this.outstandingPings.clear()
+    this.outstandingPings.clear();
 
     if (this.heartbeatTimer !== null) {
-      clearInterval(this.heartbeatTimer)
-      this.heartbeatTimer = null
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
     }
   }
 
   private failHeartbeat(error: Error): void {
-    this.stopHeartbeat()
-    this.options.onHeartbeatFailure?.(error)
+    this.stopHeartbeat();
+    this.options.onHeartbeatFailure?.(error);
   }
 
   private clearPending(id: GatewayRequestId): void {
-    const call = this.pending.get(id)
+    const call = this.pending.get(id);
 
     if (call?.timer) {
-      clearTimeout(call.timer)
+      clearTimeout(call.timer);
     }
 
-    this.pending.delete(id)
+    this.pending.delete(id);
   }
 
   private rejectAllPending(error: Error): void {
     for (const [id, call] of this.pending) {
       if (call.timer) {
-        clearTimeout(call.timer)
+        clearTimeout(call.timer);
       }
 
-      this.pending.delete(id)
-      call.reject(error)
+      this.pending.delete(id);
+      call.reject(error);
     }
   }
 }

@@ -43,8 +43,11 @@ logger = logging.getLogger(__name__)
 
 #: ChainExhausted reasons that mean "the provider is rate-limiting / quota'd us".
 RATE_LIMIT_REASONS = frozenset({"rate_limit", "quota"})
-#: ChainExhausted reasons that waiting cannot fix.
-PERMANENT_REASONS = frozenset({"auth", "bad_request"})
+#: ChainExhausted reasons that are transient: an unattended run parks on them instead of failing its turn.
+UNATTENDED_PARK_REASONS = frozenset({"server", "timeout", "network", "unknown"})
+#: ChainExhausted reasons that waiting cannot fix: a rejected key, an unknown model, a certificate that does not
+#: verify (set SSL_CERT_FILE or fix the proxy; connectivity coming back changes nothing).
+PERMANENT_REASONS = frozenset({"auth", "bad_request", "ssl_cert"})
 
 
 class TurnCancelled(K3CodeError):
@@ -87,6 +90,8 @@ class RetryConfig:
     max_wait: float | None = None
     #: Sleep granularity while waiting (keeps waits cancel-aware).
     poll_interval: float = 0.5
+    #: Unattended runs only: parks on a transient exhaustion (server, timeout, network, unknown) before giving up.
+    max_unattended_parks: int = 6
 
 
 class _RetryAfterObserver:
@@ -133,6 +138,9 @@ class PersistentRetry:
         self.router = router
         self.netwatch = netwatch
         self.config = config or RetryConfig()
+        #: Set per turn (Reliability.set_unattended): an unattended run parks, not fails, on transient exhaustion.
+        self.unattended = False
+        self._unattended_parks = 0
         self.events = events or EventEmitter()
         self.cancel_token = cancel_token or CancelToken()
         self._sleep = sleep or asyncio.sleep
@@ -158,6 +166,7 @@ class PersistentRetry:
         # Every call starts a fresh ladder: the instance lives as long as the session, and a ladder that only ever
         # climbed made every later blip park the full 10 minutes (and reused a stale hour-long Retry-After).
         self._park_step = 0
+        self._unattended_parks = 0
         self._last_retry_after = None
         deadline = None if self.config.max_wait is None else self._monotonic() + self.config.max_wait
         while True:
@@ -219,6 +228,14 @@ class PersistentRetry:
                 else f"{exc.last_reason}"
             )
             await self._park(detail, deadline, delay=retry_after)
+            return True
+        if (
+            self.unattended
+            and exc.last_reason in UNATTENDED_PARK_REASONS
+            and self._unattended_parks < self.config.max_unattended_parks
+        ):
+            self._unattended_parks += 1  # no answer from the providers: an unattended run waits on the ladder
+            await self._park(f"providers unavailable ({exc.last_reason}); unattended run waits", deadline)
             return True
         return False  # auth, bad_request, ... : not transient, let it propagate
 

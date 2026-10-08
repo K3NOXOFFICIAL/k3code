@@ -62,3 +62,32 @@ async def test_cancelled_merge_leaves_the_checkout_clean(tmp_path):
         await task
     assert not await wt.merge_in_progress(repo)
     assert not (repo / "x.txt").exists()
+
+
+async def test_concurrent_creates_on_one_repo_both_succeed(tmp_path, monkeypatch):
+    """Parallel `git worktree add` calls raced on .git/worktrees ("failed to read .../commondir"): a second add read
+    a sibling's half-written admin dir. Adds on one repo must run one at a time; the window is widened so the
+    overlap is deterministic without the lock."""
+    repo = git_repo(tmp_path / "repo")
+    real_git = wt.git
+    running = peak = 0
+
+    async def tracked(cwd, *args, timeout=60):
+        nonlocal running, peak
+        if args[:2] != ("worktree", "add"):
+            return await real_git(cwd, *args, timeout=timeout)
+        running += 1
+        peak = max(peak, running)
+        try:
+            await asyncio.sleep(0.02)
+            return await real_git(cwd, *args, timeout=timeout)
+        finally:
+            running -= 1
+
+    monkeypatch.setattr(wt, "git", tracked)
+    made = await asyncio.gather(*(wt.create(repo, f"sa-{i}") for i in range(4)))
+    monkeypatch.setattr(wt, "git", real_git)
+    assert all(w is not None for w in made) and peak == 1
+    listed = sh(repo, "worktree", "list", "--porcelain")
+    for w in made:
+        assert w.path.is_dir() and f"worktree {w.path.resolve()}" in listed

@@ -1,10 +1,13 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { createSelectionState } from '../selection.js'
-import { getTerminalFocusState, resetTerminalFocusState } from '../terminal-focus-state.js'
-import { FOCUS_IN, FOCUS_OUT } from '../termio/csi.js'
+import { createSelectionState } from "../selection.js";
+import {
+  getTerminalFocusState,
+  resetTerminalFocusState,
+} from "../terminal-focus-state.js";
+import { FOCUS_IN, FOCUS_OUT } from "../termio/csi.js";
 
-import App from './App.js'
+import App from "./App.js";
 
 function makeApp(onTerminalFocusChange = vi.fn()) {
   const stdin = {
@@ -16,8 +19,8 @@ function makeApp(onTerminalFocusChange = vi.fn()) {
     setEncoding: vi.fn(),
     setRawMode: vi.fn(),
     addListener: vi.fn(),
-    removeListener: vi.fn()
-  } as unknown as NodeJS.ReadStream
+    removeListener: vi.fn(),
+  } as unknown as NodeJS.ReadStream;
 
   const stdout = {
     isTTY: true,
@@ -25,8 +28,8 @@ function makeApp(onTerminalFocusChange = vi.fn()) {
     rows: 24,
     write: vi.fn(),
     on: vi.fn(),
-    off: vi.fn()
-  } as unknown as NodeJS.WriteStream
+    off: vi.fn(),
+  } as unknown as NodeJS.WriteStream;
 
   return new App({
     children: null,
@@ -50,26 +53,26 @@ function makeApp(onTerminalFocusChange = vi.fn()) {
     stdin,
     stdout,
     terminalColumns: 80,
-    terminalRows: 24
-  })
+    terminalRows: 24,
+  });
 }
 
-describe('App terminal focus events', () => {
+describe("App terminal focus events", () => {
   beforeEach(() => {
-    resetTerminalFocusState()
-  })
+    resetTerminalFocusState();
+  });
 
-  it('notifies the renderer on DECSET 1004 focus transitions', () => {
-    const onTerminalFocusChange = vi.fn()
-    const app = makeApp(onTerminalFocusChange)
+  it("notifies the renderer on DECSET 1004 focus transitions", () => {
+    const onTerminalFocusChange = vi.fn();
+    const app = makeApp(onTerminalFocusChange);
 
-    app.processInput(FOCUS_OUT)
-    expect(getTerminalFocusState()).toBe('blurred')
-    expect(onTerminalFocusChange).toHaveBeenLastCalledWith(false)
+    app.processInput(FOCUS_OUT);
+    expect(getTerminalFocusState()).toBe("blurred");
+    expect(onTerminalFocusChange).toHaveBeenLastCalledWith(false);
 
-    app.processInput(FOCUS_IN)
-    expect(getTerminalFocusState()).toBe('focused')
-    expect(onTerminalFocusChange).toHaveBeenLastCalledWith(true)
-    expect(onTerminalFocusChange).toHaveBeenCalledTimes(2)
-  })
-})
+    app.processInput(FOCUS_IN);
+    expect(getTerminalFocusState()).toBe("focused");
+    expect(onTerminalFocusChange).toHaveBeenLastCalledWith(true);
+    expect(onTerminalFocusChange).toHaveBeenCalledTimes(2);
+  });
+});

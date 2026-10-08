@@ -16,6 +16,10 @@ from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec, mes
 _TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=15.0)
 
 
+#: Anthropic reports cache reads and cache writes apart from input_tokens; they are prompt tokens too.
+_INPUT_USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+
+
 class AnthropicProvider(Provider):
     """Talks to the Anthropic messages API (also most Claude-compatible relays)."""
 
@@ -137,7 +141,9 @@ class AnthropicProvider(Provider):
                 elif etype == "message_start":
                     message = event.get("message") or {}
                     usage = message.get("usage") or {}
-                    usage_in = int(usage.get("input_tokens") or 0)
+                    # prompt tokens = every input token the model read, cache hits and cache writes included, the same
+                    # definition as the claude-cli provider and the OpenAI-compatible one (whose count already has them)
+                    usage_in = sum(int(usage.get(k) or 0) for k in _INPUT_USAGE_KEYS)
                 elif etype == "message_delta":
                     usage = event.get("usage") or {}
                     usage_out = int(usage.get("output_tokens") or 0)

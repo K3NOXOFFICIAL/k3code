@@ -108,8 +108,8 @@ func checkTranscript(file, id string, t *Transcript) error {
 // layout and belongs in reviewed code. It was checked against the 39 project
 // directories on the author's machine: every one is the absolute path with "/"
 // replaced by "-", including a nested case that proves the replacement is
-// literal and not a normalisation ("/tmp/claude-1000/-home-gaurav-.../work"
-// becomes "-tmp-claude-1000--home-gaurav-...-work", keeping the doubled dash).
+// literal and not a normalisation ("/tmp/claude-1000/-home-user-.../work"
+// becomes "-tmp-claude-1000--home-user-...-work", keeping the doubled dash).
 func (t Transcript) ExpandDir(cwd string) string {
 	if !t.Enabled() || cwd == "" {
 		return ""

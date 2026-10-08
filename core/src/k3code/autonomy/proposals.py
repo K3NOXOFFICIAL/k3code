@@ -94,16 +94,34 @@ class ProposalStore:
     def get(self, pid: str) -> Proposal | None:
         return next((p for p in self.all() if p.id == pid), None)
 
-    def add(self, kind: str, text: str, action: str, session: str = "", *, payload: dict[str, Any] | None = None,
-            project: str = "", key: str | None = None) -> Proposal | None:
+    def add(
+        self,
+        kind: str,
+        text: str,
+        action: str,
+        session: str = "",
+        *,
+        payload: dict[str, Any] | None = None,
+        project: str = "",
+        key: str | None = None,
+    ) -> Proposal | None:
         """Store a new proposal; None when its dedup key was seen before (pending, accepted or dismissed)."""
         existing = self.all()
         key = key or dedup_key(kind, text)
         if any(p.key == key for p in existing):
             return None
         n = max([len(existing), *(int(x.id[1:]) for x in existing if x.id[1:].isdigit())])  # skipped lines keep ids
-        p = Proposal(id=f"p{n + 1}", kind=kind, text=text, action=action, key=key,
-                     session=session, ts=time.time(), payload=payload or {}, project=project)
+        p = Proposal(
+            id=f"p{n + 1}",
+            kind=kind,
+            text=text,
+            action=action,
+            key=key,
+            session=session,
+            ts=time.time(),
+            payload=payload or {},
+            project=project,
+        )
         self._write(p)
         return p
 
@@ -116,8 +134,16 @@ class ProposalStore:
         return p
 
 
-async def propose(caller: Any, store: ProposalStore, context: str, *, session_id: str = "",
-                  ranker: Any = None, preferences: list[str] | None = None, project: str = "") -> list[Proposal]:
+async def propose(
+    caller: Any,
+    store: ProposalStore,
+    context: str,
+    *,
+    session_id: str = "",
+    ranker: Any = None,
+    preferences: list[str] | None = None,
+    project: str = "",
+) -> list[Proposal]:
     """Run the proposer on ``context`` and return the newly stored proposals (never raises).
 
     ``ranker(items) -> items`` (M5) orders/filters suggestions from decision history; ``preferences`` are the
@@ -126,7 +152,8 @@ async def propose(caller: Any, store: ProposalStore, context: str, *, session_id
     system = PROPOSER_SYSTEM
     if preferences:
         system += "\nLearned user preferences (bias suggestions toward these):\n" + "\n".join(
-            f"- {p}" for p in preferences[:5])
+            f"- {p}" for p in preferences[:5]
+        )
     try:
         res = await caller.complete(
             TaskKind.CLASSIFICATION,

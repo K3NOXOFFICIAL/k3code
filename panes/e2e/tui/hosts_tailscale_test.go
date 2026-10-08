@@ -138,7 +138,7 @@ case "$addr" in
       n=0
       while [ ! -e "$state/approved-$id" ] && [ ! -e "$state/signedin" ]; do
         n=$((n+1))
-        if [ $n -gt $limit ]; then echo "Connection to 192.0.2.1 port 22 closed by remote host." >&2; exit 255; fi
+        if [ $n -gt $limit ]; then echo "Connection to 192.0.2.9 port 22 closed by remote host." >&2; exit 255; fi
         sleep 0.1
       done
       printf '# Authentication checked with Tailscale SSH.\r\n' >&2

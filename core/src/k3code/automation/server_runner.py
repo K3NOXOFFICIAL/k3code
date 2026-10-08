@@ -16,7 +16,13 @@ from k3code.routing.tiers import TaskKind
 if TYPE_CHECKING:
     from k3code.gateway.server import GatewayServer
 
-_STATUS = {"done": "completed", "error": "failed", "needs_input": "needs_input", "interrupted": "interrupted"}
+_STATUS = {
+    "done": "completed",
+    "error": "failed",
+    "needs_input": "blocked",  # waiting for a human: never reported as completed or silently stopped
+    "interrupted": "interrupted",
+    "halted": "interrupted",  # /daemon pause stopped the run: it is not a failure
+}
 KEEP_FINISHED_RUNS = 20  # finished unattended sessions kept live (visible in the strip)
 BUSY_POLL_S = 1.0
 SHELL_TIMEOUT_S = 600.0
@@ -84,6 +90,8 @@ class ServerRunner:
         kind: str = "background_turn",
     ) -> RunResult:
         srv = self.server
+        if getattr(srv, "halted", False):  # /daemon pause: catch-all for every unattended start
+            return RunResult(status="interrupted", error="daemon halted (/daemon pause)")
         if srv.background_paused:
             return RunResult(
                 status="failed", error="background work is paused (restart-storm safe mode)", failure_kind="other"
@@ -173,7 +181,7 @@ class ServerRunner:
                     await old.reliability.stop()
 
     async def run_shell(self, command: str, cwd: str) -> tuple[int, str]:
-        """Run a shell command inside the bwrap sandbox (unsandboxed with a note when bwrap is unusable)."""
+        """Run a shell command inside the bwrap sandbox. Unattended, so it fails closed when bwrap is unusable."""
         from k3code.reliability import sandbox
         from k3code.tools import tool_bash
 
@@ -183,12 +191,14 @@ class ServerRunner:
         workdir, err = _default_cwd(cwd)
         if err:
             return 1, err
-        # usable() spawns bwrap (up to 10 s on first use): keep it off the event loop
-        argv = sandbox.build_argv(workdir) if await asyncio.to_thread(sandbox.usable) else None
+        try:
+            # usable() spawns bwrap (up to 10 s on first use): unattended_prefix runs off the event loop
+            argv = await asyncio.to_thread(sandbox.unattended_prefix, workdir)
+        except sandbox.SandboxRefused as exc:
+            return 126, f"refused: {exc}"
         res = await tool_bash({"command": command, "timeout": SHELL_TIMEOUT_S}, cwd=Path(workdir), sandbox=argv)
         out = (res.get("stdout") or "") + (res.get("stderr") or "") + (res.get("error") or "")
-        note = "" if argv else "\n[note: bwrap unavailable, ran unsandboxed]"
-        return int(res.get("exit_code") if res.get("exit_code") is not None else 1), out.strip() + note
+        return int(res.get("exit_code") if res.get("exit_code") is not None else 1), out.strip()
 
     async def start_goal(self, objective: str, session_id: str | None, cwd: str) -> RunResult:
         """Create (or reuse) a session, set a /goal on it and let the goal loop drive it."""

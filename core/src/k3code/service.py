@@ -9,7 +9,18 @@ import subprocess
 import sys
 from pathlib import Path
 
+from k3code import daemon
+
 UNIT_NAME = "k3code.service"
+RECOVER_UNIT_NAME = "k3code-recover.service"
+
+#: systemd's start budget is aligned with the daemon's own restart-storm guard: the guard enters safe mode on the
+#: start that exceeds RESTART_LIMIT within RESTART_WINDOW_S, and systemd gives up one start later, so safe mode is
+#: already in place when systemd stops restarting the daemon.
+START_LIMIT_INTERVAL_S = int(daemon.RESTART_WINDOW_S)
+START_LIMIT_BURST = daemon.RESTART_LIMIT + 1
+#: After systemd gave up (start limit hit), the recovery unit waits this long, then starts the daemon again.
+RECOVER_COOLDOWN_S = 1800
 
 #: Canonical unit text; ``install/systemd/k3code.service`` is this with the default ExecStart.
 UNIT_TEMPLATE = """\
@@ -17,8 +28,9 @@ UNIT_TEMPLATE = """\
 Description=k3code daemon (keeps coding-agent sessions running 24/7)
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=600
-StartLimitBurst=20
+StartLimitIntervalSec={start_interval}
+StartLimitBurst={start_burst}
+OnFailure={recover_unit}
 
 [Service]
 Type=notify
@@ -38,6 +50,17 @@ EnvironmentFile=-%h/.config/k3code/env
 WantedBy=default.target
 """
 
+#: Runs when systemd gave up on the daemon: a cooldown, then reset the failed state and start it again.
+RECOVER_TEMPLATE = """\
+[Unit]
+Description=Recover the k3code daemon after systemd stopped restarting it (start limit hit)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=/bin/sh -c 'sleep {cooldown} && systemctl --user reset-failed {unit} && systemctl --user start {unit}'
+"""
+
 DEFAULT_EXEC_START = "%h/.local/bin/k3code daemon"
 
 
@@ -50,7 +73,16 @@ def default_exec_start() -> str:
 
 
 def render_unit(exec_start: str | None = None) -> str:
-    return UNIT_TEMPLATE.format(exec_start=exec_start or default_exec_start())
+    return UNIT_TEMPLATE.format(
+        exec_start=exec_start or default_exec_start(),
+        start_interval=START_LIMIT_INTERVAL_S,
+        start_burst=START_LIMIT_BURST,
+        recover_unit=RECOVER_UNIT_NAME,
+    )
+
+
+def render_recover_unit() -> str:
+    return RECOVER_TEMPLATE.format(cooldown=RECOVER_COOLDOWN_S, unit=UNIT_NAME)
 
 
 def unit_dir() -> Path:
@@ -62,6 +94,10 @@ def unit_path() -> Path:
     return unit_dir() / UNIT_NAME
 
 
+def recover_unit_path() -> Path:
+    return unit_dir() / RECOVER_UNIT_NAME
+
+
 def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, check=False)
 
@@ -70,8 +106,10 @@ def install(dry_run: bool = False) -> list[str]:
     """Write the unit, reload, enable --now. Returns the lines describing (or reporting) each step."""
     unit = render_unit()
     path = unit_path()
+    recover = recover_unit_path()
     steps = [
         f"write {path}",
+        f"write {recover}",
         "systemctl --user daemon-reload",
         f"systemctl --user enable --now {UNIT_NAME}",
     ]
@@ -83,7 +121,8 @@ def install(dry_run: bool = False) -> list[str]:
         return ["[dry-run] would:", *(f"  - {s}" for s in steps), "[dry-run] unit file:", unit, advice]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(unit)
-    out = [f"wrote {path}"]
+    recover.write_text(render_recover_unit())
+    out = [f"wrote {path}", f"wrote {recover}"]
     for args in (("daemon-reload",), ("enable", "--now", UNIT_NAME)):
         r = _systemctl(*args)
         out.append(
@@ -95,7 +134,12 @@ def install(dry_run: bool = False) -> list[str]:
 
 def uninstall(dry_run: bool = False) -> list[str]:
     path = unit_path()
-    steps = [f"systemctl --user disable --now {UNIT_NAME}", f"remove {path}", "systemctl --user daemon-reload"]
+    steps = [
+        f"systemctl --user disable --now {UNIT_NAME}",
+        f"remove {path}",
+        f"remove {recover_unit_path()}",
+        "systemctl --user daemon-reload",
+    ]
     if dry_run:
         return ["[dry-run] would:", *(f"  - {s}" for s in steps)]
     out = []
@@ -104,6 +148,9 @@ def uninstall(dry_run: bool = False) -> list[str]:
     if path.exists():
         path.unlink()
         out.append(f"removed {path}")
+    if recover_unit_path().exists():
+        recover_unit_path().unlink()
+        out.append(f"removed {recover_unit_path()}")
     _systemctl("daemon-reload")
     return out
 

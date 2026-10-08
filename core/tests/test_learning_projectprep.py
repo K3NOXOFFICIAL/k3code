@@ -16,14 +16,25 @@ def make(tmp_path, files: dict[str, str]):
 
 
 MATRIX = [
-    ("python-uv", {"pyproject.toml": "[project]\nname='a'\n[tool.ruff]\n[build-system]\nrequires=[]\n", "uv.lock": ""},
-     dict(language="python", package_manager="uv", test="uv run pytest", lint="uv run ruff check .")),
-    ("node-npm", {"package.json": json.dumps({"scripts": {"test": "jest", "lint": "eslint .", "build": "tsc"}}),
-                  "package-lock.json": "{}"},
-     dict(language="javascript", package_manager="npm", test="npm test", lint="npm run lint", build="npm run build")),
+    (
+        "python-uv",
+        {"pyproject.toml": "[project]\nname='a'\n[tool.ruff]\n[build-system]\nrequires=[]\n", "uv.lock": ""},
+        dict(language="python", package_manager="uv", test="uv run pytest", lint="uv run ruff check ."),
+    ),
+    (
+        "node-npm",
+        {
+            "package.json": json.dumps({"scripts": {"test": "jest", "lint": "eslint .", "build": "tsc"}}),
+            "package-lock.json": "{}",
+        },
+        dict(language="javascript", package_manager="npm", test="npm test", lint="npm run lint", build="npm run build"),
+    ),
     ("go", {"go.mod": "module x\n"}, dict(language="go", test="go test ./...", build="go build ./...")),
-    ("rust", {"Cargo.toml": "[workspace]\nmembers=[]\n"},
-     dict(language="rust", package_manager="cargo", test="cargo test", monorepo=True)),
+    (
+        "rust",
+        {"Cargo.toml": "[workspace]\nmembers=[]\n"},
+        dict(language="rust", package_manager="cargo", test="cargo test", monorepo=True),
+    ),
 ]
 
 
@@ -35,8 +46,10 @@ def test_detection_matrix(tmp_path, name, files, expect):
 
 
 def test_detects_ci_docker_monorepo(tmp_path):
-    make(tmp_path, {"package.json": '{"workspaces": ["a"]}', ".github/workflows/ci.yml": "on: push",
-                    "Dockerfile": "FROM x"})
+    make(
+        tmp_path,
+        {"package.json": '{"workspaces": ["a"]}', ".github/workflows/ci.yml": "on: push", "Dockerfile": "FROM x"},
+    )
     info = projectprep.detect(tmp_path)
     assert info["ci"] == "github-actions" and info["docker"] and info["monorepo"]
 
@@ -45,10 +58,10 @@ async def test_prepare_writes_only_project_json_until_accepted(tmp_path):
     make(tmp_path, {"package.json": json.dumps({"scripts": {"test": "jest"}}), "src/a.js": "x"})
     store = ProposalStore(tmp_path / "home")
     clock = FakeClock()
-    props = await projectprep.prepare(tmp_path, store=store, caller=FakeCaller("# Notes\nRun npm test please\n"),
-                                      clock=clock)
-    written = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")
-                     if p.is_file() and ".k3code" in p.parts)
+    props = await projectprep.prepare(
+        tmp_path, store=store, caller=FakeCaller("# Notes\nRun npm test please\n"), clock=clock
+    )
+    written = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*") if p.is_file() and ".k3code" in p.parts)
     assert written == [".k3code/project.json"]
     assert not (tmp_path / "K3CODE.md").exists() and not (tmp_path / ".k3code" / "config.yaml").exists()
     meta = json.loads((tmp_path / ".k3code" / "project.json").read_text())
@@ -67,8 +80,10 @@ async def test_prepare_writes_only_project_json_until_accepted(tmp_path):
 
 
 async def test_secret_risk_flagged_without_leaking_value(tmp_path):
-    make(tmp_path, {"go.mod": "module x", "main_test.go": "package x", "config.txt": "key=AKIAABCDEFGHIJKLMNOP",
-                    ".env": "A=1"})
+    make(
+        tmp_path,
+        {"go.mod": "module x", "main_test.go": "package x", "config.txt": "key=AKIAABCDEFGHIJKLMNOP", ".env": "A=1"},
+    )
     store = ProposalStore(tmp_path / "home")
     props = await projectprep.prepare(tmp_path, store=store)
     risk = [p for p in props if p.payload["op"] == "ack"][0].text

@@ -22,7 +22,13 @@ ANSWERS = {
     "usage": {"primary": "ops", "languages": [], "frameworks": []},
     "providers": {
         "entries": [
-            {"preset": "omniroute", "name": "gw", "base_url": "http://127.0.0.1:9/v1", "api_key": "sk-SECRET-1"},
+            {
+                "preset": "omniroute",
+                "name": "gw",
+                "base_url": "http://127.0.0.1:9/v1",
+                "api_key_env": "OMNIROUTE_API_KEY",
+                "api_key": "sk-SECRET-1",
+            },
             {"preset": "anthropic", "api_key": "sk-ant-SECRET-2"},
         ],
         "test": False,
@@ -140,7 +146,7 @@ def test_env_file_accepts_export_and_quoted_values(env: Path) -> None:
     """`export KEY="value"` (the shell form people paste) was read as key `export KEY` with the quotes kept."""
     p = st.env_file_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("export A_KEY=\"sk-1\"\nB_KEY='sk 2'\nC_KEY=\"half\nexport D_KEY=plain\n")
+    p.write_text('export A_KEY="sk-1"\nB_KEY=\'sk 2\'\nC_KEY="half\nexport D_KEY=plain\n')
     assert st.read_env_file(p) == {"A_KEY": "sk-1", "B_KEY": "sk 2", "C_KEY": '"half', "D_KEY": "plain"}
     st.set_env_var("A_KEY", "sk-3")  # replaces the export line instead of adding a second A_KEY
     assert p.read_text().count("A_KEY") == 1 and st.read_env_file(p)["A_KEY"] == "sk-3"
@@ -200,3 +206,120 @@ def test_secrets_step_asks_only_for_missing(env: Path) -> None:
     run_setup(AnswerPrompter({"secrets": {"NEED_KEY": "sk-NEW", "HAVE_KEY": "ignored"}}), only_step="secrets")
     assert st.read_env_file() == {"HAVE_KEY": "already", "NEED_KEY": "sk-NEW"}
     assert stat.S_IMODE(st.env_file_path().stat().st_mode) == 0o600
+
+
+def test_sandbox_state_reports_each_case_and_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.reliability import sandbox
+    from k3code.setup import detect
+
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: None)
+    assert detect.sandbox_state() == "missing"
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    assert detect.sandbox_state() == "unusable"
+    assert detect.sandbox_state(probe=False) == "unknown"
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    assert detect.detect()["sandbox"] == "usable"
+
+    def boom() -> bool:
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(sandbox, "usable", boom)
+    assert detect.sandbox_state() == "unknown"  # the wizard step goes on
+
+
+_FAKE_KEY = "fake-mcp-key-for-tests-0001"  # a placeholder, never a real credential
+
+
+def _integrations(answers: dict[str, object]) -> dict[str, object]:
+    from k3code.setup import steps
+
+    ctx = steps.Ctx(p=AnswerPrompter(answers), data={}, do_probe=False)
+    return steps.step_integrations(ctx)
+
+
+def test_no_mcp_server_is_added_by_default(env: Path) -> None:
+    assert _integrations({})["mcp"] == {}
+
+
+def test_hand_written_mcp_server_is_kept(env: Path) -> None:
+    out = _integrations({"integrations": {"mcp": [{"name": "docs", "url": "https://mcp.example.com/mcp"}]}})
+    assert out["mcp"] == {"docs": {"url": "https://mcp.example.com/mcp"}}
+
+
+def test_bearer_is_read_when_connecting(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.config import McpServerConfig
+    from k3code.mcpclient import request_headers
+
+    cfg = McpServerConfig(url="https://mcp.example.com/mcp", bearer_env="EXAMPLE_MCP_KEY")
+    monkeypatch.setenv("EXAMPLE_MCP_KEY", _FAKE_KEY)
+    assert request_headers(cfg) == {"Authorization": f"Bearer {_FAKE_KEY}"}
+    monkeypatch.delenv("EXAMPLE_MCP_KEY")
+    assert request_headers(cfg) == {}  # unset: no header, and never the literal variable name
+
+
+def test_provider_default_is_claude_login_when_claude_is_installed(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.setup import probe, steps
+
+    assert "omniroute" not in probe.PRESETS and "omniroute" not in steps.PRESET_CHOICES
+    monkeypatch.setattr(steps.shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+    assert steps.default_preset() == "claude-cli"
+    ctx = steps.Ctx(p=AnswerPrompter({}), data={}, do_probe=False)
+    assert steps._entry_from(ctx, 0, "primary", None) == {"name": "claude-cli", "kind": "claude-cli"}
+
+
+def test_provider_default_without_claude_asks_for_a_custom_endpoint(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.setup import steps
+
+    monkeypatch.setattr(steps.shutil, "which", lambda name: None)
+    assert steps.default_preset() == "custom"
+    ctx = steps.Ctx(p=AnswerPrompter({}), data={}, do_probe=False)
+    assert steps._entry_from(ctx, 0, "primary", None) is None  # no default URL: nothing is invented
+
+
+def test_wizard_searxng_answer_reaches_the_research_setting(env: Path) -> None:
+    """The integrations answer used to land under a top-level ``searxng`` key that Settings dropped."""
+    from k3code import confio
+    from k3code.config import load_config
+    from k3code.paths import user_config_path
+
+    run_setup(
+        AnswerPrompter({**ANSWERS, "integrations": {**ANSWERS["integrations"], "searxng_url": "http://searx.test"}}),
+        do_probe=False,
+    )
+    assert "searxng" not in confio.read_yaml(user_config_path())
+    assert load_config().research["searxng_url"] == "http://searx.test"
+
+    # a re-run of only the integrations step keeps the user's other research keys and can clear the URL
+    confio.write_yaml(
+        user_config_path(),
+        {
+            **confio.read_yaml(user_config_path()),
+            "research": {"searxng_url": "http://searx.test", "max_subquestions": 3},
+        },
+    )
+    run_setup(
+        AnswerPrompter({**ANSWERS, "integrations": {**ANSWERS["integrations"], "searxng_url": "http://new.test"}}),
+        only_step="integrations",
+        do_probe=False,
+    )
+    assert load_config().research == {"searxng_url": "http://new.test", "max_subquestions": 3}
+    run_setup(
+        AnswerPrompter({**ANSWERS, "integrations": {**ANSWERS["integrations"], "searxng_url": ""}}),
+        only_step="integrations",
+        do_probe=False,
+    )
+    assert load_config().research == {"max_subquestions": 3}
+
+
+def test_legacy_top_level_searxng_key_is_lifted_on_load(env: Path) -> None:
+    from k3code import confio
+    from k3code.config import load_config
+    from k3code.paths import user_config_path
+
+    confio.write_yaml(user_config_path(), {"searxng": {"url": "http://old.test"}})
+    assert load_config().research["searxng_url"] == "http://old.test"
+    confio.write_yaml(
+        user_config_path(), {"searxng": {"url": "http://old.test"}, "research": {"searxng_url": "http://new.test"}}
+    )
+    assert load_config().research["searxng_url"] == "http://new.test"

@@ -167,8 +167,12 @@ def test_bash_does_not_read_the_gateways_stdin(temp_dir):
         "print(repr(r['stdout']))\n"
     )
     out = subprocess.run(
-        [sys.executable, "-c", script, str(temp_dir)], input='{"jsonrpc":"2.0","method":"x"}\n',
-        capture_output=True, text=True, timeout=30, check=True,
+        [sys.executable, "-c", script, str(temp_dir)],
+        input='{"jsonrpc":"2.0","method":"x"}\n',
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
     )
     assert out.stdout.strip() == "''"
 
@@ -184,6 +188,13 @@ async def test_grep_no_matches(temp_dir):
     (temp_dir / "a.py").write_text("x = 1\n")
     result = await tool_grep({"pattern": "def foo", "path": "."}, cwd=temp_dir)
     assert result["matches"] == ""
+
+
+async def test_grep_pattern_that_looks_like_a_flag_is_searched_as_text(temp_dir):
+    # Without -e/--, rg reads "--files" as its own option and lists file names instead of matching the line.
+    (temp_dir / "notes.txt").write_text("the flag --files is literal here\n")
+    result = await tool_grep({"pattern": "--files", "path": "."}, cwd=temp_dir)
+    assert "notes.txt:1:the flag --files is literal here" in result["matches"]
 
 
 async def test_glob_finds(temp_dir):

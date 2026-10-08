@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-KINDS = ("approval", "model_switch", "proposal", "plan", "interrupt", "undo", "scope", "config")
+KINDS = ("approval", "model_switch", "proposal", "plan", "interrupt", "undo", "scope", "config", "auto_apply")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -29,8 +29,10 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE INDEX IF NOT EXISTS decisions_kind ON decisions(kind, project);
 """
 
-_SECRET = re.compile(r"(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{12,}|Bearer\s+\S+|"
-                     r"(?i:(?:api[_-]?key|token|secret|password)\s*[=:]\s*\S+))")
+_SECRET = re.compile(
+    r"(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{12,}|Bearer\s+\S+|"
+    r"(?i:(?:api[_-]?key|token|secret|password)\s*[=:]\s*\S+))"
+)
 
 
 def scrub(text: str) -> str:
@@ -52,8 +54,13 @@ def project_id(cwd: str | Path) -> str:
     """Stable id for a project: the git remote URL when there is one, else a hash of the path."""
     p = Path(cwd)
     try:
-        out = subprocess.run(["git", "-C", str(p), "config", "--get", "remote.origin.url"],
-                             capture_output=True, text=True, timeout=3, check=False)
+        out = subprocess.run(
+            ["git", "-C", str(p), "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
         url = out.stdout.strip()
     except (OSError, subprocess.SubprocessError):
         url = ""
@@ -86,24 +93,48 @@ class DecisionLog:
             self._pid_cache[cwd] = project_id(cwd)
         return self._pid_cache[cwd]
 
-    def record(self, kind: str, *, session: str = "", cwd: str = "", subject: str = "", choice: str = "",
-               detail: dict[str, Any] | None = None, ts: float | None = None, project: str | None = None,
-               actor: str = "user") -> int:
+    def record(
+        self,
+        kind: str,
+        *,
+        session: str = "",
+        cwd: str = "",
+        subject: str = "",
+        choice: str = "",
+        detail: dict[str, Any] | None = None,
+        ts: float | None = None,
+        project: str | None = None,
+        actor: str = "user",
+    ) -> int:
         """``actor``: ``user`` (a human decided) or ``auto`` (unattended pre-approval); miners read only users."""
         if kind not in KINDS:
             raise ValueError(f"unknown decision kind: {kind}")
         clean = _scrub_obj({**(detail or {}), "actor": actor})
         cur = self._db.execute(
             "INSERT INTO decisions (ts, kind, session, cwd, project, subject, choice, detail) VALUES (?,?,?,?,?,?,?,?)",
-            (self.clock() if ts is None else ts, kind, session, cwd,
-             project if project is not None else self._project(cwd),
-             scrub(subject), choice, json.dumps(clean, ensure_ascii=False)),
+            (
+                self.clock() if ts is None else ts,
+                kind,
+                session,
+                cwd,
+                project if project is not None else self._project(cwd),
+                scrub(subject),
+                choice,
+                json.dumps(clean, ensure_ascii=False),
+            ),
         )
         self._db.commit()
         return int(cur.lastrowid or 0)
 
-    def query(self, kind: str | None = None, *, project: str | None = None, since: float | None = None,
-              limit: int | None = None, actor: str | None = "user") -> list[dict[str, Any]]:
+    def query(
+        self,
+        kind: str | None = None,
+        *,
+        project: str | None = None,
+        since: float | None = None,
+        limit: int | None = None,
+        actor: str | None = "user",
+    ) -> list[dict[str, Any]]:
         """Rows are filtered to ``actor`` (default ``user``; ``None`` = every actor)."""
         sql, args = "SELECT * FROM decisions WHERE 1=1", []
         if kind:
@@ -144,9 +175,15 @@ class DecisionLog:
             except ValueError:
                 continue
             kind = "plan" if row.get("tool") == "exit_plan" else "approval"
-            self.record(kind, session=row.get("session", ""), cwd=row.get("cwd", ""),
-                        subject=row.get("pattern", ""), choice=row.get("choice", ""),
-                        detail={"tool": row.get("tool", ""), "migrated": True}, ts=float(row.get("ts") or 0))
+            self.record(
+                kind,
+                session=row.get("session", ""),
+                cwd=row.get("cwd", ""),
+                subject=row.get("pattern", ""),
+                choice=row.get("choice", ""),
+                detail={"tool": row.get("tool", ""), "migrated": True},
+                ts=float(row.get("ts") or 0),
+            )
             n += 1
         src.rename(src.with_suffix(".jsonl.migrated"))
         return n

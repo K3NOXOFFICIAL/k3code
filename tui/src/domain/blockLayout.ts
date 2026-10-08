@@ -1,6 +1,6 @@
-import type { DetailsMode, Msg, SectionVisibility } from '../types.js'
+import type { DetailsMode, Msg, SectionVisibility } from "../types.js";
 
-import { sectionMode } from './details.js'
+import { sectionMode } from "./details.js";
 
 /**
  * Visual group a transcript block belongs to. Blocks in the same group render
@@ -17,49 +17,59 @@ import { sectionMode } from './details.js'
  *   slash  — slash-command echoes (owns its margin)
  *   intro  — banner / panels (rendered out-of-band, never gapped here)
  */
-export type BlockGroup = 'diff' | 'event' | 'intro' | 'model' | 'note' | 'slash' | 'trail' | 'user'
+export type BlockGroup =
+  "diff" | "event" | "intro" | "model" | "note" | "slash" | "trail" | "user";
 
-export const messageGroup = (msg: Pick<Msg, 'kind' | 'role'>): BlockGroup => {
+export const messageGroup = (msg: Pick<Msg, "kind" | "role">): BlockGroup => {
   switch (msg.kind) {
-    case 'intro':
+    case "intro":
+    case "panel":
+      return "intro";
 
-    case 'panel':
-      return 'intro'
+    case "slash":
+      return "slash";
 
-    case 'slash':
-      return 'slash'
+    case "event":
+      return "event";
 
-    case 'event':
-      return 'event'
+    case "diff":
+      return "diff";
 
-    case 'diff':
-      return 'diff'
-
-    case 'trail':
-      return 'trail'
+    case "trail":
+      return "trail";
   }
 
-  if (msg.role === 'user') {
-    return 'user'
+  if (msg.role === "user") {
+    return "user";
   }
 
   // Assistant prose is the model's voice; system notes/errors are their own
   // band. (No runtime block uses role 'tool' — tool *results* fold into
   // trails — so a stray 'tool' falls through to the note band harmlessly.)
-  return msg.role === 'assistant' ? 'model' : 'note'
-}
+  return msg.role === "assistant" ? "model" : "note";
+};
 
 // Groups whose leading gap is already owned by their own chrome in
 // MessageLine (the turn separator + top margin for user, the top margin for
 // slash, the top+bottom margins for diff) or that are painted out-of-band
 // (intro). The grouping primitive only spaces the model working area —
 // model prose, reasoning/tool trails, and notes/errors.
-const SELF_SPACED: ReadonlySet<BlockGroup> = new Set(['diff', 'event', 'intro', 'slash', 'user'])
+const SELF_SPACED: ReadonlySet<BlockGroup> = new Set([
+  "diff",
+  "event",
+  "intro",
+  "slash",
+  "user",
+]);
 
 // Groups that already paint a trailing blank line beneath themselves
 // (marginBottom in MessageLine), so the block that follows must not add its
 // own leading gap or the single boundary would become a double gap.
-const PAINTS_TRAILING_GAP: ReadonlySet<BlockGroup> = new Set(['diff', 'event', 'user'])
+const PAINTS_TRAILING_GAP: ReadonlySet<BlockGroup> = new Set([
+  "diff",
+  "event",
+  "user",
+]);
 
 /**
  * Whether `cur` renders one blank line above it, given the block rendered
@@ -72,32 +82,46 @@ const PAINTS_TRAILING_GAP: ReadonlySet<BlockGroup> = new Set(['diff', 'event', '
  * assistant block therefore computes the same gap while it streams as the
  * settled segment does once it flushes, so the live area never jumps.
  */
-export const hasLeadGap = (prev: Pick<Msg, 'kind' | 'role'> | undefined, cur: Pick<Msg, 'kind' | 'role'>): boolean => {
-  const group = messageGroup(cur)
+export const hasLeadGap = (
+  prev: Pick<Msg, "kind" | "role"> | undefined,
+  cur: Pick<Msg, "kind" | "role">,
+): boolean => {
+  const group = messageGroup(cur);
 
   if (SELF_SPACED.has(group)) {
-    return false
+    return false;
   }
 
   if (!prev) {
-    return false
+    return false;
   }
 
-  const prevGroup = messageGroup(prev)
+  const prevGroup = messageGroup(prev);
 
-  return prevGroup !== group && !PAINTS_TRAILING_GAP.has(prevGroup)
-}
+  return prevGroup !== group && !PAINTS_TRAILING_GAP.has(prevGroup);
+};
 
 export interface DetailsCtx {
-  commandOverride?: boolean
-  detailsMode: DetailsMode
-  sections?: SectionVisibility
+  commandOverride?: boolean;
+  detailsMode: DetailsMode;
+  sections?: SectionVisibility;
 }
 
 const trailAllHidden = (ctx: DetailsCtx): boolean =>
-  sectionMode('thinking', ctx.detailsMode, ctx.sections, ctx.commandOverride) === 'hidden' &&
-  sectionMode('tools', ctx.detailsMode, ctx.sections, ctx.commandOverride) === 'hidden' &&
-  sectionMode('activity', ctx.detailsMode, ctx.sections, ctx.commandOverride) === 'hidden'
+  sectionMode(
+    "thinking",
+    ctx.detailsMode,
+    ctx.sections,
+    ctx.commandOverride,
+  ) === "hidden" &&
+  sectionMode("tools", ctx.detailsMode, ctx.sections, ctx.commandOverride) ===
+    "hidden" &&
+  sectionMode(
+    "activity",
+    ctx.detailsMode,
+    ctx.sections,
+    ctx.commandOverride,
+  ) === "hidden";
 
 /**
  * Whether a settled transcript block paints anything. A trail renders nothing
@@ -111,21 +135,24 @@ const trailAllHidden = (ctx: DetailsCtx): boolean =>
  * default/collapsed modes content-bearing trails always render, so this is a
  * no-op there.
  */
-export const blockRenders = (msg: Pick<Msg, 'kind' | 'thinking' | 'todos' | 'tools'>, ctx: DetailsCtx): boolean => {
-  if (msg.kind !== 'trail') {
-    return true
+export const blockRenders = (
+  msg: Pick<Msg, "kind" | "thinking" | "todos" | "tools">,
+  ctx: DetailsCtx,
+): boolean => {
+  if (msg.kind !== "trail") {
+    return true;
   }
 
   if (msg.todos?.length) {
-    return true
+    return true;
   }
 
   if (!(msg.tools?.length || msg.thinking?.trim())) {
-    return false
+    return false;
   }
 
-  return !trailAllHidden(ctx)
-}
+  return !trailAllHidden(ctx);
+};
 
 /**
  * The nearest block above `index` that actually renders, resolved through a
@@ -136,15 +163,15 @@ export const blockRenders = (msg: Pick<Msg, 'kind' | 'thinking' | 'todos' | 'too
 export const prevRenderedMsg = (
   msgAt: (i: number) => Msg | undefined,
   index: number,
-  ctx: DetailsCtx
+  ctx: DetailsCtx,
 ): Msg | undefined => {
   for (let i = index - 1; i >= 0; i--) {
-    const candidate = msgAt(i)
+    const candidate = msgAt(i);
 
     if (candidate && blockRenders(candidate, ctx)) {
-      return candidate
+      return candidate;
     }
   }
 
-  return undefined
-}
+  return undefined;
+};

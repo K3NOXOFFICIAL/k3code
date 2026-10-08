@@ -5,8 +5,10 @@ from learn_helpers import FakeClock
 
 
 def test_migrates_jsonl_once(tmp_path):
-    rows = [{"session": "s1", "tool": "bash", "pattern": "npm test *", "choice": "once", "cwd": "/x", "ts": 5.0},
-            {"session": "s1", "tool": "exit_plan", "pattern": "*", "choice": "deny", "cwd": "/x", "ts": 6.0}]
+    rows = [
+        {"session": "s1", "tool": "bash", "pattern": "npm test *", "choice": "once", "cwd": "/x", "ts": 5.0},
+        {"session": "s1", "tool": "exit_plan", "pattern": "*", "choice": "deny", "cwd": "/x", "ts": 6.0},
+    ]
     (tmp_path / "decisions.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\nnot json\n")
     log = DecisionLog(tmp_path)
     assert not (tmp_path / "decisions.jsonl").exists() and (tmp_path / "decisions.jsonl.migrated").exists()
@@ -31,6 +33,7 @@ def test_records_every_kind_with_cwd_project_and_ts(tmp_path):
         "undo": dict(subject="config.yaml", choice="config-rollback"),
         "scope": dict(subject="override", choice="small"),
         "config": dict(subject="update-config", choice="apply"),
+        "auto_apply": dict(subject="clip tool results", choice="applied", actor="auto", detail={"experiment": "x1"}),
     }
     assert set(samples) == set(KINDS)
     for kind, kw in samples.items():
@@ -47,8 +50,9 @@ def test_project_id_git_remote_strips_credentials(tmp_path):
     import subprocess
 
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "remote", "add", "origin",
-                    "https://user:tok@github.com/acme/app.git"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin", "https://user:tok@github.com/acme/app.git"], check=True
+    )
     pid = project_id(tmp_path)
     assert pid == "git:github.com/acme/app" and "tok" not in pid
 

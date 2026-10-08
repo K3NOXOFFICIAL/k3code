@@ -24,36 +24,42 @@ k3code (CLI entry)
 ### Key Functions
 
 1. **`resolvePython()`** (line ~180) — Determines the Python interpreter:
+
    ```typescript
-   const configured = process.env.K3CODE_PYTHON?.trim()
-   if (configured) return configured
-   return process.platform === 'win32' ? 'python' : 'python3'
+   const configured = process.env.K3CODE_PYTHON?.trim();
+   if (configured) return configured;
+   return process.platform === "win32" ? "python" : "python3";
    ```
 
 2. **`startSpawnedGateway(root: string)`** (line ~420) — Spawns the gateway child process:
+
    ```typescript
-   this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+   this.proc = spawn(python, ["-m", "tui_gateway.entry"], {
+     cwd,
+     env,
+     stdio: ["pipe", "pipe", "pipe"],
+   });
    ```
 
 3. **`startAttachedGateway(attachUrl: string)`** (line ~490) — Attaches to existing gateway via WebSocket.
 
 4. **`resolveGatewayAttachUrl()`** (line ~160) — Checks for attach mode:
    ```typescript
-   const raw = process.env.K3CODE_TUI_GATEWAY_URL?.trim()
-   return raw ? raw : null
+   const raw = process.env.K3CODE_TUI_GATEWAY_URL?.trim();
+   return raw ? raw : null;
    ```
 
 ### Transport Decision Logic (in `start()`)
 
 ```typescript
-const attachUrl = resolveGatewayAttachUrl()
+const attachUrl = resolveGatewayAttachUrl();
 
 if (attachUrl) {
-  this.startAttachedGateway(attachUrl)  // WebSocket attach mode
-  return
+  this.startAttachedGateway(attachUrl); // WebSocket attach mode
+  return;
 }
 
-this.startSpawnedGateway(root)           // Stdio spawn mode (DEFAULT)
+this.startSpawnedGateway(root); // Stdio spawn mode (DEFAULT)
 ```
 
 ---
@@ -65,6 +71,7 @@ The TUI **defaults to spawning the gateway** when `K3CODE_TUI_GATEWAY_URL` is no
 ### What k3code Needs to Do
 
 1. **Build the TUI:**
+
    ```bash
    cd tui && npm run build
    # Output: tui/dist/entry.js (entry point)
@@ -72,22 +79,23 @@ The TUI **defaults to spawning the gateway** when `K3CODE_TUI_GATEWAY_URL` is no
    ```
 
 2. **Launch from k3code CLI:**
+
    ```javascript
    // In k3code's main entry point
-   const { spawn } = require('node:child_process')
-   
+   const { spawn } = require("node:child_process");
+
    // 1. Spawn the TUI
-   const tui = spawn('k3code-tui', [], {
-     stdio: ['inherit', 'inherit', 'inherit', 'ipc'], // or pipe for control
+   const tui = spawn("k3code-tui", [], {
+     stdio: ["inherit", "inherit", "inherit", "ipc"], // or pipe for control
      env: {
        ...process.env,
-       K3CODE_PYTHON: '/path/to/k3code-gateway-python',  // Optional: explicit python
-       K3CODE_CWD: process.cwd(),                         // Working dir for gateway
-       K3CODE_PYTHON_SRC_ROOT: '/path/to/k3code/core',   // Python source root
+       K3CODE_PYTHON: "/path/to/k3code-gateway-python", // Optional: explicit python
+       K3CODE_CWD: process.cwd(), // Working dir for gateway
+       K3CODE_PYTHON_SRC_ROOT: "/path/to/k3code/core", // Python source root
        // DO NOT SET: K3CODE_TUI_GATEWAY_URL (leave unset for stdio mode)
-     }
-   })
-   
+     },
+   });
+
    // 2. The TUI will spawn: python -m tui_gateway.entry
    //    You need to ensure the gateway module is importable from K3CODE_PYTHON_SRC_ROOT
    ```
@@ -126,6 +134,7 @@ The TUI will connect via WebSocket instead of spawning a child.
 The TUI expects the gateway to implement these **33 methods** and emit **24 events**:
 
 ### Methods (Client → Server)
+
 - `session.create`, `session.list`, `session.active_list`, `session.resume`, `session.activate`, `session.delete`, `session.interrupt`, `session.steer`, `session.control.read`
 - `prompt.submit`, `clipboard.paste`, `image.attach`, `image.detach`, `input.detect_drop`
 - `command.dispatch`, `slash.exec`
@@ -134,6 +143,7 @@ The TUI expects the gateway to implement these **33 methods** and emit **24 even
 - `system.battery`, `setup.status`
 
 ### Events (Server → Client)
+
 - `gateway.ready`, `skin.changed`, `session.info`, `session.control.update`
 - `message.start`, `message.delta`, `reasoning.delta`, `reasoning.available`, `thinking.delta`
 - `message.interim`, `message.complete`
@@ -143,6 +153,7 @@ The TUI expects the gateway to implement these **33 methods** and emit **24 even
 - `error`
 
 ### Server Requests (Server → Client Callbacks)
+
 - `clarify`, `approval`, `sudo`, `secret`
 - `request.cancel` (withdrawal notification)
 
@@ -150,17 +161,17 @@ The TUI expects the gateway to implement these **33 methods** and emit **24 even
 
 ## Environment Variables Reference
 
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `K3CODE_TUI_GATEWAY_URL` | No | (unset) | WebSocket URL to attach to existing gateway. If unset, TUI spawns gateway. |
-| `K3CODE_GATEWAY_CMD` | No | (unset) | Full command for the spawned gateway (shell-style quoting), e.g. `python -m k3code.cli gateway --stdio`. Overrides `K3CODE_PYTHON`. |
-| `K3CODE_TUI_SIDECAR_URL` | No | (unset) | WebSocket URL to mirror events to (dashboard). |
-| `K3CODE_PYTHON` | No | `python3` / `python` | Python interpreter for spawned gateway. |
-| `K3CODE_CWD` | No | `process.cwd()` | Working directory for gateway process. |
-| `K3CODE_PYTHON_SRC_ROOT` | **Yes** (for spawn) | `import.meta.dirname + '/../../'` | Root where `tui_gateway` package is importable. |
-| `K3CODE_TUI_STARTUP_TIMEOUT_MS` | No | `15000` | Max wait for `gateway.ready`. |
-| `K3CODE_TUI_RPC_TIMEOUT_MS` | No | `120000` | RPC request timeout. |
-| `HERMES_VOICE` | No | `0` | Set to `1` to enable voice features. |
+| Variable                        | Required            | Default                           | Description                                                                                                                         |
+| ------------------------------- | ------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| `K3CODE_TUI_GATEWAY_URL`        | No                  | (unset)                           | WebSocket URL to attach to existing gateway. If unset, TUI spawns gateway.                                                          |
+| `K3CODE_GATEWAY_CMD`            | No                  | (unset)                           | Full command for the spawned gateway (shell-style quoting), e.g. `python -m k3code.cli gateway --stdio`. Overrides `K3CODE_PYTHON`. |
+| `K3CODE_TUI_SIDECAR_URL`        | No                  | (unset)                           | WebSocket URL to mirror events to (dashboard).                                                                                      |
+| `K3CODE_PYTHON`                 | No                  | `python3` / `python`              | Python interpreter for spawned gateway.                                                                                             |
+| `K3CODE_CWD`                    | No                  | `process.cwd()`                   | Working directory for gateway process.                                                                                              |
+| `K3CODE_PYTHON_SRC_ROOT`        | **Yes** (for spawn) | `import.meta.dirname + '/../../'` | Root where `tui_gateway` package is importable.                                                                                     |
+| `K3CODE_TUI_STARTUP_TIMEOUT_MS` | No                  | `15000`                           | Max wait for `gateway.ready`.                                                                                                       |
+| `K3CODE_TUI_RPC_TIMEOUT_MS`     | No                  | `120000`                          | RPC request timeout.                                                                                                                |
+| `HERMES_VOICE`                  | No                  | `0`                               | Set to `1` to enable voice features.                                                                                                |
 
 ---
 
@@ -203,12 +214,12 @@ K3CODE_PYTHON=python3 K3CODE_PYTHON_SRC_ROOT=/tmp node dist/entry.js
 
 ## File Locations Summary
 
-| File | Purpose |
-|------|---------|
-| `tui/src/gatewayClient.ts` | Transport logic, spawn/attach, RPC channel |
-| `tui/src/app/createGatewayEventHandler.ts` | Event handlers (switch on `ev.type`) |
-| `tui/src/app/useMainApp.ts` | Main app, subscribes to gateway events |
-| `tui/shared/gateway-contract.generated.ts` | TypeScript types (generated from Python) |
-| `tui/shared/gateway-events.ts` | Event type definitions |
-| `tui/scripts/build/tui.mjs` | Build script (esbuild) |
-| `tui/package.json` | `"bin": {"k3code-tui": "./dist/entry.js"}` |
+| File                                       | Purpose                                    |
+| ------------------------------------------ | ------------------------------------------ |
+| `tui/src/gatewayClient.ts`                 | Transport logic, spawn/attach, RPC channel |
+| `tui/src/app/createGatewayEventHandler.ts` | Event handlers (switch on `ev.type`)       |
+| `tui/src/app/useMainApp.ts`                | Main app, subscribes to gateway events     |
+| `tui/shared/gateway-contract.generated.ts` | TypeScript types (generated from Python)   |
+| `tui/shared/gateway-events.ts`             | Event type definitions                     |
+| `tui/scripts/build/tui.mjs`                | Build script (esbuild)                     |
+| `tui/package.json`                         | `"bin": {"k3code-tui": "./dist/entry.js"}` |

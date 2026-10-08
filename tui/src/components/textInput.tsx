@@ -1,24 +1,41 @@
-import type { InputEvent, Key } from '@k3code/ink'
-import * as Ink from '@k3code/ink'
-import { type MutableRefObject, useEffect, useMemo, useRef, useState } from 'react'
+import type { InputEvent, Key } from "@k3code/ink";
+import * as Ink from "@k3code/ink";
+import {
+  type MutableRefObject,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
-import { setInputSelection } from '../app/inputSelectionStore.js'
-import { highlightMask, highlightsStable } from '../domain/composerHighlights.js'
-import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
-import { cursorLayout, offsetFromPosition } from '../lib/inputMetrics.js'
-import { isActionMod, isMac, isMacActionFallback } from '../lib/platform.js'
-import { isTermuxTuiMode } from '../lib/termux.js'
+import { setInputSelection } from "../app/inputSelectionStore.js";
+import {
+  highlightMask,
+  highlightsStable,
+} from "../domain/composerHighlights.js";
+import { readClipboardText, writeClipboardText } from "../lib/clipboard.js";
+import { cursorLayout, offsetFromPosition } from "../lib/inputMetrics.js";
+import { isActionMod, isMac, isMacActionFallback } from "../lib/platform.js";
+import { isTermuxTuiMode } from "../lib/termux.js";
 
 type InkExt = typeof Ink & {
-  colorize: (str: string, color: string | undefined, type: 'foreground' | 'background') => string
-  stringWidth: (s: string) => number
-  useCursorAdvance: () => (dx: number, dy?: number) => void
-  useDeclaredCursor: (a: { line: number; column: number; active: boolean }) => (el: any) => void
-  useStdout: () => { stdout?: NodeJS.WriteStream }
-  useTerminalFocus: () => boolean
-}
+  colorize: (
+    str: string,
+    color: string | undefined,
+    type: "foreground" | "background",
+  ) => string;
+  stringWidth: (s: string) => number;
+  useCursorAdvance: () => (dx: number, dy?: number) => void;
+  useDeclaredCursor: (a: {
+    line: number;
+    column: number;
+    active: boolean;
+  }) => (el: any) => void;
+  useStdout: () => { stdout?: NodeJS.WriteStream };
+  useTerminalFocus: () => boolean;
+};
 
-const ink = Ink as unknown as InkExt
+const ink = Ink as unknown as InkExt;
 
 const {
   Box,
@@ -30,34 +47,39 @@ const {
   colorize,
   useCursorAdvance,
   useDeclaredCursor,
-  useTerminalFocus
-} = ink
+  useTerminalFocus,
+} = ink;
 
-const ESC = '\x1b'
-const INV = `${ESC}[7m`
-const INV_OFF = `${ESC}[27m`
-const FWD_DEL_RE = new RegExp(`${ESC}\\[3(?:[~$^]|;)`)
-const PRINTABLE = /^[ -~\u00a0-\uffff]+$/
-const BRACKET_PASTE = new RegExp(`${ESC}?\\[20[01]~`, 'g')
-const FRAME_BATCH_MS = 16
-const MULTI_CLICK_MS = 500
-type MinimalEnv = Record<string, string | undefined>
+const ESC = "\x1b";
+const INV = `${ESC}[7m`;
+const INV_OFF = `${ESC}[27m`;
+const FWD_DEL_RE = new RegExp(`${ESC}\\[3(?:[~$^]|;)`);
+const PRINTABLE = /^[ -~\u00a0-\uffff]+$/;
+const BRACKET_PASTE = new RegExp(`${ESC}?\\[20[01]~`, "g");
+const FRAME_BATCH_MS = 16;
+const MULTI_CLICK_MS = 500;
+type MinimalEnv = Record<string, string | undefined>;
 
-const invert = (s: string) => INV + s + INV_OFF
+const invert = (s: string) => INV + s + INV_OFF;
 
 // Placeholder styling is EXPLICIT color only — never SGR dim/inverse:
 // both are terminal-interpreted relative to the default fg/bg, and on
 // transparent profiles (terminal.background #00000000) they composite
 // against a black RGB the user never sees — the hint rendered as a slab.
-const HINT_FALLBACK = '#808080'
+const HINT_FALLBACK = "#808080";
 
 const hintRgb = (hex?: string): [number, number, number] => {
-  const n = parseInt((/^#([0-9a-f]{6})$/i.exec(hex ?? '')?.[1] ?? HINT_FALLBACK.slice(1)) as string, 16)
+  const n = parseInt(
+    (/^#([0-9a-f]{6})$/i.exec(hex ?? "")?.[1] ??
+      HINT_FALLBACK.slice(1)) as string,
+    16,
+  );
 
-  return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff]
-}
+  return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+};
 
-const hintHex = (hex?: string): string => (/^#[0-9a-f]{6}$/i.test(hex ?? '') ? hex! : HINT_FALLBACK)
+const hintHex = (hex?: string): string =>
+  /^#[0-9a-f]{6}$/i.test(hex ?? "") ? hex! : HINT_FALLBACK;
 
 // Through Ink's own `colorize` (see fgSeq below): a hand-rolled 38;2;r;g;b
 // is worse than unparseable on a non-truecolor terminal — legacy
@@ -65,7 +87,8 @@ const hintHex = (hex?: string): string => (/^#[0-9a-f]{6}$/i.test(hex ?? '') ? h
 // lands as SGR 2 (dim ON) with no `22m` ever emitted. Every subsequent
 // frame's unstyled cells then paint dim until an unrelated bold span's
 // `22m` clears it: text randomly dims after the placeholder renders.
-export const colorizeHint = (s: string, hex?: string) => colorize(s, hintHex(hex), 'foreground')
+export const colorizeHint = (s: string, hex?: string) =>
+  colorize(s, hintHex(hex), "foreground");
 
 /**
  * The SGR foreground-open sequence for a theme tone, or '' when it has none.
@@ -82,18 +105,18 @@ export const colorizeHint = (s: string, hex?: string) => colorize(s, hintHex(hex
  * theme foregrounds to on exactly those limited-palette terminals.
  */
 const fgSeq = (tone?: string): string => {
-  const value = (tone ?? '').trim()
+  const value = (tone ?? "").trim();
 
   if (!value) {
-    return ''
+    return "";
   }
 
   // Colorize a sentinel and keep the OPEN half, so the depth decision stays
   // Ink's rather than being re-derived here.
-  const [open = ''] = colorize('\u0000', value, 'foreground').split('\u0000')
+  const [open = ""] = colorize("\u0000", value, "foreground").split("\u0000");
 
-  return open
-}
+  return open;
+};
 
 // Typed-text fast-echo must carry the SAME explicit fg the Ink render uses:
 // the bypass writes raw cells, and a default-fg glyph goes invisible the
@@ -101,114 +124,120 @@ const fgSeq = (tone?: string): string => {
 // skin on a light terminal ⇒ black-on-black). No color ⇒ passthrough, so
 // unthemed inputs keep the terminal default.
 export const colorizeEcho = (s: string, hex?: string) => {
-  const open = fgSeq(hex)
+  const open = fgSeq(hex);
 
-  return open ? `${open}${s}${ESC}[39m` : s
-}
+  return open ? `${open}${s}${ESC}[39m` : s;
+};
 
 /** Synthetic placeholder cursor: a hint-colored chip with luminance-picked
  *  ink, standing in for the hidden hardware cursor (bubbles pattern).
  *  Both halves go through `colorize` so the escapes match the terminal's
  *  real color depth (same hazard as colorizeHint above). */
 export const hintCursorCell = (ch: string, hex?: string) => {
-  const [r, g, b] = hintRgb(hex)
-  const ink = 0.2126 * r + 0.7152 * g + 0.0722 * b > 140 ? '#000000' : '#ffffff'
+  const [r, g, b] = hintRgb(hex);
+  const ink =
+    0.2126 * r + 0.7152 * g + 0.0722 * b > 140 ? "#000000" : "#ffffff";
 
-  return colorize(colorize(ch, ink, 'foreground'), hintHex(hex), 'background')
-}
+  return colorize(colorize(ch, ink, "foreground"), hintHex(hex), "background");
+};
 
-let _seg: Intl.Segmenter | null = null
-const seg = () => (_seg ??= new Intl.Segmenter(undefined, { granularity: 'grapheme' }))
-const STOP_CACHE_MAX = 32
-const stopCache = new Map<string, number[]>()
+let _seg: Intl.Segmenter | null = null;
+const seg = () =>
+  (_seg ??= new Intl.Segmenter(undefined, { granularity: "grapheme" }));
+const STOP_CACHE_MAX = 32;
+const stopCache = new Map<string, number[]>();
 
 function graphemeStops(s: string) {
-  const hit = stopCache.get(s)
+  const hit = stopCache.get(s);
 
   if (hit) {
-    return hit
+    return hit;
   }
 
-  const stops = [0]
+  const stops = [0];
 
   for (const { index } of seg().segment(s)) {
     if (index > 0) {
-      stops.push(index)
+      stops.push(index);
     }
   }
 
   if (stops.at(-1) !== s.length) {
-    stops.push(s.length)
+    stops.push(s.length);
   }
 
-  stopCache.set(s, stops)
+  stopCache.set(s, stops);
 
   if (stopCache.size > STOP_CACHE_MAX) {
-    const oldest = stopCache.keys().next().value
+    const oldest = stopCache.keys().next().value;
 
     if (oldest !== undefined) {
-      stopCache.delete(oldest)
+      stopCache.delete(oldest);
     }
   }
 
-  return stops
+  return stops;
 }
 
 function snapPos(s: string, p: number) {
-  const pos = Math.max(0, Math.min(p, s.length))
-  let last = 0
+  const pos = Math.max(0, Math.min(p, s.length));
+  let last = 0;
 
   for (const stop of graphemeStops(s)) {
     if (stop > pos) {
-      break
+      break;
     }
 
-    last = stop
+    last = stop;
   }
 
-  return last
+  return last;
 }
 
 export interface TextInsertResult {
-  cursor: number
-  value: string
+  cursor: number;
+  value: string;
 }
 
 export function applyPrintableInsert(
   value: string,
   cursor: number,
   text: string,
-  range?: { end: number; start: number } | null
+  range?: { end: number; start: number } | null,
 ): null | TextInsertResult {
   if (!PRINTABLE.test(text)) {
-    return null
+    return null;
   }
 
   if (range) {
     return {
       cursor: range.start + text.length,
-      value: value.slice(0, range.start) + text + value.slice(range.end)
-    }
+      value: value.slice(0, range.start) + text + value.slice(range.end),
+    };
   }
 
   return {
     cursor: cursor + text.length,
-    value: value.slice(0, cursor) + text + value.slice(cursor)
-  }
+    value: value.slice(0, cursor) + text + value.slice(cursor),
+  };
 }
 
-export const shouldRouteMultiCharInputAsPaste = (text: string): boolean => text.includes('\n')
+export const shouldRouteMultiCharInputAsPaste = (text: string): boolean =>
+  text.includes("\n");
 
 export function valueForReturnSubmit(
   value: string,
   cursor: number,
   input: string,
-  range?: { end: number; start: number } | null
+  range?: { end: number; start: number } | null,
 ): TextInsertResult {
-  const pending = input.replace(BRACKET_PASTE, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  const pending = input
+    .replace(BRACKET_PASTE, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
 
   if (!pending) {
-    return { cursor, value }
+    return { cursor, value };
   }
 
   // Browser/xterm IME commits can arrive as one burst immediately followed by
@@ -217,13 +246,18 @@ export function valueForReturnSubmit(
   // printable-input branch yet.  Preserve the printable prefix before the first
   // newline so the visible, just-committed IME text is part of the submitted
   // prompt instead of being silently dropped.
-  const [beforeReturn] = pending.split('\n', 1)
+  const [beforeReturn] = pending.split("\n", 1);
 
   if (!beforeReturn) {
-    return { cursor, value }
+    return { cursor, value };
   }
 
-  return applyPrintableInsert(value, cursor, beforeReturn, range) ?? { cursor, value }
+  return (
+    applyPrintableInsert(value, cursor, beforeReturn, range) ?? {
+      cursor,
+      value,
+    }
+  );
 }
 
 /**
@@ -236,48 +270,50 @@ export function valueForReturnSubmit(
 export async function cutSelection(
   text: string,
   write: (text: string) => Promise<boolean>,
-  removeSelection: () => void
+  removeSelection: () => void,
 ): Promise<boolean> {
-  const ok = await write(text)
+  const ok = await write(text);
 
   if (ok) {
-    removeSelection()
+    removeSelection();
   }
 
-  return ok
+  return ok;
 }
 
-export function shouldPreserveCtrlJNewline(env: MinimalEnv = process.env): boolean {
+export function shouldPreserveCtrlJNewline(
+  env: MinimalEnv = process.env,
+): boolean {
   if (env.WT_SESSION) {
-    return true
+    return true;
   }
 
   if (env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY) {
-    return true
+    return true;
   }
 
   if (env.GHOSTTY_RESOURCES_DIR || env.GHOSTTY_BIN_DIR) {
-    return true
+    return true;
   }
 
-  if ((env.TERM ?? '').toLowerCase() === 'xterm-ghostty') {
-    return true
+  if ((env.TERM ?? "").toLowerCase() === "xterm-ghostty") {
+    return true;
   }
 
-  if ((env.TERM_PROGRAM ?? '').toLowerCase() === 'ghostty') {
-    return true
+  if ((env.TERM_PROGRAM ?? "").toLowerCase() === "ghostty") {
+    return true;
   }
 
-  return (env.WSL_DISTRO_NAME ?? '').toLowerCase().includes('microsoft')
+  return (env.WSL_DISTRO_NAME ?? "").toLowerCase().includes("microsoft");
 }
 
 type ReturnDecisionKey = {
-  ctrl: boolean
-  meta: boolean
-  return?: boolean
-  shift?: boolean
-  super?: boolean
-}
+  ctrl: boolean;
+  meta: boolean;
+  return?: boolean;
+  shift?: boolean;
+  super?: boolean;
+};
 
 /**
  * Decide whether a Return keypress should insert a newline instead of
@@ -289,67 +325,70 @@ type ReturnDecisionKey = {
  * but aren't env-detectable, so a bare LF is treated as a newline there as well.
  * Plain Enter (CR) stays submit everywhere.
  */
-export function shouldInsertNewlineOnReturn(key: ReturnDecisionKey, sequence = ''): boolean {
+export function shouldInsertNewlineOnReturn(
+  key: ReturnDecisionKey,
+  sequence = "",
+): boolean {
   if (key.shift || key.ctrl || (isMac ? isActionMod(key) : key.meta)) {
-    return true
+    return true;
   }
 
-  return sequence === '\n' && (isMac || shouldPreserveCtrlJNewline())
+  return sequence === "\n" && (isMac || shouldPreserveCtrlJNewline());
 }
 
 function prevPos(s: string, p: number) {
-  const pos = snapPos(s, p)
-  let prev = 0
+  const pos = snapPos(s, p);
+  let prev = 0;
 
   for (const stop of graphemeStops(s)) {
     if (stop >= pos) {
-      return prev
+      return prev;
     }
 
-    prev = stop
+    prev = stop;
   }
 
-  return prev
+  return prev;
 }
 
 function nextPos(s: string, p: number) {
-  const pos = snapPos(s, p)
+  const pos = snapPos(s, p);
 
   for (const stop of graphemeStops(s)) {
     if (stop > pos) {
-      return stop
+      return stop;
     }
   }
 
-  return s.length
+  return s.length;
 }
 
 function wordLeft(s: string, p: number) {
-  let i = snapPos(s, p) - 1
+  let i = snapPos(s, p) - 1;
 
   while (i > 0 && /\s/.test(s[i]!)) {
-    i--
+    i--;
   }
 
   while (i > 0 && !/\s/.test(s[i - 1]!)) {
-    i--
+    i--;
   }
 
-  return Math.max(0, i)
+  return Math.max(0, i);
 }
 
 function wordRight(s: string, p: number) {
-  let i = snapPos(s, p)
+  let i = snapPos(s, p);
 
   while (i < s.length && !/\s/.test(s[i]!)) {
-    i++
+    i++;
   }
 
   while (i < s.length && /\s/.test(s[i]!)) {
-    i++
+    i++;
   }
 
-  return i
+  return i;
 }
 
 /**
@@ -358,8 +397,14 @@ function wordRight(s: string, p: number) {
  * removed. Callers guard against `cursor >= value.length` themselves; when the
  * cursor is already at the end this is a no-op.
  */
-export function deleteWordForward(value: string, cursor: number): TextInsertResult {
-  return { cursor, value: value.slice(0, cursor) + value.slice(wordRight(value, cursor)) }
+export function deleteWordForward(
+  value: string,
+  cursor: number,
+): TextInsertResult {
+  return {
+    cursor,
+    value: value.slice(0, cursor) + value.slice(wordRight(value, cursor)),
+  };
 }
 
 /**
@@ -369,35 +414,35 @@ export function deleteWordForward(value: string, cursor: number): TextInsertResu
  * signal to fall through to history cycling instead of eating the arrow key.
  */
 export function lineNav(s: string, p: number, dir: -1 | 1): null | number {
-  const pos = snapPos(s, p)
-  const curStart = s.lastIndexOf('\n', pos - 1) + 1
-  const col = pos - curStart
+  const pos = snapPos(s, p);
+  const curStart = s.lastIndexOf("\n", pos - 1) + 1;
+  const col = pos - curStart;
 
   if (dir < 0) {
     if (curStart === 0) {
-      return null
+      return null;
     }
 
-    const prevStart = s.lastIndexOf('\n', curStart - 2) + 1
+    const prevStart = s.lastIndexOf("\n", curStart - 2) + 1;
 
-    return snapPos(s, Math.min(prevStart + col, curStart - 1))
+    return snapPos(s, Math.min(prevStart + col, curStart - 1));
   }
 
-  const nextBreak = s.indexOf('\n', pos)
+  const nextBreak = s.indexOf("\n", pos);
 
   if (nextBreak < 0) {
-    return null
+    return null;
   }
 
-  const nextEnd = s.indexOf('\n', nextBreak + 1)
-  const lineEnd = nextEnd < 0 ? s.length : nextEnd
+  const nextEnd = s.indexOf("\n", nextBreak + 1);
+  const lineEnd = nextEnd < 0 ? s.length : nextEnd;
 
-  return snapPos(s, Math.min(nextBreak + 1 + col, lineEnd))
+  return snapPos(s, Math.min(nextBreak + 1 + col, lineEnd));
 }
 
-export { offsetFromPosition }
+export { offsetFromPosition };
 
-const ASCII_PRINTABLE_RE = /^[\x20-\x7e]+$/
+const ASCII_PRINTABLE_RE = /^[\x20-\x7e]+$/;
 
 /**
  * Pure shape-only precondition for the fast-echo append path.
@@ -441,10 +486,15 @@ const ASCII_PRINTABLE_RE = /^[\x20-\x7e]+$/
  * `curRefCurrent` genuinely diverge and assert the layout matches the
  * fresh ref value, not the stale state.
  */
-export function resolveCursorLayout(display: string, cur: number, curRefCurrent: number, columns: number) {
-  void cur // intentionally unused for layout — see doc comment above
+export function resolveCursorLayout(
+  display: string,
+  cur: number,
+  curRefCurrent: number,
+  columns: number,
+) {
+  void cur; // intentionally unused for layout — see doc comment above
 
-  return cursorLayout(display, curRefCurrent, columns)
+  return cursorLayout(display, curRefCurrent, columns);
 }
 
 /**
@@ -457,11 +507,14 @@ export function resolveCursorLayout(display: string, cur: number, curRefCurrent:
  * newline so a repeat press makes progress instead of wedging — this is
  * what makes "repeat to clear across lines" work.
  */
-export function killToLineStart(value: string, cursor: number): { value: string; cursor: number } {
-  const start = value.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1
-  const from = start === cursor && cursor > 0 ? start - 1 : start
+export function killToLineStart(
+  value: string,
+  cursor: number,
+): { value: string; cursor: number } {
+  const start = value.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
+  const from = start === cursor && cursor > 0 ? start - 1 : start;
 
-  return { value: value.slice(0, from) + value.slice(cursor), cursor: from }
+  return { value: value.slice(0, from) + value.slice(cursor), cursor: from };
 }
 
 /**
@@ -469,11 +522,14 @@ export function killToLineStart(value: string, cursor: number): { value: string;
  * end of the current logical line. At a line end, consume the newline so a
  * repeat press joins the next line rather than doing nothing.
  */
-export function killToLineEnd(value: string, cursor: number): { value: string; cursor: number } {
-  const nl = value.indexOf('\n', cursor)
-  const to = nl < 0 ? value.length : nl === cursor ? nl + 1 : nl
+export function killToLineEnd(
+  value: string,
+  cursor: number,
+): { value: string; cursor: number } {
+  const nl = value.indexOf("\n", cursor);
+  const to = nl < 0 ? value.length : nl === cursor ? nl + 1 : nl;
 
-  return { value: value.slice(0, cursor) + value.slice(to), cursor }
+  return { value: value.slice(0, cursor) + value.slice(to), cursor };
 }
 
 /**
@@ -490,8 +546,12 @@ export function killToLineEnd(value: string, cursor: number): { value: string; c
  * Terminals that instead rewrite Cmd+Backspace to Ctrl+U are handled by
  * the `isMacActionFallback` kill-to-start path, not by this predicate.
  */
-export function isLineKillModifier(key: { ctrl: boolean; meta: boolean; super?: boolean }): boolean {
-  return key.super === true
+export function isLineKillModifier(key: {
+  ctrl: boolean;
+  meta: boolean;
+  super?: boolean;
+}): boolean {
+  return key.super === true;
 }
 
 /**
@@ -509,18 +569,24 @@ export function isLineKillModifier(key: { ctrl: boolean; meta: boolean; super?: 
  */
 export function fastBackspaceEffect(
   current: string,
-  cursor: number
-): { advanceDelta: number; newCursor: number; newValue: string; removed: string; write: string } {
-  const t = prevPos(current, cursor)
-  const removed = current.slice(t, cursor)
+  cursor: number,
+): {
+  advanceDelta: number;
+  newCursor: number;
+  newValue: string;
+  removed: string;
+  write: string;
+} {
+  const t = prevPos(current, cursor);
+  const removed = current.slice(t, cursor);
 
   return {
     advanceDelta: -1,
     newCursor: t,
     newValue: current.slice(0, t) + current.slice(cursor),
     removed,
-    write: '\b \b'
-  }
+    write: "\b \b",
+  };
 }
 
 /**
@@ -534,14 +600,19 @@ export function fastBackspaceEffect(
 export function fastAppendEffect(
   current: string,
   cursor: number,
-  text: string
-): { advanceDelta: number; newCursor: number; newValue: string; write: string } {
+  text: string,
+): {
+  advanceDelta: number;
+  newCursor: number;
+  newValue: string;
+  write: string;
+} {
   return {
     advanceDelta: text.length,
     newCursor: cursor + text.length,
     newValue: current.slice(0, cursor) + text + current.slice(cursor),
-    write: text
-  }
+    write: text,
+  };
 }
 
 export function canFastAppendShape(
@@ -549,25 +620,25 @@ export function canFastAppendShape(
   cursor: number,
   text: string,
   columns: number,
-  currentLineWidth: number
+  currentLineWidth: number,
 ): boolean {
   if (cursor !== current.length) {
-    return false
+    return false;
   }
 
   if (current.length === 0) {
-    return false
+    return false;
   }
 
-  if (current.includes('\n')) {
-    return false
+  if (current.includes("\n")) {
+    return false;
   }
 
   if (!ASCII_PRINTABLE_RE.test(text)) {
-    return false
+    return false;
   }
 
-  return currentLineWidth + text.length < Math.max(1, columns)
+  return currentLineWidth + text.length < Math.max(1, columns);
 }
 
 /**
@@ -597,17 +668,21 @@ export function canFastAppendShape(
  * through. Do NOT omit it from any new caller that relies on the
  * wrap-boundary protection.
  */
-export function canFastBackspaceShape(current: string, cursor: number, columns?: number): boolean {
+export function canFastBackspaceShape(
+  current: string,
+  cursor: number,
+  columns?: number,
+): boolean {
   if (cursor !== current.length) {
-    return false
+    return false;
   }
 
   if (cursor <= 0) {
-    return false
+    return false;
   }
 
-  if (current.includes('\n')) {
-    return false
+  if (current.includes("\n")) {
+    return false;
   }
 
   // If we know the wrap width, reject at the soft-wrap boundary: the
@@ -622,23 +697,25 @@ export function canFastBackspaceShape(current: string, cursor: number, columns?:
   // because it now mirrors wrap-ansi's break points exactly (see the
   // cursor-drift-multiline fix in lib/inputMetrics.ts).
   if (columns !== undefined) {
-    const layout = cursorLayout(current, cursor, columns)
+    const layout = cursorLayout(current, cursor, columns);
 
     if (layout.column === 0 || layout.column >= columns) {
-      return false
+      return false;
     }
   }
 
-  const removed = current.slice(prevPos(current, cursor), cursor)
+  const removed = current.slice(prevPos(current, cursor), cursor);
 
-  return ASCII_PRINTABLE_RE.test(removed)
+  return ASCII_PRINTABLE_RE.test(removed);
 }
 
-export function supportsFastEchoTerminal(env: NodeJS.ProcessEnv = process.env): boolean {
+export function supportsFastEchoTerminal(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
   // Terminal.app still shows paint/cursor artifacts under the fast-echo
   // bypass path. Fall back to the normal Ink render path there.
-  if ((env.TERM_PROGRAM ?? '').trim() === 'Apple_Terminal') {
-    return false
+  if ((env.TERM_PROGRAM ?? "").trim() === "Apple_Terminal") {
+    return false;
   }
 
   // tmux adds a PTY multiplexing layer that desyncs stdout.write() cursor
@@ -652,28 +729,32 @@ export function supportsFastEchoTerminal(env: NodeJS.ProcessEnv = process.env): 
   // deliberately do NOT match `screen*`: GNU screen sets the same TERM and has
   // no reported drift, so widening to screen would disable the optimization for
   // those users with no evidence of a bug.
-  const term = (env.TERM ?? '').trim().toLowerCase()
+  const term = (env.TERM ?? "").trim().toLowerCase();
 
-  if ((env.TMUX ?? '').trim().length > 0 || term === 'tmux' || term.startsWith('tmux-')) {
-    return false
+  if (
+    (env.TMUX ?? "").trim().length > 0 ||
+    term === "tmux" ||
+    term.startsWith("tmux-")
+  ) {
+    return false;
   }
 
   // Termux terminals are especially sensitive to bypass-path cursor drift and
   // stale paints at soft-wrap boundaries on tall/narrow viewports. Keep this
   // off by default in Termux mode; allow explicit opt-in for local debugging.
   if (isTermuxTuiMode(env)) {
-    const override = String(env.K3CODE_TUI_TERMUX_FAST_ECHO ?? '')
+    const override = String(env.K3CODE_TUI_TERMUX_FAST_ECHO ?? "")
       .trim()
-      .toLowerCase()
+      .toLowerCase();
 
     if (override) {
-      return /^(?:1|true|yes|on)$/i.test(override)
+      return /^(?:1|true|yes|on)$/i.test(override);
     }
 
-    return false
+    return false;
   }
 
-  return true
+  return true;
 }
 
 /**
@@ -683,89 +764,102 @@ export function supportsFastEchoTerminal(env: NodeJS.ProcessEnv = process.env): 
  * `offset` to stay aligned. `[39m` closes back to the outer `<Text color>`
  * (chalk re-opens it), leaving prose on the theme's text tone.
  */
-function paintHighlights(value: string, accentOpen: string, mask: boolean[] | null, offset = 0) {
+function paintHighlights(
+  value: string,
+  accentOpen: string,
+  mask: boolean[] | null,
+  offset = 0,
+) {
   if (!accentOpen || !mask) {
-    return value
+    return value;
   }
 
-  let out = ''
-  let on = false
+  let out = "";
+  let on = false;
 
   for (const { segment, index } of seg().segment(value)) {
-    const want = !!mask[offset + index]
+    const want = !!mask[offset + index];
 
     if (want !== on) {
-      out += want ? accentOpen : `${ESC}[39m`
-      on = want
+      out += want ? accentOpen : `${ESC}[39m`;
+      on = want;
     }
 
-    out += segment
+    out += segment;
   }
 
-  return on ? `${out}${ESC}[39m` : out
+  return on ? `${out}${ESC}[39m` : out;
 }
 
-function renderWithCursor(value: string, cursor: number, accentOpen = '', mask: boolean[] | null = null) {
-  const pos = Math.max(0, Math.min(cursor, value.length))
-  const under = [...seg().segment(value.slice(pos))][0]?.segment
+function renderWithCursor(
+  value: string,
+  cursor: number,
+  accentOpen = "",
+  mask: boolean[] | null = null,
+) {
+  const pos = Math.max(0, Math.min(cursor, value.length));
+  const under = [...seg().segment(value.slice(pos))][0]?.segment;
   // The cursor cell is inverted, not accented: inverse swaps fg/bg, so an
   // accent under the block would fight it rather than show through.
-  const cell = under && under !== '\n' ? under : ' '
-  const tail = under && under !== '\n' ? pos + under.length : pos
+  const cell = under && under !== "\n" ? under : " ";
+  const tail = under && under !== "\n" ? pos + under.length : pos;
 
   return (
     paintHighlights(value.slice(0, pos), accentOpen, mask) +
     invert(cell) +
     paintHighlights(value.slice(tail), accentOpen, mask, tail)
-  )
+  );
 }
 
 function renderWithSelection(
   value: string,
   start: number,
   end: number,
-  accentOpen = '',
-  mask: boolean[] | null = null
+  accentOpen = "",
+  mask: boolean[] | null = null,
 ) {
   if (start >= end) {
-    return paintHighlights(value, accentOpen, mask)
+    return paintHighlights(value, accentOpen, mask);
   }
 
   return (
     paintHighlights(value.slice(0, start), accentOpen, mask) +
-    invert(paintHighlights(value.slice(start, end), accentOpen, mask, start) || ' ') +
+    invert(
+      paintHighlights(value.slice(start, end), accentOpen, mask, start) || " ",
+    ) +
     paintHighlights(value.slice(end), accentOpen, mask, end)
-  )
+  );
 }
 
 function useFwdDelete(active: boolean) {
-  const ref = useRef(false)
-  const { inputEmitter: ee } = useStdin()
+  const ref = useRef(false);
+  const { inputEmitter: ee } = useStdin();
 
   useEffect(() => {
     if (!active) {
-      return
+      return;
     }
 
     const h = (d: string) => {
-      ref.current = FWD_DEL_RE.test(d)
-    }
+      ref.current = FWD_DEL_RE.test(d);
+    };
 
-    ee.prependListener('input', h)
+    ee.prependListener("input", h);
 
     return () => {
-      ee.removeListener('input', h)
-    }
-  }, [active, ee])
+      ee.removeListener("input", h);
+    };
+  }, [active, ee]);
 
-  return ref
+  return ref;
 }
 
-type PasteResult = { cursor: number; value: string } | null
+type PasteResult = { cursor: number; value: string } | null;
 
 const isPasteResultPromise = (
-  value: PasteResult | Promise<PasteResult> | null | undefined
-): value is Promise<PasteResult> => !!value && typeof (value as PromiseLike<PasteResult>).then === 'function'
+  value: PasteResult | Promise<PasteResult> | null | undefined,
+): value is Promise<PasteResult> =>
+  !!value && typeof (value as PromiseLike<PasteResult>).then === "function";
 
 export function TextInput({
   columns = 80,
@@ -777,35 +871,37 @@ export function TextInput({
   mouseApiRef,
   cursorSnapshotRef,
   ignoreVerticalArrows = false,
-  placeholder = '',
+  placeholder = "",
   placeholderColor,
   accentColor,
   color,
-  focus = true
+  focus = true,
 }: TextInputProps) {
   const [cur, setCur] = useState(() =>
-    cursorSnapshotRef?.current?.value === value ? cursorSnapshotRef.current.cursor : value.length
-  )
+    cursorSnapshotRef?.current?.value === value
+      ? cursorSnapshotRef.current.cursor
+      : value.length,
+  );
 
-  const [sel, setSel] = useState<null | { end: number; start: number }>(null)
-  const fwdDel = useFwdDelete(focus)
-  const termFocus = useTerminalFocus()
-  const { stdout } = useStdout()
-  const noteCursorAdvance = useCursorAdvance()
+  const [sel, setSel] = useState<null | { end: number; start: number }>(null);
+  const fwdDel = useFwdDelete(focus);
+  const termFocus = useTerminalFocus();
+  const { stdout } = useStdout();
+  const noteCursorAdvance = useCursorAdvance();
 
-  const curRef = useRef(cur)
-  const selRef = useRef<null | { end: number; start: number }>(null)
-  const vRef = useRef(value)
-  const self = useRef(false)
+  const curRef = useRef(cur);
+  const selRef = useRef<null | { end: number; start: number }>(null);
+  const vRef = useRef(value);
+  const self = useRef(false);
   // The last value handed to onChange. While a deferred key-burst flush is in
   // flight the user can type past it, so the parent's echo comes back older
   // than vRef; matching against this keeps such echoes on the own-change path.
-  const emittedValueRef = useRef<string | null>(null)
-  const keyBurstTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const editVersionRef = useRef(0)
-  const parentChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const pendingParentValue = useRef<string | null>(null)
-  const localRenderTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const emittedValueRef = useRef<string | null>(null);
+  const keyBurstTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const editVersionRef = useRef(0);
+  const parentChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingParentValue = useRef<string | null>(null);
+  const localRenderTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // True for one keystroke after a commit took the full Ink render path
   // (syncParent). Ink repaints the whole input line, so the terminal cursor
   // baseline that the fast-echo "\b \b" shortcut assumes is no longer valid;
@@ -813,29 +909,43 @@ export function TextInput({
   // and strands glyphs (the OpenKey Vietnamese "hạ␣␣" bug: an injected U+202F
   // marker forces an Ink repaint, then the recompose backspaces fast-echo
   // against a stale baseline). Suppress fast-echo for that one next edit.
-  const inkRepaintedRef = useRef(false)
-  const inkRepaintResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const lineWidthRef = useRef(stringWidth(value.includes('\n') ? value.slice(value.lastIndexOf('\n') + 1) : value))
-  const mouseAnchorRef = useRef<null | number>(null)
-  const lastClickRef = useRef<{ at: number; offset: number }>({ at: 0, offset: -1 })
-  const undo = useRef<{ cursor: number; value: string }[]>([])
-  const redo = useRef<{ cursor: number; value: string }[]>([])
+  const inkRepaintedRef = useRef(false);
+  const inkRepaintResetTimer = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+  const lineWidthRef = useRef(
+    stringWidth(
+      value.includes("\n") ? value.slice(value.lastIndexOf("\n") + 1) : value,
+    ),
+  );
+  const mouseAnchorRef = useRef<null | number>(null);
+  const lastClickRef = useRef<{ at: number; offset: number }>({
+    at: 0,
+    offset: -1,
+  });
+  const undo = useRef<{ cursor: number; value: string }[]>([]);
+  const redo = useRef<{ cursor: number; value: string }[]>([]);
 
-  const cbChange = useRef(onChange)
-  const cbSubmit = useRef(onSubmit)
-  const cbPaste = useRef(onPaste)
-  cbChange.current = onChange
-  cbSubmit.current = onSubmit
-  cbPaste.current = onPaste
+  const cbChange = useRef(onChange);
+  const cbSubmit = useRef(onSubmit);
+  const cbPaste = useRef(onPaste);
+  cbChange.current = onChange;
+  cbSubmit.current = onSubmit;
+  cbPaste.current = onPaste;
 
-  const raw = self.current ? vRef.current : value
-  const display = mask ? raw.replace(/[^\n]/g, mask[0] ?? '*') : raw
+  const raw = self.current ? vRef.current : value;
+  const display = mask ? raw.replace(/[^\n]/g, mask[0] ?? "*") : raw;
 
   const selected = useMemo(
     () =>
-      sel && sel.start !== sel.end ? { end: Math.max(sel.start, sel.end), start: Math.min(sel.start, sel.end) } : null,
-    [sel]
-  )
+      sel && sel.start !== sel.end
+        ? {
+            end: Math.max(sel.start, sel.end),
+            start: Math.min(sel.start, sel.end),
+          }
+        : null,
+    [sel],
+  );
 
   // Read `curRef.current` (always up-to-date) rather than the `cur`
   // React state. The fast-echo path defers the React `setCur` by 16ms
@@ -849,7 +959,7 @@ export function TextInput({
   // for layout. The cursorLayout call is cheap (one wrap-text pass
   // over a single-line string in the common case), so dropping useMemo
   // is fine.
-  const layout = resolveCursorLayout(display, cur, curRef.current, columns)
+  const layout = resolveCursorLayout(display, cur, curRef.current, columns);
 
   const boxRef = useDeclaredCursor({
     line: layout.line,
@@ -857,8 +967,8 @@ export function TextInput({
     // The placeholder state draws a synthetic cursor (see `rendered`), so the
     // hardware cursor must not also be declared there — hosts paint it with
     // their own cursor colors as a solid slab over the first glyph.
-    active: focus && termFocus && !selected && !(!display && !!placeholder)
-  })
+    active: focus && termFocus && !selected && !(!display && !!placeholder),
+  });
 
   // Hide the hardware cursor while a selection is active (prevents
   // auto-wrap onto the next row when inverted text fills the column
@@ -870,22 +980,25 @@ export function TextInput({
   // placeholder state draws its own synthetic cursor instead (the
   // bubbletea/bubbles textinput pattern: the cursor cell renders the first
   // placeholder character, styled), so the hint is always fully legible.
-  const placeholderShowing = focus && !display && !!placeholder
-  const hideHardwareCursor = focus && !!stdout?.isTTY && (!!selected || !termFocus || placeholderShowing)
+  const placeholderShowing = focus && !display && !!placeholder;
+  const hideHardwareCursor =
+    focus &&
+    !!stdout?.isTTY &&
+    (!!selected || !termFocus || placeholderShowing);
 
   useEffect(() => {
     if (!hideHardwareCursor || !stdout) {
-      return
+      return;
     }
 
-    stdout.write('\x1b[?25l')
+    stdout.write("\x1b[?25l");
 
     return () => {
-      stdout.write('\x1b[?25h')
-    }
-  }, [hideHardwareCursor, stdout])
+      stdout.write("\x1b[?25h");
+    };
+  }, [hideHardwareCursor, stdout]);
 
-  const nativeCursor = focus && termFocus && !selected && !!stdout?.isTTY
+  const nativeCursor = focus && termFocus && !selected && !!stdout?.isTTY;
 
   // Placeholder text is just a hint, not a selection — render it in the
   // theme's muted color (SGR dim as fallback). The cursor over an empty
@@ -896,28 +1009,50 @@ export function TextInput({
   // `/work`, `@file:src/a.ts`, and `[[ Image 1 ]]` wear in the composer the
   // accent they wear once sent. A masked input is a password, never a
   // reference, so it never highlights.
-  const accentOpen = mask ? '' : fgSeq(accentColor)
-  const highlights = useMemo(() => (accentOpen ? highlightMask(display) : null), [accentOpen, display])
+  const accentOpen = mask ? "" : fgSeq(accentColor);
+  const highlights = useMemo(
+    () => (accentOpen ? highlightMask(display) : null),
+    [accentOpen, display],
+  );
 
   const rendered = useMemo(() => {
     if (!focus) {
-      return display ? paintHighlights(display, accentOpen, highlights) : colorizeHint(placeholder, placeholderColor)
+      return display
+        ? paintHighlights(display, accentOpen, highlights)
+        : colorizeHint(placeholder, placeholderColor);
     }
 
     if (!display && placeholder) {
       return (
-        hintCursorCell(placeholder[0] ?? ' ', placeholderColor) + colorizeHint(placeholder.slice(1), placeholderColor)
-      )
+        hintCursorCell(placeholder[0] ?? " ", placeholderColor) +
+        colorizeHint(placeholder.slice(1), placeholderColor)
+      );
     }
 
     if (selected) {
-      return renderWithSelection(display, selected.start, selected.end, accentOpen, highlights)
+      return renderWithSelection(
+        display,
+        selected.start,
+        selected.end,
+        accentOpen,
+        highlights,
+      );
     }
 
     return nativeCursor
-      ? paintHighlights(display, accentOpen, highlights) || ' '
-      : renderWithCursor(display, cur, accentOpen, highlights)
-  }, [accentOpen, cur, display, focus, highlights, nativeCursor, placeholder, placeholderColor, selected])
+      ? paintHighlights(display, accentOpen, highlights) || " "
+      : renderWithCursor(display, cur, accentOpen, highlights);
+  }, [
+    accentOpen,
+    cur,
+    display,
+    focus,
+    highlights,
+    nativeCursor,
+    placeholder,
+    placeholderColor,
+    selected,
+  ]);
 
   useEffect(() => {
     // `value === vRef.current` misses a deferred flush still in flight: the
@@ -926,172 +1061,192 @@ export function TextInput({
     // backward, letters vanished — #111934). An echo matching the last value
     // we emitted is still our own; the pending flush for the newer local
     // value converges the parent on its next timer.
-    const ownEcho = self.current && (value === vRef.current || value === emittedValueRef.current)
-    self.current = false
+    const ownEcho =
+      self.current &&
+      (value === vRef.current || value === emittedValueRef.current);
+    self.current = false;
 
     if (ownEcho || value === vRef.current) {
-      return
+      return;
     }
 
     // An external value replaced the draft. A key burst still waiting on its
     // 16ms flush is now stale; letting it fire would hand the parent the old
     // draft on top of the value it just set.
     if (parentChangeTimer.current) {
-      clearTimeout(parentChangeTimer.current)
-      parentChangeTimer.current = null
+      clearTimeout(parentChangeTimer.current);
+      parentChangeTimer.current = null;
     }
 
-    pendingParentValue.current = null
-    setCur(value.length)
-    setSel(null)
-    curRef.current = value.length
-    selRef.current = null
-    vRef.current = value
-    lineWidthRef.current = stringWidth(value.includes('\n') ? value.slice(value.lastIndexOf('\n') + 1) : value)
-    undo.current = []
-    redo.current = []
-  }, [value])
+    pendingParentValue.current = null;
+    setCur(value.length);
+    setSel(null);
+    curRef.current = value.length;
+    selRef.current = null;
+    vRef.current = value;
+    lineWidthRef.current = stringWidth(
+      value.includes("\n") ? value.slice(value.lastIndexOf("\n") + 1) : value,
+    );
+    undo.current = [];
+    redo.current = [];
+  }, [value]);
 
   // The composer unmounts while full-screen monitors own input. Keep its
   // insertion point with the shell, not with transient steer/secret inputs.
   useEffect(
     () => () => {
       if (cursorSnapshotRef) {
-        cursorSnapshotRef.current = { cursor: curRef.current, value: vRef.current }
+        cursorSnapshotRef.current = {
+          cursor: curRef.current,
+          value: vRef.current,
+        };
       }
     },
-    [cursorSnapshotRef]
-  )
+    [cursorSnapshotRef],
+  );
 
   useEffect(() => {
     if (!focus) {
-      return
+      return;
     }
 
     const dropSel = () => {
       if (!selRef.current) {
-        return
+        return;
       }
 
-      selRef.current = null
-      setSel(null)
-    }
+      selRef.current = null;
+      setSel(null);
+    };
 
     setInputSelection({
       clear: dropSel,
       collapseToEnd: () => {
-        dropSel()
-        setCur(vRef.current.length)
-        curRef.current = vRef.current.length
+        dropSel();
+        setCur(vRef.current.length);
+        curRef.current = vRef.current.length;
       },
       copy: () => {
-        const range = selRange()
+        const range = selRange();
 
         if (range) {
-          void writeClipboardText(vRef.current.slice(range.start, range.end))
+          void writeClipboardText(vRef.current.slice(range.start, range.end));
         }
       },
       cut: () => {
-        const range = selRange()
+        const range = selRange();
 
         if (!range) {
-          return
+          return;
         }
 
         // Transactional cut: only remove the selection once the clipboard
         // write actually succeeds. A fire-and-forget write on a headless/SSH
         // box (no clipboard backend) would otherwise destroy the text with no
         // copy to paste back. On failure the selection is left intact.
-        const text = vRef.current.slice(range.start, range.end)
+        const text = vRef.current.slice(range.start, range.end);
 
         void cutSelection(text, writeClipboardText, () => {
           // Re-read the selection: the awaited clipboard write opens a window
           // in which the user could have moved/changed the selection. Only
           // remove when it still matches what we copied.
-          const current = selRange()
+          const current = selRange();
 
-          if (!current || current.start !== range.start || current.end !== range.end) {
-            return
+          if (
+            !current ||
+            current.start !== range.start ||
+            current.end !== range.end
+          ) {
+            return;
           }
 
-          commit(vRef.current.slice(0, current.start) + vRef.current.slice(current.end), current.start)
-        })
+          commitRef.current(
+            vRef.current.slice(0, current.start) +
+              vRef.current.slice(current.end),
+            current.start,
+          );
+        });
       },
       end: selected?.end ?? curRef.current,
       start: selected?.start ?? curRef.current,
-      value: vRef.current
-    })
+      value: vRef.current,
+    });
 
-    return () => setInputSelection(null)
-  }, [cur, focus, selected])
+    return () => setInputSelection(null);
+  }, [cur, focus, selected]);
 
   useEffect(
     () => () => {
       if (keyBurstTimer.current) {
-        clearTimeout(keyBurstTimer.current)
+        clearTimeout(keyBurstTimer.current);
       }
 
       if (parentChangeTimer.current) {
-        clearTimeout(parentChangeTimer.current)
+        clearTimeout(parentChangeTimer.current);
       }
 
       if (localRenderTimer.current) {
-        clearTimeout(localRenderTimer.current)
+        clearTimeout(localRenderTimer.current);
       }
 
       if (inkRepaintResetTimer.current) {
-        clearTimeout(inkRepaintResetTimer.current)
+        clearTimeout(inkRepaintResetTimer.current);
       }
     },
-    []
-  )
+    [],
+  );
 
   const flushParentChange = () => {
     if (parentChangeTimer.current) {
-      clearTimeout(parentChangeTimer.current)
-      parentChangeTimer.current = null
+      clearTimeout(parentChangeTimer.current);
+      parentChangeTimer.current = null;
     }
 
-    const next = pendingParentValue.current
-    pendingParentValue.current = null
+    const next = pendingParentValue.current;
+    pendingParentValue.current = null;
 
     if (next !== null) {
-      self.current = true
-      emittedValueRef.current = next
-      cbChange.current(next)
+      self.current = true;
+      emittedValueRef.current = next;
+      cbChange.current(next);
     }
-  }
+  };
 
   const scheduleParentChange = (next: string) => {
-    pendingParentValue.current = next
+    pendingParentValue.current = next;
 
     if (parentChangeTimer.current) {
-      return
+      return;
     }
 
-    parentChangeTimer.current = setTimeout(flushParentChange, FRAME_BATCH_MS)
-  }
+    parentChangeTimer.current = setTimeout(flushParentChange, FRAME_BATCH_MS);
+  };
 
   const cancelLocalRender = () => {
     if (localRenderTimer.current) {
-      clearTimeout(localRenderTimer.current)
-      localRenderTimer.current = null
+      clearTimeout(localRenderTimer.current);
+      localRenderTimer.current = null;
     }
-  }
+  };
 
   const scheduleLocalRender = () => {
     if (localRenderTimer.current) {
-      return
+      return;
     }
 
     localRenderTimer.current = setTimeout(() => {
-      localRenderTimer.current = null
-      setCur(curRef.current)
-    }, FRAME_BATCH_MS)
-  }
+      localRenderTimer.current = null;
+      setCur(curRef.current);
+    }, FRAME_BATCH_MS);
+  };
 
   const canFastEchoBase = () =>
-    supportsFastEchoTerminal() && focus && termFocus && !selected && !mask && !!stdout?.isTTY
+    supportsFastEchoTerminal() &&
+    focus &&
+    termFocus &&
+    !selected &&
+    !mask &&
+    !!stdout?.isTTY;
 
   const canFastAppend = (current: string, cursor: number, text: string) =>
     canFastEchoBase() &&
@@ -1099,14 +1254,22 @@ export function TextInput({
     // Typing can RE-COLOR cells already on screen: `]` closing a `[[ token ]]`,
     // or a second `/` demoting `/usr` to a path. The bypass only writes the new
     // cells, so anything that repaints old ones must take the Ink path.
-    (!accentOpen || highlightsStable(current, current.slice(0, cursor) + text + current.slice(cursor)))
+    (!accentOpen ||
+      highlightsStable(
+        current,
+        current.slice(0, cursor) + text + current.slice(cursor),
+      ));
 
   const canFastBackspace = (current: string, cursor: number) =>
     !inkRepaintedRef.current &&
     canFastEchoBase() &&
     canFastBackspaceShape(current, cursor, columns) &&
     // Deleting can re-color survivors too (erasing `]` re-opens the token).
-    (!accentOpen || highlightsStable(current, current.slice(0, prevPos(current, cursor)) + current.slice(cursor)))
+    (!accentOpen ||
+      highlightsStable(
+        current,
+        current.slice(0, prevPos(current, cursor)) + current.slice(cursor),
+      ));
 
   const commit = (
     next: string,
@@ -1114,45 +1277,48 @@ export function TextInput({
     track = true,
     syncParent = true,
     syncLocal = true,
-    nextLineWidth?: number
+    nextLineWidth?: number,
   ) => {
-    const prev = vRef.current
-    const c = snapPos(next, nextCur)
-    editVersionRef.current += 1
+    const prev = vRef.current;
+    const c = snapPos(next, nextCur);
+    editVersionRef.current += 1;
 
     if (selRef.current) {
-      selRef.current = null
-      setSel(null)
+      selRef.current = null;
+      setSel(null);
     }
 
     if (track && next !== prev) {
-      undo.current.push({ cursor: curRef.current, value: prev })
+      undo.current.push({ cursor: curRef.current, value: prev });
 
       if (undo.current.length > 200) {
-        undo.current.shift()
+        undo.current.shift();
       }
 
-      redo.current = []
+      redo.current = [];
     }
 
     if (syncLocal) {
-      cancelLocalRender()
-      setCur(c)
+      cancelLocalRender();
+      setCur(c);
     } else {
-      scheduleLocalRender()
+      scheduleLocalRender();
     }
 
-    curRef.current = c
-    vRef.current = next
+    curRef.current = c;
+    vRef.current = next;
     lineWidthRef.current =
-      nextLineWidth ?? stringWidth(next.includes('\n') ? next.slice(next.lastIndexOf('\n') + 1) : next)
+      nextLineWidth ??
+      stringWidth(
+        next.includes("\n") ? next.slice(next.lastIndexOf("\n") + 1) : next,
+      );
 
     if (next !== prev) {
       if (syncParent) {
-        flushParentChange()
-        self.current = true
-        emittedValueRef.current = next
-        cbChange.current(next)
+        flushParentChange();
+        self.current = true;
+        emittedValueRef.current = next;
+        cbChange.current(next);
         // A full Ink repaint just happened. Mark it so any fast-echo backspace
         // later in this IME recompose burst is suppressed (it would write
         // "\b \b" against a baseline Ink just invalidated, stranding the U+202F
@@ -1161,485 +1327,530 @@ export function TextInput({
         // clear the flag between reads and miss the very backspaces it must
         // guard. Use a short real-time window that spans a recompose burst;
         // normal typing re-enables fast-echo via the append path below.
-        inkRepaintedRef.current = true
+        inkRepaintedRef.current = true;
 
         if (inkRepaintResetTimer.current) {
-          clearTimeout(inkRepaintResetTimer.current)
+          clearTimeout(inkRepaintResetTimer.current);
         }
 
         inkRepaintResetTimer.current = setTimeout(() => {
-          inkRepaintResetTimer.current = null
-          inkRepaintedRef.current = false
-        }, 60)
+          inkRepaintResetTimer.current = null;
+          inkRepaintedRef.current = false;
+        }, 60);
       } else {
-        self.current = true
-        scheduleParentChange(next)
+        self.current = true;
+        scheduleParentChange(next);
       }
     }
-  }
+  };
+
+  // commit is rebuilt on every render. The selection handlers published by the
+  // effect above call it through this ref, so that effect keeps its [cur, focus,
+  // selected] deps and does not re-publish the selection on every render.
+  const commitRef = useRef(commit);
+  commitRef.current = commit;
 
   const swap = (from: typeof undo, to: typeof redo) => {
-    const entry = from.current.pop()
+    const entry = from.current.pop();
 
     if (!entry) {
-      return
+      return;
     }
 
-    to.current.push({ cursor: curRef.current, value: vRef.current })
-    commit(entry.value, entry.cursor, false)
-  }
+    to.current.push({ cursor: curRef.current, value: vRef.current });
+    commit(entry.value, entry.cursor, false);
+  };
 
   const emitPaste = (e: PasteEvent) => {
-    const startVersion = editVersionRef.current
-    const h = cbPaste.current?.(e)
+    const startVersion = editVersionRef.current;
+    const h = cbPaste.current?.(e);
 
     if (isPasteResultPromise(h)) {
-      const fallbackText = e.text
+      const fallbackText = e.text;
 
       void h
-        .then(result => {
+        .then((result) => {
           if (result && editVersionRef.current === startVersion) {
-            commit(result.value, result.cursor)
+            commit(result.value, result.cursor);
           } else if (result && fallbackText && PRINTABLE.test(fallbackText)) {
             // User typed while async paste was in-flight — fall back to raw text insert
             // so the pasted content is not silently lost.
-            const cur = curRef.current
-            const v = vRef.current
-            commit(v.slice(0, cur) + fallbackText + v.slice(cur), cur + fallbackText.length)
+            const cur = curRef.current;
+            const v = vRef.current;
+            commit(
+              v.slice(0, cur) + fallbackText + v.slice(cur),
+              cur + fallbackText.length,
+            );
           }
         })
-        .catch(() => {})
+        .catch(() => {});
 
-      return true
+      return true;
     }
 
     if (h) {
-      commit(h.value, h.cursor)
+      commit(h.value, h.cursor);
     }
 
-    return !!h
-  }
+    return !!h;
+  };
 
   const flushKeyBurst = () => {
     if (keyBurstTimer.current) {
-      clearTimeout(keyBurstTimer.current)
-      keyBurstTimer.current = null
+      clearTimeout(keyBurstTimer.current);
+      keyBurstTimer.current = null;
     }
 
-    flushParentChange()
-  }
-
-  const scheduleKeyBurstCommit = (next: string, nextCur: number) => {
-    commit(next, nextCur, true, false, false)
-
-    if (keyBurstTimer.current) {
-      return
-    }
-
-    keyBurstTimer.current = setTimeout(() => {
-      keyBurstTimer.current = null
-      flushParentChange()
-    }, FRAME_BATCH_MS)
-  }
+    flushParentChange();
+  };
 
   const clearSel = () => {
     if (!selRef.current) {
-      return
+      return;
     }
 
-    selRef.current = null
-    setSel(null)
-  }
+    selRef.current = null;
+    setSel(null);
+  };
 
   const selectAll = () => {
-    const end = vRef.current.length
+    const end = vRef.current.length;
 
     if (!end) {
-      return
+      return;
     }
 
-    const next = { end, start: 0 }
-    selRef.current = next
-    setSel(next)
-    setCur(end)
-    curRef.current = end
-  }
+    const next = { end, start: 0 };
+    selRef.current = next;
+    setSel(next);
+    setCur(end);
+    curRef.current = end;
+  };
 
   const moveCursor = (next: number, extend = false) => {
-    const c = snapPos(vRef.current, next)
-    const anchor = selRef.current?.start ?? curRef.current
+    const c = snapPos(vRef.current, next);
+    const anchor = selRef.current?.start ?? curRef.current;
 
     if (!extend || anchor === c) {
-      clearSel()
+      clearSel();
     } else {
-      const nextSel = { end: c, start: anchor }
-      selRef.current = nextSel
-      setSel(nextSel)
+      const nextSel = { end: c, start: anchor };
+      selRef.current = nextSel;
+      setSel(nextSel);
     }
 
-    setCur(c)
-    curRef.current = c
-  }
+    setCur(c);
+    curRef.current = c;
+  };
 
   const selRange = () => {
-    const range = selRef.current
+    const range = selRef.current;
 
     return range && range.start !== range.end
-      ? { end: Math.max(range.start, range.end), start: Math.min(range.start, range.end) }
-      : null
-  }
+      ? {
+          end: Math.max(range.start, range.end),
+          start: Math.min(range.start, range.end),
+        }
+      : null;
+  };
 
-  const ins = (v: string, c: number, s: string) => v.slice(0, c) + s + v.slice(c)
+  const ins = (v: string, c: number, s: string) =>
+    v.slice(0, c) + s + v.slice(c);
 
   const pastePlainText = (text: string) => {
-    const cleaned = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+    const cleaned = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 
     if (!cleaned) {
-      return
+      return;
     }
 
-    const range = selRange()
+    const range = selRange();
 
     const nextValue = range
-      ? vRef.current.slice(0, range.start) + cleaned + vRef.current.slice(range.end)
-      : vRef.current.slice(0, curRef.current) + cleaned + vRef.current.slice(curRef.current)
+      ? vRef.current.slice(0, range.start) +
+        cleaned +
+        vRef.current.slice(range.end)
+      : vRef.current.slice(0, curRef.current) +
+        cleaned +
+        vRef.current.slice(curRef.current);
 
-    const nextCursor = range ? range.start + cleaned.length : curRef.current + cleaned.length
+    const nextCursor = range
+      ? range.start + cleaned.length
+      : curRef.current + cleaned.length;
 
-    commit(nextValue, nextCursor)
-  }
+    commit(nextValue, nextCursor);
+  };
 
   const startMouseSelection = (next: number) => {
-    const c = snapPos(vRef.current, next)
+    const c = snapPos(vRef.current, next);
 
-    mouseAnchorRef.current = c
-    selRef.current = { end: c, start: c }
-    setSel(null)
-    setCur(c)
-    curRef.current = c
-  }
+    mouseAnchorRef.current = c;
+    selRef.current = { end: c, start: c };
+    setSel(null);
+    setCur(c);
+    curRef.current = c;
+  };
 
   const dragMouseSelection = (next: number) => {
     if (mouseAnchorRef.current === null) {
-      return
+      return;
     }
 
-    const c = snapPos(vRef.current, next)
-    const range = { end: c, start: mouseAnchorRef.current }
-    selRef.current = range
-    setSel(range.start === range.end ? null : range)
-    setCur(c)
-    curRef.current = c
-  }
+    const c = snapPos(vRef.current, next);
+    const range = { end: c, start: mouseAnchorRef.current };
+    selRef.current = range;
+    setSel(range.start === range.end ? null : range);
+    setCur(c);
+    curRef.current = c;
+  };
 
   const endMouseSelection = () => {
-    mouseAnchorRef.current = null
+    mouseAnchorRef.current = null;
 
-    const range = selRef.current
+    const range = selRef.current;
 
     if (range && range.start === range.end) {
-      selRef.current = null
-      setSel(null)
+      selRef.current = null;
+      setSel(null);
 
-      return
+      return;
     }
 
-    const normalized = selRange()
+    const normalized = selRange();
 
     if (isMac && normalized) {
-      void writeClipboardText(vRef.current.slice(normalized.start, normalized.end))
+      void writeClipboardText(
+        vRef.current.slice(normalized.start, normalized.end),
+      );
     }
-  }
+  };
 
   const offsetAt = (e: { localCol?: number; localRow?: number }) =>
-    offsetFromPosition(display, e.localRow ?? 0, e.localCol ?? 0, columns)
+    offsetFromPosition(display, e.localRow ?? 0, e.localCol ?? 0, columns);
 
   const isMultiClickAt = (offset: number) => {
-    const now = Date.now()
-    const last = lastClickRef.current
-    lastClickRef.current = { at: now, offset }
+    const now = Date.now();
+    const last = lastClickRef.current;
+    lastClickRef.current = { at: now, offset };
 
-    return now - last.at < MULTI_CLICK_MS && offset === last.offset
-  }
+    return now - last.at < MULTI_CLICK_MS && offset === last.offset;
+  };
 
   if (mouseApiRef) {
     mouseApiRef.current = {
-      dragAt: (row, col) => dragMouseSelection(offsetFromPosition(display, row, col, columns)),
+      dragAt: (row, col) =>
+        dragMouseSelection(offsetFromPosition(display, row, col, columns)),
       end: endMouseSelection,
-      startAtBeginning: () => startMouseSelection(0)
-    }
+      startAtBeginning: () => startMouseSelection(0),
+    };
   }
 
   useInput(
     (inp: string, k: Key, event: InputEvent) => {
-      const eventRaw = event.keypress.raw
+      const eventRaw = event.keypress.raw;
 
       // F7 is reserved for global (composer-external) handling so users keep
       // one predictable chord that always escapes composer-level defaults.
-      if (event.keypress.name === 'f7') {
-        flushKeyBurst()
+      if (event.keypress.name === "f7") {
+        flushKeyBurst();
 
-        return
+        return;
       }
 
       if (
-        eventRaw === '\x1bv' ||
-        eventRaw === '\x1bV' ||
-        eventRaw === '\x16' ||
-        (isMac && isActionMod(k) && inp.toLowerCase() === 'v')
+        eventRaw === "\x1bv" ||
+        eventRaw === "\x1bV" ||
+        eventRaw === "\x16" ||
+        (isMac && isActionMod(k) && inp.toLowerCase() === "v")
       ) {
-        flushKeyBurst()
+        flushKeyBurst();
 
         if (cbPaste.current) {
-          return void emitPaste({ cursor: curRef.current, hotkey: true, text: '', value: vRef.current })
+          return void emitPaste({
+            cursor: curRef.current,
+            hotkey: true,
+            text: "",
+            value: vRef.current,
+          });
         }
 
         if (isMac) {
-          void readClipboardText().then(text => {
+          void readClipboardText().then((text) => {
             if (text) {
-              pastePlainText(text)
+              pastePlainText(text);
             }
-          })
+          });
         }
 
-        return
+        return;
       }
 
-      if (isMac && isActionMod(k) && inp.toLowerCase() === 'c') {
-        flushKeyBurst()
+      if (isMac && isActionMod(k) && inp.toLowerCase() === "c") {
+        flushKeyBurst();
 
-        const range = selRange()
+        const range = selRange();
 
         if (range) {
-          const text = vRef.current.slice(range.start, range.end)
+          const text = vRef.current.slice(range.start, range.end);
 
-          void writeClipboardText(text)
+          void writeClipboardText(text);
         }
 
-        return
+        return;
       }
 
       if ((k.upArrow || k.downArrow) && !ignoreVerticalArrows) {
-        flushKeyBurst()
+        flushKeyBurst();
 
-        const next = lineNav(vRef.current, curRef.current, k.upArrow ? -1 : 1)
+        const next = lineNav(vRef.current, curRef.current, k.upArrow ? -1 : 1);
 
         if (next !== null) {
-          moveCursor(next, k.shift)
+          moveCursor(next, k.shift);
 
-          return
+          return;
         }
 
-        return
+        return;
       }
 
       if (k.return) {
-        flushKeyBurst()
+        flushKeyBurst();
 
-        const range = selRange()
-        const pending = valueForReturnSubmit(vRef.current, curRef.current, inp, range)
-        const sequence = (event.keypress as { sequence?: string }).sequence
-        const insertNewline = shouldInsertNewlineOnReturn(k, sequence ?? '')
+        const range = selRange();
+        const pending = valueForReturnSubmit(
+          vRef.current,
+          curRef.current,
+          inp,
+          range,
+        );
+        const sequence = (event.keypress as { sequence?: string }).sequence;
+        const insertNewline = shouldInsertNewlineOnReturn(k, sequence ?? "");
 
         if (insertNewline) {
-          commit(ins(pending.value, pending.cursor, '\n'), pending.cursor + 1)
+          commit(ins(pending.value, pending.cursor, "\n"), pending.cursor + 1);
         } else {
-          cbSubmit.current?.(pending.value)
+          cbSubmit.current?.(pending.value);
         }
 
-        return
+        return;
       }
 
-      let c = curRef.current
-      let v = vRef.current
-      const mod = isActionMod(k)
-      const wordMod = mod || k.meta
-      const actionHome = k.home || (!isMac && mod && inp === 'a') || isMacActionFallback(k, inp, 'a')
-      const actionEnd = k.end || (mod && inp === 'e') || isMacActionFallback(k, inp, 'e')
-      const actionDeleteToStart = (mod && inp === 'u') || isMacActionFallback(k, inp, 'u')
-      const actionKillToEnd = (mod && inp === 'k') || isMacActionFallback(k, inp, 'k')
-      const actionDeleteWord = (mod && inp === 'w') || isMacActionFallback(k, inp, 'w')
-      const range = selRange()
-      const delFwd = k.delete || fwdDel.current
+      let c = curRef.current;
+      let v = vRef.current;
+      const mod = isActionMod(k);
+      const wordMod = mod || k.meta;
+      const actionHome =
+        k.home ||
+        (!isMac && mod && inp === "a") ||
+        isMacActionFallback(k, inp, "a");
+      const actionEnd =
+        k.end || (mod && inp === "e") || isMacActionFallback(k, inp, "e");
+      const actionDeleteToStart =
+        (mod && inp === "u") || isMacActionFallback(k, inp, "u");
+      const actionKillToEnd =
+        (mod && inp === "k") || isMacActionFallback(k, inp, "k");
+      const actionDeleteWord =
+        (mod && inp === "w") || isMacActionFallback(k, inp, "w");
+      const range = selRange();
+      const delFwd = k.delete || fwdDel.current;
 
       const isPrintableInput =
         !event.isControlChord &&
         (event.keypress.isPasted || inp.length > 0) &&
-        PRINTABLE.test(inp.replace(BRACKET_PASTE, ''))
+        PRINTABLE.test(inp.replace(BRACKET_PASTE, ""));
 
       if (!isPrintableInput) {
-        flushKeyBurst()
+        flushKeyBurst();
       }
 
-      if (mod && inp === 'z') {
-        return swap(undo, redo)
+      if (mod && inp === "z") {
+        return swap(undo, redo);
       }
 
       // Extended-key terminals (kitty CSI-u / modifyOtherKeys) deliver a shifted
       // letter as its uppercase char, so Cmd+Shift+Z arrives as inp 'Z' — match
       // case-insensitively like the copy/paste chords above.
-      if ((mod && inp === 'y') || (mod && k.shift && inp.toLowerCase() === 'z')) {
-        return swap(redo, undo)
+      if (
+        (mod && inp === "y") ||
+        (mod && k.shift && inp.toLowerCase() === "z")
+      ) {
+        return swap(redo, undo);
       }
 
-      if (isMac && mod && inp === 'a') {
-        return selectAll()
+      if (isMac && mod && inp === "a") {
+        return selectAll();
       }
 
       if (actionHome) {
-        c = 0
-        moveCursor(c, k.shift)
+        c = 0;
+        moveCursor(c, k.shift);
 
-        return
+        return;
       } else if (actionEnd) {
-        c = v.length
-        moveCursor(c, k.shift)
+        c = v.length;
+        moveCursor(c, k.shift);
 
-        return
+        return;
       } else if (k.leftArrow) {
         if (range && !wordMod && !k.shift) {
-          clearSel()
-          c = range.start
+          clearSel();
+          c = range.start;
         } else {
-          c = wordMod ? wordLeft(v, c) : prevPos(v, c)
+          c = wordMod ? wordLeft(v, c) : prevPos(v, c);
         }
 
-        moveCursor(c, k.shift)
+        moveCursor(c, k.shift);
 
-        return
+        return;
       } else if (k.rightArrow) {
         if (range && !wordMod && !k.shift) {
-          clearSel()
-          c = range.end
+          clearSel();
+          c = range.end;
         } else {
-          c = wordMod ? wordRight(v, c) : nextPos(v, c)
+          c = wordMod ? wordRight(v, c) : nextPos(v, c);
         }
 
-        moveCursor(c, k.shift)
+        moveCursor(c, k.shift);
 
-        return
-      } else if (wordMod && inp === 'b') {
-        clearSel()
-        c = wordLeft(v, c)
-      } else if (wordMod && inp === 'f') {
-        clearSel()
-        c = wordRight(v, c)
-      } else if (wordMod && inp === 'd') {
+        return;
+      } else if (wordMod && inp === "b") {
+        clearSel();
+        c = wordLeft(v, c);
+      } else if (wordMod && inp === "f") {
+        clearSel();
+        c = wordRight(v, c);
+      } else if (wordMod && inp === "d") {
         // meta+d (readline kill-word). The web dashboard maps Ctrl+Delete to
         // ESC d, which hermes-ink decodes as meta+'d'; without this branch it
         // fell through to the printable path and typed a literal "d".
         if (range) {
-          v = v.slice(0, range.start) + v.slice(range.end)
-          c = range.start
+          v = v.slice(0, range.start) + v.slice(range.end);
+          c = range.start;
         } else if (c < v.length) {
-          clearSel()
-          const next = deleteWordForward(v, c)
-          v = next.value
-          c = next.cursor
+          clearSel();
+          const next = deleteWordForward(v, c);
+          v = next.value;
+          c = next.cursor;
         } else {
-          return
+          return;
         }
       } else if (range && (k.backspace || delFwd)) {
-        v = v.slice(0, range.start) + v.slice(range.end)
-        c = range.start
+        v = v.slice(0, range.start) + v.slice(range.end);
+        c = range.start;
       } else if (k.backspace && c > 0) {
         if (isLineKillModifier(k)) {
           // Cmd+Backspace — kill backward to start of line, matching the
           // Ctrl+U (unix-line-discard) path below.
-          ;({ cursor: c, value: v } = killToLineStart(v, c))
+          ({ cursor: c, value: v } = killToLineStart(v, c));
         } else if (wordMod) {
-          const t = wordLeft(v, c)
-          v = v.slice(0, t) + v.slice(c)
-          c = t
+          const t = wordLeft(v, c);
+          v = v.slice(0, t) + v.slice(c);
+          c = t;
         } else if (canFastBackspace(v, c)) {
-          const effect = fastBackspaceEffect(v, c)
-          v = effect.newValue
-          c = effect.newCursor
-          stdout!.write(effect.write)
+          const effect = fastBackspaceEffect(v, c);
+          v = effect.newValue;
+          c = effect.newCursor;
+          stdout!.write(effect.write);
           // The "\b \b" sequence ends with the cursor one column to the
           // LEFT of where Ink last parked it. Tell Ink so its `displayCursor`
           // (and log-update's relative-move basis on the next frame) stays
           // in sync — otherwise the cursor parks one cell to the right of
           // the caret on the next unrelated re-render.
-          noteCursorAdvance(effect.advanceDelta)
-          commit(v, c, true, false, false, Math.max(0, lineWidthRef.current - 1))
+          noteCursorAdvance(effect.advanceDelta);
+          commit(
+            v,
+            c,
+            true,
+            false,
+            false,
+            Math.max(0, lineWidthRef.current - 1),
+          );
 
-          return
+          return;
         } else {
-          const t = prevPos(v, c)
-          v = v.slice(0, t) + v.slice(c)
-          c = t
+          const t = prevPos(v, c);
+          v = v.slice(0, t) + v.slice(c);
+          c = t;
         }
       } else if (delFwd && c < v.length) {
         if (isLineKillModifier(k)) {
           // Cmd+ForwardDelete — kill to end of line, matching Ctrl+K.
-          ;({ cursor: c, value: v } = killToLineEnd(v, c))
+          ({ cursor: c, value: v } = killToLineEnd(v, c));
         } else if (wordMod) {
-          v = deleteWordForward(v, c).value
+          v = deleteWordForward(v, c).value;
         } else {
-          v = v.slice(0, c) + v.slice(nextPos(v, c))
+          v = v.slice(0, c) + v.slice(nextPos(v, c));
         }
       } else if (actionDeleteWord) {
         if (range) {
-          v = v.slice(0, range.start) + v.slice(range.end)
-          c = range.start
+          v = v.slice(0, range.start) + v.slice(range.end);
+          c = range.start;
         } else if (c > 0) {
-          clearSel()
-          const t = wordLeft(v, c)
-          v = v.slice(0, t) + v.slice(c)
-          c = t
+          clearSel();
+          const t = wordLeft(v, c);
+          v = v.slice(0, t) + v.slice(c);
+          c = t;
         } else {
-          return
+          return;
         }
       } else if (actionDeleteToStart) {
         if (range) {
-          v = v.slice(0, range.start) + v.slice(range.end)
-          c = range.start
+          v = v.slice(0, range.start) + v.slice(range.end);
+          c = range.start;
         } else {
-          ;({ cursor: c, value: v } = killToLineStart(v, c))
+          ({ cursor: c, value: v } = killToLineStart(v, c));
         }
       } else if (actionKillToEnd) {
         if (range) {
-          v = v.slice(0, range.start) + v.slice(range.end)
-          c = range.start
+          v = v.slice(0, range.start) + v.slice(range.end);
+          c = range.start;
         } else {
-          ;({ cursor: c, value: v } = killToLineEnd(v, c))
+          ({ cursor: c, value: v } = killToLineEnd(v, c));
         }
-      } else if (event.keypress.isPasted || (inp.length > 0 && !event.isControlChord)) {
-        const bracketed = event.keypress.isPasted || inp.includes('[200~')
-        const text = inp.replace(BRACKET_PASTE, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+      } else if (
+        event.keypress.isPasted ||
+        (inp.length > 0 && !event.isControlChord)
+      ) {
+        const bracketed = event.keypress.isPasted || inp.includes("[200~");
+        const text = inp
+          .replace(BRACKET_PASTE, "")
+          .replace(/\r\n/g, "\n")
+          .replace(/\r/g, "\n");
 
-        if (bracketed && emitPaste({ bracketed: true, cursor: c, text, value: v })) {
-          return
+        if (
+          bracketed &&
+          emitPaste({ bracketed: true, cursor: c, text, value: v })
+        ) {
+          return;
         }
 
         if (!text) {
-          return
+          return;
         }
 
-        if (text === '\n') {
-          return commit(ins(v, c, '\n'), c + 1)
+        if (text === "\n") {
+          return commit(ins(v, c, "\n"), c + 1);
         }
 
-        if (text.length > 1 || text.includes('\n')) {
+        if (text.length > 1 || text.includes("\n")) {
           if (shouldRouteMultiCharInputAsPaste(text)) {
-            flushKeyBurst()
+            flushKeyBurst();
 
             if (!emitPaste({ cursor: c, text, value: v })) {
-              commit(ins(v, c, text), c + text.length)
+              commit(ins(v, c, text), c + text.length);
             }
 
-            return
+            return;
           }
 
-          const inserted = applyPrintableInsert(v, c, text, range)
+          const inserted = applyPrintableInsert(v, c, text, range);
 
           if (!inserted) {
-            return
+            return;
           }
 
-          v = inserted.value
-          c = inserted.cursor
+          v = inserted.value;
+          c = inserted.cursor;
           // Multi-character inserts are IME recompositions or pastes, NOT rapid
           // single-key typing. Committing them through the 16ms deferred
           // key-burst path opens a race: when an IME recompose arrives as a
@@ -1650,44 +1861,53 @@ export function TextInput({
           // flushes, snapping the buffer back to a stale parent value and
           // dropping the recomposed tail (the "hanhj -> hạ␣␣" bug). Commit
           // synchronously so the recomposed value reaches the parent atomically.
-          commit(v, c)
+          commit(v, c);
 
-          return
+          return;
         }
 
         {
-          const inserted = applyPrintableInsert(v, c, text, range)
+          const inserted = applyPrintableInsert(v, c, text, range);
 
           if (!inserted) {
-            return
+            return;
           }
 
           if (range) {
-            v = inserted.value
-            c = inserted.cursor
+            v = inserted.value;
+            c = inserted.cursor;
           } else {
-            const simpleAppend = canFastAppend(v, c, text)
-            const preInsertValue = v
-            const preInsertCursor = c
+            const simpleAppend = canFastAppend(v, c, text);
+            const preInsertValue = v;
+            const preInsertCursor = c;
 
-            v = inserted.value
-            c = inserted.cursor
+            v = inserted.value;
+            c = inserted.cursor;
 
             if (simpleAppend) {
-              const effect = fastAppendEffect(preInsertValue, preInsertCursor, text)
+              const effect = fastAppendEffect(
+                preInsertValue,
+                preInsertCursor,
+                text,
+              );
               // Same explicit fg as the Ink render (see the <Text color>) —
               // the bypass cell must not flash the terminal-default color. A
               // character landing inside a `/skill` / `@ref` / `[[ token ]]`
               // takes the accent, matching what Ink would have painted.
-              stdout!.write(colorizeEcho(effect.write, highlightMask(v)[preInsertCursor] ? accentColor : color))
+              stdout!.write(
+                colorizeEcho(
+                  effect.write,
+                  highlightMask(v)[preInsertCursor] ? accentColor : color,
+                ),
+              );
               // A real character was just fast-echoed to the screen, so the
               // terminal baseline is synced again — clear any pending Ink-repaint
               // fast-echo suppression so normal backspace fast-echo resumes.
-              inkRepaintedRef.current = false
+              inkRepaintedRef.current = false;
 
               if (inkRepaintResetTimer.current) {
-                clearTimeout(inkRepaintResetTimer.current)
-                inkRepaintResetTimer.current = null
+                clearTimeout(inkRepaintResetTimer.current);
+                inkRepaintResetTimer.current = null;
               }
 
               // ASCII-printable text advances the physical cursor by exactly
@@ -1697,83 +1917,95 @@ export function TextInput({
               // any unrelated re-render that happens before the 16ms
               // setCur/setParent flush parks the cursor text.length cells
               // too far right (#cursor-drift).
-              noteCursorAdvance(effect.advanceDelta)
-              commit(v, c, true, false, false, lineWidthRef.current + stringWidth(text))
+              noteCursorAdvance(effect.advanceDelta);
+              commit(
+                v,
+                c,
+                true,
+                false,
+                false,
+                lineWidthRef.current + stringWidth(text),
+              );
 
-              return
+              return;
             }
           }
         }
       } else {
-        return
+        return;
       }
 
-      commit(v, c)
+      commit(v, c);
     },
-    { isActive: focus }
-  )
+    { isActive: focus },
+  );
 
   return (
     <Box
       onClick={(e: MouseEventLite) => {
         if (!focus) {
-          return
+          return;
         }
 
-        e.stopImmediatePropagation?.()
-        clearSel()
-        const next = offsetAt(e)
-        setCur(next)
-        curRef.current = next
+        e.stopImmediatePropagation?.();
+        clearSel();
+        const next = offsetAt(e);
+        setCur(next);
+        curRef.current = next;
       }}
       onMouseDown={(e: MouseEventLite) => {
         if (!focus) {
-          return
+          return;
         }
 
         // Right-click → copy active selection if any, otherwise paste.
         if (e.button === 2) {
-          e.stopImmediatePropagation?.()
-          const decision = decideRightClickAction(vRef.current, selRange())
+          e.stopImmediatePropagation?.();
+          const decision = decideRightClickAction(vRef.current, selRange());
 
-          if (decision.action === 'copy') {
-            void writeClipboardText(decision.text)
+          if (decision.action === "copy") {
+            void writeClipboardText(decision.text);
 
-            return
+            return;
           }
 
-          emitPaste({ cursor: curRef.current, hotkey: true, text: '', value: vRef.current })
+          emitPaste({
+            cursor: curRef.current,
+            hotkey: true,
+            text: "",
+            value: vRef.current,
+          });
 
-          return
+          return;
         }
 
         if (e.button !== 0) {
-          return
+          return;
         }
 
-        e.stopImmediatePropagation?.()
-        const offset = offsetAt(e)
+        e.stopImmediatePropagation?.();
+        const offset = offsetAt(e);
 
         if (isMultiClickAt(offset)) {
-          mouseAnchorRef.current = null
-          selectAll()
+          mouseAnchorRef.current = null;
+          selectAll();
 
-          return
+          return;
         }
 
-        startMouseSelection(offset)
+        startMouseSelection(offset);
       }}
       onMouseDrag={(e: MouseEventLite) => {
         if (!focus || e.button !== 0 || mouseAnchorRef.current === null) {
-          return
+          return;
         }
 
-        e.stopImmediatePropagation?.()
-        dragMouseSelection(offsetAt(e))
+        e.stopImmediatePropagation?.();
+        dragMouseSelection(offsetAt(e));
       }}
       onMouseUp={(e: MouseEventLite) => {
-        e.stopImmediatePropagation?.()
-        endMouseSelection()
+        e.stopImmediatePropagation?.();
+        endMouseSelection();
       }}
       ref={boxRef}
       width={columns}
@@ -1787,53 +2019,57 @@ export function TextInput({
         {rendered}
       </Text>
     </Box>
-  )
+  );
 }
 
 type MouseEventLite = {
-  button?: number
-  localCol?: number
-  localRow?: number
-  stopImmediatePropagation?: () => void
-}
+  button?: number;
+  localCol?: number;
+  localRow?: number;
+  stopImmediatePropagation?: () => void;
+};
 
 export interface PasteEvent {
-  bracketed?: boolean
-  cursor: number
-  hotkey?: boolean
-  text: string
-  value: string
+  bracketed?: boolean;
+  cursor: number;
+  hotkey?: boolean;
+  text: string;
+  value: string;
 }
 
 export interface InputCursorSnapshot {
-  cursor: number
-  value: string
+  cursor: number;
+  value: string;
 }
 
 interface TextInputProps {
   /** Hex/ansi256 tone for `/skill`, `@ref`, and `[[ token ]]` spans. */
-  accentColor?: string
+  accentColor?: string;
   /** Hex color for typed text (theme text); terminal default when omitted. */
-  color?: string
-  columns?: number
-  cursorSnapshotRef?: MutableRefObject<InputCursorSnapshot | null>
-  focus?: boolean
+  color?: string;
+  columns?: number;
+  cursorSnapshotRef?: MutableRefObject<InputCursorSnapshot | null>;
+  focus?: boolean;
   /** Leave ↑/↓ to the owner: a form that moves field focus with them owns the key, not the field. */
-  ignoreVerticalArrows?: boolean
-  mask?: string
-  mouseApiRef?: MutableRefObject<null | TextInputMouseApi>
-  onChange: (v: string) => void
+  ignoreVerticalArrows?: boolean;
+  mask?: string;
+  mouseApiRef?: MutableRefObject<null | TextInputMouseApi>;
+  onChange: (v: string) => void;
   onPaste?: (
-    e: PasteEvent
-  ) => { cursor: number; value: string } | Promise<{ cursor: number; value: string } | null> | null
-  onSubmit?: (v: string) => void
-  placeholder?: string
+    e: PasteEvent,
+  ) =>
+    | { cursor: number; value: string }
+    | Promise<{ cursor: number; value: string } | null>
+    | null;
+  onSubmit?: (v: string) => void;
+  placeholder?: string;
   /** Hex color for placeholder text (theme muted); SGR dim when omitted. */
-  placeholderColor?: string
-  value: string
+  placeholderColor?: string;
+  value: string;
 }
 
-export type RightClickDecision = { action: 'copy'; text: string } | { action: 'paste' }
+export type RightClickDecision =
+  { action: "copy"; text: string } | { action: "paste" };
 
 /**
  * Decide what right-click should do on the composer:
@@ -1848,34 +2084,37 @@ export type RightClickDecision = { action: 'copy'; text: string } | { action: 'p
  */
 export function decideRightClickAction(
   value: string,
-  range: { end: number; start: number } | null
+  range: { end: number; start: number } | null,
 ): RightClickDecision {
   if (range && range.end > range.start) {
-    const text = value.slice(range.start, range.end)
+    const text = value.slice(range.start, range.end);
 
     if (text) {
-      return { action: 'copy', text }
+      return { action: "copy", text };
     }
   }
 
-  return { action: 'paste' }
+  return { action: "paste" };
 }
 
-export const shouldPassThroughToGlobalHandler = (input: string, key: Key): boolean =>
+export const shouldPassThroughToGlobalHandler = (
+  input: string,
+  key: Key,
+): boolean =>
   Boolean(
-    (key.ctrl && input === 'c') ||
-      (key.ctrl && input === 'x') ||
-      (key.ctrl && input === 'o') ||
-      (key.ctrl && (input === 'r' || input === 't')) ||
-      key.tab ||
-      (key.shift && key.tab) ||
-      key.pageUp ||
-      key.pageDown ||
-      key.escape
-  )
+    (key.ctrl && input === "c") ||
+    (key.ctrl && input === "x") ||
+    (key.ctrl && input === "o") ||
+    (key.ctrl && (input === "r" || input === "t")) ||
+    key.tab ||
+    (key.shift && key.tab) ||
+    key.pageUp ||
+    key.pageDown ||
+    key.escape,
+  );
 
 export interface TextInputMouseApi {
-  dragAt: (row: number, col: number) => void
-  end: () => void
-  startAtBeginning: () => void
+  dragAt: (row: number, col: number) => void;
+  end: () => void;
+  startAtBeginning: () => void;
 }

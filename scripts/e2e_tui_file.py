@@ -11,6 +11,7 @@ Env switches:
   E2E_FAKE=1    use the scripted fake provider (writes the target file via a bash tool call)
                 instead of OmniRoute, so the run needs no API quota.
 """
+
 import os
 import re
 import sys
@@ -30,8 +31,13 @@ if FAKE:
     (home / "fake.json").write_text(
         json.dumps(
             [
-                {"type": "tool_call", "id": "c1", "name": "bash", "when": "first",
-                 "arguments": {"command": "printf works > e2e.txt"}},
+                {
+                    "type": "tool_call",
+                    "id": "c1",
+                    "name": "bash",
+                    "when": "first",
+                    "arguments": {"command": "printf works > e2e.txt"},
+                },
                 {"type": "text", "text": "done: wrote e2e.txt", "when": "after_tool"},
                 {"type": "usage", "prompt_tokens": 5, "completion_tokens": 2},
             ]
@@ -43,8 +49,10 @@ if FAKE:
     )
 else:
     if os.environ.get("K3_ALLOW_OMNIROUTE") != "1":
-        sys.exit("OmniRoute use is paused by the owner (2026-10-07): run with E2E_FAKE=1, "
-                 "or set K3_ALLOW_OMNIROUTE=1 to go live")
+        sys.exit(
+            "OmniRoute use is paused by the owner (2026-10-07): run with E2E_FAKE=1, "
+            "or set K3_ALLOW_OMNIROUTE=1 to go live"
+        )
     (home / "config.yaml").write_text(
         "providers:\n"
         '  - {name: omniroute, kind: openai, base_url: "http://localhost:20128/v1", '
@@ -81,8 +89,16 @@ if DAEMON:
             break
         time.sleep(0.1)
     print("daemon-socket-up", sock.exists())
-child = pexpect.spawn("node", [str(repo / "tui/dist/entry.js")], cwd=str(work), env=env,
-                      dimensions=(40, 140), encoding="utf-8", codec_errors="replace", timeout=5)
+child = pexpect.spawn(
+    "node",
+    [str(repo / "tui/dist/entry.js")],
+    cwd=str(work),
+    env=env,
+    dimensions=(40, 140),
+    encoding="utf-8",
+    codec_errors="replace",
+    timeout=5,
+)
 ansi = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b[()][AB0]|\x1b[=>]")
 screen = ""
 

@@ -84,10 +84,10 @@ def _print_event(event: RouterEvent) -> None:
 
 def _build_reliability(config: Any, session: str) -> Reliability:
     """M2: build the reliability bundle from the config's reliability dict."""
-    from k3code.config import K3CODE_HOME
+    from k3code.paths import home as k3code_home
     from k3code.reliability import build_reliability
 
-    return build_reliability(config, session=session, home=K3CODE_HOME)
+    return build_reliability(config, session=session, home=k3code_home())
 
 
 async def _run_headless(
@@ -151,9 +151,7 @@ async def _run_headless(
 
     try:
         await reliability.start()
-        async for _ in loop.run(
-            prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume
-        ):
+        async for _ in loop.run(prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume):
             pass
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
@@ -202,8 +200,12 @@ async def _run_repl(
     cooldowns = CooldownStore(path=_cooldown_path())
 
     def make_router() -> Router:
-        return Router(build_chain(providers, _resolve_model_specs(config)), cooldowns=cooldowns,
-                      on_event=_print_event, **router_options(config))
+        return Router(
+            build_chain(providers, _resolve_model_specs(config)),
+            cooldowns=cooldowns,
+            on_event=_print_event,
+            **router_options(config),
+        )
 
     router = make_router()
 
@@ -269,9 +271,7 @@ async def _run_repl(
         loop.on_text_delta = on_text_delta
 
         try:
-            async for _ in loop.run(
-                user_input, max_tokens=config.max_tokens, temperature=config.temperature
-            ):
+            async for _ in loop.run(user_input, max_tokens=config.max_tokens, temperature=config.temperature):
                 pass
             print()  # newline after streaming
         except AllProvidersUnreachable as e:
@@ -351,11 +351,20 @@ def main(
 
     import asyncio
 
+    from k3code import trust
     from k3code.config import load_config
     from k3code.permissions import PermissionMode
 
-    # Load config
-    config = load_config(project_dir=config_dir or Path.cwd())
+    # Load config. A project config is applied only once the user trusted this exact file. Interactive opens are
+    # asked here, in this process (the TUI's gateway is a piped child and cannot ask); headless runs never ask.
+    project_dir = config_dir or Path.cwd()
+    if not prompt and _is_interactive():
+        _offer_project_trust(project_dir)
+    config = load_config(project_dir=project_dir)
+    if trust.decision(project_dir) in (trust.UNDECIDED, trust.DECLINED):
+        click.echo(
+            f"k3code: ignoring {trust.config_path(project_dir)} (not trusted; `k3code trust` applies it)", err=True
+        )
     if not config.providers and (prompt or not _is_interactive()):
         from k3code.setup.onboard import NO_CONFIG_HINT
 
@@ -374,8 +383,13 @@ def main(
     if prompt:
         result = asyncio.run(
             _run_headless(
-                prompt, model=model, permission_mode=permission_mode, config=config, json_output=json_output,
-                session=session, resume=resume,
+                prompt,
+                model=model,
+                permission_mode=permission_mode,
+                config=config,
+                json_output=json_output,
+                session=session,
+                resume=resume,
             )
         )
         if json_output and result:
@@ -392,6 +406,22 @@ def main(
 
 def _is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _offer_project_trust(project_dir: Path) -> None:
+    """Show what the project config changes and remember the answer; asked once per version of the file."""
+    from k3code import trust
+
+    if trust.decision(project_dir) != trust.UNDECIDED:
+        return
+    if (why := trust.problem(project_dir)) is not None:
+        click.echo(f"{trust.config_path(project_dir)} is ignored: {why}.", err=True)
+        return
+    click.echo(f"{trust.config_path(project_dir)} changes how k3code runs in this project:", err=True)
+    for line in trust.summary(project_dir) or []:
+        click.echo(f"  - {line}", err=True)
+    answer = click.confirm("Trust this project config?", default=False, err=True)
+    trust.record(project_dir, trusted=answer)
 
 
 def _run_gateway() -> None:
@@ -434,10 +464,13 @@ def _launch_tui(*, model: str | None = None, env_extra: dict[str, str] | None = 
 
         config = load_config(project_dir=Path.cwd())
         with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(_run_repl(
-                model=model, permission_mode=_permission_from_config("permission_mode", config.permission_mode),
-                config=config,
-            ))
+            asyncio.run(
+                _run_repl(
+                    model=model,
+                    permission_mode=_permission_from_config("permission_mode", config.permission_mode),
+                    config=config,
+                )
+            )
         return
 
     env = os.environ.copy()
@@ -606,13 +639,18 @@ def service_status() -> None:
 @cli.command("doctor")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
 @click.option("--no-probe", is_flag=True, help="Skip network probes")
-def doctor_cmd(as_json: bool, no_probe: bool) -> None:
+@click.option("--install", "install_subset", is_flag=True, help="Install-time subset: warnings only, always exit 0")
+def doctor_cmd(as_json: bool, no_probe: bool, install_subset: bool) -> None:
     """Health checks with fix hints. Exit status 1 when any check fails."""
     import asyncio
 
     from k3code import doctor
     from k3code.config import load_config
 
+    if install_subset:
+        checks = doctor.install_subset()
+        click.echo(doctor.to_json(checks) if as_json else doctor.format_report(checks))
+        return
     logging.getLogger("httpx").setLevel(logging.WARNING)
     checks = asyncio.run(doctor.run_checks(load_config(project_dir=Path.cwd()), probe=not no_probe))
     click.echo(doctor.to_json(checks) if as_json else doctor.format_report(checks))
@@ -620,7 +658,7 @@ def doctor_cmd(as_json: bool, no_probe: bool) -> None:
 
 
 @cli.command("stats")
-@click.option("--by", type=click.Choice(["day", "session"]), default="day")
+@click.option("--by", type=click.Choice(["day", "session", "turn"]), default="day")
 @click.option("--days", type=int, default=None, help="Only the last N days")
 @click.option("--json", "as_json", is_flag=True)
 def stats_cmd(by: str, days: int | None, as_json: bool) -> None:
@@ -795,6 +833,39 @@ def update_cmd(check: bool, yes: bool, channel: str | None, from_source: bool, d
     raise SystemExit(0 if res.ok else 1)
 
 
+@cli.command("trust")
+@click.argument("path", required=False, type=click.Path(path_type=Path, file_okay=False))
+@click.option("--revoke", is_flag=True, help="Forget the answer: the project config is ignored again until trusted")
+def trust_cmd(path: Path | None, revoke: bool) -> None:
+    """Trust a project's .k3code/config.yaml (PATH, default: the current directory).
+
+    Its MCP servers, permission rules and providers apply from the next start. Headless and piped runs ignore a
+    project config that is not trusted; an interactive open asks again when the file changes.
+    """
+    from k3code import trust
+
+    project_dir = path or Path.cwd()
+    where = trust.config_path(project_dir)
+    if revoke:
+        if trust.revoke(project_dir):
+            click.echo(f"trust revoked for {where}: it is ignored until you trust it again")
+        else:
+            click.echo(f"no trust answer is recorded for {where}")
+        return
+    if (why := trust.problem(project_dir)) is not None:
+        click.echo(f"{where} cannot be trusted: {why}. Fix it first.", err=True)
+        raise SystemExit(1)
+    lines = trust.summary(project_dir)
+    if lines is None:
+        click.echo(f"no project settings in {where}; nothing to trust")
+        return
+    click.echo(f"{where} changes how k3code runs in this project:")
+    for line in lines:
+        click.echo(f"  - {line}")
+    trust.record(project_dir, trusted=True)
+    click.echo("trusted: the project config applies from the next start")
+
+
 @cli.command("config-edit")
 @click.option("--project", is_flag=True, help="Edit the project config instead of the user config")
 def config_edit_cmd(project: bool) -> None:
@@ -849,8 +920,13 @@ def schedule_add(expr: str, prompt: tuple[str, ...], cwd: Path | None, model: st
 
     db, sched = _scheduler_db()
     try:
-        job = sched.add(prompt=" ".join(prompt), schedule=expr, name=name, model=model,
-                        cwd=str((cwd or Path.cwd()).expanduser().resolve()))
+        job = sched.add(
+            prompt=" ".join(prompt),
+            schedule=expr,
+            name=name,
+            model=model,
+            cwd=str((cwd or Path.cwd()).expanduser().resolve()),
+        )
     except ScheduleError as e:
         hint = "For natural language ('every weekday at 9') use /schedule add inside k3code."
         raise click.ClickException(f"{e}\n{hint}") from e

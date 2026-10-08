@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from k3code.errors import AllProvidersUnreachable, ChainExhausted
 from k3code.providers.types import Message, StreamEvent, Usage
 from k3code.reliability.events import PARKED, PAUSED, RESUMED, UNPARKED, EventEmitter
@@ -498,3 +500,33 @@ async def test_a_huge_park_step_cannot_overflow():
     retry._park_step = 5000  # backoff_factor ** 5000 overflows a float
     await retry._park("test", None)
     assert [p.data["delay"] for p in seen if p.kind == PARKED] == [retry.config.park_max]
+
+
+async def test_unattended_server_error_parks_with_retry_after_and_succeeds():
+    error = ChainExhausted("all provider entries failed (last reason: server)", last_reason="server")
+    router = FakeRouter(fails=2, error=error)
+    retry, clock, events, seen = _retry(router, netwatch=FakeNetWatch(NetState.ONLINE))
+    retry.unattended = True
+    out = await _drain(retry.stream([Message(role="user", content="x")], []))
+    assert [e.type for e in out].count("done") == 1  # the turn went on: not failed
+    parked = [e for e in seen if e.kind == PARKED]
+    assert len(parked) == 2 and all(e.data.get("delay") for e in parked)  # retry_after is set on each park
+
+
+async def test_unattended_park_gives_up_after_max_parks():
+    router = FakeRouter(fails=99, error=ChainExhausted("down", last_reason="server"))
+    config = RetryConfig(park_base=1.0, park_max=8.0, poll_interval=0.5, max_unattended_parks=2)
+    retry, clock, events, seen = _retry(router, netwatch=FakeNetWatch(NetState.ONLINE), config=config)
+    retry.unattended = True
+    with pytest.raises(ChainExhausted):
+        await _drain(retry.stream([Message(role="user", content="x")], []))
+    assert sum(1 for e in seen if e.kind == PARKED) == 2
+    assert router.calls == 3  # the first try plus one retry per park
+
+
+async def test_interactive_server_error_still_fails_fast():
+    router = FakeRouter(fails=99, error=ChainExhausted("down", last_reason="server"))
+    retry, clock, events, seen = _retry(router, netwatch=FakeNetWatch(NetState.ONLINE))
+    with pytest.raises(ChainExhausted):
+        await _drain(retry.stream([Message(role="user", content="x")], []))
+    assert router.calls == 1 and seen == []

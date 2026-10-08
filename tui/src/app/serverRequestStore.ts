@@ -1,38 +1,41 @@
-import type { ServerRequest } from '@k3code/shared/json-rpc-channel'
+import type { ServerRequest } from "@k3code/shared/json-rpc-channel";
 
 // Live server→client requests (clarify, approval, sudo, …) keyed by request
 // id. Overlay state keeps only the id; answering resolves the stored request
 // so a re-delivered (`open_requests`) request with the same id reuses the
 // same card. Module-level, like the overlay store: the gateway client and
 // the Ink handlers share one instance per process.
-const open = new Map<string, ServerRequest>()
+const open = new Map<string, ServerRequest>();
 
 export function rememberServerRequest(request: ServerRequest): void {
-  open.set(request.id, request)
+  open.set(request.id, request);
 }
 
 export function forgetServerRequest(id: string): void {
-  open.delete(id)
+  open.delete(id);
 }
 
 /** Answer request `id` and forget it. False when nothing is open under that id (expired / already answered). */
-export function respondToServerRequest(id: string, result: Record<string, unknown>): boolean {
-  const request = open.get(id)
+export function respondToServerRequest(
+  id: string,
+  result: Record<string, unknown>,
+): boolean {
+  const request = open.get(id);
 
   if (!request) {
-    return false
+    return false;
   }
 
-  open.delete(id)
-  request.respond(result)
+  open.delete(id);
+  request.respond(result);
 
-  return true
+  return true;
 }
 
 export function hasOpenServerRequest(id: string): boolean {
-  return open.has(id)
+  return open.has(id);
 }
 
 export function resetServerRequestsForTests(): void {
-  open.clear()
+  open.clear();
 }

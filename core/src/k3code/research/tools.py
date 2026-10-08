@@ -19,13 +19,22 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 from k3code.providers.types import ToolSpec
+from k3code.research.browser import (
+    STOP_VERDICTS,
+    BrowserManager,
+    BrowserUnavailable,
+    RenderedPage,
+    Stopped,
+    Verdict,
+    classify,
+    stop_report,
+)
+from k3code.research.fetch import UA, FetchRefused, FetchStatus, WebFetcher
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SEARXNG = ""  # no default instance: web_search stays off until research.searxng_url is set
 MAX_FETCH_CHARS = 14_000
-MAX_FETCH_BYTES = 2 * 1024 * 1024  # how much of a response body is read at most
-UA = "k3code-research/0.1 (+https://github.com/K3NOXOFFICIAL/k3code)"
 
 
 @dataclass
@@ -107,32 +116,55 @@ def _safe_url(url: str) -> str | None:
     return url if u.scheme in ("http", "https") and u.netloc else None
 
 
-async def fetch_page(url: str, *, timeout: float = 20.0, client: httpx.AsyncClient | None = None) -> tuple[str, str]:
-    """(title, text) of a web page (text truncated). Raises ValueError/httpx errors for the caller to report."""
-    if _safe_url(url) is None:
-        raise ValueError(f"not an http(s) URL: {url}")
-    own = client is None
-    client = client or httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={"User-Agent": UA})
+async def fetch_page(
+    url: str,
+    *,
+    timeout: float = 20.0,
+    client: httpx.AsyncClient | None = None,
+    fetcher: WebFetcher | None = None,
+    browser: BrowserManager | None = None,
+) -> tuple[str, str]:
+    """(title, text) of a web page through the shared fetch layer (cache, per-host rate, robots.txt, deadline).
+    A 403 or a challenge page is read in the browser when one is given. Raises ``Stopped`` at a CAPTCHA, a login
+    wall or a paywall; ``FetchStatus`` for other non-2xx answers; ``FetchRefused`` for robots.txt; httpx errors."""
+    if fetcher is not None:
+        return await _read_page(fetcher, url, browser)
+    own = WebFetcher(client=client, deadline=timeout)  # no shared fetcher: a short-lived one for this call
     try:
-        # Streamed and capped: client.get() buffered the whole body (a 1 GB download, a never-ending stream) in the
-        # shared daemon before the text was cut to MAX_FETCH_CHARS.
-        async with client.stream("GET", url) as r:
-            r.raise_for_status()
-            ctype = r.headers.get("content-type", "")
-            encoding = r.encoding or "utf-8"
-            buf = bytearray()
-            async for chunk in r.aiter_bytes():
-                buf += chunk
-                if len(buf) >= MAX_FETCH_BYTES:
-                    break
+        return await _read_page(own, url, browser)
     finally:
-        if own:
-            await client.aclose()
-    body = bytes(buf[:MAX_FETCH_BYTES]).decode(encoding, errors="replace")
-    if "html" in ctype or body.lstrip().lower().startswith(("<!doctype", "<html")):
-        title, text = extract_text(body)
+        await own.aclose()
+
+
+async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | None) -> tuple[str, str]:
+    got = await fetcher.get(url)
+    verdict = classify(got.status, got.body)
+    if verdict is Verdict.BLOCKED and browser is not None:
+        return await _read_rendered(browser, url, fetcher)
+    if verdict in STOP_VERDICTS:
+        raise Stopped(stop_report(verdict, url))
+    if not 200 <= got.status < 300:
+        raise FetchStatus(got.status, url)
+    if "html" in got.content_type or got.body.lstrip().lower().startswith(("<!doctype", "<html")):
+        title, text = extract_text(got.body)
     else:
-        title, text = url, body
+        title, text = url, got.body
+    if got.truncated:
+        text += "\n[page cut: the fetch deadline or the size cap was reached]"
+    return title or url, text[:MAX_FETCH_CHARS]
+
+
+async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher) -> tuple[str, str]:
+    """A page the browser renders. The same stop rules apply: a CAPTCHA, a login or a paywall ends the read. The
+    browser's own navigation is admitted like any other request: robots.txt, then a token of the host's bucket."""
+    await fetcher.admit(url)
+    page: RenderedPage = await browser.fetch(url)
+    verdict = classify(page.status, page.html)
+    if verdict in STOP_VERDICTS:
+        raise Stopped(stop_report(verdict, url))
+    if verdict is not Verdict.OK:
+        raise RuntimeError(f"still blocked in the browser (HTTP {page.status}) at {url}; not solved, not retried")
+    title, text = extract_text(page.html)
     return title or url, text[:MAX_FETCH_CHARS]
 
 
@@ -167,8 +199,10 @@ class SearxngSearch:
             self._ok = True
         except Exception as e:  # noqa: BLE001
             self._ok = False
-            self.reason = (f"SearXNG at {self.url} is unreachable or not returning JSON ({type(e).__name__}); "
-                           "set research.searxng_url to a working instance")
+            self.reason = (
+                f"SearXNG at {self.url} is unreachable or not returning JSON ({type(e).__name__}); "
+                "set research.searxng_url to a working instance"
+            )
         return self._ok
 
     async def search(self, query: str, n: int = 5) -> list[Hit]:
@@ -249,9 +283,18 @@ class ResearchTools:
 class BuiltinTools(ResearchTools):
     name = "builtin web_search/web_fetch"
 
-    def __init__(self, searxng_url: str | None, *, keyless_fallback: bool = True) -> None:
+    def __init__(
+        self,
+        searxng_url: str | None,
+        *,
+        keyless_fallback: bool = True,
+        fetcher: WebFetcher | None = None,
+        browser: BrowserManager | None = None,
+    ) -> None:
         self.searx = SearxngSearch(searxng_url)
         self.ddg = DuckDuckGoSearch() if keyless_fallback else None
+        self.fetcher = fetcher
+        self.browser = browser
 
     async def unavailable_reason(self) -> str:
         if await self.searx.available() or self.ddg is not None:
@@ -266,7 +309,7 @@ class BuiltinTools(ResearchTools):
         return []
 
     async def fetch(self, url: str) -> tuple[str, str]:
-        return await fetch_page(url)
+        return await fetch_page(url, fetcher=self.fetcher, browser=self.browser)
 
 
 _URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
@@ -316,6 +359,14 @@ def mcp_fetch_error(text: str) -> RuntimeError:
     return DeadLink(text[:200]) if dead else RuntimeError(text[:200])
 
 
+async def mcp_search_hits(mcp: Any, tool: Any, query: str, n: int = 5) -> list[Hit]:
+    """Hits from one call of a connected MCP search tool."""
+    res = await mcp.call(tool.qualified, {McpTools._arg(tool, "query", "q"): query})
+    if "error" in res:
+        raise RuntimeError(str(res["error"])[:200])
+    return parse_search_text(str(res.get("content", "")))[:n]
+
+
 class McpTools(ResearchTools):
     """Search/fetch through connected MCP tools (e.g. ``hub_searxng`` and ``hub_fetch``)."""
 
@@ -329,10 +380,7 @@ class McpTools(ResearchTools):
         return next((c for c in candidates if c in props), candidates[0])
 
     async def search(self, query: str, n: int = 5) -> list[Hit]:
-        res = await self.mcp.call(self.search_tool.qualified, {self._arg(self.search_tool, "query", "q"): query})
-        if "error" in res:
-            raise RuntimeError(str(res["error"])[:200])
-        return parse_search_text(str(res.get("content", "")))[:n]
+        return await mcp_search_hits(self.mcp, self.search_tool, query, n)
 
     async def fetch(self, url: str) -> tuple[str, str]:
         if self.fetch_tool is None:
@@ -348,26 +396,59 @@ class McpTools(ResearchTools):
 _NOT_WEB = ("memory", "session", "skill", "tool_search", "fleet", "mem0", "nc_", "file", "repo", "code")
 
 
+#: Helpers that sit next to the real web tool and are not one: an instance description, a suggestion feed, a status
+#: readout. A hub_searxng server lists these beside ``searxng_web_search``; the first ``searxng`` match used to win.
+_HELPER_TOOLS = ("instance", "suggest", "autocomplete", "info", "health", "status", "config", "engines", "categories")
+
+
 def rank_tool(tools: list[Any], strong: tuple[str, ...], generic: tuple[str, ...], exclude: tuple[str, ...]) -> Any:
-    """Best MCP tool for a web job: names with a ``strong`` marker first, then ``generic`` ones minus ``exclude``."""
+    """Best MCP tool for a web job. A ``strong`` marker only counts on a tool whose name also carries a ``generic``
+    action word (``search``/``fetch``), and helper tools never win; then ``generic`` ones minus ``exclude``."""
+
+    def is_helper(t: Any) -> bool:
+        return any(h in str(getattr(t, "name", "")).lower() for h in _HELPER_TOOLS)
+
+    def is_excluded(t: Any) -> bool:
+        return any(x in t.qualified.lower() for x in exclude)
+
     for t in tools:
-        if any(m in t.qualified.lower() for m in strong):
+        name = t.qualified.lower()
+        if (
+            any(m in name for m in strong)
+            and any(g in name for g in generic)
+            and not is_helper(t)
+            and not is_excluded(t)
+        ):
             return t
     for t in tools:
         name = t.qualified.lower()
-        if any(m in name for m in generic) and not any(x in name for x in exclude):
+        if any(m in name for m in generic) and not is_helper(t) and not is_excluded(t):
             return t
     return None
 
 
-def pick_tools(config: Any, mcp: Any) -> ResearchTools:
+_SEARCH_MARKERS = ("searxng", "web_search", "websearch", "web-search")
+
+
+def mcp_search_tool(mcp: Any) -> Any:
+    """The connected MCP tool that searches the web, or None."""
+    tools = list(mcp.tools()) if mcp is not None else []
+    return rank_tool(tools, _SEARCH_MARKERS, ("search",), _NOT_WEB)
+
+
+def pick_tools(
+    config: Any, mcp: Any, fetcher: WebFetcher | None = None, browser: BrowserManager | None = None
+) -> ResearchTools:
     """MCP search/fetch when connected, else the built-ins."""
     cfg = dict(getattr(config, "research", None) or {})
     builtin = BuiltinTools(
-        cfg.get("searxng_url", DEFAULT_SEARXNG), keyless_fallback=bool(cfg.get("keyless_fallback", True))
+        cfg.get("searxng_url", DEFAULT_SEARXNG),
+        keyless_fallback=bool(cfg.get("keyless_fallback", True)),
+        fetcher=fetcher,
+        browser=browser,
     )
     tools = list(mcp.tools()) if mcp is not None else []
-    search = rank_tool(tools, ("searxng", "web_search", "websearch", "web-search"), ("search",), _NOT_WEB)
+    search = mcp_search_tool(mcp)
     if search is not None:
         fetch = rank_tool(tools, ("hub_fetch", "web_fetch", "webfetch", "fetch_url"), ("fetch", "scrape"), _NOT_WEB)
         return McpTools(mcp, search, fetch, builtin)
@@ -377,41 +458,141 @@ def pick_tools(config: Any, mcp: Any) -> ResearchTools:
 # ── agent-facing tools ──
 
 
-def register_web_tools(reg: Any, config: Any) -> None:
-    """``web_fetch`` always; ``web_search`` over SearXNG (probed lazily, disabled with a message if unreachable)."""
+async def fallback_search(
+    query: str, n: int, *, searx: SearxngSearch, ddg: DuckDuckGoSearch | None, mcp: Any = None
+) -> tuple[list[Hit], list[str], bool]:
+    """The agent's ``web_search`` chain: SearXNG, then keyless DuckDuckGo, then a connected MCP search tool. The first
+    source with hits wins. Returns (hits, notes, answered); ``answered`` is False when no source could be asked."""
+    notes: list[str] = []
+    answered = False
+    if not await searx.available():
+        notes.append(f"SearXNG: {searx.reason}")
+    else:
+        try:
+            hits = await searx.search(query, n)
+        except Exception as e:  # noqa: BLE001 - one dead source must not end the chain
+            notes.append(f"SearXNG failed: {type(e).__name__}")
+        else:
+            answered = True
+            if hits:
+                return hits, notes, True
+            notes.append("SearXNG: no results")
+    if ddg is None:
+        notes.append("keyless DuckDuckGo fallback is off (research.keyless_fallback)")
+    else:
+        try:
+            hits = await ddg.search(query, n)
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"DuckDuckGo failed: {type(e).__name__}")
+        else:
+            answered = True
+            if hits:
+                return hits, notes, True
+            notes.append("DuckDuckGo: no results")
+    tool = mcp_search_tool(mcp)
+    if tool is None:
+        notes.append("no MCP web search tool is connected")
+    else:
+        try:
+            hits = await mcp_search_hits(mcp, tool, query, n)
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"MCP {tool.qualified} failed: {str(e)[:120]}")
+        else:
+            answered = True
+            if hits:
+                return hits, notes, True
+            notes.append("MCP search: no results")
+    return [], notes, answered
+
+
+def register_web_tools(
+    reg: Any, config: Any, fetcher: WebFetcher | None = None, mcp: Any = None, browser: BrowserManager | None = None
+) -> None:
+    """``web_fetch`` (escalates to the browser on a 403 or a challenge), ``web_browse`` (renders a page in the browser),
+    and ``web_search`` over SearXNG, then keyless DuckDuckGo, then a connected MCP search tool."""
     cfg = dict(getattr(config, "research", None) or {})
     searx = SearxngSearch(cfg.get("searxng_url", DEFAULT_SEARXNG))
+    ddg = DuckDuckGoSearch() if bool(cfg.get("keyless_fallback", True)) else None
+    fetcher = fetcher or WebFetcher.from_config(cfg)
+    browser = browser or BrowserManager.from_config(config)
 
     async def tool_fetch(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         url = str(arguments.get("url") or "")
         try:
-            title, text = await fetch_page(url)
+            title, text = await fetch_page(url, fetcher=fetcher, browser=browser)
         except Exception as e:  # noqa: BLE001
             return {"error": f"web_fetch failed: {e}"}
         return {"content": f"# {title}\n{url}\n\n{text}"}
+
+    async def tool_browse(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
+        url = str(arguments.get("url") or "")
+        if _safe_url(url) is None:
+            return {"error": f"web_browse needs an http(s) URL: {url[:200]}"}
+        try:
+            await fetcher.admit(url)
+        except FetchRefused as e:
+            return {"error": str(e)}
+        try:
+            page = await browser.fetch(url)
+        except BrowserUnavailable as e:
+            return {"error": f"web_browse is unavailable: {e}"}
+        except Exception as e:  # noqa: BLE001
+            return {"error": f"web_browse failed: {e}"}
+        if page.downloads:
+            return {"content": "downloaded (saved under the k3code home): " + ", ".join(page.downloads)}
+        verdict = classify(page.status, page.html)
+        if verdict in STOP_VERDICTS:
+            return {"error": stop_report(verdict, url)}
+        if verdict is not Verdict.OK:
+            return {"error": f"web_browse: still blocked (HTTP {page.status}) at {url}; not solved, not retried"}
+        title, text = extract_text(page.html)
+        return {"content": f"# {title or url}\n{page.url}\n\n{text[:MAX_FETCH_CHARS]}"}
 
     async def tool_search(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         query = str(arguments.get("query") or "").strip()
         if not query:
             return {"error": "web_search needs a query"}
-        if not await searx.available():
-            return {"error": f"web_search is disabled: {searx.reason}"}
-        try:
-            hits = await searx.search(query, int(arguments.get("limit") or 5))
-        except Exception as e:  # noqa: BLE001
-            return {"error": f"web_search failed: {e}"}
-        return {"content": "\n".join(f"- {h.title}\n  {h.url}\n  {h.snippet[:200]}" for h in hits) or "no results"}
+        hits, notes, answered = await fallback_search(
+            query, int(arguments.get("limit") or 5), searx=searx, ddg=ddg, mcp=mcp
+        )
+        if hits:
+            return {"content": "\n".join(f"- {h.title}\n  {h.url}\n  {h.snippet[:200]}" for h in hits)}
+        if answered:
+            return {"content": "no results"}
+        return {"error": f"web_search is disabled: {'; '.join(notes)}"}
 
     reg.register(
-        ToolSpec(name="web_fetch", description="Fetch a web page and return its readable text.",
-                 parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
-                 side_effect=False),
+        ToolSpec(
+            name="web_fetch",
+            description="Fetch a web page and return its readable text. A page that blocks "
+            "plain HTTP is read in a browser; CAPTCHAs, logins and paywalls stop.",
+            parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+            side_effect=False,
+        ),
         tool_fetch,
     )
     reg.register(
-        ToolSpec(name="web_search", description="Search the web (SearXNG). Returns titles, URLs and snippets.",
-                 parameters={"type": "object", "properties": {"query": {"type": "string"},
-                                                              "limit": {"type": "integer"}}, "required": ["query"]},
-                 side_effect=False),
+        ToolSpec(
+            name="web_browse",
+            description="Render a page in a real Chromium (for pages that need JavaScript) "
+            "and return its readable text. Reads only: it never clicks, types or "
+            "logs in. Needs the optional Playwright install.",
+            parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+            side_effect=False,
+        ),
+        tool_browse,
+    )
+    reg.register(
+        ToolSpec(
+            name="web_search",
+            description="Search the web: SearXNG if configured, else keyless DuckDuckGo, "
+            "else a connected MCP search tool. Returns titles, URLs and snippets.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                "required": ["query"],
+            },
+            side_effect=False,
+        ),
         tool_search,
     )
