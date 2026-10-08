@@ -542,3 +542,61 @@ async def test_sandboxed_bash_cannot_write_git_hooks(tmp_path):
     assert (repo / "inside.txt").read_text().strip() == "ok"  # the working tree itself stays writable
     assert "Read-only file system" in res["stderr"]  # the hook write was refused by the sandbox
 
+
+# ── escape regression suite (P2-5): each case fails on the pre-fix branch ──
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_escape_bash_with_home_as_cwd_cannot_write_into_home(tmp_path, monkeypatch):
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import ToolCall
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))  # the sandbox hides and binds Path.home()
+
+    class _R:
+        chain: list = []
+
+    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="yolo")  # type: ignore[arg-type]
+    touch = f"touch {home}/escaped.txt"
+    result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": touch}))
+    assert "bash refused" in result.get("error", "")
+    assert not (home / "escaped.txt").exists(), "sandboxed bash with cwd $HOME wrote into $HOME"
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_escape_a_hook_planted_from_the_sandbox_never_runs_under_harness_git(tmp_path):
+    from k3code.subagents import worktree
+    from m1cmd_helpers import git_repo
+
+    repo = git_repo(tmp_path / "repo").resolve()
+    marker = tmp_path / "hook-ran.txt"
+    hook = repo / ".git" / "hooks" / "pre-commit"
+    body = f"#!/bin/sh\ntouch {marker}\n"
+    await tool_bash({"command": f"printf '{body}' > {hook}; chmod +x {hook}"}, cwd=repo,
+                    sandbox=sandbox.build_argv(repo))
+    (repo / "change.txt").write_text("x\n")
+    await worktree.git(repo, "add", "-A")
+    await worktree.git(repo, "commit", "-qm", "harness commit")  # the harness's own git
+    assert not marker.exists(), "a hook written from the sandbox ran under harness git"
+
+
+async def test_escape_auto_mode_write_outside_the_project_is_denied(tmp_path):
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import ToolCall
+
+    project = tmp_path / "project"
+    project.mkdir()
+    target = tmp_path / "outside.txt"
+
+    class _R:
+        chain: list = []
+
+    loop = AgentLoop(_R(), system_prompt="x", cwd=project, permission_mode="auto")  # type: ignore[arg-type]
+    result = await loop._execute_tool(
+        ToolCall(id="c1", name="write", arguments={"path": str(target), "content": "pwned"})
+    )
+    assert "project roots" in result.get("error", "")
+    assert not target.exists(), "auto mode wrote outside the project roots"
+

@@ -11,6 +11,7 @@ from k3code.permissions import PermissionMode
 from k3code.reliability import sandbox
 from k3code.subagents import DepthLimit
 from k3code.subagents.types import load_agent_types, parse_agent_md
+from k3code.tools import tool_bash
 from m1cmd_helpers import git_repo
 from test_autonomy_gateway import call, events, make, models_called, run_turn, start
 
@@ -280,3 +281,19 @@ def test_child_reliability_keeps_the_configured_budgets(tmp_path):
     scopes = {b.scope: b for b in rel.governor._budgets.values()}
     assert scopes["session"].tokens == 1000 and scopes["day"].usd == 5.0
     assert rel.flags.netwatch is False  # still no netwatch per child
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_escape_git_in_a_sub_agent_worktree_reads_but_cannot_write_the_shared_hooks(tmp_path):
+    from k3code.subagents import worktree
+
+    repo = git_repo(tmp_path / "repo").resolve()
+    child = await worktree.create(repo, "child1")
+    assert child is not None
+    cmd = ('git status --porcelain >/dev/null && echo git-reads-ok; '
+           'echo planted > "$(git rev-parse --git-common-dir)/hooks/post-commit"; echo wrote=$?')
+    res = await tool_bash({"command": cmd}, cwd=child.path, sandbox=sandbox.build_argv(child.path))
+    assert "git-reads-ok" in res["stdout"]  # git works in the linked worktree
+    assert "wrote=0" not in res["stdout"]  # but the hooks dir every worktree shares is read-only
+    assert not (repo / ".git" / "hooks" / "post-commit").exists()
+
