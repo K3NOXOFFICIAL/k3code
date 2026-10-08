@@ -11,7 +11,7 @@
 
 Read `docs/reports/m4a-autonomy.md`, `docs/reports/m2-ops.md` and `docs/reports/merge-m4a.md`.
 
-References, read-only: Hermes (MIT, `/home/user/.hermes/hermes-agent`): `tools/delegate_tool*.py`, `tools/subagent_worktree.py`, `hermes_cli/kanban_swarm.py`, `kanban_decompose.py`.
+References, read-only: Hermes (MIT, `~/.hermes/hermes-agent`): `tools/delegate_tool*.py`, `tools/subagent_worktree.py`, `hermes_cli/kanban_swarm.py`, `kanban_decompose.py`.
 
 Port the designs, not the code wholesale. Record ports in `VENDOR.toml`.
 
@@ -46,7 +46,7 @@ Port the designs, not the code wholesale. Record ports in `VENDOR.toml`.
    Budget guard: `ultracode.max_tokens` (default 2M) and `max_agents` (default 12). Show live progress in the strip.
 6. **`/ultraresearch <question>`.** Multi-source research producing a cited report:
    - adapt the flow from Eigenwise/atomic-agents `atomic-examples/deep-research` (MIT; fetch its prompts and state design with curl and record the port in VENDOR.toml). Do not add `instructor` as a dependency;
-   - search tools come from the configured MCP servers, e.g. a k3nox `hub_searxng` web search or a fetch tool when present, or else a built-in `web_fetch` tool (httpx + readability-lite text extraction) plus `web_search` configured as a SearXNG URL in config (`research.searxng_url`, default `https://<searxng-host>` if reachable, otherwise disabled with a clear message);
+   - search tools come from the configured MCP servers, e.g. a `hub_searxng` web search or a fetch tool when present, or else a built-in `web_fetch` tool (httpx + readability-lite text extraction) plus `web_search` configured as a SearXNG URL in config (`research.searxng_url`, default `https://<searxng-host>` if reachable, otherwise disabled with a clear message);
    - flow: decompose into sub-questions, search in parallel (cheap tier), read and extract (cheap), cross-check claims, then synthesize (strong) with numbered citations;
    - write the report to `.k3code/research/<ts>-<slug>.md`.
 7. **`/artifacts`.** List the files that sessions produced (plans, research reports, previews, review reports, debug dumps, exported bundles) from an `artifacts` table. Producers register their outputs there.

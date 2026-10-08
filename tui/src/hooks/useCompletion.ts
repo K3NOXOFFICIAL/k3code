@@ -41,9 +41,7 @@ export function mergeWidgetAppItems(
 const TAB_PATH_RE =
   /((?:["']?(?:[A-Za-z]:[\\/]|\.{1,2}\/|~\/|\/|@|[^"'`\s]+\/))[^\s]*)$/;
 
-export function completionRequestForInput(
-  input: string,
-):
+export function completionRequestForInput(input: string):
   | { method: "complete.path"; params: { word: string }; replaceFrom: number }
   | {
       method: "complete.slash";

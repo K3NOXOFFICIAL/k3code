@@ -66,7 +66,8 @@ fi
 # Prefer OmniRoute's tailnet address: the public URL sits behind Cloudflare, which cuts
 # responses after ~100 s (HTTP 524). The settings copy lives in RAM (XDG_RUNTIME_DIR, 0600)
 # and is removed on exit; it holds the same key as the source profile.
-DIRECT_URL=${K3DEV_DIRECT_URL:-http://<omniroute-host>:20128}
+# K3DEV_DIRECT_URL: the gateway's direct (e.g. tailnet) address; K3DEV_PUBLIC_URL: its public URL.
+DIRECT_URL=${K3DEV_DIRECT_URL:-http://127.0.0.1:20128}
 RUNTIME_SETTINGS=""
 if [ "$ALLOW_OMNI" != 1 ]; then
   HEALTH_URL="https://api.anthropic.com/"   # Claude only: wait for Anthropic, never contact OmniRoute
@@ -80,7 +81,7 @@ elif curl -s -o /dev/null -m 5 "$DIRECT_URL/"; then
   SETTINGS=$RUNTIME_SETTINGS
   HEALTH_URL="$DIRECT_URL/"
 else
-  HEALTH_URL="https://<omniroute-public-host>/"
+  HEALTH_URL="${K3DEV_PUBLIC_URL:-$DIRECT_URL}/"
 fi
 echo "$(date -Is) gateway=$HEALTH_URL" >> "$RUNS/driver.log"
 

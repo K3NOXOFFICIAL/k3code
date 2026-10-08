@@ -163,7 +163,8 @@ async def check_b(procs: cl.Procs) -> None:
         crit,
         how,
         "PASS" if ok else "FAIL",
-        f"paused {paused[0] - t_down:.1f}s after proxy down; resumed {lat:.1f}s after proxy up; task finished "
+        f"paused {(paused[0] - t_down) if paused else float('nan'):.1f}s after proxy down; "
+        f"resumed {lat:.1f}s after proxy up; task finished "
         f"{fin:.1f}s after proxy up; c.txt={(d.proj / 'c.txt').exists()}\n{ev_lines(peer, t0, KINDS)}",
     )
     peer.close()

@@ -27,7 +27,7 @@ This was verified with `scripts/e2e_tui_file.py` and `E2E_PROMPT="use the bash t
      - `dd of=/dev/`;
      - `curl … | sh`;
      - commands that print env secrets (`env`, `printenv`, `cat ~/.ssh/*`, `cat *.env`);
-     - `ssh protected-host-a`/`ssh protected-host-b` with `systemctl restart|stop` or `docker restart|stop`;
+     - `ssh <server-a>`/`ssh <server-b>` with `systemctl restart|stop` or `docker restart|stop`;
      - `git push --force` to main/master.
 
      Keep the list in `permissions/hardline.py` and make it extendable from config.

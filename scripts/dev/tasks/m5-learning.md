@@ -15,7 +15,7 @@ Read `docs/reports/m1-permissions.md`, `m4a-autonomy.md`, `merge-m4a.md`, `m4c-a
 | Usage db | `/stats`. |
 | Config IO | Backups and rollback. |
 
-Reference, read-only, MIT: Hermes Agent at `/home/user/.hermes/hermes-agent`:
+Reference, read-only, MIT: Hermes Agent at `~/.hermes/hermes-agent`:
 - `hermes_cli/approvals_suggest.py`
 - `agent/background_review.py`
 - `agent/curator.py`

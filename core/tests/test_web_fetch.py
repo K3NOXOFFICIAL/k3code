@@ -181,3 +181,53 @@ async def test_fetch_page_without_a_shared_fetcher_still_works_with_an_injected_
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         title, text = await fetch_page("https://plain.test/p", client=client)
     assert title == "T" and "hello world" in text
+
+
+async def test_redirect_hops_are_checked_against_robots_and_the_host_bucket():
+    clock, hits = FakeClock(), []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        hits.append((req.url.host, req.url.path))
+        if req.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nDisallow: /private\n")
+        if req.url.path == "/hop":
+            return httpx.Response(302, headers={"location": "/private/secret"})
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=PAGE)
+
+    web = fetcher_for(handler, clock)
+    with pytest.raises(FetchRefused):
+        await web.get("https://a.test/hop")
+    assert ("a.test", "/private/secret") not in hits
+
+
+async def test_redirects_are_followed_within_the_budget_and_report_the_final_url():
+    clock, hits = FakeClock(), []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        hits.append(req.url.host)
+        if req.url.host != "b.test":
+            return httpx.Response(302, headers={"location": "https://b.test/page"})
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=PAGE)
+
+    web = fetcher_for(handler, clock, respect_robots=False)
+    got = await web.get("https://a0.test/x")
+    assert got.url == "https://b.test/page" and got.status == 200
+    for h in ("a1", "a2"):
+        await web.get(f"https://{h}.test/x")
+    assert clock.t >= 2.0  # three hops onto b.test at 1 req/s each wait for a token
+
+
+async def test_redirect_loops_and_non_http_targets_are_refused():
+    clock = FakeClock()
+
+    def loop(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": str(req.url) + "x"})
+
+    with pytest.raises(FetchRefused):
+        await fetcher_for(loop, clock, respect_robots=False).get("https://loop.test/")
+
+    def bad(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"location": "file:///etc/passwd"})
+
+    with pytest.raises(FetchRefused):
+        await fetcher_for(bad, clock, respect_robots=False).get("https://bad.test/")

@@ -5,7 +5,7 @@
 - `tui/` is the vendored Ink TUI. It speaks newline-delimited JSON-RPC 2.0 to a "gateway" child process.
 - `docs/tui-contract.md` maps every method, event and server request. The **M1-core** rows are the scope of this task.
 - Exact payload shapes are in the Hermes reference contracts, which you may read but not modify:
-  - `/home/user/.hermes/hermes-agent/tui_gateway/contracts/*.py`
+  - `~/.hermes/hermes-agent/tui_gateway/contracts/*.py`
   - the generated TS at `tui/shared/gateway-contract.generated.ts`, or wherever the TUI keeps it
 - How the TUI spawns and attaches to the gateway is described in `tui/src/gatewayClient.ts` (`startSpawnedGateway`) and `tui/K3_INTEGRATION.md`.
 

@@ -20,6 +20,7 @@ import httpx
 from k3code.artifacts import write_artifact_file
 from k3code.providers.types import Message
 from k3code.research import prompts
+from k3code.research.fetch import FetchStatus
 from k3code.research.state import Learning, ResearchState, SubTopic
 from k3code.research.tools import DeadLink, Hit, ResearchTools, pick_tools
 from k3code.routing.tiers import TaskKind, Tier
@@ -43,6 +44,8 @@ def is_dead_link(exc: BaseException) -> bool:
     snippet is still real content from it."""
     if isinstance(exc, DeadLink):  # the MCP fetch path reports the same conditions as a DeadLink
         return True
+    if isinstance(exc, FetchStatus):  # the built-in fetch path (tools._read_page) reports non-2xx answers this way
+        return exc.status in (404, 410) or exc.status >= 500
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
         return code in (404, 410) or code >= 500

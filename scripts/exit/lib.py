@@ -91,9 +91,12 @@ def live_backend() -> dict:
     }
 
 
-# Build workers run on the owner's personal combo (owner decision 2026-10-07), but that combo prepends a "Who are you?" bootstrap
-# prompt that makes a headless product agent stop and ask. The product's own live rows therefore use a plain combo.
+# Build workers run on the owner's personal OmniRoute combo (owner decision 2026-10-07), but that combo prepends an
+# identity bootstrap prompt that makes a headless product agent stop and ask. The product's own live rows therefore use
+# a plain combo.
 OMNI_AGENT_MODEL = "auto/coding-manual"
+# The OmniRoute gateway the live rows use (set K3_OMNIROUTE_URL to your own; 20128 is OmniRoute's default port).
+OMNIROUTE_URL = os.environ.get("K3_OMNIROUTE_URL", "http://127.0.0.1:20128").rstrip("/")
 
 
 def live_providers_yaml(
@@ -103,7 +106,7 @@ def live_providers_yaml(
     if backend["kind"] == "omniroute":
         default = f"[{', '.join(omni_default)}]" if isinstance(omni_default, list) else omni_default
         return (
-            "providers:\n  - {name: omniroute, kind: openai, base_url: 'http://<omniroute-host>:20128/v1', "
+            f"providers:\n  - {{name: omniroute, kind: openai, base_url: '{OMNIROUTE_URL}/v1', "
             f"api_key_env: OMNIROUTE_API_KEY, models: {{default: {default}, cheap: {omni_cheap}, "
             f"fast: {omni_cheap}}}}}\n"
         )
@@ -119,7 +122,7 @@ def live_chat(backend: dict, messages: list[dict], max_tokens: int = 400) -> str
         import urllib.request
 
         req = urllib.request.Request(
-            "http://<omniroute-host>:20128/v1/chat/completions",
+            f"{OMNIROUTE_URL}/v1/chat/completions",
             data=json.dumps({"model": "auto/coding-cheap", "max_tokens": max_tokens, "messages": messages}).encode(),
             headers={"Authorization": f"Bearer {os.environ['OMNIROUTE_API_KEY']}", "content-type": "application/json"},
         )
@@ -163,7 +166,7 @@ def omniroute_quota() -> tuple[bool, str]:
     if not key:
         return False, "OMNIROUTE_API_KEY not set"
     req = urllib.request.Request(
-        "http://<omniroute-host>:20128/v1/chat/completions",
+        f"{OMNIROUTE_URL}/v1/chat/completions",
         data=json.dumps(
             {"model": "auto/coding-cheap", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
         ).encode(),

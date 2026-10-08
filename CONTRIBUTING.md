@@ -26,7 +26,7 @@ Do not run `go test ./...` in `panes/`. Its upstream remote-sync tests recurse w
 
 License bookkeeping is checked with `python3 scripts/vendor_check.py`.
 
-CI runs the core, TUI, panes and vendor checks on every pull request (`.github/workflows/ci.yml`). A secret scan runs too (`.github/workflows/gitleaks.yml`). The CI core job runs `uv run ruff check .` and `uv run pytest -q` in `core/`, so `core/scripts` is linted too.
+CI runs the core, TUI, panes and vendor checks on every pull request (`.github/workflows/ci.yml`). A secret scan runs too (`.github/workflows/gitleaks.yml`). The CI core job runs `uv run ruff check . ../scripts`, `uv run ruff format --check . ../scripts` and `uv run pytest -q` in `core/`, so `core/scripts` and the top-level `scripts/` are linted and format-checked too.
 
 ## Before you open a pull request
 

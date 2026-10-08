@@ -66,7 +66,7 @@ Each command is one module in the registry, with help text, and works via the ga
   - Output is a list of findings: severity, file:line, issue, suggestion.
   - It runs as a sub-turn using the main model.
 - **`/goal <objective>` | `/goal status|pause|resume|clear`**
-  - Port the design of Hermes' `hermes_cli/goals.py` (MIT, read-only at `/home/user/.hermes/hermes-agent`):
+  - Port the design of Hermes' `hermes_cli/goals.py` (MIT, read-only at `~/.hermes/hermes-agent`):
     - a persistent `GoalState` per session;
     - after each turn, a cheap-model judge decides `continue` or `done`;
     - while the verdict is `continue`, a continuation user message is sent automatically;

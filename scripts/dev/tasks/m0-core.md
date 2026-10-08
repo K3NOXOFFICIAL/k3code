@@ -2,7 +2,7 @@
 
 Build the first working slice of `core/`: a Python package `k3code` (uv project at `core/`, `requires-python >=3.12`, src layout `core/src/k3code/`). The dev machine has system Python 3.14 and `uv`.
 
-Reference checkout, read-only: Hermes Agent at `/home/user/.hermes/hermes-agent`, MIT, commit 4127d78da84b1eee105f298979cc57cc7457f98d.
+Reference checkout, read-only: Hermes Agent at `~/.hermes/hermes-agent`, MIT, commit 4127d78da84b1eee105f298979cc57cc7457f98d.
 
 ## Build these modules
 
