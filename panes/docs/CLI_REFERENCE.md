@@ -3340,7 +3340,7 @@ link found:
 build  gaurav@buildbox  no_daemon
 The host is up and no tuios daemon is running on it.
 To start the daemon, run this command on the host:
-  /home/gaurav/.local/bin/tuios start-server
+  /home/user/.local/bin/tuios start-server
 Or start it from this machine:
   tuios hosts test build --start
 ```

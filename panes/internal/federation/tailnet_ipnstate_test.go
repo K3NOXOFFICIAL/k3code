@@ -13,8 +13,8 @@ func TestTailnetStatusReadsTheCommandOutput(t *testing.T) {
   "BackendState": "Running",
   "Self": {"ID": "n1", "HostName": "laptop", "DNSName": "laptop.tail1.ts.net.", "OS": "macOS", "UserID": 42, "TailscaleIPs": ["192.0.2.1", "fd7a::1"], "Online": false},
   "Peer": {
-    "nodekey:bb": {"HostName": "build", "DNSName": "build.tail1.ts.net.", "OS": "linux", "UserID": 42, "TailscaleIPs": ["fd7a::2", "192.0.2.1"], "Tags": ["tag:ci"], "Online": true},
-    "nodekey:aa": {"HostName": "Pixel", "DNSName": "pixel.tail1.ts.net.", "OS": "android", "UserID": 7, "TailscaleIPs": ["192.0.2.1"], "Online": true, "ShareeNode": true}
+    "nodekey:bb": {"HostName": "build", "DNSName": "build.tail1.ts.net.", "OS": "linux", "UserID": 42, "TailscaleIPs": ["fd7a::2", "192.0.2.2"], "Tags": ["tag:ci"], "Online": true},
+    "nodekey:aa": {"HostName": "Pixel", "DNSName": "pixel.tail1.ts.net.", "OS": "android", "UserID": 7, "TailscaleIPs": ["192.0.2.3"], "Online": true, "ShareeNode": true}
   },
   "User": {"42": {"ID": 42, "LoginName": "me@example.com"}, "7": {"ID": 7, "LoginName": "friend@example.com"}}
 }`
@@ -33,7 +33,7 @@ func TestTailnetStatusReadsTheCommandOutput(t *testing.T) {
 	if m := byName["laptop"]; !m.Self || !m.Online || m.IP != "192.0.2.1" || m.User != "me@example.com" || m.DNSName != "laptop.tail1.ts.net" {
 		t.Errorf("self = %+v", m)
 	}
-	if m := byName["build"]; m.IP != "192.0.2.1" || len(m.Tags) != 1 || m.Tags[0] != "tag:ci" || m.OS != "linux" {
+	if m := byName["build"]; m.IP != "192.0.2.2" || len(m.Tags) != 1 || m.Tags[0] != "tag:ci" || m.OS != "linux" {
 		t.Errorf("build = %+v", m)
 	}
 	if m := byName["pixel"]; !m.Shared || m.User != "friend@example.com" || m.Offered {

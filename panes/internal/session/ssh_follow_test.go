@@ -128,7 +128,7 @@ func TestParseRemoteLogin(t *testing.T) {
 		{"mosh folder", []string{"mosh", "h"}, "/srv/a b",
 			[]string{"/path/mosh", "h", "--", "sh", "-c", `cd "/srv/a b" 2>/dev/null; exec "$SHELL" -l`}},
 		{"mosh unknown option", []string{"mosh", "--frob", "h"}, "", nil},
-		{"mosh-client", []string{"mosh-client", "-# -p 6000 u@h |", "100.1.2.3", "60001"}, "",
+		{"mosh-client", []string{"mosh-client", "-# -p 6000 u@h |", "1.2.3.4", "60001"}, "",
 			[]string{"/path/mosh", "--port=6000", "u@h"}},
 		{"mosh-client with a command", []string{"mosh-client", "-# u@h -- top |", "1.2.3.4", "6"}, "", nil},
 		{"mosh-client with a stray token", []string{"mosh-client", "-# u@h top |", "1.2.3.4", "6"}, "", nil},

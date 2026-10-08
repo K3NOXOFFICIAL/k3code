@@ -131,7 +131,7 @@ func TestAddedHostRoundTripsThroughTheParser(t *testing.T) {
 	path := writeTemp(t, "")
 	entry := HostConfig{
 		Addr:           "gaurav@buildbox",
-		Command:        "/home/gaurav/.local/bin/tuios",
+		Command:        "/home/user/.local/bin/tuios",
 		ConnectTimeout: 7,
 		SSHOptions:     []string{"-J", "bastion", "-o", "StrictHostKeyChecking=yes"},
 		ReposRoot:      "~/src",
