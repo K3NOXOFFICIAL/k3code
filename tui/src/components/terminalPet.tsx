@@ -50,9 +50,10 @@ export function TerminalPet({
   t: Theme
 }) {
   const [reduced] = useState(() => isReducedMotion())
-  const [phase, dispatch] = useReducer(nextPetPhase, 'idle' as PetPhase)
+  // A pet that mounts during a turn starts in `working` at once, not one render later.
+  const [phase, dispatch] = useReducer(nextPetPhase, (busy ? 'working' : 'idle') as PetPhase)
   const [tick, setTick] = useState(0)
-  const busyRef = useRef(false)
+  const busyRef = useRef(busy)
   const needsRef = useRef(false)
 
   useEffect(() => {
@@ -79,21 +80,25 @@ export function TerminalPet({
     return () => clearTimeout(id)
   }, [phase])
 
+  // Animate only while the pet is doing something. Idle is a still pose (frame 0), so an
+  // idle pet arms no timer and repaints nothing.
+  const animating = !reduced && phase !== 'idle'
+
   useEffect(() => {
-    if (reduced) {
+    if (!animating) {
       return
     }
 
     const id = setInterval(() => setTick(n => n + 1), PET_TICK_MS)
 
     return () => clearInterval(id)
-  }, [reduced])
+  }, [animating])
 
   const color = phase === 'needs_input' ? t.color.warn : phase === 'done' ? t.color.accent : t.color.muted
 
   return (
     <Box flexDirection="column">
-      {petLines(name, phase, tick, reduced).map((line, i) => (
+      {petLines(name, phase, phase === 'idle' ? 0 : tick, reduced).map((line, i) => (
         <Text color={color} key={i}>
           {line}
         </Text>
