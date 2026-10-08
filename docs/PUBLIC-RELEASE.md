@@ -1,9 +1,9 @@
 # Making the repository public
 
 The repository is private. This is the checklist for the day it becomes public. Everything that could be done
-without rewriting history or deleting anything is already done (see [Already done](#already-done)). The rest
-rewrites history or deletes branches, so it waits until the switch: doing it earlier would diverge every clone
-and open branch while development continues.
+without rewriting history or deleting anything is already done (see [Already done](#already-done-2026-10-08)),
+and the history rewrite is scripted and dry-run verified. Publishing the rewrite waits until the switch: doing it
+earlier would diverge every clone and open branch while development continues.
 
 ## Already done (2026-10-08)
 
@@ -18,6 +18,8 @@ and open branch while development continues.
   self-hosted runners or secrets that a fork's pull request could reach.
 - Every text file is LF in the repo and in every checkout (`.gitattributes`).
 - LICENSE (MIT), NOTICE, `LICENSES/` and `VENDOR.toml` cover all vendored code; `scripts/vendor_check.py` passes.
+- Every CI job was run locally and passes (core, tui, panes, vendor_check, installer-windows via Windows
+  PowerShell 5.1); GitHub Actions itself refused all jobs for a billing reason on 2026-10-08.
 
 ## Still in history (needs a rewrite)
 
@@ -28,55 +30,46 @@ and open branch while development continues.
 | The tailnet IP, the owner's domains, SSH host names, first name, other people's names | earlier versions of the files scrubbed above, plus `GOAL.md` history | `--replace-text` |
 | `Claude-Session:` trailers | 276 commit messages | `--replace-message` |
 
+The rewrite is `scripts/release/rewrite_history.sh`. Its rules live in `~/.config/k3code-release/` on the owner's
+machine, outside the repository, because they name what is removed. It was dry-run on 2026-10-08 against all 27
+branches and passed every check: each removed value at 0 occurrences in contents and messages (each rule matched
+2 to 276 lines before), only noreply author addresses, no blob over 5 MB (13 MB packed), gitleaks clean over the
+whole rewritten history, and `Main`'s files identical to the current `Main` apart from commit ids, which
+`scripts/release/remap_hashes.py` points at the new commits (`.gitleaksignore`, `.git-blame-ignore-revs`, a few
+docs).
+
+**Why a fresh repository:** GitHub keeps every pull request's head as a read-only `refs/pull/<n>/head` (here #1,
+#4–#8, #16, #17). A force-push cannot remove them, so the old commits would stay reachable in this repository
+once it is public. Publish the rewritten history to a new, empty repository instead (or ask GitHub Support to
+purge the old refs, which takes longer).
+
 ## On the day
 
 1. **Decide what stays.** `docs/reports/`, `scripts/dev/`, `scripts/exit/` and `GOAL.md` are the build record.
-   They are scrubbed, but they describe the owner's workflow. Keep them, or move them to a private repo and
-   delete them here (`scripts/release/build_release.sh` already leaves them out of release archives).
-2. **Merge or close every open branch and pull request**, then stop all agents and soaks that push.
-3. **Rewrite history** in a fresh mirror clone with [git-filter-repo](https://github.com/newren/git-filter-repo).
-   Keep `replacements.txt` and `mailmap` *outside* the repository: they contain the values being removed.
+   They are scrubbed, but they describe the owner's workflow. Keep them, or delete them in a last commit before
+   the rewrite (`scripts/release/build_release.sh` already leaves them out of release archives).
+2. **Update the wording** in that same commit: `README.md` (the "private for now" note and the `gh auth login`
+   install step) and `GOAL.md` (the repository row, the visibility decision and the "repository is private" line).
+3. **Merge or close every open branch and pull request**, then stop the agents, soaks and timers that push.
+4. **Dry run**, and check the summary says `verification passed`:
 
    ```bash
-   git clone --mirror https://github.com/K3NOXOFFICIAL/k3code k3code-rewrite.git
-   cd k3code-rewrite.git
-   # replacements.txt, one rule per line:  literal==>replacement   (or regex:...==>...)
-   #   <tailnet-ip>==><omniroute-host>
-   #   regex:[a-z]+\.<owner-domain>==><owner-host>
-   #   /home/<name>/==>~/
-   #   <first name>==>the owner
-   #   <ssh host a>==><server-a>
-   #   <ssh host b>==><server-b>
-   # messages.txt:  regex:(?m)^Claude-Session: .*$==>
-   # mailmap:  K3NOX <46091052+K3NOXOFFICIAL@users.noreply.github.com> <personal address>
-   git filter-repo \
-     --path panes/k3 --invert-paths \
-     --replace-text ../replacements.txt \
-     --replace-message ../messages.txt \
-     --mailmap ../mailmap
+   scripts/release/rewrite_history.sh          # needs git, uv, gitleaks; pushes nothing
    ```
 
-   Check the result before pushing:
+5. **Swap the repositories.** Rename the current one to `k3code-archive` (Settings → General; keep it private,
+   it holds the old history), create a new **private** `K3NOXOFFICIAL/k3code` with no README, then publish:
 
    ```bash
-   git log --all --format='%an <%ae>%n%cn <%ce>' | sort -u                     # only noreply addresses
-   git log --all -p | grep -cE '<tailnet-ip>|<owner-domain>|<first name>'         # 0
-   git rev-list --objects --all | git cat-file --batch-check='%(objectsize) %(rest)' | sort -n | tail -3
-   gitleaks git . --log-opts=--all --redact                                     # fixtures only; new fingerprints
+   scripts/release/rewrite_history.sh --push https://github.com/K3NOXOFFICIAL/k3code
    ```
 
-   The rewrite changes every commit id, so the fingerprints in `.gitleaksignore` (`<commit>:<file>:<rule>:<line>`)
-   must be regenerated from the new gitleaks report, and `.git-blame-ignore-revs` must be rewritten with the new
-   ids of the formatting commits.
-4. **Push the rewrite**: temporarily allow force pushes on `Main`, `git push --mirror --force`, then restore
-   branch protection.
-5. **Delete stale branches** on GitHub (`claude/*`, `m0/*` … `m6/*`, `exit/verify`, `m0-scaffold`) once their
-   work is confirmed merged.
-6. **Re-clone everywhere** (laptop, desktop, servers). Old clones still hold the old history and must not be
-   pushed again.
-7. **Update the wording**: `README.md` (the "private for now" note and the `gh auth login` install step) and
-   `GOAL.md` (the repository row, the visibility decision and the "repository is private" line).
-8. **Switch visibility** in Settings → General, then enable: private vulnerability reporting (SECURITY.md relies
+   Set the default branch of the new repository to `Main`.
+6. **Re-clone everywhere** (laptop, desktop, servers). The install and release URLs keep working, since the name
+   is unchanged. Old clones still hold the old history and must never be pushed to the new repository.
+7. **Switch visibility** in Settings → General, then enable: private vulnerability reporting (SECURITY.md relies
    on it), Dependabot alerts, secret scanning with push protection, and branch protection on `Main` requiring CI.
-9. Optional: pin the actions in `.github/workflows/` by commit SHA (most useful for `release.yml`, which has
-   `contents: write`), and remove the inert upstream workflows under `panes/.github/`.
+   Actions need a working billing setup on the account first.
+8. Optional: pin the actions in `.github/workflows/` by commit SHA (most useful for `release.yml`, which has
+   `contents: write`), remove the inert upstream workflows under `panes/.github/`, and delete the archive once
+   nothing needs its history.
