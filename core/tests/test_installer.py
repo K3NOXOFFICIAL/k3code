@@ -346,7 +346,8 @@ def test_presetup_doctor_sees_a_custom_prefix_data_dir(tmp_path: Path) -> None:
     r = run(tmp_path, INSTALL, "--from-source", "--yes", "--prefix", str(prefix))
     assert r.returncode == 0, r.stderr
     assert f"data={prefix / 'share' / 'k3code'}" in r.stderr
-||||||| 8d7de67
+
+
 def test_unit_files_share_one_restart_budget_and_a_recovery_unit(tmp_path, monkeypatch):
     """P1-2: the repo copies, the rendered unit and the recovery unit agree; systemd gives up one start after the
     daemon's own storm guard (safe mode), and the recovery unit starts the daemon again after a cooldown."""
