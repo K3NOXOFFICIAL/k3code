@@ -21,6 +21,7 @@ from k3code.agent.loop import AgentLoop
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.prompting import build_system_prompt
+from k3code.providers.types import ToolCall
 from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings
 from k3code.routing.tiers import TaskKind, Tier, tier_for
 from k3code.subagents import worktree as wt_mod
@@ -374,18 +375,29 @@ class SubagentManager:
         final = ""
         try:
             stream = loop.run(prompt, max_tokens=server.config.max_tokens, temperature=server.config.temperature)
+            seen: set[str] = set()  # call ids already counted (claude_cli streams them, then repeats them on done)
+
+            def on_tool(tc: ToolCall) -> None:
+                if tc.id in seen:
+                    return
+                seen.add(tc.id)
+                h.tool_count += 1
+                h.last_tool = tc.name
+                args = tc.arguments or {}
+                preview = str(args.get("command") or args.get("path") or args.get("pattern")
+                              or args.get("description") or "")[:120]
+                h.tail.append(f"{tc.name} {preview}".strip())
+                self._emit(parent, "subagent.tool", h, tool_name=tc.name, tool_preview=preview, text=preview)
+
             async for ev in stream:
                 if ev.type == "tool_call" and ev.tool_call:
-                    h.tool_count += 1
-                    h.last_tool = ev.tool_call.name
-                    args = ev.tool_call.arguments or {}
-                    preview = str(args.get("command") or args.get("path") or args.get("pattern")
-                                  or args.get("description") or "")[:120]
-                    h.tail.append(f"{ev.tool_call.name} {preview}".strip())
-                    self._emit(parent, "subagent.tool", h, tool_name=ev.tool_call.name, tool_preview=preview,
-                               text=preview)
+                    on_tool(ev.tool_call)
                 elif ev.type == "done" and ev.message and ev.message.role == "assistant":
                     msg = ev.message
+                    # openai_compat and anthropic stream no tool_call events: their calls arrive on this message
+                    for tc in msg.tool_calls:
+                        on_tool(tc)
+                    seen.clear()
                     if msg.usage:
                         h.tokens_in += msg.usage.prompt_tokens
                         h.tokens_out += msg.usage.completion_tokens

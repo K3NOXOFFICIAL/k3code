@@ -118,6 +118,8 @@ class LiveSession:
         #: session.steer messages for the running turn: the live AgentLoop takes them before its next model call;
         #: what no loop took (a job ran, or the loop had already answered) runs as the next prompt.
         self.steer_queue: list[str] = []
+        #: tool call ids of the model call in flight already announced with tool.start (see _announce_tool)
+        self.announced_tools: set[str] = set()
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
         self.reasoning_effort: str | None = None
@@ -1424,18 +1426,18 @@ class GatewayServer:
             self.store.save(session.stored)
             session.emit("session.title", {"session_id": session.session_id, "title": title})
 
+    def _announce_tool(self, session: LiveSession, tc: ToolCall) -> None:
+        """tool.generating + tool.start and the usage row, once per call id."""
+        if tc.id in session.announced_tools:
+            return
+        session.announced_tools.add(tc.id)
+        session.emit("tool.generating", {"name": tc.name})
+        session.emit("tool.start", {"tool_id": tc.id, "name": tc.name, "args": tc.arguments})
+        self.usage.record("tool", session=session.session_id, detail=tc.name)
+
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
-            session.emit("tool.generating", {"name": event.tool_call.name})
-            session.emit(
-                "tool.start",
-                {
-                    "tool_id": event.tool_call.id,
-                    "name": event.tool_call.name,
-                    "args": event.tool_call.arguments,
-                },
-            )
-            self.usage.record("tool", session=session.session_id, detail=event.tool_call.name)
+            self._announce_tool(session, event.tool_call)
         elif event.type == "done" and event.message:
             msg = event.message
             if msg.role == "tool":
@@ -1465,6 +1467,10 @@ class GatewayServer:
                 )
                 if u:
                     session.emit("session.usage", {"usage": _usage_payload(u)})
+                # openai_compat and anthropic stream no tool_call events: their calls arrive on this message only
+                for tc in msg.tool_calls:
+                    self._announce_tool(session, tc)
+                session.announced_tools.clear()
 
     async def _approval_callback_for(self, session: LiveSession) -> Any:
         async def approve(tool_name: str, arguments: dict[str, Any], decision: Any = None) -> ApprovalResult:
