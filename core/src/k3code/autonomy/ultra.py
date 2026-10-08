@@ -341,7 +341,8 @@ class Ultra:
                     Message(
                         role="system",
                         content=(
-                            f"You are a skeptical reviewer with the {desc} lens. For each candidate finding decide if it is a "
+                            f"You are a skeptical reviewer with the {desc} lens. "
+                            f"For each candidate finding decide if it is a "
                             'REAL problem in the diff. Reply with JSON only: {"votes": {"<id>": true|false, ...}}.'
                         ),
                     ),

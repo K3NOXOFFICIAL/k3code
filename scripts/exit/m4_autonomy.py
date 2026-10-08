@@ -513,7 +513,8 @@ def degradation_live() -> None:
         [  # exactly 6 lines: emit() keeps the last six
             f"{base['tasks']} task runs per config (the same 10 small tasks twice: 5 interactive with scope gate, 5 "
             f"unattended background) on {BACKEND['label']}",
-            f"pass {base['pass']}/{base['tasks']} baseline (all main) vs {deg['pass']}/{deg['tasks']} degraded; list-price "
+            f"pass {base['pass']}/{base['tasks']} baseline (all main) "
+            f"vs {deg['pass']}/{deg['tasks']} degraded; list-price "
             f"cost ${base['cost']:.4f} vs ${deg['cost']:.4f} = {cut:.0f}% cut; calls {base['calls']} vs {deg['calls']}",
             f"failed tasks: baseline {base['failed'] or 'none'}; degraded {deg['failed'] or 'none'}",
             *table,
@@ -658,7 +659,8 @@ def ultraresearch_live() -> tuple[str, str]:
     ev = "\n".join(
         [
             f"question: {question}",
-            f"{len(res.state.sources)} sources read, {len(urls)} cited, {resolving} resolve ({ok} HTTP 2xx/3xx + {blocked} "
+            f"{len(res.state.sources)} sources read, {len(urls)} cited, {resolving} resolve ("
+            f"{ok} HTTP 2xx/3xx + {blocked} "
             f"answered 401/403/429 to a script) in a {secs:.0f} s run via {res.tools}",
             f"broken (404/5xx/unreachable): {bad or 'none'}",
             f"report saved: {res.path}",

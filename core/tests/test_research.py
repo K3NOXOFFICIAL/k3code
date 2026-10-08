@@ -412,7 +412,8 @@ DDG_PAGE = "".join(
             "A <b>TaskGroup</b> waits for all its tasks.",
         ),
         '<div class="result result--ad"><a rel="nofollow" class="result__a" '
-        'href="https://duckduckgo.com/y.js?ad_domain=ads.example&amp;u3=x">An ad</a></div>',  # an ad: no snippet, skipped
+        'href="https://duckduckgo.com/y.js?ad_domain=ads.example&amp;u3=x">'
+        "An ad</a></div>",  # an ad: no snippet, skipped
         _ddg_result("https%3A%2F%2Fexample.org%2Fa%3Fb%3D1%26c%3D2", "Second result", "Second   snippet"),
         '<div class="result"><a class="result__a" href="javascript:alert(1)">not http</a></div>',
     ]
