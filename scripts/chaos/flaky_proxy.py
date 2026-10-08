@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local TCP proxy that can be switched between up and down without root.
 
-Usage: flaky_proxy.py --listen 127.0.0.1:18080 --upstream localhost:20128 --mode-file /tmp/mode
+Usage: flaky_proxy.py --listen 127.0.0.1:18080 --upstream localhost:8080 --mode-file /tmp/mode
 
 The mode file holds one word, re-read on every connection and every second:
   up    forward traffic to the upstream
