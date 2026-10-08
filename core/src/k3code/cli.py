@@ -21,7 +21,9 @@ if TYPE_CHECKING:  # annotations only: the engine is imported inside the functio
     from k3code.reliability import Reliability
     from k3code.router import RouterEvent
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+# WARNING by default: at INFO, httpx request lines and "Turn N/20" were interleaved with the answer of every `-p` run.
+# The gateway and the daemon set their own level (force=True) because this runs first, at import.
+logging.basicConfig(level=os.environ.get("K3CODE_LOG_LEVEL", "WARNING").upper(), format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -448,6 +450,7 @@ def _run_gateway() -> None:
         stream=sys.stderr,
         level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,  # the import-time basicConfig above already installed a handler
     )
     from k3code.gateway.server import GatewayServer
 
@@ -631,6 +634,7 @@ def daemon_cmd() -> None:
         stream=sys.stderr,
         level=os.environ.get("K3CODE_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,  # the import-time basicConfig above already installed a handler
     )
     try:
         with contextlib.suppress(KeyboardInterrupt):
