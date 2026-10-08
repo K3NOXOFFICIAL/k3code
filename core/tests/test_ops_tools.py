@@ -186,6 +186,25 @@ def test_bwrap_argv_policy(tmp_path):
     assert argv.index("--tmpfs") < argv.index(f"{proj.resolve()}")  # project is bound after the home tmpfs
 
 
+def test_bwrap_never_rebinds_home_and_masks_secrets(tmp_path, monkeypatch):
+    """cwd = $HOME (or /) was bound read-write after the home tmpfs: unattended bash saw ~/.config/k3code/env and
+    ~/.ssh."""
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    home = tmp_path / "home"
+    (home / ".config/k3code").mkdir(parents=True)
+    (home / ".ssh").mkdir()
+    for cwd in (home, "/"):
+        argv = sandbox.build_argv(cwd, [home / ".config"], home=home, bwrap="/usr/bin/bwrap")
+        joined = " ".join(argv)
+        assert f"--bind {home} " not in joined and "--bind / " not in joined
+        assert f"--bind {home}/.config {home}/.config" in joined  # a dir inside $HOME is still bound …
+        last_bind = max(i for i, a in enumerate(argv) if a == "--bind")
+        for secret in (home / ".config/k3code", home / ".ssh"):  # … but the secrets are masked after every bind
+            assert argv.index(str(secret)) > last_bind and argv[argv.index(str(secret)) - 1] == "--tmpfs"
+    assert sandbox.exposes_home(home, home) and sandbox.exposes_home("/", home)
+    assert not sandbox.exposes_home(home / "proj", home)
+
+
 def test_sandbox_policy_by_mode():
     assert sandbox.should_sandbox(PermissionMode.AUTO, False) and sandbox.should_sandbox("yolo", False)
     assert sandbox.should_sandbox(PermissionMode.DEFAULT, True)  # background/cron/loop

@@ -129,6 +129,8 @@ class Experiments:
         self.path = self.home / "learning" / "experiments.json"
         self.overlays = self.home / "overlays"
         self.clock = clock
+        #: called with the experiment after a config rollback rewrote the file (the hub syncs the live config)
+        self.on_config_rollback: Callable[[dict[str, Any]], None] | None = None
 
     def all(self) -> list[dict[str, Any]]:
         try:
@@ -181,6 +183,8 @@ class Experiments:
             path = config_path or user_config_path()
             cur = confio.read_yaml(path)
             confio.write_yaml(path, _restore(cur, exp["patch"], exp["prev"]))
+            if self.on_config_rollback is not None:
+                self.on_config_rollback(exp)
         else:
             f = self.overlays / f"{xid}-{exp['name']}.md"
             if f.is_file():
@@ -191,12 +195,13 @@ class Experiments:
         return True
 
     def session_done(self, current_metrics: Callable[[float], dict[str, Any]], notify: Callable[[str], None] | None
-                     = None, config_path: Path | None = None) -> list[dict[str, Any]]:
-        """Count one finished session for every active experiment; judge the ones that reached their target."""
+                     = None, config_path: Path | None = None, ids: set[str] | None = None) -> list[dict[str, Any]]:
+        """Count one finished session for every active experiment (or only ``ids``); judge the ones that reached
+        their target."""
         items = self.all()
         finished = []
         for x in items:
-            if x["status"] != "active":
+            if x["status"] != "active" or (ids is not None and x["id"] not in ids):
                 continue
             x["sessions_done"] += 1
             if x["sessions_done"] >= x["target_sessions"]:

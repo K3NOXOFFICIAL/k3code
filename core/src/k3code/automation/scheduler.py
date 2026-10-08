@@ -200,9 +200,7 @@ class JobScheduler:
                 return
         now = self.clock.now()
         scheduled_for = job["next_run_at"]
-        if manual:
-            self.db.update("jobs", job_id, run_requested=0)
-        elif scheduled_for is not None and now - scheduled_for > job["grace_s"]:
+        if not manual and scheduled_for is not None and now - scheduled_for > job["grace_s"]:
             late_h = (now - scheduled_for) / 3600
             logger.warning("job %s missed its run by %.1fh (> grace): skipped", job_id, late_h)
             self.db.insert(
@@ -217,6 +215,10 @@ class JobScheduler:
             self.db.update("jobs", job_id, next_run_at=sched.next_after(now), last_status="skipped")
             self.on_change()
             return
+        # Advance the schedule before running: a daemon restart mid-run re-ran the job at once, because next_run_at
+        # only moved when the run finished. _record still sets the final value (retry and quota paths).
+        keep = manual and (scheduled_for or 0) > now  # a manual run leaves the schedule alone
+        self.db.update("jobs", job_id, run_requested=0, next_run_at=scheduled_for if keep else sched.next_after(now))
         run_id = self.db.insert("job_runs", owner=job_id, started_at=now, scheduled_for=scheduled_for, status="running")
         self.on_change()
         try:

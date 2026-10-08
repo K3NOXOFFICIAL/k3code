@@ -289,3 +289,36 @@ async def test_automation_shell_probes_bwrap_off_the_event_loop(tmp_path, monkey
     assert code == 0 and "shell-ok" in out and "bwrap unavailable" in out
     assert probed_on and probed_on[0] is not threading.main_thread()
     await server.close()
+
+
+async def test_start_goal_on_a_vanished_session_fails_cleanly(tmp_path, monkeypatch):
+    """start_goal with a session id that no longer exists passed None to live_for() and crashed."""
+    from k3code.automation.server_runner import ServerRunner
+
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    res = await ServerRunner(server).start_goal("fix it", "no-such-session", str(tmp_path))
+    assert res.status == "failed" and "no longer exists" in res.error
+    await server.close()
+
+
+async def test_unattended_runs_refuse_to_default_to_the_daemons_home_cwd(tmp_path, monkeypatch):
+    """A daemon started in $HOME gave every job without a cwd the whole home directory as its project."""
+    from k3code.automation.server_runner import ServerRunner
+
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    runner = ServerRunner(server)
+    code, out = await runner.run_shell("echo hi", "")
+    assert code != 0 and "explicit cwd" in out
+    for res in (await runner.run_prompt("hi"), await runner.start_goal("goal", None, "")):
+        assert res.status == "failed" and "explicit cwd" in res.error
+    eng = await engine_for(server, FakeClock())
+    out = await cmd(server, '/schedule add "* * * * *" "say hi"', None)  # no session, no --cwd
+    assert "--cwd" in out["output"] and eng.jobs.active_count() == 0
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    monkeypatch.chdir(proj)
+    assert (await runner.run_prompt("hi")).status == "completed"
+    await eng.stop()
+    await server.close()

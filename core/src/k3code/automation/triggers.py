@@ -100,6 +100,7 @@ class CronTrigger(Trigger):
     async def run(self) -> None:
         now = self.clock.now()
         due = self.first_due if self.first_due is not None else self.schedule.next_after(now)
+        self.first_due = None  # used once: a restart after a crash must not fire the missed run again
         if due <= now and now - due > self.grace_s:
             logger.warning("cron automation missed its run by >%ss: skipped", self.grace_s)
             due = self.schedule.next_after(now)

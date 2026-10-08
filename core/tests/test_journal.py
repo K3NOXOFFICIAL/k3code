@@ -77,6 +77,22 @@ def test_pure_tool_intent_carries_raw_args_for_rerun(home: Path):
         j2.close()
 
 
+def test_side_effect_intent_does_not_store_raw_args(home: Path):
+    """Every intent stored its raw args: write contents and bash commands with tokens ended up in the journal."""
+    j = ToolJournal(home, "s4")
+    try:
+        j.record_intent("c3", "bash", {"command": "curl -H 'Authorization: Bearer sk-secret'"}, side_effect=True)
+    finally:
+        j.close()
+    assert "sk-secret" not in j.path.read_text()
+    j2 = ToolJournal(home, "s4")
+    try:
+        plan = j2.resume_plan()
+        assert plan[0].side_effect is True and plan[0].args == {} and plan[0].args_hash
+    finally:
+        j2.close()
+
+
 def test_done_without_intent_is_ignored(home: Path):
     j = ToolJournal(home, "s4")
     try:
@@ -122,7 +138,7 @@ def test_find_pending_ignores_completed_and_blank_lines(home: Path):
         pending = j2.find_pending(j2.read_all())
         assert [r.id for r in pending] == ["b"]
         args_by_id = j2.load_args(j2.read_all())
-        assert args_by_id["b"] == {"cmd": "x"}
+        assert args_by_id == {"a": {"p": "1"}}  # side-effect args are never stored
     finally:
         j2.close()
 

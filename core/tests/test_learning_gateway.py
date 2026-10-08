@@ -90,3 +90,38 @@ async def test_commands_optimizer_selfimprove_and_project_prep(tmp_path, monkeyp
     assert "off" in st["output"]
     si = await call(server, "command.dispatch", {"name": "self-improve", "arg": "faster startup", "session_id": sid})
     assert list((tmp_path / ".k3code" / "self-improve").glob("*.md")) and "draft" in si["output"]
+
+
+async def test_optimizer_rollback_restores_the_live_config(tmp_path, monkeypatch):
+    """rollback() restored the YAML only: the running daemon kept routing with the experiment's values."""
+    monkeypatch.chdir(tmp_path)
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch, task_tiers={"title": "fast"})
+    (tmp_path / "home").mkdir(exist_ok=True)
+    (tmp_path / "home" / "config.yaml").write_text("task_tiers:\n  title: fast\n")
+    hub = server.learning
+    resets = []
+    monkeypatch.setattr(server, "reset_tier_routers", lambda: resets.append(1))
+    msg = hub._apply_overlay({"title": "t", "patch": {"task_tiers": {"classification": "main"}}})
+    assert msg.startswith("Experiment x1 started")
+    assert server.config.task_tiers == {"title": "fast", "classification": "main"} and resets == [1]
+    assert hub.experiments.rollback("x1")
+    assert server.config.task_tiers == {"title": "fast"} and resets == [1, 1]
+    assert read_yaml(tmp_path / "home" / "config.yaml") == {"task_tiers": {"title": "fast"}}
+
+
+async def test_experiments_count_each_interactive_session_once(tmp_path, monkeypatch):
+    """session_done ran on every turn end, background/cron turns included: a 20-session A/B ended after a few
+    sessions (or one busy cron job)."""
+    server, _ = make_server(tmp_path, ["ok", "ok", "ok", "ok"], monkeypatch)
+    hub = server.learning
+    hub._apply_overlay({"title": "t", "prompt": "be brief", "name": "brief"})
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    for _ in range(3):
+        await run_turn(server, "go", [])
+        await hub.drain()
+    assert hub.experiments.get("x1")["sessions_done"] == 1
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    server.session.background = True
+    await run_turn(server, "go", [])
+    await hub.drain()
+    assert hub.experiments.get("x1")["sessions_done"] == 1

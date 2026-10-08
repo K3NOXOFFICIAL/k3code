@@ -162,6 +162,19 @@ async def test_park_ladder_caps_at_max():
     assert [p.data["delay"] for p in parked] == [1.0, 2.0, 4.0, 8.0, 8.0]  # capped at park_max
 
 
+def test_max_park_seconds_config_reaches_the_park_ladder(tmp_path):
+    """reliability.max_park_seconds was accepted and then dropped: the park cap stayed at 600 s."""
+    from types import SimpleNamespace
+
+    from k3code.reliability.hooks import build_reliability
+    from k3code.subagents.runner import child_reliability
+
+    cfg = SimpleNamespace(reliability={"max_park_seconds": 120, "flags": {"netwatch": False}})
+    assert build_reliability(cfg, "s", home=tmp_path).retry_config.park_max == 120.0
+    assert child_reliability(cfg, "c", tmp_path).retry_config.park_max == 120.0
+    assert build_reliability(SimpleNamespace(reliability={}), "s", home=tmp_path).retry_config.park_max == 600.0
+
+
 async def test_rate_limit_parks_with_retry_after():
     """ChainExhausted(rate_limit) + router.retry Retry-After -> park exactly that long."""
 

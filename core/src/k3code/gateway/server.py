@@ -1080,6 +1080,13 @@ class GatewayServer:
     _chain_key: str | None = None
     _router_cfg: Any = None  # the config.providers object the cached providers/routers were built from
 
+    def reset_tier_routers(self) -> None:
+        """Rebuild the routers on next use, over the same providers (task tiers / router options changed live)."""
+        self._router_cache = {}
+        if self._router_cfg is not None:  # built here; a router injected from outside (tests) stays as is
+            self.router = None
+            self._tiers = None
+
     def tier_routers(self) -> TierRouters:
         """The per-tier routers (built with the main router; rebuilt when the model key changes)."""
         if self._tiers is None:

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import secrets
+import shlex
 from collections.abc import Callable
 from typing import Any
 
@@ -46,9 +47,17 @@ class AutomationError(ValueError):
     pass
 
 
-def render(template: str, info: dict[str, Any]) -> str:
-    """Substitute ``{{key}}`` from the trigger event (unknown keys are left as written)."""
-    return _TEMPLATE.sub(lambda m: str(info.get(m.group(1), m.group(0))), template)
+def render(template: str, info: dict[str, Any], *, shell: bool = False) -> str:
+    """Substitute ``{{key}}`` from the trigger event (unknown keys are left as written).
+
+    ``shell``: the values come from outside (file names, commit subjects, webhook bodies), so each one is
+    shell-quoted (``{{path}}`` becomes one word: do not wrap it in quotes yourself) and also exported as
+    ``K3_<KEY>`` for commands that prefer reading the environment."""
+    if not shell:
+        return _TEMPLATE.sub(lambda m: str(info.get(m.group(1), m.group(0))), template)
+    body = _TEMPLATE.sub(lambda m: shlex.quote(str(info[m.group(1)])) if m.group(1) in info else m.group(0), template)
+    exports = [f"K3_{k.upper()}={shlex.quote(str(v))}" for k, v in info.items() if re.fullmatch(r"[A-Za-z_]\w*", k)]
+    return f"export {' '.join(exports)}\n{body}" if exports else body
 
 
 def validate(trigger: dict[str, Any], action: dict[str, Any]) -> None:
@@ -329,7 +338,7 @@ class AutomationManager:
             return RunResult(status="completed", text="notified")
         async with self.slot():
             if kind == "shell":
-                rc, out = await self.runner.run_shell(render(str(act["command"]), info), cwd)
+                rc, out = await self.runner.run_shell(render(str(act["command"]), info, shell=True), cwd)
                 return RunResult(
                     status="completed" if rc == 0 else "failed", text=out[-2000:], error="" if rc == 0 else f"exit {rc}"
                 )

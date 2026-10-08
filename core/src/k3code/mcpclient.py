@@ -71,6 +71,10 @@ class _Runner:
             res = await asyncio.wait_for(session.call_tool(tool, args), CALL_TIMEOUT)
             if not fut.done():
                 fut.set_result(res)
+        except asyncio.CancelledError:  # the runner shut down (reload, config change, transport error)
+            if not fut.done():
+                fut.set_exception(RuntimeError(f"mcp server {self.name} stopped during the call"))
+            raise
         except Exception as e:  # noqa: BLE001
             if not fut.done():
                 fut.set_exception(e)
@@ -135,6 +139,8 @@ class _Runner:
                         if fut.done():  # the caller gave up while the request was queued
                             continue
                         call = asyncio.create_task(self._call(session, tool, args, fut))
+                        # a task cancelled before its first step never enters _call: resolve its future here too
+                        call.add_done_callback(lambda _t, f=fut: _fail(f, f"mcp server {self.name} stopped"))
                         inflight.add(call)  # concurrent: a slow call must not block the other sessions
                         call.add_done_callback(inflight.discard)
                 finally:
@@ -172,6 +178,11 @@ class _Runner:
                 with contextlib.suppress(BaseException):
                     await self.task
         self.task = None
+
+
+def _fail(fut: asyncio.Future[Any], msg: str) -> None:
+    if not fut.done():
+        fut.set_exception(RuntimeError(msg))
 
 
 def _attr(obj: Any, *names: str) -> Any:
@@ -299,7 +310,9 @@ class McpManager:
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         runner.queue.put_nowait((info.name, args, fut))
         try:
-            res = await fut
+            res = await asyncio.wait_for(fut, CALL_TIMEOUT + 5)  # never hang a turn on a lost runner
+        except TimeoutError:
+            return {"error": f"MCP call timed out: {info.server} did not answer"}
         except Exception as e:  # noqa: BLE001
             return {"error": f"MCP call failed: {_describe(e)}"}
         text = "\n".join(getattr(c, "text", None) or f"[{getattr(c, 'type', 'content')}]" for c in res.content)

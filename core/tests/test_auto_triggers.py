@@ -115,6 +115,28 @@ async def test_cron_trigger_missed_once_and_grace():
     await t2.stop()
 
 
+async def test_cron_trigger_restart_after_a_crash_does_not_refire_the_missed_run():
+    """The restart after a crash reused the stale first_due and fired the missed run again at once."""
+    c = clock()
+    events: list[dict] = []
+
+    async def fire(info):
+        events.append(info)
+        if len(events) == 1:
+            raise RuntimeError("boom")
+
+    t = CronTrigger({"type": "cron", "schedule": "*/5 * * * *"}, fire, c, first_due=c.now() - 3600)
+    t.RESTART_BASE_S = 0.01
+    t.start()
+    await c.settle()
+    await asyncio.sleep(0.1)  # the guard restarts the crashed trigger
+    await c.settle()
+    assert len(events) == 1
+    await c.advance(300)
+    assert len(events) == 2
+    await t.stop()
+
+
 async def _post(port, path, token=None, body="{}", header="X-K3-Token"):
     r, w = await asyncio.open_connection("127.0.0.1", port)
     h = f"{header}: {token}\r\n" if token else ""
@@ -152,6 +174,16 @@ def test_render():
     assert render("changed {{path}} / {{nope}}", {"path": "a.py"}) == "changed a.py / {{nope}}"
 
 
+def test_render_shell_quotes_trigger_data(tmp_path):
+    """Trigger data (file names, commit subjects, webhook bodies) went raw into the `shell` command: injection."""
+    import subprocess
+
+    evil = "x'; touch pwned; echo \"$(id)\" `id` $HOME"
+    cmd = render("printf '%s|' {{path}} \"$K3_PATH\" {{nope}}", {"path": evil, "bad-key": "y"}, shell=True)
+    out = subprocess.run(["bash", "-c", cmd], cwd=tmp_path, capture_output=True, text=True, check=True).stdout
+    assert out == f"{evil}|{evil}|{{{{nope}}}}|" and not (tmp_path / "pwned").exists()
+
+
 async def test_manager_actions_policy_and_events(tmp_path):
     c, db, r, m = mgr_for(tmp_path)
     for bad in (
@@ -187,7 +219,7 @@ async def test_manager_actions_policy_and_events(tmp_path):
     assert r.shells == []
     m.session_event("s1", "needs_input")
     await until(lambda: r.shells)
-    assert r.shells[0] == ("echo s1", "/tmp")
+    assert r.shells[0][0].splitlines()[-1] == "echo s1" and r.shells[0][1] == "/tmp"
     m.session_event("s2", "needs_input")  # cooldown
     await c.settle()
     assert len(r.shells) == 1
