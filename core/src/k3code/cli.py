@@ -412,6 +412,11 @@ def main(
         )
         if json_output and result:
             print(json.dumps(result, ensure_ascii=False))
+        elif result:
+            if result.get("text") and not result["text"].endswith("\n"):
+                sys.stdout.write("\n")  # the streamed answer: end it so the shell prompt starts on its own line
+            if "error" in result:
+                click.echo(f"k3code: error: {result.get('message') or result['error']}", err=True)
         sys.exit(0 if result and "error" not in result else 1)
     elif repl or not _is_interactive():
         with contextlib.suppress(KeyboardInterrupt):
