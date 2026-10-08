@@ -2158,8 +2158,10 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
         raise _InvalidParams("no active session")
     text = _require(params, "text")
     server.last_user_activity = time.time()
-    if session.streaming:
-        session.pending_prompts.append(str(text))  # really queued: it runs when the current turn ends
+    if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
+        # really queued: it runs when the current turn ends. The task check covers a turn that has not reached
+        # `streaming = True` yet (compaction, MCP start): a second task there overwrote turn_task, so /stop missed one.
+        session.pending_prompts.append(str(text))
         return {"turn_id": "", "status": "queued"}
     if params.get("background"):
         session.background = True
