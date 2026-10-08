@@ -459,10 +459,23 @@ installed_ref() { # the ref the active version was built from, if it was recorde
   return 0
 }
 
-pick_default_ref() { # sets REF: the latest tag on the remote, else Main; offline, the ref of the active version
+checkout_root() { # the k3code checkout this script sits in, if any
+  d=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || return 1
+  [ -f "$d/core/pyproject.toml" ] && [ -f "$d/VERSION" ] && printf '%s' "$d"
+}
+
+# Sets REF: the latest tag on the remote, else Main; offline, the ref of the active version.
+# Returns 3 when the remote is unreachable, nothing is installed yet and this script runs from a checkout of the
+# default repository: the caller then installs that checkout (for example a Windows clone made with Windows git,
+# whose credentials the WSL side does not have).
+pick_default_ref() {
   if REF=$(default_ref); then return 0; fi
   REF=$(installed_ref)
   if [ -z "$REF" ]; then
+    if [ "$GIT_URL" = "$DEFAULT_URL" ] && checkout_root >/dev/null; then
+      log "could not reach $GIT_URL ($(git_error_hint "$(git_error_reason)")): installing this checkout instead (--from-source)"
+      return 3
+    fi
     die "could not reach $GIT_URL to find the latest version: $(git_error_hint "$(git_error_reason)"). Pass --ref to choose one"
   fi
   log "could not reach $GIT_URL for the latest version: keeping the installed $REF"
@@ -491,7 +504,13 @@ acquire_source() {
   else
     [ -n "$GIT_URL" ] || GIT_URL=$DEFAULT_URL
     GIT_ERR=$(mktemp "${TMPDIR:-/tmp}/k3code-giterr.XXXXXX")
-    if [ -z "$REF" ]; then pick_default_ref; fi
+    if [ -z "$REF" ]; then
+      if ! pick_default_ref; then
+        FROM=source
+        acquire_source
+        return 0
+      fi
+    fi
     # A tag never moves, so a complete install of it needs no network at all (this works offline).
     case "$REF" in
       v[0-9]*)
