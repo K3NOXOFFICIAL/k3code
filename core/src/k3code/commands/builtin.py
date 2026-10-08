@@ -24,17 +24,28 @@ class _ModelCommand(CommandDef):
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         if arg.split()[:1] == ["chain"]:
             return self._chain(ctx, session_id, arg.split()[1:])
+        live = ctx.sessions.get(session_id) if session_id else None
         if not arg:
-            return {"type": "message", "message": f"Current model key: {ctx.config.default_model}"}
+            current = (live.stored.model if live is not None else "") or ctx.config.default_model
+            return {"type": "message", "message": f"Current model key: {current}"}
         key, _, reason = arg.partition(" ")
-        old = ctx.config.default_model
+        # like config.set model: a known key, set on the session (the next turn routes on stored.model); it used to
+        # change only config.default_model, which a session with its own model never reads, and took any typo
+        known = {m for p in ctx.config.providers for m in p.models} | {ctx.config.default_model}
+        if key not in known:
+            return {"type": "message", "message": f"Unknown model key: {key} (known: {', '.join(sorted(known))})"}
+        old = (live.stored.model if live is not None else "") or ctx.config.default_model
         if hasattr(ctx, "learning") and key != old:
-            live = ctx.sessions.get(session_id) if session_id else None
             kind = getattr(live, "current_kind", "") if live is not None else ""
             ctx.learning.record("model_switch", live, subject=f"{old} -> {key}", choice=key,
                                 detail={"from": old, "to": key, "reason": reason.strip(), "task_kind": kind or ""})
-        ctx.config.default_model = key if reason else arg
-        return {"type": "message", "message": f"Model key set to: {arg}"}
+        if live is None:
+            ctx.config.default_model = key
+        else:
+            live.stored.model = key
+            ctx.store.save(live.stored)
+            live.emit("session.info", live.live_info())
+        return {"type": "message", "message": f"Model key set to: {key}"}
 
 
     def _chain(self, ctx: Any, session_id: str | None, args: list[str]) -> dict[str, Any]:
