@@ -16,6 +16,10 @@ from k3code.learning.updateconfig import PatchRejected, check_patch, merge_patch
 from k3code.paths import home, user_config_path
 
 ROLLBACK_MARGIN = 0.02
+#: Scope outcomes that are verifier results: "done" passed, "error" failed. "outage" (providers unreachable),
+#: "interrupted" (the user stopped it) and "needs_input" (a budget or loop guard paused it) say nothing about
+#: correctness, so they are not judged.
+VERIFIED_OUTCOMES = ("done", "error")
 
 
 # ── metrics ────────────────────────────────────────────────────────────────
@@ -30,15 +34,19 @@ def collect(usage_rows: list[dict[str, Any]], log: DecisionLog, scope_rows: list
     calls = [r for r in ev if r["kind"] == "call"]
     by_tier: dict[str, dict[str, int]] = {}
     for r in calls:
-        by_tier.setdefault(r["tier"] or "main", {"calls": 0, "escalated": 0})["calls"] += 1
+        by_tier.setdefault(r["tier"] or "main", _tier_row())["calls"] += 1
     esc_kinds: dict[str, int] = {}
     for r in ev:
+        # "escalated" is a quality signal (the attempt stalled); a provider outage is its own kind and not counted here
         if r["kind"] == "escalated":
             esc_kinds[r["task_kind"]] = esc_kinds.get(r["task_kind"], 0) + 1
             src = (r["detail"] or "").split("->")[0]
-            by_tier.setdefault(src or "cheap", {"calls": 0, "escalated": 0})["escalated"] += 1
+            by_tier.setdefault(src or "cheap", _tier_row())["escalated"] += 1
+        elif r["kind"] == "loop_guard":  # on every tier; rows from before the tier was recorded came from cheap starts
+            by_tier.setdefault(r.get("tier") or "cheap", _tier_row())["loop_guard"] += 1
     for t in by_tier.values():
         t["rate"] = round(t["escalated"] / t["calls"], 3) if t["calls"] else 0.0
+        t["loop_guard_rate"] = round(t["loop_guard"] / t["calls"], 3) if t["calls"] else 0.0
     total_calls = max(1, len(calls))
     # M1: tokens per tier, per task kind and per turn (every call row counts, whatever the provider reported)
     tokens_by_tier: dict[str, int] = {}
@@ -62,7 +70,8 @@ def collect(usage_rows: list[dict[str, Any]], log: DecisionLog, scope_rows: list
             verdicts[r["hash"]] = r
         elif r["type"] == "outcome" and r["hash"] in verdicts:
             verdicts[r["hash"]]["outcome"] = r["outcome"]
-    judged = [v for v in verdicts.values() if "outcome" in v]
+    judged = [v for v in verdicts.values() if v.get("outcome") in VERIFIED_OUTCOMES]
+    passed = sum(1 for v in judged if v["outcome"] == "done")
     wrong = sum(1 for v in judged if v["verdict"].get("scope") in ("trivial", "small") and v["outcome"] != "done")
     return {
         "sessions": len(sessions),
@@ -76,6 +85,8 @@ def collect(usage_rows: list[dict[str, Any]], log: DecisionLog, scope_rows: list
         "proposal_accept_rate": round(acc / len(props), 3) if props else None,
         "scope_judged": len(judged),
         "scope_accuracy": round(1 - wrong / len(judged), 3) if judged else None,
+        "verifier_pass_rate": round(passed / len(judged), 3) if judged else None,
+        "outage_rate": round(sum(1 for r in ev if r["kind"] == "outage") / total_calls, 3),
         "tiers": by_tier,
         "escalated_kinds": esc_kinds,
         "tokens": call_tokens,
@@ -84,6 +95,10 @@ def collect(usage_rows: list[dict[str, Any]], log: DecisionLog, scope_rows: list
         "tokens_by_tier": tokens_by_tier,
         "tokens_by_kind": tokens_by_kind,
     }
+
+
+def _tier_row() -> dict[str, int]:
+    return {"calls": 0, "escalated": 0, "loop_guard": 0}
 
 
 def score(m: dict[str, Any]) -> float:

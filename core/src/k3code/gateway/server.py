@@ -1276,13 +1276,15 @@ class GatewayServer:
                     history=history,
                 ):
                     self._on_stream_event(session, event)
-                new_tier = escalation.record(loop.escalation_reason) if cheap_start and loop.escalation_reason else None
+                attempt_reason = loop.escalation_reason or ""
+                if "loop_guard" in attempt_reason:  # counted on every tier, not only when a cheap start escalates
+                    self.usage.record("loop_guard", session=session.session_id, detail=attempt_reason,
+                                      tier=tier.value, task_kind=kind.value, turn=session.turn_id)
+                new_tier = escalation.record(attempt_reason) if cheap_start and attempt_reason else None
                 if new_tier is None or loop.interrupted:
                     break
                 # The attempt stalled on a cheap tier: continue the same task one tier up.
-                reason = loop.escalation_reason or "unknown"
-                if "loop_guard" in reason:
-                    self.usage.record("loop_guard", session=session.session_id, detail=reason)
+                reason = attempt_reason or "unknown"
                 self.model_caller.note_escalation(kind, tier, new_tier, reason, session.session_id)
                 tier = new_tier
                 session.needs_input = False
@@ -1329,7 +1331,10 @@ class GatewayServer:
             if session.paused:  # a cancelled wait never saw "resumed"
                 session.paused = False
                 session.emit("notification.clear", {"key": self.PAUSE_KEY}, importance="essential")
-            self.autonomy.finish(session, gate, status, final_text, text)
+            # a provider outage is not a correctness failure: the scope log keeps it apart from "error"
+            scope_outcome = "outage" if isinstance(session.last_exc, (AllProvidersUnreachable, ChainExhausted)) \
+                and status == "error" else status
+            self.autonomy.finish(session, gate, scope_outcome, final_text, text)
             if self.learning.enabled:
                 self.learning.spawn(self.learning.turn_finished(session, status))
 

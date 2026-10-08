@@ -3,8 +3,13 @@ from types import SimpleNamespace
 from k3code import confio
 from k3code.autonomy.proposals import ProposalStore
 from k3code.config import Settings
+from k3code.errors import ChainExhausted
 from k3code.learning import optimizer
 from k3code.learning.decisions import DecisionLog
+from k3code.providers.types import Message
+from k3code.routing.caller import ModelCaller
+from k3code.routing.tiers import TaskKind
+from k3code.usage import UsageDB
 from learn_helpers import FakeClock
 
 
@@ -116,3 +121,52 @@ def test_overlay_cannot_touch_secrets(tmp_path):
     with pytest.raises(PatchRejected):
         xp.start({"title": "x", "patch": {"mem0": {"api_key_env": "A"}}}, metrics_for(0.1),
                  config_path=tmp_path / "c.yaml")
+
+
+def test_outages_and_loop_guards_are_not_read_as_quality_escalations(tmp_path):
+    rows_ = [ev(1, "call", tier="cheap", task_kind="title")] * 1
+    rows_ += [ev(2, "call", tier="cheap", task_kind="title") for _ in range(3)]
+    rows_ += [ev(3, "call", tier="main", task_kind="title")]
+    rows_ += [ev(4, "outage", tier="main", task_kind="title", detail="cheap->main: chain exhausted: down")]
+    rows_ += [ev(5, "loop_guard", tier="main", detail="loop_guard")]
+    rows_ += [ev(6, "loop_guard", tier="cheap", detail="loop_guard")]
+    m = optimizer.collect(rows_, DecisionLog(tmp_path), [], since=0)
+    assert m["escalation_rate"] == 0 and m["escalated_kinds"] == {}
+    assert m["outage_rate"] == 0.2 and m["loop_guard_per_session"] == 2.0
+    assert m["tiers"]["main"]["loop_guard"] == 1 and m["tiers"]["cheap"]["loop_guard"] == 1
+    assert m["tiers"]["main"]["loop_guard_rate"] == 1.0
+
+
+class _Router:
+    def __init__(self, down: bool) -> None:
+        self.down = down
+
+    async def complete(self, messages, tools, *, max_tokens: int = 0):
+        if self.down:
+            raise ChainExhausted("every provider of the tier is unreachable", "server")
+        return SimpleNamespace(content="ok", usage=None)
+
+
+class _Routers:
+    def get(self, tier):
+        return _Router(down=tier.value == "cheap")
+
+
+async def test_chain_exhausted_escalates_as_an_outage_row(tmp_path):
+    db = UsageDB(tmp_path / "usage.db")
+    caller = ModelCaller(lambda: _Routers(), Settings(), db)
+    res = await caller.complete(TaskKind.CLASSIFICATION, [Message(role="user", content="x")], session_id="s1")
+    assert res.tier.value == "main"
+    assert sorted(r["kind"] for r in db.rows(0)) == ["call", "outage"]
+    m = optimizer.collect(db.rows(0), DecisionLog(tmp_path), [], since=0)
+    assert m["escalation_rate"] == 0 and m["escalated_kinds"] == {} and m["outage_rate"] == 1.0  # per call row
+
+
+def test_scope_accuracy_is_scored_from_the_verifier_outcome(tmp_path):
+    scope = []
+    for h, verdict_scope, outcome in (("h1", "small", "outage"), ("h2", "small", "interrupted"),
+                                      ("h3", "small", "error"), ("h4", "small", "done")):
+        scope.append({"ts": 1, "type": "verdict", "hash": h, "verdict": {"scope": verdict_scope}})
+        scope.append({"ts": 2, "type": "outcome", "hash": h, "outcome": outcome})
+    m = optimizer.collect([], DecisionLog(tmp_path), scope, since=0)
+    assert m["scope_judged"] == 2 and m["scope_accuracy"] == 0.5 and m["verifier_pass_rate"] == 0.5
