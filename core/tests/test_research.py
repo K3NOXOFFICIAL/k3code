@@ -335,6 +335,25 @@ async def test_pick_tools_ignores_non_web_search_decoys():
     assert pick_tools(SimpleNamespace(research={}), generic).search_tool.name == "brave_search"
 
 
+def test_rank_tool_picks_the_explicit_search_tool_not_its_helpers():
+    """hub_searxng lists instance_info and search_suggestions beside searxng_web_search: the first 'searxng' match
+    used to win, so web_search was fed an instance description."""
+    from k3code.research.tools import _NOT_WEB, rank_tool
+
+    def tool(name):
+        return SimpleNamespace(name=name, qualified=f"hub_searxng__{name}", schema={})
+
+    strong = ("searxng", "web_search", "websearch", "web-search")
+    hub = [tool("searxng_instance_info"), tool("searxng_search_suggestions"), tool("searxng_web_search")]
+    assert rank_tool(hub, strong, ("search",), _NOT_WEB).name == "searxng_web_search"
+    reordered = [tool("searxng_search_suggestions"), tool("searxng_web_search"), tool("searxng_instance_info")]
+    assert rank_tool(reordered, strong, ("search",), _NOT_WEB).name == "searxng_web_search"
+    assert rank_tool([tool("searxng_instance_info")], strong, ("search",), _NOT_WEB) is None
+    # through pick_tools: only the instance helper connected -> the built-in tools, never the helper as search
+    helper_only = SimpleNamespace(tools=lambda: [tool("searxng_instance_info")])
+    assert isinstance(pick_tools(SimpleNamespace(research={}), helper_only), BuiltinTools)
+
+
 async def test_fetch_page_reads_a_capped_prefix_not_the_whole_body():
     """client.get() buffered the entire response in the shared daemon before truncating the text."""
     import httpx

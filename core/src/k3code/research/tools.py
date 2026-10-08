@@ -348,14 +348,29 @@ class McpTools(ResearchTools):
 _NOT_WEB = ("memory", "session", "skill", "tool_search", "fleet", "mem0", "nc_", "file", "repo", "code")
 
 
+#: Helpers that sit next to the real web tool and are not one: an instance description, a suggestion feed, a status
+#: readout. A hub_searxng server lists these beside ``searxng_web_search``; the first ``searxng`` match used to win.
+_HELPER_TOOLS = ("instance", "suggest", "autocomplete", "info", "health", "status", "config", "engines", "categories")
+
+
 def rank_tool(tools: list[Any], strong: tuple[str, ...], generic: tuple[str, ...], exclude: tuple[str, ...]) -> Any:
-    """Best MCP tool for a web job: names with a ``strong`` marker first, then ``generic`` ones minus ``exclude``."""
+    """Best MCP tool for a web job. A ``strong`` marker only counts on a tool whose name also carries a ``generic``
+    action word (``search``/``fetch``), and helper tools never win; then ``generic`` ones minus ``exclude``."""
+
+    def is_helper(t: Any) -> bool:
+        return any(h in str(getattr(t, "name", "")).lower() for h in _HELPER_TOOLS)
+
+    def is_excluded(t: Any) -> bool:
+        return any(x in t.qualified.lower() for x in exclude)
+
     for t in tools:
-        if any(m in t.qualified.lower() for m in strong):
+        name = t.qualified.lower()
+        if (any(m in name for m in strong) and any(g in name for g in generic)
+                and not is_helper(t) and not is_excluded(t)):
             return t
     for t in tools:
         name = t.qualified.lower()
-        if any(m in name for m in generic) and not any(x in name for x in exclude):
+        if any(m in name for m in generic) and not is_helper(t) and not is_excluded(t):
             return t
     return None
 
