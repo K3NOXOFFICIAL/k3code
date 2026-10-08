@@ -258,7 +258,10 @@ class Reliability:
                 "content": m.content,
                 "tool_call_id": m.tool_call_id,
                 "name": m.name,
-                "tool_calls": [{"id": c.id, "name": c.name, "arguments": c.arguments} for c in m.tool_calls],
+                "tool_calls": [
+                    {"id": c.id, "name": c.name, "arguments": c.arguments, "raw_arguments": c.raw_arguments}
+                    for c in m.tool_calls
+                ],
             }
             for m in messages
         ]
@@ -283,7 +286,8 @@ class Reliability:
                     tool_call_id=d.get("tool_call_id"),
                     name=d.get("name"),
                     tool_calls=[
-                        ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"])
+                        ToolCall(id=c["id"], name=c["name"], arguments=c["arguments"],
+                                 raw_arguments=c.get("raw_arguments"))
                         for c in d.get("tool_calls", [])
                     ],
                 )

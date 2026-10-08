@@ -49,10 +49,10 @@ def register_task_tools(
         ToolSpec(
             name="task",
             description=(
-                "Delegate a self-contained job to a sub-agent and get its final answer. Use for parallel "
-                "investigation, isolated implementation (isolation=worktree) or independent review. "
-                "agent_type: explorer (read-only), worker, reviewer, planner, or a custom type. "
-                "background=true returns a handle; poll it with task_result."
+                "Delegate a self-contained job to a sub-agent; returns its final answer. Use for parallel "
+                "investigation, isolated work (isolation=worktree) or review. agent_type: explorer (read-only), "
+                "worker, reviewer, planner or a custom name. background=true returns a handle; poll it with "
+                "task_result."
             ),
             parameters={
                 "type": "object",

@@ -196,10 +196,26 @@ def _alive(pid: int) -> bool:
         return False
 
 
-async def test_bash_truncates_output_to_the_head_with_a_count(temp_dir):
+async def test_bash_keeps_the_whole_output_when_it_fits_the_capture(temp_dir):
+    """The model's cut (clip_tool_results) happens later; the tool itself keeps everything it captured."""
     result = await tool_bash({"command": "head -c 12000 /dev/zero | tr '\\0' a"}, cwd=temp_dir)
-    assert result["stdout"].startswith("a" * 10_000) and result["stdout"].endswith("[truncated 2000 chars]")
+    assert result["stdout"] == "a" * 12_000
     assert result["exit_code"] == 0
+
+
+async def test_bash_capture_keeps_the_head_and_the_tail_and_counts_what_it_dropped(temp_dir):
+    import k3code.tools as tools
+
+    result = await tool_bash({"command": "seq 1 30000"}, cwd=temp_dir)
+    full = "".join(f"{i}\n" for i in range(1, 30_001))
+    dropped = len(full) - tools._KEEP_HEAD_BYTES - tools._KEEP_TAIL_BYTES
+    expected = (
+        full[: tools._KEEP_HEAD_BYTES]
+        + f"\n... [truncated {dropped} bytes not kept by the capture] ...\n"
+        + full[-tools._KEEP_TAIL_BYTES :]
+    )
+    assert result["stdout"] == expected
+    assert result["stdout"].endswith("30000\n")
 
 
 async def test_bash_flood_is_killed_instead_of_filling_daemon_memory(temp_dir, monkeypatch):
@@ -212,7 +228,7 @@ async def test_bash_flood_is_killed_instead_of_filling_daemon_memory(temp_dir, m
     before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     result = await asyncio.wait_for(tool_bash({"command": "yes", "timeout": 30}, cwd=temp_dir), 20)
     assert "Output limit exceeded" in result["error"] and result["exit_code"] == -9
-    assert len(result["stdout"]) < 10_100
+    assert len(result["stdout"]) < tools._KEEP_HEAD_BYTES + tools._KEEP_TAIL_BYTES + 200  # head + tail + marker
     assert resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before < 100_000  # KB: far below the old GBs
 
 

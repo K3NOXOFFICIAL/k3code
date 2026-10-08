@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from k3code.providers.types import ToolSpec
+from k3code.providers.types import Message, ToolSpec
 from k3code.tools.fuzzy_match import (
     format_no_match_hint,
     fuzzy_find_and_replace,
@@ -219,17 +221,21 @@ async def tool_bash(
             await asyncio.shield(_kill_group(proc))
 
 
-#: Per stream: bytes after which the command is killed, and the head kept for the model (10k chars as before).
+#: Per stream: bytes after which the command is killed.
 MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+#: What a command's output keeps (the first and the last bytes); the transcript stores exactly this.
 _KEEP_HEAD_BYTES = 40_000
+_KEEP_TAIL_BYTES = 10_000
+#: The most of one tool result the model is sent, in chars (see clip_tool_results). The bash cap as before.
 _MAX_CHARS = 10_000
 
 
 class _Capture:
-    """Bounded capture of one output stream: the first bytes, a byte count, an overflow flag."""
+    """Bounded capture of one output stream: the first and the last bytes, a byte count, an overflow flag."""
 
     def __init__(self) -> None:
         self.head = bytearray()
+        self.tail = bytearray()
         self.total = 0
         self.overflowed = False
 
@@ -238,14 +244,50 @@ class _Capture:
         room = _KEEP_HEAD_BYTES - len(self.head)
         if room > 0:
             self.head += chunk[:room]
+            chunk = chunk[room:]
+        if chunk:
+            self.tail += chunk
+            if len(self.tail) > _KEEP_TAIL_BYTES:
+                del self.tail[: len(self.tail) - _KEEP_TAIL_BYTES]
 
     def text(self) -> str:
-        decoded = bytes(self.head).decode("utf-8", errors="replace")
-        shown = decoded[:_MAX_CHARS]
-        if len(decoded) <= _MAX_CHARS and self.total <= len(self.head):
-            return decoded
-        dropped = self.total - len(shown.encode("utf-8"))  # bytes not shown (= chars for ASCII output)
-        return shown + f"\n... [truncated {dropped} chars]"
+        head, tail = bytes(self.head), bytes(self.tail)
+        dropped = self.total - len(head) - len(tail)  # bytes the capture itself could not keep
+        if dropped <= 0:
+            return (head + tail).decode("utf-8", errors="replace")
+        return (
+            head.decode("utf-8", errors="replace")
+            + f"\n... [truncated {dropped} bytes not kept by the capture] ...\n"
+            + tail.decode("utf-8", errors="replace")
+        )
+
+
+def clip_head_tail(text: str, limit: int = _MAX_CHARS) -> str:
+    """``text`` cut to ``limit`` chars: the first 3/5 and the last 2/5 are kept, the middle becomes a marker that
+    states how many chars it dropped. Text within the limit is returned unchanged."""
+    if len(text) <= limit:
+        return text
+    head = limit * 3 // 5
+    tail = limit - head
+    dropped = len(text) - head - tail
+    return (
+        f"{text[:head]}\n... [truncated {dropped} chars from the middle of {len(text)}; "
+        f"first {head} and last {tail} shown] ...\n{text[-tail:]}"
+    )
+
+
+def clip_tool_results(messages: Sequence[Message], limit: int = _MAX_CHARS) -> list[Message]:
+    """The messages a provider receives: every tool result longer than ``limit`` becomes its head+tail clip.
+
+    Pure per message, so one history always yields the same bytes for the same prefix (prompt caches can hit). The
+    input list and its messages are untouched: the transcript and the session keep the full results.
+    """
+    out: list[Message] = []
+    for m in messages:
+        if m.role == "tool" and m.content and len(m.content) > limit:
+            m = dataclasses.replace(m, content=clip_head_tail(m.content, limit))
+        out.append(m)
+    return out
 
 
 async def _drain(stream: asyncio.StreamReader | None, cap: _Capture, proc: asyncio.subprocess.Process) -> None:
@@ -481,8 +523,8 @@ def build_registry() -> ToolRegistry:
         ToolSpec(
             name="exit_plan",
             description=(
-                "Plan mode only: present your finished plan to the user for approval. "
-                "On approval the session leaves plan mode and you may start implementing."
+                "Plan mode only: submit the finished plan for user approval; on approval you leave plan mode "
+                "and may implement it."
             ),
             parameters={
                 "type": "object",
