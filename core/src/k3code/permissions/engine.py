@@ -96,6 +96,8 @@ class Decision:
     rule: Rule | None = None  # winning rule (or synthetic default)
     hardline: str | None = None  # hardline rule name, if denied by hardline
     auto_allowed: bool = False  # mode auto-allowed a would-be ask (log me)
+    #: an ask that auto mode must not convert: a human answers it, an unattended run treats it as a deny
+    needs_human: bool = False
 
 
 def builtin_defaults() -> list[Rule]:
@@ -160,7 +162,10 @@ def decide(
         bash_cwd = _abs(str(args.get("cwd") or "."), cwd_s)
         dec = _decide_bash(mode, str(args.get("command", "")), ruleset, hardline_extra, roots, bash_cwd)
     elif tool in EDIT_TOOLS or tool in READ_TOOLS:
-        dec = _decide_path(mode, tool, _abs(str(args.get("path") or args.get("file") or "."), cwd_s), roots, ruleset)
+        path = _abs(str(args.get("path") or args.get("file") or "."), cwd_s)
+        if tool == "glob":
+            path = _glob_base(path, str(args.get("pattern") or ""))
+        dec = _decide_path(mode, tool, path, roots, ruleset)
     elif tool == EXIT_PLAN_TOOL:
         dec = Decision(action="allow", patterns=["*"])
     else:
@@ -179,7 +184,7 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
     if dec.hardline is None and dec.action != "deny":
         if mode == PermissionMode.YOLO:
             dec.action = "allow"
-        elif mode == PermissionMode.AUTO and dec.action == "ask":
+        elif mode == PermissionMode.AUTO and dec.action == "ask" and not dec.needs_human:
             dec.action, dec.auto_allowed = "allow", True
     if dec.action == "ask" and headless:
         dec.action = "deny"
@@ -239,7 +244,8 @@ def _voids_allow(sub: str, rule: Rule, ruleset: list[Rule], roots: list[str], cw
     has_redirect = bool(_REDIRECT.search(plain))
     has_subst = bool(_SUBSTITUTION.search(plain))
     if rule.layer == 0:
-        return has_redirect or has_subst
+        # the builtin read-only allowlist covers the project only: `cat /etc/x`, `grep -r k ~` and `ls $DIR` ask
+        return has_redirect or has_subst or any(_arg_outside(a, roots, cwd) for a in _path_args(sub))
     if has_redirect and not _redirects_ok(plain, roots, cwd):
         return True
     if not has_subst:
@@ -250,6 +256,39 @@ def _voids_allow(sub: str, rule: Rule, ruleset: list[Rule], roots: list[str], cw
     )
 
 
+#: Read-only commands (the builtin allowlist and its kin) that must never be pointed at a key file.
+_READERS = frozenset({"cat", "grep", "egrep", "fgrep", "rg", "ls", "head", "tail", "less", "more"})
+
+
+def _path_args(sub: str) -> list[str]:
+    """The non-flag arguments of ``sub`` (after sudo/env/... wrappers), plus the values of ``--flag=value``."""
+    words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked by _redirects_ok
+    real = hardline.strip_wrappers(hardline.tokens(words))
+    out: list[str] = []
+    for t in real[1:]:
+        if t.startswith("-"):
+            if "=" in t:
+                out.append(t.split("=", 1)[1])
+            continue
+        out.append(t)
+    return out
+
+
+def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
+    if not arg:
+        return False
+    if arg.startswith("$"):
+        return True  # a variable: an unknown path
+    return not _inside(_abs(arg, cwd), roots)
+
+
+def _reads_secret(sub: str, cwd: str) -> bool:
+    real = hardline.strip_wrappers(hardline.tokens(sub))
+    if not real or os.path.basename(real[0]) not in _READERS:
+        return False
+    return any(sensitive_path(_abs(a, cwd)) for a in _path_args(sub) if a and not a.startswith("$"))
+
+
 def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
@@ -257,6 +296,9 @@ def _decide_bash(
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     subs = hardline.split_commands(command)
+    if any(_reads_secret(sub, cwd) for sub in subs):
+        hit = "sensitive-path"
+        return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     prefixes = [hardline.command_prefix(s) or s for s in subs]
     if mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=prefixes, message=PLAN_MSG)
@@ -284,6 +326,11 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
     is_edit = tool in EDIT_TOOLS
     if is_edit and mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=[path], message=PLAN_MSG)
+    if not is_edit and sensitive_path(path):
+        # read/grep/glob run in the daemon process, outside the sandbox: they would hand the keys to the model
+        return Decision(
+            action="deny", patterns=[path], hardline="sensitive-path", message=f"Hardline deny (sensitive-path): {path}"
+        )
     inside = _inside(path, roots)
     if not inside:
         fallback: Action = "ask"
@@ -299,7 +346,53 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         if is_edit and mode == PermissionMode.AUTO and rule.action == "ask":
             # auto mode writes only inside the project roots; an explicit user allow rule still applies
             dec.action, dec.message = "deny", f"Auto mode writes only inside the project roots: {path}"
+        elif not is_edit and rule.action == "ask":
+            # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
+            dec.needs_human = True
     return dec
+
+
+#: ``$HOME`` entries that hold keys or credentials (the sandbox masks the first two, see sandbox.HOME_SECRETS).
+_HOME_SECRETS = (".config/k3code", ".ssh", ".gnupg", ".aws")
+_PROC_ENVIRON = re.compile(r"^/proc/[^/]+/(?:task/[^/]+/)?environ$")
+_DOTENV_TEMPLATES = (".example", ".sample", ".template", ".dist")
+
+
+def _secret_dirs() -> list[str]:
+    home = os.path.expanduser("~")
+    dirs = [os.path.join(home, s) for s in _HOME_SECRETS]
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        dirs.append(os.path.join(xdg, "k3code"))
+    return dirs
+
+
+def sensitive_path(path: str) -> bool:
+    """``path`` (absolute) is a key/credential location: ``~/.ssh``, ``~/.gnupg``, ``~/.aws``, the k3code secrets dir
+    (``~/.config/k3code``, ``$XDG_CONFIG_HOME/k3code``: the daemon's ``env`` file), a process environment
+    (``/proc/*/environ``) or a dotenv file. Checked on the path as written and on its realpath (symlinks)."""
+    dirs = [os.path.normpath(d) for d in _secret_dirs()]
+    dirs += [os.path.realpath(d) for d in dirs]
+    for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
+        if _PROC_ENVIRON.match(p) or any(p == d or p.startswith(d.rstrip("/") + "/") for d in dirs):
+            return True
+        name = os.path.basename(p)
+        if name == ".env" or (name.startswith(".env.") and not name.endswith(_DOTENV_TEMPLATES)):
+            return True
+    return False
+
+
+def _glob_base(path: str, pattern: str) -> str:
+    """The directory a glob of ``pattern`` under ``path`` starts from: its literal leading segments count, so a
+    pattern such as ``../../.ssh/*`` is decided as ``~/.ssh``."""
+    if os.path.isabs(pattern):
+        return os.path.normpath(pattern)  # pathlib refuses it; decide the absolute prefix anyway
+    literal: list[str] = []
+    for seg in pattern.split("/"):
+        if any(ch in seg for ch in "*?["):
+            break
+        literal.append(seg)
+    return os.path.normpath(os.path.join(path, *literal)) if literal else path
 
 
 def suggest_rules(tool: str, dec: Decision) -> list[Rule]:

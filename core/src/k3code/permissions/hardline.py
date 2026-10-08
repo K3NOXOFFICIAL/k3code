@@ -44,6 +44,7 @@ HARDLINE_SIMPLE_PATTERNS: list[tuple[str, str]] = [
 HARDLINE_NAMES: list[str] = [
     "rm-rf-root",
     "rm-rf-home",
+    "sensitive-path",  # read/grep/glob or cat/grep/rg/ls of keys, ~/.config/k3code, /proc/*/environ, .env (engine.py)
     *(n for n, _ in HARDLINE_PATTERNS),
     *(n for n, _ in HARDLINE_SIMPLE_PATTERNS),
 ]
@@ -417,3 +418,8 @@ def is_launcher(sub_command: str) -> bool:
         return True
     real = _strip_wrappers(tokens)
     return bool(real) and os.path.basename(real[0]) in LAUNCHERS
+
+
+#: Shell tokenising for the engine's argument checks (quote-aware, wrappers such as sudo/env stripped).
+tokens = _tokens
+strip_wrappers = _strip_wrappers

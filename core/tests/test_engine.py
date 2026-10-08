@@ -245,11 +245,11 @@ def test_auto_mode_denies_writes_outside_the_project_roots() -> None:
     assert d.action == "deny" and "project roots" in (d.message or "")
 
 
-def test_auto_mode_still_allows_project_writes_and_reads_outside() -> None:
+def test_auto_mode_still_allows_project_writes_and_sandboxed_reads_outside() -> None:
     assert decide(mode="auto", tool="write", args={"path": "a.txt"}, cwd=CWD).action == "allow"
     assert decide(mode="auto", tool="bash", args={"command": "echo x > a.txt"}, cwd=CWD).action == "allow"
+    # auto-mode bash runs in the sandbox ($HOME hidden); the in-process read tool does not: it asks (finding 16)
     assert decide(mode="auto", tool="bash", args={"command": "cat < /etc/hosts"}, cwd=CWD).action == "allow"
-    assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD).action == "allow"
 
 
 def test_auto_mode_honours_an_explicit_user_allow_outside_the_roots() -> None:
@@ -261,3 +261,59 @@ def test_auto_mode_honours_an_explicit_user_allow_outside_the_roots() -> None:
 def test_yolo_and_default_modes_are_not_restricted_to_the_roots() -> None:
     assert decide(mode="yolo", tool="write", args={"path": "/etc/motd"}, cwd=CWD).action == "allow"
     assert decide(mode="default", tool="write", args={"path": "/etc/motd"}, cwd=CWD).action == "ask"
+
+
+# --- reads of secrets and outside the roots (review finding 16) ----------------
+
+
+def test_reads_of_key_and_daemon_env_files_are_denied_in_every_mode(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    proj = str(tmp_path / "proj")
+    secrets = [
+        ("read", "/proc/self/environ"),
+        ("read", "/proc/1/task/1/environ"),
+        ("read", "~/.config/k3code/env"),
+        ("read", f"{home}/.ssh/id_ed25519"),
+        ("grep", "~/.ssh"),
+        ("grep", "~/.aws/credentials"),
+        ("read", ".env"),  # the project's own dotenv, like the `cat .env` hardline
+        ("glob", "~/.gnupg"),
+    ]
+    for mode in ("default", "auto", "yolo", "plan"):
+        for tool, path in secrets:
+            d = decide(mode=mode, tool=tool, args={"path": path, "pattern": "."}, cwd=proj, add_dirs=[str(home)])
+            assert d.action == "deny", (mode, tool, path, d)
+            assert d.hardline == "sensitive-path"
+    d = decide(mode="auto", tool="glob", args={"path": ".", "pattern": "../home/.ssh/*"}, cwd=proj)
+    assert d.action == "deny"
+    assert decide(mode="default", tool="read", args={"path": ".env.example"}, cwd=proj).action == "allow"
+
+
+def test_auto_mode_reads_outside_the_roots_are_not_silently_allowed() -> None:
+    d = decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD)
+    assert d.action == "ask" and not d.auto_allowed and d.needs_human
+    assert decide(mode="auto", tool="grep", args={"path": "/var/log"}, cwd=CWD).action == "ask"
+    assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, headless=True).action == "deny"
+    user = [_r("read", "/etc/hosts", "allow")]
+    assert decide(mode="auto", tool="read", args={"path": "/etc/hosts"}, cwd=CWD, user_rules=user).action == "allow"
+    assert decide(mode="auto", tool="read", args={"path": "src/a.py"}, cwd=CWD).action == "allow"
+    assert decide(mode="yolo", tool="read", args={"path": "/etc/hosts"}, cwd=CWD).action == "allow"
+
+
+def test_builtin_bash_readers_do_not_reach_outside_the_roots_or_secrets(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+    def action(command: str) -> str:
+        return decide(mode="default", tool="bash", args={"command": command}, cwd=CWD).action
+
+    for command in ("cat ~/.config/k3code/env", "cat /proc/self/environ", "rg . ~/.ssh/id_ed25519"):
+        assert action(command) == "deny", command
+    assert action("grep -r KEY ~/.config") == "ask"
+    assert action("cat /etc/hosts") == "ask"
+    assert action("grep -rn --file=/etc/x y") == "ask"
+    assert action("cat $HOME/notes") == "ask"
+    assert action("grep KEY .env") == "deny"
+    assert action("ls src") == "allow" and action("grep -rn 'foo$' src tests") == "allow"
+    assert action("cat README.md") == "allow" and action("git log --oneline -5") == "allow"
