@@ -221,7 +221,7 @@ class Router:
         while entry_index < len(self.chain):
             entry = self.chain[entry_index]
             target_model = model if entry_index == 0 and model else entry.model
-            skip_reason = self._skip_in_cooldown(entry)
+            skip_reason = self._skip_in_cooldown(entry, target_model)
             if skip_reason is not None:
                 logger.debug(
                     "skipping %s/%s: cooldown %.0fs remaining (%s)",
@@ -231,7 +231,7 @@ class Router:
                     "cooldown",
                 )
                 cooled = self.cooldowns.reason_of(
-                    provider=entry.provider_name, model=entry.model, base_url=entry.base_url
+                    provider=entry.provider_name, model=target_model, base_url=entry.base_url
                 )
                 if cooled is not None:
                     last_reason = cooled
@@ -311,7 +311,7 @@ class Router:
                 "all provider entries are unreachable (network errors)", attempts=len(self.chain)
             )
         reason_name = last_reason.value if last_reason else "unknown"
-        wait = self.earliest_reset()
+        wait = self.earliest_reset(model)
         if wait is not None:
             until = self.cooldowns.wall() + wait
             clock = time.strftime("%H:%M", time.localtime(until))
@@ -338,18 +338,18 @@ class Router:
             return float(declared)
         return None
 
-    def earliest_reset(self) -> float | None:
-        """Seconds until the first chain entry leaves cooldown, when *every* entry is cooling down."""
+    def earliest_reset(self, model: str | None = None) -> float | None:
+        """Seconds until the first chain entry leaves cooldown, when *every* entry is cooling down. ``model`` is the
+        override the walk runs the first entry with: cooldowns are keyed by the model actually called."""
         if not self.chain or self.cooldowns is None:
             return None
         remaining = []
-        for entry in self.chain:
-            if not self.cooldowns.in_cooldown(provider=entry.provider_name, model=entry.model, base_url=entry.base_url):
+        for index, entry in enumerate(self.chain):
+            target = model if index == 0 and model else entry.model
+            if not self.cooldowns.in_cooldown(provider=entry.provider_name, model=target, base_url=entry.base_url):
                 return None
             remaining.append(
-                self.cooldowns.remaining_seconds(
-                    provider=entry.provider_name, model=entry.model, base_url=entry.base_url
-                )
+                self.cooldowns.remaining_seconds(provider=entry.provider_name, model=target, base_url=entry.base_url)
             )
         return min(remaining)
 
@@ -359,13 +359,11 @@ class Router:
             return max(0.0, float(classified.retry_after))
         return jittered_backoff(attempt, base_delay=self.base_delay, max_delay=self.max_delay)
 
-    def _skip_in_cooldown(self, entry: ChainEntry) -> float | None:
+    def _skip_in_cooldown(self, entry: ChainEntry, model: str) -> float | None:
         if self.cooldowns is None:
             return None
-        if self.cooldowns.in_cooldown(provider=entry.provider_name, model=entry.model, base_url=entry.base_url):
-            return self.cooldowns.remaining_seconds(
-                provider=entry.provider_name, model=entry.model, base_url=entry.base_url
-            )
+        if self.cooldowns.in_cooldown(provider=entry.provider_name, model=model, base_url=entry.base_url):
+            return self.cooldowns.remaining_seconds(provider=entry.provider_name, model=model, base_url=entry.base_url)
         return None
 
     def _failover(

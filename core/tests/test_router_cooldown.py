@@ -237,3 +237,15 @@ async def test_restarted_router_does_not_hit_exhausted_provider(tmp_path):
     router2, _, _, _ = make([a2, Scripted("b", ["b"])], store=CooldownStore(path=path))
     assert (await router2.complete(MSGS, [])).content == "b"
     assert a2.calls == 0
+
+
+async def test_a_cooldown_armed_under_a_model_override_is_honoured_on_the_next_call():
+    a = Scripted("a", [err429(120)])
+    router, store, _, _ = make([a])
+    with pytest.raises(ChainExhausted):
+        await router.complete(MSGS, [], model="override")
+    assert store.in_cooldown(provider="a", model="override", base_url="http://a")
+    with pytest.raises(ChainExhausted) as exc:
+        await router.complete(MSGS, [], model="override")
+    assert a.calls == 1  # skipped inside its window, not called again
+    assert exc.value.retry_after is not None and exc.value.retry_after > 100
