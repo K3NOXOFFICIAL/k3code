@@ -75,3 +75,17 @@ async def test_daemon_pause_and_resume_commands(tmp_path, monkeypatch):
     assert "resumed" in str(await cmd(server, "/daemon resume", sid))
     assert not server.halted
     await server.close()
+
+
+async def test_prompts_queued_behind_a_turn_survive_a_halt(tmp_path, monkeypatch):
+    server, provider = make_server(tmp_path, monkeypatch, replies=["x"])
+    sid = await new_session(server, tmp_path)
+    live = server.live_for(server.store.get(sid))
+    live.pending_prompts.extend(["first queued", "second queued"])
+    server.halt = halt_mod.Halt(reason="held", since=0.0)  # halted between the turn and the queue
+    assert (await server._run_turn(live, "go"))[0] == "halted"
+    assert live.pending_prompts == ["first queued", "second queued"] and provider.n == 0  # kept, not dropped
+    server.resume_daemon()
+    await server._run_turn(live, "go")
+    assert live.pending_prompts == [] and provider.n == 3  # the queue runs after /daemon resume
+    await server.close()

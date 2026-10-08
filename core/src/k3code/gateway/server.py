@@ -1172,7 +1172,7 @@ class GatewayServer:
         async with session.turn_lock:  # a second turn on this session waits instead of interleaving with the first
             result = await self._run_turn_locked(session, text)
             # A prompt typed mid-turn used to be answered "queued" and then dropped. Run those now, in order.
-            while session.pending_prompts and result[0] != "interrupted":
+            while session.pending_prompts and result[0] not in ("interrupted", "halted"):  # halted: keep them queued
                 result = await self._run_turn_locked(session, session.pending_prompts.pop(0))
             return result
 
