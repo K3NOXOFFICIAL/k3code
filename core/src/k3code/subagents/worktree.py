@@ -42,6 +42,22 @@ def repo_lock(repo: str | Path) -> asyncio.Lock:
     return _REPO_LOCKS.setdefault(str(Path(repo).resolve()), asyncio.Lock())
 
 
+#: One lock per repository for ``git worktree add`` / ``remove``. Concurrent adds raced on the shared
+#: ``.git/worktrees`` admin dirs: one add read a sibling's half-written ``commondir``
+#: ("fatal: failed to read .git/worktrees/<id>/commondir"). Kept apart from ``_REPO_LOCKS`` so a worktree op never
+#: waits on a merge. Keyed per loop too: an asyncio lock binds to the loop it first waits on.
+_WORKTREE_LOCKS: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Lock]] = {}
+
+
+def worktree_lock(repo: str | Path) -> asyncio.Lock:
+    key = str(Path(repo).resolve())
+    loop = asyncio.get_running_loop()
+    held = _WORKTREE_LOCKS.get(key)
+    if held is None or held[0] is not loop:
+        held = _WORKTREE_LOCKS[key] = (loop, asyncio.Lock())
+    return held[1]
+
+
 async def merge_in_progress(repo: str | Path) -> bool:
     rc, _ = await git(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD")
     return rc == 0
@@ -73,14 +89,15 @@ async def create(parent_cwd: str | Path, child_id: str) -> Worktree | None:
     if rc != 0:  # no commits yet
         return None
     base = base.strip()
-    k3 = root / ".k3code"
-    k3.mkdir(exist_ok=True)
-    gi = k3 / ".gitignore"
-    if not gi.exists():
-        gi.write_text("*\n", encoding="utf-8")  # worktrees/plans/research never show up as untracked
-    path = k3 / "worktrees" / child_id
+    path = root / ".k3code" / "worktrees" / child_id
     branch = f"k3/{child_id}"
-    rc, out = await git(root, "worktree", "add", str(path), "-b", branch, base)
+    async with worktree_lock(root):  # parallel adds on one repo race on .git/worktrees (see worktree_lock)
+        k3 = root / ".k3code"
+        k3.mkdir(exist_ok=True)
+        gi = k3 / ".gitignore"
+        if not gi.exists():
+            gi.write_text("*\n", encoding="utf-8")  # worktrees/plans/research never show up as untracked
+        rc, out = await git(root, "worktree", "add", str(path), "-b", branch, base)
     if rc != 0:
         raise RuntimeError(f"git worktree add failed: {out.strip()}")
     return Worktree(child_id, root, path, branch, base)
@@ -133,9 +150,10 @@ async def merge(wt: Worktree) -> tuple[bool, str]:
 
 async def remove(wt: Worktree, *, keep_branch: bool) -> None:
     """Drop the worktree directory; delete the branch unless it must survive (conflict)."""
-    await git(wt.repo, "worktree", "remove", "--force", str(wt.path))
-    if not keep_branch:
-        await git(wt.repo, "branch", "-D", wt.branch)
+    async with worktree_lock(wt.repo):  # a remove rewrites .git/worktrees while a sibling add may be reading it
+        await git(wt.repo, "worktree", "remove", "--force", str(wt.path))
+        if not keep_branch:
+            await git(wt.repo, "branch", "-D", wt.branch)
 
 
 async def head_sha(repo: str | Path) -> str:

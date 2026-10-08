@@ -84,10 +84,10 @@ def _print_event(event: RouterEvent) -> None:
 
 def _build_reliability(config: Any, session: str) -> Reliability:
     """M2: build the reliability bundle from the config's reliability dict."""
-    from k3code.config import K3CODE_HOME
+    from k3code.paths import home as k3code_home
     from k3code.reliability import build_reliability
 
-    return build_reliability(config, session=session, home=K3CODE_HOME)
+    return build_reliability(config, session=session, home=k3code_home())
 
 
 async def _run_headless(
