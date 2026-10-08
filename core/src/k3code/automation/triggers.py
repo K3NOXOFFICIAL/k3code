@@ -150,7 +150,8 @@ class FileChangeTrigger(Trigger):
 
 async def git_out(cwd: str, *args: str) -> str:
     proc = await asyncio.create_subprocess_exec(
-        "git", *args, cwd=cwd or None, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+        "git", *args, cwd=cwd or None, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
     out, _ = await proc.communicate()
     return out.decode().strip() if proc.returncode == 0 else ""

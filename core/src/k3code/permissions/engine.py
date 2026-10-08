@@ -61,9 +61,9 @@ BUILTIN_BASH_ALLOW = [
     "cat *",
     "grep *",
     "rg *",
-    "git status*",
-    "git diff*",
-    "git log*",
+    "git status *",
+    "git diff *",
+    "git log *",
 ]
 
 #: ``rg --pre CMD`` runs CMD on every file; ``git diff|log --output=FILE`` writes FILE; ``--ext-diff``/``--textconv``
@@ -75,6 +75,8 @@ BUILTIN_BASH_ASK = [
     "git log* --output*",
     "git diff* --ext-diff*",
     "git diff* --textconv*",
+    "git log* --ext-diff*",
+    "git log* --textconv*",
 ]
 
 PURE_TOOLS = frozenset({"read", "grep", "glob", "todo", "skill", "mcp_tool_search", "task", "task_result"})
@@ -119,7 +121,12 @@ def _abs(raw: str, cwd: str) -> str:
 
 
 def _inside(path: str, roots: list[str]) -> bool:
-    return any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+    """``path`` lies under one of ``roots``, after resolving symlinks on both sides: a lexical check let
+    ``proj/docs -> ../outside`` turn a write to ``docs/x`` into a write outside the project. A path that does not
+    exist yet resolves through its nearest existing parent (realpath keeps the missing remainder as is)."""
+    real = os.path.realpath(path)
+    real_roots = [os.path.realpath(r) for r in roots]
+    return any(real == r or real.startswith(r.rstrip("/") + "/") for r in real_roots)
 
 
 def decide(
@@ -149,7 +156,9 @@ def decide(
     ruleset = merge(builtin_defaults(), user_rules or [], project_rules or [], session_rules or [])
 
     if tool == "bash":
-        dec = _decide_bash(mode, str(args.get("command", "")), ruleset, hardline_extra, roots, cwd_s)
+        # The command runs in args["cwd"] (relative to the session cwd): redirects resolve against it.
+        bash_cwd = _abs(str(args.get("cwd") or "."), cwd_s)
+        dec = _decide_bash(mode, str(args.get("command", "")), ruleset, hardline_extra, roots, bash_cwd)
     elif tool in EDIT_TOOLS or tool in READ_TOOLS:
         dec = _decide_path(mode, tool, _abs(str(args.get("path") or args.get("file") or "."), cwd_s), roots, ruleset)
     elif tool == EXIT_PLAN_TOOL:
@@ -181,8 +190,9 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
 
 
 #: Redirections that are harmless next to any command (they do not write or read an arbitrary file).
-_HARMLESS_REDIRECT = re.compile(r"(?:\d*>&\d+|&>\s*/dev/null|\d*>>?\s*/dev/null)")
-_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*(?:>>?|<)\s*([^\s;&|<>()]+)")
+_HARMLESS_REDIRECT = re.compile(r"(?:\d*[<>]&(?:\d+|-)|&>>?\s*/dev/null|\d*>>?&?\s*/dev/null)(?![^\s;&|<>()])")
+#: ``>f``, ``>>f``, ``<f``, ``&>f``, ``&>>f``, ``>&f`` (the last three send stdout+stderr to f).
+_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:>>?|<)&?)\s*([^\s;&|<>()]+)")
 _SUBSTITUTION = re.compile(r"\$\(|`")
 #: Redirect targets that are code or credentials even inside the project.
 _SENSITIVE_TARGET = re.compile(r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
@@ -196,7 +206,7 @@ def _redirects_ok(plain: str, roots: list[str], cwd: str) -> bool:
         if not target or any(ch in target for ch in "$*?[{~") and not target.startswith("~/"):
             return False  # a variable or glob: unknown target
         path = _abs(target, cwd)
-        if not _inside(path, roots) or _SENSITIVE_TARGET.search(path):
+        if not _inside(path, roots) or any(_SENSITIVE_TARGET.search(p) for p in (path, os.path.realpath(path))):
             return False
     return True
 
@@ -242,6 +252,8 @@ def _decide_bash(
         if worst is None or _RANK[rule.action] > _RANK[worst.action]:
             worst = rule
     worst = worst or Rule(tool="bash", pattern="*", action="ask")
+    if worst.action == "allow" and not _inside(cwd, roots):
+        return Decision(action="ask", patterns=prefixes, message=f"Working directory outside project roots: {cwd}")
     return Decision(action=worst.action, patterns=prefixes, rule=worst)
 
 

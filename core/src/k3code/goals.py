@@ -101,6 +101,7 @@ async def run_gate(gate: GoalGate, *, cwd: str | None = None) -> tuple[bool, int
         proc = await asyncio.create_subprocess_shell(
             gate.command,
             cwd=cwd or None,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )

@@ -871,6 +871,8 @@ def slash_cmd(command: tuple[str, ...], socket_opt: Path | None) -> None:
 
     try:
         out = asyncio.run(slash_via_daemon(" ".join(command), cwd=str(Path.cwd()), sock=socket_opt))
+    except TimeoutError as e:
+        raise click.ClickException("the daemon did not answer within 60 s") from e
     except OSError as e:
         raise click.ClickException(f"cannot reach the daemon ({e}); start it with `k3code daemon`") from e
     click.echo(out)

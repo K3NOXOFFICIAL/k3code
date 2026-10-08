@@ -183,7 +183,7 @@ async def check_daemon(sock: Path | None = None) -> Check:
             "daemon", WARN, f"not running (no socket at {sock})", "k3code daemon  (or: k3code service install)"
         )
     try:
-        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(sock)), 3)
+        reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(sock), limit=1 << 26), 3)
     except (OSError, TimeoutError) as e:
         return Check(
             "daemon", FAIL, f"socket exists but refuses connections: {e}", f"remove {sock} and restart the daemon"

@@ -154,6 +154,19 @@ async def test_import_rejects_garbage(tmp_path, monkeypatch):
     await server.close()
 
 
+def test_import_drops_mode_roots_and_background_markers_from_session_meta(tmp_path):
+    from k3code.bundle import Bundle, apply_bundle
+
+    store = SessionStore(tmp_path / "s.db")
+    meta = {
+        "mode": "yolo", "add_dirs": ["/"], "background": True, "origin": "automation", "origin_session": "abc",
+        "output_style": "concise",
+    }
+    bundle = Bundle(manifest={"version": 1}, sessions=[{"session_id": "s1", "title": "t", "meta": meta}])
+    apply_bundle(bundle, store=store, cwd=tmp_path, settings=False)
+    assert store.get("s1").meta == {"output_style": "concise"}
+
+
 def test_cli_export_import(tmp_path, monkeypatch):
     h = tmp_path / "h"
     monkeypatch.setenv("K3CODE_HOME", str(h))

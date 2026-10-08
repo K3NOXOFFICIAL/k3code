@@ -23,6 +23,9 @@ BUNDLE_VERSION = 1
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
 _SETTINGS_FILES = {"settings/user.config.yaml": "user", "settings/project.config.yaml": "project"}
 _SESSION_RE = re.compile(r"^sessions/([A-Za-z0-9_\-]{1,64})\.json$")
+#: Session meta an imported bundle must not carry over: a permission mode (yolo), extra writable roots, and the
+#: background / automation-origin markers that make the daemon run or resume the session on its own.
+_UNTRUSTED_META = frozenset({"mode", "add_dirs", "background"})
 
 
 class BundleError(ValueError):
@@ -205,6 +208,10 @@ def apply_bundle(
                 **{k: obj[k] for k in StoredSession.__dataclass_fields__ if k in obj and k != "session_id"},
                 session_id=str(obj["session_id"]),
             )
+            sess.meta = {
+                k: v for k, v in (sess.meta if isinstance(sess.meta, dict) else {}).items()
+                if k not in _UNTRUSTED_META and not k.startswith("origin")
+            }
             old = sess.session_id
             if store.get(old) is not None:
                 sess.session_id = store.new_id()

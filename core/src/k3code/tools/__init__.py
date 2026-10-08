@@ -97,6 +97,37 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
+#: Files larger than this are only read as an explicit line range (streamed, never loaded whole).
+MAX_READ_BYTES = 10 * 1024 * 1024
+
+
+def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
+    """Lines ``start..end`` of a large file, streamed, at most MAX_READ_BYTES of them."""
+    selected: list[str] = []
+    total = 0
+    too_big = {"error": f"Lines {start}-{end} exceed {MAX_READ_BYTES // (1024 * 1024)} MB: request a smaller range"}
+    with path.open("rb") as f:
+        number = 1  # only \n ends a line here; a huge file is not re-split on \r
+        while number <= end:
+            raw = f.readline(MAX_READ_BYTES + 1)  # bounded: one endless line must not be loaded whole either
+            if not raw:
+                break
+            if len(raw) > MAX_READ_BYTES and not raw.endswith(b"\n"):
+                if number >= start:
+                    return too_big
+                while raw and not raw.endswith(b"\n"):  # skip the rest of a huge line before the range
+                    raw = f.readline(1 << 20)
+            elif number >= start:
+                total += len(raw)
+                if total > MAX_READ_BYTES:
+                    return too_big
+                selected.append(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
+            number += 1
+    if not selected:
+        return {"content": "", "lines": f"{start}-{start} (past the end of the file)"}
+    return {"content": "\n".join(selected), "lines": f"{start}-{start + len(selected) - 1}"}
+
+
 async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Read a file, optionally with line ranges."""
     path = _resolve_path(arguments["path"], cwd)
@@ -104,6 +135,13 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         return {"error": f"File not found: {path}"}
     start = arguments.get("start", 1)
     end = arguments.get("end")
+    size = path.stat().st_size
+    if size > MAX_READ_BYTES:
+        # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
+        if end is None:
+            return {"error": f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB): "
+                             "pass start and end to read a line range, or use grep to find what you need"}
+        return _read_range(path, max(1, start), end)
     text = path.read_bytes().decode("utf-8", errors="replace")  # reading may show U+FFFD; it never writes back
     lines = _split_lines(text)
     if end is None:
@@ -175,6 +213,7 @@ async def tool_bash(
                 "-c",
                 cmd,
                 cwd=workdir,
+                stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -183,6 +222,7 @@ async def tool_bash(
             proc = await asyncio.create_subprocess_shell(
                 cmd,
                 cwd=workdir,
+                stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
@@ -335,9 +375,10 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         if exclude:
             for exc in (exclude if isinstance(exclude, list) else [exclude]):
                 cmd += ["-g", f"!{exc}"]
-        cmd += [pattern, str(path)]
+        cmd += ["-e", pattern, "--", str(path)]  # -e: a pattern starting with "-" is not taken for a flag
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

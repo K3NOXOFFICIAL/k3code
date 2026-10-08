@@ -216,7 +216,8 @@ def repo_summary(cwd: Path, *, max_files: int = 5000) -> str:
             break
     top = ", ".join(f"{e}×{n}" for e, n in sorted(exts.items(), key=lambda kv: -kv[1])[:5]) or "none"
     try:
-        out = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, timeout=5)
+        out = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, timeout=5,
+                             stdin=subprocess.DEVNULL)
         git = f"{len(out.stdout.splitlines())} changed files" if out.returncode == 0 else "not a git repo"
     except (OSError, subprocess.SubprocessError):
         git = "git unavailable"
