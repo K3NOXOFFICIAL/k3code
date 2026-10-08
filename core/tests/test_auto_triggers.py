@@ -115,6 +115,28 @@ async def test_cron_trigger_missed_once_and_grace():
     await t2.stop()
 
 
+async def test_cron_trigger_restart_after_a_crash_does_not_refire_the_missed_run():
+    """The restart after a crash reused the stale first_due and fired the missed run again at once."""
+    c = clock()
+    events: list[dict] = []
+
+    async def fire(info):
+        events.append(info)
+        if len(events) == 1:
+            raise RuntimeError("boom")
+
+    t = CronTrigger({"type": "cron", "schedule": "*/5 * * * *"}, fire, c, first_due=c.now() - 3600)
+    t.RESTART_BASE_S = 0.01
+    t.start()
+    await c.settle()
+    await asyncio.sleep(0.1)  # the guard restarts the crashed trigger
+    await c.settle()
+    assert len(events) == 1
+    await c.advance(300)
+    assert len(events) == 2
+    await t.stop()
+
+
 async def _post(port, path, token=None, body="{}", header="X-K3-Token"):
     r, w = await asyncio.open_connection("127.0.0.1", port)
     h = f"{header}: {token}\r\n" if token else ""
