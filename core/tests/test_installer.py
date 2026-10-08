@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,8 @@ INSTALL = REPO / "install" / "install.sh"
 UNINSTALL = REPO / "install" / "uninstall.sh"
 
 pytestmark = pytest.mark.skipif(shutil.which("uv") is None, reason="installer needs uv present")
+# bubblewrap is the Linux sandbox: the installer checks for it only on Linux
+linux_only = pytest.mark.skipif(sys.platform != "linux", reason="bubblewrap check runs on Linux only")
 
 
 def run(
@@ -273,6 +276,7 @@ def test_presetup_second_run_changes_nothing(tmp_path: Path) -> None:
     assert snapshot(tmp_path) == before
 
 
+@linux_only
 def test_bwrap_missing_prints_the_command_and_exits_zero(tmp_path: Path) -> None:
     sudo_log = tmp_path / "sudo.log"
     sudo = stub_bin(tmp_path, "sudo", f'echo "sudo $*" >>"{sudo_log}"\nexit 1\n')
@@ -283,6 +287,7 @@ def test_bwrap_missing_prints_the_command_and_exits_zero(tmp_path: Path) -> None
     assert not sudo_log.exists()  # never sudo unattended, not even when the command is known
 
 
+@linux_only
 def test_bwrap_installed_but_unusable_is_a_warning(tmp_path: Path) -> None:
     bwrap = stub_bin(tmp_path, "bwrap", "exit 1\n")
     r = run(tmp_path, INSTALL, "--from-source", "--yes", env_extra={"K3_BWRAP": str(bwrap / "bwrap")})
@@ -290,6 +295,7 @@ def test_bwrap_installed_but_unusable_is_a_warning(tmp_path: Path) -> None:
     assert "installed but cannot create a sandbox" in r.stderr
 
 
+@linux_only
 def test_bwrap_usable_is_reported_ok(tmp_path: Path) -> None:
     bwrap = stub_bin(tmp_path, "bwrap", "exit 0\n")
     r = run(tmp_path, INSTALL, "--from-source", "--yes", env_extra={"K3_BWRAP": str(bwrap / "bwrap")})
