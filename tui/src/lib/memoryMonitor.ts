@@ -37,7 +37,7 @@ const MB = 1024 ** 2
 // clamp to sane floors/ceilings so a tiny --max-old-space-size can't drive the
 // thresholds below the warn watermark. Callers may still override explicitly.
 function resolveThresholds(criticalBytes?: number, highBytes?: number) {
-  let limit = 0
+  let limit: number
 
   try {
     limit = getHeapStatistics().heap_size_limit || 0

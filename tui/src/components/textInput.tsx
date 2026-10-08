@@ -1014,7 +1014,7 @@ export function TextInput({
             return
           }
 
-          commit(vRef.current.slice(0, current.start) + vRef.current.slice(current.end), current.start)
+          commitRef.current(vRef.current.slice(0, current.start) + vRef.current.slice(current.end), current.start)
         })
       },
       end: selected?.end ?? curRef.current,
@@ -1178,6 +1178,12 @@ export function TextInput({
     }
   }
 
+  // commit is rebuilt on every render. The selection handlers published by the
+  // effect above call it through this ref, so that effect keeps its [cur, focus,
+  // selected] deps and does not re-publish the selection on every render.
+  const commitRef = useRef(commit)
+  commitRef.current = commit
+
   const swap = (from: typeof undo, to: typeof redo) => {
     const entry = from.current.pop()
 
@@ -1227,19 +1233,6 @@ export function TextInput({
     }
 
     flushParentChange()
-  }
-
-  const scheduleKeyBurstCommit = (next: string, nextCur: number) => {
-    commit(next, nextCur, true, false, false)
-
-    if (keyBurstTimer.current) {
-      return
-    }
-
-    keyBurstTimer.current = setTimeout(() => {
-      keyBurstTimer.current = null
-      flushParentChange()
-    }, FRAME_BATCH_MS)
   }
 
   const clearSel = () => {

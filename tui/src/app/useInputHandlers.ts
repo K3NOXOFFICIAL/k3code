@@ -5,7 +5,6 @@ import { useEffect, useRef } from 'react'
 import { DASHBOARD_TUI_MODE } from '../config/env.js'
 import { DOUBLE_ESC_MS, TYPING_IDLE_MS } from '../config/timing.js'
 import { applyCompletion } from '../domain/slash.js'
-import type { ConfigSetResponse } from '../gatewayTypes.js'
 import { isAction, isCopyShortcut, isMac, isMacActionFallback } from '../lib/platform.js'
 import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionWheel.js'
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
@@ -157,8 +156,6 @@ export function dismissSensitivePrompt(
     respondToServerRequest(requestId, { value: '' })
   }
 }
-
-const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
 
 export function shouldDetachEditedHistoryInput(historyIdx: null | number, history: readonly string[], value: string) {
   return historyIdx !== null && value !== history[historyIdx]
@@ -573,7 +570,9 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         !cState.input || (cursor !== null && cState.input.lastIndexOf('\n', Math.max(0, cursor - 1)) < 0)
 
       if (noLineAbove) {
-        cycleQueue(1) || cycleHistory(-1)
+        if (!cycleQueue(1)) {
+          cycleHistory(-1)
+        }
 
         return
       }
@@ -585,7 +584,9 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       const noLineBelow = !cState.input || (cursor !== null && cState.input.indexOf('\n', cursor) < 0)
 
       if (noLineBelow || cState.historyIdx !== null) {
-        cycleQueue(-1) || cycleHistory(1)
+        if (!cycleQueue(-1)) {
+          cycleHistory(1)
+        }
 
         return
       }

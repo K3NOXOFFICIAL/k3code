@@ -23,7 +23,6 @@ import type { Msg } from '../types.js'
 import { scrollbarColors } from './overlayPrimitives.js'
 
 const FACE_TICK_MS = 2500
-const HEART_COLORS = ['#ff5fa2', '#ff4d6d']
 
 // Keep verb segment width stable so status-bar content to the right doesn't
 // jitter when the ticker rotates between short/long verbs.

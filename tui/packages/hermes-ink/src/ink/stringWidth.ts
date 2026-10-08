@@ -142,11 +142,7 @@ function getEmojiWidth(grapheme: string): number {
   const first = grapheme.codePointAt(0)!
 
   if (first >= 0x1f1e6 && first <= 0x1f1ff) {
-    let count = 0
-
-    for (const _ of grapheme) {
-      count++
-    }
+    const count = [...grapheme].length
 
     return count === 1 ? 1 : 2
   }

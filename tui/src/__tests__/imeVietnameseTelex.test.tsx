@@ -197,7 +197,7 @@ describe('Fast-echo suppression reset (60ms window)', () => {
     // repaint must NOT fast-echo (would strand the NNBSP marker as a stray space).
 
     // Type "ha" normally (each char goes through fast-echo append path)
-    let reads = ['h', 'a']
+    const reads = ['h', 'a']
     const stdout1 = new FakeTty()
     const stdin1 = new FakeTty()
     const stderr1 = new FakeTty()

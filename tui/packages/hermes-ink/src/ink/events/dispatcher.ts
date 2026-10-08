@@ -128,22 +128,15 @@ function processDispatchQueue(listeners: DispatchListener[], event: TerminalEven
 function getEventPriority(eventType: string): number {
   switch (eventType) {
     case 'keydown':
-
     case 'keyup':
-
     case 'click':
-
     case 'focus':
-
     case 'blur':
-
     case 'paste':
       return DiscreteEventPriority as number
 
     case 'resize':
-
     case 'scroll':
-
     case 'mousemove':
       return ContinuousEventPriority as number
 

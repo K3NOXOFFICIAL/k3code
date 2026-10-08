@@ -10,7 +10,7 @@ const buildCtx = (results: Record<string, unknown>) => {
   const sys = vi.fn()
   const panel = vi.fn()
 
-  const rpc = vi.fn((method: string, _params: unknown) => Promise.resolve(results[method]))
+  const rpc = vi.fn((method: string) => Promise.resolve(results[method]))
 
   const ctx = {
     gateway: { rpc },

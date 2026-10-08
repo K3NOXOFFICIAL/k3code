@@ -1601,8 +1601,8 @@ function layoutNode(
     for (const c of line) {
       const cMargin = c.style.margin
       const cLayoutMargin = c.layout.margin
-      let autoMainLead = false
-      let autoMainTrail = false
+      let autoMainLead: boolean
+      let autoMainTrail: boolean
       let autoCrossLead = false
       let autoCrossTrail = false
       let mMainLead: number
@@ -1637,10 +1637,10 @@ function layoutNode(
       } else if (autoCrossLead) {
         crossPos += Math.max(0, crossFree)
       } else if (autoCrossTrail) {
+        // Auto cross-trail margin only: the child keeps the lead position.
       } else {
         switch (childAlign) {
           case Align.FlexStart:
-
           case Align.Stretch:
             if (wrapReverse) {
               crossPos += crossFree
@@ -2340,7 +2340,6 @@ function parseDimension(v: number | string | undefined): Value {
 function physicalEdge(edge: Edge): number {
   switch (edge) {
     case Edge.Left:
-
     case Edge.Start:
       return EDGE_LEFT
 
@@ -2348,7 +2347,6 @@ function physicalEdge(edge: Edge): number {
       return EDGE_TOP
 
     case Edge.Right:
-
     case Edge.End:
       return EDGE_RIGHT
 

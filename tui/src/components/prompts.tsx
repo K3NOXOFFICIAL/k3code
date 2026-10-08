@@ -294,7 +294,11 @@ export function ClarifyPrompt({ cols = 80, onAnswer, onCancel, onQuestionAnswer,
     }
 
     if (key.return) {
-      sel === choices.length ? setTyping(true) : choices[sel] && onAnswer(choices[sel]!)
+      if (sel === choices.length) {
+        setTyping(true)
+      } else if (choices[sel]) {
+        onAnswer(choices[sel]!)
+      }
     }
 
     const n = parseInt(ch)
@@ -437,7 +441,11 @@ export function ConfirmPrompt({ onCancel, onConfirm, req, t }: ConfirmPromptProp
     }
 
     if (key.return) {
-      sel === 0 ? onCancel() : onConfirm()
+      if (sel === 0) {
+        onCancel()
+      } else {
+        onConfirm()
+      }
     }
   })
 

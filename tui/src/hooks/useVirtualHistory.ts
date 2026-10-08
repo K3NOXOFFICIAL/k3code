@@ -92,7 +92,11 @@ const upperBound = (arr: ArrayLike<number>, target: number, length = arr.length)
   while (lo < hi) {
     const mid = (lo + hi) >> 1
 
-    arr[mid]! <= target ? (lo = mid + 1) : (hi = mid)
+    if (arr[mid]! <= target) {
+      lo = mid + 1
+    } else {
+      hi = mid
+    }
   }
 
   return lo
@@ -368,7 +372,11 @@ export function useVirtualHistory(
   }
 
   if (!nativeMode && end - start > maxMounted) {
-    sticky ? (start = Math.max(0, end - maxMounted)) : (end = Math.min(n, start + maxMounted))
+    if (sticky) {
+      start = Math.max(0, end - maxMounted)
+    } else {
+      end = Math.min(n, start + maxMounted)
+    }
   }
 
   // Coverage guarantee: ensure sum(real or pessimistic heights) ≥
