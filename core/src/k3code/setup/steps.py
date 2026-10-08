@@ -93,7 +93,7 @@ def step_about(c: Ctx) -> dict[str, Any]:
 
 
 def step_system(c: Ctx) -> dict[str, Any]:
-    det = detect.detect()
+    det = detect.detect(probe=c.do_probe)
     c.say("Detected: " + ", ".join(f"{k}={v}" for k, v in det.items() if v not in ("", [], False)))
     if c.p.confirm("system.confirm", "Is this correct?", True):
         out = dict(det)

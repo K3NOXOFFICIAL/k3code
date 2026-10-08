@@ -88,6 +88,14 @@ ask() { # ask QUESTION: --yes answers yes; otherwise ask on the terminal
   die "$1 (no terminal to ask on: re-run with --yes, or --no-install-deps)"
 }
 
+ask_tty() { # ask_tty QUESTION: asks on the terminal only, never with --yes; no terminal means no
+  if [ "$YES" = 1 ] || ! (: </dev/tty) 2>/dev/null; then return 1; fi
+  printf '%s [y/N] ' "$1" >/dev/tty
+  read -r ans </dev/tty || ans=""
+  case "$ans" in y | Y | yes | YES) return 0 ;; esac
+  return 1
+}
+
 fetch() { # fetch URL FILE
   if have curl; then curl -fsSL "$1" -o "$2"; else wget -qO "$2" "$1"; fi
 }
@@ -467,7 +475,45 @@ presetup_step() { # presetup_step NAME FUNC
   return 0
 }
 
-presetup_sandbox() { :; }
+# Same probe as k3code's sandbox.usable(): bwrap has to run a command inside its namespaces.
+bwrap_cmd() { printf '%s' "${K3_BWRAP:-bwrap}"; }
+bwrap_usable() {
+  b=$(command -v "$(bwrap_cmd)" 2>/dev/null) || return 1
+  if have timeout; then
+    timeout 10 "$b" --die-with-parent --unshare-pid --ro-bind / / --dev /dev --proc /proc /bin/true >/dev/null 2>&1
+  else
+    "$b" --die-with-parent --unshare-pid --ro-bind / / --dev /dev --proc /proc /bin/true >/dev/null 2>&1
+  fi
+}
+
+# Never runs sudo unattended: the install command is printed, and run only after a yes on a terminal.
+presetup_sandbox() {
+  if [ "$PLATFORM" != Linux ]; then return 0; fi
+  if bwrap_usable; then
+    log "presetup: sandbox ok (bubblewrap works here)"
+    return 0
+  fi
+  if have "$(bwrap_cmd)"; then
+    log "presetup: WARNING: bubblewrap is installed but cannot create a sandbox here (user namespaces blocked?)"
+    say "      unattended runs (auto, yolo, background) are not sandboxed until this is fixed"
+    return 0
+  fi
+  log "presetup: WARNING: bubblewrap is not installed; unattended runs (auto, yolo, background) are not sandboxed"
+  cmd=$(hint_cmd bwrap)
+  say "      install it:  $cmd"
+  case "$cmd" in
+    "sudo "*)
+      if ask_tty "Run that now? (sudo asks for your password)"; then
+        if sh -c "$cmd" </dev/tty >/dev/tty 2>&1 && bwrap_usable; then
+          log "presetup: sandbox ok (bubblewrap installed)"
+        else
+          log "presetup: bubblewrap still not usable; run the command above by hand"
+        fi
+      fi
+      ;;
+  esac
+  return 0
+}
 presetup_chromium() { :; }
 presetup_doctor() { :; }
 

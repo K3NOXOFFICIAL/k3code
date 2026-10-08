@@ -190,3 +190,23 @@ def test_secrets_step_asks_only_for_missing(env: Path) -> None:
     run_setup(AnswerPrompter({"secrets": {"NEED_KEY": "sk-NEW", "HAVE_KEY": "ignored"}}), only_step="secrets")
     assert st.read_env_file() == {"HAVE_KEY": "already", "NEED_KEY": "sk-NEW"}
     assert stat.S_IMODE(st.env_file_path().stat().st_mode) == 0o600
+
+
+def test_sandbox_state_reports_each_case_and_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.reliability import sandbox
+    from k3code.setup import detect
+
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: None)
+    assert detect.sandbox_state() == "missing"
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    assert detect.sandbox_state() == "unusable"
+    assert detect.sandbox_state(probe=False) == "unknown"
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    assert detect.detect()["sandbox"] == "usable"
+
+    def boom() -> bool:
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr(sandbox, "usable", boom)
+    assert detect.sandbox_state() == "unknown"  # the wizard step goes on

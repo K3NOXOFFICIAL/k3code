@@ -160,3 +160,27 @@ def test_presetup_second_run_changes_nothing(tmp_path: Path) -> None:
     assert again.returncode == 0, again.stderr
     assert "presetup (optional" in again.stderr  # the phase still runs and reports
     assert snapshot(tmp_path) == before
+
+
+def test_bwrap_missing_prints_the_command_and_exits_zero(tmp_path: Path) -> None:
+    sudo_log = tmp_path / "sudo.log"
+    sudo = stub_bin(tmp_path, "sudo", f'echo "sudo $*" >>"{sudo_log}"\nexit 1\n')
+    r = run(tmp_path, INSTALL, "--from-source", "--yes", env_extra={"K3_BWRAP": "/nonexistent/bwrap"}, path_front=sudo)
+    assert r.returncode == 0, r.stderr
+    assert "bubblewrap is not installed" in r.stderr
+    assert "install it:" in r.stderr
+    assert not sudo_log.exists()  # never sudo unattended, not even when the command is known
+
+
+def test_bwrap_installed_but_unusable_is_a_warning(tmp_path: Path) -> None:
+    bwrap = stub_bin(tmp_path, "bwrap", "exit 1\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--yes", env_extra={"K3_BWRAP": str(bwrap / "bwrap")})
+    assert r.returncode == 0, r.stderr
+    assert "installed but cannot create a sandbox" in r.stderr
+
+
+def test_bwrap_usable_is_reported_ok(tmp_path: Path) -> None:
+    bwrap = stub_bin(tmp_path, "bwrap", "exit 0\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--yes", env_extra={"K3_BWRAP": str(bwrap / "bwrap")})
+    assert r.returncode == 0, r.stderr
+    assert "sandbox ok" in r.stderr
