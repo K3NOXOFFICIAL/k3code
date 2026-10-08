@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.providers.types import Message, ToolSpec
+from k3code.reliability.sandbox import child_env
 from k3code.tools.fuzzy_match import (
     format_no_match_hint,
     fuzzy_find_and_replace,
@@ -178,6 +179,7 @@ async def tool_bash(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                env=child_env(),  # the daemon's provider keys never reach a tool
             )
         else:
             proc = await asyncio.create_subprocess_shell(
@@ -186,6 +188,7 @@ async def tool_bash(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                env=child_env(),
             )
         out, err = _Capture(), _Capture()
         # Streams are read incrementally into bounded buffers: communicate() held every byte in the shared daemon's
@@ -341,6 +344,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=child_env(),
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)

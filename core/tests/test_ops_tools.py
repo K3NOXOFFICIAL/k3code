@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shutil
 import tarfile
@@ -342,3 +343,90 @@ def test_a_failed_bwrap_probe_is_retried_not_latched(monkeypatch):
     clock[0] += 10_000
     assert sandbox.usable() is True and len(calls) == 2  # a positive result is cached
     sandbox.reset_probe()
+
+
+# ── one gate for unattended children (P2-1) ──
+
+_SECRET_KEYS = {"K3CODE_API_KEY": "sk-k3-secret-111", "OMNIROUTE_API_KEY": "sk-omni-secret-222"}
+
+
+async def test_goal_gate_and_fanout_children_never_get_provider_keys(tmp_path, monkeypatch):
+    from k3code.autonomy.fanout import run_tests
+    from k3code.goals import GoalGate, run_gate
+
+    for name, value in _SECRET_KEYS.items():
+        monkeypatch.setenv(name, value)
+    _passed, _code, gate_out = await run_gate(GoalGate(command="env"), cwd=str(tmp_path))
+    _ok, fanout_out = await run_tests("env", tmp_path, 30)
+    for text in (gate_out, fanout_out):
+        assert "sk-k3-secret-111" not in text and "sk-omni-secret-222" not in text
+        assert "K3CODE_API_KEY" not in text and "OMNIROUTE_API_KEY" not in text
+
+
+@pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
+async def test_unattended_gate_and_fanout_argv_start_with_bwrap(tmp_path, monkeypatch):
+    from k3code.autonomy.fanout import run_tests
+    from k3code.goals import GoalGate, run_gate
+
+    spawned: list[tuple[str, ...]] = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spy(*argv, **kwargs):
+        spawned.append(argv)
+        return await real_exec(*argv, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    passed, code, _ = await run_gate(GoalGate(command="true"), cwd=str(tmp_path))
+    ok, _ = await run_tests("true", tmp_path, 30)
+    assert passed and code == 0 and ok
+    assert len(spawned) == 2 and all(argv[0] == sandbox.bwrap_path() for argv in spawned)
+
+
+def test_unattended_prefix_refuses_when_bwrap_is_unusable(tmp_path, monkeypatch):
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    with pytest.raises(sandbox.SandboxUnavailable):
+        sandbox.unattended_prefix(tmp_path)
+
+
+async def test_goal_gate_fails_closed_without_bwrap(tmp_path, monkeypatch):
+    from k3code.goals import GoalGate, run_gate
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    marker = tmp_path / "ran.txt"
+    passed, code, text = await run_gate(GoalGate(command=f"touch {marker}"), cwd=str(tmp_path))
+    assert passed is False and code == -1 and "unusable" in text
+    assert not marker.exists()  # the check never ran unsandboxed
+
+
+def test_harness_git_disables_hooks_and_fsmonitor():
+    argv = sandbox.harness_git_argv("status", "--porcelain")
+    assert argv[0] == "git" and argv[-2:] == ["status", "--porcelain"]
+    configs = {argv[i + 1] for i, arg in enumerate(argv) if arg == "-c"}
+    assert {"core.hooksPath=/dev/null", "core.fsmonitor=false"} <= configs
+
+
+async def test_harness_git_children_get_hardened_argv_and_scrubbed_env(tmp_path, monkeypatch):
+    from k3code.subagents import worktree
+
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "sk-omni-secret-222")
+    seen: dict[str, object] = {}
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spy(*argv, **kwargs):
+        seen["argv"], seen["env"] = argv, kwargs.get("env") or {}
+        return await real_exec(*argv, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    await worktree.git(tmp_path, "--version")
+    argv, env = seen["argv"], seen["env"]
+    assert "core.hooksPath=/dev/null" in argv and "core.fsmonitor=false" in argv
+    assert "OMNIROUTE_API_KEY" not in env and "PATH" in env
+
+
+def test_mcp_stdio_children_get_the_scrubbed_env(monkeypatch):
+    from k3code import mcpclient
+
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "sk-omni-secret-222")
+    env = mcpclient.stdio_env({"MY_SERVER_SETTING": "x"})
+    assert "OMNIROUTE_API_KEY" not in env and env["MY_SERVER_SETTING"] == "x" and "PATH" in env
+

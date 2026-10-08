@@ -7,12 +7,13 @@ callers fall back to running unsandboxed and ``/doctor`` warns.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 from k3code.permissions import PermissionMode
@@ -21,11 +22,19 @@ from k3code.permissions import PermissionMode
 HOME_CACHE = ".cache"
 HOME_UV = ".local/share/uv"
 SANDBOXED_MODES = (PermissionMode.AUTO, PermissionMode.YOLO)
-#: Environment variables the sandboxed command inherits (everything else, in particular API keys, is dropped).
+#: Environment variables a child process inherits (everything else, in particular API keys, is dropped). Used for
+#: the sandboxed command and for every unsandboxed child too (tools, gates, fan-out, git, MCP stdio): see
+#: :func:`child_env`.
 ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "NO_COLOR", "COLORTERM")
+#: Harness git never runs a hook or a fsmonitor program: a sandboxed command could have written one into .git.
+HARNESS_GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 #: A failed probe is retried after this many seconds (one slow probe used to disable the sandbox for the whole
 #: daemon lifetime: every unattended session then ran bash on the real $HOME).
 REPROBE_AFTER_S = 60.0
+
+
+class SandboxUnavailable(RuntimeError):
+    """An unattended process needs bwrap and bwrap cannot create the sandbox here. Refused, never run unsandboxed."""
 
 
 def bwrap_path() -> str | None:
@@ -35,6 +44,57 @@ def bwrap_path() -> str | None:
 def should_sandbox(mode: PermissionMode | str, background: bool) -> bool:
     """auto/yolo permission modes and background/cron/loop sessions run sandboxed."""
     return background or PermissionMode(mode) in SANDBOXED_MODES
+
+
+def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The environment every child process gets: :data:`ENV_ALLOW` from the daemon, plus ``extra``.
+
+    Provider keys (``OMNIROUTE_API_KEY``, ``K3CODE_API_KEY``, ...) are never passed to a child, so a tool, a gate,
+    a fan-out worker or a git trigger cannot print them.
+    """
+    env = {name: os.environ[name] for name in ENV_ALLOW if name in os.environ}
+    env.update(extra or {})
+    return env
+
+
+def harness_git_argv(*args: str) -> list[str]:
+    """``git`` argv for the harness itself (worktrees, merges, triggers, status): hooks and fsmonitor disabled."""
+    return ["git", *HARNESS_GIT_CONFIG, *args]
+
+
+def unattended_prefix(cwd: Path | str, add_dirs: Iterable[Path | str] = ()) -> list[str]:
+    """The bwrap prefix for an unattended child. Raises :class:`SandboxUnavailable` when bwrap is unusable.
+
+    Unattended work (goal gates, fan-out tests, ultra, sub-agents) has no human to see a warning, so there is no
+    unsandboxed fallback for it. Callers run this in a thread: :func:`usable` may spawn bwrap (up to 10 s).
+    """
+    if not usable():
+        raise SandboxUnavailable(
+            "bubblewrap is unusable here (user namespaces blocked?): unattended commands are refused, "
+            "not run unsandboxed; see /doctor"
+        )
+    return build_argv(cwd, add_dirs)
+
+
+async def spawn_unattended_shell(
+    command: str,
+    *,
+    cwd: Path | str,
+    add_dirs: Sequence[Path | str] = (),
+    extra_env: Mapping[str, str] | None = None,
+    stdin: int | None = asyncio.subprocess.DEVNULL,
+    stdout: int | None = asyncio.subprocess.PIPE,
+    stderr: int | None = asyncio.subprocess.STDOUT,
+) -> asyncio.subprocess.Process:
+    """Start ``command`` through ``/bin/sh`` inside bwrap, with the scrubbed :func:`child_env`.
+
+    The single gate for unattended shell commands. Raises :class:`SandboxUnavailable` before anything is spawned.
+    """
+    prefix = await asyncio.to_thread(unattended_prefix, cwd, add_dirs)
+    return await asyncio.create_subprocess_exec(
+        *prefix, "/bin/sh", "-c", command,
+        cwd=str(cwd), env=child_env(extra_env), stdin=stdin, stdout=stdout, stderr=stderr,
+    )
 
 
 def build_argv(
@@ -120,6 +180,7 @@ def _probe_bwrap() -> bool:
             capture_output=True,
             timeout=10,
             check=False,
+            env=child_env(),
         )
     except (OSError, subprocess.SubprocessError):
         return False
