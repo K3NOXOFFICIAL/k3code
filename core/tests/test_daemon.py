@@ -221,7 +221,11 @@ def test_notify_abstract_socket_and_no_socket(monkeypatch):
 def test_unit_file_matches_policy_and_repo_copy():
     unit = service.render_unit("/usr/bin/k3code daemon")
     unit_section, service_section = unit.split("[Service]")
-    for line in ("StartLimitIntervalSec=600", "StartLimitBurst=20"):
+    for line in (
+        f"StartLimitIntervalSec={service.START_LIMIT_INTERVAL_S}",
+        f"StartLimitBurst={service.START_LIMIT_BURST}",
+        "OnFailure=k3code-recover.service",
+    ):
         assert line in unit_section  # belongs in [Unit], not [Service]
     for line in (
         "Type=notify",

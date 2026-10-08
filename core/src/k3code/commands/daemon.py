@@ -1,4 +1,4 @@
-"""/daemon: show background-work state; ``/daemon resume`` leaves restart-storm safe mode."""
+"""/daemon: show background-work state; ``/daemon pause`` halts everything, ``/daemon resume`` clears it."""
 
 from __future__ import annotations
 
@@ -9,16 +9,26 @@ from k3code.commands import CommandDef
 
 class DaemonCommand(CommandDef):
     def __init__(self) -> None:
-        super().__init__(name="daemon", help="Daemon state: /daemon [resume]")
+        super().__init__(name="daemon", help="Daemon state: /daemon [pause|resume]")
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+        if arg == "pause":
+            stopped = await ctx.halt_daemon("/daemon pause")
+            return {
+                "type": "message",
+                "message": f"Daemon halted: {stopped} running turn(s) stopped; loops, jobs and sub-agents wait. "
+                "/daemon resume to continue.",
+            }
         if arg == "resume":
-            ctx.background_paused = False
-            ctx.safe_mode_notice = ""
-            ctx.emit("notification.clear", {"key": "k3.safe_mode"}, importance="essential")
+            ctx.resume_daemon()
             return {"type": "message", "message": "Background work resumed."}
         live = len(ctx.live)
-        state = "PAUSED (restart-storm safe mode)" if ctx.background_paused else "running"
+        if ctx.halted:
+            state = f"HALTED ({ctx.halt.reason})"
+        elif ctx.background_paused:
+            state = "PAUSED (restart-storm safe mode)"
+        else:
+            state = "running"
         return {
             "type": "message",
             "message": f"Background work: {state}; {live} live session(s); {len(ctx.clients)} client(s).",

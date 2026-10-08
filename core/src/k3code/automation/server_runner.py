@@ -16,7 +16,13 @@ from k3code.routing.tiers import TaskKind
 if TYPE_CHECKING:
     from k3code.gateway.server import GatewayServer
 
-_STATUS = {"done": "completed", "error": "failed", "needs_input": "needs_input", "interrupted": "interrupted"}
+_STATUS = {
+    "done": "completed",
+    "error": "failed",
+    "needs_input": "blocked",  # waiting for a human: never reported as completed or silently stopped
+    "interrupted": "interrupted",
+    "halted": "interrupted",  # /daemon pause stopped the run: it is not a failure
+}
 KEEP_FINISHED_RUNS = 20  # finished unattended sessions kept live (visible in the strip)
 BUSY_POLL_S = 1.0
 SHELL_TIMEOUT_S = 600.0
@@ -71,6 +77,8 @@ class ServerRunner:
         kind: str = "background_turn",
     ) -> RunResult:
         srv = self.server
+        if getattr(srv, "halted", False):  # /daemon pause: catch-all for every unattended start
+            return RunResult(status="interrupted", error="daemon halted (/daemon pause)")
         if srv.background_paused:
             return RunResult(
                 status="failed", error="background work is paused (restart-storm safe mode)", failure_kind="other"

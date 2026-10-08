@@ -129,6 +129,17 @@ class SessionStore:
             meta=json.loads(row[9] or "{}"),
         )
 
+    def with_goal_status(self, *statuses: str) -> list[StoredSession]:
+        """Full sessions whose goal is in one of ``statuses`` (boot resume and the watchdog read only these)."""
+        if not statuses:
+            return []
+        marks = ",".join("?" * len(statuses))
+        ids = self._db.execute(
+            f"SELECT session_id FROM sessions WHERE json_extract(meta, '$.goal.status') IN ({marks})",  # noqa: S608
+            statuses,
+        ).fetchall()
+        return [s for s in (self.get(row[0]) for row in ids) if s is not None]
+
     def list(self, *, limit: int = 50, include_automation: bool = True) -> list[StoredSession]:
         where = "" if include_automation else " WHERE COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
         rows = self._db.execute(

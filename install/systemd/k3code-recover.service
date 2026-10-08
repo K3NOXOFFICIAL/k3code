@@ -1,0 +1,7 @@
+[Unit]
+Description=Recover the k3code daemon after systemd stopped restarting it (start limit hit)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=/bin/sh -c 'sleep 1800 && systemctl --user reset-failed k3code.service && systemctl --user start k3code.service'
