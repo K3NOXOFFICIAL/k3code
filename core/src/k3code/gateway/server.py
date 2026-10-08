@@ -196,6 +196,13 @@ class LiveSession:
         self.preapproved_plan: dict[str, Any] | None = None
 
     @property
+    def turn_in_flight(self) -> bool:
+        """A turn owns this session: it streams, or its task still runs (scope gate, compaction, the goal judge, the
+        goal check, the advisor: ``streaming`` is False there). Anything that starts a turn, or evicts or idles the
+        session, must test this, not ``streaming``."""
+        return self.streaming or (self.turn_task is not None and not self.turn_task.done())
+
+    @property
     def state(self) -> str:
         """``working`` (also while paused), ``needs_input``, ``completed``/``failed`` (unattended run) or ``idle``."""
         if self.needs_input or self.server.has_open_request(self.session_id):
@@ -985,7 +992,7 @@ class GatewayServer:
         stopped = 0
         for live in list(self.live.values()):
             rel = live.reliability
-            if rel is None or not rel._started or live.streaming or live.pending_approval is not None:
+            if rel is None or not rel._started or live.turn_in_flight or live.pending_approval is not None:
                 continue
             if now - live.idle_since < self.IDLE_RELIABILITY_S:
                 continue
@@ -2015,7 +2022,7 @@ class GatewayServer:
         goal = mgr.state
         if goal is None or goal.status != "active":
             return False
-        if live.streaming or (live.turn_task is not None and not live.turn_task.done()):
+        if live.turn_in_flight:
             return False  # a live turn is working on it already
         now = time.time()
         if len(mgr.recent_kicks(now)) >= MAX_KICKS_PER_WINDOW:
@@ -2150,7 +2157,7 @@ class GatewayServer:
         text becomes the assistant message."""
         if self.halted:
             raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
-        if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
+        if session.turn_in_flight:
             raise _InvalidParams("a turn is already running in this session; /stop it or wait")
 
         async def runner() -> None:
@@ -2533,7 +2540,7 @@ async def _session_close(server: GatewayServer, params: dict[str, Any]) -> dict[
     if live is None:
         return {"closed": False, "reason": "not live"}
     if (
-        live.streaming
+        live.turn_in_flight
         or live.background
         or live.needs_input
         or server.has_open_request(sid)
@@ -2644,7 +2651,7 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     if server.halted:
         raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
     server.last_user_activity = time.time()
-    if session.streaming or (session.turn_task is not None and not session.turn_task.done()):
+    if session.turn_in_flight:
         # really queued: it runs when the current turn ends. The task check covers a turn that has not reached
         # `streaming = True` yet (compaction, MCP start): a second task there overwrote turn_task, so /stop missed one.
         session.pending_prompts.append(str(text))

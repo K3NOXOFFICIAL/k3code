@@ -171,7 +171,7 @@ class ServerRunner:
         finished = [
             s
             for s in self.server.live.values()
-            if s.stored.meta.get("origin") == self.origin and not s.streaming and s.pending_approval is None
+            if s.stored.meta.get("origin") == self.origin and not s.turn_in_flight and s.pending_approval is None
         ]
         finished.sort(key=lambda s: s.stored.updated_at)
         for old in finished[: max(0, len(finished) - KEEP_FINISHED_RUNS)]:

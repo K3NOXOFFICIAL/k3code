@@ -76,3 +76,54 @@ async def test_a_loop_guard_stop_reports_a_loop_tick_as_blocked(tmp_path, monkey
     res = await ServerRunner(server).run_prompt("watch the build", session_id=sid, kind="loop_tick")
     assert res.status == "blocked", res
     await server.close()
+
+
+async def test_closing_a_session_whose_goal_is_being_judged_keeps_it_live(tmp_path, monkeypatch):
+    """`streaming` is False during the judge, the check and compaction while the turn task runs on: session.close
+    evicted the session and the watchdog then built a second LiveSession and kicked the goal twice."""
+    from m1cmd_helpers import rpc
+
+    repo = git_repo(tmp_path / "repo")
+    server, provider = make_server(tmp_path, monkeypatch, ["working on it"], autonomy=NO_ADVISOR)
+    a = await new_session(server, repo)
+    live = server.live[a]
+    server.goal_manager(live).set("ship it")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def slow_judge(goal: str, response: str):
+        entered.set()
+        await release.wait()
+        return "done", "shipped", False, False
+
+    server.goal_judge = slow_judge
+    live.turn_task = asyncio.create_task(server._run_turn(live, "ship it"))
+    await asyncio.wait_for(entered.wait(), 20)
+    assert not live.streaming
+    await new_session(server, repo)  # the client moves on to another session
+    assert (await rpc(server, "session.close", {"session_id": a}))["result"]["closed"] is False
+    assert a in server.live
+    assert await server.watchdog_tick() == []  # no second driver
+    release.set()
+    await asyncio.wait_for(live.turn_task, 20)
+    assert provider.n == 1
+    await server.close()
+
+
+async def test_releasing_finished_runs_never_evicts_one_whose_turn_is_still_running(tmp_path, monkeypatch):
+    from k3code.automation import server_runner
+
+    monkeypatch.setattr(server_runner, "KEEP_FINISHED_RUNS", 0)
+    server, _ = make_server(tmp_path, monkeypatch)
+    stored = server.store.create(title="auto", cwd=str(tmp_path))
+    stored.meta.update({"background": True, "origin": "automation"})
+    server.store.save(stored)
+    live = server.live_for(stored)
+    gate = asyncio.Event()
+    live.turn_task = asyncio.create_task(gate.wait())  # e.g. the goal check runs: not streaming, not finished
+    await ServerRunner(server)._release(live)
+    assert stored.session_id in server.live
+    gate.set()
+    await live.turn_task
+    await ServerRunner(server)._release(live)
+    assert stored.session_id not in server.live  # finished now: evictable as before
+    await server.close()
