@@ -1,48 +1,60 @@
-import type { MouseTrackingMode } from '@k3code/ink'
-import { useEffect, useRef } from 'react'
+import type { MouseTrackingMode } from "@k3code/ink";
+import { useEffect, useRef } from "react";
 
-import { resolveDetailsMode, resolveSections } from '../domain/details.js'
-import type { GatewayClient } from '../gatewayClient.js'
-import type { ConfigFullResponse, ConfigMtimeResponse, ReloadMcpResponse } from '../gatewayTypes.js'
-import { asRpcResult } from '../lib/rpc.js'
+import { resolveDetailsMode, resolveSections } from "../domain/details.js";
+import type { GatewayClient } from "../gatewayClient.js";
+import type {
+  ConfigFullResponse,
+  ConfigMtimeResponse,
+  ReloadMcpResponse,
+} from "../gatewayTypes.js";
+import { asRpcResult } from "../lib/rpc.js";
 
-import { applyConfiguredTuiTheme } from './createGatewayEventHandler.js'
+import { applyConfiguredTuiTheme } from "./createGatewayEventHandler.js";
 import {
   type BusyInputMode,
   DEFAULT_INDICATOR_STYLE,
   INDICATOR_STYLES,
   type IndicatorStyle,
-  type StatusBarMode
-} from './interfaces.js'
-import { applyPetConfig } from './petStore.js'
-import { turnController } from './turnController.js'
-import { patchUiState } from './uiStore.js'
+  type StatusBarMode,
+} from "./interfaces.js";
+import { applyPetConfig } from "./petStore.js";
+import { turnController } from "./turnController.js";
+import { patchUiState } from "./uiStore.js";
 
 const STATUSBAR_ALIAS: Record<string, StatusBarMode> = {
-  bottom: 'bottom',
-  off: 'off',
-  on: 'top',
-  top: 'top'
-}
+  bottom: "bottom",
+  off: "off",
+  on: "top",
+  top: "top",
+};
 
 export const normalizeStatusBar = (raw: unknown): StatusBarMode =>
-  raw === false ? 'off' : typeof raw === 'string' ? (STATUSBAR_ALIAS[raw.trim().toLowerCase()] ?? 'top') : 'top'
+  raw === false
+    ? "off"
+    : typeof raw === "string"
+      ? (STATUSBAR_ALIAS[raw.trim().toLowerCase()] ?? "top")
+      : "top";
 
 // `display.status_bar.fields` — the SAME key the classic CLI bar honors
 // (PR #98250). A non-empty list filters status-rule segments; missing/empty/
 // malformed = null (user hasn't customized → show the default set). Unknown
 // names pass through harmlessly — the renderer only tests membership.
-export const normalizeStatusBarFields = (raw: unknown): null | ReadonlySet<string> => {
+export const normalizeStatusBarFields = (
+  raw: unknown,
+): null | ReadonlySet<string> => {
   if (!Array.isArray(raw) || raw.length === 0) {
-    return null
+    return null;
   }
 
-  const cleaned = raw.map(v => String(v).trim().toLowerCase()).filter(Boolean)
+  const cleaned = raw
+    .map((v) => String(v).trim().toLowerCase())
+    .filter(Boolean);
 
-  return cleaned.length ? new Set(cleaned) : null
-}
+  return cleaned.length ? new Set(cleaned) : null;
+};
 
-const BUSY_MODES = new Set<BusyInputMode>(['interrupt', 'queue', 'steer'])
+const BUSY_MODES = new Set<BusyInputMode>(["interrupt", "queue", "steer"]);
 
 // TUI defaults to `queue` even though the framework default
 // (`hermes_cli/config.py`) is `interrupt`.  Rationale: in a full-screen
@@ -51,33 +63,44 @@ const BUSY_MODES = new Set<BusyInputMode>(['interrupt', 'queue', 'steer'])
 // `display.busy_input_mode: interrupt` (or `steer`) explicitly to
 // opt out per-config; CLI / messaging adapters keep their `interrupt`
 // default unchanged.
-const TUI_BUSY_DEFAULT: BusyInputMode = 'queue'
+const TUI_BUSY_DEFAULT: BusyInputMode = "queue";
 
 export const normalizeBusyInputMode = (raw: unknown): BusyInputMode => {
-  if (typeof raw !== 'string') {
-    return TUI_BUSY_DEFAULT
+  if (typeof raw !== "string") {
+    return TUI_BUSY_DEFAULT;
   }
 
-  const v = raw.trim().toLowerCase() as BusyInputMode
+  const v = raw.trim().toLowerCase() as BusyInputMode;
 
-  return BUSY_MODES.has(v) ? v : TUI_BUSY_DEFAULT
-}
+  return BUSY_MODES.has(v) ? v : TUI_BUSY_DEFAULT;
+};
 
-const INDICATOR_STYLE_SET: ReadonlySet<IndicatorStyle> = new Set(INDICATOR_STYLES)
+const INDICATOR_STYLE_SET: ReadonlySet<IndicatorStyle> = new Set(
+  INDICATOR_STYLES,
+);
 
 export const normalizeIndicatorStyle = (raw: unknown): IndicatorStyle => {
-  if (typeof raw !== 'string') {
-    return DEFAULT_INDICATOR_STYLE
+  if (typeof raw !== "string") {
+    return DEFAULT_INDICATOR_STYLE;
   }
 
-  const v = raw.trim().toLowerCase() as IndicatorStyle
+  const v = raw.trim().toLowerCase() as IndicatorStyle;
 
-  return INDICATOR_STYLE_SET.has(v) ? v : DEFAULT_INDICATOR_STYLE
-}
+  return INDICATOR_STYLE_SET.has(v) ? v : DEFAULT_INDICATOR_STYLE;
+};
 
-const FALSEY_MOUSE = new Set(['0', 'false', 'no', 'off'])
-const TRUTHY_MOUSE_ALL = new Set(['1', 'true', 'yes', 'on', 'all', 'full', 'any'])
-const hasOwn = (obj: object, key: PropertyKey) => Object.prototype.hasOwnProperty.call(obj, key)
+const FALSEY_MOUSE = new Set(["0", "false", "no", "off"]);
+const TRUTHY_MOUSE_ALL = new Set([
+  "1",
+  "true",
+  "yes",
+  "on",
+  "all",
+  "full",
+  "any",
+]);
+const hasOwn = (obj: object, key: PropertyKey) =>
+  Object.prototype.hasOwnProperty.call(obj, key);
 
 // `display.mouse_tracking` accepts boolean (`true` ⇒ all modes, `false` ⇒ off)
 // for back-compat, plus the string presets `off|wheel|buttons|all` (aliases:
@@ -87,61 +110,63 @@ const hasOwn = (obj: object, key: PropertyKey) => Object.prototype.hasOwnPropert
 // `buttons` adds 1002 so terminal-side text selection drags still register.
 // Legacy `tui_mouse` is honored only if `mouse_tracking` is absent.
 export const normalizeMouseTracking = (display: {
-  mouse_tracking?: unknown
-  tui_mouse?: unknown
+  mouse_tracking?: unknown;
+  tui_mouse?: unknown;
 }): MouseTrackingMode => {
-  const raw = hasOwn(display, 'mouse_tracking') ? display.mouse_tracking : display.tui_mouse
+  const raw = hasOwn(display, "mouse_tracking")
+    ? display.mouse_tracking
+    : display.tui_mouse;
 
   if (raw === false || raw === 0) {
-    return 'off'
+    return "off";
   }
 
   if (raw === true || raw === undefined || raw === null) {
-    return 'all'
+    return "all";
   }
 
-  if (typeof raw === 'number') {
-    return 'all'
+  if (typeof raw === "number") {
+    return "all";
   }
 
-  if (typeof raw !== 'string') {
-    return 'all'
+  if (typeof raw !== "string") {
+    return "all";
   }
 
-  const v = raw.trim().toLowerCase()
+  const v = raw.trim().toLowerCase();
 
   if (FALSEY_MOUSE.has(v)) {
-    return 'off'
+    return "off";
   }
 
   if (TRUTHY_MOUSE_ALL.has(v)) {
-    return 'all'
+    return "all";
   }
 
-  if (v === 'wheel' || v === 'scroll') {
-    return 'wheel'
+  if (v === "wheel" || v === "scroll") {
+    return "wheel";
   }
 
-  if (v === 'buttons' || v === 'button' || v === 'click') {
-    return 'buttons'
+  if (v === "buttons" || v === "button" || v === "click") {
+    return "buttons";
   }
 
-  return 'all'
-}
+  return "all";
+};
 
-const MTIME_POLL_MS = 5000
+const MTIME_POLL_MS = 5000;
 
 const quietRpc = async <T extends Record<string, any> = Record<string, any>>(
   gw: GatewayClient,
   method: string,
-  params: Record<string, unknown> = {}
+  params: Record<string, unknown> = {},
 ): Promise<null | T> => {
   try {
-    return asRpcResult<T>(await gw.request<T>(method, params))
+    return asRpcResult<T>(await gw.request<T>(method, params));
   } catch {
-    return null
+    return null;
   }
-}
+};
 
 // ── MCP revision handshake ───────────────────────────────────────────
 //
@@ -157,9 +182,9 @@ const quietRpc = async <T extends Record<string, any> = Record<string, any>>(
 
 export interface McpRevState {
   /** Last revision the server CONFIRMED it loaded (or boot baseline). */
-  accepted: string
+  accepted: string;
   /** A reload RPC is outstanding — don't stack another every poll tick. */
-  inFlight: boolean
+  inFlight: boolean;
 }
 
 export const syncMcpReload = async (
@@ -167,75 +192,79 @@ export const syncMcpReload = async (
   sid: string,
   nextMcpRev: string,
   state: McpRevState,
-  onReloaded?: () => void
+  onReloaded?: () => void,
 ): Promise<void> => {
   if (!nextMcpRev || nextMcpRev === state.accepted || state.inFlight) {
-    return
+    return;
   }
 
-  state.inFlight = true
+  state.inFlight = true;
 
   try {
-    const r = await quietRpc<ReloadMcpResponse>(gw, 'reload.mcp', {
+    const r = await quietRpc<ReloadMcpResponse>(gw, "reload.mcp", {
       confirm: true,
       rev: nextMcpRev,
-      session_id: sid
-    })
+      session_id: sid,
+    });
 
-    if (r?.status === 'reloaded') {
-      state.accepted = String(r.loaded_rev || nextMcpRev)
-      onReloaded?.()
+    if (r?.status === "reloaded") {
+      state.accepted = String(r.loaded_rev || nextMcpRev);
+      onReloaded?.();
     }
     // Failure (null) or confirm_required: leave `accepted` unchanged so the
     // next poll tick retries the same revision.
   } finally {
-    state.inFlight = false
+    state.inFlight = false;
   }
-}
+};
 
-const _pasteCollapseLinesFromConfig = (cfg: ConfigFullResponse | null): number => {
+const _pasteCollapseLinesFromConfig = (
+  cfg: ConfigFullResponse | null,
+): number => {
   if (!cfg?.config) {
-    return 5
+    return 5;
   }
 
-  const raw = cfg.config.paste_collapse_threshold
+  const raw = cfg.config.paste_collapse_threshold;
 
-  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) {
-    return Math.round(raw)
+  if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) {
+    return Math.round(raw);
   }
 
-  if (typeof raw === 'string') {
-    const n = parseInt(raw, 10)
+  if (typeof raw === "string") {
+    const n = parseInt(raw, 10);
 
     if (Number.isFinite(n) && n >= 0) {
-      return n
+      return n;
     }
   }
 
-  return 5
-}
+  return 5;
+};
 
-const _pasteCollapseCharsFromConfig = (cfg: ConfigFullResponse | null): number => {
+const _pasteCollapseCharsFromConfig = (
+  cfg: ConfigFullResponse | null,
+): number => {
   if (!cfg?.config) {
-    return 2000
+    return 2000;
   }
 
-  const raw = cfg.config.paste_collapse_char_threshold
+  const raw = cfg.config.paste_collapse_char_threshold;
 
-  if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) {
-    return Math.round(raw)
+  if (typeof raw === "number" && Number.isFinite(raw) && raw >= 0) {
+    return Math.round(raw);
   }
 
-  if (typeof raw === 'string') {
-    const n = parseInt(raw, 10)
+  if (typeof raw === "string") {
+    const n = parseInt(raw, 10);
 
     if (Number.isFinite(n) && n >= 0) {
-      return n
+      return n;
     }
   }
 
-  return 2000
-}
+  return 2000;
+};
 
 /** Fetch ``config.get full`` and fan the result through ``applyDisplay``.
  *
@@ -247,30 +276,32 @@ const _pasteCollapseCharsFromConfig = (cfg: ConfigFullResponse | null): number =
 export async function hydrateFullConfig(
   gw: GatewayClient,
   setBell: (v: boolean) => void,
-  setBellOnPrompt?: (v: boolean) => void
+  setBellOnPrompt?: (v: boolean) => void,
 ): Promise<ConfigFullResponse | null> {
-  const cfg = await quietRpc<ConfigFullResponse>(gw, 'config.get', { key: 'full' })
-  applyDisplay(cfg, setBell, setBellOnPrompt)
+  const cfg = await quietRpc<ConfigFullResponse>(gw, "config.get", {
+    key: "full",
+  });
+  applyDisplay(cfg, setBell, setBellOnPrompt);
 
-  return cfg
+  return cfg;
 }
 
 export const applyDisplay = (
   cfg: ConfigFullResponse | null,
   setBell: (v: boolean) => void,
-  setBellOnPrompt?: (v: boolean) => void
+  setBellOnPrompt?: (v: boolean) => void,
 ) => {
-  const d = cfg?.config?.display ?? {}
-  const approvals = cfg?.config?.approvals
+  const d = cfg?.config?.display ?? {};
+  const approvals = cfg?.config?.approvals;
 
-  setBell(!!d.bell_on_complete)
+  setBell(!!d.bell_on_complete);
 
-  setBellOnPrompt?.(!!d.bell_on_prompt)
+  setBellOnPrompt?.(!!d.bell_on_prompt);
 
-  applyConfiguredTuiTheme(d.tui_theme)
+  applyConfiguredTuiTheme(d.tui_theme);
 
   if (cfg) {
-    applyPetConfig(d.pet)
+    applyPetConfig(d.pet);
   }
 
   patchUiState({
@@ -280,7 +311,12 @@ export const applyDisplay = (
     // Fail safe: only YAML boolean false disables the prompt. A transient
     // config RPC failure (cfg=null) preserves the last known policy instead
     // of silently changing approval behavior until the next successful poll.
-    ...(cfg ? { destructiveSlashConfirm: approvals?.destructive_slash_confirm !== false } : {}),
+    ...(cfg
+      ? {
+          destructiveSlashConfirm:
+            approvals?.destructive_slash_confirm !== false,
+        }
+      : {}),
     detailsMode: resolveDetailsMode(d),
     detailsModeCommandOverride: false,
     focusView: !!(d.focus_view ?? d.focus_mode),
@@ -296,89 +332,103 @@ export const applyDisplay = (
     streaming: d.streaming !== false,
     // The SAME key that stamps [HH:MM] on classic-CLI labels (#41531) —
     // no separate TUI knob.
-    timestamps: d.timestamps === true
-  })
-}
+    timestamps: d.timestamps === true,
+  });
+};
 
-export function useConfigSync({ gw, setBellOnComplete, setBellOnPrompt, sid }: UseConfigSyncOptions) {
-  const mtimeRef = useRef(0)
-  const mcpRevRef = useRef<McpRevState>({ accepted: '', inFlight: false })
+export function useConfigSync({
+  gw,
+  setBellOnComplete,
+  setBellOnPrompt,
+  sid,
+}: UseConfigSyncOptions) {
+  const mtimeRef = useRef(0);
+  const mcpRevRef = useRef<McpRevState>({ accepted: "", inFlight: false });
 
   useEffect(() => {
     if (!sid) {
-      return
+      return;
     }
 
     // Keep startup cheap: environment flags are enough to initialize the UI
     // bit; heavier optional-feature checks stay out of the startup path so
     // prompt.submit is never delayed on the single stdio RPC pipe.
-    quietRpc<ConfigMtimeResponse>(gw, 'config.get', { key: 'mtime' }).then(r => {
-      mtimeRef.current = Number(r?.mtime ?? 0)
-      // Seed the MCP revision baseline too: after a normal boot mtime is
-      // already non-zero, so the poller's baseline branch never runs, and an
-      // unset baseline would make the FIRST cosmetic write (mtime bump, same
-      // mcp_rev) look like an MCP change and fire a needless reload.mcp.
-      mcpRevRef.current.accepted = String(r?.mcp_rev ?? '')
-    })
-    void hydrateFullConfig(gw, setBellOnComplete, setBellOnPrompt)
-  }, [gw, setBellOnComplete, setBellOnPrompt, sid])
+    quietRpc<ConfigMtimeResponse>(gw, "config.get", { key: "mtime" }).then(
+      (r) => {
+        mtimeRef.current = Number(r?.mtime ?? 0);
+        // Seed the MCP revision baseline too: after a normal boot mtime is
+        // already non-zero, so the poller's baseline branch never runs, and an
+        // unset baseline would make the FIRST cosmetic write (mtime bump, same
+        // mcp_rev) look like an MCP change and fire a needless reload.mcp.
+        mcpRevRef.current.accepted = String(r?.mcp_rev ?? "");
+      },
+    );
+    void hydrateFullConfig(gw, setBellOnComplete, setBellOnPrompt);
+  }, [gw, setBellOnComplete, setBellOnPrompt, sid]);
 
   useEffect(() => {
     if (!sid) {
-      return
+      return;
     }
 
     const id = setInterval(() => {
-      quietRpc<ConfigMtimeResponse>(gw, 'config.get', { key: 'mtime' }).then(r => {
-        const next = Number(r?.mtime ?? 0)
-        const nextMcpRev = String(r?.mcp_rev ?? '')
+      quietRpc<ConfigMtimeResponse>(gw, "config.get", { key: "mtime" }).then(
+        (r) => {
+          const next = Number(r?.mtime ?? 0);
+          const nextMcpRev = String(r?.mcp_rev ?? "");
 
-        if (!mtimeRef.current) {
-          if (next) {
-            mtimeRef.current = next
-            mcpRevRef.current.accepted = nextMcpRev
+          if (!mtimeRef.current) {
+            if (next) {
+              mtimeRef.current = next;
+              mcpRevRef.current.accepted = nextMcpRev;
+            }
+
+            return;
           }
 
-          return
-        }
+          // Reload MCP only when the MCP-relevant config actually changed.
+          // Cosmetic writes (/skin, /statusbar, /theme) bump mtime constantly;
+          // reconnecting every MCP server for those costs seconds and made
+          // skin switching feel glacial. The handshake runs on EVERY poll tick
+          // (not just mtime changes) so a failed reload retries until the
+          // server confirms the revision was loaded.
+          if (nextMcpRev) {
+            void syncMcpReload(gw, sid, nextMcpRev, mcpRevRef.current, () =>
+              turnController.pushActivity("MCP reloaded after config change"),
+            );
+          }
 
-        // Reload MCP only when the MCP-relevant config actually changed.
-        // Cosmetic writes (/skin, /statusbar, /theme) bump mtime constantly;
-        // reconnecting every MCP server for those costs seconds and made
-        // skin switching feel glacial. The handshake runs on EVERY poll tick
-        // (not just mtime changes) so a failed reload retries until the
-        // server confirms the revision was loaded.
-        if (nextMcpRev) {
-          void syncMcpReload(gw, sid, nextMcpRev, mcpRevRef.current, () =>
-            turnController.pushActivity('MCP reloaded after config change')
-          )
-        }
+          if (!next || next === mtimeRef.current) {
+            return;
+          }
 
-        if (!next || next === mtimeRef.current) {
-          return
-        }
+          mtimeRef.current = next;
 
-        mtimeRef.current = next
+          // Older gateways don't send mcp_rev — fall back to
+          // reload-on-any-change there (no ack tracking possible).
+          if (!nextMcpRev) {
+            quietRpc<ReloadMcpResponse>(gw, "reload.mcp", {
+              session_id: sid,
+              confirm: true,
+            }).then(
+              (r) =>
+                r &&
+                turnController.pushActivity("MCP reloaded after config change"),
+            );
+          }
 
-        // Older gateways don't send mcp_rev — fall back to
-        // reload-on-any-change there (no ack tracking possible).
-        if (!nextMcpRev) {
-          quietRpc<ReloadMcpResponse>(gw, 'reload.mcp', { session_id: sid, confirm: true }).then(
-            r => r && turnController.pushActivity('MCP reloaded after config change')
-          )
-        }
+          void hydrateFullConfig(gw, setBellOnComplete, setBellOnPrompt);
+        },
+      );
+    }, MTIME_POLL_MS);
 
-        void hydrateFullConfig(gw, setBellOnComplete, setBellOnPrompt)
-      })
-    }, MTIME_POLL_MS)
-
-    return () => clearInterval(id)
-  }, [gw, setBellOnComplete, setBellOnPrompt, sid])
+    return () => clearInterval(id);
+  }, [gw, setBellOnComplete, setBellOnPrompt, sid]);
 }
 
 export interface UseConfigSyncOptions {
-  gw: GatewayClient
-  setBellOnComplete: (v: boolean) => void
-  setBellOnPrompt?: (v: boolean) => void
-  sid: null | string
+  gw: GatewayClient;
+  setBellOnComplete: (v: boolean) => void;
+  setBellOnPrompt?: (v: boolean) => void;
+  sid: null | string;
 }

@@ -1,15 +1,16 @@
-import { stringWidth, wrapAnsi } from '@k3code/ink'
+import { stringWidth, wrapAnsi } from "@k3code/ink";
 
-import type { Role } from '../types.js'
+import type { Role } from "../types.js";
 
-export const COMPOSER_PROMPT_GAP_WIDTH = 1
+export const COMPOSER_PROMPT_GAP_WIDTH = 1;
 
-let _seg: Intl.Segmenter | null = null
-const seg = () => (_seg ??= new Intl.Segmenter(undefined, { granularity: 'grapheme' }))
+let _seg: Intl.Segmenter | null = null;
+const seg = () =>
+  (_seg ??= new Intl.Segmenter(undefined, { granularity: "grapheme" }));
 
 interface VisualLine {
-  end: number
-  start: number
+  end: number;
+  start: number;
 }
 
 const graphemes = (value: string) =>
@@ -17,8 +18,8 @@ const graphemes = (value: string) =>
     end: index + segment.length,
     index,
     segment,
-    width: Math.max(1, stringWidth(segment))
-  }))
+    width: Math.max(1, stringWidth(segment)),
+  }));
 
 // Build VisualLines from wrap-ansi's output by mapping each emitted character
 // back to its original offset in `value`. wrap-ansi only INSERTS '\n' at wrap
@@ -34,35 +35,36 @@ const graphemes = (value: string) =>
 // Sourcing both from wrap-ansi guarantees agreement.
 function visualLines(value: string, cols: number): VisualLine[] {
   if (!value.length) {
-    return [{ start: 0, end: 0 }]
+    return [{ start: 0, end: 0 }];
   }
 
-  const width = Math.max(1, cols)
-  const wrapped = wrapAnsi(value, width, { hard: true, trim: false })
-  const lines: VisualLine[] = []
+  const width = Math.max(1, cols);
+  const wrapped = wrapAnsi(value, width, { hard: true, trim: false });
+  const lines: VisualLine[] = [];
 
-  let originalIdx = 0
-  let lineStart = 0
+  let originalIdx = 0;
+  let lineStart = 0;
 
   for (let i = 0; i < wrapped.length; i += 1) {
-    const ch = wrapped[i]!
+    const ch = wrapped[i]!;
 
-    if (ch === '\n') {
+    if (ch === "\n") {
       // wrap-ansi inserts '\n' to mark a soft-wrap boundary OR copies a
       // literal '\n' from the input. Either way the next char in `wrapped`
       // begins a new visual line. If the source character is a hard '\n',
       // consume it (it doesn't appear in either line). Otherwise the '\n'
       // is purely a wrap marker and originalIdx stays put.
-      lines.push({ start: lineStart, end: originalIdx })
-      const isHardNewline = originalIdx < value.length && value[originalIdx] === '\n'
+      lines.push({ start: lineStart, end: originalIdx });
+      const isHardNewline =
+        originalIdx < value.length && value[originalIdx] === "\n";
 
       if (isHardNewline) {
-        originalIdx += 1
+        originalIdx += 1;
       }
 
-      lineStart = originalIdx
+      lineStart = originalIdx;
 
-      continue
+      continue;
     }
 
     // Defensive sync check. wrap-ansi (with `hard: true, trim: false`, no
@@ -76,37 +78,37 @@ function visualLines(value: string, cols: number): VisualLine[] {
     // for the matching character; bail out (return whatever we have) if the
     // sync is unrecoverable rather than producing wrong-but-plausible output.
     if (originalIdx >= value.length) {
-      break
+      break;
     }
 
     if (value[originalIdx] !== ch) {
-      const reSync = value.indexOf(ch, originalIdx)
+      const reSync = value.indexOf(ch, originalIdx);
 
       if (reSync === -1) {
-        break
+        break;
       }
 
-      originalIdx = reSync
+      originalIdx = reSync;
     }
 
-    originalIdx += 1
+    originalIdx += 1;
   }
 
-  lines.push({ start: lineStart, end: originalIdx })
+  lines.push({ start: lineStart, end: originalIdx });
 
   // wrap-ansi collapses an empty input into [""] which we already handled
   // above; preserve the invariant that lines is never empty for any input.
-  return lines.length ? lines : [{ start: 0, end: 0 }]
+  return lines.length ? lines : [{ start: 0, end: 0 }];
 }
 
 function widthBetween(value: string, start: number, end: number) {
-  let width = 0
+  let width = 0;
 
   for (const part of graphemes(value.slice(start, end))) {
-    width += part.width
+    width += part.width;
   }
 
-  return width
+  return width;
 }
 
 /**
@@ -120,21 +122,21 @@ function widthBetween(value: string, start: number, end: number) {
  * from wrap-ansi to enforce that invariant.
  */
 export function cursorLayout(value: string, cursor: number, cols: number) {
-  const pos = Math.max(0, Math.min(cursor, value.length))
-  const w = Math.max(1, cols)
-  const lines = visualLines(value, w)
-  let lineIndex = 0
+  const pos = Math.max(0, Math.min(cursor, value.length));
+  const w = Math.max(1, cols);
+  const lines = visualLines(value, w);
+  let lineIndex = 0;
 
   for (let i = 0; i < lines.length; i += 1) {
     if (lines[i]!.start <= pos) {
-      lineIndex = i
+      lineIndex = i;
     } else {
-      break
+      break;
     }
   }
 
-  const line = lines[lineIndex]!
-  const column = widthBetween(value, line.start, Math.min(pos, line.end))
+  const line = lines[lineIndex]!;
+  const column = widthBetween(value, line.start, Math.min(pos, line.end));
 
   // NOTE: the previous implementation forced an extra line break when
   // `column >= w` (the "trailing cursor-cell overflows" rule). With
@@ -142,62 +144,80 @@ export function cursorLayout(value: string, cursor: number, cols: number) {
   // above already matches what Ink will actually render. Pushing the
   // cursor onto a phantom next line here would re-introduce the same
   // drift we're fixing, so we don't.
-  return { column, line: lineIndex }
+  return { column, line: lineIndex };
 }
 
-export function offsetFromPosition(value: string, row: number, col: number, cols: number) {
+export function offsetFromPosition(
+  value: string,
+  row: number,
+  col: number,
+  cols: number,
+) {
   if (!value.length) {
-    return 0
+    return 0;
   }
 
-  const lines = visualLines(value, cols)
-  const target = lines[Math.max(0, Math.min(lines.length - 1, Math.floor(row)))]!
-  const targetCol = Math.max(0, Math.floor(col))
-  let column = 0
+  const lines = visualLines(value, cols);
+  const target =
+    lines[Math.max(0, Math.min(lines.length - 1, Math.floor(row)))]!;
+  const targetCol = Math.max(0, Math.floor(col));
+  let column = 0;
 
   for (const part of graphemes(value.slice(target.start, target.end))) {
     if (targetCol <= column + Math.max(0, part.width - 1)) {
-      return target.start + part.index
+      return target.start + part.index;
     }
 
-    column += part.width
+    column += part.width;
   }
 
-  return target.end
+  return target.end;
 }
 
 export function inputVisualHeight(value: string, columns: number) {
-  return cursorLayout(value, value.length, columns).line + 1
+  return cursorLayout(value, value.length, columns).line + 1;
 }
 
 export function composerPromptWidth(promptText: string) {
-  return Math.max(1, stringWidth(promptText)) + COMPOSER_PROMPT_GAP_WIDTH
+  return Math.max(1, stringWidth(promptText)) + COMPOSER_PROMPT_GAP_WIDTH;
 }
 
 export function transcriptGutterWidth(role: Role, userPrompt: string) {
-  return role === 'user' ? composerPromptWidth(userPrompt) : 3
+  return role === "user" ? composerPromptWidth(userPrompt) : 3;
 }
 
-export function transcriptBodyWidth(totalCols: number, role: Role, userPrompt: string, termuxMode = false): number {
-  const horizontalReserve = termuxMode ? 2 : 4
-  const available = Math.max(1, totalCols - transcriptGutterWidth(role, userPrompt) - horizontalReserve)
+export function transcriptBodyWidth(
+  totalCols: number,
+  role: Role,
+  userPrompt: string,
+  termuxMode = false,
+): number {
+  const horizontalReserve = termuxMode ? 2 : 4;
+  const available = Math.max(
+    1,
+    totalCols - transcriptGutterWidth(role, userPrompt) - horizontalReserve,
+  );
 
   if (termuxMode) {
     // On narrow / unusual aspect-ratio mobile panes, forcing a wide minimum
     // width causes right-edge clipping and chopped words.
-    return available
+    return available;
   }
 
-  return Math.max(20, available)
+  return Math.max(20, available);
 }
 
-export function stableComposerColumns(totalCols: number, promptWidth: number, termuxMode = false): number {
+export function stableComposerColumns(
+  totalCols: number,
+  promptWidth: number,
+  termuxMode = false,
+): number {
   // Physical render/wrap width. Always reserve outer composer padding and
   // prompt prefix. Only reserve the transcript scrollbar gutter when the
   // terminal is wide enough; on narrow panes, preserving input columns beats
   // keeping gutters visually aligned.
-  const afterPrompt = totalCols - promptWidth
-  const reserveScrollbar = afterPrompt >= (termuxMode ? 36 : 24) ? 2 : 0
+  const afterPrompt = totalCols - promptWidth;
+  const reserveScrollbar = afterPrompt >= (termuxMode ? 36 : 24) ? 2 : 0;
 
-  return Math.max(1, totalCols - promptWidth - 2 - reserveScrollbar)
+  return Math.max(1, totalCols - promptWidth - 2 - reserveScrollbar);
 }

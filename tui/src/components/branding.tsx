@@ -1,35 +1,38 @@
-import { Box, Text, useStdout } from '@k3code/ink'
-import { mix } from '@k3code/shared/color'
-import { useEffect, useState } from 'react'
-import unicodeSpinners from 'unicode-animations'
+import { Box, Text, useStdout } from "@k3code/ink";
+import { mix } from "@k3code/shared/color";
+import { useEffect, useState } from "react";
+import unicodeSpinners from "unicode-animations";
 
-import { artWidth, hero, HERO_WIDTH, logo, LOGO_WIDTH } from '../banner.js'
-import { flat } from '../lib/text.js'
-import type { Theme } from '../theme.js'
-import type { PanelSection, SessionInfo } from '../types.js'
+import { artWidth, hero, HERO_WIDTH, logo, LOGO_WIDTH } from "../banner.js";
+import { flat } from "../lib/text.js";
+import type { Theme } from "../theme.js";
+import type { PanelSection, SessionInfo } from "../types.js";
 
-import { Accordion } from './accordion.js'
-import { ShimmerRows } from './loaders.js'
-import { WidgetGrid } from './widgetGrid.js'
+import { Accordion } from "./accordion.js";
+import { ShimmerRows } from "./loaders.js";
+import { WidgetGrid } from "./widgetGrid.js";
 
-const LOADER_TICK_MS = 120
+const LOADER_TICK_MS = 120;
 
 function InlineLoader({ label, t }: { label: string; t: Theme }) {
-  const [tick, setTick] = useState(0)
-  const spinner = unicodeSpinners.braille
-  const frame = spinner.frames[tick % spinner.frames.length] ?? '⠋'
+  const [tick, setTick] = useState(0);
+  const spinner = unicodeSpinners.braille;
+  const frame = spinner.frames[tick % spinner.frames.length] ?? "⠋";
 
   useEffect(() => {
-    const id = setInterval(() => setTick(n => n + 1), Math.max(LOADER_TICK_MS, spinner.interval))
+    const id = setInterval(
+      () => setTick((n) => n + 1),
+      Math.max(LOADER_TICK_MS, spinner.interval),
+    );
 
-    return () => clearInterval(id)
-  }, [spinner.interval])
+    return () => clearInterval(id);
+  }, [spinner.interval]);
 
   return (
     <Text color={t.color.muted} wrap="truncate">
       <Text color={t.color.accent}>{frame}</Text> {label}
     </Text>
-  )
+  );
 }
 
 export function ArtLines({ lines }: { lines: [string, string][] }) {
@@ -46,7 +49,7 @@ export function ArtLines({ lines }: { lines: [string, string][] }) {
         </Text>
       ))}
     </Box>
-  )
+  );
 }
 
 // Responsive Banner: full art → compact rule → text → hidden.
@@ -54,33 +57,34 @@ export function ArtLines({ lines }: { lines: [string, string][] }) {
 // Terminals can't scale glyphs, so "responsive" means picking a layout that
 // fits the available columns. Thresholds are picked so each tier reads
 // comfortably without forcing wrap or truncation drift on box-drawing edges.
-const TAG_FULL = 'k3code · terminal coding agent'
-const TAG_MID = 'terminal coding agent'
-const TAG_TINY = 'k3code'
-const HIDE_BELOW = 34
-const COMPACT_FROM = 58
+const TAG_FULL = "k3code · terminal coding agent";
+const TAG_MID = "terminal coding agent";
+const TAG_TINY = "k3code";
+const HIDE_BELOW = 34;
+const COMPACT_FROM = 58;
 
-const clip = (s: string, w: number) => (w <= 0 ? '' : s.length > w ? `${s.slice(0, Math.max(0, w - 1))}…` : s)
+const clip = (s: string, w: number) =>
+  w <= 0 ? "" : s.length > w ? `${s.slice(0, Math.max(0, w - 1))}…` : s;
 
 const centerIn = (s: string, w: number) => {
-  const f = clip(s, w)
-  const slack = Math.max(0, w - f.length)
-  const left = slack >> 1
+  const f = clip(s, w);
+  const slack = Math.max(0, w - f.length);
+  const left = slack >> 1;
 
-  return `${' '.repeat(left)}${f}${' '.repeat(slack - left)}`
-}
+  return `${" ".repeat(left)}${f}${" ".repeat(slack - left)}`;
+};
 
 const ruleIn = (label: string, w: number) => {
-  const f = clip(label, Math.max(1, w - 4))
-  const slack = Math.max(0, w - f.length - 2)
-  const left = slack >> 1
+  const f = clip(label, Math.max(1, w - 4));
+  const slack = Math.max(0, w - f.length - 2);
+  const left = slack >> 1;
 
-  return `${'─'.repeat(left)} ${f} ${'─'.repeat(slack - left)}`
-}
+  return `${"─".repeat(left)} ${f} ${"─".repeat(slack - left)}`;
+};
 
 function CompactBanner({ cols, t }: { cols: number; t: Theme }) {
   // -4 keeps a margin so exact-edge rows don't trip terminal pending-wrap.
-  const w = Math.max(28, cols - 4)
+  const w = Math.max(28, cols - 4);
 
   // No `opaque` (see ArtLines): the dashed rules are glyphs and the tagline's
   // centering spaces carry the text's own fg style, so every cell paints with
@@ -95,21 +99,21 @@ function CompactBanner({ cols, t }: { cols: number; t: Theme }) {
     <Box flexDirection="column" height={3} marginBottom={1} width={w}>
       <Text color={t.color.primary}>{ruleIn(t.brand.name, w)}</Text>
       <Text color={t.color.muted}>{centerIn(TAG_FULL, w)}</Text>
-      <Text color={t.color.primary}>{'─'.repeat(w)}</Text>
+      <Text color={t.color.primary}>{"─".repeat(w)}</Text>
     </Box>
-  )
+  );
 }
 
 export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
-  const term = useStdout().stdout?.columns ?? 80
-  const cols = Math.max(1, Math.min(term, maxWidth ?? term))
+  const term = useStdout().stdout?.columns ?? 80;
+  const cols = Math.max(1, Math.min(term, maxWidth ?? term));
 
   if (cols < HIDE_BELOW) {
-    return null
+    return null;
   }
 
-  const logoLines = logo(t.color, t.bannerLogo || undefined)
-  const logoW = t.bannerLogo ? artWidth(logoLines) : LOGO_WIDTH
+  const logoLines = logo(t.color, t.bannerLogo || undefined);
+  const logoW = t.bannerLogo ? artWidth(logoLines) : LOGO_WIDTH;
 
   // Each tier renders its rows through a single-column WidgetGrid sized to
   // the available columns — same visual output as the old plain flex column
@@ -126,19 +130,19 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
           paddingY={0}
           rowGap={0}
           widgets={[
-            { children: <ArtLines lines={logoLines} />, id: 'banner-art' },
+            { children: <ArtLines lines={logoLines} />, id: "banner-art" },
             {
               children: (
                 <Text color={t.color.muted} wrap="truncate-end">
                   {t.brand.icon} {TAG_FULL}
                 </Text>
               ),
-              id: 'banner-tagline'
-            }
+              id: "banner-tagline",
+            },
           ]}
         />
       </Box>
-    )
+    );
   }
 
   if (cols >= COMPACT_FROM) {
@@ -150,13 +154,19 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
         paddingX={0}
         paddingY={0}
         rowGap={0}
-        widgets={[{ children: <CompactBanner cols={cols} t={t} />, id: 'banner-compact' }]}
+        widgets={[
+          {
+            children: <CompactBanner cols={cols} t={t} />,
+            id: "banner-compact",
+          },
+        ]}
       />
-    )
+    );
   }
 
-  const name = cols >= 52 ? t.brand.name : (t.brand.name.split(' ')[0] ?? t.brand.name)
-  const tag = cols >= 64 ? TAG_FULL : cols >= 46 ? TAG_MID : TAG_TINY
+  const name =
+    cols >= 52 ? t.brand.name : (t.brand.name.split(" ")[0] ?? t.brand.name);
+  const tag = cols >= 64 ? TAG_FULL : cols >= 46 ? TAG_MID : TAG_TINY;
 
   return (
     <Box flexDirection="column" marginBottom={1}>
@@ -174,7 +184,7 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
                 {t.brand.icon} {name}
               </Text>
             ),
-            id: 'banner-name'
+            id: "banner-name",
           },
           {
             children: (
@@ -182,12 +192,12 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
                 {t.brand.icon} {tag}
               </Text>
             ),
-            id: 'banner-tag'
-          }
+            id: "banner-tag",
+          },
         ]}
       />
     </Box>
-  )
+  );
 }
 
 // ── Skeleton ─────────────────────────────────────────────────────────
@@ -201,135 +211,149 @@ const SKELETON_ROWS: readonly (readonly [number, number])[] = [
   [14, 12],
   [12, 12],
   [7, 7],
-  [10, 13]
-]
+  [10, 13],
+];
 
 // ── SessionPanel ─────────────────────────────────────────────────────
 
-const SKILLS_MAX = 8
-const TOOLSETS_MAX = 8
+const SKILLS_MAX = 8;
+const TOOLSETS_MAX = 8;
 
 export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
-  const term = useStdout().stdout?.columns ?? 100
-  const cols = Math.max(20, Math.min(term, maxWidth ?? term))
-  const heroLines = hero(t.color, t.bannerHero || undefined)
-  const leftW = Math.min((artWidth(heroLines) || HERO_WIDTH) + 4, Math.floor(cols * 0.4))
-  const wide = cols >= 90 && leftW + 40 < cols
-  const w = Math.max(20, wide ? cols - leftW - 14 : cols - 12)
-  const lineBudget = Math.max(12, w - 2)
-  const strip = (s: string) => (s.endsWith('_tools') ? s.slice(0, -6) : s)
+  const term = useStdout().stdout?.columns ?? 100;
+  const cols = Math.max(20, Math.min(term, maxWidth ?? term));
+  const heroLines = hero(t.color, t.bannerHero || undefined);
+  const leftW = Math.min(
+    (artWidth(heroLines) || HERO_WIDTH) + 4,
+    Math.floor(cols * 0.4),
+  );
+  const wide = cols >= 90 && leftW + 40 < cols;
+  const w = Math.max(20, wide ? cols - leftW - 14 : cols - 12);
+  const lineBudget = Math.max(12, w - 2);
+  const strip = (s: string) => (s.endsWith("_tools") ? s.slice(0, -6) : s);
 
   // Hierarchy: labels lead in the label tone; member lists recede in the
   // muted/text midpoint. Anchoring on MUTED (mid-luminance by construction)
   // keeps the fade readable on both poles even when polarity detection is
   // wrong — surface-relative blends go invisible when text is already pale.
-  const listFade = mix(t.color.muted, t.color.text, 0.5)
+  const listFade = mix(t.color.muted, t.color.text, 0.5);
 
   // ── Local collapse state for each section ──
-  const [toolsOpen, setToolsOpen] = useState(true)
-  const [skillsOpen, setSkillsOpen] = useState(false)
-  const [systemOpen, setSystemOpen] = useState(false)
-  const [mcpOpen, setMcpOpen] = useState(false)
+  const [toolsOpen, setToolsOpen] = useState(true);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [systemOpen, setSystemOpen] = useState(false);
+  const [mcpOpen, setMcpOpen] = useState(false);
 
   const truncLine = (pfx: string, items: string[]) => {
-    let line = ''
-    let shown = 0
+    let line = "";
+    let shown = 0;
 
     for (const item of [...items].sort()) {
-      const next = line ? `${line}, ${item}` : item
+      const next = line ? `${line}, ${item}` : item;
 
       if (pfx.length + next.length > lineBudget) {
-        return line ? `${line}, …+${items.length - shown}` : `${item}, …`
+        return line ? `${line}, …+${items.length - shown}` : `${item}, …`;
       }
 
-      line = next
-      shown++
+      line = next;
+      shown++;
     }
 
-    return line
-  }
+    return line;
+  };
 
   // ── Collapsible skills section ──
-  const skills = info.skills ?? {}
-  const skillEntries = Object.entries(skills).sort()
-  const skillsTotal = flat(skills).length
-  const skillsCatCount = skillEntries.length
+  const skills = info.skills ?? {};
+  const skillEntries = Object.entries(skills).sort();
+  const skillsTotal = flat(skills).length;
+  const skillsCatCount = skillEntries.length;
 
   const skillsBody = () => {
     if (info.lazy && skillEntries.length === 0) {
-      return <InlineLoader label="scanning skills" t={t} />
+      return <InlineLoader label="scanning skills" t={t} />;
     }
 
-    const shown = skillEntries.slice(0, SKILLS_MAX)
-    const overflow = skillEntries.length - SKILLS_MAX
+    const shown = skillEntries.slice(0, SKILLS_MAX);
+    const overflow = skillEntries.length - SKILLS_MAX;
 
     return (
       <>
         {shown.map(([k, vs]) => (
           <Text key={k} wrap="truncate">
             <Text color={t.color.label}>{strip(k)}: </Text>
-            <Text color={listFade}>{truncLine(strip(k) + ': ', vs)}</Text>
+            <Text color={listFade}>{truncLine(strip(k) + ": ", vs)}</Text>
           </Text>
         ))}
-        {overflow > 0 && <Text color={t.color.muted}>(and {overflow} more categories…)</Text>}
+        {overflow > 0 && (
+          <Text color={t.color.muted}>(and {overflow} more categories…)</Text>
+        )}
       </>
-    )
-  }
+    );
+  };
 
   // ── Collapsible tools section ──
-  const tools = info.tools ?? {}
-  const toolEntries = Object.entries(tools).sort()
-  const toolsTotal = flat(tools).length
+  const tools = info.tools ?? {};
+  const toolEntries = Object.entries(tools).sort();
+  const toolsTotal = flat(tools).length;
 
   // MCP headline counts *connected* servers, not configured-but-disabled ones,
   // so it matches the CLI banner's own connected count and the "connected"
   // label on the collapse toggle.
-  const mcpServers = info.mcp_servers ?? []
-  const mcpConnected = mcpServers.filter(s => s.connected).length
+  const mcpServers = info.mcp_servers ?? [];
+  const mcpConnected = mcpServers.filter((s) => s.connected).length;
 
   const toolsBody = () => {
     if (info.lazy && toolEntries.length === 0) {
-      return <ShimmerRows color={listFade} highlight={t.color.label} rows={SKELETON_ROWS} />
+      return (
+        <ShimmerRows
+          color={listFade}
+          highlight={t.color.label}
+          rows={SKELETON_ROWS}
+        />
+      );
     }
 
-    const shown = toolEntries.slice(0, TOOLSETS_MAX)
-    const overflow = toolEntries.length - TOOLSETS_MAX
+    const shown = toolEntries.slice(0, TOOLSETS_MAX);
+    const overflow = toolEntries.length - TOOLSETS_MAX;
 
     return (
       <>
         {shown.map(([k, vs]) => (
           <Text key={k} wrap="truncate">
             <Text color={t.color.label}>{strip(k)}: </Text>
-            <Text color={listFade}>{truncLine(strip(k) + ': ', vs)}</Text>
+            <Text color={listFade}>{truncLine(strip(k) + ": ", vs)}</Text>
           </Text>
         ))}
-        {overflow > 0 && <Text color={t.color.muted}>(and {overflow} more toolsets…)</Text>}
+        {overflow > 0 && (
+          <Text color={t.color.muted}>(and {overflow} more toolsets…)</Text>
+        )}
       </>
-    )
-  }
+    );
+  };
 
   // ── Collapsible MCP section ──
   const mcpBody = () => (
     <>
-      {(info.mcp_servers ?? []).map(s => (
+      {(info.mcp_servers ?? []).map((s) => (
         <Text key={s.name} wrap="truncate">
           <Text color={t.color.muted}>{`  ${s.name} `}</Text>
           <Text color={t.color.muted}>{`[${s.transport}]`}</Text>
           <Text color={t.color.muted}>: </Text>
           {s.connected ? (
             <Text color={t.color.text}>
-              {s.tools} tool{s.tools === 1 ? '' : 's'}
+              {s.tools} tool{s.tools === 1 ? "" : "s"}
             </Text>
-          ) : s.disabled || s.status === 'disabled' ? (
+          ) : s.disabled || s.status === "disabled" ? (
             <Text color={t.color.muted}>disabled</Text>
-          ) : s.status === 'connecting' ? (
+          ) : s.status === "connecting" ? (
             <Text color={t.color.warn}>connecting</Text>
-          ) : s.status === 'lazy' ? (
+          ) : s.status === "lazy" ? (
             // Registered from the schema cache, process not spawned yet: its tools are callable.
             <Text color={t.color.text}>
-              {s.tools} tool{s.tools === 1 ? '' : 's'} <Text color={t.color.muted}>(lazy)</Text>
+              {s.tools} tool{s.tools === 1 ? "" : "s"}{" "}
+              <Text color={t.color.muted}>(lazy)</Text>
             </Text>
-          ) : s.status === 'configured' ? (
+          ) : s.status === "configured" ? (
             <Text color={t.color.muted}>configured</Text>
           ) : (
             <Text color={t.color.error}>failed</Text>
@@ -337,18 +361,18 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         </Text>
       ))}
     </>
-  )
+  );
 
   // ── System prompt body ──
-  const sysPromptLen = (info.system_prompt ?? '').length
+  const sysPromptLen = (info.system_prompt ?? "").length;
 
   const systemBody = () => {
     if (sysPromptLen === 0) {
-      return <Text color={t.color.muted}>No system prompt loaded.</Text>
+      return <Text color={t.color.muted}>No system prompt loaded.</Text>;
     }
 
-    return <Text color={t.color.muted}>{info.system_prompt}</Text>
-  }
+    return <Text color={t.color.muted}>{info.system_prompt}</Text>;
+  };
 
   // The wide layout is a real two-column grid: a fixed-width hero track and a
   // flexible info track (grid-template-columns: <leftW> 1fr, gap 2) — the
@@ -361,7 +385,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
       <Text />
 
       <Text color={t.color.accent}>
-        {(info.model ?? '').split('/').pop()}
+        {(info.model ?? "").split("/").pop()}
         <Text color={t.color.muted}> · k3code</Text>
       </Text>
 
@@ -376,7 +400,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         </Text>
       )}
     </Box>
-  ) : null
+  ) : null;
 
   const infoColumn = (
     <Box flexDirection="column" width="100%">
@@ -384,8 +408,8 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         <Box justifyContent="center" marginBottom={1}>
           <Text bold color={t.color.primary}>
             {t.brand.name}
-            {info.version ? ` v${info.version}` : ''}
-            {info.release_date ? ` (${info.release_date})` : ''}
+            {info.version ? ` v${info.version}` : ""}
+            {info.release_date ? ` (${info.release_date})` : ""}
           </Text>
         </Box>
       ) : (
@@ -393,7 +417,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         // here so they aren't lost.
         <Box flexDirection="column" marginBottom={1}>
           <Text color={t.color.accent} wrap="truncate-end">
-            {(info.model ?? '').split('/').pop()}
+            {(info.model ?? "").split("/").pop()}
             <Text color={t.color.muted}> · k3code</Text>
           </Text>
           <Text color={t.color.muted} wrap="truncate-end">
@@ -410,7 +434,12 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
 
       {/* ── Tools (expanded by default) ── */}
       <Box flexDirection="column" marginTop={1}>
-        <Accordion onToggle={() => setToolsOpen(v => !v)} open={toolsOpen} t={t} title="Available Tools">
+        <Accordion
+          onToggle={() => setToolsOpen((v) => !v)}
+          open={toolsOpen}
+          t={t}
+          title="Available Tools"
+        >
           {toolsBody()}
         </Accordion>
       </Box>
@@ -419,9 +448,13 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
       <Box flexDirection="column" marginTop={1}>
         <Accordion
           count={skillsTotal}
-          onToggle={() => setSkillsOpen(v => !v)}
+          onToggle={() => setSkillsOpen((v) => !v)}
           open={skillsOpen}
-          suffix={skillsCatCount > 0 ? `in ${skillsCatCount} categor${skillsCatCount === 1 ? 'y' : 'ies'}` : undefined}
+          suffix={
+            skillsCatCount > 0
+              ? `in ${skillsCatCount} categor${skillsCatCount === 1 ? "y" : "ies"}`
+              : undefined
+          }
           t={t}
           title="Available Skills"
         >
@@ -433,7 +466,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
       {sysPromptLen > 0 && (
         <Box flexDirection="column" marginTop={1}>
           <Accordion
-            onToggle={() => setSystemOpen(v => !v)}
+            onToggle={() => setSystemOpen((v) => !v)}
             open={systemOpen}
             suffix={`— ${sysPromptLen.toLocaleString()} chars`}
             t={t}
@@ -449,7 +482,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         <Box flexDirection="column" marginTop={1}>
           <Accordion
             count={mcpConnected}
-            onToggle={() => setMcpOpen(v => !v)}
+            onToggle={() => setMcpOpen((v) => !v)}
             open={mcpOpen}
             suffix="connected"
             t={t}
@@ -464,25 +497,26 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
 
       <Text color={t.color.text}>
         {/* Lazy boot: never print "0 tools · 0 skills" while counts load. */}
-        {info.lazy && !toolsTotal ? '… ' : `${toolsTotal} `}tools{' · '}
-        {info.lazy && !skillsTotal ? '… ' : `${skillsTotal} `}skills
-        {mcpConnected ? ` · ${mcpConnected} MCP` : ''}
-        {' · '}
+        {info.lazy && !toolsTotal ? "… " : `${toolsTotal} `}tools{" · "}
+        {info.lazy && !skillsTotal ? "… " : `${skillsTotal} `}skills
+        {mcpConnected ? ` · ${mcpConnected} MCP` : ""}
+        {" · "}
         <Text color={t.color.muted}>/help for commands</Text>
       </Text>
 
-      {typeof info.update_behind === 'number' && info.update_behind > 0 && (
+      {typeof info.update_behind === "number" && info.update_behind > 0 && (
         <Text bold color={t.color.warn}>
-          ! {info.update_behind} {info.update_behind === 1 ? 'commit' : 'commits'} behind
+          ! {info.update_behind}{" "}
+          {info.update_behind === 1 ? "commit" : "commits"} behind
           <Text bold={false} color={t.color.warn} dimColor>
-            {' '}
-            - run{' '}
+            {" "}
+            - run{" "}
           </Text>
           <Text bold color={t.color.warn}>
-            {info.update_command || 'k3code update'}
+            {info.update_command || "k3code update"}
           </Text>
           <Text bold={false} color={t.color.warn} dimColor>
-            {' '}
+            {" "}
             to update
           </Text>
         </Text>
@@ -494,10 +528,16 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         </Text>
       )}
     </Box>
-  )
+  );
 
   return (
-    <Box borderColor={t.color.border} borderStyle="round" marginBottom={1} paddingX={2} paddingY={1}>
+    <Box
+      borderColor={t.color.border}
+      borderStyle="round"
+      marginBottom={1}
+      paddingX={2}
+      paddingY={1}
+    >
       <WidgetGrid
         cols={wide ? leftW + 2 + w : w}
         columns={wide ? [leftW, { fr: 1 }] : 1}
@@ -508,19 +548,25 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         widgets={
           wide
             ? [
-                { children: heroColumn, id: 'session-hero' },
-                { children: infoColumn, id: 'session-info' }
+                { children: heroColumn, id: "session-hero" },
+                { children: infoColumn, id: "session-info" },
               ]
-            : [{ children: infoColumn, id: 'session-info' }]
+            : [{ children: infoColumn, id: "session-info" }]
         }
       />
     </Box>
-  )
+  );
 }
 
 export function Panel({ sections, t, title }: PanelProps) {
   return (
-    <Box borderColor={t.color.border} borderStyle="round" flexDirection="column" paddingX={2} paddingY={1}>
+    <Box
+      borderColor={t.color.border}
+      borderStyle="round"
+      flexDirection="column"
+      paddingX={2}
+      paddingY={1}
+    >
       <Box justifyContent="center" marginBottom={1}>
         <Text bold color={t.color.primary}>
           {title}
@@ -552,18 +598,18 @@ export function Panel({ sections, t, title }: PanelProps) {
         </Box>
       ))}
     </Box>
-  )
+  );
 }
 
 interface PanelProps {
-  sections: PanelSection[]
-  t: Theme
-  title: string
+  sections: PanelSection[];
+  t: Theme;
+  title: string;
 }
 
 interface SessionPanelProps {
-  info: SessionInfo
-  maxWidth?: number
-  sid?: string | null
-  t: Theme
+  info: SessionInfo;
+  maxWidth?: number;
+  sid?: string | null;
+  t: Theme;
 }

@@ -1,6 +1,10 @@
-import type { SubagentAggregate, SubagentNode, SubagentProgress } from '../types.js'
+import type {
+  SubagentAggregate,
+  SubagentNode,
+  SubagentProgress,
+} from "../types.js";
 
-const ROOT_KEY = '__root__'
+const ROOT_KEY = "__root__";
 
 /**
  * Reconstruct the subagent spawn tree from a flat event-ordered list.
@@ -14,37 +18,40 @@ const ROOT_KEY = '__root__'
  * Older gateways omit `parentId`; every subagent is then a top-level node
  * and the tree renders flat — matching pre-observability behaviour.
  */
-export function buildSubagentTree(items: readonly SubagentProgress[]): SubagentNode[] {
+export function buildSubagentTree(
+  items: readonly SubagentProgress[],
+): SubagentNode[] {
   if (!items.length) {
-    return []
+    return [];
   }
 
-  const byParent = new Map<string, SubagentProgress[]>()
-  const known = new Set<string>()
+  const byParent = new Map<string, SubagentProgress[]>();
+  const known = new Set<string>();
 
   for (const item of items) {
-    known.add(item.id)
+    known.add(item.id);
   }
 
   for (const item of items) {
-    const parentKey = item.parentId && known.has(item.parentId) ? item.parentId : ROOT_KEY
-    const bucket = byParent.get(parentKey) ?? []
-    bucket.push(item)
-    byParent.set(parentKey, bucket)
+    const parentKey =
+      item.parentId && known.has(item.parentId) ? item.parentId : ROOT_KEY;
+    const bucket = byParent.get(parentKey) ?? [];
+    bucket.push(item);
+    byParent.set(parentKey, bucket);
   }
 
   for (const bucket of byParent.values()) {
-    bucket.sort((a, b) => a.depth - b.depth || a.index - b.index)
+    bucket.sort((a, b) => a.depth - b.depth || a.index - b.index);
   }
 
   const build = (item: SubagentProgress): SubagentNode => {
-    const kids = byParent.get(item.id) ?? []
-    const children = kids.map(build)
+    const kids = byParent.get(item.id) ?? [];
+    const children = kids.map(build);
 
-    return { aggregate: aggregate(item, children), children, item }
-  }
+    return { aggregate: aggregate(item, children), children, item };
+  };
 
-  return (byParent.get(ROOT_KEY) ?? []).map(build)
+  return (byParent.get(ROOT_KEY) ?? []).map(build);
 }
 
 /**
@@ -55,30 +62,37 @@ export function buildSubagentTree(items: readonly SubagentProgress[]): SubagentN
  * "how much work is happening in this branch".  Used to colour tree rails
  * in the overlay / inline view so the eye spots the expensive branch.
  */
-export function aggregate(item: SubagentProgress, children: readonly SubagentNode[]): SubagentAggregate {
-  let totalTools = item.toolCount ?? 0
-  let totalDuration = item.durationSeconds ?? 0
-  let descendantCount = 0
-  let activeCount = isRunning(item) ? 1 : 0
-  let maxDepthFromHere = 0
-  let inputTokens = item.inputTokens ?? 0
-  let outputTokens = item.outputTokens ?? 0
-  let costUsd = item.costUsd ?? 0
-  let filesTouched = (item.filesRead?.length ?? 0) + (item.filesWritten?.length ?? 0)
+export function aggregate(
+  item: SubagentProgress,
+  children: readonly SubagentNode[],
+): SubagentAggregate {
+  let totalTools = item.toolCount ?? 0;
+  let totalDuration = item.durationSeconds ?? 0;
+  let descendantCount = 0;
+  let activeCount = isRunning(item) ? 1 : 0;
+  let maxDepthFromHere = 0;
+  let inputTokens = item.inputTokens ?? 0;
+  let outputTokens = item.outputTokens ?? 0;
+  let costUsd = item.costUsd ?? 0;
+  let filesTouched =
+    (item.filesRead?.length ?? 0) + (item.filesWritten?.length ?? 0);
 
   for (const child of children) {
-    totalTools += child.aggregate.totalTools
-    totalDuration += child.aggregate.totalDuration
-    descendantCount += child.aggregate.descendantCount + 1
-    activeCount += child.aggregate.activeCount
-    maxDepthFromHere = Math.max(maxDepthFromHere, child.aggregate.maxDepthFromHere + 1)
-    inputTokens += child.aggregate.inputTokens
-    outputTokens += child.aggregate.outputTokens
-    costUsd += child.aggregate.costUsd
-    filesTouched += child.aggregate.filesTouched
+    totalTools += child.aggregate.totalTools;
+    totalDuration += child.aggregate.totalDuration;
+    descendantCount += child.aggregate.descendantCount + 1;
+    activeCount += child.aggregate.activeCount;
+    maxDepthFromHere = Math.max(
+      maxDepthFromHere,
+      child.aggregate.maxDepthFromHere + 1,
+    );
+    inputTokens += child.aggregate.inputTokens;
+    outputTokens += child.aggregate.outputTokens;
+    costUsd += child.aggregate.costUsd;
+    filesTouched += child.aggregate.filesTouched;
   }
 
-  const hotness = totalDuration > 0 ? totalTools / totalDuration : 0
+  const hotness = totalDuration > 0 ? totalTools / totalDuration : 0;
 
   return {
     activeCount,
@@ -90,8 +104,8 @@ export function aggregate(item: SubagentProgress, children: readonly SubagentNod
     maxDepthFromHere,
     outputTokens,
     totalDuration,
-    totalTools
-  }
+    totalTools,
+  };
 }
 
 /**
@@ -99,52 +113,55 @@ export function aggregate(item: SubagentProgress, children: readonly SubagentNod
  * Drives the inline sparkline (`▁▃▇▅`) and the status-bar HUD.
  */
 export function widthByDepth(tree: readonly SubagentNode[]): number[] {
-  const widths: number[] = []
+  const widths: number[] = [];
 
   const walk = (nodes: readonly SubagentNode[], depth: number) => {
     if (!nodes.length) {
-      return
+      return;
     }
 
-    widths[depth] = (widths[depth] ?? 0) + nodes.length
+    widths[depth] = (widths[depth] ?? 0) + nodes.length;
 
     for (const node of nodes) {
-      walk(node.children, depth + 1)
+      walk(node.children, depth + 1);
     }
-  }
+  };
 
-  walk(tree, 0)
+  walk(tree, 0);
 
-  return widths
+  return widths;
 }
 
 /**
  * Flat totals across the full tree — feeds the summary chip header.
  */
 export function treeTotals(tree: readonly SubagentNode[]): SubagentAggregate {
-  let totalTools = 0
-  let totalDuration = 0
-  let descendantCount = 0
-  let activeCount = 0
-  let maxDepthFromHere = 0
-  let inputTokens = 0
-  let outputTokens = 0
-  let costUsd = 0
-  let filesTouched = 0
+  let totalTools = 0;
+  let totalDuration = 0;
+  let descendantCount = 0;
+  let activeCount = 0;
+  let maxDepthFromHere = 0;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let costUsd = 0;
+  let filesTouched = 0;
 
   for (const node of tree) {
-    totalTools += node.aggregate.totalTools
-    totalDuration += node.aggregate.totalDuration
-    descendantCount += node.aggregate.descendantCount + 1
-    activeCount += node.aggregate.activeCount
-    maxDepthFromHere = Math.max(maxDepthFromHere, node.aggregate.maxDepthFromHere + 1)
-    inputTokens += node.aggregate.inputTokens
-    outputTokens += node.aggregate.outputTokens
-    costUsd += node.aggregate.costUsd
-    filesTouched += node.aggregate.filesTouched
+    totalTools += node.aggregate.totalTools;
+    totalDuration += node.aggregate.totalDuration;
+    descendantCount += node.aggregate.descendantCount + 1;
+    activeCount += node.aggregate.activeCount;
+    maxDepthFromHere = Math.max(
+      maxDepthFromHere,
+      node.aggregate.maxDepthFromHere + 1,
+    );
+    inputTokens += node.aggregate.inputTokens;
+    outputTokens += node.aggregate.outputTokens;
+    costUsd += node.aggregate.costUsd;
+    filesTouched += node.aggregate.filesTouched;
   }
 
-  const hotness = totalDuration > 0 ? totalTools / totalDuration : 0
+  const hotness = totalDuration > 0 ? totalTools / totalDuration : 0;
 
   return {
     activeCount,
@@ -156,8 +173,8 @@ export function treeTotals(tree: readonly SubagentNode[]): SubagentAggregate {
     maxDepthFromHere,
     outputTokens,
     totalDuration,
-    totalTools
-  }
+    totalTools,
+  };
 }
 
 /**
@@ -165,43 +182,43 @@ export function treeTotals(tree: readonly SubagentNode[]): SubagentAggregate {
  * for "kill subtree" walks that fire one RPC per descendant.
  */
 export function flattenTree(tree: readonly SubagentNode[]): SubagentNode[] {
-  const out: SubagentNode[] = []
+  const out: SubagentNode[] = [];
 
   const walk = (nodes: readonly SubagentNode[]) => {
     for (const node of nodes) {
-      out.push(node)
-      walk(node.children)
+      out.push(node);
+      walk(node.children);
     }
-  }
+  };
 
-  walk(tree)
+  walk(tree);
 
-  return out
+  return out;
 }
 
 /**
  * Collect every descendant's id for a given node (excluding the node itself).
  */
 export function descendantIds(node: SubagentNode): string[] {
-  const ids: string[] = []
+  const ids: string[] = [];
 
   const walk = (children: readonly SubagentNode[]) => {
     for (const child of children) {
-      ids.push(child.item.id)
-      walk(child.children)
+      ids.push(child.item.id);
+      walk(child.children);
     }
-  }
+  };
 
-  walk(node.children)
+  walk(node.children);
 
-  return ids
+  return ids;
 }
 
-export function isRunning(item: Pick<SubagentProgress, 'status'>): boolean {
-  return item.status === 'running' || item.status === 'queued'
+export function isRunning(item: Pick<SubagentProgress, "status">): boolean {
+  return item.status === "running" || item.status === "queued";
 }
 
-const SPARK_RAMP = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'] as const
+const SPARK_RAMP = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
 
 /**
  * 8-step unicode bar sparkline from a positive-integer array.  Zeroes render
@@ -209,88 +226,95 @@ const SPARK_RAMP = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'] as c
  */
 export function sparkline(values: readonly number[]): string {
   if (!values.length) {
-    return ''
+    return "";
   }
 
-  const max = Math.max(...values)
+  const max = Math.max(...values);
 
   if (max <= 0) {
-    return ' '.repeat(values.length)
+    return " ".repeat(values.length);
   }
 
   return values
-    .map(v => {
+    .map((v) => {
       if (v <= 0) {
-        return ' '
+        return " ";
       }
 
-      const idx = Math.min(SPARK_RAMP.length - 1, Math.max(0, Math.ceil((v / max) * (SPARK_RAMP.length - 1))))
+      const idx = Math.min(
+        SPARK_RAMP.length - 1,
+        Math.max(0, Math.ceil((v / max) * (SPARK_RAMP.length - 1))),
+      );
 
-      return SPARK_RAMP[idx]
+      return SPARK_RAMP[idx];
     })
-    .join('')
+    .join("");
 }
 
 /**
  * Format totals into a compact one-line summary: `d2 · 7 agents · 124 tools · 2m 14s`
  */
 export function formatSummary(totals: SubagentAggregate): string {
-  const pieces = [`d${Math.max(0, totals.maxDepthFromHere)}`]
-  pieces.push(`${totals.descendantCount} agent${totals.descendantCount === 1 ? '' : 's'}`)
+  const pieces = [`d${Math.max(0, totals.maxDepthFromHere)}`];
+  pieces.push(
+    `${totals.descendantCount} agent${totals.descendantCount === 1 ? "" : "s"}`,
+  );
 
   if (totals.totalTools > 0) {
-    pieces.push(`${totals.totalTools} tool${totals.totalTools === 1 ? '' : 's'}`)
+    pieces.push(
+      `${totals.totalTools} tool${totals.totalTools === 1 ? "" : "s"}`,
+    );
   }
 
   if (totals.totalDuration > 0) {
-    pieces.push(fmtDuration(totals.totalDuration))
+    pieces.push(fmtDuration(totals.totalDuration));
   }
 
-  const tokens = totals.inputTokens + totals.outputTokens
+  const tokens = totals.inputTokens + totals.outputTokens;
 
   if (tokens > 0) {
-    pieces.push(`${fmtTokens(tokens)} tok`)
+    pieces.push(`${fmtTokens(tokens)} tok`);
   }
 
   if (totals.activeCount > 0) {
-    pieces.push(`⚡${totals.activeCount}`)
+    pieces.push(`⚡${totals.activeCount}`);
   }
 
-  return pieces.join(' · ')
+  return pieces.join(" · ");
 }
 
 /** Compact dollar amount: `$0.02`, `$1.34`, `$12.4` — never > 5 chars beyond the `$`. */
 export function fmtCost(usd: number): string {
   if (!Number.isFinite(usd) || usd <= 0) {
-    return ''
+    return "";
   }
 
   if (usd < 0.01) {
-    return '<$0.01'
+    return "<$0.01";
   }
 
   if (usd < 10) {
-    return `$${usd.toFixed(2)}`
+    return `$${usd.toFixed(2)}`;
   }
 
-  return `$${usd.toFixed(1)}`
+  return `$${usd.toFixed(1)}`;
 }
 
 /** Compact token count: `12k`, `1.2k`, `542`. */
 export function fmtTokens(n: number): string {
   if (!Number.isFinite(n) || n <= 0) {
-    return '0'
+    return "0";
   }
 
   if (n < 1000) {
-    return String(Math.round(n))
+    return String(Math.round(n));
   }
 
   if (n < 10_000) {
-    return `${(n / 1000).toFixed(1)}k`
+    return `${(n / 1000).toFixed(1)}k`;
   }
 
-  return `${Math.round(n / 1000)}k`
+  return `${Math.round(n / 1000)}k`;
 }
 
 /**
@@ -299,13 +323,13 @@ export function fmtTokens(n: number): string {
  */
 export function fmtDuration(seconds: number): string {
   if (seconds < 60) {
-    return `${Math.max(0, Math.round(seconds))}s`
+    return `${Math.max(0, Math.round(seconds))}s`;
   }
 
-  const m = Math.floor(seconds / 60)
-  const s = Math.round(seconds - m * 60)
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds - m * 60);
 
-  return s === 0 ? `${m}m` : `${m}m ${s}s`
+  return s === 0 ? `${m}m` : `${m}m ${s}s`;
 }
 
 /**
@@ -314,10 +338,12 @@ export function fmtDuration(seconds: number): string {
  * `buildSubagentTree` uses — keep call sites consistent across the live
  * view, disk label, and diff pane.
  */
-export function topLevelSubagents(items: readonly SubagentProgress[]): SubagentProgress[] {
-  const ids = new Set(items.map(s => s.id))
+export function topLevelSubagents(
+  items: readonly SubagentProgress[],
+): SubagentProgress[] {
+  const ids = new Set(items.map((s) => s.id));
 
-  return items.filter(s => !s.parentId || !ids.has(s.parentId))
+  return items.filter((s) => !s.parentId || !ids.has(s.parentId));
 }
 
 /**
@@ -325,27 +351,36 @@ export function topLevelSubagents(items: readonly SubagentProgress[]): SubagentP
  * Higher hotness = "hotter" colour. Normalized against the tree's peak hotness
  * so a uniformly slow tree still shows gradient across its busiest branches.
  */
-export function hotnessBucket(hotness: number, peakHotness: number, buckets: number): number {
-  if (!Number.isFinite(hotness) || hotness <= 0 || peakHotness <= 0 || buckets <= 1) {
-    return 0
+export function hotnessBucket(
+  hotness: number,
+  peakHotness: number,
+  buckets: number,
+): number {
+  if (
+    !Number.isFinite(hotness) ||
+    hotness <= 0 ||
+    peakHotness <= 0 ||
+    buckets <= 1
+  ) {
+    return 0;
   }
 
-  const ratio = Math.min(1, hotness / peakHotness)
+  const ratio = Math.min(1, hotness / peakHotness);
 
-  return Math.min(buckets - 1, Math.max(0, Math.round(ratio * (buckets - 1))))
+  return Math.min(buckets - 1, Math.max(0, Math.round(ratio * (buckets - 1))));
 }
 
 export function peakHotness(tree: readonly SubagentNode[]): number {
-  let peak = 0
+  let peak = 0;
 
   const walk = (nodes: readonly SubagentNode[]) => {
     for (const node of nodes) {
-      peak = Math.max(peak, node.aggregate.hotness)
-      walk(node.children)
+      peak = Math.max(peak, node.aggregate.hotness);
+      walk(node.children);
     }
-  }
+  };
 
-  walk(tree)
+  walk(tree);
 
-  return peak
+  return peak;
 }

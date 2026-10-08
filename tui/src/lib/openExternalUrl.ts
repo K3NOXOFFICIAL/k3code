@@ -1,5 +1,5 @@
-import { spawn, type SpawnOptions } from 'node:child_process'
-import { platform } from 'node:os'
+import { spawn, type SpawnOptions } from "node:child_process";
+import { platform } from "node:os";
 
 /**
  * Opens an external URL in the user's default browser/handler.
@@ -30,20 +30,23 @@ import { platform } from 'node:os'
  * so the TUI doesn't crash, and the user just doesn't see their browser
  * pop.
  */
-export function openExternalUrl(rawUrl: string, dependencies: OpenDependencies = {}): boolean {
-  const url = parseSafeUrl(rawUrl)
+export function openExternalUrl(
+  rawUrl: string,
+  dependencies: OpenDependencies = {},
+): boolean {
+  const url = parseSafeUrl(rawUrl);
 
   if (!url) {
-    return false
+    return false;
   }
 
-  const spawnFn = dependencies.spawn ?? spawn
-  const platformId = dependencies.platform?.() ?? platform()
+  const spawnFn = dependencies.spawn ?? spawn;
+  const platformId = dependencies.platform?.() ?? platform();
 
-  const command = openCommand(platformId)
+  const command = openCommand(platformId);
 
   if (!command) {
-    return false
+    return false;
   }
 
   try {
@@ -52,8 +55,8 @@ export function openExternalUrl(rawUrl: string, dependencies: OpenDependencies =
       // and ignore stdio so we don't leak FDs into our raw-mode terminal.
       // Without `ignore` here, Chrome's stderr can land in the alt screen.
       detached: true,
-      stdio: 'ignore'
-    } satisfies SpawnOptions)
+      stdio: "ignore",
+    } satisfies SpawnOptions);
 
     // Async failure path: spawn returns a ChildProcess synchronously even
     // when the binary is missing (ENOENT on `xdg-open` / `explorer.exe`),
@@ -64,61 +67,61 @@ export function openExternalUrl(rawUrl: string, dependencies: OpenDependencies =
     // consumer; we already returned `true` synchronously, so the user
     // just won't see their browser open — same as if the URL had been
     // rejected upstream.
-    child.once('error', () => {
+    child.once("error", () => {
       // Intentional no-op. The TUI keeps running; user gets no browser
       // pop, which is the failure mode we promised in the doc comment.
-    })
+    });
 
-    child.unref()
+    child.unref();
 
-    return true
+    return true;
   } catch {
     // spawn can also throw synchronously on argv-validation failures
     // (e.g. NUL in the path). Treat it as a no-op rather than crashing.
-    return false
+    return false;
   }
 }
 
 export type OpenDependencies = {
-  spawn?: typeof spawn
-  platform?: () => string
-}
+  spawn?: typeof spawn;
+  platform?: () => string;
+};
 
 /**
  * Validate and normalize a URL for opening externally.
  * Exported for testing.
  */
 export function parseSafeUrl(value: string): null | URL {
-  if (!value || typeof value !== 'string') {
-    return null
+  if (!value || typeof value !== "string") {
+    return null;
   }
 
-  let parsed: URL
+  let parsed: URL;
 
   try {
-    parsed = new URL(value)
+    parsed = new URL(value);
   } catch {
-    return null
+    return null;
   }
 
   // http(s) only — opening file://, data:, javascript:, vbscript:, etc.
   // would let a malicious model run a local handler with attacker-controlled
   // input on a single click.
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return null
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return null;
   }
 
   // Reject empty or all-whitespace hostnames defensively. URL parsing
   // accepts URLs like 'http:///foo' on some Node versions; we don't want
   // to forward those to `open`.
   if (!parsed.hostname.trim()) {
-    return null
+    return null;
   }
 
-  return parsed
+  return parsed;
 }
 
-type OpenCommand = { command: string; args: readonly string[] }
+type OpenCommand = { command: string; args: readonly string[] };
 
 /**
  * Per-platform open command. We deliberately avoid `cmd.exe /c start` on
@@ -137,22 +140,28 @@ type OpenCommand = { command: string; args: readonly string[] }
  * platform that probably doesn't have it.
  */
 export function openCommand(platformId: string): OpenCommand | null {
-  if (platformId === 'darwin') {
-    return { command: 'open', args: [] }
+  if (platformId === "darwin") {
+    return { command: "open", args: [] };
   }
 
-  if (platformId === 'win32') {
-    return { command: 'explorer.exe', args: [] }
+  if (platformId === "win32") {
+    return { command: "explorer.exe", args: [] };
   }
 
   // Linux + the BSD family ship xdg-open via xdg-utils. Everything else
   // (aix, sunos, cygwin, haiku, etc.) returns null so openExternalUrl's
   // command-not-found fallback fires honestly.
-  const XDG_OPEN_PLATFORMS = new Set(['linux', 'freebsd', 'openbsd', 'netbsd', 'dragonfly'])
+  const XDG_OPEN_PLATFORMS = new Set([
+    "linux",
+    "freebsd",
+    "openbsd",
+    "netbsd",
+    "dragonfly",
+  ]);
 
   if (XDG_OPEN_PLATFORMS.has(platformId)) {
-    return { command: 'xdg-open', args: [] }
+    return { command: "xdg-open", args: [] };
   }
 
-  return null
+  return null;
 }

@@ -1,15 +1,22 @@
-import type { MessageCompletePayload, SubagentEventPayload, ToolLabel } from '@k3code/shared/gateway-events'
+import type {
+  MessageCompletePayload,
+  SubagentEventPayload,
+  ToolLabel,
+} from "@k3code/shared/gateway-events";
 
 import {
   REASONING_PULSE_MS,
   STREAM_BATCH_MS,
   STREAM_IDLE_BATCH_MS,
   STREAM_SCROLL_BATCH_MS,
-  STREAM_TYPING_BATCH_MS
-} from '../config/timing.js'
-import type { SessionInterruptResponse } from '../gatewayTypes.js'
-import { appendToolShelfMessage, isToolShelfMessage } from '../lib/liveProgress.js'
-import { hasReasoningTag, splitReasoning } from '../lib/reasoning.js'
+  STREAM_TYPING_BATCH_MS,
+} from "../config/timing.js";
+import type { SessionInterruptResponse } from "../gatewayTypes.js";
+import {
+  appendToolShelfMessage,
+  isToolShelfMessage,
+} from "../lib/liveProgress.js";
+import { hasReasoningTag, splitReasoning } from "../lib/reasoning.js";
 import {
   boundedLiveRenderText,
   estimateTokensRough,
@@ -19,15 +26,26 @@ import {
   sameToolTrailGroup,
   toolTrailLabel,
   toolTrailLine,
-  verboseToolTrailLine
-} from '../lib/text.js'
-import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '../types.js'
+  verboseToolTrailLine,
+} from "../lib/text.js";
+import type {
+  ActiveTool,
+  ActivityItem,
+  Msg,
+  SubagentProgress,
+  TodoItem,
+} from "../types.js";
 
-import type { Notice } from './interfaces.js'
-import { resetFlowOverlays } from './overlayStore.js'
-import { pushSnapshot } from './spawnHistoryStore.js'
-import { archiveDoneTodos, getTurnState, patchTurnState, resetTurnState } from './turnStore.js'
-import { getUiState, patchUiState } from './uiStore.js'
+import type { Notice } from "./interfaces.js";
+import { resetFlowOverlays } from "./overlayStore.js";
+import { pushSnapshot } from "./spawnHistoryStore.js";
+import {
+  archiveDoneTodos,
+  getTurnState,
+  patchTurnState,
+  resetTurnState,
+} from "./turnStore.js";
+import { getUiState, patchUiState } from "./uiStore.js";
 
 function toolTrailLines(
   done: ActiveTool | undefined,
@@ -35,100 +53,115 @@ function toolTrailLines(
   labels: readonly ToolLabel[],
   summary: string,
   resultText: string,
-  took?: number
+  took?: number,
 ): string[] {
-  const heads = labels.length ? labels.map(formatToolLabel) : [formatToolCall(name, done?.context || '')]
-  const verbose = Boolean(done?.verboseArgs || resultText)
+  const heads = labels.length
+    ? labels.map(formatToolLabel)
+    : [formatToolCall(name, done?.context || "")];
+  const verbose = Boolean(done?.verboseArgs || resultText);
 
   return heads.map((head, index) => {
     if (index < heads.length - 1) {
-      return toolTrailLine(head)
+      return toolTrailLine(head);
     }
 
     return verbose
-      ? verboseToolTrailLine(head, false, took, done?.verboseArgs, resultText || summary)
-      : toolTrailLine(head, false, summary, took)
-  })
+      ? verboseToolTrailLine(
+          head,
+          false,
+          took,
+          done?.verboseArgs,
+          resultText || summary,
+        )
+      : toolTrailLine(head, false, summary, took);
+  });
 }
 
-const INTERRUPT_COOLDOWN_MS = 1500
-const ACTIVITY_LIMIT = 8
-const TRAIL_LIMIT = 8
+const INTERRUPT_COOLDOWN_MS = 1500;
+const ACTIVITY_LIMIT = 8;
+const TRAIL_LIMIT = 8;
 
 // Extracts the raw patch from a diff-only segment produced by
 // pushInlineDiffSegment. Used at message.complete to dedupe against final
 // assistant text that narrates the same patch. Returns null for anything
 // else so real assistant narration never gets touched.
 const diffSegmentBody = (msg: Msg): null | string => {
-  if (msg.kind !== 'diff') {
-    return null
+  if (msg.kind !== "diff") {
+    return null;
   }
 
-  const m = msg.text.match(/^```diff\n([\s\S]*?)\n```$/)
+  const m = msg.text.match(/^```diff\n([\s\S]*?)\n```$/);
 
-  return m ? m[1]! : null
-}
+  return m ? m[1]! : null;
+};
 
-const hasDetails = (msg: Msg): boolean => Boolean(msg.thinking || msg.tools?.length || msg.toolTokens)
+const hasDetails = (msg: Msg): boolean =>
+  Boolean(msg.thinking || msg.tools?.length || msg.toolTokens);
 
-const isTodoStatus = (status: unknown): status is TodoItem['status'] =>
-  status === 'pending' || status === 'in_progress' || status === 'completed' || status === 'cancelled'
+const isTodoStatus = (status: unknown): status is TodoItem["status"] =>
+  status === "pending" ||
+  status === "in_progress" ||
+  status === "completed" ||
+  status === "cancelled";
 
 const parseTodos = (value: unknown): null | TodoItem[] => {
   if (!Array.isArray(value)) {
-    return null
+    return null;
   }
 
   return value
-    .map(item => {
-      if (!item || typeof item !== 'object') {
-        return null
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return null;
       }
 
-      const row = item as Record<string, unknown>
-      const status = row.status
+      const row = item as Record<string, unknown>;
+      const status = row.status;
 
       if (!isTodoStatus(status)) {
-        return null
+        return null;
       }
 
-      const id = String(row.id ?? '').trim()
-      const parent = String(row.parent ?? '').trim()
+      const id = String(row.id ?? "").trim();
+      const parent = String(row.parent ?? "").trim();
 
       return {
-        content: String(row.content ?? '').trim(),
+        content: String(row.content ?? "").trim(),
         id,
         status,
-        ...(parent && parent !== id ? { parent } : {})
-      }
+        ...(parent && parent !== id ? { parent } : {}),
+      };
     })
-    .filter((item): item is TodoItem => Boolean(item?.id && item.content))
-}
+    .filter((item): item is TodoItem => Boolean(item?.id && item.content));
+};
 
 const textSegments = (segments: Msg[]) =>
-  segments.filter(msg => msg.role === 'assistant' && msg.kind !== 'diff').map(msg => msg.text)
+  segments
+    .filter((msg) => msg.role === "assistant" && msg.kind !== "diff")
+    .map((msg) => msg.text);
 
 const finalTail = (finalText: string, segments: Msg[]) => {
-  let tail = finalText
+  let tail = finalText;
 
   for (const text of textSegments(segments)) {
-    const trimmed = text.trim()
+    const trimmed = text.trim();
 
     if (trimmed && tail.startsWith(trimmed)) {
-      tail = tail.slice(trimmed.length).trimStart()
+      tail = tail.slice(trimmed.length).trimStart();
     }
   }
 
-  return tail
-}
+  return tail;
+};
 
-const interruptedText = (partial: string) => (partial ? `${partial}\n\n*[interrupted]*` : '*[interrupted]*')
+const interruptedText = (partial: string) =>
+  partial ? `${partial}\n\n*[interrupted]*` : "*[interrupted]*";
 
 // What interruptTurn sealed into the transcript: `text` is the bubble it
 // appended (null when it only wrote a sys note), `partial` the reply text in it.
 export interface SealedInterrupt {
-  partial: string
-  text: null | string
+  partial: string;
+  text: null | string;
 }
 
 // The bubble fix for an honoured interrupt: Ctrl+C seals the reply the moment
@@ -138,59 +171,72 @@ export interface SealedInterrupt {
 // what was sealed, the transcript takes it so the screen matches state.db.
 export const lateInterruptedReply = (
   sealed: null | SealedInterrupt,
-  payload: MessageCompletePayload
+  payload: MessageCompletePayload,
 ): null | { from: null | string; to: string } => {
-  const persisted = typeof payload.text === 'string' ? payload.text.trim() : ''
-  const shown = sealed?.partial.trimEnd() ?? ''
+  const persisted = typeof payload.text === "string" ? payload.text.trim() : "";
+  const shown = sealed?.partial.trimEnd() ?? "";
 
-  if (!sealed || payload.status !== 'interrupted' || persisted.length <= shown.length || !persisted.startsWith(shown)) {
-    return null
+  if (
+    !sealed ||
+    payload.status !== "interrupted" ||
+    persisted.length <= shown.length ||
+    !persisted.startsWith(shown)
+  ) {
+    return null;
   }
 
-  return { from: sealed.text, to: interruptedText(persisted) }
-}
+  return { from: sealed.text, to: interruptedText(persisted) };
+};
 
 export interface InterruptDeps {
-  appendMessage: (msg: Msg) => void
-  gw: { request: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T> }
-  sid: string
-  sys: (text: string) => void
+  appendMessage: (msg: Msg) => void;
+  gw: {
+    request: <T = unknown>(
+      method: string,
+      params?: Record<string, unknown>,
+    ) => Promise<T>;
+  };
+  sid: string;
+  sys: (text: string) => void;
 }
 
-type Timer = null | ReturnType<typeof setTimeout>
+type Timer = null | ReturnType<typeof setTimeout>;
 
 const clear = (t: Timer): null => {
   if (t) {
-    clearTimeout(t)
+    clearTimeout(t);
   }
 
-  return null
-}
+  return null;
+};
 
 class TurnController {
-  bufRef = ''
-  interrupted = false
-  sealedInterrupt: null | SealedInterrupt = null
-  lastStatusNote = ''
-  persistedToolLabels = new Set<string>()
-  persistSpawnTree?: (subagents: SubagentProgress[], sessionId: null | string) => Promise<void>
-  protocolWarned = false
-  reasoningText = ''
-  segmentMessages: Msg[] = []
-  pendingSegmentTools: string[] = []
-  statusTimer: Timer = null
-  toolTokenAcc = 0
-  turnTools: string[] = []
+  bufRef = "";
+  interrupted = false;
+  sealedInterrupt: null | SealedInterrupt = null;
+  lastStatusNote = "";
+  persistedToolLabels = new Set<string>();
+  persistSpawnTree?: (
+    subagents: SubagentProgress[],
+    sessionId: null | string,
+  ) => Promise<void>;
+  protocolWarned = false;
+  reasoningText = "";
+  segmentMessages: Msg[] = [];
+  pendingSegmentTools: string[] = [];
+  statusTimer: Timer = null;
+  toolTokenAcc = 0;
+  turnTools: string[] = [];
 
-  private activeTools: ActiveTool[] = []
-  private activeReasoningText = ''
-  private reasoningSegmentIndex: null | number = null
-  private interimBoundaryIndex: null | number = null
-  private activityId = 0
-  private reasoningStreamingTimer: Timer = null
-  private reasoningTimer: Timer = null
-  private streamTimer: Timer = null
-  private streamDelay = STREAM_IDLE_BATCH_MS
+  private activeTools: ActiveTool[] = [];
+  private activeReasoningText = "";
+  private reasoningSegmentIndex: null | number = null;
+  private interimBoundaryIndex: null | number = null;
+  private activityId = 0;
+  private reasoningStreamingTimer: Timer = null;
+  private reasoningTimer: Timer = null;
+  private streamTimer: Timer = null;
+  private streamDelay = STREAM_IDLE_BATCH_MS;
 
   // ── Credits notice machinery (Strategy B) ───────────────────────────
   //
@@ -199,33 +245,33 @@ class TurnController {
   // The TTL clock starts only when the notice becomes VISIBLE (on apply),
   // never on arrival, so an 8s "restored" notice shows for its full life.
   // `noticeTimer` is DEDICATED — it is never the shared `statusTimer`.
-  private pendingNotice: Notice | null = null
-  private noticeTimer: Timer = null
-  private noticeIdSeq = 0
+  private pendingNotice: Notice | null = null;
+  private noticeTimer: Timer = null;
+  private noticeIdSeq = 0;
 
   boostStreamingForTyping() {
-    this.streamDelay = STREAM_TYPING_BATCH_MS
+    this.streamDelay = STREAM_TYPING_BATCH_MS;
   }
 
   boostStreamingForScroll() {
-    this.streamDelay = Math.max(this.streamDelay, STREAM_SCROLL_BATCH_MS)
+    this.streamDelay = Math.max(this.streamDelay, STREAM_SCROLL_BATCH_MS);
   }
 
   relaxStreaming() {
-    this.streamDelay = STREAM_IDLE_BATCH_MS
+    this.streamDelay = STREAM_IDLE_BATCH_MS;
   }
 
   clearReasoning() {
-    this.reasoningTimer = clear(this.reasoningTimer)
-    this.activeReasoningText = ''
-    this.reasoningSegmentIndex = null
-    this.reasoningText = ''
-    this.toolTokenAcc = 0
-    patchTurnState({ reasoning: '', reasoningTokens: 0, toolTokens: 0 })
+    this.reasoningTimer = clear(this.reasoningTimer);
+    this.activeReasoningText = "";
+    this.reasoningSegmentIndex = null;
+    this.reasoningText = "";
+    this.toolTokenAcc = 0;
+    patchTurnState({ reasoning: "", reasoningTokens: 0, toolTokens: 0 });
   }
 
   clearStatusTimer() {
-    this.statusTimer = clear(this.statusTimer)
+    this.statusTimer = clear(this.statusTimer);
   }
 
   // ── Notice: arrival ──────────────────────────────────────────────────
@@ -238,15 +284,18 @@ class TurnController {
   // applyNotice() is a defensive backup; the primary latest-wins mechanism is
   // that applyNotice/clearNotice always cancel the prior timer first.
   showNotice(notice: Notice) {
-    const stamped: Notice = { ...notice, id: notice.id || `n${++this.noticeIdSeq}` }
+    const stamped: Notice = {
+      ...notice,
+      id: notice.id || `n${++this.noticeIdSeq}`,
+    };
 
     if (getUiState().busy) {
-      this.pendingNotice = stamped
+      this.pendingNotice = stamped;
 
-      return
+      return;
     }
 
-    this.applyNotice(stamped)
+    this.applyNotice(stamped);
   }
 
   // ── Notice: clear by key (R3-H3 / HIGH-3) ────────────────────────────
@@ -256,12 +305,12 @@ class TurnController {
   // a matching pending notice so it can't resurface at the next turn end.
   clearNotice(key?: string) {
     if (this.pendingNotice && this.pendingNotice.key === key) {
-      this.pendingNotice = null
+      this.pendingNotice = null;
     }
 
     if (getUiState().notice?.key === key) {
-      this.clearNoticeTimer()
-      patchUiState({ notice: null })
+      this.clearNoticeTimer();
+      patchUiState({ notice: null });
     }
   }
 
@@ -270,27 +319,31 @@ class TurnController {
   // expiry can't wipe this one. A 'ttl' notice with `ttl_ms` self-expires;
   // 'sticky' (default) persists until an explicit clear.
   private applyNotice(notice: Notice) {
-    this.clearNoticeTimer()
-    patchUiState({ notice })
+    this.clearNoticeTimer();
+    patchUiState({ notice });
 
-    if (notice.kind === 'ttl' && typeof notice.ttl_ms === 'number' && notice.ttl_ms > 0) {
-      const id = notice.id
+    if (
+      notice.kind === "ttl" &&
+      typeof notice.ttl_ms === "number" &&
+      notice.ttl_ms > 0
+    ) {
+      const id = notice.id;
 
       this.noticeTimer = setTimeout(() => {
-        this.noticeTimer = null
+        this.noticeTimer = null;
 
         // Defensive backup: the prior timer was already cancelled by
         // clearNoticeTimer() when a newer notice was applied, so in
         // practice this guard only fires for the notice that armed it.
         if (getUiState().notice?.id === id) {
-          patchUiState({ notice: null })
+          patchUiState({ notice: null });
         }
-      }, notice.ttl_ms)
+      }, notice.ttl_ms);
     }
   }
 
   private clearNoticeTimer() {
-    this.noticeTimer = clear(this.noticeTimer)
+    this.noticeTimer = clear(this.noticeTimer);
   }
 
   // ── Notice: turn-end flush (R3-C1 / R3-H4) ───────────────────────────
@@ -303,56 +356,56 @@ class TurnController {
   // no-op, so a standing sticky notice REappears untouched after the turn.
   private flushPendingNotice() {
     if (!this.pendingNotice) {
-      return
+      return;
     }
 
-    const notice = this.pendingNotice
-    this.pendingNotice = null
-    this.applyNotice(notice)
+    const notice = this.pendingNotice;
+    this.pendingNotice = null;
+    this.applyNotice(notice);
   }
 
   // Drop all notice state — pending + timer + visible (R3-H5). Called by
   // reset()/fullReset() so a session A notice can't bleed into session B.
   private clearNoticeState() {
-    this.pendingNotice = null
-    this.clearNoticeTimer()
+    this.pendingNotice = null;
+    this.clearNoticeTimer();
 
     if (getUiState().notice) {
-      patchUiState({ notice: null })
+      patchUiState({ notice: null });
     }
   }
 
   endReasoningPhase() {
-    this.reasoningStreamingTimer = clear(this.reasoningStreamingTimer)
+    this.reasoningStreamingTimer = clear(this.reasoningStreamingTimer);
 
     // Seal any open reasoning segment so its isLiveReasoning flag drops the
     // moment the reasoning phase ends — the panel must stop tracking the
     // turn's global reasoningActive, not stay "live" for the rest of the turn.
     if (this.reasoningSegmentIndex !== null) {
-      this.syncReasoningSegment(false)
+      this.syncReasoningSegment(false);
     }
 
-    patchTurnState({ reasoningActive: false, reasoningStreaming: false })
+    patchTurnState({ reasoningActive: false, reasoningStreaming: false });
   }
 
   idle() {
-    this.endReasoningPhase()
-    this.activeTools = []
-    this.streamTimer = clear(this.streamTimer)
-    this.bufRef = ''
-    this.pendingSegmentTools = []
-    this.segmentMessages = []
+    this.endReasoningPhase();
+    this.activeTools = [];
+    this.streamTimer = clear(this.streamTimer);
+    this.bufRef = "";
+    this.pendingSegmentTools = [];
+    this.segmentMessages = [];
 
     patchTurnState({
       streamPendingTools: [],
       streamSegments: [],
-      streaming: '',
+      streaming: "",
       subagents: [],
       tools: [],
-      turnTrail: []
-    })
-    patchUiState({ busy: false, compacting: false })
-    resetFlowOverlays()
+      turnTrail: [],
+    });
+    patchUiState({ busy: false, compacting: false });
+    resetFlowOverlays();
   }
 
   // `keepBusy` holds the session busy after interrupting so a queued message
@@ -360,26 +413,31 @@ class TurnController {
   // while `interrupted`) instead of racing the still-unwinding turn — the race
   // duplicated the user bubble, leaked a "queued: …" note, and surfaced the
   // cancelled turn's "[interrupted]" reply.
-  interruptTurn({ appendMessage, gw, sid, sys }: InterruptDeps, opts: { keepBusy?: boolean } = {}) {
-    this.interrupted = true
-    gw.request<SessionInterruptResponse>('session.interrupt', { session_id: sid }).catch(() => {})
+  interruptTurn(
+    { appendMessage, gw, sid, sys }: InterruptDeps,
+    opts: { keepBusy?: boolean } = {},
+  ) {
+    this.interrupted = true;
+    gw.request<SessionInterruptResponse>("session.interrupt", {
+      session_id: sid,
+    }).catch(() => {});
 
-    this.closeReasoningSegment()
+    this.closeReasoningSegment();
 
-    const segments = this.segmentMessages
-    const partial = this.bufRef.trimStart()
-    const tools = this.pendingSegmentTools
+    const segments = this.segmentMessages;
+    const partial = this.bufRef.trimStart();
+    const tools = this.pendingSegmentTools;
 
     // Drain streaming/segment state off the nanostore before writing the
     // preserved snapshot to the transcript — otherwise each flushed segment
     // appears in both `turn.streamSegments` and the transcript for one frame.
-    this.idle()
-    this.clearReasoning()
-    this.turnTools = []
-    patchTurnState({ activity: [], outcome: '' })
+    this.idle();
+    this.clearReasoning();
+    this.turnTools = [];
+    patchTurnState({ activity: [], outcome: "" });
 
     for (const msg of segments) {
-      appendMessage(msg)
+      appendMessage(msg);
     }
 
     // Always surface an interruption indicator — if there's an in-flight
@@ -387,158 +445,182 @@ class TurnController {
     // otherwise emit a sys note so the transcript always records that the
     // turn was cancelled, even when only prior `segments` were preserved.
     if (partial || tools.length) {
-      const text = interruptedText(partial)
+      const text = interruptedText(partial);
 
-      appendMessage({ role: 'assistant', text, ...(tools.length && { tools }) })
-      this.sealedInterrupt = { partial, text }
+      appendMessage({
+        role: "assistant",
+        text,
+        ...(tools.length && { tools }),
+      });
+      this.sealedInterrupt = { partial, text };
     } else {
-      sys('interrupted')
-      this.sealedInterrupt = { partial: '', text: null }
+      sys("interrupted");
+      this.sealedInterrupt = { partial: "", text: null };
     }
 
-    this.clearStatusTimer()
+    this.clearStatusTimer();
 
     if (opts.keepBusy) {
       // `idle()` already cleared busy; re-assert it so the drain waits for settle.
-      patchUiState({ busy: true, status: 'interrupting…' })
+      patchUiState({ busy: true, status: "interrupting…" });
 
-      return
+      return;
     }
 
-    patchUiState({ status: 'interrupted' })
+    patchUiState({ status: "interrupted" });
 
     this.statusTimer = setTimeout(() => {
-      this.statusTimer = null
-      patchUiState({ status: 'ready' })
-    }, INTERRUPT_COOLDOWN_MS)
+      this.statusTimer = null;
+      patchUiState({ status: "ready" });
+    }, INTERRUPT_COOLDOWN_MS);
 
     // Real turn end: surface any notice held back while busy.
-    this.flushPendingNotice()
+    this.flushPendingNotice();
   }
 
   pruneTransient() {
-    this.turnTools = this.turnTools.filter(line => !isTransientTrailLine(line))
-    patchTurnState(state => {
-      const next = state.turnTrail.filter(line => !isTransientTrailLine(line))
+    this.turnTools = this.turnTools.filter(
+      (line) => !isTransientTrailLine(line),
+    );
+    patchTurnState((state) => {
+      const next = state.turnTrail.filter(
+        (line) => !isTransientTrailLine(line),
+      );
 
-      return next.length === state.turnTrail.length ? state : { ...state, turnTrail: next }
-    })
+      return next.length === state.turnTrail.length
+        ? state
+        : { ...state, turnTrail: next };
+    });
   }
 
   private syncReasoningSegment(live = true) {
-    const thinking = this.activeReasoningText.trim()
+    const thinking = this.activeReasoningText.trim();
 
     if (!thinking) {
-      return
+      return;
     }
 
     const msg: Msg = {
-      kind: 'trail',
-      role: 'system',
-      text: '',
+      kind: "trail",
+      role: "system",
+      text: "",
       thinking,
       thinkingTokens: estimateTokensRough(thinking),
       toolTokens: this.toolTokenAcc || undefined,
-      ...(live ? { isLiveReasoning: true } : {})
-    }
+      ...(live ? { isLiveReasoning: true } : {}),
+    };
 
     if (this.reasoningSegmentIndex === null) {
-      this.reasoningSegmentIndex = this.segmentMessages.length
-      this.segmentMessages = [...this.segmentMessages, msg]
+      this.reasoningSegmentIndex = this.segmentMessages.length;
+      this.segmentMessages = [...this.segmentMessages, msg];
     } else {
-      this.segmentMessages = this.segmentMessages.map((item, i) => (i === this.reasoningSegmentIndex ? msg : item))
+      this.segmentMessages = this.segmentMessages.map((item, i) =>
+        i === this.reasoningSegmentIndex ? msg : item,
+      );
     }
 
-    patchTurnState({ streamSegments: this.segmentMessages })
+    patchTurnState({ streamSegments: this.segmentMessages });
   }
 
   private closeReasoningSegment() {
-    this.syncReasoningSegment(false)
-    this.activeReasoningText = ''
-    this.reasoningSegmentIndex = null
+    this.syncReasoningSegment(false);
+    this.activeReasoningText = "";
+    this.reasoningSegmentIndex = null;
   }
 
   private pushSegment(msg: Msg) {
-    this.segmentMessages = appendToolShelfMessage(this.segmentMessages, msg)
+    this.segmentMessages = appendToolShelfMessage(this.segmentMessages, msg);
   }
 
   flushStreamingSegment() {
-    const raw = this.bufRef.trimStart()
+    const raw = this.bufRef.trimStart();
 
     const split = raw
       ? hasReasoningTag(raw)
         ? splitReasoning(raw)
-        : { reasoning: '', text: raw }
-      : { reasoning: '', text: '' }
+        : { reasoning: "", text: raw }
+      : { reasoning: "", text: "" };
 
     if (split.reasoning && !this.reasoningText.trim()) {
-      this.reasoningText = split.reasoning
-      this.activeReasoningText = split.reasoning
-      patchTurnState({ reasoning: this.reasoningText, reasoningTokens: estimateTokensRough(this.reasoningText) })
-      this.syncReasoningSegment()
+      this.reasoningText = split.reasoning;
+      this.activeReasoningText = split.reasoning;
+      patchTurnState({
+        reasoning: this.reasoningText,
+        reasoningTokens: estimateTokensRough(this.reasoningText),
+      });
+      this.syncReasoningSegment();
     }
 
     const msg: Msg = {
-      role: split.text ? 'assistant' : 'system',
+      role: split.text ? "assistant" : "system",
       text: split.text,
-      ...(!split.text && { kind: 'trail' as const }),
-      ...(this.pendingSegmentTools.length && { tools: this.pendingSegmentTools })
-    }
+      ...(!split.text && { kind: "trail" as const }),
+      ...(this.pendingSegmentTools.length && {
+        tools: this.pendingSegmentTools,
+      }),
+    };
 
-    this.streamTimer = clear(this.streamTimer)
+    this.streamTimer = clear(this.streamTimer);
 
     if (split.text || hasDetails(msg)) {
-      this.pushSegment(msg)
+      this.pushSegment(msg);
     }
 
-    this.pendingSegmentTools = []
-    this.bufRef = ''
-    patchTurnState({ streamPendingTools: [], streamSegments: this.segmentMessages, streaming: '' })
+    this.pendingSegmentTools = [];
+    this.bufRef = "";
+    patchTurnState({
+      streamPendingTools: [],
+      streamSegments: this.segmentMessages,
+      streaming: "",
+    });
   }
 
   pulseReasoningStreaming() {
-    this.reasoningStreamingTimer = clear(this.reasoningStreamingTimer)
-    patchTurnState({ reasoningActive: true, reasoningStreaming: true })
+    this.reasoningStreamingTimer = clear(this.reasoningStreamingTimer);
+    patchTurnState({ reasoningActive: true, reasoningStreaming: true });
 
     this.reasoningStreamingTimer = setTimeout(() => {
-      this.reasoningStreamingTimer = null
-      patchTurnState({ reasoningStreaming: false })
-    }, REASONING_PULSE_MS)
+      this.reasoningStreamingTimer = null;
+      patchTurnState({ reasoningStreaming: false });
+    }, REASONING_PULSE_MS);
   }
 
   recordTodos(value: unknown) {
     if (this.interrupted) {
-      return
+      return;
     }
 
-    const todos = parseTodos(value)
+    const todos = parseTodos(value);
 
     if (todos !== null) {
-      patchTurnState({ todos })
+      patchTurnState({ todos });
     }
   }
 
   private flushPendingToolsIntoLastSegment() {
     if (!this.pendingSegmentTools.length) {
-      return false
+      return false;
     }
 
     const next = appendToolShelfMessage(this.segmentMessages, {
-      kind: 'trail',
-      role: 'system',
-      text: '',
-      tools: this.pendingSegmentTools
-    })
+      kind: "trail",
+      role: "system",
+      text: "",
+      tools: this.pendingSegmentTools,
+    });
 
     if (next.length === this.segmentMessages.length + 1) {
-      return false
+      return false;
     }
 
-    this.segmentMessages = next
-    this.pendingSegmentTools = []
-    patchTurnState({ streamPendingTools: [], streamSegments: this.segmentMessages })
+    this.segmentMessages = next;
+    this.pendingSegmentTools = [];
+    patchTurnState({
+      streamPendingTools: [],
+      streamSegments: this.segmentMessages,
+    });
 
-    return true
+    return true;
   }
 
   pushInlineDiffSegment(diffText: string, tools: string[] = []) {
@@ -546,10 +628,10 @@ class TurnController {
     // leading "┊ review diff" header written by `_emit_inline_diff` for the
     // terminal printer). That header only makes sense as stdout dressing,
     // not inside a markdown ```diff block.
-    const stripped = diffText.replace(/^\s*┊[^\n]*\n?/, '').trim()
+    const stripped = diffText.replace(/^\s*┊[^\n]*\n?/, "").trim();
 
     if (!stripped) {
-      return
+      return;
     }
 
     // Flush any in-progress streaming text as its own segment first, so the
@@ -557,76 +639,95 @@ class TurnController {
     // whatever the agent streams afterwards — not glued onto the final
     // message. This is the whole point of segment-anchored diffs: the diff
     // renders where the edit actually happened.
-    this.flushStreamingSegment()
+    this.flushStreamingSegment();
 
-    const block = `\`\`\`diff\n${stripped}\n\`\`\``
+    const block = `\`\`\`diff\n${stripped}\n\`\`\``;
 
     // Skip consecutive duplicates (same tool firing tool.complete twice, or
     // two edits producing the same patch). Keeping this cheap — deeper
     // dedupe against the final assistant text happens at message.complete.
     if (this.segmentMessages.at(-1)?.text === block) {
-      return
+      return;
     }
 
     this.segmentMessages = [
       ...this.segmentMessages,
-      { kind: 'diff', role: 'assistant', text: block, ...(tools.length && { tools }) }
-    ]
-    patchTurnState({ streamSegments: this.segmentMessages })
+      {
+        kind: "diff",
+        role: "assistant",
+        text: block,
+        ...(tools.length && { tools }),
+      },
+    ];
+    patchTurnState({ streamSegments: this.segmentMessages });
   }
 
-  pushActivity(text: string, tone: ActivityItem['tone'] = 'info', replaceLabel?: string) {
-    patchTurnState(state => {
+  pushActivity(
+    text: string,
+    tone: ActivityItem["tone"] = "info",
+    replaceLabel?: string,
+  ) {
+    patchTurnState((state) => {
       const base = replaceLabel
-        ? state.activity.filter(item => !sameToolTrailGroup(replaceLabel, item.text))
-        : state.activity
+        ? state.activity.filter(
+            (item) => !sameToolTrailGroup(replaceLabel, item.text),
+          )
+        : state.activity;
 
-      const tail = base.at(-1)
+      const tail = base.at(-1);
 
       if (tail?.text === text && tail.tone === tone) {
-        return state
+        return state;
       }
 
-      return { ...state, activity: [...base, { id: ++this.activityId, text, tone }].slice(-ACTIVITY_LIMIT) }
-    })
+      return {
+        ...state,
+        activity: [...base, { id: ++this.activityId, text, tone }].slice(
+          -ACTIVITY_LIMIT,
+        ),
+      };
+    });
   }
 
   pushTrail(line: string) {
     if (this.interrupted) {
-      return
+      return;
     }
 
-    patchTurnState(state => {
+    patchTurnState((state) => {
       if (state.turnTrail.at(-1) === line) {
-        return state
+        return state;
       }
 
-      const next = [...state.turnTrail.filter(item => !isTransientTrailLine(item)), line].slice(-TRAIL_LIMIT)
+      const next = [
+        ...state.turnTrail.filter((item) => !isTransientTrailLine(item)),
+        line,
+      ].slice(-TRAIL_LIMIT);
 
-      this.turnTools = next
+      this.turnTools = next;
 
-      return { ...state, turnTrail: next }
-    })
+      return { ...state, turnTrail: next };
+    });
   }
 
   recordError() {
     // A failed turn discards the whole unsealed turn (flushed segments AND the
     // streaming tail) — unlike recordMessageComplete, which must keep the tail
     // (#61520), and interruptTurn, which preserves it as `partial`.
-    this.idle()
-    this.clearReasoning()
-    this.clearStatusTimer()
-    this.pendingSegmentTools = []
-    this.segmentMessages = []
-    this.turnTools = []
-    this.persistedToolLabels.clear()
+    this.idle();
+    this.clearReasoning();
+    this.clearStatusTimer();
+    this.pendingSegmentTools = [];
+    this.segmentMessages = [];
+    this.turnTools = [];
+    this.persistedToolLabels.clear();
 
     // Real turn end: surface any notice held back while busy.
-    this.flushPendingNotice()
+    this.flushPendingNotice();
   }
 
   recordMessageComplete(payload: MessageCompletePayload) {
-    this.closeReasoningSegment()
+    this.closeReasoningSegment();
 
     // Ink renders markdown via <Md>; the gateway's Rich-rendered ANSI
     // (`payload.rendered`) is for terminals that can't.  Prioritising
@@ -635,22 +736,23 @@ class TurnController {
     // pass through into the React tree.  Prefer raw text and fall back
     // only when the gateway elected not to send any (#16391).
     // `text` is `str | JsonValue` on the wire (structured parts stay possible); only a string renders here.
-    const wireText = typeof payload.text === 'string' ? payload.text : undefined
-    const completionText = wireText ?? payload.rendered
-    const rawText = (completionText ?? this.bufRef).trimStart()
+    const wireText =
+      typeof payload.text === "string" ? payload.text : undefined;
+    const completionText = wireText ?? payload.rendered;
+    const rawText = (completionText ?? this.bufRef).trimStart();
 
     // Text still in `this.bufRef` streamed after the last segment flush; `idle()`
     // below would wipe it (#61520). Flush it as a segment only when the
     // gateway's final text does not already carry it — otherwise the tail IS
     // the answer and flushing would move the tool shelf/trail under it. Skipped
     // when `completionText` is absent: `rawText` is then the buffer (#16391).
-    const tail = this.bufRef.trim()
+    const tail = this.bufRef.trim();
 
     if (tail && completionText != null && !completionText.includes(tail)) {
-      this.flushStreamingSegment()
+      this.flushStreamingSegment();
     }
 
-    const split = splitReasoning(rawText)
+    const split = splitReasoning(rawText);
     // Only dedupe segments AFTER the interim boundary — interim-sealed
     // segments are preserved even if the final text includes them.
     // Exception: when response_previewed is true, the final text is the
@@ -658,21 +760,32 @@ class TurnController {
     // message. Dedupe against ALL segments (including sealed interims) so
     // the identical text doesn't render as a duplicate message. (#65919
     // review: duplicate-message blocker)
-    const dedupeStart = payload.response_previewed ? 0 : (this.interimBoundaryIndex ?? 0)
-    const finalText = finalTail(split.text, this.segmentMessages.slice(dedupeStart))
-    const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()
-    const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n')
-    const savedToolTokens = this.toolTokenAcc
-    let tools = this.pendingSegmentTools
-    const last = this.segmentMessages[this.segmentMessages.length - 1]
+    const dedupeStart = payload.response_previewed
+      ? 0
+      : (this.interimBoundaryIndex ?? 0);
+    const finalText = finalTail(
+      split.text,
+      this.segmentMessages.slice(dedupeStart),
+    );
+    const existingReasoning =
+      this.reasoningText.trim() || String(payload.reasoning ?? "").trim();
+    const savedReasoning = [
+      existingReasoning,
+      existingReasoning ? "" : split.reasoning,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    const savedToolTokens = this.toolTokenAcc;
+    let tools = this.pendingSegmentTools;
+    const last = this.segmentMessages[this.segmentMessages.length - 1];
 
     if (tools.length && isToolShelfMessage(last)) {
       this.segmentMessages = [
         ...this.segmentMessages.slice(0, -1),
-        { ...last, tools: [...(last.tools ?? []), ...tools] }
-      ]
-      this.pendingSegmentTools = []
-      tools = []
+        { ...last, tools: [...(last.tools ?? []), ...tools] },
+      ];
+      this.pendingSegmentTools = [];
+      tools = [];
     }
 
     // Drop diff-only segments the agent is about to narrate in the final
@@ -680,136 +793,143 @@ class TurnController {
     // render two stacked copies of the same patch. Only touches segments
     // with `kind: 'diff'` emitted by pushInlineDiffSegment — real
     // assistant narration stays put.
-    const finalHasOwnDiffFence = /```(?:diff|patch)\b/i.test(finalText)
+    const finalHasOwnDiffFence = /```(?:diff|patch)\b/i.test(finalText);
 
-    const segments = this.segmentMessages.filter(msg => {
-      const body = diffSegmentBody(msg)
+    const segments = this.segmentMessages.filter((msg) => {
+      const body = diffSegmentBody(msg);
 
-      return body === null || (!finalHasOwnDiffFence && !finalText.includes(body))
-    })
+      return (
+        body === null || (!finalHasOwnDiffFence && !finalText.includes(body))
+      );
+    });
 
     const hasReasoningSegment =
-      this.reasoningSegmentIndex !== null || segments.some(msg => Boolean(msg.thinking?.trim()))
+      this.reasoningSegmentIndex !== null ||
+      segments.some((msg) => Boolean(msg.thinking?.trim()));
 
-    const finalThinking = hasReasoningSegment ? '' : savedReasoning.trim()
+    const finalThinking = hasReasoningSegment ? "" : savedReasoning.trim();
 
     const finalDetails: Msg = {
-      kind: 'trail',
-      role: 'system',
-      text: '',
+      kind: "trail",
+      role: "system",
+      text: "",
       thinking: finalThinking || undefined,
-      thinkingTokens: finalThinking ? estimateTokensRough(finalThinking) : undefined,
+      thinkingTokens: finalThinking
+        ? estimateTokensRough(finalThinking)
+        : undefined,
       toolTokens: savedToolTokens || undefined,
-      ...(tools.length && { tools })
-    }
+      ...(tools.length && { tools }),
+    };
 
     // Archive prepended so the trail msg anchors under the user prompt,
     // not between thinking/tools and final assistant text.
     const finalMessages: Msg[] = [
       ...archiveDoneTodos(),
       ...segments,
-      ...(hasDetails(finalDetails) ? [finalDetails] : [])
-    ]
+      ...(hasDetails(finalDetails) ? [finalDetails] : []),
+    ];
 
     if (finalText) {
-      finalMessages.push({ role: 'assistant', text: finalText })
+      finalMessages.push({ role: "assistant", text: finalText });
     }
 
-    const wasInterrupted = this.interrupted
-    const interruptedReply = wasInterrupted ? lateInterruptedReply(this.sealedInterrupt, payload) : null
+    const wasInterrupted = this.interrupted;
+    const interruptedReply = wasInterrupted
+      ? lateInterruptedReply(this.sealedInterrupt, payload)
+      : null;
 
     // Archive the turn's spawn tree to history BEFORE idle() drops subagents
     // from turnState.  Lets /replay and the overlay's history nav pull up
     // finished fan-outs without a round-trip to disk.
-    const finishedSubagents = getTurnState().subagents
-    const sessionId = getUiState().sid
+    const finishedSubagents = getTurnState().subagents;
+    const sessionId = getUiState().sid;
 
     if (finishedSubagents.length > 0) {
-      pushSnapshot(finishedSubagents, { sessionId, startedAt: null })
+      pushSnapshot(finishedSubagents, { sessionId, startedAt: null });
       // Fire-and-forget disk persistence so /replay survives process restarts.
       // The same snapshot lives in memory via spawnHistoryStore for immediate
       // recall — disk is the long-term archive.
-      void this.persistSpawnTree?.(finishedSubagents, sessionId)
+      void this.persistSpawnTree?.(finishedSubagents, sessionId);
     }
 
-    this.idle()
-    this.clearReasoning()
-    this.turnTools = []
-    this.persistedToolLabels.clear()
-    this.bufRef = ''
-    this.interrupted = false
-    this.sealedInterrupt = null
-    patchTurnState({ activity: [], outcome: '' })
+    this.idle();
+    this.clearReasoning();
+    this.turnTools = [];
+    this.persistedToolLabels.clear();
+    this.bufRef = "";
+    this.interrupted = false;
+    this.sealedInterrupt = null;
+    patchTurnState({ activity: [], outcome: "" });
 
     // Real turn end: surface any notice held back while busy. Done after
     // idle() flips busy=false so applyNotice() reaches the visible slot.
-    this.flushPendingNotice()
+    this.flushPendingNotice();
 
-    return { finalMessages, finalText, interruptedReply, wasInterrupted }
+    return { finalMessages, finalText, interruptedReply, wasInterrupted };
   }
 
   recordMessageDelta({ text }: { rendered?: string | null; text?: string }) {
     if (this.interrupted || !text) {
-      return
+      return;
     }
 
-    this.pruneTransient()
-    this.endReasoningPhase()
+    this.pruneTransient();
+    this.endReasoningPhase();
 
     // Always accumulate the raw text delta.  The pre-#16391 path replaced
     // the entire buffer with `rendered` (an *incremental* Rich ANSI
     // fragment), which on every tick discarded everything streamed so far
     // — visible as overlapping coloured text and lost prose under
     // `display.final_response_markdown: render`.
-    this.bufRef += text
+    this.bufRef += text;
 
     if (getUiState().streaming) {
-      this.scheduleStreaming()
+      this.scheduleStreaming();
     }
   }
 
   recordInterimMessage(text: string) {
     if (this.interrupted) {
-      return
+      return;
     }
 
-    const authoritativeText = text.trimStart()
+    const authoritativeText = text.trimStart();
 
     if (!authoritativeText) {
-      return
+      return;
     }
 
     // If the streaming buffer hasn't caught up to the authoritative interim
     // text (e.g. the backend didn't stream every token), sync it so the
     // sealed segment matches what the user should see.
     if (this.bufRef.trimStart() !== authoritativeText) {
-      this.bufRef = authoritativeText
+      this.bufRef = authoritativeText;
     }
 
     // Flush the current streaming buffer into a sealed segment — this is the
     // TUI equivalent of the desktop's finalizeInterimAssistantMessage. The
     // segment survives message.complete's finalTail dedupe because
     // interimBoundaryIndex marks it as interim-sealed.
-    this.flushStreamingSegment()
-    this.interimBoundaryIndex = this.segmentMessages.length
+    this.flushStreamingSegment();
+    this.interimBoundaryIndex = this.segmentMessages.length;
   }
 
   recordReasoningAvailable(text: string, force = false) {
     if (this.interrupted || (!force && !getUiState().showReasoning)) {
-      return
+      return;
     }
 
-    const incoming = text.trim()
+    const incoming = text.trim();
 
     if (!incoming || this.reasoningText.trim()) {
-      return
+      return;
     }
 
-    this.reasoningText = incoming
-    this.activeReasoningText = incoming
-    this.scheduleReasoning()
-    this.syncReasoningSegment()
-    this.pulseReasoningStreaming()
+    this.reasoningText = incoming;
+    this.activeReasoningText = incoming;
+    this.scheduleReasoning();
+    this.syncReasoningSegment();
+    this.pulseReasoningStreaming();
   }
 
   /**
@@ -820,50 +940,58 @@ class TurnController {
    * thinking-style segment tagged with the source model, so a multi-reference
    * preset builds a stack the user can scroll.
    */
-  recordMoaReference(label: string, text: string, index?: number, count?: number) {
+  recordMoaReference(
+    label: string,
+    text: string,
+    index?: number,
+    count?: number,
+  ) {
     if (this.interrupted) {
-      return
+      return;
     }
 
     // Close any open reasoning segment so the reference block lands as its own
     // committed entry rather than merging into streaming reasoning.
-    this.closeReasoningSegment()
+    this.closeReasoningSegment();
 
-    const header = index && count ? `◇ Reference ${index}/${count} — ${label}` : `◇ Reference — ${label}`
+    const header =
+      index && count
+        ? `◇ Reference ${index}/${count} — ${label}`
+        : `◇ Reference — ${label}`;
 
-    const body = text.trim()
-    const thinking = body ? `${header}\n${body}` : header
+    const body = text.trim();
+    const thinking = body ? `${header}\n${body}` : header;
 
     this.pushSegment({
-      kind: 'trail',
-      role: 'system',
-      text: '',
+      kind: "trail",
+      role: "system",
+      text: "",
       thinking,
       isMoaReference: true,
-      thinkingTokens: estimateTokensRough(thinking)
-    })
-    patchTurnState({ streamSegments: this.segmentMessages })
+      thinkingTokens: estimateTokensRough(thinking),
+    });
+    patchTurnState({ streamSegments: this.segmentMessages });
   }
 
   recordReasoningDelta(text: string, force = false) {
     if (this.interrupted || (!force && !getUiState().showReasoning)) {
-      return
+      return;
     }
 
     if (!this.activeReasoningText.trim() && this.pendingSegmentTools.length) {
-      this.flushStreamingSegment()
+      this.flushStreamingSegment();
     }
 
-    this.reasoningText += text
-    this.activeReasoningText += text
+    this.reasoningText += text;
+    this.activeReasoningText += text;
 
     if (this.reasoningText.length > 80_000) {
-      this.reasoningText = this.reasoningText.slice(-60_000)
+      this.reasoningText = this.reasoningText.slice(-60_000);
     }
 
-    this.scheduleReasoning()
-    this.syncReasoningSegment()
-    this.pulseReasoningStreaming()
+    this.scheduleReasoning();
+    this.syncReasoningSegment();
+    this.pulseReasoningStreaming();
   }
 
   recordToolComplete(
@@ -873,18 +1001,25 @@ class TurnController {
     duration?: number,
     todos?: unknown,
     resultText?: string,
-    labels?: ToolLabel[]
+    labels?: ToolLabel[],
   ) {
     if (this.interrupted) {
-      return
+      return;
     }
 
-    this.recordTodos(todos)
-    const lines = this.completeTool(toolId, fallbackName, summary, duration, resultText, labels)
+    this.recordTodos(todos);
+    const lines = this.completeTool(
+      toolId,
+      fallbackName,
+      summary,
+      duration,
+      resultText,
+      labels,
+    );
 
-    this.pendingSegmentTools = [...this.pendingSegmentTools, ...lines]
-    this.flushPendingToolsIntoLastSegment()
-    this.publishToolState()
+    this.pendingSegmentTools = [...this.pendingSegmentTools, ...lines];
+    this.flushPendingToolsIntoLastSegment();
+    this.publishToolState();
   }
 
   recordInlineDiffToolComplete(
@@ -893,15 +1028,18 @@ class TurnController {
     fallbackName?: string,
     duration?: number,
     resultText?: string,
-    labels?: ToolLabel[]
+    labels?: ToolLabel[],
   ) {
     if (this.interrupted) {
-      return
+      return;
     }
 
-    this.flushStreamingSegment()
-    this.pushInlineDiffSegment(diffText, this.completeTool(toolId, fallbackName, '', duration, resultText, labels))
-    this.publishToolState()
+    this.flushStreamingSegment();
+    this.pushInlineDiffSegment(
+      diffText,
+      this.completeTool(toolId, fallbackName, "", duration, resultText, labels),
+    );
+    this.publishToolState();
   }
 
   // `tool.complete` carries no error flag on the wire (tui_gateway/tool_progress.py::_on_tool_complete);
@@ -912,131 +1050,151 @@ class TurnController {
     summary?: string,
     duration?: number,
     resultText?: string,
-    eventLabels?: ToolLabel[]
+    eventLabels?: ToolLabel[],
   ) {
-    const done = this.activeTools.find(tool => tool.id === toolId)
-    const name = done?.name ?? fallbackName ?? 'tool'
-    const label = toolTrailLabel(name)
-    const labels = eventLabels?.length ? eventLabels : (done?.labels ?? [])
-    const fallbackDuration = done?.startedAt ? (Date.now() - done.startedAt) / 1000 : undefined
-    const took = duration ?? fallbackDuration
+    const done = this.activeTools.find((tool) => tool.id === toolId);
+    const name = done?.name ?? fallbackName ?? "tool";
+    const label = toolTrailLabel(name);
+    const labels = eventLabels?.length ? eventLabels : (done?.labels ?? []);
+    const fallbackDuration = done?.startedAt
+      ? (Date.now() - done.startedAt) / 1000
+      : undefined;
+    const took = duration ?? fallbackDuration;
 
-    const lines = toolTrailLines(done, name, labels, summary || '', resultText || '', took)
+    const lines = toolTrailLines(
+      done,
+      name,
+      labels,
+      summary || "",
+      resultText || "",
+      took,
+    );
 
-    this.activeTools = this.activeTools.filter(tool => tool.id !== toolId)
+    this.activeTools = this.activeTools.filter((tool) => tool.id !== toolId);
 
-    const next = this.turnTools.filter(item => !sameToolTrailGroup(label, item))
+    const next = this.turnTools.filter(
+      (item) => !sameToolTrailGroup(label, item),
+    );
 
     if (!this.activeTools.length) {
-      next.push('analyzing tool output…')
+      next.push("analyzing tool output…");
     }
 
-    this.turnTools = next.slice(-TRAIL_LIMIT)
+    this.turnTools = next.slice(-TRAIL_LIMIT);
 
-    return lines
+    return lines;
   }
 
   private publishToolState() {
     patchTurnState({
       streamPendingTools: this.pendingSegmentTools,
       tools: this.activeTools,
-      turnTrail: this.turnTools
-    })
+      turnTrail: this.turnTools,
+    });
   }
 
-  recordToolStart(toolId: string, name: string, context: string, verboseArgs?: string, labels?: ToolLabel[]) {
+  recordToolStart(
+    toolId: string,
+    name: string,
+    context: string,
+    verboseArgs?: string,
+    labels?: ToolLabel[],
+  ) {
     if (this.interrupted) {
-      return
+      return;
     }
 
-    this.flushStreamingSegment()
-    this.closeReasoningSegment()
-    this.pruneTransient()
-    this.endReasoningPhase()
+    this.flushStreamingSegment();
+    this.closeReasoningSegment();
+    this.pruneTransient();
+    this.endReasoningPhase();
 
-    const sample = `${name} ${context}`.trim()
+    const sample = `${name} ${context}`.trim();
 
-    this.toolTokenAcc += sample ? estimateTokensRough(sample) : 0
-    this.activeTools = [...this.activeTools, { context, id: toolId, labels, name, startedAt: Date.now(), verboseArgs }]
+    this.toolTokenAcc += sample ? estimateTokensRough(sample) : 0;
+    this.activeTools = [
+      ...this.activeTools,
+      { context, id: toolId, labels, name, startedAt: Date.now(), verboseArgs },
+    ];
 
-    patchTurnState({ toolTokens: this.toolTokenAcc, tools: this.activeTools })
+    patchTurnState({ toolTokens: this.toolTokenAcc, tools: this.activeTools });
   }
 
   reset() {
-    this.clearReasoning()
-    this.clearStatusTimer()
-    this.idle()
-    this.bufRef = ''
-    this.interrupted = false
-    this.sealedInterrupt = null
-    this.lastStatusNote = ''
-    this.activeReasoningText = ''
-    this.pendingSegmentTools = []
-    this.protocolWarned = false
-    this.reasoningSegmentIndex = null
-    this.interimBoundaryIndex = null
-    this.segmentMessages = []
-    this.turnTools = []
-    this.toolTokenAcc = 0
-    this.persistedToolLabels.clear()
+    this.clearReasoning();
+    this.clearStatusTimer();
+    this.idle();
+    this.bufRef = "";
+    this.interrupted = false;
+    this.sealedInterrupt = null;
+    this.lastStatusNote = "";
+    this.activeReasoningText = "";
+    this.pendingSegmentTools = [];
+    this.protocolWarned = false;
+    this.reasoningSegmentIndex = null;
+    this.interimBoundaryIndex = null;
+    this.segmentMessages = [];
+    this.turnTools = [];
+    this.toolTokenAcc = 0;
+    this.persistedToolLabels.clear();
     // Session boundary: drop notice state so session A's sticky can't bleed
     // into session B (R3-H5). reset()/fullReset() CLEAR — they never flush.
-    this.clearNoticeState()
-    patchTurnState({ activity: [], outcome: '' })
+    this.clearNoticeState();
+    patchTurnState({ activity: [], outcome: "" });
   }
 
   fullReset() {
-    this.reset()
-    resetTurnState()
+    this.reset();
+    resetTurnState();
   }
 
   scheduleReasoning() {
     if (this.reasoningTimer) {
-      return
+      return;
     }
 
     this.reasoningTimer = setTimeout(() => {
-      this.reasoningTimer = null
+      this.reasoningTimer = null;
       patchTurnState({
         reasoning: this.reasoningText,
-        reasoningTokens: estimateTokensRough(this.reasoningText)
-      })
-    }, STREAM_BATCH_MS)
+        reasoningTokens: estimateTokensRough(this.reasoningText),
+      });
+    }, STREAM_BATCH_MS);
   }
 
   scheduleStreaming() {
     if (this.streamTimer) {
-      return
+      return;
     }
 
     this.streamTimer = setTimeout(() => {
-      this.streamTimer = null
-      const raw = this.bufRef.trimStart()
-      const visible = hasReasoningTag(raw) ? splitReasoning(raw).text : raw
-      patchTurnState({ streaming: boundedLiveRenderText(visible) })
-    }, this.streamDelay)
+      this.streamTimer = null;
+      const raw = this.bufRef.trimStart();
+      const visible = hasReasoningTag(raw) ? splitReasoning(raw).text : raw;
+      patchTurnState({ streaming: boundedLiveRenderText(visible) });
+    }, this.streamDelay);
   }
 
   hydrateStreamingText(text: string) {
-    this.streamTimer = clear(this.streamTimer)
-    this.bufRef = text
-    const raw = this.bufRef.trimStart()
-    const visible = hasReasoningTag(raw) ? splitReasoning(raw).text : raw
-    patchTurnState({ streaming: boundedLiveRenderText(visible) })
+    this.streamTimer = clear(this.streamTimer);
+    this.bufRef = text;
+    const raw = this.bufRef.trimStart();
+    const visible = hasReasoningTag(raw) ? splitReasoning(raw).text : raw;
+    patchTurnState({ streaming: boundedLiveRenderText(visible) });
   }
 
   startMessage() {
-    this.endReasoningPhase()
-    this.clearReasoning()
-    this.activeTools = []
-    this.activeReasoningText = ''
-    this.reasoningSegmentIndex = null
-    this.interimBoundaryIndex = null
-    this.turnTools = []
-    this.toolTokenAcc = 0
-    this.interrupted = false
-    this.sealedInterrupt = null
-    this.persistedToolLabels.clear()
+    this.endReasoningPhase();
+    this.clearReasoning();
+    this.activeTools = [];
+    this.activeReasoningText = "";
+    this.reasoningSegmentIndex = null;
+    this.interimBoundaryIndex = null;
+    this.turnTools = [];
+    this.toolTokenAcc = 0;
+    this.interrupted = false;
+    this.sealedInterrupt = null;
+    this.persistedToolLabels.clear();
     // "Flash and yield" notices clear when a new turn starts: a usage-band heads-up
     // (credits.usage, 50/75/90%) and the one-time "grant spent" transition
     // (credits.grant_spent) should show once, then get out of the way — not camp the
@@ -1044,35 +1202,45 @@ class TurnController {
     // left). Depletion (credits.depleted) and other notices stay — they're explicitly
     // sticky until the policy clears them. The Python `active` latch retains the key,
     // so a yielded notice won't re-fire on the next turn.
-    const yieldingNoticeKey = getUiState().notice?.key
+    const yieldingNoticeKey = getUiState().notice?.key;
 
-    if (yieldingNoticeKey === 'credits.usage' || yieldingNoticeKey === 'credits.grant_spent') {
-      this.clearNotice(yieldingNoticeKey)
+    if (
+      yieldingNoticeKey === "credits.usage" ||
+      yieldingNoticeKey === "credits.grant_spent"
+    ) {
+      this.clearNotice(yieldingNoticeKey);
     }
 
-    patchUiState({ busy: true })
-    patchTurnState({ activity: [], outcome: '', subagents: [], toolTokens: 0, tools: [], turnTrail: [] })
+    patchUiState({ busy: true });
+    patchTurnState({
+      activity: [],
+      outcome: "",
+      subagents: [],
+      toolTokens: 0,
+      tools: [],
+      turnTrail: [],
+    });
   }
 
   upsertSubagent(
     p: SubagentEventPayload,
     patch: (current: SubagentProgress) => Partial<SubagentProgress>,
-    opts: { createIfMissing?: boolean } = { createIfMissing: true }
+    opts: { createIfMissing?: boolean } = { createIfMissing: true },
   ) {
     // Stable id: prefer the server-issued subagent_id (survives nested
     // grandchildren + cross-tree joins).  Fall back to the composite key
     // for older gateways that omit the field — those produce a flat list.
-    const id = p.subagent_id || `sa:${p.task_index}:${p.goal || 'subagent'}`
+    const id = p.subagent_id || `sa:${p.task_index}:${p.goal || "subagent"}`;
 
-    patchTurnState(state => {
-      const existing = state.subagents.find(item => item.id === id)
+    patchTurnState((state) => {
+      const existing = state.subagents.find((item) => item.id === id);
 
       // Late events (subagent.complete/tool/progress arriving after message.complete
       // has already fired idle()) would otherwise resurrect a finished
       // subagent into turn.subagents and block the "finished" title on the
       // /agents overlay.  When `createIfMissing` is false we drop silently.
       if (!existing && !opts.createIfMissing) {
-        return state
+        return state;
       }
 
       const base: SubagentProgress = existing ?? {
@@ -1085,24 +1253,24 @@ class TurnController {
         notes: [],
         parentId: p.parent_id ?? null,
         startedAt: Date.now(),
-        status: 'running',
+        status: "running",
         taskCount: p.task_count ?? 1,
         thinking: [],
         toolCount: p.tool_count ?? 0,
         tools: [],
-        toolsets: p.toolsets ?? undefined
-      }
+        toolsets: p.toolsets ?? undefined,
+      };
 
       // Map snake_case payload keys onto camelCase state.  Only overwrite
       // when the event actually carries the field; `??` preserves prior
       // values across streaming events that emit partial payloads.
       const outputTail = p.output_tail
-        ? p.output_tail.map(e => ({
+        ? p.output_tail.map((e) => ({
             isError: Boolean(e.is_error),
-            preview: String(e.preview ?? ''),
-            tool: String(e.tool ?? 'tool')
+            preview: String(e.preview ?? ""),
+            tool: String(e.tool ?? "tool"),
           }))
-        : base.outputTail
+        : base.outputTail;
 
       const next: SubagentProgress = {
         ...base,
@@ -1121,21 +1289,23 @@ class TurnController {
         taskCount: p.task_count ?? base.taskCount,
         toolCount: p.tool_count ?? base.toolCount,
         toolsets: p.toolsets ?? base.toolsets,
-        ...patch(base)
-      }
+        ...patch(base),
+      };
 
       // Stable order: by spawn (depth, parent, index) rather than insert time.
       // Without it, grandchildren can shuffle relative to siblings when
       // events arrive out of order under high concurrency.
       const subagents = existing
-        ? state.subagents.map(item => (item.id === id ? next : item))
-        : [...state.subagents, next].sort((a, b) => a.depth - b.depth || a.index - b.index)
+        ? state.subagents.map((item) => (item.id === id ? next : item))
+        : [...state.subagents, next].sort(
+            (a, b) => a.depth - b.depth || a.index - b.index,
+          );
 
-      return { ...state, subagents }
-    })
+      return { ...state, subagents };
+    });
   }
 }
 
-export const turnController = new TurnController()
+export const turnController = new TurnController();
 
-export type { TurnController }
+export type { TurnController };

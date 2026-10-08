@@ -1,105 +1,105 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const { evictInkCachesMock, forceRedrawMock } = vi.hoisted(() => ({
   evictInkCachesMock: vi.fn(),
-  forceRedrawMock: vi.fn()
-}))
+  forceRedrawMock: vi.fn(),
+}));
 
-vi.mock('@k3code/ink', () => ({
+vi.mock("@k3code/ink", () => ({
   evictInkCaches: evictInkCachesMock,
-  forceRedraw: forceRedrawMock
-}))
+  forceRedraw: forceRedrawMock,
+}));
 
-import { scheduleResumeScrollToBottom } from './sessionResumeView.js'
+import { scheduleResumeScrollToBottom } from "./sessionResumeView.js";
 
-describe('scheduleResumeScrollToBottom', () => {
+describe("scheduleResumeScrollToBottom", () => {
   afterEach(() => {
-    vi.useRealTimers()
-    evictInkCachesMock.mockReset()
-    forceRedrawMock.mockReset()
-  })
+    vi.useRealTimers();
+    evictInkCachesMock.mockReset();
+    forceRedrawMock.mockReset();
+  });
 
-  it('re-snaps while sticky and stops when the user scrolls away', () => {
-    vi.useFakeTimers()
-    let sticky = true
-    let lastManualScrollAt = 0
-    const scrollToBottom = vi.fn()
+  it("re-snaps while sticky and stops when the user scrolls away", () => {
+    vi.useFakeTimers();
+    let sticky = true;
+    let lastManualScrollAt = 0;
+    const scrollToBottom = vi.fn();
 
     const cancel = scheduleResumeScrollToBottom(
       {
         current: {
           getLastManualScrollAt: () => lastManualScrollAt,
           isSticky: () => sticky,
-          scrollToBottom
-        }
+          scrollToBottom,
+        },
       } as any,
-      [0, 80, 240]
-    )
+      [0, 80, 240],
+    );
 
-    vi.advanceTimersByTime(0)
-    expect(scrollToBottom).toHaveBeenCalledTimes(1)
-    expect(evictInkCachesMock).toHaveBeenCalledWith('all')
-    expect(forceRedrawMock).toHaveBeenCalledTimes(1)
+    vi.advanceTimersByTime(0);
+    expect(scrollToBottom).toHaveBeenCalledTimes(1);
+    expect(evictInkCachesMock).toHaveBeenCalledWith("all");
+    expect(forceRedrawMock).toHaveBeenCalledTimes(1);
 
-    vi.advanceTimersByTime(80)
-    expect(scrollToBottom).toHaveBeenCalledTimes(2)
-    expect(forceRedrawMock).toHaveBeenCalledTimes(1)
+    vi.advanceTimersByTime(80);
+    expect(scrollToBottom).toHaveBeenCalledTimes(2);
+    expect(forceRedrawMock).toHaveBeenCalledTimes(1);
 
-    sticky = false
-    lastManualScrollAt = Date.now() + 1
-    vi.advanceTimersByTime(160)
-    expect(scrollToBottom).toHaveBeenCalledTimes(2)
+    sticky = false;
+    lastManualScrollAt = Date.now() + 1;
+    vi.advanceTimersByTime(160);
+    expect(scrollToBottom).toHaveBeenCalledTimes(2);
 
-    cancel()
-  })
+    cancel();
+  });
 
-  it('cancels pending resume snaps', () => {
-    vi.useFakeTimers()
-    const scrollToBottom = vi.fn()
+  it("cancels pending resume snaps", () => {
+    vi.useFakeTimers();
+    const scrollToBottom = vi.fn();
 
     const cancel = scheduleResumeScrollToBottom(
       {
         current: {
           getLastManualScrollAt: () => 0,
           isSticky: () => true,
-          scrollToBottom
-        }
+          scrollToBottom,
+        },
       } as any,
-      [20]
-    )
+      [20],
+    );
 
-    cancel()
-    vi.advanceTimersByTime(20)
+    cancel();
+    vi.advanceTimersByTime(20);
 
-    expect(scrollToBottom).not.toHaveBeenCalled()
-    expect(forceRedrawMock).not.toHaveBeenCalled()
-  })
+    expect(scrollToBottom).not.toHaveBeenCalled();
+    expect(forceRedrawMock).not.toHaveBeenCalled();
+  });
 
-  it('keeps the immediate resume snap even before sticky state settles', () => {
-    vi.useFakeTimers()
-    let sticky = false
-    const scrollToBottom = vi.fn()
+  it("keeps the immediate resume snap even before sticky state settles", () => {
+    vi.useFakeTimers();
+    let sticky = false;
+    const scrollToBottom = vi.fn();
 
     const cancel = scheduleResumeScrollToBottom(
       {
         current: {
           getLastManualScrollAt: () => 0,
           isSticky: () => sticky,
-          scrollToBottom
-        }
+          scrollToBottom,
+        },
       } as any,
-      [0, 80]
-    )
+      [0, 80],
+    );
 
-    vi.advanceTimersByTime(0)
-    expect(scrollToBottom).toHaveBeenCalledTimes(1)
-    expect(forceRedrawMock).toHaveBeenCalledTimes(1)
+    vi.advanceTimersByTime(0);
+    expect(scrollToBottom).toHaveBeenCalledTimes(1);
+    expect(forceRedrawMock).toHaveBeenCalledTimes(1);
 
-    vi.advanceTimersByTime(80)
-    expect(scrollToBottom).toHaveBeenCalledTimes(1)
-    expect(forceRedrawMock).toHaveBeenCalledTimes(1)
+    vi.advanceTimersByTime(80);
+    expect(scrollToBottom).toHaveBeenCalledTimes(1);
+    expect(forceRedrawMock).toHaveBeenCalledTimes(1);
 
-    sticky = true
-    cancel()
-  })
-})
+    sticky = true;
+    cancel();
+  });
+});

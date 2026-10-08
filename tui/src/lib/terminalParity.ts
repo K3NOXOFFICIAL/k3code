@@ -2,39 +2,46 @@ import {
   detectVSCodeLikeTerminal,
   type FileOps,
   isRemoteShellSession,
-  shouldPromptForTerminalSetup
-} from './terminalSetup.js'
+  shouldPromptForTerminalSetup,
+} from "./terminalSetup.js";
 
 export type MacTerminalHint = {
-  key: string
-  message: string
-  tone: 'info' | 'warn'
-}
+  key: string;
+  message: string;
+  tone: "info" | "warn";
+};
 
 export type MacTerminalContext = {
-  isAppleTerminal: boolean
-  isRemote: boolean
-  isTmux: boolean
-  vscodeLike: null | 'cursor' | 'vscode' | 'windsurf'
-}
+  isAppleTerminal: boolean;
+  isRemote: boolean;
+  isTmux: boolean;
+  vscodeLike: null | "cursor" | "vscode" | "windsurf";
+};
 
-export function detectMacTerminalContext(env: NodeJS.ProcessEnv = process.env): MacTerminalContext {
-  const termProgram = env['TERM_PROGRAM'] ?? ''
+export function detectMacTerminalContext(
+  env: NodeJS.ProcessEnv = process.env,
+): MacTerminalContext {
+  const termProgram = env["TERM_PROGRAM"] ?? "";
 
   return {
-    isAppleTerminal: termProgram === 'Apple_Terminal' || !!env['TERM_SESSION_ID'],
+    isAppleTerminal:
+      termProgram === "Apple_Terminal" || !!env["TERM_SESSION_ID"],
     isRemote: isRemoteShellSession(env),
-    isTmux: !!env['TMUX'],
-    vscodeLike: detectVSCodeLikeTerminal(env)
-  }
+    isTmux: !!env["TMUX"],
+    vscodeLike: detectVSCodeLikeTerminal(env),
+  };
 }
 
 export async function terminalParityHints(
   env: NodeJS.ProcessEnv = process.env,
-  options?: { fileOps?: Partial<FileOps>; homeDir?: string; platform?: NodeJS.Platform }
+  options?: {
+    fileOps?: Partial<FileOps>;
+    homeDir?: string;
+    platform?: NodeJS.Platform;
+  },
 ): Promise<MacTerminalHint[]> {
-  const ctx = detectMacTerminalContext(env)
-  const hints: MacTerminalHint[] = []
+  const ctx = detectMacTerminalContext(env);
+  const hints: MacTerminalHint[] = [];
 
   if (
     ctx.vscodeLike &&
@@ -42,42 +49,42 @@ export async function terminalParityHints(
       env,
       fileOps: options?.fileOps,
       homeDir: options?.homeDir,
-      platform: options?.platform
+      platform: options?.platform,
     }))
   ) {
     hints.push({
-      key: 'ide-setup',
-      tone: 'info',
-      message: `Detected ${ctx.vscodeLike} terminal · run /terminal-setup for best Cmd+Enter / undo parity`
-    })
+      key: "ide-setup",
+      tone: "info",
+      message: `Detected ${ctx.vscodeLike} terminal · run /terminal-setup for best Cmd+Enter / undo parity`,
+    });
   }
 
   if (ctx.isAppleTerminal) {
     hints.push({
-      key: 'apple-terminal',
-      tone: 'warn',
+      key: "apple-terminal",
+      tone: "warn",
       message:
-        'Apple Terminal detected · use /paste for image-only clipboard fallback, and try Ctrl+A / Ctrl+E / Ctrl+U if Cmd+←/→/⌫ gets rewritten'
-    })
+        "Apple Terminal detected · use /paste for image-only clipboard fallback, and try Ctrl+A / Ctrl+E / Ctrl+U if Cmd+←/→/⌫ gets rewritten",
+    });
   }
 
   if (ctx.isTmux) {
     hints.push({
-      key: 'tmux',
-      tone: 'warn',
+      key: "tmux",
+      tone: "warn",
       message:
-        'tmux detected · clipboard copy/paste uses passthrough when available; allow-passthrough improves OSC52 reliability'
-    })
+        "tmux detected · clipboard copy/paste uses passthrough when available; allow-passthrough improves OSC52 reliability",
+    });
   }
 
   if (ctx.isRemote) {
     hints.push({
-      key: 'remote',
-      tone: 'warn',
+      key: "remote",
+      tone: "warn",
       message:
-        'SSH session detected · text clipboard can bridge via OSC52, but image clipboard and local screenshot paths still depend on the machine running k3code'
-    })
+        "SSH session detected · text clipboard can bridge via OSC52, but image clipboard and local screenshot paths still depend on the machine running k3code",
+    });
   }
 
-  return hints
+  return hints;
 }

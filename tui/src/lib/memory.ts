@@ -1,102 +1,130 @@
-import { createWriteStream } from 'node:fs'
-import { mkdir, readdir, readFile, stat, unlink, writeFile } from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { pipeline } from 'node:stream/promises'
-import { getHeapSnapshot, getHeapSpaceStatistics, getHeapStatistics } from 'node:v8'
+import { createWriteStream } from "node:fs";
+import {
+  mkdir,
+  readdir,
+  readFile,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { pipeline } from "node:stream/promises";
+import {
+  getHeapSnapshot,
+  getHeapSpaceStatistics,
+  getHeapStatistics,
+} from "node:v8";
 
-export type MemoryTrigger = 'auto-critical' | 'auto-high' | 'manual'
+export type MemoryTrigger = "auto-critical" | "auto-high" | "manual";
 
 export interface MemoryDiagnostics {
-  activeHandles: number
-  activeRequests: number
+  activeHandles: number;
+  activeRequests: number;
   analysis: {
-    potentialLeaks: string[]
-    recommendation: string
-  }
+    potentialLeaks: string[];
+    recommendation: string;
+  };
   memoryGrowthRate: {
-    bytesPerSecond: number
-    mbPerHour: number
-  }
+    bytesPerSecond: number;
+    mbPerHour: number;
+  };
   memoryUsage: {
-    arrayBuffers: number
-    external: number
-    heapTotal: number
-    heapUsed: number
-    rss: number
-  }
-  nodeVersion: string
-  openFileDescriptors?: number
-  platform: string
+    arrayBuffers: number;
+    external: number;
+    heapTotal: number;
+    heapUsed: number;
+    rss: number;
+  };
+  nodeVersion: string;
+  openFileDescriptors?: number;
+  platform: string;
   resourceUsage: {
-    maxRSS: number
-    systemCPUTime: number
-    userCPUTime: number
-  }
-  smapsRollup?: string
-  timestamp: string
-  trigger: MemoryTrigger
-  uptimeSeconds: number
-  v8HeapSpaces?: { available: number; name: string; size: number; used: number }[]
+    maxRSS: number;
+    systemCPUTime: number;
+    userCPUTime: number;
+  };
+  smapsRollup?: string;
+  timestamp: string;
+  trigger: MemoryTrigger;
+  uptimeSeconds: number;
+  v8HeapSpaces?: {
+    available: number;
+    name: string;
+    size: number;
+    used: number;
+  }[];
   v8HeapStats: {
-    detachedContexts: number
-    heapSizeLimit: number
-    mallocedMemory: number
-    nativeContexts: number
-    peakMallocedMemory: number
-  }
+    detachedContexts: number;
+    heapSizeLimit: number;
+    mallocedMemory: number;
+    nativeContexts: number;
+    peakMallocedMemory: number;
+  };
 }
 
 export interface HeapDumpResult {
-  diagPath?: string
-  error?: string
-  heapPath?: string
+  diagPath?: string;
+  error?: string;
+  heapPath?: string;
   // True when an auto trigger wrote diagnostics only and intentionally skipped
   // the heavy snapshot because K3CODE_AUTO_HEAPDUMP was not enabled (#21767).
-  suppressed?: boolean
-  success: boolean
+  suppressed?: boolean;
+  success: boolean;
 }
 
-export async function captureMemoryDiagnostics(trigger: MemoryTrigger): Promise<MemoryDiagnostics> {
-  const usage = process.memoryUsage()
-  const heapStats = getHeapStatistics()
-  const resourceUsage = process.resourceUsage()
-  const uptimeSeconds = process.uptime()
+export async function captureMemoryDiagnostics(
+  trigger: MemoryTrigger,
+): Promise<MemoryDiagnostics> {
+  const usage = process.memoryUsage();
+  const heapStats = getHeapStatistics();
+  const resourceUsage = process.resourceUsage();
+  const uptimeSeconds = process.uptime();
 
   // Not available on Bun / older Node.
-  let heapSpaces: ReturnType<typeof getHeapSpaceStatistics> | undefined
+  let heapSpaces: ReturnType<typeof getHeapSpaceStatistics> | undefined;
 
   try {
-    heapSpaces = getHeapSpaceStatistics()
+    heapSpaces = getHeapSpaceStatistics();
   } catch {
     /* noop */
   }
 
   const internals = process as unknown as {
-    _getActiveHandles: () => unknown[]
-    _getActiveRequests: () => unknown[]
-  }
+    _getActiveHandles: () => unknown[];
+    _getActiveRequests: () => unknown[];
+  };
 
-  const activeHandles = internals._getActiveHandles().length
-  const activeRequests = internals._getActiveRequests().length
-  const openFileDescriptors = await swallow(async () => (await readdir('/proc/self/fd')).length)
-  const smapsRollup = await swallow(() => readFile('/proc/self/smaps_rollup', 'utf8'))
+  const activeHandles = internals._getActiveHandles().length;
+  const activeRequests = internals._getActiveRequests().length;
+  const openFileDescriptors = await swallow(
+    async () => (await readdir("/proc/self/fd")).length,
+  );
+  const smapsRollup = await swallow(() =>
+    readFile("/proc/self/smaps_rollup", "utf8"),
+  );
 
-  const nativeMemory = usage.rss - usage.heapUsed
+  const nativeMemory = usage.rss - usage.heapUsed;
   // Real growth rate since STARTED_AT (captured at module load) — NOT a lifetime
   // average of rss/uptime, which would report phantom "growth" for a stable process.
-  const elapsed = Math.max(0, uptimeSeconds - STARTED_AT.uptime)
-  const bytesPerSecond = elapsed > 0 ? (usage.rss - STARTED_AT.rss) / elapsed : 0
-  const mbPerHour = (bytesPerSecond * 3600) / (1024 * 1024)
+  const elapsed = Math.max(0, uptimeSeconds - STARTED_AT.uptime);
+  const bytesPerSecond =
+    elapsed > 0 ? (usage.rss - STARTED_AT.rss) / elapsed : 0;
+  const mbPerHour = (bytesPerSecond * 3600) / (1024 * 1024);
 
   const potentialLeaks = [
     heapStats.number_of_detached_contexts > 0 &&
       `${heapStats.number_of_detached_contexts} detached context(s) — possible component/closure leak`,
-    activeHandles > 100 && `${activeHandles} active handles — possible timer/socket leak`,
-    nativeMemory > usage.heapUsed && 'Native memory > heap — leak may be in native addons',
-    mbPerHour > 100 && `High memory growth rate: ${mbPerHour.toFixed(1)} MB/hour`,
-    openFileDescriptors && openFileDescriptors > 500 && `${openFileDescriptors} open FDs — possible file/socket leak`
-  ].filter((s): s is string => typeof s === 'string')
+    activeHandles > 100 &&
+      `${activeHandles} active handles — possible timer/socket leak`,
+    nativeMemory > usage.heapUsed &&
+      "Native memory > heap — leak may be in native addons",
+    mbPerHour > 100 &&
+      `High memory growth rate: ${mbPerHour.toFixed(1)} MB/hour`,
+    openFileDescriptors &&
+      openFileDescriptors > 500 &&
+      `${openFileDescriptors} open FDs — possible file/socket leak`,
+  ].filter((s): s is string => typeof s === "string");
 
   return {
     activeHandles,
@@ -105,7 +133,7 @@ export async function captureMemoryDiagnostics(trigger: MemoryTrigger): Promise<
       potentialLeaks,
       recommendation: potentialLeaks.length
         ? `WARNING: ${potentialLeaks.length} potential leak indicator(s). See potentialLeaks.`
-        : 'No obvious leak indicators. Inspect heap snapshot for retained objects.'
+        : "No obvious leak indicators. Inspect heap snapshot for retained objects.",
     },
     memoryGrowthRate: { bytesPerSecond, mbPerHour },
     memoryUsage: {
@@ -113,7 +141,7 @@ export async function captureMemoryDiagnostics(trigger: MemoryTrigger): Promise<
       external: usage.external,
       heapTotal: usage.heapTotal,
       heapUsed: usage.heapUsed,
-      rss: usage.rss
+      rss: usage.rss,
     },
     nodeVersion: process.version,
     openFileDescriptors,
@@ -121,65 +149,79 @@ export async function captureMemoryDiagnostics(trigger: MemoryTrigger): Promise<
     resourceUsage: {
       maxRSS: resourceUsage.maxRSS * 1024,
       systemCPUTime: resourceUsage.systemCPUTime,
-      userCPUTime: resourceUsage.userCPUTime
+      userCPUTime: resourceUsage.userCPUTime,
     },
     smapsRollup,
     timestamp: new Date().toISOString(),
     trigger,
     uptimeSeconds,
-    v8HeapSpaces: heapSpaces?.map(s => ({
+    v8HeapSpaces: heapSpaces?.map((s) => ({
       available: s.space_available_size,
       name: s.space_name,
       size: s.space_size,
-      used: s.space_used_size
+      used: s.space_used_size,
     })),
     v8HeapStats: {
       detachedContexts: heapStats.number_of_detached_contexts,
       heapSizeLimit: heapStats.heap_size_limit,
       mallocedMemory: heapStats.malloced_memory,
       nativeContexts: heapStats.number_of_native_contexts,
-      peakMallocedMemory: heapStats.peak_malloced_memory
-    }
-  }
+      peakMallocedMemory: heapStats.peak_malloced_memory,
+    },
+  };
 }
 
-export async function performHeapDump(trigger: MemoryTrigger = 'manual'): Promise<HeapDumpResult> {
+export async function performHeapDump(
+  trigger: MemoryTrigger = "manual",
+): Promise<HeapDumpResult> {
   try {
     // Diagnostics first — heap-snapshot serialization can crash on very large
     // heaps, and the JSON sidecar is the most actionable artifact if so.
-    const diagnostics = await captureMemoryDiagnostics(trigger)
-    const dir = process.env.K3CODE_HEAPDUMP_DIR?.trim() || join(homedir() || tmpdir(), '.k3code', 'heapdumps')
+    const diagnostics = await captureMemoryDiagnostics(trigger);
+    const dir =
+      process.env.K3CODE_HEAPDUMP_DIR?.trim() ||
+      join(homedir() || tmpdir(), ".k3code", "heapdumps");
 
-    await mkdir(dir, { recursive: true })
+    await mkdir(dir, { recursive: true });
 
-    const base = `k3code-${new Date().toISOString().replace(/[:.]/g, '-')}-${process.pid}-${trigger}`
-    const heapPath = join(dir, `${base}.heapsnapshot`)
-    const diagPath = join(dir, `${base}.diagnostics.json`)
+    const base = `k3code-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}-${trigger}`;
+    const heapPath = join(dir, `${base}.heapsnapshot`);
+    const diagPath = join(dir, `${base}.diagnostics.json`);
 
     // The diagnostics JSON is KB-sized and the most useful artifact when a
     // full snapshot is suppressed by the auto-heapdump opt-in gate below.
-    await writeFile(diagPath, JSON.stringify(diagnostics, null, 2), { mode: 0o600 })
+    await writeFile(diagPath, JSON.stringify(diagnostics, null, 2), {
+      mode: 0o600,
+    });
 
     // Auto triggers require explicit opt-in: multi-GiB snapshots written on
     // every threshold cross can fill the user's disk (issue #21767).
-    const isAuto = trigger === 'auto-critical' || trigger === 'auto-high'
-    const autoEnabled = /^(?:1|true|yes|on)$/i.test((process.env.K3CODE_AUTO_HEAPDUMP ?? '').trim())
+    const isAuto = trigger === "auto-critical" || trigger === "auto-high";
+    const autoEnabled = /^(?:1|true|yes|on)$/i.test(
+      (process.env.K3CODE_AUTO_HEAPDUMP ?? "").trim(),
+    );
 
     if (isAuto && !autoEnabled) {
-      await pruneHeapdumps(dir).catch(() => undefined)
+      await pruneHeapdumps(dir).catch(() => undefined);
 
       // Not an error: the dump did its job — it wrote the lightweight
       // diagnostics sidecar and intentionally skipped the heavy snapshot.
       // `heapPath` is omitted so callers/notices report diagnostics-only.
-      return { diagPath, suppressed: true, success: true }
+      return { diagPath, suppressed: true, success: true };
     }
 
-    await pipeline(getHeapSnapshot(), createWriteStream(heapPath, { mode: 0o600 }))
-    await pruneHeapdumps(dir).catch(() => undefined)
+    await pipeline(
+      getHeapSnapshot(),
+      createWriteStream(heapPath, { mode: 0o600 }),
+    );
+    await pruneHeapdumps(dir).catch(() => undefined);
 
-    return { diagPath, heapPath, success: true }
+    return { diagPath, heapPath, success: true };
   } catch (e) {
-    return { error: e instanceof Error ? e.message : String(e), success: false }
+    return {
+      error: e instanceof Error ? e.message : String(e),
+      success: false,
+    };
   }
 }
 
@@ -188,59 +230,63 @@ export async function performHeapDump(trigger: MemoryTrigger = 'manual'): Promis
 // gated auto-triggers cannot accumulate without bound. The newest file is
 // always retained even if it alone exceeds the cap.
 async function pruneHeapdumps(dir: string): Promise<void> {
-  const raw = process.env.K3CODE_HEAPDUMP_MAX_BYTES?.trim()
-  const parsed = raw ? Number(raw) : NaN
-  const cap = Number.isFinite(parsed) && parsed > 0 ? parsed : 2 * 1024 ** 3
+  const raw = process.env.K3CODE_HEAPDUMP_MAX_BYTES?.trim();
+  const parsed = raw ? Number(raw) : NaN;
+  const cap = Number.isFinite(parsed) && parsed > 0 ? parsed : 2 * 1024 ** 3;
 
-  const names = await readdir(dir)
+  const names = await readdir(dir);
 
   const stats = await Promise.all(
-    names.map(async name => {
-      const path = join(dir, name)
-      const s = await stat(path).catch(() => null)
+    names.map(async (name) => {
+      const path = join(dir, name);
+      const s = await stat(path).catch(() => null);
 
-      return s && s.isFile() ? { mtimeMs: s.mtimeMs, path, size: s.size } : null
-    })
-  )
+      return s && s.isFile()
+        ? { mtimeMs: s.mtimeMs, path, size: s.size }
+        : null;
+    }),
+  );
 
-  const valid = stats.filter((s): s is { mtimeMs: number; path: string; size: number } => s !== null)
+  const valid = stats.filter(
+    (s): s is { mtimeMs: number; path: string; size: number } => s !== null,
+  );
 
-  valid.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  valid.sort((a, b) => b.mtimeMs - a.mtimeMs);
 
-  let total = valid.reduce((acc, s) => acc + s.size, 0)
+  let total = valid.reduce((acc, s) => acc + s.size, 0);
 
   while (total > cap && valid.length > 1) {
-    const oldest = valid.pop()
+    const oldest = valid.pop();
 
     if (!oldest) {
-      break
+      break;
     }
 
-    await unlink(oldest.path).catch(() => undefined)
-    total -= oldest.size
+    await unlink(oldest.path).catch(() => undefined);
+    total -= oldest.size;
   }
 }
 
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) {
-    return '0B'
+    return "0B";
   }
 
-  const exp = Math.min(UNITS.length - 1, Math.floor(Math.log10(bytes) / 3))
-  const value = bytes / 1024 ** exp
+  const exp = Math.min(UNITS.length - 1, Math.floor(Math.log10(bytes) / 3));
+  const value = bytes / 1024 ** exp;
 
-  return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)}${UNITS[exp]}`
+  return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)}${UNITS[exp]}`;
 }
 
-const UNITS = ['B', 'KB', 'MB', 'GB', 'TB']
+const UNITS = ["B", "KB", "MB", "GB", "TB"];
 
-const STARTED_AT = { rss: process.memoryUsage().rss, uptime: process.uptime() }
+const STARTED_AT = { rss: process.memoryUsage().rss, uptime: process.uptime() };
 
 // Returns undefined when the probe isn't available (non-Linux paths, sandboxed FS).
 const swallow = async <T>(fn: () => Promise<T>): Promise<T | undefined> => {
   try {
-    return await fn()
+    return await fn();
   } catch {
-    return undefined
+    return undefined;
   }
-}
+};

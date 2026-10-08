@@ -1,32 +1,45 @@
-import { expect, it } from 'vitest'
+import { expect, it } from "vitest";
 
-import { rosterViewport, sendAgentSteer } from '../components/agentControls.js'
-import type { GatewayClient } from '../gatewayClient.js'
+import { rosterViewport, sendAgentSteer } from "../components/agentControls.js";
+import type { GatewayClient } from "../gatewayClient.js";
 
-it('reports queued acceptance rather than claiming delivery and preserves rejected text', async () => {
-  const calls: unknown[] = []
+it("reports queued acceptance rather than claiming delivery and preserves rejected text", async () => {
+  const calls: unknown[] = [];
 
   const gw = {
     request: async (...args: unknown[]) => {
-      calls.push(args)
+      calls.push(args);
 
-      return { status: 'queued' }
-    }
-  } as unknown as GatewayClient
+      return { status: "queued" };
+    },
+  } as unknown as GatewayClient;
 
-  expect((await sendAgentSteer(gw, 'owner', 'child', 'check tests')).accepted).toBe(true)
-  expect(calls).toEqual([['subagent.steer', { session_id: 'owner', subagent_id: 'child', text: 'check tests' }]])
-  const rejected = { request: async () => ({ status: 'rejected' }) } as unknown as GatewayClient
-  expect((await sendAgentSteer(rejected, 'owner', 'child', 'check tests')).accepted).toBe(false)
-})
+  expect(
+    (await sendAgentSteer(gw, "owner", "child", "check tests")).accepted,
+  ).toBe(true);
+  expect(calls).toEqual([
+    [
+      "subagent.steer",
+      { session_id: "owner", subagent_id: "child", text: "check tests" },
+    ],
+  ]);
+  const rejected = {
+    request: async () => ({ status: "rejected" }),
+  } as unknown as GatewayClient;
+  expect(
+    (await sendAgentSteer(rejected, "owner", "child", "check tests")).accepted,
+  ).toBe(false);
+});
 
-it('keeps every roster selection in the visible viewport including short terminals', () => {
+it("keeps every roster selection in the visible viewport including short terminals", () => {
   for (const height of [10, 14, 24, 40]) {
     for (const cursor of [0, 9, 19]) {
-      const view = rosterViewport(height, 20, cursor)
-      expect(view.start).toBeLessThanOrEqual(cursor)
-      expect(view.start + view.rows).toBeGreaterThan(cursor)
-      expect(view.rows + (view.timelineRows ? view.timelineRows + 4 : 0) + 7).toBeLessThanOrEqual(height)
+      const view = rosterViewport(height, 20, cursor);
+      expect(view.start).toBeLessThanOrEqual(cursor);
+      expect(view.start + view.rows).toBeGreaterThan(cursor);
+      expect(
+        view.rows + (view.timelineRows ? view.timelineRows + 4 : 0) + 7,
+      ).toBeLessThanOrEqual(height);
     }
   }
-})
+});

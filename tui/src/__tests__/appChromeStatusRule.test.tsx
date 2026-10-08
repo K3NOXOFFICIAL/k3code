@@ -1,156 +1,181 @@
-import React from 'react'
-import { describe, expect, it, vi } from 'vitest'
+import React from "react";
+import { describe, expect, it, vi } from "vitest";
 
-import { StatusRule } from '../components/appChrome.js'
-import { DEFAULT_THEME } from '../theme.js'
+import { StatusRule } from "../components/appChrome.js";
+import { DEFAULT_THEME } from "../theme.js";
 
-type ReactNodeLike = React.ReactNode
+type ReactNodeLike = React.ReactNode;
 
 const textContent = (node: ReactNodeLike): string => {
-  if (node === null || node === undefined || typeof node === 'boolean') {
-    return ''
+  if (node === null || node === undefined || typeof node === "boolean") {
+    return "";
   }
 
-  if (typeof node === 'string' || typeof node === 'number') {
-    return String(node)
+  if (typeof node === "string" || typeof node === "number") {
+    return String(node);
   }
 
   if (Array.isArray(node)) {
-    return node.map(textContent).join('')
+    return node.map(textContent).join("");
   }
 
   if (React.isValidElement(node)) {
-    return textContent(node.props.children)
+    return textContent(node.props.children);
   }
 
-  return ''
-}
+  return "";
+};
 
-const findClickableWithText = (node: ReactNodeLike, needle: string): React.ReactElement | null => {
-  if (node === null || node === undefined || typeof node === 'boolean') {
-    return null
+const findClickableWithText = (
+  node: ReactNodeLike,
+  needle: string,
+): React.ReactElement | null => {
+  if (node === null || node === undefined || typeof node === "boolean") {
+    return null;
   }
 
   if (Array.isArray(node)) {
     for (const child of node) {
-      const found = findClickableWithText(child, needle)
+      const found = findClickableWithText(child, needle);
 
       if (found) {
-        return found
+        return found;
       }
     }
 
-    return null
+    return null;
   }
 
   if (!React.isValidElement(node)) {
-    return null
+    return null;
   }
 
-  if (typeof node.props.onClick === 'function' && textContent(node).includes(needle)) {
-    return node
+  if (
+    typeof node.props.onClick === "function" &&
+    textContent(node).includes(needle)
+  ) {
+    return node;
   }
 
-  return findClickableWithText(node.props.children, needle)
-}
+  return findClickableWithText(node.props.children, needle);
+};
 
 // Find the innermost element whose own (direct) text content includes the
 // needle. Used to assert the colour the session title is rendered with.
-const findElementWithText = (node: ReactNodeLike, needle: string): React.ReactElement | null => {
-  if (node === null || node === undefined || typeof node === 'boolean') {
-    return null
+const findElementWithText = (
+  node: ReactNodeLike,
+  needle: string,
+): React.ReactElement | null => {
+  if (node === null || node === undefined || typeof node === "boolean") {
+    return null;
   }
 
   if (Array.isArray(node)) {
     for (const child of node) {
-      const found = findElementWithText(child, needle)
+      const found = findElementWithText(child, needle);
 
       if (found) {
-        return found
+        return found;
       }
     }
 
-    return null
+    return null;
   }
 
   if (!React.isValidElement(node)) {
-    return null
+    return null;
   }
 
   // Prefer the deepest matching element so we get the leaf <Text> that
   // actually carries the colour, not an ancestor Box.
-  const deeper = findElementWithText(node.props.children, needle)
+  const deeper = findElementWithText(node.props.children, needle);
 
   if (deeper) {
-    return deeper
+    return deeper;
   }
 
-  return textContent(node).includes(needle) ? node : null
-}
+  return textContent(node).includes(needle) ? node : null;
+};
 
 const baseProps = {
   bgCount: 0,
   busy: false,
   cols: 100,
-  cwdLabel: '~/repo',
+  cwdLabel: "~/repo",
   liveSessionCount: 0,
-  model: 'opus-4.8',
+  model: "opus-4.8",
   sessionStartedAt: null,
-  status: 'ready',
+  status: "ready",
   statusColor: DEFAULT_THEME.color.ok,
   t: DEFAULT_THEME,
   turnStartedAt: null,
-  usage: { context_max: 200_000, context_percent: 25, context_used: 50_000, total: 50_000 },
+  usage: {
+    context_max: 200_000,
+    context_percent: 25,
+    context_used: 50_000,
+    total: 50_000,
+  },
+};
 
-}
-
-describe('StatusRule model label', () => {
-  it('shows a clamped effort as what the route sends, never as a distinct level (#61634)', () => {
+describe("StatusRule model label", () => {
+  it("shows a clamped effort as what the route sends, never as a distinct level (#61634)", () => {
     const clamped = textContent(
-      StatusRule({ ...baseProps, modelReasoningEffort: 'ultra', modelReasoningEffortWire: 'max' })
-    )
+      StatusRule({
+        ...baseProps,
+        modelReasoningEffort: "ultra",
+        modelReasoningEffortWire: "max",
+      }),
+    );
 
-    expect(clamped).toContain('ultra→max')
+    expect(clamped).toContain("ultra→max");
     // Verbatim (or not-yet-stamped) wire levels make no claim.
     expect(
-      textContent(StatusRule({ ...baseProps, modelReasoningEffort: 'high', modelReasoningEffortWire: 'high' }))
-    ).toContain('opus 4.8 high')
-    expect(textContent(StatusRule({ ...baseProps, modelReasoningEffort: 'ultra' }))).toContain('opus 4.8 ultra')
-  })
-})
+      textContent(
+        StatusRule({
+          ...baseProps,
+          modelReasoningEffort: "high",
+          modelReasoningEffortWire: "high",
+        }),
+      ),
+    ).toContain("opus 4.8 high");
+    expect(
+      textContent(StatusRule({ ...baseProps, modelReasoningEffort: "ultra" })),
+    ).toContain("opus 4.8 ultra");
+  });
+});
 
-describe('StatusRule session title', () => {
-  it('marks only estimated context occupancy at every visible width', () => {
+describe("StatusRule session title", () => {
+  it("marks only estimated context occupancy at every visible width", () => {
     for (const cols of [80, 120, 200]) {
       for (const estimated of [true, false]) {
         const text = textContent(
           StatusRule({
             ...baseProps,
             cols,
-            statusBarFields: new Set(['context_detail']),
-            usage: { ...baseProps.usage, context_estimated: estimated }
-          })
-        )
+            statusBarFields: new Set(["context_detail"]),
+            usage: { ...baseProps.usage, context_estimated: estimated },
+          }),
+        );
 
-        const context = text.match(/(~?\d+(?:\.\d+)?k(?:\/\d+k| tok))/)?.[1]
+        const context = text.match(/(~?\d+(?:\.\d+)?k(?:\/\d+k| tok))/)?.[1];
 
-        expect(context, `context must render at ${cols} columns`).toBeTruthy()
-        expect(context?.startsWith('~')).toBe(estimated)
+        expect(context, `context must render at ${cols} columns`).toBeTruthy();
+        expect(context?.startsWith("~")).toBe(estimated);
       }
     }
-  })
+  });
 
-  it('pins the named session at the far-right edge instead of the cwd label', () => {
+  it("pins the named session at the far-right edge instead of the cwd label", () => {
     const element = StatusRule({
       ...baseProps,
-      sessionTitle: 'weekly-digest'
-    })
+      sessionTitle: "weekly-digest",
+    });
 
-    const rendered = textContent(element)
-    const title = findElementWithText(element, 'weekly-digest')
+    const rendered = textContent(element);
+    const title = findElementWithText(element, "weekly-digest");
 
-    expect(rendered).toContain('weekly-digest')
-    expect(rendered).not.toContain('~/repo')
+    expect(rendered).toContain("weekly-digest");
+    expect(rendered).not.toContain("~/repo");
     // Regression for issue #82465: a raw, full-saturation accent-hue
     // background (e.g. #FFBF00 on DARK_SEEDS) paired with statusFg (a
     // near-white tone never designed to sit on it) rendered at roughly a
@@ -158,57 +183,57 @@ describe('StatusRule session title', () => {
     // the accent color goes on the text instead, matching the theme's
     // own convention that a raw accent hue is never used as a solid
     // fill elsewhere (fills are always softened, e.g. activeRow).
-    expect(title?.props.backgroundColor).toBeUndefined()
-    expect(title?.props.color).toBe(DEFAULT_THEME.color.accent)
-  })
-})
+    expect(title?.props.backgroundColor).toBeUndefined();
+    expect(title?.props.color).toBe(DEFAULT_THEME.color.accent);
+  });
+});
 
-describe('StatusRule background-subagent indicator', () => {
-  it('renders ⛓ N on a wide terminal when subagents are running', () => {
+describe("StatusRule background-subagent indicator", () => {
+  it("renders ⛓ N on a wide terminal when subagents are running", () => {
     const element = StatusRule({
       ...baseProps,
-      usage: { ...baseProps.usage, active_subagents: 3 }
-    })
+      usage: { ...baseProps.usage, active_subagents: 3 },
+    });
 
-    expect(textContent(element)).toContain('⛓ 3')
-  })
+    expect(textContent(element)).toContain("⛓ 3");
+  });
 
-  it('omits the segment when no subagents are running', () => {
+  it("omits the segment when no subagents are running", () => {
     const element = StatusRule({
       ...baseProps,
-      usage: { ...baseProps.usage, active_subagents: 0 }
-    })
+      usage: { ...baseProps.usage, active_subagents: 0 },
+    });
 
-    expect(textContent(element)).not.toContain('⛓')
-  })
+    expect(textContent(element)).not.toContain("⛓");
+  });
 
-  it('spells out the auto-resume hint when idle with subagents in flight', () => {
+  it("spells out the auto-resume hint when idle with subagents in flight", () => {
     const element = StatusRule({
       ...baseProps,
-      usage: { ...baseProps.usage, active_subagents: 1 }
-    })
+      usage: { ...baseProps.usage, active_subagents: 1 },
+    });
 
-    expect(textContent(element)).toContain('resumes when')
-  })
+    expect(textContent(element)).toContain("resumes when");
+  });
 
-  it('hides the resume hint mid-turn (a busy turn owns the indicator)', () => {
+  it("hides the resume hint mid-turn (a busy turn owns the indicator)", () => {
     const element = StatusRule({
       ...baseProps,
       busy: true,
       turnStartedAt: Date.now(),
-      usage: { ...baseProps.usage, active_subagents: 2 }
-    })
+      usage: { ...baseProps.usage, active_subagents: 2 },
+    });
 
-    expect(textContent(element)).not.toContain('resumes when')
-  })
+    expect(textContent(element)).not.toContain("resumes when");
+  });
 
-  it('omits the resume hint when no subagents are running', () => {
-    const element = StatusRule({ ...baseProps })
+  it("omits the resume hint when no subagents are running", () => {
+    const element = StatusRule({ ...baseProps });
 
-    expect(textContent(element)).not.toContain('resumes when')
-  })
+    expect(textContent(element)).not.toContain("resumes when");
+  });
 
-  it('drops the subagent segment before the bg segment on a narrow terminal', () => {
+  it("drops the subagent segment before the bg segment on a narrow terminal", () => {
     // cols=44 is below the subagents breakpoint (92) but the bg breakpoint
     // (88) too — both gone. Assert the lower-priority subagent indicator is
     // not shown when space is tight even with a live count.
@@ -216,52 +241,51 @@ describe('StatusRule background-subagent indicator', () => {
       ...baseProps,
       cols: 44,
       bgCount: 1,
-      usage: { ...baseProps.usage, active_subagents: 2 }
-    })
+      usage: { ...baseProps.usage, active_subagents: 2 },
+    });
 
-    expect(textContent(element)).not.toContain('⛓')
-  })
-})
+    expect(textContent(element)).not.toContain("⛓");
+  });
+});
 
-describe('StatusRule session count click target', () => {
-  it('makes the live session count itself clickable', () => {
-    const openSwitcher = vi.fn()
+describe("StatusRule session count click target", () => {
+  it("makes the live session count itself clickable", () => {
+    const openSwitcher = vi.fn();
 
     const element = StatusRule({
       bgCount: 0,
       busy: false,
       cols: 100,
-      cwdLabel: '~/repo',
+      cwdLabel: "~/repo",
       liveSessionCount: 1,
-      model: 'kimi-k2.6',
+      model: "kimi-k2.6",
       onSessionCountClick: openSwitcher,
       sessionStartedAt: null,
-      status: 'ready',
+      status: "ready",
       statusColor: DEFAULT_THEME.color.ok,
       t: DEFAULT_THEME,
       turnStartedAt: null,
       usage: { total: 0 },
+    });
 
-    })
+    const clickableSessionCount = findClickableWithText(element, "1 session");
 
-    const clickableSessionCount = findClickableWithText(element, '1 session')
+    expect(clickableSessionCount).not.toBeNull();
+    clickableSessionCount!.props.onClick({ stopImmediatePropagation: vi.fn() });
+    expect(openSwitcher).toHaveBeenCalledOnce();
+  });
 
-    expect(clickableSessionCount).not.toBeNull()
-    clickableSessionCount!.props.onClick({ stopImmediatePropagation: vi.fn() })
-    expect(openSwitcher).toHaveBeenCalledOnce()
-  })
-
-  it('keeps status + model and drops the low-value tail on a narrow terminal', () => {
+  it("keeps status + model and drops the low-value tail on a narrow terminal", () => {
     const element = StatusRule({
       bgCount: 0,
       busy: false,
       cols: 44,
-      cwdLabel: '~/src/hermes-agent/apps/desktop (bb/tui-statusbar-responsive)',
+      cwdLabel: "~/src/hermes-agent/apps/desktop (bb/tui-statusbar-responsive)",
       liveSessionCount: 3,
-      model: 'opus-4.8',
+      model: "opus-4.8",
       onSessionCountClick: vi.fn(),
       sessionStartedAt: Date.now() - 60_000,
-      status: 'ready',
+      status: "ready",
       statusColor: DEFAULT_THEME.color.ok,
       t: DEFAULT_THEME,
       turnStartedAt: null,
@@ -272,160 +296,187 @@ describe('StatusRule session count click target', () => {
         context_used: 50_000,
         input: 0,
         output: 0,
-        total: 50_000
+        total: 50_000,
       },
+    });
 
-    })
-
-    const rendered = textContent(element)
+    const rendered = textContent(element);
 
     // Must-keep essentials survive intact …
-    expect(rendered).toContain('ready')
-    expect(rendered).toContain('opus 4.8')
+    expect(rendered).toContain("ready");
+    expect(rendered).toContain("opus 4.8");
     // … while the low-value tail (session count) is dropped, not truncated.
-    expect(rendered).not.toContain('3 sessions')
-  })
-})
+    expect(rendered).not.toContain("3 sessions");
+  });
+});
 
-describe('StatusRule credits notice render priority', () => {
-  it('replaces the idle status with the notice text and keeps model + context', () => {
+describe("StatusRule credits notice render priority", () => {
+  it("replaces the idle status with the notice text and keeps model + context", () => {
     const element = StatusRule({
       ...baseProps,
-      notice: { key: 'credits.depleted', kind: 'sticky', level: 'error', text: '✕ credits exhausted' }
-    })
+      notice: {
+        key: "credits.depleted",
+        kind: "sticky",
+        level: "error",
+        text: "✕ credits exhausted",
+      },
+    });
 
-    const rendered = textContent(element)
+    const rendered = textContent(element);
 
     // Notice replaces the status verb slot …
-    expect(rendered).toContain('✕ credits exhausted')
-    expect(rendered).not.toContain('ready')
+    expect(rendered).toContain("✕ credits exhausted");
+    expect(rendered).not.toContain("ready");
     // … but model + context stay visible.
-    expect(rendered).toContain('opus 4.8')
-    expect(rendered).toContain('50k')
-  })
+    expect(rendered).toContain("opus 4.8");
+    expect(rendered).toContain("50k");
+  });
 
-  it('busy wins: the FaceTicker shows, the notice is hidden mid-turn', () => {
+  it("busy wins: the FaceTicker shows, the notice is hidden mid-turn", () => {
     const element = StatusRule({
       ...baseProps,
       busy: true,
-      notice: { key: 'credits.90', kind: 'sticky', level: 'warn', text: '⚠ 90% used' },
-      turnStartedAt: Date.now()
-    })
+      notice: {
+        key: "credits.90",
+        kind: "sticky",
+        level: "warn",
+        text: "⚠ 90% used",
+      },
+      turnStartedAt: Date.now(),
+    });
 
-    const rendered = textContent(element)
+    const rendered = textContent(element);
 
     // Notice must NOT render while busy.
-    expect(rendered).not.toContain('⚠ 90% used')
+    expect(rendered).not.toContain("⚠ 90% used");
     // Model still visible.
-    expect(rendered).toContain('opus 4.8')
-  })
-})
+    expect(rendered).toContain("opus 4.8");
+  });
+});
 
-describe('StatusRule battery indicator', () => {
-  it('renders the battery label with a battery glyph on AC-off', () => {
+describe("StatusRule battery indicator", () => {
+  it("renders the battery label with a battery glyph on AC-off", () => {
     const element = StatusRule({
       ...baseProps,
-      battery: { available: true, category: 'good', percent: 82, plugged: false }
-    })
+      battery: {
+        available: true,
+        category: "good",
+        percent: 82,
+        plugged: false,
+      },
+    });
 
-    expect(textContent(element)).toContain('🔋 82%')
-  })
+    expect(textContent(element)).toContain("🔋 82%");
+  });
 
-  it('uses a bolt glyph while charging', () => {
+  it("uses a bolt glyph while charging", () => {
     const element = StatusRule({
       ...baseProps,
-      battery: { available: true, category: 'good', percent: 82, plugged: true }
-    })
+      battery: {
+        available: true,
+        category: "good",
+        percent: 82,
+        plugged: true,
+      },
+    });
 
-    expect(textContent(element)).toContain('⚡ 82%')
-  })
+    expect(textContent(element)).toContain("⚡ 82%");
+  });
 
-  it('omits the segment when battery is null', () => {
-    const element = StatusRule({ ...baseProps, battery: null })
+  it("omits the segment when battery is null", () => {
+    const element = StatusRule({ ...baseProps, battery: null });
 
-    expect(textContent(element)).not.toContain('🔋')
-  })
+    expect(textContent(element)).not.toContain("🔋");
+  });
 
-  it('omits the segment when no battery is available (desktop/server)', () => {
+  it("omits the segment when no battery is available (desktop/server)", () => {
     const element = StatusRule({
       ...baseProps,
-      battery: { available: false, category: 'dim', percent: null, plugged: null }
-    })
+      battery: {
+        available: false,
+        category: "dim",
+        percent: null,
+        plugged: null,
+      },
+    });
 
-    expect(textContent(element)).not.toContain('🔋')
-  })
-})
+    expect(textContent(element)).not.toContain("🔋");
+  });
+});
 
-describe('StatusRule idle-since read-out', () => {
+describe("StatusRule idle-since read-out", () => {
   // The IdleSince component uses hooks, so it can't be invoked outside a
   // renderer — assert on the element tree instead (same reason the duration
   // tests don't check SessionDuration's text).
-  const findComponentByName = (node: ReactNodeLike, name: string): React.ReactElement | null => {
-    if (node === null || node === undefined || typeof node === 'boolean') {
-      return null
+  const findComponentByName = (
+    node: ReactNodeLike,
+    name: string,
+  ): React.ReactElement | null => {
+    if (node === null || node === undefined || typeof node === "boolean") {
+      return null;
     }
 
     if (Array.isArray(node)) {
       for (const child of node) {
-        const found = findComponentByName(child, name)
+        const found = findComponentByName(child, name);
 
         if (found) {
-          return found
+          return found;
         }
       }
 
-      return null
+      return null;
     }
 
     if (!React.isValidElement(node)) {
-      return null
+      return null;
     }
 
-    if (typeof node.type === 'function' && node.type.name === name) {
-      return node
+    if (typeof node.type === "function" && node.type.name === name) {
+      return node;
     }
 
-    return findComponentByName(node.props.children, name)
-  }
+    return findComponentByName(node.props.children, name);
+  };
 
-  it('shows time since the last final agent response when idle', () => {
-    const endedAt = Date.now() - 42_000
+  it("shows time since the last final agent response when idle", () => {
+    const endedAt = Date.now() - 42_000;
 
     const element = StatusRule({
       ...baseProps,
       lastTurnEndedAt: endedAt,
-      sessionStartedAt: Date.now() - 60_000
-    })
+      sessionStartedAt: Date.now() - 60_000,
+    });
 
-    const idle = findComponentByName(element, 'IdleSince')
+    const idle = findComponentByName(element, "IdleSince");
 
-    expect(idle).not.toBeNull()
-    expect(idle!.props.endedAt).toBe(endedAt)
-  })
+    expect(idle).not.toBeNull();
+    expect(idle!.props.endedAt).toBe(endedAt);
+  });
 
-  it('is hidden while a turn is busy', () => {
+  it("is hidden while a turn is busy", () => {
     const element = StatusRule({
       ...baseProps,
       busy: true,
       lastTurnEndedAt: Date.now() - 42_000,
-      turnStartedAt: Date.now()
-    })
+      turnStartedAt: Date.now(),
+    });
 
-    expect(findComponentByName(element, 'IdleSince')).toBeNull()
-  })
+    expect(findComponentByName(element, "IdleSince")).toBeNull();
+  });
 
-  it('is hidden before the first turn completes', () => {
+  it("is hidden before the first turn completes", () => {
     const element = StatusRule({
       ...baseProps,
       lastTurnEndedAt: null,
-      sessionStartedAt: Date.now() - 60_000
-    })
+      sessionStartedAt: Date.now() - 60_000,
+    });
 
-    expect(findComponentByName(element, 'IdleSince')).toBeNull()
-  })
-})
+    expect(findComponentByName(element, "IdleSince")).toBeNull();
+  });
+});
 
-describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
+describe("StatusRule perf read-outs (cache hit / latency / tps)", () => {
   const perfUsage = {
     ...baseProps.usage,
     avg_latency_s: 3.2,
@@ -433,50 +484,50 @@ describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
     cache_hit_pct: 87,
     calls: 4,
     input: 1000,
-    output: 500
-  }
+    output: 500,
+  };
 
-  it('renders all three segments on a wide terminal', () => {
-    const element = StatusRule({ ...baseProps, cols: 160, usage: perfUsage })
-    const rendered = textContent(element)
+  it("renders all three segments on a wide terminal", () => {
+    const element = StatusRule({ ...baseProps, cols: 160, usage: perfUsage });
+    const rendered = textContent(element);
 
-    expect(rendered).toContain('◎ 87%')
-    expect(rendered).toContain('◷ 3.2s')
-    expect(rendered).toContain('↑ 50 t/s')
-  })
+    expect(rendered).toContain("◎ 87%");
+    expect(rendered).toContain("◷ 3.2s");
+    expect(rendered).toContain("↑ 50 t/s");
+  });
 
-  it('self-hides when the server omits the keys', () => {
-    const element = StatusRule({ ...baseProps, cols: 160 })
-    const rendered = textContent(element)
+  it("self-hides when the server omits the keys", () => {
+    const element = StatusRule({ ...baseProps, cols: 160 });
+    const rendered = textContent(element);
 
-    expect(rendered).not.toContain('◎')
-    expect(rendered).not.toContain('◷')
-    expect(rendered).not.toContain('t/s')
-  })
+    expect(rendered).not.toContain("◎");
+    expect(rendered).not.toContain("◷");
+    expect(rendered).not.toContain("t/s");
+  });
 
-  it('honors the display.status_bar.fields visibility filter', () => {
+  it("honors the display.status_bar.fields visibility filter", () => {
     const element = StatusRule({
       ...baseProps,
       cols: 160,
-      statusBarFields: new Set(['model', 'context_pct', 'cache_hit']),
-      usage: perfUsage
-    })
+      statusBarFields: new Set(["model", "context_pct", "cache_hit"]),
+      usage: perfUsage,
+    });
 
-    const rendered = textContent(element)
+    const rendered = textContent(element);
 
-    expect(rendered).toContain('◎ 87%')
-    expect(rendered).not.toContain('◷')
-    expect(rendered).not.toContain('t/s')
-  })
+    expect(rendered).toContain("◎ 87%");
+    expect(rendered).not.toContain("◷");
+    expect(rendered).not.toContain("t/s");
+  });
 
-  it('hides the session title badge when the fields filter omits title', () => {
+  it("hides the session title badge when the fields filter omits title", () => {
     const element = StatusRule({
       ...baseProps,
       cols: 160,
-      sessionTitle: 'weekly-digest',
-      statusBarFields: new Set(['model', 'context_pct'])
-    })
+      sessionTitle: "weekly-digest",
+      statusBarFields: new Set(["model", "context_pct"]),
+    });
 
-    expect(textContent(element)).not.toContain('weekly-digest')
-  })
-})
+    expect(textContent(element)).not.toContain("weekly-digest");
+  });
+});

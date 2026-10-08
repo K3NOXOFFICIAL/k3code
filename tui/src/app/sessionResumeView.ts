@@ -1,41 +1,44 @@
-import type { ScrollBoxHandle } from '@k3code/ink'
-import { evictInkCaches, forceRedraw } from '@k3code/ink'
-import type { RefObject } from 'react'
+import type { ScrollBoxHandle } from "@k3code/ink";
+import { evictInkCaches, forceRedraw } from "@k3code/ink";
+import type { RefObject } from "react";
 
-export const refreshSessionView = (stdout: NodeJS.WriteStream = process.stdout) => {
-  evictInkCaches('all')
-  forceRedraw(stdout)
-}
+export const refreshSessionView = (
+  stdout: NodeJS.WriteStream = process.stdout,
+) => {
+  evictInkCaches("all");
+  forceRedraw(stdout);
+};
 
 export const scheduleResumeScrollToBottom = (
   scrollRef: RefObject<null | ScrollBoxHandle>,
-  delays: readonly number[] = [0, 80, 240]
+  delays: readonly number[] = [0, 80, 240],
 ) => {
-  const startedAt = Date.now()
+  const startedAt = Date.now();
 
   const timers = delays.map((delay, index) =>
     setTimeout(() => {
-      const scroll = scrollRef.current
+      const scroll = scrollRef.current;
 
       if (!scroll) {
-        return
+        return;
       }
 
-      const manuallyScrolledAfterResume = scroll.getLastManualScrollAt() > startedAt
+      const manuallyScrolledAfterResume =
+        scroll.getLastManualScrollAt() > startedAt;
 
       if (!manuallyScrolledAfterResume && (index === 0 || scroll.isSticky())) {
-        scroll.scrollToBottom()
+        scroll.scrollToBottom();
 
         if (index === 0) {
-          refreshSessionView()
+          refreshSessionView();
         }
       }
-    }, delay)
-  )
+    }, delay),
+  );
 
   return () => {
     for (const timer of timers) {
-      clearTimeout(timer)
+      clearTimeout(timer);
     }
-  }
-}
+  };
+};

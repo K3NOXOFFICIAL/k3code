@@ -1,21 +1,21 @@
-import type { Key } from '@k3code/ink'
-import type { ReactNode } from 'react'
+import type { Key } from "@k3code/ink";
+import type { ReactNode } from "react";
 
-import type { Theme } from '../theme.js'
+import type { Theme } from "../theme.js";
 
 /** One keypress, as the input pipeline delivers it. */
 export interface WidgetInput {
-  ch: string
-  key: Key
+  ch: string;
+  key: Key;
 }
 
 export interface WidgetRenderCtx<S> {
   /** Terminal columns available to the app. */
-  cols: number
+  cols: number;
   /** Terminal rows available to the app. */
-  rows: number
-  state: S
-  t: Theme
+  rows: number;
+  state: S;
+  t: Theme;
 }
 
 /**
@@ -34,24 +34,24 @@ export interface WidgetRenderCtx<S> {
  *   placement and theming stay engine-derived.
  */
 export interface WidgetApp<S = unknown> {
-  id: string
+  id: string;
   /** One-line description — surfaces in `/` completions and command help. */
-  help: string
+  help: string;
   /**
    * `modal` (default): owns every keypress, blocks the composer.
    * `ambient`: glanceable panel — no input capture, no blocking; launching
    * the same id again toggles it closed.
    */
-  mode?: 'ambient' | 'modal'
+  mode?: "ambient" | "modal";
   /** Ambient placement — see AmbientZone. Default `dock-bottom`. */
-  zone?: AmbientZone
+  zone?: AmbientZone;
   /** Card width in cells (ambient). Floats RESERVE this as a transcript
    *  rail, so match your Dialog width. Default 44. */
-  width?: number
-  init(arg: string): null | S
-  reduce(state: S, input: WidgetInput): null | S
-  render(ctx: WidgetRenderCtx<S>): ReactNode
-  usage?: string
+  width?: number;
+  init(arg: string): null | S;
+  reduce(state: S, input: WidgetInput): null | S;
+  render(ctx: WidgetRenderCtx<S>): ReactNode;
+  usage?: string;
 }
 
 /**
@@ -70,14 +70,23 @@ export interface WidgetApp<S = unknown> {
  * Users phrase placement loosely ("top right", "pin it above the status
  * bar") — map words to the nearest zone; corners mean floats.
  */
-export type AmbientZone = 'bottom-left' | 'bottom-right' | 'dock-bottom' | 'dock-top' | 'top-left' | 'top-right'
+export type AmbientZone =
+  | "bottom-left"
+  | "bottom-right"
+  | "dock-bottom"
+  | "dock-top"
+  | "top-left"
+  | "top-right";
 
 /** The host's serializable record of the active app. */
 export interface ActiveWidget {
-  appId: string
-  state: unknown
+  appId: string;
+  state: unknown;
 }
 
 /** Ctrl+<letter> test, shared so app reducers match the core pipeline. */
-export const isCtrl = (key: { ctrl: boolean }, ch: string, target: string): boolean =>
-  key.ctrl && ch.toLowerCase() === target
+export const isCtrl = (
+  key: { ctrl: boolean },
+  ch: string,
+  target: string,
+): boolean => key.ctrl && ch.toLowerCase() === target;

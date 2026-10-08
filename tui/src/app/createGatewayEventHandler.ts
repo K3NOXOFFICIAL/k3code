@@ -1,39 +1,75 @@
-import { execFile } from 'child_process'
+import { execFile } from "child_process";
 
-import { forceRedraw, onTerminalBackground, onTerminalForeground } from '@k3code/ink'
-import { stripAnsi } from '@k3code/shared/ansi'
-import { relativeLuminance } from '@k3code/shared/color'
-import type { StreamDeltaPayload, SubagentStatus, Usage } from '@k3code/shared/gateway-events'
+import {
+  forceRedraw,
+  onTerminalBackground,
+  onTerminalForeground,
+} from "@k3code/ink";
+import { stripAnsi } from "@k3code/shared/ansi";
+import { relativeLuminance } from "@k3code/shared/color";
+import type {
+  StreamDeltaPayload,
+  SubagentStatus,
+  Usage,
+} from "@k3code/shared/gateway-events";
 
-import { STARTUP_IMAGE, STARTUP_QUERY } from '../config/env.js'
-import { STREAM_BATCH_MS } from '../config/timing.js'
-import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
+import { STARTUP_IMAGE, STARTUP_QUERY } from "../config/env.js";
+import { STREAM_BATCH_MS } from "../config/timing.js";
+import {
+  buildSetupRequiredSections,
+  SETUP_REQUIRED_TITLE,
+} from "../content/setup.js";
 import type {
   AnyGatewayEvent,
   CommandsCatalogResponse,
   ConfigFullResponse,
   DelegationStatusResponse,
   GatewaySkin,
-  SessionMostRecentResponse
-} from '../gatewayTypes.js'
-import { rpcErrorMessage } from '../lib/rpc.js'
-import { topLevelSubagents } from '../lib/subagentTree.js'
-import { isPaintableHex, setTerminalBackground, setTerminalForeground } from '../lib/terminalModes.js'
-import { formatAbandonedClarify, formatAbandonedClarifyBatch, formatToolCall } from '../lib/text.js'
-import { bootSeededPin, invalidateBootBackground, writeBootTheme } from '../lib/themeBoot.js'
-import { defaultThemeForCurrentBackground, fromSkin, skinIsLight, type Theme, themeToneHex } from '../theme.js'
-import type { Msg, SessionInfo, SubagentProgress } from '../types.js'
+  SessionMostRecentResponse,
+} from "../gatewayTypes.js";
+import { rpcErrorMessage } from "../lib/rpc.js";
+import { topLevelSubagents } from "../lib/subagentTree.js";
+import {
+  isPaintableHex,
+  setTerminalBackground,
+  setTerminalForeground,
+} from "../lib/terminalModes.js";
+import {
+  formatAbandonedClarify,
+  formatAbandonedClarifyBatch,
+  formatToolCall,
+} from "../lib/text.js";
+import {
+  bootSeededPin,
+  invalidateBootBackground,
+  writeBootTheme,
+} from "../lib/themeBoot.js";
+import {
+  defaultThemeForCurrentBackground,
+  fromSkin,
+  skinIsLight,
+  type Theme,
+  themeToneHex,
+} from "../theme.js";
+import type { Msg, SessionInfo, SubagentProgress } from "../types.js";
 
-import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
-import { applyGoalSnapshot } from './goalStatus.js'
-import type { GatewayEventHandlerContext, NoticeLevel } from './interfaces.js'
-import { getOverlayState, patchOverlayState } from './overlayStore.js'
-import { addStreamedText, completionTokensOf, settleOutput } from './outputTokensStore.js'
-import { flashGoodVibes } from './petFlashStore.js'
-import { addProposal } from '../k3/proposalsStore.js'
-import { forgetServerRequest } from './serverRequestStore.js'
-import { turnController } from './turnController.js'
-import { getUiState, patchUiState } from './uiStore.js'
+import {
+  applyDelegationStatus,
+  getDelegationState,
+} from "./delegationStore.js";
+import { applyGoalSnapshot } from "./goalStatus.js";
+import type { GatewayEventHandlerContext, NoticeLevel } from "./interfaces.js";
+import { getOverlayState, patchOverlayState } from "./overlayStore.js";
+import {
+  addStreamedText,
+  completionTokensOf,
+  settleOutput,
+} from "./outputTokensStore.js";
+import { flashGoodVibes } from "./petFlashStore.js";
+import { addProposal } from "../k3/proposalsStore.js";
+import { forgetServerRequest } from "./serverRequestStore.js";
+import { turnController } from "./turnController.js";
+import { getUiState, patchUiState } from "./uiStore.js";
 import {
   BACKEND_SLOW_START,
   BACKEND_SLOW_START_STATUS,
@@ -43,13 +79,19 @@ import {
   isBareErrorText,
   promptTimeoutNotice,
   stderrLooksLikeProblem,
-  stderrProblemActivity
-} from './userMessages.js'
+  stderrProblemActivity,
+} from "./userMessages.js";
 
-const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i
+const NO_PROVIDER_RE = /\bNo (?:LLM|inference) provider configured\b/i;
 
-const NOTICE_LEVELS: readonly NoticeLevel[] = ['error', 'info', 'success', 'warn']
-const isNoticeLevel = (value: unknown): value is NoticeLevel => NOTICE_LEVELS.includes(value as NoticeLevel)
+const NOTICE_LEVELS: readonly NoticeLevel[] = [
+  "error",
+  "info",
+  "success",
+  "warn",
+];
+const isNoticeLevel = (value: unknown): value is NoticeLevel =>
+  NOTICE_LEVELS.includes(value as NoticeLevel);
 
 // Shallow-compare Usage to avoid creating a new object reference when values
 // haven't changed. A fresh reference on every streaming event forces every
@@ -59,32 +101,37 @@ const isNoticeLevel = (value: unknown): value is NoticeLevel => NOTICE_LEVELS.in
 // active_subagents, consumed by the status rule's subagent segment) can never
 // be silently dropped from the comparison.
 export const usageChanged = (prev: Usage, next: Usage): boolean => {
-  const keys = new Set([...Object.keys(prev), ...Object.keys(next)]) as Set<keyof Usage>
+  const keys = new Set([...Object.keys(prev), ...Object.keys(next)]) as Set<
+    keyof Usage
+  >;
 
   for (const key of keys) {
     if (prev[key] !== next[key]) {
-      return true
+      return true;
     }
   }
 
-  return false
-}
+  return false;
+};
 
-export const mergeUsageStable = (prev: Usage, patch: Partial<Usage> | undefined): Usage => {
+export const mergeUsageStable = (
+  prev: Usage,
+  patch: Partial<Usage> | undefined,
+): Usage => {
   if (!patch) {
-    return prev
+    return prev;
   }
 
-  const merged: Usage = { ...prev, ...patch }
+  const merged: Usage = { ...prev, ...patch };
 
-  return usageChanged(prev, merged) ? merged : prev
-}
+  return usageChanged(prev, merged) ? merged : prev;
+};
 
-const statusFromBusy = () => (getUiState().busy ? 'running…' : 'ready')
+const statusFromBusy = () => (getUiState().busy ? "running…" : "ready");
 
 // The last gateway skin, kept so the theme can be re-derived when the OSC-11
 // background answer arrives after (or without) gateway.ready.
-let lastSkin: GatewaySkin | null = null
+let lastSkin: GatewaySkin | null = null;
 
 const themeForSkin = (s: GatewaySkin) => {
   // Polarity overrides OVERLAY the base palette, they don't replace it: a skin
@@ -94,19 +141,22 @@ const themeForSkin = (s: GatewaySkin) => {
   // still works — it just overrides every key it lists. Polarity follows the
   // skin's authored background when it has one (the skin paints the terminal
   // with it), else the host's.
-  const paired = skinIsLight(s.colors ?? {}) ? s.light_colors : s.dark_colors
+  const paired = skinIsLight(s.colors ?? {}) ? s.light_colors : s.dark_colors;
 
-  const colors = paired && Object.keys(paired).length ? { ...(s.colors ?? {}), ...paired } : (s.colors ?? {})
+  const colors =
+    paired && Object.keys(paired).length
+      ? { ...(s.colors ?? {}), ...paired }
+      : (s.colors ?? {});
 
   return fromSkin(
     colors,
     s.branding ?? {},
-    s.banner_logo ?? '',
-    s.banner_hero ?? '',
-    s.tool_prefix ?? '',
-    s.help_header ?? ''
-  )
-}
+    s.banner_logo ?? "",
+    s.banner_hero ?? "",
+    s.tool_prefix ?? "",
+    s.help_header ?? "",
+  );
+};
 
 // Patch the live theme AND persist it for the next launch's first frame
 // (flash-free boot — see lib/themeBoot.ts).
@@ -120,40 +170,44 @@ const themeForSkin = (s: GatewaySkin) => {
 // new theme has rendered guarantees a coherent frame. Deferred ~2 frames so
 // React + Ink flush the recolored tree first; skipping identical themes keeps
 // the no-op resolution path (boot cache confirmed by detection) paint-free.
-let lastCommittedTheme: Theme | null = null
+let lastCommittedTheme: Theme | null = null;
 
 const commitTheme = (theme: Theme) => {
   // First commit compares against the SEED uiStore mounted with (boot cache
   // or default), not null — otherwise a first resolve that differs from the
   // boot-cached theme skips the anti-tearing repaint (the exact seed≠skin
   // case: cold start defaults dark, then resolves to a light skin).
-  const prev = lastCommittedTheme ?? getUiState().theme
-  const changed = !themesEqual(prev, theme)
+  const prev = lastCommittedTheme ?? getUiState().theme;
+  const changed = !themesEqual(prev, theme);
 
-  lastCommittedTheme = theme
-  patchUiState({ theme })
+  lastCommittedTheme = theme;
+  patchUiState({ theme });
   // Persist the config pin alongside the resolved theme + physical
   // background: a pinned session's resolved polarity intentionally
   // disagrees with the background, and caching one without the other
   // recreates the multi-stage flash on the next launch (light first frame →
   // dark skin resolve against the cached background → light config pin).
-  const pin = configPinnedTheme ? process.env.K3CODE_TUI_THEME : undefined
+  const pin = configPinnedTheme ? process.env.K3CODE_TUI_THEME : undefined;
 
-  writeBootTheme(theme, process.env.K3CODE_TUI_BACKGROUND, pin === 'light' || pin === 'dark' ? pin : undefined)
+  writeBootTheme(
+    theme,
+    process.env.K3CODE_TUI_BACKGROUND,
+    pin === "light" || pin === "dark" ? pin : undefined,
+  );
 
   if (changed) {
-    setTimeout(() => forceRedraw(process.stdout), 40).unref?.()
+    setTimeout(() => forceRedraw(process.stdout), 40).unref?.();
   }
-}
+};
 
 const themesEqual = (a: Theme, b: Theme) => {
   if (a === b) {
-    return true
+    return true;
   }
 
-  for (const key of Object.keys(a.color) as (keyof Theme['color'])[]) {
+  for (const key of Object.keys(a.color) as (keyof Theme["color"])[]) {
     if (a.color[key] !== b.color[key]) {
-      return false
+      return false;
     }
   }
 
@@ -162,8 +216,8 @@ const themesEqual = (a: Theme, b: Theme) => {
     a.brand.prompt === b.brand.prompt &&
     a.bannerLogo === b.bannerLogo &&
     a.bannerHero === b.bannerHero
-  )
-}
+  );
+};
 
 // A skin that owns the background must own BOTH terminal defaults: OSC-11
 // paints every cell's backdrop, and OSC-10 re-bases every default-fg token —
@@ -174,29 +228,33 @@ const themesEqual = (a: Theme, b: Theme) => {
 // The text tone resolves through themeToneHex because a limited-palette
 // terminal quantizes it to `ansi256(N)`, which OSC-10 cannot speak.
 const paintTerminalDefaults = (theme: Theme) => {
-  const background = lastSkin?.colors?.background ?? ''
+  const background = lastSkin?.colors?.background ?? "";
 
-  setTerminalBackground(background)
-  setTerminalForeground(isPaintableHex(background) ? themeToneHex(theme.color.text) : '')
-}
+  setTerminalBackground(background);
+  setTerminalForeground(
+    isPaintableHex(background) ? themeToneHex(theme.color.text) : "",
+  );
+};
 
 const applySkin = (s: GatewaySkin) => {
-  lastSkin = s
-  const theme = themeForSkin(s)
+  lastSkin = s;
+  const theme = themeForSkin(s);
 
-  commitTheme(theme)
-  paintTerminalDefaults(theme)
-}
+  commitTheme(theme);
+  paintTerminalDefaults(theme);
+};
 
 /** Re-derive the theme from current detection signals (env overrides, cached
  *  OSC-11 answer) — used by /theme, config sync, and the OSC listener. */
 export function reapplyTheme(): void {
-  const theme = lastSkin ? themeForSkin(lastSkin) : defaultThemeForCurrentBackground()
+  const theme = lastSkin
+    ? themeForSkin(lastSkin)
+    : defaultThemeForCurrentBackground();
 
-  commitTheme(theme)
+  commitTheme(theme);
   // Polarity flips swap paired palettes, so the default fg must track the
   // re-derived text tone even though the skin's background hasn't moved.
-  paintTerminalDefaults(theme)
+  paintTerminalDefaults(theme);
 }
 
 /**
@@ -213,42 +271,42 @@ export function reapplyTheme(): void {
 // boot cache replayed counts as config-owned — it originated from
 // display.tui_theme last session, and treating it as a shell export would
 // make a stale cached pin unclearable by 'auto'.
-let configPinnedTheme = bootSeededPin
+let configPinnedTheme = bootSeededPin;
 
 export function applyConfiguredTuiTheme(raw: unknown): void {
-  const mode = String(raw ?? '')
+  const mode = String(raw ?? "")
     .trim()
-    .toLowerCase()
+    .toLowerCase();
 
-  const current = process.env.K3CODE_TUI_THEME ?? ''
+  const current = process.env.K3CODE_TUI_THEME ?? "";
 
-  if (mode === 'light' || mode === 'dark') {
+  if (mode === "light" || mode === "dark") {
     // Record config ownership BEFORE the match short-circuit — otherwise a
     // pin that already matches (e.g. env and config agree at boot) leaves
     // configPinnedTheme false, and a later 'auto' would refuse to clear it.
-    configPinnedTheme = true
+    configPinnedTheme = true;
 
     if (current === mode) {
-      return
+      return;
     }
 
-    process.env.K3CODE_TUI_THEME = mode
+    process.env.K3CODE_TUI_THEME = mode;
   } else {
     // 'auto' clears only a pin CONFIG set — never a K3CODE_TUI_THEME the user
     // exported in their shell, which is an explicit override that outranks
     // auto-detection (see detectLightMode's priority order).
     if (!current || !configPinnedTheme) {
-      return
+      return;
     }
 
-    configPinnedTheme = false
-    delete process.env.K3CODE_TUI_THEME
+    configPinnedTheme = false;
+    delete process.env.K3CODE_TUI_THEME;
   }
 
-  reapplyTheme()
+  reapplyTheme();
 }
 
-let themeBackgroundSyncStarted = false
+let themeBackgroundSyncStarted = false;
 
 /**
  * Re-derive the theme from the terminal's ACTUAL background color once the
@@ -268,34 +326,36 @@ let themeBackgroundSyncStarted = false
  *  for the inferred pole, or undefined when the answer is unusable
  *  (mid-gray foregrounds are ambiguous; #000000/#ffffff can be unset
  *  defaults themselves, so only clearly-toned answers count). */
-export function polarityBackgroundFromForeground(hex: string): string | undefined {
-  const luminance = relativeLuminance(hex)
+export function polarityBackgroundFromForeground(
+  hex: string,
+): string | undefined {
+  const luminance = relativeLuminance(hex);
 
-  if (luminance === null || hex === '#000000' || hex === '#ffffff') {
-    return undefined
+  if (luminance === null || hex === "#000000" || hex === "#ffffff") {
+    return undefined;
   }
 
   if (luminance >= 0.45) {
-    return '#1e1e1e'
+    return "#1e1e1e";
   }
 
   if (luminance <= 0.2) {
-    return '#ffffff'
+    return "#ffffff";
   }
 
-  return undefined
+  return undefined;
 }
 
 export function syncThemeToTerminalBackground(): void {
   if (themeBackgroundSyncStarted) {
-    return
+    return;
   }
 
-  themeBackgroundSyncStarted = true
+  themeBackgroundSyncStarted = true;
 
-  let resolved = false
+  let resolved = false;
 
-  onTerminalBackground(hex => {
+  onTerminalBackground((hex) => {
     // Exactly-#000000 is the "unset default" fingerprint, not a measurement:
     // xterm.js reports it when the editor theme sets no terminal background
     // (observed: pure black reported on a white Cursor terminal), and tmux
@@ -305,7 +365,7 @@ export function syncThemeToTerminalBackground(): void {
     // #282828, …). Distrusting pure black universally is safe: the OSC-10
     // foreground below resolves the pole for transparent hosts, and a truly
     // pure-black terminal lands on dark either way.
-    if (hex === '#000000') {
+    if (hex === "#000000") {
       // The CURRENT terminal answered with an untrusted value — a background
       // the boot cache seeded is from another era and must not keep
       // outranking the live fallback chain (previous light session + new
@@ -316,38 +376,42 @@ export function syncThemeToTerminalBackground(): void {
       if (invalidateBootBackground()) {
         setTimeout(() => {
           if (!resolved) {
-            reapplyTheme()
+            reapplyTheme();
           }
-        }, 250).unref?.()
+        }, 250).unref?.();
       }
 
-      return
+      return;
     }
 
-    resolved = true
-    process.env.K3CODE_TUI_BACKGROUND = hex
-    reapplyTheme()
-  })
+    resolved = true;
+    process.env.K3CODE_TUI_BACKGROUND = hex;
+    reapplyTheme();
+  });
 
   // Foreground tiebreaker for the distrusted-background case. The two OSC
   // replies arrive in the same startup batch; this listener only commits when
   // the background didn't (first-writer-wins via `resolved`), and an explicit
   // user pin still outranks it inside detectLightMode.
-  onTerminalForeground(hex => {
-    if (resolved || process.env.K3CODE_TUI_THEME || process.env.K3CODE_TUI_LIGHT) {
-      return
+  onTerminalForeground((hex) => {
+    if (
+      resolved ||
+      process.env.K3CODE_TUI_THEME ||
+      process.env.K3CODE_TUI_LIGHT
+    ) {
+      return;
     }
 
-    const inferred = polarityBackgroundFromForeground(hex)
+    const inferred = polarityBackgroundFromForeground(hex);
 
     if (!inferred) {
-      return
+      return;
     }
 
-    resolved = true
-    process.env.K3CODE_TUI_BACKGROUND = inferred
-    reapplyTheme()
-  })
+    resolved = true;
+    process.env.K3CODE_TUI_BACKGROUND = inferred;
+    reapplyTheme();
+  });
 
   // Last-resort inference when the probe never answers (or answered with the
   // untrusted default): on macOS, editor themes overwhelmingly track the
@@ -357,92 +421,111 @@ export function syncThemeToTerminalBackground(): void {
   setTimeout(() => {
     if (
       resolved ||
-      process.platform !== 'darwin' ||
+      process.platform !== "darwin" ||
       process.env.K3CODE_TUI_BACKGROUND ||
       process.env.K3CODE_TUI_THEME ||
       process.env.K3CODE_TUI_LIGHT ||
       process.env.COLORFGBG
     ) {
-      return
+      return;
     }
 
-    execFile('defaults', ['read', '-g', 'AppleInterfaceStyle'], (error, stdout) => {
-      if (resolved || process.env.K3CODE_TUI_BACKGROUND || process.env.K3CODE_TUI_THEME) {
-        return
-      }
+    execFile(
+      "defaults",
+      ["read", "-g", "AppleInterfaceStyle"],
+      (error, stdout) => {
+        if (
+          resolved ||
+          process.env.K3CODE_TUI_BACKGROUND ||
+          process.env.K3CODE_TUI_THEME
+        ) {
+          return;
+        }
 
-      // `defaults read` exits non-zero when the key is absent — which MEANS
-      // light mode; "Dark" means dark. Cache as an inferred background so
-      // every later signal (config pin, real OSC answer) still outranks it.
-      const dark = !error && stdout.trim() === 'Dark'
+        // `defaults read` exits non-zero when the key is absent — which MEANS
+        // light mode; "Dark" means dark. Cache as an inferred background so
+        // every later signal (config pin, real OSC answer) still outranks it.
+        const dark = !error && stdout.trim() === "Dark";
 
-      // Mark resolved so a LATE OSC-10 foreground reply (also an inference)
-      // can't re-flip this committed guess after the fact — visible churn.
-      // A real OSC-11 background answer still corrects it: that listener
-      // intentionally doesn't gate on `resolved` (a measurement outranks an
-      // inference).
-      resolved = true
-      process.env.K3CODE_TUI_BACKGROUND = dark ? '#1e1e1e' : '#ffffff'
-      reapplyTheme()
-    })
-  }, 1500).unref?.()
+        // Mark resolved so a LATE OSC-10 foreground reply (also an inference)
+        // can't re-flip this committed guess after the fact — visible churn.
+        // A real OSC-11 background answer still corrects it: that listener
+        // intentionally doesn't gate on `resolved` (a measurement outranks an
+        // inference).
+        resolved = true;
+        process.env.K3CODE_TUI_BACKGROUND = dark ? "#1e1e1e" : "#ffffff";
+        reapplyTheme();
+      },
+    );
+  }, 1500).unref?.();
 }
 
 const dropBgTask = (taskId: string) =>
-  patchUiState(state => {
-    const next = new Set(state.bgTasks)
-    next.delete(taskId)
+  patchUiState((state) => {
+    const next = new Set(state.bgTasks);
+    next.delete(taskId);
 
-    return { ...state, bgTasks: next }
-  })
+    return { ...state, bgTasks: next };
+  });
 
 const pushUnique =
   (max: number) =>
   <T>(xs: T[], x: T): T[] =>
-    xs.at(-1) === x ? xs : [...xs, x].slice(-max)
+    xs.at(-1) === x ? xs : [...xs, x].slice(-max);
 
-const pushThinking = pushUnique(6)
-const pushNote = pushUnique(6)
-const pushTool = pushUnique(8)
+const pushThinking = pushUnique(6);
+const pushNote = pushUnique(6);
+const pushTool = pushUnique(8);
 
 const KNOWN_SUBAGENT_STATUSES = new Set<SubagentStatus>([
-  'completed',
-  'error',
-  'failed',
-  'interrupted',
-  'queued',
-  'running',
-  'timeout'
-])
+  "completed",
+  "error",
+  "failed",
+  "interrupted",
+  "queued",
+  "running",
+  "timeout",
+]);
 
-const normalizeSubagentStatus = (status: unknown, fallback: SubagentStatus): SubagentStatus => {
-  if (typeof status !== 'string') {
-    return fallback
+const normalizeSubagentStatus = (
+  status: unknown,
+  fallback: SubagentStatus,
+): SubagentStatus => {
+  if (typeof status !== "string") {
+    return fallback;
   }
 
-  const normalized = status.toLowerCase() as SubagentStatus
+  const normalized = status.toLowerCase() as SubagentStatus;
 
-  return KNOWN_SUBAGENT_STATUSES.has(normalized) ? normalized : fallback
-}
+  return KNOWN_SUBAGENT_STATUSES.has(normalized) ? normalized : fallback;
+};
 
-export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev: AnyGatewayEvent) => void {
-  syncThemeToTerminalBackground()
+export function createGatewayEventHandler(
+  ctx: GatewayEventHandlerContext,
+): (ev: AnyGatewayEvent) => void {
+  syncThemeToTerminalBackground();
 
-  const { rpc } = ctx.gateway
-  const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
-  const { bellOnComplete, stdout, sys } = ctx.system
+  const { rpc } = ctx.gateway;
+  const {
+    STARTUP_RESUME_ID,
+    newSession,
+    recoverSidRef,
+    resumeById,
+    setCatalog,
+  } = ctx.session;
+  const { bellOnComplete, stdout, sys } = ctx.system;
 
-  const { appendMessage, panel, setHistoryItems } = ctx.transcript
-  const { submitLiteralRef } = ctx.submission
+  const { appendMessage, panel, setHistoryItems } = ctx.transcript;
+  const { submitLiteralRef } = ctx.submission;
 
-  let pendingThinkingStatus = ''
-  let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null
-  let startupPromptSubmitted = false
+  let pendingThinkingStatus = "";
+  let thinkingStatusTimer: null | ReturnType<typeof setTimeout> = null;
+  let startupPromptSubmitted = false;
 
   // Request IDs of clarify prompts we've already flushed to the transcript as
   // an abandoned-prompt record, so the tool.complete and message.complete
   // paths can't both persist the same prompt twice.
-  const persistedAbandonedClarify = new Set<string>()
+  const persistedAbandonedClarify = new Set<string>();
 
   // When a clarify prompt is dismissed without an answer (the backend request
   // timed out and returned no answer), the live ClarifyPrompt overlay is
@@ -454,21 +537,29 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   // answer (so this no-ops there).  Flush the question + options into the
   // transcript as a persistent system line, then clear the overlay.
   const flushAbandonedClarify = () => {
-    const { clarify } = getOverlayState()
+    const { clarify } = getOverlayState();
 
     if (!clarify || persistedAbandonedClarify.has(clarify.requestId)) {
-      return
+      return;
     }
 
-    persistedAbandonedClarify.add(clarify.requestId)
+    persistedAbandonedClarify.add(clarify.requestId);
     appendMessage({
-      role: 'system',
+      role: "system",
       text: clarify.questions?.length
-        ? formatAbandonedClarifyBatch(clarify.questions, clarify.answers ?? {}, 'timed out')
-        : formatAbandonedClarify(clarify.question, clarify.choices, 'timed out')
-    })
-    patchOverlayState({ clarify: null })
-  }
+        ? formatAbandonedClarifyBatch(
+            clarify.questions,
+            clarify.answers ?? {},
+            "timed out",
+          )
+        : formatAbandonedClarify(
+            clarify.question,
+            clarify.choices,
+            "timed out",
+          ),
+    });
+    patchOverlayState({ clarify: null });
+  };
 
   // Inject the disk-save callback into turnController so recordMessageComplete
   // can fire-and-forget a persist without having to plumb a gateway ref around.
@@ -476,35 +567,37 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     try {
       const startedAt = subagents.reduce<number>((min, s) => {
         if (!s.startedAt) {
-          return min
+          return min;
         }
 
-        return min === 0 ? s.startedAt : Math.min(min, s.startedAt)
-      }, 0)
+        return min === 0 ? s.startedAt : Math.min(min, s.startedAt);
+      }, 0);
 
       const top = topLevelSubagents(subagents)
-        .map(s => s.goal)
+        .map((s) => s.goal)
         .filter(Boolean)
-        .slice(0, 2)
+        .slice(0, 2);
 
-      const label = top.length ? top.join(' · ') : `${subagents.length} subagents`
+      const label = top.length
+        ? top.join(" · ")
+        : `${subagents.length} subagents`;
 
-      await rpc('spawn_tree.save', {
+      await rpc("spawn_tree.save", {
         finished_at: Date.now() / 1000,
         label: label.slice(0, 120),
-        session_id: sessionId ?? 'default',
+        session_id: sessionId ?? "default",
         started_at: startedAt ? startedAt / 1000 : null,
-        subagents
-      })
+        subagents,
+      });
     } catch {
       // Persistence is best-effort; in-memory history is the authoritative
       // same-session source.  A write failure doesn't block the turn.
     }
-  }
+  };
 
   // Refresh delegation caps at most every 5s so the status bar HUD can
   // render a /warning close to the configured cap without spamming the RPC.
-  let lastDelegationFetchAt = 0
+  let lastDelegationFetchAt = 0;
 
   // ── Shared full-config read ──────────────────────────────────────────
   //
@@ -513,13 +606,15 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   // Memoize the `config.get full` RPC so we make exactly one round-trip
   // instead of one per concern.  Resolves to null on RPC failure; callers
   // treat null as "use defaults".
-  let fullConfigPromise: null | Promise<ConfigFullResponse | null> = null
+  let fullConfigPromise: null | Promise<ConfigFullResponse | null> = null;
 
   const getFullConfigOnce = (): Promise<ConfigFullResponse | null> => {
-    fullConfigPromise ??= rpc<ConfigFullResponse>('config.get', { key: 'full' }).catch(() => null)
+    fullConfigPromise ??= rpc<ConfigFullResponse>("config.get", {
+      key: "full",
+    }).catch(() => null);
 
-    return fullConfigPromise
-  }
+    return fullConfigPromise;
+  };
 
   // ── Nudge toward /agents on delegation ───────────────────────────────
   //
@@ -532,29 +627,29 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   //   • silent if the overlay is already open (nothing to advertise)
   // Reset on `message.start`.  The config flag is fetched once, lazily;
   // until it resolves we assume the default (on).
-  let agentsNudgeEnabled = true
-  let agentsNudgeConfigFetched = false
-  let agentsNudgedThisTurn = false
+  let agentsNudgeEnabled = true;
+  let agentsNudgeConfigFetched = false;
+  let agentsNudgedThisTurn = false;
 
   const ensureAgentsNudgeConfig = () => {
     if (agentsNudgeConfigFetched) {
-      return
+      return;
     }
 
-    agentsNudgeConfigFetched = true
-    getFullConfigOnce().then(cfg => {
+    agentsNudgeConfigFetched = true;
+    getFullConfigOnce().then((cfg) => {
       // Only an explicit `false` disables it; absent/unknown keeps default on.
       if (cfg?.config?.display?.tui_agents_nudge === false) {
-        agentsNudgeEnabled = false
+        agentsNudgeEnabled = false;
       }
-    })
-  }
+    });
+  };
 
   const maybeNudgeAgents = () => {
-    ensureAgentsNudgeConfig()
+    ensureAgentsNudgeConfig();
 
     if (!agentsNudgeEnabled || agentsNudgedThisTurn) {
-      return
+      return;
     }
 
     // Already watching → no point advertising the dashboard.  Don't burn the
@@ -562,123 +657,136 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     // same turn while delegation is still ongoing, a subsequent event should
     // still be allowed to nudge.  The flag is only set once we actually push.
     if (getOverlayState().agents) {
-      return
+      return;
     }
 
-    agentsNudgedThisTurn = true
-    turnController.pushActivity('subagents working · /agents to watch live', 'info')
-  }
+    agentsNudgedThisTurn = true;
+    turnController.pushActivity(
+      "subagents working · /agents to watch live",
+      "info",
+    );
+  };
 
   const resetAgentsNudgeTurnState = () => {
-    agentsNudgedThisTurn = false
-  }
+    agentsNudgedThisTurn = false;
+  };
 
   const refreshDelegationStatus = (force = false) => {
-    const now = Date.now()
+    const now = Date.now();
 
     if (!force && now - lastDelegationFetchAt < 5000) {
-      return
+      return;
     }
 
-    lastDelegationFetchAt = now
-    rpc<DelegationStatusResponse>('delegation.status', {})
-      .then(r => applyDelegationStatus(r))
-      .catch(() => {})
-  }
+    lastDelegationFetchAt = now;
+    rpc<DelegationStatusResponse>("delegation.status", {})
+      .then((r) => applyDelegationStatus(r))
+      .catch(() => {});
+  };
 
   const setStatus = (status: string) => {
-    pendingThinkingStatus = ''
+    pendingThinkingStatus = "";
 
     if (thinkingStatusTimer) {
-      clearTimeout(thinkingStatusTimer)
-      thinkingStatusTimer = null
+      clearTimeout(thinkingStatusTimer);
+      thinkingStatusTimer = null;
     }
 
-    patchUiState({ status })
-  }
+    patchUiState({ status });
+  };
 
   const scheduleThinkingStatus = (status: string) => {
-    pendingThinkingStatus = status
+    pendingThinkingStatus = status;
 
     if (thinkingStatusTimer) {
-      return
+      return;
     }
 
     thinkingStatusTimer = setTimeout(() => {
-      thinkingStatusTimer = null
-      patchUiState({ status: pendingThinkingStatus || statusFromBusy() })
-    }, STREAM_BATCH_MS)
-  }
+      thinkingStatusTimer = null;
+      patchUiState({ status: pendingThinkingStatus || statusFromBusy() });
+    }, STREAM_BATCH_MS);
+  };
 
   const restoreStatusAfter = (ms: number) => {
-    turnController.clearStatusTimer()
+    turnController.clearStatusTimer();
     turnController.statusTimer = setTimeout(() => {
-      turnController.statusTimer = null
-      patchUiState({ status: statusFromBusy() })
-    }, ms)
-  }
+      turnController.statusTimer = null;
+      patchUiState({ status: statusFromBusy() });
+    }, ms);
+  };
 
   const scheduleStartupPrompt = () => {
     if (startupPromptSubmitted || (!STARTUP_QUERY && !STARTUP_IMAGE)) {
-      return
+      return;
     }
 
-    startupPromptSubmitted = true
+    startupPromptSubmitted = true;
     setTimeout(async () => {
-      let sid = getUiState().sid
+      let sid = getUiState().sid;
 
       for (let i = 0; !sid && i < 40; i += 1) {
-        await new Promise(resolve => setTimeout(resolve, 100))
-        sid = getUiState().sid
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        sid = getUiState().sid;
       }
 
       if (!sid) {
-        return sys('startup query skipped: no active session')
+        return sys("startup query skipped: no active session");
       }
 
       if (STARTUP_IMAGE) {
         try {
-          await rpc('image.attach', { path: STARTUP_IMAGE, session_id: sid })
+          await rpc("image.attach", { path: STARTUP_IMAGE, session_id: sid });
         } catch (e) {
-          sys(`startup image attach failed: ${rpcErrorMessage(e)}`)
+          sys(`startup image attach failed: ${rpcErrorMessage(e)}`);
         }
       }
 
       // Startup queries are arbitrary launcher/script text (Omarchy prompted
       // launches, `k3code --tui -q "…"`) — submit LITERALLY, bypassing the
       // slash/!/interpolation dispatcher, matching one-shot's semantics.
-      submitLiteralRef.current(STARTUP_QUERY || 'What do you see in this image?')
-    }, 0)
-  }
+      submitLiteralRef.current(
+        STARTUP_QUERY || "What do you see in this image?",
+      );
+    }, 0);
+  };
 
   // Terminal statuses are never overwritten by late-arriving live events —
   // otherwise a stale `subagent.start` / `spawn_requested` can clobber a
   // terminal state from complete (failed/interrupted/timeout/error).
-  const isTerminalStatus = (s: SubagentProgress['status']) =>
-    s === 'completed' || s === 'error' || s === 'failed' || s === 'interrupted' || s === 'timeout'
+  const isTerminalStatus = (s: SubagentProgress["status"]) =>
+    s === "completed" ||
+    s === "error" ||
+    s === "failed" ||
+    s === "interrupted" ||
+    s === "timeout";
 
-  const keepTerminalElseRunning = (s: SubagentProgress['status']) => (isTerminalStatus(s) ? s : 'running')
+  const keepTerminalElseRunning = (s: SubagentProgress["status"]) =>
+    isTerminalStatus(s) ? s : "running";
 
   const handleReady = (skin?: GatewaySkin) => {
     if (skin) {
-      applySkin(skin)
+      applySkin(skin);
     }
 
     // Kick off the config fetch once the gateway is actually ready. If handler
     // construction does this during React render, a startup transport error can
     // report through sys(), mutate transcript state, and trip React's
     // "too many re-renders" guard in embedded dashboard PTYs.
-    ensureAgentsNudgeConfig()
+    ensureAgentsNudgeConfig();
 
     // Bound to the live session when one exists (reconnect): project-local
     // skills follow the session's repo. Before the first session the gateway
     // uses the same workspace it seeds a new session with.
-    const catalogSid = getUiState().sid
+    const catalogSid = getUiState().sid;
 
-    rpc<CommandsCatalogResponse>('commands.catalog', catalogSid ? { session_id: catalogSid } : {})
-      .then(r => {
+    rpc<CommandsCatalogResponse>(
+      "commands.catalog",
+      catalogSid ? { session_id: catalogSid } : {},
+    )
+      .then((r) => {
         if (!r?.pairs) {
-          return
+          return;
         }
 
         setCatalog({
@@ -686,39 +794,44 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           categories: r.categories ?? [],
           pairs: r.pairs as [string, string][],
           skillCount: (r.skill_count ?? 0) as number,
-          sub: (r.sub ?? {}) as Record<string, string[]>
-        })
+          sub: (r.sub ?? {}) as Record<string, string[]>,
+        });
 
         if (r.warning) {
-          turnController.pushActivity(String(r.warning), 'warn')
+          turnController.pushActivity(String(r.warning), "warn");
         }
       })
-      .catch((e: unknown) => turnController.pushActivity(`command catalog unavailable: ${rpcErrorMessage(e)}`, 'info'))
+      .catch((e: unknown) =>
+        turnController.pushActivity(
+          `command catalog unavailable: ${rpcErrorMessage(e)}`,
+          "info",
+        ),
+      );
 
     // Keep the recovery target until resume succeeds, including across a second
     // disconnect during setup or history loading. Recovery never resends the prompt.
-    const recoverSid = recoverSidRef?.current
+    const recoverSid = recoverSidRef?.current;
 
     if (recoverSidRef && recoverSid) {
       void resumeById(recoverSid).then(() => {
         if (getUiState().sid && recoverSidRef.current === recoverSid) {
-          recoverSidRef.current = null
+          recoverSidRef.current = null;
         }
-      })
+      });
       // After resumeById: it synchronously sets status to 'resuming…' on entry,
       // so override it here to keep the distinct "recovering" label visible for
       // the duration of the resume RPC (which later flips status to 'ready').
-      patchUiState({ status: 'recovering session…' })
+      patchUiState({ status: "recovering session…" });
 
-      return
+      return;
     }
 
     if (STARTUP_RESUME_ID) {
-      patchUiState({ status: 'resuming…' })
-      resumeById(STARTUP_RESUME_ID)
-      scheduleStartupPrompt()
+      patchUiState({ status: "resuming…" });
+      resumeById(STARTUP_RESUME_ID);
+      scheduleStartupPrompt();
 
-      return
+      return;
     }
 
     // Opt-in: when `display.tui_auto_resume_recent` is true, look up
@@ -728,392 +841,434 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     // unrecoverable after disconnection" gap.  Default off so existing
     // users aren't surprised.  (Shares the memoized full-config read.)
     getFullConfigOnce()
-      .then(cfg => {
+      .then((cfg) => {
         if (!cfg?.config?.display?.tui_auto_resume_recent) {
-          patchUiState({ status: 'forging session…' })
-          newSession()
-          scheduleStartupPrompt()
+          patchUiState({ status: "forging session…" });
+          newSession();
+          scheduleStartupPrompt();
 
-          return
+          return;
         }
 
-        return rpc<SessionMostRecentResponse>('session.most_recent', {}).then(r => {
-          const target = r?.session_id
+        return rpc<SessionMostRecentResponse>("session.most_recent", {}).then(
+          (r) => {
+            const target = r?.session_id;
 
-          if (target) {
-            patchUiState({ status: 'resuming most recent…' })
-            resumeById(target)
-            scheduleStartupPrompt()
+            if (target) {
+              patchUiState({ status: "resuming most recent…" });
+              resumeById(target);
+              scheduleStartupPrompt();
 
-            return
-          }
+              return;
+            }
 
-          patchUiState({ status: 'forging session…' })
-          newSession()
-          scheduleStartupPrompt()
-        })
+            patchUiState({ status: "forging session…" });
+            newSession();
+            scheduleStartupPrompt();
+          },
+        );
       })
       .catch(() => {
-        patchUiState({ status: 'forging session…' })
-        newSession()
-        scheduleStartupPrompt()
-      })
-  }
+        patchUiState({ status: "forging session…" });
+        newSession();
+        scheduleStartupPrompt();
+      });
+  };
 
   return (ev: AnyGatewayEvent) => {
-    const sid = getUiState().sid
+    const sid = getUiState().sid;
 
-    if (ev.session_id && sid && ev.session_id !== sid && !ev.type.startsWith('gateway.')) {
-      return
+    if (
+      ev.session_id &&
+      sid &&
+      ev.session_id !== sid &&
+      !ev.type.startsWith("gateway.")
+    ) {
+      return;
     }
 
     switch (ev.type) {
-      case 'gateway.ready':
-        handleReady(ev.payload?.skin)
+      case "gateway.ready":
+        handleReady(ev.payload?.skin);
 
-        return
+        return;
 
-      case 'skin.changed':
+      case "skin.changed":
         if (ev.payload) {
-          applySkin(ev.payload)
+          applySkin(ev.payload);
         }
 
-        return
-      case 'session.info': {
-        let info = ev.payload as SessionInfo | undefined
+        return;
+      case "session.info": {
+        let info = ev.payload as SessionInfo | undefined;
 
         if (!info) {
-          return
+          return;
         }
 
         // A replayed snapshot can be the only terminal signal after reconnect.
         // Missing running on older gateways must not clear a live turn.
         if (info.running === false) {
-          turnController.clearStatusTimer()
-          turnController.idle()
-          setStatus('ready')
+          turnController.clearStatusTimer();
+          turnController.idle();
+          setStatus("ready");
         }
 
         // Agent-less producers (lazy cwd switches, `_fallback_session_info`) send
         // payloads without a durable id — keep the one we already track so a
         // later reconnect still resumes this session.
-        const storedSid = info.stored_session_id || getUiState().storedSid
+        const storedSid = info.stored_session_id || getUiState().storedSid;
 
         if (storedSid) {
-          info = { ...info, stored_session_id: storedSid }
+          info = { ...info, stored_session_id: storedSid };
         }
 
-        patchUiState(state => ({
+        patchUiState((state) => ({
           ...state,
           info,
-          status: state.status === 'starting agent…' ? 'ready' : state.status,
+          status: state.status === "starting agent…" ? "ready" : state.status,
           storedSid,
-          usage: info.usage ? mergeUsageStable(state.usage, info.usage) : state.usage
-        }))
+          usage: info.usage
+            ? mergeUsageStable(state.usage, info.usage)
+            : state.usage,
+        }));
 
-        setHistoryItems(prev => prev.map(m => (m.kind === 'intro' ? { ...m, info } : m)))
+        setHistoryItems((prev) =>
+          prev.map((m) => (m.kind === "intro" ? { ...m, info } : m)),
+        );
 
-        return
+        return;
       }
 
-      case 'session.usage': {
+      case "session.usage": {
         // Live usage tick while a turn runs (see tui_gateway
         // _start_usage_ticker) — keeps the status-bar context window current
         // mid-turn instead of only at message.complete. The session filter at
         // the top of this handler already dropped ticks for non-focused
         // sessions.
-        const usage = ev.payload?.usage
+        const usage = ev.payload?.usage;
 
         if (usage) {
-          patchUiState(state => ({ ...state, usage: { ...state.usage, ...usage } }))
+          patchUiState((state) => ({
+            ...state,
+            usage: { ...state.usage, ...usage },
+          }));
           // One completed LLM call's real output tokens replace the streamed estimate for that call.
-          settleOutput(completionTokensOf(usage))
+          settleOutput(completionTokensOf(usage));
         }
 
-        return
+        return;
       }
 
-      case 'thinking.delta': {
+      case "thinking.delta": {
         if (!getUiState().busy) {
-          return
+          return;
         }
 
-        const text = ev.payload?.text
+        const text = ev.payload?.text;
 
         if (text !== undefined) {
-          const value = String(text)
-          scheduleThinkingStatus(value || statusFromBusy())
+          const value = String(text);
+          scheduleThinkingStatus(value || statusFromBusy());
 
           if (value) {
-            turnController.recordReasoningDelta(value)
+            turnController.recordReasoningDelta(value);
           }
         }
 
-        return
+        return;
       }
 
-      case 'session.control.update':
-        applyGoalSnapshot(sid, ev.payload?.control.goal ?? null)
+      case "session.control.update":
+        applyGoalSnapshot(sid, ev.payload?.control.goal ?? null);
 
-        return
+        return;
 
-      case 'message.start':
-        resetAgentsNudgeTurnState()
-        turnController.startMessage()
+      case "message.start":
+        resetAgentsNudgeTurnState();
+        turnController.startMessage();
 
-        return
-      case 'status.update': {
-        const p = ev.payload
+        return;
+      case "status.update": {
+        const p = ev.payload;
 
         if (!p?.text) {
-          return
+          return;
         }
 
-        if (p.kind === 'goal') {
-          sys(p.text)
+        if (p.kind === "goal") {
+          sys(p.text);
 
-          const brief = p.text.startsWith('✓')
-            ? '✓ goal complete'
-            : p.text.startsWith('↻')
-              ? '↻ goal continuing'
-              : p.text.startsWith('⏸')
-                ? '⏸ goal paused'
-                : 'ready'
+          const brief = p.text.startsWith("✓")
+            ? "✓ goal complete"
+            : p.text.startsWith("↻")
+              ? "↻ goal continuing"
+              : p.text.startsWith("⏸")
+                ? "⏸ goal paused"
+                : "ready";
 
-          setStatus(brief)
-          restoreStatusAfter(6000)
+          setStatus(brief);
+          restoreStatusAfter(6000);
 
-          return
+          return;
         }
 
-        setStatus(p.text)
+        setStatus(p.text);
 
-        if (p.kind === 'compressing' || p.kind === 'compacting') {
-          sys(p.text)
-          turnController.clearStatusTimer()
-          patchUiState({ compacting: true })
+        if (p.kind === "compressing" || p.kind === "compacting") {
+          sys(p.text);
+          turnController.clearStatusTimer();
+          patchUiState({ compacting: true });
 
-          return
+          return;
         }
 
-        if (p.kind === 'compacted') {
-          patchUiState({ compacting: false })
+        if (p.kind === "compacted") {
+          patchUiState({ compacting: false });
         }
 
-        if (!p.kind || p.kind === 'status') {
-          return
+        if (!p.kind || p.kind === "status") {
+          return;
         }
 
         if (turnController.lastStatusNote !== p.text) {
-          turnController.lastStatusNote = p.text
+          turnController.lastStatusNote = p.text;
           turnController.pushActivity(
             p.text,
-            p.kind === 'error' ? 'error' : p.kind === 'warn' || p.kind === 'approval' ? 'warn' : 'info'
-          )
+            p.kind === "error"
+              ? "error"
+              : p.kind === "warn" || p.kind === "approval"
+                ? "warn"
+                : "info",
+          );
         }
 
-        restoreStatusAfter(4000)
+        restoreStatusAfter(4000);
 
-        return
+        return;
       }
 
-      case 'notification.show': {
+      case "notification.show": {
         // Credits/usage notice from the gateway. Payload is snake_case on the
         // wire and stays snake_case in UiState.notice (no mapping layer). The
         // text already carries its own glyph; turnController decides whether to
         // show now or hold until turn end (FaceTicker wins while busy).
-        const p = ev.payload
+        const p = ev.payload;
 
         if (!p?.text) {
-          return
+          return;
         }
 
         turnController.showNotice({
           id: p.id ?? undefined,
           key: p.key ?? undefined,
-          kind: p.kind === 'ttl' ? 'ttl' : 'sticky',
-          level: isNoticeLevel(p.level) ? p.level : 'info',
+          kind: p.kind === "ttl" ? "ttl" : "sticky",
+          level: isNoticeLevel(p.level) ? p.level : "info",
           text: p.text,
-          ttl_ms: p.ttl_ms ?? null
-        })
+          ttl_ms: p.ttl_ms ?? null,
+        });
 
-        return
+        return;
       }
 
-      case 'notification.clear':
+      case "notification.clear":
         // Key-matched clear only — a stale/late clear must not wipe a newer
         // notice (turnController guards the key match).
-        turnController.clearNotice(ev.payload?.key)
+        turnController.clearNotice(ev.payload?.key);
 
-        return
+        return;
 
-      case 'gateway.stderr': {
+      case "gateway.stderr": {
         // Every raw line is already in the /logs buffer (gatewayClient.pushLog).
         // Only failure-looking lines earn an activity row, and a traceback's
         // many lines collapse into one (pushActivity dedupes a repeated tail).
         if (!ev.payload) {
-          return
+          return;
         }
 
-        const line = String(ev.payload.line)
+        const line = String(ev.payload.line);
 
         if (stderrLooksLikeProblem(line)) {
-          turnController.pushActivity(stderrProblemActivity(line), 'warn')
+          turnController.pushActivity(stderrProblemActivity(line), "warn");
         }
 
-        return
+        return;
       }
 
-      case 'gateway.reconnecting': {
-        const { attempt, delay_ms: delayMs } = ev.payload ?? {}
+      case "gateway.reconnecting": {
+        const { attempt, delay_ms: delayMs } = ev.payload ?? {};
 
-        setStatus(backendReconnecting(attempt, delayMs))
+        setStatus(backendReconnecting(attempt, delayMs));
 
-        return
+        return;
       }
 
-      case 'browser.progress': {
-        const message = String(ev.payload?.message ?? '').trim()
+      case "browser.progress": {
+        const message = String(ev.payload?.message ?? "").trim();
 
         if (message) {
-          sys(message)
+          sys(message);
         }
 
-        return
+        return;
       }
 
-      
-      case 'gateway.start_timeout': {
+      case "gateway.start_timeout": {
         // Still waiting (the ready timer does not give up) — say so, and point
         // at /logs for the interpreter/cwd/stderr detail instead of printing
         // paths here. Only failure-looking stderr lines are echoed inline so
         // "wrong python" / "missing dep" stay diagnosable at a glance.
-        const { stderr_tail: stderrTail } = ev.payload ?? {}
+        const { stderr_tail: stderrTail } = ev.payload ?? {};
 
-        setStatus(BACKEND_SLOW_START_STATUS)
-        turnController.pushActivity(BACKEND_SLOW_START, 'warn')
+        setStatus(BACKEND_SLOW_START_STATUS);
+        turnController.pushActivity(BACKEND_SLOW_START, "warn");
 
-        const STDERR_LINE_CAP = 120
-        const STDERR_LINES_MAX = 4
+        const STDERR_LINE_CAP = 120;
+        const STDERR_LINES_MAX = 4;
 
-        const tailLines = (stderrTail ?? '')
-          .split('\n')
-          .map(l => l.trim())
-          .filter(l => l && stderrLooksLikeProblem(l))
-          .slice(-STDERR_LINES_MAX)
+        const tailLines = (stderrTail ?? "")
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l && stderrLooksLikeProblem(l))
+          .slice(-STDERR_LINES_MAX);
 
         for (const line of tailLines) {
-          turnController.pushActivity(line.slice(0, STDERR_LINE_CAP), 'error')
+          turnController.pushActivity(line.slice(0, STDERR_LINE_CAP), "error");
         }
 
-        return
+        return;
       }
 
-      case 'gateway.protocol_error':
-        setStatus('protocol warning')
-        restoreStatusAfter(4000)
+      case "gateway.protocol_error":
+        setStatus("protocol warning");
+        restoreStatusAfter(4000);
 
         if (!turnController.protocolWarned) {
-          turnController.protocolWarned = true
-          turnController.pushActivity('protocol noise detected · /logs to inspect', 'info')
+          turnController.protocolWarned = true;
+          turnController.pushActivity(
+            "protocol noise detected · /logs to inspect",
+            "info",
+          );
         }
 
         if (ev.payload?.preview) {
-          turnController.pushActivity(`protocol noise: ${String(ev.payload.preview).slice(0, 120)}`, 'info')
+          turnController.pushActivity(
+            `protocol noise: ${String(ev.payload.preview).slice(0, 120)}`,
+            "info",
+          );
         }
 
-        return
+        return;
 
-      case 'reasoning.delta':
+      case "reasoning.delta":
         if (ev.payload?.text) {
-          turnController.recordReasoningDelta(ev.payload.text, Boolean(ev.payload.verbose))
+          turnController.recordReasoningDelta(
+            ev.payload.text,
+            Boolean(ev.payload.verbose),
+          );
         }
 
-        return
+        return;
 
-      case 'reasoning.available':
-        turnController.recordReasoningAvailable(String(ev.payload?.text ?? ''), Boolean(ev.payload?.verbose))
+      case "reasoning.available":
+        turnController.recordReasoningAvailable(
+          String(ev.payload?.text ?? ""),
+          Boolean(ev.payload?.verbose),
+        );
 
-        return
+        return;
 
-      case 'moa.reference':
+      case "moa.reference":
         turnController.recordMoaReference(
-          String(ev.payload?.label ?? 'reference'),
-          String(ev.payload?.text ?? ''),
-          typeof ev.payload?.index === 'number' ? ev.payload.index : undefined,
-          typeof ev.payload?.count === 'number' ? ev.payload.count : undefined
-        )
+          String(ev.payload?.label ?? "reference"),
+          String(ev.payload?.text ?? ""),
+          typeof ev.payload?.index === "number" ? ev.payload.index : undefined,
+          typeof ev.payload?.count === "number" ? ev.payload.count : undefined,
+        );
 
-        return
+        return;
 
-      case 'moa.aggregating':
+      case "moa.aggregating":
         // Spinner/status transition only — the aggregator's response follows
         // through the normal message stream. No committed transcript entry.
-        return
+        return;
 
-      case 'moa.progress':
+      case "moa.progress":
         // Live fan-out progress — one activity line, replaced in place as each
         // reference completes ("MoA: refs 2/3"), so the user sees movement
         // during the (potentially long) reference phase without transcript spam.
-        if (typeof ev.payload?.refs_done === 'number' && typeof ev.payload?.refs_total === 'number') {
-          turnController.pushActivity(`MoA: refs ${ev.payload.refs_done}/${ev.payload.refs_total}`, 'info', 'MoA')
+        if (
+          typeof ev.payload?.refs_done === "number" &&
+          typeof ev.payload?.refs_total === "number"
+        ) {
+          turnController.pushActivity(
+            `MoA: refs ${ev.payload.refs_done}/${ev.payload.refs_total}`,
+            "info",
+            "MoA",
+          );
         }
 
-        return
+        return;
 
-      case 'moa.phase':
+      case "moa.phase":
         // Phase transition — currently only phase="aggregator" (fan-out done,
         // aggregator acting). Swap the progress line for aggregator copy.
-        if (ev.payload?.phase === 'aggregator') {
-          turnController.pushActivity('MoA: aggregating…', 'info', 'MoA')
+        if (ev.payload?.phase === "aggregator") {
+          turnController.pushActivity("MoA: aggregating…", "info", "MoA");
         }
 
-        return
+        return;
 
-      case 'tool.generating':
+      case "tool.generating":
         if (ev.payload?.name) {
-          turnController.pushTrail(`drafting ${ev.payload.name}…`)
+          turnController.pushTrail(`drafting ${ev.payload.name}…`);
         }
 
-        return
+        return;
 
-      case 'reaction':
+      case "reaction":
         // Core-detected affection (ily / <3 / good bot): flash the ♥.
-        flashGoodVibes()
+        flashGoodVibes();
 
-        return
+        return;
 
-      case 'tool.start':
+      case "tool.start":
         if (!ev.payload) {
-          return
+          return;
         }
 
         turnController.recordToolStart(
           ev.payload.tool_id,
-          ev.payload.name ?? 'tool',
-          ev.payload.context ?? '',
-          ev.payload.args_text ? stripAnsi(String(ev.payload.args_text)) : undefined,
-          ev.payload.labels ?? undefined
-        )
+          ev.payload.name ?? "tool",
+          ev.payload.context ?? "",
+          ev.payload.args_text
+            ? stripAnsi(String(ev.payload.args_text))
+            : undefined,
+          ev.payload.labels ?? undefined,
+        );
 
-        return
-      case 'tool.complete': {
+        return;
+      case "tool.complete": {
         // The clarify tool finishing with its overlay still live means it was
         // abandoned (backend _block timed out, empty answer). A real answer
         // clears the overlay in answerClarify() before this fires, so this
         // no-ops there. Persist the question + options so they don't vanish.
         if (!ev.payload) {
-          return
+          return;
         }
 
-        if (ev.payload.name === 'clarify') {
-          flushAbandonedClarify()
+        if (ev.payload.name === "clarify") {
+          flushAbandonedClarify();
         }
 
         const inlineDiffText =
-          ev.payload.inline_diff && getUiState().inlineDiffs ? stripAnsi(String(ev.payload.inline_diff)).trim() : ''
+          ev.payload.inline_diff && getUiState().inlineDiffs
+            ? stripAnsi(String(ev.payload.inline_diff)).trim()
+            : "";
 
-        const resultText = ev.payload.result_text ? stripAnsi(String(ev.payload.result_text)) : undefined
+        const resultText = ev.payload.result_text
+          ? stripAnsi(String(ev.payload.result_text))
+          : undefined;
 
         if (inlineDiffText) {
           turnController.recordInlineDiffToolComplete(
@@ -1122,8 +1277,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ev.payload.name,
             ev.payload.duration_s ?? undefined,
             resultText,
-            ev.payload.labels ?? undefined
-          )
+            ev.payload.labels ?? undefined,
+          );
         } else {
           turnController.recordToolComplete(
             ev.payload.tool_id,
@@ -1132,338 +1287,387 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ev.payload.duration_s ?? undefined,
             ev.payload.todos ?? undefined,
             resultText,
-            ev.payload.labels ?? undefined
-          )
+            ev.payload.labels ?? undefined,
+          );
         }
 
-        return
+        return;
       }
 
-      case 'request.cancel': {
+      case "request.cancel": {
         // The backend withdrew a server→client request (timeout / interrupt /
         // session close): tear down whichever card carries that id. A clarify
         // that timed out is persisted as an abandoned prompt by tool.complete.
-        const id = ev.payload?.id
+        const id = ev.payload?.id;
 
         if (!id) {
-          return
+          return;
         }
 
         // A password/secret card that timed out vanished silently; say what
         // happened and how to get it back. Clarify already records its own
         // "(timed out)" line via tool.complete.
-        const timeoutNotice = promptTimeoutNotice(ev.payload?.method, ev.payload?.reason)
+        const timeoutNotice = promptTimeoutNotice(
+          ev.payload?.method,
+          ev.payload?.reason,
+        );
 
         if (timeoutNotice) {
-          sys(timeoutNotice)
+          sys(timeoutNotice);
         }
 
-        forgetServerRequest(id)
-        patchOverlayState(prev => {
-          const next = { ...prev }
-          let changed = false
+        forgetServerRequest(id);
+        patchOverlayState((prev) => {
+          const next = { ...prev };
+          let changed = false;
 
-          for (const key of ['approval', 'clarify', 'secret', 'sudo'] as const) {
+          for (const key of [
+            "approval",
+            "clarify",
+            "secret",
+            "sudo",
+          ] as const) {
             if (prev[key]?.requestId === id) {
-              next[key] = null
-              changed = true
+              next[key] = null;
+              changed = true;
             }
           }
 
-          return changed ? next : prev
-        })
+          return changed ? next : prev;
+        });
 
-        return
+        return;
       }
 
-      case 'plan.show': {
-        const p = ev.payload
+      case "plan.show": {
+        const p = ev.payload;
 
         // Show the plan once when it is proposed (or finally rejected); the approved update only adds the verdict.
-        if (!p || (p.status === 'approved' && !p.advisor && !p.auto_approved)) {
-          return
+        if (!p || (p.status === "approved" && !p.advisor && !p.auto_approved)) {
+          return;
         }
 
-        const head = `plan (${p.scope}, risk ${p.risk}) — ${p.status}${p.auto_approved ? ' automatically' : ''}`
-        const body = p.status === 'proposed' ? `\n${p.plan}` : ''
-        const note = p.fanout_candidate ? '\nlarge task: independent steps fan out to parallel sub-agents' : ''
-        const critique = p.advisor ? `\nadvisor: ${p.advisor}` : ''
+        const head = `plan (${p.scope}, risk ${p.risk}) — ${p.status}${p.auto_approved ? " automatically" : ""}`;
+        const body = p.status === "proposed" ? `\n${p.plan}` : "";
+        const note = p.fanout_candidate
+          ? "\nlarge task: independent steps fan out to parallel sub-agents"
+          : "";
+        const critique = p.advisor ? `\nadvisor: ${p.advisor}` : "";
 
-        sys(`${head}${body}${note}${critique}`)
+        sys(`${head}${body}${note}${critique}`);
 
-        return
+        return;
       }
 
-      case 'fanout.plan':
+      case "fanout.plan":
         if (ev.payload) {
-          const t = ev.payload.test_command ? `, tests: ${ev.payload.test_command}` : ''
+          const t = ev.payload.test_command
+            ? `, tests: ${ev.payload.test_command}`
+            : "";
 
-          sys(`fan-out: ${ev.payload.subtasks.length} subtasks, up to ${ev.payload.max_parallel} in parallel${t}`)
+          sys(
+            `fan-out: ${ev.payload.subtasks.length} subtasks, up to ${ev.payload.max_parallel} in parallel${t}`,
+          );
         }
 
-        return
+        return;
 
-      case 'fanout.progress':
-        if (ev.payload && ['merged', 'retrying', 'escalated', 'failed', 'skipped'].includes(ev.payload.state)) {
-          const d = ev.payload.detail ? ` — ${ev.payload.detail.split('\n')[0]}` : ''
+      case "fanout.progress":
+        if (
+          ev.payload &&
+          ["merged", "retrying", "escalated", "failed", "skipped"].includes(
+            ev.payload.state,
+          )
+        ) {
+          const d = ev.payload.detail
+            ? ` — ${ev.payload.detail.split("\n")[0]}`
+            : "";
 
-          sys(`fan-out ${ev.payload.done}/${ev.payload.total} · ${ev.payload.title}: ${ev.payload.state}${d}`)
+          sys(
+            `fan-out ${ev.payload.done}/${ev.payload.total} · ${ev.payload.title}: ${ev.payload.state}${d}`,
+          );
         }
 
-        return
+        return;
 
-      case 'fanout.done':
+      case "fanout.done":
         if (ev.payload) {
-          sys(`fan-out done: ${ev.payload.merged}/${ev.payload.total} merged, tests ${ev.payload.tests}`)
+          sys(
+            `fan-out done: ${ev.payload.merged}/${ev.payload.total} merged, tests ${ev.payload.tests}`,
+          );
         }
 
-        return
+        return;
 
-      case 'ultra.progress':
+      case "ultra.progress":
         if (ev.payload) {
-          const b = ev.payload.max_agents ? ` [${ev.payload.agents ?? 0}/${ev.payload.max_agents} agents]` : ''
+          const b = ev.payload.max_agents
+            ? ` [${ev.payload.agents ?? 0}/${ev.payload.max_agents} agents]`
+            : "";
 
-          sys(`/${ev.payload.command}: ${ev.payload.phase}${ev.payload.detail ? ` — ${ev.payload.detail}` : ''}${b}`)
+          sys(
+            `/${ev.payload.command}: ${ev.payload.phase}${ev.payload.detail ? ` — ${ev.payload.detail}` : ""}${b}`,
+          );
         }
 
-        return
+        return;
 
-      case 'research.progress':
+      case "research.progress":
         if (ev.payload) {
-          sys(`/ultraresearch: ${ev.payload.phase}${ev.payload.detail ? ` — ${ev.payload.detail}` : ''}`)
+          sys(
+            `/ultraresearch: ${ev.payload.phase}${ev.payload.detail ? ` — ${ev.payload.detail}` : ""}`,
+          );
         }
 
-        return
+        return;
 
-      case 'session.background_done':
-        return
+      case "session.background_done":
+        return;
 
-      case 'proposal.show':
+      case "proposal.show":
         if (ev.payload) {
-          addProposal(ev.payload)
+          addProposal(ev.payload);
         }
 
-        return
+        return;
 
-      case 'scope.verdict':
+      case "scope.verdict":
         if (ev.payload) {
-          sys(`scope: ${ev.payload.scope}, risk ${ev.payload.risk}${ev.payload.needs_plan ? ', plan first' : ''}`)
+          sys(
+            `scope: ${ev.payload.scope}, risk ${ev.payload.risk}${ev.payload.needs_plan ? ", plan first" : ""}`,
+          );
         }
 
-        return
+        return;
 
-      case 'routing.escalated':
+      case "routing.escalated":
         if (ev.payload) {
-          sys(`escalated ${ev.payload.task_kind}: ${ev.payload.from} → ${ev.payload.to} (${ev.payload.reason})`)
+          sys(
+            `escalated ${ev.payload.task_kind}: ${ev.payload.from} → ${ev.payload.to} (${ev.payload.reason})`,
+          );
         }
 
-        return
+        return;
 
-      case 'background.complete':
+      case "background.complete":
         if (!ev.payload) {
-          return
+          return;
         }
 
-        dropBgTask(ev.payload.task_id)
-        sys(`[bg ${ev.payload.task_id}] ${ev.payload.text}`)
+        dropBgTask(ev.payload.task_id);
+        sys(`[bg ${ev.payload.task_id}] ${ev.payload.text}`);
 
-        return
+        return;
 
-      case 'btw.complete':
+      case "btw.complete":
         if (!ev.payload) {
-          return
+          return;
         }
 
-        sys(`[btw${ev.payload.question ? ` "${ev.payload.question}"` : ''}] ${ev.payload.text}`)
+        sys(
+          `[btw${ev.payload.question ? ` "${ev.payload.question}"` : ""}] ${ev.payload.text}`,
+        );
 
-        return
-      case 'review.summary': {
+        return;
+      case "review.summary": {
         // Self-improvement background review emitted a persistent summary
         // of what it saved to memory/skills. Surface it as a system line
         // in the transcript so it never gets lost to a transient status
         // flash. Python-side already formats it as "💾 Self-improvement
         // review: …".
-        const text = String(ev.payload?.text ?? '').trim()
+        const text = String(ev.payload?.text ?? "").trim();
 
         if (text) {
-          sys(text)
+          sys(text);
         }
 
-        return
+        return;
       }
 
-      case 'subagent.spawn_requested':
+      case "subagent.spawn_requested":
         // Child built but not yet running (waiting on ThreadPoolExecutor slot).
         // Preserve completed state if a later event races in before this one.
         if (!ev.payload) {
-          return
+          return;
         }
 
-        turnController.upsertSubagent(ev.payload, c => (isTerminalStatus(c.status) ? {} : { status: 'queued' }))
+        turnController.upsertSubagent(ev.payload, (c) =>
+          isTerminalStatus(c.status) ? {} : { status: "queued" },
+        );
 
         // First sign of delegation this turn → nudge toward /agents.
-        maybeNudgeAgents()
+        maybeNudgeAgents();
 
         // Prime the status-bar HUD: fetch caps (once every 5s) so we can
         // warn as depth/concurrency approaches the configured ceiling.
         if (getDelegationState().maxSpawnDepth === null) {
-          refreshDelegationStatus(true)
+          refreshDelegationStatus(true);
         } else {
-          refreshDelegationStatus()
+          refreshDelegationStatus();
         }
 
-        return
+        return;
 
-      case 'subagent.start':
+      case "subagent.start":
         if (!ev.payload) {
-          return
+          return;
         }
 
-        turnController.upsertSubagent(ev.payload, c => (isTerminalStatus(c.status) ? {} : { status: 'running' }))
+        turnController.upsertSubagent(ev.payload, (c) =>
+          isTerminalStatus(c.status) ? {} : { status: "running" },
+        );
 
         // `subagent.start` is the first delegation event the TUI reliably
         // receives (the delegate callback drops `spawn_requested` in the
         // CLI→gateway path), so nudge here too.  Once-per-turn guarded, so
         // hooking both events is safe.
-        maybeNudgeAgents()
+        maybeNudgeAgents();
 
-        return
-      case 'subagent.thinking': {
+        return;
+      case "subagent.thinking": {
         if (!ev.payload) {
-          return
+          return;
         }
 
-        const text = String(ev.payload.text ?? '').trim()
+        const text = String(ev.payload.text ?? "").trim();
 
         if (!text) {
-          return
+          return;
         }
 
         // Update-only: never resurrect subagents whose spawn_requested/start
         // we missed or that already flushed via message.complete.
         turnController.upsertSubagent(
           ev.payload,
-          c => ({
+          (c) => ({
             status: keepTerminalElseRunning(c.status),
-            thinking: pushThinking(c.thinking, text)
+            thinking: pushThinking(c.thinking, text),
           }),
-          { createIfMissing: false }
-        )
+          { createIfMissing: false },
+        );
 
-        return
+        return;
       }
 
-      case 'subagent.tool': {
+      case "subagent.tool": {
         if (!ev.payload) {
-          return
+          return;
         }
 
         const line = formatToolCall(
-          ev.payload.tool_name ?? 'delegate_task',
-          ev.payload.tool_preview ?? ev.payload.text ?? ''
-        )
+          ev.payload.tool_name ?? "delegate_task",
+          ev.payload.tool_preview ?? ev.payload.text ?? "",
+        );
 
         turnController.upsertSubagent(
           ev.payload,
-          c => ({
+          (c) => ({
             status: keepTerminalElseRunning(c.status),
-            tools: pushTool(c.tools, line)
+            tools: pushTool(c.tools, line),
           }),
-          { createIfMissing: false }
-        )
+          { createIfMissing: false },
+        );
 
-        return
+        return;
       }
 
-      case 'subagent.progress': {
+      case "subagent.progress": {
         if (!ev.payload) {
-          return
+          return;
         }
 
-        const text = String(ev.payload.text ?? '').trim()
+        const text = String(ev.payload.text ?? "").trim();
 
         if (!text) {
-          return
+          return;
         }
 
         turnController.upsertSubagent(
           ev.payload,
-          c => ({
+          (c) => ({
             notes: pushNote(c.notes, text),
-            status: keepTerminalElseRunning(c.status)
+            status: keepTerminalElseRunning(c.status),
           }),
-          { createIfMissing: false }
-        )
+          { createIfMissing: false },
+        );
 
-        return
+        return;
       }
 
-      case 'subagent.complete': {
-        const done = ev.payload
+      case "subagent.complete": {
+        const done = ev.payload;
 
         if (!done) {
-          return
+          return;
         }
 
         turnController.upsertSubagent(
           done,
-          c => ({
+          (c) => ({
             durationSeconds: done.duration_seconds ?? c.durationSeconds,
-            status: normalizeSubagentStatus(done.status, 'completed'),
-            summary: done.summary || done.text || c.summary
+            status: normalizeSubagentStatus(done.status, "completed"),
+            summary: done.summary || done.text || c.summary,
           }),
-          { createIfMissing: false }
-        )
+          { createIfMissing: false },
+        );
 
-        return
+        return;
       }
 
-      case 'message.delta':
+      case "message.delta":
         // Estimates the working line's token count while the reply streams.
-        addStreamedText(ev.payload?.text)
-        turnController.recordMessageDelta(ev.payload ?? ({} as StreamDeltaPayload))
+        addStreamedText(ev.payload?.text);
+        turnController.recordMessageDelta(
+          ev.payload ?? ({} as StreamDeltaPayload),
+        );
 
-        return
-      case 'message.interim': {
-        const text = ev.payload?.text
+        return;
+      case "message.interim": {
+        const text = ev.payload?.text;
 
-        if (typeof text === 'string' && text.trim()) {
-          turnController.recordInterimMessage(text)
+        if (typeof text === "string" && text.trim()) {
+          turnController.recordInterimMessage(text);
         }
 
-        return
+        return;
       }
 
-      case 'message.complete': {
+      case "message.complete": {
         // The turn is over: text whose call never reported usage keeps its estimate.
-        settleOutput(0)
+        settleOutput(0);
 
-        const { finalMessages, finalText, interruptedReply, wasInterrupted } = turnController.recordMessageComplete(
-          ev.payload ?? {}
-        )
+        const { finalMessages, finalText, interruptedReply, wasInterrupted } =
+          turnController.recordMessageComplete(ev.payload ?? {});
 
         // Ctrl+C sealed the reply before the agent stopped streaming: take the
         // persisted partial so the screen shows what state.db (and the next
         // request) holds.
         if (interruptedReply?.from === null) {
-          appendMessage({ role: 'assistant', text: interruptedReply.to })
+          appendMessage({ role: "assistant", text: interruptedReply.to });
         } else if (interruptedReply) {
-          const { from, to } = interruptedReply
+          const { from, to } = interruptedReply;
 
-          setHistoryItems(prev => {
-            const at = prev.findLastIndex(m => m.role === 'assistant' && m.text === from)
+          setHistoryItems((prev) => {
+            const at = prev.findLastIndex(
+              (m) => m.role === "assistant" && m.text === from,
+            );
 
-            return at < 0 ? prev : prev.map((m, i) => (i === at ? { ...m, text: to } : m))
-          })
+            return at < 0
+              ? prev
+              : prev.map((m, i) => (i === at ? { ...m, text: to } : m));
+          });
         }
 
         if (!wasInterrupted) {
-          const payload = ev.payload ?? {}
+          const payload = ev.payload ?? {};
           // A failed turn with no reply: the backend's assistant-slot text is
           // "Error: <raw provider body>". Render the structured error_surface
           // (layer/code/retryable) as a plain title + Details + next step
           // instead; a partial reply keeps its streamed text.
-          const failed = payload.status === 'error' && !payload.partial && isBareErrorText(finalText, payload.error)
+          const failed =
+            payload.status === "error" &&
+            !payload.partial &&
+            isBareErrorText(finalText, payload.error);
 
           // Only the trailing bare-error slot is replaced; interim segments the
           // model streamed before the failure stay in the transcript.
@@ -1473,54 +1677,60 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
                   (m, i) =>
                     !(
                       i === finalMessages.length - 1 &&
-                      m.role === 'assistant' &&
+                      m.role === "assistant" &&
                       isBareErrorText(m.text, payload.error)
-                    )
+                    ),
                 ),
-                { role: 'assistant', text: describeTurnFailure(payload) }
+                { role: "assistant", text: describeTurnFailure(payload) },
               ]
             : finalMessages.length
               ? finalMessages
-              : [{ role: 'assistant', text: finalText }]
+              : [{ role: "assistant", text: finalText }];
 
-          msgs.forEach(appendMessage)
+          msgs.forEach(appendMessage);
 
           if (bellOnComplete && stdout?.isTTY) {
-            stdout.write('\x07')
+            stdout.write("\x07");
           }
         }
 
-        setStatus('ready')
+        setStatus("ready");
 
         if (ev.payload?.warning) {
-          turnController.pushActivity(ev.payload.warning, 'warn')
+          turnController.pushActivity(ev.payload.warning, "warn");
         }
 
         if (ev.payload?.usage) {
-          patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, ev.payload!.usage ?? undefined) }))
+          patchUiState((state) => ({
+            ...state,
+            usage: mergeUsageStable(
+              state.usage,
+              ev.payload!.usage ?? undefined,
+            ),
+          }));
         }
 
-        return
+        return;
       }
 
-      case 'error':
-        turnController.recordError()
+      case "error":
+        turnController.recordError();
 
         {
-          const message = String(ev.payload?.message || 'unknown error')
+          const message = String(ev.payload?.message || "unknown error");
 
-          turnController.pushActivity(message, 'error')
+          turnController.pushActivity(message, "error");
 
           if (NO_PROVIDER_RE.test(message)) {
-            panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections())
-            setStatus('setup required')
+            panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections());
+            setStatus("setup required");
 
-            return
+            return;
           }
 
-          sys(`error: ${describeRpcError(new Error(message))}`)
-          setStatus('ready')
+          sys(`error: ${describeRpcError(new Error(message))}`);
+          setStatus("ready");
         }
     }
-  }
+  };
 }

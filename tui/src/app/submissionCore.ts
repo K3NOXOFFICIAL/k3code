@@ -1,21 +1,25 @@
-import type { GatewayClient } from '../gatewayClient.js'
-import type { InputDetectDropResponse, PromptSubmitResponse } from '../gatewayTypes.js'
-import type { Msg } from '../types.js'
+import type { GatewayClient } from "../gatewayClient.js";
+import type {
+  InputDetectDropResponse,
+  PromptSubmitResponse,
+} from "../gatewayTypes.js";
+import type { Msg } from "../types.js";
 
-import { turnController } from './turnController.js'
-import { getUiState, patchUiState } from './uiStore.js'
+import { turnController } from "./turnController.js";
+import { getUiState, patchUiState } from "./uiStore.js";
 
-const SESSION_BUSY_RE = /session busy|waiting for model response/i
+const SESSION_BUSY_RE = /session busy|waiting for model response/i;
 
-export const isSessionBusyError = (e: unknown) => e instanceof Error && SESSION_BUSY_RE.test(e.message)
+export const isSessionBusyError = (e: unknown) =>
+  e instanceof Error && SESSION_BUSY_RE.test(e.message);
 
 export interface SubmitPromptDeps {
-  appendMessage: (msg: Msg) => void
-  enqueue: (text: string) => void
-  expand: (text: string) => string
-  gw: GatewayClient
-  setLastUserMsg: (value: string) => void
-  sys: (text: string) => void
+  appendMessage: (msg: Msg) => void;
+  enqueue: (text: string) => void;
+  expand: (text: string) => string;
+  gw: GatewayClient;
+  setLastUserMsg: (value: string) => void;
+  sys: (text: string) => void;
 }
 
 // Optimistically flip the session to busy the INSTANT a prompt is accepted for
@@ -35,7 +39,7 @@ export interface SubmitPromptDeps {
 // Marking busy at the choke point closes the gap for every caller: the mainline
 // submit, queue-edit picks, and the drain effect all funnel through here.
 export function markSubmitting(): void {
-  patchUiState({ busy: true, status: 'running…' })
+  patchUiState({ busy: true, status: "running…" });
 }
 
 // Submit a ready prompt (already resolved to be neither a slash command nor a
@@ -50,53 +54,65 @@ export function submitPrompt(
   deps: SubmitPromptDeps,
   showUserMessage = true,
   displayOverride?: string,
-  opts: { skipDetectDrop?: boolean } = {}
+  opts: { skipDetectDrop?: boolean } = {},
 ): void {
-  const sid = getUiState().sid
+  const sid = getUiState().sid;
 
   if (!sid) {
-    return deps.sys('session not ready yet')
+    return deps.sys("session not ready yet");
   }
 
   // Close the async-busy gap up front, before the detect_drop round-trip.
-  markSubmitting()
+  markSubmitting();
 
-  const startSubmit = (displayText: string, submitText: string, show = true) => {
-    const liveSid = getUiState().sid
+  const startSubmit = (
+    displayText: string,
+    submitText: string,
+    show = true,
+  ) => {
+    const liveSid = getUiState().sid;
 
     if (!liveSid) {
-      return deps.sys('session not ready yet')
+      return deps.sys("session not ready yet");
     }
 
-    turnController.clearStatusTimer()
-    deps.setLastUserMsg(text)
+    turnController.clearStatusTimer();
+    deps.setLastUserMsg(text);
 
     if (show) {
-      deps.appendMessage({ role: 'user', text: displayOverride || displayText })
+      deps.appendMessage({
+        role: "user",
+        text: displayOverride || displayText,
+      });
     }
 
-    patchUiState({ busy: true, status: 'running…' })
-    turnController.bufRef = ''
-    turnController.interrupted = false
+    patchUiState({ busy: true, status: "running…" });
+    turnController.bufRef = "";
+    turnController.interrupted = false;
 
     deps.gw
-      .request<PromptSubmitResponse>('prompt.submit', { session_id: liveSid, text: submitText })
+      .request<PromptSubmitResponse>("prompt.submit", {
+        session_id: liveSid,
+        text: submitText,
+      })
       .catch((e: Error) => {
         // Defensive: prompt.submit no longer rejects a mid-turn send with
         // "session busy" (the gateway queues it and returns success), but keep
         // the re-queue path as a safety net for any future/legacy gateway that
         // still errors, so a message is never silently dropped.
         if (isSessionBusyError(e)) {
-          deps.enqueue(submitText)
-          patchUiState({ busy: true, status: 'queued for next turn' })
+          deps.enqueue(submitText);
+          patchUiState({ busy: true, status: "queued for next turn" });
 
-          return deps.sys(`queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? '…' : ''}"`)
+          return deps.sys(
+            `queued: "${submitText.slice(0, 50)}${submitText.length > 50 ? "…" : ""}"`,
+          );
         }
 
-        deps.sys(`error: ${e.message}`)
-        patchUiState({ busy: false, status: 'ready' })
-      })
-  }
+        deps.sys(`error: ${e.message}`);
+        patchUiState({ busy: false, status: "ready" });
+      });
+  };
 
   // Always ask the backend whether this looks like a file drop. The backend's
   // _detect_file_drop handles paths with spaces, quotes, Windows drive letters,
@@ -108,17 +124,20 @@ export function submitPrompt(
   // in place. Announcing it a second time above the status bar was the old
   // out-of-band attachment UI.
   if (opts.skipDetectDrop) {
-    return startSubmit(text, deps.expand(text), showUserMessage)
+    return startSubmit(text, deps.expand(text), showUserMessage);
   }
 
   deps.gw
-    .request<InputDetectDropResponse>('input.detect_drop', { session_id: sid, text })
-    .then(r => {
+    .request<InputDetectDropResponse>("input.detect_drop", {
+      session_id: sid,
+      text,
+    })
+    .then((r) => {
       if (!r?.matched) {
-        return startSubmit(text, deps.expand(text), showUserMessage)
+        return startSubmit(text, deps.expand(text), showUserMessage);
       }
 
-      startSubmit(r.text || text, deps.expand(r.text || text), showUserMessage)
+      startSubmit(r.text || text, deps.expand(r.text || text), showUserMessage);
     })
-    .catch(() => startSubmit(text, deps.expand(text), showUserMessage))
+    .catch(() => startSubmit(text, deps.expand(text), showUserMessage));
 }

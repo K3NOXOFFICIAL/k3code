@@ -1,5 +1,5 @@
-import type { ComposerToken } from '../app/interfaces.js'
-import { PASTE_SNIPPET_RE } from '../protocol/paste.js'
+import type { ComposerToken } from "../app/interfaces.js";
+import { PASTE_SNIPPET_RE } from "../protocol/paste.js";
 
 /**
  * Composer tokens are the ONE way deferred content shows up in the input line:
@@ -13,18 +13,21 @@ import { PASTE_SNIPPET_RE } from '../protocol/paste.js'
  *   - Position in the text is meaningful: the model sees the payload where the
  *     token sat, not stapled to the front of the turn.
  */
-export const imageToken = (index: number) => `[[ Image ${index} ]]`
+export const imageToken = (index: number) => `[[ Image ${index} ]]`;
 
 /** Highest image token index handed out so far, so a new one never collides. */
 export const nextImageIndex = (tokens: ComposerToken[]) =>
-  tokens.reduce((max, t) => (t.kind === 'image' ? Math.max(max, t.index) : max), 0) + 1
+  tokens.reduce(
+    (max, t) => (t.kind === "image" ? Math.max(max, t.index) : max),
+    0,
+  ) + 1;
 
 /** Tokens whose label is no longer anywhere in the composer text. */
 export const droppedTokens = (tokens: ComposerToken[], value: string) => {
-  const live = new Set(value.match(PASTE_SNIPPET_RE) ?? [])
+  const live = new Set(value.match(PASTE_SNIPPET_RE) ?? []);
 
-  return tokens.filter(t => !live.has(t.label))
-}
+  return tokens.filter((t) => !live.has(t.label));
+};
 
 /**
  * Resolve every token in `value` to what the agent should actually receive.
@@ -38,27 +41,32 @@ export const droppedTokens = (tokens: ComposerToken[], value: string) => {
  * adjacent space to avoid leaving a gap in the middle of a sentence.
  */
 export const expandTokens = (tokens: ComposerToken[]) => {
-  const byLabel = new Map<string, ComposerToken[]>()
+  const byLabel = new Map<string, ComposerToken[]>();
 
   for (const token of tokens) {
-    const hit = byLabel.get(token.label)
+    const hit = byLabel.get(token.label);
     if (hit) {
-      hit.push(token)
+      hit.push(token);
     } else {
-      byLabel.set(token.label, [token])
+      byLabel.set(token.label, [token]);
     }
   }
 
   return (value: string) =>
     value
-      .replace(new RegExp(`[ \\t]?(?:${PASTE_SNIPPET_RE.source})`, 'g'), match => {
-        const token = byLabel.get(match.trimStart())?.shift()
+      .replace(
+        new RegExp(`[ \\t]?(?:${PASTE_SNIPPET_RE.source})`, "g"),
+        (match) => {
+          const token = byLabel.get(match.trimStart())?.shift();
 
-        if (!token) {
-          return match
-        }
+          if (!token) {
+            return match;
+          }
 
-        return token.kind === 'paste' ? match.slice(0, match.length - token.label.length) + token.text : ''
-      })
-      .trim()
-}
+          return token.kind === "paste"
+            ? match.slice(0, match.length - token.label.length) + token.text
+            : "";
+        },
+      )
+      .trim();
+};

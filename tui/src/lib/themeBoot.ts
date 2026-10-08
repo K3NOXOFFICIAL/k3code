@@ -14,110 +14,121 @@
  * every later signal overwrites it (then persists the new answer).
  */
 
-import { readFileSync, renameSync, writeFileSync } from 'fs'
-import { homedir } from 'os'
-import { join } from 'path'
+import { readFileSync, renameSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
 
-import type { Theme } from '../theme.js'
+import type { Theme } from "../theme.js";
 
 interface BootThemeFile {
   /** The resolved background hex that detection settled on, if any. */
-  background?: string
+  background?: string;
   /** The config mode pin (`display.tui_theme`) active when this cache was
    *  written. Without it a pinned theme caches incoherently — a light
    *  resolved theme next to the dark PHYSICAL background — and the next
    *  launch flashes light → dark (skin resolves against the seeded
    *  background) → light (config pin rehydrates). */
-  mode?: 'dark' | 'light'
+  mode?: "dark" | "light";
   /** The fully-resolved Theme (palette + brand) from the last session. */
-  theme?: Theme
-  version: 1
+  theme?: Theme;
+  version: 1;
 }
 
 // Profile-aware: the Python launcher exports K3CODE_HOME (set by
 // _apply_profile_override) before spawning the TUI. Falling back to
 // ~/.k3code matches the Python home helper's default.
-const bootFilePath = () => join(process.env.K3CODE_HOME ?? join(homedir(), '.k3code'), 'tui-theme-boot.json')
+const bootFilePath = () =>
+  join(
+    process.env.K3CODE_HOME ?? join(homedir(), ".k3code"),
+    "tui-theme-boot.json",
+  );
 
 // Never touch the user's real ~/.k3code from test runs (the TS suite has no
 // K3CODE_HOME isolation fixture).
-const isTestRun = () => !!process.env.VITEST || process.env.NODE_ENV === 'test'
+const isTestRun = () => !!process.env.VITEST || process.env.NODE_ENV === "test";
 
 const looksLikeTheme = (value: unknown): value is Theme => {
-  if (typeof value !== 'object' || value === null) {
-    return false
+  if (typeof value !== "object" || value === null) {
+    return false;
   }
 
-  const theme = value as Partial<Theme>
+  const theme = value as Partial<Theme>;
 
   return (
-    typeof theme.color === 'object' &&
+    typeof theme.color === "object" &&
     theme.color !== null &&
-    typeof theme.color.text === 'string' &&
-    typeof theme.color.primary === 'string' &&
-    typeof theme.brand === 'object' &&
+    typeof theme.color.text === "string" &&
+    typeof theme.color.primary === "string" &&
+    typeof theme.brand === "object" &&
     theme.brand !== null &&
-    typeof theme.brand.name === 'string'
-  )
-}
+    typeof theme.brand.name === "string"
+  );
+};
 
 export interface BootTheme {
-  background?: string
-  mode?: 'dark' | 'light'
-  theme: Theme
+  background?: string;
+  mode?: "dark" | "light";
+  theme: Theme;
 }
 
 /** Read the cached boot theme. Null on first launch / damage / test runs. */
 export function readBootTheme(): BootTheme | null {
   if (isTestRun()) {
-    return null
+    return null;
   }
 
   try {
-    const raw = JSON.parse(readFileSync(bootFilePath(), 'utf8')) as BootThemeFile
+    const raw = JSON.parse(
+      readFileSync(bootFilePath(), "utf8"),
+    ) as BootThemeFile;
 
     if (raw.version !== 1 || !looksLikeTheme(raw.theme)) {
-      return null
+      return null;
     }
 
     return {
-      background: typeof raw.background === 'string' ? raw.background : undefined,
-      mode: raw.mode === 'light' || raw.mode === 'dark' ? raw.mode : undefined,
-      theme: raw.theme
-    }
+      background:
+        typeof raw.background === "string" ? raw.background : undefined,
+      mode: raw.mode === "light" || raw.mode === "dark" ? raw.mode : undefined,
+      theme: raw.theme,
+    };
   } catch {
-    return null
+    return null;
   }
 }
 
-let writeTimer: NodeJS.Timeout | null = null
+let writeTimer: NodeJS.Timeout | null = null;
 
 /** Persist the resolved theme (debounced, atomic, fire-and-forget). */
-export function writeBootTheme(theme: Theme, background?: string, mode?: 'dark' | 'light'): void {
+export function writeBootTheme(
+  theme: Theme,
+  background?: string,
+  mode?: "dark" | "light",
+): void {
   if (isTestRun()) {
-    return
+    return;
   }
 
   if (writeTimer) {
-    clearTimeout(writeTimer)
+    clearTimeout(writeTimer);
   }
 
   writeTimer = setTimeout(() => {
-    writeTimer = null
+    writeTimer = null;
 
     try {
-      const payload: BootThemeFile = { background, mode, theme, version: 1 }
-      const path = bootFilePath()
-      const tmp = `${path}.tmp`
+      const payload: BootThemeFile = { background, mode, theme, version: 1 };
+      const path = bootFilePath();
+      const tmp = `${path}.tmp`;
 
-      writeFileSync(tmp, JSON.stringify(payload))
-      renameSync(tmp, path)
+      writeFileSync(tmp, JSON.stringify(payload));
+      renameSync(tmp, path);
     } catch {
       // Cache write failures are cosmetic — next launch just flashes once.
     }
-  }, 400)
+  }, 400);
 
-  writeTimer.unref?.()
+  writeTimer.unref?.();
 }
 
 // ── Boot-time seeding (with provenance) ──────────────────────────────
@@ -133,25 +144,28 @@ export function writeBootTheme(theme: Theme, background?: string, mode?: 'dark' 
 
 export interface BootSeedResult {
   /** The background hex this boot seeded into env, or null. */
-  seededBackground: null | string
+  seededBackground: null | string;
   /** True when the cached config pin was seeded into K3CODE_TUI_THEME. */
-  seededPin: boolean
+  seededPin: boolean;
 }
 
 // Provenance of the last seeding pass — read by invalidateBootBackground.
 // Module-load seeds process.env; tests re-seed against a fake env.
-let seeded: BootSeedResult = { seededBackground: null, seededPin: false }
+let seeded: BootSeedResult = { seededBackground: null, seededPin: false };
 
 /** Seeding step (exported for tests — module-load runs it on process.env).
  *  Explicit user signals always outrank the cache. Records provenance so
  *  invalidateBootBackground can later demote the hint. */
-export function seedBootEnvironment(boot: BootTheme | null, env: NodeJS.ProcessEnv): BootSeedResult {
-  const result: BootSeedResult = { seededBackground: null, seededPin: false }
+export function seedBootEnvironment(
+  boot: BootTheme | null,
+  env: NodeJS.ProcessEnv,
+): BootSeedResult {
+  const result: BootSeedResult = { seededBackground: null, seededPin: false };
 
-  seeded = result
+  seeded = result;
 
   if (!boot || env.K3CODE_TUI_THEME || env.K3CODE_TUI_LIGHT) {
-    return result
+    return result;
   }
 
   // Replay the config mode pin first: a pinned session caches a resolved
@@ -159,8 +173,8 @@ export function seedBootEnvironment(boot: BootTheme | null, env: NodeJS.ProcessE
   // background, and without the pin the first skin resolution flips to the
   // physical pole before config hydration flips it back (multi-stage flash).
   if (boot.mode) {
-    env.K3CODE_TUI_THEME = boot.mode
-    result.seededPin = true
+    env.K3CODE_TUI_THEME = boot.mode;
+    result.seededPin = true;
   }
 
   if (
@@ -168,14 +182,14 @@ export function seedBootEnvironment(boot: BootTheme | null, env: NodeJS.ProcessE
     // Never seed the untrusted "unset default" fingerprint — a cache written
     // before the distrust rule existed must not poison this session's
     // detection (it would also suppress the macOS-appearance fallback).
-    boot.background.toLowerCase() !== '#000000' &&
+    boot.background.toLowerCase() !== "#000000" &&
     !env.K3CODE_TUI_BACKGROUND
   ) {
-    env.K3CODE_TUI_BACKGROUND = boot.background
-    result.seededBackground = boot.background
+    env.K3CODE_TUI_BACKGROUND = boot.background;
+    result.seededBackground = boot.background;
   }
 
-  return result
+  return result;
 }
 
 /**
@@ -186,24 +200,32 @@ export function seedBootEnvironment(boot: BootTheme | null, env: NodeJS.ProcessE
  * OSC answer or explicit export that overwrote it is left alone.
  * Returns true when the slot was cleared.
  */
-export function invalidateBootBackground(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (!seeded.seededBackground || env.K3CODE_TUI_BACKGROUND !== seeded.seededBackground) {
-    return false
+export function invalidateBootBackground(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (
+    !seeded.seededBackground ||
+    env.K3CODE_TUI_BACKGROUND !== seeded.seededBackground
+  ) {
+    return false;
   }
 
-  delete env.K3CODE_TUI_BACKGROUND
-  seeded.seededBackground = null
+  delete env.K3CODE_TUI_BACKGROUND;
+  seeded.seededBackground = null;
 
-  return true
+  return true;
 }
 
-const boot = readBootTheme()
+const boot = readBootTheme();
 
 /** True when this boot replayed a cached config pin into K3CODE_TUI_THEME.
  *  applyConfiguredTuiTheme treats it as config-owned so a later 'auto' can
  *  clear it — otherwise a stale cached pin masquerades as a user shell
  *  export and becomes unclearable. */
-export const bootSeededPin: boolean = seedBootEnvironment(boot, process.env).seededPin
+export const bootSeededPin: boolean = seedBootEnvironment(
+  boot,
+  process.env,
+).seededPin;
 
 /** The cached theme for the first frame, or null on first launch. */
-export const bootTheme: Theme | null = boot?.theme ?? null
+export const bootTheme: Theme | null = boot?.theme ?? null;

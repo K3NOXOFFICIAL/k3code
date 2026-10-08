@@ -1,8 +1,8 @@
-import { useContext, useEffect } from 'react'
-import stripAnsi from 'strip-ansi'
+import { useContext, useEffect } from "react";
+import stripAnsi from "strip-ansi";
 
-import { OSC, osc } from '../termio/osc.js'
-import { TerminalWriteContext } from '../useTerminalNotification.js'
+import { OSC, osc } from "../termio/osc.js";
+import { TerminalWriteContext } from "../useTerminalNotification.js";
 
 /**
  * Declaratively set the terminal tab/window title.
@@ -20,45 +20,49 @@ import { TerminalWriteContext } from '../useTerminalNotification.js'
  *
  * On Windows, uses `process.title` (classic conhost doesn't support OSC).
  */
-export function useTerminalTitle(title: string | TerminalTitlePair | null): void {
-  const writeRaw = useContext(TerminalWriteContext)
+export function useTerminalTitle(
+  title: string | TerminalTitlePair | null,
+): void {
+  const writeRaw = useContext(TerminalWriteContext);
 
   useEffect(() => {
     if (title === null || !writeRaw) {
-      return
+      return;
     }
 
-    if (process.platform === 'win32') {
-      const clean = stripAnsi(typeof title === 'string' ? title : (title.window ?? title.tab ?? ''))
-      process.title = clean
+    if (process.platform === "win32") {
+      const clean = stripAnsi(
+        typeof title === "string" ? title : (title.window ?? title.tab ?? ""),
+      );
+      process.title = clean;
 
-      return
+      return;
     }
 
-    if (typeof title === 'string') {
-      writeRaw(osc(OSC.SET_TITLE_AND_ICON, stripAnsi(title)))
+    if (typeof title === "string") {
+      writeRaw(osc(OSC.SET_TITLE_AND_ICON, stripAnsi(title)));
 
-      return
+      return;
     }
 
     // Separate tab (OSC 1) and window (OSC 2) titles so narrow tab bars
     // show the short session name instead of a truncated tail.
-    const tab = stripAnsi(title.tab ?? '')
-    const window = stripAnsi(title.window ?? '')
+    const tab = stripAnsi(title.tab ?? "");
+    const window = stripAnsi(title.window ?? "");
 
     if (tab && window) {
-      writeRaw(osc(OSC.SET_ICON, tab) + osc(OSC.SET_TITLE, window))
+      writeRaw(osc(OSC.SET_ICON, tab) + osc(OSC.SET_TITLE, window));
     } else if (window) {
-      writeRaw(osc(OSC.SET_TITLE_AND_ICON, window))
+      writeRaw(osc(OSC.SET_TITLE_AND_ICON, window));
     } else if (tab) {
-      writeRaw(osc(OSC.SET_TITLE_AND_ICON, tab))
+      writeRaw(osc(OSC.SET_TITLE_AND_ICON, tab));
     }
-  }, [title, writeRaw])
+  }, [title, writeRaw]);
 }
 
 export interface TerminalTitlePair {
   /** Short title for the tab/icon label (OSC 1). */
-  tab?: string
+  tab?: string;
   /** Full title for the window title bar (OSC 2). */
-  window?: string
+  window?: string;
 }

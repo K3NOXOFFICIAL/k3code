@@ -149,33 +149,33 @@ Current input behavior is split across `app.tsx`, `components/textInput.tsx`, an
 
 ### Main chat input
 
-| Key                             | Behavior                                                                                                                                                |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Enter`                         | Submit the current draft                                                                                                                                |
-| empty `Enter` twice             | If queued messages exist and the agent is busy, interrupt the current run. If queued messages exist and the agent is idle, send the next queued message |
-| `Shift+Enter` / `Alt+Enter`     | Insert a newline in the current draft                                                                                                                   |
-| `\` + `Enter`                   | Append the line to the multiline buffer (fallback for terminals without modifier support)                                                               |
-| `Ctrl+C`                        | Interrupt active run, or clear the current draft, or exit if nothing is pending                                                                         |
-| `Ctrl+D`                        | Exit                                                                                                                                                    |
-| `Cmd/Ctrl+G` / `Alt+G`          | Open `$EDITOR` with the current draft (use `Alt+G` in VSCode/Cursor — they bind the primary keystroke to Find Next)                                     |
-| `Ctrl+L`                        | New session (same as `/clear`)                                                                                                                          |
-| `Ctrl+V` / `Alt+V`              | Paste text first, then fall back to image/path attachment when applicable                                                                               |
-| `Tab`                           | Apply the active completion                                                                                                                             |
-| `Up/Down`                       | Cycle completions if the completion list is open; otherwise edit queued messages first, then walk input history                                         |
-| `Left/Right`                    | Move the cursor                                                                                                                                         |
-| modified `Left/Right`           | Move by word when the terminal sends `Ctrl` or `Meta` with the arrow key                                                                                |
-| `Home` / `Ctrl+A`               | Start of line                                                                                                                                           |
-| `End` / `Ctrl+E`                | End of line                                                                                                                                             |
-| `Backspace`                     | Delete the character to the left of the cursor                                                                                                          |
-| `Delete`                        | Delete the character to the right of the cursor                                                                                                         |
-| modified `Backspace`            | Delete the previous word                                                                                                                                |
-| modified `Delete`               | Delete the next word                                                                                                                                    |
-| `Ctrl+W`                        | Delete the previous word                                                                                                                                |
-| `Ctrl+U`                        | Delete from the cursor back to the start of the line                                                                                                    |
-| `Ctrl+K`                        | Delete from the cursor to the end of the line                                                                                                           |
-| `Meta+B` / `Meta+F`             | Move by word                                                                                                                                            |
-| `!cmd`                          | Run a shell command through the gateway                                                                                                                 |
-| `{!cmd}`                        | Inline shell interpolation before send; queued drafts keep the raw text until they are sent                                                            |
+| Key                         | Behavior                                                                                                                                                |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Enter`                     | Submit the current draft                                                                                                                                |
+| empty `Enter` twice         | If queued messages exist and the agent is busy, interrupt the current run. If queued messages exist and the agent is idle, send the next queued message |
+| `Shift+Enter` / `Alt+Enter` | Insert a newline in the current draft                                                                                                                   |
+| `\` + `Enter`               | Append the line to the multiline buffer (fallback for terminals without modifier support)                                                               |
+| `Ctrl+C`                    | Interrupt active run, or clear the current draft, or exit if nothing is pending                                                                         |
+| `Ctrl+D`                    | Exit                                                                                                                                                    |
+| `Cmd/Ctrl+G` / `Alt+G`      | Open `$EDITOR` with the current draft (use `Alt+G` in VSCode/Cursor — they bind the primary keystroke to Find Next)                                     |
+| `Ctrl+L`                    | New session (same as `/clear`)                                                                                                                          |
+| `Ctrl+V` / `Alt+V`          | Paste text first, then fall back to image/path attachment when applicable                                                                               |
+| `Tab`                       | Apply the active completion                                                                                                                             |
+| `Up/Down`                   | Cycle completions if the completion list is open; otherwise edit queued messages first, then walk input history                                         |
+| `Left/Right`                | Move the cursor                                                                                                                                         |
+| modified `Left/Right`       | Move by word when the terminal sends `Ctrl` or `Meta` with the arrow key                                                                                |
+| `Home` / `Ctrl+A`           | Start of line                                                                                                                                           |
+| `End` / `Ctrl+E`            | End of line                                                                                                                                             |
+| `Backspace`                 | Delete the character to the left of the cursor                                                                                                          |
+| `Delete`                    | Delete the character to the right of the cursor                                                                                                         |
+| modified `Backspace`        | Delete the previous word                                                                                                                                |
+| modified `Delete`           | Delete the next word                                                                                                                                    |
+| `Ctrl+W`                    | Delete the previous word                                                                                                                                |
+| `Ctrl+U`                    | Delete from the cursor back to the start of the line                                                                                                    |
+| `Ctrl+K`                    | Delete from the cursor to the end of the line                                                                                                           |
+| `Meta+B` / `Meta+F`         | Move by word                                                                                                                                            |
+| `!cmd`                      | Run a shell command through the gateway                                                                                                                 |
+| `{!cmd}`                    | Inline shell interpolation before send; queued drafts keep the raw text until they are sent                                                             |
 
 Notes:
 
@@ -251,6 +251,7 @@ These are stateful UI branches in `app.tsx`, not separate screens.
 The following commands are handled directly by the TUI client. Unrecognized commands fall through to the Python gateway via `slash.exec` and `command.dispatch`.
 
 ### Core (`core.ts`)
+
 `/help`, `/quit` (alias `/exit`), `/update`, `/clear` (alias `/new`),
 `/density`, `/copy`, `/paste`, `/details` (alias `/detail`),
 `/statusbar` (alias `/sb`), `/queue` (alias `/q`), `/logs`, `/history`,
@@ -258,26 +259,32 @@ The following commands are handled directly by the TUI client. Unrecognized comm
 `/status`, `/title`, `/fortune`, `/redraw`, `/terminal-setup`
 
 ### Billing (`billing.ts`)
+
 `/billing` — manage Nous remote spending — buy credits, auto-reload, limits
 
 ### Session (`session.ts`)
+
 `/model`, `/sessions` (aliases `/switch`, `/session`, `/resume`),
 `/bg`, `/btw`, `/image`, `/personality`,
 `/compress`, `/branch` (alias `/fork`), `/voice`, `/skin`,
 `/indicator`, `/yolo`, `/reasoning`, `/fast`, `/busy`, `/verbose`, `/usage`
 
 ### Ops (`ops.ts`)
+
 `/stop`, `/reload-mcp` (alias `/reload_mcp`), `/reload`, `/browser`,
 `/rollback`, `/agents` (alias `/tasks`), `/replay`, `/replay-diff`,
 `/skills`, `/reload-skills` (alias `/reload_skills`), `/plugins`, `/tools`
 
 ### Credits (`credits.ts`)
+
 `/credits` — Nous credit balance and browser top-up
 
 ### Setup (`setup.ts`)
+
 `/setup` — launches external `hermes setup` wizard, suspends Ink while it runs
 
 ### Debug (`debug.ts`)
+
 `/heapdump`, `/mem` — V8 memory diagnostics
 
 ---
@@ -293,41 +300,41 @@ That lets Python own aliases, plugins, skills, and registry-backed commands with
 
 Primary event types the client handles today:
 
-| Event                      | Payload                                                                     |
-| -------------------------- | --------------------------------------------------------------------------- |
-| `gateway.ready`            | `{ skin? }`                                                                 |
-| `skin.changed`             | `{ skin }`                                                                  |
-| `session.info`             | session metadata for banner + tool/skill panels                             |
-| `message.start`            | start assistant streaming                                                   |
-| `message.delta`            | `{ text, rendered? }`                                                       |
-| `message.complete`         | `{ text, rendered?, usage, status }`                                        |
-| `thinking.delta`           | `{ text }`                                                                  |
-| `reasoning.delta`          | `{ text, verbose? }`                                                        |
-| `reasoning.available`      | `{ text, verbose? }`                                                        |
-| `status.update`            | `{ kind, text }`                                                            |
-| `notification.show`        | `{ id, key, kind, level, text, ttl_ms? }`                                   |
-| `notification.clear`       | `{ key }`                                                                   |
-| `tool.start`               | `{ tool_id, name, context?, args_text? }`                                   |
-| `tool.generating`          | `{ name }`                                                                  |
-| `tool.progress`            | `{ name, preview }`                                                         |
-| `tool.complete`            | `{ tool_id, name, error?, summary?, duration_s?, inline_diff?, todos? }`    |
-| `request.cancel`           | `{ id, method, reason }` clears the withdrawn server→client request         |
-| `background.complete`      | `{ task_id, text }`                                                         |
-| `billing.step_up.verification` | `{ verification_url, user_code }`                                       |
-| `review.summary`           | `{ text }`                                                                  |
-| `browser.progress`         | `{ message }`                                                               |
-| `voice.status`             | `{ state }`                                                                 |
-| `voice.transcript`         | `{ text, no_speech_limit? }`                                                |
-| `subagent.spawn_requested` | `{ subagent_id?, task_index, goal?, depth?, parent_id? }`                   |
-| `subagent.start`           | `{ subagent_id?, task_index, goal?, depth?, parent_id? }`                   |
-| `subagent.thinking`        | `{ text }`                                                                  |
-| `subagent.tool`            | `{ tool_name?, tool_preview?, text? }`                                      |
-| `subagent.progress`        | `{ text }`                                                                  |
-| `subagent.complete`        | `{ status, summary?, text?, duration_seconds? }`                            |
-| `error`                    | `{ message }`                                                               |
-| `gateway.stderr`           | synthesized from child stderr                                               |
-| `gateway.protocol_error`   | synthesized from malformed stdout                                           |
-| `gateway.start_timeout`    | `{ cwd?, python?, stderr_tail? }`                                           |
+| Event                          | Payload                                                                  |
+| ------------------------------ | ------------------------------------------------------------------------ |
+| `gateway.ready`                | `{ skin? }`                                                              |
+| `skin.changed`                 | `{ skin }`                                                               |
+| `session.info`                 | session metadata for banner + tool/skill panels                          |
+| `message.start`                | start assistant streaming                                                |
+| `message.delta`                | `{ text, rendered? }`                                                    |
+| `message.complete`             | `{ text, rendered?, usage, status }`                                     |
+| `thinking.delta`               | `{ text }`                                                               |
+| `reasoning.delta`              | `{ text, verbose? }`                                                     |
+| `reasoning.available`          | `{ text, verbose? }`                                                     |
+| `status.update`                | `{ kind, text }`                                                         |
+| `notification.show`            | `{ id, key, kind, level, text, ttl_ms? }`                                |
+| `notification.clear`           | `{ key }`                                                                |
+| `tool.start`                   | `{ tool_id, name, context?, args_text? }`                                |
+| `tool.generating`              | `{ name }`                                                               |
+| `tool.progress`                | `{ name, preview }`                                                      |
+| `tool.complete`                | `{ tool_id, name, error?, summary?, duration_s?, inline_diff?, todos? }` |
+| `request.cancel`               | `{ id, method, reason }` clears the withdrawn server→client request      |
+| `background.complete`          | `{ task_id, text }`                                                      |
+| `billing.step_up.verification` | `{ verification_url, user_code }`                                        |
+| `review.summary`               | `{ text }`                                                               |
+| `browser.progress`             | `{ message }`                                                            |
+| `voice.status`                 | `{ state }`                                                              |
+| `voice.transcript`             | `{ text, no_speech_limit? }`                                             |
+| `subagent.spawn_requested`     | `{ subagent_id?, task_index, goal?, depth?, parent_id? }`                |
+| `subagent.start`               | `{ subagent_id?, task_index, goal?, depth?, parent_id? }`                |
+| `subagent.thinking`            | `{ text }`                                                               |
+| `subagent.tool`                | `{ tool_name?, tool_preview?, text? }`                                   |
+| `subagent.progress`            | `{ text }`                                                               |
+| `subagent.complete`            | `{ status, summary?, text?, duration_seconds? }`                         |
+| `error`                        | `{ message }`                                                            |
+| `gateway.stderr`               | synthesized from child stderr                                            |
+| `gateway.protocol_error`       | synthesized from malformed stdout                                        |
+| `gateway.start_timeout`        | `{ cwd?, python?, stderr_tail? }`                                        |
 
 ## Theme model
 

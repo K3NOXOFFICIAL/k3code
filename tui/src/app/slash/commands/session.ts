@@ -1,118 +1,148 @@
-import { compactNumber } from '@k3code/shared/format'
+import { compactNumber } from "@k3code/shared/format";
 
-import { introMsg, toTranscriptMessages } from '../../../domain/messages.js'
-import { sessionScopedModelArg, TUI_SESSION_MODEL_FLAG } from '../../../domain/slash.js'
-import { parsePetCommand, PET_MIN_COLS } from '../../../lib/terminalPet.js'
+import { introMsg, toTranscriptMessages } from "../../../domain/messages.js";
+import {
+  sessionScopedModelArg,
+  TUI_SESSION_MODEL_FLAG,
+} from "../../../domain/slash.js";
+import { parsePetCommand, PET_MIN_COLS } from "../../../lib/terminalPet.js";
 import type {
   BackgroundStartResponse,
   ConfigGetValueResponse,
   ConfigSetResponse,
   SessionCompressResponse,
   SessionUsageResponse,
-  SlashExecResponse
-} from '../../../gatewayTypes.js'
-import type { PanelSection } from '../../../types.js'
-import { applyConfiguredTuiTheme } from '../../createGatewayEventHandler.js'
-import { DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES, type IndicatorStyle } from '../../interfaces.js'
-import { patchOverlayState } from '../../overlayStore.js'
-import { $petEnabled, $petName, $petParty, petConfigValue, setPetEnabled, setPetName, setPetParty } from '../../petStore.js'
-import { patchUiState } from '../../uiStore.js'
-import type { SlashCommand } from '../types.js'
+  SlashExecResponse,
+} from "../../../gatewayTypes.js";
+import type { PanelSection } from "../../../types.js";
+import { applyConfiguredTuiTheme } from "../../createGatewayEventHandler.js";
+import {
+  DEFAULT_INDICATOR_STYLE,
+  INDICATOR_STYLES,
+  type IndicatorStyle,
+} from "../../interfaces.js";
+import { patchOverlayState } from "../../overlayStore.js";
+import {
+  $petEnabled,
+  $petName,
+  $petParty,
+  petConfigValue,
+  setPetEnabled,
+  setPetName,
+  setPetParty,
+} from "../../petStore.js";
+import { patchUiState } from "../../uiStore.js";
+import type { SlashCommand } from "../types.js";
 
-const TUI_SESSION_MODEL_RE = new RegExp(`(?:^|\\s)${TUI_SESSION_MODEL_FLAG}(?:\\s|$)`)
-const REASONING_SESSION_FLAGS = new Set(['--session'])
-const REASONING_GLOBAL_FLAGS = new Set(['--global'])
+const TUI_SESSION_MODEL_RE = new RegExp(
+  `(?:^|\\s)${TUI_SESSION_MODEL_FLAG}(?:\\s|$)`,
+);
+const REASONING_SESSION_FLAGS = new Set(["--session"]);
+const REASONING_GLOBAL_FLAGS = new Set(["--global"]);
 
 const modelValueForConfigSet = (arg: string) => {
-  const trimmed = arg.trim()
+  const trimmed = arg.trim();
 
   if (!trimmed) {
-    return trimmed
+    return trimmed;
   }
 
   if (TUI_SESSION_MODEL_RE.test(trimmed)) {
-    return sessionScopedModelArg(trimmed)
+    return sessionScopedModelArg(trimmed);
   }
 
-  return trimmed
-}
+  return trimmed;
+};
 
 const reasoningConfigPayload = (arg: string, sid: string) => {
-  const parts = arg.trim().split(/\s+/).filter(Boolean)
-  let scope = ''
-  const valueParts: string[] = []
+  const parts = arg.trim().split(/\s+/).filter(Boolean);
+  let scope = "";
+  const valueParts: string[] = [];
 
   for (const part of parts) {
-    const flag = part.toLowerCase()
+    const flag = part.toLowerCase();
 
     if (REASONING_GLOBAL_FLAGS.has(flag)) {
-      scope = 'global'
+      scope = "global";
 
-      continue
+      continue;
     }
 
     if (REASONING_SESSION_FLAGS.has(flag)) {
       // Session scope is the default; accept the flag for parity with /model.
       if (!scope) {
-        scope = 'session'
+        scope = "session";
       }
 
-      continue
+      continue;
     }
 
-    valueParts.push(part)
+    valueParts.push(part);
   }
 
-  const value = valueParts.join(' ')
+  const value = valueParts.join(" ");
 
   return {
-    key: 'reasoning',
+    key: "reasoning",
     session_id: sid,
     value,
-    ...(scope ? { scope } : {})
-  }
-}
+    ...(scope ? { scope } : {}),
+  };
+};
 
 export const sessionCommands: SlashCommand[] = [
   // k3: no local /bg. The gateway's /bg handles `/bg <prompt>`, `/bg --pane <prompt>` and a bare `/bg`
   // (send the running turn to the background); the old local handler only knew `/bg <prompt>`.
 
   {
-    help: 'ask a side question about this conversation',
-    name: 'btw',
+    help: "ask a side question about this conversation",
+    name: "btw",
     run: (arg, ctx) => {
       if (!arg) {
-        return ctx.transcript.sys('/btw <question>')
+        return ctx.transcript.sys("/btw <question>");
       }
 
-      ctx.gateway.rpc<BackgroundStartResponse>('prompt.btw', { session_id: ctx.sid, text: arg }).then(
-        ctx.guarded<BackgroundStartResponse>(r => {
-          if (!r.task_id) {
-            return
-          }
-
-          ctx.transcript.sys(`btw ${r.task_id} — answering from a conversation snapshot`)
+      ctx.gateway
+        .rpc<BackgroundStartResponse>("prompt.btw", {
+          session_id: ctx.sid,
+          text: arg,
         })
-      )
-    }
+        .then(
+          ctx.guarded<BackgroundStartResponse>((r) => {
+            if (!r.task_id) {
+              return;
+            }
+
+            ctx.transcript.sys(
+              `btw ${r.task_id} — answering from a conversation snapshot`,
+            );
+          }),
+        );
+    },
   },
 
   {
-    help: 'change or show model',
-    name: 'model',
+    help: "change or show model",
+    name: "model",
     run: (arg, ctx, cmd) => {
       // k3: `/model chain [add|remove|move …]` is the gateway's fallback-chain view, not a model switch.
       if (/^chain(\s|$)/.test(arg.trim())) {
         return ctx.gateway.gw
-          .request<SlashExecResponse>('slash.exec', { command: cmd.slice(1), session_id: ctx.sid })
-          .then(r => {
+          .request<SlashExecResponse>("slash.exec", {
+            command: cmd.slice(1),
+            session_id: ctx.sid,
+          })
+          .then((r) => {
             if (ctx.stale()) {
-              return
+              return;
             }
 
-            ctx.transcript.page(r?.output || '/model chain: no output', 'Fallback chain')
+            ctx.transcript.page(
+              r?.output || "/model chain: no output",
+              "Fallback chain",
+            );
           })
-          .catch(ctx.guardedErr)
+          .catch(ctx.guardedErr);
       }
 
       // No busy guard here (unlike session switching). A model change is a
@@ -121,181 +151,209 @@ export const sessionCommands: SlashCommand[] = [
       // deferred:true) instead of rejecting. Either way the pick sticks without
       // interrupting the stream or waiting on the swap.
       if (!arg.trim()) {
-        return patchOverlayState({ modelPicker: true })
+        return patchOverlayState({ modelPicker: true });
       }
 
-      if (arg.trim() === '--refresh') {
-        return patchOverlayState({ modelPicker: { refresh: true } })
+      if (arg.trim() === "--refresh") {
+        return patchOverlayState({ modelPicker: { refresh: true } });
       }
 
       const switchModel = (confirmExpensiveModel = false) =>
         ctx.gateway
-          .rpc<ConfigSetResponse>('config.set', {
+          .rpc<ConfigSetResponse>("config.set", {
             confirm_expensive_model: confirmExpensiveModel,
-            key: 'model',
+            key: "model",
             session_id: ctx.sid,
-            value: modelValueForConfigSet(arg)
+            value: modelValueForConfigSet(arg),
           })
           .then(
-            ctx.guarded<ConfigSetResponse>(r => {
+            ctx.guarded<ConfigSetResponse>((r) => {
               if (r.confirm_required) {
                 patchOverlayState({
                   confirm: {
-                    cancelLabel: 'Cancel',
-                    confirmLabel: 'Switch anyway',
+                    cancelLabel: "Cancel",
+                    confirmLabel: "Switch anyway",
                     danger: true,
-                    detail: r.confirm_message || r.warning || 'This model has unusually high known pricing.',
+                    detail:
+                      r.confirm_message ||
+                      r.warning ||
+                      "This model has unusually high known pricing.",
                     onConfirm: () => switchModel(true),
-                    title: 'Expensive model selection'
-                  }
-                })
+                    title: "Expensive model selection",
+                  },
+                });
 
-                return
+                return;
               }
 
               if (!r.value) {
-                return ctx.transcript.sys('error: invalid response: model switch')
+                return ctx.transcript.sys(
+                  "error: invalid response: model switch",
+                );
               }
 
-              ctx.transcript.sys(r.deferred ? `model → ${r.value} (applies next turn)` : `model → ${r.value}`)
-              ctx.local.maybeWarn(r)
+              ctx.transcript.sys(
+                r.deferred
+                  ? `model → ${r.value} (applies next turn)`
+                  : `model → ${r.value}`,
+              );
+              ctx.local.maybeWarn(r);
 
-              patchUiState(state => ({
+              patchUiState((state) => ({
                 ...state,
-                info: state.info ? { ...state.info, model: r.value! } : { model: r.value!, skills: {}, tools: {} }
-              }))
-            })
-          )
+                info: state.info
+                  ? { ...state.info, model: r.value! }
+                  : { model: r.value!, skills: {}, tools: {} },
+              }));
+            }),
+          );
 
-      switchModel()
-    }
+      switchModel();
+    },
   },
 
   {
-    aliases: ['switch', 'session', 'resume'],
-    help: 'browse, switch, or resume sessions',
-    name: 'sessions',
+    aliases: ["switch", "session", "resume"],
+    help: "browse, switch, or resume sessions",
+    name: "sessions",
     run: (arg, ctx) => {
-      const trimmed = arg.trim()
+      const trimmed = arg.trim();
 
       // A new *live* session keeps the current one running in the background
       // (it doesn't close it), so fanning out while busy is allowed — that's
       // the whole point of multiple live sessions.
-      if (trimmed.toLowerCase() === 'new') {
-        return ctx.session.newLiveSession()
+      if (trimmed.toLowerCase() === "new") {
+        return ctx.session.newLiveSession();
       }
 
       // `/resume <id|title>` (and `/sessions <id>`) load a cold session and
       // CLOSE the current one, so guard it while a turn is in-flight to avoid
       // corrupting streaming/busy state. Bare opens the overlay to browse.
       if (trimmed) {
-        if (ctx.session.guardBusySessionSwitch('switch sessions')) {
-          return
+        if (ctx.session.guardBusySessionSwitch("switch sessions")) {
+          return;
         }
 
-        return ctx.session.resumeById(trimmed)
+        return ctx.session.resumeById(trimmed);
       }
 
-      patchOverlayState({ sessions: true })
-    }
+      patchOverlayState({ sessions: true });
+    },
   },
 
   {
-    help: 'attach an image',
-    name: 'image',
-    run: (arg, ctx) => ctx.composer.attachImagePath(arg)
+    help: "attach an image",
+    name: "image",
+    run: (arg, ctx) => ctx.composer.attachImagePath(arg),
   },
 
   {
-    help: 'switch personality for this session',
-    name: 'personality',
+    help: "switch personality for this session",
+    name: "personality",
     run: (arg, ctx) => {
       if (!arg) {
-        return
+        return;
       }
 
-      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'personality', session_id: ctx.sid, value: arg }).then(
-        ctx.guarded<ConfigSetResponse>(r => {
-          if (r.history_reset) {
-            ctx.session.resetVisibleHistory(r.info ?? null)
-          }
-
-          ctx.transcript.sys(`personality: ${r.value || 'default'}${r.history_reset ? ' · transcript cleared' : ''}`)
-          ctx.local.maybeWarn(r)
-        })
-      )
-    }
-  },
-
-  {
-    help: 'compress transcript',
-    name: 'compress',
-    run: (arg, ctx) => {
       ctx.gateway
-        .rpc<SessionCompressResponse>('session.compress', {
+        .rpc<ConfigSetResponse>("config.set", {
+          key: "personality",
           session_id: ctx.sid,
-          ...(arg ? { focus_topic: arg } : {})
+          value: arg,
         })
         .then(
-          ctx.guarded<SessionCompressResponse>(r => {
-            if (Array.isArray(r.messages)) {
-              const rows = toTranscriptMessages(r.messages)
-
-              ctx.transcript.setHistoryItems(r.info ? [introMsg(r.info), ...rows] : rows)
-            }
-
-            if (r.info) {
-              patchUiState({ info: r.info })
-            }
-
-            if (r.usage) {
-              patchUiState(state => ({ ...state, usage: { ...state.usage, ...r.usage } }))
-            }
-
-            if (r.summary?.headline) {
-              const prefix = r.summary.noop ? '' : '✓ '
-
-              ctx.transcript.sys(`${prefix}${r.summary.headline}`)
-
-              if (r.summary.token_line) {
-                ctx.transcript.sys(`  ${r.summary.token_line}`)
-              }
-
-              if (r.summary.note) {
-                ctx.transcript.sys(`  ${r.summary.note}`)
-              }
-
-              return
-            }
-
-            if ((r.removed ?? 0) <= 0) {
-              return ctx.transcript.sys('nothing to compress')
+          ctx.guarded<ConfigSetResponse>((r) => {
+            if (r.history_reset) {
+              ctx.session.resetVisibleHistory(r.info ?? null);
             }
 
             ctx.transcript.sys(
-              `compressed ${r.removed} messages${r.usage?.total ? ` · ${compactNumber(r.usage.total)} tok` : ''}`
-            )
-          })
-        )
-        .catch(ctx.guardedErr)
-    }
+              `personality: ${r.value || "default"}${r.history_reset ? " · transcript cleared" : ""}`,
+            );
+            ctx.local.maybeWarn(r);
+          }),
+        );
+    },
   },
 
   {
-    help: 'pin light/dark mode or trust auto-detection (usage: /theme [auto|light|dark])',
-    name: 'theme',
-    usage: '/theme [auto|light|dark]',
+    help: "compress transcript",
+    name: "compress",
     run: (arg, ctx) => {
-      const value = arg.trim().toLowerCase()
+      ctx.gateway
+        .rpc<SessionCompressResponse>("session.compress", {
+          session_id: ctx.sid,
+          ...(arg ? { focus_topic: arg } : {}),
+        })
+        .then(
+          ctx.guarded<SessionCompressResponse>((r) => {
+            if (Array.isArray(r.messages)) {
+              const rows = toTranscriptMessages(r.messages);
+
+              ctx.transcript.setHistoryItems(
+                r.info ? [introMsg(r.info), ...rows] : rows,
+              );
+            }
+
+            if (r.info) {
+              patchUiState({ info: r.info });
+            }
+
+            if (r.usage) {
+              patchUiState((state) => ({
+                ...state,
+                usage: { ...state.usage, ...r.usage },
+              }));
+            }
+
+            if (r.summary?.headline) {
+              const prefix = r.summary.noop ? "" : "✓ ";
+
+              ctx.transcript.sys(`${prefix}${r.summary.headline}`);
+
+              if (r.summary.token_line) {
+                ctx.transcript.sys(`  ${r.summary.token_line}`);
+              }
+
+              if (r.summary.note) {
+                ctx.transcript.sys(`  ${r.summary.note}`);
+              }
+
+              return;
+            }
+
+            if ((r.removed ?? 0) <= 0) {
+              return ctx.transcript.sys("nothing to compress");
+            }
+
+            ctx.transcript.sys(
+              `compressed ${r.removed} messages${r.usage?.total ? ` · ${compactNumber(r.usage.total)} tok` : ""}`,
+            );
+          }),
+        )
+        .catch(ctx.guardedErr);
+    },
+  },
+
+  {
+    help: "pin light/dark mode or trust auto-detection (usage: /theme [auto|light|dark])",
+    name: "theme",
+    usage: "/theme [auto|light|dark]",
+    run: (arg, ctx) => {
+      const value = arg.trim().toLowerCase();
 
       if (!value) {
         return ctx.gateway
-          .rpc<ConfigGetValueResponse>('config.get', { key: 'theme' })
-          .then(ctx.guarded<ConfigGetValueResponse>(r => ctx.transcript.sys(`theme: ${r.value || 'auto'}`)))
+          .rpc<ConfigGetValueResponse>("config.get", { key: "theme" })
+          .then(
+            ctx.guarded<ConfigGetValueResponse>((r) =>
+              ctx.transcript.sys(`theme: ${r.value || "auto"}`),
+            ),
+          );
       }
 
-      if (!['auto', 'light', 'dark'].includes(value)) {
-        return ctx.transcript.sys('usage: /theme [auto|light|dark]')
+      if (!["auto", "light", "dark"].includes(value)) {
+        return ctx.transcript.sys("usage: /theme [auto|light|dark]");
       }
 
       // Apply only after the write is confirmed (mirrors /indicator): a
@@ -303,299 +361,385 @@ export const sessionCommands: SlashCommand[] = [
       // reverts on restart. A few ms later than an optimistic flip, but the
       // env/theme state and config.yaml never disagree.
       ctx.gateway
-        .rpc<ConfigSetResponse>('config.set', { key: 'theme', value })
+        .rpc<ConfigSetResponse>("config.set", { key: "theme", value })
         .then(
-          ctx.guarded<ConfigSetResponse>(r => {
+          ctx.guarded<ConfigSetResponse>((r) => {
             if (r.value === undefined) {
-              return
+              return;
             }
 
-            applyConfiguredTuiTheme(value)
-            ctx.transcript.sys(`theme → ${value}`)
-          })
+            applyConfiguredTuiTheme(value);
+            ctx.transcript.sys(`theme → ${value}`);
+          }),
         )
-        .catch(ctx.guardedErr)
-    }
+        .catch(ctx.guardedErr);
+    },
   },
 
   {
-    help: 'switch theme skin (fires skin.changed)',
-    name: 'skin',
+    help: "switch theme skin (fires skin.changed)",
+    name: "skin",
     run: (arg, ctx) => {
       if (!arg) {
         return ctx.gateway
-          .rpc<ConfigGetValueResponse>('config.get', { key: 'skin' })
-          .then(ctx.guarded<ConfigGetValueResponse>(r => ctx.transcript.sys(`skin: ${r.value || 'default'}`)))
+          .rpc<ConfigGetValueResponse>("config.get", { key: "skin" })
+          .then(
+            ctx.guarded<ConfigGetValueResponse>((r) =>
+              ctx.transcript.sys(`skin: ${r.value || "default"}`),
+            ),
+          );
       }
 
       ctx.gateway
-        .rpc<ConfigSetResponse>('config.set', { key: 'skin', value: arg })
-        .then(ctx.guarded<ConfigSetResponse>(r => r.value && ctx.transcript.sys(`skin → ${r.value}`)))
-    }
+        .rpc<ConfigSetResponse>("config.set", { key: "skin", value: arg })
+        .then(
+          ctx.guarded<ConfigSetResponse>(
+            (r) => r.value && ctx.transcript.sys(`skin → ${r.value}`),
+          ),
+        );
+    },
   },
 
   {
-    help: 'terminal pet: /pet [on|off|toggle|status|random|party|solo|<name>]',
-    name: 'pet',
-    usage: '/pet [on|off|toggle|status|random|party|solo|<name>]',
+    help: "terminal pet: /pet [on|off|toggle|status|random|party|solo|<name>]",
+    name: "pet",
+    usage: "/pet [on|off|toggle|status|random|party|solo|<name>]",
     run: (arg, ctx) => {
-      const word = arg.trim().toLowerCase()
-      const result = parsePetCommand(arg, { enabled: $petEnabled.get(), name: $petName.get(), party: $petParty.get() })
+      const word = arg.trim().toLowerCase();
+      const result = parsePetCommand(arg, {
+        enabled: $petEnabled.get(),
+        name: $petName.get(),
+        party: $petParty.get(),
+      });
 
       if (result.enabled !== undefined) {
-        setPetEnabled(result.enabled)
+        setPetEnabled(result.enabled);
       }
 
       if (result.name !== undefined) {
-        setPetName(result.name)
+        setPetName(result.name);
       }
 
       if (result.party !== undefined) {
-        setPetParty(result.party)
+        setPetParty(result.party);
       }
 
       // Party is a session choice and is not saved; the saved value keeps the pinned pet.
-      if ((result.enabled !== undefined || result.name !== undefined) && result.party === undefined) {
+      if (
+        (result.enabled !== undefined || result.name !== undefined) &&
+        result.party === undefined
+      ) {
         // Pin the species only when the user named one; `random` re-rolls on every launch.
-        const value = petConfigValue($petEnabled.get(), word === result.name ? result.name : null)
+        const value = petConfigValue(
+          $petEnabled.get(),
+          word === result.name ? result.name : null,
+        );
 
-        ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'pet', value }).catch(() => {})
+        ctx.gateway
+          .rpc<ConfigSetResponse>("config.set", { key: "pet", value })
+          .catch(() => {});
       }
 
-      const narrow = $petEnabled.get() && (process.stdout.columns ?? 0) < PET_MIN_COLS
-      const hint = $petParty.get() ? `two or three pets at ${PET_MIN_COLS}+ columns` : `shown at ${PET_MIN_COLS}+ columns`
+      const narrow =
+        $petEnabled.get() && (process.stdout.columns ?? 0) < PET_MIN_COLS;
+      const hint = $petParty.get()
+        ? `two or three pets at ${PET_MIN_COLS}+ columns`
+        : `shown at ${PET_MIN_COLS}+ columns`;
 
-      ctx.transcript.sys(narrow ? `${result.message} (${hint})` : result.message)
-    }
+      ctx.transcript.sys(
+        narrow ? `${result.message} (${hint})` : result.message,
+      );
+    },
   },
 
   {
-    help: 'pick the busy indicator: kaomoji (default), emoji, unicode (braille), or ascii',
-    name: 'indicator',
-    usage: `/indicator [${INDICATOR_STYLES.join('|')}]`,
+    help: "pick the busy indicator: kaomoji (default), emoji, unicode (braille), or ascii",
+    name: "indicator",
+    usage: `/indicator [${INDICATOR_STYLES.join("|")}]`,
     run: (arg, ctx) => {
-      const value = arg.trim().toLowerCase()
+      const value = arg.trim().toLowerCase();
 
       if (!value) {
         return ctx.gateway
-          .rpc<ConfigGetValueResponse>('config.get', { key: 'indicator' })
+          .rpc<ConfigGetValueResponse>("config.get", { key: "indicator" })
           .then(
-            ctx.guarded<ConfigGetValueResponse>(r =>
-              ctx.transcript.sys(`indicator: ${r.value || DEFAULT_INDICATOR_STYLE}`)
-            )
-          )
+            ctx.guarded<ConfigGetValueResponse>((r) =>
+              ctx.transcript.sys(
+                `indicator: ${r.value || DEFAULT_INDICATOR_STYLE}`,
+              ),
+            ),
+          );
       }
 
       if (!(INDICATOR_STYLES as readonly string[]).includes(value)) {
-        return ctx.transcript.sys(`usage: /indicator [${INDICATOR_STYLES.join('|')}]`)
+        return ctx.transcript.sys(
+          `usage: /indicator [${INDICATOR_STYLES.join("|")}]`,
+        );
       }
 
-      ctx.gateway.rpc<ConfigSetResponse>('config.set', { key: 'indicator', value }).then(
-        ctx.guarded<ConfigSetResponse>(r => {
-          if (!r.value) {
-            return
-          }
+      ctx.gateway
+        .rpc<ConfigSetResponse>("config.set", { key: "indicator", value })
+        .then(
+          ctx.guarded<ConfigSetResponse>((r) => {
+            if (!r.value) {
+              return;
+            }
 
-          // Hot-swap the running TUI immediately so the next render
-          // uses the new style without waiting for the 5s mtime poll
-          // to re-apply config.full.
-          patchUiState({ indicatorStyle: value as IndicatorStyle })
-          ctx.transcript.sys(`indicator → ${r.value}`)
-        })
-      )
-    }
+            // Hot-swap the running TUI immediately so the next render
+            // uses the new style without waiting for the 5s mtime poll
+            // to re-apply config.full.
+            patchUiState({ indicatorStyle: value as IndicatorStyle });
+            ctx.transcript.sys(`indicator → ${r.value}`);
+          }),
+        );
+    },
   },
 
   {
-    help: 'toggle yolo mode (per-session approvals)',
-    name: 'yolo',
+    help: "toggle yolo mode (per-session approvals)",
+    name: "yolo",
     run: (_arg, ctx) => {
       ctx.gateway
-        .rpc<ConfigSetResponse>('config.set', { key: 'yolo', session_id: ctx.sid })
-        .then(ctx.guarded<ConfigSetResponse>(r => ctx.transcript.sys(`yolo ${r.value === '1' ? 'on' : 'off'}`)))
-    }
+        .rpc<ConfigSetResponse>("config.set", {
+          key: "yolo",
+          session_id: ctx.sid,
+        })
+        .then(
+          ctx.guarded<ConfigSetResponse>((r) =>
+            ctx.transcript.sys(`yolo ${r.value === "1" ? "on" : "off"}`),
+          ),
+        );
+    },
   },
 
   {
-    help: 'show or hide reasoning, or set effort [show|hide|low|medium|high|xhigh|max|default]',
-    name: 'reasoning',
+    help: "show or hide reasoning, or set effort [show|hide|low|medium|high|xhigh|max|default]",
+    name: "reasoning",
     run: (arg, ctx) => {
       if (!arg) {
         return ctx.gateway
-          .rpc<ConfigGetValueResponse>('config.get', { key: 'reasoning', session_id: ctx.sid })
+          .rpc<ConfigGetValueResponse>("config.get", {
+            key: "reasoning",
+            session_id: ctx.sid,
+          })
           .then(
             ctx.guarded<ConfigGetValueResponse>(
-              r => r.value && ctx.transcript.sys(`reasoning: ${r.value} · display ${r.display || 'hide'}`)
-            )
-          )
-      }
-
-      ctx.gateway.rpc<ConfigSetResponse>('config.set', reasoningConfigPayload(arg, ctx.sid ?? '')).then(
-        ctx.guarded<ConfigSetResponse>(r => {
-          if (!r.value) {
-            return
-          }
-
-          if (r.value === 'hide') {
-            patchUiState(state => ({
-              ...state,
-              sections: { ...state.sections, thinking: 'hidden' },
-              showReasoning: false
-            }))
-          } else if (r.value === 'show') {
-            patchUiState(state => ({
-              ...state,
-              sections: { ...state.sections, thinking: 'expanded' },
-              showReasoning: true
-            }))
-          }
-
-          ctx.transcript.sys(`reasoning: ${r.value}`)
-        })
-      )
-    }
-  },
-
-  {
-    help: 'toggle fast mode [normal|fast|status|on|off|toggle]',
-    name: 'fast',
-    run: (arg, ctx) => {
-      const mode = arg.trim().toLowerCase()
-      const valid = new Set(['', 'status', 'normal', 'fast', 'on', 'off', 'toggle'])
-
-      if (!valid.has(mode)) {
-        return ctx.transcript.sys('usage: /fast [normal|fast|status|on|off|toggle]')
-      }
-
-      if (!mode || mode === 'status') {
-        return ctx.gateway
-          .rpc<ConfigGetValueResponse>('config.get', { key: 'fast', session_id: ctx.sid })
-          .then(
-            ctx.guarded<ConfigGetValueResponse>(r =>
-              ctx.transcript.sys(`fast mode: ${r.value === 'fast' ? 'fast' : 'normal'}`)
-            )
-          )
-          .catch(ctx.guardedErr)
+              (r) =>
+                r.value &&
+                ctx.transcript.sys(
+                  `reasoning: ${r.value} · display ${r.display || "hide"}`,
+                ),
+            ),
+          );
       }
 
       ctx.gateway
-        .rpc<ConfigSetResponse>('config.set', { key: 'fast', session_id: ctx.sid, value: mode })
+        .rpc<ConfigSetResponse>(
+          "config.set",
+          reasoningConfigPayload(arg, ctx.sid ?? ""),
+        )
         .then(
-          ctx.guarded<ConfigSetResponse>(r => {
-            const next = r.value === 'fast' ? 'fast' : 'normal'
-            ctx.transcript.sys(`fast mode: ${next}`)
-            patchUiState(state => ({
+          ctx.guarded<ConfigSetResponse>((r) => {
+            if (!r.value) {
+              return;
+            }
+
+            if (r.value === "hide") {
+              patchUiState((state) => ({
+                ...state,
+                sections: { ...state.sections, thinking: "hidden" },
+                showReasoning: false,
+              }));
+            } else if (r.value === "show") {
+              patchUiState((state) => ({
+                ...state,
+                sections: { ...state.sections, thinking: "expanded" },
+                showReasoning: true,
+              }));
+            }
+
+            ctx.transcript.sys(`reasoning: ${r.value}`);
+          }),
+        );
+    },
+  },
+
+  {
+    help: "toggle fast mode [normal|fast|status|on|off|toggle]",
+    name: "fast",
+    run: (arg, ctx) => {
+      const mode = arg.trim().toLowerCase();
+      const valid = new Set([
+        "",
+        "status",
+        "normal",
+        "fast",
+        "on",
+        "off",
+        "toggle",
+      ]);
+
+      if (!valid.has(mode)) {
+        return ctx.transcript.sys(
+          "usage: /fast [normal|fast|status|on|off|toggle]",
+        );
+      }
+
+      if (!mode || mode === "status") {
+        return ctx.gateway
+          .rpc<ConfigGetValueResponse>("config.get", {
+            key: "fast",
+            session_id: ctx.sid,
+          })
+          .then(
+            ctx.guarded<ConfigGetValueResponse>((r) =>
+              ctx.transcript.sys(
+                `fast mode: ${r.value === "fast" ? "fast" : "normal"}`,
+              ),
+            ),
+          )
+          .catch(ctx.guardedErr);
+      }
+
+      ctx.gateway
+        .rpc<ConfigSetResponse>("config.set", {
+          key: "fast",
+          session_id: ctx.sid,
+          value: mode,
+        })
+        .then(
+          ctx.guarded<ConfigSetResponse>((r) => {
+            const next = r.value === "fast" ? "fast" : "normal";
+            ctx.transcript.sys(`fast mode: ${next}`);
+            patchUiState((state) => ({
               ...state,
               info: state.info
                 ? {
                     ...state.info,
-                    fast: next === 'fast',
-                    service_tier: next === 'fast' ? 'priority' : ''
+                    fast: next === "fast",
+                    service_tier: next === "fast" ? "priority" : "",
                   }
-                : state.info
-            }))
-          })
+                : state.info,
+            }));
+          }),
         )
-        .catch(ctx.guardedErr)
-    }
+        .catch(ctx.guardedErr);
+    },
   },
 
   {
-    help: 'control busy enter mode [queue|steer|interrupt|status]',
-    name: 'busy',
+    help: "control busy enter mode [queue|steer|interrupt|status]",
+    name: "busy",
     run: (arg, ctx) => {
-      const mode = arg.trim().toLowerCase()
-      const valid = new Set(['', 'status', 'queue', 'steer', 'interrupt'])
+      const mode = arg.trim().toLowerCase();
+      const valid = new Set(["", "status", "queue", "steer", "interrupt"]);
 
       if (!valid.has(mode)) {
-        return ctx.transcript.sys('usage: /busy [queue|steer|interrupt|status]')
+        return ctx.transcript.sys(
+          "usage: /busy [queue|steer|interrupt|status]",
+        );
       }
 
-      if (!mode || mode === 'status') {
+      if (!mode || mode === "status") {
         return ctx.gateway
-          .rpc<ConfigGetValueResponse>('config.get', { key: 'busy' })
+          .rpc<ConfigGetValueResponse>("config.get", { key: "busy" })
           .then(
-            ctx.guarded<ConfigGetValueResponse>(r => {
-              const current = r.value || 'interrupt'
-              ctx.transcript.sys(`busy input mode: ${current}`)
-            })
+            ctx.guarded<ConfigGetValueResponse>((r) => {
+              const current = r.value || "interrupt";
+              ctx.transcript.sys(`busy input mode: ${current}`);
+            }),
           )
-          .catch(ctx.guardedErr)
+          .catch(ctx.guardedErr);
       }
 
       ctx.gateway
-        .rpc<ConfigSetResponse>('config.set', { key: 'busy', value: mode })
+        .rpc<ConfigSetResponse>("config.set", { key: "busy", value: mode })
         .then(
-          ctx.guarded<ConfigSetResponse>(r => {
-            const next = r.value || mode
-            ctx.transcript.sys(`busy input mode: ${next}`)
-          })
+          ctx.guarded<ConfigSetResponse>((r) => {
+            const next = r.value || mode;
+            ctx.transcript.sys(`busy input mode: ${next}`);
+          }),
         )
-        .catch(ctx.guardedErr)
-    }
+        .catch(ctx.guardedErr);
+    },
   },
 
   {
-    help: 'cycle verbose tool-output mode (updates live agent)',
-    name: 'verbose',
+    help: "cycle verbose tool-output mode (updates live agent)",
+    name: "verbose",
     run: (arg, ctx) => {
       ctx.gateway
-        .rpc<ConfigSetResponse>('config.set', { key: 'verbose', session_id: ctx.sid, value: arg || 'cycle' })
-        .then(ctx.guarded<ConfigSetResponse>(r => r.value && ctx.transcript.sys(`verbose: ${r.value}`)))
-    }
+        .rpc<ConfigSetResponse>("config.set", {
+          key: "verbose",
+          session_id: ctx.sid,
+          value: arg || "cycle",
+        })
+        .then(
+          ctx.guarded<ConfigSetResponse>(
+            (r) => r.value && ctx.transcript.sys(`verbose: ${r.value}`),
+          ),
+        );
+    },
   },
 
   {
-    help: 'session usage',
-    name: 'usage',
+    help: "session usage",
+    name: "usage",
     run: (_arg, ctx) => {
-      ctx.gateway.rpc<SessionUsageResponse>('session.usage', { session_id: ctx.sid }).then(r => {
-        if (ctx.stale()) {
-          return
-        }
+      ctx.gateway
+        .rpc<SessionUsageResponse>("session.usage", { session_id: ctx.sid })
+        .then((r) => {
+          if (ctx.stale()) {
+            return;
+          }
 
-        const sys = ctx.transcript.sys
+          const sys = ctx.transcript.sys;
 
-        if (r) {
-          patchUiState({
-            usage: { calls: r.calls ?? 0, input: r.input ?? 0, output: r.output ?? 0, total: r.total ?? 0 }
-          })
-        }
+          if (r) {
+            patchUiState({
+              usage: {
+                calls: r.calls ?? 0,
+                input: r.input ?? 0,
+                output: r.output ?? 0,
+                total: r.total ?? 0,
+              },
+            });
+          }
 
-        // k3code M1 cut: the billing/subscription "balance" panel (plan name,
-        // credits, low-balance nudges toward /subscription and /topup) is
-        // removed — this command now shows only token/call usage.
-        if (!r?.calls) {
-          sys('no API calls yet')
+          // k3code M1 cut: the billing/subscription "balance" panel (plan name,
+          // credits, low-balance nudges toward /subscription and /topup) is
+          // removed — this command now shows only token/call usage.
+          if (!r?.calls) {
+            sys("no API calls yet");
 
-          return
-        }
+            return;
+          }
 
-        const f = (v: number | undefined) => (v ?? 0).toLocaleString()
+          const f = (v: number | undefined) => (v ?? 0).toLocaleString();
 
-        const rows: [string, string][] = [
-          ['Model', r.model ?? ''],
-          ['Input tokens', f(r.input)],
-          ['Output tokens', f(r.output)],
-          ['Total tokens', f(r.total)],
-          ['API calls', f(r.calls)]
-        ]
+          const rows: [string, string][] = [
+            ["Model", r.model ?? ""],
+            ["Input tokens", f(r.input)],
+            ["Output tokens", f(r.output)],
+            ["Total tokens", f(r.total)],
+            ["API calls", f(r.calls)],
+          ];
 
-        const sections: PanelSection[] = [{ rows }]
+          const sections: PanelSection[] = [{ rows }];
 
-        if (r.context_max) {
-          const mark = r.context_estimated ? '~' : ''
-          sections.push({
-            text: `Context: ${mark}${f(r.context_used)} / ${f(r.context_max)} (${mark}${r.context_percent}%)`
-          })
-        }
+          if (r.context_max) {
+            const mark = r.context_estimated ? "~" : "";
+            sections.push({
+              text: `Context: ${mark}${f(r.context_used)} / ${f(r.context_max)} (${mark}${r.context_percent}%)`,
+            });
+          }
 
-        if (r.compressions) {
-          sections.push({ text: `Compressions: ${r.compressions}` })
-        }
+          if (r.compressions) {
+            sections.push({ text: `Compressions: ${r.compressions}` });
+          }
 
-        ctx.transcript.panel('Usage', sections)
-      })
-    }
-  }
-]
+          ctx.transcript.panel("Usage", sections);
+        });
+    },
+  },
+];

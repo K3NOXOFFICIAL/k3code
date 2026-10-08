@@ -1,48 +1,61 @@
-import { useStore } from '@nanostores/react'
-import { useEffect } from 'react'
+import { useStore } from "@nanostores/react";
+import { useEffect } from "react";
 
-import type { GatewayClient } from '../gatewayClient.js'
-import type { SystemBatteryResponse } from '../gatewayTypes.js'
-import { asRpcResult } from '../lib/rpc.js'
+import type { GatewayClient } from "../gatewayClient.js";
+import type { SystemBatteryResponse } from "../gatewayTypes.js";
+import { asRpcResult } from "../lib/rpc.js";
 
-import type { BatteryCategory, BatteryInfo } from './interfaces.js'
-import { $uiState, getUiState, patchUiState } from './uiStore.js'
+import type { BatteryCategory, BatteryInfo } from "./interfaces.js";
+import { $uiState, getUiState, patchUiState } from "./uiStore.js";
 
-const BATTERY_POLL_MS = 30_000
+const BATTERY_POLL_MS = 30_000;
 
-const CATEGORIES: ReadonlySet<BatteryCategory> = new Set(['bad', 'critical', 'dim', 'good', 'warn'])
+const CATEGORIES: ReadonlySet<BatteryCategory> = new Set([
+  "bad",
+  "critical",
+  "dim",
+  "good",
+  "warn",
+]);
 
 const normalizeCategory = (raw: unknown): BatteryCategory =>
-  typeof raw === 'string' && CATEGORIES.has(raw as BatteryCategory) ? (raw as BatteryCategory) : 'dim'
+  typeof raw === "string" && CATEGORIES.has(raw as BatteryCategory)
+    ? (raw as BatteryCategory)
+    : "dim";
 
 /** True when two readings show the same thing (field-by-field; `toBatteryInfo` makes a fresh object each poll). */
-export const sameBatteryInfo = (a: BatteryInfo | null, b: BatteryInfo | null): boolean =>
+export const sameBatteryInfo = (
+  a: BatteryInfo | null,
+  b: BatteryInfo | null,
+): boolean =>
   a === b ||
   (a !== null &&
     b !== null &&
     a.available === b.available &&
     a.category === b.category &&
     a.percent === b.percent &&
-    a.plugged === b.plugged)
+    a.plugged === b.plugged);
 
 /** Coerce a `system.battery` RPC payload into the UI's BatteryInfo shape. */
-export const toBatteryInfo = (r: null | SystemBatteryResponse): BatteryInfo | null => {
+export const toBatteryInfo = (
+  r: null | SystemBatteryResponse,
+): BatteryInfo | null => {
   if (!r) {
-    return null
+    return null;
   }
 
   const percent =
-    typeof r.percent === 'number' && Number.isFinite(r.percent)
+    typeof r.percent === "number" && Number.isFinite(r.percent)
       ? Math.max(0, Math.min(100, Math.round(r.percent)))
-      : null
+      : null;
 
   return {
     available: !!r.available,
     category: normalizeCategory(r.category),
     percent,
-    plugged: typeof r.plugged === 'boolean' ? r.plugged : null
-  }
-}
+    plugged: typeof r.plugged === "boolean" ? r.plugged : null,
+  };
+};
 
 /**
  * Poll the host battery while the status-bar indicator is enabled.
@@ -53,38 +66,40 @@ export const toBatteryInfo = (r: null | SystemBatteryResponse): BatteryInfo | nu
  * indicator is toggled off the cached reading is cleared.
  */
 export function useBatteryPoll(gw: GatewayClient) {
-  const enabled = useStore($uiState).battery
+  const enabled = useStore($uiState).battery;
 
   useEffect(() => {
     if (!enabled) {
-      patchUiState({ batteryStatus: null })
+      patchUiState({ batteryStatus: null });
 
-      return
+      return;
     }
 
-    let cancelled = false
+    let cancelled = false;
 
     const poll = async () => {
       try {
-        const r = asRpcResult<SystemBatteryResponse>(await gw.request<SystemBatteryResponse>('system.battery', {}))
-        const next = toBatteryInfo(r)
+        const r = asRpcResult<SystemBatteryResponse>(
+          await gw.request<SystemBatteryResponse>("system.battery", {}),
+        );
+        const next = toBatteryInfo(r);
 
         // Patch only a changed reading: every patch re-renders all $uiState subscribers,
         // and the reading is usually the same as the last poll.
         if (!cancelled && !sameBatteryInfo(getUiState().batteryStatus, next)) {
-          patchUiState({ batteryStatus: next })
+          patchUiState({ batteryStatus: next });
         }
       } catch {
         // Keep the last-good reading on a transient RPC failure.
       }
-    }
+    };
 
-    void poll()
-    const id = setInterval(() => void poll(), BATTERY_POLL_MS)
+    void poll();
+    const id = setInterval(() => void poll(), BATTERY_POLL_MS);
 
     return () => {
-      cancelled = true
-      clearInterval(id)
-    }
-  }, [enabled, gw])
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [enabled, gw]);
 }

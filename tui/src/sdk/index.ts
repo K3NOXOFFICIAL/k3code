@@ -12,24 +12,29 @@
  */
 
 // Theme + chrome primitives
-export { Accordion } from '../components/accordion.js'
-export { Shimmer, ShimmerRows, shimmerSegments, useShimmerPhase } from '../components/loaders.js'
+export { Accordion } from "../components/accordion.js";
+export {
+  Shimmer,
+  ShimmerRows,
+  shimmerSegments,
+  useShimmerPhase,
+} from "../components/loaders.js";
 // Layout components + overlay primitives
-export { Dialog, Overlay, type OverlayZone } from '../components/overlay.js'
-export { OverlayHint, windowItems } from '../components/overlayControls.js'
+export { Dialog, Overlay, type OverlayZone } from "../components/overlay.js";
+export { OverlayHint, windowItems } from "../components/overlayControls.js";
 export {
   ActionRow,
   chipRowProps,
   listRowStyle,
   MenuRow,
   scrollbarColors,
-  useMenu
-} from '../components/overlayPrimitives.js'
+  useMenu,
+} from "../components/overlayPrimitives.js";
 
-export { GridAreas, WidgetGrid } from '../components/widgetGrid.js'
+export { GridAreas, WidgetGrid } from "../components/widgetGrid.js";
 
-export { gauge, hbars, sparkline, sparkRows } from '../lib/charts.js'
-export { liftForContrast } from '../lib/color.js'
+export { gauge, hbars, sparkline, sparkRows } from "../lib/charts.js";
+export { liftForContrast } from "../lib/color.js";
 // Layout engine
 export {
   type GridAreaItem,
@@ -41,9 +46,9 @@ export {
   resolveGridTracks,
   type WidgetGridItem,
   type WidgetGridLayout,
-  type WidgetGridLayoutOptions
-} from '../lib/widgetGrid.js'
-export type { Theme, ThemeColors } from '../theme.js'
+  type WidgetGridLayoutOptions,
+} from "../lib/widgetGrid.js";
+export type { Theme, ThemeColors } from "../theme.js";
 
 // App contract + host
 export {
@@ -55,16 +60,21 @@ export {
   dispatchWidgetInput,
   launchWidget,
   openWidget,
-  updateWidget
-} from './host.js'
-export { defineWidgetApp, getWidgetApp, listWidgetApps } from './registry.js'
+  updateWidget,
+} from "./host.js";
+export { defineWidgetApp, getWidgetApp, listWidgetApps } from "./registry.js";
 export {
   type ActiveWidget,
   type AmbientZone,
   isCtrl,
   type WidgetApp,
   type WidgetInput,
-  type WidgetRenderCtx
-} from './types.js'
-export { loadUserWidgets, type UserWidgetLoadResult, widgetSdk, type WidgetSdk } from './userWidgets.js'
-export { contrastRatio, mix, relativeLuminance } from '@k3code/shared/color'
+  type WidgetRenderCtx,
+} from "./types.js";
+export {
+  loadUserWidgets,
+  type UserWidgetLoadResult,
+  widgetSdk,
+  type WidgetSdk,
+} from "./userWidgets.js";
+export { contrastRatio, mix, relativeLuminance } from "@k3code/shared/color";

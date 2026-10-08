@@ -27,61 +27,69 @@
  * install). It does not need a TTY.
  */
 
-import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, statSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { beforeAll, describe, expect, it } from 'vitest'
+import { beforeAll, describe, expect, it } from "vitest";
 
-const here = dirname(fileURLToPath(import.meta.url))
-const uiTuiRoot = resolve(here, '..', '..')
-const bundlePath = resolve(uiTuiRoot, 'dist', 'entry.js')
+const here = dirname(fileURLToPath(import.meta.url));
+const uiTuiRoot = resolve(here, "..", "..");
+const bundlePath = resolve(uiTuiRoot, "dist", "entry.js");
 
 function bundleIsFresh(): boolean {
   if (!existsSync(bundlePath)) {
-    return false
+    return false;
   }
 
   try {
-    const bundleMtime = statSync(bundlePath).mtimeMs
+    const bundleMtime = statSync(bundlePath).mtimeMs;
 
-    const sourceMtime = statSync(resolve(uiTuiRoot, 'packages/hermes-ink/src/entry-exports.ts')).mtimeMs
+    const sourceMtime = statSync(
+      resolve(uiTuiRoot, "packages/hermes-ink/src/entry-exports.ts"),
+    ).mtimeMs;
 
-    return bundleMtime >= sourceMtime
+    return bundleMtime >= sourceMtime;
   } catch {
-    return false
+    return false;
   }
 }
 
-let bundleSrc = ''
+let bundleSrc = "";
 
 beforeAll(() => {
   if (!bundleIsFresh()) {
     // Refresh the bundle so the regression test runs against current
     // sources, not whatever was last committed by hand.
-    execFileSync(process.execPath, [resolve(uiTuiRoot, 'scripts/build/tui.mjs')], {
-      cwd: uiTuiRoot,
-      stdio: ['ignore', 'ignore', 'inherit'],
-      timeout: 120_000
-    })
+    execFileSync(
+      process.execPath,
+      [resolve(uiTuiRoot, "scripts/build/tui.mjs")],
+      {
+        cwd: uiTuiRoot,
+        stdio: ["ignore", "ignore", "inherit"],
+        timeout: 120_000,
+      },
+    );
   }
 
-  bundleSrc = readFileSync(bundlePath, 'utf8')
-}, 180_000)
+  bundleSrc = readFileSync(bundlePath, "utf8");
+}, 180_000);
 
-describe('TUI bundle (issue #31227)', () => {
-  it('has no async __esm wrappers (would risk circular-await deadlock)', () => {
+describe("TUI bundle (issue #31227)", () => {
+  it("has no async __esm wrappers (would risk circular-await deadlock)", () => {
     // esbuild emits `async "<path>"() { ... }` as the first key of a
     // module's `__esm` definition when the module body contains
     // top-level await. The lightweight `__esm` helper at the top of
     // the bundle does NOT await nested inits, so any async __esm
     // module in a circular graph hangs forever the first time it's
     // entered.
-    const matches = bundleSrc.match(/async "(packages|src|node_modules)\/[^"]+"\s*\(\)/g) ?? []
+    const matches =
+      bundleSrc.match(/async "(packages|src|node_modules)\/[^"]+"\s*\(\)/g) ??
+      [];
     expect(
       matches,
-      `Found ${matches.length} async __esm wrappers — these can deadlock #31227. First few:\n${matches.slice(0, 3).join('\n')}`
-    ).toEqual([])
-  })
-})
+      `Found ${matches.length} async __esm wrappers — these can deadlock #31227. First few:\n${matches.slice(0, 3).join("\n")}`,
+    ).toEqual([]);
+  });
+});

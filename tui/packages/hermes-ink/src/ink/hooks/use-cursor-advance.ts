@@ -1,6 +1,8 @@
-import { useContext } from 'react'
+import { useContext } from "react";
 
-import CursorAdvanceContext, { type CursorAdvanceNotifier } from '../components/CursorAdvanceContext.js'
+import CursorAdvanceContext, {
+  type CursorAdvanceNotifier,
+} from "../components/CursorAdvanceContext.js";
 
 /**
  * Returns a function that notifies Ink the physical terminal cursor was
@@ -29,5 +31,5 @@ import CursorAdvanceContext, { type CursorAdvanceNotifier } from '../components/
  * the returned callback is a safe no-op.
  */
 export function useCursorAdvance(): CursorAdvanceNotifier {
-  return useContext(CursorAdvanceContext)
+  return useContext(CursorAdvanceContext);
 }

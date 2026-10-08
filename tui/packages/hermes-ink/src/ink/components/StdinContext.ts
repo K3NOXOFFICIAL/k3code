@@ -1,16 +1,16 @@
-import { createContext } from 'react'
+import { createContext } from "react";
 
-import { EventEmitter } from '../events/emitter.js'
-import type { TerminalQuerier } from '../terminal-querier.js'
+import { EventEmitter } from "../events/emitter.js";
+import type { TerminalQuerier } from "../terminal-querier.js";
 
 export type Props = {
-  readonly stdin: NodeJS.ReadStream
-  readonly setRawMode: (value: boolean) => void
-  readonly isRawModeSupported: boolean
-  readonly exitOnCtrlC: boolean
-  readonly inputEmitter: EventEmitter
-  readonly querier: TerminalQuerier | null
-}
+  readonly stdin: NodeJS.ReadStream;
+  readonly setRawMode: (value: boolean) => void;
+  readonly isRawModeSupported: boolean;
+  readonly exitOnCtrlC: boolean;
+  readonly inputEmitter: EventEmitter;
+  readonly querier: TerminalQuerier | null;
+};
 
 const StdinContext = createContext<Props>({
   stdin: process.stdin,
@@ -18,8 +18,8 @@ const StdinContext = createContext<Props>({
   setRawMode() {},
   isRawModeSupported: false,
   exitOnCtrlC: true,
-  querier: null
-})
+  querier: null,
+});
 
-StdinContext.displayName = 'StdinContext'
-export default StdinContext
+StdinContext.displayName = "StdinContext";
+export default StdinContext;

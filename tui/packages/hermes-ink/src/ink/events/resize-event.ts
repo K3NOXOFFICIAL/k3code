@@ -1,12 +1,12 @@
-import { TerminalEvent } from './terminal-event.js'
+import { TerminalEvent } from "./terminal-event.js";
 
 export class ResizeEvent extends TerminalEvent {
-  readonly columns: number
-  readonly rows: number
+  readonly columns: number;
+  readonly rows: number;
 
   constructor(columns: number, rows: number) {
-    super('resize', { bubbles: true, cancelable: true })
-    this.columns = columns
-    this.rows = rows
+    super("resize", { bubbles: true, cancelable: true });
+    this.columns = columns;
+    this.rows = rows;
   }
 }

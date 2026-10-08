@@ -22,33 +22,37 @@
 
 export interface FuzzyMatch {
   /** Total score; higher is better. */
-  score: number
+  score: number;
   /** Indices into the original (non-lowercased) target that were matched. */
-  positions: number[]
+  positions: number[];
 }
 
-const WORD_BOUNDARY = /[-_/.\s]/
+const WORD_BOUNDARY = /[-_/.\s]/;
 
 /** Length-preserving search fold: lower-case and `[-_.]` → space. */
 export function searchFold(value: string): string {
-  return value.toLowerCase().replace(/[-_.]/g, ' ')
+  return value.toLowerCase().replace(/[-_.]/g, " ");
 }
 
 function isBoundary(target: string, index: number): boolean {
   if (index === 0) {
-    return true
+    return true;
   }
 
-  const prev = target[index - 1]
+  const prev = target[index - 1];
 
   if (WORD_BOUNDARY.test(prev)) {
-    return true
+    return true;
   }
 
   // camelCase / lower→upper transition (e.g. the `O` in `gptO`).
-  const cur = target[index]
+  const cur = target[index];
 
-  return prev === prev.toLowerCase() && cur !== cur.toLowerCase() && cur === cur.toUpperCase()
+  return (
+    prev === prev.toLowerCase() &&
+    cur !== cur.toLowerCase() &&
+    cur === cur.toUpperCase()
+  );
 }
 
 /**
@@ -57,66 +61,70 @@ function isBoundary(target: string, index: number): boolean {
  */
 export function fuzzyScore(target: string, query: string): FuzzyMatch | null {
   if (!query) {
-    return { score: 0, positions: [] }
+    return { score: 0, positions: [] };
   }
 
-  const lowerTarget = searchFold(target)
-  const lowerQuery = searchFold(query)
+  const lowerTarget = searchFold(target);
+  const lowerQuery = searchFold(query);
 
-  const positions: number[] = []
-  let score = 0
-  let prevIndex = -1
-  let searchFrom = 0
+  const positions: number[] = [];
+  let score = 0;
+  let prevIndex = -1;
+  let searchFrom = 0;
 
   for (const ch of lowerQuery) {
-    const idx = lowerTarget.indexOf(ch, searchFrom)
+    const idx = lowerTarget.indexOf(ch, searchFrom);
 
     if (idx < 0) {
-      return null
+      return null;
     }
 
-    positions.push(idx)
+    positions.push(idx);
 
     // Base point for the matched character.
-    score += 1
+    score += 1;
 
     // Contiguous with the previous match → strong bonus.
     if (prevIndex >= 0 && idx === prevIndex + 1) {
-      score += 5
+      score += 5;
     } else if (prevIndex >= 0) {
       // Penalise the gap we had to skip (capped), so contiguous beats scattered.
-      score -= Math.min(idx - prevIndex - 1, 3)
+      score -= Math.min(idx - prevIndex - 1, 3);
     }
 
     // Word-boundary / start-of-string matches are meaningful.
     if (isBoundary(target, idx)) {
-      score += 3
+      score += 3;
     }
 
     // Matching the very first character of the target is the strongest signal.
     if (idx === 0) {
-      score += 5
+      score += 5;
     }
 
-    prevIndex = idx
-    searchFrom = idx + 1
+    prevIndex = idx;
+    searchFrom = idx + 1;
   }
 
   // Prefix bonus: the query matched a contiguous prefix of the target.
-  if (positions.length && positions[0] === 0 && positions[positions.length - 1] === positions.length - 1) {
-    score += 8
+  if (
+    positions.length &&
+    positions[0] === 0 &&
+    positions[positions.length - 1] === positions.length - 1
+  ) {
+    score += 8;
   }
 
   // Exact full match dominates everything else.
   if (lowerTarget === lowerQuery) {
-    score += 20
+    score += 20;
   }
 
   // Slightly prefer shorter targets when scores are otherwise close, so a
   // query that fully prefixes a short id beats the same prefix on a long one.
-  score -= lowerTarget.length * 0.01
+  score -= lowerTarget.length * 0.01;
 
-  return { score, positions }
+  return { score, positions };
 }
 
 /**
@@ -124,37 +132,40 @@ export function fuzzyScore(target: string, query: string): FuzzyMatch | null {
  * must match (AND semantics); the result aggregates per-token scores and the
  * union of matched positions. Returns null if any token fails to match.
  */
-export function fuzzyScoreMulti(target: string, query: string): FuzzyMatch | null {
-  const tokens = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
+export function fuzzyScoreMulti(
+  target: string,
+  query: string,
+): FuzzyMatch | null {
+  const tokens = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
 
   if (!tokens.length) {
-    return { score: 0, positions: [] }
+    return { score: 0, positions: [] };
   }
 
-  let score = 0
-  const positionSet = new Set<number>()
+  let score = 0;
+  const positionSet = new Set<number>();
 
   for (const token of tokens) {
-    const match = fuzzyScore(target, token)
+    const match = fuzzyScore(target, token);
 
     if (!match) {
-      return null
+      return null;
     }
 
-    score += match.score
+    score += match.score;
 
     for (const pos of match.positions) {
-      positionSet.add(pos)
+      positionSet.add(pos);
     }
   }
 
-  return { score, positions: [...positionSet].sort((a, b) => a - b) }
+  return { score, positions: [...positionSet].sort((a, b) => a - b) };
 }
 
 export interface RankedItem<T> {
-  item: T
-  score: number
-  positions: number[]
+  item: T;
+  score: number;
+  positions: number[];
 }
 
 /**
@@ -163,24 +174,37 @@ export interface RankedItem<T> {
  * the original index so ordering is stable for equal scores. An empty query
  * returns every item in original order with no positions.
  */
-export function fuzzyRank<T>(items: readonly T[], query: string, toText: (item: T) => string): RankedItem<T>[] {
-  const trimmed = query.trim()
+export function fuzzyRank<T>(
+  items: readonly T[],
+  query: string,
+  toText: (item: T) => string,
+): RankedItem<T>[] {
+  const trimmed = query.trim();
 
   if (!trimmed) {
-    return items.map(item => ({ item, score: 0, positions: [] }))
+    return items.map((item) => ({ item, score: 0, positions: [] }));
   }
 
-  const ranked: Array<RankedItem<T> & { index: number }> = []
+  const ranked: Array<RankedItem<T> & { index: number }> = [];
 
   items.forEach((item, index) => {
-    const match = fuzzyScoreMulti(toText(item), trimmed)
+    const match = fuzzyScoreMulti(toText(item), trimmed);
 
     if (match) {
-      ranked.push({ item, score: match.score, positions: match.positions, index })
+      ranked.push({
+        item,
+        score: match.score,
+        positions: match.positions,
+        index,
+      });
     }
-  })
+  });
 
-  ranked.sort((a, b) => b.score - a.score || a.index - b.index)
+  ranked.sort((a, b) => b.score - a.score || a.index - b.index);
 
-  return ranked.map(({ item, score, positions }) => ({ item, score, positions }))
+  return ranked.map(({ item, score, positions }) => ({
+    item,
+    score,
+    positions,
+  }));
 }

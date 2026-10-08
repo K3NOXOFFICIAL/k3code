@@ -1,10 +1,17 @@
-import { Box, NoSelect, Text } from '@k3code/ink'
-import { compactNumber } from '@k3code/shared/format'
-import { memo, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
-import spinners, { type BrailleSpinnerName } from 'unicode-animations'
+import { Box, NoSelect, Text } from "@k3code/ink";
+import { compactNumber } from "@k3code/shared/format";
+import {
+  memo,
+  type ReactNode,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import spinners, { type BrailleSpinnerName } from "unicode-animations";
 
-import { THINKING_COT_MAX } from '../config/limits.js'
-import { sectionMode } from '../domain/details.js'
+import { THINKING_COT_MAX } from "../config/limits.js";
+import { sectionMode } from "../domain/details.js";
 import {
   buildSubagentTree,
   fmtTokens,
@@ -13,8 +20,8 @@ import {
   peakHotness,
   sparkline,
   treeTotals,
-  widthByDepth
-} from '../lib/subagentTree.js'
+  widthByDepth,
+} from "../lib/subagentTree.js";
 import {
   boundedLiveRenderText,
   compactPreview,
@@ -25,9 +32,9 @@ import {
   pick,
   splitToolDuration,
   thinkingPreview,
-  toolTrailLabel
-} from '../lib/text.js'
-import type { Theme } from '../theme.js'
+  toolTrailLabel,
+} from "../lib/text.js";
+import type { Theme } from "../theme.js";
 import type {
   ActiveTool,
   ActivityItem,
@@ -35,25 +42,44 @@ import type {
   SectionVisibility,
   SubagentNode,
   SubagentProgress,
-  ThinkingMode
-} from '../types.js'
+  ThinkingMode,
+} from "../types.js";
 
-const THINK: BrailleSpinnerName[] = ['helix', 'breathe', 'orbit', 'dna', 'waverows', 'snake', 'pulse']
-const TOOL: BrailleSpinnerName[] = ['cascade', 'scan', 'diagswipe', 'fillsweep', 'rain', 'columns', 'sparkle']
+const THINK: BrailleSpinnerName[] = [
+  "helix",
+  "breathe",
+  "orbit",
+  "dna",
+  "waverows",
+  "snake",
+  "pulse",
+];
+const TOOL: BrailleSpinnerName[] = [
+  "cascade",
+  "scan",
+  "diagswipe",
+  "fillsweep",
+  "rain",
+  "columns",
+  "sparkle",
+];
 
 const fmtElapsed = (ms: number) => {
-  const sec = Math.max(0, ms) / 1000
+  const sec = Math.max(0, ms) / 1000;
 
-  return sec < 10 ? `${sec.toFixed(1)}s` : `${Math.round(sec)}s`
-}
+  return sec < 10 ? `${sec.toFixed(1)}s` : `${Math.round(sec)}s`;
+};
 
-type TreeBranch = 'mid' | 'last'
-type TreeRails = readonly boolean[]
+type TreeBranch = "mid" | "last";
+type TreeRails = readonly boolean[];
 
-const nextTreeRails = (rails: TreeRails, branch: TreeBranch) => [...rails, branch === 'mid']
+const nextTreeRails = (rails: TreeRails, branch: TreeBranch) => [
+  ...rails,
+  branch === "mid",
+];
 
 const treeLead = (rails: TreeRails, branch: TreeBranch) =>
-  `${rails.map(on => (on ? '│ ' : '  ')).join('')}${branch === 'mid' ? '├─ ' : '└─ '}`
+  `${rails.map((on) => (on ? "│ " : "  ")).join("")}${branch === "mid" ? "├─ " : "└─ "}`;
 
 // ── Primitives ───────────────────────────────────────────────────────
 
@@ -63,16 +89,16 @@ function TreeRow({
   rails = [],
   stemColor,
   stemDim = true,
-  t
+  t,
 }: {
-  branch: TreeBranch
-  children: ReactNode
-  rails?: TreeRails
-  stemColor?: string
-  stemDim?: boolean
-  t: Theme
+  branch: TreeBranch;
+  children: ReactNode;
+  rails?: TreeRails;
+  stemColor?: string;
+  stemDim?: boolean;
+  t: Theme;
 }) {
-  const lead = treeLead(rails, branch)
+  const lead = treeLead(rails, branch);
 
   return (
     <Box>
@@ -85,7 +111,7 @@ function TreeRow({
         {children}
       </Box>
     </Box>
-  )
+  );
 }
 
 function TreeTextRow({
@@ -95,15 +121,15 @@ function TreeTextRow({
   dimColor,
   rails = [],
   t,
-  wrap = 'wrap-trim'
+  wrap = "wrap-trim",
 }: {
-  branch: TreeBranch
-  color: string
-  content: ReactNode
-  dimColor?: boolean
-  rails?: TreeRails
-  t: Theme
-  wrap?: 'truncate-end' | 'wrap' | 'wrap-trim'
+  branch: TreeBranch;
+  color: string;
+  content: ReactNode;
+  dimColor?: boolean;
+  rails?: TreeRails;
+  t: Theme;
+  wrap?: "truncate-end" | "wrap" | "wrap-trim";
 }) {
   const text = dimColor ? (
     <Text color={color} dim wrap={wrap}>
@@ -113,13 +139,13 @@ function TreeTextRow({
     <Text color={color} wrap={wrap}>
       {content}
     </Text>
-  )
+  );
 
   return (
     <TreeRow branch={branch} rails={rails} t={t}>
       {text}
     </TreeRow>
-  )
+  );
 }
 
 function TreeNode({
@@ -130,103 +156,127 @@ function TreeNode({
   rails = [],
   stemColor,
   stemDim,
-  t
+  t,
 }: {
-  branch: TreeBranch
-  children?: (rails: boolean[]) => ReactNode
-  header: ReactNode
-  open: boolean
-  rails?: TreeRails
-  stemColor?: string
-  stemDim?: boolean
-  t: Theme
+  branch: TreeBranch;
+  children?: (rails: boolean[]) => ReactNode;
+  header: ReactNode;
+  open: boolean;
+  rails?: TreeRails;
+  stemColor?: string;
+  stemDim?: boolean;
+  t: Theme;
 }) {
   return (
     <Box flexDirection="column">
-      <TreeRow branch={branch} rails={rails} stemColor={stemColor} stemDim={stemDim} t={t}>
+      <TreeRow
+        branch={branch}
+        rails={rails}
+        stemColor={stemColor}
+        stemDim={stemDim}
+        t={t}
+      >
         {header}
       </TreeRow>
       {open ? children?.(nextTreeRails(rails, branch)) : null}
     </Box>
-  )
+  );
 }
 
-export function Spinner({ color, variant = 'think' }: { color: string; variant?: 'think' | 'tool' }) {
+export function Spinner({
+  color,
+  variant = "think",
+}: {
+  color: string;
+  variant?: "think" | "tool";
+}) {
   const spin = useMemo(() => {
-    const raw = spinners[pick(variant === 'tool' ? TOOL : THINK)]
+    const raw = spinners[pick(variant === "tool" ? TOOL : THINK)];
 
-    return { ...raw, frames: raw.frames.map(f => [...f][0] ?? '⠀') }
-  }, [variant])
+    return { ...raw, frames: raw.frames.map((f) => [...f][0] ?? "⠀") };
+  }, [variant]);
 
-  const [frame, setFrame] = useState(0)
-
-  useEffect(() => {
-    setFrame(0)
-  }, [spin])
+  const [frame, setFrame] = useState(0);
 
   useEffect(() => {
-    const id = setInterval(() => setFrame(f => (f + 1) % spin.frames.length), spin.interval)
+    setFrame(0);
+  }, [spin]);
 
-    return () => clearInterval(id)
-  }, [spin])
+  useEffect(() => {
+    const id = setInterval(
+      () => setFrame((f) => (f + 1) % spin.frames.length),
+      spin.interval,
+    );
 
-  return <Text color={color}>{spin.frames[frame]}</Text>
+    return () => clearInterval(id);
+  }, [spin]);
+
+  return <Text color={color}>{spin.frames[frame]}</Text>;
 }
 
 interface DetailRow {
-  color: string
-  content: ReactNode
-  dimColor?: boolean
-  key: string
+  color: string;
+  content: ReactNode;
+  dimColor?: boolean;
+  key: string;
 }
 
 function Detail({
-  branch = 'last',
+  branch = "last",
   color,
   content,
   dimColor,
   rails = [],
-  t
+  t,
 }: DetailRow & { branch?: TreeBranch; rails?: TreeRails; t: Theme }) {
-  return <TreeTextRow branch={branch} color={color} content={content} dimColor={dimColor} rails={rails} t={t} />
+  return (
+    <TreeTextRow
+      branch={branch}
+      color={color}
+      content={content}
+      dimColor={dimColor}
+      rails={rails}
+      t={t}
+    />
+  );
 }
 
 function StreamCursor({
   color,
   dimColor,
   streaming = false,
-  visible = false
+  visible = false,
 }: {
-  color: string
-  dimColor?: boolean
-  streaming?: boolean
-  visible?: boolean
+  color: string;
+  dimColor?: boolean;
+  streaming?: boolean;
+  visible?: boolean;
 }) {
-  const [on, setOn] = useState(true)
+  const [on, setOn] = useState(true);
 
   useEffect(() => {
     if (!visible || !streaming) {
-      setOn(true)
+      setOn(true);
 
-      return
+      return;
     }
 
-    const id = setInterval(() => setOn(v => !v), 420)
+    const id = setInterval(() => setOn((v) => !v), 420);
 
-    return () => clearInterval(id)
-  }, [streaming, visible])
+    return () => clearInterval(id);
+  }, [streaming, visible]);
 
   if (!visible) {
-    return null
+    return null;
   }
 
   return dimColor ? (
     <Text color={color} dim>
-      {streaming && on ? '▍' : ' '}
+      {streaming && on ? "▍" : " "}
     </Text>
   ) : (
-    <Text color={color}>{streaming && on ? '▍' : ' '}</Text>
-  )
+    <Text color={color}>{streaming && on ? "▍" : " "}</Text>
+  );
 }
 
 function Chevron({
@@ -236,46 +286,61 @@ function Chevron({
   suffix,
   t,
   title,
-  tone = 'dim'
+  tone = "dim",
 }: {
-  count?: number
-  onClick: (deep?: boolean) => void
-  open: boolean
-  suffix?: string
-  t: Theme
-  title: string
-  tone?: 'dim' | 'error' | 'warn'
+  count?: number;
+  onClick: (deep?: boolean) => void;
+  open: boolean;
+  suffix?: string;
+  t: Theme;
+  title: string;
+  tone?: "dim" | "error" | "warn";
 }) {
-  const color = tone === 'error' ? t.color.error : tone === 'warn' ? t.color.warn : t.color.muted
+  const color =
+    tone === "error"
+      ? t.color.error
+      : tone === "warn"
+        ? t.color.warn
+        : t.color.muted;
 
   return (
     <Box onClick={(e: any) => onClick(!!e?.shiftKey || !!e?.ctrlKey)}>
-      <Text color={color} dim={tone === 'dim'}>
-        <Text color={t.color.accent}>{open ? '▾ ' : '▸ '}</Text>
+      <Text color={color} dim={tone === "dim"}>
+        <Text color={t.color.accent}>{open ? "▾ " : "▸ "}</Text>
         {title}
-        {typeof count === 'number' ? ` (${count})` : ''}
+        {typeof count === "number" ? ` (${count})` : ""}
         {suffix ? (
           <Text color={t.color.statusFg} dim>
-            {'  '}
+            {"  "}
             {suffix}
           </Text>
         ) : null}
       </Text>
     </Box>
-  )
+  );
 }
 
-function heatColor(node: SubagentNode, peak: number, theme: Theme): string | undefined {
-  const palette = [theme.color.border, theme.color.accent, theme.color.primary, theme.color.warn, theme.color.error]
-  const idx = hotnessBucket(node.aggregate.hotness, peak, palette.length)
+function heatColor(
+  node: SubagentNode,
+  peak: number,
+  theme: Theme,
+): string | undefined {
+  const palette = [
+    theme.color.border,
+    theme.color.accent,
+    theme.color.primary,
+    theme.color.warn,
+    theme.color.error,
+  ];
+  const idx = hotnessBucket(node.aggregate.hotness, peak, palette.length);
 
   // Below the median bucket we keep the default dim stem so cool branches
   // fade into the chrome — only "hot" branches draw the eye.
   if (idx < 2) {
-    return undefined
+    return undefined;
   }
 
-  return palette[idx]
+  return palette[idx];
 }
 
 function SubagentAccordion({
@@ -284,136 +349,150 @@ function SubagentAccordion({
   node,
   peak,
   rails = [],
-  t
+  t,
 }: {
-  branch: TreeBranch
-  expanded: boolean
-  node: SubagentNode
-  peak: number
-  rails?: TreeRails
-  t: Theme
+  branch: TreeBranch;
+  expanded: boolean;
+  node: SubagentNode;
+  peak: number;
+  rails?: TreeRails;
+  t: Theme;
 }) {
-  const [open, setOpen] = useState(expanded)
-  const [deep, setDeep] = useState(expanded)
-  const [openThinking, setOpenThinking] = useState(expanded)
-  const [openTools, setOpenTools] = useState(expanded)
-  const [openNotes, setOpenNotes] = useState(expanded)
-  const [openKids, setOpenKids] = useState(expanded)
+  const [open, setOpen] = useState(expanded);
+  const [deep, setDeep] = useState(expanded);
+  const [openThinking, setOpenThinking] = useState(expanded);
+  const [openTools, setOpenTools] = useState(expanded);
+  const [openNotes, setOpenNotes] = useState(expanded);
+  const [openKids, setOpenKids] = useState(expanded);
 
   useEffect(() => {
     if (!expanded) {
-      return
+      return;
     }
 
-    setOpen(true)
-    setDeep(true)
-    setOpenThinking(true)
-    setOpenTools(true)
-    setOpenNotes(true)
-    setOpenKids(true)
-  }, [expanded])
+    setOpen(true);
+    setDeep(true);
+    setOpenThinking(true);
+    setOpenTools(true);
+    setOpenNotes(true);
+    setOpenKids(true);
+  }, [expanded]);
 
   const expandAll = () => {
-    setOpen(true)
-    setDeep(true)
-    setOpenThinking(true)
-    setOpenTools(true)
-    setOpenNotes(true)
-    setOpenKids(true)
-  }
+    setOpen(true);
+    setDeep(true);
+    setOpenThinking(true);
+    setOpenTools(true);
+    setOpenNotes(true);
+    setOpenKids(true);
+  };
 
-  const item = node.item
-  const children = node.children
-  const aggregate = node.aggregate
+  const item = node.item;
+  const children = node.children;
+  const aggregate = node.aggregate;
 
-  const statusTone: 'dim' | 'error' | 'warn' =
-    item.status === 'error' || item.status === 'failed'
-      ? 'error'
-      : item.status === 'interrupted' || item.status === 'timeout'
-        ? 'warn'
-        : 'dim'
+  const statusTone: "dim" | "error" | "warn" =
+    item.status === "error" || item.status === "failed"
+      ? "error"
+      : item.status === "interrupted" || item.status === "timeout"
+        ? "warn"
+        : "dim";
 
   // `[6a66 3/9]` when the gateway tags the batch; `[3/9]` on older gateways.
-  const batchTag = item.delegationId?.split('_').at(-1)?.slice(0, 4)
+  const batchTag = item.delegationId?.split("_").at(-1)?.slice(0, 4);
 
   const prefix =
     item.taskCount > 1
-      ? `[${batchTag ? `${batchTag} ` : ''}${item.index + 1}/${item.taskCount}] `
+      ? `[${batchTag ? `${batchTag} ` : ""}${item.index + 1}/${item.taskCount}] `
       : batchTag
         ? `[${batchTag}] `
-        : ''
+        : "";
 
-  const goalLabel = item.goal || `Subagent ${item.index + 1}`
-  const title = `${prefix}${open ? goalLabel : compactPreview(goalLabel, 60)}`
-  const summary = compactPreview((item.summary || '').replace(/\s+/g, ' ').trim(), 72)
+  const goalLabel = item.goal || `Subagent ${item.index + 1}`;
+  const title = `${prefix}${open ? goalLabel : compactPreview(goalLabel, 60)}`;
+  const summary = compactPreview(
+    (item.summary || "").replace(/\s+/g, " ").trim(),
+    72,
+  );
 
   // Suffix packs branch rollup: status · elapsed · per-branch tool/agent/token/cost.
   // Emphasises the numbers the user can't easily eyeball from a flat list.
-  const statusLabel = item.status === 'queued' ? 'queued' : item.status === 'running' ? 'running' : String(item.status)
+  const statusLabel =
+    item.status === "queued"
+      ? "queued"
+      : item.status === "running"
+        ? "running"
+        : String(item.status);
 
-  const rollupBits: string[] = [statusLabel]
+  const rollupBits: string[] = [statusLabel];
 
   if (item.durationSeconds) {
-    rollupBits.push(fmtElapsed(item.durationSeconds * 1000))
+    rollupBits.push(fmtElapsed(item.durationSeconds * 1000));
   }
 
-  const localTools = item.toolCount ?? 0
-  const subtreeTools = aggregate.totalTools - localTools
+  const localTools = item.toolCount ?? 0;
+  const subtreeTools = aggregate.totalTools - localTools;
 
   if (localTools > 0) {
-    rollupBits.push(`${localTools} tool${localTools === 1 ? '' : 's'}`)
+    rollupBits.push(`${localTools} tool${localTools === 1 ? "" : "s"}`);
   }
 
-  const localTokens = (item.inputTokens ?? 0) + (item.outputTokens ?? 0)
+  const localTokens = (item.inputTokens ?? 0) + (item.outputTokens ?? 0);
 
   if (localTokens > 0) {
-    rollupBits.push(`${fmtTokens(localTokens)} tok`)
+    rollupBits.push(`${fmtTokens(localTokens)} tok`);
   }
 
-  const filesLocal = (item.filesWritten?.length ?? 0) + (item.filesRead?.length ?? 0)
+  const filesLocal =
+    (item.filesWritten?.length ?? 0) + (item.filesRead?.length ?? 0);
 
   if (filesLocal > 0) {
-    rollupBits.push(`⎘${filesLocal}`)
+    rollupBits.push(`⎘${filesLocal}`);
   }
 
   if (children.length > 0) {
-    rollupBits.push(`${aggregate.descendantCount}↓`)
+    rollupBits.push(`${aggregate.descendantCount}↓`);
 
     if (subtreeTools > 0) {
-      rollupBits.push(`+${subtreeTools}t sub`)
+      rollupBits.push(`+${subtreeTools}t sub`);
     }
 
-    if (aggregate.activeCount > 0 && item.status !== 'running') {
-      rollupBits.push(`⚡${aggregate.activeCount}`)
+    if (aggregate.activeCount > 0 && item.status !== "running") {
+      rollupBits.push(`⚡${aggregate.activeCount}`);
     }
   }
 
-  const suffix = rollupBits.join(' · ')
+  const suffix = rollupBits.join(" · ");
 
-  const thinkingText = item.thinking.join('\n')
-  const hasThinking = Boolean(thinkingText)
-  const hasTools = item.tools.length > 0
-  const noteRows = [...(summary ? [summary] : []), ...item.notes]
-  const hasNotes = noteRows.length > 0
-  const noteColor = statusTone === 'error' ? t.color.error : statusTone === 'warn' ? t.color.warn : t.color.muted
+  const thinkingText = item.thinking.join("\n");
+  const hasThinking = Boolean(thinkingText);
+  const hasTools = item.tools.length > 0;
+  const noteRows = [...(summary ? [summary] : []), ...item.notes];
+  const hasNotes = noteRows.length > 0;
+  const noteColor =
+    statusTone === "error"
+      ? t.color.error
+      : statusTone === "warn"
+        ? t.color.warn
+        : t.color.muted;
 
   const sections: {
-    header: ReactNode
-    key: string
-    open: boolean
-    render: (rails: boolean[]) => ReactNode
-  }[] = []
+    header: ReactNode;
+    key: string;
+    open: boolean;
+    render: (rails: boolean[]) => ReactNode;
+  }[] = [];
 
   if (hasThinking) {
     sections.push({
       header: (
         <Chevron
           count={item.thinking.length}
-          onClick={shift => {
+          onClick={(shift) => {
             if (shift) {
-              expandAll()
+              expandAll();
             } else {
-              setOpenThinking(v => !v)
+              setOpenThinking((v) => !v);
             }
           }}
           open={openThinking}
@@ -421,20 +500,20 @@ function SubagentAccordion({
           title="Thinking"
         />
       ),
-      key: 'thinking',
+      key: "thinking",
       open: openThinking,
-      render: childRails => (
+      render: (childRails) => (
         <Thinking
-          active={item.status === 'running'}
+          active={item.status === "running"}
           branch="last"
           mode="full"
           rails={childRails}
           reasoning={thinkingText}
-          streaming={item.status === 'running'}
+          streaming={item.status === "running"}
           t={t}
         />
-      )
-    })
+      ),
+    });
   }
 
   if (hasTools) {
@@ -442,11 +521,11 @@ function SubagentAccordion({
       header: (
         <Chevron
           count={item.tools.length}
-          onClick={shift => {
+          onClick={(shift) => {
             if (shift) {
-              expandAll()
+              expandAll();
             } else {
-              setOpenTools(v => !v)
+              setOpenTools((v) => !v);
             }
           }}
           open={openTools}
@@ -454,13 +533,13 @@ function SubagentAccordion({
           title="Tool calls"
         />
       ),
-      key: 'tools',
+      key: "tools",
       open: openTools,
-      render: childRails => (
+      render: (childRails) => (
         <Box flexDirection="column">
           {item.tools.map((line, index) => (
             <TreeTextRow
-              branch={index === item.tools.length - 1 ? 'last' : 'mid'}
+              branch={index === item.tools.length - 1 ? "last" : "mid"}
               color={t.color.text}
               content={
                 <>
@@ -474,8 +553,8 @@ function SubagentAccordion({
             />
           ))}
         </Box>
-      )
-    })
+      ),
+    });
   }
 
   if (hasNotes) {
@@ -483,11 +562,11 @@ function SubagentAccordion({
       header: (
         <Chevron
           count={noteRows.length}
-          onClick={shift => {
+          onClick={(shift) => {
             if (shift) {
-              expandAll()
+              expandAll();
             } else {
-              setOpenNotes(v => !v)
+              setOpenNotes((v) => !v);
             }
           }}
           open={openNotes}
@@ -496,24 +575,24 @@ function SubagentAccordion({
           tone={statusTone}
         />
       ),
-      key: 'notes',
+      key: "notes",
       open: openNotes,
-      render: childRails => (
+      render: (childRails) => (
         <Box flexDirection="column">
           {noteRows.map((line, index) => (
             <TreeTextRow
-              branch={index === noteRows.length - 1 ? 'last' : 'mid'}
+              branch={index === noteRows.length - 1 ? "last" : "mid"}
               color={noteColor}
               content={line}
-              dimColor={statusTone === 'dim'}
+              dimColor={statusTone === "dim"}
               key={`${item.id}-note-${index}`}
               rails={childRails}
               t={t}
             />
           ))}
         </Box>
-      )
-    })
+      ),
+    });
   }
 
   if (children.length > 0) {
@@ -523,11 +602,11 @@ function SubagentAccordion({
       header: (
         <Chevron
           count={children.length}
-          onClick={shift => {
+          onClick={(shift) => {
             if (shift) {
-              expandAll()
+              expandAll();
             } else {
-              setOpenKids(v => !v)
+              setOpenKids((v) => !v);
             }
           }}
           open={openKids}
@@ -536,13 +615,13 @@ function SubagentAccordion({
           title="Spawned"
         />
       ),
-      key: 'subagents',
+      key: "subagents",
       open: openKids,
-      render: childRails => (
+      render: (childRails) => (
         <Box flexDirection="column">
           {children.map((child, i) => (
             <SubagentAccordion
-              branch={i === children.length - 1 ? 'last' : 'mid'}
+              branch={i === children.length - 1 ? "last" : "mid"}
               expanded={expanded || deep}
               key={child.item.id}
               node={child}
@@ -552,33 +631,33 @@ function SubagentAccordion({
             />
           ))}
         </Box>
-      )
-    })
+      ),
+    });
   }
 
   // Heatmap: amber→error gradient on the stem when this branch is "hot"
   // (high tools/sec) relative to the whole tree's peak.
-  const stem = heatColor(node, peak, t)
+  const stem = heatColor(node, peak, t);
 
   return (
     <TreeNode
       branch={branch}
       header={
         <Chevron
-          onClick={shift => {
+          onClick={(shift) => {
             if (shift) {
-              expandAll()
+              expandAll();
 
-              return
+              return;
             }
 
-            setOpen(v => {
+            setOpen((v) => {
               if (!v) {
-                setDeep(false)
+                setDeep(false);
               }
 
-              return !v
-            })
+              return !v;
+            });
           }}
           open={open}
           suffix={suffix}
@@ -593,11 +672,11 @@ function SubagentAccordion({
       stemDim={stem == null}
       t={t}
     >
-      {childRails => (
+      {(childRails) => (
         <Box flexDirection="column">
           {sections.map((section, index) => (
             <TreeNode
-              branch={index === sections.length - 1 ? 'last' : 'mid'}
+              branch={index === sections.length - 1 ? "last" : "mid"}
               header={section.header}
               key={`${item.id}-${section.key}`}
               open={section.open}
@@ -610,87 +689,102 @@ function SubagentAccordion({
         </Box>
       )}
     </TreeNode>
-  )
+  );
 }
 
 // ── Thinking ─────────────────────────────────────────────────────────
 
 export const Thinking = memo(function Thinking({
   active = false,
-  branch = 'last',
-  mode = 'truncated',
+  branch = "last",
+  mode = "truncated",
   rails = [],
   reasoning,
   streaming = false,
-  t
+  t,
 }: {
-  active?: boolean
-  branch?: TreeBranch
-  mode?: ThinkingMode
-  rails?: TreeRails
-  reasoning: string
-  streaming?: boolean
-  t: Theme
+  active?: boolean;
+  branch?: TreeBranch;
+  mode?: ThinkingMode;
+  rails?: TreeRails;
+  reasoning: string;
+  streaming?: boolean;
+  t: Theme;
 }) {
   const preview = useMemo(() => {
-    const raw = thinkingPreview(reasoning, mode, THINKING_COT_MAX)
+    const raw = thinkingPreview(reasoning, mode, THINKING_COT_MAX);
 
-    return mode === 'full' ? boundedLiveRenderText(raw) : raw
-  }, [mode, reasoning])
+    return mode === "full" ? boundedLiveRenderText(raw) : raw;
+  }, [mode, reasoning]);
 
-  const lines = useMemo(() => preview.split('\n').map(line => line.replace(/\t/g, '  ')), [preview])
+  const lines = useMemo(
+    () => preview.split("\n").map((line) => line.replace(/\t/g, "  ")),
+    [preview],
+  );
 
   if (!preview && !active) {
-    return null
+    return null;
   }
 
   return (
     <TreeRow branch={branch} rails={rails} t={t}>
       <Box flexDirection="column" flexGrow={1}>
         {preview ? (
-          mode === 'full' ? (
+          mode === "full" ? (
             lines.map((line, index) => (
               <Text color={t.color.thinking} key={index} wrap="wrap-trim">
-                {line || ' '}
+                {line || " "}
                 {index === lines.length - 1 ? (
-                  <StreamCursor color={t.color.thinking} streaming={streaming} visible={active} />
+                  <StreamCursor
+                    color={t.color.thinking}
+                    streaming={streaming}
+                    visible={active}
+                  />
                 ) : null}
               </Text>
             ))
           ) : (
             <Text color={t.color.thinking} wrap="truncate-end">
               {preview}
-              <StreamCursor color={t.color.thinking} streaming={streaming} visible={active} />
+              <StreamCursor
+                color={t.color.thinking}
+                streaming={streaming}
+                visible={active}
+              />
             </Text>
           )
         ) : (
           <Text color={t.color.thinking}>
-            <StreamCursor color={t.color.thinking} streaming={streaming} visible={active} />
+            <StreamCursor
+              color={t.color.thinking}
+              streaming={streaming}
+              visible={active}
+            />
           </Text>
         )}
       </Box>
     </TreeRow>
-  )
-})
+  );
+});
 
 // ── ToolTrail ────────────────────────────────────────────────────────
 
 interface Group {
-  color: string
-  content: ReactNode
-  details: DetailRow[]
-  key: string
-  label: string
+  color: string;
+  content: ReactNode;
+  details: DetailRow[];
+  key: string;
+  label: string;
 }
 
 export const ToolTrail = memo(function ToolTrail({
   busy = false,
   commandOverride = false,
-  detailsMode = 'collapsed',
-  outcome = '',
+  detailsMode = "collapsed",
+  outcome = "",
   preferExpandedThinking = false,
   reasoningActive = false,
-  reasoning = '',
+  reasoning = "",
   reasoningAlwaysVisible = false,
   reasoningTokens,
   reasoningStreaming = false,
@@ -700,43 +794,51 @@ export const ToolTrail = memo(function ToolTrail({
   tools = [],
   toolTokens,
   trail = [],
-  activity = []
+  activity = [],
 }: {
-  busy?: boolean
-  commandOverride?: boolean
-  detailsMode?: DetailsMode
-  outcome?: string
-  preferExpandedThinking?: boolean
-  reasoningActive?: boolean
-  reasoning?: string
+  busy?: boolean;
+  commandOverride?: boolean;
+  detailsMode?: DetailsMode;
+  outcome?: string;
+  preferExpandedThinking?: boolean;
+  reasoningActive?: boolean;
+  reasoning?: string;
   // MoA reference blocks (see Msg.isMoaReference) stay visible even when
   // `visible.thinking === 'hidden'` — they're the mixture-of-agents process
   // the user opted into, not private model reasoning (#64657).
-  reasoningAlwaysVisible?: boolean
-  reasoningTokens?: number
-  reasoningStreaming?: boolean
-  sections?: SectionVisibility
-  subagents?: SubagentProgress[]
-  t: Theme
-  tools?: ActiveTool[]
-  toolTokens?: number
-  trail?: string[]
-  activity?: ActivityItem[]
+  reasoningAlwaysVisible?: boolean;
+  reasoningTokens?: number;
+  reasoningStreaming?: boolean;
+  sections?: SectionVisibility;
+  subagents?: SubagentProgress[];
+  t: Theme;
+  tools?: ActiveTool[];
+  toolTokens?: number;
+  trail?: string[];
+  activity?: ActivityItem[];
 }) {
   const visible = useMemo(
     () => ({
-      thinking: sectionMode('thinking', detailsMode, sections, commandOverride),
-      tools: sectionMode('tools', detailsMode, sections, commandOverride),
-      subagents: sectionMode('subagents', detailsMode, sections, commandOverride),
-      activity: sectionMode('activity', detailsMode, sections, commandOverride)
+      thinking: sectionMode("thinking", detailsMode, sections, commandOverride),
+      tools: sectionMode("tools", detailsMode, sections, commandOverride),
+      subagents: sectionMode(
+        "subagents",
+        detailsMode,
+        sections,
+        commandOverride,
+      ),
+      activity: sectionMode("activity", detailsMode, sections, commandOverride),
     }),
-    [commandOverride, detailsMode, sections]
-  )
+    [commandOverride, detailsMode, sections],
+  );
 
   const thinkingDefaultExpanded =
-    visible.thinking === 'expanded' && (preferExpandedThinking || commandOverride || sections?.thinking === 'expanded')
+    visible.thinking === "expanded" &&
+    (preferExpandedThinking ||
+      commandOverride ||
+      sections?.thinking === "expanded");
 
-  const [now, setNow] = useState(() => Date.now())
+  const [now, setNow] = useState(() => Date.now());
   // Local toggles own the open state once mounted.  Init from the resolved
   // section visibility so default-expanded sections (thinking/tools) render
   // open on first paint; the useEffect below re-syncs when the user mutates
@@ -750,21 +852,27 @@ export const ToolTrail = memo(function ToolTrail({
   // label. This only affects the initial mount value; the re-sync effect
   // below deliberately does NOT re-apply it, so a manual collapse still
   // sticks (see the no-OR-at-effect-time warning above, #14968).
-  const [openThinking, setOpenThinking] = useState(thinkingDefaultExpanded || reasoningAlwaysVisible)
-  const [openTools, setOpenTools] = useState(visible.tools === 'expanded')
-  const [openSubagents, setOpenSubagents] = useState(visible.subagents === 'expanded')
-  const [deepSubagents, setDeepSubagents] = useState(visible.subagents === 'expanded')
-  const [openMeta, setOpenMeta] = useState(visible.activity === 'expanded')
+  const [openThinking, setOpenThinking] = useState(
+    thinkingDefaultExpanded || reasoningAlwaysVisible,
+  );
+  const [openTools, setOpenTools] = useState(visible.tools === "expanded");
+  const [openSubagents, setOpenSubagents] = useState(
+    visible.subagents === "expanded",
+  );
+  const [deepSubagents, setDeepSubagents] = useState(
+    visible.subagents === "expanded",
+  );
+  const [openMeta, setOpenMeta] = useState(visible.activity === "expanded");
 
   useEffect(() => {
-    if (!tools.length || (visible.tools !== 'expanded' && !openTools)) {
-      return
+    if (!tools.length || (visible.tools !== "expanded" && !openTools)) {
+      return;
     }
 
-    const id = setInterval(() => setNow(Date.now()), 500)
+    const id = setInterval(() => setNow(Date.now()), 500);
 
-    return () => clearInterval(id)
-  }, [openTools, tools.length, visible.tools])
+    return () => clearInterval(id);
+  }, [openTools, tools.length, visible.tools]);
 
   // Effects run after the FIRST render too, not just on later updates — so
   // this re-sync was clobbering the reasoningAlwaysVisible mount value above
@@ -773,45 +881,52 @@ export const ToolTrail = memo(function ToolTrail({
   // very first run; every subsequent `visible` change (the case this effect
   // exists for) still re-syncs without the override, so a manual collapse
   // still sticks per the no-OR-at-effect-time rule above.
-  const skippedInitialSync = useRef(false)
+  const skippedInitialSync = useRef(false);
   useEffect(() => {
     if (!skippedInitialSync.current) {
-      skippedInitialSync.current = true
+      skippedInitialSync.current = true;
 
-      return
+      return;
     }
 
-    setOpenThinking(thinkingDefaultExpanded)
-    setOpenTools(visible.tools === 'expanded')
-    setOpenSubagents(visible.subagents === 'expanded')
-    setOpenMeta(visible.activity === 'expanded')
-  }, [thinkingDefaultExpanded, visible])
+    setOpenThinking(thinkingDefaultExpanded);
+    setOpenTools(visible.tools === "expanded");
+    setOpenSubagents(visible.subagents === "expanded");
+    setOpenMeta(visible.activity === "expanded");
+  }, [thinkingDefaultExpanded, visible]);
 
   // `collapsed` is an auto preference: keep the panel open while reasoning
   // is live (stream pulses keep `reasoningActive` true) and collapse it the
   // moment the reasoning phase ends (`endReasoningPhase` flips it false).
   // `expanded` stays fully manual, `hidden` never renders content, and MoA
   // reference panels (reasoningAlwaysVisible) are left alone.
-  const thinkingAuto = visible.thinking === 'collapsed' && !reasoningAlwaysVisible
+  const thinkingAuto =
+    visible.thinking === "collapsed" && !reasoningAlwaysVisible;
   useEffect(() => {
     if (!thinkingAuto) {
-      return
+      return;
     }
 
-    setOpenThinking(reasoningActive)
-  }, [thinkingAuto, reasoningActive])
+    setOpenThinking(reasoningActive);
+  }, [thinkingAuto, reasoningActive]);
 
-  const cot = useMemo(() => thinkingPreview(reasoning, 'full', THINKING_COT_MAX), [reasoning])
+  const cot = useMemo(
+    () => thinkingPreview(reasoning, "full", THINKING_COT_MAX),
+    [reasoning],
+  );
 
   // Spawn-tree derivations must live above any early return so React's
   // rules-of-hooks sees a stable call order.  Cheap O(N) builds memoised
   // by subagent-list identity.
-  const spawnTree = useMemo(() => buildSubagentTree(subagents), [subagents])
-  const spawnPeak = useMemo(() => peakHotness(spawnTree), [spawnTree])
-  const spawnTotals = useMemo(() => treeTotals(spawnTree), [spawnTree])
-  const spawnWidths = useMemo(() => widthByDepth(spawnTree), [spawnTree])
-  const spawnSpark = useMemo(() => sparkline(spawnWidths), [spawnWidths])
-  const spawnSummaryLabel = useMemo(() => formatSpawnSummary(spawnTotals), [spawnTotals])
+  const spawnTree = useMemo(() => buildSubagentTree(subagents), [subagents]);
+  const spawnPeak = useMemo(() => peakHotness(spawnTree), [spawnTree]);
+  const spawnTotals = useMemo(() => treeTotals(spawnTree), [spawnTree]);
+  const spawnWidths = useMemo(() => widthByDepth(spawnTree), [spawnTree]);
+  const spawnSpark = useMemo(() => sparkline(spawnWidths), [spawnWidths]);
+  const spawnSummaryLabel = useMemo(
+    () => formatSpawnSummary(spawnTotals),
+    [spawnTotals],
+  );
 
   if (
     !busy &&
@@ -823,54 +938,62 @@ export const ToolTrail = memo(function ToolTrail({
     !reasoningActive &&
     !outcome
   ) {
-    return null
+    return null;
   }
 
   // ── Build groups + meta ────────────────────────────────────────
 
-  const groups: Group[] = []
-  const meta: DetailRow[] = []
-  const pushDetail = (row: DetailRow) => (groups.at(-1)?.details ?? meta).push(row)
+  const groups: Group[] = [];
+  const meta: DetailRow[] = [];
+  const pushDetail = (row: DetailRow) =>
+    (groups.at(-1)?.details ?? meta).push(row);
 
   for (const [i, line] of trail.entries()) {
-    const parsed = parseToolTrailResultLine(line)
+    const parsed = parseToolTrailResultLine(line);
 
     if (parsed) {
       groups.push({
-        color: parsed.mark === '✗' ? t.color.error : t.color.text,
+        color: parsed.mark === "✗" ? t.color.error : t.color.text,
         content: parsed.call,
         details: [],
         key: `tr-${i}`,
-        label: parsed.call
-      })
+        label: parsed.call,
+      });
 
       if (parsed.detail) {
         pushDetail({
-          color: parsed.mark === '✗' ? t.color.error : t.color.muted,
+          color: parsed.mark === "✗" ? t.color.error : t.color.muted,
           content: parsed.detail,
-          dimColor: parsed.mark !== '✗',
-          key: `tr-${i}-d`
-        })
+          dimColor: parsed.mark !== "✗",
+          key: `tr-${i}-d`,
+        });
       }
 
-      continue
+      continue;
     }
 
-    if (line.startsWith('drafting ')) {
-      const label = toolTrailLabel(line.slice(9).replace(/…$/, '').trim())
+    if (line.startsWith("drafting ")) {
+      const label = toolTrailLabel(line.slice(9).replace(/…$/, "").trim());
 
       groups.push({
         color: t.color.text,
         content: label,
-        details: [{ color: t.color.muted, content: 'drafting...', dimColor: true, key: `tr-${i}-d` }],
+        details: [
+          {
+            color: t.color.muted,
+            content: "drafting...",
+            dimColor: true,
+            key: `tr-${i}-d`,
+          },
+        ],
         key: `tr-${i}`,
-        label
-      })
+        label,
+      });
 
-      continue
+      continue;
     }
 
-    if (line === 'analyzing tool output…') {
+    if (line === "analyzing tool output…") {
       pushDetail({
         color: t.color.muted,
         dimColor: true,
@@ -881,18 +1004,25 @@ export const ToolTrail = memo(function ToolTrail({
           </>
         ) : (
           line
-        )
-      })
+        ),
+      });
 
-      continue
+      continue;
     }
 
-    meta.push({ color: t.color.muted, content: line, dimColor: true, key: `tr-${i}` })
+    meta.push({
+      color: t.color.muted,
+      content: line,
+      dimColor: true,
+      key: `tr-${i}`,
+    });
   }
 
   for (const tool of tools) {
     // A bridged call names its inner calls; anything else is still name + preview.
-    const label = tool.labels?.length ? formatToolLabels(tool.labels) : formatToolCall(tool.name, tool.context || '')
+    const label = tool.labels?.length
+      ? formatToolLabels(tool.labels)
+      : formatToolCall(tool.name, tool.context || "");
 
     groups.push({
       color: t.color.text,
@@ -904,49 +1034,73 @@ export const ToolTrail = memo(function ToolTrail({
               color: t.color.muted,
               content: `Args:\n${boundedLiveRenderText(tool.verboseArgs)}`,
               dimColor: true,
-              key: `${tool.id}-args`
-            }
+              key: `${tool.id}-args`,
+            },
           ]
         : [],
       content: (
         <>
           <Spinner color={t.color.tool} variant="tool" /> {label}
-          {tool.startedAt ? ` (${fmtElapsed(now - tool.startedAt)})` : ''}
+          {tool.startedAt ? ` (${fmtElapsed(now - tool.startedAt)})` : ""}
         </>
-      )
-    })
+      ),
+    });
   }
 
   for (const item of activity.slice(-4)) {
-    const glyph = item.tone === 'error' ? '✗' : item.tone === 'warn' ? '!' : '·'
-    const color = item.tone === 'error' ? t.color.error : item.tone === 'warn' ? t.color.warn : t.color.muted
-    meta.push({ color, content: `${glyph} ${item.text}`, dimColor: item.tone === 'info', key: `a-${item.id}` })
+    const glyph =
+      item.tone === "error" ? "✗" : item.tone === "warn" ? "!" : "·";
+    const color =
+      item.tone === "error"
+        ? t.color.error
+        : item.tone === "warn"
+          ? t.color.warn
+          : t.color.muted;
+    meta.push({
+      color,
+      content: `${glyph} ${item.text}`,
+      dimColor: item.tone === "info",
+      key: `a-${item.id}`,
+    });
   }
 
   // ── Derived ────────────────────────────────────────────────────
 
-  const hasTools = groups.length > 0
-  const hasSubagents = subagents.length > 0
-  const hasMeta = meta.length > 0
-  const hasThinking = !!cot || reasoningActive || reasoningStreaming
-  const thinkingLive = reasoningActive || reasoningStreaming
+  const hasTools = groups.length > 0;
+  const hasSubagents = subagents.length > 0;
+  const hasMeta = meta.length > 0;
+  const hasThinking = !!cot || reasoningActive || reasoningStreaming;
+  const thinkingLive = reasoningActive || reasoningStreaming;
 
   const tokenCount =
-    reasoningTokens && reasoningTokens > 0 ? reasoningTokens : reasoning ? estimateTokensRough(reasoning) : 0
+    reasoningTokens && reasoningTokens > 0
+      ? reasoningTokens
+      : reasoning
+        ? estimateTokensRough(reasoning)
+        : 0;
 
-  const toolTokenCount = toolTokens ?? 0
-  const totalTokenCount = tokenCount + toolTokenCount
-  const thinkingTokensLabel = tokenCount > 0 ? `~${compactNumber(tokenCount)} tokens` : null
+  const toolTokenCount = toolTokens ?? 0;
+  const totalTokenCount = tokenCount + toolTokenCount;
+  const thinkingTokensLabel =
+    tokenCount > 0 ? `~${compactNumber(tokenCount)} tokens` : null;
 
   const toolTokensLabel =
-    toolTokens !== undefined && toolTokens > 0 ? `~${compactNumber(toolTokens)} tokens` : undefined
+    toolTokens !== undefined && toolTokens > 0
+      ? `~${compactNumber(toolTokens)} tokens`
+      : undefined;
 
-  const totalTokensLabel = tokenCount > 0 && toolTokenCount > 0 ? `~${compactNumber(totalTokenCount)} total` : null
-  const delegateGroups = groups.filter(g => g.label.startsWith('Delegate Task'))
-  const inlineDelegateKey = hasSubagents && delegateGroups.length === 1 ? delegateGroups[0]!.key : null
+  const totalTokensLabel =
+    tokenCount > 0 && toolTokenCount > 0
+      ? `~${compactNumber(totalTokenCount)} total`
+      : null;
+  const delegateGroups = groups.filter((g) =>
+    g.label.startsWith("Delegate Task"),
+  );
+  const inlineDelegateKey =
+    hasSubagents && delegateGroups.length === 1 ? delegateGroups[0]!.key : null;
 
   const toolLabel = (group: Group) => {
-    const { duration, label } = splitToolDuration(String(group.content))
+    const { duration, label } = splitToolDuration(String(group.content));
 
     return duration ? (
       <>
@@ -957,8 +1111,8 @@ export const ToolTrail = memo(function ToolTrail({
       </>
     ) : (
       group.content
-    )
-  }
+    );
+  };
 
   // ── Backstop: floating alerts when every panel is hidden ─────────
   //
@@ -970,24 +1124,27 @@ export const ToolTrail = memo(function ToolTrail({
   // backstop so quiet-mode users aren't blind to failures.
 
   const allHidden =
-    visible.thinking === 'hidden' &&
+    visible.thinking === "hidden" &&
     !reasoningAlwaysVisible &&
-    visible.tools === 'hidden' &&
-    visible.subagents === 'hidden' &&
-    visible.activity === 'hidden'
+    visible.tools === "hidden" &&
+    visible.subagents === "hidden" &&
+    visible.activity === "hidden";
 
   if (allHidden) {
-    const alerts = activity.filter(i => i.tone !== 'info').slice(-2)
+    const alerts = activity.filter((i) => i.tone !== "info").slice(-2);
 
     return alerts.length ? (
       <Box flexDirection="column">
-        {alerts.map(i => (
-          <Text color={i.tone === 'error' ? t.color.error : t.color.warn} key={`ha-${i.id}`}>
-            {i.tone === 'error' ? '✗' : '!'} {i.text}
+        {alerts.map((i) => (
+          <Text
+            color={i.tone === "error" ? t.color.error : t.color.warn}
+            key={`ha-${i.id}`}
+          >
+            {i.tone === "error" ? "✗" : "!"} {i.text}
           </Text>
         ))}
       </Box>
-    ) : null
+    ) : null;
   }
 
   // ── Tree render fragments ──────────────────────────────────────
@@ -996,36 +1153,38 @@ export const ToolTrail = memo(function ToolTrail({
   // hidden sections stay hidden so the override is honoured.
 
   const expandAll = () => {
-    if (visible.thinking !== 'hidden' || reasoningAlwaysVisible) {
-      setOpenThinking(true)
+    if (visible.thinking !== "hidden" || reasoningAlwaysVisible) {
+      setOpenThinking(true);
     }
 
-    if (visible.tools !== 'hidden') {
-      setOpenTools(true)
+    if (visible.tools !== "hidden") {
+      setOpenTools(true);
     }
 
-    if (visible.subagents !== 'hidden') {
-      setOpenSubagents(true)
-      setDeepSubagents(true)
+    if (visible.subagents !== "hidden") {
+      setOpenSubagents(true);
+      setDeepSubagents(true);
     }
 
-    if (visible.activity !== 'hidden') {
-      setOpenMeta(true)
+    if (visible.activity !== "hidden") {
+      setOpenMeta(true);
     }
-  }
+  };
 
-  const metaTone: 'dim' | 'error' | 'warn' = activity.some(i => i.tone === 'error')
-    ? 'error'
-    : activity.some(i => i.tone === 'warn')
-      ? 'warn'
-      : 'dim'
+  const metaTone: "dim" | "error" | "warn" = activity.some(
+    (i) => i.tone === "error",
+  )
+    ? "error"
+    : activity.some((i) => i.tone === "warn")
+      ? "warn"
+      : "dim";
 
   const renderSubagentList = (rails: boolean[]) => (
     <Box flexDirection="column">
       {spawnTree.map((node, index) => (
         <SubagentAccordion
-          branch={index === spawnTree.length - 1 ? 'last' : 'mid'}
-          expanded={visible.subagents === 'expanded' || deepSubagents}
+          branch={index === spawnTree.length - 1 ? "last" : "mid"}
+          expanded={visible.subagents === "expanded" || deepSubagents}
           key={node.item.id}
           node={node}
           peak={spawnPeak}
@@ -1034,29 +1193,32 @@ export const ToolTrail = memo(function ToolTrail({
         />
       ))}
     </Box>
-  )
+  );
 
   const panels: {
-    header: ReactNode
-    key: string
-    open: boolean
-    render: (rails: boolean[]) => ReactNode
-  }[] = []
+    header: ReactNode;
+    key: string;
+    open: boolean;
+    render: (rails: boolean[]) => ReactNode;
+  }[] = [];
 
-  if (hasThinking && (visible.thinking !== 'hidden' || reasoningAlwaysVisible)) {
+  if (
+    hasThinking &&
+    (visible.thinking !== "hidden" || reasoningAlwaysVisible)
+  ) {
     panels.push({
       header: (
         <Box
           onClick={(e: any) => {
             if (e?.shiftKey || e?.ctrlKey) {
-              expandAll()
+              expandAll();
             } else {
-              setOpenThinking(v => !v)
+              setOpenThinking((v) => !v);
             }
           }}
         >
           <Text color={t.color.muted} dim={!thinkingLive}>
-            <Text color={t.color.accent}>{openThinking ? '▾ ' : '▸ '}</Text>
+            <Text color={t.color.accent}>{openThinking ? "▾ " : "▸ "}</Text>
             {thinkingLive ? (
               <Text bold color={t.color.text}>
                 Thinking
@@ -1068,16 +1230,16 @@ export const ToolTrail = memo(function ToolTrail({
             )}
             {thinkingTokensLabel ? (
               <Text color={t.color.statusFg} dim>
-                {'  '}
+                {"  "}
                 {thinkingTokensLabel}
               </Text>
             ) : null}
           </Text>
         </Box>
       ),
-      key: 'thinking',
+      key: "thinking",
       open: openThinking,
-      render: rails => (
+      render: (rails) => (
         <Thinking
           active={reasoningActive}
           branch="last"
@@ -1087,20 +1249,20 @@ export const ToolTrail = memo(function ToolTrail({
           streaming={busy && reasoningStreaming}
           t={t}
         />
-      )
-    })
+      ),
+    });
   }
 
-  if (hasTools && visible.tools !== 'hidden') {
+  if (hasTools && visible.tools !== "hidden") {
     panels.push({
       header: (
         <Chevron
           count={groups.length}
-          onClick={shift => {
+          onClick={(shift) => {
             if (shift) {
-              expandAll()
+              expandAll();
             } else {
-              setOpenTools(v => !v)
+              setOpenTools((v) => !v);
             }
           }}
           open={openTools}
@@ -1109,18 +1271,19 @@ export const ToolTrail = memo(function ToolTrail({
           title="Tool calls"
         />
       ),
-      key: 'tools',
+      key: "tools",
       open: openTools,
-      render: rails => (
+      render: (rails) => (
         <Box flexDirection="column">
           {groups.map((group, index) => {
-            const branch: TreeBranch = index === groups.length - 1 ? 'last' : 'mid'
-            const childRails = nextTreeRails(rails, branch)
-            const hasInlineSubagents = inlineDelegateKey === group.key
+            const branch: TreeBranch =
+              index === groups.length - 1 ? "last" : "mid";
+            const childRails = nextTreeRails(rails, branch);
+            const hasInlineSubagents = inlineDelegateKey === group.key;
             // Surface the /agents hint the moment a delegate group appears —
             // while it's still in-flight and before any subagent has
             // registered — so users can open the live monitor immediately.
-            const isDelegateGroup = group.label.startsWith('Delegate Task')
+            const isDelegateGroup = group.label.startsWith("Delegate Task");
 
             return (
               <Box flexDirection="column" key={group.key}>
@@ -1133,7 +1296,7 @@ export const ToolTrail = memo(function ToolTrail({
                       {toolLabel(group)}
                       {isDelegateGroup ? (
                         <Text color={t.color.statusFg} dim>
-                          {'  (/agents to monitor)'}
+                          {"  (/agents to monitor)"}
                         </Text>
                       ) : null}
                     </>
@@ -1144,7 +1307,12 @@ export const ToolTrail = memo(function ToolTrail({
                 {group.details.map((detail, detailIndex) => (
                   <Detail
                     {...detail}
-                    branch={detailIndex === group.details.length - 1 && !hasInlineSubagents ? 'last' : 'mid'}
+                    branch={
+                      detailIndex === group.details.length - 1 &&
+                      !hasInlineSubagents
+                        ? "last"
+                        : "mid"
+                    }
                     key={detail.key}
                     rails={childRails}
                     t={t}
@@ -1152,29 +1320,31 @@ export const ToolTrail = memo(function ToolTrail({
                 ))}
                 {hasInlineSubagents ? renderSubagentList(childRails) : null}
               </Box>
-            )
+            );
           })}
         </Box>
-      )
-    })
+      ),
+    });
   }
 
-  if (hasSubagents && !inlineDelegateKey && visible.subagents !== 'hidden') {
+  if (hasSubagents && !inlineDelegateKey && visible.subagents !== "hidden") {
     // Spark + summary give a one-line read on the branch shape before
     // opening the subtree.  `/agents` opens the full-screen audit overlay.
-    const suffix = spawnSpark ? `${spawnSummaryLabel}  ${spawnSpark}  (/agents)` : `${spawnSummaryLabel}  (/agents)`
+    const suffix = spawnSpark
+      ? `${spawnSummaryLabel}  ${spawnSpark}  (/agents)`
+      : `${spawnSummaryLabel}  (/agents)`;
 
     panels.push({
       header: (
         <Chevron
           count={spawnTotals.descendantCount}
-          onClick={shift => {
+          onClick={(shift) => {
             if (shift) {
-              expandAll()
-              setDeepSubagents(true)
+              expandAll();
+              setDeepSubagents(true);
             } else {
-              setOpenSubagents(v => !v)
-              setDeepSubagents(false)
+              setOpenSubagents((v) => !v);
+              setDeepSubagents(false);
             }
           }}
           open={openSubagents}
@@ -1183,22 +1353,22 @@ export const ToolTrail = memo(function ToolTrail({
           title="Spawn tree"
         />
       ),
-      key: 'subagents',
+      key: "subagents",
       open: openSubagents,
-      render: renderSubagentList
-    })
+      render: renderSubagentList,
+    });
   }
 
-  if (hasMeta && visible.activity !== 'hidden') {
+  if (hasMeta && visible.activity !== "hidden") {
     panels.push({
       header: (
         <Chevron
           count={meta.length}
-          onClick={shift => {
+          onClick={(shift) => {
             if (shift) {
-              expandAll()
+              expandAll();
             } else {
-              setOpenMeta(v => !v)
+              setOpenMeta((v) => !v);
             }
           }}
           open={openMeta}
@@ -1207,13 +1377,13 @@ export const ToolTrail = memo(function ToolTrail({
           tone={metaTone}
         />
       ),
-      key: 'meta',
+      key: "meta",
       open: openMeta,
-      render: rails => (
+      render: (rails) => (
         <Box flexDirection="column">
           {meta.map((row, index) => (
             <TreeTextRow
-              branch={index === meta.length - 1 ? 'last' : 'mid'}
+              branch={index === meta.length - 1 ? "last" : "mid"}
               color={row.color}
               content={row.content}
               dimColor={row.dimColor}
@@ -1223,17 +1393,17 @@ export const ToolTrail = memo(function ToolTrail({
             />
           ))}
         </Box>
-      )
-    })
+      ),
+    });
   }
 
-  const topCount = panels.length + (totalTokensLabel ? 1 : 0)
+  const topCount = panels.length + (totalTokensLabel ? 1 : 0);
 
   return (
     <Box flexDirection="column">
       {panels.map((panel, index) => (
         <TreeNode
-          branch={index === topCount - 1 ? 'last' : 'mid'}
+          branch={index === topCount - 1 ? "last" : "mid"}
           header={panel.header}
           key={panel.key}
           open={panel.open}
@@ -1264,5 +1434,5 @@ export const ToolTrail = memo(function ToolTrail({
         </Box>
       ) : null}
     </Box>
-  )
-})
+  );
+});

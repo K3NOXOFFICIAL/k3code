@@ -1,191 +1,210 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it } from "vitest";
 
-const ENV_KEYS = ['COLORTERM', 'FORCE_COLOR', 'K3CODE_TUI_TRUECOLOR', 'NO_COLOR', 'TERM', 'TERM_PROGRAM'] as const
-let importId = 0
+const ENV_KEYS = [
+  "COLORTERM",
+  "FORCE_COLOR",
+  "K3CODE_TUI_TRUECOLOR",
+  "NO_COLOR",
+  "TERM",
+  "TERM_PROGRAM",
+] as const;
+let importId = 0;
 
 async function withCleanEnv(setup: () => void, body: () => Promise<void>) {
-  const saved: Record<string, string | undefined> = {}
+  const saved: Record<string, string | undefined> = {};
 
   for (const k of ENV_KEYS) {
-    saved[k] = process.env[k]
-    delete process.env[k]
+    saved[k] = process.env[k];
+    delete process.env[k];
   }
 
   try {
-    setup()
-    await body()
+    setup();
+    await body();
   } finally {
     for (const k of ENV_KEYS) {
       if (saved[k] === undefined) {
-        delete process.env[k]
+        delete process.env[k];
       } else {
-        process.env[k] = saved[k]
+        process.env[k] = saved[k];
       }
     }
   }
 }
 
-describe('forceTruecolor', () => {
-  it('does not force truecolor by default', async () => {
+describe("forceTruecolor", () => {
+  it("does not force truecolor by default", async () => {
     await withCleanEnv(
       () => {},
       async () => {
-        await import('../lib/forceTruecolor.js?t=default-' + importId++)
-        expect(process.env.COLORTERM).toBeUndefined()
-        expect(process.env.FORCE_COLOR).toBeUndefined()
-      }
-    )
-  })
+        await import("../lib/forceTruecolor.js?t=default-" + importId++);
+        expect(process.env.COLORTERM).toBeUndefined();
+        expect(process.env.FORCE_COLOR).toBeUndefined();
+      },
+    );
+  });
 
-  it('does not infer truecolor from Apple Terminal on pre-Tahoe macOS', async () => {
+  it("does not infer truecolor from Apple Terminal on pre-Tahoe macOS", async () => {
     await withCleanEnv(
       () => {
-        process.env.TERM_PROGRAM = 'Apple_Terminal'
-        process.env.TERM = 'xterm-256color'
+        process.env.TERM_PROGRAM = "Apple_Terminal";
+        process.env.TERM = "xterm-256color";
       },
       async () => {
-        const mod = await import('../lib/forceTruecolor.js?t=apple-' + importId++)
-        expect(mod.shouldForceTruecolor({ TERM_PROGRAM: 'Apple_Terminal' })).toBe(false)
-        expect(process.env.COLORTERM).toBeUndefined()
-        expect(process.env.FORCE_COLOR).toBeUndefined()
-      }
-    )
-  })
+        const mod = await import(
+          "../lib/forceTruecolor.js?t=apple-" + importId++
+        );
+        expect(
+          mod.shouldForceTruecolor({ TERM_PROGRAM: "Apple_Terminal" }),
+        ).toBe(false);
+        expect(process.env.COLORTERM).toBeUndefined();
+        expect(process.env.FORCE_COLOR).toBeUndefined();
+      },
+    );
+  });
 
-  it('downgrades Apple Terminal when truecolor is only advertised by env', async () => {
+  it("downgrades Apple Terminal when truecolor is only advertised by env", async () => {
     await withCleanEnv(
       () => {
-        process.env.TERM_PROGRAM = 'Apple_Terminal'
-        process.env.COLORTERM = 'truecolor'
-        process.env.FORCE_COLOR = '3'
+        process.env.TERM_PROGRAM = "Apple_Terminal";
+        process.env.COLORTERM = "truecolor";
+        process.env.FORCE_COLOR = "3";
       },
       async () => {
-        const mod = await import('../lib/forceTruecolor.js?t=downgrade-' + importId++)
+        const mod = await import(
+          "../lib/forceTruecolor.js?t=downgrade-" + importId++
+        );
         expect(
           mod.shouldDowngradeAppleTerminalTruecolor({
-            TERM_PROGRAM: 'Apple_Terminal',
-            COLORTERM: 'truecolor',
-            FORCE_COLOR: '3'
-          } as NodeJS.ProcessEnv)
-        ).toBe(true)
-        expect(process.env.COLORTERM).toBeUndefined()
-        expect(process.env.FORCE_COLOR).toBeUndefined()
-      }
-    )
-  })
+            TERM_PROGRAM: "Apple_Terminal",
+            COLORTERM: "truecolor",
+            FORCE_COLOR: "3",
+          } as NodeJS.ProcessEnv),
+        ).toBe(true);
+        expect(process.env.COLORTERM).toBeUndefined();
+        expect(process.env.FORCE_COLOR).toBeUndefined();
+      },
+    );
+  });
 
-  it('keeps non-Apple terminals untouched when they advertise truecolor', async () => {
+  it("keeps non-Apple terminals untouched when they advertise truecolor", async () => {
     await withCleanEnv(
       () => {
-        process.env.TERM_PROGRAM = 'vscode'
-        process.env.COLORTERM = 'truecolor'
-        process.env.FORCE_COLOR = '3'
+        process.env.TERM_PROGRAM = "vscode";
+        process.env.COLORTERM = "truecolor";
+        process.env.FORCE_COLOR = "3";
       },
       async () => {
-        const mod = await import('../lib/forceTruecolor.js?t=keep-non-apple-' + importId++)
+        const mod = await import(
+          "../lib/forceTruecolor.js?t=keep-non-apple-" + importId++
+        );
         expect(
           mod.shouldDowngradeAppleTerminalTruecolor({
-            TERM_PROGRAM: 'vscode',
-            COLORTERM: 'truecolor',
-            FORCE_COLOR: '3'
-          } as NodeJS.ProcessEnv)
-        ).toBe(false)
-        expect(process.env.COLORTERM).toBe('truecolor')
-        expect(process.env.FORCE_COLOR).toBe('3')
-      }
-    )
-  })
+            TERM_PROGRAM: "vscode",
+            COLORTERM: "truecolor",
+            FORCE_COLOR: "3",
+          } as NodeJS.ProcessEnv),
+        ).toBe(false);
+        expect(process.env.COLORTERM).toBe("truecolor");
+        expect(process.env.FORCE_COLOR).toBe("3");
+      },
+    );
+  });
 
-  it('sets COLORTERM=truecolor and FORCE_COLOR=3 when explicitly enabled', async () => {
+  it("sets COLORTERM=truecolor and FORCE_COLOR=3 when explicitly enabled", async () => {
     await withCleanEnv(
       () => {
-        process.env.K3CODE_TUI_TRUECOLOR = '1'
+        process.env.K3CODE_TUI_TRUECOLOR = "1";
       },
       async () => {
-        await import('../lib/forceTruecolor.js?t=enabled-' + importId++)
-        expect(process.env.COLORTERM).toBe('truecolor')
-        expect(process.env.FORCE_COLOR).toBe('3')
-      }
-    )
-  })
+        await import("../lib/forceTruecolor.js?t=enabled-" + importId++);
+        expect(process.env.COLORTERM).toBe("truecolor");
+        expect(process.env.FORCE_COLOR).toBe("3");
+      },
+    );
+  });
 
-  it('respects K3CODE_TUI_TRUECOLOR=0 opt-out', async () => {
+  it("respects K3CODE_TUI_TRUECOLOR=0 opt-out", async () => {
     await withCleanEnv(
       () => {
-        process.env.K3CODE_TUI_TRUECOLOR = '0'
-        process.env.TERM_PROGRAM = 'Apple_Terminal'
+        process.env.K3CODE_TUI_TRUECOLOR = "0";
+        process.env.TERM_PROGRAM = "Apple_Terminal";
       },
       async () => {
-        await import('../lib/forceTruecolor.js?t=optout-' + importId++)
-        expect(process.env.COLORTERM).toBeUndefined()
-        expect(process.env.FORCE_COLOR).toBeUndefined()
-      }
-    )
-  })
+        await import("../lib/forceTruecolor.js?t=optout-" + importId++);
+        expect(process.env.COLORTERM).toBeUndefined();
+        expect(process.env.FORCE_COLOR).toBeUndefined();
+      },
+    );
+  });
 
-  it('lets explicit opt-in keep Apple truecolor advertisement', async () => {
+  it("lets explicit opt-in keep Apple truecolor advertisement", async () => {
     await withCleanEnv(
       () => {
-        process.env.TERM_PROGRAM = 'Apple_Terminal'
-        process.env.COLORTERM = 'truecolor'
-        process.env.FORCE_COLOR = '3'
-        process.env.K3CODE_TUI_TRUECOLOR = '1'
+        process.env.TERM_PROGRAM = "Apple_Terminal";
+        process.env.COLORTERM = "truecolor";
+        process.env.FORCE_COLOR = "3";
+        process.env.K3CODE_TUI_TRUECOLOR = "1";
       },
       async () => {
-        const mod = await import('../lib/forceTruecolor.js?t=apple-explicit-on-' + importId++)
+        const mod = await import(
+          "../lib/forceTruecolor.js?t=apple-explicit-on-" + importId++
+        );
         expect(
           mod.shouldDowngradeAppleTerminalTruecolor({
-            TERM_PROGRAM: 'Apple_Terminal',
-            COLORTERM: 'truecolor',
-            FORCE_COLOR: '3',
-            K3CODE_TUI_TRUECOLOR: '1'
-          } as NodeJS.ProcessEnv)
-        ).toBe(false)
-        expect(process.env.COLORTERM).toBe('truecolor')
-        expect(process.env.FORCE_COLOR).toBe('3')
-      }
-    )
-  })
+            TERM_PROGRAM: "Apple_Terminal",
+            COLORTERM: "truecolor",
+            FORCE_COLOR: "3",
+            K3CODE_TUI_TRUECOLOR: "1",
+          } as NodeJS.ProcessEnv),
+        ).toBe(false);
+        expect(process.env.COLORTERM).toBe("truecolor");
+        expect(process.env.FORCE_COLOR).toBe("3");
+      },
+    );
+  });
 
-  it('respects NO_COLOR', async () => {
+  it("respects NO_COLOR", async () => {
     await withCleanEnv(
       () => {
-        process.env.NO_COLOR = '1'
-        process.env.K3CODE_TUI_TRUECOLOR = '1'
+        process.env.NO_COLOR = "1";
+        process.env.K3CODE_TUI_TRUECOLOR = "1";
       },
       async () => {
-        await import('../lib/forceTruecolor.js?t=no-color-' + importId++)
-        expect(process.env.COLORTERM).toBeUndefined()
-        expect(process.env.FORCE_COLOR).toBeUndefined()
-      }
-    )
-  })
+        await import("../lib/forceTruecolor.js?t=no-color-" + importId++);
+        expect(process.env.COLORTERM).toBeUndefined();
+        expect(process.env.FORCE_COLOR).toBeUndefined();
+      },
+    );
+  });
 
-  it('respects existing FORCE_COLOR unless Hermes truecolor is explicit', async () => {
+  it("respects existing FORCE_COLOR unless Hermes truecolor is explicit", async () => {
     await withCleanEnv(
       () => {
-        process.env.FORCE_COLOR = ''
+        process.env.FORCE_COLOR = "";
       },
       async () => {
-        const mod = await import('../lib/forceTruecolor.js?t=force-color-' + importId++)
-        expect(mod.shouldForceTruecolor(process.env)).toBe(false)
-        expect(process.env.COLORTERM).toBeUndefined()
-        expect(process.env.FORCE_COLOR).toBe('')
-      }
-    )
-  })
+        const mod = await import(
+          "../lib/forceTruecolor.js?t=force-color-" + importId++
+        );
+        expect(mod.shouldForceTruecolor(process.env)).toBe(false);
+        expect(process.env.COLORTERM).toBeUndefined();
+        expect(process.env.FORCE_COLOR).toBe("");
+      },
+    );
+  });
 
-  it('lets explicit Hermes truecolor override existing FORCE_COLOR', async () => {
+  it("lets explicit Hermes truecolor override existing FORCE_COLOR", async () => {
     await withCleanEnv(
       () => {
-        process.env.FORCE_COLOR = '0'
-        process.env.K3CODE_TUI_TRUECOLOR = '1'
+        process.env.FORCE_COLOR = "0";
+        process.env.K3CODE_TUI_TRUECOLOR = "1";
       },
       async () => {
-        await import('../lib/forceTruecolor.js?t=explicit-force-' + importId++)
-        expect(process.env.COLORTERM).toBe('truecolor')
-        expect(process.env.FORCE_COLOR).toBe('3')
-      }
-    )
-  })
-})
+        await import("../lib/forceTruecolor.js?t=explicit-force-" + importId++);
+        expect(process.env.COLORTERM).toBe("truecolor");
+        expect(process.env.FORCE_COLOR).toBe("3");
+      },
+    );
+  });
+});

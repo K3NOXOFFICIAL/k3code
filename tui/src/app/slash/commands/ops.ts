@@ -10,15 +10,23 @@ import type {
   SlashExecResponse,
   SpawnTreeListResponse,
   SpawnTreeLoadResponse,
-  ToolsConfigureResponse
-} from '../../../gatewayTypes.js'
-import { applyDelegationStatus, getDelegationState } from '../../delegationStore.js'
-import { patchOverlayState } from '../../overlayStore.js'
-import { getSpawnHistory, pushDiskSnapshot, setDiffPair, type SpawnSnapshot } from '../../spawnHistoryStore.js'
-import type { SlashCommand } from '../types.js'
+  ToolsConfigureResponse,
+} from "../../../gatewayTypes.js";
+import {
+  applyDelegationStatus,
+  getDelegationState,
+} from "../../delegationStore.js";
+import { patchOverlayState } from "../../overlayStore.js";
+import {
+  getSpawnHistory,
+  pushDiskSnapshot,
+  setDiffPair,
+  type SpawnSnapshot,
+} from "../../spawnHistoryStore.js";
+import type { SlashCommand } from "../types.js";
 
 interface SkillsReloadResponse {
-  output?: string
+  output?: string;
 }
 
 export const opsCommands: SlashCommand[] = [
@@ -26,402 +34,446 @@ export const opsCommands: SlashCommand[] = [
   // `process.stop` RPC, which the k3code gateway does not have (so it always errored).
 
   {
-    aliases: ['reload_mcp'],
-    help: 'reload MCP servers in the live session (warns about prompt cache invalidation)',
-    name: 'reload-mcp',
+    aliases: ["reload_mcp"],
+    help: "reload MCP servers in the live session (warns about prompt cache invalidation)",
+    name: "reload-mcp",
     run: (arg, ctx) => {
       // Parse arg: `now` / `always` skip the confirmation gate.
       // `always` additionally persists approvals.mcp_reload_confirm=false.
-      const a = (arg || '').trim().toLowerCase()
+      const a = (arg || "").trim().toLowerCase();
 
-      const params: { session_id: string | null; confirm?: boolean; always?: boolean } = {
-        session_id: ctx.sid
-      }
+      const params: {
+        session_id: string | null;
+        confirm?: boolean;
+        always?: boolean;
+      } = {
+        session_id: ctx.sid,
+      };
 
-      if (a === 'now' || a === 'approve' || a === 'once' || a === 'yes') {
-        params.confirm = true
-      } else if (a === 'always') {
-        params.confirm = true
-        params.always = true
+      if (a === "now" || a === "approve" || a === "once" || a === "yes") {
+        params.confirm = true;
+      } else if (a === "always") {
+        params.confirm = true;
+        params.always = true;
       }
 
       ctx.gateway
-        .rpc<ReloadMcpResponse>('reload.mcp', params)
+        .rpc<ReloadMcpResponse>("reload.mcp", params)
         .then(
-          ctx.guarded<ReloadMcpResponse>(r => {
-            if (r.status === 'confirm_required') {
-              ctx.transcript.sys(r.message || '/reload-mcp requires confirmation')
+          ctx.guarded<ReloadMcpResponse>((r) => {
+            if (r.status === "confirm_required") {
+              ctx.transcript.sys(
+                r.message || "/reload-mcp requires confirmation",
+              );
 
-              return
+              return;
             }
 
-            if (r.status === 'reloaded') {
+            if (r.status === "reloaded") {
               ctx.transcript.sys(
                 params.always
-                  ? 'MCP servers reloaded · future /reload-mcp will run without confirmation'
-                  : 'MCP servers reloaded'
-              )
+                  ? "MCP servers reloaded · future /reload-mcp will run without confirmation"
+                  : "MCP servers reloaded",
+              );
 
-              return
+              return;
             }
 
-            ctx.transcript.sys('reload complete')
-          })
+            ctx.transcript.sys("reload complete");
+          }),
         )
-        .catch(ctx.guardedErr)
-    }
+        .catch(ctx.guardedErr);
+    },
   },
 
   {
-    help: 're-read ~/.k3code/.env into the running gateway (CLI parity)',
-    name: 'reload',
+    help: "re-read ~/.k3code/.env into the running gateway (CLI parity)",
+    name: "reload",
     run: (_arg, ctx) => {
       ctx.gateway
-        .rpc<ReloadEnvResponse>('reload.env', {})
+        .rpc<ReloadEnvResponse>("reload.env", {})
         .then(
-          ctx.guarded<ReloadEnvResponse>(r => {
-            const n = Number(r.updated ?? 0)
-            const noun = n === 1 ? 'var' : 'vars'
+          ctx.guarded<ReloadEnvResponse>((r) => {
+            const n = Number(r.updated ?? 0);
+            const noun = n === 1 ? "var" : "vars";
 
-            ctx.transcript.sys(`reloaded .env (${n} ${noun} updated)`)
-          })
+            ctx.transcript.sys(`reloaded .env (${n} ${noun} updated)`);
+          }),
         )
-        .catch(ctx.guardedErr)
-    }
+        .catch(ctx.guardedErr);
+    },
   },
 
   {
-    help: 'manage browser CDP connection [connect|disconnect|status]',
-    name: 'browser',
+    help: "manage browser CDP connection [connect|disconnect|status]",
+    name: "browser",
     run: (arg, ctx) => {
-      const [rawAction = 'status', ...rest] = arg.trim().split(/\s+/).filter(Boolean)
-      const action = rawAction.toLowerCase()
+      const [rawAction = "status", ...rest] = arg
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean);
+      const action = rawAction.toLowerCase();
 
-      if (!['connect', 'disconnect', 'status'].includes(action)) {
+      if (!["connect", "disconnect", "status"].includes(action)) {
         return ctx.transcript.sys(
-          'usage: /browser [connect|disconnect|status] [url] · persistent: set browser.cdp_url in config.yaml'
-        )
+          "usage: /browser [connect|disconnect|status] [url] · persistent: set browser.cdp_url in config.yaml",
+        );
       }
 
-      const sid = ctx.sid ?? null
-      const url = action === 'connect' ? rest.join(' ').trim() || 'http://127.0.0.1:9222' : undefined
+      const sid = ctx.sid ?? null;
+      const url =
+        action === "connect"
+          ? rest.join(" ").trim() || "http://127.0.0.1:9222"
+          : undefined;
 
       if (url) {
-        ctx.transcript.sys(`checking Chromium-family browser remote debugging at ${url}...`)
+        ctx.transcript.sys(
+          `checking Chromium-family browser remote debugging at ${url}...`,
+        );
       }
 
       ctx.gateway
-        .rpc<BrowserManageResponse>('browser.manage', { action, session_id: sid, ...(url && { url }) })
+        .rpc<BrowserManageResponse>("browser.manage", {
+          action,
+          session_id: sid,
+          ...(url && { url }),
+        })
         .then(
-          ctx.guarded<BrowserManageResponse>(r => {
+          ctx.guarded<BrowserManageResponse>((r) => {
             // Without a session we can't subscribe to streamed
             // browser.progress events, so flush the bundled list.
             if (!sid) {
-              r.messages?.forEach(message => ctx.transcript.sys(message))
+              r.messages?.forEach((message) => ctx.transcript.sys(message));
             }
 
-            if (action === 'status') {
+            if (action === "status") {
               return ctx.transcript.sys(
                 r.connected
-                  ? `browser connected: ${r.url || '(url unavailable)'}`
-                  : 'browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)'
-              )
+                  ? `browser connected: ${r.url || "(url unavailable)"}`
+                  : "browser not connected (try /browser connect <url> or set browser.cdp_url in config.yaml)",
+              );
             }
 
-            if (action === 'disconnect') {
-              return ctx.transcript.sys('browser disconnected')
+            if (action === "disconnect") {
+              return ctx.transcript.sys("browser disconnected");
             }
 
             if (r.connected) {
-              ctx.transcript.sys('Browser connected to live Chromium-family browser via CDP')
-              ctx.transcript.sys(`Endpoint: ${r.url || '(url unavailable)'}`)
-              ctx.transcript.sys('next browser tool call will use this CDP endpoint')
+              ctx.transcript.sys(
+                "Browser connected to live Chromium-family browser via CDP",
+              );
+              ctx.transcript.sys(`Endpoint: ${r.url || "(url unavailable)"}`);
+              ctx.transcript.sys(
+                "next browser tool call will use this CDP endpoint",
+              );
             }
-          })
+          }),
         )
-        .catch(ctx.guardedErr)
-    }
+        .catch(ctx.guardedErr);
+    },
   },
 
   {
-    help: 'list, diff, or restore checkpoints',
-    name: 'rollback',
+    help: "list, diff, or restore checkpoints",
+    name: "rollback",
     run: (arg, ctx) => {
       if (!ctx.sid) {
-        return ctx.transcript.sys('no active session — nothing to rollback')
+        return ctx.transcript.sys("no active session — nothing to rollback");
       }
 
-      const trimmed = arg.trim()
-      const [first = '', ...rest] = trimmed.split(/\s+/).filter(Boolean)
-      const lower = first.toLowerCase()
+      const trimmed = arg.trim();
+      const [first = "", ...rest] = trimmed.split(/\s+/).filter(Boolean);
+      const lower = first.toLowerCase();
 
-      if (!trimmed || lower === 'list' || lower === 'ls') {
+      if (!trimmed || lower === "list" || lower === "ls") {
         return ctx.gateway
-          .rpc<RollbackListResponse>('rollback.list', { session_id: ctx.sid })
+          .rpc<RollbackListResponse>("rollback.list", { session_id: ctx.sid })
           .then(
-            ctx.guarded<RollbackListResponse>(r => {
+            ctx.guarded<RollbackListResponse>((r) => {
               if (!r.enabled) {
-                return ctx.transcript.sys('checkpoints are not enabled')
+                return ctx.transcript.sys("checkpoints are not enabled");
               }
 
-              const checkpoints = r.checkpoints ?? []
+              const checkpoints = r.checkpoints ?? [];
 
               if (!checkpoints.length) {
-                return ctx.transcript.sys('no checkpoints found')
+                return ctx.transcript.sys("no checkpoints found");
               }
 
-              ctx.transcript.panel('Rollback checkpoints', [
+              ctx.transcript.panel("Rollback checkpoints", [
                 {
                   rows: checkpoints.map((c, idx) => [
                     `${idx + 1}. ${c.hash.slice(0, 10)}`,
-                    [c.timestamp, c.message].filter(Boolean).join(' · ') || '(no metadata)'
-                  ])
-                }
-              ])
-            })
+                    [c.timestamp, c.message].filter(Boolean).join(" · ") ||
+                      "(no metadata)",
+                  ]),
+                },
+              ]);
+            }),
           )
-          .catch(ctx.guardedErr)
+          .catch(ctx.guardedErr);
       }
 
-      if (lower === 'diff') {
-        const hash = rest[0]
+      if (lower === "diff") {
+        const hash = rest[0];
 
         if (!hash) {
-          return ctx.transcript.sys('usage: /rollback diff <checkpoint>')
+          return ctx.transcript.sys("usage: /rollback diff <checkpoint>");
         }
 
         return ctx.gateway
-          .rpc<RollbackDiffResponse>('rollback.diff', { hash, session_id: ctx.sid })
+          .rpc<RollbackDiffResponse>("rollback.diff", {
+            hash,
+            session_id: ctx.sid,
+          })
           .then(
-            ctx.guarded<RollbackDiffResponse>(r => {
-              const body = (r.rendered || r.diff || '').trim()
+            ctx.guarded<RollbackDiffResponse>((r) => {
+              const body = (r.rendered || r.diff || "").trim();
 
               if (!body && !r.stat) {
-                return ctx.transcript.sys('no changes since this checkpoint')
+                return ctx.transcript.sys("no changes since this checkpoint");
               }
 
-              const text = [r.stat || '', body].filter(Boolean).join('\n\n')
-              ctx.transcript.page(text, 'Rollback diff')
-            })
+              const text = [r.stat || "", body].filter(Boolean).join("\n\n");
+              ctx.transcript.page(text, "Rollback diff");
+            }),
           )
-          .catch(ctx.guardedErr)
+          .catch(ctx.guardedErr);
       }
 
-      const hash = first
-      const filePath = rest.join(' ').trim()
+      const hash = first;
+      const filePath = rest.join(" ").trim();
 
       return ctx.gateway
-        .rpc<RollbackRestoreResponse>('rollback.restore', {
+        .rpc<RollbackRestoreResponse>("rollback.restore", {
           ...(filePath ? { file_path: filePath } : {}),
           hash,
-          session_id: ctx.sid
+          session_id: ctx.sid,
         })
         .then(
-          ctx.guarded<RollbackRestoreResponse>(r => {
+          ctx.guarded<RollbackRestoreResponse>((r) => {
             if (!r.success) {
-              return ctx.transcript.sys(`rollback failed: ${r.error || r.message || 'unknown error'}`)
+              return ctx.transcript.sys(
+                `rollback failed: ${r.error || r.message || "unknown error"}`,
+              );
             }
 
-            const target = filePath || 'workspace'
-            const detail = r.reason || r.message || r.restored_to || 'restored'
-            ctx.transcript.sys(`rollback restored ${target}: ${detail}`)
+            const target = filePath || "workspace";
+            const detail = r.reason || r.message || r.restored_to || "restored";
+            ctx.transcript.sys(`rollback restored ${target}: ${detail}`);
 
             if ((r.history_removed ?? 0) > 0) {
-              ctx.transcript.setHistoryItems(prev => ctx.transcript.trimLastExchange(prev))
+              ctx.transcript.setHistoryItems((prev) =>
+                ctx.transcript.trimLastExchange(prev),
+              );
             }
-          })
+          }),
         )
-        .catch(ctx.guardedErr)
-    }
+        .catch(ctx.guardedErr);
+    },
   },
 
   {
-    aliases: ['tasks'],
-    help: 'open the spawn-tree dashboard (live audit + kill/pause controls)',
-    name: 'agents',
+    aliases: ["tasks"],
+    help: "open the spawn-tree dashboard (live audit + kill/pause controls)",
+    name: "agents",
     run: (arg, ctx) => {
-      const sub = arg.trim().toLowerCase()
+      const sub = arg.trim().toLowerCase();
 
       // Stay compatible with the gateway `/agents [pause|resume|status]` CLI —
       // explicit subcommands skip the overlay and act directly so scripts and
       // multi-step flows can drive it without entering interactive mode.
-      if (sub === 'pause' || sub === 'resume' || sub === 'unpause') {
-        const paused = sub === 'pause'
+      if (sub === "pause" || sub === "resume" || sub === "unpause") {
+        const paused = sub === "pause";
         ctx.gateway.gw
-          .request<DelegationPauseResponse>('delegation.pause', { paused })
-          .then(r => {
-            applyDelegationStatus({ paused: r?.paused })
-            ctx.transcript.sys(`delegation · ${r?.paused ? 'paused' : 'resumed'}`)
+          .request<DelegationPauseResponse>("delegation.pause", { paused })
+          .then((r) => {
+            applyDelegationStatus({ paused: r?.paused });
+            ctx.transcript.sys(
+              `delegation · ${r?.paused ? "paused" : "resumed"}`,
+            );
           })
-          .catch(ctx.guardedErr)
+          .catch(ctx.guardedErr);
 
-        return
+        return;
       }
 
-      if (sub === 'status') {
-        const d = getDelegationState()
+      if (sub === "status") {
+        const d = getDelegationState();
         ctx.transcript.sys(
-          `delegation · ${d.paused ? 'paused' : 'active'} · caps d${d.maxSpawnDepth ?? '?'}/${d.maxConcurrentChildren ?? '?'}`
-        )
+          `delegation · ${d.paused ? "paused" : "active"} · caps d${d.maxSpawnDepth ?? "?"}/${d.maxConcurrentChildren ?? "?"}`,
+        );
 
-        return
+        return;
       }
 
-      patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 })
-    }
+      patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 });
+    },
   },
 
   {
-    aliases: ['learning', 'memory-graph'],
-    help: 'open your learning journey — skills + memories on a timeline',
-    name: 'journey',
+    aliases: ["learning", "memory-graph"],
+    help: "open your learning journey — skills + memories on a timeline",
+    name: "journey",
     run: (_arg, ctx) => {
-      void ctx
-      patchOverlayState({ journey: true })
-    }
+      void ctx;
+      patchOverlayState({ journey: true });
+    },
   },
 
   {
-    help: 'replay a completed spawn tree · `/replay [N|last|list|load <path>]`',
-    name: 'replay',
+    help: "replay a completed spawn tree · `/replay [N|last|list|load <path>]`",
+    name: "replay",
     run: (arg, ctx) => {
-      const history = getSpawnHistory()
-      const raw = arg.trim()
-      const lower = raw.toLowerCase()
+      const history = getSpawnHistory();
+      const raw = arg.trim();
+      const lower = raw.toLowerCase();
 
       // ── Disk-backed listing ─────────────────────────────────────
-      if (lower === 'list' || lower === 'ls') {
+      if (lower === "list" || lower === "ls") {
         ctx.gateway
-          .rpc<SpawnTreeListResponse>('spawn_tree.list', {
+          .rpc<SpawnTreeListResponse>("spawn_tree.list", {
             limit: 30,
-            session_id: ctx.sid ?? 'default'
+            session_id: ctx.sid ?? "default",
           })
           .then(
-            ctx.guarded<SpawnTreeListResponse>(r => {
-              const entries = r.entries ?? []
+            ctx.guarded<SpawnTreeListResponse>((r) => {
+              const entries = r.entries ?? [];
 
               if (!entries.length) {
-                return ctx.transcript.sys('no archived spawn trees on disk for this session')
+                return ctx.transcript.sys(
+                  "no archived spawn trees on disk for this session",
+                );
               }
 
-              const rows: [string, string][] = entries.map(e => {
-                const ts = e.finished_at ? new Date(e.finished_at * 1000).toLocaleString() : '?'
-                const label = e.label || `${e.count} subagents`
+              const rows: [string, string][] = entries.map((e) => {
+                const ts = e.finished_at
+                  ? new Date(e.finished_at * 1000).toLocaleString()
+                  : "?";
+                const label = e.label || `${e.count} subagents`;
 
-                return [`${ts} · ${e.count}×`, `${label}\n  ${e.path}`]
-              })
+                return [`${ts} · ${e.count}×`, `${label}\n  ${e.path}`];
+              });
 
-              ctx.transcript.panel('Archived spawn trees', [{ rows }])
-            })
+              ctx.transcript.panel("Archived spawn trees", [{ rows }]);
+            }),
           )
-          .catch(ctx.guardedErr)
+          .catch(ctx.guardedErr);
 
-        return
+        return;
       }
 
       // ── Disk-backed load by path ─────────────────────────────────
-      if (lower.startsWith('load ')) {
-        const path = raw.slice(5).trim()
+      if (lower.startsWith("load ")) {
+        const path = raw.slice(5).trim();
 
         if (!path) {
-          return ctx.transcript.sys('usage: /replay load <path>')
+          return ctx.transcript.sys("usage: /replay load <path>");
         }
 
         ctx.gateway
-          .rpc<SpawnTreeLoadResponse>('spawn_tree.load', { path })
+          .rpc<SpawnTreeLoadResponse>("spawn_tree.load", { path })
           .then(
-            ctx.guarded<SpawnTreeLoadResponse>(r => {
+            ctx.guarded<SpawnTreeLoadResponse>((r) => {
               if (!r.subagents?.length) {
-                return ctx.transcript.sys('snapshot empty or unreadable')
+                return ctx.transcript.sys("snapshot empty or unreadable");
               }
 
               // Push onto the in-memory history so the overlay picks it up
               // by index 1 just like any other snapshot.
-              pushDiskSnapshot(r, path)
-              patchOverlayState({ agents: true, agentsInitialHistoryIndex: 1 })
-            })
+              pushDiskSnapshot(r, path);
+              patchOverlayState({ agents: true, agentsInitialHistoryIndex: 1 });
+            }),
           )
-          .catch(ctx.guardedErr)
+          .catch(ctx.guardedErr);
 
-        return
+        return;
       }
 
       // ── In-memory nav (same-session) ─────────────────────────────
       if (!history.length) {
-        return ctx.transcript.sys('no completed spawn trees this session · try /replay list')
+        return ctx.transcript.sys(
+          "no completed spawn trees this session · try /replay list",
+        );
       }
 
-      let index = 1
+      let index = 1;
 
-      if (raw && lower !== 'last') {
-        const parsed = parseInt(raw, 10)
+      if (raw && lower !== "last") {
+        const parsed = parseInt(raw, 10);
 
         if (Number.isNaN(parsed) || parsed < 1 || parsed > history.length) {
-          return ctx.transcript.sys(`replay: index out of range 1..${history.length} · use /replay list for disk`)
+          return ctx.transcript.sys(
+            `replay: index out of range 1..${history.length} · use /replay list for disk`,
+          );
         }
 
-        index = parsed
+        index = parsed;
       }
 
-      patchOverlayState({ agents: true, agentsInitialHistoryIndex: index })
-    }
+      patchOverlayState({ agents: true, agentsInitialHistoryIndex: index });
+    },
   },
 
   {
-    help: 'diff two completed spawn trees · `/replay-diff <baseline> <candidate>` (indexes from /replay list or history N)',
-    name: 'replay-diff',
+    help: "diff two completed spawn trees · `/replay-diff <baseline> <candidate>` (indexes from /replay list or history N)",
+    name: "replay-diff",
     run: (arg, ctx) => {
-      const parts = arg.trim().split(/\s+/).filter(Boolean)
+      const parts = arg.trim().split(/\s+/).filter(Boolean);
 
       if (parts.length !== 2) {
-        return ctx.transcript.sys('usage: /replay-diff <a> <b>  (e.g. /replay-diff 1 2 for last two)')
+        return ctx.transcript.sys(
+          "usage: /replay-diff <a> <b>  (e.g. /replay-diff 1 2 for last two)",
+        );
       }
 
-      const [a, b] = parts
-      const history = getSpawnHistory()
+      const [a, b] = parts;
+      const history = getSpawnHistory();
 
       const resolve = (token: string): null | SpawnSnapshot => {
-        const n = parseInt(token!, 10)
+        const n = parseInt(token!, 10);
 
         if (Number.isFinite(n) && n >= 1 && n <= history.length) {
-          return history[n - 1] ?? null
+          return history[n - 1] ?? null;
         }
 
-        return null
-      }
+        return null;
+      };
 
-      const baseline = resolve(a!)
-      const candidate = resolve(b!)
+      const baseline = resolve(a!);
+      const candidate = resolve(b!);
 
       if (!baseline || !candidate) {
-        return ctx.transcript.sys(`replay-diff: could not resolve indices · history has ${history.length} entries`)
+        return ctx.transcript.sys(
+          `replay-diff: could not resolve indices · history has ${history.length} entries`,
+        );
       }
 
-      setDiffPair({ baseline, candidate })
-      patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 })
-    }
+      setDiffPair({ baseline, candidate });
+      patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 });
+    },
   },
 
   {
-    aliases: ['reload_skills'],
-    help: 're-scan installed skills in the live TUI gateway',
-    name: 'reload-skills',
+    aliases: ["reload_skills"],
+    help: "re-scan installed skills in the live TUI gateway",
+    name: "reload-skills",
     run: (_arg, ctx) => {
       // Bound to the session so the rescan and the refreshed catalog see its
       // repo's project-local skills, not the launch environment's.
-      const params = ctx.sid ? { session_id: ctx.sid } : {}
+      const params = ctx.sid ? { session_id: ctx.sid } : {};
 
       ctx.gateway
-        .rpc<SkillsReloadResponse>('skills.reload', params)
+        .rpc<SkillsReloadResponse>("skills.reload", params)
         .then(
-          ctx.guarded<SkillsReloadResponse>(r => {
-            ctx.transcript.page(r.output || 'skills reloaded', 'Reload Skills')
+          ctx.guarded<SkillsReloadResponse>((r) => {
+            ctx.transcript.page(r.output || "skills reloaded", "Reload Skills");
             ctx.gateway
-              .rpc<CommandsCatalogResponse>('commands.catalog', params)
+              .rpc<CommandsCatalogResponse>("commands.catalog", params)
               .then(
-                ctx.guarded<CommandsCatalogResponse>(catalog => {
+                ctx.guarded<CommandsCatalogResponse>((catalog) => {
                   if (!catalog?.pairs) {
-                    return
+                    return;
                   }
 
                   ctx.local.setCatalog({
@@ -429,113 +481,133 @@ export const opsCommands: SlashCommand[] = [
                     categories: catalog.categories ?? [],
                     pairs: catalog.pairs as [string, string][],
                     skillCount: (catalog.skill_count ?? 0) as number,
-                    sub: (catalog.sub ?? {}) as Record<string, string[]>
-                  })
-                })
+                    sub: (catalog.sub ?? {}) as Record<string, string[]>,
+                  });
+                }),
               )
-              .catch(() => {})
-          })
+              .catch(() => {});
+          }),
         )
-        .catch(ctx.guardedErr)
-    }
+        .catch(ctx.guardedErr);
+    },
   },
 
   {
-    help: 'view & toggle plugins (no arg opens the hub; enable/disable <name> for direct toggle)',
-    name: 'plugins',
+    help: "view & toggle plugins (no arg opens the hub; enable/disable <name> for direct toggle)",
+    name: "plugins",
     run: (arg, ctx, cmd) => {
       // No argument → open the interactive Plugins Hub overlay. Any
       // subcommand (enable/disable/list/install/…) falls through to the
       // text slash worker so it stays at parity with `k3code plugins`.
       if (!arg.trim()) {
-        return patchOverlayState({ pluginsHub: true })
+        return patchOverlayState({ pluginsHub: true });
       }
 
       ctx.gateway.gw
-        .request<SlashExecResponse>('slash.exec', { command: cmd.slice(1), session_id: ctx.sid })
-        .then(r => {
+        .request<SlashExecResponse>("slash.exec", {
+          command: cmd.slice(1),
+          session_id: ctx.sid,
+        })
+        .then((r) => {
           if (ctx.stale()) {
-            return
+            return;
           }
 
-          const body = r?.output || '/plugins: no output'
-          const text = r?.warning ? `warning: ${r.warning}\n${body}` : body
-          const long = text.length > 180 || text.split('\n').filter(Boolean).length > 2
+          const body = r?.output || "/plugins: no output";
+          const text = r?.warning ? `warning: ${r.warning}\n${body}` : body;
+          const long =
+            text.length > 180 || text.split("\n").filter(Boolean).length > 2;
 
           if (long) {
-            ctx.transcript.page(text, 'Plugins')
+            ctx.transcript.page(text, "Plugins");
           } else {
-            ctx.transcript.sys(text)
+            ctx.transcript.sys(text);
           }
         })
-        .catch(ctx.guardedErr)
-    }
+        .catch(ctx.guardedErr);
+    },
   },
 
   {
-    help: 'enable or disable tools (client-side history reset on change)',
-    name: 'tools',
+    help: "enable or disable tools (client-side history reset on change)",
+    name: "tools",
     run: (arg, ctx, cmd) => {
-      const [subcommand, ...names] = arg.trim().split(/\s+/).filter(Boolean)
+      const [subcommand, ...names] = arg.trim().split(/\s+/).filter(Boolean);
 
-      if (subcommand !== 'disable' && subcommand !== 'enable') {
+      if (subcommand !== "disable" && subcommand !== "enable") {
         ctx.gateway.gw
-          .request<SlashExecResponse>('slash.exec', { command: cmd.slice(1), session_id: ctx.sid })
-          .then(r => {
+          .request<SlashExecResponse>("slash.exec", {
+            command: cmd.slice(1),
+            session_id: ctx.sid,
+          })
+          .then((r) => {
             if (ctx.stale()) {
-              return
+              return;
             }
 
-            const body = r?.output || '/tools: no output'
-            const text = r?.warning ? `warning: ${r.warning}\n${body}` : body
-            const long = text.length > 180 || text.split('\n').filter(Boolean).length > 2
+            const body = r?.output || "/tools: no output";
+            const text = r?.warning ? `warning: ${r.warning}\n${body}` : body;
+            const long =
+              text.length > 180 || text.split("\n").filter(Boolean).length > 2;
 
             if (long) {
-              ctx.transcript.page(text, 'Tools')
+              ctx.transcript.page(text, "Tools");
             } else {
-              ctx.transcript.sys(text)
+              ctx.transcript.sys(text);
             }
           })
-          .catch(ctx.guardedErr)
+          .catch(ctx.guardedErr);
 
-        return
+        return;
       }
 
       if (!names.length) {
-        ctx.transcript.sys(`usage: /tools ${subcommand} <name> [name ...]`)
-        ctx.transcript.sys(`built-in toolset: /tools ${subcommand} web`)
-        ctx.transcript.sys(`MCP tool: /tools ${subcommand} github:create_issue`)
+        ctx.transcript.sys(`usage: /tools ${subcommand} <name> [name ...]`);
+        ctx.transcript.sys(`built-in toolset: /tools ${subcommand} web`);
+        ctx.transcript.sys(
+          `MCP tool: /tools ${subcommand} github:create_issue`,
+        );
 
-        return
+        return;
       }
 
       ctx.gateway
-        .rpc<ToolsConfigureResponse>('tools.configure', { action: subcommand, names, session_id: ctx.sid })
+        .rpc<ToolsConfigureResponse>("tools.configure", {
+          action: subcommand,
+          names,
+          session_id: ctx.sid,
+        })
         .then(
-          ctx.guarded<ToolsConfigureResponse>(r => {
+          ctx.guarded<ToolsConfigureResponse>((r) => {
             if (r.info) {
-              ctx.session.setSessionStartedAt(Date.now())
-              ctx.session.resetVisibleHistory(r.info)
+              ctx.session.setSessionStartedAt(Date.now());
+              ctx.session.resetVisibleHistory(r.info);
             }
 
             if (r.changed?.length) {
-              ctx.transcript.sys(`${subcommand === 'disable' ? 'disabled' : 'enabled'}: ${r.changed.join(', ')}`)
+              ctx.transcript.sys(
+                `${subcommand === "disable" ? "disabled" : "enabled"}: ${r.changed.join(", ")}`,
+              );
             }
 
             if (r.unknown?.length) {
-              ctx.transcript.sys(`unknown toolsets: ${r.unknown.join(', ')}`)
+              ctx.transcript.sys(`unknown toolsets: ${r.unknown.join(", ")}`);
             }
 
             if (r.missing_servers?.length) {
-              ctx.transcript.sys(`missing MCP servers: ${r.missing_servers.join(', ')}`)
+              ctx.transcript.sys(
+                `missing MCP servers: ${r.missing_servers.join(", ")}`,
+              );
             }
 
             if (r.reset) {
-              ctx.transcript.sys('session reset. new tool configuration is active.')
+              ctx.transcript.sys(
+                "session reset. new tool configuration is active.",
+              );
             }
-          })
+          }),
         )
-        .catch(ctx.guardedErr)
-    }
-  }
-]
+        .catch(ctx.guardedErr);
+    },
+  },
+];

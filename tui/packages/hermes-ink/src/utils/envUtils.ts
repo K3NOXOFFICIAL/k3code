@@ -1,13 +1,13 @@
 export function isEnvTruthy(envVar: string | boolean | undefined): boolean {
   if (!envVar) {
-    return false
+    return false;
   }
 
-  if (typeof envVar === 'boolean') {
-    return envVar
+  if (typeof envVar === "boolean") {
+    return envVar;
   }
 
-  const v = envVar.toLowerCase().trim()
+  const v = envVar.toLowerCase().trim();
 
-  return ['1', 'true', 'yes', 'on'].includes(v)
+  return ["1", "true", "yes", "on"].includes(v);
 }

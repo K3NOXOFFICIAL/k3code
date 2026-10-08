@@ -1,28 +1,42 @@
 #!/usr/bin/env -S node --max-old-space-size=8192 --expose-gc
 // Must be first import. If the user explicitly opts into truecolor, this
 // nudges chalk / supports-color before either package is initialized.
-import './lib/forceTruecolor.js'
+import "./lib/forceTruecolor.js";
 
-import type { FrameEvent } from '@k3code/ink'
+import type { FrameEvent } from "@k3code/ink";
 
-import { setRpcErrorLogSink } from './app/userMessages.js'
-import { DASHBOARD_TUI_MODE, NATIVE_MODE, TERMUX_TUI_MODE } from './config/env.js'
-import { GatewayClient } from './gatewayClient.js'
-import { setupGracefulExit } from './lib/gracefulExit.js'
-import { formatBytes, type HeapDumpResult, performHeapDump } from './lib/memory.js'
-import { type MemorySnapshot, startMemoryMonitor } from './lib/memoryMonitor.js'
-import { openExternalUrl } from './lib/openExternalUrl.js'
-import { recordParentLifecycle } from './lib/parentLog.js'
-import { clearNativeTuiFrame, resetTerminalModes } from './lib/terminalModes.js'
+import { setRpcErrorLogSink } from "./app/userMessages.js";
+import {
+  DASHBOARD_TUI_MODE,
+  NATIVE_MODE,
+  TERMUX_TUI_MODE,
+} from "./config/env.js";
+import { GatewayClient } from "./gatewayClient.js";
+import { setupGracefulExit } from "./lib/gracefulExit.js";
+import {
+  formatBytes,
+  type HeapDumpResult,
+  performHeapDump,
+} from "./lib/memory.js";
+import {
+  type MemorySnapshot,
+  startMemoryMonitor,
+} from "./lib/memoryMonitor.js";
+import { openExternalUrl } from "./lib/openExternalUrl.js";
+import { recordParentLifecycle } from "./lib/parentLog.js";
+import {
+  clearNativeTuiFrame,
+  resetTerminalModes,
+} from "./lib/terminalModes.js";
 
 if (!process.stdin.isTTY) {
-  console.log('k3code-tui: no TTY')
-  process.exit(0)
+  console.log("k3code-tui: no TTY");
+  process.exit(0);
 }
 
 // Start from a clean slate. If a previous TUI crashed or was kill -9'd, the
 // terminal tab can still have mouse/focus/paste modes enabled.
-resetTerminalModes()
+resetTerminalModes();
 
 // Final backstop for terminal cleanup. setupGracefulExit() resets modes on
 // signals/uncaught errors, and die()/dieWithCode() call process.exit() after
@@ -36,86 +50,97 @@ resetTerminalModes()
 // synchronous code; resetTerminalModes() writes via writeSync, so it completes
 // before the process is gone. Idempotent and cheap, so layering it under the
 // graceful-exit cleanups is safe.
-process.on('exit', () => {
-  resetTerminalModes()
+process.on("exit", () => {
+  resetTerminalModes();
 
   if (NATIVE_MODE) {
-    clearNativeTuiFrame()
+    clearNativeTuiFrame();
   }
-})
+});
 
 // Desktop terminals benefit from a clean startup slate because the TUI usually
 // runs in AlternateScreen. On Termux we keep prior output intact so users can
 // review/copy earlier assistant replies after reopening the app.
 if (TERMUX_TUI_MODE || NATIVE_MODE) {
-  process.stdout.write('\n')
+  process.stdout.write("\n");
 } else {
-  process.stdout.write('\x1b[2J\x1b[H\x1b[3J')
+  process.stdout.write("\x1b[2J\x1b[H\x1b[3J");
 }
 
-const gw = new GatewayClient()
+const gw = new GatewayClient();
 
 // describeRpcError replaces raw wire errors with plain copy; keep the original in /logs.
-setRpcErrorLogSink(line => gw.recordLog(line))
-gw.start()
+setRpcErrorLogSink((line) => gw.recordLog(line));
+gw.start();
 
 const dumpNotice = (snap: MemorySnapshot, dump: HeapDumpResult | null) =>
-  `k3code-tui: ${snap.level} memory (${formatBytes(snap.heapUsed)}) — auto heap dump → ${dump?.heapPath ?? dump?.diagPath ?? '(failed)'}\n`
+  `k3code-tui: ${snap.level} memory (${formatBytes(snap.heapUsed)}) — auto heap dump → ${dump?.heapPath ?? dump?.diagPath ?? "(failed)"}\n`;
 
-let consecutiveDeadStreamErrors = 0
+let consecutiveDeadStreamErrors = 0;
 
 setupGracefulExit({
   cleanups: [
     () => {
-      resetTerminalModes()
+      resetTerminalModes();
 
-      return gw.kill('graceful-exit-cleanup')
-    }
+      return gw.kill("graceful-exit-cleanup");
+    },
   ],
   onError: (scope, err) => {
-    const message = err instanceof Error ? `${err.name}: ${err.message}\n${err.stack ?? ''}` : String(err)
+    const message =
+      err instanceof Error
+        ? `${err.name}: ${err.message}\n${err.stack ?? ""}`
+        : String(err);
 
-    recordParentLifecycle(`${scope}: ${message.split('\n')[0]?.slice(0, 400) ?? ''}`)
+    recordParentLifecycle(
+      `${scope}: ${message.split("\n")[0]?.slice(0, 400) ?? ""}`,
+    );
 
     // A dead PTY (terminal tab closed, SSH dropped without SIGHUP) turns every
     // stdout/stderr write into EIO/EPIPE. Swallowing those here made the parent
     // a zombie: Ink's render loop throws once a second, each throw lands back
     // in this handler, and the crash log fills with `write EIO` forever while
     // the gateway child keeps running. Bail out for real after a few in a row.
-    const code = (err as NodeJS.ErrnoException)?.code
+    const code = (err as NodeJS.ErrnoException)?.code;
 
-    if (code === 'EIO' || code === 'EPIPE') {
+    if (code === "EIO" || code === "EPIPE") {
       if (++consecutiveDeadStreamErrors >= 5) {
-        recordParentLifecycle(`dead output stream (${code} x${consecutiveDeadStreamErrors}) → exiting`)
-        void gw.kill('dead-output-stream')
-        process.exit(1)
+        recordParentLifecycle(
+          `dead output stream (${code} x${consecutiveDeadStreamErrors}) → exiting`,
+        );
+        void gw.kill("dead-output-stream");
+        process.exit(1);
       }
 
-      return
+      return;
     }
 
-    consecutiveDeadStreamErrors = 0
+    consecutiveDeadStreamErrors = 0;
 
     try {
-      process.stderr.write(`k3code-tui lifecycle ${scope}: ${message.slice(0, 2000)}\n`)
+      process.stderr.write(
+        `k3code-tui lifecycle ${scope}: ${message.slice(0, 2000)}\n`,
+      );
     } catch {
       // stderr may be the dead stream itself.
     }
   },
-  onSignal: signal => {
+  onSignal: (signal) => {
     // The next line in the crash log is the child's `=== SIGTERM received ===`
     // (gw.kill forwards SIGTERM regardless of which signal hit us) — this is
     // what tells SIGHUP (terminal/SSH dropped) apart from a real SIGTERM.
-    recordParentLifecycle(`graceful-exit received signal=${signal} → killing gateway`)
-    resetTerminalModes()
-    process.stderr.write(`k3code-tui lifecycle: received ${signal}\n`)
+    recordParentLifecycle(
+      `graceful-exit received signal=${signal} → killing gateway`,
+    );
+    resetTerminalModes();
+    process.stderr.write(`k3code-tui lifecycle: received ${signal}\n`);
   },
   // The dashboard chat tab has no in-page restart path after the PTY child
   // exits. Ignore SIGINT there so Ctrl+C cannot kill the embedded TUI if raw
   // mode briefly drops and the terminal driver turns the keystroke into a
   // signal instead of input bytes. SIGTERM/SIGHUP still cleanly shut down.
-  ignoredSignals: DASHBOARD_TUI_MODE ? ['SIGINT'] : []
-})
+  ignoredSignals: DASHBOARD_TUI_MODE ? ["SIGINT"] : [],
+});
 
 const stopMemoryMonitor = startMemoryMonitor({
   onCritical: (snap, dump) => {
@@ -123,53 +148,55 @@ const stopMemoryMonitor = startMemoryMonitor({
     // EOF, NOT SIGTERM. Recording it here is the only way a crash report can
     // attribute a death to Node OOM rather than a signal-driven kill.
     recordParentLifecycle(
-      `memory-critical process.exit(137) heap=${formatBytes(snap.heapUsed)} rss=${formatBytes(snap.rss)} dump=${dump?.heapPath ?? 'failed'}`
-    )
-    resetTerminalModes()
+      `memory-critical process.exit(137) heap=${formatBytes(snap.heapUsed)} rss=${formatBytes(snap.rss)} dump=${dump?.heapPath ?? "failed"}`,
+    );
+    resetTerminalModes();
     process.stderr.write(
-      `k3code-tui lifecycle: memory critical exit heap=${formatBytes(snap.heapUsed)} rss=${formatBytes(snap.rss)}\n`
-    )
-    process.stderr.write(dumpNotice(snap, dump))
-    process.stderr.write('k3code-tui: exiting to avoid OOM; restart to recover\n')
-    process.exit(137)
+      `k3code-tui lifecycle: memory critical exit heap=${formatBytes(snap.heapUsed)} rss=${formatBytes(snap.rss)}\n`,
+    );
+    process.stderr.write(dumpNotice(snap, dump));
+    process.stderr.write(
+      "k3code-tui: exiting to avoid OOM; restart to recover\n",
+    );
+    process.exit(137);
   },
   onHigh: (snap, dump) => process.stderr.write(dumpNotice(snap, dump)),
   // Sub-threshold abnormal heap growth (#34095). The TUI used to die silently
   // here — Node OOMs from a render-tree blowup well below the exit threshold,
   // so the only trace was a bare gateway `stdin EOF`. Persist a breadcrumb +
   // stderr line so the next such death is attributable instead of silent.
-  onWarn: snap => {
+  onWarn: (snap) => {
     recordParentLifecycle(
-      `memory-warning fast heap growth heap=${formatBytes(snap.heapUsed)} rss=${formatBytes(snap.rss)}`
-    )
+      `memory-warning fast heap growth heap=${formatBytes(snap.heapUsed)} rss=${formatBytes(snap.rss)}`,
+    );
     process.stderr.write(
-      `k3code-tui: heap climbing fast (${formatBytes(snap.heapUsed)}) — a large tool output or long session may be straining memory\n`
-    )
-  }
-})
+      `k3code-tui: heap climbing fast (${formatBytes(snap.heapUsed)}) — a large tool output or long session may be straining memory\n`,
+    );
+  },
+});
 
-if (process.env.K3CODE_HEAPDUMP_ON_START === '1') {
-  void performHeapDump('manual')
+if (process.env.K3CODE_HEAPDUMP_ON_START === "1") {
+  void performHeapDump("manual");
 }
 
-process.on('beforeExit', () => stopMemoryMonitor())
+process.on("beforeExit", () => stopMemoryMonitor());
 
 const [ink, { App }, { logFrameEvent }, { trackFrame }] = await Promise.all([
-  import('@k3code/ink'),
-  import('./app.js'),
-  import('./lib/perfPane.js'),
-  import('./lib/fpsStore.js')
-])
+  import("@k3code/ink"),
+  import("./app.js"),
+  import("./lib/perfPane.js"),
+  import("./lib/fpsStore.js"),
+]);
 
 // Both consumers are undefined when their env flags are off; only attach
 // onFrame when at least one is on so ink skips timing in the default case.
 const onFrame =
   logFrameEvent || trackFrame
     ? (event: FrameEvent) => {
-        logFrameEvent?.(event)
-        trackFrame?.(event.durationMs)
+        logFrameEvent?.(event);
+        trackFrame?.(event.durationMs);
       }
-    : undefined
+    : undefined;
 
 ink.render(<App gw={gw} />, {
   exitOnCtrlC: false,
@@ -178,7 +205,7 @@ ink.render(<App gw={gw} />, {
   // The TUI's mouse tracking captures click events before Terminal.app's
   // own URL detection can fire, so without this hook clicks on `<Link>`
   // do nothing in any terminal where mouseTracking is on.
-  onHyperlinkClick: url => {
-    openExternalUrl(url)
-  }
-})
+  onHyperlinkClick: (url) => {
+    openExternalUrl(url);
+  },
+});
