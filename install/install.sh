@@ -451,12 +451,20 @@ import_bundle() {
 }
 
 # ---- presetup ----------------------------------------------------------------
-# Optional extras after activation (--minimal skips them all). Each step reports and returns 0; see P3-2.
+# Optional extras after activation (--minimal skips them all). Never fails the install: each step runs in its own
+# `||` context, so a failing step is reported and the next one still runs. Every step is safe to re-run: it
+# writes a marker only when it did something, so a second run changes nothing.
 presetup() {
   log "presetup (optional; --minimal skips it):"
-  presetup_sandbox
-  presetup_chromium
-  presetup_doctor
+  presetup_step sandbox presetup_sandbox
+  presetup_step chromium presetup_chromium
+  presetup_step doctor presetup_doctor
+  return 0
+}
+
+presetup_step() { # presetup_step NAME FUNC
+  "$2" || log "presetup: $1 step did not finish; continuing"
+  return 0
 }
 
 presetup_sandbox() { :; }

@@ -142,3 +142,21 @@ def test_presetup_is_the_default_and_minimal_skips_it(tmp_path: Path) -> None:
     assert "presetup (optional" not in m.stderr
     assert not log.exists()
     assert "Installed k3code" in m.stderr
+
+
+def test_update_flags_print_only_the_version(tmp_path: Path) -> None:
+    # k3code update runs the installer with these flags and reads the version from stdout: nothing else may land there.
+    r = run(tmp_path, INSTALL, "--from-source", "--yes", "--no-setup", "--no-activate", "--print-version")
+    assert r.returncode == 0, r.stderr
+    lines = r.stdout.strip().splitlines()
+    assert len(lines) == 1 and lines[0].startswith((REPO / "VERSION").read_text().strip())
+    assert "presetup" not in r.stderr  # presetup runs only after activation
+
+
+def test_presetup_second_run_changes_nothing(tmp_path: Path) -> None:
+    assert run(tmp_path, INSTALL, "--from-source", "--yes").returncode == 0
+    before = snapshot(tmp_path)
+    again = run(tmp_path, INSTALL, "--from-source", "--yes")
+    assert again.returncode == 0, again.stderr
+    assert "presetup (optional" in again.stderr  # the phase still runs and reports
+    assert snapshot(tmp_path) == before
