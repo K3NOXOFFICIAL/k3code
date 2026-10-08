@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 import time
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,21 @@ from k3code.subagents.budget import AgentBudget, BudgetStop
 from k3code.subagents.runner import Handle
 
 logger = logging.getLogger(__name__)
+
+
+async def gather_or_cancel[T](*aws: Awaitable[T]) -> list[T]:
+    """``asyncio.gather`` that cancels the siblings when one fails (e.g. ``BudgetStop``) or the caller is cancelled.
+
+    Plain gather re-raised the first error and left the others running: their sub-agents kept working and spending
+    past the budget. A sibling waiting in ``SubagentManager.wait`` takes its child down when cancelled."""
+    tasks = [asyncio.ensure_future(a) for a in aws]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 ANGLES = {
     "mvp-first": "Find the smallest slice that delivers the goal end to end; defer everything else.",
@@ -136,8 +153,6 @@ class Ultra:
 
     async def ultraplan(self, session: Any, task: str, *, budget: AgentBudget | None = None,
                         command: str = "ultraplan", angles: list[str] | None = None) -> UltraPlan:
-        import asyncio
-
         angles = list(angles or ANGLES)
         mgr = self.server.subagents
         self.progress(session, command, "planning", f"{len(angles)} independent planners", budget)
@@ -153,7 +168,7 @@ class Ultra:
             return angle, h
 
         try:
-            done = await asyncio.gather(*(one(i, a) for i, a in enumerate(angles)))
+            done = await gather_or_cancel(*(one(i, a) for i, a in enumerate(angles)))
         except asyncio.CancelledError:
             mgr.interrupt_session(session.session_id)
             raise
@@ -256,8 +271,6 @@ class Ultra:
 
     async def review_and_fix(self, session: Any, budget: AgentBudget, report: _Report, task: str, plan: str,
                              base: str) -> None:
-        import asyncio
-
         cwd = Path(session.perms.cwd)
         diff = ""
         if base:
@@ -278,7 +291,7 @@ class Ultra:
             h = await self.run_child(session, budget, "reviewer", prompt, f"review: {lens}")
             return parse_findings(h.result)
 
-        results = await asyncio.gather(*(lens_review(k, v) for k, v in LENSES.items()))
+        results = await gather_or_cancel(*(lens_review(k, v) for k, v in LENSES.items()))
         candidates = dedupe_findings([f for r in results for f in r])
         report.candidates = candidates
         if not candidates:
