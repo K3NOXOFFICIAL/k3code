@@ -1167,7 +1167,7 @@ class GatewayServer:
         for install in session.extra_tools:
             install(loop.tools)
         register_task_tools(loop.tools, self, session, depth=1)
-        register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher)
+        register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher, mcp=self.mcp)
         return loop
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:

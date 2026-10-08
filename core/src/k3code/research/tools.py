@@ -315,6 +315,14 @@ def mcp_fetch_error(text: str) -> RuntimeError:
     return DeadLink(text[:200]) if dead else RuntimeError(text[:200])
 
 
+async def mcp_search_hits(mcp: Any, tool: Any, query: str, n: int = 5) -> list[Hit]:
+    """Hits from one call of a connected MCP search tool."""
+    res = await mcp.call(tool.qualified, {McpTools._arg(tool, "query", "q"): query})
+    if "error" in res:
+        raise RuntimeError(str(res["error"])[:200])
+    return parse_search_text(str(res.get("content", "")))[:n]
+
+
 class McpTools(ResearchTools):
     """Search/fetch through connected MCP tools (e.g. ``hub_searxng`` and ``hub_fetch``)."""
 
@@ -328,10 +336,7 @@ class McpTools(ResearchTools):
         return next((c for c in candidates if c in props), candidates[0])
 
     async def search(self, query: str, n: int = 5) -> list[Hit]:
-        res = await self.mcp.call(self.search_tool.qualified, {self._arg(self.search_tool, "query", "q"): query})
-        if "error" in res:
-            raise RuntimeError(str(res["error"])[:200])
-        return parse_search_text(str(res.get("content", "")))[:n]
+        return await mcp_search_hits(self.mcp, self.search_tool, query, n)
 
     async def fetch(self, url: str) -> tuple[str, str]:
         if self.fetch_tool is None:
@@ -374,6 +379,15 @@ def rank_tool(tools: list[Any], strong: tuple[str, ...], generic: tuple[str, ...
     return None
 
 
+_SEARCH_MARKERS = ("searxng", "web_search", "websearch", "web-search")
+
+
+def mcp_search_tool(mcp: Any) -> Any:
+    """The connected MCP tool that searches the web, or None."""
+    tools = list(mcp.tools()) if mcp is not None else []
+    return rank_tool(tools, _SEARCH_MARKERS, ("search",), _NOT_WEB)
+
+
 def pick_tools(config: Any, mcp: Any, fetcher: WebFetcher | None = None) -> ResearchTools:
     """MCP search/fetch when connected, else the built-ins."""
     cfg = dict(getattr(config, "research", None) or {})
@@ -382,7 +396,7 @@ def pick_tools(config: Any, mcp: Any, fetcher: WebFetcher | None = None) -> Rese
         fetcher=fetcher,
     )
     tools = list(mcp.tools()) if mcp is not None else []
-    search = rank_tool(tools, ("searxng", "web_search", "websearch", "web-search"), ("search",), _NOT_WEB)
+    search = mcp_search_tool(mcp)
     if search is not None:
         fetch = rank_tool(tools, ("hub_fetch", "web_fetch", "webfetch", "fetch_url"), ("fetch", "scrape"), _NOT_WEB)
         return McpTools(mcp, search, fetch, builtin)
@@ -392,10 +406,58 @@ def pick_tools(config: Any, mcp: Any, fetcher: WebFetcher | None = None) -> Rese
 # ── agent-facing tools ──
 
 
-def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None) -> None:
-    """``web_fetch`` always; ``web_search`` over SearXNG (probed lazily, disabled with a message if unreachable)."""
+async def fallback_search(
+    query: str, n: int, *, searx: SearxngSearch, ddg: DuckDuckGoSearch | None, mcp: Any = None
+) -> tuple[list[Hit], list[str], bool]:
+    """The agent's ``web_search`` chain: SearXNG, then keyless DuckDuckGo, then a connected MCP search tool. The first
+    source with hits wins. Returns (hits, notes, answered); ``answered`` is False when no source could be asked."""
+    notes: list[str] = []
+    answered = False
+    if not await searx.available():
+        notes.append(f"SearXNG: {searx.reason}")
+    else:
+        try:
+            hits = await searx.search(query, n)
+        except Exception as e:  # noqa: BLE001 - one dead source must not end the chain
+            notes.append(f"SearXNG failed: {type(e).__name__}")
+        else:
+            answered = True
+            if hits:
+                return hits, notes, True
+            notes.append("SearXNG: no results")
+    if ddg is None:
+        notes.append("keyless DuckDuckGo fallback is off (research.keyless_fallback)")
+    else:
+        try:
+            hits = await ddg.search(query, n)
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"DuckDuckGo failed: {type(e).__name__}")
+        else:
+            answered = True
+            if hits:
+                return hits, notes, True
+            notes.append("DuckDuckGo: no results")
+    tool = mcp_search_tool(mcp)
+    if tool is None:
+        notes.append("no MCP web search tool is connected")
+    else:
+        try:
+            hits = await mcp_search_hits(mcp, tool, query, n)
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"MCP {tool.qualified} failed: {str(e)[:120]}")
+        else:
+            answered = True
+            if hits:
+                return hits, notes, True
+            notes.append("MCP search: no results")
+    return [], notes, answered
+
+
+def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None, mcp: Any = None) -> None:
+    """``web_fetch`` always; ``web_search`` over SearXNG, then keyless DuckDuckGo, then a connected MCP search tool."""
     cfg = dict(getattr(config, "research", None) or {})
     searx = SearxngSearch(cfg.get("searxng_url", DEFAULT_SEARXNG))
+    ddg = DuckDuckGoSearch() if bool(cfg.get("keyless_fallback", True)) else None
     fetcher = fetcher or WebFetcher.from_config(cfg)
 
     async def tool_fetch(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
@@ -410,13 +472,13 @@ def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None)
         query = str(arguments.get("query") or "").strip()
         if not query:
             return {"error": "web_search needs a query"}
-        if not await searx.available():
-            return {"error": f"web_search is disabled: {searx.reason}"}
-        try:
-            hits = await searx.search(query, int(arguments.get("limit") or 5))
-        except Exception as e:  # noqa: BLE001
-            return {"error": f"web_search failed: {e}"}
-        return {"content": "\n".join(f"- {h.title}\n  {h.url}\n  {h.snippet[:200]}" for h in hits) or "no results"}
+        hits, notes, answered = await fallback_search(query, int(arguments.get("limit") or 5),
+                                                      searx=searx, ddg=ddg, mcp=mcp)
+        if hits:
+            return {"content": "\n".join(f"- {h.title}\n  {h.url}\n  {h.snippet[:200]}" for h in hits)}
+        if answered:
+            return {"content": "no results"}
+        return {"error": f"web_search is disabled: {'; '.join(notes)}"}
 
     reg.register(
         ToolSpec(name="web_fetch", description="Fetch a web page and return its readable text.",
@@ -425,7 +487,8 @@ def register_web_tools(reg: Any, config: Any, fetcher: WebFetcher | None = None)
         tool_fetch,
     )
     reg.register(
-        ToolSpec(name="web_search", description="Search the web (SearXNG). Returns titles, URLs and snippets.",
+        ToolSpec(name="web_search", description="Search the web: SearXNG if configured, else keyless DuckDuckGo, "
+                                                "else a connected MCP search tool. Returns titles, URLs and snippets.",
                  parameters={"type": "object", "properties": {"query": {"type": "string"},
                                                               "limit": {"type": "integer"}}, "required": ["query"]},
                  side_effect=False),

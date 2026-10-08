@@ -617,3 +617,53 @@ async def test_loaded_research_searxng_url_enables_agent_web_search(tmp_path, mo
     out = await reg.handlers["web_search"]({"query": "anything"})
     assert "disabled" not in out.get("error", "")
     assert "http://p.test/1" in out["content"]
+
+
+_NO_RESULTS = "<html><body>no results</body></html>"
+
+
+@respx.mock
+async def test_agent_web_search_without_searxng_uses_duckduckgo(tmp_path):
+    """No SearXNG URL: the agent's web_search answers from the keyless fallback instead of 'is disabled'."""
+    from k3code.research.tools import register_web_tools
+
+    respx.post("https://html.duckduckgo.com/html/").mock(return_value=httpx.Response(200, text=DDG_PAGE))
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}))
+    out = await reg.handlers["web_search"]({"query": "asyncio taskgroup"})
+    assert "error" not in out and "https://docs.python.org/3/library/asyncio-task.html" in out["content"]
+
+
+@respx.mock
+async def test_agent_web_search_chain_is_searxng_then_duckduckgo_then_mcp(tmp_path):
+    from k3code.research.tools import register_web_tools
+
+    ddg = respx.post("https://html.duckduckgo.com/html/").mock(return_value=httpx.Response(200, text=DDG_PAGE))
+    respx.get("http://searx.test/search").mock(
+        return_value=httpx.Response(200, json={"results": [{"title": "S", "url": "http://s.test/1", "content": ""}]})
+    )
+    reg = _Registry()
+    mcp = FakeMcp([mcp_tool("hub_searxng__search")])
+    register_web_tools(reg, SimpleNamespace(research={"searxng_url": "http://searx.test"}), mcp=mcp)
+    out = await reg.handlers["web_search"]({"query": "q"})
+    assert "http://s.test/1" in out["content"] and not ddg.called and not mcp.calls  # SearXNG answered first
+
+    # keyless DuckDuckGo is empty -> the connected MCP search tool answers
+    respx.post("https://html.duckduckgo.com/html/").mock(return_value=httpx.Response(200, text=_NO_RESULTS))
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}), mcp=FakeMcp([mcp_tool("hub_searxng__search")]))
+    out = await reg.handlers["web_search"]({"query": "q"})
+    assert "http://h.test" in out["content"]
+
+    # DuckDuckGo down (a 503) and no MCP tool: nothing answered, the error says why
+    respx.post("https://html.duckduckgo.com/html/").mock(return_value=httpx.Response(503))
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}), mcp=FakeMcp([]))
+    out = await reg.handlers["web_search"]({"query": "q"})
+    assert out["error"].startswith("web_search is disabled") and "DuckDuckGo failed" in out["error"]
+
+    # keyless fallback switched off: the MCP tool is the only source
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={"keyless_fallback": False}),
+                       mcp=FakeMcp([mcp_tool("hub_searxng__search")]))
+    assert "http://h.test" in (await reg.handlers["web_search"]({"query": "q"}))["content"]
