@@ -25,6 +25,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from collections import deque
 from collections.abc import Callable
 from pathlib import Path
@@ -153,6 +154,8 @@ class LiveSession:
         #: M4a: tier and task kind of the call in flight (for usage rows); /scope override for the next task.
         self.last_tier = "main"
         self.current_kind = "interactive_turn"
+        #: M1: id of the turn in flight (usage rows carry it, so per-turn totals add up); "" between turns.
+        self.turn_id = ""
         self.scope_override: str | None = None
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
@@ -354,6 +357,7 @@ class GatewayServer:
             self.usage,
             emit=lambda t, p: self.emit(t, p),
             last_attempt=lambda: self.last_attempt,
+            turn_of=self._turn_of,
         )
         self.autonomy = PlanFirst(self)
         self.learning = LearningHub(self, self.autonomy.proposals)
@@ -1170,6 +1174,7 @@ class GatewayServer:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
         self._ensure_router(session.stored.model or None)
         assert self.router is not None
+        session.turn_id = uuid.uuid4().hex[:12]
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
@@ -1451,6 +1456,7 @@ class GatewayServer:
                     cost_usd=u.cost_usd if u else None,
                     tier=session.last_tier,
                     task_kind=session.current_kind,
+                    turn=session.turn_id,
                 )
                 if u:
                     session.emit("session.usage", {"usage": _usage_payload(u)})
@@ -1544,6 +1550,11 @@ class GatewayServer:
     async def clarify(self, question: str, choices: list[str], session_id: str | None) -> dict[str, Any]:
         """Ask the client a multiple-choice question (``clarify`` server request)."""
         return await self._ask_client("clarify", {"question": question, "choices": choices}, session_id or "")
+
+    def _turn_of(self, session_id: str) -> str:
+        """The turn id in flight for a live session ("" when it is idle or unknown)."""
+        live = self.live.get(session_id)
+        return live.turn_id if live is not None else ""
 
     def apply_file_config(self, cwd: str | Path | None = None) -> None:
         """Re-read config files into the live settings (only keys present in a file are replaced)."""

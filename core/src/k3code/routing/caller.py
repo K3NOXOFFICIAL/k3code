@@ -40,12 +40,15 @@ class ModelCaller:
         usage: Any,
         emit: Callable[[str, dict[str, Any]], None] | None = None,
         last_attempt: Callable[[], tuple[str, str]] | None = None,
+        turn_of: Callable[[str], str] | None = None,
     ) -> None:
         self._routers = routers
         self.config = config
         self.usage = usage
         self.emit = emit
         self._last_attempt = last_attempt
+        #: session id -> the turn id in flight, so side calls (titles, compaction, judges) join that turn's totals
+        self._turn_of = turn_of
 
     async def complete(
         self,
@@ -105,5 +108,6 @@ class ModelCaller:
             self.usage.record(
                 "call", session=session_id, provider=provider, model=model, tokens_in=pt, tokens_out=ct,
                 cost_usd=usage.cost_usd if usage else None, tier=tier.value, task_kind=kind.value,
+                turn=self._turn_of(session_id) if self._turn_of else "",
             )
         return CallResult(final.content or "", tier, model, provider, pt, ct)

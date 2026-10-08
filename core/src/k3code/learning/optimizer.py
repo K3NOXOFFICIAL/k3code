@@ -40,6 +40,18 @@ def collect(usage_rows: list[dict[str, Any]], log: DecisionLog, scope_rows: list
     for t in by_tier.values():
         t["rate"] = round(t["escalated"] / t["calls"], 3) if t["calls"] else 0.0
     total_calls = max(1, len(calls))
+    # M1: tokens per tier, per task kind and per turn (every call row counts, whatever the provider reported)
+    tokens_by_tier: dict[str, int] = {}
+    tokens_by_kind: dict[str, int] = {}
+    turns: set[str] = set()
+    for r in calls:
+        n = int(r.get("tokens_in") or 0) + int(r.get("tokens_out") or 0)
+        tokens_by_tier[r["tier"] or "main"] = tokens_by_tier.get(r["tier"] or "main", 0) + n
+        if r["task_kind"]:
+            tokens_by_kind[r["task_kind"]] = tokens_by_kind.get(r["task_kind"], 0) + n
+        if r.get("turn"):
+            turns.add(r["turn"])
+    call_tokens = sum(tokens_by_tier.values())
     props = [d for d in log.query("proposal", since=since) if d["ts"] < until]
     acc = sum(1 for d in props if d["choice"] == "accept")
     verdicts: dict[str, dict[str, Any]] = {}
@@ -66,6 +78,11 @@ def collect(usage_rows: list[dict[str, Any]], log: DecisionLog, scope_rows: list
         "scope_accuracy": round(1 - wrong / len(judged), 3) if judged else None,
         "tiers": by_tier,
         "escalated_kinds": esc_kinds,
+        "tokens": call_tokens,
+        "turns": len(turns),
+        "tokens_per_turn": round(call_tokens / len(turns), 1) if turns else None,
+        "tokens_by_tier": tokens_by_tier,
+        "tokens_by_kind": tokens_by_kind,
     }
 
 
