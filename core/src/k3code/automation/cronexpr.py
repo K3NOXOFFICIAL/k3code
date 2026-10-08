@@ -120,11 +120,14 @@ def _first_after(wall: datetime, after: float) -> float | None:
     Datetime arithmetic drops ``fold``, so inside the repeated DST fall-back hour a candidate resolved to its first
     (summer-time) occurrence even when ``after`` was already in the second pass: ``cron_next`` then returned a time
     ~55 minutes in the past and the job re-fired back to back. Try both occurrences and take the earlier one that is
-    still in the future.
+    still in the future. The second occurrence only exists when the time is really ambiguous: for a time that does
+    not exist (the spring-forward gap) fold=1 is the pre-gap reading an hour early, so ``daily 02:30`` fired twice.
     """
     best: float | None = None
     for fold in (0, 1):
         ts = wall.replace(fold=fold).timestamp()
+        if fold and datetime.fromtimestamp(ts, wall.tzinfo).replace(tzinfo=None, fold=0) != wall.replace(tzinfo=None):
+            continue  # not a second occurrence of this wall time
         if ts > after and (best is None or ts < best):
             best = ts
     return best
