@@ -39,7 +39,6 @@ import type {
   ConfigSetResponse,
   SessionActiveListResponse,
   SessionCloseResponse,
-  TerminalResizeResponse,
 } from "../gatewayTypes.js";
 import { useGitBranch } from "../hooks/useGitBranch.js";
 import {
@@ -926,14 +925,11 @@ export function useMainApp(gw: GatewayClient) {
       timer = setTimeout(() => {
         timer = undefined;
 
+        // (no terminal.resize: the k3code gateway never needs the width, and the call printed
+        // "out of sync" into the transcript on every resize)
         if (scrollRef.current?.isSticky()) {
           scrollRef.current.scrollToBottom();
         }
-
-        void rpc<TerminalResizeResponse>("terminal.resize", {
-          cols: stdout.columns ?? 80,
-          session_id: ui.sid,
-        });
       }, 100);
     };
 

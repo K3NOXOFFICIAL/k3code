@@ -2995,6 +2995,147 @@ async def _browser_manage(server: GatewayServer, params: dict[str, Any]) -> dict
     return await server.browser.manage(action, url=str(url) if url else None)
 
 
+# ── TUI conveniences the Ink UI calls directly (each used to answer "Method not found", shown as "out of sync") ──
+
+#: `!cmd` and `{!cmd}`: the user's own command, so it gets a terminal's timeout, not an agent tool's
+USER_SHELL_TIMEOUT_S = 300
+
+
+async def _shell_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """`!cmd` in the composer and `{!cmd}` inside a prompt: run the user's own command in the session's directory.
+
+    Not sandboxed (the user typed it, as in a terminal), but the hardline rules, including the user's own
+    ``permissions.hardline`` patterns, still refuse it."""
+    from k3code.permissions import hardline
+    from k3code.tools import tool_bash
+
+    command = str(_require(params, "command"))
+    session = server._session_for(params.get("session_id"))
+    cwd = Path(session.perms.cwd) if session is not None else Path.cwd()
+    extra = list(session.perms.hardline_extra) if session is not None else []
+    if denied := hardline.check(command, extra):
+        return {"code": 126, "stdout": "", "stderr": f"denied by hardline rule: {denied}"}
+    res = await tool_bash({"command": command, "timeout": USER_SHELL_TIMEOUT_S}, cwd=cwd)
+    code = res.get("exit_code")
+    return {
+        "code": int(code) if code is not None else 1,
+        "stdout": res.get("stdout") or "",
+        "stderr": (res.get("stderr") or "") + (res.get("error") or ""),
+    }
+
+
+async def _session_undo(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/undo and /retry: drop the last user message and everything after it."""
+    session = server._session_for(params.get("session_id"))
+    if session is None:
+        raise _InvalidParams("no active session")
+    if session.turn_in_flight:
+        raise _InvalidParams("a turn is running in this session; /undo when it ends")
+    messages = list(session.messages)
+    last_user = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), None)
+    if last_user is None:
+        return {"removed": 0}
+    session.messages = messages[:last_user]
+    server.store.save(session.stored)
+    return {"removed": len(messages) - last_user}
+
+
+async def _session_usage(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/usage: this session's model calls and tokens (``/stats`` covers every session)."""
+    session = server._session_for(params.get("session_id"))
+    if session is None:
+        return {"calls": 0}
+    rows = server.usage.aggregate(by="session", session=session.session_id)
+    row = rows[0] if rows else {}
+    t_in, t_out = int(row.get("tokens_in") or 0), int(row.get("tokens_out") or 0)
+    return {
+        "model": session.stored.model or server.config.default_model,
+        "input": t_in,
+        "output": t_out,
+        "total": t_in + t_out,
+        "calls": int(row.get("calls") or 0),
+    }
+
+
+async def _session_status(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/status: the same view as /settings (model, tiers, providers, permissions, theme)."""
+    from k3code.commands.settings_cmd import build_settings_view, render_text
+
+    session = server._session_for(params.get("session_id"))
+    return {"output": render_text(build_settings_view(server, session.session_id if session else None))}
+
+
+async def _session_save(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/save: write the session's transcript as JSON into its working directory."""
+    session = server._session_for(params.get("session_id"))
+    if session is None:
+        raise _InvalidParams("no active session")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = Path(session.perms.cwd) / f"k3code-session-{session.session_id[:8]}-{stamp}.json"
+    payload = {
+        "session_id": session.session_id,
+        "title": session.stored.title,
+        "model": session.stored.model,
+        "messages": list(session.messages),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"file": str(path)}
+
+
+def _session_cwd(server: GatewayServer, params: dict[str, Any]) -> str | None:
+    session = server._session_for(params.get("session_id"))
+    return str(session.perms.cwd) if session is not None else None
+
+
+async def _reload_mcp(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/reload-mcp: re-read the config and restart the MCP servers (the gateway's `/mcp reload`)."""
+    server.apply_file_config(_session_cwd(server, params))
+    await server.mcp.reload(server.config.mcp.servers)
+    return {"status": "reloaded"}
+
+
+async def _reload_env(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/reload: re-read config.yaml and the key file (~/.config/k3code/env) into the running gateway."""
+    from k3code.setup.state import read_env_file
+
+    server.apply_file_config(_session_cwd(server, params))
+    return {"updated": len(read_env_file())}
+
+
+async def _skills_reload(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """/reload-skills: skill discovery is never cached, so this lists what a fresh scan finds."""
+    res = await server.dispatch_command("skills", "", params.get("session_id"))
+    return {"output": str(res.get("message") or res.get("output") or "")}
+
+
+async def _delegation_status(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    from k3code.subagents.runner import MAX_DEPTH
+
+    fanout = getattr(getattr(server.config, "autonomy", None), "fanout", None)
+    return {
+        "paused": server.subagents.paused,
+        "max_spawn_depth": MAX_DEPTH,
+        "max_concurrent_children": int(getattr(fanout, "max_parallel", 0) or 0),
+    }
+
+
+async def _delegation_pause(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """`p` in the agents overlay, `/agents pause|resume`: stop or allow new sub-agents (running ones finish)."""
+    server.subagents.paused = bool(params.get("paused", not server.subagents.paused))
+    return {"paused": server.subagents.paused}
+
+
+async def _subagent_steer(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """`e` in the agents overlay: a message the running child reads before its next model call."""
+    sub_id = str(_require(params, "subagent_id"))
+    text = str(_require(params, "text")).strip()
+    handle = server.subagents.handles.get(sub_id)
+    if handle is None or handle.status != "running":
+        return {"status": "not_queued", "message": "that agent is not running"}
+    handle.steer_queue.append(text)
+    return {"status": "queued"}
+
+
 _HANDLERS: dict[str, Any] = {
     "session.create": _session_create,
     "session.list": _session_list,
@@ -3039,6 +3180,17 @@ _HANDLERS: dict[str, Any] = {
     "setup.status": _setup_status,
     "system.battery": _system_battery,
     "browser.manage": _browser_manage,
+    "shell.exec": _shell_exec,
+    "session.undo": _session_undo,
+    "session.usage": _session_usage,
+    "session.status": _session_status,
+    "session.save": _session_save,
+    "reload.mcp": _reload_mcp,
+    "reload.env": _reload_env,
+    "skills.reload": _skills_reload,
+    "delegation.status": _delegation_status,
+    "delegation.pause": _delegation_pause,
+    "subagent.steer": _subagent_steer,
 }
 
 _HANDLERS["session.branch_stored"] = _session_resume  # M1: fork == resume the source

@@ -61,6 +61,8 @@ class Handle:
     #: wall clock (Unix seconds) at start: what clients get as ``started_at``; the TUI turned the monotonic value
     #: (seconds since boot) into a date in 1970 and showed every sub-agent as running for ~56 years
     started_wall: float = 0.0
+    #: messages the user typed for this child in the agents overlay (`e`); its loop takes them before the next call
+    steer_queue: list[str] = field(default_factory=list)
     model: str = ""
     cwd: str = ""
     worktree: wt_mod.Worktree | None = None
@@ -145,6 +147,8 @@ class SubagentManager:
     def __init__(self, server: Any) -> None:
         self.server = server
         self.handles: dict[str, Handle] = {}
+        #: the agents overlay's `p` / `/agents pause`: no new child starts while set; running ones finish
+        self.paused = False
         self._types: dict[str, AgentType] | None = None
         self._types_key: str = ""
 
@@ -196,6 +200,8 @@ class SubagentManager:
         """Create the child and start it as a task; the caller awaits :meth:`wait` or polls."""
         if getattr(self.server, "halted", False):  # /daemon pause: no new child runs anywhere
             raise RuntimeError("daemon is halted (/daemon pause): sub-agents are not started")
+        if self.paused:
+            raise RuntimeError("spawning is paused (/agents resume): sub-agents are not started")
         if depth > MAX_DEPTH:
             raise DepthLimit(f"sub-agent depth limit ({MAX_DEPTH}) reached")
         if isolation not in ("none", "worktree"):
@@ -434,6 +440,13 @@ class SubagentManager:
             for name in list(loop.tools.names()):
                 if name not in allowed and name != "exit_plan":
                     loop.tools._tools.pop(name, None)  # noqa: SLF001
+
+        def take_steer() -> list[str]:
+            taken = h.steer_queue[:]
+            h.steer_queue.clear()
+            return taken
+
+        loop.take_steer = take_steer
         return loop
 
     async def _drive(self, parent: Any, h: Handle, atype: AgentType, prompt: str, cwd: Path) -> None:

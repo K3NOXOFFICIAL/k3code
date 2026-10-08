@@ -123,7 +123,7 @@ class _ClearCommand(CommandDef):
 
 class _CompactCommand(CommandDef):
     def __init__(self) -> None:
-        super().__init__(name="compact", help="Summarize the older transcript to free context")
+        super().__init__(name="compact", help="Summarize the older transcript to free context", aliases=["compress"])
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         live = ctx.sessions.get(session_id) if session_id else None
