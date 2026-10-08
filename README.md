@@ -4,7 +4,7 @@
 
 k3code plans before it acts, can run several agents in parallel, retries through dropped connections and provider outages, and sends cheap background work to cheaper models. It has a Python core, a terminal UI (TypeScript, Ink) and an optional multi-window terminal (`k3`, a fork of TUIOS). It works with OpenAI-compatible and Anthropic providers, and with a local Claude Code login.
 
-> **Status: alpha, version 0.0.1 (unreleased).** The core is built and its test suite passes, and most exit criteria have scripted evidence. Live-model behaviour, the 72-hour daemon soak and multi-day use are not verified yet. Read [Safety](#safety) before you add a provider key or let it run unattended, and [Status](#status) for what has been tested.
+> **Status: alpha, version 0.1.0 (not tagged).** The core is built and its test suite passes, and most exit criteria have scripted evidence. Live-model behaviour, the 72-hour daemon soak and multi-day use are not verified yet. Read [Safety](#safety) before you add a provider key or let it run unattended, and [Status](#status) for what has been tested.
 > The repository is private for now. Install with the command in [Install](#install): it uses the latest `v*` tag, or `Main` until a tag exists. There is no tagged release yet.
 
 ---
@@ -291,7 +291,7 @@ Tip: keep at least one chain entry that does not go through a self-hosted gatewa
 | [`panes/`](panes) | `k3`, the multi-window terminal: a TUIOS fork (Go) plus the `internal/k3keys` keymap. |
 | [`install/`](install) | `install.sh`, `uninstall.sh` (Linux, macOS, WSL), `install.ps1`, `uninstall.ps1` (Windows, via WSL), the systemd unit, a sample answers file. |
 | [`scripts/`](scripts) | `dev/` (build-worker driver and task specs), `chaos/` (failure-injection tests), `exit/` (exit-criteria runner), vendor and upstream-sync tools. |
-| [`docs/`](docs) | [`PLAN.md`](docs/PLAN.md) (roadmap), [`tui-contract.md`](docs/tui-contract.md) (core ↔ TUI protocol), [`reports/`](docs/reports) (one report per milestone and merge). |
+| [`docs/`](docs) | [`PLAN.md`](docs/PLAN.md) (roadmap), [`tui-contract.md`](docs/tui-contract.md) (core ↔ TUI protocol), `reports/` (one report per milestone and merge). |
 | [`VENDOR.toml`](VENDOR.toml) | Ledger of every file or tree taken from another project: origin, commit, license, whether modified. |
 
 The core and the TUI talk the Hermes TUI gateway protocol (newline-delimited JSON-RPC 2.0), extended with a few k3code events such as `proposal.show`, `plan.show` and `scope.verdict`. The router, permissions engine, reliability layer, autonomy and learning modules are mostly k3code's own code. The error classifier, cooldown store and retry helpers are adapted from Hermes Agent, the permission rules, wildcard matcher and command-arity table are Python ports of opencode, and several other designs are re-implemented from upstream projects (see [`VENDOR.toml`](VENDOR.toml) and [Credits](#credits-and-licenses)).
@@ -316,8 +316,8 @@ Run each block from the repository root.
 python3 scripts/vendor_check.py
 ```
 
-- **Exit checks:** `scripts/exit/run_all.sh [--soak-minutes N] [--only m0,m1,…]` runs every check (real-TUI scripted flows, daemon and chaos tests, the panes tests, a clean-install test in a Fedora 44 podman container, and a 30-minute daemon soak in the background) and **overwrites the tracked** [`docs/reports/exit-status.md`](docs/reports/exit-status.md). Expect 30–40 minutes (an untested estimate) and heavy CPU, RAM and disk use. It needs `bash`, `python3`, `uv`, `node` (with the TUI built first), `go`, and optionally `podman`. Live-model rows stay pending while the provider quota is exhausted.
-- **How it was built:** most of the code was written by headless coding agents driven by [`scripts/dev/omni-worker.sh`](scripts/dev/omni-worker.sh) from the task specs in [`scripts/dev/tasks/`](scripts/dev/tasks). Each task produced a branch and a report in `docs/reports/`. Those scripts are internal build tooling; you do not need them to build, test or use k3code.
+- **Exit checks:** `scripts/exit/run_all.sh [--soak-minutes N] [--only m0,m1,…]` runs every check (real-TUI scripted flows, daemon and chaos tests, the panes tests, a clean-install test in a Fedora 44 podman container, and a 30-minute daemon soak in the background) and **overwrites the tracked** `docs/reports/exit-status.md`. Expect 30–40 minutes (an untested estimate) and heavy CPU, RAM and disk use. It needs `bash`, `python3`, `uv`, `node` (with the TUI built first), `go`, and optionally `podman`. Live-model rows stay pending while the provider quota is exhausted.
+- **How it was built:** most of the code was written by headless coding agents driven by `scripts/dev/omni-worker.sh` from the task specs in `scripts/dev/tasks/`. Each task produced a branch and a report in `docs/reports/`. Those scripts are internal build tooling; you do not need them to build, test or use k3code.
 - **Branches:** work branches are named by milestone, for example `w/m1-gateway`, `w/m2-ops`, `w/m4a-autonomy` or `w/m6-install`. The `w/merge-*` branches are integration merges. The exit checks are on `w/exit-verify` locally and `exit/verify` on `origin`. Integration happens on `m0-scaffold`.
 - **License hygiene:** `scripts/vendor_check.py` checks each file entry in `VENDOR.toml` (the file exists, the license is MIT or Apache-2.0, the project is not on a short banned list that includes the leaked Claude Code source and the closed Ante binary). It does not check the `[[tree]]` entries (`tui/`, `panes/`) or inspect the code itself.
 
@@ -334,16 +334,16 @@ python3 scripts/vendor_check.py
 | [`docs/tui-contract.md`](docs/tui-contract.md) | The protocol between the core and the TUI |
 | [`docs/UPSTREAM.md`](docs/UPSTREAM.md) | How the vendored TUI relates to its upstream |
 | [`docs/k3-panes-test.md`](docs/k3-panes-test.md) | Manual test steps for the `k3` multi-window terminal |
-| [`docs/reports/`](docs/reports) | One report per milestone and merge, including the exit-status table |
+| `docs/reports/` | One report per milestone and merge, including the exit-status table |
 | [`VENDOR.toml`](VENDOR.toml) | Every file and tree taken from another project, with its license |
 
 ---
 
 ## Status
 
-**Alpha, version 0.0.1 (unreleased).** This is the first version meant for people other than its author. Expect rough edges, and expect the config format and some commands to change.
+**Alpha, version 0.1.0 (not tagged).** This is the first version meant for people other than its author. Expect rough edges, and expect the config format and some commands to change.
 
-As of 2026-10-08, 51 exit-criteria checks have been run: 46 pass, none fail, and 5 are pending. The pending rows need a live model, a person or days of real use. The table with the evidence behind every row is [`docs/reports/exit-status.md`](docs/reports/exit-status.md). The core test suite passes.
+As of 2026-10-08, 51 exit-criteria checks have been run: 46 pass, none fail, and 5 are pending. The pending rows need a live model, a person or days of real use. The table with the evidence behind every row is `docs/reports/exit-status.md`. The core test suite passes.
 
 What is not verified yet:
 

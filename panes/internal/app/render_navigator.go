@@ -843,7 +843,7 @@ func navFolder(p string) string {
 }
 
 // navShortPath writes the home folder as ~. The home folder has to be the
-// whole first part of the path: /home/al is not ~ in /home/alex.
+// whole first part of the path, so a sibling folder whose name only starts with the same letters is not ~.
 func navShortPath(p string) string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {

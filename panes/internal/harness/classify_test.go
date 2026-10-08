@@ -193,7 +193,7 @@ func TestClassifyCoversEveryClaudeBlocker(t *testing.T) {
 		}},
 		{"folder trust", []string{
 			"Do you trust the files in this folder?",
-			"/home/gaurav/dev/tuios",
+			"/home/user/dev/tuios",
 		}},
 		{"plan approval", []string{
 			"Would you like to proceed?",

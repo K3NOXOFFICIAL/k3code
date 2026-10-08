@@ -13,9 +13,10 @@ usage:
   frameworks: []
 providers:
   entries:
-  - preset: omniroute
+  - preset: custom
     name: gw
     base_url: http://127.0.0.1:9/v1
+    api_key_env: GW_API_KEY
     api_key: sk-SECRET-1
   - preset: anthropic
     api_key: sk-ant-SECRET-2

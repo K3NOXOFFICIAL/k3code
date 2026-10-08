@@ -8,7 +8,6 @@ from typing import Any
 import httpx
 
 PRESETS: dict[str, dict[str, str]] = {
-    "omniroute": {"kind": "openai", "base_url": "http://localhost:20128/v1", "api_key_env": "OMNIROUTE_API_KEY"},
     "anthropic": {"kind": "anthropic", "base_url": "https://api.anthropic.com", "api_key_env": "ANTHROPIC_API_KEY"},
     "openai": {"kind": "openai", "base_url": "https://api.openai.com/v1", "api_key_env": "OPENAI_API_KEY"},
     "openrouter": {"kind": "openai", "base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY"},

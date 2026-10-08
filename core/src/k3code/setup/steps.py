@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,16 @@ USE_DEFAULTS: dict[str, tuple[str, bool, int, str]] = {
 }
 _GATEWAYS: set[str] = set()  # names of entries created from the self-hosted gateway preset
 BASE_THEMES = ["default", "midnight", "light", "solarized", "mono"]
+#: Provider choices in the wizard. "claude-cli" is Claude Code's own login (no URL, no key). "custom" is any
+#: OpenAI-compatible endpoint, typed in by the user. The other presets are vendor endpoints.
+PRESET_CHOICES = ["claude-cli", *probe.PRESETS, "custom"]
+#: Model aliases for Claude Code's own login, offered as defaults for the four tiers.
+CLAUDE_CLI_TIERS = {"main": "sonnet", "strong": "opus", "cheap": "haiku", "fast": "haiku"}
+
+
+def default_preset() -> str:
+    """The preselected provider: Claude Code's own login when `claude` is installed, else a custom endpoint."""
+    return "claude-cli" if shutil.which("claude") else "custom"
 
 
 @dataclass
@@ -135,10 +146,19 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
     if spec is None:
         if not c.p.confirm(f"providers.add{idx}", f"Add a {label} provider?", idx == 0):
             return None
-        preset = c.p.select(f"providers.preset{idx}", "Preset", list(probe.PRESETS), "omniroute")
+        preset = c.p.select(f"providers.preset{idx}", "Preset", PRESET_CHOICES, default_preset())
+        if preset == "claude-cli":  # Claude Code's own login: no URL and no key
+            return {"name": "claude-cli", "kind": "claude-cli"}
         spec = {"preset": preset}
-        base = probe.PRESETS[preset]
-        spec["base_url"] = c.p.text(f"providers.base_url{idx}", "Base URL", base["base_url"])
+        base = probe.PRESETS.get(preset, {})
+        spec["base_url"] = c.p.text(
+            f"providers.base_url{idx}",
+            "Base URL (OpenAI-compatible, e.g. https://host/v1)" if preset == "custom" else "Base URL",
+            base.get("base_url", ""),
+        ).strip()
+        if not spec["base_url"]:
+            c.say("  no base URL given: this provider is skipped")
+            return None
         # Ask for the key itself first: pasting it is what most people mean. It is stored in the
         # 0600 env file under the preset's variable name; the config only ever names the variable.
         key = c.p.text(
@@ -148,15 +168,15 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
             "",
             secret=True,
         )
-        spec["api_key_env"] = base["api_key_env"]
+        spec["api_key_env"] = base.get("api_key_env", "K3CODE_API_KEY")
         if key.strip():
             spec["api_key"] = key.strip()
         else:
             while True:
                 name = c.p.text(
                     f"providers.env{idx}",
-                    "Name of the environment variable that holds the key (letters, digits, _; e.g. OMNIROUTE_API_KEY)",
-                    base["api_key_env"],
+                    "Name of the environment variable that holds the key (letters, digits, _; e.g. K3CODE_API_KEY)",
+                    spec["api_key_env"],
                 ).strip()
                 if _ENV_NAME.match(name):
                     spec["api_key_env"] = name
@@ -167,6 +187,8 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
                 )
             if not os.environ.get(spec["api_key_env"]) and not read_env_file().get(spec["api_key_env"]):
                 c.say(f"  NOTE: {spec['api_key_env']} is not set yet. Export it, or add it to {env_file_path()}.")
+    if spec.get("preset") == "claude-cli" or spec.get("kind") == "claude-cli":  # an answers file can name it too
+        return {"name": spec.get("name") or "claude-cli", "kind": "claude-cli"}
     base = probe.PRESETS.get(spec.get("preset", ""), {})
     entry = {
         "name": spec.get("name") or spec.get("preset") or f"provider{idx + 1}",
@@ -202,6 +224,8 @@ def step_providers(c: Ctx) -> dict[str, Any]:
     results: dict[str, Any] = {}
     if c.p.confirm("providers.test", "Test each provider live?", c.p.interactive) and c.do_probe:
         for e in entries:
+            if e.get("kind") == "claude-cli":  # no endpoint to list models from
+                continue
             ok, ms, _ids, detail = probe.list_models(e, os.environ.get(e["api_key_env"], ""))
             c.say(f"  {e['name']}: {'OK' if ok else 'FAIL'} {ms:.0f} ms ({detail})")
             results[e["name"]] = ok
@@ -217,9 +241,9 @@ def step_tiers(c: Ctx) -> dict[str, Any]:
     providers = c.data.get("providers", {}).get("entries", [])
     out: dict[str, dict[str, str]] = {}
     for e in providers:
-        ok, _ms, ids, _d = (
-            probe.list_models(e, os.environ.get(e["api_key_env"], "")) if c.do_probe else (False, 0, [], "")
-        )
+        claude_cli = e.get("kind") == "claude-cli"
+        live = c.do_probe and not claude_cli
+        ok, _ms, ids, _d = probe.list_models(e, os.environ.get(e["api_key_env"], "")) if live else (False, 0, [], "")
         tiers: dict[str, str] = {}
         for t in TIERS:
             given = c.p.raw(f"tiers.{t}")
@@ -231,7 +255,8 @@ def step_tiers(c: Ctx) -> dict[str, Any]:
                 pick = c.p.select(f"tiers.{e['name']}.{t}", f"{e['name']}: model for '{t}'", [*ids, "(type one)"])
                 tiers[t] = pick if pick != "(type one)" else c.p.text(f"tiers.{e['name']}.{t}.custom", "Model id")
             else:
-                tiers[t] = c.p.text(f"tiers.{e['name']}.{t}", f"{e['name']}: model for '{t}'")
+                fallback = CLAUDE_CLI_TIERS.get(t, "") if claude_cli else ""
+                tiers[t] = c.p.text(f"tiers.{e['name']}.{t}", f"{e['name']}: model for '{t}'", fallback)
         out[e["name"]] = {t: m for t, m in tiers.items() if m}
     return {"models": out}
 
@@ -252,31 +277,11 @@ def step_permissions(c: Ctx) -> dict[str, Any]:
     return {"mode": mode, "extra_hardline": [str(x) for x in extra]}
 
 
-#: The k3nox hub is one MCP endpoint: its search, fetch and browser tools all come through it, as hub_* tools.
-HUB_URL = "https://<memory-host>/mcp"
-#: Variables that may hold the hub key, in order. The config only ever names one of them.
-HUB_KEY_ENVS = ("K3NOX_KEY", "OMNIROUTE_API_KEY")
-
-
-def hub_key_env() -> str:
-    """The name of the variable that holds the hub key, or '' when no key is set. The value is never returned."""
-    from k3code.config import env_value
-
-    return next((name for name in HUB_KEY_ENVS if env_value(name)), "")
-
-
 def step_integrations(c: Ctx) -> dict[str, Any]:
     out: dict[str, Any] = {"mcp": {}, "mem0_url": "", "skills_roots": [], "searxng_url": ""}
     mcp = c.p.raw("integrations.mcp")
     if mcp is None:
         mcp = []
-        key_env = hub_key_env()
-        if key_env and c.p.confirm(
-            "integrations.hub_mcp",
-            f"Add the k3nox hub (web search, fetch and browser tools), authenticated with ${key_env}?",
-            True,
-        ):
-            mcp.append({"name": "k3nox", "url": HUB_URL, "bearer_env": key_env})
         while c.p.interactive and c.p.confirm("integrations.addmcp", "Add an MCP server?", False):
             name = c.p.text("integrations.mcp_name", "Name")
             target = c.p.text("integrations.mcp_target", "URL (http…) or stdio command")

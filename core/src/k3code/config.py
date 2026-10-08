@@ -98,7 +98,7 @@ class DisplayConfig(BaseModel):
 
 
 class GoalConfig(BaseModel):
-    max_turns: int = 300  # judged turns before a goal pauses; raised from 30 by the owner's request
+    max_turns: int = 300  # judged turns before a goal pauses; raised from 30 at the owner's request
     judge_model: str = "cheap"
 
 

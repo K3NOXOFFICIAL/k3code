@@ -3,7 +3,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE="$HERE/../../core"
-UPSTREAM="${UPSTREAM:-localhost:20128}"
+UPSTREAM="${UPSTREAM:-localhost:8080}"  # set UPSTREAM to your own OpenAI-compatible endpoint
 PORT="${PROXY_PORT:-18080}"
 MODEL="${CHAOS_MODEL:-auto/coding-cheap}"
 # OmniRoute is paused by the owner (2026-10-07): the suite runs against the deterministic fake

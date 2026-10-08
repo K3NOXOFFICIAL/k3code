@@ -198,7 +198,9 @@ def test_detect_prefers_what_is_already_set_up(root, monkeypatch) -> None:
     found = ob.detect_providers()
     assert set(found) == {"openrouter", "claude-cli"}
     assert ob._default_provider(found) == "openrouter"
-    assert ob._default_provider({}) == "anthropic"
+    assert ob._default_provider({}) == "claude-cli"  # nothing set up, but the claude command exists
+    monkeypatch.setattr(ob.shutil, "which", lambda name: None)
+    assert ob._default_provider({}) == "api"  # no claude command either: ask for a custom endpoint
 
 
 def test_fast_api_without_endpoint_is_an_error_not_a_loop(root) -> None:

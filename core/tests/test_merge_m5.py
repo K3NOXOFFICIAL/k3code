@@ -1,3 +1,4 @@
+
 """merge-m5: GOAL.md command set, /permissions, /focus, actor tagging of unattended decisions."""
 
 from __future__ import annotations
@@ -5,12 +6,17 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 from k3code.commands.builtin import build_registry
 from k3code.confio import read_yaml
 from k3code.learning.decisions import DecisionLog
 from test_permissions_gateway import call, make_server
 
 GOAL = Path(__file__).resolve().parents[2] / "GOAL.md"
+
+# GOAL.md is an internal planning document that the release export leaves out: skip rather than fail there
+pytestmark = pytest.mark.skipif(not GOAL.is_file(), reason="GOAL.md is not in the release export")
 
 
 def _goal_commands() -> list[str]:

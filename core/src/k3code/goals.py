@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MAX_TURNS = 300  # a backstop for unattended goals; raised from 30 by the owner's request
+DEFAULT_MAX_TURNS = 300  # a backstop for unattended goals; raised from 30 at the owner's request
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
 DEFAULT_GATE_MAX_RETRIES = 3
 MAX_CONSECUTIVE_PARSE_FAILURES = 3

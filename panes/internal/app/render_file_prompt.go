@@ -147,7 +147,7 @@ func (m *OS) renderFileConfirm() (string, overlay.Geometry, []overlayRowHit) {
 
 	// The path is cut from the front, like the rail's own header: the tail is
 	// the file being deleted and the head is the disk it is on. A confirmation
-	// that truncated to "/home/gaurav/dev/tui…" would have cut off the only
+	// that truncated to "/home/user/dev/tui…" would have cut off the only
 	// part that says which file.
 	path := ""
 	if len(m.filePrompt.Paths) > 0 {

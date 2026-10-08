@@ -9,3 +9,6 @@ dist/
 .k3code/
 scripts/exit/rows/
 tui/node_modules
+
+# built panes binary (install builds it from source)
+panes/k3

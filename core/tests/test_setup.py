@@ -22,7 +22,13 @@ ANSWERS = {
     "usage": {"primary": "ops", "languages": [], "frameworks": []},
     "providers": {
         "entries": [
-            {"preset": "omniroute", "name": "gw", "base_url": "http://127.0.0.1:9/v1", "api_key": "sk-SECRET-1"},
+            {
+                "preset": "omniroute",
+                "name": "gw",
+                "base_url": "http://127.0.0.1:9/v1",
+                "api_key_env": "OMNIROUTE_API_KEY",
+                "api_key": "sk-SECRET-1",
+            },
             {"preset": "anthropic", "api_key": "sk-ant-SECRET-2"},
         ],
         "test": False,
@@ -222,7 +228,7 @@ def test_sandbox_state_reports_each_case_and_never_raises(monkeypatch: pytest.Mo
     assert detect.sandbox_state() == "unknown"  # the wizard step goes on
 
 
-_FAKE_HUB_KEY = "fake-hub-key-for-tests-0001"  # a placeholder, never a real credential
+_FAKE_KEY = "fake-mcp-key-for-tests-0001"  # a placeholder, never a real credential
 
 
 def _integrations(answers: dict[str, object]) -> dict[str, object]:
@@ -232,41 +238,45 @@ def _integrations(answers: dict[str, object]) -> dict[str, object]:
     return steps.step_integrations(ctx)
 
 
-def test_hub_entry_is_not_offered_without_a_key(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from k3code.setup import steps
-
-    for name in steps.HUB_KEY_ENVS:
-        monkeypatch.delenv(name, raising=False)
-    assert "k3nox" not in _integrations({})["mcp"]
+def test_no_mcp_server_is_added_by_default(env: Path) -> None:
+    assert _integrations({})["mcp"] == {}
 
 
-def test_hub_entry_names_the_env_var_and_never_the_value(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from k3code.setup import steps
-
-    monkeypatch.delenv("K3NOX_KEY", raising=False)
-    monkeypatch.setenv("OMNIROUTE_API_KEY", _FAKE_HUB_KEY)
-    out = _integrations({})
-    assert out["mcp"]["k3nox"] == {"url": steps.HUB_URL, "bearer_env": "OMNIROUTE_API_KEY"}
-    text = yaml.safe_dump(steps.build_config({"integrations": out}))
-    assert _FAKE_HUB_KEY not in text
-    assert "bearer_env: OMNIROUTE_API_KEY" in text
+def test_hand_written_mcp_server_is_kept(env: Path) -> None:
+    out = _integrations({"integrations": {"mcp": [{"name": "docs", "url": "https://mcp.example.com/mcp"}]}})
+    assert out["mcp"] == {"docs": {"url": "https://mcp.example.com/mcp"}}
 
 
-def test_hub_entry_declined_leaves_no_server(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("K3NOX_KEY", _FAKE_HUB_KEY)
-    assert "k3nox" not in _integrations({"integrations": {"hub_mcp": False}})["mcp"]
-
-
-def test_hub_bearer_is_read_when_connecting(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bearer_is_read_when_connecting(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from k3code.config import McpServerConfig
     from k3code.mcpclient import request_headers
+
+    cfg = McpServerConfig(url="https://mcp.example.com/mcp", bearer_env="EXAMPLE_MCP_KEY")
+    monkeypatch.setenv("EXAMPLE_MCP_KEY", _FAKE_KEY)
+    assert request_headers(cfg) == {"Authorization": f"Bearer {_FAKE_KEY}"}
+    monkeypatch.delenv("EXAMPLE_MCP_KEY")
+    assert request_headers(cfg) == {}  # unset: no header, and never the literal variable name
+
+
+def test_provider_default_is_claude_login_when_claude_is_installed(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.setup import probe, steps
+
+    assert "omniroute" not in probe.PRESETS and "omniroute" not in steps.PRESET_CHOICES
+    monkeypatch.setattr(steps.shutil, "which", lambda name: "/usr/bin/claude" if name == "claude" else None)
+    assert steps.default_preset() == "claude-cli"
+    ctx = steps.Ctx(p=AnswerPrompter({}), data={}, do_probe=False)
+    assert steps._entry_from(ctx, 0, "primary", None) == {"name": "claude-cli", "kind": "claude-cli"}
+
+
+def test_provider_default_without_claude_asks_for_a_custom_endpoint(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from k3code.setup import steps
 
-    cfg = McpServerConfig(url=steps.HUB_URL, bearer_env="K3NOX_KEY")
-    monkeypatch.setenv("K3NOX_KEY", _FAKE_HUB_KEY)
-    assert request_headers(cfg) == {"Authorization": f"Bearer {_FAKE_HUB_KEY}"}
-    monkeypatch.delenv("K3NOX_KEY")
-    assert request_headers(cfg) == {}  # unset: no header, and never the literal variable name
+    monkeypatch.setattr(steps.shutil, "which", lambda name: None)
+    assert steps.default_preset() == "custom"
+    ctx = steps.Ctx(p=AnswerPrompter({}), data={}, do_probe=False)
+    assert steps._entry_from(ctx, 0, "primary", None) is None  # no default URL: nothing is invented
+
+
 def test_wizard_searxng_answer_reaches_the_research_setting(env: Path) -> None:
     """The integrations answer used to land under a top-level ``searxng`` key that Settings dropped."""
     from k3code import confio

@@ -22,7 +22,6 @@ from k3code.setup.wizard import run_setup
 QUESTION = "Fast setup (API endpoint + key) or full setup?"
 MODES = ["fast", "full"]
 CLAUDE_CLI_MODEL = "sonnet"  # a Claude Code alias: resolves to the current Sonnet
-DEFAULT_ENDPOINT = probe.PRESETS["omniroute"]["base_url"]
 NO_CONFIG_HINT = "No k3code provider configured. Run `k3code onboard` to set one up."
 
 
@@ -84,7 +83,8 @@ def detect_providers() -> dict[str, str]:
 
 
 def _default_provider(found: dict[str, str]) -> str:
-    return next((n for n in PROVIDERS if n in found), "anthropic")
+    """The first provider already set up here. With none: Claude Code's login if `claude` exists, else custom."""
+    return next((n for n in PROVIDERS if n in found), "claude-cli" if shutil.which("claude") else "api")
 
 
 def _pick_model(p: Prompter, name: str, ids: list[str]) -> str:
@@ -106,14 +106,9 @@ def _pick_model(p: Prompter, name: str, ids: list[str]) -> str:
 def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any], str]:
     """Build the provider entry for a preset (or "api": ask the URL) and choose its main model ("" if unknown)."""
     if name == "api":
-        default = (
-            DEFAULT_ENDPOINT if os.environ.get("OMNIROUTE_API_KEY") or read_env_file().get("OMNIROUTE_API_KEY") else ""
-        )
         base = ""
         while not base:
-            base = (
-                p.text("onboard.endpoint", "API endpoint (base URL, e.g. https://host/v1)", default) or default
-            ).strip()
+            base = p.text("onboard.endpoint", "API endpoint (base URL, e.g. https://host/v1)", "").strip()
             if not base and not p.interactive:
                 raise ValueError("onboard.endpoint is required for provider api")
         base = base.rstrip("/")
