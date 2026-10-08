@@ -195,12 +195,13 @@ class Experiments:
         return True
 
     def session_done(self, current_metrics: Callable[[float], dict[str, Any]], notify: Callable[[str], None] | None
-                     = None, config_path: Path | None = None) -> list[dict[str, Any]]:
-        """Count one finished session for every active experiment; judge the ones that reached their target."""
+                     = None, config_path: Path | None = None, ids: set[str] | None = None) -> list[dict[str, Any]]:
+        """Count one finished session for every active experiment (or only ``ids``); judge the ones that reached
+        their target."""
         items = self.all()
         finished = []
         for x in items:
-            if x["status"] != "active":
+            if x["status"] != "active" or (ids is not None and x["id"] not in ids):
                 continue
             x["sessions_done"] += 1
             if x["sessions_done"] >= x["target_sessions"]:

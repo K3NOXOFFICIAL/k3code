@@ -207,8 +207,12 @@ class LearningHub:
                 config=self.server.config, min_turns=minimum, session_id=session.session_id,
                 project=project_id(session.stored.cwd or "."))
             self.emit(session, r["proposals"])
-        if self.experiments.active():
-            self.experiments.session_done(lambda since: self.metrics(since=since), notify=self._notify)
+        # Once per session and experiment (this ran on every turn), and never for background/cron/loop runs.
+        counted = set(meta.get("experiments_counted") or [])
+        fresh = {x["id"] for x in self.experiments.active()} - counted
+        if fresh and not session.background:
+            meta["experiments_counted"] = sorted(counted | fresh)
+            self.experiments.session_done(lambda since: self.metrics(since=since), notify=self._notify, ids=fresh)
         await self.maintenance(session)
 
     def _notify(self, text: str) -> None:

@@ -106,3 +106,21 @@ async def test_optimizer_rollback_restores_the_live_config(tmp_path, monkeypatch
     assert hub.experiments.rollback("x1")
     assert server.config.task_tiers == {"title": "fast"} and resets == [1, 1]
     assert read_yaml(tmp_path / "home" / "config.yaml") == {"task_tiers": {"title": "fast"}}
+
+
+async def test_experiments_count_each_interactive_session_once(tmp_path, monkeypatch):
+    """session_done ran on every turn end, background/cron turns included: a 20-session A/B ended after a few
+    sessions (or one busy cron job)."""
+    server, _ = make_server(tmp_path, ["ok", "ok", "ok", "ok"], monkeypatch)
+    hub = server.learning
+    hub._apply_overlay({"title": "t", "prompt": "be brief", "name": "brief"})
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    for _ in range(3):
+        await run_turn(server, "go", [])
+        await hub.drain()
+    assert hub.experiments.get("x1")["sessions_done"] == 1
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    server.session.background = True
+    await run_turn(server, "go", [])
+    await hub.drain()
+    assert hub.experiments.get("x1")["sessions_done"] == 1
