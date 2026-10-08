@@ -339,6 +339,8 @@ class GoalManager:
         s.turns_used += 1
         s.last_turn_at = time.time()
         verdict, reason, parse_failed, transport_failed = await judge(s.goal, last_response)
+        if (gone := self._superseded(s)) is not None:
+            return gone
         s.last_verdict, s.last_reason = verdict, reason
         s.consecutive_parse_failures = s.consecutive_parse_failures + 1 if parse_failed else 0
         s.consecutive_transport_failures = s.consecutive_transport_failures + 1 if transport_failed else 0
@@ -352,6 +354,8 @@ class GoalManager:
         if verdict == "done":
             for gate in s.gates:  # the check must pass before `done` counts
                 passed, code, tail = await run_gate(gate, cwd=cwd)
+                if (gone := self._superseded(s)) is not None:
+                    return gone
                 gate.last_exit_code, gate.last_output_tail = code, tail
                 if passed:
                     gate.attempts = 0
@@ -379,6 +383,8 @@ class GoalManager:
                 )
             if reviewer is not None:  # advisor veto: blocking issues keep the goal going
                 blocking, issues = await reviewer(s.goal)
+                if (gone := self._superseded(s)) is not None:
+                    return gone
                 if blocking and issues and s.turns_used < s.max_turns:
                     s.last_verdict = "advisor_blocked"
                     s.last_reason = "advisor: " + "; ".join(issues)[:300]
@@ -415,6 +421,14 @@ class GoalManager:
             "active", True, self.continuation_prompt(), "continue", reason,
             f"↻ Continuing toward goal ({s.turns_used}/{s.max_turns}): {reason}",
         )
+
+    def _superseded(self, s: GoalState) -> Decision | None:
+        """After an await (judge, check, reviewer: possibly minutes): the user may have cleared, paused or replaced
+        the goal meanwhile. Saving our copy then would resurrect it, so stop with an inactive decision instead."""
+        cur = self.state
+        if cur is not None and cur.status == "active" and cur.created_at == s.created_at and cur.goal == s.goal:
+            return None
+        return Decision(cur.status if cur else None, False, None, "inactive", "goal changed during evaluation", "")
 
     def _budget_pause(self, s: GoalState, verdict: str, reason: str) -> Decision:
         return self._pause_decision(
