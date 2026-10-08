@@ -238,7 +238,7 @@ To report a vulnerability, use the private route in [SECURITY.md](SECURITY.md).
 
 State lives in `~/.k3code/` (override with `K3CODE_HOME`): `config.yaml`, session and usage databases, the journal, memory, learned preferences, logs. Secrets live only in `~/.config/k3code/env` (mode 0600) or your environment. A project can add `.k3code/config.yaml`, read from the directory k3code was started in (or `--config-dir`). It applies only after you trust that exact file: an interactive start shows what it changes and asks once, and asks again when the file changes. Headless and piped runs ignore an untrusted file. `k3code trust [PATH]` grants trust and `k3code trust --revoke` takes it back.
 
-Precedence per top-level key: command-line flag > environment (`K3CODE_<KEY>`, scalar keys only, for example `K3CODE_PERMISSION_MODE`) > project config > user config > defaults. Nested sections are replaced as a whole, not merged. Known exception: `providers` comes from the user config whenever that file defines it, even if the project config does too. Change settings with `/config`, `/update-config` or `k3code setup --step <name>`; edits are backed up and `/config rollback` restores the last one.
+Precedence per top-level key: command-line flag > environment (`K3CODE_<KEY>`, scalar keys only, for example `K3CODE_PERMISSION_MODE`) > project config > user config > defaults. Nested sections and the `providers` list are replaced as a whole, not merged. Change settings with `/config`, `/update-config` or `k3code setup --step <name>`; edits are backed up and `/config rollback` restores the last one.
 
 ```yaml
 providers:                          # the fallback chain, in order (add as many as you like)

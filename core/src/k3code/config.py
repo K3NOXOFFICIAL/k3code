@@ -190,7 +190,10 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 
 def _merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """Shallow merge for top-level keys; providers list is replaced, not merged."""
+    """Shallow merge per top-level key: a key set in ``override`` replaces the whole base value.
+
+    Nested sections and the ``providers`` list are replaced as a whole, never merged.
+    """
     result = base.copy()
     result.update(override)
     return result
@@ -244,12 +247,6 @@ def load_config(
     merged = _merge_dicts(merged, cli)
 
     _warn_unknown_escalate_keys(merged)
-
-    # Parse providers list specially (replace, don't merge)
-    for src in (user_config, project_config, cli):
-        if "providers" in src:
-            merged["providers"] = src["providers"]
-            break
 
     # Expand provider api_key_env -> api_key (api_key_env is a required field on
     # ProviderEntry, so look it up without popping it out of the dict).
