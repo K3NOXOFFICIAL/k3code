@@ -56,7 +56,7 @@ from k3code.gateway.protocol import (
     next_request_id,
 )
 from k3code.gateway.sessions import SessionStore
-from k3code.goals import GoalManager, make_judge
+from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
@@ -342,6 +342,8 @@ class GatewayServer:
         self.safe_mode_notice = ""
         #: ``/daemon pause``: a persisted global halt (k3code.halt); loaded here so it survives a restart.
         self.halt: Halt | None = load_halt(self._home())
+        #: Set by a graceful stop: a turn cancelled now pauses its goal as "daemon restart" (boot resumes it).
+        self.stopping = False
         self._client_seq = 0
         self.usage = UsageDB(self._home() / "usage.db")
         self.artifacts = ArtifactStore(self._home() / "artifacts.db")
@@ -617,6 +619,7 @@ class GatewayServer:
     socket_path: Path
 
     def request_stop(self) -> None:
+        self.stopping = True
         self._stop.set()
 
     @property
@@ -857,6 +860,7 @@ class GatewayServer:
         self._open_requests.clear()
 
     async def close(self) -> None:
+        self.stopping = True
         if self.automation is not None:
             await self.automation.stop()
         cancelled = []
@@ -1147,7 +1151,7 @@ class GatewayServer:
                         status, final_text = await self._run_one_turn(session, prompt)
             except asyncio.CancelledError:
                 if mgr.is_active():
-                    mgr.pause("interrupted")
+                    mgr.pause("daemon restart" if self.stopping else "interrupted")
                     self.emit_goal(session)
                 raise
             if self.halted and mgr.is_active() and status == "done":
@@ -1716,6 +1720,52 @@ class GatewayServer:
             self.store.save(session.stored)
 
         return GoalManager(load, save, default_max_turns=self.config.goal.max_turns)
+
+    async def kick_goal(self, live: LiveSession, *, source: str) -> bool:
+        """Start the next turn of an active goal that has no live turn. Boot resume and the watchdog both use this.
+
+        Refused while halted or in restart-storm safe mode. Every kick is counted: once MAX_KICKS_PER_WINDOW kicks
+        happened within KICK_WINDOW_S, the goal is parked (paused) instead of kicked again.
+        """
+        if self.halted or self.background_paused:
+            return False
+        mgr = self.goal_manager(live)
+        goal = mgr.state
+        if goal is None or goal.status != "active":
+            return False
+        if live.streaming or (live.turn_task is not None and not live.turn_task.done()):
+            return False  # a live turn is working on it already
+        now = time.time()
+        if len(mgr.recent_kicks(now)) >= MAX_KICKS_PER_WINDOW:
+            mgr.pause(f"parked: {MAX_KICKS_PER_WINDOW} automatic kicks in 1 h")
+            self.emit_goal(live)
+            return False
+        mgr.record_kick(now)
+        live.turn_task = asyncio.get_running_loop().create_task(
+            self._run_turn(live, mgr.kick_prompt() or goal.goal), name=f"kick-{live.session_id}"
+        )
+        self.emit_goal(live)
+        return True
+
+    async def resume_goals(self) -> int:
+        """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.
+
+        Returns how many turns were started. Nothing starts while halted or in restart-storm safe mode.
+        """
+        if self.halted or self.background_paused:
+            return 0
+        started = 0
+        for stored in self.store.with_meta_key("goal"):
+            live = self.live_for(stored)
+            mgr = self.goal_manager(live)
+            goal = mgr.state
+            if goal is None:
+                continue
+            if goal.status == "paused" and goal.paused_reason == "daemon restart":
+                mgr.resume(reset_budget=False)
+            if await self.kick_goal(live, source="boot"):
+                started += 1
+        return started
 
     def emit_goal(self, session: LiveSession) -> None:
         """Push the goal snapshot to the TUI goal bar (``session.control.update``)."""

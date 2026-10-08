@@ -127,6 +127,7 @@ async def run_daemon(
     if serve.done():
         serve.result()  # the server failed to come up: raise its error instead of announcing READY=1
     await server.ensure_automation()  # resume loops, start the cron scheduler and triggers
+    await server.resume_goals()  # goals that were active (or paused by a graceful stop) continue
     sdnotify.ready()
     logger.info("daemon ready on %s", sock)
     if ready_event is not None:

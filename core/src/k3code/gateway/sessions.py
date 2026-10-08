@@ -129,6 +129,13 @@ class SessionStore:
             meta=json.loads(row[9] or "{}"),
         )
 
+    def with_meta_key(self, key: str) -> list[StoredSession]:
+        """Every session whose meta has the top-level ``key`` (full rows, meta included)."""
+        ids = self._db.execute(
+            "SELECT session_id FROM sessions WHERE json_extract(meta, ?) IS NOT NULL", (f"$.{key}",)
+        ).fetchall()
+        return [s for s in (self.get(row[0]) for row in ids) if s is not None]
+
     def list(self, *, limit: int = 50, include_automation: bool = True) -> list[StoredSession]:
         where = "" if include_automation else " WHERE COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
         rows = self._db.execute(
