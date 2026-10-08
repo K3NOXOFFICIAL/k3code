@@ -115,7 +115,7 @@ def main() -> int:
                 print(f"PENDING: upstream unreachable: {project}: {e}")
                 return 3
             head = git("rev-parse", "upstream", cwd=d).strip()
-            for p, up_path, local, base_c, kind in entries:
+            for p, up_path, local, base_c, _kind in entries:
                 if p != project:
                     continue
                 base = blobs(d, base_c, up_path)
@@ -130,7 +130,8 @@ def main() -> int:
                 subtrees[f"{project}:{local}"] = {
                     "project": project, "upstream_path": up_path, "base": base_c[:10], "upstream_head": head[:10],
                     "conflicts": len(r["conflicts"]), "theirs_only": len(r["theirs_only"]),
-                    "ours_only": len(r["ours_only"]), "both_changed": len(both), "base_missing": not base, "examples": r["conflicts"][:5]}
+                    "ours_only": len(r["ours_only"]), "both_changed": len(both),
+                    "base_missing": not base, "examples": r["conflicts"][:5]}
     agg: dict[str, int] = {}
     upstream_changed: dict[str, int] = {}
     for k, v in subtrees.items():
@@ -150,7 +151,8 @@ def main() -> int:
                 print(f"SUBTREE {k}: {n} conflicting file(s); FROZEN FORK, not merged: {upstream_changed[k]} files "
                       f"changed upstream since the base, to be cherry-picked by hand (docs/UPSTREAM.md)")
             else:
-                print(f"SUBTREE {k}: {n} conflicting file(s) (target <{a.threshold}) {'OK' if n < a.threshold else 'OVER'}")
+                print(f"SUBTREE {k}: {n} conflicting file(s) (target <{a.threshold}) "
+                      f"{'OK' if n < a.threshold else 'OVER'}")
     return 0 if worst < a.threshold else 1
 
 
