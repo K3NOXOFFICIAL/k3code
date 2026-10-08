@@ -360,6 +360,10 @@ async def test_background_turn_escalates_after_repeated_tool_errors(tmp_path, mo
 
 
 async def test_background_turn_escalates_when_the_loop_guard_fires(tmp_path, monkeypatch):
+    from k3code.reliability import sandbox
+
+    # unattended bash is refused when bwrap is unusable (tool_errors would escalate first); this test is about the guard
+    monkeypatch.setattr(sandbox, "should_sandbox", lambda *a, **k: False)
     same = {"type": "tool_call", "model": "m-cheap", "id": "c1", "name": "bash", "arguments": {"command": "echo hi"}}
     steps = [same, {"type": "text", "model": "m-main", "text": "recovered"}]
     server = make(tmp_path, monkeypatch, steps)

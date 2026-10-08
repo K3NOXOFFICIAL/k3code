@@ -34,3 +34,9 @@ fbf92c87922c932561ad35339a3480afc01cf786:panes/internal/integration/hook_test.go
 fbf92c87922c932561ad35339a3480afc01cf786:panes/internal/session/approvals_test.go:generic-api-key:456
 fbf92c87922c932561ad35339a3480afc01cf786:scripts/dev/tasks/m3-panes.md:generic-api-key:5
 fbf92c87922c932561ad35339a3480afc01cf786:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:64
+
+# The same kind of fixtures, re-reported under the 2026-10-08 formatting commits and the replay-harness commit
+# (reviewed 2026-10-08): a fake session key, the sequential AKIA test key, and the sk- string the replay store must not keep.
+510346574ef1963d6cbc957566c75edadaf902ef:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:67
+2255b4e9472fd9671a71cb94721d09871cf3e086:core/tests/test_learning_projectprep.py:aws-access-token:85
+7829fe13f20170bccfe88405a62bd99549cb318e:core/tests/test_learning_replay.py:generic-api-key:62

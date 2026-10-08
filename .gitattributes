@@ -1,3 +1,5 @@
+# Normalise every text file to LF in the repo and in every checkout (also a Windows checkout used from WSL).
+* text=auto eol=lf
 panes/internal/vt/testdata/** binary
 *.bin binary
 # install.sh runs in WSL from a Windows checkout: keep LF even with core.autocrlf=true

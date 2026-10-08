@@ -1,7 +1,8 @@
 """Precedence per top-level key: CLI flag > env > project config > user config > defaults.
 
 Nested sections are replaced as a whole, never merged. Every file here lives under pytest's tmp_path;
-HOME, XDG_CONFIG_HOME and K3CODE_HOME are redirected so a real ~/.k3code or ~/.config/k3code is never read.
+HOME, XDG_CONFIG_HOME and K3CODE_HOME are redirected so a real ~/.k3code or ~/.config/k3code is never read,
+and each project config is recorded as trusted there (an untrusted one is ignored).
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from k3code import trust
 from k3code.config import load_config
 
 USER_PROVIDER_A = """
@@ -61,6 +63,7 @@ def _write_user(dirs: dict[str, Path], text: str) -> None:
 
 def _write_project(dirs: dict[str, Path], text: str) -> None:
     _write(dirs["project"] / ".k3code" / "config.yaml", text)
+    trust.record(dirs["project"], trusted=True)  # an untrusted project config is never applied (k3code.trust)
 
 
 def test_project_providers_win_over_user_providers(dirs: dict[str, Path]) -> None:
