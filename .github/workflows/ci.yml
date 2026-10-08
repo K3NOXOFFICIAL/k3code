@@ -17,6 +17,30 @@ jobs:
         working-directory: core
         run: uv run pytest -q
 
+  installer-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: installer tests
+        working-directory: core
+        run: uv run pytest -q tests/test_installer.py
+
+  installer-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: parse install.ps1 and uninstall.ps1 with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          foreach ($f in 'install/install.ps1', 'install/uninstall.ps1') {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errs)
+            if ($errs) { $errs | Out-String | Write-Error; exit 1 }
+          }
+          powershell -NoProfile -ExecutionPolicy Bypass -File install/install.ps1 -Help
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
   tui:
     runs-on: ubuntu-latest
     steps:
