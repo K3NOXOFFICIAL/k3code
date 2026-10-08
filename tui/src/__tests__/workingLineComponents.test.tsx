@@ -12,11 +12,13 @@ import {
   markTurnStart,
   settleOutput
 } from '../app/outputTokensStore.js'
+import { $petEnabled, $petName, $petParty } from '../app/petStore.js'
 import { PET_NAMES, PETS } from '../content/pets.js'
-import { TerminalPet } from '../components/terminalPet.js'
+import { WORKING_MESSAGES } from '../content/workingMessages.js'
+import { PetCorner, TerminalPet } from '../components/terminalPet.js'
 import { WorkingLine } from '../components/workingLine.js'
-import { PET_DONE_HOLD_MS, PET_IDLE_BLINK_EVERY_MS, PET_IDLE_BLINK_MS, PET_TICK_MS } from '../lib/terminalPet.js'
-import { WORKING_TICK_MS } from '../lib/workingLine.js'
+import { PET_DONE_HOLD_MS, PET_TICK_MS } from '../lib/terminalPet.js'
+import { WORKING_ROTATE_MS, WORKING_TICK_MS } from '../lib/workingLine.js'
 import { DEFAULT_THEME } from '../theme.js'
 
 // React schedules its work on the real setImmediate. Capture it before fake timers replace it, so a
@@ -59,6 +61,71 @@ const mountWithIntervals = (element: React.ReactElement) => {
   return { delays, view }
 }
 
+describe('pet party corner', () => {
+  const saved = process.env.K3_NO_ANIMATION
+  const savedName = $petName.get()
+
+  beforeEach(() => {
+    delete process.env.K3_NO_ANIMATION
+    vi.useFakeTimers()
+    $petEnabled.set(true)
+    $petName.set('owl')
+    $petParty.set(true)
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    $petParty.set(false)
+    $petName.set(savedName)
+
+    if (saved === undefined) {
+      delete process.env.K3_NO_ANIMATION
+    } else {
+      process.env.K3_NO_ANIMATION = saved
+    }
+  })
+
+  const sideBySide = (output: string, names: readonly (keyof typeof PETS)[]) =>
+    output
+      .split('\n')
+      .some(line => names.every(name => line.includes(PETS[name].idle[0][0].trimEnd())))
+
+  it('shows two pets side by side at 100 columns', () => {
+    const view = mount(<PetCorner busy={false} cols={100} t={DEFAULT_THEME} />)
+
+    expect(sideBySide(view.output(), ['owl', 'robot'])).toBe(true)
+
+    view.unmount()
+  })
+
+  it('shows three pets side by side at 130 columns', () => {
+    const view = mount(<PetCorner busy={false} cols={130} t={DEFAULT_THEME} />)
+
+    expect(sideBySide(view.output(), ['owl', 'robot', 'blob'])).toBe(true)
+
+    view.unmount()
+  })
+
+  it('keeps one pet at 80 columns, with the party on', () => {
+    const view = mount(<PetCorner busy={false} cols={80} t={DEFAULT_THEME} />)
+
+    expect(view.output()).toContain(PETS.owl.idle[0][0].trimEnd())
+    expect(view.output()).not.toContain(PETS.robot.idle[0][0].trimEnd())
+
+    view.unmount()
+  })
+
+  it('draws nothing when the party is off', () => {
+    $petParty.set(false)
+    const view = mount(<PetCorner busy={false} cols={200} t={DEFAULT_THEME} />)
+
+    expect(view.output()).not.toContain(PETS.robot.idle[0][0].trimEnd())
+    expect(view.output()).toContain(PETS.owl.idle[0][0].trimEnd())
+
+    view.unmount()
+  })
+})
+
 describe('reduced motion (K3_NO_ANIMATION=1)', () => {
   const saved = process.env.K3_NO_ANIMATION
 
@@ -87,6 +154,20 @@ describe('reduced motion (K3_NO_ANIMATION=1)', () => {
     expect(delays).toEqual([1000])
 
     view.unmount()
+  })
+
+  it('a party of pets shows still frames with no pet timer', () => {
+    const savedParty = $petParty.get()
+
+    $petEnabled.set(true)
+    $petParty.set(true)
+    const { delays, view } = mountWithIntervals(<PetCorner busy cols={100} t={DEFAULT_THEME} />)
+
+    expect(delays.filter(delay => delay < 1000)).toEqual([])
+    expect(view.output()).toContain(PETS[$petName.get()].working[0][0].trimEnd())
+
+    view.unmount()
+    $petParty.set(savedParty)
   })
 
   it('shows a fixed pet frame and arms no pet timer', () => {
@@ -161,7 +242,7 @@ describe('animated timers', () => {
     view.unmount()
   })
 
-  it('a finished turn keeps the pet timer through done, then drops to the slow idle blink', async () => {
+  it('a finished turn shows a celebration for the hold, then the pet goes still with no timer', async () => {
     const before = vi.getTimerCount()
     const view = mount(<TerminalPet busy name="owl" needsInput={false} t={DEFAULT_THEME} />)
 
@@ -170,24 +251,38 @@ describe('animated timers', () => {
     view.rerender(<TerminalPet busy={false} name="owl" needsInput={false} t={DEFAULT_THEME} />)
     await settle()
 
+    expect(view.output()).toContain('done!')
     expect(vi.getTimerCount()).toBeGreaterThan(before)
 
     vi.advanceTimersByTime(PET_DONE_HOLD_MS + PET_TICK_MS)
     await settle()
 
-    // Only the idle blink timer is left (one interval every PET_IDLE_BLINK_EVERY_MS).
-    expect(vi.getTimerCount()).toBe(before + 1)
+    // The idle pet ticks never: no timer is left, and no further frame is drawn.
+    expect(vi.getTimerCount()).toBe(before)
     expect(view.output()).toContain(PETS.owl.idle[0][1].trimEnd())
 
-    vi.advanceTimersByTime(PET_IDLE_BLINK_EVERY_MS)
-    await settle()
-    expect(view.output()).toContain(PETS.owl.idle[2][1].trimEnd())
+    const still = view.output()
 
-    vi.advanceTimersByTime(PET_IDLE_BLINK_MS)
+    vi.advanceTimersByTime(60_000)
     await settle()
-    expect(view.output()).toContain(PETS.owl.idle[0][1].trimEnd())
+    expect(view.output()).toBe(still)
 
     view.unmount()
+  })
+
+  it('a working pet says a quip from the pool and moves to the next one as the turn runs', async () => {
+    const spy = vi.spyOn(Math, 'random').mockReturnValue(0)
+    const view = mount(<TerminalPet busy name="owl" needsInput={false} t={DEFAULT_THEME} />)
+
+    expect(view.output()).toContain(WORKING_MESSAGES[0])
+
+    vi.advanceTimersByTime(WORKING_ROTATE_MS + PET_TICK_MS)
+    await settle()
+
+    expect(view.output()).toContain(WORKING_MESSAGES[1])
+
+    view.unmount()
+    spy.mockRestore()
   })
 
   it('a pet tick re-renders the pet, not the component that holds it', async () => {

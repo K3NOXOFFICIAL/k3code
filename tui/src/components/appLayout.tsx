@@ -8,7 +8,7 @@ import { Fragment, memo, type MutableRefObject, useEffect, useMemo, useRef } fro
 import { useGateway } from '../app/gatewayContext.js'
 import type { AppLayoutProps } from '../app/interfaces.js'
 import { $isBlocked, $overlayState, patchOverlayState } from '../app/overlayStore.js'
-import { $petEnabled } from '../app/petStore.js'
+import { $petEnabled, $petParty } from '../app/petStore.js'
 import { $uiState } from '../app/uiStore.js'
 import { INLINE_MODE, NATIVE_MODE, SHOW_FPS, TERMUX_TUI_MODE } from '../config/env.js'
 import { PLACEHOLDER } from '../content/placeholders.js'
@@ -77,7 +77,9 @@ const TranscriptPane = memo(function TranscriptPane({
 }: Pick<AppLayoutProps, 'actions' | 'composer' | 'progress' | 'transcript'> & { nativeMode: boolean }) {
   const ui = useStore($uiState)
   const petEnabled = useStore($petEnabled)
-  const railCols = useAmbientRailWidth('left') + useAmbientRailWidth('right') + petColumnWidth(petEnabled, composer.cols)
+  const petParty = useStore($petParty)
+  const railCols =
+    useAmbientRailWidth('left') + useAmbientRailWidth('right') + petColumnWidth(petEnabled, composer.cols, petParty)
   const bodyCols = Math.max(28, composer.cols - railCols)
 
   // LiveTodoPanel rides as a child of the latest user-message row so it

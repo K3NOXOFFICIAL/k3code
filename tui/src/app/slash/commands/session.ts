@@ -15,7 +15,7 @@ import type { PanelSection } from '../../../types.js'
 import { applyConfiguredTuiTheme } from '../../createGatewayEventHandler.js'
 import { DEFAULT_INDICATOR_STYLE, INDICATOR_STYLES, type IndicatorStyle } from '../../interfaces.js'
 import { patchOverlayState } from '../../overlayStore.js'
-import { $petEnabled, $petName, petConfigValue, setPetEnabled, setPetName } from '../../petStore.js'
+import { $petEnabled, $petName, $petParty, petConfigValue, setPetEnabled, setPetName, setPetParty } from '../../petStore.js'
 import { patchUiState } from '../../uiStore.js'
 import type { SlashCommand } from '../types.js'
 
@@ -335,12 +335,12 @@ export const sessionCommands: SlashCommand[] = [
   },
 
   {
-    help: 'terminal pet: /pet [on|off|toggle|status|random|<name>]',
+    help: 'terminal pet: /pet [on|off|toggle|status|random|party|solo|<name>]',
     name: 'pet',
-    usage: '/pet [on|off|toggle|status|random|<name>]',
+    usage: '/pet [on|off|toggle|status|random|party|solo|<name>]',
     run: (arg, ctx) => {
       const word = arg.trim().toLowerCase()
-      const result = parsePetCommand(arg, { enabled: $petEnabled.get(), name: $petName.get() })
+      const result = parsePetCommand(arg, { enabled: $petEnabled.get(), name: $petName.get(), party: $petParty.get() })
 
       if (result.enabled !== undefined) {
         setPetEnabled(result.enabled)
@@ -350,7 +350,12 @@ export const sessionCommands: SlashCommand[] = [
         setPetName(result.name)
       }
 
-      if (result.enabled !== undefined || result.name !== undefined) {
+      if (result.party !== undefined) {
+        setPetParty(result.party)
+      }
+
+      // Party is a session choice and is not saved; the saved value keeps the pinned pet.
+      if ((result.enabled !== undefined || result.name !== undefined) && result.party === undefined) {
         // Pin the species only when the user named one; `random` re-rolls on every launch.
         const value = petConfigValue($petEnabled.get(), word === result.name ? result.name : null)
 
@@ -358,8 +363,9 @@ export const sessionCommands: SlashCommand[] = [
       }
 
       const narrow = $petEnabled.get() && (process.stdout.columns ?? 0) < PET_MIN_COLS
+      const hint = $petParty.get() ? `two or three pets at ${PET_MIN_COLS}+ columns` : `shown at ${PET_MIN_COLS}+ columns`
 
-      ctx.transcript.sys(narrow ? `${result.message} (shown at ${PET_MIN_COLS}+ columns)` : result.message)
+      ctx.transcript.sys(narrow ? `${result.message} (${hint})` : result.message)
     }
   },
 

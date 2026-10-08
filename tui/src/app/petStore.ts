@@ -11,7 +11,13 @@ export const $petEnabled = atom(true)
 /** Chosen at random when the TUI starts. */
 export const $petName = atom<PetName>(pickPet())
 
+/** `/pet party`: the pet and its neighbours in the pet list show side by side (two or
+ *  three pets on a wide terminal). Not saved: a launch starts solo. */
+export const $petParty = atom(false)
+
 export const setPetEnabled = (enabled: boolean) => $petEnabled.set(enabled)
+
+export const setPetParty = (party: boolean) => $petParty.set(party)
 
 export const setPetName = (name: PetName) => $petName.set(name)
 

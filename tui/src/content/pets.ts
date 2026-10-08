@@ -36,6 +36,13 @@ const BLOB_BLINK: PetFrame = ['  .-.  ', ' (- -) ', " '---' "]
 const CAT: PetFrame = [' /\\_/\\', '( o.o )', ' > ^ < ']
 const CAT_BLINK: PetFrame = [' /\\_/\\', '( -.- )', ' > ^ < ']
 
+/** The burst under the pet when a turn finishes: two frames, alternating while the
+ *  pet holds its done pose. Wider than the art (the quip column), still plain ASCII. */
+export const PET_CELEBRATION: readonly PetFrame[] = [
+  ['*  *  *  *', ' \\ | | / ', '  done!    '],
+  [' *  *  *  ', ' / | | \\ ', '  done!    ']
+]
+
 export const PETS: Record<PetName, PetStates> = {
   blob: {
     done: [
