@@ -20,7 +20,7 @@ import {
 // asserts the message names what happened and cites the real next step.
 
 describe('describeTurnFailure', () => {
-  it('turns an auth error_surface into a plain title, a Details line and the /model + /retry hint', () => {
+  it('turns an auth error_surface into a plain title, a Details line and the k3code onboard hint', () => {
     const raw =
       'Error code: 401 - {"error": {"message": "Incorrect API key provided", "type": "invalid_request_error"}}'
 
@@ -36,7 +36,7 @@ describe('describeTurnFailure', () => {
     expect(title).not.toMatch(/Error code|401|\{/)
     expect(details).toMatch(/^Details: /)
     expect(details).toContain('Incorrect API key provided')
-    expect(text).toContain('/model')
+    expect(text).toContain('k3code onboard')
     expect(text).toContain('/retry')
   })
 

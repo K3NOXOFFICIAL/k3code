@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any
 
 from k3code import confio
+from k3code import skills as skills_mod
+from k3code._version import __version__
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, autonomy_cfg
@@ -79,6 +81,7 @@ from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router
 from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
+from k3code.tools import build_registry as build_tool_registry
 from k3code.tools import clip_head_tail
 from k3code.usage import UsageDB
 
@@ -109,6 +112,8 @@ class LiveSession:
         self.system_prompt = _load_system_prompt()  # base prompt; per-turn extras via build_system_prompt
         self.loop: AgentLoop | None = None
         self.turn_task: asyncio.Task[None] | None = None
+        self._tools_cache: dict[str, list[str]] | None = None  # banner info, see live_info
+        self._skills_cache: dict[str, list[str]] | None = None
         self.streaming = False
         #: Serializes whole turns of this session (two prompts, a loop tick and a prompt, ... never interleave two
         #: AgentLoops on one conversation) and unattended runs' set-up/tear-down (see ServerRunner.run_prompt).
@@ -227,8 +232,13 @@ class LiveSession:
     def live_info(self) -> dict[str, Any]:
         """SessionLiveInfo payload for session.create/resume/activate results."""
         config = self.server.config
+        key = self.stored.model or config.default_model
         return {
-            "model": self.stored.model or config.default_model,
+            "model": _model_label(config, key),
+            "model_key": key,
+            "version": __version__,
+            "tools": self._tools_info(),
+            "skills": self._skills_info(),
             "provider": self.stored.provider,
             "reasoning_effort": self.reasoning_effort,
             "approval_mode": self.perms.mode.value,
@@ -243,6 +253,85 @@ class LiveSession:
             "paused": self.paused,
             "background": self.background,
         }
+
+
+    def _tools_info(self) -> dict[str, list[str]]:
+        """Tool names by group for the TUI's banner (built once per session; MCP tools are added live)."""
+        if self._tools_cache is None:
+            reg = build_tool_registry()
+            register_skill_tool(reg, self.perms.cwd, list(self.server.config.skills.roots))
+            register_web_tools(reg, self.server.config)
+            register_task_tools(reg, self.server, self, depth=1)
+            groups: dict[str, list[str]] = {}
+            for name in reg.names():
+                groups.setdefault(_TOOL_GROUPS.get(name, "agent"), []).append(name)
+            self._tools_cache = groups
+        out = dict(self._tools_cache)
+        mcp = [t.qualified for t in self.server.mcp.tools()] if self.server.mcp else []
+        if mcp:
+            out["mcp"] = mcp
+        return out
+
+    def _skills_info(self) -> dict[str, list[str]]:
+        if self._skills_cache is None:
+            try:
+                found = skills_mod.discover(self.perms.cwd, list(self.server.config.skills.roots))
+            except OSError:
+                found = []
+            self._skills_cache = {"skills": sorted(sk.name for sk in found)} if found else {}
+        return self._skills_cache
+
+
+#: ChainExhausted.last_reason -> the TUI's turn-failure code (tui/src/app/userMessages.ts TURN_CODE_COPY).
+_FAILURE_CODES = {
+    "auth": "auth",
+    "quota": "billing",
+    "rate_limit": "rate_limit",
+    "bad_request": "model_not_found",
+    "timeout": "timeout",
+    "server": "server_error",
+    "context_overflow": "context_overflow",
+}
+
+
+def _error_surface(exc: BaseException | None) -> dict[str, Any] | None:
+    """What the TUI needs to explain a failed turn: a code it has copy for, and whether /retry can help."""
+    if isinstance(exc, AllProvidersUnreachable):
+        return {"layer": "endpoint", "retryable": True}
+    if isinstance(exc, ContextOverflow):
+        return {"code": "context_overflow", "retryable": True}
+    if isinstance(exc, ChainExhausted):
+        reason = exc.last_reason or "unknown"
+        surface: dict[str, Any] = {"layer": "provider", "retryable": reason not in ("auth", "bad_request")}
+        if reason in _FAILURE_CODES:
+            surface["code"] = _FAILURE_CODES[reason]
+        return surface
+    if isinstance(exc, DiskGuardFull):
+        return {"layer": "disk", "retryable": True}
+    return {"layer": "gateway", "retryable": True} if exc is not None else None
+
+
+_TOOL_GROUPS = {
+    "read": "files",
+    "write": "files",
+    "edit": "files",
+    "glob": "files",
+    "grep": "files",
+    "bash": "shell",
+    "todo": "planning",
+    "exit_plan": "planning",
+    "web_search": "web",
+    "web_fetch": "web",
+}
+
+
+def _model_label(config: Any, key: str) -> str:
+    """The model id the first provider uses for ``key`` (what the user recognises), else the key itself."""
+    specs = _resolve_model_specs(config, key) if config.providers else []
+    first = specs[0] if specs else ""
+    if isinstance(first, list):
+        first = first[0] if first else ""
+    return str(first or key)
 
 
 #: Conversation size at which a session's older messages are folded into a summary, and how many recent ones stay.
@@ -1010,7 +1099,9 @@ class GatewayServer:
                 },
             )
         elif event.kind == "router.exhausted":
-            self.emit("error", {"message": f"All providers failed: {event.detail}"})
+            # No error event here: the failed turn's message.complete reports it once, with the next step
+            # (error_surface). A walk that is retried after a pause or park must not leave a stale error behind.
+            self.emit("status.update", {"kind": "status", "text": f"all providers failed ({event.reason})"})
 
     #: Notification key shared by pause/park toasts so ``resumed`` can clear them.
     PAUSE_KEY = "k3.reliability.pause"
@@ -1298,8 +1389,7 @@ class GatewayServer:
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)
-            session.last_exc = e
-            session.emit("error", {"message": str(e)})
+            session.last_exc = e  # message.complete carries it with error_surface; no separate error toast
         except BudgetExceeded as e:
             # The reliability event already told the client (error + needs_input).
             status = "needs_input"
@@ -1347,6 +1437,7 @@ class GatewayServer:
                 "usage": _usage_payload(usage),
                 "status": status,
                 "error": error,
+                "error_surface": _error_surface(session.last_exc) if status == "error" else None,
                 "state": session.state,
             },
         )
