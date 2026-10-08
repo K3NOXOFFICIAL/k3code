@@ -52,14 +52,16 @@ def headless_fake() -> None:
     emit(M, "k3code finishes a headless read/edit/bash task (mechanics)",
          "`k3code -p ... --permission yolo` in a temp project with K3CODE_FAKE_PROVIDER scripting read+edit+bash; "
          "asserts app.py edited and out.txt produced by the bash step", "PASS" if ok else "FAIL",
-         f"rc={rc} app.py={(proj / 'app.py').read_text()!r} out.txt={(proj / 'out.txt').read_text() if (proj / 'out.txt').exists() else 'MISSING'!r}\n{out}")
+         f"rc={rc} app.py={(proj / 'app.py').read_text()!r} "
+         f"out.txt={(proj / 'out.txt').read_text() if (proj / 'out.txt').exists() else 'MISSING'!r}\n{out}")
 
 
 def headless_live() -> None:
     crit = "k3code finishes a read/edit/bash task with a live model (the plan said: through OmniRoute)"
     backend = live_backend()
     if not backend["ok"]:
-        emit(M, crit, f"live `k3code -p`; {backend['label']}", "PENDING", f"live model unavailable: {backend['detail']}",
+        emit(M, crit, f"live `k3code -p`; {backend['label']}", "PENDING",
+             f"live model unavailable: {backend['detail']}",
              "Log in to Claude Code (`claude`), or set K3_ALLOW_OMNIROUTE=1 with a working OmniRoute key; "
              "then rerun `scripts/exit/run_all.sh --only m0`")
         return
@@ -90,7 +92,8 @@ def failover() -> None:
         proj.mkdir(parents=True)
         (home / "config.yaml").write_text(
             "providers:\n"
-            "  - {name: primary, kind: openai, base_url: 'http://127.0.0.1:9/v1', api_key_env: K, models: {default: m}}\n"
+            "  - {name: primary, kind: openai, base_url: 'http://127.0.0.1:9/v1', "
+            "api_key_env: K, models: {default: m}}\n"
             f"  - {{name: secondary, kind: openai, base_url: 'http://127.0.0.1:{up}/v1', api_key_env: K, "
             "models: {default: m}}\n"
             "reliability: {flags: {netwatch: false}}\n")
@@ -133,7 +136,7 @@ for fn in (headless_fake, headless_live, failover, vendor, hermes_untouched):
         continue
     try:
         fn()
-    except Exception as e:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         import traceback
         emit(M, fn.__name__, "crashed", "FAIL", traceback.format_exc())
 shutil.rmtree(TMP, ignore_errors=True)

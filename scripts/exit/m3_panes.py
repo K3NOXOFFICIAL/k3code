@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -114,7 +113,8 @@ def live_checks(tmp: Path) -> None:
             else:
                 lines.append(f"{st}: never observed (seen={list(seen)}, sent={list(sent)})")
                 worst = 99
-        emit(M, "Pane badges update within 1 s", how_live + "; latency = gateway state report -> list-agents poll (20 ms)",
+        emit(M, "Pane badges update within 1 s",
+             how_live + "; latency = gateway state report -> list-agents poll (20 ms)",
              "PASS" if worst < 1.0 else "FAIL", "\n".join(lines) + f"\nworst {worst * 1000:.0f} ms")
 
         # --- Inbox approval
@@ -160,9 +160,11 @@ def live_checks(tmp: Path) -> None:
 
 def main() -> None:
     rc, out = go("-count=1 ./internal/k3keys/ ./internal/harness/")
-    emit(M, "go test passes for k3keys and harness", "cd panes && go test -count=1 ./internal/k3keys/ ./internal/harness/",
+    emit(M, "go test passes for k3keys and harness",
+         "cd panes && go test -count=1 ./internal/k3keys/ ./internal/harness/",
          "PASS" if rc == 0 else "FAIL", out)
-    rc, out = go("-count=1 -v -run 'TestHintsPerMode|TestModeLabel|TestAgentsModeKeys|TestEscFromEveryMode' ./internal/k3keys/")
+    rc, out = go("-count=1 -v -run "
+                 "'TestHintsPerMode|TestModeLabel|TestAgentsModeKeys|TestEscFromEveryMode' ./internal/k3keys/")
     emit(M, "Hint bar is always correct", "k3keys tests: every mode has hints with key+label, essential esc in each "
          "non-typing mode, lock suffix, chooser lists all modes (TestHintsPerMode et al., -v)",
          "PASS" if rc == 0 and "--- PASS: TestHintsPerMode" in out else "FAIL",
@@ -178,7 +180,8 @@ def main() -> None:
     emit(M, "Upstream tuios tests pass with keymap=tuios",
          "cd panes && go test ./internal/input/ ./internal/app/ ./internal/harness/ (the packages the k3 hooks touch; "
          "cmd/tuios and internal/federation are excluded: their remote-sync tests recurse without bound)",
-         "PASS" if rc == 0 else "FAIL", f"{npass} packages ok, {len(fails)} failing\n" + "\n".join(fails[:5]) + "\n" + tail(out, 3))
+         "PASS" if rc == 0 else "FAIL",
+         f"{npass} packages ok, {len(fails)} failing\n" + "\n".join(fails[:5]) + "\n" + tail(out, 3))
     tmp = Path(tempfile.mkdtemp(prefix="m3-exit-"))
     try:
         live_checks(tmp)

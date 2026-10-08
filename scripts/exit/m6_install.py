@@ -1,11 +1,11 @@
 """M6 exit checks: fresh-container install, --from-bundle, resumable setup, update rollback, upstream sync dry run."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -48,7 +48,8 @@ def k3(home: Path, *args: str, **kw: object) -> tuple[int, str]:
 
 
 def fresh_install() -> None:
-    how = f"podman run {IMAGE}: dnf basics, cp /src to /tmp/k3code, install.sh --from-source --yes --no-setup, k3code setup --non-interactive --no-probe, k3code doctor"
+    how = (f"podman run {IMAGE}: dnf basics, cp /src to /tmp/k3code, install.sh --from-source --yes "
+           f"--no-setup, k3code setup --non-interactive --no-probe, k3code doctor")
     if not shutil.which("podman"):
         return emit("M6", "Fresh install in a fresh Fedora 44 container", how, "PENDING", "podman not installed",
                     "run scripts/exit/m6_install.py on a host with podman")
@@ -58,7 +59,8 @@ def fresh_install() -> None:
     with open(log, "w") as f:
         try:
             p = subprocess.run(["podman", "run", "--rm", "-v", f"{REPO}:/src:ro,Z", "-v", f"{inner}:/inner.sh:ro,Z",
-                                IMAGE, "sh", "/inner.sh"], stdout=f, stderr=subprocess.STDOUT, timeout=2400, check=False)
+                                IMAGE, "sh", "/inner.sh"], stdout=f, stderr=subprocess.STDOUT,
+                                timeout=2400, check=False)
             rc = p.returncode
         except subprocess.TimeoutExpired:
             rc = 124
@@ -66,7 +68,9 @@ def fresh_install() -> None:
     m = re.search(r"TOTAL_SECS=(\d+)", text)
     srcs = re.search(r"INSTALL_SECS=(\d+)", text)
     dr = re.search(r"DOCTOR_RC=(\d+)", text)
-    ev = f"podman rc={rc}; " + (f"install {srcs.group(1)}s, install+setup {m.group(1)}s; " if m and srcs else "") + tail(text, 5)
+    ev = (f"podman rc={rc}; "
+          + (f"install {srcs.group(1)}s, install+setup {m.group(1)}s; " if m and srcs else "")
+          + tail(text, 5))
     setup_ok = "SETUP_RC=0" in text and "INSTALL_RC=0" in text
     if m and setup_ok and dr:
         secs = int(m.group(1))
@@ -79,20 +83,26 @@ def fresh_install() -> None:
         ok = secs < 600 and not unexpected
         emit("M6", "Fresh install in a fresh Fedora 44 container (<10 min incl. setup, doctor passes)", how,
              "PASS" if ok else "FAIL", ev)
-    elif re.search(r"(Could not resolve|Failed to download|curl: \(|Temporary failure|Cannot download|No route)", text) or "DNF_FAIL" in text:
+    elif re.search(r"(Could not resolve|Failed to download|curl: \(|Temporary failure|Cannot download|"
+                   r"No route)", text) or "DNF_FAIL" in text:
         emit("M6", "Fresh install in a fresh Fedora 44 container", how, "PENDING", ev,
-             "rerun scripts/exit/m6_install.py with working network to the container (dnf, astral.sh, nodejs.org, go.dev)")
+             "rerun scripts/exit/m6_install.py with working network to the container "
+             "(dnf, astral.sh, nodejs.org, go.dev)")
     else:
         emit("M6", "Fresh install in a fresh Fedora 44 container", how, "FAIL", ev)
 
 
 def bundle_restore() -> None:
-    how = "temp HOME A: setup+session+`k3code export`; temp HOME B: `install.sh --from-source --from-bundle` (real venv, no tui/go build), check config+session restored, secrets redacted"
+    how = ("temp HOME A: setup+session+`k3code export`; temp HOME B: "
+           "`install.sh --from-source --from-bundle` (real venv, no tui/go build), "
+           "check config+session restored, secrets redacted")
     sys.path.insert(0, str(CORE / "src"))
     with tempfile.TemporaryDirectory(prefix="m6b-") as t:
         a, b = Path(t, "a"), Path(t, "b")
-        a.mkdir(); b.mkdir()
-        rc, out = k3(a, "setup", "--non-interactive", "--answers", str(REPO / "install/answers.sample.yaml"), "--no-probe")
+        a.mkdir()
+        b.mkdir()
+        rc, out = k3(a, "setup", "--non-interactive", "--answers", str(REPO / "install/answers.sample.yaml"),
+                     "--no-probe")
         if rc != 0:
             return emit("M6", "--from-bundle restore", how, "FAIL", "setup in home A: " + out)
         code = ("from k3code.gateway.sessions import SessionStore;from pathlib import Path;import os;"
@@ -122,11 +132,13 @@ def bundle_restore() -> None:
             listing = o2
         emit("M6", "--from-bundle restore (config + sessions restored, secrets not in bundle)", how,
              "PASS" if ok and has_sess and not secret else "FAIL",
-             f"install rc={rc}, config restored={cfg.is_file()}, secret leaked={secret}, sessions in B: {listing.strip()[:150]}\n{tail(out, 3)}")
+             f"install rc={rc}, config restored={cfg.is_file()}, secret leaked={secret}, "
+             f"sessions in B: {listing.strip()[:150]}\n{tail(out, 3)}")
 
 
 def interrupted_setup() -> None:
-    how = "real CLI: interactive `k3code setup` killed with SIGINT mid-step (stdin held open), then re-run with --answers; plus pytest test_resume_after_interrupt"
+    how = ("real CLI: interactive `k3code setup` killed with SIGINT mid-step (stdin held open), "
+           "then re-run with --answers; plus pytest test_resume_after_interrupt")
     with tempfile.TemporaryDirectory(prefix="m6s-") as t:
         h = Path(t)
         # The real wizard needs a terminal (prompt_toolkit ignores piped stdin), so drive it through a pty:
@@ -159,10 +171,8 @@ def interrupted_setup() -> None:
                     break
             child.sendintr()
             time.sleep(2)
-            try:
+            with contextlib.suppress(Exception):
                 out1 += child.read_nonblocking(65536, timeout=3)
-            except Exception:  # noqa: BLE001
-                pass
             child.close(force=True)
         except Exception as e:  # noqa: BLE001
             child.close(force=True)
@@ -174,10 +184,12 @@ def interrupted_setup() -> None:
 
         p = _P()
         interrupted = "Interrupted; progress saved" in out1 or p.returncode in (130, -2, 2, 128 + 2)
-        rc2, out2 = k3(h, "setup", "--non-interactive", "--answers", str(REPO / "install/answers.sample.yaml"), "--no-probe")
+        rc2, out2 = k3(h, "setup", "--non-interactive", "--answers",
+                       str(REPO / "install/answers.sample.yaml"), "--no-probe")
         resumed = "Resuming at step" in out2
         cfg = (h / ".k3code" / "config.yaml").is_file()
-        rc3, out3 = run(["uv", "run", "--quiet", "pytest", "-q", "--color=no", "-p", "no:cacheprovider", "tests/test_setup.py", "-k", "resume"], cwd=CORE, timeout=300)
+        rc3, out3 = run(["uv", "run", "--quiet", "pytest", "-q", "--color=no", "-p", "no:cacheprovider",
+                         "tests/test_setup.py", "-k", "resume"], cwd=CORE, timeout=300)
         ok = interrupted and saved >= 2 and resumed and rc2 == 0 and cfg and rc3 == 0
         emit("M6", "Interrupted setup resumes", how, "PASS" if ok else "FAIL",
              f"sigint rc={p.returncode} interrupted={interrupted} steps saved before the interrupt={saved}; "
@@ -185,20 +197,27 @@ def interrupted_setup() -> None:
 
 
 def broken_update() -> None:
-    how = "real CLI `k3code update --from-source --yes` in temp K3CODE_DATA: staged version fails its smoke test -> current untouched; `update --rollback`; plus pytest test_update.py (daemon-unhealthy rollback)"
+    how = ("real CLI `k3code update --from-source --yes` in temp K3CODE_DATA: staged version fails its "
+           "smoke test -> current untouched; `update --rollback`; plus pytest test_update.py "
+           "(daemon-unhealthy rollback)")
     with tempfile.TemporaryDirectory(prefix="m6u-") as t:
-        h = Path(t, "home"); h.mkdir()
+        h = Path(t, "home")
+        h.mkdir()
         data = h / "data"
         def mk(ver: str, ok: bool) -> None:
             exe = data / "versions" / ver / "venv" / "bin" / "k3code"
             exe.parent.mkdir(parents=True)
-            exe.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "k3code, version %s"; exit %d; fi\n'
-                           'echo \'{"summary":{"ok":1,"warn":0,"fail":0},"checks":[]}\'\n' % (ver, 0 if ok else 3))
+            code = 0 if ok else 3
+            exe.write_text(f'#!/bin/sh\nif [ "$1" = "--version" ]; then '
+                           f'echo "k3code, version {ver}"; exit {code}; fi\n'
+                           f'echo \'{{"summary":{{"ok":1,"warn":0,"fail":0}},"checks":[]}}\'\n')
             exe.chmod(0o755)
-        mk("1.0.0", True); mk("2.0.0", False)
+        mk("1.0.0", True)
+        mk("2.0.0", False)
         (data / "current").symlink_to(data / "versions" / "1.0.0")
         # source checkout with a shim installer that "stages" the broken 2.0.0 and a remote to pull from
-        origin = Path(t, "origin.git"); src = Path(t, "src")
+        origin = Path(t, "origin.git")
+        src = Path(t, "src")
         run(["git", "init", "-q", "--bare", "-b", "main", str(origin)])
         run(["git", "init", "-q", "-b", "main", str(src)])
         (src / "install").mkdir()
@@ -212,27 +231,31 @@ def broken_update() -> None:
         stayed = cur == "1.0.0" and rc != 0 and "smoke test failed" in out
         # now make 2.0.0 healthy-looking at the smoke test but force a manual rollback path
         mk_fix = data / "versions" / "2.0.0" / "venv" / "bin" / "k3code"
-        mk_fix.write_text(mk_fix.read_text().replace("exit 3", "exit 0")); 
+        mk_fix.write_text(mk_fix.read_text().replace("exit 3", "exit 0"))
         rc2, out2 = k3(h, "update", "--from-source", "--yes")
         switched = (data / "current").resolve().name == "2.0.0"
         rc3, out3 = k3(h, "update", "--rollback")
         back = (data / "current").resolve().name == "1.0.0"
-    rc4, out4 = run(["uv", "run", "--quiet", "pytest", "-q", "--color=no", "-p", "no:cacheprovider", "tests/test_update.py"], cwd=CORE, timeout=300)
+    rc4, out4 = run(["uv", "run", "--quiet", "pytest", "-q", "--color=no", "-p", "no:cacheprovider",
+                     "tests/test_update.py"], cwd=CORE, timeout=300)
     ok = stayed and switched and back and rc4 == 0
     emit("M6", "A broken update rolls back (broken version never becomes current; rollback restores previous)", how,
          "PASS" if ok else "FAIL",
-         f"broken: rc={rc} current stayed 1.0.0={stayed} ({tail(out, 1)}); fixed update switched={switched}; rollback={back} ({tail(out3, 1)}); pytest rc={rc4}: {tail(out4, 1)}")
+         f"broken: rc={rc} current stayed 1.0.0={stayed} ({tail(out, 1)}); fixed update switched={switched}; "
+         f"rollback={back} ({tail(out3, 1)}); pytest rc={rc4}: {tail(out4, 1)}")
 
 
 def upstream_sync() -> None:
     crit = ("Upstream sync: mergeable subtrees have <10 conflicting files; the Hermes TUI is a documented frozen fork")
-    how = ("scripts/sync-upstream.sh --dry-run: git fetch tuios + hermes-agent upstream HEAD into temp bare repos, 3-way "
+    how = ("scripts/sync-upstream.sh --dry-run: git fetch tuios + hermes-agent upstream HEAD into temp "
+           "bare repos, 3-way "
            "blob diff vs recorded base commits; the frozen fork (hermes-agent:tui) is reported, not counted; "
            "docs/UPSTREAM.md must document the policy and the cherry-pick procedure")
     rc, out = run(["sh", str(REPO / "scripts/sync-upstream.sh"), "--dry-run"], timeout=1500)
     (LOGS / "m6_sync.log").write_text(out)
     if rc == 3:
-        return emit("M6", crit, how, "PENDING", out, "rerun scripts/sync-upstream.sh --dry-run with network access to github.com")
+        return emit("M6", crit, how, "PENDING", out,
+                    "rerun scripts/sync-upstream.sh --dry-run with network access to github.com")
     doc = REPO / "docs" / "UPSTREAM.md"
     doc_ok = doc.is_file() and all(w in doc.read_text() for w in ("Frozen fork", "Cherry-picking", "Merging TUIOS"))
     frozen_reported = "FROZEN FORK" in out

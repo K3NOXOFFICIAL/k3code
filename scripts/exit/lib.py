@@ -31,7 +31,8 @@ def emit(milestone: str, criterion: str, how: str, status: str, evidence: str, c
     print(f"[{status}] {milestone}: {criterion}", file=sys.stderr)
 
 
-def run(cmd: str | list[str], cwd: Path | str | None = None, env: dict | None = None, timeout: int = 600) -> tuple[int, str]:
+def run(cmd: str | list[str], cwd: Path | str | None = None, env: dict | None = None,
+        timeout: int = 600) -> tuple[int, str]:
     """Run a command, return (rc, combined output). Never raises on failure/timeout."""
     try:
         p = subprocess.run(cmd, shell=isinstance(cmd, str), cwd=cwd, env=env, capture_output=True, text=True,
@@ -43,7 +44,8 @@ def run(cmd: str | list[str], cwd: Path | str | None = None, env: dict | None = 
 
 LIVE_DEFAULT_MODEL = "claude-sonnet-5-5"
 LIVE_CHEAP_MODEL = "claude-haiku-4-5-20251001"
-CLAUDE_CLI_LABEL = "live Claude Sonnet 5.5 (cheap tier: Haiku 4.5) via the claude-cli provider; OmniRoute paused by owner"
+CLAUDE_CLI_LABEL = ("live Claude Sonnet 5.5 (cheap tier: Haiku 4.5) via the claude-cli provider; "
+                    "OmniRoute paused by owner")
 
 
 def live_backend() -> dict:
@@ -54,7 +56,8 @@ def live_backend() -> dict:
     """
     if os.environ.get("K3_ALLOW_OMNIROUTE") == "1":
         ok, detail = omniroute_quota()
-        return {"kind": "omniroute", "ok": ok, "detail": detail, "label": f"live OmniRoute {OMNI_AGENT_MODEL} (cheap tier auto/coding-cheap)"}
+        return {"kind": "omniroute", "ok": ok, "detail": detail,
+                "label": f"live OmniRoute {OMNI_AGENT_MODEL} (cheap tier auto/coding-cheap)"}
     import shutil
 
     path = shutil.which("claude")
@@ -106,8 +109,8 @@ def live_chat(backend: dict, messages: list[dict], max_tokens: int = 400) -> str
     async def go() -> str:
         provider = ClaudeCliProvider(name="claude-code")
         try:
-            events = [e async for e in provider.stream([Message(role=m["role"], content=m["content"]) for m in messages],
-                                                       [], LIVE_CHEAP_MODEL)]
+            events = [e async for e in provider.stream(
+                [Message(role=m["role"], content=m["content"]) for m in messages], [], LIVE_CHEAP_MODEL)]
         finally:
             await provider.aclose()
         done = events[-1].message

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -38,10 +39,8 @@ class Procs:
         return p
 
     def kill(self, p: subprocess.Popen, sig: int = signal.SIGTERM) -> None:
-        try:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(p.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            pass
         try:
             p.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -116,7 +115,8 @@ class Peer:
         self._n += 1
         fut = asyncio.get_running_loop().create_future()
         self._pending[self._n] = fut
-        self.w.write((json.dumps({"jsonrpc": "2.0", "id": self._n, "method": method, "params": params}) + "\n").encode())
+        self.w.write((json.dumps({"jsonrpc": "2.0", "id": self._n, "method": method,
+                                  "params": params}) + "\n").encode())
         await self.w.drain()
         return await asyncio.wait_for(fut, timeout)
 
