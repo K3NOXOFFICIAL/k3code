@@ -886,13 +886,14 @@ class GatewayServer:
 
         try:
             result = await handler(self, params)
+            reply = encode_response(req_id, result)  # inside the try: a result that does not encode still answers
         except _InvalidParams as e:
             self._reply(client, encode_error(req_id, INVALID_PARAMS, str(e)))
         except Exception as e:  # noqa: BLE001 - one bad method must not kill the gateway
             logger.exception("method %s failed", method)
             self._reply(client, encode_error(req_id, INTERNAL_ERROR, f"{type(e).__name__}: {e}"))
         else:
-            self._reply(client, encode_response(req_id, result))
+            self._reply(client, reply)
 
     def _resolve_server_request(self, req_id: Any, obj: dict[str, Any]) -> None:
         self._open_requests.pop(str(req_id), None)
@@ -2322,13 +2323,16 @@ async def _session_mode_set(server: GatewayServer, params: dict[str, Any]) -> di
 
 async def _config_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     key = str(_require(params, "key"))
-    if key == "full":
-        return {"config": redact(server.config.model_dump())}  # provider api_key never goes to clients
     if key == "mtime":
         return {"mtime": 0.0}
-    value: Any = server.config
+    # Every key is looked up in the redacted JSON dump: provider api_key, mcp server env/headers never go to clients,
+    # and a section ("providers", "mcp.servers") is plain JSON. Before, a sub-key returned the pydantic object (the
+    # reply failed to encode and never came) or a secret unredacted ("mcp.servers.x.headers").
+    value: Any = redact(server.config.model_dump(mode="json"))
+    if key == "full":
+        return {"config": value}
     for part in key.split("."):
-        value = getattr(value, part, None) if not isinstance(value, dict) else value.get(part)
+        value = value.get(part) if isinstance(value, dict) else None
         if value is None:
             break
     return {"value": value}
