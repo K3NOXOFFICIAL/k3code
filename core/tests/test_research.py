@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -565,3 +566,33 @@ async def test_sources_per_topic_zero_still_produces_sources(tmp_path, monkeypat
     await call(server, "session.create", {"cwd": str(tmp_path)})
     res = await server.research.run(server.session, "q", n_sub=1)
     assert res.state.sources, "sources_per_topic 0 spilled every hit"
+
+
+class _Registry:
+    """Records the agent tools that ``register_web_tools`` registers, by name."""
+
+    def __init__(self) -> None:
+        self.handlers: dict[str, Any] = {}
+
+    def register(self, spec, fn) -> None:
+        self.handlers[spec.name] = fn
+
+
+@respx.mock
+async def test_loaded_research_searxng_url_enables_agent_web_search(tmp_path, monkeypatch):
+    """The wizard's answer, read back by load_config(), must reach web_search (it used to say 'disabled')."""
+    from k3code import confio
+    from k3code.config import load_config
+    from k3code.paths import user_config_path
+    from k3code.research.tools import register_web_tools
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    confio.write_yaml(user_config_path(), {"research": {"searxng_url": "http://searx.test"}})
+    respx.get("http://searx.test/search").mock(
+        return_value=httpx.Response(200, json={"results": [{"title": "T", "url": "http://p.test/1", "content": "c"}]})
+    )
+    reg = _Registry()
+    register_web_tools(reg, load_config())
+    out = await reg.handlers["web_search"]({"query": "anything"})
+    assert "disabled" not in out.get("error", "")
+    assert "http://p.test/1" in out["content"]

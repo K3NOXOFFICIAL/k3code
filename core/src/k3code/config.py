@@ -140,6 +140,22 @@ class Settings(BaseModel):
     research: dict[str, Any] = Field(default_factory=dict)
     # Context management: {compact_at_tokens: 80000, keep_messages: 8}; see GatewayServer._maybe_compact
     context: dict[str, Any] = Field(default_factory=dict)
+    # Browser for web tools: {cdp_url: ""} (empty = off, never attach to a running browser by default)
+    browser: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lift_legacy_searxng(cls, data: Any) -> Any:
+        """The setup wizard used to write a top-level ``searxng: {url}``, which no code read. Move it to
+        ``research.searxng_url`` so existing configs keep working; an explicit research value wins."""
+        if isinstance(data, dict) and isinstance(data.get("searxng"), dict):
+            data = dict(data)
+            legacy = data.pop("searxng")
+            research = dict(data.get("research") or {})
+            if legacy.get("url") and not research.get("searxng_url"):
+                research["searxng_url"] = legacy["url"]
+            data["research"] = research
+        return data
 
 
 def _current_home() -> Path:
