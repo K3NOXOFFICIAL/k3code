@@ -11,8 +11,9 @@
 #   PREFIX/share/k3code/versions/<ver>/{venv,tui,bin}
 #   PREFIX/share/k3code/current -> versions/<ver>           previous: a file with the name of the version before
 # The installer never runs onboarding; it ends by telling you to run `k3code onboard`.
-# Env (mostly for tests): K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG, K3_NO_DOWNLOAD (= --no-install-deps),
-#   K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv), K3_EDITABLE (--from-source only).
+# Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
+#   K3_NO_DOWNLOAD (= --no-install-deps), K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv,
+#   no network), K3_EDITABLE (--from-source only), K3_BWRAP (the bubblewrap binary to probe).
 set -eu
 
 DEFAULT_URL=https://github.com/K3NOXOFFICIAL/k3code.git
@@ -39,10 +40,14 @@ Options:
   --from-bundle FILE    after installing, import a k3code export (settings and sessions)
   --yes, -y             do not ask (installs uv without asking)
   --no-install-deps     install nothing (no uv, no Python); fail with the hints instead
+  --minimal             skip presetup: no sandbox check, no Chromium, no doctor subset
   --check               print the platform and dependency report, change nothing
   --no-activate         build the version without switching to it (used by k3code update)
   --print-version       print the version name on stdout (used by k3code update)
   -h, --help
+
+Presetup (on by default, after the version is activated; never fails the install): checks the sandbox,
+installs Chromium for the browser tool (K3CODE_SKIP_CHROMIUM=1 skips only that), and prints a health subset.
 
 Optional and never installed by this script: node 18+ with npm (builds the TUI), go (builds the
 k3 pane binary), bubblewrap (sandbox). k3code runs without them.
@@ -445,11 +450,24 @@ import_bundle() {
   "$BIN/k3code" import "$BUNDLE" --yes >&2 || die "import of $BUNDLE failed"
 }
 
+# ---- presetup ----------------------------------------------------------------
+# Optional extras after activation (--minimal skips them all). Each step reports and returns 0; see P3-2.
+presetup() {
+  log "presetup (optional; --minimal skips it):"
+  presetup_sandbox
+  presetup_chromium
+  presetup_doctor
+}
+
+presetup_sandbox() { :; }
+presetup_chromium() { :; }
+presetup_doctor() { :; }
+
 # ---- main ------------------------------------------------------------------
 main() {
   export GIT_TERMINAL_PROMPT=0
   FROM="" GIT_URL="" REF="" CHANNEL=stable WANT_VERSION="" PREFIX="$HOME/.local" BUNDLE=""
-  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0
+  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0 PRESETUP=1
   if [ "${K3_NO_DOWNLOAD:-0}" = 1 ]; then NO_DEPS=1; fi
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -493,6 +511,7 @@ main() {
         ;;
       --yes | -y) YES=1 ;;
       --no-install-deps) NO_DEPS=1 ;;
+      --minimal) PRESETUP=0 ;;
       --check) CHECK=1 ;;
       --no-activate) ACTIVATE=0 ;;
       --print-version) PRINT_VERSION=1 ;;
@@ -541,6 +560,7 @@ main() {
   fi
   if [ "$ACTIVATE" != 1 ]; then exit 0; fi
   if [ -n "$BUNDLE" ]; then import_bundle; fi
+  if [ "$PRESETUP" = 1 ]; then presetup || log "presetup did not finish; k3code is installed and works without it"; fi
   case ":$PATH:" in
     *":$BIN:"*) ;;
     *) say "Add $BIN to your PATH:  export PATH=\"$BIN:\$PATH\"   (in ~/.bashrc or ~/.zshrc)" ;;

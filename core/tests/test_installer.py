@@ -14,17 +14,43 @@ UNINSTALL = REPO / "install" / "uninstall.sh"
 pytestmark = pytest.mark.skipif(shutil.which("uv") is None, reason="installer needs uv present")
 
 
-def run(home: Path, script: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def run(
+    home: Path,
+    script: Path,
+    *args: str,
+    env_extra: dict[str, str] | None = None,
+    drop: tuple[str, ...] = (),
+    path_front: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
     env = {
         "PATH": os.environ["PATH"],
         "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),  # never read a real ~/.config/k3code/env
         "K3_STUB_VENV": "1",  # fake core venv: no pip / network
         "K3_SKIP_TUI": "1",
         "K3_SKIP_GO": "1",
         "K3_NO_DOWNLOAD": "1",
         "K3_NO_GH": "1",
     }
-    return subprocess.run(["sh", str(script), *args], env=env, capture_output=True, text=True, check=False)
+    for k in drop:
+        env.pop(k, None)
+    env.update(env_extra or {})
+    if path_front is not None:
+        env["PATH"] = f"{path_front}{os.pathsep}{env['PATH']}"
+    # A new session has no controlling terminal, so the installer cannot open /dev/tty and prompt.
+    return subprocess.run(
+        ["sh", str(script), *args], env=env, capture_output=True, text=True, check=False, start_new_session=True
+    )
+
+
+def stub_bin(root: Path, name: str, body: str) -> Path:
+    """A directory holding one executable stub (a shell script) named ``name``; put it first on PATH."""
+    d = root / "stubbin"
+    d.mkdir(exist_ok=True)
+    p = d / name
+    p.write_text("#!/bin/sh\n" + body)
+    p.chmod(0o755)
+    return d
 
 
 def snapshot(home: Path) -> dict[str, tuple[float, str]]:
@@ -97,3 +123,22 @@ def test_uninstall_keeps_user_data_unless_purge(tmp_path: Path) -> None:
     assert (tmp_path / ".k3code" / "config.yaml").is_file()
     assert run(tmp_path, UNINSTALL, "--purge").returncode == 0
     assert not (tmp_path / ".k3code").exists()
+
+
+def test_presetup_is_the_default_and_minimal_skips_it(tmp_path: Path) -> None:
+    log = tmp_path / "curl.log"
+    curl = stub_bin(tmp_path, "curl", f'echo "curl $*" >>"{log}"\nexit 1\n')
+    default_home = tmp_path / "default"
+    default_home.mkdir()
+    r = run(default_home, INSTALL, "--from-source", "--yes", path_front=curl)
+    assert r.returncode == 0, r.stderr
+    assert "presetup (optional" in r.stderr
+    assert not log.exists()  # under stubs presetup makes no network call
+
+    minimal_home = tmp_path / "minimal"
+    minimal_home.mkdir()
+    m = run(minimal_home, INSTALL, "--from-source", "--yes", "--minimal", path_front=curl)
+    assert m.returncode == 0, m.stderr
+    assert "presetup (optional" not in m.stderr
+    assert not log.exists()
+    assert "Installed k3code" in m.stderr
