@@ -129,6 +129,8 @@ class Experiments:
         self.path = self.home / "learning" / "experiments.json"
         self.overlays = self.home / "overlays"
         self.clock = clock
+        #: called with the experiment after a config rollback rewrote the file (the hub syncs the live config)
+        self.on_config_rollback: Callable[[dict[str, Any]], None] | None = None
 
     def all(self) -> list[dict[str, Any]]:
         try:
@@ -181,6 +183,8 @@ class Experiments:
             path = config_path or user_config_path()
             cur = confio.read_yaml(path)
             confio.write_yaml(path, _restore(cur, exp["patch"], exp["prev"]))
+            if self.on_config_rollback is not None:
+                self.on_config_rollback(exp)
         else:
             f = self.overlays / f"{xid}-{exp['name']}.md"
             if f.is_file():
