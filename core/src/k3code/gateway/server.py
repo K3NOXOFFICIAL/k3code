@@ -122,7 +122,7 @@ class LiveSession:
         self.announced_tools: set[str] = set()
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
-        self.reasoning_effort: str | None = None
+        self.reasoning_effort: str | None = stored.meta.get("reasoning_effort")  # /effort
         self.todos: list[dict[str, Any]] = []
         self.todo_revision = 0
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None

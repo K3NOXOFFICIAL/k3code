@@ -72,10 +72,20 @@ class _EffortCommand(CommandDef):
         super().__init__(name="effort", help="Show or set reasoning effort: /effort [low|medium|high]")
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+        live = ctx.sessions.get(session_id) if session_id else None
         if not arg:
-            return {"type": "message", "message": "Usage: /effort [low|medium|high]"}
+            current = getattr(live, "reasoning_effort", None) or "default"
+            return {"type": "message", "message": f"Reasoning effort: {current}. Usage: /effort [low|medium|high]"}
         if arg not in ("low", "medium", "high"):
             return {"type": "message", "message": f"Unknown effort: {arg} (low|medium|high)"}
+        if live is None:
+            return {"type": "message", "message": "No active session."}
+        # Stored on the session and shown in session.info. No provider takes a reasoning-effort parameter yet, so
+        # it does not change the requests (it used to be acknowledged and dropped).
+        live.reasoning_effort = arg
+        live.stored.meta["reasoning_effort"] = arg
+        ctx.store.save(live.stored)
+        live.emit("session.info", live.live_info())
         return {"type": "message", "message": f"Reasoning effort set to: {arg}"}
 
 
