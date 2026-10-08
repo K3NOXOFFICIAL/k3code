@@ -13,9 +13,19 @@ def load(name: str) -> dict:
 
 def test_ci_jobs() -> None:
     wf = load("ci.yml")
-    assert set(wf["jobs"]) == {"core", "installer-macos", "installer-windows", "tui", "panes", "vendor_check"}
+    assert set(wf["jobs"]) == {"core", "tui", "panes", "vendor_check"}
     for job in wf["jobs"].values():
         assert job["runs-on"] and job["steps"]
+
+
+def test_installer_jobs_run_only_when_the_installer_changes() -> None:
+    # macOS and Windows minutes cost several times a Linux minute, so they sit behind a paths filter.
+    wf = load("installer.yml")
+    assert set(wf["jobs"]) == {"installer-macos", "installer-windows"}
+    for job in wf["jobs"].values():
+        assert job["runs-on"] and job["steps"]
+    for event in ("push", "pull_request"):
+        assert "install/**" in wf[True][event]["paths"]
 
 
 def test_release_triggers_on_tags_and_ships_assets() -> None:
