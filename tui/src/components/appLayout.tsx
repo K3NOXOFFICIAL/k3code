@@ -64,6 +64,7 @@ import { HelpHint } from "./helpHint.js";
 import { Journey } from "./journey.js";
 import { MessageLine } from "./messageLine.js";
 import { QueuedMessages } from "./queuedMessages.js";
+import { SectionRule } from "./sectionRule.js";
 import { LiveTodoPanel, StreamingAssistant } from "./streamingAssistant.js";
 import {
   type InputCursorSnapshot,
@@ -170,7 +171,12 @@ const TranscriptPane = memo(function TranscriptPane({
               firstUserIdx >= 0 &&
               row.index > firstUserIdx && (
                 <Box marginTop={1}>
-                  <Text color={ui.theme.color.border}>───</Text>
+                  {/* padding (2) + scrollbar gutter (2): a full rule that never wraps */}
+                  <SectionRule
+                    cols={Math.max(1, bodyCols - 4)}
+                    dim
+                    t={ui.theme}
+                  />
                 </Box>
               )}
 
@@ -562,9 +568,14 @@ const AgentsOverlayPane = memo(function AgentsOverlayPane() {
   return (
     <AgentsOverlay
       gw={gw}
+      initialAgentId={overlay.agentsInitialAgentId}
       initialHistoryIndex={overlay.agentsInitialHistoryIndex}
       onClose={() =>
-        patchOverlayState({ agents: false, agentsInitialHistoryIndex: 0 })
+        patchOverlayState({
+          agents: false,
+          agentsInitialAgentId: null,
+          agentsInitialHistoryIndex: 0,
+        })
       }
       t={ui.theme}
     />
