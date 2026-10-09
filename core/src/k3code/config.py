@@ -155,7 +155,7 @@ class Settings(BaseModel):
     ultracode: dict[str, Any] = Field(default_factory=dict)
     research: dict[str, Any] = Field(default_factory=dict)
     # Web tools SSRF guard: {allow_private: false}. true lets web_fetch/web_browse reach loopback/private addresses;
-    # the host of research.searxng_url is always allowed. See k3code.net_guard.
+    # the exact origin of research.searxng_url is always allowed. See k3code.net_guard.
     web: dict[str, Any] = Field(default_factory=dict)
     # Context management: {compact_at_tokens: 80000, keep_messages: 8}; see GatewayServer._maybe_compact
     context: dict[str, Any] = Field(default_factory=dict)
