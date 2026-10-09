@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 import uuid
@@ -44,7 +45,7 @@ from k3code.autonomy.ultra import Ultra
 from k3code.blockers import BlockerStore
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
-from k3code.config import Settings, default_project_dir, load_config
+from k3code.config import Settings, default_project_dir, load_config, retention
 from k3code.context_budget import compact_threshold, context_window, overhead_tokens
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
@@ -78,6 +79,7 @@ from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
+from k3code.reliability.journal import delete_session_journal, prune_journals
 from k3code.reliability.persistent_retry import PERMANENT_REASONS, TurnCancelled
 from k3code.research.browser import BrowserManager
 from k3code.research.fetch import WebFetcher
@@ -2243,14 +2245,46 @@ class GatewayServer:
         process's next save restores the session. ``save()`` is no upsert: a row removed by ``session.delete`` has
         no tombstone and stays gone. The sweep forgets tombstones after 90 days."""
         keep = self._sweep_keep()
-        return 0 if keep is None else self.store.sweep_empty(now=now, max_age=max_age, keep=keep)
+        if keep is None:
+            return 0
+        swept: list[str] = []
+        n = self.store.sweep_empty(now=now, max_age=max_age, keep=keep, swept=swept)
+        for sid in swept:
+            self.remove_session_files(sid)
+        return n
 
     async def sweep_empty_sessions_async(
         self, *, now: float | None = None, max_age: float = EMPTY_SESSION_MAX_AGE_S
     ) -> int:
         """:meth:`sweep_empty_sessions` in small batches that yield to the event loop (same tombstones)."""
         keep = self._sweep_keep()
-        return 0 if keep is None else await self.store.sweep_empty_async(now=now, max_age=max_age, keep=keep)
+        if keep is None:
+            return 0
+        swept: list[str] = []
+        n = await self.store.sweep_empty_async(now=now, max_age=max_age, keep=keep, swept=swept)
+        for sid in swept:
+            self.remove_session_files(sid)
+        return n
+
+    def remove_session_files(self, sid: str) -> None:
+        """A deleted or swept session's files: its tool journal, transcript checkpoint and stored pastes."""
+        home = self._home()
+        delete_session_journal(home, sid)
+        pastes = home / PASTES_DIR / sid
+        if sid and pastes.parent == home / PASTES_DIR and pastes.is_dir():
+            shutil.rmtree(pastes, ignore_errors=True)
+
+    def prune_retention(self, *, now: float | None = None) -> dict[str, int]:
+        """Daemon start: usage rows past ``retention.usage_days``, journal files of sessions that are not live and not
+        written for ``retention.journal_days``, learning decisions past ``retention.decisions_days`` (debug bundles
+        are pruned as each is written)."""
+        keep = retention(self.config)
+        rows = self.usage.prune(keep["usage_days"], now=now)
+        files = prune_journals(
+            self._home(), keep=lambda sid: sid in self.live, max_age_s=keep["journal_days"] * 86400, now=now
+        )
+        decisions = self.learning.log.prune(keep["decisions_days"])
+        return {"usage_rows": rows, "journal_files": files, "decisions": decisions}
 
     async def resume_goals(self) -> int:
         """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.
@@ -2798,7 +2832,8 @@ async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict
         if live.turn_task is not None and not live.turn_task.done():
             live.turn_task.cancel()
         if live.reliability is not None:
-            await live.reliability.stop()
+            await live.reliability.stop()  # closes the journal file before it goes
+    server.remove_session_files(str(sid))
     for client in server.clients:
         if client.session_id == sid:
             client.session_id = None

@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -197,6 +198,58 @@ class ToolJournal:
             )
             for r in pending
         ]
+
+
+#: A closed session's journal files older than this are pruned at daemon start (``retention.journal_days``).
+JOURNAL_MAX_AGE_S = 30 * 86400
+#: The files a session leaves in ``$K3CODE_HOME/journal``: the tool journal and the transcript checkpoint.
+_SUFFIXES = (".jsonl", ".messages.json")
+
+
+def _session_of(name: str) -> str | None:
+    for suffix in _SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return None
+
+
+def delete_session_journal(home: Path, session: str) -> int:
+    """Remove ``session``'s journal and transcript checkpoint (a deleted or swept session); returns files removed."""
+    removed = 0
+    for suffix in _SUFFIXES:
+        path = home / "journal" / f"{session}{suffix}"
+        if path.parent.name == "journal" and path.parent.parent == home:  # a session id never walks out of journal/
+            try:
+                path.unlink()
+                removed += 1
+            except FileNotFoundError:
+                pass
+    return removed
+
+
+def prune_journals(
+    home: Path, *, keep: Callable[[str], bool], max_age_s: float = JOURNAL_MAX_AGE_S, now: float | None = None
+) -> int:
+    """Remove journal files not written for ``max_age_s`` whose session is not ``keep(session)`` (live, in use).
+
+    Every session (and every ``k3code -p`` run) leaves an fsync'd jsonl here and nothing removed it. Returns files
+    removed."""
+    jdir = home / "journal"
+    if not jdir.is_dir():
+        return 0
+    cutoff = (time.time() if now is None else now) - max_age_s
+    removed = 0
+    for path in jdir.iterdir():
+        sid = _session_of(path.name)
+        if sid is None or keep(sid):
+            continue
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except FileNotFoundError:
+            continue
+    return removed
 
 
 def interrupted_result(tool: str) -> dict[str, Any]:

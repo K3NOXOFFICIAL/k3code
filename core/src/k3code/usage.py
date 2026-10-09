@@ -109,6 +109,13 @@ class UsageDB:
         )
         self._db.commit()
 
+    def prune(self, older_than_days: float, *, now: float | None = None) -> int:
+        """Delete events older than ``older_than_days`` (the daemon calls it at start); returns rows deleted."""
+        cutoff = (time.time() if now is None else now) - older_than_days * 86400
+        with self._db:
+            cur = self._db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+        return cur.rowcount
+
     def rows(self, since: float = 0.0) -> list[dict[str, Any]]:
         """Raw events with ``ts >= since`` as dicts (for the self-optimizer)."""
         cur = self._db.execute(
