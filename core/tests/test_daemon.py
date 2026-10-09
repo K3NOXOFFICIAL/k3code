@@ -273,11 +273,47 @@ def test_unit_file_matches_policy_and_repo_copy():
         "Nice=5",
         "IOSchedulingClass=idle",
         "MemoryHigh=2G",
+        "MemoryMax=4G",
+        "TasksMax=512",
+        "LimitNOFILE=65536",
+        "UMask=0077",
+        "NoNewPrivileges=yes",
+        "RestrictSUIDSGID=yes",
+        "LockPersonality=yes",
+        "RestrictRealtime=yes",
         "ExecStart=/usr/bin/k3code daemon",
     ):
         assert line in service_section
+    # the user manager has no network-online.target, so ordering on it would be a no-op
+    assert "network-online" not in "\n".join(ln for ln in unit.splitlines() if not ln.startswith("#"))
+    # the daemon runs bubblewrap and the user's tools: no filesystem/namespace sandboxing of the daemon itself
+    for forbidden in ("ProtectHome", "ProtectSystem", "PrivateTmp", "PrivateNetwork"):
+        assert forbidden not in "\n".join(ln for ln in unit.splitlines() if not ln.startswith("#"))
     repo = Path(__file__).resolve().parents[2] / "install" / "systemd" / "k3code.service"
     assert repo.read_text() == service.render_unit(service.DEFAULT_EXEC_START)
+
+
+def test_unit_exec_start_uses_the_stable_current_symlink_and_pins_non_default_dirs(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("K3CODE_DATA", raising=False)
+    monkeypatch.delenv("K3CODE_HOME", raising=False)
+    default_data = tmp_path / "home" / ".local" / "share" / "k3code"
+    exe = default_data / "current" / "venv" / "bin" / "k3code"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("#!/bin/sh\n")
+    unit = service.render_unit()
+    assert f"ExecStart={exe} daemon\n" in unit  # not a versions/<ver> path and not whatever is on PATH
+    assert "K3CODE_DATA" not in unit and "K3CODE_HOME" not in unit  # defaults need no Environment= lines
+    custom = tmp_path / "other data"
+    (custom / "current" / "venv" / "bin").mkdir(parents=True)
+    (custom / "current" / "venv" / "bin" / "k3code").write_text("#!/bin/sh\n")
+    monkeypatch.setenv("K3CODE_DATA", str(custom))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "kh"))
+    unit = service.render_unit()
+    assert f'ExecStart="{custom}/current/venv/bin/k3code" daemon\n' in unit  # a space in the path is quoted
+    assert f'Environment="K3CODE_DATA={custom}"\n' in unit
+    assert f'Environment="K3CODE_HOME={tmp_path / "kh"}"\n' in unit
+    assert "K3CODE_DATA" not in service.render_unit("/usr/bin/k3code daemon")  # an explicit ExecStart is verbatim
 
 
 def test_service_install_dry_run_touches_nothing(tmp_path, monkeypatch):
