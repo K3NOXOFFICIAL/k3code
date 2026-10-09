@@ -53,7 +53,8 @@ def permission_mode_from_config(key: str, value: str) -> PermissionMode:
         return PermissionMode(value)
     except ValueError:
         raise InvalidPermissionMode(
-            f"{key} {value!r} is not one of: ask, auto-edit, yolo (set in config.yaml or K3CODE_{key.upper()})"
+            f"{key} {value!r} is not one of: ask, auto-edit, plan, auto, yolo "
+            f"(set in config.yaml or K3CODE_{key.upper()})"
         ) from None
 
 
@@ -328,8 +329,8 @@ _FILE_VALUE_OPTS = ("eFfmP", frozenset({"--exclude", "--separator", "--files-fro
 _FILE_READ_OPTS = frozenset({"-f", "-m", "--files-from", "--magic-file"})
 #: ssh client short options taking a value. ``-i KEY``, ``-o IdentityFile=KEY`` and ``-F CONFIG`` name a file the
 #: client authenticates with or reads its settings from (see _ssh_key_value). (rsync is not here: its ``-i`` is
-#: ``--itemize-changes``, so the next word is a source it copies; an rsync key goes in ``-e 'ssh -i KEY'``, a single
-#: word that names no credential.)
+#: ``--itemize-changes``, so the next word is a source it copies; an rsync key goes in ``-e 'ssh -i KEY'``, a command
+#: line (hardline.ssh_option_commands returns it) that _secret_access checks as an ssh command of its own.)
 _SSH_VALUE_OPTS = hardline.SSH_VALUE_OPTS
 _IDENTITY_OPTION = re.compile(r"identityfile=", re.IGNORECASE)
 _SSH_CONFIG_NAME = re.compile(r"(?:^|/)(?:config|[^/]*(?:\.conf|_config))$")

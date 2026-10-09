@@ -261,7 +261,7 @@ providers:                          # the fallback chain, in order (add as many 
     api_key_env: ANTHROPIC_API_KEY
     models: {default: claude-sonnet-5-5}
 
-permission_mode: ask                # ask | auto-edit | yolo
+permission_mode: ask                # ask | auto-edit | plan | auto | yolo
 autonomy:
   plan_first: true
   fanout: {max_parallel: 3}
