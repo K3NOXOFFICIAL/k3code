@@ -97,6 +97,47 @@ export const shouldOpenAgentView = ({
   !stripFocused &&
   !blocked;
 
+/**
+ * Whether this Esc counts toward the double Esc that interrupts a running turn (Ctrl+C's interrupt, but the draft
+ * stays). Only when nothing else owns Esc: no overlay, pager, picker, prompt or agent view up (`blocked`), the strip
+ * not focused, no history walk or queue edit, and no modifier. `key.meta` is set on every Esc, so Alt comes from the
+ * raw keypress (`\x1b\x1b` or a kitty CSI u).
+ */
+export const escCountsTowardInterrupt = ({
+  blocked,
+  busy,
+  hasSession,
+  historyIdx,
+  key,
+  queueEditIdx,
+  stripFocused,
+}: {
+  blocked: boolean;
+  busy: boolean;
+  hasSession: boolean;
+  historyIdx: null | number;
+  key: {
+    alt: boolean;
+    ctrl: boolean;
+    escape: boolean;
+    shift: boolean;
+    super: boolean;
+  };
+  queueEditIdx: null | number;
+  stripFocused: boolean;
+}): boolean =>
+  key.escape &&
+  !key.alt &&
+  !key.ctrl &&
+  !key.shift &&
+  !key.super &&
+  busy &&
+  hasSession &&
+  !blocked &&
+  !stripFocused &&
+  historyIdx === null &&
+  queueEditIdx === null;
+
 /** Overlays Ctrl+C dismisses, first match wins. */
 const CTRL_C_ORDER = [
   // First: the full-screen agent view hides PromptZone, so a prompt behind it must never be answered unseen.
@@ -375,13 +416,61 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
   // sits above the isBlocked early-return so a prompt overlay cannot swallow
   // it. Ctrl+C now clears a non-empty composer even mid-stream; Esc Esc is
   // still the dedicated discard (pushes the draft to history so Up recalls it).
+  // Mid-turn, with nothing else owning Esc, Esc Esc interrupts instead.
   const lastEscRef = useRef(0);
+  // When the first Esc of an interrupting pair landed; 0 when no pair is open. Every other Esc closes the pair, so an
+  // Esc that closed an overlay (or anything else that owns Esc) never counts as its first half.
+  const interruptEscRef = useRef(0);
 
   useInput((ch, key, event) => {
     const live = getUiState();
 
+    // Esc Esc mid-turn interrupts and keeps the draft. A busy Esc never takes part in the draft discard below, so
+    // neither half of the pair (nor an Esc right after the turn ends) can wipe the draft.
+    const pairEsc = escCountsTowardInterrupt({
+      blocked: isBlocked,
+      busy: live.busy,
+      hasSession: Boolean(live.sid),
+      historyIdx: cState.historyIdx,
+      key: {
+        alt: Boolean(event.keypress.meta || event.keypress.option),
+        ctrl: key.ctrl,
+        escape: key.escape,
+        shift: key.shift,
+        super: key.super,
+      },
+      queueEditIdx: cState.queueEditIdx,
+      stripFocused: $stripNav.get().focused,
+    });
+
+    if (pairEsc && live.sid) {
+      const now = Date.now();
+      const opensPair =
+        !interruptEscRef.current ||
+        now - interruptEscRef.current > DOUBLE_ESC_MS;
+
+      lastEscRef.current = 0;
+      interruptEscRef.current = opensPair ? now : 0;
+
+      if (!opensPair) {
+        return turnController.interruptTurn({
+          appendMessage: actions.appendMessage,
+          gw: gateway.gw,
+          sid: live.sid,
+          sys: actions.sys,
+        });
+      }
+    } else if (key.escape) {
+      interruptEscRef.current = 0;
+    }
+
     // The agent view owns Esc (it closes the view); counting it here would let the next Esc discard the draft.
-    if (key.escape && !$stripNav.get().focused && !overlay.agentView) {
+    if (
+      key.escape &&
+      !pairEsc &&
+      !$stripNav.get().focused &&
+      !overlay.agentView
+    ) {
       const now = Date.now();
       const isDouble = now - lastEscRef.current <= DOUBLE_ESC_MS;
 

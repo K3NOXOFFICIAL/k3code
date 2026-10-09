@@ -32,7 +32,10 @@ declare module "@k3code/ink" {
     readonly key: Key;
     readonly keypress: {
       readonly isPasted?: boolean;
+      /** Alt as parsed, unlike `key.meta`, which is also set on every plain Esc. */
+      readonly meta?: boolean;
       readonly name?: string;
+      readonly option?: boolean;
       readonly raw?: string;
     };
   };
