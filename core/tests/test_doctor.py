@@ -248,3 +248,20 @@ def test_the_key_count_leaves_out_claude_cli(monkeypatch):
     assert (
         check_keys(Settings(providers=[ProviderEntry(name="c", kind="claude-cli")])).detail == "no provider needs a key"
     )
+
+
+def test_project_check_reports_the_stacks_a_read_only_scan_finds(tmp_path):
+    """A fresh uv + pnpm project read "project: none" (the trust state of a project without a config) until a TUI
+    session had scanned it; doctor now scans it itself and stores nothing."""
+    from k3code import doctor
+    from k3code.learning import projectstate
+
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0"\n')
+    (tmp_path / "uv.lock").write_text("version = 1\n")
+    (tmp_path / "package.json").write_text('{"name": "web"}\n')
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    chk = doctor.check_project(tmp_path)
+    assert chk.status == doctor.OK
+    assert chk.detail.startswith("stacks: python (uv), node (pnpm); no project config")
+    assert chk.data["stacks"] == ["python (uv)", "node (pnpm)"]
+    assert not projectstate.state_path(tmp_path).exists()
