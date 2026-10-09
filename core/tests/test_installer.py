@@ -823,7 +823,8 @@ def test_credentials_in_urls_never_reach_the_log(tmp_path: Path) -> None:
     real_git = shutil.which("git")
     url = "https://alice:s3cr3t-token@example.invalid/x.git"
     body = (
-        f'case "$*" in *fetch*) echo "fatal: unable to access \'{url}/\': Could not resolve host" >&2; exit 128 ;; esac\n'
+        f'case "$*" in *fetch*) echo "fatal: unable to access \'{url}/\': Could not resolve host" >&2\n'
+        "  exit 128 ;; esac\n"
         f'exec "{real_git}" "$@"\n'
     )
     stubs = stub_bin(tmp_path, "git", body)
