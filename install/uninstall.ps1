@@ -35,7 +35,7 @@ if (-not $WindowsOnly) {
   if (-not (Test-Path $state)) { Die "no $($state): k3code was not installed with install.ps1 (use -WindowsOnly to clean up shims)" }
   $cfg = Get-Content -Raw $state | ConvertFrom-Json
   $shArgs = @("--prefix $(Quote-Sh $cfg.prefix)")
-  if ($Purge) { $shArgs += '--purge' }
+  if ($Purge) { $shArgs += @('--purge', '--yes') } # -Purge is the confirmation
   $checkout = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { '' }
   if ($checkout -and (Test-Path (Join-Path $PSScriptRoot 'uninstall.sh'))) {
     & $Wsl -d $cfg.distro --cd $checkout --exec sh -lc "exec sh install/uninstall.sh $($shArgs -join ' ')"

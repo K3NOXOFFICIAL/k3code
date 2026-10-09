@@ -129,7 +129,7 @@ def test_uninstall_keeps_user_data_unless_purge(tmp_path: Path) -> None:
     assert not (tmp_path / ".local" / "share" / "k3code").exists()
     assert not (tmp_path / ".local" / "bin" / "k3code").exists()
     assert (tmp_path / ".k3code" / "config.yaml").is_file()
-    assert run(tmp_path, UNINSTALL, "--purge").returncode == 0
+    assert run(tmp_path, UNINSTALL, "--purge", "--yes").returncode == 0
     assert not (tmp_path / ".k3code").exists()
 
 
@@ -432,7 +432,7 @@ def test_uninstall_removes_presetup_leftovers_and_keeps_user_data(tmp_path: Path
     assert not data.exists()  # presetup markers and the browser location go with the install
     assert (tmp_path / ".k3code" / "config.yaml").is_file()
     assert (tmp_path / ".config" / "k3code" / "env").is_file()
-    assert run(tmp_path, UNINSTALL, "--purge").returncode == 0
+    assert run(tmp_path, UNINSTALL, "--purge", "--yes").returncode == 0
     assert not (tmp_path / ".k3code").exists()
     assert not (tmp_path / ".config" / "k3code").exists()
 
@@ -657,3 +657,31 @@ def test_no_systemctl_call_without_a_k3code_unit(tmp_path: Path) -> None:
     stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
     assert run(tmp_path, INSTALL, "--from-source", "--minimal", path_front=stubs).returncode == 0
     assert not calls.exists()
+
+
+def test_purge_without_yes_and_without_a_terminal_is_refused(tmp_path: Path) -> None:
+    assert run(tmp_path, INSTALL, "--from-source", "--minimal").returncode == 0
+    (tmp_path / ".k3code").mkdir(exist_ok=True)
+    (tmp_path / ".k3code" / "config.yaml").write_text("x: 1\n")
+    r = run(tmp_path, UNINSTALL, "--purge")  # a new session: no terminal to confirm on
+    assert r.returncode != 0
+    assert "--yes" in r.stderr
+    assert (tmp_path / ".k3code" / "config.yaml").is_file()
+    assert (tmp_path / DATA_REL / "current").is_symlink()  # refused before anything was removed
+
+
+def test_uninstall_fallback_removes_both_units(tmp_path: Path) -> None:
+    # no k3code to run `k3code service uninstall`: the script disables and removes the daemon and its recovery unit
+    units = tmp_path / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    for name in ("k3code.service", "k3code-recover.service"):
+        (units / name).write_text("[Unit]\n")
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    r = run(tmp_path, UNINSTALL, path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    assert not (units / "k3code.service").exists()
+    assert not (units / "k3code-recover.service").exists()
+    log = calls.read_text()
+    assert "disable --now k3code.service k3code-recover.service" in log
+    assert "daemon-reload" in log
