@@ -11,6 +11,7 @@ import {
   type ViewRow,
   visibleWindow,
 } from "../../k3/agentViewStore.js";
+import { buildStripRows, GLYPH } from "../../k3/agentStrip.js";
 import type { SessionActiveItem } from "../../gatewayTypes.js";
 import type { SubagentProgress } from "../../types.js";
 
@@ -102,6 +103,32 @@ describe("buildViewRows", () => {
 
     expect(byId).toHaveLength(1);
     expect(byId[0]).toMatchObject({ current: true, group: "input", id: "x" });
+  });
+
+  it("shows the current session's last turn as failed (✗) or completed (✓), leading the finished group", () => {
+    for (const [status, state] of [
+      ["failed", "failed"],
+      ["completed", "done"],
+    ] as const) {
+      const rows = build({
+        sessions: [
+          { id: "w1", status: "working", title: "W1" },
+          { id: "f1", status: "failed", title: "F1" },
+          { current: true, id: "cur", status, title: "Here" },
+        ],
+      });
+      const cur = rows.find((r) => r.current)!;
+
+      expect(cur).toMatchObject({ group: "finished", id: "cur", state });
+      expect(GLYPH[cur.state]).toBe(state === "failed" ? "✗" : "✓");
+      expect(rows.map((r) => r.id)).toEqual(["w1", "cur", "f1"]);
+      // the inline strip leaves the current session out, whatever its state
+      expect(
+        buildStripRows([], [{ current: true, id: "cur", status }], NOW).map(
+          (r) => r.id,
+        ),
+      ).toEqual([]);
+    }
   });
 
   it("picks the current row by id over a stale `current` flag, and by the flag only when the id is unknown", () => {

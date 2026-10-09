@@ -184,7 +184,7 @@ class LiveSession:
         self.pending_advisor: str = ""
         #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
         self.extra_tools: list[Callable[[Any], None]] = []
-        #: Outcome of the last unattended run (``completed`` / ``failed``); cleared when a new turn starts.
+        #: Outcome of the last turn (``completed`` / ``failed``); cleared when a new turn starts.
         self.run_result: str | None = None
         #: What the last turn ended with, for the cron/loop runners.
         self.last_error = ""
@@ -204,7 +204,7 @@ class LiveSession:
 
     @property
     def state(self) -> str:
-        """``working`` (also while paused), ``needs_input``, ``completed``/``failed`` (unattended run) or ``idle``."""
+        """``working`` (also while paused), ``needs_input``, ``completed``/``failed`` (last turn) or ``idle``."""
         if self.needs_input or self.server.has_open_request(self.session_id):
             return "needs_input"
         if self.streaming:
@@ -1709,10 +1709,10 @@ class GatewayServer:
 
         session.last_error = error or ""
         session.last_api_calls = sum(1 for m in loop.turn_messages if m.role == "assistant")
-        if session.background:
-            session.run_result = {"done": "completed", "interrupted": "completed"}.get(status, "failed")
-            if status == "needs_input":
-                session.run_result = None
+        # Foreground turns too: the agent view and the strip show a turn that ended in an error as failed, not idle.
+        session.run_result = {"done": "completed", "interrupted": "completed"}.get(status, "failed")
+        if status == "needs_input":
+            session.run_result = None
         for msg in reversed(loop.turn_messages):
             if msg.role == "assistant" and msg.usage:
                 usage = msg.usage
