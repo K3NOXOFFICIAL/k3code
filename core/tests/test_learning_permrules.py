@@ -68,6 +68,23 @@ def test_accept_writes_rule_to_project_or_user_config(tmp_path, monkeypatch):
     assert rules[0].pattern == "cargo test *"
 
 
+def test_rule_accepted_from_a_project_recipe_is_not_proposed_again(tmp_path, monkeypatch):
+    from k3code.learning import recipes
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    log = DecisionLog(tmp_path)
+    approve(log, "uv run pytest", n=3, cwd=str(proj))
+    (c,) = permrules.mine(log, cwd=str(proj))
+    assert c.pattern == "uv run pytest"
+    recipes.apply(
+        {"type": "rule", "root": str(proj), "rules": [{"tool": "bash", "pattern": "uv run pytest", "action": "allow"}]}
+    )
+    assert permrules.mine(log, cwd=str(proj)) == []
+    assert not (proj / ".k3code").exists()  # the recipe rule lives under K3CODE_HOME, not in the repo
+
+
 def test_dismiss_latches(tmp_path):
     log = DecisionLog(tmp_path)
     approve(log, "npm test *", n=3)

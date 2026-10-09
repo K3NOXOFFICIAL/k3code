@@ -84,4 +84,21 @@ describe("kind icons", () => {
     expect(new Set(icons).size).toBe(kinds.length);
     expect(glyphFor("something_new")).toBe("•");
   });
+
+  it("gives every project-recipe kind its own icon instead of the fallback", () => {
+    const learned = [
+      "permission_rule",
+      "preference",
+      "project_setup",
+      "skill",
+      "optimizer",
+      "consequence",
+      "improvement",
+    ].map(glyphFor);
+    const recipe = ["mcp", "hook", "rule", "commands"].map(glyphFor);
+
+    expect(recipe).not.toContain("•");
+    expect(new Set(recipe).size).toBe(recipe.length);
+    recipe.forEach((icon) => expect(learned).not.toContain(icon));
+  });
 });
