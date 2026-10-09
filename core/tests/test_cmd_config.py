@@ -213,6 +213,9 @@ async def test_skills_command_and_tool(tmp_path, monkeypatch):
     write_skill(home() / "skills", "alpha", "Does alpha things", body="ALPHA-SECRET-BODY")
     proj = tmp_path / "proj"
     write_skill(proj / ".k3code" / "skills", "beta", "Does beta things")
+    from k3code import trust
+
+    trust.record(proj, trusted=True)  # project skills load only from a trusted project (test_project_content_trust)
     extra = tmp_path / "library"
     write_skill(extra / "skills", "gamma", "Does gamma things", body="GAMMA-BODY")
     server.config.skills.roots = [str(extra)]

@@ -56,7 +56,7 @@ async def test_facts_go_to_k3code_home_and_never_into_repo_files(tmp_path: Path)
 
 def test_project_key_matches_the_tui_history_key() -> None:
     # tui/src/lib/history.ts projectHistoryKey: root.replace(/[/:\\]+/g, "_") || "default"
-    assert project_key("/home/alice/src/myapp") == "_home_alice_src_myapp"
+    assert project_key("/home/dev/src/myapp") == "_home_dev_src_myapp"
     assert project_key("C:\\work\\myapp") == "C_work_myapp"
 
 
