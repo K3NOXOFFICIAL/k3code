@@ -124,6 +124,35 @@ def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("UV_CACHE_DIR", _REAL_UV_CACHE)
 
 
+#: Programs that reach the real systemd user manager (or the login manager): no test may run the real ones.
+SYSTEMD_TOOLS = ("systemctl", "loginctl", "journalctl")
+_SYSTEMD_STUB = """#!/bin/sh
+# Test stub: the real {name} would act on the developer's systemd user manager (the 72 h soak daemon included).
+printf '%s\\n' "{name} $*" >>"{log}"
+case "{name} $*" in systemctl*is-active*) echo inactive; exit 3 ;; esac
+exit 0
+"""
+
+
+@pytest.fixture(scope="session")
+def systemd_stub_dir(tmp_path_factory) -> Path:
+    """A directory of logging ``systemctl``/``loginctl``/``journalctl`` stubs; every call lands in ``calls.log``."""
+    d = tmp_path_factory.mktemp("systemd-stubs")
+    for name in SYSTEMD_TOOLS:
+        p = d / name
+        p.write_text(_SYSTEMD_STUB.format(name=name, log=d / "calls.log"))
+        p.chmod(0o755)
+    return d
+
+
+@pytest.fixture(autouse=True)
+def _no_real_systemd(request, monkeypatch, systemd_stub_dir):
+    """The stubs come first on PATH for every test (and every script it runs), so nothing reaches the real systemd
+    user manager. A test that really needs the host's programs opts out with ``@pytest.mark.real_systemd``."""
+    if request.node.get_closest_marker("real_systemd") is None:
+        monkeypatch.setenv("PATH", f"{systemd_stub_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
 @pytest.fixture
 def mock_transport():
     """Provides a respx router for mocking HTTP calls."""

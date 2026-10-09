@@ -247,10 +247,14 @@ def test_uninstall_removes_the_unit_under_xdg_config_home(tmp_path: Path) -> Non
     unit = xdg / "systemd" / "user" / "k3code.service"
     unit.parent.mkdir(parents=True)
     unit.write_text("[Unit]\n")
-    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CONFIG_HOME": str(xdg)}
+    # the uninstaller's fallback calls systemctl --user: a stub, never the real user manager
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    env = {"PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}", "HOME": str(tmp_path), "XDG_CONFIG_HOME": str(xdg)}
     r = subprocess.run(["sh", str(UNINSTALL)], env=env, capture_output=True, text=True, check=False)
     assert r.returncode == 0, r.stderr
     assert not unit.exists()  # removed even though no k3code is installed to do it
+    assert "systemctl --user disable --now k3code.service" in calls.read_text()
 
 
 def test_presetup_is_the_default_and_minimal_skips_it(tmp_path: Path) -> None:
