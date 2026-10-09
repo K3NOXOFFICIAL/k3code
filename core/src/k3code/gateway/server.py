@@ -1850,6 +1850,8 @@ class GatewayServer:
                     tokens_in=u.prompt_tokens if u else 0,
                     tokens_out=u.completion_tokens if u else 0,
                     cost_usd=u.cost_usd if u else None,
+                    cache_read=u.cache_read_tokens if u else 0,
+                    cache_write=u.cache_creation_tokens if u else 0,
                     tier=session.last_tier,
                     task_kind=session.current_kind,
                     turn=session.turn_id,

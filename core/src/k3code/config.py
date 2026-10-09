@@ -34,6 +34,16 @@ class ProviderEntry(BaseModel):
     thinking_tokens: int | None = 0
     #: ...for models whose name contains one of these (default: Haiku, the cheap tier); the others keep the CLI default
     thinking_models: list[str] = Field(default_factory=lambda: ["haiku"])
+    #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
+    #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
+    prompt_cache: str = "auto"
+
+    @field_validator("prompt_cache")
+    @classmethod
+    def validate_prompt_cache(cls, v: str) -> str:
+        if v not in ("auto", "on", "off"):
+            raise ValueError("prompt_cache must be 'auto', 'on' or 'off'")
+        return v
 
     @field_validator("kind")
     @classmethod

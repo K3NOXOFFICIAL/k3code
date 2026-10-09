@@ -24,6 +24,25 @@ class Usage:
     completion_tokens: int = 0
     #: List-price cost reported by the provider itself (only the claude-cli provider does); None = unknown.
     cost_usd: float | None = None
+    #: Prompt tokens read from / written to the provider's prompt cache (part of prompt_tokens; 0 = none or unknown).
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+
+
+#: An Anthropic prompt-cache breakpoint: the prefix up to and including the block that carries it is cached.
+EPHEMERAL = {"type": "ephemeral"}
+
+
+def with_cache_breakpoint(content: Any) -> Any:
+    """``content`` (a message's string or block list) with a cache breakpoint on its last block; unchanged when it has
+    no block that can carry one (empty text is rejected by the API)."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content, "cache_control": EPHEMERAL}] if content else content
+    if isinstance(content, list) and content:
+        last = content[-1]
+        if isinstance(last, dict) and (last.get("type") != "text" or last.get("text")):
+            return [*content[:-1], {**last, "cache_control": EPHEMERAL}]
+    return content
 
 
 @dataclass
