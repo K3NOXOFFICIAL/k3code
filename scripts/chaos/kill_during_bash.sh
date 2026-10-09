@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # kill -9 mid-bash, resume, verify INTERRUPTED shown to the model and the command not re-run.
+# shellcheck source=scripts/chaos/_common.sh
 source "$(dirname "$0")/_common.sh"
 MARK="$WORK/proj/marker.txt"
 PROMPT='Run exactly one bash command, then tell me what happened: RUN[echo run >> marker.txt; sleep 20; echo finished >> marker.txt]'

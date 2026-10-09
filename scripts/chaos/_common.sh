@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared setup for chaos scripts: scratch dir, flaky proxy, config pointing at it.
 # Requires OMNIROUTE_API_KEY in env. Never prints it.
 set -euo pipefail
@@ -53,9 +54,9 @@ if [ "$CHAOS_UPSTREAM" = fake ]; then
   FAKE_PID=$!
   UPSTREAM="127.0.0.1:$FAKE_PORT"
 fi
-python3 "$HERE/flaky_proxy.py" --listen 127.0.0.1:$PORT --upstream "$UPSTREAM" --mode-file "$MODE" &
+python3 "$HERE/flaky_proxy.py" --listen "127.0.0.1:$PORT" --upstream "$UPSTREAM" --mode-file "$MODE" &
 PROXY_PID=$!
-cleanup() { kill "$PROXY_PID" ${FAKE_PID:-} 2>/dev/null || true; }
+cleanup() { kill "$PROXY_PID" ${FAKE_PID:+"$FAKE_PID"} 2>/dev/null || true; }
 trap cleanup EXIT
 sleep 1
 k3code() { (cd "$WORK/proj" && uv run --project "$CORE" k3code "$@"); }

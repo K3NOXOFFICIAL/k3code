@@ -206,13 +206,51 @@ def test_arity_narrowest_pattern_suggestion() -> None:
     assert d.patterns == ["git commit"]
 
 
-def test_project_beats_user_same_specificity() -> None:
+def test_user_deny_beats_project_allow() -> None:
+    """User config wins: a project allow never overrides a user deny, at the same or a higher specificity."""
     user = [_r("bash", "git push*", "deny")]
-    proj = [_r("bash", "git push*", "allow")]
+    for proj_pattern in ("git push*", "git push origin *"):
+        proj = [_r("bash", proj_pattern, "allow")]
+        d = decide(
+            mode="default",
+            tool="bash",
+            args={"command": "git push origin m"},
+            cwd=CWD,
+            user_rules=user,
+            project_rules=proj,
+        )
+        assert d.action == "deny", proj_pattern
+    # a project allow still beats a user ask, and a session allow still beats a user deny
     d = decide(
-        mode="default", tool="bash", args={"command": "git push o m"}, cwd=CWD, user_rules=user, project_rules=proj
+        mode="default",
+        tool="bash",
+        args={"command": "git push origin m"},
+        cwd=CWD,
+        user_rules=[_r("bash", "git push*", "ask")],
+        project_rules=[_r("bash", "git push origin *", "allow")],
     )
     assert d.action == "allow"
+    d = decide(
+        mode="default",
+        tool="bash",
+        args={"command": "git push origin m"},
+        cwd=CWD,
+        user_rules=user,
+        session_rules=[_r("bash", "git push origin *", "allow")],
+    )
+    assert d.action == "allow"
+
+
+def test_session_deny_beats_a_more_specific_project_allow() -> None:
+    d = decide(
+        mode="default",
+        tool="bash",
+        args={"command": "npm install left-pad"},
+        cwd=CWD,
+        project_rules=[_r("bash", "npm install left-pad*", "allow")],
+        session_rules=[_r("bash", "npm install*", "deny")],
+    )
+    assert d.action == "deny"
 
 
 def test_session_beats_project() -> None:
