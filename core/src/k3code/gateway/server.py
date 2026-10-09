@@ -60,7 +60,7 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
-from k3code.gateway.sessions import SessionStore, StoredSession
+from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, StoredSession
 from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
@@ -1407,6 +1407,9 @@ class GatewayServer:
                     if await self._maybe_compact(session, force=True):
                         status, final_text = await self._run_one_turn(session, prompt)
             except asyncio.CancelledError:
+                # /stop and Esc cancel the turn task: the cancellation skips _run_one_turn's outcome mapping, so the
+                # turn read 'idle' (or an earlier turn's 'failed'). Interrupted ends as completed, like TurnCancelled.
+                session.run_result = "completed"
                 self._block_goal_for(session, "interrupted")
                 raise
             if self.halted and mgr.is_active() and status == "done":
@@ -1550,6 +1553,9 @@ class GatewayServer:
         error: str | None = None
         status = "done"
         gate = GateResult(prompt=text)
+        # bound before the try: a /stop during the scope gate reached the finally first, whose replay record then
+        # raised UnboundLocalError in place of the CancelledError
+        history: list[Message] = []
         loop = self._build_loop(
             session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
         )
@@ -2094,6 +2100,41 @@ class GatewayServer:
         )
         self.emit_goal(live)
         return True
+
+    def _sweep_keep(self) -> Callable[[str], bool] | None:
+        """The sweep's "leave this row alone" test, or None without the automation engine (nothing is swept then:
+        which rows a loop or automation points at cannot be told)."""
+        automation = self.automation
+        if automation is None:
+            return None
+
+        def keep(sid: str) -> bool:
+            if sid in self.live or (self.session is not None and self.session.session_id == sid):
+                return True
+            if any(c.session_id == sid for c in self.clients):
+                return True
+            return bool(automation.references_session(sid))
+
+        return keep
+
+    def sweep_empty_sessions(self, *, now: float | None = None, max_age: float = EMPTY_SESSION_MAX_AGE_S) -> int:
+        """Drop old empty stored sessions (every `k3code agents`, `n` and abandoned TUI start leaves one).
+
+        The store decides what counts as empty and unclaimed; this adds what only the server knows: live sessions,
+        the ones a client looks at, and those any loop or automation, paused ones included, points at.
+
+        Known limitation: a standalone stdio TUI/CLI sharing sessions.db can hold an empty session open longer than
+        ``max_age`` (30 days); if the daemon deletes its row, that process's later saves are lost, because ``save()``
+        is a plain UPDATE. It must stay one: an upsert would resurrect sessions deleted with ``session.delete``."""
+        keep = self._sweep_keep()
+        return 0 if keep is None else self.store.sweep_empty(now=now, max_age=max_age, keep=keep)
+
+    async def sweep_empty_sessions_async(
+        self, *, now: float | None = None, max_age: float = EMPTY_SESSION_MAX_AGE_S
+    ) -> int:
+        """:meth:`sweep_empty_sessions` in small batches that yield to the event loop (same limitation)."""
+        keep = self._sweep_keep()
+        return 0 if keep is None else await self.store.sweep_empty_async(now=now, max_age=max_age, keep=keep)
 
     async def resume_goals(self) -> int:
         """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.

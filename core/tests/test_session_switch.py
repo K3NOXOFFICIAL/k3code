@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 import m1cmd_helpers as m1
@@ -270,3 +272,44 @@ async def test_a_job_reports_its_own_outcome_not_an_earlier_turns_failure(tmp_pa
     server.start_job(live, "ultraresearch z", probe_job)
     await live.turn_task
     assert seen == [None] and live.state == "completed"
+
+
+async def test_an_interrupted_foreground_turn_reports_completed_until_the_next_prompt(tmp_path, monkeypatch):
+    """/stop and Esc cancel the turn task; the CancelledError skipped the outcome mapping, so an interrupted turn read
+    'idle' in the agent view and the strip (and kept an earlier turn's 'failed')."""
+    server, _ = m1.make_server(tmp_path, monkeypatch, ["done", "done"])
+    sid = await m1.new_session(server, tmp_path)
+    live = server.live[sid]
+    live.run_result = "failed"  # an earlier turn's outcome must not survive the interrupted one either
+    started = asyncio.Event()
+    original = server.autonomy.prepare
+
+    async def hang(session, text):
+        started.set()
+        await asyncio.Event().wait()  # inside the turn's try block: only task.cancel() gets it out
+
+    server.autonomy.prepare = hang  # type: ignore[method-assign]
+    await m1.rpc(server, "prompt.submit", {"text": "long task"})
+    task = live.turn_task
+    await asyncio.wait_for(started.wait(), 10)
+    assert live.streaming and live.state == "working"
+    assert (await m1.rpc(server, "session.interrupt", {"session_id": sid}))["result"]["interrupted"]
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    assert task.cancelled()  # the cancellation propagated, nothing swallowed it
+    assert not live.streaming and not live.turn_in_flight
+    assert live.run_result == "completed" and live.state == "completed"
+    row = next(r for r in (await m1.rpc(server, "session.active_list", {}))["result"]["sessions"] if r["id"] == sid)
+    assert row["state"] == "completed"
+
+    # the session takes the next prompt, and that turn starts from a cleared outcome
+    seen: list[str | None] = []
+
+    async def probe(session, text):
+        seen.append(session.run_result)
+        return await original(session, text)
+
+    server.autonomy.prepare = probe  # type: ignore[method-assign]
+    await m1.submit_and_wait(server, "next")
+    assert seen == [None]
+    assert live.run_result == "completed" and live.state == "completed"

@@ -613,7 +613,13 @@ def attach_cmd(session_id: str, readonly: bool, socket_opt: Path | None) -> None
     cmd = f"{sys.executable} -m k3code.cli gateway --attach" + (" --readonly" if readonly else "")
     if socket_opt:
         cmd += f" --socket {shlex.quote(str(socket_opt))}"
-    _launch_tui(env_extra={"K3CODE_GATEWAY_CMD": cmd, "K3CODE_TUI_RESUME": session_id}, require=True)
+    # K3CODE_TUI_CWD, as `k3code agents` sends it: only sessions this TUI creates use it (/new, the fresh session when
+    # <session_id> is unknown); session.resume carries no cwd and /bg prefers the attached session's own cwd, so the
+    # resumed session and where it runs stay as they are. Set explicitly: an inherited value would name another shell.
+    _launch_tui(
+        env_extra={"K3CODE_GATEWAY_CMD": cmd, "K3CODE_TUI_RESUME": session_id, "K3CODE_TUI_CWD": os.getcwd()},
+        require=True,
+    )
 
 
 @cli.command("agents")

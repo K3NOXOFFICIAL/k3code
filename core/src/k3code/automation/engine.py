@@ -179,6 +179,18 @@ class AutomationEngine:
             for row in self.db.rows("automations", "state='active'")
         )
 
+    def references_session(self, session_id: str) -> bool:
+        """Any loop that can still run, or any automation in any state (a paused one can be resumed), points at
+        ``session_id``. Wider than :meth:`bound_to`: the stored-session sweep must not delete a row a resume needs."""
+        if any(
+            r["session_id"] == session_id for r in self.db.rows("loops", "state NOT IN ('stopped', 'done', 'failed')")
+        ):
+            return True
+        return any(
+            (row["action"] or {}).get("session") == session_id or (row["trigger"] or {}).get("session") == session_id
+            for row in self.db.rows("automations")
+        )
+
     def changed(self) -> None:
         """Push the ``⟳`` badge counts and the refreshed strip to attached clients."""
         counts = self.counts()

@@ -9,14 +9,20 @@ kept in memory by the server; this store only persists what resume needs.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+#: The daemon start sweep deletes empty, unnamed stored sessions untouched this long (see SessionStore.sweep_empty).
+EMPTY_SESSION_MAX_AGE_S = 30 * 24 * 3600.0
+SWEEP_BATCH = 200
 
 
 @dataclass
@@ -202,6 +208,57 @@ class SessionStore:
         cur = self._db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         self._db.commit()
         return cur.rowcount > 0
+
+    def sweep_empty(
+        self,
+        *,
+        now: float | None = None,
+        max_age: float = EMPTY_SESSION_MAX_AGE_S,
+        keep: Callable[[str], bool] = lambda _sid: False,
+    ) -> int:
+        """Delete stored sessions nobody can come back to; returns how many went.
+
+        Only rows that are all of: no message, no title, no meta key at all (mode, add_dirs, reasoning effort, goal,
+        origin, background, branches... each is something the user or an automation set), last saved more than
+        ``max_age`` seconds before ``now``, and not ``keep(session_id)`` (the caller's live sessions and those an
+        loop or automation points at). ``model`` is no signal: every new session gets the default model.
+        A workspace move leaves no marker either; the age limit covers it (moving saves the row).
+        """
+        ids = self._old_ids(now, max_age)
+        return sum(self._sweep_batch(ids[i : i + SWEEP_BATCH], keep) for i in range(0, len(ids), SWEEP_BATCH))
+
+    async def sweep_empty_async(
+        self,
+        *,
+        now: float | None = None,
+        max_age: float = EMPTY_SESSION_MAX_AGE_S,
+        keep: Callable[[str], bool] = lambda _sid: False,
+    ) -> int:
+        """:meth:`sweep_empty` in small batches that yield to the event loop between them (the connection is not
+        thread-safe, so no thread). Each batch re-reads its rows, so a session that gained a message meanwhile stays."""
+        ids = self._old_ids(now, max_age)
+        deleted = 0
+        for i in range(0, len(ids), SWEEP_BATCH):
+            deleted += self._sweep_batch(ids[i : i + SWEEP_BATCH], keep)
+            await asyncio.sleep(0)
+        return deleted
+
+    def _old_ids(self, now: float | None, max_age: float) -> list[str]:
+        """Ids only, straight off the ``updated_at`` index: no transcript is read here."""
+        cutoff = (time.time() if now is None else now) - max_age
+        return [r[0] for r in self._db.execute("SELECT session_id FROM sessions WHERE updated_at < ?", (cutoff,))]
+
+    def _sweep_batch(self, ids: list[str], keep: Callable[[str], bool]) -> int:
+        marks = ",".join("?" * len(ids))
+        rows = self._db.execute(
+            f"SELECT session_id, title, meta FROM sessions WHERE session_id IN ({marks}) AND messages IN ('', '[]')",  # noqa: S608
+            ids,
+        ).fetchall()
+        doomed = [sid for sid, title, meta in rows if not title and meta in ("", "{}") and not keep(sid)]
+        for sid in doomed:
+            self._db.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+        self._db.commit()
+        return len(doomed)
 
     def most_recent(self) -> StoredSession | None:
         """The session to continue: the newest one the user worked in (cron/loop/automation runs and sessions with no
