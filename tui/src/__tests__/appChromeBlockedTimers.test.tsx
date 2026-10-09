@@ -2,23 +2,38 @@ import { PassThrough } from "stream";
 
 import { renderSync } from "@k3code/ink";
 import { stripAnsi } from "@k3code/shared/ansi";
-import React from "react";
+import React, { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { GatewayProvider } from "../app/gatewayContext.js";
 import type {
   AppLayoutProps,
+  ComposerActions,
+  GatewayServices,
+  InputHandlerContext,
   OverlayState,
   UiState,
 } from "../app/interfaces.js";
-import { patchOverlayState, resetOverlayState } from "../app/overlayStore.js";
+import {
+  getOverlayState,
+  patchOverlayState,
+  resetOverlayState,
+} from "../app/overlayStore.js";
+import { patchTurnState, resetTurnState } from "../app/turnStore.js";
 import { patchUiState, resetUiState } from "../app/uiStore.js";
+import { useInputHandlers } from "../app/useInputHandlers.js";
 import { StatusRule } from "../components/appChrome.js";
 import { AppLayout } from "../components/appLayout.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import { AGENT_VIEW_HINT } from "../k3/agentView.js";
-import { $stripSessions } from "../k3/agentStripStore.js";
+import {
+  $stripNav,
+  $stripSessions,
+  IDLE_NAV,
+  setStripHandlers,
+} from "../k3/agentStripStore.js";
 import { DEFAULT_THEME } from "../theme.js";
+import type { SubagentProgress } from "../types.js";
 
 type StatusRuleProps = React.ComponentProps<typeof StatusRule>;
 type IntervalSpy = ReturnType<
@@ -208,16 +223,21 @@ const mountLayout = (
   overlay: Partial<OverlayState> = {},
   ui: Partial<UiState> = {},
   actions: Partial<AppLayoutProps["actions"]> = {},
+  {
+    beside = null,
+    gateway = gatewayStub,
+  }: { beside?: React.ReactNode; gateway?: GatewayServices } = {},
 ) => {
   patchUiState({ sessionTitle: "test", sid: "sid-1", status: "ready", ...ui });
   patchOverlayState(overlay);
 
   return mountTree(
-    <GatewayProvider value={gatewayStub}>
+    <GatewayProvider value={gateway}>
       <AppLayout
         {...layoutProps}
         actions={{ ...layoutProps.actions, ...actions }}
       />
+      {beside}
     </GatewayProvider>,
     { interactive: true },
   );
@@ -571,4 +591,320 @@ describe("AppLayout agent view: leaving the startup session", () => {
       expect(spy).toHaveBeenCalledWith(...args);
     },
   );
+});
+
+// ── useInputHandlers harness ─────────────────────────────────────────
+//
+// The real global key handler, mounted through Ink beside AppLayout as useMainApp does, with a composer whose state
+// lives in React so a cleared draft shows up in `composer.input`.
+
+const LEFT = "\x1b[D";
+const ESC = "\x1b";
+
+type ComposerProbe = { clearIn: ReturnType<typeof vi.fn>; input: string };
+
+const InputHarness = ({
+  historyIdx = null,
+  initialInput = "",
+  probe,
+}: {
+  historyIdx?: null | number;
+  initialInput?: string;
+  probe: ComposerProbe;
+}) => {
+  const [input, setInput] = useState(initialInput);
+
+  probe.input = input;
+
+  const composerActions: Partial<ComposerActions> = {
+    clearIn: () => {
+      probe.clearIn();
+      setInput("");
+    },
+    pushHistory: () => {},
+    setHistoryIdx: () => {},
+    setInput,
+    setQueueEdit: () => {},
+  };
+  const ctx: InputHandlerContext = {
+    actions: {
+      answerClarify: () => {},
+      appendMessage: () => {},
+      die: () => {},
+      dispatchSubmission: () => {},
+      guardBusySessionSwitch: () => false,
+      newSession: () => {},
+      sys: () => {},
+    },
+    composer: {
+      actions: composerActions as ComposerActions,
+      refs: {
+        historyDraftRef: { current: "" },
+        historyRef: { current: [""] },
+        queueEditRef: { current: null },
+        queueRef: { current: [] },
+        submitRef: { current: () => {} },
+        tokensRef: { current: [] },
+      },
+      state: {
+        compIdx: 0,
+        compReplace: 0,
+        completions: [],
+        historyIdx,
+        input,
+        inputBuf: [],
+        queueEditIdx: null,
+        queuedDisplay: [],
+        tokens: [],
+      },
+    },
+    gateway: gatewayStub,
+    terminal: {
+      hasSelection: false,
+      scrollRef: { current: null },
+      scrollWithSelection: () => {},
+      selection: {} as InputHandlerContext["terminal"]["selection"],
+    },
+    wheelStep: 1,
+  };
+
+  useInputHandlers(ctx);
+
+  return null;
+};
+
+const newProbe = (): ComposerProbe => ({ clearIn: vi.fn(), input: "" });
+
+describe("useInputHandlers: ← opens the agent view from an idle, empty prompt", () => {
+  afterEach(() => {
+    $stripNav.set(IDLE_NAV);
+    $stripSessions.set([]);
+  });
+
+  it("opens the view on a plain ← with an empty composer", async () => {
+    const probe = newProbe();
+    const layout = mountLayout(
+      {},
+      {},
+      {},
+      {
+        beside: <InputHarness probe={probe} />,
+      },
+    );
+
+    await flush();
+    layout.press(LEFT);
+
+    await vi.waitFor(() => expect(getOverlayState().agentView).toBe(true));
+    await vi.waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
+  });
+
+  it.each<
+    [
+      string,
+      {
+        harness?: Partial<React.ComponentProps<typeof InputHarness>>;
+        key?: string;
+        overlay?: Partial<OverlayState>;
+        strip?: boolean;
+      },
+    ]
+  >([
+    ["with text typed", { harness: { initialInput: "draft" } }],
+    ["during a history walk", { harness: { historyIdx: 0 } }],
+    ["with the agent strip focused", { strip: true }],
+    ["with Shift held", { key: "\x1b[1;2D" }],
+    ["with Alt held", { key: "\x1b[1;3D" }],
+    [
+      "while an approval prompt is open",
+      {
+        overlay: {
+          approval: {
+            command: "ls",
+            requestId: "a-1",
+          } as OverlayState["approval"],
+        },
+      },
+    ],
+  ])("does not open %s", async (_name, { harness, key, overlay, strip }) => {
+    if (strip) {
+      // The strip drops focus as soon as it has no rows, so give it one.
+      $stripSessions.set([{ id: "bg-1", status: "working", title: "bg" }]);
+      $stripNav.set({ ...IDLE_NAV, focused: true });
+    }
+
+    const probe = newProbe();
+    const layout = mountLayout(
+      overlay,
+      {},
+      {},
+      {
+        beside: <InputHarness probe={probe} {...harness} />,
+      },
+    );
+
+    await flush();
+    layout.press(key ?? LEFT);
+    // Past Ink's 50 ms escape-sequence flush, so the key has been dispatched.
+    await flush();
+    await flush();
+    await flush();
+
+    expect(getOverlayState().agentView).toBe(false);
+
+    if (strip) {
+      expect($stripNav.get().focused).toBe(true);
+    }
+  });
+});
+
+describe("useInputHandlers: Esc that closes the agent view does not count toward double-Esc", () => {
+  it("keeps the draft when a second Esc follows the one that closed the view", async () => {
+    const probe = newProbe();
+    const layout = mountLayout(
+      { agentView: true },
+      {},
+      {},
+      {
+        beside: <InputHarness initialInput="keep me" probe={probe} />,
+      },
+    );
+
+    await vi.waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
+
+    // Date.now is pinned to T0, so both presses sit well inside DOUBLE_ESC_MS.
+    layout.press(ESC);
+    await vi.waitFor(() => expect(getOverlayState().agentView).toBe(false));
+    await flush();
+
+    layout.press(ESC);
+    await flush();
+    await flush();
+    await flush();
+
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+});
+
+describe("AppLayout agent view: ⏎ routes by row kind", () => {
+  const helper: SubagentProgress = {
+    depth: 0,
+    goal: "helper agent",
+    id: "ag-1",
+    index: 0,
+    notes: [],
+    parentId: null,
+    startedAt: T0 - 5_000,
+    status: "running",
+    taskCount: 1,
+    thinking: [],
+    toolCount: 0,
+    tools: [],
+  } as SubagentProgress;
+
+  afterEach(() => {
+    $stripSessions.set([]);
+    setStripHandlers(null);
+    resetTurnState();
+  });
+
+  /** A gateway whose `session.list` returns one earlier session of this project. */
+  const pastGateway: GatewayServices = {
+    gw: {
+      request: () =>
+        Promise.resolve({
+          sessions: [
+            {
+              cwd: "/work/proj",
+              id: "past-1",
+              message_count: 4,
+              started_at: T0 / 1000 - 86_400,
+              title: "older work",
+            },
+          ],
+        }),
+      send: () => {},
+    } as unknown as GatewayClient,
+    rpc: gatewayStub.rpc,
+  };
+
+  const info = {
+    cwd: "/work/proj",
+    model: "test",
+    skills: {},
+    tools: {},
+  } as UiState["info"];
+
+  // Each case leaves only the target row in the list, so it is the selected one.
+  it("attaches a live session row with activateLiveSession", async () => {
+    const activateLiveSession = vi.fn();
+    const resumeById = vi.fn();
+
+    $stripSessions.set([
+      { id: "live-1", message_count: 3, status: "working", title: "busy one" },
+    ]);
+
+    const layout = mountLayout(
+      { agentView: true },
+      { info, sid: "s1" },
+      { activateLiveSession, resumeById },
+    );
+
+    await vi.waitFor(() => expect(layout.output()).toContain("› ◐ busy one"));
+    layout.press("\r");
+
+    await vi.waitFor(() => expect(activateLiveSession).toHaveBeenCalled());
+    // s1 is not in the live list, so there is no empty origin session to drop.
+    expect(activateLiveSession).toHaveBeenCalledWith("live-1", undefined);
+    expect(resumeById).not.toHaveBeenCalled();
+    expect(getOverlayState().agentView).toBe(false);
+  });
+
+  it("resumes an earlier session row with resumeById", async () => {
+    const activateLiveSession = vi.fn();
+    const resumeById = vi.fn();
+    const layout = mountLayout(
+      { agentView: true },
+      { info, sid: "s1" },
+      { activateLiveSession, resumeById },
+      { gateway: pastGateway },
+    );
+
+    await vi.waitFor(() => expect(layout.output()).toContain("› · older work"));
+    layout.press("\r");
+
+    await vi.waitFor(() => expect(resumeById).toHaveBeenCalled());
+    expect(resumeById).toHaveBeenCalledWith("past-1");
+    expect(activateLiveSession).not.toHaveBeenCalled();
+    expect(getOverlayState().agentView).toBe(false);
+  });
+
+  it("opens an in-turn agent row through the strip's activate handler", async () => {
+    const activateLiveSession = vi.fn();
+    const resumeById = vi.fn();
+    const stripActivate = vi.fn();
+
+    setStripHandlers({ activate: stripActivate, stop: () => {} });
+    patchTurnState({ subagents: [helper] });
+
+    const layout = mountLayout(
+      { agentView: true },
+      { info, sid: "s1" },
+      { activateLiveSession, resumeById },
+    );
+
+    await vi.waitFor(() =>
+      expect(layout.output()).toContain("› ◐ helper agent"),
+    );
+    layout.press("\r");
+
+    await vi.waitFor(() => expect(stripActivate).toHaveBeenCalled());
+    expect(stripActivate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "ag-1", kind: "agent" }),
+    );
+    expect(activateLiveSession).not.toHaveBeenCalled();
+    expect(resumeById).not.toHaveBeenCalled();
+    expect(getOverlayState().agentView).toBe(false);
+  });
 });

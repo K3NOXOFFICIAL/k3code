@@ -347,6 +347,85 @@ describe("AgentViewPane", () => {
     }
   });
 
+  it("treats Ctrl/Alt+letter as chords: Ctrl+N and Alt+N start nothing, Ctrl+X arms no stop", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([{ id: "a", status: "working", title: "alpha" }]);
+
+    const onNew = vi.fn();
+    const onStop = vi.fn();
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      ref: () => {},
+      setRawMode: () => {},
+      unref: () => {},
+    });
+    let output = "";
+    const stdout = Object.assign(new PassThrough(), {
+      columns: 90,
+      isTTY: false,
+      rows: 30,
+    });
+
+    stdout.on("data", (c) => {
+      output += stripAnsi(c.toString());
+    });
+
+    const view = renderSync(
+      <AgentViewPane
+        gw={
+          {
+            request: () => Promise.resolve({ sessions: [] }),
+          } as unknown as GatewayClient
+        }
+        onActivate={() => {}}
+        onClose={() => {}}
+        onNew={onNew}
+        onStop={onStop}
+      />,
+      {
+        patchConsole: false,
+        stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+      },
+    );
+    // Long enough for Ink's 50 ms escape-sequence flush and the re-render after it.
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 120));
+
+    try {
+      await vi.waitFor(() => expect(output).toContain("› ◐ alpha"));
+
+      stdin.write("\x0e"); // Ctrl+N
+      await settle();
+      stdin.write("\x1bn"); // Alt+N
+      await settle();
+      stdin.write("\x18"); // Ctrl+X
+      await settle();
+      stdin.write("y");
+      await settle();
+
+      expect(onNew).not.toHaveBeenCalled();
+      expect(onStop).not.toHaveBeenCalled();
+      expect(output).not.toContain("stop? y/n");
+
+      // The bare letters still are view commands.
+      stdin.write("x");
+      await vi.waitFor(() => expect(output).toContain("stop? y/n"));
+      stdin.write("y");
+      await vi.waitFor(() => expect(onStop).toHaveBeenCalled());
+      expect(onStop.mock.calls[0]![0]).toMatchObject({ id: "a" });
+
+      stdin.write("n");
+      await vi.waitFor(() => expect(onNew).toHaveBeenCalled());
+    } finally {
+      view.unmount();
+      view.cleanup();
+      $stripSessions.set([]);
+      resetUiState();
+    }
+  });
+
   it("asks the gateway for the current project's earlier sessions only", async () => {
     resetUiState();
     patchUiState({
