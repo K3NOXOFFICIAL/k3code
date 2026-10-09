@@ -19,12 +19,14 @@ import {
   patchOverlayState,
   resetOverlayState,
 } from "../app/overlayStore.js";
+import { turnController } from "../app/turnController.js";
 import { patchTurnState, resetTurnState } from "../app/turnStore.js";
 import { getUiState, patchUiState, resetUiState } from "../app/uiStore.js";
 import { useInputHandlers } from "../app/useInputHandlers.js";
 import { useSessionLifecycle } from "../app/useSessionLifecycle.js";
 import { StatusRule } from "../components/appChrome.js";
 import { AppLayout } from "../components/appLayout.js";
+import { DOUBLE_ESC_MS } from "../config/timing.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import { AGENT_VIEW_HINT } from "../k3/agentView.js";
 import {
@@ -80,6 +82,8 @@ const mountTree = (tree: React.ReactElement, { interactive = false } = {}) => {
   });
 
   const instance = renderSync(tree, {
+    // The app handles Ctrl+C itself (clear / interrupt / exit); Ink must not unmount on it.
+    exitOnCtrlC: false,
     patchConsole: false,
     stderr: stderr as NodeJS.WriteStream,
     stdin: stdin as NodeJS.ReadStream,
@@ -800,13 +804,17 @@ const ESC = "\x1b";
 type ComposerProbe = { clearIn: ReturnType<typeof vi.fn>; input: string };
 
 const InputHarness = ({
+  gateway = gatewayStub,
   historyIdx = null,
   initialInput = "",
   probe,
+  queueEditIdx = null,
 }: {
+  gateway?: GatewayServices;
   historyIdx?: null | number;
   initialInput?: string;
   probe: ComposerProbe;
+  queueEditIdx?: null | number;
 }) => {
   const [input, setInput] = useState(initialInput);
 
@@ -849,12 +857,12 @@ const InputHarness = ({
         historyIdx,
         input,
         inputBuf: [],
-        queueEditIdx: null,
+        queueEditIdx,
         queuedDisplay: [],
         tokens: [],
       },
     },
-    gateway: gatewayStub,
+    gateway,
     terminal: {
       hasSelection: false,
       scrollRef: { current: null },
@@ -1019,6 +1027,395 @@ describe("useInputHandlers: Esc that closes the agent view does not count toward
 
     expect(probe.clearIn).not.toHaveBeenCalled();
     expect(probe.input).toBe("keep me");
+  });
+});
+
+describe("useInputHandlers: a double Esc interrupts a running turn", () => {
+  afterEach(() => {
+    $stripNav.set(IDLE_NAV);
+    $stripSessions.set([]);
+    turnController.fullReset();
+  });
+
+  /** A gateway whose requests resolve, so `session.interrupt` calls can be counted. */
+  const spyGateway = () => {
+    const request = vi.fn((_method: string, _params?: unknown) =>
+      Promise.resolve<unknown>(null),
+    );
+
+    return {
+      gateway: {
+        gw: { request, send: () => {} } as unknown as GatewayClient,
+        rpc: gatewayStub.rpc,
+      } as GatewayServices,
+      interrupts: () =>
+        request.mock.calls.filter(([method]) => method === "session.interrupt"),
+    };
+  };
+
+  type EscSeen = { ctrl: boolean; meta: boolean; shift: boolean };
+
+  /** Records every Esc the input layer dispatched, with its raw modifiers. */
+  const EscProbe = ({ escs }: { escs: EscSeen[] }) => {
+    useInput((_ch, key, event) => {
+      if (key.escape) {
+        escs.push({
+          ctrl: key.ctrl,
+          meta: Boolean(event.keypress.meta || event.keypress.option),
+          shift: key.shift,
+        });
+      }
+    });
+
+    return null;
+  };
+
+  const setup = ({
+    actions = {},
+    busy = true,
+    harness = {},
+    overlay = {},
+  }: {
+    actions?: Partial<AppLayoutProps["actions"]>;
+    busy?: boolean;
+    harness?: Partial<React.ComponentProps<typeof InputHarness>>;
+    overlay?: Partial<OverlayState>;
+  } = {}) => {
+    const { gateway, interrupts } = spyGateway();
+    const probe = newProbe();
+    const hits = { f12: 0 };
+    const escs: EscSeen[] = [];
+    const layout = mountLayout(overlay, { busy }, actions, {
+      beside: (
+        <>
+          <InputHarness gateway={gateway} probe={probe} {...harness} />
+          <SentinelProbe hits={hits} />
+          <EscProbe escs={escs} />
+        </>
+      ),
+      gateway,
+    });
+
+    // A lone Esc is only emitted after Ink's 50 ms escape-sequence flush; the sentinel must follow after it, or the
+    // two merge into Alt+F12 (which the probe ignores, so the wait fails rather than passes falsely). Back-to-back
+    // `\x1b\x1b` would likewise arrive as one Alt+Esc, so every Esc of a pair goes through here.
+    const escThenSentinel = async (key = ESC) => {
+      layout.press(key);
+      await flush();
+      await flush();
+      await flush();
+      await pressThenSentinel(layout, hits, "");
+    };
+
+    /** Make the next turn run again after an interrupt ended the last one. */
+    const startTurn = async () => {
+      patchUiState({ busy: true });
+      await flush();
+    };
+
+    return { escs, escThenSentinel, interrupts, layout, probe, startTurn };
+  };
+
+  // Date.now is pinned to T0 (beforeEach), so consecutive Escs sit inside DOUBLE_ESC_MS unless a test moves it.
+
+  it("a single Esc mid-turn does not interrupt and leaves the draft alone", async () => {
+    const { escThenSentinel, interrupts, probe } = setup({
+      harness: { initialInput: "keep me" },
+    });
+
+    await flush();
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(0);
+    expect(getUiState().busy).toBe(true);
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+
+  it("Esc Esc inside the window sends session.interrupt once and keeps the draft", async () => {
+    const { escThenSentinel, interrupts, probe } = setup({
+      harness: { initialInput: "keep me" },
+    });
+
+    await flush();
+    await escThenSentinel();
+    await escThenSentinel();
+
+    expect(interrupts()).toEqual([
+      ["session.interrupt", { session_id: "sid-1" }],
+    ]);
+    expect(getUiState().busy).toBe(false);
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+
+  it("Esc Esc further apart than the window does not interrupt; the late Esc opens a new pair", async () => {
+    const { escThenSentinel, interrupts, probe } = setup({
+      harness: { initialInput: "keep me" },
+    });
+
+    await flush();
+    await escThenSentinel();
+    nowSpy.mockReturnValue(T0 + DOUBLE_ESC_MS + 1);
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(0);
+    expect(probe.input).toBe("keep me");
+
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(1);
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+
+  it("an Esc right after the interrupt starts a new pair instead of interrupting again", async () => {
+    const { escThenSentinel, interrupts, probe, startTurn } = setup({
+      harness: { initialInput: "keep me" },
+    });
+
+    await flush();
+    await escThenSentinel();
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(1);
+
+    await startTurn();
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(1);
+
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(2);
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+
+  it("the Esc that closes an overlay is not the first half of a pair", async () => {
+    const { escThenSentinel, interrupts, probe } = setup({
+      harness: { initialInput: "keep me" },
+      overlay: { pager: { lines: ["a"], offset: 0 } },
+    });
+
+    await flush();
+    await escThenSentinel();
+    await waitFor(() => expect(getOverlayState().pager).toBeNull());
+    await flush();
+
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(0);
+    expect(probe.input).toBe("keep me");
+
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(1);
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+
+  it("an Esc that closes an overlay between the two halves cancels the open pair", async () => {
+    const { escThenSentinel, interrupts, probe } = setup({
+      harness: { initialInput: "keep me" },
+    });
+
+    await flush();
+    // Opens a pair.
+    await escThenSentinel();
+    patchOverlayState({ pager: { lines: ["a"], offset: 0 } });
+    await flush();
+    await escThenSentinel();
+    await waitFor(() => expect(getOverlayState().pager).toBeNull());
+    await flush();
+
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(0);
+
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(1);
+    expect(probe.input).toBe("keep me");
+  });
+
+  it("idle: Esc Esc still discards the draft and interrupts nothing", async () => {
+    const { escThenSentinel, interrupts, probe } = setup({
+      busy: false,
+      harness: { initialInput: "drop me" },
+    });
+
+    await flush();
+    await escThenSentinel();
+
+    expect(probe.input).toBe("drop me");
+
+    await escThenSentinel();
+
+    await waitFor(() => expect(probe.clearIn).toHaveBeenCalledTimes(1));
+    expect(probe.input).toBe("");
+    expect(interrupts()).toHaveLength(0);
+  });
+
+  it("a mid-turn Esc never pairs with an idle Esc into a draft discard", async () => {
+    const { escThenSentinel, interrupts, probe, startTurn } = setup({
+      busy: false,
+      harness: { initialInput: "keep me" },
+    });
+
+    await flush();
+    // Idle: arms the discard clock.
+    await escThenSentinel();
+    await startTurn();
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(0);
+    expect(probe.input).toBe("keep me");
+
+    // The turn ends; this idle Esc sits inside the window of both earlier ones.
+    patchUiState({ busy: false });
+    await flush();
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(0);
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+
+  it("a pending approval prompt keeps Esc (it denies) and Esc Esc does not interrupt", async () => {
+    const answerApproval = vi.fn();
+    const { escThenSentinel, interrupts, probe } = setup({
+      actions: { answerApproval },
+      harness: { initialInput: "keep me" },
+      overlay: {
+        approval: {
+          command: "ls",
+          requestId: "a-1",
+        } as OverlayState["approval"],
+      },
+    });
+
+    await flush();
+    await escThenSentinel();
+    await escThenSentinel();
+
+    await waitFor(() => expect(answerApproval).toHaveBeenCalledWith("deny"));
+    // As before: a prompt overlay does not swallow the double-Esc draft discard.
+    await waitFor(() => expect(probe.clearIn).toHaveBeenCalledTimes(1));
+    expect(interrupts()).toHaveLength(0);
+  });
+
+  it("Esc cancels a pending sudo prompt and does not count toward a pair", async () => {
+    const { escThenSentinel, interrupts } = setup({
+      overlay: { sudo: { requestId: "sudo-1" } as OverlayState["sudo"] },
+    });
+
+    await flush();
+    await escThenSentinel();
+    await waitFor(() => expect(getOverlayState().sudo).toBeNull());
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(0);
+  });
+
+  it("Esc closes the agent view and does not count toward a pair", async () => {
+    const { escThenSentinel, interrupts, layout, probe } = setup({
+      harness: { initialInput: "keep me" },
+      overlay: { agentView: true },
+    });
+
+    await waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
+    await escThenSentinel();
+    await waitFor(() => expect(getOverlayState().agentView).toBe(false));
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(0);
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+
+  it("Esc returns focus from the agent strip and does not count toward a pair", async () => {
+    // The strip drops focus as soon as it has no rows, so give it one.
+    $stripSessions.set([{ id: "bg-1", status: "working", title: "bg" }]);
+    $stripNav.set({ ...IDLE_NAV, focused: true });
+
+    const { escThenSentinel, interrupts } = setup();
+
+    await flush();
+    await escThenSentinel();
+    await waitFor(() => expect($stripNav.get().focused).toBe(false));
+    await escThenSentinel();
+
+    expect(interrupts()).toHaveLength(0);
+  });
+
+  it("during a history walk Esc Esc keeps its old meaning (discards the recalled entry) and does not interrupt", async () => {
+    const { escThenSentinel, interrupts, probe } = setup({
+      harness: { historyIdx: 0, initialInput: "older input" },
+    });
+
+    await flush();
+    await escThenSentinel();
+    await escThenSentinel();
+
+    await waitFor(() => expect(probe.clearIn).toHaveBeenCalledTimes(1));
+    expect(interrupts()).toHaveLength(0);
+  });
+
+  it("during a queue edit Esc cancels the edit and Esc Esc does not interrupt", async () => {
+    const { escThenSentinel, interrupts, probe } = setup({
+      harness: { initialInput: "queued", queueEditIdx: 0 },
+    });
+
+    await flush();
+    await escThenSentinel();
+    await escThenSentinel();
+
+    await waitFor(() => expect(probe.clearIn).toHaveBeenCalled());
+    expect(interrupts()).toHaveLength(0);
+  });
+
+  it.each([
+    [
+      "Shift+Esc (kitty)",
+      "\x1b[27;2u",
+      { ctrl: false, meta: false, shift: true },
+    ],
+    [
+      "Alt+Esc (kitty)",
+      "\x1b[27;3u",
+      { ctrl: false, meta: true, shift: false },
+    ],
+    [
+      "Ctrl+Esc (kitty)",
+      "\x1b[27;5u",
+      { ctrl: true, meta: false, shift: false },
+    ],
+  ])("a %s pair does not interrupt", async (_name, key, modifiers) => {
+    const { escThenSentinel, escs, interrupts } = setup();
+
+    await flush();
+    await escThenSentinel(key);
+    await escThenSentinel(key);
+
+    // Each arrived as one modified Esc, not as a lone Esc the pair logic would count.
+    expect(escs).toEqual([modifiers, modifiers]);
+    expect(interrupts()).toHaveLength(0);
+  });
+
+  it("leaves Ctrl+C as it was: a draft is cleared first, an empty composer interrupts", async () => {
+    const { interrupts, layout, probe } = setup({
+      harness: { initialInput: "draft" },
+    });
+
+    await flush();
+    layout.press("\x03");
+    await waitFor(() => expect(probe.clearIn).toHaveBeenCalledTimes(1));
+    expect(interrupts()).toHaveLength(0);
+
+    await flush();
+    layout.press("\x03");
+    await waitFor(() => expect(interrupts()).toHaveLength(1));
   });
 });
 

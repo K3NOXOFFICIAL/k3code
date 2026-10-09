@@ -17,6 +17,7 @@ import {
   handleIdleHotkeyExit,
   resolveCtrlCComposerAction,
   shouldDetachEditedHistoryInput,
+  escCountsTowardInterrupt,
   shouldFallThroughForScroll,
   shouldOpenAgentView,
 } from "../app/useInputHandlers.js";
@@ -274,6 +275,59 @@ describe("shouldOpenAgentView — ← opens the agent view only from an idle, em
     for (const mod of ["shift", "meta", "ctrl"] as const) {
       expect(
         shouldOpenAgentView({ ...idle, key: { leftArrow: true, [mod]: true } }),
+      ).toBe(false);
+    }
+  });
+});
+
+describe("escCountsTowardInterrupt — only a bare Esc mid-turn that nothing else owns counts toward the interrupting Esc Esc", () => {
+  const esc = {
+    alt: false,
+    ctrl: false,
+    escape: true,
+    shift: false,
+    super: false,
+  };
+  const running = {
+    blocked: false,
+    busy: true,
+    hasSession: true,
+    historyIdx: null,
+    key: esc,
+    queueEditIdx: null,
+    stripFocused: false,
+  };
+
+  it("counts a bare Esc mid-turn", () => {
+    expect(escCountsTowardInterrupt(running)).toBe(true);
+  });
+
+  it("does not count when idle or before the session exists", () => {
+    expect(escCountsTowardInterrupt({ ...running, busy: false })).toBe(false);
+    expect(escCountsTowardInterrupt({ ...running, hasSession: false })).toBe(
+      false,
+    );
+  });
+
+  it("leaves Esc to an overlay, prompt or agent view, the strip, a history walk or a queue edit", () => {
+    expect(escCountsTowardInterrupt({ ...running, blocked: true })).toBe(false);
+    expect(escCountsTowardInterrupt({ ...running, stripFocused: true })).toBe(
+      false,
+    );
+    expect(escCountsTowardInterrupt({ ...running, historyIdx: 0 })).toBe(false);
+    expect(escCountsTowardInterrupt({ ...running, queueEditIdx: 0 })).toBe(
+      false,
+    );
+  });
+
+  it("does not count other keys or an Esc with a modifier held", () => {
+    expect(
+      escCountsTowardInterrupt({ ...running, key: { ...esc, escape: false } }),
+    ).toBe(false);
+
+    for (const mod of ["alt", "ctrl", "shift", "super"] as const) {
+      expect(
+        escCountsTowardInterrupt({ ...running, key: { ...esc, [mod]: true } }),
       ).toBe(false);
     }
   });

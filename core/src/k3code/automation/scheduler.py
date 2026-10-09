@@ -99,11 +99,8 @@ class JobScheduler:
         return self.db.get("jobs", job_id) or {}
 
     def find(self, ref: str) -> dict[str, Any] | None:
-        row = self.db.find("jobs", ref)
-        if row is None:
-            rows = [r for r in self.db.rows("jobs") if r["name"] == ref]
-            row = rows[0] if len(rows) == 1 else None
-        return row
+        """Exact id, then exact name, then unique id prefix; an ambiguous ref finds nothing."""
+        return self.db.find("jobs", ref, name_col="name")
 
     def remove(self, ref: str) -> bool:
         row = self.find(ref)

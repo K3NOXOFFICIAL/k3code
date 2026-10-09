@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import sqlite3
 import time
 import uuid
@@ -20,8 +21,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 #: The daemon start sweep deletes empty, unnamed stored sessions untouched this long (see SessionStore.sweep_empty).
 EMPTY_SESSION_MAX_AGE_S = 30 * 24 * 3600.0
+#: The sweep forgets its tombstone of a deleted row after this long (a later save no longer restores it).
+SWEPT_TOMBSTONE_MAX_AGE_S = 90 * 24 * 3600.0
 SWEEP_BATCH = 200
 
 
@@ -65,6 +70,9 @@ class SessionStore:
         with contextlib.suppress(sqlite3.OperationalError):  # column already exists
             self._db.execute("ALTER TABLE sessions ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
         self._db.execute("CREATE INDEX IF NOT EXISTS sessions_updated_at ON sessions (updated_at)")
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS swept_sessions (session_id TEXT PRIMARY KEY, swept_at REAL NOT NULL)"
+        )
         self._db.commit()
 
     def create(self, *, title: str = "", model: str = "", provider: str = "", cwd: str = "") -> StoredSession:
@@ -91,6 +99,12 @@ class SessionStore:
         now = time.time()
         sess.created_at = sess.created_at or now
         sess.updated_at = now
+        self._insert_row(sess)
+        self._db.commit()
+        return sess
+
+    def _insert_row(self, sess: StoredSession) -> None:
+        """The full-row INSERT shared by :meth:`insert` and a save that restores a swept row; no commit."""
         self._db.execute(
             "INSERT INTO sessions"
             " (session_id, title, model, provider, cwd, messages, usage, created_at, updated_at, meta)"
@@ -108,8 +122,6 @@ class SessionStore:
                 json.dumps(sess.meta, ensure_ascii=False),
             ),
         )
-        self._db.commit()
-        return sess
 
     @staticmethod
     def new_id() -> str:
@@ -186,27 +198,40 @@ class SessionStore:
         ).fetchall()
 
     def save(self, sess: StoredSession) -> None:
+        """Update the row; a missing row stays missing (deleted sessions are not resurrected), unless the start
+        sweep removed it: then its tombstone is there and the row is restored from ``sess`` (another process, such
+        as a standalone stdio TUI, may hold the session open past the sweep's age limit)."""
         sess.updated_at = time.time()
-        self._db.execute(
-            "UPDATE sessions SET title=?, model=?, provider=?, cwd=?, messages=?, usage=?, updated_at=?, meta=?"
-            " WHERE session_id=?",
-            (
-                sess.title,
-                sess.model,
-                sess.provider,
-                sess.cwd,
-                json.dumps(sess.messages, ensure_ascii=False),
-                json.dumps(sess.usage, ensure_ascii=False),
-                sess.updated_at,
-                json.dumps(sess.meta, ensure_ascii=False),
-                sess.session_id,
-            ),
-        )
-        self._db.commit()
+        with self._db:
+            cur = self._db.execute(
+                "UPDATE sessions SET title=?, model=?, provider=?, cwd=?, messages=?, usage=?, updated_at=?, meta=?"
+                " WHERE session_id=?",
+                (
+                    sess.title,
+                    sess.model,
+                    sess.provider,
+                    sess.cwd,
+                    json.dumps(sess.messages, ensure_ascii=False),
+                    json.dumps(sess.usage, ensure_ascii=False),
+                    sess.updated_at,
+                    json.dumps(sess.meta, ensure_ascii=False),
+                    sess.session_id,
+                ),
+            )
+            if cur.rowcount:
+                return
+            gone = self._db.execute("DELETE FROM swept_sessions WHERE session_id = ?", (sess.session_id,))
+            if not gone.rowcount:
+                return
+            sess.created_at = sess.created_at or sess.updated_at
+            self._insert_row(sess)
+        logger.info("restored stored session %s removed by the empty-session sweep", sess.session_id)
 
     def delete(self, session_id: str) -> bool:
-        cur = self._db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-        self._db.commit()
+        """Delete the row and any sweep tombstone for it, so no later save brings the session back."""
+        with self._db:
+            cur = self._db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            self._db.execute("DELETE FROM swept_sessions WHERE session_id = ?", (session_id,))
         return cur.rowcount > 0
 
     def sweep_empty(
@@ -223,9 +248,15 @@ class SessionStore:
         ``max_age`` seconds before ``now``, and not ``keep(session_id)`` (the caller's live sessions and those an
         loop or automation points at). ``model`` is no signal: every new session gets the default model.
         A workspace move leaves no marker either; the age limit covers it (moving saves the row).
+
+        Each deleted row leaves a tombstone in ``swept_sessions`` (same transaction), so a process that still holds
+        the session restores it on its next :meth:`save`; tombstones older than ``SWEPT_TOMBSTONE_MAX_AGE_S`` go here.
         """
+        now = self._prune_tombstones(now)
         ids = self._old_ids(now, max_age)
-        return sum(self._sweep_batch(ids[i : i + SWEEP_BATCH], keep) for i in range(0, len(ids), SWEEP_BATCH))
+        return sum(
+            self._sweep_batch(ids[i : i + SWEEP_BATCH], keep, now, max_age) for i in range(0, len(ids), SWEEP_BATCH)
+        )
 
     async def sweep_empty_async(
         self,
@@ -236,29 +267,51 @@ class SessionStore:
     ) -> int:
         """:meth:`sweep_empty` in small batches that yield to the event loop between them (the connection is not
         thread-safe, so no thread). Each batch re-reads its rows, so a session that gained a message meanwhile stays."""
+        now = self._prune_tombstones(now)
         ids = self._old_ids(now, max_age)
         deleted = 0
         for i in range(0, len(ids), SWEEP_BATCH):
-            deleted += self._sweep_batch(ids[i : i + SWEEP_BATCH], keep)
+            deleted += self._sweep_batch(ids[i : i + SWEEP_BATCH], keep, now, max_age)
             await asyncio.sleep(0)
         return deleted
 
-    def _old_ids(self, now: float | None, max_age: float) -> list[str]:
+    def _prune_tombstones(self, now: float | None) -> float:
+        """Forget tombstones older than ``SWEPT_TOMBSTONE_MAX_AGE_S``; returns the sweep's clock."""
+        now = time.time() if now is None else now
+        with self._db:
+            self._db.execute("DELETE FROM swept_sessions WHERE swept_at < ?", (now - SWEPT_TOMBSTONE_MAX_AGE_S,))
+        return now
+
+    def _old_ids(self, now: float, max_age: float) -> list[str]:
         """Ids only, straight off the ``updated_at`` index: no transcript is read here."""
-        cutoff = (time.time() if now is None else now) - max_age
+        cutoff = now - max_age
         return [r[0] for r in self._db.execute("SELECT session_id FROM sessions WHERE updated_at < ?", (cutoff,))]
 
-    def _sweep_batch(self, ids: list[str], keep: Callable[[str], bool]) -> int:
+    def _sweep_batch(self, ids: list[str], keep: Callable[[str], bool], now: float, max_age: float) -> int:
         marks = ",".join("?" * len(ids))
         rows = self._db.execute(
             f"SELECT session_id, title, meta FROM sessions WHERE session_id IN ({marks}) AND messages IN ('', '[]')",  # noqa: S608
             ids,
         ).fetchall()
         doomed = [sid for sid, title, meta in rows if not title and meta in ("", "{}") and not keep(sid)]
-        for sid in doomed:
-            self._db.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
-        self._db.commit()
-        return len(doomed)
+        deleted = 0
+        with self._db:  # a row and its tombstone go together or not at all
+            for sid in doomed:
+                # the read above ran outside this transaction: another process may have saved the row since, so the
+                # DELETE repeats every condition of the read and the guard (same shape, in SQL) and may match nothing
+                cur = self._db.execute(
+                    "DELETE FROM sessions WHERE session_id = ? AND messages IN ('', '[]') AND updated_at < ?"
+                    " AND (title IS NULL OR title = '') AND meta IN ('', '{}')",
+                    (sid, now - max_age),
+                )
+                if cur.rowcount != 1:
+                    logger.info("empty-session sweep left %s alone: it changed or went while the sweep ran", sid)
+                    continue
+                self._db.execute(
+                    "INSERT OR REPLACE INTO swept_sessions (session_id, swept_at) VALUES (?, ?)", (sid, now)
+                )
+                deleted += 1
+        return deleted
 
     def most_recent(self) -> StoredSession | None:
         """The session to continue: the newest one the user worked in (cron/loop/automation runs and sessions with no
