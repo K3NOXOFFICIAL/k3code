@@ -1407,6 +1407,9 @@ class GatewayServer:
                     if await self._maybe_compact(session, force=True):
                         status, final_text = await self._run_one_turn(session, prompt)
             except asyncio.CancelledError:
+                # /stop and Esc cancel the turn task: the cancellation skips _run_one_turn's outcome mapping, so the
+                # turn read 'idle' (or an earlier turn's 'failed'). Interrupted ends as completed, like TurnCancelled.
+                session.run_result = "completed"
                 self._block_goal_for(session, "interrupted")
                 raise
             if self.halted and mgr.is_active() and status == "done":
@@ -1550,6 +1553,9 @@ class GatewayServer:
         error: str | None = None
         status = "done"
         gate = GateResult(prompt=text)
+        # bound before the try: a /stop during the scope gate reached the finally first, whose replay record then
+        # raised UnboundLocalError in place of the CancelledError
+        history: list[Message] = []
         loop = self._build_loop(
             session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
         )
