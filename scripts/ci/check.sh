@@ -205,7 +205,8 @@ tui_deps() {
     echo "node_modules matches package-lock.json; npm ci skipped"
     return 0
   fi
-  npm ci --no-audit --no-fund
+  # step runs this under `|| rc=$?`, where errexit is off: stamp only an install that succeeded.
+  npm ci --no-audit --no-fund || return $?
   echo "$want" >node_modules/.k3ci-lock
 }
 

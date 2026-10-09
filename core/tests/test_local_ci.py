@@ -218,6 +218,21 @@ def test_post_refuses_a_dirty_tree_or_a_commit_not_on_origin(tmp_path: Path) -> 
     assert not (tmp_path / "logs").exists()
 
 
+def test_a_failed_npm_ci_fails_tui_and_leaves_no_stamp(tmp_path: Path) -> None:
+    env = _env(tmp_path)
+    repo = _ci_repo(tmp_path, env)
+    bindir = _stub_bin(tmp_path)
+    # a partial install: node_modules exists, but npm ci failed
+    (bindir / "npm").write_text('#!/bin/sh\n[ "$1" = ci ] && { mkdir -p node_modules/partial; exit 1; }\nexit 0\n')
+    env.update(PATH=f"{bindir}:{env['PATH']}", K3CODE_CI_ROOT=str(repo), K3CODE_CI_LOG_DIR=str(tmp_path / "logs"))
+    for _ in range(2):  # the second run must retry npm ci, not trust the broken node_modules
+        r = _run(["bash", str(CHECK), "--only", "tui", "--quick"], REPO, env)
+        assert r.returncode == 1, r.stdout + r.stderr
+        assert "FAILED: npm ci (exit 1)" in r.stderr
+        assert "npm ci skipped" not in (tmp_path / "logs" / "tui.log").read_text()
+        assert not (repo / "tui" / "node_modules" / ".k3ci-lock").exists()
+
+
 def test_a_missing_tool_fails_its_area_with_an_install_hint(tmp_path: Path) -> None:
     env = _env(tmp_path)
     repo = _ci_repo(tmp_path, env)
