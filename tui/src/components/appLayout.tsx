@@ -10,6 +10,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
 } from "react";
 
 import { useGateway } from "../app/gatewayContext.js";
@@ -20,7 +21,7 @@ import {
   patchOverlayState,
 } from "../app/overlayStore.js";
 import { $petEnabled, $petParty } from "../app/petStore.js";
-import { $uiState } from "../app/uiStore.js";
+import { $uiState, getUiState } from "../app/uiStore.js";
 import {
   INLINE_MODE,
   NATIVE_MODE,
@@ -48,9 +49,16 @@ import {
 import { AgentsOverlay } from "./agentsOverlay.js";
 import { AgentStrip } from "../k3/agentStrip.js";
 import { ProposalCards } from "../k3/proposalCards.js";
-import { $stripNav, getStripHandlers } from "../k3/agentStripStore.js";
+import {
+  $stripNav,
+  $stripSessions,
+  getStripHandlers,
+} from "../k3/agentStripStore.js";
 import { AgentViewPane } from "../k3/agentView.js";
-import type { ViewRow } from "../k3/agentViewStore.js";
+import {
+  isDisposableEmptySession,
+  type ViewRow,
+} from "../k3/agentViewStore.js";
 import { focusVisibleMessages } from "../k3/focusPolicy.js";
 import {
   GoodVibesHeart,
@@ -601,15 +609,27 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
   actions,
 }: Pick<AppLayoutProps, "actions">) {
   const { gw } = useGateway();
+  // The session the view was opened from (for `k3code agents`, the one forged at startup).
+  const [originSid] = useState(() => getUiState().sid);
   const close = () => patchOverlayState({ agentView: false });
+  // Leaving it for another session closes it when it is still empty; resuming already closes the session it leaves.
+  const dropSid = () =>
+    originSid &&
+    isDisposableEmptySession(
+      $stripSessions.get().find((s) => s.id === originSid),
+    )
+      ? originSid
+      : undefined;
 
   const activate = ({ kind, ...row }: ViewRow) => {
     // A live session attaches like Enter in the strip; an earlier one is resumed like the session switcher does
-    // (busy-guarded); an in-turn agent has nothing to attach to, so it just returns to the prompt.
+    // (busy-guarded); an in-turn agent opens its detail view, as Enter on it in the strip does.
     if (kind === "session") {
-      getStripHandlers()?.activate({ ...row, kind });
+      actions.activateLiveSession(row.id, dropSid());
     } else if (kind === "past") {
       actions.resumeById(row.id);
+    } else {
+      getStripHandlers()?.activate({ ...row, kind });
     }
 
     close();
@@ -621,7 +641,7 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
       onActivate={activate}
       onClose={close}
       onNew={() => {
-        actions.newLiveSession();
+        actions.newLiveSession(dropSid());
         close();
       }}
       onStop={({ kind, ...row }) => {

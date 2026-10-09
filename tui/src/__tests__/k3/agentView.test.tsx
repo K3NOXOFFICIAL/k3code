@@ -3,9 +3,16 @@ import { PassThrough } from "node:stream";
 import { renderSync } from "@k3code/ink";
 import React from "react";
 import stripAnsi from "strip-ansi";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { AGENT_VIEW_HINT, AgentViewView } from "../../k3/agentView.js";
+import { patchUiState, resetUiState } from "../../app/uiStore.js";
+import type { GatewayClient } from "../../gatewayClient.js";
+import {
+  AGENT_VIEW_HINT,
+  AgentViewPane,
+  AgentViewView,
+} from "../../k3/agentView.js";
+import { $stripSessions } from "../../k3/agentStripStore.js";
 import {
   IDLE_VIEW_NAV,
   type ViewNav,
@@ -172,5 +179,76 @@ describe("AgentViewView", () => {
     expect(bottom).toContain("↑ 24 more");
     expect(bottom).not.toMatch(/↓ \d+ more/);
     expect(listLines(bottom).length).toBeLessThanOrEqual(height);
+  });
+});
+
+describe("AgentViewPane", () => {
+  it("keeps the selection on its row when a poll inserts or reorders rows above it", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([
+      { id: "a", status: "working", title: "alpha" },
+      { id: "b", status: "working", title: "bravo" },
+    ]);
+
+    const onActivate = vi.fn();
+    const stdout = Object.assign(new PassThrough(), {
+      columns: 90,
+      isTTY: false,
+      rows: 30,
+    });
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      ref: () => {},
+      setRawMode: () => {},
+      unref: () => {},
+    });
+    let output = "";
+
+    stdout.on("data", (c) => {
+      output += stripAnsi(c.toString());
+    });
+
+    const view = renderSync(
+      <AgentViewPane
+        gw={
+          {
+            request: () => Promise.resolve({ sessions: [] }),
+          } as unknown as GatewayClient
+        }
+        onActivate={onActivate}
+        onClose={() => {}}
+        onNew={() => {}}
+        onStop={() => {}}
+      />,
+      {
+        patchConsole: false,
+        stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+      },
+    );
+
+    try {
+      await vi.waitFor(() => expect(output).toContain("› ◐ alpha"));
+      output = "";
+      stdin.write("\x1b[B"); // ↓ onto bravo
+      await vi.waitFor(() => expect(output).toContain("› ◐ bravo"));
+
+      $stripSessions.set([
+        { id: "c", status: "working", title: "charlie" },
+        { id: "a", status: "working", title: "alpha" },
+        { id: "b", status: "working", title: "bravo" },
+      ]);
+      await vi.waitFor(() => expect(output).toContain("charlie"));
+      stdin.write("\r");
+      await vi.waitFor(() => expect(onActivate).toHaveBeenCalled());
+      expect(onActivate.mock.calls[0]![0]).toMatchObject({ id: "b" });
+    } finally {
+      view.unmount();
+      view.cleanup();
+      $stripSessions.set([]);
+      resetUiState();
+    }
   });
 });

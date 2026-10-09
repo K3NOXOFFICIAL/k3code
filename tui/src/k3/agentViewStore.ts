@@ -78,6 +78,8 @@ export function buildViewRows({
   const pastRows: ViewRow[] = (
     resumableHistory(past, sessions) as PastSessionRow[]
   )
+    // An empty stored session (opened, never used) is noise, not history.
+    .filter((h) => h.message_count !== 0)
     .filter((h) => !!h.cwd && h.cwd === currentCwd)
     .map((h, i) => ({ h, i }))
     .sort((a, b) => (b.h.started_at ?? 0) - (a.h.started_at ?? 0) || a.i - b.i)
@@ -125,6 +127,29 @@ export type ViewEffect =
   | { type: "close" }
   | { type: "new" };
 
+/**
+ * Selected row by key, so a refresh that reorders or inserts rows keeps the cursor on the same row. Only when that row
+ * has gone does the old position (clamped) stand in.
+ */
+export function selectedIndex(
+  rows: readonly ViewRow[],
+  key: null | string,
+  fallback: number,
+): number {
+  const i = key == null ? -1 : rows.findIndex((r) => r.key === key);
+
+  return i >= 0 ? i : Math.max(0, Math.min(fallback, rows.length - 1));
+}
+
+/**
+ * A live session that was opened and never used: no messages, idle, not backgrounded. Leaving it for another session
+ * from the agent view closes it, so `k3code agents` does not leave an empty session behind per run.
+ */
+export const isDisposableEmptySession = (
+  s: (SessionActiveItem & { background?: boolean }) | undefined,
+): boolean =>
+  !!s && s.message_count === 0 && !s.background && s.status === "idle";
+
 /** Live sessions other than this one and in-turn agents can be stopped; past rows and the current session cannot. */
 export const isStoppable = (row: ViewRow) =>
   row.kind === "agent" || (row.kind === "session" && !row.current);
@@ -144,14 +169,13 @@ export function reduceViewKey(
     effect,
     nav: { confirmKey: null, index, ...next },
   });
-  // A confirmation whose row has gone (stopped elsewhere, list refreshed) is dropped.
-  const target = nav.confirmKey
-    ? rows.find((r) => r.key === nav.confirmKey)
-    : undefined;
+  // A pending confirmation eats the next key and is cleared. Only y/⏎ on a target still listed stops; when the row has
+  // gone (stopped elsewhere, list refreshed) the key does nothing, so ⏎ cannot attach to whatever row moved under it.
+  if (nav.confirmKey) {
+    const target = rows.find((r) => r.key === nav.confirmKey);
 
-  if (target) {
     return done(
-      !key.escape && !key.left && (ch === "y" || key.return)
+      target && !key.escape && !key.left && (ch === "y" || key.return)
         ? { row: target, type: "stop" }
         : null,
     );

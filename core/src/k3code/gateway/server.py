@@ -275,7 +275,7 @@ class LiveSession:
             "mode": self.perms.mode.value,
             "yolo": self.perms.mode == PermissionMode.YOLO,
             "add_dirs": list(self.perms.add_dirs),
-            "cwd": self.stored.cwd,
+            "cwd": _norm_cwd(self.stored.cwd),
             "title": self.stored.title,
             "stored_session_id": self.session_id,
             "running": self.streaming,
@@ -2412,6 +2412,11 @@ def _usage_payload(usage: Usage) -> dict[str, Any]:
 # ── M1-core method handlers ──────────────────────────────────────────────
 
 
+def _norm_cwd(cwd: str | None) -> str | None:
+    """One spelling per directory (symlinks resolved, no trailing slash), so clients can compare cwds for equality."""
+    return os.path.realpath(cwd) if cwd else None
+
+
 def _require(params: dict[str, Any], key: str) -> Any:
     value = params.get(key)
     if value is None or value == "":
@@ -2423,7 +2428,7 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
     stored = server.store.create(
         model=params.get("model") or server.config.default_model,
         provider=params.get("provider") or "",
-        cwd=params.get("cwd") or str(Path.cwd()),
+        cwd=_norm_cwd(params.get("cwd")) or str(Path.cwd()),
     )
     if params.get("background"):
         stored.meta["background"] = True
@@ -2456,7 +2461,7 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
                 "message_count": len(s.messages),
                 "status": state,
                 "state": state,
-                "cwd": s.cwd or None,
+                "cwd": _norm_cwd(s.cwd),
             }
         )
     return {"sessions": rows}

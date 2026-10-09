@@ -403,9 +403,10 @@ export interface AppLayoutActions {
   answerSecret: (value: string) => void;
   answerSudo: (pw: string) => void;
   clearSelection: () => void;
-  activateLiveSession: (id: string) => void;
+  /** `dropSid`: an empty session to close once attached elsewhere (agent view). */
+  activateLiveSession: (id: string, dropSid?: string) => void;
   closeLiveSession: (id: string) => Promise<null | SessionCloseResponse>;
-  newLiveSession: () => void;
+  newLiveSession: (dropSid?: string) => void;
   newPromptSession: (prompt: string, modelArg?: string) => void;
   onModelSelect: (value: string) => void;
   resumeById: (id: string) => void;

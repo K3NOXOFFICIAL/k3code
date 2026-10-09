@@ -340,17 +340,32 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     [startNewSession],
   );
 
+  // `dropSid`: an empty session to close once this client has moved off it (the daemon refuses while attached, and
+  // refuses a session that is in use; that refusal is not an error here).
+  const dropAfterSwitch = useCallback(
+    (dropSid: string | undefined, nowSid: null | string | undefined) => {
+      if (dropSid && nowSid && dropSid !== nowSid) {
+        void closeSession(dropSid).catch(() => null);
+      }
+    },
+    [closeSession],
+  );
+
   const newLiveSession = useCallback(
-    (msg = "new live session started", title?: string) => {
+    (msg = "new live session started", title?: string, dropSid?: string) => {
       patchOverlayState({ agentView: false, sessions: false });
 
-      return startNewSession(msg, title, true);
+      return startNewSession(msg, title, true).then((sid) => {
+        dropAfterSwitch(dropSid, sid);
+
+        return sid;
+      });
     },
-    [startNewSession],
+    [dropAfterSwitch, startNewSession],
   );
 
   const activateLiveSession = useCallback(
-    (id: string) => {
+    (id: string, dropSid?: string) => {
       patchOverlayState({ agentView: false, sessions: false });
       patchUiState({ status: "switching session…" });
 
@@ -395,13 +410,22 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           cancelResumeScrollRef.current?.();
           cancelResumeScrollRef.current =
             scheduleResumeScrollToBottom(scrollRef);
+          dropAfterSwitch(dropSid, r.session_id);
         })
         .catch((e: Error) => {
           sys(`error: ${e.message}`);
           patchUiState({ status: "ready" });
         });
     },
-    [gw, resetSession, scrollRef, setHistoryItems, setSessionStartedAt, sys],
+    [
+      dropAfterSwitch,
+      gw,
+      resetSession,
+      scrollRef,
+      setHistoryItems,
+      setSessionStartedAt,
+      sys,
+    ],
   );
 
   const resumeById = useCallback(

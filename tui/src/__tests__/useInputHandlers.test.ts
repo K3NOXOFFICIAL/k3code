@@ -9,8 +9,10 @@ import {
   rememberServerRequest,
   resetServerRequestsForTests,
 } from "../app/serverRequestStore.js";
+import { createServerRequestHandler } from "../app/createServerRequestHandler.js";
 import {
   composerHasDraft,
+  ctrlCOverlayTarget,
   dismissSensitivePrompt,
   handleIdleHotkeyExit,
   resolveCtrlCComposerAction,
@@ -274,5 +276,55 @@ describe("shouldOpenAgentView — ← opens the agent view only from an idle, em
         shouldOpenAgentView({ ...idle, key: { leftArrow: true, [mod]: true } }),
       ).toBe(false);
     }
+  });
+});
+
+describe("agent view vs. prompts — a prompt is never hidden behind the view", () => {
+  const closed = getOverlayState();
+
+  it("an approval or clarify request closes the view and shows its prompt", () => {
+    const handle = createServerRequestHandler({
+      ringPromptBell: vi.fn(),
+      setStatus: vi.fn(),
+    });
+
+    resetServerRequestsForTests();
+
+    for (const [method, params] of [
+      ["approval", { command: "rm -rf build" }],
+      ["clarify", { question: "which one?" }],
+    ] as const) {
+      resetOverlayState();
+      patchOverlayState({ agentView: true });
+
+      expect(handle({ id: `r-${method}`, method, params })).toBe(true);
+      expect(getOverlayState().agentView).toBe(false);
+      expect(getOverlayState()[method]).toMatchObject({
+        requestId: `r-${method}`,
+      });
+    }
+
+    resetOverlayState();
+    resetServerRequestsForTests();
+  });
+
+  it("Ctrl+C with the view open and no prompt closes the view only", () => {
+    expect(ctrlCOverlayTarget({ ...closed, agentView: true })).toBe(
+      "agentView",
+    );
+  });
+
+  it("Ctrl+C with the view open closes the view before answering a prompt behind it", () => {
+    const approval = {
+      command: "rm",
+      description: "dangerous command",
+      requestId: "r1",
+    };
+
+    expect(ctrlCOverlayTarget({ ...closed, agentView: true, approval })).toBe(
+      "agentView",
+    );
+    expect(ctrlCOverlayTarget({ ...closed, approval })).toBe("approval");
+    expect(ctrlCOverlayTarget(closed)).toBeNull();
   });
 });

@@ -625,8 +625,15 @@ def agents_cmd(readonly: bool, socket_opt: Path | None) -> None:
     if socket_opt:
         cmd += f" --socket {shlex.quote(str(socket_opt))}"
     # An empty K3CODE_TUI_RESUME: an inherited one would resume that session instead of starting fresh.
+    # K3CODE_TUI_CWD: the session the TUI forges is this shell's project, not the daemon's launch directory.
     _launch_tui(
-        env_extra={"K3CODE_GATEWAY_CMD": cmd, "K3CODE_TUI_RESUME": "", "K3CODE_TUI_VIEW": "agents"}, require=True
+        env_extra={
+            "K3CODE_GATEWAY_CMD": cmd,
+            "K3CODE_TUI_RESUME": "",
+            "K3CODE_TUI_VIEW": "agents",
+            "K3CODE_TUI_CWD": os.getcwd(),
+        },
+        require=True,
     )
 
 

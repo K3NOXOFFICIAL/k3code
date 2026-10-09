@@ -141,6 +141,23 @@ async def test_session_list_rows_carry_the_session_cwd():
     await server.close()
 
 
+async def test_session_cwd_is_normalised_for_equality(tmp_path):
+    """The agent view filters earlier sessions by strict cwd equality: a symlink or trailing slash must not split one
+    project into two."""
+    real = tmp_path / "proj"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    server = make_server()
+    created = (await rpc(server, "session.create", {"model": "m", "cwd": f"{link}/"}))["result"]
+    assert created["info"]["cwd"] == str(real.resolve())
+    old = server.store.create(cwd=f"{real}/").session_id  # stored before normalisation
+    rows = {r["id"]: r for r in (await rpc(server, "session.list", req_id=2))["result"]["sessions"]}
+    assert rows[created["session_id"]]["cwd"] == str(real.resolve())
+    assert rows[old]["cwd"] == str(real.resolve())
+    await server.close()
+
+
 async def test_prompt_submit_without_session_is_invalid_params():
     server = make_server()
     frame = await rpc(server, "prompt.submit", {"text": "hi"})

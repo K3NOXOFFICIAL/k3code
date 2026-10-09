@@ -1571,7 +1571,8 @@ export function useMainApp(gw: GatewayClient) {
       answerSecret,
       answerSudo,
       clearSelection,
-      newLiveSession: () => session.newLiveSession(),
+      newLiveSession: (dropSid?: string) =>
+        session.newLiveSession(undefined, undefined, dropSid),
       newPromptSession,
       onModelSelect,
       // Resuming a cold session from the overlay CLOSES the current one, so it

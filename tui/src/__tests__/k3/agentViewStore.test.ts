@@ -3,8 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   buildViewRows,
   IDLE_VIEW_NAV,
+  isDisposableEmptySession,
   type PastSessionRow,
   reduceViewKey,
+  selectedIndex,
   type ViewKey,
   type ViewNav,
   type ViewRow,
@@ -163,6 +165,32 @@ describe("buildViewRows", () => {
         past: [past("a", 1), past("b", 2, null)],
       }),
     ).toEqual([]);
+  });
+
+  it("hides earlier sessions that were never used", () => {
+    const rows = build({
+      past: [
+        { ...past("empty", 300), message_count: 0 },
+        { ...past("used", 200), message_count: 4 },
+        past("unknown", 100),
+      ],
+    });
+
+    expect(rows.map((r) => r.id)).toEqual(["used", "unknown"]);
+  });
+
+  it("keeps the project filter strict: another path or a missing cwd is excluded", () => {
+    const rows = build({
+      past: [
+        past("same", 300),
+        past("sub", 250, `${CWD}/sub`),
+        past("prefix", 240, `${CWD}2`),
+        past("none", 200, null),
+        { ...past("nullcwd", 150), cwd: null },
+      ],
+    });
+
+    expect(rows.map((r) => r.id)).toEqual(["same"]);
   });
 
   it("does not list a live session again as a past one", () => {
@@ -339,9 +367,68 @@ describe("reduceViewKey", () => {
     const empty = press(stale, { ch: "q" }, []);
 
     expect(empty.nav).toEqual(at(0));
-    expect(press(stale, { escape: true }, []).effect).toEqual({
+    // Like a live confirmation, a stale one eats Esc: the next Esc closes.
+    expect(press(stale, { escape: true }, []).effect).toBeNull();
+    expect(press(at(0), { escape: true }, []).effect).toEqual({
       type: "close",
     });
+  });
+
+  it("a stale confirmation eats ⏎ instead of attaching to the row under the cursor", () => {
+    const r = press({ confirmKey: "agent:gone", index: 1 }, { return: true });
+
+    expect(r.effect).toBeNull();
+    expect(r.nav.confirmKey).toBeNull();
+    expect(press(r.nav, { return: true }).effect).toEqual({
+      row: ROWS[1],
+      type: "activate",
+    });
+  });
+});
+
+describe("selectedIndex", () => {
+  it("follows the selected key when rows are inserted above it or reordered", () => {
+    const moved = [vrow("new"), ROWS[2]!, ROWS[0]!, ROWS[1]!];
+
+    expect(selectedIndex(moved, "session:s1", 1)).toBe(3);
+    expect(selectedIndex(moved, "agent:a1", 2)).toBe(1);
+  });
+
+  it("falls back to the old position, clamped, when the key is gone or unset", () => {
+    expect(selectedIndex(ROWS, "session:gone", 2)).toBe(2);
+    expect(selectedIndex(ROWS, null, 9)).toBe(4);
+    expect(selectedIndex([], "session:s1", 3)).toBe(0);
+  });
+});
+
+describe("isDisposableEmptySession", () => {
+  const idle: SessionActiveItem = {
+    id: "s",
+    message_count: 0,
+    status: "idle",
+  };
+
+  it("is an idle live session without messages", () => {
+    expect(isDisposableEmptySession(idle)).toBe(true);
+  });
+
+  it("never a used, busy, waiting, backgrounded, unknown or missing session", () => {
+    expect(isDisposableEmptySession({ ...idle, message_count: 2 })).toBe(false);
+    expect(
+      isDisposableEmptySession({ ...idle, message_count: undefined }),
+    ).toBe(false);
+
+    for (const status of [
+      "working",
+      "needs_input",
+      "waiting",
+      "starting",
+    ] as const) {
+      expect(isDisposableEmptySession({ ...idle, status })).toBe(false);
+    }
+
+    expect(isDisposableEmptySession({ ...idle, background: true })).toBe(false);
+    expect(isDisposableEmptySession(undefined)).toBe(false);
   });
 });
 

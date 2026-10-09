@@ -20,6 +20,7 @@ import {
   IDLE_VIEW_NAV,
   type PastSessionRow,
   reduceViewKey,
+  selectedIndex,
   VIEW_GROUP_LABEL,
   VIEW_GROUPS,
   type ViewGroup,
@@ -235,7 +236,9 @@ export function AgentViewPane({
   const [past, setPast] = useState<PastSessionRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<null | string>(null);
-  const [nav, setNav] = useState<ViewNav>(IDLE_VIEW_NAV);
+  const [navState, setNav] = useState<ViewNav>(IDLE_VIEW_NAV);
+  // The selection follows its row's key: the 1.5 s session poll can reorder or insert rows above it.
+  const [selKey, setSelKey] = useState<null | string>(null);
   const [now, setNow] = useState(Date.now);
   // The session's own workspace, not the TUI's launch directory: that one would show another project's history.
   const currentCwd = info?.cwd;
@@ -289,6 +292,10 @@ export function AgentViewPane({
       }),
     [currentCwd, now, past, sessions, sid, subagents],
   );
+  const nav: ViewNav = {
+    ...navState,
+    index: selectedIndex(rows, selKey, navState.index),
+  };
   const working = rows.some((r) => r.state === "working");
 
   useEffect(() => {
@@ -321,6 +328,7 @@ export function AgentViewPane({
     );
 
     setNav(r.nav);
+    setSelKey(rows[r.nav.index]?.key ?? null);
 
     // Side effects run here, never inside a state updater, so a stop cannot fire twice.
     switch (r.effect?.type) {

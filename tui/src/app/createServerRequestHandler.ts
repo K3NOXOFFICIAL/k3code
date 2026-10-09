@@ -32,6 +32,8 @@ export function createServerRequestHandler(
   const { ringPromptBell, setStatus } = ctx;
 
   const open = (request: ServerRequest, status: string) => {
+    // The full-screen agent view hides PromptZone: close it so the prompt is seen (and Ctrl+C cannot answer it unseen).
+    patchOverlayState({ agentView: false });
     rememberServerRequest(request);
     setStatus(status);
 
