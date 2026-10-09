@@ -516,7 +516,7 @@ const ComposerPane = memo(function ComposerPane({
                     composer.empty
                       ? PLACEHOLDER
                       : ui.busy
-                        ? "Ctrl+C to interrupt…"
+                        ? "Ctrl+C or Esc Esc to interrupt…"
                         : ""
                   }
                   // Exactly the "(and N more toolsets…)" tone. `muted` is a
