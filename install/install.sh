@@ -164,6 +164,29 @@ pid_running() { # pid_running PID: kill -0, or /proc for a process of another us
   [ -d /proc/self ] && [ -d "/proc/$1" ]
 }
 
+proc_start() { # proc_start PID: when PID started, to tell it from a later process given the same pid; empty when unknown
+  # k3code update (update.py _process_start) writes and compares the same value: keep the two in step
+  if [ -d /proc/self ]; then
+    # field 22 of /proc/PID/stat; the command name (field 2) may hold spaces and ")", so count from the last ")"
+    stat_line=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+    printf '%s\n' "${stat_line##*")"}" | awk '{ print $20 }'
+  else # macOS: no /proc. A fixed locale and time zone, so every run prints the same text for the same process
+    LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | awk '{ $1 = $1; print }'
+  fi
+}
+
+clean_recorded_tmp() { # clean_recorded_tmp LOCK: the TUI build dir the install that held LOCK recorded (killed mid-build)
+  t=$(cat "$1/tui_tmp" 2>/dev/null || true)
+  tmpd=${TMPDIR:-/tmp}
+  name=${t#"${tmpd%/}"/}
+  # never follow an arbitrary path from a lock file: only a k3code-tui.* directly in the temp dir this run uses
+  case "$name" in "$t" | */*) return 0 ;; k3code-tui.?*) ;; *) return 0 ;; esac
+  if [ -d "$t" ]; then
+    rm -rf "$t"
+    log "removed the TUI build directory $t that the interrupted install left"
+  fi
+}
+
 clean_unfinished_versions() { # versions/<v> a killed install left without .complete (never the one current names)
   cur=$(basename "$(readlink "$DATA/current" 2>/dev/null)" 2>/dev/null || true)
   for d in "$DATA"/versions/*/; do
@@ -182,24 +205,36 @@ take_lock() { # one installer at a time per install root; the lock goes when thi
     case "$pid" in *[!0-9]*) pid="" ;; esac
     if [ -n "$pid" ]; then
       if pid_running "$pid"; then
-        die "another install into $DATA is running (pid $pid); wait for it to finish"
+        # a pid is reused: a live pid is still that install only if it started when the lock says (a lock without
+        # a start time, from an older installer, or a start time that cannot be read here, trusts the pid alone)
+        started=$(cat "$lock/start" 2>/dev/null || true)
+        now=""
+        if [ -n "$started" ]; then now=$(proc_start "$pid"); fi
+        if [ -z "$now" ] || [ "$now" = "$started" ]; then
+          die "another install into $DATA is running (pid $pid); wait for it to finish"
+        fi
+        why="its pid $pid now belongs to another process (started $now, not $started)"
+      else
+        why="its install (pid $pid) is not running"
       fi
-      why="its install (pid $pid) is not running"
     elif [ -n "$(find "$lock" -prune -mmin +"$LOCK_STALE_MIN" 2>/dev/null)" ]; then
       why="it names no process and is older than $((LOCK_STALE_MIN / 60)) hours"
     else
       die "an install lock without a pid is in $lock (an install that is just starting?): if no other install runs, remove it (rm -r '$lock') and re-run"
     fi
     log "taking over the install lock in $lock: $why (killed mid-install?)"
+    clean_recorded_tmp "$lock"
     rm -rf "$lock"
     mkdir "$lock" 2>/dev/null || die "another install into $DATA took the lock just now; wait for it to finish"
     LOCK=$lock
     printf '%s\n' "$$" >"$LOCK/pid"
+    proc_start "$$" >"$LOCK/start"
     clean_unfinished_versions
     return 0
   fi
   LOCK=$lock
   printf '%s\n' "$$" >"$LOCK/pid"
+  proc_start "$$" >"$LOCK/start"
 }
 
 # ---- platform and package manager ------------------------------------------
@@ -802,6 +837,8 @@ build_tui() {
   tui=$SRC_ROOT/tui
   if [ "$FROM" = source ]; then # the build writes node_modules and dist: never into the user's checkout
     TUI_TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-tui.XXXXXX")
+    # cleanup removes it on exit; after a SIGKILL the run that takes over the lock finds it here
+    printf '%s\n' "$TUI_TMP" >"$LOCK/tui_tmp"
     if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then
       log "WARNING: could not copy the TUI sources to $TUI_TMP; k3code will use the line REPL"
       return 0
