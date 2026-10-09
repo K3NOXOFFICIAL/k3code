@@ -83,6 +83,20 @@ def test_agents_sends_the_shell_cwd_as_the_session_workspace(launched, tmp_path,
     assert launched[0]["K3CODE_TUI_CWD"] == os.getcwd()
 
 
+def test_attach_resumes_its_session_and_sends_the_shell_cwd_for_new_sessions(launched, tmp_path, monkeypatch):
+    """`k3code attach <id>` resumes <id> (whose stored cwd the resume keeps); the shell cwd only names the workspace of
+    sessions the TUI creates (/new, the fresh one when <id> is unknown), never the daemon's launch directory or a
+    K3CODE_TUI_CWD inherited from a parent k3code."""
+    monkeypatch.setenv("K3CODE_TUI_CWD", "/somewhere/else")
+    monkeypatch.chdir(tmp_path)
+    res = CliRunner().invoke(cli_mod.cli, ["attach", "abc123"])
+    assert res.exit_code == 0, res.output
+    env = launched[0]
+    assert env["K3CODE_TUI_RESUME"] == "abc123"
+    assert env["K3CODE_TUI_CWD"] == os.getcwd()
+    assert env["K3CODE_GATEWAY_CMD"].endswith("-m k3code.cli gateway --attach")
+
+
 async def test_gateway_loads_the_project_config_named_by_k3code_project_dir(tmp_path, monkeypatch):
     from k3code.gateway.server import GatewayServer
     from k3code.gateway.sessions import SessionStore
