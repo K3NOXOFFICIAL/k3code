@@ -85,17 +85,41 @@ def _is_user_home(k3dir: Path) -> bool:
         return False
 
 
+#: Project skill directories outside ``.k3code`` (Claude Code's, the cross-agent one), labelled by their path under
+#: the project; ``.k3code`` files keep their path under ``.k3code`` so answers recorded before these still hold.
+OTHER_SKILL_DIRS = (".claude/skills", ".agents/skills")
+
+
+def _is_user_claude_skills(path: Path) -> bool:
+    """``<project>/.claude/skills`` is the user's own ``~/.claude/skills`` (a session started in $HOME)."""
+    try:
+        return path.resolve() == (Path.home() / ".claude" / "skills").resolve()
+    except OSError:
+        return False
+
+
 def content_files(project_dir: str | Path) -> list[tuple[str, Path]]:
-    """The project's agent, skill (``SKILL.md``) and output-style files, as (path under ``.k3code``, path), sorted."""
-    k3dir = Path(project_dir).expanduser() / ".k3code"
-    if not k3dir.is_dir() or _is_user_home(k3dir):
-        return []
+    """The project's agent, skill (``SKILL.md``) and output-style files under ``.k3code`` (labelled by their path
+    there), its ``SKILL.md`` files under ``.claude/skills`` and ``.agents/skills`` (labelled by their path under the
+    project), as (label, path), sorted."""
     from k3code.skills import find_markers  # skills imports this module
 
-    found = [*sorted((k3dir / "agents").glob("*.md")), *sorted((k3dir / "output-styles").glob("*.md"))]
-    if (k3dir / "skills").is_dir():
-        found += find_markers(k3dir / "skills")
-    return sorted((p.relative_to(k3dir).as_posix(), p) for p in found if p.is_file())
+    project = Path(project_dir).expanduser()
+    k3dir = project / ".k3code"
+    out: list[tuple[str, Path]] = []
+    if k3dir.is_dir() and not _is_user_home(k3dir):
+        found = [*sorted((k3dir / "agents").glob("*.md")), *sorted((k3dir / "output-styles").glob("*.md"))]
+        if (k3dir / "skills").is_dir():
+            found += find_markers(k3dir / "skills")
+        out += [(p.relative_to(k3dir).as_posix(), p) for p in found if p.is_file()]
+    for sub in OTHER_SKILL_DIRS:
+        d = project / sub
+        if d.is_dir() and not _is_user_claude_skills(d):
+            out += [(p.relative_to(project).as_posix(), p) for p in find_markers(d)]
+    mcp_json = project / ".mcp.json"
+    if mcp_json.is_file():
+        out.append((".mcp.json", mcp_json))
+    return sorted(out)
 
 
 def _state(project_dir: str | Path) -> tuple[bytes | None, str | None]:
@@ -183,7 +207,7 @@ def untrusted_hint(project_dir: str | Path) -> str | None:
     files = content_files(project_dir)
     if not files or decision(project_dir) == TRUSTED:
         return None
-    where = Path(project_dir).expanduser() / ".k3code"
+    where = Path(project_dir).expanduser()
     return (
         f"project not trusted: {len(files)} agent, skill or output-style file(s) in {where} are not loaded "
         "(`k3code trust` shows them and applies them)"
@@ -259,11 +283,23 @@ def summary(project_dir: str | Path) -> list[str] | None:
         ("agents/", "agents (added only: a name you or k3code already use is skipped)"),
         ("skills/", "skills (listed in the system prompt)"),
         ("output-styles/", "output styles"),
+        (".claude/skills/", "skills from .claude/skills (listed in the system prompt)"),
+        (".agents/skills/", "skills from .agents/skills (listed in the system prompt)"),
     ):
         names = [rel.removeprefix(prefix) for rel in files if rel.startswith(prefix)]
         if names:
             shown = ", ".join(names[:_MAX_RULES_SHOWN]) + (" ..." if len(names) > _MAX_RULES_SHOWN else "")
             lines.append(f"project {label}: {shown}")
+    if ".mcp.json" in files:
+        from k3code import mcpjson
+
+        try:
+            text = (Path(project_dir).expanduser() / ".mcp.json").read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        for name, spec in mcpjson.parse(text).items():
+            what = " ".join([spec.command, *spec.args]) if spec.command else str(spec.url)
+            lines.append(f"MCP server {name} in .mcp.json (starts only after /mcp enable {name}): {_short(what)}")
     return lines
 
 
@@ -322,7 +358,13 @@ def describe(text: str) -> list[str]:
     if data.get("mem0"):
         lines.append("mem0 is IGNORED (a project config cannot set mem0; only your user config can)")
 
-    others = sorted(str(k) for k in data if k not in ("mcp", "permissions", "providers", "mem0"))
+    from k3code.userhooks import parse as parse_hooks
+
+    for hook in parse_hooks(data.get("hooks"), "project"):
+        on = f" on {_short(hook.matcher, 40)}" if hook.matcher else ""
+        lines.append(f"hook {hook.event}{on} runs as you, unsandboxed: {_short(hook.command)}")
+
+    others = sorted(str(k) for k in data if k not in ("mcp", "permissions", "providers", "mem0", "hooks"))
     if others:
         lines.append("also sets: " + ", ".join(others))
     return lines or ["no settings"]

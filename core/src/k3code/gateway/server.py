@@ -34,7 +34,7 @@ from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 
-from k3code import confio
+from k3code import confio, mcpjson, userhooks
 from k3code import skills as skills_mod
 from k3code._version import __version__
 from k3code.agent.loop import AgentLoop, ApprovalResult
@@ -72,6 +72,7 @@ from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
+from k3code.memory import fenced
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
@@ -104,7 +105,7 @@ from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
 from k3code.tools import build_registry as build_tool_registry
-from k3code.tools import clip_for_model
+from k3code.tools import clip_for_model, register_todo
 from k3code.tools import jobs as tool_jobs
 from k3code.usage import UsageDB
 
@@ -233,6 +234,8 @@ class LiveSession:
         self.pending_advisor: str = ""
         #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
         self.extra_tools: list[Callable[[Any], None]] = []
+        #: the SessionStart hooks ran for this session in this process
+        self.hooks_started = False
         #: Outcome of the last turn (``completed`` / ``failed``); cleared when a new turn starts.
         self.run_result: str | None = None
         #: What the last turn ended with, for the cron/loop runners.
@@ -493,7 +496,7 @@ class GatewayServer:
         self._stdout = stdout
         self.commands: CommandRegistry = build_commands()
         self.live: dict[str, LiveSession] = {}
-        self.mcp = McpManager(self.config.mcp.servers)
+        self.mcp = McpManager(mcpjson.merged(self.config.mcp.servers, default_project_dir()))
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
         self.web_fetcher = WebFetcher.from_config(self.config.research, self.config.web)
         self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
@@ -1630,6 +1633,8 @@ class GatewayServer:
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
+        register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
+        loop.hooks = userhooks.load(session.perms.cwd, session.session_id)  # re-read per loop: config edits apply
         loop.tool_error_stop_message = not escalates
         loop.on_tool_outcome = lambda call, result, failure: self.learning.tool_outcome(session, call, result, failure)
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
@@ -1640,6 +1645,23 @@ class GatewayServer:
         register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher, mcp=self.mcp, browser=self.browser)
         session.overhead_tokens = overhead_tokens(loop.system_prompt, loop.tool_specs())
         return loop
+
+    async def _prompt_hooks(
+        self, session: LiveSession, hooks: userhooks.HookRunner | None, text: str
+    ) -> userhooks.HookOutcome:
+        """SessionStart (once per session in this process) and UserPromptSubmit; their context is merged."""
+        outcome = userhooks.HookOutcome()
+        if not hooks:
+            return outcome
+        if not session.hooks_started:
+            session.hooks_started = True
+            source = "resume" if session.stored.messages else "startup"
+            started = await hooks.run("SessionStart", {"source": source})
+            outcome.context += started.context
+        submitted = await hooks.run("UserPromptSubmit", {"prompt": text})
+        outcome.blocked, outcome.reason = submitted.blocked, submitted.reason
+        outcome.context += submitted.context
+        return outcome
 
     def _active_model(self, session: LiveSession) -> str:
         """The model id the session's main tier sends to first (what its context window is looked up by)."""
@@ -1722,9 +1744,13 @@ class GatewayServer:
         session.emit("status.update", {"kind": "status", "text": "thinking", "state": "working"})
         session.streaming = True
         session.current_kind = kind.value
+        prompt_blocked = False
         try:
+            hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
+            prompt_blocked = hooked.blocked
             try:
-                gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
+                if not hooked.blocked:
+                    gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
             except Exception:  # noqa: BLE001 - the autonomy layer must never block the user's task
                 logger.exception("autonomy gate failed; running the task directly")
             session.current_kind = kind.value
@@ -1759,6 +1785,10 @@ class GatewayServer:
                 session.loop = loop
             history = session.history
             prompt = gate.prompt
+            if hooked.blocked:
+                gate.proceed, gate.message = False, f"Prompt blocked by a UserPromptSubmit hook: {hooked.reason}"
+            elif extra := hooked.context_text():
+                prompt = f"{prompt}\n\n" + fenced("context from the user's hooks:", extra)
             if gate.proceed and (subtasks := self.fanout.applies(session, gate)):
                 fan = await self.fanout.run(session, text, gate.plan, subtasks)  # M4b: parallel worktree children
                 if fan is not None and fan.ok:
@@ -1828,6 +1858,10 @@ class GatewayServer:
                 # over). Ending it 'done' let an active goal judge it and continue into the same loop, and reported a
                 # /loop tick as completed.
                 status = "needs_input"
+            if loop.hooks and not hooked.blocked:
+                stopped = await loop.hooks.run("Stop", {"stop_hook_active": False})
+                if stopped.blocked:  # Claude Code would continue the turn; k3code ends it and logs the reason
+                    logger.info("a Stop hook asked to continue the turn (not supported): %s", stopped.reason[:200])
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)
@@ -1872,8 +1906,9 @@ class GatewayServer:
                 if isinstance(session.last_exc, (AllProvidersUnreachable, ChainExhausted)) and status == "error"
                 else status
             )
-            self.autonomy.finish(session, gate, scope_outcome, final_text, text)
-            if self.learning.enabled:
+            if not prompt_blocked:  # a prompt a hook refused is not a task: nothing to log or learn from
+                self.autonomy.finish(session, gate, scope_outcome, final_text, text)
+            if self.learning.enabled and not prompt_blocked:
                 self.learning.spawn(self.learning.turn_finished(session, status))
 
         session.last_error = error or ""
@@ -1899,7 +1934,12 @@ class GatewayServer:
             },
         )
         session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
-        if status == "done" and not session.stored.title and autonomy_cfg(self.config)["auto_title"]:
+        if (
+            status == "done"
+            and not prompt_blocked
+            and not session.stored.title
+            and autonomy_cfg(self.config)["auto_title"]
+        ):
             task = asyncio.create_task(self._auto_title(session, text))
             self._side_tasks.add(task)
             task.add_done_callback(self._side_tasks.discard)
@@ -2006,15 +2046,15 @@ class GatewayServer:
             msg = event.message
             if msg.role == "tool":
                 self._checkpoint_turn(session)
-                session.emit(
-                    "tool.complete",
-                    {
-                        "tool_id": msg.tool_call_id or "",
-                        "name": msg.name or "",
-                        "result_text": msg.content or "",
-                        "result": {"content": msg.content},
-                    },
-                )
+                payload = {
+                    "tool_id": msg.tool_call_id or "",
+                    "name": msg.name or "",
+                    "result_text": msg.content or "",
+                    "result": {"content": msg.content},
+                }
+                if msg.name == "todo":  # the TUI's todo panel reads the list from tool.complete
+                    payload["todos"] = list(session.stored.meta.get("todos") or [])
+                session.emit("tool.complete", payload)
             elif msg.role == "assistant":
                 provider, model = session.last_entry
                 u = msg.usage
@@ -2152,7 +2192,7 @@ class GatewayServer:
         if "providers" in changed:
             self.router = None
             self._tiers = None
-        self.mcp.configure(self.config.mcp.servers)
+        self.mcp.configure(mcpjson.merged(self.config.mcp.servers, base))
 
     def activate_session(self, session_id: str) -> LiveSession | None:
         stored = self.store.get(session_id)
@@ -3423,7 +3463,9 @@ def _session_cwd(server: GatewayServer, params: dict[str, Any]) -> str | None:
 async def _reload_mcp(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """/reload-mcp: re-read the config and restart the MCP servers (the gateway's `/mcp reload`)."""
     server.apply_file_config(_session_cwd(server, params))
-    await server.mcp.reload(server.config.mcp.servers)
+    await server.mcp.reload(
+        mcpjson.merged(server.config.mcp.servers, _session_cwd(server, params) or default_project_dir())
+    )
     return {"status": "reloaded"}
 
 

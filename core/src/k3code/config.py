@@ -91,6 +91,8 @@ class McpConfig(BaseModel):
 
 class SkillsConfig(BaseModel):
     roots: list[str] = Field(default_factory=list)
+    #: also load ~/.claude/skills; read from the user's config only (skills.import_claude_enabled)
+    import_claude: bool = True
 
 
 class Mem0Config(BaseModel):
@@ -177,6 +179,9 @@ class Settings(BaseModel):
     # /artifacts publish: {publish_dir: "" (default <home>/published), publish_url: "" (template, e.g.
     # https://example.com/{name}; nothing is uploaded, the link is only printed)}
     artifacts: dict[str, Any] = Field(default_factory=dict)
+    # User hooks: {PreToolUse: [{matcher, command, timeout}], ...}. Run from the user's config and, once the project
+    # is trusted, the project's: both apply (k3code.userhooks.load reads each file; this merged value is not used).
+    hooks: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod

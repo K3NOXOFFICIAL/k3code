@@ -511,6 +511,48 @@ def step_secrets(c: Ctx) -> dict[str, Any]:
     return {"stored": asked}
 
 
+PROJECT_RECIPE_MODES = ("ask", "accept_all", "none")
+
+
+def offer_project_recipes(p: Prompter, cwd: Path) -> dict[str, Any]:
+    """Scan the project ``cwd`` is in and offer its recipe proposals (k3code.learning.recipes).
+
+    Answers file: ``project_recipes: accept_all | none | ask``; ``ask`` without a terminal means ``none``, and
+    ``none`` scans nothing and creates no proposal (a session still offers them as cards later)."""
+    import asyncio
+
+    from k3code.autonomy.proposals import ProposalStore
+    from k3code.learning import projectprep, projectstate, recipes
+    from k3code.paths import home
+
+    mode = str(p.raw("project_recipes", "ask") or "ask")
+    if mode not in PROJECT_RECIPE_MODES:
+        raise ValueError(f"project_recipes must be one of: {', '.join(PROJECT_RECIPE_MODES)} (got {mode!r})")
+    if mode == "ask" and not p.interactive:
+        mode = "none"
+    if mode == "none":
+        return {"recipes": "none", "accepted": []}
+    root = projectstate.project_root(cwd)
+    store = ProposalStore(home())
+    asyncio.run(projectprep.prepare(root, store=store))
+    found = projectstate.load(root).get("stacks") or []
+    if not found:
+        return {"recipes": mode, "accepted": []}
+    p.say(f"Project {root}: " + ", ".join(recipes.label(s) for s in found))
+    accepted: list[str] = []
+    for prop in projectprep.pending_recipes(store, root):
+        if mode == "ask" and not p.confirm(f"project_recipes.{prop.id}", f"{prop.text} Apply now?", False):
+            continue  # stays pending: offered again as a card in a session
+        store.set_status(prop.id, "accepted")
+        p.say(f"  {recipes.apply(prop.payload)}")
+        accepted.append(prop.id)
+    return {"recipes": mode, "accepted": accepted}
+
+
+def step_project(c: Ctx) -> dict[str, Any]:
+    return offer_project_recipes(c.p, c.cwd)
+
+
 @dataclass
 class Step:
     name: str
@@ -530,6 +572,7 @@ STEPS: list[Step] = [
     Step("theme", step_theme, "Theme and UI"),
     Step("service", step_service, "24/7 service"),
     Step("tour", step_tour, "Keymap tour"),
+    Step("project", step_project, "This project"),
     Step("summary", step_summary, "Summary"),
 ]
 STEP_NAMES = [s.name for s in STEPS]

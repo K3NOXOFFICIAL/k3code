@@ -109,10 +109,12 @@ def unsafe_pattern(pattern: str) -> bool:
 
 
 def _existing(cwd: str) -> set[tuple[str, str]]:
+    from k3code.learning.projectstate import rules_path
     from k3code.paths import user_config_path
 
     have: set[tuple[str, str]] = set()
-    for path in (user_config_path(), project_config_path(cwd)):
+    # rules_path: rules the user accepted from a project recipe, kept in k3code's state for this project
+    for path in (user_config_path(), project_config_path(cwd), rules_path(cwd)):
         rules, _ = load_permissions_config(path)
         have.update((r.tool, r.pattern) for r in rules)
     return have

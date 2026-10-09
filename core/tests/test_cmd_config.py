@@ -162,9 +162,9 @@ def test_memory_loader_order(tmp_path, monkeypatch):
 
     files = memmod.load_memory(sub)
     assert [(m.scope, m.text) for m in files] == [("user", "USER-FACT"), ("project", "AGENTS-FALLBACK")]
-    (repo / "K3CODE.md").write_text("K3-PROJECT")  # K3CODE.md beats AGENTS.md
+    (repo / "K3CODE.md").write_text("K3-PROJECT")  # both are read, K3CODE.md first
     files = memmod.load_memory(sub)
-    assert [m.text for m in files] == ["USER-FACT", "K3-PROJECT"]
+    assert [m.text for m in files] == ["USER-FACT", "K3-PROJECT", "AGENTS-FALLBACK"]
 
     prompt = build_system_prompt("BASE", cwd=sub, config=make_cfg())
     assert prompt.index("BASE") < prompt.index("USER-FACT") < prompt.index("K3-PROJECT")

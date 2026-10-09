@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from k3code import userhooks
 from k3code.agent.loop import AgentLoop
 from k3code.autonomy import advisor as advisor_mod
 from k3code.autonomy import autonomy_cfg, scope
@@ -220,6 +221,7 @@ class PlanFirst:
             session=sid,
             task_kind=TaskKind.PLAN,
         )
+        loop.hooks = userhooks.load(session.perms.cwd, sid)  # the planner's read tools see the user's hooks too
         session.current_kind = TaskKind.PLAN.value
         session.emit("status.update", {"kind": "status", "text": "planning", "state": "working"})
         prompt = f"Task:\n{text}\n\nScope: {verdict.scope}. Risk: {verdict.risk}. {verdict.reason}"

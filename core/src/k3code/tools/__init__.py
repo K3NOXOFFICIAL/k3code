@@ -593,10 +593,99 @@ async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     return {"files": [str(f.relative_to(path)) for f in files]}
 
 
-async def tool_todo(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Manage a todo list (in-memory, per-session)."""
-    # This is a simple in-memory store; real persistence is M1+
-    return {"ok": True, "note": "todo is a no-op in M0; use agent's internal list"}
+TODO_STATUSES = ("pending", "in_progress", "completed")
+_TODO_MARK = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
+MAX_TODOS = 100
+
+
+def parse_todos(raw: Any) -> tuple[list[dict[str, str]], str | None]:
+    """The model's list as stored items ``{id, content, status}``, or an error. Items without an id get their
+    1-based position; at most one item may be in progress."""
+    if not isinstance(raw, list):
+        return [], "todos must be a list of {content, status} items"
+    if len(raw) > MAX_TODOS:
+        return [], f"at most {MAX_TODOS} todos"
+    todos: list[dict[str, str]] = []
+    for i, item in enumerate(raw, 1):
+        if not isinstance(item, dict):
+            return [], f"todo {i} is not an object"
+        content = " ".join(str(item.get("content") or "").split())
+        status = str(item.get("status") or "")
+        if not content:
+            return [], f"todo {i} has no content"
+        if status not in TODO_STATUSES:
+            return [], f"todo {i} has status {status!r}; use one of {', '.join(TODO_STATUSES)}"
+        todos.append({"id": str(item.get("id") or i), "content": content, "status": status})
+    if sum(t["status"] == "in_progress" for t in todos) > 1:
+        return [], "at most one todo may be in_progress"
+    return todos, None
+
+
+def render_todos(todos: list[dict[str, str]]) -> str:
+    if not todos:
+        return "Todo list cleared."
+    done = sum(t["status"] == "completed" for t in todos)
+    lines = [f"Todos ({done}/{len(todos)} done):"]
+    lines += [f"{_TODO_MARK[t['status']]} {t['content']}" for t in todos]
+    return "\n".join(lines)
+
+
+class TodoStore:
+    """The session's todo list. ``state`` is where it lives: the session's persisted meta in the gateway (key
+    ``todos``), a plain dict for a loop of its own (REPL, headless)."""
+
+    KEY = "todos"
+
+    def __init__(self, state: dict[str, Any] | None = None) -> None:
+        self.state = state if state is not None else {}
+
+    @property
+    def todos(self) -> list[dict[str, str]]:
+        return list(self.state.get(self.KEY) or [])
+
+    async def tool(self, arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
+        """Replace the whole list (Claude Code's TodoWrite)."""
+        todos, error = parse_todos(arguments.get("todos", arguments.get("items")))
+        if error:
+            return {"error": error}
+        self.state[self.KEY] = todos
+        return {"content": render_todos(todos), "todos": todos}
+
+
+TODO_SPEC = ToolSpec(
+    name="todo",
+    description=(
+        "Plan and track multi-step work. Send the whole list every time (it replaces the previous one): items "
+        "{content, status: pending|in_progress|completed}. Keep exactly one item in_progress while working and mark "
+        "items completed as soon as they are done.\n"
+        f"Limits: at most {MAX_TODOS} items and one in_progress; the list lives with this session only."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "todos": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "status": {"type": "string", "enum": list(TODO_STATUSES)},
+                        "id": {"type": "string"},
+                    },
+                    "required": ["content", "status"],
+                },
+            }
+        },
+        "required": ["todos"],
+    },
+    side_effect=False,
+)
+
+
+def register_todo(reg: ToolRegistry, state: dict[str, Any] | None = None) -> TodoStore:
+    store = TodoStore(state)
+    reg.register(TODO_SPEC, store.tool)
+    return store
 
 
 async def tool_bash_output(
@@ -790,22 +879,7 @@ def build_registry() -> ToolRegistry:
         ),
         tool_glob,
     )
-    reg.register(
-        ToolSpec(
-            name="todo",
-            description="Manage a todo list.\nLimits: a no-op placeholder; nothing is stored, keep the list yourself.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string"},
-                    "items": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["action"],
-            },
-            side_effect=False,
-        ),
-        tool_todo,
-    )
+    register_todo(reg)  # this loop's own list; the gateway re-registers it on the session's persisted state
     reg.register(
         ToolSpec(
             name="exit_plan",

@@ -154,7 +154,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 | **Models and effort** | `/model` (opens the picker; `/model <key>` switches; `/model chain` shows the fallback chain and its health, and `add`, `remove` and `move` edit it) · `/effort` · `/output-style` |
 | **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` · `/ultraresearch` · `/advisor` |
 | **Automation** | `/schedule` (cron) · `/automations` (file, git, webhook, session, network and idle triggers) |
-| **Review and learning** | `/review` · `/proposals` · `/learn` · `/optimizer` · `/self-improve` |
+| **Review and learning** | `/review` · `/proposals` · `/project` (detected stacks and recipe proposals; `/project rescan`) · `/learn` · `/optimizer` · `/self-improve` |
 | **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
 | **Operations** | `/doctor` · `/stats` · `/debug` · `/daemon` · `/update` · `/help` |
 | **Look and feel** (TUI) | `/pet` (`on`, `off`, `random` or a pet name: blob, cat, crab, duck, ghost, hamster, owl, robot; shown at 100+ columns) · `/indicator` (`ascii` for terminals without Unicode glyphs) · `/theme` · `/statusbar` · `/focus`. These choices are saved to `display` in `~/.k3code/config.yaml`. Set `K3_NO_ANIMATION=1` to stop the spinner, messages and pet from moving. |
@@ -241,7 +241,7 @@ To report a vulnerability, use the private route in [SECURITY.md](SECURITY.md).
 
 ## Configuration
 
-State lives in `~/.k3code/` (override with `K3CODE_HOME`): `config.yaml`, session and usage databases, the journal, memory, learned preferences, logs. Secrets live only in `~/.config/k3code/env` (mode 0600) or your environment. A project can add `.k3code/config.yaml`, read from the directory k3code was started in (or `--config-dir`). It applies only after you trust that exact file: an interactive start shows what it changes and asks once, and asks again when the file changes. Headless and piped runs ignore an untrusted file. `k3code trust [PATH]` grants trust and `k3code trust --revoke` takes it back. The same answer covers the project's `.k3code/agents`, `.k3code/skills` and `.k3code/output-styles`: they load only in a trusted project, and a change to any of them asks again. A project agent can add an agent but never replace a built-in or user agent of the same name. A project config cannot set `providers` (it would choose where your keys are sent); they are ignored with a warning in the trust summary and `k3code doctor`. The project's `K3CODE.md` or `AGENTS.md` always loads, fenced as project instructions from the repository.
+State lives in `~/.k3code/` (override with `K3CODE_HOME`): `config.yaml`, session and usage databases, the journal, memory, learned preferences, logs. Secrets live only in `~/.config/k3code/env` (mode 0600) or your environment. A project can add `.k3code/config.yaml`, read from the directory k3code was started in (or `--config-dir`). It applies only after you trust that exact file: an interactive start shows what it changes and asks once, and asks again when the file changes. Headless and piped runs ignore an untrusted file. `k3code trust [PATH]` grants trust and `k3code trust --revoke` takes it back. The same answer covers the project's `.k3code/agents`, `.k3code/skills`, `.k3code/output-styles`, `.claude/skills` and `.agents/skills`: they load only in a trusted project, and a change to any of them asks again. A project agent can add an agent but never replace a built-in or user agent of the same name. A project config cannot set `providers` (it would choose where your keys are sent); they are ignored with a warning in the trust summary and `k3code doctor`. The project's memory always loads, fenced as project instructions from the repository: `K3CODE.md`, `AGENTS.md` and `CLAUDE.md` (all that exist, identical ones once) in every directory from the repository root down to the working directory, nearest last, after `.k3code/rules/*.md`. A line `@path` imports a file (relative to the importing file, at most 5 deep, never from outside the repository; the user's `USER.md` may import from your home directory). Each file is capped at 20,000 characters and all of them together at 40,000.
 
 Precedence per top-level key: command-line flag > environment (`K3CODE_<KEY>`, scalar keys only, for example `K3CODE_PERMISSION_MODE`) > project config > user config > defaults. Nested sections are replaced as a whole, not merged. `providers` comes from the user config only. Change settings with `/config`, `/update-config` or `k3code setup --step <name>`; edits are backed up and `/config rollback` restores the last one.
 
@@ -269,6 +269,20 @@ mcp:
   servers:
     search: {url: "https://example.org/mcp"}
 ```
+
+### Hooks
+
+Hooks run your own commands on agent events, with Claude Code's contract, so existing hook scripts work:
+
+```yaml
+hooks:
+  PreToolUse:                       # also PostToolUse, UserPromptSubmit, SessionStart, Stop
+    - {matcher: "bash|edit", command: "~/bin/check-tool.sh", timeout: 30}   # matcher: tool-name regex
+```
+
+The command gets the event as JSON on stdin (`session_id`, `cwd`, `hook_event_name`, `tool_name`, `tool_input`, `tool_response` for PostToolUse, `prompt` for UserPromptSubmit). Exit 0 lets the action go on, and its stdout may be JSON `{"decision": "block"|"approve", "reason", "additionalContext"}`. Exit 2 blocks the action, and stderr is the reason the model sees. Any other exit status, or a run longer than `timeout` (default 60 s), is logged and blocks nothing. PreToolUse runs before the permission prompt: it can block a call or answer the prompt with `approve`, but it can never turn a deny (a hardline rule, a deny rule) into an allow. A Stop hook cannot extend a turn. Hooks run as you, outside the sandbox, with the same scrubbed environment as other child processes plus `CLAUDE_PROJECT_DIR`. Hooks in your user config always run; hooks in a project's `.k3code/config.yaml` run only once you trust the project, and the trust prompt lists each one.
+
+Other Claude Code files k3code reads: `CLAUDE.md` (see above), skills in `~/.claude/skills` (set `skills: {import_claude: false}` in your user config to skip them) and, in a trusted project, `.claude/skills` and `.agents/skills`. A trusted project's `.mcp.json` servers show in `/mcp` as available; none starts until you run `/mcp enable <name>` (`/mcp disable <name>` stops it). That choice is stored under `~/.k3code/projects/`, not in the repository, and a changed server definition has to be enabled again. `env` and `headers` values are used as written (no `${VAR}` expansion), and `sse` servers are skipped.
 
 Tip: keep at least one chain entry that does not go through a self-hosted gateway, so a gateway outage still has a fallback. (`k3code doctor` only warns when every entry looks like an OmniRoute gateway: its name contains `omniroute`, or it uses port 20128. It cannot recognise other gateways.)
 
