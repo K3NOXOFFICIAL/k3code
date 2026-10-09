@@ -26,7 +26,18 @@ def temp_dir():
 def test_registry_has_all_tools():
     reg = build_registry()
     names = reg.names()
-    assert set(names) == {"read", "write", "edit", "bash", "grep", "glob", "todo", "exit_plan"}
+    assert set(names) == {
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "bash_output",
+        "bash_kill",
+        "grep",
+        "glob",
+        "todo",
+        "exit_plan",
+    }
     for name in names:
         spec, handler = reg.get(name)
         assert spec.name == name

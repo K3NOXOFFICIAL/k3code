@@ -92,6 +92,14 @@ def _build_reliability(config: Any, session: str) -> Reliability:
     return build_reliability(config, session=session, home=k3code_home())
 
 
+async def _reap_jobs(session: str) -> None:
+    """Kill the run's background bash jobs: their process groups (start_new_session) would outlive the CLI."""
+    from k3code.tools import jobs
+
+    with contextlib.suppress(Exception):
+        await jobs.reap(session)
+
+
 async def _run_headless(
     prompt: str,
     *,
@@ -182,6 +190,7 @@ async def _run_headless(
         logger.exception("Agent failed")
         return {"error": "agent_error", "message": str(e)}
     finally:
+        await _reap_jobs(session)  # no background bash job outlives the run
         await reliability.stop()
 
 
@@ -311,6 +320,7 @@ async def _run_repl(
         except Exception as e:
             logger.exception("REPL turn failed")
             print(f"\n[Error] {e}")
+    await _reap_jobs(loop.session_id)
     await reliability.stop()
 
 
@@ -686,7 +696,10 @@ def service_group() -> None:
 def service_install(dry_run: bool) -> None:
     from k3code import service
 
-    click.echo("\n".join(service.install(dry_run=dry_run)))
+    try:
+        click.echo("\n".join(service.install(dry_run=dry_run)))
+    except service.ServiceError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @service_group.command("uninstall")
@@ -859,8 +872,19 @@ def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
 @click.option("--from-source", is_flag=True, help="git pull the source checkout and rebuild")
 @click.option("--no-pull", is_flag=True, help="With --from-source: rebuild without git pull (you pulled the clone)")
 @click.option("--rollback", "do_rollback", is_flag=True, help="Switch back to the previous version")
+@click.option(
+    "--allow-unpinned",
+    is_flag=True,
+    help="Install a release that ships no locked requirements file (its dependencies resolve from PyPI)",
+)
 def update_cmd(
-    check: bool, yes: bool, channel: str | None, from_source: bool, no_pull: bool, do_rollback: bool
+    check: bool,
+    yes: bool,
+    channel: str | None,
+    from_source: bool,
+    no_pull: bool,
+    do_rollback: bool,
+    allow_unpinned: bool,
 ) -> None:
     """Update to the latest release (smoke-tested, auto-rollback) or roll back.
 
@@ -868,6 +892,8 @@ def update_cmd(
     built from a checkout (`install.sh --from-source`) updates from that checkout, and an install made with
     `install.sh --from-git` (the default) rebuilds from the newest commit of the branch or tag it was made from
     (`update.url`, default: the GitHub repository `update.repo`)."""
+    import httpx
+
     from k3code import update as upd
 
     if do_rollback:
@@ -881,7 +907,7 @@ def update_cmd(
     if not from_source:
         denied = ""
         try:
-            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token())
+            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token(), cfg["api"])
         except PermissionError as e:
             denied = str(e)
         except Exception as e:  # noqa: BLE001
@@ -956,7 +982,12 @@ def update_cmd(
             return
         if not yes:
             click.confirm(f"Update to {rel.version}?", abort=True)
-        upd.install_release(rel, upd.github_token())
+        try:
+            upd.install_release(rel, upd.github_token(), allow_unpinned=allow_unpinned)
+        except upd.IntegrityError as e:
+            raise click.ClickException(f"update refused: {e}. Nothing was installed.") from e
+        except (OSError, ValueError, httpx.HTTPError, subprocess.CalledProcessError) as e:
+            raise click.ClickException(f"update failed: {e}. Nothing was activated.") from e
         ver = rel.version
     res = upd.activate(ver)
     click.echo(res.message)

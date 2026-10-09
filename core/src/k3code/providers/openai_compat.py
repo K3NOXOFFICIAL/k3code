@@ -10,7 +10,14 @@ import httpx
 
 from k3code.providers.base import Provider, ProviderError, request_headers, to_provider_error
 from k3code.providers.effort import openai_effort
-from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec, messages_to_openai
+from k3code.providers.types import (
+    Message,
+    StreamEvent,
+    ToolCall,
+    ToolSpec,
+    messages_to_openai,
+    with_cache_breakpoint,
+)
 
 _TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=15.0)
 
@@ -25,8 +32,12 @@ class OpenAICompatProvider(Provider):
         base_url: str,
         api_key: str,
         client: httpx.AsyncClient | None = None,
+        prompt_cache: str = "auto",
     ) -> None:
         self.name = name
+        #: "on": Anthropic-style cache_control inside messages for Claude model ids (auto = off: plain OpenAI
+        #: endpoints cache by themselves and some reject unknown fields)
+        self.prompt_cache = prompt_cache == "on"
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
@@ -51,9 +62,12 @@ class OpenAICompatProvider(Provider):
         max_tokens: int,
         temperature: float | None,
     ) -> dict[str, Any]:
+        wire = messages_to_openai(messages)
+        if self.prompt_cache and "claude" in model.lower():
+            _add_cache_breakpoints(wire)
         payload: dict[str, Any] = {
             "model": model,
-            "messages": messages_to_openai(messages),
+            "messages": wire,
             "stream": True,
             "stream_options": {"include_usage": True},
             "max_tokens": max_tokens,
@@ -208,12 +222,29 @@ def _error_message(body: dict[str, Any]) -> str:
     return ""
 
 
+def _add_cache_breakpoints(wire: list[dict[str, Any]]) -> None:
+    """Two Anthropic-style breakpoints for a relay to Claude: the last leading system message and the newest one."""
+    leading = 0
+    while leading < len(wire) and wire[leading]["role"] == "system":
+        leading += 1
+    marks = {leading - 1, len(wire) - 1} - {-1}
+    for i in marks:
+        if isinstance(wire[i].get("content"), str):
+            wire[i] = {**wire[i], "content": with_cache_breakpoint(wire[i]["content"])}
+
+
 def _parse_usage(chunk_usage: dict[str, Any]) -> Any:
     from k3code.providers.types import Usage
 
+    details = chunk_usage.get("prompt_tokens_details") or {}
     return Usage(
         prompt_tokens=int(chunk_usage.get("prompt_tokens") or 0),
         completion_tokens=int(chunk_usage.get("completion_tokens") or 0),
+        # OpenAI reports cache hits in prompt_tokens_details; relays to Anthropic pass its own fields on
+        cache_read_tokens=int(details.get("cached_tokens") or chunk_usage.get("cache_read_input_tokens") or 0),
+        cache_creation_tokens=int(
+            details.get("cache_write_tokens") or chunk_usage.get("cache_creation_input_tokens") or 0
+        ),
     )
 
 

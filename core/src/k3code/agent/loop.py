@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from k3code import context_budget
 from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.state import PermissionState
@@ -16,7 +17,15 @@ from k3code.providers.types import Message, StreamEvent, ToolCall
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
-from k3code.tools import MAX_TOOL_RESULT_CHARS, build_registry, clip_tool_results, format_tool_result
+from k3code.toolerrors import Failure, describe_call, failure_of
+from k3code.tools import (
+    MAX_TOOL_RESULT_CHARS,
+    SESSION_TOOLS,
+    build_registry,
+    clip_tool_results,
+    format_tool_result,
+)
+from k3code.tools.validate import invalid_arguments
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +79,19 @@ class AgentLoop:
         task_kind: str = "interactive_turn",
         max_tool_errors: int = 0,
         tool_output_chars: int | None = None,
+        context_window: int | None = None,
     ) -> None:
         self.router = router
+        #: the session this loop runs for: background bash jobs are filed under it
+        self.session_id = session
+        #: Tokens the model takes; past ELIDE_AT_RATIO of it, old tool results are elided from requests (None = never)
+        self.context_window = context_window
+        #: Per run(): tool results elided from requests so far (they stay elided), results an "unchanged" read points
+        #: at (never elided), and successful reads by (path, mtime, size, range) → (step, tool call id).
+        self._elided: set[str] = set()
+        self._pinned: set[str] = set()
+        self._reads: dict[tuple[Any, ...], tuple[int, str]] = {}
+        self._step = 0
         #: M1: how much of one tool result the model is sent (the transcript keeps all of it); None = the default
         self.tool_output_chars = tool_output_chars
         #: M4a: what this loop is for (routes to a tier; tagged on usage rows).
@@ -79,6 +99,13 @@ class AgentLoop:
         #: Stop the loop once this many tool calls in a row failed (0 = never); see escalation_reason.
         self.max_tool_errors = max_tool_errors
         self._tool_errors = 0
+        #: the consecutive failed calls behind _tool_errors: (call, first error line), listed when the turn stops
+        self._failed: list[tuple[str, str]] = []
+        #: end a tool-error stop with an assistant message listing the failures (off when a higher tier continues)
+        self.tool_error_stop_message = True
+        #: called after every tool call with (call, result, failure or None); the gateway's learning hub records
+        #: tool errors with it
+        self.on_tool_outcome: Callable[[ToolCall, dict[str, Any], Failure | None], None] | None = None
         #: Set when the loop stopped because the attempt looks stuck: "tool_errors" | "loop_guard".
         self.escalation_reason: str | None = None
         self.system_prompt = system_prompt
@@ -171,6 +198,7 @@ class AgentLoop:
         # (another loop on a different tier may have attached its own since construction).
         self.reliability.attach_router(self.router)
         self.reliability.begin_turn()
+        self._elided, self._pinned, self._reads, self._step = set(), set(), {}, 0
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
             *(history or []),
@@ -214,10 +242,11 @@ class AgentLoop:
             self._check_budgets("turn start")
             # M2: the stream goes through persistent retry (pause/park/resume). The model gets head+tail clips of
             # long tool results; ``messages`` (transcript, session, gateway) keeps every full result.
+            specs = self.tool_specs()
             stream = self.reliability.stream(
                 self.router,
-                clip_tool_results(messages, self.tool_output_chars or MAX_TOOL_RESULT_CHARS),
-                self.tool_specs(),
+                self._request_messages(messages, specs),
+                specs,
                 model=model,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -294,6 +323,7 @@ class AgentLoop:
                     logger.info("Interrupted before tool %s", tc.name)
                     self.turn_messages = messages
                     return
+                self._step += 1
                 result = await self._execute_tool(tc)
                 tool_msg = Message(
                     role="tool",
@@ -305,9 +335,17 @@ class AgentLoop:
                 self.reliability.save_transcript(messages)
                 # Yield the tool result as a stream event
                 yield StreamEvent(type="done", message=tool_msg)
-                self._tool_errors = self._tool_errors + 1 if "error" in result and "content" not in result else 0
+                failure = self._observe_result(tc, result, notes)
+                if "error" in result and "content" not in result:
+                    self._tool_errors += 1
+                    self._failed.append((describe_call(tc.name, tc.arguments), failure.first_line if failure else ""))
+                else:
+                    self._tool_errors, self._failed = 0, []
                 if self.max_tool_errors and self._tool_errors >= self.max_tool_errors:
                     self.escalation_reason = "tool_errors"
+                    if self.tool_error_stop_message:
+                        for stop_event in self._stop_for_tool_errors(messages):
+                            yield stop_event
                     self.turn_messages = messages
                     return
 
@@ -326,6 +364,9 @@ class AgentLoop:
         args = tool_call.arguments
         if tool_call.name == EXIT_PLAN_TOOL:
             return await self._exit_plan(args)
+        # before the permission prompt: a call the handler cannot run is not worth an approval
+        if (invalid := invalid_arguments(tool_call.name, spec.parameters, args)) is not None:
+            return {"error": invalid}
         decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
         if decision.action == "deny":
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
@@ -339,23 +380,59 @@ class AgentLoop:
         elif decision.auto_allowed and self.on_auto_allow is not None:
             self.on_auto_allow(tool_call.name, args, decision)
 
+        read_key = self._read_key(args) if tool_call.name == "read" else None
+        if read_key is not None and (seen := self._reads.get(read_key)) and seen[1] not in self._elided:
+            step, call_id = seen
+            self._pinned.add(call_id)  # the earlier result must stay in the requests: this one points at it
+            return {
+                "content": f"[unchanged since the read at step {step} (call {call_id}): same path, size and "
+                "modification time; that result above still holds]"
+            }
         # M2: fsync a journal intent before the tool runs.
         self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
         try:
             if tool_call.name == "bash":
                 # the bwrap probe runs a subprocess (up to 10 s): never on the event loop that serves every session
                 argv = await asyncio.to_thread(self._sandbox_argv)
-                result = await handler(args, cwd=self.cwd, sandbox=argv)
+                result = await handler(args, cwd=self.cwd, sandbox=argv, session_id=self.session_id)
+            elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
+                result = await handler(args, cwd=self.cwd, session_id=self.session_id)
             else:
                 result = await handler(args, cwd=self.cwd)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
             result = {"error": f"bash refused: {exc}"}
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
-            result = {"error": f"Tool execution failed: {e}"}
+            result = {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
         # M2: completion digest, so resume knows this call finished.
         self.reliability.journal_done(tool_call.id, result)
+        if read_key is not None and "first" in result:
+            self._reads[read_key] = (self._step, tool_call.id)
         return result
+
+    def _read_key(self, args: dict[str, Any]) -> tuple[Any, ...] | None:
+        """What makes two reads the same: the file (path, mtime, size) and the requested range; None if no file."""
+        from k3code.tools import _resolve_path
+
+        try:
+            path = _resolve_path(str(args.get("path", "")), self.cwd)
+            st = path.stat()
+        except (OSError, ValueError):
+            return None
+        window = tuple(args.get(k) for k in ("offset", "limit", "start", "end"))
+        return (str(path), st.st_mtime_ns, st.st_size, window)
+
+    def _request_messages(self, messages: list[Message], specs: list[Any]) -> list[Message]:
+        """What the provider is sent: long tool results clipped, and once the request passes ELIDE_AT_RATIO of the
+        context window, old tool results elided. ``messages`` (transcript, session) keeps every full result."""
+        wire = clip_tool_results(messages, self.tool_output_chars or MAX_TOOL_RESULT_CHARS)
+        if not self.context_window:
+            return wire
+        estimate = context_budget.overhead_tokens(self.system_prompt, specs) + context_budget.message_tokens(wire)
+        over = estimate > self.context_window * context_budget.ELIDE_AT_RATIO
+        if not over and not self._elided:
+            return wire
+        return context_budget.elide_old_results(wire, over=over, elided=self._elided, keep=self._pinned)
 
     def _sandbox_argv(self) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.
@@ -424,6 +501,39 @@ class AgentLoop:
             messages.append(Message(role="system", content=outcome.note))
             return False
         return outcome.verdict is Verdict.STOP
+
+    def _observe_result(self, tc: ToolCall, result: dict[str, Any], notes: list[Message]) -> Failure | None:
+        """Tell the learning hook and the loop guard how a call went; queue the guard's reminder into ``notes`` (one
+        per step: the request guard's note, when there is one, already says to change approach)."""
+        failure = failure_of(tc.name, tc.arguments, result)
+        if self.on_tool_outcome is not None:
+            try:
+                self.on_tool_outcome(tc, result, failure)
+            except Exception:  # noqa: BLE001 - learning must never break a turn
+                logger.warning("tool outcome hook failed", exc_info=True)
+        outcome = self.reliability.observe_tool_result(
+            tc, failure.signature if failure else None, describe_call(tc.name, tc.arguments)
+        )
+        if outcome is not None and outcome.verdict is Verdict.NOTE and outcome.note and not notes:
+            notes.append(Message(role="system", content=outcome.note))
+        return failure
+
+    def _stop_for_tool_errors(self, messages: list[Message]) -> Any:
+        """Yield a final assistant message listing the failed calls that stopped the turn."""
+        counts: dict[tuple[str, str], int] = {}
+        for item in self._failed:
+            counts[item] = counts.get(item, 0) + 1
+        lines = [
+            f"- {call}: {error or 'failed'}" + (f" (×{n})" if n > 1 else "") for (call, error), n in counts.items()
+        ]
+        stop_msg = Message(
+            role="assistant",
+            content=f"I stopped because {self._tool_errors} tool calls in a row failed:\n"
+            + "\n".join(lines)
+            + "\nPlease tell me how to proceed (or fix what they need) and I will continue.",
+        )
+        messages.append(stop_msg)
+        yield StreamEvent(type="done", message=stop_msg)
 
     def _stop_for_input(self, messages: list[Message]) -> Any:
         """Yield a final assistant message marking the turn stopped (needs_input)."""
