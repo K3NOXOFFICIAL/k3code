@@ -59,6 +59,9 @@ def test_the_moving_breakpoint_follows_a_plain_user_message_and_never_lands_on_e
     assert "tools" not in payload and breakpoints(payload) == 2
     empty = p._payload([Message(role="user", content="")], [], "claude-test", max_tokens=100, temperature=None)
     assert breakpoints(empty) == 0 and "system" not in empty
+    silent = [*conversation()[:3], Message(role="tool", content="", tool_call_id="c1", name="read")]
+    payload = p._payload(silent, [], "claude-test", max_tokens=100, temperature=None)
+    assert breakpoints(payload) == 1  # the system prompt only: never on an empty tool result
 
 
 def test_prompt_cache_off_sends_no_breakpoints():

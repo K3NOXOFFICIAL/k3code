@@ -35,12 +35,13 @@ EPHEMERAL = {"type": "ephemeral"}
 
 def with_cache_breakpoint(content: Any) -> Any:
     """``content`` (a message's string or block list) with a cache breakpoint on its last block; unchanged when it has
-    no block that can carry one (empty text is rejected by the API)."""
+    no block that can carry one (empty text is rejected by the API; an empty tool result is skipped the same way)."""
     if isinstance(content, str):
         return [{"type": "text", "text": content, "cache_control": EPHEMERAL}] if content else content
     if isinstance(content, list) and content:
         last = content[-1]
-        if isinstance(last, dict) and (last.get("type") != "text" or last.get("text")):
+        body = {"text": "text", "tool_result": "content"}.get(str(last.get("type")))
+        if body is None or last.get(body):
             return [*content[:-1], {**last, "cache_control": EPHEMERAL}]
     return content
 
