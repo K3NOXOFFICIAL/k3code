@@ -23,8 +23,10 @@ class BgCommand(CommandDef):
             pane = pop_flag(args, "--pane")
             arg = " ".join(args)
         if arg:
+            from k3code.gateway.server import _ctx_cwd
+
             try:
-                new = ctx.start_background(live, arg)
+                new = ctx.start_background(live, arg, cwd=_ctx_cwd.get())
             except Exception as e:  # noqa: BLE001 - _InvalidParams (paused background work) etc.
                 return reply(f"Cannot start a background session: {e}")
             extra: dict[str, Any] = {}

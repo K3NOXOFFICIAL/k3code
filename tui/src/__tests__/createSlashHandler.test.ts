@@ -14,7 +14,7 @@ import * as TerminalSetupModule from "../lib/terminalSetup.js";
 // DASHBOARD_TUI_MODE resolves once at module load from K3CODE_TUI_DASHBOARD,
 // so toggling process.env in a test body can't move it. Mock just that one
 // export (everything else stays real) and flip the holder per test.
-const envState = { dashboardTuiMode: false };
+const envState = { dashboardTuiMode: false, workspaceCwd: "" };
 vi.mock("../config/env.js", async (importActual) => {
   const actual = await importActual<typeof EnvModule>();
 
@@ -22,6 +22,9 @@ vi.mock("../config/env.js", async (importActual) => {
     ...actual,
     get DASHBOARD_TUI_MODE() {
       return envState.dashboardTuiMode;
+    },
+    get STARTUP_WORKSPACE_CWD() {
+      return envState.workspaceCwd;
     },
   };
 });
@@ -32,6 +35,7 @@ describe("createSlashHandler", () => {
     resetOverlayState();
     resetUiState();
     envState.dashboardTuiMode = false;
+    envState.workspaceCwd = "";
   });
 
   it("opens the unified sessions overlay for /resume", () => {
@@ -162,6 +166,51 @@ describe("createSlashHandler", () => {
     );
 
     vi.useRealTimers();
+  });
+
+  it("starts /bg in the session's own cwd, so a switched project wins over the shell's K3CODE_TUI_CWD", () => {
+    envState.workspaceCwd = "/work/shell-project";
+    patchUiState({
+      info: { cwd: "/work/other-project" } as never,
+      sid: "sid-abc",
+    });
+    const ctx = buildCtx();
+
+    expect(createSlashHandler(ctx)("/bg write the tests")).toBe(true);
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
+      command: "bg write the tests",
+      cwd: "/work/other-project",
+      session_id: "sid-abc",
+    });
+
+    // after switching again, the new session's cwd is used
+    patchUiState({ info: { cwd: "/daemon/launch" } as never });
+    createSlashHandler(ctx)("/bg again");
+    expect(ctx.gateway.gw.request).toHaveBeenLastCalledWith("slash.exec", {
+      command: "bg again",
+      cwd: "/daemon/launch",
+      session_id: "sid-abc",
+    });
+
+    // other commands carry no cwd
+    createSlashHandler(ctx)("/skills check");
+    expect(ctx.gateway.gw.request).toHaveBeenLastCalledWith("slash.exec", {
+      command: "skills check",
+      session_id: "sid-abc",
+    });
+  });
+
+  it("falls back to K3CODE_TUI_CWD for /bg when no session info has arrived", () => {
+    envState.workspaceCwd = "/work/proj";
+    patchUiState({ info: null, sid: "sid-abc" });
+    const ctx = buildCtx();
+
+    createSlashHandler(ctx)("/bg write the tests");
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
+      command: "bg write the tests",
+      cwd: "/work/proj",
+      session_id: "sid-abc",
+    });
   });
 
   it("sends /model chain to the gateway instead of opening the model picker", () => {

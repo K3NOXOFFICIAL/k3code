@@ -157,6 +157,26 @@ describe("unified Sessions overlay helpers", () => {
     ]);
   });
 
+  it("hides stored sessions with no message; a live empty session stays a live row", () => {
+    const history = [
+      { id: "a", message_count: 4, preview: "", started_at: 0, title: "A" },
+      { id: "e", message_count: 0, preview: "", started_at: 0, title: "" },
+      { id: "n", message_count: 0, preview: "", started_at: 0, title: "" },
+      { id: "c", message_count: 1, preview: "", started_at: 0, title: "C" },
+    ] satisfies SessionListRow[];
+    // "n" is the empty session this TUI just opened: live, so it is listed among the live rows, not as history.
+    const live = [{ id: "n", status: "idle" }] satisfies SessionActiveItem[];
+    const hist = resumableHistory(history, live);
+
+    expect(hist.map((h) => h.id)).toEqual(["a", "c"]);
+    expect(resumableHistory(history, []).map((h) => h.id)).toEqual(["a", "c"]);
+    // [new][n][a][c]: the pinned new row, the live empty session, then the non-empty history
+    expect(sessionRowKindAt(0, live.length)).toBe("new");
+    expect(sessionRowKindAt(1, live.length)).toBe("live");
+    expect(sessionRowKindAt(1 + hist.length, live.length)).toBe("history");
+    expect(live.length + hist.length + 1).toBe(4);
+  });
+
   it("renders relative session age, blank when unknown", () => {
     const nowSec = Math.floor(Date.now() / 1000);
 

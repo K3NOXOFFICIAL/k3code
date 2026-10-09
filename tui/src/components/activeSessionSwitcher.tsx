@@ -90,14 +90,17 @@ export const relativeSessionAge = (ts?: number) => {
   return `${Math.floor(days)}d ago`;
 };
 
-/** Drop already-live sessions from the resumable history list (dedupe by id). */
+/**
+ * Resumable history: drop already-live sessions (dedupe by id) and stored sessions with no message (abandoned TUI
+ * starts left one "Session · 0 msgs" row each). Live sessions are listed separately, so a live empty one stays.
+ */
 export const resumableHistory = (
   history: readonly SessionListRow[],
   live: readonly SessionActiveItem[],
 ) => {
   const liveIds = new Set(live.map((s) => s.id));
 
-  return history.filter((h) => !liveIds.has(h.id));
+  return history.filter((h) => !liveIds.has(h.id) && h.message_count !== 0);
 };
 
 export const resumeRowContextHintSegments: OrchestratorHintSegment[] = [

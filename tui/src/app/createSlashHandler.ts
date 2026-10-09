@@ -5,6 +5,7 @@ import { rpcErrorMessage } from "../lib/rpc.js";
 import { launchWidget } from "../sdk/host.js";
 import { getWidgetApp } from "../sdk/registry.js";
 
+import { backgroundCwd } from "./backgroundSession.js";
 import type { SlashHandlerContext } from "./interfaces.js";
 import { scoreSlashMenuItem } from "./slash/fuzzyScore.js";
 import { findSlashCommand } from "./slash/registry.js";
@@ -186,9 +187,14 @@ export function createSlashHandler(
       }
     };
 
+    // /bg starts a session on the gateway, which may be a daemon launched elsewhere: name the session's own
+    // workspace (K3CODE_TUI_CWD only when there is none yet) so the background session runs in this project.
+    const bgCwd = parsed.name === "bg" ? backgroundCwd() : "";
+
     gw.request<SlashExecResponse>("slash.exec", {
       command: cmd.slice(1),
       session_id: sid,
+      ...(bgCwd ? { cwd: bgCwd } : {}),
     })
       .then((r) => {
         if (stale()) {
