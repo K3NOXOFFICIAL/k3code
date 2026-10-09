@@ -52,7 +52,7 @@ def test_checksums_fail_closed(tmp_path: Path) -> None:
 def test_cli_refuses_unverifiable_release_cleanly(
     data: Path, monkeypatch: pytest.MonkeyPatch, sums: str | None
 ) -> None:
-    assets = {"k3code-9.0.0-py3-none-any.whl": "u/whl"}
+    assets = {"k3code-9.0.0-py3-none-any.whl": "u/whl", "k3code-9.0.0-requirements.txt": "u/reqs"}
     if sums is not None:
         assets["SHA256SUMS"] = "u/sums"
     rel = upd.Release(tag="v9.0.0", version="9.0.0", body="", prerelease=False, assets=assets)

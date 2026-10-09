@@ -187,6 +187,44 @@ class UpdateResult:
     log: list[str] = field(default_factory=list)
 
 
+def uv_path() -> str:
+    return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+
+
+def carry_playwright(prev_vdir: Path, new_vdir: Path, uv: str | None = None) -> str | None:
+    """Install the Playwright version of ``prev_vdir``'s venv into ``new_vdir``'s; a line for the log, or None.
+
+    Only the installer's presetup installs Playwright, and every update builds a fresh venv without it, so the browser
+    tool used to vanish on the first update. Chromium itself lives in ``<data>/browsers``, shared by all versions, so
+    only the Python package is installed again (no browser download)."""
+    old_py = prev_vdir / "venv" / "bin" / "python"
+    new_py = new_vdir / "venv" / "bin" / "python"
+    if not old_py.exists() or not new_py.exists():
+        return None
+    probe = "from importlib.metadata import version; import playwright; print(version('playwright'))"
+    try:
+        old = subprocess.run([str(old_py), "-c", probe], capture_output=True, text=True, timeout=60, check=False)
+        if old.returncode != 0 or not old.stdout.strip():
+            return None  # the browser tool was off before the update: keep it off
+        ver = old.stdout.strip().splitlines()[-1]
+        new = subprocess.run([str(new_py), "-c", probe], capture_output=True, text=True, timeout=60, check=False)
+        if new.returncode == 0:
+            return None  # the new version brings its own
+        r = subprocess.run(
+            [uv or uv_path(), "pip", "install", "--quiet", "--python", str(new_py), f"playwright=={ver}"],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"warning: could not carry Playwright over ({type(e).__name__}: {e}); the browser tool is off"
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip()[-300:]
+        return f"warning: could not install Playwright {ver} into the new version ({err}); the browser tool is off"
+    return f"carried Playwright {ver} over to the new version"
+
+
 def activate(
     version: str,
     *,
@@ -195,17 +233,24 @@ def activate(
     daemon_installed: Callable[[], bool] = service.is_installed,
     smoke: Callable[[Path], tuple[bool, str]] = smoke_test,
     wait: Callable[..., bool] = wait_healthy,
+    carry: Callable[[Path, Path], str | None] = carry_playwright,
 ) -> UpdateResult:
-    """Smoke-test ``versions/<version>``, switch to it, restart the daemon; roll back on any failure."""
+    """Smoke-test ``versions/<version>``, switch to it, restart the daemon; roll back on any failure.
+
+    Release, source and git updates all pass through here, so this is where the new venv gets the optional Playwright
+    package the current one has (before the smoke test, which then runs the venv as it will be used)."""
     vdir = versions_dir() / version
     prev = current_version()
+    log: list[str] = []
+    if prev and prev != version and (carried := carry(versions_dir() / prev, vdir)):
+        log.append(carried)
     ok, detail = smoke(vdir)
     if not ok:
         if version not in (prev, previous_version()):  # a staged build that never ran: do not leave it behind
             shutil.rmtree(vdir, ignore_errors=True)
-        return UpdateResult(False, version, f"smoke test failed, not switching: {detail}", log=[detail])
+        return UpdateResult(False, version, f"smoke test failed, not switching: {detail}", log=[*log, detail])
     switch_to(version)
-    log = [f"switched current -> {version} (was {prev})"]
+    log.append(f"switched current -> {version} (was {prev})")
     if daemon_installed():
         try:
             restart()
@@ -224,7 +269,8 @@ def activate(
                 log.append(f"daemon unhealthy after {DAEMON_WAIT_SECONDS}s; rolled back to {prev}")
                 return UpdateResult(False, version, log[-1], rolled_back=True, log=log)
             return UpdateResult(False, version, "daemon unhealthy and no previous version to roll back to", log=log)
-    return UpdateResult(True, version, f"updated to {version}", log=log)
+    warnings = "".join(f"\n{line}" for line in log if line.startswith("warning:"))
+    return UpdateResult(True, version, f"updated to {version}{warnings}", log=log)
 
 
 def rollback(
@@ -373,13 +419,25 @@ def verify_checksums(files: dict[str, Path]) -> None:
             raise IntegrityError(f"checksum mismatch for {name}: the download is corrupt or was altered")
 
 
-def install_release(rel: Release, token: str | None, uv: str | None = None) -> Path:
+class UnpinnedReleaseError(IntegrityError):
+    """The release ships no locked requirements file: its dependencies would be whatever PyPI has today."""
+
+
+#: The release asset with the runtime dependencies exported from core/uv.lock, with hashes (``k3code-<ver>-...``).
+REQUIREMENTS_SUFFIX = "-requirements.txt"
+
+
+def install_release(rel: Release, token: str | None, uv: str | None = None, *, allow_unpinned: bool = False) -> Path:
     """Download + verify the release assets and build ``versions/<ver>`` (not yet activated).
+
+    The dependencies come from the release's hashed requirements file (the set CI tested, from core/uv.lock), the
+    wheel itself with ``--no-deps``: installing the wheel alone resolved the newest PyPI versions of everything. A
+    release without that file is refused unless ``allow_unpinned``.
 
     Never touches a version that is installed and complete, nor the current or previous one: ``/update now`` used
     to rmtree ``versions/<ver>`` even when it was the live install, deleting the running k3code.
     """
-    uv = uv or shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+    uv = uv or uv_path()
     vdir = versions_dir() / rel.version
     if vdir.exists():
         if (vdir / ".complete").is_file():
@@ -387,6 +445,12 @@ def install_release(rel: Release, token: str | None, uv: str | None = None) -> P
         if rel.version in (current_version(), previous_version()):
             raise ValueError(f"refusing to rebuild {rel.version}: it is the active or the previous version")
         shutil.rmtree(vdir)  # an interrupted earlier download
+    if not allow_unpinned and not any(n.endswith(REQUIREMENTS_SUFFIX) for n in rel.assets):
+        raise UnpinnedReleaseError(
+            f"release {rel.version} has no locked requirements file (k3code-{rel.version}{REQUIREMENTS_SUFFIX}), so "
+            "its dependencies would be resolved from PyPI as they are today rather than the set it was tested "
+            "with. Run `k3code update --allow-unpinned` to install it anyway"
+        )
     # Build in place: venvs are not relocatable (absolute shebangs). `.complete` is written last.
     vdir.mkdir(parents=True)
     try:
@@ -402,7 +466,13 @@ def install_release(rel: Release, token: str | None, uv: str | None = None) -> P
             raise ValueError("release has no wheel")
         subprocess.run([uv, "venv", "--python", ">=3.12", str(vdir / "venv")], check=True, capture_output=True)
         py = str(vdir / "venv" / "bin" / "python")
-        subprocess.run([uv, "pip", "install", "--python", py, str(wheel)], check=True, capture_output=True)
+        reqs = next((p for n, p in files.items() if n.endswith(REQUIREMENTS_SUFFIX)), None)
+        if reqs is None:  # allow_unpinned: an older release, resolved as before
+            subprocess.run([uv, "pip", "install", "--python", py, str(wheel)], check=True, capture_output=True)
+        else:
+            pip = [uv, "pip", "install", "--python", py]
+            subprocess.run([*pip, "--require-hashes", "-r", str(reqs)], check=True, capture_output=True)
+            subprocess.run([*pip, "--no-deps", str(wheel)], check=True, capture_output=True)
         tui = next((p for n, p in files.items() if n.startswith("k3code-tui") and n.endswith(".tar.gz")), None)
         if tui:
             (vdir / "tui").mkdir()

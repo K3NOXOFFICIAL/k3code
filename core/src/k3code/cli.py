@@ -862,8 +862,19 @@ def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
 @click.option("--from-source", is_flag=True, help="git pull the source checkout and rebuild")
 @click.option("--no-pull", is_flag=True, help="With --from-source: rebuild without git pull (you pulled the clone)")
 @click.option("--rollback", "do_rollback", is_flag=True, help="Switch back to the previous version")
+@click.option(
+    "--allow-unpinned",
+    is_flag=True,
+    help="Install a release that ships no locked requirements file (its dependencies resolve from PyPI)",
+)
 def update_cmd(
-    check: bool, yes: bool, channel: str | None, from_source: bool, no_pull: bool, do_rollback: bool
+    check: bool,
+    yes: bool,
+    channel: str | None,
+    from_source: bool,
+    no_pull: bool,
+    do_rollback: bool,
+    allow_unpinned: bool,
 ) -> None:
     """Update to the latest release (smoke-tested, auto-rollback) or roll back.
 
@@ -962,7 +973,7 @@ def update_cmd(
         if not yes:
             click.confirm(f"Update to {rel.version}?", abort=True)
         try:
-            upd.install_release(rel, upd.github_token())
+            upd.install_release(rel, upd.github_token(), allow_unpinned=allow_unpinned)
         except upd.IntegrityError as e:
             raise click.ClickException(f"update refused: {e}. Nothing was installed.") from e
         except (OSError, ValueError, httpx.HTTPError, subprocess.CalledProcessError) as e:

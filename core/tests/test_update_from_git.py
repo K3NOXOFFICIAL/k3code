@@ -221,7 +221,7 @@ def test_a_published_release_still_wins_over_a_recorded_ref(data, no_release, mo
     _install(data, "1234567aaaa")
     rel = upd.Release(tag="v0.2.0", version="0.2.0", body="notes", prerelease=False, assets={})
     monkeypatch.setattr(upd, "fetch_latest", lambda *a, **k: rel)
-    monkeypatch.setattr(upd, "install_release", lambda r, tok: None)
+    monkeypatch.setattr(upd, "install_release", lambda r, tok, **kw: None)
     monkeypatch.setattr(upd, "update_from_git", _no_update)
     monkeypatch.setattr(upd, "remote_head", _no_update)
     r = CliRunner().invoke(cli, ["update", "--yes"])
