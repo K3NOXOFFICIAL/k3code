@@ -18,6 +18,7 @@ from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
 from k3code.tools import MAX_TOOL_RESULT_CHARS, build_registry, clip_tool_results, format_tool_result
+from k3code.tools.validate import invalid_arguments
 
 logger = logging.getLogger(__name__)
 
@@ -339,6 +340,9 @@ class AgentLoop:
         args = tool_call.arguments
         if tool_call.name == EXIT_PLAN_TOOL:
             return await self._exit_plan(args)
+        # before the permission prompt: a call the handler cannot run is not worth an approval
+        if (invalid := invalid_arguments(tool_call.name, spec.parameters, args)) is not None:
+            return {"error": invalid}
         decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
         if decision.action == "deny":
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
@@ -373,7 +377,7 @@ class AgentLoop:
             result = {"error": f"bash refused: {exc}"}
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
-            result = {"error": f"Tool execution failed: {e}"}
+            result = {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
         # M2: completion digest, so resume knows this call finished.
         self.reliability.journal_done(tool_call.id, result)
         if read_key is not None and "first" in result:
