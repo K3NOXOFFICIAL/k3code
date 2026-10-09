@@ -20,11 +20,14 @@ SOAK_PID=""
 if [[ ",$ONLY," == *",m2,"* ]]; then
   bash "$HERE/soak.sh" --minutes "$SOAK_MIN" --report >"$LOGS/soak.log" 2>&1 & SOAK_PID=$!
 fi
+# The milestone scripts import k3code (chaoslib authenticates to the daemon): use the project's venv, not the
+# system python3, which has no k3code.
+if [ -x "$REPO/core/.venv/bin/python" ]; then PY=("$REPO/core/.venv/bin/python"); else PY=(uv run --project "$REPO/core" python); fi
 for m in ${ONLY//,/ }; do
   f="$(find "$HERE" -maxdepth 1 \( -name "${m}_*.sh" -o -name "${m}_*.py" \) | sort | head -1)"
   [ -z "$f" ] && { echo "[exit] no check for $m"; continue; }
   echo "[exit] === $m ($(basename "$f")) $(date +%T)"
-  if [[ "$f" == *.py ]]; then python3 "$f" >"$LOGS/$m.log" 2>&1; else bash "$f" >"$LOGS/$m.log" 2>&1; fi
+  if [[ "$f" == *.py ]]; then "${PY[@]}" "$f" >"$LOGS/$m.log" 2>&1; else bash "$f" >"$LOGS/$m.log" 2>&1; fi
   echo "[exit] $m rc=$? (log: scripts/exit/rows/logs/$m.log)"
 done
 [ -n "$SOAK_PID" ] && { echo "[exit] waiting for soak ($SOAK_PID)"; wait "$SOAK_PID"; }
