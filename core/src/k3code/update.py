@@ -22,6 +22,8 @@ from k3code import service
 from k3code.paths import data_dir, user_config_path
 
 DEFAULT_REPO = "K3NOXOFFICIAL/k3code"
+#: The GitHub-compatible releases API; K3CODE_UPDATE_API or update.api point it at a mirror.
+DEFAULT_API = "https://api.github.com"
 KEEP_VERSIONS = 3
 DAEMON_WAIT_SECONDS = 120
 
@@ -87,8 +89,28 @@ def version_key(v: str) -> tuple[Any, ...]:
 # -- smoke test / daemon health -------------------------------------------------
 
 
+#: Doctor checks about the machine, not about the new version: they never block an update (a fresh install has no
+#: providers yet, a node-less one no TUI); the daemon itself is health-checked after the switch.
+ENV_CHECKS = (
+    "provider",
+    "providers",
+    "api-keys",
+    "omniroute-bypass",
+    "netwatch",
+    "disk",
+    "psi",
+    "daemon",
+    "systemd-unit",
+    "tui",
+    "vendor",
+    "sandbox",
+    "hermes-isolation",
+)
+
+
 def smoke_test(vdir: Path, timeout: float = 60.0) -> tuple[bool, str]:
-    """``k3code --version`` and ``k3code doctor --json --no-probe`` (no fails) using the version's own venv."""
+    """The new version's own venv: ``k3code --version`` names this version, and ``doctor --json --no-probe`` (which
+    loads the config with the new code) has no failing check about k3code itself; environment checks do not count."""
     exe = vdir / "venv" / "bin" / "k3code"
     if not exe.exists():
         return False, f"{exe} missing"
@@ -99,6 +121,9 @@ def smoke_test(vdir: Path, timeout: float = 60.0) -> tuple[bool, str]:
         )
         if v.returncode != 0:
             return False, f"--version failed: {v.stderr.strip()[:200]}"
+        want = vdir.name.split("-src")[0]
+        if want not in v.stdout:
+            return False, f"--version says {v.stdout.strip()[:80]!r}, expected {want}"
         d = subprocess.run(
             [str(exe), "doctor", "--json", "--no-probe"],
             capture_output=True,
@@ -108,19 +133,26 @@ def smoke_test(vdir: Path, timeout: float = 60.0) -> tuple[bool, str]:
             check=False,
         )
         try:
-            summary = json.loads(d.stdout).get("summary", {})
+            report = json.loads(d.stdout)
         except ValueError:
             return False, f"doctor emitted no JSON (exit {d.returncode}): {d.stderr.strip()[:200]}"
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"{type(e).__name__}: {e}"
-    if summary.get("fail", 0):
-        return False, f"doctor reports {summary['fail']} failing check(s)"
+    checks = report.get("checks") or []
+    blocking = [
+        str(c.get("name"))
+        for c in checks
+        if c.get("status") == "fail" and str(c.get("name", "")).split(":")[0] not in ENV_CHECKS
+    ]
+    if blocking or (not checks and report.get("summary", {}).get("fail", 0)):
+        return False, f"doctor reports failing check(s): {', '.join(blocking) or 'unnamed'}"
     return True, v.stdout.strip()
 
 
 def restart_daemon() -> None:
+    """Restart the unit; raises ``service.ServiceError`` when systemd refuses (reported, never ignored)."""
     if service.is_installed():
-        service._systemctl("restart", service.UNIT_NAME)  # noqa: SLF001
+        service.restart()
 
 
 def daemon_healthy() -> bool:
@@ -169,15 +201,26 @@ def activate(
     prev = current_version()
     ok, detail = smoke(vdir)
     if not ok:
+        if version not in (prev, previous_version()):  # a staged build that never ran: do not leave it behind
+            shutil.rmtree(vdir, ignore_errors=True)
         return UpdateResult(False, version, f"smoke test failed, not switching: {detail}", log=[detail])
     switch_to(version)
     log = [f"switched current -> {version} (was {prev})"]
     if daemon_installed():
-        restart()
-        if not wait(healthy):
+        try:
+            restart()
+            up = wait(healthy)
+        except service.ServiceError as e:
+            log.append(str(e))
+            up = False
+        if not up:
             if prev:
                 switch_to(prev)
-                restart()
+                try:
+                    restart()
+                except service.ServiceError as e:
+                    log.append(f"rolled back to {prev}, but the daemon did not restart: {e}")
+                    return UpdateResult(False, version, log[-1], rolled_back=True, log=log)
                 log.append(f"daemon unhealthy after {DAEMON_WAIT_SECONDS}s; rolled back to {prev}")
                 return UpdateResult(False, version, log[-1], rolled_back=True, log=log)
             return UpdateResult(False, version, "daemon unhealthy and no previous version to roll back to", log=log)
@@ -193,7 +236,10 @@ def rollback(
         return UpdateResult(False, cur or "", "no previous version to roll back to")
     switch_to(prev)  # records `cur` as the new previous, so rollback twice toggles
     if daemon_installed():
-        restart()
+        try:
+            restart()
+        except service.ServiceError as e:
+            return UpdateResult(False, prev, f"rolled back {cur} -> {prev}, but {e}", rolled_back=True)
     return UpdateResult(True, prev, f"rolled back {cur} -> {prev}", rolled_back=True)
 
 
@@ -243,6 +289,7 @@ def update_settings() -> dict[str, Any]:
         "source": s.get("source", ""),
         # the git remote a `install.sh --from-git` install updates from (a fork or mirror may set its own)
         "url": s.get("url") or f"https://github.com/{repo}.git",
+        "api": os.environ.get("K3CODE_UPDATE_API") or s.get("api") or DEFAULT_API,
     }
 
 
@@ -253,9 +300,12 @@ def _headers(token: str | None, accept: str = "application/vnd.github+json") -> 
     return h
 
 
-def fetch_latest(channel: str = "stable", repo: str = DEFAULT_REPO, token: str | None = None) -> Release | None:
+def fetch_latest(
+    channel: str = "stable", repo: str = DEFAULT_REPO, token: str | None = None, api: str | None = None
+) -> Release | None:
     """Newest release on ``channel`` (``stable`` skips prereleases; ``dev`` takes anything)."""
-    r = httpx.get(f"https://api.github.com/repos/{repo}/releases?per_page=30", headers=_headers(token), timeout=15)
+    base = (api or os.environ.get("K3CODE_UPDATE_API") or DEFAULT_API).rstrip("/")
+    r = httpx.get(f"{base}/repos/{repo}/releases?per_page=30", headers=_headers(token), timeout=15)
     if r.status_code in (401, 403, 404):
         raise PermissionError(
             f"GitHub API {r.status_code}: {repo} is private or does not exist; set GITHUB_TOKEN (or `gh auth login`) "
@@ -301,6 +351,28 @@ def is_newer(candidate: str, current: str | None) -> bool:
     return version_key(candidate) > version_key(current.split("-src")[0])
 
 
+class IntegrityError(ValueError):
+    """A release asset could not be verified: nothing from the release is installed."""
+
+
+def verify_checksums(files: dict[str, Path]) -> None:
+    """Fail closed: SHA256SUMS must be there and list every other downloaded asset with a matching hash."""
+    if "SHA256SUMS" not in files:
+        raise IntegrityError("the release has no SHA256SUMS: refusing to install files that cannot be verified")
+    sums = {}
+    for line in files["SHA256SUMS"].read_text().splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            sums[parts[1].lstrip("*")] = parts[0].lower()
+    for name, path in files.items():
+        if name == "SHA256SUMS":
+            continue
+        if name not in sums:
+            raise IntegrityError(f"SHA256SUMS has no entry for {name}: refusing to install it unverified")
+        if sums[name] != _sha256(path):
+            raise IntegrityError(f"checksum mismatch for {name}: the download is corrupt or was altered")
+
+
 def install_release(rel: Release, token: str | None, uv: str | None = None) -> Path:
     """Download + verify the release assets and build ``versions/<ver>`` (not yet activated).
 
@@ -324,15 +396,7 @@ def install_release(rel: Release, token: str | None, uv: str | None = None) -> P
         for name, url in rel.assets.items():
             files[name] = dl / name
             _download(url, files[name], token)
-        sums = {}
-        if "SHA256SUMS" in files:
-            for line in files["SHA256SUMS"].read_text().splitlines():
-                parts = line.split()
-                if len(parts) == 2:
-                    sums[parts[1].lstrip("*")] = parts[0]
-        for name, path in files.items():
-            if name != "SHA256SUMS" and sums.get(name) and sums[name] != _sha256(path):
-                raise ValueError(f"checksum mismatch for {name}")
+        verify_checksums(files)
         wheel = next((p for n, p in files.items() if n.endswith(".whl")), None)
         if wheel is None:
             raise ValueError("release has no wheel")

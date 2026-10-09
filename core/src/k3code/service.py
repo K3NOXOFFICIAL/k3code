@@ -98,8 +98,28 @@ def recover_unit_path() -> Path:
     return unit_dir() / RECOVER_UNIT_NAME
 
 
+class ServiceError(RuntimeError):
+    """systemd refused, or is not there: the message says which."""
+
+
+def systemd_available() -> bool:
+    return shutil.which("systemctl") is not None
+
+
 def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, check=False)
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        raise ServiceError("systemd user manager not available (no systemctl)") from None
+
+
+def restart(unit: str = UNIT_NAME) -> None:
+    """``reset-failed`` then ``restart``: after a crash loop the start limit refuses a bare restart
+    (start-limit-hit), and the daemon would stay down until the recovery unit runs."""
+    _systemctl("reset-failed", unit)  # a unit with nothing to reset is not an error
+    r = _systemctl("restart", unit)
+    if r.returncode != 0:
+        raise ServiceError(f"systemctl --user restart {unit} failed: {(r.stderr or r.stdout).strip()[:300]}")
 
 
 def install(dry_run: bool = False) -> list[str]:
@@ -119,6 +139,8 @@ def install(dry_run: bool = False) -> list[str]:
     )
     if dry_run:
         return ["[dry-run] would:", *(f"  - {s}" for s in steps), "[dry-run] unit file:", unit, advice]
+    if not systemd_available():  # checked before anything is written
+        raise ServiceError("systemd user manager not available: run `k3code daemon` directly instead")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(unit)
     recover.write_text(render_recover_unit())

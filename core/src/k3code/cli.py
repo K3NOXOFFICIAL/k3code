@@ -686,7 +686,10 @@ def service_group() -> None:
 def service_install(dry_run: bool) -> None:
     from k3code import service
 
-    click.echo("\n".join(service.install(dry_run=dry_run)))
+    try:
+        click.echo("\n".join(service.install(dry_run=dry_run)))
+    except service.ServiceError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @service_group.command("uninstall")
@@ -868,6 +871,8 @@ def update_cmd(
     built from a checkout (`install.sh --from-source`) updates from that checkout, and an install made with
     `install.sh --from-git` (the default) rebuilds from the newest commit of the branch or tag it was made from
     (`update.url`, default: the GitHub repository `update.repo`)."""
+    import httpx
+
     from k3code import update as upd
 
     if do_rollback:
@@ -881,7 +886,7 @@ def update_cmd(
     if not from_source:
         denied = ""
         try:
-            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token())
+            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token(), cfg["api"])
         except PermissionError as e:
             denied = str(e)
         except Exception as e:  # noqa: BLE001
@@ -956,7 +961,12 @@ def update_cmd(
             return
         if not yes:
             click.confirm(f"Update to {rel.version}?", abort=True)
-        upd.install_release(rel, upd.github_token())
+        try:
+            upd.install_release(rel, upd.github_token())
+        except upd.IntegrityError as e:
+            raise click.ClickException(f"update refused: {e}. Nothing was installed.") from e
+        except (OSError, ValueError, httpx.HTTPError, subprocess.CalledProcessError) as e:
+            raise click.ClickException(f"update failed: {e}. Nothing was activated.") from e
         ver = rel.version
     res = upd.activate(ver)
     click.echo(res.message)
