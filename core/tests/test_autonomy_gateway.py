@@ -252,6 +252,32 @@ async def test_trivial_task_that_stalls_on_the_cheap_tier_escalates_to_main(tmp_
     assert server.session.stored.messages[-1]["content"] == "recovered"
 
 
+async def test_cheap_start_turn_escalated_to_main_still_escalates_instead_of_stopping(tmp_path, monkeypatch):
+    """The MAIN attempt of a cheap-start turn is followed by STRONG, so its tool-error stop must stay silent."""
+    same = {
+        "type": "tool_call",
+        "model": "m-cheap",
+        "match": "TRIVIAL-TASK",
+        "id": "c1",
+        "name": "bash",
+        "arguments": {"command": "echo hi"},
+    }
+    steps = [verdict("trivial"), same, {"type": "text", "model": "m-main", "text": "recovered"}]
+    server = make(tmp_path, monkeypatch, steps)
+    builds: list[bool] = []
+    real = server._build_loop
+
+    def spy(*args: Any, **kwargs: Any):
+        builds.append(kwargs.get("escalates", False))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(server, "_build_loop", spy)
+    await start(server, tmp_path)
+    await run_turn(server, "TRIVIAL-TASK rename x", [{"choice": "once"}] * 5)
+    assert [(e["from"], e["to"]) for e in events(server, "routing.escalated")] == [("cheap", "main")]
+    assert builds[-1] is True, builds
+
+
 async def test_degrade_trivial_can_be_switched_off(tmp_path, monkeypatch):
     server = make(tmp_path, monkeypatch, [verdict("trivial"), *DIRECT], autonomy={"degrade_trivial": False})
     await start(server, tmp_path)

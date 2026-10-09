@@ -77,6 +77,8 @@ def test_signature_normalises_paths_numbers_hex_and_uuids():
     assert bash.error_class == "exit 127" and bash.signature == "npm: exit <n>: sh: <n>: npm: not found"
     assert failure_of("bash", {"command": "true"}, {"stdout": "", "exit_code": 0}) is None
     assert len(normalise("x" * 500)) == 160
+    leak = normalise("postgresql://app:" + "pa55" + "w0rdXYZ@db/x sk-proj-" + "1234567890" + "abcdefghijkl")
+    assert "pa55" not in leak and "1234567890" not in leak and "w0rdXYZ" not in leak
 
 
 def test_three_identical_failures_with_different_args_remind_once():
