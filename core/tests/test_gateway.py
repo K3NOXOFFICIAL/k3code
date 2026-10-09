@@ -204,6 +204,43 @@ async def test_session_list_cwd_applies_the_limit_after_filtering(tmp_path):
     await server.close()
 
 
+async def test_session_list_cwd_scan_does_not_parse_every_transcript(tmp_path, monkeypatch):
+    """The scan ran on the daemon's event loop parsing up to 2000 full transcripts (8 s on a big store), stalling
+    every other client: only the matches' transcripts may be read into Python."""
+    from k3code.gateway import server as server_mod
+
+    (tmp_path / "proj").mkdir()
+    server = make_server()
+    blob = json.dumps([{"role": "user", "content": "x" * 20_000}])
+    rows = []
+    for i in range(600):
+        cwd = str(tmp_path / "proj") if i in (0, 250, 599) else f"/elsewhere/{i % 5}"
+        rows.append((f"s{i:04d}", cwd, blob, "{}", float(i)))
+    rows.append(("empty", str(tmp_path / "proj"), "[]", "{}", 1000.0))
+    rows.append(("cron", str(tmp_path / "proj"), blob, '{"origin": "automation"}', 1001.0))
+    server.store._db.executemany(
+        "INSERT INTO sessions (session_id, cwd, messages, meta, updated_at) VALUES (?,?,?,?,?)", rows
+    )
+    server.store._db.commit()
+    real_loads = json.loads
+    big_parses = 0
+
+    def counting_loads(s, *a, **kw):
+        nonlocal big_parses
+        if isinstance(s, str) and len(s) > 10_000:
+            big_parses += 1
+        return real_loads(s, *a, **kw)
+
+    monkeypatch.setattr(json, "loads", counting_loads)
+    got = server_mod._project_sessions(server, str((tmp_path / "proj").resolve()), 50)
+    monkeypatch.setattr(json, "loads", real_loads)
+    assert [s.session_id for s in got] == ["s0599", "s0250", "s0000"]
+    assert big_parses == 3  # the three matches, not the 600 rows scanned
+    res = (await rpc(server, "session.list", {"cwd": str(tmp_path / "proj"), "limit": 50}))["result"]["sessions"]
+    assert [r["id"] for r in res] == ["s0599", "s0250", "s0000"]
+    await server.close()
+
+
 async def test_session_list_without_cwd_is_unchanged(tmp_path):
     """Other callers (the session switcher) still get every project, automation runs and empty sessions included."""
     (tmp_path / "a").mkdir()

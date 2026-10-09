@@ -58,6 +58,7 @@ class SessionStore:
         self._db.execute(_SCHEMA)
         with contextlib.suppress(sqlite3.OperationalError):  # column already exists
             self._db.execute("ALTER TABLE sessions ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
+        self._db.execute("CREATE INDEX IF NOT EXISTS sessions_updated_at ON sessions (updated_at)")
         self._db.commit()
 
     def create(self, *, title: str = "", model: str = "", provider: str = "", cwd: str = "") -> StoredSession:
@@ -165,6 +166,19 @@ class SessionStore:
             )
         return out
 
+    def worked_in(self, *, limit: int) -> list[tuple[str, str]]:
+        """``(session_id, cwd)`` of the newest ``limit`` sessions with at least one message and no automation origin.
+
+        Decided in SQL, so no transcript is parsed or copied into Python: every write path stores an empty
+        transcript as exactly ``'[]'``.
+        """
+        return self._db.execute(
+            "SELECT session_id, cwd FROM sessions"
+            " WHERE messages NOT IN ('', '[]') AND COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
+            " ORDER BY updated_at DESC LIMIT ?",
+            (max(1, limit),),
+        ).fetchall()
+
     def save(self, sess: StoredSession) -> None:
         sess.updated_at = time.time()
         self._db.execute(
@@ -190,9 +204,10 @@ class SessionStore:
         return cur.rowcount > 0
 
     def most_recent(self) -> StoredSession | None:
-        """The session to continue: the newest one the user worked in (cron/loop/automation runs are not that)."""
-        rows = self.list(limit=1, include_automation=False)
-        return rows[0] if rows else None
+        """The session to continue: the newest one the user worked in (cron/loop/automation runs and sessions with no
+        message are not that: resuming one opens an empty chat)."""
+        rows = self.worked_in(limit=1)
+        return self.get(rows[0][0]) if rows else None
 
     def close(self) -> None:
         self._db.close()

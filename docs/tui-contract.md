@@ -37,7 +37,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `session.control` | `{session_id, goal?, loop?, heartbeat?}` | `{ok: boolean}` | | Write goal/loop/heartbeat |
 | `session.workspace.move` | `{session_id, path}` | `{ok: boolean}` | | Move session cwd |
 | `session.branch_stored` | `{session_id, branch_name?}` | `{session_id}` | | Fork stored session |
-| `session.most_recent` | `{}` | `{session_id?, info?}` | | Last session |
+| `session.most_recent` | `{}` | `{session_id?, info?}` | | Last session with at least one message (automation runs excluded) |
 | `session.events.since` | `{session_id, seq}` | `{events: GatewayEvent[]}` | | Event replay |
 | `session.events.stats` | `{session_id}` | `{total, by_type}` | | Event stats |
 | `prompt.submit` | `{session_id, text, attachments?, images?, files?, model?, tools?, compact?}` | `{turn_id}` | ✅ | Send user message |
@@ -63,7 +63,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | Method | Params | Result | Notes |
 |--------|--------|--------|-------|
 | `session.compress` | `{session_id, target_tokens?}` | `{compressed: boolean}` | Context compaction |
-| `session.close` | `{session_id}` | `{closed: boolean}` | Close without delete |
+| `session.close` | `{session_id, disposable_only?}` | `{closed: boolean, reason?}` | Close without delete. `disposable_only` (default false; send it after attaching elsewhere) closes only an empty, idle session and deletes its stored row; a session with messages or work is left alone with `{closed: false, reason}`, not an error |
 | `delegation.status` | `{}` | `{active[], paused, max_depth, max_concurrent}` | Sub-agent panel |
 | `delegation.pause` | `{paused}` | `{paused: boolean}` | Pause delegation |
 | `subagent.list` | `{session_id}` | `{subagents: ActiveSubagent[]}` | Sub-agent panel |

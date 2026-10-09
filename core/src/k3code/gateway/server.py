@@ -523,8 +523,10 @@ class GatewayServer:
         """Drop ``sid`` from the live registry (its stored copy stays resumable) unless it is in use: a turn owns it,
         it runs in the background, it waits for an answer, or a client is on it.
 
-        ``disposable_only`` (its last client just left) also keeps every session with something in it or behind it:
-        a message, an automation origin, a finished-run state, queued input, a running sub-agent.
+        ``disposable_only`` (its last client just left, or the caller switched away from it) also keeps every session
+        with something in it or behind it: a message, an automation origin, a finished-run state, queued input, a
+        running sub-agent. A session it does close is deleted from the store too: it has nothing to resume, and left
+        behind it would be the newest stored row, the one auto-resume picks.
         """
         live = self.live.get(sid)
         if live is None:
@@ -547,6 +549,8 @@ class GatewayServer:
         ):
             return {"closed": False, "reason": "not disposable"}
         self.live.pop(sid, None)
+        if disposable_only:
+            self.store.delete(sid)
         if live.reliability is not None:
             await live.reliability.stop()
         return {"closed": True}
@@ -934,7 +938,8 @@ class GatewayServer:
                 writer.close()
             # Every TUI start creates a session so the prompt is usable; one left empty and idle by its last client
             # (TUI exit, crash, kill -9: the socket just drops) was never closed, because session.close refuses while
-            # its caller is still attached. Not during a daemon stop: close() iterates the registry across awaits.
+            # its caller is still attached. Its stored row goes too (close_live). Not during a daemon stop: close()
+            # iterates the registry across awaits.
             if client.session_id and not self.stopping:
                 with contextlib.suppress(Exception):
                     if (await self.close_live(client.session_id, disposable_only=True))["closed"]:
@@ -2480,34 +2485,25 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"session_id": stored.session_id, "info": live.live_info()}
 
 
-#: Most stored rows ``session.list {cwd}`` reads looking for that project's sessions (newest first). Old rows can spell
-#: the cwd with a symlink or trailing slash, so the match is made in Python, not with ``WHERE cwd = ?``.
+#: Most stored sessions ``session.list {cwd}`` considers looking for that project's (the newest non-empty,
+#: non-automation ones; older history of a project buried under this many newer sessions elsewhere is not listed).
+#: Old rows can spell the cwd with a symlink or trailing slash, so the match is made in Python, not with
+#: ``WHERE cwd = ?``; only ids and cwds are scanned, full rows are loaded for the matches alone.
 _SESSION_LIST_SCAN_CAP = 2000
-_SESSION_LIST_SCAN_PAGE = 200
 
 
 def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[StoredSession]:
     """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised)."""
     spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
-    out: list[StoredSession] = []
-    offset = 0
-    while offset < _SESSION_LIST_SCAN_CAP:
-        page = server.store.list(
-            limit=min(_SESSION_LIST_SCAN_PAGE, _SESSION_LIST_SCAN_CAP - offset),
-            include_automation=False,
-            offset=offset,
-        )
-        for s in page:
-            if s.cwd not in spelled:
-                spelled[s.cwd] = _norm_cwd(s.cwd)
-            if s.messages and spelled[s.cwd] == cwd:
-                out.append(s)
-                if len(out) >= limit:
-                    return out
-        if len(page) < _SESSION_LIST_SCAN_PAGE:
-            break
-        offset += len(page)
-    return out
+    ids: list[str] = []
+    for sid, stored_cwd in server.store.worked_in(limit=_SESSION_LIST_SCAN_CAP):
+        if stored_cwd not in spelled:
+            spelled[stored_cwd] = _norm_cwd(stored_cwd)
+        if spelled[stored_cwd] == cwd:
+            ids.append(sid)
+            if len(ids) >= limit:
+                break
+    return [s for s in map(server.store.get, ids) if s is not None]
 
 
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -2618,8 +2614,14 @@ async def _session_activate(server: GatewayServer, params: dict[str, Any]) -> di
 async def _session_close(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """The TUI closes the session it just left (``/resume``, new session). An idle foreground session is dropped from
     the live registry (its stored copy stays resumable); one that is running, backgrounded or waiting for an
-    answer keeps going, so it stays in the agent strip."""
-    return await server.close_live(str(params.get("session_id") or ""))
+    answer keeps going, so it stays in the agent strip.
+
+    ``disposable_only`` (sent after the caller attached elsewhere) closes only an empty, idle session, and deletes its
+    stored row; anything else is left alone with ``{closed: false, reason}``, not an error. A caller still on the
+    session counts as using it either way."""
+    return await server.close_live(
+        str(params.get("session_id") or ""), disposable_only=bool(params.get("disposable_only"))
+    )
 
 
 async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
