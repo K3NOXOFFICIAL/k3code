@@ -27,6 +27,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 - Sub-agents: finished ones showed as working, elapsed times of about 56 years, and the live view said "unavailable" for every agent.
 - A loop tick could start while a user turn was still preparing, and a prompt typed behind a tick ran unattended on the cheap tier.
 - Reading key files, `.env`, `~/.config/k3code` and `/proc/*/environ` is refused in every mode, and "always allow" no longer saves a command's inline `VAR=secret` in the rule.
+- The credential-file refusal covers only commands that can reveal or send a file's content: readers, copies with the file as source, archives, interpreters given the path, `< file`, and `curl -d @file`, `-F name=@file`, `-T file` (the `@file` forms were let through before). Commands that only name, test or authenticate with the file get the normal decision: `ssh|scp|sftp -i KEY`, `-F CONFIG`, `-o IdentityFile=KEY`, `ssh-add`, `ssh-keygen -l|-y -f KEY`, `chmod`/`chown`/`chgrp`/`stat`/`test`/`[`/`[[`/`touch`/`realpath`/`readlink`/`ls`/`file`, `git check-ignore`, and `echo`/`printf` also into a file (not into a pipe or `$(...)`). Deleting one (`rm`, `unlink`, `shred`), `source .env`, `git add|rm|mv` of one and `docker|podman --env-file` ask a person in `default` and `auto` (an unattended run refuses them).
 - The setup answer "focus mode on by default" is applied.
 
 ## [0.1.0] - 2026-10-08 (alpha, not tagged)

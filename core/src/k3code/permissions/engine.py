@@ -295,15 +295,58 @@ def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
 _INPUT_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*<(?![<&(>])\s*([^\s;&|<>()]+)")
 _ANY_VAR = re.compile(r"\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
 _GLOB_CHARS = frozenset("*?[")
-#: Print their arguments as text: ``echo .env`` reads nothing (unless the text goes on to a pipe or a file).
-_PRINTERS = frozenset({"echo", "printf"})
-#: Lists names, not contents.
-_LISTERS = frozenset({"ls"})
+#: Print, test or change the metadata of the paths they are given, never a file's content: ``echo .env``,
+#: ``test -f .env``, ``chmod 600 ~/.ssh/id_rsa``, ``ssh-add ~/.ssh/id_ed25519``. Exempt unless their output goes on to a
+#: pipe or a substitution, where a printed name feeds a reader (``realpath .env | xargs cat``, ``tac $(echo .env)``).
+_NAME_ONLY = frozenset(
+    {
+        "echo",
+        "printf",
+        "ls",
+        "realpath",
+        "readlink",
+        "stat",
+        "file",
+        "chmod",
+        "chown",
+        "chgrp",
+        "touch",
+        "test",
+        "[",
+        "[[",
+        "ssh-add",
+    }
+)
+#: ``file`` options whose value it reads: ``-f`` lists files to check (each line comes back as a name), ``-m`` names a
+#: magic file (bad lines come back in the warnings).
+_FILE_VALUE_OPTS = ("eFfmP", frozenset({"--exclude", "--separator", "--files-from", "--magic-file", "--parameter"}))
+_FILE_READ_OPTS = frozenset({"-f", "-m", "--files-from", "--magic-file"})
+#: ssh client short options taking a value. ``-i KEY``, ``-F CONFIG`` and ``-o IdentityFile=KEY`` name a file the
+#: client authenticates with; it never prints it. (rsync is not here: its ``-i`` is ``--itemize-changes``, so the next
+#: word is a source it copies; an rsync key goes in ``-e 'ssh -i KEY'``, a single word that names no credential.)
+_SSH_VALUE_OPTS = {"ssh": "BbcDEeFIiJLlmOoPpQRSWw", "scp": "cDFiJloPSX", "sftp": "BbcDFiJloPRSsX"}
+_SSH_KEY_OPTS = frozenset({"-i", "-F"})
+_IDENTITY_OPTION = re.compile(r"identityfile=", re.IGNORECASE)
+#: ``ssh-keygen -l`` (fingerprint) and ``-y`` (the public half) read the key named by ``-f`` and print no secret; any
+#: other mode letter (``-p``, ``-e``, ``-i``, ``-t`` ...) leaves the key file classified as a read.
+_KEYGEN_VALUE_OPTS = "abCDEFfGIJjKMmNnOPRrSstVwYZz"
+_KEYGEN_PRINT_ONLY = frozenset("lyvqfE")
+#: curl options that send a file: ``-d @FILE`` (and ``--data-urlencode NAME@FILE``), ``-F NAME=@FILE``/``NAME=<FILE``,
+#: ``-T FILE``. ``--data-raw @x`` sends the text ``@x``.
+_CURL_VALUE_OPTS = "AbcCdDeEFHKmoPQrtTuUwxXyYz"
+_CURL_DATA = frozenset({"-d", "--data", "--data-ascii", "--data-binary", "--data-urlencode", "--json"})
+_CURL_FORM = frozenset({"-F", "--form"})
+_CURL_LONG_VALUE = _CURL_DATA | _CURL_FORM | {"--upload-file", "--config"}
+_CURL_FORM_FILE = re.compile(r"=[@<]([^;]*)")
+#: Delete a credential file: a person confirms.
+_REMOVERS = frozenset({"rm", "unlink", "shred"})
 #: ``SOURCE... DEST``: a credential file as the source is copied somewhere readable (deny); as the destination it is
 #: only overwritten (ask).
 _COPIERS = frozenset({"cp", "mv", "ln", "install"})
 _KEY_NAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
-_SEVERITY = {"ask": 1, "human": 2, "deny": 3}
+#: ``human``: a variable may point at a credential file; ``confirm``: the command deletes, sources, stages or hands a
+#: container one. Both are an ask that a person answers.
+_SEVERITY = {"ask": 1, "human": 2, "confirm": 2, "deny": 3}
 
 
 def _worse(a: str | None, b: str | None) -> str | None:
@@ -423,6 +466,127 @@ def _target_dir_flag(args: list[str]) -> bool:
     return False
 
 
+def _options(args: list[str], short_val: str, long_val: frozenset[str]) -> tuple[list[tuple[str, str]], list[str]]:
+    """GNU-style scan of ``args``: every option with its value (``""`` for a flag; short clusters split, ``-xVALUE``
+    and ``--opt=value`` included) and the positional arguments. Options may follow positionals; ``--`` ends them."""
+    opts: list[tuple[str, str]] = []
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            positional += args[i:]
+            break
+        if a.startswith("--"):
+            key, eq, value = a.partition("=")
+            if not eq and key in long_val and i < len(args):
+                value, i = args[i], i + 1
+            opts.append((key, value))
+        elif a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:], 1):
+                if ch in short_val:
+                    value = a[k + 1 :]
+                    if not value and i < len(args):
+                        value, i = args[i], i + 1
+                    opts.append(("-" + ch, value))
+                    break
+                opts.append(("-" + ch, ""))
+        else:
+            positional.append(a)
+    return opts, positional
+
+
+def _words(args: list[str]) -> list[str]:
+    """Every argument that may name a file: the non-flag ones, ``--flag=value`` values and a value glued to a short
+    option (``-T.env``, ``-f~/.ssh/id_rsa``)."""
+    glued = [a[2:] for a in args if a.startswith("-") and not a.startswith("--") and len(a) > 2 and "=" not in a]
+    return _arg_values(args) + glued
+
+
+def _curl_reads(args: list[str]) -> list[str]:
+    """curl's arguments with the files its data, form and upload options send spelled as plain paths."""
+    opts, positional = _options(args, _CURL_VALUE_OPTS, _CURL_LONG_VALUE)
+    reads = list(positional)
+    for opt, value in opts:
+        if opt in _CURL_DATA and "@" in value:
+            value = value.split("@", 1)[1]
+        elif opt in _CURL_FORM and (m := _CURL_FORM_FILE.search(value)):
+            value = m.group(1)
+        reads.append(value)
+    return reads
+
+
+def _copier_roles(args: list[str]) -> tuple[list[str], list[str]]:
+    """(sources, destination) of ``cp``/``mv``/``ln``/``install``."""
+    reads = _arg_values(args)
+    writes: list[str] = []
+    positional = [a for a in args if not a.startswith("-")]
+    if _target_dir_flag(args):
+        for k, a in enumerate(args[:-1]):
+            if a in ("-t", "--target-directory") and args[k + 1] in reads:
+                writes = [args[k + 1]]
+                reads.remove(args[k + 1])
+                break
+    elif len(positional) >= 2:
+        writes = [positional[-1]]
+        del reads[len(reads) - 1 - reads[::-1].index(positional[-1])]
+    return reads, writes
+
+
+def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str], list[str], list[str]]:
+    """The arguments of ``name args`` that may name a credential file, by what the command does with it: (reads or
+    sends it: deny, overwrites it: ask, deletes/sources/stages it or hands it to a container: confirm). An argument the
+    command only prints, tests, changes the metadata of or authenticates with is in none of the lists; any command not
+    named here reads every argument."""
+    if name in _NAME_ONLY or (name == "git" and args[:1] == ["check-ignore"]):
+        if piped:
+            return _words(args), [], []
+        if name == "file":
+            opts, _ = _options(args, *_FILE_VALUE_OPTS)
+            return [v for o, v in opts if o in _FILE_READ_OPTS], [], []
+        return [], [], []
+    if name in _SSH_VALUE_OPTS:
+        opts, positional = _options(args, _SSH_VALUE_OPTS[name], frozenset())
+        values = [v for o, v in opts if v and o not in _SSH_KEY_OPTS and not (o == "-o" and _IDENTITY_OPTION.match(v))]
+        return values + positional, [], []
+    if name == "ssh-keygen":
+        opts, positional = _options(args, _KEYGEN_VALUE_OPTS, frozenset())
+        letters = {o[1] for o, _ in opts}
+        if letters & {"l", "y"} and letters <= _KEYGEN_PRINT_ONLY:
+            return positional, [], []
+        return _words(args), [], []
+    if name == "curl":
+        return _curl_reads(args), [], []
+    if name in _REMOVERS:
+        return [], [], _words(args)
+    if name in ("source", "."):
+        words = _words(args)
+        return words[1:], [], words[:1]
+    if name == "git" and args[:1] in (["add"], ["rm"], ["mv"]):
+        opts, positional = _options(args[1:], "", frozenset({"--pathspec-from-file", "--chmod"}))
+        return [v for o, v in opts if v], [], positional
+    if name in ("docker", "podman"):
+        env_files: list[str] = []
+        rest: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--env-file" and i + 1 < len(args):
+                env_files.append(args[i + 1])
+                i += 2
+                continue
+            if args[i].startswith("--env-file="):
+                env_files.append(args[i].split("=", 1)[1])
+            else:
+                rest.append(args[i])
+            i += 1
+        return _words(rest), [], env_files
+    if name in _COPIERS:
+        reads, writes = _copier_roles(args)
+        return reads, writes, []
+    return _words(args), [], []
+
+
 def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
     plain = _HARMLESS_REDIRECT.sub("", sub)
     worst: str | None = None
@@ -431,32 +595,22 @@ def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None
     argv = _argv(sub)
     if not argv:
         return worst
-    name, args = argv[0], argv[1:]
-    if (name in _LISTERS or name in _PRINTERS) and not piped and not _REDIRECT.search(plain):
-        return worst
-    reads = _arg_values(args)
-    writes: list[str] = []
-    positional = [a for a in args if not a.startswith("-")]
-    if name in _COPIERS and _target_dir_flag(args):
-        for k, a in enumerate(args[:-1]):
-            if a in ("-t", "--target-directory") and args[k + 1] in reads:
-                writes = [args[k + 1]]
-                reads.remove(args[k + 1])
-                break
-    elif name in _COPIERS and len(positional) >= 2:
-        writes = [positional[-1]]
-        del reads[len(reads) - 1 - reads[::-1].index(positional[-1])]
+    reads, writes, confirm = _credential_roles(argv[0], argv[1:], piped)
     for arg in reads:
         worst = _worse(worst, _classify_arg(arg, cwd, home))
     if any(_classify_arg(arg, cwd, home) for arg in writes):
         worst = _worse(worst, "ask")
+    if any(_classify_arg(arg, cwd, home) for arg in confirm):
+        worst = _worse(worst, "confirm")
     return worst
 
 
 def _secret_access(parsed: hardline.Parsed, cwd: str, home: str, consumed: bool = False) -> str | None:
-    """How a command line touches credential files: ``deny`` (reads or copies one), ``human`` (a variable may point at
-    one), ``ask`` (overwrites one), None. Every argument of every simple command and of everything nested in it counts,
-    and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are expanded, globs are matched."""
+    """How a command line touches credential files: ``deny`` (reads, copies or sends one), ``human`` (a variable may
+    point at one), ``confirm`` (deletes, sources, stages one or hands it to a container), ``ask`` (overwrites one),
+    None. Every argument of every simple command and of everything nested in it counts unless the command only prints,
+    tests or authenticates with it (see _credential_roles), and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are
+    expanded, globs are matched."""
     worst: str | None = None
     for sub in parsed.subs:
         piped = consumed or any(len(p) > 1 and sub in p for p in parsed.pipelines)
@@ -533,12 +687,14 @@ def _decide_bash(
             needs_human=True,
             message=f"Command could not be parsed safely; confirm it yourself: {command[:120]}",
         )
-    if secret == "human" and worst.action != "deny":
+    if secret in ("human", "confirm") and worst.action != "deny":
+        why = (
+            "A variable may point at a credential file"
+            if secret == "human"
+            else "Deletes, sources, stages or hands a container a credential file"
+        )
         return Decision(
-            action="ask",
-            patterns=prefixes,
-            needs_human=True,
-            message=f"A variable may point at a credential file; confirm it yourself: {command[:120]}",
+            action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
         )
     if secret == "ask" and worst.action == "allow":
         return Decision(action="ask", patterns=prefixes, message=f"Overwrites a credential file: {command[:120]}")

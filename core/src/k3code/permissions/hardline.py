@@ -45,8 +45,10 @@ HARDLINE_SIMPLE_PATTERNS: list[tuple[str, str]] = [
 HARDLINE_NAMES: list[str] = [
     "rm-rf-root",
     "rm-rf-home",
-    # read/grep/glob, or any bash argument, < source or glob naming keys, ~/.config/k3code, /proc/*/environ, .env
-    "sensitive-path",  # (engine.py; ls, echo and a copy destination excepted)
+    # read/grep/glob, or a bash argument, < source or glob that reads or sends keys, ~/.config/k3code,
+    # /proc/*/environ, .env (engine.py: printing, testing, chmod, ssh -i and a copy destination are not reads;
+    # rm, source, git add and --env-file ask a person)
+    "sensitive-path",
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
     "git-push-mirror",
     *(n for n, _ in HARDLINE_PATTERNS),
