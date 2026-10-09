@@ -113,7 +113,7 @@ k3code update                                    # smoke-tested update; rolls ba
 k3code update --rollback                         # switch back to the previous version
 ```
 
-There is no release yet. An install built from a checkout (`install.sh --from-source`) therefore updates from that checkout: `k3code update` (also `/update` in the TUI) pulls it with `git pull --ff-only` and rebuilds whenever there is no release to fetch, including a private repository without a GitHub token. On Windows the clone is pulled with Windows git, which has your GitHub credentials. If git still cannot sign in, pull the clone yourself and run `k3code update --from-source --no-pull`. An install made with `install.sh --from-git` (the default) keeps no checkout: `k3code update` looks up the newest commit of the branch or tag it was installed from (`git ls-remote`) and, when there is one, rebuilds from it with that commit's own installer. An install pinned to a commit SHA stays where it is. `update.url` in `config.yaml` points it at a fork or mirror.
+There is no release yet. An install built from a checkout (`install.sh --from-source`) therefore updates from that checkout: `k3code update` (also `/update` in the TUI) pulls it with `git pull --ff-only` and rebuilds whenever there is no release to fetch, including a private repository without a GitHub token. On Windows the clone is pulled with Windows git, which has your GitHub credentials. If git still cannot sign in, pull the clone yourself and run `k3code update --from-source --no-pull`. `/update now` in the TUI runs the update in the background: through `systemd-run` when the daemon is a systemd unit, otherwise (macOS, WSL without systemd) as a detached process that logs to `~/.local/share/k3code/update.log`. An install made with `install.sh --from-git` (the default) keeps no checkout: `k3code update` looks up the newest commit of the branch or tag it was installed from (`git ls-remote`) and, when there is one, rebuilds from it with that commit's own installer. An install pinned to a commit SHA stays where it is. `update.url` in `config.yaml` points it at a fork or mirror.
 
 ### Three ways to run it
 
@@ -373,7 +373,7 @@ What is not verified yet:
 
 - **Live models.** Many scripted checks use a scripted fake provider. The live-model rows ran through the `claude-cli` provider (a local Claude Code login), not through a gateway.
 - **Long unattended runs.** A 30-minute daemon soak passed. The 72-hour soak is pending.
-- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. The installer tests ran on macOS while CI ran on GitHub Actions; a macOS run is now a manual step before a release ([`docs/RELEASING.md`](docs/RELEASING.md)). Windows (`install.ps1` via WSL) is tested only against a stand-in for `wsl.exe` on Linux.
+- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. The installer tests ran on macOS while CI ran on GitHub Actions; a macOS run is now a manual step before a release ([`docs/RELEASING.md`](docs/RELEASING.md)). Windows (`install.ps1` via WSL) is tested only against a stand-in for `wsl.exe` on Linux: `scripts/ci/platforms.sh` installs, updates, rolls back and uninstalls through it into an Ubuntu container, and on clean Ubuntu, Debian and Alpine containers.
 - **Updates.** There is no release yet, so the update and rollback path has only been tested against local version directories.
 
 | | Milestone | Built | Verified so far |
