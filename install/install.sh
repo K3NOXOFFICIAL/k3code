@@ -728,15 +728,54 @@ set_current() { # set_current DIR: point DATA/current at DIR with one rename, so
   ln -sfn "$1" "$DATA/current"
 }
 
-prune_versions() { # keep the current and the previous version only
+prune_versions() { # keep the current and the previous version, and the one the running daemon executes from
   prev=$(cat "$DATA/previous" 2>/dev/null || true)
+  busy=$(daemon_version)
   for d in "$DATA"/versions/*; do
     [ -d "$d" ] || continue
     n=$(basename "$d")
     case "$n" in "$VER" | "$prev") continue ;; esac
+    if [ -n "$busy" ] && [ "$n" = "$busy" ]; then
+      log "kept old version $n: the running k3code daemon still executes from it"
+      continue
+    fi
     rm -rf "$d"
     log "removed old version $n"
   done
+  return 0
+}
+
+# The daemon is a systemd user unit only when `k3code service install` wrote one (the path uninstall.sh uses too).
+daemon_unit() { [ "$PLATFORM" = Linux ] && have systemctl && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/k3code.service" ]; }
+
+daemon_version() { # the versions/<name> the running k3code daemon executes from; empty when none or unknown
+  daemon_unit || return 0
+  pid=$(systemctl --user show -p MainPID --value k3code.service 2>/dev/null || true)
+  case "$pid" in '' | 0 | *[!0-9]*) return 0 ;; esac
+  [ -d "/proc/$pid" ] || return 0
+  real=$(cd "$DATA" 2>/dev/null && pwd -P) || real=$DATA
+  # a venv python's exe is the base interpreter, so the version shows in its cwd or command line (the shebang path)
+  { readlink "/proc/$pid/exe" && readlink "/proc/$pid/cwd" && tr '\0' '\n' <"/proc/$pid/cmdline"; } 2>/dev/null |
+    while IFS= read -r p; do
+      case "$p" in
+        "$DATA"/versions/*) p=${p#"$DATA"/versions/} ;;
+        "$real"/versions/*) p=${p#"$real"/versions/} ;;
+        *) continue ;;
+      esac
+      printf '%s\n' "${p%%/*}"
+      break
+    done
+}
+
+restart_daemon() { # a running daemon keeps executing the old version until it restarts
+  daemon_unit || return 0
+  systemctl --user is-active --quiet k3code.service 2>/dev/null || return 0
+  systemctl --user reset-failed k3code.service 2>/dev/null || true
+  if systemctl --user restart k3code.service >&2; then
+    log "restarted the k3code daemon (k3code.service) on $VER"
+  else
+    log "WARNING: could not restart k3code.service; it still runs the old version: systemctl --user restart k3code.service"
+  fi
   return 0
 }
 
@@ -751,6 +790,7 @@ activate() {
   if [ "$FROM" = git ] && [ -e "$DATA/source_path" ]; then rm -f "$DATA/source_path"; fi
   link_bin k3code "$DATA/current/venv/bin/k3code"
   link_bin k3 "$DATA/current/bin/k3"
+  if [ "$cur" != "$VER" ]; then restart_daemon; fi
   prune_versions
 }
 

@@ -583,3 +583,77 @@ def test_a_foreign_k3code_in_bin_is_kept_unless_force(tmp_path: Path) -> None:
     forced = run(tmp_path, INSTALL, "--from-source", "--minimal", "--force")
     assert forced.returncode == 0, forced.stderr
     assert mine.is_symlink() and os.readlink(mine).startswith(str(tmp_path / DATA_REL))
+
+
+def _mini_checkout(root: Path) -> Path:
+    """A committed k3code-shaped checkout carrying this installer; edits to it give new (dirty) versions."""
+    src = root / "src"
+    (src / "core").mkdir(parents=True)
+    (src / "install").mkdir()
+    (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (src / "VERSION").write_text("9.9.9\n")
+    shutil.copy(INSTALL, src / "install" / "install.sh")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    git = ["git", "-C", str(src), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run([*git, "init", "-q"], check=True, env=env)
+    subprocess.run([*git, "add", "-A"], check=True, env=env)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True, env=env)
+    return src
+
+
+def _fake_systemd(root: Path, home: Path) -> tuple[Path, Path, Path]:
+    """A k3code.service unit file plus a systemctl stub: active, MainPID read from a file, every call logged."""
+    unit = home / ".config" / "systemd" / "user" / "k3code.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\nExecStart=/bin/true\n")
+    calls, pidfile = root / "systemctl.log", root / "mainpid"
+    pidfile.write_text("0\n")
+    body = (
+        f'echo "systemctl $*" >>"{calls}"\n'
+        'case "$*" in *show*MainPID*) cat "' + str(pidfile) + '" ;; esac\n'
+        "exit 0\n"
+    )
+    return stub_bin(root, "systemctl", body), calls, pidfile
+
+
+@linux_only
+def test_activation_restarts_a_running_daemon_and_keeps_its_version(tmp_path: Path) -> None:
+    src = _mini_checkout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    stubs, calls, pidfile = _fake_systemd(tmp_path, home)
+    versions = home / DATA_REL / "versions"
+
+    def install() -> subprocess.CompletedProcess[str]:
+        r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", path_front=stubs)
+        assert r.returncode == 0, r.stderr
+        return r
+
+    install()
+    v1 = (home / DATA_REL / "current").resolve().name
+    (src / "VERSION").write_text("9.9.9\n\n")  # uncommitted edit: a second version
+    install()
+    log = calls.read_text()
+    assert "systemctl --user reset-failed k3code.service" in log
+    assert "systemctl --user restart k3code.service" in log
+
+    daemon = subprocess.Popen(["sleep", "60"], cwd=versions / v1)  # the "daemon" still runs from the first version
+    try:
+        pidfile.write_text(f"{daemon.pid}\n")
+        (src / "VERSION").write_text("9.9.9\n\n\n")  # a third version: v1 is neither current nor previous
+        r = install()
+        assert (versions / v1).is_dir(), r.stderr
+        assert "still executes from it" in r.stderr
+    finally:
+        daemon.kill()
+        daemon.wait()
+    restarts = calls.read_text().count("restart k3code.service")
+    install()  # the same version again: nothing switched, so no restart
+    assert calls.read_text().count("restart k3code.service") == restarts
+
+
+def test_no_systemctl_call_without_a_k3code_unit(tmp_path: Path) -> None:
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    assert run(tmp_path, INSTALL, "--from-source", "--minimal", path_front=stubs).returncode == 0
+    assert not calls.exists()
