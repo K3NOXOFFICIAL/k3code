@@ -26,15 +26,16 @@ def _git(key: str) -> str:
 
 
 def sandbox_state(probe: bool = True) -> str:
-    """``usable``, ``unusable`` (bwrap present but blocked), ``missing``, or ``unknown`` (not probed or the probe
-    failed). Never raises: the setup wizard must not fail on a sandbox probe."""
+    """``usable``, ``unusable`` (bwrap present but blocked), ``bubblewrap`` (bwrap is on PATH, not probed),
+    ``missing``, or ``unknown`` (the probe failed). Never raises: the setup wizard must not fail on a sandbox probe."""
     try:
+        from k3code import doctor
         from k3code.reliability import sandbox
 
         if sandbox.bwrap_path() is None:
             return "missing"
-        if not probe:
-            return "unknown"
+        if not probe:  # the same detection as `k3code doctor --no-probe`
+            return "bubblewrap" if doctor.check_sandbox(probe=False).status == doctor.OK else "unknown"
         return "usable" if sandbox.usable() else "unusable"
     except Exception:  # noqa: BLE001 - reported as unknown, the wizard goes on
         return "unknown"
