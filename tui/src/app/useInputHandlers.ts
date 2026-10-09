@@ -40,6 +40,10 @@ import {
   type OverlayState,
 } from "./interfaces.js";
 import {
+  hideEscInterruptHint,
+  showEscInterruptHint,
+} from "./escInterruptHintStore.js";
+import {
   $isBlocked,
   $overlayState,
   patchOverlayState,
@@ -47,7 +51,7 @@ import {
 import { respondToServerRequest } from "./serverRequestStore.js";
 import { turnController } from "./turnController.js";
 import { patchTurnState } from "./turnStore.js";
-import { getUiState } from "./uiStore.js";
+import { $uiState, getUiState } from "./uiStore.js";
 
 const isCtrl = (key: { ctrl: boolean }, ch: string, target: string) =>
   key.ctrl && ch.toLowerCase() === target;
@@ -422,8 +426,35 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
   // Esc that closed an overlay (or anything else that owns Esc) never counts as its first half.
   const interruptEscRef = useRef(0);
 
+  // The "Esc again to interrupt" hint goes as soon as the turn ends or something blocking appears, and on unmount.
+  // Synchronous listeners, so it never outlives either by a render.
+  useEffect(() => {
+    const offUi = $uiState.listen((state) => {
+      if (!state.busy) {
+        hideEscInterruptHint();
+      }
+    });
+
+    const offBlocked = $isBlocked.listen((blocked) => {
+      if (blocked) {
+        hideEscInterruptHint();
+      }
+    });
+
+    return () => {
+      offUi();
+      offBlocked();
+      hideEscInterruptHint();
+    };
+  }, []);
+
   useInput((ch, key, event) => {
     const live = getUiState();
+
+    // Any other key hides the hint (the pair itself stays open, as before).
+    if (!key.escape) {
+      hideEscInterruptHint();
+    }
 
     // Esc Esc mid-turn interrupts and keeps the draft. A busy Esc never takes part in the draft discard below, so
     // neither half of the pair (nor an Esc right after the turn ends) can wipe the draft.
@@ -452,7 +483,11 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       lastEscRef.current = 0;
       interruptEscRef.current = opensPair ? now : 0;
 
-      if (!opensPair) {
+      if (opensPair) {
+        showEscInterruptHint();
+      } else {
+        hideEscInterruptHint();
+
         return turnController.interruptTurn({
           appendMessage: actions.appendMessage,
           gw: gateway.gw,
@@ -462,6 +497,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       }
     } else if (key.escape) {
       interruptEscRef.current = 0;
+      hideEscInterruptHint();
     }
 
     // The agent view owns Esc (it closes the view); counting it here would let the next Esc discard the draft.

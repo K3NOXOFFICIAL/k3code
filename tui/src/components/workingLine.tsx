@@ -1,7 +1,8 @@
-import { Text } from "@k3code/ink";
+import { Box, Text } from "@k3code/ink";
 import { useStore } from "@nanostores/react";
 import { useEffect, useState } from "react";
 
+import { $escInterruptHint } from "../app/escInterruptHintStore.js";
 import {
   $sessionOutputTokens,
   $streamedOutputChars,
@@ -31,8 +32,11 @@ interface WorkingLineProps {
   t: Theme;
 }
 
+export const ESC_INTERRUPT_HINT = "Esc again to interrupt";
+
 /** One row above the composer while a turn runs. Renders nothing when idle.
- *  Owns its own timer, so a tick re-renders this row and nothing else. */
+ *  Owns its own timer, so a tick re-renders this row and nothing else.
+ *  After the first Esc of an interrupting pair it also shows `ESC_INTERRUPT_HINT` on the same row. */
 export function WorkingLine({
   ascii,
   busy,
@@ -74,6 +78,7 @@ function ActiveWorkingLine({
   const tokenBaseline = useStore($turnTokenBaseline);
   // Text streamed in the call still running: estimated until its real count lands.
   const pendingChars = useStore($streamedOutputChars);
+  const escHint = useStore($escInterruptHint);
 
   useEffect(() => {
     // Animated: one timer drives the glyph, the clock and the message rotation.
@@ -110,9 +115,27 @@ function ActiveWorkingLine({
     ),
   });
 
-  return (
+  const working = (
     <Text color={t.color.accent} wrap="truncate-end">
       {line}
     </Text>
+  );
+
+  if (!escHint) {
+    return working;
+  }
+
+  // The hint keeps its width and the working text truncates first, so a narrow terminal still shows the hint.
+  return (
+    <Box flexDirection="row">
+      <Box flexShrink={1} minWidth={0}>
+        {working}
+      </Box>
+      <Box flexShrink={0}>
+        <Text color={t.color.muted} wrap="truncate-end">
+          {` · ${ESC_INTERRUPT_HINT}`}
+        </Text>
+      </Box>
+    </Box>
   );
 }
