@@ -347,7 +347,7 @@ async def test_project_command_shows_stacks_and_pending_and_rescans(tmp_path):
     )
     cmd = ProjectCommand()
     empty = await cmd.handle(ctx, "s1", "")
-    assert "No stacks detected" in empty["message"]
+    assert "Not scanned yet" in empty["message"] and "No stacks detected" not in empty["message"]
     first = await cmd.handle(ctx, "s1", "rescan")
     assert "new proposal" in first["message"] and "go: test `go test ./...`" in first["message"]
     assert first["pending"] and first["stacks"] == [{"id": "go", "dir": ".", "label": "go (go)"}]

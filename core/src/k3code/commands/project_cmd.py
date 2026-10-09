@@ -51,7 +51,10 @@ class ProjectCommand(CommandDef):
         state = projectstate.load(root)
         found = state.get("stacks") or []
         if not found:
-            return reply(note + f"No stacks detected in {root} (yet). /project rescan scans now.", stacks=[])
+            if not state.get("detected_at"):
+                # Nothing is stored until a scan runs; "no stacks" would be wrong for a fresh uv/pnpm project.
+                return reply(note + f"Not scanned yet: /project rescan scans {root} and stores the result.", stacks=[])
+            return reply(note + f"No stacks detected in {root}. /project rescan scans again.", stacks=[])
         changed = await asyncio.to_thread(projectprep.needs_prep, root)
         age = _age(time.time() - float(state.get("detected_at") or 0))
         lines = [

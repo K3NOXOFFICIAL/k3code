@@ -37,14 +37,14 @@ def _run(tmp_path: Path, *args: str, providers: bool = True) -> subprocess.Compl
 def test_a_slash_command_prompt_runs_the_command_without_the_model(tmp_path):
     res = _run(tmp_path, "-p", "/project")
     assert res.returncode == 0, res.stderr
-    assert "No stacks detected in" in res.stdout and "/project rescan" in res.stdout
+    assert "Not scanned yet" in res.stdout and "/project rescan" in res.stdout
     assert MODEL_TEXT not in res.stdout
 
 
 def test_a_slash_command_needs_no_provider(tmp_path):
     res = _run(tmp_path, "-p", "/project", providers=False)
     assert res.returncode == 0, res.stderr
-    assert "No stacks detected in" in res.stdout
+    assert "Not scanned yet" in res.stdout
 
 
 def test_a_slash_command_prompt_takes_its_arguments_and_json(tmp_path):
