@@ -292,10 +292,13 @@ def _reads_secret(sub: str, cwd: str) -> bool:
 def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
-    hit = hardline.check(command, extra)
+    hit = hardline.check(command, extra, cwd=cwd)
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
-    subs = hardline.split_commands(command)
+    parsed = hardline.parse(command)
+    subs = parsed.subs
+    # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
+    unsafe = parsed.unterminated or parsed.comment_quote
     if any(_reads_secret(sub, cwd) for sub in subs):
         hit = "sensitive-path"
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
@@ -314,9 +317,18 @@ def _decide_bash(
         rule = evaluate("bash", sub, ruleset, default="ask")
         if rule.action == "allow" and _voids_allow(sub, rule, ruleset, roots, cwd):
             rule = Rule(tool="bash", pattern="*", action="ask")
+        if rule.action == "allow" and rule.layer == 0 and "\n" in sub:
+            unsafe = True  # the builtin read-only allowlist covers one-line commands only
         if worst is None or _RANK[rule.action] > _RANK[worst.action]:
             worst = rule
     worst = worst or Rule(tool="bash", pattern="*", action="ask")
+    if unsafe and worst.action != "deny":
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            needs_human=True,
+            message=f"Command could not be parsed safely; confirm it yourself: {command[:120]}",
+        )
     if worst.action == "allow" and not _inside(cwd, roots):
         return Decision(action="ask", patterns=prefixes, message=f"Working directory outside project roots: {cwd}")
     return Decision(action=worst.action, patterns=prefixes, rule=worst)
