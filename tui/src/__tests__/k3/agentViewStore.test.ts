@@ -131,6 +131,73 @@ describe("buildViewRows", () => {
     }
   });
 
+  it("shows a session with no turn yet as idle (○) in its own group between working and finished", () => {
+    const rows = build({
+      sessions: [
+        { id: "f1", status: "failed", title: "F1" },
+        { current: true, id: "cur", message_count: 0, status: "idle" },
+        { id: "w1", status: "working", title: "W1" },
+      ],
+    });
+    const cur = rows.find((r) => r.current)!;
+
+    expect(cur).toMatchObject({ group: "idle", id: "cur", state: "idle" });
+    expect(GLYPH[cur.state]).toBe("○");
+    expect(rows.map((r) => [r.id, r.group])).toEqual([
+      ["w1", "working"],
+      ["cur", "idle"],
+      ["f1", "finished"],
+    ]);
+
+    // Enter on it closes the view; x does not arm a stop on the current session.
+    const idx = rows.indexOf(cur);
+
+    expect(
+      reduceViewKey({ confirmKey: null, index: idx }, rows, { return: true }, 5)
+        .effect,
+    ).toEqual({ type: "close" });
+    expect(
+      reduceViewKey({ confirmKey: null, index: idx }, rows, { ch: "x" }, 5).nav
+        .confirmKey,
+    ).toBeNull();
+  });
+
+  it("keeps an idle session that has messages (or an unknown count) as completed", () => {
+    for (const message_count of [3, undefined]) {
+      const rows = build({
+        sessions: [
+          {
+            current: true,
+            id: "cur",
+            status: "idle",
+            ...(message_count === undefined ? {} : { message_count }),
+          },
+        ],
+      });
+
+      expect(rows[0]).toMatchObject({
+        group: "finished",
+        id: "cur",
+        state: "done",
+      });
+    }
+  });
+
+  it("leaves the inline strip's reading of an empty idle background session unchanged", () => {
+    const bg: SessionActiveItem = {
+      id: "bg",
+      message_count: 0,
+      status: "idle",
+      title: "BG",
+    };
+
+    expect(buildStripRows([], [bg], NOW).map((r) => r.state)).toEqual(["done"]);
+    // the view, which owns the idle reading, groups the same session as idle
+    expect(build({ sessions: [bg] })).toMatchObject([
+      { group: "idle", id: "bg", state: "idle" },
+    ]);
+  });
+
   it("picks the current row by id over a stale `current` flag, and by the flag only when the id is unknown", () => {
     const stale: SessionActiveItem[] = [
       { current: true, id: "old", status: "idle", title: "Old" },
