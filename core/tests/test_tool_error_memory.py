@@ -124,3 +124,19 @@ async def test_a_turn_records_its_tool_failures_through_the_gateway(tmp_path, mo
     rows = DecisionLog(tmp_path.parent / f"{tmp_path.name}-k3home").query("tool_error", actor=None)
     assert [r["subject"] for r in rows] == ["File not found: <path>"] * 3
     assert [c["kind"] for c in shown(server, "project_gotcha")] == ["project_gotcha"]
+
+
+PASSWORD = "S3cr3t" + "Passw0rd"
+DIGIT_KEY = "sk-proj-" + "1234567890" + "abcdefghijkl"
+
+
+async def test_digit_bearing_credentials_never_reach_the_signature_or_the_log(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    url = "https://u:" + PASSWORD + "@host.example/x.git"
+    _fail(hub, _session(server, tmp_path), "git pull", f"fatal: Authentication failed for '{url}' key {DIGIT_KEY}")
+    (row,) = hub.log.query("tool_error", actor=None)
+    signature = failure_of("db", {}, {"error": f"{url} {DIGIT_KEY}"}).signature
+    for secret in (PASSWORD, DIGIT_KEY, "1234567890"):
+        assert secret not in json.dumps(row)
+        assert secret not in signature

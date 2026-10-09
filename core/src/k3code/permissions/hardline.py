@@ -45,8 +45,10 @@ HARDLINE_SIMPLE_PATTERNS: list[tuple[str, str]] = [
 HARDLINE_NAMES: list[str] = [
     "rm-rf-root",
     "rm-rf-home",
-    # read/grep/glob, or any bash argument, < source or glob naming keys, ~/.config/k3code, /proc/*/environ, .env
-    "sensitive-path",  # (engine.py; ls, echo and a copy destination excepted)
+    # read/grep/glob, or a bash argument, < source or glob that reads or sends keys, ~/.config/k3code,
+    # /proc/*/environ, .env (engine.py: printing, testing, chmod, ssh -i and a copy destination are not reads;
+    # rm, source, git add and --env-file ask a person)
+    "sensitive-path",
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
     "git-push-mirror",
     *(n for n, _ in HARDLINE_PATTERNS),
@@ -305,12 +307,53 @@ _WRAPPER_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
     "taskset": ("", frozenset(), 1),
     "setsid": ("", frozenset(), 0),
 }
+#: Wrapper options whose value names a file the wrapper reads and hands on as text: ``xargs -a FILE echo`` prints FILE.
+_WRAPPER_READ_OPTS: dict[str, tuple[str, frozenset[str]]] = {"xargs": ("a", frozenset({"--arg-file"}))}
 #: git options before the subcommand that take a value (``git -C dir push`` is ``git push``).
 _GIT_VALUE_OPTS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"})
+#: ssh client short options taking a value.
+SSH_VALUE_OPTS = {"ssh": "BbcDEeFIiJLlmOoPpQRSWw", "scp": "cDFiJloPSX", "sftp": "BbcDFiJloPRSsX"}
+#: ``-o Keyword=value`` / ``-o 'Keyword value'`` whose value is a command line (ProxyCommand, LocalCommand,
+#: RemoteCommand, KnownHostsCommand).
+_SSH_COMMAND_OPTION = re.compile(r"\s*[A-Za-z]*command(?:\s*=|\s)\s*(.*)", re.IGNORECASE | re.DOTALL)
 
 
-def _skip_wrapper_options(name: str, args: list[str], spec: tuple[str, frozenset[str], int]) -> list[str]:
+def ssh_command_value(value: str) -> str | None:
+    """The command line in an ssh ``-o`` value whose keyword ends in ``Command``, else None."""
+    m = _SSH_COMMAND_OPTION.match(value)
+    return m.group(1) if m else None
+
+
+def ssh_option_commands(name: str, args: list[str]) -> list[str]:
+    """The command lines ``ssh``/``scp``/``sftp`` run from their ``-o XxxCommand`` options, glued
+    (``-oProxyCommand=...``, ``-vo...``) or spaced. ssh parses options after the host name too, so every argument is
+    scanned."""
+    short_val = SSH_VALUE_OPTS.get(name)
+    out: list[str] = []
+    i = 0
+    while short_val and i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            break
+        if not a.startswith("-") or a.startswith("--"):
+            continue
+        for k, ch in enumerate(a[1:], 1):
+            if ch in short_val:
+                value = a[k + 1 :]
+                if not value and i < len(args):
+                    value, i = args[i], i + 1
+                if ch == "o" and (command := ssh_command_value(value)) is not None:
+                    out.append(command)
+                break
+    return out
+
+
+def _skip_wrapper_options(
+    name: str, args: list[str], spec: tuple[str, frozenset[str], int], reads: list[str] | None = None
+) -> list[str]:
     short_val, long_val, positionals = spec
+    read_short, read_long = _WRAPPER_READ_OPTS.get(name, ("", frozenset()))
     prefix: list[str] = []  # env -S "cmd args" splits its value into the command
     i = 0
     while i < len(args):
@@ -328,6 +371,8 @@ def _skip_wrapper_options(name: str, args: list[str], spec: tuple[str, frozenset
                 value = args[i] if i < len(args) else ""
             if name == "env" and key == "--split-string":
                 prefix += _tokens(value)
+            if key in read_long and value and reads is not None:
+                reads.append(value)
             i += 1
             continue
         if a.startswith("-") and len(a) > 1:
@@ -339,6 +384,8 @@ def _skip_wrapper_options(name: str, args: list[str], spec: tuple[str, frozenset
                         value = args[i] if i < len(args) else ""
                     if name == "env" and ch == "S":
                         prefix += _tokens(value)
+                    if ch in read_short and value and reads is not None:
+                        reads.append(value)
                     break
             i += 1
             continue
@@ -346,10 +393,11 @@ def _skip_wrapper_options(name: str, args: list[str], spec: tuple[str, frozenset
     return prefix + args[i + positionals :]
 
 
-def normalize_argv(tokens: list[str]) -> list[str]:
+def normalize_argv(tokens: list[str], reads: list[str] | None = None) -> list[str]:
     """The command that really runs: leading ``VAR=x`` assignments and wrappers (sudo, env, nice, timeout, xargs,
     ...) with their options dropped, ``eval`` arguments re-split, git's global options (``-C dir``, ``-c k=v``, ...)
-    removed and argv0 reduced to its basename. A wrapper with nothing left to run is itself the command (``env``)."""
+    removed and argv0 reduced to its basename. A wrapper with nothing left to run is itself the command (``env``).
+    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``, see _WRAPPER_READ_OPTS)."""
     argv = list(tokens)
     for _ in range(len(tokens) + 1):  # every round drops at least one token
         while argv and _is_assignment(argv[0]):
@@ -369,7 +417,7 @@ def normalize_argv(tokens: list[str]) -> list[str]:
         spec = _WRAPPER_SPECS.get(name)
         if spec is None:
             return argv
-        rest = _skip_wrapper_options(name, argv[1:], spec)
+        rest = _skip_wrapper_options(name, argv[1:], spec, reads)
         if not rest:
             return argv
         argv = rest
@@ -784,8 +832,8 @@ def _scan(text: str) -> Parsed:
 
 
 def _launcher_payloads(sub: str) -> list[str]:
-    """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...`` and the joined arguments of ``eval``:
-    strings run as commands."""
+    """Quoted arguments of ``bash -c``, ``ssh host "..."``, ``sudo sh -c ...``, the joined arguments of ``eval`` and
+    the values of ``ssh -oProxyCommand=...`` (see ssh_option_commands): strings run as commands."""
     toks = _tokens(sub)
     out: list[str] = []
     pre = _strip_wrappers(toks)
@@ -794,6 +842,8 @@ def _launcher_payloads(sub: str) -> list[str]:
     real = normalize_argv(toks)
     if real and real[0] in LAUNCHERS:
         out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
+    if real:
+        out += ssh_option_commands(real[0], real[1:])
     return out
 
 

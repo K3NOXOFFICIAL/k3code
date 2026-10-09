@@ -70,10 +70,120 @@ def test_browser_check_reports_playwright_and_chromium(monkeypatch, tmp_path):
     monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
     assert doctor.check_browser().status == doctor.WARN
-    (tmp_path / "data" / "browsers" / "chromium-1").mkdir(parents=True)
+    shell_dir = tmp_path / "data" / "browsers" / "chromium_headless_shell-1" / "chrome-linux"
+    shell_dir.mkdir(parents=True)
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "playwright" else None)
+    chk = doctor.check_browser()  # the directory exists but holds no browser
+    assert chk.status == doctor.WARN and "no executable browser" in chk.detail
+    binary = shell_dir / "headless_shell"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o644)  # present but not executable
+    assert doctor.check_browser().status == doctor.WARN
+    binary.chmod(0o755)
     chk = doctor.check_browser()
     assert chk.status == doctor.OK and "Playwright and Chromium" in chk.detail
+
+
+def test_env_file_check_flags_a_loose_mode_and_export_lines(monkeypatch, tmp_path):
+    from k3code import doctor
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert doctor.check_env_file().status == doctor.OK  # no file: nothing to say
+    env = tmp_path / "k3code" / "env"
+    env.parent.mkdir()
+    env.write_text("K3CODE_API_KEY=fake\n")
+    env.chmod(0o644)
+    chk = doctor.check_env_file()
+    assert chk.status == doctor.WARN and f"chmod 600 {env}" in chk.fix
+    env.chmod(0o600)
+    assert doctor.check_env_file().status == doctor.OK
+    env.write_text("K3CODE_API_KEY=fake\nexport OMNIROUTE_API_KEY=fake\n")
+    chk = doctor.check_env_file()
+    assert chk.status == doctor.WARN and "rejects 'export'" in chk.detail and "line 2" in chk.detail
+    assert "fake" not in chk.detail + chk.fix  # values are never echoed
+
+
+def test_linger_check_warns_only_for_an_installed_unit_with_lingering_off(monkeypatch, tmp_path):
+    import subprocess
+
+    from k3code import doctor, service
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert doctor.check_linger().status == doctor.OK  # no unit installed
+    service.unit_path().parent.mkdir(parents=True)
+    service.unit_path().write_text("[Service]\n")
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: "/usr/bin/loginctl")
+    answer = {"out": "Linger=no\n"}
+    monkeypatch.setattr(
+        doctor.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout=answer["out"], stderr="")
+    )
+    chk = doctor.check_linger()
+    assert chk.status == doctor.WARN and "loginctl enable-linger" in chk.fix and "stops at logout" in chk.detail
+    answer["out"] = "Linger=yes\n"
+    assert doctor.check_linger().status == doctor.OK
+    monkeypatch.setattr(doctor.shutil, "which", lambda name: None)  # no loginctl: cannot tell, no warning
+    assert doctor.check_linger().status == doctor.OK
+
+
+def test_daemon_version_check_compares_with_the_current_symlink(monkeypatch, tmp_path):
+    from k3code import doctor
+
+    data = tmp_path / "data"
+    (data / "versions" / "1.2.3-src.abc").mkdir(parents=True)
+    (data / "versions" / "1.2.4").mkdir()
+    monkeypatch.setenv("K3CODE_DATA", str(data))
+    assert doctor.check_daemon_version("1.2.3").status == doctor.OK  # no `current`: not comparable
+    (data / "current").symlink_to(data / "versions" / "1.2.4")
+    assert doctor.check_daemon_version(None).status == doctor.OK  # daemon not running
+    assert doctor.check_daemon_version("1.2.4").status == doctor.OK
+    chk = doctor.check_daemon_version("1.2.3")
+    assert chk.status == doctor.WARN and "restart the daemon" in chk.fix
+    (data / "current").unlink()
+    (data / "current").symlink_to(data / "versions" / "1.2.3-src.abc")
+    assert doctor.check_daemon_version("1.2.3").status == doctor.OK  # "<version>-src.<sha>" dirs match
+
+
+def test_install_links_check_flags_a_dangling_current_and_a_missing_previous(monkeypatch, tmp_path):
+    from k3code import doctor
+
+    data = tmp_path / "data"
+    (data / "versions" / "1.0.0").mkdir(parents=True)
+    monkeypatch.setenv("K3CODE_DATA", str(data))
+    assert doctor.check_install_links().status == doctor.OK  # nothing installed
+    (data / "current").symlink_to(data / "versions" / "0.9.0")  # target does not exist
+    chk = doctor.check_install_links()
+    assert chk.status == doctor.WARN and "missing" in chk.detail
+    (data / "current").unlink()
+    (data / "current").symlink_to(data / "versions" / "1.0.0")
+    assert doctor.check_install_links().status == doctor.OK
+    (data / "previous").write_text("0.9.0\n")
+    chk = doctor.check_install_links()
+    assert chk.status == doctor.WARN and "rollback" in chk.detail
+    (data / "versions" / "0.9.0").mkdir()
+    assert doctor.check_install_links().status == doctor.OK
+
+
+async def test_check_daemon_reports_the_running_version(tmp_path):
+    import asyncio
+
+    from k3code import __version__, doctor
+
+    sock = tmp_path / "d.sock"
+
+    async def handle(reader, writer):
+        await reader.readline()
+        writer.write(
+            b'{"jsonrpc":"2.0","id":"doctor","result":{"ready":true,"version":"' + __version__.encode() + b'"}}\n'
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_unix_server(handle, path=str(sock))
+    try:
+        chk = await doctor.check_daemon(sock)
+    finally:
+        server.close()
+    assert chk.status == doctor.OK and chk.data["version"] == __version__
 
 
 def test_searxng_check_reads_the_research_setting(monkeypatch, tmp_path):

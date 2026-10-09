@@ -217,7 +217,11 @@ def test_sandbox_state_reports_each_case_and_never_raises(monkeypatch: pytest.Mo
     monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
     monkeypatch.setattr(sandbox, "usable", lambda: False)
     assert detect.sandbox_state() == "unusable"
-    assert detect.sandbox_state(probe=False) == "unknown"
+    # not probed, but bwrap is on PATH: say so instead of "unknown" (and never spawn bwrap)
+    assert detect.sandbox_state(probe=False) == "bubblewrap"
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: None)
+    assert detect.sandbox_state(probe=False) == "missing"
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
     monkeypatch.setattr(sandbox, "usable", lambda: True)
     assert detect.detect()["sandbox"] == "usable"
 

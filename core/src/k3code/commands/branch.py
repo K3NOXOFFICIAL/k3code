@@ -12,6 +12,7 @@ from k3code.commands import CommandDef
 from k3code.commands._util import pop_flag, reply, split_args
 from k3code.commands.fork import fork_session
 from k3code.memory import project_root
+from k3code.reliability.sandbox import child_env
 
 _NAME_OK = re.compile(r"^[A-Za-z0-9._/-]+$")
 
@@ -24,6 +25,7 @@ async def _git(cwd: Path, *args: str) -> tuple[int, str]:
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=child_env(),  # no provider keys, no daemon socket: the TUI's stdio gateway still has them
     )
     out, _ = await proc.communicate()
     return proc.returncode or 0, out.decode(errors="replace").strip()

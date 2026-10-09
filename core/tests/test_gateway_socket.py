@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from k3code.bundle import write_bundle
+from k3code.gateway.auth import authenticate
 from m1cmd_helpers import make_server
 
 
@@ -18,13 +19,20 @@ class Peer:
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.reader, self.writer, self._id = reader, writer, 0
+        self._early: list[bytes] = []  # frames that arrived before the gateway.auth reply
 
     @classmethod
-    async def connect(cls, path: Path) -> Peer:
+    async def connect(cls, path: Path, *, auth: bool = True) -> Peer:
+        """Connect; ``auth`` sends gateway.auth with the daemon token first, as the TUI bridge and the CLI do."""
         reader, writer = await asyncio.open_unix_connection(str(path))
-        return cls(reader, writer)
+        peer = cls(reader, writer)
+        if auth:
+            await authenticate(reader, writer, path, peer._early.append)
+        return peer
 
     async def frame(self, timeout: float = 10.0) -> dict:
+        if self._early:
+            return json.loads(self._early.pop(0))
         line = await asyncio.wait_for(self.reader.readline(), timeout)
         assert line, "connection closed"
         return json.loads(line)

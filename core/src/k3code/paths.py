@@ -5,6 +5,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+#: Environment variables that point a process at the daemon's socket. Never passed to a child process: only an
+#: authenticated client (k3code.gateway.auth) may drive the daemon.
+GATEWAY_ENV_VARS = ("K3CODE_GATEWAY_SOCKET", "HERMES_TUI_GATEWAY_URL")
+
 
 def home() -> Path:
     return Path(os.environ.get("K3CODE_HOME", str(Path.home() / ".k3code"))).expanduser()
