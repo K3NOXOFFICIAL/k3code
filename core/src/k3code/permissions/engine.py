@@ -321,12 +321,13 @@ _NAME_ONLY = frozenset(
 #: magic file (bad lines come back in the warnings).
 _FILE_VALUE_OPTS = ("eFfmP", frozenset({"--exclude", "--separator", "--files-from", "--magic-file", "--parameter"}))
 _FILE_READ_OPTS = frozenset({"-f", "-m", "--files-from", "--magic-file"})
-#: ssh client short options taking a value. ``-i KEY``, ``-F CONFIG`` and ``-o IdentityFile=KEY`` name a file the
-#: client authenticates with; it never prints it. (rsync is not here: its ``-i`` is ``--itemize-changes``, so the next
-#: word is a source it copies; an rsync key goes in ``-e 'ssh -i KEY'``, a single word that names no credential.)
+#: ssh client short options taking a value. ``-i KEY``, ``-o IdentityFile=KEY`` and ``-F CONFIG`` name a file the
+#: client authenticates with or reads its settings from (see _ssh_key_value). (rsync is not here: its ``-i`` is
+#: ``--itemize-changes``, so the next word is a source it copies; an rsync key goes in ``-e 'ssh -i KEY'``, a single
+#: word that names no credential.)
 _SSH_VALUE_OPTS = {"ssh": "BbcDEeFIiJLlmOoPpQRSWw", "scp": "cDFiJloPSX", "sftp": "BbcDFiJloPRSsX"}
-_SSH_KEY_OPTS = frozenset({"-i", "-F"})
 _IDENTITY_OPTION = re.compile(r"identityfile=", re.IGNORECASE)
+_SSH_CONFIG_NAME = re.compile(r"(?:^|/)(?:config|[^/]*(?:\.conf|_config))$")
 #: ``ssh-keygen -l`` (fingerprint) and ``-y`` (the public half) read the key named by ``-f`` and print no secret; any
 #: other mode letter (``-p``, ``-e``, ``-i``, ``-t`` ...) leaves the key file classified as a read.
 _KEYGEN_VALUE_OPTS = "abCDEFfGIJjKMmNnOPRrSstVwYZz"
@@ -534,6 +535,14 @@ def _copier_roles(args: list[str]) -> tuple[list[str], list[str]]:
     return reads, writes
 
 
+def _ssh_key_value(opt: str, value: str) -> bool:
+    """``-i KEY`` / ``-o IdentityFile=KEY`` (a key that fails to load prints nothing of itself), or ``-F`` naming a
+    config file: ssh echoes the first word of every line it cannot parse, so ``-F ~/.ssh/id_rsa`` prints the key."""
+    if opt == "-i" or (opt == "-o" and _IDENTITY_OPTION.match(value)):
+        return True
+    return opt == "-F" and bool(_SSH_CONFIG_NAME.search(value))
+
+
 def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str], list[str], list[str]]:
     """The arguments of ``name args`` that may name a credential file, by what the command does with it: (reads or
     sends it: deny, overwrites it: ask, deletes/sources/stages it or hands it to a container: confirm). An argument the
@@ -548,8 +557,7 @@ def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str
         return [], [], []
     if name in _SSH_VALUE_OPTS:
         opts, positional = _options(args, _SSH_VALUE_OPTS[name], frozenset())
-        values = [v for o, v in opts if v and o not in _SSH_KEY_OPTS and not (o == "-o" and _IDENTITY_OPTION.match(v))]
-        return values + positional, [], []
+        return [v for o, v in opts if v and not _ssh_key_value(o, v)] + positional, [], []
     if name == "ssh-keygen":
         opts, positional = _options(args, _KEYGEN_VALUE_OPTS, frozenset())
         letters = {o[1] for o, _ in opts}
