@@ -116,7 +116,8 @@ class Suggestions:
 
     def get(self, ref: str) -> dict[str, Any] | None:
         """By 1-based pending index (checked first: ``1`` must never be read as an id prefix), then exact id, then
-        title (case-insensitive), then unique id prefix. A shared title or an ambiguous prefix finds nothing."""
+        title (case-insensitive; a pending row beats a resolved one), then unique id prefix. A shared title or an
+        ambiguous prefix finds nothing."""
         pending = self.pending()
         if ref.isdigit() and 1 <= int(ref) <= len(pending):
             return pending[int(ref) - 1]
@@ -125,7 +126,8 @@ class Suggestions:
             return row
         titled = [s for s in self.db.rows("suggestions") if s["title"].lower() == ref.lower()]
         if titled:
-            return titled[0] if len(titled) == 1 else None
+            live = [s for s in titled if s["status"] == "pending"] or titled  # a resolved twin must not shadow it
+            return live[0] if len(live) == 1 else None
         return self.db.find("suggestions", ref)
 
     def dismiss(self, ref: str) -> bool:

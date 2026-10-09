@@ -104,10 +104,12 @@ class AutomationDB:
         return self._dec(self._db.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone())  # noqa: S608
 
     def find(self, table: str, prefix: str, *, name_col: str | None = None) -> dict[str, Any] | None:
-        """Row by exact id, then (with ``name_col``) exact name, then unique id prefix.
+        """Row by exact id, then (with ``name_col``) exact name, then a unique name ignoring case, then id prefix.
 
-        Ids are random hex, so a name such as ``cafe`` can also be a prefix of another row's id: the name must win.
-        A name shared by several rows or an ambiguous prefix finds nothing rather than an arbitrary row.
+        Ids are random hex, so a name such as ``cafe`` can also be a prefix of another row's id: a ref that equals a
+        name (ignoring case) never falls through to an id-prefix hit on a different row. The prefix match is
+        case-insensitive and takes ``_`` and ``%`` literally. A name shared by several rows or an ambiguous prefix
+        finds nothing. The id prefix must be unique.
         """
         row = self.get(table, prefix)
         if row is not None:
@@ -117,7 +119,15 @@ class AutomationDB:
             named = self._db.execute(f"SELECT * FROM {table} WHERE {name_col}=?", (prefix,)).fetchall()  # noqa: S608
             if named:
                 return self._dec(named[0]) if len(named) == 1 else None
-        rows = self._db.execute(f"SELECT * FROM {table} WHERE id LIKE ?", (prefix + "%",)).fetchall()  # noqa: S608
+            folded = [
+                r
+                for r in self._db.execute(f"SELECT * FROM {table}").fetchall()  # noqa: S608
+                if str(r[name_col]).casefold() == prefix.casefold()
+            ]
+            if folded:
+                return self._dec(folded[0]) if len(folded) == 1 else None
+        like = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        rows = self._db.execute(f"SELECT * FROM {table} WHERE id LIKE ? ESCAPE '\\'", (like,)).fetchall()  # noqa: S608
         return self._dec(rows[0]) if len(rows) == 1 else None
 
     def rows(

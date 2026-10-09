@@ -4,7 +4,6 @@ start leaves a 0-message row; hidden from the agent view, auto-resume and the sw
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import sqlite3
 import time
@@ -12,6 +11,7 @@ import time
 import pytest
 
 import m1cmd_helpers as m1
+from daemon_helpers import _stop_daemon
 from k3code import daemon
 from k3code.automation.engine import AutomationEngine
 from k3code.gateway.sessions import SessionStore, StoredSession
@@ -92,19 +92,6 @@ async def _wait_until(cond, what: str, timeout: float = 10.0) -> None:
         await asyncio.sleep(0.05)
 
 
-async def _stop_daemon(server, task: asyncio.Task, timeout: float = 10.0) -> None:
-    """Stop a test daemon with a hard bound. ``wait_for(task, ...)`` is none: on timeout it cancels the task and then
-    waits for the cancellation to finish, so a shutdown stuck in ``server.close()`` hung the run with no stack."""
-    server.request_stop()
-    done, _ = await asyncio.wait({task}, timeout=timeout)
-    if not done:
-        stack = io.StringIO()
-        task.print_stack(file=stack)
-        task.cancel()
-        pytest.fail(f"the daemon did not stop within {timeout:g} s; it was stuck in:\n{stack.getvalue()}")
-    task.result()  # the daemon's own error, if it had one
-
-
 async def test_stop_daemon_fails_fast_with_the_stack_when_shutdown_hangs():
     class _Server:
         def request_stop(self) -> None:
@@ -141,14 +128,14 @@ async def test_daemon_start_sweeps_old_empty_sessions(tmp_path, monkeypatch):
     task = asyncio.create_task(
         daemon.run_daemon(home=home, install_signals=False, ready_event=ready, server_out=holder, watchdog_interval=5)
     )
-    await asyncio.wait_for(ready.wait(), 10)
-    server = holder[0]
     try:  # the sweep runs in the background after readiness
+        await asyncio.wait_for(ready.wait(), 10)
+        server = holder[0]
         await _wait_until(lambda: server.store.get(old.session_id) is None, "the start sweep to delete the old row")
         assert server.store.get(old.session_id) is None
         assert server.store.get(kept.session_id) is not None
     finally:
-        await _stop_daemon(server, task)
+        await _stop_daemon(holder[0] if holder else None, task)
 
 
 async def test_sweep_keeps_rows_referenced_by_paused_automations(tmp_path, monkeypatch):
@@ -169,8 +156,8 @@ async def test_sweep_keeps_rows_referenced_by_paused_automations(tmp_path, monke
             action={"type": "prompt", "prompt": "x"},
         ),
     ]
-    # pause by id, not by name: ``find`` tries a unique id prefix before the name, and ids are random hex, so the name
-    # "a" resolved to the other automation whenever only its id started with "a" (about 1 run in 17)
+    # pause by id, not by name: ids are random hex, and a name that is an id prefix is still resolved by exact id,
+    # then exact name, then case-insensitive name; keeping the ids here sidesteps lookup order in a sweep test
     for row in added:
         assert await server.automation.automations.pause(row["id"])
     server.live.clear()
@@ -255,13 +242,14 @@ async def test_daemon_ready_before_sweep_finishes_and_shutdown_cancels_it(tmp_pa
     task = asyncio.create_task(
         daemon.run_daemon(home=home, install_signals=False, ready_event=ready, server_out=holder, watchdog_interval=5)
     )
-    await asyncio.wait_for(ready.wait(), 10)  # readiness does not wait for the sweep
     try:
+        await asyncio.wait_for(ready.wait(), 10)  # readiness does not wait for the sweep
         await _wait_until(lambda: slow, "the start sweep to begin")
         await asyncio.wait_for(slow[0].started.wait(), 10)
         assert not slow[0].finished
     finally:  # always stopped, also when an assertion above fails: a daemon left running can stall the loop teardown
-        await _stop_daemon(holder[0], task)  # shutdown cancels the blocked sweep instead of hanging on it
+        # shutdown cancels the blocked sweep instead of hanging on it
+        await _stop_daemon(holder[0] if holder else None, task)
     assert not slow[0].finished
 
 

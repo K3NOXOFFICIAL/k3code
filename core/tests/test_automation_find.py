@@ -75,3 +75,45 @@ async def test_ambiguous_ref_changes_nothing(tmp_path):
     assert not await m.pause("dup")
     assert not await m.remove("caf")
     assert {r["state"] for r in db.rows("automations")} == {"active"} and len(db.rows("automations")) == 2
+
+
+def test_a_name_matches_ignoring_case_before_any_id_prefix(tmp_path):
+    db, m = _mgr(tmp_path)
+    _row(db, "cafe1234", "x")
+    _row(db, "11112222", "cafe")
+    assert m.find("CAFE")["id"] == "11112222"
+    assert m.find("Cafe")["id"] == "11112222"
+
+
+async def test_pause_by_a_differently_cased_name_touches_only_the_named_automation(tmp_path):
+    db, m = _mgr(tmp_path)
+    _row(db, "cafe1234", "x")
+    _row(db, "11112222", "cafe")
+    assert await m.pause("CAFE")
+    assert db.get("automations", "11112222")["state"] == "paused"
+    assert db.get("automations", "cafe1234")["state"] == "active"
+
+
+def test_names_differing_only_by_case_are_ambiguous_for_a_third_spelling(tmp_path):
+    db, m = _mgr(tmp_path)
+    _row(db, "aaaa0001", "Cafe")
+    _row(db, "aaaa0002", "cAFE")
+    assert m.find("CAFE") is None
+    assert m.find("Cafe")["id"] == "aaaa0001"  # an exact name still wins
+
+
+def test_prefix_wildcards_are_literal(tmp_path):
+    db, m = _mgr(tmp_path)
+    _row(db, "ab0c1234", "one")
+    _row(db, "beef0000", "three")
+    assert m.find("ab_c") is None
+    assert m.find("a%") is None
+    assert m.find("%") is None
+    assert m.find("_eef") is None
+    assert m.find("ab0")["id"] == "ab0c1234"
+
+
+def test_prefix_is_still_case_insensitive(tmp_path):
+    db, m = _mgr(tmp_path)
+    _row(db, "cafe1234", "one")
+    assert m.find("CAF")["id"] == "cafe1234"

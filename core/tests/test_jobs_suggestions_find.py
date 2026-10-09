@@ -92,3 +92,64 @@ def test_suggestion_duplicate_title_and_ambiguous_prefix_find_nothing(tmp_path):
     assert g.get("missing") is None
     assert not g.dismiss("dup") and g.mark_accepted("caf") is None
     assert [r["status"] for r in db.rows("suggestions")] == ["pending", "pending"]
+
+
+def test_job_name_matches_ignoring_case_and_prefix_wildcards_are_literal(tmp_path):
+    db, s = _sched(tmp_path)
+    _job(db, "cafe1234", "other")
+    _job(db, "11112222", "cafe")
+    _job(db, "ab0c1234", "p")
+    assert s.find("CAFE")["id"] == "11112222"
+    assert s.find("ab_c") is None
+    assert s.find("a%") is None
+    assert s.find("ab0")["id"] == "ab0c1234"
+
+
+def test_job_names_differing_only_by_case_find_nothing_for_a_third_spelling(tmp_path):
+    db, s = _sched(tmp_path)
+    _job(db, "aaaa0001", "Cafe")
+    _job(db, "aaaa0002", "cAFE")
+    assert s.find("CAFE") is None
+    assert s.find("Cafe")["id"] == "aaaa0001"
+
+
+def test_suggestion_id_prefix_wildcards_are_literal(tmp_path):
+    db = make_db(tmp_path)
+    g = Suggestions(db, catalog=[])
+    _sug(db, "ab0c1234", "one")
+    assert g.get("ab_c") is None
+    assert g.get("a%") is None
+    assert g.get("ab0")["id"] == "ab0c1234"
+
+
+def test_a_pending_suggestion_wins_over_a_resolved_one_with_the_same_title(tmp_path):
+    db = make_db(tmp_path)
+    g = Suggestions(db, catalog=[])
+    _sug(db, "aaaa0001", "same")
+    _sug(db, "bbbb0002", "same")
+    db.update("suggestions", "aaaa0001", status="dismissed")
+    assert g.get("same")["id"] == "bbbb0002"
+    assert g.dismiss("same")
+    assert db.get("suggestions", "bbbb0002")["status"] == "dismissed"
+    # both resolved now: the lookup falls back to all matches, which are two, so it finds nothing
+    assert g.get("same") is None
+
+
+def test_two_pending_suggestions_with_one_title_stay_ambiguous_even_with_a_resolved_twin(tmp_path):
+    db = make_db(tmp_path)
+    g = Suggestions(db, catalog=[])
+    _sug(db, "aaaa0001", "same")
+    _sug(db, "bbbb0002", "same")
+    _sug(db, "cccc0003", "same")
+    db.update("suggestions", "aaaa0001", status="accepted")
+    assert g.get("same") is None
+    assert not g.dismiss("same")
+
+
+def test_a_lone_resolved_suggestion_is_still_found_by_title(tmp_path):
+    db = make_db(tmp_path)
+    g = Suggestions(db, catalog=[])
+    _sug(db, "aaaa0001", "gone")
+    db.update("suggestions", "aaaa0001", status="dismissed")
+    assert g.get("gone")["id"] == "aaaa0001"
+    assert not g.dismiss("gone")

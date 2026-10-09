@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from daemon_helpers import _stop_daemon
 from k3code import daemon, sdnotify, service
 
 
@@ -117,10 +118,11 @@ async def running_daemon(tmp_path, monkeypatch):
             home=home, install_signals=False, ready_event=ready, server_out=holder, watchdog_interval=0.05
         )
     )
-    await asyncio.wait_for(ready.wait(), 10)
-    yield home, holder[0]
-    holder[0].request_stop()
-    await asyncio.wait_for(task, 10)
+    try:
+        await asyncio.wait_for(ready.wait(), 10)
+        yield home, holder[0]
+    finally:
+        await _stop_daemon(holder[0] if holder else None, task)
 
 
 async def test_two_clients_share_one_session_and_background_prompt_survives_detach(running_daemon):
