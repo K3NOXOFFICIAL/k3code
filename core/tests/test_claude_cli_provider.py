@@ -200,6 +200,21 @@ def test_no_tools_prompt_has_no_tool_protocol() -> None:
     assert "<tool_calls>" in with_tools and "Tools you can call" in with_tools
 
 
+def test_a_mid_turn_system_note_stays_in_the_transcript_not_the_system_prompt() -> None:
+    call = ToolCall(id="c1", name="read_file", arguments={"path": "a.py"})
+    head = [
+        Message(role="system", content="S"),
+        Message(role="user", content="u"),
+        Message(role="assistant", content="", tool_calls=[call]),
+        Message(role="tool", content="print(1)", tool_call_id="c1", name="read_file"),
+    ]
+    before, _ = render_prompt(head, TOOLS)
+    system, prompt = render_prompt([*head, Message(role="system", content="NOTE: stop repeating")], TOOLS)
+    assert system == before == "S"  # the system prompt (the cached prefix) does not change mid-turn
+    note = "<system-reminder>\nNOTE: stop repeating\n</system-reminder>"
+    assert prompt.index("[tool result id=c1") < prompt.index(note)
+
+
 @pytest.mark.parametrize(
     ("mode", "status", "needle"),
     [

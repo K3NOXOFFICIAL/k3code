@@ -205,12 +205,17 @@ async def draft_memory(caller: Any, root: Path, info: dict[str, Any], session_id
 
 
 def safe_commands(info: dict[str, Any]) -> list[str]:
+    """Allow-rule patterns for the detected test/lint/build commands: ``<prefix> *``, or the exact command when its
+    arguments name what runs (``uv run pytest``, ``npx eslint .``: ``uv *`` would allow any program)."""
+    from k3code.permissions.engine import exact_rule_pattern
+    from k3code.permissions.hardline import command_prefix, wildcard_unsafe
+
     cmds = [info[k] for k in ("test", "lint", "build") if info.get(k)]
     out = []
     for c in cmds:
-        from k3code.permissions.hardline import command_prefix
-
-        out.append(command_prefix(c) + " *")
+        pattern = exact_rule_pattern(c) if wildcard_unsafe(c) else command_prefix(c) + " *"
+        if pattern:
+            out.append(pattern)
     return list(dict.fromkeys(out))
 
 

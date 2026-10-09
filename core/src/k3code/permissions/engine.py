@@ -8,6 +8,8 @@ except hardline).
 
 from __future__ import annotations
 
+import fnmatch
+import glob
 import os
 import re
 from dataclasses import dataclass, field
@@ -79,7 +81,11 @@ BUILTIN_BASH_ASK = [
     "git log* --textconv*",
 ]
 
-PURE_TOOLS = frozenset({"read", "grep", "glob", "todo", "skill", "mcp_tool_search", "task", "task_result"})
+#: bash_output / bash_kill only reach background jobs of the calling session (the job registry enforces it); starting
+#: one is ``bash`` with ``background: true`` and goes through the bash decision like any command.
+PURE_TOOLS = frozenset(
+    {"read", "grep", "glob", "todo", "skill", "mcp_tool_search", "task", "task_result", "bash_output", "bash_kill"}
+)
 EDIT_TOOLS = frozenset({"write", "edit"})
 READ_TOOLS = frozenset({"read", "grep", "glob"})  # path-taking read-only tools
 EXIT_PLAN_TOOL = "exit_plan"
@@ -256,22 +262,28 @@ def _voids_allow(sub: str, rule: Rule, ruleset: list[Rule], roots: list[str], cw
     )
 
 
-#: Read-only commands (the builtin allowlist and its kin) that must never be pointed at a key file.
-_READERS = frozenset({"cat", "grep", "egrep", "fgrep", "rg", "ls", "head", "tail", "less", "more"})
+def _argv(sub: str, reads: list[str] | None = None) -> list[str]:
+    """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv).
+    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``)."""
+    words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked separately
+    return hardline.normalize_argv(hardline.tokens(words), reads)
 
 
-def _path_args(sub: str) -> list[str]:
-    """The non-flag arguments of ``sub`` (after sudo/env/... wrappers), plus the values of ``--flag=value``."""
-    words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked by _redirects_ok
-    real = hardline.strip_wrappers(hardline.tokens(words))
+def _arg_values(args: list[str]) -> list[str]:
+    """The non-flag arguments in ``args``, plus the values of ``--flag=value``."""
     out: list[str] = []
-    for t in real[1:]:
+    for t in args:
         if t.startswith("-"):
             if "=" in t:
                 out.append(t.split("=", 1)[1])
             continue
         out.append(t)
     return out
+
+
+def _path_args(sub: str) -> list[str]:
+    """The non-flag arguments of ``sub`` (after sudo/env/... wrappers), plus the values of ``--flag=value``."""
+    return _arg_values(_argv(sub)[1:])
 
 
 def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
@@ -282,24 +294,391 @@ def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
     return not _inside(_abs(arg, cwd), roots)
 
 
-def _reads_secret(sub: str, cwd: str) -> bool:
-    real = hardline.strip_wrappers(hardline.tokens(sub))
-    if not real or os.path.basename(real[0]) not in _READERS:
+# ── credential files named on a command line ──
+
+#: ``<file`` (not ``<<``, ``<<<``, ``<&``, ``<(``, ``<>``): a file the command reads.
+_INPUT_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*<(?![<&(>])\s*([^\s;&|<>()]+)")
+_ANY_VAR = re.compile(r"\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
+_GLOB_CHARS = frozenset("*?[")
+#: Print, test or change the metadata of the paths they are given, never a file's content: ``echo .env``,
+#: ``test -f .env``, ``chmod 600 ~/.ssh/id_rsa``, ``ssh-add ~/.ssh/id_ed25519``. Exempt unless their output goes on to a
+#: pipe or a substitution, where a printed name feeds a reader (``realpath .env | xargs cat``, ``tac $(echo .env)``).
+_NAME_ONLY = frozenset(
+    {
+        "echo",
+        "printf",
+        "ls",
+        "realpath",
+        "readlink",
+        "stat",
+        "file",
+        "chmod",
+        "chown",
+        "chgrp",
+        "touch",
+        "test",
+        "[",
+        "[[",
+        "ssh-add",
+    }
+)
+#: ``file`` options whose value it reads: ``-f`` lists files to check (each line comes back as a name), ``-m`` names a
+#: magic file (bad lines come back in the warnings).
+_FILE_VALUE_OPTS = ("eFfmP", frozenset({"--exclude", "--separator", "--files-from", "--magic-file", "--parameter"}))
+_FILE_READ_OPTS = frozenset({"-f", "-m", "--files-from", "--magic-file"})
+#: ssh client short options taking a value. ``-i KEY``, ``-o IdentityFile=KEY`` and ``-F CONFIG`` name a file the
+#: client authenticates with or reads its settings from (see _ssh_key_value). (rsync is not here: its ``-i`` is
+#: ``--itemize-changes``, so the next word is a source it copies; an rsync key goes in ``-e 'ssh -i KEY'``, a single
+#: word that names no credential.)
+_SSH_VALUE_OPTS = hardline.SSH_VALUE_OPTS
+_IDENTITY_OPTION = re.compile(r"identityfile=", re.IGNORECASE)
+_SSH_CONFIG_NAME = re.compile(r"(?:^|/)(?:config|[^/]*(?:\.conf|_config))$")
+#: ``ssh-keygen -l`` (fingerprint) and ``-y`` (the public half) read the key named by ``-f`` and print no secret; any
+#: other mode letter (``-p``, ``-e``, ``-i``, ``-t`` ...) leaves the key file classified as a read.
+_KEYGEN_VALUE_OPTS = "abCDEFfGIJjKMmNnOPRrSstVwYZz"
+_KEYGEN_PRINT_ONLY = frozenset("lyvqfE")
+#: curl options that send a file: ``-d @FILE`` (and ``--data-urlencode NAME@FILE``), ``-F NAME=@FILE``/``NAME=<FILE``,
+#: ``-T FILE``. ``--data-raw @x`` sends the text ``@x``.
+_CURL_VALUE_OPTS = "AbcCdDeEFHKmoPQrtTuUwxXyYz"
+_CURL_DATA = frozenset({"-d", "--data", "--data-ascii", "--data-binary", "--data-urlencode", "--json"})
+_CURL_FORM = frozenset({"-F", "--form"})
+_CURL_LONG_VALUE = _CURL_DATA | _CURL_FORM | {"--upload-file", "--config"}
+_CURL_FORM_FILE = re.compile(r"=[@<]([^;]*)")
+#: Delete a credential file: a person confirms.
+_REMOVERS = frozenset({"rm", "unlink", "shred"})
+#: ``SOURCE... DEST``: a credential file as the source is copied somewhere readable (deny); as the destination it is
+#: only overwritten (ask).
+_COPIERS = frozenset({"cp", "mv", "ln", "install"})
+_KEY_NAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
+#: ``human``: a variable may point at a credential file; ``confirm``: the command deletes, sources, stages or hands a
+#: container one. Both are an ask that a person answers.
+_SEVERITY = {"ask": 1, "human": 2, "confirm": 2, "deny": 3}
+
+
+def _worse(a: str | None, b: str | None) -> str | None:
+    return b if b and (a is None or _SEVERITY[b] > _SEVERITY[a]) else a
+
+
+def _dotenv_name(name: str) -> bool:
+    return name == ".env" or (name.startswith(".env.") and not name.endswith(_DOTENV_TEMPLATES))
+
+
+def _sensitive_name(text: str) -> bool:
+    """``text`` (a path with its unknown parts removed) names a credential: a dotenv file, an ssh key, a secrets dir,
+    a process environment."""
+    parts = [p for p in text.split("/") if p]
+    if not parts:
         return False
-    return any(sensitive_path(_abs(a, cwd)) for a in _path_args(sub) if a and not a.startswith("$"))
+    if any(p in (".ssh", ".gnupg", ".aws") for p in parts) or "/.config/k3code/" in f"/{text}/":
+        return True
+    base = parts[-1]
+    return _dotenv_name(base) or base in _KEY_NAMES or base == "environ" or base.endswith((".pem", ".key"))
+
+
+def _glob_match(pattern: str, path: str) -> bool:
+    """Shell-style match of an absolute glob against an absolute path: component by component (``*`` never crosses a
+    ``/``) and a wildcard never matches a leading dot (``cat *`` does not read ``.env``)."""
+    pat, parts = pattern.split("/"), path.split("/")
+    if len(pat) != len(parts):
+        return False
+    return all(
+        fnmatch.fnmatchcase(name, comp) and (comp.startswith(".") or not name.startswith("."))
+        for comp, name in zip(pat, parts, strict=True)
+    )
+
+
+def _canonical_secrets(pattern: str, home: str) -> list[str]:
+    """Representative credential paths a glob is matched against (it need not exist on this machine)."""
+    keys = [*_KEY_NAMES, "x.pem", "x.key", "config", "authorized_keys"]
+    out = [os.path.join(home, ".ssh", k) for k in keys]
+    out += [os.path.join(home, ".gnupg", "x"), os.path.join(home, ".aws", "credentials")]
+    out += [os.path.join(d, "env") for d in _secret_dirs()]
+    out += ["/proc/self/environ", "/proc/1/environ", "/proc/self/task/1/environ"]
+    folder = os.path.dirname(pattern)  # dotenv files live anywhere: try them next to the pattern
+    out += [os.path.join(folder, n) for n in (".env", ".env.local", ".env.production")]
+    return out
+
+
+def _glob_reads_secret(pattern: str, home: str) -> bool:
+    """An absolute glob that matches a credential file: on disk, by its literal leading directory, or by its shape
+    against the canonical secret names."""
+    for k, hit in enumerate(glob.iglob(pattern)):
+        if sensitive_path(hit):
+            return True
+        if k >= 1000:
+            break
+    literal: list[str] = []
+    for seg in pattern.split("/"):
+        if _GLOB_CHARS & set(seg):
+            break
+        literal.append(seg)
+    base = "/".join(literal) or "/"
+    if base != "/" and sensitive_path(base):
+        return True
+    return any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home))
+
+
+_BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+
+
+def _brace_expand(word: str, limit: int = 64) -> list[str]:
+    """The words the shell makes of ``a{b,c}d`` (``abd``, ``acd``); capped so a pathological word cannot explode."""
+    out = [word]
+    for _ in range(8):
+        nxt: list[str] = []
+        changed = False
+        for w in out:
+            m = _BRACE.search(w)
+            if not m:
+                nxt.append(w)
+                continue
+            changed = True
+            nxt.extend(w[: m.start()] + alt + w[m.end() :] for alt in m.group(1).split(","))
+        out = nxt[:limit]
+        if not changed:
+            break
+    return out
+
+
+def _classify_arg(arg: str, cwd: str, home: str) -> str | None:
+    """``deny`` when ``arg`` names (or globs onto) a credential file, ``human`` when an unknown variable stands in
+    front of a credential name (``$DIR/.env``), else None. ``{a,b}`` alternatives are classified one by one."""
+    worst: str | None = None
+    for word in _brace_expand(arg):
+        worst = _worse(worst, _classify_word(word, cwd, home))
+    return worst
+
+
+def _classify_word(arg: str, cwd: str, home: str) -> str | None:
+    arg = arg.strip("'\"")
+    if not arg or "://" in arg:
+        return None
+    word = hardline.expand_vars(arg, cwd, home)
+    if "$" in word or "`" in word:
+        return "human" if _sensitive_name(_ANY_VAR.sub("", word)) else None
+    path = _abs(word, cwd)
+    if _GLOB_CHARS & set(word):
+        return "deny" if _glob_reads_secret(path, home) else None
+    return "deny" if sensitive_path(path) else None
+
+
+def _target_dir_flag(args: list[str]) -> bool:
+    """``cp -t DIR SRC...`` / ``--target-directory``: the destination is the flag value; the rest are sources."""
+    for a in args:
+        if a == "--":
+            return False
+        if a.startswith("--target-directory") or (a.startswith("-") and not a.startswith("--") and "t" in a[1:]):
+            return True
+    return False
+
+
+def _options(args: list[str], short_val: str, long_val: frozenset[str]) -> tuple[list[tuple[str, str]], list[str]]:
+    """GNU-style scan of ``args``: every option with its value (``""`` for a flag; short clusters split, ``-xVALUE``
+    and ``--opt=value`` included) and the positional arguments. Options may follow positionals; ``--`` ends them."""
+    opts: list[tuple[str, str]] = []
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            positional += args[i:]
+            break
+        if a.startswith("--"):
+            key, eq, value = a.partition("=")
+            if not eq and key in long_val and i < len(args):
+                value, i = args[i], i + 1
+            opts.append((key, value))
+        elif a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:], 1):
+                if ch in short_val:
+                    value = a[k + 1 :]
+                    if not value and i < len(args):
+                        value, i = args[i], i + 1
+                    opts.append(("-" + ch, value))
+                    break
+                opts.append(("-" + ch, ""))
+        else:
+            positional.append(a)
+    return opts, positional
+
+
+def _words(args: list[str]) -> list[str]:
+    """Every argument that may name a file: the non-flag ones, ``--flag=value`` values and a value glued to a short
+    option (``-T.env``, ``-f~/.ssh/id_rsa``)."""
+    glued = [a[2:] for a in args if a.startswith("-") and not a.startswith("--") and len(a) > 2 and "=" not in a]
+    return _arg_values(args) + glued
+
+
+def _curl_reads(args: list[str]) -> list[str]:
+    """curl's arguments with the files its data, form and upload options send spelled as plain paths."""
+    opts, positional = _options(args, _CURL_VALUE_OPTS, _CURL_LONG_VALUE)
+    reads = list(positional)
+    for opt, value in opts:
+        if opt in _CURL_DATA and "@" in value:
+            value = value.split("@", 1)[1]
+        elif opt in _CURL_FORM and (m := _CURL_FORM_FILE.search(value)):
+            value = m.group(1)
+        reads.append(value)
+    return reads
+
+
+def _copier_roles(args: list[str]) -> tuple[list[str], list[str]]:
+    """(sources, destination) of ``cp``/``mv``/``ln``/``install``."""
+    reads = _arg_values(args)
+    writes: list[str] = []
+    positional = [a for a in args if not a.startswith("-")]
+    if _target_dir_flag(args):
+        for k, a in enumerate(args[:-1]):
+            if a in ("-t", "--target-directory") and args[k + 1] in reads:
+                writes = [args[k + 1]]
+                reads.remove(args[k + 1])
+                break
+    elif len(positional) >= 2:
+        writes = [positional[-1]]
+        del reads[len(reads) - 1 - reads[::-1].index(positional[-1])]
+    return reads, writes
+
+
+def _ssh_key_value(opt: str, value: str) -> bool:
+    """``-i KEY`` / ``-o IdentityFile=KEY`` (a key that fails to load prints nothing of itself), or ``-F`` naming a
+    config file: ssh echoes the first word of every line it cannot parse, so ``-F ~/.ssh/id_rsa`` prints the key."""
+    if opt == "-i" or (opt == "-o" and _IDENTITY_OPTION.match(value)):
+        return True
+    return opt == "-F" and bool(_SSH_CONFIG_NAME.search(value))
+
+
+def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str], list[str], list[str]]:
+    """The arguments of ``name args`` that may name a credential file, by what the command does with it: (reads or
+    sends it: deny, overwrites it: ask, deletes/sources/stages it or hands it to a container: confirm). An argument the
+    command only prints, tests, changes the metadata of or authenticates with is in none of the lists; any command not
+    named here reads every argument."""
+    if name in _NAME_ONLY or (name == "git" and args[:1] == ["check-ignore"]):
+        if piped:
+            return _words(args), [], []
+        if name == "file":
+            opts, _ = _options(args, *_FILE_VALUE_OPTS)
+            return [v for o, v in opts if o in _FILE_READ_OPTS], [], []
+        return [], [], []
+    if name in _SSH_VALUE_OPTS:
+        opts, positional = _options(args, _SSH_VALUE_OPTS[name], frozenset())
+        # an -o XxxCommand value is a command line, not a path: _sub_secret_access checks it
+        paths = [
+            v
+            for o, v in opts
+            if v and not _ssh_key_value(o, v) and not (o == "-o" and hardline.ssh_command_value(v) is not None)
+        ]
+        return paths + positional, [], []
+    if name == "ssh-keygen":
+        opts, positional = _options(args, _KEYGEN_VALUE_OPTS, frozenset())
+        letters = {o[1] for o, _ in opts}
+        if letters & {"l", "y"} and letters <= _KEYGEN_PRINT_ONLY:
+            return positional, [], []
+        return _words(args), [], []
+    if name == "curl":
+        return _curl_reads(args), [], []
+    if name in _REMOVERS:
+        return [], [], _words(args)
+    if name in ("source", "."):
+        words = _words(args)
+        return words[1:], [], words[:1]
+    if name == "git" and args[:1] in (["add"], ["rm"], ["mv"]):
+        opts, positional = _options(args[1:], "", frozenset({"--pathspec-from-file", "--chmod"}))
+        return [v for o, v in opts if v], [], positional
+    if name in ("docker", "podman"):
+        env_files: list[str] = []
+        rest: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--env-file" and i + 1 < len(args):
+                env_files.append(args[i + 1])
+                i += 2
+                continue
+            if args[i].startswith("--env-file="):
+                env_files.append(args[i].split("=", 1)[1])
+            else:
+                rest.append(args[i])
+            i += 1
+        return _words(rest), [], env_files
+    if name in _COPIERS:
+        reads, writes = _copier_roles(args)
+        return reads, writes, []
+    return _words(args), [], []
+
+
+def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
+    plain = _HARMLESS_REDIRECT.sub("", sub)
+    worst: str | None = None
+    for source in _INPUT_REDIRECT.findall(plain):
+        worst = _worse(worst, _classify_arg(source, cwd, home))
+    wrapper_reads: list[str] = []  # ``xargs -a .env echo`` prints the file whatever it wraps
+    argv = _argv(sub, wrapper_reads)
+    for arg in wrapper_reads:
+        worst = _worse(worst, _classify_arg(arg, cwd, home))
+    if not argv:
+        return worst
+    for command in hardline.ssh_option_commands(argv[0], argv[1:]):
+        # ``ssh -oProxyCommand='head .env' x``: ssh runs it, and its output goes on to ssh
+        worst = _worse(worst, _secret_access(hardline.parse(command), cwd, home, consumed=True))
+    reads, writes, confirm = _credential_roles(argv[0], argv[1:], piped)
+    for arg in reads:
+        worst = _worse(worst, _classify_arg(arg, cwd, home))
+    if any(_classify_arg(arg, cwd, home) for arg in writes):
+        worst = _worse(worst, "ask")
+    if any(_classify_arg(arg, cwd, home) for arg in confirm):
+        worst = _worse(worst, "confirm")
+    return worst
+
+
+def _secret_access(parsed: hardline.Parsed, cwd: str, home: str, consumed: bool = False) -> str | None:
+    """How a command line touches credential files: ``deny`` (reads, copies or sends one), ``human`` (a variable may
+    point at one), ``confirm`` (deletes, sources, stages one or hands it to a container), ``ask`` (overwrites one),
+    None. Every argument of every simple command and of everything nested in it counts unless the command only prints,
+    tests or authenticates with it (see _credential_roles), and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are
+    expanded, globs are matched."""
+    worst: str | None = None
+    for sub in parsed.subs:
+        piped = consumed or any(len(p) > 1 and sub in p for p in parsed.pipelines)
+        worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home))
+    # the first children are ``$(...)``/backtick/``<(...)`` payloads: their output becomes the outer arguments
+    n_subst = sum(len(ps) for ps in parsed.sub_payloads)
+    for k, child in enumerate(parsed.children):
+        worst = _worse(worst, _secret_access(child, cwd, home, consumed or k < n_subst))
+    return worst
+
+
+def _rule_forms(parsed: hardline.Parsed) -> list[str]:
+    """What else the subs of ``parsed`` run as, for deny/ask rules: their normalised argv (``/bin/rm x`` is ``rm x``,
+    ``git -C . push`` is ``git push``) and every nested command (``bash -c '...'``, ``$(...)``) in both spellings."""
+    forms: list[str] = []
+    for sub in parsed.subs:
+        norm = " ".join(_argv(sub))
+        if norm and norm != sub:
+            forms.append(norm)
+    for nested in parsed.nested:
+        forms.append(nested)
+        norm = " ".join(_argv(nested))
+        if norm and norm != nested:
+            forms.append(norm)
+    return list(dict.fromkeys(forms))
 
 
 def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
-    hit = hardline.check(command, extra)
+    home = os.path.expanduser("~")
+    hit = hardline.check(command, extra, cwd=cwd, home=home)
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
-    subs = hardline.split_commands(command)
-    if any(_reads_secret(sub, cwd) for sub in subs):
+    parsed = hardline.parse(command)
+    subs = parsed.subs
+    # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
+    unsafe = parsed.unterminated or parsed.comment_quote
+    secret = _secret_access(parsed, cwd, home)
+    if secret == "deny":
         hit = "sensitive-path"
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
-    prefixes = [hardline.command_prefix(s) or s for s in subs]
+    prefixes = [_rule_pattern_base(s) for s in subs]
     if mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=prefixes, message=PLAN_MSG)
     if mode == PermissionMode.YOLO:
@@ -314,9 +693,36 @@ def _decide_bash(
         rule = evaluate("bash", sub, ruleset, default="ask")
         if rule.action == "allow" and _voids_allow(sub, rule, ruleset, roots, cwd):
             rule = Rule(tool="bash", pattern="*", action="ask")
+        if rule.action == "allow" and rule.layer == 0 and "\n" in sub:
+            unsafe = True  # the builtin read-only allowlist covers one-line commands only
         if worst is None or _RANK[rule.action] > _RANK[worst.action]:
             worst = rule
+    # deny/ask rules also see through wrappers, absolute paths and nested commands (`/bin/rm x`, `bash -c 'rm x'`);
+    # an allow is only ever granted from the command as written, and a bare "*" catch-all would make every form ask
+    strict = [r for r in ruleset if r.pattern != "*"]
+    for form in _rule_forms(parsed):
+        rule = evaluate("bash", form, strict, default="allow")
+        if rule.action != "allow" and (worst is None or _RANK[rule.action] > _RANK[worst.action]):
+            worst = rule
     worst = worst or Rule(tool="bash", pattern="*", action="ask")
+    if unsafe and worst.action != "deny":
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            needs_human=True,
+            message=f"Command could not be parsed safely; confirm it yourself: {command[:120]}",
+        )
+    if secret in ("human", "confirm") and worst.action != "deny":
+        why = (
+            "A variable may point at a credential file"
+            if secret == "human"
+            else "Deletes, sources, stages or hands a container a credential file"
+        )
+        return Decision(
+            action="ask", patterns=prefixes, needs_human=True, message=f"{why}; confirm it yourself: {command[:120]}"
+        )
+    if secret == "ask" and worst.action == "allow":
+        return Decision(action="ask", patterns=prefixes, message=f"Overwrites a credential file: {command[:120]}")
     if worst.action == "allow" and not _inside(cwd, roots):
         return Decision(action="ask", patterns=prefixes, message=f"Working directory outside project roots: {cwd}")
     return Decision(action=worst.action, patterns=prefixes, rule=worst)
@@ -403,18 +809,39 @@ def _drop_assignments(prefix: str) -> str:
     return " ".join(words)
 
 
+#: An exact command proposed as a rule must not carry wildcards, variables, substitutions or redirections.
+_INEXACT = re.compile(r"[*?$`;&|<>\n]")
+
+
+def _rule_pattern_base(sub: str) -> str:
+    """What a bash decision records for ``sub``: its arity prefix, or the exact command for the commands whose
+    arguments name what runs (hardline.WILDCARD_UNSAFE: ``uv run pytest``, ``docker run --rm alpine``)."""
+    if hardline.wildcard_unsafe(sub):
+        return sub
+    return hardline.command_prefix(sub) or sub
+
+
+def exact_rule_pattern(command: str) -> str | None:
+    """``command`` as an exact rule pattern (leading assignments dropped), or None when it cannot be one."""
+    command = _drop_assignments(command.strip())
+    return command if command and not _INEXACT.search(command) else None
+
+
 def suggest_rules(tool: str, dec: Decision) -> list[Rule]:
     """Narrowest rules to persist for an ``always``/``session`` approval."""
     if tool == "bash":
         # "<prefix> *" matches "git commit" and "git commit -m x" but not "git commit-tree"/"shutdown".
         # Never for launchers (shells, ssh, interpreters, xargs, find, sudo ...): "always allow `python3 *`" would
         # allow every command the user will ever be asked about.
+        # For the commands whose arguments name what runs (uv, npx, make, docker run ...) only the exact command.
         # A leading VAR=value is dropped: "always" on `API_KEY=sk-... curl x` wrote the key into config.yaml.
-        prefixes = (_drop_assignments(p) for p in dec.patterns)
-        return [
-            Rule(tool="bash", pattern=f"{p} *", action="allow")
-            for p in dict.fromkeys(prefixes)
-            if p and not hardline.is_launcher(p)
-        ]
+        out: list[Rule] = []
+        for p in dict.fromkeys(_drop_assignments(p) for p in dec.patterns):
+            if not p or hardline.is_launcher(p):
+                continue
+            pattern = exact_rule_pattern(p) if hardline.wildcard_unsafe(p) else f"{p} *"
+            if pattern:
+                out.append(Rule(tool="bash", pattern=pattern, action="allow"))
+        return out
     name = "edit" if tool in EDIT_TOOLS else "read" if tool in READ_TOOLS else tool
     return [Rule(tool=name, pattern=p, action="allow") for p in dec.patterns]

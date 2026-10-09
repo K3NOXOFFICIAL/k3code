@@ -122,6 +122,8 @@ ARITY: dict[str, int] = {
     "pulumi stack": 3,
     "pyenv": 2,
     "python": 2,
+    "python -m": 3,
+    "python3 -m": 3,
     "rake": 2,
     "rbenv": 2,
     "redis-cli": 2,

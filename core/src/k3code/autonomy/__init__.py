@@ -25,6 +25,9 @@ DEFAULTS: dict[str, Any] = {
     #: failed tool calls in a row before a cheap-tier task escalates. A loop-guard hit always escalates at once (the
     #: attempt stops there), so it has no key; M1 removed the unread ``loop_guard`` and ``judge_not_done`` keys.
     "escalate": {"tool_errors": 3},
+    #: failed tool calls in a row after which a main-tier turn stops and lists them (0 = never). A cheap/fast start
+    #: escalates after ``escalate.tool_errors`` instead.
+    "max_tool_errors": 8,
     #: name a new session from its first prompt (one cheap-tier call, background); opt-in
     "auto_title": False,
     "preview_timeout": 30,

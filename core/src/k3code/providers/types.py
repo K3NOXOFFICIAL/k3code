@@ -24,6 +24,26 @@ class Usage:
     completion_tokens: int = 0
     #: List-price cost reported by the provider itself (only the claude-cli provider does); None = unknown.
     cost_usd: float | None = None
+    #: Prompt tokens read from / written to the provider's prompt cache (part of prompt_tokens; 0 = none or unknown).
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+
+
+#: An Anthropic prompt-cache breakpoint: the prefix up to and including the block that carries it is cached.
+EPHEMERAL = {"type": "ephemeral"}
+
+
+def with_cache_breakpoint(content: Any) -> Any:
+    """``content`` (a message's string or block list) with a cache breakpoint on its last block; unchanged when it has
+    no block that can carry one (empty text is rejected by the API; an empty tool result is skipped the same way)."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content, "cache_control": EPHEMERAL}] if content else content
+    if isinstance(content, list) and content:
+        last = content[-1]
+        body = {"text": "text", "tool_result": "content"}.get(str(last.get("type")))
+        if body is None or last.get(body):
+            return [*content[:-1], {**last, "cache_control": EPHEMERAL}]
+    return content
 
 
 @dataclass
@@ -117,15 +137,47 @@ def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
     return out
 
 
+def _text_blocks(content: Any) -> list[dict[str, Any]]:
+    """A user message's content as a block list (string content becomes one text block, empty text none)."""
+    if isinstance(content, list):
+        return list(content)
+    return [{"type": "text", "text": content}] if content else []
+
+
+def _attach_reminders(entry: dict[str, Any], reminders: list[dict[str, Any]]) -> None:
+    """Add reminder blocks to a user entry: after its tool_result blocks (the API wants those first), else before."""
+    blocks = _text_blocks(entry["content"])
+    has_results = any(b.get("type") == "tool_result" for b in blocks)
+    entry["content"] = blocks + reminders if has_results else reminders + blocks
+
+
 def messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str, Any]]]:
-    """Split messages into (system, rest) for the Anthropic messages API."""
+    """Split messages into (system, rest) for the Anthropic messages API.
+
+    Only the leading system messages become the system prompt. A system message later in the conversation (the loop
+    guard's note) is sent as a ``<system-reminder>`` text block inside the adjacent user message: hoisting it into the
+    system prompt rewrote the start of every request from then on, so the provider's prompt cache missed for the whole
+    rest of the turn. It joins the user message before it (the tool results it follows), else the next one, so it sits
+    at the same place in every later request; the API wants user and assistant turns to alternate.
+    """
     system_parts: list[str] = []
     rest: list[dict[str, Any]] = []
+    leading = True
+    pending: list[dict[str, Any]] = []
     for m in normalize_tool_pairs(messages):
         if m.role == "system":
-            if m.content:
+            if not m.content:
+                continue
+            if leading:
                 system_parts.append(m.content)
+                continue
+            reminder = {"type": "text", "text": f"<system-reminder>\n{m.content}\n</system-reminder>"}
+            if rest and rest[-1]["role"] == "user":
+                _attach_reminders(rest[-1], [reminder])
+            else:
+                pending.append(reminder)
             continue
+        leading = False
         if m.role == "assistant":
             blocks: list[dict[str, Any]] = []
             if m.content:
@@ -136,20 +188,24 @@ def messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str, 
                 rest.append({"role": "assistant", "content": blocks})
             continue
         if m.role == "tool":
-            rest.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": m.tool_call_id or "",
-                            "content": m.content or "",
-                        }
-                    ],
-                }
-            )
-            continue
-        rest.append({"role": "user", "content": m.content or ""})
+            entry: dict[str, Any] = {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": m.tool_call_id or "",
+                        "content": m.content or "",
+                    }
+                ],
+            }
+        else:
+            entry = {"role": "user", "content": m.content or ""}
+        if pending:
+            _attach_reminders(entry, pending)
+            pending = []
+        rest.append(entry)
+    if pending:  # notes after an assistant message with no user message after them yet
+        rest.append({"role": "user", "content": pending})
     return "\n\n".join(system_parts), rest
 
 

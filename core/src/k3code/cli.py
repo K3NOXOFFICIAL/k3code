@@ -92,6 +92,14 @@ def _build_reliability(config: Any, session: str) -> Reliability:
     return build_reliability(config, session=session, home=k3code_home())
 
 
+async def _reap_jobs(session: str) -> None:
+    """Kill the run's background bash jobs: their process groups (start_new_session) would outlive the CLI."""
+    from k3code.tools import jobs
+
+    with contextlib.suppress(Exception):
+        await jobs.reap(session)
+
+
 async def _run_headless(
     prompt: str,
     *,
@@ -182,6 +190,7 @@ async def _run_headless(
         logger.exception("Agent failed")
         return {"error": "agent_error", "message": str(e)}
     finally:
+        await _reap_jobs(session)  # no background bash job outlives the run
         await reliability.stop()
 
 
@@ -311,6 +320,7 @@ async def _run_repl(
         except Exception as e:
             logger.exception("REPL turn failed")
             print(f"\n[Error] {e}")
+    await _reap_jobs(loop.session_id)
     await reliability.stop()
 
 

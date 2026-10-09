@@ -20,6 +20,7 @@ def turn(
     memory: int = 500,
     skills: list[int] | None = None,
     user: str | None = None,
+    tool: str = "grep",  # a tool the clip applies to: read keeps its own budget
 ):
     msgs = [Message(role="system", content="system " + "s" * 100), Message(role="user", content=user or f"task {i}")]
     for k in range(tools):
@@ -27,10 +28,10 @@ def turn(
             Message(
                 role="assistant",
                 content=None,
-                tool_calls=[ToolCall(id=f"c{k}", name="read", arguments={"path": f"f{k}.py"})],
+                tool_calls=[ToolCall(id=f"c{k}", name=tool, arguments={"path": f"f{k}.py"})],
             )
         )
-        msgs.append(Message(role="tool", content="x" * tool_chars, tool_call_id=f"c{k}", name="read"))
+        msgs.append(Message(role="tool", content="x" * tool_chars, tool_call_id=f"c{k}", name=tool))
     msgs.append(Message(role="assistant", content=f"answer {i}"))
     return build_record(
         turn=f"t{i}",
@@ -61,6 +62,20 @@ def test_clip_candidate_reports_the_token_reduction_and_the_pass_bound():
     result = evaluate_sync(turns, Candidate("clip", clip_chars=1000))
     assert result["token_reduction_pct"] > 0 and result["changed_turns"] == 10
     assert result["pass_rate_before"] == 1.0 and result["pass_drop_points"] == round(100 * 10 / 11, 2)
+
+
+def test_the_clip_candidate_leaves_read_results_to_their_own_budget():
+    # the wire sends a read result whole up to its own budget, whatever tool_output_chars says: so does the replay
+    reads = [turn(i, tool_chars=20_000, tool="read") for i in range(4)]
+    assert reads[0]["entries"][3] == {"r": "tool", "n": 20_000, "t": "read"}
+    result = evaluate_sync(reads, Candidate("clip", clip_chars=1000))
+    assert result["tokens_before"] == result["tokens_after"] and result["changed_turns"] == 0
+    # other tools are clipped, and so are results recorded before the tool name was kept
+    greps = [turn(i, tool_chars=20_000) for i in range(4)]
+    old = [{**t, "entries": [{k: v for k, v in e.items() if k != "t"} for e in t["entries"]]} for t in reads]
+    for turns in (greps, old):
+        clipped = evaluate_sync(turns, Candidate("clip", clip_chars=1000))
+        assert clipped["tokens_after"] < clipped["tokens_before"] and clipped["changed_turns"] == 4
 
 
 def test_memory_and_skill_candidates_cut_the_system_prompt_only():

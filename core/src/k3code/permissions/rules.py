@@ -20,6 +20,8 @@ from . import wildcard
 Action = Literal["allow", "ask", "deny"]
 
 ACTION_RANK: dict[str, int] = {"allow": 1, "ask": 2, "deny": 3}
+#: Rule.layer values as assigned by merge(builtin, user, project, session).
+USER_LAYER, PROJECT_LAYER, SESSION_LAYER = 1, 2, 3
 
 
 @dataclass(frozen=True)
@@ -77,9 +79,12 @@ def evaluate(tool: str, pattern: str, ruleset: list[Rule], *, default: Action = 
 
     Most specific pattern wins; ties go to the later source (session > project >
     user > builtin), then deny > ask > allow. Falls back to ``{"tool": tool, "pattern": "*", action: default}``.
+    User config wins over a project's: a project allow never overrides a matching user (or session) deny, however
+    specific it is (a cloned repo's ``git push origin *: allow`` beat the user's ``git push *: deny``).
     """
     best: Rule | None = None
     best_key: tuple[int, ...] = (-1, -1, -1, -1)
+    vetoes: list[tuple[tuple[int, ...], Rule]] = []  # user/session denies that a project allow must not override
     for index, rule in enumerate(ruleset):
         if not wildcard.match(tool, rule.tool):
             continue
@@ -92,8 +97,12 @@ def evaluate(tool: str, pattern: str, ruleset: list[Rule], *, default: Action = 
         if not wildcard.match(pattern, rule.pattern):
             continue
         key = (specificity, rule.layer, ACTION_RANK[rule.action], index)
+        if rule.action == "deny" and rule.layer in (USER_LAYER, SESSION_LAYER):
+            vetoes.append((key, rule))
         if key >= best_key:
             best, best_key = rule, key
     if best is None:
         return Rule(tool=tool, pattern="*", action=default)
+    if best.action == "allow" and best.layer == PROJECT_LAYER and vetoes:
+        return max(vetoes, key=lambda v: v[0])[1]
     return best
