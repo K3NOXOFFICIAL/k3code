@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from k3code.paths import home, project_state_dir
+from k3code.paths import ensure_private_dir, home, private_file, project_state_dir
 from k3code.redact import REDACTED, scrub_text
 
 PROJECT_FILES = ("K3CODE.md", "AGENTS.md", "CLAUDE.md")  # all that exist are read, in this order
@@ -79,8 +79,9 @@ def read_learned(cwd: str | Path) -> list[str]:
 
 def write_learned(cwd: str | Path, facts: list[str]) -> Path:
     path = learned_notes_path(cwd)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(LEARNED_HEADING + "\n\n" + "".join(f"- {f}\n" for f in facts), encoding="utf-8")
+    ensure_private_dir(path.parent)
+    body = LEARNED_HEADING + "\n\n" + "".join(f"- {f}\n" for f in facts)
+    private_file(path).write_text(body, encoding="utf-8")  # 0600 whatever the umask; write_text keeps the mode
     return path
 
 

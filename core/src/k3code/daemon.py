@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import sdnotify
-from k3code.paths import GATEWAY_ENV_VARS
+from k3code.paths import GATEWAY_ENV_VARS, ensure_private_dir
 
 logger = logging.getLogger("k3code.daemon")
 
@@ -59,8 +59,6 @@ def record_restart(home: Path | None = None, now: float | None = None) -> int:
         data = json.loads(path.read_text())
         stamps = [float(t) for t in data if now - float(t) < RESTART_WINDOW_S]
     stamps.append(now)
-    from k3code.gateway.auth import ensure_private_dir
-
     ensure_private_dir(path.parent)
     path.write_text(json.dumps(stamps))
     return len(stamps)
