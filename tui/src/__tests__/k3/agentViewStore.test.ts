@@ -105,6 +105,27 @@ describe("buildViewRows", () => {
     expect(byId[0]).toMatchObject({ current: true, group: "input", id: "x" });
   });
 
+  it("picks the current row by id over a stale `current` flag, and by the flag only when the id is unknown", () => {
+    const stale: SessionActiveItem[] = [
+      { current: true, id: "old", status: "idle", title: "Old" },
+      { id: "me", status: "working", title: "Me" },
+    ];
+
+    expect(
+      build({ currentSid: "me", sessions: stale })
+        .filter((r) => r.current)
+        .map((r) => r.id),
+    ).toEqual(["me"]);
+    expect(
+      build({ currentSid: null, sessions: stale })
+        .filter((r) => r.current)
+        .map((r) => r.id),
+    ).toEqual(["old"]);
+    expect(
+      build({ currentSid: "gone", sessions: stale }).filter((r) => r.current),
+    ).toEqual([]);
+  });
+
   it("carries model and last_active from the live session", () => {
     const rows = build({ sessions });
 
@@ -304,6 +325,29 @@ describe("reduceViewKey", () => {
     expect(press(at(2), { ch: "n" }).effect).toEqual({ type: "new" });
     expect(press(at(2), { escape: true }).effect).toEqual({ type: "close" });
     expect(press(at(2), { left: true }).effect).toEqual({ type: "close" });
+  });
+
+  it("ignores n, x and y chords with Ctrl or Meta; arrows, ⏎ and esc still work", () => {
+    for (const mod of [{ ctrl: true }, { meta: true }]) {
+      for (const ch of ["n", "x", "y", "N"]) {
+        const r = press(at(1), { ch, ...mod });
+
+        expect(r.effect).toBeNull();
+        expect(r.nav).toEqual(at(1));
+      }
+
+      const ask = press(at(1), { ch: "x" }).nav;
+
+      expect(press(ask, { ch: "y", ...mod }).effect).toBeNull();
+      expect(press(at(1), { down: true, ...mod }).nav).toEqual(at(2));
+      expect(press(at(1), { return: true, ...mod }).effect).toEqual({
+        row: ROWS[1],
+        type: "activate",
+      });
+      expect(press(at(1), { escape: true, ...mod }).effect).toEqual({
+        type: "close",
+      });
+    }
   });
 
   it("swallows every other key without an effect", () => {

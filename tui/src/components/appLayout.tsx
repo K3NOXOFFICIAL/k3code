@@ -10,7 +10,6 @@ import {
   useEffect,
   useMemo,
   useRef,
-  useState,
 } from "react";
 
 import { useGateway } from "../app/gatewayContext.js";
@@ -609,17 +608,19 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
   actions,
 }: Pick<AppLayoutProps, "actions">) {
   const { gw } = useGateway();
-  // The session the view was opened from (for `k3code agents`, the one forged at startup).
-  const [originSid] = useState(() => getUiState().sid);
   const close = () => patchOverlayState({ agentView: false });
-  // Leaving it for another session closes it when it is still empty; resuming already closes the session it leaves.
-  const dropSid = () =>
-    originSid &&
-    isDisposableEmptySession(
-      $stripSessions.get().find((s) => s.id === originSid),
-    )
+  // Leaving the current session for another one closes it when it is still empty; resuming already closes the session
+  // it leaves. Read at action time: `k3code agents` opens the view before the startup session exists.
+  const dropSid = () => {
+    const originSid = getUiState().sid;
+
+    return originSid &&
+      isDisposableEmptySession(
+        $stripSessions.get().find((s) => s.id === originSid),
+      )
       ? originSid
       : undefined;
+  };
 
   const activate = ({ kind, ...row }: ViewRow) => {
     // A live session attaches like Enter in the strip; an earlier one is resumed like the session switcher does

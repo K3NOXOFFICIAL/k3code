@@ -17,6 +17,7 @@ import { StatusRule } from "../components/appChrome.js";
 import { AppLayout } from "../components/appLayout.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import { AGENT_VIEW_HINT } from "../k3/agentView.js";
+import { $stripSessions } from "../k3/agentStripStore.js";
 import { DEFAULT_THEME } from "../theme.js";
 
 type StatusRuleProps = React.ComponentProps<typeof StatusRule>;
@@ -79,6 +80,8 @@ const mountTree = (tree: React.ReactElement, { interactive = false } = {}) => {
       output = "";
     },
     output: () => stripAnsi(output),
+    /** Type into the tree's stdin (interactive mounts only). */
+    press: (keys: string) => stdin.write(keys),
   };
 };
 
@@ -204,13 +207,17 @@ const layoutProps: AppLayoutProps = {
 const mountLayout = (
   overlay: Partial<OverlayState> = {},
   ui: Partial<UiState> = {},
+  actions: Partial<AppLayoutProps["actions"]> = {},
 ) => {
   patchUiState({ sessionTitle: "test", sid: "sid-1", status: "ready", ...ui });
   patchOverlayState(overlay);
 
   return mountTree(
     <GatewayProvider value={gatewayStub}>
-      <AppLayout {...layoutProps} />
+      <AppLayout
+        {...layoutProps}
+        actions={{ ...layoutProps.actions, ...actions }}
+      />
     </GatewayProvider>,
     { interactive: true },
   );
@@ -520,4 +527,48 @@ describe("AppLayout status-rule visibility", () => {
     expect(layout.output()).not.toContain("~/repo");
     expect(oneSecondTimers(intervalSpy)).toBe(0);
   });
+});
+
+describe("AppLayout agent view: leaving the startup session", () => {
+  afterEach(() => {
+    $stripSessions.set([]);
+  });
+
+  // `k3code agents` opens the view on gateway.ready, before the startup session exists; it arrives afterwards.
+  it.each([
+    ["n", "newLiveSession", ["s1"]],
+    ["\r", "activateLiveSession", ["s2", "s1"]],
+  ] as const)(
+    "%j closes the empty session forged after the view opened",
+    async (key, method, args) => {
+      const spy = vi.fn();
+      const layout = mountLayout(
+        { agentView: true },
+        { sid: null },
+        {
+          [method]: spy,
+        },
+      );
+
+      await flush();
+      patchUiState({ sid: "s1" });
+      $stripSessions.set([
+        {
+          current: true,
+          id: "s1",
+          message_count: 0,
+          status: "idle",
+          title: "startup",
+        },
+        { id: "s2", status: "working", title: "busy one" },
+      ]);
+      await vi.waitFor(() => expect(layout.output()).toContain("busy one"));
+
+      // s2 (working) is listed first, so ⏎ attaches to it.
+      layout.press(key);
+
+      await vi.waitFor(() => expect(spy).toHaveBeenCalled());
+      expect(spy).toHaveBeenCalledWith(...args);
+    },
+  );
 });

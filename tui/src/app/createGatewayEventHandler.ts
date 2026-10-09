@@ -862,7 +862,11 @@ export function createGatewayEventHandler(
     // users aren't surprised.  (Shares the memoized full-config read.)
     getFullConfigOnce()
       .then((cfg) => {
-        if (!cfg?.config?.display?.tui_auto_resume_recent) {
+        // `k3code agents` wins over auto-resume: resuming closes the agent view it just opened.
+        if (
+          !cfg?.config?.display?.tui_auto_resume_recent ||
+          STARTUP_VIEW === "agents"
+        ) {
           patchUiState({ status: "forging session…" });
           newSession();
           scheduleStartupPrompt();

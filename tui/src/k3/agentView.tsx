@@ -55,6 +55,8 @@ const stateText = (row: ViewRow) =>
 
 export interface AgentViewViewProps {
   cols: number;
+  /** Short terminal: no spacer lines and no scroll indicators, so every line goes to the list. */
+  compact?: boolean;
   error?: null | string;
   /** Lines available to the grouped list (headers, rows and scroll indicators). */
   height: number;
@@ -67,6 +69,7 @@ export interface AgentViewViewProps {
 /** Presentation only: every session grouped by state, the selection kept in view. */
 export function AgentViewView({
   cols,
+  compact = false,
   error = null,
   height,
   loading = false,
@@ -90,9 +93,9 @@ export function AgentViewView({
   }
 
   const selLine = lines.findIndex((l) => l.type === "row" && l.index === index);
-  const overflow = lines.length > height;
-  // On overflow two lines go to the ↑/↓ indicators so the list never outgrows `height`.
-  const inner = overflow ? Math.max(1, height - 2) : height;
+  // On overflow two lines go to the ↑/↓ indicators (not in compact mode) so the list never outgrows `height`.
+  const overflow = !compact && lines.length > height;
+  const inner = overflow ? Math.max(1, height - 2) : Math.max(1, height);
   const [prevStart, setPrevStart] = useState(0);
   const win = visibleWindow(lines.length, selLine, inner, prevStart);
 
@@ -179,9 +182,9 @@ export function AgentViewView({
           {error}
         </Text>
       ) : null}
-      <Text> </Text>
+      {compact ? null : <Text> </Text>}
       {!rows.length ? (
-        <Text color={t.color.muted}>
+        <Text color={t.color.muted} wrap="truncate-end">
           {loading
             ? "Loading sessions…"
             : "No sessions yet - press n to start one"}
@@ -189,11 +192,18 @@ export function AgentViewView({
       ) : (
         <Box flexDirection="column">
           {above > 0 ? (
-            <Text color={t.color.muted}>{`  ↑ ${above} more`}</Text>
+            <Text color={t.color.muted} wrap="truncate-end">
+              {`  ↑ ${above} more`}
+            </Text>
           ) : null}
           {lines.slice(win.start, win.end).map((l) =>
             l.type === "header" ? (
-              <Text bold color={t.color.text} key={`group:${l.group}`}>
+              <Text
+                bold
+                color={t.color.text}
+                key={`group:${l.group}`}
+                wrap="truncate-end"
+              >
                 {VIEW_GROUP_LABEL[l.group]}
               </Text>
             ) : (
@@ -201,11 +211,13 @@ export function AgentViewView({
             ),
           )}
           {below > 0 ? (
-            <Text color={t.color.muted}>{`  ↓ ${below} more`}</Text>
+            <Text color={t.color.muted} wrap="truncate-end">
+              {`  ↓ ${below} more`}
+            </Text>
           ) : null}
         </Box>
       )}
-      <Text> </Text>
+      {compact ? null : <Text> </Text>}
       <Text color={t.color.muted} wrap="truncate-end">
         {AGENT_VIEW_HINT}
       </Text>
@@ -243,9 +255,13 @@ export function AgentViewPane({
   // The session's own workspace, not the TUI's launch directory: that one would show another project's history.
   const currentCwd = info?.cwd;
 
-  const cols = Math.max(40, (stdout?.columns ?? 80) - 1);
-  // header, spacer, spacer, footer (+ the error line)
-  const height = Math.max(3, (stdout?.rows ?? 24) - 4 - (error ? 1 : 0));
+  const termRows = stdout?.rows ?? 24;
+  // The real width, however narrow: a wider layout would wrap every line.
+  const cols = Math.max(1, (stdout?.columns ?? 80) - 1);
+  // Under 8 rows the spacers and scroll indicators go, so the list keeps what little room there is.
+  const compact = termRows < 8;
+  // header, spacer, spacer, footer (+ the error line); compact: header and footer only
+  const height = Math.max(1, termRows - (compact ? 2 : 4) - (error ? 1 : 0));
 
   useEffect(() => {
     let stopped = false;
@@ -318,11 +334,13 @@ export function AgentViewPane({
       rows,
       {
         ch,
+        ctrl: key.ctrl,
         down: key.downArrow,
         end: key.end,
         escape: key.escape,
         home: key.home,
         left: key.leftArrow,
+        meta: key.meta,
         pageDown: key.pageDown,
         pageUp: key.pageUp,
         return: key.return,
@@ -350,6 +368,7 @@ export function AgentViewPane({
   return (
     <AgentViewView
       cols={cols}
+      compact={compact}
       error={error}
       height={height}
       loading={loading}

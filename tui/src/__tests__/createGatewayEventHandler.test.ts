@@ -1246,6 +1246,38 @@ describe("createGatewayEventHandler", () => {
     },
   );
 
+  it("on gateway.ready with STARTUP_VIEW=agents and auto_resume on, keeps the agent view and forges instead of resuming", async () => {
+    const newSession = vi.fn();
+    // The real resumeById closes the agent view on entry.
+    const resumeById = vi.fn(() => patchOverlayState({ agentView: false }));
+    const ctx = buildCtx([]);
+
+    ctx.session.newSession = newSession;
+    ctx.session.resumeById = resumeById;
+    ctx.session.STARTUP_RESUME_ID = "";
+    ctx.session.STARTUP_VIEW = "agents";
+    ctx.gateway.rpc = vi.fn(async (method: string) => {
+      if (method === "config.get") {
+        return { config: { display: { tui_auto_resume_recent: true } } };
+      }
+
+      if (method === "session.most_recent") {
+        return { session_id: "sess-most-recent" };
+      }
+
+      return null;
+    });
+
+    createGatewayEventHandler(ctx)({
+      payload: {},
+      type: "gateway.ready",
+    } as any);
+
+    await vi.waitFor(() => expect(newSession).toHaveBeenCalled());
+    expect(resumeById).not.toHaveBeenCalled();
+    expect(getOverlayState().agentView).toBe(true);
+  });
+
   it("on gateway.ready after a crash, resumes the recovered session once and skips forge", async () => {
     const appended: Msg[] = [];
     const newSession = vi.fn();

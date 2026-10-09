@@ -65,9 +65,10 @@ export function buildViewRows({
     };
   };
 
-  const cur = sessions.find(
-    (s) => s.current || (currentSid != null && s.id === currentSid),
-  );
+  // By id first: a stale `current` flag on another row must not take the lead while the TUI knows its session.
+  const cur =
+    sessions.find((s) => s.id === currentSid) ??
+    (currentSid == null ? sessions.find((s) => s.current) : undefined);
   const strip = buildStripRows(subagents, sessions, nowMs, currentSid).map(
     (r) => live(r, false),
   );
@@ -111,11 +112,13 @@ export const IDLE_VIEW_NAV: ViewNav = { confirmKey: null, index: 0 };
 
 export type ViewKey = {
   ch?: string;
+  ctrl?: boolean;
   down?: boolean;
   end?: boolean;
   escape?: boolean;
   home?: boolean;
   left?: boolean;
+  meta?: boolean;
   pageDown?: boolean;
   pageUp?: boolean;
   return?: boolean;
@@ -163,7 +166,8 @@ export function reduceViewKey(
 ): { consumed: true; effect: null | ViewEffect; nav: ViewNav } {
   const last = rows.length - 1;
   const index = Math.max(0, Math.min(nav.index, last));
-  const ch = (key.ch ?? "").toLowerCase();
+  // With Ctrl/Meta held the letter is a chord (Ctrl+N, Ctrl+X), not a view command.
+  const ch = key.ctrl || key.meta ? "" : (key.ch ?? "").toLowerCase();
   const done = (effect: null | ViewEffect, next: Partial<ViewNav> = {}) => ({
     consumed: true as const,
     effect,

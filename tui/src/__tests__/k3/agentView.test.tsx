@@ -252,6 +252,101 @@ describe("AgentViewPane", () => {
     }
   });
 
+  it("fits a 30x6 terminal: nothing wraps and the list shrinks to what is left", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    $stripSessions.set([
+      {
+        current: true,
+        id: "cur",
+        status: "working",
+        title: "the session I came from",
+      },
+      { id: "a", status: "working", title: "alpha with a rather long title" },
+      { id: "b", status: "waiting", title: "bravo needs an answer" },
+      { id: "c", status: "failed", title: "charlie broke" },
+    ]);
+
+    const stdout = Object.assign(new PassThrough(), {
+      columns: 30,
+      isTTY: false,
+      rows: 6,
+    });
+    const frames: string[] = [];
+    // The pane sizes itself from useStdout(), which is always process.stdout.
+    const saved = ["columns", "rows"].map(
+      (k) => [k, Object.getOwnPropertyDescriptor(process.stdout, k)] as const,
+    );
+
+    Object.defineProperty(process.stdout, "columns", {
+      configurable: true,
+      value: 30,
+    });
+    Object.defineProperty(process.stdout, "rows", {
+      configurable: true,
+      value: 6,
+    });
+
+    stdout.on("data", (c) => frames.push(stripAnsi(c.toString())));
+
+    const view = renderSync(
+      <AgentViewPane
+        gw={
+          {
+            request: () => Promise.resolve({ sessions: [] }),
+          } as unknown as GatewayClient
+        }
+        onActivate={() => {}}
+        onClose={() => {}}
+        onNew={() => {}}
+        onStop={() => {}}
+      />,
+      {
+        patchConsole: false,
+        stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+        stdin: Object.assign(new PassThrough(), {
+          isTTY: true,
+          ref: () => {},
+          setRawMode: () => {},
+          unref: () => {},
+        }) as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+      },
+    );
+
+    try {
+      await vi.waitFor(() => expect(frames.join("")).not.toContain("loading"));
+
+      const out = (frames.filter((f) => f.trim()).at(-1) ?? "").trimEnd();
+      const lines = out.split("\n");
+
+      // header, four list lines, footer: no spacers, no ↑/↓ indicators
+      expect(lines).toHaveLength(6);
+      expect(lines[0]).toContain("Agents");
+      expect(lines[1]).toBe("Needs input");
+      expect(lines[2]).toContain("bravo");
+      expect(out).not.toMatch(/more/);
+      expect(lines.at(-1)).toContain("↑↓ select");
+
+      for (const line of lines) {
+        expect(line.length).toBeLessThanOrEqual(29);
+      }
+    } finally {
+      for (const [k, d] of saved) {
+        if (d) {
+          Object.defineProperty(process.stdout, k, d);
+        } else {
+          delete (process.stdout as unknown as Record<string, unknown>)[k];
+        }
+      }
+
+      view.unmount();
+      view.cleanup();
+      $stripSessions.set([]);
+      resetUiState();
+    }
+  });
+
   it("asks the gateway for the current project's earlier sessions only", async () => {
     resetUiState();
     patchUiState({
