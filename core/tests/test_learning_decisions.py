@@ -62,4 +62,26 @@ def test_secrets_scrubbed_from_log(tmp_path):
     log.record("config", subject="set key sk-abcdefghijklmnop", detail={"v": "Bearer abc.def"})
     row = log.query("config")[0]
     assert "sk-abc" not in row["subject"] and "abc.def" not in json.dumps(row["detail"])
-    assert scrub("api_key=hunter2") == "[redacted]"
+    # scrub is now redact.scrub_text: the variable name stays, the value goes
+    assert scrub("api_key=hunter2") == "api_key=<redacted>"
+
+
+SECRET_SHAPES = {
+    "postgres://alice:hunter2pass@db.myapp.example/app": "hunter2pass",
+    "deploy --password hunter2pass": "hunter2pass",
+    "--password hunter2pass": "hunter2pass",
+    "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA0abc\n-----END RSA PRIVATE KEY-----": "MIIEpAIBAAKCAQEA0abc",
+    "token github_pat_11ABCDEFG0123456789_abcdefghijklmnop": "github_pat_11ABCDEFG",
+    "slack xoxb-1234567890-abcdefghij": "xoxb-1234567890",
+    "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJl": "eyJzdWIiOiIxMjM0In0",
+}
+
+
+def test_scrub_catches_every_secret_shape(tmp_path):
+    for text, secret in SECRET_SHAPES.items():
+        assert secret not in scrub(text), text
+    log = DecisionLog(tmp_path)
+    for text in SECRET_SHAPES:
+        log.record("config", subject=text, detail={"cmd": text})
+    dumped = json.dumps(log.query("config"))
+    assert not [s for s in SECRET_SHAPES.values() if s in dumped]

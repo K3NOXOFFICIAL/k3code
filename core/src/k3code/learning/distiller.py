@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from k3code.autonomy.proposals import ProposalStore, dedup_key
-from k3code.learning.decisions import DecisionLog, scrub
+from k3code.learning.decisions import DecisionLog
 from k3code.providers.types import Message
+from k3code.redact import scrub_text
 from k3code.routing.tiers import TaskKind
 
 HEADING = "## Learned preferences (auto)"
@@ -134,7 +135,7 @@ async def polish(caller: Any, prefs: list[Preference], *, session_id: str = "") 
         items = json.loads(m.group(0)) if m else []
     except Exception:  # noqa: BLE001
         return prefs
-    new = {str(i.get("key")): scrub(str(i.get("text", "")).strip()) for i in items if isinstance(i, dict)}
+    new = {str(i.get("key")): scrub_text(str(i.get("text", "")).strip()) for i in items if isinstance(i, dict)}
     for p in prefs:
         t = new.get(p.key)
         if t and len(t) <= 160 and "\n" not in t:
