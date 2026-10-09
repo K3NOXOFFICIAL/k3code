@@ -427,3 +427,53 @@ def test_daemon_sweeps_while_a_stdio_process_holds_the_session(tmp_path):
     assert daemon_store.sweep_empty(now=now) == 0  # it has a message now
     daemon_store.close()
     stdio_store.close()
+
+
+# --- the sweep reads its candidates outside the transaction that deletes them: another process may save in the gap
+
+
+def _raced_save(other: SessionStore, held: StoredSession) -> None:
+    held.messages = [{"role": "user", "content": "typed while the sweep ran"}]
+    other.save(held)
+
+
+def _raw(sql: str):
+    """One column changed behind ``save``'s back (``updated_at`` stays old), so each condition is pinned alone."""
+
+    def change(other: SessionStore, held: StoredSession) -> None:
+        other._db.execute(sql, (held.session_id,))
+        other._db.commit()
+
+    return change
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        _raced_save,
+        _raw("""UPDATE sessions SET messages = '[{"role": "user", "content": "x"}]' WHERE session_id = ?"""),
+        _raw("UPDATE sessions SET title = 'named meanwhile' WHERE session_id = ?"),
+        _raw("""UPDATE sessions SET meta = '{"mode": "plan"}' WHERE session_id = ?"""),
+        _raw("UPDATE sessions SET updated_at = strftime('%s', 'now') WHERE session_id = ?"),
+    ],
+    ids=["save", "message", "title", "meta", "touched"],
+)
+def test_sweep_does_not_delete_a_row_saved_after_its_read(tmp_path, change):
+    db = tmp_path / "sessions.db"
+    daemon_store, stdio_store = SessionStore(db), SessionStore(db)  # two processes, two connections
+    now = time.time()
+    raced, idle = stdio_store.create(cwd="/proj"), stdio_store.create()
+    for sid in (raced.session_id, idle.session_id):
+        _age(daemon_store, sid, now - 31 * DAY)
+
+    def keep(sid: str) -> bool:  # runs after the batch read, before the delete: the gap another process can hit
+        if sid == raced.session_id:
+            change(stdio_store, raced)
+        return False
+
+    assert daemon_store.sweep_empty(now=now, keep=keep) == 1
+    assert daemon_store.get(raced.session_id) is not None
+    assert daemon_store.get(idle.session_id) is None
+    assert _tombstones(daemon_store) == {idle.session_id: now}
+    daemon_store.close()
+    stdio_store.close()

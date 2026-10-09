@@ -254,7 +254,9 @@ class SessionStore:
         """
         now = self._prune_tombstones(now)
         ids = self._old_ids(now, max_age)
-        return sum(self._sweep_batch(ids[i : i + SWEEP_BATCH], keep, now) for i in range(0, len(ids), SWEEP_BATCH))
+        return sum(
+            self._sweep_batch(ids[i : i + SWEEP_BATCH], keep, now, max_age) for i in range(0, len(ids), SWEEP_BATCH)
+        )
 
     async def sweep_empty_async(
         self,
@@ -269,7 +271,7 @@ class SessionStore:
         ids = self._old_ids(now, max_age)
         deleted = 0
         for i in range(0, len(ids), SWEEP_BATCH):
-            deleted += self._sweep_batch(ids[i : i + SWEEP_BATCH], keep, now)
+            deleted += self._sweep_batch(ids[i : i + SWEEP_BATCH], keep, now, max_age)
             await asyncio.sleep(0)
         return deleted
 
@@ -285,20 +287,31 @@ class SessionStore:
         cutoff = now - max_age
         return [r[0] for r in self._db.execute("SELECT session_id FROM sessions WHERE updated_at < ?", (cutoff,))]
 
-    def _sweep_batch(self, ids: list[str], keep: Callable[[str], bool], now: float) -> int:
+    def _sweep_batch(self, ids: list[str], keep: Callable[[str], bool], now: float, max_age: float) -> int:
         marks = ",".join("?" * len(ids))
         rows = self._db.execute(
             f"SELECT session_id, title, meta FROM sessions WHERE session_id IN ({marks}) AND messages IN ('', '[]')",  # noqa: S608
             ids,
         ).fetchall()
         doomed = [sid for sid, title, meta in rows if not title and meta in ("", "{}") and not keep(sid)]
+        deleted = 0
         with self._db:  # a row and its tombstone go together or not at all
             for sid in doomed:
-                self._db.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+                # the read above ran outside this transaction: another process may have saved the row since, so the
+                # DELETE repeats every condition of the read and the guard (same shape, in SQL) and may match nothing
+                cur = self._db.execute(
+                    "DELETE FROM sessions WHERE session_id = ? AND messages IN ('', '[]') AND updated_at < ?"
+                    " AND (title IS NULL OR title = '') AND meta IN ('', '{}')",
+                    (sid, now - max_age),
+                )
+                if cur.rowcount != 1:
+                    logger.info("empty-session sweep left %s alone: it changed or went while the sweep ran", sid)
+                    continue
                 self._db.execute(
                     "INSERT OR REPLACE INTO swept_sessions (session_id, swept_at) VALUES (?, ?)", (sid, now)
                 )
-        return len(doomed)
+                deleted += 1
+        return deleted
 
     def most_recent(self) -> StoredSession | None:
         """The session to continue: the newest one the user worked in (cron/loop/automation runs and sessions with no
