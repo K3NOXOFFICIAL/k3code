@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -186,6 +188,9 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path) -> 
     assert (tmp_path / ".local" / "share" / "k3code" / "current").is_symlink()
     shim = (appdata / "k3code" / "bin" / "k3code.cmd").read_text()
     assert f'--exec sh -lc "exec {tmp_path}/.local/bin/k3code \\"$@\\"" k3code %*' in shim
+    # at a drive root %CD% is C:\ and its backslash would escape the closing quote of --cd "...": it is doubled
+    assert 'if "%K3_CD:~-1%"=="\\" set "K3_CD=%K3_CD%\\"' in shim.splitlines()
+    assert ' --cd "%K3_CD%" ' in shim
     assert not (appdata / "k3code" / "bin" / "k3.cmd").exists()  # no k3 binary was built
 
     r = ps("uninstall.ps1")
@@ -646,6 +651,122 @@ def test_activation_restarts_a_running_daemon_and_keeps_its_version(tmp_path: Pa
     restarts = calls.read_text().count("restart k3code.service")
     install()  # the same version again: nothing switched, so no restart
     assert calls.read_text().count("restart k3code.service") == restarts
+
+
+# mv stand-ins: GNU mv (-T), BSD/macOS mv (no -T; -h does the same), and an mv with neither (the ln -sfn fallback).
+# Each logs where DATA/current points at the moment it is asked to replace it, then does the move with the real mv.
+MV_FLAVOURS = {
+    "gnu": "",
+    "bsd": '  -T) echo "mv: illegal option -- T" >&2; exit 64 ;;\n  -h) shift; exec "$REAL_MV" -T "$@" ;;\n',
+    "none": '  -T | -h) echo "mv: illegal option" >&2; exit 64 ;;\n',
+}
+
+
+@pytest.mark.parametrize("flavour", sorted(MV_FLAVOURS))
+def test_switching_versions_replaces_current_in_one_rename(tmp_path: Path, flavour: str) -> None:
+    real_mv = shutil.which("mv")
+    assert real_mv
+    seen = tmp_path / "mv.log"
+    body = (
+        f'REAL_MV="{real_mv}"\nfor a; do last=$a; done\n'
+        f'case "$last" in */current) printf "%s %s\\n" "$1" "$(readlink "$last")" >>"{seen}" ;; esac\n'
+        f'case "$1" in\n{MV_FLAVOURS[flavour]}esac\nexec "$REAL_MV" "$@"\n'
+    )
+    stubs = stub_bin(tmp_path, "mv", body)
+    src = _mini_checkout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    current = home / DATA_REL / "current"
+    assert run(home, src / "install" / "install.sh", "--from-source", "--minimal", path_front=stubs).returncode == 0
+    v1 = os.readlink(current)
+    (src / "VERSION").write_text("9.9.9\n\n")  # uncommitted edit: a second version
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    v2 = os.readlink(current)
+    assert v2 != v1 and Path(v2).name in r.stderr and (Path(v2) / ".complete").is_file()
+    assert not [p.name for p in (home / DATA_REL).iterdir() if p.name.startswith(".current.")]  # no temp link left
+    if flavour != "none":
+        # the rename over the old link is what switches versions: until that instant readers still see v1
+        assert f"{'-T' if flavour == 'gnu' else '-h'} {v1}" in seen.read_text().splitlines()
+
+
+def _path_without(root: Path, name: str) -> str:
+    """This PATH with NAME hidden: each directory holding NAME is replaced by a link farm of everything else."""
+    dirs = []
+    for i, d in enumerate(os.environ["PATH"].split(os.pathsep)):
+        if d and (Path(d) / name).exists():
+            farm = root / f"path-without-{name}-{i}"
+            farm.mkdir()
+            for entry in Path(d).iterdir():
+                if entry.name != name:
+                    (farm / entry.name).symlink_to(entry)
+            d = str(farm)
+        dirs.append(d)
+    return os.pathsep.join(dirs)
+
+
+@linux_only
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
+@pytest.mark.parametrize("answer", ["y", "n"])
+def test_bwrap_install_is_asked_on_the_terminal_though_stdin_is_not_one(tmp_path: Path, answer: str) -> None:
+    # install.sh runs main with stdin from /dev/null (curl | sh has the script there): the question about sudo goes
+    # to the controlling terminal, /dev/tty, and only a yes typed there runs sudo
+    sudo_log = tmp_path / "sudo.log"
+    stubs = stub_bin(tmp_path, "sudo", f'echo "sudo $*" >>"{sudo_log}"\nexit 0\n')
+    stub_bin(tmp_path, "dnf", "exit 0\n")  # a package manager to name; the sudo stub never runs it
+    env = {
+        "PATH": f"{stubs}{os.pathsep}{_path_without(tmp_path, 'bwrap')}",
+        "HOME": str(tmp_path),
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "K3_STUB_VENV": "1",
+        "K3_SKIP_TUI": "1",
+        "K3_SKIP_GO": "1",
+        "K3_NO_GH": "1",
+    }  # no K3_NO_DOWNLOAD: that means --no-install-deps, which never offers bubblewrap
+    master, slave = os.openpty()
+    try:
+        # setsid --ctty: a new session whose controlling terminal is the pty, so the installer can open /dev/tty
+        proc = subprocess.Popen(
+            ["setsid", "--ctty", "sh", str(INSTALL), "--from-source", "--minimal"],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env=env,
+        )
+        os.close(slave)
+        slave = -1
+        out, answered = b"", False
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 1)
+            if ready:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # EIO: every writer to the terminal is gone
+                    break
+                if not chunk:
+                    break
+                out += chunk
+                if not answered and b"[y/N]" in out:
+                    os.write(master, answer.encode() + b"\n")
+                    answered = True
+            elif proc.poll() is not None:
+                break
+        if proc.poll() is None:
+            proc.kill()
+        rc = proc.wait()
+    finally:
+        os.close(master)
+        if slave >= 0:
+            os.close(slave)
+    text = out.decode(errors="replace")
+    assert rc == 0, text
+    assert "Install bubblewrap now with sudo" in text
+    if answer == "y":
+        assert "sudo dnf install -y bubblewrap" in sudo_log.read_text()
+    else:
+        assert not sudo_log.exists()
+        assert "needs root to install" in text
 
 
 def test_no_systemctl_call_without_a_k3code_unit(tmp_path: Path) -> None:
