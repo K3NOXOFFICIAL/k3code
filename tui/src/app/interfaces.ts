@@ -126,7 +126,7 @@ export interface GatewayProviderProps {
 export interface OverlayState {
   agents: boolean;
   agentsInitialHistoryIndex: number;
-  /** Sub-agent to open in detail view (Enter on its row in the agent strip); null opens the list. */
+  /** Sub-agent to open in detail view (→ or Enter on its row in the agent view); null opens the list. */
   agentsInitialAgentId: null | string;
   /** Full-screen agent view (`←` on an empty prompt, `/agents`): every session grouped by state. */
   agentView: boolean;

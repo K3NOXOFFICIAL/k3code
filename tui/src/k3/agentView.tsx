@@ -29,13 +29,12 @@ import {
   visibleWindow,
 } from "./agentViewStore.js";
 
-export const AGENT_VIEW_HINT = "↑↓ select · ⏎ attach · x stop · n new · ← back";
+export const AGENT_VIEW_HINT =
+  "↑↓ select · →/⏎ attach · x stop · n new · ←/esc back";
 
 const COUNT_LABEL: Record<ViewGroup, string> = {
-  finished: "finished",
-  idle: "idle",
+  completed: "completed",
   input: "need input",
-  past: "earlier",
   working: "working",
 };
 
@@ -135,7 +134,12 @@ export function AgentViewView({
       (confirm ? CONFIRM_TAG.length : 0);
     const titleW = Math.max(8, cols - fixed - 1);
     const title = compactPreview(row.title, Math.max(1, titleW - tag.length));
-    const ink = selected ? (style.color ?? t.color.text) : t.color.text;
+    // Earlier sessions are dimmed unless selected, so the live rows above them stand out.
+    const ink = selected
+      ? (style.color ?? t.color.text)
+      : row.kind === "past"
+        ? t.color.muted
+        : t.color.text;
 
     return (
       <Text
@@ -250,7 +254,8 @@ export function AgentViewPane({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<null | string>(null);
   const [navState, setNav] = useState<ViewNav>(IDLE_VIEW_NAV);
-  // The selection follows its row's key: the 1.5 s session poll can reorder or insert rows above it.
+  // The selection follows its row's key: the 1.5 s session poll can reorder or insert rows above it. Until the user
+  // moves, it rests on this session's row, where they came from.
   const [selKey, setSelKey] = useState<null | string>(null);
   const [now, setNow] = useState(Date.now);
   // The session's own workspace, not the TUI's launch directory: that one would show another project's history.
@@ -315,7 +320,11 @@ export function AgentViewPane({
   );
   const nav: ViewNav = {
     ...navState,
-    index: selectedIndex(rows, selKey, navState.index),
+    index: selectedIndex(
+      rows,
+      selKey ?? rows.find((r) => r.current)?.key ?? null,
+      navState.index,
+    ),
   };
   const working = rows.some((r) => r.state === "working");
 
@@ -345,6 +354,7 @@ export function AgentViewPane({
         pageDown: key.pageDown,
         pageUp: key.pageUp,
         return: key.return,
+        right: key.rightArrow,
         up: key.upArrow,
       },
       Math.max(1, height - 2),

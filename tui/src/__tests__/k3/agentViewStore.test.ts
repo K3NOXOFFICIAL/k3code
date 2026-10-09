@@ -69,7 +69,7 @@ describe("buildViewRows", () => {
     { id: "f1", status: "failed", title: "F1" },
   ];
 
-  it("orders groups input, working, finished, past and keeps the strip order inside a group", () => {
+  it("orders groups input, working, completed, keeps the strip order inside a group and ends with past rows", () => {
     const rows = build({
       past: [past("p1", 10)],
       sessions,
@@ -81,11 +81,12 @@ describe("buildViewRows", () => {
       ["cur", "working"],
       ["w1", "working"],
       ["a1", "working"],
-      ["f1", "finished"],
-      ["d1", "finished"],
-      ["a2", "finished"],
-      ["p1", "past"],
+      ["f1", "completed"],
+      ["d1", "completed"],
+      ["a2", "completed"],
+      ["p1", "completed"],
     ]);
+    expect(rows.at(-1)).toMatchObject({ kind: "past", state: "done" });
   });
 
   it("includes the current session once, flagged, found by `current` or by id", () => {
@@ -105,7 +106,7 @@ describe("buildViewRows", () => {
     expect(byId[0]).toMatchObject({ current: true, group: "input", id: "x" });
   });
 
-  it("shows the current session's last turn as failed (✗) or completed (✓), leading the finished group", () => {
+  it("shows the current session's last turn as failed (✗) or completed (✓), leading the Completed group", () => {
     for (const [status, state] of [
       ["failed", "failed"],
       ["completed", "done"],
@@ -119,7 +120,7 @@ describe("buildViewRows", () => {
       });
       const cur = rows.find((r) => r.current)!;
 
-      expect(cur).toMatchObject({ group: "finished", id: "cur", state });
+      expect(cur).toMatchObject({ group: "completed", id: "cur", state });
       expect(GLYPH[cur.state]).toBe(state === "failed" ? "✗" : "✓");
       expect(rows.map((r) => r.id)).toEqual(["w1", "cur", "f1"]);
       // the inline strip leaves the current session out, whatever its state
@@ -131,7 +132,7 @@ describe("buildViewRows", () => {
     }
   });
 
-  it("shows a session with no turn yet as idle (○) in its own group between working and finished", () => {
+  it("shows a session with no turn yet as idle (○) in the Completed group, which it leads", () => {
     const rows = build({
       sessions: [
         { id: "f1", status: "failed", title: "F1" },
@@ -141,12 +142,16 @@ describe("buildViewRows", () => {
     });
     const cur = rows.find((r) => r.current)!;
 
-    expect(cur).toMatchObject({ group: "idle", id: "cur", state: "idle" });
+    expect(cur).toMatchObject({
+      group: "completed",
+      id: "cur",
+      state: "idle",
+    });
     expect(GLYPH[cur.state]).toBe("○");
-    expect(rows.map((r) => [r.id, r.group])).toEqual([
-      ["w1", "working"],
-      ["cur", "idle"],
-      ["f1", "finished"],
+    expect(rows.map((r) => [r.id, r.group, r.state])).toEqual([
+      ["w1", "working", "working"],
+      ["cur", "completed", "idle"],
+      ["f1", "completed", "failed"],
     ]);
 
     // Enter on it closes the view; x does not arm a stop on the current session.
@@ -176,7 +181,7 @@ describe("buildViewRows", () => {
       });
 
       expect(rows[0]).toMatchObject({
-        group: "finished",
+        group: "completed",
         id: "cur",
         state: "done",
       });
@@ -192,9 +197,9 @@ describe("buildViewRows", () => {
     };
 
     expect(buildStripRows([], [bg], NOW).map((r) => r.state)).toEqual(["done"]);
-    // the view, which owns the idle reading, groups the same session as idle
+    // the view, which owns the idle reading, shows the same session as idle (in Completed)
     expect(build({ sessions: [bg] })).toMatchObject([
-      { group: "idle", id: "bg", state: "idle" },
+      { group: "completed", id: "bg", state: "idle" },
     ]);
   });
 
@@ -264,7 +269,7 @@ describe("buildViewRows", () => {
     expect(rows.map((r) => r.id)).toEqual(["new", "old"]);
     expect(rows[0]).toMatchObject({
       current: false,
-      group: "past",
+      group: "completed",
       key: "past:new",
       kind: "past",
       lastActive: 300,
@@ -334,7 +339,12 @@ const ROWS: ViewRow[] = [
   vrow("cur", { current: true }),
   vrow("s1"),
   vrow("a1", { key: "agent:a1", kind: "agent" }),
-  vrow("p1", { group: "past", key: "past:p1", kind: "past", state: "done" }),
+  vrow("p1", {
+    group: "completed",
+    key: "past:p1",
+    kind: "past",
+    state: "done",
+  }),
   vrow("s2"),
 ];
 
@@ -370,6 +380,44 @@ describe("reduceViewKey", () => {
       type: "activate",
     });
     expect(press(at(0), { return: true }).effect).toEqual({ type: "close" });
+  });
+
+  it("→ attaches to the selected row like ⏎, and closes on the current one", () => {
+    expect(press(at(1), { right: true }).effect).toEqual({
+      row: ROWS[1],
+      type: "activate",
+    });
+    expect(press(at(2), { right: true }).effect).toEqual({
+      row: ROWS[2],
+      type: "activate",
+    });
+    expect(press(at(3), { right: true }).effect).toEqual({
+      row: ROWS[3],
+      type: "activate",
+    });
+    expect(press(at(0), { right: true })).toEqual({
+      consumed: true,
+      effect: { type: "close" },
+      nav: at(0),
+    });
+    expect(press(at(1), { right: true }, [])).toEqual({
+      consumed: true,
+      effect: null,
+      nav: at(0),
+    });
+  });
+
+  it("→ cancels a pending stop confirmation instead of stopping or attaching", () => {
+    const ask = press(at(1), { ch: "x" }).nav;
+    const r = press(ask, { right: true });
+
+    expect(r.effect).toBeNull();
+    expect(r.nav).toEqual(at(1));
+    // the next → attaches as usual
+    expect(press(r.nav, { right: true }).effect).toEqual({
+      row: ROWS[1],
+      type: "activate",
+    });
   });
 
   it("x asks first; y or ⏎ stops", () => {

@@ -20,14 +20,6 @@ import { closeWidget, dispatchWidgetInput } from "../sdk/host.js";
 
 import { toggleFocusMode } from "../k3/focusPolicy.js";
 import { handleProposalKey } from "../k3/proposalsStore.js";
-import {
-  $stripNav,
-  $stripRows,
-  getStripHandlers,
-  IDLE_NAV,
-  reduceStripKey,
-  shouldEnterStrip,
-} from "../k3/agentStripStore.js";
 
 import { $agentDockCollapsed } from "./agentRoster.js";
 import { sendTurnToBackground } from "./backgroundSession.js";
@@ -71,7 +63,7 @@ export const composerHasDraft = (cState: {
 
 /**
  * `←` opens the agent view only from an idle, empty prompt: no text or multi-line buffer, no history walk or queue
- * edit, the strip not focused and no overlay up. Anywhere else `←` keeps moving the cursor.
+ * edit and no overlay up. Anywhere else `←` keeps moving the cursor.
  */
 export const shouldOpenAgentView = ({
   blocked,
@@ -80,7 +72,6 @@ export const shouldOpenAgentView = ({
   inputBuf,
   key,
   queueEditIdx,
-  stripFocused,
 }: {
   blocked: boolean;
   historyIdx: null | number;
@@ -88,7 +79,6 @@ export const shouldOpenAgentView = ({
   inputBuf: readonly string[];
   key: { ctrl?: boolean; leftArrow?: boolean; meta?: boolean; shift?: boolean };
   queueEditIdx: null | number;
-  stripFocused: boolean;
 }): boolean =>
   Boolean(key.leftArrow) &&
   !key.shift &&
@@ -98,13 +88,12 @@ export const shouldOpenAgentView = ({
   !inputBuf.length &&
   historyIdx === null &&
   queueEditIdx === null &&
-  !stripFocused &&
   !blocked;
 
 /**
  * Whether this Esc counts toward the double Esc that interrupts a running turn (Ctrl+C's interrupt, but the draft
- * stays). Only when nothing else owns Esc: no overlay, pager, picker, prompt or agent view up (`blocked`), the strip
- * not focused, no history walk or queue edit, and no modifier. `key.meta` is set on every Esc, so Alt comes from the
+ * stays). Only when nothing else owns Esc: no overlay, pager, picker, prompt or agent view up (`blocked`), no
+ * history walk or queue edit, and no modifier. `key.meta` is set on every Esc, so Alt comes from the
  * raw keypress (`\x1b\x1b` or a kitty CSI u).
  */
 export const escCountsTowardInterrupt = ({
@@ -114,7 +103,6 @@ export const escCountsTowardInterrupt = ({
   historyIdx,
   key,
   queueEditIdx,
-  stripFocused,
 }: {
   blocked: boolean;
   busy: boolean;
@@ -128,7 +116,6 @@ export const escCountsTowardInterrupt = ({
     super: boolean;
   };
   queueEditIdx: null | number;
-  stripFocused: boolean;
 }): boolean =>
   key.escape &&
   !key.alt &&
@@ -138,7 +125,6 @@ export const escCountsTowardInterrupt = ({
   busy &&
   hasSession &&
   !blocked &&
-  !stripFocused &&
   historyIdx === null &&
   queueEditIdx === null;
 
@@ -471,7 +457,6 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         super: key.super,
       },
       queueEditIdx: cState.queueEditIdx,
-      stripFocused: $stripNav.get().focused,
     });
 
     if (pairEsc && live.sid) {
@@ -501,12 +486,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     // The agent view owns Esc (it closes the view); counting it here would let the next Esc discard the draft.
-    if (
-      key.escape &&
-      !pairEsc &&
-      !$stripNav.get().focused &&
-      !overlay.agentView
-    ) {
+    if (key.escape && !pairEsc && !overlay.agentView) {
       const now = Date.now();
       const isDouble = now - lastEscRef.current <= DOUBLE_ESC_MS;
 
@@ -734,44 +714,8 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return;
     }
 
-    // Agent strip (below the composer). Precedence: a focused strip owns ↑/↓/Enter/Esc/x;
-    // ↓ enters it only from an empty input with no history cycle in progress.
-    const strip = $stripNav.get();
-
-    if (strip.focused) {
-      const r = reduceStripKey(strip, $stripRows.get(), {
-        ch,
-        down: key.downArrow,
-        escape: key.escape,
-        return: key.return,
-        up: key.upArrow,
-      });
-
-      if (r.consumed) {
-        $stripNav.set(r.nav);
-
-        if (r.effect) {
-          getStripHandlers()?.[r.effect.type]?.(r.effect.row);
-        }
-
-        return;
-      }
-    } else if (
-      key.downArrow &&
-      !key.shift &&
-      shouldEnterStrip({
-        historyIdx: cState.historyIdx,
-        input: cState.input,
-        rows: $stripRows.get().length,
-      }) &&
-      !cState.inputBuf.length &&
-      cState.queueEditIdx === null
-    ) {
-      $stripNav.set({ ...IDLE_NAV, focused: true });
-
-      return;
-    }
-
+    // The agent strip below the composer is read-only: ↑/↓ always stay with the prompt (queue, history, multi-line
+    // cursor) and its rows are managed in the agent view (←).
     // ← on an idle, empty prompt opens the agent view. In the view the same key closes it: this handler sees that
     // press while `isBlocked` is still true and returns above, so it cannot reopen the view.
     if (
@@ -782,7 +726,6 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         inputBuf: cState.inputBuf,
         key,
         queueEditIdx: cState.queueEditIdx,
-        stripFocused: strip.focused,
       })
     ) {
       patchOverlayState({ agentView: true });

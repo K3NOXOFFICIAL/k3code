@@ -243,7 +243,6 @@ describe("shouldOpenAgentView — ← opens the agent view only from an idle, em
     inputBuf: [] as string[],
     key: { leftArrow: true },
     queueEditIdx: null,
-    stripFocused: false,
   };
 
   it("opens on a plain ← with an empty prompt", () => {
@@ -266,8 +265,7 @@ describe("shouldOpenAgentView — ← opens the agent view only from an idle, em
     expect(shouldOpenAgentView({ ...idle, queueEditIdx: 0 })).toBe(false);
   });
 
-  it("does not open with the agent strip focused or an overlay up", () => {
-    expect(shouldOpenAgentView({ ...idle, stripFocused: true })).toBe(false);
+  it("does not open with an overlay up", () => {
     expect(shouldOpenAgentView({ ...idle, blocked: true })).toBe(false);
   });
 
@@ -295,7 +293,6 @@ describe("escCountsTowardInterrupt — only a bare Esc mid-turn that nothing els
     historyIdx: null,
     key: esc,
     queueEditIdx: null,
-    stripFocused: false,
   };
 
   it("counts a bare Esc mid-turn", () => {
@@ -309,11 +306,8 @@ describe("escCountsTowardInterrupt — only a bare Esc mid-turn that nothing els
     );
   });
 
-  it("leaves Esc to an overlay, prompt or agent view, the strip, a history walk or a queue edit", () => {
+  it("leaves Esc to an overlay, prompt or agent view, a history walk or a queue edit", () => {
     expect(escCountsTowardInterrupt({ ...running, blocked: true })).toBe(false);
-    expect(escCountsTowardInterrupt({ ...running, stripFocused: true })).toBe(
-      false,
-    );
     expect(escCountsTowardInterrupt({ ...running, historyIdx: 0 })).toBe(false);
     expect(escCountsTowardInterrupt({ ...running, queueEditIdx: 0 })).toBe(
       false,

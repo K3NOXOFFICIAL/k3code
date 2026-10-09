@@ -137,8 +137,7 @@ With a daemon running, `k3code attach <session-id>` opens the TUI on one of its 
 | `Ctrl+F` | Focus mode on/off (also `/focus`) |
 | `Ctrl+C` | Interrupt the running turn (clears the draft first if there is one) |
 | `Esc` | Close the open overlay; `Esc` `Esc` interrupts the running turn and keeps the draft (when idle it clears the draft) |
-| `↓` (empty input) | Move into the agent list under the input; `↑`/`↓` select, `Enter` opens that session, `x` stops it (asks first), `Esc` returns |
-| `←` (empty input) | Open the agent view: every session and sub-agent by state, plus earlier sessions of this project; `↑`/`↓` select, `Enter` attaches, `x` stops (asks first), `n` starts a new session, `←`/`Esc` go back (also `/agents`) |
+| `←` (empty input) | Open the agent view: every session and sub-agent grouped into Needs input, Working and Completed (earlier sessions of this project at the end of Completed); `↑`/`↓` select, `→` or `Enter` attaches, `x` stops (asks first), `n` starts a new session, `←`/`Esc` go back (also `/agents`). The agent list under the input only shows them |
 | `↑` / `↓` (in the input) | Walk through your previous inputs (kept per project) |
 | `Ctrl+B` | Send the running turn to the background |
 | `Alt+Y` / `Alt+N` | Accept / dismiss the top proposal card (a bare letter would steal the first character of your message) |

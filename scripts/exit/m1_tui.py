@@ -81,6 +81,35 @@ def wait_badge(t: Tui, want: bool, timeout: float = 10) -> bool:
     return False
 
 
+def wait_cs(t: Tui, pattern: str, timeout: float = 10) -> bool:
+    """Case-sensitive wait on the current screen (Tui.wait ignores case, so "Working" would match a strip row)."""
+    import time
+
+    rx = re.compile(pattern, re.M)
+    end = time.time() + timeout
+    while time.time() < end:
+        t.pump(0.4)
+        if rx.search(t.text()):
+            return True
+    return False
+
+
+VIEW_FOOTER = r"→/⏎ attach"
+VIEW_GROUP = r"\b(Needs input|Working|Completed)\b"
+STRIP_MARKER = r"›\s*[◐●✓✗○]"
+STRIP_ROW = r"^\s*[◐●✓✗○] {}.* · (working|needs input|idle|completed|failed)\b"  # a strip row by title
+
+
+def marker_line(t: Tui) -> str:
+    """The agent view row carrying the selection marker ("" when none)."""
+    return next((ln for ln in t.text().splitlines() if "›" in ln), "")
+
+
+def input_line(t: Tui) -> str:
+    """The composer line: the last prompt-glyph line on screen (the composer sits below the transcript)."""
+    return next((ln for ln in reversed(t.text().splitlines()) if "❯" in ln), "")
+
+
 def tail_screen(t: Tui, n: int = 14) -> str:
     return "\n".join(ln for ln in t.text().splitlines() if ln.strip())[-1800:] if n else ""
 
@@ -336,7 +365,8 @@ def bg_strip() -> str:
 @flow(
     "needs_input",
     "A needs-input approval from a /bg session is answered inline",
-    "TUI tape: bg session asks for bash approval; strip shows 'needs input'; Enter on the row attaches; answer",
+    "TUI tape: bg session asks for bash approval; strip shows 'needs input'; ← opens the agent view, Home + → "
+    "attaches the row; answer",
 )
 def needs_input() -> str:
     t, home, cwd = mk("ni", [bash_step("touch ni.txt"), TOOL_DONE])
@@ -345,17 +375,107 @@ def needs_input() -> str:
         need(
             t.wait(r"needs input · touch the file", 25, ever=True), "strip never showed needs input\n" + tail_screen(t)
         )
-        t.key("down")
+        t.key("left")
+        need(wait_cs(t, r"Needs input", 10), "agent view did not show the Needs input group\n" + tail_screen(t))
+        # The view opens on the current session's row (in Completed); Home selects the first row, the waiting session.
+        t.key("home")
         t.pump(0.5)
-        t.key("enter")
+        t.key("right")
         need(t.wait(r"approval required", 20), "approval dialog did not appear on attach\n" + tail_screen(t))
         t.key("enter")
         need(t.wait(r"turn-complete|ready", 20), "bg turn did not finish after answering")
         t.pump(2)
         need((cwd / "ni.txt").exists(), "approved command did not run")
         return (
-            "strip: '● … · needs input'; attached with Enter; "
+            "strip: '● … · needs input'; agent view group 'Needs input'; attached with Home + →; "
             "dialog 'approval required' answered 'Allow once'; ni.txt created"
+        )
+    finally:
+        t.close()
+
+
+@flow(
+    "agent_view_keys",
+    "Agent view keys: ← opens, ↑↓ select, → attaches, ←/esc back; ↑/↓ in a session stay with the prompt history",
+    "TUI tape: one prompt, /bg a slow bash; ↓ leaves the strip unselected; ← view; ↑↓ move '›'; → attaches; "
+    "← reopens, esc closes; ↑ recalls the earlier prompt",
+)
+def agent_view_keys() -> str:
+    t, home, cwd = mk(
+        "avk",
+        [
+            {"type": "text", "text": "hello-back", "match": "say himark"},
+            {
+                "type": "tool_call",
+                "id": "b",
+                "name": "bash",
+                "arguments": {"command": "sleep 25"},
+                "when": "turn_first",
+                "match": "run slowjob",
+            },
+            {"type": "text", "text": "slow-finished", "when": "turn_after_tool", "match": "run slowjob"},
+        ],
+        permission_mode="yolo",
+    )
+    try:
+        t.line("say himark")
+        need(t.wait(r"hello-back", 20), "first prompt got no answer\n" + tail_screen(t))
+        t.line("/bg run slowjob")
+        need(t.wait(r"working · run slowjob", 15, ever=True), "strip never showed the bg session\n" + tail_screen(t))
+
+        # The strip is read-only: ↓ on the empty prompt selects no row.
+        need(re.search(r"agents \(\d+\) · ← agent view", t.text()), "strip header not visible\n" + tail_screen(t))
+        t.key("down")
+        t.pump(0.6)
+        need(not re.search(STRIP_MARKER, t.text()), "↓ put a selection marker in the strip\n" + tail_screen(t))
+
+        t.key("left")
+        need(wait_cs(t, VIEW_FOOTER, 10), "agent view footer '→/⏎ attach' not shown\n" + tail_screen(t))
+        need(wait_cs(t, VIEW_GROUP, 5), "no Needs input/Working/Completed group header\n" + tail_screen(t))
+        groups = sorted(set(re.findall(VIEW_GROUP, t.text())))
+        start = marker_line(t)
+        need(start and "run slowjob" not in start, "view did not open on the current session's row\n" + t.text())
+
+        # Working sits above Completed, so ↑ from the current row selects the bg session and ↓ goes back.
+        t.key("up")
+        t.pump(0.5)
+        need("run slowjob" in marker_line(t), "↑ did not move '›' to the bg session\n" + t.text())
+        t.key("down")
+        t.pump(0.5)
+        need("run slowjob" not in marker_line(t), "↓ did not move '›' back\n" + t.text())
+        t.key("up")
+        t.pump(0.5)
+        need("run slowjob" in marker_line(t), "↑ did not reselect the bg session\n" + t.text())
+
+        t.key("right")
+        need(t.wait_gone(VIEW_FOOTER, 10), "→ did not leave the agent view\n" + tail_screen(t))
+        # Only an attach makes the busy session current: the composer shows its interrupt hint (the earlier session
+        # was idle) and the strip, which leaves the current session out, drops its row. A → that merely closed the
+        # view would leave the idle composer and the strip row '◐ run slowjob … · working'.
+        need(wait_cs(t, r"Esc Esc to interrupt", 10), "→ did not attach: composer not busy\n" + tail_screen(t))
+        need(
+            not re.search(STRIP_ROW.format("run slowjob"), t.text(), re.M),
+            "→ did not attach the bg session\n" + t.text(),
+        )
+
+        t.key("left")
+        need(wait_cs(t, VIEW_FOOTER, 10), "← on the empty prompt did not reopen the view\n" + tail_screen(t))
+        t.key("esc")
+        need(t.wait_gone(VIEW_FOOTER, 10), "esc did not close the agent view\n" + tail_screen(t))
+
+        # ↑ walks the per-project prompt history back to the earlier prompt.
+        need("say himark" not in input_line(t), "input not empty after closing the view\n" + tail_screen(t))
+        for _ in range(3):
+            t.key("up")
+            t.pump(0.5)
+            if "say himark" in input_line(t):
+                break
+        need("say himark" in input_line(t), "↑ did not recall the earlier prompt\n" + tail_screen(t))
+        return (
+            f"↓ left the strip unselected; ← view with groups {groups} and footer '→/⏎ attach', opened on the current "
+            "row; ↑/↓ moved '›' to the bg session and back; → attached it (composer busy, its strip row gone); "
+            "← reopened, esc closed; "
+            f"↑ recalled: {input_line(t).strip()!r}"
         )
     finally:
         t.close()

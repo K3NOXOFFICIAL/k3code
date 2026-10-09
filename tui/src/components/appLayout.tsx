@@ -48,7 +48,7 @@ import {
 import { AgentsOverlay } from "./agentsOverlay.js";
 import { AgentStrip } from "../k3/agentStrip.js";
 import { ProposalCards } from "../k3/proposalCards.js";
-import { $stripNav, getStripHandlers } from "../k3/agentStripStore.js";
+import { getStripHandlers } from "../k3/agentStripStore.js";
 import { AgentViewPane } from "../k3/agentView.js";
 import { type ViewRow } from "../k3/agentViewStore.js";
 import { focusVisibleMessages } from "../k3/focusPolicy.js";
@@ -307,7 +307,6 @@ const ComposerPane = memo(function ComposerPane({
 }) {
   const ui = useStore($uiState);
   const isBlocked = useStore($isBlocked);
-  const stripNav = useStore($stripNav);
   const sh = (composer.inputBuf[0] ?? composer.input).startsWith("!");
 
   const promptText = composerPromptText(
@@ -503,7 +502,6 @@ const ComposerPane = memo(function ComposerPane({
               >
                 {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
                 <TextInput
-                  focus={!stripNav.focused}
                   accentColor={ui.theme.color.accent}
                   color={ui.theme.color.text}
                   columns={inputColumns}

@@ -933,7 +933,7 @@ export function AgentsOverlay({
     }
   }, [history.length, historyIndex, liveSubagents.length]);
 
-  // Opened from the agent strip (↓ then Enter on a sub-agent row): land on that agent's detail view, once.
+  // Opened from the agent view (→ or Enter on a sub-agent row): land on that agent's detail view, once.
   const openedAgentRef = useRef(false);
 
   useEffect(() => {
