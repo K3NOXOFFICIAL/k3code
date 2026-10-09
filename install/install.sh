@@ -911,7 +911,11 @@ daemon_version() { # the versions/<name> the running k3code daemon executes from
   [ -d "/proc/$pid" ] || return 0
   real=$(cd "$DATA" 2>/dev/null && pwd -P) || real=$DATA
   # a venv python's exe is the base interpreter, so the version shows in its cwd or command line (the shebang path)
-  { readlink "/proc/$pid/exe" && readlink "/proc/$pid/cwd" && tr '\0' '\n' <"/proc/$pid/cmdline"; } 2>/dev/null |
+  {
+    readlink "/proc/$pid/exe"
+    readlink "/proc/$pid/cwd"
+    tr '\0' '\n' <"/proc/$pid/cmdline"
+  } 2>/dev/null |
     while IFS= read -r p; do
       case "$p" in
         "$DATA"/versions/*) p=${p#"$DATA"/versions/} ;;
