@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import service
-from k3code.config import Settings, load_config
+from k3code.config import Settings, default_project_dir, load_config
 from k3code.daemon import k3_home, socket_path
 from k3code.reliability.governor import read_psi
 from k3code.reliability.journal import ToolJournal
@@ -552,6 +552,28 @@ def check_searxng() -> Check:
     return Check("searxng", OK, "not configured (optional: set research.searxng_url or connect a SearXNG MCP server)")
 
 
+def check_project(project_dir: Path) -> Check:
+    """The project's ``.k3code``: content left unloaded because it is not trusted, and providers it cannot set."""
+    from k3code import confio, trust
+
+    problems: list[str] = []
+    if hint := trust.untrusted_hint(project_dir):
+        problems.append(hint)
+    cfg_path = trust.config_path(project_dir)
+    if trust.project_dir_of(cfg_path) is not None and cfg_path.is_file():
+        try:
+            raw = confio.read_yaml(cfg_path)
+        except Exception:  # noqa: BLE001 - an unreadable project config is reported by the trust prompt
+            raw = {}
+        if isinstance(raw, dict) and raw.get("providers"):
+            problems.append(f"{cfg_path} sets providers: ignored (only your user config can set providers)")
+        if isinstance(raw, dict) and raw.get("mem0"):
+            problems.append(f"{cfg_path} sets mem0: ignored (only your user config can set mem0)")
+    if problems:
+        return Check("project", WARN, "; ".join(problems), "`k3code trust` shows what the project changes")
+    return Check("project", OK, f"{trust.decision(project_dir)} ({project_dir})")
+
+
 def install_subset(home: Path | None = None) -> list[Check]:
     """What the installer prints after activation. Warnings only: no check here can fail an install.
 
@@ -586,6 +608,7 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
         # the probe runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
         await asyncio.to_thread(check_sandbox, probe),
         check_isolation(),
+        check_project(default_project_dir()),
     ]
     return checks
 

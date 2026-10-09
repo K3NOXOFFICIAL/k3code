@@ -82,15 +82,27 @@ def test_dismiss_latches(tmp_path):
 def test_auto_do_for_always_approved_high_risk_plans(tmp_path, monkeypatch):
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
     log = DecisionLog(tmp_path)
-    for _ in range(3):
-        log.record("plan", subject="confirm", choice="approved", detail={"risk": "high"})
+    # 10 approvals in one project (3 used to be enough, and the answer applied to every project)
+    for i in range(10):
+        if i == 3:
+            assert not [c for c in permrules.mine(log) if c.auto_do]
+        log.record("plan", subject="confirm", choice="approved", detail={"risk": "high"}, project="git:myapp")
     (c,) = [c for c in permrules.mine(log) if c.auto_do]
-    assert "automatically in auto mode" in c.text()
+    assert "automatically in auto mode" in c.text() and c.scope == "project" and c.project == "git:myapp"
     store = ProposalStore(tmp_path)
     (p,) = permrules.to_proposals([c], store)
     permrules.apply(p.payload)
     from k3code.confio import read_yaml
 
-    assert read_yaml(tmp_path / "home" / "config.yaml")["autonomy"]["auto_do_plans"] is True
-    log.record("plan", subject="confirm", choice="rejected", detail={"risk": "high"})
+    autonomy = read_yaml(tmp_path / "home" / "config.yaml")["autonomy"]
+    assert autonomy["auto_do_projects"] == ["git:myapp"] and "auto_do_plans" not in autonomy
+    assert permrules.auto_do_allowed(autonomy, "git:myapp") and not permrules.auto_do_allowed(autonomy, "git:other")
+    log.record("plan", subject="confirm", choice="rejected", detail={"risk": "high"}, project="git:myapp")
     assert not [c for c in permrules.mine(log) if c.auto_do]
+
+
+def test_auto_do_needs_ten_approvals_in_the_same_project(tmp_path):
+    log = DecisionLog(tmp_path)
+    for i in range(12):
+        log.record("plan", subject="confirm", choice="approved", detail={"risk": "high"}, project=f"git:p{i % 2}")
+    assert not [c for c in permrules.mine(log) if c.auto_do]  # 6 + 6 across two projects is not 10 in one

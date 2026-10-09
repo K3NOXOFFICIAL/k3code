@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Any
 
 from k3code.autonomy.proposals import ProposalStore, dedup_key
-from k3code.learning.decisions import DecisionLog, scrub
+from k3code.learning.decisions import DecisionLog
 from k3code.providers.types import Message
+from k3code.redact import scrub_text
 from k3code.routing.tiers import TaskKind
 
 HEADING = "## Learned preferences (auto)"
@@ -151,7 +152,7 @@ def denial_preferences(log: DecisionLog, *, min_evidence: int = 2) -> list[dict[
         for _words, reasons in clusters:
             if len(reasons) >= min_evidence:
                 text = Counter(reasons).most_common(1)[0][0]  # the most common wording, the first on a tie
-                out.append({"prefix": prefix, "reason": scrub(text), "evidence": len(reasons)})
+                out.append({"prefix": prefix, "reason": scrub_text(text), "evidence": len(reasons)})
     return out
 
 
@@ -174,7 +175,7 @@ def propose_denial_preferences(log: DecisionLog, proposals: ProposalStore) -> li
 def add_user_line(path: Path, text: str, heading: str = HEADING) -> None:
     """Add ``- text`` to ``path`` above the auto section (the distiller rewrites that section, and everything below
     its heading up to the next one, on every run)."""
-    text = scrub(text.strip())
+    text = scrub_text(text.strip())
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     lines = existing.splitlines(keepends=True)
     at = next((i for i, ln in enumerate(lines) if ln.strip() == heading), None)
@@ -211,7 +212,7 @@ async def polish(caller: Any, prefs: list[Preference], *, session_id: str = "") 
         items = json.loads(m.group(0)) if m else []
     except Exception:  # noqa: BLE001
         return prefs
-    new = {str(i.get("key")): scrub(str(i.get("text", "")).strip()) for i in items if isinstance(i, dict)}
+    new = {str(i.get("key")): scrub_text(str(i.get("text", "")).strip()) for i in items if isinstance(i, dict)}
     for p in prefs:
         t = new.get(p.key)
         if t and len(t) <= 160 and "\n" not in t:

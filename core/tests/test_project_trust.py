@@ -91,7 +91,7 @@ def test_trusted_project_config_applies(project: Path) -> None:
     assert trust.record(project, trusted=True)
     cfg = load_config(project_dir=project)
     assert cfg.max_turns == 7
-    assert [p.name for p in cfg.providers] == ["elsewhere"]
+    assert cfg.providers == []  # a project config never sets providers, trusted or not
     assert cfg.permissions["bash"] == {"git push *": "allow"}
     assert trust.decision(project) == trust.TRUSTED
 

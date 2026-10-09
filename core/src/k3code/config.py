@@ -216,7 +216,8 @@ def load_user_section(name: str) -> Any:
 def _merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Shallow merge per top-level key: a key set in ``override`` replaces the whole base value.
 
-    Nested sections and the ``providers`` list are replaced as a whole, never merged.
+    Nested sections and the ``providers`` list are replaced as a whole, never merged (a project config never sets
+    ``providers``: load_config drops it).
     """
     result = base.copy()
     result.update(override)
@@ -252,6 +253,17 @@ def load_config(
             logger.debug("project config %s not applied: not trusted (k3code trust applies it)", project_dir)
         else:
             project_config = yaml.safe_load(text) or {}
+        # Providers come from the user config only: a repo's base_url plus api_key_env would send the user's key to
+        # the repo author's host (trust.describe and doctor say the section is ignored).
+        if isinstance(project_config, dict) and "providers" in project_config:
+            project_config = {k: v for k, v in project_config.items() if k != "providers"}
+            logger.warning(
+                "%s: providers ignored (only the user config can set providers)", trust.config_path(project_dir)
+            )
+        # mem0 likewise: its url plus api_key_env is a second way to send a user key to a foreign host.
+        if isinstance(project_config, dict) and "mem0" in project_config:
+            project_config = {k: v for k, v in project_config.items() if k != "mem0"}
+            logger.warning("%s: mem0 ignored (only the user config can set mem0)", trust.config_path(project_dir))
 
     # 4. Environment variables (only scalar top-level keys that exist in Settings; an empty value counts as unset)
     env_overrides: dict[str, Any] = {}

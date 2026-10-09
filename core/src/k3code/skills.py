@@ -37,11 +37,15 @@ def parse_frontmatter(text: str) -> dict[str, str]:
 
 
 def skill_roots(cwd: str | Path, extra: list[str] | None = None) -> list[Path]:
-    roots = [home() / "skills", Path(cwd) / ".k3code" / "skills", *(Path(r).expanduser() for r in extra or [])]
+    """The user's skills, the project's (only once the project is trusted, see k3code.trust), then config roots."""
+    from k3code import trust
+
+    project = [Path(cwd) / ".k3code" / "skills"] if trust.content_allowed(cwd) else []
+    roots = [home() / "skills", *project, *(Path(r).expanduser() for r in extra or [])]
     return [r for r in roots if r.is_dir()]
 
 
-def _find(root: Path) -> list[Path]:
+def find_markers(root: Path) -> list[Path]:
     found: list[Path] = []
     stack = [(root, 0)]
     while stack:
@@ -64,7 +68,7 @@ def discover(cwd: str | Path, extra_roots: list[str] | None = None) -> list[Skil
     """All skills; earlier roots win on a name clash (user < project < config roots by order given)."""
     seen: dict[str, Skill] = {}
     for root in skill_roots(cwd, extra_roots):
-        for marker in _find(root):
+        for marker in find_markers(root):
             try:
                 head = marker.read_text(encoding="utf-8", errors="replace")[:4000]
             except OSError:

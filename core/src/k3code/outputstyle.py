@@ -25,7 +25,11 @@ PRESETS: dict[str, str] = {
 
 
 def _dirs(cwd: str | Path) -> list[Path]:
-    return [home() / "output-styles", Path(cwd) / ".k3code" / "output-styles"]
+    """The user's styles, then the project's (only once the project is trusted, see k3code.trust)."""
+    from k3code import trust
+
+    project = [Path(cwd) / ".k3code" / "output-styles"] if trust.content_allowed(cwd) else []
+    return [home() / "output-styles", *project]
 
 
 def custom_styles(cwd: str | Path) -> dict[str, Path]:

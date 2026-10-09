@@ -8,7 +8,7 @@ import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from k3code import service
 from k3code.gateway.sessions import SessionStore
@@ -18,6 +18,9 @@ from k3code.permissions.hardline import HARDLINE_NAMES
 from k3code.setup import detect, probe
 from k3code.setup.prompter import Prompter
 from k3code.setup.state import env_file_path, read_env_file, set_env_var
+
+if TYPE_CHECKING:
+    from k3code.bundle import SensitiveItem
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TIERS = ("main", "strong", "cheap", "fast")
@@ -72,19 +75,26 @@ def step_welcome(c: Ctx) -> dict[str, Any]:
         path = c.p.text("welcome.bundle", "Path to the .k3bundle")
         out["bundle"] = path
         if path:
-            c.say("Imported:\n" + apply_import(path, c.cwd))
+            c.say("Imported:\n" + apply_import(path, c.cwd, accept=lambda item: _accept_item(c.p, item)))
             c.say("Only secrets are missing: they are asked for in the providers step.")
     return out
 
 
-def apply_import(bundle_path: str, cwd: Path) -> str:
-    """Import settings and sessions from a bundle with the existing importer; returns its report."""
+def _accept_item(p: Prompter, item: SensitiveItem) -> bool:
+    """One explicit yes per MCP server, permission rule, provider endpoint or hook in the bundle; the default is no.
+    An answers file says yes with ``welcome.accept.<item key>: true`` (nested: the key's dots are levels)."""
+    return p.confirm(f"welcome.accept.{item.key}", f"{item.text()}\nApply {item.key}?", False)
+
+
+def apply_import(bundle_path: str, cwd: Path, accept: Callable[[SensitiveItem], bool] | None = None) -> str:
+    """Import settings and sessions from a bundle with the existing importer; returns its report. Sensitive user
+    settings are applied only where ``accept`` says yes (see k3code.bundle.sensitive_items)."""
     from k3code.bundle import apply_bundle, read_bundle
 
     bundle = read_bundle(Path(bundle_path).expanduser())
     store = SessionStore(home() / "sessions.db")
     try:
-        return apply_bundle(bundle, store=store, cwd=cwd).describe()
+        return apply_bundle(bundle, store=store, cwd=cwd, accept=accept).describe()
     finally:
         store.close()
 

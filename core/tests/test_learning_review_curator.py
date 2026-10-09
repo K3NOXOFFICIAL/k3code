@@ -51,8 +51,12 @@ async def test_review_creates_drafts_facts_then_proposal_and_accept_saves(tmp_pa
     draft = tmp_path / "home" / "skills" / "_drafts" / "release-notes" / "SKILL.md"
     assert draft.is_file() and "group by type" in draft.read_text()
     assert not (tmp_path / "home" / "skills" / "Bad Name").exists()
-    mem = (tmp_path / "repo" / "K3CODE.md").read_text()
-    assert "hand written" in mem and "uv run pytest -q" in mem and "hunter2" not in mem
+    # facts go to $K3CODE_HOME/projects/<key>/learned.md, never into the repository's memory file
+    assert (tmp_path / "repo" / "K3CODE.md").read_text() == "# Mine\nhand written\n"
+    from k3code.memory import learned_notes_path
+
+    mem = learned_notes_path(tmp_path / "repo").read_text()
+    assert "uv run pytest -q" in mem and "hunter2" not in mem
     assert len(sent) == 1  # the secret-bearing fact was dropped before mem0
     (p,) = r["proposals"]
     assert p.kind == "skill" and "release-notes" in p.text
