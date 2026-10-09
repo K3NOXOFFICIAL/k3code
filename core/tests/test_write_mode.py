@@ -48,3 +48,22 @@ async def test_write_and_edit_keep_an_existing_files_mode(tmp_path, umask):
 async def test_no_temporary_file_is_left_behind(tmp_path, umask):
     await tool_write({"path": "a.txt", "content": "x"}, cwd=tmp_path)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["a.txt"]
+
+
+async def test_a_private_files_temp_copy_is_never_wider_than_0600(tmp_path, umask, monkeypatch):
+    umask(0o022)
+    secret = tmp_path / ".env"
+    secret.write_text("TOKEN=old\n")
+    secret.chmod(0o600)
+    seen: list[int] = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        seen.append(stat.S_IMODE(os.fstat(fd).st_mode))  # the temp file's mode while it holds the full content
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    res = await tool_write({"path": ".env", "content": "TOKEN=new\n"}, cwd=tmp_path)
+    assert res["ok"] is True
+    assert seen == [0o600]
+    assert _mode(secret) == 0o600

@@ -133,6 +133,19 @@ async def test_glob_honours_gitignore_in_a_work_tree(tmp_path, no_git_env):
     assert res["files"] == ["src/a.py", "src/pkg/b.py"]  # build/ ignored by .gitignore, the rest by SKIP_DIRS
 
 
+async def test_glob_omits_files_deleted_from_the_work_tree(tmp_path, no_git_env):
+    assert shutil.which("git")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "a.py").write_text("a\n")
+    (tmp_path / "sub" / "b.py").write_text("b\n")
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
+    assert (tmp_path / ".git" / "HEAD").is_file()  # the repository is the test's own
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True, capture_output=True)
+    (tmp_path / "a.py").unlink()  # deleted without staging: still in the index
+    res = await tool_glob({"pattern": "*.py"}, cwd=tmp_path)
+    assert res["files"] == ["sub/b.py"]
+
+
 async def test_glob_caps_its_results_and_says_so(tmp_path, no_git_env):
     many = tmp_path / "many"
     many.mkdir()

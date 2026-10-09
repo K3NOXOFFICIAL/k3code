@@ -87,8 +87,10 @@ def _atomic_write(path: Path, data: bytes) -> None:
     mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
     for _ in range(100):
         tmp = str(target.parent / f".{target.name}.k3tmp-{secrets.token_hex(4)}")
-        try:  # O_EXCL never follows or reuses an existing name; the kernel applies the umask to 0o666
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        try:  # O_EXCL never follows or reuses an existing name; the kernel applies the umask to the new-file 0o666
+            # An existing file's content is written under 0600 so a 0600 secret is never briefly world-readable;
+            # the chmod to its real mode happens before the rename.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666 if mode is None else 0o600)
             break
         except FileExistsError:
             continue
@@ -608,7 +610,8 @@ def _git_files(path: Path) -> list[str] | None:
         return None
     if out.returncode != 0:
         return None
-    return [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f]
+    # -c lists index entries whose file is gone (deleted or moved without staging): the work tree decides.
+    return [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f and os.path.lexists(path / f)]
 
 
 def _tree(path: Path) -> tuple[list[str], list[str]]:
