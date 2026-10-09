@@ -105,7 +105,7 @@ MAX_READ_BYTES = 10 * 1024 * 1024
 def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
     """Lines ``start..end`` of a large file, streamed, at most MAX_READ_BYTES of them."""
     selected: list[str] = []
-    total = 0
+    total = used = 0
     too_big = {"error": f"Lines {start}-{end} exceed {MAX_READ_BYTES // (1024 * 1024)} MB: request a smaller range"}
     with path.open("rb") as f:
         number = 1  # only \n ends a line here; a huge file is not re-split on \r
@@ -122,37 +122,86 @@ def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
                 total += len(raw)
                 if total > MAX_READ_BYTES:
                     return too_big
-                selected.append(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
+                line = _cap_line(raw.decode("utf-8", errors="replace").rstrip("\r\n"))
+                used += len(line) + _NUMBER_WIDTH + 2
+                if selected and used > READ_MAX_CHARS:
+                    break  # the char budget is spent: the model continues with offset
+                selected.append(line)
             number += 1
     if not selected:
         return {"content": "", "lines": f"{start}-{start} (past the end of the file)"}
-    return {"content": "\n".join(selected), "lines": f"{start}-{start + len(selected) - 1}"}
+    last = start + len(selected) - 1
+    return {"content": "\n".join(selected), "lines": f"{start}-{last}", "first": start, "last": last, "total": None}
+
+
+#: read: lines returned when no limit is given, chars kept of one line, and chars of numbered output per call. A read
+#: has its own budget (it is not cut to MAX_TOOL_RESULT_CHARS): head+tail clipping lost the middle of a 400-line file
+#: and the model read it again.
+READ_DEFAULT_LIMIT = 2000
+READ_MAX_LINE_CHARS = 2000
+READ_MAX_CHARS = 60_000
+_NUMBER_WIDTH = 6  # cat -n: the line number right-aligned in 6 columns, then a tab
+
+
+def _read_window(arguments: dict[str, Any]) -> tuple[int, int | None]:
+    """(first line, line count or None) from ``offset``/``limit``, or the older ``start``/``end`` (both 1-based)."""
+    if "offset" in arguments or "limit" in arguments:
+        first = int(arguments.get("offset") or 1)
+        limit = arguments.get("limit")
+        return max(1, first), (max(1, int(limit)) if limit is not None else None)
+    first = max(1, int(arguments.get("start") or 1))
+    end = arguments.get("end")
+    return first, (max(1, int(end) - first + 1) if end is not None else None)
+
+
+def _cap_line(line: str) -> str:
+    if len(line) <= READ_MAX_LINE_CHARS:
+        return line
+    return f"{line[:READ_MAX_LINE_CHARS]}... [line cut: {len(line)} chars]"
 
 
 async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Read a file, optionally with line ranges."""
+    """Read a file: ``limit`` lines (default READ_DEFAULT_LIMIT) from line ``offset``, within READ_MAX_CHARS.
+
+    ``start``/``end`` (an inclusive line range) still work. The result carries the raw lines (``content``) and where
+    they are (``first``, ``last``, ``total``); format_tool_result numbers them for the model and says how to go on.
+    """
     path = _resolve_path(arguments["path"], cwd)
     if not path.is_file():
         return {"error": f"File not found: {path}"}
-    start = arguments.get("start", 1)
-    end = arguments.get("end")
+    explicit = any(k in arguments for k in ("offset", "limit", "start", "end"))
+    first, count = _read_window(arguments)
     size = path.stat().st_size
     if size > MAX_READ_BYTES:
         # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
-        if end is None:
+        if not explicit:
             return {
                 "error": f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB): "
-                "pass start and end to read a line range, or use grep to find what you need"
+                "pass offset and limit (or start and end) to read a line range, or use grep to find what you need"
             }
-        return _read_range(path, max(1, start), end)
+        return _read_range(path, first, first + (count or READ_DEFAULT_LIMIT) - 1)
     text = path.read_bytes().decode("utf-8", errors="replace")  # reading may show U+FFFD; it never writes back
     lines = _split_lines(text)
-    if end is None:
-        end = len(lines)
-    start = max(1, min(start, len(lines) + 1))
-    end = max(start, min(end, len(lines)))
-    selected = lines[start - 1 : end]
-    return {"content": "\n".join(selected), "lines": f"{start}-{end} of {len(lines)}"}
+    total = len(lines)
+    first = min(first, total + 1)
+    last_wanted = min(total, first - 1 + (count or READ_DEFAULT_LIMIT))
+    selected: list[str] = []
+    used = 0
+    for line in lines[first - 1 : last_wanted]:
+        line = _cap_line(line)
+        cost = len(line) + _NUMBER_WIDTH + 2  # what the numbered line costs: number, tab, newline
+        if selected and used + cost > READ_MAX_CHARS:
+            break  # the char budget is spent: the model continues with offset
+        selected.append(line)
+        used += cost
+    last = first + len(selected) - 1
+    return {
+        "content": "\n".join(selected),
+        "lines": f"{first}-{max(first, last)} of {total}",
+        "first": first,
+        "last": last,
+        "total": total,
+    }
 
 
 async def tool_write(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
@@ -277,8 +326,11 @@ def format_tool_result(result: dict[str, Any]) -> Any:
     escapes every newline, quote and backslash: ``{'stdout': 'a\\nb\\n', 'stderr': '', 'exit_code': 0}``. The TUI
     showed that as one unreadable line, and a model that copied a line it had read that way into an ``edit`` copied
     the escapes too. They are plain text now (stdout as is; stderr, an error note and a non-zero exit code only when
-    there is something to say). Every other result is unchanged: ``read``'s ``content``, small ok/error dicts.
+    there is something to say). ``read`` is numbered like ``cat -n`` and ends with how to read on when it stopped
+    before the end of the file. Every other result is unchanged: other ``content``, small ok/error dicts.
     """
+    if "content" in result and "first" in result:  # read
+        return _numbered_read(result)
     if "content" in result:
         return result["content"]
     if "stdout" in result or "stderr" in result:  # bash
@@ -309,6 +361,21 @@ def format_tool_result(result: dict[str, Any]) -> Any:
     if result.keys() == {"error"}:
         return f"Error: {result['error']}"
     return str(result)
+
+
+def _numbered_read(result: dict[str, Any]) -> str:
+    first, last, total = int(result["first"]), int(result["last"]), result.get("total")
+    if last < first:
+        if total == 0:
+            return "(empty file)"
+        return f"[file has {total} lines; offset {first} is past the end]"
+    lines = str(result["content"]).split("\n")
+    body = "\n".join(f"{n:>{_NUMBER_WIDTH}}\t{line}" for n, line in enumerate(lines, first))
+    if total is None:  # a huge file, streamed: its length is not known
+        return f"{body}\n[showed {first}-{last}; continue with offset={last + 1}]"
+    if last < total:
+        return f"{body}\n[file has {total} lines; showed {first}-{last}; continue with offset={last + 1}]"
+    return body
 
 
 #: Per stream: bytes after which the command is killed.
@@ -353,9 +420,21 @@ class _Capture:
         )
 
 
-def clip_head_tail(text: str, limit: int = _MAX_CHARS) -> str:
+#: How to get at a clipped middle, per tool (the clip marker says it); other tools get _CLIP_HINT_DEFAULT.
+_CLIP_HINTS = {
+    "bash": "rerun piped through grep, head, tail or sed -n",
+    "grep": "grep a narrower pattern or path",
+    "glob": "glob a narrower pattern or path",
+    "read": "read with offset and limit",
+}
+_CLIP_HINT_DEFAULT = "narrow the request to see the rest"
+#: A read result has its own budget (READ_MAX_CHARS); this is only a backstop for read results stored before it.
+_READ_RESULT_CHARS = READ_MAX_CHARS + 1000
+
+
+def clip_head_tail(text: str, limit: int = _MAX_CHARS, hint: str = _CLIP_HINT_DEFAULT) -> str:
     """``text`` cut to ``limit`` chars: the first 3/5 and the last 2/5 are kept, the middle becomes a marker that
-    states how many chars it dropped. Text within the limit is returned unchanged."""
+    states how many chars it dropped and (``hint``) how to see them. Text within the limit is returned unchanged."""
     if len(text) <= limit:
         return text
     head = limit * 3 // 5
@@ -363,20 +442,29 @@ def clip_head_tail(text: str, limit: int = _MAX_CHARS) -> str:
     dropped = len(text) - head - tail
     return (
         f"{text[:head]}\n... [truncated {dropped} chars from the middle of {len(text)}; "
-        f"first {head} and last {tail} shown] ...\n{text[-tail:]}"
+        f"first {head} and last {tail} shown; {hint}] ...\n{text[-tail:]}"
     )
 
 
+def clip_for_model(name: str | None, text: str, limit: int = _MAX_CHARS) -> str:
+    """What the model is sent of one tool result: ``read`` keeps its own budget, others are clipped to ``limit``."""
+    if name == "read":
+        limit = max(limit, _READ_RESULT_CHARS)
+    return clip_head_tail(text, limit, _CLIP_HINTS.get(name or "", _CLIP_HINT_DEFAULT))
+
+
 def clip_tool_results(messages: Sequence[Message], limit: int = _MAX_CHARS) -> list[Message]:
-    """The messages a provider receives: every tool result longer than ``limit`` becomes its head+tail clip.
+    """The messages a provider receives: every tool result over its limit becomes its head+tail clip (clip_for_model).
 
     Pure per message, so one history always yields the same bytes for the same prefix (prompt caches can hit). The
     input list and its messages are untouched: the transcript and the session keep the full results.
     """
     out: list[Message] = []
     for m in messages:
-        if m.role == "tool" and m.content and len(m.content) > limit:
-            m = dataclasses.replace(m, content=clip_head_tail(m.content, limit))
+        if m.role == "tool" and m.content:
+            clipped = clip_for_model(m.name, m.content, limit)
+            if clipped is not m.content:
+                m = dataclasses.replace(m, content=clipped)
         out.append(m)
     return out
 
@@ -499,13 +587,20 @@ def build_registry() -> ToolRegistry:
     reg.register(
         ToolSpec(
             name="read",
-            description="Read a file with optional line range",
+            description=(
+                "Read a text file. Lines come numbered (number, tab, line); the numbers are not part of the file. "
+                f"Returns up to {READ_DEFAULT_LIMIT} lines; a longer file ends with a note saying which offset "
+                "continues it."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
-                    "start": {"type": "integer", "default": 1},
-                    "end": {"type": "integer"},
+                    "offset": {"type": "integer", "description": "First line to read (1-based)", "default": 1},
+                    "limit": {
+                        "type": "integer",
+                        "description": f"How many lines to read (default {READ_DEFAULT_LIMIT})",
+                    },
                 },
                 "required": ["path"],
             },

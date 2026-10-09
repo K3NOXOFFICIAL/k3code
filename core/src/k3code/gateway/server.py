@@ -88,7 +88,7 @@ from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
 from k3code.tools import build_registry as build_tool_registry
-from k3code.tools import clip_head_tail
+from k3code.tools import clip_for_model
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -377,7 +377,7 @@ def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
     for m in messages:
         c = m.get("content")
         if m.get("role") == "tool" and isinstance(c, str):
-            c = clip_head_tail(c)
+            c = clip_for_model(m.get("name"), c)
         chars += len(c) if isinstance(c, str) else len(json.dumps(c, ensure_ascii=False)) if c else 0
         if m.get("tool_calls"):
             chars += len(json.dumps(m["tool_calls"], ensure_ascii=False))

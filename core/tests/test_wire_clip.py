@@ -15,7 +15,7 @@ from k3code.gateway.server import _estimate_tokens
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage, messages_to_openai
 from k3code.reliability import Reliability
 from k3code.router import Router, build_chain
-from k3code.tools import clip_head_tail, clip_tool_results
+from k3code.tools import clip_for_model, clip_head_tail, clip_tool_results
 
 
 class Recorder:
@@ -86,11 +86,11 @@ def test_text_within_the_limit_is_returned_unchanged():
 def test_only_long_tool_results_are_clipped_and_the_input_is_left_alone():
     big = "a" * 30_000 + "THE-END"
     user = Message(role="user", content=big)
-    tool = Message(role="tool", content=big, tool_call_id="c1", name="read")
+    tool = Message(role="tool", content=big, tool_call_id="c1", name="bash")
     original = [user, tool]
     out = clip_tool_results(original)
     assert out[0] is user  # user text is never clipped
-    assert out[1].content == clip_head_tail(big)
+    assert out[1].content == clip_for_model("bash", big)
     assert out[1].content.endswith("THE-END")
     assert tool.content == big  # the input messages are untouched
     assert clip_tool_results(original)[1].content == out[1].content  # the same history gives the same bytes
@@ -98,14 +98,16 @@ def test_only_long_tool_results_are_clipped_and_the_input_is_left_alone():
 
 async def test_the_model_gets_the_clipped_result_and_the_transcript_keeps_the_full_one(tmp_path):
     target = write_big_file(tmp_path / "big.txt")
-    provider = Recorder([tool_reply(ToolCall(id="c1", name="read", arguments={"path": target})), text_reply("done")])
+    # a long bash output (read has its own budget and is not clipped, see test_token_read_tool.py)
+    cat = ToolCall(id="c1", name="bash", arguments={"command": f"cat {target}"})
+    provider = Recorder([tool_reply(cat), text_reply("done")])
     loop = make_loop(tmp_path, provider, session="clip")
     async for _ in loop.run("read the file"):
         pass
     full = next(m.content for m in loop.turn_messages if m.role == "tool")
     assert len(full) > 10_000
     sent = next(m.content for m in provider.requests[1][0] if m.role == "tool")
-    assert sent == clip_head_tail(full)
+    assert sent == clip_for_model("bash", full)
     assert f"truncated {len(full) - 10_000} chars" in sent
     stored = [m.content for m in loop.reliability.load_transcript() if m.role == "tool"]
     assert stored == [full]  # the transcript on disk keeps every char the tool returned
@@ -148,8 +150,8 @@ def test_the_volatile_part_of_the_system_prompt_comes_last(tmp_path, monkeypatch
 
 def test_compaction_counts_a_tool_result_as_the_model_receives_it():
     big = "z" * 35_000
-    tool_msg = {"role": "tool", "content": big, "tool_call_id": "c", "name": "read"}
-    assert _estimate_tokens([tool_msg]) == len(clip_head_tail(big)) // 4
+    tool_msg = {"role": "tool", "content": big, "tool_call_id": "c", "name": "bash"}
+    assert _estimate_tokens([tool_msg]) == len(clip_for_model("bash", big)) // 4
     assert _estimate_tokens([{"role": "user", "content": big}]) == 35_000 // 4
 
 
