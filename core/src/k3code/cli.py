@@ -215,6 +215,37 @@ async def _run_headless(
         usage.close()
 
 
+def _headless_slash(prompt: str) -> tuple[Any, str, str] | None:
+    """(command, name, arg) when the prompt's first word is exactly a registered slash command (``/project rescan``).
+
+    None sends the prompt to the model, including one that only starts with a path (``/etc/hosts explain this``).
+    """
+    from k3code.commands.builtin import build_registry
+
+    parts = prompt.split(None, 1)
+    if not parts or not parts[0].startswith("/"):
+        return None
+    name = parts[0][1:]
+    cmd = build_registry().get(name) if name and not name.startswith("/") else None
+    return (cmd, name, parts[1] if len(parts) > 1 else "") if cmd is not None else None
+
+
+async def _run_headless_slash(cmd: Any, name: str, arg: str, config: Any) -> dict[str, Any]:
+    """Run a slash command through the gateway's own dispatch, without a session, a client or any provider."""
+    if not cmd.headless:
+        return {"error": "interactive_only", "message": f"/{name} needs an interactive session; run it in the TUI"}
+    from k3code.gateway.server import GatewayServer
+
+    server = GatewayServer(config=config)
+    try:
+        result = await server.dispatch_command(name, arg, None)
+    finally:
+        await server.close()
+    text = str(result.get("output") or result.get("message") or "")
+    data = {k: v for k, v in result.items() if k not in ("type", "message", "output")}
+    return {"text": text, "command": f"/{cmd.name}", "data": data}
+
+
 #: Characters of each tool result kept in ``k3code -p --json``'s ``tools`` list.
 HEADLESS_RESULT_CHARS = 2000
 
@@ -521,6 +552,16 @@ def main(
     config = load_config(project_dir=project_dir)
     if trust.decision(project_dir) in (trust.UNDECIDED, trust.DECLINED):
         click.echo(f"k3code: ignoring {trust.subject(project_dir)} (not trusted; `k3code trust` applies it)", err=True)
+    # `-p "/project"` runs the command, as the TUI would, before the provider check: no model is involved
+    if prompt and (slash := _headless_slash(prompt)) is not None:
+        result = asyncio.run(_run_headless_slash(*slash, config=config))
+        if json_output:
+            print(json.dumps(result, ensure_ascii=False))
+        elif "error" in result:
+            click.echo(f"k3code: error: {result['message']}", err=True)
+        else:
+            click.echo(result["text"])
+        sys.exit(1 if "error" in result else 0)
     if not config.providers and (prompt or not _is_interactive()):
         from k3code.setup.onboard import NO_CONFIG_HINT
 

@@ -24,6 +24,8 @@ def _age(seconds: float) -> str:
 
 
 class ProjectCommand(CommandDef):
+    headless = True
+
     def __init__(self) -> None:
         super().__init__(
             name="project",

@@ -123,6 +123,8 @@ k3code -p "fix the failing test" --json  # headless: one prompt, JSON result
 k3code daemon                            # a long-running host: sessions, schedules and automations keep running
 ```
 
+A `-p` prompt whose first word is a slash command runs that command instead of asking the model: `k3code -p "/project"` prints the detected stacks, as do `/skills`, `/stats` and `/help`. A command that needs a live session (`/clear`, `/compact` …) exits with an error that says so.
+
 With a daemon running, `k3code attach <session-id>` opens the TUI on one of its sessions (find ids with `/resume`; add `--readonly` to only watch). Detach any time; the session keeps working.
 
 ---

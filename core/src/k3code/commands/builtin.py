@@ -218,6 +218,8 @@ class _ExitCommand(CommandDef):
 
 
 class _HelpCommand(CommandDef):
+    headless = True
+
     def __init__(self) -> None:
         super().__init__(name="help", aliases=["h", "?"], help="List available commands")
 
