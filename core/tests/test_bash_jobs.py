@@ -1,10 +1,14 @@
-"""E5: bash documents its timeout and runs background jobs (bash_output / bash_kill); T6: every tool states limits."""
+"""E5: background bash jobs (bash_output / bash_kill), owned by one session and reaped when it ends.
+
+The timeout text, the bash schema and the tool limits are in test_bash_timeout_docs.py."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import re
+import signal
 
 import pytest
 
@@ -12,9 +16,8 @@ from k3code.agent.loop import AgentLoop
 from k3code.config import Settings
 from k3code.permissions import decide
 from k3code.providers.types import ToolCall
-from k3code.research.tools import register_web_tools
 from k3code.router import Router, build_chain
-from k3code.tools import build_registry, jobs, tool_bash, tool_bash_kill, tool_bash_output
+from k3code.tools import jobs, tool_bash, tool_bash_kill, tool_bash_output
 from test_permissions_gateway import call, make_server
 
 
@@ -47,18 +50,6 @@ def _alive(pid: int) -> bool:
 async def clean_jobs():
     yield
     await jobs.REGISTRY.reap_all()
-
-
-async def test_timeout_says_how_long_and_how_to_go_on(tmp_path):
-    res = await tool_bash({"command": "sleep 5", "timeout": 0.3}, cwd=tmp_path)
-    assert res["error"] == "Command timed out after 0.3s; retry with timeout up to 600 or background: true"
-
-
-def test_bash_schema_documents_default_and_max_timeout():
-    spec, _ = build_registry().get("bash")
-    timeout = spec.parameters["properties"]["timeout"]
-    assert timeout["default"] == 30 and "default 30, max 600" in timeout["description"]
-    assert "Seconds" in timeout["description"] and spec.parameters["properties"]["background"]["type"] == "boolean"
 
 
 async def test_background_job_lifecycle(tmp_path, clean_jobs):
@@ -157,12 +148,96 @@ async def test_background_bash_goes_through_the_bash_permission_decision(tmp_pat
     assert out["content"].startswith(f"killed {job}")
 
 
-def test_every_builtin_tool_states_its_limits():
-    reg = build_registry()
-    register_web_tools(reg, Settings())
-    for name in ("read", "write", "edit", "bash", "bash_output", "bash_kill", "grep", "glob", "todo", "web_fetch"):
-        spec, _ = reg.get(name)
-        limits = [ln for ln in spec.description.splitlines() if ln.startswith("Limits: ")]
-        assert len(limits) == 1, name
-    assert "30 s by default" in reg.get("bash")[0].description
-    assert "14000 chars" in reg.get("web_fetch")[0].description
+def _record_jobs(monkeypatch) -> list:
+    """Every job the registry starts, kept even after a reap forgets it."""
+    started: list = []
+    real_add = jobs.REGISTRY.add
+
+    def add(*a, **kw):
+        job = real_add(*a, **kw)
+        started.append(job)
+        return job
+
+    monkeypatch.setattr(jobs.REGISTRY, "add", add)
+    return started
+
+
+async def test_a_finished_sub_agent_reaps_its_background_jobs(tmp_path, monkeypatch, clean_jobs):
+    from k3code.subagents import runner
+    from test_autonomy_gateway import make, run_turn, start
+
+    real_build = runner.SubagentManager.build_loop
+
+    def unsandboxed(self, *args, **kwargs):  # this test is about the job's owner, not bwrap
+        loop = real_build(self, *args, **kwargs)
+        loop._sandbox_argv = lambda: None
+        return loop
+
+    monkeypatch.setattr(runner.SubagentManager, "build_loop", unsandboxed)
+    started = _record_jobs(monkeypatch)
+    steps = [
+        {
+            "type": "tool_call",
+            "match": "CHILD-J",
+            "when": "first",
+            "name": "bash",
+            "arguments": {"command": "sleep 30", "background": True},
+        },
+        {"type": "text", "match": "CHILD-J", "when": "after_tool", "text": "started it"},
+        {
+            "type": "tool_call",
+            "match": "PARENT",
+            "when": "first",
+            "name": "task",
+            "arguments": {"description": "child job", "prompt": "CHILD-J start a server"},
+        },
+        {"type": "text", "match": "PARENT", "when": "after_tool", "text": "parent done"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, mode="yolo", autonomy={"plan_first": False, "proposals": False})
+    (tmp_path / "proj").mkdir()
+    await start(server, tmp_path / "proj")
+    await run_turn(server, "PARENT: delegate it")
+    (h,) = server.subagents.for_session(server.session.session_id)
+    (job,) = started
+    assert job.session_id == h.id and h.status == "completed"
+    # the parent session is still open: only the child's finish can have ended the job
+    assert jobs.list_jobs(h.id) == [] and not _alive(job.proc.pid)
+
+
+@pytest.mark.parametrize("mode", ["headless", "repl"])
+def test_a_cli_run_reaps_its_background_jobs_at_exit(tmp_path, monkeypatch, mode):
+    from k3code import cli as cli_mod
+    from k3code.config import ProviderEntry
+    from k3code.permissions import PermissionMode
+    from test_permissions_gateway import ScriptedProvider
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    (tmp_path / "proj").mkdir()
+    monkeypatch.chdir(tmp_path / "proj")
+    import k3code.providers as providers_mod
+
+    bg = ToolCall(id="c1", name="bash", arguments={"command": "sleep 30", "background": True})
+    monkeypatch.setattr(providers_mod, "make_providers", lambda entries: [ScriptedProvider([bg, "started it"])])
+    monkeypatch.setattr(AgentLoop, "_sandbox_argv", lambda self: None)  # about the run's exit, not bwrap
+    started = _record_jobs(monkeypatch)
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    config = Settings(providers=[prov], default_model="default")
+    try:
+        if mode == "headless":
+            result = asyncio.run(
+                cli_mod._run_headless(
+                    "go", model=None, permission_mode=PermissionMode.YOLO, config=config, json_output=True
+                )
+            )
+            assert result is not None and result.get("text") == "started it", result
+        else:
+            inputs = iter(["go", "/exit"])
+            monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+            asyncio.run(cli_mod._run_repl(model=None, permission_mode=PermissionMode.YOLO, config=config))
+        (job,) = started
+        assert jobs.list_jobs(job.session_id) == [] and not _alive(job.proc.pid)
+    finally:  # the run's event loop is gone: end a job it left behind directly
+        for job in started:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(job.proc.pid, signal.SIGKILL)
+            jobs.REGISTRY._jobs.pop(job.id, None)
