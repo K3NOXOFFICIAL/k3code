@@ -606,7 +606,12 @@ describe("AppLayout agent view: leaving the startup session", () => {
       ]);
       await waitFor(() => expect(layout.output()).toContain("busy one"));
 
-      // s2 (working) is listed first, so ⏎ attaches to it.
+      // The view rests on this session's row (s1); s2 (working) is listed above it, so ↑ selects it for ⏎ to attach.
+      if (key === "\r") {
+        layout.press("\x1b[A");
+        await waitFor(() => expect(layout.output()).toContain("› ◐ busy one"));
+      }
+
       layout.press(key);
 
       await waitFor(() => expect(spy).toHaveBeenCalled());
