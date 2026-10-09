@@ -369,9 +369,38 @@ def _glob_reads_secret(pattern: str, home: str) -> bool:
     return any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home))
 
 
+_BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+
+
+def _brace_expand(word: str, limit: int = 64) -> list[str]:
+    """The words the shell makes of ``a{b,c}d`` (``abd``, ``acd``); capped so a pathological word cannot explode."""
+    out = [word]
+    for _ in range(8):
+        nxt: list[str] = []
+        changed = False
+        for w in out:
+            m = _BRACE.search(w)
+            if not m:
+                nxt.append(w)
+                continue
+            changed = True
+            nxt.extend(w[: m.start()] + alt + w[m.end() :] for alt in m.group(1).split(","))
+        out = nxt[:limit]
+        if not changed:
+            break
+    return out
+
+
 def _classify_arg(arg: str, cwd: str, home: str) -> str | None:
     """``deny`` when ``arg`` names (or globs onto) a credential file, ``human`` when an unknown variable stands in
-    front of a credential name (``$DIR/.env``), else None."""
+    front of a credential name (``$DIR/.env``), else None. ``{a,b}`` alternatives are classified one by one."""
+    worst: str | None = None
+    for word in _brace_expand(arg):
+        worst = _worse(worst, _classify_word(word, cwd, home))
+    return worst
+
+
+def _classify_word(arg: str, cwd: str, home: str) -> str | None:
     arg = arg.strip("'\"")
     if not arg or "://" in arg:
         return None
@@ -384,6 +413,16 @@ def _classify_arg(arg: str, cwd: str, home: str) -> str | None:
     return "deny" if sensitive_path(path) else None
 
 
+def _target_dir_flag(args: list[str]) -> bool:
+    """``cp -t DIR SRC...`` / ``--target-directory``: the destination is the flag value; the rest are sources."""
+    for a in args:
+        if a == "--":
+            return False
+        if a.startswith("--target-directory") or (a.startswith("-") and not a.startswith("--") and "t" in a[1:]):
+            return True
+    return False
+
+
 def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
     plain = _HARMLESS_REDIRECT.sub("", sub)
     worst: str | None = None
@@ -393,12 +432,18 @@ def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None
     if not argv:
         return worst
     name, args = argv[0], argv[1:]
-    if name in _LISTERS or (name in _PRINTERS and not piped and not _REDIRECT.search(plain)):
+    if (name in _LISTERS or name in _PRINTERS) and not piped and not _REDIRECT.search(plain):
         return worst
     reads = _arg_values(args)
     writes: list[str] = []
     positional = [a for a in args if not a.startswith("-")]
-    if name in _COPIERS and len(positional) >= 2:
+    if name in _COPIERS and _target_dir_flag(args):
+        for k, a in enumerate(args[:-1]):
+            if a in ("-t", "--target-directory") and args[k + 1] in reads:
+                writes = [args[k + 1]]
+                reads.remove(args[k + 1])
+                break
+    elif name in _COPIERS and len(positional) >= 2:
         writes = [positional[-1]]
         del reads[len(reads) - 1 - reads[::-1].index(positional[-1])]
     for arg in reads:
@@ -408,16 +453,18 @@ def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None
     return worst
 
 
-def _secret_access(parsed: hardline.Parsed, cwd: str, home: str) -> str | None:
+def _secret_access(parsed: hardline.Parsed, cwd: str, home: str, consumed: bool = False) -> str | None:
     """How a command line touches credential files: ``deny`` (reads or copies one), ``human`` (a variable may point at
     one), ``ask`` (overwrites one), None. Every argument of every simple command and of everything nested in it counts,
     and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are expanded, globs are matched."""
     worst: str | None = None
     for sub in parsed.subs:
-        piped = any(len(p) > 1 and sub in p for p in parsed.pipelines)
+        piped = consumed or any(len(p) > 1 and sub in p for p in parsed.pipelines)
         worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home))
-    for child in parsed.children:
-        worst = _worse(worst, _secret_access(child, cwd, home))
+    # the first children are ``$(...)``/backtick/``<(...)`` payloads: their output becomes the outer arguments
+    n_subst = sum(len(ps) for ps in parsed.sub_payloads)
+    for k, child in enumerate(parsed.children):
+        worst = _worse(worst, _secret_access(child, cwd, home, consumed or k < n_subst))
     return worst
 
 

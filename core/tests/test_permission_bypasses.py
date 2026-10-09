@@ -216,6 +216,19 @@ SENSITIVE_DENY: list[str] = [
     "echo $(head ~/.ssh/id_rsa)",
     # echo is only exempt while its text stays text
     "echo .env | xargs cat",
+    "ls .env | xargs tac",
+    "ls ~/.ssh/id_rsa | xargs cat",
+    # ... and not inside a substitution, whose output becomes the outer command's arguments
+    "tac $(echo .env)",
+    "tac `printf %s .env`",
+    # -t names the destination: the rest are sources
+    "cp -t . ~/.ssh/id_rsa",
+    "install -t . ~/.config/k3code/env",
+    "ln -t . ~/.ssh/id_rsa",
+    "cp --target-directory=. ~/.ssh/id_rsa",
+    # brace expansion
+    "cat .{env,x}",
+    "tac {.env,x}",
 ]
 
 
