@@ -686,6 +686,16 @@ def test_a_recorded_path_that_is_not_a_tui_build_dir_is_left_alone(tmp_path: Pat
     assert (tmp_path / recorded).is_dir()
 
 
+def test_a_tui_build_dir_is_removed_when_tmpdir_ends_in_a_slash(tmp_path: Path) -> None:
+    # macOS TMPDIR ends in "/", so mktemp recorded "<tmp>//k3code-tui.X" and the strict prefix check refused it
+    dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+    lock = _lock_of(tmp_path, int(dead), "", "tmp/k3code-tui.Ab12Cd")
+    (lock / "tui_tmp").write_text(f"{tmp_path / 'tmp'}//k3code-tui.Ab12Cd\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": f"{tmp_path / 'tmp'}/"})
+    assert r.returncode == 0, r.stderr
+    assert not (tmp_path / "tmp" / "k3code-tui.Ab12Cd").exists() and "removed the TUI build directory" in r.stderr
+
+
 def test_a_lock_k3code_update_holds_stops_the_installer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # one lock format for both: install.sh reads the pid and start time update.py wrote, and still refuses
     from k3code import update as upd

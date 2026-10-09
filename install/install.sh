@@ -175,10 +175,16 @@ proc_start() { # proc_start PID: when PID started, to tell it from a later proce
   fi
 }
 
+tui_tmp_root() { # the temp dir the TUI build uses, without trailing slashes (macOS TMPDIR ends in "/")
+  root=${TMPDIR:-/tmp}
+  while [ "$root" != / ] && [ "${root%/}" != "$root" ]; do root=${root%/}; done
+  printf '%s\n' "$root"
+}
+
 clean_recorded_tmp() { # clean_recorded_tmp LOCK: the TUI build dir the install that held LOCK recorded (killed mid-build)
   t=$(cat "$1/tui_tmp" 2>/dev/null || true)
-  tmpd=${TMPDIR:-/tmp}
-  name=${t#"${tmpd%/}"/}
+  name=${t#"$(tui_tmp_root)"/}
+  while [ "${name#/}" != "$name" ] && [ "$name" != "$t" ]; do name=${name#/}; done # a "//" from a trailing-slash TMPDIR
   # never follow an arbitrary path from a lock file: only a k3code-tui.* directly in the temp dir this run uses
   case "$name" in "$t" | */*) return 0 ;; k3code-tui.?*) ;; *) return 0 ;; esac
   if [ -d "$t" ]; then
@@ -836,7 +842,7 @@ build_tui() {
   log "building the TUI (npm ci; this takes a minute)"
   tui=$SRC_ROOT/tui
   if [ "$FROM" = source ]; then # the build writes node_modules and dist: never into the user's checkout
-    TUI_TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-tui.XXXXXX")
+    TUI_TMP=$(mktemp -d "$(tui_tmp_root)/k3code-tui.XXXXXX")
     # cleanup removes it on exit; after a SIGKILL the run that takes over the lock finds it here
     printf '%s\n' "$TUI_TMP" >"$LOCK/tui_tmp"
     if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then
