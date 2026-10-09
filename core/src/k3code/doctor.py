@@ -19,6 +19,7 @@ from typing import Any
 
 from k3code import service
 from k3code.config import Settings, default_project_dir, load_config
+from k3code.context_budget import FALLBACK_WINDOW, compact_threshold, family_window, has_explicit_window
 from k3code.daemon import k3_home, socket_path
 from k3code.reliability.governor import read_psi
 from k3code.reliability.journal import ToolJournal
@@ -154,6 +155,34 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
             )
         )
     return checks
+
+
+def check_context_windows(config: Settings) -> list[Check]:
+    """Chain models whose context window is a guess: no ``models.<id>.context_window`` entry and no known family.
+
+    Compaction keys to the window, so a wrong guess either compacts a large model too early or lets a small one
+    overflow before compacting.
+    """
+    ids: list[str] = []
+    for p in config.providers:
+        for spec in [*p.models.values(), *p.tiers.values()]:
+            for model_id in [spec] if isinstance(spec, str) else spec:
+                if model_id and model_id not in ids:
+                    ids.append(model_id)
+    unknown = [m for m in ids if not has_explicit_window(config, m) and family_window(m) is None]
+    if not unknown:
+        return [Check("context-window", OK, "every chain model has a known context window")]
+    return [
+        Check(
+            f"context-window:{m}",
+            WARN,
+            f"no known context window; assuming {FALLBACK_WINDOW} tokens "
+            f"(compaction at ~{compact_threshold(config, m)})",
+            f"set the model's real window in config.yaml: models: {{{m}: {{context_window: <tokens>}}}}",
+            {"model": m, "assumed_window": FALLBACK_WINDOW},
+        )
+        for m in unknown
+    ]
 
 
 def check_keys(config: Settings) -> Check:
@@ -591,6 +620,7 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
     checks: list[Check] = []
     checks += await check_providers(config, probe=probe)
     checks.append(check_keys(config))
+    checks += check_context_windows(config)
     checks.append(await check_netwatch_async() if probe else Check("netwatch", OK, "probe skipped"))
     checks += [check_disk(home), check_psi()]
     daemon_check = await check_daemon() if probe else Check("daemon", OK, "probe skipped")
