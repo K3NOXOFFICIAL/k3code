@@ -44,6 +44,7 @@ from k3code.blockers import BlockerStore
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, default_project_dir, load_config
+from k3code.context_budget import compact_threshold, context_window, overhead_tokens
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
 from k3code.gateway import tui_display
@@ -180,6 +181,8 @@ class LiveSession:
         #: M1: id of the turn in flight (usage rows carry it, so per-turn totals add up); "" between turns.
         self.turn_id = ""
         self.scope_override: str | None = None
+        #: Estimated tokens of the system prompt + tool schemas of this session's latest loop (0 = none built yet).
+        self.overhead_tokens = 0
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
         #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
@@ -363,8 +366,9 @@ def _model_label(config: Any, key: str) -> str:
     return str(first or key)
 
 
-#: Conversation size at which a session's older messages are folded into a summary, and how many recent ones stay.
-CONTEXT_DEFAULTS: dict[str, Any] = {"compact_at_tokens": 80_000, "keep_messages": 8, "compact_input_chars": 60_000}
+#: How many recent messages stay when a session's older messages are folded into a summary. When that happens is
+#: context_budget.compact_threshold: context.compact_at_ratio of the active model's window, or compact_at_tokens.
+CONTEXT_DEFAULTS: dict[str, Any] = {"keep_messages": 8, "compact_input_chars": 60_000}
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -1508,6 +1512,7 @@ class GatewayServer:
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
             tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            context_window=context_window(self.config, self._active_model(session)),
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
@@ -1517,7 +1522,12 @@ class GatewayServer:
             install(loop.tools)
         register_task_tools(loop.tools, self, session, depth=1)
         register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher, mcp=self.mcp, browser=self.browser)
+        session.overhead_tokens = overhead_tokens(loop.system_prompt, loop.tool_specs())
         return loop
+
+    def _active_model(self, session: LiveSession) -> str:
+        """The model id the session's main tier sends to first (what its context window is looked up by)."""
+        return _model_label(self.config, session.stored.model or self.config.default_model)
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
@@ -1778,7 +1788,7 @@ class GatewayServer:
             return 0
         cfg = {**CONTEXT_DEFAULTS, **dict(getattr(self.config, "context", None) or {})}
         messages = session.stored.messages
-        if not force and _estimate_tokens(messages) < int(cfg["compact_at_tokens"]):
+        if not force and self._request_tokens(session) < compact_threshold(self.config, self._active_model(session)):
             return 0
         try:
             new, folded = await compact_messages(
@@ -1805,6 +1815,21 @@ class GatewayServer:
                 },
             )
         return folded
+
+    def _request_tokens(self, session: LiveSession) -> int:
+        """Estimated size of the session's next request: the stored conversation (its stored system entry is not sent:
+        the loop builds a fresh one) plus the system prompt and the tool schemas every request carries."""
+        if not session.overhead_tokens:  # no loop built yet in this daemon: the prompt and the built-in tools
+            prompt = build_system_prompt(
+                session.system_prompt,
+                cwd=session.perms.cwd,
+                config=self.config,
+                session_meta=session.stored.meta,
+                mcp=self.mcp,
+            )
+            session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
+        conversation = [m for m in session.stored.messages if m.get("role") != "system"]
+        return _estimate_tokens(conversation) + session.overhead_tokens
 
     async def _auto_title(self, session: LiveSession, first_message: str) -> None:
         """Name a fresh session on the ``title`` task kind; best-effort, never surfaces errors."""

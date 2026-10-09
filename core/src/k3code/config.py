@@ -167,8 +167,11 @@ class Settings(BaseModel):
     # Web tools SSRF guard: {allow_private: false}. true lets web_fetch/web_browse reach loopback/private addresses;
     # the host of research.searxng_url is always allowed. See k3code.net_guard.
     web: dict[str, Any] = Field(default_factory=dict)
-    # Context management: {compact_at_tokens: 80000, keep_messages: 8}; see GatewayServer._maybe_compact
+    # Context management: {compact_at_ratio: 0.7, compact_at_tokens: <absolute override>, keep_messages: 8}; see
+    # GatewayServer._maybe_compact and k3code.context_budget
     context: dict[str, Any] = Field(default_factory=dict)
+    # Per model id: {<model id>: {context_window: 200000}}; ids without an entry use k3code.context_budget's defaults
+    models: dict[str, dict[str, Any]] = Field(default_factory=dict)
     # Browser for web tools: {cdp_url: ""} (empty = off, never attach to a running browser by default)
     browser: dict[str, Any] = Field(default_factory=dict)
     # /artifacts publish: {publish_dir: "" (default <home>/published), publish_url: "" (template, e.g.
