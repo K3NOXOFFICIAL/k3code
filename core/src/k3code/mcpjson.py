@@ -103,6 +103,9 @@ def split(project_dir: str | Path) -> tuple[dict[str, McpServerConfig], list[str
 
 
 def merged(config_servers: dict[str, McpServerConfig], project_dir: str | Path) -> dict[str, McpServerConfig]:
-    """The servers to run: the project's enabled ``.mcp.json`` servers, then the config's (the config wins)."""
+    """The servers to run: the project's enabled ``.mcp.json`` servers, the ones the user accepted from a project
+    recipe for this project (k3code.learning.recipes), then the config's (the config wins)."""
+    from k3code.learning.projectstate import mcp_servers
+
     enabled, _ = split(project_dir)
-    return {**enabled, **config_servers}
+    return {**enabled, **mcp_servers(project_dir), **config_servers}

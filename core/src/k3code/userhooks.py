@@ -10,6 +10,7 @@ trusted; both apply, the user's first)::
         - {command: "date"}
 
 Claude Code's nested form (``- matcher: X`` with ``hooks: [{type: command, command, timeout}]``) is read too.
+An entry with ``project: /abs/path`` (what an accepted project recipe writes) runs only for sessions in that tree.
 
 The command gets the event as JSON on stdin (``session_id``, ``cwd``, ``hook_event_name``, plus ``tool_name`` and
 ``tool_input`` for tool events, ``tool_response`` for PostToolUse, ``prompt`` for UserPromptSubmit). Exit 0 is fine;
@@ -51,6 +52,16 @@ class Hook:
     matcher: str = ""
     timeout: float = DEFAULT_TIMEOUT
     source: str = "user"  # "user" | "project"
+    project: str = ""  # k3code extension: a user hook with ``project: /path`` runs only in that directory tree
+
+    def applies_to(self, project_dir: str | Path) -> bool:
+        if not self.project:
+            return True
+        try:
+            Path(project_dir).resolve().relative_to(Path(self.project).expanduser().resolve())
+        except (ValueError, OSError):
+            return False
+        return True
 
     def matches(self, tool_name: str | None) -> bool:
         if self.event not in TOOL_EVENTS or self.matcher in ("", "*"):
@@ -87,6 +98,7 @@ def parse(section: Any, source: str) -> list[Hook]:
             if not isinstance(entry, dict):
                 continue
             matcher = str(entry.get("matcher") or "")
+            project = str(entry.get("project") or "")
             inner = entry.get("hooks") if isinstance(entry.get("hooks"), list) else [entry]  # Claude Code's nesting
             for h in inner:
                 if not isinstance(h, dict) or not str(h.get("command") or "").strip():
@@ -95,7 +107,7 @@ def parse(section: Any, source: str) -> list[Hook]:
                     timeout = float(h.get("timeout") or DEFAULT_TIMEOUT)
                 except (TypeError, ValueError):
                     timeout = DEFAULT_TIMEOUT
-                hooks.append(Hook(str(event), str(h["command"]), matcher, timeout, source))
+                hooks.append(Hook(str(event), str(h["command"]), matcher, timeout, source, project))
     return hooks
 
 
@@ -113,6 +125,7 @@ def load(project_dir: str | Path, session_id: str = "") -> HookRunner:
             data = {}
         if isinstance(data, dict):
             hooks += parse(data.get("hooks"), "project")
+    hooks = [h for h in hooks if h.applies_to(project_dir)]
     return HookRunner(hooks, session_id=session_id, cwd=Path(project_dir))
 
 
