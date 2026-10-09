@@ -102,6 +102,28 @@ async def test_run_dir_is_private_and_the_token_file_0600(tmp_path, monkeypatch)
     assert not gw_auth.token_path(sock).exists()  # removed with the socket
 
 
+async def test_the_socket_is_never_bound_with_group_or_other_access(tmp_path, monkeypatch):
+    """chmod 0600 after bind left a window in which the socket had the umask mode (0755 under umask 022)."""
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    real_start = asyncio.start_unix_server
+    born: list[int] = []
+
+    async def spy(*args, path, **kwargs):  # the mode the socket had before start_socket's chmod
+        srv = await real_start(*args, path=path, **kwargs)
+        born.append(stat.S_IMODE(os.stat(path).st_mode))
+        return srv
+
+    monkeypatch.setattr(asyncio, "start_unix_server", spy)
+    old_umask = os.umask(0o022)
+    try:
+        await server.start_socket(tmp_path / "run" / "gw.sock")
+    finally:
+        os.umask(old_umask)
+        await server.stop_socket()
+        await server.close()
+    assert len(born) == 1 and born[0] & 0o077 == 0, oct(born[0])  # umask 077: born 0700, chmod'ed to 0600 next
+
+
 async def test_daemon_run_dir_is_created_private(tmp_path, monkeypatch):
     from k3code import daemon
 
@@ -115,14 +137,35 @@ def test_child_env_never_names_the_daemon_socket(monkeypatch):
     from k3code.providers.claude_cli import _clean_env
     from k3code.reliability.sandbox import child_env
 
-    monkeypatch.setenv("K3CODE_GATEWAY_SOCKET", "/home/alice/.myapp/run/gateway.sock")
-    monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", "unix:///home/alice/.myapp/run/gateway.sock")
+    monkeypatch.setenv("K3CODE_GATEWAY_SOCKET", "/home/user/.myapp/run/gateway.sock")
+    monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", "unix:///home/user/.myapp/run/gateway.sock")
     leaked = {"K3CODE_GATEWAY_SOCKET": "/x.sock", "HERMES_TUI_GATEWAY_URL": "unix:///x.sock", "KEEP": "1"}
     for env in (child_env(leaked), stdio_env(leaked)):  # an MCP server's configured env cannot re-add them
         assert env.get("KEEP") == "1"
         assert "K3CODE_GATEWAY_SOCKET" not in env and "HERMES_TUI_GATEWAY_URL" not in env
     claude = _clean_env()
     assert "K3CODE_GATEWAY_SOCKET" not in claude and "HERMES_TUI_GATEWAY_URL" not in claude
+
+
+@pytest.mark.parametrize("module", ["k3code.commands.branch", "k3code.commands.review"])
+async def test_slash_command_git_gets_the_scrubbed_child_env(tmp_path, monkeypatch, module):
+    """The daemon scrubs its own environment, but the TUI-spawned stdio gateway does not: /branch and /review ran git
+    with the full environment, the daemon socket and the provider keys included."""
+    import importlib
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake_git = bindir / "git"
+    fake_git.write_text("#!/bin/sh\nenv\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("K3CODE_GATEWAY_SOCKET", "/home/user/.myapp/run/gateway.sock")
+    monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", "unix:///home/user/.myapp/run/gateway.sock")
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "sk-alice")
+    rc, out = await importlib.import_module(module)._git(tmp_path, "status")
+    names = {line.split("=", 1)[0] for line in out.splitlines()}
+    assert rc == 0 and "PATH" in names  # the fake git ran
+    assert not names & {"K3CODE_GATEWAY_SOCKET", "HERMES_TUI_GATEWAY_URL", "OMNIROUTE_API_KEY"}, names
 
 
 async def test_the_daemon_drops_the_socket_variables_from_its_own_environment(tmp_path, monkeypatch):
@@ -227,6 +270,6 @@ async def test_k3code_slash_without_the_token_fails_closed(gw, tmp_path):
 
 
 def test_auth_token_lives_next_to_the_socket():
-    assert gw_auth.token_path(Path("/home/alice/.myapp/run/gateway.sock")) == Path(
-        "/home/alice/.myapp/run/gateway.token"
+    assert gw_auth.token_path(Path("/home/user/.myapp/run/gateway.sock")) == Path(
+        "/home/user/.myapp/run/gateway.token"
     )

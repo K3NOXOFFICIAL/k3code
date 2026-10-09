@@ -11,6 +11,7 @@ from k3code.artifacts import write_artifact_file
 from k3code.commands import CommandDef
 from k3code.commands._util import reply, session_cwd, split_args
 from k3code.goals import _extract_json_object
+from k3code.reliability.sandbox import child_env
 
 RUBRIC_PATH = Path(__file__).resolve().parent.parent / "prompts" / "review_rubric.md"
 MAX_INPUT_CHARS = 120_000
@@ -25,6 +26,7 @@ async def _git(cwd: Path, *args: str) -> tuple[int, str]:
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        env=child_env(),  # no provider keys, no daemon socket: the TUI's stdio gateway still has them
     )
     out, _ = await proc.communicate()
     return proc.returncode or 0, out.decode(errors="replace")
