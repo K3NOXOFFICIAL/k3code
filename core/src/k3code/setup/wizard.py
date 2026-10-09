@@ -41,7 +41,7 @@ def run_setup(
         state["data"][step.name] = step.fn(ctx)
         if step.name not in state["completed"] and step.name != "secrets":
             state["completed"].append(step.name)
-        if only_step and step.name not in ("summary", "secrets"):
+        if only_step and step.name not in ("summary", "secrets", "project"):  # these own no config keys
             write_config(state["data"], only=step.name)
             if step.name in ("about", "system", "usage"):
                 write_user_md(state["data"])

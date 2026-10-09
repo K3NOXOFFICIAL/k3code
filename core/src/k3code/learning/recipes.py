@@ -197,9 +197,10 @@ class Suggestion:
 
 
 def label(stack: dict[str, Any]) -> str:
-    where = f" in {stack['dir']}/" if stack.get("dir", ".") != "." else ""
+    """``python (uv) in api/``; ``go (go)`` at the root."""
     manager = f" ({stack['manager']})" if stack.get("manager") else ""
-    return f"{stack['id']}{where}{manager}"
+    where = f" in {stack['dir']}/" if stack.get("dir", ".") != "." else ""
+    return f"{stack['id']}{manager}{where}"
 
 
 def exact_rules(stack: dict[str, Any], kinds: tuple[str, ...]) -> list[str]:

@@ -209,3 +209,110 @@ async def test_home_assistant_mcp_references_a_token_variable_and_is_scoped(tmp_
     await projectprep.apply(mcp.payload)
     assert mcpjson.merged({}, ha)["home-assistant"].bearer_env == "HASS_TOKEN"
     assert "home-assistant" not in mcpjson.merged({}, tmp_path / "elsewhere")
+
+
+# ── project facts, skills ranking, onboarding, /project ──
+
+
+async def test_facts_section_is_injected_without_memory_and_is_stable(tmp_path):
+    from k3code.config import Settings
+    from k3code.prompting import build_system_prompt
+
+    repo = make(tmp_path / "repo", {**MONOREPO, ".git/HEAD": ""})  # a session in api/ shares the repo's state
+    assert projectprep.facts_prompt(repo) == ""
+    await projectprep.prepare(repo, store=ProposalStore(tmp_path / "home"))
+    facts = projectprep.facts_prompt(repo)
+    assert facts.startswith("## Project facts") and len(facts.splitlines()) <= projectprep.FACTS_MAX_LINES
+    assert "python (uv) in api/" in facts and "node (pnpm) in packages/web/" in facts
+    assert "api/ python: test `uv run pytest`" in facts and "format `uv run ruff format .`" in facts
+    assert not any((repo / n).exists() for n in ("K3CODE.md", "AGENTS.md", "CLAUDE.md"))  # no memory file
+    one = build_system_prompt("BASE", cwd=repo / "api", config=Settings())
+    two = build_system_prompt("BASE", cwd=repo / "api", config=Settings())
+    assert facts in one and one == two
+
+
+def test_facts_section_is_capped(tmp_path):
+    many = {f"svc{i:02d}/go.mod": "module x\n" for i in range(40)}
+    repo = make(tmp_path / "repo", {".git/HEAD": "", **many})
+    projectstate.save(repo, {"stacks": stacks.scan(repo).stacks})
+    lines = projectprep.facts_prompt(repo).splitlines()
+    assert len(lines) == projectprep.FACTS_MAX_LINES and lines[-2].startswith("…and ")
+
+
+def _skill(root: Path, name: str, description: str) -> None:
+    make(root, {f"{name}/SKILL.md": f"---\nname: {name}\ndescription: {description}\n---\nbody\n"})
+
+
+async def test_skills_index_prefers_stack_matches_then_recent_successful_use(tmp_path):
+    from k3code.skills import skills_prompt
+
+    sroot = tmp_path / "skills"
+    for i in range(65):
+        _skill(sroot, f"a-skill-{i:02d}", "generic helper")
+    _skill(sroot, "zz-pytest-runner", "run the test suite")
+    _skill(sroot, "zz-used-often", "generic helper")
+    repo = make(tmp_path / "repo", {"pyproject.toml": "[project]\nname='a'\n"})
+    before = skills_prompt(repo, [str(sroot)], limit=10)
+    assert "zz-pytest-runner" not in before  # by name only, it is past the first 10
+    await projectprep.prepare(repo, store=ProposalStore(tmp_path / "home"))
+    ranked = skills_prompt(repo, [str(sroot)], limit=10)
+    assert "zz-pytest-runner" in ranked and "zz-used-often" not in ranked
+    from k3code.learning.curator import record_use
+
+    record_use("zz-used-often")
+    used = skills_prompt(repo, [str(sroot)], limit=10)
+    assert "zz-used-often" in used and "zz-pytest-runner" in used
+    assert used == skills_prompt(repo, [str(sroot)], limit=10)  # same input, same section
+
+
+def test_onboarding_non_interactive_default_creates_no_proposals(tmp_path):
+    from k3code.setup.prompter import AnswerPrompter
+    from k3code.setup.steps import offer_project_recipes
+
+    repo = make(tmp_path / "repo", MONOREPO)
+    before = snapshot(repo)
+    out = offer_project_recipes(AnswerPrompter({}), repo)
+    assert out == {"recipes": "none", "accepted": []}
+    assert ProposalStore(paths.home()).all() == [] and not projectstate.state_path(repo).exists()
+    assert snapshot(repo) == before
+
+
+def test_onboarding_accept_all_applies_the_recipes(tmp_path):
+    from k3code.setup.prompter import AnswerPrompter
+    from k3code.setup.steps import offer_project_recipes
+
+    repo = make(tmp_path / "repo", MONOREPO)
+    before = snapshot(repo)
+    said: list[str] = []
+    p = AnswerPrompter({"project_recipes": "accept_all"})
+    p.say = said.append  # type: ignore[method-assign]
+    out = offer_project_recipes(p, repo)
+    assert out["accepted"] and any("python (uv) in api/" in s for s in said)
+    store = ProposalStore(paths.home())
+    assert {x.status for x in store.all() if x.payload.get("op") == "recipe"} == {"accepted"}
+    assert "uv run pytest" in projectstate.rules_path(repo).read_text()
+    assert snapshot(repo) == before
+
+
+async def test_project_command_shows_stacks_and_pending_and_rescans(tmp_path):
+    from types import SimpleNamespace
+
+    from k3code.commands.project_cmd import ProjectCommand
+    from k3code.config import Settings
+
+    repo = make(tmp_path / "repo", {"go.mod": "module x\n", ".git/HEAD": ""})
+    live = SimpleNamespace(stored=SimpleNamespace(cwd=str(repo)))
+    store = ProposalStore(tmp_path / "home")
+    ctx = SimpleNamespace(
+        config=Settings(), autonomy=SimpleNamespace(proposals=store), sessions={"s1": live}, learning=None
+    )
+    cmd = ProjectCommand()
+    empty = await cmd.handle(ctx, "s1", "")
+    assert "No stacks detected" in empty["message"]
+    first = await cmd.handle(ctx, "s1", "rescan")
+    assert "new proposal" in first["message"] and "go: test `go test ./...`" in first["message"]
+    assert first["pending"] and first["stacks"] == [{"id": "go", "dir": ".", "label": "go (go)"}]
+    assert "nothing changed" in (await cmd.handle(ctx, "s1", "rescan"))["message"]
+    make(repo, {"go.mod": "module x\n\ngo 1.22\n"})
+    assert (await cmd.handle(ctx, "s1", ""))["changed"] is True
+    assert "Usage" in (await cmd.handle(ctx, "s1", "bogus"))["message"]

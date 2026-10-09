@@ -152,13 +152,48 @@ def search(query: str, cwd: str | Path, extra_roots: list[str] | None = None, li
     return [s for _, s in scored[:limit]]
 
 
+RECENT_USE_DAYS = 30
+
+
+def rank_skills(skills: list[Skill], cwd: str | Path, *, now: float | None = None) -> list[Skill]:
+    """Best first: skills that fit the project's detected stacks (or that the user pinned for it), then skills used
+    successfully in the last RECENT_USE_DAYS days (curator usage), then by name. Coarse on purpose: a use does not
+    reorder anything unless it crosses one of these lines, so the prompt stays cache-stable."""
+    import time
+
+    from k3code.learning import projectstate, recipes
+    from k3code.learning.curator import load_usage
+
+    state = projectstate.load(cwd)
+    keywords = recipes.keywords_for({str(s.get("id")) for s in state.get("stacks") or [] if isinstance(s, dict)})
+    pinned = set((state.get("accepted") or {}).get("skills") or [])
+    usage = load_usage()
+    cutoff = (now if now is not None else time.time()) - RECENT_USE_DAYS * 86400
+
+    def recent_ok(name: str) -> bool:
+        u = usage.get(name) if isinstance(usage, dict) else None
+        if not isinstance(u, dict):
+            return False
+        ok = int(u.get("uses") or 0) - int(u.get("failures") or 0) > 0
+        return ok and float(u.get("last_used") or 0) >= cutoff
+
+    def fits(s: Skill) -> bool:
+        return s.name in pinned or (bool(keywords) and recipes.skill_score(s.name, s.description, keywords) >= 2)
+
+    return sorted(skills, key=lambda s: (not fits(s), not recent_ok(s.name), s.name))
+
+
 def skills_prompt(cwd: str | Path, extra_roots: list[str] | None = None, limit: int = PROMPT_LIMIT) -> str:
-    """Names + descriptions only; full text is loaded on demand via the ``skill`` tool."""
+    """Names + descriptions only; full text is loaded on demand via the ``skill`` tool.
+
+    With more than ``limit`` skills, which ones are named is decided by rank (:func:`rank_skills`); the named ones
+    are listed by name, so the section changes only when the chosen set does."""
     skills = discover(cwd, extra_roots)
     if not skills:
         return ""
     lines = ["## Skills", "", "Load a skill's full instructions with the `skill` tool (`name`, or `query` to search)."]
-    for s in skills[:limit]:
+    chosen = sorted(rank_skills(skills, cwd)[:limit], key=lambda s: s.name) if len(skills) > limit else skills
+    for s in chosen:
         desc = s.description if len(s.description) <= 110 else s.description[:107] + "..."
         lines.append(f"- {s.name}: {desc}")
     if len(skills) > limit:

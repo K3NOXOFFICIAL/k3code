@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from k3code.confio import read_yaml
+from k3code.learning import projectstate
 from k3code.learning.decisions import DecisionLog
 from k3code.paths import user_config_path
 from test_permissions_gateway import bash, call, run_turn
@@ -94,9 +95,11 @@ async def test_commands_optimizer_selfimprove_and_project_prep(tmp_path, monkeyp
     sess = await call(server, "session.create", {"cwd": str(tmp_path)})
     await server.learning.drain()
     sid = sess["session_id"]
-    assert (tmp_path / ".k3code" / "project.json").is_file() and not (tmp_path / "K3CODE.md").exists()
+    # WS7: the scan is kept in k3code's state, not the repo, and the go recipe adds its own cards
+    assert projectstate.state_path(tmp_path).is_file() and not (tmp_path / ".k3code" / "project.json").exists()
+    assert not (tmp_path / "K3CODE.md").exists()
     kinds = {c["kind"] for c in shown(server)}
-    assert kinds == {"project_setup"}
+    assert kinds == {"project_setup", "mcp", "hook", "rule", "commands"}
     st = await call(server, "command.dispatch", {"name": "optimizer", "arg": "status", "session_id": sid})
     assert "off" in st["output"]
     si = await call(server, "command.dispatch", {"name": "self-improve", "arg": "faster startup", "session_id": sid})

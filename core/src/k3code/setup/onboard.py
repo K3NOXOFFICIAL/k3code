@@ -16,7 +16,7 @@ from k3code.paths import home, user_config_path
 from k3code.setup import probe
 from k3code.setup.prompter import Prompter
 from k3code.setup.state import env_file_path, read_env_file
-from k3code.setup.steps import Ctx, _entry_from, write_config
+from k3code.setup.steps import Ctx, _entry_from, offer_project_recipes, write_config
 from k3code.setup.wizard import run_setup
 
 QUESTION = "Fast setup (API endpoint + key) or full setup?"
@@ -193,6 +193,7 @@ def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
         p.say(f"  kept as fallback (after {entry['name']}): {', '.join(kept)}")
     if not model:
         p.say("  No model set yet: add providers[0].models.default with `k3code config-edit`.")
+    offer_project_recipes(p, Path.cwd())
     p.say("Ready. `k3code onboard` (choose full) adds more providers, MCP servers and more any time.")
 
 

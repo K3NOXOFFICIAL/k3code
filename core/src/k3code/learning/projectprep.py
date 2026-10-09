@@ -256,6 +256,35 @@ async def prepare(
     return out
 
 
+FACTS_MAX_LINES = 25
+
+
+def facts_prompt(cwd: str | Path) -> str:
+    """The "Project facts" system-prompt section from the stored scan (never a scan here): stacks, package managers
+    and commands. Built only from k3code's own templates and plain directory names, so no project-file text reaches
+    the prompt; it changes only when a re-scan stores a different result or the user confirms commands."""
+    state = projectstate.load(cwd)
+    found = [s for s in state.get("stacks") or [] if isinstance(s, dict) and s.get("id")]
+    if not found:
+        return ""
+    confirmed = (state.get("accepted") or {}).get("commands") or {}
+    body = ["stacks: " + ", ".join(recipes.label(s) for s in found)]
+    for s in found:
+        key = stacks.stack_key(s)
+        cmds = confirmed.get(key) or s.get("commands") or {}
+        if not cmds:
+            continue
+        where = "" if s.get("dir", ".") == "." else f"{s['dir']}/ "
+        tag = " (confirmed)" if key in confirmed else ""
+        shown = " · ".join(f"{k} `{cmds[k]}`" for k in stacks.COMMAND_KINDS if cmds.get(k))
+        body.append(f"{where}{s['id']}{tag}: {shown}")
+    head = ["## Project facts", "", "Detected from this project's files (re-scanned when they change):", "```text"]
+    room = FACTS_MAX_LINES - len(head) - 1
+    if len(body) > room:
+        body = [*body[: room - 1], f"…and {len(body) - room + 1} more"]
+    return "\n".join([*head, *body, "```"])
+
+
 def pending_recipes(store: ProposalStore, root: Path) -> list[Proposal]:
     """Recipe proposals of this project that still wait for an answer."""
     root_s = str(projectstate.project_root(root))
