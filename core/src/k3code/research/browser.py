@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from k3code.net_guard import BlockedURL, acheck_url, web_settings
 from k3code.paths import home as k3code_home
 from k3code.router.classifier import UPSTREAM_BLOCKED_PATTERNS
 
@@ -193,7 +194,10 @@ class BrowserManager:
         challenge_wait: float = 8.0,
         cdp_url: str = "",
         launcher: Callable[[str], Awaitable[Any]] | None = None,
+        allow_private: bool = False,
+        allow_hosts: frozenset[str] = frozenset(),
     ) -> None:
+        self.allow_private, self.allow_hosts = allow_private, allow_hosts  # SSRF guard escape hatches
         self.home = home
         self.headless = headless
         self.executable_path = executable_path
@@ -208,7 +212,10 @@ class BrowserManager:
     @classmethod
     def from_config(cls, config: Any) -> BrowserManager:
         cfg = dict(getattr(config, "browser", None) or {})
+        allow_private, allow_hosts = web_settings(config)
         return cls(
+            allow_private=allow_private,
+            allow_hosts=allow_hosts,
             headless=bool(cfg.get("headless", True)),
             executable_path=str(cfg.get("executable_path") or ""),
             challenge_wait=float(cfg.get("challenge_wait", 8)),
@@ -293,8 +300,10 @@ class BrowserManager:
     async def fetch(self, url: str) -> RenderedPage:
         """Renders ``url`` and returns what the page shows. Reads only: no clicks, no typing, no form submits."""
         site = urlparse(url).hostname or ""
+        await acheck_url(url, allow_private=self.allow_private, allow_hosts=self.allow_hosts)  # raises BlockedURL
         ctx = await self.context_for(site)
         page = await ctx.new_page()
+        await page.route("**/*", self._guard_route())  # redirects and sub-requests happen inside Chromium
         saved: list[str] = []
         pending: list[asyncio.Future[Any]] = []
         page.on("download", lambda d: pending.append(asyncio.ensure_future(self._save_download(d, saved))))
@@ -303,6 +312,30 @@ class BrowserManager:
         finally:
             with suppress(Exception):
                 await page.close()
+
+    def _guard_route(self) -> Callable[[Any], Awaitable[None]]:
+        """Playwright route handler: aborts any request (navigation, redirect hop or sub-resource) to a blocked host.
+        Verdicts are cached per host for the page, so a page with many sub-resources resolves each host once."""
+        verdicts: dict[str, bool] = {}
+
+        async def handler(route: Any) -> None:
+            url = str(route.request.url)
+            if urlparse(url).scheme in ("data", "blob", "about"):
+                await route.continue_()
+                return
+            host = (urlparse(url).hostname or "").lower()
+            if host not in verdicts:
+                try:
+                    await acheck_url(url, allow_private=self.allow_private, allow_hosts=self.allow_hosts)
+                    verdicts[host] = True
+                except BlockedURL:
+                    verdicts[host] = False
+            if verdicts[host]:
+                await route.continue_()
+            else:
+                await route.abort("blockedbyclient")
+
+        return handler
 
     async def _read(self, page: Any, url: str, saved: list[str], pending: list[asyncio.Future[Any]]) -> RenderedPage:
         status = 0
