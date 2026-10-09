@@ -130,6 +130,17 @@ async def test_session_create_fields():
     await server.close()
 
 
+async def test_session_list_rows_carry_the_session_cwd():
+    """The agent view lists only earlier sessions of the current project, so each row says where it ran."""
+    server = make_server()
+    sid = (await rpc(server, "session.create", {"model": "m", "cwd": "/tmp/proj"}))["result"]["session_id"]
+    unknown = server.store.create(cwd="").session_id
+    rows = {r["id"]: r for r in (await rpc(server, "session.list", req_id=2))["result"]["sessions"]}
+    assert rows[sid]["cwd"] == "/tmp/proj"
+    assert rows[unknown]["cwd"] is None
+    await server.close()
+
+
 async def test_prompt_submit_without_session_is_invalid_params():
     server = make_server()
     frame = await rpc(server, "prompt.submit", {"text": "hi"})

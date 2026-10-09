@@ -31,8 +31,8 @@ export interface ViewRow extends Omit<StripRow, "kind"> {
   model?: string;
 }
 
-/** `session.list` row; `cwd` is not in the generated contract yet, the gateway adds it later. */
-export type PastSessionRow = SessionListRow & { cwd?: string };
+/** `session.list` row. The k3code gateway adds `cwd` (null when unknown); the generated Hermes contract lacks it. */
+export type PastSessionRow = SessionListRow & { cwd?: null | string };
 
 const groupOf = (state: StripState): ViewGroup =>
   state === "input" ? "input" : state === "working" ? "working" : "finished";

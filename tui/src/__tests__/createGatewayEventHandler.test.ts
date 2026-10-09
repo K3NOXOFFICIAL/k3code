@@ -31,6 +31,7 @@ const buildCtx = (appended: Msg[]) =>
     },
     session: {
       STARTUP_RESUME_ID: "",
+      STARTUP_VIEW: "",
       colsRef: ref(80),
       newSession: vi.fn(),
       resetSession: vi.fn(),
@@ -1216,6 +1217,34 @@ describe("createGatewayEventHandler", () => {
     await vi.waitFor(() => expect(newSession).toHaveBeenCalled());
     expect(resumeById).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["agents", true],
+    ["tree", false],
+    ["", false],
+  ])(
+    "on gateway.ready with STARTUP_VIEW=%j, agentView is %s and a session is still forged",
+    async (view, open) => {
+      const newSession = vi.fn();
+      const ctx = buildCtx([]);
+
+      ctx.session.newSession = newSession;
+      ctx.session.STARTUP_VIEW = view;
+      ctx.gateway.rpc = vi.fn(async (method: string) =>
+        method === "config.get"
+          ? { config: { display: { tui_auto_resume_recent: false } } }
+          : null,
+      );
+
+      createGatewayEventHandler(ctx)({
+        payload: {},
+        type: "gateway.ready",
+      } as any);
+
+      expect(getOverlayState().agentView).toBe(open);
+      await vi.waitFor(() => expect(newSession).toHaveBeenCalled());
+    },
+  );
 
   it("on gateway.ready after a crash, resumes the recovered session once and skips forge", async () => {
     const appended: Msg[] = [];

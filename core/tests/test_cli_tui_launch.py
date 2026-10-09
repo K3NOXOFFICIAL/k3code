@@ -63,6 +63,17 @@ def test_config_dir_reaches_the_tui_gateway(launched, tmp_path):
     assert Path(launched[0]["K3CODE_PROJECT_DIR"]) == proj.resolve()
 
 
+def test_agents_opens_the_tui_on_the_daemon_with_the_agent_view(launched, monkeypatch):
+    monkeypatch.delenv("K3CODE_TUI_VIEW", raising=False)
+    monkeypatch.setenv("K3CODE_TUI_RESUME", "stale-session")  # inherited from a parent k3code: must not resume it
+    res = CliRunner().invoke(cli_mod.cli, ["agents"])
+    assert res.exit_code == 0, res.output
+    env = launched[0]
+    assert env["K3CODE_TUI_VIEW"] == "agents"
+    assert env["K3CODE_TUI_RESUME"] == ""
+    assert env["K3CODE_GATEWAY_CMD"].endswith("-m k3code.cli gateway --attach")
+
+
 async def test_gateway_loads_the_project_config_named_by_k3code_project_dir(tmp_path, monkeypatch):
     from k3code.gateway.server import GatewayServer
     from k3code.gateway.sessions import SessionStore

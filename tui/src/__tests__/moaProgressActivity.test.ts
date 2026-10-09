@@ -23,6 +23,7 @@ const buildCtx = (appended: Msg[]) =>
     },
     session: {
       STARTUP_RESUME_ID: "",
+      STARTUP_VIEW: "",
       colsRef: ref(80),
       newSession: () => undefined,
       resetSession: () => undefined,

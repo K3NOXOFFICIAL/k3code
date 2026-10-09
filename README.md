@@ -137,6 +137,7 @@ With a daemon running, `k3code attach <session-id>` opens the TUI on one of its 
 | `Ctrl+F` | Focus mode on/off (also `/focus`) |
 | `Ctrl+C` | Interrupt the running turn (clears the draft first if there is one) |
 | `↓` (empty input) | Move into the agent list under the input; `↑`/`↓` select, `Enter` opens that session, `x` stops it (asks first), `Esc` returns |
+| `←` (empty input) | Open the agent view: every session and sub-agent by state, plus earlier sessions of this project; `↑`/`↓` select, `Enter` attaches, `x` stops (asks first), `n` starts a new session, `←`/`Esc` go back (also `/agents`) |
 | `↑` / `↓` (in the input) | Walk through your previous inputs (kept per project) |
 | `Ctrl+B` | Send the running turn to the background |
 | `Alt+Y` / `Alt+N` | Accept / dismiss the top proposal card (a bare letter would steal the first character of your message) |
@@ -150,7 +151,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 |---|---|
 | **Session and context** | `/clear` · `/compact` · `/resume` · `/rename` · `/fork` · `/branch` · `/stop` · `/exit` · `/add-dir` |
 | **Models and effort** | `/model` (opens the picker; `/model <key>` switches; `/model chain` shows the fallback chain and its health, and `add`, `remove` and `move` edit it) · `/effort` · `/output-style` |
-| **Planning and agents** | `/goal` · `/loop` · `/bg` · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` · `/ultraresearch` · `/advisor` |
+| **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` · `/ultraresearch` · `/advisor` |
 | **Automation** | `/schedule` (cron) · `/automations` (file, git, webhook, session, network and idle triggers) |
 | **Review and learning** | `/review` · `/proposals` · `/learn` · `/optimizer` · `/self-improve` |
 | **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
@@ -206,6 +207,7 @@ A pane running k3code reports its state (working, needs input, done) to `k3` aut
 k3code daemon                  # long-lived host: sessions, scheduler, automations
 k3code service install         # systemd user unit (--dry-run previews it); then: loginctl enable-linger $USER
 k3code attach <session-id>     # open the TUI on a daemon session; detach any time, work continues
+k3code agents                  # open the TUI on the daemon with the agent view showing
 ```
 
 What keeps it alive and safe when nobody is watching:

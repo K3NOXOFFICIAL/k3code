@@ -20,6 +20,7 @@ import {
   DASHBOARD_TUI_MODE,
   NATIVE_MODE,
   STARTUP_RESUME_ID,
+  STARTUP_VIEW,
 } from "../config/env.js";
 import { WHEEL_SCROLL_STEP } from "../config/limits.js";
 import { RESIZE_COALESCE_MS } from "../config/timing.js";
@@ -1144,6 +1145,7 @@ export function useMainApp(gw: GatewayClient) {
         gateway,
         session: {
           STARTUP_RESUME_ID,
+          STARTUP_VIEW,
           colsRef,
           newSession: session.newSession,
           recoverSidRef,

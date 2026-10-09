@@ -26,6 +26,8 @@ const parseToggle = (v?: string): boolean | null => {
 export const TERMUX_TUI_MODE: boolean = isTermuxTuiMode();
 
 export const STARTUP_RESUME_ID = (process.env.K3CODE_TUI_RESUME ?? "").trim();
+// View to open once the gateway is ready (`k3code agents` sets "agents"); other values are ignored.
+export const STARTUP_VIEW = (process.env.K3CODE_TUI_VIEW ?? "").trim();
 export const STARTUP_QUERY = (process.env.K3CODE_TUI_QUERY ?? "").trim();
 export const STARTUP_IMAGE = (process.env.K3CODE_TUI_IMAGE ?? "").trim();
 // Workspace the dashboard user picked for a fresh chat (`/api/pty?cwd=`). Sent as the explicit

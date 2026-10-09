@@ -2456,6 +2456,7 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
                 "message_count": len(s.messages),
                 "status": state,
                 "state": state,
+                "cwd": s.cwd or None,
             }
         )
     return {"sessions": rows}

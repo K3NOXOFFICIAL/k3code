@@ -72,7 +72,7 @@ Research (2026-10-07):
 | Proactive proposals | openclaw task-suggestion tools (design reference), hermes suggestions dedup latch | NEW post-turn proposer |
 | Degradation to cheaper models | litellm complexity-router heuristics (design reference; no code copied) | NEW `degrade.py` tiers, chosen in the wizard |
 | Plan-first auto mode + scope decision + auto fan-out | hermes `delegate_tool` batch, `subagent_worktree`, `kanban_decompose` prompts; pi planner/worker/reviewer prompts (design reference) | NEW `scope_gate`, `complexity`, `fanout` with governor |
-| Agent strip under the input, ↑ history, states | hermes ui-tui `agentsPanel`, `agentControls`, `activeSessionSwitcher` (moved below the composer, cross-session rows) | NEW `tui/src/k3/agentStrip.tsx` |
+| Agent strip under the input, ↑ history, states | hermes ui-tui `agentsPanel`, `agentControls`, `activeSessionSwitcher` (moved below the composer, cross-session rows) | NEW `tui/src/k3/agentStrip.tsx`; the full-screen agent view `tui/src/k3/agentView.tsx` exists too (`←` on an empty input, `/agents`, `k3code agents`) |
 | Focus mode (only questions, input, results) | hermes `/focus` + details | NEW importance tag on every event + `focusPolicy.ts` |
 | Compaction, MCP (deferred tools), memory, skills | hermes `context_compressor`, `mcp_tool`, `memory_manager`, skills; opencode compaction template | gateway MCP + mem0 + skills-library preconfigured |
 | Sessions: export/import/fork/branch/resume/rename | hermes `hermes_state_portability`, `session_export`, `rewind` | NEW `.k3bundle` (settings + session, redacted) |

@@ -522,6 +522,7 @@ export function createGatewayEventHandler(
   ): Promise<null | T> => rawRpc<T>(method, params).catch(() => null);
   const {
     STARTUP_RESUME_ID,
+    STARTUP_VIEW,
     newSession,
     recoverSidRef,
     resumeById,
@@ -838,6 +839,11 @@ export function createGatewayEventHandler(
       patchUiState({ status: "recovering session…" });
 
       return;
+    }
+
+    // `k3code agents`: open the agent view over the session that is resumed or forged below.
+    if (STARTUP_VIEW === "agents") {
+      patchOverlayState({ agentView: true });
     }
 
     if (STARTUP_RESUME_ID) {
