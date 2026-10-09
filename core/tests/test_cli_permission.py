@@ -140,3 +140,32 @@ async def test_bad_configured_permission_mode_fails_session_start_not_the_daemon
     await server._handle_line(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session.list", "params": {}}))
     assert any(f.get("id") == 2 and "result" in f for f in frames_of(server))
     await server.close()
+
+
+def test_headless_runs_take_auto_from_the_flag(tmp_path, monkeypatch, seen):
+    """`k3code -p ... --permission auto`: only `headless_permission: auto` in the config used to reach auto mode."""
+    run(tmp_path, monkeypatch, PROV, "--permission", "auto")
+    run(tmp_path, monkeypatch, PROV + "headless_permission: auto-edit\n", "--permission", "auto", command=cli_mod.cli)
+    assert seen == ["auto", "auto"]
+    out = CliRunner().invoke(cli_mod.cli, ["--help"]).output
+    assert "auto-edit, auto (" in " ".join(out.split())
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("make build", "allow"),  # would ask: auto allows it, headless or not
+        ("rm -rf /", "deny"),  # hardline
+        ("rm build.log", "deny"),  # a user deny rule
+        ("cat .env", "deny"),  # a credential read
+    ],
+)
+def test_headless_auto_decides_like_interactive_auto(tmp_path, command, expected):
+    from k3code.permissions import Rule, decide
+
+    rules = [Rule(tool="bash", pattern="rm *", action="deny")]
+    got = [
+        decide(mode="auto", tool="bash", args={"command": command}, cwd=tmp_path, user_rules=rules, headless=h).action
+        for h in (True, False)
+    ]
+    assert got == [expected, expected]
