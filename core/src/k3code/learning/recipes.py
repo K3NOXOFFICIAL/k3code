@@ -157,10 +157,10 @@ def matching_skills(skills: list[Any], stack_id: str) -> list[str]:
 
 # ── formatter hooks ──
 
+#: double quotes only, so the single-quoted shell word stays readable in config.yaml
 _PATH_OF_EDIT = (
-    "import json,os,sys;d=sys.argv[1];"
-    "p=str((json.load(sys.stdin).get('tool_input') or {}).get('path') or '');"
-    "p=os.path.abspath(os.path.expanduser(p)) if p else '';"
+    'import json,os,sys;d=os.path.realpath(sys.argv[1]);p=str((json.load(sys.stdin).get("tool_input") or {})'
+    '.get("path") or "");p=os.path.realpath(os.path.expanduser(p)) if p else "";'
     "print(p) if p.endswith(tuple(sys.argv[2:])) and os.path.commonpath([d,p])==d else None"
 )
 

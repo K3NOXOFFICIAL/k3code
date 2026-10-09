@@ -173,7 +173,7 @@ async def test_formatter_hook_command_formats_only_matching_files_under_its_dir(
     for path in ("api/a.py", "api/b.md", "c.py"):
         out = await runner.run("PostToolUse", {"tool_input": {"path": path}}, tool_name="edit")
         assert not out.blocked
-    assert seen.read_text().splitlines() == [str(api / "a.py")]
+    assert seen.read_text().splitlines() == [str((api / "a.py").resolve())]
 
 
 async def test_fingerprint_change_proposes_only_what_is_new(tmp_path):
