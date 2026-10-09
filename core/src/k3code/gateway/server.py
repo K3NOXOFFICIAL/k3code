@@ -417,6 +417,8 @@ class Client:
 _ctx_client: contextvars.ContextVar[Client | None] = contextvars.ContextVar("k3_client", default=None)
 #: The session a turn task is running, so router/reliability events reach its clients.
 _ctx_session: contextvars.ContextVar[LiveSession | None] = contextvars.ContextVar("k3_session", default=None)
+#: Workspace the client named with ``slash.exec {cwd}`` (``/bg`` from a TUI attached to a daemon launched elsewhere).
+_ctx_cwd: contextvars.ContextVar[str | None] = contextvars.ContextVar("k3_cwd", default=None)
 
 
 class GatewayServer:
@@ -2245,12 +2247,12 @@ class GatewayServer:
 
     # ── background sessions (/bg, Ctrl+B) ─────────────────────────────
 
-    def _fresh_session_like(self, src: LiveSession, *, background: bool = False) -> LiveSession:
-        """A new session with ``src``'s cwd, model, permission mode and add-dirs."""
+    def _fresh_session_like(self, src: LiveSession, *, background: bool = False, cwd: str | None = None) -> LiveSession:
+        """A new session with ``src``'s cwd (``cwd`` instead when given), model, permission mode and add-dirs."""
         stored = self.store.create(
             model=src.stored.model or self.config.default_model,
             provider=src.stored.provider or "",
-            cwd=src.stored.cwd or str(Path.cwd()),
+            cwd=_norm_cwd(cwd) or src.stored.cwd or str(Path.cwd()),
         )
         stored.meta["mode"] = src.perms.mode.value
         stored.meta["add_dirs"] = list(src.perms.add_dirs)
@@ -2263,13 +2265,15 @@ class GatewayServer:
         self.live[live.session_id] = live
         return live
 
-    def start_background(self, origin: LiveSession, prompt: str) -> LiveSession:
-        """``/bg <prompt>``: run ``prompt`` in a new background session; notify ``origin`` when it ends."""
+    def start_background(self, origin: LiveSession, prompt: str, cwd: str | None = None) -> LiveSession:
+        """``/bg <prompt>``: run ``prompt`` in a new background session; notify ``origin`` when it ends.
+
+        ``cwd``: the client's workspace (a TUI attached to a daemon); without it the session inherits ``origin``'s."""
         if self.halted:
             raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
         if self.background_paused:
             raise _InvalidParams("background work is paused (restart-storm safe mode); resume with /daemon resume")
-        live = self._fresh_session_like(origin, background=True)
+        live = self._fresh_session_like(origin, background=True, cwd=cwd)
         live.stored.title = live.stored.title or " ".join(prompt.split())[:60]
         self.store.save(live.stored)
         live.turn_task = asyncio.get_running_loop().create_task(self._run_turn(live, prompt))
@@ -2743,7 +2747,7 @@ async def _prompt_background(server: GatewayServer, params: dict[str, Any]) -> d
         raise _InvalidParams("no active session")
     text = str(params.get("text") or "").strip()
     if text:
-        live = server.start_background(session, text)
+        live = server.start_background(session, text, cwd=params.get("cwd"))
         return {"session_id": live.session_id, "status": "started", "info": live.live_info()}
     if not session.streaming or session.turn_task is None or session.turn_task.done():
         raise _InvalidParams("nothing is running in this session; give a prompt: /bg <prompt>")
@@ -2826,7 +2830,11 @@ async def _slash_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str
     session_id = params.get("session_id")
     parts = command.split(None, 1)
     name, arg = parts[0], parts[1] if len(parts) > 1 else ""
-    return await server.dispatch_command(name, arg, session_id)
+    token = _ctx_cwd.set(params.get("cwd") or None)
+    try:
+        return await server.dispatch_command(name, arg, session_id)
+    finally:
+        _ctx_cwd.reset(token)
 
 
 async def _model_options(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

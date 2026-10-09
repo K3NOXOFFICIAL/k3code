@@ -14,7 +14,7 @@ import * as TerminalSetupModule from "../lib/terminalSetup.js";
 // DASHBOARD_TUI_MODE resolves once at module load from K3CODE_TUI_DASHBOARD,
 // so toggling process.env in a test body can't move it. Mock just that one
 // export (everything else stays real) and flip the holder per test.
-const envState = { dashboardTuiMode: false };
+const envState = { dashboardTuiMode: false, workspaceCwd: "" };
 vi.mock("../config/env.js", async (importActual) => {
   const actual = await importActual<typeof EnvModule>();
 
@@ -22,6 +22,9 @@ vi.mock("../config/env.js", async (importActual) => {
     ...actual,
     get DASHBOARD_TUI_MODE() {
       return envState.dashboardTuiMode;
+    },
+    get STARTUP_WORKSPACE_CWD() {
+      return envState.workspaceCwd;
     },
   };
 });
@@ -32,6 +35,7 @@ describe("createSlashHandler", () => {
     resetOverlayState();
     resetUiState();
     envState.dashboardTuiMode = false;
+    envState.workspaceCwd = "";
   });
 
   it("opens the unified sessions overlay for /resume", () => {
@@ -162,6 +166,36 @@ describe("createSlashHandler", () => {
     );
 
     vi.useRealTimers();
+  });
+
+  it("names the TUI's workspace with /bg so a daemon starts the session in this project", () => {
+    envState.workspaceCwd = "/work/proj";
+    patchUiState({
+      info: { cwd: "/daemon/launch" } as never,
+      sid: "sid-abc",
+    });
+    const ctx = buildCtx();
+
+    expect(createSlashHandler(ctx)("/bg write the tests")).toBe(true);
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
+      command: "bg write the tests",
+      cwd: "/work/proj",
+      session_id: "sid-abc",
+    });
+
+    // without K3CODE_TUI_CWD the session's own workspace; other commands carry no cwd
+    envState.workspaceCwd = "";
+    createSlashHandler(ctx)("/bg again");
+    expect(ctx.gateway.gw.request).toHaveBeenLastCalledWith("slash.exec", {
+      command: "bg again",
+      cwd: "/daemon/launch",
+      session_id: "sid-abc",
+    });
+    createSlashHandler(ctx)("/skills check");
+    expect(ctx.gateway.gw.request).toHaveBeenLastCalledWith("slash.exec", {
+      command: "skills check",
+      session_id: "sid-abc",
+    });
   });
 
   it("sends /model chain to the gateway instead of opening the model picker", () => {

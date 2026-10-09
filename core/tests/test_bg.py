@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+import m1cmd_helpers as m1
 from test_autonomy_gateway import call, events, make, start
 
 NO_GATE = {"autonomy": {"plan_first": False, "proposals": False}}
@@ -90,3 +91,29 @@ async def test_bg_refused_in_safe_mode(tmp_path, monkeypatch):
     server.background_paused = True
     out = await call(server, "slash.exec", {"command": "bg do it"})
     assert "paused" in out["output"]
+
+
+async def test_bg_runs_in_the_workspace_the_client_names(tmp_path, monkeypatch):
+    """A TUI attached to a daemon launched elsewhere sends its workspace with /bg: the background session runs there
+    (one spelling: symlinks resolved), not in the origin session's directory. Without a cwd it inherits the origin's."""
+    server, _ = m1.make_server(tmp_path, monkeypatch, ["bg reply"])
+    daemon_dir, project = tmp_path / "daemon", tmp_path / "project"
+    daemon_dir.mkdir()
+    project.mkdir()
+    (tmp_path / "link").symlink_to(project)
+    sid = await m1.new_session(server, daemon_dir)
+    res = await m1.rpc(
+        server, "slash.exec", {"command": "bg write a poem", "session_id": sid, "cwd": f"{tmp_path}/link/"}
+    )
+    new = server.live[res["result"]["session_id"]]
+    assert new.background and new.stored.cwd == str(project.resolve())
+    await asyncio.wait_for(new.turn_task, 20)
+
+    res = await m1.rpc(server, "prompt.background", {"text": "again", "session_id": sid, "cwd": str(project)})
+    other = server.live[res["result"]["session_id"]]
+    assert other.stored.cwd == str(project.resolve())
+    await asyncio.wait_for(other.turn_task, 20)
+
+    plain = (await m1.cmd(server, "/bg no cwd given", sid))["session_id"]
+    assert server.live[plain].stored.cwd == str(daemon_dir.resolve())
+    await asyncio.wait_for(server.live[plain].turn_task, 20)

@@ -1,6 +1,7 @@
 import { parseCommandDispatch, parseSlashCommand } from "@k3code/shared/slash";
 
 import type { SlashExecResponse } from "../gatewayTypes.js";
+import { STARTUP_WORKSPACE_CWD } from "../config/env.js";
 import { rpcErrorMessage } from "../lib/rpc.js";
 import { launchWidget } from "../sdk/host.js";
 import { getWidgetApp } from "../sdk/registry.js";
@@ -186,9 +187,15 @@ export function createSlashHandler(
       }
     };
 
+    // /bg starts a session on the gateway, which may be a daemon launched elsewhere: name this TUI's workspace
+    // (K3CODE_TUI_CWD, else the session's own) so the background session runs in this project.
+    const bgCwd =
+      parsed.name === "bg" ? STARTUP_WORKSPACE_CWD || ui.info?.cwd || "" : "";
+
     gw.request<SlashExecResponse>("slash.exec", {
       command: cmd.slice(1),
       session_id: sid,
+      ...(bgCwd ? { cwd: bgCwd } : {}),
     })
       .then((r) => {
         if (stale()) {
