@@ -13,6 +13,10 @@ All notable changes are listed here. Until version 1.0, any release may change t
 - **Logging.** `k3code -p` prints only warnings by default, ends the answer with a newline and says why on stderr when a run fails. `K3CODE_LOG_LEVEL=info` brings the log back.
 - **Setup.** Fast setup over an existing config puts the new provider first and keeps the others as fallbacks. `k3code doctor` reports a provider without a key as a warning while another provider can still answer.
 
+### Added
+
+- **`sandbox.home_readonly`** (user config only): `$HOME` entries that stay visible, read-only, inside the bash sandbox, for example `[".myapp"]`. The sandbox hid all of `$HOME`, so a model that checks a marker file in the home folder could never see it and repeated its first-run question in every `auto`/`yolo` session.
+
 ### Fixed
 
 - The TUI called 29 gateway methods that did not exist, and each printed "the terminal UI and the k3code backend are out of sync": window resize, `!cmd` shell mode (and `{!cmd}` inside a prompt), `/undo` and `/retry`, `/usage`, `/status`, `/save`, `/reload`, `/reload-mcp`, `/reload-skills`, pausing and steering sub-agents, and the command catalog. They exist now. `/rollback`, `/journey`, `/plugins`, `/tools`, `/btw`, `/skin`, `/personality`, `/fast`, `/verbose` and `/replay list|load` had no backend and are removed.
