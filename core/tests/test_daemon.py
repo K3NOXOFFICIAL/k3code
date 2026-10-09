@@ -13,6 +13,7 @@ import pytest
 
 from daemon_helpers import _stop_daemon
 from k3code import daemon, sdnotify, service
+from k3code.gateway.auth import authenticate
 
 
 def _write_fake_config(home: Path, script: list[dict]) -> None:
@@ -36,8 +37,17 @@ class Peer:
 
     @classmethod
     async def connect(cls, path: Path) -> Peer:
+        """Connect and send gateway.auth with the daemon token, as the TUI bridge and the CLI clients do."""
         r, w = await asyncio.open_unix_connection(str(path))
-        return cls(r, w)
+        peer = cls(r, w)
+
+        def keep(line: bytes) -> None:  # events sent before the auth reply (gateway.ready, notifications)
+            frame = json.loads(line)
+            if frame.get("method") == "event":
+                peer.events.append(frame["params"])
+
+        await authenticate(r, w, path, keep)
+        return peer
 
     async def call(self, method: str, **params):
         self._n += 1
