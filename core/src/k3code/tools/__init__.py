@@ -77,14 +77,23 @@ def _atomic_write(path: Path, data: bytes) -> None:
     """Replace ``path`` with ``data`` atomically (temp file in the same directory + rename), keeping its mode.
 
     A plain write_text() truncates first: a kill -9 or a full disk in the middle left a half-written source file.
-    Symlinks are written through (the link itself is not replaced).
+    Symlinks are written through (the link itself is not replaced). A new file gets 0666 minus the umask, like any
+    other program's (mkstemp made every new file 0600).
     """
+    import secrets
     import stat
-    import tempfile
 
     target = path.resolve() if path.is_symlink() else path
     mode = stat.S_IMODE(target.stat().st_mode) if target.exists() else None
-    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.k3tmp-")
+    for _ in range(100):
+        tmp = str(target.parent / f".{target.name}.k3tmp-{secrets.token_hex(4)}")
+        try:  # O_EXCL never follows or reuses an existing name; the kernel applies the umask to 0o666
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError(f"no free temporary name next to {target}")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
