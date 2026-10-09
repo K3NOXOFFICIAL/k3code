@@ -30,6 +30,7 @@ import {
 } from "../k3/agentStripStore.js";
 
 import { $agentDockCollapsed } from "./agentRoster.js";
+import { sendTurnToBackground } from "./backgroundSession.js";
 import { getInputSelection } from "./inputSelectionStore.js";
 import {
   type GatewayRpc,
@@ -680,18 +681,14 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         );
       }
 
-      return void gateway
-        .rpc<{ new_session_id?: string }>("prompt.background", {
-          session_id: live.sid,
-        })
-        .then((r) => {
-          if (r?.new_session_id) {
-            actions.resumeById?.(r.new_session_id);
-            actions.sys(
-              "turn sent to the background; it appears in the agent strip",
-            );
-          }
-        });
+      return void sendTurnToBackground(gateway.rpc, live.sid).then((r) => {
+        if (r?.new_session_id) {
+          actions.resumeById?.(r.new_session_id);
+          actions.sys(
+            "turn sent to the background; it appears in the agent strip",
+          );
+        }
+      });
     }
 
     if (key.upArrow && !cState.inputBuf.length) {

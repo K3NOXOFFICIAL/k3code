@@ -168,10 +168,10 @@ describe("createSlashHandler", () => {
     vi.useRealTimers();
   });
 
-  it("names the TUI's workspace with /bg so a daemon starts the session in this project", () => {
-    envState.workspaceCwd = "/work/proj";
+  it("starts /bg in the session's own cwd, so a switched project wins over the shell's K3CODE_TUI_CWD", () => {
+    envState.workspaceCwd = "/work/shell-project";
     patchUiState({
-      info: { cwd: "/daemon/launch" } as never,
+      info: { cwd: "/work/other-project" } as never,
       sid: "sid-abc",
     });
     const ctx = buildCtx();
@@ -179,21 +179,36 @@ describe("createSlashHandler", () => {
     expect(createSlashHandler(ctx)("/bg write the tests")).toBe(true);
     expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
       command: "bg write the tests",
-      cwd: "/work/proj",
+      cwd: "/work/other-project",
       session_id: "sid-abc",
     });
 
-    // without K3CODE_TUI_CWD the session's own workspace; other commands carry no cwd
-    envState.workspaceCwd = "";
+    // after switching again, the new session's cwd is used
+    patchUiState({ info: { cwd: "/daemon/launch" } as never });
     createSlashHandler(ctx)("/bg again");
     expect(ctx.gateway.gw.request).toHaveBeenLastCalledWith("slash.exec", {
       command: "bg again",
       cwd: "/daemon/launch",
       session_id: "sid-abc",
     });
+
+    // other commands carry no cwd
     createSlashHandler(ctx)("/skills check");
     expect(ctx.gateway.gw.request).toHaveBeenLastCalledWith("slash.exec", {
       command: "skills check",
+      session_id: "sid-abc",
+    });
+  });
+
+  it("falls back to K3CODE_TUI_CWD for /bg when no session info has arrived", () => {
+    envState.workspaceCwd = "/work/proj";
+    patchUiState({ info: null, sid: "sid-abc" });
+    const ctx = buildCtx();
+
+    createSlashHandler(ctx)("/bg write the tests");
+    expect(ctx.gateway.gw.request).toHaveBeenCalledWith("slash.exec", {
+      command: "bg write the tests",
+      cwd: "/work/proj",
       session_id: "sid-abc",
     });
   });

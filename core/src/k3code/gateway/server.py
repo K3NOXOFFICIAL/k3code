@@ -2213,6 +2213,7 @@ class GatewayServer:
         async def runner() -> None:
             _ctx_session.set(session)
             session.needs_input = False
+            session.run_result = None  # an earlier turn's outcome must not survive into this job's events
             session.streaming = True
             session.emit("message.start", {})
             session.emit("status.update", {"kind": "status", "text": label, "state": "working"})
@@ -2228,6 +2229,8 @@ class GatewayServer:
             finally:
                 session.streaming = False
                 self.subagents.interrupt_session(session.session_id)  # nothing may outlive the job
+            # same mapping as _run_one_turn, set before the closing events carry session.state
+            session.run_result = {"done": "completed", "interrupted": "completed"}.get(status, "failed")
             session.emit("message.delta", {"text": text})
             session.stored.messages = [
                 *session.stored.messages,

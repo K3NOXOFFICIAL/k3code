@@ -218,3 +218,55 @@ async def test_a_foreground_turn_reports_completed_and_failed_until_the_next_pro
     await m1.submit_and_wait(server, "third")
     assert seen == [None]
     assert live.run_result == "completed" and live.state == "completed"
+
+
+async def test_a_job_reports_its_own_outcome_not_an_earlier_turns_failure(tmp_path, monkeypatch):
+    """/ultraplan, /ultracode and /ultraresearch run through start_job: a 'failed' left by an earlier turn must not
+    reach the job's closing events, and a job's own result (completed or failed) replaces it."""
+    server, _ = m1.make_server(tmp_path, monkeypatch, ["done"])
+    provider = _FlakyProvider(["done"])
+    server.providers = [provider]  # type: ignore[list-item]
+    server.router = Router(build_chain([provider], [["m"]]), max_retries=0)  # type: ignore[list-item]
+    server._oneshot_routers["default"] = server.router  # type: ignore[attr-defined]
+    sid = await m1.new_session(server, tmp_path)
+    live = server.live[sid]
+
+    provider.fail = True
+    await m1.submit_and_wait(server, "boom")
+    assert live.state == "failed"
+
+    def closing(since: int) -> tuple[dict, dict]:
+        events = [f["params"] for f in m1.frames_of(server)[since:] if f.get("method") == "event"]
+        done = [e["payload"] for e in events if e.get("type") == "message.complete"][-1]
+        status = [e["payload"] for e in events if e.get("type") == "status.update"][-1]
+        return done, status
+
+    async def ok_job() -> str:
+        return "job result"
+
+    async def bad_job() -> str:
+        raise RuntimeError("job exploded")
+
+    seen: list[str | None] = []
+
+    async def probe_job() -> str:
+        seen.append(live.run_result)  # inside the job, after the reset
+        return "probe"
+
+    n = len(m1.frames_of(server))
+    server.start_job(live, "ultraplan x", ok_job)
+    await live.turn_task
+    done, status = closing(n)
+    assert done["status"] == "done" and done["state"] == "completed" and status["state"] == "completed"
+    assert live.run_result == "completed"
+
+    n = len(m1.frames_of(server))
+    server.start_job(live, "ultracode y", bad_job)
+    await live.turn_task
+    done, status = closing(n)
+    assert done["status"] == "error" and done["state"] == "failed" and status["state"] == "failed"
+    assert live.run_result == "failed"
+
+    server.start_job(live, "ultraresearch z", probe_job)
+    await live.turn_task
+    assert seen == [None] and live.state == "completed"
