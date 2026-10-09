@@ -7,6 +7,7 @@ import json
 import re
 import tarfile
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,33 @@ def session_to_dict(s: StoredSession) -> dict[str, Any]:
     return redact_session_json(asdict(s))
 
 
+def _known_secrets(config: Any, cwd: Path) -> list[str]:
+    """Every secret value this process knows (configured provider keys, secret-named env vars), longest first."""
+    from k3code.debugdump import secret_values
+
+    if config is None:
+        from k3code.config import load_config
+
+        try:
+            config = load_config(project_dir=cwd)
+        except Exception:  # noqa: BLE001 - a config that does not load still leaves the env vars to check
+            config = None
+    return secret_values(config)
+
+
+def _drop_values(obj: Any, secrets: list[str]) -> Any:
+    """``obj`` with every occurrence of a known secret value replaced, whatever its shape (scrub_text is by shape)."""
+    if isinstance(obj, dict):
+        return {k: _drop_values(v, secrets) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_drop_values(v, secrets) for v in obj]
+    if isinstance(obj, str):
+        for s in secrets:
+            if s in obj:
+                obj = obj.replace(s, REDACTED)
+    return obj
+
+
 def write_bundle(
     path: Path,
     *,
@@ -51,21 +79,24 @@ def write_bundle(
     cwd: Path,
     session_ids: list[str],
     settings: bool = True,
+    config: Any = None,
 ) -> dict[str, Any]:
-    """Write the bundle; returns the manifest."""
+    """Write the bundle; returns the manifest. ``config`` names the keys to drop (default: loaded for ``cwd``)."""
+    secrets = _known_secrets(config, cwd)
     files: dict[str, bytes] = {}
     if settings:
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                data = redact(confio.read_yaml(src))
+                data = _drop_values(redact(confio.read_yaml(src)), secrets)
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
     exported: list[str] = []
     for sid in session_ids:
         stored = store.get(sid)
         if stored is None:
             raise BundleError(f"unknown session: {sid}")
-        files[f"sessions/{sid}.json"] = json.dumps(session_to_dict(stored), ensure_ascii=False, indent=1).encode()
+        session = _drop_values(session_to_dict(stored), secrets)
+        files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
     manifest = {
         "version": BUNDLE_VERSION,
@@ -168,17 +199,94 @@ def merge_settings(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[s
 
 
 @dataclass
+class SensitiveItem:
+    """One user-level setting from a bundle that runs code, approves tools or sends keys somewhere."""
+
+    key: str  # e.g. "mcp.servers.github", "permissions.bash", "providers", "hooks"
+    path: tuple[str, ...]  # where it sits in the incoming settings
+    diff: list[str]  # "old → new" lines, secrets redacted
+
+    def text(self) -> str:
+        return f"The bundle changes {self.key}:\n" + "\n".join(f"  {line}" for line in self.diff)
+
+
+def _show(value: Any) -> str:
+    if value is None:
+        return "(not set)"
+    return json.dumps(redact(value), ensure_ascii=False, sort_keys=True)
+
+
+def sensitive_items(bundle: Bundle, existing: dict[str, Any] | None = None) -> list[SensitiveItem]:
+    """The user-level settings an import must not apply without an explicit yes, item by item.
+
+    MCP servers (a stdio ``command`` runs on the next start), permission rules (approve tools without asking),
+    providers (``base_url``/``api_key_env``: where a key is sent) and ``hooks``. ``existing`` defaults to the
+    user's config.yaml; an item that would not change anything is not listed.
+    """
+    incoming = bundle.settings.get("user") or {}
+    have = confio.read_yaml(user_config_path()) if existing is None else existing
+    items: list[SensitiveItem] = []
+    servers = (incoming.get("mcp") or {}).get("servers") if isinstance(incoming.get("mcp"), dict) else None
+    old_servers = (have.get("mcp") or {}).get("servers") or {} if isinstance(have.get("mcp"), dict) else {}
+    for name, spec in servers.items() if isinstance(servers, dict) else []:
+        old = old_servers.get(name) if isinstance(old_servers, dict) else None
+        if spec != old and spec != REDACTED:
+            diff = [f"{k}: {_show((old or {}).get(k))} → {_show(v)}" for k, v in (spec or {}).items()]
+            items.append(SensitiveItem(f"mcp.servers.{name}", ("mcp", "servers", name), diff or [_show(spec)]))
+    perms = incoming.get("permissions")
+    old_perms = have.get("permissions") if isinstance(have.get("permissions"), dict) else {}
+    for tool, entry in perms.items() if isinstance(perms, dict) else []:
+        if entry != old_perms.get(tool):
+            diff = [f"{_show(old_perms.get(tool))} → {_show(entry)}"]
+            items.append(SensitiveItem(f"permissions.{tool}", ("permissions", str(tool)), diff))
+    providers = incoming.get("providers")
+    if isinstance(providers, list):
+        old_by_name = {p.get("name"): p for p in have.get("providers") or [] if isinstance(p, dict)}
+        diff = []
+        for p in (p for p in providers if isinstance(p, dict)):
+            old = old_by_name.get(p.get("name")) or {}
+            for k in ("base_url", "api_key_env"):
+                if p.get(k) != old.get(k):
+                    diff.append(f"providers.{p.get('name', '?')}.{k}: {_show(old.get(k))} → {_show(p.get(k))}")
+        if diff:
+            items.append(SensitiveItem("providers", ("providers",), diff))
+    if "hooks" in incoming and incoming["hooks"] != have.get("hooks"):
+        items.append(SensitiveItem("hooks", ("hooks",), [f"{_show(have.get('hooks'))} → {_show(incoming['hooks'])}"]))
+    return items
+
+
+def _without(settings: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any]:
+    """A copy of ``settings`` with the value at ``path`` removed (and any section that leaves empty)."""
+    out = dict(settings)
+    head, *rest = path
+    if not rest:
+        out.pop(head, None)
+    elif isinstance(out.get(head), dict):
+        out[head] = _without(out[head], tuple(rest))
+        if not out[head]:
+            out.pop(head)
+    return out
+
+
+@dataclass
 class ImportReport:
     settings_written: list[str] = field(default_factory=list)
     backups: list[str] = field(default_factory=list)
     sessions: dict[str, str] = field(default_factory=dict)  # original id → imported id
     #: the project config the bundle wrote; it is not trusted until the user runs `k3code trust`
     untrusted_project: str | None = None
+    #: sensitive user settings left out (no explicit yes for each, see sensitive_items)
+    skipped: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
         lines = []
         for f in self.settings_written:
             lines.append(f"settings written: {f}")
+        for key in self.skipped:
+            lines.append(
+                f"warning: skipped {key} from the bundle (runs code, approves tools or sends keys; accept it item by "
+                "item in an interactive import, or pass --trust-bundle)"
+            )
         for b in self.backups:
             lines.append(f"backup: {b}")
         for old, new in self.sessions.items():
@@ -197,11 +305,20 @@ def apply_bundle(
     cwd: Path,
     settings: bool = True,
     sessions: bool = True,
+    accept: Callable[[SensitiveItem], bool] | None = None,
+    trust_bundle: bool = False,
 ) -> ImportReport:
+    """Merge the bundle. Each sensitive user setting (sensitive_items) is applied only with ``trust_bundle`` or
+    when ``accept(item)`` says yes; without either it is skipped and the report says so."""
     rep = ImportReport()
     if settings:
         for kind, incoming in bundle.settings.items():
             target = user_config_path() if kind == "user" else project_config_path(cwd)
+            if kind == "user" and not trust_bundle:
+                for item in sensitive_items(bundle, confio.read_yaml(target)):
+                    if accept is None or not accept(item):
+                        incoming = _without(incoming, item.path)
+                        rep.skipped.append(item.key)
             merged = merge_settings(confio.read_yaml(target), incoming)
             confio.validate(merged)
             # the bundle's project settings are its author's: never trusted on the user's behalf (see k3code.trust)

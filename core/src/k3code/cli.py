@@ -779,8 +779,17 @@ def export_cmd(
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation (headless)")
 @click.option("--settings-only", is_flag=True)
 @click.option("--session-only", is_flag=True)
-def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool) -> None:
-    """Import a .k3bundle: merge settings (existing config backed up) and sessions."""
+@click.option(
+    "--trust-bundle",
+    is_flag=True,
+    help="Also apply MCP servers, permission rules, provider endpoints and hooks without asking (--yes does not)",
+)
+def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool, trust_bundle: bool) -> None:
+    """Import a .k3bundle: merge settings (existing config backed up) and sessions.
+
+    MCP servers, permission rules, provider endpoints and hooks are asked for one by one in a terminal; without one
+    (and without --trust-bundle) they are skipped with a warning.
+    """
     from k3code.bundle import BundleError, apply_bundle, read_bundle
     from k3code.gateway.sessions import SessionStore
     from k3code.paths import home
@@ -794,12 +803,25 @@ def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool) -
         click.confirm("Import this bundle? Existing config is backed up first.", abort=True)
     store = SessionStore(home() / "sessions.db")
     try:
-        rep = apply_bundle(bundle, store=store, cwd=Path.cwd(), settings=not session_only, sessions=not settings_only)
+        rep = apply_bundle(
+            bundle,
+            store=store,
+            cwd=Path.cwd(),
+            settings=not session_only,
+            sessions=not settings_only,
+            accept=_confirm_item if _is_interactive() else None,
+            trust_bundle=trust_bundle,
+        )
     except (BundleError, ValueError) as e:
         raise click.ClickException(str(e)) from e
     finally:
         store.close()
     click.echo("Imported.\n" + rep.describe())
+
+
+def _confirm_item(item: Any) -> bool:
+    click.echo(item.text())
+    return click.confirm(f"Apply {item.key}?", default=False)
 
 
 @cli.command("setup")
