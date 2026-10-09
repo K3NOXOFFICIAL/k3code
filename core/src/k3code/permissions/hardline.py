@@ -107,6 +107,50 @@ LAUNCHERS = frozenset(
         *_WRAPPERS,
     }
 )
+#: Commands whose arguments name what runs (a package, a module, a script, a target, a container): a learned or
+#: proposed ``<prefix> *`` rule (``uv *``, ``npx *``, ``docker run *``) would allow anything at all, so they are only
+#: ever proposed as the exact command. Separate from LAUNCHERS, which also drives payload parsing.
+WILDCARD_UNSAFE = frozenset(
+    {"uv", "uvx", "npx", "bunx", "deno", "node", "perl", "ruby", "php", "sh", "bash", "zsh", "env", "xargs", "make"}
+)
+_WILDCARD_UNSAFE_PREFIXES = ("pip", "python")
+_WILDCARD_UNSAFE_PAIRS = frozenset(
+    {
+        ("pnpm", "dlx"),
+        ("pnpm", "exec"),
+        ("bun", "x"),
+        ("npm", "exec"),
+        ("docker", "run"),
+        ("docker", "exec"),
+        ("podman", "run"),
+        ("podman", "exec"),
+        ("kubectl", "exec"),
+    }
+)
+
+
+def wildcard_unsafe(command: str) -> bool:
+    """``command`` (or a rule pattern) starts with a command that must never get a ``<prefix> *`` rule (see
+    WILDCARD_UNSAFE), including ``git -c key=value ...`` (a config value can name a program to run)."""
+    toks = _tokens(command)
+    while toks and _is_assignment(toks[0]):
+        toks = toks[1:]
+    if not toks:
+        return False
+    root = os.path.basename(toks[0])
+    if root in WILDCARD_UNSAFE or root.startswith(_WILDCARD_UNSAFE_PREFIXES):
+        return True
+    if root == "git":
+        i = 1
+        while i < len(toks) and toks[i].startswith("-"):
+            if toks[i].startswith(("-c", "--config-env")):
+                return True
+            i += 2 if toks[i] in _GIT_VALUE_OPTS else 1
+        return False
+    operands = [t for t in toks[1:] if not t.startswith("-")]
+    return bool(operands) and (root, operands[0]) in _WILDCARD_UNSAFE_PAIRS
+
+
 _DANGEROUS_RM_TARGETS = frozenset(
     {
         "/",
@@ -780,7 +824,8 @@ def command_prefix(sub_command: str) -> str:
     """Narrowest arity prefix string for an ``always`` rule suggestion.
 
     ``git commit -m x`` -> ``"git commit"``; unknown commands -> first token.
-    Flags never count: they are stripped before arity lookup.
+    Flags never count: they are stripped before arity lookup, except python's ``-m MODULE``
+    (``python -m pytest -q`` -> ``"python -m pytest"``, not ``"python pytest"``).
     """
     try:
         tokens = shlex.split(sub_command, posix=True)
@@ -788,7 +833,8 @@ def command_prefix(sub_command: str) -> str:
         tokens = sub_command.split()
     while tokens and "=" in tokens[0] and tokens[0].split("=", 1)[0].isidentifier():
         tokens = tokens[1:]  # a leading VAR=value is not the command, and is often a secret
-    tokens = [t for t in tokens if not t.startswith("-") or t in ("-", "--")]
+    python = bool(tokens) and tokens[0].startswith("python")
+    tokens = [t for t in tokens if not t.startswith("-") or t in ("-", "--") or (python and t == "-m")]
     if not tokens:
         return ""
     from .arity import prefix

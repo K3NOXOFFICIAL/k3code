@@ -452,7 +452,7 @@ def _decide_bash(
     if secret == "deny":
         hit = "sensitive-path"
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
-    prefixes = [hardline.command_prefix(s) or s for s in subs]
+    prefixes = [_rule_pattern_base(s) for s in subs]
     if mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=prefixes, message=PLAN_MSG)
     if mode == PermissionMode.YOLO:
@@ -581,18 +581,39 @@ def _drop_assignments(prefix: str) -> str:
     return " ".join(words)
 
 
+#: An exact command proposed as a rule must not carry wildcards, variables, substitutions or redirections.
+_INEXACT = re.compile(r"[*?$`;&|<>\n]")
+
+
+def _rule_pattern_base(sub: str) -> str:
+    """What a bash decision records for ``sub``: its arity prefix, or the exact command for the commands whose
+    arguments name what runs (hardline.WILDCARD_UNSAFE: ``uv run pytest``, ``docker run --rm alpine``)."""
+    if hardline.wildcard_unsafe(sub):
+        return sub
+    return hardline.command_prefix(sub) or sub
+
+
+def exact_rule_pattern(command: str) -> str | None:
+    """``command`` as an exact rule pattern (leading assignments dropped), or None when it cannot be one."""
+    command = _drop_assignments(command.strip())
+    return command if command and not _INEXACT.search(command) else None
+
+
 def suggest_rules(tool: str, dec: Decision) -> list[Rule]:
     """Narrowest rules to persist for an ``always``/``session`` approval."""
     if tool == "bash":
         # "<prefix> *" matches "git commit" and "git commit -m x" but not "git commit-tree"/"shutdown".
         # Never for launchers (shells, ssh, interpreters, xargs, find, sudo ...): "always allow `python3 *`" would
         # allow every command the user will ever be asked about.
+        # For the commands whose arguments name what runs (uv, npx, make, docker run ...) only the exact command.
         # A leading VAR=value is dropped: "always" on `API_KEY=sk-... curl x` wrote the key into config.yaml.
-        prefixes = (_drop_assignments(p) for p in dec.patterns)
-        return [
-            Rule(tool="bash", pattern=f"{p} *", action="allow")
-            for p in dict.fromkeys(prefixes)
-            if p and not hardline.is_launcher(p)
-        ]
+        out: list[Rule] = []
+        for p in dict.fromkeys(_drop_assignments(p) for p in dec.patterns):
+            if not p or hardline.is_launcher(p):
+                continue
+            pattern = exact_rule_pattern(p) if hardline.wildcard_unsafe(p) else f"{p} *"
+            if pattern:
+                out.append(Rule(tool="bash", pattern=pattern, action="allow"))
+        return out
     name = "edit" if tool in EDIT_TOOLS else "read" if tool in READ_TOOLS else tool
     return [Rule(tool=name, pattern=p, action="allow") for p in dec.patterns]

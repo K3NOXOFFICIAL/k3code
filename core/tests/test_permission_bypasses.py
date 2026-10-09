@@ -160,14 +160,14 @@ HARDLINE_ALLOW: list[str] = [
 
 @pytest.mark.parametrize("cmd", HARDLINE_ALLOW)
 def test_hardline_does_not_overblock(cmd: str) -> None:
-    assert hardline.check(cmd, cwd="/work/proj", home="/home/tester") is None, cmd
+    assert hardline.check(cmd, cwd="/work/proj", home="/home/user") is None, cmd
 
 
 def test_rm_targets_expand_home_and_pwd() -> None:
-    assert hardline.check("rm -rf /home/tester/.", home="/home/tester") == "rm-rf-home"
-    assert hardline.check("rm -rf ${HOME}/", home="/home/tester") == "rm-rf-home"
-    assert hardline.check("rm -rf $PWD", cwd="/", home="/home/tester") == "rm-rf-root"
-    assert hardline.check("rm -rf $PWD", cwd="/work/proj", home="/home/tester") is None
+    assert hardline.check("rm -rf /home/user/.", home="/home/user") == "rm-rf-home"
+    assert hardline.check("rm -rf ${HOME}/", home="/home/user") == "rm-rf-home"
+    assert hardline.check("rm -rf $PWD", cwd="/", home="/home/user") == "rm-rf-root"
+    assert hardline.check("rm -rf $PWD", cwd="/work/proj", home="/home/user") is None
 
 
 # ── credential files: any command, any argument, nested or redirected, globbed or spelled with $HOME/$PWD/~ ──
@@ -368,3 +368,83 @@ NORMALIZE: list[tuple[list[str], list[str]]] = [
 @pytest.mark.parametrize(("argv", "expected"), NORMALIZE)
 def test_normalize_argv(argv: list[str], expected: list[str]) -> None:
     assert normalize_argv(argv) == expected
+
+
+# ── learned and proposed rule shapes: no wildcard after a command whose arguments name what runs ──
+
+#: (command, the rules an "always" approval proposes)
+SUGGEST: list[tuple[str, list[str]]] = [
+    ("uv run pytest", ["uv run pytest"]),
+    ("npx eslint .", ["npx eslint ."]),
+    ("docker run --rm alpine", ["docker run --rm alpine"]),
+    ("pnpm dlx create-app", ["pnpm dlx create-app"]),
+    ("git -c core.pager=less log", ["git -c core.pager=less log"]),
+    ("make test", ["make test"]),
+    ("API_KEY=sk-live-1 uvx ruff check", ["uvx ruff check"]),
+    ("npx eslint src/*.ts", []),  # an exact rule cannot carry a wildcard
+    ("node scripts/x.js", []),  # launchers are never proposed
+    ("python -m pytest", []),
+    ("npm test", ["npm test *"]),
+    ("git commit -m x", ["git commit *"]),
+    ("docker ps -a", ["docker ps *"]),
+]
+
+
+@pytest.mark.parametrize(("cmd", "expected"), SUGGEST)
+def test_always_rules_are_exact_for_wildcard_unsafe_commands(tmp_path: Path, cmd: str, expected: list[str]) -> None:
+    from k3code.permissions.engine import suggest_rules
+
+    d = _decide(cmd, "default", tmp_path)
+    assert [r.pattern for r in suggest_rules("bash", d)] == expected
+
+
+#: (learned pattern, rejected)
+LEARNED: list[tuple[str, bool]] = [
+    ("uv *", True),
+    ("uv run *", True),
+    ("npx *", True),
+    ("node *", True),
+    ("docker run *", True),
+    ("podman exec *", True),
+    ("kubectl exec *", True),
+    ("python3.12 *", True),
+    ("pip install *", True),
+    ("make *", True),
+    ("git -c *", True),
+    ("uv run pytest", False),
+    ("docker ps *", False),
+    ("kubectl get *", False),
+    ("npm test *", False),
+    ("git commit *", False),
+]
+
+
+@pytest.mark.parametrize(("pattern", "rejected"), LEARNED)
+def test_learned_wildcards_on_wildcard_unsafe_commands_are_rejected(pattern: str, rejected: bool) -> None:
+    from k3code.learning.permrules import unsafe_pattern
+
+    assert unsafe_pattern(pattern) is rejected
+
+
+#: (detected project command, proposed allow pattern)
+PROJECT_COMMANDS: list[tuple[str, str]] = [
+    ("uv run pytest", "uv run pytest"),
+    ("npx eslint .", "npx eslint ."),
+    ("python -m pytest", "python -m pytest"),
+    ("make test", "make test"),
+    ("npm test", "npm test *"),
+    ("cargo test", "cargo test *"),
+]
+
+
+@pytest.mark.parametrize(("cmd", "expected"), PROJECT_COMMANDS)
+def test_project_setup_proposes_exact_commands_for_wildcard_unsafe_ones(cmd: str, expected: str) -> None:
+    from k3code.learning.projectprep import safe_commands
+
+    assert safe_commands({"test": cmd}) == [expected]
+
+
+def test_command_prefix_keeps_python_module() -> None:
+    assert hardline.command_prefix("python -m pytest -q") == "python -m pytest"
+    assert hardline.command_prefix("python3 -u -m http.server 8000") == "python3 -m http.server"
+    assert hardline.command_prefix("python script.py") == "python script.py"
