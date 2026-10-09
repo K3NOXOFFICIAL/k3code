@@ -182,6 +182,9 @@ class Settings(BaseModel):
     # User hooks: {PreToolUse: [{matcher, command, timeout}], ...}. Run from the user's config and, once the project
     # is trusted, the project's: both apply (k3code.userhooks.load reads each file; this merged value is not used).
     hooks: dict[str, Any] = Field(default_factory=dict)
+    # What the daemon prunes at start: {usage_days: 180, journal_days: 30, debug_bundles: 10, decisions_days: 365};
+    # see retention()
+    retention: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -196,6 +199,22 @@ class Settings(BaseModel):
                 research["searxng_url"] = legacy["url"]
             data["research"] = research
         return data
+
+
+#: ``retention`` defaults: usage.db rows (days), closed sessions' journal files (days), debug bundles kept (count),
+#: learning decisions (days).
+RETENTION_DEFAULTS: dict[str, int] = {"usage_days": 180, "journal_days": 30, "debug_bundles": 10, "decisions_days": 365}
+
+
+def retention(config: Any) -> dict[str, int]:
+    """``config.retention`` over :data:`RETENTION_DEFAULTS`; a value that is not a positive number keeps its default."""
+    raw = getattr(config, "retention", None) or {}
+    out = dict(RETENTION_DEFAULTS)
+    for key in out:
+        value = raw.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+            out[key] = int(value)
+    return out
 
 
 def _current_home() -> Path:

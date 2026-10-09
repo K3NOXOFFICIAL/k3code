@@ -134,12 +134,22 @@ async def _housekeeping(server: Any, home: Path) -> None:
 
 
 async def _sweep_empty_sessions(server: Any) -> None:
-    """Once, after readiness: drop old empty stored sessions (rows a loop or automation points at stay)."""
-    with contextlib.suppress(Exception):  # housekeeping: a failed sweep must never hurt the running daemon
-        if server.stopping:
-            return
+    """Once, after readiness: drop old empty stored sessions (rows a loop or automation points at stay), then prune
+    old usage rows and closed sessions' journal files (``retention``)."""
+    if server.stopping:
+        return
+    try:  # housekeeping: a failed sweep must never hurt the running daemon, but it must be visible
         swept = await server.sweep_empty_sessions_async()
         logger.info("swept %d old empty stored session(s)", swept)
+    except Exception:
+        logger.exception("empty-session sweep failed")
+    try:
+        pruned = server.prune_retention()
+        logger.info(
+            "retention: pruned %d usage row(s), %d journal file(s)", pruned["usage_rows"], pruned["journal_files"]
+        )
+    except Exception:
+        logger.exception("retention pruning failed")
 
 
 SAFE_MODE_NOTICE = (

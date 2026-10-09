@@ -2,7 +2,9 @@
 the last read, ``bash_kill`` stops it. A job belongs to the session that started it: another session can neither read
 nor kill it. Every job of a session is killed when the session closes (``reap``).
 
-``list_jobs(session_id)`` is the read-only view for callers outside the agent loop (the gateway's process list).
+``list_jobs(session_id)`` is the read-only view for callers outside the agent loop. ``processes(session_id)`` is the
+gateway's ``process.list``: the session's background jobs plus the foreground ``bash`` commands running right now
+(``track``/``untrack`` around each one).
 """
 
 from __future__ import annotations
@@ -16,6 +18,8 @@ from typing import Any
 
 #: Unread output kept per job; past it the oldest unread bytes are dropped (and the next read says how many).
 MAX_UNREAD_BYTES = 1024 * 1024
+#: Last output bytes kept per job for the process list's preview (independent of what bash_output has read).
+TAIL_BYTES = 2048
 
 
 @dataclass
@@ -29,6 +33,9 @@ class Job:
     dropped: int = 0  # unread bytes dropped since the last read
     exit_code: int | None = None
     reader: asyncio.Task[None] | None = None
+    cwd: str = ""
+    exited_at: float | None = None
+    tail: bytearray = field(default_factory=bytearray)
 
     @property
     def running(self) -> bool:
@@ -40,6 +47,8 @@ class Job:
         if over > 0:
             del self.unread[:over]
             self.dropped += over
+        self.tail += chunk
+        del self.tail[:-TAIL_BYTES]
 
     def info(self) -> dict[str, Any]:
         return {
@@ -52,14 +61,61 @@ class Job:
             "started": self.started,
         }
 
+    def process_entry(self, now: float) -> dict[str, Any]:
+        """The TUI's ``ProcessEntry`` shape (tui/src/app/processRoster.ts); ``session_id`` is the row id there."""
+        return {
+            "session_id": self.id,
+            "job_id": self.id,
+            "kind": "background",
+            "pid": self.proc.pid,
+            "command": self.command,
+            "cwd": self.cwd,
+            "started": self.started,
+            "status": "running" if self.running else "exited",
+            "uptime_seconds": max(0.0, now - self.started),
+            "exit_code": self.exit_code,
+            "exited_at": self.exited_at,
+            "completion_reason": None,
+            "output_preview": bytes(self.tail).decode("utf-8", errors="replace"),
+        }
+
+
+@dataclass
+class Foreground:
+    """A foreground ``bash`` command while it runs (it leaves the list when the call returns)."""
+
+    session_id: str
+    command: str
+    pid: int
+    cwd: str
+    started: float = field(default_factory=time.time)
+
+    def process_entry(self, now: float) -> dict[str, Any]:
+        return {
+            "session_id": f"fg{self.pid}",
+            "job_id": "",
+            "kind": "foreground",
+            "pid": self.pid,
+            "command": self.command,
+            "cwd": self.cwd,
+            "started": self.started,
+            "status": "running",
+            "uptime_seconds": max(0.0, now - self.started),
+            "exit_code": None,
+            "exited_at": None,
+            "completion_reason": None,
+            "output_preview": "",
+        }
+
 
 class JobRegistry:
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
         self._ids = itertools.count(1)
+        self._foreground: dict[int, Foreground] = {}
 
-    def add(self, session_id: str, command: str, proc: asyncio.subprocess.Process) -> Job:
-        job = Job(id=f"job{next(self._ids)}", session_id=session_id, command=command, proc=proc)
+    def add(self, session_id: str, command: str, proc: asyncio.subprocess.Process, *, cwd: str = "") -> Job:
+        job = Job(id=f"job{next(self._ids)}", session_id=session_id, command=command, proc=proc, cwd=cwd)
         job.reader = asyncio.ensure_future(self._pump(job))
         self._jobs[job.id] = job
         return job
@@ -70,6 +126,7 @@ class JobRegistry:
             while chunk := await stream.read(64 * 1024):
                 job.feed(chunk)
         job.exit_code = await job.proc.wait()
+        job.exited_at = time.time()
 
     def get(self, session_id: str, job_id: str) -> Job | None:
         """The job, only for the session that started it."""
@@ -118,6 +175,19 @@ class JobRegistry:
     def list_jobs(self, session_id: str) -> list[dict[str, Any]]:
         return [j.info() for j in self._jobs.values() if j.session_id == session_id]
 
+    def track(self, session_id: str, command: str, pid: int, cwd: str = "") -> None:
+        """A foreground command of ``session_id`` started (shown by :meth:`processes` until :meth:`untrack`)."""
+        self._foreground[pid] = Foreground(session_id=session_id, command=command, pid=pid, cwd=cwd)
+
+    def untrack(self, pid: int) -> None:
+        self._foreground.pop(pid, None)
+
+    def processes(self, session_id: str) -> list[dict[str, Any]]:
+        """Foreground commands running now, then the session's background jobs (running and exited)."""
+        now = time.time()
+        fg = [f.process_entry(now) for f in self._foreground.values() if f.session_id == session_id]
+        return fg + [j.process_entry(now) for j in self._jobs.values() if j.session_id == session_id]
+
     def _ids_of(self, session_id: str) -> str:
         return ", ".join(j.id for j in self._jobs.values() if j.session_id == session_id)
 
@@ -131,6 +201,8 @@ async def _stop(job: Job) -> None:
             await asyncio.wait_for(job.reader, timeout=5.0)
     if job.exit_code is None:
         job.exit_code = job.proc.returncode
+    if job.exited_at is None:
+        job.exited_at = time.time()
 
 
 #: The process-wide registry (the gateway serves every session from one event loop).

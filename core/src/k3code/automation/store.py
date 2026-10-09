@@ -12,6 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from k3code import sqlstore
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS loops (
     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, prompt TEXT NOT NULL, schedule TEXT,
@@ -55,10 +57,8 @@ class AutomationDB:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(self.path), check_same_thread=False, timeout=10)
+        self._db = sqlstore.connect(self.path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA busy_timeout=10000")
         self._db.executescript(_SCHEMA)
         self._db.commit()
 

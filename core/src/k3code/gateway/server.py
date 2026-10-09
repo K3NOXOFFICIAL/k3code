@@ -20,10 +20,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import hashlib
 import hmac
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 import uuid
@@ -46,7 +48,7 @@ from k3code.autonomy.ultra import Ultra
 from k3code.blockers import BlockerStore
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
-from k3code.config import Settings, default_project_dir, load_config
+from k3code.config import Settings, default_project_dir, load_config, retention
 from k3code.context_budget import compact_threshold, context_window, overhead_tokens
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
@@ -84,6 +86,7 @@ from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
+from k3code.reliability.journal import delete_session_journal, prune_journals
 from k3code.reliability.persistent_retry import PERMANENT_REASONS, TurnCancelled
 from k3code.research.browser import BrowserManager
 from k3code.research.fetch import WebFetcher
@@ -214,6 +217,8 @@ class LiveSession:
         #: True while a /goal continuation runs: nobody is watching, so bash is sandboxed even in a foreground session.
         self.goal_continuation = False
         self.reliability: Reliability | None = None
+        #: Why NetWatch did not start ("" while it runs): offline pause/resume is off for this session until it does.
+        self.offline_protection_error = ""
         #: paused = waiting on the network/provider; the session still counts as working.
         self.paused = False
         self.paused_since = 0.0
@@ -1001,9 +1006,11 @@ class GatewayServer:
             # its caller is still attached. Only the live entry is dropped; the stored row stays. Not during a daemon
             # stop: close() iterates the registry across awaits.
             if client.session_id and not self.stopping:
-                with contextlib.suppress(Exception):
+                try:
                     if (await self.close_live(client.session_id, disposable_only=True))["closed"]:
                         logger.info("closed empty session %s: its last client left", client.session_id)
+                except Exception:
+                    logger.exception("closing session %s after its last client left failed", client.session_id)
 
     async def _read_frame(self, reader: asyncio.StreamReader, client: Client) -> bytes | None:
         """The next line from ``reader`` (b"" at EOF), or None for one longer than MAX_FRAME_BYTES: that frame is
@@ -1075,6 +1082,7 @@ class GatewayServer:
                     "status": s.state,
                     "state": s.state,
                     "paused": s.paused,
+                    "offline_protection": not s.offline_protection_error,
                     "background": s.background,
                     "origin": s.stored.meta.get("origin", ""),
                     "title": s.stored.title or "Session",
@@ -1111,8 +1119,10 @@ class GatewayServer:
     async def _idle_sweep_loop(self) -> None:
         while True:
             await asyncio.sleep(self.IDLE_SWEEP_EVERY_S)
-            with contextlib.suppress(Exception):
+            try:
                 await self.sweep_idle_reliability()
+            except Exception:
+                logger.exception("idle reliability sweep failed")
 
     async def sweep_idle_reliability(self, now: float | None = None) -> int:
         """Stop the NetWatch of sessions that have been idle for IDLE_RELIABILITY_S; returns how many were stopped.
@@ -1129,9 +1139,12 @@ class GatewayServer:
                 continue
             if now - live.idle_since < self.IDLE_RELIABILITY_S:
                 continue
-            with contextlib.suppress(Exception):
+            try:
                 await rel.stop()  # re-armed by _reliability_for on the session's next turn
-                stopped += 1
+            except Exception:
+                logger.warning("session %s: stopping its idle NetWatch failed", live.session_id, exc_info=True)
+                continue
+            stopped += 1
         return stopped
 
     def shutdown(self) -> None:
@@ -1161,8 +1174,10 @@ class GatewayServer:
             await tool_jobs.REGISTRY.reap_all()  # no background bash job outlives the daemon
         for live in self.live.values():
             if live.reliability is not None:
-                with contextlib.suppress(Exception):
+                try:
                     await live.reliability.stop()
+                except Exception:
+                    logger.warning("session %s: stopping its reliability bundle failed", live.session_id, exc_info=True)
         await self.mcp.close()
         for p in self.providers:
             await p.aclose()
@@ -1397,8 +1412,26 @@ class GatewayServer:
             session.reliability = rel
         assert self.router is not None
         session.reliability.register_providers(self.router.chain)
-        with contextlib.suppress(Exception):
+        try:
             await session.reliability.start()
+        except Exception as e:  # noqa: BLE001 - the turn still runs, without offline pause/resume
+            logger.exception("session %s: NetWatch did not start; offline protection is off", session.session_id)
+            if not session.offline_protection_error:  # one notice per session, not one per turn
+                session.emit(
+                    "notification.show",
+                    {
+                        "text": f"offline protection off: network watch failed to start ({e})",
+                        "level": "warning",
+                        "kind": "reliability",
+                        "key": self.NETWATCH_KEY,
+                    },
+                    importance="essential",
+                )
+            session.offline_protection_error = str(e) or type(e).__name__
+        else:
+            if session.offline_protection_error:
+                session.offline_protection_error = ""
+                session.emit("notification.clear", {"key": self.NETWATCH_KEY}, importance="essential")
         return session.reliability
 
     def _on_router_event(self, event: RouterEvent) -> None:
@@ -1428,6 +1461,8 @@ class GatewayServer:
 
     #: Notification key shared by pause/park toasts so ``resumed`` can clear them.
     PAUSE_KEY = "k3.reliability.pause"
+    #: Notification key of the "offline protection off" warning (NetWatch failed to start).
+    NETWATCH_KEY = "k3.reliability.netwatch"
 
     def _on_reliability_event(self, session: LiveSession, event: Any) -> None:
         """Map a ``reliability.*`` / ``net.state`` loop event onto the TUI events that display it.
@@ -2349,14 +2384,51 @@ class GatewayServer:
         process's next save restores the session. ``save()`` is no upsert: a row removed by ``session.delete`` has
         no tombstone and stays gone. The sweep forgets tombstones after 90 days."""
         keep = self._sweep_keep()
-        return 0 if keep is None else self.store.sweep_empty(now=now, max_age=max_age, keep=keep)
+        if keep is None:
+            return 0
+        swept: list[str] = []
+        n = self.store.sweep_empty(now=now, max_age=max_age, keep=keep, swept=swept)
+        for sid in swept:
+            self.remove_session_files(sid)
+        return n
 
     async def sweep_empty_sessions_async(
         self, *, now: float | None = None, max_age: float = EMPTY_SESSION_MAX_AGE_S
     ) -> int:
         """:meth:`sweep_empty_sessions` in small batches that yield to the event loop (same tombstones)."""
         keep = self._sweep_keep()
-        return 0 if keep is None else await self.store.sweep_empty_async(now=now, max_age=max_age, keep=keep)
+        if keep is None:
+            return 0
+        swept: list[str] = []
+        n = await self.store.sweep_empty_async(now=now, max_age=max_age, keep=keep, swept=swept)
+        for sid in swept:
+            self.remove_session_files(sid)
+        return n
+
+    def remove_session_files(self, sid: str) -> None:
+        """A deleted or swept session's files: its tool journal, transcript checkpoint and stored pastes.
+
+        ``sid`` comes from a client (session.delete): only a plain name is used, never ``.``, ``..`` or a path (``..``
+        would have made the pastes directory ``$K3CODE_HOME`` itself)."""
+        if not sid or sid in (".", "..") or "/" in sid or "\\" in sid or "\0" in sid:
+            return
+        home = self._home()
+        delete_session_journal(home, sid)
+        pastes = home / PASTES_DIR / sid
+        if pastes.is_dir() and not pastes.is_symlink():
+            shutil.rmtree(pastes, ignore_errors=True)
+
+    def prune_retention(self, *, now: float | None = None) -> dict[str, int]:
+        """Daemon start: usage rows past ``retention.usage_days``, journal files of sessions that are not live and not
+        written for ``retention.journal_days``, learning decisions past ``retention.decisions_days`` (debug bundles
+        are pruned as each is written)."""
+        keep = retention(self.config)
+        rows = self.usage.prune(keep["usage_days"], now=now)
+        files = prune_journals(
+            self._home(), keep=lambda sid: sid in self.live, max_age_s=keep["journal_days"] * 86400, now=now
+        )
+        decisions = self.learning.log.prune(keep["decisions_days"])
+        return {"usage_rows": rows, "journal_files": files, "decisions": decisions}
 
     async def resume_goals(self) -> int:
         """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.
@@ -2905,7 +2977,8 @@ async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict
         if live.turn_task is not None and not live.turn_task.done():
             live.turn_task.cancel()
         if live.reliability is not None:
-            await live.reliability.stop()
+            await live.reliability.stop()  # closes the journal file before it goes
+    server.remove_session_files(str(sid))
     for client in server.clients:
         if client.session_id == sid:
             client.session_id = None
@@ -3073,6 +3146,41 @@ async def _subagent_tail(server: GatewayServer, params: dict[str, Any]) -> dict[
 async def _clipboard_paste(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     # M1: no clipboard integration; the TUI pastes text inline instead.
     return {"text": "", "images": [], "files": []}
+
+
+async def _process_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """The TUI's process dock (polled): the session's running foreground ``bash`` commands and its background jobs.
+
+    In memory only (no disk, no subprocess): it is asked every 1.5 s. Each entry has the TUI's ``ProcessEntry`` shape
+    plus ``pid``, ``started``, ``cwd`` and ``kind``; its ``session_id`` is the process's own id (the TUI keys rows on
+    it), the owning session is the one asked for."""
+    live = server._session_for(params.get("session_id"))
+    return {"processes": tool_jobs.REGISTRY.processes(live.session_id) if live is not None else []}
+
+
+#: Pasted text the TUI collapsed into a token is kept here, one directory per session (removed with the session).
+PASTES_DIR = "pastes"
+
+
+async def _paste_collapse(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Store a large paste the TUI shows as a ``[Pasted text #N]`` token; returns ``{path}`` of the stored copy.
+
+    The file name is the content hash, so pasting the same text twice writes one file. The session is the caller's
+    live session (the TUI sends no session id); only a live session's id ever becomes a directory name."""
+    text = params.get("text")
+    if not isinstance(text, str):
+        raise _InvalidParams("text must be a string")
+    live = server.live.get(str(params.get("session_id") or "")) or server.session
+    sid = live.session_id if live is not None else "unbound"
+    folder = server._home() / PASTES_DIR / sid
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    data = text.encode("utf-8")
+    path = folder / f"{hashlib.sha256(data).hexdigest()[:16]}.txt"
+    if not path.exists():
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    return {"path": str(path), "chars": len(text), "lines": text.count("\n") + 1}
 
 
 async def _image_attach(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3592,6 +3700,8 @@ _HANDLERS: dict[str, Any] = {
     "subagent.interrupt": _subagent_interrupt,
     "subagent.tail": _subagent_tail,
     "clipboard.paste": _clipboard_paste,
+    "paste.collapse": _paste_collapse,
+    "process.list": _process_list,
     "image.attach": _image_attach,
     "image.attach_bytes": _image_attach,
     "image.detach": _image_detach,

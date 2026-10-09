@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable
@@ -280,15 +282,46 @@ def load_preferences(home: Path, top: int = 5) -> list[Preference]:
     return prefs[:top]
 
 
-def store_mem0(
-    config: Any, prefs: list[Preference], post: Callable[[str, dict[str, Any], dict[str, str]], None] | None = None
-) -> int:
-    """Store each preference as a mem0 memory when mem0 is configured. The key comes from the env only."""
-    import os
+#: Keys of what store_mem0 already posted (newest last), so the daily distill does not post every preference again.
+MEM0_POSTED = "mem0_posted.json"
+MEM0_POSTED_MAX = 2000
 
+
+def _posted_key(m: Any, text: str) -> str:
+    """Same text to the same mem0 target = same key; another url, agent or user posts again."""
+    return hashlib.sha256(f"{m.url}\0{m.agent_id}\0{m.user_id}\0{text}".encode()).hexdigest()[:24]
+
+
+def _load_posted(path: Path) -> list[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [str(k) for k in data] if isinstance(data, list) else []
+
+
+def _save_posted(path: Path, keys: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(keys[-MEM0_POSTED_MAX:]), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def store_mem0(
+    config: Any,
+    prefs: list[Preference],
+    post: Callable[[str, dict[str, Any], dict[str, str]], None] | None = None,
+    posted: Path | None = None,
+) -> int:
+    """Store each preference as a mem0 memory when mem0 is configured. The key comes from the env only.
+
+    ``posted`` is a JSON file of what was already sent: a preference posted before is skipped (the daily distill
+    re-derives every preference and posted each one again, every day). Returns how many were posted now."""
     m = getattr(config, "mem0", None)
     if m is None or not m.url:
         return 0
+    done = _load_posted(posted) if posted is not None else []
+    seen = set(done)
     headers = {"Content-Type": "application/json"}
     if m.api_key_env and os.environ.get(m.api_key_env):
         headers["Authorization"] = f"Token {os.environ[m.api_key_env]}"
@@ -300,6 +333,9 @@ def store_mem0(
 
     n = 0
     for p in prefs:
+        key = _posted_key(m, p.text)
+        if key in seen:
+            continue
         body = {
             "messages": [{"role": "user", "content": f"User preference (learned by k3code): {p.text}"}],
             "agent_id": m.agent_id,
@@ -309,8 +345,12 @@ def store_mem0(
         try:
             post(m.url.rstrip("/") + "/memories", body, headers)
             n += 1
-        except Exception:  # noqa: BLE001 - mem0 is best effort
+        except Exception:  # noqa: BLE001 - mem0 is best effort (a failed one is tried again next time)
             continue
+        seen.add(key)
+        done.append(key)
+    if posted is not None and n:
+        _save_posted(posted, done)
     return n
 
 
@@ -331,7 +371,7 @@ async def distill(
     write_auto_section(user_md, prefs)
     write_preferences_json(home, prefs)
     # blocking HTTP (up to 10 s per preference): never on the event loop that serves every session
-    await asyncio.to_thread(store_mem0, config, prefs, mem0_post)
+    await asyncio.to_thread(store_mem0, config, prefs, mem0_post, home / "learning" / MEM0_POSTED)
     if proposals is not None:
         propose_denial_preferences(log, proposals)
         for s in suggestions:
