@@ -516,7 +516,7 @@ def register_web_tools(
     cfg = dict(getattr(config, "research", None) or {})
     searx = SearxngSearch(cfg.get("searxng_url", DEFAULT_SEARXNG))
     ddg = DuckDuckGoSearch() if bool(cfg.get("keyless_fallback", True)) else None
-    fetcher = fetcher or WebFetcher.from_config(cfg)
+    fetcher = fetcher or WebFetcher.from_config(cfg, getattr(config, "web", None))
     browser = browser or BrowserManager.from_config(config)
 
     async def tool_fetch(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
@@ -570,7 +570,9 @@ def register_web_tools(
         ToolSpec(
             name="web_fetch",
             description="Fetch a web page and return its readable text. A page that blocks "
-            "plain HTTP is read in a browser; CAPTCHAs, logins and paywalls stop.",
+            "plain HTTP is read in a browser; CAPTCHAs, logins and paywalls stop.\n"
+            f"Limits: http(s) only; text cut at {MAX_FETCH_CHARS} chars; about 20 s per page "
+            "(research.fetch_deadline).",
             parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
             side_effect=False,
         ),

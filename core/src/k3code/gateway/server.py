@@ -44,6 +44,7 @@ from k3code.blockers import BlockerStore
 from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, default_project_dir, load_config
+from k3code.context_budget import compact_threshold, context_window, overhead_tokens
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
 from k3code.gateway import tui_display
@@ -83,12 +84,22 @@ from k3code.research.flow import Research
 from k3code.research.tools import register_web_tools
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 from k3code.routing.caller import ModelCaller
-from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router_options, tier_for
+from k3code.routing.tiers import (
+    Escalation,
+    TaskKind,
+    Tier,
+    TierRouters,
+    next_tier,
+    router_options,
+    tier_for,
+    tier_model_specs,
+)
 from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
 from k3code.tools import build_registry as build_tool_registry
-from k3code.tools import clip_head_tail
+from k3code.tools import clip_for_model
+from k3code.tools import jobs as tool_jobs
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -180,6 +191,8 @@ class LiveSession:
         #: M1: id of the turn in flight (usage rows carry it, so per-turn totals add up); "" between turns.
         self.turn_id = ""
         self.scope_override: str | None = None
+        #: Estimated tokens of the system prompt + tool schemas of this session's latest loop (0 = none built yet).
+        self.overhead_tokens = 0
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
         #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
@@ -363,8 +376,9 @@ def _model_label(config: Any, key: str) -> str:
     return str(first or key)
 
 
-#: Conversation size at which a session's older messages are folded into a summary, and how many recent ones stay.
-CONTEXT_DEFAULTS: dict[str, Any] = {"compact_at_tokens": 80_000, "keep_messages": 8, "compact_input_chars": 60_000}
+#: How many recent messages stay when a session's older messages are folded into a summary. When that happens is
+#: context_budget.compact_threshold: context.compact_at_ratio of the active model's window, or compact_at_tokens.
+CONTEXT_DEFAULTS: dict[str, Any] = {"keep_messages": 8, "compact_input_chars": 60_000}
 
 
 def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
@@ -377,7 +391,7 @@ def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
     for m in messages:
         c = m.get("content")
         if m.get("role") == "tool" and isinstance(c, str):
-            c = clip_head_tail(c)
+            c = clip_for_model(m.get("name"), c)
         chars += len(c) if isinstance(c, str) else len(json.dumps(c, ensure_ascii=False)) if c else 0
         if m.get("tool_calls"):
             chars += len(json.dumps(m["tool_calls"], ensure_ascii=False))
@@ -442,7 +456,7 @@ class GatewayServer:
         self.live: dict[str, LiveSession] = {}
         self.mcp = McpManager(self.config.mcp.servers)
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
-        self.web_fetcher = WebFetcher.from_config(self.config.research)
+        self.web_fetcher = WebFetcher.from_config(self.config.research, self.config.web)
         self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
         self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
         self.providers: list[Any] = []
@@ -552,6 +566,7 @@ class GatewayServer:
         ):
             return {"closed": False, "reason": "not disposable"}
         self.live.pop(sid, None)
+        await tool_jobs.reap(sid)  # background bash jobs end with their session
         if live.reliability is not None:
             await live.reliability.stop()
         return {"closed": True}
@@ -1069,6 +1084,8 @@ class GatewayServer:
                 cancelled.append(live.turn_task)
         if cancelled:  # let each turn persist what it has (its finally block) before the store is closed below
             await asyncio.wait(cancelled, timeout=5.0)
+        with contextlib.suppress(Exception):
+            await tool_jobs.REGISTRY.reap_all()  # no background bash job outlives the daemon
         for live in self.live.values():
             if live.reliability is not None:
                 with contextlib.suppress(Exception):
@@ -1479,7 +1496,10 @@ class GatewayServer:
         approval: Any,
         *,
         max_tool_errors: int = 0,
+        escalates: bool = False,
     ) -> AgentLoop:
+        """``escalates``: a cheap/fast attempt that a higher tier continues when it stalls, so a tool-error stop is
+        silent (the next tier carries on); otherwise the stop ends the turn with the list of failed calls."""
         loop = AgentLoop(
             router,
             system_prompt=build_system_prompt(
@@ -1508,16 +1528,36 @@ class GatewayServer:
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
             tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            context_window=self._router_window(router, session),
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
+        loop.tool_error_stop_message = not escalates
+        loop.on_tool_outcome = lambda call, result, failure: self.learning.tool_outcome(session, call, result, failure)
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
             install(loop.tools)
         register_task_tools(loop.tools, self, session, depth=1)
         register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher, mcp=self.mcp, browser=self.browser)
+        session.overhead_tokens = overhead_tokens(loop.system_prompt, loop.tool_specs())
         return loop
+
+    def _active_model(self, session: LiveSession) -> str:
+        """The model id the session's main tier sends to first (what its context window is looked up by)."""
+        specs = tier_model_specs(self.config, Tier.MAIN, key=session.stored.model or self.config.default_model)
+        first = specs[0] if specs else ""
+        if isinstance(first, list):
+            first = first[0] if first else ""
+        return str(first or session.stored.model or self.config.default_model)
+
+    def _router_window(self, router: Router, session: LiveSession) -> int:
+        """The smallest context window among the models ``router`` can send to (a cheap tier or an escalated one
+        has its own), so in-turn elision starts before the tightest model overflows."""
+        models = [e.model for e in getattr(router, "chain", None) or [] if e.model]
+        if not models:
+            return context_window(self.config, self._active_model(session))
+        return min(context_window(self.config, m) for m in models)
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
@@ -1544,7 +1584,8 @@ class GatewayServer:
         )
         tier = tier_for(kind, self.config.task_tiers)
         cheap_start = tier in (Tier.FAST, Tier.CHEAP)
-        max_errors = int(autonomy_cfg(self.config)["escalate"]["tool_errors"]) if cheap_start else 0
+        main_errors = int(autonomy_cfg(self.config)["max_tool_errors"])  # a main-tier turn stops after this many
+        max_errors = int(autonomy_cfg(self.config)["escalate"]["tool_errors"]) if cheap_start else main_errors
         escalation = Escalation(tier, thresholds={"tool_errors": 1, "loop_guard": 1})  # the loop counted already
 
         config = self.config
@@ -1557,7 +1598,13 @@ class GatewayServer:
         # raised UnboundLocalError in place of the CancelledError
         history: list[Message] = []
         loop = self._build_loop(
-            session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
+            session,
+            reliability,
+            self.tier_routers().get(tier),
+            kind,
+            approval,
+            max_tool_errors=max_errors,
+            escalates=cheap_start,
         )
         session.loop = loop
 
@@ -1600,7 +1647,13 @@ class GatewayServer:
                 max_errors = int(acfg["escalate"]["tool_errors"])
                 escalation = Escalation(tier, thresholds={"tool_errors": 1, "loop_guard": 1})
                 loop = self._build_loop(
-                    session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
+                    session,
+                    reliability,
+                    self.tier_routers().get(tier),
+                    kind,
+                    approval,
+                    max_tool_errors=max_errors,
+                    escalates=True,
                 )
                 loop.on_text_delta = on_text_delta
                 loop.on_text_reset = on_text_reset
@@ -1642,6 +1695,10 @@ class GatewayServer:
                         turn=session.turn_id,
                     )
                 new_tier = escalation.record(attempt_reason) if cheap_start and attempt_reason else None
+                if new_tier is None and attempt_reason == "tool_errors" and not loop.interrupted:
+                    # the loop stopped after N failed calls in a row and listed them: the user decides how to go on
+                    # (ending 'done' let an active goal judge it and continue into the same failures)
+                    session.needs_input = True
                 if new_tier is None or loop.interrupted:
                     break
                 # The attempt stalled on a cheap tier: continue the same task one tier up.
@@ -1657,7 +1714,13 @@ class GatewayServer:
                     "with a different approach if needed."
                 )
                 loop = self._build_loop(
-                    session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
+                    session,
+                    reliability,
+                    self.tier_routers().get(tier),
+                    kind,
+                    approval,
+                    max_tool_errors=max_errors if tier in (Tier.FAST, Tier.CHEAP) else main_errors,
+                    escalates=cheap_start and next_tier(tier) is not None,
                 )
                 loop.on_text_delta = on_text_delta
                 loop.on_text_reset = on_text_reset
@@ -1778,7 +1841,7 @@ class GatewayServer:
             return 0
         cfg = {**CONTEXT_DEFAULTS, **dict(getattr(self.config, "context", None) or {})}
         messages = session.stored.messages
-        if not force and _estimate_tokens(messages) < int(cfg["compact_at_tokens"]):
+        if not force and self._request_tokens(session) < compact_threshold(self.config, self._active_model(session)):
             return 0
         try:
             new, folded = await compact_messages(
@@ -1805,6 +1868,21 @@ class GatewayServer:
                 },
             )
         return folded
+
+    def _request_tokens(self, session: LiveSession) -> int:
+        """Estimated size of the session's next request: the stored conversation (its stored system entry is not sent:
+        the loop builds a fresh one) plus the system prompt and the tool schemas every request carries."""
+        if not session.overhead_tokens:  # no loop built yet in this daemon: the prompt and the built-in tools
+            prompt = build_system_prompt(
+                session.system_prompt,
+                cwd=session.perms.cwd,
+                config=self.config,
+                session_meta=session.stored.meta,
+                mcp=self.mcp,
+            )
+            session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
+        conversation = [m for m in session.stored.messages if m.get("role") != "system"]
+        return _estimate_tokens(conversation) + session.overhead_tokens
 
     async def _auto_title(self, session: LiveSession, first_message: str) -> None:
         """Name a fresh session on the ``title`` task kind; best-effort, never surfaces errors."""
@@ -1850,6 +1928,8 @@ class GatewayServer:
                     tokens_in=u.prompt_tokens if u else 0,
                     tokens_out=u.completion_tokens if u else 0,
                     cost_usd=u.cost_usd if u else None,
+                    cache_read=u.cache_read_tokens if u else 0,
+                    cache_write=u.cache_creation_tokens if u else 0,
                     tier=session.last_tier,
                     task_kind=session.current_kind,
                     turn=session.turn_id,
@@ -1896,7 +1976,9 @@ class GatewayServer:
                 session.perms.session_rules.extend(rules)
             if choice == "always" and rules:
                 persist_rules(project_config_path(session.perms.cwd), rules)
-            self.learning.approval(session, tool_name, pattern, choice)
+            self.learning.approval(
+                session, tool_name, pattern, choice, reason=reason, command=_command_for_tool(tool_name, arguments)
+            )
             return ApprovalResult(choice, reason)
 
         return approve
@@ -2495,10 +2577,13 @@ def _file_keys(base: Path) -> set[str]:
 
 
 def _usage_payload(usage: Usage) -> dict[str, Any]:
+    """The ``usage`` of ``session.usage`` and ``message.complete``. The cache counts are part of prompt_tokens."""
     return {
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_write_tokens": usage.cache_creation_tokens,
     }
 
 
@@ -2677,6 +2762,7 @@ async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict
     sid = _require(params, "session_id")
     deleted = server.store.delete(str(sid))
     live = server.live.pop(str(sid), None)
+    await tool_jobs.reap(str(sid))  # background bash jobs end with their session
     if live is not None:
         if live.turn_task is not None and not live.turn_task.done():
             live.turn_task.cancel()

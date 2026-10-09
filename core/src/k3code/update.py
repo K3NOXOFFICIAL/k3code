@@ -587,6 +587,15 @@ def pull_checkout(checkout: Path) -> None:
     raise SourceUpdateError(f"git pull failed in {checkout}:\n{err[:600]}")
 
 
+def _installer_env(**extra: str) -> dict[str, str]:
+    """The environment for install.sh: an install made as root (``--allow-root``) must stay updatable as root. An
+    environment variable, unlike a flag, is ignored by an older installer."""
+    env = {**os.environ, **extra}
+    if os.geteuid() == 0:
+        env["K3_ALLOW_ROOT"] = "1"
+    return env
+
+
 def update_from_source(checkout: Path, *, pull: bool = True) -> str:
     """``git pull --ff-only`` then stage a new version via the installer (``--no-activate``); returns its name."""
     if pull:
@@ -604,6 +613,7 @@ def update_from_source(checkout: Path, *, pull: bool = True) -> str:
         check=False,
         capture_output=True,
         text=True,
+        env=_installer_env(),
     )
     if r.returncode:
         tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
@@ -738,7 +748,7 @@ def update_from_git(url: str, ref: str) -> str:
             capture_output=True,
             text=True,
             stdin=subprocess.DEVNULL,
-            env={**os.environ, "K3CODE_DATA": str(data_dir()), "GIT_TERMINAL_PROMPT": "0"},
+            env=_installer_env(K3CODE_DATA=str(data_dir()), GIT_TERMINAL_PROMPT="0"),
         )
         if r.returncode or not r.stdout.strip():
             tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])

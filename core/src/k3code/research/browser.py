@@ -17,6 +17,7 @@ import importlib
 import os
 import re
 import secrets
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from k3code.net_guard import BlockedURL, acheck_url, origin_of, web_settings
 from k3code.paths import home as k3code_home
 from k3code.router.classifier import UPSTREAM_BLOCKED_PATTERNS
 
@@ -193,7 +195,10 @@ class BrowserManager:
         challenge_wait: float = 8.0,
         cdp_url: str = "",
         launcher: Callable[[str], Awaitable[Any]] | None = None,
+        allow_private: bool = False,
+        allow_origins: frozenset[tuple[str, str, int]] = frozenset(),
     ) -> None:
+        self.allow_private, self.allow_origins = allow_private, allow_origins  # SSRF guard escape hatches
         self.home = home
         self.headless = headless
         self.executable_path = executable_path
@@ -208,7 +213,10 @@ class BrowserManager:
     @classmethod
     def from_config(cls, config: Any) -> BrowserManager:
         cfg = dict(getattr(config, "browser", None) or {})
+        allow_private, allow_origins = web_settings(config)
         return cls(
+            allow_private=allow_private,
+            allow_origins=allow_origins,
             headless=bool(cfg.get("headless", True)),
             executable_path=str(cfg.get("executable_path") or ""),
             challenge_wait=float(cfg.get("challenge_wait", 8)),
@@ -271,7 +279,13 @@ class BrowserManager:
         downloads_dir(self.home).mkdir(parents=True, exist_ok=True)
         env = scrubbed_env(self.home)
         Path(env["HOME"]).mkdir(parents=True, exist_ok=True)
-        opts: dict[str, Any] = {"headless": self.headless, "accept_downloads": True, "env": env}
+        # service workers would fetch outside the context's routes (net_guard): blocked
+        opts: dict[str, Any] = {
+            "headless": self.headless,
+            "accept_downloads": True,
+            "env": env,
+            "service_workers": "block",
+        }
         if self.executable_path:
             opts["executable_path"] = self.executable_path
         try:
@@ -287,14 +301,25 @@ class BrowserManager:
         if self._cdp is not None:  # attached by the user's own choice: the browser's own context, no k3code profile
             return self._cdp.contexts[0] if self._cdp.contexts else await self._cdp.new_context()
         if site not in self._contexts:
-            self._contexts[site] = await self._launch(site)
+            ctx = await self._launch(site)
+            await self._guard(ctx)  # once per context: covers every page, popups' first requests and WebSockets
+            self._contexts[site] = ctx
         return self._contexts[site]
+
+    async def _guard(self, target: Any) -> None:
+        """The SSRF guard inside Chromium: every request and WebSocket of ``target`` (a context, or a page of the user's
+        CDP-attached browser, whose context k3code does not route) is vetted; a blocked one is aborted."""
+        await target.route("**/*", self._guard_route())
+        await target.route_web_socket(lambda _url: True, self._guard_ws())
 
     async def fetch(self, url: str) -> RenderedPage:
         """Renders ``url`` and returns what the page shows. Reads only: no clicks, no typing, no form submits."""
         site = urlparse(url).hostname or ""
+        await acheck_url(url, allow_private=self.allow_private, allow_origins=self.allow_origins)  # raises BlockedURL
         ctx = await self.context_for(site)
         page = await ctx.new_page()
+        if self._cdp is not None:
+            await self._guard(page)  # the user's own context is not routed: this page is (its popups are not)
         saved: list[str] = []
         pending: list[asyncio.Future[Any]] = []
         page.on("download", lambda d: pending.append(asyncio.ensure_future(self._save_download(d, saved))))
@@ -303,6 +328,56 @@ class BrowserManager:
         finally:
             with suppress(Exception):
                 await page.close()
+
+    def _verdict(self) -> Callable[[str], Awaitable[bool]]:
+        """Whether a URL may be requested. Verdicts are cached per origin for a minute, so a page with many
+        sub-resources resolves each host once; per origin, because the SearXNG exemption is one exact origin."""
+        verdicts: dict[tuple[str, str, int], tuple[float, bool]] = {}
+
+        async def allowed(url: str) -> bool:
+            origin = origin_of(url)
+            if origin is None:
+                return False
+            now = time.monotonic()
+            hit = verdicts.get(origin)
+            if hit is None or hit[0] <= now:
+                try:
+                    await acheck_url(url, allow_private=self.allow_private, allow_origins=self.allow_origins)
+                    hit = (now + 60.0, True)
+                except BlockedURL:
+                    hit = (now + 60.0, False)
+                if len(verdicts) > 1024:
+                    verdicts.clear()
+                verdicts[origin] = hit
+            return hit[1]
+
+        return allowed
+
+    def _guard_route(self) -> Callable[[Any], Awaitable[None]]:
+        """Playwright route handler: aborts any request (navigation, redirect hop or sub-resource) to a blocked host."""
+        allowed = self._verdict()
+
+        async def handler(route: Any) -> None:
+            url = str(route.request.url)
+            if urlparse(url).scheme in ("data", "blob", "about") or await allowed(url):
+                await route.continue_()
+            else:
+                await route.abort("blockedbyclient")
+
+        return handler
+
+    def _guard_ws(self) -> Callable[[Any], Awaitable[None]]:
+        """Playwright WebSocket route handler: ws/wss are vetted as http/https; a blocked socket never connects."""
+        allowed = self._verdict()
+
+        async def handler(ws: Any) -> None:
+            url = re.sub(r"^ws(s?)://", r"http\1://", str(ws.url), flags=re.IGNORECASE)
+            if await allowed(url):
+                ws.connect_to_server()
+            else:
+                await ws.close(code=1008, reason="blocked by k3code's SSRF guard")
+
+        return handler
 
     async def _read(self, page: Any, url: str, saved: list[str], pending: list[asyncio.Future[Any]]) -> RenderedPage:
         status = 0

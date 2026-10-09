@@ -34,6 +34,16 @@ class ProviderEntry(BaseModel):
     thinking_tokens: int | None = 0
     #: ...for models whose name contains one of these (default: Haiku, the cheap tier); the others keep the CLI default
     thinking_models: list[str] = Field(default_factory=lambda: ["haiku"])
+    #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
+    #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
+    prompt_cache: str = "auto"
+
+    @field_validator("prompt_cache")
+    @classmethod
+    def validate_prompt_cache(cls, v: str) -> str:
+        if v not in ("auto", "on", "off"):
+            raise ValueError("prompt_cache must be 'auto', 'on' or 'off'")
+        return v
 
     @field_validator("kind")
     @classmethod
@@ -154,8 +164,14 @@ class Settings(BaseModel):
     # M4b: ultracode: {max_tokens, max_agents}; research: {searxng_url, max_subquestions, ...}
     ultracode: dict[str, Any] = Field(default_factory=dict)
     research: dict[str, Any] = Field(default_factory=dict)
-    # Context management: {compact_at_tokens: 80000, keep_messages: 8}; see GatewayServer._maybe_compact
+    # Web tools SSRF guard: {allow_private: false}. true lets web_fetch/web_browse reach loopback/private addresses;
+    # the exact origin of research.searxng_url is always allowed. See k3code.net_guard.
+    web: dict[str, Any] = Field(default_factory=dict)
+    # Context management: {compact_at_ratio: 0.7, compact_at_tokens: <absolute override>, keep_messages: 8}; see
+    # GatewayServer._maybe_compact and k3code.context_budget
     context: dict[str, Any] = Field(default_factory=dict)
+    # Per model id: {<model id>: {context_window: 200000}}; ids without an entry use k3code.context_budget's defaults
+    models: dict[str, dict[str, Any]] = Field(default_factory=dict)
     # Browser for web tools: {cdp_url: ""} (empty = off, never attach to a running browser by default)
     browser: dict[str, Any] = Field(default_factory=dict)
     # /artifacts publish: {publish_dir: "" (default <home>/published), publish_url: "" (template, e.g.

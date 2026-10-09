@@ -93,9 +93,16 @@ class FakePage:
 class FakeContext:
     def __init__(self, pages: dict, log: list) -> None:
         self._pages, self.log = pages, log
+        self.guards: list = []  # route / route_web_socket registrations (the SSRF guard), not page actions
 
     async def new_page(self) -> FakePage:
         return FakePage(self._pages, self.log)
+
+    async def route(self, pattern: str, handler) -> None:  # the SSRF guard's request filter; see test_net_guard
+        self.guards.append(("route", pattern, handler))
+
+    async def route_web_socket(self, pattern, handler) -> None:
+        self.guards.append(("route_web_socket", pattern, handler))
 
     async def close(self) -> None:
         self.log.append(("context-close",))
@@ -275,6 +282,7 @@ async def test_fetch_still_works_without_playwright_and_says_so_for_a_blocked_pa
 
 class _Site(BaseHTTPRequestHandler):
     requests: list[tuple[str, str, str]] = []
+    page_override: str | None = None  # the body served at /guarded
 
     def do_GET(self):  # noqa: N802
         ua = self.headers.get("User-Agent", "")
@@ -292,6 +300,8 @@ class _Site(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        elif self.path == "/guarded" and self.page_override:
+            body, status = self.page_override.encode(), 200
         else:
             body, status = ARTICLE.encode(), 200
         self.send_response(status)
@@ -340,10 +350,10 @@ async def test_real_browser_escalation_reads_the_page_a_plain_fetch_was_refused(
     _playwright_or_skip()
     base, requests = local_site
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "k3"))
-    manager = BrowserManager(challenge_wait=0)
+    manager = BrowserManager(challenge_wait=0, allow_private=True)  # the local site is on loopback
     try:
         await _launch_or_skip(manager, f"{base}/article")
-        title, text = await fetch_page(f"{base}/gate", fetcher=fetcher(), browser=manager)
+        title, text = await fetch_page(f"{base}/gate", fetcher=fetcher(allow_private=True), browser=manager)
     finally:
         await manager.close()
     assert title == "Real Title" and "word word" in text
@@ -355,11 +365,11 @@ async def test_real_browser_stops_at_a_captcha_and_posts_nothing(tmp_path, monke
     _playwright_or_skip()
     base, requests = local_site
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "k3"))
-    manager = BrowserManager(challenge_wait=0)
+    manager = BrowserManager(challenge_wait=0, allow_private=True)  # the local site is on loopback
     try:
         await _launch_or_skip(manager, f"{base}/article")
         with pytest.raises(Stopped, match="CAPTCHA"):
-            await fetch_page(f"{base}/captcha", fetcher=fetcher(), browser=manager)
+            await fetch_page(f"{base}/captcha", fetcher=fetcher(allow_private=True), browser=manager)
     finally:
         await manager.close()
     assert requests and all(method == "GET" for method, _p, _ua in requests)
@@ -370,7 +380,7 @@ async def test_real_browser_saves_a_download_under_the_k3code_home_only(tmp_path
     base, _requests = local_site
     k3home = tmp_path / "k3"
     monkeypatch.setenv("K3CODE_HOME", str(k3home))
-    manager = BrowserManager(challenge_wait=0)
+    manager = BrowserManager(challenge_wait=0, allow_private=True)  # the local site is on loopback
     try:
         page = await _launch_or_skip(manager, f"{base}/article")
         assert page.status == 200
@@ -432,3 +442,87 @@ async def test_a_huge_dom_is_capped_and_parsed_off_the_event_loop(monkeypatch):
     _, text = await t._read_rendered(Browser(), "https://big.test/", Fetcher())
     assert seen and seen[0] != threading.main_thread().name
     assert "[page cut" in text
+
+
+# ── the SSRF guard inside Chromium: routes on the context, service workers blocked ──
+
+
+async def test_fetch_routes_every_request_and_websocket_of_the_context_through_the_guard():
+    browser, log = fake_browser({"https://public.test/a": (200, ARTICLE)})
+    await browser.fetch("https://public.test/a")
+    routes = browser._contexts["public.test"].guards
+    assert [e[0] for e in routes] == ["route", "route_web_socket"]  # once, on the context
+    assert routes[0][1] == "**/*"
+    seen: list[str] = []
+
+    async def abort(reason: str = "") -> None:
+        seen.append(reason)
+
+    blocked = SimpleNamespace(request=SimpleNamespace(url="http://127.0.0.1:9/admin"), abort=abort)
+    await routes[0][2](blocked)  # the attached handler is the guard
+    assert seen == ["blockedbyclient"]
+    await browser.fetch("https://public.test/a")
+    assert len(routes) == 2 and ("launch", "public.test") in log  # the context is reused, its routes are not stacked
+
+
+async def test_launch_blocks_service_workers(monkeypatch, tmp_path):
+    seen: dict = {}
+
+    class _Chromium:
+        async def launch_persistent_context(self, _profile, **opts):
+            seen.update(opts)
+            return SimpleNamespace()
+
+    class _PW:
+        async def start(self):
+            return SimpleNamespace(chromium=_Chromium())
+
+    monkeypatch.setattr(b, "playwright_module", lambda: SimpleNamespace(async_playwright=lambda: _PW()))
+    await BrowserManager(home=tmp_path)._launch_playwright("public.test")
+    assert seen["service_workers"] == "block"
+
+
+class _Sink(BaseHTTPRequestHandler):
+    """A loopback service the page must not reach: it records every request it gets."""
+
+    requests: list[str] = []
+
+    def do_GET(self):  # noqa: N802
+        self.requests.append(self.path)
+        self.send_response(200)
+        self.send_header("content-length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *_args) -> None:
+        return None
+
+
+async def test_real_browser_aborts_loopback_subresources_popups_and_websockets(tmp_path, monkeypatch, local_site):
+    """The page's own origin is exempt (as the configured SearXNG would be); a second loopback port is not."""
+    _playwright_or_skip()
+    import asyncio
+
+    _Sink.requests = []
+    sink = ThreadingHTTPServer(("127.0.0.1", 0), _Sink)
+    threading.Thread(target=sink.serve_forever, daemon=True).start()
+    other = f"http://127.0.0.1:{sink.server_address[1]}"
+    base, _requests = local_site
+    _Site.page_override = (
+        f'<html><body><img src="{other}/img"><script>fetch("{other}/fetch").catch(() => 0);'
+        f'try {{ new WebSocket("{other.replace("http", "ws")}/ws"); }} catch (e) {{}}'
+        f'window.open("{other}/popup");</script><main>{"word " * 400}</main></body></html>'
+    )
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "k3"))
+    origin = ("http", "127.0.0.1", int(base.rsplit(":", 1)[1]))
+    manager = BrowserManager(challenge_wait=0, allow_origins=frozenset({origin}))
+    try:
+        page = await _launch_or_skip(manager, f"{base}/guarded")
+        await asyncio.sleep(1.5)  # the img, fetch, socket and popup all start while the page loads
+    finally:
+        _Site.page_override = None
+        await manager.close()
+        sink.shutdown()
+        sink.server_close()
+    assert page.status == 200
+    assert _Sink.requests == []
