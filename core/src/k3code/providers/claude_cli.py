@@ -51,15 +51,25 @@ _FOOTER_TOOLS = (
 
 
 def render_prompt(messages: list[Message], tools: list[ToolSpec]) -> tuple[str, str]:
-    """Return ``(system, prompt)``: the system text and the transcript the CLI gets on stdin."""
-    system = "\n\n".join(m.content for m in messages if m.role == "system" and m.content)
+    """Return ``(system, prompt)``: the system text and the transcript the CLI gets on stdin.
+
+    Only the leading system messages form the system text. A later one (the loop guard's note) stays at its place in
+    the transcript as a ``<system-reminder>``: joined into the system text it changed the CLI's system prompt from that
+    call on, so the cached prefix missed for the rest of the turn (as in ``messages_to_anthropic``).
+    """
+    leading = 0
+    while leading < len(messages) and messages[leading].role == "system":
+        leading += 1
+    system = "\n\n".join(m.content for m in messages[:leading] if m.content)
     parts: list[str] = [_PREAMBLE]
     if tools:
         catalogue = [{"name": t.name, "description": t.description, "parameters": t.parameters} for t in tools]
         parts.append("## Tools you can call (JSON schema per tool)\n" + json.dumps(catalogue, ensure_ascii=False))
     parts.append("## Conversation so far")
-    for m in messages:
+    for m in messages[leading:]:
         if m.role == "system":
+            if m.content:
+                parts.append(f"<system-reminder>\n{m.content}\n</system-reminder>")
             continue
         if m.role == "user":
             parts.append(f"[user]\n{m.content or ''}")

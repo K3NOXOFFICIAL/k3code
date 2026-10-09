@@ -28,6 +28,7 @@ from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilityS
 from k3code.routing.tiers import TaskKind, Tier, tier_for
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.types import AgentType, load_agent_types
+from k3code.tools import jobs as tool_jobs
 
 logger = logging.getLogger(__name__)
 
@@ -500,6 +501,9 @@ class SubagentManager:
                     h.model = server.last_attempt[1] or h.model
         finally:
             h.result = final.strip()
+            # the child's background bash jobs are filed under its own id: no session close ever reaps them
+            with contextlib.suppress(Exception):
+                await tool_jobs.reap(h.id)
             await self._stop_reliability(reliability)
         if loop.interrupted:
             h.status = "interrupted"
