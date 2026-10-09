@@ -316,9 +316,16 @@ describe("AgentViewPane", () => {
     );
 
     try {
-      await waitFor(() => expect(frames.join("")).not.toContain("loading"));
+      const lastFrame = () =>
+        (frames.filter((f) => f.trim()).at(-1) ?? "").trimEnd();
 
-      const out = (frames.filter((f) => f.trim()).at(-1) ?? "").trimEnd();
+      // A positive marker: the list and the footer are painted (the loading text never shows at this width).
+      await waitFor(() => {
+        expect(lastFrame()).toContain("↑↓ select");
+        expect(lastFrame()).toContain("bravo");
+      });
+
+      const out = lastFrame();
       const lines = out.split("\n");
 
       // header, four list lines, footer: no spacers, no ↑/↓ indicators
@@ -351,7 +358,11 @@ describe("AgentViewPane", () => {
   it("treats Ctrl/Alt+letter as chords: Ctrl+N and Alt+N start nothing, Ctrl+X arms no stop", async () => {
     resetUiState();
     patchUiState({ sid: "cur" });
-    $stripSessions.set([{ id: "a", status: "working", title: "alpha" }]);
+    // bravo is the sentinel: moving onto it and back proves the chords before it were dispatched.
+    $stripSessions.set([
+      { id: "a", status: "working", title: "alpha" },
+      { id: "b", status: "working", title: "bravo" },
+    ]);
 
     const onNew = vi.fn();
     const onStop = vi.fn();
@@ -361,7 +372,9 @@ describe("AgentViewPane", () => {
       setRawMode: () => {},
       unref: () => {},
     });
+    // `output` keeps every frame (the absence check reads all of them); `fresh` only what came after a reset.
     let output = "";
+    let fresh = "";
     const stdout = Object.assign(new PassThrough(), {
       columns: 90,
       isTTY: false,
@@ -369,7 +382,10 @@ describe("AgentViewPane", () => {
     });
 
     stdout.on("data", (c) => {
-      output += stripAnsi(c.toString());
+      const text = stripAnsi(c.toString());
+
+      output += text;
+      fresh += text;
     });
 
     const view = renderSync(
@@ -391,20 +407,21 @@ describe("AgentViewPane", () => {
         stdout: stdout as unknown as NodeJS.WriteStream,
       },
     );
-    // Long enough for Ink's 50 ms escape-sequence flush and the re-render after it.
-    const settle = () => new Promise((resolve) => setTimeout(resolve, 120));
-
     try {
       await waitFor(() => expect(output).toContain("› ◐ alpha"));
 
       stdin.write("\x0e"); // Ctrl+N
-      await settle();
       stdin.write("\x1bn"); // Alt+N
-      await settle();
       stdin.write("\x18"); // Ctrl+X
-      await settle();
       stdin.write("y");
-      await settle();
+
+      // Sentinel: ↓ then ↑, each waited for on output captured after it was sent.
+      fresh = "";
+      stdin.write("\x1b[B");
+      await waitFor(() => expect(fresh).toContain("› ◐ bravo"));
+      fresh = "";
+      stdin.write("\x1b[A");
+      await waitFor(() => expect(fresh).toContain("› ◐ alpha"));
 
       expect(onNew).not.toHaveBeenCalled();
       expect(onStop).not.toHaveBeenCalled();
