@@ -131,7 +131,7 @@ Research (2026-10-07):
 - Back up before touching configs. Never push to main directly.
 
 ## Verification
-- **CI (as implemented):** ruff and pytest (core), vitest (tui), go build and `go test ./internal/k3keys/...` (panes), vendor_check, and gitleaks. A contract-drift check and a banned-import lint are not in CI.
+- **CI (as implemented, local since 2026-10-09: `scripts/ci/check.sh`):** ruff and pytest (core), vitest (tui), go build and `go test ./internal/k3keys/...` (panes), vendor_check, gitleaks and shellcheck. A contract-drift check and a banned-import lint are not in CI.
 - **Per milestone:** the exit checks above, run on the laptop. The M2 chaos suite runs as `scripts/chaos/*.sh`.
 - **Token check:** after each milestone, compare OmniRoute usage against Claude usage in `/stats` and the OmniRoute insights. The goal is that most build tokens go through OmniRoute.
 - **End of each milestone:** a mem0 summary memory with open TODOs.
