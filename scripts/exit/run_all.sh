@@ -21,7 +21,7 @@ if [[ ",$ONLY," == *",m2,"* ]]; then
   bash "$HERE/soak.sh" --minutes "$SOAK_MIN" --report >"$LOGS/soak.log" 2>&1 & SOAK_PID=$!
 fi
 for m in ${ONLY//,/ }; do
-  f="$(ls "$HERE"/${m}_*.sh "$HERE"/${m}_*.py 2>/dev/null | head -1)"
+  f="$(find "$HERE" -maxdepth 1 \( -name "${m}_*.sh" -o -name "${m}_*.py" \) | sort | head -1)"
   [ -z "$f" ] && { echo "[exit] no check for $m"; continue; }
   echo "[exit] === $m ($(basename "$f")) $(date +%T)"
   if [[ "$f" == *.py ]]; then python3 "$f" >"$LOGS/$m.log" 2>&1; else bash "$f" >"$LOGS/$m.log" 2>&1; fi

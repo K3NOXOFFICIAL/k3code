@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# pre-push: the local CI gate (scripts/ci/check.sh). Installed by scripts/dev/install-hooks.sh.
+#   a push to refs/heads/Main or of any tag  -> the full check
+#   any other branch push                    -> check.sh --quick
+#   deleting refs only                       -> nothing
+# The check runs on the working tree, which is normally the commit being pushed.
+# K3CODE_SKIP_HOOKS=1 skips it (with a warning); the branch then has no local check behind it.
+set -euo pipefail
+
+if [ "${K3CODE_SKIP_HOOKS:-}" = 1 ]; then
+  {
+    echo "############################################################"
+    echo "# pre-push: K3CODE_SKIP_HOOKS=1, the local CI check is SKIPPED."
+    echo "# Nothing checked this push. Run scripts/ci/check.sh yourself."
+    echo "############################################################"
+  } >&2
+  exit 0
+fi
+
+mode=""
+head=$(git rev-parse HEAD)
+other=""
+# stdin: one line per ref, "<local ref> <local sha> <remote ref> <remote sha>"
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+  [ -n "${local_sha:-}" ] || continue
+  # an all-zero local sha deletes the remote ref: nothing to check
+  case $local_sha in *[!0]*) ;; *) continue ;; esac
+  case $remote_ref in
+    refs/heads/Main | refs/tags/*) mode=full ;;
+    *) [ -n "$mode" ] || mode=quick ;;
+  esac
+  commit=$(git rev-parse --verify --quiet "$local_sha^{commit}" || echo "$local_sha") # a tag peels to its commit
+  [ "$commit" = "$head" ] || other="$other ${commit:0:12}"
+done
+
+[ -n "$mode" ] || exit 0
+
+root=$(git rev-parse --show-toplevel)
+check="$root/scripts/ci/check.sh"
+if [ ! -f "$check" ]; then
+  echo "pre-push: $check not found in this checkout; no local check ran" >&2
+  exit 0
+fi
+if [ -n "$other" ]; then
+  echo "pre-push: note: pushing commit(s)$other, but the check runs on the working tree at ${head:0:12}" >&2
+fi
+
+if [ "$mode" = full ]; then
+  echo "pre-push: pushing Main or a tag: running the FULL local check (scripts/ci/check.sh)" >&2
+  exec bash "$check"
+fi
+echo "pre-push: running scripts/ci/check.sh --quick (the full check runs before Main or a tag is pushed)" >&2
+exec bash "$check" --quick
