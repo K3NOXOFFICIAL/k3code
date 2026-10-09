@@ -5,9 +5,11 @@
 #
 # Usage: scripts/ci/platforms.sh [--full] [TARGET...]
 #
-#   TARGET   ubuntu (24.04, what `wsl --install` sets up), debian (12, /bin/sh is dash), alpine (3.20: musl and
-#            BusyBox), wsl (install.ps1 and uninstall.ps1 run by PowerShell 7, with a wsl.exe stand-in that runs each
-#            command as a normal user in an Ubuntu container). Default: all four.
+#   TARGET   ubuntu (24.04, what `wsl --install` sets up), ubuntu2204 (22.04 with only git and curl added: no Go,
+#            no python3, no unzip; with --full the installer fetches its own Go), debian (12, /bin/sh is dash),
+#            fedora (44, dnf), alpine (3.20: musl and BusyBox), wsl (install.ps1 and uninstall.ps1 run by
+#            PowerShell 7, with a wsl.exe stand-in that runs each command as a normal user in an Ubuntu container).
+#            Default: all six.
 #   --full   also build the TUI and the k3 binary (fetches Node and Go; several minutes per target)
 #
 # Each target builds a throwaway clone of HEAD (commit first: uncommitted changes are not tested), installs it as a
@@ -33,12 +35,12 @@ while [ $# -gt 0 ]; do
       sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'
       exit 0
       ;;
-    ubuntu | debian | alpine | wsl) TARGETS+=("$1") ;;
+    ubuntu | ubuntu2204 | debian | fedora | alpine | wsl) TARGETS+=("$1") ;;
     *) die "unknown option or target: $1 (see --help)" ;;
   esac
   shift
 done
-[ ${#TARGETS[@]} -gt 0 ] || TARGETS=(ubuntu debian alpine wsl)
+[ ${#TARGETS[@]} -gt 0 ] || TARGETS=(ubuntu ubuntu2204 debian fedora alpine wsl)
 
 ENGINE=""
 for e in podman docker; do if have "$e"; then ENGINE=$e && break; fi; done
@@ -60,15 +62,25 @@ PREPARE='set -eu
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq >/dev/null && apt-get install -y -qq git curl ca-certificates >/dev/null
+elif command -v dnf >/dev/null; then # the Fedora image has no su (util-linux) and no git
+  dnf install -y -q --setopt=install_weak_deps=False git curl ca-certificates tar gzip util-linux shadow-utils >/dev/null
 elif command -v apk >/dev/null; then apk add -q git curl ca-certificates
 fi
 if command -v useradd >/dev/null; then useradd -m u; else adduser -D u; fi
+'
+# ubuntu2204 is the box whose system Go is too old or missing: nothing the preparation pulls in may bring one along.
+# shellcheck disable=SC2016 # expanded by the container's shell, not this one
+MINIMAL='for c in go unzip python3; do
+  if command -v "$c" >/dev/null; then echo "PLATFORM CHECK FAILED: $c is preinstalled, the image is not minimal" >&2; exit 1; fi
+done
 '
 
 # The user's part for a distro target: install from a bare clone, update to a new commit, roll back, uninstall.
 # shellcheck disable=SC2016 # expanded by the container's shell, not this one
 DISTRO_PAYLOAD='set -eu
-fail() { echo "PLATFORM CHECK FAILED: $*" >&2; exit 1; }
+steps="" t=$(date +%s)
+step() { n=$(date +%s); steps="$steps${steps:+, }$1 $((n - t))s"; t=$n; } # step NAME: NAME took the time since the last step
+fail() { echo "PLATFORM CHECK FAILED: $*${steps:+ (passed: $steps)}" >&2; exit 1; }
 cd "$HOME"
 git config --global user.email ci@k3code.invalid && git config --global user.name ci
 git clone -q --bare /src bare.git && git clone -q bare.git work
@@ -76,35 +88,41 @@ export PATH=$HOME/.local/bin:$PATH
 sh work/install/install.sh --from-git "file://$HOME/bare.git" --ref Main || fail "install"
 first=$(basename "$(readlink ~/.local/share/k3code/current)")
 k3code --version || fail "k3code does not start"
+step install
 mkdir -p ~/.k3code && printf "update:\n  url: file://%s/bare.git\n" "$HOME" >~/.k3code/config.yaml
 k3code update --check || fail "update --check"
+step check
 (cd work && git commit -q --allow-empty -m "platform check" && git push -q origin Main)
 k3code update --yes || fail "update"
 second=$(basename "$(readlink ~/.local/share/k3code/current)")
 [ "$second" != "$first" ] || fail "update did not switch versions ($first)"
+step update
 k3code update --yes | grep -q "Already up to date" || fail "a second update was not a no-op"
+step no-op
 k3code update --rollback || fail "rollback"
 [ "$(basename "$(readlink ~/.local/share/k3code/current)")" = "$first" ] || fail "rollback did not return to $first"
+step rollback
 sh work/install/uninstall.sh || fail "uninstall"
 [ ! -e ~/.local/share/k3code ] && [ ! -e ~/.local/bin/k3code ] || fail "uninstall left files"
-echo "PLATFORM CHECK OK: $first -> $second -> $first"
+step uninstall
+echo "PLATFORM CHECK OK: $first -> $second -> $first ($steps)"
 '
 
 RESULTS=$RUN/results
 : >"$RESULTS"
 result() { printf '%s\t%s\n' "$1" "$2" >>"$RESULTS"; } # result TARGET TEXT (no associative arrays: bash 3.2)
 
-run_distro() { # run_distro NAME IMAGE
-  local name=$1 image=$2 log=$RUN/$1.log
+run_distro() { # run_distro NAME IMAGE [ROOT_CHECK]: ROOT_CHECK runs as root after PREPARE
+  local name=$1 image=$2 check=${3:-} log=$RUN/$1.log start=$SECONDS
   note "$name: $image"
   printf '%s' "$DISTRO_PAYLOAD" >"$RUN/$name.payload.sh"
   # shellcheck disable=SC2086 # SKIP_ENV is a list of VAR=value words
   if "$ENGINE" run --rm -v "$WORK:/src:ro,z" -v "$RUN/$name.payload.sh:/payload.sh:ro,z" "$image" sh -c \
-    "$PREPARE git config --system --add safe.directory '*'; su u -c 'env $SKIP_ENV sh /payload.sh'" >"$log" 2>&1 &&
+    "$PREPARE $check git config --system --add safe.directory '*'; su u -c 'env $SKIP_ENV sh /payload.sh'" >"$log" 2>&1 &&
     grep -q "PLATFORM CHECK OK" "$log"; then
-    result "$name" "ok   $(grep "PLATFORM CHECK OK" "$log" | sed 's/^PLATFORM CHECK OK: //')"
+    result "$name" "ok   $(grep "PLATFORM CHECK OK" "$log" | sed 's/^PLATFORM CHECK OK: //') in $((SECONDS - start))s"
   else
-    result "$name" "FAIL (see $log)"
+    result "$name" "FAIL $(grep -m 1 "PLATFORM CHECK FAILED" "$log" | sed 's/^PLATFORM CHECK FAILED: //') (see $log)"
   fi
 }
 
@@ -183,16 +201,18 @@ EOF
 for t in "${TARGETS[@]}"; do
   case $t in
     ubuntu) run_distro ubuntu docker.io/library/ubuntu:24.04 ;;
+    ubuntu2204) run_distro ubuntu2204 docker.io/library/ubuntu:22.04 "$MINIMAL" ;;
     debian) run_distro debian docker.io/library/debian:12 ;;
+    fedora) run_distro fedora registry.fedoraproject.org/fedora:44 ;;
     alpine) run_distro alpine docker.io/library/alpine:3.20 ;;
     wsl) run_wsl ;;
   esac
 done
 
 rc=0
-printf '\n%-8s %s\n' target result
+printf '\n%-10s %s\n' target result
 while IFS=$'\t' read -r t r; do
-  printf '%-8s %s\n' "$t" "$r"
+  printf '%-10s %s\n' "$t" "$r"
   case $r in ok*) ;; *) rc=1 ;; esac
 done <"$RESULTS"
 rm -rf "$WORK"
