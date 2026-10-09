@@ -869,3 +869,31 @@ def test_from_source_builds_the_tui_outside_the_checkout(tmp_path: Path) -> None
     assert (tmp_path / DATA_REL / "current" / "tui" / "dist" / "entry.js").read_text() == "built\n"
     assert not (src / "tui" / "node_modules").exists()
     assert not (src / "tui" / "dist").exists()
+
+
+def test_without_git_a_github_tag_installs_from_its_archive(tmp_path: Path) -> None:
+    sha_rel, sha_rc = "a" * 40, "b" * 40
+    advert = (
+        "001e# service=git-upload-pack\n0000"
+        f"0099{sha_rc} HEAD\0multi_ack symref=HEAD:refs/heads/main\n"
+        f"003f{sha_rc} refs/heads/main\n"
+        f"0041{sha_rel} refs/tags/v0.0.1\n"
+        f"0044{sha_rc} refs/tags/v0.0.2-rc1\n"
+        "0000"
+    )
+    archive = _tar_gz(
+        {"k3fake-0.0.1/VERSION": "0.0.1\n", "k3fake-0.0.1/core/pyproject.toml": "[project]\nname = 'x'\n"}
+    )
+    curl, log = _download_stub(tmp_path, {"refs?service=git-upload-pack": advert.encode(), "v0.0.1": archive})
+    # the macOS /usr/bin/git stub: present on PATH, but fails without the developer tools
+    stub_bin(tmp_path, "git", 'echo "xcode-select: note: no developer tools were found" >&2\nexit 1\n')
+    r = run(tmp_path, INSTALL, "--from-git", "https://github.com/alice/k3fake", "--minimal", path_front=curl)
+    assert r.returncode == 0, r.stderr
+    current = tmp_path / DATA_REL / "current"
+    assert (current / ".ref").read_text().strip() == "v0.0.1"  # the newest tag that is not a pre-release
+    assert current.resolve().name == "0.0.1-src.aaaaaaa"
+    assert "https://codeload.github.com/alice/k3fake/tar.gz/refs/tags/v0.0.1" in log.read_text()
+
+    other = run(tmp_path, INSTALL, "--from-git", "https://example.invalid/x.git", "--minimal", path_front=curl)
+    assert other.returncode != 0
+    assert "git is needed" in other.stderr

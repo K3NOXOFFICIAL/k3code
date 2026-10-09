@@ -320,7 +320,7 @@ report() {
     say "      $(hint_cmd python)"
   fi
   if have_git; then item ok "git"; else
-    item missing "git" "needed for --from-git, the default"
+    item missing "git" "used by --from-git, the default; without it only GitHub URLs install (as archives)"
     say "      $(hint_cmd git)"
   fi
   if [ "$NODE_OK" = 1 ]; then item ok "node 20+ with npm"; else
@@ -533,9 +533,60 @@ default_ref() { # latest v* release tag on the remote (never a pre-release such 
     echo Main
     return 0
   fi
+  if [ "$NO_GIT" = 1 ]; then
+    out=$(remote_refs) || return 1
+    t=$(printf '%s\n' "$out" | sed -n 's#.*refs/tags/v\([0-9][^/^-]*\)$#\1#p' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
+    if [ -n "$t" ]; then echo "v$t"; else echo Main; fi
+    return 0
+  fi
   out=$(git ls-remote --tags --refs --sort=-v:refname "$GIT_URL" 2>"$GIT_ERR") || return 1
   t=$(printf '%s\n' "$out" | sed -n 's#.*refs/tags/\(v[0-9][^/-]*\)$#\1#p' | head -n 1)
   echo "${t:-Main}"
+}
+
+# Without git, a GitHub repository is read over HTTPS: its ref list (what git ls-remote reads) and codeload archives.
+github_slug() { # OWNER/REPO of an https://github.com URL; fails for any other URL
+  s=${GIT_URL#https://github.com/}
+  [ "$s" != "$GIT_URL" ] || return 1
+  s=${s%/}
+  s=${s%.git}
+  case "$s" in */*/* | /* | */ | *[!A-Za-z0-9._/-]*) return 1 ;; */*) printf '%s' "$s" ;; *) return 1 ;; esac
+}
+
+remote_refs() { # "<sha> <ref>" lines like git ls-remote (annotated tags also as <ref>^{}): git, else GitHub over HTTPS
+  if [ "$NO_GIT" != 1 ]; then
+    git ls-remote "$GIT_URL" 2>"$GIT_ERR"
+    return
+  fi
+  rr="$GIT_ERR.refs"
+  if ! fetch "https://github.com/$(github_slug).git/info/refs?service=git-upload-pack" "$rr" 2>"$GIT_ERR"; then
+    rm -f "$rr"
+    return 1
+  fi
+  # pkt-lines: 4 hex digits of length, the SHA, a space, the ref (the first one also carries NUL + capabilities)
+  tr '\000' ' ' <"$rr" | sed -n 's#^[0-9a-f]\{4\}\([0-9a-f]\{40\}\) \(refs/[^ ]*\).*$#\1 \2#p'
+  rm -f "$rr"
+}
+
+archive_source() { # without git: REF's tree from GitHub's codeload into SRC_ROOT; sets SHA
+  refs=$(remote_refs) || return 1
+  sha=$(printf '%s\n' "$refs" | awk -v t="refs/tags/$REF" '$2 == t "^{}" { p = $1 } $2 == t { s = $1 } END { print (p ? p : s) }')
+  path=refs/tags/$REF
+  if [ -z "$sha" ]; then
+    sha=$(printf '%s\n' "$refs" | awk -v h="refs/heads/$REF" '$2 == h { print $1; exit }')
+    path=refs/heads/$REF
+  fi
+  if [ -z "$sha" ]; then
+    case "$REF" in *[!0-9a-f]*) ;; *) if [ ${#REF} -eq 40 ]; then sha=$REF path=$REF; fi ;; esac
+  fi
+  if [ -z "$sha" ]; then
+    echo "no branch, tag or full commit SHA named '$REF'" >"$GIT_ERR"
+    return 1
+  fi
+  fetch "https://codeload.github.com/$(github_slug)/tar.gz/$path" "$TMP/src.tar.gz" 2>"$GIT_ERR" || return 1
+  tar -xzf "$TMP/src.tar.gz" -C "$SRC_ROOT" --strip-components=1 2>"$GIT_ERR" || return 1
+  rm -f "$TMP/src.tar.gz"
+  SHA=$(printf '%s' "$sha" | cut -c 1-7)
 }
 
 # Network failures are told apart from private-repo failures: the git error text decides.
@@ -601,7 +652,7 @@ pick_default_ref() {
 resolve_short_sha() {
   case "$REF" in *[!0-9a-f]*) return 0 ;; esac
   if [ ${#REF} -lt 7 ] || [ ${#REF} -ge 40 ]; then return 0; fi
-  refs=$(git ls-remote "$GIT_URL" 2>"$GIT_ERR") || return 0 # unreachable: the fetch below reports it
+  refs=$(remote_refs) || return 0 # unreachable: the fetch below reports it
   if printf '%s\n' "$refs" | awk -v r="$REF" '$2 == "refs/heads/" r || $2 == "refs/tags/" r { f = 1 } END { exit !f }'; then
     return 0 # a branch or tag that happens to look like a SHA
   fi
@@ -660,8 +711,19 @@ acquire_source() {
     SRC_ROOT=$TMP/src
     mkdir "$SRC_ROOT"
     log "fetching $REF from $GIT_URL"
-    git -c init.defaultBranch=main init -q "$SRC_ROOT"
-    if ! git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" 2>"$GIT_ERR"; then
+    if [ "$NO_GIT" = 1 ]; then
+      fetched=0
+      if archive_source; then fetched=1; fi
+    else
+      git -c init.defaultBranch=main init -q "$SRC_ROOT"
+      fetched=0
+      if git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" 2>"$GIT_ERR"; then
+        git -C "$SRC_ROOT" checkout -q FETCH_HEAD
+        SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD)
+        fetched=1
+      fi
+    fi
+    if [ "$fetched" != 1 ]; then
       msg="could not fetch '$REF' from $GIT_URL: $(git_error_hint "$(git_error_reason)")"
       # A branch moves, so it is always fetched first; the installed build of it is the fallback when that fails.
       VER=$(recorded_version "$REF")
@@ -671,8 +733,6 @@ acquire_source() {
       SRC_ROOT=""
       return 0
     fi
-    git -C "$SRC_ROOT" checkout -q FETCH_HEAD
-    SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD)
   fi
   if [ ! -f "$SRC_ROOT/core/pyproject.toml" ] || [ ! -f "$SRC_ROOT/VERSION" ]; then
     die "not a k3code checkout (no core/pyproject.toml or VERSION): $SRC_ROOT"
@@ -1014,7 +1074,7 @@ presetup_doctor() {
 main() {
   export GIT_TERMINAL_PROMPT=0
   FROM="" GIT_URL="" REF="" CHANNEL=stable WANT_VERSION="" PREFIX="$HOME/.local" BUNDLE=""
-  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0 PRESETUP=1 ALLOW_ROOT=0 FORCE=0
+  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0 PRESETUP=1 ALLOW_ROOT=0 FORCE=0 NO_GIT=0
   if [ "${K3_NO_DOWNLOAD:-0}" = 1 ]; then NO_DEPS=1; fi
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1103,7 +1163,12 @@ main() {
   printf '\n==== %s install start (args: %s) ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(redact "$*")" >>"$INSTALL_LOG" 2>/dev/null || true
   report
   if [ "$NO_DEPS" = 1 ]; then export UV_PYTHON_DOWNLOADS=never; fi
-  if [ "$FROM" = git ] && ! have_git; then die "git is needed for --from-git: $(hint_cmd git)"; fi
+  if [ "$FROM" = git ] && ! have_git; then
+    GIT_URL=${GIT_URL:-$DEFAULT_URL}
+    github_slug >/dev/null || die "git is needed for --from-git $GIT_URL (without git only GitHub https URLs work): $(hint_cmd git)"
+    NO_GIT=1
+    log "git not found: reading $GIT_URL over HTTPS and fetching source archives from codeload.github.com"
+  fi
   ensure_uv
   if [ -z "$PY_FOUND" ] && [ "$NO_DEPS" != 1 ]; then
     log "no Python 3.12+ here: uv will download a managed one (kept in uv's own data directory)"
