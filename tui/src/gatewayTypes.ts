@@ -202,9 +202,12 @@ export interface SessionActiveItem {
   origin?: string;
   preview?: string;
   session_key?: string;
+  /** When the stored session was created (epoch s): its age, not how long it has been working. */
   started_at?: number;
   status: LiveSessionStatus;
   title?: string;
+  /** Start of the turn in flight (epoch s); null between turns, when no elapsed time is shown. */
+  turn_started_at?: null | number;
 }
 
 export interface SessionActiveListResponse {
