@@ -159,4 +159,16 @@ describe("/help", () => {
       }
     },
   );
+
+  it("keeps short names aligned so a long name does not hide their descriptions at width 80", async () => {
+    const rows = runHelp().flatMap((s) => s.rows ?? []);
+    const fortune = rows.find(([k]) => k === "/fortune [random|daily]");
+
+    expect(fortune).toBeDefined();
+
+    const lines = (await renderPanel(runHelp(), 80)).split("\n");
+    const line = lines.find((l) => l.includes(fortune![0]));
+
+    expect(line).toContain(fortune![1]);
+  });
 });

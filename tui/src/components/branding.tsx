@@ -574,13 +574,6 @@ export function Panel({ sections, t, title }: PanelProps) {
       </Box>
 
       {sections.map((sec, si) => {
-        // Size the name column to the longest name in the section so a long
-        // name never runs straight into its description.
-        const nameWidth = Math.max(
-          20,
-          ...(sec.rows ?? []).map(([k]) => k.length + 2),
-        );
-
         return (
           <Box flexDirection="column" key={si} marginTop={si > 0 ? 1 : 0}>
             {sec.title && (
@@ -591,7 +584,9 @@ export function Panel({ sections, t, title }: PanelProps) {
 
             {sec.rows?.map(([k, v], ri) => (
               <Text key={ri} wrap="truncate">
-                <Text color={t.color.muted}>{k.padEnd(nameWidth)}</Text>
+                <Text color={t.color.muted}>
+                  {k.padEnd(Math.max(20, k.length + 2))}
+                </Text>
                 <Text color={t.color.text}>{v}</Text>
               </Text>
             ))}
