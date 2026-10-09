@@ -26,6 +26,8 @@ def _write_fake_config(home: Path, script: list[dict]) -> None:
 class Peer:
     """A minimal JSON-RPC client over the daemon socket."""
 
+    CALL_DEADLINE_S = 30.0  # wall-clock cap for one call(); events must not keep a missing response waiting forever
+
     def __init__(self, reader, writer):
         self.r, self.w = reader, writer
         self.events: list[dict] = []
@@ -41,12 +43,21 @@ class Peer:
         rid = self._n
         self.w.write((json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}) + "\n").encode())
         await self.w.drain()
-        while True:
-            frame = json.loads(await asyncio.wait_for(self.r.readline(), 10))
-            if frame.get("id") == rid:
-                return frame
-            if frame.get("method") == "event":
-                self.events.append(frame["params"])
+        deadline = time.monotonic() + self.CALL_DEADLINE_S
+        seen: list[str] = []
+        try:
+            while (left := deadline - time.monotonic()) > 0:
+                frame = json.loads(await asyncio.wait_for(self.r.readline(), min(10, left)))
+                if frame.get("id") == rid:
+                    return frame
+                if frame.get("method") == "event":
+                    self.events.append(frame["params"])
+                    seen.append(str(frame["params"].get("type")))
+                else:
+                    seen.append(str(frame.get("method") or "response"))
+        except TimeoutError:
+            pass
+        raise AssertionError(f"no response to {method!r} within {self.CALL_DEADLINE_S}s; last frames: {seen[-5:]}")
 
     async def read_until(self, etype: str, timeout: float = 10):
         deadline = time.monotonic() + timeout
@@ -61,6 +72,30 @@ class Peer:
 
     def close(self):
         self.w.close()
+
+
+class _EventsOnlyReader:
+    """Answers every read with an event frame, never with a response."""
+
+    async def readline(self):
+        await asyncio.sleep(0.01)
+        return b'{"jsonrpc": "2.0", "method": "event", "params": {"type": "tick"}}\n'
+
+
+class _NullWriter:
+    def write(self, data):
+        pass
+
+    async def drain(self):
+        pass
+
+
+async def test_call_fails_instead_of_hanging_when_only_events_arrive(monkeypatch):
+    monkeypatch.setattr(Peer, "CALL_DEADLINE_S", 0.2)
+    peer = Peer(_EventsOnlyReader(), _NullWriter())
+    with pytest.raises(AssertionError, match=r"'session.list'.*\['tick'"):
+        await asyncio.wait_for(peer.call("session.list"), 5)
+    assert peer.events
 
 
 @pytest.fixture
