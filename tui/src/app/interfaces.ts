@@ -315,6 +315,9 @@ export interface InputHandlerResult {
   pagerPageSize: number;
 }
 
+/** How `resumeById` ended: `"unknown-session"` when the gateway has no such session (e.g. reaped while empty). */
+export type ResumeOutcome = "unknown-session" | void;
+
 export interface GatewayEventHandlerContext {
   composer: {
     setInput: StateSetter<string>;
@@ -328,7 +331,7 @@ export interface GatewayEventHandlerContext {
     // Session carried across a transport loss or child exit, cleared after resume.
     recoverSidRef?: MutableRefObject<null | string>;
     resetSession: () => void;
-    resumeById: (id: string) => Promise<void>;
+    resumeById: (id: string) => Promise<ResumeOutcome>;
     setCatalog: StateSetter<null | SlashCatalog>;
   };
   submission: {

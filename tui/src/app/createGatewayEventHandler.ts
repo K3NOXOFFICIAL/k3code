@@ -67,7 +67,10 @@ import {
 } from "./outputTokensStore.js";
 import { flashGoodVibes } from "./petFlashStore.js";
 import { addProposal } from "../k3/proposalsStore.js";
-import { forgetServerRequest } from "./serverRequestStore.js";
+import {
+  forgetAllServerRequests,
+  forgetServerRequest,
+} from "./serverRequestStore.js";
 import { turnController } from "./turnController.js";
 import { getUiState, patchUiState } from "./uiStore.js";
 import {
@@ -784,6 +787,10 @@ export function createGatewayEventHandler(
       applySkin(skin);
     }
 
+    // Requests stored before this gateway announced itself came over a dead transport: answering one goes nowhere,
+    // and the recovery resume below would reopen its card. The gateway re-sends what is still open on attach.
+    forgetAllServerRequests();
+
     // Kick off the config fetch once the gateway is actually ready. If handler
     // construction does this during React render, a startup transport error can
     // report through sys(), mutate transcript state, and trip React's
@@ -828,8 +835,22 @@ export function createGatewayEventHandler(
     const recoverSid = recoverSidRef?.current;
 
     if (recoverSidRef && recoverSid) {
-      void resumeById(recoverSid).then(() => {
-        if (getUiState().sid && recoverSidRef.current === recoverSid) {
+      void resumeById(recoverSid).then((outcome) => {
+        if (recoverSidRef.current !== recoverSid) {
+          return;
+        }
+
+        // The daemon deletes a session that was still empty when its last client detached, so the target can be
+        // gone; stay on no session at all and every prompt is lost, so start a fresh one instead.
+        if (outcome === "unknown-session") {
+          recoverSidRef.current = null;
+          patchUiState({ status: "forging session…" });
+          newSession("the previous session was empty and is gone");
+
+          return;
+        }
+
+        if (getUiState().sid) {
           recoverSidRef.current = null;
         }
       });

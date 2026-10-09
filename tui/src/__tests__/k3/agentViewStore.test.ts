@@ -3,7 +3,6 @@ import { describe, expect, it } from "vitest";
 import {
   buildViewRows,
   IDLE_VIEW_NAV,
-  isDisposableEmptySession,
   type PastSessionRow,
   reduceViewKey,
   selectedIndex,
@@ -442,37 +441,6 @@ describe("selectedIndex", () => {
     expect(selectedIndex(ROWS, "session:gone", 2)).toBe(2);
     expect(selectedIndex(ROWS, null, 9)).toBe(4);
     expect(selectedIndex([], "session:s1", 3)).toBe(0);
-  });
-});
-
-describe("isDisposableEmptySession", () => {
-  const idle: SessionActiveItem = {
-    id: "s",
-    message_count: 0,
-    status: "idle",
-  };
-
-  it("is an idle live session without messages", () => {
-    expect(isDisposableEmptySession(idle)).toBe(true);
-  });
-
-  it("never a used, busy, waiting, backgrounded, unknown or missing session", () => {
-    expect(isDisposableEmptySession({ ...idle, message_count: 2 })).toBe(false);
-    expect(
-      isDisposableEmptySession({ ...idle, message_count: undefined }),
-    ).toBe(false);
-
-    for (const status of [
-      "working",
-      "needs_input",
-      "waiting",
-      "starting",
-    ] as const) {
-      expect(isDisposableEmptySession({ ...idle, status })).toBe(false);
-    }
-
-    expect(isDisposableEmptySession({ ...idle, background: true })).toBe(false);
-    expect(isDisposableEmptySession(undefined)).toBe(false);
   });
 });
 

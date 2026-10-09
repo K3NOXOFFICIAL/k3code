@@ -48,16 +48,9 @@ import {
 import { AgentsOverlay } from "./agentsOverlay.js";
 import { AgentStrip } from "../k3/agentStrip.js";
 import { ProposalCards } from "../k3/proposalCards.js";
-import {
-  $stripNav,
-  $stripSessions,
-  getStripHandlers,
-} from "../k3/agentStripStore.js";
+import { $stripNav, getStripHandlers } from "../k3/agentStripStore.js";
 import { AgentViewPane } from "../k3/agentView.js";
-import {
-  isDisposableEmptySession,
-  type ViewRow,
-} from "../k3/agentViewStore.js";
+import { type ViewRow } from "../k3/agentViewStore.js";
 import { focusVisibleMessages } from "../k3/focusPolicy.js";
 import {
   GoodVibesHeart,
@@ -609,24 +602,20 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
 }: Pick<AppLayoutProps, "actions">) {
   const { gw } = useGateway();
   const close = () => patchOverlayState({ agentView: false });
-  // Leaving the current session for another one closes it when it is still empty; resuming already closes the session
-  // it leaves. Read at action time: `k3code agents` opens the view before the startup session exists.
-  const dropSid = () => {
+  // The session being left, handed to the switch so the gateway can close it once this client is attached elsewhere
+  // if it is disposable (the gateway judges; resuming already closes the session it leaves). Read at action time:
+  // `k3code agents` opens the view before the startup session exists.
+  const dropSid = (targetSid?: string) => {
     const originSid = getUiState().sid;
 
-    return originSid &&
-      isDisposableEmptySession(
-        $stripSessions.get().find((s) => s.id === originSid),
-      )
-      ? originSid
-      : undefined;
+    return originSid && originSid !== targetSid ? originSid : undefined;
   };
 
   const activate = ({ kind, ...row }: ViewRow) => {
     // A live session attaches like Enter in the strip; an earlier one is resumed like the session switcher does
     // (busy-guarded); an in-turn agent opens its detail view, as Enter on it in the strip does.
     if (kind === "session") {
-      actions.activateLiveSession(row.id, dropSid());
+      actions.activateLiveSession(row.id, dropSid(row.id));
     } else if (kind === "past") {
       actions.resumeById(row.id);
     } else {

@@ -28,7 +28,12 @@ import type {
 import { asRpcResult } from "../lib/rpc.js";
 import type { Msg, PanelSection, SessionInfo } from "../types.js";
 
-import type { ComposerActions, GatewayRpc, StateSetter } from "./interfaces.js";
+import type {
+  ComposerActions,
+  GatewayRpc,
+  ResumeOutcome,
+  StateSetter,
+} from "./interfaces.js";
 import { patchOverlayState } from "./overlayStore.js";
 import {
   forgetServerRequestsForSession,
@@ -126,6 +131,10 @@ export const signalFreshSessionBoundary = (
 
   return true;
 };
+
+// The gateway's answer to a session id it does not store (`unknown session: <id>`, JSON-RPC invalid params).
+const isUnknownSessionError = (e: unknown) =>
+  e instanceof Error && e.message.includes("unknown session");
 
 const trimTail = (items: Msg[]) => {
   const q = [...items];
@@ -277,6 +286,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         await closeSession(previousSid);
       }
 
+      // Left for good from this client's view: the gateway re-sends the old session's open requests if it is
+      // attached again, so a kept entry could only reopen a card answered or expired elsewhere meanwhile.
+      if (previousSid && previousSid !== r.session_id) {
+        forgetServerRequestsForSession(previousSid);
+      }
+
       // The durable id lives on the create result; the lazy-create `info` does
       // not carry it, and session.resume / the exit epilogue need the stored id.
       const storedSid = r.stored_session_id || r.session_id;
@@ -364,15 +379,20 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     [startNewSession],
   );
 
-  // `dropSid`: an empty session to close once this client has moved off it (the daemon refuses while attached, and
-  // refuses a session that is in use; that refusal is not an error here).
+  // `dropSid`: the session this client just left. Once attached elsewhere, ask the gateway to close it if it is
+  // disposable (empty, idle, not background); the gateway judges, and `closed: false` or an error is not a failure.
   const dropAfterSwitch = useCallback(
     (dropSid: string | undefined, nowSid: null | string | undefined) => {
       if (dropSid && nowSid && dropSid !== nowSid) {
-        void closeSession(dropSid).catch(() => null);
+        void gw
+          .request<SessionCloseResponse>("session.close", {
+            disposable_only: true,
+            session_id: dropSid,
+          })
+          .catch(() => null);
       }
     },
-    [closeSession],
+    [gw],
   );
 
   const newLiveSession = useCallback(
@@ -456,7 +476,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   );
 
   const resumeById = useCallback(
-    (id: string) => {
+    (id: string): Promise<ResumeOutcome> => {
       patchOverlayState({ agentView: false, sessions: false });
       patchUiState({ status: "resuming…" });
 
@@ -480,8 +500,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
             if (!r) {
               sys("error: invalid response: session.resume");
+              patchUiState({ status: "ready" });
 
-              return patchUiState({ status: "ready" });
+              return;
             }
 
             const storedSid =
@@ -528,9 +549,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               void closeSession(previousSid);
             }
           })
-          .catch((e: Error) => {
+          .catch((e: Error): ResumeOutcome => {
             sys(`error: ${e.message}`);
             patchUiState({ status: "ready" });
+
+            return isUnknownSessionError(e) ? "unknown-session" : undefined;
           });
       });
     },

@@ -856,8 +856,8 @@ describe("AppLayout agent view: ⏎ routes by row kind", () => {
     layout.press("\r");
 
     await waitFor(() => expect(activateLiveSession).toHaveBeenCalled());
-    // s1 is not in the live list, so there is no empty origin session to drop.
-    expect(activateLiveSession).toHaveBeenCalledWith("live-1", undefined);
+    // The origin goes along even though it is not in the live list: the gateway decides whether it is disposable.
+    expect(activateLiveSession).toHaveBeenCalledWith("live-1", "s1");
     expect(resumeById).not.toHaveBeenCalled();
     expect(getOverlayState().agentView).toBe(false);
   });

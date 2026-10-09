@@ -144,15 +144,6 @@ export function selectedIndex(
   return i >= 0 ? i : Math.max(0, Math.min(fallback, rows.length - 1));
 }
 
-/**
- * A live session that was opened and never used: no messages, idle, not backgrounded. Leaving it for another session
- * from the agent view closes it, so `k3code agents` does not leave an empty session behind per run.
- */
-export const isDisposableEmptySession = (
-  s: (SessionActiveItem & { background?: boolean }) | undefined,
-): boolean =>
-  !!s && s.message_count === 0 && !s.background && s.status === "idle";
-
 /** Live sessions other than this one and in-turn agents can be stopped; past rows and the current session cannot. */
 export const isStoppable = (row: ViewRow) =>
   row.kind === "agent" || (row.kind === "session" && !row.current);

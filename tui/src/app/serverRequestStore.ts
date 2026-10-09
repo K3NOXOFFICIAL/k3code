@@ -49,6 +49,14 @@ export function forgetServerRequestsForSession(sid: string): void {
   }
 }
 
+/**
+ * Forget every stored request. Called when a gateway (re)announces itself: what was stored came over a transport
+ * that is gone, so its ids mean nothing to the new one, and the gateway re-sends whatever is still open on attach.
+ */
+export function forgetAllServerRequests(): void {
+  open.clear();
+}
+
 export function hasOpenServerRequest(id: string): boolean {
   return open.has(id);
 }
