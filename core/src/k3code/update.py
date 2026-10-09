@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 
 from k3code import service
-from k3code.paths import data_dir, user_config_path
+from k3code.paths import GATEWAY_ENV_VARS, data_dir, user_config_path
 
 DEFAULT_REPO = "K3NOXOFFICIAL/k3code"
 #: The GitHub-compatible releases API; K3CODE_UPDATE_API or update.api point it at a mirror.
@@ -494,14 +494,49 @@ def install_release(rel: Release, token: str | None, uv: str | None = None, *, a
     return vdir
 
 
-def apply_detached() -> str:
+def update_log_path() -> Path:
+    return data_dir() / "update.log"
+
+
+def spawn_update(exe: str) -> str:
+    """Run ``k3code update --yes`` as a process of its own session, logging to ``update.log``.
+
+    Used when no service unit is installed (macOS, WSL without systemd, a TUI without the daemon): nothing has to be
+    restarted, so the update only has to outlive this process and the terminal it runs in."""
+    log_path = update_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if k not in GATEWAY_ENV_VARS}
+    try:
+        with log_path.open("ab") as log:
+            log.write(f"\n==== {time.strftime('%Y-%m-%d %H:%M:%S')} k3code update --yes ====\n".encode())
+            log.flush()
+            p = subprocess.Popen(
+                [exe, "update", "--yes"],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+            )
+    except OSError as e:
+        return f"Could not start the update: {e}. Run `k3code update --yes` from a terminal."
+    return (
+        f"Update started in the background (pid {p.pid}). The new version is smoke-tested and only switched to when it "
+        f"passes; restart k3code afterwards to use it. Follow it in {log_path}."
+    )
+
+
+def apply_detached(*, unit_installed: Callable[[], bool] = service.is_installed) -> str:
     """Run ``k3code update --yes`` outside this process's service unit, so the update can restart the unit.
 
     The daemon used to install, restart its own unit from a worker thread and then poll for health *inside* the unit
     it was restarting: systemd SIGTERMed the whole cgroup (the poller included), so the auto-rollback branch could
     never run and the shutdown hung on the executor thread. A transient ``systemd-run --user`` unit survives it.
+    Without a unit there is nothing to restart, and no systemd to ask on macOS or most WSL setups: a detached process.
     """
     exe = shutil.which("k3code") or str(Path(sys.argv[0]).resolve())
+    if not unit_installed():
+        return spawn_update(exe)
     runner = shutil.which("systemd-run")
     if runner is None:
         return (
@@ -567,7 +602,8 @@ def git_pull_command(checkout: Path) -> list[str]:
         win = subprocess.run(["wslpath", "-w", path], capture_output=True, text=True, check=False).stdout.strip()
         if win:
             return [exe, "-C", win, "pull", "--ff-only"]
-    return ["git", "-C", path, "pull", "--ff-only"]
+    # safe.directory: a checkout owned by another user is "dubious" and git refuses it (install.sh trusts it alike)
+    return ["git", "-c", f"safe.directory={path}", "-C", path, "pull", "--ff-only"]
 
 
 def pull_checkout(checkout: Path) -> None:

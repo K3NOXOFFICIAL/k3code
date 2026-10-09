@@ -674,6 +674,11 @@ resolve_short_sha() {
 }
 
 # ---- source ----------------------------------------------------------------
+# git in the checkout this script installs. A checkout owned by another user (a Windows clone seen from WSL, a
+# shared one) is "dubious" to git, which then refuses every command: rev-parse failed silently, so each build was
+# named X.Y.Z-src and an update never left the first one. Its own install.sh runs anyway, so its config is trusted.
+src_git() { git -c safe.directory="$SRC_ROOT" -C "$SRC_ROOT" "$@"; }
+
 acquire_source() {
   if [ "$FROM" = source ]; then
     d=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || d=""
@@ -685,11 +690,14 @@ acquire_source() {
       die "--from-source must run from a k3code checkout (sh install/install.sh --from-source)"
     fi
     SOURCE_PATH=$SRC_ROOT
-    SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD 2>/dev/null || true)
+    SHA=$(src_git rev-parse --short HEAD 2>/dev/null || true)
+    if [ -z "$SHA" ] && [ -e "$SRC_ROOT/.git" ] && have_git; then
+      die "git cannot read the checkout $SRC_ROOT ($(src_git rev-parse HEAD 2>&1 | head -n 1)): without its commit every build of it would get the same version name"
+    fi
     # Uncommitted edits get their own version (a checksum of the changes), so they are not hidden by the
     # build of the clean HEAD.
-    if [ -n "$SHA" ] && [ -n "$(git -C "$SRC_ROOT" status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
-      dirty=$( (git -C "$SRC_ROOT" diff HEAD && git -C "$SRC_ROOT" ls-files --others --exclude-standard |
+    if [ -n "$SHA" ] && [ -n "$(src_git status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
+      dirty=$( (src_git diff HEAD && src_git ls-files --others --exclude-standard |
         while IFS= read -r f; do cat "$SRC_ROOT/$f"; done) 2>/dev/null | cksum | cut -d' ' -f1)
       SHA="$SHA.dirty$dirty"
     fi

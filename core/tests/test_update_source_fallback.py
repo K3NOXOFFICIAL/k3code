@@ -57,6 +57,18 @@ def test_no_release_yet_also_updates_from_the_checkout_and_no_pull_skips_git(che
     assert "No release has been published yet" in r.output and calls == [False, True]
 
 
+def test_a_checkout_with_nothing_new_is_reported_up_to_date(checkout, monkeypatch):
+    # the installer hands back the version that is already active: that is not an update, and nothing is activated
+    monkeypatch.setattr(upd, "github_token", lambda: None)
+    monkeypatch.setattr(upd, "fetch_latest", lambda *a, **k: None)
+    monkeypatch.setattr(upd, "current_version", lambda: "0.1.0-src.abc1234")
+    monkeypatch.setattr(upd, "update_from_source", lambda src, *, pull=True: "0.1.0-src.abc1234")
+    monkeypatch.setattr(upd, "activate", lambda v: pytest.fail("an unchanged version must not be activated again"))
+    r = CliRunner().invoke(cli, ["update", "--from-source", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert "Already up to date (0.1.0-src.abc1234)" in r.output and "updated to" not in r.output
+
+
 def test_check_only_reports_the_checkout_and_changes_nothing(checkout, monkeypatch):
     monkeypatch.setattr(upd, "github_token", lambda: None)
     monkeypatch.setattr(upd, "fetch_latest", _deny)
@@ -97,7 +109,15 @@ def test_from_wsl_a_windows_clone_is_pulled_with_windows_git(monkeypatch):
 def test_other_checkouts_are_pulled_with_the_plain_git(monkeypatch):
     monkeypatch.setattr(upd.shutil, "which", lambda name: "/x/" + name)
     monkeypatch.setattr(upd, "_in_wsl", lambda: True)
-    assert upd.git_pull_command(Path("/home/u/src/k3code")) == ["git", "-C", "/home/u/src/k3code", "pull", "--ff-only"]
+    assert upd.git_pull_command(Path("/home/u/src/k3code")) == [
+        "git",
+        "-c",
+        "safe.directory=/home/u/src/k3code",  # a checkout owned by another user is still pulled
+        "-C",
+        "/home/u/src/k3code",
+        "pull",
+        "--ff-only",
+    ]
     monkeypatch.setattr(upd, "_in_wsl", lambda: False)  # not WSL: /mnt/c is just a path
     assert upd.git_pull_command(Path("/mnt/c/x"))[0] == "git"
     monkeypatch.setattr(upd, "_in_wsl", lambda: True)
