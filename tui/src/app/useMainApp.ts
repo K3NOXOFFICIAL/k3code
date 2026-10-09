@@ -658,6 +658,10 @@ export function useMainApp(gw: GatewayClient) {
     [exit, gw],
   );
 
+  const reopenServerRequest = useCallback((request: ServerRequest) => {
+    onServerRequestRef.current(request);
+  }, []);
+
   const session = useSessionLifecycle({
     colsRef,
     composerActions,
@@ -666,6 +670,7 @@ export function useMainApp(gw: GatewayClient) {
       ? setDashboardFreshSessionId
       : undefined,
     panel,
+    reopenServerRequest,
     rpc,
     scrollRef,
     setHistoryItems,

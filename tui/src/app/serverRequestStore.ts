@@ -32,6 +32,23 @@ export function respondToServerRequest(
   return true;
 }
 
+/** The open requests session `sid` asked (`params.session_id`), oldest first. */
+export function serverRequestsForSession(sid: string): ServerRequest[] {
+  return [...open.values()].filter((r) => r.params.session_id === sid);
+}
+
+/**
+ * Forget the requests of a session this client just left. The gateway sends
+ * `request.cancel` only to clients attached to the session, so an entry kept
+ * here could be answered or expire elsewhere meanwhile; the gateway re-sends
+ * whatever is still open when a client attaches to the session again.
+ */
+export function forgetServerRequestsForSession(sid: string): void {
+  for (const r of serverRequestsForSession(sid)) {
+    open.delete(r.id);
+  }
+}
+
 export function hasOpenServerRequest(id: string): boolean {
   return open.has(id);
 }

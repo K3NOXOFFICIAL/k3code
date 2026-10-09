@@ -519,6 +519,38 @@ class GatewayServer:
         """An approval/clarify request of this session is waiting for an answer (the session needs input)."""
         return any(sid == session_id for sid, _ in self._open_requests.values())
 
+    async def close_live(self, sid: str, *, disposable_only: bool = False) -> dict[str, Any]:
+        """Drop ``sid`` from the live registry (its stored copy stays resumable) unless it is in use: a turn owns it,
+        it runs in the background, it waits for an answer, or a client is on it.
+
+        ``disposable_only`` (its last client just left) also keeps every session with something in it or behind it:
+        a message, an automation origin, a finished-run state, queued input, a running sub-agent.
+        """
+        live = self.live.get(sid)
+        if live is None:
+            return {"closed": False, "reason": "not live"}
+        if (
+            live.turn_in_flight
+            or live.background
+            or live.needs_input
+            or self.has_open_request(sid)
+            or any(c.session_id == sid for c in self.clients)
+        ):
+            return {"closed": False, "reason": "still in use"}
+        if disposable_only and (
+            live.stored.messages
+            or live.state != "idle"
+            or live.stored.meta.get("origin") == "automation"
+            or live.pending_prompts
+            or live.steer_queue
+            or any(not h.done for h in self.subagents.for_session(sid))
+        ):
+            return {"closed": False, "reason": "not disposable"}
+        self.live.pop(sid, None)
+        if live.reliability is not None:
+            await live.reliability.stop()
+        return {"closed": True}
+
     def attach(self, client: Client, live: LiveSession, *, replay_delay: float = 0.0) -> None:
         """Point ``client`` at ``live`` and replay any approvals it is still waiting on.
 
@@ -900,6 +932,13 @@ class GatewayServer:
             logger.info("client %s detached; its sessions keep running", client.name)
             with contextlib.suppress(Exception):
                 writer.close()
+            # Every TUI start creates a session so the prompt is usable; one left empty and idle by its last client
+            # (TUI exit, crash, kill -9: the socket just drops) was never closed, because session.close refuses while
+            # its caller is still attached. Not during a daemon stop: close() iterates the registry across awaits.
+            if client.session_id and not self.stopping:
+                with contextlib.suppress(Exception):
+                    if (await self.close_live(client.session_id, disposable_only=True))["closed"]:
+                        logger.info("closed empty session %s: its last client left", client.session_id)
 
     async def _read_frame(self, reader: asyncio.StreamReader, client: Client) -> bytes | None:
         """The next line from ``reader`` (b"" at EOF), or None for one longer than MAX_FRAME_BYTES: that frame is
@@ -2580,22 +2619,7 @@ async def _session_close(server: GatewayServer, params: dict[str, Any]) -> dict[
     """The TUI closes the session it just left (``/resume``, new session). An idle foreground session is dropped from
     the live registry (its stored copy stays resumable); one that is running, backgrounded or waiting for an
     answer keeps going, so it stays in the agent strip."""
-    sid = str(params.get("session_id") or "")
-    live = server.live.get(sid)
-    if live is None:
-        return {"closed": False, "reason": "not live"}
-    if (
-        live.turn_in_flight
-        or live.background
-        or live.needs_input
-        or server.has_open_request(sid)
-        or any(c.session_id == sid for c in server.clients)
-    ):
-        return {"closed": False, "reason": "still in use"}
-    server.live.pop(sid, None)
-    if live.reliability is not None:
-        await live.reliability.stop()
-    return {"closed": True}
+    return await server.close_live(str(params.get("session_id") or ""))
 
 
 async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

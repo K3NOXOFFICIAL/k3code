@@ -7,6 +7,7 @@ import type {
   SessionResumeResult,
   Usage,
 } from "@k3code/shared/gateway-events";
+import type { ServerRequest } from "@k3code/shared/json-rpc-channel";
 import { type RefObject, useCallback, useEffect, useMemo, useRef } from "react";
 
 import { STARTUP_WORKSPACE_CWD } from "../config/env.js";
@@ -29,6 +30,10 @@ import type { Msg, PanelSection, SessionInfo } from "../types.js";
 
 import type { ComposerActions, GatewayRpc, StateSetter } from "./interfaces.js";
 import { patchOverlayState } from "./overlayStore.js";
+import {
+  forgetServerRequestsForSession,
+  serverRequestsForSession,
+} from "./serverRequestStore.js";
 import { scheduleResumeScrollToBottom } from "./sessionResumeView.js";
 import { turnController } from "./turnController.js";
 import { patchTurnState } from "./turnStore.js";
@@ -142,6 +147,8 @@ export interface UseSessionLifecycleOptions {
   gw: GatewayClient;
   onFreshSessionStarted?: (sessionId: string) => void;
   panel: (title: string, sections: PanelSection[]) => void;
+  /** Opens a server→client request's card again (the server-request handler). */
+  reopenServerRequest?: (request: ServerRequest) => void;
   rpc: GatewayRpc;
   scrollRef: RefObject<null | ScrollBoxHandle>;
   setHistoryItems: StateSetter<Msg[]>;
@@ -158,6 +165,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     gw,
     onFreshSessionStarted,
     panel,
+    reopenServerRequest,
     rpc,
     scrollRef,
     setHistoryItems,
@@ -166,6 +174,22 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     setStickyPrompt,
     sys,
   } = opts;
+
+  // After a switch has settled: the gateway re-sends the new session's open approval/clarify when this client
+  // attaches, and that can arrive before the activate/resume `.then` whose resetSession() drops every prompt card.
+  // Re-open what is still stored for the new session, so a needs-input session shows its prompt whatever the order.
+  const settleServerRequests = useCallback(
+    (previousSid: null | string, nextSid: string) => {
+      if (previousSid && previousSid !== nextSid) {
+        forgetServerRequestsForSession(previousSid);
+      }
+
+      for (const request of serverRequestsForSession(nextSid)) {
+        reopenServerRequest?.({ ...request, replayed: true });
+      }
+    },
+    [reopenServerRequest],
+  );
 
   const closeSession = useCallback(
     (targetSid?: null | string) =>
@@ -368,6 +392,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     (id: string, dropSid?: string) => {
       patchOverlayState({ agentView: false, sessions: false });
       patchUiState({ status: "switching session…" });
+      const previousSid = getUiState().sid;
 
       gw.request<SessionActivateResponse>("session.activate", {
         session_id: id,
@@ -406,6 +431,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             usage: usageFrom(info),
           });
           hydrateLiveSessionInflight(r.inflight);
+          settleServerRequests(previousSid, r.session_id);
 
           cancelResumeScrollRef.current?.();
           cancelResumeScrollRef.current =
@@ -424,6 +450,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       scrollRef,
       setHistoryItems,
       setSessionStartedAt,
+      settleServerRequests,
       sys,
     ],
   );
@@ -491,6 +518,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               usage: usageFrom(info),
             });
             hydrateLiveSessionInflight(r.inflight);
+            settleServerRequests(previousSid, r.session_id);
 
             cancelResumeScrollRef.current?.();
             cancelResumeScrollRef.current =
@@ -516,6 +544,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       scrollRef,
       setHistoryItems,
       setSessionStartedAt,
+      settleServerRequests,
       sys,
     ],
   );

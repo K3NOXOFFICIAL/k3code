@@ -161,3 +161,81 @@ async def test_stdio_survives_an_over_limit_frame(tmp_path, monkeypatch):
     assert any("longer than" in json.dumps(f) for f in frames)
     assert any(f.get("id") == 2 for f in frames)  # the loop kept reading after the over-long frame
     await server.close()
+
+
+async def _peer_on_new_session(sock: Path, tmp_path: Path) -> tuple[Peer, str]:
+    peer = await Peer.connect(sock)
+    created = await peer.send("session.create", {"cwd": str(tmp_path)})
+    return peer, (await peer.until(lambda f: f.get("id") == created))["result"]["session_id"]
+
+
+async def _until_detached(server, sockets_left: int) -> None:
+    """The daemon has run its detach bookkeeping (client removed and the reap decided, in one synchronous step)."""
+    async with asyncio.timeout(5):
+        while len([c for c in server.clients if c.name.startswith("socket#")]) != sockets_left:
+            await asyncio.sleep(0.01)
+
+
+async def _until_not_live(server, sid: str) -> None:
+    async with asyncio.timeout(5):
+        while sid in server.live:
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("hang_up", ["goodbye", "crash"])
+async def test_an_empty_idle_session_is_closed_when_its_last_client_leaves(daemon, tmp_path, hang_up):
+    """Every TUI start creates a session; session.close refuses while its caller is attached, so an empty one stayed
+    live for the daemon's lifetime after the TUI exited, crashed or was killed."""
+    server, sock = daemon
+    peer, sid = await _peer_on_new_session(sock, tmp_path)
+    assert sid in server.live
+    if hang_up == "goodbye":
+        peer.writer.close()
+    else:  # kill -9: the socket drops without a goodbye
+        peer.writer.transport.abort()
+    await _until_detached(server, 0)
+    await _until_not_live(server, sid)
+    assert server.store.get(sid) is not None  # only dropped from the live registry
+
+
+class _RunningSubagent:
+    def __init__(self, parent_sid: str) -> None:
+        self.parent_sid, self.done, self.status, self.id = parent_sid, False, "running", "sa-1"
+
+
+@pytest.mark.parametrize("busy", ["message", "working", "background", "automation", "queued", "subagent"])
+async def test_a_session_with_content_or_work_survives_its_last_client_leaving(daemon, tmp_path, busy):
+    server, sock = daemon
+    peer, sid = await _peer_on_new_session(sock, tmp_path)
+    live = server.live[sid]
+    if busy == "message":
+        live.stored.messages.append({"role": "user", "content": "hi"})
+    elif busy == "working":
+        live.streaming = True
+    elif busy == "background":
+        live.background = True
+    elif busy == "automation":
+        live.stored.meta["origin"] = "automation"
+    elif busy == "queued":
+        live.pending_prompts.append("next")
+    else:
+        server.subagents.handles["sa-1"] = _RunningSubagent(sid)
+    peer.writer.transport.abort()
+    await _until_detached(server, 0)
+    assert sid in server.live
+    live.streaming = False
+    server.subagents.handles.pop("sa-1", None)
+
+
+async def test_an_empty_session_stays_while_another_client_is_still_attached(daemon, tmp_path):
+    server, sock = daemon
+    first, sid = await _peer_on_new_session(sock, tmp_path)
+    second = await Peer.connect(sock)
+    activated = await second.send("session.activate", {"session_id": sid})
+    await second.until(lambda f: f.get("id") == activated)
+    first.writer.close()
+    await _until_detached(server, 1)
+    assert sid in server.live
+    second.writer.close()
+    await _until_detached(server, 0)
+    await _until_not_live(server, sid)
