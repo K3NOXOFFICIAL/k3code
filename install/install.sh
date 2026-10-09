@@ -33,6 +33,7 @@ TMP=""
 BUILDING=""
 REQS=""
 UV_TMP=""
+TUI_TMP=""
 GIT_ERR=""
 LOCK=""
 
@@ -70,9 +71,16 @@ EOF
 }
 
 # ---- output ----------------------------------------------------------------
+redact() { # redact TEXT: credentials in URLs (https://user:token@host) become ***
+  case "$*" in
+    *://*@*) printf '%s\n' "$*" | sed 's#://[^/@[:space:]]*@#://***@#g' ;;
+    *) printf '%s\n' "$*" ;;
+  esac
+}
 say() { # say TEXT: stderr and the install log, no prefix (hints stay copy-pasteable)
-  printf '%s\n' "$*" >&2
-  if [ -n "$INSTALL_LOG" ]; then printf '%s\n' "$*" >>"$INSTALL_LOG" 2>/dev/null || true; fi
+  msg=$(redact "$*")
+  printf '%s\n' "$msg" >&2
+  if [ -n "$INSTALL_LOG" ]; then printf '%s\n' "$msg" >>"$INSTALL_LOG" 2>/dev/null || true; fi
 }
 log() { say "k3code-install: $*"; }
 die() {
@@ -86,6 +94,7 @@ cleanup() {
   if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
   if [ -n "$REQS" ]; then rm -f "$REQS"; fi
   if [ -n "$UV_TMP" ]; then rm -rf "$UV_TMP"; fi
+  if [ -n "$TUI_TMP" ]; then rm -rf "$TUI_TMP"; fi
   if [ -n "$GIT_ERR" ]; then rm -f "$GIT_ERR"; fi
   if [ -n "$LOCK" ]; then rm -rf "$LOCK"; fi
   if [ "$rc" -ne 0 ]; then say "k3code-install: FAILED (exit $rc)${INSTALL_LOG:+. Log: $INSTALL_LOG}"; fi
@@ -97,7 +106,11 @@ have() { command -v "$1" >/dev/null 2>&1; }
 have_git() { git --version >/dev/null 2>&1; } # macOS ships a /usr/bin/git stub that fails without the developer tools
 
 fetch() { # fetch URL FILE
-  if have curl; then curl -fsSL --retry 3 "$1" -o "$2"; else wget -q --tries=3 -O "$2" "$1"; fi
+  if have curl; then
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$1" -o "$2"
+  else
+    wget -q --https-only --tries=3 -O "$2" "$1"
+  fi
 }
 
 ask_tty() { # ask_tty QUESTION: asks on the terminal only, never with --yes; no terminal means no
@@ -489,12 +502,12 @@ ensure_go() { # the Go release panes/go.mod asks for, from go.dev, checked again
 
 ensure_bwrap() { # Linux sandbox: through the package manager, as root or after a yes at a terminal
   if [ "$PLATFORM" != Linux ] || have bwrap || [ "$NO_DEPS" = 1 ] || [ -z "$PM" ] || [ "$PM" = brew ]; then return 0; fi
-  # Never sudo unattended: a passwordless sudo is not consent. Root installs directly; anyone else is asked at a
-  # terminal (never with --yes, never without a tty), and sudo then asks for the password itself.
-  if [ "$(id -u)" != 0 ] && [ "${ROOT_APPROVED:-0}" != 1 ] && [ "$YES" != 1 ] && [ -t 0 ] && [ -t 1 ] && have sudo; then
-    printf 'Install bubblewrap now with sudo (it asks for your password)? [y/N] ' >&2
-    read -r ans || ans=
-    case "$ans" in y | Y | yes | YES) ROOT_APPROVED=1 ;; esac
+  # Never sudo unattended: a passwordless sudo is not consent. Root installs directly; anyone else is asked on the
+  # terminal (/dev/tty: stdin is /dev/null or the piped script; never with --yes, never without a terminal), and sudo
+  # then asks for the password itself.
+  if [ "$(id -u)" != 0 ] && [ "${ROOT_APPROVED:-0}" != 1 ] && have sudo; then
+    BWRAP_ASKED=1
+    if ask_tty "Install bubblewrap now with sudo (it asks for your password)?"; then ROOT_APPROVED=1; fi
   fi
   if [ "$(id -u)" != 0 ] && [ "${ROOT_APPROVED:-0}" != 1 ]; then
     log "bubblewrap (the sandbox for unattended runs) needs root to install: $(hint_cmd bwrap)"
@@ -666,14 +679,6 @@ acquire_source() {
   fi
   VER="$(tr -d '[:space:]' <"$SRC_ROOT/VERSION")-src${SHA:+.$SHA}"
   VERDIR="$DATA/versions/$VER"
-  # The TUI build writes node_modules into its tree. A read-only checkout is built from a copy.
-  if [ "$FROM" = source ] && [ ! -f "$VERDIR/.complete" ] && [ "${K3_EDITABLE:-0}" != 1 ] &&
-    [ "${K3_SKIP_TUI:-0}" != 1 ] && [ ! -w "$SRC_ROOT/tui" ]; then
-    log "the checkout is read-only: building from a temporary copy"
-    TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-src.XXXXXX")
-    cp -R "$SRC_ROOT" "$TMP/src"
-    SRC_ROOT=$TMP/src
-  fi
   return 0
 }
 
@@ -685,9 +690,18 @@ build_tui() {
     return 0
   fi
   log "building the TUI (npm ci; this takes a minute)"
-  if (cd "$SRC_ROOT/tui" && npm ci --no-audit --no-fund >&2 && npm run build:ink >&2 && npm run build >&2) &&
-    [ -d "$SRC_ROOT/tui/dist" ]; then
-    cp -R "$SRC_ROOT/tui/dist" "$VERDIR/tui/dist"
+  tui=$SRC_ROOT/tui
+  if [ "$FROM" = source ]; then # the build writes node_modules and dist: never into the user's checkout
+    TUI_TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-tui.XXXXXX")
+    if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then
+      log "WARNING: could not copy the TUI sources to $TUI_TMP; k3code will use the line REPL"
+      return 0
+    fi
+    tui=$TUI_TMP/tui
+  fi
+  if (cd "$tui" && npm ci --no-audit --no-fund >&2 && npm run build:ink >&2 && npm run build >&2) &&
+    [ -d "$tui/dist" ]; then
+    cp -R "$tui/dist" "$VERDIR/tui/dist"
     # Build receipts belong to the build tooling; nothing at runtime reads them.
     rm -f "$VERDIR/tui/dist/hermes-build.json" "$VERDIR/tui/dist/.k3code-product"
   else
@@ -927,7 +941,7 @@ presetup_sandbox() {
   say "      install it:  $cmd"
   case "$cmd" in
     "sudo "*)
-      if ask_tty "Run that now? (sudo asks for your password)"; then
+      if [ "${BWRAP_ASKED:-0}" != 1 ] && ask_tty "Run that now? (sudo asks for your password)"; then # asked once per run
         if sh -c "$cmd" </dev/tty >/dev/tty 2>&1 && bwrap_usable; then
           log "presetup: sandbox ok (bubblewrap installed)"
         else
@@ -1083,7 +1097,10 @@ main() {
   mkdir -p "$DATA" "$BIN"
   take_lock
   INSTALL_LOG="${K3_INSTALL_LOG:-$DATA/install.log}"
-  printf '\n==== %s install start (args: %s) ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$INSTALL_LOG" 2>/dev/null || true
+  # only the user reads the log: it names URLs and paths (credentials in URLs are redacted)
+  (umask 077 && : >>"$INSTALL_LOG") 2>/dev/null || true
+  chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+  printf '\n==== %s install start (args: %s) ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(redact "$*")" >>"$INSTALL_LOG" 2>/dev/null || true
   report
   if [ "$NO_DEPS" = 1 ]; then export UV_PYTHON_DOWNLOADS=never; fi
   if [ "$FROM" = git ] && ! have_git; then die "git is needed for --from-git: $(hint_cmd git)"; fi

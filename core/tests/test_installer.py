@@ -817,3 +817,55 @@ def test_an_old_go_gets_a_checked_private_go(tmp_path: Path, listed: str) -> Non
     else:
         assert not private.exists()
         assert "did not match the sha256 go.dev lists" in r.stderr
+
+
+def test_credentials_in_urls_never_reach_the_log(tmp_path: Path) -> None:
+    real_git = shutil.which("git")
+    url = "https://alice:s3cr3t-token@example.invalid/x.git"
+    body = (
+        f'case "$*" in *fetch*) echo "fatal: unable to access \'{url}/\': Could not resolve host" >&2; exit 128 ;; esac\n'
+        f'exec "{real_git}" "$@"\n'
+    )
+    stubs = stub_bin(tmp_path, "git", body)
+    r = run(tmp_path, INSTALL, "--from-git", url, "--ref", "main", path_front=stubs)
+    assert r.returncode != 0
+    log = tmp_path / DATA_REL / "install.log"
+    text = log.read_text()
+    assert "https://***@example.invalid/x.git" in text  # the args line and the fetch error, redacted
+    assert "s3cr3t" not in text and "s3cr3t" not in r.stderr
+    assert log.stat().st_mode & 0o777 == 0o600
+
+
+def test_downloads_are_https_only(tmp_path: Path) -> None:
+    calls = tmp_path / "curl.log"
+    curl = stub_bin(tmp_path, "curl", f'echo "curl $*" >>"{calls}"\nexit 22\n')
+    r = run(
+        tmp_path,
+        INSTALL,
+        "--from-source",
+        "--minimal",
+        env_extra={"PATH": _no_uv_path()},
+        drop=("K3_NO_DOWNLOAD",),
+        path_front=curl,
+    )
+    assert r.returncode != 0  # no uv, and its download "failed"
+    assert "--proto =https --tlsv1.2" in calls.read_text()
+
+
+def test_from_source_builds_the_tui_outside_the_checkout(tmp_path: Path) -> None:
+    src = _mini_checkout(tmp_path)
+    (src / "tui").mkdir()
+    (src / "tui" / "package.json").write_text("{}\n")
+    tools = stub_bin(tmp_path, "node", 'echo "v22.0.0"\n')
+    stub_bin(
+        tmp_path,
+        "npm",
+        'case "$*" in ci*) mkdir -p node_modules ;; "run build") mkdir -p dist && echo built >dist/entry.js ;; esac\n',
+    )
+    r = run(
+        tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", drop=("K3_SKIP_TUI",), path_front=tools
+    )
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / DATA_REL / "current" / "tui" / "dist" / "entry.js").read_text() == "built\n"
+    assert not (src / "tui" / "node_modules").exists()
+    assert not (src / "tui" / "dist").exists()
