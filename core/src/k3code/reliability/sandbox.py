@@ -59,6 +59,65 @@ class SandboxUnavailable(SandboxRefused):
 HOME_SECRETS = (".config/k3code", ".ssh")
 
 
+def configured_home_readonly() -> list[str]:
+    """``sandbox.home_readonly`` from the user's ``config.yaml`` (never a project's): ``$HOME`` entries that stay
+    visible, read-only, inside the sandbox. Empty when unset or malformed."""
+    try:
+        from k3code import config
+
+        section = config.load_user_section("sandbox")
+    except Exception:  # an unreadable config must not break bash: the sandbox then keeps its default view
+        logger.warning("sandbox: could not read sandbox.home_readonly from the user config", exc_info=True)
+        return []
+    entries = section.get("home_readonly") if isinstance(section, dict) else None
+    return [e for e in entries if isinstance(e, str)] if isinstance(entries, list) else []
+
+
+#: ``$HOME`` entries ``home_readonly`` never exposes, on top of :data:`HOME_SECRETS` (the k3code home is added too).
+HOME_READONLY_REFUSED = (".gnupg", ".aws")
+
+
+def _home_readonly_paths(home: Path, entries: Iterable[object], writable: Iterable[Path] = ()) -> list[Path]:
+    """The entries that may be bound read-only: relative to ``$HOME``, present, and neither ``$HOME`` itself, nor
+    above or inside a secret (``~/.ssh``, ``~/.gnupg``, ``~/.aws``, the k3code home), nor above a writable root
+    (``writable``: the project, added dirs, the cache), which a read-only bind would shadow. Anything else is
+    skipped with a warning; an entry that cannot be inspected (name too long, no permission) is skipped too, never
+    raised: a sandbox that cannot be built would leave bash running without one."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    guarded = [home / s for s in (*HOME_SECRETS, *HOME_READONLY_REFUSED)] + [paths.home()]
+    if xdg:
+        guarded.append(Path(xdg) / "k3code")
+    try:
+        secrets = [g.resolve() for g in guarded]
+        roots = [Path(w).resolve() for w in writable]
+    except (OSError, ValueError, RuntimeError):
+        logger.warning("sandbox: home_readonly ignored (could not resolve the guarded paths)", exc_info=True)
+        return []
+    out: list[Path] = []
+    for raw in entries:
+        text = raw.strip() if isinstance(raw, str) else ""
+        rel = Path(text) if text else None
+        if rel is None or rel.is_absolute() or ".." in rel.parts or rel.parts in ((), (".",)):
+            logger.warning("sandbox: ignoring home_readonly entry %r (must be a path below $HOME)", raw)
+            continue
+        path = home / rel
+        try:
+            if not path.exists():
+                continue
+            real = path.resolve()
+        except (OSError, ValueError, RuntimeError):
+            logger.warning("sandbox: ignoring home_readonly entry %r (cannot be inspected)", raw)
+            continue
+        if exposes_home(real, home) or any(real.is_relative_to(s) or s.is_relative_to(real) for s in secrets):
+            logger.warning("sandbox: ignoring home_readonly entry %r (reaches $HOME or a secrets folder)", raw)
+            continue
+        if any(r.is_relative_to(real) for r in roots):
+            logger.warning("sandbox: ignoring home_readonly entry %r (it contains a writable folder)", raw)
+            continue
+        out.append(path)
+    return out
+
+
 def bwrap_path() -> str | None:
     return shutil.which("bwrap")
 
@@ -173,8 +232,12 @@ def build_argv(
     home: Path | None = None,
     bwrap: str | None = None,
     network: bool = True,
+    home_readonly: Iterable[str] | None = None,
 ) -> list[str]:
     """The ``bwrap`` argv *prefix*; append the command (e.g. ``/bin/sh -c "..."``).
+
+    ``home_readonly`` lists ``$HOME`` entries that stay visible read-only (default: ``sandbox.home_readonly`` of the
+    user's config). It exists for small marker files a tool must be able to read, e.g. ``.myapp``.
 
     A project dir that is ``$HOME`` or contains it (``/``) is not bound: that would undo the home tmpfs and hand the
     command ``~/.config/k3code/env`` and ``~/.ssh``. Those two are masked again after the binds in any case.
@@ -230,6 +293,10 @@ def build_argv(
             # git metadata is read-only: a sandboxed command cannot write a hook or change core.* config
             for meta in _git_metadata(root):
                 argv += ["--ro-bind", str(meta), str(meta)]
+    # Listed $HOME entries come back read-only after the project binds, so a project bind cannot make one writable
+    extra = configured_home_readonly() if home_readonly is None else list(home_readonly)
+    for path in _home_readonly_paths(home, extra, [*roots, cache]):
+        argv += ["--ro-bind", str(path), str(path)]
     # $HOME secrets are masked again after the project binds: a bind above them would re-expose them
     xdg = os.environ.get("XDG_CONFIG_HOME")
     secrets = [home / s for s in HOME_SECRETS] + ([Path(xdg) / "k3code"] if xdg else [])

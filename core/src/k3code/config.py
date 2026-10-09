@@ -189,6 +189,14 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return {}
 
 
+def load_user_section(name: str) -> Any:
+    """One top-level section of the *user's* ``config.yaml`` only: never the project's, never the environment.
+
+    For settings that widen what a sandboxed command can see, which a repository must not be able to do.
+    """
+    return _load_yaml(_current_home() / "config.yaml").get(name)
+
+
 def _merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Shallow merge per top-level key: a key set in ``override`` replaces the whole base value.
 
