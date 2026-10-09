@@ -97,6 +97,7 @@ def wait_cs(t: Tui, pattern: str, timeout: float = 10) -> bool:
 VIEW_FOOTER = r"→/⏎ attach"
 VIEW_GROUP = r"\b(Needs input|Working|Completed)\b"
 STRIP_MARKER = r"›\s*[◐●✓✗○]"
+STRIP_ROW = r"^\s*[◐●✓✗○] {}.* · (working|needs input|idle|completed|failed)\b"  # a strip row by title
 
 
 def marker_line(t: Tui) -> str:
@@ -448,7 +449,14 @@ def agent_view_keys() -> str:
 
         t.key("right")
         need(t.wait_gone(VIEW_FOOTER, 10), "→ did not leave the agent view\n" + tail_screen(t))
-        need(t.wait(r"run slowjob", 10), "attached session's title not shown\n" + tail_screen(t))
+        # Only an attach makes the busy session current: the composer shows its interrupt hint (the earlier session
+        # was idle) and the strip, which leaves the current session out, drops its row. A → that merely closed the
+        # view would leave the idle composer and the strip row '◐ run slowjob … · working'.
+        need(wait_cs(t, r"Esc Esc to interrupt", 10), "→ did not attach: composer not busy\n" + tail_screen(t))
+        need(
+            not re.search(STRIP_ROW.format("run slowjob"), t.text(), re.M),
+            "→ did not attach the bg session\n" + t.text(),
+        )
 
         t.key("left")
         need(wait_cs(t, VIEW_FOOTER, 10), "← on the empty prompt did not reopen the view\n" + tail_screen(t))
@@ -465,7 +473,8 @@ def agent_view_keys() -> str:
         need("say himark" in input_line(t), "↑ did not recall the earlier prompt\n" + tail_screen(t))
         return (
             f"↓ left the strip unselected; ← view with groups {groups} and footer '→/⏎ attach', opened on the current "
-            "row; ↑/↓ moved '›' to the bg session and back; → attached it; ← reopened, esc closed; "
+            "row; ↑/↓ moved '›' to the bg session and back; → attached it (composer busy, its strip row gone); "
+            "← reopened, esc closed; "
             f"↑ recalled: {input_line(t).strip()!r}"
         )
     finally:
