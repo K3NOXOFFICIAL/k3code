@@ -152,7 +152,7 @@ def denial_preferences(log: DecisionLog, *, min_evidence: int = 2) -> list[dict[
         for _words, reasons in clusters:
             if len(reasons) >= min_evidence:
                 text = Counter(reasons).most_common(1)[0][0]  # the most common wording, the first on a tie
-                out.append({"prefix": prefix, "reason": scrub(text), "evidence": len(reasons)})
+                out.append({"prefix": prefix, "reason": scrub_text(text), "evidence": len(reasons)})
     return out
 
 
@@ -175,7 +175,7 @@ def propose_denial_preferences(log: DecisionLog, proposals: ProposalStore) -> li
 def add_user_line(path: Path, text: str, heading: str = HEADING) -> None:
     """Add ``- text`` to ``path`` above the auto section (the distiller rewrites that section, and everything below
     its heading up to the next one, on every run)."""
-    text = scrub(text.strip())
+    text = scrub_text(text.strip())
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     lines = existing.splitlines(keepends=True)
     at = next((i for i, ln in enumerate(lines) if ln.strip() == heading), None)
