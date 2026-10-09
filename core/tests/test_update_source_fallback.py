@@ -141,3 +141,102 @@ async def test_the_slash_command_offers_the_checkout_too(checkout, monkeypatch):
     assert f"built from {checkout}" in out["output"] and "/update now" in out["output"]
     out = await UpdateCommand().handle(None, None, "now")
     assert "Update started" in out["output"]
+
+
+# -- the slash command on a git install (a version dir with `.ref`, no checkout, no releases) --------------------
+
+OLD = "a" * 40
+NEW = "b" * 40
+
+
+@pytest.fixture
+def git_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """An install built from `main` at OLD[:7]; no release, no checkout; `apply_detached` is recorded."""
+
+    def make(ref: str = "main") -> list[str]:
+        data = tmp_path / "data"
+        vdir = data / "versions" / f"0.1.0-src.{OLD[:7]}"
+        vdir.mkdir(parents=True)
+        (vdir / ".ref").write_text(ref + "\n")
+        (data / "current").symlink_to(vdir)
+        return applied
+
+    applied: list[str] = []
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(upd, "github_token", lambda: None)
+    monkeypatch.setattr(upd, "fetch_latest", lambda *a, **k: None)
+    monkeypatch.setattr(upd, "apply_detached", lambda: applied.append("applied") or "Update started (test).")
+    return make
+
+
+async def _slash(arg: str) -> str:
+    from k3code.commands.update_cmd import UpdateCommand
+
+    return (await UpdateCommand().handle(None, None, arg))["output"]
+
+
+async def test_slash_update_on_an_up_to_date_git_install_says_so(git_install, monkeypatch):
+    applied = git_install()
+    monkeypatch.setattr(upd, "remote_head", lambda url, ref: OLD)
+    for arg in ("", "now"):
+        out = await _slash(arg)
+        assert "No releases" not in out and "current: 0.1.0-src.aaaaaaa" in out
+        assert f"latest:  {OLD[:7]} (main)" in out and "Already up to date." in out
+    assert applied == []
+
+
+async def test_slash_update_on_a_git_install_with_a_newer_head_offers_and_applies_it(git_install, monkeypatch):
+    applied = git_install()
+    monkeypatch.setattr(upd, "remote_head", lambda url, ref: NEW)
+    out = await _slash("")
+    assert f"latest:  {NEW[:7]} (main)" in out and "/update now" in out and "Already up to date" not in out
+    assert applied == []
+    out = await _slash("now")
+    assert "Update started (test)." in out and applied == ["applied"]
+
+
+async def test_slash_update_on_a_git_install_shows_a_remote_error_instead_of_raising(git_install, monkeypatch):
+    applied = git_install()
+
+    def boom(url, ref):
+        raise upd.SourceUpdateError("git ls-remote x: no network (offline)")
+
+    monkeypatch.setattr(upd, "remote_head", boom)
+    for arg in ("", "now"):
+        out = await _slash(arg)
+        assert "Could not check main of" in out and "no network (offline)" in out
+    assert applied == []
+
+
+async def test_slash_update_on_a_git_install_survives_a_private_repo_release_lookup(git_install, monkeypatch):
+    git_install()
+    monkeypatch.setattr(upd, "fetch_latest", _deny)
+    monkeypatch.setattr(upd, "remote_head", lambda url, ref: NEW)
+    assert f"latest:  {NEW[:7]} (main)" in await _slash("")
+
+
+async def test_slash_update_on_an_install_pinned_to_a_sha_has_nothing_to_update(git_install, monkeypatch):
+    applied = git_install(ref=OLD)
+    monkeypatch.setattr(upd, "remote_head", lambda url, ref: ref)
+    for arg in ("", "now"):
+        assert "pinned to commit" in await _slash(arg)
+    assert applied == []
+
+
+async def test_slash_update_without_release_checkout_or_git_ref_still_says_no_releases(tmp_path, monkeypatch):
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(upd, "github_token", lambda: None)
+    monkeypatch.setattr(upd, "fetch_latest", lambda *a, **k: None)
+    assert "No releases on channel" in await _slash("")
+
+
+async def test_slash_update_with_a_release_still_compares_versions(git_install, monkeypatch):
+    applied = git_install()  # a `.ref` must not shadow a published release
+    rel = upd.Release(tag="v9.9.9", version="9.9.9", body="notes", prerelease=False, assets={})
+    monkeypatch.setattr(upd, "fetch_latest", lambda *a, **k: rel)
+    monkeypatch.setattr(upd, "remote_head", lambda *a: pytest.fail("a release wins over the git ref"))
+    out = await _slash("")
+    assert "latest:  9.9.9" in out and "notes" in out
+    assert "Update started" in await _slash("now") and applied == ["applied"]
