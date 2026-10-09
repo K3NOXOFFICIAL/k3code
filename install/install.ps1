@@ -37,6 +37,8 @@ function Die([string]$Text) { Say "ERROR: $Text"; exit 1 }
 function Quote-Sh([string]$Arg) { "'" + ($Arg -replace "'", "'\''") + "'" } # one sh word, no double quotes
 
 function Get-WslText([string[]]$WslArgs) { # runs wsl.exe and returns its stdout as clean text
+  # Windows PowerShell 5.1 turns a native command's stderr into an error record, which 'Stop' makes terminating
+  $ErrorActionPreference = 'Continue'
   $out = & $Wsl @WslArgs 2>$null
   if ($LASTEXITCODE -ne 0) { return $null }
   return (($out | Out-String) -replace "`0", '').Trim()
@@ -62,10 +64,30 @@ function Get-ShArgs([string]$Command, [string]$Cwd = '') { # wsl.exe arguments t
   return $a + @('--exec', 'sh', '-lc', $Command)
 }
 
+# The user PATH is a REG_EXPAND_SZ holding %VARIABLES%. [Environment]::SetEnvironmentVariable would store it expanded
+# as REG_SZ, so it is read and written through the registry unexpanded instead.
+function Get-UserPath {
+  if ($env:OS -ne 'Windows_NT') { return $null }
+  $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+  if (-not $key) { return $null }
+  try { return [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+  finally { $key.Close() }
+}
+
+function Set-UserPath([string]$Value) {
+  if ($env:OS -ne 'Windows_NT') { return } # elsewhere (tests) there is no user PATH to write
+  $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
+  try { $key.SetValue('Path', $Value, [Microsoft.Win32.RegistryValueKind]::ExpandString) } finally { $key.Close() }
+  # a throwaway variable set and removed through .NET broadcasts WM_SETTINGCHANGE, so new terminals see the change
+  [Environment]::SetEnvironmentVariable('K3CODE_PATH_REFRESH', '1', 'User')
+  [Environment]::SetEnvironmentVariable('K3CODE_PATH_REFRESH', $null, 'User')
+}
+
 function Write-Shim([string]$Dir, [string]$Name, [string]$Target) {
-  # cmd passes %* to wsl.exe, which splits it with the Windows rules; sh then gets each argument as "$@"
-  $body = "@echo off`r`n" +
-  "wsl.exe -d $($script:Distro) --cd `"%CD%`" --exec sh -lc `"exec $Target \`"`$@\`"`" $Name %*`r`n"
+  # cmd passes %* to wsl.exe, which splits it with the Windows rules; sh then gets each argument as "$@".
+  # At a drive root %CD% ends in a backslash ("C:\"), which would escape the closing quote: double it there.
+  $body = "@echo off`r`nsetlocal`r`nset `"K3_CD=%CD%`"`r`nif `"%K3_CD:~-1%`"==`"\`" set `"K3_CD=%K3_CD%\`"`r`n" +
+  "wsl.exe -d $($script:Distro) --cd `"%K3_CD%`" --exec sh -lc `"exec $Target \`"`$@\`"`" $Name %*`r`n"
   Set-Content -Path (Join-Path $Dir "$Name.cmd") -Value $body -NoNewline -Encoding Ascii
 }
 
@@ -163,14 +185,14 @@ if ($LASTEXITCODE -eq 0) {
   Set-Content -Path (Join-Path $env:LOCALAPPDATA 'k3code\wsl.json') -Encoding Ascii
 Say "Windows commands in $shimDir run k3code in $($script:Distro)"
 
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$userPath = Get-UserPath
 $onPath = $userPath -and (($userPath -split ';') -contains $shimDir)
 if (-not $onPath) {
   if ($NoModifyPath) {
     Say "Add $shimDir to your PATH to run k3code from PowerShell and cmd"
   } else {
     $new = if ($userPath) { "$userPath;$shimDir" } else { $shimDir }
-    [Environment]::SetEnvironmentVariable('Path', $new, 'User')
+    Set-UserPath $new
     Say "added $shimDir to your user PATH (new terminals pick it up)"
   }
   $env:Path = "$env:Path;$shimDir"
