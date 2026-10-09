@@ -5,6 +5,10 @@ import { stripAnsi } from "@k3code/shared/ansi";
 import React, { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  $escInterruptHint,
+  hideEscInterruptHint,
+} from "../app/escInterruptHintStore.js";
 import { GatewayProvider } from "../app/gatewayContext.js";
 import type {
   AppLayoutProps,
@@ -26,6 +30,7 @@ import { useInputHandlers } from "../app/useInputHandlers.js";
 import { useSessionLifecycle } from "../app/useSessionLifecycle.js";
 import { StatusRule } from "../components/appChrome.js";
 import { AppLayout } from "../components/appLayout.js";
+import { ESC_INTERRUPT_HINT } from "../components/workingLine.js";
 import { DOUBLE_ESC_MS } from "../config/timing.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import { AGENT_VIEW_HINT } from "../k3/agentView.js";
@@ -60,14 +65,17 @@ const mounted: Array<() => void> = [];
  * Teardown is registered up front so a failing assertion still unmounts the
  * tree — a leaked instance would keep re-arming timers into the next test.
  */
-const mountTree = (tree: React.ReactElement, { interactive = false } = {}) => {
+const mountTree = (
+  tree: React.ReactElement,
+  { columns = 120, interactive = false, rows = 20 } = {},
+) => {
   const stdout = new PassThrough();
   const stdin = new PassThrough();
   const stderr = new PassThrough();
 
   let output = "";
 
-  Object.assign(stdout, { columns: 120, isTTY: false, rows: 20 });
+  Object.assign(stdout, { columns, isTTY: false, rows });
   // PromptZone's prompts call `useInput`, which needs raw mode; without it Ink
   // swaps the whole tree for an error panel and stops updating.
   Object.assign(
@@ -231,8 +239,15 @@ const mountLayout = (
   actions: Partial<AppLayoutProps["actions"]> = {},
   {
     beside = null,
+    columns = 120,
     gateway = gatewayStub,
-  }: { beside?: React.ReactNode; gateway?: GatewayServices } = {},
+    rows = 20,
+  }: {
+    beside?: React.ReactNode;
+    columns?: number;
+    gateway?: GatewayServices;
+    rows?: number;
+  } = {},
 ) => {
   patchUiState({ sessionTitle: "test", sid: "sid-1", status: "ready", ...ui });
   patchOverlayState(overlay);
@@ -242,10 +257,11 @@ const mountLayout = (
       <AppLayout
         {...layoutProps}
         actions={{ ...layoutProps.actions, ...actions }}
+        composer={{ ...layoutProps.composer, cols: columns }}
       />
       {beside}
     </GatewayProvider>,
-    { interactive: true },
+    { columns, interactive: true, rows },
   );
 };
 
@@ -1113,7 +1129,15 @@ describe("useInputHandlers: a double Esc interrupts a running turn", () => {
       await flush();
     };
 
-    return { escs, escThenSentinel, interrupts, layout, probe, startTurn };
+    return {
+      escs,
+      escThenSentinel,
+      hits,
+      interrupts,
+      layout,
+      probe,
+      startTurn,
+    };
   };
 
   // Date.now is pinned to T0 (beforeEach), so consecutive Escs sit inside DOUBLE_ESC_MS unless a test moves it.
@@ -1416,6 +1440,163 @@ describe("useInputHandlers: a double Esc interrupts a running turn", () => {
     await flush();
     layout.press("\x03");
     await waitFor(() => expect(interrupts()).toHaveLength(1));
+  });
+
+  describe("the Esc-again hint", () => {
+    afterEach(() => hideEscInterruptHint());
+
+    /** Every value the hint store takes from now on. */
+    const recordHint = () => {
+      const seen: boolean[] = [];
+      const off = $escInterruptHint.listen((value) => seen.push(value));
+
+      mounted.push(off);
+
+      return seen;
+    };
+
+    it("is off at first, comes up on the first Esc mid-turn and lapses with the window", async () => {
+      const { interrupts, layout } = setup();
+
+      await flush();
+      expect($escInterruptHint.get()).toBe(false);
+
+      layout.press(ESC);
+      await waitFor(() => expect($escInterruptHint.get()).toBe(true));
+      // Nothing else happens: only the window's own timer can take it down.
+      await waitFor(() => expect($escInterruptHint.get()).toBe(false));
+      expect(interrupts()).toHaveLength(0);
+    });
+
+    it("the second Esc hides it before the interrupt goes out", async () => {
+      const original = turnController.interruptTurn.bind(turnController);
+      const atInterrupt: boolean[] = [];
+      const spy = vi
+        .spyOn(turnController, "interruptTurn")
+        .mockImplementation((args) => {
+          atInterrupt.push($escInterruptHint.get());
+
+          return original(args);
+        });
+
+      try {
+        const { interrupts, layout } = setup();
+
+        await flush();
+        layout.press(ESC);
+        await waitFor(() => expect($escInterruptHint.get()).toBe(true));
+        layout.press(ESC);
+        await waitFor(() => expect(interrupts()).toHaveLength(1));
+
+        expect(atInterrupt).toEqual([false]);
+        expect($escInterruptHint.get()).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("another key hides it but leaves the pair open", async () => {
+      const { escThenSentinel, hits, interrupts, layout } = setup();
+
+      await flush();
+      layout.press(ESC);
+      await waitFor(() => expect($escInterruptHint.get()).toBe(true));
+      await pressThenSentinel(layout, hits, "");
+
+      expect($escInterruptHint.get()).toBe(false);
+
+      await escThenSentinel();
+
+      expect(interrupts()).toHaveLength(1);
+    });
+
+    it("hides the moment the turn ends", async () => {
+      const { layout } = setup();
+
+      await flush();
+      layout.press(ESC);
+      await waitFor(() => expect($escInterruptHint.get()).toBe(true));
+
+      patchUiState({ busy: false });
+
+      expect($escInterruptHint.get()).toBe(false);
+    });
+
+    it("hides the moment a blocking overlay opens", async () => {
+      const { layout } = setup();
+
+      await flush();
+      layout.press(ESC);
+      await waitFor(() => expect($escInterruptHint.get()).toBe(true));
+
+      patchOverlayState({ pager: { lines: ["a"], offset: 0 } });
+
+      expect($escInterruptHint.get()).toBe(false);
+    });
+
+    it("never comes up when idle", async () => {
+      const { escThenSentinel } = setup({ busy: false });
+      const seen = recordHint();
+
+      await flush();
+      await escThenSentinel();
+      await escThenSentinel();
+
+      expect(seen).not.toContain(true);
+    });
+
+    it("never comes up for the Esc that closes an overlay", async () => {
+      const { escThenSentinel } = setup({
+        overlay: { pager: { lines: ["a"], offset: 0 } },
+      });
+      const seen = recordHint();
+
+      await flush();
+      await escThenSentinel();
+      await waitFor(() => expect(getOverlayState().pager).toBeNull());
+
+      expect(seen).not.toContain(true);
+    });
+
+    it.each([
+      ["Shift+Esc (kitty)", "\x1b[27;2u"],
+      ["Alt+Esc (kitty)", "\x1b[27;3u"],
+      ["Ctrl+Esc (kitty)", "\x1b[27;5u"],
+    ])("never comes up for %s", async (_name, key) => {
+      const { escThenSentinel, escs } = setup();
+      const seen = recordHint();
+
+      await flush();
+      await escThenSentinel(key);
+      await escThenSentinel(key);
+
+      expect(escs).toHaveLength(2);
+      expect(seen).not.toContain(true);
+    });
+
+    it("renders in a 30x6 terminal on the working row, within the width", async () => {
+      const layout = mountLayout(
+        {},
+        { busy: true },
+        {},
+        { columns: 30, rows: 6 },
+      );
+
+      await flush();
+      expect(layout.output()).not.toContain(ESC_INTERRUPT_HINT);
+
+      $escInterruptHint.set(true);
+      await waitFor(() =>
+        expect(layout.output()).toContain(ESC_INTERRUPT_HINT),
+      );
+
+      const row = layout
+        .output()
+        .split("\n")
+        .find((line) => line.includes(ESC_INTERRUPT_HINT));
+
+      expect(row!.trimEnd().length).toBeLessThanOrEqual(30);
+    });
   });
 });
 

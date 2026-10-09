@@ -6,6 +6,10 @@ import stripAnsi from "strip-ansi";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  $escInterruptHint,
+  hideEscInterruptHint,
+} from "../app/escInterruptHintStore.js";
+import {
   $sessionOutputTokens,
   $turnTokenBaseline,
   addStreamedText,
@@ -16,7 +20,7 @@ import { $petEnabled, $petName, $petParty } from "../app/petStore.js";
 import { PET_NAMES, PETS } from "../content/pets.js";
 import { WORKING_MESSAGES } from "../content/workingMessages.js";
 import { PetCorner, TerminalPet } from "../components/terminalPet.js";
-import { WorkingLine } from "../components/workingLine.js";
+import { ESC_INTERRUPT_HINT, WorkingLine } from "../components/workingLine.js";
 import { PET_DONE_HOLD_MS, PET_TICK_MS } from "../lib/terminalPet.js";
 import { WORKING_ROTATE_MS, WORKING_TICK_MS } from "../lib/workingLine.js";
 import { DEFAULT_THEME } from "../theme.js";
@@ -30,8 +34,8 @@ const settle = async () => {
   }
 };
 
-const mount = (element: React.ReactElement) => {
-  const stdout = Object.assign(new PassThrough(), { columns: 120, rows: 10 });
+const mount = (element: React.ReactElement, columns = 120) => {
+  const stdout = Object.assign(new PassThrough(), { columns, rows: 10 });
   const frames: string[] = [];
   stdout.on("data", (chunk) => frames.push(chunk.toString()));
 
@@ -408,5 +412,61 @@ describe("animated timers", () => {
 
       view.unmount();
     }
+  });
+});
+
+describe("WorkingLine: the Esc-again hint", () => {
+  afterEach(() => hideEscInterruptHint());
+
+  it("shows the hint beside the working text only while the hint store is set", async () => {
+    const view = mount(
+      <WorkingLine busy startedAt={Date.now()} t={DEFAULT_THEME} />,
+    );
+
+    expect(view.output()).not.toContain(ESC_INTERRUPT_HINT);
+
+    $escInterruptHint.set(true);
+    await vi.waitFor(() => expect(view.output()).toContain(ESC_INTERRUPT_HINT));
+
+    const row = view
+      .output()
+      .split("\n")
+      .find((line) => line.includes(ESC_INTERRUPT_HINT));
+
+    expect(row).toMatch(/\) · Esc again to interrupt/);
+
+    view.unmount();
+  });
+
+  it("never shows the hint when no turn runs", () => {
+    $escInterruptHint.set(true);
+
+    const view = mount(<WorkingLine busy={false} t={DEFAULT_THEME} />);
+
+    expect(view.output()).not.toContain(ESC_INTERRUPT_HINT);
+
+    view.unmount();
+  });
+
+  it("keeps the whole hint on the working row at 30 columns, truncating the working text instead", () => {
+    $escInterruptHint.set(true);
+
+    const view = mount(
+      <WorkingLine busy startedAt={Date.now()} t={DEFAULT_THEME} />,
+      30,
+    );
+    const rows = view
+      .output()
+      .split("\n")
+      .filter((line) => line.trim());
+    const row = rows.find((line) => line.includes(ESC_INTERRUPT_HINT));
+
+    expect(row).toBeDefined();
+    expect(row!.trimEnd().length).toBeLessThanOrEqual(30);
+    // One row: the hint did not wrap and the working glyph still leads it.
+    expect(rows.filter((line) => line.includes("interrupt"))).toHaveLength(1);
+    expect(row!.trimStart().startsWith(ESC_INTERRUPT_HINT)).toBe(false);
+
+    view.unmount();
   });
 });
