@@ -446,7 +446,7 @@ def test_a_second_daemon_on_the_same_home_is_refused(tmp_path):
     try:
         with pytest.raises(DaemonAlreadyRunning):
             acquire_instance_lock(sock)
-        assert (sock.parent / "daemon.lock").read_text().strip() == str(os.getpid())
+        assert sock.with_suffix(".lock").read_text().strip() == str(os.getpid())
     finally:
         os.close(first)
     os.close(acquire_instance_lock(sock))  # released: a new daemon can start

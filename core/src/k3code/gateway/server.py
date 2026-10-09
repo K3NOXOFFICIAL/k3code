@@ -787,7 +787,7 @@ class GatewayServer:
     async def start_socket(self, path: Path | str) -> None:
         """Listen on a Unix socket: one JSON-RPC connection per client, sessions shared."""
         path = Path(path)
-        gw_auth.ensure_private_dir(path.parent)  # 0700: it holds the socket and the token
+        gw_auth.prepare_socket_dir(path)  # the default run dir is made 0700; a custom one is only checked
         if path.exists():
             if _socket_is_live(path):
                 raise RuntimeError(f"{path} is served by another process; not taking it over")

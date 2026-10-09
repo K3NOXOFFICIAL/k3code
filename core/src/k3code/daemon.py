@@ -153,16 +153,16 @@ class DaemonAlreadyRunning(RuntimeError):
 
 
 def acquire_instance_lock(sock: Path) -> int:
-    """Take an exclusive, non-blocking flock on ``<run dir>/daemon.lock``; returns the fd to keep open.
+    """Take an exclusive, non-blocking flock on ``<socket>.lock`` (``gateway.lock``); returns the fd to keep open.
 
     Without it a second ``k3code daemon`` (a manual start next to the systemd unit, the 5 s RestartSec window) unlinked
     the live socket and rebound it: the first daemon kept running its sessions, cron and loops but became unreachable,
     and stopping either one then deleted the other's socket.
     """
-    from k3code.gateway.auth import ensure_private_dir
+    from k3code.gateway.auth import lock_path, prepare_socket_dir
 
-    ensure_private_dir(sock.parent)  # 0700: the run dir holds the socket and the gateway token
-    fd = os.open(sock.parent / "daemon.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    prepare_socket_dir(sock)  # the default run dir is made 0700; a custom one is only checked
+    fd = os.open(lock_path(sock), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

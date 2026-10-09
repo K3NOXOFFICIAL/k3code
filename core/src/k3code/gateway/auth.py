@@ -14,8 +14,11 @@ import contextlib
 import json
 import os
 import secrets
+import stat
 from collections.abc import Callable
 from pathlib import Path
+
+from k3code import paths
 
 #: Request id of the auth frame the bundled clients send first (a string no TUI request id uses).
 AUTH_REQUEST_ID = "k3-gateway-auth"
@@ -23,8 +26,13 @@ AUTH_METHOD = "gateway.auth"
 
 
 def token_path(sock: Path) -> Path:
-    """The token file of the daemon serving ``sock``: next to it, in the same private run directory."""
-    return Path(sock).parent / "gateway.token"
+    """The token file of the daemon serving ``sock``: next to it (``gateway.sock`` -> ``gateway.token``)."""
+    return Path(sock).with_suffix(".token")
+
+
+def lock_path(sock: Path) -> Path:
+    """The single-instance lock of the daemon serving ``sock``: next to it, named after it."""
+    return Path(sock).with_suffix(".lock")
 
 
 def ensure_private_dir(path: Path) -> Path:
@@ -36,6 +44,25 @@ def ensure_private_dir(path: Path) -> Path:
     if st.st_mode & 0o777 != 0o700:
         path.chmod(0o700)
     return path
+
+
+def prepare_socket_dir(sock: Path) -> Path:
+    """Make ``sock``'s directory safe for the socket and the token.
+
+    The default ``<K3CODE_HOME>/run`` is ours: it is created or tightened to 0700. A directory the user chose through
+    ``K3CODE_GATEWAY_SOCKET`` is never chmod'ed (it may be ``$HOME`` or ``/tmp``): it is created 0700 when missing and
+    refused when other users could replace the socket or the token in it (group/other-writable without the sticky bit).
+    """
+    parent = Path(sock).parent
+    if parent == paths.home() / "run":
+        return ensure_private_dir(parent)
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    mode = parent.stat().st_mode
+    if mode & 0o022 and not mode & stat.S_ISVTX:
+        raise RuntimeError(
+            f"{parent} is writable by other users; put the gateway socket in a directory only you can write to"
+        )
+    return parent
 
 
 def write_token(sock: Path) -> str:

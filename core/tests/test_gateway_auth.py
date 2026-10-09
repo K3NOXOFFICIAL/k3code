@@ -86,6 +86,7 @@ async def test_an_unauthenticated_peer_cannot_answer_a_pending_request(gw, tmp_p
 
 async def test_run_dir_is_private_and_the_token_file_0600(tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
     run = tmp_path / "run"
     run.mkdir(mode=0o755)
     run.chmod(0o755)  # an existing run dir from an older daemon, created with the default umask
@@ -100,6 +101,34 @@ async def test_run_dir_is_private_and_the_token_file_0600(tmp_path, monkeypatch)
         await server.stop_socket()
         await server.close()
     assert not gw_auth.token_path(sock).exists()  # removed with the socket
+
+
+async def test_a_custom_socket_directory_is_never_chmodded(tmp_path, monkeypatch):
+    """K3CODE_GATEWAY_SOCKET=~/k3.sock used to chmod $HOME to 0700 (and /tmp was refused as foreign-owned)."""
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    custom = tmp_path / "custom"
+    custom.mkdir()
+    custom.chmod(0o755)
+    sock = custom / "k3.sock"
+    await server.start_socket(sock)
+    try:
+        assert stat.S_IMODE(custom.stat().st_mode) == 0o755
+        assert stat.S_IMODE(gw_auth.token_path(sock).stat().st_mode) == 0o600
+        assert gw_auth.token_path(sock) == custom / "k3.token"
+    finally:
+        await server.stop_socket()
+        await server.close()
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o777)  # group/other-writable, no sticky bit: another user could swap the socket or token
+    with pytest.raises(RuntimeError, match="writable by other users"):
+        await server.start_socket(shared / "k3.sock")
+    shared.chmod(0o1777)  # /tmp style: allowed
+    await server.start_socket(shared / "k3.sock")
+    await server.stop_socket()
+    await server.close()
+    assert stat.S_IMODE(shared.stat().st_mode) == 0o1777
 
 
 async def test_the_socket_is_never_bound_with_group_or_other_access(tmp_path, monkeypatch):
@@ -127,6 +156,7 @@ async def test_the_socket_is_never_bound_with_group_or_other_access(tmp_path, mo
 async def test_daemon_run_dir_is_created_private(tmp_path, monkeypatch):
     from k3code import daemon
 
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "fresh"))
     fd = daemon.acquire_instance_lock(tmp_path / "fresh" / "run" / "gateway.sock")
     os.close(fd)
     assert stat.S_IMODE((tmp_path / "fresh" / "run").stat().st_mode) == 0o700
@@ -270,6 +300,4 @@ async def test_k3code_slash_without_the_token_fails_closed(gw, tmp_path):
 
 
 def test_auth_token_lives_next_to_the_socket():
-    assert gw_auth.token_path(Path("/home/user/.myapp/run/gateway.sock")) == Path(
-        "/home/user/.myapp/run/gateway.token"
-    )
+    assert gw_auth.token_path(Path("/home/user/.myapp/run/gateway.sock")) == Path("/home/user/.myapp/run/gateway.token")
