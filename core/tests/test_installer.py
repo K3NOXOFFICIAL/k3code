@@ -1019,3 +1019,73 @@ def test_without_git_a_github_tag_installs_from_its_archive(tmp_path: Path) -> N
     other = run(tmp_path, INSTALL, "--from-git", "https://example.invalid/x.git", "--minimal", path_front=curl)
     assert other.returncode != 0
     assert "git is needed" in other.stderr
+
+
+def test_k3_allow_root_lets_a_root_run_install_like_the_flag(tmp_path: Path) -> None:
+    # `k3code update` re-runs install.sh as root for a root install and cannot pass a flag an older ref would reject
+    ids = stub_bin(tmp_path, "id", 'case "$1" in -u) echo 0 ;; -un) echo root ;; *) echo "uid=0(root)" ;; esac\n')
+    home = tmp_path / "home"
+    home.mkdir()
+    ok = run(home, INSTALL, "--from-source", "--minimal", env_extra={"K3_ALLOW_ROOT": "1"}, path_front=ids)
+    assert ok.returncode == 0, ok.stderr
+    assert (home / DATA_REL / "current").is_symlink()
+
+
+def _fetch_only(root: Path, url: str, tool_body: str, tool: str) -> subprocess.CompletedProcess[str]:
+    """Run install.sh's fetch() alone, with ``tool`` the only downloader on a PATH that holds nothing else."""
+    root.mkdir(parents=True, exist_ok=True)
+    text = INSTALL.read_text().splitlines()
+    keep = [ln for ln in text if ln.startswith("have() ")]
+    start = next(i for i, ln in enumerate(text) if ln.startswith("fetch() {"))
+    end = text.index("}", start)
+    script = root / "fetch.sh"
+    script.write_text("\n".join([*keep, *text[start : end + 1], f'fetch "$1" "{root}/out"', ""]))
+    bin_dir = stub_bin(root, tool, tool_body)
+    return subprocess.run(
+        ["/bin/sh", str(script), url], env={"PATH": str(bin_dir)}, capture_output=True, text=True, check=False
+    )
+
+
+# BusyBox wget (the only downloader on a stock Alpine) rejects --https-only: it must not be passed
+BUSYBOX_WGET = (
+    'for a in "$@"; do case "$a" in --https-only) echo "wget: unrecognized option" >&2; exit 1 ;; esac; done\n'
+)
+
+
+def test_fetch_works_with_a_busybox_wget_and_refuses_plain_http(tmp_path: Path) -> None:
+    good = _fetch_only(tmp_path / "g", "https://example.invalid/x", BUSYBOX_WGET, "wget")
+    assert good.returncode == 0, good.stderr
+    plain = _fetch_only(tmp_path / "p", "http://example.invalid/x", 'touch "$0.called"\n', "wget")
+    assert plain.returncode != 0
+    assert not (tmp_path / "p" / "stubbin" / "wget.called").exists()  # refused before any downloader ran
+
+
+def test_a_bad_signature_on_the_node_checksum_list_skips_the_tui(tmp_path: Path) -> None:
+    served = tmp_path / "served"
+    served.mkdir()
+    (served / "SHASUMS256.txt").write_text(f"{'0' * 64}  node-v22.1.0-linux-x64.tar.gz\n")
+    (served / "SHASUMS256.txt.asc").write_text("signature\n")
+    log = tmp_path / "curl.log"
+    curl_body = (
+        'out=""; url=""\n'
+        'while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\n'
+        f'echo "$url" >>"{log}"\n'
+        f'[ -f "{served}/${{url##*/}}" ] || exit 22\n'
+        f'cp "{served}/${{url##*/}}" "$out"\n'
+    )
+    stubs = stub_bin(tmp_path, "curl", curl_body)
+    stub_bin(tmp_path, "node", "exit 1\n")  # no usable node on this machine
+    stub_bin(tmp_path, "gpg", 'echo "[GNUPG:] BADSIG 0123 Node Release"\nexit 1\n')
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(
+        home,
+        INSTALL,
+        "--from-source",
+        "--minimal",
+        env_extra={"K3_SKIP_TUI": "0", "K3_NO_DOWNLOAD": "0"},
+        path_front=stubs,
+    )
+    assert "signature on nodejs.org's SHASUMS256.txt is bad" in r.stderr, r.stderr
+    assert "SHASUMS256.txt.asc" in log.read_text()
+    assert not (home / DATA_REL / "node").exists()

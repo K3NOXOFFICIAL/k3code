@@ -105,11 +105,12 @@ cleanup() {
 have() { command -v "$1" >/dev/null 2>&1; }
 have_git() { git --version >/dev/null 2>&1; } # macOS ships a /usr/bin/git stub that fails without the developer tools
 
-fetch() { # fetch URL FILE
+fetch() { # fetch URL FILE: https only, whichever downloader is there
+  case "$1" in https://*) ;; *) return 1 ;; esac
   if have curl; then
     curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$1" -o "$2"
-  else
-    wget -q --https-only --tries=3 -O "$2" "$1"
+  else # BusyBox wget (Alpine) has no --https-only and GNU wget applies it only to recursive fetches: the case above is the guard
+    wget -q --tries=3 -O "$2" "$1"
   fi
 }
 
@@ -140,9 +141,10 @@ home_of() { # home_of USER: that user's home directory, empty when unknown
 }
 
 # The install belongs to the user whose home it is in. Root (sudo included) would leave root-owned files there, or
-# install into root's home; --allow-root is for a deliberate root install such as a container.
+# install into root's home; --allow-root is for a deliberate root install such as a container. `k3code update` runs
+# this script as root again for such an install and says so with K3_ALLOW_ROOT=1 (an older installer would reject a flag).
 check_user() {
-  if [ "$ALLOW_ROOT" = 1 ]; then return 0; fi
+  if [ "$ALLOW_ROOT" = 1 ] || [ "${K3_ALLOW_ROOT:-0}" = 1 ]; then return 0; fi
   if [ "$(id -u)" = 0 ]; then
     die "refusing to run as root${SUDO_USER:+ (through sudo)}: run the installer as the user who will use k3code, without sudo (--allow-root installs for root, for example in a container)"
   fi
@@ -448,6 +450,12 @@ ensure_node() { # a private Node 22 LTS in DATA/node/<ver>, checked against node
     rm -rf "$t"
     return 0
   fi
+  if have gpg && fetch "$base/SHASUMS256.txt.asc" "$t/SHASUMS256.txt.asc" &&
+    gpg --status-fd 1 --verify "$t/SHASUMS256.txt.asc" "$t/SHASUMS256.txt" 2>/dev/null | grep -q '^\[GNUPG:\] BADSIG '; then
+    log "WARNING: the signature on nodejs.org's SHASUMS256.txt is bad; the TUI is skipped (k3code uses the line REPL)"
+    rm -rf "$t"
+    return 0
+  fi # no gpg, no .asc or a key gpg does not know passes silently: the checksum list over https is the baseline
   line=$(grep " node-v[0-9.]*-$NODE_OS-$NODE_ARCH\.tar\.gz\$" "$t/SHASUMS256.txt" | head -n 1)
   name=${line##* }
   want=${line%% *}
