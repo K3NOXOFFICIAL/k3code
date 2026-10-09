@@ -39,6 +39,8 @@ scripts/dev/install-hooks.sh     # once per clone: pre-commit (staged files) and
 
 Verification: run `scripts/ci/check.sh` (full) before pushing to Main; `--changed` while iterating.
 
+A change to `install/`, `core/src/k3code/update.py` or `core/src/k3code/service.py` also needs `scripts/ci/platforms.sh` (podman or docker; `pwsh` for the Windows target): it installs, updates, rolls back and uninstalls on clean Ubuntu, Debian and Alpine containers and through `install.ps1` against a WSL stand-in.
+
 A missing tool (uv, Node, Go, gitleaks, shellcheck) fails its area with a line on how to install it. Maintainers merge pull requests with `scripts/ci/merge-pr.sh <number>`: it merges `Main` into the PR in a temporary worktree, runs the full check, and only then pushes, sets the `local-ci` status that branch protection requires and merges. Releases are made with `scripts/release/release.sh`. Both are described in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Before you open a pull request

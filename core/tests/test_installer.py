@@ -152,13 +152,21 @@ def test_windows_shell_points_to_install_ps1(tmp_path: Path) -> None:
 
 
 FAKE_WSL = """#!/bin/sh
-# wsl.exe stand-in: lists one distro, and runs --exec commands here (honouring --cd)
-if [ "$1" = --list ]; then printf '  NAME      STATE           VERSION\\n* Ubuntu    Running         2\\n'; exit 0; fi
+# wsl.exe stand-in for Windows 10's inbox WSL: Ubuntu is the one to use (FAKE_WSL_DOCKER=1: Docker Desktop's distro is
+# the default), there is no --cd option, and --exec runs commands here (wslpath -a returns the path: it is a Linux
+# one here already)
+if [ "$1" = --list ]; then
+  printf '  NAME              STATE           VERSION\\n'
+  if [ "${FAKE_WSL_DOCKER:-0}" = 1 ]; then
+    printf '* docker-desktop    Running         2\\n  Ubuntu            Stopped         2\\n'
+  else printf '* Ubuntu            Running         2\\n'; fi
+  exit 0
+fi
 while [ $# -gt 0 ]; do
   case "$1" in
-    -d) shift ;;
-    --cd) cd "$2" || exit 9; shift ;;
-    --exec) shift; exec "$@" ;;
+    -d) [ "$2" = Ubuntu ] || { echo "not the distro to install into: $2" >&2; exit 8; }; shift ;;
+    --cd) echo "Invalid command line option: --cd" >&2; exit 1 ;;
+    --exec) shift; if [ "$1" = wslpath ]; then printf '%s\\n' "$3"; exit 0; fi; exec "$@" ;;
   esac
   shift
 done
@@ -166,16 +174,19 @@ done
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
-def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path) -> None:
+@pytest.mark.parametrize("docker_default", [False, True], ids=["ubuntu-default", "docker-desktop-default"])
+def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path, docker_default: bool) -> None:
     wsl = tmp_path / "wsl"
     wsl.write_text(FAKE_WSL)
     wsl.chmod(0o755)
+    wslpath = stub_bin(tmp_path, "wslpath", 'printf "%s\\n" "$2"\n')  # inside "WSL" (here) paths are Linux already
     appdata = tmp_path / "appdata"
     env = {
-        "PATH": os.environ["PATH"],
+        "PATH": f"{wslpath}{os.pathsep}{os.environ['PATH']}",
         "HOME": str(tmp_path),
         "LOCALAPPDATA": str(appdata),
         "K3_WSL": str(wsl),
+        "FAKE_WSL_DOCKER": "1" if docker_default else "0",
         "K3_STUB_VENV": "1",
         "K3_SKIP_TUI": "1",
         "K3_SKIP_GO": "1",
@@ -191,10 +202,8 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path) -> 
     assert "WSL distribution: Ubuntu" in r.stderr
     assert (tmp_path / ".local" / "share" / "k3code" / "current").is_symlink()
     shim = (appdata / "k3code" / "bin" / "k3code.cmd").read_text()
-    assert f'--exec sh -lc "exec {tmp_path}/.local/bin/k3code \\"$@\\"" k3code %*' in shim
-    # at a drive root %CD% is C:\ and its backslash would escape the closing quote of --cd "...": it is doubled
-    assert 'if "%K3_CD:~-1%"=="\\" set "K3_CD=%K3_CD%\\"' in shim.splitlines()
-    assert ' --cd "%K3_CD%" ' in shim
+    assert f'wsl.exe -d Ubuntu --exec sh -lc "exec {tmp_path}/.local/bin/k3code \\"$@\\"" k3code %*' in shim
+    assert "--cd" not in shim  # wsl.exe starts in the current directory by itself; Windows 10's WSL has no --cd
     assert not (appdata / "k3code" / "bin" / "k3.cmd").exists()  # no k3 binary was built
 
     r = ps("uninstall.ps1")
@@ -214,7 +223,8 @@ def test_relative_prefix_gives_absolute_links(tmp_path: Path) -> None:
     assert link.resolve().is_file()
 
 
-def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> None:
+def mini_checkout(tmp_path: Path) -> tuple[Path, list[str]]:
+    """A committed checkout holding just what install.sh --from-source needs; and the git command for it."""
     src = tmp_path / "src"
     (src / "core").mkdir(parents=True)
     (src / "install").mkdir()
@@ -225,6 +235,43 @@ def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> 
     subprocess.run([*git, "init", "-q"], check=True)
     subprocess.run([*git, "add", "-A"], check=True)
     subprocess.run([*git, "commit", "-qm", "init"], check=True)
+    return src, git
+
+
+def test_a_checkout_owned_by_someone_else_still_names_its_commit(tmp_path: Path) -> None:
+    # A Windows clone seen from WSL, or a shared checkout, can belong to another user: git calls it "dubious" and
+    # refuses every command. The version was then X.Y.Z-src for every commit, so `k3code update --from-source`
+    # reported an update and kept running the first build. GIT_TEST_ASSUME_DIFFERENT_OWNER makes git see that.
+    src, git = mini_checkout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    foreign = {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+    assert subprocess.run(["git", "-C", str(src), "status"], env={**os.environ, **foreign}, check=False).returncode
+
+    def version() -> str:
+        r = run(home, src / "install" / "install.sh", "--from-source", "--print-version", env_extra=foreign)
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip()
+
+    first = version()
+    head = subprocess.run([*git, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True)
+    assert first == f"9.9.9-src.{head.stdout.strip()}"
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "next"], check=True)
+    assert version() != first
+
+
+def test_a_checkout_git_cannot_read_is_refused_not_misnamed(tmp_path: Path) -> None:
+    # a .git that git cannot read (here: no commit yet) would name the build X.Y.Z-src, the same for every state
+    src, _ = mini_checkout(tmp_path)
+    shutil.rmtree(src / ".git")
+    subprocess.run(["git", "-C", str(src), "init", "-q"], check=True)
+    r = run(tmp_path / "home", src / "install" / "install.sh", "--from-source", "--print-version")
+    assert r.returncode != 0 and "git cannot read the checkout" in r.stderr
+    assert not r.stdout.strip()
+
+
+def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> None:
+    src, _ = mini_checkout(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
 

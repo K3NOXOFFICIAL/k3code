@@ -57,7 +57,8 @@ if (-not $WindowsOnly) {
   if ($Purge) { $shArgs += @('--purge', '--yes') } # -Purge is the confirmation
   $checkout = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { '' }
   if ($checkout -and (Test-Path (Join-Path $PSScriptRoot 'uninstall.sh'))) {
-    & $Wsl -d $cfg.distro --cd $checkout --exec sh -lc "exec sh install/uninstall.sh $($shArgs -join ' ')"
+    # cd inside sh (wsl.exe --cd needs a newer WSL than Windows 10 ships with), from the Windows path as an argument
+    & $Wsl -d $cfg.distro --exec sh -lc "cd `"`$(wslpath -a `"`$1`")`" && exec sh install/uninstall.sh $($shArgs -join ' ')" sh $checkout
   } else {
     & $Wsl -d $cfg.distro --exec sh -lc "curl -fsSL $(Quote-Sh $RawUrl) | sh -s -- $($shArgs -join ' ')"
   }
