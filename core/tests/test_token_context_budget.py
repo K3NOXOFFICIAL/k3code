@@ -11,6 +11,7 @@ from k3code.gateway.server import _estimate_tokens
 from k3code.providers.types import ToolCall
 from k3code.reliability import Reliability
 from k3code.router import Router, build_chain
+from k3code.routing.tiers import TaskKind
 from test_auto_compaction import Recording, long_history, seed
 from test_wire_clip import Recorder, text_reply, tool_reply
 
@@ -126,3 +127,25 @@ async def test_a_reread_of_an_unchanged_file_points_at_the_earlier_result(tmp_pa
     assert "\ttwo" not in results["b"]
     assert results["c"].startswith("     2\ttwo")
     assert "TWO!" in results["e"]
+
+
+async def test_a_loop_takes_its_window_from_the_models_its_router_sends_to(tmp_path, monkeypatch):
+    server, live = await seed(tmp_path, monkeypatch, Recording(), context={})
+    main = server._active_model(live)
+    server.config.models = {main: {"context_window": 200_000}, "tiny-cheap": {"context_window": 8_000}}
+    rel = Reliability.from_settings(None, session="w", home=tmp_path / "home")
+    cheap = Router(build_chain([Recording()], [["tiny-cheap"]]), max_retries=0)
+    loop = server._build_loop(live, rel, cheap, TaskKind.INTERACTIVE_TURN, None)
+    assert loop.context_window == 8_000  # not the main model's 200k
+    mixed = Router(build_chain([Recording()], [["tiny-cheap", main]]), max_retries=0)
+    assert server._build_loop(live, rel, mixed, TaskKind.INTERACTIVE_TURN, None).context_window == 8_000
+    await server.close()
+
+
+async def test_the_active_model_honours_tiers_main(tmp_path, monkeypatch):
+    server, live = await seed(tmp_path, monkeypatch, Recording(), context={})
+    server.config.providers[0].tiers = {"main": "tier-main-model"}
+    live.stored.model = None
+    server.config.default_model = "default"
+    assert server._active_model(live) == "tier-main-model"
+    await server.close()

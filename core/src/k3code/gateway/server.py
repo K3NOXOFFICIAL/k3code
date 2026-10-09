@@ -84,7 +84,15 @@ from k3code.research.flow import Research
 from k3code.research.tools import register_web_tools
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
 from k3code.routing.caller import ModelCaller
-from k3code.routing.tiers import Escalation, TaskKind, Tier, TierRouters, router_options, tier_for
+from k3code.routing.tiers import (
+    Escalation,
+    TaskKind,
+    Tier,
+    TierRouters,
+    router_options,
+    tier_for,
+    tier_model_specs,
+)
 from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
@@ -1512,7 +1520,7 @@ class GatewayServer:
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
             tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
-            context_window=context_window(self.config, self._active_model(session)),
+            context_window=self._router_window(router, session),
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
@@ -1527,7 +1535,19 @@ class GatewayServer:
 
     def _active_model(self, session: LiveSession) -> str:
         """The model id the session's main tier sends to first (what its context window is looked up by)."""
-        return _model_label(self.config, session.stored.model or self.config.default_model)
+        specs = tier_model_specs(self.config, Tier.MAIN, key=session.stored.model or self.config.default_model)
+        first = specs[0] if specs else ""
+        if isinstance(first, list):
+            first = first[0] if first else ""
+        return str(first or session.stored.model or self.config.default_model)
+
+    def _router_window(self, router: Router, session: LiveSession) -> int:
+        """The smallest context window among the models ``router`` can send to (a cheap tier or an escalated one
+        has its own), so in-turn elision starts before the tightest model overflows."""
+        models = [e.model for e in getattr(router, "chain", None) or [] if e.model]
+        if not models:
+            return context_window(self.config, self._active_model(session))
+        return min(context_window(self.config, m) for m in models)
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
