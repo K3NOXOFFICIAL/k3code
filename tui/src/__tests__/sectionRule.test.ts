@@ -8,7 +8,7 @@ describe("sectionRuleText", () => {
     for (const cols of [1, 12, 60, 80, 160]) {
       expect(stringWidth(sectionRuleText(cols))).toBe(cols);
       expect(
-        stringWidth(sectionRuleText(cols, "agents (2) · ↓ to select")),
+        stringWidth(sectionRuleText(cols, "agents (2) · ← agent view")),
       ).toBe(cols);
     }
   });
