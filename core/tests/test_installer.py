@@ -685,3 +685,39 @@ def test_uninstall_fallback_removes_both_units(tmp_path: Path) -> None:
     log = calls.read_text()
     assert "disable --now k3code.service k3code-recover.service" in log
     assert "daemon-reload" in log
+
+
+def _git(src: Path, *args: str) -> str:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(src), *args]
+    return subprocess.run(cmd, check=True, env=env, capture_output=True, text=True).stdout.strip()
+
+
+def test_stable_channel_skips_pre_release_tags(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    (src / "VERSION").write_text("0.0.2\n")
+    _git(src, "commit", "-qam", "rc")
+    _git(src, "tag", "v0.0.2-rc1")  # sorts above v0.0.1, but is a pre-release
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, INSTALL, "--from-git", f"file://{src}", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert (home / DATA_REL / "current" / ".ref").read_text().strip() == "v0.0.1"
+
+
+def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)  # its first commit is the tag v0.0.1
+    (src / "VERSION").write_text("0.0.2\n")
+    _git(src, "commit", "-qam", "second")
+    middle = _git(src, "rev-parse", "HEAD")  # no branch or tag points here
+    (src / "VERSION").write_text("0.0.3\n")
+    _git(src, "commit", "-qam", "third")
+    tip = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", tip[:9], "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert (home / DATA_REL / "current" / ".ref").read_text().strip() == tip
+    old = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", middle[:9], "--minimal")
+    assert old.returncode != 0
+    assert "full 40-character SHA" in old.stderr

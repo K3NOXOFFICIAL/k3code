@@ -94,6 +94,7 @@ cleanup() {
 
 # ---- helpers ---------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+have_git() { git --version >/dev/null 2>&1; } # macOS ships a /usr/bin/git stub that fails without the developer tools
 
 fetch() { # fetch URL FILE
   if have curl; then curl -fsSL --retry 3 "$1" -o "$2"; else wget -q --tries=3 -O "$2" "$1"; fi
@@ -305,7 +306,7 @@ report() {
     item missing "python 3.12+" "uv downloads a managed one when needed"
     say "      $(hint_cmd python)"
   fi
-  if have git; then item ok "git"; else
+  if have_git; then item ok "git"; else
     item missing "git" "needed for --from-git, the default"
     say "      $(hint_cmd git)"
   fi
@@ -451,13 +452,14 @@ ensure_bwrap() { # Linux sandbox: through the package manager, as root or after 
   return 0
 }
 
-default_ref() { # latest v* tag on the remote, else Main; fails (prints nothing) when the remote cannot be reached
+default_ref() { # latest v* release tag on the remote (never a pre-release such as v1.2.0-rc1), else Main; fails
+  # (prints nothing) when the remote cannot be reached
   if [ "$CHANNEL" = dev ]; then
     echo Main
     return 0
   fi
   out=$(git ls-remote --tags --refs --sort=-v:refname "$GIT_URL" 2>"$GIT_ERR") || return 1
-  t=$(printf '%s\n' "$out" | sed -n 's#.*refs/tags/\(v[0-9][^/]*\)$#\1#p' | head -n 1)
+  t=$(printf '%s\n' "$out" | sed -n 's#.*refs/tags/\(v[0-9][^/-]*\)$#\1#p' | head -n 1)
   echo "${t:-Main}"
 }
 
@@ -520,6 +522,23 @@ pick_default_ref() {
   log "could not reach $GIT_URL for the latest version: keeping the installed $REF"
 }
 
+# git fetches a commit only by its full SHA. A shorter one is resolved against the remote's branch and tag tips.
+resolve_short_sha() {
+  case "$REF" in *[!0-9a-f]*) return 0 ;; esac
+  if [ ${#REF} -lt 7 ] || [ ${#REF} -ge 40 ]; then return 0; fi
+  refs=$(git ls-remote "$GIT_URL" 2>"$GIT_ERR") || return 0 # unreachable: the fetch below reports it
+  if printf '%s\n' "$refs" | awk -v r="$REF" '$2 == "refs/heads/" r || $2 == "refs/tags/" r { f = 1 } END { exit !f }'; then
+    return 0 # a branch or tag that happens to look like a SHA
+  fi
+  full=$(printf '%s\n' "$refs" | awk -v r="$REF" 'index($1, r) == 1 { print $1 }' | sort -u)
+  case "$full" in
+    "") die "--ref $REF looks like a short commit SHA, which git cannot fetch: pass the full 40-character SHA, a tag or a branch" ;;
+    *[!0-9a-f]*) die "--ref $REF matches more than one commit on $GIT_URL: pass the full 40-character SHA" ;;
+  esac
+  log "--ref $REF is commit $full"
+  REF=$full
+}
+
 # ---- source ----------------------------------------------------------------
 acquire_source() {
   if [ "$FROM" = source ]; then
@@ -550,6 +569,7 @@ acquire_source() {
         return 0
       fi
     fi
+    resolve_short_sha
     # A tag never moves, so a complete install of it needs no network at all (this works offline).
     case "$REF" in
       v[0-9]*)
@@ -1004,7 +1024,7 @@ main() {
   printf '\n==== %s install start (args: %s) ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$INSTALL_LOG" 2>/dev/null || true
   report
   if [ "$NO_DEPS" = 1 ]; then export UV_PYTHON_DOWNLOADS=never; fi
-  if [ "$FROM" = git ] && ! have git; then die "git is needed for --from-git: $(hint_cmd git)"; fi
+  if [ "$FROM" = git ] && ! have_git; then die "git is needed for --from-git: $(hint_cmd git)"; fi
   ensure_uv
   if [ -z "$PY_FOUND" ] && [ "$NO_DEPS" != 1 ]; then
     log "no Python 3.12+ here: uv will download a managed one (kept in uv's own data directory)"
