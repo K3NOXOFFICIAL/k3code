@@ -14,9 +14,13 @@ import json
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+#: The daemon start sweep deletes empty, unnamed stored sessions untouched this long (see SessionStore.sweep_empty).
+EMPTY_SESSION_MAX_AGE_S = 7 * 24 * 3600.0
 
 
 @dataclass
@@ -202,6 +206,32 @@ class SessionStore:
         cur = self._db.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         self._db.commit()
         return cur.rowcount > 0
+
+    def sweep_empty(
+        self,
+        *,
+        now: float | None = None,
+        max_age: float = EMPTY_SESSION_MAX_AGE_S,
+        keep: Callable[[str], bool] = lambda _sid: False,
+    ) -> int:
+        """Delete stored sessions nobody can come back to; returns how many went.
+
+        Only rows that are all of: no message, no title, no meta key at all (mode, add_dirs, reasoning effort, goal,
+        origin, background, branches... each is something the user or an automation set), last saved more than
+        ``max_age`` seconds before ``now``, and not ``keep(session_id)`` (the caller's live sessions and those an
+        active loop or automation is bound to). ``model`` is no signal: every new session gets the default model.
+        A workspace move leaves no marker either; the age limit covers it (moving saves the row).
+        """
+        cutoff = (time.time() if now is None else now) - max_age
+        rows = self._db.execute(
+            "SELECT session_id, title, meta FROM sessions WHERE messages IN ('', '[]') AND updated_at < ?",
+            (cutoff,),
+        ).fetchall()
+        doomed = [sid for sid, title, meta in rows if not title and meta in ("", "{}") and not keep(sid)]
+        for sid in doomed:
+            self._db.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+        self._db.commit()
+        return len(doomed)
 
     def most_recent(self) -> StoredSession | None:
         """The session to continue: the newest one the user worked in (cron/loop/automation runs and sessions with no

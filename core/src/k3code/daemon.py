@@ -196,6 +196,9 @@ async def run_daemon(
         serve.result()  # the server failed to come up: raise its error instead of announcing READY=1
     await server.ensure_automation()  # resume loops, start the cron scheduler and triggers
     await server.resume_goals()  # goals that were active (or paused by a graceful stop) continue
+    with contextlib.suppress(Exception):  # housekeeping: a failed sweep must never keep the daemon from starting
+        swept = server.sweep_empty_sessions()  # after the engine: rows a loop or automation is bound to stay
+        logger.info("swept %d old empty stored session(s)", swept)
     sdnotify.ready()
     logger.info("daemon ready on %s", sock)
     if ready_event is not None:

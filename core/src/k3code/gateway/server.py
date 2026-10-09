@@ -60,7 +60,7 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
-from k3code.gateway.sessions import SessionStore, StoredSession
+from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, StoredSession
 from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
@@ -2100,6 +2100,25 @@ class GatewayServer:
         )
         self.emit_goal(live)
         return True
+
+    def sweep_empty_sessions(self, *, now: float | None = None, max_age: float = EMPTY_SESSION_MAX_AGE_S) -> int:
+        """Daemon start: drop old empty stored sessions (every `k3code agents`, `n` and abandoned TUI start leaves one).
+
+        The store decides what counts as empty and unclaimed; this adds what only the server knows: live sessions,
+        the ones a client looks at, and those an active loop or automation is bound to. Without the automation engine
+        nothing is swept: which rows a loop is bound to cannot be told then."""
+        automation = self.automation
+        if automation is None:
+            return 0
+
+        def keep(sid: str) -> bool:
+            if sid in self.live or (self.session is not None and self.session.session_id == sid):
+                return True
+            if any(c.session_id == sid for c in self.clients):
+                return True
+            return bool(automation.bound_to(sid))
+
+        return self.store.sweep_empty(now=now, max_age=max_age, keep=keep)
 
     async def resume_goals(self) -> int:
         """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.
