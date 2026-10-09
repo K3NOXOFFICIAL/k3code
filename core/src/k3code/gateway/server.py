@@ -88,7 +88,7 @@ from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
 from k3code.tools import build_registry as build_tool_registry
-from k3code.tools import clip_head_tail
+from k3code.tools import clip_head_tail, register_todo
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -1511,6 +1511,7 @@ class GatewayServer:
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
+        register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
@@ -1830,15 +1831,15 @@ class GatewayServer:
             msg = event.message
             if msg.role == "tool":
                 self._checkpoint_turn(session)
-                session.emit(
-                    "tool.complete",
-                    {
-                        "tool_id": msg.tool_call_id or "",
-                        "name": msg.name or "",
-                        "result_text": msg.content or "",
-                        "result": {"content": msg.content},
-                    },
-                )
+                payload = {
+                    "tool_id": msg.tool_call_id or "",
+                    "name": msg.name or "",
+                    "result_text": msg.content or "",
+                    "result": {"content": msg.content},
+                }
+                if msg.name == "todo":  # the TUI's todo panel reads the list from tool.complete
+                    payload["todos"] = list(session.stored.meta.get("todos") or [])
+                session.emit("tool.complete", payload)
             elif msg.role == "assistant":
                 provider, model = session.last_entry
                 u = msg.usage
