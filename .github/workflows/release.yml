@@ -4,21 +4,23 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
       - name: ruff
         working-directory: core
         run: uv run ruff check . ../scripts
       - name: pytest
         working-directory: core
         run: uv run pytest -q
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: panes/go.mod
       - working-directory: panes
@@ -27,21 +29,33 @@ jobs:
   build:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # gh release create
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: tag matches VERSION
         run: |
           test "v$(tr -d '[:space:]' < VERSION)" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != VERSION"; exit 1; }
-      - uses: astral-sh/setup-uv@v5
-      - uses: actions/setup-node@v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: panes/go.mod
       - name: core wheel
         working-directory: core
         run: uv build --wheel --out-dir ../dist
+      # The runtime dependencies `k3code update` installs (with --require-hashes) before the wheel (--no-deps): the
+      # set from uv.lock that the test job ran, not whatever PyPI resolves to on the day of the update. --locked
+      # fails the release on a lock that no longer matches pyproject.toml instead of shipping it.
+      - name: locked requirements
+        working-directory: core
+        run: |
+          uv export --locked --no-dev --no-emit-project --no-header --format requirements-txt \
+            -o "../dist/k3code-${GITHUB_REF_NAME#v}-requirements.txt"
       - name: TUI dist tarball
         run: |
           cd tui
