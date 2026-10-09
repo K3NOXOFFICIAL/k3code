@@ -342,6 +342,25 @@ CREDENTIAL_USE: list[tuple[str, str, str, str]] = [
     ("rsync -i ~/.ssh/id_rsa host:/tmp", "deny", "deny", "deny"),
     ("ssh-keygen -p -f ~/.ssh/id_rsa", "deny", "deny", "deny"),
     ("ssh-keygen -e -f ~/.ssh/id_rsa", "deny", "deny", "deny"),
+    # an -o XxxCommand value is a command ssh runs, glued or spaced: a key option beside it covers nothing
+    ("ssh -i ~/.ssh/id_rsa -oProxyCommand='head $HOME/.ssh/id_rsa' x", "deny", "deny", "deny"),
+    ("ssh -o ProxyCommand='tac .env' x", "deny", "deny", "deny"),
+    ("ssh -o 'ProxyCommand base64 .env' x", "deny", "deny", "deny"),
+    ("ssh -oLocalCommand='od -c .env' -oPermitLocalCommand=yes x", "deny", "deny", "deny"),
+    ("ssh -o 'LocalCommand=strings ~/.ssh/id_rsa' -o PermitLocalCommand=yes x", "deny", "deny", "deny"),
+    ("ssh -vo localcommand='xxd .env' x", "deny", "deny", "deny"),
+    ("scp -oProxyCommand='nl .env' f.txt host:", "deny", "deny", "deny"),
+    ("ssh -oProxyCommand='realpath .env' x", "deny", "deny", "deny"),
+    ("ssh -oProxyCommand='nc %h %p' host", "ask", "allow", "allow"),
+    # xargs -a FILE hands FILE's lines to the command it runs, whatever that is
+    ("xargs -a .env echo", "deny", "deny", "deny"),
+    ("xargs -a ~/.ssh/id_rsa echo", "deny", "deny", "deny"),
+    ("xargs --arg-file=~/.ssh/id_rsa echo", "deny", "deny", "deny"),
+    ("xargs --arg-file .env printf '%s\\n'", "deny", "deny", "deny"),
+    ("xargs -ra.env echo", "deny", "deny", "deny"),
+    ("sudo xargs -0 -a .env echo", "deny", "deny", "deny"),
+    ("xargs -a .env", "deny", "deny", "deny"),
+    ("xargs -a list.txt echo", "ask", "allow", "allow"),
     # ssh echoes every config line it cannot parse: -F takes a config file only
     ("ssh -F ~/.ssh/id_rsa host", "deny", "deny", "deny"),
     ("scp -F .env f.txt host:", "deny", "deny", "deny"),
@@ -422,6 +441,8 @@ RULE_DENY: list[str] = [
     "xargs rm x",
     "sudo -u bob rm x",
     'echo "$(rm x)"',
+    "ssh -oProxyCommand='rm x' host",
+    "scp -vo 'LocalCommand=git push origin x' f.txt host:",
 ]
 
 

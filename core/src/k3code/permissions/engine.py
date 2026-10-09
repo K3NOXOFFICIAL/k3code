@@ -258,10 +258,11 @@ def _voids_allow(sub: str, rule: Rule, ruleset: list[Rule], roots: list[str], cw
     )
 
 
-def _argv(sub: str) -> list[str]:
-    """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv)."""
+def _argv(sub: str, reads: list[str] | None = None) -> list[str]:
+    """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv).
+    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``)."""
     words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked separately
-    return hardline.normalize_argv(hardline.tokens(words))
+    return hardline.normalize_argv(hardline.tokens(words), reads)
 
 
 def _arg_values(args: list[str]) -> list[str]:
@@ -325,7 +326,7 @@ _FILE_READ_OPTS = frozenset({"-f", "-m", "--files-from", "--magic-file"})
 #: client authenticates with or reads its settings from (see _ssh_key_value). (rsync is not here: its ``-i`` is
 #: ``--itemize-changes``, so the next word is a source it copies; an rsync key goes in ``-e 'ssh -i KEY'``, a single
 #: word that names no credential.)
-_SSH_VALUE_OPTS = {"ssh": "BbcDEeFIiJLlmOoPpQRSWw", "scp": "cDFiJloPSX", "sftp": "BbcDFiJloPRSsX"}
+_SSH_VALUE_OPTS = hardline.SSH_VALUE_OPTS
 _IDENTITY_OPTION = re.compile(r"identityfile=", re.IGNORECASE)
 _SSH_CONFIG_NAME = re.compile(r"(?:^|/)(?:config|[^/]*(?:\.conf|_config))$")
 #: ``ssh-keygen -l`` (fingerprint) and ``-y`` (the public half) read the key named by ``-f`` and print no secret; any
@@ -557,7 +558,13 @@ def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str
         return [], [], []
     if name in _SSH_VALUE_OPTS:
         opts, positional = _options(args, _SSH_VALUE_OPTS[name], frozenset())
-        return [v for o, v in opts if v and not _ssh_key_value(o, v)] + positional, [], []
+        # an -o XxxCommand value is a command line, not a path: _sub_secret_access checks it
+        paths = [
+            v
+            for o, v in opts
+            if v and not _ssh_key_value(o, v) and not (o == "-o" and hardline.ssh_command_value(v) is not None)
+        ]
+        return paths + positional, [], []
     if name == "ssh-keygen":
         opts, positional = _options(args, _KEYGEN_VALUE_OPTS, frozenset())
         letters = {o[1] for o, _ in opts}
@@ -600,9 +607,15 @@ def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None
     worst: str | None = None
     for source in _INPUT_REDIRECT.findall(plain):
         worst = _worse(worst, _classify_arg(source, cwd, home))
-    argv = _argv(sub)
+    wrapper_reads: list[str] = []  # ``xargs -a .env echo`` prints the file whatever it wraps
+    argv = _argv(sub, wrapper_reads)
+    for arg in wrapper_reads:
+        worst = _worse(worst, _classify_arg(arg, cwd, home))
     if not argv:
         return worst
+    for command in hardline.ssh_option_commands(argv[0], argv[1:]):
+        # ``ssh -oProxyCommand='head .env' x``: ssh runs it, and its output goes on to ssh
+        worst = _worse(worst, _secret_access(hardline.parse(command), cwd, home, consumed=True))
     reads, writes, confirm = _credential_roles(argv[0], argv[1:], piped)
     for arg in reads:
         worst = _worse(worst, _classify_arg(arg, cwd, home))
