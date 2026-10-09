@@ -17,8 +17,8 @@ until the switch: doing it earlier would diverge every clone and open branch whi
 - The names and hosts the export scan looks for are not listed in the repository either: `scripts/release/build_release.sh`
   reads them from the rules folder (see below). Its tests use invented names.
 - `core/.k3code/project.json` (a runtime artifact) is no longer tracked; `.k3code/` is ignored.
-- `ci.yml` runs with a read-only token (`permissions: contents: read`); no workflow uses `pull_request_target`,
-  self-hosted runners or secrets that a fork's pull request could reach.
+- There are no GitHub Actions workflows (since 2026-10-09): the checks, merges and releases run locally
+  ([`docs/RELEASING.md`](RELEASING.md)), so no workflow token or secret exists that a fork's pull request could reach.
 - Every text file is LF in the repo and in every checkout (`.gitattributes`).
 - LICENSE (MIT), NOTICE, `LICENSES/` and `VENDOR.toml` cover all vendored code; `scripts/vendor_check.py` passes.
 - Issue forms (bug report, feature request), a pull request template, and a contact link that sends security
@@ -86,11 +86,10 @@ repository, which becomes the archive.
    A Windows install built from an old clone keeps updating from it (`k3code update` pulls the clone); re-run
    `install\install.ps1` from a fresh clone to move it to the new repository.
 5. **Switch visibility** in Settings → General, then enable: private vulnerability reporting (SECURITY.md relies
-   on it), Dependabot alerts, secret scanning with push protection, and branch protection on `Main` requiring CI.
-   Actions need a working billing setup on the account first.
+   on it), Dependabot alerts, secret scanning with push protection, and branch protection on `Main` requiring the
+   `local-ci` status ([`docs/RELEASING.md`](RELEASING.md)). Actions can stay disabled.
 6. **Publish the first release.** Releases do not carry over from the archive: tag `v0.1.0` in the new repository
-   (`release.yml` builds and attaches the archive), or build it with `scripts/release/build_release.sh`.
+   with `scripts/release/release.sh 0.1.0` ([`docs/RELEASING.md`](RELEASING.md)).
 7. **Clean up.** This file and the two single-use scripts (`rewrite_history.sh`, `remap_hashes.py`) can be deleted in
-   a last commit. Optional: pin the actions in `.github/workflows/` by commit SHA (most useful for `release.yml`,
-   which has `contents: write`), remove the inert upstream workflows under `panes/.github/`, and delete the archive
+   a last commit. Optional: remove the inert upstream workflows under `panes/.github/`, and delete the archive
    once nothing needs its history.
