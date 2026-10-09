@@ -57,9 +57,17 @@ main() {
   unit="$units/k3code.service"
   recover="$units/k3code-recover.service"
   if [ -f "$unit" ] || [ -f "$recover" ]; then
-    if [ -x "$BIN/k3code" ] && "$BIN/k3code" service uninstall; then
+    # The probe's output is dropped: a broken install prints a Python traceback that says nothing useful here.
+    if [ -x "$BIN/k3code" ] && "$BIN/k3code" --version >/dev/null 2>&1; then
+      runnable=1
+    else
+      runnable=0
+      echo "k3code is not runnable; removing units directly" >&2
+    fi
+    if [ "$runnable" = 1 ] && "$BIN/k3code" service uninstall; then
       :
     else # k3code is broken or gone: do what `k3code service uninstall` does
+      if [ "$runnable" = 1 ]; then echo "k3code service uninstall failed; removing units directly" >&2; fi
       systemctl --user disable --now k3code.service k3code-recover.service 2>/dev/null || true
       rm -f "$unit" "$recover"
       systemctl --user daemon-reload 2>/dev/null || true

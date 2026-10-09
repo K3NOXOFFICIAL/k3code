@@ -841,6 +841,27 @@ def test_uninstall_fallback_removes_both_units(tmp_path: Path) -> None:
     assert "daemon-reload" in log
 
 
+def test_uninstall_with_a_broken_k3code_prints_one_line_not_a_traceback(tmp_path: Path) -> None:
+    units = tmp_path / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    for name in ("k3code.service", "k3code-recover.service"):
+        (units / name).write_text("[Unit]\n")
+    broken = tmp_path / ".local" / "bin" / "k3code"
+    broken.parent.mkdir(parents=True)
+    broken.write_text(
+        "#!/bin/sh\necho 'Traceback (most recent call last):' >&2\necho 'ModuleNotFoundError: k3code' >&2\nexit 1\n"
+    )
+    broken.chmod(0o755)
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    r = run(tmp_path, UNINSTALL, path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    assert "Traceback" not in r.stderr and "ModuleNotFoundError" not in r.stderr
+    assert r.stderr.count("k3code is not runnable; removing units directly") == 1
+    assert not (units / "k3code.service").exists() and not (units / "k3code-recover.service").exists()
+    assert "disable --now k3code.service k3code-recover.service" in calls.read_text()
+
+
 def _git(src: Path, *args: str) -> str:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(src), *args]
