@@ -34,6 +34,7 @@ def test_records_every_kind_with_cwd_project_and_ts(tmp_path):
         "scope": dict(subject="override", choice="small"),
         "config": dict(subject="update-config", choice="apply"),
         "auto_apply": dict(subject="clip tool results", choice="applied", actor="auto", detail={"experiment": "x1"}),
+        "tool_error": dict(subject="npm: exit <n>: sh: npm: not found", choice="exit 127", detail={"tool": "bash"}),
     }
     assert set(samples) == set(KINDS)
     for kind, kw in samples.items():

@@ -11,7 +11,15 @@ import httpx
 
 from k3code.providers.base import Provider, ProviderError, request_headers, to_provider_error
 from k3code.providers.effort import anthropic_effort
-from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec, messages_to_anthropic
+from k3code.providers.types import (
+    EPHEMERAL,
+    Message,
+    StreamEvent,
+    ToolCall,
+    ToolSpec,
+    messages_to_anthropic,
+    with_cache_breakpoint,
+)
 
 _TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=15.0)
 
@@ -30,8 +38,11 @@ class AnthropicProvider(Provider):
         base_url: str = "https://api.anthropic.com",
         api_key: str,
         client: httpx.AsyncClient | None = None,
+        prompt_cache: str = "auto",
     ) -> None:
         self.name = name
+        #: auto and on both mark cache breakpoints here (the native API supports them); off sends none
+        self.prompt_cache = prompt_cache != "off"
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
@@ -73,6 +84,8 @@ class AnthropicProvider(Provider):
             payload["tools"] = [
                 {"name": t.name, "description": t.description, "input_schema": t.parameters} for t in tools
             ]
+        if self.prompt_cache:
+            _add_cache_breakpoints(payload)
         return payload
 
     async def stream(
@@ -102,7 +115,7 @@ class AnthropicProvider(Provider):
             content_parts: list[str] = []
             # tool index -> {"id", "name", "args"}
             tool_blocks: dict[int, dict[str, Any]] = {}
-            usage_in = usage_out = 0
+            usage_in = usage_out = cache_read = cache_creation = 0
             complete = False  # message_stop arrived
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
@@ -144,6 +157,8 @@ class AnthropicProvider(Provider):
                     # prompt tokens = every input token the model read, cache hits and cache writes included, the same
                     # definition as the claude-cli provider and the OpenAI-compatible one (whose count already has them)
                     usage_in = sum(int(usage.get(k) or 0) for k in _INPUT_USAGE_KEYS)
+                    cache_read = int(usage.get("cache_read_input_tokens") or 0)
+                    cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
                 elif etype == "message_delta":
                     usage = event.get("usage") or {}
                     usage_out = int(usage.get("output_tokens") or 0)
@@ -154,7 +169,12 @@ class AnthropicProvider(Provider):
                 )
             from k3code.providers.types import Usage
 
-            usage = Usage(prompt_tokens=usage_in, completion_tokens=usage_out)
+            usage = Usage(
+                prompt_tokens=usage_in,
+                completion_tokens=usage_out,
+                cache_read_tokens=cache_read,
+                cache_creation_tokens=cache_creation,
+            )
             final_calls = [
                 ToolCall(
                     id=slot["id"],
@@ -175,6 +195,19 @@ class AnthropicProvider(Provider):
             raise to_provider_error(exc, kind="anthropic") from exc
         finally:
             await response.aclose()
+
+
+def _add_cache_breakpoints(payload: dict[str, Any]) -> None:
+    """Mark three prompt-cache breakpoints (the API allows four): the system prompt, the last tool definition, and the
+    last block of the newest message. The last one moves forward every call, so each request reads the prefix the
+    request before it wrote instead of paying for the whole conversation again on every tool-loop step."""
+    if payload.get("system"):
+        payload["system"] = [{"type": "text", "text": payload["system"], "cache_control": EPHEMERAL}]
+    if payload.get("tools"):
+        payload["tools"][-1] = {**payload["tools"][-1], "cache_control": EPHEMERAL}
+    messages = payload["messages"]
+    if messages:
+        messages[-1] = {**messages[-1], "content": with_cache_breakpoint(messages[-1]["content"])}
 
 
 async def _error_from_response(response: httpx.Response) -> ProviderError:

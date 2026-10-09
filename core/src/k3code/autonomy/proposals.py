@@ -15,7 +15,19 @@ from k3code.routing.tiers import TaskKind
 
 KINDS = ("consequence", "also_setup", "improvement")
 #: M5 kinds created by the learning package (not by the LLM proposer); accepting them runs a handler.
-LEARNED_KINDS = ("permission_rule", "preference", "project_setup", "skill", "optimizer")
+LEARNED_KINDS = (
+    "permission_rule",
+    "preference",
+    "project_setup",
+    "skill",
+    "optimizer",
+    "project_gotcha",
+    # project recipes (k3code.learning.recipes; payload op "recipe"): "skill" above doubles as one
+    "mcp",
+    "hook",
+    "rule",
+    "commands",
+)
 
 PROPOSER_SYSTEM = (
     "You think one step ahead of a coding agent. Given the plan or the finished task, reply with ONE JSON "

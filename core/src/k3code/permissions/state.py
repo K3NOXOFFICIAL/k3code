@@ -95,6 +95,12 @@ class PermissionState:
     def reload(self) -> None:
         """Re-read user + project config (cheap; called per turn)."""
         user, user_hard = load_permissions_config(self.user_config or _home() / "config.yaml")
+        # Rules the user accepted from a project recipe live in k3code's state for this project, not in the repo:
+        # they rank as the user's own (k3code.learning.projectstate.rules_path).
+        from k3code.learning.projectstate import rules_path
+
+        accepted, _ = load_permissions_config(rules_path(self.cwd))
+        user = [*user, *accepted]
         # A project config the user has not trusted contributes no rules and no hardline patterns.
         text = trust.trusted_text(self.cwd)
         project, project_hard = permissions_from_text(text) if text is not None else ([], [])

@@ -10,11 +10,24 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from k3code.autonomy.proposals import Proposal, ProposalStore
+from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.config import Settings, load_config
-from k3code.learning import curator, distiller, learning_cfg, optimizer, permrules, projectprep, ranking, replay, review
+from k3code.learning import (
+    curator,
+    distiller,
+    gotchas,
+    learning_cfg,
+    optimizer,
+    permrules,
+    projectprep,
+    ranking,
+    recipes,
+    replay,
+    review,
+)
 from k3code.learning.decisions import DecisionLog, project_id
 from k3code.learning.updateconfig import merge_patch
+from k3code.redact import scrub_text
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +47,8 @@ class LearningHub:
         self.replays = replay.ReplayStore(self.home)
         self._state_path = self.home / "learning" / "state.json"
         self._tasks: set[asyncio.Task[Any]] = set()
+        #: (session id, tool) -> (tool_error row id, signature, the failed call's args): waits for the retry that works
+        self._last_failure: dict[tuple[str, str], tuple[int, str, dict[str, Any]]] = {}
 
     # ── config / state ──
 
@@ -88,13 +103,85 @@ class LearningHub:
         except Exception:  # noqa: BLE001 - learning must never break a turn
             logger.warning("decision log write failed", exc_info=True)
 
-    def approval(self, session: Any, tool: str, pattern: str, choice: str) -> None:
-        self.record("approval", session, subject=pattern, choice=choice, detail={"tool": tool})
+    def approval(
+        self, session: Any, tool: str, pattern: str, choice: str, *, reason: str = "", command: str = ""
+    ) -> None:
+        """``reason``: what the user typed with the answer ("use pnpm, not npm"); it used to reach the model for one
+        turn only. Kept scrubbed, so the distiller can turn repeated reasons into a preference."""
+        detail: dict[str, Any] = {"tool": tool}
+        if reason.strip():
+            detail["reason"] = scrub_text(reason.strip())[:300]
+        if command.strip():
+            detail["command"] = scrub_text(command.strip())[:200]
+        self.record("approval", session, subject=pattern, choice=choice, detail=detail)
         if tool == "bash" and self.enabled:
             self.spawn(self._mine_later(session))
 
     async def _mine_later(self, session: Any) -> None:
         self.mine_permissions(session)
+
+    def tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> None:
+        """Record a failed tool call as a ``tool_error``; the next call of that tool in the session that looks like a
+        retry and works becomes the row's hint. A signature seen REPEATS times in the project within WINDOW proposes
+        a project gotcha. Never raises: it runs inside the turn."""
+        if not self.enabled or session is None:
+            return
+        try:
+            self._tool_outcome(session, call, result, failure)
+        except Exception:  # noqa: BLE001 - learning must never break a turn
+            logger.warning("tool error learning failed", exc_info=True)
+
+    def _tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> None:
+        cwd = str(session.perms.cwd)
+        key = (session.session_id, call.name)
+        if failure is None:
+            pending = self._last_failure.pop(key, None)
+            if pending is not None:
+                row_id, sig, failed_args = pending
+                hint = gotchas.followup_hint(call.name, failed_args, call.arguments)
+                if hint:
+                    self.log.update_detail(row_id, followup=hint)
+                    self._maybe_gotcha(session, cwd, call.name, sig)
+            return
+        if failure.error_class in gotchas.NOT_PROJECT or (
+            failure.error_class.startswith("exit ") and not str(result.get("stderr") or "").strip()
+        ):
+            return  # a failing test run or `grep` without a match says nothing about the project by itself
+        row_id = self.log.record(
+            "tool_error",
+            session=session.session_id,
+            cwd=cwd,
+            subject=failure.signature,
+            choice=failure.error_class,
+            detail={"tool": call.name, "error": failure.first_line},
+            actor="auto" if getattr(session, "background", False) else "user",
+        )
+        self._last_failure[key] = (row_id, failure.signature, dict(call.arguments))
+        self._maybe_gotcha(session, cwd, call.name, failure.signature)
+
+    def _maybe_gotcha(self, session: Any, cwd: str, tool: str, sig: str) -> Proposal | None:
+        pid = self.log.project_for(cwd)
+        rows = [
+            r
+            for r in self.log.query("tool_error", project=pid, since=self.clock() - gotchas.WINDOW, actor=None)
+            if r["subject"] == sig and r["detail"].get("tool") == tool
+        ]
+        if len(rows) < gotchas.REPEATS:
+            return None
+        hint = next((str(r["detail"]["followup"]) for r in reversed(rows) if r["detail"].get("followup")), "")
+        line = f"{tool}: {sig}" + (f" — {hint}" if hint else "")
+        p = self.store.add(
+            "project_gotcha",
+            gotchas.proposal_text(sig, hint),
+            "remember this pitfall for the project",
+            session.session_id,
+            payload={"project": pid, "line": line},
+            project=pid,
+            key=dedup_key("project_gotcha", f"{pid} {tool} {sig}"),
+        )
+        if p is not None:
+            self.emit(session, [p])
+        return p
 
     # ── proposals ──
 
@@ -143,6 +230,13 @@ class LearningHub:
         """Run the handler of an accepted learned proposal; returns a human message."""
         payload = p.payload
         cwd = str(session.perms.cwd) if session is not None else ""
+        if payload.get("op") == "recipe":  # before the kind switch: a recipe "skill" is not a curator skill
+            msg = recipes.apply(payload)
+            if session is not None:
+                session.perms.reload()
+            if payload.get("type") == "mcp":
+                await self._reload_mcp(str(payload.get("root") or cwd))
+            return msg
         if p.kind == "permission_rule":
             msg = permrules.apply(payload, cwd=cwd)
             if payload.get("auto_do") and payload.get("project"):
@@ -160,6 +254,15 @@ class LearningHub:
             return msg
         if p.kind == "skill":
             return curator.apply(payload)
+        if p.kind == "project_gotcha" and payload.get("project") and payload.get("line"):
+            path = gotchas.gotchas_path(str(payload["project"]), self.home)
+            gotchas.append_gotcha(path, str(payload["line"]))
+            return f"added to the known pitfalls of this project ({path})"
+        if p.kind == "preference" and payload.get("text"):
+            from k3code.memory import user_memory_path
+
+            distiller.add_user_line(user_memory_path(), str(payload["text"]))
+            return f"remembered in {user_memory_path()}"
         if p.kind == "optimizer":
             if "task_tiers" in payload:
                 return self._apply_overlay(
@@ -204,19 +307,32 @@ class LearningHub:
     # ── project prep ──
 
     async def prepare_project(self, session: Any) -> list[Proposal]:
-        root = Path(session.stored.cwd or ".")
-        if not self.enabled or not projectprep.needs_prep(root) or session.background:
+        """Scan the session's project (in a worker thread); new or changed stacks get their proposals."""
+        if not self.enabled or session.background:
             return []
         made = await projectprep.prepare(
-            root,
+            Path(session.stored.cwd or "."),
             store=self.store,
             caller=self.server.model_caller,
             preferences=self.preferences(),
             session_id=session.session_id,
             clock=self.clock,
+            skill_roots=list(self.server.config.skills.roots),
         )
         self.emit(session, made)
         return made
+
+    async def _reload_mcp(self, cwd: str) -> None:
+        """An accepted recipe MCP server: restart the set the way ``/mcp reload`` does."""
+        from k3code import mcpjson
+
+        mcp = getattr(self.server, "mcp", None)
+        if mcp is None or not cwd:
+            return
+        try:
+            await mcp.reload(mcpjson.merged(self.server.config.mcp.servers, cwd))
+        except Exception:  # noqa: BLE001 - the server is saved; /mcp reload retries
+            logger.warning("MCP reload after a recipe failed", exc_info=True)
 
     # ── turn end ──
 

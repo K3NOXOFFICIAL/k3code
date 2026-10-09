@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS events (
     detail TEXT NOT NULL DEFAULT '',
     tier TEXT NOT NULL DEFAULT '',
     task_kind TEXT NOT NULL DEFAULT '',
-    turn TEXT NOT NULL DEFAULT ''
+    turn TEXT NOT NULL DEFAULT '',
+    cache_read INTEGER NOT NULL DEFAULT 0,
+    cache_write INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS events_day ON events(day);
 CREATE INDEX IF NOT EXISTS events_session ON events(session);
@@ -54,6 +56,9 @@ class UsageDB:
         for col in ("tier", "task_kind", "turn"):  # M4a: databases from M2 lack these; M1: turn ids
             if col not in cols:
                 self._db.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        for col in ("cache_read", "cache_write"):  # prompt-cache tokens (part of tokens_in); older databases lack them
+            if col not in cols:
+                self._db.execute(f"ALTER TABLE events ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
         self._db.commit()
 
     def record(
@@ -72,14 +77,16 @@ class UsageDB:
         tier: str = "",
         task_kind: str = "",
         turn: str = "",
+        cache_read: int = 0,
+        cache_write: int = 0,
     ) -> None:
         if kind not in KINDS:
             raise ValueError(f"unknown usage event kind {kind!r}")
         ts = time.time() if ts is None else ts
         self._db.execute(
             "INSERT INTO events (ts, day, session, kind, provider, model, tokens_in, tokens_out, cost_usd,"
-            " seconds, detail, tier, task_kind, turn)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " seconds, detail, tier, task_kind, turn, cache_read, cache_write)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 ts,
                 time.strftime("%Y-%m-%d", time.localtime(ts)),
@@ -95,6 +102,8 @@ class UsageDB:
                 tier,
                 task_kind,
                 turn,
+                cache_read,
+                cache_write,
             ),
         )
         self._db.commit()
@@ -128,14 +137,30 @@ class UsageDB:
             args.append(time.time() - days * 86400)
         sql = (
             "SELECT ts, day, session, kind, provider, model, tokens_in, tokens_out, cost_usd, seconds, tier,"
-            " task_kind, turn FROM events"
+            " task_kind, turn, cache_read, cache_write FROM events"
         )
         if where:
             sql += " WHERE " + " AND ".join(where)
         groups: dict[str, dict[str, Any]] = {}
         calls: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
         rows = self._db.execute(sql + " ORDER BY ts", args)
-        for ts, day, sess, kind, provider, model, t_in, t_out, cost, secs, tier, task_kind, turn in rows:
+        for (
+            ts,
+            day,
+            sess,
+            kind,
+            provider,
+            model,
+            t_in,
+            t_out,
+            cost,
+            secs,
+            tier,
+            task_kind,
+            turn,
+            c_read,
+            c_write,
+        ) in rows:
             key = {"day": day, "session": sess, "turn": turn}[by]
             g = groups.setdefault(
                 key,
@@ -144,6 +169,8 @@ class UsageDB:
                     "session": sess if by == "turn" else None,
                     "tokens_in": 0,
                     "tokens_out": 0,
+                    "cache_read": 0,
+                    "cache_write": 0,
                     "cost_usd": None,
                     "calls": 0,
                     "failovers": 0,
@@ -165,6 +192,8 @@ class UsageDB:
             g["last_ts"] = max(g["last_ts"], ts)
             g["tokens_in"] += t_in
             g["tokens_out"] += t_out
+            g["cache_read"] += c_read
+            g["cache_write"] += c_write
             if cost is not None:
                 g["cost_usd"] = (g["cost_usd"] or 0.0) + cost
             if kind == "call":
@@ -234,6 +263,11 @@ def format_stats(rows: list[dict[str, Any]], by: str) -> str:
             f"pauses {g['pauses']} ({g['paused_seconds']:.0f}s paused), tools {g['tool_calls']}, "
             f"approvals {g['approvals']}, escalations {g['escalations']}, outages {g['outages']}, "
             f"loop guards {g['loop_guards']}"
+            + (
+                f", prompt cache read/write {g['cache_read']}/{g['cache_write']} tok"
+                if g["cache_read"] or g["cache_write"]
+                else ""
+            )
         )
         tiers = ", ".join(
             f"{t} {v['calls']} calls ({v['tokens_in']}/{v['tokens_out']} tok)" for t, v in sorted(g["by_tier"].items())

@@ -111,6 +111,83 @@ def derive(log: DecisionLog, *, min_evidence: int = 3) -> tuple[list[Preference]
     return prefs, suggestions
 
 
+def _command_prefix(row: dict[str, Any]) -> str:
+    """The program a denied command runs (``npm`` of ``FOO=1 npm install x``); the pattern when no command was kept."""
+    words = str(row["detail"].get("command") or row["subject"] or "").split()
+    while words and "=" in words[0] and words[0].split("=", 1)[0].isidentifier():
+        words.pop(0)
+    return words[0] if words else ""
+
+
+def _reason_words(text: str) -> set[str]:
+    return set(re.sub(r"\W+", " ", text.lower()).split())
+
+
+def _similar(a: set[str], b: set[str]) -> bool:
+    return bool(a and b) and len(a & b) / len(a | b) >= 0.5
+
+
+def denial_preferences(log: DecisionLog, *, min_evidence: int = 2) -> list[dict[str, Any]]:
+    """Denials of one command prefix that came with similar reasons ("use pnpm, not npm" twice), as preference
+    candidates: ``{"prefix", "reason", "evidence"}``. A reason told once reaches the model for that turn only."""
+    groups: dict[tuple[str, str], list[list[Any]]] = defaultdict(list)  # (tool, prefix) -> [[words, reasons], ...]
+    for r in log.query("approval"):
+        reason = str(r["detail"].get("reason") or "").strip()
+        if r["choice"] != "deny" or not reason:
+            continue
+        tool = str(r["detail"].get("tool") or "")
+        prefix = _command_prefix(r) if tool == "bash" else tool
+        if not prefix:
+            continue
+        words = _reason_words(reason)
+        clusters = groups[(tool, prefix)]
+        for c in clusters:
+            if _similar(c[0], words):
+                c[1].append(reason)
+                break
+        else:
+            clusters.append([words, [reason]])
+    out = []
+    for (_tool, prefix), clusters in groups.items():
+        for _words, reasons in clusters:
+            if len(reasons) >= min_evidence:
+                text = Counter(reasons).most_common(1)[0][0]  # the most common wording, the first on a tie
+                out.append({"prefix": prefix, "reason": scrub_text(text), "evidence": len(reasons)})
+    return out
+
+
+def propose_denial_preferences(log: DecisionLog, proposals: ProposalStore) -> list[Any]:
+    made = []
+    for c in denial_preferences(log):
+        line = f"for `{c['prefix']}` commands: {c['reason']}"
+        p = proposals.add(
+            "preference",
+            f'You denied `{c["prefix"]}` {c["evidence"]}× saying "{c["reason"]}" → remember: {line}?',
+            "remember this preference",
+            payload={"text": line},
+            key=dedup_key("preference", f"deny {c['prefix']} {c['reason']}"),
+        )
+        if p is not None:
+            made.append(p)
+    return made
+
+
+def add_user_line(path: Path, text: str, heading: str = HEADING) -> None:
+    """Add ``- text`` to ``path`` above the auto section (the distiller rewrites that section, and everything below
+    its heading up to the next one, on every run)."""
+    text = scrub_text(text.strip())
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    lines = existing.splitlines(keepends=True)
+    at = next((i for i, ln in enumerate(lines) if ln.strip() == heading), None)
+    if at is None:
+        sep = "" if not existing or existing.endswith("\n") else "\n"
+        new = existing + sep + f"- {text}\n"
+    else:
+        new = "".join(lines[:at]) + f"- {text}\n\n" + "".join(lines[at:])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new, encoding="utf-8")
+
+
 DISTILL_SYSTEM = (
     "You rewrite observed user-behaviour facts as short, durable preference lines for a coding agent's memory. "
     'Reply with ONE JSON array of {"key": str, "text": str}. Keep each text under 100 chars, imperative or '
@@ -256,6 +333,7 @@ async def distill(
     # blocking HTTP (up to 10 s per preference): never on the event loop that serves every session
     await asyncio.to_thread(store_mem0, config, prefs, mem0_post)
     if proposals is not None:
+        propose_denial_preferences(log, proposals)
         for s in suggestions:
             text = (
                 f"You keep moving away from {s['model']} for {s['task_kind']} tasks ({s['evidence']}×) → "
