@@ -128,7 +128,8 @@ async def _run_headless(
     providers = make_providers(config.providers)
     chain = build_chain(providers, _resolve_model_specs(config))
     cooldowns = CooldownStore(path=_cooldown_path())
-    router = Router(chain, cooldowns=cooldowns, on_event=_print_event, **router_options(config))
+    usage = _HeadlessUsage(session)
+    router = Router(chain, cooldowns=cooldowns, on_event=usage.on_router_event, **router_options(config))
 
     # M2: reliability bundle (netwatch, persistent retry, journal, guards).
     reliability = _build_reliability(config, session=session)
@@ -148,7 +149,7 @@ async def _run_headless(
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
 
     final_text = ""
-    tool_results: list[dict[str, Any]] = []
+    tool_results = usage.tools
 
     async def on_text_delta(text: str) -> None:
         nonlocal final_text
@@ -171,8 +172,10 @@ async def _run_headless(
 
     try:
         await reliability.start()
-        async for _ in loop.run(prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume):
-            pass
+        async for event in loop.run(
+            prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume
+        ):
+            usage.on_stream_event(event)
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
         return {"error": "all_providers_unreachable", "message": str(e), "attempts": e.attempts}
@@ -192,6 +195,85 @@ async def _run_headless(
     finally:
         await _reap_jobs(session)  # no background bash job outlives the run
         await reliability.stop()
+        usage.close()
+
+
+#: Characters of each tool result kept in ``k3code -p --json``'s ``tools`` list.
+HEADLESS_RESULT_CHARS = 2000
+
+
+class _HeadlessUsage:
+    """What a ``k3code -p`` run reports and records: its tool calls (the ``--json`` ``tools`` list) and the same
+    ``call``/``tool``/``retry``/``failover`` rows in ``$K3CODE_HOME/usage.db`` that a gateway turn writes (headless
+    runs used to write none, so ``k3code stats`` never saw them). A usage.db that cannot be opened is skipped."""
+
+    def __init__(self, session: str) -> None:
+        from k3code.daemon import k3_home
+        from k3code.usage import UsageDB
+
+        self.session = session
+        self.tools: list[dict[str, Any]] = []
+        self._by_id: dict[str, dict[str, Any]] = {}
+        self._last: tuple[str, str] = ("", "")
+        try:
+            self.db: Any = UsageDB(k3_home() / "usage.db")
+        except Exception:  # noqa: BLE001 - accounting must never stop the run
+            logger.warning("usage.db unavailable; this run is not recorded", exc_info=True)
+            self.db = None
+
+    def _record(self, kind: str, **kw: Any) -> None:
+        if self.db is None:
+            return
+        try:
+            self.db.record(kind, session=self.session, **kw)
+        except Exception:  # noqa: BLE001
+            logger.warning("usage row not recorded", exc_info=True)
+
+    def on_router_event(self, event: RouterEvent) -> None:
+        if event.kind == "router.attempt":
+            self._last = (event.provider, event.model)
+        elif event.kind in ("router.retry", "router.failover"):
+            self._record(
+                event.kind.removeprefix("router."), provider=event.provider, model=event.model, detail=event.reason
+            )
+        _print_event(event)
+
+    def _tool(self, call: Any) -> None:
+        if call.id in self._by_id:
+            return
+        entry = {"id": call.id, "name": call.name, "arguments": call.arguments}
+        self._by_id[call.id] = entry
+        self.tools.append(entry)
+        self._record("tool", detail=call.name)
+
+    def on_stream_event(self, event: Any) -> None:
+        if event.type == "tool_call" and event.tool_call:
+            self._tool(event.tool_call)
+        elif event.type == "done" and event.message is not None:
+            msg = event.message
+            if msg.role == "assistant":
+                u = msg.usage
+                provider, model = self._last
+                self._record(
+                    "call",
+                    provider=provider,
+                    model=model,
+                    tokens_in=u.prompt_tokens if u else 0,
+                    tokens_out=u.completion_tokens if u else 0,
+                    cost_usd=u.cost_usd if u else None,
+                    cache_read=u.cache_read_tokens if u else 0,
+                    cache_write=u.cache_creation_tokens if u else 0,
+                )
+                for call in msg.tool_calls:
+                    self._tool(call)
+            elif msg.role == "tool" and (entry := self._by_id.get(msg.tool_call_id or "")) is not None:
+                text = msg.content if isinstance(msg.content, str) else json.dumps(msg.content, default=str)
+                entry["result"] = text[:HEADLESS_RESULT_CHARS]
+
+    def close(self) -> None:
+        if self.db is not None:
+            with contextlib.suppress(Exception):
+                self.db.close()
 
 
 async def _run_repl(
