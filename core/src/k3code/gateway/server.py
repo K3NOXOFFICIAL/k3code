@@ -937,8 +937,8 @@ class GatewayServer:
                 writer.close()
             # Every TUI start creates a session so the prompt is usable; one left empty and idle by its last client
             # (TUI exit, crash, kill -9: the socket just drops) was never closed, because session.close refuses while
-            # its caller is still attached. Its stored row goes too (close_live). Not during a daemon stop: close()
-            # iterates the registry across awaits.
+            # its caller is still attached. Only the live entry is dropped; the stored row stays. Not during a daemon
+            # stop: close() iterates the registry across awaits.
             if client.session_id and not self.stopping:
                 with contextlib.suppress(Exception):
                     if (await self.close_live(client.session_id, disposable_only=True))["closed"]:
