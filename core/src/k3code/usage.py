@@ -9,11 +9,12 @@ unknown instead of inventing a number.
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+
+from k3code import sqlstore
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -50,7 +51,7 @@ class UsageDB:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(self.path))
+        self._db = sqlstore.connect(self.path)
         self._db.executescript(_SCHEMA)
         cols = {row[1] for row in self._db.execute("PRAGMA table_info(events)")}
         for col in ("tier", "task_kind", "turn"):  # M4a: databases from M2 lack these; M1: turn ids

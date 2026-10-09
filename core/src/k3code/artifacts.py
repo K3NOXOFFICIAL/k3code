@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import logging
 import shutil
-import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from k3code import sqlstore
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ class ArtifactStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._db = sqlstore.connect(self.path, check_same_thread=False)
         self._db.executescript(_SCHEMA)
         self._db.commit()
 

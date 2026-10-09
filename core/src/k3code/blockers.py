@@ -12,6 +12,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from k3code import sqlstore
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS blockers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,7 +31,7 @@ class BlockerStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(self.path), timeout=10)
+        self._db = sqlstore.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.execute(_SCHEMA)
         self._db.commit()

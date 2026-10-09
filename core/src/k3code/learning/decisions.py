@@ -12,6 +12,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from k3code import sqlstore
+
 KINDS = (
     "approval",
     "model_switch",
@@ -87,7 +89,7 @@ class DecisionLog:
         self.path = self.home / "learning" / "decisions.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.clock = clock
-        self._db = sqlite3.connect(str(self.path))
+        self._db = sqlstore.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(_SCHEMA)
         self._db.commit()

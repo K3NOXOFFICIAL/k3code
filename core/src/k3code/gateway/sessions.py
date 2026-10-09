@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from k3code import sqlstore
+
 logger = logging.getLogger(__name__)
 
 #: The daemon start sweep deletes empty, unnamed stored sessions untouched this long (see SessionStore.sweep_empty).
@@ -65,7 +67,7 @@ class SessionStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(self.path))
+        self._db = sqlstore.connect(self.path)
         self._db.execute(_SCHEMA)
         with contextlib.suppress(sqlite3.OperationalError):  # column already exists
             self._db.execute("ALTER TABLE sessions ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
