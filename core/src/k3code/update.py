@@ -22,6 +22,8 @@ from k3code import service
 from k3code.paths import data_dir, user_config_path
 
 DEFAULT_REPO = "K3NOXOFFICIAL/k3code"
+#: The GitHub-compatible releases API; K3CODE_UPDATE_API or update.api point it at a mirror.
+DEFAULT_API = "https://api.github.com"
 KEEP_VERSIONS = 3
 DAEMON_WAIT_SECONDS = 120
 
@@ -87,8 +89,28 @@ def version_key(v: str) -> tuple[Any, ...]:
 # -- smoke test / daemon health -------------------------------------------------
 
 
+#: Doctor checks about the machine, not about the new version: they never block an update (a fresh install has no
+#: providers yet, a node-less one no TUI); the daemon itself is health-checked after the switch.
+ENV_CHECKS = (
+    "provider",
+    "providers",
+    "api-keys",
+    "omniroute-bypass",
+    "netwatch",
+    "disk",
+    "psi",
+    "daemon",
+    "systemd-unit",
+    "tui",
+    "vendor",
+    "sandbox",
+    "hermes-isolation",
+)
+
+
 def smoke_test(vdir: Path, timeout: float = 60.0) -> tuple[bool, str]:
-    """``k3code --version`` and ``k3code doctor --json --no-probe`` (no fails) using the version's own venv."""
+    """The new version's own venv: ``k3code --version`` names this version, and ``doctor --json --no-probe`` (which
+    loads the config with the new code) has no failing check about k3code itself; environment checks do not count."""
     exe = vdir / "venv" / "bin" / "k3code"
     if not exe.exists():
         return False, f"{exe} missing"
@@ -99,6 +121,9 @@ def smoke_test(vdir: Path, timeout: float = 60.0) -> tuple[bool, str]:
         )
         if v.returncode != 0:
             return False, f"--version failed: {v.stderr.strip()[:200]}"
+        want = vdir.name.split("-src")[0]
+        if want not in v.stdout:
+            return False, f"--version says {v.stdout.strip()[:80]!r}, expected {want}"
         d = subprocess.run(
             [str(exe), "doctor", "--json", "--no-probe"],
             capture_output=True,
@@ -108,19 +133,26 @@ def smoke_test(vdir: Path, timeout: float = 60.0) -> tuple[bool, str]:
             check=False,
         )
         try:
-            summary = json.loads(d.stdout).get("summary", {})
+            report = json.loads(d.stdout)
         except ValueError:
             return False, f"doctor emitted no JSON (exit {d.returncode}): {d.stderr.strip()[:200]}"
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, f"{type(e).__name__}: {e}"
-    if summary.get("fail", 0):
-        return False, f"doctor reports {summary['fail']} failing check(s)"
+    checks = report.get("checks") or []
+    blocking = [
+        str(c.get("name"))
+        for c in checks
+        if c.get("status") == "fail" and str(c.get("name", "")).split(":")[0] not in ENV_CHECKS
+    ]
+    if blocking or (not checks and report.get("summary", {}).get("fail", 0)):
+        return False, f"doctor reports failing check(s): {', '.join(blocking) or 'unnamed'}"
     return True, v.stdout.strip()
 
 
 def restart_daemon() -> None:
+    """Restart the unit; raises ``service.ServiceError`` when systemd refuses (reported, never ignored)."""
     if service.is_installed():
-        service._systemctl("restart", service.UNIT_NAME)  # noqa: SLF001
+        service.restart()
 
 
 def daemon_healthy() -> bool:
@@ -155,6 +187,44 @@ class UpdateResult:
     log: list[str] = field(default_factory=list)
 
 
+def uv_path() -> str:
+    return shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+
+
+def carry_playwright(prev_vdir: Path, new_vdir: Path, uv: str | None = None) -> str | None:
+    """Install the Playwright version of ``prev_vdir``'s venv into ``new_vdir``'s; a line for the log, or None.
+
+    Only the installer's presetup installs Playwright, and every update builds a fresh venv without it, so the browser
+    tool used to vanish on the first update. Chromium itself lives in ``<data>/browsers``, shared by all versions, so
+    only the Python package is installed again (no browser download)."""
+    old_py = prev_vdir / "venv" / "bin" / "python"
+    new_py = new_vdir / "venv" / "bin" / "python"
+    if not old_py.exists() or not new_py.exists():
+        return None
+    probe = "from importlib.metadata import version; import playwright; print(version('playwright'))"
+    try:
+        old = subprocess.run([str(old_py), "-c", probe], capture_output=True, text=True, timeout=60, check=False)
+        if old.returncode != 0 or not old.stdout.strip():
+            return None  # the browser tool was off before the update: keep it off
+        ver = old.stdout.strip().splitlines()[-1]
+        new = subprocess.run([str(new_py), "-c", probe], capture_output=True, text=True, timeout=60, check=False)
+        if new.returncode == 0:
+            return None  # the new version brings its own
+        r = subprocess.run(
+            [uv or uv_path(), "pip", "install", "--quiet", "--python", str(new_py), f"playwright=={ver}"],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"warning: could not carry Playwright over ({type(e).__name__}: {e}); the browser tool is off"
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout).strip()[-300:]
+        return f"warning: could not install Playwright {ver} into the new version ({err}); the browser tool is off"
+    return f"carried Playwright {ver} over to the new version"
+
+
 def activate(
     version: str,
     *,
@@ -163,25 +233,44 @@ def activate(
     daemon_installed: Callable[[], bool] = service.is_installed,
     smoke: Callable[[Path], tuple[bool, str]] = smoke_test,
     wait: Callable[..., bool] = wait_healthy,
+    carry: Callable[[Path, Path], str | None] = carry_playwright,
 ) -> UpdateResult:
-    """Smoke-test ``versions/<version>``, switch to it, restart the daemon; roll back on any failure."""
+    """Smoke-test ``versions/<version>``, switch to it, restart the daemon; roll back on any failure.
+
+    Release, source and git updates all pass through here, so this is where the new venv gets the optional Playwright
+    package the current one has (before the smoke test, which then runs the venv as it will be used)."""
     vdir = versions_dir() / version
     prev = current_version()
+    log: list[str] = []
+    if prev and prev != version and (carried := carry(versions_dir() / prev, vdir)):
+        log.append(carried)
     ok, detail = smoke(vdir)
     if not ok:
-        return UpdateResult(False, version, f"smoke test failed, not switching: {detail}", log=[detail])
+        if version not in (prev, previous_version()):  # a staged build that never ran: do not leave it behind
+            shutil.rmtree(vdir, ignore_errors=True)
+        return UpdateResult(False, version, f"smoke test failed, not switching: {detail}", log=[*log, detail])
     switch_to(version)
-    log = [f"switched current -> {version} (was {prev})"]
+    log.append(f"switched current -> {version} (was {prev})")
     if daemon_installed():
-        restart()
-        if not wait(healthy):
+        try:
+            restart()
+            up = wait(healthy)
+        except service.ServiceError as e:
+            log.append(str(e))
+            up = False
+        if not up:
             if prev:
                 switch_to(prev)
-                restart()
+                try:
+                    restart()
+                except service.ServiceError as e:
+                    log.append(f"rolled back to {prev}, but the daemon did not restart: {e}")
+                    return UpdateResult(False, version, log[-1], rolled_back=True, log=log)
                 log.append(f"daemon unhealthy after {DAEMON_WAIT_SECONDS}s; rolled back to {prev}")
                 return UpdateResult(False, version, log[-1], rolled_back=True, log=log)
             return UpdateResult(False, version, "daemon unhealthy and no previous version to roll back to", log=log)
-    return UpdateResult(True, version, f"updated to {version}", log=log)
+    warnings = "".join(f"\n{line}" for line in log if line.startswith("warning:"))
+    return UpdateResult(True, version, f"updated to {version}{warnings}", log=log)
 
 
 def rollback(
@@ -193,7 +282,10 @@ def rollback(
         return UpdateResult(False, cur or "", "no previous version to roll back to")
     switch_to(prev)  # records `cur` as the new previous, so rollback twice toggles
     if daemon_installed():
-        restart()
+        try:
+            restart()
+        except service.ServiceError as e:
+            return UpdateResult(False, prev, f"rolled back {cur} -> {prev}, but {e}", rolled_back=True)
     return UpdateResult(True, prev, f"rolled back {cur} -> {prev}", rolled_back=True)
 
 
@@ -243,6 +335,7 @@ def update_settings() -> dict[str, Any]:
         "source": s.get("source", ""),
         # the git remote a `install.sh --from-git` install updates from (a fork or mirror may set its own)
         "url": s.get("url") or f"https://github.com/{repo}.git",
+        "api": os.environ.get("K3CODE_UPDATE_API") or s.get("api") or DEFAULT_API,
     }
 
 
@@ -253,9 +346,12 @@ def _headers(token: str | None, accept: str = "application/vnd.github+json") -> 
     return h
 
 
-def fetch_latest(channel: str = "stable", repo: str = DEFAULT_REPO, token: str | None = None) -> Release | None:
+def fetch_latest(
+    channel: str = "stable", repo: str = DEFAULT_REPO, token: str | None = None, api: str | None = None
+) -> Release | None:
     """Newest release on ``channel`` (``stable`` skips prereleases; ``dev`` takes anything)."""
-    r = httpx.get(f"https://api.github.com/repos/{repo}/releases?per_page=30", headers=_headers(token), timeout=15)
+    base = (api or os.environ.get("K3CODE_UPDATE_API") or DEFAULT_API).rstrip("/")
+    r = httpx.get(f"{base}/repos/{repo}/releases?per_page=30", headers=_headers(token), timeout=15)
     if r.status_code in (401, 403, 404):
         raise PermissionError(
             f"GitHub API {r.status_code}: {repo} is private or does not exist; set GITHUB_TOKEN (or `gh auth login`) "
@@ -301,13 +397,47 @@ def is_newer(candidate: str, current: str | None) -> bool:
     return version_key(candidate) > version_key(current.split("-src")[0])
 
 
-def install_release(rel: Release, token: str | None, uv: str | None = None) -> Path:
+class IntegrityError(ValueError):
+    """A release asset could not be verified: nothing from the release is installed."""
+
+
+def verify_checksums(files: dict[str, Path]) -> None:
+    """Fail closed: SHA256SUMS must be there and list every other downloaded asset with a matching hash."""
+    if "SHA256SUMS" not in files:
+        raise IntegrityError("the release has no SHA256SUMS: refusing to install files that cannot be verified")
+    sums = {}
+    for line in files["SHA256SUMS"].read_text().splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            sums[parts[1].lstrip("*")] = parts[0].lower()
+    for name, path in files.items():
+        if name == "SHA256SUMS":
+            continue
+        if name not in sums:
+            raise IntegrityError(f"SHA256SUMS has no entry for {name}: refusing to install it unverified")
+        if sums[name] != _sha256(path):
+            raise IntegrityError(f"checksum mismatch for {name}: the download is corrupt or was altered")
+
+
+class UnpinnedReleaseError(IntegrityError):
+    """The release ships no locked requirements file: its dependencies would be whatever PyPI has today."""
+
+
+#: The release asset with the runtime dependencies exported from core/uv.lock, with hashes (``k3code-<ver>-...``).
+REQUIREMENTS_SUFFIX = "-requirements.txt"
+
+
+def install_release(rel: Release, token: str | None, uv: str | None = None, *, allow_unpinned: bool = False) -> Path:
     """Download + verify the release assets and build ``versions/<ver>`` (not yet activated).
+
+    The dependencies come from the release's hashed requirements file (the set CI tested, from core/uv.lock), the
+    wheel itself with ``--no-deps``: installing the wheel alone resolved the newest PyPI versions of everything. A
+    release without that file is refused unless ``allow_unpinned``.
 
     Never touches a version that is installed and complete, nor the current or previous one: ``/update now`` used
     to rmtree ``versions/<ver>`` even when it was the live install, deleting the running k3code.
     """
-    uv = uv or shutil.which("uv") or str(Path.home() / ".local" / "bin" / "uv")
+    uv = uv or uv_path()
     vdir = versions_dir() / rel.version
     if vdir.exists():
         if (vdir / ".complete").is_file():
@@ -315,6 +445,12 @@ def install_release(rel: Release, token: str | None, uv: str | None = None) -> P
         if rel.version in (current_version(), previous_version()):
             raise ValueError(f"refusing to rebuild {rel.version}: it is the active or the previous version")
         shutil.rmtree(vdir)  # an interrupted earlier download
+    if not allow_unpinned and not any(n.endswith(REQUIREMENTS_SUFFIX) for n in rel.assets):
+        raise UnpinnedReleaseError(
+            f"release {rel.version} has no locked requirements file (k3code-{rel.version}{REQUIREMENTS_SUFFIX}), so "
+            "its dependencies would be resolved from PyPI as they are today rather than the set it was tested "
+            "with. Run `k3code update --allow-unpinned` to install it anyway"
+        )
     # Build in place: venvs are not relocatable (absolute shebangs). `.complete` is written last.
     vdir.mkdir(parents=True)
     try:
@@ -324,21 +460,19 @@ def install_release(rel: Release, token: str | None, uv: str | None = None) -> P
         for name, url in rel.assets.items():
             files[name] = dl / name
             _download(url, files[name], token)
-        sums = {}
-        if "SHA256SUMS" in files:
-            for line in files["SHA256SUMS"].read_text().splitlines():
-                parts = line.split()
-                if len(parts) == 2:
-                    sums[parts[1].lstrip("*")] = parts[0]
-        for name, path in files.items():
-            if name != "SHA256SUMS" and sums.get(name) and sums[name] != _sha256(path):
-                raise ValueError(f"checksum mismatch for {name}")
+        verify_checksums(files)
         wheel = next((p for n, p in files.items() if n.endswith(".whl")), None)
         if wheel is None:
             raise ValueError("release has no wheel")
         subprocess.run([uv, "venv", "--python", ">=3.12", str(vdir / "venv")], check=True, capture_output=True)
         py = str(vdir / "venv" / "bin" / "python")
-        subprocess.run([uv, "pip", "install", "--python", py, str(wheel)], check=True, capture_output=True)
+        reqs = next((p for n, p in files.items() if n.endswith(REQUIREMENTS_SUFFIX)), None)
+        if reqs is None:  # allow_unpinned: an older release, resolved as before
+            subprocess.run([uv, "pip", "install", "--python", py, str(wheel)], check=True, capture_output=True)
+        else:
+            pip = [uv, "pip", "install", "--python", py]
+            subprocess.run([*pip, "--require-hashes", "-r", str(reqs)], check=True, capture_output=True)
+            subprocess.run([*pip, "--no-deps", str(wheel)], check=True, capture_output=True)
         tui = next((p for n, p in files.items() if n.startswith("k3code-tui") and n.endswith(".tar.gz")), None)
         if tui:
             (vdir / "tui").mkdir()
