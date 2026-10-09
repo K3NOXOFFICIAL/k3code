@@ -7,21 +7,17 @@ import type { SubagentProgress } from "../types.js";
 import { buildStripRows, sessionRow } from "./agentStrip.js";
 import type { StripRow, StripState } from "./agentStripStore.js";
 
-export type ViewGroup = "finished" | "idle" | "input" | "past" | "working";
+export type ViewGroup = "completed" | "input" | "working";
 
 export const VIEW_GROUPS: readonly ViewGroup[] = [
   "input",
   "working",
-  "idle",
-  "finished",
-  "past",
+  "completed",
 ];
 
 export const VIEW_GROUP_LABEL: Record<ViewGroup, string> = {
-  finished: "Completed / failed",
-  idle: "Idle",
+  completed: "Completed",
   input: "Needs input",
-  past: "Earlier sessions",
   working: "Working",
 };
 
@@ -36,14 +32,9 @@ export interface ViewRow extends Omit<StripRow, "kind"> {
 /** `session.list` row. The k3code gateway adds `cwd` (null when unknown); the generated Hermes contract lacks it. */
 export type PastSessionRow = SessionListRow & { cwd?: null | string };
 
+/** Idle, done and failed all land in Completed; each row keeps its own glyph. */
 const groupOf = (state: StripState): ViewGroup =>
-  state === "input"
-    ? "input"
-    : state === "working"
-      ? "working"
-      : state === "idle"
-        ? "idle"
-        : "finished";
+  state === "input" ? "input" : state === "working" ? "working" : "completed";
 
 /**
  * A session that has not had a turn yet: nothing ran, so "completed" would be a lie. Only a known zero counts; an
@@ -107,7 +98,7 @@ export function buildViewRows({
       activity: h.preview?.trim() ?? "",
       current: false,
       elapsedSeconds: null,
-      group: "past",
+      group: "completed",
       id: h.id,
       key: `past:${h.id}`,
       kind: "past",
@@ -116,9 +107,11 @@ export function buildViewRows({
       title: h.title?.trim() || h.preview?.trim() || h.id.slice(0, 8),
     }));
 
-  return VIEW_GROUPS.flatMap((g) =>
-    g === "past" ? pastRows : liveRows.filter((r) => r.group === g),
-  );
+  // Earlier sessions close the Completed group, after the live rows.
+  return [
+    ...VIEW_GROUPS.flatMap((g) => liveRows.filter((r) => r.group === g)),
+    ...pastRows,
+  ];
 }
 
 export interface ViewNav {
@@ -141,6 +134,7 @@ export type ViewKey = {
   pageDown?: boolean;
   pageUp?: boolean;
   return?: boolean;
+  right?: boolean;
   up?: boolean;
 };
 
@@ -183,8 +177,9 @@ export function reduceViewKey(
     effect,
     nav: { confirmKey: null, index, ...next },
   });
-  // A pending confirmation eats the next key and is cleared. Only y/⏎ on a target still listed stops; when the row has
-  // gone (stopped elsewhere, list refreshed) the key does nothing, so ⏎ cannot attach to whatever row moved under it.
+  // A pending confirmation eats the next key and is cleared. Only y/⏎ on a target still listed stops (→ cancels like any
+  // other key); when the row has gone (stopped elsewhere, list refreshed) the key does nothing, so ⏎ cannot attach to
+  // whatever row moved under it.
   if (nav.confirmKey) {
     const target = rows.find((r) => r.key === nav.confirmKey);
 
@@ -237,7 +232,7 @@ export function reduceViewKey(
 
   const row = rows[index]!;
 
-  if (key.return) {
+  if (key.return || key.right) {
     return done(row.current ? { type: "close" } : { row, type: "activate" });
   }
 

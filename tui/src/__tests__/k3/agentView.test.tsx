@@ -73,11 +73,11 @@ const mixed = (): ViewRow[] => [
   row(1, { group: "input", state: "input", title: "asks a question" }),
   row(2, { current: true, model: "model-a", title: "this one" }),
   row(3, { key: "agent:id3", kind: "agent", title: "helper agent" }),
-  row(4, { group: "finished", state: "done", title: "shipped" }),
-  row(5, { group: "finished", state: "failed", title: "broke" }),
+  row(4, { group: "completed", state: "done", title: "shipped" }),
+  row(5, { group: "completed", state: "failed", title: "broke" }),
   row(6, {
     elapsedSeconds: null,
-    group: "past",
+    group: "completed",
     key: "past:id6",
     kind: "past",
     lastActive: Date.now() / 1000 - 3 * DAY,
@@ -87,7 +87,7 @@ const mixed = (): ViewRow[] => [
 ];
 
 describe("AgentViewView", () => {
-  it("groups rows under headers with the strip's glyphs and counts", () => {
+  it("groups rows under the three headers with the strip's glyphs and counts, past rows last", () => {
     const out = dump(mixed(), {}, { confirmKey: null, index: 1 });
 
     console.log(`\n--- agent view dump ---\n${out}\n-----------------------`);
@@ -95,9 +95,10 @@ describe("AgentViewView", () => {
     const lines = out.split("\n");
 
     expect(lines[0]).toContain("Agents");
-    expect(lines[0]).toContain(
-      "1 need input · 2 working · 2 finished · 1 earlier",
-    );
+    expect(lines[0]).toContain("1 need input · 2 working · 3 completed");
+    expect(lines.filter((l) => l === "Completed")).toHaveLength(1);
+    expect(out).not.toContain("Earlier sessions");
+    expect(out).not.toContain("Idle");
 
     const order = [
       "Needs input",
@@ -105,10 +106,9 @@ describe("AgentViewView", () => {
       "Working",
       "◐ this one (this session)",
       "◐ helper agent",
-      "Completed / failed",
+      "Completed",
       "✓ shipped",
       "✗ broke",
-      "Earlier sessions",
       "· older work",
     ].map((s) => out.indexOf(s));
 
@@ -119,33 +119,34 @@ describe("AgentViewView", () => {
     expect(out).toContain("model-a");
     expect(out).toMatch(/› ◐ this one/);
     expect(lines.at(-1)).toBe(AGENT_VIEW_HINT);
-    expect(out).toContain("↑↓ select · ⏎ attach · x stop · n new · ← back");
+    expect(out).toContain(
+      "↑↓ select · →/⏎ attach · x stop · n new · ←/esc back",
+    );
   });
 
-  it("shows a session with no turn yet as idle, not completed, between working and finished", () => {
+  it("shows a session with no turn yet as idle (○) inside Completed, not as completed (✓)", () => {
     const out = dump([
       row(1, { title: "busy" }),
       row(2, {
         current: true,
         elapsedSeconds: null,
-        group: "idle",
+        group: "completed",
         state: "idle",
         title: "Session",
       }),
-      row(3, { group: "finished", state: "done", title: "shipped" }),
+      row(3, { group: "completed", state: "done", title: "shipped" }),
     ]);
     const lines = out.split("\n");
 
-    expect(lines[0]).toContain("1 working · 1 idle · 1 finished");
+    expect(lines[0]).toContain("1 working · 2 completed");
     expect(out).toMatch(/○ Session \(this session\)\s+idle\s*$/m);
     expect(out).not.toMatch(/Session \(this session\)\s+completed/);
 
     const order = [
       "Working",
       "◐ busy",
-      "Idle",
+      "Completed",
       "○ Session",
-      "Completed / failed",
       "✓ shipped",
     ].map((s) => out.indexOf(s));
 
@@ -158,7 +159,7 @@ describe("AgentViewView", () => {
 
     expect(out).toContain("Working");
     expect(out).not.toContain("Needs input");
-    expect(out).not.toContain("Earlier sessions");
+    expect(out).not.toContain("Completed");
   });
 
   it("shows the stop confirmation on its row", () => {
@@ -215,6 +216,80 @@ describe("AgentViewView", () => {
 });
 
 describe("AgentViewPane", () => {
+  it("opens on this session's row; → closes there and attaches elsewhere", async () => {
+    resetUiState();
+    patchUiState({ sid: "cur" });
+    // alpha (needs input) is listed above this session, so the first row is not the current one.
+    $stripSessions.set([
+      { id: "a", status: "waiting", title: "alpha" },
+      { current: true, id: "cur", status: "working", title: "this one" },
+    ]);
+
+    const onActivate = vi.fn();
+    const onClose = vi.fn();
+    const stdout = Object.assign(new PassThrough(), {
+      columns: 90,
+      isTTY: false,
+      rows: 30,
+    });
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      ref: () => {},
+      setRawMode: () => {},
+      unref: () => {},
+    });
+    let output = "";
+
+    stdout.on("data", (c) => {
+      output += stripAnsi(c.toString());
+    });
+
+    const view = renderSync(
+      <AgentViewPane
+        gw={
+          {
+            request: () => Promise.resolve({ sessions: [] }),
+          } as unknown as GatewayClient
+        }
+        onActivate={onActivate}
+        onClose={onClose}
+        onNew={() => {}}
+        onStop={() => {}}
+      />,
+      {
+        patchConsole: false,
+        stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: stdout as unknown as NodeJS.WriteStream,
+      },
+    );
+
+    try {
+      await waitFor(() =>
+        expect(output).toContain("› ◐ this one (this session)"),
+      );
+      expect(output).not.toContain("› ● alpha");
+      expect(output).toContain(AGENT_VIEW_HINT);
+
+      stdin.write("\x1b[C"); // → on this session
+      await waitFor(() => expect(onClose).toHaveBeenCalled());
+      expect(onActivate).not.toHaveBeenCalled();
+
+      output = "";
+      stdin.write("\x1b[A"); // ↑ onto alpha
+      await waitFor(() => expect(output).toContain("› ● alpha"));
+      stdin.write("\x1b[C");
+      await waitFor(() => expect(onActivate).toHaveBeenCalled());
+      expect(onActivate.mock.calls[0]![0]).toMatchObject({ id: "a" });
+      expect(onClose).toHaveBeenCalledTimes(1);
+    } finally {
+      view.unmount();
+      view.cleanup();
+      $stripSessions.set([]);
+      resetUiState();
+    }
+  });
+
   it("keeps the selection on its row when a poll inserts or reorders rows above it", async () => {
     resetUiState();
     patchUiState({ sid: "cur" });
