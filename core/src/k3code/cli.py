@@ -1114,6 +1114,9 @@ def update_cmd(
             ver = upd.update_from_source(src, pull=not no_pull)
         except upd.SourceUpdateError as e:
             raise click.ClickException(str(e)) from e
+        if ver == cur:  # the checkout builds the version that is already active
+            click.echo(f"Already up to date ({ver}).")
+            return
     else:
         assert rel is not None
         click.echo(f"current: {cur}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")

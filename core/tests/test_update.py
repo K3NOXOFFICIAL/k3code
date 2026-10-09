@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -176,8 +177,32 @@ def test_apply_detached_runs_outside_the_service_unit(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(upd.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(upd.subprocess, "run", lambda argv, **k: seen.append(list(argv)) or R())
-    msg = upd.apply_detached()
+    msg = upd.apply_detached(unit_installed=lambda: True)
     assert seen and seen[0][:3] == ["/usr/bin/systemd-run", "--user", "--collect"]
     assert seen[0][-2:] == ["update", "--yes"] and "background" in msg
     monkeypatch.setattr(upd.shutil, "which", lambda name: None if name == "systemd-run" else "/x/k3code")
-    assert "systemd-run is not available" in upd.apply_detached()
+    assert "systemd-run is not available" in upd.apply_detached(unit_installed=lambda: True)
+
+
+def test_apply_detached_without_a_unit_needs_no_systemd(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """macOS and WSL without systemd have no systemd-run: `/update now` used to answer "run it from a terminal".
+    With no service unit there is nothing to restart, so the update runs as a detached process, logged to a file."""
+    import time
+
+    out = data / "ran.txt"
+    exe = data / "k3code"
+    sid = data / "sid.txt"  # its own session: closing the terminal (SIGHUP to the session) does not stop it
+    exe.write_text(
+        f'#!/bin/sh\nps -o sid= -p $$ > {sid}\necho "$@ sock=${{K3CODE_GATEWAY_SOCKET:-none}}" > {out}\necho updating\n'
+    )
+    exe.chmod(0o755)
+    monkeypatch.setenv("K3CODE_GATEWAY_SOCKET", "/run/secret.sock")
+    monkeypatch.setattr(upd.shutil, "which", lambda name: str(exe) if name == "k3code" else None)
+    msg = upd.apply_detached(unit_installed=lambda: False)
+    assert "background" in msg and str(upd.update_log_path()) in msg
+    deadline = time.monotonic() + 10
+    while not (out.exists() and "updating" in upd.update_log_path().read_text()) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert out.read_text().strip() == "update --yes sock=none"  # the daemon's socket is never handed to the child
+    assert "updating" in upd.update_log_path().read_text()
+    assert int(sid.read_text()) != os.getsid(0)

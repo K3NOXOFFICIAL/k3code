@@ -9,7 +9,8 @@ they cost no CI minutes:
 | `scripts/ci/merge-pr.sh N` | waiting for the checks, then pressing merge | merges `Main` into the PR, runs the full check, pushes, posts `local-ci`, merges |
 | `scripts/release/release.sh VER` | `release.yml` | checks, builds the assets, tags, publishes the GitHub release |
 
-`installer.yml` (macOS and Windows runners) has no local equivalent; see [macOS and Windows](#macos-and-windows).
+`installer.yml` (macOS and Windows runners) is replaced, as far as Linux can, by `scripts/ci/platforms.sh`; see
+[macOS and Windows](#macos-and-windows).
 
 ## One-time repository settings (owner)
 
@@ -103,17 +104,25 @@ them against `SHA256SUMS` and picks the files by these names. `core/tests/test_l
 
 ## macOS and Windows
 
-The macOS and Windows installer jobs ran on GitHub's paid runners and have no local equivalent:
+The macOS and Windows installer jobs ran on GitHub's paid runners. `scripts/ci/platforms.sh` covers what can run on a
+Linux machine with podman or docker:
 
-- **macOS:** run `cd core && uv run pytest -q tests/test_installer.py` on a Mac before a release that changes
-  `install/`.
-- **Windows:** on Linux, PowerShell 7 (`pwsh`) can at least parse the scripts:
+```sh
+scripts/ci/platforms.sh                 # ubuntu, debian, alpine and wsl; core only (about five minutes)
+scripts/ci/platforms.sh --full ubuntu   # also builds the TUI and the k3 binary
+```
 
-  ```sh
-  for f in install/install.ps1 install/uninstall.ps1; do
-    pwsh -NoProfile -Command "\$e = \$null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path '$f'), [ref]\$null, [ref]\$e); if (\$e) { \$e | Out-String | Write-Error; exit 1 }"
-  done
-  ```
+Each target installs a clone of `HEAD` as a normal user in a clean container, commits on top, runs `k3code update`,
+checks that the version switched and that a second update is a no-op, rolls back and uninstalls. `ubuntu` is the
+distribution `wsl --install` sets up, `debian` runs the installer under dash and `alpine` under BusyBox on musl. `wsl`
+runs `install.ps1` and `uninstall.ps1` with PowerShell 7 (`pwsh`) against a `wsl.exe` stand-in that behaves like the
+WSL Windows 10 ships with (no `--cd`) and runs each command in an Ubuntu container, on a checkout that belongs to
+another user, as a clone made by Windows git can when WSL sees it; it updates with `k3code update --from-source`.
+Run it before a release and after a change to `install/`, `update.py` or `service.py`.
 
-  The real check (Windows PowerShell 5.1, `install.ps1 -Help`, an install under WSL) is a manual run on a Windows
-  machine.
+Still manual:
+
+- **macOS:** run `cd core && uv run pytest -q tests/test_installer.py`, then `sh install/install.sh` and
+  `k3code update` on a Mac before a release that changes `install/`.
+- **Windows:** `pwsh` is not Windows PowerShell 5.1, and the stand-in is not WSL. Before a release that changes
+  `install/*.ps1`, run `install.ps1 -Help`, an install and `k3code update` from PowerShell 5.1 on a Windows machine.
