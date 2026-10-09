@@ -2,12 +2,16 @@ import { atom } from "nanostores";
 
 export type ProposalKind =
   | "also_setup"
+  | "commands"
   | "consequence"
+  | "hook"
   | "improvement"
+  | "mcp"
   | "optimizer"
   | "permission_rule"
   | "preference"
   | "project_setup"
+  | "rule"
   | "skill";
 
 export interface Proposal {
@@ -75,12 +79,16 @@ export const clearProposals = () => $proposals.set([]);
 
 export const GLYPH: Record<ProposalKind, string> = {
   also_setup: "＋",
+  commands: "▶",
   consequence: "⚠",
+  hook: "↪",
   improvement: "↑",
+  mcp: "🔌",
   optimizer: "⚙",
   permission_rule: "🔑",
   preference: "♥",
   project_setup: "📁",
+  rule: "✓",
   skill: "✦",
 };
 

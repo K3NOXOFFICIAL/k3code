@@ -68,6 +68,23 @@ def test_accept_writes_rule_to_project_or_user_config(tmp_path, monkeypatch):
     assert rules[0].pattern == "cargo test *"
 
 
+def test_rule_accepted_from_a_project_recipe_is_not_proposed_again(tmp_path, monkeypatch):
+    from k3code.learning import recipes
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    log = DecisionLog(tmp_path)
+    approve(log, "uv run pytest", n=3, cwd=str(proj))
+    (c,) = permrules.mine(log, cwd=str(proj))
+    assert c.pattern == "uv run pytest"
+    recipes.apply(
+        {"type": "rule", "root": str(proj), "rules": [{"tool": "bash", "pattern": "uv run pytest", "action": "allow"}]}
+    )
+    assert permrules.mine(log, cwd=str(proj)) == []
+    assert not (proj / ".k3code").exists()  # the recipe rule lives under K3CODE_HOME, not in the repo
+
+
 def test_dismiss_latches(tmp_path):
     log = DecisionLog(tmp_path)
     approve(log, "npm test *", n=3)
@@ -82,15 +99,27 @@ def test_dismiss_latches(tmp_path):
 def test_auto_do_for_always_approved_high_risk_plans(tmp_path, monkeypatch):
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
     log = DecisionLog(tmp_path)
-    for _ in range(3):
-        log.record("plan", subject="confirm", choice="approved", detail={"risk": "high"})
+    # 10 approvals in one project (3 used to be enough, and the answer applied to every project)
+    for i in range(10):
+        if i == 3:
+            assert not [c for c in permrules.mine(log) if c.auto_do]
+        log.record("plan", subject="confirm", choice="approved", detail={"risk": "high"}, project="git:myapp")
     (c,) = [c for c in permrules.mine(log) if c.auto_do]
-    assert "automatically in auto mode" in c.text()
+    assert "automatically in auto mode" in c.text() and c.scope == "project" and c.project == "git:myapp"
     store = ProposalStore(tmp_path)
     (p,) = permrules.to_proposals([c], store)
     permrules.apply(p.payload)
     from k3code.confio import read_yaml
 
-    assert read_yaml(tmp_path / "home" / "config.yaml")["autonomy"]["auto_do_plans"] is True
-    log.record("plan", subject="confirm", choice="rejected", detail={"risk": "high"})
+    autonomy = read_yaml(tmp_path / "home" / "config.yaml")["autonomy"]
+    assert autonomy["auto_do_projects"] == ["git:myapp"] and "auto_do_plans" not in autonomy
+    assert permrules.auto_do_allowed(autonomy, "git:myapp") and not permrules.auto_do_allowed(autonomy, "git:other")
+    log.record("plan", subject="confirm", choice="rejected", detail={"risk": "high"}, project="git:myapp")
     assert not [c for c in permrules.mine(log) if c.auto_do]
+
+
+def test_auto_do_needs_ten_approvals_in_the_same_project(tmp_path):
+    log = DecisionLog(tmp_path)
+    for i in range(12):
+        log.record("plan", subject="confirm", choice="approved", detail={"risk": "high"}, project=f"git:p{i % 2}")
+    assert not [c for c in permrules.mine(log) if c.auto_do]  # 6 + 6 across two projects is not 10 in one

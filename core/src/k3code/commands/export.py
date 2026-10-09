@@ -22,6 +22,7 @@ def run_export(
     current: str | None = None,
     settings_only: bool = False,
     session_only: bool = False,
+    config: Any = None,
 ) -> tuple[Path, dict[str, Any]]:
     if all_sessions:
         ids = [s.session_id for s in store.list(limit=100_000)]
@@ -36,7 +37,7 @@ def run_export(
     out = Path(path).expanduser() if path else cwd / f"k3code-export-{time.strftime('%Y%m%d-%H%M%S')}.k3bundle"
     if not out.is_absolute():
         out = cwd / out
-    manifest = write_bundle(out, store=store, cwd=cwd, session_ids=ids, settings=not session_only)
+    manifest = write_bundle(out, store=store, cwd=cwd, session_ids=ids, settings=not session_only, config=config)
     return out, manifest
 
 
@@ -64,6 +65,7 @@ class ExportCommand(CommandDef):
                 current=session_id,
                 settings_only=settings_only,
                 session_only=session_only,
+                config=ctx.config,
             )
         except BundleError as e:
             return reply(f"Export failed: {e}")

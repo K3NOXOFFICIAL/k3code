@@ -12,11 +12,14 @@ from typing import Any
 
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning import distiller
-from k3code.learning.decisions import scrub
+from k3code.memory import MAX_FACT_CHARS as MAX_FACT_CHARS  # the cap lives in memory, which re-applies it on read
+from k3code.memory import clean_fact
 from k3code.paths import home
 from k3code.providers.types import Message
+from k3code.redact import scrub_text
 from k3code.routing.tiers import TaskKind
 
+#: The heading earlier versions wrote into the repo's K3CODE.md/AGENTS.md; facts now go to learned.md (k3code.memory).
 FACTS_HEADING = "## Learned project notes (auto)"
 SYSTEM = (
     "You review a finished coding-agent session. Reply with ONE JSON object: "
@@ -84,15 +87,15 @@ async def review_session(
     except Exception:  # noqa: BLE001
         return {"skipped": True, "facts": [], "drafts": [], "proposals": []}
     data = parse(res.text)
-    facts = [scrub(str(f)).strip() for f in data.get("facts") or [] if str(f).strip()][:5]
-    facts = [f for f in facts if "[redacted]" not in f]
+    facts = [f for f in (clean_fact(str(x)) for x in data.get("facts") or []) if f][:5]
     if facts:
-        from k3code.memory import project_memory_path
+        # The summary can echo fetched web content, so facts never go into the repository's tracked memory file
+        # (that re-injects them as project instructions for everyone): they go to $K3CODE_HOME, and the prompt shows
+        # them fenced as auto-generated notes (k3code.memory).
+        from k3code.memory import read_learned, write_learned
 
-        mem = project_memory_path(cwd, for_write=True)
-        existing = distiller.read_auto_section(mem, FACTS_HEADING)
-        merged = list(dict.fromkeys([*existing, *facts]))[-30:]
-        distiller.write_auto_section(mem, [distiller.Preference(f, 0.6, 1) for f in merged], FACTS_HEADING)
+        merged = list(dict.fromkeys([*read_learned(cwd), *facts]))[-30:]
+        write_learned(cwd, merged)
         # store_mem0 is blocking HTTP (10 s per fact): never on the gateway's event loop
         await asyncio.to_thread(
             distiller.store_mem0,
@@ -108,8 +111,8 @@ async def review_session(
             continue
         if (home() / "skills" / s["name"]).exists():
             continue
-        body = scrub(str(s["body"]))
-        md = write_draft(s["name"], scrub(str(s.get("description", ""))).replace("\n", " "), body)
+        body = scrub_text(str(s["body"]))
+        md = write_draft(s["name"], scrub_text(str(s.get("description", ""))).replace("\n", " "), body)
         drafts.append(str(md))
         label = f"Save skill '{s['name']}'? ({str(s.get('description', ''))[:80]})"
         payload = {"op": "save", "name": s["name"], "draft": str(md)}

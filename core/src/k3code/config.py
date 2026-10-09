@@ -91,6 +91,8 @@ class McpConfig(BaseModel):
 
 class SkillsConfig(BaseModel):
     roots: list[str] = Field(default_factory=list)
+    #: also load ~/.claude/skills; read from the user's config only (skills.import_claude_enabled)
+    import_claude: bool = True
 
 
 class Mem0Config(BaseModel):
@@ -165,7 +167,7 @@ class Settings(BaseModel):
     ultracode: dict[str, Any] = Field(default_factory=dict)
     research: dict[str, Any] = Field(default_factory=dict)
     # Web tools SSRF guard: {allow_private: false}. true lets web_fetch/web_browse reach loopback/private addresses;
-    # the host of research.searxng_url is always allowed. See k3code.net_guard.
+    # the exact origin of research.searxng_url is always allowed. See k3code.net_guard.
     web: dict[str, Any] = Field(default_factory=dict)
     # Context management: {compact_at_ratio: 0.7, compact_at_tokens: <absolute override>, keep_messages: 8}; see
     # GatewayServer._maybe_compact and k3code.context_budget
@@ -177,6 +179,9 @@ class Settings(BaseModel):
     # /artifacts publish: {publish_dir: "" (default <home>/published), publish_url: "" (template, e.g.
     # https://example.com/{name}; nothing is uploaded, the link is only printed)}
     artifacts: dict[str, Any] = Field(default_factory=dict)
+    # User hooks: {PreToolUse: [{matcher, command, timeout}], ...}. Run from the user's config and, once the project
+    # is trusted, the project's: both apply (k3code.userhooks.load reads each file; this merged value is not used).
+    hooks: dict[str, Any] = Field(default_factory=dict)
     # What the daemon prunes at start: {usage_days: 180, journal_days: 30, debug_bundles: 10, decisions_days: 365};
     # see retention()
     retention: dict[str, Any] = Field(default_factory=dict)
@@ -235,7 +240,8 @@ def load_user_section(name: str) -> Any:
 def _merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Shallow merge per top-level key: a key set in ``override`` replaces the whole base value.
 
-    Nested sections and the ``providers`` list are replaced as a whole, never merged.
+    Nested sections and the ``providers`` list are replaced as a whole, never merged (a project config never sets
+    ``providers``: load_config drops it).
     """
     result = base.copy()
     result.update(override)
@@ -271,6 +277,17 @@ def load_config(
             logger.debug("project config %s not applied: not trusted (k3code trust applies it)", project_dir)
         else:
             project_config = yaml.safe_load(text) or {}
+        # Providers come from the user config only: a repo's base_url plus api_key_env would send the user's key to
+        # the repo author's host (trust.describe and doctor say the section is ignored).
+        if isinstance(project_config, dict) and "providers" in project_config:
+            project_config = {k: v for k, v in project_config.items() if k != "providers"}
+            logger.warning(
+                "%s: providers ignored (only the user config can set providers)", trust.config_path(project_dir)
+            )
+        # mem0 likewise: its url plus api_key_env is a second way to send a user key to a foreign host.
+        if isinstance(project_config, dict) and "mem0" in project_config:
+            project_config = {k: v for k, v in project_config.items() if k != "mem0"}
+            logger.warning("%s: mem0 ignored (only the user config can set mem0)", trust.config_path(project_dir))
 
     # 4. Environment variables (only scalar top-level keys that exist in Settings; an empty value counts as unset)
     env_overrides: dict[str, Any] = {}

@@ -799,6 +799,8 @@ build_panes() {
 # The installed core is a regular copy (it must not depend on a checkout that can be switched or deleted).
 # Its runtime dependencies are the locked set from core/uv.lock without the dev group, so the install is the
 # set CI tested. --locked fails on a stale lock (a missing dependency) instead of installing the stale set.
+# The export keeps the lock's hashes and --require-hashes installs only files that match them (every uv with
+# `export` writes them).
 # A checkout without a lock file (an older tag) resolves the dependencies as before.
 install_core_copy() {
   if [ ! -f "$SRC_ROOT/core/uv.lock" ]; then
@@ -807,9 +809,9 @@ install_core_copy() {
     return 0
   fi
   REQS=$(mktemp "${TMPDIR:-/tmp}/k3code-reqs.XXXXXX")
-  "$UV" export --quiet --project "$SRC_ROOT/core" --locked --no-dev --no-hashes --no-emit-project -o "$REQS" >/dev/null ||
+  "$UV" export --quiet --project "$SRC_ROOT/core" --locked --no-dev --no-emit-project -o "$REQS" >/dev/null ||
     die "could not export the locked runtime dependencies (core/uv.lock is stale?): run 'uv lock' in core/"
-  "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" -r "$REQS" >&2
+  "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" --require-hashes -r "$REQS" >&2
   "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" --no-deps "$SRC_ROOT/core" >&2
   rm -f "$REQS"
   REQS=""

@@ -5,9 +5,28 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+#: Environment variables that point a process at the daemon's socket. Never passed to a child process: only an
+#: authenticated client (k3code.gateway.auth) may drive the daemon.
+GATEWAY_ENV_VARS = ("K3CODE_GATEWAY_SOCKET", "HERMES_TUI_GATEWAY_URL")
+
 
 def home() -> Path:
     return Path(os.environ.get("K3CODE_HOME", str(Path.home() / ".k3code"))).expanduser()
+
+
+def project_key(root: str | Path) -> str:
+    """The ``$K3CODE_HOME/projects/<key>`` name of a project: its path with separators flattened.
+
+    The same key as the TUI's ``projectHistoryKey`` (tui/src/lib/history.ts), so both sides share one directory.
+    """
+    import re
+
+    return re.sub(r"[/:\\]+", "_", str(root)) or "default"
+
+
+def project_state_dir(root: str | Path) -> Path:
+    """Per-project state k3code keeps outside the repository (input history, learned notes)."""
+    return home() / "projects" / project_key(root)
 
 
 def user_config_path() -> Path:

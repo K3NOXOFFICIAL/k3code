@@ -8,7 +8,7 @@ import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from k3code import service
 from k3code.gateway.sessions import SessionStore
@@ -18,6 +18,9 @@ from k3code.permissions.hardline import HARDLINE_NAMES
 from k3code.setup import detect, probe
 from k3code.setup.prompter import Prompter
 from k3code.setup.state import env_file_path, read_env_file, set_env_var
+
+if TYPE_CHECKING:
+    from k3code.bundle import SensitiveItem
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TIERS = ("main", "strong", "cheap", "fast")
@@ -72,19 +75,26 @@ def step_welcome(c: Ctx) -> dict[str, Any]:
         path = c.p.text("welcome.bundle", "Path to the .k3bundle")
         out["bundle"] = path
         if path:
-            c.say("Imported:\n" + apply_import(path, c.cwd))
+            c.say("Imported:\n" + apply_import(path, c.cwd, accept=lambda item: _accept_item(c.p, item)))
             c.say("Only secrets are missing: they are asked for in the providers step.")
     return out
 
 
-def apply_import(bundle_path: str, cwd: Path) -> str:
-    """Import settings and sessions from a bundle with the existing importer; returns its report."""
+def _accept_item(p: Prompter, item: SensitiveItem) -> bool:
+    """One explicit yes per MCP server, permission rule, provider endpoint or hook in the bundle; the default is no.
+    An answers file says yes with ``welcome.accept.<item key>: true`` (nested: the key's dots are levels)."""
+    return p.confirm(f"welcome.accept.{item.key}", f"{item.text()}\nApply {item.key}?", False)
+
+
+def apply_import(bundle_path: str, cwd: Path, accept: Callable[[SensitiveItem], bool] | None = None) -> str:
+    """Import settings and sessions from a bundle with the existing importer; returns its report. Sensitive user
+    settings are applied only where ``accept`` says yes (see k3code.bundle.sensitive_items)."""
     from k3code.bundle import apply_bundle, read_bundle
 
     bundle = read_bundle(Path(bundle_path).expanduser())
     store = SessionStore(home() / "sessions.db")
     try:
-        return apply_bundle(bundle, store=store, cwd=cwd).describe()
+        return apply_bundle(bundle, store=store, cwd=cwd, accept=accept).describe()
     finally:
         store.close()
 
@@ -501,6 +511,48 @@ def step_secrets(c: Ctx) -> dict[str, Any]:
     return {"stored": asked}
 
 
+PROJECT_RECIPE_MODES = ("ask", "accept_all", "none")
+
+
+def offer_project_recipes(p: Prompter, cwd: Path) -> dict[str, Any]:
+    """Scan the project ``cwd`` is in and offer its recipe proposals (k3code.learning.recipes).
+
+    Answers file: ``project_recipes: accept_all | none | ask``; ``ask`` without a terminal means ``none``, and
+    ``none`` scans nothing and creates no proposal (a session still offers them as cards later)."""
+    import asyncio
+
+    from k3code.autonomy.proposals import ProposalStore
+    from k3code.learning import projectprep, projectstate, recipes
+    from k3code.paths import home
+
+    mode = str(p.raw("project_recipes", "ask") or "ask")
+    if mode not in PROJECT_RECIPE_MODES:
+        raise ValueError(f"project_recipes must be one of: {', '.join(PROJECT_RECIPE_MODES)} (got {mode!r})")
+    if mode == "ask" and not p.interactive:
+        mode = "none"
+    if mode == "none":
+        return {"recipes": "none", "accepted": []}
+    root = projectstate.project_root(cwd)
+    store = ProposalStore(home())
+    asyncio.run(projectprep.prepare(root, store=store))
+    found = projectstate.load(root).get("stacks") or []
+    if not found:
+        return {"recipes": mode, "accepted": []}
+    p.say(f"Project {root}: " + ", ".join(recipes.label(s) for s in found))
+    accepted: list[str] = []
+    for prop in projectprep.pending_recipes(store, root):
+        if mode == "ask" and not p.confirm(f"project_recipes.{prop.id}", f"{prop.text} Apply now?", False):
+            continue  # stays pending: offered again as a card in a session
+        store.set_status(prop.id, "accepted")
+        p.say(f"  {recipes.apply(prop.payload)}")
+        accepted.append(prop.id)
+    return {"recipes": mode, "accepted": accepted}
+
+
+def step_project(c: Ctx) -> dict[str, Any]:
+    return offer_project_recipes(c.p, c.cwd)
+
+
 @dataclass
 class Step:
     name: str
@@ -520,6 +572,7 @@ STEPS: list[Step] = [
     Step("theme", step_theme, "Theme and UI"),
     Step("service", step_service, "24/7 service"),
     Step("tour", step_tour, "Keymap tour"),
+    Step("project", step_project, "This project"),
     Step("summary", step_summary, "Summary"),
 ]
 STEP_NAMES = [s.name for s in STEPS]

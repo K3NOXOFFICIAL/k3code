@@ -109,11 +109,14 @@ async def _run_headless(
     json_output: bool,
     session: str = "headless",
     resume: bool = False,
+    project_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     """Run headless mode and return final result dict."""
+    from k3code import userhooks
     from k3code.agent.loop import AgentLoop
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
+    from k3code.memory import fenced
     from k3code.prompting import build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
@@ -147,6 +150,7 @@ async def _run_headless(
         session=session,
     )
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
+    loop.hooks = userhooks.load(project_dir or Path.cwd(), session)  # the directory the trust check keys on
 
     final_text = ""
     tool_results = usage.tools
@@ -172,10 +176,23 @@ async def _run_headless(
 
     try:
         await reliability.start()
+        run_prompt = prompt
+        if loop.hooks:
+            started = await loop.hooks.run("SessionStart", {"source": "resume" if resume else "startup"})
+            submitted = await loop.hooks.run("UserPromptSubmit", {"prompt": prompt})
+            if submitted.blocked:
+                return {
+                    "error": "prompt_blocked",
+                    "message": f"Prompt blocked by a UserPromptSubmit hook: {submitted.reason}",
+                }
+            if extra := "\n".join(c for c in (started.context_text(), submitted.context_text()) if c):
+                run_prompt = f"{prompt}\n\n" + fenced("context from the user's hooks:", extra)
         async for event in loop.run(
-            prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume
+            run_prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume
         ):
             usage.on_stream_event(event)
+        if loop.hooks:
+            await loop.hooks.run("Stop", {"stop_hook_active": False})
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
         return {"error": "all_providers_unreachable", "message": str(e), "attempts": e.attempts}
@@ -281,11 +298,14 @@ async def _run_repl(
     model: str | None,
     permission_mode: PermissionMode,
     config: Any,
+    project_dir: Path | None = None,
 ) -> None:
     """Run minimal REPL."""
+    from k3code import userhooks
     from k3code.agent.loop import AgentLoop
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
+    from k3code.memory import fenced
     from k3code.prompting import build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
@@ -327,6 +347,8 @@ async def _run_repl(
         reliability=reliability,
     )
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
+    loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
+    hooks_started = False
 
     print("k3code REPL (type /exit to quit, /model <name> to switch, /stop to cancel a stuck turn)")
     print(f"Permission mode: {permission_mode.value}")
@@ -380,8 +402,23 @@ async def _run_repl(
         loop.on_text_reset = on_text_reset
 
         try:
-            async for _ in loop.run(user_input, max_tokens=config.max_tokens, temperature=config.temperature):
+            run_input = user_input
+            if loop.hooks:
+                extra_parts: list[str] = []
+                if not hooks_started:
+                    hooks_started = True
+                    extra_parts.append((await loop.hooks.run("SessionStart", {"source": "startup"})).context_text())
+                submitted = await loop.hooks.run("UserPromptSubmit", {"prompt": user_input})
+                if submitted.blocked:
+                    print(f"[Blocked] Prompt blocked by a UserPromptSubmit hook: {submitted.reason}")
+                    continue
+                extra_parts.append(submitted.context_text())
+                if extra := "\n".join(c for c in extra_parts if c):
+                    run_input = f"{user_input}\n\n" + fenced("context from the user's hooks:", extra)
+            async for _ in loop.run(run_input, max_tokens=config.max_tokens, temperature=config.temperature):
                 pass
+            if loop.hooks:
+                await loop.hooks.run("Stop", {"stop_hook_active": False})
             print()  # newline after streaming
         except AllProvidersUnreachable as e:
             print(f"\n[Error] All providers unreachable: {e}")
@@ -472,9 +509,7 @@ def main(
         _offer_project_trust(project_dir)
     config = load_config(project_dir=project_dir)
     if trust.decision(project_dir) in (trust.UNDECIDED, trust.DECLINED):
-        click.echo(
-            f"k3code: ignoring {trust.config_path(project_dir)} (not trusted; `k3code trust` applies it)", err=True
-        )
+        click.echo(f"k3code: ignoring {trust.subject(project_dir)} (not trusted; `k3code trust` applies it)", err=True)
     if not config.providers and (prompt or not _is_interactive()):
         from k3code.setup.onboard import NO_CONFIG_HINT
 
@@ -500,6 +535,7 @@ def main(
                 json_output=json_output,
                 session=session,
                 resume=resume,
+                project_dir=project_dir,
             )
         )
         if json_output and result:
@@ -512,7 +548,7 @@ def main(
         sys.exit(0 if result and "error" not in result else 1)
     elif repl or not _is_interactive():
         with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(_run_repl(model=model, permission_mode=permission_mode, config=config))
+            asyncio.run(_run_repl(model=model, permission_mode=permission_mode, config=config, project_dir=project_dir))
     else:
         if model and (err := _use_model_key(config, model)):
             raise click.ClickException(err)
@@ -532,7 +568,7 @@ def _offer_project_trust(project_dir: Path) -> None:
     if (why := trust.problem(project_dir)) is not None:
         click.echo(f"{trust.config_path(project_dir)} is ignored: {why}.", err=True)
         return
-    click.echo(f"{trust.config_path(project_dir)} changes how k3code runs in this project:", err=True)
+    click.echo(f"{trust.subject(project_dir)} changes how k3code runs in this project:", err=True)
     for line in trust.summary(project_dir) or []:
         click.echo(f"  - {line}", err=True)
     answer = click.confirm("Trust this project config?", default=False, err=True)
@@ -598,6 +634,7 @@ def _launch_tui(
                     permission_mode=permission_mode
                     or _permission_from_config("permission_mode", config.permission_mode),
                     config=config,
+                    project_dir=project_dir,
                 )
             )
         return
@@ -778,7 +815,10 @@ def service_group() -> None:
 def service_install(dry_run: bool) -> None:
     from k3code import service
 
-    click.echo("\n".join(service.install(dry_run=dry_run)))
+    try:
+        click.echo("\n".join(service.install(dry_run=dry_run)))
+    except service.ServiceError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @service_group.command("uninstall")
@@ -873,8 +913,17 @@ def export_cmd(
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation (headless)")
 @click.option("--settings-only", is_flag=True)
 @click.option("--session-only", is_flag=True)
-def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool) -> None:
-    """Import a .k3bundle: merge settings (existing config backed up) and sessions."""
+@click.option(
+    "--trust-bundle",
+    is_flag=True,
+    help="Also apply MCP servers, permission rules, provider endpoints and hooks without asking (--yes does not)",
+)
+def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool, trust_bundle: bool) -> None:
+    """Import a .k3bundle: merge settings (existing config backed up) and sessions.
+
+    MCP servers, permission rules, provider endpoints and hooks are asked for one by one in a terminal; without one
+    (and without --trust-bundle) they are skipped with a warning.
+    """
     from k3code.bundle import BundleError, apply_bundle, read_bundle
     from k3code.gateway.sessions import SessionStore
     from k3code.paths import home
@@ -888,12 +937,25 @@ def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool) -
         click.confirm("Import this bundle? Existing config is backed up first.", abort=True)
     store = SessionStore(home() / "sessions.db")
     try:
-        rep = apply_bundle(bundle, store=store, cwd=Path.cwd(), settings=not session_only, sessions=not settings_only)
+        rep = apply_bundle(
+            bundle,
+            store=store,
+            cwd=Path.cwd(),
+            settings=not session_only,
+            sessions=not settings_only,
+            accept=_confirm_item if _is_interactive() else None,
+            trust_bundle=trust_bundle,
+        )
     except (BundleError, ValueError) as e:
         raise click.ClickException(str(e)) from e
     finally:
         store.close()
     click.echo("Imported.\n" + rep.describe())
+
+
+def _confirm_item(item: Any) -> bool:
+    click.echo(item.text())
+    return click.confirm(f"Apply {item.key}?", default=False)
 
 
 @cli.command("setup")
@@ -951,8 +1013,19 @@ def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
 @click.option("--from-source", is_flag=True, help="git pull the source checkout and rebuild")
 @click.option("--no-pull", is_flag=True, help="With --from-source: rebuild without git pull (you pulled the clone)")
 @click.option("--rollback", "do_rollback", is_flag=True, help="Switch back to the previous version")
+@click.option(
+    "--allow-unpinned",
+    is_flag=True,
+    help="Install a release that ships no locked requirements file (its dependencies resolve from PyPI)",
+)
 def update_cmd(
-    check: bool, yes: bool, channel: str | None, from_source: bool, no_pull: bool, do_rollback: bool
+    check: bool,
+    yes: bool,
+    channel: str | None,
+    from_source: bool,
+    no_pull: bool,
+    do_rollback: bool,
+    allow_unpinned: bool,
 ) -> None:
     """Update to the latest release (smoke-tested, auto-rollback) or roll back.
 
@@ -960,6 +1033,8 @@ def update_cmd(
     built from a checkout (`install.sh --from-source`) updates from that checkout, and an install made with
     `install.sh --from-git` (the default) rebuilds from the newest commit of the branch or tag it was made from
     (`update.url`, default: the GitHub repository `update.repo`)."""
+    import httpx
+
     from k3code import update as upd
 
     if do_rollback:
@@ -973,7 +1048,7 @@ def update_cmd(
     if not from_source:
         denied = ""
         try:
-            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token())
+            rel = upd.fetch_latest(channel or cfg["channel"], cfg["repo"], upd.github_token(), cfg["api"])
         except PermissionError as e:
             denied = str(e)
         except Exception as e:  # noqa: BLE001
@@ -1048,7 +1123,12 @@ def update_cmd(
             return
         if not yes:
             click.confirm(f"Update to {rel.version}?", abort=True)
-        upd.install_release(rel, upd.github_token())
+        try:
+            upd.install_release(rel, upd.github_token(), allow_unpinned=allow_unpinned)
+        except upd.IntegrityError as e:
+            raise click.ClickException(f"update refused: {e}. Nothing was installed.") from e
+        except (OSError, ValueError, httpx.HTTPError, subprocess.CalledProcessError) as e:
+            raise click.ClickException(f"update failed: {e}. Nothing was activated.") from e
         ver = rel.version
     res = upd.activate(ver)
     click.echo(res.message)
@@ -1069,7 +1149,7 @@ def trust_cmd(path: Path | None, revoke: bool) -> None:
     from k3code import trust
 
     project_dir = path or Path.cwd()
-    where = trust.config_path(project_dir)
+    where = trust.subject(project_dir)
     if revoke:
         if trust.revoke(project_dir):
             click.echo(f"trust revoked for {where}: it is ignored until you trust it again")

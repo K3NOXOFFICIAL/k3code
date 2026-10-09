@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from k3code import daemon
+from k3code import daemon, paths
 
 UNIT_NAME = "k3code.service"
 RECOVER_UNIT_NAME = "k3code-recover.service"
@@ -26,8 +26,8 @@ RECOVER_COOLDOWN_S = 1800
 UNIT_TEMPLATE = """\
 [Unit]
 Description=k3code daemon (keeps coding-agent sessions running 24/7)
-After=network-online.target
-Wants=network-online.target
+# No After/Wants=network-online.target: the user manager has no such target; the daemon's netwatch waits for the
+# network itself.
 StartLimitIntervalSec={start_interval}
 StartLimitBurst={start_burst}
 OnFailure={recover_unit}
@@ -42,8 +42,17 @@ WatchdogSec=120
 Nice=5
 IOSchedulingClass=idle
 MemoryHigh=2G
+MemoryMax=4G
+TasksMax=512
+LimitNOFILE=65536
+UMask=0077
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+# Deliberately no ProtectHome/ProtectSystem/PrivateTmp/PrivateNetwork: the daemon runs bubblewrap and the user's tools.
 Environment=K3CODE_LOG_LEVEL=INFO
-# Provider API keys (K3CODE_API_KEY=..., OMNIROUTE_API_KEY=...) go here, chmod 600:
+{extra_env}# Provider API keys (K3CODE_API_KEY=..., OMNIROUTE_API_KEY=...) go here, chmod 600:
 EnvironmentFile=-%h/.config/k3code/env
 
 [Install]
@@ -61,20 +70,47 @@ TimeoutStartSec=infinity
 ExecStart=/bin/sh -c 'sleep {cooldown} && systemctl --user reset-failed {unit} && systemctl --user start {unit}'
 """
 
-DEFAULT_EXEC_START = "%h/.local/bin/k3code daemon"
+DEFAULT_EXEC_START = "%h/.local/share/k3code/current/venv/bin/k3code daemon"
+
+
+def _unit_quote(text: str) -> str:
+    """``%`` is a specifier in unit files; a path with spaces needs quotes."""
+    text = text.replace("%", "%%")
+    return f'"{text}"' if " " in text else text
 
 
 def default_exec_start() -> str:
-    """Absolute ExecStart for this install: the ``k3code`` script if on PATH, else this interpreter."""
+    """Absolute ExecStart for this install: ``<data>/current/venv/bin/k3code`` (stable across updates, which only
+    repoint ``current``), else the ``k3code`` on PATH, else this interpreter (a dev checkout without an install)."""
+    stable = paths.data_dir() / "current" / "venv" / "bin" / "k3code"
+    if stable.exists():
+        return f"{_unit_quote(str(stable))} daemon"
     exe = shutil.which("k3code")
     if exe:
-        return f"{exe} daemon"
-    return f"{sys.executable} -m k3code.cli daemon"
+        return f"{_unit_quote(exe)} daemon"
+    return f"{_unit_quote(sys.executable)} -m k3code.cli daemon"
+
+
+def default_extra_env() -> str:
+    """``Environment=`` lines for K3CODE_DATA / K3CODE_HOME, only when they differ from the defaults (the unit would
+    otherwise read a different tree than the shell that installed it)."""
+    defaults = {
+        "K3CODE_DATA": Path.home() / ".local" / "share" / "k3code",
+        "K3CODE_HOME": Path.home() / ".k3code",
+    }
+    actual = {"K3CODE_DATA": paths.data_dir(), "K3CODE_HOME": paths.home()}
+    return "".join(
+        f'Environment="{name}={str(actual[name]).replace("%", "%%")}"\n'
+        for name in defaults
+        if actual[name] != defaults[name]
+    )
 
 
 def render_unit(exec_start: str | None = None) -> str:
+    """The unit text. An explicit ``exec_start`` is used as given, with no K3CODE_DATA / K3CODE_HOME lines."""
     return UNIT_TEMPLATE.format(
         exec_start=exec_start or default_exec_start(),
+        extra_env="" if exec_start else default_extra_env(),
         start_interval=START_LIMIT_INTERVAL_S,
         start_burst=START_LIMIT_BURST,
         recover_unit=RECOVER_UNIT_NAME,
@@ -98,8 +134,28 @@ def recover_unit_path() -> Path:
     return unit_dir() / RECOVER_UNIT_NAME
 
 
+class ServiceError(RuntimeError):
+    """systemd refused, or is not there: the message says which."""
+
+
+def systemd_available() -> bool:
+    return shutil.which("systemctl") is not None
+
+
 def _systemctl(*args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, check=False)
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        raise ServiceError("systemd user manager not available (no systemctl)") from None
+
+
+def restart(unit: str = UNIT_NAME) -> None:
+    """``reset-failed`` then ``restart``: after a crash loop the start limit refuses a bare restart
+    (start-limit-hit), and the daemon would stay down until the recovery unit runs."""
+    _systemctl("reset-failed", unit)  # a unit with nothing to reset is not an error
+    r = _systemctl("restart", unit)
+    if r.returncode != 0:
+        raise ServiceError(f"systemctl --user restart {unit} failed: {(r.stderr or r.stdout).strip()[:300]}")
 
 
 def install(dry_run: bool = False) -> list[str]:
@@ -119,6 +175,8 @@ def install(dry_run: bool = False) -> list[str]:
     )
     if dry_run:
         return ["[dry-run] would:", *(f"  - {s}" for s in steps), "[dry-run] unit file:", unit, advice]
+    if not systemd_available():  # checked before anything is written
+        raise ServiceError("systemd user manager not available: run `k3code daemon` directly instead")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(unit)
     recover.write_text(render_recover_unit())

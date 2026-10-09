@@ -26,6 +26,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
 from k3code import paths
+from k3code.paths import GATEWAY_ENV_VARS
 from k3code.permissions import PermissionMode
 
 logger = logging.getLogger(__name__)
@@ -132,10 +133,13 @@ def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment every child process gets: :data:`ENV_ALLOW` from the daemon, plus ``extra``.
 
     Provider keys (``OMNIROUTE_API_KEY``, ``K3CODE_API_KEY``, ...) are never passed to a child, so a tool, a gate,
-    a fan-out worker or a git trigger cannot print them.
+    a fan-out worker or a git trigger cannot print them. Nor does a child learn where the daemon's socket is, not even
+    from ``extra`` (an MCP server's configured ``env``): only an authenticated client may drive the daemon.
     """
     env = {name: os.environ[name] for name in ENV_ALLOW if name in os.environ}
     env.update(extra or {})
+    for name in GATEWAY_ENV_VARS:
+        env.pop(name, None)
     return env
 
 

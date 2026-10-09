@@ -21,6 +21,7 @@ from k3code.learning import (
     permrules,
     projectprep,
     ranking,
+    recipes,
     replay,
     review,
 )
@@ -229,10 +230,18 @@ class LearningHub:
         """Run the handler of an accepted learned proposal; returns a human message."""
         payload = p.payload
         cwd = str(session.perms.cwd) if session is not None else ""
+        if payload.get("op") == "recipe":  # before the kind switch: a recipe "skill" is not a curator skill
+            msg = recipes.apply(payload)
+            if session is not None:
+                session.perms.reload()
+            if payload.get("type") == "mcp":
+                await self._reload_mcp(str(payload.get("root") or cwd))
+            return msg
         if p.kind == "permission_rule":
             msg = permrules.apply(payload, cwd=cwd)
-            if payload.get("auto_do"):
-                self.server.config.autonomy["auto_do_plans"] = True
+            if payload.get("auto_do") and payload.get("project"):
+                live = self.server.config.autonomy
+                live["auto_do_projects"] = [*(live.get("auto_do_projects") or []), payload["project"]]
             if session is not None:
                 session.perms.reload()
             return msg
@@ -298,19 +307,32 @@ class LearningHub:
     # ── project prep ──
 
     async def prepare_project(self, session: Any) -> list[Proposal]:
-        root = Path(session.stored.cwd or ".")
-        if not self.enabled or not projectprep.needs_prep(root) or session.background:
+        """Scan the session's project (in a worker thread); new or changed stacks get their proposals."""
+        if not self.enabled or session.background:
             return []
         made = await projectprep.prepare(
-            root,
+            Path(session.stored.cwd or "."),
             store=self.store,
             caller=self.server.model_caller,
             preferences=self.preferences(),
             session_id=session.session_id,
             clock=self.clock,
+            skill_roots=list(self.server.config.skills.roots),
         )
         self.emit(session, made)
         return made
+
+    async def _reload_mcp(self, cwd: str) -> None:
+        """An accepted recipe MCP server: restart the set the way ``/mcp reload`` does."""
+        from k3code import mcpjson
+
+        mcp = getattr(self.server, "mcp", None)
+        if mcp is None or not cwd:
+            return
+        try:
+            await mcp.reload(mcpjson.merged(self.server.config.mcp.servers, cwd))
+        except Exception:  # noqa: BLE001 - the server is saved; /mcp reload retries
+            logger.warning("MCP reload after a recipe failed", exc_info=True)
 
     # ── turn end ──
 

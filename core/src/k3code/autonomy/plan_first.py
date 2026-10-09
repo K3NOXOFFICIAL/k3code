@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from k3code import userhooks
 from k3code.agent.loop import AgentLoop
 from k3code.autonomy import advisor as advisor_mod
 from k3code.autonomy import autonomy_cfg, scope
@@ -188,7 +189,10 @@ class PlanFirst:
             cap.plan = plan
             cap.asked += 1
             show("proposed")
-            auto_ok = verdict.risk != "high" or bool(self.cfg.get("auto_do_plans"))
+            from k3code.learning.permrules import auto_do_allowed
+
+            # a high-risk plan is auto-approved only in a project the user accepted it for (per-project, learned)
+            auto_ok = verdict.risk != "high" or auto_do_allowed(self.cfg, learning_project(session))
             if session.perms.mode is PermissionMode.AUTO and auto_ok:
                 cap.approved, cap.auto, cap.mode = True, True, "auto"
             elif session.perms.mode is PermissionMode.AUTO:
@@ -217,6 +221,7 @@ class PlanFirst:
             session=sid,
             task_kind=TaskKind.PLAN,
         )
+        loop.hooks = userhooks.load(session.perms.cwd, sid)  # the planner's read tools see the user's hooks too
         session.current_kind = TaskKind.PLAN.value
         session.emit("status.update", {"kind": "status", "text": "planning", "state": "working"})
         prompt = f"Task:\n{text}\n\nScope: {verdict.scope}. Risk: {verdict.risk}. {verdict.reason}"

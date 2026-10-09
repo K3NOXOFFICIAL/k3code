@@ -27,6 +27,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
+from k3code.paths import GATEWAY_ENV_VARS
 from k3code.providers.base import Provider, ProviderError
 from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec, Usage
 
@@ -95,7 +96,7 @@ def _real_home() -> str:
 
 
 def _clean_env(thinking_tokens: int | None = 0) -> dict[str, str]:
-    drop = ("ANTHROPIC_", "OMNIROUTE_", "MAX_THINKING_TOKENS")
+    drop = ("ANTHROPIC_", "OMNIROUTE_", "MAX_THINKING_TOKENS", *GATEWAY_ENV_VARS)  # Claude Code runs its own tools
     env = {k: v for k, v in os.environ.items() if not k.startswith(drop)}
     env["HOME"] = _real_home()
     env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"

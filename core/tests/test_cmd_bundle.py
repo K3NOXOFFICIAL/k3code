@@ -95,7 +95,7 @@ async def test_export_import_round_trip(tmp_path, monkeypatch):
     h2.mkdir(parents=True, exist_ok=True)
     (h2 / "config.yaml").write_text(yaml.safe_dump({"mem0": {"api_key": "LOCAL-SECRET-VALUE"}, "max_turns": 7}))
     sid2 = await new_session(server2, proj)
-    res = await cmd(server2, f"/import {out} --yes", sid2)
+    res = await cmd(server2, f"/import {out} --yes --trust-bundle", sid2)  # mem0.url is gated since it sends a key
     assert res["output"].startswith("Imported."), res
     merged = yaml.safe_load((h2 / "config.yaml").read_text())
     assert merged["max_turns"] == 7 and merged["max_tokens"] == 4096

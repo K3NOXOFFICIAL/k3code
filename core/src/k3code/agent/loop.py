@@ -26,6 +26,7 @@ from k3code.tools import (
     format_tool_result,
 )
 from k3code.tools.validate import invalid_arguments
+from k3code.userhooks import HookOutcome, HookRunner
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,8 @@ class AgentLoop:
         #: returns user messages typed mid-turn (session.steer); they join the conversation before the next model call
         self.take_steer: Callable[[], list[str]] | None = None
         self.approval_callback = approval_callback
+        #: the user's PreToolUse/PostToolUse hooks (k3code.userhooks); None = none
+        self.hooks: HookRunner | None = None
         self.tools = build_registry()
         self._interrupt = asyncio.Event()
         #: Conversation messages of the most recent run(), in order (system first).
@@ -368,9 +371,13 @@ class AgentLoop:
         if (invalid := invalid_arguments(tool_call.name, spec.parameters, args)) is not None:
             return {"error": invalid}
         decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
-        if decision.action == "deny":
+        if decision.action == "deny":  # hardline and deny rules: no hook can turn these into an allow
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
-        if decision.action == "ask":
+        pre = await self._run_hooks("PreToolUse", tool_call.name, {"tool_input": args})
+        if pre.blocked:
+            return {"error": f"Blocked by a PreToolUse hook: {pre.reason}"}
+        # a hook's "approve" answers the prompt, but never one only a human may answer
+        if decision.action == "ask" and not (pre.approved and not decision.needs_human):
             if self.approval_callback is None:
                 return {"error": f"Permission denied: {tool_call.name} requires approval (no prompter)"}
             answer = await self.approval_callback(tool_call.name, args, decision)
@@ -408,7 +415,18 @@ class AgentLoop:
         self.reliability.journal_done(tool_call.id, result)
         if read_key is not None and "first" in result:
             self._reads[read_key] = (self._step, tool_call.id)
+        post = await self._run_hooks(
+            "PostToolUse", tool_call.name, {"tool_input": args, "tool_response": format_tool_result(result)}
+        )
+        feedback = "\n".join(t for t in (post.reason if post.blocked else "", post.context_text()) if t)
+        if feedback:  # the tool already ran: the hook's word joins its result for the model
+            result = {**result, "content": f"{format_tool_result(result)}\n\n[PostToolUse hook] {feedback}"}
         return result
+
+    async def _run_hooks(self, event: str, tool: str, payload: dict[str, Any]) -> HookOutcome:
+        if not self.hooks:
+            return HookOutcome()
+        return await self.hooks.run(event, {"tool_name": tool, **payload}, tool_name=tool)
 
     def _read_key(self, args: dict[str, Any]) -> tuple[Any, ...] | None:
         """What makes two reads the same: the file (path, mtime, size) and the requested range; None if no file."""

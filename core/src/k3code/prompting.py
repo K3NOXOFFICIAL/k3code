@@ -43,6 +43,10 @@ def build_system_prompt(
         parts.append(skills)
     if mcp is not None and (m := mcp_prompt(mcp)):
         parts.append(m)
+    from k3code.learning.projectprep import facts_prompt
+
+    if facts := facts_prompt(cwd):  # the stored stack scan; with or without a memory file, changes on re-scan only
+        parts.append(facts)
     if mem := memory_prompt(cwd, limit=int(ctx.get("memory_chars", MAX_MEMORY_CHARS))):
         parts.append(mem)
     from k3code.learning.gotchas import gotchas_prompt

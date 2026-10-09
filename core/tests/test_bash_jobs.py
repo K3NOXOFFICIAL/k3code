@@ -109,6 +109,15 @@ async def test_close_live_reaps_the_sessions_jobs(tmp_path, monkeypatch, clean_j
     assert jobs.list_jobs(sid) == [] and not _alive(pid)
 
 
+async def test_session_delete_reaps_the_sessions_jobs(tmp_path, monkeypatch, clean_jobs):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    sid = (await call(server, "session.create", {"cwd": str(tmp_path)}))["session_id"]
+    await tool_bash({"command": "sleep 30", "background": True}, cwd=tmp_path, session_id=sid)
+    pid = jobs.list_jobs(sid)[0]["pid"]
+    await call(server, "session.delete", {"session_id": sid})
+    assert jobs.list_jobs(sid) == [] and not _alive(pid)
+
+
 class _NoProvider:
     name = "fake"
     base_url = "https://fake.test"

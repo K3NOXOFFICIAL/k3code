@@ -40,3 +40,6 @@ ff1e22c031b8ca64e15e61b32285ad823e732178:scripts/dev/tasks/m3-panes.md:generic-a
 505ad255b7151929208b7e0bddb997c749c8eaba:tui/src/__tests__/useSessionLifecycleStoredSid.test.ts:generic-api-key:67
 e958b89b40f044e307f345cd8e128a8d2aa3420d:core/tests/test_learning_projectprep.py:aws-access-token:85
 58ba25c38e085f259826f4e831aabf59fc759e84:core/tests/test_learning_replay.py:generic-api-key:62
+
+# fake JWT test fixture (core/tests/test_learning_decisions.py), replaced by a runtime-built string
+d33d77df9545e4e46e19a943bebb38ed260e869f:core/tests/test_learning_decisions.py:jwt:76

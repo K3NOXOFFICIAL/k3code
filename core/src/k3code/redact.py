@@ -20,6 +20,7 @@ _PREFIXED = re.compile(
     r"(?:sk-[A-Za-z0-9_\-]{12,}|sk_(?:live|test)_[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}"
     r"|xox[abprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,}|glpat-[A-Za-z0-9_\-]{16,}"
     r"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}|Bearer\s+[A-Za-z0-9._\-~+/]{16,}"
+    r"|Bearer\s+(?=[A-Za-z0-9._\-~+/]*[0-9._\-~+/])[A-Za-z0-9._\-~+/]{6,}"
     r"|://[^/\s:@]+:[^/\s@]+@)"
 )
 _OPAQUE = re.compile(r"[A-Za-z0-9_\-]{32,}")
@@ -59,7 +60,7 @@ _SECRET_FLAG = re.compile(
     r"(?i)--?(?:password|passwd|token|api[_-]?key|apikey|secret|client[_-]?secret|auth(?:[_-]?token)?)"
 )
 _FLAG_SECRET = re.compile(
-    r"(?i)(\s--?(?:password|passwd|token|api[_-]?key|apikey|secret|client[_-]?secret|auth(?:[_-]?token)?)(?:=|\s+))"
+    r"(?i)((?:^|\s)--?(?:password|passwd|token|api[_-]?key|apikey|secret|client[_-]?secret|auth(?:[_-]?token)?)(?:=|\s+))"
     r"[^\s'\"-][^\s'\"]*"
 )
 

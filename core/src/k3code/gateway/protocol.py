@@ -24,6 +24,10 @@ INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
 INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
+#: Server-defined: the method needs a connection that sent ``gateway.auth`` with the daemon token.
+UNAUTHORIZED = -32001
+#: Server-defined: this connection already has the maximum of concurrent long-running requests in flight.
+TOO_MANY_REQUESTS = -32002
 
 _request_counter = itertools.count(1)
 

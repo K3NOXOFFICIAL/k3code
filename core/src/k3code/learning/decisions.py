@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import sqlstore
+from k3code.redact import scrub_text
 
 KINDS = (
     "approval",
@@ -42,20 +43,19 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE INDEX IF NOT EXISTS decisions_kind ON decisions(kind, project);
 """
 
-_SECRET = re.compile(
-    r"(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{8,}|AKIA[0-9A-Z]{12,}|Bearer\s+\S+|"
-    r"(?i:(?:api[_-]?key|token|secret|password)\s*[=:]\s*\S+))"
-)
-
 
 def scrub(text: str) -> str:
-    """Strip anything that looks like a credential before it reaches the log."""
-    return _SECRET.sub("[redacted]", text)
+    """Strip anything that looks like a credential before it reaches the log: k3code.redact.scrub_text.
+
+    Kept as a name for older imports; its own regex missed URL userinfo, ``--password x``, PEM blocks,
+    ``github_pat_``, ``xoxb-`` and JWTs, and its output reached USER.md, project notes, mem0 and skill drafts.
+    """
+    return scrub_text(text)
 
 
 def _scrub_obj(o: Any) -> Any:
     if isinstance(o, str):
-        return scrub(o)
+        return scrub_text(o)
     if isinstance(o, dict):
         return {k: _scrub_obj(v) for k, v in o.items()}
     if isinstance(o, list):
@@ -155,7 +155,7 @@ class DecisionLog:
                 session,
                 cwd,
                 project if project is not None else self._project(cwd),
-                scrub(subject),
+                scrub_text(subject),
                 choice,
                 json.dumps(clean, ensure_ascii=False),
                 actor,

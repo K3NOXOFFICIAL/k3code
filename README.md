@@ -106,7 +106,7 @@ k3code doctor                                    # health checks with fix hints
 k3code setup --step providers                    # re-run one step (any step name above)
 k3code setup --restart                           # ignore saved progress and start over
 k3code setup --non-interactive --answers FILE    # unattended setup (add --no-probe to skip live provider tests)
-k3code export my.k3bundle                        # settings (secrets redacted) and sessions
+k3code export my.k3bundle                        # settings (secrets and configured key values redacted) and sessions
 k3code import my.k3bundle                        # merge them on another machine (existing config is backed up)
 k3code update --check                            # show the current and latest version
 k3code update                                    # smoke-tested update; rolls back automatically if it fails
@@ -154,7 +154,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 | **Models and effort** | `/model` (opens the picker; `/model <key>` switches; `/model chain` shows the fallback chain and its health, and `add`, `remove` and `move` edit it) · `/effort` · `/output-style` |
 | **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` · `/ultraresearch` · `/advisor` |
 | **Automation** | `/schedule` (cron) · `/automations` (file, git, webhook, session, network and idle triggers) |
-| **Review and learning** | `/review` · `/proposals` · `/learn` · `/optimizer` · `/self-improve` |
+| **Review and learning** | `/review` · `/proposals` · `/project` (detected stacks and recipe proposals; `/project rescan`) · `/learn` · `/optimizer` · `/self-improve` |
 | **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
 | **Operations** | `/doctor` · `/stats` · `/debug` · `/daemon` · `/update` · `/help` |
 | **Look and feel** (TUI) | `/pet` (`on`, `off`, `random` or a pet name: blob, cat, crab, duck, ghost, hamster, owl, robot; shown at 100+ columns) · `/indicator` (`ascii` for terminals without Unicode glyphs) · `/theme` · `/statusbar` · `/focus`. These choices are saved to `display` in `~/.k3code/config.yaml`. Set `K3_NO_ANIMATION=1` to stop the spinner, messages and pet from moving. |
@@ -232,16 +232,18 @@ k3code edits files and runs shell commands on your machine, as your user. Some m
 - **Sandbox, and where it fails open.** In `auto` and `yolo` modes, and in every background, cron and loop session, bash runs inside [bubblewrap](https://github.com/containers/bubblewrap). The system is read-only, the project (and any directory added with `/add-dir`) is writable, `$HOME` is hidden except `~/.cache` (writable), `~/.local/share/uv` (read-only) and any entries you list under `sandbox.home_readonly` in your own `~/.k3code/config.yaml` (read-only; never read from a project's config; `~/.ssh`, `~/.config/k3code` and anything above them are refused), `/tmp` is private, and the command does not inherit your API keys. The network stays on. **If `bwrap` is missing or user namespaces are disabled, bash runs without the sandbox.** k3code logs a warning once, and `k3code doctor` reports it. Install bubblewrap before you run unattended.
 - **Spend caps.** Off by default. `reliability.session_tokens`, `reliability.session_usd`, `reliability.day_tokens` and `reliability.day_usd` stop a turn, or the day's work, when a limit is reached. Dollar figures are estimates, not an invoice.
 - **Approvals write rules.** Choosing *always* writes a narrow rule (for example `git commit *`) into the project's `.k3code/config.yaml`. Review those rules before you commit that file.
-- **Secrets.** Keys live in `~/.config/k3code/env` (mode 0600) or in your environment. The config names an environment variable, never the value. `k3code export` redacts secrets.
+- **Secrets.** Keys live in `~/.config/k3code/env` (mode 0600) or in your environment. The config names an environment variable, never the value. `k3code export` redacts secrets, including any configured key value that appears in a session.
+- **Imports ask per risky item.** `k3code import`, `/import` and the setup wizard's import show a diff for each MCP server, permission rule, provider endpoint (`base_url`, `api_key_env`) and hook in the bundle and apply it only on an explicit yes. `--yes` does not cover them; `--trust-bundle` does. Without a terminal to ask in they are skipped with a warning.
+- **Learned notes stay out of the repository.** Facts from the session review go to `~/.k3code/projects/<project>/learned.md`, one capped line each (also when you edit the file), and reach the prompt fenced and labelled as auto-generated. k3code never writes them into `K3CODE.md` or `AGENTS.md`. An "auto-do high-risk plans" proposal needs 10 approvals and no denials in one project, and applies to that project only.
 - **Not a security boundary.** Treat k3code like a script you run yourself. It is not built to contain a hostile model, repository or MCP server.
 
 To report a vulnerability, use the private route in [SECURITY.md](SECURITY.md).
 
 ## Configuration
 
-State lives in `~/.k3code/` (override with `K3CODE_HOME`): `config.yaml`, session and usage databases, the journal, memory, learned preferences, logs. Secrets live only in `~/.config/k3code/env` (mode 0600) or your environment. A project can add `.k3code/config.yaml`, read from the directory k3code was started in (or `--config-dir`). It applies only after you trust that exact file: an interactive start shows what it changes and asks once, and asks again when the file changes. Headless and piped runs ignore an untrusted file. `k3code trust [PATH]` grants trust and `k3code trust --revoke` takes it back.
+State lives in `~/.k3code/` (override with `K3CODE_HOME`): `config.yaml`, session and usage databases, the journal, memory, learned preferences, logs. Secrets live only in `~/.config/k3code/env` (mode 0600) or your environment. A project can add `.k3code/config.yaml`, read from the directory k3code was started in (or `--config-dir`). It applies only after you trust that exact file: an interactive start shows what it changes and asks once, and asks again when the file changes. Headless and piped runs ignore an untrusted file. `k3code trust [PATH]` grants trust and `k3code trust --revoke` takes it back. The same answer covers the project's `.k3code/agents`, `.k3code/skills`, `.k3code/output-styles`, `.claude/skills` and `.agents/skills`: they load only in a trusted project, and a change to any of them asks again. A project agent can add an agent but never replace a built-in or user agent of the same name. A project config cannot set `providers` (it would choose where your keys are sent); they are ignored with a warning in the trust summary and `k3code doctor`. The project's memory always loads, fenced as project instructions from the repository: `K3CODE.md`, `AGENTS.md` and `CLAUDE.md` (all that exist, identical ones once) in every directory from the repository root down to the working directory, nearest last, after `.k3code/rules/*.md`. A line `@path` imports a file (relative to the importing file, at most 5 deep, never from outside the repository; the user's `USER.md` may import from your home directory). Each file is capped at 20,000 characters and all of them together at 40,000.
 
-Precedence per top-level key: command-line flag > environment (`K3CODE_<KEY>`, scalar keys only, for example `K3CODE_PERMISSION_MODE`) > project config > user config > defaults. Nested sections and the `providers` list are replaced as a whole, not merged. Change settings with `/config`, `/update-config` or `k3code setup --step <name>`; edits are backed up and `/config rollback` restores the last one.
+Precedence per top-level key: command-line flag > environment (`K3CODE_<KEY>`, scalar keys only, for example `K3CODE_PERMISSION_MODE`) > project config > user config > defaults. Nested sections are replaced as a whole, not merged. `providers` comes from the user config only. Change settings with `/config`, `/update-config` or `k3code setup --step <name>`; edits are backed up and `/config rollback` restores the last one.
 
 ```yaml
 providers:                          # the fallback chain, in order (add as many as you like)
@@ -267,6 +269,20 @@ mcp:
   servers:
     search: {url: "https://example.org/mcp"}
 ```
+
+### Hooks
+
+Hooks run your own commands on agent events, with Claude Code's contract, so existing hook scripts work:
+
+```yaml
+hooks:
+  PreToolUse:                       # also PostToolUse, UserPromptSubmit, SessionStart, Stop
+    - {matcher: "bash|edit", command: "~/bin/check-tool.sh", timeout: 30}   # matcher: tool-name regex
+```
+
+The command gets the event as JSON on stdin (`session_id`, `cwd`, `hook_event_name`, `tool_name`, `tool_input`, `tool_response` for PostToolUse, `prompt` for UserPromptSubmit). Exit 0 lets the action go on, and its stdout may be JSON `{"decision": "block"|"approve", "reason", "additionalContext"}`. Exit 2 blocks the action, and stderr is the reason the model sees. Any other exit status, or a run longer than `timeout` (default 60 s), is logged and blocks nothing. PreToolUse runs before the permission prompt: it can block a call or answer the prompt with `approve`, but it can never turn a deny (a hardline rule, a deny rule) into an allow. A Stop hook cannot extend a turn. Hooks run as you, outside the sandbox, with the same scrubbed environment as other child processes plus `CLAUDE_PROJECT_DIR`. Hooks in your user config always run; hooks in a project's `.k3code/config.yaml` run only once you trust the project, and the trust prompt lists each one.
+
+Other Claude Code files k3code reads: `CLAUDE.md` (see above), skills in `~/.claude/skills` (set `skills: {import_claude: false}` in your user config to skip them) and, in a trusted project, `.claude/skills` and `.agents/skills`. A trusted project's `.mcp.json` servers show in `/mcp` as available; none starts until you run `/mcp enable <name>` (`/mcp disable <name>` stops it). That choice is stored under `~/.k3code/projects/`, not in the repository, and a changed server definition has to be enabled again. `env` and `headers` values are used as written (no `${VAR}` expansion), and `sse` servers are skipped.
 
 Tip: keep at least one chain entry that does not go through a self-hosted gateway, so a gateway outage still has a fallback. (`k3code doctor` only warns when every entry looks like an OmniRoute gateway: its name contains `omniroute`, or it uses port 20128. It cannot recognise other gateways.)
 
@@ -317,7 +333,12 @@ Run each block from the repository root.
 
 # license bookkeeping
 python3 scripts/vendor_check.py
+
+# or all of the above, as the merge gate runs it (summary table, logs in .k3dev/ci/)
+scripts/ci/check.sh
 ```
+
+There are no GitHub Actions: checks, merges and releases run locally ([`docs/RELEASING.md`](docs/RELEASING.md)).
 
 - **Exit checks:** `scripts/exit/run_all.sh [--soak-minutes N] [--only m0,m1,…]` runs every check (real-TUI scripted flows, daemon and chaos tests, the panes tests, a clean-install test in a Fedora 44 podman container, and a 30-minute daemon soak in the background) and **overwrites the tracked** `docs/reports/exit-status.md`. Expect 30–40 minutes (an untested estimate) and heavy CPU, RAM and disk use. It needs `bash`, `python3`, `uv`, `node` (with the TUI built first), `go`, and optionally `podman`. Live-model rows stay pending while the provider quota is exhausted.
 - **How it was built:** most of the code was written by headless coding agents driven by `scripts/dev/omni-worker.sh` from the task specs in `scripts/dev/tasks/`. Each task produced a branch and a report in `docs/reports/`. Those scripts are internal build tooling; you do not need them to build, test or use k3code.
@@ -352,7 +373,7 @@ What is not verified yet:
 
 - **Live models.** Many scripted checks use a scripted fake provider. The live-model rows ran through the `claude-cli` provider (a local Claude Code login), not through a gateway.
 - **Long unattended runs.** A 30-minute daemon soak passed. The 72-hour soak is pending.
-- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. CI runs the installer tests on macOS; Windows (`install.ps1` via WSL) is tested only against a stand-in for `wsl.exe` on Linux.
+- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. The installer tests ran on macOS while CI ran on GitHub Actions; a macOS run is now a manual step before a release ([`docs/RELEASING.md`](docs/RELEASING.md)). Windows (`install.ps1` via WSL) is tested only against a stand-in for `wsl.exe` on Linux.
 - **Updates.** There is no release yet, so the update and rollback path has only been tested against local version directories.
 
 | | Milestone | Built | Verified so far |
@@ -363,7 +384,7 @@ What is not verified yet:
 | **M3** | `k3` keymap, agent states and approvals in panes | ✅ | Keymap tests and the live pane-badge check pass; the first-time-user test is pending |
 | **M4** | Plan-first and scope gate, tiers, fan-out, `/ultra*`, `/preview`, `/advisor`, loops, cron, automations | ✅ | All exit rows pass except the 30-task scope eval: its 30 labels are proposed and not yet confirmed |
 | **M5** | Learning, proposals, project preparation, self-optimizer | ✅ | Demo and tests pass; live mem0 and 2 weeks of use are pending |
-| **M6** | Installer, guided setup, update with rollback, release CI | ✅ | A clean Fedora 44 container installs in about a minute; setup resume, `--from-bundle` and update rollback pass. The upstream-sync check passes under the agreed policy: TUIOS stays mergeable (0 conflicting files) and the heavily modified Hermes TUI is a documented frozen fork whose upstream fixes are cherry-picked by hand ([`docs/UPSTREAM.md`](docs/UPSTREAM.md)) |
+| **M6** | Installer, guided setup, update with rollback, release script | ✅ | A clean Fedora 44 container installs in about a minute; setup resume, `--from-bundle` and update rollback pass. The upstream-sync check passes under the agreed policy: TUIOS stays mergeable (0 conflicting files) and the heavily modified Hermes TUI is a documented frozen fork whose upstream fixes are cherry-picked by hand ([`docs/UPSTREAM.md`](docs/UPSTREAM.md)) |
 
 
 ---

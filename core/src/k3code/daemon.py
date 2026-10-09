@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import sdnotify
+from k3code.paths import GATEWAY_ENV_VARS
 
 logger = logging.getLogger("k3code.daemon")
 
@@ -58,7 +59,9 @@ def record_restart(home: Path | None = None, now: float | None = None) -> int:
         data = json.loads(path.read_text())
         stamps = [float(t) for t in data if now - float(t) < RESTART_WINDOW_S]
     stamps.append(now)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    from k3code.gateway.auth import ensure_private_dir
+
+    ensure_private_dir(path.parent)
     path.write_text(json.dumps(stamps))
     return len(stamps)
 
@@ -160,14 +163,16 @@ class DaemonAlreadyRunning(RuntimeError):
 
 
 def acquire_instance_lock(sock: Path) -> int:
-    """Take an exclusive, non-blocking flock on ``<run dir>/daemon.lock``; returns the fd to keep open.
+    """Take an exclusive, non-blocking flock on ``<socket>.lock`` (``gateway.lock``); returns the fd to keep open.
 
     Without it a second ``k3code daemon`` (a manual start next to the systemd unit, the 5 s RestartSec window) unlinked
     the live socket and rebound it: the first daemon kept running its sessions, cron and loops but became unreachable,
     and stopping either one then deleted the other's socket.
     """
-    sock.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(sock.parent / "daemon.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    from k3code.gateway.auth import lock_path, prepare_socket_dir
+
+    prepare_socket_dir(sock)  # the default run dir is made 0700; a custom one is only checked
+    fd = os.open(lock_path(sock), os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -195,6 +200,9 @@ async def run_daemon(
     lock_fd = acquire_instance_lock(sock)  # refuses to start a second daemon on this home (held until we exit)
     count = record_restart(home)
     server = GatewayServer()
+    # The socket is resolved: no child of the daemon (git, an MCP server, the claude CLI, a hook) learns where it is.
+    for var in GATEWAY_ENV_VARS:
+        os.environ.pop(var, None)
     if server_out is not None:
         server_out.append(server)
     if storm_active(count):
@@ -250,6 +258,7 @@ async def attach_bridge(sock: Path | None = None, *, readonly: bool = False) -> 
     """
     import sys
 
+    from k3code.gateway.auth import AuthFailed, authenticate
     from k3code.integrations.panes import PaneLink, readonly_verdict
 
     sock = sock or socket_path()
@@ -285,6 +294,20 @@ async def attach_bridge(sock: Path | None = None, *, readonly: bool = False) -> 
     link = PaneLink.from_env(inject, readonly=readonly)
     if link is not None:
         link.reporter.report("idle")
+
+    def forward(raw: bytes) -> None:  # what the daemon sent before answering gateway.auth goes to the TUI as usual
+        sys.stdout.buffer.write(raw)
+        sys.stdout.buffer.flush()
+        if link is not None:
+            link.on_server_line(raw.decode("utf-8", errors="replace").strip())
+
+    try:
+        await authenticate(reader, writer, sock, forward)
+    except AuthFailed as e:
+        sys.stderr.write(f"k3code: the daemon at {sock} refused this client: {e}\n")
+        with contextlib.suppress(Exception):
+            writer.close()
+        return 1
 
     def filter_line(text: str) -> str | None:
         if link is not None:
@@ -338,12 +361,20 @@ async def tail_subagent(subagent_id: str, sock: Path | None = None, *, interval:
     """Follow a sub-agent of the daemon read-only (``k3code tail``): print its tail until it finishes."""
     import sys
 
+    from k3code.gateway.auth import AuthFailed, authenticate
+
     out = out or sys.stdout
     sock = sock or socket_path()
     try:
         reader, writer = await asyncio.open_unix_connection(str(sock), limit=1 << 26)
     except OSError as e:
         out.write(f"k3code: cannot attach to the daemon at {sock}: {e}\n")
+        return 1
+    try:
+        await authenticate(reader, writer, sock)
+    except AuthFailed as e:
+        out.write(f"k3code: the daemon at {sock} refused this client: {e}\n")
+        writer.close()
         return 1
     shown = ""
     seq = 0
@@ -383,12 +414,22 @@ async def tail_subagent(subagent_id: str, sock: Path | None = None, *, interval:
 async def slash_via_daemon(command: str, *, cwd: str, sock: Path | None = None, session_id: str | None = None) -> str:
     """Run one slash command (``/automations list`` …) against the running daemon and return its output text.
 
-    Uses a throwaway session when ``session_id`` is not given. Answers any ``clarify`` request with its first choice.
+    Uses a throwaway session when ``session_id`` is not given. Nobody can answer a question here: a command that asks
+    one (``clarify``) is refused (the request is answered with an error) and the output says so. It used to answer
+    every question with its first choice, whatever that did.
     """
+    from k3code.gateway.auth import AuthFailed, authenticate
+
     sock = sock or socket_path()
     reader, writer = await asyncio.open_unix_connection(str(sock), limit=1 << 26)  # a long output is one line
+    try:
+        await authenticate(reader, writer, sock)
+    except AuthFailed:
+        writer.close()
+        raise
     pending: dict[int, asyncio.Future[dict]] = {}
     seq = 0
+    refused: list[str] = []
 
     async def pump() -> None:
         while line := await reader.readline():
@@ -399,8 +440,9 @@ async def slash_via_daemon(command: str, *, cwd: str, sock: Path | None = None, 
             if msg.get("id") in pending and "method" not in msg:
                 pending[msg["id"]].set_result(msg)
             elif msg.get("method") == "clarify" and "id" in msg:
-                choices = (msg.get("params") or {}).get("choices") or [""]
-                reply = {"jsonrpc": "2.0", "id": msg["id"], "result": {"answer": choices[0]}}
+                refused.append(str((msg.get("params") or {}).get("question") or "a question"))
+                reason = "k3code slash cannot answer questions; run the command in the TUI"
+                reply = {"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32000, "message": reason}}
                 writer.write((json.dumps(reply) + "\n").encode())
 
     async def call(method: str, params: dict) -> dict:
@@ -419,6 +461,11 @@ async def slash_via_daemon(command: str, *, cwd: str, sock: Path | None = None, 
             created = await call("session.create", {"cwd": cwd})
             session_id = created["result"]["session_id"]
         res = await call("slash.exec", {"command": command.lstrip("/"), "session_id": session_id})
+        if refused:
+            return (
+                f"error: /{command.lstrip('/')} asked {refused[0]!r} and k3code slash cannot answer; "
+                "nothing was chosen. Run it in the TUI (`k3code attach` / `k3code agents`)."
+            )
         if "error" in res:
             return f"error: {res['error'].get('message', res['error'])}"
         return str(res["result"].get("output") or res["result"].get("message") or "")
