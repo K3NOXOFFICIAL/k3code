@@ -864,8 +864,10 @@ def update_cmd(
 ) -> None:
     """Update to the latest release (smoke-tested, auto-rollback) or roll back.
 
-    An install built from a checkout (`install.sh --from-source`) updates from that checkout whenever there is no
-    release to fetch: none published yet, or a private repository and no token."""
+    Whenever there is no release to fetch (none published yet, or a private repository and no token), an install
+    built from a checkout (`install.sh --from-source`) updates from that checkout, and an install made with
+    `install.sh --from-git` (the default) rebuilds from the newest commit of the branch or tag it was made from
+    (`update.url`, default: the GitHub repository `update.repo`)."""
     from k3code import update as upd
 
     if do_rollback:
@@ -875,6 +877,7 @@ def update_cmd(
     cfg = upd.update_settings()
     cur = upd.current_version()
     rel = None
+    git_ref = None
     if not from_source:
         denied = ""
         try:
@@ -885,11 +888,53 @@ def update_cmd(
             raise click.ClickException(str(e)) from e
         if rel is None:
             src = upd.source_checkout()
-            if src is None or not (src / ".git").exists():
-                raise click.ClickException(denied or "no releases found on this channel")
-            click.echo(f"{denied or 'No release has been published yet'}.\nThis install is built from {src}: using it.")
-            from_source = True
-    if from_source:
+            if src is not None and (src / ".git").exists():
+                click.echo(
+                    f"{denied or 'No release has been published yet'}.\nThis install is built from {src}: using it."
+                )
+                from_source = True
+            elif (git_ref := upd.git_ref()) is not None:
+                click.echo(
+                    f"{denied or 'No release has been published yet'}.\n"
+                    f"This install was made from git ({git_ref} of {cfg['url']}): checking it."
+                )
+            else:
+                raise click.ClickException(
+                    denied
+                    or "no releases found on this channel, and this install keeps no checkout or git ref to update "
+                    "from. Reinstall with `sh install.sh --from-git` (it can update itself from then on), or set "
+                    "update.source in config.yaml to a k3code checkout"
+                )
+    if git_ref is not None:
+        try:
+            head = upd.remote_head(cfg["url"], git_ref)
+        except upd.SourceUpdateError as e:
+            raise click.ClickException(str(e)) from e
+        if upd.is_commit_sha(git_ref):
+            click.echo(
+                f"current: {cur}\nThis install is pinned to commit {git_ref[:12]}: there is nothing to update. "
+                f"Reinstall with `sh install.sh --from-git --ref Main` to follow a branch."
+            )
+            return
+        click.echo(f"current: {cur}\nlatest:  {head[:7]} ({git_ref})")
+        if check:
+            return
+        have = upd.installed_sha()
+        if have and head.startswith(have):
+            click.echo("Already up to date.")
+            return
+        if not yes:
+            click.confirm(f"Update to {head[:7]} ({git_ref})?", abort=True)
+        try:
+            ver = upd.update_from_git(cfg["url"], git_ref)
+        except upd.SourceUpdateError as e:
+            raise click.ClickException(str(e)) from e
+        if ver == cur:  # the installer's own fetch failed and it fell back to the installed build of the ref
+            raise click.ClickException(
+                f"the installer could not fetch {git_ref} and kept the installed {ver}: nothing was changed. "
+                "Try again later."
+            )
+    elif from_source:
         src = upd.source_checkout()
         if src is None or not (src / ".git").exists():
             raise click.ClickException("no source checkout known; set update.source in config.yaml")
