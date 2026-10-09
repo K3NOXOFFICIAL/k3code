@@ -97,4 +97,17 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
             info.mtime = int(time.time())
             tar.addfile(info, io.BytesIO(data))
     path.chmod(0o600)
+    from k3code.config import retention
+
+    prune_bundles(out_dir, keep=retention(server.config)["debug_bundles"])
     return path
+
+
+def prune_bundles(out_dir: Path, keep: int) -> int:
+    """Keep the newest ``keep`` bundles in ``out_dir`` (names are timestamps); returns how many were removed."""
+    bundles = sorted(p for p in out_dir.glob("*.tar.gz") if p.is_file())
+    removed = 0
+    for old in bundles[: max(0, len(bundles) - keep)]:
+        old.unlink(missing_ok=True)
+        removed += 1
+    return removed

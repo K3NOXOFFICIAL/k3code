@@ -12,6 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from k3code import sqlstore
 from k3code.redact import scrub_text
 
 KINDS = (
@@ -82,18 +83,41 @@ def project_id(cwd: str | Path) -> str:
     return "path:" + hashlib.sha1(str(p.resolve()).encode()).hexdigest()[:12]
 
 
+#: Decisions older than this are deleted by :meth:`DecisionLog.prune` (``retention.decisions_days``).
+MAX_AGE_DAYS = 365
+
+
 class DecisionLog:
     def __init__(self, home: Path, clock: Callable[[], float] = time.time) -> None:
         self.home = Path(home)
         self.path = self.home / "learning" / "decisions.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.clock = clock
-        self._db = sqlite3.connect(str(self.path))
+        self._db = sqlstore.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(_SCHEMA)
+        self._migrate_actor()
         self._db.commit()
         self._pid_cache: dict[str, str] = {}
         self.migrate_jsonl()
+
+    def _migrate_actor(self) -> None:
+        """``actor`` as a column (it lived only in the detail JSON, so every query loaded every row and filtered in
+        Python, once per turn end), indexed with kind and time."""
+        cols = {r[1] for r in self._db.execute("PRAGMA table_info(decisions)")}
+        if "actor" not in cols:
+            self._db.execute("ALTER TABLE decisions ADD COLUMN actor TEXT NOT NULL DEFAULT 'user'")
+            self._db.execute(
+                "UPDATE decisions SET actor = COALESCE(json_extract(detail, '$.actor'), 'user')"
+                " WHERE json_valid(detail)"
+            )
+        self._db.execute("CREATE INDEX IF NOT EXISTS decisions_kind_actor_ts ON decisions(kind, actor, ts)")
+
+    def prune(self, max_age_days: float = MAX_AGE_DAYS) -> int:
+        """Delete decisions older than ``max_age_days`` (the daemon calls it at start); returns rows deleted."""
+        with self._db:
+            cur = self._db.execute("DELETE FROM decisions WHERE ts < ?", (self.clock() - max_age_days * 86400,))
+        return cur.rowcount
 
     def close(self) -> None:
         self._db.close()
@@ -123,7 +147,8 @@ class DecisionLog:
             raise ValueError(f"unknown decision kind: {kind}")
         clean = _scrub_obj({**(detail or {}), "actor": actor})
         cur = self._db.execute(
-            "INSERT INTO decisions (ts, kind, session, cwd, project, subject, choice, detail) VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT INTO decisions (ts, kind, session, cwd, project, subject, choice, detail, actor)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 self.clock() if ts is None else ts,
                 kind,
@@ -133,6 +158,7 @@ class DecisionLog:
                 scrub_text(subject),
                 choice,
                 json.dumps(clean, ensure_ascii=False),
+                actor,
             ),
         )
         self._db.commit()
@@ -171,6 +197,9 @@ class DecisionLog:
         if since is not None:
             sql += " AND ts>=?"
             args.append(since)
+        if actor is not None:
+            sql += " AND actor=?"
+            args.append(actor)
         sql += " ORDER BY ts, id"
         if limit:
             sql += f" LIMIT {int(limit)}"
@@ -178,8 +207,6 @@ class DecisionLog:
         for r in self._db.execute(sql, args):
             d = dict(r)
             d["detail"] = json.loads(d["detail"] or "{}")
-            if actor is not None and d["detail"].get("actor", "user") != actor:
-                continue
             rows.append(d)
         return rows
 

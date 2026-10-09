@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from k3code import sqlstore
+
 logger = logging.getLogger(__name__)
 
 #: The daemon start sweep deletes empty, unnamed stored sessions untouched this long (see SessionStore.sweep_empty).
@@ -65,7 +67,7 @@ class SessionStore:
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(self.path))
+        self._db = sqlstore.connect(self.path)
         self._db.execute(_SCHEMA)
         with contextlib.suppress(sqlite3.OperationalError):  # column already exists
             self._db.execute("ALTER TABLE sessions ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
@@ -240,6 +242,7 @@ class SessionStore:
         now: float | None = None,
         max_age: float = EMPTY_SESSION_MAX_AGE_S,
         keep: Callable[[str], bool] = lambda _sid: False,
+        swept: list[str] | None = None,
     ) -> int:
         """Delete stored sessions nobody can come back to; returns how many went.
 
@@ -251,11 +254,13 @@ class SessionStore:
 
         Each deleted row leaves a tombstone in ``swept_sessions`` (same transaction), so a process that still holds
         the session restores it on its next :meth:`save`; tombstones older than ``SWEPT_TOMBSTONE_MAX_AGE_S`` go here.
+        The ids of the deleted rows are appended to ``swept`` when given (the caller removes their journals).
         """
         now = self._prune_tombstones(now)
         ids = self._old_ids(now, max_age)
         return sum(
-            self._sweep_batch(ids[i : i + SWEEP_BATCH], keep, now, max_age) for i in range(0, len(ids), SWEEP_BATCH)
+            self._sweep_batch(ids[i : i + SWEEP_BATCH], keep, now, max_age, swept)
+            for i in range(0, len(ids), SWEEP_BATCH)
         )
 
     async def sweep_empty_async(
@@ -264,6 +269,7 @@ class SessionStore:
         now: float | None = None,
         max_age: float = EMPTY_SESSION_MAX_AGE_S,
         keep: Callable[[str], bool] = lambda _sid: False,
+        swept: list[str] | None = None,
     ) -> int:
         """:meth:`sweep_empty` in small batches that yield to the event loop between them (the connection is not
         thread-safe, so no thread). Each batch re-reads its rows, so a session that gained a message meanwhile stays."""
@@ -271,7 +277,7 @@ class SessionStore:
         ids = self._old_ids(now, max_age)
         deleted = 0
         for i in range(0, len(ids), SWEEP_BATCH):
-            deleted += self._sweep_batch(ids[i : i + SWEEP_BATCH], keep, now, max_age)
+            deleted += self._sweep_batch(ids[i : i + SWEEP_BATCH], keep, now, max_age, swept)
             await asyncio.sleep(0)
         return deleted
 
@@ -287,7 +293,9 @@ class SessionStore:
         cutoff = now - max_age
         return [r[0] for r in self._db.execute("SELECT session_id FROM sessions WHERE updated_at < ?", (cutoff,))]
 
-    def _sweep_batch(self, ids: list[str], keep: Callable[[str], bool], now: float, max_age: float) -> int:
+    def _sweep_batch(
+        self, ids: list[str], keep: Callable[[str], bool], now: float, max_age: float, swept: list[str] | None
+    ) -> int:
         marks = ",".join("?" * len(ids))
         rows = self._db.execute(
             f"SELECT session_id, title, meta FROM sessions WHERE session_id IN ({marks}) AND messages IN ('', '[]')",  # noqa: S608
@@ -311,6 +319,8 @@ class SessionStore:
                     "INSERT OR REPLACE INTO swept_sessions (session_id, swept_at) VALUES (?, ?)", (sid, now)
                 )
                 deleted += 1
+                if swept is not None:
+                    swept.append(sid)
         return deleted
 
     def most_recent(self) -> StoredSession | None:
