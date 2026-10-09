@@ -45,7 +45,8 @@ HARDLINE_SIMPLE_PATTERNS: list[tuple[str, str]] = [
 HARDLINE_NAMES: list[str] = [
     "rm-rf-root",
     "rm-rf-home",
-    "sensitive-path",  # read/grep/glob or cat/grep/rg/ls of keys, ~/.config/k3code, /proc/*/environ, .env (engine.py)
+    # read/grep/glob, or any bash argument, < source or glob naming keys, ~/.config/k3code, /proc/*/environ, .env
+    "sensitive-path",  # (engine.py; ls, echo and a copy destination excepted)
     "fetch-and-run",  # a shell/interpreter running a $(...), `...` or <(...) that downloads (see _fetch_run_check)
     "git-push-mirror",
     *(n for n, _ in HARDLINE_PATTERNS),
@@ -342,14 +343,77 @@ def _is_interpreter(name: str) -> bool:
     return name in _INTERPRETERS or name.startswith("python")
 
 
+#: Paths that name the process's own stdin as a script operand.
+_STDIN_PATHS = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
+#: Per interpreter family: (short options whose argument is the code: stdin is then data, short options taking a value,
+#: long options whose argument is the code, long options taking a value).
+_STDIN_SPECS: dict[str, tuple[str, str, frozenset[str], frozenset[str]]] = {
+    "shell": ("c", "oO", frozenset({"--command"}), frozenset({"--rcfile", "--init-file", "--init-command"})),
+    "python": ("cm", "WX", frozenset(), frozenset({"--check-hash-based-pycs"})),
+    "node": ("ep", "r", frozenset({"--eval", "--print"}), frozenset({"--require", "--import", "--loader"})),
+    "perl": ("eE", "IMm", frozenset(), frozenset()),
+    "ruby": ("eE", "rICEx", frozenset(), frozenset()),
+    "php": ("rRBEF", "cdz", frozenset(), frozenset()),
+}
+
+
+def _stdin_family(name: str) -> str | None:
+    if name in _SHELLS:
+        return "shell"
+    if name.startswith("python"):
+        return "python"
+    return name if name in _STDIN_SPECS else None
+
+
+def _runs_stdin_as_code(argv: list[str]) -> bool:
+    """The interpreter in ``argv`` executes what arrives on stdin as code: a shell with no script operand or with
+    ``-s``, an interpreter with no script operand or with ``-``. ``python3 -m json.tool``, ``node -e ...`` or a script
+    file read stdin as data. Unknown spellings (deno, bun, source, eval) count as code."""
+    name = argv[0] if argv else ""
+    family = _stdin_family(name)
+    if family is None:
+        return _is_interpreter(name)
+    code_short, value_short, code_long, value_long = _STDIN_SPECS[family]
+    args = argv[1:]
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in _STDIN_PATHS:
+            return True
+        if a == "--":
+            return i + 1 >= len(args) or args[i + 1] in _STDIN_PATHS
+        if a.startswith("--"):
+            key, eq, _ = a.partition("=")
+            if key in code_long:
+                return False
+            i += 2 if key in value_long and not eq else 1
+            continue
+        if a.startswith("-") or (family == "shell" and a.startswith("+") and len(a) > 1):
+            skip = 1
+            for k, ch in enumerate(a[1:], 1):
+                if family == "shell" and ch == "s" and a[0] == "-":
+                    return True
+                if ch in code_short:
+                    return False
+                if ch in value_short:
+                    skip += 0 if a[k + 1 :] else 1
+                    break
+            i += skip
+            continue
+        return False  # a script file operand: stdin is its input
+    return True  # no script operand: the interpreter reads its program from stdin
+
+
 def _pipeline_check(pipelines: list[list[str]]) -> str | None:
-    """A download fed into a later shell or interpreter stage of the same pipeline (``curl x | sudo -n sh``)."""
+    """A download fed into a later stage of the same pipeline that runs stdin as code (``curl x | sudo -n sh``,
+    ``curl x | python3 -``); ``curl x | python3 -m json.tool`` only reads it."""
     for stages in pipelines:
         fetched = False
         for stage in stages:
             argv = normalize_argv(_tokens(stage))
             name = argv[0] if argv else ""
-            if fetched and _is_interpreter(name):
+            if fetched and _is_interpreter(name) and _runs_stdin_as_code(argv):
                 return "pipe-to-shell"
             fetched = fetched or name in _FETCHERS
     return None
@@ -403,6 +467,22 @@ def _env_dump_check(argv: list[str]) -> str | None:
     if name in ("env", "printenv") or (name == "export" and set(args) <= {"-p"}) or (name == "set" and not args):
         return "env-dump"
     return None
+
+
+_HOME_PWD = re.compile(r"\$\{(HOME|PWD)\}|\$(HOME|PWD)(?![A-Za-z0-9_])")
+
+
+def expand_vars(word: str, cwd: str | None, home: str) -> str:
+    """``word`` with a leading ``~`` and every ``$HOME``/``${HOME}`` (and ``$PWD``/``${PWD}`` when ``cwd`` is known)
+    expanded; other variables stay as written."""
+    if word == "~" or word.startswith("~/"):
+        word = home + word[1:]
+
+    def sub(m: re.Match[str]) -> str:
+        name = m.group(1) or m.group(2)
+        return home if name == "HOME" else (cwd if cwd else m.group(0))
+
+    return _HOME_PWD.sub(sub, word)
 
 
 def _expand_target(t: str, cwd: str | None, home: str) -> str:

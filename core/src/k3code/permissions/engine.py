@@ -8,6 +8,8 @@ except hardline).
 
 from __future__ import annotations
 
+import fnmatch
+import glob
 import os
 import re
 from dataclasses import dataclass, field
@@ -256,22 +258,27 @@ def _voids_allow(sub: str, rule: Rule, ruleset: list[Rule], roots: list[str], cw
     )
 
 
-#: Read-only commands (the builtin allowlist and its kin) that must never be pointed at a key file.
-_READERS = frozenset({"cat", "grep", "egrep", "fgrep", "rg", "ls", "head", "tail", "less", "more"})
+def _argv(sub: str) -> list[str]:
+    """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv)."""
+    words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked separately
+    return hardline.normalize_argv(hardline.tokens(words))
 
 
-def _path_args(sub: str) -> list[str]:
-    """The non-flag arguments of ``sub`` (after sudo/env/... wrappers), plus the values of ``--flag=value``."""
-    words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked by _redirects_ok
-    real = hardline.strip_wrappers(hardline.tokens(words))
+def _arg_values(args: list[str]) -> list[str]:
+    """The non-flag arguments in ``args``, plus the values of ``--flag=value``."""
     out: list[str] = []
-    for t in real[1:]:
+    for t in args:
         if t.startswith("-"):
             if "=" in t:
                 out.append(t.split("=", 1)[1])
             continue
         out.append(t)
     return out
+
+
+def _path_args(sub: str) -> list[str]:
+    """The non-flag arguments of ``sub`` (after sudo/env/... wrappers), plus the values of ``--flag=value``."""
+    return _arg_values(_argv(sub)[1:])
 
 
 def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
@@ -282,24 +289,167 @@ def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
     return not _inside(_abs(arg, cwd), roots)
 
 
-def _reads_secret(sub: str, cwd: str) -> bool:
-    real = hardline.strip_wrappers(hardline.tokens(sub))
-    if not real or os.path.basename(real[0]) not in _READERS:
+# ── credential files named on a command line ──
+
+#: ``<file`` (not ``<<``, ``<<<``, ``<&``, ``<(``, ``<>``): a file the command reads.
+_INPUT_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*<(?![<&(>])\s*([^\s;&|<>()]+)")
+_ANY_VAR = re.compile(r"\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
+_GLOB_CHARS = frozenset("*?[")
+#: Print their arguments as text: ``echo .env`` reads nothing (unless the text goes on to a pipe or a file).
+_PRINTERS = frozenset({"echo", "printf"})
+#: Lists names, not contents.
+_LISTERS = frozenset({"ls"})
+#: ``SOURCE... DEST``: a credential file as the source is copied somewhere readable (deny); as the destination it is
+#: only overwritten (ask).
+_COPIERS = frozenset({"cp", "mv", "ln", "install"})
+_KEY_NAMES = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
+_SEVERITY = {"ask": 1, "human": 2, "deny": 3}
+
+
+def _worse(a: str | None, b: str | None) -> str | None:
+    return b if b and (a is None or _SEVERITY[b] > _SEVERITY[a]) else a
+
+
+def _dotenv_name(name: str) -> bool:
+    return name == ".env" or (name.startswith(".env.") and not name.endswith(_DOTENV_TEMPLATES))
+
+
+def _sensitive_name(text: str) -> bool:
+    """``text`` (a path with its unknown parts removed) names a credential: a dotenv file, an ssh key, a secrets dir,
+    a process environment."""
+    parts = [p for p in text.split("/") if p]
+    if not parts:
         return False
-    return any(sensitive_path(_abs(a, cwd)) for a in _path_args(sub) if a and not a.startswith("$"))
+    if any(p in (".ssh", ".gnupg", ".aws") for p in parts) or "/.config/k3code/" in f"/{text}/":
+        return True
+    base = parts[-1]
+    return _dotenv_name(base) or base in _KEY_NAMES or base == "environ" or base.endswith((".pem", ".key"))
+
+
+def _glob_match(pattern: str, path: str) -> bool:
+    """Shell-style match of an absolute glob against an absolute path: component by component (``*`` never crosses a
+    ``/``) and a wildcard never matches a leading dot (``cat *`` does not read ``.env``)."""
+    pat, parts = pattern.split("/"), path.split("/")
+    if len(pat) != len(parts):
+        return False
+    return all(
+        fnmatch.fnmatchcase(name, comp) and (comp.startswith(".") or not name.startswith("."))
+        for comp, name in zip(pat, parts, strict=True)
+    )
+
+
+def _canonical_secrets(pattern: str, home: str) -> list[str]:
+    """Representative credential paths a glob is matched against (it need not exist on this machine)."""
+    keys = [*_KEY_NAMES, "x.pem", "x.key", "config", "authorized_keys"]
+    out = [os.path.join(home, ".ssh", k) for k in keys]
+    out += [os.path.join(home, ".gnupg", "x"), os.path.join(home, ".aws", "credentials")]
+    out += [os.path.join(d, "env") for d in _secret_dirs()]
+    out += ["/proc/self/environ", "/proc/1/environ", "/proc/self/task/1/environ"]
+    folder = os.path.dirname(pattern)  # dotenv files live anywhere: try them next to the pattern
+    out += [os.path.join(folder, n) for n in (".env", ".env.local", ".env.production")]
+    return out
+
+
+def _glob_reads_secret(pattern: str, home: str) -> bool:
+    """An absolute glob that matches a credential file: on disk, by its literal leading directory, or by its shape
+    against the canonical secret names."""
+    for k, hit in enumerate(glob.iglob(pattern)):
+        if sensitive_path(hit):
+            return True
+        if k >= 1000:
+            break
+    literal: list[str] = []
+    for seg in pattern.split("/"):
+        if _GLOB_CHARS & set(seg):
+            break
+        literal.append(seg)
+    base = "/".join(literal) or "/"
+    if base != "/" and sensitive_path(base):
+        return True
+    return any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home))
+
+
+def _classify_arg(arg: str, cwd: str, home: str) -> str | None:
+    """``deny`` when ``arg`` names (or globs onto) a credential file, ``human`` when an unknown variable stands in
+    front of a credential name (``$DIR/.env``), else None."""
+    arg = arg.strip("'\"")
+    if not arg or "://" in arg:
+        return None
+    word = hardline.expand_vars(arg, cwd, home)
+    if "$" in word or "`" in word:
+        return "human" if _sensitive_name(_ANY_VAR.sub("", word)) else None
+    path = _abs(word, cwd)
+    if _GLOB_CHARS & set(word):
+        return "deny" if _glob_reads_secret(path, home) else None
+    return "deny" if sensitive_path(path) else None
+
+
+def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
+    plain = _HARMLESS_REDIRECT.sub("", sub)
+    worst: str | None = None
+    for source in _INPUT_REDIRECT.findall(plain):
+        worst = _worse(worst, _classify_arg(source, cwd, home))
+    argv = _argv(sub)
+    if not argv:
+        return worst
+    name, args = argv[0], argv[1:]
+    if name in _LISTERS or (name in _PRINTERS and not piped and not _REDIRECT.search(plain)):
+        return worst
+    reads = _arg_values(args)
+    writes: list[str] = []
+    positional = [a for a in args if not a.startswith("-")]
+    if name in _COPIERS and len(positional) >= 2:
+        writes = [positional[-1]]
+        del reads[len(reads) - 1 - reads[::-1].index(positional[-1])]
+    for arg in reads:
+        worst = _worse(worst, _classify_arg(arg, cwd, home))
+    if any(_classify_arg(arg, cwd, home) for arg in writes):
+        worst = _worse(worst, "ask")
+    return worst
+
+
+def _secret_access(parsed: hardline.Parsed, cwd: str, home: str) -> str | None:
+    """How a command line touches credential files: ``deny`` (reads or copies one), ``human`` (a variable may point at
+    one), ``ask`` (overwrites one), None. Every argument of every simple command and of everything nested in it counts,
+    and so do ``<`` sources; ``$HOME``, ``$PWD`` and ``~`` are expanded, globs are matched."""
+    worst: str | None = None
+    for sub in parsed.subs:
+        piped = any(len(p) > 1 and sub in p for p in parsed.pipelines)
+        worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home))
+    for child in parsed.children:
+        worst = _worse(worst, _secret_access(child, cwd, home))
+    return worst
+
+
+def _rule_forms(parsed: hardline.Parsed) -> list[str]:
+    """What else the subs of ``parsed`` run as, for deny/ask rules: their normalised argv (``/bin/rm x`` is ``rm x``,
+    ``git -C . push`` is ``git push``) and every nested command (``bash -c '...'``, ``$(...)``) in both spellings."""
+    forms: list[str] = []
+    for sub in parsed.subs:
+        norm = " ".join(_argv(sub))
+        if norm and norm != sub:
+            forms.append(norm)
+    for nested in parsed.nested:
+        forms.append(nested)
+        norm = " ".join(_argv(nested))
+        if norm and norm != nested:
+            forms.append(norm)
+    return list(dict.fromkeys(forms))
 
 
 def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
-    hit = hardline.check(command, extra, cwd=cwd)
+    home = os.path.expanduser("~")
+    hit = hardline.check(command, extra, cwd=cwd, home=home)
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     parsed = hardline.parse(command)
     subs = parsed.subs
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
     unsafe = parsed.unterminated or parsed.comment_quote
-    if any(_reads_secret(sub, cwd) for sub in subs):
+    secret = _secret_access(parsed, cwd, home)
+    if secret == "deny":
         hit = "sensitive-path"
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     prefixes = [hardline.command_prefix(s) or s for s in subs]
@@ -321,6 +471,13 @@ def _decide_bash(
             unsafe = True  # the builtin read-only allowlist covers one-line commands only
         if worst is None or _RANK[rule.action] > _RANK[worst.action]:
             worst = rule
+    # deny/ask rules also see through wrappers, absolute paths and nested commands (`/bin/rm x`, `bash -c 'rm x'`);
+    # an allow is only ever granted from the command as written, and a bare "*" catch-all would make every form ask
+    strict = [r for r in ruleset if r.pattern != "*"]
+    for form in _rule_forms(parsed):
+        rule = evaluate("bash", form, strict, default="allow")
+        if rule.action != "allow" and (worst is None or _RANK[rule.action] > _RANK[worst.action]):
+            worst = rule
     worst = worst or Rule(tool="bash", pattern="*", action="ask")
     if unsafe and worst.action != "deny":
         return Decision(
@@ -329,6 +486,15 @@ def _decide_bash(
             needs_human=True,
             message=f"Command could not be parsed safely; confirm it yourself: {command[:120]}",
         )
+    if secret == "human" and worst.action != "deny":
+        return Decision(
+            action="ask",
+            patterns=prefixes,
+            needs_human=True,
+            message=f"A variable may point at a credential file; confirm it yourself: {command[:120]}",
+        )
+    if secret == "ask" and worst.action == "allow":
+        return Decision(action="ask", patterns=prefixes, message=f"Overwrites a credential file: {command[:120]}")
     if worst.action == "allow" and not _inside(cwd, roots):
         return Decision(action="ask", patterns=prefixes, message=f"Working directory outside project roots: {cwd}")
     return Decision(action=worst.action, patterns=prefixes, rule=worst)
