@@ -113,7 +113,7 @@ k3code update                                    # smoke-tested update; rolls ba
 k3code update --rollback                         # switch back to the previous version
 ```
 
-There is no release yet. An install built from a checkout (`install.sh --from-source`) therefore updates from that checkout: `k3code update` (also `/update` in the TUI) pulls it with `git pull --ff-only` and rebuilds whenever there is no release to fetch, including a private repository without a GitHub token. On Windows the clone is pulled with Windows git, which has your GitHub credentials. If git still cannot sign in, pull the clone yourself and run `k3code update --from-source --no-pull`.
+There is no release yet. An install built from a checkout (`install.sh --from-source`) therefore updates from that checkout: `k3code update` (also `/update` in the TUI) pulls it with `git pull --ff-only` and rebuilds whenever there is no release to fetch, including a private repository without a GitHub token. On Windows the clone is pulled with Windows git, which has your GitHub credentials. If git still cannot sign in, pull the clone yourself and run `k3code update --from-source --no-pull`. An install made with `install.sh --from-git` (the default) keeps no checkout: `k3code update` looks up the newest commit of the branch or tag it was installed from (`git ls-remote`) and, when there is one, rebuilds from it with that commit's own installer. An install pinned to a commit SHA stays where it is. `update.url` in `config.yaml` points it at a fork or mirror.
 
 ### Three ways to run it
 

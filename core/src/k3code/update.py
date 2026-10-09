@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -235,7 +236,14 @@ def update_settings() -> dict[str, Any]:
     from k3code import confio
 
     s = confio.read_yaml(user_config_path()).get("update") or {}
-    return {"channel": s.get("channel", "stable"), "repo": s.get("repo", DEFAULT_REPO), "source": s.get("source", "")}
+    repo = s.get("repo", DEFAULT_REPO)
+    return {
+        "channel": s.get("channel", "stable"),
+        "repo": repo,
+        "source": s.get("source", ""),
+        # the git remote a `install.sh --from-git` install updates from (a fork or mirror may set its own)
+        "url": s.get("url") or f"https://github.com/{repo}.git",
+    }
 
 
 def _headers(token: str | None, accept: str = "application/vnd.github+json") -> dict[str, str]:
@@ -467,3 +475,140 @@ def update_from_source(checkout: Path, *, pull: bool = True) -> str:
         tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
         raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
     return r.stdout.strip().splitlines()[-1]
+
+
+# -- installs made with `install.sh --from-git` -----------------------------------
+# Such an install keeps no checkout: only `<version dir>/.ref`, the branch or tag it was built from. Its version is
+# named `<VERSION>-src.<short sha>`, so the remote head of that ref tells whether there is anything newer.
+
+LS_REMOTE_TIMEOUT = 30.0
+FETCH_TIMEOUT = 300.0
+
+#: What git prints when the network is down (the same patterns install.sh uses to tell offline from private).
+_OFFLINE_HINTS = re.compile(
+    r"could not resolve host|temporary failure in name resolution|failed to connect|network is unreachable"
+    r"|connection (timed out|refused|reset)|operation timed out",
+    re.IGNORECASE,
+)
+
+
+def git_ref() -> str | None:
+    """The ref the active version was built from (``install.sh --from-git``); None for any other install."""
+    try:
+        ref = (current_link() / ".ref").read_text().strip()
+    except OSError:
+        return None
+    return ref or None
+
+
+def is_commit_sha(ref: str) -> bool:
+    """A full commit SHA: an install of it is pinned and never moves."""
+    return re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", ref) is not None
+
+
+def installed_sha() -> str | None:
+    """The commit the active version was built from: the ``<sha>`` of ``X.Y.Z-src.<sha>``."""
+    m = re.search(r"-src\.([0-9a-f]{7,64})$", current_version() or "")
+    return m.group(1) if m else None
+
+
+def _git(args: list[str], timeout: float, what: str) -> str:
+    """Run git without a credential prompt and within ``timeout``; its stdout, or a SourceUpdateError with advice."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        raise SourceUpdateError(
+            "git is not installed: it is needed to update an install made with `install.sh --from-git`"
+        ) from None
+    except subprocess.TimeoutExpired:
+        raise SourceUpdateError(f"{what} timed out after {timeout:.0f} s: check the network and try again") from None
+    if r.returncode == 0:
+        return r.stdout
+    err = (r.stderr or r.stdout or "").strip()
+    last = err.splitlines()[-1][:140] if err else ""
+    if any(hint in err.lower() for hint in _AUTH_HINTS):
+        raise SourceUpdateError(
+            f"{what}: git could not sign in ({last}).\nIf the repository is private, give git your credentials "
+            "(`gh auth login && gh auth setup-git`), then run `k3code update` again."
+        )
+    if _OFFLINE_HINTS.search(err):
+        raise SourceUpdateError(f"{what}: no network ({last}). Check the connection and try again.")
+    raise SourceUpdateError(f"{what} failed:\n{err[:600]}")
+
+
+def remote_head(url: str, ref: str) -> str:
+    """The commit ``ref`` (a branch, then a tag, then a full ref name) points at on ``url``.
+
+    An annotated tag resolves to the commit it tags (``^{}``), which is what the installer builds and names the
+    version after. A full commit SHA is returned as is: it is pinned and needs no network."""
+    if is_commit_sha(ref):
+        return ref
+    out = _git(
+        ["ls-remote", url, f"refs/heads/{ref}", f"refs/tags/{ref}", f"refs/tags/{ref}^{{}}", ref],
+        LS_REMOTE_TIMEOUT,
+        f"git ls-remote {url}",
+    )
+    refs: dict[str, str] = {}
+    for line in out.splitlines():
+        sha, _, name = line.partition("\t")
+        if sha and name:
+            refs.setdefault(name, sha)
+    for name in (f"refs/heads/{ref}", f"refs/tags/{ref}^{{}}", f"refs/tags/{ref}", ref):
+        if name in refs:  # ls-remote also matches on a tail (`main` hits `refs/heads/feature/main`): not those
+            return refs[name]
+    raise SourceUpdateError(
+        f"'{ref}' was not found on {url}: the branch or tag this install follows is gone. Reinstall from another "
+        f"one: `sh install.sh --from-git {url} --ref Main`"
+    )
+
+
+def update_from_git(url: str, ref: str) -> str:
+    """Stage a new version from ``ref`` on ``url`` via that ref's own installer (``--no-activate``); its name.
+
+    The installer comes from a shallow fetch of the ref into a temporary directory under the data dir (never
+    ``versions/``, which prune and the version list read), removed again whatever happens. ``--from-git`` (not
+    ``--from-source``) keeps the install a git install: it records ``.ref`` and no checkout path."""
+    data_dir().mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=".update-git-", dir=data_dir()))
+    try:
+        src = tmp / "src"
+        _git(["-c", "init.defaultBranch=main", "init", "-q", str(src)], LS_REMOTE_TIMEOUT, "git init")
+        _git(["-C", str(src), "fetch", "-q", "--depth", "1", url, ref], FETCH_TIMEOUT, f"git fetch {ref} from {url}")
+        _git(["-C", str(src), "checkout", "-q", "FETCH_HEAD"], LS_REMOTE_TIMEOUT, "git checkout")
+        installer = src / "install" / "install.sh"
+        if not installer.is_file():
+            raise SourceUpdateError(f"'{ref}' on {url} has no install/install.sh: it is not a k3code repository")
+        r = subprocess.run(
+            [
+                "sh",
+                str(installer),
+                "--from-git",
+                url,
+                "--ref",
+                ref,
+                "--yes",
+                "--no-setup",
+                "--no-activate",
+                "--print-version",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            env={**os.environ, "K3CODE_DATA": str(data_dir()), "GIT_TERMINAL_PROMPT": "0"},
+        )
+        if r.returncode or not r.stdout.strip():
+            tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
+            raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
+        return r.stdout.strip().splitlines()[-1]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
