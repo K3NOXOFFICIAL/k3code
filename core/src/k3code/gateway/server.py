@@ -1943,7 +1943,9 @@ class GatewayServer:
                 session.perms.session_rules.extend(rules)
             if choice == "always" and rules:
                 persist_rules(project_config_path(session.perms.cwd), rules)
-            self.learning.approval(session, tool_name, pattern, choice)
+            self.learning.approval(
+                session, tool_name, pattern, choice, reason=reason, command=_command_for_tool(tool_name, arguments)
+            )
             return ApprovalResult(choice, reason)
 
         return approve

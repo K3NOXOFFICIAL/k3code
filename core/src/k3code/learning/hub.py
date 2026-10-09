@@ -15,6 +15,7 @@ from k3code.config import Settings, load_config
 from k3code.learning import curator, distiller, learning_cfg, optimizer, permrules, projectprep, ranking, replay, review
 from k3code.learning.decisions import DecisionLog, project_id
 from k3code.learning.updateconfig import merge_patch
+from k3code.redact import scrub_text
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +89,17 @@ class LearningHub:
         except Exception:  # noqa: BLE001 - learning must never break a turn
             logger.warning("decision log write failed", exc_info=True)
 
-    def approval(self, session: Any, tool: str, pattern: str, choice: str) -> None:
-        self.record("approval", session, subject=pattern, choice=choice, detail={"tool": tool})
+    def approval(
+        self, session: Any, tool: str, pattern: str, choice: str, *, reason: str = "", command: str = ""
+    ) -> None:
+        """``reason``: what the user typed with the answer ("use pnpm, not npm"); it used to reach the model for one
+        turn only. Kept scrubbed, so the distiller can turn repeated reasons into a preference."""
+        detail: dict[str, Any] = {"tool": tool}
+        if reason.strip():
+            detail["reason"] = scrub_text(reason.strip())[:300]
+        if command.strip():
+            detail["command"] = scrub_text(command.strip())[:200]
+        self.record("approval", session, subject=pattern, choice=choice, detail=detail)
         if tool == "bash" and self.enabled:
             self.spawn(self._mine_later(session))
 
@@ -159,6 +169,11 @@ class LearningHub:
             return msg
         if p.kind == "skill":
             return curator.apply(payload)
+        if p.kind == "preference" and payload.get("text"):
+            from k3code.memory import user_memory_path
+
+            distiller.add_user_line(user_memory_path(), str(payload["text"]))
+            return f"remembered in {user_memory_path()}"
         if p.kind == "optimizer":
             if "task_tiers" in payload:
                 return self._apply_overlay(
