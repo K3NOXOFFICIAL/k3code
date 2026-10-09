@@ -61,7 +61,12 @@ def snapshot(home: Path) -> dict[str, tuple[float, str]]:
     for p in sorted(home.rglob("*")):
         if ".k3code" in p.parts or p.name == "install.log":
             continue  # doctor may touch its own home dir; the install log grows on every run by design
-        out[str(p.relative_to(home))] = (p.lstat().st_mtime_ns, os.readlink(p) if p.is_symlink() else "")
+        # every run takes and drops its lock directory in the install root, which touches that directory's mtime
+        lock_parent = p.name == "k3code" and p.parent.name == "share"
+        out[str(p.relative_to(home))] = (
+            0 if lock_parent else p.lstat().st_mtime_ns,
+            os.readlink(p) if p.is_symlink() else "",
+        )
     return out
 
 
@@ -518,3 +523,63 @@ def test_passwordless_sudo_is_never_used_for_bubblewrap(tmp_path: Path) -> None:
     r = run(tmp_path, INSTALL, "--from-source", "--yes", env_extra={"K3_BWRAP": "/nonexistent/bwrap"}, path_front=sudo)
     assert r.returncode == 0, r.stderr
     assert not sudo_log.exists()
+
+
+DATA_REL = Path(".local") / "share" / "k3code"
+
+
+def test_root_is_refused_unless_allow_root(tmp_path: Path) -> None:
+    ids = stub_bin(tmp_path, "id", 'case "$1" in -u) echo 0 ;; -un) echo root ;; *) echo "uid=0(root)" ;; esac\n')
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, INSTALL, "--from-source", "--minimal", path_front=ids)
+    assert r.returncode != 0
+    assert "refusing to run as root" in r.stderr
+    assert not (home / ".local").exists()  # refused before anything was written
+    ok = run(home, INSTALL, "--from-source", "--minimal", "--allow-root", path_front=ids)
+    assert ok.returncode == 0, ok.stderr
+    assert (home / DATA_REL / "current").is_symlink()
+
+
+def test_sudo_with_someone_elses_home_is_refused(tmp_path: Path) -> None:
+    # `sudo -u bob` keeping alice's HOME: the install would land in a home that does not belong to the running user
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"SUDO_USER": "alice"})
+    assert r.returncode != 0
+    assert "through sudo" in r.stderr
+    assert not (tmp_path / DATA_REL).exists()
+
+
+def test_a_held_install_lock_stops_a_second_install(tmp_path: Path) -> None:
+    lock = tmp_path / DATA_REL / ".install.lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{os.getpid()}\n")  # a live process holds it
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert r.returncode != 0
+    assert "another install" in r.stderr and str(os.getpid()) in r.stderr
+    assert not (tmp_path / DATA_REL / "versions").exists()
+    assert lock.is_dir()  # someone else's lock is never removed
+
+    dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+    (lock / "pid").write_text(f"{dead}\n")
+    stale = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert stale.returncode != 0
+    assert "not running" in stale.stderr and "rm -r" in stale.stderr
+
+
+def test_the_install_lock_is_released_after_a_run(tmp_path: Path) -> None:
+    assert run(tmp_path, INSTALL, "--from-source", "--minimal").returncode == 0
+    assert not (tmp_path / DATA_REL / ".install.lock").exists()
+    assert run(tmp_path, INSTALL, "--from-source", "--minimal").returncode == 0  # the next run gets it
+
+
+def test_a_foreign_k3code_in_bin_is_kept_unless_force(tmp_path: Path) -> None:
+    mine = tmp_path / ".local" / "bin" / "k3code"
+    mine.parent.mkdir(parents=True)
+    mine.write_text("#!/bin/sh\necho someone else's k3code\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "not a link into" in r.stderr
+    assert not mine.is_symlink() and "someone else" in mine.read_text()
+    forced = run(tmp_path, INSTALL, "--from-source", "--minimal", "--force")
+    assert forced.returncode == 0, forced.stderr
+    assert mine.is_symlink() and os.readlink(mine).startswith(str(tmp_path / DATA_REL))

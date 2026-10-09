@@ -34,6 +34,7 @@ BUILDING=""
 REQS=""
 UV_TMP=""
 GIT_ERR=""
+LOCK=""
 
 usage() {
   cat <<EOF
@@ -53,6 +54,8 @@ Options:
   --no-install-deps     install nothing (no uv, Python, Node, Go); fail or skip with the hints instead
   --minimal             skip presetup: no sandbox check, no Chromium, no doctor subset
   --check               print the platform and dependency report, change nothing
+  --allow-root          install as root anyway (for example in a container); refused by default
+  --force               replace a k3code or k3 in the bin directory that this installer did not create
   --no-activate         build the version without switching to it (used by k3code update)
   --print-version       print the version name on stdout (used by k3code update)
   -h, --help
@@ -84,6 +87,7 @@ cleanup() {
   if [ -n "$REQS" ]; then rm -f "$REQS"; fi
   if [ -n "$UV_TMP" ]; then rm -f "$UV_TMP"; fi
   if [ -n "$GIT_ERR" ]; then rm -f "$GIT_ERR"; fi
+  if [ -n "$LOCK" ]; then rm -rf "$LOCK"; fi
   if [ "$rc" -ne 0 ]; then say "k3code-install: FAILED (exit $rc)${INSTALL_LOG:+. Log: $INSTALL_LOG}"; fi
   exit "$rc"
 }
@@ -114,6 +118,41 @@ as_root() { # as_root CMD...: root directly, or through sudo only after a person
 }
 
 node_major() { "$1" --version 2>/dev/null | sed 's/^v//; s/\..*//'; }
+
+home_of() { # home_of USER: that user's home directory, empty when unknown
+  case "$1" in '' | *[!A-Za-z0-9._-]*) return 0 ;; esac
+  h=$(eval "printf '%s' ~$1")
+  case "$h" in /*) printf '%s' "$h" ;; esac
+}
+
+# The install belongs to the user whose home it is in. Root (sudo included) would leave root-owned files there, or
+# install into root's home; --allow-root is for a deliberate root install such as a container.
+check_user() {
+  if [ "$ALLOW_ROOT" = 1 ]; then return 0; fi
+  if [ "$(id -u)" = 0 ]; then
+    die "refusing to run as root${SUDO_USER:+ (through sudo)}: run the installer as the user who will use k3code, without sudo (--allow-root installs for root, for example in a container)"
+  fi
+  if [ -n "${SUDO_USER:-}" ]; then # sudo -u: HOME must be the home of the user this runs as
+    h=$(home_of "$(id -un)")
+    if [ -n "$h" ] && [ "$h" != "$HOME" ]; then
+      die "HOME is $HOME but this runs as $(id -un) (home $h) through sudo: run it as that user with their HOME (sudo -H), or as yourself without sudo"
+    fi
+  fi
+  return 0
+}
+
+take_lock() { # one installer at a time per install root; the lock goes when this run exits
+  if mkdir "$DATA/.install.lock" 2>/dev/null; then
+    LOCK=$DATA/.install.lock
+    printf '%s\n' "$$" >"$LOCK/pid"
+    return 0
+  fi
+  pid=$(cat "$DATA/.install.lock/pid" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    die "another install into $DATA is running (pid $pid); wait for it to finish"
+  fi
+  die "an install lock from pid ${pid:-unknown} is left in $DATA/.install.lock, and that process is not running: if no other install runs, remove it (rm -r '$DATA/.install.lock') and re-run"
+}
 
 # ---- platform and package manager ------------------------------------------
 detect_platform() {
@@ -654,15 +693,39 @@ install_version() {
 }
 
 # ---- activation ------------------------------------------------------------
-link_bin() { # link_bin NAME TARGET: BIN/NAME -> TARGET; drops a stale link of ours
+link_bin() { # link_bin NAME TARGET: BIN/NAME -> TARGET; drops a stale link of ours; never replaces someone else's
+  lb=$(readlink "$BIN/$1" 2>/dev/null || true)
   if [ -e "$2" ]; then
-    if [ "$(readlink "$BIN/$1" 2>/dev/null || true)" != "$2" ]; then ln -sfn "$2" "$BIN/$1"; fi
+    if [ "$lb" = "$2" ]; then return 0; fi
+    if [ -e "$BIN/$1" ] || [ -L "$BIN/$1" ]; then
+      case "$lb" in
+        "$DATA"/*) ;;
+        *)
+          if [ "$FORCE" != 1 ]; then
+            log "WARNING: $BIN/$1 is not a link into $DATA (another program?): left in place; --force replaces it"
+            return 0
+          fi
+          rm -f "$BIN/$1"
+          ;;
+      esac
+    fi
+    ln -sfn "$2" "$BIN/$1"
   else
-    case "$(readlink "$BIN/$1" 2>/dev/null || true)" in
+    case "$lb" in
       "$DATA"/*) rm -f "$BIN/$1" ;;
     esac
   fi
   return 0
+}
+
+set_current() { # set_current DIR: point DATA/current at DIR with one rename, so no reader ever sees it missing
+  nl="$DATA/.current.$$"
+  rm -f "$nl"
+  ln -s "$1" "$nl"
+  if mv -T "$nl" "$DATA/current" 2>/dev/null; then return 0; fi # GNU, busybox
+  if [ -L "$nl" ] && mv -h "$nl" "$DATA/current" 2>/dev/null; then return 0; fi # macOS, BSD: -h does not follow
+  rm -f "$nl"
+  ln -sfn "$1" "$DATA/current"
 }
 
 prune_versions() { # keep the current and the previous version only
@@ -682,7 +745,7 @@ activate() {
   if [ -L "$DATA/current" ]; then cur=$(basename "$(readlink "$DATA/current")"); fi
   if [ "$cur" != "$VER" ]; then
     if [ -n "$cur" ]; then printf '%s\n' "$cur" >"$DATA/previous"; fi
-    ln -sfn "$VERDIR" "$DATA/current"
+    set_current "$VERDIR"
     log "current -> $VER${cur:+ (previous: $cur, kept for rollback)}"
   fi
   if [ "$FROM" = git ] && [ -e "$DATA/source_path" ]; then rm -f "$DATA/source_path"; fi
@@ -694,7 +757,7 @@ activate() {
 import_bundle() {
   [ -f "$BUNDLE" ] || die "bundle not found: $BUNDLE"
   log "importing $BUNDLE (settings and sessions; secrets are not in bundles)"
-  "$BIN/k3code" import "$BUNDLE" --yes >&2 || die "import of $BUNDLE failed"
+  "$DATA/current/venv/bin/k3code" import "$BUNDLE" --yes >&2 || die "import of $BUNDLE failed"
 }
 
 # ---- presetup ----------------------------------------------------------------
@@ -801,12 +864,12 @@ presetup_chromium() {
   return 0
 }
 presetup_doctor() {
-  if [ ! -x "$BIN/k3code" ]; then
-    log "presetup: health subset skipped (k3code is not linked)"
+  if [ ! -x "$DATA/current/venv/bin/k3code" ]; then
+    log "presetup: health subset skipped (k3code is not installed)"
     return 0
   fi
   log "presetup: health subset (warnings only; 'k3code doctor' gives the full report)"
-  out=$(K3CODE_DATA="$DATA" "$BIN/k3code" doctor --install 2>/dev/null) || true
+  out=$(K3CODE_DATA="$DATA" "$DATA/current/venv/bin/k3code" doctor --install 2>/dev/null) || true
   if [ -n "$out" ]; then say "$out"; fi
   return 0
 }
@@ -815,7 +878,7 @@ presetup_doctor() {
 main() {
   export GIT_TERMINAL_PROMPT=0
   FROM="" GIT_URL="" REF="" CHANNEL=stable WANT_VERSION="" PREFIX="$HOME/.local" BUNDLE=""
-  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0 PRESETUP=1
+  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0 PRESETUP=1 ALLOW_ROOT=0 FORCE=0
   if [ "${K3_NO_DOWNLOAD:-0}" = 1 ]; then NO_DEPS=1; fi
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -861,6 +924,8 @@ main() {
       --no-install-deps) NO_DEPS=1 ;;
       --minimal) PRESETUP=0 ;;
       --check) CHECK=1 ;;
+      --allow-root) ALLOW_ROOT=1 ;;
+      --force) FORCE=1 ;;
       --no-activate) ACTIVATE=0 ;;
       --print-version) PRINT_VERSION=1 ;;
       --no-setup | --headless) ;; # legacy no-ops: setup no longer runs here; old callers (k3code update) still pass it
@@ -892,7 +957,9 @@ main() {
     report
     exit 0
   fi
+  check_user
   mkdir -p "$DATA" "$BIN"
+  take_lock
   INSTALL_LOG="${K3_INSTALL_LOG:-$DATA/install.log}"
   printf '\n==== %s install start (args: %s) ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$INSTALL_LOG" 2>/dev/null || true
   report
