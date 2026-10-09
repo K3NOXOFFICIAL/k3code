@@ -157,17 +157,49 @@ check_user() {
   return 0
 }
 
+LOCK_STALE_MIN=360 # a lock that names no process is taken over after this many minutes
+
+pid_running() { # pid_running PID: kill -0, or /proc for a process of another user (kill -0 fails with EPERM)
+  kill -0 "$1" 2>/dev/null && return 0
+  [ -d /proc/self ] && [ -d "/proc/$1" ]
+}
+
+clean_unfinished_versions() { # versions/<v> a killed install left without .complete (never the one current names)
+  cur=$(basename "$(readlink "$DATA/current" 2>/dev/null)" 2>/dev/null || true)
+  for d in "$DATA"/versions/*/; do
+    [ -d "$d" ] || continue
+    d=${d%/}
+    if [ -f "$d/.complete" ] || [ "$(basename "$d")" = "$cur" ]; then continue; fi
+    rm -rf "$d"
+    log "removed the unfinished version $(basename "$d") that the interrupted install left"
+  done
+}
+
 take_lock() { # one installer at a time per install root; the lock goes when this run exits
-  if mkdir "$DATA/.install.lock" 2>/dev/null; then
-    LOCK=$DATA/.install.lock
+  lock=$DATA/.install.lock
+  if ! mkdir "$lock" 2>/dev/null; then
+    pid=$(cat "$lock/pid" 2>/dev/null || true)
+    case "$pid" in *[!0-9]*) pid="" ;; esac
+    if [ -n "$pid" ]; then
+      if pid_running "$pid"; then
+        die "another install into $DATA is running (pid $pid); wait for it to finish"
+      fi
+      why="its install (pid $pid) is not running"
+    elif [ -n "$(find "$lock" -prune -mmin +"$LOCK_STALE_MIN" 2>/dev/null)" ]; then
+      why="it names no process and is older than $((LOCK_STALE_MIN / 60)) hours"
+    else
+      die "an install lock without a pid is in $lock (an install that is just starting?): if no other install runs, remove it (rm -r '$lock') and re-run"
+    fi
+    log "taking over the install lock in $lock: $why (killed mid-install?)"
+    rm -rf "$lock"
+    mkdir "$lock" 2>/dev/null || die "another install into $DATA took the lock just now; wait for it to finish"
+    LOCK=$lock
     printf '%s\n' "$$" >"$LOCK/pid"
+    clean_unfinished_versions
     return 0
   fi
-  pid=$(cat "$DATA/.install.lock/pid" 2>/dev/null || true)
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    die "another install into $DATA is running (pid $pid); wait for it to finish"
-  fi
-  die "an install lock from pid ${pid:-unknown} is left in $DATA/.install.lock, and that process is not running: if no other install runs, remove it (rm -r '$DATA/.install.lock') and re-run"
+  LOCK=$lock
+  printf '%s\n' "$$" >"$LOCK/pid"
 }
 
 # ---- platform and package manager ------------------------------------------

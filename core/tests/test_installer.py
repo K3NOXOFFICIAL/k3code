@@ -572,11 +572,40 @@ def test_a_held_install_lock_stops_a_second_install(tmp_path: Path) -> None:
     assert not (tmp_path / DATA_REL / "versions").exists()
     assert lock.is_dir()  # someone else's lock is never removed
 
+
+def test_a_lock_left_by_a_killed_install_is_taken_over(tmp_path: Path) -> None:
+    # SIGKILL mid-install leaves the lock (with its pid) and a version without .complete: the next run goes on
+    data = tmp_path / DATA_REL
+    lock = data / ".install.lock"
+    lock.mkdir(parents=True)
     dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
     (lock / "pid").write_text(f"{dead}\n")
-    stale = run(tmp_path, INSTALL, "--from-source", "--minimal")
-    assert stale.returncode != 0
-    assert "not running" in stale.stderr and "rm -r" in stale.stderr
+    half = data / "versions" / "0.0.0-half"
+    (half / "venv").mkdir(parents=True)
+    done = data / "versions" / "0.0.0-done"
+    done.mkdir()
+    (done / ".complete").write_text("0.0.0-done\n")
+    (data / "current").symlink_to(done)
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and f"pid {dead}" in r.stderr
+    assert not half.exists() and "unfinished version 0.0.0-half" in r.stderr
+    assert (done / ".complete").is_file()  # the previous version stays (rollback)
+    assert os.readlink(data / "current") != str(done)
+    assert (data / "current").is_symlink() and not lock.exists()
+
+
+def test_a_lock_without_a_pid_is_taken_over_only_when_old(tmp_path: Path) -> None:
+    lock = tmp_path / DATA_REL / ".install.lock"
+    lock.mkdir(parents=True)  # an install killed between mkdir and writing its pid
+    young = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert young.returncode != 0
+    assert "without a pid" in young.stderr and "rm -r" in young.stderr
+    old = time.time() - 7 * 3600
+    os.utime(lock, (old, old))
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and "older than 6 hours" in r.stderr
 
 
 def test_the_install_lock_is_released_after_a_run(tmp_path: Path) -> None:
