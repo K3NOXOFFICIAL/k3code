@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from k3code.paths import home, project_state_dir
+from k3code.paths import ensure_private_dir, home, private_file, project_state_dir
 from k3code.redact import REDACTED, scrub_text
 
 PROJECT_FILES = ("K3CODE.md", "AGENTS.md", "CLAUDE.md")  # all that exist are read, in this order
@@ -79,8 +79,9 @@ def read_learned(cwd: str | Path) -> list[str]:
 
 def write_learned(cwd: str | Path, facts: list[str]) -> Path:
     path = learned_notes_path(cwd)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(LEARNED_HEADING + "\n\n" + "".join(f"- {f}\n" for f in facts), encoding="utf-8")
+    ensure_private_dir(path.parent)
+    body = LEARNED_HEADING + "\n\n" + "".join(f"- {f}\n" for f in facts)
+    private_file(path).write_text(body, encoding="utf-8")  # 0600 whatever the umask; write_text keeps the mode
     return path
 
 
@@ -222,7 +223,13 @@ def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = M
 
 
 def append_memory(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Append ``- text``. The user's memory is private state (0600 in a 0700 directory whatever the umask); a
+    project's memory file is a project file and keeps the umask."""
+    if path == user_memory_path():
+        ensure_private_dir(path.parent)
+        private_file(path)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     sep = "" if not existing or existing.endswith("\n") else "\n"
     path.write_text(existing + sep + f"- {text.strip()}\n", encoding="utf-8")

@@ -39,7 +39,10 @@ function Quote-Sh([string]$Arg) { "'" + ($Arg -replace "'", "'\''") + "'" } # on
 function Get-WslText([string[]]$WslArgs) { # runs wsl.exe and returns its stdout as clean text
   # Windows PowerShell 5.1 turns a native command's stderr into an error record, which 'Stop' makes terminating
   $ErrorActionPreference = 'Continue'
-  $out = & $Wsl @WslArgs 2>$null
+  # Linux programs print UTF-8; Windows PowerShell 5.1 would decode it with the OEM codepage (C:\Users\Jörg breaks)
+  $enc = [Console]::OutputEncoding
+  try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; $out = & $Wsl @WslArgs 2>$null }
+  finally { [Console]::OutputEncoding = $enc }
   if ($LASTEXITCODE -ne 0) { return $null }
   return (($out | Out-String) -replace "`0", '').Trim()
 }
@@ -59,9 +62,12 @@ function Get-Distros { # the installed distributions: @{ Name; Default; Version 
 function Get-ShArgs([string]$Command, [string]$Cwd = '') { # wsl.exe arguments that run COMMAND in a login sh
   # (a login shell reads ~/.profile, so PATH has what the user installed). The caller runs `& $Wsl @a` itself:
   # wsl.exe output must stay on the console, not in a PowerShell pipe, or install.sh has no terminal to ask on.
-  $a = @('-d', $script:Distro)
-  if ($Cwd) { $a += @('--cd', $Cwd) }
-  return $a + @('--exec', 'sh', '-lc', $Command)
+  # The directory is changed inside sh (wsl.exe --cd needs a newer WSL than Windows 10 ships with), from the Windows
+  # path given as an argument: wsl.exe passes arguments as UTF-16, so no codepage touches a non-ASCII path.
+  if ($Cwd) {
+    return @('-d', $script:Distro, '--exec', 'sh', '-lc', "cd `"`$(wslpath -a `"`$1`")`" && $Command", 'sh', $Cwd)
+  }
+  return @('-d', $script:Distro, '--exec', 'sh', '-lc', $Command)
 }
 
 # The user PATH is a REG_EXPAND_SZ holding %VARIABLES%. [Environment]::SetEnvironmentVariable would store it expanded
@@ -85,9 +91,9 @@ function Set-UserPath([string]$Value) {
 
 function Write-Shim([string]$Dir, [string]$Name, [string]$Target) {
   # cmd passes %* to wsl.exe, which splits it with the Windows rules; sh then gets each argument as "$@".
-  # At a drive root %CD% ends in a backslash ("C:\"), which would escape the closing quote: double it there.
-  $body = "@echo off`r`nsetlocal`r`nset `"K3_CD=%CD%`"`r`nif `"%K3_CD:~-1%`"==`"\`" set `"K3_CD=%K3_CD%\`"`r`n" +
-  "wsl.exe -d $($script:Distro) --cd `"%K3_CD%`" --exec sh -lc `"exec $Target \`"`$@\`"`" $Name %*`r`n"
+  # wsl.exe starts in the Linux path of the current Windows directory by itself (no --cd: Windows 10's WSL lacks it).
+  $body = "@echo off`r`n" +
+  "wsl.exe -d $($script:Distro) --exec sh -lc `"exec $Target \`"`$@\`"`" $Name %*`r`n"
   Set-Content -Path (Join-Path $Dir "$Name.cmd") -Value $body -NoNewline -Encoding Ascii
 }
 
@@ -105,8 +111,12 @@ if (-not $env:K3_WSL -and $env:OS -ne 'Windows_NT') {
 if (-not (Get-Command $Wsl -ErrorAction SilentlyContinue)) {
   Die 'this Windows has no wsl.exe: k3code needs Windows 10 version 2004 or later, or Windows 11, for WSL'
 }
-$distros = @(Get-Distros)
-if ($distros.Count -eq 0) {
+# Docker Desktop's own distributions (docker-desktop, docker-desktop-data) can be the default one, but are not for
+# installing into: they are skipped unless -Distro names one.
+function Get-UsableDistros { return @(Get-Distros | Where-Object { $_.Name -notlike 'docker-desktop*' }) }
+$distros = @(Get-UsableDistros)
+$named = $Distro -and @(Get-Distros | Where-Object { $_.Name -eq $Distro }).Count -gt 0
+if ($distros.Count -eq 0 -and -not $named) {
   if ($InstallArgs -contains '--no-install-deps') {
     Die "WSL has no Linux distribution yet and --no-install-deps is set. Run 'wsl --install -d Ubuntu', then this installer again."
   }
@@ -117,15 +127,16 @@ if ($distros.Count -eq 0) {
   if ($LASTEXITCODE -ne 0) {
     Die "wsl --install failed (exit $LASTEXITCODE). Run 'wsl --install -d Ubuntu' in an administrator PowerShell, restart, then run this installer again."
   }
-  $distros = @(Get-Distros)
+  $distros = @(Get-UsableDistros)
   if ($distros.Count -eq 0) {
     Say 'WSL is set up. Restart Windows if it asked you to, open Ubuntu from the Start menu once to choose your Linux user name, then run this installer again.'
     exit 0
   }
 }
 if ($Distro) {
-  $picked = @($distros | Where-Object { $_.Name -eq $Distro })
-  if ($picked.Count -eq 0) { Die "no WSL distribution named '$Distro' (installed: $(($distros | ForEach-Object Name) -join ', '))" }
+  $all = @(Get-Distros)
+  $picked = @($all | Where-Object { $_.Name -eq $Distro })
+  if ($picked.Count -eq 0) { Die "no WSL distribution named '$Distro' (installed: $(($all | ForEach-Object Name) -join ', '))" }
 } else {
   $picked = @($distros | Where-Object { $_.Default })
   if ($picked.Count -eq 0) { $picked = @($distros[0]) }

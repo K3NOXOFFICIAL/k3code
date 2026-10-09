@@ -113,7 +113,7 @@ k3code update                                    # smoke-tested update; rolls ba
 k3code update --rollback                         # switch back to the previous version
 ```
 
-There is no release yet. An install built from a checkout (`install.sh --from-source`) therefore updates from that checkout: `k3code update` (also `/update` in the TUI) pulls it with `git pull --ff-only` and rebuilds whenever there is no release to fetch, including a private repository without a GitHub token. On Windows the clone is pulled with Windows git, which has your GitHub credentials. If git still cannot sign in, pull the clone yourself and run `k3code update --from-source --no-pull`. An install made with `install.sh --from-git` (the default) keeps no checkout: `k3code update` looks up the newest commit of the branch or tag it was installed from (`git ls-remote`) and, when there is one, rebuilds from it with that commit's own installer. An install pinned to a commit SHA stays where it is. `update.url` in `config.yaml` points it at a fork or mirror.
+There is no release yet. An install built from a checkout (`install.sh --from-source`) therefore updates from that checkout: `k3code update` (also `/update` in the TUI) pulls it with `git pull --ff-only` and rebuilds whenever there is no release to fetch, including a private repository without a GitHub token. On Windows the clone is pulled with Windows git, which has your GitHub credentials. If git still cannot sign in, pull the clone yourself and run `k3code update --from-source --no-pull`. `/update now` in the TUI runs the update in the background: through `systemd-run` when the daemon is a systemd unit, otherwise (macOS, WSL without systemd) as a detached process that logs to `~/.local/share/k3code/update.log`. An install made with `install.sh --from-git` (the default) keeps no checkout: `k3code update` looks up the newest commit of the branch or tag it was installed from (`git ls-remote`) and, when there is one, rebuilds from it with that commit's own installer. An install pinned to a commit SHA stays where it is. `update.url` in `config.yaml` points it at a fork or mirror.
 
 ### Three ways to run it
 
@@ -170,7 +170,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 
 Approvals are *once*, *for this session*, *always* (writes a narrow rule such as `git commit *` to the project's `.k3code/config.yaml`; for file edits, the exact path) or *deny*.
 A short **hardline list** is refused in every mode, `yolo` included: `rm -rf /` and `rm -rf ~`, `mkfs`, `dd of=/dev/…`, `curl … | sh`, `env`/`printenv`, `cat` of `~/.ssh/` or `.env` files, `git push --force` to `main` or `master`, and stopping or restarting services over ssh on the hosts named in `_REMOTE_HOSTS` (`protected-host-a` and `protected-host-b`, placeholders in this release). These are pattern matches, not a sandbox, and they match specific spellings only; extend them with `permissions.hardline` in your config.
-The command-line flag `--permission` takes `ask`, `auto-edit` or `yolo`.
+The command-line flag `--permission` takes `ask`, `auto-edit`, `auto` or `yolo`. A headless run (`k3code -p`) cannot ask, so in `ask` and `auto-edit` every shell command that would ask is denied; `--permission auto` (or `headless_permission: auto` in the config) runs it as an interactive `auto` session would: bash in the sandbox, the hardline list and `deny` rules still refusing.
 
 ### Plan-first and fan-out
 
@@ -225,7 +225,7 @@ What keeps it alive and safe when nobody is watching:
 
 k3code edits files and runs shell commands on your machine, as your user. Some modes do that without asking. Read this section before you choose a mode and before you add a provider key.
 
-- **Permission modes** are described under [Permission modes](#permission-modes). In short: `default` asks before edits and before shell commands that are not allowlisted; `plan` is read-only; `auto` runs everything that is not denied and logs each auto-approved side effect; `yolo` skips approval prompts. The config key `permission_mode` accepts `ask` (the same as `default`), `auto-edit` (the same as `accept-edits`), `yolo`, `plan` and `auto`; the `--permission` flag takes `ask`, `auto-edit` or `yolo`.
+- **Permission modes** are described under [Permission modes](#permission-modes). In short: `default` asks before edits and before shell commands that are not allowlisted; `plan` is read-only; `auto` runs everything that is not denied and logs each auto-approved side effect; `yolo` skips approval prompts. The config key `permission_mode` accepts `ask` (the same as `default`), `auto-edit` (the same as `accept-edits`), `yolo`, `plan` and `auto`; the `--permission` flag takes `ask`, `auto-edit`, `auto` or `yolo`.
 - **`yolo` does not ask.** Use it for scratch projects and for scripted runs you can throw away. Anything the agent reads (a file, a web page, a tool result) can try to steer it, and in `yolo` nothing stops it from acting on that. Start in `default` on anything you care about.
 - **Hardline list.** Refused in every mode, `yolo` included: `rm -rf /` and `rm -rf ~`, `mkfs`, `dd` to a device, `curl … | sh`, `env` and `printenv`, `cat` of `~/.ssh/` or `.env` files, `git push --force` to `main` or `master`, and stopping or restarting services over ssh on the hosts listed in `_REMOTE_HOSTS` (`core/src/k3code/permissions/hardline.py`). These are pattern matches, not a sandbox, and they only match the spellings they list. The host names in `_REMOTE_HOSTS` are placeholders in this release. Add your own patterns under `permissions.hardline` in your config.
 - **Sandbox, and where it fails open.** In `auto` and `yolo` modes, and in every background, cron and loop session, bash runs inside [bubblewrap](https://github.com/containers/bubblewrap). The system is read-only, the project (and any directory added with `/add-dir`) is writable, `$HOME` is hidden except `~/.cache` (writable), `~/.local/share/uv` (read-only) and any entries you list under `sandbox.home_readonly` in your own `~/.k3code/config.yaml` (read-only; never read from a project's config; `~/.ssh`, `~/.config/k3code` and anything above them are refused), `/tmp` is private, and the command does not inherit your API keys. The network stays on. **If `bwrap` is missing or user namespaces are disabled, bash runs without the sandbox.** k3code logs a warning once, and `k3code doctor` reports it. Install bubblewrap before you run unattended.
@@ -260,7 +260,7 @@ providers:                          # the fallback chain, in order (add as many 
     api_key_env: ANTHROPIC_API_KEY
     models: {default: claude-sonnet-5-5}
 
-permission_mode: ask                # ask | auto-edit | yolo
+permission_mode: ask                # ask | auto-edit | plan | auto | yolo
 autonomy:
   plan_first: true
   fanout: {max_parallel: 3}
@@ -372,7 +372,7 @@ What is not verified yet:
 
 - **Live models.** Many scripted checks use a scripted fake provider. The live-model rows ran through the `claude-cli` provider (a local Claude Code login), not through a gateway.
 - **Long unattended runs.** A 30-minute daemon soak passed. The 72-hour soak is pending.
-- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. The installer tests ran on macOS while CI ran on GitHub Actions; a macOS run is now a manual step before a release ([`docs/RELEASING.md`](docs/RELEASING.md)). Windows (`install.ps1` via WSL) is tested only against a stand-in for `wsl.exe` on Linux.
+- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. The installer tests ran on macOS while CI ran on GitHub Actions; a macOS run is now a manual step before a release ([`docs/RELEASING.md`](docs/RELEASING.md)). Windows (`install.ps1` via WSL) is tested only against a stand-in for `wsl.exe` on Linux: `scripts/ci/platforms.sh` installs, updates, rolls back and uninstalls through it into an Ubuntu container, and on clean Ubuntu, Debian and Alpine containers.
 - **Updates.** There is no release yet, so the update and rollback path has only been tested against local version directories.
 
 | | Milestone | Built | Verified so far |

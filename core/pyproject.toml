@@ -45,6 +45,7 @@ packages = ["src/k3code"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-q"
+markers = ["real_systemd: run with the host's systemctl/loginctl/journalctl instead of the conftest stubs"]
 
 [tool.ruff]
 line-length = 120

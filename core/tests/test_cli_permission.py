@@ -85,7 +85,8 @@ def test_unknown_config_permission_is_a_usage_error_not_a_traceback(tmp_path, mo
     res = invoke(tmp_path, monkeypatch, PROV + "permission_mode: bypass\n")
     assert_usage_error(
         res,
-        "permission_mode 'bypass' is not one of: ask, auto-edit, yolo (set in config.yaml or K3CODE_PERMISSION_MODE)",
+        "permission_mode 'bypass' is not one of: ask, auto-edit, plan, auto, yolo "
+        "(set in config.yaml or K3CODE_PERMISSION_MODE)",
     )
     assert seen == []
 
@@ -94,7 +95,7 @@ def test_unknown_headless_permission_names_its_own_key(tmp_path, monkeypatch, se
     res = invoke(tmp_path, monkeypatch, PROV + "headless_permission: bypass\n")
     assert_usage_error(
         res,
-        "headless_permission 'bypass' is not one of: ask, auto-edit, yolo "
+        "headless_permission 'bypass' is not one of: ask, auto-edit, plan, auto, yolo "
         "(set in config.yaml or K3CODE_HEADLESS_PERMISSION)",
     )
     assert seen == []
@@ -104,7 +105,8 @@ def test_unknown_config_permission_fails_the_repl_path_too(tmp_path, monkeypatch
     res = invoke(tmp_path, monkeypatch, PROV + "permission_mode: bypass\n", prompt=False)
     assert_usage_error(
         res,
-        "permission_mode 'bypass' is not one of: ask, auto-edit, yolo (set in config.yaml or K3CODE_PERMISSION_MODE)",
+        "permission_mode 'bypass' is not one of: ask, auto-edit, plan, auto, yolo "
+        "(set in config.yaml or K3CODE_PERMISSION_MODE)",
     )
 
 
@@ -135,8 +137,37 @@ async def test_bad_configured_permission_mode_fails_session_start_not_the_daemon
     )
     reply = next(f for f in frames_of(server) if f.get("id") == 1)
     assert reply["error"]["message"].startswith(
-        "InvalidPermissionMode: permission_mode 'bypass' is not one of: ask, auto-edit, yolo"
+        "InvalidPermissionMode: permission_mode 'bypass' is not one of: ask, auto-edit, plan, auto, yolo"
     ), reply
     await server._handle_line(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "session.list", "params": {}}))
     assert any(f.get("id") == 2 and "result" in f for f in frames_of(server))
     await server.close()
+
+
+def test_headless_runs_take_auto_from_the_flag(tmp_path, monkeypatch, seen):
+    """`k3code -p ... --permission auto`: only `headless_permission: auto` in the config used to reach auto mode."""
+    run(tmp_path, monkeypatch, PROV, "--permission", "auto")
+    run(tmp_path, monkeypatch, PROV + "headless_permission: auto-edit\n", "--permission", "auto", command=cli_mod.cli)
+    assert seen == ["auto", "auto"]
+    out = CliRunner().invoke(cli_mod.cli, ["--help"]).output
+    assert "auto-edit, auto (" in " ".join(out.split())
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("make build", "allow"),  # would ask: auto allows it, headless or not
+        ("rm -rf /", "deny"),  # hardline
+        ("rm build.log", "deny"),  # a user deny rule
+        ("cat .env", "deny"),  # a credential read
+    ],
+)
+def test_headless_auto_decides_like_interactive_auto(tmp_path, command, expected):
+    from k3code.permissions import Rule, decide
+
+    rules = [Rule(tool="bash", pattern="rm *", action="deny")]
+    got = [
+        decide(mode="auto", tool="bash", args={"command": command}, cwd=tmp_path, user_rules=rules, headless=h).action
+        for h in (True, False)
+    ]
+    assert got == [expected, expected]

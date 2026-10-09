@@ -443,6 +443,17 @@ async def _run_repl(
     await reliability.stop()
 
 
+#: ``--permission`` values. ``auto`` is what an unattended ``-p`` run needs: it allows what would only ask (bash
+#: included, run in the sandbox), while the hardline list and deny rules still refuse, exactly as in an interactive
+#: auto session; ``ask`` and ``auto-edit`` deny every shell command that would ask, since nobody can answer.
+PERMISSION_CHOICES = ["ask", "auto-edit", "auto", "yolo"]
+PERMISSION_HELP = (
+    "Permission mode: ask, auto-edit, auto (runs what is not denied, bash in the sandbox; the hardline list and deny "
+    "rules still refuse; the mode for unattended -p runs) or yolo. Default: permission_mode from the config (ask), "
+    "or headless_permission for -p"
+)
+
+
 def _permission_from_config(key: str, value: str) -> PermissionMode:
     """The PermissionMode for a config string. An unknown value is a usage error, not a ValueError traceback."""
     from k3code.permissions import InvalidPermissionMode, permission_mode_from_config
@@ -458,9 +469,9 @@ def _permission_from_config(key: str, value: str) -> PermissionMode:
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
 @click.option(
     "--permission",
-    type=click.Choice(["ask", "auto-edit", "yolo"]),
+    type=click.Choice(PERMISSION_CHOICES),
     default=None,
-    help="Permission mode (default: permission_mode from the config, which defaults to ask)",
+    help=PERMISSION_HELP,
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
 @click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
@@ -487,7 +498,7 @@ def main(
     """k3code — terminal coding agent.
 
     Examples:
-      k3code -p "create hello.py" --permission yolo
+      k3code -p "create hello.py" --permission auto
       k3code -p "fix the bug" --json
       k3code  # starts the TUI (or the REPL with --repl / non-tty)
     """
@@ -672,9 +683,9 @@ def _find_repo_root() -> Path | None:
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
 @click.option(
     "--permission",
-    type=click.Choice(["ask", "auto-edit", "yolo"]),
+    type=click.Choice(PERMISSION_CHOICES),
     default=None,
-    help="Permission mode (default: permission_mode from the config, which defaults to ask)",
+    help=PERMISSION_HELP,
 )
 @click.option("--json", "json_output", is_flag=True, help="Output final result as JSON (headless only)")
 @click.option("--session", "session", default="headless", help="Session id (journal + transcript name)")
@@ -1114,6 +1125,9 @@ def update_cmd(
             ver = upd.update_from_source(src, pull=not no_pull)
         except upd.SourceUpdateError as e:
             raise click.ClickException(str(e)) from e
+        if ver == cur:  # the checkout builds the version that is already active
+            click.echo(f"Already up to date ({ver}).")
+            return
     else:
         assert rel is not None
         click.echo(f"current: {cur}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")

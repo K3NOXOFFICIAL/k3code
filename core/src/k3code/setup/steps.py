@@ -517,12 +517,13 @@ PROJECT_RECIPE_MODES = ("ask", "accept_all", "none")
 def offer_project_recipes(p: Prompter, cwd: Path) -> dict[str, Any]:
     """Scan the project ``cwd`` is in and offer its recipe proposals (k3code.learning.recipes).
 
-    Answers file: ``project_recipes: accept_all | none | ask``; ``ask`` without a terminal means ``none``, and
-    ``none`` scans nothing and creates no proposal (a session still offers them as cards later)."""
+    Answers file: ``project_recipes: accept_all | none | ask``; ``ask`` without a terminal means ``none``. The project
+    is always scanned (read-only) and its stacks and commands shown; ``none`` creates no proposal and stores nothing
+    (a session still offers them as cards later)."""
     import asyncio
 
     from k3code.autonomy.proposals import ProposalStore
-    from k3code.learning import projectprep, projectstate, recipes
+    from k3code.learning import projectprep, projectstate, recipes, stacks
     from k3code.paths import home
 
     mode = str(p.raw("project_recipes", "ask") or "ask")
@@ -530,9 +531,19 @@ def offer_project_recipes(p: Prompter, cwd: Path) -> dict[str, Any]:
         raise ValueError(f"project_recipes must be one of: {', '.join(PROJECT_RECIPE_MODES)} (got {mode!r})")
     if mode == "ask" and not p.interactive:
         mode = "none"
-    if mode == "none":
-        return {"recipes": "none", "accepted": []}
     root = projectstate.project_root(cwd)
+    if mode == "none":
+        found = stacks.scan(root).stacks
+        if not found:
+            p.say(f"No stacks detected in {root}.")
+            return {"recipes": "none", "accepted": []}
+        p.say(f"Project {root}: " + ", ".join(recipes.label(s) for s in found))
+        for s in found:
+            cmds = ", ".join(f"{kind} `{cmd}`" for kind, cmd in (s.get("commands") or {}).items())
+            if cmds:
+                p.say(f"  {recipes.label(s)}: {cmds}")
+        p.say("Recipes not offered (project_recipes: none); a session offers them as cards, or run /project there.")
+        return {"recipes": "none", "accepted": []}
     store = ProposalStore(home())
     asyncio.run(projectprep.prepare(root, store=store))
     found = projectstate.load(root).get("stacks") or []

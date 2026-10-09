@@ -138,7 +138,7 @@ class Settings(BaseModel):
     max_turns: int = 20
     max_tokens: int = 8192
     temperature: float | None = None
-    permission_mode: str = "ask"  # ask | auto-edit | yolo
+    permission_mode: str = "ask"  # ask | auto-edit | plan | auto | yolo
     headless_permission: str | None = None  # overrides permission_mode in -p mode
     # M2 reliability layer; keys mirror reliability.ReliabilitySettings, e.g.
     #   reliability: {enabled: true, max_wait: 3600,

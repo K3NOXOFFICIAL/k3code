@@ -27,6 +27,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from k3code.paths import ensure_private_dir, private_file
+
 #: Message embedded in synthesized tool results for interrupted side-effect tools.
 INTERRUPTED_TEMPLATE = (
     "INTERRUPTED: {tool} may or may not have completed before a crash; "
@@ -73,9 +75,9 @@ class ToolJournal:
     def __init__(self, home: Path, session: str) -> None:
         self.session = session
         self.dir = home / "journal"
-        self.dir.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.dir)  # tool args and results: 0700/0600 whatever the umask
         self.path = self.dir / f"{session}.jsonl"
-        self._fh = self.path.open("a", encoding="utf-8")
+        self._fh = private_file(self.path).open("a", encoding="utf-8")
 
     def close(self) -> None:
         if self._fh and not self._fh.closed:

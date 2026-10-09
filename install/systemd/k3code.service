@@ -19,7 +19,9 @@ MemoryHigh=2G
 MemoryMax=4G
 TasksMax=512
 LimitNOFILE=65536
-UMask=0077
+# The user's usual umask: files the tools write into a project are 0644 like any other. k3code makes its own state
+# (sessions, journals, the token) 0600/0700 itself and does not rely on this.
+UMask=0022
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes

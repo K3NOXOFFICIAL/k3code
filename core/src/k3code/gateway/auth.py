@@ -19,6 +19,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from k3code import paths
+from k3code.paths import ensure_private_dir
 
 #: Request id of the auth frame the bundled clients send first (a string no TUI request id uses).
 AUTH_REQUEST_ID = "k3-gateway-auth"
@@ -33,17 +34,6 @@ def token_path(sock: Path) -> Path:
 def lock_path(sock: Path) -> Path:
     """The single-instance lock of the daemon serving ``sock``: next to it, named after it."""
     return Path(sock).with_suffix(".lock")
-
-
-def ensure_private_dir(path: Path) -> Path:
-    """Create ``path`` as 0700, or tighten an existing one we own to 0700. Refuses a directory another user owns."""
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    st = path.stat()
-    if st.st_uid != os.getuid():
-        raise RuntimeError(f"{path} is owned by another user; the gateway socket and token need a private directory")
-    if st.st_mode & 0o777 != 0o700:
-        path.chmod(0o700)
-    return path
 
 
 def prepare_socket_dir(sock: Path) -> Path:

@@ -152,13 +152,21 @@ def test_windows_shell_points_to_install_ps1(tmp_path: Path) -> None:
 
 
 FAKE_WSL = """#!/bin/sh
-# wsl.exe stand-in: lists one distro, and runs --exec commands here (honouring --cd)
-if [ "$1" = --list ]; then printf '  NAME      STATE           VERSION\\n* Ubuntu    Running         2\\n'; exit 0; fi
+# wsl.exe stand-in for Windows 10's inbox WSL: Ubuntu is the one to use (FAKE_WSL_DOCKER=1: Docker Desktop's distro is
+# the default), there is no --cd option, and --exec runs commands here (wslpath -a returns the path: it is a Linux
+# one here already)
+if [ "$1" = --list ]; then
+  printf '  NAME              STATE           VERSION\\n'
+  if [ "${FAKE_WSL_DOCKER:-0}" = 1 ]; then
+    printf '* docker-desktop    Running         2\\n  Ubuntu            Stopped         2\\n'
+  else printf '* Ubuntu            Running         2\\n'; fi
+  exit 0
+fi
 while [ $# -gt 0 ]; do
   case "$1" in
-    -d) shift ;;
-    --cd) cd "$2" || exit 9; shift ;;
-    --exec) shift; exec "$@" ;;
+    -d) [ "$2" = Ubuntu ] || { echo "not the distro to install into: $2" >&2; exit 8; }; shift ;;
+    --cd) echo "Invalid command line option: --cd" >&2; exit 1 ;;
+    --exec) shift; if [ "$1" = wslpath ]; then printf '%s\\n' "$3"; exit 0; fi; exec "$@" ;;
   esac
   shift
 done
@@ -166,16 +174,19 @@ done
 
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
-def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path) -> None:
+@pytest.mark.parametrize("docker_default", [False, True], ids=["ubuntu-default", "docker-desktop-default"])
+def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path, docker_default: bool) -> None:
     wsl = tmp_path / "wsl"
     wsl.write_text(FAKE_WSL)
     wsl.chmod(0o755)
+    wslpath = stub_bin(tmp_path, "wslpath", 'printf "%s\\n" "$2"\n')  # inside "WSL" (here) paths are Linux already
     appdata = tmp_path / "appdata"
     env = {
-        "PATH": os.environ["PATH"],
+        "PATH": f"{wslpath}{os.pathsep}{os.environ['PATH']}",
         "HOME": str(tmp_path),
         "LOCALAPPDATA": str(appdata),
         "K3_WSL": str(wsl),
+        "FAKE_WSL_DOCKER": "1" if docker_default else "0",
         "K3_STUB_VENV": "1",
         "K3_SKIP_TUI": "1",
         "K3_SKIP_GO": "1",
@@ -191,10 +202,8 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path) -> 
     assert "WSL distribution: Ubuntu" in r.stderr
     assert (tmp_path / ".local" / "share" / "k3code" / "current").is_symlink()
     shim = (appdata / "k3code" / "bin" / "k3code.cmd").read_text()
-    assert f'--exec sh -lc "exec {tmp_path}/.local/bin/k3code \\"$@\\"" k3code %*' in shim
-    # at a drive root %CD% is C:\ and its backslash would escape the closing quote of --cd "...": it is doubled
-    assert 'if "%K3_CD:~-1%"=="\\" set "K3_CD=%K3_CD%\\"' in shim.splitlines()
-    assert ' --cd "%K3_CD%" ' in shim
+    assert f'wsl.exe -d Ubuntu --exec sh -lc "exec {tmp_path}/.local/bin/k3code \\"$@\\"" k3code %*' in shim
+    assert "--cd" not in shim  # wsl.exe starts in the current directory by itself; Windows 10's WSL has no --cd
     assert not (appdata / "k3code" / "bin" / "k3.cmd").exists()  # no k3 binary was built
 
     r = ps("uninstall.ps1")
@@ -214,7 +223,8 @@ def test_relative_prefix_gives_absolute_links(tmp_path: Path) -> None:
     assert link.resolve().is_file()
 
 
-def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> None:
+def mini_checkout(tmp_path: Path) -> tuple[Path, list[str]]:
+    """A committed checkout holding just what install.sh --from-source needs; and the git command for it."""
     src = tmp_path / "src"
     (src / "core").mkdir(parents=True)
     (src / "install").mkdir()
@@ -225,6 +235,43 @@ def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> 
     subprocess.run([*git, "init", "-q"], check=True)
     subprocess.run([*git, "add", "-A"], check=True)
     subprocess.run([*git, "commit", "-qm", "init"], check=True)
+    return src, git
+
+
+def test_a_checkout_owned_by_someone_else_still_names_its_commit(tmp_path: Path) -> None:
+    # A Windows clone seen from WSL, or a shared checkout, can belong to another user: git calls it "dubious" and
+    # refuses every command. The version was then X.Y.Z-src for every commit, so `k3code update --from-source`
+    # reported an update and kept running the first build. GIT_TEST_ASSUME_DIFFERENT_OWNER makes git see that.
+    src, git = mini_checkout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    foreign = {"GIT_TEST_ASSUME_DIFFERENT_OWNER": "1"}
+    assert subprocess.run(["git", "-C", str(src), "status"], env={**os.environ, **foreign}, check=False).returncode
+
+    def version() -> str:
+        r = run(home, src / "install" / "install.sh", "--from-source", "--print-version", env_extra=foreign)
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip()
+
+    first = version()
+    head = subprocess.run([*git, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, check=True)
+    assert first == f"9.9.9-src.{head.stdout.strip()}"
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "next"], check=True)
+    assert version() != first
+
+
+def test_a_checkout_git_cannot_read_is_refused_not_misnamed(tmp_path: Path) -> None:
+    # a .git that git cannot read (here: no commit yet) would name the build X.Y.Z-src, the same for every state
+    src, _ = mini_checkout(tmp_path)
+    shutil.rmtree(src / ".git")
+    subprocess.run(["git", "-C", str(src), "init", "-q"], check=True)
+    r = run(tmp_path / "home", src / "install" / "install.sh", "--from-source", "--print-version")
+    assert r.returncode != 0 and "git cannot read the checkout" in r.stderr
+    assert not r.stdout.strip()
+
+
+def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> None:
+    src, _ = mini_checkout(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
 
@@ -247,10 +294,14 @@ def test_uninstall_removes_the_unit_under_xdg_config_home(tmp_path: Path) -> Non
     unit = xdg / "systemd" / "user" / "k3code.service"
     unit.parent.mkdir(parents=True)
     unit.write_text("[Unit]\n")
-    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CONFIG_HOME": str(xdg)}
+    # the uninstaller's fallback calls systemctl --user: a stub, never the real user manager
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    env = {"PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}", "HOME": str(tmp_path), "XDG_CONFIG_HOME": str(xdg)}
     r = subprocess.run(["sh", str(UNINSTALL)], env=env, capture_output=True, text=True, check=False)
     assert r.returncode == 0, r.stderr
     assert not unit.exists()  # removed even though no k3code is installed to do it
+    assert "systemctl --user disable --now k3code.service" in calls.read_text()
 
 
 def test_presetup_is_the_default_and_minimal_skips_it(tmp_path: Path) -> None:
@@ -568,11 +619,40 @@ def test_a_held_install_lock_stops_a_second_install(tmp_path: Path) -> None:
     assert not (tmp_path / DATA_REL / "versions").exists()
     assert lock.is_dir()  # someone else's lock is never removed
 
+
+def test_a_lock_left_by_a_killed_install_is_taken_over(tmp_path: Path) -> None:
+    # SIGKILL mid-install leaves the lock (with its pid) and a version without .complete: the next run goes on
+    data = tmp_path / DATA_REL
+    lock = data / ".install.lock"
+    lock.mkdir(parents=True)
     dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
     (lock / "pid").write_text(f"{dead}\n")
-    stale = run(tmp_path, INSTALL, "--from-source", "--minimal")
-    assert stale.returncode != 0
-    assert "not running" in stale.stderr and "rm -r" in stale.stderr
+    half = data / "versions" / "0.0.0-half"
+    (half / "venv").mkdir(parents=True)
+    done = data / "versions" / "0.0.0-done"
+    done.mkdir()
+    (done / ".complete").write_text("0.0.0-done\n")
+    (data / "current").symlink_to(done)
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and f"pid {dead}" in r.stderr
+    assert not half.exists() and "unfinished version 0.0.0-half" in r.stderr
+    assert (done / ".complete").is_file()  # the previous version stays (rollback)
+    assert os.readlink(data / "current") != str(done)
+    assert (data / "current").is_symlink() and not lock.exists()
+
+
+def test_a_lock_without_a_pid_is_taken_over_only_when_old(tmp_path: Path) -> None:
+    lock = tmp_path / DATA_REL / ".install.lock"
+    lock.mkdir(parents=True)  # an install killed between mkdir and writing its pid
+    young = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert young.returncode != 0
+    assert "without a pid" in young.stderr and "rm -r" in young.stderr
+    old = time.time() - 7 * 3600
+    os.utime(lock, (old, old))
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and "older than 6 hours" in r.stderr
 
 
 def test_the_install_lock_is_released_after_a_run(tmp_path: Path) -> None:
@@ -806,6 +886,27 @@ def test_uninstall_fallback_removes_both_units(tmp_path: Path) -> None:
     log = calls.read_text()
     assert "disable --now k3code.service k3code-recover.service" in log
     assert "daemon-reload" in log
+
+
+def test_uninstall_with_a_broken_k3code_prints_one_line_not_a_traceback(tmp_path: Path) -> None:
+    units = tmp_path / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    for name in ("k3code.service", "k3code-recover.service"):
+        (units / name).write_text("[Unit]\n")
+    broken = tmp_path / ".local" / "bin" / "k3code"
+    broken.parent.mkdir(parents=True)
+    broken.write_text(
+        "#!/bin/sh\necho 'Traceback (most recent call last):' >&2\necho 'ModuleNotFoundError: k3code' >&2\nexit 1\n"
+    )
+    broken.chmod(0o755)
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    r = run(tmp_path, UNINSTALL, path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    assert "Traceback" not in r.stderr and "ModuleNotFoundError" not in r.stderr
+    assert r.stderr.count("k3code is not runnable; removing units directly") == 1
+    assert not (units / "k3code.service").exists() and not (units / "k3code-recover.service").exists()
+    assert "disable --now k3code.service k3code-recover.service" in calls.read_text()
 
 
 def _git(src: Path, *args: str) -> str:

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from k3code.paths import home
+from k3code.paths import home, private_file
 
 
 def state_path() -> Path:
@@ -33,7 +33,7 @@ def save_state(state: dict[str, Any]) -> None:
     p = state_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    private_file(tmp).write_text(json.dumps(state, indent=2, sort_keys=True))  # setup answers: 0600
     os.replace(tmp, p)
 
 
