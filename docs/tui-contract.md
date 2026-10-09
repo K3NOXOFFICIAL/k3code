@@ -25,7 +25,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | Method | Params | Result | Used by TUI | Notes |
 |--------|--------|--------|-------------|-------|
 | `session.create` | `{profile?, cwd?, model?, goal?, tools?, compact?}` | `{session_id, info: SessionLiveInfo}` | ✅ | New chat session |
-| `session.list` | `{limit?, offset?, include_hidden?}` | `{sessions: SessionListItem[]}` | ✅ | Session picker/history |
+| `session.list` | `{limit?, offset?, include_hidden?, cwd?}` | `{sessions: SessionListItem[]}` | ✅ | Session picker/history; `cwd` keeps that project's non-empty, non-automation sessions (limit applied after) |
 | `session.active_list` | `{current_session_id?}` | `{sessions: ActiveSession[]}` | ✅ | Agent strip / switcher |
 | `session.resume` | `{session_id, compact?}` | `{session_id, info: SessionLiveInfo}` | ✅ | Resume stored session |
 | `session.activate` | `{session_id}` | `{session_id, info: SessionLiveInfo}` | ✅ | Switch active session |

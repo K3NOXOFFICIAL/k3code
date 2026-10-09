@@ -251,4 +251,51 @@ describe("AgentViewPane", () => {
       resetUiState();
     }
   });
+
+  it("asks the gateway for the current project's earlier sessions only", async () => {
+    resetUiState();
+    patchUiState({
+      info: { cwd: "/work/proj", model: "test", skills: {}, tools: {} },
+      sid: "cur",
+    });
+
+    const request = vi.fn(() => Promise.resolve({ sessions: [] }));
+    const stdin = Object.assign(new PassThrough(), {
+      isTTY: true,
+      ref: () => {},
+      setRawMode: () => {},
+      unref: () => {},
+    });
+    const view = renderSync(
+      <AgentViewPane
+        gw={{ request } as unknown as GatewayClient}
+        onActivate={() => {}}
+        onClose={() => {}}
+        onNew={() => {}}
+        onStop={() => {}}
+      />,
+      {
+        patchConsole: false,
+        stderr: new PassThrough() as unknown as NodeJS.WriteStream,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        stdout: Object.assign(new PassThrough(), {
+          columns: 90,
+          isTTY: false,
+          rows: 30,
+        }) as unknown as NodeJS.WriteStream,
+      },
+    );
+
+    try {
+      await vi.waitFor(() => expect(request).toHaveBeenCalled());
+      expect(request).toHaveBeenCalledWith("session.list", {
+        cwd: "/work/proj",
+        limit: 50,
+      });
+    } finally {
+      view.unmount();
+      view.cleanup();
+      resetUiState();
+    }
+  });
 });

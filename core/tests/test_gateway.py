@@ -158,6 +158,86 @@ async def test_session_cwd_is_normalised_for_equality(tmp_path):
     await server.close()
 
 
+def _stored(server: GatewayServer, cwd: str, *, updated_at: float, messages: int = 1, origin: str = "") -> str:
+    """A stored session with ``messages`` user turns and a fixed ``updated_at`` (list order is by that column)."""
+    s = server.store.create(cwd=cwd)
+    s.messages = [{"role": "user", "content": f"q{i}"} for i in range(messages)]
+    if origin:
+        s.meta["origin"] = origin
+    server.store.save(s)
+    server.store._db.execute("UPDATE sessions SET updated_at = ? WHERE session_id = ?", (updated_at, s.session_id))
+    server.store._db.commit()
+    return s.session_id
+
+
+async def test_session_list_cwd_returns_only_that_projects_sessions(tmp_path):
+    """The agent view asks for the current project's earlier sessions: another project's, an automation run's and an
+    empty one's stay out, and an old row spelled through a symlink or with a trailing slash still counts."""
+    real = tmp_path / "proj"
+    real.mkdir()
+    (tmp_path / "other").mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    server = make_server()
+    plain = _stored(server, str(real), updated_at=10)
+    via_link = _stored(server, f"{link}/", updated_at=9)
+    slash = _stored(server, f"{real}/", updated_at=8)
+    _stored(server, str(tmp_path / "other"), updated_at=11)
+    _stored(server, str(real), updated_at=12, origin="automation")
+    _stored(server, str(real), updated_at=13, messages=0)
+    res = (await rpc(server, "session.list", {"cwd": f"{link}/", "limit": 50}))["result"]["sessions"]
+    assert [r["id"] for r in res] == [plain, via_link, slash]
+    assert {r["cwd"] for r in res} == {str(real.resolve())}
+    await server.close()
+
+
+async def test_session_list_cwd_applies_the_limit_after_filtering(tmp_path):
+    """A busy daemon's newer sessions in other projects must not crowd this project's history out of the page."""
+    (tmp_path / "proj").mkdir()
+    (tmp_path / "busy").mkdir()
+    server = make_server()
+    mine = [_stored(server, str(tmp_path / "proj"), updated_at=t) for t in (2, 1, 0.5)]
+    for t in range(300):  # more than one scan page, all newer than mine
+        _stored(server, str(tmp_path / "busy"), updated_at=100 + t)
+    res = (await rpc(server, "session.list", {"cwd": str(tmp_path / "proj"), "limit": 2}))["result"]["sessions"]
+    assert [r["id"] for r in res] == mine[:2]
+    await server.close()
+
+
+async def test_session_list_without_cwd_is_unchanged(tmp_path):
+    """Other callers (the session switcher) still get every project, automation runs and empty sessions included."""
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    server = make_server()
+    ids = {
+        _stored(server, str(tmp_path / "a"), updated_at=4),
+        _stored(server, str(tmp_path / "b"), updated_at=3),
+        _stored(server, str(tmp_path / "a"), updated_at=2, origin="automation"),
+        _stored(server, str(tmp_path / "a"), updated_at=1, messages=0),
+    }
+    res = (await rpc(server, "session.list", {"limit": 50}))["result"]["sessions"]
+    assert {r["id"] for r in res} == ids
+    await server.close()
+
+
+async def test_resumed_session_reports_its_cwd_normalised(tmp_path, monkeypatch):
+    """A session stored as ``<symlink>/`` (before normalisation existed) reports the real path once resumed, so the
+    agent view's project filter matches it."""
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    real = tmp_path / "proj"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    server = make_server()
+    stored = server.store.create(model="m", cwd=f"{link}/")
+    for req_id, method in ((7, "session.resume"), (8, "session.activate")):
+        line = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": {"session_id": stored.session_id}}
+        await server._handle_line(json.dumps(line))  # resume also emits progress events: pick our response by id
+        res = next(f for f in frames_of(server) if f.get("id") == req_id)
+        assert res["result"]["info"]["cwd"] == str(real.resolve()), method
+    await server.close()
+
+
 async def test_prompt_submit_without_session_is_invalid_params():
     server = make_server()
     frame = await rpc(server, "prompt.submit", {"text": "hi"})

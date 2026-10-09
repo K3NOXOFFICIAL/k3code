@@ -140,12 +140,12 @@ class SessionStore:
         ).fetchall()
         return [s for s in (self.get(row[0]) for row in ids) if s is not None]
 
-    def list(self, *, limit: int = 50, include_automation: bool = True) -> list[StoredSession]:
+    def list(self, *, limit: int = 50, include_automation: bool = True, offset: int = 0) -> list[StoredSession]:
         where = "" if include_automation else " WHERE COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
         rows = self._db.execute(
             "SELECT session_id, title, model, provider, cwd, messages, usage, created_at, updated_at"
-            f" FROM sessions{where} ORDER BY updated_at DESC LIMIT ?",  # noqa: S608
-            (max(1, limit),),
+            f" FROM sessions{where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",  # noqa: S608
+            (max(1, limit), max(0, offset)),
         ).fetchall()
         out: list[StoredSession] = []
         for row in rows:

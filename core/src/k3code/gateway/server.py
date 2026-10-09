@@ -60,7 +60,7 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
-from k3code.gateway.sessions import SessionStore
+from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
@@ -2441,10 +2441,44 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"session_id": stored.session_id, "info": live.live_info()}
 
 
+#: Most stored rows ``session.list {cwd}`` reads looking for that project's sessions (newest first). Old rows can spell
+#: the cwd with a symlink or trailing slash, so the match is made in Python, not with ``WHERE cwd = ?``.
+_SESSION_LIST_SCAN_CAP = 2000
+_SESSION_LIST_SCAN_PAGE = 200
+
+
+def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[StoredSession]:
+    """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised)."""
+    spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
+    out: list[StoredSession] = []
+    offset = 0
+    while offset < _SESSION_LIST_SCAN_CAP:
+        page = server.store.list(
+            limit=min(_SESSION_LIST_SCAN_PAGE, _SESSION_LIST_SCAN_CAP - offset),
+            include_automation=False,
+            offset=offset,
+        )
+        for s in page:
+            if s.cwd not in spelled:
+                spelled[s.cwd] = _norm_cwd(s.cwd)
+            if s.messages and spelled[s.cwd] == cwd:
+                out.append(s)
+                if len(out) >= limit:
+                    return out
+        if len(page) < _SESSION_LIST_SCAN_PAGE:
+            break
+        offset += len(page)
+    return out
+
+
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``cwd`` (optional) narrows the list to that project's earlier sessions: same normalised cwd, at least one
+    message, no automation runs, ``limit`` applied after the filter. Without it: the newest ``limit`` of all."""
     limit = int(params.get("limit") or 50)
+    cwd = _norm_cwd(params.get("cwd"))
+    sessions = _project_sessions(server, cwd, max(1, limit)) if cwd else server.store.list(limit=limit)
     rows = []
-    for s in server.store.list(limit=limit):
+    for s in sessions:
         preview = ""
         for m in s.messages:
             if m.get("role") == "user" and m.get("content"):

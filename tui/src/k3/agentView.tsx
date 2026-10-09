@@ -250,7 +250,11 @@ export function AgentViewPane({
   useEffect(() => {
     let stopped = false;
 
-    gw.request<SessionListResult>("session.list", { limit: 50 })
+    // The gateway filters by project (`cwd`) before applying the limit; buildViewRows re-checks it.
+    gw.request<SessionListResult>("session.list", {
+      ...(currentCwd ? { cwd: currentCwd } : {}),
+      limit: 50,
+    })
       .then((raw) => {
         if (stopped) {
           return;
@@ -278,7 +282,7 @@ export function AgentViewPane({
     return () => {
       stopped = true;
     };
-  }, [gw]);
+  }, [currentCwd, gw]);
 
   const rows = useMemo(
     () =>
