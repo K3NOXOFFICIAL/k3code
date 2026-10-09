@@ -103,6 +103,8 @@ def unsafe_pattern(pattern: str) -> bool:
     root = tokens[0].rsplit("/", 1)[-1]
     if root in UNSAFE_ROOTS or root.startswith(UNSAFE_PREFIXES):
         return True
+    if "*" in pattern and hardline.wildcard_unsafe(pattern):
+        return True  # `uv *`, `npx *`, `docker run *`: the wildcard covers whatever program they are told to run
     return hardline.check(pattern.replace(" *", "")) is not None or any(c in pattern for c in "$`;|&<>")
 
 
