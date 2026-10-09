@@ -11,6 +11,7 @@ from typing import Any
 
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning.decisions import project_id
+from k3code.memory import PROJECT_FILES
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 
@@ -248,7 +249,7 @@ async def prepare(
         if p is not None:
             out.append(p)
 
-    if not any((root / n).is_file() for n in ("K3CODE.md", "AGENTS.md")):
+    if not any((root / n).is_file() for n in PROJECT_FILES):  # K3CODE.md, AGENTS.md or CLAUDE.md
         # drafted on the cheap tier when accepted (no model call on session start)
         add(
             "project_setup",
