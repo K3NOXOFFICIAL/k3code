@@ -2123,16 +2123,18 @@ class GatewayServer:
         The store decides what counts as empty and unclaimed; this adds what only the server knows: live sessions,
         the ones a client looks at, and those any loop or automation, paused ones included, points at.
 
-        Known limitation: a standalone stdio TUI/CLI sharing sessions.db can hold an empty session open longer than
-        ``max_age`` (30 days); if the daemon deletes its row, that process's later saves are lost, because ``save()``
-        is a plain UPDATE. It must stay one: an upsert would resurrect sessions deleted with ``session.delete``."""
+        A standalone stdio TUI/CLI sharing sessions.db can hold an empty session open longer than ``max_age``
+        (30 days) and so lose its row here. Each deleted row leaves a tombstone (``swept_sessions``, written in the
+        same transaction), and ``save()`` re-inserts a missing row only when its tombstone is there, so that
+        process's next save restores the session. ``save()`` is no upsert: a row removed by ``session.delete`` has
+        no tombstone and stays gone. The sweep forgets tombstones after 90 days."""
         keep = self._sweep_keep()
         return 0 if keep is None else self.store.sweep_empty(now=now, max_age=max_age, keep=keep)
 
     async def sweep_empty_sessions_async(
         self, *, now: float | None = None, max_age: float = EMPTY_SESSION_MAX_AGE_S
     ) -> int:
-        """:meth:`sweep_empty_sessions` in small batches that yield to the event loop (same limitation)."""
+        """:meth:`sweep_empty_sessions` in small batches that yield to the event loop (same tombstones)."""
         keep = self._sweep_keep()
         return 0 if keep is None else await self.store.sweep_empty_async(now=now, max_age=max_age, keep=keep)
 

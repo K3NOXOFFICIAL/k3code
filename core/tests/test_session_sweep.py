@@ -4,12 +4,16 @@ start leaves a 0-message row; hidden from the agent view, auto-resume and the sw
 from __future__ import annotations
 
 import asyncio
+import logging
+import sqlite3
 import time
+
+import pytest
 
 import m1cmd_helpers as m1
 from k3code import daemon
 from k3code.automation.engine import AutomationEngine
-from k3code.gateway.sessions import SessionStore
+from k3code.gateway.sessions import SessionStore, StoredSession
 from test_daemon import _write_fake_config
 
 DAY = 24 * 3600.0
@@ -238,3 +242,184 @@ async def test_daemon_does_not_sweep_when_already_stopping(tmp_path, monkeypatch
     await daemon._sweep_empty_sessions(server)
     assert calls == []
     await server.close()
+
+
+# --- tombstones: a process that still holds a swept session (a standalone stdio TUI) gets it back on its next save
+
+
+def _tombstones(store: SessionStore) -> dict[str, float]:
+    return dict(store._db.execute("SELECT session_id, swept_at FROM swept_sessions").fetchall())
+
+
+def _row_count(store: SessionStore) -> int:
+    return store._db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+
+def _swept(store: SessionStore, now: float, **create) -> StoredSession:
+    """An empty session the caller still holds, aged past the limit and swept away under it."""
+    held = store.create(**create)
+    _age(store, held.session_id, now - 31 * DAY)
+    assert store.sweep_empty(now=now) == 1
+    return held
+
+
+class _NoTombstones:
+    """The store's connection, except that writing a tombstone fails (a full disk, say)."""
+
+    def __init__(self, db: sqlite3.Connection) -> None:
+        self.db = db
+
+    def __getattr__(self, name):
+        return getattr(self.db, name)
+
+    def __enter__(self):
+        return self.db.__enter__()
+
+    def __exit__(self, *exc):
+        return self.db.__exit__(*exc)
+
+    def execute(self, sql, *args):
+        if "INTO swept_sessions" in sql:
+            raise sqlite3.OperationalError("database or disk is full")
+        return self.db.execute(sql, *args)
+
+
+def test_sweep_writes_the_tombstone_in_the_same_transaction_as_the_delete(tmp_path):
+    store = SessionStore(tmp_path / "s.db")
+    now = time.time()
+    a, b = store.create(), store.create()
+    for sid in (a.session_id, b.session_id):
+        _age(store, sid, now - 31 * DAY)
+
+    real = store._db
+    store._db = _NoTombstones(real)  # type: ignore[assignment]
+    with pytest.raises(sqlite3.OperationalError):
+        store.sweep_empty(now=now)
+    store._db = real
+    real.commit()  # whatever the failed sweep left pending must not be a delete without its tombstone
+    assert store.get(a.session_id) is not None and store.get(b.session_id) is not None
+    assert _tombstones(store) == {}
+
+    assert store.sweep_empty(now=now) == 2
+    assert store.get(a.session_id) is None and store.get(b.session_id) is None
+    assert _tombstones(store) == {a.session_id: now, b.session_id: now}
+
+
+def test_save_after_the_sweep_restores_the_row_and_clears_the_tombstone(tmp_path, caplog):
+    store = SessionStore(tmp_path / "s.db")
+    now = time.time()
+    held = _swept(store, now, model="m1", provider="p1", cwd="/old")
+    created_at = held.created_at
+    assert store.get(held.session_id) is None  # reading does not bring it back: only a save does
+    assert held.session_id in _tombstones(store)
+
+    held.messages = [{"role": "user", "content": "still here"}]
+    held.title = "late work"
+    held.meta = {"mode": "plan", "add_dirs": ["/extra"]}
+    held.cwd = "/new"
+    held.usage = {"input_tokens": 3}
+    held.model, held.provider = "m2", "p2"
+    with caplog.at_level(logging.INFO, logger="k3code.gateway.sessions"):
+        store.save(held)
+        got = store.get(held.session_id)
+        assert got is not None
+        assert (got.messages, got.title, got.meta, got.cwd, got.usage, got.model, got.provider) == (
+            [{"role": "user", "content": "still here"}],
+            "late work",
+            {"mode": "plan", "add_dirs": ["/extra"]},
+            "/new",
+            {"input_tokens": 3},
+            "m2",
+            "p2",
+        )
+        assert got.created_at == created_at and got.updated_at == held.updated_at
+        assert _tombstones(store) == {}
+
+        # the next save is an ordinary update of the restored row
+        held.messages.append({"role": "assistant", "content": "ok"})
+        store.save(held)
+    again = store.get(held.session_id)
+    assert again is not None and len(again.messages) == 2 and again.title == "late work"
+    assert _row_count(store) == 1
+    restored = [r for r in caplog.records if "restored" in r.getMessage() and held.session_id in r.getMessage()]
+    assert len(restored) == 1 and restored[0].levelno == logging.INFO
+
+
+def test_save_after_session_delete_does_not_recreate(tmp_path):
+    store = SessionStore(tmp_path / "s.db")
+    now = time.time()
+    plain = store.create()
+    assert store.delete(plain.session_id)
+    plain.messages = [{"role": "user", "content": "x"}]
+    store.save(plain)
+    assert store.get(plain.session_id) is None
+
+    # swept first, then deleted by the user (the delete finds no row): the tombstone goes with the delete
+    held = _swept(store, now)
+    assert not store.delete(held.session_id)
+    assert _tombstones(store) == {}
+    held.messages = [{"role": "user", "content": "x"}]
+    store.save(held)
+    assert store.get(held.session_id) is None
+    assert _row_count(store) == 0
+
+
+def test_save_for_an_id_never_seen_stays_a_no_op(tmp_path):
+    store = SessionStore(tmp_path / "s.db")
+    store.save(StoredSession(session_id="never-seen", title="t", messages=[{"role": "user", "content": "x"}]))
+    assert store.get("never-seen") is None
+    assert _row_count(store) == 0 and _tombstones(store) == {}
+
+
+def test_sweep_prunes_tombstones_older_than_90_days(tmp_path):
+    store = SessionStore(tmp_path / "s.db")
+    now = time.time()
+    held = _swept(store, now)
+    assert store.sweep_empty(now=now + 89 * DAY) == 0
+    assert _tombstones(store) == {held.session_id: now}
+    assert store.sweep_empty(now=now + 91 * DAY) == 0  # nothing to delete: the prune still runs
+    assert _tombstones(store) == {}
+    held.messages = [{"role": "user", "content": "too late"}]
+    store.save(held)
+    assert store.get(held.session_id) is None
+
+
+async def test_async_sweep_prunes_and_writes_tombstones(tmp_path):
+    store = SessionStore(tmp_path / "s.db")
+    now = time.time()
+    old = _swept(store, now - 100 * DAY)
+    fresh = store.create()
+    _age(store, fresh.session_id, now - 31 * DAY)
+    assert await store.sweep_empty_async(now=now) == 1
+    assert _tombstones(store) == {fresh.session_id: now}
+    assert old.session_id not in _tombstones(store)
+
+
+def test_sweep_with_tombstones_is_idempotent(tmp_path):
+    store = SessionStore(tmp_path / "s.db")
+    now = time.time()
+    held = _swept(store, now)
+    assert store.sweep_empty(now=now + DAY) == 0
+    assert _tombstones(store) == {held.session_id: now}
+    reopened = SessionStore(tmp_path / "s.db")  # the schema statements are idempotent too
+    assert _tombstones(reopened) == {held.session_id: now}
+    reopened.close()
+
+
+def test_daemon_sweeps_while_a_stdio_process_holds_the_session(tmp_path):
+    db = tmp_path / "sessions.db"
+    daemon_store, stdio_store = SessionStore(db), SessionStore(db)  # two processes, two connections
+    now = time.time()
+    held = stdio_store.create(cwd="/proj")
+    _age(daemon_store, held.session_id, now - 31 * DAY)
+    assert daemon_store.sweep_empty(now=now) == 1
+    assert stdio_store.get(held.session_id) is None
+
+    held.messages = [{"role": "user", "content": "saved after the sweep"}]
+    stdio_store.save(held)
+    got = daemon_store.get(held.session_id)
+    assert got is not None and got.messages == held.messages and got.cwd == "/proj"
+    assert _tombstones(daemon_store) == {}
+    assert daemon_store.sweep_empty(now=now) == 0  # it has a message now
+    daemon_store.close()
+    stdio_store.close()
