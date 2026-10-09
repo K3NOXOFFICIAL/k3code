@@ -108,13 +108,17 @@ The macOS and Windows installer jobs ran on GitHub's paid runners. `scripts/ci/p
 Linux machine with podman or docker:
 
 ```sh
-scripts/ci/platforms.sh                 # ubuntu, debian, alpine and wsl; core only (about five minutes)
-scripts/ci/platforms.sh --full ubuntu   # also builds the TUI and the k3 binary
+scripts/ci/platforms.sh                     # ubuntu, ubuntu2204, debian, fedora, alpine and wsl; core only
+scripts/ci/platforms.sh fedora ubuntu2204   # only these targets (about a minute each once the images are pulled)
+scripts/ci/platforms.sh --full ubuntu2204   # also builds the TUI and the k3 binary (two to three minutes)
 ```
 
 Each target installs a clone of `HEAD` as a normal user in a clean container, commits on top, runs `k3code update`,
-checks that the version switched and that a second update is a no-op, rolls back and uninstalls. `ubuntu` is the
-distribution `wsl --install` sets up, `debian` runs the installer under dash and `alpine` under BusyBox on musl. `wsl`
+checks that the version switched and that a second update is a no-op, rolls back and uninstalls; the result line names
+each step with its time, or the step that failed. `ubuntu` is the distribution `wsl --install` sets up. `ubuntu2204`
+is a bare 22.04 with only git and curl added (the run fails if Go, unzip or python3 came along): it has no Go new
+enough for `panes/go.mod`, so `--full ubuntu2204` checks that the installer fetches its own. `fedora` (44) prepares
+with dnf. `debian` runs the installer under dash and `alpine` under BusyBox on musl. `wsl`
 runs `install.ps1` and `uninstall.ps1` with PowerShell 7 (`pwsh`) against a `wsl.exe` stand-in that behaves like the
 WSL Windows 10 ships with (no `--cd`) and runs each command in an Ubuntu container, on a checkout that belongs to
 another user, as a clone made by Windows git can when WSL sees it; it updates with `k3code update --from-source`.

@@ -121,3 +121,12 @@ def test_learning_preferences_and_mem0_ledger_are_0600_whatever_the_umask(tmp_pa
     assert mode(prefs) == 0o600
     assert mode(ledger) == 0o600
     assert mode(prefs.parent) == 0o700
+
+
+def test_setup_user_md_is_0600_whatever_the_umask() -> None:
+    from k3code.setup import steps
+
+    with umask(0):
+        path = steps.write_user_md({"name": "Alice"})
+    assert mode(path) == 0o600
+    assert mode(path.parent) == 0o700
