@@ -11,11 +11,14 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
+
+from k3code.net_guard import BlockedURL, acheck_url, web_settings
 
 MAX_FETCH_BYTES = 2 * 1024 * 1024  # how much of a response body is read at most
 ROBOTS_MAX_BYTES = 512 * 1024
@@ -80,11 +83,14 @@ class WebFetcher:
         max_bytes: int = MAX_FETCH_BYTES,
         cache_size: int = 256,
         client: httpx.AsyncClient | None = None,
+        allow_private: bool = False,
+        allow_hosts: frozenset[str] = frozenset(),
         now: Clock = time.monotonic,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         self.ttl, self.deadline, self.respect_robots, self.max_bytes = ttl, deadline, respect_robots, max_bytes
         self.per_host_rate, self.burst, self.cache_size = max(per_host_rate, 1e-6), max(burst, 1.0), cache_size
+        self.allow_private, self.allow_hosts = allow_private, allow_hosts  # SSRF guard escape hatches
         self._client = client
         self._owns_client = client is None
         self._now, self._sleep = now, sleep
@@ -93,9 +99,12 @@ class WebFetcher:
         self._robots: dict[str, tuple[float, RobotFileParser | None, bool]] = {}  # origin -> (expires, rules, deny)
 
     @classmethod
-    def from_config(cls, research: dict[str, Any] | None) -> WebFetcher:
+    def from_config(cls, research: dict[str, Any] | None, web: dict[str, Any] | None = None) -> WebFetcher:
         cfg = dict(research or {})
+        allow_private, allow_hosts = web_settings(SimpleNamespace(research=cfg, web=web))
         return cls(
+            allow_private=allow_private,
+            allow_hosts=allow_hosts,
             ttl=float(cfg.get("fetch_cache_ttl", 900)),
             per_host_rate=float(cfg.get("fetch_rate_per_host", 1.0)),
             deadline=float(cfg.get("fetch_deadline", 20)),
@@ -115,10 +124,18 @@ class WebFetcher:
             await self._client.aclose()
         self._client = None
 
+    async def _vet(self, url: str) -> None:
+        """SSRF guard for one hop: http(s) only, and no host that resolves to a private/loopback address."""
+        try:
+            await acheck_url(url, allow_private=self.allow_private, allow_hosts=self.allow_hosts)
+        except BlockedURL as e:
+            raise FetchRefused(str(e)) from e
+
     async def admit(self, url: str) -> None:
-        """robots.txt and the per-host rate for a navigation made outside ``get()`` (the browser tool)."""
+        """SSRF guard, robots.txt and the per-host rate for a navigation made outside ``get()`` (the browser tool)."""
         if _safe_url(url) is None:
             raise ValueError(f"not an http(s) URL: {url}")
+        await self._vet(url)
         if self.respect_robots and (reason := await self._robots_refusal(url, self._now() + self.deadline)):
             raise FetchRefused(reason)
         await self._throttle(urlparse(url).netloc.lower())
@@ -129,6 +146,7 @@ class WebFetcher:
             raise ValueError(f"not an http(s) URL: {url}")
         if (hit := self._cache.get(url)) and hit[0] > self._now():
             return replace(hit[1], cached=True)
+        await self._vet(url)  # before robots.txt: a blocked host must not get a robots.txt request either
         deadline_at = self._now() + self.deadline
         if self.respect_robots and (reason := await self._robots_refusal(url, deadline_at)):
             raise FetchRefused(reason)
@@ -143,6 +161,7 @@ class WebFetcher:
         per-host bucket when ``admit``), the hop count is bounded and ``Fetched.url`` is the page the body came from.
         The first hop was admitted by the caller."""
         for hop in range(MAX_REDIRECTS + 1):
+            await self._vet(url)  # every hop: the first, each redirect target, robots.txt fetches included
             got = await self._stream(url, deadline_at, max_bytes)
             got = replace(got, url=url)
             if got.status not in REDIRECTS or not got.location:

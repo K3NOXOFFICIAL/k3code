@@ -516,7 +516,7 @@ def register_web_tools(
     cfg = dict(getattr(config, "research", None) or {})
     searx = SearxngSearch(cfg.get("searxng_url", DEFAULT_SEARXNG))
     ddg = DuckDuckGoSearch() if bool(cfg.get("keyless_fallback", True)) else None
-    fetcher = fetcher or WebFetcher.from_config(cfg)
+    fetcher = fetcher or WebFetcher.from_config(cfg, getattr(config, "web", None))
     browser = browser or BrowserManager.from_config(config)
 
     async def tool_fetch(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
