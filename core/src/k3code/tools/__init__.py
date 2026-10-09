@@ -393,7 +393,8 @@ def format_tool_result(result: dict[str, Any]) -> Any:
             text = f"{text}\n[{result['warnings']}]" if text else f"[{result['warnings']}]"
         return text or "(no matches)"
     if "files" in result and isinstance(result["files"], list):  # glob
-        return "\n".join(str(f) for f in result["files"]) or "(no files)"
+        text = "\n".join(str(f) for f in result["files"]) or "(no files)"
+        return f"{text}\n[{result['note']}]" if result.get("note") else text
     if result.keys() == {"ok", "path"} and result["ok"] is True:  # write
         return f"Wrote {result['path']}"
     if result.keys() == {"ok", "replacements", "strategy"} and result["ok"] is True:  # edit
@@ -580,33 +581,112 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
             raise RuntimeError(stderr.decode("utf-8", errors="replace"))
         return {"matches": stdout.decode("utf-8", errors="replace").strip()}
     except (FileNotFoundError, RuntimeError):
-        # Python fallback
-        import re
+        # Python fallback (no rg): off the event loop, same tree rules as glob, capped
+        return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude)
 
-        matches = []
-        for root, _dirs, files in os.walk(path):
-            for f in files:
-                if include and not any(Path(f).match(p) for p in (include if isinstance(include, list) else [include])):
-                    continue
-                if exclude and any(Path(f).match(p) for p in (exclude if isinstance(exclude, list) else [exclude])):
-                    continue
-                fp = Path(root) / f
-                try:
-                    text = fp.read_text(encoding="utf-8", errors="replace")
-                    for i, line in enumerate(text.splitlines(), 1):
-                        if re.search(pattern, line):
-                            matches.append(f"{fp}:{i}:{line}")
-                except Exception:
-                    pass
-        return {"matches": "\n".join(matches)}
+
+#: Directories glob and the grep fallback never enter (rg skips them through .gitignore or as hidden).
+SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "dist"})
+#: Most paths a glob returns, and most lines the grep fallback returns; past it the result says it was cut.
+MAX_SEARCH_RESULTS = 1000
+
+
+def _git_files(path: Path) -> list[str] | None:
+    """Files under ``path`` that git tracks or would track (``.gitignore`` honoured), relative to ``path``; None when
+    ``path`` is not in a git work tree or git is missing."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(path), "ls-files", "-co", "--exclude-standard", "-z"],
+            capture_output=True,
+            timeout=15,
+            check=False,
+            env=child_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f]
+
+
+def _tree(path: Path) -> tuple[list[str], list[str]]:
+    """(files, directories) under ``path`` as relative posix paths, without SKIP_DIRS: from git when ``path`` is in a
+    work tree (so ``.gitignore`` holds), else from a walk that prunes them."""
+    tracked = _git_files(path)
+    if tracked:  # empty: not a work tree, or a path git ignores as a whole (asked for on purpose): walk it
+        files = [f for f in tracked if not SKIP_DIRS.intersection(f.split("/")[:-1])]
+        dirs = sorted({"/".join(f.split("/")[:i]) for f in files for i in range(1, f.count("/") + 1)})
+        return files, dirs
+    files, dirs = [], []
+    for root, subdirs, names in os.walk(path):
+        subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+        rel = Path(root).relative_to(path).as_posix()
+        prefix = "" if rel == "." else rel + "/"
+        dirs.extend(prefix + d for d in subdirs)
+        files.extend(prefix + n for n in names)
+    return files, dirs
+
+
+def _match_parts(parts: list[str], pats: list[str]) -> bool:
+    import fnmatch
+
+    if not pats:
+        return not parts
+    if pats[0] == "**":
+        return any(_match_parts(parts[i:], pats[1:]) for i in range(len(parts) + 1))
+    return bool(parts) and fnmatch.fnmatchcase(parts[0], pats[0]) and _match_parts(parts[1:], pats[1:])
+
+
+def _glob_match(rel: str, pattern: str) -> bool:
+    """``Path.rglob`` semantics: ``pattern`` may start at any depth (``*.py`` finds ``a/b/c.py``)."""
+    pats = [p for p in pattern.split("/") if p not in ("", ".")]
+    return _match_parts(rel.split("/"), ["**", *pats])
+
+
+def _capped(items: list[str]) -> tuple[list[str], str]:
+    if len(items) <= MAX_SEARCH_RESULTS:
+        return items, ""
+    note = f"truncated to the first {MAX_SEARCH_RESULTS} results: narrow the pattern or path"
+    return items[:MAX_SEARCH_RESULTS], note
+
+
+def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
+    files, dirs = _tree(path)
+    found, note = _capped(sorted(p for p in (*files, *dirs) if _glob_match(p, pattern)))
+    return {"files": found, **({"note": note} if note else {})}
+
+
+def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict[str, Any]:
+    import re
+
+    includes = include if isinstance(include, list) else [include] if include else []
+    excludes = exclude if isinstance(exclude, list) else [exclude] if exclude else []
+    rx = re.compile(pattern)
+    candidates = [path] if path.is_file() else [path / f for f in _tree(path)[0]]
+    matches: list[str] = []
+    for fp in candidates:
+        if includes and not any(Path(fp.name).match(p) for p in includes):
+            continue
+        if excludes and any(Path(fp.name).match(p) for p in excludes):
+            continue
+        try:
+            text = fp.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        matches.extend(f"{fp}:{i}:{line}" for i, line in enumerate(text.splitlines(), 1) if rx.search(line))
+        if len(matches) > MAX_SEARCH_RESULTS:
+            break
+    shown, note = _capped(matches)
+    return {"matches": "\n".join(shown), **({"warnings": note} if note else {})}
 
 
 async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Find files matching a glob pattern."""
+    """Find files matching a glob pattern (skipping .git, node_modules, .venv, dist and what .gitignore ignores)."""
     pattern = arguments["pattern"]
     path = _resolve_path(arguments.get("path", "."), cwd)
-    files = list(path.rglob(pattern))
-    return {"files": [str(f.relative_to(path)) for f in files]}
+    return await asyncio.to_thread(_glob_sync, path, pattern)
 
 
 async def tool_todo(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:

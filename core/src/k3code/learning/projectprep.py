@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -233,7 +234,7 @@ async def prepare(
     info = detect(root)
     if info["language"] == "unknown" and not (root / ".git").exists() and not info["docker"]:
         return []  # not a project (empty or scratch directory): nothing to prepare
-    risks = scan_risks(root, info)
+    risks = await asyncio.to_thread(scan_risks, root, info)  # walks and reads up to 2000 files: off the event loop
     meta = {**info, "risks": risks, "detected_at": clock(), "project": project_id(root)}
     path = project_json_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)

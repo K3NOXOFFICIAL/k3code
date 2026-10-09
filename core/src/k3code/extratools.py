@@ -26,8 +26,14 @@ def register_skill_tool(reg: ToolRegistry, cwd: Path, roots: list[str]) -> None:
                 return {"error": f"Unknown skill: {name}.{hint}"}
             from k3code.learning.curator import record_use
 
-            record_use(skill.name)
-            text = skill.text()
+            try:
+                text = skill.text()
+            except OSError as e:  # deleted or unreadable since discovery: a failed use (the curator flags it)
+                record_use(skill.name, ok=False)
+                return {"error": f"Skill {skill.name} could not be read: {e}"}
+            record_use(skill.name, ok=bool(text.strip()))  # an empty SKILL.md gave the model nothing
+            if not text.strip():
+                return {"error": f"Skill {skill.name} is empty ({skill.path})"}
             if len(text) > MAX_SKILL_CHARS:
                 text = text[:MAX_SKILL_CHARS] + "\n…(truncated)"
             return {"content": f"# Skill: {skill.name}\n(location: {skill.path.parent})\n\n{text}"}

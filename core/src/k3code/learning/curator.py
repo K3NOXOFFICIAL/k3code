@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from collections.abc import Callable
@@ -40,8 +41,13 @@ def record_use(name: str, *, ok: bool = True, clock: Callable[[], float] = time.
     e["uses"] += 1
     e["failures"] += 0 if ok else 1
     e["last_used"] = clock()
-    _usage_path().parent.mkdir(parents=True, exist_ok=True)
-    _usage_path().write_text(json.dumps(data, indent=1), encoding="utf-8")
+    path = _usage_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # temp file + rename: a crash (or a second process) mid-write left a truncated file, which load_usage then read
+    # as empty and the next write made every count start over
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def list_skills(root: Path | None = None) -> list[dict[str, Any]]:
