@@ -441,6 +441,8 @@ def check_project(project_dir: Path) -> Check:
             raw = {}
         if isinstance(raw, dict) and raw.get("providers"):
             problems.append(f"{cfg_path} sets providers: ignored (only your user config can set providers)")
+        if isinstance(raw, dict) and raw.get("mem0"):
+            problems.append(f"{cfg_path} sets mem0: ignored (only your user config can set mem0)")
     if problems:
         return Check("project", WARN, "; ".join(problems), "`k3code trust` shows what the project changes")
     return Check("project", OK, f"{trust.decision(project_dir)} ({project_dir})")

@@ -289,7 +289,10 @@ def describe(text: str) -> list[str]:
             command = " ".join(str(part) for part in [spec["command"], *args])
             lines.append(f"MCP server {name} runs: {_short(command)}")
         elif spec.get("url"):
-            lines.append(f"MCP server {name} connects to: {_short(str(spec['url']))}")
+            shown = f"MCP server {name} connects to: {_short(str(spec['url']))}"
+            if spec.get("bearer_env"):
+                shown += f" and sends the secret in ${_short(str(spec['bearer_env']), 60)} as its bearer token"
+            lines.append(shown)
 
     perms = data.get("permissions")
     if isinstance(perms, dict):
@@ -316,7 +319,10 @@ def describe(text: str) -> list[str]:
                 + "; ".join(parts)
             )
 
-    others = sorted(str(k) for k in data if k not in ("mcp", "permissions", "providers"))
+    if data.get("mem0"):
+        lines.append("mem0 is IGNORED (a project config cannot set mem0; only your user config can)")
+
+    others = sorted(str(k) for k in data if k not in ("mcp", "permissions", "providers", "mem0"))
     if others:
         lines.append("also sets: " + ", ".join(others))
     return lines or ["no settings"]

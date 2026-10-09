@@ -247,6 +247,10 @@ def load_config(
             logger.warning(
                 "%s: providers ignored (only the user config can set providers)", trust.config_path(project_dir)
             )
+        # mem0 likewise: its url plus api_key_env is a second way to send a user key to a foreign host.
+        if isinstance(project_config, dict) and "mem0" in project_config:
+            project_config = {k: v for k, v in project_config.items() if k != "mem0"}
+            logger.warning("%s: mem0 ignored (only the user config can set mem0)", trust.config_path(project_dir))
 
     # 4. Environment variables (only scalar top-level keys that exist in Settings; an empty value counts as unset)
     env_overrides: dict[str, Any] = {}

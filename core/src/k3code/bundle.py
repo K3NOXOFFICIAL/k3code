@@ -210,6 +210,29 @@ class SensitiveItem:
         return f"The bundle changes {self.key}:\n" + "\n".join(f"  {line}" for line in self.diff)
 
 
+#: Single settings that approve tools, widen reach or send a key somewhere, gated like the sections below.
+_SCALAR_SENSITIVE: tuple[tuple[str, ...], ...] = (
+    ("permission_mode",),
+    ("headless_permission",),
+    ("autonomy", "auto_do_plans"),
+    ("autonomy", "auto_do_projects"),
+    ("mem0", "url"),
+    ("mem0", "api_key_env"),
+    ("skills", "roots"),
+    ("web", "allow_private"),
+    ("browser", "cdp_url"),
+)
+
+
+def _at(settings: dict[str, Any], path: tuple[str, ...]) -> Any:
+    cur: Any = settings
+    for part in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
 def _show(value: Any) -> str:
     if value is None:
         return "(not set)"
@@ -250,6 +273,10 @@ def sensitive_items(bundle: Bundle, existing: dict[str, Any] | None = None) -> l
                     diff.append(f"providers.{p.get('name', '?')}.{k}: {_show(old.get(k))} → {_show(p.get(k))}")
         if diff:
             items.append(SensitiveItem("providers", ("providers",), diff))
+    for path in _SCALAR_SENSITIVE:
+        new, old = _at(incoming, path), _at(have, path)
+        if new is not None and new != REDACTED and new != old:
+            items.append(SensitiveItem(".".join(path), path, [f"{_show(old)} → {_show(new)}"]))
     if "hooks" in incoming and incoming["hooks"] != have.get("hooks"):
         items.append(SensitiveItem("hooks", ("hooks",), [f"{_show(have.get('hooks'))} → {_show(incoming['hooks'])}"]))
     return items
