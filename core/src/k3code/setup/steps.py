@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any
 from k3code import service
 from k3code.gateway.sessions import SessionStore
 from k3code.outputstyle import PRESETS as STYLE_PRESETS
-from k3code.paths import home
+from k3code.paths import ensure_private_dir, home, private_file
 from k3code.permissions.hardline import HARDLINE_NAMES
 from k3code.setup import detect, probe
 from k3code.setup.prompter import Prompter
@@ -430,8 +430,8 @@ def write_user_md(data: dict[str, Any]) -> Path:
     from k3code.memory import user_memory_path
 
     mem = user_memory_path()
-    mem.parent.mkdir(parents=True, exist_ok=True)
-    mem.write_text("# About the user\n\n" + user_md(data), encoding="utf-8")
+    ensure_private_dir(mem.parent)  # user memory is private state: 0600/0700 whatever the umask
+    private_file(mem).write_text("# About the user\n\n" + user_md(data), encoding="utf-8")
     return mem
 
 
