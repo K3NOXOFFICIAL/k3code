@@ -286,7 +286,7 @@ def test_unit_file_matches_policy_and_repo_copy():
         "MemoryMax=4G",
         "TasksMax=512",
         "LimitNOFILE=65536",
-        "UMask=0077",
+        "UMask=0022",  # the user's umask for project files; private state is 0600/0700 in code
         "NoNewPrivileges=yes",
         "RestrictSUIDSGID=yes",
         "LockPersonality=yes",
