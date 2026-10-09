@@ -45,7 +45,9 @@ MemoryHigh=2G
 MemoryMax=4G
 TasksMax=512
 LimitNOFILE=65536
-UMask=0077
+# The user's usual umask: files the tools write into a project are 0644 like any other. k3code makes its own state
+# (sessions, journals, the token) 0600/0700 itself and does not rely on this.
+UMask=0022
 NoNewPrivileges=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
@@ -68,6 +70,13 @@ Description=Recover the k3code daemon after systemd stopped restarting it (start
 Type=oneshot
 TimeoutStartSec=infinity
 ExecStart=/bin/sh -c 'sleep {cooldown} && systemctl --user reset-failed {unit} && systemctl --user start {unit}'
+MemoryMax=64M
+TasksMax=16
+UMask=0022
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
 """
 
 DEFAULT_EXEC_START = "%h/.local/share/k3code/current/venv/bin/k3code daemon"
@@ -193,6 +202,7 @@ def install(dry_run: bool = False) -> list[str]:
 def uninstall(dry_run: bool = False) -> list[str]:
     path = unit_path()
     steps = [
+        f"systemctl --user stop {RECOVER_UNIT_NAME}",
         f"systemctl --user disable --now {UNIT_NAME}",
         f"remove {path}",
         f"remove {recover_unit_path()}",
@@ -201,6 +211,10 @@ def uninstall(dry_run: bool = False) -> list[str]:
     if dry_run:
         return ["[dry-run] would:", *(f"  - {s}" for s in steps)]
     out = []
+    # First: a recovery unit waiting out its cooldown would start the daemon again after the uninstall. It has no
+    # [Install] section, so there is nothing to disable; a unit that is not loaded is not an error here.
+    r = _systemctl("stop", RECOVER_UNIT_NAME)
+    out.append(f"stop {RECOVER_UNIT_NAME}: " + ("ok" if r.returncode == 0 else "not running"))
     r = _systemctl("disable", "--now", UNIT_NAME)
     out.append("disable --now: " + ("ok" if r.returncode == 0 else f"failed: {r.stderr.strip()}"))
     if path.exists():

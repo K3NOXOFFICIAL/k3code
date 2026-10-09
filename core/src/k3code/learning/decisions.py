@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import sqlstore
+from k3code.paths import ensure_private_dir
 from k3code.redact import scrub_text
 
 KINDS = (
@@ -91,7 +92,7 @@ class DecisionLog:
     def __init__(self, home: Path, clock: Callable[[], float] = time.time) -> None:
         self.home = Path(home)
         self.path = self.home / "learning" / "decisions.db"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.path.parent)
         self.clock = clock
         self._db = sqlstore.connect(self.path)
         self._db.row_factory = sqlite3.Row

@@ -352,6 +352,12 @@ CREDENTIAL_USE: list[tuple[str, str, str, str]] = [
     ("scp -oProxyCommand='nl .env' f.txt host:", "deny", "deny", "deny"),
     ("ssh -oProxyCommand='realpath .env' x", "deny", "deny", "deny"),
     ("ssh -oProxyCommand='nc %h %p' host", "ask", "allow", "allow"),
+    # rsync's -e/--rsh value is the remote shell command line: an ssh -o XxxCommand inside it runs too
+    ("rsync -e \"ssh -oProxyCommand='head .env'\" -a src host:dst", "deny", "deny", "deny"),
+    ("rsync -avze \"ssh -o 'ProxyCommand tac ~/.ssh/id_rsa'\" src host:dst", "deny", "deny", "deny"),
+    ("rsync --rsh=\"ssh -oLocalCommand='nl .env' -oPermitLocalCommand=yes\" src host:dst", "deny", "deny", "deny"),
+    ("rsync --rsh 'sh -c \"cat .env\"' src host:dst", "deny", "deny", "deny"),
+    ("rsync -e 'ssh -p 2222 -i ~/.ssh/id_ed25519' -a src host:dst", "ask", "allow", "allow"),
     # xargs -a FILE hands FILE's lines to the command it runs, whatever that is
     ("xargs -a .env echo", "deny", "deny", "deny"),
     ("xargs -a ~/.ssh/id_rsa echo", "deny", "deny", "deny"),
@@ -443,6 +449,7 @@ RULE_DENY: list[str] = [
     'echo "$(rm x)"',
     "ssh -oProxyCommand='rm x' host",
     "scp -vo 'LocalCommand=git push origin x' f.txt host:",
+    "rsync -e \"ssh -oProxyCommand='rm x'\" -a src host:dst",
 ]
 
 

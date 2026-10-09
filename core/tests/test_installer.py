@@ -294,10 +294,14 @@ def test_uninstall_removes_the_unit_under_xdg_config_home(tmp_path: Path) -> Non
     unit = xdg / "systemd" / "user" / "k3code.service"
     unit.parent.mkdir(parents=True)
     unit.write_text("[Unit]\n")
-    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CONFIG_HOME": str(xdg)}
+    # the uninstaller's fallback calls systemctl --user: a stub, never the real user manager
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    env = {"PATH": f"{stubs}{os.pathsep}{os.environ['PATH']}", "HOME": str(tmp_path), "XDG_CONFIG_HOME": str(xdg)}
     r = subprocess.run(["sh", str(UNINSTALL)], env=env, capture_output=True, text=True, check=False)
     assert r.returncode == 0, r.stderr
     assert not unit.exists()  # removed even though no k3code is installed to do it
+    assert "systemctl --user disable --now k3code.service" in calls.read_text()
 
 
 def test_presetup_is_the_default_and_minimal_skips_it(tmp_path: Path) -> None:
@@ -615,11 +619,40 @@ def test_a_held_install_lock_stops_a_second_install(tmp_path: Path) -> None:
     assert not (tmp_path / DATA_REL / "versions").exists()
     assert lock.is_dir()  # someone else's lock is never removed
 
+
+def test_a_lock_left_by_a_killed_install_is_taken_over(tmp_path: Path) -> None:
+    # SIGKILL mid-install leaves the lock (with its pid) and a version without .complete: the next run goes on
+    data = tmp_path / DATA_REL
+    lock = data / ".install.lock"
+    lock.mkdir(parents=True)
     dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
     (lock / "pid").write_text(f"{dead}\n")
-    stale = run(tmp_path, INSTALL, "--from-source", "--minimal")
-    assert stale.returncode != 0
-    assert "not running" in stale.stderr and "rm -r" in stale.stderr
+    half = data / "versions" / "0.0.0-half"
+    (half / "venv").mkdir(parents=True)
+    done = data / "versions" / "0.0.0-done"
+    done.mkdir()
+    (done / ".complete").write_text("0.0.0-done\n")
+    (data / "current").symlink_to(done)
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and f"pid {dead}" in r.stderr
+    assert not half.exists() and "unfinished version 0.0.0-half" in r.stderr
+    assert (done / ".complete").is_file()  # the previous version stays (rollback)
+    assert os.readlink(data / "current") != str(done)
+    assert (data / "current").is_symlink() and not lock.exists()
+
+
+def test_a_lock_without_a_pid_is_taken_over_only_when_old(tmp_path: Path) -> None:
+    lock = tmp_path / DATA_REL / ".install.lock"
+    lock.mkdir(parents=True)  # an install killed between mkdir and writing its pid
+    young = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert young.returncode != 0
+    assert "without a pid" in young.stderr and "rm -r" in young.stderr
+    old = time.time() - 7 * 3600
+    os.utime(lock, (old, old))
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and "older than 6 hours" in r.stderr
 
 
 def test_the_install_lock_is_released_after_a_run(tmp_path: Path) -> None:
@@ -853,6 +886,27 @@ def test_uninstall_fallback_removes_both_units(tmp_path: Path) -> None:
     log = calls.read_text()
     assert "disable --now k3code.service k3code-recover.service" in log
     assert "daemon-reload" in log
+
+
+def test_uninstall_with_a_broken_k3code_prints_one_line_not_a_traceback(tmp_path: Path) -> None:
+    units = tmp_path / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    for name in ("k3code.service", "k3code-recover.service"):
+        (units / name).write_text("[Unit]\n")
+    broken = tmp_path / ".local" / "bin" / "k3code"
+    broken.parent.mkdir(parents=True)
+    broken.write_text(
+        "#!/bin/sh\necho 'Traceback (most recent call last):' >&2\necho 'ModuleNotFoundError: k3code' >&2\nexit 1\n"
+    )
+    broken.chmod(0o755)
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    r = run(tmp_path, UNINSTALL, path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    assert "Traceback" not in r.stderr and "ModuleNotFoundError" not in r.stderr
+    assert r.stderr.count("k3code is not runnable; removing units directly") == 1
+    assert not (units / "k3code.service").exists() and not (units / "k3code-recover.service").exists()
+    assert "disable --now k3code.service k3code-recover.service" in calls.read_text()
 
 
 def _git(src: Path, *args: str) -> str:

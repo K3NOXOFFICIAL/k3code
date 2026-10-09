@@ -296,6 +296,26 @@ def test_onboarding_non_interactive_default_creates_no_proposals(tmp_path):
     assert snapshot(repo) == before
 
 
+def test_onboarding_non_interactive_still_shows_the_scan(tmp_path):
+    """`k3code setup --non-interactive` showed an empty "This project" step: `none` skipped the scan as well."""
+    from k3code.setup.prompter import AnswerPrompter
+    from k3code.setup.steps import offer_project_recipes
+
+    repo = make(tmp_path / "repo", MONOREPO)
+    said: list[str] = []
+    p = AnswerPrompter({})
+    p.say = said.append  # type: ignore[method-assign]
+    assert offer_project_recipes(p, repo) == {"recipes": "none", "accepted": []}
+    text = "\n".join(said)
+    assert "python (uv) in api/" in text and "node (pnpm) in packages/web/" in text
+    assert "test `uv run pytest`" in text and "project_recipes: none" in text
+    assert ProposalStore(paths.home()).all() == [] and not projectstate.state_path(repo).exists()
+
+    said.clear()
+    offer_project_recipes(p, make(tmp_path / "empty", {"notes.txt": "hi\n"}))
+    assert said and "No stacks detected" in said[0]
+
+
 def test_onboarding_accept_all_applies_the_recipes(tmp_path):
     from k3code.setup.prompter import AnswerPrompter
     from k3code.setup.steps import offer_project_recipes

@@ -324,10 +324,44 @@ def ssh_command_value(value: str) -> str | None:
     return m.group(1) if m else None
 
 
+#: rsync short options that take a value (``-e`` is the remote shell; the others only need skipping).
+_RSYNC_VALUE_OPTS = "BefTM@"
+
+
+def _rsync_shell_commands(args: list[str]) -> list[str]:
+    """The remote-shell command lines of ``rsync -e CMD`` / ``-eCMD`` / ``-avze CMD`` / ``--rsh=CMD`` /
+    ``--rsh CMD``: rsync runs them."""
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            break
+        if a == "--rsh" and i < len(args):
+            out.append(args[i])
+            i += 1
+        elif a.startswith("--rsh="):
+            out.append(a.split("=", 1)[1])
+        elif a.startswith("-") and not a.startswith("--"):
+            for k, ch in enumerate(a[1:], 1):
+                if ch in _RSYNC_VALUE_OPTS:
+                    value = a[k + 1 :]
+                    if not value and i < len(args):
+                        value, i = args[i], i + 1
+                    if ch == "e":
+                        out.append(value)
+                    break
+    return out
+
+
 def ssh_option_commands(name: str, args: list[str]) -> list[str]:
     """The command lines ``ssh``/``scp``/``sftp`` run from their ``-o XxxCommand`` options, glued
-    (``-oProxyCommand=...``, ``-vo...``) or spaced. ssh parses options after the host name too, so every argument is
-    scanned."""
+    (``-oProxyCommand=...``, ``-vo...``) or spaced, and the remote shell of ``rsync -e``/``--rsh`` (a command line
+    too: ``rsync -e "ssh -oProxyCommand='head .env'"`` runs the inner command). ssh parses options after the host name
+    too, so every argument is scanned."""
+    if name == "rsync":
+        return _rsync_shell_commands(args)
     short_val = SSH_VALUE_OPTS.get(name)
     out: list[str] = []
     i = 0
