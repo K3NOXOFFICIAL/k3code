@@ -12,16 +12,15 @@ from typing import Any
 
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning import distiller
+from k3code.memory import MAX_FACT_CHARS as MAX_FACT_CHARS  # the cap lives in memory, which re-applies it on read
+from k3code.memory import clean_fact
 from k3code.paths import home
 from k3code.providers.types import Message
-from k3code.redact import REDACTED, scrub_text
+from k3code.redact import scrub_text
 from k3code.routing.tiers import TaskKind
 
 #: The heading earlier versions wrote into the repo's K3CODE.md/AGENTS.md; facts now go to learned.md (k3code.memory).
 FACTS_HEADING = "## Learned project notes (auto)"
-MAX_FACT_CHARS = 200
-_FENCE = re.compile(r"```|~~~")
-_LINK = re.compile(r"!?\[([^\]]*)\]\([^)]*\)")
 SYSTEM = (
     "You review a finished coding-agent session. Reply with ONE JSON object: "
     '{"facts": [str], "skills": [{"name": kebab-case, "description": str, "body": markdown steps}]}. '
@@ -43,18 +42,6 @@ def transcript(messages: list[dict[str, Any]], limit: int = 7000) -> str:
         if isinstance(c, str) and m.get("role") in ("user", "assistant"):
             lines.append(f"{m['role']}: {c[:600]}")
     return "\n".join(lines)[-limit:]
-
-
-def clean_fact(text: str) -> str:
-    """One line of at most MAX_FACT_CHARS with no heading, link or code fence; '' when the fact must be dropped."""
-    fact = " ".join(scrub_text(text).split())
-    if not fact or REDACTED in fact or _FENCE.search(fact):
-        return ""
-    fact = _LINK.sub(r"\1", fact)  # [text](url) and ![alt](url) keep only their text
-    fact = fact.lstrip("#>").strip()
-    if not fact or "](" in fact:
-        return ""
-    return fact if len(fact) <= MAX_FACT_CHARS else fact[: MAX_FACT_CHARS - 1] + "…"
 
 
 def parse(text: str) -> dict[str, Any]:
