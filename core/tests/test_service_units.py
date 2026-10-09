@@ -57,3 +57,18 @@ def test_uninstall_stops_and_removes_the_recovery_unit(tmp_path: Path, monkeypat
     assert calls[-1] == ("daemon-reload",)
     assert any(service.RECOVER_UNIT_NAME in line for line in out)
     assert any(service.RECOVER_UNIT_NAME in step for step in service.uninstall(dry_run=True))
+
+
+def test_install_dry_run_prints_every_unit_it_would_write(tmp_path: Path, monkeypatch) -> None:
+    from click.testing import CliRunner
+
+    from k3code.cli import cli
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))
+    r = CliRunner().invoke(cli, ["service", "install", "--dry-run"])
+    assert r.exit_code == 0, r.output
+    # both unit texts, not only their names in the step list
+    assert service.render_unit() in r.output
+    assert service.render_recover_unit() in r.output
+    assert f"unit file {service.recover_unit_path()}:" in r.output
+    assert not service.unit_path().exists() and not service.recover_unit_path().exists()
