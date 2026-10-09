@@ -734,6 +734,12 @@ export function createGatewayEventHandler(
     }, ms);
   };
 
+  // resumeById ended "unknown-session" (raw error suppressed): one notice naming the id, then a fresh session.
+  const startFreshAfterUnknown = (sid: string) => {
+    patchUiState({ status: "forging session…" });
+    newSession(`session ${sid} no longer exists; started a new one`);
+  };
+
   const scheduleStartupPrompt = () => {
     if (startupPromptSubmitted || (!STARTUP_QUERY && !STARTUP_IMAGE)) {
       return;
@@ -835,25 +841,26 @@ export function createGatewayEventHandler(
     const recoverSid = recoverSidRef?.current;
 
     if (recoverSidRef && recoverSid) {
-      void resumeById(recoverSid).then((outcome) => {
-        if (recoverSidRef.current !== recoverSid) {
-          return;
-        }
+      void resumeById(recoverSid, { quietUnknownSession: true }).then(
+        (outcome) => {
+          if (recoverSidRef.current !== recoverSid) {
+            return;
+          }
 
-        // The daemon deletes a session that was still empty when its last client detached, so the target can be
-        // gone; stay on no session at all and every prompt is lost, so start a fresh one instead.
-        if (outcome === "unknown-session") {
-          recoverSidRef.current = null;
-          patchUiState({ status: "forging session…" });
-          newSession("the previous session was empty and is gone");
+          // The target can be gone (deleted, or a different daemon came back); stay on no session at all and every
+          // prompt is lost, so start a fresh one instead.
+          if (outcome === "unknown-session") {
+            recoverSidRef.current = null;
+            startFreshAfterUnknown(recoverSid);
 
-          return;
-        }
+            return;
+          }
 
-        if (getUiState().sid) {
-          recoverSidRef.current = null;
-        }
-      });
+          if (getUiState().sid) {
+            recoverSidRef.current = null;
+          }
+        },
+      );
       // After resumeById: it synchronously sets status to 'resuming…' on entry,
       // so override it here to keep the distinct "recovering" label visible for
       // the duration of the resume RPC (which later flips status to 'ready').
@@ -869,7 +876,14 @@ export function createGatewayEventHandler(
 
     if (STARTUP_RESUME_ID) {
       patchUiState({ status: "resuming…" });
-      resumeById(STARTUP_RESUME_ID);
+      // `k3code attach <sid>` on an id the gateway does not know: a fresh session, not none at all.
+      void resumeById(STARTUP_RESUME_ID, { quietUnknownSession: true }).then(
+        (outcome) => {
+          if (outcome === "unknown-session") {
+            startFreshAfterUnknown(STARTUP_RESUME_ID);
+          }
+        },
+      );
       scheduleStartupPrompt();
 
       return;

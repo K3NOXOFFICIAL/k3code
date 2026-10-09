@@ -76,6 +76,9 @@ export class JsonRpcGatewayError extends Error {
 /** JSON-RPC "method not found" (tui_gateway/server.py::dispatch `_err(rid, -32601, …)`). */
 export const JSON_RPC_METHOD_NOT_FOUND = -32601;
 
+/** JSON-RPC "invalid params" (the gateway's `_InvalidParams`, e.g. `unknown session: <id>`). */
+export const JSON_RPC_INVALID_PARAMS = -32602;
+
 /** JSON-RPC "internal error" — used when a server→client request handler throws. */
 export const JSON_RPC_INTERNAL_ERROR = -32603;
 

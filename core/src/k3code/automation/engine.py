@@ -170,6 +170,15 @@ class AutomationEngine:
             "automations": self.automations.active_count(),
         }
 
+    def bound_to(self, session_id: str) -> bool:
+        """An active loop ticks in ``session_id``, or an active automation prompts into it or watches its runs."""
+        if any(r["session_id"] == session_id for r in self.db.rows("loops", "state='active'")):
+            return True
+        return any(
+            (row["action"] or {}).get("session") == session_id or (row["trigger"] or {}).get("session") == session_id
+            for row in self.db.rows("automations", "state='active'")
+        )
+
     def changed(self) -> None:
         """Push the ``⟳`` badge counts and the refreshed strip to attached clients."""
         counts = self.counts()

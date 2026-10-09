@@ -195,8 +195,7 @@ async def test_an_empty_idle_session_is_closed_when_its_last_client_leaves(daemo
         peer.writer.transport.abort()
     await _until_detached(server, 0)
     await _until_not_live(server, sid)
-    # and from the store: left there it was the newest row, so auto-resume opened this empty chat next time
-    assert server.store.get(sid) is None
+    assert server.store.get(sid) is not None  # only dropped from the live registry
 
 
 class _RunningSubagent:

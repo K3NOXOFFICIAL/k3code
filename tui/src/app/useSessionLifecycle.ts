@@ -7,7 +7,11 @@ import type {
   SessionResumeResult,
   Usage,
 } from "@k3code/shared/gateway-events";
-import type { ServerRequest } from "@k3code/shared/json-rpc-channel";
+import {
+  JSON_RPC_INVALID_PARAMS,
+  JsonRpcGatewayError,
+  type ServerRequest,
+} from "@k3code/shared/json-rpc-channel";
 import { type RefObject, useCallback, useEffect, useMemo, useRef } from "react";
 
 import { STARTUP_WORKSPACE_CWD } from "../config/env.js";
@@ -31,6 +35,7 @@ import type { Msg, PanelSection, SessionInfo } from "../types.js";
 import type {
   ComposerActions,
   GatewayRpc,
+  ResumeOptions,
   ResumeOutcome,
   StateSetter,
 } from "./interfaces.js";
@@ -134,7 +139,9 @@ export const signalFreshSessionBoundary = (
 
 // The gateway's answer to a session id it does not store (`unknown session: <id>`, JSON-RPC invalid params).
 const isUnknownSessionError = (e: unknown) =>
-  e instanceof Error && e.message.includes("unknown session");
+  e instanceof JsonRpcGatewayError &&
+  e.code === JSON_RPC_INVALID_PARAMS &&
+  e.message.includes("unknown session");
 
 const trimTail = (items: Msg[]) => {
   const q = [...items];
@@ -476,7 +483,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   );
 
   const resumeById = useCallback(
-    (id: string): Promise<ResumeOutcome> => {
+    (id: string, opts: ResumeOptions = {}): Promise<ResumeOutcome> => {
       patchOverlayState({ agentView: false, sessions: false });
       patchUiState({ status: "resuming…" });
 
@@ -548,18 +555,27 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             if (previousSid && previousSid !== r.session_id) {
               void closeSession(previousSid);
             }
+
+            dropAfterSwitch(opts.dropSid, r.session_id);
           })
           .catch((e: Error): ResumeOutcome => {
-            sys(`error: ${e.message}`);
+            const unknown = isUnknownSessionError(e);
+
+            // A caller with its own fallback for a vanished session says so in its notice instead.
+            if (!(unknown && opts.quietUnknownSession)) {
+              sys(`error: ${e.message}`);
+            }
+
             patchUiState({ status: "ready" });
 
-            return isUnknownSessionError(e) ? "unknown-session" : undefined;
+            return unknown ? "unknown-session" : undefined;
           });
       });
     },
     [
       closeSession,
       colsRef,
+      dropAfterSwitch,
       gw,
       panel,
       resetSession,

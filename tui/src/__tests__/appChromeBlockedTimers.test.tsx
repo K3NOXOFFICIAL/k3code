@@ -607,12 +607,12 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
     { disposable_only: true, session_id: "s1" },
   ];
 
-  const mountWithLifecycle = (sid: null | string) => {
+  const mountWithLifecycle = (sid: null | string, past: unknown[] = []) => {
     const request = vi.fn((method: string, params?: Record<string, unknown>) =>
       Promise.resolve<unknown>(
         method === "session.list"
-          ? { sessions: [] }
-          : method === "session.activate"
+          ? { sessions: past }
+          : method === "session.activate" || method === "session.resume"
             ? {
                 messages: [],
                 running: false,
@@ -663,12 +663,25 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
             activateLiveSession: session.activateLiveSession,
             newLiveSession: (dropSid?: string) =>
               void session.newLiveSession(undefined, undefined, dropSid),
+            resumeById: (id: string, dropSid?: string) =>
+              void session.resumeById(id, { dropSid }),
           }}
         />
       );
     };
 
-    patchUiState({ sessionTitle: "test", sid, status: "ready" });
+    patchUiState({
+      // Earlier sessions are listed for the current project only.
+      info: {
+        cwd: "/work/proj",
+        model: "test",
+        skills: {},
+        tools: {},
+      } as UiState["info"],
+      sessionTitle: "test",
+      sid,
+      status: "ready",
+    });
     patchOverlayState({ agentView: true });
 
     const layout = mountTree(
@@ -710,6 +723,31 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
       session_id: "s2",
     });
     expect(getUiState().sid).toBe("s2");
+    expect(closeCalls(request)).toHaveLength(1);
+  });
+
+  it("⏎ on an earlier session row closes the origin session once the resumed one is attached", async () => {
+    const { layout, request } = mountWithLifecycle("s1", [
+      {
+        cwd: "/work/proj",
+        id: "past-1",
+        message_count: 4,
+        started_at: T0 / 1000 - 86_400,
+        title: "older work",
+      },
+    ]);
+
+    await waitFor(() => expect(layout.output()).toContain("› · older work"));
+    // The row is painted before the pane's input handler is re-armed with it (see "⏎ routes by row kind").
+    await flush();
+    layout.press("\r");
+
+    await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1));
+    expect(request).toHaveBeenCalledWith(
+      "session.resume",
+      expect.objectContaining({ session_id: "past-1" }),
+    );
+    expect(getUiState().sid).toBe("past-1");
     expect(closeCalls(request)).toHaveLength(1);
   });
 
@@ -1075,7 +1113,7 @@ describe("AppLayout agent view: ⏎ routes by row kind", () => {
     layout.press("\r");
 
     await waitFor(() => expect(resumeById).toHaveBeenCalled());
-    expect(resumeById).toHaveBeenCalledWith("past-1");
+    expect(resumeById).toHaveBeenCalledWith("past-1", "s1");
     expect(activateLiveSession).not.toHaveBeenCalled();
     expect(getOverlayState().agentView).toBe(false);
   });

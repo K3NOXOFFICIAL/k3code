@@ -1584,12 +1584,12 @@ export function useMainApp(gw: GatewayClient) {
       // must respect the busy guard just like the `/resume` slash path.
       // (Switching between live sessions and `+ new` keep the current session
       // running, so those stay unguarded — that's the orchestrator's purpose.)
-      resumeById: (id: string) => {
+      resumeById: (id: string, dropSid?: string) => {
         if (session.guardBusySessionSwitch("switch sessions")) {
           return;
         }
 
-        session.resumeById(id);
+        void session.resumeById(id, { dropSid });
       },
       setStickyPrompt,
     }),

@@ -1303,7 +1303,9 @@ describe("createGatewayEventHandler", () => {
     onEvent({ payload: {}, type: "gateway.ready" } as any);
 
     await vi.waitFor(() =>
-      expect(resumeById).toHaveBeenCalledWith("sess-crashed"),
+      expect(resumeById).toHaveBeenCalledWith("sess-crashed", {
+        quietUnknownSession: true,
+      }),
     );
     expect(newSession).not.toHaveBeenCalled();
     expect(ctx.session.recoverSidRef.current).toBe("sess-crashed");
@@ -1437,7 +1439,7 @@ describe("createGatewayEventHandler", () => {
   it("on gateway.ready with STARTUP_RESUME_ID set, the env wins over config auto_resume", async () => {
     const appended: Msg[] = [];
     const newSession = vi.fn();
-    const resumeById = vi.fn();
+    const resumeById = vi.fn(async () => undefined);
     const ctx = buildCtx(appended);
 
     ctx.session.newSession = newSession;
@@ -1453,9 +1455,32 @@ describe("createGatewayEventHandler", () => {
     } as any);
 
     await vi.waitFor(() =>
-      expect(resumeById).toHaveBeenCalledWith("env-explicit"),
+      expect(resumeById).toHaveBeenCalledWith("env-explicit", {
+        quietUnknownSession: true,
+      }),
     );
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(newSession).not.toHaveBeenCalled();
+  });
+
+  it("on gateway.ready with a STARTUP_RESUME_ID the gateway does not know, starts a fresh session", async () => {
+    const appended: Msg[] = [];
+    const newSession = vi.fn();
+    const ctx = buildCtx(appended);
+
+    ctx.session.newSession = newSession;
+    ctx.session.resumeById = vi.fn(async () => "unknown-session" as const);
+    ctx.session.STARTUP_RESUME_ID = "sess-gone";
+
+    createGatewayEventHandler(ctx)({
+      payload: {},
+      type: "gateway.ready",
+    } as any);
+
+    await vi.waitFor(() => expect(newSession).toHaveBeenCalledTimes(1));
+    expect(newSession).toHaveBeenCalledWith(
+      "session sess-gone no longer exists; started a new one",
+    );
   });
 
   it("keeps gateway noise informational and approval out of Activity", async () => {

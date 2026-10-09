@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { createGatewayEventHandler } from "../app/createGatewayEventHandler.js";
 import { createServerRequestHandler } from "../app/createServerRequestHandler.js";
+import type { ResumeOptions } from "../app/interfaces.js";
 import { getOverlayState, resetOverlayState } from "../app/overlayStore.js";
 import {
   hasOpenServerRequest,
@@ -191,19 +192,21 @@ const readyHandler = (
   lifecycle: ReturnType<typeof mountLifecycle>,
   recoverSid: string,
   newSession = vi.fn(),
+  startupResumeId = "",
 ) => {
-  const recoverSidRef = { current: recoverSid as null | string };
+  const recoverSidRef = { current: (recoverSid || null) as null | string };
   const onEvent = createGatewayEventHandler({
     composer: { setInput: vi.fn() },
     gateway: { gw: { request: vi.fn() }, rpc: vi.fn(async () => null) },
     session: {
-      STARTUP_RESUME_ID: "",
+      STARTUP_RESUME_ID: startupResumeId,
       STARTUP_VIEW: "",
       colsRef: { current: 80 },
       newSession,
       recoverSidRef,
       resetSession: vi.fn(),
-      resumeById: (id: string) => lifecycle.api().resumeById(id),
+      resumeById: (id: string, opts?: ResumeOptions) =>
+        lifecycle.api().resumeById(id, opts),
       setCatalog: vi.fn(),
     },
     submission: {
@@ -260,11 +263,12 @@ describe("recovering the session after the gateway came back", () => {
     }
   });
 
-  it("starts a fresh session when the recovered one was reaped while empty", async () => {
+  it("starts a fresh session when the recovered one is gone", async () => {
     const request = vi.fn(async (_method: string) => {
       throw new JsonRpcGatewayError("unknown session: sid-A", { code: -32602 });
     });
-    const lifecycle = mountLifecycle(request);
+    const sys = vi.fn();
+    const lifecycle = mountLifecycle(request, { sys });
 
     try {
       await vi.waitFor(() => expect(lifecycle.api()).toBeTruthy());
@@ -281,6 +285,67 @@ describe("recovering the session after the gateway came back", () => {
         expect.objectContaining({ session_id: "sid-A" }),
       );
       expect(recoverSidRef.current).toBeNull();
+      // One notice naming the id, not the raw gateway error before it.
+      expect(newSession).toHaveBeenCalledWith(
+        "session sid-A no longer exists; started a new one",
+      );
+      expect(sys).not.toHaveBeenCalled();
+    } finally {
+      lifecycle.unmount();
+    }
+  });
+
+  it("starts a fresh session when `k3code attach <sid>` names a session the gateway does not know", async () => {
+    const request = vi.fn(async (_method: string) => {
+      throw new JsonRpcGatewayError("unknown session: sid-X", { code: -32602 });
+    });
+    const sys = vi.fn();
+    const lifecycle = mountLifecycle(request, { sys });
+
+    try {
+      await vi.waitFor(() => expect(lifecycle.api()).toBeTruthy());
+
+      const { newSession, ready } = readyHandler(
+        lifecycle,
+        "",
+        vi.fn(),
+        "sid-X",
+      );
+
+      ready();
+      await vi.waitFor(() =>
+        expect(newSession).toHaveBeenCalledWith(
+          "session sid-X no longer exists; started a new one",
+        ),
+      );
+      expect(sys).not.toHaveBeenCalled();
+    } finally {
+      lifecycle.unmount();
+    }
+  });
+
+  it("does not treat an unknown-session message without the invalid-params code as a vanished session", async () => {
+    const request = vi.fn(async (_method: string) => {
+      throw new JsonRpcGatewayError("unknown session: sid-A", { code: 5000 });
+    });
+    const sys = vi.fn();
+    const lifecycle = mountLifecycle(request, { sys });
+
+    try {
+      await vi.waitFor(() => expect(lifecycle.api()).toBeTruthy());
+
+      const { newSession, ready, recoverSidRef } = readyHandler(
+        lifecycle,
+        "sid-A",
+      );
+
+      ready();
+      await vi.waitFor(() =>
+        expect(sys).toHaveBeenCalledWith("error: unknown session: sid-A"),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(newSession).not.toHaveBeenCalled();
+      expect(recoverSidRef.current).toBe("sid-A");
     } finally {
       lifecycle.unmount();
     }

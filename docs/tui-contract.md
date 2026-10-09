@@ -63,7 +63,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | Method | Params | Result | Notes |
 |--------|--------|--------|-------|
 | `session.compress` | `{session_id, target_tokens?}` | `{compressed: boolean}` | Context compaction |
-| `session.close` | `{session_id, disposable_only?}` | `{closed: boolean, reason?}` | Close without delete. `disposable_only` (default false; send it after attaching elsewhere) closes only an empty, idle session and deletes its stored row; a session with messages or work is left alone with `{closed: false, reason}`, not an error |
+| `session.close` | `{session_id, disposable_only?}` | `{closed: boolean, reason?}` | Close without delete. `disposable_only` (default false; send it after attaching elsewhere) closes only an empty, idle session with no active loop or automation bound to it (its stored row stays); a session with messages, work or a bound automation is left alone with `{closed: false, reason}`, not an error |
 | `delegation.status` | `{}` | `{active[], paused, max_depth, max_concurrent}` | Sub-agent panel |
 | `delegation.pause` | `{paused}` | `{paused: boolean}` | Pause delegation |
 | `subagent.list` | `{session_id}` | `{subagents: ActiveSubagent[]}` | Sub-agent panel |

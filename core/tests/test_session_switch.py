@@ -64,7 +64,7 @@ async def test_most_recent_on_a_store_of_only_empty_sessions_is_like_an_empty_st
 
 async def test_disposable_only_close_drops_an_empty_session_the_caller_left(tmp_path, monkeypatch):
     """The TUI sends session.close {disposable_only} for the session it just switched away from: an empty idle one
-    goes, live and stored (nothing in it is lost, and it must not become the newest stored row)."""
+    leaves the live registry; its stored row (settings such as model or workspace) stays."""
     server, _ = make_server(tmp_path, ["ok"], monkeypatch)
     a = (await call(server, "session.create", {"cwd": str(tmp_path)}))["session_id"]
     res = await call(server, "session.close", {"session_id": a, "disposable_only": True})
@@ -72,7 +72,48 @@ async def test_disposable_only_close_drops_an_empty_session_the_caller_left(tmp_
     assert a in server.live and server.store.get(a) is not None
     await call(server, "session.create", {"cwd": str(tmp_path)})  # the caller moves on
     assert (await call(server, "session.close", {"session_id": a, "disposable_only": True}))["closed"] is True
-    assert a not in server.live and server.store.get(a) is None
+    assert a not in server.live and server.store.get(a) is not None
+    await server.close()
+
+
+async def test_disposable_only_close_keeps_the_row_and_most_recent_still_skips_it(tmp_path, monkeypatch):
+    """The kept empty row is newer than the user's last work, yet auto-resume still lands on that work."""
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    older = _worked_in(server, str(tmp_path))
+    a = (await call(server, "session.create", {"cwd": str(tmp_path)}))["session_id"]
+    await call(server, "session.create", {"cwd": str(tmp_path)})  # the caller moves on
+    assert (await call(server, "session.close", {"session_id": a, "disposable_only": True}))["closed"] is True
+    assert server.store.get(a) is not None
+    assert (await call(server, "session.most_recent", {}))["session_id"] == older
+    await server.close()
+
+
+@pytest.mark.parametrize("binding", ["loop", "automation prompt", "automation trigger"])
+async def test_disposable_only_close_keeps_an_empty_session_an_automation_is_bound_to(tmp_path, monkeypatch, binding):
+    """An empty session owning `/loop daily 09:00 ...` must stay: the loop ticks into it."""
+    from k3code.automation.engine import AutomationEngine
+
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    a = (await call(server, "session.create", {"cwd": str(tmp_path)}))["session_id"]
+    server.automation = AutomationEngine(server, use_netwatch=False)
+    await server.automation.start()
+    if binding == "loop":
+        server.automation.loops.create(session_id=a, prompt="check the build", interval="daily 09:00")
+    else:
+        prompt = {"type": "prompt", "prompt": "summarise", "session": a if binding == "automation prompt" else ""}
+        trigger = {"type": "session_event", "event": "completed"}
+        if binding == "automation trigger":
+            trigger["session"] = a
+        server.automation.db.insert("automations", id="au1", name="x", trigger=trigger, action=prompt, created_at=0.0)
+    await call(server, "session.create", {"cwd": str(tmp_path)})  # the caller moves on
+    res = await call(server, "session.close", {"session_id": a, "disposable_only": True})
+    assert res == {"closed": False, "reason": "not disposable"}
+    assert a in server.live and server.store.get(a) is not None
+    if binding == "loop":
+        server.automation.loops.stop(session_id=a)
+    else:
+        server.automation.db.update("automations", "au1", state="paused")
+    assert (await call(server, "session.close", {"session_id": a, "disposable_only": True}))["closed"] is True
     await server.close()
 
 

@@ -525,8 +525,8 @@ class GatewayServer:
 
         ``disposable_only`` (its last client just left, or the caller switched away from it) also keeps every session
         with something in it or behind it: a message, an automation origin, a finished-run state, queued input, a
-        running sub-agent. A session it does close is deleted from the store too: it has nothing to resume, and left
-        behind it would be the newest stored row, the one auto-resume picks.
+        running sub-agent, an active loop or automation bound to it. Its stored row stays either way (the session's
+        settings live there, and an empty row is invisible to auto-resume and the project's earlier sessions).
         """
         live = self.live.get(sid)
         if live is None:
@@ -546,11 +546,10 @@ class GatewayServer:
             or live.pending_prompts
             or live.steer_queue
             or any(not h.done for h in self.subagents.for_session(sid))
+            or (self.automation is not None and self.automation.bound_to(sid))
         ):
             return {"closed": False, "reason": "not disposable"}
         self.live.pop(sid, None)
-        if disposable_only:
-            self.store.delete(sid)
         if live.reliability is not None:
             await live.reliability.stop()
         return {"closed": True}
@@ -2616,9 +2615,9 @@ async def _session_close(server: GatewayServer, params: dict[str, Any]) -> dict[
     the live registry (its stored copy stays resumable); one that is running, backgrounded or waiting for an
     answer keeps going, so it stays in the agent strip.
 
-    ``disposable_only`` (sent after the caller attached elsewhere) closes only an empty, idle session, and deletes its
-    stored row; anything else is left alone with ``{closed: false, reason}``, not an error. A caller still on the
-    session counts as using it either way."""
+    ``disposable_only`` (sent after the caller attached elsewhere) closes only an empty, idle session no loop or
+    automation is bound to (its stored row stays); anything else is left alone with ``{closed: false, reason}``, not
+    an error. A caller still on the session counts as using it either way."""
     return await server.close_live(
         str(params.get("session_id") or ""), disposable_only=bool(params.get("disposable_only"))
     )

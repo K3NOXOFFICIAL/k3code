@@ -603,7 +603,7 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
   const { gw } = useGateway();
   const close = () => patchOverlayState({ agentView: false });
   // The session being left, handed to the switch so the gateway can close it once this client is attached elsewhere
-  // if it is disposable (the gateway judges; resuming already closes the session it leaves). Read at action time:
+  // if it is disposable (the gateway judges). Read at action time:
   // `k3code agents` opens the view before the startup session exists.
   const dropSid = (targetSid?: string) => {
     const originSid = getUiState().sid;
@@ -617,7 +617,7 @@ const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
     if (kind === "session") {
       actions.activateLiveSession(row.id, dropSid(row.id));
     } else if (kind === "past") {
-      actions.resumeById(row.id);
+      actions.resumeById(row.id, dropSid(row.id));
     } else {
       getStripHandlers()?.activate({ ...row, kind });
     }
