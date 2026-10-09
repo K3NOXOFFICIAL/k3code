@@ -116,6 +116,9 @@ def content_files(project_dir: str | Path) -> list[tuple[str, Path]]:
         d = project / sub
         if d.is_dir() and not _is_user_claude_skills(d):
             out += [(p.relative_to(project).as_posix(), p) for p in find_markers(d)]
+    mcp_json = project / ".mcp.json"
+    if mcp_json.is_file():
+        out.append((".mcp.json", mcp_json))
     return sorted(out)
 
 
@@ -287,6 +290,16 @@ def summary(project_dir: str | Path) -> list[str] | None:
         if names:
             shown = ", ".join(names[:_MAX_RULES_SHOWN]) + (" ..." if len(names) > _MAX_RULES_SHOWN else "")
             lines.append(f"project {label}: {shown}")
+    if ".mcp.json" in files:
+        from k3code import mcpjson
+
+        try:
+            text = (Path(project_dir).expanduser() / ".mcp.json").read_text(encoding="utf-8")
+        except OSError:
+            text = ""
+        for name, spec in mcpjson.parse(text).items():
+            what = " ".join([spec.command, *spec.args]) if spec.command else str(spec.url)
+            lines.append(f"MCP server {name} in .mcp.json (starts only after /mcp enable {name}): {_short(what)}")
     return lines
 
 

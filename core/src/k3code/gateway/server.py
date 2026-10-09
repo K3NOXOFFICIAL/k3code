@@ -31,7 +31,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from k3code import confio, userhooks
+from k3code import confio, mcpjson, userhooks
 from k3code import skills as skills_mod
 from k3code._version import __version__
 from k3code.agent.loop import AgentLoop, ApprovalResult
@@ -443,7 +443,7 @@ class GatewayServer:
         self._stdout = stdout
         self.commands: CommandRegistry = build_commands()
         self.live: dict[str, LiveSession] = {}
-        self.mcp = McpManager(self.config.mcp.servers)
+        self.mcp = McpManager(mcpjson.merged(self.config.mcp.servers, default_project_dir()))
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
         self.web_fetcher = WebFetcher.from_config(self.config.research, self.config.web)
         self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
@@ -2004,7 +2004,7 @@ class GatewayServer:
         if "providers" in changed:
             self.router = None
             self._tiers = None
-        self.mcp.configure(self.config.mcp.servers)
+        self.mcp.configure(mcpjson.merged(self.config.mcp.servers, base))
 
     def activate_session(self, session_id: str) -> LiveSession | None:
         stored = self.store.get(session_id)
@@ -3253,7 +3253,9 @@ def _session_cwd(server: GatewayServer, params: dict[str, Any]) -> str | None:
 async def _reload_mcp(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """/reload-mcp: re-read the config and restart the MCP servers (the gateway's `/mcp reload`)."""
     server.apply_file_config(_session_cwd(server, params))
-    await server.mcp.reload(server.config.mcp.servers)
+    await server.mcp.reload(
+        mcpjson.merged(server.config.mcp.servers, _session_cwd(server, params) or default_project_dir())
+    )
     return {"status": "reloaded"}
 
 
