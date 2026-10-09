@@ -42,6 +42,8 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `session.events.stats` | `{session_id}` | `{total, by_type}` | | Event stats |
 | `prompt.submit` | `{session_id, text, attachments?, images?, files?, model?, tools?, compact?}` | `{turn_id}` | ✅ | Send user message |
 | `clipboard.paste` | `{session_id}` | `{text?, images?, files?}` | ✅ | Paste from clipboard |
+| `paste.collapse` | `{text, session_id?}` | `{path, chars, lines}` | ✅ | A large paste shown as a token: stored 0600 at `$K3CODE_HOME/pastes/<session>/<sha256[:16]>.txt` (the caller's live session; removed with the session) |
+| `process.list` | `{session_id}` | `{processes: ProcessEntry[]}` | ✅ | Processes dock (polled): running foreground `bash` commands and background jobs. Each entry: `session_id` (the process's own row id: the job id, or `fg<pid>`), `kind`, `pid`, `command`, `cwd`, `started`, `status` (`running`/`exited`), `uptime_seconds`, `exit_code`, `exited_at`, `completion_reason`, `output_preview` (last 2 KiB) |
 | `image.attach` | `{session_id, data_uri, name?}` | `{id}` | ✅ | Attach image |
 | `image.attach_bytes` | `{session_id, base64, mime, name?}` | `{id}` | | Attach image from bytes |
 | `image.detach` | `{session_id, path}` | `{ok: boolean}` | ✅ | Detach image |

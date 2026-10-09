@@ -310,15 +310,20 @@ async def tool_bash(
         from k3code.tools import jobs
 
         try:
-            job = jobs.REGISTRY.add(session_id, cmd, await _spawn_shell(cmd, workdir, sandbox, merge_stderr=True))
+            job = jobs.REGISTRY.add(
+                session_id, cmd, await _spawn_shell(cmd, workdir, sandbox, merge_stderr=True), cwd=str(workdir)
+            )
         except Exception as e:
             return {"error": f"Failed to execute: {e}"}
         return {
             "content": f"started {job.id} (pid {job.proc.pid}) in the background: read its output with "
             f'bash_output {{"job_id": "{job.id}"}}, stop it with bash_kill'
         }
+    from k3code.tools import jobs as _jobs
+
     try:
         proc = await _spawn_shell(cmd, workdir, sandbox)
+        _jobs.REGISTRY.track(session_id, cmd, proc.pid, str(workdir))  # the TUI's process dock (process.list)
         out, err = _Capture(), _Capture()
         # Streams are read incrementally into bounded buffers: communicate() held every byte in the shared daemon's
         # memory (a runaway `yes` or `cat huge.log` took it to hundreds of MB in a second and the OOM killer then took
@@ -350,8 +355,10 @@ async def tool_bash(
         return {"error": f"Failed to execute: {e}"}
     finally:
         # Every exit path, including /stop (CancelledError) and a daemon shutdown, must not leave the tree running.
-        if proc is not None and proc.returncode is None:
-            await asyncio.shield(_kill_group(proc))
+        if proc is not None:
+            _jobs.REGISTRY.untrack(proc.pid)
+            if proc.returncode is None:
+                await asyncio.shield(_kill_group(proc))
 
 
 def format_tool_result(result: dict[str, Any]) -> Any:

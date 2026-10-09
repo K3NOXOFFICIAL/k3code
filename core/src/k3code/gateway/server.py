@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -2967,6 +2968,41 @@ async def _clipboard_paste(server: GatewayServer, params: dict[str, Any]) -> dic
     return {"text": "", "images": [], "files": []}
 
 
+async def _process_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """The TUI's process dock (polled): the session's running foreground ``bash`` commands and its background jobs.
+
+    In memory only (no disk, no subprocess): it is asked every 1.5 s. Each entry has the TUI's ``ProcessEntry`` shape
+    plus ``pid``, ``started``, ``cwd`` and ``kind``; its ``session_id`` is the process's own id (the TUI keys rows on
+    it), the owning session is the one asked for."""
+    live = server._session_for(params.get("session_id"))
+    return {"processes": tool_jobs.REGISTRY.processes(live.session_id) if live is not None else []}
+
+
+#: Pasted text the TUI collapsed into a token is kept here, one directory per session (removed with the session).
+PASTES_DIR = "pastes"
+
+
+async def _paste_collapse(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Store a large paste the TUI shows as a ``[Pasted text #N]`` token; returns ``{path}`` of the stored copy.
+
+    The file name is the content hash, so pasting the same text twice writes one file. The session is the caller's
+    live session (the TUI sends no session id); only a live session's id ever becomes a directory name."""
+    text = params.get("text")
+    if not isinstance(text, str):
+        raise _InvalidParams("text must be a string")
+    live = server.live.get(str(params.get("session_id") or "")) or server.session
+    sid = live.session_id if live is not None else "unbound"
+    folder = server._home() / PASTES_DIR / sid
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    data = text.encode("utf-8")
+    path = folder / f"{hashlib.sha256(data).hexdigest()[:16]}.txt"
+    if not path.exists():
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    return {"path": str(path), "chars": len(text), "lines": text.count("\n") + 1}
+
+
 async def _image_attach(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     raise _InvalidParams("image.attach is not supported in M1 (text-only providers)")
 
@@ -3464,6 +3500,8 @@ _HANDLERS: dict[str, Any] = {
     "subagent.interrupt": _subagent_interrupt,
     "subagent.tail": _subagent_tail,
     "clipboard.paste": _clipboard_paste,
+    "paste.collapse": _paste_collapse,
+    "process.list": _process_list,
     "image.attach": _image_attach,
     "image.attach_bytes": _image_attach,
     "image.detach": _image_detach,
