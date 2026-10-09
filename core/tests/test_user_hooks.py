@@ -13,7 +13,7 @@ from k3code.agent.loop import AgentLoop
 from k3code.providers.types import ToolCall
 from k3code.router import Router, build_chain
 from k3code.userhooks import Hook, HookRunner
-from test_autonomy_gateway import events, k3home, make, run_turn, start
+from test_autonomy_gateway import call, events, k3home, make, run_turn, start
 
 NO_GATE = {"autonomy": {"plan_first": False, "proposals": False}}
 
@@ -166,3 +166,85 @@ async def test_gateway_user_prompt_submit_blocks_or_adds_context(tmp_path: Path,
     await run_turn(server, "do the forbidden thing")
     deltas = [e.get("text", "") for e in events(server, "message.delta")]
     assert "Prompt blocked by a UserPromptSubmit hook: not that" in deltas
+
+
+def _user_config(tmp_path: Path, hooks_yaml: str) -> None:
+    home = k3home(tmp_path)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("hooks:\n" + hooks_yaml, encoding="utf-8")
+
+
+def _glob_step(match: str, when: str, **extra) -> dict:
+    return {"type": "tool_call", "match": match, "when": when, "name": "glob", "arguments": {"pattern": "*"}, **extra}
+
+
+async def test_plan_first_planning_loop_runs_user_hooks(tmp_path: Path, monkeypatch) -> None:
+    from test_autonomy_gateway import ADVISOR_BRIEF, EXECUTOR, PLAN, PROPOSER, verdict
+
+    planner = [  # exit_plan never reaches the hooks: the planner looks around first
+        _glob_step("PLANNING mode", "first", model="m-strong"),
+        {
+            "type": "tool_call",
+            "model": "m-strong",
+            "match": "PLANNING mode",
+            "when": "after_tool",
+            "name": "exit_plan",
+            "arguments": {"plan": PLAN},
+        },
+    ]
+    server = make(tmp_path, monkeypatch, [verdict("medium"), *planner, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
+    dump = tmp_path / "plan-hook.json"
+    _user_config(tmp_path, f"  PreToolUse:\n    - {{matcher: glob, command: 'cat > {dump}'}}\n")
+    await start(server, tmp_path)
+    await run_turn(server, "add a --verbose flag to the CLI")
+    assert [p["status"] for p in events(server, "plan.show")] == ["proposed", "approved"]
+    seen = json.loads(dump.read_text())
+    assert seen["hook_event_name"] == "PreToolUse" and seen["tool_name"] == "glob"
+    assert seen["session_id"] == server.session.session_id
+
+
+async def test_subagent_loop_runs_user_hooks(tmp_path: Path, monkeypatch) -> None:
+    from test_subagents import final, task_call
+
+    steps = [
+        task_call("CHILD-H look around"),
+        final("parent done"),
+        _glob_step("CHILD-H", "first"),
+        {"type": "text", "match": "CHILD-H", "when": "after_tool", "text": "looked"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    dump = tmp_path / "child-hook.json"
+    _user_config(tmp_path, f"  PreToolUse:\n    - {{matcher: glob, command: 'cat > {dump}'}}\n")
+    await start(server, tmp_path)
+    await run_turn(server, "PARENT: delegate it")
+    (h,) = server.subagents.handles.values()
+    seen = json.loads(dump.read_text())
+    assert seen["tool_name"] == "glob" and seen["session_id"] == h.id  # the child's own loop ran it
+    assert seen["cwd"] == str(tmp_path)
+
+
+async def test_worktree_child_runs_trusted_project_hooks_in_its_worktree(tmp_path: Path, monkeypatch) -> None:
+    from m1cmd_helpers import git_repo
+    from test_subagents import final, task_call
+
+    repo = git_repo(tmp_path / "repo")
+    steps = [
+        task_call("CHILD-WH look around", isolation="worktree"),
+        final("parent done"),
+        _glob_step("CHILD-WH", "first"),
+        {"type": "text", "match": "CHILD-WH", "when": "after_tool", "text": "looked"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    dump, where = tmp_path / "wt-hook.json", tmp_path / "wt-pwd.txt"
+    cfg = repo / ".k3code" / "config.yaml"
+    cfg.parent.mkdir()
+    cfg.write_text(
+        f"hooks:\n  PreToolUse:\n    - {{matcher: glob, command: 'cat > {dump}; pwd > {where}'}}\n", encoding="utf-8"
+    )
+    trust.record(repo, trusted=True)  # the user trusted the project, not the child's fresh worktree path
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_turn(server, "PARENT")
+    (h,) = server.subagents.handles.values()
+    worktree = repo / ".k3code" / "worktrees" / h.id
+    assert json.loads(dump.read_text())["cwd"] == str(worktree)
+    assert where.read_text().strip() == str(worktree)
