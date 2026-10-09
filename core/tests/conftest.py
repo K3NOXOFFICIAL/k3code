@@ -144,6 +144,24 @@ def _isolated_k3code_home(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_dns(monkeypatch):
+    """The SSRF guard resolves hostnames: tests never touch DNS. Names resolve to a public address; IP literals
+    (decimal, octal and hex forms included) still go through the real, offline parser."""
+    import socket
+
+    from k3code import net_guard
+
+    def resolve(host: str) -> list[str]:
+        try:
+            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST)
+        except (socket.gaierror, UnicodeError):
+            return ["93.184.215.14"]
+        return [str(i[4][0]) for i in infos]
+
+    monkeypatch.setattr(net_guard, "_resolve", resolve)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_tuios(monkeypatch):
     """Tests run inside k3 panes must not report to the real tuios daemon."""
     for var in ("TUIOS_SOCKET", "TUIOS_PANE_ID", "TUIOS_PANE_TOKEN", "TUIOS_SESSION"):

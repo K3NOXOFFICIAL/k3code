@@ -80,6 +80,9 @@ class FakePage:
     async def title(self) -> str:
         return ""
 
+    async def route(self, _pattern: str, _handler) -> None:  # the SSRF guard's request filter; see test_net_guard
+        return None
+
     def on(self, _event: str, _handler) -> None:  # downloads are not part of these fixtures
         return None
 

@@ -442,7 +442,7 @@ class GatewayServer:
         self.live: dict[str, LiveSession] = {}
         self.mcp = McpManager(self.config.mcp.servers)
         # one pooled client, cache and rate budget per gateway, shared by every session's web tools
-        self.web_fetcher = WebFetcher.from_config(self.config.research)
+        self.web_fetcher = WebFetcher.from_config(self.config.research, self.config.web)
         self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
         self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
         self.providers: list[Any] = []
