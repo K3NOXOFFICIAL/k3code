@@ -130,6 +130,15 @@ async def _housekeeping(server: Any, home: Path) -> None:
             await server.watchdog_tick()
 
 
+async def _sweep_empty_sessions(server: Any) -> None:
+    """Once, after readiness: drop old empty stored sessions (rows a loop or automation points at stay)."""
+    with contextlib.suppress(Exception):  # housekeeping: a failed sweep must never hurt the running daemon
+        if server.stopping:
+            return
+        swept = await server.sweep_empty_sessions_async()
+        logger.info("swept %d old empty stored session(s)", swept)
+
+
 SAFE_MODE_NOTICE = (
     "k3code daemon restarted more than 5 times in 10 minutes: background work is paused. "
     "Fix the cause, then run /daemon resume."
@@ -196,9 +205,6 @@ async def run_daemon(
         serve.result()  # the server failed to come up: raise its error instead of announcing READY=1
     await server.ensure_automation()  # resume loops, start the cron scheduler and triggers
     await server.resume_goals()  # goals that were active (or paused by a graceful stop) continue
-    with contextlib.suppress(Exception):  # housekeeping: a failed sweep must never keep the daemon from starting
-        swept = server.sweep_empty_sessions()  # after the engine: rows a loop or automation is bound to stay
-        logger.info("swept %d old empty stored session(s)", swept)
     sdnotify.ready()
     logger.info("daemon ready on %s", sock)
     if ready_event is not None:
@@ -206,12 +212,16 @@ async def run_daemon(
     interval = sdnotify.watchdog_interval(WATCHDOG_INTERVAL_S) if watchdog_interval is None else watchdog_interval
     dog = asyncio.create_task(sdnotify.watchdog_loop(interval))
     housekeeping = asyncio.create_task(_housekeeping(server, home))
+    sweep = asyncio.create_task(_sweep_empty_sessions(server))  # after READY: a large store must not delay startup
     try:
         await serve
     finally:
         sdnotify.stopping()
         dog.cancel()
         housekeeping.cancel()
+        sweep.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sweep
         with contextlib.suppress(asyncio.CancelledError):
             await dog
         with contextlib.suppress(asyncio.CancelledError):

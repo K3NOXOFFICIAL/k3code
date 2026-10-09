@@ -2101,24 +2101,40 @@ class GatewayServer:
         self.emit_goal(live)
         return True
 
-    def sweep_empty_sessions(self, *, now: float | None = None, max_age: float = EMPTY_SESSION_MAX_AGE_S) -> int:
-        """Daemon start: drop old empty stored sessions (every `k3code agents`, `n` and abandoned TUI start leaves one).
-
-        The store decides what counts as empty and unclaimed; this adds what only the server knows: live sessions,
-        the ones a client looks at, and those an active loop or automation is bound to. Without the automation engine
-        nothing is swept: which rows a loop is bound to cannot be told then."""
+    def _sweep_keep(self) -> Callable[[str], bool] | None:
+        """The sweep's "leave this row alone" test, or None without the automation engine (nothing is swept then:
+        which rows a loop or automation points at cannot be told)."""
         automation = self.automation
         if automation is None:
-            return 0
+            return None
 
         def keep(sid: str) -> bool:
             if sid in self.live or (self.session is not None and self.session.session_id == sid):
                 return True
             if any(c.session_id == sid for c in self.clients):
                 return True
-            return bool(automation.bound_to(sid))
+            return bool(automation.references_session(sid))
 
-        return self.store.sweep_empty(now=now, max_age=max_age, keep=keep)
+        return keep
+
+    def sweep_empty_sessions(self, *, now: float | None = None, max_age: float = EMPTY_SESSION_MAX_AGE_S) -> int:
+        """Drop old empty stored sessions (every `k3code agents`, `n` and abandoned TUI start leaves one).
+
+        The store decides what counts as empty and unclaimed; this adds what only the server knows: live sessions,
+        the ones a client looks at, and those any loop or automation, paused ones included, points at.
+
+        Known limitation: a standalone stdio TUI/CLI sharing sessions.db can hold an empty session open longer than
+        ``max_age`` (30 days); if the daemon deletes its row, that process's later saves are lost, because ``save()``
+        is a plain UPDATE. It must stay one: an upsert would resurrect sessions deleted with ``session.delete``."""
+        keep = self._sweep_keep()
+        return 0 if keep is None else self.store.sweep_empty(now=now, max_age=max_age, keep=keep)
+
+    async def sweep_empty_sessions_async(
+        self, *, now: float | None = None, max_age: float = EMPTY_SESSION_MAX_AGE_S
+    ) -> int:
+        """:meth:`sweep_empty_sessions` in small batches that yield to the event loop (same limitation)."""
+        keep = self._sweep_keep()
+        return 0 if keep is None else await self.store.sweep_empty_async(now=now, max_age=max_age, keep=keep)
 
     async def resume_goals(self) -> int:
         """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.
