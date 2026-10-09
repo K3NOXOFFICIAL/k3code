@@ -572,11 +572,33 @@ def propose_replayed(candidates: list[dict[str, Any]], store: ProposalStore) -> 
     return out
 
 
+#: The most overlay files, and overlay chars in total, the system prompt carries; the rest is named in a note.
+MAX_OVERLAY_FILES = 10
+MAX_OVERLAY_CHARS = 4000
+
+
 def overlay_prompt() -> str:
-    """Active prompt overlays (``$K3CODE_HOME/overlays/*.md``) for the system prompt."""
+    """Active prompt overlays (``$K3CODE_HOME/overlays/*.md``) for the system prompt, capped at
+    MAX_OVERLAY_FILES files and MAX_OVERLAY_CHARS chars (every overlay used to be injected, re-sent on every call)."""
     d = home() / "overlays"
-    parts = [f.read_text(encoding="utf-8").strip() for f in sorted(d.glob("*.md"))] if d.is_dir() else []
-    return "## Learned guidance (overlay)\n" + "\n".join(f"- {p}" for p in parts if p) if parts else ""
+    texts = [f.read_text(encoding="utf-8").strip() for f in sorted(d.glob("*.md"))] if d.is_dir() else []
+    texts = [t for t in texts if t]
+    kept: list[str] = []
+    used = 0
+    for text in texts:
+        if len(kept) >= MAX_OVERLAY_FILES or used + len(text) > MAX_OVERLAY_CHARS:
+            break
+        kept.append(text)
+        used += len(text)
+    if not texts:
+        return ""
+    lines = [f"- {t}" for t in kept]
+    if skipped := len(texts) - len(kept):
+        lines.append(
+            f"({skipped} more overlay{'s' if skipped != 1 else ''} not included: the cap is "
+            f"{MAX_OVERLAY_FILES} files / {MAX_OVERLAY_CHARS} chars)"
+        )
+    return "## Learned guidance (overlay)\n" + "\n".join(lines)
 
 
 SELF_IMPROVE_DIR = ".k3code/self-improve"

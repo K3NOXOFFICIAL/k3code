@@ -4,7 +4,8 @@ Every finished turn is recorded with its inputs (the size of each message before
 the injected memory and skills) and its outcome (status, recorded tokens, whether the verifier passed it).
 A candidate setting (a smaller tool-output clip, a memory or skill limit) is replayed: each request is rebuilt with the
 candidate applied and sent through :class:`FakeProvider`, whose usage step is the estimated size (characters / 4).
-The same records always give the same token totals. A record holds the size of each message, never its text.
+The same records always give the same token totals. A record holds the size of each message (and the tool name of a
+tool result, which decides its clip), never its text.
 
 The replay cannot re-run the model, so the verifier pass rate is bounded rather than measured: a passing turn whose
 inputs the candidate changed counts as a possible failure. That bound is conservative, and it is what the auto-apply
@@ -24,7 +25,7 @@ from typing import Any
 
 from k3code.providers.fake import FakeProvider
 from k3code.providers.types import Message
-from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_head_tail
+from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_for_model
 
 RECORD_PARTS = ("learning", "replay", "turns.jsonl")
 #: A turn record larger than this is not kept (records hold sizes only, so this is a guard, not a norm).
@@ -127,6 +128,8 @@ def build_record(
 def _entry(m: Message) -> dict[str, Any]:
     """Sizes only: a turn record holds no text, so nothing secret can reach the file."""
     out: dict[str, Any] = {"r": m.role, "n": len(m.content or "")}
+    if m.role == "tool" and m.name:  # the tool decides how its result is clipped (read keeps its own budget)
+        out["t"] = m.name
     if m.tool_calls:
         out["c"] = [len(tc.name) + len(json.dumps(tc.arguments, ensure_ascii=False)) for tc in m.tool_calls]
     return out
@@ -137,9 +140,13 @@ def _entry_chars(e: dict[str, Any]) -> int:
 
 
 @functools.lru_cache(maxsize=4096)
-def _clipped_len(n: int, limit: int) -> int:
-    """Length of ``clip_head_tail`` applied to a text of ``n`` characters (the clip depends on the length only)."""
-    return len(clip_head_tail("x" * n, limit)) if n > limit else n
+def _clipped_len(n: int, limit: int, tool: str | None) -> int | None:
+    """Length of what ``tool``'s result of ``n`` characters is sent as at ``limit``, None when it is sent whole
+    (``clip_for_model``, the wire's own clip: it depends on the length and the tool only, and ``read`` keeps its own
+    budget). Records from before the tool name was kept pass None and are clipped like any other tool."""
+    text = "x" * n
+    sent = clip_for_model(tool, text, limit)
+    return None if sent == text else len(sent)
 
 
 # ── replay ─────────────────────────────────────────────────────────────────
@@ -165,8 +172,10 @@ def _apply(
     out = []
     for e in entries:
         if cand.clip_chars and e["r"] == "tool" and int(e["n"]) > cand.clip_chars:
-            e = {**e, "n": _clipped_len(int(e["n"]), cand.clip_chars)}
-            changed = True
+            sent = _clipped_len(int(e["n"]), cand.clip_chars, e.get("t"))
+            if sent is not None:
+                e = {**e, "n": sent}
+                changed = True
         out.append(e)
     cut = 0
     if cand.memory_chars is not None and turn["memory_chars"] > cand.memory_chars:
