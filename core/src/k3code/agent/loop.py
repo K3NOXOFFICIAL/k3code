@@ -18,7 +18,13 @@ from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
 from k3code.toolerrors import Failure, describe_call, failure_of
-from k3code.tools import MAX_TOOL_RESULT_CHARS, build_registry, clip_tool_results, format_tool_result
+from k3code.tools import (
+    MAX_TOOL_RESULT_CHARS,
+    SESSION_TOOLS,
+    build_registry,
+    clip_tool_results,
+    format_tool_result,
+)
 from k3code.tools.validate import invalid_arguments
 
 logger = logging.getLogger(__name__)
@@ -76,6 +82,8 @@ class AgentLoop:
         context_window: int | None = None,
     ) -> None:
         self.router = router
+        #: the session this loop runs for: background bash jobs are filed under it
+        self.session_id = session
         #: Tokens the model takes; past ELIDE_AT_RATIO of it, old tool results are elided from requests (None = never)
         self.context_window = context_window
         #: Per run(): tool results elided from requests so far (they stay elided), results an "unchanged" read points
@@ -386,7 +394,9 @@ class AgentLoop:
             if tool_call.name == "bash":
                 # the bwrap probe runs a subprocess (up to 10 s): never on the event loop that serves every session
                 argv = await asyncio.to_thread(self._sandbox_argv)
-                result = await handler(args, cwd=self.cwd, sandbox=argv)
+                result = await handler(args, cwd=self.cwd, sandbox=argv, session_id=self.session_id)
+            elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
+                result = await handler(args, cwd=self.cwd, session_id=self.session_id)
             else:
                 result = await handler(args, cwd=self.cwd)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned

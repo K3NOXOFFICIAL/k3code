@@ -16,6 +16,7 @@ from k3code.tools.fuzzy_match import (
     format_no_match_hint,
     fuzzy_find_and_replace,
 )
+from k3code.tools.jobs import MAX_UNREAD_BYTES
 
 # ── Tool registry ──────────────────────────────────────────────────────
 
@@ -247,44 +248,68 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     return {"ok": True, "replacements": count, "strategy": strategy}
 
 
+#: bash: seconds before a foreground command is killed, when the call names no timeout, and the most it may name.
+BASH_DEFAULT_TIMEOUT = 30
+BASH_MAX_TIMEOUT = 600
+
+
+async def _spawn_shell(
+    cmd: str, workdir: Path, sandbox: list[str] | None, *, merge_stderr: bool = False
+) -> asyncio.subprocess.Process:
+    """``/bin/sh -c cmd`` in its own process group (so the whole tree can be killed), inside ``sandbox`` if given."""
+    stderr = asyncio.subprocess.STDOUT if merge_stderr else asyncio.subprocess.PIPE
+    # start_new_session: its own process group, so the whole tree can be killed (setsid, without preexec_fn)
+    if sandbox:
+        return await asyncio.create_subprocess_exec(
+            *sandbox,
+            "/bin/sh",
+            "-c",
+            cmd,
+            cwd=workdir,
+            stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
+            stdout=asyncio.subprocess.PIPE,
+            stderr=stderr,
+            start_new_session=True,
+            env=child_env(),  # the daemon's provider keys never reach a tool
+        )
+    return await asyncio.create_subprocess_shell(
+        cmd,
+        cwd=workdir,
+        stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
+        stdout=asyncio.subprocess.PIPE,
+        stderr=stderr,
+        start_new_session=True,
+        env=child_env(),
+    )
+
+
 async def tool_bash(
-    arguments: dict[str, Any], *, cwd: Path | None = None, sandbox: list[str] | None = None
+    arguments: dict[str, Any], *, cwd: Path | None = None, sandbox: list[str] | None = None, session_id: str = ""
 ) -> dict[str, Any]:
     """Run a shell command with timeout and process-group kill.
 
     ``sandbox`` is a bwrap argv prefix (see ``reliability.sandbox``); the command then runs inside it.
+    ``background: true`` starts it as a job of ``session_id`` (see ``k3code.tools.jobs``) and returns its job_id.
     """
     cmd = arguments["command"]
-    timeout = arguments.get("timeout", 30.0)
+    timeout = min(float(arguments.get("timeout") or BASH_DEFAULT_TIMEOUT), BASH_MAX_TIMEOUT)
     workdir = _resolve_path(arguments.get("cwd", "."), cwd)
     proc: asyncio.subprocess.Process | None = None
     if sandbox:
         sandbox = with_chdir(sandbox, workdir)  # the command starts in the requested cwd, not the session's
+    if arguments.get("background"):
+        from k3code.tools import jobs
+
+        try:
+            job = jobs.REGISTRY.add(session_id, cmd, await _spawn_shell(cmd, workdir, sandbox, merge_stderr=True))
+        except Exception as e:
+            return {"error": f"Failed to execute: {e}"}
+        return {
+            "content": f"started {job.id} (pid {job.proc.pid}) in the background: read its output with "
+            f'bash_output {{"job_id": "{job.id}"}}, stop it with bash_kill'
+        }
     try:
-        # start_new_session: its own process group, so the whole tree can be killed (setsid, without preexec_fn)
-        if sandbox:
-            proc = await asyncio.create_subprocess_exec(
-                *sandbox,
-                "/bin/sh",
-                "-c",
-                cmd,
-                cwd=workdir,
-                stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-                env=child_env(),  # the daemon's provider keys never reach a tool
-            )
-        else:
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                cwd=workdir,
-                stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-                env=child_env(),
-            )
+        proc = await _spawn_shell(cmd, workdir, sandbox)
         out, err = _Capture(), _Capture()
         # Streams are read incrementally into bounded buffers: communicate() held every byte in the shared daemon's
         # memory (a runaway `yes` or `cat huge.log` took it to hundreds of MB in a second and the OOM killer then took
@@ -298,7 +323,8 @@ async def tool_bash(
         except TimeoutError:
             await _kill_group(proc)
             return {
-                "error": f"Command timed out after {timeout}s",
+                "error": f"Command timed out after {timeout:g}s; retry with timeout up to {BASH_MAX_TIMEOUT} "
+                "or background: true",
                 "stdout": out.text(),
                 "stderr": err.text(),
                 "exit_code": -1,
@@ -573,6 +599,26 @@ async def tool_todo(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     return {"ok": True, "note": "todo is a no-op in M0; use agent's internal list"}
 
 
+async def tool_bash_output(
+    arguments: dict[str, Any], *, cwd: Path | None = None, session_id: str = ""
+) -> dict[str, Any]:
+    """New output of a background job since the last read, and whether it still runs."""
+    from k3code.tools import jobs
+
+    return await jobs.REGISTRY.read(session_id, str(arguments["job_id"]))
+
+
+async def tool_bash_kill(arguments: dict[str, Any], *, cwd: Path | None = None, session_id: str = "") -> dict[str, Any]:
+    """Stop a background job of this session (its whole process group)."""
+    from k3code.tools import jobs
+
+    return await jobs.REGISTRY.kill(session_id, str(arguments["job_id"]))
+
+
+#: Tools whose handler takes the session id (background jobs belong to the session that started them).
+SESSION_TOOLS = frozenset({"bash", "bash_output", "bash_kill"})
+
+
 async def tool_exit_plan(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Placeholder: the agent loop intercepts exit_plan and asks the user."""
     return {"error": "exit_plan is only available in plan mode"}
@@ -590,7 +636,9 @@ def build_registry() -> ToolRegistry:
             description=(
                 "Read a text file. Lines come numbered (number, tab, line); the numbers are not part of the file. "
                 f"Returns up to {READ_DEFAULT_LIMIT} lines; a longer file ends with a note saying which offset "
-                "continues it."
+                "continues it.\n"
+                f"Limits: {READ_DEFAULT_LIMIT} lines and {READ_MAX_CHARS} chars per call, lines cut at "
+                f"{READ_MAX_LINE_CHARS} chars; a file over {MAX_READ_BYTES // (1024 * 1024)} MB needs offset+limit."
             ),
             parameters={
                 "type": "object",
@@ -611,7 +659,8 @@ def build_registry() -> ToolRegistry:
     reg.register(
         ToolSpec(
             name="write",
-            description="Write a file, creating parents",
+            description="Write a file, creating parents.\n"
+            "Limits: replaces the whole file atomically (an existing file keeps its mode); UTF-8 text only.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -627,7 +676,9 @@ def build_registry() -> ToolRegistry:
     reg.register(
         ToolSpec(
             name="edit",
-            description="Edit a file by replacing old_string with new_string",
+            description="Edit a file by replacing old_string with new_string.\n"
+            "Limits: old_string must match exactly once unless replace_all (whitespace-tolerant matching is a "
+            "fallback); UTF-8 files only; line endings are kept.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -645,13 +696,27 @@ def build_registry() -> ToolRegistry:
     reg.register(
         ToolSpec(
             name="bash",
-            description="Run a shell command",
+            description="Run a shell command (/bin/sh -c) and return its stdout, stderr and exit code.\n"
+            f"Limits: killed after {BASH_DEFAULT_TIMEOUT} s by default (timeout: up to {BASH_MAX_TIMEOUT} s) or "
+            f"past {MAX_OUTPUT_BYTES // (1024 * 1024)} MB of output; you see at most {MAX_TOOL_RESULT_CHARS} chars "
+            "(head and tail). For servers, watchers and long builds use background: true, then bash_output.",
             parameters={
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "timeout": {"type": "number", "default": 30},
-                    "cwd": {"type": "string"},
+                    "timeout": {
+                        "type": "number",
+                        "description": f"Seconds before the command is killed (default {BASH_DEFAULT_TIMEOUT}, max "
+                        f"{BASH_MAX_TIMEOUT}); ignored with background",
+                        "default": BASH_DEFAULT_TIMEOUT,
+                    },
+                    "cwd": {"type": "string", "description": "Directory to run in, relative to the session cwd"},
+                    "background": {
+                        "type": "boolean",
+                        "description": "Start the command and return a job_id at once, with no timeout; read its "
+                        "output with bash_output, stop it with bash_kill. Jobs end with the session.",
+                        "default": False,
+                    },
                 },
                 "required": ["command"],
             },
@@ -661,8 +726,39 @@ def build_registry() -> ToolRegistry:
     )
     reg.register(
         ToolSpec(
+            name="bash_output",
+            description="Output a background bash job printed since the last read, and whether it still runs "
+            "(or its exit code).\n"
+            f"Limits: keeps the newest {MAX_UNREAD_BYTES // 1024} KB of unread output per job; you see at most "
+            f"{MAX_TOOL_RESULT_CHARS} chars (head and tail).",
+            parameters={
+                "type": "object",
+                "properties": {"job_id": {"type": "string", "description": "From bash with background: true"}},
+                "required": ["job_id"],
+            },
+            side_effect=False,
+        ),
+        tool_bash_output,
+    )
+    reg.register(
+        ToolSpec(
+            name="bash_kill",
+            description="Stop a background bash job (its whole process group).\n"
+            "Limits: only jobs this session started.",
+            parameters={
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"],
+            },
+            side_effect=True,
+        ),
+        tool_bash_kill,
+    )
+    reg.register(
+        ToolSpec(
             name="grep",
-            description="Search for a pattern in files",
+            description="Search for a regex in files (ripgrep; .gitignore is respected). Returns path:line:text.\n"
+            f"Limits: stops after 10 s; you see at most {MAX_TOOL_RESULT_CHARS} chars (head and tail).",
             parameters={
                 "type": "object",
                 "properties": {
@@ -680,7 +776,8 @@ def build_registry() -> ToolRegistry:
     reg.register(
         ToolSpec(
             name="glob",
-            description="Find files matching a glob pattern",
+            description="Find files matching a glob pattern (recursive under path).\n"
+            f"Limits: paths relative to path; you see at most {MAX_TOOL_RESULT_CHARS} chars (head and tail).",
             parameters={
                 "type": "object",
                 "properties": {
@@ -696,7 +793,7 @@ def build_registry() -> ToolRegistry:
     reg.register(
         ToolSpec(
             name="todo",
-            description="Manage a todo list",
+            description="Manage a todo list.\nLimits: a no-op placeholder; nothing is stored, keep the list yourself.",
             parameters={
                 "type": "object",
                 "properties": {

@@ -98,6 +98,7 @@ from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
 from k3code.tools import build_registry as build_tool_registry
 from k3code.tools import clip_for_model
+from k3code.tools import jobs as tool_jobs
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -564,6 +565,7 @@ class GatewayServer:
         ):
             return {"closed": False, "reason": "not disposable"}
         self.live.pop(sid, None)
+        await tool_jobs.reap(sid)  # background bash jobs end with their session
         if live.reliability is not None:
             await live.reliability.stop()
         return {"closed": True}
@@ -1081,6 +1083,8 @@ class GatewayServer:
                 cancelled.append(live.turn_task)
         if cancelled:  # let each turn persist what it has (its finally block) before the store is closed below
             await asyncio.wait(cancelled, timeout=5.0)
+        with contextlib.suppress(Exception):
+            await tool_jobs.REGISTRY.reap_all()  # no background bash job outlives the daemon
         for live in self.live.values():
             if live.reliability is not None:
                 with contextlib.suppress(Exception):
