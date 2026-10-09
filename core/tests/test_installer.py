@@ -327,6 +327,11 @@ def test_without_git_each_checkout_gets_its_own_version_from_its_files(tmp_path:
     (a / "core" / "__pycache__" / "extra.cpython-312.pyc").write_bytes(b"\0")
     (a / "tui" / "node_modules").mkdir(parents=True)
     (a / "tui" / "node_modules" / "dep.js").write_text("1\n")
+    # files the install never reads (Finder, editors, agents) do not count either
+    (a / ".DS_Store").write_bytes(b"\0")
+    (a / "core" / ".DS_Store").write_bytes(b"\0")
+    (a / ".idea").mkdir()
+    (a / ".idea" / "workspace.xml").write_text("<x/>\n")
     again = install(a)
     assert again.stdout.strip() == ver_a
     assert "already installed" in again.stderr

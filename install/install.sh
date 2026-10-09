@@ -716,11 +716,16 @@ src_git() { git -c safe.directory="$SRC_ROOT" -c safe.directory="$(cd "$SRC_ROOT
 # already. The name is then a checksum of the checkout's file names and contents: another checkout gets its own
 # version and the same one keeps its name. File times do not count, the C locale fixes the sort order, and what
 # .gitignore leaves out (caches, builds, dependencies) is skipped, so a test run or a TUI build does not change it.
+# Only what the install reads counts (VERSION, core, tui, panes): a Finder .DS_Store, editor state or an agent's
+# .claude directory elsewhere in the checkout must not turn an unchanged tree into a new version.
 tree_id() {
   if have sha256sum; then set -- sha256sum; else set -- shasum -a 256; fi
-  (cd "$SRC_ROOT" && LC_ALL=C find . \( -name .git -o -name .venv -o -name node_modules -o -name .k3dev \
+  roots=""
+  for r in VERSION core tui panes; do [ -e "$SRC_ROOT/$r" ] && roots="$roots ./$r"; done
+  # shellcheck disable=SC2086 # the roots are fixed names without spaces
+  (cd "$SRC_ROOT" && LC_ALL=C find $roots \( -name .git -o -name .venv -o -name node_modules -o -name .k3dev \
     -o -name __pycache__ -o -name dist -o -name .pytest_cache -o -name .ruff_cache -o -name .k3code \
-    -o -path ./panes/k3 \) -prune -o -type f ! -name '*.pyc' -exec "$@" {} +) | LC_ALL=C sort | "$@" | cut -c 1-12
+    -o -name .DS_Store -o -path ./panes/k3 \) -prune -o -type f ! -name '*.pyc' -exec "$@" {} +) | LC_ALL=C sort | "$@" | cut -c 1-12
 }
 
 acquire_source() {
