@@ -7,6 +7,11 @@ import type {
   SessionResumeResult,
   Usage,
 } from "@k3code/shared/gateway-events";
+import {
+  JSON_RPC_INVALID_PARAMS,
+  JsonRpcGatewayError,
+  type ServerRequest,
+} from "@k3code/shared/json-rpc-channel";
 import { type RefObject, useCallback, useEffect, useMemo, useRef } from "react";
 
 import { STARTUP_WORKSPACE_CWD } from "../config/env.js";
@@ -27,8 +32,18 @@ import type {
 import { asRpcResult } from "../lib/rpc.js";
 import type { Msg, PanelSection, SessionInfo } from "../types.js";
 
-import type { ComposerActions, GatewayRpc, StateSetter } from "./interfaces.js";
+import type {
+  ComposerActions,
+  GatewayRpc,
+  ResumeOptions,
+  ResumeOutcome,
+  StateSetter,
+} from "./interfaces.js";
 import { patchOverlayState } from "./overlayStore.js";
+import {
+  forgetServerRequestsForSession,
+  serverRequestsForSession,
+} from "./serverRequestStore.js";
 import { scheduleResumeScrollToBottom } from "./sessionResumeView.js";
 import { turnController } from "./turnController.js";
 import { patchTurnState } from "./turnStore.js";
@@ -122,6 +137,12 @@ export const signalFreshSessionBoundary = (
   return true;
 };
 
+// The gateway's answer to a session id it does not store (`unknown session: <id>`, JSON-RPC invalid params).
+const isUnknownSessionError = (e: unknown) =>
+  e instanceof JsonRpcGatewayError &&
+  e.code === JSON_RPC_INVALID_PARAMS &&
+  e.message.includes("unknown session");
+
 const trimTail = (items: Msg[]) => {
   const q = [...items];
 
@@ -142,6 +163,8 @@ export interface UseSessionLifecycleOptions {
   gw: GatewayClient;
   onFreshSessionStarted?: (sessionId: string) => void;
   panel: (title: string, sections: PanelSection[]) => void;
+  /** Opens a server→client request's card again (the server-request handler). */
+  reopenServerRequest?: (request: ServerRequest) => void;
   rpc: GatewayRpc;
   scrollRef: RefObject<null | ScrollBoxHandle>;
   setHistoryItems: StateSetter<Msg[]>;
@@ -158,6 +181,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     gw,
     onFreshSessionStarted,
     panel,
+    reopenServerRequest,
     rpc,
     scrollRef,
     setHistoryItems,
@@ -166,6 +190,22 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     setStickyPrompt,
     sys,
   } = opts;
+
+  // After a switch has settled: the gateway re-sends the new session's open approval/clarify when this client
+  // attaches, and that can arrive before the activate/resume `.then` whose resetSession() drops every prompt card.
+  // Re-open what is still stored for the new session, so a needs-input session shows its prompt whatever the order.
+  const settleServerRequests = useCallback(
+    (previousSid: null | string, nextSid: string) => {
+      if (previousSid && previousSid !== nextSid) {
+        forgetServerRequestsForSession(previousSid);
+      }
+
+      for (const request of serverRequestsForSession(nextSid)) {
+        reopenServerRequest?.({ ...request, replayed: true });
+      }
+    },
+    [reopenServerRequest],
+  );
 
   const closeSession = useCallback(
     (targetSid?: null | string) =>
@@ -251,6 +291,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       // and /clear left one more live session behind for the daemon's lifetime.
       if (!keepCurrent && previousSid && previousSid !== r.session_id) {
         await closeSession(previousSid);
+      }
+
+      // Left for good from this client's view: the gateway re-sends the old session's open requests if it is
+      // attached again, so a kept entry could only reopen a card answered or expired elsewhere meanwhile.
+      if (previousSid && previousSid !== r.session_id) {
+        forgetServerRequestsForSession(previousSid);
       }
 
       // The durable id lives on the create result; the lazy-create `info` does
@@ -340,19 +386,40 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     [startNewSession],
   );
 
-  const newLiveSession = useCallback(
-    (msg = "new live session started", title?: string) => {
-      patchOverlayState({ sessions: false });
-
-      return startNewSession(msg, title, true);
+  // `dropSid`: the session this client just left. Once attached elsewhere, ask the gateway to close it if it is
+  // disposable (empty, idle, not background); the gateway judges, and `closed: false` or an error is not a failure.
+  const dropAfterSwitch = useCallback(
+    (dropSid: string | undefined, nowSid: null | string | undefined) => {
+      if (dropSid && nowSid && dropSid !== nowSid) {
+        void gw
+          .request<SessionCloseResponse>("session.close", {
+            disposable_only: true,
+            session_id: dropSid,
+          })
+          .catch(() => null);
+      }
     },
-    [startNewSession],
+    [gw],
+  );
+
+  const newLiveSession = useCallback(
+    (msg = "new live session started", title?: string, dropSid?: string) => {
+      patchOverlayState({ agentView: false, sessions: false });
+
+      return startNewSession(msg, title, true).then((sid) => {
+        dropAfterSwitch(dropSid, sid);
+
+        return sid;
+      });
+    },
+    [dropAfterSwitch, startNewSession],
   );
 
   const activateLiveSession = useCallback(
-    (id: string) => {
-      patchOverlayState({ sessions: false });
+    (id: string, dropSid?: string) => {
+      patchOverlayState({ agentView: false, sessions: false });
       patchUiState({ status: "switching session…" });
+      const previousSid = getUiState().sid;
 
       gw.request<SessionActivateResponse>("session.activate", {
         session_id: id,
@@ -391,22 +458,33 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             usage: usageFrom(info),
           });
           hydrateLiveSessionInflight(r.inflight);
+          settleServerRequests(previousSid, r.session_id);
 
           cancelResumeScrollRef.current?.();
           cancelResumeScrollRef.current =
             scheduleResumeScrollToBottom(scrollRef);
+          dropAfterSwitch(dropSid, r.session_id);
         })
         .catch((e: Error) => {
           sys(`error: ${e.message}`);
           patchUiState({ status: "ready" });
         });
     },
-    [gw, resetSession, scrollRef, setHistoryItems, setSessionStartedAt, sys],
+    [
+      dropAfterSwitch,
+      gw,
+      resetSession,
+      scrollRef,
+      setHistoryItems,
+      setSessionStartedAt,
+      settleServerRequests,
+      sys,
+    ],
   );
 
   const resumeById = useCallback(
-    (id: string) => {
-      patchOverlayState({ sessions: false });
+    (id: string, opts: ResumeOptions = {}): Promise<ResumeOutcome> => {
+      patchOverlayState({ agentView: false, sessions: false });
       patchUiState({ status: "resuming…" });
 
       return rpc<SetupStatusResponse>("setup.status", {}).then((setup) => {
@@ -429,8 +507,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
             if (!r) {
               sys("error: invalid response: session.resume");
+              patchUiState({ status: "ready" });
 
-              return patchUiState({ status: "ready" });
+              return;
             }
 
             const storedSid =
@@ -467,6 +546,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               usage: usageFrom(info),
             });
             hydrateLiveSessionInflight(r.inflight);
+            settleServerRequests(previousSid, r.session_id);
 
             cancelResumeScrollRef.current?.();
             cancelResumeScrollRef.current =
@@ -475,16 +555,27 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             if (previousSid && previousSid !== r.session_id) {
               void closeSession(previousSid);
             }
+
+            dropAfterSwitch(opts.dropSid, r.session_id);
           })
-          .catch((e: Error) => {
-            sys(`error: ${e.message}`);
+          .catch((e: Error): ResumeOutcome => {
+            const unknown = isUnknownSessionError(e);
+
+            // A caller with its own fallback for a vanished session says so in its notice instead.
+            if (!(unknown && opts.quietUnknownSession)) {
+              sys(`error: ${e.message}`);
+            }
+
             patchUiState({ status: "ready" });
+
+            return unknown ? "unknown-session" : undefined;
           });
       });
     },
     [
       closeSession,
       colsRef,
+      dropAfterSwitch,
       gw,
       panel,
       resetSession,
@@ -492,6 +583,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       scrollRef,
       setHistoryItems,
       setSessionStartedAt,
+      settleServerRequests,
       sys,
     ],
   );

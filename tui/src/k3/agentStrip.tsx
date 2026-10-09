@@ -23,20 +23,20 @@ import {
 /** How long a finished sub-agent stays in the strip after it ends. */
 export const FINISHED_LINGER_MS = 60_000;
 
-const GLYPH: Record<StripState, string> = {
+export const GLYPH: Record<StripState, string> = {
   done: "✓",
   failed: "✗",
   input: "●",
   working: "◐",
 };
-const LABEL: Record<StripState, string> = {
+export const LABEL: Record<StripState, string> = {
   done: "completed",
   failed: "failed",
   input: "needs input",
   working: "working",
 };
 
-const color = (state: StripState, t: Theme): string =>
+export const stateColor = (state: StripState, t: Theme): string =>
   state === "done"
     ? t.color.statusGood
     : state === "failed"
@@ -65,6 +65,22 @@ const agentState = (status: string): StripState =>
       ? "failed"
       : "working";
 
+/** One live session as a row; shared by the strip and the agent view (which also shows the current session). */
+export const sessionRow = (s: SessionActiveItem, nowMs: number): StripRow => ({
+  activity:
+    s.preview?.trim() ||
+    (s.status === "waiting" || s.status === "needs_input"
+      ? "waiting for input"
+      : s.status),
+  elapsedSeconds:
+    s.started_at != null ? Math.max(0, nowMs / 1000 - s.started_at) : null,
+  id: s.id,
+  key: `session:${s.id}`,
+  kind: "session",
+  state: sessionState(s.status),
+  title: s.title?.trim() || s.preview?.trim() || s.id.slice(0, 8),
+});
+
 /** Merge background sessions and live sub-agents into strip rows (needs-input first, then working, then finished). */
 export function buildStripRows(
   subagents: readonly SubagentProgress[],
@@ -82,20 +98,7 @@ export function buildStripRows(
       continue;
     }
 
-    rows.push({
-      activity:
-        s.preview?.trim() ||
-        (s.status === "waiting" || s.status === "needs_input"
-          ? "waiting for input"
-          : s.status),
-      elapsedSeconds:
-        s.started_at != null ? Math.max(0, nowMs / 1000 - s.started_at) : null,
-      id: s.id,
-      key: `session:${s.id}`,
-      kind: "session",
-      state: sessionState(s.status),
-      title: s.title?.trim() || s.preview?.trim() || s.id.slice(0, 8),
-    });
+    rows.push(sessionRow(s, nowMs));
   }
 
   for (const a of subagents) {
@@ -201,7 +204,7 @@ export function AgentStripView({
             <Text color={selected ? t.color.accent : t.color.muted}>
               {head.slice(0, 2)}
             </Text>
-            <Text color={color(row.state, t)}>{GLYPH[row.state]} </Text>
+            <Text color={stateColor(row.state, t)}>{GLYPH[row.state]} </Text>
             <Text bold={selected} color={t.color.text}>
               {compactPreview(row.title, titleW)}
             </Text>

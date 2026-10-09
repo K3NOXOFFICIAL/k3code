@@ -60,7 +60,7 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
-from k3code.gateway.sessions import SessionStore
+from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
@@ -275,7 +275,7 @@ class LiveSession:
             "mode": self.perms.mode.value,
             "yolo": self.perms.mode == PermissionMode.YOLO,
             "add_dirs": list(self.perms.add_dirs),
-            "cwd": self.stored.cwd,
+            "cwd": _norm_cwd(self.stored.cwd),
             "title": self.stored.title,
             "stored_session_id": self.session_id,
             "running": self.streaming,
@@ -518,6 +518,41 @@ class GatewayServer:
     def has_open_request(self, session_id: str) -> bool:
         """An approval/clarify request of this session is waiting for an answer (the session needs input)."""
         return any(sid == session_id for sid, _ in self._open_requests.values())
+
+    async def close_live(self, sid: str, *, disposable_only: bool = False) -> dict[str, Any]:
+        """Drop ``sid`` from the live registry (its stored copy stays resumable) unless it is in use: a turn owns it,
+        it runs in the background, it waits for an answer, or a client is on it.
+
+        ``disposable_only`` (its last client just left, or the caller switched away from it) also keeps every session
+        with something in it or behind it: a message, an automation origin, a finished-run state, queued input, a
+        running sub-agent, an active loop or automation bound to it. Its stored row stays either way (the session's
+        settings live there, and an empty row is invisible to auto-resume and the project's earlier sessions).
+        """
+        live = self.live.get(sid)
+        if live is None:
+            return {"closed": False, "reason": "not live"}
+        if (
+            live.turn_in_flight
+            or live.background
+            or live.needs_input
+            or self.has_open_request(sid)
+            or any(c.session_id == sid for c in self.clients)
+        ):
+            return {"closed": False, "reason": "still in use"}
+        if disposable_only and (
+            live.stored.messages
+            or live.state != "idle"
+            or live.stored.meta.get("origin") == "automation"
+            or live.pending_prompts
+            or live.steer_queue
+            or any(not h.done for h in self.subagents.for_session(sid))
+            or (self.automation is not None and self.automation.bound_to(sid))
+        ):
+            return {"closed": False, "reason": "not disposable"}
+        self.live.pop(sid, None)
+        if live.reliability is not None:
+            await live.reliability.stop()
+        return {"closed": True}
 
     def attach(self, client: Client, live: LiveSession, *, replay_delay: float = 0.0) -> None:
         """Point ``client`` at ``live`` and replay any approvals it is still waiting on.
@@ -900,6 +935,14 @@ class GatewayServer:
             logger.info("client %s detached; its sessions keep running", client.name)
             with contextlib.suppress(Exception):
                 writer.close()
+            # Every TUI start creates a session so the prompt is usable; one left empty and idle by its last client
+            # (TUI exit, crash, kill -9: the socket just drops) was never closed, because session.close refuses while
+            # its caller is still attached. Only the live entry is dropped; the stored row stays. Not during a daemon
+            # stop: close() iterates the registry across awaits.
+            if client.session_id and not self.stopping:
+                with contextlib.suppress(Exception):
+                    if (await self.close_live(client.session_id, disposable_only=True))["closed"]:
+                        logger.info("closed empty session %s: its last client left", client.session_id)
 
     async def _read_frame(self, reader: asyncio.StreamReader, client: Client) -> bytes | None:
         """The next line from ``reader`` (b"" at EOF), or None for one longer than MAX_FRAME_BYTES: that frame is
@@ -2412,6 +2455,11 @@ def _usage_payload(usage: Usage) -> dict[str, Any]:
 # ── M1-core method handlers ──────────────────────────────────────────────
 
 
+def _norm_cwd(cwd: str | None) -> str | None:
+    """One spelling per directory (symlinks resolved, no trailing slash), so clients can compare cwds for equality."""
+    return os.path.realpath(cwd) if cwd else None
+
+
 def _require(params: dict[str, Any], key: str) -> Any:
     value = params.get(key)
     if value is None or value == "":
@@ -2423,7 +2471,7 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
     stored = server.store.create(
         model=params.get("model") or server.config.default_model,
         provider=params.get("provider") or "",
-        cwd=params.get("cwd") or str(Path.cwd()),
+        cwd=_norm_cwd(params.get("cwd")) or str(Path.cwd()),
     )
     if params.get("background"):
         stored.meta["background"] = True
@@ -2436,10 +2484,35 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"session_id": stored.session_id, "info": live.live_info()}
 
 
+#: Most stored sessions ``session.list {cwd}`` considers looking for that project's (the newest non-empty,
+#: non-automation ones; older history of a project buried under this many newer sessions elsewhere is not listed).
+#: Old rows can spell the cwd with a symlink or trailing slash, so the match is made in Python, not with
+#: ``WHERE cwd = ?``; only ids and cwds are scanned, full rows are loaded for the matches alone.
+_SESSION_LIST_SCAN_CAP = 2000
+
+
+def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[StoredSession]:
+    """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised)."""
+    spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
+    ids: list[str] = []
+    for sid, stored_cwd in server.store.worked_in(limit=_SESSION_LIST_SCAN_CAP):
+        if stored_cwd not in spelled:
+            spelled[stored_cwd] = _norm_cwd(stored_cwd)
+        if spelled[stored_cwd] == cwd:
+            ids.append(sid)
+            if len(ids) >= limit:
+                break
+    return [s for s in map(server.store.get, ids) if s is not None]
+
+
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``cwd`` (optional) narrows the list to that project's earlier sessions: same normalised cwd, at least one
+    message, no automation runs, ``limit`` applied after the filter. Without it: the newest ``limit`` of all."""
     limit = int(params.get("limit") or 50)
+    cwd = _norm_cwd(params.get("cwd"))
+    sessions = _project_sessions(server, cwd, max(1, limit)) if cwd else server.store.list(limit=limit)
     rows = []
-    for s in server.store.list(limit=limit):
+    for s in sessions:
         preview = ""
         for m in s.messages:
             if m.get("role") == "user" and m.get("content"):
@@ -2456,6 +2529,7 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
                 "message_count": len(s.messages),
                 "status": state,
                 "state": state,
+                "cwd": _norm_cwd(s.cwd),
             }
         )
     return {"sessions": rows}
@@ -2539,23 +2613,14 @@ async def _session_activate(server: GatewayServer, params: dict[str, Any]) -> di
 async def _session_close(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """The TUI closes the session it just left (``/resume``, new session). An idle foreground session is dropped from
     the live registry (its stored copy stays resumable); one that is running, backgrounded or waiting for an
-    answer keeps going, so it stays in the agent strip."""
-    sid = str(params.get("session_id") or "")
-    live = server.live.get(sid)
-    if live is None:
-        return {"closed": False, "reason": "not live"}
-    if (
-        live.turn_in_flight
-        or live.background
-        or live.needs_input
-        or server.has_open_request(sid)
-        or any(c.session_id == sid for c in server.clients)
-    ):
-        return {"closed": False, "reason": "still in use"}
-    server.live.pop(sid, None)
-    if live.reliability is not None:
-        await live.reliability.stop()
-    return {"closed": True}
+    answer keeps going, so it stays in the agent strip.
+
+    ``disposable_only`` (sent after the caller attached elsewhere) closes only an empty, idle session no loop or
+    automation is bound to (its stored row stays); anything else is left alone with ``{closed: false, reason}``, not
+    an error. A caller still on the session counts as using it either way."""
+    return await server.close_live(
+        str(params.get("session_id") or ""), disposable_only=bool(params.get("disposable_only"))
+    )
 
 
 async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:

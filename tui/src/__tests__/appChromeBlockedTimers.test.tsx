@@ -1,22 +1,41 @@
 import { PassThrough } from "stream";
 
-import { renderSync } from "@k3code/ink";
+import { renderSync, useInput } from "@k3code/ink";
 import { stripAnsi } from "@k3code/shared/ansi";
-import React from "react";
+import React, { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { GatewayProvider } from "../app/gatewayContext.js";
 import type {
   AppLayoutProps,
+  ComposerActions,
+  GatewayServices,
+  InputHandlerContext,
   OverlayState,
   UiState,
 } from "../app/interfaces.js";
-import { patchOverlayState, resetOverlayState } from "../app/overlayStore.js";
-import { patchUiState, resetUiState } from "../app/uiStore.js";
+import {
+  getOverlayState,
+  patchOverlayState,
+  resetOverlayState,
+} from "../app/overlayStore.js";
+import { patchTurnState, resetTurnState } from "../app/turnStore.js";
+import { getUiState, patchUiState, resetUiState } from "../app/uiStore.js";
+import { useInputHandlers } from "../app/useInputHandlers.js";
+import { useSessionLifecycle } from "../app/useSessionLifecycle.js";
 import { StatusRule } from "../components/appChrome.js";
 import { AppLayout } from "../components/appLayout.js";
 import type { GatewayClient } from "../gatewayClient.js";
+import { AGENT_VIEW_HINT } from "../k3/agentView.js";
+import {
+  $stripNav,
+  $stripSessions,
+  IDLE_NAV,
+  setStripHandlers,
+} from "../k3/agentStripStore.js";
 import { DEFAULT_THEME } from "../theme.js";
+import type { SubagentProgress } from "../types.js";
+import { waitFor } from "./waitFor.js";
 
 type StatusRuleProps = React.ComponentProps<typeof StatusRule>;
 type IntervalSpy = ReturnType<
@@ -78,6 +97,8 @@ const mountTree = (tree: React.ReactElement, { interactive = false } = {}) => {
       output = "";
     },
     output: () => stripAnsi(output),
+    /** Type into the tree's stdin (interactive mounts only). */
+    press: (keys: string) => stdin.write(keys),
   };
 };
 
@@ -203,13 +224,22 @@ const layoutProps: AppLayoutProps = {
 const mountLayout = (
   overlay: Partial<OverlayState> = {},
   ui: Partial<UiState> = {},
+  actions: Partial<AppLayoutProps["actions"]> = {},
+  {
+    beside = null,
+    gateway = gatewayStub,
+  }: { beside?: React.ReactNode; gateway?: GatewayServices } = {},
 ) => {
   patchUiState({ sessionTitle: "test", sid: "sid-1", status: "ready", ...ui });
   patchOverlayState(overlay);
 
   return mountTree(
-    <GatewayProvider value={gatewayStub}>
-      <AppLayout {...layoutProps} />
+    <GatewayProvider value={gateway}>
+      <AppLayout
+        {...layoutProps}
+        actions={{ ...layoutProps.actions, ...actions }}
+      />
+      {beside}
     </GatewayProvider>,
     { interactive: true },
   );
@@ -323,7 +353,7 @@ describe("status-chrome timers under an occluding overlay", () => {
     resetOverlayState();
     // Poll for the reveal frame instead of a fixed tick: under CI load the
     // store-driven re-render can land well after one 20ms scheduler turn.
-    await vi.waitFor(() => expect(rule.output()).toContain("6m 0s"), {
+    await waitFor(() => expect(rule.output()).toContain("6m 0s"), {
       interval: 10,
       timeout: 5_000,
     });
@@ -381,12 +411,14 @@ describe("status-chrome timers track the current overlay model", () => {
     ["widget", { widget: { appId: "demo", state: null } }],
   ];
 
-  // In `$isBlocked` but NOT occluding.  `agents` / `journey` unmount the whole
-  // ComposerPane subtree, so React's effect cleanup already stops the clocks
-  // and gating on them would be dead code; the rest are PromptZone states that
-  // render in normal flow and push the rule down without covering it.
+  // In `$isBlocked` but NOT occluding.  `agents` / `agentView` / `journey`
+  // unmount the whole ComposerPane subtree, so React's effect cleanup already
+  // stops the clocks and gating on them would be dead code; the rest are
+  // PromptZone states that render in normal flow and push the rule down
+  // without covering it.
   const nonOccluding: Array<[string, Partial<OverlayState>]> = [
     ["agents", { agents: true }],
+    ["agentView", { agentView: true }],
     [
       "approval",
       {
@@ -505,5 +537,610 @@ describe("AppLayout status-rule visibility", () => {
     await flush();
 
     expect(oneSecondTimers(intervalSpy)).toBe(2);
+  });
+
+  it("swaps the transcript and composer for the full-screen agent view", async () => {
+    const layout = mountLayout({ agentView: true });
+
+    await flush();
+
+    expect(layout.output()).toContain(AGENT_VIEW_HINT);
+    // the composer (and the status rule inside it) unmounts with the view up
+    expect(layout.output()).not.toContain("~/repo");
+    expect(oneSecondTimers(intervalSpy)).toBe(0);
+  });
+});
+
+describe("AppLayout agent view: leaving the startup session", () => {
+  afterEach(() => {
+    $stripSessions.set([]);
+  });
+
+  // `k3code agents` opens the view on gateway.ready, before the startup session exists; it arrives afterwards.
+  it.each([
+    ["n", "newLiveSession", ["s1"]],
+    ["\r", "activateLiveSession", ["s2", "s1"]],
+  ] as const)(
+    "%j closes the empty session forged after the view opened",
+    async (key, method, args) => {
+      const spy = vi.fn();
+      const layout = mountLayout(
+        { agentView: true },
+        { sid: null },
+        {
+          [method]: spy,
+        },
+      );
+
+      await flush();
+      patchUiState({ sid: "s1" });
+      $stripSessions.set([
+        {
+          current: true,
+          id: "s1",
+          message_count: 0,
+          status: "idle",
+          title: "startup",
+        },
+        { id: "s2", status: "working", title: "busy one" },
+      ]);
+      await waitFor(() => expect(layout.output()).toContain("busy one"));
+
+      // s2 (working) is listed first, so ⏎ attaches to it.
+      layout.press(key);
+
+      await waitFor(() => expect(spy).toHaveBeenCalled());
+      expect(spy).toHaveBeenCalledWith(...args);
+    },
+  );
+});
+
+// The real session lifecycle behind the layout, as useMainApp wires it: what reaches the gateway, not which action
+// the pane called.
+describe("AppLayout agent view: the gateway closes the session left behind", () => {
+  afterEach(() => {
+    $stripSessions.set([]);
+  });
+
+  const CLOSE_S1 = [
+    "session.close",
+    { disposable_only: true, session_id: "s1" },
+  ];
+
+  const mountWithLifecycle = (sid: null | string, past: unknown[] = []) => {
+    const request = vi.fn((method: string, params?: Record<string, unknown>) =>
+      Promise.resolve<unknown>(
+        method === "session.list"
+          ? { sessions: past }
+          : method === "session.activate" || method === "session.resume"
+            ? {
+                messages: [],
+                running: false,
+                session_id: params?.session_id,
+                status: "idle",
+              }
+            : method === "session.close"
+              ? { closed: true }
+              : null,
+      ),
+    );
+    const rpc = vi.fn((method: string) =>
+      Promise.resolve<unknown>(
+        method === "setup.status"
+          ? { provider_configured: true }
+          : method === "session.create"
+            ? { session_id: "s-new" }
+            : null,
+      ),
+    );
+    const gateway = {
+      gw: { request, send: () => {} } as unknown as GatewayClient,
+      rpc: rpc as unknown as GatewayServices["rpc"],
+    };
+
+    const WithLifecycle = () => {
+      const session = useSessionLifecycle({
+        colsRef: { current: 120 },
+        composerActions: {
+          setComposerTokens: () => {},
+        } as unknown as ComposerActions,
+        gw: gateway.gw,
+        panel: () => {},
+        rpc: gateway.rpc,
+        scrollRef: { current: null },
+        setHistoryItems: () => {},
+        setLastUserMsg: () => {},
+        setSessionStartedAt: () => {},
+        setStickyPrompt: () => {},
+        sys: () => {},
+      });
+
+      return (
+        <AppLayout
+          {...layoutProps}
+          actions={{
+            ...layoutProps.actions,
+            activateLiveSession: session.activateLiveSession,
+            newLiveSession: (dropSid?: string) =>
+              void session.newLiveSession(undefined, undefined, dropSid),
+            resumeById: (id: string, dropSid?: string) =>
+              void session.resumeById(id, { dropSid }),
+          }}
+        />
+      );
+    };
+
+    patchUiState({
+      // Earlier sessions are listed for the current project only.
+      info: {
+        cwd: "/work/proj",
+        model: "test",
+        skills: {},
+        tools: {},
+      } as UiState["info"],
+      sessionTitle: "test",
+      sid,
+      status: "ready",
+    });
+    patchOverlayState({ agentView: true });
+
+    const layout = mountTree(
+      <GatewayProvider value={gateway}>
+        <WithLifecycle />
+      </GatewayProvider>,
+      { interactive: true },
+    );
+
+    return { layout, request, rpc };
+  };
+
+  const closeCalls = (request: ReturnType<typeof vi.fn>) =>
+    request.mock.calls.filter(([method]) => method === "session.close");
+
+  it("n with no strip rows closes the origin session once the new one is attached", async () => {
+    const { layout, request } = mountWithLifecycle("s1");
+
+    await waitFor(() =>
+      expect(layout.output()).toContain("No sessions yet - press n"),
+    );
+    layout.press("n");
+
+    await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1));
+    expect(getUiState().sid).toBe("s-new");
+    expect(closeCalls(request)).toHaveLength(1);
+  });
+
+  it("⏎ on a live row closes the origin session even though the strip does not list it", async () => {
+    $stripSessions.set([{ id: "s2", status: "working", title: "busy one" }]);
+
+    const { layout, request } = mountWithLifecycle("s1");
+
+    await waitFor(() => expect(layout.output()).toContain("› ◐ busy one"));
+    layout.press("\r");
+
+    await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1));
+    expect(request).toHaveBeenCalledWith("session.activate", {
+      session_id: "s2",
+    });
+    expect(getUiState().sid).toBe("s2");
+    expect(closeCalls(request)).toHaveLength(1);
+  });
+
+  it("⏎ on an earlier session row closes the origin session once the resumed one is attached", async () => {
+    const { layout, request } = mountWithLifecycle("s1", [
+      {
+        cwd: "/work/proj",
+        id: "past-1",
+        message_count: 4,
+        started_at: T0 / 1000 - 86_400,
+        title: "older work",
+      },
+    ]);
+
+    await waitFor(() => expect(layout.output()).toContain("› · older work"));
+    // The row is painted before the pane's input handler is re-armed with it (see "⏎ routes by row kind").
+    await flush();
+    layout.press("\r");
+
+    await waitFor(() => expect(request).toHaveBeenCalledWith(...CLOSE_S1));
+    expect(request).toHaveBeenCalledWith(
+      "session.resume",
+      expect.objectContaining({ session_id: "past-1" }),
+    );
+    expect(getUiState().sid).toBe("past-1");
+    expect(closeCalls(request)).toHaveLength(1);
+  });
+
+  it("closes nothing when there was no origin session", async () => {
+    const { layout, request, rpc } = mountWithLifecycle(null);
+
+    await waitFor(() =>
+      expect(layout.output()).toContain("No sessions yet - press n"),
+    );
+    layout.press("n");
+
+    // The switch has landed (the close would be sent right after it), so an absent close is a real absence.
+    await waitFor(() => expect(getUiState().sid).toBe("s-new"));
+    expect(rpc).toHaveBeenCalledWith("session.create", expect.anything());
+    await flush();
+
+    expect(closeCalls(request)).toHaveLength(0);
+  });
+
+  it("closes nothing when ⏎ re-attaches the session the view was opened from", async () => {
+    $stripSessions.set([
+      { current: true, id: "s1", status: "working", title: "this one" },
+    ]);
+
+    const { layout, request } = mountWithLifecycle("s1");
+
+    await waitFor(() => expect(layout.output()).toContain("› ◐ this one"));
+    layout.press("\r");
+
+    // ⏎ on the current row just leaves the view: no switch, so nothing to close.
+    await waitFor(() => expect(getOverlayState().agentView).toBe(false));
+    await flush();
+
+    expect(
+      request.mock.calls.filter(([method]) => method === "session.activate"),
+    ).toHaveLength(0);
+    expect(closeCalls(request)).toHaveLength(0);
+    expect(getUiState().sid).toBe("s1");
+  });
+});
+
+// ── useInputHandlers harness ─────────────────────────────────────────
+//
+// The real global key handler, mounted through Ink beside AppLayout as useMainApp does, with a composer whose state
+// lives in React so a cleared draft shows up in `composer.input`.
+
+const LEFT = "\x1b[D";
+const ESC = "\x1b";
+
+type ComposerProbe = { clearIn: ReturnType<typeof vi.fn>; input: string };
+
+const InputHarness = ({
+  historyIdx = null,
+  initialInput = "",
+  probe,
+}: {
+  historyIdx?: null | number;
+  initialInput?: string;
+  probe: ComposerProbe;
+}) => {
+  const [input, setInput] = useState(initialInput);
+
+  probe.input = input;
+
+  const composerActions: Partial<ComposerActions> = {
+    clearIn: () => {
+      probe.clearIn();
+      setInput("");
+    },
+    pushHistory: () => {},
+    setHistoryIdx: () => {},
+    setInput,
+    setQueueEdit: () => {},
+  };
+  const ctx: InputHandlerContext = {
+    actions: {
+      answerClarify: () => {},
+      appendMessage: () => {},
+      die: () => {},
+      dispatchSubmission: () => {},
+      guardBusySessionSwitch: () => false,
+      newSession: () => {},
+      sys: () => {},
+    },
+    composer: {
+      actions: composerActions as ComposerActions,
+      refs: {
+        historyDraftRef: { current: "" },
+        historyRef: { current: [""] },
+        queueEditRef: { current: null },
+        queueRef: { current: [] },
+        submitRef: { current: () => {} },
+        tokensRef: { current: [] },
+      },
+      state: {
+        compIdx: 0,
+        compReplace: 0,
+        completions: [],
+        historyIdx,
+        input,
+        inputBuf: [],
+        queueEditIdx: null,
+        queuedDisplay: [],
+        tokens: [],
+      },
+    },
+    gateway: gatewayStub,
+    terminal: {
+      hasSelection: false,
+      scrollRef: { current: null },
+      scrollWithSelection: () => {},
+      selection: {} as InputHandlerContext["terminal"]["selection"],
+    },
+    wheelStep: 1,
+  };
+
+  useInputHandlers(ctx);
+
+  return null;
+};
+
+const newProbe = (): ComposerProbe => ({ clearIn: vi.fn(), input: "" });
+
+// A key nothing in the layout handles: pressed after the key under test, its arrival proves that key was dispatched
+// (stdin is read in order), so an absence asserted afterwards is real. Counted only unmodified, so an Esc that merged
+// with it into Alt+F12 never registers and the wait fails instead of passing falsely.
+const F12 = "\x1b[24~";
+
+const SentinelProbe = ({ hits }: { hits: { f12: number } }) => {
+  useInput((_ch, key, event) => {
+    if (event.keypress.name === "f12" && !key.meta) {
+      hits.f12++;
+    }
+  });
+
+  return null;
+};
+
+/** Press `key`, then the F12 sentinel, and wait until the sentinel has been dispatched. */
+const pressThenSentinel = async (
+  layout: { press: (keys: string) => void },
+  hits: { f12: number },
+  key: string,
+) => {
+  const before = hits.f12;
+
+  layout.press(key);
+  layout.press(F12);
+  await waitFor(() => expect(hits.f12).toBe(before + 1));
+};
+
+describe("useInputHandlers: ← opens the agent view from an idle, empty prompt", () => {
+  afterEach(() => {
+    $stripNav.set(IDLE_NAV);
+    $stripSessions.set([]);
+  });
+
+  it("opens the view on a plain ← with an empty composer", async () => {
+    const probe = newProbe();
+    const layout = mountLayout(
+      {},
+      {},
+      {},
+      {
+        beside: <InputHarness probe={probe} />,
+      },
+    );
+
+    await flush();
+    layout.press(LEFT);
+
+    await waitFor(() => expect(getOverlayState().agentView).toBe(true));
+    await waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
+  });
+
+  it.each<
+    [
+      string,
+      {
+        harness?: Partial<React.ComponentProps<typeof InputHarness>>;
+        key?: string;
+        overlay?: Partial<OverlayState>;
+        strip?: boolean;
+      },
+    ]
+  >([
+    ["with text typed", { harness: { initialInput: "draft" } }],
+    ["during a history walk", { harness: { historyIdx: 0 } }],
+    ["with the agent strip focused", { strip: true }],
+    ["with Shift held", { key: "\x1b[1;2D" }],
+    ["with Alt held", { key: "\x1b[1;3D" }],
+    [
+      "while an approval prompt is open",
+      {
+        overlay: {
+          approval: {
+            command: "ls",
+            requestId: "a-1",
+          } as OverlayState["approval"],
+        },
+      },
+    ],
+  ])("does not open %s", async (_name, { harness, key, overlay, strip }) => {
+    if (strip) {
+      // The strip drops focus as soon as it has no rows, so give it one.
+      $stripSessions.set([{ id: "bg-1", status: "working", title: "bg" }]);
+      $stripNav.set({ ...IDLE_NAV, focused: true });
+    }
+
+    const probe = newProbe();
+    const hits = { f12: 0 };
+    const layout = mountLayout(
+      overlay,
+      {},
+      {},
+      {
+        beside: (
+          <>
+            <InputHarness probe={probe} {...harness} />
+            <SentinelProbe hits={hits} />
+          </>
+        ),
+      },
+    );
+
+    await flush();
+    await pressThenSentinel(layout, hits, key ?? LEFT);
+
+    expect(getOverlayState().agentView).toBe(false);
+
+    if (strip) {
+      expect($stripNav.get().focused).toBe(true);
+    }
+  });
+});
+
+describe("useInputHandlers: Esc that closes the agent view does not count toward double-Esc", () => {
+  it("keeps the draft when a second Esc follows the one that closed the view", async () => {
+    const probe = newProbe();
+    const hits = { f12: 0 };
+    const layout = mountLayout(
+      { agentView: true },
+      {},
+      {},
+      {
+        beside: (
+          <>
+            <InputHarness initialInput="keep me" probe={probe} />
+            <SentinelProbe hits={hits} />
+          </>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
+
+    // Date.now is pinned to T0, so both presses sit well inside DOUBLE_ESC_MS.
+    layout.press(ESC);
+    await waitFor(() => expect(getOverlayState().agentView).toBe(false));
+    await flush();
+
+    layout.press(ESC);
+    // A lone Esc is only emitted after Ink's 50 ms escape-sequence flush; the sentinel must arrive after that, or the
+    // two merge into Alt+F12 (which the probe ignores, so the wait below would fail rather than pass falsely).
+    await flush();
+    await flush();
+    await flush();
+    await pressThenSentinel(layout, hits, "");
+
+    expect(probe.clearIn).not.toHaveBeenCalled();
+    expect(probe.input).toBe("keep me");
+  });
+});
+
+describe("AppLayout agent view: ⏎ routes by row kind", () => {
+  const helper: SubagentProgress = {
+    depth: 0,
+    goal: "helper agent",
+    id: "ag-1",
+    index: 0,
+    notes: [],
+    parentId: null,
+    startedAt: T0 - 5_000,
+    status: "running",
+    taskCount: 1,
+    thinking: [],
+    toolCount: 0,
+    tools: [],
+  } as SubagentProgress;
+
+  afterEach(() => {
+    $stripSessions.set([]);
+    setStripHandlers(null);
+    resetTurnState();
+  });
+
+  /** A gateway whose `session.list` returns one earlier session of this project. */
+  const pastGateway: GatewayServices = {
+    gw: {
+      request: () =>
+        Promise.resolve({
+          sessions: [
+            {
+              cwd: "/work/proj",
+              id: "past-1",
+              message_count: 4,
+              started_at: T0 / 1000 - 86_400,
+              title: "older work",
+            },
+          ],
+        }),
+      send: () => {},
+    } as unknown as GatewayClient,
+    rpc: gatewayStub.rpc,
+  };
+
+  const info = {
+    cwd: "/work/proj",
+    model: "test",
+    skills: {},
+    tools: {},
+  } as UiState["info"];
+
+  // Each case leaves only the target row in the list, so it is the selected one.
+  it("attaches a live session row with activateLiveSession", async () => {
+    const activateLiveSession = vi.fn();
+    const resumeById = vi.fn();
+
+    $stripSessions.set([
+      { id: "live-1", message_count: 3, status: "working", title: "busy one" },
+    ]);
+
+    const layout = mountLayout(
+      { agentView: true },
+      { info, sid: "s1" },
+      { activateLiveSession, resumeById },
+    );
+
+    await waitFor(() => expect(layout.output()).toContain("› ◐ busy one"));
+    layout.press("\r");
+
+    await waitFor(() => expect(activateLiveSession).toHaveBeenCalled());
+    // The origin goes along even though it is not in the live list: the gateway decides whether it is disposable.
+    expect(activateLiveSession).toHaveBeenCalledWith("live-1", "s1");
+    expect(resumeById).not.toHaveBeenCalled();
+    expect(getOverlayState().agentView).toBe(false);
+  });
+
+  it("resumes an earlier session row with resumeById", async () => {
+    const activateLiveSession = vi.fn();
+    const resumeById = vi.fn();
+    const layout = mountLayout(
+      { agentView: true },
+      { info, sid: "s1" },
+      { activateLiveSession, resumeById },
+      { gateway: pastGateway },
+    );
+
+    await waitFor(() => expect(layout.output()).toContain("› · older work"));
+    // The row is painted before the pane's input handler is re-armed with it; a ⏎ in that gap is dropped, and
+    // nothing observable marks the end of the gap.
+    await flush();
+    layout.press("\r");
+
+    await waitFor(() => expect(resumeById).toHaveBeenCalled());
+    expect(resumeById).toHaveBeenCalledWith("past-1", "s1");
+    expect(activateLiveSession).not.toHaveBeenCalled();
+    expect(getOverlayState().agentView).toBe(false);
+  });
+
+  it("opens an in-turn agent row through the strip's activate handler", async () => {
+    const activateLiveSession = vi.fn();
+    const resumeById = vi.fn();
+    const stripActivate = vi.fn();
+
+    setStripHandlers({ activate: stripActivate, stop: () => {} });
+    patchTurnState({ subagents: [helper] });
+
+    const layout = mountLayout(
+      { agentView: true },
+      { info, sid: "s1" },
+      { activateLiveSession, resumeById },
+    );
+
+    await waitFor(() => expect(layout.output()).toContain("› ◐ helper agent"));
+    layout.press("\r");
+
+    await waitFor(() => expect(stripActivate).toHaveBeenCalled());
+    expect(stripActivate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "ag-1", kind: "agent" }),
+    );
+    expect(activateLiveSession).not.toHaveBeenCalled();
+    expect(resumeById).not.toHaveBeenCalled();
+    expect(getOverlayState().agentView).toBe(false);
   });
 });

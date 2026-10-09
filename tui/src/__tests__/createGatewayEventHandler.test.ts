@@ -31,6 +31,7 @@ const buildCtx = (appended: Msg[]) =>
     },
     session: {
       STARTUP_RESUME_ID: "",
+      STARTUP_VIEW: "",
       colsRef: ref(80),
       newSession: vi.fn(),
       resetSession: vi.fn(),
@@ -1217,6 +1218,66 @@ describe("createGatewayEventHandler", () => {
     expect(resumeById).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["agents", true],
+    ["tree", false],
+    ["", false],
+  ])(
+    "on gateway.ready with STARTUP_VIEW=%j, agentView is %s and a session is still forged",
+    async (view, open) => {
+      const newSession = vi.fn();
+      const ctx = buildCtx([]);
+
+      ctx.session.newSession = newSession;
+      ctx.session.STARTUP_VIEW = view;
+      ctx.gateway.rpc = vi.fn(async (method: string) =>
+        method === "config.get"
+          ? { config: { display: { tui_auto_resume_recent: false } } }
+          : null,
+      );
+
+      createGatewayEventHandler(ctx)({
+        payload: {},
+        type: "gateway.ready",
+      } as any);
+
+      expect(getOverlayState().agentView).toBe(open);
+      await vi.waitFor(() => expect(newSession).toHaveBeenCalled());
+    },
+  );
+
+  it("on gateway.ready with STARTUP_VIEW=agents and auto_resume on, keeps the agent view and forges instead of resuming", async () => {
+    const newSession = vi.fn();
+    // The real resumeById closes the agent view on entry.
+    const resumeById = vi.fn(() => patchOverlayState({ agentView: false }));
+    const ctx = buildCtx([]);
+
+    ctx.session.newSession = newSession;
+    ctx.session.resumeById = resumeById;
+    ctx.session.STARTUP_RESUME_ID = "";
+    ctx.session.STARTUP_VIEW = "agents";
+    ctx.gateway.rpc = vi.fn(async (method: string) => {
+      if (method === "config.get") {
+        return { config: { display: { tui_auto_resume_recent: true } } };
+      }
+
+      if (method === "session.most_recent") {
+        return { session_id: "sess-most-recent" };
+      }
+
+      return null;
+    });
+
+    createGatewayEventHandler(ctx)({
+      payload: {},
+      type: "gateway.ready",
+    } as any);
+
+    await vi.waitFor(() => expect(newSession).toHaveBeenCalled());
+    expect(resumeById).not.toHaveBeenCalled();
+    expect(getOverlayState().agentView).toBe(true);
+  });
+
   it("on gateway.ready after a crash, resumes the recovered session once and skips forge", async () => {
     const appended: Msg[] = [];
     const newSession = vi.fn();
@@ -1242,7 +1303,9 @@ describe("createGatewayEventHandler", () => {
     onEvent({ payload: {}, type: "gateway.ready" } as any);
 
     await vi.waitFor(() =>
-      expect(resumeById).toHaveBeenCalledWith("sess-crashed"),
+      expect(resumeById).toHaveBeenCalledWith("sess-crashed", {
+        quietUnknownSession: true,
+      }),
     );
     expect(newSession).not.toHaveBeenCalled();
     expect(ctx.session.recoverSidRef.current).toBe("sess-crashed");
@@ -1376,7 +1439,7 @@ describe("createGatewayEventHandler", () => {
   it("on gateway.ready with STARTUP_RESUME_ID set, the env wins over config auto_resume", async () => {
     const appended: Msg[] = [];
     const newSession = vi.fn();
-    const resumeById = vi.fn();
+    const resumeById = vi.fn(async () => undefined);
     const ctx = buildCtx(appended);
 
     ctx.session.newSession = newSession;
@@ -1392,9 +1455,32 @@ describe("createGatewayEventHandler", () => {
     } as any);
 
     await vi.waitFor(() =>
-      expect(resumeById).toHaveBeenCalledWith("env-explicit"),
+      expect(resumeById).toHaveBeenCalledWith("env-explicit", {
+        quietUnknownSession: true,
+      }),
     );
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(newSession).not.toHaveBeenCalled();
+  });
+
+  it("on gateway.ready with a STARTUP_RESUME_ID the gateway does not know, starts a fresh session", async () => {
+    const appended: Msg[] = [];
+    const newSession = vi.fn();
+    const ctx = buildCtx(appended);
+
+    ctx.session.newSession = newSession;
+    ctx.session.resumeById = vi.fn(async () => "unknown-session" as const);
+    ctx.session.STARTUP_RESUME_ID = "sess-gone";
+
+    createGatewayEventHandler(ctx)({
+      payload: {},
+      type: "gateway.ready",
+    } as any);
+
+    await vi.waitFor(() => expect(newSession).toHaveBeenCalledTimes(1));
+    expect(newSession).toHaveBeenCalledWith(
+      "session sess-gone no longer exists; started a new one",
+    );
   });
 
   it("keeps gateway noise informational and approval out of Activity", async () => {
@@ -1592,7 +1678,7 @@ describe("createGatewayEventHandler", () => {
     ).toBe("completed");
   });
 
-  it("nudges toward /agents on the first spawn_requested of a turn", () => {
+  it("nudges toward /agents tree on the first spawn_requested of a turn", () => {
     const appended: Msg[] = [];
     const onEvent = createGatewayEventHandler(buildCtx(appended));
 
@@ -1605,7 +1691,11 @@ describe("createGatewayEventHandler", () => {
       a.text.includes("/agents"),
     );
     expect(hints).toHaveLength(1);
-    expect(hints[0]).toMatchObject({ tone: "info" });
+    // bare /agents opens the agent view now; the spawn tree it advertises lives at /agents tree
+    expect(hints[0]).toMatchObject({
+      text: "subagents working · /agents tree to watch live",
+      tone: "info",
+    });
   });
 
   it("nudges at most once per turn and resets on the next message.start", () => {

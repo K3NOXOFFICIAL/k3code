@@ -4,6 +4,7 @@ config although trust had been offered for --config-dir."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -61,6 +62,25 @@ def test_config_dir_reaches_the_tui_gateway(launched, tmp_path):
     res = CliRunner().invoke(cli_mod.main, ["--config-dir", str(proj)])
     assert res.exit_code == 0, res.output
     assert Path(launched[0]["K3CODE_PROJECT_DIR"]) == proj.resolve()
+
+
+def test_agents_opens_the_tui_on_the_daemon_with_the_agent_view(launched, monkeypatch):
+    monkeypatch.delenv("K3CODE_TUI_VIEW", raising=False)
+    monkeypatch.setenv("K3CODE_TUI_RESUME", "stale-session")  # inherited from a parent k3code: must not resume it
+    res = CliRunner().invoke(cli_mod.cli, ["agents"])
+    assert res.exit_code == 0, res.output
+    env = launched[0]
+    assert env["K3CODE_TUI_VIEW"] == "agents"
+    assert env["K3CODE_TUI_RESUME"] == ""
+    assert env["K3CODE_GATEWAY_CMD"].endswith("-m k3code.cli gateway --attach")
+
+
+def test_agents_sends_the_shell_cwd_as_the_session_workspace(launched, tmp_path, monkeypatch):
+    """The TUI forges its startup session on the daemon, whose own cwd is wherever it was started."""
+    monkeypatch.chdir(tmp_path)
+    res = CliRunner().invoke(cli_mod.cli, ["agents"])
+    assert res.exit_code == 0, res.output
+    assert launched[0]["K3CODE_TUI_CWD"] == os.getcwd()
 
 
 async def test_gateway_loads_the_project_config_named_by_k3code_project_dir(tmp_path, monkeypatch):

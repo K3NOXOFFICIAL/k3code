@@ -616,6 +616,27 @@ def attach_cmd(session_id: str, readonly: bool, socket_opt: Path | None) -> None
     _launch_tui(env_extra={"K3CODE_GATEWAY_CMD": cmd, "K3CODE_TUI_RESUME": session_id}, require=True)
 
 
+@cli.command("agents")
+@click.option("--readonly", is_flag=True, help="Watch only: prompts and approvals from this window are refused")
+@click.option("--socket", "socket_opt", type=click.Path(path_type=Path), help="Daemon socket path")
+def agents_cmd(readonly: bool, socket_opt: Path | None) -> None:
+    """Open the TUI on the daemon with the agent view showing (every session by state)."""
+    cmd = f"{sys.executable} -m k3code.cli gateway --attach" + (" --readonly" if readonly else "")
+    if socket_opt:
+        cmd += f" --socket {shlex.quote(str(socket_opt))}"
+    # An empty K3CODE_TUI_RESUME: an inherited one would resume that session instead of starting fresh.
+    # K3CODE_TUI_CWD: the session the TUI forges is this shell's project, not the daemon's launch directory.
+    _launch_tui(
+        env_extra={
+            "K3CODE_GATEWAY_CMD": cmd,
+            "K3CODE_TUI_RESUME": "",
+            "K3CODE_TUI_VIEW": "agents",
+            "K3CODE_TUI_CWD": os.getcwd(),
+        },
+        require=True,
+    )
+
+
 @cli.command("tail")
 @click.argument("subagent_id")
 @click.option("--socket", "socket_opt", type=click.Path(path_type=Path), help="Daemon socket path")

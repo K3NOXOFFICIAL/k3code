@@ -20,7 +20,7 @@ import {
   patchOverlayState,
 } from "../app/overlayStore.js";
 import { $petEnabled, $petParty } from "../app/petStore.js";
-import { $uiState } from "../app/uiStore.js";
+import { $uiState, getUiState } from "../app/uiStore.js";
 import {
   INLINE_MODE,
   NATIVE_MODE,
@@ -48,7 +48,9 @@ import {
 import { AgentsOverlay } from "./agentsOverlay.js";
 import { AgentStrip } from "../k3/agentStrip.js";
 import { ProposalCards } from "../k3/proposalCards.js";
-import { $stripNav } from "../k3/agentStripStore.js";
+import { $stripNav, getStripHandlers } from "../k3/agentStripStore.js";
+import { AgentViewPane } from "../k3/agentView.js";
+import { type ViewRow } from "../k3/agentViewStore.js";
 import { focusVisibleMessages } from "../k3/focusPolicy.js";
 import {
   GoodVibesHeart,
@@ -595,6 +597,52 @@ const JourneyPane = memo(function JourneyPane() {
   );
 });
 
+const AgentViewOverlayPane = memo(function AgentViewOverlayPane({
+  actions,
+}: Pick<AppLayoutProps, "actions">) {
+  const { gw } = useGateway();
+  const close = () => patchOverlayState({ agentView: false });
+  // The session being left, handed to the switch so the gateway can close it once this client is attached elsewhere
+  // if it is disposable (the gateway judges). Read at action time:
+  // `k3code agents` opens the view before the startup session exists.
+  const dropSid = (targetSid?: string) => {
+    const originSid = getUiState().sid;
+
+    return originSid && originSid !== targetSid ? originSid : undefined;
+  };
+
+  const activate = ({ kind, ...row }: ViewRow) => {
+    // A live session attaches like Enter in the strip; an earlier one is resumed like the session switcher does
+    // (busy-guarded); an in-turn agent opens its detail view, as Enter on it in the strip does.
+    if (kind === "session") {
+      actions.activateLiveSession(row.id, dropSid(row.id));
+    } else if (kind === "past") {
+      actions.resumeById(row.id, dropSid(row.id));
+    } else {
+      getStripHandlers()?.activate({ ...row, kind });
+    }
+
+    close();
+  };
+
+  return (
+    <AgentViewPane
+      gw={gw}
+      onActivate={activate}
+      onClose={close}
+      onNew={() => {
+        actions.newLiveSession(dropSid());
+        close();
+      }}
+      onStop={({ kind, ...row }) => {
+        if (kind !== "past") {
+          getStripHandlers()?.stop({ ...row, kind });
+        }
+      }}
+    />
+  );
+});
+
 const StatusRulePane = memo(function StatusRulePane({
   at,
   composer,
@@ -659,6 +707,8 @@ export const AppLayout = memo(function AppLayout({
 }: AppLayoutProps) {
   const overlay = useStore($overlayState);
   const ui = useStore($uiState);
+  // These replace the transcript, rails, pet, prompt zone and composer with one full-screen pane.
+  const fullScreen = overlay.agents || overlay.journey || overlay.agentView;
 
   const cursorSnapshotRef = useRef<InputCursorSnapshot | null>(null);
   useEffect(() => {
@@ -679,7 +729,7 @@ export const AppLayout = memo(function AppLayout({
         position={NATIVE_MODE ? undefined : "relative"}
       >
         <Box flexDirection="row" flexGrow={1}>
-          {!overlay.agents && !overlay.journey && <AmbientRail side="left" />}
+          {!fullScreen && <AmbientRail side="left" />}
           {overlay.agents ? (
             <PerfPane id="agents">
               <AgentsOverlayPane />
@@ -687,6 +737,10 @@ export const AppLayout = memo(function AppLayout({
           ) : overlay.journey ? (
             <PerfPane id="journey">
               <JourneyPane />
+            </PerfPane>
+          ) : overlay.agentView ? (
+            <PerfPane id="agentView">
+              <AgentViewOverlayPane actions={actions} />
             </PerfPane>
           ) : (
             <PerfPane id="transcript">
@@ -699,13 +753,13 @@ export const AppLayout = memo(function AppLayout({
               />
             </PerfPane>
           )}
-          {!overlay.agents && !overlay.journey && <AmbientRail side="right" />}
-          {!overlay.agents && !overlay.journey && (
+          {!fullScreen && <AmbientRail side="right" />}
+          {!fullScreen && (
             <PetCorner busy={ui.busy} cols={composer.cols} t={ui.theme} />
           )}
         </Box>
 
-        {!overlay.agents && !overlay.journey && (
+        {!fullScreen && (
           <>
             <PerfPane id="prompt">
               <PromptZone

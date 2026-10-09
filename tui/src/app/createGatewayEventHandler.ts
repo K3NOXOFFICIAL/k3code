@@ -67,7 +67,10 @@ import {
 } from "./outputTokensStore.js";
 import { flashGoodVibes } from "./petFlashStore.js";
 import { addProposal } from "../k3/proposalsStore.js";
-import { forgetServerRequest } from "./serverRequestStore.js";
+import {
+  forgetAllServerRequests,
+  forgetServerRequest,
+} from "./serverRequestStore.js";
 import { turnController } from "./turnController.js";
 import { getUiState, patchUiState } from "./uiStore.js";
 import {
@@ -522,6 +525,7 @@ export function createGatewayEventHandler(
   ): Promise<null | T> => rawRpc<T>(method, params).catch(() => null);
   const {
     STARTUP_RESUME_ID,
+    STARTUP_VIEW,
     newSession,
     recoverSidRef,
     resumeById,
@@ -630,11 +634,11 @@ export function createGatewayEventHandler(
     return fullConfigPromise;
   };
 
-  // ── Nudge toward /agents on delegation ───────────────────────────────
+  // ── Nudge toward /agents tree on delegation ───────────────────────────────
   //
   // When `display.tui_agents_nudge` is enabled (default true), the first
   // time a turn starts delegating we drop a single transient activity hint
-  // ("subagents working · /agents to watch live") so the user discovers the
+  // ("subagents working · /agents tree to watch live") so the user discovers the
   // spawn-tree dashboard instead of staring at a quiet transcript — without
   // hijacking the screen by force-opening an overlay.  Guards:
   //   • fires at most once per turn (`agentsNudgedThisTurn`)
@@ -676,7 +680,7 @@ export function createGatewayEventHandler(
 
     agentsNudgedThisTurn = true;
     turnController.pushActivity(
-      "subagents working · /agents to watch live",
+      "subagents working · /agents tree to watch live",
       "info",
     );
   };
@@ -728,6 +732,12 @@ export function createGatewayEventHandler(
       turnController.statusTimer = null;
       patchUiState({ status: statusFromBusy() });
     }, ms);
+  };
+
+  // resumeById ended "unknown-session" (raw error suppressed): one notice naming the id, then a fresh session.
+  const startFreshAfterUnknown = (sid: string) => {
+    patchUiState({ status: "forging session…" });
+    newSession(`session ${sid} no longer exists; started a new one`);
   };
 
   const scheduleStartupPrompt = () => {
@@ -783,6 +793,10 @@ export function createGatewayEventHandler(
       applySkin(skin);
     }
 
+    // Requests stored before this gateway announced itself came over a dead transport: answering one goes nowhere,
+    // and the recovery resume below would reopen its card. The gateway re-sends what is still open on attach.
+    forgetAllServerRequests();
+
     // Kick off the config fetch once the gateway is actually ready. If handler
     // construction does this during React render, a startup transport error can
     // report through sys(), mutate transcript state, and trip React's
@@ -827,11 +841,26 @@ export function createGatewayEventHandler(
     const recoverSid = recoverSidRef?.current;
 
     if (recoverSidRef && recoverSid) {
-      void resumeById(recoverSid).then(() => {
-        if (getUiState().sid && recoverSidRef.current === recoverSid) {
-          recoverSidRef.current = null;
-        }
-      });
+      void resumeById(recoverSid, { quietUnknownSession: true }).then(
+        (outcome) => {
+          if (recoverSidRef.current !== recoverSid) {
+            return;
+          }
+
+          // The target can be gone (deleted, or a different daemon came back); stay on no session at all and every
+          // prompt is lost, so start a fresh one instead.
+          if (outcome === "unknown-session") {
+            recoverSidRef.current = null;
+            startFreshAfterUnknown(recoverSid);
+
+            return;
+          }
+
+          if (getUiState().sid) {
+            recoverSidRef.current = null;
+          }
+        },
+      );
       // After resumeById: it synchronously sets status to 'resuming…' on entry,
       // so override it here to keep the distinct "recovering" label visible for
       // the duration of the resume RPC (which later flips status to 'ready').
@@ -840,9 +869,21 @@ export function createGatewayEventHandler(
       return;
     }
 
+    // `k3code agents`: open the agent view over the session that is resumed or forged below.
+    if (STARTUP_VIEW === "agents") {
+      patchOverlayState({ agentView: true });
+    }
+
     if (STARTUP_RESUME_ID) {
       patchUiState({ status: "resuming…" });
-      resumeById(STARTUP_RESUME_ID);
+      // `k3code attach <sid>` on an id the gateway does not know: a fresh session, not none at all.
+      void resumeById(STARTUP_RESUME_ID, { quietUnknownSession: true }).then(
+        (outcome) => {
+          if (outcome === "unknown-session") {
+            startFreshAfterUnknown(STARTUP_RESUME_ID);
+          }
+        },
+      );
       scheduleStartupPrompt();
 
       return;
@@ -856,7 +897,11 @@ export function createGatewayEventHandler(
     // users aren't surprised.  (Shares the memoized full-config read.)
     getFullConfigOnce()
       .then((cfg) => {
-        if (!cfg?.config?.display?.tui_auto_resume_recent) {
+        // `k3code agents` wins over auto-resume: resuming closes the agent view it just opened.
+        if (
+          !cfg?.config?.display?.tui_auto_resume_recent ||
+          STARTUP_VIEW === "agents"
+        ) {
           patchUiState({ status: "forging session…" });
           newSession();
           scheduleStartupPrompt();

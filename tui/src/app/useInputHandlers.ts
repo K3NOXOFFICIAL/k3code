@@ -64,6 +64,61 @@ export const composerHasDraft = (cState: {
 }): boolean =>
   Boolean(cState.input || cState.inputBuf.length || cState.tokens?.length);
 
+/**
+ * `←` opens the agent view only from an idle, empty prompt: no text or multi-line buffer, no history walk or queue
+ * edit, the strip not focused and no overlay up. Anywhere else `←` keeps moving the cursor.
+ */
+export const shouldOpenAgentView = ({
+  blocked,
+  historyIdx,
+  input,
+  inputBuf,
+  key,
+  queueEditIdx,
+  stripFocused,
+}: {
+  blocked: boolean;
+  historyIdx: null | number;
+  input: string;
+  inputBuf: readonly string[];
+  key: { ctrl?: boolean; leftArrow?: boolean; meta?: boolean; shift?: boolean };
+  queueEditIdx: null | number;
+  stripFocused: boolean;
+}): boolean =>
+  Boolean(key.leftArrow) &&
+  !key.shift &&
+  !key.meta &&
+  !key.ctrl &&
+  input === "" &&
+  !inputBuf.length &&
+  historyIdx === null &&
+  queueEditIdx === null &&
+  !stripFocused &&
+  !blocked;
+
+/** Overlays Ctrl+C dismisses, first match wins. */
+const CTRL_C_ORDER = [
+  // First: the full-screen agent view hides PromptZone, so a prompt behind it must never be answered unseen.
+  "agentView",
+  "clarify",
+  "approval",
+  "sudo",
+  "secret",
+  "modelPicker",
+  "skillsHub",
+  "pluginsHub",
+  "sessions",
+  "agents",
+  "journey",
+  "widget",
+] as const satisfies readonly (keyof OverlayState)[];
+
+/** The overlay Ctrl+C dismisses, or null when none is up. */
+export const ctrlCOverlayTarget = (
+  overlay: Pick<OverlayState, (typeof CTRL_C_ORDER)[number]>,
+): (typeof CTRL_C_ORDER)[number] | null =>
+  CTRL_C_ORDER.find((k) => Boolean(overlay[k])) ?? null;
+
 export function handleInputSelectionClipboard(
   selection: ReturnType<typeof getInputSelection>,
   action: "copy" | "cut",
@@ -226,48 +281,34 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
   };
 
   const cancelOverlayFromCtrlC = () => {
-    if (overlay.clarify) {
-      return actions.answerClarify("");
-    }
+    switch (ctrlCOverlayTarget(overlay)) {
+      case "agentView":
+        return patchOverlayState({ agentView: false });
+      case "clarify":
+        return actions.answerClarify("");
+      case "approval":
+        respondToServerRequest(overlay.approval!.requestId, { choice: "deny" });
+        patchOverlayState({ approval: null });
+        patchTurnState({ outcome: "denied" });
 
-    if (overlay.approval) {
-      respondToServerRequest(overlay.approval.requestId, { choice: "deny" });
-      patchOverlayState({ approval: null });
-      patchTurnState({ outcome: "denied" });
-
-      return;
-    }
-
-    if (overlay.sudo || overlay.secret) {
-      return dismissSensitivePrompt(overlay, gateway.rpc, actions.sys);
-    }
-
-    if (overlay.modelPicker) {
-      return patchOverlayState({ modelPicker: false });
-    }
-
-    if (overlay.skillsHub) {
-      return patchOverlayState({ skillsHub: false });
-    }
-
-    if (overlay.pluginsHub) {
-      return patchOverlayState({ pluginsHub: false });
-    }
-
-    if (overlay.sessions) {
-      return patchOverlayState({ sessions: false });
-    }
-
-    if (overlay.agents) {
-      return patchOverlayState({ agents: false });
-    }
-
-    if (overlay.journey) {
-      return patchOverlayState({ journey: false });
-    }
-
-    if (overlay.widget) {
-      return closeWidget();
+        return;
+      case "sudo":
+      case "secret":
+        return dismissSensitivePrompt(overlay, gateway.rpc, actions.sys);
+      case "modelPicker":
+        return patchOverlayState({ modelPicker: false });
+      case "skillsHub":
+        return patchOverlayState({ skillsHub: false });
+      case "pluginsHub":
+        return patchOverlayState({ pluginsHub: false });
+      case "sessions":
+        return patchOverlayState({ sessions: false });
+      case "agents":
+        return patchOverlayState({ agents: false });
+      case "journey":
+        return patchOverlayState({ journey: false });
+      case "widget":
+        return closeWidget();
     }
   };
 
@@ -338,7 +379,8 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
   useInput((ch, key, event) => {
     const live = getUiState();
 
-    if (key.escape && !$stripNav.get().focused) {
+    // The agent view owns Esc (it closes the view); counting it here would let the next Esc discard the draft.
+    if (key.escape && !$stripNav.get().focused && !overlay.agentView) {
       const now = Date.now();
       const isDouble = now - lastEscRef.current <= DOUBLE_ESC_MS;
 
@@ -600,6 +642,24 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       cState.queueEditIdx === null
     ) {
       $stripNav.set({ ...IDLE_NAV, focused: true });
+
+      return;
+    }
+
+    // ← on an idle, empty prompt opens the agent view. In the view the same key closes it: this handler sees that
+    // press while `isBlocked` is still true and returns above, so it cannot reopen the view.
+    if (
+      shouldOpenAgentView({
+        blocked: isBlocked,
+        historyIdx: cState.historyIdx,
+        input: cState.input,
+        inputBuf: cState.inputBuf,
+        key,
+        queueEditIdx: cState.queueEditIdx,
+        stripFocused: strip.focused,
+      })
+    ) {
+      patchOverlayState({ agentView: true });
 
       return;
     }

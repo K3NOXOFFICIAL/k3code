@@ -128,6 +128,8 @@ export interface OverlayState {
   agentsInitialHistoryIndex: number;
   /** Sub-agent to open in detail view (Enter on its row in the agent strip); null opens the list. */
   agentsInitialAgentId: null | string;
+  /** Full-screen agent view (`←` on an empty prompt, `/agents`): every session grouped by state. */
+  agentView: boolean;
   approval: ApprovalReq | null;
   clarify: ClarifyReq | null;
   confirm: ConfirmReq | null;
@@ -313,6 +315,16 @@ export interface InputHandlerResult {
   pagerPageSize: number;
 }
 
+/** How `resumeById` ended: `"unknown-session"` when the gateway has no such session (e.g. reaped while empty). */
+export type ResumeOutcome = "unknown-session" | void;
+
+export interface ResumeOptions {
+  /** The session this client is leaving, closed once attached elsewhere if the gateway finds it disposable. */
+  dropSid?: string;
+  /** The caller handles `"unknown-session"` with its own notice: do not print the raw error. */
+  quietUnknownSession?: boolean;
+}
+
 export interface GatewayEventHandlerContext {
   composer: {
     setInput: StateSetter<string>;
@@ -320,12 +332,13 @@ export interface GatewayEventHandlerContext {
   gateway: GatewayServices;
   session: {
     STARTUP_RESUME_ID: string;
+    STARTUP_VIEW: string;
     colsRef: MutableRefObject<number>;
     newSession: (msg?: string, title?: string) => void;
     // Session carried across a transport loss or child exit, cleared after resume.
     recoverSidRef?: MutableRefObject<null | string>;
     resetSession: () => void;
-    resumeById: (id: string) => Promise<void>;
+    resumeById: (id: string, opts?: ResumeOptions) => Promise<ResumeOutcome>;
     setCatalog: StateSetter<null | SlashCatalog>;
   };
   submission: {
@@ -400,12 +413,14 @@ export interface AppLayoutActions {
   answerSecret: (value: string) => void;
   answerSudo: (pw: string) => void;
   clearSelection: () => void;
-  activateLiveSession: (id: string) => void;
+  /** `dropSid`: an empty session to close once attached elsewhere (agent view). */
+  activateLiveSession: (id: string, dropSid?: string) => void;
   closeLiveSession: (id: string) => Promise<null | SessionCloseResponse>;
-  newLiveSession: () => void;
+  newLiveSession: (dropSid?: string) => void;
   newPromptSession: (prompt: string, modelArg?: string) => void;
   onModelSelect: (value: string) => void;
-  resumeById: (id: string) => void;
+  /** `dropSid`: the session being left, closed once attached elsewhere if it is disposable (agent view). */
+  resumeById: (id: string, dropSid?: string) => void;
   setStickyPrompt: (value: string) => void;
 }
 

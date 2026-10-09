@@ -1280,7 +1280,7 @@ export const ToolTrail = memo(function ToolTrail({
               index === groups.length - 1 ? "last" : "mid";
             const childRails = nextTreeRails(rails, branch);
             const hasInlineSubagents = inlineDelegateKey === group.key;
-            // Surface the /agents hint the moment a delegate group appears —
+            // Surface the /agents tree hint the moment a delegate group appears —
             // while it's still in-flight and before any subagent has
             // registered — so users can open the live monitor immediately.
             const isDelegateGroup = group.label.startsWith("Delegate Task");
@@ -1296,7 +1296,7 @@ export const ToolTrail = memo(function ToolTrail({
                       {toolLabel(group)}
                       {isDelegateGroup ? (
                         <Text color={t.color.statusFg} dim>
-                          {"  (/agents to monitor)"}
+                          {"  (/agents tree to monitor)"}
                         </Text>
                       ) : null}
                     </>
@@ -1329,10 +1329,10 @@ export const ToolTrail = memo(function ToolTrail({
 
   if (hasSubagents && !inlineDelegateKey && visible.subagents !== "hidden") {
     // Spark + summary give a one-line read on the branch shape before
-    // opening the subtree.  `/agents` opens the full-screen audit overlay.
+    // opening the subtree.  `/agents tree` opens the full-screen spawn-tree overlay.
     const suffix = spawnSpark
-      ? `${spawnSummaryLabel}  ${spawnSpark}  (/agents)`
-      : `${spawnSummaryLabel}  (/agents)`;
+      ? `${spawnSummaryLabel}  ${spawnSpark}  (/agents tree)`
+      : `${spawnSummaryLabel}  (/agents tree)`;
 
     panels.push({
       header: (

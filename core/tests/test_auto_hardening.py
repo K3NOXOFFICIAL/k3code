@@ -149,6 +149,8 @@ async def test_engine_prune_deletes_finished_unattended_sessions_only(tmp_path, 
     old.meta["origin"] = "automation"
     server.store.save(old)
     mine = server.store.create(title="my work", model="m", cwd=str(tmp_path))
+    mine.messages = [{"role": "user", "content": "hi"}]  # most_recent skips sessions with no message
+    server.store.save(mine)
     eng.db.insert("jobs", id="gone-job-owner", name="x", prompt="p", schedule="* * * * *", created_at=0.0)
     eng.db.delete("jobs", "gone-job-owner")  # the job was removed: its runs are orphans
     for sid in (old.session_id, mine.session_id):

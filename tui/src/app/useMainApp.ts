@@ -20,6 +20,7 @@ import {
   DASHBOARD_TUI_MODE,
   NATIVE_MODE,
   STARTUP_RESUME_ID,
+  STARTUP_VIEW,
 } from "../config/env.js";
 import { WHEEL_SCROLL_STEP } from "../config/limits.js";
 import { RESIZE_COALESCE_MS } from "../config/timing.js";
@@ -657,6 +658,10 @@ export function useMainApp(gw: GatewayClient) {
     [exit, gw],
   );
 
+  const reopenServerRequest = useCallback((request: ServerRequest) => {
+    onServerRequestRef.current(request);
+  }, []);
+
   const session = useSessionLifecycle({
     colsRef,
     composerActions,
@@ -665,6 +670,7 @@ export function useMainApp(gw: GatewayClient) {
       ? setDashboardFreshSessionId
       : undefined,
     panel,
+    reopenServerRequest,
     rpc,
     scrollRef,
     setHistoryItems,
@@ -1144,6 +1150,7 @@ export function useMainApp(gw: GatewayClient) {
         gateway,
         session: {
           STARTUP_RESUME_ID,
+          STARTUP_VIEW,
           colsRef,
           newSession: session.newSession,
           recoverSidRef,
@@ -1569,19 +1576,20 @@ export function useMainApp(gw: GatewayClient) {
       answerSecret,
       answerSudo,
       clearSelection,
-      newLiveSession: () => session.newLiveSession(),
+      newLiveSession: (dropSid?: string) =>
+        session.newLiveSession(undefined, undefined, dropSid),
       newPromptSession,
       onModelSelect,
       // Resuming a cold session from the overlay CLOSES the current one, so it
       // must respect the busy guard just like the `/resume` slash path.
       // (Switching between live sessions and `+ new` keep the current session
       // running, so those stay unguarded — that's the orchestrator's purpose.)
-      resumeById: (id: string) => {
+      resumeById: (id: string, dropSid?: string) => {
         if (session.guardBusySessionSwitch("switch sessions")) {
           return;
         }
 
-        session.resumeById(id);
+        void session.resumeById(id, { dropSid });
       },
       setStickyPrompt,
     }),

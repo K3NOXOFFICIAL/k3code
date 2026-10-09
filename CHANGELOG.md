@@ -15,6 +15,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Added
 
+- **Agent view.** `←` on an empty input, `/agents` or `k3code agents` (on the daemon) opens a full-screen list of every session and sub-agent by state, plus earlier sessions of the current project; `session.list` rows now carry the session's `cwd`, and a `cwd` param filters the list to that project on the gateway.
 - **`sandbox.home_readonly`** (user config only): `$HOME` entries that stay visible, read-only, inside the bash sandbox, for example `[".myapp"]`. The sandbox hid all of `$HOME`, so a model that checks a marker file in the home folder could never see it and repeated its first-run question in every `auto`/`yolo` session.
 
 ### Fixed

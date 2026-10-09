@@ -7,6 +7,7 @@ const buildOverlayState = (): OverlayState => ({
   agents: false,
   agentsInitialHistoryIndex: 0,
   agentsInitialAgentId: null,
+  agentView: false,
   approval: null,
   clarify: null,
   confirm: null,
@@ -28,6 +29,7 @@ export const $isBlocked = computed(
   $overlayState,
   ({
     agents,
+    agentView,
     approval,
     clarify,
     confirm,
@@ -43,6 +45,7 @@ export const $isBlocked = computed(
   }) =>
     Boolean(
       agents ||
+      agentView ||
       approval ||
       clarify ||
       confirm ||
@@ -86,7 +89,7 @@ export const $isBlocked = computed(
  *   render in NORMAL FLOW above ComposerPane (`appLayout.tsx:553-568`): they
  *   push content down, they do not cover it.  The rule stays on screen and
  *   its clock must keep running.
- * - `agents` and `journey`.  They unmount the entire ComposerPane subtree
+ * - `agents`, `agentView` and `journey`.  They unmount the entire ComposerPane subtree
  *   (`appLayout.tsx:553`), so `StatusRule` unmounts with it and React's own
  *   effect cleanup clears the intervals.  Gating on them would be dead code.
  * - `ambient` — a glanceable in-flow dock that reserves its own rows.
@@ -142,7 +145,7 @@ export const resetOverlayState = () => $overlayState.set(buildOverlayState());
 
 /**
  * Soft reset: drop FLOW-scoped overlays (approval / clarify / confirm / sudo
- * / secret / pager) but PRESERVE user-toggled ones — agents dashboard, model
+ * / secret / pager) but PRESERVE user-toggled ones — agents dashboard, agent view, model
  * picker, skills hub, sessions overlay.  Those are opened deliberately and
  * shouldn't vanish when a turn ends.  Called from turnController.idle() on
  * every turn completion / interrupt; the old "reset everything" behaviour
@@ -154,6 +157,7 @@ export const resetFlowOverlays = () =>
     agents: $overlayState.get().agents,
     agentsInitialHistoryIndex: $overlayState.get().agentsInitialHistoryIndex,
     agentsInitialAgentId: $overlayState.get().agentsInitialAgentId,
+    agentView: $overlayState.get().agentView,
     ambient: $overlayState.get().ambient,
     widget: $overlayState.get().widget,
     journey: $overlayState.get().journey,
