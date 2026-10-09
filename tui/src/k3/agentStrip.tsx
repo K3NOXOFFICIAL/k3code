@@ -12,8 +12,6 @@ import type { Theme } from "../theme.js";
 import type { SubagentProgress } from "../types.js";
 
 import {
-  $stripNav,
-  $stripRows,
   $stripSessions,
   STRIP_MAX_ROWS,
   type StripRow,
@@ -153,22 +151,15 @@ export function buildStripRows(
 
 export interface AgentStripViewProps {
   cols: number;
-  confirmKey?: null | string;
-  focused?: boolean;
-  index?: number;
   rows: readonly StripRow[];
   t: Theme;
 }
 
-/** Presentation only: one row per session/agent, ≤6 rows then `+N more`; hidden when empty. */
-export function AgentStripView({
-  cols,
-  confirmKey = null,
-  focused = false,
-  index = 0,
-  rows,
-  t,
-}: AgentStripViewProps) {
+/**
+ * Read-only list under the prompt: one row per session/agent, ≤6 rows then `+N more`; hidden when empty. It never takes
+ * focus (↑/↓ stay with the prompt history); `←` on an empty prompt opens the agent view, where rows are selected.
+ */
+export function AgentStripView({ cols, rows, t }: AgentStripViewProps) {
   if (!rows.length) {
     return null;
   }
@@ -176,27 +167,20 @@ export function AgentStripView({
   const shown = rows.slice(0, STRIP_MAX_ROWS);
   const more = rows.length - shown.length;
 
-  const count = `agents (${rows.length})`;
-
   return (
     <Box flexDirection="column" flexShrink={0} width={cols}>
-      {/* The section header doubles as the key hint, like Claude Code's "↓ to select" under the prompt. */}
+      {/* The section header doubles as the key hint: the rows are managed in the agent view. */}
       <SectionRule
         cols={cols}
-        label={
-          focused
-            ? `${count} · ↑↓ move · ⏎ open · x stop · esc back`
-            : `${count} · ↓ to select`
-        }
+        label={`agents (${rows.length}) · ← agent view`}
         t={t}
       />
-      {shown.map((row, i) => {
-        const selected = focused && i === index;
+      {shown.map((row) => {
         const elapsed =
           row.elapsedSeconds == null
             ? ""
             : ` ${fmtDuration(row.elapsedSeconds)}`;
-        const head = `${selected ? "›" : " "} ${GLYPH[row.state]} `;
+        const head = `  ${GLYPH[row.state]} `;
         const tail = `${elapsed} · ${LABEL[row.state]}`;
         const titleW = Math.max(
           8,
@@ -206,11 +190,8 @@ export function AgentStripView({
 
         return (
           <Text key={row.key} wrap="truncate-end">
-            <Text color={selected ? t.color.accent : t.color.muted}>
-              {head.slice(0, 2)}
-            </Text>
-            <Text color={stateColor(row.state, t)}>{GLYPH[row.state]} </Text>
-            <Text bold={selected} color={t.color.text}>
+            <Text color={stateColor(row.state, t)}>{head}</Text>
+            <Text color={t.color.text}>
               {compactPreview(row.title, titleW)}
             </Text>
             <Text color={t.color.muted}>{tail}</Text>
@@ -218,9 +199,6 @@ export function AgentStripView({
               <Text
                 color={t.color.muted}
               >{` · ${compactPreview(row.activity, actW)}`}</Text>
-            ) : null}
-            {confirmKey === row.key ? (
-              <Text color={t.color.warn}> stop? y/n</Text>
             ) : null}
           </Text>
         );
@@ -234,7 +212,6 @@ export function AgentStripView({
 export function AgentStrip({ cols }: { cols: number }) {
   const { sid, theme } = useStore($uiState);
   const sessions = useStore($stripSessions);
-  const nav = useStore($stripNav);
   const subagents = useAgentRoster();
   const [now, setNow] = useState(Date.now);
   const rows = useMemo(
@@ -256,22 +233,5 @@ export function AgentStrip({ cols }: { cols: number }) {
     return () => clearInterval(timer);
   }, [live]);
 
-  useEffect(() => {
-    $stripRows.set(rows);
-
-    if (!rows.length && $stripNav.get().focused) {
-      $stripNav.set({ confirmKey: null, focused: false, index: 0 });
-    }
-  }, [rows]);
-
-  return (
-    <AgentStripView
-      cols={cols}
-      confirmKey={nav.confirmKey}
-      focused={nav.focused}
-      index={nav.index}
-      rows={rows}
-      t={theme}
-    />
-  );
+  return <AgentStripView cols={cols} rows={rows} t={theme} />;
 }

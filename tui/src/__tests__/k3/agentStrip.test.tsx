@@ -6,14 +6,7 @@ import stripAnsi from "strip-ansi";
 import { describe, expect, it } from "vitest";
 
 import { AgentStripView, buildStripRows } from "../../k3/agentStrip.js";
-import {
-  IDLE_NAV,
-  reduceStripKey,
-  shouldEnterStrip,
-  type StripNav,
-  type StripRow,
-  STRIP_MAX_ROWS,
-} from "../../k3/agentStripStore.js";
+import { type StripRow, STRIP_MAX_ROWS } from "../../k3/agentStripStore.js";
 import { DEFAULT_THEME } from "../../theme.js";
 import type { SubagentProgress } from "../../types.js";
 
@@ -27,17 +20,14 @@ const row = (n: number, state: StripRow["state"] = "working"): StripRow => ({
   title: `task ${n}`,
 });
 
-const dump = (
-  rows: StripRow[],
-  extra: Partial<React.ComponentProps<typeof AgentStripView>> = {},
-) => {
+const dump = (rows: StripRow[]) => {
   const stdout = Object.assign(new PassThrough(), { columns: 80, rows: 24 });
   const frames: string[] = [];
 
   stdout.on("data", (c) => frames.push(c.toString()));
 
   const view = renderSync(
-    <AgentStripView cols={80} rows={rows} t={DEFAULT_THEME} {...extra} />,
+    <AgentStripView cols={80} rows={rows} t={DEFAULT_THEME} />,
     {
       stdin: new PassThrough() as NodeJS.ReadStream,
       stdout: stdout as unknown as NodeJS.WriteStream,
@@ -82,17 +72,23 @@ describe("AgentStripView", () => {
     expect(dump([])).toBe("");
   });
 
-  it("heads the list with a rule naming it and how to enter it", () => {
-    const idle = dump([row(1), row(2)]);
+  it("heads the list with a rule naming it and pointing at the agent view", () => {
+    const out = dump([row(1), row(2)]);
 
-    expect(idle.split("\n")[0]).toMatch(/^── agents \(2\) · ↓ to select ─+$/);
+    expect(out.split("\n")[0]).toMatch(/^── agents \(2\) · ← agent view ─+$/);
+  });
 
-    const focused = dump([row(1), row(2)], { focused: true, index: 1 });
+  it("is a read-only list: no selection marker and no stop prompt on any row", () => {
+    const lines = dump([row(1), row(2, "input"), row(3, "done")]).split("\n");
 
-    expect(focused.split("\n")[0]).toContain(
-      "agents (2) · ↑↓ move · ⏎ open · x stop · esc back",
-    );
-    expect(focused).not.toContain("⏎ attach");
+    expect(lines.slice(1)).toHaveLength(3);
+
+    for (const line of lines.slice(1)) {
+      expect(line).toMatch(/^ {2}[◐●✓✗○] task \d/);
+    }
+
+    expect(lines.join("\n")).not.toContain("›");
+    expect(lines.join("\n")).not.toContain("stop?");
   });
 
   it("drops finished sub-agents a minute after they end; running ones stay", () => {
@@ -129,17 +125,6 @@ describe("AgentStripView", () => {
 
     expect(rows.map((r) => r.state)).toEqual(["working", "done"]);
     expect(rows[0]?.elapsedSeconds).toBe(300);
-  });
-
-  it("marks the selected row and the stop confirmation", () => {
-    const rows = [row(1), row(2)];
-    const out = dump(rows, {
-      confirmKey: rows[1]!.key,
-      focused: true,
-      index: 1,
-    });
-    expect(out).toMatch(/› .*task 2/);
-    expect(out).toContain("stop? y/n");
   });
 });
 
@@ -179,64 +164,6 @@ describe("buildStripRows", () => {
 
   it("maps failed sub-agents", () => {
     expect(buildStripRows([sub("failed")], [], 5000)[0]!.state).toBe("failed");
-  });
-});
-
-describe("strip keyboard", () => {
-  const rows = [row(1), row(2), row(3)];
-  const focused: StripNav = { ...IDLE_NAV, focused: true };
-
-  it("↓ enters only from an empty input with no history cycle", () => {
-    expect(shouldEnterStrip({ historyIdx: null, input: "", rows: 2 })).toBe(
-      true,
-    );
-    expect(shouldEnterStrip({ historyIdx: null, input: "hi", rows: 2 })).toBe(
-      false,
-    );
-    expect(shouldEnterStrip({ historyIdx: 3, input: "", rows: 2 })).toBe(false);
-    expect(shouldEnterStrip({ historyIdx: null, input: "", rows: 0 })).toBe(
-      false,
-    );
-  });
-
-  it("ignores keys when not focused", () => {
-    expect(reduceStripKey(IDLE_NAV, rows, { down: true }).consumed).toBe(false);
-  });
-
-  it("↑/↓ move between rows and clamp at the bottom", () => {
-    let n = reduceStripKey(focused, rows, { down: true }).nav;
-    expect(n.index).toBe(1);
-    n = reduceStripKey(n, rows, { down: true }).nav;
-    n = reduceStripKey(n, rows, { down: true }).nav;
-    expect(n.index).toBe(2);
-    expect(reduceStripKey(n, rows, { up: true }).nav.index).toBe(1);
-  });
-
-  it("↑ past the first row and Esc return to the input", () => {
-    expect(reduceStripKey(focused, rows, { up: true }).nav.focused).toBe(false);
-    expect(reduceStripKey(focused, rows, { escape: true }).nav.focused).toBe(
-      false,
-    );
-  });
-
-  it("Enter activates the selected row and leaves the strip", () => {
-    const r = reduceStripKey({ ...focused, index: 1 }, rows, { return: true });
-    expect(r.effect).toEqual({ row: rows[1], type: "activate" });
-    expect(r.nav.focused).toBe(false);
-  });
-
-  it("x asks for confirmation; y stops, anything else cancels", () => {
-    const ask = reduceStripKey({ ...focused, index: 2 }, rows, { ch: "x" });
-    expect(ask.effect).toBeNull();
-    expect(ask.nav.confirmKey).toBe(rows[2]!.key);
-    expect(reduceStripKey(ask.nav, rows, { ch: "y" }).effect).toEqual({
-      row: rows[2],
-      type: "stop",
-    });
-    const no = reduceStripKey(ask.nav, rows, { ch: "n" });
-    expect(no.effect).toBeNull();
-    expect(no.nav.confirmKey).toBeNull();
-    expect(no.nav.focused).toBe(true);
   });
 });
 

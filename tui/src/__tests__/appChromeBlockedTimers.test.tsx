@@ -34,12 +34,7 @@ import { ESC_INTERRUPT_HINT } from "../components/workingLine.js";
 import { DOUBLE_ESC_MS } from "../config/timing.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import { AGENT_VIEW_HINT } from "../k3/agentView.js";
-import {
-  $stripNav,
-  $stripSessions,
-  IDLE_NAV,
-  setStripHandlers,
-} from "../k3/agentStripStore.js";
+import { $stripSessions, setStripHandlers } from "../k3/agentStripStore.js";
 import { DEFAULT_THEME } from "../theme.js";
 import type { SubagentProgress } from "../types.js";
 import { waitFor } from "./waitFor.js";
@@ -820,18 +815,22 @@ describe("AppLayout agent view: the gateway closes the session left behind", () 
 // lives in React so a cleared draft shows up in `composer.input`.
 
 const LEFT = "\x1b[D";
+const UP = "\x1b[A";
+const DOWN = "\x1b[B";
 const ESC = "\x1b";
 
 type ComposerProbe = { clearIn: ReturnType<typeof vi.fn>; input: string };
 
 const InputHarness = ({
   gateway = gatewayStub,
+  history = [""],
   historyIdx = null,
   initialInput = "",
   probe,
   queueEditIdx = null,
 }: {
   gateway?: GatewayServices;
+  history?: string[];
   historyIdx?: null | number;
   initialInput?: string;
   probe: ComposerProbe;
@@ -865,7 +864,7 @@ const InputHarness = ({
       actions: composerActions as ComposerActions,
       refs: {
         historyDraftRef: { current: "" },
-        historyRef: { current: [""] },
+        historyRef: { current: history },
         queueEditRef: { current: null },
         queueRef: { current: [] },
         submitRef: { current: () => {} },
@@ -930,7 +929,6 @@ const pressThenSentinel = async (
 
 describe("useInputHandlers: ← opens the agent view from an idle, empty prompt", () => {
   afterEach(() => {
-    $stripNav.set(IDLE_NAV);
     $stripSessions.set([]);
   });
 
@@ -959,13 +957,11 @@ describe("useInputHandlers: ← opens the agent view from an idle, empty prompt"
         harness?: Partial<React.ComponentProps<typeof InputHarness>>;
         key?: string;
         overlay?: Partial<OverlayState>;
-        strip?: boolean;
       },
     ]
   >([
     ["with text typed", { harness: { initialInput: "draft" } }],
     ["during a history walk", { harness: { historyIdx: 0 } }],
-    ["with the agent strip focused", { strip: true }],
     ["with Shift held", { key: "\x1b[1;2D" }],
     ["with Alt held", { key: "\x1b[1;3D" }],
     [
@@ -979,13 +975,7 @@ describe("useInputHandlers: ← opens the agent view from an idle, empty prompt"
         },
       },
     ],
-  ])("does not open %s", async (_name, { harness, key, overlay, strip }) => {
-    if (strip) {
-      // The strip drops focus as soon as it has no rows, so give it one.
-      $stripSessions.set([{ id: "bg-1", status: "working", title: "bg" }]);
-      $stripNav.set({ ...IDLE_NAV, focused: true });
-    }
-
+  ])("does not open %s", async (_name, { harness, key, overlay }) => {
     const probe = newProbe();
     const hits = { f12: 0 };
     const layout = mountLayout(
@@ -1006,10 +996,46 @@ describe("useInputHandlers: ← opens the agent view from an idle, empty prompt"
     await pressThenSentinel(layout, hits, key ?? LEFT);
 
     expect(getOverlayState().agentView).toBe(false);
+  });
+});
 
-    if (strip) {
-      expect($stripNav.get().focused).toBe(true);
-    }
+describe("useInputHandlers: the agent strip is read-only, ↑/↓ stay with the prompt", () => {
+  afterEach(() => {
+    $stripSessions.set([]);
+  });
+
+  it("with strip rows on screen, ↓ on an empty idle prompt selects nothing and ↑ recalls history", async () => {
+    $stripSessions.set([{ id: "bg-1", status: "working", title: "bg job" }]);
+
+    const probe = newProbe();
+    const hits = { f12: 0 };
+    const layout = mountLayout(
+      {},
+      {},
+      {},
+      {
+        beside: (
+          <>
+            <InputHarness history={["earlier prompt"]} probe={probe} />
+            <SentinelProbe hits={hits} />
+          </>
+        ),
+      },
+    );
+
+    await waitFor(() => expect(layout.output()).toContain("◐ bg job"));
+
+    layout.clear();
+    await pressThenSentinel(layout, hits, DOWN);
+    await flush();
+
+    // No row picks up a selection marker: the strip never takes focus.
+    expect(probe.input).toBe("");
+    expect(layout.output()).not.toContain("›");
+
+    await pressThenSentinel(layout, hits, UP);
+
+    await waitFor(() => expect(probe.input).toBe("earlier prompt"));
   });
 });
 
@@ -1053,7 +1079,6 @@ describe("useInputHandlers: Esc that closes the agent view does not count toward
 
 describe("useInputHandlers: a double Esc interrupts a running turn", () => {
   afterEach(() => {
-    $stripNav.set(IDLE_NAV);
     $stripSessions.set([]);
     turnController.fullReset();
   });
@@ -1361,21 +1386,6 @@ describe("useInputHandlers: a double Esc interrupts a running turn", () => {
     expect(interrupts()).toHaveLength(0);
     expect(probe.clearIn).not.toHaveBeenCalled();
     expect(probe.input).toBe("keep me");
-  });
-
-  it("Esc returns focus from the agent strip and does not count toward a pair", async () => {
-    // The strip drops focus as soon as it has no rows, so give it one.
-    $stripSessions.set([{ id: "bg-1", status: "working", title: "bg" }]);
-    $stripNav.set({ ...IDLE_NAV, focused: true });
-
-    const { escThenSentinel, interrupts } = setup();
-
-    await flush();
-    await escThenSentinel();
-    await waitFor(() => expect($stripNav.get().focused).toBe(false));
-    await escThenSentinel();
-
-    expect(interrupts()).toHaveLength(0);
   });
 
   it("during a history walk Esc Esc keeps its old meaning (discards the recalled entry) and does not interrupt", async () => {

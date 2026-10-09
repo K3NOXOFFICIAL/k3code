@@ -66,12 +66,7 @@ import { estimatedMsgHeight, messageHeightKey } from "../lib/virtualHeights.js";
 import { onUserWidgets } from "../sdk/userWidgets.js";
 import type { Msg, PanelSection, SlashCatalog } from "../types.js";
 
-import {
-  $stripNav,
-  $stripSessions,
-  IDLE_NAV,
-  setStripHandlers,
-} from "../k3/agentStripStore.js";
+import { $stripSessions, setStripHandlers } from "../k3/agentStripStore.js";
 import { clearProposals, setProposalHandlers } from "../k3/proposalsStore.js";
 
 import { applyAgentSnapshot } from "./agentRoster.js";
@@ -805,15 +800,14 @@ export function useMainApp(gw: GatewayClient) {
 
   const { activateLiveSession } = session;
 
-  // Agent strip actions: Enter attaches a background session or opens a sub-agent's detail view, `x` stops a row.
+  // Agent view row actions: attach a background session or open a sub-agent's detail view; `x` stops a row.
   useEffect(() => {
     setStripHandlers({
       activate: (row) => {
         if (row.kind === "session") {
           activateLiveSession(row.id);
         } else {
-          // like Claude Code: Enter on a running agent shows what it is doing; Esc goes back to the prompt
-          $stripNav.set(IDLE_NAV);
+          // like Claude Code: attaching a running agent shows what it is doing; Esc goes back to the prompt
           patchOverlayState({
             agents: true,
             agentsInitialAgentId: row.id,
