@@ -85,7 +85,7 @@ cleanup() {
   if [ -n "$BUILDING" ]; then rm -rf "$BUILDING"; fi
   if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
   if [ -n "$REQS" ]; then rm -f "$REQS"; fi
-  if [ -n "$UV_TMP" ]; then rm -f "$UV_TMP"; fi
+  if [ -n "$UV_TMP" ]; then rm -rf "$UV_TMP"; fi
   if [ -n "$GIT_ERR" ]; then rm -f "$GIT_ERR"; fi
   if [ -n "$LOCK" ]; then rm -rf "$LOCK"; fi
   if [ "$rc" -ne 0 ]; then say "k3code-install: FAILED (exit $rc)${INSTALL_LOG:+. Log: $INSTALL_LOG}"; fi
@@ -295,7 +295,7 @@ report() {
   say "k3code-install: platform $PLATFORM $ARCH${DISTRO:+, $DISTRO}; package manager: ${PM:-none found}"
   say "dependencies:"
   if find_uv; then item ok "uv"; else
-    item missing "uv" "required; installed from astral.sh after a notice (or by you, see below)"
+    item missing "uv" "required; uv $UV_VERSION is fetched from its release archive, sha256 pinned (or install it yourself, see below)"
     say "      $(hint_cmd uv)"
     if ! have curl && ! have wget; then
       item missing "curl or wget" "needed to install uv"
@@ -335,28 +335,91 @@ report() {
   return 0
 }
 
+# uv is fetched as a release archive of this pinned version, never through a moving install script. The archive has to
+# match both the .sha256 file published next to it and the hash pinned here.
+UV_VERSION=0.12.24
+uv_pinned_sha256() { # uv_pinned_sha256 TARGET
+  case "$1" in
+    x86_64-unknown-linux-gnu) echo b4dfaef47d491a7296981f8374a4595f55dbf84e8937c8ecd2983574d8bb3da6 ;;
+    aarch64-unknown-linux-gnu) echo 5231be65f496304623895dacdbf1de8504fec90303684bdf05805aa34414dd21 ;;
+    x86_64-unknown-linux-musl) echo 48170bd200a5430298c18f3b264485a1f3a8605f01088277daf6e37633edf0f5 ;;
+    aarch64-unknown-linux-musl) echo 7f9ab4726d743b6a92e310477a7840c8a8a7b3938cb3c4657d541342fca75011 ;;
+    x86_64-apple-darwin) echo 4fa82e37cb94767661f532b001e470b67a186c7260e305bd84ddb78fd545c0b6 ;;
+    aarch64-apple-darwin) echo 0c4346de7abdb49495b393b9ec809fe387aa43e586be20fecb972216c1e71732 ;;
+  esac
+}
+
+uv_target() { # the uv release target for this machine
+  case "$GO_ARCH" in amd64) a=x86_64 ;; *) a=aarch64 ;; esac
+  if [ "$PLATFORM" = macOS ]; then
+    echo "$a-apple-darwin"
+  elif [ "$MUSL" = 1 ]; then
+    echo "$a-unknown-linux-musl"
+  else
+    echo "$a-unknown-linux-gnu"
+  fi
+}
+
 ensure_uv() {
   if find_uv; then return 0; fi
   if [ "$NO_DEPS" = 1 ]; then die "uv is missing and --no-install-deps is set; install it: $(hint_cmd uv)"; fi
-  if ! have curl && ! have wget; then die "curl or wget is needed to install uv: $(hint_cmd curl)"; fi
-  log "uv is missing: installing it into $BIN with its official installer (https://astral.sh/uv/install.sh)"
-  UV_TMP=$(mktemp "${TMPDIR:-/tmp}/uv-install.XXXXXX")
-  fetch https://astral.sh/uv/install.sh "$UV_TMP" ||
-    die "could not download the uv installer (no network?); install uv yourself: $(hint_cmd uv)"
-  UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$BIN" sh "$UV_TMP" >&2 || die "the uv installer failed (output above); install uv yourself: $(hint_cmd uv)"
-  rm -f "$UV_TMP"
+  if ! can_fetch; then die "curl or wget is needed to install uv: $(hint_cmd curl)"; fi
+  target=$(uv_target)
+  pinned=$(uv_pinned_sha256 "$target")
+  base=https://github.com/astral-sh/uv/releases/download/$UV_VERSION
+  log "uv is missing: installing uv $UV_VERSION ($target) into $BIN from its release archive (sha256 pinned in this script)"
+  UV_TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-uv.XXXXXX")
+  if ! { fetch "$base/uv-$target.tar.gz" "$UV_TMP/uv.tar.gz" && fetch "$base/uv-$target.tar.gz.sha256" "$UV_TMP/uv.sha256"; }; then
+    die "could not download uv $UV_VERSION (no network?); install uv yourself: $(hint_cmd uv)"
+  fi
+  got=$(sha256_of "$UV_TMP/uv.tar.gz")
+  published=$(cut -d' ' -f1 <"$UV_TMP/uv.sha256")
+  if [ "$got" != "$published" ] || [ "$got" != "$pinned" ]; then
+    die "the uv download does not match its checksum (sha256 $got; the release lists ${published:-nothing}, this installer pins $pinned): nothing was installed"
+  fi
+  tar -xzf "$UV_TMP/uv.tar.gz" -C "$UV_TMP" || die "could not unpack the uv archive"
+  mkdir -p "$BIN"
+  for x in uv uvx; do
+    [ -f "$UV_TMP/uv-$target/$x" ] || continue
+    if ! { cp "$UV_TMP/uv-$target/$x" "$BIN/.$x.new" && chmod 755 "$BIN/.$x.new" && mv -f "$BIN/.$x.new" "$BIN/$x"; }; then
+      die "could not write $BIN/$x"
+    fi
+  done
+  rm -rf "$UV_TMP"
   UV_TMP=""
   find_uv || die "uv installation failed"
 }
 
-find_go() { # sets GO to a go on PATH, else the newest one fetched into DATA/go
-  GO=""
-  if have go; then
-    GO=$(command -v go)
-    return 0
-  fi
-  for g in "$DATA"/go/go*/bin/go; do
-    if [ -x "$g" ]; then GO=$g; fi
+version_ge() { # version_ge A B: dotted version A is B or newer (three numeric parts at most)
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    split(a, x, "."); split(b, y, ".")
+    for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+    exit 0
+  }'
+}
+
+go_version_of() { GOTOOLCHAIN=local "$1" version 2>/dev/null | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p'; }
+
+go_wanted() { # the Go release panes/go.mod asks for, named the way go.dev names it (go 1.22 is go1.22.0)
+  v=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$SRC_ROOT/panes/go.mod" 2>/dev/null | head -n 1)
+  case "$v" in
+    1.*.*) ;;
+    1.*) if [ "${v#1.}" -ge 21 ] 2>/dev/null; then v="$v.0"; fi ;;
+  esac
+  printf '%s' "$v"
+}
+
+# Sets GO to a go that is GO_WANT or newer (the one on PATH first, then the one fetched into DATA/go). Without one,
+# GO is an older go if there is any (GO_OLD=1): go build may still fetch its own toolchain.
+find_go() {
+  GO="" GO_OLD=0
+  for g in "$(command -v go 2>/dev/null || true)" "$DATA"/go/go*/bin/go; do
+    if [ -z "$g" ] || [ ! -x "$g" ]; then continue; fi
+    if [ -z "${GO_WANT:-}" ] || version_ge "$(go_version_of "$g")" "$GO_WANT"; then
+      GO=$g GO_OLD=0
+      return 0
+    fi
+    if [ -z "$GO" ]; then GO=$g GO_OLD=1; fi
   done
   [ -n "$GO" ]
 }
@@ -390,39 +453,38 @@ ensure_node() { # a private Node 22 LTS in DATA/node/<ver>, checked against node
   find_node
 }
 
-ensure_go() { # the Go toolchain panes/go.mod asks for, from the Go module proxy, in DATA/go/go<ver>
-  if [ "${K3_SKIP_GO:-0}" = 1 ] || find_go || [ "$NO_DEPS" = 1 ] || ! can_fetch; then return 0; fi
-  gv=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$SRC_ROOT/panes/go.mod" | head -n 1)
-  [ -n "$gv" ] || return 0
-  name="v0.0.1-go$gv.$GO_OS-$GO_ARCH"
+go_sha256() { # go_sha256 JSON FILE: the sha256 go.dev lists for the download FILE
+  s=$(awk -v f="\"filename\": \"$2\"" 'index($0, f) { on = 1 } on && /"sha256":/ { sub(/.*"sha256": *"/, ""); sub(/".*/, ""); print; exit }' "$1")
+  case "$s" in *[!0-9a-f]* | "") return 0 ;; esac
+  if [ ${#s} -eq 64 ]; then printf '%s' "$s"; fi
+}
+
+ensure_go() { # the Go release panes/go.mod asks for, from go.dev, checked against the sha256 go.dev lists for it
+  if [ "${K3_SKIP_GO:-0}" = 1 ]; then return 0; fi
+  GO_WANT=$(go_wanted)
+  if find_go && [ "$GO_OLD" != 1 ]; then return 0; fi
+  if [ "$NO_DEPS" = 1 ] || ! can_fetch || [ -z "$GO_WANT" ]; then return 0; fi
+  gv=$GO_WANT
+  name="go$gv.$GO_OS-$GO_ARCH.tar.gz"
   t=$(mktemp -d "${TMPDIR:-/tmp}/k3code-go.XXXXXX")
-  log "fetching Go $gv ($GO_OS-$GO_ARCH) into $DATA/go to build the k3 pane binary"
-  if fetch "https://proxy.golang.org/golang.org/toolchain/@v/$name.zip" "$t/go.zip" && unpack_zip "$t/go.zip" "$t"; then
+  log "fetching Go $gv ($GO_OS-$GO_ARCH) into $DATA/go to build the k3 pane binary${GO:+ ($GO is older)}"
+  want=""
+  if fetch "https://go.dev/dl/?mode=json&include=all" "$t/releases.json"; then want=$(go_sha256 "$t/releases.json" "$name"); fi
+  if [ -z "$want" ]; then
+    log "WARNING: no sha256 for $name from go.dev (unreachable, or no such release); Go is not downloaded"
+  elif fetch "https://go.dev/dl/$name" "$t/$name" && [ "$(sha256_of "$t/$name")" = "$want" ] &&
+    tar -xzf "$t/$name" -C "$t" && [ -x "$t/go/bin/go" ]; then
     mkdir -p "$DATA/go"
     rm -rf "$DATA/go/go$gv"
-    mv "$t/golang.org/toolchain@$name" "$DATA/go/go$gv"
+    mv "$t/go" "$DATA/go/go$gv"
     for d in "$DATA"/go/go*; do # keep only this toolchain
       if [ "$d" != "$DATA/go/go$gv" ]; then rm -rf "$d"; fi
     done
   else
-    log "WARNING: the Go download failed; the k3 pane binary is skipped"
+    log "WARNING: the Go download failed or did not match the sha256 go.dev lists; nothing was installed"
   fi
   rm -rf "$t"
   find_go || true
-}
-
-unpack_zip() { # unpack_zip ZIP DIR: unzip, else Python's zipfile (which drops the exec bits: restore them)
-  if have unzip; then
-    unzip -q "$1" -d "$2"
-    return $?
-  fi
-  py=$PY_FOUND
-  if [ -z "$py" ] && [ -x "$VERDIR/venv/bin/python" ]; then py=$VERDIR/venv/bin/python; fi
-  [ -n "$py" ] || return 1
-  "$py" -m zipfile -e "$1" "$2" || return 1
-  for x in "$2"/golang.org/toolchain@*/bin "$2"/golang.org/toolchain@*/pkg/tool; do
-    if [ -d "$x" ]; then chmod -R u+x "$x"; fi
-  done
 }
 
 ensure_bwrap() { # Linux sandbox: through the package manager, as root or after a yes at a terminal

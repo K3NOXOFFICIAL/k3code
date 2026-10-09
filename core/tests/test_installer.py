@@ -404,8 +404,8 @@ def test_uv_temp_file_is_removed_when_the_uv_download_fails(tmp_path: Path) -> N
         path_front=curl,
     )
     assert r.returncode != 0
-    assert "could not download the uv installer" in r.stderr
-    assert list(tmpdir.glob("uv-install.*")) == []
+    assert "could not download uv" in r.stderr
+    assert list(tmpdir.glob("k3code-uv.*")) == []
 
 
 def test_check_reports_the_node_floor_of_20(tmp_path: Path) -> None:
@@ -608,11 +608,7 @@ def _fake_systemd(root: Path, home: Path) -> tuple[Path, Path, Path]:
     unit.write_text("[Service]\nExecStart=/bin/true\n")
     calls, pidfile = root / "systemctl.log", root / "mainpid"
     pidfile.write_text("0\n")
-    body = (
-        f'echo "systemctl $*" >>"{calls}"\n'
-        'case "$*" in *show*MainPID*) cat "' + str(pidfile) + '" ;; esac\n'
-        "exit 0\n"
-    )
+    body = f'echo "systemctl $*" >>"{calls}"\ncase "$*" in *show*MainPID*) cat "' + str(pidfile) + '" ;; esac\nexit 0\n'
     return stub_bin(root, "systemctl", body), calls, pidfile
 
 
@@ -721,3 +717,103 @@ def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
     old = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", middle[:9], "--minimal")
     assert old.returncode != 0
     assert "full 40-character SHA" in old.stderr
+
+
+def _download_stub(root: Path, files: dict[str, bytes]) -> tuple[Path, Path]:
+    """A curl stand-in that serves ``files`` by the last path segment of the URL (go.dev's release list as
+    ``releases.json``), refuses anything else, and logs every URL."""
+    served = root / "served"
+    served.mkdir(parents=True)
+    for name, data in files.items():
+        (served / name).write_bytes(data)
+    log = root / "curl.log"
+    body = (
+        'out=""; url=""\n'
+        'while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\n'
+        f'echo "$url" >>"{log}"\n'
+        'case "$url" in *mode=json*) f=releases.json ;; *) f=${url##*/} ;; esac\n'
+        f'[ -f "{served}/$f" ] || exit 22\n'
+        f'cp "{served}/$f" "$out"\n'
+    )
+    return stub_bin(root, "curl", body), log
+
+
+def _tar_gz(entries: dict[str, str]) -> bytes:
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, text in entries.items():
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), 0o755
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _no_uv_path() -> str:
+    return os.pathsep.join(d for d in os.environ["PATH"].split(os.pathsep) if not (Path(d) / "uv").exists())
+
+
+@pytest.mark.skipif(sys.platform != "linux" or os.uname().machine != "x86_64", reason="fixture names the linux x64 uv")
+@pytest.mark.parametrize("published", ["match", "mismatch"])
+def test_a_uv_archive_off_the_pinned_hash_is_refused(tmp_path: Path, published: str) -> None:
+    import hashlib
+
+    archive = _tar_gz({"uv-x86_64-unknown-linux-gnu/uv": "#!/bin/sh\necho planted\n"})
+    digest = hashlib.sha256(archive).hexdigest() if published == "match" else "0" * 64
+    name = "uv-x86_64-unknown-linux-gnu.tar.gz"
+    curl, log = _download_stub(tmp_path, {name: archive, name + ".sha256": f"{digest}  {name}\n".encode()})
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(
+        home,
+        INSTALL,
+        "--from-source",
+        "--minimal",
+        env_extra={"PATH": _no_uv_path()},
+        drop=("K3_NO_DOWNLOAD",),
+        path_front=curl,
+    )
+    assert r.returncode != 0
+    assert "does not match its checksum" in r.stderr
+    assert not (home / ".local" / "bin" / "uv").exists()
+    assert "https://github.com/astral-sh/uv/releases/download/" in log.read_text()
+    assert "astral.sh/uv/install.sh" not in log.read_text()
+
+
+GO_OS = {"linux": "linux", "darwin": "darwin"}.get(sys.platform, "")
+GO_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(os.uname().machine, "")
+
+
+@pytest.mark.skipif(not GO_OS or not GO_ARCH, reason="needs a platform go.dev builds for")
+@pytest.mark.parametrize("listed", ["right", "wrong"])
+def test_an_old_go_gets_a_checked_private_go(tmp_path: Path, listed: str) -> None:
+    import hashlib
+    import json
+
+    want = next(ln.split()[1] for ln in (REPO / "panes" / "go.mod").read_text().splitlines() if ln.startswith("go "))
+    fake_go = (
+        "#!/bin/sh\n"
+        f'case "$1" in version) echo "go version go{want} {GO_OS}/{GO_ARCH}" ;;\n'
+        'build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    )
+    archive = _tar_gz({"go/bin/go": fake_go})
+    name = f"go{want}.{GO_OS}-{GO_ARCH}.tar.gz"
+    digest = hashlib.sha256(archive).hexdigest() if listed == "right" else "1" * 64
+    releases = [{"version": f"go{want}", "files": [{"filename": name, "os": GO_OS, "arch": GO_ARCH, "sha256": digest}]}]
+    curl, log = _download_stub(tmp_path, {name: archive, "releases.json": json.dumps(releases, indent=1).encode()})
+    # the go on PATH is too old for panes/go.mod
+    old = stub_bin(tmp_path, "go", 'case "$1" in version) echo "go version go1.20.1 x/y" ;; *) exit 1 ;; esac\n')
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", drop=("K3_NO_DOWNLOAD", "K3_SKIP_GO"), path_front=old)
+    assert r.returncode == 0, r.stderr
+    private = tmp_path / DATA_REL / "go" / f"go{want}" / "bin" / "go"
+    assert f"https://go.dev/dl/{name}" in log.read_text() or listed == "wrong"
+    assert "proxy.golang.org" not in log.read_text()
+    if listed == "right":
+        assert private.is_file()
+        assert (tmp_path / DATA_REL / "current" / "bin" / "k3").is_file()  # built with the private go
+    else:
+        assert not private.exists()
+        assert "did not match the sha256 go.dev lists" in r.stderr
