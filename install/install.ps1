@@ -39,7 +39,10 @@ function Quote-Sh([string]$Arg) { "'" + ($Arg -replace "'", "'\''") + "'" } # on
 function Get-WslText([string[]]$WslArgs) { # runs wsl.exe and returns its stdout as clean text
   # Windows PowerShell 5.1 turns a native command's stderr into an error record, which 'Stop' makes terminating
   $ErrorActionPreference = 'Continue'
-  $out = & $Wsl @WslArgs 2>$null
+  # Linux programs print UTF-8; Windows PowerShell 5.1 would decode it with the OEM codepage (C:\Users\Jörg breaks)
+  $enc = [Console]::OutputEncoding
+  try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; $out = & $Wsl @WslArgs 2>$null }
+  finally { [Console]::OutputEncoding = $enc }
   if ($LASTEXITCODE -ne 0) { return $null }
   return (($out | Out-String) -replace "`0", '').Trim()
 }
@@ -56,18 +59,13 @@ function Get-Distros { # the installed distributions: @{ Name; Default; Version 
   return $rows
 }
 
-function Get-LinuxPath([string]$WinPath) { # the WSL path of a Windows path (wslpath ships with every WSL)
-  return Get-WslText @('-d', $script:Distro, '--exec', 'wslpath', '-a', $WinPath)
-}
-
 function Get-ShArgs([string]$Command, [string]$Cwd = '') { # wsl.exe arguments that run COMMAND in a login sh
   # (a login shell reads ~/.profile, so PATH has what the user installed). The caller runs `& $Wsl @a` itself:
   # wsl.exe output must stay on the console, not in a PowerShell pipe, or install.sh has no terminal to ask on.
-  # The directory is changed inside sh: wsl.exe --cd needs a WSL newer than the one Windows 10 ships with.
+  # The directory is changed inside sh (wsl.exe --cd needs a newer WSL than Windows 10 ships with), from the Windows
+  # path given as an argument: wsl.exe passes arguments as UTF-16, so no codepage touches a non-ASCII path.
   if ($Cwd) {
-    $dir = Get-LinuxPath $Cwd
-    if (-not $dir) { Die "could not translate $Cwd to a path in $($script:Distro) (wslpath failed)" }
-    $Command = "cd $(Quote-Sh $dir) && $Command"
+    return @('-d', $script:Distro, '--exec', 'sh', '-lc', "cd `"`$(wslpath -a `"`$1`")`" && $Command", 'sh', $Cwd)
   }
   return @('-d', $script:Distro, '--exec', 'sh', '-lc', $Command)
 }
@@ -117,7 +115,8 @@ if (-not (Get-Command $Wsl -ErrorAction SilentlyContinue)) {
 # installing into: they are skipped unless -Distro names one.
 function Get-UsableDistros { return @(Get-Distros | Where-Object { $_.Name -notlike 'docker-desktop*' }) }
 $distros = @(Get-UsableDistros)
-if ($distros.Count -eq 0) {
+$named = $Distro -and @(Get-Distros | Where-Object { $_.Name -eq $Distro }).Count -gt 0
+if ($distros.Count -eq 0 -and -not $named) {
   if ($InstallArgs -contains '--no-install-deps') {
     Die "WSL has no Linux distribution yet and --no-install-deps is set. Run 'wsl --install -d Ubuntu', then this installer again."
   }

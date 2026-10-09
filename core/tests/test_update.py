@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -190,7 +191,10 @@ def test_apply_detached_without_a_unit_needs_no_systemd(data: Path, monkeypatch:
 
     out = data / "ran.txt"
     exe = data / "k3code"
-    exe.write_text(f'#!/bin/sh\necho "$@ sock=${{K3CODE_GATEWAY_SOCKET:-none}}" > {out}\necho updating\n')
+    sid = data / "sid.txt"  # its own session: closing the terminal (SIGHUP to the session) does not stop it
+    exe.write_text(
+        f'#!/bin/sh\nps -o sid= -p $$ > {sid}\necho "$@ sock=${{K3CODE_GATEWAY_SOCKET:-none}}" > {out}\necho updating\n'
+    )
     exe.chmod(0o755)
     monkeypatch.setenv("K3CODE_GATEWAY_SOCKET", "/run/secret.sock")
     monkeypatch.setattr(upd.shutil, "which", lambda name: str(exe) if name == "k3code" else None)
@@ -201,3 +205,4 @@ def test_apply_detached_without_a_unit_needs_no_systemd(data: Path, monkeypatch:
         time.sleep(0.05)
     assert out.read_text().strip() == "update --yes sock=none"  # the daemon's socket is never handed to the child
     assert "updating" in upd.update_log_path().read_text()
+    assert int(sid.read_text()) != os.getsid(0)

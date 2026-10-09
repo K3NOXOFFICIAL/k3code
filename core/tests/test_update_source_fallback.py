@@ -113,6 +113,8 @@ def test_other_checkouts_are_pulled_with_the_plain_git(monkeypatch):
         "git",
         "-c",
         "safe.directory=/home/u/src/k3code",  # a checkout owned by another user is still pulled
+        "-c",
+        "safe.directory=/home/u/src/k3code",  # resolved: the same here (no symlink)
         "-C",
         "/home/u/src/k3code",
         "pull",

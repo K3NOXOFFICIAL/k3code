@@ -57,12 +57,8 @@ if (-not $WindowsOnly) {
   if ($Purge) { $shArgs += @('--purge', '--yes') } # -Purge is the confirmation
   $checkout = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { '' }
   if ($checkout -and (Test-Path (Join-Path $PSScriptRoot 'uninstall.sh'))) {
-    # cd inside sh: wsl.exe --cd needs a WSL newer than the one Windows 10 ships with
-    $ErrorActionPreference = 'Continue' # Windows PowerShell 5.1 turns wsl.exe's stderr into a terminating error
-    $dir = ((& $Wsl -d $cfg.distro --exec wslpath -a $checkout 2>$null | Out-String) -replace "`0", '').Trim()
-    $ErrorActionPreference = 'Stop'
-    if (-not $dir) { Die "could not translate $checkout to a path in $($cfg.distro) (wslpath failed)" }
-    & $Wsl -d $cfg.distro --exec sh -lc "cd $(Quote-Sh $dir) && exec sh install/uninstall.sh $($shArgs -join ' ')"
+    # cd inside sh (wsl.exe --cd needs a newer WSL than Windows 10 ships with), from the Windows path as an argument
+    & $Wsl -d $cfg.distro --exec sh -lc "cd `"`$(wslpath -a `"`$1`")`" && exec sh install/uninstall.sh $($shArgs -join ' ')" sh $checkout
   } else {
     & $Wsl -d $cfg.distro --exec sh -lc "curl -fsSL $(Quote-Sh $RawUrl) | sh -s -- $($shArgs -join ' ')"
   }

@@ -153,10 +153,12 @@ def test_windows_shell_points_to_install_ps1(tmp_path: Path) -> None:
 
 FAKE_WSL = """#!/bin/sh
 # wsl.exe stand-in for Windows 10's inbox WSL: Ubuntu is the one to use (FAKE_WSL_DOCKER=1: Docker Desktop's distro is
-# the default), there is no --cd option, and --exec runs commands here (wslpath -a returns the path, which is already a Linux one here)
+# the default), there is no --cd option, and --exec runs commands here (wslpath -a returns the path: it is a Linux
+# one here already)
 if [ "$1" = --list ]; then
   printf '  NAME              STATE           VERSION\\n'
-  if [ "${FAKE_WSL_DOCKER:-0}" = 1 ]; then printf '* docker-desktop    Running         2\\n  Ubuntu            Stopped         2\\n'
+  if [ "${FAKE_WSL_DOCKER:-0}" = 1 ]; then
+    printf '* docker-desktop    Running         2\\n  Ubuntu            Stopped         2\\n'
   else printf '* Ubuntu            Running         2\\n'; fi
   exit 0
 fi
@@ -177,9 +179,10 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path, doc
     wsl = tmp_path / "wsl"
     wsl.write_text(FAKE_WSL)
     wsl.chmod(0o755)
+    wslpath = stub_bin(tmp_path, "wslpath", 'printf "%s\\n" "$2"\n')  # inside "WSL" (here) paths are Linux already
     appdata = tmp_path / "appdata"
     env = {
-        "PATH": os.environ["PATH"],
+        "PATH": f"{wslpath}{os.pathsep}{os.environ['PATH']}",
         "HOME": str(tmp_path),
         "LOCALAPPDATA": str(appdata),
         "K3_WSL": str(wsl),
@@ -255,6 +258,16 @@ def test_a_checkout_owned_by_someone_else_still_names_its_commit(tmp_path: Path)
     assert first == f"9.9.9-src.{head.stdout.strip()}"
     subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "next"], check=True)
     assert version() != first
+
+
+def test_a_checkout_git_cannot_read_is_refused_not_misnamed(tmp_path: Path) -> None:
+    # a .git that git cannot read (here: no commit yet) would name the build X.Y.Z-src, the same for every state
+    src, _ = mini_checkout(tmp_path)
+    shutil.rmtree(src / ".git")
+    subprocess.run(["git", "-C", str(src), "init", "-q"], check=True)
+    r = run(tmp_path / "home", src / "install" / "install.sh", "--from-source", "--print-version")
+    assert r.returncode != 0 and "git cannot read the checkout" in r.stderr
+    assert not r.stdout.strip()
 
 
 def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> None:

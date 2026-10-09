@@ -677,7 +677,8 @@ resolve_short_sha() {
 # git in the checkout this script installs. A checkout owned by another user (a Windows clone seen from WSL, a
 # shared one) is "dubious" to git, which then refuses every command: rev-parse failed silently, so each build was
 # named X.Y.Z-src and an update never left the first one. Its own install.sh runs anyway, so its config is trusted.
-src_git() { git -c safe.directory="$SRC_ROOT" -C "$SRC_ROOT" "$@"; }
+# Both spellings of the path: git before 2.46 compares safe.directory with the symlink-free one.
+src_git() { git -c safe.directory="$SRC_ROOT" -c safe.directory="$(cd "$SRC_ROOT" && pwd -P)" -C "$SRC_ROOT" "$@"; }
 
 acquire_source() {
   if [ "$FROM" = source ]; then

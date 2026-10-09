@@ -522,7 +522,8 @@ def spawn_update(exe: str) -> str:
         return f"Could not start the update: {e}. Run `k3code update --yes` from a terminal."
     return (
         f"Update started in the background (pid {p.pid}). The new version is smoke-tested and only switched to when it "
-        f"passes; restart k3code afterwards to use it. Follow it in {log_path}."
+        f"passes; restart k3code afterwards to use it. Follow it in {log_path}. On WSL keep a k3code window open "
+        "until it is done: WSL may stop the distribution, and the update with it, once no window is open."
     )
 
 
@@ -603,7 +604,9 @@ def git_pull_command(checkout: Path) -> list[str]:
         if win:
             return [exe, "-C", win, "pull", "--ff-only"]
     # safe.directory: a checkout owned by another user is "dubious" and git refuses it (install.sh trusts it alike)
-    return ["git", "-c", f"safe.directory={path}", "-C", path, "pull", "--ff-only"]
+    # (both spellings: git before 2.46 compares the value with the symlink-free path)
+    real = str(checkout.resolve())
+    return ["git", "-c", f"safe.directory={path}", "-c", f"safe.directory={real}", "-C", path, "pull", "--ff-only"]
 
 
 def pull_checkout(checkout: Path) -> None:

@@ -115,11 +115,17 @@ run_wsl() {
     result wsl "FAIL (pwsh not found: https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-linux)"
     return 0
   fi
-  {
+  trap '"$ENGINE" rm -f "$ctr" >/dev/null 2>&1 || true' EXIT
+  (
     # The checkout is mounted at its own path, owned by another user inside (root), as a clone made by Windows
     # git can be when WSL sees it: that is the case `k3code update --from-source` has to handle.
     "$ENGINE" run -d --name "$ctr" -v "$WORK:$WORK:z" docker.io/library/ubuntu:24.04 sleep infinity >/dev/null
     "$ENGINE" exec "$ctr" sh -c "$PREPARE chmod -R a+rwX '$WORK'"
+    # wslpath -a PATH: paths here are Linux paths already
+    # shellcheck disable=SC2016 # the stub expands $2, not this shell
+    printf '#!/bin/sh\nprintf "%%s\\n" "$2"\n' >"$RUN/wslpath"
+    chmod 755 "$RUN/wslpath"
+    "$ENGINE" cp "$RUN/wslpath" "$ctr:/usr/local/bin/wslpath"
     mkdir -p "$RUN/wsl-bin" "$RUN/appdata" "$RUN/winhome"
     cat >"$RUN/wsl-bin/wsl" <<EOF
 #!/bin/sh
@@ -141,9 +147,9 @@ EOF
     chmod +x "$RUN/wsl-bin/wsl"
     local w=$RUN/wsl-bin/wsl
     export K3_WSL=$w LOCALAPPDATA=$RUN/appdata
-    fail() {
+    fail() { # stops the subshell: no later step runs on a broken install
       echo "PLATFORM CHECK FAILED: $*"
-      return 1
+      exit 1
     }
     pwsh -NoProfile -File "$WORK/install/install.ps1" -NoModifyPath --from-source || fail "install.ps1"
     shim=$(cat "$RUN/appdata/k3code/bin/k3code.cmd")
@@ -159,12 +165,14 @@ EOF
     [ -n "$first" ] && [ "$second" != "$first" ] || fail "update did not switch versions ($first -> $second)"
     k3 update --from-source --no-pull --yes | grep -q "Already up to date" || fail "a second update was not a no-op"
     k3 update --rollback || fail "rollback"
+    [ "$(k3 update --check | sed -n 's/^current: //p')" = "$first" ] || fail "rollback did not return to $first"
     pwsh -NoProfile -File "$WORK/install/uninstall.ps1" || fail "uninstall.ps1"
     [ ! -e "$RUN/appdata/k3code" ] || fail "uninstall.ps1 left the shims"
     "$ENGINE" exec "$ctr" test ! -e /home/u/.local/share/k3code || fail "uninstall.ps1 left the install in WSL"
     echo "PLATFORM CHECK OK: $first -> $second -> rolled back"
-  } >"$log" 2>&1 || true
+  ) >"$log" 2>&1 || true
   "$ENGINE" rm -f "$ctr" >/dev/null 2>&1 || true
+  trap - EXIT
   if grep -q "PLATFORM CHECK OK" "$log" && ! grep -q "PLATFORM CHECK FAILED" "$log"; then
     result wsl "ok   $(grep "PLATFORM CHECK OK" "$log" | sed 's/^PLATFORM CHECK OK: //')"
   else
