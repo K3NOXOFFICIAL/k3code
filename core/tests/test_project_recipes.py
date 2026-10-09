@@ -165,6 +165,25 @@ async def test_hook_proposal_is_a_valid_project_scoped_hook_entry(tmp_path):
     assert userhooks.load(tmp_path).hooks == []  # outside the project: not loaded
 
 
+def _rust_hook_command(stack: dict, root: Path) -> str:
+    (hook,) = [s for s in recipes.suggest(stack, root) if s.kind == "hook"]
+    return hook.payload["entry"]["command"]
+
+
+def test_hostile_cargo_edition_never_reaches_the_hook_command(tmp_path):
+    hostile = "2021; echo injected"
+    repo = make(tmp_path / "r", {"Cargo.toml": f"[package]\nname='x'\nedition='{hostile}'\n"})
+    rust = by_id(stacks.scan(repo))["rust"]
+    assert rust["extra"]["edition"] == ""  # not a year: dropped at detection
+    cmd = _rust_hook_command(rust, repo)
+    assert "injected" not in cmd and "--edition" not in cmd
+    # a value stored by an older scan is still quoted into a single argument
+    stored = {**rust, "extra": {"edition": hostile}}
+    assert "rustfmt --edition '2021; echo injected' \"$f\"" in _rust_hook_command(stored, repo)
+    plain = {**rust, "extra": {"edition": "2021"}}
+    assert 'rustfmt --edition 2021 "$f"' in _rust_hook_command(plain, repo)
+
+
 async def test_formatter_hook_command_formats_only_matching_files_under_its_dir(tmp_path):
     api = make(tmp_path / "repo", {"api/a.py": "", "api/b.md": "", "c.py": ""}) / "api"
     seen = tmp_path / "seen.txt"

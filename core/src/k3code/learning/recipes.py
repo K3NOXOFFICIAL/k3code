@@ -180,7 +180,7 @@ def _formatter(template: str, stack: dict[str, Any]) -> str | None:
     if "{prettier}" in template:
         exec_ = _PRETTIER_EXEC.get(stack.get("manager", ""))
         return template.replace("{prettier}", exec_) if exec_ else None
-    edition = f" --edition {extra['edition']}" if extra.get("edition") else ""
+    edition = f" --edition {shlex.quote(str(extra['edition']))}" if extra.get("edition") else ""
     return template.replace("{run}", str(extra.get("run") or "")).replace("{edition}", edition)
 
 

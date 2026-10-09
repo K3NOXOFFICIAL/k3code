@@ -169,6 +169,8 @@ def _go(d: Path, names: set[str]) -> tuple[str, dict[str, str], dict[str, Any]]:
 def _rust(d: Path, names: set[str]) -> tuple[str, dict[str, str], dict[str, Any]]:
     cargo = _load_toml(d / "Cargo.toml")
     edition = str((cargo.get("package") or {}).get("edition") or "") if isinstance(cargo.get("package"), dict) else ""
+    if not re.fullmatch(r"\d{4}", edition):  # repo-controlled and spliced into a hook command: a year or nothing
+        edition = ""
     cmds = {"test": "cargo test", "lint": "cargo clippy", "format": "cargo fmt", "build": "cargo build"}
     return "cargo", cmds, {"edition": edition, "workspace": "workspace" in cargo}
 
