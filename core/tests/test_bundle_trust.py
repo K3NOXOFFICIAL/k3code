@@ -220,7 +220,8 @@ async def test_gateway_import_asks_for_each_risky_item(tmp_path: Path, monkeypat
     assert "warning: skipped providers" in res["output"]
 
     questions.clear()
-    res = await cmd(server, f"/import {bundle} --yes", sid)  # --yes: no questions, risky items still skipped
+    # --yes: no questions (a question would time out here), risky items still skipped
+    res = await asyncio.wait_for(cmd(server, f"/import {bundle} --yes", sid), timeout=10)
     assert questions == [] and "warning: skipped mcp.servers.tools" in res["output"]
     assert "mcp" not in _user_config()
     await server.close()
