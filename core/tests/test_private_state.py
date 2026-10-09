@@ -111,3 +111,13 @@ def test_existing_private_files_are_tightened(tmp_path: Path) -> None:
     db.chmod(0o644)  # written by an older daemon or the CLI under umask 0022
     SessionStore(db)
     assert mode(db) == 0o600
+
+
+def test_learning_preferences_and_mem0_ledger_are_0600_whatever_the_umask(tmp_path: Path) -> None:
+    with umask(0):
+        prefs = distiller.write_preferences_json(tmp_path, [distiller.Preference("prefers uv", 0.9, 3, "uv")])
+        ledger = tmp_path / "learning" / distiller.MEM0_POSTED
+        distiller._save_posted(ledger, ["k1"])
+    assert mode(prefs) == 0o600
+    assert mode(ledger) == 0o600
+    assert mode(prefs.parent) == 0o700

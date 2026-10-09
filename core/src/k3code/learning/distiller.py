@@ -264,7 +264,8 @@ def read_auto_section(path: Path, heading: str = HEADING) -> list[str]:
 
 def write_preferences_json(home: Path, prefs: list[Preference]) -> Path:
     path = home / "learning" / "preferences.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(path.parent)
+    private_file(path)
     path.write_text(
         json.dumps(
             {p.key or p.text: {"text": p.text, "confidence": p.confidence, "evidence": p.evidence} for p in prefs},
@@ -306,8 +307,8 @@ def _load_posted(path: Path) -> list[str]:
 
 
 def _save_posted(path: Path, keys: list[str]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    ensure_private_dir(path.parent)
+    tmp = private_file(path.with_name(f"{path.name}.{os.getpid()}.tmp"))
     tmp.write_text(json.dumps(keys[-MEM0_POSTED_MAX:]), encoding="utf-8")
     os.replace(tmp, path)
 
