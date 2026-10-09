@@ -2522,10 +2522,13 @@ def _file_keys(base: Path) -> set[str]:
 
 
 def _usage_payload(usage: Usage) -> dict[str, Any]:
+    """The ``usage`` of ``session.usage`` and ``message.complete``. The cache counts are part of prompt_tokens."""
     return {
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+        "cache_write_tokens": usage.cache_creation_tokens,
     }
 
 

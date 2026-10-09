@@ -158,14 +158,14 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `session.resume_progress` | `{phase, status, message_count?, message?}` | | Resume hydration |
 | `session.reclaimed` | `{session_id, stored_session_id, reason}` | | Session stolen |
 | `session.control.update` | `{control: SessionControlSnapshot}` | ✅ | Goal/loop/heartbeat |
-| `session.usage` | `{usage: Usage}` | | Mid-turn usage |
+| `session.usage` | `{usage: Usage}` | | Mid-turn usage. `Usage` is `{prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens}`; the cache counts are part of `prompt_tokens` (0 = none or not reported) |
 | `message.start` | `{}` | ✅ | Turn begins |
 | `message.delta` | `{text, rendered?, verbose?}` | ✅ | Streaming text |
 | `reasoning.delta` | `{text, rendered?, verbose?}` | ✅ | Streaming reasoning |
 | `reasoning.available` | `{text, rendered?, verbose?}` | ✅ | Non-stream reasoning |
 | `thinking.delta` | `{text, rendered?, verbose?}` | | Legacy thinking |
 | `message.interim` | `{text, already_streamed}` | ✅ | Interim assistant text |
-| `message.complete` | `{text, usage, status, reasoning, warning, billing, error, ...}` | ✅ | Turn complete |
+| `message.complete` | `{text, usage, status, reasoning, warning, billing, error, ...}` | ✅ | Turn complete (`usage` as in `session.usage`) |
 | `status.update` | `{kind, text}` | ✅ | Status line |
 | `tool.start` | `{tool_id, name, context?, args?, args_text?, preview?, labels?}` | ✅ | Tool call start |
 | `tool.complete` | `{tool_id, name, args?, duration_s, result, summary, result_text, inline_diff?, todos?, revision?, labels?}` | ✅ | Tool call done |

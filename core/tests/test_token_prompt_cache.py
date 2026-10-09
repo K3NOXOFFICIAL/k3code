@@ -145,3 +145,19 @@ def test_usage_db_records_cache_tokens_and_migrates_an_old_database(tmp_path):
     assert (row["tokens_in"], row["cache_read"], row["cache_write"]) == (1007, 800, 150)
     assert "prompt cache read/write 800/150 tok" in format_stats([row], "session")
     db.close()
+
+
+def test_the_usage_wire_payload_carries_the_cache_tokens():
+    from k3code.gateway.server import _usage_payload
+    from k3code.providers.types import Usage
+
+    payload = _usage_payload(
+        Usage(prompt_tokens=1000, completion_tokens=10, cache_read_tokens=800, cache_creation_tokens=150)
+    )
+    assert payload == {
+        "prompt_tokens": 1000,
+        "completion_tokens": 10,
+        "total_tokens": 1010,
+        "cache_read_tokens": 800,
+        "cache_write_tokens": 150,
+    }
