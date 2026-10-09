@@ -188,7 +188,10 @@ class PlanFirst:
             cap.plan = plan
             cap.asked += 1
             show("proposed")
-            auto_ok = verdict.risk != "high" or bool(self.cfg.get("auto_do_plans"))
+            from k3code.learning.permrules import auto_do_allowed
+
+            # a high-risk plan is auto-approved only in a project the user accepted it for (per-project, learned)
+            auto_ok = verdict.risk != "high" or auto_do_allowed(self.cfg, learning_project(session))
             if session.perms.mode is PermissionMode.AUTO and auto_ok:
                 cap.approved, cap.auto, cap.mode = True, True, "auto"
             elif session.perms.mode is PermissionMode.AUTO:

@@ -181,32 +181,51 @@ def mine(
                     evidence=e["ids"][-10:],
                 )
             )
-    out.extend(_auto_do(log, min_approvals, since))
+    out.extend(_auto_do(log, AUTO_DO_MIN_APPROVALS, since))
     return out
 
 
+#: High-risk plan approvals in one project, with no denial there, before auto mode may skip asking in that project.
+AUTO_DO_MIN_APPROVALS = 10
+
+
 def _auto_do(log: DecisionLog, n: int, since: float | None) -> list[Candidate]:
-    """High-risk plan confirmations always approved → propose auto-approving them in auto mode."""
-    rows = [r for r in log.query("plan", since=since) if r["detail"].get("risk") == "high"]
-    ok = sum(1 for r in rows if r["choice"] in APPROVED or r["choice"] == "approved")
-    bad = len(rows) - ok
-    if ok >= n and bad == 0:
-        return [
-            Candidate(
-                "plan",
-                "high-risk plans",
-                "allow",
-                "user",
-                "",
-                "",
-                ok,
-                0,
-                1,
-                auto_do=True,
-                evidence=[r["id"] for r in rows[-10:]],
+    """High-risk plan confirmations always approved in a project → propose auto-approving them there in auto mode."""
+    by_project: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in log.query("plan", since=since):
+        if r["detail"].get("risk") == "high" and (r["project"] or r["cwd"]):
+            by_project[r["project"] or r["cwd"]].append(r)
+    out = []
+    for proj, rows in sorted(by_project.items()):
+        ok = sum(1 for r in rows if r["choice"] in APPROVED or r["choice"] == "approved")
+        if ok >= n and ok == len(rows):
+            out.append(
+                Candidate(
+                    "plan",
+                    "high-risk plans",
+                    "allow",
+                    "project",
+                    proj,
+                    rows[-1]["cwd"],
+                    ok,
+                    0,
+                    1,
+                    auto_do=True,
+                    evidence=[r["id"] for r in rows[-10:]],
+                )
             )
-        ]
-    return []
+    return out
+
+
+def auto_do_allowed(autonomy: dict[str, Any], project: str) -> bool:
+    """May auto mode approve a high-risk plan in ``project`` without asking? (``autonomy.auto_do_projects``)
+
+    ``autonomy.auto_do_plans: true`` still means every project: a setting only the user writes by hand.
+    """
+    if autonomy.get("auto_do_plans") is True:
+        return True
+    projects = autonomy.get("auto_do_projects") or []
+    return bool(project) and isinstance(projects, list) and project in projects
 
 
 def to_proposals(cands: list[Candidate], store: ProposalStore, session: str = "") -> list[Proposal]:
@@ -224,6 +243,7 @@ def to_proposals(cands: list[Candidate], store: ProposalStore, session: str = ""
                 "scope": c.scope,
                 "cwd": c.cwd,
                 "auto_do": c.auto_do,
+                "project": c.project,
                 "approvals": c.approvals,
                 "denials": c.denials,
                 "evidence": c.evidence,
@@ -242,11 +262,17 @@ def apply(payload: dict[str, Any], *, cwd: str = "") -> str:
     from k3code.paths import user_config_path
 
     if payload.get("auto_do"):
+        # per project, in the user's config: never a repo file, and never every project at once
+        project = str(payload.get("project") or "")
+        if not project:
+            return "not applied: the proposal names no project"
         path = user_config_path()
         data = read_yaml(path)
-        data.setdefault("autonomy", {})["auto_do_plans"] = True
+        autonomy = data.setdefault("autonomy", {})
+        projects = [p for p in autonomy.get("auto_do_projects") or [] if p != project]
+        autonomy["auto_do_projects"] = [*projects, project]
         write_yaml(path, data)
-        return f"auto mode will now approve high-risk plans without asking ({path})"
+        return f"auto mode will now approve high-risk plans without asking in {project} ({path})"
     rule = Rule(tool=payload["tool"], pattern=payload["pattern"], action=payload["action"])
     if payload.get("scope") == "user":
         path = user_config_path()

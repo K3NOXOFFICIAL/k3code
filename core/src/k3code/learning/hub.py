@@ -145,8 +145,9 @@ class LearningHub:
         cwd = str(session.perms.cwd) if session is not None else ""
         if p.kind == "permission_rule":
             msg = permrules.apply(payload, cwd=cwd)
-            if payload.get("auto_do"):
-                self.server.config.autonomy["auto_do_plans"] = True
+            if payload.get("auto_do") and payload.get("project"):
+                live = self.server.config.autonomy
+                live["auto_do_projects"] = [*(live.get("auto_do_projects") or []), payload["project"]]
             if session is not None:
                 session.perms.reload()
             return msg
