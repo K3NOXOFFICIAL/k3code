@@ -98,6 +98,7 @@ from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
 from k3code.tools import build_registry as build_tool_registry
 from k3code.tools import clip_for_model
+from k3code.tools import jobs as tool_jobs
 from k3code.usage import UsageDB
 
 logger = logging.getLogger("k3code.gateway")
@@ -564,6 +565,7 @@ class GatewayServer:
         ):
             return {"closed": False, "reason": "not disposable"}
         self.live.pop(sid, None)
+        await tool_jobs.reap(sid)  # background bash jobs end with their session
         if live.reliability is not None:
             await live.reliability.stop()
         return {"closed": True}
@@ -1081,6 +1083,8 @@ class GatewayServer:
                 cancelled.append(live.turn_task)
         if cancelled:  # let each turn persist what it has (its finally block) before the store is closed below
             await asyncio.wait(cancelled, timeout=5.0)
+        with contextlib.suppress(Exception):
+            await tool_jobs.REGISTRY.reap_all()  # no background bash job outlives the daemon
         for live in self.live.values():
             if live.reliability is not None:
                 with contextlib.suppress(Exception):
@@ -1491,7 +1495,10 @@ class GatewayServer:
         approval: Any,
         *,
         max_tool_errors: int = 0,
+        escalates: bool = False,
     ) -> AgentLoop:
+        """``escalates``: a cheap/fast attempt that a higher tier continues when it stalls, so a tool-error stop is
+        silent (the next tier carries on); otherwise the stop ends the turn with the list of failed calls."""
         loop = AgentLoop(
             router,
             system_prompt=build_system_prompt(
@@ -1524,6 +1531,8 @@ class GatewayServer:
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
+        loop.tool_error_stop_message = not escalates
+        loop.on_tool_outcome = lambda call, result, failure: self.learning.tool_outcome(session, call, result, failure)
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
@@ -1574,7 +1583,8 @@ class GatewayServer:
         )
         tier = tier_for(kind, self.config.task_tiers)
         cheap_start = tier in (Tier.FAST, Tier.CHEAP)
-        max_errors = int(autonomy_cfg(self.config)["escalate"]["tool_errors"]) if cheap_start else 0
+        main_errors = int(autonomy_cfg(self.config)["max_tool_errors"])  # a main-tier turn stops after this many
+        max_errors = int(autonomy_cfg(self.config)["escalate"]["tool_errors"]) if cheap_start else main_errors
         escalation = Escalation(tier, thresholds={"tool_errors": 1, "loop_guard": 1})  # the loop counted already
 
         config = self.config
@@ -1587,7 +1597,13 @@ class GatewayServer:
         # raised UnboundLocalError in place of the CancelledError
         history: list[Message] = []
         loop = self._build_loop(
-            session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
+            session,
+            reliability,
+            self.tier_routers().get(tier),
+            kind,
+            approval,
+            max_tool_errors=max_errors,
+            escalates=cheap_start,
         )
         session.loop = loop
 
@@ -1630,7 +1646,13 @@ class GatewayServer:
                 max_errors = int(acfg["escalate"]["tool_errors"])
                 escalation = Escalation(tier, thresholds={"tool_errors": 1, "loop_guard": 1})
                 loop = self._build_loop(
-                    session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
+                    session,
+                    reliability,
+                    self.tier_routers().get(tier),
+                    kind,
+                    approval,
+                    max_tool_errors=max_errors,
+                    escalates=True,
                 )
                 loop.on_text_delta = on_text_delta
                 loop.on_text_reset = on_text_reset
@@ -1672,6 +1694,10 @@ class GatewayServer:
                         turn=session.turn_id,
                     )
                 new_tier = escalation.record(attempt_reason) if cheap_start and attempt_reason else None
+                if new_tier is None and attempt_reason == "tool_errors" and not loop.interrupted:
+                    # the loop stopped after N failed calls in a row and listed them: the user decides how to go on
+                    # (ending 'done' let an active goal judge it and continue into the same failures)
+                    session.needs_input = True
                 if new_tier is None or loop.interrupted:
                     break
                 # The attempt stalled on a cheap tier: continue the same task one tier up.
@@ -1687,7 +1713,13 @@ class GatewayServer:
                     "with a different approach if needed."
                 )
                 loop = self._build_loop(
-                    session, reliability, self.tier_routers().get(tier), kind, approval, max_tool_errors=max_errors
+                    session,
+                    reliability,
+                    self.tier_routers().get(tier),
+                    kind,
+                    approval,
+                    max_tool_errors=max_errors if tier in (Tier.FAST, Tier.CHEAP) else main_errors,
+                    escalates=tier in (Tier.FAST, Tier.CHEAP),
                 )
                 loop.on_text_delta = on_text_delta
                 loop.on_text_reset = on_text_reset
@@ -1943,7 +1975,9 @@ class GatewayServer:
                 session.perms.session_rules.extend(rules)
             if choice == "always" and rules:
                 persist_rules(project_config_path(session.perms.cwd), rules)
-            self.learning.approval(session, tool_name, pattern, choice)
+            self.learning.approval(
+                session, tool_name, pattern, choice, reason=reason, command=_command_for_tool(tool_name, arguments)
+            )
             return ApprovalResult(choice, reason)
 
         return approve
