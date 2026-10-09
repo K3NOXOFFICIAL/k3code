@@ -176,6 +176,8 @@ class LiveSession:
         #: True while a /goal continuation runs: nobody is watching, so bash is sandboxed even in a foreground session.
         self.goal_continuation = False
         self.reliability: Reliability | None = None
+        #: Why NetWatch did not start ("" while it runs): offline pause/resume is off for this session until it does.
+        self.offline_protection_error = ""
         #: paused = waiting on the network/provider; the session still counts as working.
         self.paused = False
         self.paused_since = 0.0
@@ -956,9 +958,11 @@ class GatewayServer:
             # its caller is still attached. Only the live entry is dropped; the stored row stays. Not during a daemon
             # stop: close() iterates the registry across awaits.
             if client.session_id and not self.stopping:
-                with contextlib.suppress(Exception):
+                try:
                     if (await self.close_live(client.session_id, disposable_only=True))["closed"]:
                         logger.info("closed empty session %s: its last client left", client.session_id)
+                except Exception:
+                    logger.exception("closing session %s after its last client left failed", client.session_id)
 
     async def _read_frame(self, reader: asyncio.StreamReader, client: Client) -> bytes | None:
         """The next line from ``reader`` (b"" at EOF), or None for one longer than MAX_FRAME_BYTES: that frame is
@@ -1001,6 +1005,7 @@ class GatewayServer:
                     "status": s.state,
                     "state": s.state,
                     "paused": s.paused,
+                    "offline_protection": not s.offline_protection_error,
                     "background": s.background,
                     "origin": s.stored.meta.get("origin", ""),
                     "title": s.stored.title or "Session",
@@ -1037,8 +1042,10 @@ class GatewayServer:
     async def _idle_sweep_loop(self) -> None:
         while True:
             await asyncio.sleep(self.IDLE_SWEEP_EVERY_S)
-            with contextlib.suppress(Exception):
+            try:
                 await self.sweep_idle_reliability()
+            except Exception:
+                logger.exception("idle reliability sweep failed")
 
     async def sweep_idle_reliability(self, now: float | None = None) -> int:
         """Stop the NetWatch of sessions that have been idle for IDLE_RELIABILITY_S; returns how many were stopped.
@@ -1055,9 +1062,12 @@ class GatewayServer:
                 continue
             if now - live.idle_since < self.IDLE_RELIABILITY_S:
                 continue
-            with contextlib.suppress(Exception):
+            try:
                 await rel.stop()  # re-armed by _reliability_for on the session's next turn
-                stopped += 1
+            except Exception:
+                logger.warning("session %s: stopping its idle NetWatch failed", live.session_id, exc_info=True)
+                continue
+            stopped += 1
         return stopped
 
     def shutdown(self) -> None:
@@ -1087,8 +1097,10 @@ class GatewayServer:
             await tool_jobs.REGISTRY.reap_all()  # no background bash job outlives the daemon
         for live in self.live.values():
             if live.reliability is not None:
-                with contextlib.suppress(Exception):
+                try:
                     await live.reliability.stop()
+                except Exception:
+                    logger.warning("session %s: stopping its reliability bundle failed", live.session_id, exc_info=True)
         await self.mcp.close()
         for p in self.providers:
             await p.aclose()
@@ -1295,8 +1307,26 @@ class GatewayServer:
             session.reliability = rel
         assert self.router is not None
         session.reliability.register_providers(self.router.chain)
-        with contextlib.suppress(Exception):
+        try:
             await session.reliability.start()
+        except Exception as e:  # noqa: BLE001 - the turn still runs, without offline pause/resume
+            logger.exception("session %s: NetWatch did not start; offline protection is off", session.session_id)
+            if not session.offline_protection_error:  # one notice per session, not one per turn
+                session.emit(
+                    "notification.show",
+                    {
+                        "text": f"offline protection off: network watch failed to start ({e})",
+                        "level": "warning",
+                        "kind": "reliability",
+                        "key": self.NETWATCH_KEY,
+                    },
+                    importance="essential",
+                )
+            session.offline_protection_error = str(e) or type(e).__name__
+        else:
+            if session.offline_protection_error:
+                session.offline_protection_error = ""
+                session.emit("notification.clear", {"key": self.NETWATCH_KEY}, importance="essential")
         return session.reliability
 
     def _on_router_event(self, event: RouterEvent) -> None:
@@ -1326,6 +1356,8 @@ class GatewayServer:
 
     #: Notification key shared by pause/park toasts so ``resumed`` can clear them.
     PAUSE_KEY = "k3.reliability.pause"
+    #: Notification key of the "offline protection off" warning (NetWatch failed to start).
+    NETWATCH_KEY = "k3.reliability.netwatch"
 
     def _on_reliability_event(self, session: LiveSession, event: Any) -> None:
         """Map a ``reliability.*`` / ``net.state`` loop event onto the TUI events that display it.
