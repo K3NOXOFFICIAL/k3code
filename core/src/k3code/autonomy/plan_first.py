@@ -109,7 +109,14 @@ class PlanFirst:
     async def drain(self) -> None:
         """Wait for background proposer passes (tests, shutdown)."""
         while self._tasks:
-            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+            # A finished task leaves the set only when its done-callback runs. Awaiting a gather of tasks that are
+            # all done already does not yield to the loop, so drop them here and yield once, or this spins forever.
+            for task in [t for t in self._tasks if t.done()]:
+                self._tasks.discard(task)
+            pending = list(self._tasks)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            await asyncio.sleep(0)
 
     # ── the gate ──
 
