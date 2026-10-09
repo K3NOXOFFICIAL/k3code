@@ -34,11 +34,12 @@ def first_line(text: str) -> str:
 
 
 def normalise(line: str) -> str:
+    line = scrub_text(line)  # first: the placeholders below would break the credential patterns
     line = _UUID.sub("<uuid>", line)
     line = _PATH.sub("<path>", line)
     line = _HEX.sub("<hex>", line)
     line = _NUMBER.sub("<n>", line)
-    line = re.sub(r"\s+", " ", scrub_text(line)).strip()
+    line = re.sub(r"\s+", " ", line).strip()
     return line[:SIGNATURE_CHARS]
 
 

@@ -89,6 +89,7 @@ from k3code.routing.tiers import (
     TaskKind,
     Tier,
     TierRouters,
+    next_tier,
     router_options,
     tier_for,
     tier_model_specs,
@@ -1719,7 +1720,7 @@ class GatewayServer:
                     kind,
                     approval,
                     max_tool_errors=max_errors if tier in (Tier.FAST, Tier.CHEAP) else main_errors,
-                    escalates=tier in (Tier.FAST, Tier.CHEAP),
+                    escalates=cheap_start and next_tier(tier) is not None,
                 )
                 loop.on_text_delta = on_text_delta
                 loop.on_text_reset = on_text_reset
@@ -2761,6 +2762,7 @@ async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict
     sid = _require(params, "session_id")
     deleted = server.store.delete(str(sid))
     live = server.live.pop(str(sid), None)
+    await tool_jobs.reap(str(sid))  # background bash jobs end with their session
     if live is not None:
         if live.turn_task is not None and not live.turn_task.done():
             live.turn_task.cancel()
