@@ -17,6 +17,9 @@ import {
 } from "../../spawnHistoryStore.js";
 import type { SlashCommand } from "../types.js";
 
+const openSpawnTree = () =>
+  patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 });
+
 interface SkillsReloadResponse {
   output?: string;
 }
@@ -166,8 +169,7 @@ export const opsCommands: SlashCommand[] = [
   },
 
   {
-    aliases: ["tasks"],
-    help: "open the spawn-tree dashboard (live audit + kill/pause controls)",
+    help: "open the agent view (every session by state) · `/agents tree` for the spawn-tree dashboard",
     name: "agents",
     run: (arg, ctx) => {
       const sub = arg.trim().toLowerCase();
@@ -199,8 +201,18 @@ export const opsCommands: SlashCommand[] = [
         return;
       }
 
-      patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 });
+      if (sub === "tree") {
+        return openSpawnTree();
+      }
+
+      patchOverlayState({ agentView: true });
     },
+  },
+
+  {
+    help: "open the spawn-tree dashboard (live audit + kill/pause controls)",
+    name: "tasks",
+    run: () => openSpawnTree(),
   },
 
   {

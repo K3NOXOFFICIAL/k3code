@@ -342,7 +342,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   const newLiveSession = useCallback(
     (msg = "new live session started", title?: string) => {
-      patchOverlayState({ sessions: false });
+      patchOverlayState({ agentView: false, sessions: false });
 
       return startNewSession(msg, title, true);
     },
@@ -351,7 +351,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   const activateLiveSession = useCallback(
     (id: string) => {
-      patchOverlayState({ sessions: false });
+      patchOverlayState({ agentView: false, sessions: false });
       patchUiState({ status: "switching session…" });
 
       gw.request<SessionActivateResponse>("session.activate", {
@@ -406,7 +406,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   const resumeById = useCallback(
     (id: string) => {
-      patchOverlayState({ sessions: false });
+      patchOverlayState({ agentView: false, sessions: false });
       patchUiState({ status: "resuming…" });
 
       return rpc<SetupStatusResponse>("setup.status", {}).then((setup) => {

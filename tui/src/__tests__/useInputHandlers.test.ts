@@ -16,6 +16,7 @@ import {
   resolveCtrlCComposerAction,
   shouldDetachEditedHistoryInput,
   shouldFallThroughForScroll,
+  shouldOpenAgentView,
 } from "../app/useInputHandlers.js";
 
 const baseKey = {
@@ -228,5 +229,50 @@ describe("dismissSensitivePrompt", () => {
 
     expect(getOverlayState().secret).toBeNull();
     expect(sys).toHaveBeenCalled();
+  });
+});
+
+describe("shouldOpenAgentView — ← opens the agent view only from an idle, empty prompt", () => {
+  const idle = {
+    blocked: false,
+    historyIdx: null,
+    input: "",
+    inputBuf: [] as string[],
+    key: { leftArrow: true },
+    queueEditIdx: null,
+    stripFocused: false,
+  };
+
+  it("opens on a plain ← with an empty prompt", () => {
+    expect(shouldOpenAgentView(idle)).toBe(true);
+  });
+
+  it("does not open for other keys", () => {
+    expect(shouldOpenAgentView({ ...idle, key: { leftArrow: false } })).toBe(
+      false,
+    );
+  });
+
+  it("keeps ← as cursor movement over typed text or a multi-line buffer", () => {
+    expect(shouldOpenAgentView({ ...idle, input: "draft" })).toBe(false);
+    expect(shouldOpenAgentView({ ...idle, inputBuf: ["line 1"] })).toBe(false);
+  });
+
+  it("does not open during a history walk or a queue edit", () => {
+    expect(shouldOpenAgentView({ ...idle, historyIdx: 2 })).toBe(false);
+    expect(shouldOpenAgentView({ ...idle, queueEditIdx: 0 })).toBe(false);
+  });
+
+  it("does not open with the agent strip focused or an overlay up", () => {
+    expect(shouldOpenAgentView({ ...idle, stripFocused: true })).toBe(false);
+    expect(shouldOpenAgentView({ ...idle, blocked: true })).toBe(false);
+  });
+
+  it("does not open with Shift, Alt or Ctrl held", () => {
+    for (const mod of ["shift", "meta", "ctrl"] as const) {
+      expect(
+        shouldOpenAgentView({ ...idle, key: { leftArrow: true, [mod]: true } }),
+      ).toBe(false);
+    }
   });
 });

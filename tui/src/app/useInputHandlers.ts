@@ -64,6 +64,38 @@ export const composerHasDraft = (cState: {
 }): boolean =>
   Boolean(cState.input || cState.inputBuf.length || cState.tokens?.length);
 
+/**
+ * `←` opens the agent view only from an idle, empty prompt: no text or multi-line buffer, no history walk or queue
+ * edit, the strip not focused and no overlay up. Anywhere else `←` keeps moving the cursor.
+ */
+export const shouldOpenAgentView = ({
+  blocked,
+  historyIdx,
+  input,
+  inputBuf,
+  key,
+  queueEditIdx,
+  stripFocused,
+}: {
+  blocked: boolean;
+  historyIdx: null | number;
+  input: string;
+  inputBuf: readonly string[];
+  key: { ctrl?: boolean; leftArrow?: boolean; meta?: boolean; shift?: boolean };
+  queueEditIdx: null | number;
+  stripFocused: boolean;
+}): boolean =>
+  Boolean(key.leftArrow) &&
+  !key.shift &&
+  !key.meta &&
+  !key.ctrl &&
+  input === "" &&
+  !inputBuf.length &&
+  historyIdx === null &&
+  queueEditIdx === null &&
+  !stripFocused &&
+  !blocked;
+
 export function handleInputSelectionClipboard(
   selection: ReturnType<typeof getInputSelection>,
   action: "copy" | "cut",
@@ -266,6 +298,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return patchOverlayState({ journey: false });
     }
 
+    if (overlay.agentView) {
+      return patchOverlayState({ agentView: false });
+    }
+
     if (overlay.widget) {
       return closeWidget();
     }
@@ -338,7 +374,8 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
   useInput((ch, key, event) => {
     const live = getUiState();
 
-    if (key.escape && !$stripNav.get().focused) {
+    // The agent view owns Esc (it closes the view); counting it here would let the next Esc discard the draft.
+    if (key.escape && !$stripNav.get().focused && !overlay.agentView) {
       const now = Date.now();
       const isDouble = now - lastEscRef.current <= DOUBLE_ESC_MS;
 
@@ -600,6 +637,24 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       cState.queueEditIdx === null
     ) {
       $stripNav.set({ ...IDLE_NAV, focused: true });
+
+      return;
+    }
+
+    // ← on an idle, empty prompt opens the agent view. In the view the same key closes it: this handler sees that
+    // press while `isBlocked` is still true and returns above, so it cannot reopen the view.
+    if (
+      shouldOpenAgentView({
+        blocked: isBlocked,
+        historyIdx: cState.historyIdx,
+        input: cState.input,
+        inputBuf: cState.inputBuf,
+        key,
+        queueEditIdx: cState.queueEditIdx,
+        stripFocused: strip.focused,
+      })
+    ) {
+      patchOverlayState({ agentView: true });
 
       return;
     }

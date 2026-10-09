@@ -16,6 +16,7 @@ import { patchUiState, resetUiState } from "../app/uiStore.js";
 import { StatusRule } from "../components/appChrome.js";
 import { AppLayout } from "../components/appLayout.js";
 import type { GatewayClient } from "../gatewayClient.js";
+import { AGENT_VIEW_HINT } from "../k3/agentView.js";
 import { DEFAULT_THEME } from "../theme.js";
 
 type StatusRuleProps = React.ComponentProps<typeof StatusRule>;
@@ -381,12 +382,14 @@ describe("status-chrome timers track the current overlay model", () => {
     ["widget", { widget: { appId: "demo", state: null } }],
   ];
 
-  // In `$isBlocked` but NOT occluding.  `agents` / `journey` unmount the whole
-  // ComposerPane subtree, so React's effect cleanup already stops the clocks
-  // and gating on them would be dead code; the rest are PromptZone states that
-  // render in normal flow and push the rule down without covering it.
+  // In `$isBlocked` but NOT occluding.  `agents` / `agentView` / `journey`
+  // unmount the whole ComposerPane subtree, so React's effect cleanup already
+  // stops the clocks and gating on them would be dead code; the rest are
+  // PromptZone states that render in normal flow and push the rule down
+  // without covering it.
   const nonOccluding: Array<[string, Partial<OverlayState>]> = [
     ["agents", { agents: true }],
+    ["agentView", { agentView: true }],
     [
       "approval",
       {
@@ -505,5 +508,16 @@ describe("AppLayout status-rule visibility", () => {
     await flush();
 
     expect(oneSecondTimers(intervalSpy)).toBe(2);
+  });
+
+  it("swaps the transcript and composer for the full-screen agent view", async () => {
+    const layout = mountLayout({ agentView: true });
+
+    await flush();
+
+    expect(layout.output()).toContain(AGENT_VIEW_HINT);
+    // the composer (and the status rule inside it) unmounts with the view up
+    expect(layout.output()).not.toContain("~/repo");
+    expect(oneSecondTimers(intervalSpy)).toBe(0);
   });
 });

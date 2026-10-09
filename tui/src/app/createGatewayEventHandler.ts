@@ -630,11 +630,11 @@ export function createGatewayEventHandler(
     return fullConfigPromise;
   };
 
-  // ── Nudge toward /agents on delegation ───────────────────────────────
+  // ── Nudge toward /agents tree on delegation ───────────────────────────────
   //
   // When `display.tui_agents_nudge` is enabled (default true), the first
   // time a turn starts delegating we drop a single transient activity hint
-  // ("subagents working · /agents to watch live") so the user discovers the
+  // ("subagents working · /agents tree to watch live") so the user discovers the
   // spawn-tree dashboard instead of staring at a quiet transcript — without
   // hijacking the screen by force-opening an overlay.  Guards:
   //   • fires at most once per turn (`agentsNudgedThisTurn`)
@@ -676,7 +676,7 @@ export function createGatewayEventHandler(
 
     agentsNudgedThisTurn = true;
     turnController.pushActivity(
-      "subagents working · /agents to watch live",
+      "subagents working · /agents tree to watch live",
       "info",
     );
   };

@@ -1592,7 +1592,7 @@ describe("createGatewayEventHandler", () => {
     ).toBe("completed");
   });
 
-  it("nudges toward /agents on the first spawn_requested of a turn", () => {
+  it("nudges toward /agents tree on the first spawn_requested of a turn", () => {
     const appended: Msg[] = [];
     const onEvent = createGatewayEventHandler(buildCtx(appended));
 
@@ -1605,7 +1605,11 @@ describe("createGatewayEventHandler", () => {
       a.text.includes("/agents"),
     );
     expect(hints).toHaveLength(1);
-    expect(hints[0]).toMatchObject({ tone: "info" });
+    // bare /agents opens the agent view now; the spawn tree it advertises lives at /agents tree
+    expect(hints[0]).toMatchObject({
+      text: "subagents working · /agents tree to watch live",
+      tone: "info",
+    });
   });
 
   it("nudges at most once per turn and resets on the next message.start", () => {
