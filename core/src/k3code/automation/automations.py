@@ -217,11 +217,8 @@ class AutomationManager:
         return row
 
     def find(self, ref: str) -> dict[str, Any] | None:
-        row = self.db.find("automations", ref)
-        if row is None:
-            named = [r for r in self.db.rows("automations") if r["name"] == ref]
-            row = named[0] if len(named) == 1 else None
-        return row
+        """Exact id, then exact name, then unique id prefix; an ambiguous name or prefix finds nothing."""
+        return self.db.find("automations", ref, name_col="name")
 
     async def remove(self, ref: str) -> bool:
         row = self.find(ref)

@@ -103,11 +103,20 @@ class AutomationDB:
         assert table in TABLES
         return self._dec(self._db.execute(f"SELECT * FROM {table} WHERE id=?", (row_id,)).fetchone())  # noqa: S608
 
-    def find(self, table: str, prefix: str) -> dict[str, Any] | None:
-        """Row by exact id or unique id prefix."""
+    def find(self, table: str, prefix: str, *, name_col: str | None = None) -> dict[str, Any] | None:
+        """Row by exact id, then (with ``name_col``) exact name, then unique id prefix.
+
+        Ids are random hex, so a name such as ``cafe`` can also be a prefix of another row's id: the name must win.
+        A name shared by several rows or an ambiguous prefix finds nothing rather than an arbitrary row.
+        """
         row = self.get(table, prefix)
         if row is not None:
             return row
+        if name_col:
+            assert name_col in ("name",)
+            named = self._db.execute(f"SELECT * FROM {table} WHERE {name_col}=?", (prefix,)).fetchall()  # noqa: S608
+            if named:
+                return self._dec(named[0]) if len(named) == 1 else None
         rows = self._db.execute(f"SELECT * FROM {table} WHERE id LIKE ?", (prefix + "%",)).fetchall()  # noqa: S608
         return self._dec(rows[0]) if len(rows) == 1 else None
 
