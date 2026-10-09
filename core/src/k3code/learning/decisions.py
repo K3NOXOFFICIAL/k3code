@@ -14,7 +14,18 @@ from typing import Any
 
 from k3code.redact import scrub_text
 
-KINDS = ("approval", "model_switch", "proposal", "plan", "interrupt", "undo", "scope", "config", "auto_apply")
+KINDS = (
+    "approval",
+    "model_switch",
+    "proposal",
+    "plan",
+    "interrupt",
+    "undo",
+    "scope",
+    "config",
+    "auto_apply",
+    "tool_error",  # subject = normalised error signature, choice = error class, detail.tool (see k3code.toolerrors)
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -126,6 +137,19 @@ class DecisionLog:
         )
         self._db.commit()
         return int(cur.lastrowid or 0)
+
+    def project_for(self, cwd: str) -> str:
+        """The project id ``record`` files a row under for ``cwd``."""
+        return self._project(cwd)
+
+    def update_detail(self, row_id: int, **kv: Any) -> None:
+        """Merge ``kv`` (scrubbed) into one row's detail, e.g. what worked after a recorded tool error."""
+        row = self._db.execute("SELECT detail FROM decisions WHERE id=?", (row_id,)).fetchone()
+        if row is None:
+            return
+        detail = {**json.loads(row["detail"] or "{}"), **_scrub_obj(kv)}
+        self._db.execute("UPDATE decisions SET detail=? WHERE id=?", (json.dumps(detail, ensure_ascii=False), row_id))
+        self._db.commit()
 
     def query(
         self,

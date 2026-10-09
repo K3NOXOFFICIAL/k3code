@@ -25,6 +25,7 @@ STUB_INSTALLER = """#!/bin/sh
 printf '%s\\n' "$@" >"$K3_STUB_ARGS"
 printf '%s\\n' "$(cd "$(dirname "$0")/.." && pwd)" >"$K3_STUB_DIR"
 printf '%s\\n' "${K3CODE_DATA:-}" >"$K3_STUB_DATA"
+printf '%s\\n' "${K3_ALLOW_ROOT:-unset}" >"$K3_STUB_ARGS.root"
 if [ -n "${K3_STUB_FAIL:-}" ]; then
   echo "building the TUI" >&2
   echo "npm ERR! something broke" >&2
@@ -146,6 +147,29 @@ def test_a_newer_head_is_staged_by_the_refs_own_installer_and_activated(remote, 
     assert sorted(p.name for p in data.iterdir()) == ["current", "versions"]
 
 
+@pytest.mark.parametrize("uid", [0, 1000])
+def test_the_installer_is_told_to_allow_root_only_when_updating_as_root(remote, data, monkeypatch, uid):
+    monkeypatch.delenv("K3_ALLOW_ROOT", raising=False)
+    monkeypatch.setattr(upd.os, "geteuid", lambda: uid)
+    assert upd.update_from_git(remote["url"], "main") == STAGED
+    assert (remote["logs"] / "args.root").read_text().strip() == ("1" if uid == 0 else "unset")
+
+
+@pytest.mark.parametrize("uid", [0, 1000])
+def test_a_source_update_passes_allow_root_only_as_root(tmp_path, monkeypatch, uid):
+    seen: list[dict[str, str]] = []
+
+    def fake_run(cmd, **kw):
+        seen.append(kw["env"])
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"{STAGED}\n", stderr="")
+
+    monkeypatch.delenv("K3_ALLOW_ROOT", raising=False)
+    monkeypatch.setattr(upd.os, "geteuid", lambda: uid)
+    monkeypatch.setattr(upd.subprocess, "run", fake_run)
+    assert upd.update_from_source(tmp_path, pull=False) == STAGED
+    assert seen[0].get("K3_ALLOW_ROOT") == ("1" if uid == 0 else None)
+
+
 def test_check_only_reports_current_and_latest(remote, data, no_release, monkeypatch):
     cur = _install(data, "1234567aaaa")
     monkeypatch.setattr(upd, "update_from_git", _no_update)
@@ -221,7 +245,7 @@ def test_a_published_release_still_wins_over_a_recorded_ref(data, no_release, mo
     _install(data, "1234567aaaa")
     rel = upd.Release(tag="v0.2.0", version="0.2.0", body="notes", prerelease=False, assets={})
     monkeypatch.setattr(upd, "fetch_latest", lambda *a, **k: rel)
-    monkeypatch.setattr(upd, "install_release", lambda r, tok: None)
+    monkeypatch.setattr(upd, "install_release", lambda r, tok, **kw: None)
     monkeypatch.setattr(upd, "update_from_git", _no_update)
     monkeypatch.setattr(upd, "remote_head", _no_update)
     r = CliRunner().invoke(cli, ["update", "--yes"])

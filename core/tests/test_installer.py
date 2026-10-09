@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import select
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -61,7 +63,12 @@ def snapshot(home: Path) -> dict[str, tuple[float, str]]:
     for p in sorted(home.rglob("*")):
         if ".k3code" in p.parts or p.name == "install.log":
             continue  # doctor may touch its own home dir; the install log grows on every run by design
-        out[str(p.relative_to(home))] = (p.lstat().st_mtime_ns, os.readlink(p) if p.is_symlink() else "")
+        # every run takes and drops its lock directory in the install root, which touches that directory's mtime
+        lock_parent = p.name == "k3code" and p.parent.name == "share"
+        out[str(p.relative_to(home))] = (
+            0 if lock_parent else p.lstat().st_mtime_ns,
+            os.readlink(p) if p.is_symlink() else "",
+        )
     return out
 
 
@@ -98,13 +105,16 @@ def test_unknown_option_is_rejected(tmp_path: Path) -> None:
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv")
 def test_installed_requirements_are_the_locked_runtime_set() -> None:
-    # install_core_copy installs `uv export --locked --no-dev`; the stubbed installer tests never run that path.
+    # install_core_copy installs `uv export --locked --no-dev` with --require-hashes; the stubbed installer tests
+    # never run that path.
+    src = INSTALL.read_text()
+    assert "--no-hashes" not in src and '--require-hashes -r "$REQS"' in src
     uv = shutil.which("uv") or "uv"
     core = str(REPO / "core")
     lock = subprocess.run([uv, "lock", "--check", "--offline", "--project", core], capture_output=True)
     assert lock.returncode == 0, lock.stderr
     export = subprocess.run(
-        [uv, "export", "--project", core, "--locked", "--no-dev", "--no-hashes", "--no-emit-project"],
+        [uv, "export", "--project", core, "--locked", "--no-dev", "--no-emit-project"],
         capture_output=True,
         text=True,
         check=True,
@@ -113,6 +123,7 @@ def test_installed_requirements_are_the_locked_runtime_set() -> None:
     names = {ln.split("==")[0].strip().lower() for ln in lines}
     assert {"mcp", "pydantic", "click", "pyyaml", "prompt-toolkit"} <= names
     assert not names & {"pytest", "pytest-asyncio", "ruff", "respx", "pexpect"}
+    assert export.stdout.count("--hash=sha256:") >= len(lines)  # every pinned package carries its hash
 
 
 def test_uninstall_keeps_user_data_unless_purge(tmp_path: Path) -> None:
@@ -124,7 +135,7 @@ def test_uninstall_keeps_user_data_unless_purge(tmp_path: Path) -> None:
     assert not (tmp_path / ".local" / "share" / "k3code").exists()
     assert not (tmp_path / ".local" / "bin" / "k3code").exists()
     assert (tmp_path / ".k3code" / "config.yaml").is_file()
-    assert run(tmp_path, UNINSTALL, "--purge").returncode == 0
+    assert run(tmp_path, UNINSTALL, "--purge", "--yes").returncode == 0
     assert not (tmp_path / ".k3code").exists()
 
 
@@ -181,6 +192,9 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path) -> 
     assert (tmp_path / ".local" / "share" / "k3code" / "current").is_symlink()
     shim = (appdata / "k3code" / "bin" / "k3code.cmd").read_text()
     assert f'--exec sh -lc "exec {tmp_path}/.local/bin/k3code \\"$@\\"" k3code %*' in shim
+    # at a drive root %CD% is C:\ and its backslash would escape the closing quote of --cd "...": it is doubled
+    assert 'if "%K3_CD:~-1%"=="\\" set "K3_CD=%K3_CD%\\"' in shim.splitlines()
+    assert ' --cd "%K3_CD%" ' in shim
     assert not (appdata / "k3code" / "bin" / "k3.cmd").exists()  # no k3 binary was built
 
     r = ps("uninstall.ps1")
@@ -399,8 +413,8 @@ def test_uv_temp_file_is_removed_when_the_uv_download_fails(tmp_path: Path) -> N
         path_front=curl,
     )
     assert r.returncode != 0
-    assert "could not download the uv installer" in r.stderr
-    assert list(tmpdir.glob("uv-install.*")) == []
+    assert "could not download uv" in r.stderr
+    assert list(tmpdir.glob("k3code-uv.*")) == []
 
 
 def test_check_reports_the_node_floor_of_20(tmp_path: Path) -> None:
@@ -427,7 +441,7 @@ def test_uninstall_removes_presetup_leftovers_and_keeps_user_data(tmp_path: Path
     assert not data.exists()  # presetup markers and the browser location go with the install
     assert (tmp_path / ".k3code" / "config.yaml").is_file()
     assert (tmp_path / ".config" / "k3code" / "env").is_file()
-    assert run(tmp_path, UNINSTALL, "--purge").returncode == 0
+    assert run(tmp_path, UNINSTALL, "--purge", "--yes").returncode == 0
     assert not (tmp_path / ".k3code").exists()
     assert not (tmp_path / ".config" / "k3code").exists()
 
@@ -518,3 +532,564 @@ def test_passwordless_sudo_is_never_used_for_bubblewrap(tmp_path: Path) -> None:
     r = run(tmp_path, INSTALL, "--from-source", "--yes", env_extra={"K3_BWRAP": "/nonexistent/bwrap"}, path_front=sudo)
     assert r.returncode == 0, r.stderr
     assert not sudo_log.exists()
+
+
+DATA_REL = Path(".local") / "share" / "k3code"
+
+
+def test_root_is_refused_unless_allow_root(tmp_path: Path) -> None:
+    ids = stub_bin(tmp_path, "id", 'case "$1" in -u) echo 0 ;; -un) echo root ;; *) echo "uid=0(root)" ;; esac\n')
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, INSTALL, "--from-source", "--minimal", path_front=ids)
+    assert r.returncode != 0
+    assert "refusing to run as root" in r.stderr
+    assert not (home / ".local").exists()  # refused before anything was written
+    ok = run(home, INSTALL, "--from-source", "--minimal", "--allow-root", path_front=ids)
+    assert ok.returncode == 0, ok.stderr
+    assert (home / DATA_REL / "current").is_symlink()
+
+
+def test_sudo_with_someone_elses_home_is_refused(tmp_path: Path) -> None:
+    # `sudo -u bob` keeping alice's HOME: the install would land in a home that does not belong to the running user
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"SUDO_USER": "alice"})
+    assert r.returncode != 0
+    assert "through sudo" in r.stderr
+    assert not (tmp_path / DATA_REL).exists()
+
+
+def test_a_held_install_lock_stops_a_second_install(tmp_path: Path) -> None:
+    lock = tmp_path / DATA_REL / ".install.lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{os.getpid()}\n")  # a live process holds it
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert r.returncode != 0
+    assert "another install" in r.stderr and str(os.getpid()) in r.stderr
+    assert not (tmp_path / DATA_REL / "versions").exists()
+    assert lock.is_dir()  # someone else's lock is never removed
+
+    dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+    (lock / "pid").write_text(f"{dead}\n")
+    stale = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert stale.returncode != 0
+    assert "not running" in stale.stderr and "rm -r" in stale.stderr
+
+
+def test_the_install_lock_is_released_after_a_run(tmp_path: Path) -> None:
+    assert run(tmp_path, INSTALL, "--from-source", "--minimal").returncode == 0
+    assert not (tmp_path / DATA_REL / ".install.lock").exists()
+    assert run(tmp_path, INSTALL, "--from-source", "--minimal").returncode == 0  # the next run gets it
+
+
+def test_a_foreign_k3code_in_bin_is_kept_unless_force(tmp_path: Path) -> None:
+    mine = tmp_path / ".local" / "bin" / "k3code"
+    mine.parent.mkdir(parents=True)
+    mine.write_text("#!/bin/sh\necho someone else's k3code\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert "not a link into" in r.stderr
+    assert not mine.is_symlink() and "someone else" in mine.read_text()
+    forced = run(tmp_path, INSTALL, "--from-source", "--minimal", "--force")
+    assert forced.returncode == 0, forced.stderr
+    assert mine.is_symlink() and os.readlink(mine).startswith(str(tmp_path / DATA_REL))
+
+
+def _mini_checkout(root: Path) -> Path:
+    """A committed k3code-shaped checkout carrying this installer; edits to it give new (dirty) versions."""
+    src = root / "src"
+    (src / "core").mkdir(parents=True)
+    (src / "install").mkdir()
+    (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (src / "VERSION").write_text("9.9.9\n")
+    shutil.copy(INSTALL, src / "install" / "install.sh")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    git = ["git", "-C", str(src), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run([*git, "init", "-q"], check=True, env=env)
+    subprocess.run([*git, "add", "-A"], check=True, env=env)
+    subprocess.run([*git, "commit", "-qm", "init"], check=True, env=env)
+    return src
+
+
+def _fake_systemd(root: Path, home: Path) -> tuple[Path, Path, Path]:
+    """A k3code.service unit file plus a systemctl stub: active, MainPID read from a file, every call logged."""
+    unit = home / ".config" / "systemd" / "user" / "k3code.service"
+    unit.parent.mkdir(parents=True)
+    unit.write_text("[Service]\nExecStart=/bin/true\n")
+    calls, pidfile = root / "systemctl.log", root / "mainpid"
+    pidfile.write_text("0\n")
+    body = f'echo "systemctl $*" >>"{calls}"\ncase "$*" in *show*MainPID*) cat "' + str(pidfile) + '" ;; esac\nexit 0\n'
+    return stub_bin(root, "systemctl", body), calls, pidfile
+
+
+@linux_only
+def test_activation_restarts_a_running_daemon_and_keeps_its_version(tmp_path: Path) -> None:
+    src = _mini_checkout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    stubs, calls, pidfile = _fake_systemd(tmp_path, home)
+    versions = home / DATA_REL / "versions"
+
+    def install() -> subprocess.CompletedProcess[str]:
+        r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", path_front=stubs)
+        assert r.returncode == 0, r.stderr
+        return r
+
+    install()
+    v1 = (home / DATA_REL / "current").resolve().name
+    (src / "VERSION").write_text("9.9.9\n\n")  # uncommitted edit: a second version
+    install()
+    log = calls.read_text()
+    assert "systemctl --user reset-failed k3code.service" in log
+    assert "systemctl --user restart k3code.service" in log
+
+    daemon = subprocess.Popen(["sleep", "60"], cwd=versions / v1)  # the "daemon" still runs from the first version
+    try:
+        pidfile.write_text(f"{daemon.pid}\n")
+        (src / "VERSION").write_text("9.9.9\n\n\n")  # a third version: v1 is neither current nor previous
+        r = install()
+        assert (versions / v1).is_dir(), r.stderr
+        assert "still executes from it" in r.stderr
+    finally:
+        daemon.kill()
+        daemon.wait()
+    restarts = calls.read_text().count("restart k3code.service")
+    install()  # the same version again: nothing switched, so no restart
+    assert calls.read_text().count("restart k3code.service") == restarts
+
+
+# mv stand-ins: GNU mv (-T), BSD/macOS mv (no -T; -h does the same), and an mv with neither (the ln -sfn fallback).
+# Each logs where DATA/current points at the moment it is asked to replace it, then does the move with the real mv.
+MV_FLAVOURS = {
+    "gnu": "",
+    "bsd": '  -T) echo "mv: illegal option -- T" >&2; exit 64 ;;\n  -h) shift; exec "$REAL_MV" -T "$@" ;;\n',
+    "none": '  -T | -h) echo "mv: illegal option" >&2; exit 64 ;;\n',
+}
+
+
+@pytest.mark.parametrize("flavour", sorted(MV_FLAVOURS))
+def test_switching_versions_replaces_current_in_one_rename(tmp_path: Path, flavour: str) -> None:
+    real_mv = shutil.which("mv")
+    assert real_mv
+    seen = tmp_path / "mv.log"
+    body = (
+        f'REAL_MV="{real_mv}"\nfor a; do last=$a; done\n'
+        f'case "$last" in */current) printf "%s %s\\n" "$1" "$(readlink "$last")" >>"{seen}" ;; esac\n'
+        f'case "$1" in\n{MV_FLAVOURS[flavour]}esac\nexec "$REAL_MV" "$@"\n'
+    )
+    stubs = stub_bin(tmp_path, "mv", body)
+    src = _mini_checkout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    current = home / DATA_REL / "current"
+    assert run(home, src / "install" / "install.sh", "--from-source", "--minimal", path_front=stubs).returncode == 0
+    v1 = os.readlink(current)
+    (src / "VERSION").write_text("9.9.9\n\n")  # uncommitted edit: a second version
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    v2 = os.readlink(current)
+    assert v2 != v1 and Path(v2).name in r.stderr and (Path(v2) / ".complete").is_file()
+    assert not [p.name for p in (home / DATA_REL).iterdir() if p.name.startswith(".current.")]  # no temp link left
+    if flavour != "none":
+        # the rename over the old link is what switches versions: until that instant readers still see v1
+        assert f"{'-T' if flavour == 'gnu' else '-h'} {v1}" in seen.read_text().splitlines()
+
+
+def _path_without(root: Path, name: str) -> str:
+    """This PATH with NAME hidden: each directory holding NAME is replaced by a link farm of everything else."""
+    dirs = []
+    for i, d in enumerate(os.environ["PATH"].split(os.pathsep)):
+        if d and (Path(d) / name).exists():
+            farm = root / f"path-without-{name}-{i}"
+            farm.mkdir()
+            for entry in Path(d).iterdir():
+                if entry.name != name:
+                    (farm / entry.name).symlink_to(entry)
+            d = str(farm)
+        dirs.append(d)
+    return os.pathsep.join(dirs)
+
+
+@linux_only
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
+@pytest.mark.parametrize("answer", ["y", "n"])
+def test_bwrap_install_is_asked_on_the_terminal_though_stdin_is_not_one(tmp_path: Path, answer: str) -> None:
+    # install.sh runs main with stdin from /dev/null (curl | sh has the script there): the question about sudo goes
+    # to the controlling terminal, /dev/tty, and only a yes typed there runs sudo
+    sudo_log = tmp_path / "sudo.log"
+    stubs = stub_bin(tmp_path, "sudo", f'echo "sudo $*" >>"{sudo_log}"\nexit 0\n')
+    stub_bin(tmp_path, "dnf", "exit 0\n")  # a package manager to name; the sudo stub never runs it
+    env = {
+        "PATH": f"{stubs}{os.pathsep}{_path_without(tmp_path, 'bwrap')}",
+        "HOME": str(tmp_path),
+        "XDG_CONFIG_HOME": str(tmp_path / ".config"),
+        "K3_STUB_VENV": "1",
+        "K3_SKIP_TUI": "1",
+        "K3_SKIP_GO": "1",
+        "K3_NO_GH": "1",
+    }  # no K3_NO_DOWNLOAD: that means --no-install-deps, which never offers bubblewrap
+    master, slave = os.openpty()
+    try:
+        # setsid --ctty: a new session whose controlling terminal is the pty, so the installer can open /dev/tty
+        proc = subprocess.Popen(
+            ["setsid", "--ctty", "sh", str(INSTALL), "--from-source", "--minimal"],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            env=env,
+        )
+        os.close(slave)
+        slave = -1
+        out, answered = b"", False
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 1)
+            if ready:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # EIO: every writer to the terminal is gone
+                    break
+                if not chunk:
+                    break
+                out += chunk
+                if not answered and b"[y/N]" in out:
+                    os.write(master, answer.encode() + b"\n")
+                    answered = True
+            elif proc.poll() is not None:
+                break
+        if proc.poll() is None:
+            proc.kill()
+        rc = proc.wait()
+    finally:
+        os.close(master)
+        if slave >= 0:
+            os.close(slave)
+    text = out.decode(errors="replace")
+    assert rc == 0, text
+    assert "Install bubblewrap now with sudo" in text
+    if answer == "y":
+        assert "sudo dnf install -y bubblewrap" in sudo_log.read_text()
+    else:
+        assert not sudo_log.exists()
+        assert "needs root to install" in text
+
+
+def test_no_systemctl_call_without_a_k3code_unit(tmp_path: Path) -> None:
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    assert run(tmp_path, INSTALL, "--from-source", "--minimal", path_front=stubs).returncode == 0
+    assert not calls.exists()
+
+
+def test_purge_without_yes_and_without_a_terminal_is_refused(tmp_path: Path) -> None:
+    assert run(tmp_path, INSTALL, "--from-source", "--minimal").returncode == 0
+    (tmp_path / ".k3code").mkdir(exist_ok=True)
+    (tmp_path / ".k3code" / "config.yaml").write_text("x: 1\n")
+    r = run(tmp_path, UNINSTALL, "--purge")  # a new session: no terminal to confirm on
+    assert r.returncode != 0
+    assert "--yes" in r.stderr
+    assert (tmp_path / ".k3code" / "config.yaml").is_file()
+    assert (tmp_path / DATA_REL / "current").is_symlink()  # refused before anything was removed
+
+
+def test_uninstall_fallback_removes_both_units(tmp_path: Path) -> None:
+    # no k3code to run `k3code service uninstall`: the script disables and removes the daemon and its recovery unit
+    units = tmp_path / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    for name in ("k3code.service", "k3code-recover.service"):
+        (units / name).write_text("[Unit]\n")
+    calls = tmp_path / "systemctl.log"
+    stubs = stub_bin(tmp_path, "systemctl", f'echo "systemctl $*" >>"{calls}"\nexit 0\n')
+    r = run(tmp_path, UNINSTALL, path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    assert not (units / "k3code.service").exists()
+    assert not (units / "k3code-recover.service").exists()
+    log = calls.read_text()
+    assert "disable --now k3code.service k3code-recover.service" in log
+    assert "daemon-reload" in log
+
+
+def _git(src: Path, *args: str) -> str:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(src), *args]
+    return subprocess.run(cmd, check=True, env=env, capture_output=True, text=True).stdout.strip()
+
+
+def test_stable_channel_skips_pre_release_tags(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    (src / "VERSION").write_text("0.0.2\n")
+    _git(src, "commit", "-qam", "rc")
+    _git(src, "tag", "v0.0.2-rc1")  # sorts above v0.0.1, but is a pre-release
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, INSTALL, "--from-git", f"file://{src}", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert (home / DATA_REL / "current" / ".ref").read_text().strip() == "v0.0.1"
+
+
+def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)  # its first commit is the tag v0.0.1
+    (src / "VERSION").write_text("0.0.2\n")
+    _git(src, "commit", "-qam", "second")
+    middle = _git(src, "rev-parse", "HEAD")  # no branch or tag points here
+    (src / "VERSION").write_text("0.0.3\n")
+    _git(src, "commit", "-qam", "third")
+    tip = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", tip[:9], "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert (home / DATA_REL / "current" / ".ref").read_text().strip() == tip
+    old = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", middle[:9], "--minimal")
+    assert old.returncode != 0
+    assert "full 40-character SHA" in old.stderr
+
+
+def _download_stub(root: Path, files: dict[str, bytes]) -> tuple[Path, Path]:
+    """A curl stand-in that serves ``files`` by the last path segment of the URL (go.dev's release list as
+    ``releases.json``), refuses anything else, and logs every URL."""
+    served = root / "served"
+    served.mkdir(parents=True)
+    for name, data in files.items():
+        (served / name).write_bytes(data)
+    log = root / "curl.log"
+    body = (
+        'out=""; url=""\n'
+        'while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\n'
+        f'echo "$url" >>"{log}"\n'
+        'case "$url" in *mode=json*) f=releases.json ;; *) f=${url##*/} ;; esac\n'
+        f'[ -f "{served}/$f" ] || exit 22\n'
+        f'cp "{served}/$f" "$out"\n'
+    )
+    return stub_bin(root, "curl", body), log
+
+
+def _tar_gz(entries: dict[str, str]) -> bytes:
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, text in entries.items():
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), 0o755
+            tar.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _no_uv_path() -> str:
+    return os.pathsep.join(d for d in os.environ["PATH"].split(os.pathsep) if not (Path(d) / "uv").exists())
+
+
+@pytest.mark.skipif(sys.platform != "linux" or os.uname().machine != "x86_64", reason="fixture names the linux x64 uv")
+@pytest.mark.parametrize("published", ["match", "mismatch"])
+def test_a_uv_archive_off_the_pinned_hash_is_refused(tmp_path: Path, published: str) -> None:
+    import hashlib
+
+    archive = _tar_gz({"uv-x86_64-unknown-linux-gnu/uv": "#!/bin/sh\necho planted\n"})
+    digest = hashlib.sha256(archive).hexdigest() if published == "match" else "0" * 64
+    name = "uv-x86_64-unknown-linux-gnu.tar.gz"
+    curl, log = _download_stub(tmp_path, {name: archive, name + ".sha256": f"{digest}  {name}\n".encode()})
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(
+        home,
+        INSTALL,
+        "--from-source",
+        "--minimal",
+        env_extra={"PATH": _no_uv_path()},
+        drop=("K3_NO_DOWNLOAD",),
+        path_front=curl,
+    )
+    assert r.returncode != 0
+    assert "does not match its checksum" in r.stderr
+    assert not (home / ".local" / "bin" / "uv").exists()
+    assert "https://github.com/astral-sh/uv/releases/download/" in log.read_text()
+    assert "astral.sh/uv/install.sh" not in log.read_text()
+
+
+GO_OS = {"linux": "linux", "darwin": "darwin"}.get(sys.platform, "")
+GO_ARCH = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(os.uname().machine, "")
+
+
+@pytest.mark.skipif(not GO_OS or not GO_ARCH, reason="needs a platform go.dev builds for")
+@pytest.mark.parametrize("listed", ["right", "wrong"])
+def test_an_old_go_gets_a_checked_private_go(tmp_path: Path, listed: str) -> None:
+    import hashlib
+    import json
+
+    want = next(ln.split()[1] for ln in (REPO / "panes" / "go.mod").read_text().splitlines() if ln.startswith("go "))
+    fake_go = (
+        "#!/bin/sh\n"
+        f'case "$1" in version) echo "go version go{want} {GO_OS}/{GO_ARCH}" ;;\n'
+        'build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    )
+    archive = _tar_gz({"go/bin/go": fake_go})
+    name = f"go{want}.{GO_OS}-{GO_ARCH}.tar.gz"
+    digest = hashlib.sha256(archive).hexdigest() if listed == "right" else "1" * 64
+    releases = [{"version": f"go{want}", "files": [{"filename": name, "os": GO_OS, "arch": GO_ARCH, "sha256": digest}]}]
+    curl, log = _download_stub(tmp_path, {name: archive, "releases.json": json.dumps(releases, indent=1).encode()})
+    # the go on PATH is too old for panes/go.mod
+    old = stub_bin(tmp_path, "go", 'case "$1" in version) echo "go version go1.20.1 x/y" ;; *) exit 1 ;; esac\n')
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", drop=("K3_NO_DOWNLOAD", "K3_SKIP_GO"), path_front=old)
+    assert r.returncode == 0, r.stderr
+    private = tmp_path / DATA_REL / "go" / f"go{want}" / "bin" / "go"
+    assert f"https://go.dev/dl/{name}" in log.read_text() or listed == "wrong"
+    assert "proxy.golang.org" not in log.read_text()
+    if listed == "right":
+        assert private.is_file()
+        assert (tmp_path / DATA_REL / "current" / "bin" / "k3").is_file()  # built with the private go
+    else:
+        assert not private.exists()
+        assert "did not match the sha256 go.dev lists" in r.stderr
+
+
+def test_credentials_in_urls_never_reach_the_log(tmp_path: Path) -> None:
+    real_git = shutil.which("git")
+    url = "https://alice:s3cr3t-token@example.invalid/x.git"
+    body = (
+        f'case "$*" in *fetch*) echo "fatal: unable to access \'{url}/\': Could not resolve host" >&2\n'
+        "  exit 128 ;; esac\n"
+        f'exec "{real_git}" "$@"\n'
+    )
+    stubs = stub_bin(tmp_path, "git", body)
+    r = run(tmp_path, INSTALL, "--from-git", url, "--ref", "main", path_front=stubs)
+    assert r.returncode != 0
+    log = tmp_path / DATA_REL / "install.log"
+    text = log.read_text()
+    assert "https://***@example.invalid/x.git" in text  # the args line and the fetch error, redacted
+    assert "s3cr3t" not in text and "s3cr3t" not in r.stderr
+    assert log.stat().st_mode & 0o777 == 0o600
+
+
+def test_downloads_are_https_only(tmp_path: Path) -> None:
+    calls = tmp_path / "curl.log"
+    curl = stub_bin(tmp_path, "curl", f'echo "curl $*" >>"{calls}"\nexit 22\n')
+    r = run(
+        tmp_path,
+        INSTALL,
+        "--from-source",
+        "--minimal",
+        env_extra={"PATH": _no_uv_path()},
+        drop=("K3_NO_DOWNLOAD",),
+        path_front=curl,
+    )
+    assert r.returncode != 0  # no uv, and its download "failed"
+    assert "--proto =https --tlsv1.2" in calls.read_text()
+
+
+def test_from_source_builds_the_tui_outside_the_checkout(tmp_path: Path) -> None:
+    src = _mini_checkout(tmp_path)
+    (src / "tui").mkdir()
+    (src / "tui" / "package.json").write_text("{}\n")
+    tools = stub_bin(tmp_path, "node", 'echo "v22.0.0"\n')
+    stub_bin(
+        tmp_path,
+        "npm",
+        'case "$*" in ci*) mkdir -p node_modules ;; "run build") mkdir -p dist && echo built >dist/entry.js ;; esac\n',
+    )
+    r = run(
+        tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", drop=("K3_SKIP_TUI",), path_front=tools
+    )
+    assert r.returncode == 0, r.stderr
+    assert (tmp_path / DATA_REL / "current" / "tui" / "dist" / "entry.js").read_text() == "built\n"
+    assert not (src / "tui" / "node_modules").exists()
+    assert not (src / "tui" / "dist").exists()
+
+
+def test_without_git_a_github_tag_installs_from_its_archive(tmp_path: Path) -> None:
+    sha_rel, sha_rc = "a" * 40, "b" * 40
+    advert = (
+        "001e# service=git-upload-pack\n0000"
+        f"0099{sha_rc} HEAD\0multi_ack symref=HEAD:refs/heads/main\n"
+        f"003f{sha_rc} refs/heads/main\n"
+        f"0041{sha_rel} refs/tags/v0.0.1\n"
+        f"0044{sha_rc} refs/tags/v0.0.2-rc1\n"
+        "0000"
+    )
+    archive = _tar_gz(
+        {"k3fake-0.0.1/VERSION": "0.0.1\n", "k3fake-0.0.1/core/pyproject.toml": "[project]\nname = 'x'\n"}
+    )
+    curl, log = _download_stub(tmp_path, {"refs?service=git-upload-pack": advert.encode(), "v0.0.1": archive})
+    # the macOS /usr/bin/git stub: present on PATH, but fails without the developer tools
+    stub_bin(tmp_path, "git", 'echo "xcode-select: note: no developer tools were found" >&2\nexit 1\n')
+    r = run(tmp_path, INSTALL, "--from-git", "https://github.com/alice/k3fake", "--minimal", path_front=curl)
+    assert r.returncode == 0, r.stderr
+    current = tmp_path / DATA_REL / "current"
+    assert (current / ".ref").read_text().strip() == "v0.0.1"  # the newest tag that is not a pre-release
+    assert current.resolve().name == "0.0.1-src.aaaaaaa"
+    assert "https://codeload.github.com/alice/k3fake/tar.gz/refs/tags/v0.0.1" in log.read_text()
+
+    other = run(tmp_path, INSTALL, "--from-git", "https://example.invalid/x.git", "--minimal", path_front=curl)
+    assert other.returncode != 0
+    assert "git is needed" in other.stderr
+
+
+def test_k3_allow_root_lets_a_root_run_install_like_the_flag(tmp_path: Path) -> None:
+    # `k3code update` re-runs install.sh as root for a root install and cannot pass a flag an older ref would reject
+    ids = stub_bin(tmp_path, "id", 'case "$1" in -u) echo 0 ;; -un) echo root ;; *) echo "uid=0(root)" ;; esac\n')
+    home = tmp_path / "home"
+    home.mkdir()
+    ok = run(home, INSTALL, "--from-source", "--minimal", env_extra={"K3_ALLOW_ROOT": "1"}, path_front=ids)
+    assert ok.returncode == 0, ok.stderr
+    assert (home / DATA_REL / "current").is_symlink()
+
+
+def _fetch_only(root: Path, url: str, tool_body: str, tool: str) -> subprocess.CompletedProcess[str]:
+    """Run install.sh's fetch() alone, with ``tool`` the only downloader on a PATH that holds nothing else."""
+    root.mkdir(parents=True, exist_ok=True)
+    text = INSTALL.read_text().splitlines()
+    keep = [ln for ln in text if ln.startswith("have() ")]
+    start = next(i for i, ln in enumerate(text) if ln.startswith("fetch() {"))
+    end = text.index("}", start)
+    script = root / "fetch.sh"
+    script.write_text("\n".join([*keep, *text[start : end + 1], f'fetch "$1" "{root}/out"', ""]))
+    bin_dir = stub_bin(root, tool, tool_body)
+    return subprocess.run(
+        ["/bin/sh", str(script), url], env={"PATH": str(bin_dir)}, capture_output=True, text=True, check=False
+    )
+
+
+# BusyBox wget (the only downloader on a stock Alpine) rejects --https-only: it must not be passed
+BUSYBOX_WGET = (
+    'for a in "$@"; do case "$a" in --https-only) echo "wget: unrecognized option" >&2; exit 1 ;; esac; done\n'
+)
+
+
+def test_fetch_works_with_a_busybox_wget_and_refuses_plain_http(tmp_path: Path) -> None:
+    good = _fetch_only(tmp_path / "g", "https://example.invalid/x", BUSYBOX_WGET, "wget")
+    assert good.returncode == 0, good.stderr
+    plain = _fetch_only(tmp_path / "p", "http://example.invalid/x", 'touch "$0.called"\n', "wget")
+    assert plain.returncode != 0
+    assert not (tmp_path / "p" / "stubbin" / "wget.called").exists()  # refused before any downloader ran
+
+
+def test_a_bad_signature_on_the_node_checksum_list_skips_the_tui(tmp_path: Path) -> None:
+    served = tmp_path / "served"
+    served.mkdir()
+    (served / "SHASUMS256.txt").write_text(f"{'0' * 64}  node-v22.1.0-linux-x64.tar.gz\n")
+    (served / "SHASUMS256.txt.asc").write_text("signature\n")
+    log = tmp_path / "curl.log"
+    curl_body = (
+        'out=""; url=""\n'
+        'while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift ;; https://*) url=$1 ;; esac; shift; done\n'
+        f'echo "$url" >>"{log}"\n'
+        f'[ -f "{served}/${{url##*/}}" ] || exit 22\n'
+        f'cp "{served}/${{url##*/}}" "$out"\n'
+    )
+    stubs = stub_bin(tmp_path, "curl", curl_body)
+    stub_bin(tmp_path, "node", "exit 1\n")  # no usable node on this machine
+    stub_bin(tmp_path, "gpg", 'echo "[GNUPG:] BADSIG 0123 Node Release"\nexit 1\n')
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(
+        home,
+        INSTALL,
+        "--from-source",
+        "--minimal",
+        env_extra={"K3_SKIP_TUI": "0", "K3_NO_DOWNLOAD": "0"},
+        path_front=stubs,
+    )
+    assert "signature on nodejs.org's SHASUMS256.txt is bad" in r.stderr, r.stderr
+    assert "SHASUMS256.txt.asc" in log.read_text()
+    assert not (home / DATA_REL / "node").exists()

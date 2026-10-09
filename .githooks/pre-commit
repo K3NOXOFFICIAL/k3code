@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# pre-commit: fast checks on the staged files only (a few seconds). Installed by scripts/dev/install-hooks.sh.
+#   staged Python under core/ or scripts/  -> ruff format --check
+#   staged files under tui/                -> prettier --check (only when tui/node_modules is installed)
+#   gitleaks protect --staged              (only when gitleaks is installed)
+# The files are checked as they are on disk. K3CODE_SKIP_HOOKS=1 skips it (with a warning).
+set -euo pipefail
+
+if [ "${K3CODE_SKIP_HOOKS:-}" = 1 ]; then
+  echo "pre-commit: K3CODE_SKIP_HOOKS=1, staged-file checks SKIPPED" >&2
+  exit 0
+fi
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+py=()
+ts=()
+while IFS= read -r f; do
+  [ -f "$f" ] || continue
+  case $f in
+    core/*.py | scripts/*.py) py+=("../$f") ;;
+    tui/*) ts+=("${f#tui/}") ;;
+  esac
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+
+rc=0
+if [ ${#py[@]} -gt 0 ]; then
+  if command -v uv >/dev/null 2>&1; then
+    (cd core && uv run --quiet ruff format --check "${py[@]}") || rc=1
+  else
+    echo "pre-commit: uv not found, ruff format --check skipped" >&2
+  fi
+fi
+if [ ${#ts[@]} -gt 0 ]; then
+  if [ -x tui/node_modules/.bin/prettier ]; then
+    (cd tui && node_modules/.bin/prettier --check --ignore-unknown "${ts[@]}") || rc=1
+  else
+    echo "pre-commit: tui/node_modules not installed, prettier --check skipped" >&2
+  fi
+fi
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks protect --staged --source . --config .gitleaks.toml --redact --no-banner --exit-code 1 || rc=1
+fi
+if [ "$rc" != 0 ]; then
+  echo "pre-commit: fix the findings above (ruff format / npx prettier --write), then commit again" >&2
+fi
+exit "$rc"

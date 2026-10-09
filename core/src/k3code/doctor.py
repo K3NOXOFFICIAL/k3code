@@ -241,10 +241,12 @@ async def check_daemon(sock: Path | None = None) -> Check:
             line = await asyncio.wait_for(reader.readline(), 3)
             if not line:
                 raise ConnectionError("closed")
-            if json.loads(line).get("id") == "doctor":
+            reply = json.loads(line)
+            if reply.get("id") == "doctor":
                 break
         ms = (time.monotonic() - start) * 1000
-        return Check("daemon", OK, f"answering on {sock} ({ms:.0f} ms)", data={"socket": str(sock)})
+        version = str((reply.get("result") or {}).get("version") or "")
+        return Check("daemon", OK, f"answering on {sock} ({ms:.0f} ms)", data={"socket": str(sock), "version": version})
     except (OSError, TimeoutError, ValueError, ConnectionError) as e:
         return Check("daemon", FAIL, f"not answering: {e}", "restart: systemctl --user restart k3code")
     finally:
@@ -260,6 +262,110 @@ def check_systemd() -> Check:
     return Check(
         "systemd-unit", WARN, f"k3code.service is {state}", "systemctl --user start k3code; journalctl --user -u k3code"
     )
+
+
+def check_env_file() -> Check:
+    """The provider-key file the systemd unit loads: owner-only, and in the plain ``KEY=value`` form systemd parses."""
+    from k3code.setup.state import env_file_path
+
+    path = env_file_path()
+    if not path.is_file():
+        return Check("env-file", OK, f"{path} not present (optional)")
+    problems: list[str] = []
+    fixes: list[str] = []
+    mode = path.stat().st_mode & 0o777
+    if mode != 0o600:
+        problems.append(f"mode is {mode:04o}, expected 0600")
+        fixes.append(f"chmod 600 {path}")
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError as e:
+        return Check("env-file", WARN, f"cannot read {path}: {e}", f"chmod 600 {path}")
+    exported = [n for n, ln in enumerate(lines, 1) if ln.lstrip().startswith("export ")]
+    if exported:
+        problems.append(
+            "systemd EnvironmentFile rejects 'export'; the daemon won't see those variables "
+            f"(line {', '.join(map(str, exported[:5]))})"
+        )
+        fixes.append(f"remove the leading 'export ' in {path}")
+    if problems:
+        return Check("env-file", WARN, f"{path}: " + "; ".join(problems), "; ".join(fixes))
+    return Check("env-file", OK, f"{path} mode 0600")
+
+
+def check_linger() -> Check:
+    """A user unit stops at logout unless lingering is on."""
+    if not service.is_installed():
+        return Check("linger", OK, "no systemd unit installed; nothing to keep running")
+    import getpass
+
+    user = getpass.getuser()
+    if shutil.which("loginctl") is None:
+        return Check("linger", OK, "loginctl not found; cannot tell")
+    try:
+        r = subprocess.run(
+            ["loginctl", "show-user", user, "-p", "Linger"], capture_output=True, text=True, check=False, timeout=5
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return Check("linger", OK, "loginctl did not answer; cannot tell")
+    value = r.stdout.strip().partition("=")[2]
+    if r.returncode != 0 or not value:
+        return Check("linger", OK, "loginctl could not report lingering; cannot tell")
+    if value == "yes":
+        return Check("linger", OK, "lingering enabled; the daemon survives logout")
+    return Check(
+        "linger", WARN, "daemon stops at logout (lingering is off)", f"loginctl enable-linger {user} (needs sudo)"
+    )
+
+
+def check_daemon_version(running: str | None) -> Check:
+    """A daemon started before an update keeps running the old code until it is restarted."""
+    from k3code.paths import data_dir
+
+    link = data_dir() / "current"
+    if not running or not link.is_symlink():
+        return Check("daemon-version", OK, "not comparable (daemon not running or no installed `current`)")
+    name = link.resolve().name
+    # a version dir is "<version>" or "<version>-src.<sha>"
+    if name == running or name.startswith(f"{running}-"):
+        return Check("daemon-version", OK, f"daemon runs {running}")
+    return Check(
+        "daemon-version",
+        WARN,
+        f"daemon runs {running} but the installed version is {name}",
+        "restart the daemon: systemctl --user restart k3code",
+        {"running": running, "installed": name},
+    )
+
+
+def check_install_links() -> Check:
+    """``current`` must point at a version dir, and ``previous`` (the rollback target) must still exist."""
+    from k3code.paths import data_dir
+
+    data = data_dir()
+    current = data / "current"
+    if not current.is_symlink():
+        return Check("install-links", OK, "no installed `current` (dev checkout or not installed)")
+    if not current.exists():
+        return Check(
+            "install-links",
+            WARN,
+            f"`current` points at {os.readlink(current)}, which is missing",
+            "re-run the installer, or point `current` at a directory in versions/",
+        )
+    previous = data / "previous"
+    try:
+        prev_name = previous.read_text().strip() if previous.is_file() else ""
+    except OSError:
+        prev_name = ""
+    if prev_name and not (data / "versions" / prev_name).is_dir():
+        return Check(
+            "install-links",
+            WARN,
+            f"`previous` names version {prev_name}, which is missing: rollback is not possible",
+            f"update again to refresh it, or remove {previous}",
+        )
+    return Check("install-links", OK, f"current -> {current.resolve().name}")
 
 
 def find_repo_root() -> Path | None:
@@ -397,7 +503,27 @@ def check_browser() -> Check:
     location = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or data_dir() / "browsers")
     has_chromium = location.is_dir() and any(location.glob("chromium*"))
     if has_playwright and has_chromium:
-        return Check("browser", OK, f"Playwright and Chromium at {location}", data={"path": str(location)})
+        # a directory is not a browser: look for the executable (never launched here)
+        binary = next(
+            (
+                p
+                for d in location.glob("chromium*")
+                for name in ("chrome", "headless_shell", "chrome.exe")
+                for p in d.rglob(name)
+                if p.is_file() and os.access(p, os.X_OK)
+            ),
+            None,
+        )
+        if binary is None:
+            return Check(
+                "browser",
+                WARN,
+                f"Chromium directory at {location} has no executable browser; the browser tool is off",
+                "re-run the installer without --minimal",
+            )
+        return Check(
+            "browser", OK, f"Playwright and Chromium at {location}", data={"path": str(location), "exe": str(binary)}
+        )
     if has_playwright or has_chromium:
         missing = "Chromium" if has_playwright else "Playwright"
         return Check(
@@ -467,9 +593,14 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
     checks.append(check_keys(config))
     checks.append(await check_netwatch_async() if probe else Check("netwatch", OK, "probe skipped"))
     checks += [check_disk(home), check_psi()]
-    checks.append(await check_daemon() if probe else Check("daemon", OK, "probe skipped"))
+    daemon_check = await check_daemon() if probe else Check("daemon", OK, "probe skipped")
+    checks.append(daemon_check)
     checks += [
+        check_daemon_version(daemon_check.data.get("version")),
         check_systemd(),
+        check_linger(),
+        check_env_file(),
+        check_install_links(),
         check_tui(),
         check_home(home),
         check_journal(home),

@@ -222,6 +222,14 @@ class Reliability:
         self._emit_guard(outcome)
         return outcome
 
+    def observe_tool_result(self, call: ToolCall, failure: str | None, describe: str = "") -> GuardOutcome | None:
+        """Loop-guard check for a finished tool call (``failure``: its error signature, None on success)."""
+        if self.loop_guard is None:
+            return None
+        outcome = self.loop_guard.observe_tool_result(call.name, call.arguments, failure, describe)
+        self._emit_guard(outcome)
+        return outcome
+
     def observe_assistant(self, content: str | None) -> GuardOutcome | None:
         """Loop-guard check for an assistant message without tool calls."""
         if self.loop_guard is None:

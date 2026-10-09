@@ -15,6 +15,7 @@ Rules:
   - Do not stop to announce next steps; keep calling tools until the task is done.
 - Keep your context small: read files in focused ranges, never dump huge files or `node_modules`, and pipe long command output through `tail` or `head`.
 - Write tests for what you build. Run them and make them pass before finishing.
+- Verification: run `scripts/ci/check.sh` (full) before pushing to Main; `--changed` while iterating.
 - Keep the code style consistent: Python 3.12+, type hints, `ruff`-clean, small modules.
 - Do not push and do not create PRs. Commit your work on the current branch with clear messages, ending with:
   `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`

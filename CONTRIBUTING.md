@@ -26,11 +26,24 @@ Do not run `go test ./...` in `panes/`. Its upstream remote-sync tests recurse w
 
 License bookkeeping is checked with `python3 scripts/vendor_check.py`.
 
-CI runs the core, TUI, panes and vendor checks on every pull request (`.github/workflows/ci.yml`). A secret scan runs too (`.github/workflows/gitleaks.yml`). The CI core job runs `uv run ruff check . ../scripts`, `uv run ruff format --check . ../scripts` and `uv run pytest -q` in `core/`, so `core/scripts` and the top-level `scripts/` are linted and format-checked too.
+## Local CI
+
+There are no GitHub Actions. The checks run on your machine with `scripts/ci/check.sh`, which runs every area CI used to run: `core` (`uv run ruff check . ../scripts`, `uv run ruff format --check . ../scripts`, `uv run pytest -q` in `core/`, so `core/scripts` and the top-level `scripts/` are linted too), `tui`, `panes`, `vendor`, `secrets` (gitleaks) and `shell` (shellcheck). It prints a summary table and keeps the logs in `.k3dev/ci/`.
+
+```sh
+scripts/ci/check.sh              # the full check: run it before you push to Main or open a PR for review
+scripts/ci/check.sh --changed    # only the areas your branch touches: use it while iterating
+scripts/ci/check.sh --quick      # lint and format only
+scripts/dev/install-hooks.sh     # once per clone: pre-commit (staged files) and pre-push (--quick; full for Main and tags)
+```
+
+Verification: run `scripts/ci/check.sh` (full) before pushing to Main; `--changed` while iterating.
+
+A missing tool (uv, Node, Go, gitleaks, shellcheck) fails its area with a line on how to install it. Maintainers merge pull requests with `scripts/ci/merge-pr.sh <number>`: it merges `Main` into the PR in a temporary worktree, runs the full check, and only then pushes, sets the `local-ci` status that branch protection requires and merges. Releases are made with `scripts/release/release.sh`. Both are described in [`docs/RELEASING.md`](docs/RELEASING.md).
 
 ## Before you open a pull request
 
-- The core test suite and `ruff check src tests` must pass.
+- `scripts/ci/check.sh` must pass; paste its summary table into the pull request.
 - A behaviour change needs a test. A bug fix needs a test that fails without the fix.
 - Security-sensitive code (permissions, the hardline list, the sandbox, the daemon socket, redaction, bundle import and export, the updater) needs a test and a line in `CHANGELOG.md`.
 - Do not commit secrets, not even in tests. Use obviously fake values, and build them at run time when they would match a secret pattern. The secret scan fails on new matches.

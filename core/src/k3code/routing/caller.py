@@ -130,6 +130,8 @@ class ModelCaller:
                 tokens_in=pt,
                 tokens_out=ct,
                 cost_usd=usage.cost_usd if usage else None,
+                cache_read=usage.cache_read_tokens if usage else 0,
+                cache_write=usage.cache_creation_tokens if usage else 0,
                 tier=tier.value,
                 task_kind=kind.value,
                 turn=self._turn_of(session_id) if self._turn_of else "",

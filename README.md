@@ -83,7 +83,7 @@ To install from the checkout you already have, use `sh install/install.sh --from
 
 The installer creates a versioned install under `~/.local/share/k3code/` and links `k3code` into `~/.local/bin/` (put that on your `PATH`), and links `k3` too. It never runs onboarding; it ends by telling you to run `k3code onboard`. Re-running it upgrades in place and keeps the previous version for rollback.
 
-Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--no-install-deps` (fetch nothing; fail or skip with hints instead), `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`), `--minimal` (skips presetup, below). Uninstall with `sh install/uninstall.sh`; it removes the versions, the links and the Chromium location under `~/.local/share/k3code`, and keeps your data (`~/.k3code`, `~/.config/k3code`) unless you pass `--purge`.
+Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--no-install-deps` (fetch nothing; fail or skip with hints instead), `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`), `--minimal` (skips presetup, below), `--force` (replace a `k3code` or `k3` in `~/.local/bin` that is not this installer's link), `--allow-root` (the installer refuses root and sudo otherwise, for example for a container). Uninstall with `sh install/uninstall.sh`; it removes the versions, the links and the Chromium location under `~/.local/share/k3code`, and keeps your data (`~/.k3code`, `~/.config/k3code`) unless you pass `--purge`, which asks you to type `yes` (`--purge --yes` without asking).
 
 **Presetup** runs after the install and is on by default; it never fails the install. It checks the sandbox (`bwrap`): when it is missing, it prints the install command for your distribution and runs nothing (it asks for a `sudo` run only on an interactive terminal, never with `--yes`). It installs Chromium for the browser tool (the headless shell, about 115 MiB download and about 266 MB on disk; `K3CODE_SKIP_CHROMIUM=1` skips only this), and prints a health subset (`k3code doctor --install`, warnings only). `--minimal` skips all of it.
 
@@ -319,7 +319,12 @@ Run each block from the repository root.
 
 # license bookkeeping
 python3 scripts/vendor_check.py
+
+# or all of the above, as the merge gate runs it (summary table, logs in .k3dev/ci/)
+scripts/ci/check.sh
 ```
+
+There are no GitHub Actions: checks, merges and releases run locally ([`docs/RELEASING.md`](docs/RELEASING.md)).
 
 - **Exit checks:** `scripts/exit/run_all.sh [--soak-minutes N] [--only m0,m1,…]` runs every check (real-TUI scripted flows, daemon and chaos tests, the panes tests, a clean-install test in a Fedora 44 podman container, and a 30-minute daemon soak in the background) and **overwrites the tracked** `docs/reports/exit-status.md`. Expect 30–40 minutes (an untested estimate) and heavy CPU, RAM and disk use. It needs `bash`, `python3`, `uv`, `node` (with the TUI built first), `go`, and optionally `podman`. Live-model rows stay pending while the provider quota is exhausted.
 - **How it was built:** most of the code was written by headless coding agents driven by `scripts/dev/omni-worker.sh` from the task specs in `scripts/dev/tasks/`. Each task produced a branch and a report in `docs/reports/`. Those scripts are internal build tooling; you do not need them to build, test or use k3code.
@@ -354,7 +359,7 @@ What is not verified yet:
 
 - **Live models.** Many scripted checks use a scripted fake provider. The live-model rows ran through the `claude-cli` provider (a local Claude Code login), not through a gateway.
 - **Long unattended runs.** A 30-minute daemon soak passed. The 72-hour soak is pending.
-- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. CI runs the installer tests on macOS; Windows (`install.ps1` via WSL) is tested only against a stand-in for `wsl.exe` on Linux.
+- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. The installer tests ran on macOS while CI ran on GitHub Actions; a macOS run is now a manual step before a release ([`docs/RELEASING.md`](docs/RELEASING.md)). Windows (`install.ps1` via WSL) is tested only against a stand-in for `wsl.exe` on Linux.
 - **Updates.** There is no release yet, so the update and rollback path has only been tested against local version directories.
 
 | | Milestone | Built | Verified so far |
@@ -365,7 +370,7 @@ What is not verified yet:
 | **M3** | `k3` keymap, agent states and approvals in panes | ✅ | Keymap tests and the live pane-badge check pass; the first-time-user test is pending |
 | **M4** | Plan-first and scope gate, tiers, fan-out, `/ultra*`, `/preview`, `/advisor`, loops, cron, automations | ✅ | All exit rows pass except the 30-task scope eval: its 30 labels are proposed and not yet confirmed |
 | **M5** | Learning, proposals, project preparation, self-optimizer | ✅ | Demo and tests pass; live mem0 and 2 weeks of use are pending |
-| **M6** | Installer, guided setup, update with rollback, release CI | ✅ | A clean Fedora 44 container installs in about a minute; setup resume, `--from-bundle` and update rollback pass. The upstream-sync check passes under the agreed policy: TUIOS stays mergeable (0 conflicting files) and the heavily modified Hermes TUI is a documented frozen fork whose upstream fixes are cherry-picked by hand ([`docs/UPSTREAM.md`](docs/UPSTREAM.md)) |
+| **M6** | Installer, guided setup, update with rollback, release script | ✅ | A clean Fedora 44 container installs in about a minute; setup resume, `--from-bundle` and update rollback pass. The upstream-sync check passes under the agreed policy: TUIOS stays mergeable (0 conflicting files) and the heavily modified Hermes TUI is a documented frozen fork whose upstream fixes are cherry-picked by hand ([`docs/UPSTREAM.md`](docs/UPSTREAM.md)) |
 
 
 ---

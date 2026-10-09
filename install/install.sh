@@ -33,7 +33,9 @@ TMP=""
 BUILDING=""
 REQS=""
 UV_TMP=""
+TUI_TMP=""
 GIT_ERR=""
+LOCK=""
 
 usage() {
   cat <<EOF
@@ -53,6 +55,8 @@ Options:
   --no-install-deps     install nothing (no uv, Python, Node, Go); fail or skip with the hints instead
   --minimal             skip presetup: no sandbox check, no Chromium, no doctor subset
   --check               print the platform and dependency report, change nothing
+  --allow-root          install as root anyway (for example in a container); refused by default
+  --force               replace a k3code or k3 in the bin directory that this installer did not create
   --no-activate         build the version without switching to it (used by k3code update)
   --print-version       print the version name on stdout (used by k3code update)
   -h, --help
@@ -67,9 +71,16 @@ EOF
 }
 
 # ---- output ----------------------------------------------------------------
+redact() { # redact TEXT: credentials in URLs (https://user:token@host) become ***
+  case "$*" in
+    *://*@*) printf '%s\n' "$*" | sed 's#://[^/@[:space:]]*@#://***@#g' ;;
+    *) printf '%s\n' "$*" ;;
+  esac
+}
 say() { # say TEXT: stderr and the install log, no prefix (hints stay copy-pasteable)
-  printf '%s\n' "$*" >&2
-  if [ -n "$INSTALL_LOG" ]; then printf '%s\n' "$*" >>"$INSTALL_LOG" 2>/dev/null || true; fi
+  msg=$(redact "$*")
+  printf '%s\n' "$msg" >&2
+  if [ -n "$INSTALL_LOG" ]; then printf '%s\n' "$msg" >>"$INSTALL_LOG" 2>/dev/null || true; fi
 }
 log() { say "k3code-install: $*"; }
 die() {
@@ -82,17 +93,25 @@ cleanup() {
   if [ -n "$BUILDING" ]; then rm -rf "$BUILDING"; fi
   if [ -n "$TMP" ]; then rm -rf "$TMP"; fi
   if [ -n "$REQS" ]; then rm -f "$REQS"; fi
-  if [ -n "$UV_TMP" ]; then rm -f "$UV_TMP"; fi
+  if [ -n "$UV_TMP" ]; then rm -rf "$UV_TMP"; fi
+  if [ -n "$TUI_TMP" ]; then rm -rf "$TUI_TMP"; fi
   if [ -n "$GIT_ERR" ]; then rm -f "$GIT_ERR"; fi
+  if [ -n "$LOCK" ]; then rm -rf "$LOCK"; fi
   if [ "$rc" -ne 0 ]; then say "k3code-install: FAILED (exit $rc)${INSTALL_LOG:+. Log: $INSTALL_LOG}"; fi
   exit "$rc"
 }
 
 # ---- helpers ---------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+have_git() { git --version >/dev/null 2>&1; } # macOS ships a /usr/bin/git stub that fails without the developer tools
 
-fetch() { # fetch URL FILE
-  if have curl; then curl -fsSL --retry 3 "$1" -o "$2"; else wget -q --tries=3 -O "$2" "$1"; fi
+fetch() { # fetch URL FILE: https only, whichever downloader is there
+  case "$1" in https://*) ;; *) return 1 ;; esac
+  if have curl; then
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$1" -o "$2"
+  else # BusyBox wget (Alpine) has no --https-only and GNU wget applies it only to recursive fetches: the case above is the guard
+    wget -q --tries=3 -O "$2" "$1"
+  fi
 }
 
 ask_tty() { # ask_tty QUESTION: asks on the terminal only, never with --yes; no terminal means no
@@ -114,6 +133,42 @@ as_root() { # as_root CMD...: root directly, or through sudo only after a person
 }
 
 node_major() { "$1" --version 2>/dev/null | sed 's/^v//; s/\..*//'; }
+
+home_of() { # home_of USER: that user's home directory, empty when unknown
+  case "$1" in '' | *[!A-Za-z0-9._-]*) return 0 ;; esac
+  h=$(eval "printf '%s' ~$1")
+  case "$h" in /*) printf '%s' "$h" ;; esac
+}
+
+# The install belongs to the user whose home it is in. Root (sudo included) would leave root-owned files there, or
+# install into root's home; --allow-root is for a deliberate root install such as a container. `k3code update` runs
+# this script as root again for such an install and says so with K3_ALLOW_ROOT=1 (an older installer would reject a flag).
+check_user() {
+  if [ "$ALLOW_ROOT" = 1 ] || [ "${K3_ALLOW_ROOT:-0}" = 1 ]; then return 0; fi
+  if [ "$(id -u)" = 0 ]; then
+    die "refusing to run as root${SUDO_USER:+ (through sudo)}: run the installer as the user who will use k3code, without sudo (--allow-root installs for root, for example in a container)"
+  fi
+  if [ -n "${SUDO_USER:-}" ]; then # sudo -u: HOME must be the home of the user this runs as
+    h=$(home_of "$(id -un)")
+    if [ -n "$h" ] && [ "$h" != "$HOME" ]; then
+      die "HOME is $HOME but this runs as $(id -un) (home $h) through sudo: run it as that user with their HOME (sudo -H), or as yourself without sudo"
+    fi
+  fi
+  return 0
+}
+
+take_lock() { # one installer at a time per install root; the lock goes when this run exits
+  if mkdir "$DATA/.install.lock" 2>/dev/null; then
+    LOCK=$DATA/.install.lock
+    printf '%s\n' "$$" >"$LOCK/pid"
+    return 0
+  fi
+  pid=$(cat "$DATA/.install.lock/pid" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    die "another install into $DATA is running (pid $pid); wait for it to finish"
+  fi
+  die "an install lock from pid ${pid:-unknown} is left in $DATA/.install.lock, and that process is not running: if no other install runs, remove it (rm -r '$DATA/.install.lock') and re-run"
+}
 
 # ---- platform and package manager ------------------------------------------
 detect_platform() {
@@ -255,7 +310,7 @@ report() {
   say "k3code-install: platform $PLATFORM $ARCH${DISTRO:+, $DISTRO}; package manager: ${PM:-none found}"
   say "dependencies:"
   if find_uv; then item ok "uv"; else
-    item missing "uv" "required; installed from astral.sh after a notice (or by you, see below)"
+    item missing "uv" "required; uv $UV_VERSION is fetched from its release archive, sha256 pinned (or install it yourself, see below)"
     say "      $(hint_cmd uv)"
     if ! have curl && ! have wget; then
       item missing "curl or wget" "needed to install uv"
@@ -266,8 +321,8 @@ report() {
     item missing "python 3.12+" "uv downloads a managed one when needed"
     say "      $(hint_cmd python)"
   fi
-  if have git; then item ok "git"; else
-    item missing "git" "needed for --from-git, the default"
+  if have_git; then item ok "git"; else
+    item missing "git" "used by --from-git, the default; without it only GitHub URLs install (as archives)"
     say "      $(hint_cmd git)"
   fi
   if [ "$NODE_OK" = 1 ]; then item ok "node 20+ with npm"; else
@@ -295,28 +350,91 @@ report() {
   return 0
 }
 
+# uv is fetched as a release archive of this pinned version, never through a moving install script. The archive has to
+# match both the .sha256 file published next to it and the hash pinned here.
+UV_VERSION=0.12.24
+uv_pinned_sha256() { # uv_pinned_sha256 TARGET
+  case "$1" in
+    x86_64-unknown-linux-gnu) echo b4dfaef47d491a7296981f8374a4595f55dbf84e8937c8ecd2983574d8bb3da6 ;;
+    aarch64-unknown-linux-gnu) echo 5231be65f496304623895dacdbf1de8504fec90303684bdf05805aa34414dd21 ;;
+    x86_64-unknown-linux-musl) echo 48170bd200a5430298c18f3b264485a1f3a8605f01088277daf6e37633edf0f5 ;;
+    aarch64-unknown-linux-musl) echo 7f9ab4726d743b6a92e310477a7840c8a8a7b3938cb3c4657d541342fca75011 ;;
+    x86_64-apple-darwin) echo 4fa82e37cb94767661f532b001e470b67a186c7260e305bd84ddb78fd545c0b6 ;;
+    aarch64-apple-darwin) echo 0c4346de7abdb49495b393b9ec809fe387aa43e586be20fecb972216c1e71732 ;;
+  esac
+}
+
+uv_target() { # the uv release target for this machine
+  case "$GO_ARCH" in amd64) a=x86_64 ;; *) a=aarch64 ;; esac
+  if [ "$PLATFORM" = macOS ]; then
+    echo "$a-apple-darwin"
+  elif [ "$MUSL" = 1 ]; then
+    echo "$a-unknown-linux-musl"
+  else
+    echo "$a-unknown-linux-gnu"
+  fi
+}
+
 ensure_uv() {
   if find_uv; then return 0; fi
   if [ "$NO_DEPS" = 1 ]; then die "uv is missing and --no-install-deps is set; install it: $(hint_cmd uv)"; fi
-  if ! have curl && ! have wget; then die "curl or wget is needed to install uv: $(hint_cmd curl)"; fi
-  log "uv is missing: installing it into $BIN with its official installer (https://astral.sh/uv/install.sh)"
-  UV_TMP=$(mktemp "${TMPDIR:-/tmp}/uv-install.XXXXXX")
-  fetch https://astral.sh/uv/install.sh "$UV_TMP" ||
-    die "could not download the uv installer (no network?); install uv yourself: $(hint_cmd uv)"
-  UV_NO_MODIFY_PATH=1 UV_INSTALL_DIR="$BIN" sh "$UV_TMP" >&2 || die "the uv installer failed (output above); install uv yourself: $(hint_cmd uv)"
-  rm -f "$UV_TMP"
+  if ! can_fetch; then die "curl or wget is needed to install uv: $(hint_cmd curl)"; fi
+  target=$(uv_target)
+  pinned=$(uv_pinned_sha256 "$target")
+  base=https://github.com/astral-sh/uv/releases/download/$UV_VERSION
+  log "uv is missing: installing uv $UV_VERSION ($target) into $BIN from its release archive (sha256 pinned in this script)"
+  UV_TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-uv.XXXXXX")
+  if ! { fetch "$base/uv-$target.tar.gz" "$UV_TMP/uv.tar.gz" && fetch "$base/uv-$target.tar.gz.sha256" "$UV_TMP/uv.sha256"; }; then
+    die "could not download uv $UV_VERSION (no network?); install uv yourself: $(hint_cmd uv)"
+  fi
+  got=$(sha256_of "$UV_TMP/uv.tar.gz")
+  published=$(cut -d' ' -f1 <"$UV_TMP/uv.sha256")
+  if [ "$got" != "$published" ] || [ "$got" != "$pinned" ]; then
+    die "the uv download does not match its checksum (sha256 $got; the release lists ${published:-nothing}, this installer pins $pinned): nothing was installed"
+  fi
+  tar -xzf "$UV_TMP/uv.tar.gz" -C "$UV_TMP" || die "could not unpack the uv archive"
+  mkdir -p "$BIN"
+  for x in uv uvx; do
+    [ -f "$UV_TMP/uv-$target/$x" ] || continue
+    if ! { cp "$UV_TMP/uv-$target/$x" "$BIN/.$x.new" && chmod 755 "$BIN/.$x.new" && mv -f "$BIN/.$x.new" "$BIN/$x"; }; then
+      die "could not write $BIN/$x"
+    fi
+  done
+  rm -rf "$UV_TMP"
   UV_TMP=""
   find_uv || die "uv installation failed"
 }
 
-find_go() { # sets GO to a go on PATH, else the newest one fetched into DATA/go
-  GO=""
-  if have go; then
-    GO=$(command -v go)
-    return 0
-  fi
-  for g in "$DATA"/go/go*/bin/go; do
-    if [ -x "$g" ]; then GO=$g; fi
+version_ge() { # version_ge A B: dotted version A is B or newer (three numeric parts at most)
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    split(a, x, "."); split(b, y, ".")
+    for (i = 1; i <= 3; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+    exit 0
+  }'
+}
+
+go_version_of() { GOTOOLCHAIN=local "$1" version 2>/dev/null | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p'; }
+
+go_wanted() { # the Go release panes/go.mod asks for, named the way go.dev names it (go 1.22 is go1.22.0)
+  v=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$SRC_ROOT/panes/go.mod" 2>/dev/null | head -n 1)
+  case "$v" in
+    1.*.*) ;;
+    1.*) if [ "${v#1.}" -ge 21 ] 2>/dev/null; then v="$v.0"; fi ;;
+  esac
+  printf '%s' "$v"
+}
+
+# Sets GO to a go that is GO_WANT or newer (the one on PATH first, then the one fetched into DATA/go). Without one,
+# GO is an older go if there is any (GO_OLD=1): go build may still fetch its own toolchain.
+find_go() {
+  GO="" GO_OLD=0
+  for g in "$(command -v go 2>/dev/null || true)" "$DATA"/go/go*/bin/go; do
+    if [ -z "$g" ] || [ ! -x "$g" ]; then continue; fi
+    if [ -z "${GO_WANT:-}" ] || version_ge "$(go_version_of "$g")" "$GO_WANT"; then
+      GO=$g GO_OLD=0
+      return 0
+    fi
+    if [ -z "$GO" ]; then GO=$g GO_OLD=1; fi
   done
   [ -n "$GO" ]
 }
@@ -332,6 +450,12 @@ ensure_node() { # a private Node 22 LTS in DATA/node/<ver>, checked against node
     rm -rf "$t"
     return 0
   fi
+  if have gpg && fetch "$base/SHASUMS256.txt.asc" "$t/SHASUMS256.txt.asc" &&
+    gpg --status-fd 1 --verify "$t/SHASUMS256.txt.asc" "$t/SHASUMS256.txt" 2>/dev/null | grep -q '^\[GNUPG:\] BADSIG '; then
+    log "WARNING: the signature on nodejs.org's SHASUMS256.txt is bad; the TUI is skipped (k3code uses the line REPL)"
+    rm -rf "$t"
+    return 0
+  fi # no gpg, no .asc or a key gpg does not know passes silently: the checksum list over https is the baseline
   line=$(grep " node-v[0-9.]*-$NODE_OS-$NODE_ARCH\.tar\.gz\$" "$t/SHASUMS256.txt" | head -n 1)
   name=${line##* }
   want=${line%% *}
@@ -350,49 +474,48 @@ ensure_node() { # a private Node 22 LTS in DATA/node/<ver>, checked against node
   find_node
 }
 
-ensure_go() { # the Go toolchain panes/go.mod asks for, from the Go module proxy, in DATA/go/go<ver>
-  if [ "${K3_SKIP_GO:-0}" = 1 ] || find_go || [ "$NO_DEPS" = 1 ] || ! can_fetch; then return 0; fi
-  gv=$(sed -n 's/^go \([0-9][0-9.]*\)$/\1/p' "$SRC_ROOT/panes/go.mod" | head -n 1)
-  [ -n "$gv" ] || return 0
-  name="v0.0.1-go$gv.$GO_OS-$GO_ARCH"
+go_sha256() { # go_sha256 JSON FILE: the sha256 go.dev lists for the download FILE
+  s=$(awk -v f="\"filename\": \"$2\"" 'index($0, f) { on = 1 } on && /"sha256":/ { sub(/.*"sha256": *"/, ""); sub(/".*/, ""); print; exit }' "$1")
+  case "$s" in *[!0-9a-f]* | "") return 0 ;; esac
+  if [ ${#s} -eq 64 ]; then printf '%s' "$s"; fi
+}
+
+ensure_go() { # the Go release panes/go.mod asks for, from go.dev, checked against the sha256 go.dev lists for it
+  if [ "${K3_SKIP_GO:-0}" = 1 ]; then return 0; fi
+  GO_WANT=$(go_wanted)
+  if find_go && [ "$GO_OLD" != 1 ]; then return 0; fi
+  if [ "$NO_DEPS" = 1 ] || ! can_fetch || [ -z "$GO_WANT" ]; then return 0; fi
+  gv=$GO_WANT
+  name="go$gv.$GO_OS-$GO_ARCH.tar.gz"
   t=$(mktemp -d "${TMPDIR:-/tmp}/k3code-go.XXXXXX")
-  log "fetching Go $gv ($GO_OS-$GO_ARCH) into $DATA/go to build the k3 pane binary"
-  if fetch "https://proxy.golang.org/golang.org/toolchain/@v/$name.zip" "$t/go.zip" && unpack_zip "$t/go.zip" "$t"; then
+  log "fetching Go $gv ($GO_OS-$GO_ARCH) into $DATA/go to build the k3 pane binary${GO:+ ($GO is older)}"
+  want=""
+  if fetch "https://go.dev/dl/?mode=json&include=all" "$t/releases.json"; then want=$(go_sha256 "$t/releases.json" "$name"); fi
+  if [ -z "$want" ]; then
+    log "WARNING: no sha256 for $name from go.dev (unreachable, or no such release); Go is not downloaded"
+  elif fetch "https://go.dev/dl/$name" "$t/$name" && [ "$(sha256_of "$t/$name")" = "$want" ] &&
+    tar -xzf "$t/$name" -C "$t" && [ -x "$t/go/bin/go" ]; then
     mkdir -p "$DATA/go"
     rm -rf "$DATA/go/go$gv"
-    mv "$t/golang.org/toolchain@$name" "$DATA/go/go$gv"
+    mv "$t/go" "$DATA/go/go$gv"
     for d in "$DATA"/go/go*; do # keep only this toolchain
       if [ "$d" != "$DATA/go/go$gv" ]; then rm -rf "$d"; fi
     done
   else
-    log "WARNING: the Go download failed; the k3 pane binary is skipped"
+    log "WARNING: the Go download failed or did not match the sha256 go.dev lists; nothing was installed"
   fi
   rm -rf "$t"
   find_go || true
 }
 
-unpack_zip() { # unpack_zip ZIP DIR: unzip, else Python's zipfile (which drops the exec bits: restore them)
-  if have unzip; then
-    unzip -q "$1" -d "$2"
-    return $?
-  fi
-  py=$PY_FOUND
-  if [ -z "$py" ] && [ -x "$VERDIR/venv/bin/python" ]; then py=$VERDIR/venv/bin/python; fi
-  [ -n "$py" ] || return 1
-  "$py" -m zipfile -e "$1" "$2" || return 1
-  for x in "$2"/golang.org/toolchain@*/bin "$2"/golang.org/toolchain@*/pkg/tool; do
-    if [ -d "$x" ]; then chmod -R u+x "$x"; fi
-  done
-}
-
 ensure_bwrap() { # Linux sandbox: through the package manager, as root or after a yes at a terminal
   if [ "$PLATFORM" != Linux ] || have bwrap || [ "$NO_DEPS" = 1 ] || [ -z "$PM" ] || [ "$PM" = brew ]; then return 0; fi
-  # Never sudo unattended: a passwordless sudo is not consent. Root installs directly; anyone else is asked at a
-  # terminal (never with --yes, never without a tty), and sudo then asks for the password itself.
-  if [ "$(id -u)" != 0 ] && [ "${ROOT_APPROVED:-0}" != 1 ] && [ "$YES" != 1 ] && [ -t 0 ] && [ -t 1 ] && have sudo; then
-    printf 'Install bubblewrap now with sudo (it asks for your password)? [y/N] ' >&2
-    read -r ans || ans=
-    case "$ans" in y | Y | yes | YES) ROOT_APPROVED=1 ;; esac
+  # Never sudo unattended: a passwordless sudo is not consent. Root installs directly; anyone else is asked on the
+  # terminal (/dev/tty: stdin is /dev/null or the piped script; never with --yes, never without a terminal), and sudo
+  # then asks for the password itself.
+  if [ "$(id -u)" != 0 ] && [ "${ROOT_APPROVED:-0}" != 1 ] && have sudo; then
+    BWRAP_ASKED=1
+    if ask_tty "Install bubblewrap now with sudo (it asks for your password)?"; then ROOT_APPROVED=1; fi
   fi
   if [ "$(id -u)" != 0 ] && [ "${ROOT_APPROVED:-0}" != 1 ]; then
     log "bubblewrap (the sandbox for unattended runs) needs root to install: $(hint_cmd bwrap)"
@@ -412,14 +535,66 @@ ensure_bwrap() { # Linux sandbox: through the package manager, as root or after 
   return 0
 }
 
-default_ref() { # latest v* tag on the remote, else Main; fails (prints nothing) when the remote cannot be reached
+default_ref() { # latest v* release tag on the remote (never a pre-release such as v1.2.0-rc1), else Main; fails
+  # (prints nothing) when the remote cannot be reached
   if [ "$CHANNEL" = dev ]; then
     echo Main
     return 0
   fi
+  if [ "$NO_GIT" = 1 ]; then
+    out=$(remote_refs) || return 1
+    t=$(printf '%s\n' "$out" | sed -n 's#.*refs/tags/v\([0-9][^/^-]*\)$#\1#p' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
+    if [ -n "$t" ]; then echo "v$t"; else echo Main; fi
+    return 0
+  fi
   out=$(git ls-remote --tags --refs --sort=-v:refname "$GIT_URL" 2>"$GIT_ERR") || return 1
-  t=$(printf '%s\n' "$out" | sed -n 's#.*refs/tags/\(v[0-9][^/]*\)$#\1#p' | head -n 1)
+  t=$(printf '%s\n' "$out" | sed -n 's#.*refs/tags/\(v[0-9][^/-]*\)$#\1#p' | head -n 1)
   echo "${t:-Main}"
+}
+
+# Without git, a GitHub repository is read over HTTPS: its ref list (what git ls-remote reads) and codeload archives.
+github_slug() { # OWNER/REPO of an https://github.com URL; fails for any other URL
+  s=${GIT_URL#https://github.com/}
+  [ "$s" != "$GIT_URL" ] || return 1
+  s=${s%/}
+  s=${s%.git}
+  case "$s" in */*/* | /* | */ | *[!A-Za-z0-9._/-]*) return 1 ;; */*) printf '%s' "$s" ;; *) return 1 ;; esac
+}
+
+remote_refs() { # "<sha> <ref>" lines like git ls-remote (annotated tags also as <ref>^{}): git, else GitHub over HTTPS
+  if [ "$NO_GIT" != 1 ]; then
+    git ls-remote "$GIT_URL" 2>"$GIT_ERR"
+    return
+  fi
+  rr="$GIT_ERR.refs"
+  if ! fetch "https://github.com/$(github_slug).git/info/refs?service=git-upload-pack" "$rr" 2>"$GIT_ERR"; then
+    rm -f "$rr"
+    return 1
+  fi
+  # pkt-lines: 4 hex digits of length, the SHA, a space, the ref (the first one also carries NUL + capabilities)
+  tr '\000' ' ' <"$rr" | sed -n 's#^[0-9a-f]\{4\}\([0-9a-f]\{40\}\) \(refs/[^ ]*\).*$#\1 \2#p'
+  rm -f "$rr"
+}
+
+archive_source() { # without git: REF's tree from GitHub's codeload into SRC_ROOT; sets SHA
+  refs=$(remote_refs) || return 1
+  sha=$(printf '%s\n' "$refs" | awk -v t="refs/tags/$REF" '$2 == t "^{}" { p = $1 } $2 == t { s = $1 } END { print (p ? p : s) }')
+  path=refs/tags/$REF
+  if [ -z "$sha" ]; then
+    sha=$(printf '%s\n' "$refs" | awk -v h="refs/heads/$REF" '$2 == h { print $1; exit }')
+    path=refs/heads/$REF
+  fi
+  if [ -z "$sha" ]; then
+    case "$REF" in *[!0-9a-f]*) ;; *) if [ ${#REF} -eq 40 ]; then sha=$REF path=$REF; fi ;; esac
+  fi
+  if [ -z "$sha" ]; then
+    echo "no branch, tag or full commit SHA named '$REF'" >"$GIT_ERR"
+    return 1
+  fi
+  fetch "https://codeload.github.com/$(github_slug)/tar.gz/$path" "$TMP/src.tar.gz" 2>"$GIT_ERR" || return 1
+  tar -xzf "$TMP/src.tar.gz" -C "$SRC_ROOT" --strip-components=1 2>"$GIT_ERR" || return 1
+  rm -f "$TMP/src.tar.gz"
+  SHA=$(printf '%s' "$sha" | cut -c 1-7)
 }
 
 # Network failures are told apart from private-repo failures: the git error text decides.
@@ -481,6 +656,23 @@ pick_default_ref() {
   log "could not reach $GIT_URL for the latest version: keeping the installed $REF"
 }
 
+# git fetches a commit only by its full SHA. A shorter one is resolved against the remote's branch and tag tips.
+resolve_short_sha() {
+  case "$REF" in *[!0-9a-f]*) return 0 ;; esac
+  if [ ${#REF} -lt 7 ] || [ ${#REF} -ge 40 ]; then return 0; fi
+  refs=$(remote_refs) || return 0 # unreachable: the fetch below reports it
+  if printf '%s\n' "$refs" | awk -v r="$REF" '$2 == "refs/heads/" r || $2 == "refs/tags/" r { f = 1 } END { exit !f }'; then
+    return 0 # a branch or tag that happens to look like a SHA
+  fi
+  full=$(printf '%s\n' "$refs" | awk -v r="$REF" 'index($1, r) == 1 { print $1 }' | sort -u)
+  case "$full" in
+    "") die "--ref $REF looks like a short commit SHA, which git cannot fetch: pass the full 40-character SHA, a tag or a branch" ;;
+    *[!0-9a-f]*) die "--ref $REF matches more than one commit on $GIT_URL: pass the full 40-character SHA" ;;
+  esac
+  log "--ref $REF is commit $full"
+  REF=$full
+}
+
 # ---- source ----------------------------------------------------------------
 acquire_source() {
   if [ "$FROM" = source ]; then
@@ -511,6 +703,7 @@ acquire_source() {
         return 0
       fi
     fi
+    resolve_short_sha
     # A tag never moves, so a complete install of it needs no network at all (this works offline).
     case "$REF" in
       v[0-9]*)
@@ -526,8 +719,19 @@ acquire_source() {
     SRC_ROOT=$TMP/src
     mkdir "$SRC_ROOT"
     log "fetching $REF from $GIT_URL"
-    git -c init.defaultBranch=main init -q "$SRC_ROOT"
-    if ! git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" 2>"$GIT_ERR"; then
+    if [ "$NO_GIT" = 1 ]; then
+      fetched=0
+      if archive_source; then fetched=1; fi
+    else
+      git -c init.defaultBranch=main init -q "$SRC_ROOT"
+      fetched=0
+      if git -C "$SRC_ROOT" fetch -q --depth 1 "$GIT_URL" "$REF" 2>"$GIT_ERR"; then
+        git -C "$SRC_ROOT" checkout -q FETCH_HEAD
+        SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD)
+        fetched=1
+      fi
+    fi
+    if [ "$fetched" != 1 ]; then
       msg="could not fetch '$REF' from $GIT_URL: $(git_error_hint "$(git_error_reason)")"
       # A branch moves, so it is always fetched first; the installed build of it is the fallback when that fails.
       VER=$(recorded_version "$REF")
@@ -537,22 +741,12 @@ acquire_source() {
       SRC_ROOT=""
       return 0
     fi
-    git -C "$SRC_ROOT" checkout -q FETCH_HEAD
-    SHA=$(git -C "$SRC_ROOT" rev-parse --short HEAD)
   fi
   if [ ! -f "$SRC_ROOT/core/pyproject.toml" ] || [ ! -f "$SRC_ROOT/VERSION" ]; then
     die "not a k3code checkout (no core/pyproject.toml or VERSION): $SRC_ROOT"
   fi
   VER="$(tr -d '[:space:]' <"$SRC_ROOT/VERSION")-src${SHA:+.$SHA}"
   VERDIR="$DATA/versions/$VER"
-  # The TUI build writes node_modules into its tree. A read-only checkout is built from a copy.
-  if [ "$FROM" = source ] && [ ! -f "$VERDIR/.complete" ] && [ "${K3_EDITABLE:-0}" != 1 ] &&
-    [ "${K3_SKIP_TUI:-0}" != 1 ] && [ ! -w "$SRC_ROOT/tui" ]; then
-    log "the checkout is read-only: building from a temporary copy"
-    TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-src.XXXXXX")
-    cp -R "$SRC_ROOT" "$TMP/src"
-    SRC_ROOT=$TMP/src
-  fi
   return 0
 }
 
@@ -564,9 +758,18 @@ build_tui() {
     return 0
   fi
   log "building the TUI (npm ci; this takes a minute)"
-  if (cd "$SRC_ROOT/tui" && npm ci --no-audit --no-fund >&2 && npm run build:ink >&2 && npm run build >&2) &&
-    [ -d "$SRC_ROOT/tui/dist" ]; then
-    cp -R "$SRC_ROOT/tui/dist" "$VERDIR/tui/dist"
+  tui=$SRC_ROOT/tui
+  if [ "$FROM" = source ]; then # the build writes node_modules and dist: never into the user's checkout
+    TUI_TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-tui.XXXXXX")
+    if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then
+      log "WARNING: could not copy the TUI sources to $TUI_TMP; k3code will use the line REPL"
+      return 0
+    fi
+    tui=$TUI_TMP/tui
+  fi
+  if (cd "$tui" && npm ci --no-audit --no-fund >&2 && npm run build:ink >&2 && npm run build >&2) &&
+    [ -d "$tui/dist" ]; then
+    cp -R "$tui/dist" "$VERDIR/tui/dist"
     # Build receipts belong to the build tooling; nothing at runtime reads them.
     rm -f "$VERDIR/tui/dist/hermes-build.json" "$VERDIR/tui/dist/.k3code-product"
   else
@@ -596,6 +799,8 @@ build_panes() {
 # The installed core is a regular copy (it must not depend on a checkout that can be switched or deleted).
 # Its runtime dependencies are the locked set from core/uv.lock without the dev group, so the install is the
 # set CI tested. --locked fails on a stale lock (a missing dependency) instead of installing the stale set.
+# The export keeps the lock's hashes and --require-hashes installs only files that match them (every uv with
+# `export` writes them).
 # A checkout without a lock file (an older tag) resolves the dependencies as before.
 install_core_copy() {
   if [ ! -f "$SRC_ROOT/core/uv.lock" ]; then
@@ -604,9 +809,9 @@ install_core_copy() {
     return 0
   fi
   REQS=$(mktemp "${TMPDIR:-/tmp}/k3code-reqs.XXXXXX")
-  "$UV" export --quiet --project "$SRC_ROOT/core" --locked --no-dev --no-hashes --no-emit-project -o "$REQS" >/dev/null ||
+  "$UV" export --quiet --project "$SRC_ROOT/core" --locked --no-dev --no-emit-project -o "$REQS" >/dev/null ||
     die "could not export the locked runtime dependencies (core/uv.lock is stale?): run 'uv lock' in core/"
-  "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" -r "$REQS" >&2
+  "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" --require-hashes -r "$REQS" >&2
   "$UV" pip install --quiet --python "$VERDIR/venv/bin/python" --no-deps "$SRC_ROOT/core" >&2
   rm -f "$REQS"
   REQS=""
@@ -654,26 +859,93 @@ install_version() {
 }
 
 # ---- activation ------------------------------------------------------------
-link_bin() { # link_bin NAME TARGET: BIN/NAME -> TARGET; drops a stale link of ours
+link_bin() { # link_bin NAME TARGET: BIN/NAME -> TARGET; drops a stale link of ours; never replaces someone else's
+  lb=$(readlink "$BIN/$1" 2>/dev/null || true)
   if [ -e "$2" ]; then
-    if [ "$(readlink "$BIN/$1" 2>/dev/null || true)" != "$2" ]; then ln -sfn "$2" "$BIN/$1"; fi
+    if [ "$lb" = "$2" ]; then return 0; fi
+    if [ -e "$BIN/$1" ] || [ -L "$BIN/$1" ]; then
+      case "$lb" in
+        "$DATA"/*) ;;
+        *)
+          if [ "$FORCE" != 1 ]; then
+            log "WARNING: $BIN/$1 is not a link into $DATA (another program?): left in place; --force replaces it"
+            return 0
+          fi
+          rm -f "$BIN/$1"
+          ;;
+      esac
+    fi
+    ln -sfn "$2" "$BIN/$1"
   else
-    case "$(readlink "$BIN/$1" 2>/dev/null || true)" in
+    case "$lb" in
       "$DATA"/*) rm -f "$BIN/$1" ;;
     esac
   fi
   return 0
 }
 
-prune_versions() { # keep the current and the previous version only
+set_current() { # set_current DIR: point DATA/current at DIR with one rename, so no reader ever sees it missing
+  nl="$DATA/.current.$$"
+  rm -f "$nl"
+  ln -s "$1" "$nl"
+  if mv -T "$nl" "$DATA/current" 2>/dev/null; then return 0; fi # GNU, busybox
+  if [ -L "$nl" ] && mv -h "$nl" "$DATA/current" 2>/dev/null; then return 0; fi # macOS, BSD: -h does not follow
+  rm -f "$nl"
+  ln -sfn "$1" "$DATA/current"
+}
+
+prune_versions() { # keep the current and the previous version, and the one the running daemon executes from
   prev=$(cat "$DATA/previous" 2>/dev/null || true)
+  busy=$(daemon_version)
   for d in "$DATA"/versions/*; do
     [ -d "$d" ] || continue
     n=$(basename "$d")
     case "$n" in "$VER" | "$prev") continue ;; esac
+    if [ -n "$busy" ] && [ "$n" = "$busy" ]; then
+      log "kept old version $n: the running k3code daemon still executes from it"
+      continue
+    fi
     rm -rf "$d"
     log "removed old version $n"
   done
+  return 0
+}
+
+# The daemon is a systemd user unit only when `k3code service install` wrote one (the path uninstall.sh uses too).
+daemon_unit() { [ "$PLATFORM" = Linux ] && have systemctl && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/k3code.service" ]; }
+
+daemon_version() { # the versions/<name> the running k3code daemon executes from; empty when none or unknown
+  daemon_unit || return 0
+  pid=$(systemctl --user show -p MainPID --value k3code.service 2>/dev/null || true)
+  case "$pid" in '' | 0 | *[!0-9]*) return 0 ;; esac
+  [ -d "/proc/$pid" ] || return 0
+  real=$(cd "$DATA" 2>/dev/null && pwd -P) || real=$DATA
+  # a venv python's exe is the base interpreter, so the version shows in its cwd or command line (the shebang path)
+  {
+    readlink "/proc/$pid/exe"
+    readlink "/proc/$pid/cwd"
+    tr '\0' '\n' <"/proc/$pid/cmdline"
+  } 2>/dev/null |
+    while IFS= read -r p; do
+      case "$p" in
+        "$DATA"/versions/*) p=${p#"$DATA"/versions/} ;;
+        "$real"/versions/*) p=${p#"$real"/versions/} ;;
+        *) continue ;;
+      esac
+      printf '%s\n' "${p%%/*}"
+      break
+    done
+}
+
+restart_daemon() { # a running daemon keeps executing the old version until it restarts
+  daemon_unit || return 0
+  systemctl --user is-active --quiet k3code.service 2>/dev/null || return 0
+  systemctl --user reset-failed k3code.service 2>/dev/null || true
+  if systemctl --user restart k3code.service >&2; then
+    log "restarted the k3code daemon (k3code.service) on $VER"
+  else
+    log "WARNING: could not restart k3code.service; it still runs the old version: systemctl --user restart k3code.service"
+  fi
   return 0
 }
 
@@ -682,19 +954,20 @@ activate() {
   if [ -L "$DATA/current" ]; then cur=$(basename "$(readlink "$DATA/current")"); fi
   if [ "$cur" != "$VER" ]; then
     if [ -n "$cur" ]; then printf '%s\n' "$cur" >"$DATA/previous"; fi
-    ln -sfn "$VERDIR" "$DATA/current"
+    set_current "$VERDIR"
     log "current -> $VER${cur:+ (previous: $cur, kept for rollback)}"
   fi
   if [ "$FROM" = git ] && [ -e "$DATA/source_path" ]; then rm -f "$DATA/source_path"; fi
   link_bin k3code "$DATA/current/venv/bin/k3code"
   link_bin k3 "$DATA/current/bin/k3"
+  if [ "$cur" != "$VER" ]; then restart_daemon; fi
   prune_versions
 }
 
 import_bundle() {
   [ -f "$BUNDLE" ] || die "bundle not found: $BUNDLE"
   log "importing $BUNDLE (settings and sessions; secrets are not in bundles)"
-  "$BIN/k3code" import "$BUNDLE" --yes >&2 || die "import of $BUNDLE failed"
+  "$DATA/current/venv/bin/k3code" import "$BUNDLE" --yes >&2 || die "import of $BUNDLE failed"
 }
 
 # ---- presetup ----------------------------------------------------------------
@@ -742,7 +1015,7 @@ presetup_sandbox() {
   say "      install it:  $cmd"
   case "$cmd" in
     "sudo "*)
-      if ask_tty "Run that now? (sudo asks for your password)"; then
+      if [ "${BWRAP_ASKED:-0}" != 1 ] && ask_tty "Run that now? (sudo asks for your password)"; then # asked once per run
         if sh -c "$cmd" </dev/tty >/dev/tty 2>&1 && bwrap_usable; then
           log "presetup: sandbox ok (bubblewrap installed)"
         else
@@ -801,12 +1074,12 @@ presetup_chromium() {
   return 0
 }
 presetup_doctor() {
-  if [ ! -x "$BIN/k3code" ]; then
-    log "presetup: health subset skipped (k3code is not linked)"
+  if [ ! -x "$DATA/current/venv/bin/k3code" ]; then
+    log "presetup: health subset skipped (k3code is not installed)"
     return 0
   fi
   log "presetup: health subset (warnings only; 'k3code doctor' gives the full report)"
-  out=$(K3CODE_DATA="$DATA" "$BIN/k3code" doctor --install 2>/dev/null) || true
+  out=$(K3CODE_DATA="$DATA" "$DATA/current/venv/bin/k3code" doctor --install 2>/dev/null) || true
   if [ -n "$out" ]; then say "$out"; fi
   return 0
 }
@@ -815,7 +1088,7 @@ presetup_doctor() {
 main() {
   export GIT_TERMINAL_PROMPT=0
   FROM="" GIT_URL="" REF="" CHANNEL=stable WANT_VERSION="" PREFIX="$HOME/.local" BUNDLE=""
-  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0 PRESETUP=1
+  YES=0 NO_DEPS=0 CHECK=0 ACTIVATE=1 PRINT_VERSION=0 PRESETUP=1 ALLOW_ROOT=0 FORCE=0 NO_GIT=0
   if [ "${K3_NO_DOWNLOAD:-0}" = 1 ]; then NO_DEPS=1; fi
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -861,6 +1134,8 @@ main() {
       --no-install-deps) NO_DEPS=1 ;;
       --minimal) PRESETUP=0 ;;
       --check) CHECK=1 ;;
+      --allow-root) ALLOW_ROOT=1 ;;
+      --force) FORCE=1 ;;
       --no-activate) ACTIVATE=0 ;;
       --print-version) PRINT_VERSION=1 ;;
       --no-setup | --headless) ;; # legacy no-ops: setup no longer runs here; old callers (k3code update) still pass it
@@ -892,12 +1167,22 @@ main() {
     report
     exit 0
   fi
+  check_user
   mkdir -p "$DATA" "$BIN"
+  take_lock
   INSTALL_LOG="${K3_INSTALL_LOG:-$DATA/install.log}"
-  printf '\n==== %s install start (args: %s) ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$INSTALL_LOG" 2>/dev/null || true
+  # only the user reads the log: it names URLs and paths (credentials in URLs are redacted)
+  (umask 077 && : >>"$INSTALL_LOG") 2>/dev/null || true
+  chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+  printf '\n==== %s install start (args: %s) ====\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(redact "$*")" >>"$INSTALL_LOG" 2>/dev/null || true
   report
   if [ "$NO_DEPS" = 1 ]; then export UV_PYTHON_DOWNLOADS=never; fi
-  if [ "$FROM" = git ] && ! have git; then die "git is needed for --from-git: $(hint_cmd git)"; fi
+  if [ "$FROM" = git ] && ! have_git; then
+    GIT_URL=${GIT_URL:-$DEFAULT_URL}
+    github_slug >/dev/null || die "git is needed for --from-git $GIT_URL (without git only GitHub https URLs work): $(hint_cmd git)"
+    NO_GIT=1
+    log "git not found: reading $GIT_URL over HTTPS and fetching source archives from codeload.github.com"
+  fi
   ensure_uv
   if [ -z "$PY_FOUND" ] && [ "$NO_DEPS" != 1 ]; then
     log "no Python 3.12+ here: uv will download a managed one (kept in uv's own data directory)"
