@@ -102,11 +102,24 @@ class Peer:
 
     @classmethod
     async def connect(cls, sock: Path, timeout: float = 30) -> Peer:
+        from k3code.gateway.auth import authenticate  # the daemon refuses privileged RPCs without gateway.auth
+
         end = time.monotonic() + timeout
+        early: list[tuple[float, dict]] = []
+
+        def keep(line: bytes) -> None:  # events sent before the auth reply (gateway.ready, notifications)
+            frame = json.loads(line)
+            if frame.get("method") == "event":
+                early.append((time.monotonic(), frame["params"]))
+
         while True:
             try:
                 r, w = await asyncio.open_unix_connection(str(sock))
-                return cls(r, w)
+                early.clear()
+                await authenticate(r, w, sock, keep)  # before the pump starts: it would steal the reply
+                peer = cls(r, w)
+                peer.events[:0] = early
+                return peer
             except OSError:
                 if time.monotonic() > end:
                     raise
