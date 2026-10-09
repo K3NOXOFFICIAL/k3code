@@ -13,7 +13,10 @@ import pytest
 
 from k3code import memory, paths
 from k3code.gateway.sessions import SessionStore
+from k3code.learning import distiller
 from k3code.learning.decisions import DecisionLog
+from k3code.providers.types import Message
+from k3code.reliability.hooks import Reliability
 from k3code.reliability.journal import ToolJournal
 from k3code.setup import state
 from k3code.tools import tool_edit, tool_write
@@ -57,6 +60,9 @@ def test_private_state_is_0600_and_0700_whatever_the_umask(tmp_path: Path) -> No
     project.mkdir()
     (project / ".git").mkdir()
     with umask(0):  # the loosest umask: every mode below is set explicitly, not inherited
+        # first: the agent loop saves the transcript at turn start, before a tool call opens the journal
+        Reliability(session="s0", home=home).save_transcript([Message(role="user", content="a secret")])
+        assert mode(home / "journal") == 0o700
         stores = [SessionStore(home / "sessions.db"), UsageDB(home / "usage.db"), DecisionLog(home)]
         journal = ToolJournal(home, "s1")
         journal.record_intent("c1", "read", {"path": "x"}, side_effect=False)
@@ -68,6 +74,7 @@ def test_private_state_is_0600_and_0700_whatever_the_umask(tmp_path: Path) -> No
         home / "usage.db",
         home / "learning" / "decisions.db",
         home / "journal" / "s1.jsonl",
+        home / "journal" / "s0.messages.json",
         learned,
         state.state_path(),
     ]
@@ -78,6 +85,23 @@ def test_private_state_is_0600_and_0700_whatever_the_umask(tmp_path: Path) -> No
     for s in stores:
         with contextlib.suppress(AttributeError):
             s.close()
+
+
+@pytest.mark.parametrize(
+    "write",
+    [
+        lambda p: memory.append_memory(p, "prefers uv"),
+        lambda p: distiller.add_user_line(p, "prefers uv"),
+        lambda p: distiller.write_auto_section(p, []),
+    ],
+    ids=["append_memory", "add_user_line", "write_auto_section"],
+)
+def test_user_memory_is_0600_whatever_the_umask(write) -> None:
+    user_md = memory.user_memory_path()
+    with umask(0):
+        write(user_md)
+    assert mode(user_md) == 0o600
+    assert mode(user_md.parent) == 0o700
 
 
 def test_existing_private_files_are_tightened(tmp_path: Path) -> None:

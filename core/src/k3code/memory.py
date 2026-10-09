@@ -223,7 +223,13 @@ def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = M
 
 
 def append_memory(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Append ``- text``. The user's memory is private state (0600 in a 0700 directory whatever the umask); a
+    project's memory file is a project file and keeps the umask."""
+    if path == user_memory_path():
+        ensure_private_dir(path.parent)
+        private_file(path)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     sep = "" if not existing or existing.endswith("\n") else "\n"
     path.write_text(existing + sep + f"- {text.strip()}\n", encoding="utf-8")

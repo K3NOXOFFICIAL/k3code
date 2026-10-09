@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from k3code.paths import ensure_private_dir, private_file
 from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec
 from k3code.reliability import events as ev
 from k3code.reliability.events import EventEmitter
@@ -284,9 +285,11 @@ class Reliability:
             for m in messages
         ]
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            # the whole conversation, tool output included: 0700/0600 whatever the umask (saved before any tool
+            # call opens the journal, so it cannot rely on ToolJournal for the directory's mode)
+            ensure_private_dir(path.parent)
             tmp = path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data))
+            private_file(tmp).write_text(json.dumps(data))  # write_text truncates and keeps the 0600 mode
             os.replace(tmp, path)
         except OSError as e:
             logger.debug("transcript not saved (%s)", e)

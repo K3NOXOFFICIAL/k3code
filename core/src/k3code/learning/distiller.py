@@ -17,6 +17,7 @@ from typing import Any
 
 from k3code.autonomy.proposals import ProposalStore, dedup_key
 from k3code.learning.decisions import DecisionLog
+from k3code.paths import ensure_private_dir, private_file
 from k3code.providers.types import Message
 from k3code.redact import scrub_text
 from k3code.routing.tiers import TaskKind
@@ -174,6 +175,12 @@ def propose_denial_preferences(log: DecisionLog, proposals: ProposalStore) -> li
     return made
 
 
+def _write_user_memory(path: Path, text: str) -> None:
+    """USER.md is private state (learned preferences): 0600 in a 0700 directory whatever the umask."""
+    ensure_private_dir(path.parent)
+    private_file(path).write_text(text, encoding="utf-8")
+
+
 def add_user_line(path: Path, text: str, heading: str = HEADING) -> None:
     """Add ``- text`` to ``path`` above the auto section (the distiller rewrites that section, and everything below
     its heading up to the next one, on every run)."""
@@ -186,8 +193,7 @@ def add_user_line(path: Path, text: str, heading: str = HEADING) -> None:
         new = existing + sep + f"- {text}\n"
     else:
         new = "".join(lines[:at]) + f"- {text}\n\n" + "".join(lines[at:])
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new, encoding="utf-8")
+    _write_user_memory(path, new)
 
 
 DISTILL_SYSTEM = (
@@ -236,8 +242,7 @@ def write_auto_section(path: Path, prefs: list[Preference], heading: str = HEADI
         end = next((i for i in range(start + 1, len(lines)) if re.match(r"#{1,2} ", lines[i])), len(lines))
         tail = "".join(lines[end:])
         new = "".join(lines[:start]) + section + ("\n" + tail if tail else "")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new, encoding="utf-8")
+    _write_user_memory(path, new)
 
 
 def read_auto_section(path: Path, heading: str = HEADING) -> list[str]:
