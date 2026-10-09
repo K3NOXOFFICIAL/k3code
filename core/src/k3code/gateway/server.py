@@ -31,7 +31,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from k3code import confio
+from k3code import confio, userhooks
 from k3code import skills as skills_mod
 from k3code._version import __version__
 from k3code.agent.loop import AgentLoop, ApprovalResult
@@ -65,6 +65,7 @@ from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
+from k3code.memory import fenced
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
@@ -184,6 +185,8 @@ class LiveSession:
         self.pending_advisor: str = ""
         #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
         self.extra_tools: list[Callable[[Any], None]] = []
+        #: the SessionStart hooks ran for this session in this process
+        self.hooks_started = False
         #: Outcome of the last turn (``completed`` / ``failed``); cleared when a new turn starts.
         self.run_result: str | None = None
         #: What the last turn ended with, for the cron/loop runners.
@@ -1512,6 +1515,7 @@ class GatewayServer:
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
+        loop.hooks = userhooks.load(session.perms.cwd, session.session_id)  # re-read per loop: config edits apply
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
         for install in session.extra_tools:
@@ -1519,6 +1523,23 @@ class GatewayServer:
         register_task_tools(loop.tools, self, session, depth=1)
         register_web_tools(loop.tools, self.config, fetcher=self.web_fetcher, mcp=self.mcp, browser=self.browser)
         return loop
+
+    async def _prompt_hooks(
+        self, session: LiveSession, hooks: userhooks.HookRunner | None, text: str
+    ) -> userhooks.HookOutcome:
+        """SessionStart (once per session in this process) and UserPromptSubmit; their context is merged."""
+        outcome = userhooks.HookOutcome()
+        if not hooks:
+            return outcome
+        if not session.hooks_started:
+            session.hooks_started = True
+            source = "resume" if session.stored.messages else "startup"
+            started = await hooks.run("SessionStart", {"source": source})
+            outcome.context += started.context
+        submitted = await hooks.run("UserPromptSubmit", {"prompt": text})
+        outcome.blocked, outcome.reason = submitted.blocked, submitted.reason
+        outcome.context += submitted.context
+        return outcome
 
     async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
@@ -1579,8 +1600,10 @@ class GatewayServer:
         session.streaming = True
         session.current_kind = kind.value
         try:
+            hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
             try:
-                gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
+                if not hooked.blocked:
+                    gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
             except Exception:  # noqa: BLE001 - the autonomy layer must never block the user's task
                 logger.exception("autonomy gate failed; running the task directly")
             session.current_kind = kind.value
@@ -1609,6 +1632,10 @@ class GatewayServer:
                 session.loop = loop
             history = session.history
             prompt = gate.prompt
+            if hooked.blocked:
+                gate.proceed, gate.message = False, f"Prompt blocked by a UserPromptSubmit hook: {hooked.reason}"
+            elif extra := hooked.context_text():
+                prompt = f"{prompt}\n\n" + fenced("context from the user's hooks:", extra)
             if gate.proceed and (subtasks := self.fanout.applies(session, gate)):
                 fan = await self.fanout.run(session, text, gate.plan, subtasks)  # M4b: parallel worktree children
                 if fan is not None and fan.ok:
@@ -1668,6 +1695,10 @@ class GatewayServer:
                 # over). Ending it 'done' let an active goal judge it and continue into the same loop, and reported a
                 # /loop tick as completed.
                 status = "needs_input"
+            if loop.hooks and not hooked.blocked:
+                stopped = await loop.hooks.run("Stop", {"stop_hook_active": False})
+                if stopped.blocked:  # Claude Code would continue the turn; k3code ends it and logs the reason
+                    logger.info("a Stop hook asked to continue the turn (not supported): %s", stopped.reason[:200])
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)

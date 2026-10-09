@@ -345,7 +345,13 @@ def describe(text: str) -> list[str]:
     if data.get("mem0"):
         lines.append("mem0 is IGNORED (a project config cannot set mem0; only your user config can)")
 
-    others = sorted(str(k) for k in data if k not in ("mcp", "permissions", "providers", "mem0"))
+    from k3code.userhooks import parse as parse_hooks
+
+    for hook in parse_hooks(data.get("hooks"), "project"):
+        on = f" on {_short(hook.matcher, 40)}" if hook.matcher else ""
+        lines.append(f"hook {hook.event}{on} runs as you, unsandboxed: {_short(hook.command)}")
+
+    others = sorted(str(k) for k in data if k not in ("mcp", "permissions", "providers", "mem0", "hooks"))
     if others:
         lines.append("also sets: " + ", ".join(others))
     return lines or ["no settings"]

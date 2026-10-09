@@ -166,6 +166,9 @@ class Settings(BaseModel):
     # /artifacts publish: {publish_dir: "" (default <home>/published), publish_url: "" (template, e.g.
     # https://example.com/{name}; nothing is uploaded, the link is only printed)}
     artifacts: dict[str, Any] = Field(default_factory=dict)
+    # User hooks: {PreToolUse: [{matcher, command, timeout}], ...}. Run from the user's config and, once the project
+    # is trusted, the project's: both apply (k3code.userhooks.load reads each file; this merged value is not used).
+    hooks: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod

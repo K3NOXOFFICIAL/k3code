@@ -270,6 +270,18 @@ mcp:
     search: {url: "https://example.org/mcp"}
 ```
 
+### Hooks
+
+Hooks run your own commands on agent events, with Claude Code's contract, so existing hook scripts work:
+
+```yaml
+hooks:
+  PreToolUse:                       # also PostToolUse, UserPromptSubmit, SessionStart, Stop
+    - {matcher: "bash|edit", command: "~/bin/check-tool.sh", timeout: 30}   # matcher: tool-name regex
+```
+
+The command gets the event as JSON on stdin (`session_id`, `cwd`, `hook_event_name`, `tool_name`, `tool_input`, `tool_response` for PostToolUse, `prompt` for UserPromptSubmit). Exit 0 lets the action go on, and its stdout may be JSON `{"decision": "block"|"approve", "reason", "additionalContext"}`. Exit 2 blocks the action, and stderr is the reason the model sees. Any other exit status, or a run longer than `timeout` (default 60 s), is logged and blocks nothing. PreToolUse runs before the permission prompt: it can block a call or answer the prompt with `approve`, but it can never turn a deny (a hardline rule, a deny rule) into an allow. A Stop hook cannot extend a turn. Hooks run as you, outside the sandbox, with the same scrubbed environment as other child processes plus `CLAUDE_PROJECT_DIR`. Hooks in your user config always run; hooks in a project's `.k3code/config.yaml` run only once you trust the project, and the trust prompt lists each one.
+
 Tip: keep at least one chain entry that does not go through a self-hosted gateway, so a gateway outage still has a fallback. (`k3code doctor` only warns when every entry looks like an OmniRoute gateway: its name contains `omniroute`, or it uses port 20128. It cannot recognise other gateways.)
 
 ---

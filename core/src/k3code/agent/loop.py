@@ -17,6 +17,7 @@ from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
 from k3code.tools import MAX_TOOL_RESULT_CHARS, build_registry, clip_tool_results, format_tool_result
+from k3code.userhooks import HookOutcome, HookRunner
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +105,8 @@ class AgentLoop:
         #: returns user messages typed mid-turn (session.steer); they join the conversation before the next model call
         self.take_steer: Callable[[], list[str]] | None = None
         self.approval_callback = approval_callback
+        #: the user's PreToolUse/PostToolUse hooks (k3code.userhooks); None = none
+        self.hooks: HookRunner | None = None
         self.tools = build_registry()
         self._interrupt = asyncio.Event()
         #: Conversation messages of the most recent run(), in order (system first).
@@ -327,9 +330,12 @@ class AgentLoop:
         if tool_call.name == EXIT_PLAN_TOOL:
             return await self._exit_plan(args)
         decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
-        if decision.action == "deny":
+        if decision.action == "deny":  # hardline and deny rules: no hook can turn these into an allow
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
-        if decision.action == "ask":
+        pre = await self._run_hooks("PreToolUse", tool_call.name, {"tool_input": args})
+        if pre.blocked:
+            return {"error": f"Blocked by a PreToolUse hook: {pre.reason}"}
+        if decision.action == "ask" and not pre.approved:  # a hook's "approve" answers the prompt
             if self.approval_callback is None:
                 return {"error": f"Permission denied: {tool_call.name} requires approval (no prompter)"}
             answer = await self.approval_callback(tool_call.name, args, decision)
@@ -355,7 +361,18 @@ class AgentLoop:
             result = {"error": f"Tool execution failed: {e}"}
         # M2: completion digest, so resume knows this call finished.
         self.reliability.journal_done(tool_call.id, result)
+        post = await self._run_hooks(
+            "PostToolUse", tool_call.name, {"tool_input": args, "tool_response": format_tool_result(result)}
+        )
+        feedback = "\n".join(t for t in (post.reason if post.blocked else "", post.context_text()) if t)
+        if feedback:  # the tool already ran: the hook's word joins its result for the model
+            result = {**result, "content": f"{format_tool_result(result)}\n\n[PostToolUse hook] {feedback}"}
         return result
+
+    async def _run_hooks(self, event: str, tool: str, payload: dict[str, Any]) -> HookOutcome:
+        if not self.hooks:
+            return HookOutcome()
+        return await self.hooks.run(event, {"tool_name": tool, **payload}, tool_name=tool)
 
     def _sandbox_argv(self) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.

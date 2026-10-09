@@ -103,6 +103,7 @@ async def _run_headless(
     resume: bool = False,
 ) -> dict[str, Any] | None:
     """Run headless mode and return final result dict."""
+    from k3code import userhooks
     from k3code.agent.loop import AgentLoop
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
@@ -138,6 +139,7 @@ async def _run_headless(
         session=session,
     )
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
+    loop.hooks = userhooks.load(Path.cwd(), session)
 
     final_text = ""
     tool_results: list[dict[str, Any]] = []
@@ -192,6 +194,7 @@ async def _run_repl(
     config: Any,
 ) -> None:
     """Run minimal REPL."""
+    from k3code import userhooks
     from k3code.agent.loop import AgentLoop
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
@@ -236,6 +239,7 @@ async def _run_repl(
         reliability=reliability,
     )
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
+    loop.hooks = userhooks.load(Path.cwd(), "repl")
 
     print("k3code REPL (type /exit to quit, /model <name> to switch, /stop to cancel a stuck turn)")
     print(f"Permission mode: {permission_mode.value}")
