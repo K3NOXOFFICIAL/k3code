@@ -34,6 +34,7 @@ import {
 } from "../k3/agentStripStore.js";
 import { DEFAULT_THEME } from "../theme.js";
 import type { SubagentProgress } from "../types.js";
+import { waitFor } from "./waitFor.js";
 
 type StatusRuleProps = React.ComponentProps<typeof StatusRule>;
 type IntervalSpy = ReturnType<
@@ -351,7 +352,7 @@ describe("status-chrome timers under an occluding overlay", () => {
     resetOverlayState();
     // Poll for the reveal frame instead of a fixed tick: under CI load the
     // store-driven re-render can land well after one 20ms scheduler turn.
-    await vi.waitFor(() => expect(rule.output()).toContain("6m 0s"), {
+    await waitFor(() => expect(rule.output()).toContain("6m 0s"), {
       interval: 10,
       timeout: 5_000,
     });
@@ -582,12 +583,12 @@ describe("AppLayout agent view: leaving the startup session", () => {
         },
         { id: "s2", status: "working", title: "busy one" },
       ]);
-      await vi.waitFor(() => expect(layout.output()).toContain("busy one"));
+      await waitFor(() => expect(layout.output()).toContain("busy one"));
 
       // s2 (working) is listed first, so ⏎ attaches to it.
       layout.press(key);
 
-      await vi.waitFor(() => expect(spy).toHaveBeenCalled());
+      await waitFor(() => expect(spy).toHaveBeenCalled());
       expect(spy).toHaveBeenCalledWith(...args);
     },
   );
@@ -695,8 +696,8 @@ describe("useInputHandlers: ← opens the agent view from an idle, empty prompt"
     await flush();
     layout.press(LEFT);
 
-    await vi.waitFor(() => expect(getOverlayState().agentView).toBe(true));
-    await vi.waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
+    await waitFor(() => expect(getOverlayState().agentView).toBe(true));
+    await waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
   });
 
   it.each<
@@ -770,11 +771,11 @@ describe("useInputHandlers: Esc that closes the agent view does not count toward
       },
     );
 
-    await vi.waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
+    await waitFor(() => expect(layout.output()).toContain(AGENT_VIEW_HINT));
 
     // Date.now is pinned to T0, so both presses sit well inside DOUBLE_ESC_MS.
     layout.press(ESC);
-    await vi.waitFor(() => expect(getOverlayState().agentView).toBe(false));
+    await waitFor(() => expect(getOverlayState().agentView).toBe(false));
     await flush();
 
     layout.press(ESC);
@@ -851,10 +852,10 @@ describe("AppLayout agent view: ⏎ routes by row kind", () => {
       { activateLiveSession, resumeById },
     );
 
-    await vi.waitFor(() => expect(layout.output()).toContain("› ◐ busy one"));
+    await waitFor(() => expect(layout.output()).toContain("› ◐ busy one"));
     layout.press("\r");
 
-    await vi.waitFor(() => expect(activateLiveSession).toHaveBeenCalled());
+    await waitFor(() => expect(activateLiveSession).toHaveBeenCalled());
     // s1 is not in the live list, so there is no empty origin session to drop.
     expect(activateLiveSession).toHaveBeenCalledWith("live-1", undefined);
     expect(resumeById).not.toHaveBeenCalled();
@@ -871,10 +872,13 @@ describe("AppLayout agent view: ⏎ routes by row kind", () => {
       { gateway: pastGateway },
     );
 
-    await vi.waitFor(() => expect(layout.output()).toContain("› · older work"));
+    await waitFor(() => expect(layout.output()).toContain("› · older work"));
+    // The row is painted before the pane's input handler is re-armed with it; a ⏎ in that gap is dropped, and
+    // nothing observable marks the end of the gap.
+    await flush();
     layout.press("\r");
 
-    await vi.waitFor(() => expect(resumeById).toHaveBeenCalled());
+    await waitFor(() => expect(resumeById).toHaveBeenCalled());
     expect(resumeById).toHaveBeenCalledWith("past-1");
     expect(activateLiveSession).not.toHaveBeenCalled();
     expect(getOverlayState().agentView).toBe(false);
@@ -894,12 +898,10 @@ describe("AppLayout agent view: ⏎ routes by row kind", () => {
       { activateLiveSession, resumeById },
     );
 
-    await vi.waitFor(() =>
-      expect(layout.output()).toContain("› ◐ helper agent"),
-    );
+    await waitFor(() => expect(layout.output()).toContain("› ◐ helper agent"));
     layout.press("\r");
 
-    await vi.waitFor(() => expect(stripActivate).toHaveBeenCalled());
+    await waitFor(() => expect(stripActivate).toHaveBeenCalled());
     expect(stripActivate).toHaveBeenCalledWith(
       expect.objectContaining({ id: "ag-1", kind: "agent" }),
     );

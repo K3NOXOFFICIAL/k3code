@@ -19,6 +19,7 @@ import {
   type ViewRow,
 } from "../../k3/agentViewStore.js";
 import { DEFAULT_THEME } from "../../theme.js";
+import { waitFor } from "../waitFor.js";
 
 const row = (n: number, over: Partial<ViewRow> = {}): ViewRow => ({
   activity: "",
@@ -230,19 +231,19 @@ describe("AgentViewPane", () => {
     );
 
     try {
-      await vi.waitFor(() => expect(output).toContain("› ◐ alpha"));
+      await waitFor(() => expect(output).toContain("› ◐ alpha"));
       output = "";
       stdin.write("\x1b[B"); // ↓ onto bravo
-      await vi.waitFor(() => expect(output).toContain("› ◐ bravo"));
+      await waitFor(() => expect(output).toContain("› ◐ bravo"));
 
       $stripSessions.set([
         { id: "c", status: "working", title: "charlie" },
         { id: "a", status: "working", title: "alpha" },
         { id: "b", status: "working", title: "bravo" },
       ]);
-      await vi.waitFor(() => expect(output).toContain("charlie"));
+      await waitFor(() => expect(output).toContain("charlie"));
       stdin.write("\r");
-      await vi.waitFor(() => expect(onActivate).toHaveBeenCalled());
+      await waitFor(() => expect(onActivate).toHaveBeenCalled());
       expect(onActivate.mock.calls[0]![0]).toMatchObject({ id: "b" });
     } finally {
       view.unmount();
@@ -315,7 +316,7 @@ describe("AgentViewPane", () => {
     );
 
     try {
-      await vi.waitFor(() => expect(frames.join("")).not.toContain("loading"));
+      await waitFor(() => expect(frames.join("")).not.toContain("loading"));
 
       const out = (frames.filter((f) => f.trim()).at(-1) ?? "").trimEnd();
       const lines = out.split("\n");
@@ -394,7 +395,7 @@ describe("AgentViewPane", () => {
     const settle = () => new Promise((resolve) => setTimeout(resolve, 120));
 
     try {
-      await vi.waitFor(() => expect(output).toContain("› ◐ alpha"));
+      await waitFor(() => expect(output).toContain("› ◐ alpha"));
 
       stdin.write("\x0e"); // Ctrl+N
       await settle();
@@ -411,13 +412,13 @@ describe("AgentViewPane", () => {
 
       // The bare letters still are view commands.
       stdin.write("x");
-      await vi.waitFor(() => expect(output).toContain("stop? y/n"));
+      await waitFor(() => expect(output).toContain("stop? y/n"));
       stdin.write("y");
-      await vi.waitFor(() => expect(onStop).toHaveBeenCalled());
+      await waitFor(() => expect(onStop).toHaveBeenCalled());
       expect(onStop.mock.calls[0]![0]).toMatchObject({ id: "a" });
 
       stdin.write("n");
-      await vi.waitFor(() => expect(onNew).toHaveBeenCalled());
+      await waitFor(() => expect(onNew).toHaveBeenCalled());
     } finally {
       view.unmount();
       view.cleanup();
@@ -461,7 +462,7 @@ describe("AgentViewPane", () => {
     );
 
     try {
-      await vi.waitFor(() => expect(request).toHaveBeenCalled());
+      await waitFor(() => expect(request).toHaveBeenCalled());
       expect(request).toHaveBeenCalledWith("session.list", {
         cwd: "/work/proj",
         limit: 50,
