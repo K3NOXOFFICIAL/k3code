@@ -295,10 +295,15 @@ def test_agent_type_files_and_override(tmp_path, monkeypatch):
     (proj / ".k3code" / "agents").mkdir(parents=True)
     override = "---\nname: explorer\ntools: read\n---\nProject explorer.\n"
     (proj / ".k3code" / "agents" / "explorer.md").write_text(override)
+    (proj / ".k3code" / "agents" / "linter.md").write_text("---\nname: linter\ntools: read\n---\nLint.\n")
+    from k3code import trust
+
+    trust.record(proj, trusted=True)  # project agents load only from a trusted project (test_project_content_trust)
     types = load_agent_types(proj, home)
-    assert {"explorer", "worker", "reviewer", "planner", "scribe"} <= set(types)
+    assert {"explorer", "worker", "reviewer", "planner", "scribe", "linter"} <= set(types)
     assert types["scribe"].tools == ["read", "write"] and types["scribe"].tier == "cheap"
-    assert types["explorer"].tools == ["read"] and types["explorer"].source == "project"  # project overrides built-in
+    assert types["linter"].tools == ["read"] and types["linter"].source == "project"  # a project adds agents
+    assert types["explorer"].source == "builtin"  # but never replaces a built-in one
     assert types["reviewer"].tier == "strong" and "VERDICT" in types["reviewer"].prompt
     assert parse_agent_md("no frontmatter", "x").name == "x"
 

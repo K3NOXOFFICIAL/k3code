@@ -380,9 +380,7 @@ def main(
         _offer_project_trust(project_dir)
     config = load_config(project_dir=project_dir)
     if trust.decision(project_dir) in (trust.UNDECIDED, trust.DECLINED):
-        click.echo(
-            f"k3code: ignoring {trust.config_path(project_dir)} (not trusted; `k3code trust` applies it)", err=True
-        )
+        click.echo(f"k3code: ignoring {trust.subject(project_dir)} (not trusted; `k3code trust` applies it)", err=True)
     if not config.providers and (prompt or not _is_interactive()):
         from k3code.setup.onboard import NO_CONFIG_HINT
 
@@ -440,7 +438,7 @@ def _offer_project_trust(project_dir: Path) -> None:
     if (why := trust.problem(project_dir)) is not None:
         click.echo(f"{trust.config_path(project_dir)} is ignored: {why}.", err=True)
         return
-    click.echo(f"{trust.config_path(project_dir)} changes how k3code runs in this project:", err=True)
+    click.echo(f"{trust.subject(project_dir)} changes how k3code runs in this project:", err=True)
     for line in trust.summary(project_dir) or []:
         click.echo(f"  - {line}", err=True)
     answer = click.confirm("Trust this project config?", default=False, err=True)
@@ -977,7 +975,7 @@ def trust_cmd(path: Path | None, revoke: bool) -> None:
     from k3code import trust
 
     project_dir = path or Path.cwd()
-    where = trust.config_path(project_dir)
+    where = trust.subject(project_dir)
     if revoke:
         if trust.revoke(project_dir):
             click.echo(f"trust revoked for {where}: it is ignored until you trust it again")

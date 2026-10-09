@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,12 +52,24 @@ def load_memory(cwd: str | Path) -> list[MemoryFile]:
     return out
 
 
+def fenced(label: str, body: str) -> str:
+    """``label`` and ``body`` in a code fence longer than any backtick run inside it, so the body cannot close it."""
+    longest = max((len(run) for run in re.findall(r"`+", body)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{label}\n{fence}text\n{body}\n{fence}"
+
+
 def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS) -> str:
+    """User memory as written; the repository's memory file fenced as what it is (text from the repository)."""
     parts = []
     for m in load_memory(cwd):
-        label = "User memory" if m.scope == "user" else f"Project memory ({m.path.name})"
         body = m.text if len(m.text) <= limit else m.text[:limit] + "\n…(truncated)"
-        parts.append(f"## {label}\n\n{body}")
+        if m.scope == "user":
+            parts.append(f"## User memory\n\n{body}")
+        else:
+            parts.append(
+                f"## Project memory ({m.path.name})\n\n" + fenced("project instructions (from the repository):", body)
+            )
     return "\n\n".join(parts)
 
 

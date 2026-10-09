@@ -1,6 +1,7 @@
 """Agent types: markdown files with frontmatter (name, description, tools, tier).
 
-Search order (later wins): built-ins shipped in the package, ``$K3CODE_HOME/agents/``, ``<project>/.k3code/agents/``.
+Search order: built-ins shipped in the package, then ``$K3CODE_HOME/agents/`` (a user agent replaces a built-in of
+the same name), then ``<project>/.k3code/agents/`` only when the project is trusted, and only to add new names.
 """
 
 from __future__ import annotations
@@ -53,7 +54,7 @@ def parse_agent_md(text: str, default_name: str = "", source: str = "") -> Agent
     )
 
 
-def _load_dir(path: Path, source: str, into: dict[str, AgentType]) -> None:
+def _load_dir(path: Path, source: str, into: dict[str, AgentType], *, add_only: bool = False) -> None:
     if not path.is_dir():
         return
     for f in sorted(path.glob("*.md")):
@@ -61,15 +62,27 @@ def _load_dir(path: Path, source: str, into: dict[str, AgentType]) -> None:
             agent = parse_agent_md(f.read_text(encoding="utf-8"), f.stem, source)
         except OSError:
             continue
-        if agent:
-            into[agent.name] = agent
+        if not agent:
+            continue
+        if add_only and agent.name in into:
+            logger.warning(
+                "project agent %s (%s) skipped: it would replace the %s agent of that name",
+                agent.name,
+                f,
+                into[agent.name].source,
+            )
+            continue
+        into[agent.name] = agent
 
 
 def load_agent_types(project_dir: str | Path | None = None, home: str | Path | None = None) -> dict[str, AgentType]:
+    """Built-in, then user agents; a trusted project may add agents but never replace one (see k3code.trust)."""
+    from k3code import trust
+
     home_dir = Path(home) if home else Path(os.environ.get("K3CODE_HOME") or Path.home() / ".k3code")
     out: dict[str, AgentType] = {}
     _load_dir(BUILTIN_DIR, "builtin", out)
     _load_dir(home_dir / "agents", "user", out)
-    if project_dir:
-        _load_dir(Path(project_dir) / ".k3code" / "agents", "project", out)
+    if project_dir and trust.content_allowed(project_dir):
+        _load_dir(Path(project_dir) / ".k3code" / "agents", "project", out, add_only=True)
     return out

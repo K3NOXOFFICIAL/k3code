@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from k3code import trust
 from k3code.config import load_config
 from k3code.providers import make_providers
 from k3code.providers.anthropic import AnthropicProvider
@@ -17,8 +16,9 @@ from k3code.providers.openai_compat import OpenAICompatProvider
 @pytest.fixture
 def project_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("K3_TEST_KEY", "secret-value")
-    cfg_dir = tmp_path / ".k3code"
-    cfg_dir.mkdir()
+    # providers come from the user config only: a project config cannot set them (k3code.config.load_config)
+    cfg_dir = Path(os.environ["K3CODE_HOME"])
+    cfg_dir.mkdir(parents=True, exist_ok=True)
     (cfg_dir / "config.yaml").write_text(
         """
 providers:
@@ -38,7 +38,6 @@ providers:
 default_model: default
 """
     )
-    trust.record(tmp_path, trusted=True)  # the providers of an untrusted project config are ignored (k3code.trust)
     return tmp_path
 
 
@@ -52,13 +51,12 @@ def test_load_config_expands_api_key(project_config: Path):
 
 
 def test_load_config_missing_env_var_yields_empty_key(tmp_path: Path):
-    cfg_dir = tmp_path / ".k3code"
-    cfg_dir.mkdir()
+    cfg_dir = Path(os.environ["K3CODE_HOME"])
+    cfg_dir.mkdir(parents=True, exist_ok=True)
     (cfg_dir / "config.yaml").write_text(
         "providers:\n  - name: x\n    kind: openai\n    base_url: https://x\n"
         "    api_key_env: K3_DOES_NOT_EXIST\n    models: {default: m}\n"
     )
-    trust.record(tmp_path, trusted=True)
     os.environ.pop("K3_DOES_NOT_EXIST", None)
     config = load_config(project_dir=tmp_path)
     assert config.providers[0].api_key == ""

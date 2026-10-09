@@ -66,11 +66,11 @@ def _write_project(dirs: dict[str, Path], text: str) -> None:
     trust.record(dirs["project"], trusted=True)  # an untrusted project config is never applied (k3code.trust)
 
 
-def test_project_providers_win_over_user_providers(dirs: dict[str, Path]) -> None:
+def test_project_providers_are_ignored_even_when_trusted(dirs: dict[str, Path]) -> None:
     _write_user(dirs, USER_PROVIDER_A)
     _write_project(dirs, PROJECT_PROVIDER_B)
     config = load_config(project_dir=dirs["project"])
-    assert [p.name for p in config.providers] == ["project-b"]
+    assert [p.name for p in config.providers] == ["user-a"]
 
 
 def test_user_providers_kept_when_project_does_not_set_them(dirs: dict[str, Path]) -> None:
