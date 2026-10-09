@@ -81,6 +81,8 @@ class McpConfig(BaseModel):
 
 class SkillsConfig(BaseModel):
     roots: list[str] = Field(default_factory=list)
+    #: also load ~/.claude/skills; read from the user's config only (skills.import_claude_enabled)
+    import_claude: bool = True
 
 
 class Mem0Config(BaseModel):
