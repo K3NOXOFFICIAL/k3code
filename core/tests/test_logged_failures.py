@@ -62,7 +62,11 @@ async def test_a_failed_empty_session_sweep_is_logged(caplog):
     async def sweep() -> int:
         raise RuntimeError("disk I/O error")
 
-    server = SimpleNamespace(stopping=False, sweep_empty_sessions_async=sweep)
+    server = SimpleNamespace(
+        stopping=False,
+        sweep_empty_sessions_async=sweep,
+        prune_retention=lambda: {"usage_rows": 0, "journal_files": 0, "decisions": 0},
+    )
     with caplog.at_level(logging.ERROR, logger="k3code.daemon"):
         await daemon._sweep_empty_sessions(server)
     assert any("empty-session sweep failed" in r.getMessage() and r.exc_info for r in caplog.records)

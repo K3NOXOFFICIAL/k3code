@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 from k3code import debugdump
@@ -51,6 +52,17 @@ async def test_session_delete_removes_its_journal_and_pastes(tmp_path, monkeypat
     assert (await call(server, "session.delete", {"session_id": doomed.session_id}))["deleted"] is True
     assert not any(p.exists() for p in doomed_files) and not pastes.exists()
     assert all(p.exists() for p in kept_files)
+
+
+async def test_session_delete_never_turns_a_given_id_into_a_path(tmp_path, monkeypatch):
+    """`..` made the pastes directory $K3CODE_HOME itself, and the removal took every file in it."""
+    server = await _server(tmp_path, monkeypatch)
+    home = k3home(tmp_path)
+    pasted = Path((await call(server, "paste.collapse", {"text": "keep me"}))["path"])
+    (home / "precious.txt").write_text("user data")
+    for sid in ("..", ".", "../..", "/", "x/../.."):
+        assert (await call(server, "session.delete", {"session_id": sid}))["deleted"] is False
+    assert (home / "precious.txt").exists() and pasted.exists() and (tmp_path / "sessions.db").exists()
 
 
 async def test_session_delete_of_a_live_session_closes_and_removes_its_journal(tmp_path, monkeypatch):

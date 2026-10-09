@@ -2267,11 +2267,16 @@ class GatewayServer:
         return n
 
     def remove_session_files(self, sid: str) -> None:
-        """A deleted or swept session's files: its tool journal, transcript checkpoint and stored pastes."""
+        """A deleted or swept session's files: its tool journal, transcript checkpoint and stored pastes.
+
+        ``sid`` comes from a client (session.delete): only a plain name is used, never ``.``, ``..`` or a path (``..``
+        would have made the pastes directory ``$K3CODE_HOME`` itself)."""
+        if not sid or sid in (".", "..") or "/" in sid or "\\" in sid or "\0" in sid:
+            return
         home = self._home()
         delete_session_journal(home, sid)
         pastes = home / PASTES_DIR / sid
-        if sid and pastes.parent == home / PASTES_DIR and pastes.is_dir():
+        if pastes.is_dir() and not pastes.is_symlink():
             shutil.rmtree(pastes, ignore_errors=True)
 
     def prune_retention(self, *, now: float | None = None) -> dict[str, int]:
