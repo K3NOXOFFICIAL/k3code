@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -96,6 +97,21 @@ async def test_approve_answers_the_prompt_but_never_a_hardline_deny(proj: Path) 
     assert "Hardline deny" in read["error"] and "KEY" not in json.dumps(read)
 
 
+async def test_approve_does_not_answer_a_prompt_only_a_human_may_answer(proj: Path) -> None:
+    outside = proj.parent / "outside.txt"
+    outside.write_text("OUTSIDE")
+    asked: list[str] = []
+
+    async def deny(name, args, decision):
+        asked.append(name)
+        return type("A", (), {"allowed": False, "reason": ""})()
+
+    approve = Hook("PreToolUse", """echo '{"decision": "approve"}'""")
+    loop = _loop(proj, [approve], mode="ask", approval=deny)
+    read = await loop._execute_tool(ToolCall(id="r", name="read", arguments={"path": str(outside)}))
+    assert asked == ["read"] and "User denied" in read["error"] and "OUTSIDE" not in json.dumps(read)
+
+
 async def test_timeout_and_other_failures_block_nothing(proj: Path, caplog) -> None:
     slow = Hook("PreToolUse", "sleep 30", timeout=0.3)
     failing = Hook("PreToolUse", "echo broken >&2; exit 1")
@@ -166,6 +182,34 @@ async def test_gateway_user_prompt_submit_blocks_or_adds_context(tmp_path: Path,
     await run_turn(server, "do the forbidden thing")
     deltas = [e.get("text", "") for e in events(server, "message.delta")]
     assert "Prompt blocked by a UserPromptSubmit hook: not that" in deltas
+
+
+async def test_a_blocked_first_prompt_is_never_titled_or_logged(tmp_path: Path, monkeypatch) -> None:
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [{"type": "text", "text": "unused"}],
+        autonomy={**NO_GATE["autonomy"], "auto_title": True},
+    )
+    home = k3home(tmp_path)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "hooks:\n  UserPromptSubmit:\n    - {command: \"echo 'has a secret' >&2; exit 2\"}\n", encoding="utf-8"
+    )
+    titled: list[str] = []
+    finished: list[str] = []
+
+    async def spy_title(session, first_message):
+        titled.append(first_message)
+
+    monkeypatch.setattr(server, "_auto_title", spy_title)
+    monkeypatch.setattr(server.autonomy, "finish", lambda *a, **k: finished.append("finish"))
+    await start(server, tmp_path)
+    await run_turn(server, "my password is hunter2")
+    deltas = [e.get("text", "") for e in events(server, "message.delta")]
+    assert "Prompt blocked by a UserPromptSubmit hook: has a secret" in deltas
+    await asyncio.gather(*list(server._side_tasks))
+    assert titled == [] and finished == []
 
 
 def _user_config(tmp_path: Path, hooks_yaml: str) -> None:

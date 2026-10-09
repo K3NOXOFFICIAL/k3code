@@ -101,12 +101,14 @@ async def _run_headless(
     json_output: bool,
     session: str = "headless",
     resume: bool = False,
+    project_dir: Path | None = None,
 ) -> dict[str, Any] | None:
     """Run headless mode and return final result dict."""
     from k3code import userhooks
     from k3code.agent.loop import AgentLoop
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
+    from k3code.memory import fenced
     from k3code.prompting import build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
@@ -139,7 +141,7 @@ async def _run_headless(
         session=session,
     )
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
-    loop.hooks = userhooks.load(Path.cwd(), session)
+    loop.hooks = userhooks.load(project_dir or Path.cwd(), session)  # the directory the trust check keys on
 
     final_text = ""
     tool_results: list[dict[str, Any]] = []
@@ -165,8 +167,23 @@ async def _run_headless(
 
     try:
         await reliability.start()
-        async for _ in loop.run(prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume):
+        run_prompt = prompt
+        if loop.hooks:
+            started = await loop.hooks.run("SessionStart", {"source": "resume" if resume else "startup"})
+            submitted = await loop.hooks.run("UserPromptSubmit", {"prompt": prompt})
+            if submitted.blocked:
+                return {
+                    "error": "prompt_blocked",
+                    "message": f"Prompt blocked by a UserPromptSubmit hook: {submitted.reason}",
+                }
+            if extra := "\n".join(c for c in (started.context_text(), submitted.context_text()) if c):
+                run_prompt = f"{prompt}\n\n" + fenced("context from the user's hooks:", extra)
+        async for _ in loop.run(
+            run_prompt, max_tokens=config.max_tokens, temperature=config.temperature, resume=resume
+        ):
             pass
+        if loop.hooks:
+            await loop.hooks.run("Stop", {"stop_hook_active": False})
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
         return {"error": "all_providers_unreachable", "message": str(e), "attempts": e.attempts}
@@ -192,12 +209,14 @@ async def _run_repl(
     model: str | None,
     permission_mode: PermissionMode,
     config: Any,
+    project_dir: Path | None = None,
 ) -> None:
     """Run minimal REPL."""
     from k3code import userhooks
     from k3code.agent.loop import AgentLoop
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
+    from k3code.memory import fenced
     from k3code.prompting import build_system_prompt
     from k3code.providers import make_providers
     from k3code.reliability import BudgetExceeded, DiskGuardFull
@@ -239,7 +258,8 @@ async def _run_repl(
         reliability=reliability,
     )
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
-    loop.hooks = userhooks.load(Path.cwd(), "repl")
+    loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
+    hooks_started = False
 
     print("k3code REPL (type /exit to quit, /model <name> to switch, /stop to cancel a stuck turn)")
     print(f"Permission mode: {permission_mode.value}")
@@ -293,8 +313,23 @@ async def _run_repl(
         loop.on_text_reset = on_text_reset
 
         try:
-            async for _ in loop.run(user_input, max_tokens=config.max_tokens, temperature=config.temperature):
+            run_input = user_input
+            if loop.hooks:
+                extra_parts: list[str] = []
+                if not hooks_started:
+                    hooks_started = True
+                    extra_parts.append((await loop.hooks.run("SessionStart", {"source": "startup"})).context_text())
+                submitted = await loop.hooks.run("UserPromptSubmit", {"prompt": user_input})
+                if submitted.blocked:
+                    print(f"[Blocked] Prompt blocked by a UserPromptSubmit hook: {submitted.reason}")
+                    continue
+                extra_parts.append(submitted.context_text())
+                if extra := "\n".join(c for c in extra_parts if c):
+                    run_input = f"{user_input}\n\n" + fenced("context from the user's hooks:", extra)
+            async for _ in loop.run(run_input, max_tokens=config.max_tokens, temperature=config.temperature):
                 pass
+            if loop.hooks:
+                await loop.hooks.run("Stop", {"stop_hook_active": False})
             print()  # newline after streaming
         except AllProvidersUnreachable as e:
             print(f"\n[Error] All providers unreachable: {e}")
@@ -410,6 +445,7 @@ def main(
                 json_output=json_output,
                 session=session,
                 resume=resume,
+                project_dir=project_dir,
             )
         )
         if json_output and result:
@@ -422,7 +458,7 @@ def main(
         sys.exit(0 if result and "error" not in result else 1)
     elif repl or not _is_interactive():
         with contextlib.suppress(KeyboardInterrupt):
-            asyncio.run(_run_repl(model=model, permission_mode=permission_mode, config=config))
+            asyncio.run(_run_repl(model=model, permission_mode=permission_mode, config=config, project_dir=project_dir))
     else:
         if model and (err := _use_model_key(config, model)):
             raise click.ClickException(err)
@@ -508,6 +544,7 @@ def _launch_tui(
                     permission_mode=permission_mode
                     or _permission_from_config("permission_mode", config.permission_mode),
                     config=config,
+                    project_dir=project_dir,
                 )
             )
         return

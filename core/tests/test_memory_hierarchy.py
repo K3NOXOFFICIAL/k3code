@@ -30,6 +30,22 @@ def test_claude_md_is_read(tmp_path: Path) -> None:
     assert "## Project memory (CLAUDE.md)" in prompt and "project instructions (from the repository):" in prompt
 
 
+def test_symlinked_memory_files_cannot_reach_outside_the_repo_or_a_credential(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "alice"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("K3CODE_HOME", str(home / ".k3code"))
+    key = _write(home / ".ssh" / "id_ed25519", "PRIVATE-KEY-MATERIAL")
+    outside = _write(tmp_path / "outside.md", "OUTSIDE-FILE")
+    root = _repo(tmp_path)
+    (root / ".k3code" / "rules").mkdir(parents=True)
+    (root / ".k3code" / "rules" / "a.md").symlink_to(key)
+    (root / "pkg").mkdir()
+    (root / "pkg" / "CLAUDE.md").symlink_to(outside)
+    _write(root / "K3CODE.md", "REAL")
+    blob = " ".join(m.text for m in load_memory(root / "pkg"))
+    assert "PRIVATE-KEY-MATERIAL" not in blob and "OUTSIDE-FILE" not in blob and "REAL" in blob
+
+
 def test_all_three_files_in_order_and_identical_ones_once(tmp_path: Path) -> None:
     root = _repo(tmp_path)
     _write(root / "CLAUDE.md", "SHARED")

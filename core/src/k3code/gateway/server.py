@@ -1599,8 +1599,10 @@ class GatewayServer:
         session.emit("status.update", {"kind": "status", "text": "thinking", "state": "working"})
         session.streaming = True
         session.current_kind = kind.value
+        prompt_blocked = False
         try:
             hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
+            prompt_blocked = hooked.blocked
             try:
                 if not hooked.blocked:
                     gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
@@ -1743,8 +1745,9 @@ class GatewayServer:
                 if isinstance(session.last_exc, (AllProvidersUnreachable, ChainExhausted)) and status == "error"
                 else status
             )
-            self.autonomy.finish(session, gate, scope_outcome, final_text, text)
-            if self.learning.enabled:
+            if not prompt_blocked:  # a prompt a hook refused is not a task: nothing to log or learn from
+                self.autonomy.finish(session, gate, scope_outcome, final_text, text)
+            if self.learning.enabled and not prompt_blocked:
                 self.learning.spawn(self.learning.turn_finished(session, status))
 
         session.last_error = error or ""
@@ -1770,7 +1773,12 @@ class GatewayServer:
             },
         )
         session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
-        if status == "done" and not session.stored.title and autonomy_cfg(self.config)["auto_title"]:
+        if (
+            status == "done"
+            and not prompt_blocked
+            and not session.stored.title
+            and autonomy_cfg(self.config)["auto_title"]
+        ):
             task = asyncio.create_task(self._auto_title(session, text))
             self._side_tasks.add(task)
             task.add_done_callback(self._side_tasks.discard)

@@ -136,6 +136,17 @@ def expand_imports(path: Path, roots: tuple[Path, ...], _stack: tuple[Path, ...]
     return "\n".join(out)
 
 
+def _readable(path: Path, roots: tuple[Path, ...]) -> bool:
+    """Whether ``path``, with symlinks followed, stays inside ``roots`` and is not a credential location."""
+    from k3code.permissions.engine import sensitive_path
+
+    try:
+        target = path.resolve()
+    except OSError:
+        return False
+    return _within(target, roots) and not sensitive_path(str(target))
+
+
 def _chain(root: Path, cwd: Path) -> list[Path]:
     """Directories from ``root`` down to ``cwd`` (just ``root`` when ``cwd`` is not inside it)."""
     if cwd != root and root not in cwd.parents:
@@ -151,14 +162,14 @@ def load_memory(cwd: str | Path) -> list[MemoryFile]:
     user = user_memory_path()
     candidates.append(("user", user, (Path.home().resolve(), home().resolve())))
     rules = root.joinpath(*RULES_DIR)
-    if rules.is_dir():
+    if rules.is_dir() and _readable(rules, (root,)):
         candidates += [("rules", p, (root,)) for p in sorted(rules.glob("*.md"))]
     for d in _chain(root, Path(cwd).resolve()):
         candidates += [("project", d / name, (root,)) for name in PROJECT_FILES]
     out: list[MemoryFile] = []
     seen: set[str] = set()
     for scope, path, roots in candidates:
-        if not path.is_file():
+        if not path.is_file() or not _readable(path, roots):
             continue
         try:
             text = expand_imports(path, roots).strip()

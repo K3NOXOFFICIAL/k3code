@@ -335,7 +335,8 @@ class AgentLoop:
         pre = await self._run_hooks("PreToolUse", tool_call.name, {"tool_input": args})
         if pre.blocked:
             return {"error": f"Blocked by a PreToolUse hook: {pre.reason}"}
-        if decision.action == "ask" and not pre.approved:  # a hook's "approve" answers the prompt
+        # a hook's "approve" answers the prompt, but never one only a human may answer
+        if decision.action == "ask" and not (pre.approved and not decision.needs_human):
             if self.approval_callback is None:
                 return {"error": f"Permission denied: {tool_call.name} requires approval (no prompter)"}
             answer = await self.approval_callback(tool_call.name, args, decision)
