@@ -2,7 +2,8 @@ import { atom } from "nanostores";
 
 import type { SessionActiveItem } from "../gatewayTypes.js";
 
-export type StripState = "done" | "failed" | "input" | "working";
+/** `idle` (a session with no turn yet) is only assigned by the agent view; the strip shows such sessions as `done`. */
+export type StripState = "done" | "failed" | "idle" | "input" | "working";
 
 export interface StripRow {
   activity: string;

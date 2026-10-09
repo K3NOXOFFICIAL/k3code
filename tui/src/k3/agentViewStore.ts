@@ -7,17 +7,19 @@ import type { SubagentProgress } from "../types.js";
 import { buildStripRows, sessionRow } from "./agentStrip.js";
 import type { StripRow, StripState } from "./agentStripStore.js";
 
-export type ViewGroup = "finished" | "input" | "past" | "working";
+export type ViewGroup = "finished" | "idle" | "input" | "past" | "working";
 
 export const VIEW_GROUPS: readonly ViewGroup[] = [
   "input",
   "working",
+  "idle",
   "finished",
   "past",
 ];
 
 export const VIEW_GROUP_LABEL: Record<ViewGroup, string> = {
   finished: "Completed / failed",
+  idle: "Idle",
   input: "Needs input",
   past: "Earlier sessions",
   working: "Working",
@@ -35,7 +37,20 @@ export interface ViewRow extends Omit<StripRow, "kind"> {
 export type PastSessionRow = SessionListRow & { cwd?: null | string };
 
 const groupOf = (state: StripState): ViewGroup =>
-  state === "input" ? "input" : state === "working" ? "working" : "finished";
+  state === "input"
+    ? "input"
+    : state === "working"
+      ? "working"
+      : state === "idle"
+        ? "idle"
+        : "finished";
+
+/**
+ * A session that has not had a turn yet: nothing ran, so "completed" would be a lie. Only a known zero counts; an
+ * unknown message count keeps the strip's `done`.
+ */
+const noTurnYet = (status: string, messageCount: number | undefined) =>
+  (status === "idle" || status === "new") && messageCount === 0;
 
 export function buildViewRows({
   currentCwd,
@@ -55,11 +70,15 @@ export function buildViewRows({
   const byId = new Map(sessions.map((s) => [s.id, s]));
   const live = (r: StripRow, current: boolean): ViewRow => {
     const s = r.kind === "session" ? byId.get(r.id) : undefined;
+    // The view's own reading; the inline strip keeps showing such sessions as completed.
+    const state: StripState =
+      s && noTurnYet(s.status, s.message_count) ? "idle" : r.state;
 
     return {
       ...r,
       current,
-      group: groupOf(r.state),
+      group: groupOf(state),
+      state,
       lastActive: s?.last_active ?? null,
       ...(s?.model ? { model: s.model } : {}),
     };

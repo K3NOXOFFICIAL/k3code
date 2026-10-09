@@ -122,6 +122,37 @@ describe("AgentViewView", () => {
     expect(out).toContain("↑↓ select · ⏎ attach · x stop · n new · ← back");
   });
 
+  it("shows a session with no turn yet as idle, not completed, between working and finished", () => {
+    const out = dump([
+      row(1, { title: "busy" }),
+      row(2, {
+        current: true,
+        elapsedSeconds: null,
+        group: "idle",
+        state: "idle",
+        title: "Session",
+      }),
+      row(3, { group: "finished", state: "done", title: "shipped" }),
+    ]);
+    const lines = out.split("\n");
+
+    expect(lines[0]).toContain("1 working · 1 idle · 1 finished");
+    expect(out).toMatch(/○ Session \(this session\)\s+idle\s*$/m);
+    expect(out).not.toMatch(/Session \(this session\)\s+completed/);
+
+    const order = [
+      "Working",
+      "◐ busy",
+      "Idle",
+      "○ Session",
+      "Completed / failed",
+      "✓ shipped",
+    ].map((s) => out.indexOf(s));
+
+    expect(order.every((i) => i >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+  });
+
   it("omits headers of empty groups", () => {
     const out = dump([row(1)]);
 

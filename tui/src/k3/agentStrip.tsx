@@ -26,12 +26,14 @@ export const FINISHED_LINGER_MS = 60_000;
 export const GLYPH: Record<StripState, string> = {
   done: "✓",
   failed: "✗",
+  idle: "○",
   input: "●",
   working: "◐",
 };
 export const LABEL: Record<StripState, string> = {
   done: "completed",
   failed: "failed",
+  idle: "idle",
   input: "needs input",
   working: "working",
 };
@@ -43,7 +45,9 @@ export const stateColor = (state: StripState, t: Theme): string =>
       ? t.color.error
       : state === "input"
         ? t.color.warn
-        : t.color.accent;
+        : state === "idle"
+          ? t.color.muted
+          : t.color.accent;
 
 const sessionState = (s: LiveSessionStatus | string): StripState =>
   s === "waiting" || s === "needs_input"
@@ -136,8 +140,9 @@ export function buildStripRows(
   const rank: Record<StripState, number> = {
     input: 0,
     working: 1,
-    failed: 2,
-    done: 3,
+    idle: 2,
+    failed: 3,
+    done: 4,
   };
 
   return rows

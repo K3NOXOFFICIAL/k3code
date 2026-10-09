@@ -33,6 +33,7 @@ export const AGENT_VIEW_HINT = "↑↓ select · ⏎ attach · x stop · n new �
 
 const COUNT_LABEL: Record<ViewGroup, string> = {
   finished: "finished",
+  idle: "idle",
   input: "need input",
   past: "earlier",
   working: "working",
