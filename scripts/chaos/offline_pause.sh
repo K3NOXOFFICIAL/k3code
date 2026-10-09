@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Multi-turn headless task; the provider goes unreachable midway (proxy "down"),
 # then comes back. Expect reliability.paused -> reliability.resumed and the task finishing.
+# shellcheck source=scripts/chaos/_common.sh
 source "$(dirname "$0")/_common.sh"
 LOG="$WORK/run.log"
 PROMPT='Do these steps in order, one bash tool call each, then reply DONE: RUN[echo one > a.txt] RUN[sleep 2; echo two > b.txt] RUN[echo three > c.txt] RUN[cat a.txt b.txt c.txt]'
