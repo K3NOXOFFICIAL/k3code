@@ -100,6 +100,11 @@ async def test_commands_optimizer_selfimprove_and_project_prep(tmp_path, monkeyp
     assert not (tmp_path / "K3CODE.md").exists()
     kinds = {c["kind"] for c in shown(server)}
     assert kinds == {"project_setup", "mcp", "hook", "rule", "commands"}
+    rule = shown(server, "rule")[0]  # accepting a recipe card (the TUI's Alt+Y sends the same command) applies it
+    acc = await call(
+        server, "command.dispatch", {"name": "proposals", "arg": f"accept {rule['id']}", "session_id": sid}
+    )
+    assert "allow rules" in acc["output"] and "go test ./..." in projectstate.rules_path(tmp_path).read_text()
     st = await call(server, "command.dispatch", {"name": "optimizer", "arg": "status", "session_id": sid})
     assert "off" in st["output"]
     si = await call(server, "command.dispatch", {"name": "self-improve", "arg": "faster startup", "session_id": sid})
