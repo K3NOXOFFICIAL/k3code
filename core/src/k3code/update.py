@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -425,6 +426,61 @@ class UnpinnedReleaseError(IntegrityError):
 
 #: The release asset with the runtime dependencies exported from core/uv.lock, with hashes (``k3code-<ver>-...``).
 REQUIREMENTS_SUFFIX = "-requirements.txt"
+#: install/install.sh's lock in the install root: a directory holding the pid of the run that owns it.
+INSTALL_LOCK = ".install.lock"
+
+
+class InstallLockHeld(OSError):
+    """Another install or update into the same install root holds its lock."""
+
+
+def _pid_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # another user's process
+        return True
+    return True
+
+
+def _take_over_stale_lock(lock: Path) -> None:
+    """Take ``lock`` (which exists) if the process it names is gone; InstallLockHeld otherwise."""
+    try:
+        pid = int((lock / "pid").read_text().strip())
+    except (OSError, ValueError):
+        raise InstallLockHeld(
+            f"an install lock without a pid is in {lock} (an install that is just starting?): if no other "
+            f"install runs, remove it (rm -r '{lock}') and retry"
+        ) from None
+    if _pid_running(pid):
+        raise InstallLockHeld(f"another install into {lock.parent} is running (pid {pid}); wait for it to finish")
+    shutil.rmtree(lock, ignore_errors=True)
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        raise InstallLockHeld(f"another install into {lock.parent} took the lock just now") from None
+
+
+@contextlib.contextmanager
+def install_lock() -> Iterator[None]:
+    """Hold the install root's ``.install.lock``, the one install.sh takes, while building a version.
+
+    install.sh removes every ``versions/<v>`` without ``.complete`` when it takes over a stale lock, and this build
+    removes an unfinished ``versions/<ver>`` itself, so the two must not build at the same time. A lock whose process
+    is gone (a killed install or update) is taken over, as install.sh does; a lock with a live pid, or without a pid
+    (an install that is just starting), refuses."""
+    lock = data_dir() / INSTALL_LOCK
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        _take_over_stale_lock(lock)
+    try:
+        (lock / "pid").write_text(f"{os.getpid()}\n")
+        yield
+    finally:
+        shutil.rmtree(lock, ignore_errors=True)
 
 
 def install_release(rel: Release, token: str | None, uv: str | None = None, *, allow_unpinned: bool = False) -> Path:
@@ -435,8 +491,14 @@ def install_release(rel: Release, token: str | None, uv: str | None = None, *, a
     release without that file is refused unless ``allow_unpinned``.
 
     Never touches a version that is installed and complete, nor the current or previous one: ``/update now`` used
-    to rmtree ``versions/<ver>`` even when it was the live install, deleting the running k3code.
+    to rmtree ``versions/<ver>`` even when it was the live install, deleting the running k3code. The build holds
+    install.sh's lock (see install_lock); InstallLockHeld while another install runs.
     """
+    with install_lock():
+        return _build_release(rel, token, uv, allow_unpinned=allow_unpinned)
+
+
+def _build_release(rel: Release, token: str | None, uv: str | None, *, allow_unpinned: bool) -> Path:
     uv = uv or uv_path()
     vdir = versions_dir() / rel.version
     if vdir.exists():
