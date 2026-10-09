@@ -121,18 +121,22 @@ async def test_sweep_keeps_rows_referenced_by_paused_automations(tmp_path, monke
     server.automation = AutomationEngine(server, use_netwatch=False)
     await server.automation.start()
     ids = {n: await m1.new_session(server, tmp_path) for n in ("action", "trigger", "orphan", "orphan2")}
-    server.automation.automations.add(
-        name="a",
-        trigger={"type": "cron", "schedule": "daily 09:00"},
-        action={"type": "prompt", "prompt": "x", "session": ids["action"]},
-    )
-    server.automation.automations.add(
-        name="t",
-        trigger={"type": "session_event", "session": ids["trigger"], "event": "completed"},
-        action={"type": "prompt", "prompt": "x"},
-    )
-    for ref in ("a", "t"):
-        assert await server.automation.automations.pause(ref)
+    added = [
+        server.automation.automations.add(
+            name="a",
+            trigger={"type": "cron", "schedule": "daily 09:00"},
+            action={"type": "prompt", "prompt": "x", "session": ids["action"]},
+        ),
+        server.automation.automations.add(
+            name="t",
+            trigger={"type": "session_event", "session": ids["trigger"], "event": "completed"},
+            action={"type": "prompt", "prompt": "x"},
+        ),
+    ]
+    # pause by id, not by name: ``find`` tries a unique id prefix before the name, and ids are random hex, so the name
+    # "a" resolved to the other automation whenever only its id started with "a" (about 1 run in 17)
+    for row in added:
+        assert await server.automation.automations.pause(row["id"])
     server.live.clear()
     server.session = None
     for sid in ids.values():
