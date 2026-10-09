@@ -10,9 +10,20 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from k3code.autonomy.proposals import Proposal, ProposalStore
+from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.config import Settings, load_config
-from k3code.learning import curator, distiller, learning_cfg, optimizer, permrules, projectprep, ranking, replay, review
+from k3code.learning import (
+    curator,
+    distiller,
+    gotchas,
+    learning_cfg,
+    optimizer,
+    permrules,
+    projectprep,
+    ranking,
+    replay,
+    review,
+)
 from k3code.learning.decisions import DecisionLog, project_id
 from k3code.learning.updateconfig import merge_patch
 from k3code.redact import scrub_text
@@ -35,6 +46,8 @@ class LearningHub:
         self.replays = replay.ReplayStore(self.home)
         self._state_path = self.home / "learning" / "state.json"
         self._tasks: set[asyncio.Task[Any]] = set()
+        #: (session id, tool) -> (tool_error row id, signature, the failed call's args): waits for the retry that works
+        self._last_failure: dict[tuple[str, str], tuple[int, str, dict[str, Any]]] = {}
 
     # ── config / state ──
 
@@ -106,6 +119,69 @@ class LearningHub:
     async def _mine_later(self, session: Any) -> None:
         self.mine_permissions(session)
 
+    def tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> None:
+        """Record a failed tool call as a ``tool_error``; the next call of that tool in the session that looks like a
+        retry and works becomes the row's hint. A signature seen REPEATS times in the project within WINDOW proposes
+        a project gotcha. Never raises: it runs inside the turn."""
+        if not self.enabled or session is None:
+            return
+        try:
+            self._tool_outcome(session, call, result, failure)
+        except Exception:  # noqa: BLE001 - learning must never break a turn
+            logger.warning("tool error learning failed", exc_info=True)
+
+    def _tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> None:
+        cwd = str(session.perms.cwd)
+        key = (session.session_id, call.name)
+        if failure is None:
+            pending = self._last_failure.pop(key, None)
+            if pending is not None:
+                row_id, sig, failed_args = pending
+                hint = gotchas.followup_hint(call.name, failed_args, call.arguments)
+                if hint:
+                    self.log.update_detail(row_id, followup=hint)
+                    self._maybe_gotcha(session, cwd, call.name, sig)
+            return
+        if failure.error_class in gotchas.NOT_PROJECT or (
+            failure.error_class.startswith("exit ") and not str(result.get("stderr") or "").strip()
+        ):
+            return  # a failing test run or `grep` without a match says nothing about the project by itself
+        row_id = self.log.record(
+            "tool_error",
+            session=session.session_id,
+            cwd=cwd,
+            subject=failure.signature,
+            choice=failure.error_class,
+            detail={"tool": call.name, "error": failure.first_line},
+            actor="auto" if getattr(session, "background", False) else "user",
+        )
+        self._last_failure[key] = (row_id, failure.signature, dict(call.arguments))
+        self._maybe_gotcha(session, cwd, call.name, failure.signature)
+
+    def _maybe_gotcha(self, session: Any, cwd: str, tool: str, sig: str) -> Proposal | None:
+        pid = self.log.project_for(cwd)
+        rows = [
+            r
+            for r in self.log.query("tool_error", project=pid, since=self.clock() - gotchas.WINDOW, actor=None)
+            if r["subject"] == sig and r["detail"].get("tool") == tool
+        ]
+        if len(rows) < gotchas.REPEATS:
+            return None
+        hint = next((str(r["detail"]["followup"]) for r in reversed(rows) if r["detail"].get("followup")), "")
+        line = f"{tool}: {sig}" + (f" — {hint}" if hint else "")
+        p = self.store.add(
+            "project_gotcha",
+            gotchas.proposal_text(sig, hint),
+            "remember this pitfall for the project",
+            session.session_id,
+            payload={"project": pid, "line": line},
+            project=pid,
+            key=dedup_key("project_gotcha", f"{pid} {tool} {sig}"),
+        )
+        if p is not None:
+            self.emit(session, [p])
+        return p
+
     # ── proposals ──
 
     def preferences(self, top: int = 5) -> list[str]:
@@ -169,6 +245,10 @@ class LearningHub:
             return msg
         if p.kind == "skill":
             return curator.apply(payload)
+        if p.kind == "project_gotcha" and payload.get("project") and payload.get("line"):
+            path = gotchas.gotchas_path(str(payload["project"]), self.home)
+            gotchas.append_gotcha(path, str(payload["line"]))
+            return f"added to the known pitfalls of this project ({path})"
         if p.kind == "preference" and payload.get("text"):
             from k3code.memory import user_memory_path
 

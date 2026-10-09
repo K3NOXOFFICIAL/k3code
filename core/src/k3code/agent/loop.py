@@ -17,6 +17,7 @@ from k3code.providers.types import Message, StreamEvent, ToolCall
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
+from k3code.toolerrors import Failure, describe_call, failure_of
 from k3code.tools import MAX_TOOL_RESULT_CHARS, build_registry, clip_tool_results, format_tool_result
 from k3code.tools.validate import invalid_arguments
 
@@ -90,6 +91,13 @@ class AgentLoop:
         #: Stop the loop once this many tool calls in a row failed (0 = never); see escalation_reason.
         self.max_tool_errors = max_tool_errors
         self._tool_errors = 0
+        #: the consecutive failed calls behind _tool_errors: (call, first error line), listed when the turn stops
+        self._failed: list[tuple[str, str]] = []
+        #: end a tool-error stop with an assistant message listing the failures (off when a higher tier continues)
+        self.tool_error_stop_message = True
+        #: called after every tool call with (call, result, failure or None); the gateway's learning hub records
+        #: tool errors with it
+        self.on_tool_outcome: Callable[[ToolCall, dict[str, Any], Failure | None], None] | None = None
         #: Set when the loop stopped because the attempt looks stuck: "tool_errors" | "loop_guard".
         self.escalation_reason: str | None = None
         self.system_prompt = system_prompt
@@ -319,9 +327,17 @@ class AgentLoop:
                 self.reliability.save_transcript(messages)
                 # Yield the tool result as a stream event
                 yield StreamEvent(type="done", message=tool_msg)
-                self._tool_errors = self._tool_errors + 1 if "error" in result and "content" not in result else 0
+                failure = self._observe_result(tc, result, notes)
+                if "error" in result and "content" not in result:
+                    self._tool_errors += 1
+                    self._failed.append((describe_call(tc.name, tc.arguments), failure.first_line if failure else ""))
+                else:
+                    self._tool_errors, self._failed = 0, []
                 if self.max_tool_errors and self._tool_errors >= self.max_tool_errors:
                     self.escalation_reason = "tool_errors"
+                    if self.tool_error_stop_message:
+                        for stop_event in self._stop_for_tool_errors(messages):
+                            yield stop_event
                     self.turn_messages = messages
                     return
 
@@ -475,6 +491,39 @@ class AgentLoop:
             messages.append(Message(role="system", content=outcome.note))
             return False
         return outcome.verdict is Verdict.STOP
+
+    def _observe_result(self, tc: ToolCall, result: dict[str, Any], notes: list[Message]) -> Failure | None:
+        """Tell the learning hook and the loop guard how a call went; queue the guard's reminder into ``notes`` (one
+        per step: the request guard's note, when there is one, already says to change approach)."""
+        failure = failure_of(tc.name, tc.arguments, result)
+        if self.on_tool_outcome is not None:
+            try:
+                self.on_tool_outcome(tc, result, failure)
+            except Exception:  # noqa: BLE001 - learning must never break a turn
+                logger.warning("tool outcome hook failed", exc_info=True)
+        outcome = self.reliability.observe_tool_result(
+            tc, failure.signature if failure else None, describe_call(tc.name, tc.arguments)
+        )
+        if outcome is not None and outcome.verdict is Verdict.NOTE and outcome.note and not notes:
+            notes.append(Message(role="system", content=outcome.note))
+        return failure
+
+    def _stop_for_tool_errors(self, messages: list[Message]) -> Any:
+        """Yield a final assistant message listing the failed calls that stopped the turn."""
+        counts: dict[tuple[str, str], int] = {}
+        for item in self._failed:
+            counts[item] = counts.get(item, 0) + 1
+        lines = [
+            f"- {call}: {error or 'failed'}" + (f" (×{n})" if n > 1 else "") for (call, error), n in counts.items()
+        ]
+        stop_msg = Message(
+            role="assistant",
+            content=f"I stopped because {self._tool_errors} tool calls in a row failed:\n"
+            + "\n".join(lines)
+            + "\nPlease tell me how to proceed (or fix what they need) and I will continue.",
+        )
+        messages.append(stop_msg)
+        yield StreamEvent(type="done", message=stop_msg)
 
     def _stop_for_input(self, messages: list[Message]) -> Any:
         """Yield a final assistant message marking the turn stopped (needs_input)."""
