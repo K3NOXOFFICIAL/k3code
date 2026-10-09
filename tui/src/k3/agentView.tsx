@@ -134,7 +134,12 @@ export function AgentViewView({
       (confirm ? CONFIRM_TAG.length : 0);
     const titleW = Math.max(8, cols - fixed - 1);
     const title = compactPreview(row.title, Math.max(1, titleW - tag.length));
-    const ink = selected ? (style.color ?? t.color.text) : t.color.text;
+    // Earlier sessions are dimmed unless selected, so the live rows above them stand out.
+    const ink = selected
+      ? (style.color ?? t.color.text)
+      : row.kind === "past"
+        ? t.color.muted
+        : t.color.text;
 
     return (
       <Text

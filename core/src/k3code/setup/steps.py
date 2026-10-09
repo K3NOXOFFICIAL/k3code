@@ -346,7 +346,7 @@ def step_service(c: Ctx) -> dict[str, Any]:
 
 TOUR = [
     "TUI:  Shift+Tab cycles permission mode · Ctrl+F toggles focus mode · ← (empty input) opens the agent view",
-    "TUI:  ↓ opens the agent strip · /commands lists every slash command (/settings, /update, /doctor)",
+    "TUI:  ← opens the agent view · /commands lists every slash command (/settings, /update, /doctor)",
     "TUI:  /settings shows config; re-run any setup step with `k3code setup --step <name>`",
     "Panes (k3): Ctrl+G enters the pane prefix mode · Esc leaves it",
     "Panes (k3): Alt+arrows move focus between panes",
