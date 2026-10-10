@@ -48,6 +48,23 @@ func (r *dockReloadRuntime) drain(m *OS) {
 	}
 }
 
+// waitForDockText keeps delivering dock messages until the component shows
+// want. drain gives up after 50 ms of silence, which a slow machine can spend
+// just starting the component's shell command; the text is what the test is
+// about, so it waits for that for up to 30 s instead of guessing a delay.
+func waitForDockText(rt *dockReloadRuntime, m *OS, id, want string) bool {
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if m.dockEngine.Text(id) == want {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		rt.drain(m)
+	}
+}
+
 // settledGoroutines waits for the goroutine count to reach want or below, and
 // returns the count it saw last. A stopped engine's goroutines leave on their
 // own schedule, so a single read would race them.
@@ -108,7 +125,7 @@ func TestDockReloadDoesNotLeakListeners(t *testing.T) {
 
 	rt.run(m.ApplyReloadedConfig(cfg))
 	rt.drain(m)
-	if m.dockEngine.Text("custom/hello") != "hello" {
+	if !waitForDockText(rt, m, "custom/hello", "hello") {
 		t.Fatal("the custom component did not draw after a reload")
 	}
 	base := stableGoroutines()
@@ -118,7 +135,7 @@ func TestDockReloadDoesNotLeakListeners(t *testing.T) {
 		rt.run(m.ApplyReloadedConfig(cfg))
 		rt.drain(m)
 	}
-	if m.dockEngine.Text("custom/hello") != "hello" {
+	if !waitForDockText(rt, m, "custom/hello", "hello") {
 		t.Fatal("the custom component did not draw after many reloads")
 	}
 
