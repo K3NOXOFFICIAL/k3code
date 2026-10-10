@@ -51,11 +51,15 @@ def _hold_install_sh(tmp_path: Path) -> tuple[subprocess.Popen[bytes], Path]:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    deadline = time.monotonic() + 60
-    while not (tmp_path / "ready").exists():
-        assert proc.poll() is None, "install.sh ended before it reached git"
-        assert time.monotonic() < deadline, "install.sh never reached git"
-        time.sleep(0.05)
+    try:
+        deadline = time.monotonic() + 60
+        while not (tmp_path / "ready").exists():
+            assert proc.poll() is None, "install.sh ended before it reached git"
+            assert time.monotonic() < deadline, "install.sh never reached git"
+            time.sleep(0.05)
+    except BaseException:  # the caller's try/finally starts only once this returns
+        _kill_group(proc)
+        raise
     return proc, tmp_path / DATA_REL / ".install.lock"
 
 

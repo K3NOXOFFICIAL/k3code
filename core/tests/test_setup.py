@@ -396,7 +396,7 @@ def test_parse_window_reads_plain_and_k_sizes(text: str, tokens: int) -> None:
     assert parse_window(text) == tokens
 
 
-@pytest.mark.parametrize("text", ["", "k", "abc", "12", "-5000", "0"])
+@pytest.mark.parametrize("text", ["", "k", "abc", "12", "-5000", "0", "inf", "1e400", "1e12", "10000001"])
 def test_parse_window_refuses_anything_else(text: str) -> None:
     from k3code.setup.steps import parse_window
 
