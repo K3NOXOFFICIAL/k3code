@@ -484,7 +484,7 @@ def test_network_cooldown_expires(monkeypatch):
 
 def test_non_cooldown_reasons_do_not_arm():
     store = CooldownStore()
-    assert store.arm(FailoverReason.auth, provider="p", model="m") is None
+    assert store.arm(FailoverReason.bad_request, provider="p", model="m") is None
     assert not store.in_cooldown(provider="p", model="m")
 
 

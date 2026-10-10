@@ -297,3 +297,32 @@ def test_context_window_check_says_so_when_no_chain_models_are_configured():
     for providers in ([], [ProviderEntry(name="cli", kind="claude-cli")]):
         checks = check_context_windows(Settings(providers=providers))
         assert [(c.name, c.status, c.detail) for c in checks] == [("context-window", OK, "no chain models configured")]
+
+
+def test_doctor_clears_a_providers_auth_cooldown_when_its_key_answers(monkeypatch, tmp_path):
+    """A rejected key arms a 5-minute+ auth cooldown; once the key answers a doctor probe, the entry must be usable."""
+    import asyncio
+
+    from k3code import doctor
+    from k3code.config import ProviderEntry, Settings
+    from k3code.router.classifier import FailoverReason
+    from k3code.router.cooldown import CooldownStore
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
+    path = tmp_path / "cooldowns.json"
+    seed = CooldownStore(path=path)
+    seed.arm(FailoverReason.auth, provider="good", model="m")
+    seed.arm(FailoverReason.auth, provider="bad", model="m")
+
+    async def fake_probe_key(p):
+        return p.name == "good", 5.0, "HTTP 200" if p.name == "good" else "HTTP 401: rejected"
+
+    monkeypatch.setattr(doctor, "_probe_key", fake_probe_key)
+    entries = [
+        ProviderEntry(name=n, kind="openai", base_url=f"http://{n}", api_key_env="K", api_key="k")
+        for n in ("good", "bad")
+    ]
+    asyncio.run(doctor.check_providers(Settings(providers=entries)))
+    left = CooldownStore(path=path)
+    assert left.reason_of(provider="good", model="m") is None
+    assert left.reason_of(provider="bad", model="m") is FailoverReason.auth
