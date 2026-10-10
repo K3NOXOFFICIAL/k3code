@@ -20,8 +20,8 @@ from k3code.config import ProviderEntry
 from k3code.doctor import check_keys
 from k3code.providers import ClaudeCliProvider, make_providers
 from k3code.providers.base import ProviderError
-from k3code.providers.claude_cli import render_prompt
-from k3code.providers.types import Message, ToolCall, ToolSpec
+from k3code.providers.claude_cli import _parse_tool_calls, render_prompt
+from k3code.providers.types import INVALID_TOOL_CALL, Message, ToolCall, ToolSpec
 
 SHIM = r"""#!{python}
 import json, os, sys, time
@@ -169,14 +169,62 @@ async def test_long_reply_is_returned_whole_without_tools(shim: Path, monkeypatc
     await p.aclose()
 
 
-@pytest.mark.parametrize("mode", ["bad", "cut"])
-async def test_malformed_tool_block_is_a_provider_error(shim: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
-    monkeypatch.setenv("SHIM_MODE", mode)
+async def test_cut_off_tool_block_is_a_provider_error(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHIM_MODE", "cut")  # opened, never closed: the reply was cut off, a retry may help
     p = ClaudeCliProvider(name="cc", command=str(shim))
     with pytest.raises(ProviderError) as ei:
         await _collect(p, [Message(role="user", content="x")])
     assert ei.value.status_code == 502 and "tool_calls" in ei.value.message
     await p.aclose()
+
+
+async def test_invalid_tool_block_becomes_one_invalid_tool_call(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHIM_MODE", "bad")  # no ProviderError: the loop tells the model instead of a full retry
+    p = ClaudeCliProvider(name="cc", command=str(shim))
+    events = await _collect(p, [Message(role="user", content="x")])
+    calls = [e.tool_call for e in events if e.type == "tool_call"]
+    assert [c.name for c in calls] == [INVALID_TOOL_CALL]
+    assert calls[0].arguments["error"] and calls[0].arguments["body"] == "[{not json"
+    assert events[-1].message.tool_calls[0].name == INVALID_TOOL_CALL
+    await p.aclose()
+
+
+_READ = {"name": "read_file", "arguments": {"path": "a.py"}}
+
+
+@pytest.mark.parametrize(
+    ("body", "arguments"),
+    [
+        ('[{"name": "read_file", "arguments": {"path": "a.py",},},]', {"path": "a.py"}),  # trailing commas
+        ('[{"name": "read_file", "arguments": {"path": "a.py"}} ,\n ]', {"path": "a.py"}),
+        (
+            '[{"name": "read_file", "arguments": {"n": None, "a": True, "b": False}}]',
+            {"n": None, "a": True, "b": False},
+        ),
+        ('[{"name": "read_file", "arguments": {"path": "a.py"}}', {"path": "a.py"}),  # missing final ]
+        ('[{"name": "read_file", "arguments": {"path": "a.py"}},', {"path": "a.py"}),  # missing ] after a comma
+        ('[{"name": "read_file", "arguments": {"path": "x, ] True None \\" }"}},]', {"path": 'x, ] True None " }'}),
+    ],
+)
+def test_lenient_repair(body: str, arguments: dict) -> None:
+    calls = _parse_tool_calls(body)
+    assert [(c.name, c.arguments) for c in calls] == [("read_file", arguments)]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "[{not json",
+        '[{"name": "read_file", "arguments": {"path": ]',  # a missing } is not repaired
+        "[{'name': 'read_file'}]",
+        '[{"name": "a"}] [{"name": "b"}]',
+    ],
+)
+def test_unrepairable_body_is_one_invalid_tool_call(body: str) -> None:
+    calls = _parse_tool_calls(body + " " + "x" * 400)
+    assert [c.name for c in calls] == [INVALID_TOOL_CALL]
+    assert calls[0].arguments["error"] and len(calls[0].arguments["body"]) == 300
+    assert json.loads(calls[0].raw_arguments) == calls[0].arguments
 
 
 async def test_isolation_flags_env_and_cwd(shim: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

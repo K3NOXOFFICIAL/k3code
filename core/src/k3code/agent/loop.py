@@ -14,7 +14,7 @@ from k3code import context_budget
 from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.state import PermissionState
-from k3code.providers.types import Message, StreamEvent, ToolCall
+from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
@@ -384,6 +384,15 @@ class AgentLoop:
 
     async def _execute_tool(self, tool_call: ToolCall) -> dict[str, Any]:
         """Execute a single tool call with permission checking."""
+        if tool_call.name == INVALID_TOOL_CALL:
+            # The provider could not parse the model's <tool_calls> block. Nothing ran, so no permission check, hook
+            # or journal intent. The error result counts as a normal failed call (tool-error counter, loop guard),
+            # so a model that keeps writing invalid blocks is stopped like one that keeps failing a tool.
+            reason = tool_call.arguments.get("error", "unparseable")
+            return {
+                "error": f"Your <tool_calls> block was not valid JSON ({reason}). "
+                "Re-send the calls as a valid JSON array."
+            }
         spec, handler = self.tools.get(tool_call.name) or (None, None)
         if not handler:
             return {"error": f"Unknown tool: {tool_call.name}"}
