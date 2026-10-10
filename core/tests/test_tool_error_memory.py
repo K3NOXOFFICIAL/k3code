@@ -51,7 +51,8 @@ async def test_failures_are_recorded_scrubbed_with_class_and_project(tmp_path, m
 
 
 async def test_third_repeat_in_a_project_proposes_a_gotcha_with_the_followup_hint(tmp_path, monkeypatch):
-    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    # learning.auto_gotchas off: today's behaviour, even a hinted failure waits for the card at REPEATS
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch, learning={"auto_gotchas": False})
     hub = server.learning
     s = _session(server, tmp_path)
     _fail(hub, s, "npm test", "sh: 1: npm: not found")
@@ -64,6 +65,54 @@ async def test_third_repeat_in_a_project_proposes_a_gotcha_with_the_followup_hin
     assert p.text == "project gotcha: npm: exit <n>: sh: <n>: npm: not found — `pnpm test` worked instead"
     _fail(hub, s, "npm x", "sh: 1: npm: not found")
     assert len([p for p in hub.store.all() if p.kind == "project_gotcha"]) == 1  # proposed once
+    assert not gotchas.gotchas_path(hub.log.project_for(str(tmp_path))).exists()  # nothing written without the card
+
+
+def _recording_session(cwd, sid, frames):
+    return SimpleNamespace(
+        session_id=sid, perms=SimpleNamespace(cwd=cwd), background=False, emit=lambda t, p: frames.append((t, p))
+    )
+
+
+async def test_a_hinted_failure_seen_twice_is_learned_without_a_card_and_announced(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    frames: list = []
+    s1 = _recording_session(tmp_path, "s1", frames)
+    _fail(hub, s1, "python x.py", "sh: 1: python: not found")
+    _ok(hub, s1, "python3 x.py")  # a retry that worked: self-verified evidence
+    path = gotchas.gotchas_path(hub.log.project_for(str(tmp_path)))
+    assert not path.exists()  # seen once: not yet
+    s2 = _recording_session(tmp_path, "s2", frames)
+    _fail(hub, s2, "python y.py", "sh: 1: python: not found")
+    line = "- bash: python: exit <n>: sh: <n>: python: not found — `python3 x.py` worked instead"
+    assert path.read_text(encoding="utf-8").splitlines() == [line]
+    assert not [p for p in hub.store.all() if p.kind == "project_gotcha"]  # no card
+    assert [p["text"] for t, p in frames if t == "notification"] == ["Learned for this project: " + line[2:]]
+    _fail(hub, s2, "python z.py", "sh: 1: python: not found")  # already learned: no rewrite, no second notification
+    assert path.read_text(encoding="utf-8").splitlines() == [line]
+    assert len([t for t, _ in frames if t == "notification"]) == 1
+    assert line in build_system_prompt("base", cwd=tmp_path, config=Settings())
+
+
+async def test_a_hintless_recurring_failure_still_waits_for_the_card(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    for i in range(2):
+        _fail(hub, _session(server, tmp_path, f"s{i}"), f"npm t{i}", "sh: 1: npm: not found")
+    assert not [p for p in hub.store.all() if p.kind == "project_gotcha"]
+    _fail(hub, _session(server, tmp_path, "s3"), "npm t3", "sh: 1: npm: not found")
+    assert [p.kind for p in hub.store.all() if p.kind == "project_gotcha"] == ["project_gotcha"]
+    assert not gotchas.gotchas_path(hub.log.project_for(str(tmp_path))).exists()
+
+
+def test_auto_learning_refuses_redacted_hints_and_non_project_classes():
+    assert gotchas.auto_ok("exit 127", "`python3 x.py` worked instead")
+    assert not gotchas.auto_ok("exit 127", "")
+    assert not gotchas.auto_ok("exit 1", "`deploy --token <redacted>` worked instead")
+    assert not gotchas.auto_ok("exit 1", f"`deploy {FAKE_KEY}` worked instead")
+    for cls in gotchas.NOT_PROJECT:
+        assert not gotchas.auto_ok(cls, "worked with different path")
 
 
 async def test_repeats_older_than_the_window_or_in_other_projects_do_not_count(tmp_path, monkeypatch):

@@ -166,10 +166,17 @@ class LearningHub:
             for r in self.log.query("tool_error", project=pid, since=self.clock() - gotchas.WINDOW, actor=None)
             if r["subject"] == sig and r["detail"].get("tool") == tool
         ]
-        if len(rows) < gotchas.REPEATS:
-            return None
         hint = next((str(r["detail"]["followup"]) for r in reversed(rows) if r["detail"].get("followup")), "")
         line = f"{tool}: {sig}" + (f" — {hint}" if hint else "")
+        if (
+            self.cfg["auto_gotchas"]
+            and len(rows) >= gotchas.AUTO_REPEATS
+            and gotchas.auto_ok(str(rows[-1]["choice"]), hint)
+        ):
+            self._auto_gotcha(session, pid, tool, sig, line)
+            return None
+        if len(rows) < gotchas.REPEATS:
+            return None
         p = self.store.add(
             "project_gotcha",
             gotchas.proposal_text(sig, hint),
@@ -182,6 +189,15 @@ class LearningHub:
         if p is not None:
             self.emit(session, [p])
         return p
+
+    def _auto_gotcha(self, session: Any, pid: str, tool: str, sig: str, line: str) -> None:
+        """Write a self-verified gotcha (a retry worked) without a card and tell the session in one line. A signature
+        the project already has a lesson for is left alone, so a recurring failure is learned and announced once."""
+        path = gotchas.gotchas_path(pid, self.home)
+        if gotchas.has_lesson(path, tool, sig):
+            return
+        gotchas.append_gotcha(path, line)
+        session.emit("notification", {"session_id": session.session_id, "text": f"Learned for this project: {line}"})
 
     # ── proposals ──
 

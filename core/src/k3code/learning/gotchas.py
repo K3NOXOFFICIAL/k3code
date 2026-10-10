@@ -1,8 +1,11 @@
 """Project gotchas: tool failures that keep coming back in one project, kept under ``$K3CODE_HOME/projects/<id>``.
 
-The learning hub records every tool failure as a ``tool_error`` decision. When the same signature (see
-``k3code.toolerrors``) shows up REPEATS times in a project within WINDOW, it proposes a gotcha line, with a hint from
-the call that worked next when there was one. An accepted gotcha is appended to ``gotchas.md`` in the project's
+The learning hub records every tool failure as a ``tool_error`` decision. A retry of the failed call that worked next
+becomes the row's hint. A signature that carries such a hint is self-verified: with ``learning.auto_gotchas`` on (the
+default) it is written as a gotcha line on its own once it shows up AUTO_REPEATS times in a project within WINDOW, and
+the session gets a one-line notification (never for a class in NOT_PROJECT, nor a hint the scrubber redacted
+something in). A hintless signature, or any signature with the setting off, waits for REPEATS sightings and is proposed
+as a card instead. An accepted (or auto-learned) gotcha is appended to ``gotchas.md`` in the project's
 directory under the k3code home (never a file in the repository) and goes into the system prompt as a fenced
 "known pitfalls in this project" block of at most MAX_LINES lines, oldest dropped.
 """
@@ -16,10 +19,12 @@ from typing import Any
 
 from k3code.learning.decisions import project_id
 from k3code.paths import home as k3code_home
-from k3code.redact import scrub_text
+from k3code.redact import REDACTED, scrub_text
 
 WINDOW = 14 * 86400.0
 REPEATS = 3
+#: sightings after which a failure with a working retry (its hint) is learned without asking
+AUTO_REPEATS = 2
 MAX_LINES = 30
 HEADING = "## Known pitfalls in this project"
 #: failure classes that say nothing about the project: a user's denial (E6 learns from its reason) and a call the
@@ -83,3 +88,15 @@ def followup_hint(tool: str, failed_args: dict[str, Any], ok_args: dict[str, Any
 
 def proposal_text(signature: str, hint: str) -> str:
     return f"project gotcha: {signature}" + (f" — {hint}" if hint else "")
+
+
+def auto_ok(error_class: str, hint: str) -> bool:
+    """Whether a recurring failure may become a gotcha without a card: it has a working retry, says something about
+    the project, and its hint held nothing the scrubber had to redact (a lesson must never be built on a secret)."""
+    return bool(hint) and error_class not in NOT_PROJECT and REDACTED not in hint and scrub_text(hint) == hint
+
+
+def has_lesson(path: Path, tool: str, signature: str) -> bool:
+    """Whether ``path`` already holds a gotcha for this tool and signature (with any hint)."""
+    head = " ".join(f"- {tool}: {signature}".split())
+    return any(e == head or e.startswith(head + " — ") for e in _entries(path))
