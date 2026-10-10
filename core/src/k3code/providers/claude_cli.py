@@ -179,6 +179,8 @@ class _Session:
     busy: bool = True
     last_used: float = field(default_factory=time.monotonic)
     cost: float = 0.0  # the process's running total_cost_usd so far
+    timer: asyncio.TimerHandle | None = None  # the idle-reap timer while the process waits for its next turn
+    dropped: bool = False
 
 
 def _real_home() -> str:
@@ -251,13 +253,16 @@ class ClaudeCliProvider(Provider):
         self.max_sessions = max(1, max_sessions)
         self.idle_seconds = idle_seconds
         self._pool: list[_Session] = []
+        self._spawning = 0  # pool slots reserved by checkouts that are still evicting or spawning
+        self._reaping: set[asyncio.Task[None]] = set()  # background reaps of idle-expired processes
 
     def __repr__(self) -> str:
         return f"ClaudeCliProvider(name={self.name!r}, command={self.command!r})"
 
     async def aclose(self) -> None:
-        for sess in list(self._pool):
-            await self._drop(sess)
+        await self._drop(*self._pool)
+        if self._reaping:
+            await asyncio.gather(*self._reaping, return_exceptions=True)
         if self._workdir:
             shutil.rmtree(self._workdir, ignore_errors=True)
             self._workdir = None
@@ -402,6 +407,7 @@ class ClaudeCliProvider(Provider):
                 if rc != 0 or result is None or result.get("is_error"):
                     raise _error_from_result(result, err, rc)  # after streamed text the router sends "reset" first
                 text, calls = _reply_from_result(result, tools)
+                reuse = sess is not None and _mirrors_reply(result, tools)
                 usage = _usage(result)
                 final = Message(role="assistant", content=text or None, tool_calls=calls, usage=usage)
                 if sess is not None:
@@ -411,10 +417,14 @@ class ClaudeCliProvider(Provider):
                     sess.covered = [*covered, _fingerprint(final)]
                     sess.last_calls = list(calls)
                     sess.last_used = time.monotonic()
-                    sess.busy = False
+                    if reuse:
+                        sess.busy = False
+                        self._arm_idle_timer(sess)
                 ok = True
             finally:
-                if sess is not None and not ok:  # error, crash, timeout, cancel, a rejected reply: never reuse it
+                # error, crash, timeout, cancel, a rejected reply, or a reply k3code keeps differently from the
+                # process's own copy (prose around tool blocks, invalid blocks): never reuse it
+                if sess is not None and not (ok and reuse):
                     await self._drop(sess)
 
         if rest := gate.rest(text):
@@ -469,24 +479,41 @@ class ClaudeCliProvider(Provider):
                 best = s
         if best is not None:
             best.busy = True
+            self._disarm_idle_timer(best)
             return best, render_delta(body[len(best.covered) :], best.last_calls, tools), fps
-        if len(self._pool) >= self.max_sessions:
+        # A full render starts this conversation over: idle processes that began with the same first message are
+        # superseded (an edited or compacted history) and would only hold a slot until they idled out.
+        doomed = [s for s in self._pool if not s.busy and fps and s.key == key and s.covered[:1] == fps[:1]]
+        for s in doomed:
+            self._detach(s)
+        # Everything up to the reservation below is synchronous, so concurrent checkouts see each other's slots.
+        if len(self._pool) + self._spawning >= self.max_sessions:
             idle = [s for s in self._pool if not s.busy]
             if not idle:
+                await self._drop(*doomed)
                 return None, "", fps
-            await self._drop(min(idle, key=lambda s: s.last_used))  # least recently used
-        system_file = self._write_system(system)
-        env = _clean_env(thinking)
-        env["DISABLE_AUTO_COMPACT"] = "1"  # k3code compacts its own message list; the mirror must not diverge
+            victim = min(idle, key=lambda s: s.last_used)  # least recently used
+            self._detach(victim)
+            doomed.append(victim)
+        self._spawning += 1
         try:
-            proc = await self._spawn_proc(self._command_line(model, system_file, persistent=True, level=level), env)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(system_file)
-            raise
-        assert proc.stderr
-        sess = _Session(proc=proc, key=key, system_file=system_file, stderr=asyncio.ensure_future(proc.stderr.read()))
-        self._pool.append(sess)
+            await self._drop(*doomed)
+            system_file = self._write_system(system)
+            env = _clean_env(thinking)
+            env["DISABLE_AUTO_COMPACT"] = "1"  # k3code compacts its own message list; the mirror must not diverge
+            try:
+                cmd = self._command_line(model, system_file, persistent=True, level=level)
+                proc = await self._spawn_proc(cmd, env)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(system_file)
+                raise
+            assert proc.stderr
+            stderr = asyncio.ensure_future(proc.stderr.read())
+            sess = _Session(proc=proc, key=key, system_file=system_file, stderr=stderr)
+            self._pool.append(sess)
+        finally:
+            self._spawning -= 1
         return sess, prompt, fps
 
     async def _turn(self, sess: _Session, text: str) -> AsyncIterator[dict[str, Any]]:
@@ -519,26 +546,69 @@ class ClaudeCliProvider(Provider):
             raise ProviderError(f"claude -p timed out after {self.timeout:g}s", status_code=504) from exc
 
     async def _reap(self) -> None:
-        """Drop idle processes that have exited or idled longer than ``idle_seconds``."""
+        """Drop idle processes that have exited or idled longer than ``idle_seconds`` (the idle timer normally gets
+        there first; this catches exits and a loop that was too busy to run the timer)."""
         now = time.monotonic()
-        for s in list(self._pool):
-            if not s.busy and (s.proc.returncode is not None or now - s.last_used > self.idle_seconds):
-                await self._drop(s)
+        stale = [
+            s
+            for s in self._pool
+            if not s.busy and (s.proc.returncode is not None or now - s.last_used > self.idle_seconds)
+        ]
+        await self._drop(*stale)
 
-    async def _drop(self, sess: _Session) -> None:
-        """Remove a process from the pool, kill its process group and reap it (shielded so a cancel cannot skip the
-        reap, bounded so a stuck process cannot hold it up)."""
+    def _arm_idle_timer(self, sess: _Session) -> None:
+        """Reap ``sess`` after ``idle_seconds`` without a next turn, even when no further call ever comes."""
+        self._disarm_idle_timer(sess)
+        sess.timer = asyncio.get_running_loop().call_later(max(0.0, self.idle_seconds), self._idle_expired, sess)
+
+    @staticmethod
+    def _disarm_idle_timer(sess: _Session) -> None:
+        if sess.timer is not None:
+            sess.timer.cancel()
+            sess.timer = None
+
+    def _idle_expired(self, sess: _Session) -> None:
+        sess.timer = None
+        if sess.busy or sess.dropped:
+            return
+        self._detach(sess)  # out of the pool and killed now; the reap itself runs as a task
+        task = asyncio.get_running_loop().create_task(self._drop(sess))
+        self._reaping.add(task)
+        task.add_done_callback(self._reaping.discard)
+
+    def _detach(self, sess: _Session) -> None:
+        """The synchronous half of ``_drop``: out of the pool, never handed out again, process group killed."""
+        if sess.dropped:
+            return
+        sess.dropped = True
+        sess.busy = True
+        self._disarm_idle_timer(sess)
         with contextlib.suppress(ValueError):
             self._pool.remove(sess)
-        sess.busy = True
         if sess.proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(sess.proc.pid, 9)
-        with contextlib.suppress(BaseException):
-            await asyncio.wait_for(asyncio.shield(sess.proc.wait()), 5)
-        sess.stderr.cancel()
-        with contextlib.suppress(OSError):
-            os.unlink(sess.system_file)
+
+    async def _drop(self, *sessions: _Session) -> None:
+        """Remove processes from the pool, kill their process groups and reap them. All are killed before the first
+        wait; each wait is shielded so a cancel cannot skip a reap and bounded so a stuck process cannot hold it up.
+        A cancel that lands meanwhile is re-raised once every process is reaped, so the caller stops instead of
+        going on to spawn a replacement."""
+        for sess in sessions:
+            self._detach(sess)
+        cancelled: asyncio.CancelledError | None = None
+        for sess in sessions:
+            try:
+                await asyncio.wait_for(asyncio.shield(sess.proc.wait()), 5)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+            except Exception:  # TimeoutError: a stuck process is left to the kernel after SIGKILL
+                pass
+            sess.stderr.cancel()
+            with contextlib.suppress(OSError):
+                os.unlink(sess.system_file)
+        if cancelled is not None:
+            raise cancelled
 
 
 async def _feed(stdin: asyncio.StreamWriter, data: bytes) -> None:
@@ -633,6 +703,23 @@ def _reply_from_result(result: dict[str, Any], tools: list[ToolSpec]) -> tuple[s
     if not calls:
         return _TOOL_BLOCK.sub("", raw).strip(), []
     return raw[: matches[0].start()].strip(), calls
+
+
+def _mirrors_reply(result: dict[str, Any], tools: list[ToolSpec]) -> bool:
+    """Whether the process's own copy of its reply (the raw ``result`` text it keeps in its history) is what k3code
+    keeps: the text before the first tool block, then the blocks, each of which parsed to at least one call, with
+    nothing but whitespace between or after them. Anything else (prose after a block, an invalid block k3code
+    strips) means k3code's history now differs from the process's, so the process must not be reused."""
+    raw = str(result.get("result") or "")
+    if not tools:
+        return True  # the whole text is kept
+    blocks = list(_TOOL_BLOCK.finditer(raw))
+    if not blocks:
+        return True
+    if not all(_parse_tool_calls(b.group(1)) for b in blocks):
+        return False
+    gaps = [raw[a.end() : b.start()] for a, b in zip(blocks, blocks[1:], strict=False)] + [raw[blocks[-1].end() :]]
+    return all(not g.strip() for g in gaps)
 
 
 _NOT_ARGUMENTS = frozenset({"name", "tool", "id", "type", "arguments", "parameters", "input", "args"})
