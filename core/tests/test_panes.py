@@ -14,6 +14,7 @@ from k3code.integrations.panes import (
     k3code_argv,
     map_state,
     open_pane_spec,
+    readonly_verdict,
 )
 from m1cmd_helpers import cmd, frames_of, make_server, new_session, rpc
 
@@ -272,6 +273,23 @@ def test_readonly_refuses_changes(tuios):
     resume = json.dumps({"jsonrpc": "2.0", "id": 6, "method": "session.resume", "params": {}})
     assert link.on_client_line(resume) is None
     assert link.on_client_line(json.dumps({"jsonrpc": "2.0", "id": "approval-1", "result": {}})) == ""
+
+
+def test_readonly_refuses_tune_set_but_not_tune_get(tuios):
+    # tune.set switches the session's model, effort and ultracode mode and can write default_model into the user
+    # config: a watch-only attach must be refused it, like config.set. tune.get only reads.
+    link = PaneLink.from_env(readonly=True, environ=tuios.env())
+    for params in ({"model": "x", "scope": "default"}, {"ultra_mode": "ultracode"}, {}):
+        line = json.dumps({"jsonrpc": "2.0", "id": 7, "method": "tune.set", "params": params})
+        err = link.on_client_line(line)
+        assert err and json.loads(err) == {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "error": {"code": -32000, "message": "this pane is read-only"},
+        }
+        assert readonly_verdict(json.loads(line)) == err  # the daemon's own read-only attach filters the same way
+    get = json.dumps({"jsonrpc": "2.0", "id": 8, "method": "tune.get", "params": {}})
+    assert link.on_client_line(get) is None and readonly_verdict(json.loads(get)) is None
 
 
 async def test_fanout_panes_config_emits_pane_open(tmp_path, monkeypatch):

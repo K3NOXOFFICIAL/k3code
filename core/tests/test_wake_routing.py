@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 from k3code.config import Settings, load_config
 from k3code.wakewords import detect_enabled, wake_cfg
-from test_autonomy_gateway import call, events, make, models_called, start, sub, verdict
+from test_autonomy_gateway import call, events, k3home, make, models_called, start, sub, verdict
 from test_ultra import JUDGE, PLANNERS
 
 NORMAL = {"type": "text", "model": "m-main", "text": "NORMAL-TURN"}
@@ -614,6 +614,188 @@ async def test_ultraresearch_takes_a_question_with_an_apostrophe(tmp_path, monke
     await finish(server)
     await submit(server, "ultraresearch --n 3 what's new in 3.14?")
     assert pipe.calls == [("ultraresearch", "what's the state of asyncio?"), ("ultraresearch", "what's new in 3.14?")]
+
+
+# ── typed "ultracode off" and friends are mode control, not a task ──
+
+
+@pytest.mark.parametrize(
+    ("text", "before", "after", "says"),
+    [
+        ("ultracode off", "ultracode", "off", "Ultracode mode is off"),
+        ("Ultracode OFF.", "ultracode", "off", "Ultracode mode is off"),
+        ("turn off ultracode", "ultracode", "off", "Ultracode mode is off"),
+        ("please turn ultracode off", "ultracode", "off", "Ultracode mode is off"),
+        ("ultracode on", "off", "ultracode", "Ultracode mode is on"),
+        ("ultracode mode on", "off", "ultracode", "Ultracode mode is on"),
+        ("ultracode status", "ultracode", "ultracode", "Ultracode mode is on"),
+        ("show ultracode status", "off", "off", "Ultracode mode is off"),
+    ],
+)
+async def test_typed_mode_words_after_ultracode_set_or_show_the_mode_instead_of_running_the_pipeline(
+    tmp_path, monkeypatch, text, before, after, says
+):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    await start(server, tmp_path)
+    if before == "ultracode":
+        await call(server, "slash.exec", {"command": "ultracode on"})
+    await submit(server, text)
+    assert pipe.calls == [] and models_called(server) == [] and progress(server) == []
+    assert server.session.ultra_mode == after and ("ultra_mode" in server.session.stored.meta) == (after != "off")
+    (user, reply) = transcript(server)
+    assert user == ("user", text) and reply[0] == "assistant" and reply[1].startswith(says)
+    assert events(server, "message.complete")[-1]["status"] == "done"
+    assert all(e.get("text") != "running hooks" for e in events(server, "status.update"))  # none are configured
+
+
+@pytest.mark.parametrize(
+    ("text", "task"),
+    [
+        ("ultracode on the auth module", "on the auth module"),  # starts with a mode word, is still a task
+        ("ultracode off-by-one in the pager", "off-by-one in the pager"),
+        ("turn off the cache in ultracode", "turn off the cache in"),
+        ("ultracode status page for the API", "status page for the API"),
+    ],
+)
+async def test_a_task_that_merely_contains_a_mode_word_still_runs_the_pipeline(tmp_path, monkeypatch, text, task):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    await start(server, tmp_path)
+    await submit(server, text)
+    assert pipe.calls == [("ultracode", task)] and server.session.ultra_mode == "off"
+
+
+async def test_the_other_wake_words_have_no_mode_words(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    await start(server, tmp_path)
+    await submit(server, "ultraresearch off")
+    assert pipe.calls == [("ultraresearch", "off")]
+
+
+# ── the user's UserPromptSubmit hooks see a routed prompt first ──
+
+BLOCK_HOOK = "  UserPromptSubmit:\n    - {command: \"echo 'has a secret' >&2; exit 2\"}\n"
+SECRET = "my password is hunter2, fix the login form validation"
+
+
+def _hooks(tmp_path, hooks_yaml: str) -> None:
+    home = k3home(tmp_path)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text("hooks:\n" + hooks_yaml, encoding="utf-8")
+
+
+def _blocked(server: Any) -> bool:
+    return "Prompt blocked by a UserPromptSubmit hook: has a secret" in [
+        e.get("text", "") for e in events(server, "message.delta")
+    ]
+
+
+async def test_a_hook_that_blocks_the_prompt_stops_a_wake_word_run(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    _hooks(tmp_path, BLOCK_HOOK)
+    await start(server, tmp_path)
+    await submit(server, f"ultracode {SECRET}")
+    assert pipe.calls == [] and models_called(server) == [] and progress(server) == []
+    assert _blocked(server) and transcript(server) == []  # the prompt is not kept either
+    done = events(server, "message.complete")[-1]
+    assert done["status"] == "done" and "Prompt blocked" in done["text"]
+
+
+async def test_a_hook_that_blocks_the_prompt_keeps_it_from_the_scope_classifier_and_the_mode_pipeline(
+    tmp_path, monkeypatch
+):
+    server = make(tmp_path, monkeypatch, [verdict("small"), NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    _hooks(tmp_path, BLOCK_HOOK)
+    await start(server, tmp_path)
+    server.session.ultra_mode = "ultracode"
+    await submit(server, SECRET)
+    assert models_called(server) == [] and classifier_calls(server) == 0  # not even the classifier saw it
+    assert pipe.calls == [] and progress(server) == [] and transcript(server) == []
+    assert _blocked(server)
+
+
+async def test_a_blocked_bare_wake_word_gets_no_usage_line(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    _hooks(tmp_path, BLOCK_HOOK)
+    await start(server, tmp_path)
+    await submit(server, "ultracode")
+    assert pipe.calls == [] and transcript(server) == [] and _blocked(server)
+
+
+async def test_stop_while_a_hook_runs_ends_the_turn_before_any_job(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    _hooks(tmp_path, "  UserPromptSubmit: [{command: 'sleep 30'}]\n")
+    await start(server, tmp_path)
+    await call(server, "prompt.submit", {"text": "ultracode fix it"})
+    task = server.session.turn_task
+    for _ in range(500):  # until the hook is running
+        if any(e.get("text") == "running hooks" for e in events(server, "status.update")):
+            break
+        await asyncio.sleep(0.01)
+    assert (await call(server, "session.interrupt", {}))["interrupted"] is True
+    await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled() and not server.session.turn_in_flight
+    assert pipe.calls == [] and models_called(server) == [] and transcript(server) == []
+    last = events(server, "status.update")[-1]
+    assert last["text"] == "" and last["state"] == "completed"  # the busy line is cleared
+
+
+async def test_a_hooks_context_goes_with_the_task_of_a_wake_word_job(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    _hooks(tmp_path, "  UserPromptSubmit: [{command: 'echo CTX-FROM-HOOK'}]\n")
+    await start(server, tmp_path)
+    await submit(server, "ultracode fix the login form")
+    ((mode, task),) = pipe.calls
+    assert mode == "ultracode" and task.startswith("fix the login form\n\n")
+    assert "context from the user's hooks:" in task and task.endswith("CTX-FROM-HOOK\n```")
+    # the transcript keeps what the user typed, and the status line names the job without the hook's text
+    assert transcript(server)[0] == ("user", "ultracode fix the login form")
+    assert all("CTX-FROM-HOOK" not in e.get("text", "") for e in events(server, "status.update"))
+    shown = [e for e in events(server, "status.update") if e.get("text") == "running hooks"]
+    assert [e["state"] for e in shown] == ["working"]  # the user sees the turn is busy while a hook runs
+
+
+async def test_a_hooks_context_goes_with_the_task_of_a_mode_job(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [verdict("small"), NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    _hooks(tmp_path, "  UserPromptSubmit: [{command: 'echo CTX-FROM-HOOK'}]\n")
+    await start(server, tmp_path)
+    server.session.ultra_mode = "ultracode"
+    await submit(server, "add a --verbose flag to the CLI")
+    ((mode, task),) = pipe.calls
+    assert mode == "ultracode" and task.startswith("add a --verbose flag to the CLI\n\n") and "CTX-FROM-HOOK" in task
+    assert classifier_calls(server) == 1 and "CTX-FROM-HOOK" not in " ".join(
+        c["text"] for p in server.providers for c in p.log
+    )  # the classifier was asked about the prompt, not about the hook's text
+
+
+async def test_the_hooks_run_once_per_typed_prompt_whether_or_not_it_is_routed(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [verdict("trivial"), NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    count = tmp_path / "hook-count.txt"
+    _hooks(
+        tmp_path,
+        f"  SessionStart: [{{command: 'echo start >> {count}'}}]\n"
+        f"  UserPromptSubmit: [{{command: 'echo prompt >> {count}'}}]\n",
+    )
+    await start(server, tmp_path)
+    server.session.ultra_mode = "ultracode"
+    await submit(server, "what does the retry flag do?")  # classified trivial: falls through to a normal turn
+    assert pipe.calls == [] and transcript(server)[-1] == ("assistant", "NORMAL-TURN")
+    assert count.read_text().split() == ["start", "prompt"]
+    await submit(server, "ultracode fix the build")  # a wake word job
+    assert pipe.calls == [("ultracode", "fix the build")]
+    assert count.read_text().split() == ["start", "prompt", "prompt"]  # SessionStart only the first time
+    server.session.ultra_mode = "off"
+    await submit(server, "and a plain prompt")
+    assert count.read_text().split() == ["start", "prompt", "prompt", "prompt"]
 
 
 # ── config ──

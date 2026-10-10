@@ -190,8 +190,12 @@ export function buildTuneRows(snap: TuneSnapshot): TuneRow[] {
 }
 
 export interface TuneState {
-  /** What the session has now: a field is sent only when the popup moved off it. */
-  base: { model: string; stop: number; ultra: boolean };
+  /**
+   * What the session has now: a field is sent only when the popup moved off it.
+   * `defaultModel` is the other half of the model: what scope `default` would
+   * replace, so Enter can tell "already the default" from "make it the default".
+   */
+  base: { defaultModel: string; model: string; stop: number; ultra: boolean };
   cursor: number;
   hasSession: boolean;
   rows: TuneRow[];
@@ -210,6 +214,7 @@ export function initTuneState(snap: TuneSnapshot): TuneState {
 
   return {
     base: {
+      defaultModel: snap.defaultModel,
       model: snap.model,
       stop,
       ultra: snap.ultraOn,
@@ -257,8 +262,14 @@ export interface TuneStep {
 /**
  * The one `tune.set` the popup sends: scope plus ONLY the fields that moved off
  * what the session had. null when nothing would change, so Enter on an
- * untouched popup just closes it (and never rewrites the default model on the
- * side). Effort and ultracode need a session.
+ * untouched popup just closes it. Effort and ultracode need a session.
+ *
+ * The model is a change in two ways: it is off the session's model (either
+ * scope), or, with scope `default`, it is not the default model yet. The second
+ * is what "Enter makes your pick the default" promises: Enter on the session's
+ * own model, when that model is not the default, must still make it the
+ * default instead of closing without a word. Scope `session` never touches the
+ * default.
  */
 export function tuneParams(
   state: TuneState,
@@ -269,7 +280,10 @@ export function tuneParams(
   const pick = state.rows[state.cursor]?.key ?? base.model;
   const params: TuneSetParams = { scope };
 
-  if (pick !== base.model) {
+  if (
+    pick !== base.model ||
+    (scope === "default" && pick !== base.defaultModel)
+  ) {
     params.model = pick;
   }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -38,3 +39,22 @@ def test_every_wake_word_names_a_command() -> None:
     for word, command in WAKE_WORDS.items():
         assert word == command
         assert registry.get(command) is not None
+
+
+def _timed(text: str) -> tuple[object, float]:
+    start = time.perf_counter()
+    return detect(text), time.perf_counter() - start
+
+
+def test_a_long_prompt_full_of_code_is_scanned_in_linear_time() -> None:
+    # detect() runs on the gateway's event loop for every typed prompt, and collapsed pastes reach it fully expanded.
+    # Checking every code span against every other span made these take seconds to minutes (quadratic).
+    got, took = _timed("```" * 20000 + " ultracode")  # 60 KB of fences, then a word outside them
+    assert got is not None and got.mode == "ultracode" and took < 2.0
+    got, took = _timed("`a` " * 20000 + "ultracode " * 20000)  # 280 KB: 20000 inline spans, then 20000 words
+    assert got is not None and got.mode == "ultracode" and got.start == 80000 and took < 2.0
+    got, took = _timed("```" * 20000)  # no word at all
+    assert got is None and took < 2.0
+    # every word inside a code span: nothing triggers, however many there are
+    got, took = _timed("`ultracode` " * 20000 + "```\n" + "ultraplan\n" * 20000)
+    assert got is None and took < 2.0

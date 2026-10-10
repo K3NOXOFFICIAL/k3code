@@ -40,7 +40,7 @@ const WORD = new RegExp(
 
 const FENCE = /```[\s\S]*?(?:```|$)/g;
 const INLINE_CODE = /`[^`\n]*`/g;
-const QUOTES = "`\"'“”‘’";
+const QUOTES = "`\"'“”‘’„‚«»‹›「」『』";
 const LEAD_PUNCT = /^[ \t]*[:,;–—-](?=\s|$)/;
 const TRAIL_PUNCT = /[,;:–—-]+$/;
 const GLUE_AFTER = ",.;:!?)";

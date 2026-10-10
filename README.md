@@ -207,11 +207,11 @@ Say ultracode / ultraplan / ultraresearch in a prompt to run that mode once.
 | `↑` / `↓` | Move through the models (`1` to `9` jump to that row) |
 | `←` / `→` | Move the effort mark: `default` (send no effort level), `low`, `medium`, `high`, `xhigh`, `max` |
 | `Tab` | Ultracode on / off |
-| `Enter` | Apply what you changed. A model you changed also becomes the default for new sessions |
+| `Enter` | Apply what you changed, and make the highlighted model the default for new sessions (nothing is written when it already is the default) |
 | `s` | Apply to this session only |
 | `Esc` | Close; nothing changes |
 
-The current model has a green ✓. The popup sends everything in one request and only the fields you moved, so `Enter` on an untouched popup just closes it. Model and effort apply from the next turn, the ultracode mode from the next prompt. When the highlighted model takes no effort level the popup says so. Without a session, effort and ultracode are greyed out and their keys do nothing; the model can still be set. The popup does not open, and ignores keys, while an approval, question, password or confirm prompt is waiting. It fits 80x24: the model list shrinks first, and below 70 columns the descriptions go.
+The current model has a green ✓. The popup sends everything in one request and only the fields you moved, so `Enter` on an untouched popup just closes it when the highlighted model is already the default; otherwise it makes that model the default (use `s` to leave the default alone). Model and effort apply from the next turn, the ultracode mode from the next prompt. When the highlighted model takes no effort level the popup says so. Without a session, effort and ultracode are greyed out and their keys do nothing; the model can still be set. The popup does not open, and ignores keys, while an approval, question, password or confirm prompt is waiting. It fits 80x24: the model list shrinks first, and below 70 columns the descriptions go.
 
 The same thing, typed (the TUI opens the popup for a bare `/tune`; other clients get the current state):
 
@@ -230,7 +230,7 @@ The same thing, typed (the TUI opens the popup for a bare `/tune`; other clients
 - The old picker's spellings still work: `--reasoning <level>` is `effort <level>`; `minimal`, `ultra` and `none` after `effort` or `--reasoning` mean `low`, `max` and `default`; `--provider <name>` and `--tui-session` are accepted and ignored.
 - `/model <key>` and `/effort <level>` do what they always did, and take the same flags: `/model strong --reasoning high --global`.
 
-**The default model.** Enter in the popup (after you changed the model) and `--global` write `default_model: <key>` into your user `config.yaml` (never the project's). k3code checks that the key exists and that the file stays valid, keeps a timestamped backup next to it, then writes. The rewrite drops YAML comments; the backup keeps them. If the write fails you get the error and nothing else from that request is applied. `s` and anything without `--global` change this session only.
+**The default model.** Enter in the popup and `--global` write `default_model: <key>` into your user `config.yaml` (never the project's). k3code checks that the key exists and that the file stays valid, keeps a timestamped backup next to it, then writes. The rewrite drops YAML comments; the backup keeps them. If the write fails you get the error and nothing else from that request is applied. `s` and anything without `--global` change this session only.
 
 ### Ultracode mode
 
@@ -273,7 +273,9 @@ A word does not count when:
 - it is quoted or in code: in backticks, in quotes or in a code block;
 - the prompt names two different wake words ("what is the difference between ultracode and ultraplan?"): that is ambiguous, so nothing runs.
 
-Only text you typed is checked: a prompt you send, a prompt that waited in the queue (checked when it runs), a steering message that ends up running as a prompt, and `/bg <prompt>`. Goal prompts, loop, cron and automation ticks, sub-agents, tool output and text the TUI generated (skills, `/go`, accepted proposals) never trigger one. Wake words work for prompts that go through the gateway (the TUI, including `k3code attach`). They do not apply to `k3code -p` or the line REPL, which run their own loop without the gateway.
+`ultracode on`, `ultracode off` and `ultracode status`, and the same asked in a few words ("turn off ultracode", "ultracode mode on"), change or show the [mode](#ultracode-mode) like `/ultracode on|off|status` instead of starting a run. "ultracode on the auth module" is a task. Your `UserPromptSubmit` hooks see a prompt before a wake word or the mode does: one a hook blocks starts nothing, and what a hook adds is passed to the run.
+
+Only text you typed is checked (a collapsed paste is part of the prompt you send, so a word in it counts, although the composer does not paint it): a prompt you send, a prompt that waited in the queue (checked when it runs), a steering message that ends up running as a prompt, and `/bg <prompt>`. Goal prompts, loop, cron and automation ticks, sub-agents, tool output and text the TUI generated (skills, `/go`, accepted proposals) never trigger one. Wake words work for prompts that go through the gateway (the TUI, including `k3code attach`). They do not apply to `k3code -p` or the line REPL, which run their own loop without the gateway.
 
 While you type, the composer paints a word that counts in the accent colour, so you see it before you press Enter. The composer does not read your `wake_words` settings: a word you switched off is painted too, but does nothing.
 

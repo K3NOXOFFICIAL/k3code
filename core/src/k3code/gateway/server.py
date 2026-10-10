@@ -51,7 +51,7 @@ from k3code.blockers import BlockerStore
 from k3code.commands import CommandRegistry
 from k3code.commands import tune as tune_cmd
 from k3code.commands.builtin import build_registry as build_commands
-from k3code.commands.ultra_cmd import JobSpec
+from k3code.commands.ultra_cmd import JobSpec, typed_mode_word
 from k3code.config import Settings, default_project_dir, load_config, retention
 from k3code.context_budget import compact_threshold, context_window, overhead_tokens
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
@@ -1583,16 +1583,25 @@ class GatewayServer:
         prompt = text = str(text)  # the marker only says who wrote it
         mgr = self.goal_manager(session)
         session.goal_continuation = False  # the prompt the user sent is not a continuation
+        hooked: userhooks.HookOutcome | None = None  # the hooks' verdict on the typed prompt, handed to its first turn
         if typed and not self.halted:
-            # a wake word or the ultracode mode may run the prompt as a job instead of a normal turn
-            routed = await self._route_typed_prompt(session, text)
-            if routed is not None:
-                return routed
+            # the user's hooks see the prompt before the scope classifier or a job does: one a hook blocks reaches no
+            # model and no pipeline (it ends as a blocked normal turn below), and a hook's context goes into the job
+            hooked = await self._typed_prompt_hooks(session, text)
+            if not hooked.blocked:
+                # a wake word or the ultracode mode may run the prompt as a job instead of a normal turn
+                routed = await self._route_typed_prompt(session, text, hooked)
+                if routed is not None:
+                    return routed
         while True:
             try:
                 await self._maybe_compact(session)
                 n_before = len(session.stored.messages)
-                status, final_text = await self._run_one_turn(session, prompt)
+                if hooked is None:
+                    status, final_text = await self._run_one_turn(session, prompt)
+                else:  # the typed prompt's hooks ran above; a retry or a goal's next prompt runs its own
+                    status, final_text = await self._run_one_turn(session, prompt, hooked=hooked)
+                    hooked = None
                 if status == "error" and isinstance(session.last_exc, ContextOverflow):
                     # The provider says the conversation does not fit: drop this attempt's messages, fold the older
                     # history into a summary, and run the prompt once more.
@@ -1628,13 +1637,16 @@ class GatewayServer:
 
     # ── wake words and the ultracode mode ──
 
-    async def _route_typed_prompt(self, session: LiveSession, text: str) -> tuple[str, str] | None:
+    async def _route_typed_prompt(
+        self, session: LiveSession, text: str, hooked: userhooks.HookOutcome
+    ) -> tuple[str, str] | None:
         """A prompt the user typed: a wake word, else the ultracode mode, runs a job as this turn.
 
+        ``hooked``: what the user's hooks made of it (not blocked: the caller ends a blocked prompt as a normal turn).
         Returns the job's ``(status, text)``; None means run ``text`` as a normal turn. Deciding never costs the user
         their prompt: a failure while deciding is logged and the prompt runs normally."""
         try:
-            route = await self._plan_route(session, text)
+            route = await self._plan_route(session, text, hooked.context_text())
         except asyncio.CancelledError:  # /stop during the scope check: the ending of a cancelled turn
             session.run_result = "completed"
             self._block_goal_for(session, "interrupted")
@@ -1660,12 +1672,17 @@ class GatewayServer:
         self._session_finished(session, status)
         return status, out
 
-    async def _plan_route(self, session: LiveSession, text: str) -> _Route | None:
-        """Which job (if any) ``text`` runs as: an explicit wake word first, then the ultracode mode."""
+    async def _plan_route(self, session: LiveSession, text: str, context: str = "") -> _Route | None:
+        """Which job (if any) ``text`` runs as: an explicit wake word first, then the ultracode mode.
+
+        ``context``: what the user's UserPromptSubmit hooks added, handed to the job with the task."""
         if (hit := wakewords.detect_enabled(self.config, text)) is not None:
             cmd: Any = self.commands.get(hit.mode)
+            if hit.mode == "ultracode" and (word := typed_mode_word(hit.task)):
+                # "ultracode off", "turn ultracode off": what /ultracode takes as mode control, not a task to run
+                return _Route(hit.mode, "wake word", "", cmd.apply_mode_word(self, session, word))
             # an empty task (the word alone) comes back as the command's usage line
-            spec = await cmd.prepare(self, session, hit.task)
+            spec = await cmd.prepare(self, session, hit.task, context=context)
             return _Route(hit.mode, "wake word", f'"{hit.mode}" in your message', spec)
         if (
             getattr(session, "ultra_mode", "off") != "ultracode"
@@ -1680,7 +1697,7 @@ class GatewayServer:
         if verdict.source == "fallback" or SCOPES.index(verdict.scope) < SCOPES.index(min_scope):
             return None  # trivial, or the classifier is down: not worth a pipeline; the gate reuses this verdict
         ultracode: Any = self.commands.get("ultracode")
-        spec = await ultracode.prepare(self, session, text)
+        spec = await ultracode.prepare(self, session, text, context=context)
         self.autonomy.drop_mode_verdict(session)
         return _Route("ultracode", "ultracode is on", f"scope {verdict.scope}", spec)
 
@@ -1796,6 +1813,20 @@ class GatewayServer:
         outcome.context += submitted.context
         return outcome
 
+    async def _typed_prompt_hooks(self, session: LiveSession, text: str) -> userhooks.HookOutcome:
+        """The hooks for a prompt the user typed, run ahead of the turn so that nothing (the scope classifier, a
+        wake word's job) spends a model call on a prompt a hook blocks; ``_run_one_turn`` takes the outcome as given."""
+        hooks = userhooks.load(Path(session.stored.cwd or Path.cwd()), session.session_id)
+        if hooks:  # a hook can take a while: the turn is working, as it was when the hooks ran inside it
+            session.emit("status.update", {"kind": "status", "text": "running hooks", "state": "working"})
+        try:
+            return await self._prompt_hooks(session, hooks, text)
+        except asyncio.CancelledError:  # /stop while a hook runs: the ending of a cancelled turn
+            session.run_result = "completed"
+            self._block_goal_for(session, "interrupted")
+            session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+            raise
+
     def _active_model(self, session: LiveSession) -> str:
         """The model id the session's main tier sends to first (what its context window is looked up by)."""
         specs = tier_model_specs(self.config, Tier.MAIN, key=session.stored.model or self.config.default_model)
@@ -1812,8 +1843,12 @@ class GatewayServer:
             return context_window(self.config, self._active_model(session))
         return min(context_window(self.config, m) for m in models)
 
-    async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
-        """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
+    async def _run_one_turn(
+        self, session: LiveSession, text: str, *, hooked: userhooks.HookOutcome | None = None
+    ) -> tuple[str, str]:
+        """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text).
+
+        ``hooked``: the outcome of the user's hooks when the caller already ran them for ``text``."""
         if self.halted:  # /daemon pause: nothing reaches a provider; the caller pauses the goal (status 'halted')
             return "halted", ""
         self._ensure_router(session.stored.model or None)
@@ -1880,7 +1915,8 @@ class GatewayServer:
         session.current_kind = kind.value
         prompt_blocked = False
         try:
-            hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
+            if hooked is None:
+                hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
             prompt_blocked = hooked.blocked
             try:
                 if not hooked.blocked:

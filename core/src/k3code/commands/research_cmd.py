@@ -6,7 +6,7 @@ from typing import Any
 
 from k3code.commands import CommandDef
 from k3code.commands._util import reply, split_args
-from k3code.commands.ultra_cmd import JobSpec, start_spec
+from k3code.commands.ultra_cmd import JobSpec, start_spec, with_hook_context
 from k3code.research.flow import ResearchUnavailable
 
 
@@ -14,7 +14,7 @@ class UltraResearchCommand(CommandDef):
     def __init__(self) -> None:
         super().__init__(name="ultraresearch", help="Cited research report: /ultraresearch [--n N] <question>")
 
-    async def prepare(self, ctx: Any, live: Any, arg: str) -> JobSpec | dict[str, Any]:
+    async def prepare(self, ctx: Any, live: Any, arg: str, *, context: str = "") -> JobSpec | dict[str, Any]:
         n: int | None = None
         parts = split_args(arg) if arg else []  # an apostrophe in the question must not fail the command
         if len(parts) >= 2 and parts[0] == "--n" and parts[1].isdigit():
@@ -32,7 +32,7 @@ class UltraResearchCommand(CommandDef):
 
         async def job() -> str:
             try:
-                res = await ctx.research.run(live, question, n_sub=n)
+                res = await ctx.research.run(live, with_hook_context(question, context), n_sub=n)
             except ResearchUnavailable as e:
                 return str(e)
             return f"{res.report}\n\nReport saved: {res.path}"

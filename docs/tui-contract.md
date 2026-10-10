@@ -383,7 +383,8 @@ commands, which own the grammar (`core/src/k3code/commands/tune.py`).
 
 - One row per model key, in order: the default key first, then the keys of the providers' `models`, then the session's
   own key if it is not among them. Keys repeat across providers in the fallback chain; `providers` lists them and
-  `resolved` the real model ids the key maps to, in chain order.
+  `resolved` the real model ids the key maps to, in chain order. A provider that does not define the key contributes
+  its default model (what a turn on that key sends to it), so `providers` lists every provider of the chain.
 - `description` is the first non-empty text from a provider's `descriptions`, `""` when there is none.
 - `effort` on a row says whether that model takes an effort level (`false`: the level is ignored, `null`: unknown).
 - `effort` at the top is the session's level, `null` for "default" (no effort sent). Without a session
@@ -398,7 +399,7 @@ nothing changes. With `scope: "default"` a `model` is also written as `default_m
 backed up first) and set in memory; if the file cannot be written, the call fails and nothing else is applied. The result
 is the `tune.get` shape plus `{"ok": true, "changed": [...]}`, where `changed` lists what really differs now (`model`,
 `default_model`, `effort`, `ultra_mode`). A `session.info` event follows when a session exists and something changed.
-Model and effort apply from the next turn, `ultra_mode` from the next prompt.
+Model and effort apply from the next turn, `ultra_mode` from the next prompt. `tune.set` changes the session and the user config, so a read-only attach (`k3code attach --readonly`, panes) is refused; `tune.get` is forwarded.
 
 **`prompt.submit {automated?}`.** The TUI sets `automated: true` for text it generated and the user did not type: a
 `/skill` expansion, the `/go` send, an accepted proposal. It sends the key only when true. Typed prompts, and queue

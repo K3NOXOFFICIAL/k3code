@@ -268,5 +268,15 @@
   "input": "ünïcode ultracode test",
   "mode": "ultracode",
   "task": "ünïcode test"
+ },
+ {
+  "input": "was macht »ultracode«?",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "what does «ultraplan» do?",
+  "mode": null,
+  "task": null
  }
 ]

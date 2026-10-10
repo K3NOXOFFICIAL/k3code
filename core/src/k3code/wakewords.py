@@ -16,6 +16,7 @@ A mention triggers only when it is unambiguous:
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,7 +35,7 @@ _WORD = re.compile(
 )
 _FENCE = re.compile(r"```.*?(?:```|\Z)", re.DOTALL)
 _INLINE_CODE = re.compile(r"`[^`\n]*`")
-_QUOTES = "`\"'“”‘’"
+_QUOTES = "`\"'“”‘’„‚«»‹›「」『』"
 _LEAD_PUNCT = re.compile(r"^[ \t]*[:,;–—-](?=\s|$)")
 _TRAIL_PUNCT = ",;:-–—"
 _GLUE_AFTER = ",.;:!?)"
@@ -53,10 +54,24 @@ class WakeMatch:
     task: str  #: the prompt without the word (may be empty: the word alone)
 
 
-def _masked(text: str) -> list[tuple[int, int]]:
-    spans = [m.span() for m in _FENCE.finditer(text)]
-    spans += [m.span() for m in _INLINE_CODE.finditer(text) if not any(a <= m.start() < b for a, b in spans)]
-    return spans
+class _Spans:
+    """Sorted, non-overlapping ``(start, end)`` spans (what ``finditer`` yields) and a logarithmic "is this offset in
+    one of them" test, so a long prompt full of code is not scanned once per word."""
+
+    def __init__(self, spans: list[tuple[int, int]]) -> None:
+        self.spans = spans
+        self.starts = [a for a, _ in spans]
+
+    def __contains__(self, pos: int) -> bool:
+        i = bisect_right(self.starts, pos) - 1
+        return i >= 0 and pos < self.spans[i][1]
+
+
+def _masked(text: str) -> tuple[_Spans, _Spans]:
+    """The fenced blocks, and the inline code spans that do not start inside a fence."""
+    fences = _Spans([m.span() for m in _FENCE.finditer(text)])
+    inline = _Spans([m.span() for m in _INLINE_CODE.finditer(text) if m.start() not in fences])
+    return fences, inline
 
 
 def _task_without(text: str, start: int, end: int) -> str:
@@ -77,10 +92,13 @@ def detect(text: str) -> WakeMatch | None:
     """The wake word in ``text`` and the task that is left, or None (see the module docstring for the rules)."""
     if text.lstrip().startswith("/"):
         return None
-    masked = _masked(text)
+    words = list(_WORD.finditer(text))
+    if not words:
+        return None  # nearly every prompt: no need to look for code
+    fences, inline = _masked(text)
     found: list[re.Match[str]] = []
-    for m in _WORD.finditer(text):
-        if any(a <= m.start() < b for a, b in masked):
+    for m in words:
+        if m.start() in fences or m.start() in inline:
             continue
         if (m.start() > 0 and text[m.start() - 1] in _QUOTES) or (m.end() < len(text) and text[m.end()] in _QUOTES):
             continue

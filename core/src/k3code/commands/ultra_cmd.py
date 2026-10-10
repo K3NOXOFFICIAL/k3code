@@ -2,7 +2,8 @@
 
 Each command is split in two: ``prepare`` checks the input and returns either an immediate reply (usage, unavailable:
 costs nothing) or a :class:`JobSpec`, and ``handle`` = ``prepare`` + ``ctx.start_job``. Wake words and the ultracode
-mode (see ``GatewayServer._run_turn_locked``) call ``prepare`` too and run the spec inline in the running turn.
+mode (see ``GatewayServer._run_turn_locked``) call ``prepare`` too and run the spec inline in the running turn; they
+pass ``context``, what the user's UserPromptSubmit hooks added, which a normal turn appends to the prompt as well.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from typing import Any
 
 from k3code.commands import CommandDef
 from k3code.commands._util import reply
+from k3code.memory import fenced
 
 
 def _live(ctx: Any, session_id: str | None) -> Any:
@@ -27,6 +29,13 @@ class JobSpec:
     label: str  #: the status line while it runs (and the user message of a slash command)
     factory: Callable[[], Awaitable[str]]  #: the work; its text becomes the assistant message
     ack: str  #: the slash command's immediate reply
+
+
+def with_hook_context(task: str, context: str) -> str:
+    """``task`` for the pipeline, with the context the user's hooks added to the prompt (like a normal turn)."""
+    if not context:
+        return task
+    return f"{task}\n\n" + fenced("context from the user's hooks:", context)
 
 
 def start_spec(ctx: Any, live: Any, spec: JobSpec | dict[str, Any]) -> dict[str, Any]:
@@ -44,12 +53,12 @@ class UltraPlanCommand(CommandDef):
     def __init__(self) -> None:
         super().__init__(name="ultraplan", help="Deep plan: 3 independent planners + a judge: /ultraplan <task>")
 
-    async def prepare(self, ctx: Any, live: Any, arg: str) -> JobSpec | dict[str, Any]:
+    async def prepare(self, ctx: Any, live: Any, arg: str, *, context: str = "") -> JobSpec | dict[str, Any]:
         if not arg:
             return reply("Usage: /ultraplan <task>")
 
         async def job() -> str:
-            up = await ctx.ultra.ultraplan(live, arg)
+            up = await ctx.ultra.ultraplan(live, with_hook_context(arg, context))
             live.stored.meta["ultra_plan"] = {"task": arg, "plan": up.plan, "path": str(up.path or "")}
             ctx.store.save(live.stored)
             ctx.ultra.show_plan(live, up)
@@ -77,6 +86,18 @@ class UltraPlanCommand(CommandDef):
 #: ``/ultracode <word>``: when the whole argument is one of these words it sets or shows the mode; anything else is
 #: the task (a one-shot run that leaves the mode alone).
 _MODE_WORDS = {"on": "ultracode", "off": "off"}
+#: words that may stand around a mode word in a typed request: "turn off ultracode", "ultracode mode off"
+_MODE_FILLER = frozenset({"turn", "switch", "set", "show", "mode", "please", "to"})
+
+
+def typed_mode_word(task: str) -> str | None:
+    """``on``, ``off`` or ``status`` when what a wake word leaves of a prompt only asks for that, else None.
+
+    "ultracode off" and "turn ultracode off" are mode control, the words ``/ultracode`` takes as such, not a task
+    for the pipeline (they leave "off" and "turn off"). A task that merely starts with one ("ultracode on the auth
+    module") is a task."""
+    words = [w for w in (t.strip(".,;:!?") for t in task.lower().split()) if w and w not in _MODE_FILLER]
+    return words[0] if len(words) == 1 and (words[0] in _MODE_WORDS or words[0] == "status") else None
 
 
 def _mode_text(ctx: Any, mode: str) -> str:
@@ -99,12 +120,12 @@ class UltraCodeCommand(CommandDef):
             "(budget: ultracode.max_tokens / max_agents). Bare /ultracode, on, off, status: the always-on mode",
         )
 
-    async def prepare(self, ctx: Any, live: Any, arg: str) -> JobSpec | dict[str, Any]:
+    async def prepare(self, ctx: Any, live: Any, arg: str, *, context: str = "") -> JobSpec | dict[str, Any]:
         if not arg:
             return reply("Usage: /ultracode <task>")
         return JobSpec(
             f"/ultracode {arg}",
-            lambda: ctx.ultra.ultracode(live, arg),
+            lambda: ctx.ultra.ultracode(live, with_hook_context(arg, context)),
             "ultracode started: plan → fan-out → review panel → fixes → tests. See the agent strip.",
         )
 
@@ -120,18 +141,24 @@ class UltraCodeCommand(CommandDef):
         live.emit("session.info", live.live_info())
         return reply(_mode_text(ctx, mode))
 
+    @classmethod
+    def apply_mode_word(cls, ctx: Any, live: Any, word: str) -> dict[str, Any]:
+        """``on`` / ``off`` set the mode, ``status`` shows it (``/ultracode <word>``, or the word typed after the
+        wake word)."""
+        if word == "status":
+            return reply(_mode_text(ctx, getattr(live, "ultra_mode", "off")))
+        return cls._set_mode(ctx, live, _MODE_WORDS[word])
+
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         live = _live(ctx, session_id)
         if live is None:
             return reply("No active session.")
         word = arg.strip().lower()
-        current = getattr(live, "ultra_mode", "off")
         if not word:  # bare: flip the mode
+            current = getattr(live, "ultra_mode", "off")
             return self._set_mode(ctx, live, "off" if current == "ultracode" else "ultracode")
-        if word in _MODE_WORDS:
-            return self._set_mode(ctx, live, _MODE_WORDS[word])
-        if word == "status":
-            return reply(_mode_text(ctx, current))
+        if word in _MODE_WORDS or word == "status":
+            return self.apply_mode_word(ctx, live, word)
         return start_spec(ctx, live, await self.prepare(ctx, live, arg))
 
 

@@ -216,9 +216,8 @@ async def test_bare_tune_reports_the_state(server, tmp_path):
         "message"
     ] == "Model: default (gpt-5.1) · Effort: default · Ultracode: off"
     await m1.cmd(server, "/tune deep high ultracode", sid)
-    assert (await m1.cmd(server, "/tune", sid))["message"] == (
-        "Model: deep (claude-opus-5) · Effort: high · Ultracode: on"
-    )
+    # the label is the model a turn goes to first: provider a has no 'deep' and falls back to its default
+    assert (await m1.cmd(server, "/tune", sid))["message"] == "Model: deep (gpt-5.1) · Effort: high · Ultracode: on"
 
 
 async def test_apply_is_all_or_nothing(server, tmp_path):
@@ -299,21 +298,50 @@ async def test_tune_get_lists_one_row_per_model_key(server, tmp_path):
     assert [r["key"] for r in res["models"]] == ["default", "cheap", "plain", "deep", "local"]  # default first
     assert rows["default"] == {
         "key": "default",
-        "providers": ["a", "b"],
-        "resolved": ["gpt-5.1", "claude-sonnet-5"],
+        "providers": ["a", "b", "c"],  # c has no 'default' either and falls back to its first model
+        "resolved": ["gpt-5.1", "claude-sonnet-5", "sonnet"],
         "description": "Everyday coding",  # a's is empty: the first non-empty one wins
         "current": False,
         "default": True,
         "effort": True,
     }
-    assert rows["cheap"]["resolved"] == ["gpt-4o-mini", "o3-mini", "claude-haiku-4-5"]
+    assert rows["cheap"]["resolved"] == ["gpt-4o-mini", "o3-mini", "claude-haiku-4-5", "sonnet"]
     assert rows["cheap"]["description"] == "Fast and cheap" and rows["cheap"]["current"] is True
     assert rows["cheap"]["effort"] is True  # o3-mini takes one
-    assert rows["plain"]["providers"] == ["a"] and rows["plain"]["effort"] is False  # llama takes none
-    assert rows["deep"]["providers"] == ["b"] and rows["deep"]["effort"] is True and rows["deep"]["description"]
-    assert rows["local"] == {**rows["local"], "providers": ["c"], "resolved": ["sonnet"], "effort": False}
+    # a key that only some providers define still routes through all of them, in chain order: the others fall back
+    assert rows["plain"]["resolved"] == ["llama3", "claude-sonnet-5", "sonnet"] and rows["plain"]["effort"] is True
+    assert rows["deep"]["providers"] == ["a", "b", "c"] and rows["deep"]["effort"] is True
+    assert rows["deep"]["resolved"] == ["gpt-5.1", "claude-opus-5", "sonnet"] and rows["deep"]["description"]
+    assert rows["local"] == {
+        **rows["local"],
+        "providers": ["a", "b", "c"],
+        "resolved": ["gpt-5.1", "claude-sonnet-5", "sonnet"],  # a turn on 'local' goes to a's default first
+        "effort": True,
+    }
     assert [r["key"] for r in res["models"] if r["current"]] == ["cheap"]
     assert [r["key"] for r in res["models"] if r["default"]] == ["default"]
+
+
+async def test_tune_reports_the_chain_a_turn_on_the_key_really_uses(server, tmp_path):
+    """The rows, the state line and the effort flag name the models the router is built from, first one first, also
+    for a key that only a later provider defines (the others fall back to their default model)."""
+    from k3code.routing.tiers import Tier, TierRouters
+
+    sid = await _session(server, tmp_path)
+    live = server._session_for(sid)
+    providers = [types.SimpleNamespace(name=p.name, base_url=p.base_url) for p in server.config.providers]
+    rows = {r["key"]: r for r in tune.snapshot(server, live)["models"]}
+    assert set(rows) >= {"deep", "local", "plain"}
+    for key, row in rows.items():
+        chain = TierRouters(providers, server.config, main_key=key).get(Tier.MAIN).chain
+        assert row["resolved"] == list(dict.fromkeys(e.model for e in chain)), key
+        assert row["providers"] == list(dict.fromkeys(e.provider_name for e in chain)), key
+        live.stored.model = key
+        assert row["resolved"][0] == server._active_model(live), key  # where the turn goes first
+        assert tune.state_line(server.config, live).startswith(f"Model: {key} ({server._active_model(live)}) · ")
+    # the models of the key that only provider b / c define are not where a turn on it starts
+    assert rows["deep"]["resolved"][0] == "gpt-5.1" and rows["local"]["resolved"][0] == "gpt-5.1"
+    assert rows["local"]["effort"] is True  # gpt-5.1 takes an effort level; "this model ignores effort" would be wrong
 
 
 async def test_tune_get_effort_is_unknown_when_nothing_resolves():

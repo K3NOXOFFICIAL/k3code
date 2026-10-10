@@ -145,21 +145,19 @@ def current_model(config: Any, live: Any) -> str:
 
 
 def _chain_for(config: Any, key: str) -> list[tuple[Any, str]]:
-    """(provider, model id) pairs ``key`` maps to, in chain order.
+    """(provider, model id) pairs a turn on ``key`` sends to, in chain order.
 
-    From the providers that define the key; when none does (the default key of a chain that has no such entry) every
-    provider contributes the model it falls back to, which is what a turn on that key would send.
+    Exactly the specs the routers are built from (``TierRouters``, ``GatewayServer._active_model``): every provider
+    contributes one, and one that does not define ``key`` falls back to its ``default`` model, so the first pair is the
+    model the turn goes to first even when only a later provider defines the key.
     """
     specs = tier_model_specs(config, Tier.MAIN, key=key)  # one per provider
-    pairs = [
+    return [
         (p, model)
         for p, spec in zip(config.providers, specs, strict=True)
         for model in ([spec] if isinstance(spec, str) else spec)
         if model
     ]
-    if any(key in p.models for p in config.providers):
-        pairs = [(p, model) for p, model in pairs if key in p.models]
-    return pairs
 
 
 def _label(config: Any, key: str) -> str:

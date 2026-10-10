@@ -233,6 +233,22 @@ describe("TunePicker", () => {
     t.stop();
   });
 
+  it("Enter on the session's own model, when that is not the default, makes it the default instead of just closing", async () => {
+    const t = mount({ snap: { model: "fast" } });
+
+    await settle();
+    t.stdin.send(ENTER);
+    await waitFor(() => expect(t.onApply).toHaveBeenCalledTimes(1));
+
+    expect(t.onApply).toHaveBeenCalledWith({
+      model: "fast",
+      scope: "default",
+      session_id: "sid-1",
+    });
+    expect(t.onCancel).not.toHaveBeenCalled();
+    t.stop();
+  });
+
   it("without a session: effort and Tab are ignored, the model can still be set (no session id)", async () => {
     const t = mount({
       sessionId: null,

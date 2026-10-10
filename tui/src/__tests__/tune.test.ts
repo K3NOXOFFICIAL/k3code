@@ -265,7 +265,8 @@ describe("tune.set payload", () => {
   });
 
   it("sends only the fields that changed", () => {
-    expect(press(state(), RIGHT, ENTER).action).toEqual({
+    // the session is on the default model, so the model is not a change
+    expect(press(state({ model: "main" }), RIGHT, ENTER).action).toEqual({
       params: {
         effort: "xhigh",
         scope: "default",
@@ -296,21 +297,47 @@ describe("tune.set payload", () => {
   });
 
   it("a move that is undone again sends nothing", () => {
-    expect(press(state(), RIGHT, LEFT, TAB, TAB, ENTER).action).toEqual({
-      type: "cancel",
+    expect(
+      press(state({ model: "main" }), RIGHT, LEFT, TAB, TAB, ENTER).action,
+    ).toEqual({ type: "cancel" });
+  });
+
+  it("Enter on the session's own model makes it the default when it is not", () => {
+    // current = fast, default = main: the cursor starts on `fast ✓`, and the key line says "Enter set as default"
+    const sent = {
+      params: { model: "fast", scope: "default", session_id: "sid-1" },
+      type: "apply",
+    };
+
+    expect(press(state(), ENTER).action).toEqual(sent);
+    // off the row and back is the same pick
+    expect(press(state(), UP, DOWN, ENTER).action).toEqual(sent);
+    // and with the other fields it travels in the same tune.set
+    expect(press(state(), RIGHT, ENTER).action).toEqual({
+      params: {
+        effort: "xhigh",
+        model: "fast",
+        scope: "default",
+        session_id: "sid-1",
+      },
+      type: "apply",
     });
   });
 
-  it("never rewrites the default model on the side: Enter on an untouched model sends no model", () => {
-    // current = fast, default = main: only the effort moved.
-    const { action } = press(state(), RIGHT, ENTER);
+  it("Enter on a session that is already on the default model sends no model", () => {
+    const main = state({ model: "main" });
 
-    expect(action).toEqual({
-      params: { effort: "xhigh", scope: "default", session_id: "sid-1" },
+    expect(press(main, ENTER).action).toEqual({ type: "cancel" });
+    expect(press(main, DOWN, UP, ENTER).action).toEqual({ type: "cancel" });
+  });
+
+  it("`s` never touches the default model", () => {
+    // current = fast, default = main: this session only, nothing to change
+    expect(press(state(), ["s"]).action).toEqual({ type: "cancel" });
+    expect(press(state(), RIGHT, ["s"]).action).toEqual({
+      params: { effort: "xhigh", scope: "session", session_id: "sid-1" },
       type: "apply",
     });
-    expect(press(state(), ENTER).action).toEqual({ type: "cancel" });
-    expect(press(state(), ["s"]).action).toEqual({ type: "cancel" });
   });
 
   it("sends the model when the pick moved off the session's model, to whichever scope", () => {
@@ -320,8 +347,8 @@ describe("tune.set payload", () => {
     expect(press(state(), UP, ["s"]).action).toMatchObject({
       params: { model: "main", scope: "session" },
     });
-    // moving off and back is no change
-    expect(press(state(), UP, DOWN, ENTER).action).toEqual({ type: "cancel" });
+    // moving off and back is no change to the session's model
+    expect(press(state(), UP, DOWN, ["s"]).action).toEqual({ type: "cancel" });
   });
 
   it("omits session_id when the popup has no session id", () => {
