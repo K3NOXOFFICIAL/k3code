@@ -176,7 +176,12 @@ done
 
 @pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
 @pytest.mark.parametrize("docker_default", [False, True], ids=["ubuntu-default", "docker-desktop-default"])
-def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path, docker_default: bool) -> None:
+# Legacy is how Windows PowerShell 5.1 (the `powershell` every Windows has) passes arguments: embedded double quotes
+# unescaped, so the `cd "$(wslpath -a "$1")"` command reached sh cut apart and the install died with a syntax error.
+@pytest.mark.parametrize("arg_passing", ["Standard", "Legacy"])
+def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(
+    tmp_path: Path, docker_default: bool, arg_passing: str
+) -> None:
     wsl = tmp_path / "wsl"
     wsl.write_text(FAKE_WSL)
     wsl.chmod(0o755)
@@ -195,7 +200,9 @@ def test_install_ps1_runs_install_sh_in_wsl_and_writes_shims(tmp_path: Path, doc
     }
 
     def ps(script: str, *args: str) -> subprocess.CompletedProcess[str]:
-        cmd = ["pwsh", "-NoProfile", "-File", str(REPO / "install" / script), *args]
+        quoted = " ".join("'" + a.replace("'", "''") + "'" for a in (str(REPO / "install" / script), *args))
+        command = f"$PSNativeCommandArgumentPassing = '{arg_passing}'; & {quoted}; exit $LASTEXITCODE"
+        cmd = ["pwsh", "-NoProfile", "-Command", command]
         return subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
 
     r = ps("install.ps1", "-NoModifyPath", "--from-source", "--yes")
@@ -288,6 +295,23 @@ def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> 
     assert dirty.startswith(clean + ".dirty")
     (src / "core" / "new.py").write_text("x = 1\n")  # an untracked file changes it again
     assert version() not in (clean, dirty)
+
+
+def test_untracked_files_the_install_does_not_read_keep_a_clean_version(tmp_path: Path) -> None:
+    # An agent's .claude directory holding git worktrees named every build of a clean HEAD .dirty4294967295 (the
+    # checksum of nothing: ls-files lists a nested repository as a directory), so each `k3code update` rebuilt it.
+    src, _ = mini_checkout(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    clean = run(home, src / "install" / "install.sh", "--from-source", "--print-version").stdout.strip()
+    nested = src / ".claude" / "worktrees" / "w"
+    nested.mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    subprocess.run(["git", "-C", str(nested), "init", "-q"], check=True, env=env)
+    (src / "notes.txt").write_text("scratch\n")
+    r = run(home, src / "install" / "install.sh", "--from-source", "--print-version")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == clean
 
 
 def test_without_git_each_checkout_gets_its_own_version_from_its_files(tmp_path: Path) -> None:

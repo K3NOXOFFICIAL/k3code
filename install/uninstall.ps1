@@ -21,6 +21,14 @@ function Say([string]$Text) { [Console]::Error.WriteLine("k3code-uninstall: $Tex
 function Die([string]$Text) { Say "ERROR: $Text"; exit 1 }
 function Quote-Sh([string]$Arg) { "'" + ($Arg -replace "'", "'\''") + "'" }
 
+# Windows PowerShell 5.1 (and pwsh before 7.3, or with $PSNativeCommandArgumentPassing = 'Legacy') does not escape
+# double quotes inside a native program's argument (see install.ps1): they are escaped by hand there.
+function ConvertTo-NativeArgs([string[]]$NativeArgs) {
+  $mode = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue
+  if ($mode -and "$mode" -ne 'Legacy') { return $NativeArgs }
+  return @($NativeArgs | ForEach-Object { $_ -replace '(\\*)"', '$1$1\"' })
+}
+
 # The user PATH is a REG_EXPAND_SZ holding %VARIABLES%: read and write it unexpanded (as install.ps1 does), since
 # [Environment]::SetEnvironmentVariable would store it expanded as REG_SZ.
 function Get-UserPath {
@@ -58,7 +66,9 @@ if (-not $WindowsOnly) {
   $checkout = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { '' }
   if ($checkout -and (Test-Path (Join-Path $PSScriptRoot 'uninstall.sh'))) {
     # cd inside sh (wsl.exe --cd needs a newer WSL than Windows 10 ships with), from the Windows path as an argument
-    & $Wsl -d $cfg.distro --exec sh -lc "cd `"`$(wslpath -a `"`$1`")`" && exec sh install/uninstall.sh $($shArgs -join ' ')" sh $checkout
+    $a = ConvertTo-NativeArgs @('-d', $cfg.distro, '--exec', 'sh', '-lc',
+      "cd `"`$(wslpath -a `"`$1`")`" && exec sh install/uninstall.sh $($shArgs -join ' ')", 'sh', $checkout)
+    & $Wsl @a
   } else {
     & $Wsl -d $cfg.distro --exec sh -lc "curl -fsSL $(Quote-Sh $RawUrl) | sh -s -- $($shArgs -join ' ')"
   }
