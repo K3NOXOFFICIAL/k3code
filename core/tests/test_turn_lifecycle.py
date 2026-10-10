@@ -64,7 +64,7 @@ async def test_a_loop_guard_stop_pauses_the_goal_instead_of_continuing_it(tmp_pa
     assert status == "needs_input"
     assert server.goal_judge.calls == []  # never judged, never continued
     assert mgr.state.status == "paused" and mgr.state.paused_reason == "needs_input"
-    assert provider.n <= 5, provider.n  # one guarded turn, not one per goal turn
+    assert provider.n <= 10, provider.n  # one guarded turn (main, then strong once), not one per goal turn
     await server.close()
 
 

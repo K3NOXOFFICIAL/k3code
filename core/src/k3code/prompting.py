@@ -49,11 +49,13 @@ def build_system_prompt(
         parts.append(facts)
     if mem := memory_prompt(cwd, limit=int(ctx.get("memory_chars", MAX_MEMORY_CHARS))):
         parts.append(mem)
-    from k3code.learning.gotchas import gotchas_prompt
+    from k3code.learning.gotchas import gotchas_prompt, user_gotchas_prompt
     from k3code.learning.optimizer import overlay_prompt
 
     if gotchas := gotchas_prompt(cwd):  # accepted project gotchas; changes only when one is accepted
         parts.append(gotchas)
+    if machine := user_gotchas_prompt():  # lines learned alike in several projects; changes only when one is added
+        parts.append(machine)
 
     if overlay := overlay_prompt():
         parts.append(overlay)

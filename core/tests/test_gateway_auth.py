@@ -276,6 +276,21 @@ async def test_config_set_validates_and_coerces_an_allowed_key(tmp_path, monkeyp
     await server.close()
 
 
+async def test_config_set_goal_max_turns_zero_means_no_turn_limit(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    sid = await new_session(server, tmp_path)
+    live = server._session_for(sid)
+    assert (await rpc(server, "config.set", {"key": "goal.max_turns", "value": 12}))["result"]["value"] == 12
+    assert server.goal_manager(live).set("capped").max_turns == 12
+    reply = await rpc(server, "config.set", {"key": "goal.max_turns", "value": 0})
+    assert reply["result"]["value"] == 0 and server.config.goal.max_turns == 0
+    state = server.goal_manager(live).set("uncapped")
+    assert state.max_turns == 0 and not state.budget_spent()
+    state.turns_used = 500
+    assert not state.budget_spent()  # no cap however long it runs
+    await server.close()
+
+
 async def test_k3code_slash_refuses_a_command_that_asks_a_question(gw, tmp_path):
     """slash_via_daemon answered every clarify with its first choice: whatever that did, it did unattended."""
     from k3code.daemon import slash_via_daemon

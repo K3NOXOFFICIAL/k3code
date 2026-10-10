@@ -265,6 +265,8 @@ providers:                          # the fallback chain, in order (add as many 
 permission_mode: ask                # ask | auto-edit | plan | auto | yolo
 autonomy:
   plan_first: true
+  escalate_main: true               # a turn that stalls on the main tier continues on the strong tier (default)
+  auto_continue: false              # true: an ordinary prompt runs as an implicit goal until the judge says done
   fanout: {max_parallel: 3}
 mcp:
   servers:

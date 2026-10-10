@@ -114,6 +114,24 @@ async def test_old_tool_results_are_elided_from_a_big_request_but_kept_in_histor
     assert all(len(c) > 3000 for c in transcript)
 
 
+async def test_elision_runs_in_batches_so_the_request_prefix_rarely_changes(tmp_path):
+    """Past half the window every step used to elide the result that had just left the last six: each call rewrote
+    the request prefix (a prompt-cache miss; a persistent claude-cli process no longer mirrored it and was started
+    afresh). Now more is elided only once the request is over the threshold again, and then every old result at once."""
+    calls = reads_of(tmp_path, 40)
+    provider = Recorder([*(tool_reply(c) for c in calls), text_reply("done")])
+    loop = make_loop(tmp_path, provider, window=30_000)
+    loop.max_turns = 0  # make_loop caps at 20 model calls
+    async for _ in loop.run("read them all"):
+        pass
+    sent = [[m.content for m in request[0]] for request in provider.requests]
+    rewrites = sum(1 for before, after in zip(sent, sent[1:], strict=False) if after[: len(before)] != before)
+    assert 1 <= rewrites <= 5  # one per batch (three here); it was one per step (24)
+    last = {m.tool_call_id: m.content for m in provider.requests[-1][0] if m.role == "tool"}
+    assert last["r0"].startswith("[earlier read result elided: ")
+    assert all(f"file {i}" in last[f"r{i}"] for i in range(34, 40))  # the last six stay whole
+
+
 async def test_nothing_is_elided_below_half_the_window(tmp_path):
     _, provider = await run_reads(tmp_path, window=200_000)
     assert not any("elided" in (m.content or "") for m in provider.requests[-1][0])

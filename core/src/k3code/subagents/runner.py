@@ -127,6 +127,15 @@ class Handle:
         return "".join(out)
 
 
+def _child_max_turns(config: Any) -> int:
+    """Model-call cap for a sub-agent: ``subagents.max_turns`` when the global cap is 0, else the smaller of the two."""
+    own = max(0, int(config.subagents.max_turns))
+    glob = max(0, int(config.max_turns))
+    if not glob:
+        return own
+    return min(glob, own) if own else glob
+
+
 def child_reliability(config: Any, child_id: str, home: Path) -> Reliability:
     """Reliability bundle for a child: like the session's, but no netwatch probe per child."""
     raw = dict(getattr(config, "reliability", None) or {})
@@ -416,7 +425,8 @@ class SubagentManager:
         loop = AgentLoop(
             router,
             system_prompt=system,
-            max_turns=server.config.max_turns,
+            max_turns=_child_max_turns(server.config),
+            max_tool_errors=int(autonomy_cfg(server.config)["max_tool_errors"]),
             headless=False,
             on_event=server._on_router_event,
             cwd=cwd,
