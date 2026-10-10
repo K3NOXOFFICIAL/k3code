@@ -57,6 +57,14 @@ and `render_dock.go` draws it whenever `modeLegend()` returns non-nil. No
 separate visibility hook is needed — the single `LegendOverride` hook is
 sufficient.
 
+### Test-only timing fix
+
+`internal/app/dock_reload_leak_test.go` waits for the custom dock component to
+draw (up to 30 s) instead of assuming it has after 50 ms of silence. On a busy
+machine the component's shell command can take longer than that to start, so
+the upstream version failed the full check under load. No production code
+changes; an upstream merge can take either side of this file.
+
 ## New files (no upstream impact)
 
 | Path | Purpose |
