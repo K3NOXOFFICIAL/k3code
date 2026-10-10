@@ -1744,6 +1744,9 @@ class GatewayServer:
         )
         tier = tier_for(kind, self.config.task_tiers)
         cheap_start = tier in (Tier.FAST, Tier.CHEAP)
+        # A turn that starts on main climbs once to strong when it stalls ("never stop until the task is done"); only
+        # a stall there ends the turn with needs_input. ``autonomy.escalate_main: false`` keeps main as the last tier.
+        main_climbs = tier is Tier.MAIN and bool(autonomy_cfg(self.config).get("escalate_main", True))
         main_errors = int(autonomy_cfg(self.config)["max_tool_errors"])  # a main-tier turn stops after this many
         max_errors = int(autonomy_cfg(self.config)["escalate"]["tool_errors"]) if cheap_start else main_errors
         escalation = Escalation(tier, thresholds={"tool_errors": 1, "loop_guard": 1})  # the loop counted already
@@ -1764,7 +1767,7 @@ class GatewayServer:
             kind,
             approval,
             max_tool_errors=max_errors,
-            escalates=cheap_start,
+            escalates=cheap_start or main_climbs,
         )
         session.loop = loop
 
@@ -1808,7 +1811,7 @@ class GatewayServer:
             ):
                 # A trivial task is "unimportant work": start it on the cheap tier. The loop escalates to main when the
                 # attempt stalls (tool errors, loop guard), so a task the cheap model cannot do still gets done.
-                tier, cheap_start = Tier.CHEAP, True
+                tier, cheap_start, main_climbs = Tier.CHEAP, True, False
                 max_errors = int(acfg["escalate"]["tool_errors"])
                 escalation = Escalation(tier, thresholds={"tool_errors": 1, "loop_guard": 1})
                 loop = self._build_loop(
@@ -1863,14 +1866,15 @@ class GatewayServer:
                         task_kind=kind.value,
                         turn=session.turn_id,
                     )
-                new_tier = escalation.record(attempt_reason) if cheap_start and attempt_reason else None
+                climbs = cheap_start or (main_climbs and tier is Tier.MAIN)
+                new_tier = escalation.record(attempt_reason) if climbs and attempt_reason else None
                 if new_tier is None and attempt_reason == "tool_errors" and not loop.interrupted:
                     # the loop stopped after N failed calls in a row and listed them: the user decides how to go on
                     # (ending 'done' let an active goal judge it and continue into the same failures)
                     session.needs_input = True
                 if new_tier is None or loop.interrupted:
                     break
-                # The attempt stalled on a cheap tier: continue the same task one tier up.
+                # The attempt stalled on a cheap tier (or on main, see main_climbs): continue the same task one tier up.
                 reason = attempt_reason or "unknown"
                 self.model_caller.note_escalation(kind, tier, new_tier, reason, session.session_id)
                 tier = new_tier

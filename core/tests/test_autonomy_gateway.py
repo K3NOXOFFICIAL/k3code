@@ -409,6 +409,72 @@ async def test_background_turn_that_succeeds_stays_on_cheap(tmp_path, monkeypatc
     assert models_called(server) == ["m-cheap"] and events(server, "routing.escalated") == []
 
 
+def _bogus(model: str, n: int, start: int = 0) -> list[dict]:
+    """``n`` calls of tools that do not exist: each one fails, so ``n`` in a row is a tool-error stall."""
+    return [
+        {"type": "tool_call", "model": model, "id": f"c{i}", "name": f"no_such_tool_{i}", "arguments": {}}
+        for i in range(start, start + n)
+    ]
+
+
+def _stop_messages(server: GatewayServer) -> list[str]:
+    return [m["content"] for m in server.session.stored.messages if "tool calls in a row failed" in str(m["content"])]
+
+
+async def test_main_tier_stall_continues_on_strong(tmp_path, monkeypatch):
+    """A turn that starts on main does not stop after 8 failed calls: strong continues it and finishes."""
+    steps = [*_bogus("m-main", 8), {"type": "text", "model": "m-strong", "text": "finished on strong"}]
+    server = make(tmp_path, monkeypatch, steps, mode="default")
+    await start(server, tmp_path)
+    await run_turn(server, "do the thing")
+    esc = events(server, "routing.escalated")
+    assert [(e["from"], e["to"], e["reason"]) for e in esc] == [("main", "strong", "tool_errors")]
+    assert models_called(server) == ["m-main", "m-strong"]  # the fake answers all 8 calls in one response
+    assert server.session.stored.messages[-1]["content"] == "finished on strong"
+    assert _stop_messages(server) == []  # one coherent turn: main's stop message stays silent
+    assert events(server, "message.complete")[-1]["status"] == "done"
+    assert server.session.needs_input is False
+    rows = [(r["kind"], r["detail"]) for r in server.usage.rows() if r["kind"] == "escalated"]
+    assert rows == [("escalated", "main->strong: tool_errors")]
+
+
+async def test_strong_stall_after_main_stops_and_lists_the_failures(tmp_path, monkeypatch):
+    steps = [*_bogus("m-main", 8), *_bogus("m-strong", 8, start=8), {"type": "text", "text": "never reached"}]
+    server = make(tmp_path, monkeypatch, steps, mode="default")
+    await start(server, tmp_path)
+    await run_turn(server, "do the thing")
+    assert [(e["from"], e["to"]) for e in events(server, "routing.escalated")] == [("main", "strong")]
+    (stop,) = _stop_messages(server)
+    assert stop.startswith("I stopped because 8 tool calls in a row failed:") and "no_such_tool_15" in stop
+    assert events(server, "message.complete")[-1]["status"] == "needs_input"
+    assert server.session.needs_input is True
+
+
+async def test_escalate_main_off_keeps_the_main_tier_stop(tmp_path, monkeypatch):
+    steps = [*_bogus("m-main", 8), {"type": "text", "text": "never reached"}]
+    server = make(tmp_path, monkeypatch, steps, mode="default", autonomy={"escalate_main": False})
+    await start(server, tmp_path)
+    await run_turn(server, "do the thing")
+    assert events(server, "routing.escalated") == [] and "m-strong" not in models_called(server)
+    assert len(_stop_messages(server)) == 1
+    assert events(server, "message.complete")[-1]["status"] == "needs_input"
+
+
+async def test_main_tier_loop_guard_stop_continues_on_strong(tmp_path, monkeypatch):
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "should_sandbox", lambda *a, **k: False)
+    same = {"type": "tool_call", "model": "m-main", "id": "c1", "name": "bash", "arguments": {"command": "echo hi"}}
+    steps = [same, {"type": "text", "model": "m-strong", "text": "recovered"}]
+    server = make(tmp_path, monkeypatch, steps, mode="yolo")
+    await start(server, tmp_path)
+    await run_turn(server, "do the thing")
+    esc = events(server, "routing.escalated")
+    assert [(e["from"], e["to"], e["reason"]) for e in esc] == [("main", "strong", "loop_guard")]
+    assert server.session.stored.messages[-1]["content"] == "recovered"
+    assert server.session.needs_input is False
+
+
 async def test_interactive_turn_uses_main_and_config_can_override_policy(tmp_path, monkeypatch):
     server = make(tmp_path, monkeypatch, [{"type": "text", "text": "hi"}], mode="default")
     await start(server, tmp_path)
