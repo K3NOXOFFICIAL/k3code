@@ -20,6 +20,9 @@ class CommandDef:
     aliases: list[str] = field(default_factory=list)
     #: Works in a one-shot ``k3code -p "/name"`` run: no live session, client or model needed. The others refuse there.
     headless: ClassVar[bool] = False
+    #: False for a headless command that reads only ``ctx.config`` and ``ctx.commands``: ``k3code -p`` then runs it
+    #: without a GatewayServer, which opens (and so creates) the home databases.
+    needs_server: ClassVar[bool] = True
 
     async def handle(self, ctx: CommandContext, session_id: str | None, arg: str) -> dict[str, Any]:
         raise NotImplementedError

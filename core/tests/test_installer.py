@@ -764,10 +764,15 @@ def test_a_command_name_with_spaces_and_parentheses_keeps_its_lock(tmp_path: Pat
     # /proc/<pid>/stat field 2 is the command name: install.sh must count the fields from its last ")"
     from k3code import update as upd
 
-    odd = tmp_path / "a) (b c"
-    shutil.copy(shutil.which("sleep") or "/bin/sleep", odd)
-    holder = subprocess.Popen([str(odd), "30"])
+    # The name is set with prctl(PR_SET_NAME), not by running a renamed copy of `sleep`: where sleep is BusyBox, a copy
+    # does not know which applet it is.
+    code = (
+        "import ctypes, time; ctypes.CDLL(None).prctl(15, b'a) (b c', 0, 0, 0)\n"
+        "print('ready', flush=True); time.sleep(30)"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
     try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == "ready"
         assert Path(f"/proc/{holder.pid}/stat").read_text().startswith(f"{holder.pid} (a) (b c) ")
         lock = _lock_of(tmp_path, holder.pid, upd._process_start(holder.pid), "tmp/k3code-tui.Ab12Cd")
         r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})

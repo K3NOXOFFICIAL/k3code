@@ -355,3 +355,35 @@ async def test_project_command_shows_stacks_and_pending_and_rescans(tmp_path):
     make(repo, {"go.mod": "module x\n\ngo 1.22\n"})
     assert (await cmd.handle(ctx, "s1", ""))["changed"] is True
     assert "Usage" in (await cmd.handle(ctx, "s1", "bogus"))["message"]
+
+
+def _node_dirs(repo: Path) -> list[str]:
+    return sorted(s["dir"] for s in stacks.scan(repo).stacks if s["id"] == "node")
+
+
+def _members(names: list[str]) -> dict[str, str]:
+    return {f"{n}/package.json": json.dumps({"scripts": {"test": "vitest"}}) for n in names}
+
+
+def test_a_workspace_glob_reads_a_bounded_number_of_directories(tmp_path, monkeypatch):
+    """`packages/**` in a huge monorepo walked the whole tree before the first 64 entries were kept (#43)."""
+    monkeypatch.setattr(stacks, "MAX_WORKSPACE_VISITS", 5)
+    files = {"pnpm-workspace.yaml": "packages:\n  - 'packages/**'\n"}
+    files |= _members([f"packages/g{i:02d}/pkg" for i in range(12)])
+    found = _node_dirs(make(tmp_path / "repo", files))
+    assert 0 < len(found) < 12  # the budget ran out part-way through the tree
+    assert all(d.startswith("packages/g") and d.endswith("/pkg") for d in found)
+
+
+def test_one_read_budget_is_shared_by_all_workspace_globs(tmp_path, monkeypatch):
+    monkeypatch.setattr(stacks, "MAX_WORKSPACE_VISITS", 1)
+    files = {"pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n  - 'libs/*'\n"}
+    files |= _members(["packages/a", "libs/b"])
+    assert _node_dirs(make(tmp_path / "repo", files)) == ["packages/a"]
+
+
+def test_a_workspace_glob_stops_at_the_depth_cap_and_skips_dependency_dirs(tmp_path):
+    deep = "/".join(f"d{i}" for i in range(stacks.MAX_GLOB_DEPTH + 3))
+    files = {"pnpm-workspace.yaml": "packages:\n  - 'packages/**'\n"}
+    files |= _members(["packages/web", "packages/ui/button", f"packages/{deep}", "packages/node_modules/x"])
+    assert _node_dirs(make(tmp_path / "repo", files)) == ["packages/ui/button", "packages/web"]

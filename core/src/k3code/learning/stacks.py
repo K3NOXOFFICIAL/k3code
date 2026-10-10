@@ -21,6 +21,10 @@ import yaml
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "target", "dist", "build", "__pycache__", ".k3code"}
 MAX_WORKSPACE_DIRS = 64
+#: Directory reads one scan may spend expanding all of a project's workspace globs, and how deep a ``**`` descends:
+#: ``packages/**`` in a very large monorepo used to walk the whole tree before the first 64 entries were kept.
+MAX_WORKSPACE_VISITS = 2000
+MAX_GLOB_DEPTH = 6
 COMMAND_KINDS = ("test", "lint", "format", "build")
 
 
@@ -331,6 +335,61 @@ def _workspace_globs(root: Path, names: set[str]) -> list[str]:
     return [g for g in globs if g and not g.startswith("!")]
 
 
+def _subdirs(d: Path, budget: list[int], follow_links: bool) -> list[Path]:
+    """Visible subdirectories of ``d``, sorted, minus SKIP_DIRS; each call spends one directory read of ``budget``."""
+    if budget[0] <= 0:
+        return []
+    budget[0] -= 1
+    try:
+        with os.scandir(d) as it:
+            found = [
+                Path(e.path)
+                for e in it
+                if not e.name.startswith(".")
+                and e.name not in SKIP_DIRS
+                and (follow_links or not e.is_symlink())
+                and e.is_dir()
+            ]
+    except OSError:
+        return []
+    return sorted(found)
+
+
+def _glob_dirs(root: Path, pattern: str, budget: list[int]) -> list[Path]:
+    """Directories below ``root`` that a workspace glob names, at most MAX_WORKSPACE_DIRS.
+
+    Like ``Path.glob`` for the directory patterns a workspace file uses (``*``, ``?``, ``[..]``, ``**``), but it never
+    reads into SKIP_DIRS, hidden or (for ``**``) symlinked directories, descends at most MAX_GLOB_DEPTH levels for a
+    ``**`` and stops once ``budget`` (shared by every glob of one scan) is spent.
+    """
+    segments = [seg for seg in pattern.split("/") if seg and seg != "."]
+    found: list[Path] = []
+
+    def walk(d: Path, i: int, depth: int) -> None:
+        if len(found) >= MAX_WORKSPACE_DIRS:
+            return
+        if i == len(segments):
+            found.append(d)
+            return
+        seg = segments[i]
+        if seg == "**":
+            walk(d, i + 1, depth)  # ** also matches no directory at all
+            if depth < MAX_GLOB_DEPTH:
+                for child in _subdirs(d, budget, follow_links=False):
+                    walk(child, i, depth + 1)
+        elif not any(c in seg for c in "*?["):
+            child = d / seg
+            if child.is_dir() and seg not in SKIP_DIRS:
+                walk(child, i + 1, depth)
+        else:
+            for child in _subdirs(d, budget, follow_links=True):
+                if fnmatch.fnmatchcase(child.name, seg):
+                    walk(child, i + 1, depth)
+
+    walk(root, 0, 0)
+    return found
+
+
 def _scan_dirs(root: Path, names: set[str]) -> list[str]:
     """Relative directories to scan: ".", first-level subdirectories, workspace members (inside the root only)."""
     dirs = {"."}
@@ -341,19 +400,22 @@ def _scan_dirs(root: Path, names: set[str]) -> list[str]:
             dirs.add(n)
     resolved_root = root.resolve()
     extra: set[str] = set()
+    budget = [MAX_WORKSPACE_VISITS]
     for g in _workspace_globs(root, names):
         g = g.strip().removeprefix("./").rstrip("/")
         if not g or g.startswith("/") or ".." in Path(g).parts:
             continue
-        for p in sorted(root.glob(g))[:MAX_WORKSPACE_DIRS]:
+        for p in _glob_dirs(root, g, budget):
             try:
                 rel = p.resolve().relative_to(resolved_root)
             except ValueError:
                 continue
-            if p.is_dir() and not any(part in SKIP_DIRS for part in rel.parts):
+            if not any(part in SKIP_DIRS for part in rel.parts):
                 extra.add(rel.as_posix())
             if len(extra) >= MAX_WORKSPACE_DIRS:
                 break
+        if len(extra) >= MAX_WORKSPACE_DIRS:
+            break
     return sorted(dirs | extra, key=lambda d: (d != ".", d))
 
 

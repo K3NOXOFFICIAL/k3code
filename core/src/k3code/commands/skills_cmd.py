@@ -12,6 +12,7 @@ from k3code.commands._util import reply, session_cwd, split_args
 
 class SkillsCommand(CommandDef):
     headless = True
+    needs_server = False
 
     def __init__(self) -> None:
         super().__init__(name="skills", help="List skills; /skills show <name> prints one in full")
