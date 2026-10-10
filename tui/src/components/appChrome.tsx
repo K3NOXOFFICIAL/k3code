@@ -601,6 +601,7 @@ export function StatusRule({
   modelFast,
   modelReasoningEffort,
   modelReasoningEffortWire,
+  ultraMode,
   indicatorStyle = "kaomoji",
   notice,
   usage,
@@ -647,6 +648,8 @@ export function StatusRule({
     modelFast,
     modelReasoningEffortWire,
   );
+  // The ultracode session mode (/tune, /ultracode on): a pinned chip beside the model, so the mode is never a surprise.
+  const ultraChip = ultraMode === "ultracode" ? "ultracode" : "";
 
   // Battery read-out — the first (pinned) status-bar element when enabled.
   const showBattery =
@@ -693,6 +696,7 @@ export function StatusRule({
     slotWidth +
     stringWidth(" │ ") +
     stringWidth(modelText) +
+    (ultraChip ? stringWidth(" │ ") + stringWidth(ultraChip) : 0) +
     (ctxLabel ? stringWidth(" │ ") + stringWidth(ctxLabel) : 0);
 
   const rightLabel =
@@ -907,6 +911,12 @@ export function StatusRule({
             {" │ "}
             {modelText}
           </Text>
+          {ultraChip ? (
+            <Text color={t.color.accent} wrap="truncate-end">
+              {" │ "}
+              {ultraChip}
+            </Text>
+          ) : null}
           {mode ? (
             <Text
               color={mode === "default" ? t.color.muted : t.color.warn}
@@ -1210,6 +1220,8 @@ interface StatusRuleProps {
   modelFast?: boolean;
   modelReasoningEffort?: string;
   modelReasoningEffortWire?: string;
+  /** `session.info.ultra_mode`: "ultracode" shows the mode chip beside the model. */
+  ultraMode?: string;
   indicatorStyle?: IndicatorStyle;
   notice?: Notice | null;
   sessionStartedAt?: null | number;

@@ -31,12 +31,13 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 
-from k3code import confio, mcpjson, userhooks
+from k3code import confio, mcpjson, userhooks, wakewords
 from k3code import skills as skills_mod
 from k3code._version import __version__
 from k3code.agent.loop import AgentLoop, ApprovalResult
@@ -44,10 +45,13 @@ from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, autonomy_cfg
 from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
-from k3code.autonomy.ultra import Ultra
+from k3code.autonomy.scope import SCOPES
+from k3code.autonomy.ultra import Ultra, ultra_cfg
 from k3code.blockers import BlockerStore
 from k3code.commands import CommandRegistry
+from k3code.commands import tune as tune_cmd
 from k3code.commands.builtin import build_registry as build_commands
+from k3code.commands.ultra_cmd import JobSpec, typed_mode_word
 from k3code.config import Settings, default_project_dir, load_config, retention
 from k3code.context_budget import compact_threshold, context_window, overhead_tokens
 from k3code.context_select import decide, decision_settings
@@ -165,6 +169,26 @@ def _load_system_prompt() -> str:
     return "You are a helpful coding assistant."
 
 
+class TypedPrompt(str):
+    """A prompt the user typed (``prompt.submit`` without ``automated``, a steering message, ``/bg <prompt>``).
+
+    Only these are looked at for wake words and the ultracode mode; goal kicks, loop and cron ticks, automations and
+    the TUI's own prompts (``automated``) are plain ``str``. The type travels with the text through
+    ``pending_prompts`` and ``steer_queue``, so a prompt that waited behind a turn is still routed when it drains."""
+
+    __slots__ = ()
+
+
+@dataclass
+class _Route:
+    """Where a typed prompt goes instead of a normal turn: the job (or the immediate reply) and what to announce."""
+
+    command: str  #: ``ultra.progress`` command: ultracode, ultraplan or ultraresearch
+    phase: str  #: ``wake word`` or ``ultracode is on``
+    detail: str
+    spec: JobSpec | dict[str, Any]  #: a dict is the command's immediate reply (usage / unavailable): no job
+
+
 class LiveSession:
     """One active conversation: AgentLoop + router + cached state."""
 
@@ -199,6 +223,10 @@ class LiveSession:
         #: Wall-clock start of the latest turn or job (time.time()); the agent view's "working N" counts from it.
         self.turn_started_wall = 0.0
         self.reasoning_effort: str | None = stored.meta.get("reasoning_effort")  # /effort
+        #: "off" | "ultracode": ultracode as a session mode (/tune, /ultracode on|off, tune.set); kept in the meta
+        self.ultra_mode: str = (
+            stored.meta["ultra_mode"] if stored.meta.get("ultra_mode") in tune_cmd.ULTRA_MODES else "off"
+        )
         self.todos: list[dict[str, Any]] = []
         self.todo_revision = 0
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
@@ -336,6 +364,7 @@ class LiveSession:
             "skills": self._skills_info(),
             "provider": self.stored.provider,
             "reasoning_effort": self.reasoning_effort,
+            "ultra_mode": self.ultra_mode,
             "approval_mode": self.perms.mode.value,
             "mode": self.perms.mode.value,
             "yolo": self.perms.mode == PermissionMode.YOLO,
@@ -1563,17 +1592,33 @@ class GatewayServer:
     async def _run_turn_locked(self, session: LiveSession, text: str) -> tuple[str, str]:
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
         effort_mod.REASONING_EFFORT.set(session.reasoning_effort)  # /effort, read by the providers
-        prompt = text
+        typed = isinstance(text, TypedPrompt)
+        prompt = text = str(text)  # the marker only says who wrote it
         mgr = self.goal_manager(session)
         # the prompt the user sent is not a continuation: clear the flag first, a turn that ended after a continuation
         # leaves it set and a queued prompt drained next would get no implicit goal
         session.goal_continuation = False
-        self._start_implicit_goal(session, mgr, text)
+        hooked: userhooks.HookOutcome | None = None  # the hooks' verdict on the typed prompt, handed to its first turn
+        if typed and not self.halted:
+            # the user's hooks see the prompt before the scope classifier or a job does: one a hook blocks reaches no
+            # model and no pipeline (it ends as a blocked normal turn below), and a hook's context goes into the job
+            hooked = await self._typed_prompt_hooks(session, text)
+            if not hooked.blocked:
+                # a wake word or the ultracode mode may run the prompt as a job instead of a normal turn
+                routed = await self._route_typed_prompt(session, text, hooked)
+                if routed is not None:
+                    return routed
+        if hooked is None or not hooked.blocked:  # a prompt a hook refused is not a task to carry on with
+            self._start_implicit_goal(session, mgr, text)
         while True:
             try:
                 await self._maybe_compact(session)
                 n_before = len(session.stored.messages)
-                status, final_text = await self._run_one_turn(session, prompt)
+                if hooked is None:
+                    status, final_text = await self._run_one_turn(session, prompt)
+                else:  # the typed prompt's hooks ran above; a retry or a goal's next prompt runs its own
+                    status, final_text = await self._run_one_turn(session, prompt, hooked=hooked)
+                    hooked = None
                 if status == "error" and isinstance(session.last_exc, ContextOverflow):
                     # The provider says the conversation does not fit: drop this attempt's messages, fold the older
                     # history into a summary, and run the prompt once more.
@@ -1636,6 +1681,72 @@ class GatewayServer:
         else:
             return
         self.emit_goal(session)
+
+    # ── wake words and the ultracode mode ──
+
+    async def _route_typed_prompt(
+        self, session: LiveSession, text: str, hooked: userhooks.HookOutcome
+    ) -> tuple[str, str] | None:
+        """A prompt the user typed: a wake word, else the ultracode mode, runs a job as this turn.
+
+        ``hooked``: what the user's hooks made of it (not blocked: the caller ends a blocked prompt as a normal turn).
+        Returns the job's ``(status, text)``; None means run ``text`` as a normal turn. Deciding never costs the user
+        their prompt: a failure while deciding is logged and the prompt runs normally."""
+        try:
+            route = await self._plan_route(session, text, hooked.context_text())
+        except asyncio.CancelledError:  # /stop during the scope check: the ending of a cancelled turn
+            session.run_result = "completed"
+            self._block_goal_for(session, "interrupted")
+            session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("wake word / ultracode routing failed; running the prompt as a normal turn")
+            return None
+        if route is None:
+            return None
+        if isinstance(route.spec, dict):  # usage line, or the mode is unavailable: an answer, no job
+            status, out = self._reply_turn(session, text, str(route.spec["message"]))
+        else:
+            spec = route.spec
+
+            async def run() -> str:
+                self.ultra.progress(session, route.command, route.phase, route.detail)
+                return await spec.factory()
+
+            # the user's own words are the user message; the label only names the job in the status line
+            status, out = await self._run_job(session, spec.label, run, user_text=text)
+        self._block_goal_for(session, status)
+        self._session_finished(session, status)
+        return status, out
+
+    async def _plan_route(self, session: LiveSession, text: str, context: str = "") -> _Route | None:
+        """Which job (if any) ``text`` runs as: an explicit wake word first, then the ultracode mode.
+
+        ``context``: what the user's UserPromptSubmit hooks added, handed to the job with the task."""
+        if (hit := wakewords.detect_enabled(self.config, text)) is not None:
+            cmd: Any = self.commands.get(hit.mode)
+            if hit.mode == "ultracode" and (word := typed_mode_word(hit.task)):
+                # "ultracode off", "turn ultracode off": what /ultracode takes as mode control, not a task to run
+                return _Route(hit.mode, "wake word", "", cmd.apply_mode_word(self, session, word))
+            # an empty task (the word alone) comes back as the command's usage line
+            spec = await cmd.prepare(self, session, hit.task, context=context)
+            return _Route(hit.mode, "wake word", f'"{hit.mode}" in your message', spec)
+        if (
+            getattr(session, "ultra_mode", "off") != "ultracode"
+            or session.background  # unattended runs have nobody to watch a pipeline
+            or session.preapproved_plan  # /go after /ultraplan: the plan is approved, the gate hands it to fan-out
+            or text.lstrip().startswith("/")
+        ):
+            return None
+        session.emit("status.update", {"kind": "status", "text": "checking scope", "state": "working"})
+        verdict = await self.autonomy.mode_verdict(session, text)
+        min_scope = str(ultra_cfg(self.config)["min_scope"])
+        if verdict.source == "fallback" or SCOPES.index(verdict.scope) < SCOPES.index(min_scope):
+            return None  # trivial, or the classifier is down: not worth a pipeline; the gate reuses this verdict
+        ultracode: Any = self.commands.get("ultracode")
+        spec = await ultracode.prepare(self, session, text, context=context)
+        self.autonomy.drop_mode_verdict(session)
+        return _Route("ultracode", "ultracode is on", f"scope {verdict.scope}", spec)
 
     def _block_goal_for(self, session: LiveSession, status: str) -> None:
         """A turn that did not finish leaves its active goal paused, with the reason and one notification.
@@ -1764,6 +1875,20 @@ class GatewayServer:
         outcome.context += submitted.context
         return outcome
 
+    async def _typed_prompt_hooks(self, session: LiveSession, text: str) -> userhooks.HookOutcome:
+        """The hooks for a prompt the user typed, run ahead of the turn so that nothing (the scope classifier, a
+        wake word's job) spends a model call on a prompt a hook blocks; ``_run_one_turn`` takes the outcome as given."""
+        hooks = userhooks.load(Path(session.stored.cwd or Path.cwd()), session.session_id)
+        if hooks:  # a hook can take a while: the turn is working, as it was when the hooks ran inside it
+            session.emit("status.update", {"kind": "status", "text": "running hooks", "state": "working"})
+        try:
+            return await self._prompt_hooks(session, hooks, text)
+        except asyncio.CancelledError:  # /stop while a hook runs: the ending of a cancelled turn
+            session.run_result = "completed"
+            self._block_goal_for(session, "interrupted")
+            session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+            raise
+
     def _active_model(self, session: LiveSession) -> str:
         """The model id the session's main tier sends to first (what its context window is looked up by)."""
         specs = tier_model_specs(self.config, Tier.MAIN, key=session.stored.model or self.config.default_model)
@@ -1796,8 +1921,12 @@ class GatewayServer:
             return context_window(self.config, self._active_model(session))
         return min(context_window(self.config, m) for m in models)
 
-    async def _run_one_turn(self, session: LiveSession, text: str) -> tuple[str, str]:
-        """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text)."""
+    async def _run_one_turn(
+        self, session: LiveSession, text: str, *, hooked: userhooks.HookOutcome | None = None
+    ) -> tuple[str, str]:
+        """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text).
+
+        ``hooked``: the outcome of the user's hooks when the caller already ran them for ``text``."""
         if self.halted:  # /daemon pause: nothing reaches a provider; the caller pauses the goal (status 'halted')
             return "halted", ""
         self._ensure_router(session.stored.model or None)
@@ -1867,7 +1996,8 @@ class GatewayServer:
         session.current_kind = kind.value
         prompt_blocked = False
         try:
-            hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
+            if hooked is None:
+                hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
             prompt_blocked = hooked.blocked
             try:
                 if not hooked.blocked:
@@ -2651,44 +2781,65 @@ class GatewayServer:
             raise _InvalidParams("a turn is already running in this session; /stop it or wait")
 
         async def runner() -> None:
-            _ctx_session.set(session)
-            session.needs_input = False
-            session.run_result = None  # an earlier turn's outcome must not survive into this job's events
-            session.streaming = True
-            session.turn_started_wall = time.time()
-            session.emit("message.start", {})
-            session.emit("status.update", {"kind": "status", "text": label, "state": "working"})
-            status, text = "done", ""
-            try:
-                text = await make_coro()
-            except asyncio.CancelledError:
-                status, text = "interrupted", f"{label} interrupted."
-            except Exception as e:  # noqa: BLE001 - a failed job is reported, never crashes the gateway
-                logger.exception("%s failed", label)
-                status, text = "error", f"{label} failed: {e}"
-                session.emit("error", {"message": text})
-            finally:
-                session.streaming = False
-                session.call_started = None
-                self.subagents.interrupt_session(session.session_id)  # nothing may outlive the job
-            # same mapping as _run_one_turn, set before the closing events carry session.state
-            session.run_result = {"done": "completed", "interrupted": "completed"}.get(status, "failed")
-            session.emit("message.delta", {"text": text})
-            session.stored.messages = [
-                *session.stored.messages,
-                {"role": "user", "content": label},
-                {"role": "assistant", "content": text},
-            ]
-            self.store.save(session.stored)
-            session.emit(
-                "message.complete", {"text": text, "usage": {}, "status": status, "error": None, "state": session.state}
-            )
-            session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+            status, _ = await self._run_job(session, label, make_coro)
             # prompts typed while the job ran were queued: run them now, like _run_turn does after a turn
             if status != "interrupted" and (pending := self._pending_prompts(session)):
                 await self._run_turn(session, pending.pop(0))
 
         session.turn_task = asyncio.get_running_loop().create_task(runner())
+
+    async def _run_job(
+        self, session: LiveSession, label: str, make_coro: Callable[[], Any], *, user_text: str | None = None
+    ) -> tuple[str, str]:
+        """The body of a job, in whatever task owns the session's turn: ``start_job``'s task, or the turn that a wake
+        word or the ultracode mode turned into a job (it holds the turn lock; this never takes it).
+
+        ``user_text``: what the user typed when that differs from ``label`` (it is what the transcript keeps).
+        Returns ``(status, text)``; /stop (a cancel of the owning task) ends the job as ``interrupted``."""
+        _ctx_session.set(session)
+        session.needs_input = False
+        session.run_result = None  # an earlier turn's outcome must not survive into this job's events
+        session.streaming = True
+        session.turn_started_wall = time.time()
+        session.emit("message.start", {})
+        session.emit("status.update", {"kind": "status", "text": label, "state": "working"})
+        status, text = "done", ""
+        try:
+            text = await make_coro()
+        except asyncio.CancelledError:
+            status, text = "interrupted", f"{label} interrupted."
+        except Exception as e:  # noqa: BLE001 - a failed job is reported, never crashes the gateway
+            logger.exception("%s failed", label)
+            status, text = "error", f"{label} failed: {e}"
+            session.emit("error", {"message": text})
+        finally:
+            session.streaming = False
+            session.call_started = None
+            self.subagents.interrupt_session(session.session_id)  # nothing may outlive the job
+        self._finish_job(session, label if user_text is None else user_text, status, text)
+        return status, text
+
+    def _finish_job(self, session: LiveSession, user_text: str, status: str, text: str) -> None:
+        """The closing events of a job (or of a reply that is not a job) and the exchange saved to the transcript."""
+        # same mapping as _run_one_turn, set before the closing events carry session.state
+        session.run_result = {"done": "completed", "interrupted": "completed"}.get(status, "failed")
+        session.emit("message.delta", {"text": text})
+        session.stored.messages = [
+            *session.stored.messages,
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": text},
+        ]
+        self.store.save(session.stored)
+        session.emit(
+            "message.complete", {"text": text, "usage": {}, "status": status, "error": None, "state": session.state}
+        )
+        session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+
+    def _reply_turn(self, session: LiveSession, user_text: str, text: str) -> tuple[str, str]:
+        """A turn that is only an answer, with no model call and no job (a bare wake word gets the usage line)."""
+        session.emit("message.start", {})
+        self._finish_job(session, user_text, "done", text)
+        return "done", text
 
     # ── background sessions (/bg, Ctrl+B) ─────────────────────────────
 
@@ -2701,6 +2852,11 @@ class GatewayServer:
         )
         stored.meta["mode"] = src.perms.mode.value
         stored.meta["add_dirs"] = list(src.perms.add_dirs)
+        # effort and the ultracode mode are inherited and kept in the meta, so a resume of the new session has them
+        if src.reasoning_effort:
+            stored.meta["reasoning_effort"] = src.reasoning_effort
+        if src.ultra_mode != "off":
+            stored.meta["ultra_mode"] = src.ultra_mode
         if background:
             stored.meta["background"] = True
             stored.meta["origin_session"] = src.session_id
@@ -2721,7 +2877,8 @@ class GatewayServer:
         live = self._fresh_session_like(origin, background=True, cwd=cwd)
         live.stored.title = live.stored.title or " ".join(prompt.split())[:60]
         self.store.save(live.stored)
-        live.turn_task = asyncio.get_running_loop().create_task(self._run_turn(live, prompt))
+        # typed by the user: a wake word in it runs that mode here (the ultracode mode skips background sessions)
+        live.turn_task = asyncio.get_running_loop().create_task(self._run_turn(live, TypedPrompt(prompt)))
         self._watch_background(live, origin.session_id)
         return live
 
@@ -2920,6 +3077,9 @@ def _require(params: dict[str, Any], key: str) -> Any:
 
 
 async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    ultra = params.get("ultra_mode")
+    if ultra is not None and ultra not in tune_cmd.ULTRA_MODES:
+        raise _InvalidParams(f"unknown ultra_mode: {ultra} (one of {', '.join(tune_cmd.ULTRA_MODES)})")
     stored = server.store.create(
         model=params.get("model") or server.config.default_model,
         provider=params.get("provider") or "",
@@ -2927,6 +3087,9 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
     )
     if params.get("background"):
         stored.meta["background"] = True
+        server.store.save(stored)
+    if ultra == "ultracode":  # kept in the meta, so a resume and a /fork of this session have it
+        stored.meta["ultra_mode"] = ultra
         server.store.save(stored)
     live = LiveSession(stored.session_id, stored, server)
     live.reasoning_effort = params.get("effort")
@@ -3114,8 +3277,9 @@ async def _session_steer(server: GatewayServer, params: dict[str, Any]) -> dict[
     if session is None or not session.streaming:
         return {"steered": False}
     # The running loop adds it before its next model call. Appending to stored.messages lost it: the loop never saw
-    # it and the turn's persist overwrote the list.
-    session.steer_queue.append(str(text))
+    # it and the turn's persist overwrote the list. Typed text keeps its marker: if no loop takes it, it runs as the
+    # next prompt, wake words and all (``automated`` is the TUI's own text, see _prompt_submit).
+    session.steer_queue.append(str(text) if params.get("automated") is True else TypedPrompt(text))
     return {"steered": True}
 
 
@@ -3175,10 +3339,13 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     if server.halted:
         raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
     server.last_user_activity = time.time()
+    # `automated`: text the TUI generated (a /skill expansion, the /go send, an accepted proposal), not typed by the
+    # user. Only typed text is checked for wake words and the ultracode mode, now or when it drains from the queue.
+    prompt = str(text) if params.get("automated") is True else TypedPrompt(text)
     if session.turn_in_flight:
         # really queued: it runs when the current turn ends. The task check covers a turn that has not reached
         # `streaming = True` yet (compaction, MCP start): a second task there overwrote turn_task, so /stop missed one.
-        session.pending_prompts.append(str(text))
+        session.pending_prompts.append(prompt)
         return {"turn_id": "", "status": "queued"}
     if params.get("background"):
         session.background = True
@@ -3186,7 +3353,7 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     if session.background and server.background_paused:
         raise _InvalidParams("background work is paused (restart-storm safe mode); resume with /daemon resume")
     session.stored.model = params.get("model") or session.stored.model
-    session.turn_task = asyncio.get_running_loop().create_task(server._run_turn(session, str(text)))
+    session.turn_task = asyncio.get_running_loop().create_task(server._run_turn(session, prompt))
     return {"turn_id": session.turn_task.get_name(), "status": "streaming"}
 
 
@@ -3333,7 +3500,24 @@ async def _model_options(server: GatewayServer, params: dict[str, Any]) -> dict[
                 "api_url": p.base_url,
             }
         )
-    return {"providers": providers, "model": server.config.default_model}
+    # the model key of the session asked about (else the current one), not only the configured default
+    session = server._session_for(params.get("session_id"))
+    return {"providers": providers, "model": tune_cmd.current_model(server.config, session)}
+
+
+async def _tune_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``tune.get``: what the tune popup shows (models, effort levels, ultracode mode, wake words)."""
+    return tune_cmd.snapshot(server, server._session_for(params.get("session_id")))
+
+
+async def _tune_set(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``tune.set {session_id?, model?, effort?, ultra_mode?, scope?}``: validate all, apply all or nothing."""
+    session = server._session_for(params.get("session_id"))
+    try:
+        outcome = tune_cmd.apply_tune(server, session, tune_cmd.request_from_params(params))
+    except tune_cmd.TuneError as e:
+        raise _InvalidParams(str(e)) from None
+    return {**tune_cmd.snapshot(server, session), "ok": True, "changed": outcome.changed}
 
 
 async def _model_save_key(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3466,15 +3650,21 @@ async def _config_set_reasoning(server: GatewayServer, params: dict[str, Any]) -
 
 
 async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    """``config.set model``: value is ``<model-key> [--provider p] [--session|--global]`` (picker flags ignored)."""
-    parts = str(params.get("value") or "").split()
+    """``config.set model``: value is ``<model-key> [--provider p] [--reasoning <level>] [--session|--global]``.
+
+    ``--global`` also makes the key the saved default of new sessions; ``--reasoning`` sets the session's effort
+    (ignored without a session); ``--provider`` and the other picker flags are ignored."""
+    parts = iter(str(params.get("value") or "").split())
     keys: list[str] = []
-    skip = False
+    reasoning: str | None = None
+    scope = "session"
     for part in parts:
-        if skip:
-            skip = False
-        elif part == "--provider":
-            skip = True
+        if part == "--provider":
+            next(parts, None)  # its value
+        elif part == "--reasoning":
+            reasoning = next(parts, "")
+        elif part == "--global":
+            scope = "default"
         elif not part.startswith("--"):
             keys.append(part)
     if not keys:
@@ -3484,12 +3674,11 @@ async def _config_set_model(server: GatewayServer, params: dict[str, Any]) -> di
     if key not in known:
         raise _InvalidParams(f"unknown model key: {key} (known: {', '.join(sorted(known))})")
     session = server._session_for(params.get("session_id"))
-    if session is None:
-        server.config.default_model = key
-    else:
-        session.stored.model = key
-        server.store.save(session.stored)
-        session.emit("session.info", session.live_info())
+    try:
+        effort = tune_cmd.normalize_effort(reasoning, legacy=True) if reasoning is not None and session else None
+        tune_cmd.apply_tune(server, session, tune_cmd.TuneRequest(model=key, effort=effort, scope=scope))
+    except tune_cmd.TuneError as e:
+        raise _InvalidParams(str(e)) from None
     return {"ok": True, "key": "model", "value": key}
 
 
@@ -3706,7 +3895,7 @@ HELP_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "Model and settings",
-        ("model", "effort", "settings", "config", "output-style", "permissions", "update-config", "focus"),
+        ("tune", "model", "effort", "settings", "config", "output-style", "permissions", "update-config", "focus"),
     ),
     (
         "Autonomy",
@@ -3820,6 +4009,8 @@ _HANDLERS: dict[str, Any] = {
     "complete.slash": _complete_slash,
     "complete.path": _complete_path,
     "model.options": _model_options,
+    "tune.get": _tune_get,
+    "tune.set": _tune_set,
     "model.save_key": _model_save_key,
     "model.disconnect": _model_disconnect,
     "config.get": _config_get,

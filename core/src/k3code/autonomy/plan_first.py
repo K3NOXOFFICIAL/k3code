@@ -120,7 +120,33 @@ class PlanFirst:
 
     # ── the gate ──
 
+    async def mode_verdict(self, session: Any, text: str) -> ScopeVerdict:
+        """The scope of ``text`` for the ultracode mode. When the prompt then runs as a normal turn, ``prepare`` reuses
+        this verdict instead of asking the classifier a second time."""
+        override = getattr(session, "scope_override", None)
+        if override:  # /scope applies to the next task: ``prepare`` consumes it if this runs as a normal turn
+            return scope.from_override(override, text)
+        verdict = await self._classify(session, text)
+        session.mode_verdict = (text, verdict)
+        return verdict
+
+    def drop_mode_verdict(self, session: Any) -> None:
+        """The prompt went to the pipeline, not to ``prepare``: its verdict and any ``/scope`` are spent."""
+        session.mode_verdict = None
+        session.scope_override = None
+
+    async def _classify(self, session: Any, text: str) -> ScopeVerdict:
+        return await scope.classify(
+            self.server.model_caller,
+            text,
+            Path(session.stored.cwd or "."),
+            recent=advisor_mod.transcript_text(session.stored.messages[-6:], per_message=400),
+            session_id=session.session_id,
+        )
+
     async def prepare(self, session: Any, text: str) -> GateResult:
+        cached = getattr(session, "mode_verdict", None)  # classified a moment ago for the ultracode mode
+        session.mode_verdict = None
         pre = getattr(session, "preapproved_plan", None)
         if pre:  # /go after /ultraplan: the plan is approved, skip the gate and let fan-out take it
             from k3code.autonomy.ultra import plan_verdict
@@ -137,14 +163,10 @@ class PlanFirst:
         session.scope_override = None  # applies to the next task only
         if override:
             verdict = scope.from_override(override, text)
+        elif cached is not None and cached[0] == text:
+            verdict = cached[1]
         else:
-            verdict = await scope.classify(
-                self.server.model_caller,
-                text,
-                Path(session.stored.cwd or "."),
-                recent=advisor_mod.transcript_text(session.stored.messages[-6:], per_message=400),
-                session_id=sid,
-            )
+            verdict = await self._classify(session, text)
         h = self.scope_log.verdict(text, verdict, sid)
         session.emit("scope.verdict", {"session_id": sid, "hash": h, **verdict.as_dict()})
         if not verdict.wants_plan:

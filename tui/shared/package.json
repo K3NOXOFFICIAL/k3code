@@ -17,7 +17,8 @@
     "./reasoning-effort": "./reasoning-effort.ts",
     "./reconnect-backoff": "./reconnect-backoff.ts",
     "./skin": "./skin.ts",
-    "./slash": "./slash.ts"
+    "./slash": "./slash.ts",
+    "./wake-words": "./wake-words.ts"
   },
   "types": "./gateway-events.ts"
 }

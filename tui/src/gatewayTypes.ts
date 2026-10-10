@@ -173,6 +173,56 @@ export interface SystemBatteryResponse {
   plugged?: null | boolean;
 }
 
+// ── /tune: model + effort + ultracode ────────────────────────────────
+
+/** One model KEY of `tune.get` (keys repeat across providers in the fallback chain). */
+export interface TuneModelRow {
+  current?: boolean;
+  default?: boolean;
+  description?: string;
+  /** Whether the model takes an effort level; null/absent when unknown. */
+  effort?: boolean | null;
+  key: string;
+  providers?: string[];
+  /** The real model ids the key maps to, in chain order. */
+  resolved?: string[];
+}
+
+/** `tune.get` — everything the tune popup shows. */
+export interface TuneGetResponse {
+  default_model?: string;
+  /** The ladder the popup draws after its leftmost "default" stop. */
+  efforts?: string[];
+  /** The session's level; null = default (no override). */
+  effort?: null | string;
+  has_session?: boolean;
+  /** The session's model key (the configured default without a session). */
+  model?: string;
+  models?: TuneModelRow[];
+  ultra_mode?: string;
+  ultra_modes?: string[];
+  wake_words?: string[];
+  wake_words_enabled?: boolean;
+}
+
+/**
+ * `tune.set` params: only the fields that changed. `scope: "default"` also
+ * makes the model the persisted default for new sessions.
+ */
+export interface TuneSetParams {
+  effort?: string;
+  model?: string;
+  scope: "default" | "session";
+  session_id?: string;
+  ultra_mode?: string;
+}
+
+/** `tune.set` result: the `tune.get` shape plus what changed. */
+export interface TuneSetResponse extends TuneGetResponse {
+  changed?: string[];
+  ok?: boolean;
+}
+
 // ── Session lifecycle ────────────────────────────────────────────────
 
 export interface SessionCreateResponse {

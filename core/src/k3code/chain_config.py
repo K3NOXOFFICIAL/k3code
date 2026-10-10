@@ -14,6 +14,7 @@ from typing import Any
 
 import yaml
 
+from k3code import confio
 from k3code.config import ProviderEntry, Settings
 from k3code.daemon import k3_home
 
@@ -119,6 +120,32 @@ def edit_config(op: str, args: list[str], home: Path | None = None) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(data, sort_keys=False))
     return backup
+
+
+def set_default_model(key: str, home: Path | None = None) -> tuple[bool, str]:
+    """Make ``key`` the ``default_model`` of the user config, for new sessions (``/tune --global``).
+
+    Same order as :func:`edit_config`: the resulting config is validated, the existing file is backed up, then the new
+    one is written. Returns ``(written, backup)``: ``written`` is False when the file already says so (nothing is
+    touched then), ``backup`` is '' when there was no file to back up. The caller has checked that ``key`` is a known
+    model key. (YAML comments are not preserved by the rewrite; the backup keeps them.)
+    """
+    path = config_path(home)
+    try:
+        data = confio.read_yaml(path)
+    except (confio.ConfigError, yaml.YAMLError, OSError) as e:
+        raise ChainEditError(f"cannot read {path}: {e}") from e
+    if data.get("default_model") == key:
+        return False, ""
+    data["default_model"] = key
+    try:
+        confio.validate(data)
+        backup = confio.write_yaml(path, data)
+    except confio.ConfigError as e:
+        raise ChainEditError(f"{path} would be invalid: {e}") from e
+    except OSError as e:
+        raise ChainEditError(f"cannot write {path}: {e}") from e
+    return True, str(backup or "")
 
 
 def chain_rows(ctx: Any, session_id: str | None) -> list[dict[str, Any]]:

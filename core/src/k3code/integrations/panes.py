@@ -64,6 +64,7 @@ READONLY_BLOCKED = frozenset(
         "command.dispatch",
         "slash.exec",
         "config.set",
+        "tune.set",
         "clipboard.paste",
         "image.attach",
         "image.attach_bytes",

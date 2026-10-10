@@ -20,6 +20,7 @@ import { listRowStyle } from "./overlayPrimitives.js";
 import { PluginsHub } from "./pluginsHub.js";
 import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from "./prompts.js";
 import { SkillsHub } from "./skillsHub.js";
+import { TunePicker } from "./tunePicker.js";
 import { WidgetGrid, type WidgetGridWidget } from "./widgetGrid.js";
 
 const COMPLETION_WINDOW = 16;
@@ -176,6 +177,7 @@ export function FloatingOverlays({
   onNewLiveSession,
   onNewPromptSession,
   onResumeSelect,
+  onTuneApply,
   pagerPageSize,
 }: Pick<
   AppOverlaysProps,
@@ -188,6 +190,7 @@ export function FloatingOverlays({
   | "onNewLiveSession"
   | "onNewPromptSession"
   | "onResumeSelect"
+  | "onTuneApply"
   | "pagerPageSize"
 > & { nativeMode?: boolean }) {
   const { gw } = useGateway();
@@ -258,6 +261,24 @@ export function FloatingOverlays({
             maxWidth={width}
             onCancel={() => patchOverlayState({ modelPicker: false })}
             onSelect={onModelSelect}
+            sessionId={sid}
+            t={theme}
+          />
+        </FloatBox>
+      ),
+    });
+  }
+
+  if (overlay.tunePicker) {
+    widgets.push({
+      id: "tune-picker",
+      render: (width) => (
+        <FloatBox color={theme.color.border}>
+          <TunePicker
+            gw={gw}
+            maxWidth={width}
+            onApply={onTuneApply}
+            onCancel={() => patchOverlayState({ tunePicker: false })}
             sessionId={sid}
             t={theme}
           />

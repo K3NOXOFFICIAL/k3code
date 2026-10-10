@@ -876,7 +876,7 @@ export const coreCommands: SlashCommand[] = [
       }
 
       if (!ctx.sid) {
-        return ctx.transcript.send(last);
+        return ctx.transcript.resend(last);
       }
 
       ctx.gateway
@@ -890,7 +890,7 @@ export const coreCommands: SlashCommand[] = [
             ctx.transcript.setHistoryItems((prev: Msg[]) =>
               ctx.transcript.trimLastExchange(prev),
             );
-            ctx.transcript.send(last);
+            ctx.transcript.resend(last);
           }),
         );
     },

@@ -30,7 +30,7 @@ k3code plans before it acts, can run several agents in parallel, retries through
 | Area | What you get |
 |---|---|
 | **Coding agent** | Read, edit, patch, bash, grep, glob, web fetch/search and todo tools; plan mode; MCP servers; skills; project and user memory (`K3CODE.md`, mem0); output styles. |
-| **Autonomy** | In auto mode it classifies the task (trivial → huge), plans first, and fans out parallel sub-agents in git worktrees with a reviewer gate. `/goal` and `/loop` keep going until a condition holds. Cron jobs and event-triggered automations run unattended. |
+| **Autonomy** | In auto mode it classifies the task (trivial → huge), plans first, and fans out parallel sub-agents in git worktrees with a reviewer gate. `/goal` and `/loop` keep going until a condition holds. `/ultracode` runs a plan, fan-out, review and test pipeline once, or stays on as a session mode; saying `ultracode` in a prompt runs it once. Cron jobs and event-triggered automations run unattended. |
 | **Reliability** | If the network or a provider drops, it retries; when you are offline it pauses and resumes by itself. A crash-safe journal never re-runs a command that may already have executed. Concurrency limits, optional budgets and a loop guard keep unattended runs bounded. |
 | **Provider routing** | An ordered chain of providers and models (primary, secondary, tertiary, as many as you like). Errors are classified, failing entries cool down, and a long rate limit fails over instead of sleeping. Background work is routed to cheaper tiers automatically. |
 | **Multi-session UI** | An agent list under the input box with live states (working, needs input, completed, failed), navigable with the arrow keys. Background sessions and sub-agents appear there too. ↑ walks your input history. |
@@ -152,8 +152,8 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 | Group | Commands |
 |---|---|
 | **Session and context** | `/clear` · `/compact` · `/resume` · `/rename` · `/fork` · `/branch` · `/stop` · `/exit` · `/add-dir` |
-| **Models and effort** | `/model` (opens the picker; `/model <key>` switches; `/model chain` shows the fallback chain and its health, and `add`, `remove` and `move` edit it) · `/effort` · `/output-style` |
-| **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` · `/ultraresearch` · `/advisor` |
+| **Models and effort** | `/tune` (one popup for the model, the reasoning effort and the ultracode mode; or typed, for example `/tune strong high ultracode`) · `/model` (bare opens the same popup; `/model <key>` switches; `/model chain` shows the fallback chain and its health, and `add`, `remove` and `move` edit it) · `/effort` (bare opens the same popup; `/effort <level>` sets it) · `/output-style` |
+| **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` (`/ultracode <task>` runs it once; bare, `on`, `off` and `status` control the ultracode mode) · `/ultraresearch` · `/advisor` |
 | **Automation** | `/schedule` (cron) · `/automations` (file, git, webhook, session, network and idle triggers) |
 | **Review and learning** | `/review` · `/proposals` · `/project` (detected stacks and recipe proposals; `/project rescan`) · `/learn` · `/optimizer` · `/self-improve` |
 | **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
@@ -180,7 +180,106 @@ In `auto` mode every new task is classified first (`trivial`, `small`, `medium`,
 
 `large` and `huge` tasks with independent parts are split into parallel workers in separate git worktrees (this needs a git repository with at least one commit). Each result is reviewed and merged, and tested before it is kept when the project has a test command: set `autonomy.fanout.test_command`, or it is detected for pytest, npm, Go and Cargo projects.
 
-`/ultracode <task>` is the full pipeline: three independent plans and a judge, parallel implementation, a two-reviewer adversarial panel where a finding counts only if both agree, fixes, and a final test run, all under a token and agent budget.
+`/ultracode <task>` is the full pipeline: three independent plans and a judge, parallel implementation, a two-reviewer adversarial panel where a finding counts only if both agree, fixes, and a final test run, all under a token and agent budget (`ultracode.max_tokens`, `ultracode.max_agents`). It can also stay on for a whole session ([Ultracode mode](#ultracode-mode)) or run when you say its name in a prompt ([Wake words](#wake-words)).
+
+### Tune: model, effort and ultracode
+
+`/tune` opens one popup with the model list, the reasoning effort slider and the ultracode switch. A bare `/model` and a bare `/effort` open the same popup. This is a sample at 100 columns (the first row is your `default_model`, and the descriptions come from `descriptions` in the provider config):
+
+```
+Tune
+Switch between models. Enter makes your pick the default for new sessions.
+
+❯ 1. Default (recommended) ✓  model-a · Everyday coding
+  2. strong                   model-strong · Planning and review
+  3. cheap                    model-cheap · Fast and cheap
+
+Effort      Faster                                   Smarter   Ultracode  on
+            ──────────────────────────────▲─────────────────   Tab to toggle
+            default    low    medium    high    xhigh    max
+Ultracode: runs the multi-agent pipeline on every task
+↑/↓ model · ←/→ effort · Tab ultracode · Enter default · s session · Esc cancel
+Say ultracode / ultraplan / ultraresearch in a prompt to run that mode once.
+```
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Move through the models (`1` to `9` jump to that row) |
+| `←` / `→` | Move the effort mark: `default` (send no effort level), `low`, `medium`, `high`, `xhigh`, `max` |
+| `Tab` | Ultracode on / off |
+| `Enter` | Apply what you changed, and make the highlighted model the default for new sessions (nothing is written when it already is the default) |
+| `s` | Apply to this session only |
+| `Esc` | Close; nothing changes |
+
+The current model has a green ✓. The popup sends everything in one request and only the fields you moved, so `Enter` on an untouched popup just closes it when the highlighted model is already the default; otherwise it makes that model the default (use `s` to leave the default alone). Model and effort apply from the next turn, the ultracode mode from the next prompt. When the highlighted model takes no effort level the popup says so. Without a session, effort and ultracode are greyed out and their keys do nothing; the model can still be set. The popup does not open, and ignores keys, while an approval, question, password or confirm prompt is waiting. It fits 80x24: the model list shrinks first, and below 70 columns the descriptions go.
+
+The same thing, typed (the TUI opens the popup for a bare `/tune`; other clients get the current state):
+
+```
+/tune                                    show the model, effort and ultracode mode
+/tune strong                             this session uses the model key "strong"
+/tune model strong effort high           the same words, spelled out
+/tune high ultracode                     effort high and the ultracode mode on
+/tune cheap low ultracode off --global   cheap, low, ultracode off; "cheap" is also the default for new sessions
+```
+
+- Words come in any order. A bare word is a model key if it is one (a model key wins over an effort word), otherwise an effort level: `low`, `medium`, `high`, `xhigh`, `max` or `default` (send no effort level). Spell it `model <key>` or `effort <level>` if a name is ambiguous.
+- `ultracode` alone means on. `ultracode on`, `off`, `true`, `false`, `yes`, `no`, `1` and `0` also work.
+- `--global` (it needs a model) also makes the model the default for new sessions. `--session` is the default.
+- Everything is checked first and applied all or nothing. An unknown word gives an error with the usage line and changes nothing. Effort and ultracode need a session.
+- The old picker's spellings still work: `--reasoning <level>` is `effort <level>`; `minimal`, `ultra` and `none` after `effort` or `--reasoning` mean `low`, `max` and `default`; `--provider <name>` and `--tui-session` are accepted and ignored.
+- `/model <key>` and `/effort <level>` do what they always did, and take the same flags: `/model strong --reasoning high --global`.
+
+**The default model.** Enter in the popup and `--global` write `default_model: <key>` into your user `config.yaml` (never the project's). k3code checks that the key exists and that the file stays valid, keeps a timestamped backup next to it, then writes. The rewrite drops YAML comments; the backup keeps them. If the write fails you get the error and nothing else from that request is applied. `s` and anything without `--global` change this session only.
+
+### Ultracode mode
+
+Ultracode can be a mode of the session: `off` (the default) or `on`. Turn it on with `Tab` in the popup, `/tune ultracode`, or `/ultracode`:
+
+| Command | What it does |
+|---|---|
+| `/ultracode` | Flip the mode |
+| `/ultracode on` / `off` | Set it |
+| `/ultracode status` | Say whether it is on |
+| `/ultracode <task>` | Run the pipeline once for that task. It does not change the mode |
+
+While the mode is on, the status line shows an `ultracode` chip, and a prompt you type runs the ultracode pipeline (the plan, fan-out, review, fix and test steps above, with the same budget) instead of a normal turn. The plan-first scope classifier decides: a prompt rated at least `ultracode.min_scope` runs the pipeline. The default is `small`, so everything except `trivial` (an answer-only question or one located edit) does. Set `min_scope: medium` if small tasks should stay normal turns. A `trivial` prompt, or one the classifier fails on, runs as a normal turn.
+
+The mode leaves a prompt alone when:
+
+- it starts with `/` (a slash command runs as typed);
+- the TUI generated it rather than you typing it (a skill expansion, the `/go` send, an accepted proposal);
+- an approved plan is waiting for it (`/go` after `/ultraplan`);
+- the session is a background session.
+
+A prompt that waited in the queue behind a running turn is routed when it runs, with the mode as it is then. The mode belongs to the session: it survives a resume, and `/fork`, `/branch` and background sessions start with it, as they do with the effort. Each run starts several agents and spends tokens (a run stops at `ultracode.max_tokens` or `ultracode.max_agents`), so leave the mode off when you do not want that for every prompt.
+
+### Wake words
+
+`ultracode`, `ultraplan` and `ultraresearch`, typed in a prompt, run that mode once when you send it. The word is taken out of the task:
+
+```
+fix the flaky login test, ultracode              runs /ultracode fix the flaky login test
+ultraplan add rate limiting to the API           runs /ultraplan add rate limiting to the API
+ultraresearch how do other agents retry on 429?  runs /ultraresearch how do other agents retry on 429?
+```
+
+Your transcript keeps your own words; only the task the mode gets has the word removed. A wake word wins over the ultracode mode. A prompt that is only the word gets the command's usage line as the answer, and nothing runs.
+
+A word does not count when:
+
+- the prompt starts with `/` (slash commands run as typed);
+- it is part of something longer: a path (`src/ultracode.py`), a flag (`--ultracode`), an `@mention`, a `#tag` or a longer word;
+- it is quoted or in code: in backticks, in quotes or in a code block;
+- the prompt names two different wake words ("what is the difference between ultracode and ultraplan?"): that is ambiguous, so nothing runs.
+
+`ultracode on`, `ultracode off` and `ultracode status`, and the same asked in a few words ("turn off ultracode", "ultracode mode on"), change or show the [mode](#ultracode-mode) like `/ultracode on|off|status` instead of starting a run. "ultracode on the auth module" is a task. Your `UserPromptSubmit` hooks see a prompt before a wake word or the mode does: one a hook blocks starts nothing, and what a hook adds is passed to the run.
+
+Only text you typed is checked (a collapsed paste is part of the prompt you send, so a word in it counts, although the composer does not paint it): a prompt you send, a prompt that waited in the queue (checked when it runs), a steering message that ends up running as a prompt, and `/bg <prompt>`. Goal prompts, loop, cron and automation ticks, sub-agents, tool output and text the TUI generated (skills, `/go`, accepted proposals) never trigger one. Wake words work for prompts that go through the gateway (the TUI, including `k3code attach`). They do not apply to `k3code -p` or the line REPL, which run their own loop without the gateway.
+
+While you type, the composer paints a word that counts in the accent colour, so you see it before you press Enter. The composer does not read your `wake_words` settings: a word you switched off is painted too, but does nothing.
+
+To say one of the words without running anything, quote it or put it in backticks. To switch them off, set `wake_words.enabled: false` in your config, or switch off a single word, for example `wake_words.ultraplan: false` (see [Configuration](#configuration)).
 
 ### Multiple windows: `k3`
 
@@ -247,6 +346,7 @@ State lives in `~/.k3code/` (override with `K3CODE_HOME`): `config.yaml`, sessio
 Precedence per top-level key: command-line flag > environment (`K3CODE_<KEY>`, scalar keys only, for example `K3CODE_PERMISSION_MODE`) > project config > user config > defaults. Nested sections are replaced as a whole, not merged. `providers` comes from the user config only. Change settings with `/config`, `/update-config` or `k3code setup --step <name>`; edits are backed up and `/config rollback` restores the last one.
 
 ```yaml
+default_model: default              # the model key new sessions start on (/tune --global and Enter in the popup write it)
 providers:                          # the fallback chain, in order (add as many as you like)
   - name: gateway
     kind: openai                    # openai-compatible, or: anthropic
@@ -256,6 +356,10 @@ providers:                          # the fallback chain, in order (add as many 
       default: [model-a, model-b]   # tried in order before moving to the next provider
       strong: model-strong          # planning, review, advisor
       cheap: model-cheap            # background, loops, cron, titles, compaction
+    descriptions:                   # optional: one line per model key, shown in the /tune popup
+      default: Everyday coding
+      strong: Planning and review
+      cheap: Fast and cheap
   - name: direct
     kind: anthropic
     base_url: https://api.anthropic.com
@@ -268,10 +372,18 @@ autonomy:
   escalate_main: true               # a turn that stalls on the main tier continues on the strong tier (default)
   auto_continue: false              # true: an ordinary prompt runs as an implicit goal until the judge says done
   fanout: {max_parallel: 3}
+ultracode:
+  min_scope: small                  # with the ultracode mode on: a prompt rated at least this runs the pipeline
+                                    #   (trivial | small | medium | large | huge); also max_tokens and max_agents
+wake_words:
+  enabled: true                     # false switches every wake word off
+  # ultraplan: false                # or just one: ultracode | ultraplan | ultraresearch (all default to true)
 mcp:
   servers:
     search: {url: "https://example.org/mcp"}
 ```
+
+`descriptions` is optional on each provider; for a model key that several providers define, the first non-empty description is shown. `ultracode.min_scope` must be one of the five scope names, and an unknown key under `ultracode` or `wake_words` is ignored with a warning. See [Ultracode mode](#ultracode-mode) and [Wake words](#wake-words).
 
 ### Hooks
 

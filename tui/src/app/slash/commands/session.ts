@@ -29,6 +29,8 @@ import {
 import { patchUiState } from "../../uiStore.js";
 import type { SlashCommand } from "../types.js";
 
+import { openTunePopup } from "./tune.js";
+
 const TUI_SESSION_MODEL_RE = new RegExp(
   `(?:^|\\s)${TUI_SESSION_MODEL_FLAG}(?:\\s|$)`,
 );
@@ -90,7 +92,7 @@ export const sessionCommands: SlashCommand[] = [
   // (send the running turn to the background); the old local handler only knew `/bg <prompt>`.
 
   {
-    help: "change or show model",
+    help: "change or show model (bare: the /tune popup with model, effort and ultracode)",
     name: "model",
     run: (arg, ctx, cmd) => {
       // k3: `/model chain [add|remove|move …]` is the gateway's fallback-chain view, not a model switch.
@@ -118,8 +120,10 @@ export const sessionCommands: SlashCommand[] = [
       // gateway QUEUES it and applies it at the next turn start (returning
       // deferred:true) instead of rejecting. Either way the pick sticks without
       // interrupting the stream or waiting on the swap.
+      // Bare /model is the combined popup (also bare /tune and /effort); `--refresh` below still opens the provider
+      // picker, and `/model <key>` / `/model chain` are unchanged.
       if (!arg.trim()) {
-        return patchOverlayState({ modelPicker: true });
+        return openTunePopup(ctx);
       }
 
       if (arg.trim() === "--refresh") {
