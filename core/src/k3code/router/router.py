@@ -10,7 +10,8 @@ Rules (from the M0 task spec):
   into cooldown until the reset and the walk fails over at once. Quota errors do the same, with
   ``quota_cooldown`` (default 1 h) when the provider declares no reset.
 - A second auth failure in a row also arms a cooldown (300 s, doubling per strike, capped at 1 h) keyed to the
-  rejected credential (never for a keyless entry such as claude-cli; one transient 401 arms nothing): later calls skip the dead entry at once, and a replaced key is tried immediately.
+  rejected credential (never for a keyless entry such as claude-cli; one transient 401 arms nothing):
+  later calls skip the dead entry at once, and a replaced key is tried immediately.
 - context_overflow: raise :class:`ContextOverflow` — the loop compacts later.
 - When every entry in the chain has failed: :class:`AllProvidersUnreachable` if
   every failure was a network error, otherwise :class:`ChainExhausted` (carrying

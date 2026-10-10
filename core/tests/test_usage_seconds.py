@@ -102,3 +102,33 @@ async def test_side_call_row_carries_seconds(tmp_path: Path):
     (row,) = [r for r in _rows(db) if r["kind"] == "call"]
     db.close()
     assert 0.05 <= row["seconds"] < 5
+
+
+async def test_a_side_call_after_a_turn_does_not_leak_into_the_next_calls_seconds(tmp_path: Path, monkeypatch):
+    """A goal judge / auto-title call runs in the session context after the turn; its router.attempt used to arm
+    ``call_started`` with nothing to close it, so the next prompt's first `call` row absorbed it and the idle time."""
+    from k3code.gateway.server import _ctx_session
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    script = tmp_path / "s.json"
+    script.write_text(json.dumps([{"type": "text", "text": "done"}]))
+    monkeypatch.setenv("K3CODE_FAKE_PROVIDER", str(script))
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    srv = GatewayServer(
+        config=Settings(providers=[prov], default_model="default", permission_mode="yolo"),
+        store=SessionStore(tmp_path / "s.db"),
+    )
+    srv._write = lambda s: None
+    project = tmp_path / "proj"
+    project.mkdir()
+    live = srv.live_for(srv.store.create(title="t", model="default", cwd=str(project)))
+    assert (await srv._run_turn(live, "first"))[0] == "done"
+    token = _ctx_session.set(live)
+    try:  # the judge's call: it starts after the turn and produces no row
+        srv._on_router_event(RouterEvent(kind="router.attempt", provider="t", model="m", attempt=1))
+    finally:
+        _ctx_session.reset(token)
+    await asyncio.sleep(0.4)  # the user is idle
+    assert (await srv._run_turn(live, "second"))[0] == "done"
+    calls = [r for r in _rows(srv.usage) if r["kind"] == "call"]
+    assert len(calls) == 2 and all(r["seconds"] < 0.3 for r in calls), calls
