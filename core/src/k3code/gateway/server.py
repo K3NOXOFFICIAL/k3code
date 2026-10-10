@@ -1561,6 +1561,7 @@ class GatewayServer:
         effort_mod.REASONING_EFFORT.set(session.reasoning_effort)  # /effort, read by the providers
         prompt = text
         mgr = self.goal_manager(session)
+        self._start_implicit_goal(session, mgr, text)
         session.goal_continuation = False  # the prompt the user sent is not a continuation
         while True:
             try:
@@ -1585,9 +1586,17 @@ class GatewayServer:
                 self._block_goal_for(session, status)  # an active goal never ends silently
                 self._session_finished(session, status)
                 return status, final_text
+            implicit = bool((state := mgr.state) and state.implicit)
+            if implicit and self._pending_prompts(session):
+                mgr.clear()  # the user typed the next prompt meanwhile: it replaces this one, unjudged
+                self.emit_goal(session)
+                self._session_finished(session, status)
+                return status, final_text
             judge = self.goal_judge or make_judge(self._goal_completer(session))
+            # no strong-tier advisor veto on an implicit goal: it would review every answered question
+            reviewer = None if implicit else self._goal_reviewer(session)
             decision = await mgr.evaluate_after_turn(
-                final_text, judge, cwd=session.stored.cwd or None, reviewer=self._goal_reviewer(session)
+                final_text, judge, cwd=session.stored.cwd or None, reviewer=reviewer
             )
             self.emit_goal(session)
             if decision.message:
@@ -1600,6 +1609,28 @@ class GatewayServer:
             prompt = decision.prompt
             session.goal_continuation = True  # unattended from here on: the goal drives the next turn
 
+    def _start_implicit_goal(self, session: LiveSession, mgr: GoalManager, text: str) -> None:
+        """``autonomy.auto_continue``: an interactive prompt becomes the goal of its own turn loop, judged after each
+        turn like a /goal, so a model that stops early is sent on until the judge says done or blocked.
+
+        Only an attended prompt the user typed qualifies: background, cron, loop and automation turns
+        (``session.background``/``task_kind``) and goal continuations do not. A /goal, active or paused, is the
+        user's own and wins: a paused one waits for /goal resume, and the answer typed meanwhile must not erase it.
+        A leftover implicit goal (a daemon that died mid-loop) is replaced, or cleared with the setting off.
+        """
+        if session.background or session.task_kind or session.goal_continuation:
+            return
+        state = mgr.state
+        if state is not None and not state.implicit and state.status in ("active", "paused"):
+            return
+        if autonomy_cfg(self.config).get("auto_continue"):
+            mgr.set(text, implicit=True)
+        elif state is not None and state.implicit:
+            mgr.clear()
+        else:
+            return
+        self.emit_goal(session)
+
     def _block_goal_for(self, session: LiveSession, status: str) -> None:
         """A turn that did not finish leaves its active goal paused, with the reason and one notification.
 
@@ -1608,6 +1639,10 @@ class GatewayServer:
         """
         mgr = self.goal_manager(session)
         if not mgr.is_active():
+            return
+        if (state := mgr.state) is not None and state.implicit:
+            mgr.clear()  # an implicit goal ends with its turn: no pause, no "/goal resume" notice (GoalState.implicit)
+            self.emit_goal(session)
             return
         if status == "needs_input":
             reason, text = "needs_input", "Goal needs your input before it can continue. Answer, then /goal resume."
@@ -2367,6 +2402,10 @@ class GatewayServer:
             return False
         if live.turn_in_flight:
             return False  # a live turn is working on it already
+        if goal.implicit:  # its turn loop is gone (the daemon died mid-loop): the prompt is not re-run unasked
+            mgr.clear()
+            self.emit_goal(live)
+            return False
         now = time.time()
         if len(mgr.recent_kicks(now)) >= MAX_KICKS_PER_WINDOW:
             mgr.pause(f"parked: {MAX_KICKS_PER_WINDOW} automatic kicks in 1 h")

@@ -66,6 +66,7 @@ JUDGE_SYSTEM_PROMPT = (
     "DONE — the goal is fully satisfied: the response explicitly confirms completion, or clearly shows the "
     "final deliverable was produced. DONE requires the deliverable to actually exist; if the response only "
     "explains why the goal cannot be reached, the verdict is BLOCKED, not DONE.\n\n"
+    "A question, a request for an explanation or plain conversation is DONE once the response answers it.\n\n"
     "BLOCKED — the goal cannot be satisfied as stated (genuinely unachievable) or progress needs user input.\n\n"
     "CONTINUE — not done, and there is a concrete next step the agent can take right now. "
     "This is the default when in doubt.\n\n"
@@ -145,6 +146,9 @@ class GoalState:
     gates: list[GoalGate] = field(default_factory=list)
     #: Wall-clock times of automatic kicks (see GatewayServer.kick_goal); pruned to KICK_WINDOW_S.
     kick_times: list[float] = field(default_factory=list)
+    #: An ordinary prompt running as a goal (``autonomy.auto_continue``), not a /goal: it ends (cleared, never paused)
+    #: with its turn loop, so nothing waits for a /goal resume the user never asked for, and no kick revives it.
+    implicit: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -189,6 +193,7 @@ class GoalState:
             "last_verdict": self.last_verdict,
             "last_reason": self.last_reason,
             "wait_barrier": None,
+            "implicit": self.implicit,
         }
 
 
@@ -294,13 +299,16 @@ class GoalManager:
         s = self.state
         return s.snapshot() if s and s.status != "cleared" else None
 
-    def set(self, goal: str, *, max_turns: int | None = None, check: str | None = None) -> GoalState:
+    def set(
+        self, goal: str, *, max_turns: int | None = None, check: str | None = None, implicit: bool = False
+    ) -> GoalState:
         gates = [GoalGate(command=check)] if check else []
         st = GoalState(
             goal=goal.strip(),
             max_turns=self.default_max_turns if max_turns is None else max_turns,
             created_at=time.time(),
             gates=gates,
+            implicit=implicit,
         )
         return self._save(st)
 
@@ -308,6 +316,9 @@ class GoalManager:
         s = self.state
         if s is None or s.status in ("done", "cleared"):
             return s
+        if s.implicit:  # nothing to resume later: the user never set this goal (see GoalState.implicit)
+            self.clear()
+            return None
         s.status, s.paused_reason = "paused", reason
         return self._save(s)
 
@@ -359,9 +370,17 @@ class GoalManager:
         return CONTINUATION_PROMPT_TEMPLATE.format(goal=s.goal) if s and s.status == "active" else None
 
     def _pause_decision(self, s: GoalState, reason: str, verdict: str, why: str, message: str) -> Decision:
+        if s.implicit:
+            return self._end_implicit(verdict, why)
         s.status, s.paused_reason = "paused", reason
         self._save(s)
         return Decision("paused", False, None, verdict, why, message)
+
+    def _end_implicit(self, verdict: str, why: str) -> Decision:
+        """An implicit goal ends cleared and quietly: the reply itself is the outcome, and a "Goal paused/achieved"
+        notice would announce a goal the user never set."""
+        self.clear()
+        return Decision("cleared", False, None, verdict, why, "")
 
     async def evaluate_after_turn(
         self, last_response: str, judge: Judge, *, cwd: str | None = None, reviewer: Reviewer | None = None
@@ -448,6 +467,8 @@ class GoalManager:
                         s.last_reason,
                         f"⚠ Advisor found blocking issues ({s.turns_text()}): {issues[0][:120]}",
                     )
+            if s.implicit:
+                return self._end_implicit("done", reason)
             s.status = "done"
             self._save(s)
             return Decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}")
@@ -480,7 +501,7 @@ class GoalManager:
             self.continuation_prompt(),
             "continue",
             reason,
-            f"↻ Continuing toward goal ({progress}): {reason}",
+            f"↻ {'Auto-continuing' if s.implicit else 'Continuing toward goal'} ({progress}): {reason}",
         )
 
     def _superseded(self, s: GoalState) -> Decision | None:

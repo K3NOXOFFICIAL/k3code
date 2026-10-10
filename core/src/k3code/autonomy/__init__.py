@@ -31,6 +31,11 @@ DEFAULTS: dict[str, Any] = {
     #: a turn that starts on main and stalls there (``max_tool_errors`` failed calls, a loop-guard stop) continues on
     #: the strong tier instead of stopping; only a stall on strong ends the turn and asks. off = main stops and asks
     "escalate_main": True,
+    #: an interactive prompt with no /goal of its own runs as an implicit goal: the cheap judge reads each reply and a
+    #: continuation prompt drives the next turn until it says done or blocked, so a model that stops early ("next I
+    #: would…") carries on. Costs one judge call per turn; opt-in. Never for background, cron, loop or automation
+    #: turns, sub-agents or ``k3code -p``; an implicit goal ends cleared, never paused (see GoalState.implicit)
+    "auto_continue": False,
     #: name a new session from its first prompt (one cheap-tier call, background); opt-in
     "auto_title": False,
     "preview_timeout": 30,
