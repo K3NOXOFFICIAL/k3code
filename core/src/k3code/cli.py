@@ -218,7 +218,18 @@ async def _run_headless(
     finally:
         await _reap_jobs(session)  # no background bash job outlives the run
         await reliability.stop()
+        await _close_providers(providers)
         usage.close()
+
+
+async def _close_providers(providers: list[Any]) -> None:
+    """Close every provider before the event loop ends: a claude-cli provider keeps persistent ``claude`` processes,
+    and one left to the garbage collector printed "Event loop is closed" from its pipe transport after the answer."""
+    for p in providers:
+        try:
+            await p.aclose()
+        except Exception:  # noqa: BLE001 - closing must not turn a finished run into a failure
+            logger.warning("closing provider %s failed", getattr(p, "name", "?"), exc_info=True)
 
 
 def _headless_slash(prompt: str) -> tuple[Any, str, str] | None:
@@ -494,6 +505,7 @@ async def _run_repl(
             print(f"\n[Error] {e}")
     await _reap_jobs(loop.session_id)
     await reliability.stop()
+    await _close_providers(providers)
 
 
 #: ``--permission`` values. ``auto`` is what an unattended ``-p`` run needs: it allows what would only ask (bash
