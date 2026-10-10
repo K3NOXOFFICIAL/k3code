@@ -18,6 +18,7 @@ from typing import Any
 import httpx
 
 from k3code.artifacts import write_artifact_file
+from k3code.autonomy.ultra import with_hook_context
 from k3code.providers.types import Message
 from k3code.research import prompts
 from k3code.research.fetch import FetchStatus
@@ -153,7 +154,7 @@ class Research:
         )
         return res.text
 
-    async def run(self, session: Any, question: str, *, n_sub: int | None = None) -> ResearchResult:
+    async def run(self, session: Any, question: str, *, n_sub: int | None = None, context: str = "") -> ResearchResult:
         cfg = research_cfg(self.server.config)
         tools = self.tools()
         if reason := await tools.unavailable_reason():
@@ -163,12 +164,14 @@ class Research:
                 "set research.searxng_url."
             )
         n_sub = int(n_sub or cfg["sub_questions"])
-        state = ResearchState(question)
+        state = ResearchState(question, context)
         sem = asyncio.Semaphore(int(cfg["concurrency"]))
 
         # 1. decompose
         self.progress(session, "decomposing", question[:80])
-        plan_text = await self._ask(session, prompts.PLANNER, f"Question: {question}\nNumber of sub-topics: {n_sub}")
+        plan_text = await self._ask(
+            session, prompts.PLANNER, with_hook_context(f"Question: {question}\nNumber of sub-topics: {n_sub}", context)
+        )
         state.plan = self.parse_plan(plan_text, question, n_sub)
 
         # 2. search in parallel (cheap tier does the query writing; the tool does the searching)
@@ -284,7 +287,10 @@ class Research:
         listing = "\n".join(f"c{i} [{x.source_id}] {x.text}" for i, x in enumerate(items))
         data = loose_json(
             await self._ask(
-                session, prompts.CROSSCHECK, f"Question: {state.question}\n\nClaims:\n{listing}", max_tokens=1024
+                session,
+                prompts.CROSSCHECK,
+                with_hook_context(f"Question: {state.question}", state.context) + f"\n\nClaims:\n{listing}",
+                max_tokens=1024,
             )
         )
         if not isinstance(data, dict):
@@ -303,7 +309,7 @@ class Research:
                     items[int(m.group(1))].note = str(c.get("note") or "")
 
     def writer_input(self, state: ResearchState) -> str:
-        parts = [f"Research question: {state.question}", "", "Sources:"]
+        parts = [with_hook_context(f"Research question: {state.question}", state.context), "", "Sources:"]
         parts += [f"- [{s.id}] {s.title} ({s.url})" for s in state.sources]
         for t in state.plan:
             ls = state.learnings_for(t.name)

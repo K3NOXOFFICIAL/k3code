@@ -4,6 +4,7 @@ Each command is split in two: ``prepare`` checks the input and returns either an
 costs nothing) or a :class:`JobSpec`, and ``handle`` = ``prepare`` + ``ctx.start_job``. Wake words and the ultracode
 mode (see ``GatewayServer._run_turn_locked``) call ``prepare`` too and run the spec inline in the running turn; they
 pass ``context``, what the user's UserPromptSubmit hooks added, which a normal turn appends to the prompt as well.
+The pipeline gets it apart from the task: it goes into the agents' prompts, never into a title or heading.
 """
 
 from __future__ import annotations
@@ -15,7 +16,6 @@ from typing import Any
 
 from k3code.commands import CommandDef
 from k3code.commands._util import reply
-from k3code.memory import fenced
 
 
 def _live(ctx: Any, session_id: str | None) -> Any:
@@ -29,13 +29,6 @@ class JobSpec:
     label: str  #: the status line while it runs (and the user message of a slash command)
     factory: Callable[[], Awaitable[str]]  #: the work; its text becomes the assistant message
     ack: str  #: the slash command's immediate reply
-
-
-def with_hook_context(task: str, context: str) -> str:
-    """``task`` for the pipeline, with the context the user's hooks added to the prompt (like a normal turn)."""
-    if not context:
-        return task
-    return f"{task}\n\n" + fenced("context from the user's hooks:", context)
 
 
 def start_spec(ctx: Any, live: Any, spec: JobSpec | dict[str, Any]) -> dict[str, Any]:
@@ -58,7 +51,7 @@ class UltraPlanCommand(CommandDef):
             return reply("Usage: /ultraplan <task>")
 
         async def job() -> str:
-            up = await ctx.ultra.ultraplan(live, with_hook_context(arg, context))
+            up = await ctx.ultra.ultraplan(live, arg, context=context)
             live.stored.meta["ultra_plan"] = {"task": arg, "plan": up.plan, "path": str(up.path or "")}
             ctx.store.save(live.stored)
             ctx.ultra.show_plan(live, up)
@@ -94,9 +87,17 @@ def typed_mode_word(task: str) -> str | None:
     """``on``, ``off`` or ``status`` when what a wake word leaves of a prompt only asks for that, else None.
 
     "ultracode off" and "turn ultracode off" are mode control, the words ``/ultracode`` takes as such, not a task
-    for the pipeline (they leave "off" and "turn off"). A task that merely starts with one ("ultracode on the auth
-    module") is a task."""
-    words = [w for w in (t.strip(".,;:!?") for t in task.lower().split()) if w and w not in _MODE_FILLER]
+    for the pipeline (they leave "off" and "turn off"). Only filler ("show ultracode mode") and a question ("is
+    ultracode on?") ask for the status. A task that merely starts with one ("ultracode on the auth module") is a
+    task."""
+    typed = [w for w in (t.strip(".,;:!?") for t in task.lower().split()) if w]
+    if not typed:
+        return None  # the word alone: the command's usage line
+    words = [w for w in typed if w not in _MODE_FILLER]
+    if not words:
+        return "status"
+    if words[0] == "is" and len(words) == 2 and words[1] in _MODE_WORDS:
+        return "status"  # asks whether it is on, does not switch it
     return words[0] if len(words) == 1 and (words[0] in _MODE_WORDS or words[0] == "status") else None
 
 
@@ -125,7 +126,7 @@ class UltraCodeCommand(CommandDef):
             return reply("Usage: /ultracode <task>")
         return JobSpec(
             f"/ultracode {arg}",
-            lambda: ctx.ultra.ultracode(live, with_hook_context(arg, context)),
+            lambda: ctx.ultra.ultracode(live, arg, context=context),
             "ultracode started: plan → fan-out → review panel → fixes → tests. See the agent strip.",
         )
 

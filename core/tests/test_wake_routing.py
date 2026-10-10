@@ -15,7 +15,10 @@ import pytest
 from pydantic import ValidationError
 
 from k3code.config import Settings, load_config
+from k3code.gateway.server import TypedPrompt
+from k3code.session_ai import SUMMARY_PREFIX
 from k3code.wakewords import detect_enabled, wake_cfg
+from test_auto_compaction import Recording, seed
 from test_autonomy_gateway import call, events, k3home, make, models_called, start, sub, verdict
 from test_ultra import JUDGE, PLANNERS
 
@@ -30,16 +33,19 @@ class Pipeline:
 
     def __init__(self, server: Any, monkeypatch: pytest.MonkeyPatch, *, research_reason: str = "") -> None:
         self.calls: list[tuple[str, str]] = []
+        self.contexts: list[str] = []  # what the user's hooks added, as the pipeline got it (apart from the task)
         self.sessions: list[Any] = []
         self.hold: asyncio.Event | None = None
         self.started = asyncio.Event()
         self.orphan = False  # leave a never-ending sub-agent behind, as a pipeline that was cut off would
         self.server = server
 
-        async def ultracode(session: Any, task: str) -> str:
+        async def ultracode(session: Any, task: str, *, context: str = "") -> str:
+            self.contexts.append(context)
             return await self.run("ultracode", session, task)
 
-        async def research(session: Any, question: str, *, n_sub: int | None = None) -> Any:
+        async def research(session: Any, question: str, *, n_sub: int | None = None, context: str = "") -> Any:
+            self.contexts.append(context)
             return SimpleNamespace(report=await self.run("ultraresearch", session, question), path="r.md")
 
         async def unavailable_reason() -> str:
@@ -376,7 +382,7 @@ async def test_a_job_that_ends_takes_its_sub_agents_with_it(tmp_path, monkeypatc
 async def test_a_job_failure_is_reported_and_the_session_stays_usable(tmp_path, monkeypatch):
     server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
 
-    async def boom(session: Any, task: str) -> str:
+    async def boom(session: Any, task: str, **_: Any) -> str:
         raise RuntimeError("pipeline exploded")
 
     monkeypatch.setattr(server.ultra, "ultracode", boom)
@@ -774,8 +780,8 @@ async def test_a_hooks_context_goes_with_the_task_of_a_wake_word_job(tmp_path, m
     await start(server, tmp_path)
     await submit(server, "ultracode fix the login form")
     ((mode, task),) = pipe.calls
-    assert mode == "ultracode" and task.startswith("fix the login form\n\n")
-    assert "context from the user's hooks:" in task and task.endswith("CTX-FROM-HOOK\n```")
+    assert mode == "ultracode" and task == "fix the login form"  # the title and the Task line stay clean
+    assert "CTX-FROM-HOOK" in pipe.contexts[0]  # the hook's text goes to the pipeline apart from the task
     # the transcript keeps what the user typed, and the status line names the job without the hook's text
     assert transcript(server)[0] == ("user", "ultracode fix the login form")
     assert all("CTX-FROM-HOOK" not in e.get("text", "") for e in events(server, "status.update"))
@@ -791,7 +797,7 @@ async def test_a_hooks_context_goes_with_the_task_of_a_mode_job(tmp_path, monkey
     server.session.ultra_mode = "ultracode"
     await submit(server, "add a --verbose flag to the CLI")
     ((mode, task),) = pipe.calls
-    assert mode == "ultracode" and task.startswith("add a --verbose flag to the CLI\n\n") and "CTX-FROM-HOOK" in task
+    assert mode == "ultracode" and task == "add a --verbose flag to the CLI" and "CTX-FROM-HOOK" in pipe.contexts[0]
     assert classifier_calls(server) == 1 and "CTX-FROM-HOOK" not in " ".join(
         c["text"] for p in server.providers for c in p.log
     )  # the classifier was asked about the prompt, not about the hook's text
@@ -905,3 +911,51 @@ async def test_malformed_paste_spans_are_refused(tmp_path, monkeypatch, spans):
         await server._handle_line(json.dumps(msg))
         out = [json.loads(x) for x in server._frames[n:] if json.loads(x).get("id") == 9]
         assert "paste_spans" in out[0]["error"]["message"]
+
+
+# ── a blocked prompt and the context-overflow retry ──
+
+
+async def test_a_blocked_typed_prompt_makes_no_compaction_call(tmp_path, monkeypatch):
+    provider = Recording()
+    over = {"compact_at_tokens": 2000, "keep_messages": 6}  # the seeded history is well over this
+    server, live = await seed(tmp_path, monkeypatch, provider, context=over)
+    _hooks(tmp_path, BLOCK_HOOK)
+    before = list(live.stored.messages)
+    status, text = await server._run_turn(live, TypedPrompt(SECRET))
+    assert status == "done" and "Prompt blocked" in text
+    assert provider.sizes == []  # no model call at all, not even the summary one
+    assert live.stored.messages == before
+    await server.close()
+
+
+async def test_a_blocked_typed_prompt_does_not_reach_the_goal_judge(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    judged: list[str] = []
+
+    async def judge(goal: str, last: str) -> tuple[str, str, bool, bool]:
+        judged.append(last)
+        return "continue", "keep going", False, False
+
+    server.goal_judge = judge  # type: ignore[assignment]
+    _hooks(tmp_path, BLOCK_HOOK)
+    await start(server, tmp_path)
+    live = server.session
+    server.goal_manager(live).set("ship the login form")
+    await submit(server, SECRET)
+    assert _blocked(server) and judged == []  # the refusal is not a turn of the goal
+    assert server.goal_manager(live).is_active() and events(server, "message.complete")[-1]["status"] == "done"
+
+
+async def test_a_context_overflow_retry_runs_its_own_hooks(tmp_path, monkeypatch):
+    provider = Recording(overflow_over=6000)  # the first call overflows; the retry after compaction fits
+    big = {"compact_at_tokens": 10_000_000, "keep_messages": 6}  # proactive compaction off: only the retry fires
+    server, live = await seed(tmp_path, monkeypatch, provider, context=big)
+    count = tmp_path / "hook-count.txt"
+    _hooks(tmp_path, f"  UserPromptSubmit: [{{command: 'echo prompt >> {count}'}}]\n")
+    status, text = await server._run_turn(live, TypedPrompt("NEWPROMPT please"))
+    assert status == "done", (text, live.last_error)
+    assert any(str(m["content"]).startswith(SUMMARY_PREFIX) for m in live.stored.messages)  # the retry did run
+    # once for the typed prompt (ahead of routing), once for the retry's own turn
+    assert count.read_text().split() == ["prompt", "prompt"]
+    await server.close()

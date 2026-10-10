@@ -37,6 +37,8 @@ class SubTopic:
 @dataclass
 class ResearchState:
     question: str
+    #: what the user's hooks added to the prompt: for the planner, cross-check and writer prompts, never the heading
+    context: str = ""
     plan: list[SubTopic] = field(default_factory=list)
     learnings: list[Learning] = field(default_factory=list)
     sources: list[Source] = field(default_factory=list)
