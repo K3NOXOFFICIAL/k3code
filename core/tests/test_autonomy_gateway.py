@@ -460,6 +460,23 @@ async def test_escalate_main_off_keeps_the_main_tier_stop(tmp_path, monkeypatch)
     assert events(server, "message.complete")[-1]["status"] == "needs_input"
 
 
+async def test_main_tier_max_turns_cap_ends_needs_input_without_escalating(tmp_path, monkeypatch):
+    """The cap is the user's limit on the task, not a stall: strong does not get a fresh round of calls."""
+    (tmp_path / "f.txt").write_text("hello\n")
+    steps = [
+        {"type": "tool_call", "model": "m-main", "id": "r1", "name": "read", "arguments": {"path": "f.txt"}},
+        {"type": "text", "model": "m-strong", "text": "strong must not run"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, mode="yolo", max_turns=2)
+    await start(server, tmp_path)
+    await run_turn(server, "do the thing")
+    assert events(server, "routing.escalated") == []
+    assert "m-strong" not in models_called(server)
+    done = events(server, "message.complete")[-1]
+    assert done["status"] == "needs_input" and "I stopped after 2 model calls" in done["text"]
+    assert server.session.needs_input is True
+
+
 async def test_main_tier_loop_guard_stop_continues_on_strong(tmp_path, monkeypatch):
     from k3code.reliability import sandbox
 
