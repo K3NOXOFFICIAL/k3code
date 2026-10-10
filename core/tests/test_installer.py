@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -287,6 +288,53 @@ def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> 
     assert dirty.startswith(clean + ".dirty")
     (src / "core" / "new.py").write_text("x = 1\n")  # an untracked file changes it again
     assert version() not in (clean, dirty)
+
+
+def test_without_git_each_checkout_gets_its_own_version_from_its_files(tmp_path: Path) -> None:
+    # Without git every --from-source build was named X.Y.Z-src, so a second checkout counted as installed already.
+    # The macOS /usr/bin/git stub: present on PATH, but fails without the developer tools.
+    nogit = stub_bin(tmp_path, "git", 'echo "xcode-select: note: no developer tools were found" >&2\nexit 1\n')
+    home = tmp_path / "home"
+    home.mkdir()
+
+    def checkout(name: str, extra: str) -> Path:
+        src = tmp_path / name
+        (src / "core").mkdir(parents=True)
+        (src / "install").mkdir()
+        (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+        (src / "core" / "extra.py").write_text(extra)
+        (src / "VERSION").write_text("9.9.9\n")
+        shutil.copy(INSTALL, src / "install" / "install.sh")
+        return src
+
+    def install(src: Path) -> subprocess.CompletedProcess[str]:
+        r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", "--print-version", path_front=nogit)
+        assert r.returncode == 0, r.stderr
+        return r
+
+    a, b = checkout("a", "x = 1\n"), checkout("b", "x = 2\n")
+    first = install(a)
+    ver_a = first.stdout.strip()
+    assert re.fullmatch(r"9\.9\.9-src\.tree[0-9a-f]{12}", ver_a), ver_a
+    ver_b = install(b).stdout.strip()
+    assert ver_b != ver_a  # another checkout is another version, built next to the first
+    assert {p.name for p in (home / DATA_REL / "versions").iterdir()} == {ver_a, ver_b}
+
+    # the same tree keeps its name: file times, caches and build output do not count
+    for p in a.rglob("*"):
+        os.utime(p, (1_000_000, 1_000_000))
+    (a / "core" / "__pycache__").mkdir()
+    (a / "core" / "__pycache__" / "extra.cpython-312.pyc").write_bytes(b"\0")
+    (a / "tui" / "node_modules").mkdir(parents=True)
+    (a / "tui" / "node_modules" / "dep.js").write_text("1\n")
+    # files the install never reads (Finder, editors, agents) do not count either
+    (a / ".DS_Store").write_bytes(b"\0")
+    (a / "core" / ".DS_Store").write_bytes(b"\0")
+    (a / ".idea").mkdir()
+    (a / ".idea" / "workspace.xml").write_text("<x/>\n")
+    again = install(a)
+    assert again.stdout.strip() == ver_a
+    assert "already installed" in again.stderr
 
 
 def test_uninstall_removes_the_unit_under_xdg_config_home(tmp_path: Path) -> None:
@@ -653,6 +701,82 @@ def test_a_lock_without_a_pid_is_taken_over_only_when_old(tmp_path: Path) -> Non
     r = run(tmp_path, INSTALL, "--from-source", "--minimal")
     assert r.returncode == 0, r.stderr
     assert "taking over the install lock" in r.stderr and "older than 6 hours" in r.stderr
+
+
+def _lock_of(tmp_path: Path, pid: int, start: str, tui_tmp: str) -> Path:
+    """The lock a killed install left: pid, start time, the TUI build dir it recorded (made under tmp_path/tmp)."""
+    lock = tmp_path / DATA_REL / ".install.lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{pid}\n")
+    (lock / "start").write_text(f"{start}\n")
+    (tmp_path / tui_tmp).mkdir(parents=True)
+    (lock / "tui_tmp").write_text(f"{tmp_path / tui_tmp}\n")
+    return lock
+
+
+def test_a_lock_whose_pid_now_names_another_process_is_taken_over(tmp_path: Path) -> None:
+    # the killed install's pid went to an unrelated live process (here pytest): its start time is not the lock's
+    lock = _lock_of(tmp_path, os.getpid(), "0", "tmp/k3code-tui.Ab12Cd")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and f"pid {os.getpid()} now belongs to another" in r.stderr
+    assert not (tmp_path / "tmp" / "k3code-tui.Ab12Cd").exists() and "removed the TUI build directory" in r.stderr
+    assert not lock.exists()
+
+
+@pytest.mark.parametrize("recorded", ["tmp/not-k3code", "tmp/sub/k3code-tui.Zz99", "elsewhere/k3code-tui.Zz99"])
+def test_a_recorded_path_that_is_not_a_tui_build_dir_is_left_alone(tmp_path: Path, recorded: str) -> None:
+    dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+    _lock_of(tmp_path, int(dead), "", recorded)
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and "removed the TUI build directory" not in r.stderr
+    assert (tmp_path / recorded).is_dir()
+
+
+def test_a_tui_build_dir_is_removed_when_tmpdir_ends_in_a_slash(tmp_path: Path) -> None:
+    # macOS TMPDIR ends in "/", so mktemp recorded "<tmp>//k3code-tui.X" and the strict prefix check refused it
+    dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+    lock = _lock_of(tmp_path, int(dead), "", "tmp/k3code-tui.Ab12Cd")
+    (lock / "tui_tmp").write_text(f"{tmp_path / 'tmp'}//k3code-tui.Ab12Cd\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": f"{tmp_path / 'tmp'}/"})
+    assert r.returncode == 0, r.stderr
+    assert not (tmp_path / "tmp" / "k3code-tui.Ab12Cd").exists() and "removed the TUI build directory" in r.stderr
+
+
+def test_a_lock_k3code_update_holds_stops_the_installer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # one lock format for both: install.sh reads the pid and start time update.py wrote, and still refuses
+    from k3code import update as upd
+
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / DATA_REL))
+    with upd.install_lock():
+        (tmp_path / "tmp" / "k3code-tui.Ab12Cd").mkdir(parents=True)
+        (tmp_path / DATA_REL / ".install.lock" / "tui_tmp").write_text(f"{tmp_path / 'tmp' / 'k3code-tui.Ab12Cd'}\n")
+        r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+        assert (tmp_path / DATA_REL / ".install.lock" / "pid").is_file()
+    assert r.returncode != 0
+    assert "another install" in r.stderr and str(os.getpid()) in r.stderr
+    assert (tmp_path / "tmp" / "k3code-tui.Ab12Cd").is_dir()
+
+
+@linux_only
+def test_a_command_name_with_spaces_and_parentheses_keeps_its_lock(tmp_path: Path) -> None:
+    # /proc/<pid>/stat field 2 is the command name: install.sh must count the fields from its last ")"
+    from k3code import update as upd
+
+    odd = tmp_path / "a) (b c"
+    shutil.copy(shutil.which("sleep") or "/bin/sleep", odd)
+    holder = subprocess.Popen([str(odd), "30"])
+    try:
+        assert Path(f"/proc/{holder.pid}/stat").read_text().startswith(f"{holder.pid} (a) (b c) ")
+        lock = _lock_of(tmp_path, holder.pid, upd._process_start(holder.pid), "tmp/k3code-tui.Ab12Cd")
+        r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    finally:
+        holder.kill()
+        holder.wait()
+    assert r.returncode != 0
+    assert f"is running (pid {holder.pid})" in r.stderr
+    assert lock.is_dir() and (tmp_path / "tmp" / "k3code-tui.Ab12Cd").is_dir()
 
 
 def test_the_install_lock_is_released_after_a_run(tmp_path: Path) -> None:
@@ -1096,6 +1220,80 @@ def test_from_source_builds_the_tui_outside_the_checkout(tmp_path: Path) -> None
     assert (tmp_path / DATA_REL / "current" / "tui" / "dist" / "entry.js").read_text() == "built\n"
     assert not (src / "tui" / "node_modules").exists()
     assert not (src / "tui" / "dist").exists()
+
+
+def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path: Path) -> None:
+    # the recording side of the leftover-build-dir cleanup: with a TMPDIR ending in "/" the lock must name
+    # "<tmp>/k3code-tui.X", the form the next run's strict prefix check accepts
+    src = _mini_checkout(tmp_path)
+    (src / "tui").mkdir()
+    (src / "tui" / "package.json").write_text("{}\n")
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    seen = tmp_path / "seen"
+    seen.mkdir()
+    lock = tmp_path / DATA_REL / ".install.lock"
+    tools = stub_bin(tmp_path, "node", 'echo "v22.0.0"\n')
+    stub_bin(
+        tmp_path,
+        "npm",
+        f'case "$*" in ci*) cp "{lock}/tui_tmp" "{seen}/tui_tmp"; pwd >"{seen}/cwd"; mkdir -p node_modules ;;'
+        ' "run build") mkdir -p dist ;; esac\n',
+    )
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        "--from-source",
+        "--minimal",
+        env_extra={"TMPDIR": f"{tmp}/"},
+        drop=("K3_SKIP_TUI",),
+        path_front=tools,
+    )
+    assert r.returncode == 0, r.stderr
+    recorded = (seen / "tui_tmp").read_text().strip()
+    assert re.fullmatch(re.escape(f"{tmp}/") + r"k3code-tui\.[A-Za-z0-9]+", recorded), recorded
+    assert (seen / "cwd").read_text().strip().startswith(recorded + "/")
+
+
+@linux_only
+def test_the_installer_writes_its_start_time_before_its_pid(tmp_path: Path) -> None:
+    # a kill between the two writes must not leave a pid without a start time (a recycled pid would keep the lock)
+    lock = tmp_path / DATA_REL / ".install.lock"
+    mark = tmp_path / "mark"
+    # proc_start reads /proc/PID/stat through cat: note whether the pid file exists at that moment
+    tools = stub_bin(
+        tmp_path,
+        "cat",
+        f'case "$1" in /proc/*/stat) if [ -e "{lock}/pid" ]; then echo pid-first; else echo start-first; fi'
+        f' >"{mark}" ;; esac\nexec "$(PATH=/usr/bin:/bin command -v cat)" "$@"\n',
+    )
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", path_front=tools)
+    assert r.returncode == 0, r.stderr
+    assert mark.read_text().strip() == "start-first"
+
+
+def test_without_a_checksum_tool_a_no_git_checkout_is_refused(tmp_path: Path) -> None:
+    # an empty checksum would name every checkout X.Y.Z-src.tree and a second one would look installed already
+    nogit = stub_bin(tmp_path, "git", 'echo "xcode-select: note: no developer tools were found" >&2\nexit 1\n')
+    src = tmp_path / "src"
+    (src / "core").mkdir(parents=True)
+    (src / "install").mkdir()
+    (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (src / "VERSION").write_text("9.9.9\n")
+    shutil.copy(INSTALL, src / "install" / "install.sh")
+    farm = tmp_path / "farm"
+    farm.mkdir()
+    for d in os.environ["PATH"].split(os.pathsep):
+        if d and Path(d).is_dir():
+            for entry in Path(d).iterdir():
+                if entry.name not in ("sha256sum", "shasum", "git") and not (farm / entry.name).exists():
+                    (farm / entry.name).symlink_to(entry)
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", env_extra={"PATH": f"{nogit}:{farm}"})
+    assert r.returncode != 0
+    assert "neither sha256sum nor shasum is available" in r.stderr
+    assert not (home / DATA_REL / "current").exists()
 
 
 def test_without_git_a_github_tag_installs_from_its_archive(tmp_path: Path) -> None:

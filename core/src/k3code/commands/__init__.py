@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 
 class CommandContext(Protocol):
@@ -18,6 +18,8 @@ class CommandDef:
     name: str
     help: str
     aliases: list[str] = field(default_factory=list)
+    #: Works in a one-shot ``k3code -p "/name"`` run: no live session, client or model needed. The others refuse there.
+    headless: ClassVar[bool] = False
 
     async def handle(self, ctx: CommandContext, session_id: str | None, arg: str) -> dict[str, Any]:
         raise NotImplementedError
@@ -54,7 +56,8 @@ class CommandRegistry:
             result = await cmd.handle(ctx, session_id, arg.strip())
         except Exception as e:  # noqa: BLE001 - surface as chat text, never crash the gateway
             msg = f"/{cmd.name} failed: {e}"
-            return {"type": "message", "message": msg, "output": msg}
+            # `error` lets `k3code -p` exit non-zero; chat clients render `output` and ignore it
+            return {"type": "message", "message": msg, "output": msg, "error": "command_failed"}
         if not isinstance(result, dict) or "type" not in result:
             return {"type": "message", "message": str(result), "output": str(result)}
         if result["type"] == "message":

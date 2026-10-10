@@ -583,7 +583,9 @@ export function Panel({ sections, t, title }: PanelProps) {
 
           {sec.rows?.map(([k, v], ri) => (
             <Text key={ri} wrap="truncate">
-              <Text color={t.color.muted}>{k.padEnd(20)}</Text>
+              <Text color={t.color.muted}>
+                {k.padEnd(Math.max(20, k.length + 2))}
+              </Text>
               <Text color={t.color.text}>{v}</Text>
             </Text>
           ))}

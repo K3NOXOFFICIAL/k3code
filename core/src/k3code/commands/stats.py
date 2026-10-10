@@ -9,6 +9,8 @@ from k3code.usage import format_stats
 
 
 class StatsCommand(CommandDef):
+    headless = True
+
     def __init__(self) -> None:
         super().__init__(name="stats", help="Usage stats: /stats [session|day|turn] [days]")
 

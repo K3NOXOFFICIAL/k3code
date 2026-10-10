@@ -19,6 +19,7 @@ from typing import Any
 
 from k3code import service
 from k3code.config import Settings, default_project_dir, load_config
+from k3code.context_budget import FALLBACK_WINDOW, compact_threshold, family_window, has_explicit_window
 from k3code.daemon import k3_home, socket_path
 from k3code.reliability.governor import read_psi
 from k3code.reliability.journal import ToolJournal
@@ -154,6 +155,36 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
             )
         )
     return checks
+
+
+def check_context_windows(config: Settings) -> list[Check]:
+    """Chain models whose context window is a guess: no ``models.<id>.context_window`` entry and no known family.
+
+    Compaction keys to the window, so a wrong guess either compacts a large model too early or lets a small one
+    overflow before compacting.
+    """
+    ids: list[str] = []
+    for p in config.providers:
+        for spec in [*p.models.values(), *p.tiers.values()]:
+            for model_id in [spec] if isinstance(spec, str) else spec:
+                if model_id and model_id not in ids:
+                    ids.append(model_id)
+    if not ids:
+        return [Check("context-window", OK, "no chain models configured")]
+    unknown = [m for m in ids if not has_explicit_window(config, m) and family_window(m) is None]
+    if not unknown:
+        return [Check("context-window", OK, "every chain model has a known context window")]
+    return [
+        Check(
+            f"context-window:{m}",
+            WARN,
+            f"no known context window; assuming {FALLBACK_WINDOW} tokens "
+            f"(compaction at ~{compact_threshold(config, m)})",
+            f"set the model's real window in config.yaml: models: {{{m}: {{context_window: <tokens>}}}}",
+            {"model": m, "assumed_window": FALLBACK_WINDOW},
+        )
+        for m in unknown
+    ]
 
 
 def check_keys(config: Settings) -> Check:
@@ -553,8 +584,10 @@ def check_searxng() -> Check:
 
 
 def check_project(project_dir: Path) -> Check:
-    """The project's ``.k3code``: content left unloaded because it is not trusted, and providers it cannot set."""
+    """The project's ``.k3code``: content left unloaded because it is not trusted, and providers it cannot set; else
+    the stacks a read-only scan detects."""
     from k3code import confio, trust
+    from k3code.learning import projectstate, recipes, stacks
 
     problems: list[str] = []
     if hint := trust.untrusted_hint(project_dir):
@@ -571,7 +604,13 @@ def check_project(project_dir: Path) -> Check:
             problems.append(f"{cfg_path} sets mem0: ignored (only your user config can set mem0)")
     if problems:
         return Check("project", WARN, "; ".join(problems), "`k3code trust` shows what the project changes")
-    return Check("project", OK, f"{trust.decision(project_dir)} ({project_dir})")
+    # The bare trust state ("none") read as "no project detected". This is the scan a session's preparation runs,
+    # read-only here: nothing is stored and nothing is proposed.
+    found = [recipes.label(s) for s in stacks.scan(projectstate.project_root(project_dir)).stacks]
+    detected = f"stacks: {', '.join(found)}" if found else "no stacks detected"
+    decision = trust.decision(project_dir)
+    config = "no project config" if decision == trust.NONE else f"project config {decision}"
+    return Check("project", OK, f"{detected}; {config} ({project_dir})", data={"stacks": found})
 
 
 def install_subset(home: Path | None = None) -> list[Check]:
@@ -591,6 +630,7 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
     checks: list[Check] = []
     checks += await check_providers(config, probe=probe)
     checks.append(check_keys(config))
+    checks += check_context_windows(config)
     checks.append(await check_netwatch_async() if probe else Check("netwatch", OK, "probe skipped"))
     checks += [check_disk(home), check_psi()]
     daemon_check = await check_daemon() if probe else Check("daemon", OK, "probe skipped")
@@ -608,7 +648,7 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
         # the probe runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
         await asyncio.to_thread(check_sandbox, probe),
         check_isolation(),
-        check_project(default_project_dir()),
+        await asyncio.to_thread(check_project, default_project_dir()),  # the stack scan reads the tree
     ]
     return checks
 

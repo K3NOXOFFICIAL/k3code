@@ -164,6 +164,35 @@ pid_running() { # pid_running PID: kill -0, or /proc for a process of another us
   [ -d /proc/self ] && [ -d "/proc/$1" ]
 }
 
+proc_start() { # proc_start PID: when PID started, to tell it from a later process given the same pid; empty when unknown
+  # k3code update (update.py _process_start) writes and compares the same value: keep the two in step
+  if [ -d /proc/self ]; then
+    # field 22 of /proc/PID/stat; the command name (field 2) may hold spaces and ")", so count from the last ")"
+    stat_line=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+    printf '%s\n' "${stat_line##*")"}" | awk '{ print $20 }'
+  else # macOS: no /proc. A fixed locale and time zone, so every run prints the same text for the same process
+    LC_ALL=C TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | awk '{ $1 = $1; print }'
+  fi
+}
+
+tui_tmp_root() { # the temp dir the TUI build uses, without trailing slashes (macOS TMPDIR ends in "/")
+  root=${TMPDIR:-/tmp}
+  while [ "$root" != / ] && [ "${root%/}" != "$root" ]; do root=${root%/}; done
+  printf '%s\n' "$root"
+}
+
+clean_recorded_tmp() { # clean_recorded_tmp LOCK: the TUI build dir the install that held LOCK recorded (killed mid-build)
+  t=$(cat "$1/tui_tmp" 2>/dev/null || true)
+  name=${t#"$(tui_tmp_root)"/}
+  while [ "${name#/}" != "$name" ] && [ "$name" != "$t" ]; do name=${name#/}; done # a "//" from a trailing-slash TMPDIR
+  # never follow an arbitrary path from a lock file: only a k3code-tui.* directly in the temp dir this run uses
+  case "$name" in "$t" | */*) return 0 ;; k3code-tui.?*) ;; *) return 0 ;; esac
+  if [ -d "$t" ]; then
+    rm -rf "$t"
+    log "removed the TUI build directory $t that the interrupted install left"
+  fi
+}
+
 clean_unfinished_versions() { # versions/<v> a killed install left without .complete (never the one current names)
   cur=$(basename "$(readlink "$DATA/current" 2>/dev/null)" 2>/dev/null || true)
   for d in "$DATA"/versions/*/; do
@@ -182,23 +211,35 @@ take_lock() { # one installer at a time per install root; the lock goes when thi
     case "$pid" in *[!0-9]*) pid="" ;; esac
     if [ -n "$pid" ]; then
       if pid_running "$pid"; then
-        die "another install into $DATA is running (pid $pid); wait for it to finish"
+        # a pid is reused: a live pid is still that install only if it started when the lock says (a lock without
+        # a start time, from an older installer, or a start time that cannot be read here, trusts the pid alone)
+        started=$(cat "$lock/start" 2>/dev/null || true)
+        now=""
+        if [ -n "$started" ]; then now=$(proc_start "$pid"); fi
+        if [ -z "$now" ] || [ "$now" = "$started" ]; then
+          die "another install into $DATA is running (pid $pid); wait for it to finish"
+        fi
+        why="its pid $pid now belongs to another process (started $now, not $started)"
+      else
+        why="its install (pid $pid) is not running"
       fi
-      why="its install (pid $pid) is not running"
     elif [ -n "$(find "$lock" -prune -mmin +"$LOCK_STALE_MIN" 2>/dev/null)" ]; then
       why="it names no process and is older than $((LOCK_STALE_MIN / 60)) hours"
     else
       die "an install lock without a pid is in $lock (an install that is just starting?): if no other install runs, remove it (rm -r '$lock') and re-run"
     fi
     log "taking over the install lock in $lock: $why (killed mid-install?)"
+    clean_recorded_tmp "$lock"
     rm -rf "$lock"
     mkdir "$lock" 2>/dev/null || die "another install into $DATA took the lock just now; wait for it to finish"
     LOCK=$lock
+    proc_start "$$" >"$LOCK/start" # before the pid: a kill between the two must not leave a pid without its start time
     printf '%s\n' "$$" >"$LOCK/pid"
     clean_unfinished_versions
     return 0
   fi
   LOCK=$lock
+  proc_start "$$" >"$LOCK/start" # before the pid, as above
   printf '%s\n' "$$" >"$LOCK/pid"
 }
 
@@ -712,6 +753,22 @@ resolve_short_sha() {
 # Both spellings of the path: git before 2.46 compares safe.directory with the symlink-free one.
 src_git() { git -c safe.directory="$SRC_ROOT" -c safe.directory="$(cd "$SRC_ROOT" && pwd -P)" -C "$SRC_ROOT" "$@"; }
 
+# Without git there is no commit to name a build by, and a plain X.Y.Z-src made a second checkout look installed
+# already. The name is then a checksum of the checkout's file names and contents: another checkout gets its own
+# version and the same one keeps its name. File times do not count, the C locale fixes the sort order, and a fixed
+# list of caches, dependencies and build outputs is skipped, so a test run or a TUI build does not change it.
+# Only what the install reads counts (VERSION, core, tui, panes): a Finder .DS_Store, editor state or an agent's
+# .claude directory elsewhere in the checkout must not turn an unchanged tree into a new version.
+tree_id() {
+  if have sha256sum; then set -- sha256sum; else set -- shasum -a 256; fi
+  roots=""
+  for r in VERSION core tui panes; do [ -e "$SRC_ROOT/$r" ] && roots="$roots ./$r"; done
+  # shellcheck disable=SC2086 # the roots are fixed names without spaces
+  (cd "$SRC_ROOT" && LC_ALL=C find $roots \( -name .git -o -name .venv -o -name node_modules -o -name .k3dev \
+    -o -name __pycache__ -o -name dist -o -name .pytest_cache -o -name .ruff_cache -o -name .k3code \
+    -o -name .DS_Store -o -path ./panes/k3 \) -prune -o -type f ! -name '*.pyc' -exec "$@" {} +) | LC_ALL=C sort | "$@" | cut -c 1-12
+}
+
 acquire_source() {
   if [ "$FROM" = source ]; then
     d=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || d=""
@@ -733,6 +790,13 @@ acquire_source() {
       dirty=$( (src_git diff HEAD && src_git ls-files --others --exclude-standard |
         while IFS= read -r f; do cat "$SRC_ROOT/$f"; done) 2>/dev/null | cksum | cut -d' ' -f1)
       SHA="$SHA.dirty$dirty"
+    fi
+    if [ -z "$SHA" ]; then
+      id=$(tree_id)
+      # without a checksum tool the name would be a bare X.Y.Z-src.tree and a second checkout would look installed
+      case "$id" in *[!0-9a-f]*) id="" ;; esac
+      if [ ${#id} -ne 12 ]; then die "cannot name this checkout without git: neither sha256sum nor shasum is available (install one of them or git)"; fi
+      SHA=tree$id
     fi
   else
     [ -n "$GIT_URL" ] || GIT_URL=$DEFAULT_URL
@@ -801,7 +865,9 @@ build_tui() {
   log "building the TUI (npm ci; this takes a minute)"
   tui=$SRC_ROOT/tui
   if [ "$FROM" = source ]; then # the build writes node_modules and dist: never into the user's checkout
-    TUI_TMP=$(mktemp -d "${TMPDIR:-/tmp}/k3code-tui.XXXXXX")
+    TUI_TMP=$(mktemp -d "$(tui_tmp_root)/k3code-tui.XXXXXX")
+    # cleanup removes it on exit; after a SIGKILL the run that takes over the lock finds it here
+    printf '%s\n' "$TUI_TMP" >"$LOCK/tui_tmp"
     if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then
       log "WARNING: could not copy the TUI sources to $TUI_TMP; k3code will use the line REPL"
       return 0

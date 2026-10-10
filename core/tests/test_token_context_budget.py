@@ -23,12 +23,25 @@ def test_context_windows_by_config_and_by_family():
     assert context_window(cfg, "anthropic/claude-haiku") == 200_000
     assert context_window(cfg, "gpt-4o-mini") == 128_000
     assert context_window(cfg, "gpt-4.1") == 128_000
-    assert context_window(cfg, "llama-3-8b") == 32_000
+    assert context_window(cfg, "llama-3-8b") == 128_000  # no known family: the fallback
     assert compact_threshold(cfg, "claude-x") == 140_000  # 0.7 of the window
     cfg.context = {"compact_at_ratio": 0.5}
     assert compact_threshold(cfg, "gpt-4o") == 64_000
     cfg.context = {"compact_at_tokens": 5000, "compact_at_ratio": 0.5}
     assert compact_threshold(cfg, "gpt-4o") == 5000  # the absolute value overrides
+
+
+def test_an_unknown_id_such_as_a_gateway_alias_is_not_compacted_at_22k():
+    """Issue #30: ids with no known family got 32k, so a gateway alias in front of a large model compacted at ~22k."""
+    cfg = SimpleNamespace(models={}, context={})
+    assert context_window(cfg, "auto/coding-manual") == 128_000
+    assert context_window(cfg, "auto") == 128_000
+    assert compact_threshold(cfg, "auto/coding-manual") == 89_600
+    # the Claude Code aliases the claude-cli provider sends are Claude models
+    assert [context_window(cfg, m) for m in ("sonnet", "opus", "haiku")] == [200_000] * 3
+    # an explicit entry still wins, also below the fallback
+    cfg.models = {"auto": {"context_window": 16_000}}
+    assert context_window(cfg, "auto") == 16_000
 
 
 async def test_the_active_models_window_decides_when_a_session_is_compacted(tmp_path, monkeypatch):

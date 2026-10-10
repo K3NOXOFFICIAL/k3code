@@ -74,8 +74,11 @@ export const sessionRow = (s: SessionActiveItem, nowMs: number): StripRow => ({
     (s.status === "waiting" || s.status === "needs_input"
       ? "waiting for input"
       : s.status),
+  // Time the current turn, never the session's age: started_at is its creation date, days old for a reused session.
   elapsedSeconds:
-    s.started_at != null ? Math.max(0, nowMs / 1000 - s.started_at) : null,
+    s.turn_started_at != null
+      ? Math.max(0, nowMs / 1000 - s.turn_started_at)
+      : null,
   id: s.id,
   key: `session:${s.id}`,
   kind: "session",

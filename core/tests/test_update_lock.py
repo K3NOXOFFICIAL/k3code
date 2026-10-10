@@ -92,3 +92,91 @@ def test_the_lock_of_a_killed_install_is_taken_over(data: Path, monkeypatch: pyt
     vdir = upd.install_release(_release(monkeypatch, seen), None, uv=fake_uv)
     assert (vdir / ".complete").is_file() and set(seen) == {str(os.getpid())}
     assert not lock.exists()
+
+
+def _tui_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lock: Path, recorded: Path) -> Path:
+    """A TUI build dir as install.sh makes it (TMPDIR/k3code-tui.XXXXXX) and the path its lock records."""
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "tmp"))
+    built = tmp_path / "tmp" / "k3code-tui.Ab12Cd"
+    (built / "tui").mkdir(parents=True)
+    recorded.mkdir(parents=True, exist_ok=True)
+    (lock / "tui_tmp").write_text(f"{recorded}\n")
+    return built
+
+
+def test_a_lock_whose_pid_now_names_another_process_is_taken_over(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_uv: str
+) -> None:
+    # the killed install's pid went to an unrelated process (here this one): the start time tells them apart
+    lock = data / LOCK
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{os.getpid()}\n")
+    (lock / "start").write_text("0\n")
+    built = _tui_tmp(tmp_path, monkeypatch, lock, tmp_path / "tmp" / "k3code-tui.Ab12Cd")
+    seen: list[str] = []
+    vdir = upd.install_release(_release(monkeypatch, seen), None, uv=fake_uv)
+    assert (vdir / ".complete").is_file() and set(seen) == {str(os.getpid())}
+    assert not built.exists()  # the killed install's TUI build dir goes with its lock
+    assert not lock.exists()
+
+
+@pytest.mark.parametrize("recorded", ["tmp/not-k3code", "tmp/sub/k3code-tui.Zz99", "elsewhere/k3code-tui.Zz99"])
+def test_a_recorded_path_that_is_not_a_tui_build_dir_is_left_alone(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_uv: str, recorded: str
+) -> None:
+    lock = data / LOCK
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{_dead_pid()}\n")
+    _tui_tmp(tmp_path, monkeypatch, lock, tmp_path / recorded)
+    upd.install_release(_release(monkeypatch, []), None, uv=fake_uv)
+    assert (tmp_path / recorded).is_dir()
+    assert not lock.exists()
+
+
+def test_a_live_pid_that_started_when_the_lock_says_still_refuses(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_uv: str
+) -> None:
+    lock = data / LOCK
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{os.getpid()}\n")
+    (lock / "start").write_text(f"{upd._process_start(os.getpid())}\n")
+    built = _tui_tmp(tmp_path, monkeypatch, lock, tmp_path / "tmp" / "k3code-tui.Ab12Cd")
+    with pytest.raises(upd.InstallLockHeld, match=f"is running \\(pid {os.getpid()}\\)"):
+        upd.install_release(_release(monkeypatch, []), None, uv=fake_uv)
+    assert built.is_dir() and (lock / "pid").is_file()  # a live install's lock and build dir are never touched
+
+
+def test_the_lock_records_when_its_owner_started(data: Path) -> None:
+    with upd.install_lock():
+        start = (data / LOCK / "start").read_text().strip()
+    assert start and start == upd._process_start(os.getpid())
+
+
+def test_the_start_time_is_written_before_the_pid(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # a kill between the two writes must not leave a pid without a start time (a recycled pid would keep the lock)
+    present: list[bool] = []
+    real = Path.write_text
+
+    def spy(self: Path, text: str, *a: object, **kw: object) -> int:
+        if self.name == "pid":
+            present.append((self.parent / "start").is_file())
+        return real(self, text, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    with upd.install_lock():
+        pass
+    assert present == [True]
+
+
+def test_a_lock_with_a_start_but_no_pid_still_refuses(data: Path) -> None:
+    (data / LOCK).mkdir(parents=True)
+    (data / LOCK / "start").write_text("123\n")
+    with pytest.raises(upd.InstallLockHeld, match="without a pid"), upd.install_lock():
+        pass
+
+
+def test_the_start_time_is_counted_from_the_last_parenthesis() -> None:
+    # the command name may hold spaces and ")": a naive split would read a different field
+    rest = " ".join(["S", *[str(n) for n in range(4, 22)], "987654", "23", "24"])
+    assert upd._stat_start(f"4242 (k3 (x) y)) {rest}\n".encode()) == "987654"
+    assert upd._stat_start(b"4242 (cut short) S 1 2\n") == ""

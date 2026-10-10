@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
 import m1cmd_helpers as m1
 from k3code.gateway.server import transcript_rows
+from k3code.gateway.sessions import StoredSession
 from k3code.router import Router, build_chain
 from test_permissions_gateway import call, make_server
+
+DAY = 24 * 3600
 
 
 async def test_open_approval_makes_the_session_need_input(tmp_path, monkeypatch):
@@ -313,3 +317,47 @@ async def test_an_interrupted_foreground_turn_reports_completed_until_the_next_p
     await m1.submit_and_wait(server, "next")
     assert seen == [None]
     assert live.run_result == "completed" and live.state == "completed"
+
+
+async def test_a_working_row_times_the_turn_not_the_session_age(tmp_path, monkeypatch):
+    """The agent view read "working 1370m" five minutes after start: the row's time came from the stored session's
+    created_at. A turn started now must report a start time of now, whatever the session's age."""
+    server, _ = m1.make_server(tmp_path, monkeypatch, ["done"])
+    sid = await m1.new_session(server, tmp_path)
+    live = server.live[sid]
+    live.stored.created_at = time.time() - DAY  # a reused session, opened long ago
+    started = asyncio.Event()
+
+    async def hang(session, text):
+        started.set()
+        await asyncio.Event().wait()
+
+    server.autonomy.prepare = hang  # type: ignore[method-assign]
+    await m1.rpc(server, "prompt.submit", {"text": "long task"})
+    task = live.turn_task
+    await asyncio.wait_for(started.wait(), 10)
+    row = next(r for r in (await m1.rpc(server, "session.active_list", {}))["result"]["sessions"] if r["id"] == sid)
+    assert row["state"] == "working"
+    assert abs(row["turn_started_at"] - time.time()) < 2
+    assert row["started_at"] == live.stored.created_at  # the creation date stays, for age and sorting
+    await m1.rpc(server, "session.interrupt", {"session_id": sid})
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+
+
+async def test_a_resumed_idle_session_reports_no_turn_time(tmp_path, monkeypatch):
+    """Between turns there is nothing to time: a resumed session must not show its age since creation as elapsed."""
+    server, _ = m1.make_server(tmp_path, monkeypatch, ["done"])
+    old = StoredSession(
+        session_id=server.store.new_id(),
+        cwd=str(tmp_path),
+        messages=[{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}],
+        created_at=time.time() - DAY,
+    )
+    server.store.insert(old)
+    await m1.rpc(server, "session.resume", {"session_id": old.session_id})
+    rows = (await m1.rpc(server, "session.active_list", {}))["result"]["sessions"]
+    row = next(r for r in rows if r["id"] == old.session_id)
+    assert row["state"] != "working"
+    assert row["turn_started_at"] is None
+    assert row["started_at"] == old.created_at

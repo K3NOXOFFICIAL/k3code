@@ -248,3 +248,52 @@ def test_the_key_count_leaves_out_claude_cli(monkeypatch):
     assert (
         check_keys(Settings(providers=[ProviderEntry(name="c", kind="claude-cli")])).detail == "no provider needs a key"
     )
+
+
+def test_project_check_reports_the_stacks_a_read_only_scan_finds(tmp_path):
+    """A fresh uv + pnpm project read "project: none" (the trust state of a project without a config) until a TUI
+    session had scanned it; doctor now scans it itself and stores nothing."""
+    from k3code import doctor
+    from k3code.learning import projectstate
+
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "demo"\nversion = "0"\n')
+    (tmp_path / "uv.lock").write_text("version = 1\n")
+    (tmp_path / "package.json").write_text('{"name": "web"}\n')
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    chk = doctor.check_project(tmp_path)
+    assert chk.status == doctor.OK
+    assert chk.detail.startswith("stacks: python (uv), node (pnpm); no project config")
+    assert chk.data["stacks"] == ["python (uv)", "node (pnpm)"]
+    assert not projectstate.state_path(tmp_path).exists()
+
+
+def test_doctor_names_chain_models_whose_context_window_is_a_guess():
+    """Issue #30: an id with no models.<id>.context_window and no known family gets a hint; the others stay quiet."""
+    from k3code.config import ProviderEntry, Settings
+    from k3code.doctor import OK, WARN, check_context_windows
+
+    gateway = ProviderEntry(
+        name="gw",
+        kind="openai",
+        base_url="http://gw",
+        api_key_env="K",
+        models={"default": ["auto/coding-manual", "claude-sonnet-5-5"], "cheap": "set-explicitly"},
+        tiers={"strong": ["gpt-4.1", "auto/coding-manual"]},
+    )
+    cfg = Settings(providers=[gateway], models={"set-explicitly": {"context_window": 64_000}})
+    checks = check_context_windows(cfg)
+    assert [(c.name, c.status) for c in checks] == [("context-window:auto/coding-manual", WARN)]
+    assert "assuming 128000 tokens" in checks[0].detail
+    assert "models: {auto/coding-manual: {context_window: <tokens>}}" in checks[0].fix
+
+    cfg.models["auto/coding-manual"] = {"context_window": 1_000_000}
+    assert [(c.name, c.status) for c in check_context_windows(cfg)] == [("context-window", OK)]
+
+
+def test_context_window_check_says_so_when_no_chain_models_are_configured():
+    from k3code.config import ProviderEntry, Settings
+    from k3code.doctor import OK, check_context_windows
+
+    for providers in ([], [ProviderEntry(name="cli", kind="claude-cli")]):
+        checks = check_context_windows(Settings(providers=providers))
+        assert [(c.name, c.status, c.detail) for c in checks] == [("context-window", OK, "no chain models configured")]
