@@ -2550,7 +2550,12 @@ class GatewayServer:
                 session.stored.meta["goal"] = state
             self.store.save(session.stored)
 
-        return GoalManager(load, save, default_max_turns=self.config.goal.max_turns)
+        return GoalManager(
+            load,
+            save,
+            default_max_turns=self.config.goal.max_turns,
+            default_gate_max_retries=self.config.goal.gate_max_retries,
+        )
 
     async def kick_goal(self, live: LiveSession, *, source: str) -> bool:
         """Start the next turn of an active goal that has no live turn. Boot resume and the watchdog both use this.
@@ -3619,6 +3624,7 @@ SETTABLE_CONFIG_KEYS = frozenset(
         "display.theme",
         "display.focus_mode",
         "goal.max_turns",
+        "goal.gate_max_retries",
         "goal.judge_model",
     }
 )

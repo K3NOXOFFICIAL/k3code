@@ -194,16 +194,31 @@ async def test_goal_check_gate_enforced(tmp_path, monkeypatch):
     await server.close()
 
 
-async def test_goal_check_gate_retries_without_limit(tmp_path, monkeypatch):
-    # gate retries are unlimited by default (they paused the goal after 3): a failing check keeps the goal going
-    # until the agent is judged blocked (the continuation tells it to say so when the check itself is wrong)
+async def test_goal_check_gate_pauses_after_the_configured_retries(tmp_path, monkeypatch):
+    # issue #49: a check that can never pass pauses the goal after goal.gate_max_retries failed checks (default 20)
+    # instead of continuing until someone looks; the judge's blocked verdict can still pause it sooner
     server, provider = make_server(tmp_path, monkeypatch, replies=["done?"], autonomy=NO_ADVISOR)
+    server.config.goal.gate_max_retries = 4
+    server.goal_judge = scripted_judge(["done"])
+    sid = await new_session(server, tmp_path)
+    await run_goal(server, sid, '/goal impossible --check "exit 1"')
+    st = server.goal_manager(server.session).state
+    assert st.status == "paused" and st.paused_reason == "check exhausted 4 retries: $ exit 1"
+    assert provider.n == 5 and st.gates[0].attempts == 5  # 1 + 4 continuations, then paused
+    prompts = [m.content for seen in provider.seen for m in seen if m.role == "user"]
+    assert any("(attempt 4/4):" in p for p in prompts)
+    await server.close()
+
+
+async def test_goal_check_gate_retries_without_limit_when_configured_to_0(tmp_path, monkeypatch):
+    server, provider = make_server(tmp_path, monkeypatch, replies=["done?"], autonomy=NO_ADVISOR)
+    server.config.goal.gate_max_retries = 0
     server.goal_judge = judge = scripted_judge(["done"] * 6 + ["blocked"])
     sid = await new_session(server, tmp_path)
     await run_goal(server, sid, '/goal impossible --check "exit 1"')
     st = server.goal_manager(server.session).state
     assert st.status == "paused" and "unachievable" in st.paused_reason
-    assert len(judge.calls) == 7 and st.gates[0].attempts == 6  # 1 + 6 continuations, more than the old 3 retries
+    assert len(judge.calls) == 7 and st.gates[0].attempts == 6
     prompts = [m.content for seen in provider.seen for m in seen if m.role == "user"]
     assert any("(attempt 6):" in p for p in prompts) and not any("(attempt 6/" in p for p in prompts)
     await server.close()

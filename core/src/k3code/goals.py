@@ -25,9 +25,11 @@ from typing import Any
 #: Judged turns before a goal pauses; 0 = no limit: a goal runs until it is done, judged blocked or paused.
 DEFAULT_MAX_TURNS = 0
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
-#: Failed --check runs before a goal pauses; 0 = no limit (an agent that finds the check itself wrong says so and
-#: stops, and the judge's ``blocked`` verdict pauses the goal).
-DEFAULT_GATE_MAX_RETRIES = 0
+#: Failed --check runs before a goal pauses (``goal.gate_max_retries``); 0 = no limit. Finite by default: an agent
+#: that finds the check itself wrong usually says so and the judge's ``blocked`` verdict pauses the goal, but a check
+#: that can never pass (a typo, a missing tool) would otherwise burn tokens until someone looks. /goal resume starts
+#: the count again.
+DEFAULT_GATE_MAX_RETRIES = 20
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
 #: Automatic kicks (boot resume, watchdog): this many within KICK_WINDOW_S, the next one parks the goal instead.
 MAX_KICKS_PER_WINDOW = 3
@@ -277,10 +279,12 @@ class GoalManager:
         save: Callable[[dict[str, Any] | None], None],
         *,
         default_max_turns: int = DEFAULT_MAX_TURNS,
+        default_gate_max_retries: int = DEFAULT_GATE_MAX_RETRIES,
     ) -> None:
         self._load = load
         self._save_raw = save
         self.default_max_turns = default_max_turns
+        self.default_gate_max_retries = default_gate_max_retries
 
     @property
     def state(self) -> GoalState | None:
@@ -302,7 +306,7 @@ class GoalManager:
     def set(
         self, goal: str, *, max_turns: int | None = None, check: str | None = None, implicit: bool = False
     ) -> GoalState:
-        gates = [GoalGate(command=check)] if check else []
+        gates = [GoalGate(command=check, max_retries=self.default_gate_max_retries)] if check else []
         st = GoalState(
             goal=goal.strip(),
             max_turns=self.default_max_turns if max_turns is None else max_turns,
