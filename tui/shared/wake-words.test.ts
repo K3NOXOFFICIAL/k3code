@@ -10,6 +10,7 @@ import { detectWakeWord, WAKE_WORDS } from "./wake-words";
 interface Case {
   input: string;
   mode: null | string;
+  skip?: [number, number][];
   task: null | string;
 }
 
@@ -60,7 +61,7 @@ describe("detectWakeWord against the shared table", () => {
   it.each(CASES.map((c) => [c.input.slice(0, 40) || "<empty>", c] as const))(
     "%s",
     (_name, c) => {
-      const got = detectWakeWord(c.input);
+      const got = detectWakeWord(c.input, c.skip);
 
       expect(got?.mode ?? null).toBe(c.mode);
       expect(got?.task ?? null).toBe(c.task);
@@ -91,6 +92,48 @@ describe("detectWakeWord offsets", () => {
   it("does not let the long s fold onto s (no unicode case folding)", () => {
     expect(detectWakeWord("ultraresearch notes")?.mode).toBe("ultraresearch");
     expect(detectWakeWord("ultrareſearch notes")).toBeNull();
+  });
+});
+
+describe("detectWakeWord cost", () => {
+  // Python has the same test (test_wakewords.py): many words, code spans and pastes stay fast, no per-word rescan.
+  const timed = (text: string, skip: [number, number][] = []) => {
+    const t0 = performance.now();
+    const got = detectWakeWord(text, skip);
+
+    return { got, took: performance.now() - t0 };
+  };
+
+  it("is not quadratic in code spans, fences, indented blocks or pastes", () => {
+    for (const text of [
+      "`ultracode` ".repeat(20000) + "ultracode",
+      "```a``` ".repeat(20000) + "ultracode",
+      "x\n~~~\n~~~\n".repeat(20000) + "ultracode",
+      "x\n\n    y\n\n".repeat(20000) + "\n \n".repeat(20000) + "ultracode",
+      "x" + " \n".repeat(40000) + "y ultracode", // long whitespace runs that do not end the text
+      "x" + " ".repeat(80000) + "y ultracode" + " ".repeat(80000) + "z",
+    ]) {
+      const { got, took } = timed(text);
+
+      expect(got?.mode).toBe("ultracode");
+      expect(took).toBeLessThan(2000);
+    }
+
+    const pastes: [number, number][] = [];
+
+    for (let i = 0; i < 60000; i += 3) {
+      pastes.push([i, i + 2]);
+    }
+
+    const { got, took } = timed("ab ".repeat(20000) + "ultracode", pastes);
+
+    expect(got?.start).toBe(60000);
+    expect(took).toBeLessThan(2000);
+  });
+
+  it("reads a glued neighbour outside the BMP as one character", () => {
+    expect(detectWakeWord("\u{1D49C}ultracode go")).toBeNull(); // a mathematical script capital A
+    expect(detectWakeWord("\u{1F600}ultracode go")?.task).toBe("\u{1F600} go"); // an emoji is no letter
   });
 });
 
