@@ -36,7 +36,7 @@ from typing import Any
 from k3code.paths import GATEWAY_ENV_VARS
 from k3code.providers import effort
 from k3code.providers.base import Provider, ProviderError
-from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec, Usage
+from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall, ToolSpec, Usage
 
 DEFAULT_COMMAND = "claude"
 _SYSTEM_FALLBACK = "You are the model behind a coding agent."
@@ -427,12 +427,70 @@ def _call_arguments(item: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in item.items() if k not in _NOT_ARGUMENTS}
 
 
+_PY_LITERALS = {"True": "true", "False": "false", "None": "null"}
+_WORD = re.compile(r"[A-Za-z_]+")
+_INVALID_BODY_CHARS = 300
+
+
+def _repair_json(body: str) -> str:
+    """``body`` with the slips models make in JSON fixed: a comma before ``]``/``}``, ``True``/``False``/``None``
+    outside strings, and a missing final ``]`` when the array is otherwise complete. Anything else is left as it is."""
+    out: list[str] = []
+    stack: list[str] = []
+
+    def drop_trailing_comma() -> None:
+        k = len(out) - 1
+        while k >= 0 and not out[k].strip():
+            k -= 1
+        if k >= 0 and out[k] == ",":
+            del out[k]
+
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch == '"':
+            j = i + 1
+            while j < n and body[j] != '"':
+                j += 2 if body[j] == "\\" else 1
+            out.append(body[i : j + 1])
+            i = j + 1
+            continue
+        if ch in "[{":
+            stack.append(ch)
+        elif ch in "]}":
+            if stack:
+                stack.pop()
+            drop_trailing_comma()
+        elif m := _WORD.match(body, i):
+            out.append(_PY_LITERALS.get(m.group(), m.group()))
+            i = m.end()
+            continue
+        out.append(ch)
+        i += 1
+    if stack == ["["]:
+        drop_trailing_comma()
+        out.append("]")
+    return "".join(out)
+
+
 def _parse_tool_calls(body: str) -> list[ToolCall]:
     body = re.sub(r"^```(?:json)?\s*|\s*```$", "", body.strip())  # tolerate a fenced block
     try:
         items = json.loads(body)
     except json.JSONDecodeError as exc:
-        raise ProviderError(f"The model wrote an invalid <tool_calls> block: {exc}", status_code=502) from exc
+        try:
+            items = json.loads(_repair_json(body))
+        except json.JSONDecodeError:
+            # not a provider failure: a retry would regenerate the whole reply. The agent loop tells the model.
+            detail = {"error": str(exc), "body": body[:_INVALID_BODY_CHARS]}
+            return [
+                ToolCall(
+                    id=f"call_{uuid.uuid4().hex[:12]}",
+                    name=INVALID_TOOL_CALL,
+                    arguments=detail,
+                    raw_arguments=json.dumps(detail, ensure_ascii=False),
+                )
+            ]
     if isinstance(items, dict):
         items = items.get("tool_calls") or [items]
     calls: list[ToolCall] = []
