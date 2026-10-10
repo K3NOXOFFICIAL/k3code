@@ -75,3 +75,18 @@ it("shows a standing goal (active, parked, paused) and hides it once done or cle
     paint(<GoalBarView cols={58} line={null} t={DEFAULT_THEME} />).trim(),
   ).toBe("");
 });
+
+it("drops the cap for an unlimited goal and tags an implicit one", () => {
+  expect(goalLine(goal({ max_turns: 0, turns_used: 12 }))).toMatchObject({
+    detail: "12 turns",
+    label: "goal",
+  });
+  expect(goalLine(goal({ implicit: true }))).toMatchObject({
+    detail: "3/20 turns",
+    label: "↻ auto goal",
+  });
+  expect(
+    goalLine(goal({ implicit: true, max_turns: 0, turns_used: 12 })),
+  ).toMatchObject({ detail: "12 turns", label: "↻ auto goal" });
+  expect(goalLine(goal({ implicit: false }))?.label).toBe("goal");
+});

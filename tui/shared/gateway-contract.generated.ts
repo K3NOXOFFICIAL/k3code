@@ -740,6 +740,7 @@ export interface GoalSnapshot {
   last_verdict?: string | null
   last_reason?: string | null
   wait_barrier?: WaitBarrierUntil | WaitBarrierTarget | null
+  implicit?: boolean
 }
 /** ``hermes_cli/goals.py::GoalContract.to_dict``. */
 export interface GoalContractSnapshot {
