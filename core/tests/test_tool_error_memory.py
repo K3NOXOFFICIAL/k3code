@@ -189,3 +189,69 @@ async def test_digit_bearing_credentials_never_reach_the_signature_or_the_log(tm
     for secret in (PASSWORD, DIGIT_KEY, "1234567890"):
         assert secret not in json.dumps(row)
         assert secret not in signature
+
+
+async def test_a_recurring_failure_with_a_lesson_is_reminded_after_the_results_once_per_turn(tmp_path, monkeypatch):
+    reads = [ToolCall(id=f"r{i}", name="read", arguments={"path": f"gone-{i}.txt"}) for i in range(3)]
+    server, provider = make_server(tmp_path, [*reads, "ok"], monkeypatch, mode="yolo")
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    hub = server.learning
+    path = gotchas.gotchas_path(hub.log.project_for(str(tmp_path)))
+    gotchas.append_gotcha(path, "read: File not found: <path> — worked with different path")
+    assert path.is_relative_to(os.environ["K3CODE_HOME"])  # the test home, never the real one
+    await run_turn(server, "go", [])
+    note = (
+        "[learned] This failure was seen before in this project: read: File not found: <path>"
+        " — worked with different path"
+    )
+    first = provider.seen[1]
+    tool_at = max(i for i, m in enumerate(first) if m.role == "tool")
+    assert [i for i, m in enumerate(first) if m.content == note] == [tool_at + 1]  # right after the step's results
+    assert [m.content for m in provider.seen[-1]].count(note) == 1  # once per signature per turn
+    # the loop guard's note still comes after the third identical failure
+    assert any("failed the same way" in (m.content or "") for m in provider.seen[3] if m.role == "system")
+
+
+async def test_a_working_retry_on_an_earlier_row_is_a_lesson_too(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch, learning={"auto_gotchas": False})
+    hub = server.learning
+    s = _session(server, tmp_path)
+    tc = ToolCall(id="x", name="bash", arguments={"command": "npm test"})
+    result = {"stdout": "", "stderr": "sh: 1: npm: not found", "exit_code": 127}
+    assert hub.tool_outcome(s, tc, result, failure_of("bash", tc.arguments, result)) is None  # nothing known yet
+    _ok(hub, s, "pnpm test")
+    note = hub.tool_outcome(s, tc, result, failure_of("bash", tc.arguments, result))
+    assert note == (
+        "This failure was seen before in this project: bash: npm: exit <n>: sh: <n>: npm: not found"
+        " — `pnpm test` worked instead"
+    )
+
+
+async def test_a_line_learned_in_two_projects_becomes_a_machine_pitfall(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    user = hub.home / "gotchas.md"
+    line = "- bash: python: exit <n>: sh: <n>: python: not found — `python3 x.py` worked instead"
+    for name in ("a", "b", "c"):
+        (tmp_path / name).mkdir()
+    for n, name in enumerate(("a", "b")):
+        s = _session(server, tmp_path / name, f"s{name}")
+        _fail(hub, s, "python x.py", "sh: 1: python: not found")
+        _ok(hub, s, "python3 x.py")
+        _fail(hub, s, "python y.py", "sh: 1: python: not found")
+        project = gotchas.gotchas_path(hub.log.project_for(str(tmp_path / name)))
+        assert project.read_text(encoding="utf-8").splitlines() == [line]
+        assert user.exists() == (n == 1)  # one project is not enough
+    assert user.read_text(encoding="utf-8").splitlines() == [line]
+    assert user.is_relative_to(os.environ["K3CODE_HOME"])
+    prompt = build_system_prompt("base", cwd=tmp_path / "c", config=Settings())
+    assert "## Known pitfalls on this machine" in prompt and line in prompt
+    assert "## Known pitfalls in this project" not in prompt
+    both = build_system_prompt("base", cwd=tmp_path / "a", config=Settings())
+    assert both.index("## Known pitfalls in this project") < both.index("## Known pitfalls on this machine")
+    # a third project with no lesson of its own is reminded from the machine file on its first failure
+    tc = ToolCall(id="x", name="bash", arguments={"command": "python z.py"})
+    result = {"stdout": "", "stderr": "sh: 1: python: not found", "exit_code": 127}
+    sc = _session(server, tmp_path / "c", "sc")
+    note = hub.tool_outcome(sc, tc, result, failure_of("bash", tc.arguments, result))
+    assert note == "This failure was seen before on this machine: " + line[2:]

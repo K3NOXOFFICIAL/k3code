@@ -140,3 +140,32 @@ async def test_gateway_main_tier_without_escalation_stops_at_eight(tmp_path, mon
     assert sum(1 for m in msgs if m["role"] == "tool") == 8
     assert msgs[-1]["role"] == "assistant" and "8 tool calls in a row failed" in msgs[-1]["content"]
     assert server.session.needs_input
+
+
+class _Batch(_Script):
+    """Plays a list of tool calls per model call, then a final text."""
+
+    async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+        self.seen.append(list(messages))
+        tcs = self.calls[self.n] if self.n < len(self.calls) else []
+        self.n += 1
+        msg = Message(role="assistant", content=None if tcs else "done", tool_calls=tcs)
+        yield StreamEvent(type="done", message=msg, usage=Usage())
+
+
+@pytest.mark.asyncio
+async def test_a_learned_lesson_is_sent_once_per_signature_per_run_and_beside_the_guard_note(tmp_path):
+    step = [ToolCall(id=f"c{i}", name="db", arguments={"n": i}) for i in range(3)]
+    loop, _ = _loop(tmp_path, [])
+    provider = _Batch([step])
+    loop.router = Router(build_chain([provider], [["m"]]), max_retries=0)
+    loop.on_tool_outcome = lambda call, result, failure: "use the replica" if failure else None
+    await _drain(loop)
+    notes = [m.content for m in provider.seen[1] if m.role == "system"][1:]
+    assert notes[0] == "[learned] use the replica" and len(notes) == 2  # one lesson for three identical failures
+    assert "The last 3 tool calls failed the same way" in notes[1]  # the guard's note is not crowded out
+    assert provider.seen[1][-3].role == "tool"  # both come after the step's results
+    provider.n = 0
+    provider.seen.clear()
+    await _drain(loop)  # a new run reminds again
+    assert [m.content for m in provider.seen[1]].count("[learned] use the replica") == 1
