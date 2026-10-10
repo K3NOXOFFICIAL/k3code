@@ -655,6 +655,82 @@ def test_a_lock_without_a_pid_is_taken_over_only_when_old(tmp_path: Path) -> Non
     assert "taking over the install lock" in r.stderr and "older than 6 hours" in r.stderr
 
 
+def _lock_of(tmp_path: Path, pid: int, start: str, tui_tmp: str) -> Path:
+    """The lock a killed install left: pid, start time, the TUI build dir it recorded (made under tmp_path/tmp)."""
+    lock = tmp_path / DATA_REL / ".install.lock"
+    lock.mkdir(parents=True)
+    (lock / "pid").write_text(f"{pid}\n")
+    (lock / "start").write_text(f"{start}\n")
+    (tmp_path / tui_tmp).mkdir(parents=True)
+    (lock / "tui_tmp").write_text(f"{tmp_path / tui_tmp}\n")
+    return lock
+
+
+def test_a_lock_whose_pid_now_names_another_process_is_taken_over(tmp_path: Path) -> None:
+    # the killed install's pid went to an unrelated live process (here pytest): its start time is not the lock's
+    lock = _lock_of(tmp_path, os.getpid(), "0", "tmp/k3code-tui.Ab12Cd")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and f"pid {os.getpid()} now belongs to another" in r.stderr
+    assert not (tmp_path / "tmp" / "k3code-tui.Ab12Cd").exists() and "removed the TUI build directory" in r.stderr
+    assert not lock.exists()
+
+
+@pytest.mark.parametrize("recorded", ["tmp/not-k3code", "tmp/sub/k3code-tui.Zz99", "elsewhere/k3code-tui.Zz99"])
+def test_a_recorded_path_that_is_not_a_tui_build_dir_is_left_alone(tmp_path: Path, recorded: str) -> None:
+    dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+    _lock_of(tmp_path, int(dead), "", recorded)
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    assert r.returncode == 0, r.stderr
+    assert "taking over the install lock" in r.stderr and "removed the TUI build directory" not in r.stderr
+    assert (tmp_path / recorded).is_dir()
+
+
+def test_a_tui_build_dir_is_removed_when_tmpdir_ends_in_a_slash(tmp_path: Path) -> None:
+    # macOS TMPDIR ends in "/", so mktemp recorded "<tmp>//k3code-tui.X" and the strict prefix check refused it
+    dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+    lock = _lock_of(tmp_path, int(dead), "", "tmp/k3code-tui.Ab12Cd")
+    (lock / "tui_tmp").write_text(f"{tmp_path / 'tmp'}//k3code-tui.Ab12Cd\n")
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": f"{tmp_path / 'tmp'}/"})
+    assert r.returncode == 0, r.stderr
+    assert not (tmp_path / "tmp" / "k3code-tui.Ab12Cd").exists() and "removed the TUI build directory" in r.stderr
+
+
+def test_a_lock_k3code_update_holds_stops_the_installer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # one lock format for both: install.sh reads the pid and start time update.py wrote, and still refuses
+    from k3code import update as upd
+
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / DATA_REL))
+    with upd.install_lock():
+        (tmp_path / "tmp" / "k3code-tui.Ab12Cd").mkdir(parents=True)
+        (tmp_path / DATA_REL / ".install.lock" / "tui_tmp").write_text(f"{tmp_path / 'tmp' / 'k3code-tui.Ab12Cd'}\n")
+        r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+        assert (tmp_path / DATA_REL / ".install.lock" / "pid").is_file()
+    assert r.returncode != 0
+    assert "another install" in r.stderr and str(os.getpid()) in r.stderr
+    assert (tmp_path / "tmp" / "k3code-tui.Ab12Cd").is_dir()
+
+
+@linux_only
+def test_a_command_name_with_spaces_and_parentheses_keeps_its_lock(tmp_path: Path) -> None:
+    # /proc/<pid>/stat field 2 is the command name: install.sh must count the fields from its last ")"
+    from k3code import update as upd
+
+    odd = tmp_path / "a) (b c"
+    shutil.copy(shutil.which("sleep") or "/bin/sleep", odd)
+    holder = subprocess.Popen([str(odd), "30"])
+    try:
+        assert Path(f"/proc/{holder.pid}/stat").read_text().startswith(f"{holder.pid} (a) (b c) ")
+        lock = _lock_of(tmp_path, holder.pid, upd._process_start(holder.pid), "tmp/k3code-tui.Ab12Cd")
+        r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
+    finally:
+        holder.kill()
+        holder.wait()
+    assert r.returncode != 0
+    assert f"is running (pid {holder.pid})" in r.stderr
+    assert lock.is_dir() and (tmp_path / "tmp" / "k3code-tui.Ab12Cd").is_dir()
+
+
 def test_the_install_lock_is_released_after_a_run(tmp_path: Path) -> None:
     assert run(tmp_path, INSTALL, "--from-source", "--minimal").returncode == 0
     assert not (tmp_path / DATA_REL / ".install.lock").exists()

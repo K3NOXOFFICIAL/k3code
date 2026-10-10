@@ -426,7 +426,8 @@ class UnpinnedReleaseError(IntegrityError):
 
 #: The release asset with the runtime dependencies exported from core/uv.lock, with hashes (``k3code-<ver>-...``).
 REQUIREMENTS_SUFFIX = "-requirements.txt"
-#: install/install.sh's lock in the install root: a directory holding the pid of the run that owns it.
+#: install/install.sh's lock in the install root: a directory holding the pid of the run that owns it (``pid``), when
+#: that process started (``start``, see _process_start) and the TUI build dir install.sh is using (``tui_tmp``).
 INSTALL_LOCK = ".install.lock"
 
 
@@ -444,8 +445,50 @@ def _pid_running(pid: int) -> bool:
     return True
 
 
+def _stat_start(stat: bytes) -> str:
+    """Field 22 (start time) of a /proc/<pid>/stat line. The command name (field 2) may hold spaces and ")", so the
+    fields are counted from the last ")"."""
+    fields = stat.rpartition(b")")[2].split()
+    return fields[19].decode() if len(fields) > 19 else ""
+
+
+def _process_start(pid: int) -> str:
+    """When ``pid`` started, to tell it from a later process given the same pid; "" when unknown.
+
+    install.sh's proc_start writes and compares the same value, so each understands the other's lock: field 22 of
+    /proc/<pid>/stat where there is a /proc, else (macOS) ``ps -o lstart=`` in a fixed locale and time zone."""
+    if Path("/proc/self").is_dir():
+        try:
+            return _stat_start(Path(f"/proc/{pid}/stat").read_bytes())
+        except OSError:
+            return ""
+    env = {**os.environ, "LC_ALL": "C", "TZ": "UTC"}
+    try:
+        ps = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, env=env, check=False
+        )
+    except OSError:
+        return ""
+    return " ".join(ps.stdout.split())
+
+
+def _remove_recorded_tui_tmp(lock: Path) -> None:
+    """Remove the TUI build dir a killed install.sh recorded in ``lock``. Never an arbitrary path from a lock file:
+    only a ``k3code-tui.*`` directly in the temp dir install.sh uses."""
+    try:
+        recorded = Path((lock / "tui_tmp").read_text().rstrip("\n"))
+    except OSError:
+        return
+    tmp = Path(os.environ.get("TMPDIR") or "/tmp")
+    if recorded.parent == tmp and recorded.name.startswith("k3code-tui.") and recorded.name != "k3code-tui.":
+        shutil.rmtree(recorded, ignore_errors=True)
+
+
 def _take_over_stale_lock(lock: Path) -> None:
-    """Take ``lock`` (which exists) if the process it names is gone; InstallLockHeld otherwise."""
+    """Take ``lock`` (which exists) if the process it names is gone; InstallLockHeld otherwise.
+
+    A pid is reused, so a live pid is still the lock's owner only if it started when the lock says. A lock without a
+    start time (an older installer), or a start time that cannot be read here, trusts the pid alone."""
     try:
         pid = int((lock / "pid").read_text().strip())
     except (OSError, ValueError):
@@ -454,7 +497,14 @@ def _take_over_stale_lock(lock: Path) -> None:
             f"install runs, remove it (rm -r '{lock}') and retry"
         ) from None
     if _pid_running(pid):
-        raise InstallLockHeld(f"another install into {lock.parent} is running (pid {pid}); wait for it to finish")
+        try:
+            started = (lock / "start").read_text().strip()
+        except OSError:
+            started = ""
+        now = _process_start(pid) if started else ""
+        if not now or now == started:
+            raise InstallLockHeld(f"another install into {lock.parent} is running (pid {pid}); wait for it to finish")
+    _remove_recorded_tui_tmp(lock)
     shutil.rmtree(lock, ignore_errors=True)
     try:
         lock.mkdir()
@@ -468,8 +518,9 @@ def install_lock() -> Iterator[None]:
 
     install.sh removes every ``versions/<v>`` without ``.complete`` when it takes over a stale lock, and this build
     removes an unfinished ``versions/<ver>`` itself, so the two must not build at the same time. A lock whose process
-    is gone (a killed install or update) is taken over, as install.sh does; a lock with a live pid, or without a pid
-    (an install that is just starting), refuses."""
+    is gone (a killed install or update, also when its pid now names a later process) is taken over, as install.sh
+    does, with the TUI build dir it recorded; a lock with a live pid, or without a pid (an install that is just
+    starting), refuses."""
     lock = data_dir() / INSTALL_LOCK
     lock.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -478,6 +529,7 @@ def install_lock() -> Iterator[None]:
         _take_over_stale_lock(lock)
     try:
         (lock / "pid").write_text(f"{os.getpid()}\n")
+        (lock / "start").write_text(f"{_process_start(os.getpid())}\n")
         yield
     finally:
         shutil.rmtree(lock, ignore_errors=True)
