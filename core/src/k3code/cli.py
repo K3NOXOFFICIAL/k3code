@@ -9,6 +9,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -263,6 +264,9 @@ class _HeadlessUsage:
         self.tools: list[dict[str, Any]] = []
         self._by_id: dict[str, dict[str, Any]] = {}
         self._last: tuple[str, str] = ("", "")
+        #: monotonic start of the model call in flight, and of the tool the loop runs next (the rows' ``seconds``)
+        self._call_started: float | None = None
+        self._tool_mark: float | None = None
         try:
             self.db: Any = UsageDB(k3_home() / "usage.db")
         except Exception:  # noqa: BLE001 - accounting must never stop the run
@@ -280,6 +284,10 @@ class _HeadlessUsage:
     def on_router_event(self, event: RouterEvent) -> None:
         if event.kind == "router.attempt":
             self._last = (event.provider, event.model)
+            if self._call_started is None:  # retries and failovers of one call count towards its time
+                self._call_started = time.monotonic()
+        elif event.kind == "router.exhausted":
+            self._call_started = None
         elif event.kind in ("router.retry", "router.failover"):
             self._record(
                 event.kind.removeprefix("router."), provider=event.provider, model=event.model, detail=event.reason
@@ -292,7 +300,6 @@ class _HeadlessUsage:
         entry = {"id": call.id, "name": call.name, "arguments": call.arguments}
         self._by_id[call.id] = entry
         self.tools.append(entry)
-        self._record("tool", detail=call.name)
 
     def on_stream_event(self, event: Any) -> None:
         if event.type == "tool_call" and event.tool_call:
@@ -311,10 +318,18 @@ class _HeadlessUsage:
                     cost_usd=u.cost_usd if u else None,
                     cache_read=u.cache_read_tokens if u else 0,
                     cache_write=u.cache_creation_tokens if u else 0,
+                    seconds=time.monotonic() - self._call_started if self._call_started is not None else 0.0,
                 )
+                self._call_started = None
+                self._tool_mark = time.monotonic()  # the loop executes the tool calls right after this message
                 for call in msg.tool_calls:
                     self._tool(call)
             elif msg.role == "tool" and (entry := self._by_id.get(msg.tool_call_id or "")) is not None:
+                now = time.monotonic()
+                self._record(
+                    "tool", detail=entry["name"], seconds=now - self._tool_mark if self._tool_mark is not None else 0.0
+                )
+                self._tool_mark = now
                 text = msg.content if isinstance(msg.content, str) else json.dumps(msg.content, default=str)
                 entry["result"] = text[:HEADLESS_RESULT_CHARS]
 

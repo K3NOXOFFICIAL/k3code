@@ -14,6 +14,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 - **`/help`** lists the gateway's commands by category (it showed only the TUI's own commands).
 - **Logging.** `k3code -p` prints only warnings by default, ends the answer with a newline and says why on stderr when a run fails. `K3CODE_LOG_LEVEL=info` brings the log back.
 - **Rejected keys.** A provider entry whose key is rejected (401/403) now cools down for 5 minutes, doubling per consecutive rejection up to 1 hour, so later calls skip it at once instead of posting to it and probing `/models` on every step. The cooldown belongs to the key that was rejected: a replaced key is tried immediately, `k3code doctor` clears it when the key answers, and `k3code onboard` / `k3code setup` clear it after writing a provider. When every entry is rejected the error says authentication failed (and points at `k3code doctor`) instead of "rate-limited until".
+- **Usage timings.** The `call` and `tool` rows in `usage.db` now record their wall time in `seconds` (a model call from its first attempt, failovers included, to its answer; a tool from the end of the model message or the previous tool to its result), in the daemon, in `k3code -p` and for side calls such as titles and compaction. They were always 0, so `k3code stats` could not show where time goes.
 - **Setup.** Fast setup over an existing config puts the new provider first and keeps the others as fallbacks. `k3code doctor` reports a provider without a key as a warning while another provider can still answer.
 
 ### Added
