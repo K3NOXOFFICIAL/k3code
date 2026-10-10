@@ -1453,7 +1453,10 @@ class GatewayServer:
             if sess is not None:
                 sess.last_entry = (event.provider, event.model)
                 sess.last_tier = str(event.extra.get("tier", "main"))
-                if sess.call_started is None:  # retries and failovers of one call count towards its time
+                # Retries and failovers of one call count towards its time. Only a turn's own model calls are timed: a
+                # side call after the turn (goal judge, auto-title) has no `call` row to close it, so its start would
+                # stay armed and the next prompt's first row would include that call and the user's idle time.
+                if sess.streaming and sess.call_started is None:
                     sess.call_started = time.monotonic()
         elif event.kind == "router.retry":
             self.usage.record("retry", session=sid, provider=event.provider, model=event.model, detail=event.reason)
@@ -1976,6 +1979,7 @@ class GatewayServer:
             session.emit("error", {"message": str(e)})
         finally:
             session.streaming = False
+            session.call_started = None  # a call cut short by /stop or an error has no row to close it
             session.idle_since = time.monotonic()
             # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
             # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
@@ -2635,6 +2639,7 @@ class GatewayServer:
                 session.emit("error", {"message": text})
             finally:
                 session.streaming = False
+                session.call_started = None
                 self.subagents.interrupt_session(session.session_id)  # nothing may outlive the job
             # same mapping as _run_one_turn, set before the closing events carry session.state
             session.run_result = {"done": "completed", "interrupted": "completed"}.get(status, "failed")

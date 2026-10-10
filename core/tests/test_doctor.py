@@ -311,8 +311,9 @@ def test_doctor_clears_a_providers_auth_cooldown_when_its_key_answers(monkeypatc
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
     path = tmp_path / "cooldowns.json"
     seed = CooldownStore(path=path)
-    seed.arm(FailoverReason.auth, provider="good", model="m")
-    seed.arm(FailoverReason.auth, provider="bad", model="m")
+    for _ in range(2):  # the second rejection in a row arms the cooldown
+        seed.arm(FailoverReason.auth, provider="good", model="m")
+        seed.arm(FailoverReason.auth, provider="bad", model="m")
 
     async def fake_probe_key(p):
         return p.name == "good", 5.0, "HTTP 200" if p.name == "good" else "HTTP 401: rejected"

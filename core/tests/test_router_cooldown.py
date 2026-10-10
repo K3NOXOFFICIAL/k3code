@@ -27,6 +27,7 @@ class Scripted:
     def __init__(self, name: str, script: list[ProviderError | str]) -> None:
         self.name = name
         self.base_url = f"http://{name}"
+        self.api_key = f"key-{name}"
         self.script = script
         self.calls = 0
 
@@ -138,7 +139,7 @@ async def test_all_cooling_fails_fast_with_clear_message():
 
 async def test_not_all_cooling_has_no_retry_after():
     a = Scripted("a", [err429(7200)])
-    b = Scripted("b", [ProviderError(message="bad key", status_code=401)])
+    b = Scripted("b", [ProviderError(message="bad request", status_code=400)])  # fails over, arms no cooldown
     router, _, _, _ = make([a, b])
     with pytest.raises(ChainExhausted) as ei:
         await router.complete(MSGS, [])
@@ -275,22 +276,24 @@ async def test_auth_failure_cools_the_entry_down_and_later_calls_skip_it():
     b = Scripted("b", ["from b"])
     router, store, _, _ = make([a, b])
     assert (await router.complete(MSGS, [])).content == "from b"
-    assert a.calls == 1
+    assert (await router.complete(MSGS, [])).content == "from b"  # the second rejection in a row arms it
+    assert a.calls == 2
     assert store.reason_of(provider="a", model="m", base_url="http://a") is FailoverReason.auth
     assert 290 < store.remaining_seconds(provider="a", model="m", base_url="http://a") <= 300
     assert (await router.complete(MSGS, [])).content == "from b"
-    assert a.calls == 1  # no POST (and so no reachability probe) to the dead entry on the second call
+    assert a.calls == 2  # no POST (and so no reachability probe) to the dead entry on the third call
 
 
 async def test_replaced_key_is_tried_at_once():
-    a = Scripted("a", [err401(), "a works now"])
+    a = Scripted("a", [err401(), err401(), "a works now"])
     a.api_key = "revoked-key"
     router, store, _, _ = make([a, Scripted("b", ["from b"])])
     assert (await router.complete(MSGS, [])).content == "from b"
-    assert (await router.complete(MSGS, [])).content == "from b" and a.calls == 1
+    assert (await router.complete(MSGS, [])).content == "from b"
+    assert (await router.complete(MSGS, [])).content == "from b" and a.calls == 2
     a.api_key = "fresh-key"
     assert (await router.complete(MSGS, [])).content == "a works now"
-    assert a.calls == 2
+    assert a.calls == 3
     assert store.reason_of(provider="a", model="m", base_url="http://a") is None
 
 
@@ -299,7 +302,8 @@ def test_auth_cooldown_never_stores_the_key(tmp_path):
 
     path = tmp_path / "cooldowns.json"
     store = CooldownStore(path=path)
-    store.arm(FailoverReason.auth, provider="a", model="m", fingerprint=key_fingerprint("sk-secret-value"))
+    for _ in range(2):
+        store.arm(FailoverReason.auth, provider="a", model="m", fingerprint=key_fingerprint("sk-secret-value"))
     raw = path.read_text()
     assert "sk-secret-value" not in raw and key_fingerprint("sk-secret-value") in raw
     reborn = CooldownStore(path=path)
@@ -309,20 +313,20 @@ def test_auth_cooldown_never_stores_the_key(tmp_path):
 
 def test_auth_ladder_doubles_to_an_hour_and_success_resets_it():
     store = CooldownStore()
-    seen = [store.arm(FailoverReason.auth, provider="a", model="m", retry_after=5) for _ in range(6)]
-    assert seen == [300, 600, 1200, 2400, 3600, 3600]  # a declared Retry-After does not shorten it
+    seen = [store.arm(FailoverReason.auth, provider="a", model="m", retry_after=5) for _ in range(7)]
+    assert seen == [None, 300, 600, 1200, 2400, 3600, 3600]  # a declared Retry-After does not shorten it
     store.record_success(provider="a", model="m")
-    assert store.arm(FailoverReason.auth, provider="a", model="m") == 300
+    assert [store.arm(FailoverReason.auth, provider="a", model="m") for _ in range(2)] == [None, 300]
 
 
 def test_clear_reason_auth_leaves_other_cooldowns_and_resets_the_ladder():
     store = CooldownStore()
-    store.arm(FailoverReason.auth, provider="a", model="m")
-    store.arm(FailoverReason.auth, provider="a", model="m")
+    for _ in range(3):
+        store.arm(FailoverReason.auth, provider="a", model="m")
     store.arm(FailoverReason.quota, provider="q", model="m")
     assert store.clear_reason(FailoverReason.auth) == 1
     assert store.reason_of(provider="q", model="m") is FailoverReason.quota
-    assert store.arm(FailoverReason.auth, provider="a", model="m") == 300
+    assert [store.arm(FailoverReason.auth, provider="a", model="m") for _ in range(2)] == [None, 300]
 
 
 async def test_all_entries_in_auth_cooldown_says_authentication_not_rate_limit():
@@ -330,9 +334,56 @@ async def test_all_entries_in_auth_cooldown_says_authentication_not_rate_limit()
     router, _, _, _ = make([a, b])
     with pytest.raises(ChainExhausted) as first:
         await router.complete(MSGS, [])
-    with pytest.raises(ChainExhausted) as second:  # now both are skipped, nothing is called
+    with pytest.raises(ChainExhausted) as second:  # the second rejection in a row arms both
         await router.complete(MSGS, [])
-    assert (a.calls, b.calls) == (1, 1)
-    for exc in (first.value, second.value):
+    with pytest.raises(ChainExhausted) as third:  # now both are skipped, nothing is called
+        await router.complete(MSGS, [])
+    assert (a.calls, b.calls) == (2, 2)
+    for exc in (first.value, second.value, third.value):
         assert "authentication" in str(exc) and "rate-limited" not in str(exc)
         assert exc.last_reason == "auth" and exc.retry_after is None  # permanent: the retry layer must not park
+
+
+async def test_one_transient_rejection_arms_no_cooldown_two_in_a_row_do():
+    a = Scripted("a", [err401(), "a works", err401(), err401(), "unreachable"])
+    router, store, _, _ = make([a])
+    ident = {"provider": "a", "model": "m", "base_url": "http://a"}
+    with pytest.raises(ChainExhausted):
+        await router.complete(MSGS, [])
+    assert store.reason_of(**ident) is None  # one 401 from a restarting relay: the next prompt is tried
+    assert (await router.complete(MSGS, [])).content == "a works"  # success resets the strike
+    with pytest.raises(ChainExhausted):
+        await router.complete(MSGS, [])
+    assert store.reason_of(**ident) is None  # still only one strike since the success
+    with pytest.raises(ChainExhausted):
+        await router.complete(MSGS, [])
+    assert store.reason_of(**ident) is FailoverReason.auth
+
+
+async def test_a_keyless_entry_never_arms_an_auth_cooldown():
+    a = Scripted("a", [err401()])
+    a.api_key = ""  # claude-cli: logged in with `claude /login`, nothing in the config
+    router, store, _, _ = make([a])
+    for _ in range(3):
+        with pytest.raises(ChainExhausted):
+            await router.complete(MSGS, [])
+    assert a.calls == 3  # tried every time, never skipped
+    assert store.reason_of(provider="a", model="m", base_url="http://a") is None
+
+
+async def test_mixed_rate_limit_and_auth_chain_waits_for_the_reset_instead_of_calling_it_auth():
+    a = Scripted("a", [err429(120)])
+    b = Scripted("b", [err401()])
+    router, _, _, _ = make([a, b])
+    with pytest.raises(ChainExhausted) as exc:
+        await router.complete(MSGS, [])
+    assert "rate-limited" in str(exc.value) and "authentication" not in str(exc.value)
+    assert exc.value.retry_after is not None and 100 < exc.value.retry_after <= 120  # parks, resumes when A resets
+    assert exc.value.last_reason == "auth"
+
+
+async def test_a_chain_where_every_failure_is_auth_still_says_authentication_failed():
+    router, _, _, _ = make([Scripted("a", [err401()]), Scripted("b", [err401()])])
+    with pytest.raises(ChainExhausted) as exc:
+        await router.complete(MSGS, [])
+    assert "authentication failed" in str(exc.value) and exc.value.retry_after is None
