@@ -154,6 +154,18 @@ describe("composer wake-word highlight", () => {
     }
   });
 
+  it("a paste label is a paste: its preview never counts as a wake word", () => {
+    // The gateway is told to skip the paste, so its preview must not make the
+    // typed word look like a second mode, or be painted itself.
+    expect(painted("ultracode [[ ultraplan the rollout [2 lines] ]]")).toEqual([
+      "ultracode",
+      "[[ ultraplan the rollout [2 lines] ]]",
+    ]);
+    expect(painted("see [[ ultracode crashed [9 lines] ]]")).toEqual([
+      "[[ ultracode crashed [9 lines] ]]",
+    ]);
+  });
+
   it("a slash command is a command, not a wake word", () => {
     expect(painted("/ultracode fix the bug")).toEqual(["/ultracode"]);
   });

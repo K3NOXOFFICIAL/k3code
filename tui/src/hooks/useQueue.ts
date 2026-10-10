@@ -5,11 +5,18 @@ import { $uiState, getUiState } from "../app/uiStore.js";
 
 export interface QueueItem {
   display: string;
+  /** Where the user's pastes are in `text` (UTF-16 offsets), sent as `paste_spans` when the item goes out. */
+  pasteSpans?: readonly (readonly [number, number])[];
   text: string;
 }
 
-export const queueItem = (text: string, display = text): QueueItem => ({
+export const queueItem = (
+  text: string,
+  display = text,
+  pasteSpans: readonly (readonly [number, number])[] = [],
+): QueueItem => ({
   display,
+  ...(pasteSpans.length ? { pasteSpans } : {}),
   text,
 });
 
@@ -32,12 +39,22 @@ export function takeQueueItem(
     return item;
   }
 
-  return {
-    display: editedDisplay,
-    text: editedDisplay.includes(item.display)
-      ? editedDisplay.replace(item.display, item.text)
-      : editedDisplay,
-  };
+  const at = editedDisplay.indexOf(item.display);
+
+  if (at < 0) {
+    return { display: editedDisplay, text: editedDisplay };
+  }
+
+  // the edit kept the original: its pastes moved by what was typed before it
+  const text =
+    editedDisplay.slice(0, at) +
+    item.text +
+    editedDisplay.slice(at + item.display.length);
+  return queueItem(
+    text,
+    editedDisplay,
+    (item.pasteSpans ?? []).map(([a, b]) => [a + at, b + at] as const),
+  );
 }
 
 // Mutates `arr` in place; returned reference is the same input array, kept
@@ -130,8 +147,12 @@ export function useQueue() {
   );
 
   const enqueue = useCallback(
-    (text: string, display = text) => {
-      queueRef.current.push(queueItem(text, display));
+    (
+      text: string,
+      display = text,
+      pasteSpans: readonly (readonly [number, number])[] = [],
+    ) => {
+      queueRef.current.push(queueItem(text, display, pasteSpans));
       syncQueue();
     },
     [queueRef, syncQueue],
@@ -145,12 +166,14 @@ export function useQueue() {
     [queueRef, syncQueue],
   );
 
-  const dequeue = useCallback(() => {
-    const head = queueRef.current.shift()?.text;
+  const dequeueItem = useCallback(() => {
+    const head = queueRef.current.shift();
     syncQueue();
 
     return head;
   }, [queueRef, syncQueue]);
+
+  const dequeue = useCallback(() => dequeueItem()?.text, [dequeueItem]);
 
   const takeQ = useCallback(
     (i: number, editedDisplay?: string) => {
@@ -174,6 +197,7 @@ export function useQueue() {
 
   return {
     dequeue,
+    dequeueItem,
     enqueue,
     prependQ,
     queueEditIdx,

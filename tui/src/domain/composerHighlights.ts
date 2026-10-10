@@ -39,10 +39,14 @@ const matchSpans = (text: string, re: RegExp): Span[] =>
     .map((m) => ({ end: (m.index ?? 0) + m[0].length, start: m.index ?? 0 }));
 
 // The one wake word the gateway will act on (not quoted, not in a path or code,
-// not a second mode in the same prompt), so the accent never promises a run the
-// gateway would skip.
-const wakeSpans = (text: string): Span[] => {
-  const hit = detectWakeWord(text);
+// not a second mode in the same prompt, not in a paste), so the accent never
+// promises a run the gateway would skip. A `[[ … ]]` label stands for a paste
+// the gateway is told to skip, so a word in the label's preview is skipped too.
+const wakeSpans = (text: string, pastes: Span[]): Span[] => {
+  const hit = detectWakeWord(
+    text,
+    pastes.map((span) => [span.start, span.end]),
+  );
 
   return hit ? [{ end: hit.end, start: hit.start }] : [];
 };
@@ -51,11 +55,12 @@ export const splitComposerHighlights = (text: string): ComposerHighlight[] => {
   // Tokens, then @refs, then slashes, then the wake word: on an overlap the
   // earlier kind wins, so a slash inside a quoted ref value stays part of that
   // ref.
+  const tokens = matchSpans(text, tokenRe());
   const spans = [
-    ...matchSpans(text, tokenRe()),
+    ...tokens,
     ...matchSpans(text, atRe()),
     ...matchSpans(text, slashRe()),
-    ...wakeSpans(text),
+    ...wakeSpans(text, tokens),
   ]
     .sort((a, b) => a.start - b.start)
     .reduce<Span[]>((kept, span) => {
