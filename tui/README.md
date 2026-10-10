@@ -159,6 +159,7 @@ Current input behavior is split across `app.tsx`, `components/textInput.tsx`, an
 | `Ctrl+D`                    | Exit                                                                                                                                                    |
 | `Cmd/Ctrl+G` / `Alt+G`      | Open `$EDITOR` with the current draft (use `Alt+G` in VSCode/Cursor — they bind the primary keystroke to Find Next)                                     |
 | `Ctrl+L`                    | New session (same as `/clear`)                                                                                                                          |
+| `Ctrl+O`                    | Open the Tune popup (same as `/tune`): model, reasoning effort and ultracode in one place                                                               |
 | `Ctrl+V` / `Alt+V`          | Paste text first, then fall back to image/path attachment when applicable                                                                               |
 | `Tab`                       | Apply the active completion                                                                                                                             |
 | `Up/Down`                   | Cycle completions if the completion list is open; otherwise edit queued messages first, then walk input history                                         |
@@ -182,6 +183,9 @@ Notes:
 - `Tab` only applies completions when completions are present and you are not in multiline mode.
 - Queue/history navigation only applies when you are not in multiline mode.
 - `PgUp` / `PgDn` are left to the terminal emulator; the TUI does not handle them.
+- A wake word (`ultracode`, `ultraplan`, ...) is painted in the accent colour when the gateway would act on it: the
+  composer judges every line of a multi-line draft as one prompt, skips text inside a paste, and never paints a mode
+  that `wake_words` in `config.yaml` switched off.
 
 ### Prompt and picker modes
 
@@ -199,6 +203,11 @@ Notes:
 | resume picker               | `Up/Down`, `Enter`  | Move and resume the selected session              |
 | resume picker               | `1-9`               | Quick-pick one of the first nine visible sessions |
 | resume picker               | `Esc`, `Ctrl+C`     | Close the picker                                  |
+| Tune popup (`/tune`)        | `Up/Down`           | Highlight a model                                 |
+| Tune popup                  | `Left/Right`        | Reasoning effort                                  |
+| Tune popup                  | `Tab`               | Toggle ultracode                                  |
+| Tune popup                  | `Enter`, `s`        | Apply as the default, or for this session only    |
+| Tune popup                  | `Esc`, `Ctrl+C`     | Close without applying                            |
 
 Notes:
 
@@ -268,6 +277,12 @@ The following commands are handled directly by the TUI client. Unrecognized comm
 `/bg`, `/btw`, `/image`, `/personality`,
 `/compress`, `/branch` (alias `/fork`), `/voice`, `/skin`,
 `/indicator`, `/yolo`, `/reasoning`, `/fast`, `/busy`, `/verbose`, `/usage`
+
+### Tune (`tune.ts`)
+
+`/tune` — the Tune popup (also `Ctrl+O`): model, reasoning effort and ultracode.
+A bare `/model` or `/effort` opens the same popup, not the provider/key picker;
+`/model --refresh` still opens the provider picker.
 
 ### Ops (`ops.ts`)
 
@@ -417,6 +432,7 @@ ui-tui/
       maskedPrompt.tsx           masked input for sudo / secrets
       messageLine.tsx            transcript rows
       modelPicker.tsx            model switch picker
+      tunePicker.tsx             Tune popup: model, effort and ultracode (/tune, Ctrl+O)
       overlayControls.tsx        shared overlay control buttons
       pluginsHub.tsx             plugins hub overlay
       prompts.tsx                approval + clarify flows
