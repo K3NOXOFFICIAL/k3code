@@ -1564,8 +1564,10 @@ class GatewayServer:
         effort_mod.REASONING_EFFORT.set(session.reasoning_effort)  # /effort, read by the providers
         prompt = text
         mgr = self.goal_manager(session)
+        # the prompt the user sent is not a continuation: clear the flag first, a turn that ended after a continuation
+        # leaves it set and a queued prompt drained next would get no implicit goal
+        session.goal_continuation = False
         self._start_implicit_goal(session, mgr, text)
-        session.goal_continuation = False  # the prompt the user sent is not a continuation
         while True:
             try:
                 await self._maybe_compact(session)

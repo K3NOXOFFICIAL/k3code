@@ -708,8 +708,10 @@ def _reply_from_result(result: dict[str, Any], tools: list[ToolSpec]) -> tuple[s
 def _mirrors_reply(result: dict[str, Any], tools: list[ToolSpec]) -> bool:
     """Whether the process's own copy of its reply (the raw ``result`` text it keeps in its history) is what k3code
     keeps: the text before the first tool block, then the blocks, each of which parsed to at least one call, with
-    nothing but whitespace between or after them. Anything else (prose after a block, an invalid block k3code
-    strips) means k3code's history now differs from the process's, so the process must not be reused."""
+    nothing but whitespace between or after them. Anything else (prose after a block, a block with no call in it)
+    means k3code's history now differs from the process's, so the process must not be reused. A block that is not
+    valid JSON parses to one ``invalid_tool_call``: the process keeps the same raw text and is sent the loop's error
+    result as its next message, so it is reused and retries from there."""
     raw = str(result.get("result") or "")
     if not tools:
         return True  # the whole text is kept
