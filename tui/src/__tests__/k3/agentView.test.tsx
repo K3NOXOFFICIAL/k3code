@@ -155,31 +155,6 @@ describe("AgentViewView", () => {
     expect(order).toEqual([...order].sort((a, b) => a - b));
   });
 
-  it("times this session's working turn from turn_started_at, not from the session's creation", () => {
-    // The reported bug: a session created ~23h ago read "working 1370m 20s" five minutes into the app.
-    const nowMs = Date.now();
-    const rows = buildViewRows({
-      currentSid: "cur",
-      nowMs,
-      past: [],
-      sessions: [
-        {
-          current: true,
-          id: "cur",
-          started_at: nowMs / 1000 - 1370 * 60,
-          status: "working",
-          title: "Session",
-          turn_started_at: nowMs / 1000 - 20,
-        },
-      ],
-      subagents: [],
-    });
-    const out = dump(rows);
-
-    expect(out).toMatch(/◐ Session \(this session\)\s+working 20s/);
-    expect(out).not.toContain("1370m");
-  });
-
   it("omits headers of empty groups", () => {
     const out = dump([row(1)]);
 
@@ -238,6 +213,33 @@ describe("AgentViewView", () => {
     expect(bottom).toContain("↑ 24 more");
     expect(bottom).not.toMatch(/↓ \d+ more/);
     expect(listLines(bottom).length).toBeLessThanOrEqual(height);
+  });
+});
+
+describe("buildViewRows", () => {
+  it("times this session's working turn from turn_started_at, not from the session's creation", () => {
+    // The reported bug: a session created ~23h ago read "working 1370m 20s" five minutes into the app.
+    const nowMs = Date.now();
+    const rows = buildViewRows({
+      currentSid: "cur",
+      nowMs,
+      past: [],
+      sessions: [
+        {
+          current: true,
+          id: "cur",
+          started_at: nowMs / 1000 - 1370 * 60,
+          status: "working",
+          title: "Session",
+          turn_started_at: nowMs / 1000 - 20,
+        },
+      ],
+      subagents: [],
+    });
+    const out = dump(rows);
+
+    expect(out).toMatch(/◐ Session \(this session\)\s+working 20s/);
+    expect(out).not.toContain("1370m");
   });
 });
 
