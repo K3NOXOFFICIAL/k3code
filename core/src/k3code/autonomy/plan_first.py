@@ -229,6 +229,7 @@ class PlanFirst:
             task_kind=TaskKind.PLAN,
         )
         loop.hooks = userhooks.load(session.perms.cwd, sid)  # the planner's read tools see the user's hooks too
+        loop.max_turns_stop_message = False  # its last text is taken as the plan: a stop notice is not one
         session.current_kind = TaskKind.PLAN.value
         session.emit("status.update", {"kind": "status", "text": "planning", "state": "working"})
         prompt = f"Task:\n{text}\n\nScope: {verdict.scope}. Risk: {verdict.risk}. {verdict.reason}"

@@ -188,6 +188,11 @@ class LiveSession:
         self.steer_queue: list[str] = []
         #: tool call ids of the model call in flight already announced with tool.start (see _announce_tool)
         self.announced_tools: set[str] = set()
+        #: monotonic start of the model call in flight (its first router attempt), and the moment the loop began its
+        #: next tool (the model call's end, then each tool's end: it runs them one after another), so the ``call`` /
+        #: ``tool`` usage rows carry their wall time (``k3code stats`` shows where time goes)
+        self.call_started: float | None = None
+        self.tool_mark: float | None = None
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
         #: Wall-clock start of the latest turn or job (time.time()); the agent view's "working N" counts from it.
@@ -1448,6 +1453,11 @@ class GatewayServer:
             if sess is not None:
                 sess.last_entry = (event.provider, event.model)
                 sess.last_tier = str(event.extra.get("tier", "main"))
+                # Retries and failovers of one call count towards its time. Only a turn's own model calls are timed: a
+                # side call after the turn (goal judge, auto-title) has no `call` row to close it, so its start would
+                # stay armed and the next prompt's first row would include that call and the user's idle time.
+                if sess.streaming and sess.call_started is None:
+                    sess.call_started = time.monotonic()
         elif event.kind == "router.retry":
             self.usage.record("retry", session=sid, provider=event.provider, model=event.model, detail=event.reason)
         elif event.kind == "router.failover":
@@ -1460,6 +1470,8 @@ class GatewayServer:
                 },
             )
         elif event.kind == "router.exhausted":
+            if sess is not None:
+                sess.call_started = None  # the failed call produces no row; the next one starts afresh
             # No error event here: the failed turn's message.complete reports it once, with the next step
             # (error_surface). A walk that is retried after a pause or park must not leave a stale error behind.
             self.emit("status.update", {"kind": "status", "text": f"all providers failed ({event.reason})"})
@@ -1552,6 +1564,7 @@ class GatewayServer:
         effort_mod.REASONING_EFFORT.set(session.reasoning_effort)  # /effort, read by the providers
         prompt = text
         mgr = self.goal_manager(session)
+        self._start_implicit_goal(session, mgr, text)
         session.goal_continuation = False  # the prompt the user sent is not a continuation
         while True:
             try:
@@ -1576,9 +1589,17 @@ class GatewayServer:
                 self._block_goal_for(session, status)  # an active goal never ends silently
                 self._session_finished(session, status)
                 return status, final_text
+            implicit = bool((state := mgr.state) and state.implicit)
+            if implicit and self._pending_prompts(session):
+                mgr.clear()  # the user typed the next prompt meanwhile: it replaces this one, unjudged
+                self.emit_goal(session)
+                self._session_finished(session, status)
+                return status, final_text
             judge = self.goal_judge or make_judge(self._goal_completer(session))
+            # no strong-tier advisor veto on an implicit goal: it would review every answered question
+            reviewer = None if implicit else self._goal_reviewer(session)
             decision = await mgr.evaluate_after_turn(
-                final_text, judge, cwd=session.stored.cwd or None, reviewer=self._goal_reviewer(session)
+                final_text, judge, cwd=session.stored.cwd or None, reviewer=reviewer
             )
             self.emit_goal(session)
             if decision.message:
@@ -1591,6 +1612,28 @@ class GatewayServer:
             prompt = decision.prompt
             session.goal_continuation = True  # unattended from here on: the goal drives the next turn
 
+    def _start_implicit_goal(self, session: LiveSession, mgr: GoalManager, text: str) -> None:
+        """``autonomy.auto_continue``: an interactive prompt becomes the goal of its own turn loop, judged after each
+        turn like a /goal, so a model that stops early is sent on until the judge says done or blocked.
+
+        Only an attended prompt the user typed qualifies: background, cron, loop and automation turns
+        (``session.background``/``task_kind``) and goal continuations do not. A /goal, active or paused, is the
+        user's own and wins: a paused one waits for /goal resume, and the answer typed meanwhile must not erase it.
+        A leftover implicit goal (a daemon that died mid-loop) is replaced, or cleared with the setting off.
+        """
+        if session.background or session.task_kind or session.goal_continuation:
+            return
+        state = mgr.state
+        if state is not None and not state.implicit and state.status in ("active", "paused"):
+            return
+        if autonomy_cfg(self.config).get("auto_continue"):
+            mgr.set(text, implicit=True)
+        elif state is not None and state.implicit:
+            mgr.clear()
+        else:
+            return
+        self.emit_goal(session)
+
     def _block_goal_for(self, session: LiveSession, status: str) -> None:
         """A turn that did not finish leaves its active goal paused, with the reason and one notification.
 
@@ -1599,6 +1642,10 @@ class GatewayServer:
         """
         mgr = self.goal_manager(session)
         if not mgr.is_active():
+            return
+        if (state := mgr.state) is not None and state.implicit:
+            mgr.clear()  # an implicit goal ends with its turn: no pause, no "/goal resume" notice (GoalState.implicit)
+            self.emit_goal(session)
             return
         if status == "needs_input":
             reason, text = "needs_input", "Goal needs your input before it can continue. Answer, then /goal resume."
@@ -1744,6 +1791,9 @@ class GatewayServer:
         )
         tier = tier_for(kind, self.config.task_tiers)
         cheap_start = tier in (Tier.FAST, Tier.CHEAP)
+        # A turn that starts on main climbs once to strong when it stalls ("never stop until the task is done"); only
+        # a stall there ends the turn with needs_input. ``autonomy.escalate_main: false`` keeps main as the last tier.
+        main_climbs = tier is Tier.MAIN and bool(autonomy_cfg(self.config).get("escalate_main", True))
         main_errors = int(autonomy_cfg(self.config)["max_tool_errors"])  # a main-tier turn stops after this many
         max_errors = int(autonomy_cfg(self.config)["escalate"]["tool_errors"]) if cheap_start else main_errors
         escalation = Escalation(tier, thresholds={"tool_errors": 1, "loop_guard": 1})  # the loop counted already
@@ -1764,7 +1814,7 @@ class GatewayServer:
             kind,
             approval,
             max_tool_errors=max_errors,
-            escalates=cheap_start,
+            escalates=cheap_start or main_climbs,
         )
         session.loop = loop
 
@@ -1808,7 +1858,7 @@ class GatewayServer:
             ):
                 # A trivial task is "unimportant work": start it on the cheap tier. The loop escalates to main when the
                 # attempt stalls (tool errors, loop guard), so a task the cheap model cannot do still gets done.
-                tier, cheap_start = Tier.CHEAP, True
+                tier, cheap_start, main_climbs = Tier.CHEAP, True, False
                 max_errors = int(acfg["escalate"]["tool_errors"])
                 escalation = Escalation(tier, thresholds={"tool_errors": 1, "loop_guard": 1})
                 loop = self._build_loop(
@@ -1863,14 +1913,18 @@ class GatewayServer:
                         task_kind=kind.value,
                         turn=session.turn_id,
                     )
-                new_tier = escalation.record(attempt_reason) if cheap_start and attempt_reason else None
-                if new_tier is None and attempt_reason == "tool_errors" and not loop.interrupted:
-                    # the loop stopped after N failed calls in a row and listed them: the user decides how to go on
-                    # (ending 'done' let an active goal judge it and continue into the same failures)
+                climbs = cheap_start or (main_climbs and tier is Tier.MAIN)
+                # the max_turns cap is the user's limit on the task, not a stall: no tier gets a fresh round of calls
+                stalled = attempt_reason and attempt_reason != "max_turns"
+                new_tier = escalation.record(attempt_reason) if climbs and stalled else None
+                if new_tier is None and attempt_reason in ("tool_errors", "max_turns") and not loop.interrupted:
+                    # the loop stopped after N failed calls in a row (and listed them) or at the configured max_turns
+                    # cap (and said so): the user decides how to go on (ending 'done' let an active goal judge it and
+                    # continue into the same failures, and a capped task looked finished)
                     session.needs_input = True
                 if new_tier is None or loop.interrupted:
                     break
-                # The attempt stalled on a cheap tier: continue the same task one tier up.
+                # The attempt stalled on a cheap tier (or on main, see main_climbs): continue the same task one tier up.
                 reason = attempt_reason or "unknown"
                 self.model_caller.note_escalation(kind, tier, new_tier, reason, session.session_id)
                 tier = new_tier
@@ -1925,6 +1979,7 @@ class GatewayServer:
             session.emit("error", {"message": str(e)})
         finally:
             session.streaming = False
+            session.call_started = None  # a call cut short by /stop or an error has no row to close it
             session.idle_since = time.monotonic()
             # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
             # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
@@ -2078,7 +2133,6 @@ class GatewayServer:
         session.announced_tools.add(tc.id)
         session.emit("tool.generating", {"name": tc.name})
         session.emit("tool.start", {"tool_id": tc.id, "name": tc.name, "args": tc.arguments})
-        self.usage.record("tool", session=session.session_id, detail=tc.name)
 
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
@@ -2086,6 +2140,14 @@ class GatewayServer:
         elif event.type == "done" and event.message:
             msg = event.message
             if msg.role == "tool":
+                now = time.monotonic()
+                self.usage.record(
+                    "tool",
+                    session=session.session_id,
+                    detail=msg.name or "",
+                    seconds=now - session.tool_mark if session.tool_mark is not None else 0.0,
+                )
+                session.tool_mark = now
                 self._checkpoint_turn(session)
                 payload = {
                     "tool_id": msg.tool_call_id or "",
@@ -2112,7 +2174,10 @@ class GatewayServer:
                     tier=session.last_tier,
                     task_kind=session.current_kind,
                     turn=session.turn_id,
+                    seconds=time.monotonic() - session.call_started if session.call_started is not None else 0.0,
                 )
+                session.call_started = None
+                session.tool_mark = time.monotonic()  # the loop executes the tool calls right after this message
                 if u:
                     session.emit("session.usage", {"usage": _usage_payload(u)})
                 # openai_compat and anthropic stream no tool_call events: their calls arrive on this message only
@@ -2341,6 +2406,10 @@ class GatewayServer:
             return False
         if live.turn_in_flight:
             return False  # a live turn is working on it already
+        if goal.implicit:  # its turn loop is gone (the daemon died mid-loop): the prompt is not re-run unasked
+            mgr.clear()
+            self.emit_goal(live)
+            return False
         now = time.time()
         if len(mgr.recent_kicks(now)) >= MAX_KICKS_PER_WINDOW:
             mgr.pause(f"parked: {MAX_KICKS_PER_WINDOW} automatic kicks in 1 h")
@@ -2570,6 +2639,7 @@ class GatewayServer:
                 session.emit("error", {"message": text})
             finally:
                 session.streaming = False
+                session.call_started = None
                 self.subagents.interrupt_session(session.session_id)  # nothing may outlive the job
             # same mapping as _run_one_turn, set before the closing events carry session.state
             session.run_result = {"done": "completed", "interrupted": "completed"}.get(status, "failed")

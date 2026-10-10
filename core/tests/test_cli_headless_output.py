@@ -7,12 +7,12 @@ import sys
 from pathlib import Path
 
 
-def _run(tmp_path: Path, steps: list[dict]) -> subprocess.CompletedProcess[str]:
+def _run(tmp_path: Path, steps: list[dict], extra_config: str = "") -> subprocess.CompletedProcess[str]:
     home = tmp_path / "k3home"
     home.mkdir()
     (home / "config.yaml").write_text(
         "providers:\n- name: fake\n  kind: openai\n  base_url: http://fake\n  api_key_env: K3_TEST_KEY\n"
-        "  models: {default: m}\npermission_mode: yolo\n"
+        "  models: {default: m}\npermission_mode: yolo\n" + extra_config
     )
     script = tmp_path / "script.json"
     script.write_text(json.dumps(steps))
@@ -37,3 +37,12 @@ def test_a_failed_headless_run_names_the_error_on_stderr(tmp_path):
     assert res.returncode == 1
     assert "k3code: error:" in res.stderr and "Invalid API key" in res.stderr
     assert res.stdout == ""
+
+
+def test_a_headless_run_stopped_by_the_max_turns_cap_fails_and_says_why(tmp_path):
+    # the fake provider calls a tool on every request: only the configured cap ends the run
+    step = {"type": "tool_call", "id": "c1", "name": "glob", "arguments": {"pattern": "*.nothing"}}
+    res = _run(tmp_path, [step], extra_config="max_turns: 2\n")
+    assert res.returncode == 1, res.stderr
+    assert "k3code: error: stopped after 2 model calls (the max_turns cap" in res.stderr
+    assert "I stopped after 2 model calls" in res.stdout

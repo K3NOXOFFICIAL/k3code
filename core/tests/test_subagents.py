@@ -431,3 +431,29 @@ async def test_escape_git_in_a_sub_agent_worktree_reads_but_cannot_write_the_sha
     assert "git-reads-ok" in res["stdout"]  # git works in the linked worktree
     assert "wrote=0" not in res["stdout"]  # but the hooks dir every worktree shares is read-only
     assert not (repo / ".git" / "hooks" / "post-commit").exists()
+
+
+async def test_a_sub_agent_stops_at_its_own_cap_when_the_global_cap_is_unlimited(tmp_path, monkeypatch):
+    """max_turns defaults to 0 (unlimited); a sub-agent nobody watches still gets subagents.max_turns, and the
+    parent's result says the cap stopped it."""
+    steps = [
+        task_call("CHILD-A keep going"),
+        final("parent done"),
+        {"type": "tool_call", "match": "[agent:worker]", "name": "bash", "arguments": {"command": "true"}},
+    ]
+    server = make(tmp_path, monkeypatch, steps, subagents={"max_turns": 3}, **NO_GATE)
+    assert server.config.max_turns == 0
+    await start(server, tmp_path)
+    await run_turn(server, "PARENT: delegate it")
+    result = last_tool_result(server)
+    assert "max_turns" in result and "3 model calls" in result
+
+
+def test_child_max_turns_takes_the_smaller_positive_cap():
+    from k3code.config import Settings
+    from k3code.subagents.runner import _child_max_turns
+
+    assert _child_max_turns(Settings()) == 200
+    assert _child_max_turns(Settings(max_turns=50)) == 50
+    assert _child_max_turns(Settings(max_turns=500)) == 200
+    assert _child_max_turns(Settings(subagents={"max_turns": 7})) == 7

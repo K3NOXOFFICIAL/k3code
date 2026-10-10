@@ -11,7 +11,7 @@ from click.testing import CliRunner
 
 from k3code import cli as cli_mod
 from k3code import trust
-from k3code.config import load_config
+from k3code.config import Settings, load_config
 from k3code.permissions.rules import Rule
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
 
@@ -62,7 +62,7 @@ def _interactive_open(monkeypatch, project: Path, answer: str):
 
 def test_untrusted_project_config_is_ignored(project: Path) -> None:
     cfg = load_config(project_dir=project)
-    assert cfg.max_turns == 20
+    assert cfg.max_turns == Settings().max_turns  # the default: the untrusted value was ignored
     assert cfg.providers == []
     assert cfg.permissions == {}
     assert cfg.mcp.servers == {}
@@ -146,7 +146,7 @@ def test_trust_command_shows_the_changes_without_secrets_and_revoke_works(projec
     revoked = runner.invoke(cli_mod.cli, ["trust", str(project), "--revoke"])
     assert "trust revoked" in revoked.output
     assert trust.decision(project) == trust.UNDECIDED
-    assert load_config(project_dir=project).max_turns == 20
+    assert load_config(project_dir=project).max_turns == Settings().max_turns
 
     again = runner.invoke(cli_mod.cli, ["trust", str(project), "--revoke"])
     assert "no trust answer" in again.output

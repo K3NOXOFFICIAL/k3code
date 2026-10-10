@@ -17,6 +17,7 @@ from k3code.providers.types import (
     StreamEvent,
     ToolCall,
     ToolSpec,
+    Usage,
     messages_to_anthropic,
     with_cache_breakpoint,
 )
@@ -116,6 +117,7 @@ class AnthropicProvider(Provider):
             # tool index -> {"id", "name", "args"}
             tool_blocks: dict[int, dict[str, Any]] = {}
             usage_in = usage_out = cache_read = cache_creation = 0
+            stop_reason: str | None = None  # message_delta.delta.stop_reason: end_turn, tool_use, max_tokens, ...
             complete = False  # message_stop arrived
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
@@ -162,13 +164,12 @@ class AnthropicProvider(Provider):
                 elif etype == "message_delta":
                     usage = event.get("usage") or {}
                     usage_out = int(usage.get("output_tokens") or 0)
+                    stop_reason = (event.get("delta") or {}).get("stop_reason") or stop_reason
             if not complete:
                 raise to_provider_error(
                     httpx.RemoteProtocolError("peer closed connection: stream ended before message_stop"),
                     kind="anthropic",
                 )
-            from k3code.providers.types import Usage
-
             usage = Usage(
                 prompt_tokens=usage_in,
                 completion_tokens=usage_out,
@@ -189,6 +190,7 @@ class AnthropicProvider(Provider):
                 content="".join(content_parts) or None,
                 tool_calls=final_calls,
                 usage=usage,
+                stop_reason=stop_reason,
             )
             yield StreamEvent(type="done", message=final, usage=usage)
         except httpx.HTTPError as exc:

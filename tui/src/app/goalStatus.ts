@@ -46,7 +46,11 @@ export function goalLine(goal: GoalSnapshot | null): GoalLine | null {
     return null;
   }
 
-  const turns = `${goal.turns_used}/${goal.max_turns} turns`;
+  const turns =
+    goal.max_turns > 0
+      ? `${goal.turns_used}/${goal.max_turns} turns`
+      : `${goal.turns_used} turns`;
+  const auto = goal.implicit ? "↻ auto " : "";
   const barrier = goal.status === "active" ? goal.wait_barrier : null;
 
   if (barrier) {
@@ -59,7 +63,7 @@ export function goalLine(goal: GoalSnapshot | null): GoalLine | null {
     return {
       detail: `${until}${reason} · ${turns}`,
       glyph: "⏳",
-      label: "goal parked",
+      label: `${auto}goal parked`,
       title: goal.title,
     };
   }
@@ -70,12 +74,12 @@ export function goalLine(goal: GoalSnapshot | null): GoalLine | null {
     return {
       detail: `${reason}${turns}`,
       glyph: "⏸",
-      label: "goal paused",
+      label: `${auto}goal paused`,
       title: goal.title,
     };
   }
 
-  return { detail: turns, glyph: "⊙", label: "goal", title: goal.title };
+  return { detail: turns, glyph: "⊙", label: `${auto}goal`, title: goal.title };
 }
 
 export function useGoalLine(): GoalLine | null {

@@ -9,6 +9,9 @@ Rules (from the M0 task spec):
 - A Retry-After longer than ``max_inline_wait`` (default 20 s) never sleeps inline: the entry goes
   into cooldown until the reset and the walk fails over at once. Quota errors do the same, with
   ``quota_cooldown`` (default 1 h) when the provider declares no reset.
+- A second auth failure in a row also arms a cooldown (300 s, doubling per strike, capped at 1 h) keyed to the
+  rejected credential (never for a keyless entry such as claude-cli; one transient 401 arms nothing):
+  later calls skip the dead entry at once, and a replaced key is tried immediately.
 - context_overflow: raise :class:`ContextOverflow` — the loop compacts later.
 - When every entry in the chain has failed: :class:`AllProvidersUnreachable` if
   every failure was a network error, otherwise :class:`ChainExhausted` (carrying
@@ -28,7 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,7 +44,7 @@ from k3code.router.classifier import (
     classify_api_error,
     summarize,
 )
-from k3code.router.cooldown import CooldownStore
+from k3code.router.cooldown import CooldownStore, key_fingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +67,16 @@ class ChainEntry:
     @property
     def base_url(self) -> str:
         return getattr(self.provider, "base_url", "") or ""
+
+    @property
+    def key_fingerprint(self) -> str:
+        """Fingerprint of the entry's current credential: an auth cooldown only applies to the key it was armed for."""
+        return key_fingerprint(getattr(self.provider, "api_key", ""))
+
+    @property
+    def keyless(self) -> bool:
+        """No API key configured (claude-cli): a rejection is fixed by logging in, which no cooldown could notice."""
+        return not getattr(self.provider, "api_key", "")
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -217,6 +230,8 @@ class Router:
         last_detail = ""
         failure_hint = ""  # a TLS hint outlives the failovers that follow it: it is what the user must fix
         all_network = True  # tracks "every failure so far was a network failure"
+        all_auth = True  # tracks "every failure and every cooldown seen so far was an auth rejection"
+        auth_failed: set[int] = set()  # entries rejected in this walk (a first rejection arms no cooldown)
         entry_index = 0
         while entry_index < len(self.chain):
             entry = self.chain[entry_index]
@@ -231,11 +246,15 @@ class Router:
                     "cooldown",
                 )
                 cooled = self.cooldowns.reason_of(
-                    provider=entry.provider_name, model=target_model, base_url=entry.base_url
+                    provider=entry.provider_name,
+                    model=target_model,
+                    base_url=entry.base_url,
+                    fingerprint=entry.key_fingerprint,
                 )
                 if cooled is not None:
                     last_reason = cooled
                     all_network = all_network and cooled is FailoverReason.network
+                    all_auth = all_auth and cooled is FailoverReason.auth
                 entry_index += 1
                 continue
             attempt = 0
@@ -260,6 +279,9 @@ class Router:
                     last_detail = summarize(exc)
                     failure_hint = classified.hint or failure_hint
                     all_network = all_network and classified.reason is FailoverReason.network
+                    all_auth = all_auth and classified.reason is FailoverReason.auth
+                    if classified.reason is FailoverReason.auth:
+                        auth_failed.add(entry_index)
                     if classified.reason is FailoverReason.context_overflow:
                         raise ContextOverflow(summarize(exc, limit=500)) from exc
                     if streamed:
@@ -311,7 +333,17 @@ class Router:
                 "all provider entries are unreachable (network errors)", attempts=len(self.chain)
             )
         reason_name = last_reason.value if last_reason else "unknown"
-        wait = self.earliest_reset(model)
+        wait = self.earliest_reset(model, auth_failed=auth_failed)
+        if last_reason is FailoverReason.auth and all_auth:
+            # Not a rate limit: waiting does not help, only a new key does (the entries are cooling down so the next
+            # call does not hammer them). No retry_after, so the persistent retry layer fails now instead of parking.
+            # A chain that also saw a rate limit falls through to the wait below: that entry resets by itself.
+            detail = f": {last_detail}" if last_detail else ""
+            raise ChainExhausted(
+                f"provider authentication failed (last reason: auth){detail}. Hint: check the API keys "
+                "with `k3code doctor`",
+                last_reason=reason_name,
+            )
         if wait is not None:
             until = self.cooldowns.wall() + wait
             clock = time.strftime("%H:%M", time.localtime(until))
@@ -338,20 +370,34 @@ class Router:
             return float(declared)
         return None
 
-    def earliest_reset(self, model: str | None = None) -> float | None:
+    def earliest_reset(self, model: str | None = None, *, auth_failed: Collection[int] = ()) -> float | None:
         """Seconds until the first chain entry leaves cooldown, when *every* entry is cooling down. ``model`` is the
-        override the walk runs the first entry with: cooldowns are keyed by the model actually called."""
+        override the walk runs the first entry with: cooldowns are keyed by the model actually called.
+        ``auth_failed`` are the chain indices the walk just saw rejected (a first rejection arms no cooldown): waiting
+        on the others still makes sense, those entries only come back with a new key."""
         if not self.chain or self.cooldowns is None:
             return None
         remaining = []
+        auth_remaining = []  # auth cooldowns only end with a new key: they must not set the "until" of a rate limit
         for index, entry in enumerate(self.chain):
             target = model if index == 0 and model else entry.model
-            if not self.cooldowns.in_cooldown(provider=entry.provider_name, model=target, base_url=entry.base_url):
+            fp = entry.key_fingerprint
+            if not self.cooldowns.in_cooldown(
+                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+            ):
+                if index in auth_failed:
+                    continue
                 return None
-            remaining.append(
-                self.cooldowns.remaining_seconds(provider=entry.provider_name, model=target, base_url=entry.base_url)
+            left = self.cooldowns.remaining_seconds(
+                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
             )
-        return min(remaining)
+            cooled = self.cooldowns.reason_of(
+                provider=entry.provider_name, model=target, base_url=entry.base_url, fingerprint=fp
+            )
+            (auth_remaining if cooled is FailoverReason.auth else remaining).append(left)
+        if not (remaining or auth_remaining):
+            return None
+        return min(remaining or auth_remaining)
 
     def _backoff_for(self, classified, attempt: int) -> float:
         """Jittered backoff, or the Retry-After window (when short enough to sleep on)."""
@@ -362,8 +408,13 @@ class Router:
     def _skip_in_cooldown(self, entry: ChainEntry, model: str) -> float | None:
         if self.cooldowns is None:
             return None
-        if self.cooldowns.in_cooldown(provider=entry.provider_name, model=model, base_url=entry.base_url):
-            return self.cooldowns.remaining_seconds(provider=entry.provider_name, model=model, base_url=entry.base_url)
+        fp = entry.key_fingerprint
+        if self.cooldowns.in_cooldown(
+            provider=entry.provider_name, model=model, base_url=entry.base_url, fingerprint=fp
+        ):
+            return self.cooldowns.remaining_seconds(
+                provider=entry.provider_name, model=model, base_url=entry.base_url, fingerprint=fp
+            )
         return None
 
     def _failover(
@@ -385,6 +436,8 @@ class Router:
             model=target_model,
             base_url=entry.base_url,
             retry_after=retry_after,
+            fingerprint=entry.key_fingerprint,
+            keyless=entry.keyless,
         )
         if retry_after is not None and armed:
             self._emit(
