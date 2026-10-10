@@ -38,6 +38,7 @@ import {
 import {
   $isBlocked,
   $overlayState,
+  openTunePicker,
   patchOverlayState,
 } from "./overlayStore.js";
 import { respondToServerRequest } from "./serverRequestStore.js";
@@ -137,6 +138,7 @@ const CTRL_C_ORDER = [
   "sudo",
   "secret",
   "modelPicker",
+  "tunePicker",
   "skillsHub",
   "pluginsHub",
   "sessions",
@@ -329,6 +331,8 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         return dismissSensitivePrompt(overlay, gateway.rpc, actions.sys);
       case "modelPicker":
         return patchOverlayState({ modelPicker: false });
+      case "tunePicker":
+        return patchOverlayState({ tunePicker: false });
       case "skillsHub":
         return patchOverlayState({ skillsHub: false });
       case "pluginsHub":
@@ -844,17 +848,19 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return;
     }
 
-    // Ctrl+O opens the model picker without disturbing a typed draft — the
-    // same overlay `/model` opens, but reachable without clearing what you've
-    // typed to run the command. Works mid-stream: picking a model writes the
-    // session model (config.set), which the next turn reads while the in-flight
-    // turn keeps streaming.
+    // Ctrl+O opens the /tune popup (model, effort, ultracode) without
+    // disturbing a typed draft — the same overlay bare `/model` and `/effort`
+    // open, but reachable without clearing what you've typed to run the
+    // command. Works mid-stream: tune.set writes the session's model / effort /
+    // mode, which the next turn reads while the in-flight turn keeps streaming.
     if (isCtrl(key, ch, "t")) {
       return patchOverlayState({ agents: true, agentsInitialHistoryIndex: 0 });
     }
 
     if (isCtrl(key, ch, "o")) {
-      return patchOverlayState({ modelPicker: true });
+      openTunePicker();
+
+      return;
     }
 
     if (key.ctrl && ch.toLowerCase() === "c") {

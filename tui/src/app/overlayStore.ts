@@ -21,6 +21,7 @@ const buildOverlayState = (): OverlayState => ({
   sessions: false,
   skillsHub: false,
   sudo: null,
+  tunePicker: false,
 });
 
 export const $overlayState = atom<OverlayState>(buildOverlayState());
@@ -41,6 +42,7 @@ export const $isBlocked = computed(
     sessions,
     skillsHub,
     sudo,
+    tunePicker,
     widget,
   }) =>
     Boolean(
@@ -57,6 +59,7 @@ export const $isBlocked = computed(
       sessions ||
       skillsHub ||
       sudo ||
+      tunePicker ||
       widget,
     ),
 );
@@ -76,7 +79,7 @@ export const $isBlocked = computed(
  *   (`ActiveWidgetSlot`, `sdk/host.tsx:209`, outside the ComposerPane
  *   subtree) so it can anchor the full-screen absolute `Overlay`
  *   (`components/overlay.tsx`) against the whole terminal.
- * - The FloatingOverlays set — `modelPicker`, `pager`,
+ * - The FloatingOverlays set — `modelPicker`, `tunePicker`, `pager`,
  *   `sessions`, `skillsHub`, `pluginsHub` — but ONLY when the rule sits at
  *   the top.  That panel is `position="absolute" bottom="100%"` inside
  *   ComposerPane's relative Box (`appOverlays.tsx:387`), so it grows UPWARD
@@ -118,7 +121,27 @@ export const hasFloatingPanel = (overlay: OverlayState): boolean =>
     overlay.pager ||
     overlay.pluginsHub ||
     overlay.sessions ||
-    overlay.skillsHub,
+    overlay.skillsHub ||
+    overlay.tunePicker,
+  );
+
+/**
+ * A question to the user is open (approval, clarify, sudo/secret password,
+ * confirm): it owns the keyboard. The /tune popup neither opens over one nor
+ * reads a key while one is up.
+ */
+export const tuneLocked = (
+  overlay: Pick<
+    OverlayState,
+    "approval" | "clarify" | "confirm" | "secret" | "sudo"
+  >,
+): boolean =>
+  Boolean(
+    overlay.approval ||
+    overlay.clarify ||
+    overlay.confirm ||
+    overlay.secret ||
+    overlay.sudo,
   );
 
 export const $isStatusRuleOccluded = computed(
@@ -143,6 +166,17 @@ export const patchOverlayState = (
 /** Full reset — used by session/turn teardown and tests. */
 export const resetOverlayState = () => $overlayState.set(buildOverlayState());
 
+/** Open the /tune popup; false (nothing opened) while a prompt is waiting for an answer. */
+export const openTunePicker = (): boolean => {
+  if (tuneLocked($overlayState.get())) {
+    return false;
+  }
+
+  patchOverlayState({ tunePicker: true });
+
+  return true;
+};
+
 /**
  * Soft reset: drop FLOW-scoped overlays (approval / clarify / confirm / sudo
  * / secret / pager) but PRESERVE user-toggled ones — agents dashboard, agent view, model
@@ -165,4 +199,5 @@ export const resetFlowOverlays = () =>
     pluginsHub: $overlayState.get().pluginsHub,
     sessions: $overlayState.get().sessions,
     skillsHub: $overlayState.get().skillsHub,
+    tunePicker: $overlayState.get().tunePicker,
   });

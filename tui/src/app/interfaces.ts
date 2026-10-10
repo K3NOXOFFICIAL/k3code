@@ -9,7 +9,7 @@ import type {
 
 import type { PasteEvent } from "../components/textInput.js";
 import type { GatewayClient } from "../gatewayClient.js";
-import type { SessionCloseResponse } from "../gatewayTypes.js";
+import type { SessionCloseResponse, TuneSetParams } from "../gatewayTypes.js";
 import type { QueueItem } from "../hooks/useQueue.js";
 import type { RpcResult } from "../lib/rpc.js";
 import type { ActiveWidget } from "../sdk/types.js";
@@ -145,6 +145,8 @@ export interface OverlayState {
   sessions: boolean;
   skillsHub: boolean;
   sudo: null | SudoReq;
+  /** /tune popup: model list + effort slider + ultracode (bare /tune, /model, /effort, Ctrl+O). */
+  tunePicker: boolean;
 }
 
 export interface PagerState {
@@ -345,7 +347,9 @@ export interface GatewayEventHandlerContext {
     /** Submit text literally as a prompt — no slash/!/interpolation dispatch.
      *  Used for `-q` startup queries, which are arbitrary launcher-provided
      *  text (parity with one-shot's literal prompt handling). */
-    submitLiteralRef: MutableRefObject<(value: string) => void>;
+    submitLiteralRef: MutableRefObject<
+      (value: string, opts?: { automated?: boolean }) => void
+    >;
     submitRef: MutableRefObject<(value: string) => void>;
   };
   system: {
@@ -395,11 +399,14 @@ export interface SlashHandlerContext {
   transcript: {
     page: (text: string, title?: string) => void;
     panel: (title: string, sections: PanelSection[]) => void;
+    /** Submit text the gateway generated (a skill body, the /go send): `automated`, never a wake-word or ultracode-mode candidate. */
     send: (
       text: string,
       showUserMessage?: boolean,
       displayText?: string,
     ) => void;
+    /** Submit the last prompt again (/retry), typed or automated exactly as it first went out. */
+    resend: (text: string) => void;
     setHistoryItems: StateSetter<Msg[]>;
     sys: (text: string) => void;
     trimLastExchange: (items: Msg[]) => Msg[];
@@ -419,6 +426,8 @@ export interface AppLayoutActions {
   newLiveSession: (dropSid?: string) => void;
   newPromptSession: (prompt: string, modelArg?: string) => void;
   onModelSelect: (value: string) => void;
+  /** The /tune popup's Enter / `s`: closes it and sends the one `tune.set`. */
+  onTuneApply: (params: TuneSetParams) => void;
   /** `dropSid`: the session being left, closed once attached elsewhere if it is disposable (agent view). */
   resumeById: (id: string, dropSid?: string) => void;
   setStickyPrompt: (value: string) => void;
@@ -490,6 +499,7 @@ export interface AppOverlaysProps {
   onResumeSelect: (sessionId: string) => void;
   onSecretSubmit: (value: string) => void;
   onSudoSubmit: (pw: string) => void;
+  onTuneApply: (params: TuneSetParams) => void;
   pagerPageSize: number;
 }
 

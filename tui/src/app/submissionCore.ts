@@ -49,12 +49,17 @@ export function markSubmitting(): void {
 // `displayOverride` is what the transcript shows when it differs from what the
 // agent receives — a `/skill` invocation expands into the whole skill body, and
 // that scaffolding is model-facing only.
+//
+// `opts.automated` marks text the TUI generated rather than the user typed (a
+// skill expansion, the `/go` send, an accepted proposal). The gateway looks for
+// wake words and applies the ultracode mode only to typed prompts, so the flag
+// goes out ONLY when true: a typed prompt carries no `automated` key at all.
 export function submitPrompt(
   text: string,
   deps: SubmitPromptDeps,
   showUserMessage = true,
   displayOverride?: string,
-  opts: { skipDetectDrop?: boolean } = {},
+  opts: { automated?: boolean; skipDetectDrop?: boolean } = {},
 ): void {
   const sid = getUiState().sid;
 
@@ -94,6 +99,7 @@ export function submitPrompt(
       .request<PromptSubmitResponse>("prompt.submit", {
         session_id: liveSid,
         text: submitText,
+        ...(opts.automated ? { automated: true } : {}),
       })
       .catch((e: Error) => {
         // Defensive: prompt.submit no longer rejects a mid-turn send with

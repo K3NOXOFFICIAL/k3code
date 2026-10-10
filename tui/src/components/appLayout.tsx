@@ -374,6 +374,7 @@ const ComposerPane = memo(function ComposerPane({
     onNewLiveSession: actions.newLiveSession,
     onNewPromptSession: actions.newPromptSession,
     onResumeSelect: actions.resumeById,
+    onTuneApply: actions.onTuneApply,
     pagerPageSize: composer.pagerPageSize,
   };
 
@@ -679,6 +680,11 @@ const StatusRulePane = memo(function StatusRulePane({
         modelFast={ui.info?.fast}
         modelReasoningEffort={ui.info?.reasoning_effort}
         modelReasoningEffortWire={ui.info?.reasoning_effort_wire}
+        ultraMode={
+          typeof ui.info?.ultra_mode === "string"
+            ? ui.info.ultra_mode
+            : undefined
+        }
         notice={ui.notice}
         onSessionCountClick={() => patchOverlayState({ sessions: true })}
         sessionStartedAt={status.sessionStartedAt}
