@@ -169,14 +169,29 @@ def _load_system_prompt() -> str:
     return "You are a helpful coding assistant."
 
 
+def _turn_status(result: Any) -> str | None:
+    """The status of a finished turn task's result: ``_run_turn`` returns ``(status, text)``."""
+    if isinstance(result, tuple) and result and isinstance(result[0], str):
+        return result[0]
+    return None
+
+
 class TypedPrompt(str):
     """A prompt the user typed (``prompt.submit`` without ``automated``, a steering message, ``/bg <prompt>``).
 
     Only these are looked at for wake words and the ultracode mode; goal kicks, loop and cron ticks, automations and
     the TUI's own prompts (``automated``) are plain ``str``. The type travels with the text through
-    ``pending_prompts`` and ``steer_queue``, so a prompt that waited behind a turn is still routed when it drains."""
+    ``pending_prompts`` and ``steer_queue``, so a prompt that waited behind a turn is still routed when it drains.
 
-    __slots__ = ()
+    ``paste_spans``: ``(start, end)`` offsets (code points) of text the user pasted rather than typed, which the TUI
+    sends; a wake word in a pasted log or file is not the user asking for a mode."""
+
+    paste_spans: tuple[tuple[int, int], ...]
+
+    def __new__(cls, text: str, paste_spans: tuple[tuple[int, int], ...] = ()) -> TypedPrompt:
+        self = super().__new__(cls, text)
+        self.paste_spans = paste_spans
+        return self
 
 
 @dataclass
@@ -1593,7 +1608,8 @@ class GatewayServer:
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
         effort_mod.REASONING_EFFORT.set(session.reasoning_effort)  # /effort, read by the providers
         typed = isinstance(text, TypedPrompt)
-        prompt = text = str(text)  # the marker only says who wrote it
+        pasted = text.paste_spans if isinstance(text, TypedPrompt) else ()
+        prompt = text = str(text)  # the marker only says who wrote it (and which parts were pasted)
         mgr = self.goal_manager(session)
         # the prompt the user sent is not a continuation: clear the flag first, a turn that ended after a continuation
         # leaves it set and a queued prompt drained next would get no implicit goal
@@ -1605,7 +1621,7 @@ class GatewayServer:
             hooked = await self._typed_prompt_hooks(session, text)
             if not hooked.blocked:
                 # a wake word or the ultracode mode may run the prompt as a job instead of a normal turn
-                routed = await self._route_typed_prompt(session, text, hooked)
+                routed = await self._route_typed_prompt(session, text, hooked, pasted)
                 if routed is not None:
                     return routed
         if hooked is None or not hooked.blocked:  # a prompt a hook refused is not a task to carry on with
@@ -1685,15 +1701,20 @@ class GatewayServer:
     # ── wake words and the ultracode mode ──
 
     async def _route_typed_prompt(
-        self, session: LiveSession, text: str, hooked: userhooks.HookOutcome
+        self,
+        session: LiveSession,
+        text: str,
+        hooked: userhooks.HookOutcome,
+        pasted: tuple[tuple[int, int], ...] = (),
     ) -> tuple[str, str] | None:
         """A prompt the user typed: a wake word, else the ultracode mode, runs a job as this turn.
 
         ``hooked``: what the user's hooks made of it (not blocked: the caller ends a blocked prompt as a normal turn).
-        Returns the job's ``(status, text)``; None means run ``text`` as a normal turn. Deciding never costs the user
-        their prompt: a failure while deciding is logged and the prompt runs normally."""
+        ``pasted``: offsets of the pasted parts, where a wake word does not count. Returns the job's ``(status, text)``;
+        None means run ``text`` as a normal turn. Deciding never costs the user their prompt: a failure while deciding
+        is logged and the prompt runs normally."""
         try:
-            route = await self._plan_route(session, text, hooked.context_text())
+            route = await self._plan_route(session, text, hooked.context_text(), pasted)
         except asyncio.CancelledError:  # /stop during the scope check: the ending of a cancelled turn
             session.run_result = "completed"
             self._block_goal_for(session, "interrupted")
@@ -1719,11 +1740,14 @@ class GatewayServer:
         self._session_finished(session, status)
         return status, out
 
-    async def _plan_route(self, session: LiveSession, text: str, context: str = "") -> _Route | None:
+    async def _plan_route(
+        self, session: LiveSession, text: str, context: str = "", pasted: tuple[tuple[int, int], ...] = ()
+    ) -> _Route | None:
         """Which job (if any) ``text`` runs as: an explicit wake word first, then the ultracode mode.
 
-        ``context``: what the user's UserPromptSubmit hooks added, handed to the job with the task."""
-        if (hit := wakewords.detect_enabled(self.config, text)) is not None:
+        ``context``: what the user's UserPromptSubmit hooks added, handed to the job with the task. ``pasted``: offsets
+        of pasted text, where a wake word does not count."""
+        if (hit := wakewords.detect_enabled(self.config, text, pasted)) is not None:
             cmd: Any = self.commands.get(hit.mode)
             if hit.mode == "ultracode" and (word := typed_mode_word(hit.task)):
                 # "ultracode off", "turn ultracode off": what /ultracode takes as mode control, not a task to run
@@ -2917,6 +2941,10 @@ class GatewayServer:
                 text, level = f"Background session '{title}' needs your input.", "warning"
             elif t.exception() is not None:
                 text, level = f"Background session '{title}' failed: {t.exception()}", "error"
+            elif (ended := _turn_status(t.result())) == "interrupted":  # a job catches the /stop and returns
+                text, level = f"Background session '{title}' was stopped.", "warning"
+            elif ended == "error":
+                text, level = f"Background session '{title}' failed: {str(t.result()[1])[:160]}", "error"
             else:
                 last = next((m.get("content") for m in reversed(live.messages) if m.get("role") == "assistant"), "")
                 text, level = f"Background session '{title}' finished. {str(last or '')[:160]}".strip(), "info"
@@ -3072,6 +3100,29 @@ def _usage_payload(usage: Usage) -> dict[str, Any]:
 def _norm_cwd(cwd: str | None) -> str | None:
     """One spelling per directory (symlinks resolved, no trailing slash), so clients can compare cwds for equality."""
     return os.path.realpath(cwd) if cwd else None
+
+
+_MAX_PASTE_SPANS = 10_000
+
+
+def _paste_spans(params: dict[str, Any], text: Any) -> tuple[tuple[int, int], ...]:
+    """``paste_spans`` of prompt.submit / session.steer: ``[start, end]`` code-point offsets of pasted text in ``text``.
+
+    Optional (absent or null: nothing pasted); anything malformed is refused rather than guessed at."""
+    raw = params.get("paste_spans")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or len(raw) > _MAX_PASTE_SPANS:
+        raise _InvalidParams(f"paste_spans must be a list of at most {_MAX_PASTE_SPANS} [start, end] pairs")
+    size = len(str(text))
+    spans: list[tuple[int, int]] = []
+    for span in raw:
+        ok = isinstance(span, list) and len(span) == 2
+        ok = ok and all(isinstance(n, int) and not isinstance(n, bool) for n in span)
+        if not ok or not 0 <= span[0] <= span[1] <= size:
+            raise _InvalidParams(f"paste_spans: bad span {span!r} (want [start, end], 0 <= start <= end <= {size})")
+        spans.append((span[0], span[1]))
+    return tuple(spans)
 
 
 def _require(params: dict[str, Any], key: str) -> Any:
@@ -3278,13 +3329,15 @@ async def _session_interrupt(server: GatewayServer, params: dict[str, Any]) -> d
 
 async def _session_steer(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     text = _require(params, "text")
+    pasted = _paste_spans(params, text)
     session = server.session
     if session is None or not session.streaming:
         return {"steered": False}
     # The running loop adds it before its next model call. Appending to stored.messages lost it: the loop never saw
     # it and the turn's persist overwrote the list. Typed text keeps its marker: if no loop takes it, it runs as the
     # next prompt, wake words and all (``automated`` is the TUI's own text, see _prompt_submit).
-    session.steer_queue.append(str(text) if params.get("automated") is True else TypedPrompt(text))
+    typed = TypedPrompt(text, pasted)
+    session.steer_queue.append(str(text) if params.get("automated") is True else typed)
     return {"steered": True}
 
 
@@ -3346,7 +3399,7 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     server.last_user_activity = time.time()
     # `automated`: text the TUI generated (a /skill expansion, the /go send, an accepted proposal), not typed by the
     # user. Only typed text is checked for wake words and the ultracode mode, now or when it drains from the queue.
-    prompt = str(text) if params.get("automated") is True else TypedPrompt(text)
+    prompt = str(text) if params.get("automated") is True else TypedPrompt(text, _paste_spans(params, text))
     if session.turn_in_flight:
         # really queued: it runs when the current turn ends. The task check covers a turn that has not reached
         # `streaming = True` yet (compaction, MCP start): a second task there overwrote turn_task, so /stop missed one.

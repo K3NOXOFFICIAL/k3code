@@ -21,6 +21,7 @@ import {
 } from "../app/overlayStore.js";
 import { $petEnabled, $petParty } from "../app/petStore.js";
 import { $uiState, getUiState } from "../app/uiStore.js";
+import { $wakeWordConfig } from "../app/wakeWordStore.js";
 import {
   INLINE_MODE,
   NATIVE_MODE,
@@ -29,6 +30,7 @@ import {
 } from "../config/env.js";
 import { PLACEHOLDER } from "../content/placeholders.js";
 import { prevRenderedMsg } from "../domain/blockLayout.js";
+import { composerLineHighlights } from "../domain/composerHighlights.js";
 import {
   COMPOSER_PROMPT_GAP_WIDTH,
   composerPromptWidth,
@@ -307,7 +309,26 @@ const ComposerPane = memo(function ComposerPane({
 }) {
   const ui = useStore($uiState);
   const isBlocked = useStore($isBlocked);
+  const wake = useStore($wakeWordConfig);
   const sh = (composer.inputBuf[0] ?? composer.input).startsWith("!");
+  // The wake word accent judges the whole prompt (every line), like the
+  // gateway does, and paints the word on whichever line it is.
+  const highlightContext = useMemo(
+    () => ({
+      before: composer.inputBuf.length
+        ? `${composer.inputBuf.join("\n")}\n`
+        : "",
+      wake,
+    }),
+    [composer.inputBuf, wake],
+  );
+  const bufHighlights = useMemo(
+    () =>
+      composer.inputBuf.length
+        ? composerLineHighlights([...composer.inputBuf, composer.input], wake)
+        : [],
+    [composer.inputBuf, composer.input, wake],
+  );
 
   const promptText = composerPromptText(
     ui.theme.brand.prompt,
@@ -465,7 +486,20 @@ const ComposerPane = memo(function ComposerPane({
                   )}
                 </Box>
 
-                <Text color={ui.theme.color.text}>{line || " "}</Text>
+                <Text color={ui.theme.color.text}>
+                  {line
+                    ? (bufHighlights[i] ?? [{ ref: false, text: line }]).map(
+                        (part, j) =>
+                          part.ref ? (
+                            <Text color={ui.theme.color.accent} key={j}>
+                              {part.text}
+                            </Text>
+                          ) : (
+                            part.text
+                          ),
+                      )
+                    : " "}
+                </Text>
               </Box>
             ))}
 
@@ -507,6 +541,7 @@ const ComposerPane = memo(function ComposerPane({
                   color={ui.theme.color.text}
                   columns={inputColumns}
                   cursorSnapshotRef={cursorSnapshotRef}
+                  highlightContext={highlightContext}
                   mouseApiRef={inputMouseRef}
                   onChange={composer.updateInput}
                   onPaste={composer.handleTextPaste}

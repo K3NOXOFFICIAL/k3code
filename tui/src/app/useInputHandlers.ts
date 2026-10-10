@@ -957,11 +957,11 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (isAction(key, ch, "k") && cRefs.queueRef.current.length && live.sid) {
-      const next = cActions.dequeue();
+      const next = cActions.dequeueItem();
 
       if (next) {
         cActions.setQueueEdit(null);
-        actions.dispatchSubmission(next);
+        actions.dispatchSubmission(next.text, next.pasteSpans ?? []);
       }
     }
   });

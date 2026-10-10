@@ -25,8 +25,9 @@ MAX_MEMBER_BYTES = 200 * 1024 * 1024
 _SETTINGS_FILES = {"settings/user.config.yaml": "user", "settings/project.config.yaml": "project"}
 _SESSION_RE = re.compile(r"^sessions/([A-Za-z0-9_\-]{1,64})\.json$")
 #: Session meta an imported bundle must not carry over: a permission mode (yolo), extra writable roots, and the
-#: background / automation-origin markers that make the daemon run or resume the session on its own.
-_UNTRUSTED_META = frozenset({"mode", "add_dirs", "background"})
+#: background / automation-origin markers that make the daemon run or resume the session on its own, and an armed
+#: ``ultra_mode`` (ultracode spawns parallel sub-agents on the next prompt, which the importer never chose).
+_UNTRUSTED_META = frozenset({"mode", "add_dirs", "background", "ultra_mode"})
 
 
 class BundleError(ValueError):

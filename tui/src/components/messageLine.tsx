@@ -2,6 +2,7 @@ import { Ansi, Box, NoSelect, Text } from "@k3code/ink";
 import { hasAnsi, sanitizeAnsiForRender, stripAnsi } from "@k3code/shared/ansi";
 import { memo, useState } from "react";
 
+import { $wakeWordConfig } from "../app/wakeWordStore.js";
 import { TERMUX_TUI_MODE } from "../config/env.js";
 import { LONG_MSG } from "../config/limits.js";
 import { hasLeadGap } from "../domain/blockLayout.js";
@@ -292,7 +293,11 @@ export const MessageLine = memo(function MessageLine({
     // the accent it wore in the composer, instead of flattening back into the
     // body text.
     if (msg.role === "user") {
-      const segments = splitComposerHighlights(msg.text);
+      // The config as it is now: a sent prompt is not re-rendered when it
+      // changes, so a later toggle does not repaint the transcript.
+      const segments = splitComposerHighlights(msg.text, {
+        wake: $wakeWordConfig.get(),
+      });
 
       return (
         <Text {...(body ? { color: body } : {})}>
