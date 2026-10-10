@@ -8,6 +8,15 @@ something in). A hintless signature, or any signature with the setting off, wait
 as a card instead. An accepted (or auto-learned) gotcha is appended to ``gotchas.md`` in the project's
 directory under the k3code home (never a file in the repository) and goes into the system prompt as a fenced
 "known pitfalls in this project" block of at most MAX_LINES lines, oldest dropped.
+
+A failure the project already has a lesson for (a gotcha line, or a working retry recorded on an earlier ``tool_error``
+row within WINDOW) is answered in the turn itself: ``LearningHub.tool_outcome`` returns a one-line reminder (see
+``reminder``) and the agent loop sends it after the step's tool results, once per signature per turn. It is a message,
+not a system-prompt change, so the cached prompt prefix stays intact.
+
+An auto-learned line that ends up identical in the gotchas of two or more projects is also kept in the user-level
+``$K3CODE_HOME/gotchas.md`` (same format and cap) and goes into the system prompt as a separate "known pitfalls on
+this machine" block after the project one; the in-turn reminder consults that file too.
 """
 
 from __future__ import annotations
@@ -27,6 +36,9 @@ REPEATS = 3
 AUTO_REPEATS = 2
 MAX_LINES = 30
 HEADING = "## Known pitfalls in this project"
+MACHINE_HEADING = "## Known pitfalls on this machine"
+#: projects an identical auto-learned line must be in before it goes to the user-level gotchas
+PROMOTE_PROJECTS = 2
 #: failure classes that say nothing about the project: a user's denial (E6 learns from its reason) and a call the
 #: model got wrong (its schema says so)
 NOT_PROJECT = frozenset({"denied", "invalid_arguments"})
@@ -64,10 +76,39 @@ def gotchas_prompt(cwd: str | Path, home: Path | None = None) -> str:
     if not (root / "projects").is_dir():  # no project ever accepted one: skip the git call behind project_id
         return ""
     entries = _entries(gotchas_path(project_id(cwd), root))[-MAX_LINES:]
+    return _block(HEADING, "Tool failures that kept recurring here, and what worked instead. Avoid them.", entries)
+
+
+def user_gotchas_path(home: Path | None = None) -> Path:
+    """The user-level gotchas: lines learned the same way in several projects."""
+    return (home or k3code_home()) / "gotchas.md"
+
+
+def user_gotchas_prompt(home: Path | None = None) -> str:
+    """The fenced "on this machine" block for the system prompt, or "" when there is none (no git call)."""
+    entries = _entries(user_gotchas_path(home))[-MAX_LINES:]
+    return _block(MACHINE_HEADING, "Tool failures that recurred in several projects, and what worked instead.", entries)
+
+
+def _block(heading: str, intro: str, entries: list[str]) -> str:
     if not entries:
         return ""
     body = "\n".join(entries).replace("```", "'''")
-    return f"{HEADING}\nTool failures that kept recurring here, and what worked instead. Avoid them.\n```\n{body}\n```"
+    return f"{heading}\n{intro}\n```\n{body}\n```"
+
+
+def promote_if_shared(home: Path, line: str) -> bool:
+    """Copy ``line`` to the user-level gotchas once it is in the gotchas of PROMOTE_PROJECTS projects; True if it was
+    added now. An entry already there is left in place, so the prompt does not change."""
+    entry = "- " + " ".join(scrub_text(line).split())
+    user = user_gotchas_path(home)
+    if entry in _entries(user):
+        return False
+    shared = sum(entry in _entries(p) for p in (home / "projects").glob("*/gotchas.md"))
+    if shared < PROMOTE_PROJECTS:
+        return False
+    append_gotcha(user, line)
+    return True
 
 
 def _words(text: str) -> set[str]:
@@ -96,7 +137,18 @@ def auto_ok(error_class: str, hint: str) -> bool:
     return bool(hint) and error_class not in NOT_PROJECT and REDACTED not in hint and scrub_text(hint) == hint
 
 
+def lesson(path: Path, tool: str, signature: str) -> str | None:
+    """The gotcha line in ``path`` for this tool and signature (``tool: signature[ — hint]``), or None."""
+    head = " ".join(f"- {tool}: {signature}".split())
+    return next((e[2:] for e in reversed(_entries(path)) if e == head or e.startswith(head + " — ")), None)
+
+
 def has_lesson(path: Path, tool: str, signature: str) -> bool:
     """Whether ``path`` already holds a gotcha for this tool and signature (with any hint)."""
-    head = " ".join(f"- {tool}: {signature}".split())
-    return any(e == head or e.startswith(head + " — ") for e in _entries(path))
+    return lesson(path, tool, signature) is not None
+
+
+def reminder(line: str, *, machine: bool = False) -> str:
+    """The in-turn note for a failure that has a lesson (``line`` = ``tool: signature[ — hint]``)."""
+    where = "on this machine" if machine else "in this project"
+    return f"This failure was seen before {where}: {line}"

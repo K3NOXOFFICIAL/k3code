@@ -106,8 +106,10 @@ class AgentLoop:
         #: end a tool-error stop with an assistant message listing the failures (off when a higher tier continues)
         self.tool_error_stop_message = True
         #: called after every tool call with (call, result, failure or None); the gateway's learning hub records
-        #: tool errors with it
-        self.on_tool_outcome: Callable[[ToolCall, dict[str, Any], Failure | None], None] | None = None
+        #: tool errors with it. A string it returns is a lesson for the failure, sent after the step's tool results.
+        self.on_tool_outcome: Callable[[ToolCall, dict[str, Any], Failure | None], str | None] | None = None
+        #: (tool, signature) pairs whose lesson was already sent this run: one reminder per signature per turn
+        self._learned: set[tuple[str, str]] = set()
         #: Set when the loop stopped before the task was done: "tool_errors" | "loop_guard" (the attempt looks stuck)
         #: or "max_turns" (the configured cap on model calls was reached).
         self.escalation_reason: str | None = None
@@ -207,7 +209,7 @@ class AgentLoop:
         # (another loop on a different tier may have attached its own since construction).
         self.reliability.attach_router(self.router)
         self.reliability.begin_turn()
-        self._elided, self._pinned, self._reads, self._step = set(), set(), {}, 0
+        self._elided, self._pinned, self._reads, self._step, self._learned = set(), set(), {}, 0, set()
         self.escalation_reason = None  # the REPL reuses one loop: a stop in an earlier run is not this run's
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
@@ -545,18 +547,25 @@ class AgentLoop:
         return outcome.verdict is Verdict.STOP
 
     def _observe_result(self, tc: ToolCall, result: dict[str, Any], notes: list[Message]) -> Failure | None:
-        """Tell the learning hook and the loop guard how a call went; queue the guard's reminder into ``notes`` (one
-        per step: the request guard's note, when there is one, already says to change approach)."""
+        """Tell the learning hook and the loop guard how a call went; queue into ``notes`` the hook's lesson for the
+        failure (once per signature per run) and the guard's reminder (one per step: the request guard's note, when
+        there is one, already says to change approach; a lesson does not count against it)."""
+        tag = "[learned] "
         failure = failure_of(tc.name, tc.arguments, result)
         if self.on_tool_outcome is not None:
             try:
-                self.on_tool_outcome(tc, result, failure)
+                learned = self.on_tool_outcome(tc, result, failure)
             except Exception:  # noqa: BLE001 - learning must never break a turn
                 logger.warning("tool outcome hook failed", exc_info=True)
+                learned = None
+            if learned and failure is not None and (tc.name, failure.signature) not in self._learned:
+                self._learned.add((tc.name, failure.signature))
+                notes.append(Message(role="system", content=tag + learned))
         outcome = self.reliability.observe_tool_result(
             tc, failure.signature if failure else None, describe_call(tc.name, tc.arguments)
         )
-        if outcome is not None and outcome.verdict is Verdict.NOTE and outcome.note and not notes:
+        guarded = any(not (n.content or "").startswith(tag) for n in notes)
+        if outcome is not None and outcome.verdict is Verdict.NOTE and outcome.note and not guarded:
             notes.append(Message(role="system", content=outcome.note))
         return failure
 

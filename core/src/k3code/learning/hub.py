@@ -120,18 +120,20 @@ class LearningHub:
     async def _mine_later(self, session: Any) -> None:
         self.mine_permissions(session)
 
-    def tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> None:
+    def tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> str | None:
         """Record a failed tool call as a ``tool_error``; the next call of that tool in the session that looks like a
         retry and works becomes the row's hint. A signature seen REPEATS times in the project within WINDOW proposes
-        a project gotcha. Never raises: it runs inside the turn."""
+        a project gotcha. Returns a reminder for the model when the failure already has a lesson (the agent loop sends
+        it after the step's tool results), else None. Never raises: it runs inside the turn."""
         if not self.enabled or session is None:
-            return
+            return None
         try:
-            self._tool_outcome(session, call, result, failure)
+            return self._tool_outcome(session, call, result, failure)
         except Exception:  # noqa: BLE001 - learning must never break a turn
             logger.warning("tool error learning failed", exc_info=True)
+            return None
 
-    def _tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> None:
+    def _tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> str | None:
         cwd = str(session.perms.cwd)
         key = (session.session_id, call.name)
         if failure is None:
@@ -142,11 +144,11 @@ class LearningHub:
                 if hint:
                     self.log.update_detail(row_id, followup=hint)
                     self._maybe_gotcha(session, cwd, call.name, sig)
-            return
+            return None
         if failure.error_class in gotchas.NOT_PROJECT or (
             failure.error_class.startswith("exit ") and not str(result.get("stderr") or "").strip()
         ):
-            return  # a failing test run or `grep` without a match says nothing about the project by itself
+            return None  # a failing test run or `grep` without a match says nothing about the project by itself
         row_id = self.log.record(
             "tool_error",
             session=session.session_id,
@@ -157,9 +159,22 @@ class LearningHub:
             actor="auto" if getattr(session, "background", False) else "user",
         )
         self._last_failure[key] = (row_id, failure.signature, dict(call.arguments))
-        self._maybe_gotcha(session, cwd, call.name, failure.signature)
+        hint = self._maybe_gotcha(session, cwd, call.name, failure.signature)
+        return self._known_fix(cwd, call.name, failure.signature, hint)
 
-    def _maybe_gotcha(self, session: Any, cwd: str, tool: str, sig: str) -> Proposal | None:
+    def _known_fix(self, cwd: str, tool: str, sig: str, hint: str) -> str | None:
+        """The reminder for a failure with a lesson: the project's gotcha line, else the user-level one, else the
+        working retry recorded on an earlier row in the window (``hint``). Two small file reads, no model call."""
+        pid = self.log.project_for(cwd)  # cached per cwd
+        if (line := gotchas.lesson(gotchas.gotchas_path(pid, self.home), tool, sig)) is not None:
+            return gotchas.reminder(line)
+        if (line := gotchas.lesson(gotchas.user_gotchas_path(self.home), tool, sig)) is not None:
+            return gotchas.reminder(line, machine=True)
+        return gotchas.reminder(f"{tool}: {sig} — {hint}") if hint else None
+
+    def _maybe_gotcha(self, session: Any, cwd: str, tool: str, sig: str) -> str:
+        """Learn or propose a gotcha for a recurring signature; returns the working retry seen for it in the window
+        (its hint), or ""."""
         pid = self.log.project_for(cwd)
         rows = [
             r
@@ -174,9 +189,9 @@ class LearningHub:
             and gotchas.auto_ok(str(rows[-1]["choice"]), hint)
         ):
             self._auto_gotcha(session, pid, tool, sig, line)
-            return None
+            return hint
         if len(rows) < gotchas.REPEATS:
-            return None
+            return hint
         p = self.store.add(
             "project_gotcha",
             gotchas.proposal_text(sig, hint),
@@ -188,15 +203,17 @@ class LearningHub:
         )
         if p is not None:
             self.emit(session, [p])
-        return p
+        return hint
 
     def _auto_gotcha(self, session: Any, pid: str, tool: str, sig: str, line: str) -> None:
         """Write a self-verified gotcha (a retry worked) without a card and tell the session in one line. A signature
-        the project already has a lesson for is left alone, so a recurring failure is learned and announced once."""
+        the project already has a lesson for is left alone, so a recurring failure is learned and announced once. A
+        line now identical in the gotchas of PROMOTE_PROJECTS projects is copied to the user-level gotchas."""
         path = gotchas.gotchas_path(pid, self.home)
         if gotchas.has_lesson(path, tool, sig):
             return
         gotchas.append_gotcha(path, line)
+        gotchas.promote_if_shared(self.home, line)
         session.emit("notification", {"session_id": session.session_id, "text": f"Learned for this project: {line}"})
 
     # ── proposals ──
