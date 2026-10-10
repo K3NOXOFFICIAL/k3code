@@ -32,8 +32,9 @@ interface Exposed {
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Wait for a condition instead of a fixed time: a fixed sleep that is long enough on a quiet machine is too short on
-// a loaded one. Resolves as soon as `ready()` is true; fails the test after `timeoutMs`.
-const until = async (ready: () => boolean, timeoutMs = 10_000) => {
+// a loaded one. Resolves as soon as `ready()` is true; fails the test after `timeoutMs`, which stays under vitest's
+// 5 s test timeout so a miss names the condition instead of timing out the whole test.
+const until = async (ready: () => boolean, timeoutMs = 4_000) => {
   const deadline = Date.now() + timeoutMs;
 
   while (!ready()) {
@@ -734,7 +735,10 @@ describe("useVirtualHistory offset cache reuse", () => {
       const scroll = expose.current!.scroll!;
 
       scroll.scrollTo(0);
-      await delay(50);
+      // The jump from the tail mounts the top rows over a few frames (slide
+      // cap). Item 0 must be mounted and measured before the stale rerender,
+      // or it is never measured and nothing is compensated.
+      await until(() => expose.current?.virtualHistory.start === 0);
       scroll.scrollTo(5);
       const adjustScrollTop = vi.spyOn(scroll, "adjustScrollTop");
       const staleHeights = new Map(initialHeights);

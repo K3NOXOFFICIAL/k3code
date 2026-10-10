@@ -113,6 +113,16 @@ describe("GatewayClient websocket attach mode", () => {
   const originalWebSocket = globalThis.WebSocket;
   let originalGatewayUrl: string | undefined;
   let originalSidecarUrl: string | undefined;
+  // Every client a test creates. A client whose socket closed has a reconnect
+  // pending on the real clock; left alive, it fires during a later test (on a
+  // slow machine) and adds a socket there, or spawns a real gateway between
+  // tests. afterEach kills them all.
+  const clients: GatewayClient[] = [];
+  const track = (gw: GatewayClient) => {
+    clients.push(gw);
+
+    return gw;
+  };
 
   beforeEach(() => {
     originalGatewayUrl = process.env.K3CODE_TUI_GATEWAY_URL;
@@ -123,6 +133,10 @@ describe("GatewayClient websocket attach mode", () => {
   });
 
   afterEach(() => {
+    for (const gw of clients.splice(0)) {
+      gw.kill();
+    }
+
     if (originalGatewayUrl === undefined) {
       delete process.env.K3CODE_TUI_GATEWAY_URL;
     } else {
@@ -146,7 +160,7 @@ describe("GatewayClient websocket attach mode", () => {
 
   it("waits for websocket open and resolves RPC requests", async () => {
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     const gatewaySocket = FakeWebSocket.instances[0]!;
@@ -179,7 +193,7 @@ describe("GatewayClient websocket attach mode", () => {
     // re-renders" (#301). drain() must defer the buffered flush so the first
     // commit settles first.
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     const gatewaySocket = FakeWebSocket.instances[0]!;
@@ -216,7 +230,7 @@ describe("GatewayClient websocket attach mode", () => {
     // deferred microtask running must still queue BEHIND the chronologically
     // earlier buffered events, not jump ahead of them.
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     const gatewaySocket = FakeWebSocket.instances[0]!;
@@ -260,7 +274,7 @@ describe("GatewayClient websocket attach mode", () => {
     process.env.K3CODE_TUI_SIDECAR_URL =
       "ws://gateway.test/api/pub?token=abc&channel=demo";
 
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
     const seen: string[] = [];
 
     gw.on("event", (ev) => seen.push(ev.type));
@@ -297,7 +311,7 @@ describe("GatewayClient websocket attach mode", () => {
     process.env.K3CODE_TUI_SIDECAR_URL =
       "ws://gateway.test/api/pub?token=abc&channel=demo";
 
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
     const seen: string[] = [];
 
     gw.on("event", (ev) => seen.push(ev.type));
@@ -337,7 +351,7 @@ describe("GatewayClient websocket attach mode", () => {
 
   it("emits exit when attached websocket closes", async () => {
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
     const exits: Array<null | number> = [];
 
     gw.on("exit", (code) => exits.push(code));
@@ -357,7 +371,7 @@ describe("GatewayClient websocket attach mode", () => {
 
   it("rejects pending RPCs when the attached socket closes", async () => {
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     const gatewaySocket = FakeWebSocket.instances[0]!;
@@ -377,7 +391,7 @@ describe("GatewayClient websocket attach mode", () => {
 
   it("rejects pending RPCs when kill() closes the attached websocket", async () => {
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     const gatewaySocket = FakeWebSocket.instances[0]!;
@@ -398,7 +412,7 @@ describe("GatewayClient websocket attach mode", () => {
   it("reattaches when K3CODE_TUI_GATEWAY_URL rotates between requests", async () => {
     process.env.K3CODE_TUI_GATEWAY_URL =
       "ws://gateway-old.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     const firstSocket = FakeWebSocket.instances[0]!;
@@ -433,7 +447,7 @@ describe("GatewayClient websocket attach mode", () => {
 
   it("surfaces JSON-RPC error code and data to callers (shared error mapping)", async () => {
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     const socket = FakeWebSocket.instances[0]!;
@@ -468,7 +482,7 @@ describe("GatewayClient websocket attach mode", () => {
       "ws://gateway.test/api/ws?token=hunter2&channel=secret";
     delete (globalThis as { WebSocket?: unknown }).WebSocket;
 
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     // The fallback is imported on demand (Node 20 only), so the socket appears once the import resolves.
@@ -491,7 +505,7 @@ describe("GatewayClient websocket attach mode", () => {
         }
       } as unknown as typeof WebSocket;
 
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     gw.drain();
@@ -521,7 +535,7 @@ describe("GatewayClient websocket attach mode", () => {
         }
       } as unknown as typeof WebSocket;
 
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     const gatewaySocket = FakeWebSocket.instances[0]!;
@@ -557,7 +571,7 @@ describe("GatewayClient websocket attach mode", () => {
         }
       } as unknown as typeof WebSocket;
 
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     gw.start();
     gw.drain();
@@ -573,7 +587,7 @@ describe("GatewayClient websocket attach mode", () => {
   it("keeps a healthy idle websocket open when heartbeat acknowledgements arrive (issue #32997)", async () => {
     vi.useFakeTimers();
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     try {
       gw.start();
@@ -635,7 +649,7 @@ describe("GatewayClient websocket attach mode", () => {
   it("auto-reconnects after a missing heartbeat acknowledgement (issue #32997)", async () => {
     vi.useFakeTimers();
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     try {
       gw.start();
@@ -667,7 +681,7 @@ describe("GatewayClient websocket attach mode", () => {
   it("does not heartbeat an older backend that omits the capability", async () => {
     vi.useFakeTimers();
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     try {
       gw.start();
@@ -700,7 +714,7 @@ describe("GatewayClient websocket attach mode", () => {
   it("does not double-reconnect when the exit subscriber restarts immediately", async () => {
     vi.useFakeTimers();
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
 
     try {
       gw.on("exit", () => gw.start());
@@ -724,7 +738,7 @@ describe("GatewayClient websocket attach mode", () => {
   it("keeps delivering events to the mounted subscriber across reconnects, with growing backoff (#111594)", async () => {
     vi.useFakeTimers();
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
     const ready: number[] = [];
     const delays: number[] = [];
 
@@ -778,7 +792,7 @@ describe("GatewayClient websocket attach mode", () => {
   it("does not auto-reconnect after an intentional kill() (issue #32997)", async () => {
     vi.useFakeTimers();
     process.env.K3CODE_TUI_GATEWAY_URL = "ws://gateway.test/api/ws?token=abc";
-    const gw = new GatewayClient();
+    const gw = track(new GatewayClient());
     gw.start();
     FakeWebSocket.instances[0]!.open();
     gw.kill(); // sets disposed
