@@ -128,9 +128,12 @@ async def test_main_tier_stops_after_eight_errors_listing_them(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_gateway_main_tier_defaults_to_stopping_at_eight(tmp_path, monkeypatch):
+async def test_gateway_main_tier_without_escalation_stops_at_eight(tmp_path, monkeypatch):
+    """With ``escalate_main`` off the main tier is the last one (by default strong continues: test_autonomy_gateway)."""
     reads = [ToolCall(id=f"r{i}", name="read", arguments={"path": f"missing-{i}.txt"}) for i in range(10)]
-    server, provider = make_server(tmp_path, [*reads, "never reached"], monkeypatch, mode="yolo")
+    server, provider = make_server(
+        tmp_path, [*reads, "never reached"], monkeypatch, mode="yolo", autonomy={"escalate_main": False}
+    )
     await call(server, "session.create", {"cwd": str(tmp_path)})
     await run_turn(server, "go", [])
     msgs = server.session.stored.messages
