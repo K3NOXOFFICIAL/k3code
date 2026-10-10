@@ -553,8 +553,10 @@ def check_searxng() -> Check:
 
 
 def check_project(project_dir: Path) -> Check:
-    """The project's ``.k3code``: content left unloaded because it is not trusted, and providers it cannot set."""
+    """The project's ``.k3code``: content left unloaded because it is not trusted, and providers it cannot set; else
+    the stacks a read-only scan detects."""
     from k3code import confio, trust
+    from k3code.learning import projectstate, recipes, stacks
 
     problems: list[str] = []
     if hint := trust.untrusted_hint(project_dir):
@@ -571,7 +573,13 @@ def check_project(project_dir: Path) -> Check:
             problems.append(f"{cfg_path} sets mem0: ignored (only your user config can set mem0)")
     if problems:
         return Check("project", WARN, "; ".join(problems), "`k3code trust` shows what the project changes")
-    return Check("project", OK, f"{trust.decision(project_dir)} ({project_dir})")
+    # The bare trust state ("none") read as "no project detected". This is the scan a session's preparation runs,
+    # read-only here: nothing is stored and nothing is proposed.
+    found = [recipes.label(s) for s in stacks.scan(projectstate.project_root(project_dir)).stacks]
+    detected = f"stacks: {', '.join(found)}" if found else "no stacks detected"
+    decision = trust.decision(project_dir)
+    config = "no project config" if decision == trust.NONE else f"project config {decision}"
+    return Check("project", OK, f"{detected}; {config} ({project_dir})", data={"stacks": found})
 
 
 def install_subset(home: Path | None = None) -> list[Check]:
@@ -608,7 +616,7 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
         # the probe runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
         await asyncio.to_thread(check_sandbox, probe),
         check_isolation(),
-        check_project(default_project_dir()),
+        await asyncio.to_thread(check_project, default_project_dir()),  # the stack scan reads the tree
     ]
     return checks
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 
 class CommandContext(Protocol):
@@ -18,6 +18,8 @@ class CommandDef:
     name: str
     help: str
     aliases: list[str] = field(default_factory=list)
+    #: Works in a one-shot ``k3code -p "/name"`` run: no live session, client or model needed. The others refuse there.
+    headless: ClassVar[bool] = False
 
     async def handle(self, ctx: CommandContext, session_id: str | None, arg: str) -> dict[str, Any]:
         raise NotImplementedError
