@@ -13,6 +13,8 @@ from k3code.gateway.sessions import StoredSession
 from k3code.router import Router, build_chain
 from test_permissions_gateway import call, make_server
 
+DAY = 24 * 3600
+
 
 async def test_open_approval_makes_the_session_need_input(tmp_path, monkeypatch):
     server, _ = make_server(tmp_path, ["ok"], monkeypatch)
@@ -315,9 +317,6 @@ async def test_an_interrupted_foreground_turn_reports_completed_until_the_next_p
     await m1.submit_and_wait(server, "next")
     assert seen == [None]
     assert live.run_result == "completed" and live.state == "completed"
-
-
-DAY = 24 * 3600
 
 
 async def test_a_working_row_times_the_turn_not_the_session_age(tmp_path, monkeypatch):

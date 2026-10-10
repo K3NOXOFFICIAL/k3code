@@ -37,18 +37,23 @@ ELIDE_KEEP_CALLS = 6
 ELIDE_MIN_CHARS = 2000
 
 
-def context_window(config: Any, model_id: str) -> int:
-    """Tokens the model ``model_id`` takes: ``models.<id>.context_window`` from config, else the family default."""
+def _explicit_window(config: Any, model_id: str) -> int | None:
+    """The ``models.<model_id>.context_window`` from config, or None when unset."""
     entry = (getattr(config, "models", None) or {}).get(model_id) or {}
     if isinstance(entry, dict) and entry.get("context_window"):
         return int(entry["context_window"])
-    return family_window(model_id) or FALLBACK_WINDOW
+    return None
+
+
+def context_window(config: Any, model_id: str) -> int:
+    """Tokens the model ``model_id`` takes: an explicit ``models.<id>.context_window`` entry, else the family
+    window, else FALLBACK_WINDOW."""
+    return _explicit_window(config, model_id) or family_window(model_id) or FALLBACK_WINDOW
 
 
 def has_explicit_window(config: Any, model_id: str) -> bool:
     """Whether config sets ``models.<model_id>.context_window``."""
-    entry = (getattr(config, "models", None) or {}).get(model_id) or {}
-    return isinstance(entry, dict) and bool(entry.get("context_window"))
+    return _explicit_window(config, model_id) is not None
 
 
 def family_window(model_id: str) -> int | None:

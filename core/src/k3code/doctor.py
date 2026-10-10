@@ -169,6 +169,8 @@ def check_context_windows(config: Settings) -> list[Check]:
             for model_id in [spec] if isinstance(spec, str) else spec:
                 if model_id and model_id not in ids:
                     ids.append(model_id)
+    if not ids:
+        return [Check("context-window", OK, "no chain models configured")]
     unknown = [m for m in ids if not has_explicit_window(config, m) and family_window(m) is None]
     if not unknown:
         return [Check("context-window", OK, "every chain model has a known context window")]
