@@ -37,6 +37,12 @@ class ProviderEntry(BaseModel):
     #: claude-cli only: ``--effort`` (low|medium|high|xhigh|max) for turns where /effort sets none; None = the CLI's
     #: own default. /effort always wins.
     effort: str | None = None
+    #: claude-cli only: keep a live ``claude -p`` process per conversation and send each step only what is new (the
+    #: CLI start is paid once, and the prompt cache covers the earlier conversation). false = one stateless call per
+    #: step. At most ``max_sessions`` processes (~270 MB each) live at once; one idle ``idle_seconds`` is stopped.
+    persistent: bool = True
+    max_sessions: int = 4
+    idle_seconds: float = 600.0
     #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
     #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
     prompt_cache: str = "auto"
