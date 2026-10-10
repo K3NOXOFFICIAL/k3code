@@ -329,37 +329,49 @@ class AgentLoop:
                     yield stop_event
                 return
 
-            # Execute tool calls sequentially and yield results
-            for tc in tool_calls:
+            # Execute the tool calls and yield their results in the model's order. Consecutive read-only calls run
+            # together (see _batches); every other call runs alone.
+            for batch in self._batches(tool_calls):
                 if self.interrupted:
-                    logger.info("Interrupted before tool %s", tc.name)
+                    logger.info("Interrupted before tool %s", batch[0].name)
                     self.turn_messages = messages
                     return
-                self._step += 1
-                result = await self._execute_tool(tc)
-                tool_msg = Message(
-                    role="tool",
-                    content=format_tool_result(result),
-                    tool_call_id=tc.id,
-                    name=tc.name,
-                )
-                messages.append(tool_msg)
-                self.reliability.save_transcript(messages)
-                # Yield the tool result as a stream event
-                yield StreamEvent(type="done", message=tool_msg)
-                failure = self._observe_result(tc, result, notes)
-                if "error" in result and "content" not in result:
-                    self._tool_errors += 1
-                    self._failed.append((describe_call(tc.name, tc.arguments), failure.first_line if failure else ""))
+                steps = []
+                for _ in batch:  # in call order, before dispatch: the "unchanged since the read at step N" pointers
+                    self._step += 1
+                    steps.append(self._step)
+                if len(batch) == 1:
+                    results = [await self._execute_tool(batch[0])]
                 else:
-                    self._tool_errors, self._failed = 0, []
-                if self.max_tool_errors and self._tool_errors >= self.max_tool_errors:
-                    self.escalation_reason = "tool_errors"
-                    if self.tool_error_stop_message:
-                        for stop_event in self._stop_for_tool_errors(messages):
-                            yield stop_event
-                    self.turn_messages = messages
-                    return
+                    results = await asyncio.gather(
+                        *(self._execute_tool(tc, step=n) for tc, n in zip(batch, steps, strict=True))
+                    )
+                for tc, result in zip(batch, results, strict=True):
+                    tool_msg = Message(
+                        role="tool",
+                        content=format_tool_result(result),
+                        tool_call_id=tc.id,
+                        name=tc.name,
+                    )
+                    messages.append(tool_msg)
+                    self.reliability.save_transcript(messages)
+                    # Yield the tool result as a stream event
+                    yield StreamEvent(type="done", message=tool_msg)
+                    failure = self._observe_result(tc, result, notes)
+                    if "error" in result and "content" not in result:
+                        self._tool_errors += 1
+                        self._failed.append(
+                            (describe_call(tc.name, tc.arguments), failure.first_line if failure else "")
+                        )
+                    else:
+                        self._tool_errors, self._failed = 0, []
+                    if self.max_tool_errors and self._tool_errors >= self.max_tool_errors:
+                        self.escalation_reason = "tool_errors"
+                        if self.tool_error_stop_message:
+                            for stop_event in self._stop_for_tool_errors(messages):
+                                yield stop_event
+                        self.turn_messages = messages
+                        return
 
             messages.extend(notes)
             self.turn_messages = messages
@@ -382,7 +394,46 @@ class AgentLoop:
             yield StreamEvent(type="done", message=stop_msg)
         self.turn_messages = messages
 
-    async def _execute_tool(self, tool_call: ToolCall) -> dict[str, Any]:
+    # Parallel read-only calls. Safe because a call joins a batch only if its spec says side_effect=False (it changes
+    # nothing another call of the batch could observe), it is not `bash` (which can do anything whatever its spec
+    # says) or exit_plan (it changes the mode and may prompt), and the permission decision of every call in the batch
+    # is a plain allow (no approval prompt can overlap another). Everything else is a barrier that runs alone, in order.
+    # Results are appended, journaled and observed in call order after the batch finishes, and each call carries the
+    # step number it would have had when run alone.
+    def _parallel_ok(self, tc: ToolCall) -> bool:
+        if tc.name in ("bash", EXIT_PLAN_TOOL) or tc.name == INVALID_TOOL_CALL:
+            return False
+        found = self.tools.get(tc.name)
+        return found is not None and not found[0].side_effect
+
+    def _batches(self, tool_calls: list[ToolCall]) -> list[list[ToolCall]]:
+        """Split the calls of one reply into batches: runs of consecutive parallel-safe calls, and singletons."""
+        batches: list[list[ToolCall]] = []
+        run: list[ToolCall] = []
+
+        def flush() -> None:
+            if len(run) > 1 and all(self._plain_allow(tc) for tc in run):
+                batches.append(list(run))
+            else:
+                batches.extend([tc] for tc in run)
+            run.clear()
+
+        for tc in tool_calls:
+            if self._parallel_ok(tc):
+                run.append(tc)
+            else:
+                flush()
+                batches.append([tc])
+        flush()
+        return batches
+
+    def _plain_allow(self, tc: ToolCall) -> bool:
+        spec = self.tools.get(tc.name)[0]
+        if invalid_arguments(tc.name, spec.parameters, tc.arguments) is not None:
+            return True  # answered with an error before any permission check
+        return self.permissions.decide(tc.name, tc.arguments, headless=self.headless).action == "allow"
+
+    async def _execute_tool(self, tool_call: ToolCall, *, step: int | None = None) -> dict[str, Any]:
         """Execute a single tool call with permission checking."""
         if tool_call.name == INVALID_TOOL_CALL:
             # The provider could not parse the model's <tool_calls> block. Nothing ran, so no permission check, hook
@@ -447,7 +498,7 @@ class AgentLoop:
         # M2: completion digest, so resume knows this call finished.
         self.reliability.journal_done(tool_call.id, result)
         if read_key is not None and "first" in result:
-            self._reads[read_key] = (self._step, tool_call.id)
+            self._reads[read_key] = (self._step if step is None else step, tool_call.id)
         post = await self._run_hooks(
             "PostToolUse", tool_call.name, {"tool_input": args, "tool_response": format_tool_result(result)}
         )
