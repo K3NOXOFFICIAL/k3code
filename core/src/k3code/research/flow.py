@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 
 from k3code.artifacts import write_artifact_file
-from k3code.autonomy.ultra import with_hook_context
+from k3code.memory import with_hook_context
 from k3code.providers.types import Message
 from k3code.research import prompts
 from k3code.research.fetch import FetchStatus

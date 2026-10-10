@@ -189,6 +189,15 @@ def fenced(label: str, body: str) -> str:
     return f"{label}\n{fence}text\n{body}\n{fence}"
 
 
+def with_hook_context(task: str, context: str) -> str:
+    """``task`` as the agents' prompts state it: with what the user's hooks added (like a normal turn's prompt).
+
+    Only prompts take this; a title, heading or report line keeps the bare task (a hook's output is multi-line)."""
+    if not context:
+        return task
+    return f"{task}\n\n" + fenced("context from the user's hooks:", context)
+
+
 def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = MAX_MEMORY_TOTAL) -> str:
     """User memory as written; the repository's memory files fenced as what they are (text from the repository).
 

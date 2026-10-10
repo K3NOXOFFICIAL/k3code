@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from k3code.commands.research_cmd import UltraResearchCommand
-from k3code.commands.ultra_cmd import UltraCodeCommand, typed_mode_word
+from k3code.commands.ultra_cmd import UltraCodeCommand, UltraPlanCommand, typed_mode_word
 from k3code.wakewords import detect
 from test_autonomy_gateway import call, make
 from test_research import FakeTools, research_server
@@ -68,6 +68,13 @@ class _Recorder:
         self.calls.append(("ultracode", task, context))
         return "done"
 
+    async def ultraplan(self, live: Any, task: str, *, context: str = "") -> Any:
+        self.calls.append(("ultraplan", task, context))
+        return SimpleNamespace(plan="p", path=None, angles=["a"], scores={}, judge_note="")
+
+    def show_plan(self, live: Any, up: Any) -> None:
+        pass
+
     async def run(self, live: Any, question: str, *, n_sub: int | None = None, context: str = "") -> Any:
         self.calls.append(("ultraresearch", question, context))
         return SimpleNamespace(report="r", path="r.md")
@@ -79,20 +86,26 @@ async def test_commands_hand_the_pipeline_the_task_and_the_hook_context_apart():
     async def unavailable_reason() -> str:
         return ""
 
+    live = SimpleNamespace(stored=SimpleNamespace(meta={}))
     ctx = SimpleNamespace(
         ultra=rec,
+        store=SimpleNamespace(save=lambda stored: None),
         research=SimpleNamespace(
             run=rec.run, tools=lambda: SimpleNamespace(name="t", unavailable_reason=unavailable_reason)
         ),
     )
-    spec = await UltraCodeCommand().prepare(ctx, object(), "fix the login form", context=HOOK_CTX)
+    spec = await UltraCodeCommand().prepare(ctx, live, "fix the login form", context=HOOK_CTX)
     await spec.factory()
-    spec = await UltraResearchCommand().prepare(ctx, object(), "--n 2 why is it slow?", context=HOOK_CTX)
+    spec = await UltraPlanCommand().prepare(ctx, live, "fix the login form", context=HOOK_CTX)
+    await spec.factory()
+    spec = await UltraResearchCommand().prepare(ctx, live, "--n 2 why is it slow?", context=HOOK_CTX)
     await spec.factory()
     assert rec.calls == [
         ("ultracode", "fix the login form", HOOK_CTX),
+        ("ultraplan", "fix the login form", HOOK_CTX),
         ("ultraresearch", "why is it slow?", HOOK_CTX),
     ]
+    assert live.stored.meta["ultra_plan"]["task"] == "fix the login form"
 
 
 def _prompts(server: Any, marker: str) -> list[str]:
@@ -130,7 +143,8 @@ async def test_ultraresearch_keeps_the_hook_context_out_of_the_heading_and_title
     question = "What colour are the sky and grass?"
     res = await server.research.run(server.session, question, n_sub=2, context=HOOK_CTX)
 
-    assert all("HOOK-LINE" in p for p in _prompts(server, "You are a research planner"))
+    planners = _prompts(server, "You are a research planner")
+    assert planners and all("HOOK-LINE" in p for p in planners)
     assert all("HOOK-LINE" in p for p in _prompts(server, "You are a research writer"))
     assert _prompts(server, "You are a research writer")
     assert not any("HOOK-LINE" in q for q in tools.searches)

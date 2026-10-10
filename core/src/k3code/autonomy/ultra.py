@@ -17,7 +17,7 @@ from k3code.autonomy import DEFAULT_MIN_SCOPE
 from k3code.autonomy.fanout import FanoutResult, detect_test_command, extract_subtasks, run_tests
 from k3code.autonomy.plan_first import PLAN_SECTIONS, parse_plan
 from k3code.autonomy.scope import ScopeVerdict
-from k3code.memory import fenced
+from k3code.memory import with_hook_context
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 from k3code.subagents import worktree as wt_mod
@@ -75,15 +75,6 @@ class UltraPlan:
     angles: list[str] = field(default_factory=list)
     artifact_id: str | None = None
     judge_note: str = ""
-
-
-def with_hook_context(task: str, context: str) -> str:
-    """``task`` as the agents' prompts state it: with what the user's hooks added (like a normal turn's prompt).
-
-    Only prompts take this; a title, heading or report line keeps the bare task (a hook's output is multi-line)."""
-    if not context:
-        return task
-    return f"{task}\n\n" + fenced("context from the user's hooks:", context)
 
 
 def planner_prompt(task: str, angle: str) -> str:
