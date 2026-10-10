@@ -107,7 +107,7 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
         "(cd tui && tui_vitest)",
         "go vet ./internal/k3keys/... ./internal/harness/... ./cmd/k3/",
         "go test -race ./internal/k3keys/... ./internal/harness/...",
-        "go test ./internal/input/ ./internal/app/",
+        "go test -timeout 30m ./internal/input/ ./internal/app/",
         "python3 scripts/vendor_check.py",
         "gitleaks detect --source . --config .gitleaks.toml",
         "--log-opts=origin/Main..HEAD",

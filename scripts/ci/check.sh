@@ -243,7 +243,9 @@ area_panes() {
   step "go vet" panes go vet ./internal/k3keys/... ./internal/harness/... ./cmd/k3/
   if full; then
     step "go test -race" panes go test -race ./internal/k3keys/... ./internal/harness/...
-    step "go test input app" panes go test ./internal/input/ ./internal/app/
+    # ./internal/app takes ~4 min alone and several times that when other checks share the machine; the default
+    # 10 min package timeout then kills it mid-test (issue #52)
+    step "go test input app" panes go test -timeout 30m ./internal/input/ ./internal/app/
   fi
 }
 
