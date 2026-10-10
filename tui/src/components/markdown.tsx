@@ -1,4 +1,11 @@
-import { Box, Link, stringWidth, Text } from "@k3code/ink";
+import {
+  applyTextStyles,
+  Box,
+  Link,
+  stringWidth,
+  Text,
+  wrapAnsi,
+} from "@k3code/ink";
 import { Fragment, memo, type ReactNode, useMemo } from "react";
 
 import { ensureEmojiPresentation } from "../lib/emoji.js";
@@ -204,6 +211,94 @@ export const stripInlineMarkup = (v: string) =>
     .replace(/(?<!\$)\$([^\s$](?:[^$\n]*?[^\s$])?)\$(?!\$)/g, "$1")
     .replace(/\\\(([^\n]+?)\\\)/g, "$1");
 
+// Theme colours are plain strings; Ink's `Color` is a template-literal
+// union, so widen the style shape here once instead of casting each call.
+type AnsiStyle = Omit<
+  Parameters<typeof applyTextStyles>[1],
+  "color" | "backgroundColor"
+> & { color?: string; backgroundColor?: string };
+
+const styled = (text: string, style: AnsiStyle) =>
+  applyTextStyles(text, style as Parameters<typeof applyTextStyles>[1]);
+
+// ANSI-string twin of `renderMath` for contexts that need a measurable,
+// wrappable string instead of React nodes (table cells).
+const mathAnsi = (text: string) =>
+  text.replace(
+    new RegExp(`${BOX_OPEN}([^${BOX_CLOSE}]*)${BOX_CLOSE}`, "g"),
+    (_, inner: string) => styled(` ${inner} `, { bold: true, inverse: true }),
+  );
+
+// ANSI-string twin of `MdInline`. Table cells are padded and wrapped by
+// display width, which React nodes can't give us, so the cell is styled
+// to an ANSI string first and then measured (`stringWidth` ignores escape
+// codes) and wrapped (`wrapAnsi` re-opens styles on each line). Keep the
+// visible text in step with `MdInline` so column widths match the render.
+// Links lose their OSC 8 target here — label styling only.
+export const inlineAnsi = (text: string, t: Theme): string => {
+  let out = "";
+  let last = 0;
+
+  for (const m of text.matchAll(INLINE_RE)) {
+    const i = m.index ?? 0;
+
+    out += text.slice(last, i);
+
+    if (m[1] && m[2]) {
+      out += styled(`[image: ${m[1]}] ${m[2]}`, {
+        color: t.color.muted,
+      });
+    } else if (m[3] && m[4]) {
+      out += styled(
+        authoredLabel(m[3]) ?? urlAsText(normalizeExternalUrl(m[4])),
+        { color: t.color.accent, underline: true },
+      );
+    } else if (m[5]) {
+      out += styled(
+        authoredLabel(m[5].replace(/^mailto:/, "")) ??
+          urlAsText(normalizeExternalUrl(autolinkUrl(m[5]))),
+        { color: t.color.accent, underline: true },
+      );
+    } else if (m[6]) {
+      out += styled(inlineAnsi(m[6], t), { strikethrough: true });
+    } else if (m[7]) {
+      out += styled(m[7], { color: t.color.accent, dim: true });
+    } else if (m[8] ?? m[9]) {
+      out += styled(inlineAnsi(m[8] ?? m[9]!, t), { bold: true });
+    } else if (m[10] ?? m[11]) {
+      out += styled(inlineAnsi(m[10] ?? m[11]!, t), { italic: true });
+    } else if (m[12]) {
+      out += styled(inlineAnsi(m[12], t), {
+        backgroundColor: t.color.diffAdded,
+        color: t.color.diffAddedWord,
+      });
+    } else if (m[13]) {
+      out += styled(`[${m[13]}]`, { color: t.color.muted });
+    } else if (m[14]) {
+      out += styled(`^${m[14]}`, { color: t.color.muted });
+    } else if (m[15]) {
+      out += styled(`_${m[15]}`, { color: t.color.muted });
+    } else if (m[16]) {
+      const url = m[16].replace(/[),.;:!?]+$/g, "");
+
+      out +=
+        styled(urlAsText(normalizeExternalUrl(url)), {
+          color: t.color.accent,
+          underline: true,
+        }) + m[16].slice(url.length);
+    } else if (m[17] ?? m[18]) {
+      out += styled(mathAnsi(texToUnicode(m[17] ?? m[18]!)), {
+        color: t.color.accent,
+        italic: true,
+      });
+    }
+
+    last = i + m[0].length;
+  }
+
+  return out + text.slice(last);
+};
+
 const SAFETY_MARGIN = 4;
 const MIN_COL_WIDTH = 3;
 const COL_GAP = 2; // the '  ' between columns
@@ -215,12 +310,28 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
     return null;
   }
 
-  const cellDisplayWidth = (raw: string) => stringWidth(stripInlineMarkup(raw));
+  // Cells keep their inline markdown: each is styled to ANSI once, then
+  // measured and wrapped by display width (escape codes count as zero).
+  const ansiCache = new Map<string, string>();
+
+  const cellAnsi = (raw: string) => {
+    let v = ansiCache.get(raw);
+
+    if (v === undefined) {
+      v = inlineAnsi(raw, t);
+      ansiCache.set(raw, v);
+    }
+
+    return v;
+  };
+
+  const cellDisplayWidth = (raw: string) => stringWidth(cellAnsi(raw));
 
   // Minimum width: longest word in a cell (to avoid breaking words)
   const minCellWidth = (raw: string) => {
-    const text = stripInlineMarkup(raw);
-    const words = text.split(/\s+/).filter((w) => w.length > 0);
+    const words = cellAnsi(raw)
+      .split(/\s+/)
+      .filter((w) => w.length > 0);
 
     if (words.length === 0) {
       return MIN_COL_WIDTH;
@@ -332,85 +443,27 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
     }
   }
 
-  // Grapheme-safe hard-break: prefer Intl.Segmenter, fall back to code-point split
-  const segmenter =
-    typeof Intl !== "undefined" && "Segmenter" in Intl
-      ? new (Intl as any).Segmenter(undefined, { granularity: "grapheme" })
-      : null;
-
-  const graphemes = (s: string): string[] =>
-    segmenter
-      ? [...segmenter.segment(s)].map((seg: { segment: string }) => seg.segment)
-      : [...s];
-
-  // Word-wrap plain text to fit within `width` display columns.
-  // Operates on stripped text for correct width measurement.
+  // Word-wrap a styled cell to fit within `width` display columns;
+  // wrapAnsi re-opens the active styles on each continuation line.
   const wrapCell = (raw: string, width: number, hard: boolean): string[] => {
-    const text = stripInlineMarkup(raw);
+    const text = cellAnsi(raw);
 
-    if (width <= 0) {
+    if (width <= 0 || stringWidth(text) <= width) {
       return [text];
     }
 
-    if (stringWidth(text) <= width) {
-      return [text];
-    }
-
-    const words = text.split(/\s+/).filter((w) => w.length > 0);
-    const lines: string[] = [];
-    let current = "";
-    let currentWidth = 0;
-
-    for (const word of words) {
-      const w = stringWidth(word);
-
-      if (currentWidth === 0) {
-        if (hard && w > width) {
-          for (const ch of graphemes(word)) {
-            const cw = stringWidth(ch);
-
-            if (currentWidth + cw > width && current) {
-              lines.push(current);
-              current = "";
-              currentWidth = 0;
-            }
-
-            current += ch;
-            currentWidth += cw;
-          }
-        } else {
-          current = word;
-          currentWidth = w;
-        }
-      } else if (currentWidth + 1 + w <= width) {
-        current += " " + word;
-        currentWidth += 1 + w;
-      } else {
-        lines.push(current);
-        current = word;
-        currentWidth = w;
-      }
-    }
-
-    if (current) {
-      lines.push(current);
-    }
-
-    return lines.length > 0 ? lines : [""];
+    return wrapAnsi(text, width, { hard, trim: true }).split("\n");
   };
 
   const isHard = totalMin > availableWidth; // tier 3 needs hard word breaks
   const sep = columnWidths.map((w) => "─".repeat(Math.max(1, w))).join("  ");
 
   // When wrapping isn't needed, build single-line strings per row.
-  // All cells render as plain text via stripInlineMarkup.
-  // TODO: follow-up — format to ANSI then wrap with wrapAnsi for inline markdown preservation.
-  // See free-code/src/components/MarkdownTable.tsx L44-L62 for approach.
   if (!needsWrap) {
     const buildRowString = (row: string[]): string =>
       row
         .map((cell, ci) => {
-          const text = stripInlineMarkup(cell);
+          const text = cellAnsi(cell);
           const pad = " ".repeat(
             Math.max(0, columnWidths[ci]! - stringWidth(text)),
           );
@@ -509,7 +562,7 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
       return (
         <Box flexDirection="column" key={k} paddingLeft={TABLE_PADDING_LEFT}>
           <Text bold color={t.color.accent} wrap="wrap-trim">
-            {normalizedRows[0]!.map((h) => stripInlineMarkup(h)).join(" · ")}
+            {normalizedRows[0]!.map(cellAnsi).join(" · ")}
           </Text>
         </Box>
       );
@@ -533,14 +586,14 @@ const renderTable = (k: number, rows: string[][], t: Theme, cols?: number) => {
             ) : null}
             {headers.map((header, ci) => {
               const cell = row[ci] ?? "";
-              const label = stripInlineMarkup(header) || `Col ${ci + 1}`;
+              const label = cellAnsi(header) || `Col ${ci + 1}`;
 
               return (
                 <Text key={ci} wrap="wrap-trim">
                   <Text bold color={t.color.accent}>
                     {label}:
                   </Text>{" "}
-                  {stripInlineMarkup(cell)}
+                  {cellAnsi(cell)}
                 </Text>
               );
             })}
