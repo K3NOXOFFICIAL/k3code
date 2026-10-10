@@ -101,6 +101,13 @@ class AgentLoop:
         #: at (never elided), and successful reads by (path, mtime, size, range) → (step, tool call id).
         self._elided: set[str] = set()
         self._pinned: set[str] = set()
+        #: Per run(): what the decision model said is still worth knowing of an elided result (tool call id → note)
+        self._notes: dict[str, str] = {}
+        #: The decision model (k3code.context_select), when one is configured: (request, candidates) → {tool call id:
+        #: "keep" | note}. It is asked before a batch of old results is elided; None = plain elision.
+        self.decide_context: Callable[[list[Message], list[Message]], Awaitable[dict[str, str]]] | None = None
+        #: share of the context window past which old tool results are elided
+        self.elide_at_ratio = context_budget.ELIDE_AT_RATIO
         self._reads: dict[tuple[Any, ...], tuple[int, str]] = {}
         self._step = 0
         #: M1: how much of one tool result the model is sent (the transcript keeps all of it); None = the default
@@ -221,6 +228,7 @@ class AgentLoop:
         self.reliability.attach_router(self.router)
         self.reliability.begin_turn()
         self._elided, self._pinned, self._reads, self._step, self._learned = set(), set(), {}, 0, set()
+        self._notes = {}
         # an earlier run's failed calls must not count toward (or be listed in) this run's tool-error stop
         self._tool_errors, self._failed, self._truncated, self._continuations = 0, [], set(), 0
         self.escalation_reason = None  # the REPL reuses one loop: a stop in an earlier run is not this run's
@@ -272,7 +280,7 @@ class AgentLoop:
             specs = self.tool_specs()
             stream = self.reliability.stream(
                 self.router,
-                self._request_messages(messages, specs),
+                await self._request_messages(messages, specs),
                 specs,
                 model=model,
                 max_tokens=max_tokens,
@@ -561,8 +569,8 @@ class AgentLoop:
         window = tuple(args.get(k) for k in ("offset", "limit", "start", "end"))
         return (str(path), st.st_mtime_ns, st.st_size, window)
 
-    def _request_messages(self, messages: list[Message], specs: list[Any]) -> list[Message]:
-        """What the provider is sent: long tool results clipped, and once the request passes ELIDE_AT_RATIO of the
+    async def _request_messages(self, messages: list[Message], specs: list[Any]) -> list[Message]:
+        """What the provider is sent: long tool results clipped, and once the request passes ``elide_at_ratio`` of the
         context window, old tool results elided. ``messages`` (transcript, session) keeps every full result."""
         wire = clip_tool_results(messages, self.tool_output_chars or MAX_TOOL_RESULT_CHARS)
         if not self.context_window:
@@ -572,14 +580,56 @@ class AgentLoop:
         # was elided earlier stays elided; more is elided only once that request is over the threshold again, and then
         # every old result at once. Judging the unelided request instead elided one more result on every step.
         view = (
-            context_budget.elide_old_results(wire, over=False, elided=self._elided, keep=self._pinned)
+            context_budget.elide_old_results(
+                wire, over=False, elided=self._elided, keep=self._pinned, notes=self._notes
+            )
             if self._elided
             else wire
         )
-        estimate = context_budget.overhead_tokens(self.system_prompt, specs) + context_budget.message_tokens(view)
-        if estimate > self.context_window * context_budget.ELIDE_AT_RATIO:
-            view = context_budget.elide_old_results(wire, over=True, elided=self._elided, keep=self._pinned)
+        overhead = context_budget.overhead_tokens(self.system_prompt, specs)
+        threshold = self.context_window * self.elide_at_ratio
+        if overhead + context_budget.message_tokens(view) > threshold:
+            keep = set(self._pinned)
+            if self.decide_context is not None:
+                keep |= await self._ask_decision_model(wire, threshold - overhead)
+            view = context_budget.elide_old_results(wire, over=True, elided=self._elided, keep=keep, notes=self._notes)
         return view
+
+    async def _ask_decision_model(self, wire: list[Message], budget: float) -> set[str]:
+        """Ids of old results the decision model keeps whole (its notes for the others go to ``_notes``). What it keeps
+        may fill at most half of what plain elision would leave free under ``budget`` (message tokens); past that, the
+        oldest kept results are elided after all. Keeping up to the threshold itself made the next step's result start a
+        new batch (and a new prefix) on almost every step."""
+        candidates = context_budget.elision_candidates(wire, elided=self._elided, keep=self._pinned)
+        if not candidates:
+            return set()
+        try:
+            decision = await self.decide_context(wire, candidates)  # type: ignore[misc]
+        except Exception:  # noqa: BLE001 - the decision model is an optimization: any failure means plain elision
+            logger.warning("decision model failed; eliding old tool results without it", exc_info=True)
+            return set()
+        kept = [m for m in candidates if decision.get(m.tool_call_id or "") == "keep"]
+        for m in candidates:
+            note = decision.get(m.tool_call_id or "")
+            if note and note != "keep":
+                self._notes[m.tool_call_id or ""] = note
+        # the request with every candidate elided, then the kept ones added back newest first while they fit in half of
+        # the room left under the threshold: the other half is what the turn grows into before the next batch
+        floor = context_budget.message_tokens(
+            context_budget.elide_old_results(
+                wire, over=True, elided=set(self._elided), keep=self._pinned, notes=self._notes
+            )
+        )
+        limit = floor + (budget - floor) / 2
+        keep: set[str] = set()
+        for m in reversed(kept):
+            cost = len(m.content or "") // 4
+            if floor + cost > limit:
+                break
+            floor += cost
+            keep.add(m.tool_call_id or "")
+        logger.info("decision model: %d of %d old results kept, %d noted", len(keep), len(candidates), len(self._notes))
+        return keep
 
     def _sandbox_argv(self) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.

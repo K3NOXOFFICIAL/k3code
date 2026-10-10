@@ -94,15 +94,36 @@ def elide_marker(name: str | None, chars: int) -> str:
     return f"[earlier {name or 'tool'} result elided: {chars} chars — re-run if needed]"
 
 
+def elision_candidates(
+    messages: Sequence[Message], *, elided: set[str], keep: set[str] | frozenset[str] = frozenset()
+) -> list[Message]:
+    """The tool results a request over the threshold would newly elide (see elide_old_results), in order."""
+    tool_idx = [i for i, m in enumerate(messages) if m.role == "tool"]
+    old = tool_idx[:-ELIDE_KEEP_CALLS] if len(tool_idx) > ELIDE_KEEP_CALLS else []
+    return [
+        messages[i]
+        for i in old
+        if messages[i].tool_call_id not in keep
+        and messages[i].tool_call_id not in elided
+        and len(messages[i].content or "") > ELIDE_MIN_CHARS
+    ]
+
+
 def elide_old_results(
-    messages: Sequence[Message], *, over: bool, elided: set[str], keep: set[str] | frozenset[str] = frozenset()
+    messages: Sequence[Message],
+    *,
+    over: bool,
+    elided: set[str],
+    keep: set[str] | frozenset[str] = frozenset(),
+    notes: dict[str, str] | None = None,
 ) -> list[Message]:
     """The request with old tool results replaced by a marker; ``messages`` itself is not changed.
 
     Results older than the last ELIDE_KEEP_CALLS tool results and longer than ELIDE_MIN_CHARS are elided while the
     request is ``over`` the threshold. A result once elided stays elided for the rest of the turn (its id is added to
     ``elided``), so the request prefix does not flip back and forth around the threshold. Ids in ``keep`` are never
-    elided (a later "unchanged since" read points at them).
+    elided (a later "unchanged since" read points at them). ``notes`` (from the decision model, see
+    k3code.context_select) holds what is still worth knowing of an elided result; it follows the marker.
     """
     tool_idx = [i for i, m in enumerate(messages) if m.role == "tool"]
     old = set(tool_idx[:-ELIDE_KEEP_CALLS]) if len(tool_idx) > ELIDE_KEEP_CALLS else set()
@@ -111,6 +132,8 @@ def elide_old_results(
         candidate = i in old and m.tool_call_id not in keep and bool(m.content)
         if candidate and (m.tool_call_id in elided or (over and len(m.content or "") > ELIDE_MIN_CHARS)):
             elided.add(m.tool_call_id or "")
-            m = dataclasses.replace(m, content=elide_marker(m.name, len(m.content or "")))
+            marker = elide_marker(m.name, len(m.content or ""))
+            note = (notes or {}).get(m.tool_call_id or "")
+            m = dataclasses.replace(m, content=f"{marker}\nStill relevant: {note}" if note else marker)
         out.append(m)
     return out

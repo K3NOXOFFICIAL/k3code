@@ -50,6 +50,7 @@ from k3code.commands import CommandRegistry
 from k3code.commands.builtin import build_registry as build_commands
 from k3code.config import Settings, default_project_dir, load_config, retention
 from k3code.context_budget import compact_threshold, context_window, overhead_tokens
+from k3code.context_select import decide, decision_settings
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.extratools import register_mcp_tools, register_skill_tool
 from k3code.gateway import auth as gw_auth
@@ -1725,6 +1726,17 @@ class GatewayServer:
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         loop.hooks = userhooks.load(session.perms.cwd, session.session_id)  # re-read per loop: config edits apply
         loop.tool_error_stop_message = not escalates
+        decision = decision_settings(self.config)
+        if decision.enabled:
+            loop.elide_at_ratio = decision.at_ratio
+            loop.decide_context = lambda wire, candidates: decide(
+                self.model_caller,
+                wire,
+                candidates,
+                decision,
+                session_id=session.session_id,
+                router=self._decision_router(decision),
+            )
         loop.on_tool_outcome = lambda call, result, failure: self.learning.tool_outcome(session, call, result, failure)
         register_skill_tool(loop.tools, session.perms.cwd, list(self.config.skills.roots))
         register_mcp_tools(loop.tools, self.mcp)
@@ -1759,6 +1771,22 @@ class GatewayServer:
         if isinstance(first, list):
             first = first[0] if first else ""
         return str(first or session.stored.model or self.config.default_model)
+
+    def _decision_router(self, decision: Any) -> Router | None:
+        """The router for ``context.decision_model.model`` (on its ``provider`` block, or on every block), or None
+        when no model is named: the call then goes to the tier ``task_tiers.context_select`` picks (cheap)."""
+        if not decision.model:
+            return None
+        providers = [p for p in self.providers if not decision.provider or p.name == decision.provider]
+        if not providers:
+            raise ValueError(f"context.decision_model.provider {decision.provider!r} names no provider block")
+        return Router(
+            build_chain(providers, [decision.model] * len(providers)),
+            cooldowns=self.cooldowns,
+            on_event=self._on_router_event,
+            tier="cheap",
+            **router_options(self.config),
+        )
 
     def _router_window(self, router: Router, session: LiveSession) -> int:
         """The smallest context window among the models ``router`` can send to (a cheap tier or an escalated one

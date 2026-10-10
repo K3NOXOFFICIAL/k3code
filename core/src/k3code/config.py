@@ -195,7 +195,8 @@ class Settings(BaseModel):
     # the exact origin of research.searxng_url is always allowed. See k3code.net_guard.
     web: dict[str, Any] = Field(default_factory=dict)
     # Context management: {compact_at_ratio: 0.7, compact_at_tokens: <absolute override>, keep_messages: 8}; see
-    # GatewayServer._maybe_compact and k3code.context_budget
+    # GatewayServer._maybe_compact and k3code.context_budget. decision_model: {enabled: false, provider: "", model: "",
+    # at_ratio: 0.5}: a small model picks which old tool results the main model still needs (k3code.context_select)
     context: dict[str, Any] = Field(default_factory=dict)
     # Per model id: {<model id>: {context_window: 200000}}; ids without an entry use k3code.context_budget's defaults
     models: dict[str, dict[str, Any]] = Field(default_factory=dict)

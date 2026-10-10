@@ -40,6 +40,7 @@ class TaskKind(StrEnum):
     ADVISOR = "advisor"
     RESEARCH_SEARCH = "research_search"
     CLASSIFICATION = "classification"
+    CONTEXT_SELECT = "context_select"
 
 
 DEFAULT_POLICY: dict[TaskKind, Tier] = {
@@ -57,6 +58,7 @@ DEFAULT_POLICY: dict[TaskKind, Tier] = {
     TaskKind.ADVISOR: Tier.STRONG,
     TaskKind.RESEARCH_SEARCH: Tier.CHEAP,
     TaskKind.CLASSIFICATION: Tier.CHEAP,
+    TaskKind.CONTEXT_SELECT: Tier.CHEAP,
 }
 
 #: Escalation ladder: cheaper tiers climb towards ``strong``.
