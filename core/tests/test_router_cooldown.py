@@ -139,7 +139,7 @@ async def test_all_cooling_fails_fast_with_clear_message():
 
 async def test_not_all_cooling_has_no_retry_after():
     a = Scripted("a", [err429(7200)])
-    b = Scripted("b", [ProviderError(message="bad key", status_code=401)])
+    b = Scripted("b", [ProviderError(message="bad request", status_code=400)])  # fails over, arms no cooldown
     router, _, _, _ = make([a, b])
     with pytest.raises(ChainExhausted) as ei:
         await router.complete(MSGS, [])
@@ -369,3 +369,21 @@ async def test_a_keyless_entry_never_arms_an_auth_cooldown():
             await router.complete(MSGS, [])
     assert a.calls == 3  # tried every time, never skipped
     assert store.reason_of(provider="a", model="m", base_url="http://a") is None
+
+
+async def test_mixed_rate_limit_and_auth_chain_waits_for_the_reset_instead_of_calling_it_auth():
+    a = Scripted("a", [err429(120)])
+    b = Scripted("b", [err401()])
+    router, _, _, _ = make([a, b])
+    with pytest.raises(ChainExhausted) as exc:
+        await router.complete(MSGS, [])
+    assert "rate-limited" in str(exc.value) and "authentication" not in str(exc.value)
+    assert exc.value.retry_after is not None and 100 < exc.value.retry_after <= 120  # parks, resumes when A resets
+    assert exc.value.last_reason == "auth"
+
+
+async def test_a_chain_where_every_failure_is_auth_still_says_authentication_failed():
+    router, _, _, _ = make([Scripted("a", [err401()]), Scripted("b", [err401()])])
+    with pytest.raises(ChainExhausted) as exc:
+        await router.complete(MSGS, [])
+    assert "authentication failed" in str(exc.value) and exc.value.retry_after is None
