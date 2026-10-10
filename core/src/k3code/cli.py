@@ -231,7 +231,7 @@ def _headless_slash(prompt: str) -> tuple[Any, str, str] | None:
 async def _run_headless_slash(cmd: Any, name: str, arg: str, config: Any) -> dict[str, Any]:
     """Run a slash command through the gateway's own dispatch, without a session, a client or any provider."""
     if not cmd.headless:
-        return {"error": "interactive_only", "message": f"/{name} needs an interactive session; run it in the TUI"}
+        return {"error": "interactive_only", "message": f"/{name} needs an interactive session"}
     from k3code.gateway.server import GatewayServer
 
     server = GatewayServer(config=config)
@@ -240,6 +240,8 @@ async def _run_headless_slash(cmd: Any, name: str, arg: str, config: Any) -> dic
     finally:
         await server.close()
     text = str(result.get("output") or result.get("message") or "")
+    if result.get("error"):  # a handler that raised: dispatch turned it into text, but -p must fail
+        return {"error": str(result["error"]), "message": text}
     data = {k: v for k, v in result.items() if k not in ("type", "message", "output")}
     return {"text": text, "command": f"/{cmd.name}", "data": data}
 

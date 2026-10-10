@@ -10,7 +10,7 @@ from pathlib import Path
 MODEL_TEXT = "the model answered"
 
 
-def _run(tmp_path: Path, *args: str, providers: bool = True) -> subprocess.CompletedProcess[str]:
+def _run(tmp_path: Path, *args: str, providers: bool = True, setup: str = "") -> subprocess.CompletedProcess[str]:
     home = tmp_path / "k3home"
     home.mkdir(exist_ok=True)
     (home / "config.yaml").write_text(
@@ -28,7 +28,7 @@ def _run(tmp_path: Path, *args: str, providers: bool = True) -> subprocess.Compl
     (project / "uv.lock").write_text("version = 1\n")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("K3CODE_", "GIT_"))}
     env |= {"K3CODE_HOME": str(home), "K3CODE_FAKE_PROVIDER": str(script), "K3_TEST_KEY": "x", "HOME": str(tmp_path)}
-    code = "from k3code.cli import cli; cli()"
+    code = f"{setup}\nfrom k3code.cli import cli; cli()"
     return subprocess.run(
         [sys.executable, "-c", code, *args], cwd=project, env=env, capture_output=True, text=True, timeout=120
     )
@@ -64,5 +64,27 @@ def test_a_prompt_that_starts_with_a_path_still_goes_to_the_model(tmp_path):
 def test_a_command_that_needs_a_session_fails_with_one_line(tmp_path):
     res = _run(tmp_path, "-p", "/clear")
     assert res.returncode == 1
-    assert res.stderr == "k3code: error: /clear needs an interactive session; run it in the TUI\n"
+    assert res.stderr == "k3code: error: /clear needs an interactive session\n"
     assert res.stdout == ""
+
+
+#: Makes /project raise, in the child process (the command runs there, so a monkeypatch here would not reach it).
+_BROKEN_PROJECT = """
+from k3code.commands.project_cmd import ProjectCommand
+async def _boom(self, ctx, session_id, arg):
+    raise RuntimeError("boom")
+ProjectCommand.handle = _boom
+"""
+
+
+def test_a_command_that_raises_fails_with_one_stderr_line(tmp_path):
+    res = _run(tmp_path, "-p", "/project", setup=_BROKEN_PROJECT)
+    assert res.returncode == 1
+    assert res.stderr == "k3code: error: /project failed: boom\n"
+    assert res.stdout == ""
+
+
+def test_a_command_that_raises_reports_the_error_in_json(tmp_path):
+    res = _run(tmp_path, "-p", "/project", "--json", setup=_BROKEN_PROJECT)
+    assert res.returncode == 1
+    assert json.loads(res.stdout) == {"error": "command_failed", "message": "/project failed: boom"}
