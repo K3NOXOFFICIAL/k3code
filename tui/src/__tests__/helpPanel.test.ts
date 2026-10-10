@@ -61,12 +61,15 @@ const runHelp = (): PanelSection[] => {
   return panel.mock.calls[0]![1] as PanelSection[];
 };
 
-const renderPanel = async (sections: PanelSection[]): Promise<string> => {
+const renderPanel = async (
+  sections: PanelSection[],
+  columns = 100,
+): Promise<string> => {
   const stdout = new PassThrough();
   const stdin = new PassThrough();
   const stderr = new PassThrough();
 
-  Object.assign(stdout, { columns: 100, isTTY: false, rows: 24 });
+  Object.assign(stdout, { columns, isTTY: false, rows: 24 });
   Object.assign(stdin, { isTTY: false });
   Object.assign(stderr, { isTTY: false });
 
@@ -129,5 +132,43 @@ describe("/help", () => {
     }
 
     expect(out).toContain("Hotkeys");
+  });
+
+  it.each([120, 80])(
+    "keeps a gap between every name and its description at width %i",
+    async (columns) => {
+      const sections = runHelp();
+      const rows = sections.flatMap((s) => s.rows ?? []);
+      const names = rows.map(([k]) => k);
+
+      expect(names).toContain("/details [hidden|collapsed|expanded|cycle]");
+      expect(names).toContain("Shift+Enter / Alt+Enter");
+
+      const lines = (await renderPanel(sections, columns)).split("\n");
+
+      for (const [name, desc] of rows) {
+        const line = lines.find((l) => l.includes(name));
+
+        expect(line, name).toBeDefined();
+
+        const rest = line!.slice(line!.indexOf(name) + name.length);
+
+        // The description may be cut off at narrow widths, but the two
+        // spaces after the name must survive.
+        expect(rest.startsWith("  "), `${name} | ${desc}`).toBe(true);
+      }
+    },
+  );
+
+  it("keeps short names aligned so a long name does not hide their descriptions at width 80", async () => {
+    const rows = runHelp().flatMap((s) => s.rows ?? []);
+    const fortune = rows.find(([k]) => k === "/fortune [random|daily]");
+
+    expect(fortune).toBeDefined();
+
+    const lines = (await renderPanel(runHelp(), 80)).split("\n");
+    const line = lines.find((l) => l.includes(fortune![0]));
+
+    expect(line).toContain(fortune![1]);
   });
 });
