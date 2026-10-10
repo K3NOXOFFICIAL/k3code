@@ -261,3 +261,78 @@ async def test_a_cooldown_armed_under_a_model_override_is_honoured_on_the_next_c
         await router.complete(MSGS, [], model="override")
     assert a.calls == 1  # skipped inside its window, not called again
     assert exc.value.retry_after is not None and exc.value.retry_after > 100
+
+
+# ── auth failures cool the entry down ──────────────────────────────────
+
+
+def err401() -> ProviderError:
+    return ProviderError(message="invalid api key", status_code=401, body={"error": {"message": "invalid api key"}})
+
+
+async def test_auth_failure_cools_the_entry_down_and_later_calls_skip_it():
+    a = Scripted("a", [err401()])
+    b = Scripted("b", ["from b"])
+    router, store, _, _ = make([a, b])
+    assert (await router.complete(MSGS, [])).content == "from b"
+    assert a.calls == 1
+    assert store.reason_of(provider="a", model="m", base_url="http://a") is FailoverReason.auth
+    assert 290 < store.remaining_seconds(provider="a", model="m", base_url="http://a") <= 300
+    assert (await router.complete(MSGS, [])).content == "from b"
+    assert a.calls == 1  # no POST (and so no reachability probe) to the dead entry on the second call
+
+
+async def test_replaced_key_is_tried_at_once():
+    a = Scripted("a", [err401(), "a works now"])
+    a.api_key = "revoked-key"
+    router, store, _, _ = make([a, Scripted("b", ["from b"])])
+    assert (await router.complete(MSGS, [])).content == "from b"
+    assert (await router.complete(MSGS, [])).content == "from b" and a.calls == 1
+    a.api_key = "fresh-key"
+    assert (await router.complete(MSGS, [])).content == "a works now"
+    assert a.calls == 2
+    assert store.reason_of(provider="a", model="m", base_url="http://a") is None
+
+
+def test_auth_cooldown_never_stores_the_key(tmp_path):
+    from k3code.router.cooldown import key_fingerprint
+
+    path = tmp_path / "cooldowns.json"
+    store = CooldownStore(path=path)
+    store.arm(FailoverReason.auth, provider="a", model="m", fingerprint=key_fingerprint("sk-secret-value"))
+    raw = path.read_text()
+    assert "sk-secret-value" not in raw and key_fingerprint("sk-secret-value") in raw
+    reborn = CooldownStore(path=path)
+    assert reborn.in_cooldown(provider="a", model="m", fingerprint=key_fingerprint("sk-secret-value"))
+    assert not reborn.in_cooldown(provider="a", model="m", fingerprint=key_fingerprint("other"))
+
+
+def test_auth_ladder_doubles_to_an_hour_and_success_resets_it():
+    store = CooldownStore()
+    seen = [store.arm(FailoverReason.auth, provider="a", model="m", retry_after=5) for _ in range(6)]
+    assert seen == [300, 600, 1200, 2400, 3600, 3600]  # a declared Retry-After does not shorten it
+    store.record_success(provider="a", model="m")
+    assert store.arm(FailoverReason.auth, provider="a", model="m") == 300
+
+
+def test_clear_reason_auth_leaves_other_cooldowns_and_resets_the_ladder():
+    store = CooldownStore()
+    store.arm(FailoverReason.auth, provider="a", model="m")
+    store.arm(FailoverReason.auth, provider="a", model="m")
+    store.arm(FailoverReason.quota, provider="q", model="m")
+    assert store.clear_reason(FailoverReason.auth) == 1
+    assert store.reason_of(provider="q", model="m") is FailoverReason.quota
+    assert store.arm(FailoverReason.auth, provider="a", model="m") == 300
+
+
+async def test_all_entries_in_auth_cooldown_says_authentication_not_rate_limit():
+    a, b = Scripted("a", [err401()]), Scripted("b", [err401()])
+    router, _, _, _ = make([a, b])
+    with pytest.raises(ChainExhausted) as first:
+        await router.complete(MSGS, [])
+    with pytest.raises(ChainExhausted) as second:  # now both are skipped, nothing is called
+        await router.complete(MSGS, [])
+    assert (a.calls, b.calls) == (1, 1)
+    for exc in (first.value, second.value):
+        assert "authentication" in str(exc) and "rate-limited" not in str(exc)
+        assert exc.last_reason == "auth" and exc.retry_after is None  # permanent: the retry layer must not park

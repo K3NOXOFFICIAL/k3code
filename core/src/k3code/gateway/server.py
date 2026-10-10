@@ -188,6 +188,11 @@ class LiveSession:
         self.steer_queue: list[str] = []
         #: tool call ids of the model call in flight already announced with tool.start (see _announce_tool)
         self.announced_tools: set[str] = set()
+        #: monotonic start of the model call in flight (its first router attempt), and the moment the loop began its
+        #: next tool (the model call's end, then each tool's end: it runs them one after another), so the ``call`` /
+        #: ``tool`` usage rows carry their wall time (``k3code stats`` shows where time goes)
+        self.call_started: float | None = None
+        self.tool_mark: float | None = None
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
         #: Wall-clock start of the latest turn or job (time.time()); the agent view's "working N" counts from it.
@@ -1448,6 +1453,8 @@ class GatewayServer:
             if sess is not None:
                 sess.last_entry = (event.provider, event.model)
                 sess.last_tier = str(event.extra.get("tier", "main"))
+                if sess.call_started is None:  # retries and failovers of one call count towards its time
+                    sess.call_started = time.monotonic()
         elif event.kind == "router.retry":
             self.usage.record("retry", session=sid, provider=event.provider, model=event.model, detail=event.reason)
         elif event.kind == "router.failover":
@@ -1460,6 +1467,8 @@ class GatewayServer:
                 },
             )
         elif event.kind == "router.exhausted":
+            if sess is not None:
+                sess.call_started = None  # the failed call produces no row; the next one starts afresh
             # No error event here: the failed turn's message.complete reports it once, with the next step
             # (error_surface). A walk that is retried after a pause or park must not leave a stale error behind.
             self.emit("status.update", {"kind": "status", "text": f"all providers failed ({event.reason})"})
@@ -2082,7 +2091,6 @@ class GatewayServer:
         session.announced_tools.add(tc.id)
         session.emit("tool.generating", {"name": tc.name})
         session.emit("tool.start", {"tool_id": tc.id, "name": tc.name, "args": tc.arguments})
-        self.usage.record("tool", session=session.session_id, detail=tc.name)
 
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
@@ -2090,6 +2098,14 @@ class GatewayServer:
         elif event.type == "done" and event.message:
             msg = event.message
             if msg.role == "tool":
+                now = time.monotonic()
+                self.usage.record(
+                    "tool",
+                    session=session.session_id,
+                    detail=msg.name or "",
+                    seconds=now - session.tool_mark if session.tool_mark is not None else 0.0,
+                )
+                session.tool_mark = now
                 self._checkpoint_turn(session)
                 payload = {
                     "tool_id": msg.tool_call_id or "",
@@ -2116,7 +2132,10 @@ class GatewayServer:
                     tier=session.last_tier,
                     task_kind=session.current_kind,
                     turn=session.turn_id,
+                    seconds=time.monotonic() - session.call_started if session.call_started is not None else 0.0,
                 )
+                session.call_started = None
+                session.tool_mark = time.monotonic()  # the loop executes the tool calls right after this message
                 if u:
                     session.emit("session.usage", {"usage": _usage_payload(u)})
                 # openai_compat and anthropic stream no tool_call events: their calls arrive on this message only

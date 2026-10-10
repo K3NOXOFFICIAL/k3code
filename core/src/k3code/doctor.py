@@ -24,6 +24,7 @@ from k3code.daemon import k3_home, socket_path
 from k3code.reliability.governor import read_psi
 from k3code.reliability.journal import ToolJournal
 from k3code.reliability.netwatch import NetWatchConfig, _default_provider_probe, default_internet_probe
+from k3code.router.cooldown import clear_auth_cooldowns
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 #: Hosts that mean "this chain entry goes through OmniRoute".
@@ -110,6 +111,9 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
         ok, ms, detail = results[i]
         status = OK if ok else FAIL
         keyless = not (p.api_key or (p.api_key_env and os.environ.get(p.api_key_env)))
+        if ok and not keyless:
+            # the key answered: an auth cooldown armed by an earlier rejection is stale (the key was fixed in place)
+            clear_auth_cooldowns(k3_home() / "cooldowns.json", provider=p.name)
         if ok and keyless:
             # only reachability was probed: an endpoint that answers 401 is up, but every call to it fails over
             checks.append(

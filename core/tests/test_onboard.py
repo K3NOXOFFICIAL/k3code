@@ -242,3 +242,26 @@ def test_fast_onboard_over_an_existing_chain_keeps_the_other_providers_as_fallba
     assert [p.name for p in cfg.providers] == ["endpoint", "claude-cli"]
     assert cfg.providers[1].models == {"default": "sonnet"}
     assert cfg.permission_mode == "yolo"
+
+
+def test_onboard_clears_auth_cooldowns_for_the_rewritten_provider(root) -> None:
+    from k3code.router.classifier import FailoverReason
+    from k3code.router.cooldown import CooldownStore
+
+    path = root / "k3home" / "cooldowns.json"
+    CooldownStore(path=path).arm(FailoverReason.auth, provider="endpoint", model="m-fast")
+    answers = _answers(
+        root,
+        {
+            "onboard": {
+                "mode": "fast",
+                "provider": "api",
+                "endpoint": "http://127.0.0.1:9/v1/",
+                "key": "sk-NEW",
+                "model": "m-fast",
+            }
+        },
+    )
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    assert CooldownStore(path=path).reason_of(provider="endpoint", model="m-fast") is None
