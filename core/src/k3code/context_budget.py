@@ -14,8 +14,20 @@ from typing import Any
 from k3code.providers.types import Message, ToolSpec
 
 #: Built-in context windows by model family (prefix of the model id, after any "vendor/" part); see context_window.
-FAMILY_WINDOWS: tuple[tuple[str, int], ...] = (("claude", 200_000), ("gpt-4o", 128_000), ("gpt-4.1", 128_000))
-FALLBACK_WINDOW = 32_000
+#: sonnet, opus and haiku are the Claude Code aliases the claude-cli provider sends.
+FAMILY_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("claude", 200_000),
+    ("sonnet", 200_000),
+    ("opus", 200_000),
+    ("haiku", 200_000),
+    ("gpt-4o", 128_000),
+    ("gpt-4.1", 128_000),
+)
+#: Window of an id with no config entry and no known family, mostly a gateway alias (auto/coding-manual) in front of a
+#: large model. It was 32k, which compacted those sessions at ~22k tokens. 128k is the floor of current models; a
+#: smaller model that overflows is not lost: the gateway compacts on the provider's ContextOverflow and retries once.
+#: `k3code doctor` names each id that gets this value.
+FALLBACK_WINDOW = 128_000
 #: Compaction between turns starts at this share of the active model's window (context.compact_at_ratio).
 COMPACT_AT_RATIO = 0.7
 #: In a turn, old tool results are elided from the request once it passes this share of the window...
@@ -30,11 +42,22 @@ def context_window(config: Any, model_id: str) -> int:
     entry = (getattr(config, "models", None) or {}).get(model_id) or {}
     if isinstance(entry, dict) and entry.get("context_window"):
         return int(entry["context_window"])
+    return family_window(model_id) or FALLBACK_WINDOW
+
+
+def has_explicit_window(config: Any, model_id: str) -> bool:
+    """Whether config sets ``models.<model_id>.context_window``."""
+    entry = (getattr(config, "models", None) or {}).get(model_id) or {}
+    return isinstance(entry, dict) and bool(entry.get("context_window"))
+
+
+def family_window(model_id: str) -> int | None:
+    """The built-in window of the model's family, or None when no family in FAMILY_WINDOWS matches."""
     name = model_id.lower().rsplit("/", 1)[-1]
     for prefix, window in FAMILY_WINDOWS:
         if name.startswith(prefix):
             return window
-    return FALLBACK_WINDOW
+    return None
 
 
 def compact_threshold(config: Any, model_id: str) -> int:

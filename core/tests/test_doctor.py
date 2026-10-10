@@ -265,3 +265,26 @@ def test_project_check_reports_the_stacks_a_read_only_scan_finds(tmp_path):
     assert chk.detail.startswith("stacks: python (uv), node (pnpm); no project config")
     assert chk.data["stacks"] == ["python (uv)", "node (pnpm)"]
     assert not projectstate.state_path(tmp_path).exists()
+
+
+def test_doctor_names_chain_models_whose_context_window_is_a_guess():
+    """Issue #30: an id with no models.<id>.context_window and no known family gets a hint; the others stay quiet."""
+    from k3code.config import ProviderEntry, Settings
+    from k3code.doctor import OK, WARN, check_context_windows
+
+    gateway = ProviderEntry(
+        name="gw",
+        kind="openai",
+        base_url="http://gw",
+        api_key_env="K",
+        models={"default": ["auto/coding-manual", "claude-sonnet-5-5"], "cheap": "set-explicitly"},
+        tiers={"strong": ["gpt-4.1", "auto/coding-manual"]},
+    )
+    cfg = Settings(providers=[gateway], models={"set-explicitly": {"context_window": 64_000}})
+    checks = check_context_windows(cfg)
+    assert [(c.name, c.status) for c in checks] == [("context-window:auto/coding-manual", WARN)]
+    assert "assuming 128000 tokens" in checks[0].detail
+    assert "models: {auto/coding-manual: {context_window: <tokens>}}" in checks[0].fix
+
+    cfg.models["auto/coding-manual"] = {"context_window": 1_000_000}
+    assert [(c.name, c.status) for c in check_context_windows(cfg)] == [("context-window", OK)]
