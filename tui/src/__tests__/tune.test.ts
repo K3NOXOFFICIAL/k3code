@@ -440,6 +440,19 @@ describe("tuneNote", () => {
     expect(tuneNote(press(s, UP).state)).toBe("");
   });
 
+  it("keeps the ultracode line under a model that ignores effort", () => {
+    // Issue #56: the effort note used to replace it while ultracode was on.
+    const s = press(state({ model: "tiny" }), TAB).state;
+
+    expect(s.ultra).toBe(true);
+    expect(s.rows[s.cursor]!.effort).toBe(false);
+    expect(tuneNote(s)).toMatch(/ignores effort.*multi-agent pipeline/);
+    expect(tuneNote(s, 40)).toMatch(/ltracode/);
+    expect(tuneNote(s, 40).length).toBeLessThanOrEqual(40);
+    // ultracode off: the effort note alone, as before
+    expect(tuneNote(state({ model: "tiny" }))).toMatch(/^This model ignores/);
+  });
+
   it("describes ultracode only while it is on", () => {
     expect(tuneNote(state())).toBe("");
     expect(tuneNote(press(state(), TAB).state)).toMatch(
@@ -639,6 +652,78 @@ describe("tuneScreen", () => {
         lines.length + TUNE_OVERLAY_CHROME,
         `${cols}x${rows}`,
       ).toBeLessThanOrEqual(rows);
+    }
+  });
+
+  it("fits short terminals: the wake line, then the subtitle and blanks go before the list", () => {
+    // Issue #56: 60x20 overflowed by one row, 60x18 by three.
+    for (const [cols, rows] of [
+      [60, 20],
+      [60, 18],
+      [80, 18],
+      [100, 17],
+      [50, 16],
+    ] as const) {
+      for (const ultra of [[], [TAB]] as const) {
+        const { layout, lines } = screenFor(many, cols, rows, [...ultra]);
+        const kinds = lines.map((l) => l.kind);
+
+        expect(
+          lines.length + TUNE_OVERLAY_CHROME,
+          `${cols}x${rows}`,
+        ).toBeLessThanOrEqual(rows);
+        expect(kinds).toContain("keys");
+        expect(kinds.filter((k) => k === "model")).toHaveLength(
+          layout.listRows,
+        );
+      }
+    }
+
+    // 60x20: the wake line went; the subtitle stays and the list keeps three rows
+    const at20 = screenFor(many, 60, 20);
+
+    expect(at20.layout.compact).toBe(false);
+    expect(at20.lines.map((l) => l.kind)).not.toContain("wake");
+    expect(at20.lines.map((l) => l.kind)).toContain("subtitle");
+    expect(at20.layout.listRows).toBe(TUNE_MIN_LIST);
+
+    // 60x18: compact, no subtitle and no blank lines
+    const at18 = screenFor(many, 60, 18);
+
+    expect(at18.layout.compact).toBe(true);
+    expect(at18.lines.map((l) => l.kind)).not.toContain("subtitle");
+  });
+
+  it("fits narrow terminals: no line wider than the popup, Esc always on the key line", () => {
+    // Issue #56: below ~46 columns the key line lost Esc and the model rows ran past the popup.
+    const long = {
+      models: [
+        {
+          description: "a very long description that will not fit here at all",
+          effort: true,
+          key: "an-extremely-long-model-key-name-indeed",
+          resolved: ["vendor/model"],
+        },
+        ...models(3),
+      ],
+    };
+
+    for (const cols of [46, 44, 42, 40]) {
+      const { layout, lines } = screenFor(long, cols, 30);
+
+      // the popup (content + border + padding) stays inside the terminal
+      expect(layout.width + 4, `${cols}`).toBeLessThanOrEqual(cols);
+
+      for (const l of lines.filter(
+        (x) => x.kind === "model" || x.kind === "keys",
+      )) {
+        expect(
+          lineText(l).length,
+          `${cols}: ${lineText(l)}`,
+        ).toBeLessThanOrEqual(layout.width);
+      }
+
+      expect(lineText(lines.find((l) => l.kind === "keys")!)).toMatch(/Esc$/);
     }
   });
 

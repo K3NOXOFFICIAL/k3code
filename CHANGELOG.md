@@ -45,6 +45,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Fixed
 
+- **The Tune popup fits small terminals.** On a short terminal it drops the wake-word line, then the subtitle and blank lines, before the model list goes under three rows (60x20 and 60x18 overflowed before); below 46 columns the popup stays inside the terminal, the model rows are cut to its width and the key line keeps `Esc`; and while ultracode is on, a model that ignores effort no longer hides the ultracode note.
 - **An imported bundle cannot arm ultracode.** `k3code import` now drops a session's `ultra_mode`, like its `mode`, roots and background markers, so a bundle cannot make the next prompt spawn parallel sub-agents.
 - **A stopped background session says it was stopped.** Stopping a backgrounded job (an `ultracode` run catches the stop and returns) used to notify "Background session '...' finished"; it now says "was stopped" as a warning, and a turn that ends in an error says "failed" with the error.
 - **`/model <key>` keeps the reason next to flags.** `/model <key> [flags] [reason]` reads only `--reasoning`, `--global`, `--session` and `--provider` as settings and keeps every other word as the reason, so a reason with `--` in it is no longer refused, an effort word in the reason (`high latency`) no longer becomes the effort when a flag is present, and the reason is recorded with flags too. After a bare `--` everything is reason.

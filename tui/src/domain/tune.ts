@@ -46,6 +46,10 @@ const MIN_WIDTH = 40;
 const MAX_WIDTH = 90;
 /** Rows around the popup: its double border and top margin (3) plus the status rule and spacer under it (3). */
 export const TUNE_OVERLAY_CHROME = 6;
+/** The subtitle and the two blank lines: what a short terminal drops before the list goes under three rows. */
+const TUNE_ROOMY_LINES = 3;
+/** Columns around the popup's content: its border and padding. */
+const TUNE_SIDE_CHROME = 4;
 const LABEL_MAX = 26;
 const ULTRA_BLOCK_WIDTH = "Ultracode  off".length;
 const ULTRA_GAP = 3;
@@ -422,6 +426,8 @@ export interface TuneLayout {
   effort: EffortGeometry;
   /** Model rows on screen at once. */
   listRows: number;
+  /** A short terminal: no subtitle and no blank lines, so the list keeps its rows. */
+  compact?: boolean;
   /** The wake-word hint line; "" when no word is enabled or none fits the width. */
   wake: string;
   /** More models than rows: edge markers and a "+N more" line. */
@@ -429,17 +435,26 @@ export interface TuneLayout {
   width: number;
 }
 
-/** Popup width: what ModelPicker uses, so the two overlays line up; a grid cell may cap it. */
+/**
+ * Popup width: what ModelPicker uses, so the two overlays line up; a grid cell
+ * may cap it, and a terminal narrower than the minimum popup gets a popup that
+ * still fits inside it.
+ */
 export const tuneWidth = (cols: number, maxWidth?: number) =>
   clampOverlayWidth(
-    Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, cols - 6)),
+    Math.min(
+      Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, cols - 6)),
+      Math.max(1, cols - TUNE_SIDE_CHROME),
+    ),
     maxWidth,
   );
 
 /**
- * Fit the popup to `rows` x `cols`: the list window shrinks first (never below
- * three rows), the description column goes below 70 columns, the ultracode
- * block drops under the ladder when it no longer fits beside it.
+ * Fit the popup to `rows` x `cols`: the list window shrinks first, down to
+ * three rows; below that the wake-word line goes, then the subtitle and the
+ * blank lines (`compact`), and only then does the list go under three rows.
+ * The description column goes below 70 columns, the ultracode block drops
+ * under the ladder when it no longer fits beside it.
  */
 export function tuneLayout(o: {
   cols: number;
@@ -451,21 +466,31 @@ export function tuneLayout(o: {
 }): TuneLayout {
   const width = tuneWidth(o.cols, o.maxWidth);
   const effort = effortGeometry(o.stops, width);
-  const wake = wakeLine(o.wakeWords, width);
-  // title, subtitle, blank | blank | effort block | note | keys | wake line
-  const fixed = 3 + 1 + (effort.stacked ? 4 : 3) + 1 + 1 + (wake ? 1 : 0);
-  const budget = o.rows - TUNE_OVERLAY_CHROME - fixed;
-  const fits = Math.min(TUNE_MAX_LIST, Math.max(TUNE_MIN_LIST, budget));
+  const room = o.rows - TUNE_OVERLAY_CHROME;
+  // title | effort block | note | keys: always shown
+  const core = 1 + (effort.stacked ? 4 : 3) + 1 + 1;
+  // the shortest roomy list: three rows, and the "+N more" line under them
+  const minList =
+    Math.min(o.total, TUNE_MIN_LIST) + (o.total > TUNE_MIN_LIST ? 1 : 0);
+  const roomy = core + TUNE_ROOMY_LINES + minList;
+  const fullWake = wakeLine(o.wakeWords, width);
+  const wake = fullWake && roomy + 1 <= room ? fullWake : "";
+  const compact = roomy > room;
+  const budget =
+    room - core - (compact ? 0 : TUNE_ROOMY_LINES) - (wake ? 1 : 0);
+  const floor = compact ? 1 : TUNE_MIN_LIST;
+  const fits = Math.min(TUNE_MAX_LIST, Math.max(floor, budget));
   const windowed = o.total > fits;
 
   return {
+    compact,
     descriptions: o.cols >= TUNE_DESCRIPTION_COLS,
     effort,
     // one row of the budget goes to the "+N more" line
     listRows: windowed
       ? Math.min(
           TUNE_MAX_LIST,
-          Math.max(TUNE_MIN_LIST, Math.min(budget - 1, o.total - 1)),
+          Math.max(floor, Math.min(budget - 1, o.total - 1)),
         )
       : Math.max(1, o.total),
     wake,
@@ -548,8 +573,14 @@ function modelLines(state: TuneState, layout: TuneLayout): TuneLine[] {
   const win = tuneWindow(rows.length, cursor, layout.listRows);
   const numW = String(rows.length).length;
 
+  // "❯ " + number + ". " before the label, and room for " ✓" after it
+  const labelMax = Math.max(
+    4,
+    Math.min(LABEL_MAX, layout.width - (2 + numW + 2) - 2),
+  );
+
   const labels = rows.map(
-    (r) => cut(r.label, LABEL_MAX) + (r.current ? " ✓" : ""),
+    (r) => cut(r.label, labelMax) + (r.current ? " ✓" : ""),
   );
 
   const labelW = Math.max(...labels.map((l) => l.length));
@@ -571,15 +602,15 @@ function modelLines(state: TuneState, layout: TuneLayout): TuneLine[] {
       .filter(Boolean)
       .join(" · ");
 
+    const head = `${marker}${String(i + 1).padStart(numW)}. ${labels[i]!.padEnd(labelW)}`;
+    const room = layout.width - head.length - 2;
+
     out.push({
       active,
       kind: "model",
       segs: [
-        seg(
-          `${marker}${String(i + 1).padStart(numW)}. ${labels[i]!.padEnd(labelW)}`,
-          row.current ? "ok" : "plain",
-        ),
-        ...(detail ? [seg(`  ${detail}`, "muted")] : []),
+        seg(head, row.current ? "ok" : "plain"),
+        ...(detail && room > 1 ? [seg(`  ${cut(detail, room)}`, "muted")] : []),
       ],
     });
   }
@@ -678,6 +709,7 @@ const KEYS_SESSION = [
   "↑/↓ model · ←/→ effort · Tab ultracode · Enter default · s session · Esc cancel",
   "↑↓ model · ←→ effort · Tab ultracode · Enter default · s session · Esc",
   "↑↓ ←→ Tab · Enter default · s session · Esc",
+  "↑↓ ←→ Tab · Enter · s · Esc",
 ];
 
 const KEYS_NO_SESSION = [
@@ -690,14 +722,28 @@ const KEYS_LOCKED = [
   "Paused: answer the prompt",
 ];
 
-/** The one note under the ladder: no session, else a model that ignores effort, else what ultracode does. */
-export function tuneNote(state: TuneState): string {
+/**
+ * The one note under the ladder: no session, else a model that ignores effort,
+ * else what ultracode does. A model that ignores effort while ultracode is on
+ * gets both, in the longest wording that fits `width`, so the ultracode line
+ * does not vanish under the cursor.
+ */
+export function tuneNote(state: TuneState, width = Infinity): string {
   if (!state.hasSession) {
     return NO_SESSION_NOTE;
   }
 
   if (state.rows[state.cursor]?.effort === false) {
-    return EFFORT_IGNORED_NOTE;
+    return state.ultra
+      ? fit(
+          [
+            `${EFFORT_IGNORED_NOTE} ${ULTRA_NOTE}.`,
+            `Ignores effort · ${ULTRA_NOTE}`,
+            "Ignores effort · ultracode on",
+          ],
+          width,
+        )
+      : EFFORT_IGNORED_NOTE;
   }
 
   return state.ultra ? ULTRA_NOTE : "";
@@ -728,14 +774,20 @@ export function tuneScreen(
       ? KEYS_SESSION
       : KEYS_NO_SESSION;
 
+  const roomy = !layout.compact;
+
   const lines: TuneLine[] = [
     line("title", seg("Tune", "accent", true)),
-    line("subtitle", seg(fit(TUNE_SUBTITLES, layout.width), "muted")),
-    blank(),
+    ...(roomy
+      ? [
+          line("subtitle", seg(fit(TUNE_SUBTITLES, layout.width), "muted")),
+          blank(),
+        ]
+      : []),
     ...modelLines(state, layout),
-    blank(),
+    ...(roomy ? [blank()] : []),
     ...effortLines(state, layout),
-    line("note", seg(tuneNote(state) || " ", "muted")),
+    line("note", seg(tuneNote(state, layout.width) || " ", "muted")),
     line("keys", seg(fit(keys, layout.width), "muted")),
   ];
 
