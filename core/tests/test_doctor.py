@@ -288,3 +288,12 @@ def test_doctor_names_chain_models_whose_context_window_is_a_guess():
 
     cfg.models["auto/coding-manual"] = {"context_window": 1_000_000}
     assert [(c.name, c.status) for c in check_context_windows(cfg)] == [("context-window", OK)]
+
+
+def test_context_window_check_says_so_when_no_chain_models_are_configured():
+    from k3code.config import ProviderEntry, Settings
+    from k3code.doctor import OK, check_context_windows
+
+    for providers in ([], [ProviderEntry(name="cli", kind="claude-cli")]):
+        checks = check_context_windows(Settings(providers=providers))
+        assert [(c.name, c.status, c.detail) for c in checks] == [("context-window", OK, "no chain models configured")]
