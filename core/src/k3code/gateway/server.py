@@ -1876,10 +1876,13 @@ class GatewayServer:
                         turn=session.turn_id,
                     )
                 climbs = cheap_start or (main_climbs and tier is Tier.MAIN)
-                new_tier = escalation.record(attempt_reason) if climbs and attempt_reason else None
-                if new_tier is None and attempt_reason == "tool_errors" and not loop.interrupted:
-                    # the loop stopped after N failed calls in a row and listed them: the user decides how to go on
-                    # (ending 'done' let an active goal judge it and continue into the same failures)
+                # the max_turns cap is the user's limit on the task, not a stall: no tier gets a fresh round of calls
+                stalled = attempt_reason and attempt_reason != "max_turns"
+                new_tier = escalation.record(attempt_reason) if climbs and stalled else None
+                if new_tier is None and attempt_reason in ("tool_errors", "max_turns") and not loop.interrupted:
+                    # the loop stopped after N failed calls in a row (and listed them) or at the configured max_turns
+                    # cap (and said so): the user decides how to go on (ending 'done' let an active goal judge it and
+                    # continue into the same failures, and a capped task looked finished)
                     session.needs_input = True
                 if new_tier is None or loop.interrupted:
                     break

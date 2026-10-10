@@ -157,3 +157,58 @@ async def test_exhausted_providers_pause_the_goal_with_a_reason_and_one_notifica
     assert state.status == "paused" and state.paused_reason == "provider unavailable"
     assert len(_notices(server, "k3.goal.blocked")) == 1
     await server.close()
+
+
+def _mem_manager(**kw) -> GoalManager:
+    box: dict[str, dict | None] = {"goal": None}
+    return GoalManager(lambda: box["goal"], lambda s: box.__setitem__("goal", s), **kw)
+
+
+async def test_goal_without_turn_budget_never_pauses_and_reads_without_a_limit():
+    mgr = _mem_manager()  # the default: no turn budget (it was 300)
+    st = mgr.set("keep going")
+    assert st.max_turns == 0 and mgr.snapshot()["max_turns"] == 0
+    judge = scripted_judge(["continue"])
+    for _ in range(400):
+        decision = await mgr.evaluate_after_turn("still working", judge)
+        assert decision.should_continue and decision.prompt
+    assert mgr.state.status == "active" and mgr.state.turns_used == 400
+    assert decision.message == "↻ Continuing toward goal (turn 400): verdict continue"
+    assert mgr.status_line().startswith("Goal (active, 400 turns): keep going")
+
+
+async def test_a_finite_turn_budget_still_pauses_and_an_explicit_zero_overrides_a_configured_one():
+    mgr = _mem_manager(default_max_turns=2)
+    mgr.set("bounded")
+    judge = scripted_judge(["continue"])
+    first = await mgr.evaluate_after_turn("x", judge)
+    assert first.message == "↻ Continuing toward goal (1/2): verdict continue"
+    second = await mgr.evaluate_after_turn("x", judge)
+    assert not second.should_continue and mgr.state.paused_reason == "turn budget exhausted (2/2)"
+    assert mgr.set("unbounded", max_turns=0).max_turns == 0  # /goal --turns 0: no limit despite the config
+
+
+async def test_failing_check_retries_without_limit_by_default_and_a_finite_limit_still_pauses(monkeypatch):
+    import k3code.goals as goals
+
+    async def failing_gate(gate, *, cwd=None):
+        return False, 1, "nope"
+
+    monkeypatch.setattr(goals, "run_gate", failing_gate)
+    mgr = _mem_manager()
+    mgr.set("ship", check="exit 1")
+    judge = scripted_judge(["done"])
+    for n in range(1, 11):
+        decision = await mgr.evaluate_after_turn("done!", judge)
+        assert decision.should_continue and decision.verdict == "gate_failed"
+        assert f"(attempt {n}):" in decision.prompt
+    assert decision.message == "✗ Check failed (10 turns, attempt 10): $ exit 1"
+
+    capped = _mem_manager()
+    st = capped.set("ship", check="exit 1")
+    st.gates[0].max_retries = 2
+    capped._save(st)
+    assert (await capped.evaluate_after_turn("done!", judge)).message.endswith("attempt 1/2): $ exit 1")
+    await capped.evaluate_after_turn("done!", judge)
+    paused = await capped.evaluate_after_turn("done!", judge)
+    assert not paused.should_continue and capped.state.paused_reason == "check exhausted 2 retries: $ exit 1"

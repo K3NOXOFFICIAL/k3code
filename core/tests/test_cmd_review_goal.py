@@ -194,14 +194,18 @@ async def test_goal_check_gate_enforced(tmp_path, monkeypatch):
     await server.close()
 
 
-async def test_goal_check_gate_exhausts_retries(tmp_path, monkeypatch):
+async def test_goal_check_gate_retries_without_limit(tmp_path, monkeypatch):
+    # gate retries are unlimited by default (they paused the goal after 3): a failing check keeps the goal going
+    # until the agent is judged blocked (the continuation tells it to say so when the check itself is wrong)
     server, provider = make_server(tmp_path, monkeypatch, replies=["done?"], autonomy=NO_ADVISOR)
-    server.goal_judge = scripted_judge(["done"])
+    server.goal_judge = judge = scripted_judge(["done"] * 6 + ["blocked"])
     sid = await new_session(server, tmp_path)
     await run_goal(server, sid, '/goal impossible --check "exit 1"')
     st = server.goal_manager(server.session).state
-    assert st.status == "paused" and "retries" in st.paused_reason
-    assert provider.n == 4  # 1 + max_retries(3) continuations
+    assert st.status == "paused" and "unachievable" in st.paused_reason
+    assert len(judge.calls) == 7 and st.gates[0].attempts == 6  # 1 + 6 continuations, more than the old 3 retries
+    prompts = [m.content for seen in provider.seen for m in seen if m.role == "user"]
+    assert any("(attempt 6):" in p for p in prompts) and not any("(attempt 6/" in p for p in prompts)
     await server.close()
 
 
@@ -219,7 +223,7 @@ async def test_goal_pause_clear_status_and_blocked(tmp_path, monkeypatch):
     assert controls(server)[-1]["goal"] == ""
     await cmd(server, "/goal pause", sid)  # no goal: harmless
     assert "Usage" in (await cmd(server, "/goal --turns 0", sid))["output"] or True
-    assert "at least 1" in (await cmd(server, "/goal x --turns 0", sid))["output"]
+    assert "0 (no limit) or more" in (await cmd(server, "/goal x --turns -1", sid))["output"]
     await server.close()
 
 

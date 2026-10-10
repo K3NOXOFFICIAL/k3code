@@ -32,13 +32,13 @@ class GoalCommand(CommandDef):
             ctx.emit_goal(live)
             return reply("Goal cleared.")
         if sub == "resume":
-            if mgr.resume() is None:
+            if (resumed := mgr.resume()) is None:
                 return reply("No goal to resume.")
             ctx.emit_goal(live)
             return {
                 "type": "send",
                 "message": mgr.continuation_prompt() or "",
-                "notice": "Goal resumed (turn budget reset).",
+                "notice": "Goal resumed (turn budget reset)." if resumed.max_turns > 0 else "Goal resumed.",
                 "output": "Goal resumed.",
             }
         check = pop_option(args, "--check")
@@ -50,17 +50,18 @@ class GoalCommand(CommandDef):
             max_turns = int(turns) if turns else None
         except ValueError:
             return reply(f"--turns needs a number, got {turns!r}")
-        if max_turns is not None and max_turns < 1:
-            return reply("--turns must be at least 1")
+        if max_turns is not None and max_turns < 0:
+            return reply("--turns must be 0 (no limit) or more")
         mgr.set(objective, max_turns=max_turns, check=check)
         ctx.emit_goal(live)
         state = mgr.state
         assert state is not None
         gate = f"; check: $ {check}" if check else ""
+        budget = f"{state.max_turns} turn budget" if state.max_turns > 0 else "no turn limit"
         return {
             "type": "send",
             "message": mgr.kick_prompt() or objective,
             "display": f"/goal {objective}",
-            "notice": f"⊙ Goal set ({state.max_turns} turn budget{gate}). Working…",
+            "notice": f"⊙ Goal set ({budget}{gate}). Working…",
             "output": f"Goal set: {objective}",
         }

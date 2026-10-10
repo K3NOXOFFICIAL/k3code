@@ -151,9 +151,10 @@ async def test_agent_loop_max_turns(temp_cwd):
     async for event in loop.run("Do something"):
         events.append(event)
 
-    # Should have exactly 3 turns * 2 (assistant done + tool result) = 6
+    # 3 turns * 2 (assistant done + tool result) = 6, then the message saying the cap stopped the run
     done_events = [e for e in events if e.type == "done"]
-    assert len(done_events) == 6
+    assert len(done_events) == 7 and loop.escalation_reason == "max_turns"
+    assert done_events[-1].message.content.startswith("I stopped after 3 model calls")
 
 
 @pytest.mark.asyncio
