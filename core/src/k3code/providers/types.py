@@ -61,6 +61,8 @@ class Message:
     tool_call_id: str | None = None
     name: str | None = None
     usage: Usage | None = None
+    #: why the model stopped (provider-neutral; "max_tokens" = cut off at the output limit). Not persisted.
+    stop_reason: str | None = None
 
 
 @dataclass

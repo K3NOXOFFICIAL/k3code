@@ -29,6 +29,15 @@ from k3code.tools import (
 from k3code.tools.validate import invalid_arguments
 from k3code.userhooks import HookOutcome, HookRunner
 
+CUT_OFF_CONTINUE = (
+    "Your previous answer was cut off at the output token limit. Continue exactly where it stopped; "
+    "do not repeat what you already wrote."
+)
+CUT_OFF_CALL = (
+    "Your reply hit the output token limit before this call's arguments were complete, so it did not run. "
+    "Re-send it; split large content (a long file, a big edit) into several smaller calls."
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -101,6 +110,8 @@ class AgentLoop:
         #: Stop the loop once this many tool calls in a row failed (0 = never); see escalation_reason.
         self.max_tool_errors = max_tool_errors
         self._tool_errors = 0
+        self._truncated: set[str] = set()  # ids of tool calls cut off by the output limit: never executed
+        self._continuations = 0  # "continue" nudges after a text answer cut off by the output limit
         #: the consecutive failed calls behind _tool_errors: (call, first error line), listed when the turn stops
         self._failed: list[tuple[str, str]] = []
         #: end a tool-error stop with an assistant message listing the failures (off when a higher tier continues)
@@ -172,7 +183,7 @@ class AgentLoop:
         return [s for s in self.tools.specs() if plan or s.name != EXIT_PLAN_TOOL]
 
     def interrupt(self) -> None:
-        """Request cancellation of the running turn (checked between steps)."""
+        """Request cancellation of the running turn (checked between steps and between streamed events)."""
         self._interrupt.set()
 
     def reset_interrupt(self) -> None:
@@ -210,6 +221,8 @@ class AgentLoop:
         self.reliability.attach_router(self.router)
         self.reliability.begin_turn()
         self._elided, self._pinned, self._reads, self._step, self._learned = set(), set(), {}, 0, set()
+        # an earlier run's failed calls must not count toward (or be listed in) this run's tool-error stop
+        self._tool_errors, self._failed, self._truncated, self._continuations = 0, [], set(), 0
         self.escalation_reason = None  # the REPL reuses one loop: a stop in an earlier run is not this run's
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
@@ -271,6 +284,8 @@ class AgentLoop:
             text_parts: list[str] = []
 
             async for event in stream:
+                if self.interrupted and final_message is None:
+                    break  # /stop while the model is still answering: stop reading (and paying for) the rest
                 if event.type == "text_delta" and event.text:
                     text_parts.append(event.text)
                     if self.on_text_delta:
@@ -296,9 +311,21 @@ class AgentLoop:
                     self._check_budgets("after model completion")
                 yield event
 
+            if final_message is None and self.interrupted:
+                aclose = getattr(stream, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()  # closes the HTTP response: the provider stops generating
+                    except Exception:
+                        logger.debug("closing the interrupted stream failed", exc_info=True)
             if final_message:
                 messages.append(final_message)
                 self.reliability.save_transcript(messages)
+                cut = final_message.stop_reason == "max_tokens"
+                # a call cut off mid-arguments is answered with an error instead of running half-parsed input
+                self._truncated = (
+                    {c.id for c in final_message.tool_calls if "_unparsed" in c.arguments} if cut else set()
+                )
                 if final_message.tool_calls and self.on_checkpoint:
                     self.on_checkpoint()  # the tool call is about to run (maybe for an hour): persist what exists
                 # The final message's tool_calls is the authoritative list (see note
@@ -306,6 +333,12 @@ class AgentLoop:
                 if final_message.tool_calls:
                     tool_calls = final_message.tool_calls
                 else:
+                    if cut and self._continuations < 3:
+                        # the answer hit the output limit: it is not finished, so ask for the rest
+                        self._continuations += 1
+                        logger.info("Answer cut off at max_tokens: asking the model to continue")
+                        messages.append(Message(role="user", content=CUT_OFF_CONTINUE))
+                        continue
                     if self._drain_steer(messages):
                         continue  # the user steered while the model answered: answer that too, in this turn
                     logger.info("Agent finished (no tool calls)")
@@ -446,6 +479,8 @@ class AgentLoop:
                 "error": f"Your <tool_calls> block was not valid JSON ({reason}). "
                 "Re-send the calls as a valid JSON array."
             }
+        if tool_call.id in self._truncated:
+            return {"error": CUT_OFF_CALL}
         spec, handler = self.tools.get(tool_call.name) or (None, None)
         if not handler:
             return {"error": f"Unknown tool: {tool_call.name}"}

@@ -114,6 +114,7 @@ class OpenAICompatProvider(Provider):
             content_parts: list[str] = []
             usage = None
             complete = False  # [DONE] or a finish_reason arrived: the answer is whole
+            finish_reason: str | None = None
             async for line in response.aiter_lines():
                 if not line.startswith("data:"):
                     continue
@@ -133,6 +134,7 @@ class OpenAICompatProvider(Provider):
                 if choices:
                     if choices[0].get("finish_reason"):
                         complete = True
+                        finish_reason = choices[0]["finish_reason"]
                     delta = choices[0].get("delta") or {}
                     if text := delta.get("content"):
                         content_parts.append(text)
@@ -171,6 +173,7 @@ class OpenAICompatProvider(Provider):
                 content="".join(content_parts) or None,
                 tool_calls=final_calls,
                 usage=usage,
+                stop_reason="max_tokens" if finish_reason == "length" else finish_reason,
             )
             yield StreamEvent(type="done", message=final, usage=usage)
         except httpx.HTTPError as exc:
