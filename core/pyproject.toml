@@ -45,6 +45,8 @@ packages = ["src/k3code"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-q"
+# A test (or its teardown) stuck for 5 min dumps every thread's stack to the log: where a stalled run sits (issue #42).
+faulthandler_timeout = 300
 markers = ["real_systemd: run with the host's systemctl/loginctl/journalctl instead of the conftest stubs"]
 
 [tool.ruff]
