@@ -528,8 +528,10 @@ def install_lock() -> Iterator[None]:
     except FileExistsError:
         _take_over_stale_lock(lock)
     try:
-        (lock / "pid").write_text(f"{os.getpid()}\n")
+        # the start time first: a kill between the two writes must not leave a pid without it (a recycled pid would
+        # then keep the lock alive)
         (lock / "start").write_text(f"{_process_start(os.getpid())}\n")
+        (lock / "pid").write_text(f"{os.getpid()}\n")
         yield
     finally:
         shutil.rmtree(lock, ignore_errors=True)

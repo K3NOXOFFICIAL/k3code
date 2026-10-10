@@ -233,14 +233,14 @@ take_lock() { # one installer at a time per install root; the lock goes when thi
     rm -rf "$lock"
     mkdir "$lock" 2>/dev/null || die "another install into $DATA took the lock just now; wait for it to finish"
     LOCK=$lock
+    proc_start "$$" >"$LOCK/start" # before the pid: a kill between the two must not leave a pid without its start time
     printf '%s\n' "$$" >"$LOCK/pid"
-    proc_start "$$" >"$LOCK/start"
     clean_unfinished_versions
     return 0
   fi
   LOCK=$lock
+  proc_start "$$" >"$LOCK/start" # before the pid, as above
   printf '%s\n' "$$" >"$LOCK/pid"
-  proc_start "$$" >"$LOCK/start"
 }
 
 # ---- platform and package manager ------------------------------------------
@@ -755,8 +755,8 @@ src_git() { git -c safe.directory="$SRC_ROOT" -c safe.directory="$(cd "$SRC_ROOT
 
 # Without git there is no commit to name a build by, and a plain X.Y.Z-src made a second checkout look installed
 # already. The name is then a checksum of the checkout's file names and contents: another checkout gets its own
-# version and the same one keeps its name. File times do not count, the C locale fixes the sort order, and what
-# .gitignore leaves out (caches, builds, dependencies) is skipped, so a test run or a TUI build does not change it.
+# version and the same one keeps its name. File times do not count, the C locale fixes the sort order, and a fixed
+# list of caches, dependencies and build outputs is skipped, so a test run or a TUI build does not change it.
 # Only what the install reads counts (VERSION, core, tui, panes): a Finder .DS_Store, editor state or an agent's
 # .claude directory elsewhere in the checkout must not turn an unchanged tree into a new version.
 tree_id() {
@@ -791,7 +791,13 @@ acquire_source() {
         while IFS= read -r f; do cat "$SRC_ROOT/$f"; done) 2>/dev/null | cksum | cut -d' ' -f1)
       SHA="$SHA.dirty$dirty"
     fi
-    if [ -z "$SHA" ]; then SHA=tree$(tree_id); fi
+    if [ -z "$SHA" ]; then
+      id=$(tree_id)
+      # without a checksum tool the name would be a bare X.Y.Z-src.tree and a second checkout would look installed
+      case "$id" in *[!0-9a-f]*) id="" ;; esac
+      if [ ${#id} -ne 12 ]; then die "cannot name this checkout without git: neither sha256sum nor shasum is available (install one of them or git)"; fi
+      SHA=tree$id
+    fi
   else
     [ -n "$GIT_URL" ] || GIT_URL=$DEFAULT_URL
     GIT_ERR=$(mktemp "${TMPDIR:-/tmp}/k3code-giterr.XXXXXX")
