@@ -72,6 +72,8 @@ def _audit(event: str, args: tuple) -> None:
             isinstance(flags, int) and bool(flags & _WRITE_FLAGS)
         )
         candidates = args[:1] if writes else ()
+    elif event in ("os.symlink", "os.link"):  # (src, dst, ...): only the new link is written, the source is read
+        candidates = args[1:2]
     elif event in _PATH_WRITE_EVENTS:
         candidates = args[:2]
     else:
