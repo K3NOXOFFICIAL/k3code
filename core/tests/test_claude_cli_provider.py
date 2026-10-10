@@ -1,4 +1,4 @@
-"""The claude-cli provider: stateless `claude -p` per turn, built-in tools off, plain text + a final tool block.
+"""The claude-cli provider: built-in tools off, plain text + a final tool block; one-shot and persistent processes.
 
 A shim script stands in for the `claude` binary: it records its argv, stdin, cwd and a few env
 variables, then prints the stream-json events of a canned reply chosen by the SHIM_MODE variable.
@@ -126,7 +126,7 @@ def _call(tmp_path: Path) -> dict:
 
 
 async def test_text_reply_and_usage(shim: Path, tmp_path: Path) -> None:
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     events = await _collect(p, [Message(role="user", content="hi")])
     assert [e.type for e in events] == ["text_delta", "done"]
     assert events[0].text == "hello"
@@ -140,7 +140,7 @@ async def test_text_reply_and_usage(shim: Path, tmp_path: Path) -> None:
 
 async def test_tool_calls_become_k3code_tool_calls(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHIM_MODE", "tool")
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     events = await _collect(p, [Message(role="user", content="read a.py")])
     assert [e.type for e in events] == ["text_delta", "tool_call", "tool_call", "done"]
     assert events[0].text == "Let me read it."  # prose kept, the block removed
@@ -155,7 +155,7 @@ async def test_tool_calls_become_k3code_tool_calls(shim: Path, monkeypatch: pyte
 @pytest.mark.parametrize("mode", ["fenced", "twice"])
 async def test_tolerant_block_forms(shim: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     monkeypatch.setenv("SHIM_MODE", mode)  # fenced JSON inside the block; two blocks -> the last one wins
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     events = await _collect(p, [Message(role="user", content="x")])
     assert [e.tool_call.name for e in events if e.type == "tool_call"] == ["read_file", "nope"]
     await p.aclose()
@@ -163,7 +163,7 @@ async def test_tolerant_block_forms(shim: Path, monkeypatch: pytest.MonkeyPatch,
 
 async def test_long_reply_is_returned_whole_without_tools(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHIM_MODE", "long")  # /preview-style answer: nothing may be lost or summarised
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     events = await _collect(p, [Message(role="user", content="x")], tools=[])
     assert events[0].text.endswith("- c") and "[ todo ]" in events[0].text
     await p.aclose()
@@ -171,7 +171,7 @@ async def test_long_reply_is_returned_whole_without_tools(shim: Path, monkeypatc
 
 async def test_cut_off_tool_block_is_a_provider_error(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHIM_MODE", "cut")  # opened, never closed: the reply was cut off, a retry may help
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     with pytest.raises(ProviderError) as ei:
         await _collect(p, [Message(role="user", content="x")])
     assert ei.value.status_code == 502 and "tool_calls" in ei.value.message
@@ -180,7 +180,7 @@ async def test_cut_off_tool_block_is_a_provider_error(shim: Path, monkeypatch: p
 
 async def test_invalid_tool_block_becomes_one_invalid_tool_call(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHIM_MODE", "bad")  # no ProviderError: the loop tells the model instead of a full retry
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     events = await _collect(p, [Message(role="user", content="x")])
     calls = [e.tool_call for e in events if e.type == "tool_call"]
     assert [c.name for c in calls] == [INVALID_TOOL_CALL]
@@ -232,7 +232,7 @@ async def test_isolation_flags_env_and_cwd(shim: Path, tmp_path: Path, monkeypat
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "secret-token")
     monkeypatch.setenv("OMNIROUTE_API_KEY", "secret-key")
     monkeypatch.setenv("HOME", str(tmp_path / "fake-home"))
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     await _collect(
         p, [Message(role="system", content="SYS RULES"), Message(role="user", content="hi")], model="claude-sonnet-5-5"
     )
@@ -264,7 +264,7 @@ async def test_prompt_carries_tools_history_and_tool_results(shim: Path, tmp_pat
         ),
         Message(role="tool", content="print(1)", tool_call_id="c1", name="read_file"),
     ]
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     await _collect(p, messages)
     stdin = _call(tmp_path)["stdin"]
     assert "read_file" in stdin and "Run a command" in stdin  # tool catalogue
@@ -309,7 +309,7 @@ async def test_errors_map_to_provider_errors(
     shim: Path, monkeypatch: pytest.MonkeyPatch, mode: str, status: int, needle: str
 ) -> None:
     monkeypatch.setenv("SHIM_MODE", mode)
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     with pytest.raises(ProviderError) as ei:
         await _collect(p, [Message(role="user", content="x")])
     assert ei.value.status_code == status and needle in ei.value.message
@@ -326,7 +326,7 @@ async def test_missing_binary_is_an_auth_style_error(tmp_path: Path) -> None:
 
 async def test_timeout_kills_the_process(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHIM_MODE", "sleep")
-    p = ClaudeCliProvider(name="cc", command=str(shim), timeout=0.5)
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim), timeout=0.5)
     with pytest.raises(ProviderError) as ei:
         await _collect(p, [Message(role="user", content="x")])
     assert ei.value.status_code == 504
@@ -346,7 +346,7 @@ async def test_cancel_kills_and_reaps_the_process(shim: Path, monkeypatch: pytes
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
     monkeypatch.setenv("SHIM_MODE", "sleep")
-    p = ClaudeCliProvider(name="cc", command=str(shim), timeout=30)
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim), timeout=30)
     task = asyncio.create_task(_collect(p, [Message(role="user", content="x")]))
     for _ in range(100):
         if procs:
@@ -388,13 +388,15 @@ async def test_hidden_thinking_is_off_for_haiku_only_and_configurable(
     off), which ate most of the saving from routing unattended work to the cheap tier. The strong tier keeps its
     thinking (plans, reviews and the advisor use it)."""
     monkeypatch.setenv("MAX_THINKING_TOKENS", "31999")  # an inherited value must never leak into the call
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     await _collect(p, [Message(role="user", content="hi")], model="claude-haiku-4-5-20251001")
     assert _call(tmp_path)["env"]["MAX_THINKING_TOKENS"] == "0"
     await _collect(p, [Message(role="user", content="hi")], model="claude-sonnet-5-5")
     assert _call(tmp_path)["env"]["MAX_THINKING_TOKENS"] is None  # Claude Code's own default
     await p.aclose()
-    p = ClaudeCliProvider(name="cc", command=str(shim), thinking_tokens=2000, thinking_models=["sonnet"])
+    p = ClaudeCliProvider(
+        name="cc", persistent=False, command=str(shim), thinking_tokens=2000, thinking_models=["sonnet"]
+    )
     await _collect(p, [Message(role="user", content="hi")], model="claude-sonnet-5-5")
     assert _call(tmp_path)["env"]["MAX_THINKING_TOKENS"] == "2000"
     await _collect(p, [Message(role="user", content="hi")], model="claude-haiku-4-5-20251001")
@@ -474,7 +476,7 @@ async def test_text_deltas_arrive_while_the_process_still_runs(
     gate = tmp_path / "gate"
     monkeypatch.setenv("SHIM_GATE", str(gate))  # the shim does not finish the reply before this file exists
     monkeypatch.setenv("SHIM_DELTAS", json.dumps(["hel", "lo"]))
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     stream = p.stream([Message(role="user", content="hi")], [], "m1")
     first = await anext(stream)
     assert first.type == "text_delta" and first.text == "hel"
@@ -490,7 +492,7 @@ async def test_closing_the_stream_early_kills_and_reaps_the_process(
 ) -> None:
     procs = _spy_procs(monkeypatch)
     monkeypatch.setenv("SHIM_GATE", str(tmp_path / "never"))
-    p = ClaudeCliProvider(name="cc", command=str(shim), timeout=30)
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim), timeout=30)
     stream = p.stream([Message(role="user", content="hi")], [], "m1")
     assert (await anext(stream)).type == "text_delta"
     await stream.aclose()
@@ -514,7 +516,7 @@ async def test_no_part_of_the_tool_block_is_ever_streamed(
         monkeypatch.setenv("SHIM_SPLIT", "chars")
     else:
         monkeypatch.setenv("SHIM_DELTAS", json.dumps([_TOOL_REPLY[:split], _TOOL_REPLY[split:]]))
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     events = await _collect(p, [Message(role="user", content="read a.py")])
     assert not any("<" in e.text for e in events if e.type == "text_delta")  # not even "<tool_c"
     done = events[-1]
@@ -534,7 +536,7 @@ async def test_the_final_message_is_what_the_full_text_parses_to(
 
     monkeypatch.setenv("SHIM_MODE", mode)
     monkeypatch.setenv("SHIM_SPLIT", "chars")
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     events = await _collect(p, [Message(role="user", content="x")], tools=tools)
     text, calls = _reply_from_result({"result": (tmp_path / "call.json.reply").read_text()}, tools)
     done = events[-1].message
@@ -562,7 +564,7 @@ async def test_streamed_text_matches_the_final_content_at_the_edges(
         monkeypatch.setenv("SHIM_DELTAS", json.dumps(deltas))
     else:
         monkeypatch.setenv("SHIM_SPLIT", "chars")
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     events = await _collect(p, [Message(role="user", content="x")])
     assert _streamed(events) == shown == events[-1].message.content
     await p.aclose()
@@ -570,7 +572,7 @@ async def test_streamed_text_matches_the_final_content_at_the_edges(
 
 async def test_a_reply_line_longer_than_64k_is_read_whole(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SHIM_MODE", "huge")
-    p = ClaudeCliProvider(name="cc", command=str(shim))
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim))
     events = await _collect(p, [Message(role="user", content="x")], tools=[])
     assert events[-1].message.content == "x" * 300_000 == _streamed(events)
     await p.aclose()
@@ -588,7 +590,7 @@ async def test_effort_is_passed_from_effort_or_the_provider_default(
 ) -> None:
     from k3code.providers import effort
 
-    p = ClaudeCliProvider(name="cc", command=str(shim), effort=default)
+    p = ClaudeCliProvider(name="cc", persistent=False, command=str(shim), effort=default)
     token = effort.REASONING_EFFORT.set(turn)
     try:
         await _collect(p, [Message(role="user", content="hi")])
@@ -605,3 +607,256 @@ def test_provider_entry_effort_is_validated_and_passed_through() -> None:
     assert ProviderEntry(name="cc", kind="claude-cli").effort is None
     with pytest.raises(ValidationError, match="effort must be one of"):
         ProviderEntry(name="cc", kind="claude-cli", effort="extreme")
+
+
+# ── persistent sessions ──
+
+PSHIM = r"""#!{python}
+import json, os, sys, time
+log = os.environ["SHIM_LOG"]
+ctl = os.environ["SHIM_CTL"]
+
+def append(suffix, obj):
+    with open(log + suffix, "a") as fh:
+        fh.write(json.dumps(obj) + "\n")
+
+append(".spawns", {{"pid": os.getpid(), "argv": sys.argv[1:],
+                    "auto_compact_off": os.environ.get("DISABLE_AUTO_COMPACT"),
+                    "system": open(sys.argv[sys.argv.index("--system-prompt-file") + 1]).read()}})
+
+def emit(obj):
+    print(json.dumps(obj), flush=True)
+
+def answer(text, n):
+    append(".msgs", {{"pid": os.getpid(), "text": text}})
+    c = json.load(open(ctl)) if os.path.exists(ctl) else {{}}
+    mode, reply = c.get("mode", "text"), c.get("reply", "ok")
+    if mode == "crash":
+        sys.exit(3)
+    if mode == "sleep":
+        time.sleep(30)
+    for piece in c.get("deltas") or [reply]:
+        emit({{"type": "stream_event", "event": {{"type": "content_block_delta", "index": 0,
+                                                 "delta": {{"type": "text_delta", "text": piece}}}}}})
+    if c.get("gate"):
+        for _ in range(500):
+            if os.path.exists(c["gate"]):
+                break
+            time.sleep(0.02)
+    if mode == "error":
+        emit({{"type": "result", "subtype": "error", "is_error": True, "result": "boom", "api_error_status": 503}})
+        return
+    usage = {{"input_tokens": 2, "cache_read_input_tokens": 100 * n, "cache_creation_input_tokens": 10,
+              "output_tokens": 5}}
+    emit({{"type": "result", "subtype": "success", "is_error": False, "result": reply, "usage": usage,
+           "total_cost_usd": 0.0125 * n}})  # the CLI reports a running total per process
+
+if "--input-format" in sys.argv:
+    for n, line in enumerate(sys.stdin, 1):
+        answer(json.loads(line)["message"]["content"][0]["text"], n)
+else:
+    answer(sys.stdin.read(), 1)
+"""
+
+
+@pytest.fixture
+def pshim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "claude-pshim"
+    path.write_text(PSHIM.format(python=sys.executable))
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("SHIM_LOG", str(tmp_path / "log"))
+    monkeypatch.setenv("SHIM_CTL", str(tmp_path / "ctl.json"))
+    return path
+
+
+def _ctl(tmp_path: Path, **kw) -> None:
+    (tmp_path / "ctl.json").write_text(json.dumps(kw))
+
+
+def _lines(tmp_path: Path, suffix: str) -> list[dict]:
+    path = tmp_path / f"log{suffix}"
+    return [json.loads(x) for x in path.read_text().splitlines()] if path.exists() else []
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _close_and_check(p: ClaudeCliProvider, tmp_path: Path) -> None:
+    await p.aclose()
+    assert not p._pool
+    assert not [s["pid"] for s in _lines(tmp_path, ".spawns") if _alive(s["pid"])]  # no fake process survives
+
+
+def _bash(cmd: str) -> str:
+    return f'Running it.\n<tool_calls>[{{"name": "bash", "arguments": {{"command": "{cmd}"}}}}]</tool_calls>'
+
+
+def _round_trip(messages: list[Message]) -> list[Message]:
+    """Through the gateway's session store format and back, as a resumed or rebuilt turn sees it."""
+    from k3code.gateway.server import _serialize_messages
+
+    stored = json.loads(json.dumps(_serialize_messages(messages)))
+    return [
+        Message(
+            role=m["role"],
+            content=m.get("content"),
+            tool_call_id=m.get("tool_call_id"),
+            name=m.get("name"),
+            tool_calls=[
+                ToolCall(id=tc["id"], name=tc["name"], arguments=tc["arguments"], raw_arguments=tc.get("raw_arguments"))
+                for tc in m.get("tool_calls") or []
+            ],
+        )
+        for m in stored
+    ]
+
+
+async def _step(p: ClaudeCliProvider, messages: list[Message], tmp_path: Path, reply: str, **kw) -> Message:
+    _ctl(tmp_path, reply=reply)
+    events = await _collect(p, messages, **kw)
+    return events[-1].message
+
+
+async def test_one_process_per_conversation_and_only_the_delta_is_sent(pshim: Path, tmp_path: Path) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim))
+    msgs = [Message(role="system", content="SYS"), Message(role="user", content="list the files")]
+    a1 = await _step(p, msgs, tmp_path, _bash("ls"))
+    msgs += [a1, Message(role="tool", content="a.py", tool_call_id=a1.tool_calls[0].id, name="bash")]
+    a2 = await _step(p, msgs, tmp_path, _bash("cat a.py"))
+    msgs += [a2, Message(role="tool", content="print(1)", tool_call_id=a2.tool_calls[0].id, name="bash")]
+    msgs = _round_trip(msgs)  # the stored and rebuilt history still matches what the process covered
+    _ctl(tmp_path, reply="It prints 1.")
+    events = await _collect(p, msgs)
+    assert events[-1].message.content == "It prints 1."
+    spawns, sent = _lines(tmp_path, ".spawns"), _lines(tmp_path, ".msgs")
+    assert len(spawns) == 1 and len(sent) == 3 and {m["pid"] for m in sent} == {spawns[0]["pid"]}
+    assert "--input-format" in spawns[0]["argv"] and spawns[0]["system"] == "SYS"
+    assert spawns[0]["auto_compact_off"] == "1"  # k3code compacts its own list; the mirror must not
+    assert "unrelated scratch sandbox" in sent[0]["text"] and "list the files" in sent[0]["text"]
+    for text, result, cmd in [(sent[1]["text"], "a.py", "ls"), (sent[2]["text"], "print(1)", "cat a.py")]:
+        assert text.startswith(f'[tool result 1/1: bash {{"command": "{cmd}"}}]\n{result}')
+        assert "list the files" not in text and "unrelated scratch sandbox" not in text and "<tool_calls>" in text
+    assert events[-1].usage.cost_usd == pytest.approx(0.0125)  # this call's part of the running total
+    await _close_and_check(p, tmp_path)
+
+
+async def test_a_changed_prefix_or_key_starts_a_fresh_process(pshim: Path, tmp_path: Path) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim), max_sessions=8)
+    msgs = [Message(role="user", content="list the files")]
+    a1 = await _step(p, msgs, tmp_path, _bash("ls"))
+    result = Message(role="tool", content="a.py", tool_call_id=a1.tool_calls[0].id, name="bash")
+    edited = [Message(role="user", content="list the FILES"), a1, result]  # e.g. compaction rewrote an old message
+    await _step(p, edited, tmp_path, "done")
+    sent = _lines(tmp_path, ".msgs")
+    assert len(_lines(tmp_path, ".spawns")) == 2 and "list the FILES" in sent[-1]["text"]
+    assert "(called tool bash id=" in sent[-1]["text"]  # the full render, not a delta
+    base = [*msgs, a1, result]
+    await _step(p, base, tmp_path, "done", model="m2")  # another model
+    await _step(p, [Message(role="system", content="OTHER"), *base], tmp_path, "done")  # another system text
+    await _step(p, base, tmp_path, "done", tools=TOOLS[:1])  # another tool list
+    spawns = _lines(tmp_path, ".spawns")
+    assert len(spawns) == 5 and len({s["pid"] for s in spawns}) == 5
+    await _step(p, base, tmp_path, "done")  # the original key and prefix still continue the first process
+    assert len(_lines(tmp_path, ".spawns")) == 5 and _lines(tmp_path, ".msgs")[-1]["pid"] == spawns[0]["pid"]
+    await _close_and_check(p, tmp_path)
+
+
+@pytest.mark.parametrize("mode", ["error", "crash", "sleep"])
+async def test_a_failed_step_kills_the_process_and_the_retry_starts_fresh(
+    pshim: Path, tmp_path: Path, mode: str
+) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim), timeout=1.0)
+    msgs = [Message(role="user", content="list the files")]
+    a1 = await _step(p, msgs, tmp_path, _bash("ls"))
+    msgs += [a1, Message(role="tool", content="a.py", tool_call_id=a1.tool_calls[0].id, name="bash")]
+    first = _lines(tmp_path, ".spawns")[0]["pid"]
+    _ctl(tmp_path, mode=mode)
+    with pytest.raises(ProviderError) as ei:
+        await _collect(p, msgs)
+    assert ei.value.status_code == {"error": 503, "crash": 502, "sleep": 504}[mode]
+    assert not _alive(first) and not p._pool
+    await _step(p, msgs, tmp_path, "done")
+    spawns = _lines(tmp_path, ".spawns")
+    assert len(spawns) == 2 and "unrelated scratch sandbox" in _lines(tmp_path, ".msgs")[-1]["text"]
+    await _close_and_check(p, tmp_path)
+
+
+async def test_a_rejected_reply_or_cancel_kills_the_process(pshim: Path, tmp_path: Path) -> None:
+    import asyncio
+
+    p = ClaudeCliProvider(name="cc", command=str(pshim))
+    # cut off (opened, never closed) is still rejected; invalid JSON inside a closed block became an invalid_tool_call
+    _ctl(tmp_path, reply='<tool_calls>[{"name": "bash"')
+    with pytest.raises(ProviderError):
+        await _collect(p, [Message(role="user", content="x")])
+    assert not p._pool and not _alive(_lines(tmp_path, ".spawns")[0]["pid"])
+    _ctl(tmp_path, mode="sleep")
+    task = asyncio.create_task(_collect(p, [Message(role="user", content="x")]))
+    for _ in range(200):
+        if len(_lines(tmp_path, ".msgs")) == 2:
+            break
+        await asyncio.sleep(0.02)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not p._pool and not _alive(_lines(tmp_path, ".spawns")[1]["pid"])
+    await _close_and_check(p, tmp_path)
+
+
+async def test_idle_processes_are_reaped(pshim: Path, tmp_path: Path) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim), idle_seconds=0)
+    msgs = [Message(role="user", content="hi")]
+    a1 = await _step(p, msgs, tmp_path, "hello")
+    first = _lines(tmp_path, ".spawns")[0]["pid"]
+    await _step(p, [*msgs, a1, Message(role="user", content="again")], tmp_path, "ok")
+    assert len(_lines(tmp_path, ".spawns")) == 2 and not _alive(first)
+    await _close_and_check(p, tmp_path)
+
+
+async def test_pool_cap_evicts_the_least_recently_used(pshim: Path, tmp_path: Path) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim), max_sessions=2)
+    convs = {k: [Message(role="user", content=k)] for k in "abc"}
+    replies = {k: await _step(p, convs[k], tmp_path, f"re {k}") for k in "ab"}
+    pids = [s["pid"] for s in _lines(tmp_path, ".spawns")]
+    await _step(p, [*convs["a"], replies["a"], Message(role="user", content="more")], tmp_path, "ok")  # a is fresh
+    await _step(p, convs["c"], tmp_path, "re c")  # the pool is full: b, the least recently used, goes
+    assert len(_lines(tmp_path, ".spawns")) == 3 and not _alive(pids[1]) and _alive(pids[0]) and len(p._pool) == 2
+    await _close_and_check(p, tmp_path)
+
+
+async def test_streaming_works_and_a_full_pool_of_busy_processes_falls_back_to_one_shot(
+    pshim: Path, tmp_path: Path
+) -> None:
+    import asyncio
+
+    p = ClaudeCliProvider(name="cc", command=str(pshim), max_sessions=1)
+    gate = tmp_path / "gate"
+    _ctl(tmp_path, reply="hello", deltas=["hel", "lo"], gate=str(gate))
+    first = p.stream([Message(role="user", content="a")], [], "m1")
+    head = await anext(first)
+    assert head.type == "text_delta" and head.text == "hel" and not gate.exists()  # streamed before the result
+    other = asyncio.create_task(_collect(p, [Message(role="user", content="b")], tools=[]))
+    for _ in range(200):
+        if len(_lines(tmp_path, ".msgs")) == 2:
+            break
+        await asyncio.sleep(0.02)
+    gate.touch()
+    rest = [e async for e in first]
+    assert _streamed([head, *rest]) == "hello" == rest[-1].message.content == (await other)[-1].message.content
+    spawns = _lines(tmp_path, ".spawns")
+    assert len(spawns) == 2 and "--input-format" not in spawns[1]["argv"]  # the busy process was not shared
+    assert len(p._pool) == 1
+    await _close_and_check(p, tmp_path)
+
+
+def test_provider_entry_passes_the_session_settings_through() -> None:
+    (provider,) = make_providers([ProviderEntry(name="cc", kind="claude-cli")])
+    assert (provider.persistent, provider.max_sessions, provider.idle_seconds) == (True, 4, 600.0)
+    entry = ProviderEntry(name="cc", kind="claude-cli", persistent=False, max_sessions=2, idle_seconds=30)
+    (provider,) = make_providers([entry])
+    assert (provider.persistent, provider.max_sessions, provider.idle_seconds) == (False, 2, 30.0)
