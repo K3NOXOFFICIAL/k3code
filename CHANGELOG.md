@@ -45,6 +45,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 
 ### Fixed
 
+- **An imported bundle cannot arm ultracode.** `k3code import` now drops a session's `ultra_mode`, like its `mode`, roots and background markers, so a bundle cannot make the next prompt spawn parallel sub-agents.
 - **A stopped background session says it was stopped.** Stopping a backgrounded job (an `ultracode` run catches the stop and returns) used to notify "Background session '...' finished"; it now says "was stopped" as a warning, and a turn that ends in an error says "failed" with the error.
 - **`/model <key>` keeps the reason next to flags.** `/model <key> [flags] [reason]` reads only `--reasoning`, `--global`, `--session` and `--provider` as settings and keeps every other word as the reason, so a reason with `--` in it is no longer refused, an effort word in the reason (`high latency`) no longer becomes the effort when a flag is present, and the reason is recorded with flags too. After a bare `--` everything is reason.
 - **The wake word accent matches what the gateway will run.** The composer no longer paints a wake word that `wake_words` in the config switches off (all of them, or that mode), and it now judges a multi-line prompt as a whole: a word on an earlier line is painted there, a second mode on another line clears it, and a fence opened on an earlier line masks it.
