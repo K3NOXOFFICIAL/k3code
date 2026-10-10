@@ -1,7 +1,7 @@
 """The claude-cli provider: stateless `claude -p` per turn, built-in tools off, plain text + a final tool block.
 
 A shim script stands in for the `claude` binary: it records its argv, stdin, cwd and a few env
-variables, then prints a canned CLI JSON result chosen by the SHIM_MODE variable.
+variables, then prints the stream-json events of a canned reply chosen by the SHIM_MODE variable.
 """
 
 from __future__ import annotations
@@ -48,15 +48,44 @@ replies = {{
     "twice": "<tool_calls>[]</tool_calls> oops <tool_calls>" + CALLS + "</tool_calls>",
     "bad": "<tool_calls>[{{not json</tool_calls>",
     "cut": "start <tool_calls>[{{\"name\": \"read_file\"",
+    "huge": "x" * 300_000,  # one stdout line far beyond a StreamReader's 64 KiB line limit
 }}
+replies.update(json.loads(os.environ.get("SHIM_REPLIES", "{{}}")))
+
+def emit(obj):
+    print(json.dumps(obj), flush=True)  # a pipe is block-buffered: without the flush nothing streams
+
+def delta(text, kind="text_delta", key="text"):
+    emit({{"type": "stream_event", "event": {{"type": "content_block_delta", "index": 0,
+                                             "delta": {{"type": kind, key: text}}}}}})
+
+def result(**fields):
+    emit({{"type": "result", "subtype": "success", "usage": usage, "total_cost_usd": COST, **fields}})
+
 if mode in replies:
-    print(json.dumps({{"is_error": False, "usage": usage, "total_cost_usd": COST, "result": replies[mode]}}))
+    emit({{"type": "system", "subtype": "init", "tools": []}})
+    emit({{"type": "stream_event", "event": {{"type": "message_start", "message": {{}}}}}})
+    delta("pondering", "thinking_delta", "thinking")  # thinking is never shown
+    open(log + ".reply", "w").write(replies[mode])
+    split = os.environ.get("SHIM_SPLIT")  # "chars": one delta per character
+    pieces = json.loads(os.environ.get("SHIM_DELTAS", "null")) or (list(replies[mode]) if split else [replies[mode]])
+    for piece in pieces:
+        delta(piece)
+    gate = os.environ.get("SHIM_GATE")
+    if gate:  # hold the reply open until the test has seen the first delta
+        for _ in range(500):
+            if os.path.exists(gate):
+                break
+            time.sleep(0.02)
+    emit({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": replies[mode]}}]}}}})
+    emit({{"type": "rate_limit_event", "rate_limit_info": {{"status": "allowed"}}}})
+    result(is_error=False, result=replies[mode])
 elif mode == "login":
-    print(json.dumps({{"is_error": True, "result": "Not logged in · Please run /login"}})); sys.exit(1)
+    result(is_error=True, result="Not logged in · Please run /login"); sys.exit(1)
 elif mode == "limit":
-    print(json.dumps({{"is_error": True, "result": "5-hour limit reached. Resets at 21:00"}})); sys.exit(1)
+    result(is_error=True, result="5-hour limit reached. Resets at 21:00"); sys.exit(1)
 elif mode == "status":
-    print(json.dumps({{"is_error": True, "result": "boom", "api_error_status": 503}})); sys.exit(1)
+    result(is_error=True, result="boom", api_error_status=503); sys.exit(1)
 elif mode == "crash":
     sys.stderr.write("segfault-ish"); sys.exit(3)
 elif mode == "sleep":
@@ -105,6 +134,7 @@ async def test_text_reply_and_usage(shim: Path, tmp_path: Path) -> None:
     assert done.message.content == "hello" and not done.message.tool_calls
     assert done.usage.prompt_tokens == 153 and done.usage.completion_tokens == 7  # input + cache read + cache write
     assert done.usage.cost_usd == 0.0125  # Claude Code's own list-price figure, recorded in /stats
+    assert done.usage.cache_read_tokens == 100 and done.usage.cache_creation_tokens == 50
     await p.aclose()
 
 
@@ -166,6 +196,9 @@ async def test_isolation_flags_env_and_cwd(shim: Path, tmp_path: Path, monkeypat
         assert flag in argv
     assert argv[argv.index("--setting-sources") + 1] == "project"
     assert "--json-schema" not in argv  # plain-text protocol: one model turn per call
+    assert argv[argv.index("--output-format") + 1] == "stream-json"  # the reply streams
+    assert "--verbose" in argv and "--include-partial-messages" in argv
+    assert "--effort" not in argv  # neither /effort nor a provider default
     assert seen["system"] == "SYS RULES"
     assert seen["env"]["ANTHROPIC_BASE_URL"] is None and seen["env"]["ANTHROPIC_AUTH_TOKEN"] is None
     assert seen["env"]["OMNIROUTE_API_KEY"] is None
@@ -362,3 +395,165 @@ def test_flattened_arguments_are_accepted() -> None:
 def test_an_empty_block_keeps_the_text_around_it() -> None:
     text, calls = _reply("before <tool_calls>[]</tool_calls> after")
     assert calls == [] and text == "before  after"
+
+
+# ── streaming ──
+
+
+def _spy_procs(monkeypatch: pytest.MonkeyPatch) -> list:
+    import asyncio
+
+    procs: list = []
+    real_exec = asyncio.create_subprocess_exec
+
+    async def spy(*a, **kw):
+        procs.append(await real_exec(*a, **kw))
+        return procs[-1]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
+    return procs
+
+
+def _streamed(events) -> str:
+    return "".join(e.text for e in events if e.type == "text_delta")
+
+
+async def test_text_deltas_arrive_while_the_process_still_runs(
+    shim: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With --output-format json the whole reply came at once, after 7-11 s of "thinking"."""
+    procs = _spy_procs(monkeypatch)
+    gate = tmp_path / "gate"
+    monkeypatch.setenv("SHIM_GATE", str(gate))  # the shim does not finish the reply before this file exists
+    monkeypatch.setenv("SHIM_DELTAS", json.dumps(["hel", "lo"]))
+    p = ClaudeCliProvider(name="cc", command=str(shim))
+    stream = p.stream([Message(role="user", content="hi")], [], "m1")
+    first = await anext(stream)
+    assert first.type == "text_delta" and first.text == "hel"
+    assert procs[0].returncode is None and not gate.exists()  # streamed before the CLI finished
+    gate.touch()
+    rest = [e async for e in stream]
+    assert _streamed([first, *rest]) == "hello" == rest[-1].message.content
+    await p.aclose()
+
+
+async def test_closing_the_stream_early_kills_and_reaps_the_process(
+    shim: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    procs = _spy_procs(monkeypatch)
+    monkeypatch.setenv("SHIM_GATE", str(tmp_path / "never"))
+    p = ClaudeCliProvider(name="cc", command=str(shim), timeout=30)
+    stream = p.stream([Message(role="user", content="hi")], [], "m1")
+    assert (await anext(stream)).type == "text_delta"
+    await stream.aclose()
+    assert procs[0].returncode is not None
+    await p.aclose()
+
+
+_TOOL_REPLY = (
+    'Let me read it.\n<tool_calls>[{"name": "read_file", "arguments": {"path": "a.py"}}, '
+    '{"name": "nope", "arguments": {}}]</tool_calls>'
+)
+_TAG_AT = _TOOL_REPLY.index("<tool_calls>")
+
+
+@pytest.mark.parametrize("split", [*range(_TAG_AT - 1, _TAG_AT + len("<tool_calls>") + 2), "chars"])
+async def test_no_part_of_the_tool_block_is_ever_streamed(
+    shim: Path, monkeypatch: pytest.MonkeyPatch, split: int | str
+) -> None:
+    monkeypatch.setenv("SHIM_MODE", "tool")
+    if split == "chars":
+        monkeypatch.setenv("SHIM_SPLIT", "chars")
+    else:
+        monkeypatch.setenv("SHIM_DELTAS", json.dumps([_TOOL_REPLY[:split], _TOOL_REPLY[split:]]))
+    p = ClaudeCliProvider(name="cc", command=str(shim))
+    events = await _collect(p, [Message(role="user", content="read a.py")])
+    assert not any("<" in e.text for e in events if e.type == "text_delta")  # not even "<tool_c"
+    done = events[-1]
+    assert _streamed(events) == "Let me read it." == done.message.content
+    assert [c.name for c in done.message.tool_calls] == ["read_file", "nope"]
+    await p.aclose()
+
+
+@pytest.mark.parametrize("mode", ["text", "long", "tool", "fenced", "twice"])
+@pytest.mark.parametrize("tools", [TOOLS, []], ids=["tools", "no-tools"])
+async def test_the_final_message_is_what_the_full_text_parses_to(
+    shim: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, tools: list[ToolSpec]
+) -> None:
+    """Streaming character by character: the done message equals the old one-shot parse of the result text, and the
+    streamed text equals its content (the screen shows exactly what is stored)."""
+    from k3code.providers.claude_cli import _reply_from_result
+
+    monkeypatch.setenv("SHIM_MODE", mode)
+    monkeypatch.setenv("SHIM_SPLIT", "chars")
+    p = ClaudeCliProvider(name="cc", command=str(shim))
+    events = await _collect(p, [Message(role="user", content="x")], tools=tools)
+    text, calls = _reply_from_result({"result": (tmp_path / "call.json.reply").read_text()}, tools)
+    done = events[-1].message
+    assert done.content == (text or None) and [c.name for c in done.tool_calls] == [c.name for c in calls]
+    assert [c.arguments for c in done.tool_calls] == [c.arguments for c in calls]
+    assert _streamed(events) == text
+    await p.aclose()
+
+
+@pytest.mark.parametrize(
+    ("reply", "deltas", "shown"),
+    [
+        ("\n  hi there \n\n", ["\n ", " hi", " ", "there", " \n", "\n"], "hi there"),  # stripped like the final
+        ("use <tool_ here", ["use <tool_", " here"], "use <tool_ here"),  # a held tail that turned out to be text
+        ("ends <tool_c", ["ends <tool_c"], "ends <tool_c"),  # ...also at the very end
+        ("before <tool_calls>[]</tool_calls> after", None, "before  after"),  # an empty block keeps the text
+    ],
+)
+async def test_streamed_text_matches_the_final_content_at_the_edges(
+    shim: Path, monkeypatch: pytest.MonkeyPatch, reply: str, deltas: list[str] | None, shown: str
+) -> None:
+    monkeypatch.setenv("SHIM_MODE", "probe")
+    monkeypatch.setenv("SHIM_REPLIES", json.dumps({"probe": reply}))
+    if deltas:
+        monkeypatch.setenv("SHIM_DELTAS", json.dumps(deltas))
+    else:
+        monkeypatch.setenv("SHIM_SPLIT", "chars")
+    p = ClaudeCliProvider(name="cc", command=str(shim))
+    events = await _collect(p, [Message(role="user", content="x")])
+    assert _streamed(events) == shown == events[-1].message.content
+    await p.aclose()
+
+
+async def test_a_reply_line_longer_than_64k_is_read_whole(shim: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SHIM_MODE", "huge")
+    p = ClaudeCliProvider(name="cc", command=str(shim))
+    events = await _collect(p, [Message(role="user", content="x")], tools=[])
+    assert events[-1].message.content == "x" * 300_000 == _streamed(events)
+    await p.aclose()
+
+
+# ── --effort ──
+
+
+@pytest.mark.parametrize(
+    ("turn", "default", "sent"),
+    [(None, None, None), ("xhigh", None, "xhigh"), (None, "low", "low"), ("high", "low", "high")],
+)
+async def test_effort_is_passed_from_effort_or_the_provider_default(
+    shim: Path, tmp_path: Path, turn: str | None, default: str | None, sent: str | None
+) -> None:
+    from k3code.providers import effort
+
+    p = ClaudeCliProvider(name="cc", command=str(shim), effort=default)
+    token = effort.REASONING_EFFORT.set(turn)
+    try:
+        await _collect(p, [Message(role="user", content="hi")])
+    finally:
+        effort.REASONING_EFFORT.reset(token)
+    argv = _call(tmp_path)["argv"]
+    assert (argv[argv.index("--effort") + 1] if "--effort" in argv else None) == sent  # /effort wins
+    await p.aclose()
+
+
+def test_provider_entry_effort_is_validated_and_passed_through() -> None:
+    (provider,) = make_providers([ProviderEntry(name="cc", kind="claude-cli", effort="medium")])
+    assert provider.effort == "medium"
+    assert ProviderEntry(name="cc", kind="claude-cli").effort is None
+    with pytest.raises(ValidationError, match="effort must be one of"):
+        ProviderEntry(name="cc", kind="claude-cli", effort="extreme")

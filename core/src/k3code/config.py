@@ -34,6 +34,9 @@ class ProviderEntry(BaseModel):
     thinking_tokens: int | None = 0
     #: ...for models whose name contains one of these (default: Haiku, the cheap tier); the others keep the CLI default
     thinking_models: list[str] = Field(default_factory=lambda: ["haiku"])
+    #: claude-cli only: ``--effort`` (low|medium|high|xhigh|max) for turns where /effort sets none; None = the CLI's
+    #: own default. /effort always wins.
+    effort: str | None = None
     #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
     #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
     prompt_cache: str = "auto"
@@ -43,6 +46,15 @@ class ProviderEntry(BaseModel):
     def validate_prompt_cache(cls, v: str) -> str:
         if v not in ("auto", "on", "off"):
             raise ValueError("prompt_cache must be 'auto', 'on' or 'off'")
+        return v
+
+    @field_validator("effort")
+    @classmethod
+    def validate_effort(cls, v: str | None) -> str | None:
+        from k3code.providers.effort import LEVELS  # not at module level: k3code.providers imports this module
+
+        if v is not None and v not in LEVELS:
+            raise ValueError(f"effort must be one of {', '.join(LEVELS)}")
         return v
 
     @field_validator("kind")

@@ -8,6 +8,12 @@ read, no MCP servers or skills load, and **all of Claude Code's own tools are sw
 journal and approvals still apply. (``--json-schema`` was tried first: it forces a second model turn and
 the model then writes its real answer outside the schema and a one-line summary inside it.)
 
+The reply streams: ``--output-format stream-json --verbose --include-partial-messages`` prints one JSON event per
+line, and the ``text_delta`` events reach the user as they arrive (with ``--output-format json`` the whole reply came
+at once after 7-11 s of "thinking"). The final ``result`` event carries the full text, usage and error fields and
+decides the ``done`` message, exactly as the single JSON object did before. The ``<tool_calls>`` block never reaches
+the screen: a tail that could start it is held back, and nothing after it is streamed (see ``_StreamGate``).
+
 The subprocess runs in a private empty directory with the ``ANTHROPIC_*`` / ``OMNIROUTE_*``
 environment removed (so it always uses the Claude Code login, never a relay) and never reads the
 login files itself. Cost is the user's Claude plan, not an API bill.
@@ -28,12 +34,16 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from k3code.paths import GATEWAY_ENV_VARS
+from k3code.providers import effort
 from k3code.providers.base import Provider, ProviderError
 from k3code.providers.types import Message, StreamEvent, ToolCall, ToolSpec, Usage
 
 DEFAULT_COMMAND = "claude"
 _SYSTEM_FALLBACK = "You are the model behind a coding agent."
 _TOOL_BLOCK = re.compile(r"<tool_calls>\s*(.*?)\s*</tool_calls>", re.DOTALL)
+_TOOL_TAG = "<tool_calls>"
+_READ_CHUNK = 1 << 16
+_EXIT = "k3code.exit"  # the pseudo-event ``_events`` ends with: return code and stderr of the finished process
 
 _PREAMBLE = (
     "You are the language-model backend of a coding agent called k3code. The environment your host reports to you "
@@ -136,6 +146,7 @@ class ClaudeCliProvider(Provider):
         setting_sources: str = "project",
         thinking_tokens: int | None = 0,
         thinking_models: tuple[str, ...] | list[str] = ("haiku",),
+        effort: str | None = None,
     ) -> None:
         self.name = name
         self.base_url = ""  # nothing to probe over HTTP; the general internet probe covers reachability
@@ -145,6 +156,7 @@ class ClaudeCliProvider(Provider):
         self.setting_sources = setting_sources
         self.thinking_tokens = thinking_tokens
         self.thinking_models = tuple(m.lower() for m in thinking_models)
+        self.effort = effort  # --effort when /effort sets none for the turn
         self._max_parallel = max(1, max_parallel)
         self._sem: asyncio.Semaphore | None = None
         self._workdir: str | None = None
@@ -164,13 +176,15 @@ class ClaudeCliProvider(Provider):
 
     def _command_line(self, model: str, system_file: str) -> list[str]:
         binary = shutil.which(self.command) or self.command
-        return [
+        argv = [
             binary,
             "-p",
             "--model",
             model,
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",  # stream-json in print mode requires it
+            "--include-partial-messages",  # the text_delta events; without it only whole messages are printed
             "--no-session-persistence",
             "--strict-mcp-config",
             "--mcp-config",
@@ -183,6 +197,9 @@ class ClaudeCliProvider(Provider):
             "--system-prompt-file",
             system_file,
         ]
+        if level := effort.current() or self.effort:  # /effort for this turn, else the provider entry's default
+            argv += ["--effort", level]
+        return argv
 
     def _thinking_for(self, model: str) -> int | None:
         """MAX_THINKING_TOKENS for this model: ``thinking_tokens`` for the models named in ``thinking_models`` (Haiku:
@@ -190,7 +207,15 @@ class ClaudeCliProvider(Provider):
         (the strong tier plans, reviews and advises with its thinking intact)."""
         return self.thinking_tokens if any(m in model.lower() for m in self.thinking_models) else None
 
-    async def _run(self, argv: list[str], prompt: str, model: str = "") -> tuple[int, str, str]:
+    async def _events(self, argv: list[str], prompt: str, model: str = "") -> AsyncIterator[dict[str, Any]]:
+        """Run the CLI and yield each JSON event of its stdout as it is printed, then one ``_EXIT`` pseudo-event.
+
+        ``timeout`` bounds the whole call, not each read. stdin is fed and stderr drained by their own tasks, so a full
+        pipe on either side cannot stall the stdout reader. Whatever ends the call early (timeout, cancel, the consumer
+        closing the stream) kills the process group and reaps it: a zombie and its pipe transports otherwise linger.
+        stdout is split into lines here, not by ``readline``: a StreamReader line is capped at 64 KiB, and the
+        ``result`` event carries the whole reply on one line.
+        """
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -207,22 +232,38 @@ class ClaudeCliProvider(Provider):
                 "`claude` once to log in, or remove this provider from the chain.",
                 status_code=401,
             ) from exc
+        assert proc.stdin and proc.stdout and proc.stderr
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout
+        feeder = asyncio.ensure_future(_feed(proc.stdin, prompt.encode()))
+        stderr = asyncio.ensure_future(proc.stderr.read())
         try:
-            out, err = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout=self.timeout)
-        except TimeoutError as exc:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, 9)
-            await proc.wait()
-            raise ProviderError(f"claude -p timed out after {self.timeout:g}s", status_code=504) from exc
-        except asyncio.CancelledError:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, 9)
-            # Reap it (a zombie and its pipe transports otherwise linger); shielded so the cancel cannot skip it,
-            # bounded so a stuck process cannot hold the cancellation up.
-            with contextlib.suppress(BaseException):
-                await asyncio.wait_for(asyncio.shield(proc.wait()), 5)
-            raise
-        return proc.returncode or 0, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+            try:
+                buf = b""
+                while chunk := await asyncio.wait_for(proc.stdout.read(_READ_CHUNK), deadline - loop.time()):
+                    *lines, buf = (buf + chunk).split(b"\n")
+                    for line in lines:
+                        if event := _json_line(line):
+                            yield event
+                if event := _json_line(buf):  # a last line without a newline
+                    yield event
+                rc = await asyncio.wait_for(proc.wait(), max(0.0, deadline - loop.time()))
+                err = await asyncio.wait_for(stderr, max(0.0, deadline - loop.time()))
+            except TimeoutError as exc:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, 9)
+                await proc.wait()
+                raise ProviderError(f"claude -p timed out after {self.timeout:g}s", status_code=504) from exc
+            yield {"type": _EXIT, "rc": rc or 0, "stderr": err.decode("utf-8", "replace")}
+        finally:
+            feeder.cancel()
+            stderr.cancel()
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, 9)
+                # Shielded so a cancel cannot skip the reap, bounded so a stuck process cannot hold it up.
+                with contextlib.suppress(BaseException):
+                    await asyncio.wait_for(asyncio.shield(proc.wait()), 5)
 
     async def stream(
         self,
@@ -239,38 +280,108 @@ class ClaudeCliProvider(Provider):
         system_file = os.path.join(self._cwd(), f"system-{uuid.uuid4().hex[:8]}.txt")
         with open(system_file, "w", encoding="utf-8") as fh:
             fh.write(system or _SYSTEM_FALLBACK)
+        gate = _StreamGate(hold_tool_block=bool(tools))
+        result: dict[str, Any] | None = None
+        rc, err = 0, ""
         try:
             async with self._sem:
-                rc, out, err = await self._run(self._command_line(model, system_file), prompt, model)
+                events = self._events(self._command_line(model, system_file), prompt, model)
+                async with contextlib.aclosing(events):  # closed at once when the consumer stops early
+                    async for event in events:
+                        kind = event.get("type")
+                        if kind == "stream_event":
+                            if piece := gate.feed(_text_delta(event)):
+                                yield StreamEvent(type="text_delta", text=piece)
+                        elif kind == "result":
+                            result = event
+                        elif kind == _EXIT:
+                            rc, err = event["rc"], event["stderr"]
         finally:
             with contextlib.suppress(OSError):
                 os.unlink(system_file)
 
-        result = _last_json(out)
         if rc != 0 or result is None or result.get("is_error"):
-            raise _error_from_result(result, err, rc)
+            raise _error_from_result(result, err, rc)  # after streamed text the router sends "reset" first
 
         text, calls = _reply_from_result(result, tools)
         usage = _usage(result)
-        if text:
-            yield StreamEvent(type="text_delta", text=text)
+        if rest := gate.rest(text):
+            yield StreamEvent(type="text_delta", text=rest)
         for call in calls:
             yield StreamEvent(type="tool_call", tool_call=call)
         final = Message(role="assistant", content=text or None, tool_calls=calls, usage=usage)
         yield StreamEvent(type="done", message=final, usage=usage)
 
 
-def _last_json(out: str) -> dict[str, Any] | None:
-    for line in reversed(out.strip().splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                parsed = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict):
-                return parsed
-    return None
+async def _feed(stdin: asyncio.StreamWriter, data: bytes) -> None:
+    """Write the prompt and close stdin; a CLI that exits without reading it is reported by its exit code instead."""
+    with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+        stdin.write(data)
+        await stdin.drain()
+        stdin.close()
+
+
+def _json_line(line: bytes) -> dict[str, Any] | None:
+    line = line.strip()
+    if not line.startswith(b"{"):
+        return None
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _text_delta(event: dict[str, Any]) -> str:
+    """The text of a ``stream_event`` carrying a ``text_delta``; "" for every other event (thinking and signature
+    deltas, block and message boundaries)."""
+    inner = event.get("event")
+    delta = inner.get("delta") if isinstance(inner, dict) else None
+    if not isinstance(delta, dict) or inner.get("type") != "content_block_delta" or delta.get("type") != "text_delta":
+        return ""
+    return str(delta.get("text") or "")
+
+
+class _StreamGate:
+    """Decides which streamed text may reach the user before the ``result`` event settles the reply.
+
+    The ``done`` content is what ``_reply_from_result`` makes of the full text: stripped, and with tools cut at the
+    first ``<tool_calls>`` block. Every streamed piece must keep the streamed text a prefix of it, so the gate drops
+    leading whitespace, holds trailing whitespace back (it may be the end of the reply), holds back a tail that could
+    be the start of ``<tool_calls>`` (``<tool_c`` must never flash on screen), and streams nothing once the tag has
+    begun. ``rest`` then gives what the final content has beyond the streamed text (a held tail that turned out to be
+    text, or the text around an empty block), so the screen ends up showing exactly the stored message.
+    """
+
+    def __init__(self, *, hold_tool_block: bool) -> None:
+        self.hold_tool_block = hold_tool_block
+        self.pending = ""  # received, not yet streamed
+        self.sent: list[str] = []
+        self.closed = False
+
+    def feed(self, text: str) -> str:
+        if self.closed or not text:
+            return ""
+        pending = self.pending + text
+        if not self.sent:
+            pending = pending.lstrip()
+        hold = 0
+        if self.hold_tool_block:
+            cut = pending.find(_TOOL_TAG)
+            if cut >= 0:
+                self.closed = True
+                pending = pending[:cut]
+            else:
+                hold = next((k for k in range(len(_TOOL_TAG) - 1, 0, -1) if pending.endswith(_TOOL_TAG[:k])), 0)
+        out = pending[: len(pending) - hold].rstrip()
+        self.pending = pending[len(out) :]
+        if out:
+            self.sent.append(out)
+        return out
+
+    def rest(self, final: str) -> str:
+        sent = "".join(self.sent)
+        return final[len(sent) :] if final.startswith(sent) else ""
 
 
 def _reply_from_result(result: dict[str, Any], tools: list[ToolSpec]) -> tuple[str, list[ToolCall]]:
@@ -349,4 +460,6 @@ def _usage(result: dict[str, Any]) -> Usage:
         prompt_tokens=prompt,
         completion_tokens=int(u.get("output_tokens") or 0),
         cost_usd=float(cost) if isinstance(cost, int | float) else None,
+        cache_read_tokens=int(u.get("cache_read_input_tokens") or 0),
+        cache_creation_tokens=int(u.get("cache_creation_input_tokens") or 0),
     )
