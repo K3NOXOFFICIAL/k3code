@@ -163,14 +163,16 @@ class LearningHub:
         return self._known_fix(cwd, call.name, failure.signature, hint)
 
     def _known_fix(self, cwd: str, tool: str, sig: str, hint: str) -> str | None:
-        """The reminder for a failure with a lesson: the project's gotcha line, else the user-level one, else the
-        working retry recorded on an earlier row in the window (``hint``). Two small file reads, no model call."""
+        """The reminder for a failure with a lesson: the project's accepted gotcha line, else its auto-learned one,
+        else the user-level one, else the working retry recorded on an earlier row in the window (``hint``). Small
+        file reads, no model call."""
         pid = self.log.project_for(cwd)  # cached per cwd
-        if (line := gotchas.lesson(gotchas.gotchas_path(pid, self.home), tool, sig)) is not None:
-            return gotchas.reminder(line)
-        if (line := gotchas.lesson(gotchas.user_gotchas_path(self.home), tool, sig)) is not None:
-            return gotchas.reminder(line, machine=True)
-        return gotchas.reminder(f"{tool}: {sig} — {hint}") if hint else None
+        for path in (gotchas.gotchas_path(pid, self.home), gotchas.auto_gotchas_path(pid, self.home)):
+            if (known := gotchas.lesson(path, tool, sig)) is not None:
+                return gotchas.reminder(tool, sig, known)
+        if (known := gotchas.lesson(gotchas.user_gotchas_path(self.home), tool, sig)) is not None:
+            return gotchas.reminder(tool, sig, known, machine=True)
+        return gotchas.reminder(tool, sig, hint) if hint else None
 
     def _maybe_gotcha(self, session: Any, cwd: str, tool: str, sig: str) -> str:
         """Learn or propose a gotcha for a recurring signature; returns the working retry seen for it in the window
@@ -188,10 +190,14 @@ class LearningHub:
             and len(rows) >= gotchas.AUTO_REPEATS
             and gotchas.auto_ok(str(rows[-1]["choice"]), hint)
         ):
-            self._auto_gotcha(session, pid, tool, sig, line)
+            self._auto_gotcha(session, pid, tool, sig, hint, line)
             return hint
-        if len(rows) < gotchas.REPEATS:
-            return hint
+        if len(rows) >= gotchas.REPEATS:
+            self._propose_gotcha(session, pid, tool, sig, hint, line)
+        return hint
+
+    def _propose_gotcha(self, session: Any, pid: str, tool: str, sig: str, hint: str, line: str) -> None:
+        """The card that puts ``line`` into the project's system prompt when accepted; once per signature."""
         p = self.store.add(
             "project_gotcha",
             gotchas.proposal_text(sig, hint),
@@ -203,18 +209,19 @@ class LearningHub:
         )
         if p is not None:
             self.emit(session, [p])
-        return hint
 
-    def _auto_gotcha(self, session: Any, pid: str, tool: str, sig: str, line: str) -> None:
-        """Write a self-verified gotcha (a retry worked) without a card and tell the session in one line. A signature
-        the project already has a lesson for is left alone, so a recurring failure is learned and announced once. A
-        line now identical in the gotchas of PROMOTE_PROJECTS projects is copied to the user-level gotchas."""
-        path = gotchas.gotchas_path(pid, self.home)
-        if gotchas.has_lesson(path, tool, sig):
+    def _auto_gotcha(self, session: Any, pid: str, tool: str, sig: str, hint: str, line: str) -> None:
+        """Note a self-verified gotcha (a retry worked) for the in-turn reminders, propose its card and tell the
+        session in one line. The line is untrusted text (tool output and the model's retry), so it stays out of the
+        system prompt until the card is accepted. A signature the project already has a lesson for is left alone, so a
+        recurring failure is noted and announced once."""
+        path = gotchas.auto_gotchas_path(pid, self.home)
+        if any(gotchas.has_lesson(p, tool, sig) for p in (gotchas.gotchas_path(pid, self.home), path)):
             return
         gotchas.append_gotcha(path, line)
-        gotchas.promote_if_shared(self.home, line)
-        session.emit("notification", {"session_id": session.session_id, "text": f"Learned for this project: {line}"})
+        self._propose_gotcha(session, pid, tool, sig, hint, line)
+        text = f"Noted for reminders in this project: {line} (accept its card to add it to the system prompt)"
+        session.emit("notification", {"session_id": session.session_id, "text": text})
 
     # ── proposals ──
 
@@ -290,6 +297,7 @@ class LearningHub:
         if p.kind == "project_gotcha" and payload.get("project") and payload.get("line"):
             path = gotchas.gotchas_path(str(payload["project"]), self.home)
             gotchas.append_gotcha(path, str(payload["line"]))
+            gotchas.promote_if_shared(self.home, str(payload["line"]))  # accepted in PROMOTE_PROJECTS projects
             return f"added to the known pitfalls of this project ({path})"
         if p.kind == "preference" and payload.get("text"):
             from k3code.memory import user_memory_path
