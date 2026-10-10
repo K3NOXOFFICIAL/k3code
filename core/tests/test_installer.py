@@ -1222,6 +1222,80 @@ def test_from_source_builds_the_tui_outside_the_checkout(tmp_path: Path) -> None
     assert not (src / "tui" / "dist").exists()
 
 
+def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path: Path) -> None:
+    # the recording side of the leftover-build-dir cleanup: with a TMPDIR ending in "/" the lock must name
+    # "<tmp>/k3code-tui.X", the form the next run's strict prefix check accepts
+    src = _mini_checkout(tmp_path)
+    (src / "tui").mkdir()
+    (src / "tui" / "package.json").write_text("{}\n")
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    seen = tmp_path / "seen"
+    seen.mkdir()
+    lock = tmp_path / DATA_REL / ".install.lock"
+    tools = stub_bin(tmp_path, "node", 'echo "v22.0.0"\n')
+    stub_bin(
+        tmp_path,
+        "npm",
+        f'case "$*" in ci*) cp "{lock}/tui_tmp" "{seen}/tui_tmp"; pwd >"{seen}/cwd"; mkdir -p node_modules ;;'
+        ' "run build") mkdir -p dist ;; esac\n',
+    )
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        "--from-source",
+        "--minimal",
+        env_extra={"TMPDIR": f"{tmp}/"},
+        drop=("K3_SKIP_TUI",),
+        path_front=tools,
+    )
+    assert r.returncode == 0, r.stderr
+    recorded = (seen / "tui_tmp").read_text().strip()
+    assert re.fullmatch(re.escape(f"{tmp}/") + r"k3code-tui\.[A-Za-z0-9]+", recorded), recorded
+    assert (seen / "cwd").read_text().strip().startswith(recorded + "/")
+
+
+@linux_only
+def test_the_installer_writes_its_start_time_before_its_pid(tmp_path: Path) -> None:
+    # a kill between the two writes must not leave a pid without a start time (a recycled pid would keep the lock)
+    lock = tmp_path / DATA_REL / ".install.lock"
+    mark = tmp_path / "mark"
+    # proc_start reads /proc/PID/stat through cat: note whether the pid file exists at that moment
+    tools = stub_bin(
+        tmp_path,
+        "cat",
+        f'case "$1" in /proc/*/stat) if [ -e "{lock}/pid" ]; then echo pid-first; else echo start-first; fi'
+        f' >"{mark}" ;; esac\nexec "$(PATH=/usr/bin:/bin command -v cat)" "$@"\n',
+    )
+    r = run(tmp_path, INSTALL, "--from-source", "--minimal", path_front=tools)
+    assert r.returncode == 0, r.stderr
+    assert mark.read_text().strip() == "start-first"
+
+
+def test_without_a_checksum_tool_a_no_git_checkout_is_refused(tmp_path: Path) -> None:
+    # an empty checksum would name every checkout X.Y.Z-src.tree and a second one would look installed already
+    nogit = stub_bin(tmp_path, "git", 'echo "xcode-select: note: no developer tools were found" >&2\nexit 1\n')
+    src = tmp_path / "src"
+    (src / "core").mkdir(parents=True)
+    (src / "install").mkdir()
+    (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    (src / "VERSION").write_text("9.9.9\n")
+    shutil.copy(INSTALL, src / "install" / "install.sh")
+    farm = tmp_path / "farm"
+    farm.mkdir()
+    for d in os.environ["PATH"].split(os.pathsep):
+        if d and Path(d).is_dir():
+            for entry in Path(d).iterdir():
+                if entry.name not in ("sha256sum", "shasum", "git") and not (farm / entry.name).exists():
+                    (farm / entry.name).symlink_to(entry)
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", env_extra={"PATH": f"{nogit}:{farm}"})
+    assert r.returncode != 0
+    assert "neither sha256sum nor shasum is available" in r.stderr
+    assert not (home / DATA_REL / "current").exists()
+
+
 def test_without_git_a_github_tag_installs_from_its_archive(tmp_path: Path) -> None:
     sha_rel, sha_rc = "a" * 40, "b" * 40
     advert = (

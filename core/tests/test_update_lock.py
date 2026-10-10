@@ -152,6 +152,29 @@ def test_the_lock_records_when_its_owner_started(data: Path) -> None:
     assert start and start == upd._process_start(os.getpid())
 
 
+def test_the_start_time_is_written_before_the_pid(data: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # a kill between the two writes must not leave a pid without a start time (a recycled pid would keep the lock)
+    present: list[bool] = []
+    real = Path.write_text
+
+    def spy(self: Path, text: str, *a: object, **kw: object) -> int:
+        if self.name == "pid":
+            present.append((self.parent / "start").is_file())
+        return real(self, text, *a, **kw)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "write_text", spy)
+    with upd.install_lock():
+        pass
+    assert present == [True]
+
+
+def test_a_lock_with_a_start_but_no_pid_still_refuses(data: Path) -> None:
+    (data / LOCK).mkdir(parents=True)
+    (data / LOCK / "start").write_text("123\n")
+    with pytest.raises(upd.InstallLockHeld, match="without a pid"), upd.install_lock():
+        pass
+
+
 def test_the_start_time_is_counted_from_the_last_parenthesis() -> None:
     # the command name may hold spaces and ")": a naive split would read a different field
     rest = " ".join(["S", *[str(n) for n in range(4, 22)], "987654", "23", "24"])
