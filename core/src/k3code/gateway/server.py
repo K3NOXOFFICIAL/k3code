@@ -169,6 +169,13 @@ def _load_system_prompt() -> str:
     return "You are a helpful coding assistant."
 
 
+def _turn_status(result: Any) -> str | None:
+    """The status of a finished turn task's result: ``_run_turn`` returns ``(status, text)``."""
+    if isinstance(result, tuple) and result and isinstance(result[0], str):
+        return result[0]
+    return None
+
+
 class TypedPrompt(str):
     """A prompt the user typed (``prompt.submit`` without ``automated``, a steering message, ``/bg <prompt>``).
 
@@ -2929,6 +2936,10 @@ class GatewayServer:
                 text, level = f"Background session '{title}' needs your input.", "warning"
             elif t.exception() is not None:
                 text, level = f"Background session '{title}' failed: {t.exception()}", "error"
+            elif (ended := _turn_status(t.result())) == "interrupted":  # a job catches the /stop and returns
+                text, level = f"Background session '{title}' was stopped.", "warning"
+            elif ended == "error":
+                text, level = f"Background session '{title}' failed: {str(t.result()[1])[:160]}", "error"
             else:
                 last = next((m.get("content") for m in reversed(live.messages) if m.get("role") == "assistant"), "")
                 text, level = f"Background session '{title}' finished. {str(last or '')[:160]}".strip(), "info"

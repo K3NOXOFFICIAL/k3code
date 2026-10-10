@@ -339,6 +339,27 @@ async def test_an_inline_job_is_stopped_by_stop_and_leaves_no_sub_agents(tmp_pat
     assert transcript(server)[0] == ("user", "ultracode a long job")
 
 
+async def test_stopping_a_backgrounded_job_says_stopped_not_finished(tmp_path, monkeypatch, hung_children):
+    # Issue #56: the job catches the /stop and returns "interrupted", so the task ends normally and the background
+    # watcher used to report "finished".
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    await start(server, tmp_path)
+    pipe.hold = asyncio.Event()
+    await call(server, "prompt.submit", {"text": "ultracode a long job"})
+    job = server.session
+    task = job.turn_task
+    await pipe.started.wait()
+    assert (await call(server, "prompt.background", {}))["status"] == "backgrounded"
+    assert job.background and server.session is not job
+    assert (await call(server, "session.interrupt", {"session_id": job.session_id}))["interrupted"] is True
+    await asyncio.wait_for(task, 20)
+    await asyncio.sleep(0.05)  # done-callbacks run on the next loop iteration
+    note = [n for n in events(server, "notification.show") if n.get("kind") == "background"]
+    assert len(note) == 1 and "was stopped" in note[0]["text"] and "finished" not in note[0]["text"]
+    assert note[0]["level"] == "warning"
+
+
 async def test_a_job_that_ends_takes_its_sub_agents_with_it(tmp_path, monkeypatch, hung_children):
     server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
     pipe = pipeline(server, monkeypatch)
