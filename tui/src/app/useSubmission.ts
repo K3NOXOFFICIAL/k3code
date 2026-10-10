@@ -2,7 +2,11 @@ import { looksLikeSlashCommand, parseSlashCommand } from "@k3code/shared/slash";
 import { type MutableRefObject, useCallback, useEffect, useRef } from "react";
 
 import { TYPING_IDLE_MS } from "../config/timing.js";
-import { expandTokens } from "../domain/attachments.js";
+import {
+  codePointSpans,
+  expandTokens,
+  expandTokensWithSpans,
+} from "../domain/attachments.js";
 import { completionToApplyOnSubmit } from "../domain/slash.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import type {
@@ -59,13 +63,13 @@ export const queueItemFromSlash = (
   return queueItem(slashArgument(expandedCommand), display);
 };
 
-export const prepareSubmission = (
-  display: string,
-  tokens: ComposerToken[],
-) => ({
-  display,
-  text: expandTokens(tokens)(display),
-});
+// `pasteSpans`: where the pastes ended up in `text`, so the gateway does not
+// read a wake word inside a pasted log as the user asking for a mode.
+export const prepareSubmission = (display: string, tokens: ComposerToken[]) => {
+  const { pasteSpans, text } = expandTokensWithSpans(tokens)(display);
+
+  return { display, pasteSpans, text };
+};
 
 /**
  * Split a slash submission into the two things it has to be at once.
@@ -144,12 +148,21 @@ export function useSubmission(opts: UseSubmissionOptions) {
       showUserMessage = true,
       displayText?: string,
       expandOverride?: (value: string) => string,
-      submitOpts: { automated?: boolean; skipDetectDrop?: boolean } = {},
+      submitOpts: {
+        automated?: boolean;
+        pasteSpans?: readonly (readonly [number, number])[];
+        skipDetectDrop?: boolean;
+      } = {},
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
+      const withSpans = expandTokensWithSpans(composerRefs.tokensRef.current);
       const expand =
-        expandOverride ?? expandTokens(composerRefs.tokensRef.current);
+        expandOverride ?? ((value: string) => withSpans(value).text);
+
+      if (!expandOverride && submitOpts.pasteSpans === undefined) {
+        submitOpts = { ...submitOpts, pasteSpans: withSpans(text).pasteSpans };
+      }
 
       lastAutomated.current = submitOpts.automated === true;
 
@@ -245,7 +258,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
   );
 
   const sendQueued = useCallback(
-    (text: string) => {
+    (text: string, pasteSpans?: readonly (readonly [number, number])[]) => {
       if (text.startsWith("!")) {
         return shellExec(text.slice(1).trim());
       }
@@ -256,7 +269,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return interpolate(text, send);
       }
 
-      send(text);
+      send(text, true, undefined, undefined, { pasteSpans: pasteSpans ?? [] });
     },
     [interpolate, send, shellExec],
   );
@@ -281,7 +294,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         if (opts.fallbackToFront) {
           composerActions.prependQueue(item);
         } else {
-          composerActions.enqueue(item.text, item.display);
+          composerActions.enqueue(item.text, item.display, item.pasteSpans);
         }
       };
 
@@ -298,6 +311,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
         gw.request<SessionSteerResponse>("session.steer", {
           session_id: live.sid,
           text: item.text,
+          ...(item.pasteSpans?.length
+            ? { paste_spans: codePointSpans(item.text, item.pasteSpans) }
+            : {}),
         })
           .then((raw) => {
             const r = asRpcResult<SessionSteerResponse>(raw);
@@ -315,13 +331,17 @@ export function useSubmission(opts: UseSubmissionOptions) {
       // the agent is in model generation, tool execution, or an older runtime.
       // Reuse the normal submit pipeline so the correction gets its user bubble
       // and file-drop interpolation exactly once.
-      send(item.text);
+      send(item.text, true, undefined, undefined, {
+        pasteSpans: item.pasteSpans ?? [],
+      });
     },
     [composerActions, gw, send, sys],
   );
 
   const dispatchSubmission = useCallback(
-    (full: string) => {
+    // `queuedSpans`: `full` is a queued item's text (already expanded), and
+    // this is where its pastes are.
+    (full: string, queuedSpans?: readonly (readonly [number, number])[]) => {
       if (!full.trim()) {
         return;
       }
@@ -332,7 +352,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
       // Idempotent on token-free text, so re-submitting a recalled entry is
       // stable.
       const submissionTokens = [...composerRefs.tokensRef.current];
-      const submission = prepareSubmission(full, submissionTokens);
+      const submission =
+        queuedSpans && !submissionTokens.length && full === full.trim()
+          ? { display: full, pasteSpans: queuedSpans, text: full }
+          : prepareSubmission(full, submissionTokens);
       const toHistory = submission.text;
 
       if (looksLikeSlashCommand(full)) {
@@ -372,7 +395,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
       if (!live.sid) {
         composerActions.pushHistory(toHistory);
-        composerActions.enqueue(full);
+        // The tokens are cleared below, so queue the expansion (and where its
+        // pastes are), not the `[[…]]` labels that would then go out as-is.
+        composerActions.enqueue(submission.text, full, submission.pasteSpans);
         composerActions.clearIn();
 
         return;
@@ -400,29 +425,32 @@ export function useSubmission(opts: UseSubmissionOptions) {
           return handleBusyInput(picked, { fallbackToFront: true });
         }
 
-        return sendQueued(picked.text);
+        return sendQueued(picked.text, picked.pasteSpans);
       }
 
       composerActions.pushHistory(toHistory);
 
       if (getUiState().busy) {
-        return handleBusyInput(queueItem(full));
+        return handleBusyInput(
+          queueItem(submission.text, full, submission.pasteSpans),
+        );
       }
 
       if (shouldInterpolateSubmission(full)) {
         patchUiState({ busy: true });
 
-        return interpolate(full, (text) =>
-          send(
-            prepareSubmission(text, submissionTokens).text,
-            true,
-            text,
-            (value) => value,
-          ),
-        );
+        return interpolate(full, (text) => {
+          const prepared = prepareSubmission(text, submissionTokens);
+
+          send(prepared.text, true, text, (value) => value, {
+            pasteSpans: prepared.pasteSpans,
+          });
+        });
       }
 
-      send(submission.text, true, submission.display, (value) => value);
+      send(submission.text, true, submission.display, (value) => value, {
+        pasteSpans: submission.pasteSpans,
+      });
     },
     [
       appendMessage,
@@ -471,11 +499,11 @@ export function useSubmission(opts: UseSubmissionOptions) {
         }
 
         if (doubleTap && live.sid && composerRefs.queueRef.current.length) {
-          const next = composerActions.dequeue();
+          const next = composerActions.dequeueItem();
 
           if (next) {
             composerActions.setQueueEdit(null);
-            dispatchSubmission(next);
+            dispatchSubmission(next.text, next.pasteSpans ?? []);
           }
         }
 

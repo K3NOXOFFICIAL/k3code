@@ -133,6 +133,7 @@ export interface ConfigFullResponse {
     display?: ConfigDisplayConfig;
     paste_collapse_threshold?: number;
     paste_collapse_char_threshold?: number;
+    wake_words?: Record<string, unknown>;
   };
 }
 

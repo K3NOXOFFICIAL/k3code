@@ -15,6 +15,7 @@ describe("prepareSubmission", () => {
 
     expect(prepareSubmission(`review this: ${label}`, tokens)).toEqual({
       display: `review this: ${label}`,
+      pasteSpans: [[13, 30]],
       text: "review this: first\nmiddle\nlast",
     });
   });

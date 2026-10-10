@@ -232,7 +232,13 @@ export interface ComposerActions {
   attachImagePath: (path: string) => void;
   clearIn: () => void;
   dequeue: () => string | undefined;
-  enqueue: (text: string, display?: string) => void;
+  /** Like `dequeue`, with where the item's pastes are. */
+  dequeueItem: () => QueueItem | undefined;
+  enqueue: (
+    text: string,
+    display?: string,
+    pasteSpans?: readonly (readonly [number, number])[],
+  ) => void;
   handleTextPaste: (
     event: PasteEvent,
   ) => MaybePromise<ComposerPasteResult | null>;
@@ -288,7 +294,10 @@ export interface InputHandlerActions {
   answerClarify: (answer: string) => void;
   appendMessage: (msg: Msg) => void;
   die: () => void;
-  dispatchSubmission: (full: string) => void;
+  dispatchSubmission: (
+    full: string,
+    queuedSpans?: readonly (readonly [number, number])[],
+  ) => void;
   guardBusySessionSwitch: (what?: string) => boolean;
   newSession: (msg?: string, title?: string) => void;
   resumeById?: (id: string) => void;

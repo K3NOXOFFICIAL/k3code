@@ -5,6 +5,8 @@ import type {
 } from "../gatewayTypes.js";
 import type { Msg } from "../types.js";
 
+import { codePointSpans } from "../domain/attachments.js";
+
 import { turnController } from "./turnController.js";
 import { getUiState, patchUiState } from "./uiStore.js";
 
@@ -15,7 +17,11 @@ export const isSessionBusyError = (e: unknown) =>
 
 export interface SubmitPromptDeps {
   appendMessage: (msg: Msg) => void;
-  enqueue: (text: string) => void;
+  enqueue: (
+    text: string,
+    display?: string,
+    pasteSpans?: readonly (readonly [number, number])[],
+  ) => void;
   expand: (text: string) => string;
   gw: GatewayClient;
   setLastUserMsg: (value: string) => void;
@@ -54,12 +60,22 @@ export function markSubmitting(): void {
 // skill expansion, the `/go` send, an accepted proposal). The gateway looks for
 // wake words and applies the ultracode mode only to typed prompts, so the flag
 // goes out ONLY when true: a typed prompt carries no `automated` key at all.
+//
+// `opts.pasteSpans`: where the user's pastes are in `deps.expand(text)` (UTF-16
+// offsets). They go out as `paste_spans` (code points) so a wake word in a
+// pasted log is not read as the user asking for a mode — but only while the
+// text that is sent is still that expansion: a detect_drop rewrite moves
+// things, and then none go out.
 export function submitPrompt(
   text: string,
   deps: SubmitPromptDeps,
   showUserMessage = true,
   displayOverride?: string,
-  opts: { automated?: boolean; skipDetectDrop?: boolean } = {},
+  opts: {
+    automated?: boolean;
+    pasteSpans?: readonly (readonly [number, number])[];
+    skipDetectDrop?: boolean;
+  } = {},
 ): void {
   const sid = getUiState().sid;
 
@@ -74,6 +90,7 @@ export function submitPrompt(
     displayText: string,
     submitText: string,
     show = true,
+    rewritten = false,
   ) => {
     const liveSid = getUiState().sid;
 
@@ -95,11 +112,16 @@ export function submitPrompt(
     turnController.bufRef = "";
     turnController.interrupted = false;
 
+    const spans = rewritten ? [] : (opts.pasteSpans ?? []);
+
     deps.gw
       .request<PromptSubmitResponse>("prompt.submit", {
         session_id: liveSid,
         text: submitText,
         ...(opts.automated ? { automated: true } : {}),
+        ...(spans.length
+          ? { paste_spans: codePointSpans(submitText, spans) }
+          : {}),
       })
       .catch((e: Error) => {
         // Defensive: prompt.submit no longer rejects a mid-turn send with
@@ -107,7 +129,7 @@ export function submitPrompt(
         // the re-queue path as a safety net for any future/legacy gateway that
         // still errors, so a message is never silently dropped.
         if (isSessionBusyError(e)) {
-          deps.enqueue(submitText);
+          deps.enqueue(submitText, undefined, spans);
           patchUiState({ busy: true, status: "queued for next turn" });
 
           return deps.sys(
@@ -143,7 +165,14 @@ export function submitPrompt(
         return startSubmit(text, deps.expand(text), showUserMessage);
       }
 
-      startSubmit(r.text || text, deps.expand(r.text || text), showUserMessage);
+      const dropped = r.text || text;
+
+      startSubmit(
+        dropped,
+        deps.expand(dropped),
+        showUserMessage,
+        dropped !== text,
+      );
     })
     .catch(() => startSubmit(text, deps.expand(text), showUserMessage));
 }

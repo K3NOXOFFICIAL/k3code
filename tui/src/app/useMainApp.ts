@@ -169,7 +169,10 @@ export function applyProposalAccept(
 }
 
 export interface PromptLiveSessionOptions {
-  dispatchSubmission: (full: string) => void;
+  dispatchSubmission: (
+    full: string,
+    queuedSpans?: readonly (readonly [number, number])[],
+  ) => void;
   maybeWarn: (value: unknown) => void;
   modelArg?: string;
   newLiveSession: (
@@ -1129,11 +1132,11 @@ export function useMainApp(gw: GatewayClient) {
       return;
     }
 
-    const next = composerActions.dequeue();
+    const next = composerActions.dequeueItem();
 
     if (next) {
       patchUiState({ busy: true, status: "running…" });
-      sendQueued(next);
+      sendQueued(next.text, next.pasteSpans);
     }
   }, [ui.sid, ui.busy, composerActions, composerRefs, sendQueued]);
 

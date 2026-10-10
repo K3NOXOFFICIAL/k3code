@@ -10,6 +10,7 @@ import {
 
 import { setInputSelection } from "../app/inputSelectionStore.js";
 import {
+  type HighlightContext,
   highlightMask,
   highlightsStable,
 } from "../domain/composerHighlights.js";
@@ -876,6 +877,7 @@ export function TextInput({
   accentColor,
   color,
   focus = true,
+  highlightContext,
 }: TextInputProps) {
   const [cur, setCur] = useState(() =>
     cursorSnapshotRef?.current?.value === value
@@ -1011,8 +1013,8 @@ export function TextInput({
   // reference, so it never highlights.
   const accentOpen = mask ? "" : fgSeq(accentColor);
   const highlights = useMemo(
-    () => (accentOpen ? highlightMask(display) : null),
-    [accentOpen, display],
+    () => (accentOpen ? highlightMask(display, highlightContext) : null),
+    [accentOpen, display, highlightContext],
   );
 
   const rendered = useMemo(() => {
@@ -1258,6 +1260,7 @@ export function TextInput({
       highlightsStable(
         current,
         current.slice(0, cursor) + text + current.slice(cursor),
+        highlightContext,
       ));
 
   const canFastBackspace = (current: string, cursor: number) =>
@@ -1269,6 +1272,7 @@ export function TextInput({
       highlightsStable(
         current,
         current.slice(0, prevPos(current, cursor)) + current.slice(cursor),
+        highlightContext,
       ));
 
   const commit = (
@@ -1897,7 +1901,9 @@ export function TextInput({
               stdout!.write(
                 colorizeEcho(
                   effect.write,
-                  highlightMask(v)[preInsertCursor] ? accentColor : color,
+                  highlightMask(v, highlightContext)[preInsertCursor]
+                    ? accentColor
+                    : color,
                 ),
               );
               // A real character was just fast-echoed to the screen, so the
@@ -2050,6 +2056,8 @@ interface TextInputProps {
   columns?: number;
   cursorSnapshotRef?: MutableRefObject<InputCursorSnapshot | null>;
   focus?: boolean;
+  /** The rest of the prompt around this line, and the wake word config, for the wake word accent. */
+  highlightContext?: HighlightContext;
   /** Leave ↑/↓ to the owner: a form that moves field focus with them owns the key, not the field. */
   ignoreVerticalArrows?: boolean;
   mask?: string;

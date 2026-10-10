@@ -133,6 +133,9 @@ class DisplayConfig(BaseModel):
 
 class GoalConfig(BaseModel):
     max_turns: int = 0  # judged turns before a goal pauses; 0 = no limit (the goal runs until done or blocked)
+    #: failed --check runs in a row before a goal pauses; 0 = no limit. A check that can never pass would otherwise
+    #: keep the goal (and the token spend) going until someone looks; /goal resume starts the count again.
+    gate_max_retries: int = 20
     judge_model: str = "cheap"
 
 

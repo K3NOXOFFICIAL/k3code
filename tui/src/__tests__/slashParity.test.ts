@@ -16,13 +16,17 @@ interface CommandRegistryLoad {
 
 // k3code M1: the core-side command registry is `k3code.commands.builtin.
 // build_registry()`. Commands the TUI handles locally need no route assert;
-// the gateway-side ones (effort/exit/rename/resume) must dispatch natively
-// via command.dispatch — never as a slash-worker prompt fallback.
+// the gateway-side ones (compact/effort/exit/rename/resume/stop) must dispatch
+// natively via command.dispatch — never as a slash-worker prompt fallback.
+// /compact and /stop have no local TUI command: the generic slash.exec path
+// runs the gateway's own command and shows its `output`.
 const NATIVE_MUTATING_COMMANDS = new Set([
+  "compact",
   "effort",
   "exit",
   "rename",
   "resume",
+  "stop",
 ]);
 
 const MUTATING_COMMANDS = [

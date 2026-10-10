@@ -154,7 +154,7 @@ async def test_import_rejects_garbage(tmp_path, monkeypatch):
     await server.close()
 
 
-def test_import_drops_mode_roots_and_background_markers_from_session_meta(tmp_path):
+def test_import_drops_mode_roots_ultra_mode_and_background_markers_from_session_meta(tmp_path):
     from k3code.bundle import Bundle, apply_bundle
 
     store = SessionStore(tmp_path / "s.db")
@@ -164,6 +164,7 @@ def test_import_drops_mode_roots_and_background_markers_from_session_meta(tmp_pa
         "background": True,
         "origin": "automation",
         "origin_session": "abc",
+        "ultra_mode": "ultracode",
         "output_style": "concise",
     }
     bundle = Bundle(manifest={"version": 1}, sessions=[{"session_id": "s1", "title": "t", "meta": meta}])

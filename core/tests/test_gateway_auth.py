@@ -291,6 +291,17 @@ async def test_config_set_goal_max_turns_zero_means_no_turn_limit(tmp_path, monk
     await server.close()
 
 
+async def test_config_set_goal_gate_max_retries_reaches_new_goals(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    sid = await new_session(server, tmp_path)
+    live = server._session_for(sid)
+    assert server.goal_manager(live).set("default", check="true").gates[0].max_retries == 20
+    reply = await rpc(server, "config.set", {"key": "goal.gate_max_retries", "value": 0})
+    assert reply["result"]["value"] == 0 and server.config.goal.gate_max_retries == 0
+    assert server.goal_manager(live).set("unlimited", check="true").gates[0].max_retries == 0
+    await server.close()
+
+
 async def test_k3code_slash_refuses_a_command_that_asks_a_question(gw, tmp_path):
     """slash_via_daemon answered every clarify with its first choice: whatever that did, it did unattended."""
     from k3code.daemon import slash_via_daemon

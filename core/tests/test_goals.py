@@ -188,26 +188,37 @@ async def test_a_finite_turn_budget_still_pauses_and_an_explicit_zero_overrides_
     assert mgr.set("unbounded", max_turns=0).max_turns == 0  # /goal --turns 0: no limit despite the config
 
 
-async def test_failing_check_retries_without_limit_by_default_and_a_finite_limit_still_pauses(monkeypatch):
+async def test_failing_check_pauses_after_20_retries_by_default_and_0_means_no_limit(monkeypatch):
+    # issue #49: unlimited gate retries let a check that can never pass burn tokens until someone looked
     import k3code.goals as goals
 
     async def failing_gate(gate, *, cwd=None):
         return False, 1, "nope"
 
     monkeypatch.setattr(goals, "run_gate", failing_gate)
-    mgr = _mem_manager()
-    mgr.set("ship", check="exit 1")
     judge = scripted_judge(["done"])
-    for n in range(1, 11):
+    mgr = _mem_manager()
+    assert mgr.set("ship", check="exit 1").gates[0].max_retries == goals.DEFAULT_GATE_MAX_RETRIES == 20
+    for n in range(1, 21):
         decision = await mgr.evaluate_after_turn("done!", judge)
         assert decision.should_continue and decision.verdict == "gate_failed"
-        assert f"(attempt {n}):" in decision.prompt
-    assert decision.message == "✗ Check failed (10 turns, attempt 10): $ exit 1"
+        assert f"(attempt {n}/20):" in decision.prompt
+    paused = await mgr.evaluate_after_turn("done!", judge)
+    assert not paused.should_continue and mgr.state.status == "paused"
+    assert mgr.state.paused_reason == "check exhausted 20 retries: $ exit 1"
+    mgr.resume()  # /goal resume starts the count again
+    assert mgr.state.gates[0].attempts == 0
+    assert (await mgr.evaluate_after_turn("done!", judge)).should_continue
 
-    capped = _mem_manager()
-    st = capped.set("ship", check="exit 1")
-    st.gates[0].max_retries = 2
-    capped._save(st)
+    unlimited = _mem_manager(default_gate_max_retries=0)  # goal.gate_max_retries: 0
+    unlimited.set("ship", check="exit 1")
+    for n in range(1, 31):
+        decision = await unlimited.evaluate_after_turn("done!", judge)
+        assert decision.should_continue and f"(attempt {n}):" in decision.prompt
+    assert decision.message == "✗ Check failed (30 turns, attempt 30): $ exit 1"
+
+    capped = _mem_manager(default_gate_max_retries=2)
+    capped.set("ship", check="exit 1")
     assert (await capped.evaluate_after_turn("done!", judge)).message.endswith("attempt 1/2): $ exit 1")
     await capped.evaluate_after_turn("done!", judge)
     paused = await capped.evaluate_after_turn("done!", judge)

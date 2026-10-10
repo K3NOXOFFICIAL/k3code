@@ -278,5 +278,142 @@
   "input": "what does «ultraplan» do?",
   "mode": null,
   "task": null
+ },
+ {
+  "input": "ultracode fix the parser",
+  "mode": "ultracode",
+  "task": "fix the parser"
+ },
+ {
+  "input": "﻿ultracode fix the parser﻿",
+  "mode": "ultracode",
+  "task": "fix the parser"
+ },
+ {
+  "input": "\u001cultracode\u001f",
+  "mode": "ultracode",
+  "task": ""
+ },
+ {
+  "input": "fix the parserultracode",
+  "mode": "ultracode",
+  "task": "fix the parser"
+ },
+ {
+  "input": "~~~\nultracode --help\n~~~",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "run this\n~~~sh\nultracode --help\n~~~\nand explain it",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "run this\n~~~sh\nultracode --help\n~~~\nultraplan it",
+  "mode": "ultraplan",
+  "task": "run this\n~~~sh\nultracode --help\n~~~\nit"
+ },
+ {
+  "input": "what does this print?\n\n    ultracode --version\n\nthanks",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "what does this print?\n\n\tultracode --version",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "the build\n    ultracode it",
+  "mode": "ultracode",
+  "task": "the build\nit"
+ },
+ {
+  "input": "ünïultracode test",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultracodeü test",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultracodé test",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "日本ultracode",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ünï ultracode test",
+  "mode": "ultracode",
+  "task": "ünï test"
+ },
+ {
+  "input": "(ultracode) fix the parser",
+  "mode": "ultracode",
+  "task": "fix the parser"
+ },
+ {
+  "input": "please [ultracode] refactor the loader",
+  "mode": "ultracode",
+  "task": "please refactor the loader"
+ },
+ {
+  "input": "**ultracode** refactor the loader",
+  "mode": "ultracode",
+  "task": "refactor the loader"
+ },
+ {
+  "input": "fix the parser, ultracode.",
+  "mode": "ultracode",
+  "task": "fix the parser."
+ },
+ {
+  "input": "Hey, ultracode: fix the parser",
+  "mode": "ultracode",
+  "task": "Hey, fix the parser"
+ },
+ {
+  "input": "fix the parser\nultracode: and the tests",
+  "mode": "ultracode",
+  "task": "fix the parser\nand the tests"
+ },
+ {
+  "input": "(ultracode fix the parser)",
+  "mode": "ultracode",
+  "task": "(fix the parser)"
+ },
+ {
+  "input": "see this log ultracode build failed",
+  "skip": [
+   [
+    13,
+    35
+   ]
+  ],
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "x ``` y ultracode z",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "x ``` y ultracode z",
+  "skip": [
+   [
+    2,
+    5
+   ]
+  ],
+  "mode": "ultracode",
+  "task": "x ``` y z"
  }
 ]

@@ -439,6 +439,101 @@ describe("renderTable CJK width alignment", () => {
   });
 });
 
+describe("renderTable keeps inline markdown in cells", () => {
+  const renderTable = (md: string, cols: number) => {
+    // chalk defaults to level 0 under vitest, which would emit no SGR.
+    const savedLevel = chalk.level;
+    chalk.level = 3;
+
+    try {
+      return renderAnsi(
+        React.createElement(
+          Box,
+          { width: cols + 2 },
+          React.createElement(Md, { cols, t: DEFAULT_THEME, text: md }),
+        ),
+      )
+        .replace(OSC_RE, "")
+        .split("\n")
+        .filter((line) => stripAnsi(line).trim().length > 0);
+    } finally {
+      chalk.level = savedLevel;
+    }
+  };
+
+  // Ink skips blank runs with cursor-forward (CSI n C); keep them as
+  // spaces so column offsets survive.
+  const CUF_RE = new RegExp(`${ESC}\\[(\\d*)C`, "g");
+  const plain = (line: string) =>
+    stripAnsi(
+      line.replace(CUF_RE, (_, n: string) => " ".repeat(Number(n || 1))),
+    ).replace(CSI_RE, "");
+
+  // The stream holds several frames back to back; keep the body rows of
+  // the last one (everything after its rule) plus where column 2 starts.
+  const lastBody = (lines: string[]) => {
+    const rule = lines.findLastIndex((l) => /^\s*─/.test(plain(l)));
+
+    return {
+      col2: /^\s*─+\s+/.exec(plain(lines[rule]!))![0].length,
+      rows: lines.slice(rule + 1),
+    };
+  };
+
+  const BOLD = `${ESC}[1m`;
+
+  it("styles cells and aligns columns by visible width", () => {
+    const lines = renderTable(
+      [
+        "| Name | Note |",
+        "|---|---|",
+        "| **bold** | `code` and [docs](https://example.com) |",
+        "| plain | *it* x |",
+      ].join("\n"),
+      60,
+    );
+    const text = lines.map(plain);
+
+    // Markup is consumed, not printed.
+    expect(text.join("\n")).not.toMatch(/\*\*|`|\]\(/);
+    expect(text.find((l) => l.includes("docs"))).toContain("code and docs");
+
+    // ...and rendered: bold opens right before the cell text.
+    expect(lines.find((l) => l.includes("bold"))).toContain(`${BOLD}bold`);
+    expect(lines.find((l) => l.includes("it"))).toContain(`${ESC}[3mit`);
+
+    // Column 2 starts at the same offset whatever styling column 1 had.
+    const { col2, rows } = lastBody(lines);
+
+    expect(plain(rows[0]!).indexOf("code")).toBe(col2);
+    expect(plain(rows[1]!).indexOf("it")).toBe(col2);
+  });
+
+  it("re-opens a cell's style on every wrapped line", () => {
+    const lines = renderTable(
+      [
+        "| Key | Description |",
+        "|---|---|",
+        "| a | **alpha beta gamma delta epsilon zeta eta theta** iota |",
+      ].join("\n"),
+      30,
+    );
+    const { col2, rows } = lastBody(lines);
+
+    expect(rows.length).toBeGreaterThan(1);
+    expect(plain(rows[0]!).indexOf("alpha")).toBe(col2);
+
+    for (const line of rows) {
+      expect(line).toContain(BOLD);
+    }
+
+    // Continuation lines stay under the Description column.
+    for (const line of rows.slice(1).map(plain)) {
+      expect(line.length - line.trimStart().length).toBe(col2);
+    }
+  });
+});
+
 describe("body prose stays in the theme palette", () => {
   // Prose used to render in the terminal's DEFAULT foreground while inline
   // tokens beside it carried a theme color, so one line mixed two inks.

@@ -21,6 +21,7 @@ import {
 import { applyPetConfig } from "./petStore.js";
 import { turnController } from "./turnController.js";
 import { patchUiState } from "./uiStore.js";
+import { setWakeWordConfig } from "./wakeWordStore.js";
 
 const STATUSBAR_ALIAS: Record<string, StatusBarMode> = {
   bottom: "bottom",
@@ -293,6 +294,8 @@ export const applyDisplay = (
 ) => {
   const d = cfg?.config?.display ?? {};
   const approvals = cfg?.config?.approvals;
+
+  setWakeWordConfig(cfg?.config?.wake_words);
 
   setBell(!!d.bell_on_complete);
 

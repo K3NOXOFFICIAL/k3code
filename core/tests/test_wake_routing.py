@@ -339,6 +339,27 @@ async def test_an_inline_job_is_stopped_by_stop_and_leaves_no_sub_agents(tmp_pat
     assert transcript(server)[0] == ("user", "ultracode a long job")
 
 
+async def test_stopping_a_backgrounded_job_says_stopped_not_finished(tmp_path, monkeypatch, hung_children):
+    # Issue #56: the job catches the /stop and returns "interrupted", so the task ends normally and the background
+    # watcher used to report "finished".
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    await start(server, tmp_path)
+    pipe.hold = asyncio.Event()
+    await call(server, "prompt.submit", {"text": "ultracode a long job"})
+    job = server.session
+    task = job.turn_task
+    await pipe.started.wait()
+    assert (await call(server, "prompt.background", {}))["status"] == "backgrounded"
+    assert job.background and server.session is not job
+    assert (await call(server, "session.interrupt", {"session_id": job.session_id}))["interrupted"] is True
+    await asyncio.wait_for(task, 20)
+    await asyncio.sleep(0.05)  # done-callbacks run on the next loop iteration
+    note = [n for n in events(server, "notification.show") if n.get("kind") == "background"]
+    assert len(note) == 1 and "was stopped" in note[0]["text"] and "finished" not in note[0]["text"]
+    assert note[0]["level"] == "warning"
+
+
 async def test_a_job_that_ends_takes_its_sub_agents_with_it(tmp_path, monkeypatch, hung_children):
     server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
     pipe = pipeline(server, monkeypatch)
@@ -839,3 +860,48 @@ def test_unknown_keys_under_ultracode_and_wake_words_are_warned_about(tmp_path, 
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "ultracode.max_agent is not used" in text and "wake_words.x is not used" in text
     assert "min_scope is not used" not in text and "ultraplan is not used" not in text
+
+
+LOG = "Traceback: ultraresearch.py line 3 failed"  # a pasted log that names another wake word
+
+
+async def test_a_wake_word_in_pasted_text_never_runs_a_mode_now_queued_or_steered(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    pipe = pipeline(server, monkeypatch)
+    await start(server, tmp_path)
+    text = f"why does this fail?\nultraresearch failed {LOG}"
+    paste = [[20, len(text)]]
+    await submit(server, text, paste_spans=paste)  # the only wake word is pasted: a normal turn
+    assert pipe.calls == [] and transcript(server)[-1] == ("assistant", "NORMAL-TURN")
+    # typed "ultracode" plus a pasted "ultraresearch": without the spans that is two modes, which is no wake word
+    typed = f"ultracode fix this: {LOG}"
+    await submit(server, typed, paste_spans=[[20, len(typed)]])
+    assert pipe.calls == [("ultracode", f"fix this: {LOG}")]
+    # queued behind a turn and steered into one, the spans travel with the prompt
+    pipe.hold = asyncio.Event()
+    pipe.started.clear()
+    await call(server, "prompt.submit", {"text": "ultracode build the thing"})
+    task = server.session.turn_task
+    await pipe.started.wait()
+    queued = await call(server, "prompt.submit", {"text": typed, "paste_spans": [[20, len(typed)]]})
+    assert queued["status"] == "queued"
+    steer = f"ultraplan and this: {LOG}"
+    assert (await call(server, "session.steer", {"text": steer, "paste_spans": [[20, len(steer)]]}))["steered"]
+    pipe.hold.set()
+    await asyncio.wait_for(task, 20)
+    await server.autonomy.drain()
+    assert pipe.calls[1:] == [("ultracode", "build the thing"), ("ultracode", f"fix this: {LOG}")]
+    steered = transcript(server)[-3]  # ultraplan is not the faked pipeline: it ran (and found no planner)
+    assert steered[0] == "assistant" and steered[1].startswith(f"/ultraplan and this: {LOG} failed")
+
+
+@pytest.mark.parametrize("spans", [[[0]], [[3, 1]], [[0, 999]], [[-1, 2]], [[True, 2]], "0-5", [["0", "5"]]])
+async def test_malformed_paste_spans_are_refused(tmp_path, monkeypatch, spans):
+    server = make(tmp_path, monkeypatch, [NORMAL], autonomy=NO_GATE)
+    await start(server, tmp_path)
+    for method in ("prompt.submit", "session.steer"):
+        n = len(server._frames)
+        msg = {"jsonrpc": "2.0", "id": 9, "method": method, "params": {"text": "ultracode x", "paste_spans": spans}}
+        await server._handle_line(json.dumps(msg))
+        out = [json.loads(x) for x in server._frames[n:] if json.loads(x).get("id") == 9]
+        assert "paste_spans" in out[0]["error"]["message"]
