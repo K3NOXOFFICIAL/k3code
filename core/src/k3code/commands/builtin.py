@@ -1,4 +1,4 @@
-"""Built-in slash commands: /model /effort /clear /compact /rename /resume /stop /exit /help."""
+"""Built-in slash commands: /tune /model /effort /clear /compact /rename /resume /stop /exit /help."""
 
 from __future__ import annotations
 
@@ -6,12 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from k3code import chain_config
-from k3code.commands import CommandDef, CommandRegistry
+from k3code.commands import CommandDef, CommandRegistry, tune
 from k3code.commands.autonomy import AdvisorCommand, GoCommand, PreviewCommand, ProposalsCommand, ScopeCommand
 from k3code.commands.daemon import DaemonCommand
 from k3code.commands.debug import DebugCommand
 from k3code.commands.doctor import DoctorCommand
 from k3code.commands.stats import StatsCommand
+from k3code.commands.tune import TuneCommand
 from k3code.commands.update_cmd import UpdateCommand
 from k3code.config import load_config
 from k3code.providers.effort import LEVELS as EFFORT_LEVELS
@@ -29,29 +30,24 @@ class _ModelCommand(CommandDef):
         if not arg:
             current = (live.stored.model if live is not None else "") or ctx.config.default_model
             return {"type": "message", "message": f"Current model key: {current}"}
-        key, _, reason = arg.partition(" ")
+        key, _, rest = arg.partition(" ")
         # like config.set model: a known key, set on the session (the next turn routes on stored.model); it used to
-        # change only config.default_model, which a session with its own model never reads, and took any typo
-        known = {m for p in ctx.config.providers for m in p.models} | {ctx.config.default_model}
-        if key not in known:
-            return {"type": "message", "message": f"Unknown model key: {key} (known: {', '.join(sorted(known))})"}
-        old = (live.stored.model if live is not None else "") or ctx.config.default_model
-        if hasattr(ctx, "learning") and key != old:
-            kind = getattr(live, "current_kind", "") if live is not None else ""
-            ctx.learning.record(
-                "model_switch",
-                live,
-                subject=f"{old} -> {key}",
-                choice=key,
-                detail={"from": old, "to": key, "reason": reason.strip(), "task_kind": kind or ""},
-            )
-        if live is None:
-            ctx.config.default_model = key
-        else:
-            live.stored.model = key
-            ctx.store.save(live.stored)
-            live.emit("session.info", live.live_info())
-        return {"type": "message", "message": f"Model key set to: {key}"}
+        # change only config.default_model, which a session with its own model never read, and took any typo
+        if key not in tune.known_model_keys(ctx.config):
+            return {"type": "message", "message": tune.unknown_model_message(ctx.config, key)}
+        rest = rest.strip()
+        if any(t.startswith("--") for t in rest.split()):  # /model <key> --reasoning high --global: the /tune flags
+            try:
+                req = tune.parse_tune(ctx.config, f"model {key} {rest}")
+            except tune.TuneError as e:
+                return {"type": "message", "message": f"{e}. Usage: /model <key> [--reasoning <level>] [--global]"}
+        else:  # anything else after the key is the reason, kept with the model_switch record
+            req = tune.TuneRequest(model=key, reason=rest)
+        try:
+            outcome = tune.apply_tune(ctx, live, req)
+        except tune.TuneError as e:
+            return {"type": "message", "message": str(e)}
+        return {"type": "message", "message": "\n".join(outcome.lines)}
 
     def _chain(self, ctx: Any, session_id: str | None, args: list[str]) -> dict[str, Any]:
         """/model chain [add|remove|move …]: show the fallback chain, or edit the user config."""
@@ -88,17 +84,8 @@ class _EffortCommand(CommandDef):
             return {"type": "message", "message": f"Unknown effort: {arg}. Usage: {self._USAGE}"}
         if live is None:
             return {"type": "message", "message": "No active session."}
-        # Sent from the next turn on: as output_config.effort to Claude models that take it, and as
-        # reasoning_effort to OpenAI reasoning models. Other models ignore it.
-        value = None if arg == "default" else arg
-        live.reasoning_effort = value
-        if value is None:
-            live.stored.meta.pop("reasoning_effort", None)
-        else:
-            live.stored.meta["reasoning_effort"] = value
-        ctx.store.save(live.stored)
-        live.emit("session.info", live.live_info())
-        return {"type": "message", "message": f"Reasoning effort set to: {arg}"}
+        outcome = tune.apply_tune(ctx, live, tune.TuneRequest(effort=arg))
+        return {"type": "message", "message": "\n".join(outcome.lines)}
 
 
 class _ClearCommand(CommandDef):
@@ -219,6 +206,7 @@ class _ExitCommand(CommandDef):
 
 class _HelpCommand(CommandDef):
     headless = True
+    needs_server = False
 
     def __init__(self) -> None:
         super().__init__(name="help", aliases=["h", "?"], help="List available commands")
@@ -293,6 +281,7 @@ def build_registry() -> CommandRegistry:
     ):
         reg.register(extra)
     for cmd in (
+        TuneCommand(),
         _ModelCommand(),
         _EffortCommand(),
         _ClearCommand(),

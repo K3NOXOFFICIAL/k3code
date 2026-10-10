@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -193,7 +195,8 @@ def test_apply_detached_without_a_unit_needs_no_systemd(data: Path, monkeypatch:
     exe = data / "k3code"
     sid = data / "sid.txt"  # its own session: closing the terminal (SIGHUP to the session) does not stop it
     exe.write_text(
-        f'#!/bin/sh\nps -o sid= -p $$ > {sid}\necho "$@ sock=${{K3CODE_GATEWAY_SOCKET:-none}}" > {out}\necho updating\n'
+        f'#!/bin/sh\n{shlex.quote(sys.executable)} -c "import os; print(os.getsid(0))" > {sid}\n'
+        f'echo "$@ sock=${{K3CODE_GATEWAY_SOCKET:-none}}" > {out}\necho updating\n'
     )
     exe.chmod(0o755)
     monkeypatch.setenv("K3CODE_GATEWAY_SOCKET", "/run/secret.sock")

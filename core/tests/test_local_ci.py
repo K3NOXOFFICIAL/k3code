@@ -99,7 +99,7 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
     for cmd in (
         "(cd core && uv run ruff check . ../scripts)",
         "(cd core && uv run ruff format --check . ../scripts)",
-        "(cd core && uv run pytest -q)",
+        "(cd core && timeout --kill-after=30 2700 uv run pytest -q)",  # a stalled run fails (issue #42)
         "(cd tui && npm run build:ink)",
         "(cd tui && npm run typecheck)",
         "(cd tui && npm run lint)",
@@ -107,7 +107,7 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
         "(cd tui && tui_vitest)",
         "go vet ./internal/k3keys/... ./internal/harness/... ./cmd/k3/",
         "go test -race ./internal/k3keys/... ./internal/harness/...",
-        "go test ./internal/input/ ./internal/app/",
+        "go test -timeout 30m ./internal/input/ ./internal/app/",
         "python3 scripts/vendor_check.py",
         "gitleaks detect --source . --config .gitleaks.toml",
         "--log-opts=origin/Main..HEAD",

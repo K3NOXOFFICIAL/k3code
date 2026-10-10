@@ -748,14 +748,25 @@ def test_a_lock_whose_pid_now_names_another_process_is_taken_over(tmp_path: Path
     assert not lock.exists()
 
 
-@pytest.mark.parametrize("recorded", ["tmp/not-k3code", "tmp/sub/k3code-tui.Zz99", "elsewhere/k3code-tui.Zz99"])
-def test_a_recorded_path_that_is_not_a_tui_build_dir_is_left_alone(tmp_path: Path, recorded: str) -> None:
+@pytest.mark.parametrize(
+    ("recorded", "removed"),
+    [
+        ("tmp/k3code-tui.Ab12Cd", True),  # the control: a k3code-tui.* directly in TMPDIR goes
+        ("tmp/not-k3code", False),
+        ("tmp/sub/k3code-tui.Zz99", False),
+        ("elsewhere/k3code-tui.Zz99", False),
+    ],
+)
+def test_only_a_tui_build_dir_directly_in_tmpdir_is_removed_with_a_stale_lock(
+    tmp_path: Path, recorded: str, removed: bool
+) -> None:
     dead = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
     _lock_of(tmp_path, int(dead), "", recorded)
     r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
     assert r.returncode == 0, r.stderr
-    assert "taking over the install lock" in r.stderr and "removed the TUI build directory" not in r.stderr
-    assert (tmp_path / recorded).is_dir()
+    assert "taking over the install lock" in r.stderr
+    assert ("removed the TUI build directory" in r.stderr) is removed
+    assert (tmp_path / recorded).exists() is not removed
 
 
 def test_a_tui_build_dir_is_removed_when_tmpdir_ends_in_a_slash(tmp_path: Path) -> None:
@@ -774,6 +785,8 @@ def test_a_lock_k3code_update_holds_stops_the_installer(tmp_path: Path, monkeypa
 
     monkeypatch.setenv("K3CODE_DATA", str(tmp_path / DATA_REL))
     with upd.install_lock():
+        # the start time install.sh compares with its own reading of the pid: without it the pid alone would hold
+        assert (tmp_path / DATA_REL / ".install.lock" / "start").read_text().strip() == upd._process_start(os.getpid())
         (tmp_path / "tmp" / "k3code-tui.Ab12Cd").mkdir(parents=True)
         (tmp_path / DATA_REL / ".install.lock" / "tui_tmp").write_text(f"{tmp_path / 'tmp' / 'k3code-tui.Ab12Cd'}\n")
         r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})
@@ -788,10 +801,15 @@ def test_a_command_name_with_spaces_and_parentheses_keeps_its_lock(tmp_path: Pat
     # /proc/<pid>/stat field 2 is the command name: install.sh must count the fields from its last ")"
     from k3code import update as upd
 
-    odd = tmp_path / "a) (b c"
-    shutil.copy(shutil.which("sleep") or "/bin/sleep", odd)
-    holder = subprocess.Popen([str(odd), "30"])
+    # The name is set with prctl(PR_SET_NAME), not by running a renamed copy of `sleep`: where sleep is BusyBox, a copy
+    # does not know which applet it is.
+    code = (
+        "import ctypes, time; ctypes.CDLL(None).prctl(15, b'a) (b c', 0, 0, 0)\n"
+        "print('ready', flush=True); time.sleep(30)"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
     try:
+        assert holder.stdout is not None and holder.stdout.readline().strip() == "ready"
         assert Path(f"/proc/{holder.pid}/stat").read_text().startswith(f"{holder.pid} (a) (b c) ")
         lock = _lock_of(tmp_path, holder.pid, upd._process_start(holder.pid), "tmp/k3code-tui.Ab12Cd")
         r = run(tmp_path, INSTALL, "--from-source", "--minimal", env_extra={"TMPDIR": str(tmp_path / "tmp")})

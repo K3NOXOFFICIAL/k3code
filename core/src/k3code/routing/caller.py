@@ -62,10 +62,14 @@ class ModelCaller:
         timeout: float | None = None,
         escalate: bool = True,
         tier: Tier | None = None,
+        router: Any = None,
     ) -> CallResult:
+        """``router``: send to this router instead of the tier's (a model named in config); no escalation then."""
         kind = TaskKind(kind)
         routers = self._routers()
         tier = tier or tier_for(kind, getattr(self.config, "task_tiers", None))
+        if router is not None:
+            return await self._once(routers, kind, tier, messages, session_id, tools or [], max_tokens, timeout, router)
         while True:
             try:
                 return await self._once(routers, kind, tier, messages, session_id, tools or [], max_tokens, timeout)
@@ -115,8 +119,9 @@ class ModelCaller:
         tools: list[ToolSpec],
         max_tokens: int,
         timeout: float | None,
+        router: Any = None,
     ) -> CallResult:
-        router = routers.get(tier)
+        router = router if router is not None else routers.get(tier)
         coro = router.complete(messages, tools, max_tokens=max_tokens)
         started = time.monotonic()
         final = await (asyncio.wait_for(coro, timeout) if timeout else coro)

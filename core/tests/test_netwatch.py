@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+
 from k3code.reliability.netwatch import (
     InternetProbeResult,
     NetState,
@@ -321,3 +325,33 @@ async def test_rearming_a_bundle_subscribes_the_net_state_forwarder_once():
     for cb in list(rel.netwatch._callbacks):
         cb(NetState.ONLINE, NetState.OFFLINE)
     assert len(delivered) == 1
+
+
+@pytest.mark.parametrize("swallow", ["error", "return"])
+@pytest.mark.parametrize("loop", ["monitor", "nm"])
+async def test_loops_end_when_a_probe_swallows_the_cancel(loop, swallow):
+    """Issue #42: httpcore/anyio can lose a task.cancel() inside a shielded checkpoint, so the probe comes back with an
+    ordinary error (or a plain result) instead of CancelledError. The loops caught that as "just a probe error" and ran
+    on, and the event-loop teardown of the test (Runner.close -> _cancel_all_tasks) then waited for them for ever."""
+    entered = asyncio.Event()
+
+    async def swallowing_probe(*_args):
+        entered.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            if swallow == "error":
+                raise OSError("proxy refused") from None  # what a lost cancel looks like from outside
+            return InternetProbeResult(ok=True, latency_ms=1.0) if loop == "monitor" else None
+
+    probes = {"internet_probe": swallowing_probe} if loop == "monitor" else {"nm_probe": swallowing_probe}
+    nw = _watch(config=_config(base_interval=0.01, nm_poll_interval=0.01), **probes)
+    await nw.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        for t in nw._tasks:  # what asyncio.Runner.close does: cancel from outside, never via stop()
+            t.cancel()
+        _done, pending = await asyncio.wait(nw._tasks, timeout=3)
+        assert not pending, "a monitor task kept running after it was cancelled"
+    finally:
+        await nw.stop()

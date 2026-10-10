@@ -71,7 +71,7 @@ describe("cursor-drift regression — composer cursorLayout matches Ink renderin
         ).toEqual(expected);
       }
     }
-  }, 120_000);
+  }, 600_000); // CPU-bound (wrap-ansi at every prefix): ~12 s alone, 10x that on a machine running three checks
 
   it("keeps cursor on the same row when text exactly fills the terminal width", () => {
     // wrap-ansi does NOT push exact-fill text onto a phantom next line.

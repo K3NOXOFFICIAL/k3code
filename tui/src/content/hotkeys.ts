@@ -32,7 +32,7 @@ export const HOTKEYS: [string, string][] = [
   ["Ctrl+R / F7", "collapse / restore live agent preview"],
   [
     "Ctrl+O",
-    "open model picker (keeps your draft; applies to next turn mid-stream)",
+    "open /tune: model, effort, ultracode (keeps your draft; applies to next turn mid-stream)",
   ],
   [action + "+A/E", "home / end of line"],
   [action + "+Z / " + action + "+Y", "undo / redo input edits"],

@@ -120,16 +120,24 @@ def test_a_lock_whose_pid_now_names_another_process_is_taken_over(
     assert not lock.exists()
 
 
-@pytest.mark.parametrize("recorded", ["tmp/not-k3code", "tmp/sub/k3code-tui.Zz99", "elsewhere/k3code-tui.Zz99"])
-def test_a_recorded_path_that_is_not_a_tui_build_dir_is_left_alone(
-    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_uv: str, recorded: str
+@pytest.mark.parametrize(
+    ("recorded", "removed"),
+    [
+        ("tmp/k3code-tui.Ab12Cd", True),  # the control: a k3code-tui.* directly in TMPDIR goes
+        ("tmp/not-k3code", False),
+        ("tmp/sub/k3code-tui.Zz99", False),
+        ("elsewhere/k3code-tui.Zz99", False),
+    ],
+)
+def test_only_a_tui_build_dir_directly_in_tmpdir_is_removed_with_a_stale_lock(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_uv: str, recorded: str, removed: bool
 ) -> None:
     lock = data / LOCK
     lock.mkdir(parents=True)
     (lock / "pid").write_text(f"{_dead_pid()}\n")
     _tui_tmp(tmp_path, monkeypatch, lock, tmp_path / recorded)
     upd.install_release(_release(monkeypatch, []), None, uv=fake_uv)
-    assert (tmp_path / recorded).is_dir()
+    assert (tmp_path / recorded).exists() is not removed
     assert not lock.exists()
 
 

@@ -26,6 +26,7 @@ install_hint() {
     go) echo "install Go (the version in panes/go.mod): https://go.dev/dl/ (or dnf install golang / brew install go)" ;;
     gitleaks) echo "install gitleaks 8.30.1 or newer: https://github.com/gitleaks/gitleaks/releases (or brew install gitleaks)" ;;
     shellcheck) echo "install shellcheck: dnf install ShellCheck / apt install shellcheck / brew install shellcheck" ;;
+    timeout) echo "install GNU coreutils (it ships timeout): dnf install coreutils / apt install coreutils" ;;
     bwrap) echo "install bubblewrap (the sandbox the core tests run under): dnf install bubblewrap / apt install bubblewrap" ;;
     gh) echo "install the GitHub CLI and sign in: https://cli.github.com/ then gh auth login" ;;
     python3) echo "install Python 3.12+ (python3 on PATH)" ;;

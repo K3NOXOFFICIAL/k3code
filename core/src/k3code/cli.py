@@ -247,20 +247,36 @@ def _headless_slash(prompt: str) -> tuple[Any, str, str] | None:
     return (cmd, name, parts[1] if len(parts) > 1 else "") if cmd is not None else None
 
 
+class _LightCommandContext:
+    """What a command with ``needs_server = False`` may use: the config and the registry, nothing on disk."""
+
+    def __init__(self, config: Any, commands: Any) -> None:
+        self.config = config
+        self.commands = commands
+
+
 async def _run_headless_slash(cmd: Any, name: str, arg: str, config: Any) -> dict[str, Any]:
     """Run a slash command through the gateway's own dispatch, without a session, a client or any provider."""
     if not cmd.headless:
         return {"error": "interactive_only", "message": f"/{name} needs an interactive session"}
-    from k3code.gateway.server import GatewayServer
+    if cmd.needs_server:
+        from k3code.gateway.server import GatewayServer
 
-    server = GatewayServer(config=config)
-    try:
-        result = await server.dispatch_command(name, arg, None)
-    finally:
-        await server.close()
+        server = GatewayServer(config=config)
+        try:
+            result = await server.dispatch_command(name, arg, None)
+        finally:
+            await server.close()
+    else:  # /help and /skills: a plain `-p "/help"` must not create the home databases
+        from k3code.commands.builtin import build_registry
+
+        registry = build_registry()
+        result = await registry.dispatch(_LightCommandContext(config, registry), name, arg, None)
     text = str(result.get("output") or result.get("message") or "")
     if result.get("error"):  # a handler that raised: dispatch turned it into text, but -p must fail
         return {"error": str(result["error"]), "message": text}
+    if text.lstrip().lower().startswith("usage:"):  # a command that only printed its usage line did not run
+        return {"error": "usage", "message": text}
     data = {k: v for k, v in result.items() if k not in ("type", "message", "output")}
     return {"text": text, "command": f"/{cmd.name}", "data": data}
 

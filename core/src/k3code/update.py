@@ -505,6 +505,10 @@ def _take_over_stale_lock(lock: Path) -> None:
         if not now or now == started:
             raise InstallLockHeld(f"another install into {lock.parent} is running (pid {pid}); wait for it to finish")
     _remove_recorded_tui_tmp(lock)
+    # Not atomic, as in install.sh's take_lock: two runs that find the same stale lock can interleave (one removes it
+    # and makes its own, the other then removes that one) and both go on; only a run that arrives between the rmtree
+    # and the mkdir is stopped, by the mkdir. It takes two installs started within the same few milliseconds over a
+    # lock a killed install left, so it is documented here rather than closed with a retry.
     shutil.rmtree(lock, ignore_errors=True)
     try:
         lock.mkdir()

@@ -32,8 +32,13 @@ import {
   shortCwd,
 } from "../domain/paths.js";
 import { sessionScopedModelArg } from "../domain/slash.js";
+import { tuneSummary } from "../domain/tune.js";
 import { type GatewayClient } from "../gatewayClient.js";
-import type { SubagentListResponse } from "../gatewayTypes.js";
+import type {
+  SubagentListResponse,
+  TuneSetParams,
+  TuneSetResponse,
+} from "../gatewayTypes.js";
 import type {
   AnyGatewayEvent,
   ClarifyLockResponse,
@@ -132,6 +137,36 @@ const statusColorOf = (
 
   return t.muted;
 };
+
+/**
+ * The gateway's answer to accepting a proposal card. Only a `send` is a prompt,
+ * and it is the gateway's text, not something the user typed: it goes out
+ * `automated`, so no wake word and no ultracode mode looks at it. Anything else
+ * is a note about what the gateway already did.
+ */
+export function applyProposalAccept(
+  raw: unknown,
+  submitLiteral: (value: string, opts?: { automated?: boolean }) => void,
+  sys: (text: string) => void,
+): void {
+  const r = asRpcResult<{
+    message?: string;
+    notice?: string;
+    output?: string;
+    text?: string;
+    type?: string;
+  }>(raw);
+
+  if (r?.type === "send" && (r.message || r.text)) {
+    return submitLiteral(r.message ?? r.text ?? "", { automated: true });
+  }
+
+  const note = r?.output ?? r?.message ?? r?.notice;
+
+  if (note) {
+    sys(note);
+  }
+}
 
 export interface PromptLiveSessionOptions {
   dispatchSubmission: (full: string) => void;
@@ -296,7 +331,9 @@ export function useMainApp(gw: GatewayClient) {
   );
   const sysRef = useRef<(text: string) => void>(() => {});
   const submitRef = useRef<(value: string) => void>(() => {});
-  const submitLiteralRef = useRef<(value: string) => void>(() => {});
+  const submitLiteralRef = useRef<
+    (value: string, opts?: { automated?: boolean }) => void
+  >(() => {});
   const terminalHintsShownRef = useRef(new Set<string>());
   const historyItemsRef = useRef(historyItems);
   const lastUserMsgRef = useRef(lastUserMsg);
@@ -849,25 +886,9 @@ export function useMainApp(gw: GatewayClient) {
     setProposalHandlers({
       accept: (p) => {
         dispatch("accept", p.id)
-          .then((raw) => {
-            const r = asRpcResult<{
-              message?: string;
-              notice?: string;
-              output?: string;
-              text?: string;
-              type?: string;
-            }>(raw);
-
-            if (r?.type === "send" && (r.message || r.text)) {
-              return submitLiteralRef.current(r.message ?? r.text ?? "");
-            }
-
-            const note = r?.output ?? r?.message ?? r?.notice;
-
-            if (note) {
-              sys(note);
-            }
-          })
+          .then((raw) =>
+            applyProposalAccept(raw, submitLiteralRef.current, sys),
+          )
           .catch((e: Error) => sys(`proposal not accepted: ${e.message}`));
       },
       dismiss: (p) => void dispatch("dismiss", p.id).catch(() => {}),
@@ -1072,18 +1093,24 @@ export function useMainApp(gw: GatewayClient) {
 
   sysRef.current = sys;
 
-  const { dispatchSubmission, send, sendQueued, submit, submitLiteral } =
-    useSubmission({
-      appendMessage,
-      composerActions,
-      composerRefs,
-      composerState,
-      gw,
-      setLastUserMsg,
-      slashRef,
-      submitRef,
-      sys,
-    });
+  const {
+    dispatchSubmission,
+    resend,
+    sendAutomated,
+    sendQueued,
+    submit,
+    submitLiteral,
+  } = useSubmission({
+    appendMessage,
+    composerActions,
+    composerRefs,
+    composerState,
+    gw,
+    setLastUserMsg,
+    slashRef,
+    submitRef,
+    sys,
+  });
 
   submitLiteralRef.current = submitLiteral;
 
@@ -1334,7 +1361,10 @@ export function useMainApp(gw: GatewayClient) {
         transcript: {
           page,
           panel,
-          send,
+          // /retry: the last prompt again, typed or automated exactly as it first went out.
+          resend,
+          // Text the gateway generated (a /skill expansion, the /go send, a goal kick), sent `automated`.
+          send: sendAutomated,
           setHistoryItems,
           sys,
           trimLastExchange: session.trimLastExchange,
@@ -1351,8 +1381,9 @@ export function useMainApp(gw: GatewayClient) {
       maybeWarn,
       page,
       panel,
+      resend,
       selection,
-      send,
+      sendAutomated,
       session,
       setHistoryItems,
       sys,
@@ -1432,6 +1463,20 @@ export function useMainApp(gw: GatewayClient) {
     patchOverlayState({ modelPicker: false });
     slashRef.current(`/model ${value}`);
   }, []);
+
+  // /tune popup: Enter / `s`. One tune.set carries the model, effort and ultracode changes; the gateway answers with
+  // what changed and pushes a session.info, which updates the status line.
+  const onTuneApply = useCallback(
+    (params: TuneSetParams) => {
+      patchOverlayState({ tunePicker: false });
+      void rpc<TuneSetResponse>("tune.set", { ...params }).then((r) => {
+        if (r) {
+          sys(tuneSummary(params, r));
+        }
+      });
+    },
+    [rpc, sys],
+  );
 
   const closeLiveSession = useCallback(
     async (id: string) => {
@@ -1574,6 +1619,7 @@ export function useMainApp(gw: GatewayClient) {
         session.newLiveSession(undefined, undefined, dropSid),
       newPromptSession,
       onModelSelect,
+      onTuneApply,
       // Resuming a cold session from the overlay CLOSES the current one, so it
       // must respect the busy guard just like the `/resume` slash path.
       // (Switching between live sessions and `+ new` keep the current session
@@ -1597,6 +1643,7 @@ export function useMainApp(gw: GatewayClient) {
       closeLiveSession,
       newPromptSession,
       onModelSelect,
+      onTuneApply,
       session,
     ],
   );

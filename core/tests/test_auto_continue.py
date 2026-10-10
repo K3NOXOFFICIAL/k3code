@@ -161,6 +161,26 @@ async def test_a_queued_prompt_replaces_the_implicit_goal(tmp_path, monkeypatch)
     await server.close()
 
 
+async def test_a_queued_prompt_after_a_continued_turn_is_a_goal_of_its_own(tmp_path, monkeypatch):
+    """A turn that ended right after a continuation left ``goal_continuation`` set; the queued prompt run next then
+    counted as a continuation itself and got no implicit goal."""
+    server, provider, live, mgr = await _setup(tmp_path, monkeypatch, replies=["step 1", "step 2", "third"])
+    inner = scripted_judge(["continue", "done"])
+
+    async def judge(goal, response):
+        if not inner.calls:
+            live.pending_prompts.append("then do this")  # typed while the first turn ran
+        return await inner(goal, response)
+
+    server.goal_judge = judge
+    await server._run_turn(live, "first task")
+    assert provider.n == 3
+    # turn 2 ended with a prompt waiting, so it went unjudged; the waiting prompt is judged as the goal it now is
+    assert inner.calls == [("first task", "step 1"), ("then do this", "third")]
+    assert mgr.state is None
+    await server.close()
+
+
 async def test_kicks_never_resurrect_an_implicit_goal(tmp_path, monkeypatch):
     server, provider, live, mgr = await _setup(tmp_path, monkeypatch)
     mgr.set("a prompt from before the daemon died", implicit=True)

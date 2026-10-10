@@ -57,6 +57,13 @@ DEFAULTS: dict[str, Any] = {
 ESCALATE_KEYS = frozenset(DEFAULTS["escalate"])
 
 
+#: The keys of the ``ultracode`` config section; config load warns about any other key (it would be ignored).
+ULTRACODE_KEYS = frozenset({"max_tokens", "max_agents", "min_scope"})
+#: ``ultracode.min_scope`` default: with the ultracode mode on, a prompt at least this big runs the pipeline
+#: (``small`` = everything except ``trivial``: answers and one located edit).
+DEFAULT_MIN_SCOPE = "small"
+
+
 def autonomy_cfg(config: Any) -> dict[str, Any]:
     """Autonomy settings with defaults filled in (``config.autonomy`` overrides)."""
     user = dict(getattr(config, "autonomy", None) or {})

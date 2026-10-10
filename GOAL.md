@@ -120,9 +120,10 @@ All of these exist and appear in `/help`. A test (`core/tests/test_merge_m5.py`)
 | `/loop` | Repeat a prompt on an interval, or self-paced, with count, condition and tick limits |
 | `/compact` | Summarize older conversation to free context |
 | `/bg` | Run a task in the background (also: send the running turn to the background) |
-| `/effort` | Show or set reasoning effort |
-| `/model` | Show or switch the model; `/model chain` manages the fallback chain |
-| `/ultracode` | Plan, fan out, adversarial review, fix, test, with a budget |
+| `/tune` | One popup (or one line) for the model, the reasoning effort and the ultracode mode; `--global` saves the model as the default for new sessions |
+| `/effort` | Show or set reasoning effort; bare, the TUI opens the `/tune` popup |
+| `/model` | Show or switch the model; `/model chain` manages the fallback chain; bare, the TUI opens the `/tune` popup |
+| `/ultracode` | Plan, fan out, adversarial review, fix, test, with a budget; bare, `on`, `off` and `status` control the always-on ultracode mode (saying `ultracode`, `ultraplan` or `ultraresearch` in a prompt runs that mode once) |
 | `/ultraplan` | Deep planning: independent planners plus a judge |
 | `/preview` | Quick sketch of what a task would produce, with no changes |
 | `/stats` | Usage, tiers, failovers, retries and pauses |

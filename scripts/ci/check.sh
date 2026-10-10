@@ -193,7 +193,12 @@ area_core() {
   fi
   step "ruff check" core uv run ruff check . ../scripts
   step "ruff format --check" core uv run ruff format --check . ../scripts
-  if full; then step "pytest" core uv run pytest -q; fi
+  if full; then
+    # A stalled run must fail instead of hanging the whole check (issue #42). 45 min is far above a normal run;
+    # faulthandler_timeout (core/pyproject.toml) prints the stacks of a test stuck for 5 min, so the log says where.
+    need timeout
+    step "pytest" core timeout --kill-after=30 "${K3CODE_CI_PYTEST_TIMEOUT:-2700}" uv run pytest -q
+  fi
 }
 
 # npm ci when tui/node_modules does not match package-lock.json (a stamp holds the lock's hash).
@@ -243,7 +248,9 @@ area_panes() {
   step "go vet" panes go vet ./internal/k3keys/... ./internal/harness/... ./cmd/k3/
   if full; then
     step "go test -race" panes go test -race ./internal/k3keys/... ./internal/harness/...
-    step "go test input app" panes go test ./internal/input/ ./internal/app/
+    # ./internal/app takes ~4 min alone and several times that when other checks share the machine; the default
+    # 10 min package timeout then kills it mid-test (issue #52)
+    step "go test input app" panes go test -timeout 30m ./internal/input/ ./internal/app/
   fi
 }
 

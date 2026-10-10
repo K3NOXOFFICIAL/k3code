@@ -105,6 +105,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
   } = opts;
 
   const lastEmptyAt = useRef(0);
+  // Whether the last prompt went out as `automated` (see submitPrompt): /retry sends it again the same way.
+  const lastAutomated = useRef(false);
   const typingIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -142,12 +144,14 @@ export function useSubmission(opts: UseSubmissionOptions) {
       showUserMessage = true,
       displayText?: string,
       expandOverride?: (value: string) => string,
-      submitOpts: { skipDetectDrop?: boolean } = {},
+      submitOpts: { automated?: boolean; skipDetectDrop?: boolean } = {},
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
       const expand =
         expandOverride ?? expandTokens(composerRefs.tokensRef.current);
+
+      lastAutomated.current = submitOpts.automated === true;
 
       submitPrompt(
         text,
@@ -165,6 +169,27 @@ export function useSubmission(opts: UseSubmissionOptions) {
       );
     },
     [appendMessage, composerActions, composerRefs, gw, setLastUserMsg, sys],
+  );
+
+  // The last submission again (/retry), automated or typed exactly as it first went out.
+  const resend = useCallback(
+    (text: string) =>
+      send(
+        text,
+        true,
+        undefined,
+        undefined,
+        lastAutomated.current ? { automated: true } : {},
+      ),
+    [send],
+  );
+
+  // Text the gateway generated (a /skill expansion, the /go send, a goal kick), not typed by the user: `automated`, so
+  // neither the wake words nor the ultracode mode look at it.
+  const sendAutomated = useCallback(
+    (text: string, showUserMessage = true, displayText?: string) =>
+      send(text, showUserMessage, displayText, undefined, { automated: true }),
+    [send],
   );
 
   const shellExec = useCallback(
@@ -485,17 +510,28 @@ export function useSubmission(opts: UseSubmissionOptions) {
   // $(...) interpolation. Startup `-q` queries use this — they're arbitrary
   // launcher/script text, and one-shot mode already treats them literally.
   const submitLiteral = useCallback(
-    (value: string) => {
+    (value: string, opts: { automated?: boolean } = {}) => {
       if (!value.trim()) {
         return;
       }
 
-      send(value, true, value, (v) => v, { skipDetectDrop: true });
+      send(value, true, value, (v) => v, {
+        skipDetectDrop: true,
+        ...(opts.automated ? { automated: true } : {}),
+      });
     },
     [send],
   );
 
-  return { dispatchSubmission, send, sendQueued, submit, submitLiteral };
+  return {
+    dispatchSubmission,
+    resend,
+    send,
+    sendAutomated,
+    sendQueued,
+    submit,
+    submitLiteral,
+  };
 }
 
 export interface UseSubmissionOptions {

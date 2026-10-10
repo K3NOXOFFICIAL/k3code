@@ -1,10 +1,14 @@
+import { detectWakeWord } from "@k3code/shared/wake-words";
+
 import { PASTE_SNIPPET_RE } from "../protocol/paste.js";
 
 /**
  * Reference spans in composer text: a `/skill` invoked or named in prose, an
  * `@file:` / `@url:` / `@session:` ref, and a `[[ Image 1 ]]` / paste token.
  * The same vocabulary the desktop chips, so the two surfaces agree on what a
- * reference is.
+ * reference is. One more span is not a reference but a promise: an unambiguous
+ * wake word (`ultracode`, `ultraplan`, `ultraresearch`) that will run that
+ * mode once when the prompt is sent.
  *
  * Concatenating every `text` reproduces the input exactly — styling only, the
  * text is never rewritten. Regexes are built per call: a shared `/g` instance
@@ -34,13 +38,24 @@ const matchSpans = (text: string, re: RegExp): Span[] =>
     .filter((m) => m[0])
     .map((m) => ({ end: (m.index ?? 0) + m[0].length, start: m.index ?? 0 }));
 
+// The one wake word the gateway will act on (not quoted, not in a path or code,
+// not a second mode in the same prompt), so the accent never promises a run the
+// gateway would skip.
+const wakeSpans = (text: string): Span[] => {
+  const hit = detectWakeWord(text);
+
+  return hit ? [{ end: hit.end, start: hit.start }] : [];
+};
+
 export const splitComposerHighlights = (text: string): ComposerHighlight[] => {
-  // Tokens, then @refs, then slashes: on an overlap the earlier kind wins, so
-  // a slash inside a quoted ref value stays part of that ref.
+  // Tokens, then @refs, then slashes, then the wake word: on an overlap the
+  // earlier kind wins, so a slash inside a quoted ref value stays part of that
+  // ref.
   const spans = [
     ...matchSpans(text, tokenRe()),
     ...matchSpans(text, atRe()),
     ...matchSpans(text, slashRe()),
+    ...wakeSpans(text),
   ]
     .sort((a, b) => a.start - b.start)
     .reduce<Span[]>((kept, span) => {

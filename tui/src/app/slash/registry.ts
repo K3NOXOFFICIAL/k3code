@@ -3,6 +3,7 @@ import { debugCommands } from "./commands/debug.js";
 import { opsCommands } from "./commands/ops.js";
 import { sessionCommands } from "./commands/session.js";
 import { setupCommands } from "./commands/setup.js";
+import { tuneCommands } from "./commands/tune.js";
 import type { SlashCommand } from "./types.js";
 
 // k3code M1 cut: subscription/topup (billing) and wake (wake-word) slash
@@ -12,6 +13,7 @@ import type { SlashCommand } from "./types.js";
 export const SLASH_COMMANDS: SlashCommand[] = [
   ...coreCommands,
   ...sessionCommands,
+  ...tuneCommands,
   ...opsCommands,
   ...setupCommands,
   ...debugCommands,
