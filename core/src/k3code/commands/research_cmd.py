@@ -6,7 +6,7 @@ from typing import Any
 
 from k3code.commands import CommandDef
 from k3code.commands._util import reply, split_args
-from k3code.commands.ultra_cmd import JobSpec, start_spec, with_hook_context
+from k3code.commands.ultra_cmd import JobSpec, start_spec
 from k3code.research.flow import ResearchUnavailable
 
 
@@ -32,7 +32,7 @@ class UltraResearchCommand(CommandDef):
 
         async def job() -> str:
             try:
-                res = await ctx.research.run(live, with_hook_context(question, context), n_sub=n)
+                res = await ctx.research.run(live, question, n_sub=n, context=context)
             except ResearchUnavailable as e:
                 return str(e)
             return f"{res.report}\n\nReport saved: {res.path}"

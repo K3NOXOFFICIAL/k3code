@@ -1,7 +1,9 @@
 import { useStore } from "@nanostores/react";
 import { useCallback, useMemo, useRef, useState } from "react";
 
+import type { ComposerToken } from "../app/interfaces.js";
 import { $uiState, getUiState } from "../app/uiStore.js";
+import { expandTokensWithSpans, labelSpans } from "../domain/attachments.js";
 
 export interface QueueItem {
   display: string;
@@ -24,10 +26,38 @@ export function prependQueueItem(queue: QueueItem[], item: QueueItem): void {
   queue.unshift(item);
 }
 
+// A queued item edited in the composer, where the user also pasted: `tokens` expand in the text typed around the item.
+function editedWithPastes(
+  item: QueueItem,
+  edited: string,
+  tokens: readonly ComposerToken[],
+): QueueItem {
+  const expand = expandTokensWithSpans([...tokens]);
+  const at = edited.indexOf(item.display);
+
+  if (at < 0) {
+    const { pasteSpans, text } = expand(edited, false);
+
+    return queueItem(text, edited, [...pasteSpans, ...labelSpans(text)]);
+  }
+
+  const head = expand(edited.slice(0, at), false);
+  const tail = expand(edited.slice(at + item.display.length), false);
+  const shift = (spans: readonly (readonly [number, number])[], by: number) =>
+    spans.map(([a, b]) => [a + by, b + by] as const);
+
+  return queueItem(head.text + item.text + tail.text, edited, [
+    ...head.pasteSpans,
+    ...shift(item.pasteSpans ?? [], head.text.length),
+    ...shift(tail.pasteSpans, head.text.length + item.text.length),
+  ]);
+}
+
 export function takeQueueItem(
   queue: QueueItem[],
   index: number,
   editedDisplay?: string,
+  tokens: readonly ComposerToken[] = [],
 ): QueueItem | undefined {
   if (index < 0 || index >= queue.length) {
     return undefined;
@@ -39,10 +69,16 @@ export function takeQueueItem(
     return item;
   }
 
+  if (tokens.some((token) => token.kind === "paste")) {
+    return editedWithPastes(item, editedDisplay, tokens);
+  }
+
   const at = editedDisplay.indexOf(item.display);
 
   if (at < 0) {
-    return { display: editedDisplay, text: editedDisplay };
+    // The edit reached into the item's display: it is sent as it now reads, and any `[[ … ]]` label left in it
+    // quotes a paste, not typed text.
+    return queueItem(editedDisplay, editedDisplay, labelSpans(editedDisplay));
   }
 
   // the edit kept the original: its pastes moved by what was typed before it
@@ -176,8 +212,8 @@ export function useQueue() {
   const dequeue = useCallback(() => dequeueItem()?.text, [dequeueItem]);
 
   const takeQ = useCallback(
-    (i: number, editedDisplay?: string) => {
-      const item = takeQueueItem(queueRef.current, i, editedDisplay);
+    (i: number, editedDisplay?: string, tokens?: readonly ComposerToken[]) => {
+      const item = takeQueueItem(queueRef.current, i, editedDisplay, tokens);
 
       if (item) {
         syncQueue();

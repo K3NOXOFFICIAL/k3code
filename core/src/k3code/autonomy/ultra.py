@@ -17,6 +17,7 @@ from k3code.autonomy import DEFAULT_MIN_SCOPE
 from k3code.autonomy.fanout import FanoutResult, detect_test_command, extract_subtasks, run_tests
 from k3code.autonomy.plan_first import PLAN_SECTIONS, parse_plan
 from k3code.autonomy.scope import ScopeVerdict
+from k3code.memory import fenced
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 from k3code.subagents import worktree as wt_mod
@@ -74,6 +75,15 @@ class UltraPlan:
     angles: list[str] = field(default_factory=list)
     artifact_id: str | None = None
     judge_note: str = ""
+
+
+def with_hook_context(task: str, context: str) -> str:
+    """``task`` as the agents' prompts state it: with what the user's hooks added (like a normal turn's prompt).
+
+    Only prompts take this; a title, heading or report line keeps the bare task (a hook's output is multi-line)."""
+    if not context:
+        return task
+    return f"{task}\n\n" + fenced("context from the user's hooks:", context)
 
 
 def planner_prompt(task: str, angle: str) -> str:
@@ -164,8 +174,10 @@ class Ultra:
         budget: AgentBudget | None = None,
         command: str = "ultraplan",
         angles: list[str] | None = None,
+        context: str = "",
     ) -> UltraPlan:
         angles = list(angles or ANGLES)
+        brief = with_hook_context(task, context)
         mgr = self.server.subagents
         self.progress(session, command, "planning", f"{len(angles)} independent planners", budget)
 
@@ -175,7 +187,7 @@ class Ultra:
             h = mgr.spawn(
                 session,
                 description=f"plan: {angle}",
-                prompt=planner_prompt(task, angle),
+                prompt=planner_prompt(brief, angle),
                 agent_type="planner",
                 tier="strong",
                 index=i,
@@ -200,7 +212,7 @@ class Ultra:
         body = "\n\n".join(f"=== Plan ({a}) ===\n{p}" for a, p in plans)
         result = await self.server.model_caller.complete(
             TaskKind.PLAN,
-            [Message(role="system", content=JUDGE_SYSTEM), Message(role="user", content=f"Task:\n{task}\n\n{body}")],
+            [Message(role="system", content=JUDGE_SYSTEM), Message(role="user", content=f"Task:\n{brief}\n\n{body}")],
             session_id=session.session_id,
             max_tokens=4096,
         )
@@ -252,31 +264,32 @@ class Ultra:
 
     # ── /ultracode ──
 
-    async def ultracode(self, session: Any, task: str) -> str:
+    async def ultracode(self, session: Any, task: str, *, context: str = "") -> str:
         cfg = ultra_cfg(self.server.config)
+        brief = with_hook_context(task, context)  # the agents' prompts; the report and its title keep ``task``
         budget = AgentBudget(int(cfg["max_agents"]), int(cfg["max_tokens"]))
         report = _Report(task)
         cwd = Path(session.perms.cwd)
         try:
-            up = await self.ultraplan(session, task, budget=budget, command="ultracode")
+            up = await self.ultraplan(session, task, budget=budget, command="ultracode", context=context)
             report.plan_path = str(up.path)
             self.show_plan(session, up, status="approved")
             base = await wt_mod.head_sha(cwd) if await wt_mod.repo_root(cwd) else ""
 
             self.progress(session, "ultracode", "implementing", "", budget)
             subtasks = extract_subtasks(plan_verdict(up.plan), up.plan) or [task]
-            fan = await self.server.fanout.run(session, task, up.plan, subtasks, budget=budget)
+            fan = await self.server.fanout.run(session, brief, up.plan, subtasks, budget=budget)
             report.fanout = fan
             if fan is not None and fan.stopped:
                 raise BudgetStop(fan.stopped)
             if fan is None:  # no git repo: one worker, in place
-                prompt = f"Implement this task following the plan.\n\nTask:\n{task}\n\nPlan:\n{up.plan}"
+                prompt = f"Implement this task following the plan.\n\nTask:\n{brief}\n\nPlan:\n{up.plan}"
                 h = await self.run_child(session, budget, "worker", prompt, "implement")
                 report.notes.append(f"implementation (single worker, no git repo): {h.status}")
             elif not fan.ok:
                 report.notes.append("fan-out left unresolved subtasks:\n" + fan.summary())
 
-            await self.review_and_fix(session, budget, report, task, up.plan, base)
+            await self.review_and_fix(session, budget, report, brief, up.plan, base)
             test_cmd = self.server.fanout.cfg.get("test_command") or detect_test_command(cwd) or ""
             if test_cmd:
                 self.progress(session, "ultracode", "final tests", test_cmd, budget)

@@ -252,7 +252,12 @@ export interface ComposerActions {
   setInput: StateSetter<string>;
   setInputBuf: StateSetter<string[]>;
   setQueueEdit: (index: null | number) => void;
-  takeQueue: (index: number, editedDisplay?: string) => QueueItem | undefined;
+  /** `tokens`: the composer's pastes, expanded in what was typed around the item while it was edited. */
+  takeQueue: (
+    index: number,
+    editedDisplay?: string,
+    tokens?: readonly ComposerToken[],
+  ) => QueueItem | undefined;
   /** Reconcile attached payloads against tokens still present in the text. */
   syncTokens: (value: string) => void;
 }
@@ -297,6 +302,7 @@ export interface InputHandlerActions {
   dispatchSubmission: (
     full: string,
     queuedSpans?: readonly (readonly [number, number])[],
+    queuedDisplay?: string,
   ) => void;
   guardBusySessionSwitch: (what?: string) => boolean;
   newSession: (msg?: string, title?: string) => void;

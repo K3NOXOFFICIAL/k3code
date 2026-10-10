@@ -1615,20 +1615,23 @@ class GatewayServer:
         # leaves it set and a queued prompt drained next would get no implicit goal
         session.goal_continuation = False
         hooked: userhooks.HookOutcome | None = None  # the hooks' verdict on the typed prompt, handed to its first turn
+        blocked = False  # a hook refused the prompt: it ends as a blocked turn, with no model or judge call around it
         if typed and not self.halted:
             # the user's hooks see the prompt before the scope classifier or a job does: one a hook blocks reaches no
             # model and no pipeline (it ends as a blocked normal turn below), and a hook's context goes into the job
             hooked = await self._typed_prompt_hooks(session, text)
-            if not hooked.blocked:
+            blocked = hooked.blocked
+            if not blocked:
                 # a wake word or the ultracode mode may run the prompt as a job instead of a normal turn
                 routed = await self._route_typed_prompt(session, text, hooked, pasted)
                 if routed is not None:
                     return routed
-        if hooked is None or not hooked.blocked:  # a prompt a hook refused is not a task to carry on with
+        if not blocked:  # a prompt a hook refused is not a task to carry on with
             self._start_implicit_goal(session, mgr, text)
         while True:
             try:
-                await self._maybe_compact(session)
+                if not blocked:
+                    await self._maybe_compact(session)  # a blocked prompt reaches no model, not even the summary one
                 n_before = len(session.stored.messages)
                 if hooked is None:
                     status, final_text = await self._run_one_turn(session, prompt)
@@ -1647,6 +1650,9 @@ class GatewayServer:
                 session.run_result = "completed"
                 self._block_goal_for(session, "interrupted")
                 raise
+            if blocked and status == "done":  # nothing was attempted for the goal: no judge call, no continuation
+                self._session_finished(session, status)
+                return status, final_text
             if self.halted and mgr.is_active() and status == "done":
                 status = "halted"  # the halt arrived while the turn ran: no judge call, no continuation
             if status != "done" or not mgr.is_active():
