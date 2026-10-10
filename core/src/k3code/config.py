@@ -134,6 +134,12 @@ class GoalConfig(BaseModel):
     judge_model: str = "cheap"
 
 
+class SubagentsConfig(BaseModel):
+    #: model calls a sub-agent may make when the global ``max_turns`` is 0 (no cap). Nobody watches a sub-agent while
+    #: its parent waits, so it never runs unbounded; a positive global ``max_turns`` wins when it is smaller.
+    max_turns: int = 200
+
+
 class AutomationConfig(BaseModel):
     """/loop, /schedule and automations."""
 
@@ -171,6 +177,7 @@ class Settings(BaseModel):
     mcp: McpConfig = Field(default_factory=McpConfig)
     mem0: Mem0Config = Field(default_factory=Mem0Config)
     goal: GoalConfig = Field(default_factory=GoalConfig)
+    subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
 
     # router knobs: {max_inline_wait: 20, quota_cooldown: 3600}; see router.router.Router
