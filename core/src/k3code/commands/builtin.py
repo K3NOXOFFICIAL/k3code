@@ -18,6 +18,54 @@ from k3code.config import load_config
 from k3code.providers.effort import LEVELS as EFFORT_LEVELS
 from k3code.session_ai import compact_messages
 
+_MODEL_USAGE = (
+    "Usage: /model <key> [--reasoning <level>] [--global|--session] [reason] (a reason after -- is kept as is)"
+)
+
+
+def _model_request(key: str, rest: str) -> tune.TuneRequest:
+    """``/model <key> [flags] [reason]``: the /tune flags, anywhere, and the other words as the reason.
+
+    Only the flags are read as settings: an effort word or a model key in the reason stays text (it used to become
+    the effort as soon as any flag was present), and a bare ``--`` ends the flags, so a reason may hold ``--`` or
+    flag-like words. An unknown ``--word`` before that is refused, as it is most likely a mistyped flag.
+    """
+    tokens = rest.split()
+    effort: str | None = None
+    scope: str | None = None
+    reason: list[str] = []
+    flagged = False
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        low = tok.lower()
+        i += 1
+        if tok == "--":
+            reason.extend(tokens[i - 1 if reason else i :])  # keep the -- inside a reason, drop a leading one
+            flagged = True
+            break
+        if low in ("--global", "--session"):
+            new = "default" if low == "--global" else "session"
+            if scope not in (None, new):
+                raise tune.TuneError("--global and --session cannot be combined")
+            scope, flagged = new, True
+        elif low == "--tui-session":
+            flagged = True
+        elif low in ("--reasoning", "--provider"):
+            if i >= len(tokens):
+                raise tune.TuneError(f"{tok} needs a value")
+            value, flagged = tokens[i], True
+            i += 1
+            if low == "--reasoning":
+                effort = tune._once(effort, tune.normalize_effort(value, legacy=True), "effort")
+        elif tok.startswith("--"):
+            raise tune.TuneError(f"Unknown token: {tok}")
+        else:
+            reason.append(tok)
+    # no flags: the reason is the text as typed (its spacing included)
+    text = " ".join(reason) if flagged else rest.strip()
+    return tune.TuneRequest(model=key, effort=effort, scope=scope or "session", reason=text)
+
 
 class _ModelCommand(CommandDef):
     def __init__(self) -> None:
@@ -35,14 +83,10 @@ class _ModelCommand(CommandDef):
         # change only config.default_model, which a session with its own model never read, and took any typo
         if key not in tune.known_model_keys(ctx.config):
             return {"type": "message", "message": tune.unknown_model_message(ctx.config, key)}
-        rest = rest.strip()
-        if any(t.startswith("--") for t in rest.split()):  # /model <key> --reasoning high --global: the /tune flags
-            try:
-                req = tune.parse_tune(ctx.config, f"model {key} {rest}")
-            except tune.TuneError as e:
-                return {"type": "message", "message": f"{e}. Usage: /model <key> [--reasoning <level>] [--global]"}
-        else:  # anything else after the key is the reason, kept with the model_switch record
-            req = tune.TuneRequest(model=key, reason=rest)
+        try:
+            req = _model_request(key, rest)
+        except tune.TuneError as e:
+            return {"type": "message", "message": f"{e}. {_MODEL_USAGE}"}
         try:
             outcome = tune.apply_tune(ctx, live, req)
         except tune.TuneError as e:

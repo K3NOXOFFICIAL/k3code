@@ -228,7 +228,7 @@ The same thing, typed (the TUI opens the popup for a bare `/tune`; other clients
 - `--global` (it needs a model) also makes the model the default for new sessions. `--session` is the default.
 - Everything is checked first and applied all or nothing. An unknown word gives an error with the usage line and changes nothing. Effort and ultracode need a session.
 - The old picker's spellings still work: `--reasoning <level>` is `effort <level>`; `minimal`, `ultra` and `none` after `effort` or `--reasoning` mean `low`, `max` and `default`; `--provider <name>` and `--tui-session` are accepted and ignored.
-- `/model <key>` and `/effort <level>` do what they always did, and take the same flags: `/model strong --reasoning high --global`.
+- `/model <key>` and `/effort <level>` do what they always did, and take the same flags: `/model strong --reasoning high --global`. Any other words after `/model <key>` are the reason kept with the switch (`/model strong --global the cheap one loops`); only the flags are settings, so an effort word in the reason stays text, and after a bare `--` everything is reason.
 
 **The default model.** Enter in the popup and `--global` write `default_model: <key>` into your user `config.yaml` (never the project's). k3code checks that the key exists and that the file stays valid, keeps a timestamped backup next to it, then writes. The rewrite drops YAML comments; the backup keeps them. If the write fails you get the error and nothing else from that request is applied. `s` and anything without `--global` change this session only.
 

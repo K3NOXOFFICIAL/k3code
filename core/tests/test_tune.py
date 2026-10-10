@@ -721,6 +721,30 @@ async def test_model_takes_the_tune_flags(server, tmp_path):
     )
 
 
+async def test_model_reason_is_text_even_next_to_flags(server, tmp_path):
+    # Issue #56: a reason holding `--` was refused, and with any flag an effort word in the reason became the effort.
+    seen = []
+    server.learning.record = lambda kind, session=None, **kw: seen.append(kw)  # type: ignore[method-assign]
+    sid = await _session(server, tmp_path)
+    res = await m1.cmd(server, "/model cheap old one broke -- see log", sid)
+    assert res["message"].startswith("Model key set to: cheap")
+    assert seen[-1]["detail"]["reason"] == "old one broke -- see log"
+
+    res = await m1.cmd(server, "/model deep --session high latency on cheap", sid)
+    assert "Reasoning effort" not in res["message"] and server._session_for(sid).reasoning_effort is None
+    assert seen[-1]["detail"]["reason"] == "high latency on cheap"
+
+    res = await m1.cmd(server, "/model cheap --reasoning low -- --global is not a flag here", sid)
+    assert server._session_for(sid).reasoning_effort == "low" and server._session_for(sid).stored.model == "cheap"
+    assert "Default model for new sessions" not in res["message"]  # --global after -- was text
+    assert seen[-1]["detail"]["reason"] == "--global is not a flag here"
+
+    twice = (await m1.cmd(server, "/model deep --reasoning low --reasoning high", sid))["message"]
+    assert twice.startswith("effort given twice") and server._session_for(sid).stored.model == "cheap"
+    clash = (await m1.cmd(server, "/model deep --global --session", sid))["message"]
+    assert clash.startswith("--global and --session cannot be combined")
+
+
 # ── registration, help ──────────────────────────────────────────────────────────────────────────────────────────
 
 
