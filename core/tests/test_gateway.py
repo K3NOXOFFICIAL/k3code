@@ -381,6 +381,16 @@ async def test_slash_exec_routes_to_command():
     await server.close()
 
 
+async def test_slash_exec_compact_answers_natively_with_output():
+    # the TUI has no local /compact: the generic slash.exec path must run the gateway's command and render `output`
+    server = make_server()
+    frame = await rpc(server, "slash.exec", {"command": "compact"})
+    assert "error" not in frame
+    assert frame["result"]["type"] == "message"
+    assert frame["result"]["output"] == "No active session."
+    await server.close()
+
+
 # ── 6. fake provider ────────────────────────────────────────────────
 
 
