@@ -182,8 +182,16 @@ def install(dry_run: bool = False) -> list[str]:
         "To keep it running without a login session, run (needs sudo; k3code never runs it): "
         f"loginctl enable-linger {getpass.getuser()}"
     )
-    if dry_run:
-        return ["[dry-run] would:", *(f"  - {s}" for s in steps), "[dry-run] unit file:", unit, advice]
+    if dry_run:  # every unit the real install writes, so the preview shows the recovery unit too
+        return [
+            "[dry-run] would:",
+            *(f"  - {s}" for s in steps),
+            f"[dry-run] unit file {path}:",
+            unit,
+            f"[dry-run] unit file {recover}:",
+            render_recover_unit(),
+            advice,
+        ]
     if not systemd_available():  # checked before anything is written
         raise ServiceError("systemd user manager not available: run `k3code daemon` directly instead")
     path.parent.mkdir(parents=True, exist_ok=True)

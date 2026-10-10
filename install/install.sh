@@ -753,6 +753,22 @@ resolve_short_sha() {
 # Both spellings of the path: git before 2.46 compares safe.directory with the symlink-free one.
 src_git() { git -c safe.directory="$SRC_ROOT" -c safe.directory="$(cd "$SRC_ROOT" && pwd -P)" -C "$SRC_ROOT" "$@"; }
 
+# Without git there is no commit to name a build by, and a plain X.Y.Z-src made a second checkout look installed
+# already. The name is then a checksum of the checkout's file names and contents: another checkout gets its own
+# version and the same one keeps its name. File times do not count, the C locale fixes the sort order, and what
+# .gitignore leaves out (caches, builds, dependencies) is skipped, so a test run or a TUI build does not change it.
+# Only what the install reads counts (VERSION, core, tui, panes): a Finder .DS_Store, editor state or an agent's
+# .claude directory elsewhere in the checkout must not turn an unchanged tree into a new version.
+tree_id() {
+  if have sha256sum; then set -- sha256sum; else set -- shasum -a 256; fi
+  roots=""
+  for r in VERSION core tui panes; do [ -e "$SRC_ROOT/$r" ] && roots="$roots ./$r"; done
+  # shellcheck disable=SC2086 # the roots are fixed names without spaces
+  (cd "$SRC_ROOT" && LC_ALL=C find $roots \( -name .git -o -name .venv -o -name node_modules -o -name .k3dev \
+    -o -name __pycache__ -o -name dist -o -name .pytest_cache -o -name .ruff_cache -o -name .k3code \
+    -o -name .DS_Store -o -path ./panes/k3 \) -prune -o -type f ! -name '*.pyc' -exec "$@" {} +) | LC_ALL=C sort | "$@" | cut -c 1-12
+}
+
 acquire_source() {
   if [ "$FROM" = source ]; then
     d=$(cd "$(dirname "$0")/.." 2>/dev/null && pwd) || d=""
@@ -775,6 +791,7 @@ acquire_source() {
         while IFS= read -r f; do cat "$SRC_ROOT/$f"; done) 2>/dev/null | cksum | cut -d' ' -f1)
       SHA="$SHA.dirty$dirty"
     fi
+    if [ -z "$SHA" ]; then SHA=tree$(tree_id); fi
   else
     [ -n "$GIT_URL" ] || GIT_URL=$DEFAULT_URL
     GIT_ERR=$(mktemp "${TMPDIR:-/tmp}/k3code-giterr.XXXXXX")

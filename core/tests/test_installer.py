@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -287,6 +288,53 @@ def test_from_source_uncommitted_edits_get_their_own_version(tmp_path: Path) -> 
     assert dirty.startswith(clean + ".dirty")
     (src / "core" / "new.py").write_text("x = 1\n")  # an untracked file changes it again
     assert version() not in (clean, dirty)
+
+
+def test_without_git_each_checkout_gets_its_own_version_from_its_files(tmp_path: Path) -> None:
+    # Without git every --from-source build was named X.Y.Z-src, so a second checkout counted as installed already.
+    # The macOS /usr/bin/git stub: present on PATH, but fails without the developer tools.
+    nogit = stub_bin(tmp_path, "git", 'echo "xcode-select: note: no developer tools were found" >&2\nexit 1\n')
+    home = tmp_path / "home"
+    home.mkdir()
+
+    def checkout(name: str, extra: str) -> Path:
+        src = tmp_path / name
+        (src / "core").mkdir(parents=True)
+        (src / "install").mkdir()
+        (src / "core" / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+        (src / "core" / "extra.py").write_text(extra)
+        (src / "VERSION").write_text("9.9.9\n")
+        shutil.copy(INSTALL, src / "install" / "install.sh")
+        return src
+
+    def install(src: Path) -> subprocess.CompletedProcess[str]:
+        r = run(home, src / "install" / "install.sh", "--from-source", "--minimal", "--print-version", path_front=nogit)
+        assert r.returncode == 0, r.stderr
+        return r
+
+    a, b = checkout("a", "x = 1\n"), checkout("b", "x = 2\n")
+    first = install(a)
+    ver_a = first.stdout.strip()
+    assert re.fullmatch(r"9\.9\.9-src\.tree[0-9a-f]{12}", ver_a), ver_a
+    ver_b = install(b).stdout.strip()
+    assert ver_b != ver_a  # another checkout is another version, built next to the first
+    assert {p.name for p in (home / DATA_REL / "versions").iterdir()} == {ver_a, ver_b}
+
+    # the same tree keeps its name: file times, caches and build output do not count
+    for p in a.rglob("*"):
+        os.utime(p, (1_000_000, 1_000_000))
+    (a / "core" / "__pycache__").mkdir()
+    (a / "core" / "__pycache__" / "extra.cpython-312.pyc").write_bytes(b"\0")
+    (a / "tui" / "node_modules").mkdir(parents=True)
+    (a / "tui" / "node_modules" / "dep.js").write_text("1\n")
+    # files the install never reads (Finder, editors, agents) do not count either
+    (a / ".DS_Store").write_bytes(b"\0")
+    (a / "core" / ".DS_Store").write_bytes(b"\0")
+    (a / ".idea").mkdir()
+    (a / ".idea" / "workspace.xml").write_text("<x/>\n")
+    again = install(a)
+    assert again.stdout.strip() == ver_a
+    assert "already installed" in again.stderr
 
 
 def test_uninstall_removes_the_unit_under_xdg_config_home(tmp_path: Path) -> None:

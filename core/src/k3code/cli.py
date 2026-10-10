@@ -14,8 +14,6 @@ from typing import TYPE_CHECKING, Any
 
 import click
 
-from k3code import __version__
-
 if TYPE_CHECKING:  # annotations only: the engine is imported inside the functions, so --version and --help stay cheap
     from k3code.permissions import PermissionMode
     from k3code.reliability import Reliability
@@ -717,8 +715,25 @@ def _find_repo_root() -> Path | None:
     return None
 
 
+def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+    """``--version`` names the build (``0.1.0-src.<sha>``), so two installs of 0.1.0 can be told apart."""
+    if not value or ctx.resilient_parsing:
+        return
+    from k3code._version import build_version
+
+    click.echo(f"k3code, version {build_version()}")
+    ctx.exit()
+
+
 @click.group(invoke_without_command=True)
-@click.version_option(__version__, "--version", prog_name="k3code")
+@click.option(
+    "--version",
+    is_flag=True,
+    expose_value=False,
+    is_eager=True,
+    callback=_print_version,
+    help="Show the version and exit.",
+)
 @click.pass_context
 @click.option("-p", "--prompt", help="Headless prompt; omit for TUI/REPL")
 @click.option("-m", "--model", help="Model override (e.g., 'default', 'cheap')")
