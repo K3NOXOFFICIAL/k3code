@@ -56,7 +56,8 @@ class CommandRegistry:
             result = await cmd.handle(ctx, session_id, arg.strip())
         except Exception as e:  # noqa: BLE001 - surface as chat text, never crash the gateway
             msg = f"/{cmd.name} failed: {e}"
-            return {"type": "message", "message": msg, "output": msg}
+            # `error` lets `k3code -p` exit non-zero; chat clients render `output` and ignore it
+            return {"type": "message", "message": msg, "output": msg, "error": "command_failed"}
         if not isinstance(result, dict) or "type" not in result:
             return {"type": "message", "message": str(result), "output": str(result)}
         if result["type"] == "message":
