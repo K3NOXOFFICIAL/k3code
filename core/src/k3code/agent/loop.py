@@ -567,11 +567,19 @@ class AgentLoop:
         wire = clip_tool_results(messages, self.tool_output_chars or MAX_TOOL_RESULT_CHARS)
         if not self.context_window:
             return wire
-        estimate = context_budget.overhead_tokens(self.system_prompt, specs) + context_budget.message_tokens(wire)
-        over = estimate > self.context_window * context_budget.ELIDE_AT_RATIO
-        if not over and not self._elided:
-            return wire
-        return context_budget.elide_old_results(wire, over=over, elided=self._elided, keep=self._pinned)
+        # Elide in batches, because every elision rewrites the request from that message on (the provider's prompt
+        # cache misses there; a persistent claude-cli process no longer mirrors a prefix and is started afresh). What
+        # was elided earlier stays elided; more is elided only once that request is over the threshold again, and then
+        # every old result at once. Judging the unelided request instead elided one more result on every step.
+        view = (
+            context_budget.elide_old_results(wire, over=False, elided=self._elided, keep=self._pinned)
+            if self._elided
+            else wire
+        )
+        estimate = context_budget.overhead_tokens(self.system_prompt, specs) + context_budget.message_tokens(view)
+        if estimate > self.context_window * context_budget.ELIDE_AT_RATIO:
+            view = context_budget.elide_old_results(wire, over=True, elided=self._elided, keep=self._pinned)
+        return view
 
     def _sandbox_argv(self) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.

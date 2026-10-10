@@ -17,6 +17,7 @@ from k3code.providers.types import (
     StreamEvent,
     ToolCall,
     ToolSpec,
+    Usage,
     messages_to_anthropic,
     with_cache_breakpoint,
 )
@@ -169,8 +170,6 @@ class AnthropicProvider(Provider):
                     httpx.RemoteProtocolError("peer closed connection: stream ended before message_stop"),
                     kind="anthropic",
                 )
-            from k3code.providers.types import Usage
-
             usage = Usage(
                 prompt_tokens=usage_in,
                 completion_tokens=usage_out,
