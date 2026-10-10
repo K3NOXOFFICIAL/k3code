@@ -34,7 +34,7 @@ async def test_the_decision_model_keeps_some_results_and_leaves_notes_for_others
         asked.append([m.tool_call_id for m in candidates])
         return {"r0": "the config lives at line 3", "r1": "keep"}
 
-    _, provider = await run_with(tmp_path, decide)
+    _, provider = await run_with(tmp_path, decide, n=12, window=22_000)
     assert asked and asked[0][:2] == ["r0", "r1"]  # it was asked about the old results before they were elided
     sent = {m.tool_call_id: m.content for m in provider.requests[-1][0] if m.role == "tool"}
     assert sent["r0"].startswith(ELIDED) and sent["r0"].endswith("\nStill relevant: the config lives at line 3")
@@ -64,6 +64,26 @@ async def test_what_it_keeps_must_fit_under_the_threshold(tmp_path):
     sent = {m.tool_call_id: m.content for m in provider.requests[-1][0] if m.role == "tool"}
     assert sent["r0"].startswith(ELIDED)
     assert all(f"file {i}" in sent[f"r{i}"] for i in range(14, 20))  # the last six stay whole
+
+
+def rewrites_of(provider) -> int:
+    sent = [[m.content for m in request[0]] for request in provider.requests]
+    return sum(1 for before, after in zip(sent, sent[1:], strict=False) if after[: len(before)] != before)
+
+
+async def test_keeping_results_does_not_start_a_batch_on_every_step(tmp_path):
+    """Kept results used to fill the request up to the threshold, so the next step's result passed it again: 22 prefix
+    rewrites (and 22 decision calls) in a 40-read run instead of plain elision's 3."""
+    calls: list[int] = []
+
+    async def keep_all(wire, candidates):
+        calls.append(len(candidates))
+        return {m.tool_call_id: "keep" for m in candidates}
+
+    _, provider = await run_with(tmp_path, keep_all, n=40, window=30_000)
+    _, plain = await run_with(tmp_path, None, n=40, window=30_000)
+    assert rewrites_of(provider) <= 2 * rewrites_of(plain)
+    assert len(calls) == rewrites_of(provider)
 
 
 async def test_notes_stay_put_so_the_request_prefix_rarely_changes(tmp_path):
@@ -112,6 +132,13 @@ def test_settings_are_off_by_default():
     Cfg.context = {"decision_model": {"enabled": True, "model": "tiny", "at_ratio": 0.3}}
     s = decision_settings(Cfg())
     assert (s.enabled, s.model, s.at_ratio) == (True, "tiny", 0.3)
+    for bad in (
+        {"enabled": True, "at_ratio": "half"},
+        {"enabled": True, "at_ratio": 2},
+        {"enabled": True, "timeout": -1},
+    ):
+        Cfg.context = {"decision_model": bad}
+        assert not decision_settings(Cfg()).enabled  # off with a warning, not a failing turn
 
 
 async def test_the_gateway_sends_decisions_to_the_named_model_or_the_cheap_tier(tmp_path, monkeypatch):
@@ -150,3 +177,12 @@ def test_context_select_runs_on_the_cheap_tier_by_default():
 
     assert tier_for(TaskKind.CONTEXT_SELECT) is Tier.CHEAP
     assert tier_for(TaskKind.CONTEXT_SELECT, {"context_select": "fast"}) is Tier.FAST
+
+
+def test_the_prompt_names_the_latest_request_as_the_task():
+    messages = [
+        Message(role="user", content="old request"),
+        Message(role="assistant", content="done"),
+        Message(role="user", content="new request"),
+    ]
+    assert "## Task\nnew request" in build_prompt(messages, [], 40_000)

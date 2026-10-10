@@ -55,24 +55,34 @@ class DecisionSettings:
     at_ratio: float = ELIDE_AT_RATIO
     #: characters of tool results one decision reads at most
     max_input_chars: int = 40_000
-    timeout: float = 30.0
+    timeout: float = 15.0
 
 
 def decision_settings(config: Any) -> DecisionSettings:
+    """``context.decision_model`` (a mapping, or true/false); an invalid value turns the decision model off (logged)
+    instead of failing every turn."""
     raw = (getattr(config, "context", None) or {}).get("decision_model")
     if isinstance(raw, bool):
         return DecisionSettings(enabled=raw)
     if not isinstance(raw, dict):
         return DecisionSettings()
     defaults = DecisionSettings()
-    return DecisionSettings(
-        enabled=bool(raw.get("enabled", False)),
-        provider=str(raw.get("provider") or ""),
-        model=str(raw.get("model") or ""),
-        at_ratio=float(raw.get("at_ratio") or defaults.at_ratio),
-        max_input_chars=int(raw.get("max_input_chars") or defaults.max_input_chars),
-        timeout=float(raw.get("timeout") or defaults.timeout),
-    )
+    try:
+        settings = DecisionSettings(
+            enabled=bool(raw.get("enabled", False)),
+            provider=str(raw.get("provider") or ""),
+            model=str(raw.get("model") or ""),
+            at_ratio=float(raw.get("at_ratio") or defaults.at_ratio),
+            max_input_chars=int(raw.get("max_input_chars") or defaults.max_input_chars),
+            timeout=float(raw.get("timeout") or defaults.timeout),
+        )
+    except (TypeError, ValueError):
+        logger.warning("context.decision_model is invalid; the decision model is off: %r", raw)
+        return DecisionSettings()
+    if not 0 < settings.at_ratio <= 1 or settings.max_input_chars <= 0 or settings.timeout <= 0:
+        logger.warning("context.decision_model: at_ratio must be in (0, 1], the others positive; it is off: %r", raw)
+        return DecisionSettings()
+    return settings
 
 
 def _clip(text: str, limit: int) -> str:
@@ -80,7 +90,8 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _task(messages: Sequence[Message]) -> str:
-    for m in messages:
+    """The latest user message: the prompt of this turn (a reused loop's history holds older ones first)."""
+    for m in reversed(messages):
         if m.role == "user" and m.content:
             return m.content
     return ""

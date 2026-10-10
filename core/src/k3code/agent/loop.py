@@ -597,8 +597,9 @@ class AgentLoop:
 
     async def _ask_decision_model(self, wire: list[Message], budget: float) -> set[str]:
         """Ids of old results the decision model keeps whole (its notes for the others go to ``_notes``). What it keeps
-        must still fit ``budget`` (message tokens): past it, the oldest kept results are elided after all, so the
-        request is under the threshold again and the next batch is as far off as with plain elision."""
+        may fill at most half of what plain elision would leave free under ``budget`` (message tokens); past that, the
+        oldest kept results are elided after all. Keeping up to the threshold itself made the next step's result start a
+        new batch (and a new prefix) on almost every step."""
         candidates = context_budget.elision_candidates(wire, elided=self._elided, keep=self._pinned)
         if not candidates:
             return set()
@@ -612,16 +613,18 @@ class AgentLoop:
             note = decision.get(m.tool_call_id or "")
             if note and note != "keep":
                 self._notes[m.tool_call_id or ""] = note
-        # the request with every candidate elided, then the kept ones added back newest first while they fit
+        # the request with every candidate elided, then the kept ones added back newest first while they fit in half of
+        # the room left under the threshold: the other half is what the turn grows into before the next batch
         floor = context_budget.message_tokens(
             context_budget.elide_old_results(
                 wire, over=True, elided=set(self._elided), keep=self._pinned, notes=self._notes
             )
         )
+        limit = floor + (budget - floor) / 2
         keep: set[str] = set()
         for m in reversed(kept):
             cost = len(m.content or "") // 4
-            if floor + cost > budget:
+            if floor + cost > limit:
                 break
             floor += cost
             keep.add(m.tool_call_id or "")
