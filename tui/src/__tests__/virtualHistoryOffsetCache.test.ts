@@ -31,6 +31,20 @@ interface Exposed {
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Wait for a condition instead of a fixed time: a fixed sleep that is long enough on a quiet machine is too short on
+// a loaded one. Resolves as soon as `ready()` is true; fails the test after `timeoutMs`.
+const until = async (ready: () => boolean, timeoutMs = 10_000) => {
+  const deadline = Date.now() + timeoutMs;
+
+  while (!ready()) {
+    if (Date.now() > deadline) {
+      throw new Error(`condition not met within ${timeoutMs} ms`);
+    }
+
+    await delay(10);
+  }
+};
+
 const makeStreams = () => {
   const stdout = new PassThrough();
   const stdin = new PassThrough();
@@ -713,10 +727,10 @@ describe("useVirtualHistory offset cache reuse", () => {
     );
 
     try {
-      // Generous settle windows: the unmount-measurement callback must fire
-      // before the assertion, and under CI load a 20-40ms sleep is not
-      // enough (flaked as "adjustScrollTop called 0 times").
-      await delay(50);
+      // The unmount-measurement callback must fire before the assertion. A
+      // fixed sleep flaked under load ("adjustScrollTop called 0 times"), so
+      // wait for the call itself.
+      await until(() => expose.current?.scroll != null);
       const scroll = expose.current!.scroll!;
 
       scroll.scrollTo(0);
@@ -733,7 +747,8 @@ describe("useVirtualHistory offset cache reuse", () => {
           items,
         }),
       );
-      await delay(400);
+      await until(() => adjustScrollTop.mock.calls.length > 0);
+      await delay(50); // a second, unwanted call would land within this window
 
       expect(adjustScrollTop).toHaveBeenCalledOnce();
       expect(adjustScrollTop).toHaveBeenCalledWith(1);
