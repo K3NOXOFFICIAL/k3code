@@ -172,6 +172,7 @@ export interface PromptLiveSessionOptions {
   dispatchSubmission: (
     full: string,
     queuedSpans?: readonly (readonly [number, number])[],
+    queuedDisplay?: string,
   ) => void;
   maybeWarn: (value: unknown) => void;
   modelArg?: string;
@@ -1136,7 +1137,7 @@ export function useMainApp(gw: GatewayClient) {
 
     if (next) {
       patchUiState({ busy: true, status: "running…" });
-      sendQueued(next.text, next.pasteSpans);
+      sendQueued(next.text, next.pasteSpans, next.display);
     }
   }, [ui.sid, ui.busy, composerActions, composerRefs, sendQueued]);
 

@@ -1,4 +1,5 @@
 import { looksLikeSlashCommand, parseSlashCommand } from "@k3code/shared/slash";
+import type { Span } from "@k3code/shared/wake-words";
 import { type MutableRefObject, useCallback, useEffect, useRef } from "react";
 
 import { TYPING_IDLE_MS } from "../config/timing.js";
@@ -6,6 +7,7 @@ import {
   codePointSpans,
   expandTokens,
   expandTokensWithSpans,
+  labelSpans,
 } from "../domain/attachments.js";
 import { completionToApplyOnSubmit } from "../domain/slash.js";
 import type { GatewayClient } from "../gatewayClient.js";
@@ -15,10 +17,7 @@ import type {
 } from "../gatewayTypes.js";
 import { queueItem, type QueueItem } from "../hooks/useQueue.js";
 import { asRpcResult } from "../lib/rpc.js";
-import {
-  hasInterpolation,
-  INTERPOLATION_RE,
-} from "../protocol/interpolation.js";
+import { INTERPOLATION_RE } from "../protocol/interpolation.js";
 import type { Msg } from "../types.js";
 
 import type {
@@ -44,15 +43,42 @@ const spliceMatches = (
     text,
   );
 
+// `{!cmd}` the user typed: one inside (or reaching into) a paste is content, never run.
+const typedInterpolations = (text: string, pasted: readonly Span[]) =>
+  [...text.matchAll(new RegExp(INTERPOLATION_RE.source, "g"))].filter(
+    (m) => !pasted.some(([a, b]) => m.index! < b && m.index! + m[0].length > a),
+  );
+
+// The paste spans once each match was replaced by its result.
+const shiftSpans = (
+  spans: readonly Span[],
+  matches: RegExpMatchArray[],
+  results: string[],
+): Span[] =>
+  spans.map(([a, b]) => {
+    const by = matches.reduce(
+      (acc, m, i) =>
+        m.index! < a ? acc + results[i]!.length - m[0].length : acc,
+      0,
+    );
+
+    return [a + by, b + by] as const;
+  });
+
 export const expandPasteTokens = (tokens: ComposerToken[]) =>
   expandTokens(tokens.filter((token) => token.kind === "paste"));
 
 const slashArgument = (command: string) =>
   /^\/\S+\s+([\s\S]+)$/.exec(command)?.[1] ?? "";
 
+/**
+ * The item a `/queue <text>` queues. With the composer's `tokens`, a collapsed paste in the argument is expanded and
+ * its span kept with the item, so it still counts as pasted when the item is sent.
+ */
 export const queueItemFromSlash = (
   displayCommand: string,
   expandedCommand: string,
+  tokens: ComposerToken[] = [],
 ): QueueItem | undefined => {
   const display = slashArgument(displayCommand);
 
@@ -60,7 +86,15 @@ export const queueItemFromSlash = (
     return undefined;
   }
 
-  return queueItem(slashArgument(expandedCommand), display);
+  if (!tokens.some((token) => token.kind === "paste")) {
+    return queueItem(slashArgument(expandedCommand), display);
+  }
+
+  const { pasteSpans, text } = expandTokensWithSpans(
+    tokens.filter((token) => token.kind === "paste"),
+  )(display);
+
+  return queueItem(text, display, pasteSpans);
 };
 
 // `pasteSpans`: where the pastes ended up in `text`, so the gateway does not
@@ -92,8 +126,14 @@ export const prepareSlashSubmission = (
   display,
 });
 
-export const shouldInterpolateSubmission = (display: string) =>
-  hasInterpolation(display);
+// `tokens`: the `[[ … ]]` labels of the composer's pastes. A label quotes the start of a paste, so a `{!cmd}` that
+// shows in one is the paste's, not the user's.
+export const shouldInterpolateSubmission = (
+  display: string,
+  tokens?: ComposerToken[],
+) =>
+  typedInterpolations(display, tokens ? labelSpans(display, tokens) : [])
+    .length > 0;
 
 export function useSubmission(opts: UseSubmissionOptions) {
   const {
@@ -111,6 +151,11 @@ export function useSubmission(opts: UseSubmissionOptions) {
   const lastEmptyAt = useRef(0);
   // Whether the last prompt went out as `automated` (see submitPrompt): /retry sends it again the same way.
   const lastAutomated = useRef(false);
+  // ...and where its pastes were, kept with the text they count in.
+  const lastPaste = useRef<{ spans: readonly Span[]; text: string }>({
+    spans: [],
+    text: "",
+  });
   const typingIdleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -164,8 +209,6 @@ export function useSubmission(opts: UseSubmissionOptions) {
         submitOpts = { ...submitOpts, pasteSpans: withSpans(text).pasteSpans };
       }
 
-      lastAutomated.current = submitOpts.automated === true;
-
       submitPrompt(
         text,
         {
@@ -173,7 +216,17 @@ export function useSubmission(opts: UseSubmissionOptions) {
           enqueue: composerActions.enqueue,
           expand,
           gw,
-          setLastUserMsg,
+          // set when the prompt really goes out, so a send that stops early (no session yet) leaves /retry alone
+          setLastUserMsg: (value) => {
+            lastAutomated.current = submitOpts.automated === true;
+            // With an `expandOverride` the text is final and the spans count in it, so /retry can send both again;
+            // without one `text` still holds `[[ … ]]` labels and the spans count in its expansion.
+            lastPaste.current = {
+              spans: expandOverride ? (submitOpts.pasteSpans ?? []) : [],
+              text: value,
+            };
+            setLastUserMsg(value);
+          },
           sys,
         },
         showUserMessage,
@@ -186,14 +239,20 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
   // The last submission again (/retry), automated or typed exactly as it first went out.
   const resend = useCallback(
-    (text: string) =>
-      send(
-        text,
-        true,
-        undefined,
-        undefined,
-        lastAutomated.current ? { automated: true } : {},
-      ),
+    (text: string) => {
+      if (lastAutomated.current) {
+        return send(text, true, undefined, undefined, { automated: true });
+      }
+
+      // the same text again: its pastes are where they were (and it is not expanded a second time)
+      if (lastPaste.current.spans.length && lastPaste.current.text === text) {
+        return send(text, true, undefined, (value) => value, {
+          pasteSpans: lastPaste.current.spans,
+        });
+      }
+
+      send(text);
+    },
     [send],
   );
 
@@ -234,12 +293,16 @@ export function useSubmission(opts: UseSubmissionOptions) {
     [appendMessage, gw, sys],
   );
 
+  // `pasted`: spans of `text` the user did not type; a `{!cmd}` in or across one is left as it is. `then` gets the
+  // result and where those spans are in it.
   const interpolate = useCallback(
-    (text: string, then: (result: string) => void) => {
+    (
+      text: string,
+      then: (result: string, pasteSpans: Span[]) => void,
+      pasted: readonly Span[] = [],
+    ) => {
       patchUiState({ status: "interpolating…" });
-      const matches = [
-        ...text.matchAll(new RegExp(INTERPOLATION_RE.source, "g")),
-      ];
+      const matches = typedInterpolations(text, pasted);
 
       Promise.all(
         matches.map((m) =>
@@ -252,24 +315,38 @@ export function useSubmission(opts: UseSubmissionOptions) {
             })
             .catch(() => "(error)"),
         ),
-      ).then((results) => then(spliceMatches(text, matches, results)));
+      ).then((results) =>
+        then(
+          spliceMatches(text, matches, results),
+          shiftSpans(pasted, matches, results),
+        ),
+      );
     },
     [gw],
   );
 
+  // A queued prompt holds its expanded pastes (`pasteSpans`): only what the user typed runs as `!cmd` or `{!cmd}`, and
+  // the text goes out as it is (identity `expand`), so the spans still fit it.
   const sendQueued = useCallback(
-    (text: string, pasteSpans?: readonly (readonly [number, number])[]) => {
-      if (text.startsWith("!")) {
+    (text: string, pasteSpans: readonly Span[] = [], display?: string) => {
+      if (text.startsWith("!") && !pasteSpans.length) {
         return shellExec(text.slice(1).trim());
       }
 
-      if (hasInterpolation(text)) {
+      if (typedInterpolations(text, pasteSpans).length) {
         patchUiState({ busy: true });
 
-        return interpolate(text, send);
+        return interpolate(
+          text,
+          (result, spans) =>
+            send(result, true, undefined, (value) => value, {
+              pasteSpans: spans,
+            }),
+          pasteSpans,
+        );
       }
 
-      send(text, true, undefined, undefined, { pasteSpans: pasteSpans ?? [] });
+      send(text, true, display, (value) => value, { pasteSpans });
     },
     [interpolate, send, shellExec],
   );
@@ -330,8 +407,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
       // The gateway owns the atomic redirect decision because it knows whether
       // the agent is in model generation, tool execution, or an older runtime.
       // Reuse the normal submit pipeline so the correction gets its user bubble
-      // and file-drop interpolation exactly once.
-      send(item.text, true, undefined, undefined, {
+      // and file-drop interpolation exactly once. Its text is already
+      // expanded: the bubble shows the compact display, and the text goes out
+      // as it is, so its paste spans still fit.
+      send(item.text, true, item.display, (value) => value, {
         pasteSpans: item.pasteSpans ?? [],
       });
     },
@@ -340,8 +419,12 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
   const dispatchSubmission = useCallback(
     // `queuedSpans`: `full` is a queued item's text (already expanded), and
-    // this is where its pastes are.
-    (full: string, queuedSpans?: readonly (readonly [number, number])[]) => {
+    // this is where its pastes are; `queuedDisplay` is how the item shows.
+    (
+      full: string,
+      queuedSpans?: readonly (readonly [number, number])[],
+      queuedDisplay?: string,
+    ) => {
       if (!full.trim()) {
         return;
       }
@@ -351,11 +434,28 @@ export function useSubmission(opts: UseSubmissionOptions) {
       // nothing — a detached image can't be re-attached by recalling the text.
       // Idempotent on token-free text, so re-submitting a recalled entry is
       // stable.
+      // A queued item holding pastes (Ctrl+K, a double Enter) is already
+      // expanded: sent as the drain sends it, so pasted text is never read as a
+      // slash command, `!cmd` or `{!cmd}`, and keeps its spans.
+      if (queuedSpans?.length) {
+        if (!getUiState().sid) {
+          return composerActions.enqueue(
+            full,
+            queuedDisplay ?? full,
+            queuedSpans,
+          );
+        }
+
+        return getUiState().busy
+          ? handleBusyInput({
+              ...queueItem(full, queuedDisplay),
+              pasteSpans: queuedSpans,
+            })
+          : sendQueued(full, queuedSpans, queuedDisplay);
+      }
+
       const submissionTokens = [...composerRefs.tokensRef.current];
-      const submission =
-        queuedSpans && !submissionTokens.length && full === full.trim()
-          ? { display: full, pasteSpans: queuedSpans, text: full }
-          : prepareSubmission(full, submissionTokens);
+      const submission = prepareSubmission(full, submissionTokens);
       const toHistory = submission.text;
 
       if (looksLikeSlashCommand(full)) {
@@ -368,11 +468,15 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
         const queued =
           parsed.name === "queue" || parsed.name === "q"
-            ? queueItemFromSlash(slash.display, slash.command)
+            ? queueItemFromSlash(slash.display, slash.command, submissionTokens)
             : undefined;
 
         if (queued) {
-          composerActions.enqueue(queued.text, queued.display);
+          composerActions.enqueue(
+            queued.text,
+            queued.display,
+            queued.pasteSpans,
+          );
           sys(
             `queued: "${queued.display.slice(0, 50)}${queued.display.length > 50 ? "…" : ""}"`,
           );
@@ -385,7 +489,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return;
       }
 
-      if (full.startsWith("!")) {
+      // a shell escape is what the user typed: with a paste in it, it is a prompt
+      if (full.startsWith("!") && !labelSpans(full, submissionTokens).length) {
         composerActions.clearIn();
 
         return shellExec(full.slice(1).trim());
@@ -407,7 +512,12 @@ export function useSubmission(opts: UseSubmissionOptions) {
       composerActions.clearIn();
 
       if (editIdx !== null) {
-        const picked = composerActions.takeQueue(editIdx, full);
+        // the composer's tokens are cleared above, but a paste added while editing is still in `full`
+        const picked = composerActions.takeQueue(
+          editIdx,
+          full,
+          submissionTokens,
+        );
         composerActions.setQueueEdit(null);
 
         if (!picked || !live.sid) {
@@ -425,7 +535,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
           return handleBusyInput(picked, { fallbackToFront: true });
         }
 
-        return sendQueued(picked.text, picked.pasteSpans);
+        return sendQueued(picked.text, picked.pasteSpans, picked.display);
       }
 
       composerActions.pushHistory(toHistory);
@@ -436,16 +546,20 @@ export function useSubmission(opts: UseSubmissionOptions) {
         );
       }
 
-      if (shouldInterpolateSubmission(full)) {
+      if (shouldInterpolateSubmission(full, submissionTokens)) {
         patchUiState({ busy: true });
 
-        return interpolate(full, (text) => {
-          const prepared = prepareSubmission(text, submissionTokens);
+        return interpolate(
+          full,
+          (text) => {
+            const prepared = prepareSubmission(text, submissionTokens);
 
-          send(prepared.text, true, text, (value) => value, {
-            pasteSpans: prepared.pasteSpans,
-          });
-        });
+            send(prepared.text, true, text, (value) => value, {
+              pasteSpans: prepared.pasteSpans,
+            });
+          },
+          labelSpans(full, submissionTokens),
+        );
       }
 
       send(submission.text, true, submission.display, (value) => value, {
@@ -503,7 +617,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
           if (next) {
             composerActions.setQueueEdit(null);
-            dispatchSubmission(next.text, next.pasteSpans ?? []);
+            dispatchSubmission(next.text, next.pasteSpans ?? [], next.display);
           }
         }
 

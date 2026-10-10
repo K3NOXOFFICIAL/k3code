@@ -1,3 +1,5 @@
+import type { Span } from "@k3code/shared/wake-words";
+
 import type { ComposerToken } from "../app/interfaces.js";
 import { PASTE_SNIPPET_RE } from "../protocol/paste.js";
 
@@ -29,6 +31,21 @@ export const droppedTokens = (tokens: ComposerToken[], value: string) => {
   return tokens.filter((t) => !live.has(t.label));
 };
 
+/**
+ * The `[start, end)` UTF-16 span of every `[[ … ]]` label in `value` (only those of `tokens`, when given). A label
+ * quotes the first characters of a paste, so what reads off it is not something the user typed.
+ */
+export const labelSpans = (
+  value: string,
+  tokens?: readonly ComposerToken[],
+): Span[] => {
+  const known = tokens && new Set(tokens.map((t) => t.label));
+
+  return [...value.matchAll(new RegExp(PASTE_SNIPPET_RE.source, "g"))]
+    .filter((m) => !known || known.has(m[0]))
+    .map((m): Span => [m.index, m.index + m[0].length]);
+};
+
 /** Expanded composer text and where its pastes went (`[start, end)` UTF-16 offsets into `text`). */
 export interface Expanded {
   pasteSpans: [number, number][];
@@ -58,7 +75,8 @@ export const expandTokensWithSpans = (tokens: ComposerToken[]) => {
     }
   }
 
-  return (value: string): Expanded => {
+  // `trim: false` keeps the text as it is, for a piece that is put together with others (an edited queue item).
+  return (value: string, trim = true): Expanded => {
     const spans: [number, number][] = [];
     let out = "";
     let pos = 0;
@@ -83,8 +101,8 @@ export const expandTokensWithSpans = (tokens: ComposerToken[]) => {
 
     out += value.slice(pos);
 
-    const text = out.trim();
-    const lead = out.length - out.trimStart().length;
+    const text = trim ? out.trim() : out;
+    const lead = trim ? out.length - out.trimStart().length : 0;
     const clamp = (n: number) => Math.min(text.length, Math.max(0, n - lead));
 
     return {
@@ -114,12 +132,17 @@ export const codePointSpans = (
     return [];
   }
 
+  // The gateway refuses a prompt whose spans leave the text: whatever the caller counted in, stay inside it.
+  const inside = (n: number) => Math.min(Math.max(n, 0), text.length);
+
   // one walk over the text for all offsets, however many spans there are
   const points = new Map<number, number>();
   let unit = 0;
   let count = 0;
 
-  for (const want of [...new Set(spans.flat())].sort((x, y) => x - y)) {
+  for (const want of [...new Set(spans.flat().map(inside))].sort(
+    (x, y) => x - y,
+  )) {
     while (unit < want) {
       const c = text.charCodeAt(unit);
       const pair =
@@ -135,7 +158,7 @@ export const codePointSpans = (
     points.set(want, count);
   }
 
-  const at = (n: number) => points.get(n) ?? 0;
+  const at = (n: number) => points.get(inside(n)) ?? 0;
 
   return spans.map(([a, b]) => [at(a), at(b)]);
 };
