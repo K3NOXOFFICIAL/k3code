@@ -751,7 +751,27 @@ resolve_short_sha() {
 # shared one) is "dubious" to git, which then refuses every command: rev-parse failed silently, so each build was
 # named X.Y.Z-src and an update never left the first one. Its own install.sh runs anyway, so its config is trusted.
 # Both spellings of the path: git before 2.46 compares safe.directory with the symlink-free one.
-src_git() { git -c safe.directory="$SRC_ROOT" -c safe.directory="$(cd "$SRC_ROOT" && pwd -P)" -C "$SRC_ROOT" "$@"; }
+SRC_PATHS="VERSION core tui panes" # what an install reads from a checkout (fixed names without spaces)
+src_git() {
+  gd=$(win_gitdir)
+  if [ -n "$gd" ]; then
+    git --git-dir="$gd" --work-tree="$SRC_ROOT" -C "$SRC_ROOT" "$@"
+  else
+    git -c safe.directory="$SRC_ROOT" -c safe.directory="$(cd "$SRC_ROOT" && pwd -P)" -C "$SRC_ROOT" "$@"
+  fi
+}
+
+# A worktree that Windows git made (`git worktree add`, Orca, an agent's .claude/worktrees) holds a .git FILE naming
+# its git directory as a Windows path (gitdir: C:/Users/.../.git/worktrees/x), which git in WSL cannot open: every
+# command failed and install.ps1 --from-source stopped with "git cannot read the checkout". In WSL that path is
+# translated and passed as --git-dir (an explicit git dir also skips the ownership check a Windows clone fails).
+win_gitdir() {
+  [ -f "$SRC_ROOT/.git" ] && have wslpath || return 0
+  line=$(head -n 1 "$SRC_ROOT/.git" 2>/dev/null | tr -d '\r')
+  case "$line" in
+    "gitdir: "[A-Za-z]:[/\\]*) wslpath -a "${line#gitdir: }" 2>/dev/null || true ;;
+  esac
+}
 
 # Without git there is no commit to name a build by, and a plain X.Y.Z-src made a second checkout look installed
 # already. The name is then a checksum of the checkout's file names and contents: another checkout gets its own
@@ -785,9 +805,12 @@ acquire_source() {
       die "git cannot read the checkout $SRC_ROOT ($(src_git rev-parse HEAD 2>&1 | head -n 1)): without its commit every build of it would get the same version name"
     fi
     # Uncommitted edits get their own version (a checksum of the changes), so they are not hidden by the
-    # build of the clean HEAD.
-    if [ -n "$SHA" ] && [ -n "$(src_git status --porcelain --untracked-files=normal 2>/dev/null)" ]; then
-      dirty=$( (src_git diff HEAD && src_git ls-files --others --exclude-standard |
+    # build of the clean HEAD. Only what the install reads counts (as in tree_id): an agent's untracked .claude
+    # directory (worktrees, which ls-files lists as directories cat cannot read) named every build of a clean HEAD
+    # .dirty4294967295, and each update rebuilt it.
+    # shellcheck disable=SC2086 # SRC_PATHS is a list of fixed names
+    if [ -n "$SHA" ] && [ -n "$(src_git status --porcelain --untracked-files=normal -- $SRC_PATHS 2>/dev/null)" ]; then
+      dirty=$( (src_git diff HEAD -- $SRC_PATHS && src_git ls-files --others --exclude-standard -- $SRC_PATHS |
         while IFS= read -r f; do cat "$SRC_ROOT/$f"; done) 2>/dev/null | cksum | cut -d' ' -f1)
       SHA="$SHA.dirty$dirty"
     fi

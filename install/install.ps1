@@ -36,6 +36,16 @@ function Die([string]$Text) { Say "ERROR: $Text"; exit 1 }
 
 function Quote-Sh([string]$Arg) { "'" + ($Arg -replace "'", "'\''") + "'" } # one sh word, no double quotes
 
+# Windows PowerShell 5.1 (and pwsh before 7.3, or with $PSNativeCommandArgumentPassing = 'Legacy') hands a native
+# program its arguments without escaping embedded double quotes: the `cd "$(wslpath -a "$1")" && ...` command reached
+# sh cut apart ("Syntax error: end of file unexpected"). There the quotes are escaped by hand, as the Windows
+# command-line parser reads them back (backslashes before a quote doubled, then \"); newer pwsh escapes them itself.
+function ConvertTo-NativeArgs([string[]]$NativeArgs) {
+  $mode = Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue
+  if ($mode -and "$mode" -ne 'Legacy') { return $NativeArgs }
+  return @($NativeArgs | ForEach-Object { $_ -replace '(\\*)"', '$1$1\"' })
+}
+
 function Get-WslText([string[]]$WslArgs) { # runs wsl.exe and returns its stdout as clean text
   # Windows PowerShell 5.1 turns a native command's stderr into an error record, which 'Stop' makes terminating
   $ErrorActionPreference = 'Continue'
@@ -65,9 +75,9 @@ function Get-ShArgs([string]$Command, [string]$Cwd = '') { # wsl.exe arguments t
   # The directory is changed inside sh (wsl.exe --cd needs a newer WSL than Windows 10 ships with), from the Windows
   # path given as an argument: wsl.exe passes arguments as UTF-16, so no codepage touches a non-ASCII path.
   if ($Cwd) {
-    return @('-d', $script:Distro, '--exec', 'sh', '-lc', "cd `"`$(wslpath -a `"`$1`")`" && $Command", 'sh', $Cwd)
+    return ConvertTo-NativeArgs @('-d', $script:Distro, '--exec', 'sh', '-lc', "cd `"`$(wslpath -a `"`$1`")`" && $Command", 'sh', $Cwd)
   }
-  return @('-d', $script:Distro, '--exec', 'sh', '-lc', $Command)
+  return ConvertTo-NativeArgs @('-d', $script:Distro, '--exec', 'sh', '-lc', $Command)
 }
 
 # The user PATH is a REG_EXPAND_SZ holding %VARIABLES%. [Environment]::SetEnvironmentVariable would store it expanded
