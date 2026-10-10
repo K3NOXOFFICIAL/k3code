@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -117,7 +118,9 @@ class ModelCaller:
     ) -> CallResult:
         router = routers.get(tier)
         coro = router.complete(messages, tools, max_tokens=max_tokens)
+        started = time.monotonic()
         final = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        seconds = time.monotonic() - started
         usage = final.usage
         provider, model = self._last_attempt() if self._last_attempt else ("", "")
         pt, ct = (usage.prompt_tokens, usage.completion_tokens) if usage else (0, 0)
@@ -135,5 +138,6 @@ class ModelCaller:
                 tier=tier.value,
                 task_kind=kind.value,
                 turn=self._turn_of(session_id) if self._turn_of else "",
+                seconds=seconds,
             )
         return CallResult(final.content or "", tier, model, provider, pt, ct)

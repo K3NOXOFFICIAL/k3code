@@ -34,6 +34,15 @@ class ProviderEntry(BaseModel):
     thinking_tokens: int | None = 0
     #: ...for models whose name contains one of these (default: Haiku, the cheap tier); the others keep the CLI default
     thinking_models: list[str] = Field(default_factory=lambda: ["haiku"])
+    #: claude-cli only: ``--effort`` (low|medium|high|xhigh|max) for turns where /effort sets none; None = the CLI's
+    #: own default. /effort always wins.
+    effort: str | None = None
+    #: claude-cli only: keep a live ``claude -p`` process per conversation and send each step only what is new (the
+    #: CLI start is paid once, and the prompt cache covers the earlier conversation). false = one stateless call per
+    #: step. At most ``max_sessions`` processes (~270 MB each) live at once; one idle ``idle_seconds`` is stopped.
+    persistent: bool = True
+    max_sessions: int = 4
+    idle_seconds: float = 600.0
     #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
     #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
     prompt_cache: str = "auto"
@@ -43,6 +52,15 @@ class ProviderEntry(BaseModel):
     def validate_prompt_cache(cls, v: str) -> str:
         if v not in ("auto", "on", "off"):
             raise ValueError("prompt_cache must be 'auto', 'on' or 'off'")
+        return v
+
+    @field_validator("effort")
+    @classmethod
+    def validate_effort(cls, v: str | None) -> str | None:
+        from k3code.providers.effort import LEVELS  # not at module level: k3code.providers imports this module
+
+        if v is not None and v not in LEVELS:
+            raise ValueError(f"effort must be one of {', '.join(LEVELS)}")
         return v
 
     @field_validator("kind")
@@ -112,8 +130,14 @@ class DisplayConfig(BaseModel):
 
 
 class GoalConfig(BaseModel):
-    max_turns: int = 300  # judged turns before a goal pauses; raised from 30 at the owner's request
+    max_turns: int = 0  # judged turns before a goal pauses; 0 = no limit (the goal runs until done or blocked)
     judge_model: str = "cheap"
+
+
+class SubagentsConfig(BaseModel):
+    #: model calls a sub-agent may make when the global ``max_turns`` is 0 (no cap). Nobody watches a sub-agent while
+    #: its parent waits, so it never runs unbounded; a positive global ``max_turns`` wins when it is smaller.
+    max_turns: int = 200
 
 
 class AutomationConfig(BaseModel):
@@ -135,7 +159,7 @@ class Settings(BaseModel):
 
     providers: list[ProviderEntry] = Field(default_factory=list)
     default_model: str = "default"  # key into provider.models
-    max_turns: int = 20
+    max_turns: int = 0  # model calls per prompt; 0 = no cap (a reached cap stops the turn as needs_input)
     max_tokens: int = 8192
     temperature: float | None = None
     permission_mode: str = "ask"  # ask | auto-edit | plan | auto | yolo
@@ -153,6 +177,7 @@ class Settings(BaseModel):
     mcp: McpConfig = Field(default_factory=McpConfig)
     mem0: Mem0Config = Field(default_factory=Mem0Config)
     goal: GoalConfig = Field(default_factory=GoalConfig)
+    subagents: SubagentsConfig = Field(default_factory=SubagentsConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
 
     # router knobs: {max_inline_wait: 20, quota_cooldown: 3600}; see router.router.Router

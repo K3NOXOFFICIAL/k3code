@@ -151,9 +151,10 @@ async def test_agent_loop_max_turns(temp_cwd):
     async for event in loop.run("Do something"):
         events.append(event)
 
-    # Should have exactly 3 turns * 2 (assistant done + tool result) = 6
+    # 3 turns * 2 (assistant done + tool result) = 6, then the message saying the cap stopped the run
     done_events = [e for e in events if e.type == "done"]
-    assert len(done_events) == 6
+    assert len(done_events) == 7 and loop.escalation_reason == "max_turns"
+    assert done_events[-1].message.content.startswith("I stopped after 3 model calls")
 
 
 @pytest.mark.asyncio
@@ -367,3 +368,36 @@ async def test_loop_guard_note_follows_the_tool_results(temp_cwd):
         if m.role == "assistant" and m.tool_calls:
             assert [x.role for x in last[i + 1 : i + 1 + len(m.tool_calls)]] == ["tool"] * len(m.tool_calls)
     assert last[notes[0] - 1].role == "tool"
+
+
+@pytest.mark.asyncio
+async def test_invalid_tool_block_is_answered_and_the_next_valid_call_runs(temp_cwd):
+    """A provider that could not parse a <tool_calls> block hands the loop a reserved call: the model gets the error
+    as a tool result, and its re-sent valid call runs - no ProviderError, no retry of the model call."""
+    target = temp_cwd / "out.txt"
+    bad = ToolCall(id="bad_1", name="invalid_tool_call", arguments={"error": "Expecting value", "body": "[{oops"})
+    good = ToolCall(id="good_1", name="write", arguments={"path": str(target), "content": "hi"})
+    seen: list[list[Message]] = []
+
+    class Recording(FakeProvider):
+        async def stream(self, messages, tools, model, **kw):
+            seen.append(list(messages))
+            async for event in super().stream(messages, tools, model, **kw):
+                yield event
+
+    provider = Recording(
+        [
+            [make_done_event(Message(role="assistant", content=None, tool_calls=[bad]))],
+            [make_done_event(Message(role="assistant", content=None, tool_calls=[good]))],
+            [make_done_event(Message(role="assistant", content="done", tool_calls=[]))],
+        ]
+    )
+    router = Router(build_chain([provider], [["fake-model"]]), max_retries=0)
+    loop = AgentLoop(router, system_prompt="t", max_turns=10, permission_mode="yolo", cwd=temp_cwd)
+    async for _event in loop.run("go"):
+        pass
+
+    assert provider._call_count == 3  # one model call per turn: nothing was retried
+    answer = next(m for m in seen[1] if m.role == "tool" and m.tool_call_id == "bad_1")
+    assert "was not valid JSON (Expecting value)" in answer.content and "valid JSON array" in answer.content
+    assert target.read_text() == "hi"  # the valid call ran

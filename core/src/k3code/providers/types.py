@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+#: Reserved tool name: a provider could not parse the model's tool-call block. Its arguments carry ``error`` and
+#: ``body``; the agent loop answers it with an error result instead of running anything.
+INVALID_TOOL_CALL = "invalid_tool_call"
+
 
 @dataclass
 class ToolCall:
@@ -57,6 +61,8 @@ class Message:
     tool_call_id: str | None = None
     name: str | None = None
     usage: Usage | None = None
+    #: why the model stopped (provider-neutral; "max_tokens" = cut off at the output limit). Not persisted.
+    stop_reason: str | None = None
 
 
 @dataclass

@@ -469,6 +469,13 @@ def write_config(data: dict[str, Any], only: str | None = None) -> Path:
             merged.pop("research", None)
     confio.validate(merged)
     confio.write_yaml(path, merged)
+    if only in (None, "providers"):
+        # A provider was just (re)written, usually with a new key: an auth cooldown armed for the old one must
+        # not keep the entry out of the chain.
+        from k3code.daemon import k3_home
+        from k3code.router.cooldown import clear_auth_cooldowns
+
+        clear_auth_cooldowns(k3_home() / "cooldowns.json")
     return path
 
 
