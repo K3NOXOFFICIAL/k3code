@@ -6,6 +6,8 @@ variables, then prints the stream-json events of a canned reply chosen by the SH
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import json
 import os
 import pwd
@@ -860,3 +862,83 @@ def test_provider_entry_passes_the_session_settings_through() -> None:
     entry = ProviderEntry(name="cc", kind="claude-cli", persistent=False, max_sessions=2, idle_seconds=30)
     (provider,) = make_providers([entry])
     assert (provider.persistent, provider.max_sessions, provider.idle_seconds) == (False, 2, 30.0)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _bash("ls") + "\nDone, waiting for the output.",  # prose after the block
+        _bash("ls") + "\nand then\n" + _bash("pwd").split("\n", 1)[1],  # prose between two blocks
+    ],
+)
+async def test_a_reply_k3code_keeps_differently_is_not_continued(pshim: Path, tmp_path: Path, reply: str) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim))
+    msgs = [Message(role="system", content="SYS"), Message(role="user", content="list the files")]
+    a1 = await _step(p, msgs, tmp_path, reply)
+    assert a1.tool_calls and not p._pool  # the process's copy has prose k3code dropped: never reused
+    results = [Message(role="tool", content="a.py", tool_call_id=c.id, name="bash") for c in a1.tool_calls]
+    await _step(p, [*msgs, a1, *results], tmp_path, "ok")
+    spawns, sent = _lines(tmp_path, ".spawns"), _lines(tmp_path, ".msgs")
+    assert len(spawns) == 2 and not _alive(spawns[0]["pid"])
+    assert "list the files" in sent[1]["text"]  # a full render, not a delta
+    await _close_and_check(p, tmp_path)
+
+
+async def test_a_cancel_during_eviction_stops_the_call(pshim: Path, tmp_path: Path) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim), max_sessions=1)
+    await _step(p, [Message(role="user", content="first")], tmp_path, "one")
+    (old,) = p._pool
+    waiting = asyncio.Event()
+
+    async def stuck_wait() -> int:
+        waiting.set()
+        await asyncio.Event().wait()
+        return 0
+
+    old.proc.wait = stuck_wait  # type: ignore[method-assign]
+    task = asyncio.ensure_future(_collect(p, [Message(role="user", content="second")]))
+    await waiting.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    del old.proc.wait
+    await old.proc.wait()  # it was killed on eviction; reap it here since the stuck wait never did
+    assert len(_lines(tmp_path, ".spawns")) == 1 and not p._pool and not p._spawning  # no replacement spawned
+    await _close_and_check(p, tmp_path)
+
+
+async def test_concurrent_spawns_respect_the_cap(pshim: Path, tmp_path: Path) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim), max_sessions=2, max_parallel=4)
+    await _step(p, [Message(role="user", content="a")], tmp_path, "one")
+    (first,) = p._pool
+    _ctl(tmp_path, reply="two")
+    await asyncio.gather(*(_collect(p, [Message(role="user", content=c)]) for c in ("b", "c")))
+    spawns = _lines(tmp_path, ".spawns")
+    assert len(spawns) == 3 and len(p._pool) == 2 and first not in p._pool and not _alive(first.proc.pid)
+    await _close_and_check(p, tmp_path)
+
+
+async def test_an_idle_process_is_reaped_without_another_call(pshim: Path, tmp_path: Path) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim), idle_seconds=0.2)
+    await _step(p, [Message(role="user", content="hi")], tmp_path, "one")
+    (sess,) = p._pool
+    for _ in range(100):
+        if not p._pool and not p._reaping:
+            break
+        await asyncio.sleep(0.02)
+    assert not p._pool and not _alive(sess.proc.pid)
+    await _close_and_check(p, tmp_path)
+
+
+async def test_a_rewritten_history_keeps_one_idle_process_per_conversation(pshim: Path, tmp_path: Path) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim), max_sessions=8)
+    msgs = [Message(role="system", content="SYS"), Message(role="user", content="list the files")]
+    for i in range(4):
+        a = await _step(p, msgs, tmp_path, _bash(f"ls {i}"))
+        msgs += [a, Message(role="tool", content=f"out {i}", tool_call_id=a.tool_calls[0].id, name="bash")]
+        # the next step elides the oldest tool output, as compaction does: the prefix no longer matches
+        last = msgs[-1]
+        msgs = [dataclasses.replace(m, content="[elided]") if m.role == "tool" and m is not last else m for m in msgs]
+        assert len([s for s in p._pool if not s.busy]) <= 1
+    assert len(_lines(tmp_path, ".spawns")) >= 2  # the elisions did force full renders
+    await _close_and_check(p, tmp_path)
