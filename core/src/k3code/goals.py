@@ -1,13 +1,14 @@
 # Port of the design of hermes_cli/goals.py (MIT, Nous Research):
 #   Vendored from hermes-agent@4127d78da84b1eee105f298979cc57cc7457f98d:hermes_cli/goals.py (MIT)
 # Trimmed for k3code: persistent GoalState per session (stored in session meta), a cheap-model judge
-# after each turn (continue/done/blocked), automatic continuation messages, a turn budget as backstop,
+# after each turn (continue/done/blocked), automatic continuation messages, an optional turn budget,
 # and an optional shell-command gate (--check) that must pass before `done` counts.
 # Dropped: contracts, subgoals, wait barriers, delegation/background-process awareness.
 """Persistent session goals — the "Ralph loop".
 
-Judge failures are fail-OPEN (``continue``); the turn budget is the backstop. The continuation is
-a normal user message, so the system prompt (and prompt caching) never changes mid-goal.
+Judge failures are fail-OPEN (``continue``); repeated judge failures, a ``blocked`` verdict and an optional turn
+budget (``max_turns``, 0 = none, the default) pause the goal. The continuation is a normal user message, so the
+system prompt (and prompt caching) never changes mid-goal.
 """
 
 from __future__ import annotations
@@ -21,9 +22,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_MAX_TURNS = 300  # a backstop for unattended goals; raised from 30 at the owner's request
+#: Judged turns before a goal pauses; 0 = no limit: a goal runs until it is done, judged blocked or paused.
+DEFAULT_MAX_TURNS = 0
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
-DEFAULT_GATE_MAX_RETRIES = 3
+#: Failed --check runs before a goal pauses; 0 = no limit (an agent that finds the check itself wrong says so and
+#: stops, and the judge's ``blocked`` verdict pauses the goal).
+DEFAULT_GATE_MAX_RETRIES = 0
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
 #: Automatic kicks (boot resume, watchdog): this many within KICK_WINDOW_S, the next one parks the goal instead.
 MAX_KICKS_PER_WINDOW = 3
@@ -48,7 +52,7 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "[Continuing toward your standing goal — the completion check failed]\n"
     "Goal: {goal}\n\n"
     "The check command below must pass before this goal can be declared done, and it just failed "
-    "(attempt {attempt}/{max_retries}):\n"
+    "(attempt {attempt}):\n"
     "  $ {command}\n"
     "Exit code: {exit_code}\n"
     "Output (tail):\n```\n{output}\n```\n\n"
@@ -81,6 +85,11 @@ Completer = Callable[[str, str], Awaitable[str]]
 Reviewer = Callable[[str], Awaitable[tuple[bool, list[str]]]]  # (goal) -> (blocking, issues)
 
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
+
+
+def _of(n: int, limit: int) -> str:
+    """``12/50`` with a limit, ``12`` without one (``limit`` <= 0)."""
+    return f"{n}/{limit}" if limit > 0 else str(n)
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -139,6 +148,14 @@ class GoalState:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def budget_spent(self) -> bool:
+        """The turn budget is used up (never without one: ``max_turns`` <= 0)."""
+        return 0 < self.max_turns <= self.turns_used
+
+    def turns_text(self) -> str:
+        """``12/50 turns``, or ``12 turns`` without a turn budget."""
+        return f"{_of(self.turns_used, self.max_turns)} turns"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> GoalState:
@@ -281,7 +298,7 @@ class GoalManager:
         gates = [GoalGate(command=check)] if check else []
         st = GoalState(
             goal=goal.strip(),
-            max_turns=max_turns or self.default_max_turns,
+            max_turns=self.default_max_turns if max_turns is None else max_turns,
             created_at=time.time(),
             gates=gates,
         )
@@ -324,7 +341,7 @@ class GoalManager:
         s = self.state
         if s is None or s.status == "cleared":
             return "No active goal. Set one with /goal <objective>."
-        line = f"Goal ({s.status}, {s.turns_used}/{s.max_turns} turns): {s.goal}"
+        line = f"Goal ({s.status}, {s.turns_text()}): {s.goal}"
         if s.gates:
             line += "\n  check: " + "; ".join(f"$ {g.command}" for g in s.gates)
         if s.last_verdict:
@@ -383,7 +400,7 @@ class GoalManager:
                 gate.attempts += 1
                 s.last_verdict = "gate_failed"
                 s.last_reason = f"check failed (exit {code}): $ {gate.command}"
-                if gate.attempts > gate.max_retries:
+                if 0 < gate.max_retries < gate.attempts:
                     return self._pause_decision(
                         s,
                         f"check exhausted {gate.max_retries} retries: $ {gate.command}",
@@ -391,15 +408,14 @@ class GoalManager:
                         s.last_reason,
                         f"⏸ Goal paused — check still failing after {gate.max_retries} retries: $ {gate.command}",
                     )
-                if s.turns_used >= s.max_turns:
+                if s.budget_spent():
                     return self._budget_pause(s, "gate_failed", s.last_reason)
                 self._save(s)
                 prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
                     goal=s.goal,
                     command=gate.command,
                     exit_code=code,
-                    attempt=gate.attempts,
-                    max_retries=gate.max_retries,
+                    attempt=_of(gate.attempts, gate.max_retries),
                     output=tail or "(no output)",
                 )
                 return Decision(
@@ -408,14 +424,14 @@ class GoalManager:
                     prompt,
                     "gate_failed",
                     s.last_reason,
-                    f"✗ Check failed ({s.turns_used}/{s.max_turns} turns, attempt {gate.attempts}/{gate.max_retries}): "
+                    f"✗ Check failed ({s.turns_text()}, attempt {_of(gate.attempts, gate.max_retries)}): "
                     f"$ {gate.command}",
                 )
             if reviewer is not None:  # advisor veto: blocking issues keep the goal going
                 blocking, issues = await reviewer(s.goal)
                 if (gone := self._superseded(s)) is not None:
                     return gone
-                if blocking and issues and s.turns_used < s.max_turns:
+                if blocking and issues and not s.budget_spent():
                     s.last_verdict = "advisor_blocked"
                     s.last_reason = "advisor: " + "; ".join(issues)[:300]
                     self._save(s)
@@ -430,7 +446,7 @@ class GoalManager:
                         prompt,
                         "advisor_blocked",
                         s.last_reason,
-                        f"⚠ Advisor found blocking issues ({s.turns_used}/{s.max_turns} turns): {issues[0][:120]}",
+                        f"⚠ Advisor found blocking issues ({s.turns_text()}): {issues[0][:120]}",
                     )
             s.status = "done"
             self._save(s)
@@ -454,16 +470,17 @@ class GoalManager:
                 reason,
                 f"⏸ Goal paused — the judge isn't returning the required JSON verdict ({n} turns).",
             )
-        if s.turns_used >= s.max_turns:
+        if s.budget_spent():
             return self._budget_pause(s, "continue", reason)
         self._save(s)
+        progress = f"{s.turns_used}/{s.max_turns}" if s.max_turns > 0 else f"turn {s.turns_used}"
         return Decision(
             "active",
             True,
             self.continuation_prompt(),
             "continue",
             reason,
-            f"↻ Continuing toward goal ({s.turns_used}/{s.max_turns}): {reason}",
+            f"↻ Continuing toward goal ({progress}): {reason}",
         )
 
     def _superseded(self, s: GoalState) -> Decision | None:

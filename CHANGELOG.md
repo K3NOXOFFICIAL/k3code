@@ -13,6 +13,8 @@ All notable changes are listed here. Until version 1.0, any release may change t
 - **Stored sessions.** At start the daemon deletes stored sessions that never got a message, have no title or per-session setting, are not live or referenced by any loop or automation (paused ones included), and were last touched more than 30 days ago. Every `k3code agents`, `n` and abandoned TUI start used to leave one behind for good.
 - **`/help`** lists the gateway's commands by category (it showed only the TUI's own commands).
 - **Logging.** `k3code -p` prints only warnings by default, ends the answer with a newline and says why on stderr when a run fails. `K3CODE_LOG_LEVEL=info` brings the log back.
+- **No step limit by default.** `max_turns` (model calls per prompt) defaults to 0, no cap (it was 20). A configured cap that is reached no longer ends the turn silently as if the task were done: the turn ends as needs input with a message saying it stopped after N model calls, an active goal pauses instead of being judged, and `k3code -p` exits 1 with the reason on stderr.
+- **Goals run until done.** `goal.max_turns` defaults to 0, no turn budget (it was 300), and a failing `--check` no longer pauses the goal after 3 attempts; the goal still pauses when it is judged blocked. The status line and notices read `12 turns` / `turn 12` without a budget. `/goal --turns N` still sets one (`--turns 0` = none), and `/goal resume` keeps the budget a goal was stored with, so a goal set before this change keeps its 300.
 - **Setup.** Fast setup over an existing config puts the new provider first and keeps the others as fallbacks. `k3code doctor` reports a provider without a key as a warning while another provider can still answer.
 
 ### Added

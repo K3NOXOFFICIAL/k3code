@@ -191,6 +191,13 @@ async def _run_headless(
             usage.on_stream_event(event)
         if loop.hooks:
             await loop.hooks.run("Stop", {"stop_hook_active": False})
+        if loop.escalation_reason == "max_turns":  # the task is not finished: a script must not read success
+            return {
+                "error": "max_turns",
+                "message": f"stopped after {loop.max_turns} model calls (the max_turns cap; 0 = no limit)",
+                "text": final_text,
+                "tools": tool_results,
+            }
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
         return {"error": "all_providers_unreachable", "message": str(e), "attempts": e.attempts}

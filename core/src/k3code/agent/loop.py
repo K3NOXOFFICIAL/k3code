@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -62,7 +63,7 @@ class AgentLoop:
         router: Router,
         *,
         system_prompt: str,
-        max_turns: int = 20,
+        max_turns: int = 0,
         permission_mode: str = "ask",
         headless: bool = True,
         on_event: Callable[[RouterEvent], None] | None = None,
@@ -107,10 +108,15 @@ class AgentLoop:
         #: called after every tool call with (call, result, failure or None); the gateway's learning hub records
         #: tool errors with it
         self.on_tool_outcome: Callable[[ToolCall, dict[str, Any], Failure | None], None] | None = None
-        #: Set when the loop stopped because the attempt looks stuck: "tool_errors" | "loop_guard".
+        #: Set when the loop stopped before the task was done: "tool_errors" | "loop_guard" (the attempt looks stuck)
+        #: or "max_turns" (the configured cap on model calls was reached).
         self.escalation_reason: str | None = None
         self.system_prompt = system_prompt
+        #: Model calls one run() may make; 0 (the default) = no cap: a task runs until the model answers without a
+        #: tool call. A cap that is reached ends the run with a message saying so (it used to end silently).
         self.max_turns = max_turns
+        #: end a max_turns stop with an assistant message (off for the planning loop, whose last text is the plan)
+        self.max_turns_stop_message = True
         self.cwd = cwd or Path.cwd()
         self.permissions = permissions or PermissionState(mode=PermissionMode(permission_mode), cwd=self.cwd)
         self.plan_callback = plan_callback
@@ -202,6 +208,7 @@ class AgentLoop:
         self.reliability.attach_router(self.router)
         self.reliability.begin_turn()
         self._elided, self._pinned, self._reads, self._step = set(), set(), {}, 0
+        self.escalation_reason = None  # the REPL reuses one loop: a stop in an earlier run is not this run's
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
             *(history or []),
@@ -234,11 +241,13 @@ class AgentLoop:
                 self.turn_messages = messages  # the resumed transcript replaced the list
         self.reliability.save_transcript(messages)
 
-        for turn in range(self.max_turns):
+        for turn in itertools.count():
+            if 0 < self.max_turns <= turn:
+                break
             if self.interrupted:
                 logger.info("Turn %d interrupted before start", turn + 1)
                 return
-            logger.info("Turn %d/%d", turn + 1, self.max_turns)
+            logger.info("Turn %d%s", turn + 1, f"/{self.max_turns}" if self.max_turns > 0 else "")
             self._drain_steer(messages)
             # M2: disk guard + budget check before starting new work.
             self._check_disk_guard()
@@ -355,7 +364,22 @@ class AgentLoop:
             messages.extend(notes)
             self.turn_messages = messages
 
+        # Only a configured cap gets here. Ending as if the task were finished hid it: the gateway reported the turn
+        # done and an active goal judged a half-done reply. Say so and let the gateway end the turn as needs_input.
         logger.warning("Max turns (%d) reached", self.max_turns)
+        self.escalation_reason = "max_turns"
+        if self.max_turns_stop_message:
+            text = (
+                f"I stopped after {self.max_turns} model calls: the configured `max_turns` cap ({self.max_turns}) "
+                "was reached before the task was finished. Reply to continue where I left off, or raise "
+                "`max_turns` in the config (0 = no limit)."
+            )
+            if self.on_text_delta:
+                await self.on_text_delta(text)
+            stop_msg = Message(role="assistant", content=text)
+            messages.append(stop_msg)
+            self.reliability.save_transcript(messages)
+            yield StreamEvent(type="done", message=stop_msg)
         self.turn_messages = messages
 
     async def _execute_tool(self, tool_call: ToolCall) -> dict[str, Any]:

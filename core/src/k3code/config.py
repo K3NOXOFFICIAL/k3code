@@ -112,7 +112,7 @@ class DisplayConfig(BaseModel):
 
 
 class GoalConfig(BaseModel):
-    max_turns: int = 300  # judged turns before a goal pauses; raised from 30 at the owner's request
+    max_turns: int = 0  # judged turns before a goal pauses; 0 = no limit (the goal runs until done or blocked)
     judge_model: str = "cheap"
 
 
@@ -135,7 +135,7 @@ class Settings(BaseModel):
 
     providers: list[ProviderEntry] = Field(default_factory=list)
     default_model: str = "default"  # key into provider.models
-    max_turns: int = 20
+    max_turns: int = 0  # model calls per prompt; 0 = no cap (a reached cap stops the turn as needs_input)
     max_tokens: int = 8192
     temperature: float | None = None
     permission_mode: str = "ask"  # ask | auto-edit | plan | auto | yolo
