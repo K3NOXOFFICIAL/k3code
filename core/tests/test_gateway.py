@@ -345,7 +345,7 @@ async def test_approval_deny_blocks_tool():
 
 async def test_registry_names_available():
     registry = build_registry()
-    for name in ("model", "effort", "clear", "compact", "rename", "resume", "stop", "exit", "help"):
+    for name in ("tune", "model", "effort", "clear", "compact", "rename", "resume", "stop", "exit", "help"):
         assert name in registry.names(), name
 
 

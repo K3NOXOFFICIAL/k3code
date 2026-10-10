@@ -26,6 +26,8 @@ class ProviderEntry(BaseModel):
     api_key_env: str = ""  # required for "openai" / "anthropic"
     api_key: str = ""  # populated by load_config() from the api_key_env var; never set this directly
     models: dict[str, str | list[str]] = Field(default_factory=dict)  # {default, cheap, ...}
+    #: Optional one-line text per model key ({default: "Everyday coding", cheap: "Fast and cheap"}), shown by /tune.
+    descriptions: dict[str, str] = Field(default_factory=dict)
     #: M4a: model list per tier, e.g. {strong: [opus], cheap: haiku}; falls back to models[<tier>], then models.default.
     tiers: dict[str, str | list[str]] = Field(default_factory=dict)
     #: claude-cli only: hidden "thinking" budget per call (MAX_THINKING_TOKENS). 0 turns it off; None keeps Claude
@@ -163,9 +165,15 @@ class Settings(BaseModel):
     learning: dict[str, Any] = Field(default_factory=dict)
     # M4a autonomy: plan_first, gate_modes, advisor_auto, proposals, escalate_after, ...
     autonomy: dict[str, Any] = Field(default_factory=dict)
-    # M4b: ultracode: {max_tokens, max_agents}; research: {searxng_url, max_subquestions, ...}
+    # M4b: ultracode: {max_tokens, max_agents, min_scope}; research: {searxng_url, max_subquestions, ...}
+    # min_scope: with the ultracode mode on (/ultracode on), a prompt rated at least this runs the pipeline.
     ultracode: dict[str, Any] = Field(default_factory=dict)
     research: dict[str, Any] = Field(default_factory=dict)
+    # Wake words (ultracode, ultraplan, ultraresearch typed in a prompt run that mode once): {enabled: true,
+    # ultracode: true, ultraplan: true, ultraresearch: true}; see k3code.wakewords
+    wake_words: dict[str, Any] = Field(
+        default_factory=lambda: {"enabled": True, "ultracode": True, "ultraplan": True, "ultraresearch": True}
+    )
     # Web tools SSRF guard: {allow_private: false}. true lets web_fetch/web_browse reach loopback/private addresses;
     # the exact origin of research.searxng_url is always allowed. See k3code.net_guard.
     web: dict[str, Any] = Field(default_factory=dict)
@@ -199,6 +207,29 @@ class Settings(BaseModel):
                 research["searxng_url"] = legacy["url"]
             data["research"] = research
         return data
+
+    @field_validator("ultracode")
+    @classmethod
+    def _validate_ultracode(cls, v: dict[str, Any]) -> dict[str, Any]:
+        if "min_scope" in v:
+            from k3code.autonomy.scope import SCOPES
+
+            level = str(v["min_scope"]).strip().lower()
+            if level not in SCOPES:
+                raise ValueError(f"ultracode.min_scope must be one of {', '.join(SCOPES)} (got {v['min_scope']!r})")
+            v = {**v, "min_scope": level}
+        return v
+
+    @field_validator("wake_words")
+    @classmethod
+    def _validate_wake_words(cls, v: dict[str, Any]) -> dict[str, Any]:
+        from k3code.wakewords import CONFIG_KEYS
+
+        for key, value in v.items():
+            if key in CONFIG_KEYS and not isinstance(value, bool):
+                raise ValueError(f"wake_words.{key} must be true or false (got {value!r})")
+        # a section that sets only some keys (the merge replaces the default as a whole) keeps the others on
+        return {**dict.fromkeys(CONFIG_KEYS, True), **v}
 
 
 #: ``retention`` defaults: usage.db rows (days), closed sessions' journal files (days), debug bundles kept (count),
@@ -313,6 +344,7 @@ def load_config(
     merged = _merge_dicts(merged, cli)
 
     _warn_unknown_escalate_keys(merged)
+    _warn_unknown_mode_keys(merged)
 
     # Expand provider api_key_env -> api_key (api_key_env is a required field on
     # ProviderEntry, so look it up without popping it out of the dict).
@@ -337,6 +369,17 @@ def _warn_unknown_escalate_keys(merged: dict[str, Any]) -> None:
         logger.warning(
             "autonomy.escalate.%s is not used and is ignored (known keys: %s)", key, ", ".join(sorted(ESCALATE_KEYS))
         )
+
+
+def _warn_unknown_mode_keys(merged: dict[str, Any]) -> None:
+    """Keys under ``ultracode`` and ``wake_words`` that nothing reads (a typo) would be ignored without a word."""
+    from k3code.autonomy import ULTRACODE_KEYS
+    from k3code.wakewords import CONFIG_KEYS
+
+    for name, known in (("ultracode", set(ULTRACODE_KEYS)), ("wake_words", set(CONFIG_KEYS))):
+        section = merged.get(name)
+        for key in sorted(set(section) - known if isinstance(section, dict) else (), key=str):
+            logger.warning("%s.%s is not used and is ignored (known keys: %s)", name, key, ", ".join(sorted(known)))
 
 
 def _is_scalar(default: Any) -> bool:

@@ -1,0 +1,272 @@
+[
+ {
+  "input": "ultracode fix the failing tests",
+  "mode": "ultracode",
+  "task": "fix the failing tests"
+ },
+ {
+  "input": "Ultracode fix the failing tests",
+  "mode": "ultracode",
+  "task": "fix the failing tests"
+ },
+ {
+  "input": "ULTRACODE: refactor the auth module",
+  "mode": "ultracode",
+  "task": "refactor the auth module"
+ },
+ {
+  "input": "ultracode - rename the config loader",
+  "mode": "ultracode",
+  "task": "rename the config loader"
+ },
+ {
+  "input": "ultracode, migrate the build to uv",
+  "mode": "ultracode",
+  "task": "migrate the build to uv"
+ },
+ {
+  "input": "fix the failing tests ultracode",
+  "mode": "ultracode",
+  "task": "fix the failing tests"
+ },
+ {
+  "input": "fix the failing tests, ultracode",
+  "mode": "ultracode",
+  "task": "fix the failing tests"
+ },
+ {
+  "input": "fix the failing tests. ultracode",
+  "mode": "ultracode",
+  "task": "fix the failing tests."
+ },
+ {
+  "input": "please ultracode the login flow today",
+  "mode": "ultracode",
+  "task": "please the login flow today"
+ },
+ {
+  "input": "use ultracode, then run the tests",
+  "mode": "ultracode",
+  "task": "use, then run the tests"
+ },
+ {
+  "input": "ultracode",
+  "mode": "ultracode",
+  "task": ""
+ },
+ {
+  "input": "ultracode:",
+  "mode": "ultracode",
+  "task": ""
+ },
+ {
+  "input": "  ultracode  ",
+  "mode": "ultracode",
+  "task": ""
+ },
+ {
+  "input": "ultraplan the new importer",
+  "mode": "ultraplan",
+  "task": "the new importer"
+ },
+ {
+  "input": "ultraresearch how do other harnesses queue prompts",
+  "mode": "ultraresearch",
+  "task": "how do other harnesses queue prompts"
+ },
+ {
+  "input": "research the options with ultraresearch and cite sources",
+  "mode": "ultraresearch",
+  "task": "research the options with and cite sources"
+ },
+ {
+  "input": "ultracode this\nand also that",
+  "mode": "ultracode",
+  "task": "this\nand also that"
+ },
+ {
+  "input": "first line\nultracode second line",
+  "mode": "ultracode",
+  "task": "first line\nsecond line"
+ },
+ {
+  "input": "what is the difference between ultracode and ultraplan?",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultracode this and then ultraplan that",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultracode fix a, ultracode fix b",
+  "mode": "ultracode",
+  "task": "fix a, ultracode fix b"
+ },
+ {
+  "input": "/ultracode fix the failing tests",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "  /ultraplan x",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "run /ultracode later",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "look at src/ultracode.py",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "see ultracode.py for details",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultracode.py is slow",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "the ultracode.md file",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "set --ultracode on",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ask @ultracode about it",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "tag #ultracode",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "my-ultracode tool",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultracode_helper breaks",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultracoder is a word",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "preultracode",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "what does \"ultracode\" do?",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "what does 'ultracode' do?",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "what does `ultracode` do?",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "what does “ultracode” do?",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "```\nultracode fix it\n```",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "explain this:\n```sh\nk3code ultracode\n```\nthanks",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "```\nunterminated ultracode",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "run ultracode on `src/x.py` please",
+  "mode": "ultracode",
+  "task": "run on `src/x.py` please"
+ },
+ {
+  "input": "`ultracode` is great but ultraplan first",
+  "mode": "ultraplan",
+  "task": "`ultracode` is great but first"
+ },
+ {
+  "input": "no wake word here",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultrathink about it",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "https://example.com/ultracode",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "C:\\tools\\ultracode",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ultracode.",
+  "mode": "ultracode",
+  "task": ""
+ },
+ {
+  "input": "can you ultracode?",
+  "mode": "ultracode",
+  "task": "can you?"
+ },
+ {
+  "input": "ultracode ultracode",
+  "mode": "ultracode",
+  "task": "ultracode"
+ },
+ {
+  "input": "ultracode: ultraplan",
+  "mode": null,
+  "task": null
+ },
+ {
+  "input": "ünïcode ultracode test",
+  "mode": "ultracode",
+  "task": "ünïcode test"
+ }
+]

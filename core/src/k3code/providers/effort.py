@@ -24,6 +24,23 @@ def current() -> str | None:
     return effort if effort in LEVELS else None
 
 
+def takes_effort(model: str, kind: str) -> bool | None:
+    """Whether a request to ``model`` through a provider of ``kind`` carries the session's effort level.
+
+    The same test the providers apply when they build a request; None when there is nothing to judge (no model id,
+    or a provider kind this module knows nothing about). The claude-cli provider sends no effort at all.
+    """
+    if not model:
+        return None
+    if kind == "anthropic":
+        return bool(_ANTHROPIC_EFFORT.search(model.lower()))
+    if kind == "openai":
+        return bool(_OPENAI_EFFORT.search(model.lower()))
+    if kind == "claude-cli":
+        return False
+    return None
+
+
 def anthropic_effort(model: str) -> str | None:
     effort = current()
     return effort if effort and _ANTHROPIC_EFFORT.search(model.lower()) else None

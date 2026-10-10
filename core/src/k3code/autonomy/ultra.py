@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.artifacts import write_artifact_file
+from k3code.autonomy import DEFAULT_MIN_SCOPE
 from k3code.autonomy.fanout import FanoutResult, detect_test_command, extract_subtasks, run_tests
 from k3code.autonomy.plan_first import PLAN_SECTIONS, parse_plan
 from k3code.autonomy.scope import ScopeVerdict
@@ -135,7 +136,7 @@ def parse_votes(text: str) -> dict[str, bool]:
 
 def ultra_cfg(config: Any) -> dict[str, Any]:
     user = dict(getattr(config, "ultracode", None) or {})
-    return {"max_tokens": DEFAULT_MAX_TOKENS, "max_agents": DEFAULT_MAX_AGENTS, **user}
+    return {"max_tokens": DEFAULT_MAX_TOKENS, "max_agents": DEFAULT_MAX_AGENTS, "min_scope": DEFAULT_MIN_SCOPE, **user}
 
 
 class Ultra:

@@ -1,7 +1,14 @@
-"""/ultraplan, /ultracode (and /go for an ultraplan'd plan)."""
+"""/ultraplan, /ultracode (and /go for an ultraplan'd plan).
+
+Each command is split in two: ``prepare`` checks the input and returns either an immediate reply (usage, unavailable:
+costs nothing) or a :class:`JobSpec`, and ``handle`` = ``prepare`` + ``ctx.start_job``. Wake words and the ultracode
+mode (see ``GatewayServer._run_turn_locked``) call ``prepare`` too and run the spec inline in the running turn.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,14 +20,31 @@ def _live(ctx: Any, session_id: str | None) -> Any:
     return ctx.sessions.get(session_id) if session_id else None
 
 
+@dataclass
+class JobSpec:
+    """A command that runs as the session's turn: what to show, what to run, what the slash command answers."""
+
+    label: str  #: the status line while it runs (and the user message of a slash command)
+    factory: Callable[[], Awaitable[str]]  #: the work; its text becomes the assistant message
+    ack: str  #: the slash command's immediate reply
+
+
+def start_spec(ctx: Any, live: Any, spec: JobSpec | dict[str, Any]) -> dict[str, Any]:
+    """The slash command's end of ``prepare``: start the job, answer with its ack (or the immediate reply)."""
+    if isinstance(spec, dict):
+        return spec
+    try:
+        ctx.start_job(live, spec.label, spec.factory)
+    except Exception as e:  # noqa: BLE001
+        return reply(str(e))
+    return reply(spec.ack)
+
+
 class UltraPlanCommand(CommandDef):
     def __init__(self) -> None:
         super().__init__(name="ultraplan", help="Deep plan: 3 independent planners + a judge: /ultraplan <task>")
 
-    async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
-        live = _live(ctx, session_id)
-        if live is None:
-            return reply("No active session.")
+    async def prepare(self, ctx: Any, live: Any, arg: str) -> JobSpec | dict[str, Any]:
         if not arg:
             return reply("Usage: /ultraplan <task>")
 
@@ -37,11 +61,34 @@ class UltraPlanCommand(CommandDef):
             )
             return f"{head}\n\n{up.plan}{tail}" + (f"\n\nNote: {up.judge_note}" if up.judge_note else "")
 
-        try:
-            ctx.start_job(live, f"/ultraplan {arg}", job)
-        except Exception as e:  # noqa: BLE001
-            return reply(str(e))
-        return reply("Planning from three angles (MVP-first, risk-first, architecture-first), then judging…")
+        return JobSpec(
+            f"/ultraplan {arg}",
+            job,
+            "Planning from three angles (MVP-first, risk-first, architecture-first), then judging…",
+        )
+
+    async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+        live = _live(ctx, session_id)
+        if live is None:
+            return reply("No active session.")
+        return start_spec(ctx, live, await self.prepare(ctx, live, arg))
+
+
+#: ``/ultracode <word>``: when the whole argument is one of these words it sets or shows the mode; anything else is
+#: the task (a one-shot run that leaves the mode alone).
+_MODE_WORDS = {"on": "ultracode", "off": "off"}
+
+
+def _mode_text(ctx: Any, mode: str) -> str:
+    from k3code.autonomy.ultra import ultra_cfg
+
+    if mode == "ultracode":
+        return (
+            f"Ultracode mode is on: every prompt of at least '{ultra_cfg(ctx.config)['min_scope']}' scope runs the "
+            "multi-agent pipeline (plan, fan-out, review panel, fixes, tests). Answers and one-line edits stay "
+            "normal turns. /ultracode off turns it off."
+        )
+    return "Ultracode mode is off. /ultracode on turns it on; say ultracode in a prompt to run it once."
 
 
 class UltraCodeCommand(CommandDef):
@@ -49,20 +96,43 @@ class UltraCodeCommand(CommandDef):
         super().__init__(
             name="ultracode",
             help="Plan, fan out, adversarial review, fix, test: /ultracode <task> "
-            "(budget: ultracode.max_tokens / max_agents)",
+            "(budget: ultracode.max_tokens / max_agents). Bare /ultracode, on, off, status: the always-on mode",
         )
+
+    async def prepare(self, ctx: Any, live: Any, arg: str) -> JobSpec | dict[str, Any]:
+        if not arg:
+            return reply("Usage: /ultracode <task>")
+        return JobSpec(
+            f"/ultracode {arg}",
+            lambda: ctx.ultra.ultracode(live, arg),
+            "ultracode started: plan → fan-out → review panel → fixes → tests. See the agent strip.",
+        )
+
+    @staticmethod
+    def _set_mode(ctx: Any, live: Any, mode: str) -> dict[str, Any]:
+        """The always-on mode (``ultra_mode``): kept in the session's meta, shown in ``session.info``."""
+        live.ultra_mode = mode
+        if mode == "off":
+            live.stored.meta.pop("ultra_mode", None)
+        else:
+            live.stored.meta["ultra_mode"] = mode
+        ctx.store.save(live.stored)
+        live.emit("session.info", live.live_info())
+        return reply(_mode_text(ctx, mode))
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         live = _live(ctx, session_id)
         if live is None:
             return reply("No active session.")
-        if not arg:
-            return reply("Usage: /ultracode <task>")
-        try:
-            ctx.start_job(live, f"/ultracode {arg}", lambda: ctx.ultra.ultracode(live, arg))
-        except Exception as e:  # noqa: BLE001
-            return reply(str(e))
-        return reply("ultracode started: plan → fan-out → review panel → fixes → tests. See the agent strip.")
+        word = arg.strip().lower()
+        current = getattr(live, "ultra_mode", "off")
+        if not word:  # bare: flip the mode
+            return self._set_mode(ctx, live, "off" if current == "ultracode" else "ultracode")
+        if word in _MODE_WORDS:
+            return self._set_mode(ctx, live, _MODE_WORDS[word])
+        if word == "status":
+            return reply(_mode_text(ctx, current))
+        return start_spec(ctx, live, await self.prepare(ctx, live, arg))
 
 
 def go_for_ultraplan(live: Any) -> dict[str, Any] | None:
