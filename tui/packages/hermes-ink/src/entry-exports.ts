@@ -6,7 +6,7 @@ export {
   type EvictLevel,
   type InkCacheSizes,
 } from "./ink/cache-eviction.js";
-export { colorize } from "./ink/colorize.js";
+export { applyTextStyles, colorize } from "./ink/colorize.js";
 export { AlternateScreen } from "./ink/components/AlternateScreen.js";
 export { default as Box } from "./ink/components/Box.js";
 export { default as Link } from "./ink/components/Link.js";
