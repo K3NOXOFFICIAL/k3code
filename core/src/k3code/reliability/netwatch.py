@@ -235,6 +235,20 @@ async def default_nm_probe() -> str | None:
     return await nmcli_state()
 
 
+def _raise_if_cancelled() -> None:
+    """Re-raise a cancellation that something swallowed on its way up to this task.
+
+    A background loop that wraps its work in ``except Exception`` is only as cancellable as every library below it:
+    httpcore/anyio park inside a shielded checkpoint, a ``task.cancel()`` landing there can come back out as an
+    ordinary error (a ProxyError, say) or as a normal return, and the loop then runs on with the cancel forgotten.
+    The task still counts the request (``cancelling()``), so check that at the top of each round. Without this the
+    event-loop teardown of a test (``asyncio.Runner.close``) waits for the loop for ever.
+    """
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError
+
+
 class NetWatch:
     """Async connectivity monitor with an injectable probe set.
 
@@ -361,6 +375,7 @@ class NetWatch:
     async def _monitor_loop(self) -> None:
         assert self._wakeup is not None
         while self._running:
+            _raise_if_cancelled()
             try:
                 # Wake immediately when kicked (NM change, new provider, re_probe);
                 # otherwise sleep out the current adaptive interval.
@@ -385,6 +400,7 @@ class NetWatch:
         """Poll nmcli for NetworkManager state changes; re-probe immediately on change."""
         assert self._nm_wakeup is not None
         while self._running:
+            _raise_if_cancelled()
             try:
                 state = await self._probes.nm_state()
                 verdict = _nm_verdict(state)
@@ -396,6 +412,7 @@ class NetWatch:
                 raise
             except Exception as e:  # noqa: BLE001
                 logger.debug("NetWatch NM watch error: %s", e)
+            _raise_if_cancelled()
             try:
                 await asyncio.wait_for(self._nm_wakeup.wait(), timeout=self.config.nm_poll_interval)
                 self._nm_wakeup.clear()

@@ -88,3 +88,32 @@ def test_a_command_that_raises_reports_the_error_in_json(tmp_path):
     res = _run(tmp_path, "-p", "/project", "--json", setup=_BROKEN_PROJECT)
     assert res.returncode == 1
     assert json.loads(res.stdout) == {"error": "command_failed", "message": "/project failed: boom"}
+
+
+def test_a_command_that_only_prints_its_usage_fails_the_run(tmp_path):
+    res = _run(tmp_path, "-p", "/project bogus")
+    assert res.returncode == 1
+    assert res.stderr == "k3code: error: Usage: /project | /project rescan\n"
+    assert res.stdout == ""
+
+
+def test_a_usage_only_reply_reports_the_error_in_json(tmp_path):
+    res = _run(tmp_path, "-p", "/project bogus", "--json")
+    assert res.returncode == 1
+    assert json.loads(res.stdout) == {"error": "usage", "message": "Usage: /project | /project rescan"}
+
+
+def test_a_reply_that_merely_mentions_usage_still_succeeds(tmp_path):
+    res = _run(tmp_path, "-p", "/help")
+    assert res.returncode == 0, res.stderr
+    assert "/project" in res.stdout and "Commands:" in res.stdout
+
+
+def test_help_and_skills_leave_the_home_alone(tmp_path):
+    """-p "/help" used to build a GatewayServer: sessions.db, usage.db and the rest appeared in $K3CODE_HOME."""
+    written = {"k3home/config.yaml", "script.json", "proj/pyproject.toml", "proj/uv.lock"}  # what _run() sets up
+    for command in ("/help", "/skills"):
+        res = _run(tmp_path, "-p", command)
+        assert res.returncode == 0, res.stderr
+        files = {p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*") if p.is_file()}
+        assert files == written, (command, sorted(files - written))

@@ -230,6 +230,10 @@ take_lock() { # one installer at a time per install root; the lock goes when thi
     fi
     log "taking over the install lock in $lock: $why (killed mid-install?)"
     clean_recorded_tmp "$lock"
+    # Not atomic: two runs that find the same stale lock can interleave (one removes it and makes its own, the other
+    # then removes that one) and both go on; only a run that arrives between the rm and the mkdir is stopped, by the
+    # mkdir. It takes two installs started within the same few milliseconds over a lock a killed install left, so it
+    # is documented here rather than closed with a retry. k3code update (update.py _take_over_stale_lock) has the same.
     rm -rf "$lock"
     mkdir "$lock" 2>/dev/null || die "another install into $DATA took the lock just now; wait for it to finish"
     LOCK=$lock

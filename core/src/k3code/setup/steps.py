@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from k3code import service
+from k3code import context_budget, service
 from k3code.gateway.sessions import SessionStore
 from k3code.outputstyle import PRESETS as STYLE_PRESETS
 from k3code.paths import ensure_private_dir, home, private_file
@@ -268,7 +268,65 @@ def step_tiers(c: Ctx) -> dict[str, Any]:
                 fallback = CLAUDE_CLI_TIERS.get(t, "") if claude_cli else ""
                 tiers[t] = c.p.text(f"tiers.{e['name']}.{t}", f"{e['name']}: model for '{t}'", fallback)
         out[e["name"]] = {t: m for t, m in tiers.items() if m}
-    return {"models": out}
+    windows = _context_windows(c, sorted({m for tiers in out.values() for m in tiers.values()}))
+    return {"models": out, "context_windows": windows}
+
+
+#: The largest window setup accepts: past this a typo ("1e12") would switch compaction off for good.
+MAX_WINDOW = 10_000_000
+
+
+def parse_window(text: str) -> int | None:
+    """Tokens from ``32000``, ``32_000``, ``32,000`` or ``32k``; None for anything else (or a nonsense size)."""
+    t = text.strip().lower().replace("_", "").replace(",", "")
+    mult = 1000 if t.endswith("k") else 1
+    try:
+        n = int(float(t.removesuffix("k")) * mult)
+    except (ValueError, OverflowError):  # "abc"; "inf" and "1e400"
+        return None
+    return n if 1000 <= n <= MAX_WINDOW else None
+
+
+def _context_windows(c: Ctx, model_ids: list[str]) -> dict[str, int]:
+    """The real context window of each chosen model id k3code has no figure for (a gateway alias, a small local model).
+
+    Compaction keys to the window and an unknown id is assumed to have FALLBACK_WINDOW, so a smaller model only learns
+    its limit from the provider's overflow error. Interactive: asked once per such id, blank keeps the assumption (and
+    `k3code doctor` keeps warning). An answers file lists them as ``tiers.context_windows: {<model id>: <tokens>}``,
+    for any id, tiers or not. Ids that already have a ``models.<id>.context_window`` in the user config are not asked
+    again.
+    """
+    from types import SimpleNamespace
+
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    given = c.p.raw("tiers.context_windows")
+    given = given if isinstance(given, dict) else {}
+    existing = SimpleNamespace(models=confio.read_yaml(user_config_path()).get("models") or {})
+    out: dict[str, int] = {}
+    for m in sorted({*model_ids, *map(str, given)}):
+        value: Any = given.get(m)
+        if value is None:
+            known = context_budget.family_window(m) is not None or context_budget.has_explicit_window(existing, m)
+            if known or not c.p.interactive:
+                continue
+            value = c.p.text(
+                f"tiers.context_window.{m}",
+                f"Context window of '{m}' in tokens, e.g. 32000 or 32k (unknown model; blank = assume "
+                f"{context_budget.FALLBACK_WINDOW})",
+                "",
+            )
+        if not str(value).strip():
+            continue
+        n = parse_window(str(value))
+        if n is None:
+            c.say(
+                f"  Not a context window size: {value!r} (for {m}); keeping the {context_budget.FALLBACK_WINDOW} guess."
+            )
+            continue
+        out[m] = n
+    return out
 
 
 def step_permissions(c: Ctx) -> dict[str, Any]:
@@ -456,6 +514,12 @@ def write_config(data: dict[str, Any], only: str | None = None) -> Path:
             cfg.pop("providers")
         merged = existing
     merged = {**merged, **cfg}
+    windows = (data.get("tiers") or {}).get("context_windows")
+    if windows and only in (None, "tiers"):  # models.<id>.context_window: other keys of the id and other ids survive
+        models = {k: dict(v) if isinstance(v, dict) else {} for k, v in dict(existing.get("models") or {}).items()}
+        for model_id, n in windows.items():
+            models[model_id] = {**models.get(model_id, {}), "context_window": int(n)}
+        merged["models"] = models
     if only in (None, "integrations") and "integrations" in data:
         # the integrations answer owns searxng_url only: the user's other research.* keys (max_subquestions, ...)
         # survive a re-run, and a blank answer clears the URL. The legacy top-level searxng key is migrated away.

@@ -219,6 +219,7 @@ class _ExitCommand(CommandDef):
 
 class _HelpCommand(CommandDef):
     headless = True
+    needs_server = False
 
     def __init__(self) -> None:
         super().__init__(name="help", aliases=["h", "?"], help="List available commands")

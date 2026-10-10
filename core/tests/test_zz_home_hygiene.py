@@ -19,6 +19,9 @@ def test_real_home_sentinel_untouched(home_sentinel, tmp_path):
         assert os.environ[var].startswith(str(tmp_path.parent)), var
 
     probe = home_sentinel.real_home / "k3code-sentinel-probe" / "never-created"
+    # a link that points into the real home writes only the link (test_installer.py's PATH link farms do this)
+    os.symlink(probe, tmp_path / "link-into-home")
+    assert len(home_sentinel.writes) == 0, "a link pointing into the real home was counted as a write there"
     with contextlib.suppress(FileNotFoundError):
         os.open(probe, os.O_WRONLY | os.O_CREAT)
     assert len(home_sentinel.writes) == 1, "the detector did not see a write under the real home"

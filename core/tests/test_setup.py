@@ -327,3 +327,77 @@ def test_legacy_top_level_searxng_key_is_lifted_on_load(env: Path) -> None:
         user_config_path(), {"searxng": {"url": "http://old.test"}, "research": {"searxng_url": "http://new.test"}}
     )
     assert load_config().research["searxng_url"] == "http://new.test"
+
+
+class _AsksWindows(AnswerPrompter):
+    """Interactive: records the questions and answers the context-window ones from ``windows``."""
+
+    interactive = True
+
+    def __init__(self, answers: dict, windows: dict[str, str]) -> None:
+        super().__init__(answers)
+        self.windows = windows
+        self.asked: list[str] = []
+
+    def text(self, key: str, message: str, default: str = "", secret: bool = False) -> str:
+        if key.startswith("tiers.context_window."):
+            self.asked.append(key.removeprefix("tiers.context_window."))
+            return self.windows.get(key.removeprefix("tiers.context_window."), "")
+        return super().text(key, message, default, secret)
+
+
+def _config(env: Path) -> dict:
+    return yaml.safe_load((env / ".k3code" / "config.yaml").read_text())
+
+
+def test_setup_asks_for_the_context_window_of_an_unknown_model_id(
+    env: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    answers = {**ANSWERS, "tiers": {"main": "sonnet", "strong": "m-strong", "cheap": "m-cheap", "fast": "m-fast"}}
+    asker = _AsksWindows(answers, {"m-strong": "32k", "m-cheap": "not a number", "m-fast": ""})
+    run_setup(asker, do_probe=False)
+    assert asker.asked == ["m-cheap", "m-fast", "m-strong"]  # sonnet has a known family window: not asked
+    assert _config(env)["models"] == {"m-strong": {"context_window": 32000}}  # a bad or blank answer keeps the guess
+    assert "Not a context window size: 'not a number'" in capsys.readouterr().out
+
+
+def test_an_answers_file_gives_context_windows_for_any_id_and_a_rerun_keeps_the_rest(env: Path) -> None:
+    run_setup(AnswerPrompter(ANSWERS), do_probe=False)
+    path = env / ".k3code" / "config.yaml"
+    cfg = _config(env)
+    cfg["models"] = {"m-main": {"context_window": 1234, "note": "kept"}, "elsewhere": {"context_window": 9000}}
+    path.write_text(yaml.safe_dump(cfg))
+    windows = {"m-main": 64_000, "gpt-4.1": "128,000"}  # a known family id is written too: the user said so
+    run_setup(AnswerPrompter({**ANSWERS, "tiers": {**ANSWERS["tiers"], "context_windows": windows}}), only_step="tiers")
+    assert _config(env)["models"] == {
+        "m-main": {"context_window": 64000, "note": "kept"},
+        "gpt-4.1": {"context_window": 128000},
+        "elsewhere": {"context_window": 9000},
+    }
+
+
+def test_an_id_with_a_context_window_in_the_config_is_not_asked_again(env: Path) -> None:
+    run_setup(AnswerPrompter(ANSWERS), do_probe=False)
+    path = env / ".k3code" / "config.yaml"
+    path.write_text(yaml.safe_dump({**_config(env), "models": {"m-main": {"context_window": 50000}}}))
+    asker = _AsksWindows(ANSWERS, {})
+    run_setup(asker, only_step="tiers", do_probe=False)
+    assert "m-main" not in asker.asked and asker.asked == ["m-cheap", "m-fast", "m-strong"]
+    assert _config(env)["models"] == {"m-main": {"context_window": 50000}}
+
+
+@pytest.mark.parametrize(
+    ("text", "tokens"),
+    [("32000", 32000), ("32_000", 32000), ("32,000", 32000), ("32k", 32000), (" 128K ", 128000), ("1.5k", 1500)],
+)
+def test_parse_window_reads_plain_and_k_sizes(text: str, tokens: int) -> None:
+    from k3code.setup.steps import parse_window
+
+    assert parse_window(text) == tokens
+
+
+@pytest.mark.parametrize("text", ["", "k", "abc", "12", "-5000", "0", "inf", "1e400", "1e12", "10000001"])
+def test_parse_window_refuses_anything_else(text: str) -> None:
+    from k3code.setup.steps import parse_window
+
+    assert parse_window(text) is None
