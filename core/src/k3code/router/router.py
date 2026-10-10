@@ -9,8 +9,8 @@ Rules (from the M0 task spec):
 - A Retry-After longer than ``max_inline_wait`` (default 20 s) never sleeps inline: the entry goes
   into cooldown until the reset and the walk fails over at once. Quota errors do the same, with
   ``quota_cooldown`` (default 1 h) when the provider declares no reset.
-- An auth failure also arms a cooldown (300 s, doubling per strike, capped at 1 h) keyed to the rejected
-  credential: later calls skip the dead entry at once, and a replaced key is tried immediately.
+- A second auth failure in a row also arms a cooldown (300 s, doubling per strike, capped at 1 h) keyed to the
+  rejected credential (never for a keyless entry such as claude-cli; one transient 401 arms nothing): later calls skip the dead entry at once, and a replaced key is tried immediately.
 - context_overflow: raise :class:`ContextOverflow` — the loop compacts later.
 - When every entry in the chain has failed: :class:`AllProvidersUnreachable` if
   every failure was a network error, otherwise :class:`ChainExhausted` (carrying
@@ -71,6 +71,11 @@ class ChainEntry:
     def key_fingerprint(self) -> str:
         """Fingerprint of the entry's current credential: an auth cooldown only applies to the key it was armed for."""
         return key_fingerprint(getattr(self.provider, "api_key", ""))
+
+    @property
+    def keyless(self) -> bool:
+        """No API key configured (claude-cli): a rejection is fixed by logging in, which no cooldown could notice."""
+        return not getattr(self.provider, "api_key", "")
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -418,6 +423,7 @@ class Router:
             base_url=entry.base_url,
             retry_after=retry_after,
             fingerprint=entry.key_fingerprint,
+            keyless=entry.keyless,
         )
         if retry_after is not None and armed:
             self._emit(

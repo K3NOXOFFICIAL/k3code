@@ -42,6 +42,9 @@ _COOLDOWN_REASONS = frozenset(
 # Auth ladder: 5 min → 10 min … capped at 1 h. A replaced key skips it (the credential fingerprint changes).
 _AUTH_BASE_COOLDOWN_SECONDS = 300.0
 _AUTH_MAX_COOLDOWN_SECONDS = 3600.0
+#: The first rejection of an entry only counts: a relay restarting can answer one 401/403 and then work, and a
+#: one-entry chain would otherwise fail every prompt for 5 minutes. The second one in a row arms the cooldown.
+_AUTH_STRIKES_TO_ARM = 2
 
 _NETWORK_COOLDOWN_ENV = "K3CODE_NETWORK_COOLDOWN_SECONDS"
 
@@ -159,6 +162,7 @@ class CooldownStore:
         network_cooldown: float | None = None,
         now: float | None = None,
         fingerprint: str = "",
+        keyless: bool = False,
     ) -> float | None:
         """Put an entry into cooldown until its reset window. Returns the armed seconds.
 
@@ -167,14 +171,22 @@ class CooldownStore:
         consecutive arms of this entry unless ``backoff_count`` is given (it always was 0: the ladder never climbed).
         ``auth`` follows its own 300 s → 3600 s ladder and ignores any Retry-After; ``fingerprint`` (see
         :func:`key_fingerprint`) ties that cooldown to the credential that was rejected.
+        The first auth rejection in a row only counts; the second arms the cooldown (returns None before that).
+        A ``keyless`` entry (claude-cli: logged in with ``claude /login``, no key in the config) never arms an auth
+        cooldown: nothing would clear it once the login is fixed.
         """
         if reason not in _COOLDOWN_REASONS:
             return None
         key = _identity(provider, model, base_url)
         auth_step = 0
         if reason is FailoverReason.auth:
-            auth_step = self.auth_strikes.get(key, 0)
-            self.auth_strikes[key] = auth_step + 1
+            if keyless:
+                return None
+            strikes = self.auth_strikes.get(key, 0) + 1
+            self.auth_strikes[key] = strikes
+            if strikes < _AUTH_STRIKES_TO_ARM:
+                return None
+            auth_step = strikes - _AUTH_STRIKES_TO_ARM
         elif reason is not FailoverReason.network:
             if backoff_count is None:
                 backoff_count = self.strikes.get(key, 0)
