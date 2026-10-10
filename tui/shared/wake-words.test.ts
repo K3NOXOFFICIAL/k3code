@@ -5,7 +5,13 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { detectWakeWord, WAKE_WORDS } from "./wake-words";
+import {
+  detectEnabledWakeWord,
+  detectWakeWord,
+  WAKE_CONFIG_KEYS,
+  WAKE_WORDS,
+  wakeConfig,
+} from "./wake-words";
 
 interface Case {
   input: string;
@@ -26,24 +32,33 @@ const CASES: Case[] = JSON.parse(
 );
 
 // The word list of the Python side, when this checkout can import it (PYTHON=<core venv python>), like slashParity.
-const loadPythonWakeWords = (): { error?: string; words: string[] } => {
+const loadPythonWakeWords = (): {
+  configKeys: string[];
+  error?: string;
+  words: string[];
+} => {
   try {
     const out = execFileSync(
       process.env.PYTHON ?? "python3",
       [
         "-c",
-        "import json; from k3code.wakewords import WAKE_WORDS; print(json.dumps(sorted(WAKE_WORDS.items())))",
+        "import json; from k3code.wakewords import CONFIG_KEYS, WAKE_WORDS; print(json.dumps([sorted(WAKE_WORDS.items()), list(CONFIG_KEYS)]))",
       ],
       { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
     );
 
+    const [words, configKeys] = JSON.parse(out) as [
+      [string, string][],
+      string[],
+    ];
+
     return {
-      words: (JSON.parse(out) as [string, string][]).map(
-        ([word, command]) => `${word}=${command}`,
-      ),
+      configKeys,
+      words: words.map(([word, command]) => `${word}=${command}`),
     };
   } catch (error) {
     return {
+      configKeys: [],
       error: error instanceof Error ? error.message : String(error),
       words: [],
     };
@@ -137,6 +152,33 @@ describe("detectWakeWord cost", () => {
   });
 });
 
+describe("wakeConfig and detectEnabledWakeWord (wake_cfg / detect_enabled)", () => {
+  it("defaults everything on and keeps only booleans", () => {
+    expect(wakeConfig(undefined)).toEqual(
+      Object.fromEntries(WAKE_CONFIG_KEYS.map((key) => [key, true])),
+    );
+    expect(wakeConfig({ enabled: 0, extra: false, ultracode: false })).toEqual({
+      ...wakeConfig(null),
+      ultracode: false,
+    });
+  });
+
+  it("finds nothing when switched off, or when the mode found is", () => {
+    expect(detectEnabledWakeWord(wakeConfig({}), "ultracode it")?.mode).toBe(
+      "ultracode",
+    );
+    expect(
+      detectEnabledWakeWord(wakeConfig({ enabled: false }), "ultracode it"),
+    ).toBeNull();
+    expect(
+      detectEnabledWakeWord(wakeConfig({ ultracode: false }), "ultracode it"),
+    ).toBeNull();
+    expect(
+      detectEnabledWakeWord(wakeConfig({}), "ultracode it", [[0, 9]]),
+    ).toBeNull();
+  });
+});
+
 describe("wake word list parity with the Python core", () => {
   if (python.error) {
     it.skip(`Python k3code unavailable: ${python.error.split("\n")[0]}`, () => {});
@@ -148,5 +190,9 @@ describe("wake word list parity with the Python core", () => {
       .sort();
 
     expect(ours).toEqual(python.words);
+  });
+
+  pythonIt("names the same wake_words config keys as CONFIG_KEYS", () => {
+    expect([...WAKE_CONFIG_KEYS]).toEqual(python.configKeys);
   });
 });

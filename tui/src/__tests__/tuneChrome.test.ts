@@ -8,7 +8,10 @@ import {
 } from "../app/overlayStore.js";
 import { ctrlCOverlayTarget } from "../app/useInputHandlers.js";
 import { StatusRule } from "../components/appChrome.js";
+import { wakeConfig } from "@k3code/shared/wake-words";
+
 import {
+  composerLineHighlights,
   highlightsStable,
   splitComposerHighlights,
 } from "../domain/composerHighlights.js";
@@ -164,6 +167,45 @@ describe("composer wake-word highlight", () => {
     expect(painted("see [[ ultracode crashed [9 lines] ]]")).toEqual([
       "[[ ultracode crashed [9 lines] ]]",
     ]);
+  });
+
+  it("never paints a mode the wake_words config switched off", () => {
+    const paint = (text: string, raw: unknown) =>
+      splitComposerHighlights(text, { wake: wakeConfig(raw) })
+        .filter((segment) => segment.ref)
+        .map((segment) => segment.text);
+
+    expect(paint("ultracode it", { enabled: false })).toEqual([]);
+    expect(paint("ultracode it", { ultracode: false })).toEqual([]);
+    expect(paint("ultracode it", { ultraplan: false })).toEqual(["ultracode"]);
+    expect(paint("ultracode it", { ultracode: "no" })).toEqual(["ultracode"]); // not a boolean: the default
+  });
+
+  it("judges every composer line as one prompt, and paints the word's line", () => {
+    const lines = (all: string[]) =>
+      composerLineHighlights(all).map((line) =>
+        line.filter((segment) => segment.ref).map((segment) => segment.text),
+      );
+
+    expect(lines(["fix the tests", "ultracode", "thanks"])).toEqual([
+      [],
+      ["ultracode"],
+      [],
+    ]);
+    // a second mode on another line makes it ambiguous, as for the gateway
+    expect(lines(["ultracode the fix", "then ultraplan it"])).toEqual([[], []]);
+    // a fence opened on an earlier line masks the word on a later one
+    expect(lines(["```", "ultracode", "```", "go"])).toEqual([[], [], [], []]);
+
+    // the cursor line gets the lines above as context
+    const cursor = (before: string, text: string) =>
+      splitComposerHighlights(text, { before })
+        .filter((segment) => segment.ref)
+        .map((segment) => segment.text);
+
+    expect(cursor("fix the tests\n", "ultracode")).toEqual(["ultracode"]);
+    expect(cursor("ultraplan this\n", "ultracode")).toEqual([]);
+    expect(cursor("```\n", "ultracode")).toEqual([]);
   });
 
   it("a slash command is a command, not a wake word", () => {

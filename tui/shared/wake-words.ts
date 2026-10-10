@@ -286,3 +286,42 @@ export function detectWakeWord(
     task: taskWithout(text, first.start, first.end),
   };
 }
+
+/** The `wake_words` config keys: `enabled` plus one per mode. Mirrors `CONFIG_KEYS` in wakewords.py. */
+export const WAKE_CONFIG_KEYS: readonly string[] = [
+  "enabled",
+  ...Object.keys(WAKE_WORDS),
+];
+
+export type WakeConfig = Readonly<Record<string, boolean>>;
+
+/** `config.wake_words` over the defaults (everything on); a value that is not a boolean keeps its default. Mirrors
+ * `wake_cfg`. */
+export function wakeConfig(raw: unknown): WakeConfig {
+  const given =
+    raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+
+  return Object.fromEntries(
+    WAKE_CONFIG_KEYS.map((key) => {
+      const value = given[key];
+
+      return [key, typeof value === "boolean" ? value : true];
+    }),
+  );
+}
+
+/** {@link detectWakeWord}, unless the config switched wake words (or the mode it found) off. Mirrors
+ * `detect_enabled`. */
+export function detectEnabledWakeWord(
+  config: WakeConfig,
+  text: string,
+  skip: Iterable<Span> = [],
+): null | WakeMatch {
+  if (config.enabled === false) {
+    return null;
+  }
+
+  const hit = detectWakeWord(text, skip);
+
+  return hit && config[hit.mode] !== false ? hit : null;
+}
