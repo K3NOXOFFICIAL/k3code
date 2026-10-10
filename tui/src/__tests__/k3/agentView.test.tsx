@@ -14,6 +14,7 @@ import {
 } from "../../k3/agentView.js";
 import { $stripSessions } from "../../k3/agentStripStore.js";
 import {
+  buildViewRows,
   IDLE_VIEW_NAV,
   type ViewNav,
   type ViewRow,
@@ -152,6 +153,31 @@ describe("AgentViewView", () => {
 
     expect(order.every((i) => i >= 0)).toBe(true);
     expect(order).toEqual([...order].sort((a, b) => a - b));
+  });
+
+  it("times this session's working turn from turn_started_at, not from the session's creation", () => {
+    // The reported bug: a session created ~23h ago read "working 1370m 20s" five minutes into the app.
+    const nowMs = Date.now();
+    const rows = buildViewRows({
+      currentSid: "cur",
+      nowMs,
+      past: [],
+      sessions: [
+        {
+          current: true,
+          id: "cur",
+          started_at: nowMs / 1000 - 1370 * 60,
+          status: "working",
+          title: "Session",
+          turn_started_at: nowMs / 1000 - 20,
+        },
+      ],
+      subagents: [],
+    });
+    const out = dump(rows);
+
+    expect(out).toMatch(/◐ Session \(this session\)\s+working 20s/);
+    expect(out).not.toContain("1370m");
   });
 
   it("omits headers of empty groups", () => {

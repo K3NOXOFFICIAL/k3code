@@ -165,6 +165,42 @@ describe("buildStripRows", () => {
   it("maps failed sub-agents", () => {
     expect(buildStripRows([sub("failed")], [], 5000)[0]!.state).toBe("failed");
   });
+
+  it("times a session row from its turn start, and shows no time between turns", () => {
+    const nowMs = 2_000_000_000_000;
+    const dayAgo = nowMs / 1000 - 86_400; // started_at: when the stored session was created
+    const rows = buildStripRows(
+      [],
+      [
+        {
+          id: "w",
+          started_at: dayAgo,
+          status: "working",
+          title: "busy",
+          turn_started_at: nowMs / 1000 - 42,
+        },
+        {
+          id: "d",
+          started_at: dayAgo,
+          status: "completed",
+          title: "resumed",
+          turn_started_at: null,
+        },
+      ],
+      nowMs,
+    );
+
+    expect(rows.map((r) => [r.id, r.elapsedSeconds])).toEqual([
+      ["w", 42],
+      ["d", null],
+    ]);
+
+    const out = dump(rows);
+
+    expect(out).toContain("busy 42s · working");
+    expect(out).toMatch(/resumed · completed/);
+    expect(out).not.toContain("1440m");
+  });
 });
 
 describe("buildStripRows: sub-agent session rows", () => {

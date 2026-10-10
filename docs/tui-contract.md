@@ -26,7 +26,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 |--------|--------|--------|-------------|-------|
 | `session.create` | `{profile?, cwd?, model?, goal?, tools?, compact?}` | `{session_id, info: SessionLiveInfo}` | ✅ | New chat session |
 | `session.list` | `{limit?, offset?, include_hidden?, cwd?}` | `{sessions: SessionListItem[]}` | ✅ | Session picker/history; `cwd` keeps that project's non-empty, non-automation sessions (limit applied after) |
-| `session.active_list` | `{current_session_id?}` | `{sessions: ActiveSession[]}` | ✅ | Agent strip / switcher; a live session's row carries `offline_protection` (false when its NetWatch failed to start: no offline pause/resume) |
+| `session.active_list` | `{current_session_id?}` | `{sessions: ActiveSession[]}` | ✅ | Agent strip / switcher; a live session's row carries `offline_protection` (false when its NetWatch failed to start: no offline pause/resume), `started_at` (when the stored session was created: age and sorting only) and `turn_started_at` (epoch s the turn in flight started, also while paused or waiting on an approval; `null` between turns): the "working N" time counts from `turn_started_at`, and a row without one shows no time |
 | `session.resume` | `{session_id, compact?}` | `{session_id, info: SessionLiveInfo}` | ✅ | Resume stored session |
 | `session.activate` | `{session_id}` | `{session_id, info: SessionLiveInfo}` | ✅ | Switch active session |
 | `session.delete` | `{session_id}` | `{deleted: boolean}` | ✅ | Delete session |

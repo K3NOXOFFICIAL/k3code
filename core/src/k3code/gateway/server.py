@@ -190,6 +190,8 @@ class LiveSession:
         self.announced_tools: set[str] = set()
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
+        #: Wall-clock start of the latest turn or job (time.time()); the agent view's "working N" counts from it.
+        self.turn_started_wall = 0.0
         self.reasoning_effort: str | None = stored.meta.get("reasoning_effort")  # /effort
         self.todos: list[dict[str, Any]] = []
         self.todo_revision = 0
@@ -1078,7 +1080,10 @@ class GatewayServer:
                     "model": s.stored.model,
                     "preview": (s.stored.title or "")[:120],
                     "session_key": s.session_id,
-                    "started_at": s.stored.created_at,
+                    "started_at": s.stored.created_at,  # when the stored session was created: age and sorting only
+                    # Elapsed time of the turn in flight (also while paused or waiting on an approval); None between
+                    # turns, so a resumed or finished session shows no time rather than its age since creation.
+                    "turn_started_at": s.turn_started_wall if s.streaming else None,
                     "status": s.state,
                     "state": s.state,
                     "paused": s.paused,
@@ -1778,6 +1783,7 @@ class GatewayServer:
         session.emit("message.start", {})
         session.emit("status.update", {"kind": "status", "text": "thinking", "state": "working"})
         session.streaming = True
+        session.turn_started_wall = time.time()
         session.current_kind = kind.value
         prompt_blocked = False
         try:
@@ -2550,6 +2556,7 @@ class GatewayServer:
             session.needs_input = False
             session.run_result = None  # an earlier turn's outcome must not survive into this job's events
             session.streaming = True
+            session.turn_started_wall = time.time()
             session.emit("message.start", {})
             session.emit("status.update", {"kind": "status", "text": label, "state": "working"})
             status, text = "done", ""
