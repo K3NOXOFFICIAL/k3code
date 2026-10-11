@@ -3951,6 +3951,15 @@ async def _session_status(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"output": render_text(build_settings_view(server, session.session_id if session else None))}
 
 
+async def _settings_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """``settings.get``: the structured /settings view (plus its text) for the interactive settings panel."""
+    from k3code.commands.settings_cmd import build_settings_view, render_text
+
+    session = server._session_for(params.get("session_id"))
+    view = build_settings_view(server, session.session_id if session else None)
+    return {"settings": view, "output": render_text(view)}
+
+
 async def _session_save(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """/save: write the session's transcript as JSON into its working directory."""
     session = server._session_for(params.get("session_id"))
@@ -4119,6 +4128,7 @@ _HANDLERS: dict[str, Any] = {
     "complete.path": _complete_path,
     "model.options": _model_options,
     "tune.get": _tune_get,
+    "settings.get": _settings_get,
     "tune.set": _tune_set,
     "model.save_key": _model_save_key,
     "model.disconnect": _model_disconnect,

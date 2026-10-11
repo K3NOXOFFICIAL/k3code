@@ -1,5 +1,5 @@
 import type { SlashExecResponse } from "../../../gatewayTypes.js";
-import { openTunePicker } from "../../overlayStore.js";
+import { openSettingsPanel, openTunePicker } from "../../overlayStore.js";
 import type { SlashCommand, SlashRunCtx } from "../types.js";
 
 /**
@@ -32,6 +32,34 @@ function runOnGateway(name: string, arg: string, ctx: SlashRunCtx) {
 // `/ultracode [on|off|status]`, `/ultraplan` and `/ultraresearch` are deliberately NOT here: the gateway owns them,
 // and the generic slash path sends them there untouched.
 export const tuneCommands: SlashCommand[] = [
+  {
+    help: "interactive settings panel (arrows to move/change, / to search, Tab for status)",
+    name: "settings",
+    usage: "/settings [status]",
+    run: (arg, ctx) => {
+      if (arg.trim() === "status" || arg.trim() === "text") {
+        return ctx.gateway.gw
+          .request<SlashExecResponse>("slash.exec", {
+            command: "settings",
+            session_id: ctx.sid,
+          })
+          .then((r) => {
+            if (!ctx.stale()) {
+              ctx.transcript.page(
+                r?.output || "/settings: no output",
+                "Settings",
+              );
+            }
+          })
+          .catch(ctx.guardedErr);
+      }
+
+      if (!openSettingsPanel()) {
+        ctx.transcript.sys("finish the pending prompt first");
+      }
+    },
+  },
+
   {
     help: "set model, effort and ultracode together (popup, or /tune [model] [effort] [ultracode [on|off]] [--global])",
     name: "tune",
