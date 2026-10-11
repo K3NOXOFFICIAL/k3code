@@ -207,7 +207,9 @@ export const MessageLine = memo(function MessageLine({
     );
   }
 
-  const { body, glyph, prefix } = ROLE[msg.role](t);
+  const { body, fill, glyph, prefix } = ROLE[msg.role](t);
+  // Only real prompts get the fill; slash echoes and other kinded rows stay plain.
+  const rowFill = msg.role === "user" && !msg.kind ? fill : undefined;
   const gutterWidth = transcriptGutterWidth(msg.role, t.brand.prompt);
 
   const showDetails =
@@ -379,7 +381,7 @@ export const MessageLine = memo(function MessageLine({
         </Box>
       )}
 
-      <Box>
+      <Box {...(rowFill ? { backgroundColor: rowFill } : {})}>
         <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
           <Text bold={msg.role === "user"} color={prefix}>
             {glyph}{" "}

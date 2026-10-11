@@ -30,6 +30,10 @@ export interface ThemeColors {
   tool: string;
   /** Reasoning/thinking body text. Defaults to `muted`. */
   thinking: string;
+  /** Fill behind the user's own prompts in the transcript. Defaults to the panel surface. */
+  userBg: string;
+  /** Collapsed tool-call one-liners. Defaults to `muted`. */
+  toolDim: string;
 
   /** Code-block syntax highlight. Default to accent/text/border/muted. */
   syntaxString: string;
@@ -111,6 +115,7 @@ const ANSI_MUTED_FOREGROUNDS: readonly (keyof ThemeColors)[] = [
   "sessionLabel",
   "sessionBorder",
   "thinking",
+  "toolDim",
 ];
 
 function xtermEightBitRgb(colorNumber: number): [number, number, number] {
@@ -391,6 +396,8 @@ export function buildPalette(seeds: ThemeSeeds, isLight: boolean): ThemeColors {
     // parents (tool marker → accent, reasoning body → muted).
     tool: seeds.accent,
     thinking: muted,
+    userBg: surface,
+    toolDim: muted,
 
     // Code-syntax tokens default to brand tokens (unchanged highlighting)
     // but are independently skinnable.
@@ -531,6 +538,7 @@ const DISPLAY_FOREGROUNDS: readonly (keyof ThemeColors)[] = [
   "statusFg",
   "border",
   "muted",
+  "toolDim",
   "sessionLabel",
   "sessionBorder",
   "shellDollar",
@@ -547,6 +555,7 @@ const SEMANTIC_FOREGROUNDS: readonly (keyof ThemeColors)[] = [
 ];
 
 const ADAPTIVE_BACKGROUNDS: readonly (keyof ThemeColors)[] = [
+  "userBg",
   "completionBg",
   "completionCurrentBg",
   "completionMetaBg",
@@ -1017,6 +1026,8 @@ export function fromSkin(
     label: c("ui_label") ?? derived.label,
     completionBg: surface,
     completionCurrentBg: activeRow,
+    userBg: c("user_message_bg") ?? surface,
+    toolDim: c("tool_dim") ?? c("banner_dim") ?? derived.toolDim,
     completionMetaBg: c("completion_menu_meta_bg") ?? surface,
     completionMetaCurrentBg: c("completion_menu_meta_current_bg") ?? activeRow,
     sessionLabel: c("session_label") ?? c("banner_dim") ?? derived.sessionLabel,

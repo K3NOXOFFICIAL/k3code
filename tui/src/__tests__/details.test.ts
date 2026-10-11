@@ -79,11 +79,18 @@ describe("sectionMode", () => {
     expect(sectionMode("subagents", "hidden", {})).toBe("hidden");
   });
 
-  it("streams thinking + tools expanded by default for persisted config values", () => {
+  it("streams thinking expanded but collapses tool calls by default", () => {
     expect(sectionMode("thinking", "collapsed", {})).toBe("expanded");
     expect(sectionMode("thinking", "hidden", undefined)).toBe("expanded");
-    expect(sectionMode("tools", "collapsed", {})).toBe("expanded");
-    expect(sectionMode("tools", "hidden", undefined)).toBe("expanded");
+    expect(sectionMode("tools", "expanded", {})).toBe("collapsed");
+    expect(sectionMode("tools", "hidden", undefined)).toBe("collapsed");
+  });
+
+  it("still expands tools on explicit request", () => {
+    expect(sectionMode("tools", "expanded", {}, true)).toBe("expanded");
+    expect(sectionMode("tools", "collapsed", { tools: "expanded" })).toBe(
+      "expanded",
+    );
   });
 
   it("hides the activity panel by default for persisted config values", () => {

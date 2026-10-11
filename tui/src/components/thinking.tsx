@@ -775,7 +775,27 @@ interface Group {
   details: DetailRow[];
   key: string;
   label: string;
+  /** Collapsed tools panels still show in-flight and failed calls as one-liners. */
+  failed?: boolean;
+  running?: boolean;
 }
+
+/** "Glob ×2, Read, Bash" — the collapsed tools header's at-a-glance summary. */
+export const toolNamesSummary = (groups: readonly { label: string }[]) => {
+  const counts = new Map<string, number>();
+
+  for (const { label } of groups) {
+    const bare = label.replace(/^[^\p{L}\p{N}]+/u, "");
+    const name = bare.split(/[(\s:]/, 1)[0] || bare || label;
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+
+  const parts = [...counts].map(([name, n]) => (n > 1 ? `${name} ×${n}` : name));
+
+  return parts.length > 4
+    ? `${parts.slice(0, 4).join(", ")}, +${parts.length - 4}`
+    : parts.join(", ");
+};
 
 export const ToolTrail = memo(function ToolTrail({
   busy = false,
@@ -948,14 +968,25 @@ export const ToolTrail = memo(function ToolTrail({
   const pushDetail = (row: DetailRow) =>
     (groups.at(-1)?.details ?? meta).push(row);
 
+  // The same finished call can reach the trail twice (live shelf flush plus
+  // the turn's final segment); an identical result line, duration included,
+  // is the same call — render it once.
+  const seenResults = new Set<string>();
+
   for (const [i, line] of trail.entries()) {
     const parsed = parseToolTrailResultLine(line);
 
     if (parsed) {
+      if (seenResults.has(line)) {
+        continue;
+      }
+
+      seenResults.add(line);
       groups.push({
         color: parsed.mark === "✗" ? t.color.error : t.color.text,
         content: parsed.call,
         details: [],
+        failed: parsed.mark === "✗",
         key: `tr-${i}`,
         label: parsed.call,
       });
@@ -988,6 +1019,7 @@ export const ToolTrail = memo(function ToolTrail({
         ],
         key: `tr-${i}`,
         label,
+        running: true,
       });
 
       continue;
@@ -1028,6 +1060,7 @@ export const ToolTrail = memo(function ToolTrail({
       color: t.color.text,
       key: tool.id,
       label,
+      running: true,
       details: tool.verboseArgs
         ? [
             {
@@ -1067,6 +1100,8 @@ export const ToolTrail = memo(function ToolTrail({
   // ── Derived ────────────────────────────────────────────────────
 
   const hasTools = groups.length > 0;
+  // Collapsed tools panel: header only, plus in-flight calls as bare one-liners.
+  const shownGroups = openTools ? groups : groups.filter((g) => g.running || g.failed);
   const hasSubagents = subagents.length > 0;
   const hasMeta = meta.length > 0;
   const hasThinking = !!cot || reasoningActive || reasoningStreaming;
@@ -1266,18 +1301,26 @@ export const ToolTrail = memo(function ToolTrail({
             }
           }}
           open={openTools}
-          suffix={toolTokensLabel}
+          suffix={
+            openTools
+              ? toolTokensLabel
+              : [toolNamesSummary(groups), toolTokensLabel]
+                  .filter(Boolean)
+                  .join(" · ") || undefined
+          }
           t={t}
           title="Tool calls"
         />
       ),
       key: "tools",
-      open: openTools,
+      // Collapsed still shows what is running right now as one-liners, so a
+      // long call is visibly alive; finished calls fold into the header.
+      open: openTools || shownGroups.length > 0,
       render: (rails) => (
         <Box flexDirection="column">
-          {groups.map((group, index) => {
+          {shownGroups.map((group, index) => {
             const branch: TreeBranch =
-              index === groups.length - 1 ? "last" : "mid";
+              index === shownGroups.length - 1 ? "last" : "mid";
             const childRails = nextTreeRails(rails, branch);
             const hasInlineSubagents = inlineDelegateKey === group.key;
             // Surface the /agents tree hint the moment a delegate group appears —
@@ -1304,7 +1347,7 @@ export const ToolTrail = memo(function ToolTrail({
                   rails={rails}
                   t={t}
                 />
-                {group.details.map((detail, detailIndex) => (
+                {(openTools ? group.details : []).map((detail, detailIndex) => (
                   <Detail
                     {...detail}
                     branch={

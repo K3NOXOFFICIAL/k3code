@@ -12,9 +12,12 @@ export const SECTION_NAMES = [
 // Out-of-the-box per-section defaults — applied when the user hasn't pinned
 // an explicit override and layered ABOVE the global details_mode:
 //
-//   - thinking / tools: expanded — stream open so the turn reads like a
-//     live transcript (reasoning + tool calls side by side) instead of a
-//     wall of chevrons the user has to click every turn.
+//   - thinking: expanded — reasoning streams open so the turn reads like a
+//     live transcript.
+//   - tools: collapsed — each call is a one-line summary (name, args,
+//     duration, result count); result bodies stay behind the chevron so
+//     long Glob/Grep/Read output never floods the transcript.  Expand with
+//     the details key or `/details tools expanded`.
 //   - activity: hidden — ambient meta (gateway hints, terminal-parity
 //     nudges, background notifications) is noise for typical use.  Tool
 //     failures still render inline on the failing tool row, and ambient
@@ -27,7 +30,7 @@ export const SECTION_NAMES = [
 // or at runtime via `/details <name> collapsed|hidden`.
 const SECTION_DEFAULTS: SectionVisibility = {
   thinking: "expanded",
-  tools: "expanded",
+  tools: "collapsed",
   activity: "hidden",
 };
 
@@ -72,7 +75,7 @@ export const resolveSections = (raw: unknown): SectionVisibility =>
 //
 // The `commandOverride` flag is set for in-session `/details <mode>` changes.
 // That command should immediately apply to every section, including sections
-// with built-in defaults like thinking/tools=expanded and activity=hidden. On
+// with built-in defaults like thinking=expanded, tools=collapsed and activity=hidden. On
 // startup/config sync we keep those defaults layered above the persisted global
 // config so the TUI still opens live reasoning/tools by default unless the user
 // pins explicit per-section overrides.
