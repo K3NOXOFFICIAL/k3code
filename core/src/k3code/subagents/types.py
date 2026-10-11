@@ -29,22 +29,42 @@ class AgentType:
     source: str = "builtin"
 
 
+def _unquote(value: str) -> str:
+    return value.strip().strip("'\"").strip()
+
+
 def parse_agent_md(text: str, default_name: str = "", source: str = "") -> AgentType | None:
-    """Parse ``---`` frontmatter (flat ``key: value``) plus the markdown body."""
+    """Parse ``---`` frontmatter (flat ``key: value``, and ``- item`` lines under a key) plus the markdown body.
+
+    None (with a warning) for a file that cannot be trusted to say what the agent may do: frontmatter that is never
+    closed, or a ``tools:`` key that names no tool. An agent's ``tools`` empty means ALL tools, so a read-only agent
+    whose list was written as YAML lines (``  - read``) or lost to a typo must not come out with every tool."""
     meta: dict[str, str] = {}
+    items: dict[str, list[str]] = {}
     body = text
-    if text.startswith("---"):
-        parts = text.split("\n---", 1)
-        if len(parts) == 2:
-            for line in parts[0].splitlines()[1:]:
-                if ":" in line:
-                    k, _, v = line.partition(":")
-                    meta[k.strip().lower()] = v.strip().strip("'\"")
-            body = parts[1].lstrip("-").lstrip("\n")
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "---":
+        end = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+        if end is None:
+            logger.warning("agent %s: frontmatter has no closing '---'; skipped", default_name or source)
+            return None
+        key = ""
+        for line in lines[1:end]:
+            if line.lstrip().startswith("- ") and key:
+                items.setdefault(key, []).append(_unquote(line.lstrip()[2:]))
+            elif ":" in line:
+                k, _, v = line.partition(":")
+                key = k.strip().lower()
+                meta[key] = v.strip().strip("'\"")
+        body = "\n".join(lines[end + 1 :])
     name = meta.get("name") or default_name
     if not name:
         return None
-    tools = [t.strip() for t in meta.get("tools", "").strip("[]").split(",") if t.strip()]
+    tools = [t for t in (_unquote(t) for t in meta.get("tools", "").strip("[]").split(",")) if t]
+    tools += [t for t in items.get("tools", []) if t]
+    if "tools" in meta and not tools:
+        logger.warning("agent %s: 'tools:' names no tool (an agent without the key gets all of them); skipped", name)
+        return None
     tier = meta.get("tier", "")
     if tier and tier not in VALID_TIERS:
         logger.warning("agent %s: unknown tier %r ignored", name, tier)

@@ -21,6 +21,9 @@ import yaml
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "target", "dist", "build", "__pycache__", ".k3code"}
 MAX_WORKSPACE_DIRS = 64
+#: First-level subdirectories that may hold a stack of their own in a folder that is no project itself (no ``.git``, no
+#: marker file at its root): ``~/code`` with 120 projects produced a stack, and proposals, for every one of them.
+MAX_FIRST_LEVEL_DIRS = 8
 #: Directory reads one scan may spend expanding all of a project's workspace globs, and how deep a ``**`` descends:
 #: ``packages/**`` in a very large monorepo used to walk the whole tree before the first 64 entries were kept.
 MAX_WORKSPACE_VISITS = 2000
@@ -390,14 +393,25 @@ def _glob_dirs(root: Path, pattern: str, budget: list[int]) -> list[Path]:
     return found
 
 
+def _has_marker(d: Path, names: set[str] | None = None) -> bool:
+    names = _names(d) if names is None else names
+    return any(_matches(d, names, m) for m in MARKERS)
+
+
 def _scan_dirs(root: Path, names: set[str]) -> list[str]:
-    """Relative directories to scan: ".", first-level subdirectories, workspace members (inside the root only)."""
+    """Relative directories to scan: ".", first-level subdirectories, workspace members (inside the root only).
+
+    A root that is a project (a ``.git`` or a marker file in it) offers every first-level directory. A plain folder
+    offers the first MAX_FIRST_LEVEL_DIRS that hold a marker."""
     dirs = {"."}
-    for n in names:
+    plain = ".git" not in names and not _has_marker(root, names)
+    for n in sorted(names):
         if n.startswith(".") or n in SKIP_DIRS:
             continue
-        if (root / n).is_dir() and not (root / n).is_symlink():
+        if (root / n).is_dir() and not (root / n).is_symlink() and (not plain or _has_marker(root / n)):
             dirs.add(n)
+            if plain and len(dirs) > MAX_FIRST_LEVEL_DIRS:  # "." is one of them
+                break
     resolved_root = root.resolve()
     extra: set[str] = set()
     budget = [MAX_WORKSPACE_VISITS]

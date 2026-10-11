@@ -11,6 +11,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +20,12 @@ from k3code.providers.types import Message, ToolSpec
 from k3code.routing.tiers import TaskKind, Tier, TierRouters, next_tier, tier_for
 
 logger = logging.getLogger(__name__)
+
+#: (provider, model) of the router attempts of the call in flight in this context, newest last. ``_once`` installs a
+#: fresh list around its router call and the gateway's router-event callback appends to it, so a call is priced by
+#: what served IT: the one global "last attempt" belongs to whichever call attempted last, and a title on the cheap
+#: tier was recorded (and priced) as the strong model another call had just used.
+attempt_holder: ContextVar[list[tuple[str, str]] | None] = ContextVar("attempt_holder", default=None)
 
 
 @dataclass
@@ -109,6 +116,15 @@ class ModelCaller:
                 },
             )
 
+    def _served(self, attempts: list[tuple[str, str]], usage: Any) -> tuple[str, str]:
+        """(provider, model) that answered THIS call: its own last router attempt, else the model the router tagged on
+        its usage. The global last attempt is the last resort (a router that reports nothing)."""
+        if attempts:
+            return attempts[-1]
+        if usage is not None and usage.model:
+            return "", usage.model
+        return self._last_attempt() if self._last_attempt else ("", "")
+
     async def _once(
         self,
         routers: TierRouters,
@@ -124,10 +140,15 @@ class ModelCaller:
         router = router if router is not None else routers.get(tier)
         coro = router.complete(messages, tools, max_tokens=max_tokens)
         started = time.monotonic()
-        final = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        attempts: list[tuple[str, str]] = []
+        token = attempt_holder.set(attempts)
+        try:
+            final = await (asyncio.wait_for(coro, timeout) if timeout else coro)
+        finally:
+            attempt_holder.reset(token)
         seconds = time.monotonic() - started
         usage = final.usage
-        provider, model = self._last_attempt() if self._last_attempt else ("", "")
+        provider, model = self._served(attempts, usage)
         pt, ct = (usage.prompt_tokens, usage.completion_tokens) if usage else (0, 0)
         if self.usage is not None:
             self.usage.record(

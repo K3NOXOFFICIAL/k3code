@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.learning.decisions import project_id
+from k3code.learning.fsutil import write_text_atomic
 from k3code.paths import home as k3code_home
 from k3code.redact import REDACTED, scrub_text
 
@@ -65,7 +66,7 @@ def auto_gotchas_path(pid: str, home: Path | None = None) -> Path:
 
 def _entries(path: Path) -> list[str]:
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8", errors="replace")  # read every turn for the prompt: never raise
     except OSError:
         return []
     return [ln.strip() for ln in text.splitlines() if ln.strip().startswith("- ")]
@@ -75,8 +76,7 @@ def append_gotcha(path: Path, line: str) -> None:
     """Add ``- line`` to ``path``, keeping the newest MAX_LINES entries."""
     entry = "- " + " ".join(scrub_text(line).split())
     entries = [e for e in _entries(path) if e != entry] + [entry]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(entries[-MAX_LINES:]) + "\n", encoding="utf-8")
+    write_text_atomic(path, "\n".join(entries[-MAX_LINES:]) + "\n")
 
 
 def gotchas_prompt(cwd: str | Path, home: Path | None = None) -> str:

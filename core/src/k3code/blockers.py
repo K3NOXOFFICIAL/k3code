@@ -7,6 +7,7 @@ this table; nothing here needs them.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import time
 from pathlib import Path
@@ -25,6 +26,10 @@ CREATE TABLE IF NOT EXISTS blockers (
     delivered_at REAL
 )
 """
+#: ``pending()`` reads only the rows nobody took, and a daemon that runs for months piles up the others.
+_PENDING_INDEX = "CREATE INDEX IF NOT EXISTS blockers_pending ON blockers(id) WHERE delivered_at IS NULL"
+#: Delivered blockers older than this are deleted when the store is opened.
+RETAIN_DELIVERED_DAYS = 30
 
 
 class BlockerStore:
@@ -34,7 +39,19 @@ class BlockerStore:
         self._db = sqlstore.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.execute(_SCHEMA)
+        self._db.execute(_PENDING_INDEX)
         self._db.commit()
+        with contextlib.suppress(sqlite3.Error):  # another process holds the write lock: the next open prunes
+            self.prune()
+
+    def prune(self, max_age_days: float = RETAIN_DELIVERED_DAYS, now: float | None = None) -> int:
+        """Delete delivered blockers older than ``max_age_days``; returns how many. Pending ones are never deleted."""
+        cutoff = (time.time() if now is None else now) - max_age_days * 86400
+        with self._db:
+            cur = self._db.execute(
+                "DELETE FROM blockers WHERE delivered_at IS NOT NULL AND delivered_at < ?", (cutoff,)
+            )
+        return cur.rowcount
 
     def add(self, *, session_id: str, kind: str, text: str, level: str = "warning", now: float | None = None) -> int:
         cur = self._db.execute(

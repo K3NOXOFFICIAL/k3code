@@ -34,6 +34,9 @@ DEFAULT_GATE_MAX_RETRIES = 20
 #: goal pauses at once instead of spending ``DEFAULT_GATE_MAX_RETRIES`` turns on "fix the check". A timeout is -1.
 GATE_COULD_NOT_RUN = -2
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
+#: Turns in a row that ended without any text before a goal pauses: the judge is not asked about an empty reply, so
+#: nothing else would ever stop a model that answers with nothing (40+ full turns, no judge call, no failure counted).
+MAX_CONSECUTIVE_EMPTY = 3
 #: Automatic kicks (boot resume, watchdog): this many within KICK_WINDOW_S, the next one parks the goal instead.
 MAX_KICKS_PER_WINDOW = 3
 KICK_WINDOW_S = 3600.0
@@ -149,6 +152,7 @@ class GoalState:
     paused_reason: str | None = None
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
+    consecutive_empty_replies: int = 0
     gates: list[GoalGate] = field(default_factory=list)
     #: Wall-clock times of automatic kicks (see GatewayServer.kick_goal); pruned to KICK_WINDOW_S.
     kick_times: list[float] = field(default_factory=list)
@@ -335,7 +339,7 @@ class GoalManager:
         if s is None or s.status == "cleared":
             return None
         s.status, s.paused_reason = "active", None
-        s.consecutive_parse_failures = s.consecutive_transport_failures = 0
+        s.consecutive_parse_failures = s.consecutive_transport_failures = s.consecutive_empty_replies = 0
         if reset_budget:
             s.turns_used = 0
         for g in s.gates:
@@ -405,6 +409,7 @@ class GoalManager:
         s.last_verdict, s.last_reason = verdict, reason
         s.consecutive_parse_failures = s.consecutive_parse_failures + 1 if parse_failed else 0
         s.consecutive_transport_failures = s.consecutive_transport_failures + 1 if transport_failed else 0
+        s.consecutive_empty_replies = 0 if last_response.strip() else s.consecutive_empty_replies + 1
 
         if verdict == "blocked":
             return self._pause_decision(
@@ -468,9 +473,11 @@ class GoalManager:
                 blocking, issues = await reviewer(s.goal)
                 if (gone := self._superseded(s)) is not None:
                     return gone
-                if blocking and issues and not s.budget_spent():
+                if blocking and issues:
                     s.last_verdict = "advisor_blocked"
                     s.last_reason = "advisor: " + "; ".join(issues)[:300]
+                    if s.budget_spent():  # the veto stands: the goal is not done, and there is no turn left to fix it
+                        return self._budget_pause(s, "advisor_blocked", s.last_reason)
                     self._save(s)
                     listed = "\n".join(f"- {i}" for i in issues)
                     prompt = (
@@ -499,6 +506,15 @@ class GoalManager:
                 "continue",
                 reason,
                 f"⏸ Goal paused — the judge model returned errors {n} turns in a row (check goal.judge_model).",
+            )
+        if s.consecutive_empty_replies >= MAX_CONSECUTIVE_EMPTY:
+            n = s.consecutive_empty_replies
+            return self._pause_decision(
+                s,
+                f"the agent replied with no text {n} turns in a row",
+                "continue",
+                reason,
+                f"⏸ Goal paused — the last {n} turns ended without any text. /goal resume tries again.",
             )
         if s.consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
             n = s.consecutive_parse_failures

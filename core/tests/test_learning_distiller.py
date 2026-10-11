@@ -79,7 +79,8 @@ async def test_cheap_tier_polish_and_fallback(tmp_path):
     caller = FakeCaller(json.dumps([{"key": "avoid:m-x:review", "text": "Do not use m-x for reviews"}]))
     prefs = await distiller.distill(log, home=tmp_path, user_md=tmp_path / "U.md", caller=caller)
     assert any(p.text == "Do not use m-x for reviews" for p in prefs)
-    bad = await distiller.distill(log, home=tmp_path, user_md=tmp_path / "U2.md", caller=FakeCaller("garbage"))
+    # another home: this one's first pass is cached and would answer without asking the (garbage) model again
+    bad = await distiller.distill(log, home=tmp_path / "b", user_md=tmp_path / "U2.md", caller=FakeCaller("garbage"))
     assert any(p.text == "avoids model m-x for review tasks" for p in bad)
 
 

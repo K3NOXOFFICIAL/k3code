@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import subprocess
@@ -13,8 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from k3code import sqlstore
+from k3code.learning.fsutil import encodable
 from k3code.paths import ensure_private_dir
 from k3code.redact import scrub_text
+
+logger = logging.getLogger(__name__)
 
 KINDS = (
     "approval",
@@ -56,7 +60,7 @@ def scrub(text: str) -> str:
 
 def _scrub_obj(o: Any) -> Any:
     if isinstance(o, str):
-        return scrub_text(o)
+        return encodable(scrub_text(o))  # sqlite refuses a lone surrogate (a non-UTF-8 file name), and the row is lost
     if isinstance(o, dict):
         return {k: _scrub_obj(v) for k, v in o.items()}
     if isinstance(o, list):
@@ -72,20 +76,76 @@ def project_id(cwd: str | Path) -> str:
             ["git", "-C", str(p), "config", "--get", "remote.origin.url"],
             capture_output=True,
             text=True,
+            errors="replace",  # git's message about a non-UTF-8 cwd is not UTF-8 either
             timeout=3,
             check=False,
         )
         url = out.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):
         url = ""
     if url:
         url = re.sub(r"^[a-z+]+://([^@/]+@)?", "", url)  # drop scheme + userinfo (may hold a token)
         return "git:" + url.removesuffix(".git")
-    return "path:" + hashlib.sha1(str(p.resolve()).encode()).hexdigest()[:12]
+    return "path:" + hashlib.sha1(str(p.resolve()).encode("utf-8", "surrogateescape")).hexdigest()[:12]
 
 
 #: Decisions older than this are deleted by :meth:`DecisionLog.prune` (``retention.decisions_days``).
 MAX_AGE_DAYS = 365
+
+
+def _query(
+    db: sqlite3.Connection,
+    kind: str | None,
+    *,
+    project: str | None,
+    since: float | None,
+    limit: int | None,
+    actor: str | None,
+) -> list[dict[str, Any]]:
+    sql, args = "SELECT * FROM decisions WHERE 1=1", []
+    if kind:
+        sql += " AND kind=?"
+        args.append(kind)
+    if project:
+        sql += " AND project=?"
+        args.append(project)
+    if since is not None:
+        sql += " AND ts>=?"
+        args.append(since)
+    if actor is not None:
+        sql += " AND actor=?"
+        args.append(actor)
+    sql += " ORDER BY ts, id"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    rows = []
+    for r in db.execute(sql, args):
+        d = dict(r)
+        d["detail"] = json.loads(d["detail"] or "{}")
+        rows.append(d)
+    return rows
+
+
+class DecisionReader:
+    """``DecisionLog.query`` on a connection of its own (see :meth:`DecisionLog.reader`); close it when done."""
+
+    def __init__(self, path: Path) -> None:
+        self._db = sqlstore.connect(path)
+        self._db.row_factory = sqlite3.Row
+
+    def query(
+        self,
+        kind: str | None = None,
+        *,
+        project: str | None = None,
+        since: float | None = None,
+        limit: int | None = None,
+        actor: str | None = "user",
+    ) -> list[dict[str, Any]]:
+        return _query(self._db, kind, project=project, since=since, limit=limit, actor=actor)
+
+    def close(self) -> None:
+        self._db.close()
 
 
 class DecisionLog:
@@ -153,11 +213,11 @@ class DecisionLog:
             (
                 self.clock() if ts is None else ts,
                 kind,
-                session,
-                cwd,
-                project if project is not None else self._project(cwd),
-                scrub_text(subject),
-                choice,
+                encodable(session),
+                encodable(cwd),
+                encodable(project if project is not None else self._project(cwd)),
+                encodable(scrub_text(subject)),
+                encodable(choice),
                 json.dumps(clean, ensure_ascii=False),
                 actor,
             ),
@@ -188,28 +248,20 @@ class DecisionLog:
         actor: str | None = "user",
     ) -> list[dict[str, Any]]:
         """Rows are filtered to ``actor`` (default ``user``; ``None`` = every actor)."""
-        sql, args = "SELECT * FROM decisions WHERE 1=1", []
-        if kind:
-            sql += " AND kind=?"
-            args.append(kind)
-        if project:
-            sql += " AND project=?"
-            args.append(project)
-        if since is not None:
-            sql += " AND ts>=?"
-            args.append(since)
-        if actor is not None:
-            sql += " AND actor=?"
-            args.append(actor)
-        sql += " ORDER BY ts, id"
-        if limit:
-            sql += f" LIMIT {int(limit)}"
-        rows = []
-        for r in self._db.execute(sql, args):
-            d = dict(r)
-            d["detail"] = json.loads(d["detail"] or "{}")
-            rows.append(d)
-        return rows
+        return _query(self._db, kind, project=project, since=since, limit=limit, actor=actor)
+
+    def mark(self, kinds: tuple[str, ...]) -> tuple[int, int]:
+        """``(rows, newest id)`` of these kinds: unchanged between two calls means nothing new was recorded."""
+        marks = ",".join("?" * len(kinds))
+        row = self._db.execute(
+            f"SELECT COUNT(*), COALESCE(MAX(id), 0) FROM decisions WHERE kind IN ({marks})", kinds
+        ).fetchone()
+        return int(row[0]), int(row[1])
+
+    def reader(self) -> DecisionReader:
+        """A read-only view on its own connection: a sqlite connection stays on the thread that opened it, so work
+        that scans the history off the event loop opens its own."""
+        return DecisionReader(self.path)
 
     def count(self, kind: str | None = None) -> int:
         if kind:
@@ -217,26 +269,32 @@ class DecisionLog:
         return int(self._db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0])
 
     def migrate_jsonl(self) -> int:
-        """Import ``decisions.jsonl`` once (renamed to ``.migrated`` afterwards). Returns rows imported."""
+        """Import ``decisions.jsonl`` once (renamed to ``.migrated`` afterwards). Returns rows imported. A line that is
+        not an object or has no usable time is skipped with a warning: one bad line must not stop the gateway."""
         src = self.home / "decisions.jsonl"
         if not src.is_file():
             return 0
         n = 0
-        for line in src.read_text(encoding="utf-8").splitlines():
+        for lineno, line in enumerate(src.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+            if not line.strip():
+                continue
             try:
                 row = json.loads(line)
-            except ValueError:
+                if not isinstance(row, dict):
+                    raise TypeError("not an object")
+                kind = "plan" if row.get("tool") == "exit_plan" else "approval"
+                self.record(
+                    kind,
+                    session=str(row.get("session") or ""),
+                    cwd=str(row.get("cwd") or ""),
+                    subject=str(row.get("pattern") or ""),
+                    choice=str(row.get("choice") or ""),
+                    detail={"tool": str(row.get("tool") or ""), "migrated": True},
+                    ts=float(row.get("ts") or 0),
+                )
+            except (ValueError, TypeError) as e:
+                logger.warning("%s line %d skipped: %s", src, lineno, e)
                 continue
-            kind = "plan" if row.get("tool") == "exit_plan" else "approval"
-            self.record(
-                kind,
-                session=row.get("session", ""),
-                cwd=row.get("cwd", ""),
-                subject=row.get("pattern", ""),
-                choice=row.get("choice", ""),
-                detail={"tool": row.get("tool", ""), "migrated": True},
-                ts=float(row.get("ts") or 0),
-            )
             n += 1
         src.rename(src.with_suffix(".jsonl.migrated"))
         return n

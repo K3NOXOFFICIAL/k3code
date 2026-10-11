@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,7 @@ from k3code.learning import (
     review,
 )
 from k3code.learning.decisions import DecisionLog, project_id
+from k3code.learning.fsutil import encodable, write_text_atomic
 from k3code.learning.updateconfig import merge_patch
 from k3code.redact import scrub_text
 
@@ -33,6 +36,30 @@ logger = logging.getLogger(__name__)
 
 DAY = 86400.0
 WEEK = 7 * DAY
+#: After a maintenance pass that failed, the next try waits this long (it used to be tried again at every turn end).
+RETRY_AFTER = 3600.0
+#: A stored time further ahead than this is a wrong clock's doing, not a pass that is not due yet.
+CLOCK_SLACK = 60.0
+#: Sessions whose last tool failure is remembered (the oldest is dropped), and what is kept of the failed call.
+MAX_FAILURES = 256
+ARG_KEEP = 256
+BASH_KEEP = 4000
+
+
+def _slim_args(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """The failed call's arguments as ``followup_hint`` needs them: it compares them with the retry's, so a long
+    value (a 100 KB ``content``) is replaced by its digest, and the retry's are reduced the same way."""
+    out: dict[str, Any] = {}
+    for k, v in args.items():
+        if tool == "bash" and k == "command":
+            out[k] = str(v)[:BASH_KEEP]
+        elif v is None or isinstance(v, (bool, int, float)):
+            out[k] = v
+        else:
+            raw = v if isinstance(v, str) else json.dumps(v, sort_keys=True, default=str)
+            digest = hashlib.sha1(raw.encode("utf-8", "replace")).hexdigest()[:16]
+            out[k] = raw if len(raw) <= ARG_KEEP else f"#{digest}"
+    return out
 
 
 class LearningHub:
@@ -47,8 +74,12 @@ class LearningHub:
         self.replays = replay.ReplayStore(self.home)
         self._state_path = self.home / "learning" / "state.json"
         self._tasks: set[asyncio.Task[Any]] = set()
-        #: (session id, tool) -> (tool_error row id, signature, the failed call's args): waits for the retry that works
-        self._last_failure: dict[tuple[str, str], tuple[int, str, dict[str, Any]]] = {}
+        #: (session id, tool) -> (tool_error row id, signature, the failed call's args, slimmed): waits for the retry
+        #: that works; the newest MAX_FAILURES only (a session's entries also go when it closes)
+        self._last_failure: OrderedDict[tuple[str, str], tuple[int, str, dict[str, Any]]] = OrderedDict()
+        self._maintaining = False
+        #: cwd -> the approval/plan rows seen by the last permission mining there
+        self._mined: dict[str, tuple[int, int]] = {}
 
     # ── config / state ──
 
@@ -62,19 +93,37 @@ class LearningHub:
 
     def _state(self) -> dict[str, Any]:
         try:
-            return json.loads(self._state_path.read_text(encoding="utf-8"))
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
+        return data if isinstance(data, dict) else {}
 
     def _set_state(self, **kv: Any) -> None:
-        st = {**self._state(), **kv}
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        self._state_path.write_text(json.dumps(st), encoding="utf-8")
+        write_text_atomic(self._state_path, json.dumps({**self._state(), **kv}))
 
     def spawn(self, coro: Any) -> None:
         task = asyncio.get_running_loop().create_task(coro)
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: asyncio.Task[Any]) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled() and (exc := task.exception()) is not None:  # nothing else would ever look at it
+            logger.warning("learning task failed", exc_info=(type(exc), exc, exc.__traceback__))
+
+    async def aclose(self, timeout: float = 5.0) -> None:
+        """Cancel the spawned tasks, wait for them, close the decision log: the gateway calls it when it closes."""
+        pending = [t for t in self._tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            await asyncio.wait(pending, timeout=timeout)
+        self.log.close()
+
+    def forget_session(self, session_id: str) -> None:
+        """A closed session will not retry anything: drop the failures it was waiting on."""
+        for key in [k for k in self._last_failure if k[0] == session_id]:
+            del self._last_failure[key]
 
     async def drain(self) -> None:
         """Wait until every spawned task has finished.
@@ -118,7 +167,7 @@ class LearningHub:
             self.spawn(self._mine_later(session))
 
     async def _mine_later(self, session: Any) -> None:
-        self.mine_permissions(session)
+        await self.mine_if_changed(session)
 
     def tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> str | None:
         """Record a failed tool call as a ``tool_error``; the next call of that tool in the session that looks like a
@@ -140,7 +189,7 @@ class LearningHub:
             pending = self._last_failure.pop(key, None)
             if pending is not None:
                 row_id, sig, failed_args = pending
-                hint = gotchas.followup_hint(call.name, failed_args, call.arguments)
+                hint = gotchas.followup_hint(call.name, failed_args, _slim_args(call.name, call.arguments))
                 if hint:
                     self.log.update_detail(row_id, followup=hint)
                     self._maybe_gotcha(session, cwd, call.name, sig)
@@ -149,18 +198,24 @@ class LearningHub:
             failure.error_class.startswith("exit ") and not str(result.get("stderr") or "").strip()
         ):
             return None  # a failing test run or `grep` without a match says nothing about the project by itself
+        # a non-UTF-8 file name decodes to a lone surrogate: made encodable here, once, it matches the logged row and
+        # reaches no card, notification or model request as text that cannot be sent
+        sig = encodable(failure.signature)
         row_id = self.log.record(
             "tool_error",
             session=session.session_id,
             cwd=cwd,
-            subject=failure.signature,
+            subject=sig,
             choice=failure.error_class,
             detail={"tool": call.name, "error": failure.first_line},
             actor="auto" if getattr(session, "background", False) else "user",
         )
-        self._last_failure[key] = (row_id, failure.signature, dict(call.arguments))
-        hint = self._maybe_gotcha(session, cwd, call.name, failure.signature)
-        return self._known_fix(cwd, call.name, failure.signature, hint)
+        self._last_failure[key] = (row_id, sig, _slim_args(call.name, call.arguments))
+        self._last_failure.move_to_end(key)
+        while len(self._last_failure) > MAX_FAILURES:
+            self._last_failure.popitem(last=False)
+        hint = encodable(self._maybe_gotcha(session, cwd, call.name, sig))
+        return self._known_fix(cwd, call.name, sig, hint)
 
     def _known_fix(self, cwd: str, tool: str, sig: str, hint: str) -> str | None:
         """The reminder for a failure with a lesson: the project's accepted gotcha line, else its auto-learned one,
@@ -246,15 +301,40 @@ class LearningHub:
         for p in proposals:
             self.server.autonomy.emit_proposal(session, p)
 
-    def mine_permissions(self, session: Any) -> list[Proposal]:
+    def _mine(self, log: Any, cwd: str) -> list[permrules.Candidate]:
         c = self.cfg
-        cands = permrules.mine(
-            self.log,
+        return permrules.mine(
+            log,
             min_approvals=int(c["perm_min_approvals"]),
             min_denials=int(c["perm_min_denials"]),
             user_projects=int(c["user_scope_projects"]),
-            cwd=str(session.perms.cwd) if session is not None else "",
+            cwd=cwd,
         )
+
+    def mine_permissions(self, session: Any) -> list[Proposal]:
+        cands = self._mine(self.log, str(session.perms.cwd) if session is not None else "")
+        made = permrules.to_proposals(cands, self.store, session.session_id if session else "")
+        if session is not None:
+            self.emit(session, made)
+        return made
+
+    def _mine_in_thread(self, cwd: str) -> list[permrules.Candidate]:
+        reader = self.log.reader()  # its own connection: the log's stays on the event loop's thread
+        try:
+            return self._mine(reader, cwd)
+        finally:
+            reader.close()
+
+    async def mine_if_changed(self, session: Any) -> list[Proposal]:
+        """``mine_permissions`` off the event loop (it scans the whole approval history: ~0.7 s at 50 000 rows), and
+        only when approvals or plan decisions were recorded since the last time here: the same history yields the
+        same candidates, which the proposal store would drop as seen."""
+        cwd = str(session.perms.cwd) if session is not None else ""
+        mark = self.log.mark(("approval", "plan"))
+        if self._mined.get(cwd) == mark:
+            return []
+        self._mined[cwd] = mark  # before the await: a second caller meanwhile has nothing new to look at
+        cands = await asyncio.to_thread(self._mine_in_thread, cwd)
         made = permrules.to_proposals(cands, self.store, session.session_id if session else "")
         if session is not None:
             self.emit(session, made)
@@ -397,8 +477,10 @@ class LearningHub:
         *,
         history_len: int = 0,
     ) -> None:
-        """Keep one finished turn's inputs and outcome for the replay harness. Never raises: it runs at turn end."""
-        if not self.enabled:
+        """Keep one finished turn's inputs and outcome for the replay harness. Never raises: it runs at turn end.
+        Only the optimizer reads the records, so nothing is kept (or built: it renders the skills and memory prompts
+        and appends to a file of up to 40 MB) while ``learning.optimizer.enabled`` is off."""
+        if not self.enabled or not self.cfg["optimizer"]["enabled"]:
             return
         try:
             from k3code.memory import memory_prompt
@@ -407,7 +489,8 @@ class LearningHub:
             cwd = session.perms.cwd
             ctx = self.server.config.context or {}
             tok_in, tok_out = self.server.usage.turn_tokens(turn_id) if turn_id else (0, 0)
-            skill_text = skills_prompt(cwd, list(self.server.config.skills.roots), limit=PROMPT_LIMIT)
+            skill_limit = int(ctx.get("skill_prompt_limit", PROMPT_LIMIT))  # the limit the system prompt is built with
+            skill_text = skills_prompt(cwd, list(self.server.config.skills.roots), limit=skill_limit)
             record = replay.build_record(
                 turn=turn_id,
                 session=session.session_id,
@@ -419,7 +502,9 @@ class LearningHub:
                 tokens_in=tok_in,
                 tokens_out=tok_out,
                 memory_chars=len(memory_prompt(cwd, limit=int(ctx.get("memory_chars", 20_000)))),
-                skill_lines=[len(line) for line in skill_text.splitlines() if line.startswith("- ")],
+                skill_lines=[
+                    len(ln) for ln in skill_text.splitlines() if ln.startswith("- ") and not ln.startswith("- …")
+                ],
                 ts=self.clock(),
             )
             self.replays.append(record)
@@ -429,7 +514,7 @@ class LearningHub:
     async def turn_finished(self, session: Any, status: str) -> None:
         if not self.enabled:
             return
-        self.mine_permissions(session)
+        await self.mine_if_changed(session)
         msgs = session.stored.messages
         turns = review.user_turns(msgs)
         meta = session.stored.meta
@@ -461,13 +546,37 @@ class LearningHub:
             emit("notification.show", {"text": text, "level": "info", "kind": "ttl", "ttl_ms": 15000})
 
     async def maintenance(self, session: Any = None, *, force: bool = False) -> dict[str, Any]:
-        """Daily distill + curate, weekly optimizer (opt-in). Cheap tier; safe to call often."""
+        """Daily distill + curate, weekly optimizer (opt-in). Cheap tier; safe to call often.
+
+        One pass at a time (two sessions ending together each made the model calls), the attempt is stamped before the
+        work and a failed one is not tried again for RETRY_AFTER (it was, at every turn end, calling the model each
+        time), and a stored time in the future (a clock that was wrong) counts as never."""
+        if self._maintaining:
+            return {"skipped": "a pass is already running"}
+        self._maintaining = True
+        try:
+            return await self._maintenance(session, force)
+        finally:
+            self._maintaining = False
+
+    def _due(self, st: dict[str, Any], key: str, every: float, now: float, force: bool) -> bool:
+        def seen(name: str) -> float:
+            try:
+                t = float(st.get(name) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+            return 0.0 if t > now + CLOCK_SLACK else t
+
+        return force or (now - seen(key) > every and now - seen(f"{key}_attempted") > RETRY_AFTER)
+
+    async def _maintenance(self, session: Any, force: bool) -> dict[str, Any]:
         now = self.clock()
         st = self._state()
         done: dict[str, Any] = {}
-        if force or now - st.get("distilled", 0) > DAY:
+        if self._due(st, "distilled", DAY, now, force):
             from k3code.memory import user_memory_path
 
+            self._set_state(distilled_attempted=now)
             prefs = await distiller.distill(
                 self.log,
                 home=self.home,
@@ -483,7 +592,8 @@ class LearningHub:
             if session is not None:
                 self.emit(session, r["proposals"])
             self._set_state(distilled=now)
-        if (force or now - st.get("optimized", 0) > WEEK) and self.cfg["optimizer"]["enabled"]:
+        if self.cfg["optimizer"]["enabled"] and self._due(st, "optimized", WEEK, now, force):
+            self._set_state(optimized_attempted=now)
             done["optimizer"] = len(await self.run_optimizer(session))
             self._set_state(optimized=now)
         return done
@@ -497,7 +607,10 @@ class LearningHub:
         # applied, as an experiment that rolls back through the live config when it turns out worse; the rest wait
         # for a human to accept them.
         context = dict(self.server.config.context or {})
-        cands = await replay.token_candidates(context, self.replays.load())
+        # off the event loop: the replay is CPU work (a 40 MB file to read, seconds of fake-provider requests) and the
+        # worker thread has a loop of its own; only the newest turns are read and replayed
+        turns = await asyncio.to_thread(self.replays.load, replay.MAX_REPLAY_TURNS)
+        cands = await asyncio.to_thread(lambda: asyncio.run(replay.token_candidates(context, turns)))
         # a candidate the A/B window already judged worse and rolled back is never auto-applied again: it goes to
         # the proposal store, whose dedup key latches it for the human path
         for c in cands:

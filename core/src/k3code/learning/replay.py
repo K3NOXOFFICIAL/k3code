@@ -23,6 +23,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from k3code.learning.fsutil import write_text_atomic
 from k3code.providers.fake import FakeProvider
 from k3code.providers.types import Message
 from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_for_model
@@ -32,6 +33,9 @@ RECORD_PARTS = ("learning", "replay", "turns.jsonl")
 MAX_RECORD_CHARS = 200_000
 #: The file is cut back to its newest half past this size.
 MAX_FILE_BYTES = 40_000_000
+#: The optimizer replays the newest turns only: the cost is linear in turns (2 000 recorded turns took ~28 s, ~11 500
+#: took ~170 s and 460 MB), and recent turns say more about today's settings than a year-old ones.
+MAX_REPLAY_TURNS = 500
 
 #: Decided (D13): an automatic change needs at least this token reduction and at most this pass-rate drop.
 AUTO_MIN_TOKEN_REDUCTION_PCT = 15.0
@@ -65,15 +69,18 @@ class ReplayStore:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
         if self.path.stat().st_size > MAX_FILE_BYTES:
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-            self.path.write_text("\n".join(lines[len(lines) // 2 :]) + "\n", encoding="utf-8")
+            lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
+            write_text_atomic(self.path, "\n".join(lines[len(lines) // 2 :]) + "\n")  # never truncated first
         return True
 
-    def load(self) -> list[dict[str, Any]]:
+    def load(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """The recorded turns, oldest first; with ``limit`` only the newest ``limit`` lines are parsed."""
         try:
-            lines = self.path.read_text(encoding="utf-8").splitlines()
+            lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
         except OSError:
             return []
+        if limit:
+            lines = lines[-limit:]
         out = []
         for line in lines:
             try:
@@ -216,15 +223,29 @@ def _fake() -> FakeProvider:
     return provider
 
 
-async def evaluate(turns: list[dict[str, Any]], cand: Candidate, *, now_clip: int | None = None) -> dict[str, Any]:
+async def baseline(turns: list[dict[str, Any]], now_clip: int | None = None) -> list[dict[str, Any]]:
+    """What the model is sent today, per turn: tool results clipped at ``now_clip`` (the configured default when
+    None). It does not depend on the candidate, so a caller with several candidates computes it once."""
+    provider = _fake()
+    today = Candidate("today", clip_chars=now_clip or MAX_TOOL_RESULT_CHARS)
+    return [await _replay_turn(provider, t, today) for t in turns]
+
+
+async def evaluate(
+    turns: list[dict[str, Any]],
+    cand: Candidate,
+    *,
+    now_clip: int | None = None,
+    before: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """Token totals before and after ``cand`` over the recorded turns, and the verifier pass-rate bound.
 
-    "Before" is what the model is sent today: tool results clipped at ``now_clip`` (the configured default when None).
+    "Before" is what the model is sent today (see :func:`baseline`, passed as ``before`` when already computed).
     The memory and skill sizes are already the recorded ones, which were the configured sizes.
     """
     provider = _fake()
-    today = Candidate("today", clip_chars=now_clip or MAX_TOOL_RESULT_CHARS)
-    before = [await _replay_turn(provider, t, today) for t in turns]
+    if before is None:
+        before = await baseline(turns, now_clip)
     after = [await _replay_turn(provider, t, cand) for t in turns]
     tok_before = sum(r["in"] + r["out"] for r in before)
     tok_after = sum(r["in"] + r["out"] for r in after)
@@ -284,7 +305,9 @@ def tier_pass_delta(turns: list[dict[str, Any]], kind: str, to_tier: str) -> dic
 
 async def token_candidates(context: dict[str, Any], turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Replayed token-reducing candidates for the current config. Each has a config patch, the replay result and
-    ``auto_ok`` (whether the gate allows an automatic change). Candidates that would not reduce anything are dropped."""
+    ``auto_ok`` (whether the gate allows an automatic change). Candidates that would not reduce anything are dropped.
+    Only the newest MAX_REPLAY_TURNS turns are replayed."""
+    turns = turns[-MAX_REPLAY_TURNS:]
     now_clip = int(context.get("tool_output_chars", 10_000))
     now_memory = int(context.get("memory_chars", 20_000))
     now_skills = int(context.get("skill_prompt_limit", 60))
@@ -314,8 +337,9 @@ async def token_candidates(context: dict[str, Any], turns: list[dict[str, Any]])
             )
         )
     out = []
+    before = await baseline(turns, now_clip) if specs else []  # the same for every candidate
     for cand, patch, title in specs:
-        result = await evaluate(turns, cand, now_clip=now_clip)
+        result = await evaluate(turns, cand, now_clip=now_clip, before=before)
         if result["token_reduction_pct"] <= 0:
             continue
         out.append({"title": title, "patch": patch, "evidence": result, "auto_ok": auto_ok(result)})

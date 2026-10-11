@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -17,7 +18,8 @@ from typing import Any
 
 from k3code.autonomy.proposals import ProposalStore, dedup_key
 from k3code.learning.decisions import DecisionLog
-from k3code.paths import ensure_private_dir, private_file
+from k3code.learning.fsutil import encodable, write_text_atomic
+from k3code.paths import ensure_private_dir
 from k3code.providers.types import Message
 from k3code.redact import scrub_text
 from k3code.routing.tiers import TaskKind
@@ -178,7 +180,7 @@ def propose_denial_preferences(log: DecisionLog, proposals: ProposalStore) -> li
 def _write_user_memory(path: Path, text: str) -> None:
     """USER.md is private state (learned preferences): 0600 in a 0700 directory whatever the umask."""
     ensure_private_dir(path.parent)
-    private_file(path).write_text(text, encoding="utf-8")
+    write_text_atomic(path, text, private=True)  # a plain write_text truncated USER.md before it failed to encode
 
 
 def add_user_line(path: Path, text: str, heading: str = HEADING) -> None:
@@ -203,11 +205,45 @@ DISTILL_SYSTEM = (
 )
 
 
-async def polish(caller: Any, prefs: list[Preference], *, session_id: str = "") -> list[Preference]:
-    """Optional cheap-tier rewording; any failure keeps the deterministic text."""
+#: What the cheap model made of each preference, so the daily distill asks again only about the ones that changed.
+POLISH_CACHE = "polish.json"
+
+
+def _load_polish(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+async def polish(
+    caller: Any, prefs: list[Preference], *, session_id: str = "", cache: Path | None = None
+) -> list[Preference]:
+    """Optional cheap-tier rewording; any failure keeps the deterministic text.
+
+    ``cache``: a JSON file of earlier rewordings, keyed by preference key and valid while the deterministic text and
+    the evidence are the same. A pass whose preferences are all cached makes no model call, and the wording does not
+    change from one day to the next (each new wording was posted to mem0 as one more memory)."""
     if caller is None or not prefs:
         return prefs
-    payload = json.dumps([{"key": p.key, "text": p.text, "evidence": p.evidence} for p in prefs])
+    cached = _load_polish(cache) if cache is not None else {}
+    todo = []
+    for p in prefs:
+        hit = cached.get(p.key)
+        if (
+            isinstance(hit, dict)
+            and hit.get("base") == p.text
+            and hit.get("evidence") == p.evidence
+            and hit.get("text")
+        ):
+            p.text = str(hit["text"])
+        else:
+            todo.append(p)
+    if not todo:
+        return prefs
+    base = {p.key: p.text for p in todo}
+    payload = json.dumps([{"key": p.key, "text": p.text, "evidence": p.evidence} for p in todo])
     try:
         res = await caller.complete(
             TaskKind.CLASSIFICATION,
@@ -221,11 +257,18 @@ async def polish(caller: Any, prefs: list[Preference], *, session_id: str = "") 
         items = json.loads(m.group(0)) if m else []
     except Exception:  # noqa: BLE001
         return prefs
-    new = {str(i.get("key")): scrub_text(str(i.get("text", "")).strip()) for i in items if isinstance(i, dict)}
-    for p in prefs:
+    new = {
+        str(i.get("key")): encodable(scrub_text(str(i.get("text", "")).strip())) for i in items if isinstance(i, dict)
+    }
+    for p in todo:
         t = new.get(p.key)
         if t and len(t) <= 160 and "\n" not in t:
             p.text = t
+        cached[p.key] = {"base": base[p.key], "evidence": p.evidence, "text": p.text}
+    if cache is not None:
+        keep = {p.key for p in prefs}
+        with contextlib.suppress(OSError):
+            write_text_atomic(cache, json.dumps({k: v for k, v in cached.items() if k in keep}), private=True)
     return prefs
 
 
@@ -266,15 +309,8 @@ def read_auto_section(path: Path, heading: str = HEADING) -> list[str]:
 def write_preferences_json(home: Path, prefs: list[Preference]) -> Path:
     path = home / "learning" / "preferences.json"
     ensure_private_dir(path.parent)
-    private_file(path)
-    path.write_text(
-        json.dumps(
-            {p.key or p.text: {"text": p.text, "confidence": p.confidence, "evidence": p.evidence} for p in prefs},
-            indent=2,
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+    body = {p.key or p.text: {"text": p.text, "confidence": p.confidence, "evidence": p.evidence} for p in prefs}
+    write_text_atomic(path, json.dumps(body, indent=2, ensure_ascii=False), private=True)
     return path
 
 
@@ -299,6 +335,13 @@ def _posted_key(m: Any, text: str) -> str:
     return hashlib.sha256(f"{m.url}\0{m.agent_id}\0{m.user_id}\0{text}".encode()).hexdigest()[:24]
 
 
+def _pref_keys(m: Any, p: Preference) -> tuple[str, ...]:
+    """The keys that mean "this preference was posted": by its preference key (a reworded text is the same memory), and
+    by its text (what earlier versions recorded, so an upgrade does not post everything once more)."""
+    by_text = _posted_key(m, p.text)
+    return (_posted_key(m, f"preference\0{p.key}"), by_text) if p.key else (by_text,)
+
+
 def _load_posted(path: Path) -> list[str]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -309,9 +352,7 @@ def _load_posted(path: Path) -> list[str]:
 
 def _save_posted(path: Path, keys: list[str]) -> None:
     ensure_private_dir(path.parent)
-    tmp = private_file(path.with_name(f"{path.name}.{os.getpid()}.tmp"))
-    tmp.write_text(json.dumps(keys[-MEM0_POSTED_MAX:]), encoding="utf-8")
-    os.replace(tmp, path)
+    write_text_atomic(path, json.dumps(keys[-MEM0_POSTED_MAX:]), private=True)
 
 
 def store_mem0(
@@ -340,8 +381,8 @@ def store_mem0(
 
     n = 0
     for p in prefs:
-        key = _posted_key(m, p.text)
-        if key in seen:
+        keys = _pref_keys(m, p)
+        if seen.intersection(keys):
             continue
         body = {
             "messages": [{"role": "user", "content": f"User preference (learned by k3code): {p.text}"}],
@@ -354,8 +395,8 @@ def store_mem0(
             n += 1
         except Exception:  # noqa: BLE001 - mem0 is best effort (a failed one is tried again next time)
             continue
-        seen.add(key)
-        done.append(key)
+        seen.add(keys[0])
+        done.append(keys[0])
     if posted is not None and n:
         _save_posted(posted, done)
     return n
@@ -374,7 +415,7 @@ async def distill(
     session_id: str = "",
 ) -> list[Preference]:
     prefs, suggestions = derive(log, min_evidence=min_evidence)
-    prefs = await polish(caller, prefs, session_id=session_id)
+    prefs = await polish(caller, prefs, session_id=session_id, cache=home / "learning" / POLISH_CACHE)
     write_auto_section(user_md, prefs)
     write_preferences_json(home, prefs)
     # blocking HTTP (up to 10 s per preference): never on the event loop that serves every session

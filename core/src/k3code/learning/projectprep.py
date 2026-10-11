@@ -20,6 +20,7 @@ from typing import Any
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning import projectstate, recipes, stacks
 from k3code.learning.decisions import project_id
+from k3code.learning.fsutil import encodable
 from k3code.memory import PROJECT_FILES
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
@@ -310,7 +311,7 @@ async def apply(payload: dict[str, Any], caller: Any = None, session_id: str = "
         path = Path(payload["path"])
         if path.exists():
             return f"{path.name} already exists; left unchanged"
-        path.write_text(payload["content"], encoding="utf-8")
+        path.write_text(encodable(payload["content"]), encoding="utf-8")  # a surrogate left an empty file behind
         return f"wrote {path}"
     if op == "allow_rules":  # a proposal made before rules moved out of the repository
         from k3code.permissions.rules import Rule

@@ -23,7 +23,7 @@ from k3code.autonomy import autonomy_cfg
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.prompting import build_system_prompt
-from k3code.providers.types import ToolCall
+from k3code.providers.types import ToolCall, Usage
 from k3code.reliability.hooks import (
     Reliability,
     ReliabilityFlags,
@@ -109,6 +109,8 @@ class Handle:
 
     def render(self) -> str:
         """What the parent model sees as the tool result."""
+        if self.status in ("queued", "running"):  # not finished: there is no answer to read yet
+            return f"Sub-agent {self.id} is still {self.status} ({self.tool_count} tool calls so far)."
         if self.status == "failed":
             return f"Sub-agent {self.id} failed: {self.error}"
         if self.status == "interrupted":
@@ -250,7 +252,25 @@ class SubagentManager:
         self.handles[h.id] = h
         self._emit(parent, "subagent.spawn_requested", h)
         h.task = asyncio.get_running_loop().create_task(self._run(parent, h, atype, prompt, auto_merge))
+        h.task.add_done_callback(lambda t: self._cancelled_unstarted(parent, h, t))
         return h
+
+    def _cancelled_unstarted(self, parent: Any, h: Handle, task: asyncio.Task[Any]) -> None:
+        """A child interrupted before its task ran a single step never enters ``_run`` (not even its ``finally``): it
+        stayed "queued" for good, with no ``subagent.complete``, never pruned, an empty answer for the parent and a
+        session that could not be closed. Finish its handle here, the way ``_run`` finishes an interrupted one."""
+        if not task.cancelled() or h.status != "queued":
+            return
+        try:
+            h.status = "interrupted"
+            h.started_at = h.finished_at = time.monotonic()
+            h.started_wall = time.time()
+            self._emit(parent, "subagent.complete", h, duration_seconds=0.0, summary="", text="")
+        except Exception:  # noqa: BLE001 - a callback has no caller to raise to
+            logger.exception("sub-agent %s: finishing a cancelled, unstarted child failed", h.id)
+        finally:
+            h.task = None
+            self._prune()
 
     async def wait(self, h: Handle) -> Handle:
         """Wait for the child. A cancellation of the *child* (interrupt) is its result; a cancellation of the
@@ -532,7 +552,9 @@ class SubagentManager:
                         final = msg.content
                         if msg.tool_calls:
                             self._emit(parent, "subagent.progress", h, text=msg.content.strip()[:200])
-                    h.model = server.last_attempt[1] or h.model
+                    # the model the router tagged on THIS answer; the gateway's one "last attempt" is whichever call
+                    # (of any session or sub-agent) attempted last
+                    h.model = (msg.usage or ev.usage or Usage()).model or h.model
         finally:
             h.result = final.strip()
             # the child's background bash jobs are filed under its own id: no session close ever reaps them

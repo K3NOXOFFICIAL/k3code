@@ -12,6 +12,7 @@ from typing import Any
 
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning import distiller
+from k3code.learning.fsutil import encodable
 from k3code.memory import MAX_FACT_CHARS as MAX_FACT_CHARS  # the cap lives in memory, which re-applies it on read
 from k3code.memory import clean_fact
 from k3code.paths import home
@@ -57,7 +58,8 @@ def write_draft(name: str, description: str, body: str) -> Path:
     d = home() / "skills" / "_drafts" / name
     d.mkdir(parents=True, exist_ok=True)
     md = d / "SKILL.md"
-    md.write_text(f"---\nname: {name}\ndescription: {description}\n---\n\n{body.strip()}\n", encoding="utf-8")
+    text = f"---\nname: {name}\ndescription: {description}\n---\n\n{body.strip()}\n"
+    md.write_text(encodable(text), encoding="utf-8")
     return md
 
 

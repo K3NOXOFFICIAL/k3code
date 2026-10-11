@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
+import re
+import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -12,8 +16,11 @@ from k3code import confio
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning import learning_cfg
 from k3code.learning.decisions import DecisionLog
+from k3code.learning.fsutil import write_text_atomic
 from k3code.learning.updateconfig import PatchRejected, check_patch, merge_patch
 from k3code.paths import home, user_config_path
+
+logger = logging.getLogger(__name__)
 
 ROLLBACK_MARGIN = 0.02
 #: Scope outcomes that are verifier results: "done" passed, "error" failed. "outage" (providers unreachable),
@@ -328,16 +335,51 @@ class Experiments:
         self.live = live
         #: called with the experiment after a config rollback rewrote the file (the hub syncs the live config)
         self.on_config_rollback: Callable[[dict[str, Any]], None] | None = None
+        #: the last read found a file it could not use: an empty result then means "unreadable", not "no history"
+        self._unreadable = False
 
     def all(self) -> list[dict[str, Any]]:
         try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            self._unreadable = False
             return []
+        except (OSError, ValueError) as e:
+            return self._bad_file(e)
+        if not isinstance(data, list) or not all(isinstance(x, dict) and "id" in x for x in data):
+            return self._bad_file(ValueError("not a list of experiments"))
+        self._unreadable = False
+        return data
+
+    def _bad_file(self, why: Exception) -> list[dict[str, Any]]:
+        """A torn or foreign experiments.json reads as empty, but is never saved over as if it were the history: the
+        first time it is seen a ``.bad`` copy is kept (rollback data lives in it) and the problem is logged."""
+        if not self._unreadable:
+            logger.warning("%s is unreadable (%s); treating experiments as none until it is replaced", self.path, why)
+            bad = self.path.with_name(self.path.name + ".bad")
+            if not bad.exists():
+                with contextlib.suppress(OSError):
+                    shutil.copy2(self.path, bad)
+        self._unreadable = True
+        return []
 
     def _save(self, items: list[dict[str, Any]]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(items, indent=1), encoding="utf-8")
+        if self._unreadable and not items:
+            return  # an empty list read from a file that failed to parse: writing it back would erase the history
+        write_text_atomic(self.path, json.dumps(items, indent=1))
+        self._unreadable = False
+
+    def _next_id(self, items: list[dict[str, Any]]) -> str:
+        """``x<N>`` above every id in the file and every overlay file name (the file may have lost history: an id
+        is the prefix of its overlay file, and ``len(items)+1`` reused one)."""
+        top = 0
+        names = [str(x.get("id", "")) for x in items]
+        if self.overlays.is_dir():
+            names += [f.name.split("-", 1)[0] for f in self.overlays.glob("x*-*.md")]
+        for name in names:
+            if m := re.fullmatch(r"x(\d+)", name):
+                top = max(top, int(m.group(1)))
+        return f"x{top + 1}"
 
     def get(self, xid: str) -> dict[str, Any] | None:
         return next((x for x in self.all() if x["id"] == xid), None)
@@ -354,7 +396,7 @@ class Experiments:
         like any experiment when the A/B window says it made things worse.
         """
         items = self.all()
-        xid = f"x{len(items) + 1}"
+        xid = self._next_id(items)
         exp: dict[str, Any] = {
             "id": xid,
             "title": overlay.get("title", ""),
@@ -379,10 +421,7 @@ class Experiments:
             self._sync_live(merged, overlay["patch"])
         else:
             exp.update(kind="prompt", name=overlay["name"])
-            self.overlays.mkdir(parents=True, exist_ok=True)
-            (self.overlays / f"{xid}-{overlay['name']}.md").write_text(
-                overlay["prompt"].strip() + "\n", encoding="utf-8"
-            )
+            write_text_atomic(self.overlays / f"{xid}-{overlay['name']}.md", overlay["prompt"].strip() + "\n")
         items.append(exp)
         self._save(items)
         return exp
@@ -581,8 +620,15 @@ def overlay_prompt() -> str:
     """Active prompt overlays (``$K3CODE_HOME/overlays/*.md``) for the system prompt, capped at
     MAX_OVERLAY_FILES files and MAX_OVERLAY_CHARS chars (every overlay used to be injected, re-sent on every call)."""
     d = home() / "overlays"
-    texts = [f.read_text(encoding="utf-8").strip() for f in sorted(d.glob("*.md"))] if d.is_dir() else []
-    texts = [t for t in texts if t]
+    texts: list[str] = []
+    try:
+        for f in sorted(d.glob("*.md")) if d.is_dir() else []:
+            # a file that does not decode or cannot be read costs the overlay, never the prompt (this runs every turn)
+            with contextlib.suppress(OSError):
+                if text := f.read_text(encoding="utf-8", errors="replace").strip():
+                    texts.append(text)
+    except OSError:
+        pass
     kept: list[str] = []
     used = 0
     for text in texts:

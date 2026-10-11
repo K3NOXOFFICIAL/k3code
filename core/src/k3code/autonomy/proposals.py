@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
+import os
 import re
+import threading
 import time
-from dataclasses import asdict, dataclass, field
+from collections.abc import Iterator
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -78,33 +83,101 @@ def parse_proposals(text: str) -> list[dict[str, str]]:
     return out[:3]
 
 
+def _copy(p: Proposal) -> Proposal:
+    return replace(p, payload=dict(p.payload) if isinstance(p.payload, dict) else {})
+
+
+class _Snapshot:
+    """The parsed file: last line per id, the keys seen and the highest ``p<N>``; valid while ``sig`` matches."""
+
+    def __init__(self, sig: tuple[int, int, int]) -> None:
+        self.sig = sig
+        self.latest: dict[str, Proposal] = {}
+        self.keys: set[str] = set()
+        self.top = 0
+
+    def put(self, p: Proposal) -> None:
+        self.latest[p.id] = _copy(p)  # callers get copies (set_status mutates its own)
+        self.keys.add(p.key)
+        if p.id[1:].isdigit():
+            self.top = max(self.top, int(p.id[1:]))
+
+
 class ProposalStore:
-    """Append-only jsonl: each line is a proposal snapshot; the last line per id wins."""
+    """Append-only jsonl: each line is a proposal snapshot; the last line per id wins.
+
+    The daemon, a standalone gateway and the CLI share the file. ``add`` reads, checks and appends under an exclusive
+    lock on ``proposals.jsonl.lock``, so two processes never hand out one id (the later line replaced the earlier
+    proposal, and accepting a card applied another proposal's payload). The parsed file is kept until its size,
+    inode or mtime changes: mining checks hundreds of candidates, each of which used to re-read the whole file."""
 
     def __init__(self, home: Path) -> None:
         self.path = Path(home) / "proposals.jsonl"
+        self._snap: _Snapshot | None = None
+        self._mutex = threading.RLock()  # the parsed file is shared by the threads of this process
 
-    def _write(self, p: Proposal) -> None:
+    @contextlib.contextmanager
+    def _locked(self) -> Iterator[None]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(p.as_dict(), ensure_ascii=False) + "\n")
+        with self._mutex:
+            fd = os.open(self.path.with_name(self.path.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                os.close(fd)  # releases the lock
 
-    def all(self) -> list[Proposal]:
-        if not self.path.is_file():
-            return []
-        latest: dict[str, Proposal] = {}
-        for line in self.path.read_text(encoding="utf-8").splitlines():
+    def _sig(self) -> tuple[int, int, int] | None:
+        try:
+            st = self.path.stat()
+        except OSError:
+            return None
+        return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+    def _load(self) -> _Snapshot:
+        sig = self._sig()
+        if sig is None:
+            self._snap = None
+            return _Snapshot((0, 0, 0))
+        if self._snap is not None and self._snap.sig == sig:
+            return self._snap
+        snap = _Snapshot(sig)
+        for line in self.path.read_text(encoding="utf-8", errors="replace").splitlines():
             if not line.strip():
                 continue
             try:
                 p = Proposal(**json.loads(line))
             except (ValueError, TypeError):
                 continue  # a torn or corrupt line must not break every read
-            latest[p.id] = p
-        return list(latest.values())
+            if isinstance(p.id, str) and isinstance(p.key, str):
+                snap.put(p)
+        self._snap = snap
+        return snap
+
+    def _write(self, p: Proposal) -> Proposal:
+        """Append ``p``; returns it as stored (a lone surrogate in its text is a ``?`` on disk, so in memory too)."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        before = self._snap
+        line = (json.dumps(p.as_dict(), ensure_ascii=False) + "\n").encode("utf-8", "replace")
+        stored = Proposal(**json.loads(line))
+        with self.path.open("ab") as f:
+            f.write(line)
+        sig = self._sig()
+        if before is not None and sig is not None and before.sig[0] == sig[0] and before.sig[1] + len(line) == sig[1]:
+            before.sig = sig  # nothing but our line was appended: the parsed file is still right
+            before.put(stored)
+        else:
+            self._snap = None
+        return stored
+
+    def all(self) -> list[Proposal]:
+        with self._mutex:
+            return [_copy(p) for p in self._load().latest.values()]
 
     def get(self, pid: str) -> Proposal | None:
-        return next((p for p in self.all() if p.id == pid), None)
+        with self._mutex:
+            p = self._load().latest.get(pid)
+            return _copy(p) if p is not None else None
 
     def add(
         self,
@@ -118,32 +191,32 @@ class ProposalStore:
         key: str | None = None,
     ) -> Proposal | None:
         """Store a new proposal; None when its dedup key was seen before (pending, accepted or dismissed)."""
-        existing = self.all()
         key = key or dedup_key(kind, text)
-        if any(p.key == key for p in existing):
-            return None
-        n = max([len(existing), *(int(x.id[1:]) for x in existing if x.id[1:].isdigit())])  # skipped lines keep ids
-        p = Proposal(
-            id=f"p{n + 1}",
-            kind=kind,
-            text=text,
-            action=action,
-            key=key,
-            session=session,
-            ts=time.time(),
-            payload=payload or {},
-            project=project,
-        )
-        self._write(p)
-        return p
+        with self._locked():
+            snap = self._load()
+            if key in snap.keys:
+                return None
+            n = max(len(snap.latest), snap.top)  # skipped lines keep ids
+            p = Proposal(
+                id=f"p{n + 1}",
+                kind=kind,
+                text=text,
+                action=action,
+                key=key,
+                session=session,
+                ts=time.time(),
+                payload=payload or {},
+                project=project,
+            )
+            return self._write(p)
 
     def set_status(self, pid: str, status: str) -> Proposal | None:
-        p = self.get(pid)
-        if p is None:
-            return None
-        p.status = status
-        self._write(p)
-        return p
+        with self._locked():
+            p = self.get(pid)
+            if p is None:
+                return None
+            p.status = status
+            return self._write(p)
 
 
 async def propose(
