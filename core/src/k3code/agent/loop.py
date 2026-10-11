@@ -6,7 +6,7 @@ import asyncio
 import itertools
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -502,6 +502,18 @@ class AgentLoop:
         decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
         if decision.action == "deny":  # hardline and deny rules: no hook can turn these into an allow
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
+        # the bwrap probe behind _home_rooted runs a subprocess: off the event loop, like _sandbox_argv below
+        home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
+        if home_rooted:
+            # The sandbox will not bind $HOME (or a parent of it) writable: that hands every command ~/.ssh and the
+            # k3code home. Rather than refusing all bash, a human approves each command and it runs unsandboxed.
+            decision = replace(
+                decision,
+                action="ask",
+                needs_human=True,
+                auto_allowed=False,
+                message="no sandbox at the home directory: approve to run unsandboxed, or start k3code in a project",
+            )
         pre = await self._run_hooks("PreToolUse", tool_call.name, {"tool_input": args})
         if pre.blocked:
             return {"error": f"Blocked by a PreToolUse hook: {pre.reason}"}
@@ -529,14 +541,17 @@ class AgentLoop:
         try:
             if tool_call.name == "bash":
                 # the bwrap probe runs a subprocess (up to 10 s): never on the event loop that serves every session
-                argv = await asyncio.to_thread(self._sandbox_argv)
+                argv = None if home_rooted else await asyncio.to_thread(self._sandbox_argv)
                 result = await handler(args, cwd=self.cwd, sandbox=argv, session_id=self.session_id)
             elif tool_call.name in SESSION_TOOLS:  # background jobs belong to the session that started them
                 result = await handler(args, cwd=self.cwd, session_id=self.session_id)
             else:
                 result = await handler(args, cwd=self.cwd)
         except sandbox.SandboxRefused as exc:  # raised before the handler: nothing was spawned
-            result = {"error": f"bash refused: {exc}"}
+            result = {
+                "error": f"bash refused: {exc}. Unattended work needs a project directory as its root: start it "
+                "there (or add one with add_dirs); read, glob and grep still work here"
+            }
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
             result = {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
@@ -630,6 +645,16 @@ class AgentLoop:
             keep.add(m.tool_call_id or "")
         logger.info("decision model: %d of %d old results kept, %d noted", len(keep), len(candidates), len(self._notes))
         return keep
+
+    def _home_rooted(self) -> bool:
+        """An interactive sandboxed session whose root the sandbox refuses (the home directory or above it)."""
+        if self.background or self.unattended:
+            return False  # nobody to approve: bash stays refused (fail closed) with a hint
+        if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
+            return False
+        if not sandbox.usable():
+            return False  # no bwrap: bash already runs unsandboxed (warned once in _sandbox_argv), nothing to approve
+        return sandbox.root_refusal(self.cwd, self.permissions.add_dirs) is not None
 
     def _sandbox_argv(self) -> list[str] | None:
         """bwrap prefix for bash in sandboxed sessions.

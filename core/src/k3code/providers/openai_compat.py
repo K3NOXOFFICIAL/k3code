@@ -35,10 +35,14 @@ class OpenAICompatProvider(Provider):
         prompt_cache: str = "auto",
     ) -> None:
         self.name = name
-        #: "on": Anthropic-style cache_control inside messages for Claude model ids (auto = off: plain OpenAI
-        #: endpoints cache by themselves and some reject unknown fields)
-        self.prompt_cache = prompt_cache == "on"
         self.base_url = base_url.rstrip("/")
+        #: Anthropic-style cache_control inside messages for Claude model ids. "auto" sends it to every endpoint but
+        #: OpenAI's own (which caches by itself): a Claude id there means a relay to Anthropic (OpenRouter, LiteLLM,
+        #: OmniRoute), where an uncached turn re-bills the whole prompt. A relay that rejects the field turns it off.
+        self._cache_auto = prompt_cache == "auto"
+        self.prompt_cache = prompt_cache == "on" or (
+            self._cache_auto and httpx.URL(self.base_url).host != "api.openai.com"
+        )
         self.api_key = api_key
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
         self._owns_client = client is None
@@ -95,19 +99,26 @@ class OpenAICompatProvider(Provider):
         max_tokens: int = 8192,
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        request = self._client.build_request(
-            "POST",
-            self._url(),
-            headers=request_headers("openai", self.api_key),
-            json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
-        )
-        try:
-            response = await self._client.send(request, stream=True)
-        except httpx.HTTPError as exc:
-            raise to_provider_error(exc, kind="openai") from exc
-        if response.status_code >= 400:
+        while True:
+            cached = self.prompt_cache and "claude" in model.lower()
+            request = self._client.build_request(
+                "POST",
+                self._url(),
+                headers=request_headers("openai", self.api_key),
+                json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
+            )
+            try:
+                response = await self._client.send(request, stream=True)
+            except httpx.HTTPError as exc:
+                raise to_provider_error(exc, kind="openai") from exc
+            if response.status_code < 400:
+                break
             error = await _error_from_response(response)
             await response.aclose()
+            rejected = response.status_code == 400 and "cache_control" in f"{error.message} {error.body}"
+            if cached and self._cache_auto and rejected:
+                self.prompt_cache = False  # an auto guess this relay refuses: drop it for good, resend once
+                continue
             raise error
         try:
             tool_calls: dict[int, dict[str, Any]] = {}
