@@ -17,6 +17,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,12 @@ class SessionSummary:
 PREVIEW_CHARS = 120
 
 
+def dump_messages(messages: list[dict[str, Any]]) -> str:
+    """``json.dumps(messages, ensure_ascii=False)``, one message per encoder call. The C encoder keeps the GIL for a
+    whole call, so a transcript encoded in one piece freezes every other thread; in pieces they run in between."""
+    return "[" + ", ".join(json.dumps(m, ensure_ascii=False) for m in messages) + "]"
+
+
 def summarize_messages(messages: list[dict[str, Any]]) -> tuple[int, str]:
     """``(message count, preview)``: the preview is the first non-empty user message, cut to ``PREVIEW_CHARS``."""
     for m in messages:
@@ -92,6 +99,8 @@ class SessionStore:
 
     def __init__(self, path: Path | str) -> None:
         self.path = Path(path)
+        self._executor: ThreadPoolExecutor | None = None
+        self._writer: SessionStore | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlstore.connect(self.path)
         self._db.execute(_SCHEMA)
@@ -151,7 +160,7 @@ class SessionStore:
                 sess.model,
                 sess.provider,
                 sess.cwd,
-                json.dumps(sess.messages, ensure_ascii=False),
+                dump_messages(sess.messages),
                 json.dumps(sess.usage, ensure_ascii=False),
                 sess.created_at,
                 sess.updated_at,
@@ -268,6 +277,7 @@ class SessionStore:
         as a standalone stdio TUI, may hold the session open past the sweep's age limit)."""
         sess.updated_at = time.time()
         count, preview = summarize_messages(sess.messages)
+        messages = dump_messages(sess.messages)
         with self._db:
             cur = self._db.execute(
                 "UPDATE sessions SET title=?, model=?, provider=?, cwd=?, messages=?, usage=?, updated_at=?, meta=?,"
@@ -277,7 +287,7 @@ class SessionStore:
                     sess.model,
                     sess.provider,
                     sess.cwd,
-                    json.dumps(sess.messages, ensure_ascii=False),
+                    messages,
                     json.dumps(sess.usage, ensure_ascii=False),
                     sess.updated_at,
                     json.dumps(sess.meta, ensure_ascii=False),
@@ -294,6 +304,42 @@ class SessionStore:
             sess.created_at = sess.created_at or sess.updated_at
             self._insert_row(sess)
         logger.info("restored stored session %s removed by the empty-session sweep", sess.session_id)
+
+    def checkpoint(self, session_id: str, messages: list[dict[str, Any]], model: str = "") -> None:
+        """Write only the transcript (and the model, when the row has none): a mid-turn checkpoint must not carry the
+        title or meta it was snapshotted with over a newer value saved in between. A missing row stays missing."""
+        count, preview = summarize_messages(messages)
+        payload = dump_messages(messages)
+        with self._db:
+            self._db.execute(
+                "UPDATE sessions SET messages=?, model=CASE WHEN model='' THEN ? ELSE model END, updated_at=?,"
+                " message_count=?, preview=? WHERE session_id=?",
+                (payload, model, time.time(), count, preview, session_id),
+            )
+
+    async def _on_writer(self, name: str, *args: Any) -> None:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="k3code-session-writer")
+        await asyncio.get_running_loop().run_in_executor(self._executor, self._call_writer, name, *args)
+
+    def _call_writer(self, name: str, *args: Any) -> None:
+        if self._writer is None:  # a sqlite connection may only be used by the thread that made it
+            self._writer = SessionStore(self.path)
+        getattr(self._writer, name)(*args)
+
+    async def save_async(self, sess: StoredSession) -> None:
+        """:meth:`save` on a worker thread with its own connection, so a large transcript does not stall the event
+        loop. One worker, so writes land in the order they were queued. Pass a snapshot, not a live object."""
+        await self._on_writer("save", sess)
+
+    async def checkpoint_async(self, session_id: str, messages: list[dict[str, Any]], model: str = "") -> None:
+        """:meth:`checkpoint` on the same worker (so after any queued write, before any later one)."""
+        await self._on_writer("checkpoint", session_id, messages, model)
+
+    def _close_writer(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
 
     def delete(self, session_id: str) -> bool:
         """Delete the row and any sweep tombstone for it, so no later save brings the session back."""
@@ -400,4 +446,8 @@ class SessionStore:
         return sqlstore.compact(self._db)
 
     def close(self) -> None:
+        if self._executor is not None:  # lets every queued save finish first
+            self._executor.submit(self._close_writer).result()
+            self._executor.shutdown(wait=True)
+            self._executor = None
         self._db.close()

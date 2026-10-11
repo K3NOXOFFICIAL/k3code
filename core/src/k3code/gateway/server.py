@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import copy
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -234,6 +236,7 @@ class LiveSession:
         self.call_started: float | None = None
         self.tool_mark: float | None = None
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
+        self.checkpoint_task: asyncio.Task[None] | None = None  # the checkpoint write in flight, if any
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
         #: Wall-clock start of the latest turn or job (time.time()); the agent view's "working N" counts from it.
         self.turn_started_wall = 0.0
@@ -2174,7 +2177,7 @@ class GatewayServer:
             session.idle_since = time.monotonic()
             # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
             # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
-            self._persist_turn(session, loop)
+            await self._persist_turn(session, loop)
             self.learning.record_turn_replay(
                 session,
                 list(loop.turn_messages),
@@ -2235,14 +2238,25 @@ class GatewayServer:
     #: Minimum seconds between mid-turn checkpoints (each one rewrites the session's message list).
     CHECKPOINT_EVERY_S = 3.0
 
-    def _persist_turn(self, session: LiveSession, loop: AgentLoop) -> None:
-        """Write the loop's conversation so far to the session store. Never raises: it runs in ``finally``."""
+    async def _persist_turn(self, session: LiveSession, loop: AgentLoop) -> None:
+        """Write the loop's conversation so far to the session store. Never raises: it runs in ``finally``.
+
+        The JSON encoding and the SQLite write run on the store's writer thread, queued behind any checkpoint still
+        in flight (so a stale checkpoint can never land after this write). Shielded: a cancellation of the turn
+        (``/stop``, shutdown) must not drop the write."""
         try:
-            if loop.turn_messages:
-                session.stored.messages = _serialize_messages(loop.turn_messages)
-                session.stored.model = session.stored.model or self._chain_key or self.config.default_model
-                self.store.save(session.stored)
             session.last_checkpoint = time.monotonic()
+            pending = session.checkpoint_task
+            if pending is not None and not pending.done():
+                await asyncio.wait({pending})  # its write is queued first, so it cannot land after this one
+            if loop.turn_messages:
+                stored = session.stored
+                stored.messages = _serialize_messages(loop.turn_messages)
+                stored.model = stored.model or self._chain_key or self.config.default_model
+                snapshot = dataclasses.replace(stored, meta=copy.deepcopy(stored.meta), usage=copy.deepcopy(stored.usage))
+                await asyncio.shield(self.store.save_async(snapshot))
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 - a failed checkpoint must not mask the turn's own outcome
             logger.exception("could not persist the session")
 
@@ -2290,12 +2304,26 @@ class GatewayServer:
         loop.tools.register(advisor.TOOL_SPEC, handler)
 
     def _checkpoint_turn(self, session: LiveSession) -> None:
-        """After a tool result: persist the in-flight turn (throttled) so kill -9, an OOM kill or a reboot loses
-        seconds of work instead of the whole turn."""
+        """After a tool result: persist the in-flight turn (throttled, one at a time, off the event loop) so kill -9,
+        an OOM kill or a reboot loses seconds of work instead of the whole turn."""
         loop = session.loop
-        if loop is None or time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+        if loop is None or not loop.turn_messages or time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
             return
-        self._persist_turn(session, loop)
+        if session.checkpoint_task is not None and not session.checkpoint_task.done():
+            return
+        session.last_checkpoint = time.monotonic()
+        messages = _serialize_messages(loop.turn_messages)
+        session.stored.messages = messages
+        session.stored.model = session.stored.model or self._chain_key or self.config.default_model
+        session.checkpoint_task = asyncio.create_task(
+            self._write_checkpoint(session.session_id, messages, session.stored.model)
+        )
+
+    async def _write_checkpoint(self, session_id: str, messages: list[dict[str, Any]], model: str) -> None:
+        try:
+            await self.store.checkpoint_async(session_id, messages, model)
+        except Exception:  # noqa: BLE001 - the next checkpoint or the end of the turn writes it again
+            logger.exception("could not checkpoint the session")
 
     async def _maybe_compact(self, session: LiveSession, *, force: bool = False) -> int:
         """Fold the older part of the conversation into a summary once it is large; returns how many messages folded.
