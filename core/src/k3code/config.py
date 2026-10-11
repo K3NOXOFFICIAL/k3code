@@ -190,6 +190,11 @@ class Settings(BaseModel):
     # permissions: {<tool>: "allow"|"ask"|"deny" | {<pattern>: action}, hardline: [regex]}
     permissions: dict[str, Any] = Field(default_factory=dict)
     output_style: str = "default"
+    #: The currency /stats and the budget messages show money in: ``EUR`` (default) or ``USD``. Provider costs and the
+    #: built-in price table are USD; an EUR figure is the USD one times ``eur_per_usd`` (EUR for one USD). The rate is
+    #: an approximation: set it to today's.
+    currency: str = "EUR"
+    eur_per_usd: float = 0.86
     display: DisplayConfig = Field(default_factory=DisplayConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
@@ -251,6 +256,21 @@ class Settings(BaseModel):
                 research["searxng_url"] = legacy["url"]
             data["research"] = research
         return data
+
+    @field_validator("currency")
+    @classmethod
+    def _validate_currency(cls, v: str) -> str:
+        code = str(v).strip().upper()
+        if code not in ("EUR", "USD"):
+            raise ValueError(f"currency must be EUR or USD (got {v!r})")
+        return code
+
+    @field_validator("eur_per_usd", mode="before")
+    @classmethod
+    def _validate_rate(cls, v: Any) -> Any:
+        if isinstance(v, bool) or not isinstance(v, int | float) or not 0 < v < 1000:
+            raise ValueError(f"eur_per_usd must be the number of EUR one USD buys, above 0 (got {v!r})")
+        return v
 
     @field_validator("ultracode")
     @classmethod

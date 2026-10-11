@@ -257,13 +257,16 @@ class UsageDB:
         self._db.close()
 
 
-def format_stats(rows: list[dict[str, Any]], by: str) -> str:
-    """Plain-text table for the CLI / chat: totals per session, day or turn, then tokens per tier and task kind."""
+def format_stats(rows: list[dict[str, Any]], by: str, config: Any = None) -> str:
+    """Plain-text table for the CLI / chat: totals per session, day or turn, then tokens per tier and task kind.
+    Costs are shown in the configured currency (EUR unless ``config.currency`` says USD); the rows stay USD."""
+    from k3code.pricing import money
+
     if not rows:
         return "No usage recorded yet."
     out = [f"Usage per {by}:"]
     for g in rows:
-        cost = "unknown" if g["cost_usd"] is None else f"${g['cost_usd']:.4f}"
+        cost = money(config, g["cost_usd"])
         models = ", ".join(f"{m}×{n}" for m, n in sorted(g["by_model"].items())) or "-"
         head = f"- {g['key'] or '(none)'}"
         if by == "turn" and g.get("session"):

@@ -97,12 +97,18 @@ class Budget:
     used_tokens: int = 0
     used_usd: float = 0.0
 
-    def would_exceed(self, tokens: int = 0, usd: float = 0.0) -> str | None:
-        """Non-empty message when this usage would exceed the budget."""
+    def would_exceed(
+        self, tokens: int = 0, usd: float = 0.0, *, currency: str = "USD", per_usd: float = 1.0
+    ) -> str | None:
+        """Non-empty message when this usage would exceed the budget. Amounts are kept in USD; the message shows them
+        in ``currency`` (``per_usd`` units of it for one USD)."""
         if self.tokens is not None and self.used_tokens + tokens > self.tokens:
             return f"{self.scope} token budget exceeded: {self.used_tokens + tokens} > {self.tokens}"
         if self.usd is not None and self.used_usd + usd > self.usd:
-            return f"{self.scope} USD budget exceeded: {self.used_usd + usd:.4f} > {self.usd:.4f}"
+            return (
+                f"{self.scope} {currency} budget exceeded: "
+                f"{(self.used_usd + usd) * per_usd:.4f} > {self.usd * per_usd:.4f}"
+            )
         return None
 
 
@@ -145,6 +151,9 @@ class GovernorConfig:
     # USD costs: rough default per-token prices (input, output) for budgeting
     # when the router does not report cost directly.
     tokens_per_usd: float = 2_000_000.0  # blended; overridable per-budget
+    #: How budget messages show money (the amounts themselves are USD): the currency and its units per USD.
+    currency: str = "USD"
+    per_usd: float = 1.0
 
 
 @dataclass
@@ -245,7 +254,7 @@ class Governor:
         for b in self._budgets.values():
             if b.scope == "day":
                 b.used_tokens, b.used_usd = self.day_ledger.tokens, self.day_ledger.usd
-            msg = b.would_exceed()  # usage already applied; check without delta
+            msg = b.would_exceed(currency=self.config.currency, per_usd=self.config.per_usd)  # usage already applied
             if msg is None:
                 continue
             kind = "tokens" if (b.tokens is not None and "token" in msg) else "usd"

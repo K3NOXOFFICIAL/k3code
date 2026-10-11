@@ -55,8 +55,11 @@ class ReliabilitySettings:
     # Optional session budget caps, enforced from router usage reports.
     session_tokens: int | None = None
     session_usd: float | None = None
+    #: The same caps in EUR (converted with ``eur_per_usd`` when the bundle is built); when both are set the lower wins.
+    session_eur: float | None = None
     day_tokens: int | None = None
     day_usd: float | None = None
+    day_eur: float | None = None
     # Raw NetWatchConfig overrides (e.g. http_probe_url/tcp_probe_host/tcp_probe_port)
     # so chaos tooling can point the generic internet probe at a local proxy
     # instead of the real internet. Empty means NetWatchConfig defaults.
@@ -430,11 +433,37 @@ def build_reliability(config: Any, session: str, home: Path | None = None) -> Re
         "max_park_seconds",
         "session_tokens",
         "session_usd",
+        "session_eur",
         "day_tokens",
         "day_usd",
+        "day_eur",
         "netwatch",
     }
     settings = ReliabilitySettings(flags=flags) if flags else ReliabilitySettings()
     for key in known & set(raw):
         setattr(settings, key, raw[key])
-    return Reliability.from_settings(settings, session=session, home=home)
+    apply_eur_budgets(settings, config)
+    rel = Reliability.from_settings(settings, session=session, home=home)
+    show_money_in(rel, config)
+    return rel
+
+
+def apply_eur_budgets(settings: ReliabilitySettings, config: Any) -> None:
+    """A cap given in EUR becomes its USD value (budgets are kept in USD); with both given the lower one counts."""
+    from k3code.pricing import eur_to_usd
+
+    for eur_key, usd_key in (("session_eur", "session_usd"), ("day_eur", "day_usd")):
+        eur = getattr(settings, eur_key)
+        if eur is None:
+            continue
+        usd, have = eur_to_usd(config, float(eur)), getattr(settings, usd_key)
+        setattr(settings, usd_key, usd if have is None else min(have, usd))
+
+
+def show_money_in(rel: Reliability, config: Any) -> None:
+    """Budget messages show money in the configured currency (the amounts stay USD)."""
+    from k3code.pricing import currency, per_usd
+
+    if rel.governor is not None:
+        rel.governor.config.currency = currency(config)
+        rel.governor.config.per_usd = per_usd(config)

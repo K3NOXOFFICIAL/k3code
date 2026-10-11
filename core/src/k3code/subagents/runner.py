@@ -24,7 +24,13 @@ from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.prompting import build_system_prompt
 from k3code.providers.types import ToolCall
-from k3code.reliability.hooks import Reliability, ReliabilityFlags, ReliabilitySettings
+from k3code.reliability.hooks import (
+    Reliability,
+    ReliabilityFlags,
+    ReliabilitySettings,
+    apply_eur_budgets,
+    show_money_in,
+)
 from k3code.routing.tiers import TaskKind, Tier, tier_for
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.types import AgentType, load_agent_types
@@ -146,10 +152,14 @@ def child_reliability(config: Any, child_id: str, home: Path) -> Reliability:
     settings = ReliabilitySettings(flags=ReliabilityFlags(**flags_raw))
     # The budget caps too: a child's bundle used to be built without them, so sub-agents (the biggest spenders:
     # ultracode fans out dozens) ran with no budget guard at all. The day budget is the process-wide ledger.
-    for key in ("max_wait", "max_park_seconds", "session_tokens", "session_usd", "day_tokens", "day_usd"):
+    caps = ("session_tokens", "session_usd", "session_eur", "day_tokens", "day_usd", "day_eur")
+    for key in ("max_wait", "max_park_seconds", *caps):
         if key in raw:
             setattr(settings, key, raw[key])
-    return Reliability.from_settings(settings, session=child_id, home=home)
+    apply_eur_budgets(settings, config)
+    rel = Reliability.from_settings(settings, session=child_id, home=home)
+    show_money_in(rel, config)
+    return rel
 
 
 class SubagentManager:

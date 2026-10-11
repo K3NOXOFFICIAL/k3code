@@ -19,4 +19,4 @@ class StatsCommand(CommandDef):
         by = parts[0] if parts and parts[0] in ("session", "day", "turn") else "day"
         days = next((int(p) for p in parts if p.isdigit()), 7 if by == "day" else None)
         rows = ctx.usage.aggregate(by, days=days)
-        return {"type": "message", "message": format_stats(rows, by)}
+        return {"type": "message", "message": format_stats(rows, by, getattr(ctx, "config", None))}
