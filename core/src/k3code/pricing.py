@@ -80,7 +80,8 @@ def estimate_usd(config: Any, usage: Any) -> float | None:
     written = int(getattr(usage, "cache_creation_tokens", 0) or 0)
     name = str(getattr(usage, "model", "")).lower()
     if any(n in name for n in CLAUDE_NAMES):
-        read_x, write_x = CACHE_READ_MULTIPLE, CACHE_WRITE_MULTIPLE
+        read_x = CACHE_READ_MULTIPLE
+        write_x = getattr(usage, "cache_write_multiple", None) or CACHE_WRITE_MULTIPLE  # the 1-hour cache costs 2x
     else:  # no documented write surcharge; a read is discounted only for the families that say so
         read_x = next((x for needle, x in CACHE_READ_MULTIPLES if needle in name), 1.0)
         write_x = 1.0

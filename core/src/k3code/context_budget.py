@@ -195,8 +195,10 @@ def overhead_tokens(system_prompt: str, specs: Sequence[ToolSpec]) -> int:
 def message_tokens(messages: Sequence[Message]) -> int:
     """Estimated tokens of messages as sent, tool calls included. The system entry is not counted when it is the
     first message: the request's system prompt is counted by overhead_tokens."""
-    if messages and messages[0].role == "system":
-        messages = messages[1:]
+    start = 0
+    while start < len(messages) and messages[start].role == "system":  # one, or two (see AgentLoop.system_suffix)
+        start += 1
+    messages = messages[start:]
     tokens = 0
     for m in messages:
         tokens += text_tokens(m.content or "")

@@ -90,13 +90,38 @@ def transcript_text(
     return "\n".join(lines)
 
 
-async def condensed_context(caller: Any, messages: list[Any], *, threshold: int, session_id: str = "") -> str:
-    """The transcript; a cheap-tier summary of the old part (plus the recent tail) when it is large."""
+def _signature(messages: list[Any]) -> str:
+    """A fingerprint of a run of messages (what they say, not which objects): to tell that the start of a conversation
+    is still the one an earlier summary covered."""
+    import hashlib
+
+    digest = hashlib.sha1(usedforsecurity=False)
+    for m in messages:
+        get = m.get if isinstance(m, dict) else lambda k, _m=m: getattr(_m, k, None)
+        digest.update(f"{get('role')}\x00{get('content') or ''}\x00{len(get('tool_calls') or [])}\x01".encode())
+    return digest.hexdigest()
+
+
+async def condensed_context(
+    caller: Any, messages: list[Any], *, threshold: int, session_id: str = "", memo: dict[str, Any] | None = None
+) -> str:
+    """The transcript; a cheap-tier summary of the old part (plus the recent tail) when it is large.
+
+    ``memo`` (kept by the caller between calls on a growing conversation) holds the last summary and the messages it
+    covered: when those are still the start of the conversation, only what came after them is summarized, with the
+    earlier summary as input, instead of the whole old part again on every call."""
     text = transcript_text(messages)
     if len(text) <= threshold:
         return text
     tail = transcript_text(messages[-4:])
-    head = transcript_text(messages[:-4])[-threshold * 2 :]
+    old = messages[:-4]
+    covered = int(memo.get("n", 0)) if memo else 0
+    if memo and 0 < covered <= len(old) and memo.get("sig") == _signature(old[:covered]):
+        head = f"[summary so far]\n{memo['summary']}\n\n[messages since]\n{transcript_text(old[covered:])}"[
+            -threshold * 2 :
+        ]
+    else:
+        head = transcript_text(old)[-threshold * 2 :]
     try:
         res = await caller.complete(
             TaskKind.COMPACTION,
@@ -105,6 +130,8 @@ async def condensed_context(caller: Any, messages: list[Any], *, threshold: int,
             max_tokens=600,
             timeout=45,
         )
+        if memo is not None:
+            memo.update(n=len(old), sig=_signature(old), summary=res.text)
         return f"[summary of earlier conversation]\n{res.text}\n\n[recent messages]\n{tail}"
     except Exception:  # noqa: BLE001 - fall back to a hard truncation
         return text[-threshold:]

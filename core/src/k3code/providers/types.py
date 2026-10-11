@@ -33,6 +33,9 @@ class Usage:
     cache_creation_tokens: int = 0
     #: The model that answered (set by the router; "" = unknown): what the USD budgets price the call by.
     model: str = ""
+    #: What a cache-write token costs next to a fresh input token when the provider knows (a 1-hour cache costs 2x, the
+    #: 5-minute default 1.25x); None = the price table's default.
+    cache_write_multiple: float | None = None
 
 
 #: An Anthropic prompt-cache breakpoint: the prefix up to and including the block that carries it is cached.
@@ -128,12 +131,32 @@ def normalize_tool_pairs(messages: list[Message]) -> list[Message]:
     return out
 
 
+def leading_system_parts(messages: list[Message]) -> list[str]:
+    """The text of the system messages the conversation starts with, one entry per message (empty ones left out). A loop
+    sends two when the second is what differs between agents that share the first (see ``AgentLoop.system_suffix``)."""
+    parts: list[str] = []
+    for m in messages:
+        if m.role != "system":
+            break
+        if m.content:
+            parts.append(m.content)
+    return parts
+
+
 def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
-    """Serialize messages for chat-completions-compatible providers."""
+    """Serialize messages for chat-completions-compatible providers. The leading system messages become ONE system
+    message: several in a row are refused by some chat templates (and by some servers), and only the native Anthropic
+    API has a use for the split."""
     out: list[dict[str, Any]] = []
+    leading = True  # still inside the run of system messages the conversation starts with
     for m in normalize_tool_pairs(messages):
         if m.role not in _ROLE_OPENAI:
             raise ValueError(f"unknown role: {m.role}")
+        if m.role != "system":
+            leading = False
+        elif leading and out:
+            out[-1]["content"] = f"{out[-1]['content']}\n\n{m.content or ''}".rstrip()
+            continue
         entry: dict[str, Any] = {"role": m.role, "content": m.content if m.content is not None else ""}
         if m.role == "assistant" and m.tool_calls:
             entry["tool_calls"] = [

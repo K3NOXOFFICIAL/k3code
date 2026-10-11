@@ -131,3 +131,44 @@ async def test_a_cleared_list_is_not_injected(tmp_path, monkeypatch):
     assert await server.compact_session(live) > 0
     assert not any("Todo list cleared" in str(m["content"]) for m in live.stored.messages)
     await server.close()
+
+
+# ── the goal reviewer's summary of a growing conversation ────────────────────────────────────────────────────────
+
+
+async def test_a_second_review_summarizes_only_what_is_new_since_the_first():
+    from k3code.autonomy.advisor import condensed_context
+
+    def convo(n: int) -> list[dict]:
+        return [
+            m
+            for i in range(n)
+            for m in (
+                {"role": "user", "content": f"ask {i} " + "q" * 300},
+                {"role": "assistant", "content": f"did {i} " + "a" * 300},
+            )
+        ]
+
+    caller = FakeCaller("SUMMARY ONE", "SUMMARY TWO")
+    memo: dict = {}
+    first = await condensed_context(caller, convo(10), threshold=2000, memo=memo)
+    assert "SUMMARY ONE" in first and len(caller.calls) == 1
+    assert "ask 5" in caller.calls[0][1].content  # the whole old part, as far as the size limit reaches
+
+    second = await condensed_context(caller, convo(14), threshold=2000, memo=memo)
+    assert "SUMMARY TWO" in second and len(caller.calls) == 2
+    sent_second = caller.calls[1][1].content
+    assert "[summary so far]\nSUMMARY ONE" in sent_second, "the earlier summary stands in for the covered messages"
+    assert "ask 5 " not in sent_second and "ask 8 " in sent_second  # only the messages after the covered ones
+
+    # a conversation that does not start the same way is summarized from its own start
+    other = [{"role": "user", "content": "something else entirely " + "z" * 400}] + convo(14)[1:]
+    await condensed_context(FakeCaller("S"), other, threshold=2000, memo=memo)
+    caller3 = FakeCaller("S3")
+    await condensed_context(caller3, other, threshold=2000, memo={"n": 4, "sig": "stale", "summary": "old"})
+    assert "[summary so far]" not in caller3.calls[0][1].content
+
+    # no memo: as before
+    caller4 = FakeCaller("S4")
+    await condensed_context(caller4, convo(10), threshold=2000)
+    assert "[summary so far]" not in caller4.calls[0][1].content

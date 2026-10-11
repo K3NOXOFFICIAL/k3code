@@ -18,6 +18,7 @@ from k3code.providers.types import (
     ToolSpec,
     Usage,
     cache_marker,
+    leading_system_parts,
     messages_to_anthropic,
     with_cache_breakpoint,
 )
@@ -78,7 +79,10 @@ class AnthropicProvider(Provider):
             "messages": rest,
         }
         if system:
-            payload["system"] = system
+            parts = leading_system_parts(messages)
+            # two system messages (the text agents of one type share, then the part that is theirs) stay two blocks, so
+            # the shared one can be cached by itself: one block made every sibling's request a different cache entry
+            payload["system"] = [{"type": "text", "text": p} for p in parts] if len(parts) > 1 else system
         if temperature is not None:
             payload["temperature"] = temperature
         if effort := anthropic_effort(model):
@@ -196,6 +200,7 @@ class AnthropicProvider(Provider):
                 completion_tokens=usage_out,
                 cache_read_tokens=cache_read,
                 cache_creation_tokens=cache_creation,
+                cache_write_multiple=2.0 if self.prompt_cache and self.cache_ttl == "1h" else None,
             )
             final_calls = [
                 ToolCall(
@@ -225,8 +230,11 @@ def _add_cache_breakpoints(payload: dict[str, Any], ttl: str = "5m") -> None:
     last block of the newest message. The last one moves forward every call, so each request reads the prefix the
     request before it wrote instead of paying for the whole conversation again on every tool-loop step."""
     marker = cache_marker(ttl)
-    if payload.get("system"):
-        payload["system"] = [{"type": "text", "text": payload["system"], "cache_control": marker}]
+    system = payload.get("system")
+    if isinstance(system, list):  # shared block, then the part of this one request: a breakpoint after each
+        payload["system"] = [{**block, "cache_control": marker} for block in system]
+    elif system:
+        payload["system"] = [{"type": "text", "text": system, "cache_control": marker}]
     if payload.get("tools"):
         payload["tools"][-1] = {**payload["tools"][-1], "cache_control": marker}
     messages = payload["messages"]

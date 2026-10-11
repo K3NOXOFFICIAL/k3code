@@ -44,3 +44,13 @@ async def test_a_two_space_file_edited_with_four_spaces_keeps_its_two(tmp_path):
     new = "    if (a) {\n        go();\n        stop();\n    }\n"
     out = await edit(tmp_path, "f.js", text, old, new)
     assert out == "function f() {\n  if (a) {\n    go();\n    stop();\n  }\n}\n"
+
+
+async def test_a_replacement_copied_with_reads_line_numbers_is_told_so(tmp_path):
+    (tmp_path / "m.py").write_text("def f():\n    return 1\n")
+    old = "     1\tdef f():\n     2\t    return 1\n"  # as `read` prints it
+    res = await tool_edit({"path": "m.py", "old_string": old, "new_string": "def f():\n    return 2\n"}, cwd=tmp_path)
+    assert "error" in res and "line numbers" in res["error"] and "without them" in res["error"]
+    # ordinary code with a number at the start of a line is not mistaken for it
+    res = await tool_edit({"path": "m.py", "old_string": "1 + 1\n", "new_string": "2\n"}, cwd=tmp_path)
+    assert "line numbers" not in res["error"]

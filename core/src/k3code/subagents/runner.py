@@ -557,11 +557,13 @@ class SubagentManager:
             )
         # What children of one type share comes first (the provider's cache matches from the top); the task of this
         # child, which differs, comes after it
-        system = f"{base}\n\n{atype.prompt}\n\n[agent:{atype.name}] {h.description}{note}"
+        shared = f"{base}\n\n{atype.prompt}"
+        own = f"[agent:{atype.name}] {h.description}{note}"
         router = server.tier_routers().get(Tier(h.tier))
         loop = AgentLoop(
             router,
-            system_prompt=system,
+            system_prompt=shared,
+            system_suffix=own,
             max_turns=_child_max_turns(server.config),
             max_tool_errors=int(autonomy_cfg(server.config)["max_tool_errors"]),
             headless=False,

@@ -616,14 +616,25 @@ def find_closest_lines(old_string: str, content: str, context_lines: int = 2, ma
     return result
 
 
+_NUMBERED_LINE = re.compile(r"^\s*\d+\t")
+
+
 def format_no_match_hint(error: Optional[str], match_count: int,
                          old_string: str, content: str) -> str:
     """'\\n\\nDid you mean...' snippet for plain no-match errors only, else '' (ambiguous /
     escape-drift / identical errors also have ``match_count == 0`` but a hint would mislead)."""
     if match_count != 0 or not error or not error.startswith("Could not find"):
         return ""
+    lead = ""
+    lines = [ln for ln in old_string.split("\n") if ln.strip()]
+    if len(lines) >= 1 and sum(bool(_NUMBERED_LINE.match(ln)) for ln in lines) * 2 > len(lines):
+        # the text was copied from `read`'s output, which numbers its lines (`    12\tcode`): the numbers are not in the file
+        lead = (
+            "\n\nold_string starts its lines with line numbers (`12<TAB>`), as `read` prints them. They are not part of "
+            "the file: send the lines without them."
+        )
     hint = find_closest_lines(old_string, content)
-    return "\n\nDid you mean one of these sections?\n" + hint if hint else ""
+    return lead + ("\n\nDid you mean one of these sections?\n" + hint if hint else "")
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

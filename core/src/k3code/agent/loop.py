@@ -78,6 +78,7 @@ class AgentLoop:
         router: Router,
         *,
         system_prompt: str,
+        system_suffix: str = "",
         max_turns: int = 0,
         permission_mode: str = "ask",
         headless: bool = True,
@@ -143,6 +144,10 @@ class AgentLoop:
         #: or "max_turns" (the configured cap on model calls was reached).
         self.escalation_reason: str | None = None
         self.system_prompt = system_prompt
+        #: A second system message after ``system_prompt``: what differs between agents that share the first (a
+        #: sub-agent's task). The native Anthropic API caches the two as separate blocks, so siblings read the shared
+        #: one from the cache instead of each writing a request-sized entry of its own.
+        self.system_suffix = system_suffix
         #: Model calls one run() may make; 0 (the default) = no cap: a task runs until the model answers without a
         #: tool call. A cap that is reached ends the run with a message saying so (it used to end silently).
         self.max_turns = max_turns
@@ -271,6 +276,7 @@ class AgentLoop:
         self.escalation_reason = None  # the REPL reuses one loop: a stop in an earlier run is not this run's
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
+            *([Message(role="system", content=self.system_suffix)] if self.system_suffix else []),
             *(history or []),
             Message(role="user", content=user_prompt),
         ]
@@ -724,7 +730,7 @@ class AgentLoop:
             if self._elided
             else wire
         )
-        overhead = context_budget.overhead_tokens(self.system_prompt, specs)
+        overhead = context_budget.overhead_tokens(f"{self.system_prompt}\n\n{self.system_suffix}", specs)
         threshold = self.context_window * self.elide_at_ratio
         if overhead + context_budget.message_tokens(view) > threshold:
             keep = set(self._pinned)

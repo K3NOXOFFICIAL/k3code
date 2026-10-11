@@ -269,6 +269,8 @@ class LiveSession:
         #: when the prompt is first built, so a note written mid-session does not change the prompt (and make the
         #: provider re-write the whole conversation); None = read them again, as after a compaction or /clear.
         self.learned_notes: list[str] | None = None
+        #: The goal reviewer's summary of the conversation so far (autonomy.advisor.condensed_context).
+        self.advisor_memo: dict[str, Any] = {}
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
         self.pending_request_id: str | None = None
         # an invalid configured permission_mode fails this session's creation with a named error (an RPC reply), not
@@ -2604,6 +2606,7 @@ class GatewayServer:
         session.reads.clear()  # and the results it pointed at may be folded
         session.pinned_reads.clear()
         session.learned_notes = None  # the provider's cache of it is gone anyway: show the notes written since
+        session.advisor_memo.clear()
         session.stored.meta["compactions"] = int(session.stored.meta.get("compactions") or 0) + 1
         self.store.save(session.stored)
         logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
@@ -3001,6 +3004,7 @@ class GatewayServer:
                 messages[start:] if 0 < start < len(messages) else messages,
                 threshold=int(cfg["advisor_compact_chars"]),
                 session_id=session.session_id,
+                memo=session.advisor_memo,  # a goal vetoed again and again summarizes only what is new each time
             )
             return await advisor.review_done(self.model_caller, goal, ctx, session_id=session.session_id)
 
