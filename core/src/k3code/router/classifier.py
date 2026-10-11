@@ -474,6 +474,7 @@ _ERROR_CODE_REASONS: dict[str, FailoverReason] = {
     **dict.fromkeys(_QUOTA_ERROR_CODES, _R.quota),
     **dict.fromkeys(_MODEL_NOT_FOUND_ERROR_CODES, _R.bad_request),
     **dict.fromkeys(_CONTEXT_OVERFLOW_ERROR_CODES, _R.context_overflow),
+    **dict.fromkeys(("invalid_api_key", "incorrect_api_key", "authentication_error"), _R.auth),
     "server_error": _R.server,
     "api_error": _R.server,
     "rate_limit_error": _R.rate_limit,
@@ -555,6 +556,10 @@ def _status_400(c: _Ctx) -> FailoverReason:
         return _R.bad_request
     if code in {"unknown_parameter", "unsupported_parameter"}:
         return _R.bad_request
+    if "exceed context limit" in msg and "input length" in msg:
+        # Anthropic: "input length and `max_tokens` exceed context limit: 188240 + 20000 > 200000". It names max_tokens
+        # but the input is what compaction can shrink: failing over through every entry never could
+        return _R.context_overflow
     if code not in _CONTEXT_OVERFLOW_ERROR_CODES and any(p in msg for p in _OUTPUT_CAP_PATTERNS):
         return _R.bad_request
     # A malformed message array is not overflow: the input can be tiny and

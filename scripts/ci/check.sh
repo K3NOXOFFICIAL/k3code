@@ -217,11 +217,14 @@ tui_deps() {
 
 # vitest without the known-failing upstream tests in .ci-test-excludes (one glob per line).
 tui_vitest() {
-  local g args=()
+  local g args=() py=${PYTHON:-}
   if [ -f .ci-test-excludes ]; then
     while IFS= read -r g; do [ -z "$g" ] || args+=(--exclude "$g"); done <.ci-test-excludes
   fi
-  npx vitest run ${args[@]+"${args[@]}"}
+  # The slash-command and wake-word parity tests compare the TUI's lists with the core's by running Python, and skip
+  # when the interpreter cannot import k3code (a bare python3). Give them the core's own, so they run.
+  if [ -z "$py" ] && [ -x ../core/.venv/bin/python ]; then py=$(cd ../core/.venv/bin && pwd)/python; fi
+  PYTHON=${py:-python3} npx vitest run ${args[@]+"${args[@]}"}
 }
 
 area_tui() {

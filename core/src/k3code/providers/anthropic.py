@@ -12,12 +12,12 @@ import httpx
 from k3code.providers.base import Provider, ProviderError, request_headers, to_provider_error
 from k3code.providers.effort import anthropic_effort
 from k3code.providers.types import (
-    EPHEMERAL,
     Message,
     StreamEvent,
     ToolCall,
     ToolSpec,
     Usage,
+    cache_marker,
     messages_to_anthropic,
     with_cache_breakpoint,
 )
@@ -40,10 +40,12 @@ class AnthropicProvider(Provider):
         api_key: str,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
+        cache_ttl: str = "5m",
     ) -> None:
         self.name = name
         #: auto and on both mark cache breakpoints here (the native API supports them); off sends none
         self.prompt_cache = prompt_cache != "off"
+        self.cache_ttl = cache_ttl
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
@@ -86,7 +88,7 @@ class AnthropicProvider(Provider):
                 {"name": t.name, "description": t.description, "input_schema": t.parameters} for t in tools
             ]
         if self.prompt_cache:
-            _add_cache_breakpoints(payload)
+            _add_cache_breakpoints(payload, self.cache_ttl)
         return payload
 
     async def stream(
@@ -199,17 +201,20 @@ class AnthropicProvider(Provider):
             await response.aclose()
 
 
-def _add_cache_breakpoints(payload: dict[str, Any]) -> None:
+def _add_cache_breakpoints(payload: dict[str, Any], ttl: str = "5m") -> None:
     """Mark three prompt-cache breakpoints (the API allows four): the system prompt, the last tool definition, and the
     last block of the newest message. The last one moves forward every call, so each request reads the prefix the
     request before it wrote instead of paying for the whole conversation again on every tool-loop step."""
+    marker = cache_marker(ttl)
     if payload.get("system"):
-        payload["system"] = [{"type": "text", "text": payload["system"], "cache_control": EPHEMERAL}]
+        payload["system"] = [{"type": "text", "text": payload["system"], "cache_control": marker}]
     if payload.get("tools"):
-        payload["tools"][-1] = {**payload["tools"][-1], "cache_control": EPHEMERAL}
+        payload["tools"][-1] = {**payload["tools"][-1], "cache_control": marker}
     messages = payload["messages"]
-    if messages:
-        messages[-1] = {**messages[-1], "content": with_cache_breakpoint(messages[-1]["content"])}
+    # A call without tools (title, classifier, judge, compaction summary...) is asked once: the newest message is never
+    # read back, so marking it only added the 25% cache-write surcharge to its whole input.
+    if messages and payload.get("tools"):
+        messages[-1] = {**messages[-1], "content": with_cache_breakpoint(messages[-1]["content"], ttl)}
 
 
 async def _error_from_response(response: httpx.Response) -> ProviderError:

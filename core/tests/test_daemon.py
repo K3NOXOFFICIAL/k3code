@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from daemon_helpers import _stop_daemon
+from env_fixtures import sandbox_optional  # noqa: F401  (a fixture)
 from k3code import daemon, sdnotify, service
 from k3code.gateway.auth import authenticate
 
@@ -417,6 +418,7 @@ async def test_gateway_attach_without_daemon_fails_clearly(tmp_path):
     assert proc.returncode == 1 and b"Start it with `k3code daemon`" in err
 
 
+@pytest.mark.usefixtures("sandbox_optional")
 async def test_in_flight_turn_survives_client_disconnect(tmp_path, monkeypatch):
     """The turn is still inside a slow bash call when the only client goes away."""
     home = tmp_path / "home"

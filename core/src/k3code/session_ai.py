@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from k3code.autonomy.advisor import SUMMARY_SYSTEM, transcript_text
+from k3code.autonomy.advisor import summary_system, transcript_text
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 
@@ -20,6 +20,8 @@ SUMMARY_PREFIX = "[summary of earlier conversation]\n"
 COMPACT_INPUT_CHARS = 60_000
 #: Of those, the head: the start of the conversation holds the task statement.
 COMPACT_HEAD_CHARS = 8_000
+#: The summary the model may write (SUMMARY_SYSTEM asks for 400 words and the paths, commands and errors to keep).
+SUMMARY_MAX_TOKENS = 1_000
 #: The first task statement is kept verbatim (up to this many characters) so it survives any number of compactions.
 TASK_ANCHOR_CHARS = 12_000
 
@@ -36,6 +38,7 @@ async def make_title(caller: Any, first_message: str, *, session_id: str = "") -
             TaskKind.TITLE,
             [Message(role="system", content=TITLE_SYSTEM), Message(role="user", content=first_message[:2000])],
             session_id=session_id,
+            escalate=False,  # best effort: an outage of the cheap tier is not worth a call on the main one
             max_tokens=24,
             timeout=20,
         )
@@ -50,10 +53,24 @@ def split_for_compaction(messages: list[dict[str, Any]], keep: int = 6) -> int:
 
     Cutting only at a user message keeps assistant tool calls together with their tool results.
     """
-    cut = max(0, len(messages) - keep)
+    cut = max(0, len(messages) - max(1, keep))
     while cut > 0 and messages[cut].get("role") != "user":
         cut -= 1
     return cut
+
+
+def split_between_steps(messages: list[dict[str, Any]], keep: int = 6) -> int:
+    """Index of the latest assistant message at or before ``len - keep`` that follows a user message or a tool result.
+
+    For a conversation whose user messages are all early (one big task, a goal turn: hundreds of tool calls after a
+    single prompt) split_for_compaction leaves nothing to fold. A cut before such an assistant message separates no
+    call from its results. 0 = none."""
+    cut = max(0, len(messages) - max(1, keep))
+    while cut > 1 and not (
+        messages[cut].get("role") == "assistant" and messages[cut - 1].get("role") in ("user", "tool")
+    ):
+        cut -= 1
+    return cut if cut > 1 else 0
 
 
 def head_and_tail(text: str, limit: int, head: int) -> str:
@@ -79,15 +96,24 @@ async def compact_messages(
     keep: int = 6,
     session_id: str = "",
     max_input_chars: int = COMPACT_INPUT_CHARS,
+    instructions: str = "",
 ) -> tuple[list[dict[str, Any]], int]:
     """Summarize the old part of the transcript. Returns (new messages, number of messages folded).
+
+    ``instructions`` is what the user wants the summary to focus on (``/compact <focus>``).
 
     The summary model reads the head and the tail of the folded part (it used to read only the last characters, so
     the task statement was lost), and the first task statement is kept verbatim ahead of the summary.
     """
-    cut = split_for_compaction(messages, keep)
-    old = [m for m in messages[:cut] if m.get("role") != "system"]
-    if not old:
+    anchor = old = None
+    for cut in (split_for_compaction(messages, keep), split_between_steps(messages, keep)):
+        old = [m for m in messages[:cut] if m.get("role") != "system"]
+        anchor = task_anchor(old)
+        # What an earlier compaction left (the task statement and its summary) is not worth a model call alone: it
+        # would summarize a summary without freeing a token, on every turn the kept tail alone is over the limit.
+        if any(m is not anchor and not str(m.get("content") or "").startswith(SUMMARY_PREFIX) for m in old):
+            break
+    else:
         return messages, 0
     text = head_and_tail(
         transcript_text(old, per_message=3000), max_input_chars, min(COMPACT_HEAD_CHARS, max_input_chars // 4)
@@ -95,16 +121,17 @@ async def compact_messages(
     res = await caller.complete(
         TaskKind.COMPACTION,
         [
-            Message(role="system", content=SUMMARY_SYSTEM),
+            Message(role="system", content=summary_system(instructions)),
             Message(role="user", content=text),
         ],
         session_id=session_id,
-        max_tokens=700,
+        max_tokens=SUMMARY_MAX_TOKENS,
         timeout=90,
     )
+    if not res.text.strip():  # e.g. a reasoning model that spent its whole budget thinking: keep the history
+        raise ValueError("the summary model returned no text")
     summary = {"role": "user", "content": SUMMARY_PREFIX + res.text.strip()}
     system = [m for m in messages[:cut] if m.get("role") == "system"]
-    anchor = task_anchor(old)
     kept = []
     if anchor is not None:
         content = str(anchor.get("content") or "")

@@ -13,6 +13,7 @@ from k3code import paths, trust, userhooks
 from k3code.agent.loop import AgentLoop
 from k3code.providers.types import ToolCall
 from k3code.router import Router, build_chain
+from k3code.tools import format_tool_result
 from k3code.userhooks import Hook, HookRunner
 from test_autonomy_gateway import call, events, k3home, make, run_turn, start
 
@@ -79,7 +80,18 @@ async def test_json_decision_block_and_post_tool_feedback(proj: Path) -> None:
     assert (await _loop(proj, [block])._execute_tool(_bash("true")))["error"].endswith("policy says no")
     note = Hook("PostToolUse", """echo '{"additionalContext": "lint is red"}'""")
     result = await _loop(proj, [note])._execute_tool(_bash("echo out"))
-    assert result["content"] == "out\n\n[PostToolUse hook] lint is red"
+    assert format_tool_result(result) == "out\n\n[PostToolUse hook] lint is red"
+    assert result["stdout"] == "out\n" and "content" not in result  # the result itself is left as the tool made it
+
+
+async def test_post_tool_feedback_keeps_a_read_numbered_once_and_an_error_an_error(proj: Path) -> None:
+    (proj / "a.txt").write_text("alpha\n")
+    note = Hook("PostToolUse", """echo '{"additionalContext": "lint is red"}'""")
+    read = await _loop(proj, [note])._execute_tool(ToolCall(id="r", name="read", arguments={"path": "a.txt"}))
+    text = format_tool_result(read)
+    assert text.splitlines()[0].split("\t") == ["     1", "alpha"] and text.endswith("[PostToolUse hook] lint is red")
+    missing = await _loop(proj, [note])._execute_tool(ToolCall(id="m", name="read", arguments={"path": "nope.txt"}))
+    assert "error" in missing and "content" not in missing  # the failure counter still sees a failure
 
 
 async def test_approve_answers_the_prompt_but_never_a_hardline_deny(proj: Path) -> None:

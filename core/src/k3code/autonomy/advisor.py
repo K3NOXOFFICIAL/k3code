@@ -19,17 +19,47 @@ DONE_SYSTEM = (
     '{"blocking": bool, "issues": [str]}. blocking=true only for issues that mean the goal is NOT met '
     "(failing tests, missing requirement, unverified claim)."
 )
-SUMMARY_SYSTEM = "Summarize this coding conversation: the goal, decisions, work done, open problems. Max 300 words."
+SUMMARY_SYSTEM = (
+    "Summarize this coding conversation so the work can continue from the summary alone. Keep, in this order: the "
+    "goal and constraints the user gave; decisions made and why; files read, created or changed (exact paths) and "
+    "what changed in them; commands run and what they showed (failing tests, errors and their fixes); open problems; "
+    "the next step. Name identifiers, paths and error messages exactly; drop pleasantries and anything already "
+    "finished and irrelevant. Max 400 words."
+)
+#: Per tool call in a rendered transcript: the call's arguments are cut to this many characters.
+CALL_ARG_CHARS = 200
+
+
+def summary_system(instructions: str = "") -> str:
+    """SUMMARY_SYSTEM, plus the user's own focus for this summary (``/compact <focus>``)."""
+    focus = instructions.strip()
+    if not focus:
+        return SUMMARY_SYSTEM
+    return f"{SUMMARY_SYSTEM} The user asks the summary to focus on: {focus[:500]}"
+
+
+def _call_line(call: Any) -> str:
+    name, args = (call.get("name"), call.get("arguments")) if isinstance(call, dict) else (call.name, call.arguments)
+    text = json.dumps(args, ensure_ascii=False) if args else ""
+    return f"{name}({text[:CALL_ARG_CHARS]}{'…' if len(text) > CALL_ARG_CHARS else ''})"
 
 
 def transcript_text(messages: list[Message] | list[dict[str, Any]], *, per_message: int = 1500) -> str:
+    """The conversation as text for a side model: who said what, with the tool calls the assistant made (name and
+    cut-off arguments) and the name of the tool each result came from. A call has no text of its own, so a transcript
+    of ``content`` alone showed a summarizer file contents without the edits and commands that led to them."""
     lines: list[str] = []
     for m in messages:
-        role = m["role"] if isinstance(m, dict) else m.role
-        content = (m.get("content") if isinstance(m, dict) else m.content) or ""
-        if role == "system" or not content:
+        get = m.get if isinstance(m, dict) else lambda k, _m=m: getattr(_m, k, None)
+        role = get("role")
+        content = get("content") or ""
+        if role == "system":
             continue
-        lines.append(f"{role}: {str(content)[:per_message]}")
+        if content:
+            label = f"tool {get('name')}" if role == "tool" and get("name") else role
+            lines.append(f"{label}: {str(content)[:per_message]}")
+        if calls := get("tool_calls") or []:
+            lines.append(f"assistant called: {'; '.join(_call_line(c) for c in calls)}")
     return "\n".join(lines)
 
 

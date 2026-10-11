@@ -7,7 +7,7 @@ without the change they fail on what they assert, not at import.
 from __future__ import annotations
 
 from k3code.config import Settings
-from k3code.research.tools import register_web_tools
+from k3code.research.tools import MAX_FETCH_CHARS, register_web_tools
 from k3code.tools import build_registry, tool_bash
 
 
@@ -19,7 +19,7 @@ async def test_timeout_says_how_long_and_how_to_go_on(tmp_path):
 def test_bash_schema_documents_default_and_max_timeout():
     spec, _ = build_registry().get("bash")
     timeout = spec.parameters["properties"]["timeout"]
-    assert timeout["default"] == 30 and "default 30, max 600" in timeout["description"]
+    assert timeout["default"] == 120 and "default 120, max 600" in timeout["description"]
     assert "Seconds" in timeout["description"] and spec.parameters["properties"]["background"]["type"] == "boolean"
 
 
@@ -30,5 +30,5 @@ def test_every_builtin_tool_states_its_limits():
         spec, _ = reg.get(name)
         limits = [ln for ln in spec.description.splitlines() if ln.startswith("Limits: ")]
         assert len(limits) == 1, name
-    assert "30 s by default" in reg.get("bash")[0].description
-    assert "14000 chars" in reg.get("web_fetch")[0].description
+    assert "120 s by default" in reg.get("bash")[0].description
+    assert f"{MAX_FETCH_CHARS} chars" in reg.get("web_fetch")[0].description

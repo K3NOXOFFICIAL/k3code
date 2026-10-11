@@ -137,6 +137,7 @@ async def draft_memory(caller: Any, root: Path, info: dict[str, Any], session_id
                 Message(role="user", content=f"Facts: {json.dumps(info)}\n\n{_excerpts(root)}"),
             ],
             session_id=session_id,
+            escalate=False,  # best effort: an outage of the cheap tier is not worth a call on the main one
             max_tokens=700,
             timeout=40,
         )

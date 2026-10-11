@@ -92,12 +92,12 @@ async def test_a_hinted_failure_seen_twice_is_noted_for_reminders_and_proposed_n
     assert not accepted.exists()  # nothing reaches the system prompt's file without the card
     (p,) = [p for p in hub.store.all() if p.kind == "project_gotcha"]  # the card is proposed at the same time
     assert p.payload == {"project": pid, "line": line[2:]}
-    assert [p["text"] for t, p in frames if t == "notification"] == [
+    assert [p["text"] for t, p in frames if t == "notification.show"] == [
         f"Noted for reminders in this project: {line[2:]} (accept its card to add it to the system prompt)"
     ]
     _fail(hub, s2, "python z.py", "sh: 1: python: not found")  # already noted: no rewrite, no second notification
     assert auto.read_text(encoding="utf-8").splitlines() == [line]
-    assert len([t for t, _ in frames if t == "notification"]) == 1
+    assert len([t for t, _ in frames if t == "notification.show"]) == 1
     assert len([p for p in hub.store.all() if p.kind == "project_gotcha"]) == 1
     prompt = build_system_prompt("base", cwd=tmp_path, config=Settings())
     assert "not found" not in prompt and "Known pitfalls" not in prompt

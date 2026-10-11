@@ -10,6 +10,9 @@ Behavior on first trigger: inject a corrective system note telling the model
 what it is repeating and to try a different approach (once). On a second
 consecutive trigger: stop the turn and mark the session ``needs_input``.
 
+A request that repeats while its result keeps changing (polling a job's output, a health check) is not stuck: a
+different result starts the count again.
+
 Arg normalization: JSON-dump with sorted keys; strings are stripped of
 trailing whitespace; numeric-like values are compared by canonical JSON
 encoding so ``30`` and ``30.0`` count as the same.
@@ -95,6 +98,7 @@ class LoopGuard:
         self._note_injected = False  # one note per repeated pattern
         self._note_key: str | None = None
         self.needs_input = False
+        self._digests: dict[str, str] = {}  # request key -> digest of the result it last got
         self._reset_results()
 
     def _reset_results(self) -> None:
@@ -112,6 +116,7 @@ class LoopGuard:
         self._note_injected = False
         self._note_key = None
         self.needs_input = False
+        self._digests.clear()
         self._reset_results()
 
     def observe_tool_call(self, tool: str, args: Any) -> GuardOutcome:
@@ -129,13 +134,22 @@ class LoopGuard:
         self._text_run = 0
         return self._verdict(key, self._tool_run, self.tool_repeats, what=f"tool call `{tool}`")
 
-    def observe_tool_result(self, tool: str, args: Any, failure: str | None, call: str = "") -> GuardOutcome:
+    def observe_tool_result(
+        self, tool: str, args: Any, failure: str | None, call: str = "", digest: str = ""
+    ) -> GuardOutcome:
         """Record a tool call's outcome (``failure``: its error signature, None on success); NOTE once per pattern.
 
         Requests alone miss loops whose calls differ: the same failing command with tweaked args, and ABAB
-        alternation between two calls. ``call`` names the call in the reminder (``bash `npm test` ``).
+        alternation between two calls. ``call`` names the call in the reminder (``bash `npm test` ``). ``digest``
+        fingerprints what the call returned: the same request answered differently than last time is progress, so
+        its repetition count starts again.
         """
-        key = f"{tool}:{normalize_args(args)}->{failure or 'ok'}"
+        request = f"tool:{tool}:{normalize_args(args)}"
+        if digest:
+            if self._digests.get(request, digest) != digest and request == self._last_tool_key:
+                self._tool_run, self._note_injected, self._note_key = 1, False, None
+            self._digests[request] = digest
+        key = f"{tool}:{normalize_args(args)}->{failure or 'ok'}:{digest}"
         self._recent.append(key)
         if failure is None:
             self._fail_key, self._fail_run = None, 0

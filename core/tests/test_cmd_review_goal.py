@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import subprocess
 
+import pytest
+
+from env_fixtures import sandbox_optional  # noqa: F401  (a fixture)
 from k3code.commands.review import parse_findings
 from k3code.goals import GoalManager, parse_judge_response
 from m1cmd_helpers import cmd, frames_of, git_repo, make_server, new_session, submit_and_wait
@@ -175,6 +178,7 @@ async def test_goal_turn_budget_stops_loop(tmp_path, monkeypatch):
     await server.close()
 
 
+@pytest.mark.usefixtures("sandbox_optional")
 async def test_goal_check_gate_enforced(tmp_path, monkeypatch):
     marker = tmp_path / "ok.flag"
     server, provider = make_server(

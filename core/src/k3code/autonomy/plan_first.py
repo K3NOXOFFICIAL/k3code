@@ -90,6 +90,8 @@ class PlanFirst:
 
     def gate_applies(self, session: Any) -> bool:
         cfg = self.cfg
+        if getattr(session, "goal_continuation", False):
+            return False  # the goal's next turn is the same task, already classified and planned on its first turn
         if session.background and not cfg["gate_unattended"]:
             return False  # unattended runs are pre-approved: nobody is there to approve a plan
         override = getattr(session, "scope_override", None)
@@ -249,6 +251,8 @@ class PlanFirst:
             reliability=await server._reliability_for(session),
             session=sid,
             task_kind=TaskKind.PLAN,
+            tool_output_chars=int((getattr(server.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            context_window=server._router_window(router, session),
         )
         loop.hooks = userhooks.load(session.perms.cwd, sid)  # the planner's read tools see the user's hooks too
         loop.max_turns_stop_message = False  # its last text is taken as the plan: a stop notice is not one

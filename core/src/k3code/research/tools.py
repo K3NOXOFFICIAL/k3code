@@ -35,7 +35,9 @@ from k3code.research.fetch import UA, FetchRefused, FetchStatus, WebFetcher
 logger = logging.getLogger(__name__)
 
 DEFAULT_SEARXNG = ""  # no default instance: web_search stays off until research.searxng_url is set
-MAX_FETCH_CHARS = 14_000
+#: The most of a page web_fetch returns. Under the 10,000 characters the model is sent of any tool result (see
+#: k3code.tools.clip_for_model): above them the middle of the page was cut a second time, silently.
+MAX_FETCH_CHARS = 9_500
 
 
 @dataclass
@@ -150,9 +152,18 @@ async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | No
         title, text = extract_text(got.body)
     else:
         title, text = url, got.body
-    if got.truncated:
-        text += "\n[page cut: the fetch deadline or the size cap was reached]"
-    return title or url, text[:MAX_FETCH_CHARS]
+    note = "\n[page cut: the fetch deadline or the size cap was reached]" if got.truncated else ""
+    return title or url, _cap_page(text, note)
+
+
+def _cap_page(text: str, note: str = "") -> str:
+    """``text`` + ``note`` within MAX_FETCH_CHARS: a longer page keeps its start, and says how much of it that is (the
+    note used to be appended before the cut and fell off the end of a long page, which then looked complete)."""
+    if len(text) + len(note) <= MAX_FETCH_CHARS:
+        return text + note
+    marker = f"\n[page cut: the first {{}} of {len(text)} characters are shown]"
+    keep = MAX_FETCH_CHARS - len(note) - len(marker) - len(str(MAX_FETCH_CHARS))
+    return text[:keep] + marker.format(keep) + note
 
 
 async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher) -> tuple[str, str]:
@@ -166,9 +177,7 @@ async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher)
     if verdict is not Verdict.OK:
         raise RuntimeError(f"still blocked in the browser (HTTP {page.status}) at {url}; not solved, not retried")
     title, text = await asyncio.to_thread(extract_text, page.html)  # off the event loop: parsing is CPU-bound
-    if page.truncated:
-        text += "\n[page cut: the size cap was reached]"
-    return title or url, text[:MAX_FETCH_CHARS]
+    return title or url, _cap_page(text, "\n[page cut: the size cap was reached]" if page.truncated else "")
 
 
 class SearxngSearch:

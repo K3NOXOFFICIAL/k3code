@@ -36,6 +36,9 @@ async def test_every_tool_call_is_announced_and_counted_once(tmp_path, monkeypat
     starts = events(server, "tool.start")
     assert [s["name"] for s in starts] == ["bash"]
     assert [c["tool_id"] for c in events(server, "tool.complete")] == [starts[0]["tool_id"]]
+    # what the TUI's tool row shows next to the name, its Args block, and the time the row ends with
+    assert starts[0]["context"] == "echo hi" and '"command": "echo hi"' in starts[0]["args_text"]
+    assert isinstance(events(server, "tool.complete")[0]["duration_s"], float)
     rows = [r for r in server.usage.rows() if r["kind"] == "tool"]
     assert [r["detail"] for r in rows] == ["bash"]
 

@@ -11,11 +11,16 @@ from pathlib import Path
 
 import pytest
 
+from env_fixtures import hide_root  # noqa: F401  (a fixture)
+
 REPO = Path(__file__).resolve().parents[2]
 INSTALL = REPO / "install" / "install.sh"
 UNINSTALL = REPO / "install" / "uninstall.sh"
 
-pytestmark = pytest.mark.skipif(shutil.which("uv") is None, reason="installer needs uv present")
+pytestmark = [
+    pytest.mark.skipif(shutil.which("uv") is None, reason="installer needs uv present"),
+    pytest.mark.usefixtures("hide_root"),
+]
 # bubblewrap is the Linux sandbox: the installer checks for it only on Linux
 linux_only = pytest.mark.skipif(sys.platform != "linux", reason="bubblewrap check runs on Linux only")
 

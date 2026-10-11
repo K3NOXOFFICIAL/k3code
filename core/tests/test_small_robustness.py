@@ -170,7 +170,7 @@ async def test_glob_and_the_grep_fallback_run_off_the_event_loop(tmp_path, no_gi
     await tool_glob({"pattern": "*.py"}, cwd=tmp_path)
     res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
     assert len(ran) == 2
-    hits = {Path(line.split(":")[0]).relative_to(tmp_path).as_posix() for line in res["matches"].splitlines()}
+    hits = {line.split(":")[0] for line in res["matches"].splitlines()}  # relative to the session's directory
     assert hits == {"src/a.py", "src/pkg/b.py", "build/g.py", "README.md"}
 
 

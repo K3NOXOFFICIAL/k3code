@@ -45,9 +45,22 @@ class ProviderEntry(BaseModel):
     persistent: bool = True
     max_sessions: int = 4
     idle_seconds: float = 600.0
-    #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
-    #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
+    #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic; for an openai entry (a relay) they are
+    #: sent only for model ids that look like Claude, and dropped for good if the endpoint answers 400 to a request
+    #: with them and accepts it without. on = always send them, off = never.
     prompt_cache: str = "auto"
+    #: How long a cache entry lives after its last use: "5m" (the default) or "1h" (written at twice the price of
+    #: a 5-minute entry, read at the same discount). A /loop or cron job that runs every 5 minutes or more finds a
+    #: 5-minute entry expired on every tick; "1h" keeps its prompt cached between ticks. Anthropic's API only: a relay
+    #: that rejects unknown cache_control fields needs "5m".
+    cache_ttl: str = "5m"
+
+    @field_validator("cache_ttl")
+    @classmethod
+    def validate_cache_ttl(cls, v: str) -> str:
+        if v not in ("5m", "1h"):
+            raise ValueError("cache_ttl must be '5m' or '1h'")
+        return v
 
     @field_validator("prompt_cache")
     @classmethod
@@ -191,7 +204,8 @@ class Settings(BaseModel):
     task_tiers: dict[str, str] = Field(default_factory=dict)
     # M5 learning: see k3code.learning.DEFAULTS (enabled, perm_min_approvals, optimizer: {...}, ...)
     learning: dict[str, Any] = Field(default_factory=dict)
-    # M4a autonomy: plan_first, gate_modes, advisor_auto, proposals, escalate_after, ...
+    # M4a autonomy: plan_first, gate_modes, advisor_on_plan, advisor_on_goal, advisor_modes, proposals,
+    # escalate: {tool_errors}, max_tool_errors, ... (the keys and defaults are in k3code.autonomy.DEFAULTS)
     autonomy: dict[str, Any] = Field(default_factory=dict)
     # M4b: ultracode: {max_tokens, max_agents, min_scope}; research: {searxng_url, max_subquestions, ...}
     # min_scope: with the ultracode mode on (/ultracode on), a prompt rated at least this runs the pipeline.
@@ -205,9 +219,10 @@ class Settings(BaseModel):
     # Web tools SSRF guard: {allow_private: false}. true lets web_fetch/web_browse reach loopback/private addresses;
     # the exact origin of research.searxng_url is always allowed. See k3code.net_guard.
     web: dict[str, Any] = Field(default_factory=dict)
-    # Context management: {compact_at_ratio: 0.7, compact_at_tokens: <absolute override>, keep_messages: 8}; see
-    # GatewayServer._maybe_compact and k3code.context_budget. decision_model: {enabled: false, provider: "", model: "",
-    # at_ratio: 0.5}: a small model picks which old tool results the main model still needs (k3code.context_select)
+    # Context management: {autocompact: true, compact_at_ratio: 0.7, compact_at_tokens: <absolute override>,
+    # keep_messages: 8}; /autocompact edits the first three. See GatewayServer._maybe_compact and
+    # k3code.context_budget. decision_model: {enabled: false, provider: "", model: "", at_ratio: 0.5}: a small model
+    # picks which old tool results the main model still needs (k3code.context_select)
     context: dict[str, Any] = Field(default_factory=dict)
     # Per model id: {<model id>: {context_window: 200000}}; ids without an entry use k3code.context_budget's defaults
     models: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -247,6 +262,26 @@ class Settings(BaseModel):
             if level not in SCOPES:
                 raise ValueError(f"ultracode.min_scope must be one of {', '.join(SCOPES)} (got {v['min_scope']!r})")
             v = {**v, "min_scope": level}
+        return v
+
+    @field_validator("context")
+    @classmethod
+    def _validate_context(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """The automatic-compaction keys, checked when the config loads: a bad value used to raise inside every turn."""
+        flag = v.get("autocompact")
+        if flag is not None and not isinstance(flag, bool):
+            raise ValueError(f"context.autocompact must be true or false (got {flag!r})")
+        tokens = v.get("compact_at_tokens")
+        if tokens is not None and (isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0):
+            # 0 has always meant "not set" here: configs that carry it keep loading
+            raise ValueError(f"context.compact_at_tokens must be a whole number of tokens (got {tokens!r})")
+        for key in ("keep_messages", "compact_input_chars"):
+            n = v.get(key)
+            if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 1):
+                raise ValueError(f"context.{key} must be a whole number, 1 or more (got {n!r})")
+        ratio = v.get("compact_at_ratio")
+        if ratio is not None and (isinstance(ratio, bool) or not isinstance(ratio, int | float) or not 0 < ratio <= 1):
+            raise ValueError(f"context.compact_at_ratio must be a share of the window above 0 up to 1 (got {ratio!r})")
         return v
 
     @field_validator("wake_words")

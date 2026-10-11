@@ -406,12 +406,15 @@ class SubagentManager:
     def build_loop(self, parent: Any, h: Handle, atype: AgentType, cwd: Path, reliability: Reliability) -> AgentLoop:
         server = self.server
         perms = PermissionState(mode=PermissionMode(parent.perms.mode), cwd=cwd, add_dirs=list(parent.perms.add_dirs))
+        # A child gets the skill tool only when its type lists it and never gets the MCP tools: neither index belongs in
+        # its prompt (up to ~3k tokens of names it cannot call, in every request of a child that makes up to 200)
         base = build_system_prompt(
             parent.system_prompt,
             cwd=cwd,
             config=server.config,
             session_meta=parent.stored.meta,
-            mcp=server.mcp,
+            mcp=None,
+            skills=not atype.tools or "skill" in atype.tools,
         )
         note = ""
         if h.isolation == "worktree":
@@ -420,7 +423,9 @@ class SubagentManager:
                 "your changes are committed and merged back by the harness. Do not run git commands that "
                 "change branches."
             )
-        system = f"[agent:{atype.name}] {h.description}\n\n{base}\n\n{atype.prompt}{note}"
+        # What children of one type share comes first (the provider's cache matches from the top); the task of this
+        # child, which differs, comes after it
+        system = f"{base}\n\n{atype.prompt}\n\n[agent:{atype.name}] {h.description}{note}"
         router = server.tier_routers().get(Tier(h.tier))
         loop = AgentLoop(
             router,
@@ -438,6 +443,9 @@ class SubagentManager:
             unattended_network=bool(autonomy_cfg(server.config)["unattended_network"]),
             task_kind=TaskKind.SUBAGENT.value,
             approval_callback=getattr(parent, "_approval_cb", None),
+            # without these a child (up to 200 model calls) never elided old tool results and overflowed its window
+            tool_output_chars=int((getattr(server.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            context_window=server._router_window(router, parent),
         )
         from k3code.extratools import register_skill_tool
 

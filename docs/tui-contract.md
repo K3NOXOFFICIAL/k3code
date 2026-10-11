@@ -44,11 +44,11 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `clipboard.paste` | `{session_id}` | `{text?, images?, files?}` | ✅ | Paste from clipboard |
 | `paste.collapse` | `{text, session_id?}` | `{path, chars, lines}` | ✅ | A large paste shown as a token: stored 0600 at `$K3CODE_HOME/pastes/<session>/<sha256[:16]>.txt` (the caller's live session; removed with the session) |
 | `process.list` | `{session_id}` | `{processes: ProcessEntry[]}` | ✅ | Processes dock (polled): running foreground `bash` commands and background jobs. Each entry: `session_id` (the process's own row id: the job id, or `fg<pid>`), `kind`, `pid`, `command`, `cwd`, `started`, `status` (`running`/`exited`), `uptime_seconds`, `exit_code`, `exited_at`, `completion_reason`, `output_preview` (last 2 KiB) |
-| `image.attach` | `{session_id, data_uri, name?}` | `{id}` | ✅ | Attach image |
-| `image.attach_bytes` | `{session_id, base64, mime, name?}` | `{id}` | | Attach image from bytes |
+| `image.attach` | `{session_id, data_uri, name?}` | `{id}` | | Attach image. Not supported yet: the core answers with an error (M1) |
+| `image.attach_bytes` | `{session_id, base64, mime, name?}` | `{id}` | | Attach image from bytes. Not supported yet: the core answers with an error (M1) |
 | `image.detach` | `{session_id, path}` | `{ok: boolean}` | ✅ | Detach image |
-| `file.attach` | `{session_id, path, name?}` | `{id}` | | Attach file |
-| `pdf.attach` | `{session_id, data_uri, name?}` | `{id}` | | Attach PDF |
+| `file.attach` | `{session_id, path, name?}` | `{id}` | | Attach file. Not supported yet: the core answers with an error (M1) |
+| `pdf.attach` | `{session_id, data_uri, name?}` | `{id}` | | Attach PDF. Not supported yet: the core answers with an error (M1) |
 | `input.detect_drop` | `{session_id, paths[]}` | `{images[], files[]}` | ✅ | Detect dropped files |
 | `command.dispatch` | `{name, arg?, session_id}` | `CommandResult` | ✅ | Slash commands |
 | `slash.exec` | `{command, session_id}` | `SlashExecResponse` | ✅ | Internal slash exec |
@@ -160,7 +160,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `session.resume_progress` | `{phase, status, message_count?, message?}` | | Resume hydration |
 | `session.reclaimed` | `{session_id, stored_session_id, reason}` | | Session stolen |
 | `session.control.update` | `{control: SessionControlSnapshot}` | ✅ | Goal/loop/heartbeat |
-| `session.usage` | `{usage: Usage}` | | Mid-turn usage. `Usage` is `{prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens}`; the cache counts are part of `prompt_tokens` (0 = none or not reported) |
+| `session.usage` | `{usage: Usage}` | | Mid-turn usage. `Usage` is `{prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens}`; the cache counts are part of `prompt_tokens` (0 = none or not reported). The payload also carries where the session stands in its context window: `context_used` (the call's prompt and answer tokens; an estimate of the next request when `context_estimated` is true, as after a compaction), `context_max`, `context_percent`, `autocompact_at` (tokens at which automatic compaction starts, `null` when `/autocompact off`) and `compressions` (how often the session was compacted) |
 | `message.start` | `{}` | ✅ | Turn begins |
 | `message.delta` | `{text, rendered?, verbose?}` | ✅ | Streaming text |
 | `reasoning.delta` | `{text, rendered?, verbose?}` | ✅ | Streaming reasoning |
@@ -168,7 +168,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `thinking.delta` | `{text, rendered?, verbose?}` | | Legacy thinking |
 | `message.interim` | `{text, already_streamed}` | ✅ | Interim assistant text |
 | `message.complete` | `{text, usage, status, reasoning, warning, billing, error, ...}` | ✅ | Turn complete (`usage` as in `session.usage`) |
-| `status.update` | `{kind, text}` | ✅ | Status line |
+| `status.update` | `{kind, text}` | ✅ | Status line. `kind` `compacting` is sent when an automatic compaction starts and `compacted` when it ends (also when it failed), so the TUI shows the wait |
 | `tool.start` | `{tool_id, name, context?, args?, args_text?, preview?, labels?}` | ✅ | Tool call start |
 | `tool.complete` | `{tool_id, name, args?, duration_s, result, summary, result_text, inline_diff?, todos?, revision?, labels?}` | ✅ | Tool call done |
 | `tool.generating` | `{name}` | ✅ | Model emitting tool args |

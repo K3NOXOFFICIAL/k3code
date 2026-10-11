@@ -839,10 +839,10 @@ async def test_streaming_works_and_a_full_pool_of_busy_processes_falls_back_to_o
     p = ClaudeCliProvider(name="cc", command=str(pshim), max_sessions=1)
     gate = tmp_path / "gate"
     _ctl(tmp_path, reply="hello", deltas=["hel", "lo"], gate=str(gate))
-    first = p.stream([Message(role="user", content="a")], [], "m1")
+    first = p.stream([Message(role="user", content="a")], TOOLS, "m1")
     head = await anext(first)
     assert head.type == "text_delta" and head.text == "hel" and not gate.exists()  # streamed before the result
-    other = asyncio.create_task(_collect(p, [Message(role="user", content="b")], tools=[]))
+    other = asyncio.create_task(_collect(p, [Message(role="user", content="b")], tools=TOOLS))
     for _ in range(200):
         if len(_lines(tmp_path, ".msgs")) == 2:
             break
@@ -853,6 +853,20 @@ async def test_streaming_works_and_a_full_pool_of_busy_processes_falls_back_to_o
     spawns = _lines(tmp_path, ".spawns")
     assert len(spawns) == 2 and "--input-format" not in spawns[1]["argv"]  # the busy process was not shared
     assert len(p._pool) == 1
+    await _close_and_check(p, tmp_path)
+
+
+async def test_calls_without_tools_never_take_a_slot_from_the_conversation(pshim: Path, tmp_path: Path) -> None:
+    """A title, a judge or a compaction summary continues nothing: it runs in a throwaway process, and the
+    conversation's own process stays in the pool however many of them run."""
+    p = ClaudeCliProvider(name="cc", command=str(pshim), max_sessions=1)
+    _ctl(tmp_path, reply="ok")
+    await _collect(p, [Message(role="user", content="build it")], tools=TOOLS)
+    (conversation,) = p._pool
+    for i in range(3):
+        await _collect(p, [Message(role="user", content=f"title {i}")], tools=[])
+    assert p._pool == [conversation] and conversation.proc.returncode is None
+    assert len(_lines(tmp_path, ".spawns")) == 4  # three one-shot processes besides the conversation's
     await _close_and_check(p, tmp_path)
 
 

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import dataclasses
 import os
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
     format_no_match_hint,
     fuzzy_find_and_replace,
+    is_already_applied,
 )
 from k3code.tools.jobs import MAX_UNREAD_BYTES
 
@@ -27,7 +29,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, tuple[ToolSpec, callable]] = {}
         self._deferred: set[str] = set()  # registered + callable, but schema hidden until activated
-        self._active: set[str] = set()
+        self._active: list[str] = []  # in the order they were activated
 
     def register(self, spec: ToolSpec, handler: callable, *, deferred: bool = False) -> None:
         self._tools[spec.name] = (spec, handler)
@@ -38,13 +40,21 @@ class ToolRegistry:
 
     def activate(self, names: list[str]) -> None:
         """Start advertising the schemas of deferred tools (``mcp_tool_search``)."""
-        self._active.update(n for n in names if n in self._deferred)
+        self._active.extend(n for n in dict.fromkeys(names) if n in self._deferred and n not in self._active)
+
+    def active_names(self) -> list[str]:
+        """The deferred tools advertised so far, in activation order."""
+        return list(self._active)
 
     def get(self, name: str) -> tuple[ToolSpec, callable] | None:
         return self._tools.get(name)
 
     def specs(self) -> list[ToolSpec]:
-        return [spec for n, (spec, _) in self._tools.items() if n not in self._deferred or n in self._active]
+        """The tools the model is sent: the always-on ones in registration order, then the activated deferred ones in
+        activation order. The tool list leads every request, so a tool joining it in the middle (at its registration
+        place) rewrote everything after it; at the end it only extends the list."""
+        always = [spec for n, (spec, _) in self._tools.items() if n not in self._deferred]
+        return always + [self._tools[n][0] for n in self._active if n in self._tools]
 
     def names(self) -> list[str]:
         return list(self._tools.keys())
@@ -172,6 +182,23 @@ def _cap_line(line: str) -> str:
     return f"{line[:READ_MAX_LINE_CHARS]}... [line cut: {len(line)} chars]"
 
 
+def _not_a_file(path: Path) -> str:
+    """Why ``path`` cannot be read or edited as a file, with what the model can do about it: a directory is named as one
+    (it used to read "File not found"), and a missing file lists similarly named files of its directory."""
+    if path.is_dir():
+        return f'{path} is a directory, not a file: list it with glob (pattern "*") or bash ls'
+    if not path.parent.is_dir():
+        return f"File not found: {path} (the directory {path.parent} does not exist)"
+    import difflib
+
+    try:
+        names = sorted(p.name for p in path.parent.iterdir() if p.is_file())
+    except OSError:
+        names = []
+    close = difflib.get_close_matches(path.name, names, n=3, cutoff=0.6)
+    return f"File not found: {path}" + (f". Similar files in that directory: {', '.join(close)}" if close else "")
+
+
 async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Read a file: ``limit`` lines (default READ_DEFAULT_LIMIT) from line ``offset``, within READ_MAX_CHARS.
 
@@ -180,7 +207,7 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     """
     path = _resolve_path(arguments["path"], cwd)
     if not path.is_file():
-        return {"error": f"File not found: {path}"}
+        return {"error": _not_a_file(path)}
     explicit = any(k in arguments for k in ("offset", "limit", "start", "end"))
     first, count = _read_window(arguments)
     size = path.stat().st_size
@@ -192,7 +219,13 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 "pass offset and limit (or start and end) to read a line range, or use grep to find what you need"
             }
         return _read_range(path, first, first + (count or READ_DEFAULT_LIMIT) - 1)
-    text = path.read_bytes().decode("utf-8", errors="replace")  # reading may show U+FFFD; it never writes back
+    raw = path.read_bytes()
+    if b"\x00" in raw[:8192]:  # a binary file read as text is U+FFFD and NULs: tens of thousands of useless tokens
+        return {
+            "error": f"{path} looks like a binary file ({size} bytes): not shown. Use bash (file, xxd, strings) to "
+            "inspect it"
+        }
+    text = raw.decode("utf-8", errors="replace")  # reading may show U+FFFD; it never writes back
     lines = _split_lines(text)
     total = len(lines)
     first = min(first, total + 1)
@@ -229,7 +262,7 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included)."""
     path = _resolve_path(arguments["path"], cwd)
     if not path.is_file():
-        return {"error": f"File not found: {path}"}
+        return {"error": _not_a_file(path)}
     old_string = arguments["old_string"]
     new_string = arguments["new_string"]
     replace_all = arguments.get("replace_all", False)
@@ -251,6 +284,8 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         content, old_string, new_string, replace_all=replace_all
     )
     if error:
+        if count == 0 and is_already_applied(content, old_string, new_string):  # a re-sent edit: it is in the file
+            return {"content": f"No change needed: {path.name} already contains new_string and no longer old_string."}
         hint = format_no_match_hint(error, count, old_string, content)
         return {"error": error + hint}
     if crlf:
@@ -260,8 +295,10 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
 
 
 #: bash: seconds before a foreground command is killed, when the call names no timeout, and the most it may name.
-BASH_DEFAULT_TIMEOUT = 30
+BASH_DEFAULT_TIMEOUT = 120  # a test run or a build is ordinary work: at 30 s it was killed with its work lost
 BASH_MAX_TIMEOUT = 600
+#: Seconds the pipes of a command that has exited get to reach EOF before a child still holding them is stopped.
+PIPE_GRACE_S = 1.0
 
 
 async def _spawn_shell(
@@ -334,8 +371,13 @@ async def tool_bash(
             asyncio.ensure_future(_drain(proc.stdout, out, proc)),
             asyncio.ensure_future(_drain(proc.stderr, err, proc)),
         ]
+        held: set[asyncio.Future[None]] = set()
         try:
-            await asyncio.wait_for(asyncio.gather(*readers, proc.wait()), timeout=timeout)
+            # The command's own exit ends the wait, not the end of its pipes: a child it left running (`server &`)
+            # holds them open, and waiting for EOF made `sleep 100 & echo started` a "timed out" failure after the
+            # whole timeout, with the work done.
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+            _, held = await asyncio.wait(readers, timeout=PIPE_GRACE_S)
         except TimeoutError:
             await _kill_group(proc)
             return {
@@ -345,6 +387,15 @@ async def tool_bash(
                 "stderr": err.text(),
                 "exit_code": -1,
             }
+        note = ""
+        if held:  # the command is done but something it started still has its output: stop that, and say so
+            for reader in held:
+                reader.cancel()
+            await _kill_group(proc)
+            note = (
+                "a process this command started in the background was stopped when the command returned; "
+                "use background: true to keep one running"
+            )
         if out.overflowed or err.overflowed:
             return {
                 "error": f"Output limit exceeded ({MAX_OUTPUT_BYTES // (1024 * 1024)} MB): command killed",
@@ -352,7 +403,8 @@ async def tool_bash(
                 "stderr": err.text(),
                 "exit_code": -9,
             }
-        return {"stdout": out.text(), "stderr": err.text(), "exit_code": proc.returncode}
+        result = {"stdout": out.text(), "stderr": err.text(), "exit_code": proc.returncode}
+        return {**result, "note": note} if note else result
     except Exception as e:
         return {"error": f"Failed to execute: {e}"}
     finally:
@@ -363,6 +415,14 @@ async def tool_bash(
                 await asyncio.shield(_kill_group(proc))
 
 
+#: Terminal colour and cursor codes (CSI sequences): a build tool's progress bar is hundreds of tokens of them.
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+#: Where a PostToolUse hook's feedback rides on a tool result. It used to replace ``content``: a ``read`` result was
+#: then numbered a second time, and an error result with feedback looked like a success to the failure counter.
+HOOK_FEEDBACK_KEY = "hook_feedback"
+
+
 def format_tool_result(result: dict[str, Any]) -> Any:
     """What the model, the journal and the TUI see of one tool result.
 
@@ -371,21 +431,27 @@ def format_tool_result(result: dict[str, Any]) -> Any:
     showed that as one unreadable line, and a model that copied a line it had read that way into an ``edit`` copied
     the escapes too. They are plain text now (stdout as is; stderr, an error note and a non-zero exit code only when
     there is something to say). ``read`` is numbered like ``cat -n`` and ends with how to read on when it stopped
-    before the end of the file. Every other result is unchanged: other ``content``, small ok/error dicts.
+    before the end of the file. Every other result is unchanged: other ``content``, small ok/error dicts. A PostToolUse
+    hook's word (``HOOK_FEEDBACK_KEY``) follows the result it is about.
     """
+    if feedback := result.get(HOOK_FEEDBACK_KEY):
+        body = format_tool_result({k: v for k, v in result.items() if k != HOOK_FEEDBACK_KEY})
+        return f"{body}\n\n[PostToolUse hook] {feedback}"
     if "content" in result and "first" in result:  # read
         return _numbered_read(result)
     if "content" in result:
         return result["content"]
     if "stdout" in result or "stderr" in result:  # bash
-        out = str(result.get("stdout") or "").rstrip("\n")
-        err = str(result.get("stderr") or "").rstrip("\n")
+        out = _ANSI.sub("", str(result.get("stdout") or "")).rstrip("\n")
+        err = _ANSI.sub("", str(result.get("stderr") or "")).rstrip("\n")
         code = result.get("exit_code")
         parts = [out] if out else []
         if err:
             parts.append(f"[stderr]\n{err}")
         if result.get("error"):  # timeout, output limit
             parts.append(f"[{result['error']}]")
+        if result.get("note"):
+            parts.append(f"[{result['note']}]")
         if code not in (0, None):
             parts.append(f"[exit code {code}]")
         return "\n".join(parts) if parts else "(no output)"
@@ -471,6 +537,8 @@ _CLIP_HINTS = {
     "grep": "grep a narrower pattern or path",
     "glob": "glob a narrower pattern or path",
     "read": "read with offset and limit",
+    # the unread part of a job's log is cleared when it is returned: what was cut is gone, so say how to keep it
+    "bash_output": "the middle of this output is gone; run the job with `> job.log` and read it with tail or grep",
 }
 _CLIP_HINT_DEFAULT = "narrow the request to see the rest"
 #: A read result has its own budget (READ_MAX_CHARS); this is only a backstop for read results stored before it.
@@ -545,14 +613,34 @@ async def _kill_group(proc: asyncio.subprocess.Process) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
+#: grep: a match line longer than this is cut (rg --max-columns), so one minified file cannot fill the result.
+GREP_MAX_COLUMNS = 300
+
+
+def _shown(path: Path, base: Path) -> str:
+    """``path`` as the model should see it: relative to ``base`` (the session's directory) when it lies under it. The
+    absolute prefix was repeated on every match line of a grep."""
+    try:
+        return path.relative_to(base).as_posix()
+    except ValueError:
+        return str(path)
+
+
 async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Search for a pattern using ripgrep or Python fallback."""
     pattern = arguments["pattern"]
+    base = Path(cwd) if cwd else Path.cwd()
     path = _resolve_path(arguments.get("path", "."), cwd)
     include = arguments.get("include")
     exclude = arguments.get("exclude")
+    if not path.exists():
+        return {"error": f"Path not found: {_shown(path, base)}"}
     try:
         cmd = ["rg", "--line-number", "--no-heading", "--color=never"]
+        cmd += ["--max-columns", str(GREP_MAX_COLUMNS), "--max-columns-preview"]
+        if not SKIP_DIRS.intersection(path.parts):  # without a .gitignore rg would search node_modules and dist
+            for skipped in sorted(SKIP_DIRS - {".git"}):
+                cmd += ["-g", f"!{skipped}"]
         if include:
             for inc in include if isinstance(include, list) else [include]:
                 cmd += ["-g", inc]
@@ -560,9 +648,10 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
             for exc in exclude if isinstance(exclude, list) else [exclude]:
                 cmd += ["-g", f"!{exc}"]
         # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
-        cmd += ["-e", pattern, "--", str(path)]
+        cmd += ["-e", pattern, "--", _shown(path, base) if path != base else "."]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            cwd=base,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -575,16 +664,19 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 proc.kill()  # rg kept scanning after the timeout
             await proc.wait()
             return {"error": "grep timed out after 10 s: narrow the path or the pattern"}
-        if proc.returncode == 2 and stdout.strip():
+        text = stdout.decode("utf-8", errors="replace").strip()
+        text = "\n".join(line.removeprefix("./") for line in text.splitlines())
+        if proc.returncode == 2 and text:
             # rg exits 2 when any entry was unreadable (a root-owned dir) but still prints every other match
             note = stderr.decode("utf-8", errors="replace").strip().splitlines()[:3]
-            return {"matches": stdout.decode("utf-8", errors="replace").strip(), "warnings": note}
-        if proc.returncode not in (0, 1):  # 1 = no matches
-            raise RuntimeError(stderr.decode("utf-8", errors="replace"))
-        return {"matches": stdout.decode("utf-8", errors="replace").strip()}
-    except (FileNotFoundError, RuntimeError):
-        # Python fallback (no rg): off the event loop, same tree rules as glob, capped
-        return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude)
+            return {"matches": text, "warnings": note}
+        if proc.returncode not in (0, 1):  # 1 = no matches; 2 with no output is rg refusing the request (a bad regex)
+            reason = stderr.decode("utf-8", errors="replace").strip().splitlines()
+            return {"error": f"grep failed: {' '.join(line.strip() for line in reason[:4]) or 'rg exited 2'}"}
+        return {"matches": text}
+    except FileNotFoundError:  # no rg installed
+        # Python fallback: off the event loop, same tree rules as glob, capped
+        return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude, base)
 
 
 #: Directories glob and the grep fallback never enter (rg skips them through .gitignore or as hidden).
@@ -657,16 +749,21 @@ def _capped(items: list[str]) -> tuple[list[str], str]:
 
 def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
     files, dirs = _tree(path)
-    found, note = _capped(sorted(p for p in (*files, *dirs) if _glob_match(p, pattern)))
+    patterns = _expand_braces(pattern)
+    found, note = _capped(sorted(p for p in (*files, *dirs) if any(_glob_match(p, pat) for pat in patterns)))
     return {"files": found, **({"note": note} if note else {})}
 
 
-def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict[str, Any]:
+def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: Path | None = None) -> dict[str, Any]:
     import re
 
     includes = include if isinstance(include, list) else [include] if include else []
     excludes = exclude if isinstance(exclude, list) else [exclude] if exclude else []
-    rx = re.compile(pattern)
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        return {"error": f"grep failed: invalid regex {pattern!r}: {e}"}
+    base = base or Path.cwd()
     candidates = [path] if path.is_file() else [path / f for f in _tree(path)[0]]
     matches: list[str] = []
     for fp in candidates:
@@ -678,17 +775,55 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
             text = fp.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        matches.extend(f"{fp}:{i}:{line}" for i, line in enumerate(text.splitlines(), 1) if rx.search(line))
+        shown = _shown(fp, base)
+        matches.extend(
+            f"{shown}:{i}:{line[:GREP_MAX_COLUMNS]}" for i, line in enumerate(text.splitlines(), 1) if rx.search(line)
+        )
         if len(matches) > MAX_SEARCH_RESULTS:
             break
     shown, note = _capped(matches)
     return {"matches": "\n".join(shown), **({"warnings": note} if note else {})}
 
 
+def _expand_braces(pattern: str) -> list[str]:
+    """``a.{py,md}`` -> ``a.py``, ``a.md`` (nested groups too); a pattern without a group is returned as it is."""
+    depth, start = 0, -1
+    for i, ch in enumerate(pattern):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                parts, level, last = [], 0, start + 1
+                for j in range(start + 1, i):
+                    if pattern[j] == "{":
+                        level += 1
+                    elif pattern[j] == "}":
+                        level -= 1
+                    elif pattern[j] == "," and level == 0:
+                        parts.append(pattern[last:j])
+                        last = j + 1
+                parts.append(pattern[last:i])
+                if len(parts) < 2:  # `{x}` is no alternation: leave it to fnmatch
+                    break
+                return [e for part in parts for e in _expand_braces(pattern[:start] + part + pattern[i + 1 :])]
+    return [pattern]
+
+
 async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Find files matching a glob pattern (skipping .git, node_modules, .venv, dist and what .gitignore ignores)."""
+    """Find files matching a glob pattern (skipping .git, node_modules, .venv, dist and what .gitignore ignores).
+
+    ``{a,b}`` groups are expanded, and an absolute pattern searches from the directory its first wildcard is under."""
     pattern = arguments["pattern"]
     path = _resolve_path(arguments.get("path", "."), cwd)
+    if pattern.startswith("/"):  # /repo/src/**/*.py: the part before the first wildcard is the directory to search
+        parts = pattern.split("/")
+        fixed = next((i for i, part in enumerate(parts) if any(c in part for c in "*?[{")), len(parts) - 1)
+        path, pattern = Path("/".join(parts[:fixed]) or "/"), "/".join(parts[fixed:])
+    if not path.is_dir():
+        return {"error": f"Directory not found: {path}"}
     return await asyncio.to_thread(_glob_sync, path, pattern)
 
 
@@ -952,8 +1087,8 @@ def build_registry() -> ToolRegistry:
                 "properties": {
                     "pattern": {"type": "string"},
                     "path": {"type": "string", "default": "."},
-                    "include": {"type": ["string", "array"]},
-                    "exclude": {"type": ["string", "array"]},
+                    "include": {"type": ["string", "array"], "items": {"type": "string"}},
+                    "exclude": {"type": ["string", "array"], "items": {"type": "string"}},
                 },
                 "required": ["pattern"],
             },

@@ -52,11 +52,15 @@ def test_the_anthropic_payload_marks_system_last_tool_and_newest_message():
 def test_the_moving_breakpoint_follows_a_plain_user_message_and_never_lands_on_empty_text():
     p = AnthropicProvider(name="a", api_key="k")
     msgs = [Message(role="system", content="S"), Message(role="user", content="hello")]
-    payload = p._payload(msgs, [], "claude-test", max_tokens=100, temperature=None)
+    payload = p._payload(msgs, TOOLS, "claude-test", max_tokens=100, temperature=None)
     assert payload["messages"][-1]["content"] == [
         {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
     ]
-    assert "tools" not in payload and breakpoints(payload) == 2
+    assert breakpoints(payload) == 3
+    # a call without tools (title, classifier, judge, summary) is asked once: the newest message is never read back, so
+    # it does not carry the cache-write surcharge; the system prompt still does
+    once = p._payload(msgs, [], "claude-test", max_tokens=100, temperature=None)
+    assert once["messages"][-1]["content"] == "hello" and "tools" not in once and breakpoints(once) == 1
     empty = p._payload([Message(role="user", content="")], [], "claude-test", max_tokens=100, temperature=None)
     assert breakpoints(empty) == 0 and "system" not in empty
     silent = [*conversation()[:3], Message(role="tool", content="", tool_call_id="c1", name="read")]
@@ -70,9 +74,12 @@ def test_prompt_cache_off_sends_no_breakpoints():
     assert breakpoints(payload) == 0 and payload["system"] == "SYSTEM PROMPT"
 
 
-def test_openai_compatible_marks_messages_only_when_on_and_the_model_is_claude():
+def test_openai_compatible_marks_messages_only_when_not_off_and_the_model_is_claude():
     auto = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k")
-    assert breakpoints(auto._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)) == 0
+    assert breakpoints(auto._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)) == 2
+    assert breakpoints(auto._payload(conversation(), TOOLS, "gpt-4o", max_tokens=100, temperature=None)) == 0
+    off = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", prompt_cache="off")
+    assert breakpoints(off._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)) == 0
     on = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", prompt_cache="on")
     assert breakpoints(on._payload(conversation(), TOOLS, "gpt-4o", max_tokens=100, temperature=None)) == 0
     payload = on._payload(conversation(), TOOLS, "anthropic/claude-test", max_tokens=100, temperature=None)

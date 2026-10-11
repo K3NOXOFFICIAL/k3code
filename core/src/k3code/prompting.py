@@ -30,6 +30,7 @@ def build_system_prompt(
     config: Any,
     session_meta: dict[str, Any] | None = None,
     mcp: Any = None,
+    skills: bool = True,
 ) -> str:
     # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
     # come first and the learned ones (USER.md's auto section is rewritten by the distiller) come last: a rewrite
@@ -39,8 +40,11 @@ def build_system_prompt(
     if style:
         parts.append(style)
     ctx = getattr(config, "context", None) or {}  # M1: prompt-size knobs the optimizer may tune (defaults unchanged)
-    if skills := skills_prompt(cwd, list(config.skills.roots), limit=int(ctx.get("skill_prompt_limit", PROMPT_LIMIT))):
-        parts.append(skills)
+    # ``skills=False``: the caller has no skill tool, so an index of skills it cannot call would only cost tokens
+    if skills and (
+        index := skills_prompt(cwd, list(config.skills.roots), limit=int(ctx.get("skill_prompt_limit", PROMPT_LIMIT)))
+    ):
+        parts.append(index)
     if mcp is not None and (m := mcp_prompt(mcp)):
         parts.append(m)
     from k3code.learning.projectprep import facts_prompt
