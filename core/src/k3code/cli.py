@@ -982,11 +982,19 @@ def doctor_cmd(as_json: bool, no_probe: bool, install_subset: bool) -> None:
 @click.option("--json", "as_json", is_flag=True)
 def stats_cmd(by: str, days: int | None, as_json: bool) -> None:
     """Usage per day or session from $K3CODE_HOME/usage.db."""
+    from k3code.config import load_config
     from k3code.daemon import k3_home
     from k3code.usage import UsageDB, format_stats
 
     rows = UsageDB(k3_home() / "usage.db").aggregate(by, days=days)
-    click.echo(json.dumps(rows, indent=2) if as_json else format_stats(rows, by))
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    try:
+        config = load_config(project_dir=Path.cwd())
+    except Exception:  # noqa: BLE001 - a broken config still lets the numbers print, in the default currency
+        config = None
+    click.echo(format_stats(rows, by, config))
 
 
 @cli.command("export")
@@ -1203,11 +1211,12 @@ def update_cmd(
             )
             return
         click.echo(f"current: {cur}\nlatest:  {head[:7]} ({git_ref})")
-        if check:
-            return
         have = upd.installed_sha()
         if have and head.startswith(have):
             click.echo("Already up to date.")
+            return
+        if check:
+            click.echo("Update available: run `k3code update`.")
             return
         if not yes:
             click.confirm(f"Update to {head[:7]} ({git_ref})?", abort=True)
@@ -1239,9 +1248,9 @@ def update_cmd(
     else:
         assert rel is not None
         click.echo(f"current: {cur}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
-        if check or not upd.is_newer(rel.version, cur):
-            if not check:
-                click.echo("Already up to date.")
+        newer = upd.is_newer(rel.version, cur)
+        if check or not newer:
+            click.echo("Update available: run `k3code update`." if newer else "Already up to date.")
             return
         if not yes:
             click.confirm(f"Update to {rel.version}?", abort=True)

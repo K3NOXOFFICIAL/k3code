@@ -168,7 +168,12 @@ def restart(unit: str = UNIT_NAME) -> None:
 
 
 def install(dry_run: bool = False) -> list[str]:
-    """Write the unit, reload, enable --now. Returns the lines describing (or reporting) each step."""
+    """Write the unit, reload, restart a running daemon, enable --now. Returns the lines describing each step.
+
+    Raises ServiceError when a systemctl step fails (the unit files stay written): reporting it as text made
+    ``k3code service install`` exit 0 with nothing installed. ``try-restart`` goes before ``enable --now`` so an
+    already-running daemon picks up a changed ExecStart or WatchdogSec (``enable --now`` leaves it alone), while a
+    fresh install is started once, not twice."""
     unit = render_unit()
     path = unit_path()
     recover = recover_unit_path()
@@ -176,6 +181,7 @@ def install(dry_run: bool = False) -> list[str]:
         f"write {path}",
         f"write {recover}",
         "systemctl --user daemon-reload",
+        f"systemctl --user try-restart {UNIT_NAME}",
         f"systemctl --user enable --now {UNIT_NAME}",
     ]
     advice = (
@@ -198,11 +204,11 @@ def install(dry_run: bool = False) -> list[str]:
     path.write_text(unit)
     recover.write_text(render_recover_unit())
     out = [f"wrote {path}", f"wrote {recover}"]
-    for args in (("daemon-reload",), ("enable", "--now", UNIT_NAME)):
+    for args in (("daemon-reload",), ("try-restart", UNIT_NAME), ("enable", "--now", UNIT_NAME)):
         r = _systemctl(*args)
-        out.append(
-            f"systemctl --user {' '.join(args)}: " + ("ok" if r.returncode == 0 else f"failed: {r.stderr.strip()}")
-        )
+        if r.returncode != 0:
+            raise ServiceError(f"systemctl --user {' '.join(args)} failed: {(r.stderr or r.stdout).strip()[:300]}")
+        out.append(f"systemctl --user {' '.join(args)}: ok")
     out.append(advice)
     return out
 

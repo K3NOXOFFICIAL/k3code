@@ -7,7 +7,11 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 
+from k3code.automation.runner import PACING_MIN_S
+
 _RANGES = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
+#: A fixed interval is never shorter than a self-paced tick: every run is a model turn, and ``/loop 1s`` was a hot loop.
+MIN_INTERVAL_S = PACING_MIN_S
 _NAMES = {
     "jan": 1,
     "feb": 2,
@@ -48,9 +52,9 @@ def _val(tok: str, idx: int) -> int:
         v = int(t)
     else:
         raise ScheduleError(f"bad cron token {tok!r}")
-    if idx == 4 and v == 7:
-        v = 0
     lo, hi = _RANGES[idx]
+    if idx == 4:
+        hi = 7  # 7 is Sunday too; _parse_field folds it to 0 once the range is expanded (so 5-7 keeps Sunday)
     if not lo <= v <= hi:
         raise ScheduleError(f"cron field {idx + 1} value {v} out of range {lo}-{hi}")
     return v
@@ -71,15 +75,13 @@ def _parse_field(text: str, idx: int) -> set[int]:
         elif "-" in part:
             x, y = part.split("-", 1)
             a, b = _val(x, idx), _val(y, idx)
-            if idx == 4 and y == "7":
-                b = 6
         else:
             a = _val(part, idx)
-            b = hi if step > 1 else a
+            b = max(hi, a) if step > 1 else a
         if a > b:
             raise ScheduleError(f"bad cron range {part!r}")
         out.update(range(a, b + 1, step))
-    return out
+    return {v % 7 for v in out} if idx == 4 else out
 
 
 @dataclass(frozen=True)
@@ -93,17 +95,16 @@ class CronSpec:
     dow_star: bool
 
     def day_matches(self, dt: datetime) -> bool:
+        """Vixie/cronie rule: a day-of-month or day-of-week field that *starts* with ``*`` (``*``, ``*/2``) makes both
+        fields apply together (``0 9 */2 * mon`` = Mondays on odd days); only when both are plain lists is either one
+        enough (``0 0 1 * 1`` = the 1st or a Monday)."""
         if dt.month not in self.month:
             return False
         dom_ok = dt.day in self.dom
         dow_ok = ((dt.weekday() + 1) % 7) in self.dow  # cron: 0=Sunday
-        if self.dom_star and self.dow_star:
-            return True
-        if self.dom_star:
-            return dow_ok
-        if self.dow_star:
-            return dom_ok
-        return dom_ok or dow_ok  # classic cron: both restricted → either
+        if self.dom_star or self.dow_star:
+            return dom_ok and dow_ok
+        return dom_ok or dow_ok
 
 
 def parse_cron(expr: str) -> CronSpec:
@@ -161,7 +162,7 @@ class Schedule:
     def next_after(self, after: float, tz: tzinfo | None = None) -> float:
         if self.kind == "cron":
             return cron_next(self.expr, after, tz)
-        return after + self.seconds
+        return after + max(self.seconds, MIN_INTERVAL_S)  # rows stored before the floor existed are held to it too
 
     def describe(self) -> str:
         return self.expr if self.kind == "cron" else f"every {format_seconds(self.seconds)}"
@@ -183,14 +184,14 @@ def format_seconds(s: float) -> str:
 
 
 def parse_interval(text: str) -> float | None:
-    """``5m`` / ``every 2h`` / ``90s`` → seconds, or None when ``text`` is not an interval."""
+    """``5m`` / ``every 2h`` / ``90s`` → seconds (at least MIN_INTERVAL_S), or None when ``text`` is not an interval."""
     m = _INTERVAL_RE.match(text.strip())
     if not m:
         return None
     secs = float(m.group(1)) * _UNITS[m.group(2).lower()[0]]
     if secs <= 0:
         raise ScheduleError("interval must be positive")
-    return secs
+    return max(secs, MIN_INTERVAL_S)  # `/loop 1s` would run a model turn in a hot loop: shorter than 60 s is 60 s
 
 
 def parse_schedule(text: str) -> Schedule:

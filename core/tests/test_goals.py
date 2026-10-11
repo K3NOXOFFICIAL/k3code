@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from k3code.agent.loop import AgentLoop
 from k3code.automation.server_runner import ServerRunner
 from k3code.errors import ChainExhausted
@@ -223,3 +225,42 @@ async def test_failing_check_pauses_after_20_retries_by_default_and_0_means_no_l
     await capped.evaluate_after_turn("done!", judge)
     paused = await capped.evaluate_after_turn("done!", judge)
     assert not paused.should_continue and capped.state.paused_reason == "check exhausted 2 retries: $ exit 1"
+
+
+async def test_a_check_that_could_not_run_pauses_at_once_instead_of_costing_20_turns(monkeypatch):
+    # the sandbox was unusable: run_gate answered "failed (exit -1)" and the model got 20 "fix the check" turns
+    import k3code.goals as goals
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    judge = scripted_judge(["done"])
+    mgr = _mem_manager()
+    mgr.set("ship", check="make test")
+    decision = await mgr.evaluate_after_turn("done!", judge)
+    assert not decision.should_continue and decision.prompt is None and mgr.state.status == "paused"
+    assert mgr.state.paused_reason == "check could not run: $ make test"
+    assert mgr.state.gates[0].attempts == 0 and mgr.state.gates[0].last_exit_code == goals.GATE_COULD_NOT_RUN
+    assert "could not run" in decision.message and "unusable" in decision.message and "/goal resume" in decision.message
+    assert mgr.state.last_verdict == "gate_failed"
+
+    async def cannot_spawn(*a, **k):
+        raise FileNotFoundError("bwrap")
+
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    monkeypatch.setattr(sandbox, "spawn_unattended_shell", cannot_spawn)
+    again = _mem_manager()
+    again.set("ship", check="make test")
+    assert not (await again.evaluate_after_turn("done!", judge)).should_continue and again.state.status == "paused"
+
+
+async def test_a_check_that_ran_and_failed_or_timed_out_still_goes_back_to_the_model(tmp_path):
+    from k3code.reliability import sandbox
+
+    if not sandbox.usable():
+        pytest.skip("needs a usable bwrap to run a check")
+    judge = scripted_judge(["done"])
+    mgr = _mem_manager()
+    mgr.set("ship", check="exit 3")
+    decision = await mgr.evaluate_after_turn("done!", judge, cwd=str(tmp_path))
+    assert decision.should_continue and decision.verdict == "gate_failed" and "Exit code: 3" in decision.prompt
+    assert mgr.state.gates[0].attempts == 1 and mgr.state.status == "active"

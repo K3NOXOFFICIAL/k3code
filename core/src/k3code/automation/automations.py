@@ -12,7 +12,7 @@ from typing import Any
 
 from k3code.automation.clock import Clock
 from k3code.automation.cronexpr import Schedule, ScheduleError, parse_schedule
-from k3code.automation.runner import Runner, RunResult
+from k3code.automation.runner import Runner, RunResult, WaitOnline
 from k3code.automation.store import AutomationDB, new_id
 from k3code.automation.triggers import (
     CronTrigger,
@@ -41,6 +41,17 @@ _REQUIRED = {
     "idle": ("minutes",),
 }
 _ACTION_REQUIRED = {"prompt": "prompt", "shell": "command", "notify": "text", "goal": "objective"}
+
+#: Policy applied to triggers whose action can cause its own next event (it edits the watched files, it commits) or
+#: that an outside sender drives, unless the automation's own ``policy`` sets the key (``0`` switches one off).
+#: An event inside the cooldown or over the hourly cap is dropped, not queued.
+DEFAULT_POLICY: dict[str, dict[str, float]] = {
+    "file_change": {"cooldown_s": 30, "max_per_hour": 30},
+    "git": {"cooldown_s": 30, "max_per_hour": 30},
+    "webhook": {"cooldown_s": 5, "max_per_hour": 120},
+}
+#: Actions that need a model: they wait for the network and a resumed daemon before an occurrence is consumed.
+_MODEL_ACTIONS = ("prompt", "goal")
 
 
 class AutomationError(ValueError):
@@ -96,6 +107,7 @@ class AutomationManager:
         slot: Callable[[], Any] | None = None,
         activity: Callable[[], float] | None = None,
         on_change: Callable[[], None] | None = None,
+        wait_online: WaitOnline | None = None,
         webhook_port: int | None = None,
         git_poll_s: float = 15.0,
         idle_poll_s: float = 30.0,
@@ -107,6 +119,8 @@ class AutomationManager:
         self.slot = slot or contextlib.nullcontext
         self.activity = activity or (lambda: clock.now())
         self.on_change = on_change or (lambda: None)
+        self.wait_online = wait_online
+        self.active = True  # False: another process arms and fires (see AutomationEngine); rows are still managed
         self.webhook_port = webhook_port
         self.git_poll_s, self.idle_poll_s, self.grace_s = git_poll_s, idle_poll_s, grace_s
         self.webhook: WebhookServer | None = None
@@ -118,8 +132,12 @@ class AutomationManager:
 
     async def start(self) -> None:
         if self.webhook_port is not None and self.webhook is None:
-            self.webhook = WebhookServer(self.webhook_port)
-            await self.webhook.start()
+            hook = WebhookServer(self.webhook_port)
+            try:
+                await hook.start()
+                self.webhook = hook
+            except OSError as e:  # a busy port must not take the daemon down: webhook triggers stay unarmed
+                logger.error("automation: webhook listener on 127.0.0.1:%s not started: %s", self.webhook_port, e)
         for row in self.db.rows("automations", "state='active'"):
             self._arm(row)
 
@@ -134,6 +152,8 @@ class AutomationManager:
             self.webhook = None
 
     def _arm(self, row: dict[str, Any]) -> None:
+        if not self.active:
+            return
         aid, trig = row["id"], row["trigger"]
         kind = trig["type"]
 
@@ -192,6 +212,10 @@ class AutomationManager:
         cwd: str = "",
     ) -> dict[str, Any]:
         validate(trigger, action)
+        if not self.active:  # an unarmed row would look active and never fire
+            raise AutomationError(
+                "automations run in another k3code process (the daemon): use `k3code slash /automations add ...`"
+            )
         trigger = dict(trigger)
         if trigger["type"] == "webhook":
             if self.webhook_port is None:
@@ -273,8 +297,17 @@ class AutomationManager:
         row = self.db.get("automations", aid)
         if row is None or (row["state"] != "active" and not force):
             return None
+        if not self.active and not force:  # another process owns the firing; a /automations test still runs here
+            return None
+        if self.wait_online is not None and not force and row["action"]["type"] in _MODEL_ACTIONS:
+            # halted / safe mode / offline: park before the occurrence is consumed (run_prompt would answer
+            # interrupted or fail with no retry), then fire once; paused or removed meanwhile means skip
+            await self.wait_online()
+            row = self.db.get("automations", aid)
+            if row is None or row["state"] != "active":
+                return None
         now = self.clock.now()
-        policy = row["policy"] or {}
+        policy = {**DEFAULT_POLICY.get(row["trigger"]["type"], {}), **(row["policy"] or {})}
         if not force:
             cd = float(policy.get("cooldown_s") or 0)
             if cd and row["last_fired_at"] and now - row["last_fired_at"] < cd:

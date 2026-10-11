@@ -98,18 +98,24 @@ def configured_home_readonly() -> list[str]:
 HOME_READONLY_REFUSED = (".gnupg", ".aws")
 
 
+def _secret_paths(home: Path) -> list[Path]:
+    """The resolved paths a bind must never reach, above or below: ``~/.ssh``, ``~/.config/k3code``, ``~/.gnupg``,
+    ``~/.aws``, the k3code home. Raises ``OSError``/``ValueError``/``RuntimeError`` when one cannot be resolved."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    guarded = [home / s for s in (*HOME_SECRETS, *HOME_READONLY_REFUSED)] + [paths.home()]
+    if xdg:
+        guarded.append(Path(xdg) / "k3code")
+    return [g.resolve() for g in guarded]
+
+
 def _home_readonly_paths(home: Path, entries: Iterable[object], writable: Iterable[Path] = ()) -> list[Path]:
     """The entries that may be bound read-only: relative to ``$HOME``, present, and neither ``$HOME`` itself, nor
     above or inside a secret (``~/.ssh``, ``~/.gnupg``, ``~/.aws``, the k3code home), nor above a writable root
     (``writable``: the project, added dirs, the cache), which a read-only bind would shadow. Anything else is
     skipped with a warning; an entry that cannot be inspected (name too long, no permission) is skipped too, never
     raised: a sandbox that cannot be built would leave bash running without one."""
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    guarded = [home / s for s in (*HOME_SECRETS, *HOME_READONLY_REFUSED)] + [paths.home()]
-    if xdg:
-        guarded.append(Path(xdg) / "k3code")
     try:
-        secrets = [g.resolve() for g in guarded]
+        secrets = _secret_paths(home)
         roots = [Path(w).resolve() for w in writable]
     except (OSError, ValueError, RuntimeError):
         logger.warning("sandbox: home_readonly ignored (could not resolve the guarded paths)", exc_info=True)
@@ -239,25 +245,85 @@ def _refuse_root(root: Path, home: Path) -> None:
             )
 
 
-def _git_metadata(root: Path) -> list[Path]:
-    """The git metadata of a checkout: ``.git`` itself, or for a linked worktree its gitdir and common dir."""
-    dot = root / ".git"
-    if dot.is_dir():
-        return [dot]
-    if not dot.is_file():
-        return []
-    found = [dot]
+def _meta_allowed(path: Path, home: Path) -> bool:
+    """May ``path`` (a git admin dir named by repository-controlled text) be bound? Never ``$HOME`` or a directory
+    above it, nor anything at or around a secrets folder. Fails closed when it cannot be inspected."""
     try:
-        match = _GITDIR_LINE.search(dot.read_text(encoding="utf-8", errors="replace"))
+        real = path.resolve()
+        return not exposes_home(real, home) and not any(
+            real.is_relative_to(s) or s.is_relative_to(real) for s in _secret_paths(home)
+        )
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def _inside(path: Path, root: Path) -> bool:
+    return path != root and path.is_relative_to(root)
+
+
+def _head(path: Path) -> str | None:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as f:
+            return f.read(4096)
     except OSError:
-        match = None
-    if match is not None:
-        gitdir = (root / match.group(1)).resolve()
-        found.append(gitdir)
-        common = gitdir / "commondir"
-        if common.is_file():
-            found.append((gitdir / common.read_text(encoding="utf-8").strip()).resolve())
-    return [p for p in found if p.exists()]
+        return None
+
+
+def _points_back(admin: Path, root: Path) -> bool:
+    """Does the git admin dir ``admin`` belong to the checkout ``root``? A linked worktree's ``<common>/worktrees/<n>``
+    records the checkout's ``.git`` file in its ``gitdir`` file; a submodule's one records
+    the checkout in ``core.worktree``. A command in the sandbox cannot write outside the project, so it cannot forge
+    either, and a ``gitdir:`` aimed at some other directory (``$HOME``, another repo) is not bound."""
+    if not (admin / "HEAD").is_file():
+        return False
+    link = _head(admin / "gitdir") if admin.parent.name == "worktrees" else None
+    if link is not None:
+        return (admin / link.strip()).resolve() == (root / ".git").resolve()
+    config = _head(admin / "config") or ""
+    match = re.search(r"^\s*worktree\s*=\s*(.+?)\s*$", config, re.MULTILINE)
+    return match is not None and (admin / match.group(1)).resolve() == root
+
+
+def _git_metadata(root: Path, home: Path | None = None) -> list[Path]:
+    """The git metadata of a checkout: ``.git`` itself, or for a linked worktree or a submodule its admin
+    dir and common dir.
+
+    The content of a ``.git`` file is text the sandboxed command can write, so ``gitdir: /root`` must not choose what
+    is bound. An admin dir is taken only when it is inside the project or points back at this checkout
+    (:func:`_points_back`), and a common dir only when it is the admin dir's own ``<common>/worktrees/<n>`` parent
+    or inside the project; none may be (or reach) ``$HOME`` or a secrets folder. Anything else is skipped: the repo
+    is then not git-aware inside the sandbox, the safe failure. A ``.git`` symlink is followed only inside the project.
+    """
+    home = Path(home or Path.home())
+    try:
+        root = root.resolve()
+        dot = root / ".git"
+        if dot.is_symlink():  # bwrap follows a symlink source: `.git -> ~` would bring $HOME back
+            target = dot.resolve()
+            return [target] if _inside(target, root) and target.is_dir() else []
+        if dot.is_dir():
+            return [dot]
+        if not dot.is_file():
+            return []
+        found = [dot]
+        match = _GITDIR_LINE.search(_head(dot) or "")
+        if match is not None:
+            gitdir = (root / match.group(1)).resolve()
+            if (
+                gitdir.is_dir()
+                and (_inside(gitdir, root) or _points_back(gitdir, root))
+                and _meta_allowed(gitdir, home)
+            ):
+                found.append(gitdir)
+                common_text = _head(gitdir / "commondir")
+                if common_text is not None:
+                    common = (gitdir / common_text.strip()).resolve()
+                    if (common == gitdir.parent.parent or _inside(common, root)) and _meta_allowed(common, home):
+                        found.append(common)
+        return [p for p in found if p.exists()]
+    except (OSError, ValueError, RuntimeError):  # unreadable or looping: not git-aware, but the sandbox still builds
+        logger.warning("sandbox: git metadata of %s could not be inspected, not binding it", root, exc_info=True)
+        return []
 
 
 def exposes_home(path: Path | str, home: Path | None = None) -> bool:
@@ -291,6 +357,9 @@ def build_argv(
     for root in roots:
         _refuse_root(root, home)
     argv = [bwrap or bwrap_path() or "bwrap", "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc"]
+    # No capabilities at all: a uid 0 daemon (container, sudo) would otherwise hand the command CAP_SYS_ADMIN, so it
+    # could remount the read-only .git writable, mknod, or write /proc/sys.
+    argv += ["--cap-drop", "ALL"]
     if not network:
         argv.append("--unshare-net")
     # The command gets a minimal environment, not the daemon's: it carries the provider API keys (OMNIROUTE_API_KEY,
@@ -335,7 +404,10 @@ def build_argv(
                 continue
             argv += ["--bind", p, p]
             # git metadata is read-only: a sandboxed command cannot write a hook or change core.* config
-            for meta in _git_metadata(root):
+            for meta in _git_metadata(root, home):
+                if exposes_home(meta, home):  # belt and braces: _git_metadata already refuses these
+                    logger.warning("sandbox: not binding %s (it would expose $HOME)", meta)
+                    continue
                 argv += ["--ro-bind", str(meta), str(meta)]
     # Listed $HOME entries come back read-only after the project binds, so a project bind cannot make one writable
     extra = configured_home_readonly() if home_readonly is None else list(home_readonly)

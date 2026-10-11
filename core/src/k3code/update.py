@@ -340,9 +340,16 @@ def update_settings() -> dict[str, Any]:
     }
 
 
-def _headers(token: str | None, accept: str = "application/vnd.github+json") -> dict[str, str]:
+def _trusts(url: str) -> bool:
+    """Only the default GitHub API host gets the token. ``update.api`` / K3CODE_UPDATE_API name a mirror, and so does
+    every asset URL a mirror's release list names: sending a GitHub token there would hand it to whoever runs it."""
+    u, d = httpx.URL(url), httpx.URL(DEFAULT_API)
+    return (u.scheme, u.host, u.port) == (d.scheme, d.host, d.port)
+
+
+def _headers(token: str | None, accept: str = "application/vnd.github+json", url: str = DEFAULT_API) -> dict[str, str]:
     h = {"Accept": accept, "X-GitHub-Api-Version": "2022-11-28"}
-    if token:
+    if token and _trusts(url):
         h["Authorization"] = f"Bearer {token}"
     return h
 
@@ -352,11 +359,24 @@ def fetch_latest(
 ) -> Release | None:
     """Newest release on ``channel`` (``stable`` skips prereleases; ``dev`` takes anything)."""
     base = (api or os.environ.get("K3CODE_UPDATE_API") or DEFAULT_API).rstrip("/")
-    r = httpx.get(f"{base}/repos/{repo}/releases?per_page=30", headers=_headers(token), timeout=15)
+    url = f"{base}/repos/{repo}/releases?per_page=30"
+    r = httpx.get(url, headers=_headers(token, url=url), timeout=15)
+    if r.status_code == 429 or (r.status_code == 403 and _rate_limited(r)):
+        reset = r.headers.get("x-ratelimit-reset", "")
+        when = time.strftime(" (resets at %H:%M)", time.localtime(int(reset))) if reset.isdigit() else ""
+        raise PermissionError(
+            f"GitHub API rate limit reached{when}; try again later, or set GITHUB_TOKEN (or `gh auth login`) "
+            "for a higher limit"
+        )
     if r.status_code in (401, 403, 404):
+        withheld = (
+            f"; the token is only sent to {httpx.URL(DEFAULT_API).host}, not to {httpx.URL(base).host}"
+            if token and not _trusts(url)
+            else ""
+        )
         raise PermissionError(
             f"GitHub API {r.status_code}: {repo} is private or does not exist; set GITHUB_TOKEN (or `gh auth login`) "
-            "to read its releases"
+            f"to read its releases{withheld}"
         )
     r.raise_for_status()
     rels = [
@@ -375,9 +395,14 @@ def fetch_latest(
     return max(rels, key=lambda x: version_key(x.version), default=None)
 
 
+def _rate_limited(r: httpx.Response) -> bool:
+    """A 403 that is the rate limit, not a missing permission: no requests left, or GitHub says so."""
+    return r.headers.get("x-ratelimit-remaining") == "0" or "rate limit" in r.text[:500].lower()
+
+
 def _download(url: str, dest: Path, token: str | None) -> None:
     with httpx.stream(
-        "GET", url, headers=_headers(token, "application/octet-stream"), follow_redirects=True, timeout=120
+        "GET", url, headers=_headers(token, "application/octet-stream", url), follow_redirects=True, timeout=120
     ) as r:
         r.raise_for_status()
         with dest.open("wb") as f:
@@ -556,6 +581,29 @@ def install_release(rel: Release, token: str | None, uv: str | None = None, *, a
         return _build_release(rel, token, uv, allow_unpinned=allow_unpinned)
 
 
+class BuildStepError(subprocess.CalledProcessError):
+    """A uv step failed; ``str()`` carries the tail of its stderr (capture_output used to hide why)."""
+
+    def __str__(self) -> str:
+        tail = "\n".join((self.stderr or self.stdout or "").strip().splitlines()[-6:])
+        step = " ".join([Path(str(self.cmd[0])).name, *map(str, self.cmd[1:3])])
+        return f"`{step}` exited {self.returncode}" + (f":\n{tail}" if tail else "")
+
+
+def _run_step(argv: list[str]) -> None:
+    r = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if r.returncode:
+        raise BuildStepError(r.returncode, argv, r.stdout, r.stderr)
+
+
+def platform_binary() -> str:
+    """The release asset holding the ``k3`` binary for this machine (``k3-linux-amd64``)."""
+    import platform
+
+    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine(), platform.machine())
+    return f"k3-{sys.platform}-{arch}"  # linux or darwin
+
+
 def _build_release(rel: Release, token: str | None, uv: str | None, *, allow_unpinned: bool) -> Path:
     uv = uv or uv_path()
     vdir = versions_dir() / rel.version
@@ -577,31 +625,31 @@ def _build_release(rel: Release, token: str | None, uv: str | None, *, allow_unp
         dl = vdir / ".dl"
         dl.mkdir()
         files: dict[str, Path] = {}
+        mine = platform_binary()
         for name, url in rel.assets.items():
+            if name.startswith("k3-") and name != mine:
+                continue  # the other platforms' binaries: tens of MB each, none of them installed
             files[name] = dl / name
             _download(url, files[name], token)
         verify_checksums(files)
         wheel = next((p for n, p in files.items() if n.endswith(".whl")), None)
         if wheel is None:
             raise ValueError("release has no wheel")
-        subprocess.run([uv, "venv", "--python", ">=3.12", str(vdir / "venv")], check=True, capture_output=True)
+        _run_step([uv, "venv", "--python", ">=3.12", str(vdir / "venv")])
         py = str(vdir / "venv" / "bin" / "python")
         reqs = next((p for n, p in files.items() if n.endswith(REQUIREMENTS_SUFFIX)), None)
         if reqs is None:  # allow_unpinned: an older release, resolved as before
-            subprocess.run([uv, "pip", "install", "--python", py, str(wheel)], check=True, capture_output=True)
+            _run_step([uv, "pip", "install", "--python", py, str(wheel)])
         else:
             pip = [uv, "pip", "install", "--python", py]
-            subprocess.run([*pip, "--require-hashes", "-r", str(reqs)], check=True, capture_output=True)
-            subprocess.run([*pip, "--no-deps", str(wheel)], check=True, capture_output=True)
+            _run_step([*pip, "--require-hashes", "-r", str(reqs)])
+            _run_step([*pip, "--no-deps", str(wheel)])
         tui = next((p for n, p in files.items() if n.startswith("k3code-tui") and n.endswith(".tar.gz")), None)
         if tui:
             (vdir / "tui").mkdir()
             with tarfile.open(tui) as t:
                 t.extractall(vdir / "tui", filter="data")
-        import platform
-
-        arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(platform.machine(), platform.machine())
-        k3 = files.get(f"k3-{sys.platform}-{arch}")  # linux or darwin
+        k3 = files.get(mine)
         if k3:
             (vdir / "bin").mkdir()
             shutil.copy2(k3, vdir / "bin" / "k3")
@@ -647,6 +695,22 @@ def spawn_update(exe: str) -> str:
     )
 
 
+#: What a transient ``systemd-run --user`` unit would lose (it starts from the user manager's environment, not the
+#: daemon's): which install tree and release API this update works on.
+_UNIT_ENV = ("K3CODE_DATA", "K3CODE_HOME", "K3CODE_ROOT", "K3CODE_UPDATE_API")
+
+
+def _transient_env() -> list[str]:
+    """``systemd-run`` arguments that give the update the daemon's environment. argv is readable by every local user:
+    no key or token goes on it. GITHUB_TOKEN and the rest come from the file the daemon's own unit reads."""
+    args = [
+        f"--setenv={k}={v}"
+        for k in _UNIT_ENV
+        if (v := os.environ.get(k)) and not (k == "K3CODE_UPDATE_API" and "@" in v)  # userinfo in a URL is a secret
+    ]
+    return [*args, f"--property=EnvironmentFile=-{Path.home() / '.config' / 'k3code' / 'env'}"]
+
+
 def apply_detached(*, unit_installed: Callable[[], bool] = service.is_installed) -> str:
     """Run ``k3code update --yes`` outside this process's service unit, so the update can restart the unit.
 
@@ -666,7 +730,7 @@ def apply_detached(*, unit_installed: Callable[[], bool] = service.is_installed)
         )
     unit = f"k3code-update-{int(time.time())}"
     r = subprocess.run(
-        [runner, "--user", "--collect", "--quiet", f"--unit={unit}", exe, "update", "--yes"],
+        [runner, "--user", "--collect", "--quiet", f"--unit={unit}", *_transient_env(), exe, "update", "--yes"],
         capture_output=True,
         text=True,
         check=False,

@@ -455,12 +455,12 @@ def test_unattended_prefix_refuses_when_bwrap_is_unusable(tmp_path, monkeypatch)
 
 
 async def test_goal_gate_fails_closed_without_bwrap(tmp_path, monkeypatch):
-    from k3code.goals import GoalGate, run_gate
+    from k3code.goals import GATE_COULD_NOT_RUN, GoalGate, run_gate
 
     monkeypatch.setattr(sandbox, "usable", lambda: False)
     marker = tmp_path / "ran.txt"
     passed, code, text = await run_gate(GoalGate(command=f"touch {marker}"), cwd=str(tmp_path))
-    assert passed is False and code == -1 and "unusable" in text
+    assert passed is False and code == GATE_COULD_NOT_RUN and "unusable" in text
     assert not marker.exists()  # the check never ran unsandboxed
 
 

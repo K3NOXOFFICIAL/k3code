@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
+import fcntl
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -17,6 +20,7 @@ from k3code.automation.scheduler import JobScheduler
 from k3code.automation.server_runner import ServerRunner
 from k3code.automation.store import AutomationDB
 from k3code.automation.suggestions import Suggestions
+from k3code.paths import ensure_private_dir
 from k3code.reliability.governor import Governor, GovernorConfig
 
 if TYPE_CHECKING:
@@ -25,6 +29,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger("k3code.automation")
 
 HALT_POLL_S = 5.0
+LOCK_NAME = "automation.lock"  # under <home>/run: whoever holds it runs the loops, jobs and triggers
+LOCK_RETRY_S = 30.0  # a process that lost the lock race tries again this often (the holder may have exited)
 
 
 class AutomationEngine:
@@ -63,8 +69,9 @@ class AutomationEngine:
             self.runner,
             self.clock,
             slot=lambda: self.governor.slot("llm"),
-            activity=lambda: server.last_user_activity,
+            activity=self._user_activity,
             on_change=self.changed,
+            wait_online=self._online,
             webhook_port=cfg.webhook_port,
             git_poll_s=cfg.git_poll_seconds,
             idle_poll_s=cfg.idle_poll_seconds,
@@ -72,13 +79,18 @@ class AutomationEngine:
         )
         self.suggestions = Suggestions(self.db)
         self.started = False
+        self._last_busy = 0.0
+        self.active = True  # False: another process holds the lock; this engine only manages definitions
+        self._lock_fd: int | None = None
+        self._promote: asyncio.Task[None] | None = None
         self._listeners: list[Callable[[], None]] = []
 
     # ── network gate ─────────────────────────────────────────────────
 
     async def _online(self) -> None:
-        # /daemon pause: loops and jobs wait here, before a tick is consumed, and continue after /daemon resume.
-        while getattr(self.server, "halted", False):
+        # /daemon pause and restart-storm safe mode: loops, jobs and automations wait here, before a tick or an
+        # occurrence is consumed, and continue after /daemon resume (a paused run_prompt would just fail or stop).
+        while getattr(self.server, "halted", False) or getattr(self.server, "background_paused", False):
             await self.clock.sleep(HALT_POLL_S)
         if self._wait_online is not None:
             await self._wait_online()
@@ -97,12 +109,69 @@ class AutomationEngine:
             logger.warning("automation: netwatch unavailable, ticks will not be deferred offline", exc_info=True)
             self._rel = None
 
+    def _user_activity(self) -> float:
+        """The idle trigger's clock: the last prompt, or now while an attended session has a turn in flight (a long
+        turn, or one parked on an approval or a question). Unattended runs (``background``) are not the user."""
+        live = getattr(self.server, "live", {})
+        if any(s.turn_in_flight and not s.background for s in list(live.values())):
+            self._last_busy = self.clock.now()  # polled: idle counts from the turn's end, not from the prompt
+        return max(self.server.last_user_activity, self._last_busy)
+
     # ── lifecycle ────────────────────────────────────────────────────
+
+    def _take_lock(self) -> bool:
+        """Non-blocking flock on ``<home>/run/automation.lock``, kept until :meth:`stop`: two gateway processes
+        (the daemon and a TUI's own gateway) on one automation.db both fired every occurrence and marked each other's
+        live runs interrupted. A lock that cannot be used for another reason does not block the engine."""
+        if self._lock_fd is not None:
+            return True
+        try:
+            fd = os.open(
+                ensure_private_dir(Path(self.server._home()) / "run") / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600
+            )
+        except (OSError, RuntimeError):
+            logger.warning("automation: no lock file, running without the single-instance guard", exc_info=True)
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as e:
+            os.close(fd)
+            if e.errno in (errno.EWOULDBLOCK, errno.EACCES):
+                return False
+            logger.warning("automation: flock failed (%s), running without the single-instance guard", e)
+            return True
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        self._lock_fd = fd
+        return True
 
     async def start(self) -> None:
         if self.started:
             return
         self.started = True
+        if self._take_lock():
+            await self._activate()
+        else:
+            self.active = self.loops.active = self.automations.active = False
+            logger.warning(
+                "another k3code process runs the loops, cron jobs and automations (%s): this one only manages "
+                "definitions and takes over if that process exits",
+                LOCK_NAME,
+            )
+            self._promote = asyncio.get_running_loop().create_task(self._promote_loop(), name="automation-promote")
+        self.changed()
+
+    async def _promote_loop(self) -> None:
+        while not self._take_lock():
+            await self.clock.sleep(LOCK_RETRY_S)
+        logger.info("automation: the other k3code process is gone: this one runs the loops, jobs and automations now")
+        self._promote = None
+        await self._activate()
+        self.changed()
+
+    async def _activate(self) -> None:
+        """Holder only: arm everything. Runs still marked 'running' belonged to a holder that is gone."""
+        self.active = self.loops.active = self.automations.active = True
         if self._use_netwatch:
             await self._start_netwatch()
         if self._rel is not None and self._rel.netwatch is not None:
@@ -118,7 +187,6 @@ class AutomationEngine:
         self.jobs.start()
         await self.automations.start()
         logger.info("automation engine started (%d loops resumed, %d jobs)", n, self.jobs.active_count())
-        self.changed()
 
     #: Run history is pruned at start and then this often (wall clock).
     PRUNE_EVERY_S = 6 * 3600.0
@@ -147,6 +215,11 @@ class AutomationEngine:
                 logger.exception("automation housekeeping failed")
 
     async def stop(self) -> None:
+        if self._promote is not None:
+            self._promote.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._promote
+            self._promote = None
         if self._maintenance is not None:
             self._maintenance.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -159,6 +232,10 @@ class AutomationEngine:
             with contextlib.suppress(Exception):
                 await self._rel.stop()
         self.db.close()
+        if self._lock_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(self._lock_fd)
+            self._lock_fd = None
         self.started = False
 
     # ── status ───────────────────────────────────────────────────────

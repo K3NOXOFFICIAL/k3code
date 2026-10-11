@@ -26,6 +26,7 @@ logger = logging.getLogger("k3code.automation.loops")
 
 DEFAULT_MAX_TICKS = 50
 SELF_PACED_DEFAULT_S = 300.0
+MAX_CONSECUTIVE_FAILURES = 5  # failed ticks in a row stop the loop (and say so) instead of burning the tick budget
 
 _FOOTER_FIXED = (
     "\n\n[loop tick {n}] This prompt is re-sent on a schedule. When the task is fully complete, "
@@ -53,7 +54,9 @@ class LoopManager:
         self.clock = clock
         self.wait_online = wait_online
         self.on_change = on_change or (lambda: None)
+        self.active = True  # False: another process owns the ticking (see AutomationEngine); rows are still managed
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._failures: dict[str, int] = {}
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -75,6 +78,8 @@ class LoopManager:
         self._tasks.clear()
 
     def _spawn(self, loop_id: str) -> None:
+        if not self.active:
+            return
         old = self._tasks.get(loop_id)
         if old is not None and not old.done():
             return
@@ -94,6 +99,10 @@ class LoopManager:
         cwd: str = "",
         model: str = "",
     ) -> dict[str, Any]:
+        if not self.active:  # the row would sit 'active' and never tick here
+            raise RuntimeError(
+                "loops run in another k3code process (the daemon): start it there, e.g. `k3code slash '/loop ...'`"
+            )
         sched: Schedule | None = parse_schedule(interval) if interval else None
         now = self.clock.now()
         # Intervals and self-paced loops tick right away; cron-style ("daily 09:00") wait for the occurrence.
@@ -152,11 +161,14 @@ class LoopManager:
     def _finish(self, loop_id: str, state: str, reason: str) -> None:
         self.db.update("loops", loop_id, state=state, stop_reason=reason, next_run_at=None)
         task = self._tasks.pop(loop_id, None)
+        self._failures.pop(loop_id, None)
         if task is not None and task is not asyncio.current_task():
             task.cancel()
         row = self.db.get("loops", loop_id)
         if row is not None and state != "stopped":
-            self.runner.notify(f"Loop {loop_id} {state}: {reason}", "info", key=f"loop-{loop_id}")
+            self.runner.notify(
+                f"Loop {loop_id} {state}: {reason}", "warning" if state == "failed" else "info", key=f"loop-{loop_id}"
+            )
         self.on_change()
 
     async def _run(self, loop_id: str) -> None:
@@ -216,12 +228,27 @@ class LoopManager:
             summary=result.text[-300:],
             session_id=result.session_id,
         )
-        self.db.update("loops", loop_id, ticks=n, last_run_at=now, last_result=result.text[-300:])
+        # Only a tick that ran counts toward --times / --max-ticks: a failed or interrupted one (provider down, safe
+        # mode, /stop) used to burn the whole budget and end "done: max ticks reached" with nothing done.
+        counted = result.status not in ("failed", "interrupted")
+        self.db.update(
+            "loops", loop_id, last_run_at=now, last_result=result.text[-300:], **({"ticks": n} if counted else {})
+        )
         self.on_change()
 
         current = self.db.get("loops", loop_id)
         if current is None or current["state"] != "active":
             return  # stopped while the tick ran
+        if result.status == "failed":
+            fails = self._failures[loop_id] = self._failures.get(loop_id, 0) + 1
+            if fails >= MAX_CONSECUTIVE_FAILURES:
+                self._finish(loop_id, "failed", f"{fails} ticks in a row failed: {(result.error or result.text)[:160]}")
+                return
+        else:
+            self._failures.pop(loop_id, None)
+        if not counted:  # try again next interval; the budget is untouched
+            self.db.update("loops", loop_id, next_run_at=self._next_run(row, ctx, now))
+            return
         if result.status in ("blocked", "needs_input"):
             self._finish(loop_id, "blocked", "needs input: the session is waiting for you")  # notifies once
             return

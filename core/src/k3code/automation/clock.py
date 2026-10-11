@@ -13,12 +13,24 @@ class Clock(Protocol):
     async def sleep(self, seconds: float) -> None: ...
 
 
+#: asyncio.sleep runs on CLOCK_MONOTONIC, which stops while the machine is suspended: a day-long wait would end a
+#: suspend late. SystemClock.sleep wakes at least this often and re-reads the wall clock.
+WALL_RECHECK_S = 30.0
+
+
 class SystemClock:
     def now(self) -> float:
         return time.time()
 
     async def sleep(self, seconds: float) -> None:
-        await asyncio.sleep(max(0.0, seconds))
+        """Wait ``seconds`` of whichever runs faster, wall time (counts suspend) or monotonic time (survives a
+        clock set back), polling in slices of at most WALL_RECHECK_S."""
+        if seconds <= 0:
+            await asyncio.sleep(0)
+            return
+        wall0, mono0 = time.time(), time.monotonic()
+        while (left := seconds - max(time.time() - wall0, time.monotonic() - mono0)) > 0:
+            await asyncio.sleep(min(left, WALL_RECHECK_S))
 
 
 class FakeClock:

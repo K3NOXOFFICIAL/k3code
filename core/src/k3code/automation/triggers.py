@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -121,6 +122,17 @@ class FileChangeTrigger(Trigger):
         self.pattern = glob_to_regex(str(self.spec.get("glob") or "**/*"))
         self.debounce_ms = int(float(self.spec.get("debounce", 2.0)) * 1000)
         self.ready = asyncio.Event()
+        self._ran_until = 0.0  # wall time the last action returned
+
+    def _own(self, path: str) -> bool:
+        """A change the action itself made: the watcher queues events while ``fire`` runs and delivers them the moment
+        it returns, so an action that writes in the watched tree re-triggered itself without end. Anything modified
+        at or before the end of the last run is not a new edit (so an edit made *during* a run is not re-queued
+        either); a path that is gone cannot be dated, it counts as the action's only just after the run."""
+        try:
+            return os.stat(path).st_mtime <= self._ran_until
+        except OSError:
+            return time.time() - self._ran_until < self.debounce_ms / 1000 + 1.0
 
     async def run(self) -> None:
         from watchfiles import awatch
@@ -143,10 +155,11 @@ class FileChangeTrigger(Trigger):
                     rel = Path(p).resolve().relative_to(self.root).as_posix()
                 except ValueError:
                     continue
-                if self.pattern.match(rel):
+                if self.pattern.match(rel) and not self._own(p):
                     paths.append(rel)
             if paths:
                 await self.fire({"event": "file_change", "path": paths[0], "paths": ", ".join(sorted(set(paths))[:20])})
+                self._ran_until = time.time()
 
 
 async def git_out(cwd: str, *args: str) -> str:
@@ -199,6 +212,8 @@ class GitTrigger(Trigger):
                 else:
                     info["branch"] = cur
                 await self.fire(info)
+                # commits and checkouts the action made are its own: without this a prompt that commits fired again
+                self.last = await self.probe() or self.last
             elif cur:
                 self.last = cur
 

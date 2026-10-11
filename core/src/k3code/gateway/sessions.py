@@ -72,6 +72,11 @@ class SessionStore:
         with contextlib.suppress(sqlite3.OperationalError):  # column already exists
             self._db.execute("ALTER TABLE sessions ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
         self._db.execute("CREATE INDEX IF NOT EXISTS sessions_updated_at ON sessions (updated_at)")
+        # the goal watchdog (every 60 s) filters on this: without the index each pass read every transcript's row
+        with contextlib.suppress(sqlite3.OperationalError):  # a row with unreadable meta: keep scanning, as before
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS sessions_goal_status ON sessions (json_extract(meta, '$.goal.status'))"
+            )
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS swept_sessions (session_id TEXT PRIMARY KEY, swept_at REAL NOT NULL)"
         )

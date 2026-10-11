@@ -30,6 +30,9 @@ DEFAULT_GATE_TIMEOUT_SECONDS = 300
 #: that can never pass (a typo, a missing tool) would otherwise burn tokens until someone looks. /goal resume starts
 #: the count again.
 DEFAULT_GATE_MAX_RETRIES = 20
+#: ``run_gate`` exit code when the check never ran (no usable sandbox, spawn failed): the model cannot fix that, so the
+#: goal pauses at once instead of spending ``DEFAULT_GATE_MAX_RETRIES`` turns on "fix the check". A timeout is -1.
+GATE_COULD_NOT_RUN = -2
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
 #: Automatic kicks (boot resume, watchdog): this many within KICK_WINDOW_S, the next one parks the goal instead.
 MAX_KICKS_PER_WINDOW = 3
@@ -112,7 +115,8 @@ class GoalGate:
 
 
 async def run_gate(gate: GoalGate, *, cwd: str | None = None) -> tuple[bool, int, str]:
-    """Run the gate through the shell, sandboxed: ``(passed, exit_code, output_tail)``; a timeout is exit code -1.
+    """Run the gate through the shell, sandboxed: ``(passed, exit_code, output_tail)``; a timeout is exit code -1 and
+    a check that could not be started is ``GATE_COULD_NOT_RUN``.
 
     A gate runs during an unattended goal turn, so it fails closed: no usable bwrap means the check did not pass.
     """
@@ -129,7 +133,7 @@ async def run_gate(gate: GoalGate, *, cwd: str | None = None) -> tuple[bool, int
         text = out.decode("utf-8", errors="replace")
         return proc.returncode == 0, proc.returncode or 0, text[-_GATE_OUTPUT_TAIL_CHARS:]
     except Exception as exc:  # noqa: BLE001
-        return False, -1, f"[check could not run: {type(exc).__name__}: {exc}]"
+        return False, GATE_COULD_NOT_RUN, f"[check could not run: {type(exc).__name__}: {exc}]"
 
 
 @dataclass
@@ -420,6 +424,16 @@ class GoalManager:
                 if passed:
                     gate.attempts = 0
                     continue
+                if code == GATE_COULD_NOT_RUN:
+                    s.last_verdict, s.last_reason = "gate_failed", f"check could not run: $ {gate.command}"
+                    return self._pause_decision(
+                        s,
+                        s.last_reason,
+                        "gate_failed",
+                        s.last_reason,
+                        "⏸ Goal paused — the check could not run, so the goal cannot be confirmed: "
+                        f"{tail.strip()[:300]} Fix that, then /goal resume.",
+                    )
                 gate.attempts += 1
                 s.last_verdict = "gate_failed"
                 s.last_reason = f"check failed (exit {code}): $ {gate.command}"
