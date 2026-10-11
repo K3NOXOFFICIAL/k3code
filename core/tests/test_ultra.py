@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
+from env_fixtures import sandbox_optional  # noqa: F401  (a fixture)
 from k3code.autonomy.ultra import (
     dedupe_findings,
     parse_findings,
@@ -110,6 +113,7 @@ async def test_ultraplan_refuses_while_a_turn_runs_and_needs_task(tmp_path, monk
     assert "Usage" in out["output"]
 
 
+@pytest.mark.usefixtures("sandbox_optional")
 async def test_go_executes_ultraplan_with_fanout(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     steps = [
@@ -187,6 +191,7 @@ def code_steps(*extra):
     ]
 
 
+@pytest.mark.usefixtures("sandbox_optional")
 async def test_ultracode_accepts_only_findings_both_reviewers_agree_on(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     server = make(
@@ -225,6 +230,7 @@ async def test_ultracode_accepts_only_findings_both_reviewers_agree_on(tmp_path,
     assert git(repo, "status", "--porcelain").strip() == ""
 
 
+@pytest.mark.usefixtures("sandbox_optional")
 async def test_ultracode_no_agreement_means_no_fix(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     vote_c = {

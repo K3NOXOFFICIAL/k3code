@@ -295,7 +295,7 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
 
 
 #: bash: seconds before a foreground command is killed, when the call names no timeout, and the most it may name.
-BASH_DEFAULT_TIMEOUT = 30
+BASH_DEFAULT_TIMEOUT = 120  # a test run or a build is ordinary work: at 30 s it was killed with its work lost
 BASH_MAX_TIMEOUT = 600
 #: Seconds the pipes of a command that has exited get to reach EOF before a child still holding them is stopped.
 PIPE_GRACE_S = 1.0

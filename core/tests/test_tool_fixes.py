@@ -201,3 +201,36 @@ def test_a_long_page_keeps_its_start_and_says_how_much_of_it_that_is():
     assert "of 30000 characters are shown]" in capped and capped.endswith("the size cap was reached]")
     assert _cap_page("short page") == "short page"
     assert len(_cap_page("x" * (MAX_FETCH_CHARS - 5), "\n[note]")) <= MAX_FETCH_CHARS
+
+
+# ── the environment of a child ────────────────────────────────────────
+
+
+def test_a_child_gets_the_proxy_and_the_private_ca_unless_the_proxy_url_holds_a_password(monkeypatch):
+    from k3code.reliability.sandbox import child_env
+
+    for name in ("HTTP_PROXY", "https_proxy", "ALL_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.corp:3128")
+    monkeypatch.setenv("HTTP_PROXY", "http://user:pw@proxy.corp:3128")  # a secret a command could print
+    monkeypatch.setenv("NO_PROXY", "localhost,.corp")
+    monkeypatch.setenv("SSL_CERT_FILE", "/etc/ssl/corp-ca.pem")
+    monkeypatch.setenv("OMNIROUTE_API_KEY", "not-a-real-key")
+    env = child_env()
+    assert env["HTTPS_PROXY"] == "http://proxy.corp:3128" and env["NO_PROXY"] == "localhost,.corp"
+    assert env["SSL_CERT_FILE"] == "/etc/ssl/corp-ca.pem"
+    assert "HTTP_PROXY" not in env and "OMNIROUTE_API_KEY" not in env
+
+
+def test_the_sandbox_passes_the_proxy_on_only_when_it_has_a_network(monkeypatch, tmp_path):
+    from k3code.reliability import sandbox
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.corp:3128")
+    online = sandbox.build_argv(tmp_path, bwrap="/usr/bin/bwrap", network=True)
+    offline = sandbox.build_argv(tmp_path, bwrap="/usr/bin/bwrap", network=False)
+    assert online[online.index("HTTPS_PROXY") - 1 : online.index("HTTPS_PROXY") + 2] == [
+        "--setenv",
+        "HTTPS_PROXY",
+        "http://proxy.corp:3128",
+    ]
+    assert "HTTPS_PROXY" not in offline

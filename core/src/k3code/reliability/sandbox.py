@@ -38,7 +38,27 @@ SANDBOXED_MODES = (PermissionMode.AUTO, PermissionMode.YOLO)
 #: Environment variables a child process inherits (everything else, in particular API keys, is dropped). Used for
 #: the sandboxed command and for every unsandboxed child too (tools, gates, fan-out, git, MCP stdio): see
 #: :func:`child_env`.
-ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "NO_COLOR", "COLORTERM")
+ENV_ALLOW = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TZ",
+    "NO_COLOR",
+    "COLORTERM",
+    # where a private CA lives (paths, not secrets): without them curl, pip and git fail behind a TLS-inspecting proxy
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+)
+#: Proxy settings, passed on only when the URL carries no credentials (see network_env).
+PROXY_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy")
 #: Harness git never runs a hook or a fsmonitor program: a sandboxed command could have written one into .git.
 HARNESS_GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
 #: A failed probe is retried after this many seconds (one slow probe used to disable the sandbox for the whole
@@ -129,6 +149,22 @@ def should_sandbox(mode: PermissionMode | str, background: bool, unattended: boo
     return background or unattended or PermissionMode(mode) in SANDBOXED_MODES
 
 
+def network_env() -> dict[str, str]:
+    """The proxy variables of the daemon that a child may have: network commands (curl, pip, npm, git) need them where a
+    proxy is the only way out. A proxy URL with a user name or password in it is a secret a command could print, and is
+    left out; ``NO_PROXY`` is a list of hosts and always passes."""
+    env = {}
+    for name in PROXY_ENV:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        authority = value.split("://", 1)[-1].split("/", 1)[0]
+        if "@" in authority and name.upper() != "NO_PROXY":
+            continue
+        env[name] = value
+    return env
+
+
 def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     """The environment every child process gets: :data:`ENV_ALLOW` from the daemon, plus ``extra``.
 
@@ -137,6 +173,7 @@ def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     from ``extra`` (an MCP server's configured ``env``): only an authenticated client may drive the daemon.
     """
     env = {name: os.environ[name] for name in ENV_ALLOW if name in os.environ}
+    env.update(network_env())
     env.update(extra or {})
     for name in GATEWAY_ENV_VARS:
         env.pop(name, None)
@@ -262,6 +299,9 @@ def build_argv(
     for name in ENV_ALLOW:
         value = os.environ.get(name)
         if value is not None:
+            argv += ["--setenv", name, value]
+    if network:  # a proxy is of no use to a command with no network
+        for name, value in network_env().items():
             argv += ["--setenv", name, value]
     # System: read-only. /bin, /lib* are usually symlinks into /usr; recreate them as symlinks.
     for path in ("/usr", "/etc"):

@@ -327,3 +327,23 @@ def test_doctor_clears_a_providers_auth_cooldown_when_its_key_answers(monkeypatc
     left = CooldownStore(path=path)
     assert left.reason_of(provider="good", model="m") is None
     assert left.reason_of(provider="bad", model="m") is FailoverReason.auth
+
+
+def test_a_claude_model_behind_an_openai_compatible_provider_without_prompt_cache_is_flagged():
+    from k3code.config import ProviderEntry, Settings
+    from k3code.doctor import WARN, check_prompt_cache
+
+    def entry(name: str, kind: str, models: dict, **kw) -> ProviderEntry:
+        return ProviderEntry(name=name, kind=kind, base_url="https://x.test", api_key_env="K", models=models, **kw)
+
+    cfg = Settings(
+        providers=[
+            entry("relay", "openai", {"default": ["anthropic/claude-sonnet-5-5"], "cheap": "gpt-4o-mini"}),
+            entry("relay-on", "openai", {"default": "claude-sonnet-5-5"}, prompt_cache="on"),
+            entry("plain", "openai", {"default": "gpt-4o"}),
+            entry("direct", "anthropic", {"default": "claude-sonnet-5-5"}),
+        ]
+    )
+    (check,) = check_prompt_cache(cfg)
+    assert check.name == "prompt-cache:relay" and check.status == WARN
+    assert check.data["models"] == ["anthropic/claude-sonnet-5-5"] and "prompt_cache: on" in check.fix

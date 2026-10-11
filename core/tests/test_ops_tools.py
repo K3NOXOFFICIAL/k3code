@@ -376,7 +376,8 @@ def test_sandbox_argv_drops_the_daemon_environment(tmp_path):
     argv = sandbox.build_argv(tmp_path, bwrap="/usr/bin/bwrap")
     assert "--clearenv" in argv and "--unshare-ipc" in argv
     assert "--setenv" in argv and argv[argv.index("--setenv") + 1] in sandbox.ENV_ALLOW
-    assert all(name in sandbox.ENV_ALLOW for name in (argv[i + 1] for i, a in enumerate(argv) if a == "--setenv"))
+    allowed = {*sandbox.ENV_ALLOW, *sandbox.PROXY_ENV}
+    assert all(name in allowed for name in (argv[i + 1] for i, a in enumerate(argv) if a == "--setenv"))
 
 
 @pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")

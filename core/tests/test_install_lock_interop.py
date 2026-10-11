@@ -17,13 +17,17 @@ from pathlib import Path
 
 import pytest
 
+from env_fixtures import hide_root  # noqa: F401  (a fixture)
 from k3code import update as upd
 
 REPO = Path(__file__).resolve().parents[2]
 INSTALL = REPO / "install" / "install.sh"
 DATA_REL = Path(".local") / "share" / "k3code"
 
-pytestmark = pytest.mark.skipif(shutil.which("uv") is None, reason="installer needs uv present")
+pytestmark = [
+    pytest.mark.skipif(shutil.which("uv") is None, reason="installer needs uv present"),
+    pytest.mark.usefixtures("hide_root"),
+]
 
 
 def _hold_install_sh(tmp_path: Path) -> tuple[subprocess.Popen[bytes], Path]:

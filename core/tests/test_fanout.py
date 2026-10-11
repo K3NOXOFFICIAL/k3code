@@ -6,10 +6,15 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from env_fixtures import sandbox_optional  # noqa: F401  (a fixture)
 from k3code.autonomy.fanout import detect_test_command, extract_subtasks, parse_verdict
 from k3code.autonomy.scope import ScopeVerdict
 from m1cmd_helpers import git_repo
 from test_autonomy_gateway import PLAN, call, events, make, run_turn
+
+pytestmark = pytest.mark.usefixtures("sandbox_optional")
 
 
 def classify(subs: list[str]) -> dict:
