@@ -502,7 +502,8 @@ class AgentLoop:
         decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
         if decision.action == "deny":  # hardline and deny rules: no hook can turn these into an allow
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
-        home_rooted = tool_call.name == "bash" and self._home_rooted()
+        # the bwrap probe behind _home_rooted runs a subprocess: off the event loop, like _sandbox_argv below
+        home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
         if home_rooted:
             # The sandbox will not bind $HOME (or a parent of it) writable: that hands every command ~/.ssh and the
             # k3code home. Rather than refusing all bash, a human approves each command and it runs unsandboxed.
@@ -651,6 +652,8 @@ class AgentLoop:
             return False  # nobody to approve: bash stays refused (fail closed) with a hint
         if not sandbox.should_sandbox(self.permissions.mode, self.background, self.unattended):
             return False
+        if not sandbox.usable():
+            return False  # no bwrap: bash already runs unsandboxed (warned once in _sandbox_argv), nothing to approve
         return sandbox.root_refusal(self.cwd, self.permissions.add_dirs) is not None
 
     def _sandbox_argv(self) -> list[str] | None:
