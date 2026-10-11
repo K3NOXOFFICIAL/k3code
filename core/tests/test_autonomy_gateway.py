@@ -607,10 +607,68 @@ async def test_advisor_compacts_large_conversations_with_cheap_tier(tmp_path, mo
     live.messages = [
         {"role": "user" if i % 2 == 0 else "assistant", "content": f"message {i} " + "x" * 300} for i in range(10)
     ]
-    await call(server, "command.dispatch", {"name": "advisor", "arg": ""})
+    await call(server, "command.dispatch", {"name": "advisor", "arg": "ask"})
     log = server.providers[0].log
     assert [c["model"] for c in log] == ["m-cheap", "m-strong"]
     assert "SUMMARY" in log[1]["text"]
+
+
+# ── session advisor (Claude Code's advisor mode) ──
+
+
+TOOL_ADVICE = [{"type": "text", "model": "m-strong", "match": "advisor of a coding agent", "text": "Plan: do X."}]
+ASKS_ADVISOR = {
+    "type": "tool_call",
+    "model": "m-main",
+    "when": "first",
+    "id": "a1",
+    "name": "advisor",
+    "arguments": {"question": "How should I structure this?"},
+}
+
+
+async def test_advisor_set_for_session_gives_the_main_model_an_advisor_tool(tmp_path, monkeypatch):
+    finish = {"type": "text", "model": "m-main", "when": "after_tool", "text": "followed the advice"}
+    server = make(tmp_path, monkeypatch, [*TOOL_ADVICE, ASKS_ADVISOR, finish], mode="default")
+    await start(server, tmp_path)
+    shown = await call(server, "command.dispatch", {"name": "advisor", "arg": ""})
+    assert shown["message"].startswith("Advisor: off")
+    out = await call(server, "command.dispatch", {"name": "advisor", "arg": "on"})
+    assert "strong tier" in out["message"] and out["advisor"] == "strong"
+    assert server.session.stored.meta["advisor"] == "strong"
+    await run_turn(server, "build the thing")
+    log = server.providers[0].log
+    main = [c for c in log if c["model"] == "m-main"]
+    assert "advisor" in main[0]["tools"] and "advisor` tool" in main[0]["text"]  # tool + prompt note
+    assert [c["model"] for c in log] == ["m-main", "m-strong", "m-main"]
+    assert "build the thing" in log[1]["text"] and "How should I structure this?" in log[1]["text"]
+    assert any("Plan: do X." in str(m.get("content")) for m in server.session.stored.messages)
+    assert server.session.stored.messages[-1]["content"] == "followed the advice"
+
+
+async def test_advisor_off_removes_the_tool_and_unknown_keys_are_refused(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [{"type": "text", "model": "m-main", "text": "ok"}], mode="default")
+    await start(server, tmp_path)
+    bad = await call(server, "command.dispatch", {"name": "advisor", "arg": "no-such-model"})
+    assert "advisor" not in server.session.stored.meta and "/advisor <model-key>" in bad["message"]
+    await call(server, "command.dispatch", {"name": "advisor", "arg": "on"})
+    off = await call(server, "command.dispatch", {"name": "advisor", "arg": "off"})
+    assert "off" in off["message"] and server.session.stored.meta["advisor"] == ""
+    await run_turn(server, "hello")
+    main = [c for c in server.providers[0].log if c["model"] == "m-main"]
+    assert "advisor" not in main[0]["tools"] and "advisor` tool" not in main[0]["text"]
+
+
+async def test_advisor_model_key_and_default_persist(tmp_path, monkeypatch):
+    from k3code.commands.tune import known_model_keys
+
+    server = make(tmp_path, monkeypatch, [], mode="default")
+    await start(server, tmp_path)
+    key = sorted(known_model_keys(server.config))[0]
+    out = await call(server, "command.dispatch", {"name": "advisor", "arg": f"{key} --default"})
+    assert out.get("advisor") == key and "and the default" in out["message"], out
+    assert server.session.stored.meta["advisor"] == key
+    assert server.session_advisor(server.session) == key
 
 
 async def test_advisor_auto_hooks_follow_config(tmp_path, monkeypatch):

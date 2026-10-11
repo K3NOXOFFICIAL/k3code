@@ -17,6 +17,9 @@ DEFAULTS: dict[str, Any] = {
     "advisor_on_plan": True,
     "advisor_on_goal": True,
     "advisor_modes": ["auto"],
+    #: session advisor the main model can consult through the ``advisor`` tool: a model key, "strong" (the strong
+    #: tier) or "" (off). ``/advisor <key>`` sets it per session; ``/advisor <key> --default`` writes this key
+    "advisor": "",
     #: proposer pass after a plan and after a task
     "proposals": True,
     #: an interactive task the scope gate calls "trivial" starts on the cheap tier and escalates when it stalls

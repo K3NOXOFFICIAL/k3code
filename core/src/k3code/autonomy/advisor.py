@@ -1,4 +1,7 @@
-"""``/advisor``: a strong-tier critical review of the conversation, kept out of the main context."""
+"""``/advisor``: a stronger model the session's main model consults, kept out of the main context.
+
+Two paths share one call: the session advisor (``/advisor <model-key>``) gives the main model an ``advisor`` tool
+for plans, reviews and when it is stuck (Claude Code's advisor mode); ``/advisor ask`` is a one-shot critique."""
 
 from __future__ import annotations
 
@@ -6,7 +9,7 @@ import json
 import re
 from typing import Any
 
-from k3code.providers.types import Message
+from k3code.providers.types import Message, ToolSpec
 from k3code.routing.tiers import TaskKind
 
 ADVISOR_SYSTEM = (
@@ -19,7 +22,52 @@ DONE_SYSTEM = (
     '{"blocking": bool, "issues": [str]}. blocking=true only for issues that mean the goal is NOT met '
     "(failing tests, missing requirement, unverified claim)."
 )
+TOOL_SYSTEM = (
+    "You are the advisor of a coding agent: a stronger model it consults mid-task when it needs a plan, a review, "
+    "or is stuck. You see its question and the conversation so far, and you cannot run tools. Answer the question "
+    "directly: give a concrete plan or diagnosis, name wrong assumptions and risks, and say what to check next. "
+    "Under 400 words."
+)
 SUMMARY_SYSTEM = "Summarize this coding conversation: the goal, decisions, work done, open problems. Max 300 words."
+
+
+#: ``/advisor on`` without a model key: the strong tier of the configured routing.
+STRONG = "strong"
+#: Session meta key; present (even empty) means the session chose, absent means the config default applies.
+META_KEY = "advisor"
+
+TOOL_SPEC = ToolSpec(
+    name="advisor",
+    description=(
+        "Consult your advisor, a stronger model, with a question. It sees the conversation so far. Use it before "
+        "committing to a large or risky plan, when you are stuck after a couple of failed attempts, or to review a "
+        "risky change before you finish. Calls are slow and costly: ask sparingly, with one precise question."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "What you need: a plan, a diagnosis, a review, a decision."},
+            "context": {
+                "type": "string",
+                "description": "Optional facts the advisor cannot see in the conversation (file excerpts, errors).",
+            },
+        },
+        "required": ["question"],
+    },
+    side_effect=False,
+)
+PROMPT_NOTE = (
+    "You have an advisor: a stronger model reachable through the `advisor` tool. Consult it before a large or risky "
+    "plan, when you are stuck, and before finishing a risky change; otherwise work on your own. It cannot run tools, "
+    "so give it the facts it needs."
+)
+
+
+def session_advisor(meta: dict[str, Any] | None, default: str = "") -> str:
+    """The session's advisor: a model key, :data:`STRONG`, or "" when off. The session's choice beats the default."""
+    if meta and META_KEY in meta:
+        return str(meta.get(META_KEY) or "")
+    return str(default or "")
 
 
 def transcript_text(messages: list[Message] | list[dict[str, Any]], *, per_message: int = 1500) -> str:
@@ -54,19 +102,31 @@ async def condensed_context(caller: Any, messages: list[Any], *, threshold: int,
 
 
 async def advise(
-    caller: Any, context: str, question: str = "", *, session_id: str = "", brief: bool = False, timeout: float = 90
+    caller: Any,
+    context: str,
+    question: str = "",
+    *,
+    session_id: str = "",
+    brief: bool = False,
+    timeout: float = 90,
+    system: str = "",
+    router: Any = None,
+    max_tokens: int = 900,
 ) -> str:
-    """Ask the strong tier for a critique; the result is returned, never added to the context here."""
+    """Ask the advisor (the strong tier, or ``router``'s model); the result is returned, never added to the context
+    here."""
     ask = question.strip() or "Review the approach so far: risks, blind spots, and what to do next."
+    extra = {"router": router} if router is not None else {}
     res = await caller.complete(
         TaskKind.ADVISOR,
         [
-            Message(role="system", content=BRIEF_SYSTEM if brief else ADVISOR_SYSTEM),
+            Message(role="system", content=system or (BRIEF_SYSTEM if brief else ADVISOR_SYSTEM)),
             Message(role="user", content=f"Conversation:\n{context}\n\nQuestion: {ask}"),
         ],
         session_id=session_id,
-        max_tokens=900,
+        max_tokens=max_tokens,
         timeout=timeout,
+        **extra,
     )
     return res.text.strip()
 

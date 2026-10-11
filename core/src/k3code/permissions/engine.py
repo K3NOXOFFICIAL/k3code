@@ -85,7 +85,19 @@ BUILTIN_BASH_ASK = [
 #: bash_output / bash_kill only reach background jobs of the calling session (the job registry enforces it); starting
 #: one is ``bash`` with ``background: true`` and goes through the bash decision like any command.
 PURE_TOOLS = frozenset(
-    {"read", "grep", "glob", "todo", "skill", "mcp_tool_search", "task", "task_result", "bash_output", "bash_kill"}
+    {
+        "read",
+        "grep",
+        "glob",
+        "todo",
+        "skill",
+        "mcp_tool_search",
+        "task",
+        "task_result",
+        "bash_output",
+        "bash_kill",
+        "advisor",
+    }
 )
 EDIT_TOOLS = frozenset({"write", "edit"})
 READ_TOOLS = frozenset({"read", "grep", "glob"})  # path-taking read-only tools
