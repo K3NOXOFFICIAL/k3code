@@ -76,7 +76,7 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
-from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary, StoredSession
+from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary
 from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
@@ -2253,7 +2253,9 @@ class GatewayServer:
                 stored = session.stored
                 stored.messages = _serialize_messages(loop.turn_messages)
                 stored.model = stored.model or self._chain_key or self.config.default_model
-                snapshot = dataclasses.replace(stored, meta=copy.deepcopy(stored.meta), usage=copy.deepcopy(stored.usage))
+                snapshot = dataclasses.replace(
+                    stored, meta=copy.deepcopy(stored.meta), usage=copy.deepcopy(stored.usage)
+                )
                 await asyncio.shield(self.store.save_async(snapshot))
         except asyncio.CancelledError:
             raise
@@ -2307,7 +2309,9 @@ class GatewayServer:
         """After a tool result: persist the in-flight turn (throttled, one at a time, off the event loop) so kill -9,
         an OOM kill or a reboot loses seconds of work instead of the whole turn."""
         loop = session.loop
-        if loop is None or not loop.turn_messages or time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+        if loop is None or not loop.turn_messages:
+            return
+        if time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
             return
         if session.checkpoint_task is not None and not session.checkpoint_task.done():
             return

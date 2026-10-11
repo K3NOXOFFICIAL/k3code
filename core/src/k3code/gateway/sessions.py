@@ -209,7 +209,7 @@ class SessionStore:
     _SUMMARY_COLUMNS = "session_id, title, model, provider, cwd, created_at, updated_at, message_count, preview"
 
     def list(self, *, limit: int = 50, include_automation: bool = True, offset: int = 0) -> list[SessionSummary]:
-        """The newest sessions as summaries. Reads columns only: a transcript can be hundreds of MB and is never parsed."""
+        """The newest sessions as summaries. Reads columns only: a transcript can be huge and is never parsed."""
         where = "" if include_automation else " WHERE COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
         rows = self._db.execute(
             f"SELECT {self._SUMMARY_COLUMNS} FROM sessions{where}"  # noqa: S608

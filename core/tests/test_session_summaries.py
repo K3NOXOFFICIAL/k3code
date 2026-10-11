@@ -49,7 +49,9 @@ def test_listing_never_parses_a_transcript(tmp_path, monkeypatch):
         _session(store, [{"role": "user", "content": f"q{i}" + "x" * 50_000}])
     calls = []
     real = json.loads
-    monkeypatch.setattr("k3code.gateway.sessions.json.loads", lambda s, *a, **k: (calls.append(len(s)), real(s, *a, **k))[1])
+    monkeypatch.setattr(
+        "k3code.gateway.sessions.json.loads", lambda s, *a, **k: (calls.append(len(s)), real(s, *a, **k))[1]
+    )
     assert len(store.list(limit=50)) == 5
     assert calls == []
 
@@ -58,7 +60,8 @@ def test_a_huge_row_does_not_slow_the_listing(tmp_path):
     store = SessionStore(tmp_path / "s.db")
     big = json.dumps([{"role": "user", "content": "first"}] + [{"role": "tool", "content": "z" * 1_000_000}] * 100)
     store._db.execute(
-        "INSERT INTO sessions (session_id, cwd, messages, updated_at, message_count, preview) VALUES ('big','/p',?,1,101,'first')",
+        "INSERT INTO sessions (session_id, cwd, messages, updated_at, message_count, preview)"
+        " VALUES ('big','/p',?,1,101,'first')",
         (big,),
     )
     store._db.commit()

@@ -5,6 +5,7 @@ Mid-turn checkpoints are throttled, never overlap, and can never land after the 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from types import SimpleNamespace
 
@@ -59,7 +60,9 @@ async def test_checkpoint_writes_only_the_transcript(tmp_path):
     await store.checkpoint_async(sess.session_id, [{"role": "user", "content": "hi"}], "m1")
     row = store.get(sess.session_id)
     assert row.title == "renamed" and row.model == "m1" and row.messages == [{"role": "user", "content": "hi"}]
-    await store.checkpoint_async(sess.session_id, [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}], "m2")
+    await store.checkpoint_async(
+        sess.session_id, [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "yo"}], "m2"
+    )
     assert store.get(sess.session_id).model == "m1"  # a model already on the row is kept
     store.delete(sess.session_id)
     await store.checkpoint_async(sess.session_id, [{"role": "user", "content": "zombie"}], "m")
@@ -135,10 +138,8 @@ async def test_cancelling_the_turn_does_not_drop_the_final_write(tmp_path):
     task = asyncio.create_task(srv._persist_turn(live, live.loop))
     await asyncio.sleep(0)
     task.cancel()
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await task
-    except asyncio.CancelledError:
-        pass
     srv.store.close()  # joins the writer thread: every queued write has landed
     again = SessionStore(tmp_path / "s.db")
     assert [m["content"] for m in again.get(live.session_id).messages] == ["one", "before the stop"]
