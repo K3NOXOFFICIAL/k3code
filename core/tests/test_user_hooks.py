@@ -304,3 +304,27 @@ async def test_worktree_child_runs_trusted_project_hooks_in_its_worktree(tmp_pat
     worktree = repo / ".k3code" / "worktrees" / h.id
     assert json.loads(dump.read_text())["cwd"] == str(worktree)
     assert where.read_text().strip() == str(worktree)
+
+
+async def test_the_stop_hook_runs_after_the_client_has_the_answer_but_before_the_turn_ends(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A slow Stop hook used to hold message.complete back (the input stayed locked); it cannot change the turn."""
+    server = make(tmp_path, monkeypatch, [{"type": "text", "match": "HELLO", "text": "hi"}], **NO_GATE)
+    marker = tmp_path / "stop.done"
+    _user_config(tmp_path, f"  Stop:\n    - {{command: 'sleep 0.5; touch {marker}'}}\n")
+    at_complete: list[bool] = []
+    write = server._write
+
+    def spy(line: str) -> None:
+        if '"message.complete"' in line:
+            at_complete.append(marker.exists())
+        write(line)
+
+    server._write = spy  # type: ignore[method-assign]
+    await start(server, tmp_path)
+    await call(server, "prompt.submit", {"text": "HELLO"})
+    await server.session.turn_task
+    assert at_complete == [False]  # the client had its answer while the hook was still running
+    assert marker.exists()  # and the turn (so the next prompt, the goal judge) still waited for it
+    assert server.session.stored.messages[-1]["content"] == "hi"

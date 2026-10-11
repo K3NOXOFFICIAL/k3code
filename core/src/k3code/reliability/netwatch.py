@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import ssl
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -115,9 +116,25 @@ class ProviderHTTPProbe(Protocol):
 ProbeHTTPStatus = tuple[int, str, str]
 
 
+_SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+def _ssl_context() -> ssl.SSLContext | bool:
+    """The TLS context every probe shares. ``httpx.AsyncClient()`` builds a fresh one (~100 ms of CPU: it loads the CA
+    bundle) on the event loop each time, and a probe ran at the start of a turn, so the first token waited for it."""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is None:
+        try:
+            _SSL_CONTEXT = httpx.create_ssl_context()
+        except Exception:  # noqa: BLE001 - a bad CA bundle: let httpx report it the way it always did
+            return True
+    return _SSL_CONTEXT
+
+
 async def http_probe(url: str, timeout: float) -> ProbeHTTPStatus:
     """Default HTTP probe: GET with redirects followed, returns (status, body, final_url)."""
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+    verify = _SSL_CONTEXT or await asyncio.to_thread(_ssl_context)  # built off the loop, once
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=verify) as client:
         resp = await client.get(url)
     return resp.status_code, resp.text, str(resp.url)
 
@@ -420,8 +437,7 @@ class NetWatch:
                 pass
 
     async def _probe_all(self) -> None:
-        internet = await self._probes.internet(self.config)
-        provider_states = await self._probe_providers()
+        internet, provider_states = await asyncio.gather(self._probes.internet(self.config), self._probe_providers())
         new_state = self._compute_state(internet, provider_states)
         if new_state is not self._state:
             old, self._state = self._state, new_state
@@ -441,8 +457,9 @@ class NetWatch:
                     logger.debug("NetWatch callback error: %s", e)
 
     async def _probe_providers(self) -> dict[str, NetState]:
-        results: dict[str, NetState] = {}
-        for name, prov in self._providers.items():
+        """Probe every provider at the same time (a cycle took the sum of their timeouts, now the longest one)."""
+
+        async def one(prov: Any) -> NetState:
             try:
                 status, _body, _final = await self._probes.provider(prov.base_url, self.config.provider_probe_timeout)
                 if 0 < status < 500:
@@ -459,8 +476,11 @@ class NetWatch:
                 prov.last_fail = time.monotonic()
                 if prov.consecutive_fails >= self.config.provider_fail_threshold:
                     prov.state = NetState.PROVIDER_DOWN
-            results[name] = prov.state
-        return results
+            return prov.state
+
+        names = list(self._providers)
+        states = await asyncio.gather(*(one(self._providers[n]) for n in names))
+        return dict(zip(names, states, strict=True))
 
     def _compute_state(self, internet: InternetProbeResult, provider_states: dict[str, NetState]) -> NetState:
         if internet.captive:

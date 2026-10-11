@@ -355,3 +355,59 @@ async def test_loops_end_when_a_probe_swallows_the_cancel(loop, swallow):
         assert not pending, "a monitor task kept running after it was cancelled"
     finally:
         await nw.stop()
+
+
+async def test_providers_are_probed_at_the_same_time_as_each_other_and_the_internet():
+    """A probe cycle took the sum of every timeout (internet, then each provider in turn)."""
+    import time
+
+    async def slow_provider(base_url: str, timeout: float):
+        await asyncio.sleep(0.2)
+        return 200, "", base_url
+
+    async def slow_internet(config):
+        await asyncio.sleep(0.2)
+        return InternetProbeResult(ok=True, latency_ms=10.0)
+
+    nw = NetWatch(internet_probe=slow_internet, provider_probe=slow_provider, nm_probe=_nm_probe)
+    for name in ("a", "b", "c"):
+        nw.add_provider(name, f"https://{name}.test")
+    began = time.monotonic()
+    await nw._probe_all()
+    assert time.monotonic() - began < 0.5  # one after the other: 0.8 s
+    assert nw.state is NetState.ONLINE
+    assert [nw.provider_state(n) for n in ("a", "b", "c")] == [NetState.ONLINE] * 3
+
+
+async def test_a_failing_provider_does_not_stop_the_others_being_probed():
+    async def provider(base_url: str, timeout: float):
+        if "bad" in base_url:
+            raise OSError("down")
+        return 200, "", base_url
+
+    nw = NetWatch(
+        internet_probe=_internet(InternetProbeResult(ok=True, latency_ms=10.0)),
+        provider_probe=provider,
+        nm_probe=_nm_probe,
+        config=_config(provider_fail_threshold=1),
+    )
+    nw.add_provider("bad", "https://bad.test")
+    nw.add_provider("good", "https://good.test")
+    await nw._probe_all()
+    assert nw.provider_state("bad") is NetState.PROVIDER_DOWN and nw.provider_state("good") is NetState.ONLINE
+
+
+async def test_probes_share_one_tls_context(monkeypatch):
+    """httpx.AsyncClient() built a fresh context (~100 ms of CPU on the event loop) for every probe."""
+    import httpx
+
+    from k3code.reliability import netwatch
+
+    built = []
+    real = httpx.create_ssl_context
+    monkeypatch.setattr(netwatch, "_SSL_CONTEXT", None)
+    monkeypatch.setattr(httpx, "create_ssl_context", lambda *a, **k: built.append(1) or real(*a, **k))
+    for _ in range(3):
+        with pytest.raises(httpx.HTTPError):
+            await netwatch.http_probe("http://127.0.0.1:9/", 0.5)  # nothing listens there
+    assert len(built) == 1

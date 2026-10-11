@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
+import stat
+import time
 from pathlib import Path
 from typing import Any
 
@@ -363,10 +366,14 @@ def _current_home() -> Path:
     return Path(os.environ.get("K3CODE_HOME", Path.home() / ".k3code")).expanduser()
 
 
+#: libyaml's loader parses a config 10x faster than the pure-Python one and reads the same documents
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
 def _parse_mapping(text: str, where: Path) -> dict[str, Any]:
     """YAML text as a mapping; a parse error or a non-mapping top level is a :class:`ConfigError` naming ``where``."""
     try:
-        data = yaml.safe_load(text)
+        data = yaml.load(text, Loader=_YAML_LOADER)  # noqa: S506 - a safe loader (the C one when libyaml is there)
     except yaml.YAMLError as e:
         raise ConfigError(f"{where}: not valid YAML ({str(e).splitlines()[0] if str(e) else type(e).__name__})") from e
     if data is None:
@@ -376,14 +383,36 @@ def _parse_mapping(text: str, where: Path) -> dict[str, Any]:
     return data
 
 
+#: Parsed config files by path: ((mtime_ns, size, inode), mapping). The hooks, skills and sandbox settings re-read
+#: ``config.yaml`` on every event of a turn (a tool call asks twice), and a parse costs 5-70 ms of event-loop time.
+_YAML_CACHE: dict[Path, tuple[tuple[int, int, int], dict[str, Any]]] = {}
+_YAML_CACHE_MAX = 64
+#: A file changed less than this long ago is not cached: an in-place edit within the filesystem's timestamp
+#: granularity would keep its (mtime, size) and be served stale (git's "racy" case). Atomic writes change the inode.
+_RACY_NS = 2_000_000_000
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
-    if not path.is_file():
+    try:
+        st = path.stat()
+    except OSError:
         return {}
+    if not stat.S_ISREG(st.st_mode):
+        return {}
+    key = (st.st_mtime_ns, st.st_size, st.st_ino)
+    hit = _YAML_CACHE.get(path)
+    if hit is not None and hit[0] == key:
+        return copy.deepcopy(hit[1])  # callers fill in and edit what they get
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as e:
         raise ConfigError(f"{path}: cannot be read ({e.__class__.__name__})") from e
-    return _parse_mapping(text, path)
+    data = _parse_mapping(text, path)
+    if time.time_ns() - st.st_mtime_ns > _RACY_NS:
+        if len(_YAML_CACHE) >= _YAML_CACHE_MAX:
+            _YAML_CACHE.clear()
+        _YAML_CACHE[path] = (key, copy.deepcopy(data))
+    return data
 
 
 def load_user_section(name: str) -> Any:

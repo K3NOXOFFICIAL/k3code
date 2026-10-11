@@ -329,8 +329,9 @@ class Ultra:
             elif not fan.ok:
                 report.notes.append("fan-out left unresolved subtasks:\n" + fan.summary())
 
+            tree_after_fan = await wt_mod.head_sha(cwd) if fan is not None else ""
             await self.review_and_fix(session, budget, report, brief, up.plan, base)
-            await self.final_tests(session, report, budget, cwd)
+            await self.final_tests(session, report, budget, cwd, tree_after_fan)
         except BudgetStop as e:
             report.stopped = str(e)
             self.progress(session, "ultracode", "stopped", str(e), budget)
@@ -374,8 +375,25 @@ class Ultra:
             detail += " (" + "; ".join(sized.reasons) + ")"
         return sized.subtasks, sized.width, detail
 
-    async def final_tests(self, session: Any, report: _Report, budget: AgentBudget, cwd: Path) -> None:
+    async def final_tests(
+        self, session: Any, report: _Report, budget: AgentBudget, cwd: Path, tree_after_fan: str = ""
+    ) -> None:
         test_cmd = self.server.fanout.cfg.get("test_command") or detect_test_command(cwd) or ""
+        fan = report.fanout
+        if (
+            test_cmd
+            and tree_after_fan
+            and fan is not None
+            and fan.tests == "pass"
+            and fan.test_command == test_cmd
+            and not report.fix  # no fixer merged since
+            and await wt_mod.head_sha(cwd) == tree_after_fan
+            and not (await wt_mod.git(cwd, "status", "--porcelain"))[1].strip()
+        ):
+            # the last merge ran this very command on this very tree before committing it: a second run is a repeat
+            # of a test run that can take minutes
+            report.tests = f"pass ({test_cmd}): the last merge ran it on this same tree, not repeated"
+            return
         if test_cmd:
             self.progress(session, "ultracode", "final tests", test_cmd, budget)
             ok, tail = await run_tests(test_cmd, cwd, float(self.server.fanout.cfg["test_timeout"]))

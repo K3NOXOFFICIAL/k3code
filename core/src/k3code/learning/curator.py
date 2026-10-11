@@ -97,15 +97,14 @@ def find_stale(
 
 
 def duplicate_skills(skills: list[dict[str, Any]]) -> list[tuple[dict[str, Any], dict[str, Any], float]]:
+    # each skill is tokenised once (it was once per pair: 60 skills froze the event loop for 300 ms at a turn's end)
+    bags = [tokens(s["name"] + " " + s["desc"] + " " + s["text"][:1500]) for s in skills]
     pairs = []
     for i, a in enumerate(skills):
-        for b in skills[i + 1 :]:
-            sim = jaccard(
-                tokens(a["name"] + " " + a["desc"] + " " + a["text"][:1500]),
-                tokens(b["name"] + " " + b["desc"] + " " + b["text"][:1500]),
-            )
+        for j in range(i + 1, len(skills)):
+            sim = jaccard(bags[i], bags[j])
             if sim >= DUP_THRESHOLD:
-                pairs.append((a, b, round(sim, 2)))
+                pairs.append((a, skills[j], round(sim, 2)))
     return pairs
 
 

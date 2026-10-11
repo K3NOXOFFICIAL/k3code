@@ -240,7 +240,7 @@ A setting belongs to the session unless you add `--save`: raising it raises what
 - Empty replies and judge replies that cannot be read slow the goal down (the pause before each turn grows to 5 minutes) but do not stop it.
 - There is no turn limit and no limit on failed checks. A goal stored by an older version with the old default of 300 turns now reads as unlimited.
 
-What still stops it is what you set or do: `--turns N` (your own turn budget; failed turns count), `goal.gate_max_retries` (a limit on failed checks), a spend budget (`reliability.session_eur`, `day_eur` and the like), `/stop`, `/goal pause`, `/goal clear`, and `/daemon pause`. `goal.persist: false` brings back the older behaviour (a blocked verdict, repeated judge failures, empty replies and failed turns pause the goal until `/goal resume`).
+What still stops it is what you set or do: `--turns N` (your own turn budget; failed turns count), `goal.gate_max_retries` (a limit on failed checks), a spend budget (`reliability.session_eur`, `day_eur` and the like), the `max_turns` cap on model calls per prompt, `/stop`, `/goal pause`, `/goal clear`, and `/daemon pause`. `goal.persist: false` brings back the older behaviour (a blocked verdict, repeated judge failures, empty replies and failed turns pause the goal until `/goal resume`).
 
 ### Tune: model, effort and ultracode
 

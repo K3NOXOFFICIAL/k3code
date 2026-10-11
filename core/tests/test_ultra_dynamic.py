@@ -240,3 +240,71 @@ async def test_the_two_cross_check_votes_run_at_the_same_time(tmp_path, monkeypa
     report = server.session.stored.messages[-1]["content"]
     assert "1 confirmed by both reviewers" in report
     json.dumps(report)  # the report stays plain text
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_the_final_tests_are_not_repeated_on_the_tree_the_last_merge_already_tested(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    no_agreement = [
+        {"type": "text", "match": "VOTE LENS: correctness", "text": json.dumps({"votes": {"f1": True, "f2": False}})},
+        {
+            "type": "text",
+            "match": "VOTE LENS: security/robustness",
+            "text": json.dumps({"votes": {"f1": False, "f2": True}}),
+        },
+    ]
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [
+            *PLANNERS,
+            JUDGE,
+            *worker(1, "f1.txt"),
+            *worker(2, "f2.txt"),
+            *worker(3, "f3.txt"),
+            reviewer("STEP-ONE"),
+            reviewer("STEP-TWO"),
+            reviewer("STEP-THREE"),
+            LENS_C,
+            LENS_S,
+            *no_agreement,
+        ],
+        mode="auto",
+        autonomy=cfg(),
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "pass (true): the last merge ran it on this same tree, not repeated" in report
+    assert "final tests" not in [e["phase"] for e in events(server, "ultra.progress")]
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_the_final_tests_run_after_a_fix_changed_the_tree(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [
+            *PLANNERS,
+            JUDGE,
+            *worker(1, "f1.txt"),
+            *worker(2, "f2.txt"),
+            *worker(3, "f3.txt"),
+            reviewer("STEP-ONE"),
+            reviewer("STEP-TWO"),
+            reviewer("STEP-THREE"),
+            LENS_C,
+            LENS_S,
+            VOTE_C,
+            VOTE_S,
+            *FIXER,
+        ],
+        mode="auto",
+        autonomy=cfg(),
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "pass (true)" in report and "not repeated" not in report
+    assert "final tests" in [e["phase"] for e in events(server, "ultra.progress")]

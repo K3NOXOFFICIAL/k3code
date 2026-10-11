@@ -157,6 +157,33 @@ def scope_rows(tmp: Path) -> list[dict]:
 # ── plan-first ──
 
 
+async def test_the_plan_critique_does_not_hold_back_the_task(tmp_path, monkeypatch):
+    """The critique is for the user and the executor never reads it: a slow advisor call no longer delays the task."""
+    server = make(tmp_path, monkeypatch, [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
+    caller = server.model_caller
+    real = caller.complete
+
+    async def slow(kind, messages, **kw):
+        if "brief critique" in " ".join(str(getattr(m, "content", "")) for m in messages):
+            await asyncio.sleep(0.6)
+        return await real(kind, messages, **kw)
+
+    monkeypatch.setattr(caller, "complete", slow)
+    await start(server, tmp_path)
+    await run_turn(server, "add a --verbose flag to the CLI")
+    order = [
+        (f["params"]["type"], f["params"]["payload"].get("status"))
+        for f in map(json.loads, server._frames)
+        if f.get("method") == "event" and f["params"]["type"] in ("plan.show", "message.complete")
+    ]
+    assert ("message.complete", "done") in order  # the task finished ...
+    assert [o for o in order if o[0] == "plan.show"] == [("plan.show", "proposed")]  # ... before the critique came
+    assert server.session.stored.messages[-1]["content"] == "implemented"
+    await asyncio.sleep(0.9)
+    approved = events(server, "plan.show")[-1]
+    assert approved["status"] == "approved" and "watch edge case X" in approved["advisor"]
+
+
 async def test_medium_in_auto_plans_on_strong_and_auto_approves(tmp_path, monkeypatch):
     server = make(tmp_path, monkeypatch, [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
     await start(server, tmp_path)

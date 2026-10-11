@@ -26,6 +26,9 @@ CONNECT_TIMEOUT = 30.0
 CALL_TIMEOUT = 120.0
 #: A runner that failed (or whose server died) is restarted on a later turn, at most this often.
 RESTART_BACKOFF_S = 30.0
+#: A turn that finds a dead server relaunches it and waits this long for it (a healthy restart takes well under a
+#: second); a server that is still starting then connects in the background and its tools come back on a later turn.
+REVIVE_WAIT_S = 3.0
 _SAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
@@ -83,6 +86,8 @@ class _Runner:
         self.queue: asyncio.Queue[tuple[str, dict[str, Any], asyncio.Future[Any]] | None] = asyncio.Queue()
         self.task: asyncio.Task[None] | None = None
         self.started_at = 0.0  # monotonic time of the last start (restart back-off)
+        self.ended_at = 0.0  # monotonic time the last run ended
+        self.connected_once = False  # a server that never connected is throttled from its failure, not its launch
 
     async def _call(self, session: Any, tool: str, args: dict[str, Any], fut: asyncio.Future[Any]) -> None:
         """One tool call. The caller may have been cancelled meanwhile (/stop, a timeout): its future is then done and
@@ -103,41 +108,52 @@ class _Runner:
                 self.state.error = _describe(e)
                 self.dead.set()
 
-    async def _run(self) -> None:
+    async def _connect(self, stack: contextlib.AsyncExitStack) -> Any:
+        """Open the transport and the session, initialise it and list the tools; returns the session."""
         from mcp import ClientSession
 
+        if self.cfg.url:
+            import httpx2  # the SDK's http library: a plain httpx client is rejected by its transport
+            from mcp.client.streamable_http import streamable_http_client
+
+            # read=300: a server may hold a response stream open (the SDK's own default); calls are bounded by
+            # CALL_TIMEOUT in `call`
+            http = httpx2.AsyncClient(
+                headers=request_headers(self.cfg) or None, timeout=httpx2.Timeout(CONNECT_TIMEOUT, read=300.0)
+            )
+            await stack.enter_async_context(http)
+            read, write = await stack.enter_async_context(streamable_http_client(self.cfg.url, http_client=http))
+        else:
+            from mcp import StdioServerParameters
+            from mcp.client.stdio import stdio_client
+
+            if not self.cfg.command:
+                raise ValueError("server needs `command` (stdio) or `url` (http)")
+            params = StdioServerParameters(
+                command=self.cfg.command,
+                args=self.cfg.args,
+                env=stdio_env(self.cfg.env),
+                cwd=self.cfg.cwd,
+            )
+            read, write = await stack.enter_async_context(stdio_client(params))
+        session = await stack.enter_async_context(ClientSession(read, write))
+        await asyncio.wait_for(session.initialize(), CONNECT_TIMEOUT)
+        self.state.tools = await asyncio.wait_for(_list_all_tools(session, self.name), CONNECT_TIMEOUT)
+        return session
+
+    async def _run(self) -> None:
         try:
             async with contextlib.AsyncExitStack() as stack:
-                if self.cfg.url:
-                    import httpx2  # the SDK's http library: a plain httpx client is rejected by its transport
-                    from mcp.client.streamable_http import streamable_http_client
-
-                    # read=300: a server may hold a response stream open (the SDK's own default); calls are bounded by
-                    # CALL_TIMEOUT in `call`
-                    http = httpx2.AsyncClient(
-                        headers=request_headers(self.cfg) or None, timeout=httpx2.Timeout(CONNECT_TIMEOUT, read=300.0)
-                    )
-                    await stack.enter_async_context(http)
-                    read, write = await stack.enter_async_context(
-                        streamable_http_client(self.cfg.url, http_client=http)
-                    )
-                else:
-                    from mcp import StdioServerParameters
-                    from mcp.client.stdio import stdio_client
-
-                    if not self.cfg.command:
-                        raise ValueError("server needs `command` (stdio) or `url` (http)")
-                    params = StdioServerParameters(
-                        command=self.cfg.command,
-                        args=self.cfg.args,
-                        env=stdio_env(self.cfg.env),
-                        cwd=self.cfg.cwd,
-                    )
-                    read, write = await stack.enter_async_context(stdio_client(params))
-                session = await stack.enter_async_context(ClientSession(read, write))
-                await asyncio.wait_for(session.initialize(), CONNECT_TIMEOUT)
-                self.state.tools = await asyncio.wait_for(_list_all_tools(session, self.name), CONNECT_TIMEOUT)
+                try:
+                    session = await self._connect(stack)
+                except BaseException as e:
+                    if not isinstance(e, asyncio.CancelledError):
+                        self.state.status = "failed"
+                        self.state.error = _describe(e)
+                    self.ready.set()  # whoever waits for this server need not sit through the teardown below
+                    raise
                 self.state.status = "connected"
+                self.connected_once = True
                 self.ready.set()
                 inflight: set[asyncio.Task[None]] = set()
                 get_next: asyncio.Task[Any] | None = None
@@ -174,6 +190,7 @@ class _Runner:
             if isinstance(e, asyncio.CancelledError):
                 raise
         finally:
+            self.ended_at = time.monotonic()
             self.ready.set()
             # fail anything still queued
             while not self.queue.empty():
@@ -196,6 +213,14 @@ class _Runner:
                 with contextlib.suppress(BaseException):
                     await self.task
         self.task = None
+
+
+def warm_imports() -> None:
+    """Import what a server connection needs (run in a thread: it takes ~0.6 s of CPU)."""
+    with contextlib.suppress(Exception):  # a missing SDK is reported by the connection attempt, as before
+        import mcp  # noqa: F401
+        import mcp.client.stdio  # noqa: F401
+        import mcp.client.streamable_http  # noqa: F401
 
 
 MAX_TOOL_PAGES = 50
@@ -288,6 +313,7 @@ class McpManager:
         self._last_tools: dict[str, list[McpToolInfo]] = {}
         self._started = False
         self._stale = False
+        self._reaping: set[asyncio.Future[None]] = set()  # runners being stopped after a restart
         self._lock = asyncio.Lock()  # ensure_started runs on every turn of every session: single-flight
 
     def configure(self, servers: dict[str, McpServerConfig]) -> None:
@@ -295,6 +321,18 @@ class McpManager:
         if {k: v.model_dump() for k, v in servers.items()} != {k: v.model_dump() for k, v in self.servers.items()}:
             self._stale = True
         self.servers = dict(servers)
+
+    @property
+    def cold(self) -> bool:
+        """Enabled servers are configured and not (or no longer, after a config change) running."""
+        return any(c.enabled for c in self.servers.values()) and (not self._started or self._stale)
+
+    async def start_early(self) -> None:
+        """``ensure_started`` for a turn that has not reached its first model call yet: the SDK is imported off the
+        event loop first (the import blocked it for ~0.6 s) so the user's hooks and the classifier running beside this
+        are not slowed. The turn's own ``ensure_started`` then finds it done, or joins it."""
+        await asyncio.to_thread(warm_imports)
+        await self.ensure_started()
 
     async def ensure_started(self) -> None:
         async with self._lock:
@@ -340,11 +378,15 @@ class McpManager:
         runner.start()
         return runner
 
-    async def _await_ready(self) -> None:
+    async def _await_ready(self, timeout: float | None = None) -> None:
+        """Wait until every server has connected or failed. ``timeout`` (a revive) leaves a server that is still
+        starting pending, to connect in the background; without it one that never answers is marked failed."""
+        limit = CONNECT_TIMEOUT + 5 if timeout is None else timeout
         await asyncio.gather(
-            *(asyncio.wait_for(r.ready.wait(), CONNECT_TIMEOUT + 5) for r in self._runners.values()),
-            return_exceptions=True,
+            *(asyncio.wait_for(r.ready.wait(), limit) for r in self._runners.values()), return_exceptions=True
         )
+        if timeout is not None:
+            return
         for r in self._runners.values():
             if r.state.status == "pending":
                 r.state.status = "failed"
@@ -355,14 +397,26 @@ class McpManager:
         to return as soon as it had run once, so a server that was down at daemon boot (network not up yet) or that
         crashed later stayed broken until `/mcp reload`."""
         now = time.monotonic()
+        relaunched = False
         for name, r in list(self._runners.items()):
             gone = r.task is None or r.task.done() or r.dead.is_set() or r.state.status == "failed"
-            if not r.cfg.enabled or not gone or now - r.started_at < RESTART_BACKOFF_S:
+            # a server that never connected (down, or hanging until the connect timeout) is throttled from when it
+            # failed: counted from its launch, one that took 30 s to fail was relaunched, and waited for, on every turn
+            since = r.ended_at if not r.connected_once and r.ended_at else r.started_at
+            if not r.cfg.enabled or not gone or now - since < RESTART_BACKOFF_S:
                 continue
             logger.info("restarting mcp server %s (%s)", name, r.state.error or r.state.status)
-            await r.stop()
+            # the old runner may still be tearing its connection down (seconds for a hung stdio server): that goes on
+            # beside the new one, the turn does not wait for it
+            reap = asyncio.ensure_future(r.stop())
+            self._reaping.add(reap)
+            reap.add_done_callback(self._reaping.discard)
             self._runners[name] = self._launch(name, r.cfg)
-        await self._await_ready()
+            relaunched = True
+        if relaunched:
+            await self._await_ready(
+                REVIVE_WAIT_S
+            )  # a hung server must not hold the turn: it connects in the background
 
     async def reload(self, servers: dict[str, McpServerConfig] | None = None) -> None:
         await self.close()
@@ -375,7 +429,7 @@ class McpManager:
             await self._close()
 
     async def _close(self) -> None:
-        await asyncio.gather(*(r.stop() for r in self._runners.values()), return_exceptions=True)
+        await asyncio.gather(*(r.stop() for r in self._runners.values()), *list(self._reaping), return_exceptions=True)
         self._runners.clear()
         self._last_tools.clear()
         self._started = False

@@ -276,11 +276,18 @@ class PlanFirst:
             return cap
 
         extra: dict[str, Any] = {"auto_approved": cap.auto}
-        if self.advisor_applies(session, "advisor_on_plan"):
+        if not self.advisor_applies(session, "advisor_on_plan"):
+            show("approved", **extra)
+            return cap
+        # The critique is for the user: the plan is approved and the executor never reads it. It used to run before the
+        # task started (a strong-tier call, up to 60 s); now it runs beside the task and is shown when it arrives.
+        plan = cap.plan
+
+        async def critique() -> None:
             try:
                 extra["advisor"] = await advisor_mod.advise(
                     server.model_caller,
-                    f"Task: {text}\n\nPlan:\n{cap.plan}",
+                    f"Task: {text}\n\nPlan:\n{plan}",
                     "Critique this approved plan.",
                     session_id=sid,
                     brief=True,
@@ -288,7 +295,11 @@ class PlanFirst:
                 )
             except Exception:  # noqa: BLE001 - a missing critique must not stop the task
                 logger.warning("advisor critique after plan failed", exc_info=True)
-        show("approved", **extra)
+            show("approved", **extra)
+
+        task = asyncio.ensure_future(critique())
+        server._side_tasks.add(task)
+        task.add_done_callback(server._side_tasks.discard)
         return cap
 
     # ── proposer ──

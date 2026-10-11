@@ -1655,6 +1655,15 @@ class GatewayServer:
             session.pending_prompts[:0] = _take_all(session.steer_queue)
         return session.pending_prompts
 
+    def _kick_mcp(self) -> None:
+        """Start the MCP servers now if they are not running. The turn needs them before its first model call; it
+        used to start them there, after the user's hooks and the classifier (a slow stdio server added ~2 s).
+        ``ensure_started`` is single-flight, so the turn's own call joins this one."""
+        if self.halted or not self.mcp.cold:
+            return
+        task = asyncio.ensure_future(self.mcp.start_early())
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())  # the turn's own call reports a failure
+
     async def _run_turn_locked(self, session: LiveSession, text: str) -> tuple[str, str]:
         _ctx_session.set(session)  # this task's events belong to the session, not to the requesting client
         effort_mod.REASONING_EFFORT.set(session.reasoning_effort)  # /effort, read by the providers
@@ -1662,6 +1671,7 @@ class GatewayServer:
         pasted = text.paste_spans if isinstance(text, TypedPrompt) else ()
         prompt = text = str(text)  # the marker only says who wrote it (and which parts were pasted)
         mgr = self.goal_manager(session)
+        self._kick_mcp()  # the servers start while the hooks and the scope classifier run
         # the prompt the user sent is not a continuation: clear the flag first, a turn that ended after a continuation
         # leaves it set and a queued prompt drained next would get no implicit goal
         session.goal_continuation = False
@@ -2117,6 +2127,7 @@ class GatewayServer:
         usage = Usage()
         error: str | None = None
         status = "done"
+        run_stop_hook = False  # set once the turn ran to its end without an exception
         cancelled = False  # set when the turn task is cancelled (/stop, Esc)
         gate = GateResult(prompt=text)
         # bound before the try: a /stop during the scope gate reached the finally first, whose replay record then
@@ -2238,6 +2249,8 @@ class GatewayServer:
                     # cap (and said so): the user decides how to go on (ending 'done' let an active goal judge it and
                     # continue into the same failures, and a capped task looked finished)
                     session.needs_input = True
+                    if attempt_reason == "max_turns":  # a limit the user set: a persistent goal does not retry past it
+                        session.budget_stopped = True
                 if new_tier is None or loop.interrupted:
                     break
                 # The attempt stalled on a cheap tier (or on main, see main_climbs): continue the same task one tier up.
@@ -2269,10 +2282,7 @@ class GatewayServer:
                 # over). Ending it 'done' let an active goal judge it and continue into the same loop, and reported a
                 # /loop tick as completed.
                 status = "needs_input"
-            if loop.hooks and not hooked.blocked:
-                stopped = await loop.hooks.run("Stop", {"stop_hook_active": False})
-                if stopped.blocked:  # Claude Code would continue the turn; k3code ends it and logs the reason
-                    logger.info("a Stop hook asked to continue the turn (not supported): %s", stopped.reason[:200])
+            run_stop_hook = bool(loop.hooks) and not hooked.blocked  # it runs once the client has the answer, below
         except (AllProvidersUnreachable, ChainExhausted, ContextOverflow, DiskGuardFull) as e:
             status = "error"
             error = str(e)
@@ -2356,6 +2366,16 @@ class GatewayServer:
             },
         )
         session.emit("status.update", {"kind": "status", "text": "", "state": session.state})
+        if run_stop_hook:
+            # The Stop hook cannot change the turn (a hook that asks to continue is logged and ignored), so the client
+            # no longer waits for it: message.complete went out above. The session lock is still held, so the next
+            # prompt and the goal's judge run after it, as before.
+            try:
+                stopped = await loop.hooks.run("Stop", {"stop_hook_active": False})
+                if stopped.blocked:  # Claude Code would continue the turn; k3code ends it and logs the reason
+                    logger.info("a Stop hook asked to continue the turn (not supported): %s", stopped.reason[:200])
+            except Exception:  # noqa: BLE001 - the turn is over; a failing hook must not turn it into an error
+                logger.exception("the Stop hook failed")
         if (
             status == "done"
             and not prompt_blocked
