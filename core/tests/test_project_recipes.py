@@ -262,7 +262,7 @@ def _skill(root: Path, name: str, description: str) -> None:
     make(root, {f"{name}/SKILL.md": f"---\nname: {name}\ndescription: {description}\n---\nbody\n"})
 
 
-async def test_skills_index_prefers_stack_matches_then_recent_successful_use(tmp_path):
+async def test_skills_index_prefers_stack_matches_and_ignores_use(tmp_path):
     from k3code.skills import skills_prompt
 
     sroot = tmp_path / "skills"
@@ -280,8 +280,8 @@ async def test_skills_index_prefers_stack_matches_then_recent_successful_use(tmp
 
     record_use("zz-used-often")
     used = skills_prompt(repo, [str(sroot)], limit=10)
-    assert "zz-used-often" in used and "zz-pytest-runner" in used
-    assert used == skills_prompt(repo, [str(sroot)], limit=10)  # same input, same section
+    # a use does not reorder the index: that rewrote the system prompt, a prompt-cache miss for the whole request
+    assert used == ranked and "zz-used-often" not in used
 
 
 def test_onboarding_non_interactive_default_creates_no_proposals(tmp_path):

@@ -23,7 +23,8 @@ async def test_write_replaces_the_list_and_renders_it() -> None:
             {"content": "run tests", "status": "pending"},
         ],
     )
-    assert out["content"] == "Todos (1/3 done):\n[x] read the code\n[>] write the fix\n[ ] run tests"
+    assert out["content"] == "Todos updated (1/3 done)."  # the model wrote the list: it is not echoed back
+    assert out["todos"] == state["todos"]  # the TUI gets the list on its own
     assert state["todos"] == [
         {"id": "1", "content": "read the code", "status": "completed"},
         {"id": "2", "content": "write the fix", "status": "in_progress"},
@@ -65,6 +66,6 @@ async def test_gateway_keeps_the_list_with_the_session_and_sends_it_to_the_tui(t
         {"id": "1", "content": "plan", "status": "completed"},
         {"id": "2", "content": "build", "status": "in_progress"},
     ]
-    assert "[>] build" in complete["result_text"]
+    assert "1/2 done" in complete["result_text"]
     stored = server.store.get(server.session.session_id)
     assert stored.meta["todos"] == complete["todos"]

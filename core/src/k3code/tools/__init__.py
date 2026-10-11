@@ -906,7 +906,8 @@ class TodoStore:
         self.state[self.KEY] = todos
         # the model wrote the list a moment ago: echoing it back doubled it in the history (the TUI gets `todos`)
         done = sum(1 for t in todos if t.get("status") == "completed")
-        return {"content": f"Todos updated ({done}/{len(todos)} done).", "todos": todos}
+        ack = f"Todos updated ({done}/{len(todos)} done)." if todos else "Todo list cleared."
+        return {"content": ack, "todos": todos}
 
 
 TODO_SPEC = ToolSpec(

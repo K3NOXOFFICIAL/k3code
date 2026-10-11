@@ -236,6 +236,7 @@ class Router:
         failure_hint = ""  # a TLS hint outlives the failovers that follow it: it is what the user must fix
         all_network = True  # tracks "every failure so far was a network failure"
         all_auth = True  # tracks "every failure and every cooldown seen so far was an auth rejection"
+        saw_limit = False  # a rate limit or quota failure (or cooldown) was seen: the wait below is its reset
         auth_failed: set[int] = set()  # entries rejected in this walk (a first rejection arms no cooldown)
         entry_index = 0
         while entry_index < len(self.chain):
@@ -260,6 +261,7 @@ class Router:
                     last_reason = cooled
                     all_network = all_network and cooled is FailoverReason.network
                     all_auth = all_auth and cooled is FailoverReason.auth
+                    saw_limit = saw_limit or cooled in (FailoverReason.rate_limit, FailoverReason.quota)
                 entry_index += 1
                 continue
             attempt = 0
@@ -288,6 +290,7 @@ class Router:
                     failure_hint = classified.hint or failure_hint
                     all_network = all_network and classified.reason is FailoverReason.network
                     all_auth = all_auth and classified.reason is FailoverReason.auth
+                    saw_limit = saw_limit or classified.reason in (FailoverReason.rate_limit, FailoverReason.quota)
                     if classified.reason is FailoverReason.auth:
                         auth_failed.add(entry_index)
                     if classified.reason is FailoverReason.context_overflow:
@@ -355,7 +358,7 @@ class Router:
         if wait is not None:
             until = self.cooldowns.wall() + wait
             clock = time.strftime("%H:%M", time.localtime(until))
-            limited = last_reason in (FailoverReason.rate_limit, FailoverReason.quota)
+            limited = saw_limit or last_reason in (FailoverReason.rate_limit, FailoverReason.quota)
             raise ChainExhausted(
                 f"all providers {'rate-limited' if limited else 'unavailable'} until {clock} ({reason_name})",
                 last_reason=reason_name,

@@ -162,9 +162,10 @@ def test_activated_tools_follow_the_built_in_ones_in_activation_order():
         reg.register(ToolSpec(name=name, description="", parameters={"type": "object"}), handler, deferred=deferred)
     assert [s.name for s in reg.specs()] == ["read", "bash"]
     reg.activate(["mcp__c", "mcp__a", "nope", "mcp__c"])
-    assert [s.name for s in reg.specs()] == ["read", "bash", "mcp__c", "mcp__a"]
+    assert [s.name for s in reg.specs()] == ["read", "bash", "mcp__c", "mcp__a"]  # "nope" is not advertised ...
     reg.activate(["mcp__b"])
-    assert reg.active_names() == ["mcp__c", "mcp__a", "mcp__b"]  # earlier ones keep their place
+    # ... but it is remembered (its server may be down just now), and earlier ones keep their place
+    assert reg.active_names() == ["mcp__c", "mcp__a", "nope", "mcp__b"]
 
 
 # ── the loop guard ────────────────────────────────────────────────────
