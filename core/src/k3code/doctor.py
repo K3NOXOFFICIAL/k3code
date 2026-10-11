@@ -191,33 +191,6 @@ def check_context_windows(config: Settings) -> list[Check]:
     ]
 
 
-def check_prompt_cache(config: Settings) -> list[Check]:
-    """OpenAI-compatible providers that serve Claude models with ``prompt_cache: auto``: no cache breakpoints are sent
-    (auto is off for that kind, because some endpoints reject the field), so every request pays for the whole
-    conversation again. Nothing is reported for a provider that has no Claude model or already says on or off."""
-    out = []
-    for p in config.providers:
-        if p.kind != "openai" or p.prompt_cache != "auto":
-            continue
-        ids = {
-            m for spec in [*p.models.values(), *p.tiers.values()] for m in ([spec] if isinstance(spec, str) else spec)
-        }
-        claude = sorted(m for m in ids if m and "claude" in m.lower())
-        if claude:
-            out.append(
-                Check(
-                    f"prompt-cache:{p.name}",
-                    WARN,
-                    f"serves {', '.join(claude)} without prompt-cache breakpoints (prompt_cache: auto is off for "
-                    "OpenAI-compatible providers)",
-                    f"if {p.name} passes Anthropic cache_control through to Claude, set `prompt_cache: on` on this "
-                    "provider in config.yaml; set `prompt_cache: off` to silence this",
-                    {"provider": p.name, "models": claude},
-                )
-            )
-    return out
-
-
 def check_keys(config: Settings) -> Check:
     # p.api_key is what load_config resolved from the process environment *or* ~/.config/k3code/env, where the setup
     # wizard stores keys: checking os.environ alone failed every shell run, and so did the update smoke test.
@@ -662,7 +635,6 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
     checks += await check_providers(config, probe=probe)
     checks.append(check_keys(config))
     checks += check_context_windows(config)
-    checks += check_prompt_cache(config)
     checks.append(await check_netwatch_async() if probe else Check("netwatch", OK, "probe skipped"))
     checks += [check_disk(home), check_psi()]
     daemon_check = await check_daemon() if probe else Check("daemon", OK, "probe skipped")

@@ -45,8 +45,9 @@ class ProviderEntry(BaseModel):
     persistent: bool = True
     max_sessions: int = 4
     idle_seconds: float = 600.0
-    #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
-    #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
+    #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic; for an openai entry (a relay) they are
+    #: sent only for model ids that look like Claude, and dropped for good if the endpoint answers 400 to a request
+    #: with them and accepts it without. on = always send them, off = never.
     prompt_cache: str = "auto"
     #: How long a cache entry lives after its last use: "5m" (the default) or "1h" (written at twice the price of
     #: a 5-minute entry, read at the same discount). A /loop or cron job that runs every 5 minutes or more finds a

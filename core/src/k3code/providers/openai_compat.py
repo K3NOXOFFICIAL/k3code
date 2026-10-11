@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -18,6 +19,8 @@ from k3code.providers.types import (
     messages_to_openai,
     with_cache_breakpoint,
 )
+
+logger = logging.getLogger(__name__)
 
 _TIMEOUT = httpx.Timeout(connect=15.0, read=300.0, write=60.0, pool=15.0)
 
@@ -36,9 +39,11 @@ class OpenAICompatProvider(Provider):
         cache_ttl: str = "5m",
     ) -> None:
         self.name = name
-        #: "on": Anthropic-style cache_control inside messages for Claude model ids (auto = off: plain OpenAI
-        #: endpoints cache by themselves and some reject unknown fields)
-        self.prompt_cache = prompt_cache == "on"
+        #: Anthropic-style cache_control inside messages, for Claude model ids only (plain OpenAI endpoints cache by
+        #: themselves). "on" always sends it; "auto" sends it until the endpoint answers 400 to a request with it and
+        #: accepts the same request without (some relays reject the field): it is dropped for the rest of the run.
+        self.prompt_cache = prompt_cache in ("on", "auto")
+        self._cache_probing = prompt_cache == "auto"
         self.cache_ttl = cache_ttl
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -88,6 +93,41 @@ class OpenAICompatProvider(Provider):
             ]
         return payload
 
+    async def _open(
+        self, messages: list[Message], tools: list[ToolSpec], model: str, *, max_tokens: int, temperature: float | None
+    ) -> httpx.Response:
+        """The streaming response to the request, or the ProviderError of its HTTP status. With ``prompt_cache: auto`` a
+        400 to a request that carried cache breakpoints is answered by the same request without them: if that works
+        the endpoint does not take the field, and no later request carries it."""
+        rejected: ProviderError | None = None
+        while True:
+            marked = self.prompt_cache and "claude" in model.lower()
+            request = self._client.build_request(
+                "POST",
+                self._url(),
+                headers=request_headers("openai", self.api_key),
+                json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
+            )
+            try:
+                response = await self._client.send(request, stream=True)
+            except httpx.HTTPError as exc:
+                raise to_provider_error(exc, kind="openai") from exc
+            if response.status_code < 400:
+                if rejected is not None:
+                    logger.warning(
+                        "%s does not take prompt-cache breakpoints: sending Claude requests without", self.name
+                    )
+                return response
+            error = await _error_from_response(response)
+            await response.aclose()
+            if rejected is None and response.status_code == 400 and marked and self._cache_probing:
+                rejected, self.prompt_cache = error, False
+                continue
+            if rejected is not None:  # it failed without the breakpoints too: they were not the problem
+                self.prompt_cache = True
+                raise rejected
+            raise error
+
     async def stream(
         self,
         messages: list[Message],
@@ -97,20 +137,7 @@ class OpenAICompatProvider(Provider):
         max_tokens: int = 8192,
         temperature: float | None = None,
     ) -> AsyncIterator[StreamEvent]:
-        request = self._client.build_request(
-            "POST",
-            self._url(),
-            headers=request_headers("openai", self.api_key),
-            json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
-        )
-        try:
-            response = await self._client.send(request, stream=True)
-        except httpx.HTTPError as exc:
-            raise to_provider_error(exc, kind="openai") from exc
-        if response.status_code >= 400:
-            error = await _error_from_response(response)
-            await response.aclose()
-            raise error
+        response = await self._open(messages, tools, model, max_tokens=max_tokens, temperature=temperature)
         try:
             tool_calls: dict[int, dict[str, Any]] = {}
             content_parts: list[str] = []

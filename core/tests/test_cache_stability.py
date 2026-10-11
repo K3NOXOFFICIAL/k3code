@@ -130,3 +130,80 @@ async def test_a_new_turn_starts_with_the_same_elisions_the_last_one_ended_with(
     start_of_second = [m.content for m in second.requests[0][0]]
     # everything the last request of the first turn sent is sent again, byte for byte, ahead of the new prompt
     assert start_of_second[: len(last_of_first)] == last_of_first
+
+
+# ── Claude behind an OpenAI-compatible relay ──────────────────────────
+
+
+def _relay(accepts_markers: bool, seen: list[bool], status_without: int = 200):
+    """A relay on httpx's mock transport: 400 to a request with cache_control when it does not take the field."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        marked = b"cache_control" in request.content
+        seen.append(marked)
+        if marked and not accepts_markers:
+            return httpx.Response(400, json={"error": {"message": "Extra inputs are not permitted: cache_control"}})
+        if not marked and status_without != 200:
+            return httpx.Response(status_without, json={"error": {"message": "maximum context length is 1000 tokens"}})
+        body = (
+            'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+            '"usage":{"prompt_tokens":5,"completion_tokens":1}}\n\ndata: [DONE]\n\n'
+        )
+        return httpx.Response(200, content=body.encode(), headers={"content-type": "text/event-stream"})
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def _ask(provider, model: str = "anthropic/claude-sonnet-5-5"):
+    return [e async for e in provider.stream(conversation(), TOOLS, model)]
+
+
+async def test_auto_sends_the_markers_to_a_relay_that_takes_them():
+    seen: list[bool] = []
+    p = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", client=_relay(True, seen))
+    await _ask(p)
+    await _ask(p)
+    assert seen == [True, True] and p.prompt_cache
+
+
+async def test_auto_drops_the_markers_for_good_when_the_relay_rejects_them():
+    seen: list[bool] = []
+    p = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", client=_relay(False, seen))
+    events = await _ask(p)
+    assert events[-1].type == "done" and seen == [True, False]  # rejected, then sent again without
+    await _ask(p)
+    assert seen == [True, False, False] and not p.prompt_cache  # the next request does not try again
+
+
+async def test_a_400_that_has_nothing_to_do_with_the_markers_is_raised_and_the_markers_stay():
+    from k3code.providers.base import ProviderError
+
+    seen: list[bool] = []
+    p = OpenAICompatProvider(
+        name="o", base_url="https://relay.test/v1", api_key="k", client=_relay(True, seen, status_without=400)
+    )
+    ok = await _ask(p)  # markers accepted: a normal answer
+    assert ok[-1].type == "done"
+    never = OpenAICompatProvider(
+        name="o", base_url="https://relay.test/v1", api_key="k", client=_relay(False, [], status_without=400)
+    )
+    with pytest.raises(ProviderError) as err:
+        await _ask(never)
+    assert err.value.status_code == 400 and never.prompt_cache  # it failed both ways: not the markers' fault
+
+
+async def test_on_never_retries_and_a_gpt_model_never_carries_markers():
+    from k3code.providers.base import ProviderError
+
+    seen: list[bool] = []
+    forced = OpenAICompatProvider(
+        name="o", base_url="https://relay.test/v1", api_key="k", prompt_cache="on", client=_relay(False, seen)
+    )
+    with pytest.raises(ProviderError):
+        await _ask(forced)
+    assert seen == [True]
+    seen.clear()
+    auto = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", client=_relay(False, seen))
+    await _ask(auto, "gpt-4o")
+    assert seen == [False]
