@@ -11,7 +11,18 @@ def _read() -> str:
     f = core.parent / "VERSION"
     if (core / "pyproject.toml").is_file() and f.is_file():
         return f.read_text().strip()
-    # Lazy: only an installed copy (no checkout files) needs importlib.metadata.
+    # An installed copy: read the METADATA next to the package. importlib.metadata (email parser included) is
+    # ~30 ms of the ~45 ms import, paid on every `k3code --version`; it stays as the fallback.
+    for dist_info in sorted(Path(__file__).resolve().parents[1].glob("k3code-*.dist-info")):
+        try:
+            with (dist_info / "METADATA").open(encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("Version:"):
+                        return line.partition(":")[2].strip()
+                    if not line.strip():
+                        break  # end of the headers
+        except OSError:
+            continue
     from importlib import metadata
 
     try:

@@ -30,3 +30,30 @@ def test_version_without_a_recorded_build_is_the_plain_version(tmp_path: Path, m
     r = CliRunner().invoke(cli, ["--version"])
     assert r.exit_code == 0, r.output
     assert r.output == f"k3code, version {__version__}\n"
+
+
+def test_installed_copy_reads_its_version_without_importlib_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """importlib.metadata is ~30 ms of an installed copy's import; the version comes from the dist-info instead."""
+    import importlib.metadata
+    import importlib.util
+
+    import k3code._version as real
+
+    site = tmp_path / "site"
+    (site / "k3code").mkdir(parents=True)
+    (site / "k3code" / "_version.py").write_text(Path(real.__file__).read_text())
+    dist = site / "k3code-9.8.7.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text("Metadata-Version: 2.4\nName: k3code\nVersion: 9.8.7\n\nVersion: not-a-header\n")
+
+    def boom(_name: str) -> str:
+        raise AssertionError("importlib.metadata was used")
+
+    monkeypatch.setattr(importlib.metadata, "version", boom)
+    spec = importlib.util.spec_from_file_location("k3code_version_probe", site / "k3code" / "_version.py")
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.__version__ == "9.8.7"
