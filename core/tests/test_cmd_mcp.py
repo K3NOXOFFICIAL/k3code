@@ -59,7 +59,10 @@ async def test_deferred_registration_and_tool_search():
 
         _, search = reg.get("mcp_tool_search")
         res = await search({"query": "mcp__fake__add"})
-        assert '"a"' in res["content"] and "input_schema" in res["content"]  # full schema on demand
+        # the result names the tool and its arguments; the full schema reaches the model through the tool list
+        assert "mcp__fake__add(a, b)" in res["content"] and "input_schema" not in res["content"]
+        (spec,) = [s for s in reg.specs() if s.name == "mcp__fake__add"]
+        assert set(spec.parameters["properties"]) == {"a", "b"}
         assert "mcp__fake__add" in {s.name for s in reg.specs()}  # now advertised
         assert "mcp__fake__echo" not in {s.name for s in reg.specs()}
 

@@ -101,18 +101,24 @@ def _import_target(spec: str, base: Path) -> Path:
     return p.resolve()
 
 
-def expand_imports(path: Path, roots: tuple[Path, ...], _stack: tuple[Path, ...] = ()) -> str:
+def expand_imports(
+    path: Path, roots: tuple[Path, ...], _stack: tuple[Path, ...] = (), _emitted: set[Path] | None = None
+) -> str:
     """``path``'s text with each line ``@relative/or/~/path`` replaced by that file's text (recursively).
 
     An import is resolved against the importing file's directory and must stay inside ``roots`` (the repository for
     project files, the home directory for the user's memory); a key or credential location is never read. Imports
     nest at most MAX_IMPORT_DEPTH deep and a cycle is cut. A line naming no file stays as written (``@property`` in
-    prose), and lines inside a code fence are never imports.
+    prose), and lines inside a code fence are never imports. ``_emitted`` collects the files whose text went into the
+    prompt: a file imported after it was already included (``CLAUDE.md`` holding ``@AGENTS.md`` next to AGENTS.md)
+    is not repeated.
     """
     from k3code.permissions.engine import sensitive_path
 
     resolved = path.resolve()
     stack = (*_stack, resolved)
+    if _emitted is not None:
+        _emitted.add(resolved)
     text = path.read_text(encoding="utf-8", errors="replace")
     out: list[str] = []
     in_fence = False
@@ -132,8 +138,10 @@ def expand_imports(path: Path, roots: tuple[Path, ...], _stack: tuple[Path, ...]
             out.append(f"({line.strip()} not imported: outside the allowed directories)")
         elif len(stack) > MAX_IMPORT_DEPTH:
             out.append(f"({line.strip()} not imported: imports nest at most {MAX_IMPORT_DEPTH} deep)")
+        elif _emitted is not None and target in _emitted:
+            out.append(f"({line.strip()} not repeated: it is already in the instructions)")
         else:
-            out.append(expand_imports(target, roots, stack).rstrip("\n"))
+            out.append(expand_imports(target, roots, stack, _emitted).rstrip("\n"))
     return "\n".join(out)
 
 
@@ -169,11 +177,14 @@ def load_memory(cwd: str | Path) -> list[MemoryFile]:
         candidates += [("project", d / name, (root,)) for name in PROJECT_FILES]
     out: list[MemoryFile] = []
     seen: set[str] = set()
+    emitted: set[Path] = set()
     for scope, path, roots in candidates:
         if not path.is_file() or not _readable(path, roots):
             continue
+        if path.resolve() in emitted:  # an earlier file imported this one: its text is in the prompt already
+            continue
         try:
-            text = expand_imports(path, roots).strip()
+            text = expand_imports(path, roots, _emitted=emitted).strip()
         except OSError:
             continue
         if text and text not in seen:
@@ -230,6 +241,6 @@ def append_memory(path: Path, text: str) -> None:
         private_file(path)
     else:
         path.parent.mkdir(parents=True, exist_ok=True)
-    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    existing = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""  # as load_memory reads it
     sep = "" if not existing or existing.endswith("\n") else "\n"
     path.write_text(existing + sep + f"- {text.strip()}\n", encoding="utf-8")

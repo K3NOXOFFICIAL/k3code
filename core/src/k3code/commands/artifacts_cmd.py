@@ -64,6 +64,8 @@ def _publish(ctx: Any, store: Any, args: list[str]) -> dict[str, Any]:
     force = pop_flag(args, "--force")
     art = store.get(args[0]) if len(args) == 1 else None
     if art is None:
+        if len(args) == 1 and len(many := store.matches(args[0])) > 1:
+            return reply(f"{args[0]} matches several artifacts ({', '.join(a.id for a in many)}): use more of the id.")
         return reply(PUBLISH_USAGE)
     if not art.exists:
         return reply(f"Cannot publish {art.id}: the file is gone ({art.path}).")

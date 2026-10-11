@@ -25,15 +25,33 @@ class Skill:
         return self.path.read_text(encoding="utf-8", errors="replace")
 
 
+_LOOSE_LINE = re.compile(r"^([A-Za-z_][\w-]*):[ \t]*(.*?)[ \t]*$")
+
+
+def _loose_frontmatter(block: str) -> dict[str, str]:
+    """``key: value`` lines of a frontmatter block that is not valid YAML (an unquoted colon in a description is the
+    usual cause: ``description: Use when: x``): the description is still worth showing."""
+    out: dict[str, str] = {}
+    for line in block.splitlines():
+        if m := _LOOSE_LINE.match(line):
+            value = m.group(2)
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if value:
+                out[m.group(1)] = value
+    return out
+
+
 def parse_frontmatter(text: str) -> dict[str, str]:
-    m = _FM.match(text)
+    m = _FM.match(text.removeprefix("\ufeff"))  # an editor's byte-order mark is not part of the file's first line
     if not m:
         return {}
     try:
         data = yaml.safe_load(m.group(1)) or {}
     except yaml.YAMLError:
-        return {}
-    return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        return _loose_frontmatter(m.group(1))
+    # `name:` with no value is None, not the skill "None"
+    return {str(k): str(v) for k, v in data.items() if v is not None} if isinstance(data, dict) else {}
 
 
 #: Skill directories a project may ship besides ``.k3code/skills``: Claude Code's and the cross-agent convention.

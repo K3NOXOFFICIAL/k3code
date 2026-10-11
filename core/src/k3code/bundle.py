@@ -26,8 +26,10 @@ _SETTINGS_FILES = {"settings/user.config.yaml": "user", "settings/project.config
 _SESSION_RE = re.compile(r"^sessions/([A-Za-z0-9_\-]{1,64})\.json$")
 #: Session meta an imported bundle must not carry over: a permission mode (yolo), extra writable roots, and the
 #: background / automation-origin markers that make the daemon run or resume the session on its own, and an armed
-#: ``ultra_mode`` (ultracode spawns parallel sub-agents on the next prompt, which the importer never chose).
-_UNTRUSTED_META = frozenset({"mode", "add_dirs", "background", "ultra_mode"})
+#: ``ultra_mode`` (ultracode spawns parallel sub-agents on the next prompt, which the importer never chose), and the
+#: goal: an active one is resumed by the daemon's boot resume and watchdog, which would run the bundle author's goal
+#: text and ``--check`` command unattended.
+_UNTRUSTED_META = frozenset({"mode", "add_dirs", "background", "ultra_mode", "goal"})
 
 
 class BundleError(ValueError):
@@ -184,6 +186,33 @@ def _strip_redacted(obj: Any) -> Any:
     return obj
 
 
+def _has_redacted(obj: Any) -> bool:
+    if isinstance(obj, dict):
+        return any(v == REDACTED or _has_redacted(v) for v in obj.values())
+    if isinstance(obj, list):
+        return any(v == REDACTED or _has_redacted(v) for v in obj)
+    return False
+
+
+def _merge_list(existing: list[Any], incoming: list[Any]) -> list[Any]:
+    """An incoming list holding placeholders, over a list of the same length (the bundle's own export, imported on the
+    machine it came from): each placeholder keeps what is there, so a round trip does not delete ``--token=…`` from an
+    ``args`` list or the ``command`` of a hook. Lists of another length are not aligned: placeholders are dropped."""
+    if len(existing) != len(incoming):
+        return _strip_redacted(incoming)
+    out: list[Any] = []
+    for old, new in zip(existing, incoming, strict=True):
+        if new == REDACTED:
+            out.append(old)
+        elif isinstance(new, dict) and isinstance(old, dict):
+            out.append(merge_settings(old, new))
+        elif isinstance(new, list) and isinstance(old, list) and _has_redacted(new):
+            out.append(_merge_list(old, new))
+        else:
+            out.append(_strip_redacted(new))
+    return out
+
+
 def merge_settings(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     """Deep-merge ``incoming`` over ``existing``; ``<redacted>`` never overwrites (or creates) a value."""
     out = dict(existing)
@@ -192,6 +221,8 @@ def merge_settings(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[s
             continue
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = merge_settings(out[k], v)
+        elif isinstance(v, list) and _has_redacted(v) and isinstance(out.get(k), list):
+            out[k] = _merge_list(out[k], v)
         elif isinstance(v, dict | list):
             out[k] = _strip_redacted(v)
         else:
@@ -222,6 +253,10 @@ _SCALAR_SENSITIVE: tuple[tuple[str, ...], ...] = (
     ("skills", "roots"),
     ("web", "allow_private"),
     ("browser", "cdp_url"),
+    ("browser", "executable_path"),  # a program the browser tools launch
+    ("research", "searxng_url"),  # its origin is exempt from the private-address guard
+    ("automation", "webhook_port"),  # opens a listening port
+    ("artifacts", "publish_dir"),  # where /artifacts publish writes
 )
 
 
@@ -326,6 +361,14 @@ class ImportReport:
         return "\n".join(lines) or "nothing imported"
 
 
+def _usable_cwd(value: Any) -> bool:
+    try:
+        path = Path(str(value))
+        return bool(value) and path.is_absolute() and path.is_dir() and path != Path(path.anchor)
+    except (OSError, ValueError):
+        return False
+
+
 def apply_bundle(
     bundle: Bundle,
     *,
@@ -367,6 +410,8 @@ def apply_bundle(
                 for k, v in (sess.meta if isinstance(sess.meta, dict) else {}).items()
                 if k not in _UNTRUSTED_META and not k.startswith("origin")
             }
+            if not _usable_cwd(sess.cwd):  # another machine's path, or "/": the session works where it is imported
+                sess.cwd = str(cwd)
             old = sess.session_id
             if store.get(old) is not None:
                 sess.session_id = store.new_id()

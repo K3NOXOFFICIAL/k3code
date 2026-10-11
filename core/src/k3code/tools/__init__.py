@@ -561,7 +561,7 @@ def clip_head_tail(text: str, limit: int = _MAX_CHARS, hint: str = _CLIP_HINT_DE
 
 def clip_for_model(name: str | None, text: str, limit: int = _MAX_CHARS) -> str:
     """What the model is sent of one tool result: ``read`` keeps its own budget, others are clipped to ``limit``."""
-    if name == "read":
+    if name in ("read", "skill"):  # a skill is loaded to be followed whole: its own cap (MAX_SKILL_CHARS) applies
         limit = max(limit, _READ_RESULT_CHARS)
     return clip_head_tail(text, limit, _CLIP_HINTS.get(name or "", _CLIP_HINT_DEFAULT))
 

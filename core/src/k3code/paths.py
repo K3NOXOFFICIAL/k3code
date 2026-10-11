@@ -14,6 +14,24 @@ def home() -> Path:
     return Path(os.environ.get("K3CODE_HOME", str(Path.home() / ".k3code"))).expanduser()
 
 
+#: What k3code generates under a project's ``.k3code``; the rest (``config.yaml``, ``rules``, ``skills``, ``agents``,
+#: ``output-styles``) is meant to be committed.
+GENERATED_DIRS = ("worktrees", "plans", "research", "reports")
+
+
+def ignore_generated(k3dir: Path) -> None:
+    """Write ``<project>/.k3code/.gitignore`` for the generated directories. A ``*`` file (older versions wrote one)
+    hid the committed rules, skills and config from ``git status`` too, so it is replaced; any other content is the
+    user's and stays."""
+    gi = k3dir / ".gitignore"
+    try:
+        if not gi.exists() or gi.read_text(encoding="utf-8") == "*\n":
+            # the file lists itself: it is k3code's own, written per machine, and must not show up in `git status`
+            gi.write_text(".gitignore\n" + "".join(f"{d}/\n" for d in GENERATED_DIRS), encoding="utf-8")
+    except OSError:
+        pass  # a read-only checkout: the artifacts are written anyway, only the ignore file is missing
+
+
 def ensure_private_dir(path: Path) -> Path:
     """Create ``path`` as 0700, or tighten an existing one we own to 0700. Refuses a directory another user owns.
 

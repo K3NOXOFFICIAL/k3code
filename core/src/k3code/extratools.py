@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +56,13 @@ def register_skill_tool(reg: ToolRegistry, cwd: Path, roots: list[str]) -> None:
     )
 
 
+def _arguments(schema: dict[str, Any]) -> str:
+    """``a, b?``: a tool's argument names, optional ones marked."""
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    required = set(schema.get("required") or []) if isinstance(schema, dict) else set()
+    return ", ".join(k if k in required else f"{k}?" for k in props) if isinstance(props, dict) else ""
+
+
 def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
     """Register every connected MCP tool (schema deferred) plus ``mcp_tool_search``."""
     tools = mcp.tools()
@@ -89,8 +95,10 @@ def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
         reg.activate([t.qualified for t in hits])
         if not hits:
             return {"content": "No matching MCP tools."}
-        body = [{"name": t.qualified, "description": t.description, "input_schema": t.schema} for t in hits]
-        return {"content": json.dumps(body, indent=2) + "\n\nThese tools can now be called directly."}
+        # the full schemas reach the model through the tool list from the next step on: repeating them here (indented
+        # JSON) doubled their tokens, so the result names each tool with its arguments
+        body = "\n".join(f"- {t.qualified}({_arguments(t.schema)}): {t.description}" for t in hits)
+        return {"content": f"{body}\n\nThese tools can now be called directly."}
 
     reg.register(
         ToolSpec(

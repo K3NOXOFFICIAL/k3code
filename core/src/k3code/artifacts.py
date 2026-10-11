@@ -81,12 +81,29 @@ class ArtifactStore:
         q += " ORDER BY ts DESC LIMIT ?"
         return [Artifact(*row) for row in self._db.execute(q, [*args, limit])]
 
-    def get(self, ident: str) -> Artifact | None:
-        row = self._db.execute(
-            "SELECT id, ts, session, kind, title, path FROM artifacts WHERE id = ? OR id LIKE ?",
-            (ident, ident + "%"),
+    def matches(self, ident: str, limit: int = 5) -> list[Artifact]:
+        """The artifact with exactly this id, else those whose id starts with it (``%`` and ``_`` are not wildcards; an
+        empty id matches nothing)."""
+        ident = ident.strip()
+        if not ident:
+            return []
+        exact = self._db.execute(
+            "SELECT id, ts, session, kind, title, path FROM artifacts WHERE id = ?", (ident,)
         ).fetchone()
-        return Artifact(*row) if row else None
+        if exact:
+            return [Artifact(*exact)]
+        escaped = ident.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        rows = self._db.execute(
+            "SELECT id, ts, session, kind, title, path FROM artifacts WHERE id LIKE ? ESCAPE '\\' LIMIT ?",
+            (escaped + "%", limit),
+        )
+        return [Artifact(*row) for row in rows]
+
+    def get(self, ident: str) -> Artifact | None:
+        """The one artifact ``ident`` names; None when it names none or several (a prefix shared by two ids used to
+        pick one of them, and ``/artifacts publish`` published it)."""
+        found = self.matches(ident, limit=2)
+        return found[0] if len(found) == 1 else None
 
     def close(self) -> None:
         self._db.close()

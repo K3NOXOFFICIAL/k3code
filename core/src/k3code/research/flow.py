@@ -19,6 +19,7 @@ import httpx
 
 from k3code.artifacts import write_artifact_file
 from k3code.autonomy.ultra import with_hook_context
+from k3code.paths import ignore_generated
 from k3code.providers.types import Message
 from k3code.research import prompts
 from k3code.research.fetch import FetchStatus
@@ -51,6 +52,23 @@ def is_dead_link(exc: BaseException) -> bool:
         code = exc.response.status_code
         return code in (404, 410) or code >= 500
     return isinstance(exc, httpx.ConnectError)
+
+
+def spread_by_topic(learnings: list[Any], limit: int) -> list[Any]:
+    """At most ``limit`` claims, taken round-robin across sub-topics: the first ``limit`` claims in plan order left the
+    later topics (a default run extracts ~140 claims, 60 are cross-checked) labelled "single source" unchecked."""
+    if len(learnings) <= limit:
+        return list(learnings)
+    by_topic: dict[str, list[Any]] = {}
+    for x in learnings:
+        by_topic.setdefault(x.sub_topic, []).append(x)
+    out: list[Any] = []
+    queues = list(by_topic.values())
+    while len(out) < limit and any(queues):
+        for q in queues:
+            if q and len(out) < limit:
+                out.append(q.pop(0))
+    return out
 
 
 class ResearchUnavailable(Exception):
@@ -229,11 +247,8 @@ class Research:
                     max_tokens=1024,
                 )
                 data = loose_json(reply)
-                claims = (
-                    [str(c).strip() for c in (data or {}).get("claims", []) if str(c).strip()]
-                    if isinstance(data, dict)
-                    else []
-                )
+                raw = data.get("claims") if isinstance(data, dict) else None  # null, a string or a number: no claims
+                claims = [str(c).strip() for c in raw if str(c).strip()] if isinstance(raw, list) else []
                 return topic, hit, title or hit.title, claims
 
         # Read, then backfill from the spare hits until min_sources sources produced claims. A report cites only the
@@ -242,7 +257,13 @@ class Research:
         read: list[tuple[SubTopic, Hit, str, list[str]]] = []
         batch = picks
         while batch:
-            read += await asyncio.gather(*(one_read(t, h) for t, h in batch))
+            for got in await asyncio.gather(*(one_read(t, h) for t, h in batch), return_exceptions=True):
+                if isinstance(got, BaseException):  # one source's extraction failing must not lose the other reads
+                    if isinstance(got, asyncio.CancelledError):
+                        raise got
+                    logger.warning("reading a source failed: %s", got)
+                else:
+                    read.append(got)
             need = int(cfg["min_sources"]) - sum(1 for r in read if r[3])
             batch = []
             while spare and len(batch) < need:
@@ -283,7 +304,7 @@ class Research:
         if len(state.sources) < 2 or len(state.learnings) < 2:
             return
         self.progress(session, "cross-checking", f"{len(state.learnings)} claims")
-        items = state.learnings[:max_claims]
+        items = spread_by_topic(state.learnings, max_claims)
         listing = "\n".join(f"c{i} [{x.source_id}] {x.text}" for i, x in enumerate(items))
         data = loose_json(
             await self._ask(
@@ -325,9 +346,7 @@ class Research:
         cwd = Path(session.stored.cwd or ".")
         d = cwd / ".k3code" / "research"
         d.mkdir(parents=True, exist_ok=True)
-        gi = cwd / ".k3code" / ".gitignore"
-        if not gi.exists():
-            gi.write_text("*\n", encoding="utf-8")
+        ignore_generated(cwd / ".k3code")
         head = (
             f"# Research: {state.question}\n\n_{time.strftime('%Y-%m-%d %H:%M')} — tools: {tool_name}; "
             f"sub-topics: {', '.join(t.name for t in state.plan)}; {len(state.sources)} sources_\n\n"

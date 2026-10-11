@@ -8,6 +8,7 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
+from k3code.paths import ignore_generated
 from k3code.reliability.sandbox import child_env, harness_git_argv
 
 _GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true", "GIT_CONFIG_NOSYSTEM": "1"}
@@ -98,9 +99,7 @@ async def create(parent_cwd: str | Path, child_id: str) -> Worktree | None:
     async with worktree_lock(root):  # parallel adds on one repo race on .git/worktrees (see worktree_lock)
         k3 = root / ".k3code"
         k3.mkdir(exist_ok=True)
-        gi = k3 / ".gitignore"
-        if not gi.exists():
-            gi.write_text("*\n", encoding="utf-8")  # worktrees/plans/research never show up as untracked
+        ignore_generated(k3)  # worktrees/plans/research never show up as untracked
         rc, out = await git(root, "worktree", "add", str(path), "-b", branch, base)
     if rc != 0:
         raise RuntimeError(f"git worktree add failed: {out.strip()}")

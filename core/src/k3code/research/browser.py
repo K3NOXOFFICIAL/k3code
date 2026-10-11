@@ -117,14 +117,23 @@ def visible_words(html: str) -> int:
     return len(re.sub(r"<[^>]+>", " ", html).split())
 
 
+_SCRIPTS = re.compile(r"<(script|style)\b.*?</\1\s*>", re.S)
+
+
 def classify(status: int, body: str) -> Verdict:
-    """What an answer is: readable, blocked (the browser may get through), or a stop. Pure, no browser needed."""
+    """What an answer is: readable, blocked (the browser may get through), or a stop. Pure, no browser needed.
+
+    Phrases are looked for in the page's visible markup only: the i18n table of a script ("you must be logged in") made
+    ordinary pages a stop. A login phrase also needs a gate: a failing status or few visible words; on a long 200 page
+    (a forum thread or a manual quoting it) it is content. A paywall prompt stops after any amount of teaser."""
     low = body.lower()
     if _has(low, CAPTCHA_PATTERNS) and visible_words(body) < GATE_WORDS:
         return Verdict.CAPTCHA
-    if status == 402 or _has(low, PAYWALL_PATTERNS):
+    text = _SCRIPTS.sub(" ", low)
+    gate = not 200 <= status < 300 or visible_words(text) < GATE_WORDS
+    if status == 402 or _has(text, PAYWALL_PATTERNS):
         return Verdict.PAYWALL
-    if status == 401 or _has(low, LOGIN_PATTERNS):
+    if status == 401 or (gate and _has(text, LOGIN_PATTERNS)):
         return Verdict.LOGIN
     if status == 403 or _has(low, CHALLENGE_PATTERNS):
         return Verdict.BLOCKED

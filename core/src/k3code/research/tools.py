@@ -49,7 +49,9 @@ class Hit:
 
 # ── readability-lite ──
 
-_SKIP = {"script", "style", "noscript", "nav", "footer", "header", "aside", "form", "svg", "iframe"}
+#: ``form`` and ``header`` are not skipped: an ASP.NET page wraps its whole body in one <form>, and an article's
+#: <header> holds its title and byline.
+_SKIP = {"script", "style", "noscript", "nav", "footer", "aside", "svg", "iframe"}
 _BLOCK = {"p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "section", "article", "pre", "blockquote"}
 
 
@@ -143,17 +145,29 @@ async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | No
     got = await fetcher.get(url)
     verdict = classify(got.status, got.body)
     if verdict is Verdict.BLOCKED and browser is not None:
-        return await _read_rendered(browser, url, fetcher)
+        try:
+            return await _read_rendered(browser, url, fetcher)
+        except BrowserUnavailable as e:  # the error said only "install Playwright": say what was refused as well
+            raise BrowserUnavailable(f"HTTP {got.status} for {url} (a blocked page): {e}") from None
     if verdict in STOP_VERDICTS:
         raise Stopped(stop_report(verdict, url))
     if not 200 <= got.status < 300:
         raise FetchStatus(got.status, url)
+    if not _is_text(got.content_type):
+        raise ValueError(f"{url} is not a text page ({got.content_type.split(';')[0].strip()}): nothing to read")
     if "html" in got.content_type or got.body.lstrip().lower().startswith(("<!doctype", "<html")):
         title, text = extract_text(got.body)
     else:
         title, text = url, got.body
     note = "\n[page cut: the fetch deadline or the size cap was reached]" if got.truncated else ""
     return title or url, _cap_page(text, note)
+
+
+def _is_text(content_type: str) -> bool:
+    """A body worth decoding as text: no content type, ``text/*``, or a json/xml/javascript type. A PDF or an image
+    decoded as text came back as thousands of replacement characters."""
+    main = content_type.split(";")[0].strip().lower()
+    return not main or main.startswith("text/") or main.endswith(("json", "xml", "javascript", "x-www-form-urlencoded"))
 
 
 def _cap_page(text: str, note: str = "") -> str:
@@ -413,15 +427,41 @@ _NOT_WEB = ("memory", "session", "skill", "tool_search", "fleet", "mem0", "nc_",
 _HELPER_TOOLS = ("instance", "suggest", "autocomplete", "info", "health", "status", "config", "engines", "categories")
 
 
+#: Words that say a search/fetch tool reaches the web (a provider or the word itself), matched as whole name parts:
+#: ``github.search_issues``, ``Gmail.search_threads`` and ``Neon.search`` search something else: they must not win.
+_WEB_WORDS = frozenset(
+    {"web", "internet", "tavily", "brave", "exa", "serp", "serper", "ddg", "duckduckgo", "perplexity", "firecrawl"}
+    | {"kagi", "bing", "searx", "searxng", "jina", "crawl", "scrape", "browse", "url", "http", "https"}
+)
+
+
+def _words(name: str) -> list[str]:
+    return [w for w in re.split(r"[^a-z0-9]+", name.lower()) if w]
+
+
+def _is_webish(t: Any) -> bool:
+    """A tool that reaches the web: a web word in its qualified name, or a url argument."""
+    props = (getattr(t, "schema", None) or {}).get("properties") or {}
+    return bool(_WEB_WORDS.intersection(_words(t.qualified))) or any(k in props for k in ("url", "uri"))
+
+
+def _excluded(t: Any, exclude: tuple[str, ...]) -> bool:
+    """A word of ``exclude`` starting one of the name's words (``file`` -> ``files``, not ``profile``); entries with an
+    underscore (``tool_search``, ``nc_``) are matched as text."""
+    name, words = t.qualified.lower(), _words(t.qualified)
+    return any((x in name) if "_" in x else any(w.startswith(x) for w in words) for x in exclude)
+
+
 def rank_tool(tools: list[Any], strong: tuple[str, ...], generic: tuple[str, ...], exclude: tuple[str, ...]) -> Any:
     """Best MCP tool for a web job. A ``strong`` marker only counts on a tool whose name also carries a ``generic``
-    action word (``search``/``fetch``), and helper tools never win; then ``generic`` ones minus ``exclude``."""
+    action word (``search``/``fetch``), and helper tools never win; then ``generic`` ones minus ``exclude``, only when
+    they are web tools at all (``_is_webish``)."""
 
     def is_helper(t: Any) -> bool:
         return any(h in str(getattr(t, "name", "")).lower() for h in _HELPER_TOOLS)
 
     def is_excluded(t: Any) -> bool:
-        return any(x in t.qualified.lower() for x in exclude)
+        return _excluded(t, exclude)
 
     for t in tools:
         name = t.qualified.lower()
@@ -434,7 +474,7 @@ def rank_tool(tools: list[Any], strong: tuple[str, ...], generic: tuple[str, ...
             return t
     for t in tools:
         name = t.qualified.lower()
-        if any(m in name for m in generic) and not is_helper(t) and not is_excluded(t):
+        if any(m in name for m in generic) and not is_helper(t) and not is_excluded(t) and _is_webish(t):
             return t
     return None
 
@@ -558,9 +598,8 @@ def register_web_tools(
         if verdict is not Verdict.OK:
             return {"error": f"web_browse: still blocked (HTTP {page.status}) at {url}; not solved, not retried"}
         title, text = await asyncio.to_thread(extract_text, page.html)
-        if page.truncated:
-            text += "\n[page cut: the size cap was reached]"
-        return {"content": f"# {title or url}\n{page.url}\n\n{text[:MAX_FETCH_CHARS]}"}
+        note = "\n[page cut: the size cap was reached]" if page.truncated else ""
+        return {"content": f"# {title or url}\n{page.url}\n\n{_cap_page(text, note)}"}
 
     async def tool_search(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         query = str(arguments.get("query") or "").strip()

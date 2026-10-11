@@ -3949,6 +3949,13 @@ async def _system_battery(server: GatewayServer, params: dict[str, Any]) -> dict
     return {"available": False}
 
 
+async def _spawn_tree_save(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """The TUI offers each finished sub-agent tree for archiving after the turn. The core keeps the sub-agent runs in
+    ``subagent.list`` / the session transcript and nothing reads a second copy, so it is acknowledged, not stored (an
+    unknown-method error per finished turn was wasted traffic)."""
+    return {"ok": True, "persisted": False}
+
+
 def _session_dir(server: GatewayServer, params: dict[str, Any]) -> Path:
     """The directory completions resolve against: the session's cwd, else the process cwd."""
     try:
@@ -4291,6 +4298,7 @@ _HANDLERS: dict[str, Any] = {
     "config.set": _config_set,
     "setup.status": _setup_status,
     "system.battery": _system_battery,
+    "spawn_tree.save": _spawn_tree_save,
     "browser.manage": _browser_manage,
     "commands.catalog": _commands_catalog,
     "shell.exec": _shell_exec,

@@ -9,6 +9,8 @@ from k3code.commands._util import reply, split_args
 from k3code.commands.ultra_cmd import JobSpec, start_spec
 from k3code.research.flow import ResearchUnavailable
 
+MAX_SUB_QUESTIONS = 10
+
 
 class UltraResearchCommand(CommandDef):
     def __init__(self) -> None:
@@ -16,9 +18,11 @@ class UltraResearchCommand(CommandDef):
 
     async def prepare(self, ctx: Any, live: Any, arg: str, *, context: str = "") -> JobSpec | dict[str, Any]:
         n: int | None = None
+        capped = False
         parts = split_args(arg) if arg else []  # an apostrophe in the question must not fail the command
         if len(parts) >= 2 and parts[0] == "--n" and parts[1].isdigit():
-            n = int(parts[1])
+            n = min(int(parts[1]), MAX_SUB_QUESTIONS)  # every sub-topic is several model calls: `--n 20` made 83
+            capped = int(parts[1]) > MAX_SUB_QUESTIONS
             arg = arg.split(None, 2)[2] if len(parts) > 2 else ""
         if not arg.strip():
             return reply("Usage: /ultraresearch [--n N] <question>")
@@ -40,7 +44,8 @@ class UltraResearchCommand(CommandDef):
         return JobSpec(
             f"/ultraresearch {question}",
             job,
-            f"Researching with {tools.name}: decompose → search → read → cross-check → synthesize.",
+            f"Researching with {tools.name}: decompose → search → read → cross-check → synthesize."
+            + (f" (--n is capped at {MAX_SUB_QUESTIONS} sub-topics.)" if capped else ""),
         )
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:

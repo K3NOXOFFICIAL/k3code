@@ -60,6 +60,9 @@ class UsageDB:
         for col in ("cache_read", "cache_write"):  # prompt-cache tokens (part of tokens_in); older databases lack them
             if col not in cols:
                 self._db.execute(f"ALTER TABLE events ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
+        # after the migration (an old database has no turn column yet): turn_tokens runs once per turn and scanned the
+        # whole table, 79 ms at 500k rows
+        self._db.execute("CREATE INDEX IF NOT EXISTS events_turn ON events(turn)")
         self._db.commit()
 
     def record(

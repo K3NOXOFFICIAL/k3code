@@ -8,6 +8,8 @@ injectable so the rate and deadline tests run on a fake clock.
 from __future__ import annotations
 
 import asyncio
+import codecs
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -45,6 +47,21 @@ class FetchRefused(RuntimeError):
 
 class FetchDeadline(RuntimeError):
     """The whole-request deadline ran out before the response headers arrived."""
+
+
+_META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_.:-]+)""", re.I)
+
+
+def _meta_charset(head: bytes) -> str | None:
+    """The charset a page names in its own ``<meta>``, when the response headers do not name one (an ISO-8859-1 page
+    without a header charset was decoded as UTF-8 and every accent became a replacement character)."""
+    if not (m := _META_CHARSET.search(head)):
+        return None
+    name = m.group(1).decode("ascii", errors="ignore")
+    try:
+        return codecs.lookup(name).name
+    except LookupError:
+        return None
 
 
 class FetchStatus(RuntimeError):
@@ -270,5 +287,8 @@ class WebFetcher:
             if not status:
                 raise FetchDeadline(f"deadline reached waiting for {url}") from e
             truncated = True
-        body = bytes(buf[:max_bytes]).decode(encoding, errors="replace")
+        raw = bytes(buf[:max_bytes])
+        if "charset=" not in ctype.lower() and (sniffed := _meta_charset(raw[:4096])):
+            encoding = sniffed
+        body = raw.decode(encoding, errors="replace")
         return Fetched(url=url, status=status, content_type=ctype, body=body, truncated=truncated, location=location)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from k3code.paths import home
@@ -46,11 +47,16 @@ def available(cwd: str | Path) -> list[str]:
     return [*PRESETS, *sorted(n for n in custom_styles(cwd) if n not in PRESETS)]
 
 
+_FRONTMATTER = re.compile(r"\A\ufeff?---[ \t]*\n.*?\n---[ \t]*(?:\n|\Z)", re.S)
+
+
 def style_text(name: str, cwd: str | Path) -> str | None:
     """Style text for ``name`` ('' for default); None if unknown. Custom files may override presets."""
     custom = custom_styles(cwd)
     if name in custom:
-        return custom[name].read_text(encoding="utf-8").strip()
+        # a Claude Code style file starts with a frontmatter block (name, description): that is metadata, not prompt
+        text = custom[name].read_text(encoding="utf-8", errors="replace")
+        return _FRONTMATTER.sub("", text, count=1).strip()
     if name in PRESETS:
         return PRESETS[name]
     return None

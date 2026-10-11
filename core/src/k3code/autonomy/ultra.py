@@ -18,6 +18,7 @@ from k3code.autonomy.fanout import FanoutResult, detect_test_command, extract_su
 from k3code.autonomy.plan_first import PLAN_SECTIONS, parse_plan
 from k3code.autonomy.scope import ScopeVerdict
 from k3code.memory import fenced
+from k3code.paths import ignore_generated
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 from k3code.subagents import worktree as wt_mod
@@ -231,9 +232,7 @@ class Ultra:
         cwd = Path(session.stored.cwd or ".")
         d = cwd / ".k3code" / "plans"
         d.mkdir(parents=True, exist_ok=True)
-        gi = cwd / ".k3code" / ".gitignore"
-        if not gi.exists():
-            gi.write_text("*\n", encoding="utf-8")
+        ignore_generated(cwd / ".k3code")
         scores = ", ".join(f"{k}: {v:g}" for k, v in up.scores.items()) or "n/a"
         header = f"# Plan: {up.task}\n\n_ultraplan — angles: {', '.join(up.angles)}; judge scores: {scores}_\n\n"
         path = write_artifact_file(self.server, "plan", d, up.task, header + up.plan + "\n", session=session.session_id)

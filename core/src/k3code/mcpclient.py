@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import time
@@ -108,12 +109,16 @@ class _Runner:
         try:
             async with contextlib.AsyncExitStack() as stack:
                 if self.cfg.url:
-                    import httpx
-                    from mcp.client.streamable_http import streamable_http_client  # type: ignore[attr-defined]
+                    import httpx2  # the SDK's http library: a plain httpx client is rejected by its transport
+                    from mcp.client.streamable_http import streamable_http_client
 
-                    http = httpx.AsyncClient(headers=request_headers(self.cfg) or None, timeout=CALL_TIMEOUT)
+                    # read=300: a server may hold a response stream open (the SDK's own default); calls are bounded by
+                    # CALL_TIMEOUT in `call`
+                    http = httpx2.AsyncClient(
+                        headers=request_headers(self.cfg) or None, timeout=httpx2.Timeout(CONNECT_TIMEOUT, read=300.0)
+                    )
                     await stack.enter_async_context(http)
-                    read, write, _ = await stack.enter_async_context(
+                    read, write = await stack.enter_async_context(
                         streamable_http_client(self.cfg.url, http_client=http)
                     )
                 else:
@@ -131,13 +136,7 @@ class _Runner:
                     read, write = await stack.enter_async_context(stdio_client(params))
                 session = await stack.enter_async_context(ClientSession(read, write))
                 await asyncio.wait_for(session.initialize(), CONNECT_TIMEOUT)
-                listed = await asyncio.wait_for(session.list_tools(), CONNECT_TIMEOUT)
-                self.state.tools = [
-                    McpToolInfo(
-                        self.name, t.name, t.description or "", dict(_attr(t, "input_schema", "inputSchema") or {})
-                    )
-                    for t in listed.tools
-                ]
+                self.state.tools = await asyncio.wait_for(_list_all_tools(session, self.name), CONNECT_TIMEOUT)
                 self.state.status = "connected"
                 self.ready.set()
                 inflight: set[asyncio.Task[None]] = set()
@@ -199,6 +198,54 @@ class _Runner:
         self.task = None
 
 
+MAX_TOOL_PAGES = 50
+
+
+async def _list_all_tools(session: Any, server: str) -> list[McpToolInfo]:
+    """Every tool of the server: ``tools/list`` is paginated (a server with many tools answers a page and a cursor), and
+    two tools whose names sanitise to the same qualified name (``a.b`` / ``a_b``) cannot both be addressed: the first
+    wins."""
+    from mcp.types import PaginatedRequestParams
+
+    tools: list[McpToolInfo] = []
+    seen: set[str] = set()
+    cursor: str | None = None
+    for _ in range(MAX_TOOL_PAGES):
+        listed = await session.list_tools(params=PaginatedRequestParams(cursor=cursor) if cursor else None)
+        for t in listed.tools:
+            info = McpToolInfo(server, t.name, t.description or "", dict(_attr(t, "input_schema", "inputSchema") or {}))
+            if info.qualified in seen:
+                logger.warning("mcp server %s: tool %r collides with an earlier tool after renaming", server, t.name)
+                continue
+            seen.add(info.qualified)
+            tools.append(info)
+        cursor = _attr(listed, "next_cursor", "nextCursor")
+        if not cursor:
+            break
+    return tools
+
+
+def _content_text(res: Any) -> str:
+    """The text of a tool result: text blocks, the text of embedded resources, a placeholder for what cannot be shown
+    (image, audio, a resource link keeps its uri), and structured content when that is all the server sent."""
+    parts: list[str] = []
+    for c in res.content or []:
+        kind = getattr(c, "type", "content")
+        if getattr(c, "text", None):
+            parts.append(c.text)
+        elif kind == "resource" and getattr(getattr(c, "resource", None), "text", None):
+            parts.append(c.resource.text)
+        elif kind == "resource_link":
+            parts.append(f"[resource: {getattr(c, 'uri', '')}]")
+        else:
+            parts.append(f"[{kind}]")
+    text = "\n".join(parts)
+    structured = _attr(res, "structured_content", "structuredContent")
+    if structured and not any(getattr(c, "text", None) for c in res.content or []):
+        text = (text + "\n" if text else "") + json.dumps(structured, ensure_ascii=False, default=str)
+    return text
+
+
 def _fail(fut: asyncio.Future[Any], msg: str) -> None:
     if not fut.done():
         fut.set_exception(RuntimeError(msg))
@@ -257,12 +304,33 @@ class McpManager:
                 return
             self._stale = False
             self._started = True
-            for name, cfg in self.servers.items():
-                self._runners[name] = self._launch(name, cfg)
+            self._launch_all()
             await self._await_ready()
+
+    def _launch_all(self) -> None:
+        for name, cfg in self.servers.items():
+            self._runners[name] = self._launch(name, cfg)
+
+    def _taken_by(self, name: str) -> str | None:
+        """Another configured server whose tool prefix equals this one's after sanitising (``my.srv`` / ``my_srv`` both
+        give ``mcp__my_srv__``): its tools would be reached through the first server's name."""
+        mine = _SAFE.sub("_", name)
+        for other in self.servers:
+            if other == name:
+                return None
+            if _SAFE.sub("_", other) == mine and other in self._runners:
+                return other
+        return None
 
     def _launch(self, name: str, cfg: McpServerConfig) -> _Runner:
         runner = _Runner(name, cfg)
+        if clash := self._taken_by(name):
+            runner.state.status = "failed"
+            runner.state.error = (
+                f"name clashes with server {clash!r} (both give tools named mcp__{_SAFE.sub('_', name)}__*): rename one"
+            )
+            runner.ready.set()
+            return runner
         if not cfg.enabled:
             runner.state.status = "disabled"
             runner.ready.set()
@@ -324,8 +392,15 @@ class McpManager:
         if info is None:
             return {"error": f"Unknown MCP tool: {qualified}"}
         runner = self._runners[info.server]
-        if runner.state.status != "connected":
-            return {"error": f"MCP server {info.server} is {runner.state.status}: {runner.state.error}"}
+        if runner.state.status != "connected" or runner.dead.is_set():
+            # the server died after this turn started: revive it now (at most once per RESTART_BACKOFF_S) rather than
+            # fail every call until the next turn's ensure_started
+            await self.ensure_started()
+            info = self.find(qualified)
+            runner = self._runners.get(info.server) if info else None
+            if info is None or runner is None or runner.state.status != "connected":
+                status, why = (runner.state.status, runner.state.error) if runner else ("gone", "")
+                return {"error": f"MCP server {info.server if info else qualified} is {status}: {why}"}
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         runner.queue.put_nowait((info.name, args, fut))
         try:
@@ -334,7 +409,7 @@ class McpManager:
             return {"error": f"MCP call timed out: {info.server} did not answer"}
         except Exception as e:  # noqa: BLE001
             return {"error": f"MCP call failed: {_describe(e)}"}
-        text = "\n".join(getattr(c, "text", None) or f"[{getattr(c, 'type', 'content')}]" for c in res.content)
+        text = _content_text(res)
         return {"error": text or "MCP tool error"} if _attr(res, "is_error", "isError") else {"content": text}
 
     def search(self, query: str, limit: int = 8) -> list[McpToolInfo]:
