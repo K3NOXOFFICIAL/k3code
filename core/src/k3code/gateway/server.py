@@ -1865,6 +1865,7 @@ class GatewayServer:
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
+        self._register_advisor(loop, session)
         loop.hooks = userhooks.load(session.perms.cwd, session.session_id)  # re-read per loop: config edits apply
         loop.tool_error_stop_message = not escalates
         decision = decision_settings(self.config)
@@ -2244,6 +2245,49 @@ class GatewayServer:
             session.last_checkpoint = time.monotonic()
         except Exception:  # noqa: BLE001 - a failed checkpoint must not mask the turn's own outcome
             logger.exception("could not persist the session")
+
+    def session_advisor(self, session: LiveSession) -> str:
+        """The session's advisor: a model key, ``advisor.STRONG`` or "" when off (``/advisor``)."""
+        return advisor.session_advisor(session.stored.meta, autonomy_cfg(self.config).get("advisor", ""))
+
+    def _register_advisor(self, loop: AgentLoop, session: LiveSession) -> None:
+        """Claude Code's advisor mode: with a session advisor set, the main model gets an ``advisor`` tool that asks
+        that stronger model about the conversation so far. Registered per loop, so ``/advisor`` applies next turn."""
+        key = self.session_advisor(session)
+        if not key:
+            return
+
+        async def handler(args: dict[str, Any], **_: Any) -> dict[str, Any]:
+            question = str(args.get("question") or "").strip()
+            if not question:
+                return {"error": "advisor needs a question"}
+            messages = _serialize_messages(loop.turn_messages) if loop.turn_messages else session.stored.messages
+            try:
+                ctx = await advisor.condensed_context(
+                    self.model_caller,
+                    messages,
+                    threshold=int(autonomy_cfg(self.config)["advisor_compact_chars"]),
+                    session_id=session.session_id,
+                )
+                extra = str(args.get("context") or "").strip()
+                if extra:
+                    ctx = f"{ctx}\n\nExtra context from the agent:\n{extra}"
+                text = await advisor.advise(
+                    self.model_caller,
+                    ctx,
+                    question,
+                    session_id=session.session_id,
+                    system=advisor.TOOL_SYSTEM,
+                    router=None if key == advisor.STRONG else self._router_for(key),
+                    max_tokens=1500,
+                    timeout=180,
+                )
+            except Exception as exc:  # noqa: BLE001 - the main model carries on without advice
+                return {"error": f"advisor unavailable: {type(exc).__name__}: {exc}"}
+            label = "strong tier" if key == advisor.STRONG else key
+            return {"content": f"Advisor ({label}):\n{text}" if text else "The advisor returned no advice."}
+
+        loop.tools.register(advisor.TOOL_SPEC, handler)
 
     def _checkpoint_turn(self, session: LiveSession) -> None:
         """After a tool result: persist the in-flight turn (throttled) so kill -9, an OOM kill or a reboot loses
