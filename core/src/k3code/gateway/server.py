@@ -43,6 +43,7 @@ from k3code._version import __version__
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, autonomy_cfg
+from k3code.autonomy.agents import agent_limits, clean_override, session_limits
 from k3code.autonomy.fanout import FanoutExecutor
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.scope import SCOPES
@@ -422,6 +423,7 @@ class LiveSession:
             "state": self.state,
             "paused": self.paused,
             "background": self.background,
+            "agent_limits": clean_override(self.stored.meta.get("agent_limits")),
         }
 
     def _tools_info(self) -> dict[str, list[str]]:
@@ -1853,7 +1855,7 @@ class GatewayServer:
         if verdict.source == "fallback" or SCOPES.index(verdict.scope) < SCOPES.index(min_scope):
             return None  # trivial, or the classifier is down: not worth a pipeline; the gate reuses this verdict
         ultracode: Any = self.commands.get("ultracode")
-        spec = await ultracode.prepare(self, session, text, context=context)
+        spec = await ultracode.prepare(self, session, text, context=context, scope=verdict.scope)
         self.autonomy.drop_mode_verdict(session)
         return _Route("ultracode", "ultracode is on", f"scope {verdict.scope}", spec)
 
@@ -2083,6 +2085,7 @@ class GatewayServer:
         self._ensure_router(session.stored.model or None)
         assert self.router is not None
         session.turn_id = uuid.uuid4().hex[:12]
+        self.subagents.begin_turn(session.session_id)  # the per-turn count of the model's task calls starts again
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
@@ -3134,6 +3137,8 @@ class GatewayServer:
             stored.meta["reasoning_effort"] = src.reasoning_effort
         if src.ultra_mode != "off":
             stored.meta["ultra_mode"] = src.ultra_mode
+        if own := clean_override(src.stored.meta.get("agent_limits")):  # /maxagents is inherited too
+            stored.meta["agent_limits"] = own
         if background:
             stored.meta["background"] = True
             stored.meta["origin_session"] = src.session_id
@@ -4297,7 +4302,7 @@ HELP_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "Autonomy",
         ("goal", "loop", "schedule", "automations", "go", "scope", "proposals", "advisor", "preview", "review"),
     ),
-    ("Orchestration", ("ultraplan", "ultracode", "ultraresearch", "artifacts")),
+    ("Orchestration", ("ultraplan", "ultracode", "ultraresearch", "maxagents", "artifacts")),
     ("Knowledge", ("memory", "skills", "mcp", "learn", "optimizer", "self-improve")),
     ("System", ("help", "doctor", "update", "stats", "debug", "daemon")),
 )
@@ -4339,13 +4344,25 @@ async def _commands_catalog(server: GatewayServer, params: dict[str, Any]) -> di
 
 
 async def _delegation_status(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    from k3code.autonomy import autonomy_cfg
+    """The delegation caps in force; ``session_id`` (optional, the TUI sends none) adds that session's /maxagents."""
+    from k3code.reliability.governor import Governor
     from k3code.subagents.runner import MAX_DEPTH
 
+    live = server.live.get(str(params.get("session_id") or ""))
+    limits = session_limits(server.config, live) if live is not None else agent_limits(server.config)
+    queued = sum(1 for h in server.subagents.handles.values() if h.status == "queued")
+    running = sum(1 for h in server.subagents.handles.values() if h.status == "running")
     return {
         "paused": server.subagents.paused,
         "max_spawn_depth": MAX_DEPTH,
-        "max_concurrent_children": int(autonomy_cfg(server.config)["fanout"]["max_parallel"]),
+        # the width a fan-out really gets (its own ceiling, the session's parallel limit, the governor), not the raw key
+        "max_concurrent_children": Governor().agent_cap(limits.fanout_width, ceiling=limits.max_parallel),
+        "max_agents": limits.describe_max_agents() if limits.auto else limits.max_agents,
+        "dynamic": limits.dynamic,
+        "max_parallel": limits.max_parallel,
+        "max_nested": limits.max_nested,
+        "max_spawns": limits.max_spawns,
+        "live": {"children": running + queued, "queued": queued},
     }
 
 

@@ -196,9 +196,10 @@ class Governor:
         psi = self.read_psi("io")
         return psi.get("some_avg10", 0.0)
 
-    def agent_cap(self, requested: int, *, io_heavy: bool = False) -> int:
-        """How many sub-agents may run at once: the request, bounded by ``max_parallel_agents`` (and the IO cap)."""
-        cap = min(max(1, requested), self.config.max_parallel_agents)
+    def agent_cap(self, requested: int, *, io_heavy: bool = False, ceiling: int | None = None) -> int:
+        """How many sub-agents may run at once: the request, bounded by ``ceiling`` (the session's
+        ``autonomy.agents.max_parallel``; ``max_parallel_agents`` when none is given) and by the IO cap."""
+        cap = min(max(1, requested), max(1, ceiling) if ceiling else self.config.max_parallel_agents)
         return min(cap, self.config.max_io_heavy) if io_heavy else cap
 
     def io_admission_ok(self) -> bool:

@@ -8,6 +8,7 @@ from typing import Any
 from k3code import chain_config
 from k3code.commands import CommandDef, CommandRegistry, tune
 from k3code.commands._util import split_args
+from k3code.commands.agent_limits_cmd import MaxAgentsCommand
 from k3code.commands.autocompact_cmd import AutoCompactCommand
 from k3code.commands.autonomy import AdvisorCommand, GoCommand, PreviewCommand, ProposalsCommand, ScopeCommand
 from k3code.commands.daemon import DaemonCommand
@@ -347,6 +348,7 @@ def build_registry() -> CommandRegistry:
         _ClearCommand(),
         _CompactCommand(),
         AutoCompactCommand(),
+        MaxAgentsCommand(),
         _RenameCommand(),
         _ResumeCommand(),
         _AddDirCommand(),

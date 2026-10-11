@@ -422,6 +422,9 @@ SECURITY_KEYS: tuple[tuple[str, str], ...] = (
     ("artifacts.publish_dir", "published pages are written to this directory"),
     ("autonomy.unattended_network", "true gives unattended commands network access"),
     ("skills.roots", "extra folders whose skills are listed in the system prompt"),
+    ("ultracode.max_agents", "raises how many sub-agents one /ultracode run may start (and spend)"),
+    ("ultracode.max_tokens", "raises the token budget of one /ultracode run"),
+    ("autonomy.agents", "sets how many sub-agents run at once and how many the model may start"),
 )
 _MODE_HINTS = {
     "yolo": "every tool call, bash included, runs without asking",

@@ -47,6 +47,10 @@ class DepthLimit(Exception):
     pass
 
 
+class SpawnRefused(Exception):
+    """The model's ``task`` call was over one of the agent limits (see :meth:`SubagentManager.admit`)."""
+
+
 @dataclass
 class Handle:
     id: str
@@ -172,6 +176,8 @@ class SubagentManager:
         self.handles: dict[str, Handle] = {}
         #: the agents overlay's `p` / `/agents pause`: no new child starts while set; running ones finish
         self.paused = False
+        #: task calls the model made in the current user turn: (session id, parent child id) -> count
+        self._spawned: dict[tuple[str, str | None], int] = {}
         self._types: dict[str, AgentType] | None = None
         self._types_key: str = ""
 
@@ -192,6 +198,64 @@ class SubagentManager:
         return types[name]
 
     # ── queries ──
+
+    # ── admission: the limits on the model's own task calls ──
+
+    def live(self, sid: str, parent_child_id: str | None = None) -> int:
+        """Children of ``sid`` (or grandchildren of one child) that are queued or running, whoever started them."""
+        return sum(
+            1
+            for h in self.handles.values()
+            if h.parent_sid == sid and h.parent_child_id == parent_child_id and h.status in ("queued", "running")
+        )
+
+    def begin_turn(self, sid: str) -> None:
+        """A new user turn: the per-turn spawn count of this session starts again."""
+        for key in [k for k in self._spawned if k[0] == sid]:
+            del self._spawned[key]
+
+    def admit(self, parent: Any, parent_child_id: str | None, limits: Any) -> None:
+        """Refuse (never queue) a ``task`` call of the model that would go past ``limits`` (an AgentLimits):
+        children of the session at once, grandchildren of one child, live sub-agents in the whole process, task
+        calls in one user turn. Orchestrators (fan-out, /ultracode) start their children directly and size
+        themselves; a queue here could deadlock a worker that holds a slot while it waits for its own child."""
+        from k3code.autonomy.agents import DAEMON_LIVE_CEILING
+
+        sid = parent.session_id
+        if parent_child_id is None:
+            live = self.live(sid)
+            if live >= limits.max_parallel:
+                raise SpawnRefused(
+                    f"sub-agent limit: {live} of {limits.max_parallel} children are running "
+                    "(autonomy.agents.max_parallel). Collect one with task_result(id, wait=true) "
+                    "or do this part yourself."
+                )
+        else:
+            if limits.max_nested <= 0:
+                raise SpawnRefused(
+                    "sub-agents of sub-agents are switched off (autonomy.agents.max_nested is 0): do the part yourself."
+                )
+            live = self.live(sid, parent_child_id)
+            if live >= limits.max_nested:
+                raise SpawnRefused(
+                    f"sub-agent limit: this agent already has {live} of {limits.max_nested} sub-agents running "
+                    "(autonomy.agents.max_nested). Collect one with task_result(id, wait=true) first."
+                )
+        total = sum(1 for h in self.handles.values() if h.status in ("queued", "running"))
+        if total >= DAEMON_LIVE_CEILING:
+            raise SpawnRefused(
+                f"sub-agent limit: {total} sub-agents are running across all sessions (the limit is "
+                f"{DAEMON_LIVE_CEILING}). Wait for one to finish."
+            )
+        if limits.max_spawns and self._spawned.get((sid, parent_child_id), 0) >= limits.max_spawns:
+            raise SpawnRefused(
+                f"sub-agent limit: {limits.max_spawns} task calls already made in this turn "
+                "(autonomy.agents.max_spawns). Work with the results you have."
+            )
+
+    def note_spawn(self, sid: str, parent_child_id: str | None) -> None:
+        key = (sid, parent_child_id)
+        self._spawned[key] = self._spawned.get(key, 0) + 1
 
     def for_session(self, sid: str) -> list[Handle]:
         return [h for h in self.handles.values() if h.parent_sid == sid]

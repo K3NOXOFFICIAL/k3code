@@ -195,7 +195,10 @@ export const opsCommands: SlashCommand[] = [
       if (sub === "status") {
         const d = getDelegationState();
         ctx.transcript.sys(
-          `delegation · ${d.paused ? "paused" : "active"} · caps d${d.maxSpawnDepth ?? "?"}/${d.maxConcurrentChildren ?? "?"}`,
+          `delegation · ${d.paused ? "paused" : "active"} · caps d${d.maxSpawnDepth ?? "?"}/${d.maxConcurrentChildren ?? "?"}` +
+            (d.maxAgents !== null ? ` · max agents ${d.maxAgents}` : "") +
+            (d.dynamic === null ? "" : d.dynamic ? " · dynamic" : " · fixed") +
+            " · /maxagents to change",
         );
 
         return;

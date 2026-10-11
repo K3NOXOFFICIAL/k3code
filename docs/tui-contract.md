@@ -66,7 +66,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 |--------|--------|--------|-------|
 | `session.compress` | `{session_id, target_tokens?}` | `{compressed: boolean}` | Context compaction |
 | `session.close` | `{session_id, disposable_only?}` | `{closed: boolean, reason?}` | Close without delete. `disposable_only` (default false; send it after attaching elsewhere) closes only an empty, idle session with no active loop or automation bound to it (its stored row stays); a session with messages, work or a bound automation is left alone with `{closed: false, reason}`, not an error |
-| `delegation.status` | `{}` | `{active[], paused, max_depth, max_concurrent}` | Sub-agent panel |
+| `delegation.status` | `{session_id?}` | `{paused, max_spawn_depth, max_concurrent_children, max_agents, dynamic, max_parallel, max_nested, max_spawns, live: {children, queued}}` | Sub-agent panel. `max_concurrent_children` is the width a fan-out really gets (its own ceiling, held to `max_parallel`, the governor's cap), not the raw config key; `max_agents` is a number or `"auto"`. `session_id` is optional (the TUI sends none) and adds that session's `/maxagents` |
 | `delegation.pause` | `{paused}` | `{paused: boolean}` | Pause delegation |
 | `subagent.list` | `{session_id}` | `{subagents: ActiveSubagent[]}` | Sub-agent panel |
 | `subagent.steer` | `{session_id, subagent_id, text}` | `{steered: boolean}` | Steer sub-agent |

@@ -292,6 +292,22 @@ class Settings(BaseModel):
             if level not in SCOPES:
                 raise ValueError(f"ultracode.min_scope must be one of {', '.join(SCOPES)} (got {v['min_scope']!r})")
             v = {**v, "min_scope": level}
+        from k3code.autonomy.agents import check_settings
+
+        check_settings(v, {})
+        return v
+
+    @field_validator("autonomy")
+    @classmethod
+    def _validate_autonomy(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """``autonomy.agents`` is checked when the config loads: a bad count used to fail inside a run."""
+        agents = v.get("agents")
+        if agents is not None:
+            if not isinstance(agents, dict):
+                raise ValueError(f"autonomy.agents must be a mapping of settings (got {agents!r})")
+            from k3code.autonomy.agents import check_settings
+
+            check_settings({}, agents)
         return v
 
     @field_validator("context")
@@ -472,6 +488,7 @@ def load_config(
     except ValidationError as e:
         raise ConfigError(_describe_invalid(e, user_config_path, project_dir)) from e
     _warn_unknown_escalate_keys(merged)
+    _warn_unknown_agents_keys(merged)
     _warn_unknown_mode_keys(merged)
     return settings
 
@@ -498,6 +515,27 @@ def _warn_unknown_escalate_keys(merged: dict[str, Any]) -> None:
     for key in sorted(set(section) - ESCALATE_KEYS if isinstance(section, dict) else (), key=str):
         logger.warning(
             "autonomy.escalate.%s is not used and is ignored (known keys: %s)", key, ", ".join(sorted(ESCALATE_KEYS))
+        )
+
+
+def _warn_unknown_agents_keys(merged: dict[str, Any]) -> None:
+    """A key under ``autonomy.agents`` that nothing reads, or an ``autonomy.fanout.max_parallel`` no run can use."""
+    from k3code.autonomy import AGENTS_KEYS
+    from k3code.autonomy.agents import HARD_MAX_PARALLEL, whole_number
+
+    auto = merged.get("autonomy")
+    section = auto.get("agents") if isinstance(auto, dict) else None
+    for key in sorted(set(section) - AGENTS_KEYS if isinstance(section, dict) else (), key=str):
+        logger.warning(
+            "autonomy.agents.%s is not used and is ignored (known keys: %s)", key, ", ".join(sorted(AGENTS_KEYS))
+        )
+    fanout = auto.get("fanout") if isinstance(auto, dict) else None
+    width = fanout.get("max_parallel") if isinstance(fanout, dict) else None
+    if width is not None and whole_number(width, lo=1, hi=HARD_MAX_PARALLEL) is None:
+        logger.warning(
+            "autonomy.fanout.max_parallel %r is not a whole number from 1 to %d; the fan-out uses the nearest value",
+            width,
+            HARD_MAX_PARALLEL,
         )
 
 

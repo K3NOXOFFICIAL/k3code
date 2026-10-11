@@ -1187,7 +1187,9 @@ export function AgentsOverlay({
     .join(" · ");
 
   const capsLabel = delegation.maxSpawnDepth
-    ? `caps d${delegation.maxSpawnDepth}/${delegation.maxConcurrentChildren ?? "?"}`
+    ? `caps d${delegation.maxSpawnDepth}/${delegation.maxConcurrentChildren ?? "?"}` +
+      (delegation.maxAgents !== null ? ` · max ${delegation.maxAgents}` : "") +
+      (delegation.dynamic ? " dyn" : "")
     : "";
 
   const title =

@@ -40,7 +40,7 @@ class Pipeline:
         self.orphan = False  # leave a never-ending sub-agent behind, as a pipeline that was cut off would
         self.server = server
 
-        async def ultracode(session: Any, task: str, *, context: str = "") -> str:
+        async def ultracode(session: Any, task: str, *, context: str = "", scope: str | None = None) -> str:
             self.contexts.append(context)
             return await self.run("ultracode", session, task)
 

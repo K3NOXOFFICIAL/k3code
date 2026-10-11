@@ -6,7 +6,14 @@ from k3code.subagents.runner import Handle
 
 
 class BudgetStop(Exception):
-    """The orchestration ran out of agents or tokens; remaining work is not started."""
+    """The orchestration ran out of agents or tokens; remaining work is not started.
+
+    ``kind`` is ``agents`` or ``tokens``: a run that is out of agents can still spend its reserved tail (the review
+    panel and the final tests), a run out of tokens cannot."""
+
+    def __init__(self, message: str = "", kind: str = "agents") -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 class AgentBudget:
@@ -15,12 +22,33 @@ class AgentBudget:
         self.max_tokens = max_tokens
         self.agents = 0
         self.tokens = 0
+        #: agents held back for the end of the run (the review lenses and the fixer): everyone else sees the budget
+        #: without them, so a wide fan-out cannot starve the review that follows it
+        self.reserved = 0
 
-    def take_agent(self) -> None:
+    def reserve(self, n: int) -> None:
+        """Hold ``n`` agents back from every :meth:`take_agent` that is not ``reserved=True``."""
+        self.reserved = max(0, int(n))
+
+    def trim(self, n: int) -> None:
+        """Lower ``max_agents`` to ``n`` (never raise it): an ``auto`` run drops what its sized plan will not use."""
+        if self.max_agents is not None:
+            self.max_agents = max(self.agents, min(self.max_agents, int(n)))
+
+    def left(self, *, reserved: bool = False) -> int | None:
+        """Agents that may still be taken (None = no limit); ``reserved=True`` counts the held-back ones too."""
+        if self.max_agents is None:
+            return None
+        return max(0, self.max_agents - self.agents - (0 if reserved else self.reserved))
+
+    def take_agent(self, *, reserved: bool = False) -> None:
         """Reserve one child before spawning it."""
         self.check()
-        if self.max_agents is not None and self.agents >= self.max_agents:
-            raise BudgetStop(f"agent budget exhausted ({self.agents}/{self.max_agents} agents)")
+        if self.max_agents is not None:
+            ceiling = self.max_agents - (0 if reserved else self.reserved)
+            if self.agents >= ceiling:
+                held = f", {self.reserved} held back for the review" if self.reserved and not reserved else ""
+                raise BudgetStop(f"agent budget exhausted ({self.agents}/{self.max_agents} agents{held})", "agents")
         self.agents += 1
 
     def charge(self, h: Handle) -> None:
@@ -28,7 +56,7 @@ class AgentBudget:
 
     def check(self) -> None:
         if self.max_tokens is not None and self.tokens >= self.max_tokens:
-            raise BudgetStop(f"token budget exhausted ({self.tokens}/{self.max_tokens} tokens)")
+            raise BudgetStop(f"token budget exhausted ({self.tokens}/{self.max_tokens} tokens)", "tokens")
 
     def summary(self) -> str:
         agents = f"{self.agents}/{self.max_agents}" if self.max_agents is not None else str(self.agents)

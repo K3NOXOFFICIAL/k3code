@@ -128,3 +128,46 @@ async def test_unchanged_read_pointer_names_the_step_of_the_original_read(tmp_pa
     results = {m.tool_call_id: m.content for m in await run(loop)}
     assert results["a2"].startswith("[unchanged since the read at step 1 (call a)")
     assert results["b2"].startswith("[unchanged since the read at step 2 (call b)")
+
+
+def register_task_like(loop: AgentLoop, log: list[str], delay: float) -> None:
+    """A side-effecting tool whose handler says which calls are read-only (what ``task`` does for an explorer)."""
+
+    async def handler(args, cwd=None):
+        log.append(f"start {args['who']}")
+        await asyncio.sleep(delay)
+        log.append(f"end {args['who']}")
+        return {"content": args["who"]}
+
+    handler.parallel_when = lambda args: args.get("kind") == "reader"  # type: ignore[attr-defined]
+    loop.tools.register(ToolSpec(name="job", description="job", parameters=PARAMS, side_effect=True), handler)
+
+
+def job(call_id: str, who: str, kind: str) -> ToolCall:
+    return ToolCall(id=call_id, name="job", arguments={"who": who, "kind": kind})
+
+
+@pytest.mark.asyncio
+async def test_calls_a_side_effect_tool_marks_read_only_overlap_and_the_others_do_not(tmp_path):
+    log: list[str] = []
+    loop = make_loop(
+        tmp_path,
+        [[job("c0", "r1", "reader"), job("c1", "r2", "reader"), job("c2", "w", "writer"), job("c3", "r3", "reader")]],
+    )
+    register_task_like(loop, log, 0.1)
+    results = await run(loop)
+    assert [m.tool_call_id for m in results] == ["c0", "c1", "c2", "c3"]
+    assert log.index("start r2") < log.index("end r1")  # the two readers overlapped
+    assert log.index("start w") > log.index("end r2")  # the writer waited for them ...
+    assert log.index("start r3") > log.index("end w")  # ... and the next reader waited for the writer
+
+
+@pytest.mark.asyncio
+async def test_three_explorer_calls_in_one_reply_take_the_time_of_one(tmp_path):
+    log: list[str] = []
+    loop = make_loop(tmp_path, [[job(f"c{i}", f"e{i}", "reader") for i in range(3)]])
+    register_task_like(loop, log, 0.4)
+    began = time.monotonic()
+    await run(loop)
+    assert time.monotonic() - began < 0.9  # in a row: 1.2 s
+    assert log[:3] == ["start e0", "start e1", "start e2"]

@@ -28,7 +28,8 @@ PLAN_ADDENDUM = (
     "\n\nYou are in PLANNING mode: read-only. Explore the repo as needed, then call exit_plan ONCE with a "
     "plan in markdown with exactly these sections: "
     + ", ".join(f"## {s}" for s in PLAN_SECTIONS)
-    + ". Estimate = rough size/time. Do not implement anything."
+    + ". Estimate = rough size/time. In Steps, mark each step that does not depend on another with (parallel). "
+    "Do not implement anything."
 )
 
 

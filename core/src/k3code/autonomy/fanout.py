@@ -20,7 +20,9 @@ from pathlib import Path
 from typing import Any
 
 from k3code.autonomy import autonomy_cfg
+from k3code.autonomy.agents import session_limits
 from k3code.autonomy.plan_first import parse_plan
+from k3code.autonomy.sizing import group_steps, size_agents, top_level_steps, unit_text
 from k3code.reliability.governor import Governor
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.budget import AgentBudget, BudgetStop
@@ -123,6 +125,7 @@ class FanoutResult:
     tests: str = "none"  # pass | fail | none
     test_command: str = ""
     stopped: str = ""  # budget message
+    stopped_kind: str = ""  # "agents" | "tokens" (see BudgetStop.kind)
     tests_passed: int = 0  # merged subtasks whose merged result passed the tests
     tests_failed: int = 0  # merge attempts rejected because the tests failed
 
@@ -169,7 +172,26 @@ class FanoutExecutor:
             return []
         if session.background or not v.parallelizable:
             return []
+        if session_limits(self.server.config, session).dynamic:
+            sized = self.size_from_plan(session, gate.plan, v.scope)
+            if sized:
+                return sized
         return extract_subtasks(v, gate.plan)
+
+    def size_from_plan(self, session: Any, plan: str, scope: str | None) -> list[str]:
+        """The subtasks for a plan, sized to the task: the plan's own top-level steps (the strong planner's plan is
+        better evidence than the cheap classifier's suggestions), grouped into independent units and packed to as many
+        workers as the scope can keep busy. [] when the plan has fewer than two independent units."""
+        units = [unit_text(u) for u in group_steps(top_level_steps(plan))]
+        if len(units) < 2:
+            return []
+        limits = session_limits(self.server.config, session)
+        io_heavy = any(IO_HEAVY_RE.search(u) for u in units)
+        rel = session.reliability
+        gov = rel.governor if rel is not None and rel.governor is not None else Governor()
+        cap = gov.agent_cap(limits.fanout_width, io_heavy=io_heavy, ceiling=limits.max_parallel)
+        sized = size_agents(units, whole="", left=None, hold=0, width_cap=cap, scope=scope)
+        return sized.subtasks if sized.workers >= 2 else []
 
     # ── the run ──
 
@@ -182,8 +204,12 @@ class FanoutExecutor:
         *,
         budget: AgentBudget | None = None,
         require_tests: bool | None = None,
+        width: int | None = None,
     ) -> FanoutResult | None:
         cwd = Path(session.perms.cwd)
+        limits = session_limits(self.server.config, session)
+        if budget is None and limits.dynamic:  # plan-first had no spend bound: worker, reviewer, rework, re-review each
+            budget = AgentBudget(max_agents=4 * len(subtasks))
         if await wt_mod.repo_root(cwd) is None or not await wt_mod.head_sha(cwd):
             session.emit(
                 "notification.show",
@@ -197,7 +223,9 @@ class FanoutExecutor:
         need_tests = cfg["require_tests"] if require_tests is None else require_tests
         io_heavy = any(IO_HEAVY_RE.search(s) for s in subtasks)
         gov = session.reliability.governor if session.reliability and session.reliability.governor else Governor()
-        cap = gov.agent_cap(int(cfg["max_parallel"]), io_heavy=io_heavy)
+        cap = gov.agent_cap(limits.fanout_width, io_heavy=io_heavy, ceiling=limits.max_parallel)
+        if width is not None:  # a sized run (see k3code.autonomy.sizing) asks for no more than it needs
+            cap = max(1, min(cap, width))
         fid = f"fo-{uuid.uuid4().hex[:6]}"
         result = FanoutResult(
             fid, [Subtask(f"t{i + 1}", t) for i, t in enumerate(subtasks)], test_command=test_cmd if need_tests else ""
@@ -345,6 +373,7 @@ class FanoutExecutor:
             await self._merge(ctx, st)
         except BudgetStop as e:
             ctx.result.stopped = ctx.result.stopped or str(e)
+            ctx.result.stopped_kind = ctx.result.stopped_kind or e.kind
             self.progress(ctx, st, "skipped", str(e))
         except Exception as e:  # noqa: BLE001 - one subtask must not take the others down
             logger.exception("fan-out subtask %s crashed", st.id)
@@ -424,7 +453,8 @@ class FanoutExecutor:
                     f"{', '.join(files) or '(see git status)'}. Resolve the conflict markers, keep both "
                     "sides' intent, and save the files."
                 )
-            h = await self._rework(ctx, st, problem)
+            async with ctx.sem:  # the rework is a child like the others: it counts against the width
+                h = await self._rework(ctx, st, problem)
             if h.status != "completed":
                 self.progress(ctx, st, "escalated", f"{error}\n(retry {h.status}: {h.error})")
                 return

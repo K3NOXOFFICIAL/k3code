@@ -3,6 +3,10 @@ import { atom } from "nanostores";
 import type { DelegationStatusResponse } from "../gatewayTypes.js";
 
 export interface DelegationState {
+  // True when agent counts are sized from the task (`autonomy.agents.dynamic`).  null until fetched.
+  dynamic: boolean | null;
+  // Most sub-agents one /ultracode run may start: a number or "auto" (`ultracode.max_agents`, /maxagents).
+  maxAgents: null | number | string;
   // Last known caps from `delegation.status` RPC.  null until fetched.
   maxConcurrentChildren: null | number;
   maxSpawnDepth: null | number;
@@ -13,6 +17,8 @@ export interface DelegationState {
 }
 
 const buildState = (): DelegationState => ({
+  dynamic: null,
+  maxAgents: null,
   maxConcurrentChildren: null,
   maxSpawnDepth: null,
   paused: false,
@@ -72,6 +78,14 @@ export const applyDelegationStatus = (
 
   if (typeof r.max_concurrent_children === "number") {
     patch.maxConcurrentChildren = r.max_concurrent_children;
+  }
+
+  if (typeof r.max_agents === "number" || typeof r.max_agents === "string") {
+    patch.maxAgents = r.max_agents;
+  }
+
+  if (typeof r.dynamic === "boolean") {
+    patch.dynamic = r.dynamic;
   }
 
   if (typeof r.paused === "boolean") {

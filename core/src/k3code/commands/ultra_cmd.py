@@ -16,6 +16,7 @@ from typing import Any
 
 from k3code.commands import CommandDef
 from k3code.commands._util import reply
+from k3code.commands.agent_limits_cmd import alias_args
 
 
 def _live(ctx: Any, session_id: str | None) -> Any:
@@ -118,15 +119,19 @@ class UltraCodeCommand(CommandDef):
         super().__init__(
             name="ultracode",
             help="Plan, fan out, adversarial review, fix, test: /ultracode <task> "
-            "(budget: ultracode.max_tokens / max_agents). Bare /ultracode, on, off, status: the always-on mode",
+            "(budget: ultracode.max_tokens / max_agents). Bare /ultracode, on, off, status: the always-on mode. "
+            "/ultracode agents <N|auto>, dynamic <on|off>: see /maxagents",
         )
 
-    async def prepare(self, ctx: Any, live: Any, arg: str, *, context: str = "") -> JobSpec | dict[str, Any]:
+    async def prepare(
+        self, ctx: Any, live: Any, arg: str, *, context: str = "", scope: str | None = None
+    ) -> JobSpec | dict[str, Any]:
+        """``scope``: the classifier's rating of the task, known only on the always-on mode path; it sizes the run."""
         if not arg:
             return reply("Usage: /ultracode <task>")
         return JobSpec(
             f"/ultracode {arg}",
-            lambda: ctx.ultra.ultracode(live, arg, context=context),
+            lambda: ctx.ultra.ultracode(live, arg, context=context, scope=scope),
             "ultracode started: plan → fan-out → review panel → fixes → tests. See the agent strip.",
         )
 
@@ -155,6 +160,10 @@ class UltraCodeCommand(CommandDef):
         if live is None:
             return reply("No active session.")
         word = arg.strip().lower()
+        if (
+            limits := alias_args(arg)
+        ) is not None:  # /ultracode agents 20, /ultracode dynamic off: the /maxagents switch
+            return await ctx.commands.get("maxagents").handle(ctx, session_id, limits)
         if not word:  # bare: flip the mode
             current = getattr(live, "ultra_mode", "off")
             return self._set_mode(ctx, live, "off" if current == "ultracode" else "ultracode")

@@ -50,11 +50,18 @@ DEFAULTS: dict[str, Any] = {
         "test_command": "",
         "test_timeout": 600,
     },
+    #: how many sub-agents run at once and how a run picks its agent count (see k3code.autonomy.agents):
+    #: ``dynamic`` sizes the agents from the task (never above ``ultracode.max_agents``); ``max_parallel`` children
+    #: of a session at once (the model's task calls and the fan-out width, 1-8); ``max_nested`` live grandchildren
+    #: per child (0 = a child starts none); ``max_spawns`` task calls the model may make per user turn (0 = no limit)
+    "agents": {"dynamic": True, "max_parallel": 4, "max_nested": 3, "max_spawns": 16},
 }
 
 
 #: The keys ``autonomy.escalate`` reads; config load warns about any other key (it would be silently ignored).
 ESCALATE_KEYS = frozenset(DEFAULTS["escalate"])
+#: The same for ``autonomy.agents``.
+AGENTS_KEYS = frozenset(DEFAULTS["agents"])
 
 
 #: The keys of the ``ultracode`` config section; config load warns about any other key (it would be ignored).
@@ -70,4 +77,5 @@ def autonomy_cfg(config: Any) -> dict[str, Any]:
     out = {**DEFAULTS, **user}
     out["escalate"] = {**DEFAULTS["escalate"], **dict(user.get("escalate") or {})}
     out["fanout"] = {**DEFAULTS["fanout"], **dict(user.get("fanout") or {})}
+    out["agents"] = {**DEFAULTS["agents"], **dict(user.get("agents") or {})}
     return out

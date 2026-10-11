@@ -14,12 +14,22 @@ from typing import Any
 
 from k3code.artifacts import write_artifact_file
 from k3code.autonomy import DEFAULT_MIN_SCOPE
-from k3code.autonomy.fanout import FanoutResult, detect_test_command, extract_subtasks, run_tests
+from k3code.autonomy.agents import DEFAULT_MAX_AGENTS, AgentLimits, session_limits
+from k3code.autonomy.fanout import IO_HEAVY_RE, FanoutResult, detect_test_command, extract_subtasks, run_tests
 from k3code.autonomy.plan_first import PLAN_SECTIONS, parse_plan
 from k3code.autonomy.scope import ScopeVerdict
+from k3code.autonomy.sizing import (
+    REVIEW_HOLD,
+    group_steps,
+    pick_planners,
+    size_agents,
+    top_level_steps,
+    unit_text,
+)
 from k3code.memory import fenced
 from k3code.paths import ignore_generated
 from k3code.providers.types import Message
+from k3code.reliability.governor import Governor
 from k3code.routing.tiers import TaskKind
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.budget import AgentBudget, BudgetStop
@@ -56,7 +66,6 @@ LENSES = {
 }
 
 DEFAULT_MAX_TOKENS = 2_000_000
-DEFAULT_MAX_AGENTS = 12
 
 JUDGE_SYSTEM = (
     "You are the plan judge. You get several independent plans for one task. Score each from 1 to 10 "
@@ -176,28 +185,32 @@ class Ultra:
         command: str = "ultraplan",
         angles: list[str] | None = None,
         context: str = "",
+        width: int | None = None,
     ) -> UltraPlan:
         angles = list(angles or ANGLES)
         brief = with_hook_context(task, context)
         mgr = self.server.subagents
-        self.progress(session, command, "planning", f"{len(angles)} independent planners", budget)
+        noun = "planner" if len(angles) == 1 else "independent planners"
+        self.progress(session, command, "planning", f"{len(angles)} {noun}", budget)
+        gate = asyncio.Semaphore(max(1, width or len(angles)))  # planners running at once: the session's width
 
         async def one(i: int, angle: str) -> tuple[str, Handle | None]:
-            if budget is not None:
-                budget.take_agent()
-            h = mgr.spawn(
-                session,
-                description=f"plan: {angle}",
-                prompt=planner_prompt(brief, angle),
-                agent_type="planner",
-                tier="strong",
-                index=i,
-                count=len(angles),
-            )
-            await mgr.wait(h)
-            if budget is not None:
-                budget.charge(h)
-            return angle, h
+            async with gate:
+                if budget is not None:
+                    budget.take_agent()
+                h = mgr.spawn(
+                    session,
+                    description=f"plan: {angle}",
+                    prompt=planner_prompt(brief, angle),
+                    agent_type="planner",
+                    tier="strong",
+                    index=i,
+                    count=len(angles),
+                )
+                await mgr.wait(h)
+                if budget is not None:
+                    budget.charge(h)
+                return angle, h
 
         try:
             done = await gather_or_cancel(*(one(i, a) for i, a in enumerate(angles)))
@@ -209,21 +222,28 @@ class Ultra:
             raise RuntimeError(
                 "no planner produced a plan: " + "; ".join(f"{a}: {h.error or h.status}" for a, h in done if h)
             )
-        self.progress(session, command, "judging", f"{len(plans)} plans", budget)
-        body = "\n\n".join(f"=== Plan ({a}) ===\n{p}" for a, p in plans)
-        result = await self.server.model_caller.complete(
-            TaskKind.PLAN,
-            [Message(role="system", content=JUDGE_SYSTEM), Message(role="user", content=f"Task:\n{brief}\n\n{body}")],
-            session_id=session.session_id,
-            max_tokens=4096,
-        )
-        if budget is not None:
-            budget.tokens += result.prompt_tokens + result.completion_tokens
-        scores, final = parse_judge(result.text)
+        scores: dict[str, float] = {}
         note = ""
-        if not parse_plan(final):  # the judge did not produce a structured plan: fall back to the best-scored one
-            best = max(plans, key=lambda ap: scores.get(ap[0], 0.0))
-            final, note = best[1], f"judge reply had no plan sections; used the {best[0]} plan"
+        if len(angles) == 1:  # one planner was asked for (a small task): there is nothing to judge
+            final = plans[0][1]
+        else:
+            self.progress(session, command, "judging", f"{len(plans)} plans", budget)
+            body = "\n\n".join(f"=== Plan ({a}) ===\n{p}" for a, p in plans)
+            result = await self.server.model_caller.complete(
+                TaskKind.PLAN,
+                [
+                    Message(role="system", content=JUDGE_SYSTEM),
+                    Message(role="user", content=f"Task:\n{brief}\n\n{body}"),
+                ],
+                session_id=session.session_id,
+                max_tokens=4096,
+            )
+            if budget is not None:
+                budget.tokens += result.prompt_tokens + result.completion_tokens
+            scores, final = parse_judge(result.text)
+            if not parse_plan(final):  # the judge did not produce a structured plan: fall back to the best-scored one
+                best = max(plans, key=lambda ap: scores.get(ap[0], 0.0))
+                final, note = best[1], f"judge reply had no plan sections; used the {best[0]} plan"
         up = UltraPlan(task=task, plan=final, scores=scores, angles=[a for a, _ in plans], judge_note=note)
         up.path, up.artifact_id = self.save_plan(session, up)
         return up
@@ -263,24 +283,45 @@ class Ultra:
 
     # ── /ultracode ──
 
-    async def ultracode(self, session: Any, task: str, *, context: str = "") -> str:
+    async def ultracode(self, session: Any, task: str, *, context: str = "", scope: str | None = None) -> str:
+        """Plan, fan out, review, fix, test. ``scope`` is the classifier's rating of the task when there is one (the
+        always-on mode path); with dynamic sizing it picks the planner count, and bounds the workers."""
         cfg = ultra_cfg(self.server.config)
+        limits = session_limits(self.server.config, session)
         brief = with_hook_context(task, context)  # the agents' prompts; the report and its title keep ``task``
-        budget = AgentBudget(int(cfg["max_agents"]), int(cfg["max_tokens"]))
+        budget = AgentBudget(limits.budget_agents, int(cfg["max_tokens"]))
         report = _Report(task)
         cwd = Path(session.perms.cwd)
         try:
-            up = await self.ultraplan(session, task, budget=budget, command="ultracode", context=context)
+            up = await self.ultraplan(
+                session,
+                task,
+                budget=budget,
+                command="ultracode",
+                context=context,
+                angles=pick_planners(scope) if limits.dynamic else None,
+                width=limits.max_parallel,
+            )
             report.plan_path = str(up.path)
             self.show_plan(session, up, status="approved")
             base = await wt_mod.head_sha(cwd) if await wt_mod.repo_root(cwd) else ""
 
-            self.progress(session, "ultracode", "implementing", "", budget)
-            subtasks = extract_subtasks(plan_verdict(up.plan), up.plan) or [task]
-            fan = await self.server.fanout.run(session, brief, up.plan, subtasks, budget=budget)
+            width: int | None = None
+            detail = ""
+            if limits.dynamic:
+                subtasks, width, detail = self.size_fanout(session, limits, up.plan, task, scope, budget)
+            else:
+                subtasks = extract_subtasks(plan_verdict(up.plan), up.plan) or [task]
+                if limits.auto:  # no sizing, but "auto" still keeps only what the plan uses
+                    budget.trim(budget.agents + REVIEW_HOLD + 3 * len(subtasks))
+            self.progress(session, "ultracode", "implementing", detail, budget)
+            fan = await self.server.fanout.run(session, brief, up.plan, subtasks, budget=budget, width=width)
             report.fanout = fan
             if fan is not None and fan.stopped:
-                raise BudgetStop(fan.stopped)
+                if fan.stopped_kind == "agents" and budget.reserved:  # the review tail is still paid for: run it
+                    report.notes.append(f"fan-out stopped early ({fan.stopped}); what was merged is still reviewed")
+                else:
+                    raise BudgetStop(fan.stopped, fan.stopped_kind or "agents")
             if fan is None:  # no git repo: one worker, in place
                 prompt = f"Implement this task following the plan.\n\nTask:\n{brief}\n\nPlan:\n{up.plan}"
                 h = await self.run_child(session, budget, "worker", prompt, "implement")
@@ -289,13 +330,7 @@ class Ultra:
                 report.notes.append("fan-out left unresolved subtasks:\n" + fan.summary())
 
             await self.review_and_fix(session, budget, report, brief, up.plan, base)
-            test_cmd = self.server.fanout.cfg.get("test_command") or detect_test_command(cwd) or ""
-            if test_cmd:
-                self.progress(session, "ultracode", "final tests", test_cmd, budget)
-                ok, tail = await run_tests(test_cmd, cwd, float(self.server.fanout.cfg["test_timeout"]))
-                report.tests = f"{'pass' if ok else 'FAIL'} ({test_cmd})" + ("" if ok else f"\n{tail[-1500:]}")
-            else:
-                report.tests = "no test command detected"
+            await self.final_tests(session, report, budget, cwd)
         except BudgetStop as e:
             report.stopped = str(e)
             self.progress(session, "ultracode", "stopped", str(e), budget)
@@ -306,10 +341,62 @@ class Ultra:
         )
         return text + f"\n\nReport saved: {path}"
 
+    def size_fanout(
+        self, session: Any, limits: AgentLimits, plan: str, task: str, scope: str | None, budget: AgentBudget
+    ) -> tuple[list[str], int, str]:
+        """How many workers the plan needs and how many run at once. Reserves the review tail in ``budget`` (and trims
+        an ``auto`` budget to what the plan will use). Raises :class:`BudgetStop` when it cannot pay for one worker."""
+        steps = top_level_steps(plan)
+        units = [unit_text(u) for u in group_steps(steps)]
+        io_heavy = any(IO_HEAVY_RE.search(u) for u in units)
+        rel = session.reliability
+        gov = rel.governor if rel is not None and rel.governor is not None else Governor()
+        cap = gov.agent_cap(limits.fanout_width, io_heavy=io_heavy, ceiling=limits.max_parallel)
+        tokens_left = None if budget.max_tokens is None else max(0, budget.max_tokens - budget.tokens)
+        sized = size_agents(
+            units,
+            whole=task,
+            left=budget.left(reserved=True),
+            hold=REVIEW_HOLD,
+            width_cap=cap,
+            scope=scope,
+            tokens_left=tokens_left,
+        )
+        if sized.workers == 0:
+            why = "; ".join(sized.reasons) or "no agents left for the implementation"
+            raise BudgetStop(f"agent budget exhausted ({budget.agents}/{budget.max_agents} agents): {why}", "agents")
+        budget.reserve(sized.hold)
+        if limits.auto:  # what the plan uses: each worker and its reviewer, one rework apiece, and the review tail
+            budget.trim(budget.agents + sized.hold + 3 * sized.workers)
+        held = f"{sized.hold} held for the review" if sized.hold else "none held for the review"
+        detail = sized.describe(len(steps), f"budget {budget.max_agents}: {budget.agents} used, {held}")
+        if sized.reasons:
+            detail += " (" + "; ".join(sized.reasons) + ")"
+        return sized.subtasks, sized.width, detail
+
+    async def final_tests(self, session: Any, report: _Report, budget: AgentBudget, cwd: Path) -> None:
+        test_cmd = self.server.fanout.cfg.get("test_command") or detect_test_command(cwd) or ""
+        if test_cmd:
+            self.progress(session, "ultracode", "final tests", test_cmd, budget)
+            ok, tail = await run_tests(test_cmd, cwd, float(self.server.fanout.cfg["test_timeout"]))
+            report.tests = f"{'pass' if ok else 'FAIL'} ({test_cmd})" + ("" if ok else f"\n{tail[-1500:]}")
+        else:
+            report.tests = "no test command detected"
+
     async def run_child(
-        self, session: Any, budget: AgentBudget, agent_type: str, prompt: str, desc: str, **kw: Any
+        self,
+        session: Any,
+        budget: AgentBudget,
+        agent_type: str,
+        prompt: str,
+        desc: str,
+        *,
+        reserved: bool = False,
+        **kw: Any,
     ) -> Handle:
-        budget.take_agent()
+        """Run one child to completion. ``reserved`` children (the review lenses, the fixer) may use the agents the
+        fan-out left held back."""
+        budget.take_agent(reserved=reserved)
         h = await self.server.subagents.run(session, description=desc, prompt=prompt, agent_type=agent_type, **kw)
         budget.charge(h)
         return h
@@ -334,20 +421,20 @@ class Ultra:
                 'findings: [{"file": "...", "line": 0, "severity": "high|med|low", "issue": "..."}] '
                 "(an empty array if you find nothing). Report only real problems."
             )
-            h = await self.run_child(session, budget, "reviewer", prompt, f"review: {lens}")
+            h = await self.run_child(session, budget, "reviewer", prompt, f"review: {lens}", reserved=True)
             return parse_findings(h.result)
 
         results = await gather_or_cancel(*(lens_review(k, v) for k, v in LENSES.items()))
         candidates = dedupe_findings([f for r in results for f in r])
+        report.panel_ran = True
         report.candidates = candidates
         if not candidates:
             report.notes.append("review panel found nothing")
             return
         self.progress(session, "ultracode", "cross-checking findings", f"{len(candidates)} candidates", budget)
-        votes: dict[str, dict[str, bool]] = {}
         listing = json.dumps(candidates, indent=1)
-        for lens, desc in LENSES.items():
-            budget.check()
+
+        async def vote(lens: str, desc: str) -> dict[str, bool]:
             res = await self.server.model_caller.complete(
                 TaskKind.REVIEW,
                 [
@@ -369,7 +456,12 @@ class Ultra:
                 max_tokens=1024,
             )
             budget.tokens += res.prompt_tokens + res.completion_tokens
-            votes[lens] = parse_votes(res.text)
+            return parse_votes(res.text)
+
+        budget.check()
+        # the two votes are independent reads of the same diff: ask them at the same time
+        ballots = await gather_or_cancel(*(vote(k, v) for k, v in LENSES.items()))
+        votes = dict(zip(LENSES, ballots, strict=True))
         confirmed = [f for f in candidates if all(v.get(f["id"]) is True for v in votes.values())]
         report.confirmed = confirmed
         if not confirmed:
@@ -380,7 +472,9 @@ class Ultra:
             f"Fix these confirmed review findings (both reviewers agreed they are real). "
             f"Task context:\n{task}\n\nFindings:\n{json.dumps(confirmed, indent=1)}\n\nKeep changes minimal."
         )
-        h = await self.run_child(session, budget, "worker", fix_prompt, "fix findings", isolation="worktree")
+        h = await self.run_child(
+            session, budget, "worker", fix_prompt, "fix findings", reserved=True, isolation="worktree"
+        )
         report.fix = f"{h.status}; merge: {h.merge}" + (f" ({h.branch})" if h.merge == "conflict" else "")
 
 
@@ -389,6 +483,8 @@ class _Report:
     task: str
     plan_path: str = ""
     fanout: FanoutResult | None = None
+    #: the lens reviewers ran (a run stopped before them has no findings to report, which is not "0 findings")
+    panel_ran: bool = False
     candidates: list[dict[str, Any]] = field(default_factory=list)
     confirmed: list[dict[str, Any]] = field(default_factory=list)
     fix: str = ""
@@ -404,10 +500,13 @@ class _Report:
         if self.fanout is not None:
             out.append("\n## Implementation\n" + self.fanout.summary())
         rejected = len(self.candidates) - len(self.confirmed)
-        out.append(
-            f"\n## Review panel\n{len(self.candidates)} candidate finding(s); {len(self.confirmed)} confirmed "
-            f"by both reviewers, {rejected} rejected."
-        )
+        if self.panel_ran:
+            out.append(
+                f"\n## Review panel\n{len(self.candidates)} candidate finding(s); {len(self.confirmed)} confirmed "
+                f"by both reviewers, {rejected} rejected."
+            )
+        else:
+            out.append("\n## Review panel\nnot run: the change was not reviewed by the panel.")
         for f in self.confirmed:
             out.append(f"- [{f.get('severity', '?')}] {f.get('file', '?')}:{f.get('line', '?')} {f['issue']}")
         if self.fix:

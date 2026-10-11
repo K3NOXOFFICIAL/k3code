@@ -465,16 +465,25 @@ class AgentLoop:
         self.turn_messages = messages
 
     # Parallel read-only calls. Safe because a call joins a batch only if its spec says side_effect=False (it changes
-    # nothing another call of the batch could observe), it is not `bash` (which can do anything whatever its spec
-    # says) or exit_plan (it changes the mode and may prompt), and the permission decision of every call in the batch
-    # is a plain allow (no approval prompt can overlap another). Everything else is a barrier that runs alone, in order.
+    # nothing another call of the batch could observe), or its handler says so for this very call (`parallel_when`:
+    # a `task` call to a read-only agent type); it is not `bash` (which can do anything whatever its spec says) or
+    # exit_plan (it changes the mode and may prompt); and the permission decision of every call in the batch is a plain
+    # allow (no approval prompt can overlap another). Everything else is a barrier that runs alone, in order.
     # Results are appended, journaled and observed in call order after the batch finishes, and each call carries the
     # step number it would have had when run alone.
     def _parallel_ok(self, tc: ToolCall) -> bool:
         if tc.name in ("bash", EXIT_PLAN_TOOL) or tc.name == INVALID_TOOL_CALL:
             return False
         found = self.tools.get(tc.name)
-        return found is not None and not found[0].side_effect
+        if found is None:
+            return False
+        spec, handler = found
+        if not spec.side_effect:
+            return True
+        # a tool with side effects can still say that THIS call has none another call could observe (`task` with a
+        # read-only agent type): its handler carries the predicate
+        when = getattr(handler, "parallel_when", None)
+        return bool(when is not None and when(tc.arguments))
 
     def _batches(self, tool_calls: list[ToolCall]) -> list[list[ToolCall]]:
         """Split the calls of one reply into batches: runs of consecutive parallel-safe calls, and singletons."""

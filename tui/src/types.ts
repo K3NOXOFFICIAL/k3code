@@ -95,8 +95,14 @@ export interface DelegationStatus {
     subagent_id?: string;
     tool_count?: number;
   }[];
+  dynamic?: boolean;
+  live?: { children?: number; queued?: number };
+  max_agents?: number | string;
   max_concurrent_children?: number;
+  max_nested?: number;
+  max_parallel?: number;
   max_spawn_depth?: number;
+  max_spawns?: number;
   paused: boolean;
 }
 

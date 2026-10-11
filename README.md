@@ -153,7 +153,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 |---|---|
 | **Session and context** | `/clear` · `/compact` (`/compact <focus>` tells the summary what to keep) · `/autocompact` (when the conversation compacts itself) · `/resume` · `/rename` · `/fork` · `/branch` · `/stop` · `/exit` · `/add-dir` |
 | **Models and effort** | `/tune` (one popup for the model, the reasoning effort and the ultracode mode; or typed, for example `/tune strong high ultracode`) · `/model` (bare opens the same popup; `/model <key>` switches; `/model chain` shows the fallback chain and its health, and `add`, `remove` and `move` edit it) · `/effort` (bare opens the same popup; `/effort <level>` sets it) · `/output-style` |
-| **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` (`/ultracode <task>` runs it once; bare, `on`, `off` and `status` control the ultracode mode) · `/ultraresearch` · `/advisor` |
+| **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` (`/ultracode <task>` runs it once; bare, `on`, `off` and `status` control the ultracode mode) · `/maxagents` (how many sub-agents, how many at once, dynamic sizing) · `/ultraresearch` · `/advisor` |
 | **Automation** | `/schedule` (cron) · `/automations` (file, git, webhook, session, network and idle triggers) |
 | **Review and learning** | `/review` · `/proposals` · `/project` (detected stacks and recipe proposals; `/project rescan`) · `/learn` · `/optimizer` · `/self-improve` |
 | **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
@@ -198,6 +198,37 @@ In `auto` mode every new task is classified first (`trivial`, `small`, `medium`,
 `large` and `huge` tasks with independent parts are split into parallel workers in separate git worktrees (this needs a git repository with at least one commit). Each result is reviewed and merged, and tested before it is kept when the project has a test command: set `autonomy.fanout.test_command`, or it is detected for pytest, npm, Go and Cargo projects.
 
 `/ultracode <task>` is the full pipeline: three independent plans and a judge, parallel implementation, a two-reviewer adversarial panel where a finding counts only if both agree, fixes, and a final test run, all under a token and agent budget (`ultracode.max_tokens`, `ultracode.max_agents`). It can also stay on for a whole session ([Ultracode mode](#ultracode-mode)) or run when you say its name in a prompt ([Wake words](#wake-words)).
+
+### Agents: how many, and how many at once
+
+k3code picks the number of sub-agents from the task instead of using a fixed count, and runs independent work at the same time. Three numbers are yours to set; `/maxagents` shows and changes them:
+
+| Setting | Meaning | Default |
+|---|---|---|
+| `ultracode.max_agents` | Most sub-agents one `/ultracode` run may start in all (planners, workers, reviewers, the fixer). `auto` starts a run at 24 and keeps what its plan needs (a worker, its reviewer and one rework each, plus the review). 1 to 64 | 12 |
+| `autonomy.agents.max_parallel` | Most sub-agents of a session running at the same time: the cap on the model's own `task` calls, and the ceiling of a fan-out's width (1 to 8) | 4 |
+| `autonomy.agents.dynamic` | Size the planners and workers from the task (below). `false` is the older fixed shape: three planners, one worker per plan step | on |
+
+How `/ultracode` sizes a run when `dynamic` is on:
+
+- **Planners.** A small task gets one planner (no judge call), a medium one two, a large or huge one three. A task you start with `/ultracode <task>` or the word `ultracode` has no rating, so it keeps three.
+- **Workers.** The plan's top-level steps are grouped into units that can run apart: steps the planner marked `(parallel)` stay separate and the unmarked ones form one chain; without marks, steps that name the same file, or say "after step 2", stay together. The units are packed into as many workers as the budget pays for (each worker costs itself plus its reviewer; a rework after a rejection comes out of the same pool, and a subtask that cannot get one is reported as skipped), as the task's scope can keep busy (1 for small, 2 medium, 4 large, 6 huge), and never more than 8. At the default budget of 12 that is at most three workers. Nothing is dropped: extra units are joined into a worker's task, in order.
+- **The review is kept.** Three agents (the two review lenses and the fixer) are held back from the fan-out, so a wide plan can never use up the budget before its review and final tests. A run that cannot afford even one worker and its reviewer stops before it starts and tells you to raise `/maxagents`. A report whose panel never ran says "not run", not "0 findings".
+- **Width.** Workers run `min(workers, autonomy.fanout.max_parallel, autonomy.agents.max_parallel)` at a time (2 when the subtasks look IO-heavy: install, build, docker, ...). Both ceilings used to stop at 3 whatever was configured.
+
+The same limits apply when the model starts agents itself with the `task` tool: past `max_parallel` live children, `max_nested` (3) live sub-agents of one child, `max_spawns` (16) calls in one turn, or 16 live agents in the whole gateway, the call fails with a message that says which limit it hit and the model collects a result or does the part itself. Nothing is queued. Calls to read-only agent types (`explorer`, `planner`) in one reply run at the same time; anything that can write waits its turn.
+
+```
+/maxagents                    show the limits, where each came from, and what is running
+/maxagents 20                 up to 20 agents per /ultracode run, for this session
+/maxagents auto               let each run size itself (up to 24)
+/maxagents parallel 6         six sub-agents at once
+/maxagents dynamic off        the fixed shape (also: /ultracode dynamic off)
+/maxagents reset              back to the config
+/maxagents 20 --save          keep it in your config.yaml
+```
+
+A setting belongs to the session unless you add `--save`: raising it raises what a run can spend, so it never persists by accident, and an imported session bundle does not carry it. `/ultracode agents 20` and `/ultracode dynamic off` mean the same. The model's `task` limits follow a change at once; `/ultracode` and fan-out use it from their next run. `autonomy.agents` also takes `max_nested` and `max_spawns` (0 for no per-turn limit). A project config with an `ultracode:` or `autonomy:` section replaces the whole section of your own config, as it does for every section; `/maxagents --save` says so when that hides what it wrote. The `/agents` view shows `caps d2/3 · max 12 dyn`: the spawn depth, the width a fan-out really gets, the agent budget and whether sizing is on.
 
 ### Goals: `/goal` keeps going until it is done
 
@@ -414,9 +445,14 @@ autonomy:
   escalate_main: true               # a turn that stalls on the main tier continues on the strong tier (default)
   auto_continue: false              # true: an ordinary prompt runs as an implicit goal until the judge says done
   fanout: {max_parallel: 3}
+  agents:                           # /maxagents edits these; see "Agents: how many, and how many at once"
+    dynamic: true                   # size planners and workers from the task
+    max_parallel: 4                 # sub-agents of a session at once (1-8): the model's task calls and the fan-out width
+    # max_nested: 3                 # live sub-agents of one sub-agent (0: none)   max_spawns: 16 (0: no limit) per turn
 ultracode:
   min_scope: small                  # with the ultracode mode on: a prompt rated at least this runs the pipeline
                                     #   (trivial | small | medium | large | huge); also max_tokens and max_agents
+  # max_agents: 12                  # 1-64 or auto: most sub-agents one run may start
 wake_words:
   enabled: true                     # false switches every wake word off
   # ultraplan: false                # or just one: ultracode | ultraplan | ultraresearch (all default to true)

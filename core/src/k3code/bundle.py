@@ -29,8 +29,8 @@ _SESSION_RE = re.compile(r"^sessions/([A-Za-z0-9_\-]{1,64})\.json$")
 #: background / automation-origin markers that make the daemon run or resume the session on its own, and an armed
 #: ``ultra_mode`` (ultracode spawns parallel sub-agents on the next prompt, which the importer never chose), and the
 #: goal: an active one is resumed by the daemon's boot resume and watchdog, which would run the bundle author's goal
-#: text and ``--check`` command unattended.
-_UNTRUSTED_META = frozenset({"mode", "add_dirs", "background", "ultra_mode", "goal"})
+#: text and ``--check`` command unattended, and ``agent_limits`` (a /maxagents raise: more sub-agents, more spend).
+_UNTRUSTED_META = frozenset({"mode", "add_dirs", "background", "ultra_mode", "goal", "agent_limits"})
 
 
 class BundleError(ValueError):

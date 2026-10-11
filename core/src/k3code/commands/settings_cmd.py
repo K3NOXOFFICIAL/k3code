@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from k3code import outputstyle
+from k3code.autonomy.agents import agent_limits, session_limits
 from k3code.commands import CommandDef
 from k3code.commands._util import reply, session_cwd
 from k3code.memory import project_memory_path, user_memory_path
@@ -28,7 +29,13 @@ def build_settings_view(ctx: Any, session_id: str | None) -> dict[str, Any]:
         rules = len(p.user_rules) + len(p.project_rules) + len(p.session_rules)
         mode = p.mode.value
     style = (live.stored.meta.get("output_style") if live else None) or cfg.output_style
+    limits = session_limits(cfg, live) if live is not None else agent_limits(cfg)
     return {
+        "agents": {
+            "max_agents": limits.describe_max_agents(),
+            "dynamic": limits.dynamic,
+            "max_parallel": limits.max_parallel,
+        },
         "model_key": (live.stored.model if live and live.stored.model else cfg.default_model),
         "model_chain": chain,
         "effort": (live.reasoning_effort if live else None) or "default",
@@ -76,6 +83,14 @@ def render_text(v: dict[str, Any]) -> str:
         f"focus mode:   {'on' if v['focus_mode'] else 'off'}",
         f"theme:        {v['theme']}",
         f"output style: {v['output_style']}",
+        *(
+            [
+                f"agents:       up to {a['max_agents']} per /ultracode run, {a['max_parallel']} at once, "
+                f"{'sized from the task' if a['dynamic'] else 'fixed shape'}  (/maxagents)"
+            ]
+            if (a := v.get("agents"))
+            else []
+        ),
         "providers:    " + (provs or "none"),
         "paths:",
         *(f"  {k}: {p}" for k, p in v["paths"].items()),

@@ -295,9 +295,11 @@ async def test_config_set_goal_gate_max_retries_reaches_new_goals(tmp_path, monk
     server, _ = make_server(tmp_path, monkeypatch, ["ok"])
     sid = await new_session(server, tmp_path)
     live = server._session_for(sid)
-    assert server.goal_manager(live).set("default", check="true").gates[0].max_retries == 20
-    reply = await rpc(server, "config.set", {"key": "goal.gate_max_retries", "value": 0})
-    assert reply["result"]["value"] == 0 and server.config.goal.gate_max_retries == 0
+    assert server.goal_manager(live).set("default", check="true").gates[0].max_retries == 0  # no limit by default
+    reply = await rpc(server, "config.set", {"key": "goal.gate_max_retries", "value": 5})
+    assert reply["result"]["value"] == 5 and server.config.goal.gate_max_retries == 5
+    assert server.goal_manager(live).set("limited", check="true").gates[0].max_retries == 5
+    await rpc(server, "config.set", {"key": "goal.gate_max_retries", "value": 0})
     assert server.goal_manager(live).set("unlimited", check="true").gates[0].max_retries == 0
     await server.close()
 

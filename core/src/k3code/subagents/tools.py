@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from k3code.autonomy.agents import session_limits
 from k3code.providers.types import ToolSpec
-from k3code.subagents.runner import DepthLimit
+from k3code.subagents.runner import DepthLimit, SpawnRefused
+
+#: the tools of an agent type that cannot change anything another child could observe
+READ_ONLY_TOOLS = frozenset({"read", "grep", "glob"})
 
 
 def register_task_tools(
@@ -20,6 +24,7 @@ def register_task_tools(
         if not prompt:
             return {"error": "task needs a prompt"}
         try:
+            mgr.admit(parent, parent_child_id, session_limits(server.config, parent))
             h = mgr.spawn(
                 parent,
                 description=description or prompt[:60],
@@ -30,14 +35,27 @@ def register_task_tools(
                 depth=depth,
                 parent_child_id=parent_child_id,
             )
-        except DepthLimit as e:
+        except (DepthLimit, SpawnRefused, ValueError) as e:
             return {"error": str(e)}
-        except ValueError as e:
-            return {"error": str(e)}
+        mgr.note_spawn(parent.session_id, parent_child_id)
         if arguments.get("background"):
             return {"content": (f'Started sub-agent {h.id} in the background. Poll with task_result(id="{h.id}").')}
         await mgr.wait(h)
         return {"content": h.render()}
+
+    def parallel_when(arguments: dict[str, Any]) -> bool:
+        """Several ``task`` calls of one reply may run at the same time when each child can only read: an explorer or
+        planner (tools within read/grep/glob) in the shared checkout. A child that can write, runs a command or works
+        in a worktree stays a barrier. Unknown agent types are serial."""
+        if str(arguments.get("isolation") or "none") != "none":
+            return False
+        try:
+            atype = mgr.resolve_type(arguments.get("agent_type") or None, parent.perms.cwd)
+        except (ValueError, AttributeError):
+            return False
+        return bool(atype.tools) and set(atype.tools) <= READ_ONLY_TOOLS
+
+    tool_task.parallel_when = parallel_when  # type: ignore[attr-defined]  # read by AgentLoop._parallel_ok
 
     async def tool_task_result(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         h = mgr.handles.get(str(arguments.get("id") or ""))
