@@ -50,10 +50,40 @@ def compact_schema(schema: dict[str, Any]) -> str:
     return "{" + ", ".join(parts) + "}"
 
 
+def unparsed_marker(args: Any) -> str | None:
+    """The raw text of arguments a provider could not parse as a JSON object (it sends ``{"_unparsed": raw}`` for
+    broken JSON and ``{"_raw": value}`` for JSON that is no object), else None."""
+    if isinstance(args, dict) and len(args) == 1:
+        for key in ("_unparsed", "_raw"):
+            if key in args:
+                return str(args[key])
+    return None
+
+
+def drop_null_options(args: dict[str, Any], schema: dict[str, Any] | None) -> dict[str, Any]:
+    """``args`` without the optional arguments the model sent as ``null``: models fill unused options with null, which
+    the schema (``type: integer``) rejects and the handlers do not expect. A required argument, and a property whose
+    schema allows null, keep theirs."""
+    if not isinstance(schema, dict) or not isinstance(args, dict) or None not in args.values():
+        return args
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+
+    def keeps_null(name: str) -> bool:
+        prop = props.get(name)
+        typ = prop.get("type") if isinstance(prop, dict) else None
+        return name in required or not isinstance(prop, dict) or typ is None or typ == "null" or "null" in (typ or [])
+
+    return {k: v for k, v in args.items() if v is not None or keeps_null(k)}
+
+
 def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
     """What is wrong with ``args`` for ``schema`` (empty = nothing found)."""
     if not isinstance(schema, dict) or schema.get("type", "object") != "object":
         return []
+    if (raw := unparsed_marker(args)) is not None:
+        shown = raw[:150] + ("…" if len(raw) > 150 else "")
+        return [f"the arguments were not a valid JSON object (received: {shown})"]
     if not isinstance(args, dict):
         return [f"arguments must be an object, got {type(args).__name__}"]
     props = schema.get("properties") or {}

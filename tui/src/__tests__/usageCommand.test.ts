@@ -96,4 +96,39 @@ describe("/usage slash command", () => {
     expect(body).toContain("Context: ~80,000 / 200,000 (~40%)");
     expect(body).toContain("Compressions: 2");
   });
+
+  it("shows where auto-compact starts and how well the prompt cache hits", async () => {
+    const { panel, run } = buildCtx({
+      "session.usage": baseUsage({
+        autocompact_at: 140_000,
+        cache_hit_pct: 86,
+        cache_read: 86_000,
+        cache_write: 4_000,
+        calls: 5,
+        context_max: 200_000,
+      }),
+    });
+
+    await run("");
+
+    const body = usagePanel(panel);
+    expect(body).toContain("Auto-compact: at 140,000 tokens (/autocompact)");
+    expect(body).toContain(
+      "Prompt cache: 86% of input tokens read from cache (86,000 read, 4,000 written)",
+    );
+  });
+
+  it("says when auto-compact is off", async () => {
+    const { panel, run } = buildCtx({
+      "session.usage": baseUsage({
+        autocompact_at: null,
+        calls: 1,
+        context_max: 200_000,
+      }),
+    });
+
+    await run("");
+
+    expect(usagePanel(panel)).toContain("Auto-compact: off (/autocompact)");
+  });
 });

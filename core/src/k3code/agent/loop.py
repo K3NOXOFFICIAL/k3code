@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -20,13 +21,14 @@ from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
 from k3code.toolerrors import Failure, describe_call, failure_of
 from k3code.tools import (
+    HOOK_FEEDBACK_KEY,
     MAX_TOOL_RESULT_CHARS,
     SESSION_TOOLS,
     build_registry,
     clip_tool_results,
     format_tool_result,
 )
-from k3code.tools.validate import invalid_arguments
+from k3code.tools.validate import drop_null_options, invalid_arguments
 from k3code.userhooks import HookOutcome, HookRunner
 
 CUT_OFF_CONTINUE = (
@@ -103,6 +105,8 @@ class AgentLoop:
         self._pinned: set[str] = set()
         #: Per run(): what the decision model said is still worth knowing of an elided result (tool call id → note)
         self._notes: dict[str, str] = {}
+        #: True: ``_elided`` and ``_notes`` belong to the session (share_elision) and outlive a run().
+        self._carry_elision = False
         #: The decision model (k3code.context_select), when one is configured: (request, candidates) → {tool call id:
         #: "keep" | note}. It is asked before a batch of old results is elided; None = plain elision.
         self.decide_context: Callable[[list[Message], list[Message]], Awaitable[dict[str, str]]] | None = None
@@ -184,6 +188,13 @@ class AgentLoop:
     def permission_mode(self, mode: PermissionMode | str) -> None:
         self.permissions.mode = PermissionMode(mode)
 
+    def share_elision(self, elided: set[str], notes: dict[str, str]) -> None:
+        """Keep which tool results are elided (and the decision model's notes on them) in these session-owned
+        containers across runs. A run used to start with nothing elided and elide every old result at its first
+        request, so the request differed from the last one of the turn before from the first elided result on: a
+        prompt-cache miss at the start of every turn of a long session. Clear them when the history is rewritten."""
+        self._elided, self._notes, self._carry_elision = elided, notes, True
+
     def tool_specs(self) -> list[Any]:
         """Tool specs for the model; ``exit_plan`` is only offered in plan mode."""
         plan = self.permissions.mode == PermissionMode.PLAN
@@ -227,8 +238,9 @@ class AgentLoop:
         # (another loop on a different tier may have attached its own since construction).
         self.reliability.attach_router(self.router)
         self.reliability.begin_turn()
-        self._elided, self._pinned, self._reads, self._step, self._learned = set(), set(), {}, 0, set()
-        self._notes = {}
+        self._pinned, self._reads, self._step, self._learned = set(), {}, 0, set()
+        if not self._carry_elision:
+            self._elided, self._notes = set(), {}
         # an earlier run's failed calls must not count toward (or be listed in) this run's tool-error stop
         self._tool_errors, self._failed, self._truncated, self._continuations = 0, [], set(), 0
         self.escalation_reason = None  # the REPL reuses one loop: a stop in an earlier run is not this run's
@@ -472,9 +484,10 @@ class AgentLoop:
 
     def _plain_allow(self, tc: ToolCall) -> bool:
         spec = self.tools.get(tc.name)[0]
-        if invalid_arguments(tc.name, spec.parameters, tc.arguments) is not None:
+        args = drop_null_options(tc.arguments, spec.parameters)
+        if invalid_arguments(tc.name, spec.parameters, args) is not None:
             return True  # answered with an error before any permission check
-        return self.permissions.decide(tc.name, tc.arguments, headless=self.headless).action == "allow"
+        return self.permissions.decide(tc.name, args, headless=self.headless).action == "allow"
 
     async def _execute_tool(self, tool_call: ToolCall, *, step: int | None = None) -> dict[str, Any]:
         """Execute a single tool call with permission checking."""
@@ -491,9 +504,11 @@ class AgentLoop:
             return {"error": CUT_OFF_CALL}
         spec, handler = self.tools.get(tool_call.name) or (None, None)
         if not handler:
-            return {"error": f"Unknown tool: {tool_call.name}"}
+            names = sorted(self.tools.names())
+            listed = ", ".join(names[:40]) + (f", … ({len(names)} in all)" if len(names) > 40 else "")
+            return {"error": f"Unknown tool: {tool_call.name}. The tools are: {listed}"}
 
-        args = tool_call.arguments
+        args = drop_null_options(tool_call.arguments, spec.parameters)
         if tool_call.name == EXIT_PLAN_TOOL:
             return await self._exit_plan(args)
         # before the permission prompt: a call the handler cannot run is not worth an approval
@@ -548,8 +563,8 @@ class AgentLoop:
             "PostToolUse", tool_call.name, {"tool_input": args, "tool_response": format_tool_result(result)}
         )
         feedback = "\n".join(t for t in (post.reason if post.blocked else "", post.context_text()) if t)
-        if feedback:  # the tool already ran: the hook's word joins its result for the model
-            result = {**result, "content": f"{format_tool_result(result)}\n\n[PostToolUse hook] {feedback}"}
+        if feedback:  # the tool already ran: the hook's word joins its result for the model (format_tool_result)
+            result = {**result, HOOK_FEEDBACK_KEY: feedback}
         return result
 
     async def _run_hooks(self, event: str, tool: str, payload: dict[str, Any]) -> HookOutcome:
@@ -714,8 +729,9 @@ class AgentLoop:
             if learned and failure is not None and (tc.name, failure.signature) not in self._learned:
                 self._learned.add((tc.name, failure.signature))
                 notes.append(Message(role="system", content=tag + learned))
+        digest = hashlib.sha1(str(format_tool_result(result)).encode("utf-8", "replace")).hexdigest()[:12]
         outcome = self.reliability.observe_tool_result(
-            tc, failure.signature if failure else None, describe_call(tc.name, tc.arguments)
+            tc, failure.signature if failure else None, describe_call(tc.name, tc.arguments), digest
         )
         guarded = any(not (n.content or "").startswith(tag) for n in notes)
         if outcome is not None and outcome.verdict is Verdict.NOTE and outcome.note and not guarded:

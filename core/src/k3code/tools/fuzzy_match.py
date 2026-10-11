@@ -268,6 +268,10 @@ def _strategy_context_aware(content: str, pattern: str) -> list[Span]:
     n = len(pattern_lines)
     if n > len(content_lines):
         return []
+    # k3code: a pattern of one or two lines is too little to anchor a similarity match on: `x = 1` scored 0.8 against
+    # the line `x = 2` and replaced it, and `retries = 5` against `retries = 3` scored 0.91. Silent wrong edits.
+    if sum(1 for line in pattern_lines if line.strip()) < 3:
+        return []
     first_pat = pattern_lines[0].strip()
     last_pat = pattern_lines[-1].strip()
 
@@ -351,7 +355,7 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
         return content, 0, None, (
             "old_string is empty — nothing to match. Set old_string to the exact "
             "existing text the replacement should replace (read the file first if "
-            "unsure). To create a new file or fully rewrite one, use write_file "
+            "unsure). To create a new file or fully rewrite one, use write "
             "instead. Do not re-send this call unchanged.")
     if not old_string.strip():
         # Whitespace-only anchors match trivially and mass-replace or
@@ -420,7 +424,7 @@ def _detect_escape_drift(content: str, matches: list[Span],
                     f"the file does not. This is almost always a tool-call "
                     f"serialization artifact where an apostrophe or quote got "
                     f"prefixed with a spurious backslash. Re-read the file with "
-                    f"read_file and pass old_string/new_string without "
+                    f"read and pass old_string/new_string without "
                     f"backslash-escaping {plain!r} characters.")
     return _detect_backslash_doubling(matched_regions, old_string, new_string)
 
@@ -448,7 +452,7 @@ def _detect_backslash_doubling(matched_regions: str, old_string: str,
         "twice as long as in the matched region of the file (e.g. the file "
         "has `\\\\` where old_string has `\\\\\\\\`). The tool-call arguments "
         "were JSON-escaped one extra time; applying new_string verbatim would "
-        "double every backslash in the file. Re-read the file with read_file "
+        "double every backslash in the file. Re-read the file with read "
         "and resend old_string/new_string with the backslash counts exactly "
         "as they appear in the file.")
 

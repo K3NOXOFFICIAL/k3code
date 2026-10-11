@@ -249,6 +249,8 @@ class PlanFirst:
             reliability=await server._reliability_for(session),
             session=sid,
             task_kind=TaskKind.PLAN,
+            tool_output_chars=int((getattr(server.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            context_window=server._router_window(router, session),
         )
         loop.hooks = userhooks.load(session.perms.cwd, sid)  # the planner's read tools see the user's hooks too
         loop.max_turns_stop_message = False  # its last text is taken as the plan: a stop notice is not one

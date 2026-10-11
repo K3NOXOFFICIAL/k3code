@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from k3code.providers.types import Message, ToolSpec
@@ -65,29 +65,93 @@ def family_window(model_id: str) -> int | None:
     return None
 
 
-def compact_threshold(config: Any, model_id: str) -> int:
-    """Estimated tokens at which a session is compacted: ``context.compact_at_tokens`` when set (an absolute
-    override), else ``context.compact_at_ratio`` (default COMPACT_AT_RATIO) of the model's window."""
-    ctx = dict(getattr(config, "context", None) or {})
-    if ctx.get("compact_at_tokens"):
-        return int(ctx["compact_at_tokens"])
-    return int(context_window(config, model_id) * float(ctx.get("compact_at_ratio", COMPACT_AT_RATIO)))
+#: What /autocompact accepts as an explicit limit: below the floor every turn would compact (the system prompt and the
+#: tool schemas alone are several thousand tokens), above the ceiling the provider rejects the request first.
+MIN_COMPACT_TOKENS = 2_000
+MIN_COMPACT_RATIO = 0.1
+MAX_COMPACT_RATIO = 0.95
+
+
+@dataclasses.dataclass(frozen=True)
+class AutoCompact:
+    """When a session is compacted on its own: never (``enabled`` False), at ``tokens`` estimated tokens, at ``ratio``
+    of the model's window, or (both None) at COMPACT_AT_RATIO of it."""
+
+    enabled: bool = True
+    tokens: int | None = None
+    ratio: float | None = None
+
+    @property
+    def mode(self) -> str:
+        """``off``, ``tokens`` (a fixed limit), ``ratio`` (a share of the window) or ``auto`` (the default share)."""
+        if not self.enabled:
+            return "off"
+        return "tokens" if self.tokens else "ratio" if self.ratio else "auto"
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _share(value: Any) -> float | None:
+    try:
+        r = float(value)
+    except (TypeError, ValueError):
+        return None
+    return r if 0 < r <= 1 else None
+
+
+def autocompact_policy(config: Any, override: Mapping[str, Any] | None = None) -> AutoCompact:
+    """The automatic-compaction policy: ``override`` (a session's own setting, see /autocompact --session) replaces the
+    config's ``context.autocompact`` / ``compact_at_tokens`` / ``compact_at_ratio`` as a whole. A value that is no
+    positive number counts as unset: a bad hand-edit must not break a turn."""
+    src: Mapping[str, Any] = override or dict(getattr(config, "context", None) or {})
+    key = "enabled" if override else "autocompact"
+    tokens_key, ratio_key = ("tokens", "ratio") if override else ("compact_at_tokens", "compact_at_ratio")
+    return AutoCompact(
+        enabled=bool(src.get(key, True)), tokens=_positive_int(src.get(tokens_key)), ratio=_share(src.get(ratio_key))
+    )
+
+
+def compact_threshold(config: Any, model_id: str, policy: AutoCompact | None = None) -> int:
+    """Estimated tokens at which a session is compacted: the policy's absolute limit (``context.compact_at_tokens``)
+    when set, else its ratio (``context.compact_at_ratio``, default COMPACT_AT_RATIO) of the model's window."""
+    policy = policy or autocompact_policy(config)
+    if policy.tokens:
+        return policy.tokens
+    return int(context_window(config, model_id) * (policy.ratio or COMPACT_AT_RATIO))
+
+
+def text_tokens(text: str) -> int:
+    """Estimated tokens of ``text``: ~4 characters per token, plus half a token for every UTF-8 byte past the first of
+    a character (CJK text and emoji take about a token per character, of which chars // 4 counted a quarter)."""
+    n = len(text)
+    if text.isascii():
+        return n // 4
+    return n // 4 + (len(text.encode("utf-8", "ignore")) - n) // 2
 
 
 def overhead_tokens(system_prompt: str, specs: Sequence[ToolSpec]) -> int:
     """Estimated tokens of what every request carries besides the conversation: system prompt and tool schemas."""
     schemas = [{"name": s.name, "description": s.description, "parameters": s.parameters} for s in specs]
-    return (len(system_prompt) + len(json.dumps(schemas, ensure_ascii=False))) // 4
+    return text_tokens(system_prompt) + text_tokens(json.dumps(schemas, ensure_ascii=False))
 
 
 def message_tokens(messages: Sequence[Message]) -> int:
-    """Estimated tokens of messages as sent (~4 chars per token), tool calls included."""
-    chars = 0
+    """Estimated tokens of messages as sent, tool calls included. The system entry is not counted when it is the
+    first message: the request's system prompt is counted by overhead_tokens."""
+    if messages and messages[0].role == "system":
+        messages = messages[1:]
+    tokens = 0
     for m in messages:
-        chars += len(m.content or "")
+        tokens += text_tokens(m.content or "")
         for tc in m.tool_calls:
-            chars += len(tc.name) + len(tc.raw_arguments or json.dumps(tc.arguments, ensure_ascii=False))
-    return chars // 4
+            tokens += text_tokens(tc.name + (tc.raw_arguments or json.dumps(tc.arguments, ensure_ascii=False)))
+    return tokens
 
 
 def elide_marker(name: str | None, chars: int) -> str:

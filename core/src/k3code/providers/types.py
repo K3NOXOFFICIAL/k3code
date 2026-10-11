@@ -37,16 +37,23 @@ class Usage:
 EPHEMERAL = {"type": "ephemeral"}
 
 
-def with_cache_breakpoint(content: Any) -> Any:
+def cache_marker(ttl: str = "5m") -> dict[str, str]:
+    """The ``cache_control`` value for a breakpoint: the default 5-minute entry, or ``ttl`` ("1h") for work that comes
+    back after longer (a ``/loop`` or cron job every 5 minutes or more finds a 5-minute entry gone)."""
+    return EPHEMERAL if ttl in ("", "5m") else {**EPHEMERAL, "ttl": ttl}
+
+
+def with_cache_breakpoint(content: Any, ttl: str = "5m") -> Any:
     """``content`` (a message's string or block list) with a cache breakpoint on its last block; unchanged when it has
     no block that can carry one (empty text is rejected by the API; an empty tool result is skipped the same way)."""
+    marker = cache_marker(ttl)
     if isinstance(content, str):
-        return [{"type": "text", "text": content, "cache_control": EPHEMERAL}] if content else content
+        return [{"type": "text", "text": content, "cache_control": marker}] if content else content
     if isinstance(content, list) and content:
         last = content[-1]
         body = {"text": "text", "tool_result": "content"}.get(str(last.get("type")))
         if body is None or last.get(body):
-            return [*content[:-1], {**last, "cache_control": EPHEMERAL}]
+            return [*content[:-1], {**last, "cache_control": marker}]
     return content
 
 

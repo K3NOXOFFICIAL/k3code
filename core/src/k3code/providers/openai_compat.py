@@ -33,11 +33,13 @@ class OpenAICompatProvider(Provider):
         api_key: str,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
+        cache_ttl: str = "5m",
     ) -> None:
         self.name = name
         #: "on": Anthropic-style cache_control inside messages for Claude model ids (auto = off: plain OpenAI
         #: endpoints cache by themselves and some reject unknown fields)
         self.prompt_cache = prompt_cache == "on"
+        self.cache_ttl = cache_ttl
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
@@ -64,7 +66,7 @@ class OpenAICompatProvider(Provider):
     ) -> dict[str, Any]:
         wire = messages_to_openai(messages)
         if self.prompt_cache and "claude" in model.lower():
-            _add_cache_breakpoints(wire)
+            _add_cache_breakpoints(wire, self.cache_ttl)
         payload: dict[str, Any] = {
             "model": model,
             "messages": wire,
@@ -225,7 +227,7 @@ def _error_message(body: dict[str, Any]) -> str:
     return ""
 
 
-def _add_cache_breakpoints(wire: list[dict[str, Any]]) -> None:
+def _add_cache_breakpoints(wire: list[dict[str, Any]], ttl: str = "5m") -> None:
     """Two Anthropic-style breakpoints for a relay to Claude: the last leading system message and the newest one."""
     leading = 0
     while leading < len(wire) and wire[leading]["role"] == "system":
@@ -233,7 +235,7 @@ def _add_cache_breakpoints(wire: list[dict[str, Any]]) -> None:
     marks = {leading - 1, len(wire) - 1} - {-1}
     for i in marks:
         if isinstance(wire[i].get("content"), str):
-            wire[i] = {**wire[i], "content": with_cache_breakpoint(wire[i]["content"])}
+            wire[i] = {**wire[i], "content": with_cache_breakpoint(wire[i]["content"], ttl)}
 
 
 def _parse_usage(chunk_usage: dict[str, Any]) -> Any:

@@ -30,6 +30,7 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                     base_url=entry.base_url,
                     api_key=entry.api_key,
                     prompt_cache=entry.prompt_cache,
+                    cache_ttl=entry.cache_ttl,
                 )
             )
         elif entry.kind == "anthropic":
@@ -39,6 +40,7 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                     base_url=entry.base_url,
                     api_key=entry.api_key,
                     prompt_cache=entry.prompt_cache,
+                    cache_ttl=entry.cache_ttl,
                 )
             )
         elif entry.kind == "claude-cli":

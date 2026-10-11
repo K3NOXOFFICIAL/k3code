@@ -7,7 +7,7 @@ without the change they fail on what they assert, not at import.
 from __future__ import annotations
 
 from k3code.config import Settings
-from k3code.research.tools import register_web_tools
+from k3code.research.tools import MAX_FETCH_CHARS, register_web_tools
 from k3code.tools import build_registry, tool_bash
 
 
@@ -31,4 +31,4 @@ def test_every_builtin_tool_states_its_limits():
         limits = [ln for ln in spec.description.splitlines() if ln.startswith("Limits: ")]
         assert len(limits) == 1, name
     assert "30 s by default" in reg.get("bash")[0].description
-    assert "14000 chars" in reg.get("web_fetch")[0].description
+    assert f"{MAX_FETCH_CHARS} chars" in reg.get("web_fetch")[0].description

@@ -7,6 +7,7 @@ from typing import Any
 
 from k3code import chain_config
 from k3code.commands import CommandDef, CommandRegistry, tune
+from k3code.commands.autocompact_cmd import AutoCompactCommand
 from k3code.commands.autonomy import AdvisorCommand, GoCommand, PreviewCommand, ProposalsCommand, ScopeCommand
 from k3code.commands.daemon import DaemonCommand
 from k3code.commands.debug import DebugCommand
@@ -16,7 +17,6 @@ from k3code.commands.tune import TuneCommand
 from k3code.commands.update_cmd import UpdateCommand
 from k3code.config import load_config
 from k3code.providers.effort import LEVELS as EFFORT_LEVELS
-from k3code.session_ai import compact_messages
 
 _MODEL_USAGE = (
     "Usage: /model <key> [--reasoning <level>] [--global|--session] [reason] (a reason after -- is kept as is)"
@@ -154,24 +154,30 @@ class _ClearCommand(CommandDef):
 
 class _CompactCommand(CommandDef):
     def __init__(self) -> None:
-        super().__init__(name="compact", help="Summarize the older transcript to free context", aliases=["compress"])
+        super().__init__(
+            name="compact",
+            help="Summarize the older transcript to free context: /compact [what the summary should focus on]",
+            aliases=["compress"],
+        )
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         live = ctx.sessions.get(session_id) if session_id else None
         if live is None:
             return {"type": "message", "message": "No active session."}
-        if getattr(live, "streaming", False):  # the running turn's persist would overwrite the summary
+        if live.turn_in_flight:  # the running turn's persist would overwrite the summary
             return {"type": "message", "message": "A turn is running in this session; /compact when it ends."}
-        before = len(live.messages)
+        before, tokens_before = len(live.messages), ctx._request_tokens(live)
         try:
-            messages, folded = await compact_messages(ctx.model_caller, list(live.messages), session_id=live.session_id)
+            folded = await ctx.compact_session(live, instructions=arg)
         except Exception as e:  # noqa: BLE001 - e.g. every provider rate-limited
             return {"type": "message", "message": f"Compact failed: {e}"}
         if not folded:
             return {"type": "message", "message": f"Nothing to compact ({before} messages)."}
-        live.messages = messages
-        ctx.store.save(live.stored)
-        note = f"Compacted {folded} messages into a summary ({before} → {len(messages)})."
+        ctx.emit_context(live)
+        note = (
+            f"Compacted {folded} messages into a summary ({before} → {len(live.messages)}); "
+            f"the next request is ~{ctx._request_tokens(live):,} tokens, was ~{tokens_before:,}."
+        )
         return {"type": "message", "message": note}
 
 
@@ -330,6 +336,7 @@ def build_registry() -> CommandRegistry:
         _EffortCommand(),
         _ClearCommand(),
         _CompactCommand(),
+        AutoCompactCommand(),
         _RenameCommand(),
         _ResumeCommand(),
         _AddDirCommand(),

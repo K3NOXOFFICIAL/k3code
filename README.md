@@ -151,7 +151,7 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 
 | Group | Commands |
 |---|---|
-| **Session and context** | `/clear` · `/compact` · `/resume` · `/rename` · `/fork` · `/branch` · `/stop` · `/exit` · `/add-dir` |
+| **Session and context** | `/clear` · `/compact` (`/compact <focus>` tells the summary what to keep) · `/autocompact` (when the conversation compacts itself) · `/resume` · `/rename` · `/fork` · `/branch` · `/stop` · `/exit` · `/add-dir` |
 | **Models and effort** | `/tune` (one popup for the model, the reasoning effort and the ultracode mode; or typed, for example `/tune strong high ultracode`) · `/model` (bare opens the same popup; `/model <key>` switches; `/model chain` shows the fallback chain and its health, and `add`, `remove` and `move` edit it) · `/effort` (bare opens the same popup; `/effort <level>` sets it) · `/output-style` |
 | **Planning and agents** | `/goal` · `/loop` · `/bg` · `/agents` (agent view; `/agents tree` shows the spawn tree) · `/preview` (fast sketch of the result, no changes) · `/go` (run the previewed task) · `/scope` · `/ultraplan` · `/ultracode` (`/ultracode <task>` runs it once; bare, `on`, `off` and `status` control the ultracode mode) · `/ultraresearch` · `/advisor` |
 | **Automation** | `/schedule` (cron) · `/automations` (file, git, webhook, session, network and idle triggers) |
@@ -159,6 +159,23 @@ Type `/` to browse the live list (completion shows each command's help), or run 
 | **Config and memory** | `/settings` · `/config` · `/update-config` (change settings in plain words) · `/permissions` · `/memory` · `/skills` · `/mcp` · `/export` · `/import` · `/artifacts` |
 | **Operations** | `/doctor` · `/stats` · `/debug` · `/daemon` · `/update` · `/help` |
 | **Look and feel** (TUI) | `/pet` (`on`, `off`, `random` or a pet name: blob, cat, crab, duck, ghost, hamster, owl, robot; shown at 100+ columns) · `/indicator` (`ascii` for terminals without Unicode glyphs) · `/theme` · `/statusbar` · `/focus`. These choices are saved to `display` in `~/.k3code/config.yaml`. Set `K3_NO_ANIMATION=1` to stop the spinner, messages and pet from moving. |
+
+### Long sessions: compaction and the prompt cache
+
+A conversation is folded into a summary when the next request would reach 70% of the model's context window (the smallest window among the models the turn can run on, so a cheap tier or a fallback counts). The first task statement stays verbatim, the last `context.keep_messages` (8) messages stay as they were, and the summary is written by the cheap tier from the folded part with the tool calls it contained. Inside a long turn, results of older tool calls are elided from requests past 50% of the window (the session keeps them), and what was elided stays elided in the next turn so the provider's prompt cache still matches the start of every request.
+
+`/autocompact` sets when this happens, like Claude Code's auto-compact:
+
+| Command | Effect |
+|---|---|
+| `/autocompact` | Show the setting, the limit in tokens, and how far this session is from it |
+| `/autocompact auto` | The default: compact at 70% of the window |
+| `/autocompact 120k` · `/autocompact 150000` | Compact once the request reaches that many tokens (at least 2,000) |
+| `/autocompact 60%` | Compact at that share of the window (10% to 95%) |
+| `/autocompact off` · `on` | Never compact on its own (`on` restores the limit it had). A request the provider rejects as too long then fails, and the TUI says to run `/compact`; with it on, such a request is compacted and retried once |
+| add `--session` | Change this session only, nothing is saved; `/autocompact reset --session` goes back to the config |
+
+Without `--session` the setting is saved in `~/.k3code/config.yaml` under `context` (`autocompact`, `compact_at_tokens`, `compact_at_ratio`). The status bar and `/usage` show the context in use, the window and where compaction starts, and `/usage` the prompt-cache hit rate. Anthropic's cache entries live 5 minutes; a `/loop` or cron job that comes back later finds them gone. Set `cache_ttl: 1h` on an `anthropic` provider (or a relay to Claude with `prompt_cache: on`) to keep them for an hour; a one-hour entry costs more to write than a five-minute one.
 
 ### Permission modes
 
@@ -365,8 +382,16 @@ providers:                          # the fallback chain, in order (add as many 
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
     models: {default: claude-sonnet-5-5}
+    # cache_ttl: 1h                 # prompt-cache entries live 5m (default) or 1h; see "Long sessions" above
 
 permission_mode: ask                # ask | auto-edit | plan | auto | yolo
+context:                            # all optional; /autocompact edits the first three
+  autocompact: true                 # false: never compact on its own
+  compact_at_ratio: 0.7             # compact at this share of the model's window ...
+  # compact_at_tokens: 120000       # ... or at this many tokens (wins over the ratio)
+  keep_messages: 8                  # recent messages kept verbatim by a compaction
+  compact_input_chars: 60000        # how much of the folded part the summary model reads
+  tool_output_chars: 10000          # most of one tool result the model is sent (the session keeps all of it)
 autonomy:
   plan_first: true
   escalate_main: true               # a turn that stalls on the main tier continues on the strong tier (default)

@@ -309,6 +309,7 @@ export interface SessionUsageResponse {
   active_subagents?: number;
   avg_latency_s?: number;
   avg_tps?: number;
+  autocompact_at?: number | null;
   cache_hit_pct?: number;
   cache_read?: number;
   cache_write?: number;

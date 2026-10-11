@@ -475,14 +475,25 @@ export const sessionCommands: SlashCommand[] = [
           const sys = ctx.transcript.sys;
 
           if (r) {
-            patchUiState({
+            patchUiState((state) => ({
+              ...state,
               usage: {
+                ...state.usage,
                 calls: r.calls ?? 0,
                 input: r.input ?? 0,
                 output: r.output ?? 0,
                 total: r.total ?? 0,
+                // the status bar's context meter: dropped here before, until the next call reported it again
+                ...(r.context_max
+                  ? {
+                      context_estimated: r.context_estimated,
+                      context_max: r.context_max,
+                      context_percent: r.context_percent,
+                      context_used: r.context_used,
+                    }
+                  : {}),
               },
-            });
+            }));
           }
 
           // k3code M1 cut: the billing/subscription "balance" panel (plan name,
@@ -513,8 +524,22 @@ export const sessionCommands: SlashCommand[] = [
             });
           }
 
+          if (r.autocompact_at !== undefined) {
+            sections.push({
+              text: r.autocompact_at
+                ? `Auto-compact: at ${f(r.autocompact_at)} tokens (/autocompact)`
+                : "Auto-compact: off (/autocompact)",
+            });
+          }
+
           if (r.compressions) {
             sections.push({ text: `Compressions: ${r.compressions}` });
+          }
+
+          if (r.cache_read || r.cache_write) {
+            sections.push({
+              text: `Prompt cache: ${r.cache_hit_pct ?? 0}% of input tokens read from cache (${f(r.cache_read)} read, ${f(r.cache_write)} written)`,
+            });
           }
 
           ctx.transcript.panel("Usage", sections);

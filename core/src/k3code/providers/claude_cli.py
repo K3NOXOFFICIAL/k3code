@@ -388,7 +388,10 @@ class ClaudeCliProvider(Provider):
         rc, err = 0, ""
         async with self._sem:
             sess: _Session | None = None
-            if self.persistent:
+            # A call without tools (a title, the goal judge, a classifier, a compaction summary) never continues an
+            # earlier one, so a pooled process would only wait out its idle time at ~270 MB, and with the pool full its
+            # LRU eviction stopped the conversation's own process. Those calls get a throwaway process.
+            if self.persistent and tools:
                 await self._reap()
                 sess, prompt, covered = await self._checkout(messages, tools, model)
             events = self._oneshot_events(messages, tools, model) if sess is None else self._turn(sess, prompt)

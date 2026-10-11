@@ -438,6 +438,9 @@ class SubagentManager:
             unattended_network=bool(autonomy_cfg(server.config)["unattended_network"]),
             task_kind=TaskKind.SUBAGENT.value,
             approval_callback=getattr(parent, "_approval_cb", None),
+            # without these a child (up to 200 model calls) never elided old tool results and overflowed its window
+            tool_output_chars=int((getattr(server.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            context_window=server._router_window(router, parent),
         )
         from k3code.extratools import register_skill_tool
 
