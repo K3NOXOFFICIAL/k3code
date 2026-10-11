@@ -143,10 +143,14 @@ export function useCompletion(
 
       // Skill completions are per session: project-local skills follow the
       // session's repo, so the gateway must know which session is asking.
+      // The same goes for @file completion: without the session the gateway
+      // listed the daemon's own directory, not the project being worked on.
       const sid = getUiState().sid;
 
       const params =
-        request.method === "complete.slash" && sid
+        (request.method === "complete.slash" ||
+          request.method === "complete.path") &&
+        sid
           ? { ...request.params, session_id: sid }
           : request.params;
 

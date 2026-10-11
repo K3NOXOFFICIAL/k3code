@@ -296,6 +296,9 @@ class LiveSession:
         #: monotonic time before which automatic compaction is not tried again (it failed: a summary call can take
         #: 90 s to fail, and a turn that waits that long on every prompt is worse than a long history)
         self.compact_retry_at = 0.0
+        #: Prompt tokens this session sent, and how many the provider read from its cache (the status bar's hit rate).
+        self.prompt_tokens_total = 0
+        self.cache_read_tokens_total = 0
         #: Tool results elided from this session's requests so far, and what the decision model noted of them (the
         #: loop of each turn shares them: see AgentLoop.share_elision); emptied when a compaction rewrites the history.
         self.elided: set[str] = set()
@@ -386,7 +389,7 @@ class LiveSession:
                     ],
                 )
             )
-        return out
+        return _answer_interrupted_calls(out)
 
     def live_info(self) -> dict[str, Any]:
         """SessionLiveInfo payload for session.create/resume/activate results."""
@@ -2385,7 +2388,9 @@ class GatewayServer:
         estimated = used is None
         used = self._request_tokens(session) if used is None else used
         policy = self.autocompact_policy(session)
+        sent = session.prompt_tokens_total
         return {
+            **({"cache_hit_pct": round(100 * session.cache_read_tokens_total / sent)} if sent else {}),
             "context_used": used,
             "context_max": window,
             "context_percent": min(100, round(100 * used / window)) if window else 0,
@@ -2433,7 +2438,20 @@ class GatewayServer:
             return
         session.announced_tools.add(tc.id)
         session.emit("tool.generating", {"name": tc.name})
-        session.emit("tool.start", {"tool_id": tc.id, "name": tc.name, "args": tc.arguments})
+        args = tc.arguments or {}
+        # `context` is the line a tool row shows next to the tool's name (the file, the command, the pattern) and
+        # `args_text` the Args block of the expanded row: the TUI read both and the core sent neither
+        context = str(args.get("command") or args.get("path") or args.get("pattern") or args.get("url") or "")[:120]
+        session.emit(
+            "tool.start",
+            {
+                "tool_id": tc.id,
+                "name": tc.name,
+                "args": tc.arguments,
+                "context": context.splitlines()[0] if context else "",
+                "args_text": json.dumps(tc.arguments, ensure_ascii=False, indent=2)[:2000],
+            },
+        )
 
     def _on_stream_event(self, session: LiveSession, event: StreamEvent) -> None:
         if event.type == "tool_call" and event.tool_call:
@@ -2442,12 +2460,8 @@ class GatewayServer:
             msg = event.message
             if msg.role == "tool":
                 now = time.monotonic()
-                self.usage.record(
-                    "tool",
-                    session=session.session_id,
-                    detail=msg.name or "",
-                    seconds=now - session.tool_mark if session.tool_mark is not None else 0.0,
-                )
+                seconds = now - session.tool_mark if session.tool_mark is not None else 0.0
+                self.usage.record("tool", session=session.session_id, detail=msg.name or "", seconds=seconds)
                 session.tool_mark = now
                 self._checkpoint_turn(session)
                 payload = {
@@ -2455,6 +2469,7 @@ class GatewayServer:
                     "name": msg.name or "",
                     "result_text": msg.content or "",
                     "result": {"content": msg.content},
+                    "duration_s": round(seconds, 2),
                 }
                 if msg.name == "todo":  # the TUI's todo panel reads the list from tool.complete
                     payload["todos"] = list(session.stored.meta.get("todos") or [])
@@ -2477,6 +2492,9 @@ class GatewayServer:
                     turn=session.turn_id,
                     seconds=time.monotonic() - session.call_started if session.call_started is not None else 0.0,
                 )
+                if u:
+                    session.prompt_tokens_total += u.prompt_tokens
+                    session.cache_read_tokens_total += u.cache_read_tokens
                 session.call_started = None
                 session.tool_mark = time.monotonic()  # the loop executes the tool calls right after this message
                 if u:
@@ -3169,6 +3187,34 @@ def _serialize_messages(messages: list[Message]) -> list[dict[str, Any]]:
     return out
 
 
+#: What the model reads for a tool call whose turn ended before the result was stored.
+INTERRUPTED_RESULT = (
+    "[interrupted] This call was cut off before it returned a result (the turn was stopped, or the daemon restarted "
+    "while it ran). It may have run completely, partly or not at all: check the state before you repeat it."
+)
+
+
+def _answer_interrupted_calls(history: list[Message]) -> list[Message]:
+    """``history`` with a result inserted after every assistant tool call that has none.
+
+    Providers need a result for each call, so ``normalize_tool_pairs`` used to drop the unanswered call from the request
+    without a word. The model then never learned that a command had been started (a `git push`, a migration) and often
+    ran it again; the journal knows the call was interrupted, the history now says so too."""
+    answered = {m.tool_call_id for m in history if m.role == "tool"}
+    if all(tc.id in answered for m in history if m.role == "assistant" for tc in m.tool_calls):
+        return history
+    out: list[Message] = []
+    for m in history:
+        out.append(m)
+        if m.role == "assistant":
+            out.extend(
+                Message(role="tool", content=INTERRUPTED_RESULT, tool_call_id=tc.id, name=tc.name)
+                for tc in m.tool_calls
+                if tc.id not in answered
+            )
+    return out
+
+
 def _stored_tool_call(tc: ToolCall) -> dict[str, Any]:
     """A tool call as stored. ``raw_arguments`` (the model's own argument text) is kept: a turn rebuilt from storage
     must re-send the same bytes as the turn that made the call, or the provider's prompt cache misses from there."""
@@ -3431,12 +3477,16 @@ async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict
 async def _session_title(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     sid = _require(params, "session_id")
     title = _require(params, "title")
-    stored = server.store.get(str(sid))
+    # The live session's own record: saving a detached copy of the row was undone by the next save of the live one,
+    # and an auto title could overwrite it.
+    live = server.live.get(str(sid))
+    stored = live.stored if live is not None else server.store.get(str(sid))
     if stored is None:
         raise _InvalidParams(f"unknown session: {sid}")
     stored.title = str(title)
     server.store.save(stored)
-    return {"ok": True}
+    server.emit("session.title", {"session_id": str(sid), "title": stored.title})
+    return {"ok": True, "title": stored.title}
 
 
 async def _session_interrupt(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3449,13 +3499,15 @@ async def _session_steer(server: GatewayServer, params: dict[str, Any]) -> dict[
     pasted = _paste_spans(params, text)
     session = server.session
     if session is None or not session.streaming:
-        return {"steered": False}
+        return {"steered": False, "status": "rejected"}
     # The running loop adds it before its next model call. Appending to stored.messages lost it: the loop never saw
     # it and the turn's persist overwrote the list. Typed text keeps its marker: if no loop takes it, it runs as the
     # next prompt, wake words and all (``automated`` is the TUI's own text, see _prompt_submit).
     typed = TypedPrompt(text, pasted)
     session.steer_queue.append(str(text) if params.get("automated") is True else typed)
-    return {"steered": True}
+    # `status` is what the TUI checks: without "queued" it queued the text again for the next turn, so a successful
+    # steer reached the model twice (once into the running turn, once as a new turn)
+    return {"steered": True, "status": "queued"}
 
 
 async def _session_control_read(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3732,8 +3784,12 @@ async def _session_mode_set(server: GatewayServer, params: dict[str, Any]) -> di
 
 async def _config_get(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     key = str(_require(params, "key"))
-    if key == "mtime":
-        return {"mtime": 0.0}
+    if key == "mtime":  # the TUI polls this to notice an edited config.yaml; a constant 0 made hot reload dead
+        newest = 0.0
+        for path in (_user_cfg(), _proj_cfg(default_project_dir())):
+            with contextlib.suppress(OSError):
+                newest = max(newest, path.stat().st_mtime)
+        return {"mtime": newest}
     if key == "focus_view":  # the TUI reads display.focus_mode (setup: "Focus mode on by default?") under this name
         return {"value": "1" if server.config.display.focus_mode else "0"}
     if tui_display.handles(key):

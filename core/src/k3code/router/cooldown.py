@@ -51,6 +51,9 @@ _NETWORK_COOLDOWN_ENV = "K3CODE_NETWORK_COOLDOWN_SECONDS"
 # Exponential fallback when the provider declares no reset: 60 s → 2 m → 4 m … capped.
 _BASE_COOLDOWN_SECONDS = 60.0
 _MAX_COOLDOWN_SECONDS = 14400.0  # 4 h, carried over from Hermes
+#: The longest reset a provider may declare (a weekly usage limit is real; `Retry-After: 86400000` armed a cooldown
+#: of nearly three years that outlived every config fix and, as a wall-clock time, overflowed time.localtime).
+_MAX_PROVIDER_RESET_SECONDS = 7 * 86400.0
 
 
 def network_cooldown_seconds() -> float:
@@ -324,4 +327,4 @@ def _provider_reset_delay(retry_after: Any) -> float | None:
         return None
     if not math.isfinite(delay) or delay <= 0:
         return None
-    return delay
+    return min(delay, _MAX_PROVIDER_RESET_SECONDS)

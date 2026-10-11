@@ -166,11 +166,14 @@ class _CompactCommand(CommandDef):
             return {"type": "message", "message": "No active session."}
         if live.turn_in_flight:  # the running turn's persist would overwrite the summary
             return {"type": "message", "message": "A turn is running in this session; /compact when it ends."}
-        before, tokens_before = len(live.messages), ctx._request_tokens(live)
-        try:
-            folded = await ctx.compact_session(live, instructions=arg)
-        except Exception as e:  # noqa: BLE001 - e.g. every provider rate-limited
-            return {"type": "message", "message": f"Compact failed: {e}"}
+        # Holding the session's turn lock keeps a prompt typed during the summary call from starting a turn on the old
+        # history, whose persist would put the uncompacted messages back. It runs once the summary is stored.
+        async with live.turn_lock:
+            before, tokens_before = len(live.messages), ctx._request_tokens(live)
+            try:
+                folded = await ctx.compact_session(live, instructions=arg)
+            except Exception as e:  # noqa: BLE001 - e.g. every provider rate-limited
+                return {"type": "message", "message": f"Compact failed: {e}"}
         if not folded:
             return {"type": "message", "message": f"Nothing to compact ({before} messages)."}
         ctx.emit_context(live)

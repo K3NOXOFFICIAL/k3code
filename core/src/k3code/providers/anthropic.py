@@ -211,7 +211,9 @@ def _add_cache_breakpoints(payload: dict[str, Any], ttl: str = "5m") -> None:
     if payload.get("tools"):
         payload["tools"][-1] = {**payload["tools"][-1], "cache_control": marker}
     messages = payload["messages"]
-    if messages:
+    # A call without tools (title, classifier, judge, compaction summary...) is asked once: the newest message is never
+    # read back, so marking it only added the 25% cache-write surcharge to its whole input.
+    if messages and payload.get("tools"):
         messages[-1] = {**messages[-1], "content": with_cache_breakpoint(messages[-1]["content"], ttl)}
 
 

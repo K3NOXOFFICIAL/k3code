@@ -46,6 +46,9 @@ from k3code.router.classifier import (
 )
 from k3code.router.cooldown import CooldownStore, key_fingerprint
 
+#: The shortest wait between two attempts at one endpoint, whatever Retry-After says.
+MIN_RETRY_DELAY = 0.5
+
 logger = logging.getLogger(__name__)
 
 # ── Chain entries ──────────────────────────────────────────────────────
@@ -402,7 +405,7 @@ class Router:
     def _backoff_for(self, classified, attempt: int) -> float:
         """Jittered backoff, or the Retry-After window (when short enough to sleep on)."""
         if classified.retry_after is not None and classified.retry_after <= self.max_inline_wait:
-            return max(0.0, float(classified.retry_after))
+            return max(MIN_RETRY_DELAY, float(classified.retry_after))  # "Retry-After: 0" must not mean no wait at all
         return jittered_backoff(attempt, base_delay=self.base_delay, max_delay=self.max_delay)
 
     def _skip_in_cooldown(self, entry: ChainEntry, model: str) -> float | None:

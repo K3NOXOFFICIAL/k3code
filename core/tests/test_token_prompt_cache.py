@@ -52,11 +52,15 @@ def test_the_anthropic_payload_marks_system_last_tool_and_newest_message():
 def test_the_moving_breakpoint_follows_a_plain_user_message_and_never_lands_on_empty_text():
     p = AnthropicProvider(name="a", api_key="k")
     msgs = [Message(role="system", content="S"), Message(role="user", content="hello")]
-    payload = p._payload(msgs, [], "claude-test", max_tokens=100, temperature=None)
+    payload = p._payload(msgs, TOOLS, "claude-test", max_tokens=100, temperature=None)
     assert payload["messages"][-1]["content"] == [
         {"type": "text", "text": "hello", "cache_control": {"type": "ephemeral"}}
     ]
-    assert "tools" not in payload and breakpoints(payload) == 2
+    assert breakpoints(payload) == 3
+    # a call without tools (title, classifier, judge, summary) is asked once: the newest message is never read back, so
+    # it does not carry the cache-write surcharge; the system prompt still does
+    once = p._payload(msgs, [], "claude-test", max_tokens=100, temperature=None)
+    assert once["messages"][-1]["content"] == "hello" and "tools" not in once and breakpoints(once) == 1
     empty = p._payload([Message(role="user", content="")], [], "claude-test", max_tokens=100, temperature=None)
     assert breakpoints(empty) == 0 and "system" not in empty
     silent = [*conversation()[:3], Message(role="tool", content="", tool_call_id="c1", name="read")]

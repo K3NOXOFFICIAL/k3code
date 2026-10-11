@@ -221,7 +221,11 @@ class LearningHub:
         gotchas.append_gotcha(path, line)
         self._propose_gotcha(session, pid, tool, sig, hint, line)
         text = f"Noted for reminders in this project: {line} (accept its card to add it to the system prompt)"
-        session.emit("notification", {"session_id": session.session_id, "text": text})
+        # notification.show is the event the TUI shows; "notification" had no handler and the notice was dropped
+        session.emit(
+            "notification.show",
+            {"session_id": session.session_id, "text": text, "level": "info", "kind": "ttl", "ttl_ms": 15000},
+        )
 
     # ── proposals ──
 
@@ -454,7 +458,7 @@ class LearningHub:
     def _notify(self, text: str) -> None:
         emit = getattr(self.server, "emit", None)
         if emit is not None:
-            emit("notification", {"text": text})
+            emit("notification.show", {"text": text, "level": "info", "kind": "ttl", "ttl_ms": 15000})
 
     async def maintenance(self, session: Any = None, *, force: bool = False) -> dict[str, Any]:
         """Daily distill + curate, weekly optimizer (opt-in). Cheap tier; safe to call often."""

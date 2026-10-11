@@ -90,6 +90,8 @@ class PlanFirst:
 
     def gate_applies(self, session: Any) -> bool:
         cfg = self.cfg
+        if getattr(session, "goal_continuation", False):
+            return False  # the goal's next turn is the same task, already classified and planned on its first turn
         if session.background and not cfg["gate_unattended"]:
             return False  # unattended runs are pre-approved: nobody is there to approve a plan
         override = getattr(session, "scope_override", None)

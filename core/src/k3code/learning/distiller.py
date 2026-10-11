@@ -213,6 +213,7 @@ async def polish(caller: Any, prefs: list[Preference], *, session_id: str = "") 
             TaskKind.CLASSIFICATION,
             [Message(role="system", content=DISTILL_SYSTEM), Message(role="user", content=payload)],
             session_id=session_id,
+            escalate=False,  # best effort: an outage of the cheap tier is not worth a call on the main one
             max_tokens=700,
             timeout=30,
         )

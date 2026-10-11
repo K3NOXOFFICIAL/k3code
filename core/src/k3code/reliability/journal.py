@@ -78,6 +78,23 @@ class ToolJournal:
         ensure_private_dir(self.dir)  # tool args and results: 0700/0600 whatever the umask
         self.path = self.dir / f"{session}.jsonl"
         self._fh = private_file(self.path).open("a", encoding="utf-8")
+        self._end_torn_line()
+
+    def _end_torn_line(self) -> None:
+        """A process killed in the middle of a record leaves a line with no newline; the next record appended would join
+        it and be lost with it (read_all skips what does not parse). Start a new line first."""
+        try:
+            with self.path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                if f.tell() == 0:
+                    return
+                f.seek(-1, os.SEEK_END)
+                torn = f.read(1) != b"\n"
+        except OSError:
+            return
+        if torn:
+            self._fh.write("\n")
+            self._fh.flush()
 
     def close(self) -> None:
         if self._fh and not self._fh.closed:

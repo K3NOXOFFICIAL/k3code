@@ -38,7 +38,10 @@ async def test_steer_reaches_the_running_loop_and_survives_the_persist(tmp_path,
     await call(server, "session.create", {"cwd": str(tmp_path)})
     await call(server, "prompt.submit", {"text": "do it"})
     await asyncio.wait_for(provider.entered.wait(), 5)
-    assert (await call(server, "session.steer", {"text": "also say bye"}))["steered"] is True
+    reply = await call(server, "session.steer", {"text": "also say bye"})
+    # the TUI treats any reply without status "queued" as rejected and queues the text again for the next turn: a
+    # successful steer used to reach the model twice
+    assert reply["steered"] is True and reply["status"] == "queued"
     provider.gate.set()
     await asyncio.wait_for(server.session.turn_task, 20)
     second = provider.seen[1]

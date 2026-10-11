@@ -204,7 +204,8 @@ class Settings(BaseModel):
     task_tiers: dict[str, str] = Field(default_factory=dict)
     # M5 learning: see k3code.learning.DEFAULTS (enabled, perm_min_approvals, optimizer: {...}, ...)
     learning: dict[str, Any] = Field(default_factory=dict)
-    # M4a autonomy: plan_first, gate_modes, advisor_auto, proposals, escalate_after, ...
+    # M4a autonomy: plan_first, gate_modes, advisor_on_plan, advisor_on_goal, advisor_modes, proposals,
+    # escalate: {tool_errors}, max_tool_errors, ... (the keys and defaults are in k3code.autonomy.DEFAULTS)
     autonomy: dict[str, Any] = Field(default_factory=dict)
     # M4b: ultracode: {max_tokens, max_agents, min_scope}; research: {searxng_url, max_subquestions, ...}
     # min_scope: with the ultracode mode on (/ultracode on), a prompt rated at least this runs the pipeline.

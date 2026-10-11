@@ -408,6 +408,8 @@ mcp:
     search: {url: "https://example.org/mcp"}
 ```
 
+`update:` takes `channel` (`stable` or `dev`), `repo` (the GitHub repository, `owner/name`), `url` (the git remote an `install.sh --from-git` install updates from), `source` (a checkout to update from) and `api` (a mirror of the releases API; the environment variable `K3CODE_UPDATE_API` wins). `reliability.max_park_seconds` (default 600) is the longest wait between attempts while every provider is down.
+
 `descriptions` is optional on each provider; for a model key that several providers define, the first non-empty description is shown. `ultracode.min_scope` must be one of the five scope names, and an unknown key under `ultracode` or `wake_words` is ignored with a warning. See [Ultracode mode](#ultracode-mode) and [Wake words](#wake-words).
 
 ### Hooks

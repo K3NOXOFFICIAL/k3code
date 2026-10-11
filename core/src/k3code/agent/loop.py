@@ -338,6 +338,21 @@ class AgentLoop:
                         await aclose()  # closes the HTTP response: the provider stops generating
                     except Exception:
                         logger.debug("closing the interrupted stream failed", exc_info=True)
+            if (
+                final_message
+                and not final_message.tool_calls
+                and not (final_message.content or "").strip()
+                and final_message.stop_reason in ("content_filter", "refusal")
+            ):
+                # the provider ended the answer without a word: an empty reply looked like a successful, silent turn
+                note = (
+                    f"[The provider stopped this answer without any text (stop reason: {final_message.stop_reason}). "
+                    "Rephrase the request or try another model.]"
+                )
+                final_message.content = note
+                text_parts.append(note)
+                if self.on_text_delta:
+                    await self.on_text_delta(note)
             if final_message:
                 messages.append(final_message)
                 self.reliability.save_transcript(messages)
@@ -555,6 +570,11 @@ class AgentLoop:
         except Exception as e:
             logger.exception("Tool %s failed", tool_call.name)
             result = {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
+        except asyncio.CancelledError:
+            # /stop: the call ended (its process group is killed); an intent with no done would be reported as an
+            # unresolved crash by `k3code doctor` until the journal is pruned
+            self.reliability.journal_done(tool_call.id, {"error": "cancelled"})
+            raise
         # M2: completion digest, so resume knows this call finished.
         self.reliability.journal_done(tool_call.id, result)
         if read_key is not None and "first" in result:

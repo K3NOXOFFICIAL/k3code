@@ -171,6 +171,7 @@ async def propose(
             TaskKind.CLASSIFICATION,
             [Message(role="system", content=system), Message(role="user", content=context[-6000:])],
             session_id=session_id,
+            escalate=False,  # best effort: an outage of the cheap tier is not worth a call on the main one
             max_tokens=500,
             timeout=30,
         )

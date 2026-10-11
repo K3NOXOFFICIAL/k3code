@@ -74,7 +74,7 @@ class ScopeVerdict:
     reason: str = ""
     #: classifier | override | fallback
     source: str = "classifier"
-    #: large/huge: the M4b fan-out executor could take this; for now it runs sequentially
+    #: large/huge with parts that do not depend on each other: the fan-out executor (autonomy/fanout.py) takes it
     fanout_candidate: bool = False
 
     @property

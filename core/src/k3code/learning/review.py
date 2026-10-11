@@ -81,6 +81,7 @@ async def review_session(
             TaskKind.CLASSIFICATION,
             [Message(role="system", content=SYSTEM), Message(role="user", content=transcript(messages))],
             session_id=session_id,
+            escalate=False,  # best effort: an outage of the cheap tier is not worth a call on the main one
             max_tokens=900,
             timeout=45,
         )

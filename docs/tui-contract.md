@@ -44,11 +44,11 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `clipboard.paste` | `{session_id}` | `{text?, images?, files?}` | ✅ | Paste from clipboard |
 | `paste.collapse` | `{text, session_id?}` | `{path, chars, lines}` | ✅ | A large paste shown as a token: stored 0600 at `$K3CODE_HOME/pastes/<session>/<sha256[:16]>.txt` (the caller's live session; removed with the session) |
 | `process.list` | `{session_id}` | `{processes: ProcessEntry[]}` | ✅ | Processes dock (polled): running foreground `bash` commands and background jobs. Each entry: `session_id` (the process's own row id: the job id, or `fg<pid>`), `kind`, `pid`, `command`, `cwd`, `started`, `status` (`running`/`exited`), `uptime_seconds`, `exit_code`, `exited_at`, `completion_reason`, `output_preview` (last 2 KiB) |
-| `image.attach` | `{session_id, data_uri, name?}` | `{id}` | ✅ | Attach image |
-| `image.attach_bytes` | `{session_id, base64, mime, name?}` | `{id}` | | Attach image from bytes |
+| `image.attach` | `{session_id, data_uri, name?}` | `{id}` | | Attach image. Not supported yet: the core answers with an error (M1) |
+| `image.attach_bytes` | `{session_id, base64, mime, name?}` | `{id}` | | Attach image from bytes. Not supported yet: the core answers with an error (M1) |
 | `image.detach` | `{session_id, path}` | `{ok: boolean}` | ✅ | Detach image |
-| `file.attach` | `{session_id, path, name?}` | `{id}` | | Attach file |
-| `pdf.attach` | `{session_id, data_uri, name?}` | `{id}` | | Attach PDF |
+| `file.attach` | `{session_id, path, name?}` | `{id}` | | Attach file. Not supported yet: the core answers with an error (M1) |
+| `pdf.attach` | `{session_id, data_uri, name?}` | `{id}` | | Attach PDF. Not supported yet: the core answers with an error (M1) |
 | `input.detect_drop` | `{session_id, paths[]}` | `{images[], files[]}` | ✅ | Detect dropped files |
 | `command.dispatch` | `{name, arg?, session_id}` | `CommandResult` | ✅ | Slash commands |
 | `slash.exec` | `{command, session_id}` | `SlashExecResponse` | ✅ | Internal slash exec |

@@ -38,6 +38,7 @@ async def make_title(caller: Any, first_message: str, *, session_id: str = "") -
             TaskKind.TITLE,
             [Message(role="system", content=TITLE_SYSTEM), Message(role="user", content=first_message[:2000])],
             session_id=session_id,
+            escalate=False,  # best effort: an outage of the cheap tier is not worth a call on the main one
             max_tokens=24,
             timeout=20,
         )
