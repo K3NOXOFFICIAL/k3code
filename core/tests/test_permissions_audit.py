@@ -297,7 +297,7 @@ STDIN_FED_CONTROLS = [
 
 @pytest.mark.parametrize("cmd", STDIN_FED_CONTROLS)
 def test_data_fed_to_a_command_is_not_a_script(proj: Path, cmd: str) -> None:
-    assert hardline.check(cmd, cwd=str(proj), home="/home/alice") is None, cmd
+    assert hardline.check(cmd, cwd=str(proj), home="/home/user") is None, cmd
     d = _bash(cmd, "auto", proj)
     assert not d.needs_human, cmd
 
@@ -393,7 +393,7 @@ def test_wrappers_outside_the_old_list_do_not_hide_rm(proj: Path, cmd: str) -> N
     ],
 )
 def test_those_wrappers_around_harmless_commands_stay_clear_of_the_hardline(cmd: str) -> None:
-    assert hardline.check(cmd, cwd="/work/proj", home="/home/alice") is None, cmd
+    assert hardline.check(cmd, cwd="/work/proj", home="/home/user") is None, cmd
 
 
 ROOT_AND_HOME_TARGETS = [
@@ -418,13 +418,13 @@ ROOT_AND_HOME_TARGETS = [
 @pytest.mark.parametrize("cmd", ROOT_AND_HOME_TARGETS)
 def test_glob_targets_under_the_protected_roots_are_denied(proj: Path, cmd: str) -> None:
     _assert_hardline(cmd, proj)
-    assert hardline.check(cmd, cwd=str(proj), home="/home/alice") is not None, cmd
+    assert hardline.check(cmd, cwd=str(proj), home="/home/user") is not None, cmd
 
 
 def test_a_glob_under_an_explicit_home_is_denied() -> None:
-    assert hardline.check("rm -rf /home/alice/.*", cwd="/work/proj", home="/home/alice") == "rm-rf-home"
-    assert hardline.check("rm -rf /home/alice/*", cwd="/work/proj", home="/home/alice") == "rm-rf-home"
-    assert hardline.check("rm -rf /home/alice/proj/*", cwd="/work/proj", home="/home/alice") is None
+    assert hardline.check("rm -rf /home/user/.*", cwd="/work/proj", home="/home/user") == "rm-rf-home"
+    assert hardline.check("rm -rf /home/user/*", cwd="/work/proj", home="/home/user") == "rm-rf-home"
+    assert hardline.check("rm -rf /home/user/proj/*", cwd="/work/proj", home="/home/user") is None
 
 
 @pytest.mark.parametrize(
@@ -438,12 +438,12 @@ def test_a_glob_under_an_explicit_home_is_denied() -> None:
         "rm -rf ~/projects/old",
         "rm -rf ~/.cache/pip",
         "rm -rf ~/scratch/*",
-        "rm -rf /home/alice/proj/dist",
+        "rm -rf /home/user/proj/dist",
         "rm -rf build node_modules",
     ],
 )
 def test_narrower_targets_are_not_hardline(cmd: str) -> None:
-    assert hardline.check(cmd, cwd="/home/alice/proj", home="/home/alice") is None, cmd
+    assert hardline.check(cmd, cwd="/home/user/proj", home="/home/user") is None, cmd
 
 
 RELATIVE_TARGETS = [
@@ -453,20 +453,20 @@ RELATIVE_TARGETS = [
     ("rm -rf ./", "/", "rm-rf-root"),
     ("rm -rf etc", "/", "rm-rf-root"),
     ("rm -rf .*", "/", "rm-rf-root"),
-    ("rm -rf *", "/home/alice", "rm-rf-home"),
-    ("rm -rf .*", "/home/alice", "rm-rf-home"),
-    ("rm -rf .", "/home/alice", "rm-rf-home"),
-    ("rm -rf ..", "/home/alice/proj", "rm-rf-home"),
-    ("rm -rf ../", "/home/alice/proj", "rm-rf-home"),
-    ("rm -rf ../..", "/home/alice/proj", "rm-rf-home"),
-    ("rm -rf ../*", "/home/alice/proj", "rm-rf-home"),
+    ("rm -rf *", "/home/user", "rm-rf-home"),
+    ("rm -rf .*", "/home/user", "rm-rf-home"),
+    ("rm -rf .", "/home/user", "rm-rf-home"),
+    ("rm -rf ..", "/home/user/proj", "rm-rf-home"),
+    ("rm -rf ../", "/home/user/proj", "rm-rf-home"),
+    ("rm -rf ../..", "/home/user/proj", "rm-rf-home"),
+    ("rm -rf ../*", "/home/user/proj", "rm-rf-home"),
     ("rm -rf *", "/usr", "rm-rf-root"),
     ("rm -rf $PWD/*", "/etc", "rm-rf-root"),
     ("cd / && rm -rf *", "/work/proj", "rm-rf-root"),
     ("cd /; rm -rf .", "/work/proj", "rm-rf-root"),
     ("cd ~ && rm -rf *", "/work/proj", "rm-rf-home"),
     ("cd && rm -rf .*", "/work/proj", "rm-rf-home"),
-    ("cd .. && rm -rf *", "/home/alice/proj", "rm-rf-home"),
+    ("cd .. && rm -rf *", "/home/user/proj", "rm-rf-home"),
     ("cd /usr && rm -rf *", "/work/proj", "rm-rf-root"),
     ("pushd / && rm -rf *", "/work/proj", "rm-rf-root"),
     ("bash -c 'cd / && rm -rf *'", "/work/proj", "rm-rf-root"),
@@ -476,7 +476,7 @@ RELATIVE_TARGETS = [
 
 @pytest.mark.parametrize(("cmd", "cwd", "name"), RELATIVE_TARGETS)
 def test_relative_rm_targets_resolve_against_the_working_directory(cmd: str, cwd: str, name: str) -> None:
-    assert hardline.check(cmd, cwd=cwd, home="/home/alice") == name, (cmd, cwd)
+    assert hardline.check(cmd, cwd=cwd, home="/home/user") == name, (cmd, cwd)
 
 
 @pytest.mark.parametrize(
@@ -485,20 +485,20 @@ def test_relative_rm_targets_resolve_against_the_working_directory(cmd: str, cwd
         ("rm -rf *", "/work/proj"),
         ("rm -rf .", "/work/proj"),
         ("rm -rf ..", "/work/proj"),
-        ("rm -rf *", "/home/alice/proj"),
-        ("rm -rf .*", "/home/alice/proj"),
-        ("rm -rf ../proj", "/home/alice/proj"),
+        ("rm -rf *", "/home/user/proj"),
+        ("rm -rf .*", "/home/user/proj"),
+        ("rm -rf ../proj", "/home/user/proj"),
         ("rm -rf build", "/"),
         ("rm -rf tmp/*", "/"),
         ("cd build && rm -rf *", "/work/proj"),
         ("cd /tmp/x && rm -rf *", "/work/proj"),
         ("cd ~/proj && rm -rf *", "/work/proj"),
         ("cd src; rm -rf node_modules", "/work/proj"),
-        ("rm -rf *", "/home/alice/proj/build"),
+        ("rm -rf *", "/home/user/proj/build"),
     ],
 )
 def test_relative_targets_in_an_ordinary_directory_stay_allowed(cmd: str, cwd: str) -> None:
-    assert hardline.check(cmd, cwd=cwd, home="/home/alice") is None, (cmd, cwd)
+    assert hardline.check(cmd, cwd=cwd, home="/home/user") is None, (cmd, cwd)
 
 
 def test_the_engine_passes_the_commands_directory_to_the_hardline(tmp_path: Path, home: Path) -> None:
@@ -860,7 +860,7 @@ NEW_HARDLINE_CONTROLS = [
 
 @pytest.mark.parametrize("cmd", NEW_HARDLINE_CONTROLS)
 def test_nearby_ordinary_commands_are_not_hardline(cmd: str) -> None:
-    assert hardline.check(cmd, cwd="/work/proj", home="/home/alice") is None, cmd
+    assert hardline.check(cmd, cwd="/work/proj", home="/home/user") is None, cmd
 
 
 FORCE_PUSH_WITHOUT_REFSPEC = [
@@ -879,7 +879,7 @@ FORCE_PUSH_WITHOUT_REFSPEC = [
 
 @pytest.mark.parametrize("cmd", FORCE_PUSH_WITHOUT_REFSPEC)
 def test_a_force_push_without_a_refspec_always_goes_to_a_human(proj: Path, cmd: str) -> None:
-    assert hardline.check(cmd, cwd=str(proj), home="/home/alice") is None  # not a hardline: a person decides
+    assert hardline.check(cmd, cwd=str(proj), home="/home/user") is None  # not a hardline: a person decides
     _assert_needs_human(cmd, proj)
     allow = [Rule(tool="bash", pattern="git push *", action="allow")]
     d = _bash(cmd, "auto", proj, rules=allow)
