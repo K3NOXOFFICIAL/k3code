@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import shutil
 import time
 from collections.abc import AsyncIterator, Callable
@@ -141,7 +142,10 @@ class GovernorConfig:
     """All governor knobs, configurable via config later."""
 
     psi_io_threshold: float = 20.0  # IO some avg10 admission threshold
-    psi_path: str = "/proc/pressure"  # overridable in tests
+    #: where the PSI files are; $K3CODE_PSI_PATH moves it (tests point it at nothing, so the host's load cannot change
+    #: a width they check; a missing path reads as "no pressure")
+    psi_path: str = field(default_factory=lambda: os.environ.get("K3CODE_PSI_PATH") or "/proc/pressure")
+    psi_cpu_threshold: float = 50.0  # CPU some avg10 above which a new fan-out starts one child narrower
     max_io_heavy: int = 2
     max_total: int = 4
     max_parallel_agents: int = 3  # sub-agent fan-out width; IO-heavy work is capped at max_io_heavy
@@ -195,6 +199,13 @@ class Governor:
         """IO ``some avg10``; 0 when PSI is unavailable (do not block on unknown)."""
         psi = self.read_psi("io")
         return psi.get("some_avg10", 0.0)
+
+    def pressure_shrink(self) -> int:
+        """1 when the machine is under load (CPU ``some avg10`` above ``psi_cpu_threshold`` or IO at its admission
+        threshold), else 0: a fan-out that starts now runs one child fewer at a time. Read once, when it starts;
+        0 where there is no PSI (do not shrink on unknown)."""
+        cpu = self.read_psi("cpu").get("some_avg10", 0.0)
+        return 1 if cpu > self.config.psi_cpu_threshold or not self.io_admission_ok() else 0
 
     def agent_cap(self, requested: int, *, io_heavy: bool = False, ceiling: int | None = None) -> int:
         """How many sub-agents may run at once: the request, bounded by ``ceiling`` (the session's

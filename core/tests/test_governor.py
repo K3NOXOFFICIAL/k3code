@@ -328,3 +328,33 @@ def test_sessions_built_by_reliability_share_the_process_day_ledger():
 
     a, b = Reliability.from_settings(None, session="a"), Reliability.from_settings(None, session="b")
     assert a.governor.day_ledger is b.governor.day_ledger is DAY_LEDGER
+
+
+# ── pressure shrink: a fan-out that starts on a loaded machine runs one child fewer ──
+
+
+def test_cpu_pressure_above_the_threshold_shrinks_by_one(psi_dir: Path, tmp_path: Path):
+    _write_psi(psi_dir, "cpu", "some avg10=50.00 avg60=1.00 avg300=1.00 total=1\n")
+    assert _gov(psi_dir, tmp_path).pressure_shrink() == 0  # at the threshold is not above it
+    _write_psi(psi_dir, "cpu", "some avg10=50.01 avg60=1.00 avg300=1.00 total=1\n")
+    assert _gov(psi_dir, tmp_path).pressure_shrink() == 1
+    assert _gov(psi_dir, tmp_path, psi_cpu_threshold=80.0).pressure_shrink() == 0
+
+
+def test_io_pressure_at_its_admission_threshold_shrinks_by_one(psi_dir: Path, tmp_path: Path):
+    _write_psi(psi_dir, "io", "some avg10=19.99 avg60=1.00 avg300=1.00 total=1\n")
+    assert _gov(psi_dir, tmp_path).pressure_shrink() == 0
+    _write_psi(psi_dir, "io", "some avg10=20.00 avg60=1.00 avg300=1.00 total=1\n")
+    assert _gov(psi_dir, tmp_path).pressure_shrink() == 1
+
+
+def test_no_psi_files_means_no_shrink(psi_dir: Path, tmp_path: Path):
+    assert _gov(psi_dir, tmp_path).pressure_shrink() == 0  # the directory does not exist
+
+
+def test_the_psi_path_can_be_moved_with_the_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    _write_psi(tmp_path / "psi", "cpu", "some avg10=99.00 avg60=1.00 avg300=1.00 total=1\n")
+    monkeypatch.setenv("K3CODE_PSI_PATH", str(tmp_path / "psi"))
+    assert Governor(GovernorConfig(home=tmp_path / "h")).pressure_shrink() == 1
+    monkeypatch.setenv("K3CODE_PSI_PATH", str(tmp_path / "nowhere"))
+    assert Governor(GovernorConfig(home=tmp_path / "h")).pressure_shrink() == 0

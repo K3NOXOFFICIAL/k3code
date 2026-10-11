@@ -13,6 +13,8 @@ from k3code.goals import GoalManager, parse_judge_response
 from m1cmd_helpers import cmd, frames_of, git_repo, make_server, new_session, submit_and_wait
 
 NO_ADVISOR = {"advisor_on_goal": False}
+#: the advisor veto on "done" runs in the modes of advisor_modes (auto by default); these tests run in ask mode
+ADVISOR_EVERYWHERE = {"advisor_modes": ["ask", "default", "auto-edit", "plan", "auto", "yolo"]}
 
 FINDINGS = json.dumps(
     {
@@ -275,7 +277,9 @@ async def test_goal_advisor_blocking_issue_keeps_goal_going(tmp_path, monkeypatc
     # turn 1, advisor (blocking), turn 2, advisor (clear) → done
     blocking = '{"blocking": true, "issues": ["tests not run"]}'
     clear = '{"blocking": false, "issues": []}'
-    server, provider = make_server(tmp_path, monkeypatch, replies=["claim done", blocking, "ran the tests", clear])
+    server, provider = make_server(
+        tmp_path, monkeypatch, replies=["claim done", blocking, "ran the tests", clear], autonomy=ADVISOR_EVERYWHERE
+    )
     server.goal_judge = scripted_judge(["done"])
     sid = await new_session(server, tmp_path)
     await run_goal(server, sid, "/goal ship it")
@@ -288,7 +292,9 @@ async def test_goal_advisor_blocking_issue_keeps_goal_going(tmp_path, monkeypatc
 
 
 async def test_goal_advisor_failure_never_blocks_done(tmp_path, monkeypatch):
-    server, provider = make_server(tmp_path, monkeypatch, replies=["claim done", "not json at all"])
+    server, provider = make_server(
+        tmp_path, monkeypatch, replies=["claim done", "not json at all"], autonomy=ADVISOR_EVERYWHERE
+    )
     server.goal_judge = scripted_judge(["done"])
     sid = await new_session(server, tmp_path)
     await run_goal(server, sid, "/goal ship it")
@@ -304,4 +310,19 @@ async def test_goal_judge_goes_through_model_caller_with_goal_judge_kind(tmp_pat
     await run_goal(server, sid, "/goal anything")
     rows = server.usage._db.execute("SELECT tier FROM events WHERE kind='call' AND task_kind='goal_judge'").fetchall()
     assert rows == [("cheap",)]
+    await server.close()
+
+
+async def test_the_goal_advisor_runs_only_in_the_modes_of_advisor_modes(tmp_path, monkeypatch):
+    """It ignored advisor_modes: every goal, in every permission mode, paid a strong-tier call at each "done"."""
+    server, provider = make_server(tmp_path, monkeypatch, replies=["claim done", "never asked"])
+    server.goal_judge = scripted_judge(["done"])
+    sid = await new_session(server, tmp_path)
+    await run_goal(server, sid, "/goal ship it")
+    assert provider.n == 1  # the turn only: no advisor call in the default (ask) mode
+    assert server.goal_manager(server.session).state.status == "done"
+    live = server.session
+    assert server._goal_reviewer(live) is None
+    server.config.autonomy = {"advisor_modes": ["default"]}  # "default" is the ask mode
+    assert server._goal_reviewer(live) is not None
     await server.close()

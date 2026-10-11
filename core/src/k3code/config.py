@@ -117,6 +117,10 @@ class McpServerConfig(BaseModel):
     #: read when the server connects, so the secret itself never appears in config.yaml
     bearer_env: str = ""
     enabled: bool = True
+    #: the server's tools change nothing another call could observe (a search, a lookup): calls to it in one model
+    #: reply run at the same time instead of one after another. Off unless you say so; a call that would ask for
+    #: approval still runs alone.
+    parallel_safe: bool = False
 
 
 def env_value(name: str) -> str:

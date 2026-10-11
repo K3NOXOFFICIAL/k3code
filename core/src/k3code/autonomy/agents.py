@@ -70,9 +70,16 @@ class AgentLimits:
 
 
 def whole_number(value: Any, *, lo: int, hi: int | None = None) -> int | None:
-    """``value`` as an int when it is a whole number in range (a bool, a fraction or a string is not), else None."""
+    """``value`` as an int when it is a whole number in range, else None. A float with no fraction counts, and so does
+    a string of digits (``max_agents: "12"``, which a hand-written file or an environment variable gives, and which
+    ``int()`` has always read); a bool, a fraction, a negative or any other text does not."""
     if isinstance(value, bool):
         return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.isascii() or not text.isdigit():
+            return None
+        value = int(text)
     if isinstance(value, float):
         if not value.is_integer():
             return None

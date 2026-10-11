@@ -71,13 +71,16 @@ def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
     if not tools and not any(cfg.enabled for cfg in mcp.servers.values()):
         return
 
-    def make_handler(qualified: str) -> Any:
+    def make_handler(qualified: str, parallel: bool) -> Any:
         async def handler(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
             return await mcp.call(qualified, arguments)
 
+        if parallel:  # the server is declared read-only (`parallel_safe`): AgentLoop may batch its calls
+            handler.parallel_when = lambda _arguments: True  # type: ignore[attr-defined]
         return handler
 
     for t in tools:
+        server = mcp.servers.get(t.server)
         reg.register(
             ToolSpec(
                 name=t.qualified,
@@ -85,7 +88,7 @@ def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
                 parameters=t.schema or {"type": "object", "properties": {}},
                 side_effect=True,
             ),
-            make_handler(t.qualified),
+            make_handler(t.qualified, bool(server and server.parallel_safe)),
             deferred=True,
         )
 

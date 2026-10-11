@@ -222,3 +222,42 @@ async def test_a_predicate_that_gets_odd_arguments_never_breaks_the_turn(tmp_pat
     loop.tools.register(ToolSpec(name="job", description="job", parameters=PARAMS, side_effect=True), handler)
     results = await run(loop)
     assert [m.tool_call_id for m in results] == ["c0", "c1"]
+
+
+class _FakeMcp:
+    """Just enough of McpManager for register_mcp_tools: two servers, one declared read-only."""
+
+    def __init__(self) -> None:
+        from k3code.config import McpServerConfig
+        from k3code.mcpclient import McpToolInfo
+
+        self.servers = {"ro": McpServerConfig(command="x", parallel_safe=True), "rw": McpServerConfig(command="x")}
+        self._tools = [McpToolInfo(s, "look", "d", {"type": "object", "properties": {}}) for s in ("ro", "rw")]
+        self.live = {"ro": 0, "rw": 0}
+        self.peak = {"ro": 0, "rw": 0}
+
+    def tools(self):
+        return self._tools
+
+    async def call(self, qualified: str, args: dict) -> dict:
+        server = qualified.split("__")[1]
+        self.live[server] += 1
+        self.peak[server] = max(self.peak[server], self.live[server])
+        await asyncio.sleep(0.05)
+        self.live[server] -= 1
+        return {"content": qualified}
+
+
+@pytest.mark.asyncio
+async def test_calls_to_a_parallel_safe_mcp_server_overlap_and_those_to_others_do_not(tmp_path):
+    from k3code.extratools import register_mcp_tools
+
+    mcp = _FakeMcp()
+    calls = [ToolCall(id=f"{s}{i}", name=f"mcp__{s}__look", arguments={}) for s in ("ro", "rw") for i in range(3)]
+    loop = make_loop(tmp_path, [calls])
+    register_mcp_tools(loop.tools, mcp)
+    loop.tools.activate(["mcp__ro__look", "mcp__rw__look"])
+    results = await run(loop)
+    assert [m.tool_call_id for m in results] == [c.id for c in calls]  # in call order, all answered
+    assert mcp.peak["ro"] == 3  # the read-only server's three calls ran together
+    assert mcp.peak["rw"] == 1  # an ordinary server's did not

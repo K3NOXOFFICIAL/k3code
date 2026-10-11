@@ -2833,9 +2833,11 @@ class GatewayServer:
         return complete
 
     def _goal_reviewer(self, session: LiveSession) -> Any:
-        """M4a: a strong-tier advisor veto on ``done`` (``autonomy.advisor_on_goal``); None when disabled."""
+        """M4a: a strong-tier advisor veto on ``done`` (``autonomy.advisor_on_goal``) in the permission modes of
+        ``autonomy.advisor_modes`` (auto by default, as for the plan critique); None when it does not apply. It used
+        to ignore the modes: every goal in every mode paid a strong-tier call at each "done"."""
         cfg = autonomy_cfg(self.config)
-        if not cfg.get("advisor_on_goal"):
+        if not self.autonomy.advisor_applies(session, "advisor_on_goal"):
             return None
 
         async def review(goal: str) -> tuple[bool, list[str]]:

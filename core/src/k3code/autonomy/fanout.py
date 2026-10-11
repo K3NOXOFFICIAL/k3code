@@ -237,6 +237,8 @@ class FanoutExecutor:
         cap = gov.agent_cap(limits.fanout_width, io_heavy=io_heavy, ceiling=limits.max_parallel)
         if width is not None:  # a sized run (see k3code.autonomy.sizing) asks for no more than it needs
             cap = max(1, min(cap, width))
+        shrink = gov.pressure_shrink() if cap > 1 else 0  # a loaded machine runs one child fewer at a time
+        cap -= shrink
         fid = f"fo-{uuid.uuid4().hex[:6]}"
         result = FanoutResult(
             fid,
@@ -251,6 +253,7 @@ class FanoutExecutor:
                 "session_id": sid,
                 "fanout_id": fid,
                 "max_parallel": cap,
+                "pressure_shrink": shrink,
                 "io_heavy": io_heavy,
                 "require_tests": need_tests,
                 "test_command": test_cmd,

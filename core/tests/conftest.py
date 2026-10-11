@@ -175,6 +175,12 @@ def _isolated_k3code_home(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_host_load(monkeypatch, tmp_path_factory):
+    """The host's CPU and IO pressure must not change how wide a test's fan-out runs (a loaded box read 65 here)."""
+    monkeypatch.setenv("K3CODE_PSI_PATH", str(tmp_path_factory.mktemp("no-psi") / "pressure"))
+
+
+@pytest.fixture(autouse=True)
 def _no_real_dns(monkeypatch):
     """The SSRF guard resolves hostnames: tests never touch DNS. Names resolve to a public address; IP literals
     (decimal, octal and hex forms included) still go through the real, offline parser."""

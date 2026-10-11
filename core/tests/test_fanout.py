@@ -162,6 +162,35 @@ async def test_fanout_cap_limits_parallelism(tmp_path, monkeypatch):
     assert events(server, "fanout.done")[0]["merged"] == 4
 
 
+async def test_a_fanout_that_starts_on_a_loaded_machine_runs_one_child_fewer(tmp_path, monkeypatch):
+    psi = tmp_path / "pressure"
+    psi.mkdir()
+    (psi / "cpu").write_text("some avg10=90.00 avg60=50.00 avg300=20.00 total=1\n")
+    monkeypatch.setenv("K3CODE_PSI_PATH", str(psi))
+    repo = git_repo(tmp_path / "repo")
+    subs = ["SUB-A one", "SUB-B two", "SUB-C three", "SUB-D four"]
+    server = make_fan(tmp_path, monkeypatch, steps_for(subs), repo, max_parallel=3, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    plan = events(server, "fanout.plan")[0]
+    assert plan["max_parallel"] == 2 and plan["pressure_shrink"] == 1
+    assert concurrency(server) <= 2
+    assert events(server, "fanout.done")[0]["merged"] == 4  # slower, not smaller
+
+
+async def test_a_width_of_one_is_not_shrunk_to_zero(tmp_path, monkeypatch):
+    psi = tmp_path / "pressure"
+    psi.mkdir()
+    (psi / "cpu").write_text("some avg10=90.00 avg60=50.00 avg300=20.00 total=1\n")
+    monkeypatch.setenv("K3CODE_PSI_PATH", str(psi))
+    repo = git_repo(tmp_path / "repo")
+    server = make_fan(tmp_path, monkeypatch, steps_for(["SUB-A one", "SUB-B two"]), repo, max_parallel=1)
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    plan = events(server, "fanout.plan")[0]
+    assert plan["max_parallel"] == 1 and plan["pressure_shrink"] == 0
+
+
 async def test_fanout_io_heavy_subtasks_capped_at_two(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     subs = ["SUB-A install deps", "SUB-B add docs", "SUB-C more docs"]

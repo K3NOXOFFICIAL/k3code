@@ -100,13 +100,13 @@ def test_session_limits_reads_the_sessions_meta():
     assert session_limits(cfg(), SimpleNamespace()).max_agents == 12
 
 
-@pytest.mark.parametrize("value", [0, -1, True, "abc", 65, 2.5, None])
+@pytest.mark.parametrize("value", [0, -1, True, "abc", 65, 2.5, None, "5x", "-3", "2.5", "", "٣"])
 def test_ultracode_max_agents_is_validated_when_the_config_loads(value):
     with pytest.raises(ValidationError, match=r"ultracode.max_agents must be a whole number from 1 to 64"):
         Settings(ultracode={"max_agents": value})
 
 
-@pytest.mark.parametrize("ok", [1, 12, 64, "auto", "AUTO", 3.0])
+@pytest.mark.parametrize("ok", [1, 12, 64, "auto", "AUTO", 3.0, "5", " 7 "])
 def test_ultracode_max_agents_accepts_numbers_and_auto(ok):
     assert Settings(ultracode={"max_agents": ok}).ultracode == {"max_agents": ok}  # the section is stored as written
 
@@ -209,3 +209,13 @@ def test_a_token_stop_is_marked_as_one_and_trim_never_raises_the_cap():
     assert b.max_agents == 12
     b.trim(1)
     assert b.max_agents == 3  # never below what was already taken
+
+
+def test_numeric_strings_work_as_they_did_before_the_validation_existed():
+    """`int("12")` read these before the keys were checked at load: a hand-written file or an env var gives strings."""
+    lim = agent_limits(
+        cfg(ultracode={"max_agents": "20", "max_tokens": "500000"}, autonomy={"agents": {"max_parallel": "6"}})
+    )
+    assert (lim.max_agents, lim.max_parallel) == (20, 6)
+    assert Settings(ultracode={"max_tokens": "500000"}).ultracode == {"max_tokens": "500000"}  # stored as written
+    assert clean_override({"max_agents": "9", "max_parallel": "3"}) == {"max_agents": 9, "max_parallel": 3}
