@@ -12,7 +12,7 @@ from k3code.paths import home
 
 _FM = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?", re.S)
 MAX_DEPTH = 4
-PROMPT_LIMIT = 60  # skills named in the system prompt; the rest are reachable via the skill tool
+PROMPT_LIMIT = 30  # skills named in the system prompt; the rest are reachable via the skill tool
 
 
 @dataclass
@@ -194,7 +194,7 @@ def skills_prompt(cwd: str | Path, extra_roots: list[str] | None = None, limit: 
     lines = ["## Skills", "", "Load a skill's full instructions with the `skill` tool (`name`, or `query` to search)."]
     chosen = sorted(rank_skills(skills, cwd)[:limit], key=lambda s: s.name) if len(skills) > limit else skills
     for s in chosen:
-        desc = s.description if len(s.description) <= 110 else s.description[:107] + "..."
+        desc = s.description if len(s.description) <= 90 else s.description[:87] + "..."
         lines.append(f"- {s.name}: {desc}")
     if len(skills) > limit:
         lines.append(f"- …and {len(skills) - limit} more; use `skill` with a `query` to find them.")
