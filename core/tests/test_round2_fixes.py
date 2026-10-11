@@ -426,7 +426,10 @@ async def test_the_goal_done_check_reads_only_what_happened_since_the_goal_was_s
             async for event in super().stream(messages, tools, model, max_tokens=max_tokens, temperature=temperature):
                 yield event
 
-    server, live = await seed(tmp_path, monkeypatch, Spy(), autonomy={"advisor_on_goal": True})
+    everywhere = ["default", "auto-edit", "plan", "auto", "yolo"]  # the veto runs in the modes of advisor_modes
+    server, live = await seed(
+        tmp_path, monkeypatch, Spy(), autonomy={"advisor_on_goal": True, "advisor_modes": everywhere}
+    )
     live.stored.messages = [
         {"role": "user", "content": "OLD unrelated question about css"},
         {"role": "assistant", "content": "OLD answer"},
