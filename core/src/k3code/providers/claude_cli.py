@@ -33,6 +33,7 @@ login files itself. Cost is the user's Claude plan, not an API bill.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import hashlib
 import json
@@ -57,6 +58,8 @@ _SYSTEM_FALLBACK = "You are the model behind a coding agent."
 _TOOL_BLOCK = re.compile(r"<tool_calls>\s*(.*?)\s*</tool_calls>", re.DOTALL)
 _TOOL_TAG = "<tool_calls>"
 _READ_CHUNK = 1 << 16
+_WORKDIR_PREFIX = "k3code-claude-cli."
+_LEGACY_WORKDIR_MAX_AGE_S = 24 * 3600.0  # a dir from before the pid tag: nothing says whose it is, so go by age
 _EXIT = "k3code.exit"  # the pseudo-event ``_events`` ends with: return code and stderr of the finished process
 
 _PREAMBLE = (
@@ -219,6 +222,44 @@ def _error_from_result(result: dict[str, Any] | None, stderr: str, rc: int | Non
     return ProviderError(message=text, status_code=status, body={"error": {"message": text}})
 
 
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _sweep_workdirs(now: float | None = None) -> int:
+    """Remove scratch dirs a killed or crashed run left in the temp dir (``aclose`` never ran): those tagged with a
+    pid that is gone, and untagged ones untouched for a day. Returns how many went."""
+    root = tempfile.gettempdir()
+    cutoff = (time.time() if now is None else now) - _LEGACY_WORKDIR_MAX_AGE_S
+    removed = 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith(_WORKDIR_PREFIX):
+            continue
+        tag = name[len(_WORKDIR_PREFIX) :].partition(".")
+        path = os.path.join(root, name)
+        try:
+            if tag[0].isdigit() and tag[1]:
+                stale = not _pid_alive(int(tag[0]))
+            else:
+                stale = os.stat(path).st_mtime < cutoff
+            if stale and os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 class ClaudeCliProvider(Provider):
     """Runs the ``claude`` binary once per turn (see the module docstring)."""
 
@@ -269,7 +310,9 @@ class ClaudeCliProvider(Provider):
 
     def _cwd(self) -> str:
         if not self._workdir or not os.path.isdir(self._workdir):
-            self._workdir = tempfile.mkdtemp(prefix="k3code-claude-cli.")
+            _sweep_workdirs()
+            self._workdir = tempfile.mkdtemp(prefix=f"{_WORKDIR_PREFIX}{os.getpid()}.")
+            atexit.register(shutil.rmtree, self._workdir, ignore_errors=True)
         return self._workdir
 
     def _command_line(
