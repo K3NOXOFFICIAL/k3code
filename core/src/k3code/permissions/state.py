@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -12,9 +13,12 @@ from typing import Any
 import yaml
 
 from k3code import trust
+from k3code.redact import scrub_text
 
 from .engine import Decision, PermissionMode, decide
 from .rules import Rule, from_config
+
+_log = logging.getLogger(__name__)
 
 MODE_CYCLE = [PermissionMode.DEFAULT, PermissionMode.ACCEPT_EDITS, PermissionMode.PLAN, PermissionMode.AUTO]
 
@@ -55,12 +59,21 @@ def project_config_path(cwd: str | Path) -> Path:
 
 def persist_rules(path: Path, rules: list[Rule]) -> None:
     """Merge ``allow`` rules into ``permissions:`` of a config.yaml (created if missing)."""
+    # a rule pattern that carries a credential (`npx tool --token sk-...`) is never written to disk: that approval stays
+    # a session / once one
+    persistable = [r for r in rules if scrub_text(r.pattern) == r.pattern]
+    if len(persistable) < len(rules):
+        _log.warning(
+            "not persisting %d permission rule(s) whose pattern carries a secret", len(rules) - len(persistable)
+        )
+    if rules and not persistable:
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     data: dict[str, Any] = {}
     if path.is_file():
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     perms = data.setdefault("permissions", {})
-    for r in rules:
+    for r in persistable:
         entry = perms.get(r.tool)
         if not isinstance(entry, dict):
             entry = {} if entry is None else {"*": entry}

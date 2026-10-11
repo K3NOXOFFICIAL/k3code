@@ -656,6 +656,11 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         if include:
             for inc in include if isinstance(include, list) else [include]:
                 cmd += ["-g", inc]
+            # an include glob overrides rg's hidden-file filter; the last glob wins, so keep credential files out again
+            from k3code.permissions.engine import grep_excludes
+
+            for glob in grep_excludes(str(base)):
+                cmd += ["--iglob", glob]
         if exclude:
             for exc in exclude if isinstance(exclude, list) else [exclude]:
                 cmd += ["-g", f"!{exc}"]
@@ -778,7 +783,11 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: P
     base = base or Path.cwd()
     candidates = [path] if path.is_file() else [path / f for f in _tree(path)[0]]
     matches: list[str] = []
+    from k3code.permissions.engine import sensitive_path
+
     for fp in candidates:
+        if sensitive_path(str(fp)):  # the tree walk lists hidden files too: dotenv files and key directories stay out
+            continue
         if includes and not any(Path(fp.name).match(p) for p in includes):
             continue
         if excludes and any(Path(fp.name).match(p) for p in excludes):

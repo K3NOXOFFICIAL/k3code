@@ -3,7 +3,8 @@
 Modes: ``default`` (ask edits + non-allowlisted bash), ``accept-edits``
 (edits allowed, bash asks), ``plan`` (read-only + ``exit_plan``), ``auto``
 (everything not denied allowed, side effects logged), ``yolo`` (everything
-except hardline).
+except hardline; only the few asks marked ``always_ask`` survive it: an edit of a git hook or ``.envrc``, a force push
+without a branch).
 """
 
 from __future__ import annotations
@@ -105,6 +106,8 @@ class Decision:
     auto_allowed: bool = False  # mode auto-allowed a would-be ask (log me)
     #: an ask that auto mode must not convert: a human answers it, an unattended run treats it as a deny
     needs_human: bool = False
+    #: an ask that yolo does not convert either (an edit that plants code the daemon's user runs later)
+    always_ask: bool = False
 
 
 def builtin_defaults() -> list[Rule]:
@@ -190,7 +193,7 @@ def decide(
 def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
     if dec.hardline is None and dec.action != "deny":
         if mode == PermissionMode.YOLO:
-            dec.action = "allow"
+            dec.action = "ask" if dec.always_ask else "allow"
         elif mode == PermissionMode.AUTO and dec.action == "ask" and not dec.needs_human:
             dec.action, dec.auto_allowed = "allow", True
     if dec.action == "ask" and headless:
@@ -201,19 +204,24 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
     return dec
 
 
-#: Redirections that are harmless next to any command (they do not write or read an arbitrary file).
-_HARMLESS_REDIRECT = re.compile(r"(?:\d*[<>]&(?:\d+|-)|&>>?\s*/dev/null|\d*>>?&?\s*/dev/null)(?![^\s;&|<>()])")
-#: ``>f``, ``>>f``, ``<f``, ``&>f``, ``&>>f``, ``>&f`` (the last three send stdout+stderr to f).
-_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*(?:>>?|<)&?)\s*([^\s;&|<>()]+)")
-#: Output redirections only (``>``, ``>>``, ``&>``, ``&>>``, ``>&``): reading with ``<`` is never restricted by the
-#: write roots.
-_WRITE_REDIRECT = re.compile(r"(?:^|[^<>&\d])(?:&>>?|\d*>>?&?)\s*([^\s;&|<>()]+)")
+#: The redirection patterns are defined next to the parser (hardline.py): ``>``, ``>>``, ``>|``, ``<>``, ``&>``, ``<``.
+_HARMLESS_REDIRECT = hardline.HARMLESS_REDIRECT
+_REDIRECT = hardline.REDIRECT
+_WRITE_REDIRECT = hardline.WRITE_REDIRECT
 _SUBSTITUTION = re.compile(r"\$\(|`")
-#: Redirect targets that are code or credentials even inside the project.
-_SENSITIVE_TARGET = re.compile(
-    r"(?:^|/)(?:\.ssh|\.gnupg|\.git/(?:hooks|config)|\.k3code|\.aws|\.bash_?(?:rc|_profile)|"
-    r"\.zsh(?:rc|env)|\.profile|\.zprofile|authorized_keys|\.netrc|\.npmrc|\.env)(?:/|$)"
+#: Files that run as code or hold credentials, wherever they sit (a nested repo's hooks too): shell startup files, ssh /
+#: gpg / aws keys, git hooks / config / info (``core.fsmonitor`` and ``core.hooksPath`` run programs), husky hooks,
+#: direnv's ``.envrc``, dotenv files.
+_CODE_NAMES = (
+    r"\.ssh|\.gnupg|\.git/(?:[^/]+/)*(?:hooks|info|config(?:\.worktree)?)|\.husky|\.envrc|\.aws|\.bash_?(?:rc|_profile)|"
+    r"\.zsh(?:rc|env)|\.profile|\.zprofile|authorized_keys|\.netrc|\.npmrc|\.env"
 )
+#: Redirect targets that are code or credentials even inside the project (``.k3code`` too: its config holds the
+#: permission rules and hooks).
+_SENSITIVE_TARGET = re.compile(rf"(?:^|/)(?:{_CODE_NAMES}|\.k3code)(?:/|$)", re.IGNORECASE)
+#: The same for the edit tools, which run in the daemon outside the sandbox: ``.k3code`` is only its config (agents,
+#: skills and plans in there are ordinary files an agent writes).
+_CODE_LOCATION = re.compile(rf"(?:^|/)(?:{_CODE_NAMES}|\.k3code/config[^/]*)(?:/|$)", re.IGNORECASE)
 
 
 def _writes_outside_roots(sub: str, roots: list[str], cwd: str) -> bool:
@@ -263,11 +271,12 @@ def _voids_allow(sub: str, rule: Rule, ruleset: list[Rule], roots: list[str], cw
     )
 
 
-def _argv(sub: str, reads: list[str] | None = None) -> list[str]:
+def _argv(sub: str, reads: list[str] | None = None, legacy: bool = False) -> list[str]:
     """The normalised argv of ``sub`` (wrappers, assignments and redirections dropped; see hardline.normalize_argv).
-    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``)."""
-    words = _REDIRECT.sub(" ", _HARMLESS_REDIRECT.sub("", sub))  # redirect targets are checked separately
-    return hardline.normalize_argv(hardline.tokens(words), reads)
+    ``reads`` collects the files a dropped wrapper option reads (``xargs -a FILE``). ``legacy``: the reading from
+    before the reserved words and the newer wrappers were known."""
+    words = hardline.strip_redirects(sub, heredocs=False, legacy=legacy)  # redirect targets are checked separately
+    return hardline.normalize_argv(hardline.tokens(words), reads, legacy=legacy)
 
 
 def _arg_values(args: list[str]) -> list[str]:
@@ -297,8 +306,8 @@ def _arg_outside(arg: str, roots: list[str], cwd: str) -> bool:
 
 # ── credential files named on a command line ──
 
-#: ``<file`` (not ``<<``, ``<<<``, ``<&``, ``<(``, ``<>``): a file the command reads.
-_INPUT_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*<(?![<&(>])\s*([^\s;&|<>()]+)")
+#: ``<file`` and ``<>file`` (not ``<<``, ``<<<``, ``<&``, ``<(``): a file the command reads.
+_INPUT_REDIRECT = re.compile(r"(?:^|[^<>&\d])\d*<>?(?![<&(])\s*([^\s;&|<>()]+)")
 _ANY_VAR = re.compile(r"\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*|[0-9@*#?$!-])")
 _GLOB_CHARS = frozenset("*?[")
 #: Print, test or change the metadata of the paths they are given, never a file's content: ``echo .env``,
@@ -361,6 +370,8 @@ def _worse(a: str | None, b: str | None) -> str | None:
 
 
 def _dotenv_name(name: str) -> bool:
+    """A dotenv file (not a committed template). Compared case-insensitively: ``.ENV`` is the same file on macOS."""
+    name = name.lower()
     return name == ".env" or (name.startswith(".env.") and not name.endswith(_DOTENV_TEMPLATES))
 
 
@@ -370,9 +381,10 @@ def _sensitive_name(text: str) -> bool:
     parts = [p for p in text.split("/") if p]
     if not parts:
         return False
-    if any(p in (".ssh", ".gnupg", ".aws") for p in parts) or "/.config/k3code/" in f"/{text}/":
+    lowered = text.lower()
+    if any(p.lower() in (".ssh", ".gnupg", ".aws") for p in parts) or "/.config/k3code/" in f"/{lowered}/":
         return True
-    base = parts[-1]
+    base = parts[-1].lower()
     return _dotenv_name(base) or base in _KEY_NAMES or base == "environ" or base.endswith((".pem", ".key"))
 
 
@@ -383,7 +395,7 @@ def _glob_match(pattern: str, path: str) -> bool:
     if len(pat) != len(parts):
         return False
     return all(
-        fnmatch.fnmatchcase(name, comp) and (comp.startswith(".") or not name.startswith("."))
+        fnmatch.fnmatchcase(name.lower(), comp.lower()) and (comp.startswith(".") or not name.startswith("."))
         for comp, name in zip(pat, parts, strict=True)
     )
 
@@ -419,33 +431,11 @@ def _glob_reads_secret(pattern: str, home: str) -> bool:
     return any(_glob_match(pattern, c) for c in _canonical_secrets(pattern, home))
 
 
-_BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
-
-
-def _brace_expand(word: str, limit: int = 64) -> list[str]:
-    """The words the shell makes of ``a{b,c}d`` (``abd``, ``acd``); capped so a pathological word cannot explode."""
-    out = [word]
-    for _ in range(8):
-        nxt: list[str] = []
-        changed = False
-        for w in out:
-            m = _BRACE.search(w)
-            if not m:
-                nxt.append(w)
-                continue
-            changed = True
-            nxt.extend(w[: m.start()] + alt + w[m.end() :] for alt in m.group(1).split(","))
-        out = nxt[:limit]
-        if not changed:
-            break
-    return out
-
-
 def _classify_arg(arg: str, cwd: str, home: str) -> str | None:
     """``deny`` when ``arg`` names (or globs onto) a credential file, ``human`` when an unknown variable stands in
     front of a credential name (``$DIR/.env``), else None. ``{a,b}`` alternatives are classified one by one."""
     worst: str | None = None
-    for word in _brace_expand(arg):
+    for word in hardline.brace_expand(arg):
         worst = _worse(worst, _classify_word(word, cwd, home))
     return worst
 
@@ -549,6 +539,68 @@ def _ssh_key_value(opt: str, value: str) -> bool:
     return opt == "-F" and bool(_SSH_CONFIG_NAME.search(value))
 
 
+#: Commands that open the files named in their arguments. One of those arguments being a shell expansion whose value
+#: is not known (``cat $(echo .e)nv``, ``head $f``) may name a credential file, so a person decides (see _reader_files).
+_FILE_READERS = frozenset(
+    {
+        *("cat", "tac", "head", "tail", "less", "more", "nl", "od", "xxd", "hexdump", "strings", "base64", "base32"),
+        *("sort", "uniq", "cut", "paste", "wc", "diff", "cmp", "comm", "jq", "yq", "bat", "view", "source", "."),
+        *("tar", "zip", "unzip", "gzip", "gunzip", "zcat", "bzip2", "xz", "7z", "rsync", "scp"),
+        *("grep", "egrep", "fgrep", "rg", "sed", "awk", "gawk", "mawk"),
+        *_COPIERS,
+    }
+)
+_GREP_LONG = frozenset(
+    {"--regexp", "--file", "--max-count", "--after-context", "--before-context", "--context", "--directories"}
+    | {"--devices", "--include", "--exclude", "--exclude-from", "--exclude-dir", "--label", "--binary-files"}
+)
+_RG_LONG = frozenset(
+    {"--regexp", "--file", "--glob", "--iglob", "--type", "--type-not", "--max-count", "--max-depth", "--context"}
+    | {"--after-context", "--before-context", "--replace", "--threads", "--max-columns", "--encoding", "--pre"}
+    | {"--pre-glob", "--sort", "--sortr", "--ignore-file", "--type-add", "--colors"}
+)
+#: Commands whose first operand is the pattern or program, not a file (``grep PATTERN FILE``, ``sed SCRIPT FILE``):
+#: (short options with a value, long options with a value, options that give the pattern or program, options whose
+#: value is a file to read).
+_PATTERN_FIRST: dict[str, tuple[str, frozenset[str], frozenset[str], frozenset[str]]] = {
+    **dict.fromkeys(
+        ("grep", "egrep", "fgrep"),
+        ("efmABCdD", _GREP_LONG, frozenset({"-e", "-f", "--regexp", "--file"}), frozenset({"-f", "--file"})),
+    ),
+    "rg": ("ABCEMTdefgjmrt", _RG_LONG, frozenset({"-e", "-f", "--regexp", "--file"}), frozenset({"-f", "--file"})),
+    "sed": (
+        "efl",
+        frozenset({"--expression", "--file", "--line-length"}),
+        frozenset({"-e", "-f", "--expression", "--file"}),
+        frozenset({"-f", "--file"}),
+    ),
+    **dict.fromkeys(
+        ("awk", "gawk", "mawk"),
+        (
+            "fFvWe",
+            frozenset({"--file", "--field-separator", "--assign", "--source"}),
+            frozenset({"-f", "-e", "--file", "--source"}),
+            frozenset({"-f", "--file"}),
+        ),
+    ),
+}
+
+
+def _reader_files(name: str, args: list[str]) -> list[str]:
+    """The operands of ``name args`` that are files it opens (see _FILE_READERS)."""
+    if name not in _FILE_READERS:
+        return []
+    if name in _COPIERS:
+        return _copier_roles(args)[0]
+    spec = _PATTERN_FIRST.get(name)
+    if spec is None:
+        return _words(args)
+    short_val, long_val, script_opts, file_opts = spec
+    opts, positional = _options(args, short_val, long_val)
+    files = [v for o, v in opts if o in file_opts and v]
+    return files + (positional if any(o in script_opts for o, _ in opts) else positional[1:])
+
+
 def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str], list[str], list[str]]:
     """The arguments of ``name args`` that may name a credential file, by what the command does with it: (reads or
     sends it: deny, overwrites it: ask, deletes/sources/stages it or hands it to a container: confirm). An argument the
@@ -607,23 +659,47 @@ def _credential_roles(name: str, args: list[str], piped: bool) -> tuple[list[str
     return _words(args), [], []
 
 
-def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
+def _sub_secret_access(
+    sub: str, piped: bool, cwd: str, home: str, env: dict[str, list[str]] | None = None
+) -> str | None:
+    """``sub`` as written and, when it uses a variable the command line assigns, with the values put in
+    (``f=.env; cat $f`` reads ``.env``)."""
+    worst: str | None = None
+    for text in hardline.expand_assigned(sub, env or {}):
+        worst = _worse(worst, _text_secret_access(text, piped, cwd, home))
+    return worst
+
+
+def _text_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None:
     plain = _HARMLESS_REDIRECT.sub("", sub)
     worst: str | None = None
     for source in _INPUT_REDIRECT.findall(plain):
         worst = _worse(worst, _classify_arg(source, cwd, home))
-    wrapper_reads: list[str] = []  # ``xargs -a .env echo`` prints the file whatever it wraps
-    argv = _argv(sub, wrapper_reads)
-    for arg in wrapper_reads:
-        worst = _worse(worst, _classify_arg(arg, cwd, home))
-    if not argv:
-        return worst
+    seen: list[list[str]] = []
+    for legacy in (False, True):  # the command as the normaliser reads it now, and as it did before it knew more
+        wrapper_reads: list[str] = []  # ``xargs -a .env echo`` prints the file whatever it wraps
+        argv = _argv(sub, wrapper_reads, legacy)
+        if argv in seen:
+            continue
+        seen.append(argv)
+        for arg in wrapper_reads:
+            worst = _worse(worst, _classify_arg(arg, cwd, home))
+        if argv:
+            worst = _worse(worst, _argv_secret_access(argv, piped, cwd, home))
+    return worst
+
+
+def _argv_secret_access(argv: list[str], piped: bool, cwd: str, home: str) -> str | None:
+    worst: str | None = None
     for command in hardline.ssh_option_commands(argv[0], argv[1:]):
         # ``ssh -oProxyCommand='head .env' x``: ssh runs it, and its output goes on to ssh
         worst = _worse(worst, _secret_access(hardline.parse(command), cwd, home, consumed=True))
     reads, writes, confirm = _credential_roles(argv[0], argv[1:], piped)
     for arg in reads:
         worst = _worse(worst, _classify_arg(arg, cwd, home))
+    for arg in _reader_files(argv[0], argv[1:]):
+        if hardline.UNRESOLVED.search(hardline.expand_vars(arg.strip("'\""), cwd, home)):
+            worst = _worse(worst, "human")  # an expansion whose value is unknown may name a credential file
     if any(_classify_arg(arg, cwd, home) for arg in writes):
         worst = _worse(worst, "ask")
     if any(_classify_arg(arg, cwd, home) for arg in confirm):
@@ -631,7 +707,9 @@ def _sub_secret_access(sub: str, piped: bool, cwd: str, home: str) -> str | None
     return worst
 
 
-def _secret_access(parsed: hardline.Parsed, cwd: str, home: str, consumed: bool = False) -> str | None:
+def _secret_access(
+    parsed: hardline.Parsed, cwd: str, home: str, consumed: bool = False, env: dict[str, list[str]] | None = None
+) -> str | None:
     """How a command line touches credential files: ``deny`` (reads, copies or sends one), ``human`` (a variable may
     point at one), ``confirm`` (deletes, sources, stages one or hands it to a container), ``ask`` (overwrites one),
     None. Every argument of every simple command and of everything nested in it counts unless the command only prints,
@@ -640,11 +718,11 @@ def _secret_access(parsed: hardline.Parsed, cwd: str, home: str, consumed: bool 
     worst: str | None = None
     for sub in parsed.subs:
         piped = consumed or any(len(p) > 1 and sub in p for p in parsed.pipelines)
-        worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home))
+        worst = _worse(worst, _sub_secret_access(sub, piped, cwd, home, env))
     # the first children are ``$(...)``/backtick/``<(...)`` payloads: their output becomes the outer arguments
     n_subst = sum(len(ps) for ps in parsed.sub_payloads)
     for k, child in enumerate(parsed.children):
-        worst = _worse(worst, _secret_access(child, cwd, home, consumed or k < n_subst))
+        worst = _worse(worst, _secret_access(child, cwd, home, consumed or k < n_subst, env))
     return worst
 
 
@@ -653,15 +731,27 @@ def _rule_forms(parsed: hardline.Parsed) -> list[str]:
     ``git -C . push`` is ``git push``) and every nested command (``bash -c '...'``, ``$(...)``) in both spellings."""
     forms: list[str] = []
     for sub in parsed.subs:
-        norm = " ".join(_argv(sub))
-        if norm and norm != sub:
-            forms.append(norm)
+        for legacy in (False, True):  # also as the normaliser read it before it knew reserved words and more wrappers
+            norm = " ".join(_argv(sub, legacy=legacy))
+            if norm and norm != sub:
+                forms.append(norm)
     for nested in parsed.nested:
         forms.append(nested)
-        norm = " ".join(_argv(nested))
-        if norm and norm != nested:
-            forms.append(norm)
+        for legacy in (False, True):
+            norm = " ".join(_argv(nested, legacy=legacy))
+            if norm and norm != nested:
+                forms.append(norm)
     return list(dict.fromkeys(forms))
+
+
+def _force_push_ask(why: str, prefixes: list[str], command: str) -> Decision:
+    return Decision(
+        action="ask",
+        patterns=prefixes,
+        needs_human=True,
+        always_ask=True,  # yolo asks too: this is the one command it would rewrite shared history with
+        message=f"{why}; confirm it yourself: {command[:120]}",
+    )
 
 
 def _decide_bash(
@@ -672,25 +762,33 @@ def _decide_bash(
     if hit:
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     parsed = hardline.parse(command)
+    if parsed.too_deep and mode == PermissionMode.YOLO:
+        # nested past the parse limit: the hardline could not look inside, and yolo has nobody to ask
+        hit = "nesting-too-deep"
+        return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     subs = parsed.subs
-    # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it
-    unsafe = parsed.unterminated or parsed.comment_quote
-    secret = _secret_access(parsed, cwd, home)
+    # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it.
+    # Same for what the line leaves open: a shell reading a script that is not on it, a command or rm argument that is
+    # an expansion whose value is unknown (`$cmd -rf /`, `rm -rf $(echo /)`), nesting past the parse limit.
+    unparsed = hardline.needs_human(parsed, cwd, home)
+    unsafe = parsed.unterminated or parsed.comment_quote or bool(unparsed)
+    secret = _secret_access(parsed, cwd, home, env=hardline.assignments(parsed))
     if secret == "deny":
         hit = "sensitive-path"
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     prefixes = [_rule_pattern_base(s) for s in subs]
     if mode == PermissionMode.PLAN:
         return Decision(action="deny", patterns=prefixes, message=PLAN_MSG)
+    force = hardline.risky(parsed)
     if mode == PermissionMode.YOLO:
-        return Decision(action="allow", patterns=prefixes)
+        return _force_push_ask(force, prefixes, command) if force else Decision(action="allow", patterns=prefixes)
     if mode == PermissionMode.AUTO and any(_writes_outside_roots(sub, roots, cwd) for sub in subs):
         # auto mode writes only inside the project roots; no allow rule overrides this
         return Decision(
             action="deny", patterns=prefixes, message=f"Auto mode writes only inside the project roots: {command[:120]}"
         )
     worst: Rule | None = None
-    for sub in subs:
+    for sub in [*subs, *parsed.legacy_subs]:
         rule = evaluate("bash", sub, ruleset, default="ask")
         if rule.action == "allow" and _voids_allow(sub, rule, ruleset, roots, cwd):
             rule = Rule(tool="bash", pattern="*", action="ask")
@@ -707,12 +805,15 @@ def _decide_bash(
             worst = rule
     worst = worst or Rule(tool="bash", pattern="*", action="ask")
     if unsafe and worst.action != "deny":
+        detail = f" ({unparsed})" if unparsed else ""
         return Decision(
             action="ask",
             patterns=prefixes,
             needs_human=True,
-            message=f"Command could not be parsed safely; confirm it yourself: {command[:120]}",
+            message=f"Command could not be parsed safely{detail}; confirm it yourself: {command[:120]}",
         )
+    if force and worst.action != "deny":
+        return _force_push_ask(force, prefixes, command)
     if secret in ("human", "confirm") and worst.action != "deny":
         why = (
             "A variable may point at a credential file"
@@ -756,7 +857,21 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         elif not is_edit and rule.action == "ask":
             # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
             dec.needs_human = True
+    if is_edit and dec.action != "deny" and rule.layer == 0 and _code_location(path):
+        # the edit tools run in the daemon, outside the sandbox: a planted git hook, `core.fsmonitor`, husky hook or
+        # .envrc runs on the user's next git command / cd. Only an explicit rule of the user's lets it through.
+        dec.action, dec.needs_human, dec.always_ask = "ask", True, True
+        dec.message = f"Edits a file that runs as code or holds credentials ({_CODE_WHY}): {path}"
     return dec
+
+
+_CODE_WHY = "git hooks and config, .husky, .envrc, shell startup files, keys"
+
+
+def _code_location(path: str) -> bool:
+    """``path`` (absolute), or where it really points, is a file that runs as code or holds credentials, in this
+    repository or a nested one (see _CODE_LOCATION)."""
+    return any(_CODE_LOCATION.search(p) for p in dict.fromkeys((path, os.path.realpath(path))))
 
 
 #: ``$HOME`` entries that hold keys or credentials (the sandbox masks the first two, see sandbox.HOME_SECRETS).
@@ -777,16 +892,31 @@ def _secret_dirs() -> list[str]:
 def sensitive_path(path: str) -> bool:
     """``path`` (absolute) is a key/credential location: ``~/.ssh``, ``~/.gnupg``, ``~/.aws``, the k3code secrets dir
     (``~/.config/k3code``, ``$XDG_CONFIG_HOME/k3code``: the daemon's ``env`` file), a process environment
-    (``/proc/*/environ``) or a dotenv file. Checked on the path as written and on its realpath (symlinks)."""
+    (``/proc/*/environ``) or a dotenv file. Checked on the path as written and on its realpath (symlinks); names are
+    compared case-insensitively."""
     dirs = [os.path.normpath(d) for d in _secret_dirs()]
     dirs += [os.path.realpath(d) for d in dirs]
+    folded = [d.lower() for d in dirs]  # a case-insensitive file system (macOS) reaches ~/.SSH too
     for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
-        if _PROC_ENVIRON.match(p) or any(p == d or p.startswith(d.rstrip("/") + "/") for d in dirs):
+        low = p.lower()
+        if _PROC_ENVIRON.match(p) or any(low == d or low.startswith(d.rstrip("/") + "/") for d in folded):
             return True
-        name = os.path.basename(p)
-        if name == ".env" or (name.startswith(".env.") and not name.endswith(_DOTENV_TEMPLATES)):
+        if _dotenv_name(os.path.basename(p)):
             return True
     return False
+
+
+def grep_excludes(base: str) -> list[str]:
+    """rg globs (``--iglob``, to come after every ``include`` glob: the last one wins) that keep credential files out of
+    a search. An include glob switches rg's hidden-file filter off, so ``include: "*"`` would search ``.env``; these
+    are the files and directories ``sensitive_path`` calls sensitive: dotenv files at any depth, and the secret
+    directories under ``base`` (the search root), anchored there."""
+    globs = ["!.env", "!.env.*"]
+    secrets = [*map(os.path.normpath, _secret_dirs()), *map(os.path.realpath, _secret_dirs())]
+    for root in dict.fromkeys((os.path.normpath(base), os.path.realpath(base))):
+        prefix = root.rstrip("/") + "/"
+        globs += ["!/" + d[len(prefix) :] for d in dict.fromkeys(secrets) if d.startswith(prefix)]
+    return list(dict.fromkeys(globs))
 
 
 def _glob_base(path: str, pattern: str) -> str:
@@ -817,15 +947,25 @@ _INEXACT = re.compile(r"[*?$`;&|<>\n]")
 def _rule_pattern_base(sub: str) -> str:
     """What a bash decision records for ``sub``: its arity prefix, or the exact command for the commands whose
     arguments name what runs (hardline.WILDCARD_UNSAFE: ``uv run pytest``, ``docker run --rm alpine``)."""
+    sub = hardline.strip_leading_reserved(sub)  # `then git push`: the rule is for `git push`, never for `then *`
     if hardline.wildcard_unsafe(sub):
         return sub
     return hardline.command_prefix(sub) or sub
 
 
+def _carries_secret(pattern: str) -> bool:
+    """``pattern`` has a credential in it (a token flag, ``NAME_SECRET=value``, an auth header ...): see redact.py."""
+    from k3code.redact import scrub_text
+
+    return scrub_text(pattern) != pattern
+
+
 def exact_rule_pattern(command: str) -> str | None:
-    """``command`` as an exact rule pattern (leading assignments dropped), or None when it cannot be one."""
+    """``command`` as an exact rule pattern (leading assignments dropped), or None when it cannot be one: it has a
+    wildcard, variable, substitution or redirection in it, or carries a secret (an exact rule is written to
+    config.yaml verbatim, and ``npx tool --token sk-...`` would put the token there)."""
     command = _drop_assignments(command.strip())
-    return command if command and not _INEXACT.search(command) else None
+    return command if command and not _INEXACT.search(command) and not _carries_secret(command) else None
 
 
 def suggest_rules(tool: str, dec: Decision) -> list[Rule]:
@@ -838,10 +978,10 @@ def suggest_rules(tool: str, dec: Decision) -> list[Rule]:
         # A leading VAR=value is dropped: "always" on `API_KEY=sk-... curl x` wrote the key into config.yaml.
         out: list[Rule] = []
         for p in dict.fromkeys(_drop_assignments(p) for p in dec.patterns):
-            if not p or hardline.is_launcher(p):
+            if not p or hardline.is_launcher(p) or p.split()[0] in hardline.RESERVED_WORDS:
                 continue
             pattern = exact_rule_pattern(p) if hardline.wildcard_unsafe(p) else f"{p} *"
-            if pattern:
+            if pattern and not _carries_secret(pattern):
                 out.append(Rule(tool="bash", pattern=pattern, action="allow"))
         return out
     name = "edit" if tool in EDIT_TOOLS else "read" if tool in READ_TOOLS else tool
