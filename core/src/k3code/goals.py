@@ -46,6 +46,18 @@ PERSIST_BACKOFF_BASE_S = 15.0
 PERSIST_BACKOFF_MAX_S = 300.0
 #: A persistent goal judged blocked this many times in a row says so (still going on; /goal clear stops it).
 BLOCKED_NOTICE_EVERY = 5
+#: A goal longer than this is quoted in a continuation prompt by its start and a pointer to the message that holds it
+#: (the gateway puts the full text back when that message is no longer in the history). Every continuation re-sent the
+#: whole goal, as fresh input after the cached prefix, on every turn of a goal that runs for hours.
+GOAL_QUOTE_CHARS = 600
+GOAL_QUOTE_STUB = "… [the rest of the goal is in the goal message above]"
+
+
+def quote(goal: str, limit: int = GOAL_QUOTE_CHARS) -> str:
+    """``goal`` as a continuation prompt quotes it: whole up to ``limit`` characters, else its start and a pointer."""
+    return goal if len(goal) <= limit else goal[: limit // 2].rstrip() + GOAL_QUOTE_STUB
+
+
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
 #: A persistent goal keeps going when the judge's replies cannot be read, but after this many turns in a row it waits
 #: (15 s doubling to five minutes) before each turn instead of spending at full speed with nothing able to say "done".
@@ -474,7 +486,7 @@ class GoalManager:
         template = (
             CONTINUATION_PROMPT_PERSIST_TEMPLATE if self.persist and not s.implicit else CONTINUATION_PROMPT_TEMPLATE
         )
-        return template.format(goal=s.goal)
+        return template.format(goal=quote(s.goal))
 
     def _pause_decision(self, s: GoalState, reason: str, verdict: str, why: str, message: str) -> Decision:
         if s.implicit:
@@ -526,6 +538,16 @@ class GoalManager:
             if s.budget_spent():
                 return self._budget_pause(s, "blocked", reason)
             self._save(s)
+            if s.consecutive_blocked > BLOCKED_NOTICE_EVERY:
+                # a goal that stays blocked is not retried at full speed (180 turns an hour): the wait grows, as it
+                # does for an unreadable judge; any other verdict resets the count
+                await self._wait(
+                    s,
+                    s.consecutive_blocked - BLOCKED_NOTICE_EVERY - 1,
+                    f"Judged blocked {s.consecutive_blocked} turns in a row; the next attempt starts",
+                )
+                if (gone := self._superseded(s)) is not None:
+                    return gone
             note = (
                 f" — judged blocked {s.consecutive_blocked} turns in a row; /goal clear stops it"
                 if s.consecutive_blocked % BLOCKED_NOTICE_EVERY == 0
@@ -534,7 +556,7 @@ class GoalManager:
             return Decision(
                 "active",
                 True,
-                CONTINUATION_PROMPT_BLOCKED_TEMPLATE.format(goal=s.goal, reason=reason),
+                CONTINUATION_PROMPT_BLOCKED_TEMPLATE.format(goal=quote(s.goal), reason=reason),
                 "blocked",
                 reason,
                 f"↻ Judged blocked ({s.turns_text()}) — trying another way: {reason}{note}",
@@ -602,7 +624,7 @@ class GoalManager:
                     else CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE
                 )
                 prompt = template.format(
-                    goal=s.goal,
+                    goal=quote(s.goal),
                     command=gate.command,
                     exit_code=code,
                     attempt=_of(gate.attempts, gate.max_retries),
@@ -630,7 +652,7 @@ class GoalManager:
                     listed = "\n".join(f"- {i}" for i in issues)
                     prompt = (
                         f"[Goal check] A reviewer found blocking issues before the goal could be called done:\n"
-                        f"{listed}\nFix them, then confirm the goal is complete. Goal: {s.goal}"
+                        f"{listed}\nFix them, then confirm the goal is complete. Goal: {quote(s.goal)}"
                     )
                     return Decision(
                         "active",
@@ -658,7 +680,7 @@ class GoalManager:
             return Decision(
                 "active",
                 True,
-                CONTINUATION_PROMPT_EMPTY_TEMPLATE.format(goal=s.goal, n=n),
+                CONTINUATION_PROMPT_EMPTY_TEMPLATE.format(goal=quote(s.goal), n=n),
                 "continue",
                 reason,
                 f"↻ The last {n} turns ended without any text ({s.turns_text()}) — asking for a concrete step.",

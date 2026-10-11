@@ -353,7 +353,7 @@ def test_prices_follow_the_model_the_provider_cache_and_the_config():
 
     cfg = Settings(models={"my-local": {"price": {"input": 0.5, "output": 1.5}}})
     sonnet = Usage(prompt_tokens=1_000_000, completion_tokens=100_000, model="claude-sonnet-5-5")
-    assert estimate_usd(cfg, sonnet) == pytest.approx(3.0 + 1.5)  # $3 in, $15 out per million
+    assert estimate_usd(cfg, sonnet) == pytest.approx(2.0 + 1.0)  # Sonnet 5: $2 in, $10 out per million
     cached = Usage(
         prompt_tokens=1_000_000, completion_tokens=0, cache_read_tokens=900_000, cache_creation_tokens=0, model="sonnet"
     )
@@ -361,7 +361,7 @@ def test_prices_follow_the_model_the_provider_cache_and_the_config():
     assert estimate_usd(cfg, Usage(prompt_tokens=2_000_000, model="my-local")) == pytest.approx(1.0)  # the config wins
     assert estimate_usd(cfg, Usage(prompt_tokens=10, cost_usd=0.42, model="sonnet")) == 0.42  # the provider's figure
     assert estimate_usd(cfg, Usage(prompt_tokens=10, model="mystery-model")) is None  # unknown: the blended rate
-    assert model_price(cfg, "anthropic/claude-opus-5-5") == (15.0, 75.0)
+    assert model_price(cfg, "anthropic/claude-opus-5-5") == (4.0, 20.0)
 
 
 async def test_the_router_tags_a_calls_usage_with_the_model_that_answered(tmp_path):
@@ -408,9 +408,10 @@ async def test_a_priced_call_counts_in_dollars_and_a_provider_cost_counts_as_giv
         __import__("k3code.reliability.governor", fromlist=["Budget"]).Budget(scope="session", usd=1.0)
     )
     rel.record_usage(Usage(prompt_tokens=200_000, completion_tokens=0, model="claude-opus-5-5"))
-    assert rel.governor._budgets["session"].used_usd == pytest.approx(3.0)  # $15 per million, not $0.10 blended
+    assert rel.governor._budgets["session"].used_usd == pytest.approx(0.8)  # $4 per million, not $0.10 blended
     rel.record_usage(Usage(prompt_tokens=1_000_000, cost_usd=0.01, model="sonnet"))
-    assert rel.governor._budgets["session"].used_usd == pytest.approx(3.01)
+    assert rel.governor._budgets["session"].used_usd == pytest.approx(0.81)
+    rel.record_usage(Usage(prompt_tokens=100_000, completion_tokens=0, model="claude-opus-5-5"))
     assert rel.check_budgets() is not None  # over the $1 cap
 
 

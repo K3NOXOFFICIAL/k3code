@@ -1,0 +1,46 @@
+"""edit: a replacement keeps the file's own indentation characters when the model wrote another kind."""
+
+from __future__ import annotations
+
+from k3code.tools import tool_edit
+
+
+async def edit(tmp_path, name: str, text: str, old: str, new: str) -> str:
+    f = tmp_path / name
+    f.write_text(text)
+    res = await tool_edit({"path": name, "old_string": old, "new_string": new}, cwd=tmp_path)
+    assert res.get("ok"), res
+    return f.read_text()
+
+
+async def test_a_tab_indented_go_file_edited_with_spaces_keeps_tabs_on_every_line(tmp_path):
+    text = "func main() {\n\tif ready {\n\t\tfoo()\n\t}\n}\n"
+    old = "    if ready {\n        foo()\n    }\n"
+    new = "    if ready {\n        foo()\n        bar()\n    }\n"
+    out = await edit(tmp_path, "m.go", text, old, new)
+    assert out == "func main() {\n\tif ready {\n\t\tfoo()\n\t\tbar()\n\t}\n}\n"
+
+
+async def test_a_new_deeper_level_in_a_tab_file_is_written_with_tabs(tmp_path):
+    text = "def f(x):\n\tif x:\n\t\treturn 1\n\treturn 2\n"
+    old = "    if x:\n        return 1\n"
+    new = "    if x:\n        if x > 1:\n            return 3\n        return 1\n"
+    out = await edit(tmp_path, "f.py", text, old, new)
+    assert out == "def f(x):\n\tif x:\n\t\tif x > 1:\n\t\t\treturn 3\n\t\treturn 1\n\treturn 2\n"
+    compile(out, "f.py", "exec")
+
+
+async def test_a_space_file_edited_with_tabs_keeps_spaces(tmp_path):
+    text = "def f(x):\n    if x:\n        return 1\n    return 2\n"
+    old = "\tif x:\n\t\treturn 1\n"
+    new = "\tif x:\n\t\treturn 3\n"
+    out = await edit(tmp_path, "f.py", text, old, new)
+    assert out == "def f(x):\n    if x:\n        return 3\n    return 2\n"
+
+
+async def test_a_two_space_file_edited_with_four_spaces_keeps_its_two(tmp_path):
+    text = "function f() {\n  if (a) {\n    go();\n  }\n}\n"
+    old = "    if (a) {\n        go();\n    }\n"
+    new = "    if (a) {\n        go();\n        stop();\n    }\n"
+    out = await edit(tmp_path, "f.js", text, old, new)
+    assert out == "function f() {\n  if (a) {\n    go();\n    stop();\n  }\n}\n"

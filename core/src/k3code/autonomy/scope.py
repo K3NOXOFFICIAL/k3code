@@ -249,7 +249,16 @@ def repo_summary(cwd: Path, *, max_files: int = 5000) -> str:
     return f"{count}{more} files; languages: {top}; git: {git}"
 
 
+#: What the classifier reads of a task: a pasted log or file makes the prompt tens of thousands of tokens, and the
+#: verdict (scope, risk) does not depend on them. The safety floor (apply_floor) still scans the whole prompt.
+CLASSIFIER_PROMPT_CHARS = 4000
+
+
 def classifier_messages(prompt: str, summary: str, recent: str) -> list[Message]:
+    if len(prompt) > CLASSIFIER_PROMPT_CHARS:
+        tail = CLASSIFIER_PROMPT_CHARS // 4
+        cut = len(prompt) - CLASSIFIER_PROMPT_CHARS
+        prompt = f"{prompt[: CLASSIFIER_PROMPT_CHARS - tail]}\n…[{cut:,} chars omitted]…\n{prompt[-tail:]}"
     body = f"Task:\n{prompt}\n\nRepo: {summary}\n"
     if recent:
         body += f"\nRecent context:\n{recent}\n"

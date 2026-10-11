@@ -29,10 +29,10 @@ from k3code.autonomy.sizing import (
 from k3code.memory import fenced
 from k3code.paths import ignore_generated
 from k3code.providers.types import Message
-from k3code.reliability.governor import Governor
+from k3code.reliability.governor import Budget, Governor
 from k3code.routing.tiers import TaskKind
 from k3code.subagents import worktree as wt_mod
-from k3code.subagents.budget import AgentBudget, BudgetStop
+from k3code.subagents.budget import CAP_SCOPE, AgentBudget, BudgetStop
 from k3code.subagents.runner import Handle
 
 logger = logging.getLogger(__name__)
@@ -310,6 +310,17 @@ class Ultra:
         limits = session_limits(self.server.config, session)
         brief = with_hook_context(task, context)  # the agents' prompts; the report and its title keep ``task``
         budget = AgentBudget(limits.budget_agents, int(cfg["max_tokens"]))
+        # ultracode.max_tokens is checked between children above, so one worker could spend many times the cap, and
+        # parallel workers each overshoot. As a budget of the session's governor it is charged by every child's usage
+        # and checked after each model call of every child, so all of them stop right after the call that crosses it.
+        rel = session.reliability
+        if rel is None:  # a cold session (the job is the first thing it runs) has no reliability bundle yet
+            self.server._ensure_router(session.stored.model or None)
+            rel = await self.server._reliability_for(session)
+        gov = rel.governor if rel is not None else None
+        capped = gov is not None and bool(budget.max_tokens)
+        if capped:
+            gov.add_budget(Budget(scope=CAP_SCOPE, tokens=budget.max_tokens))  # type: ignore[union-attr]
         report = _Report(task)
         cwd = Path(session.perms.cwd)
         self._clocks[session.session_id] = [("start", time.monotonic())]
@@ -359,7 +370,11 @@ class Ultra:
             self.progress(session, "ultracode", "stopped", str(e), budget)
         except BaseException:
             self._clocks.pop(session.session_id, None)  # a failed or cancelled run leaves no clock behind
+            if capped:
+                gov.remove_budget(CAP_SCOPE)  # type: ignore[union-attr]
             raise
+        if capped:
+            gov.remove_budget(CAP_SCOPE)  # type: ignore[union-attr]
         report.budget = budget.summary()
         report.timing = timing_line(self._clocks.pop(session.session_id, []), time.monotonic())
         text = report.render()

@@ -51,7 +51,7 @@ class ProviderEntry(BaseModel):
     #: CLI start is paid once, and the prompt cache covers the earlier conversation). false = one stateless call per
     #: step. At most ``max_sessions`` processes (~270 MB each) live at once; one idle ``idle_seconds`` is stopped.
     persistent: bool = True
-    max_sessions: int = 4
+    max_sessions: int = 5
     idle_seconds: float = 600.0
     #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic; for an openai entry (a relay) they are
     #: sent only for model ids that look like Claude, and dropped for good if the endpoint answers 400 to a request

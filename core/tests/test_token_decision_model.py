@@ -63,7 +63,7 @@ async def test_what_it_keeps_must_fit_under_the_threshold(tmp_path):
     _, provider = await run_with(tmp_path, decide, n=20, window=16_000)
     sent = {m.tool_call_id: m.content for m in provider.requests[-1][0] if m.role == "tool"}
     assert sent["r0"].startswith(ELIDED)
-    assert all(f"file {i}" in sent[f"r{i}"] for i in range(14, 20))  # the last six stay whole
+    assert all(f"file {i}" in sent[f"r{i}"] for i in range(17, 20))  # the newest three: 15% of this window
 
 
 def rewrites_of(provider) -> int:

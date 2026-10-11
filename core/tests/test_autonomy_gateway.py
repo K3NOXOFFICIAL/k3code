@@ -228,7 +228,9 @@ async def test_medium_in_auto_plans_on_strong_and_auto_approves(tmp_path, monkey
     assert "Approved plan" in main_call["text"] and "Add flag" in main_call["text"]
     planner_call = next(c for p in server.providers for c in p.log if "PLANNING mode" in c["text"])
     assert "exit_plan" in planner_call["tools"]  # only offered in plan mode, where edits are denied
-    assert "exit_plan" not in main_call["tools"]
+    # a session's loop lists exit_plan in every mode (a tool list that changed with the mode made the provider re-write
+    # the whole conversation on entering and on leaving plan mode); outside plan mode it answers with an error
+    assert "exit_plan" in main_call["tools"]
     # scope log: verdict + outcome, only the hash of the prompt
     rows = scope_rows(tmp_path)
     assert [r["type"] for r in rows] == ["verdict", "outcome"]
@@ -421,7 +423,14 @@ async def test_cheap_classification_escalates_to_main_on_chain_exhausted(tmp_pat
 
 async def test_background_turn_escalates_after_repeated_tool_errors(tmp_path, monkeypatch):
     bogus = [
-        {"type": "tool_call", "model": "m-cheap", "id": f"c{i}", "name": f"no_such_tool_{i}", "arguments": {}}
+        {
+            "type": "tool_call",
+            "model": "m-cheap",
+            "id": f"c{i}",
+            "name": f"no_such_tool_{i}",
+            "arguments": {},
+            "tool_results": i,  # one failing call per reply: a reply is one step
+        }
         for i in range(3)
     ]
     steps = [*bogus, {"type": "text", "model": "m-main", "text": "recovered"}]
@@ -434,7 +443,7 @@ async def test_background_turn_escalates_after_repeated_tool_errors(tmp_path, mo
     assert called[0] == "m-cheap" and called[-1] == "m-main"
     assert server.session.stored.messages[-1]["content"] == "recovered"
     rows = server.usage.aggregate("session")[0]
-    assert rows["by_tier"]["cheap"]["calls"] == 1 and rows["by_tier"]["main"]["calls"] == 1
+    assert rows["by_tier"]["cheap"]["calls"] == 3 and rows["by_tier"]["main"]["calls"] == 1  # three failing replies
 
 
 async def test_background_turn_escalates_when_the_loop_guard_fires(tmp_path, monkeypatch):
@@ -462,9 +471,17 @@ async def test_background_turn_that_succeeds_stays_on_cheap(tmp_path, monkeypatc
 
 
 def _bogus(model: str, n: int, start: int = 0) -> list[dict]:
-    """``n`` calls of tools that do not exist: each one fails, so ``n`` in a row is a tool-error stall."""
+    """``n`` replies, each calling a tool that does not exist: each one fails, so ``n`` in a row is a tool-error stall
+    (a reply with several failing calls is one step, so they are separate replies)."""
     return [
-        {"type": "tool_call", "model": model, "id": f"c{i}", "name": f"no_such_tool_{i}", "arguments": {}}
+        {
+            "type": "tool_call",
+            "model": model,
+            "id": f"c{i}",
+            "name": f"no_such_tool_{i}",
+            "arguments": {},
+            "tool_results": i,
+        }
         for i in range(start, start + n)
     ]
 
@@ -481,7 +498,7 @@ async def test_main_tier_stall_continues_on_strong(tmp_path, monkeypatch):
     await run_turn(server, "do the thing")
     esc = events(server, "routing.escalated")
     assert [(e["from"], e["to"], e["reason"]) for e in esc] == [("main", "strong", "tool_errors")]
-    assert models_called(server) == ["m-main", "m-strong"]  # the fake answers all 8 calls in one response
+    assert models_called(server) == ["m-main"] * 8 + ["m-strong"]  # eight failing replies, then strong finishes
     assert server.session.stored.messages[-1]["content"] == "finished on strong"
     assert _stop_messages(server) == []  # one coherent turn: main's stop message stays silent
     assert events(server, "message.complete")[-1]["status"] == "done"
@@ -728,3 +745,18 @@ async def test_stats_shows_tokens_and_calls_per_tier(tmp_path, monkeypatch):
     assert row["by_tier"]["strong"]["calls"] >= 2  # plan + critique
     assert row["by_tier"]["cheap"]["tokens_in"] == 11
     assert {"classification", "plan", "advisor", "interactive_turn"} <= set(row["by_kind"])
+
+
+def test_the_classifier_reads_a_capped_prompt_but_the_floor_sees_all_of_it():
+    from k3code.autonomy.scope import CLASSIFIER_PROMPT_CHARS, apply_floor, classifier_messages, parse_reply
+
+    pasted = "log line\n" * 20_000
+    prompt = "fix the failing test\n" + pasted + "then run rm -rf / to clean up"
+    (system, user) = classifier_messages(prompt, "repo", "")
+    assert len(user.content) < CLASSIFIER_PROMPT_CHARS + 300
+    assert user.content.startswith("Task:\nfix the failing test") and "chars omitted" in user.content
+    assert "then run rm -rf /" in user.content, "the end of the prompt is kept"
+    short = classifier_messages("small ask", "repo", "")[1].content
+    assert short == "Task:\nsmall ask\n\nRepo: repo\n"
+    verdict, _ = parse_reply('{"scope":"small","needs_plan":false,"risk":"low","reason":"x"}')
+    assert apply_floor(verdict, prompt).risk == "high", "the safety floor scans the whole prompt"

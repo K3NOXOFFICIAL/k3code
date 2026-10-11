@@ -16,9 +16,12 @@ from k3code.autonomy import advisor as advisor_mod
 from k3code.autonomy import autonomy_cfg, scope
 from k3code.autonomy.proposals import ProposalStore, propose
 from k3code.autonomy.scope import ScopeLog, ScopeVerdict
+from k3code.context_budget import tool_output_limit
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
+from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind, Tier
+from k3code.session_ai import split_for_compaction
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,22 @@ class _Captured:
     auto: bool = False
     mode: str | None = None
     asked: int = field(default=0)
+
+
+def planner_history(history: list[Message], keep: int) -> list[Message]:
+    """The conversation as the planner is sent it: the last ``keep`` messages in full (cut at a user message, so no
+    tool call loses its result) and, before them, only what the user asked and what the assistant answered in words.
+    The planner has read, grep and glob and can look again; replaying every earlier tool call and result on the strong
+    tier made each plan cost as much as the whole session so far."""
+    cut = split_for_compaction([{"role": m.role} for m in history], keep)
+    older: list[Message] = []
+    for m in history[:cut]:
+        if m.role == "user" and older and older[-1].role == "user":
+            # the assistant's tool turn between two prompts is gone: one user turn, not two in a row
+            older[-1] = Message(role="user", content=f"{older[-1].content or ''}\n\n{m.content or ''}")
+        elif m.role == "user" or (m.role == "assistant" and not m.tool_calls and (m.content or "").strip()):
+            older.append(m)
+    return [*older, *history[cut:]]
 
 
 def parse_plan(text: str) -> dict[str, str]:
@@ -252,7 +271,7 @@ class PlanFirst:
             reliability=await server._reliability_for(session),
             session=sid,
             task_kind=TaskKind.PLAN,
-            tool_output_chars=int((getattr(server.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            tool_output_chars=tool_output_limit(server.config),
             context_window=server._router_window(router, session),
         )
         loop.hooks = userhooks.load(session.perms.cwd, sid)  # the planner's read tools see the user's hooks too
@@ -264,7 +283,10 @@ class PlanFirst:
             mark = " (parallelizable)" if verdict.parallelizable else ""
             prompt += f"\nSuggested subtasks{mark}: " + "; ".join(verdict.suggested_subtasks)
         last_text = ""
-        async for event in loop.run(prompt, max_tokens=server.config.max_tokens, history=session.history):
+        keep = int((getattr(server.config, "context", None) or {}).get("keep_messages", 8))
+        async for event in loop.run(
+            prompt, max_tokens=server.config.max_tokens, history=planner_history(session.history, keep)
+        ):
             server._on_stream_event(session, event)
             if event.type == "done" and event.message and event.message.role == "assistant" and event.message.content:
                 last_text = event.message.content

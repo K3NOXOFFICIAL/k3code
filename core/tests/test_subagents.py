@@ -457,3 +457,22 @@ def test_child_max_turns_takes_the_smaller_positive_cap():
     assert _child_max_turns(Settings(max_turns=50)) == 50
     assert _child_max_turns(Settings(max_turns=500)) == 200
     assert _child_max_turns(Settings(subagents={"max_turns": 7})) == 7
+
+
+def test_a_stopped_worktree_child_tells_the_parent_where_its_work_is():
+    from k3code.subagents.runner import Handle
+
+    def child(status: str, merge: str) -> Handle:
+        h = Handle(id="sa-1", description="d", agent_type="worker", tier="main", depth=1, parent_sid="s")
+        h.status, h.error, h.result = status, "boom", "half"
+        h.isolation, h.merge, h.branch, h.diff_stat = "worktree", merge, "k3/sa-1", " a.py | 3 ++-"
+        return h
+
+    failed = child("failed", "pending").render()
+    assert failed.startswith("Sub-agent sa-1 failed: boom") and "branch k3/sa-1 (not merged)" in failed
+    assert "a.py | 3" in failed
+    assert "branch k3/sa-1" in child("interrupted", "pending").render()
+    assert "[worktree]" not in child("failed", "no_changes").render()
+    plain = child("failed", "pending")
+    plain.isolation = "none"
+    assert plain.render() == "Sub-agent sa-1 failed: boom"

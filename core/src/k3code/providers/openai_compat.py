@@ -10,8 +10,8 @@ from typing import Any
 
 import httpx
 
-from k3code.providers.base import Provider, ProviderError, request_headers, to_provider_error
-from k3code.providers.effort import openai_effort
+from k3code.providers.base import Provider, ProviderError, error_from_http, request_headers, to_provider_error
+from k3code.providers.effort import openai_effort, takes_effort
 from k3code.providers.types import (
     Message,
     StreamEvent,
@@ -78,8 +78,10 @@ class OpenAICompatProvider(Provider):
             "messages": wire,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "max_tokens": max_tokens,
         }
+        # OpenAI's reasoning models (o-series, gpt-5) reject ``max_tokens`` ("use max_completion_tokens instead"), and
+        # the limit there also covers the hidden reasoning; every other model id keeps the key all servers understand
+        payload["max_completion_tokens" if takes_effort(model, "openai") else "max_tokens"] = max_tokens
         if temperature is not None:
             payload["temperature"] = temperature
         if effort := openai_effort(model):
@@ -240,16 +242,7 @@ class OpenAICompatProvider(Provider):
 
 
 async def _error_from_response(response: httpx.Response) -> ProviderError:
-    try:
-        text = await response.aread()
-        body = json.loads(text) if text else {}
-        if not isinstance(body, dict):
-            body = {"message": str(body)}
-    except Exception:
-        body = {}
-    message = _error_message(body) or f"HTTP {response.status_code}"
-    headers = dict(response.headers)
-    return ProviderError(message=message, status_code=response.status_code, headers=headers, body=body)
+    return error_from_http(await response.aread(), response.status_code, dict(response.headers), _error_message)
 
 
 def _inband_error(chunk: dict[str, Any]) -> ProviderError:
@@ -281,7 +274,13 @@ def _inband_error(chunk: dict[str, Any]) -> ProviderError:
 def _error_message(body: dict[str, Any]) -> str:
     err = body.get("error")
     if isinstance(err, dict) and err.get("message"):
-        return str(err["message"])
+        message = str(err["message"])
+        # OpenRouter says "Provider returned error" and puts the upstream's own text (the overflow, the throttle) here
+        meta = err.get("metadata")
+        raw = meta.get("raw") if isinstance(meta, dict) else None
+        if raw:
+            message = f"{message}: {raw if isinstance(raw, str) else json.dumps(raw)}"[:2000]
+        return message
     if isinstance(err, str):
         return err
     for key in ("message", "detail"):
@@ -308,8 +307,15 @@ def _parse_usage(chunk_usage: dict[str, Any]) -> Any:
     return Usage(
         prompt_tokens=int(chunk_usage.get("prompt_tokens") or 0),
         completion_tokens=int(chunk_usage.get("completion_tokens") or 0),
-        # OpenAI reports cache hits in prompt_tokens_details; relays to Anthropic pass its own fields on
-        cache_read_tokens=int(details.get("cached_tokens") or chunk_usage.get("cache_read_input_tokens") or 0),
+        # OpenAI reports cache hits in prompt_tokens_details; DeepSeek as prompt_cache_hit_tokens and Moonshot as a
+        # top-level cached_tokens (both count them in prompt_tokens); relays to Anthropic pass its own fields on
+        cache_read_tokens=int(
+            details.get("cached_tokens")
+            or chunk_usage.get("prompt_cache_hit_tokens")
+            or chunk_usage.get("cached_tokens")
+            or chunk_usage.get("cache_read_input_tokens")
+            or 0
+        ),
         cache_creation_tokens=int(
             details.get("cache_write_tokens") or chunk_usage.get("cache_creation_input_tokens") or 0
         ),
@@ -320,7 +326,7 @@ def _parse_args(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(raw, strict=False)  # a raw newline or tab inside a string is a model slip, not a truncation
         return parsed if isinstance(parsed, dict) else {"_raw": parsed}
     except json.JSONDecodeError:
         return {"_unparsed": raw}

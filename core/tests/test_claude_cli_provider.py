@@ -872,7 +872,7 @@ async def test_calls_without_tools_never_take_a_slot_from_the_conversation(pshim
 
 def test_provider_entry_passes_the_session_settings_through() -> None:
     (provider,) = make_providers([ProviderEntry(name="cc", kind="claude-cli")])
-    assert (provider.persistent, provider.max_sessions, provider.idle_seconds) == (True, 4, 600.0)
+    assert (provider.persistent, provider.max_sessions, provider.idle_seconds) == (True, 5, 600.0)
     entry = ProviderEntry(name="cc", kind="claude-cli", persistent=False, max_sessions=2, idle_seconds=30)
     (provider,) = make_providers([entry])
     assert (provider.persistent, provider.max_sessions, provider.idle_seconds) == (False, 2, 30.0)

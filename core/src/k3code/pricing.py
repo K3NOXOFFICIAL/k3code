@@ -16,8 +16,18 @@ from typing import Any
 #: (substring of the lower-cased model id, input USD per million tokens, output USD per million tokens). The first
 #: match wins, so a more specific name comes before the family it belongs to.
 PRICES_PER_MTOK: tuple[tuple[str, float, float], ...] = (
-    ("opus", 15.0, 75.0),
+    ("fable", 10.0, 50.0),
+    ("mythos", 10.0, 50.0),
+    ("opus-5-5", 4.0, 20.0),
+    # the Opus models before 4.5 cost three times as much as the ones after
+    ("opus-4-1", 15.0, 75.0),
+    ("opus-4-0", 15.0, 75.0),
+    ("opus-4-2", 15.0, 75.0),
+    ("claude-3-opus", 15.0, 75.0),
+    ("opus", 5.0, 25.0),
+    ("sonnet-5", 2.0, 10.0),
     ("sonnet", 3.0, 15.0),
+    ("haiku-5", 0.10, 0.50),
     ("haiku", 1.0, 5.0),
     ("gpt-4o-mini", 0.15, 0.60),
     ("gpt-4o", 2.5, 10.0),
@@ -26,6 +36,14 @@ PRICES_PER_MTOK: tuple[tuple[str, float, float], ...] = (
 )
 CACHE_READ_MULTIPLE = 0.1
 CACHE_WRITE_MULTIPLE = 1.25
+#: Names that are Claude models without "claude" in the id (the aliases of the claude-cli provider, the 5-family).
+CLAUDE_NAMES = ("claude", "opus", "sonnet", "haiku", "fable", "mythos")
+#: What a cached prompt token costs next to a fresh one, for the other families that price it (OpenAI's cached input is
+#: a fraction of the input price and its writes are free); a model not listed pays the full input price for all of them.
+CACHE_READ_MULTIPLES: tuple[tuple[str, float], ...] = (
+    ("gpt-4o", 0.5),
+    ("gpt-4.1", 0.25),
+)
 
 
 def model_price(config: Any, model: str) -> tuple[float, float] | None:
@@ -59,16 +77,16 @@ def estimate_usd(config: Any, usage: Any) -> float | None:
     prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
     read = int(getattr(usage, "cache_read_tokens", 0) or 0)
     written = int(getattr(usage, "cache_creation_tokens", 0) or 0)
-    claude = any(n in str(getattr(usage, "model", "")).lower() for n in ("claude", "opus", "sonnet", "haiku"))
-    if not claude:  # no documented cache discount for the other families: every prompt token at the input price
-        read = written = 0
+    name = str(getattr(usage, "model", "")).lower()
+    if any(n in name for n in CLAUDE_NAMES):
+        read_x, write_x = CACHE_READ_MULTIPLE, CACHE_WRITE_MULTIPLE
+    else:  # no documented write surcharge; a read is discounted only for the families that say so
+        read_x = next((x for needle, x in CACHE_READ_MULTIPLES if needle in name), 1.0)
+        write_x = 1.0
     fresh = max(0, prompt - read - written)
     completion = int(getattr(usage, "completion_tokens", 0) or 0)
     return (
-        fresh * price_in
-        + read * price_in * CACHE_READ_MULTIPLE
-        + written * price_in * CACHE_WRITE_MULTIPLE
-        + completion * price_out
+        fresh * price_in + read * price_in * read_x + written * price_in * write_x + completion * price_out
     ) / 1_000_000
 
 

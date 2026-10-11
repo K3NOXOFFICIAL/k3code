@@ -20,6 +20,7 @@ from typing import Any
 from k3code import userhooks
 from k3code.agent.loop import AgentLoop
 from k3code.autonomy import autonomy_cfg
+from k3code.errors import ContextOverflow
 from k3code.permissions import PermissionMode
 from k3code.permissions.state import PermissionState
 from k3code.prompting import build_system_prompt
@@ -119,14 +120,23 @@ class Handle:
             "diff_stat": self.diff_stat,
         }
 
+    def _left_behind(self) -> str:
+        """For a child that stopped early in a worktree: the work it did is committed on its branch, not lost."""
+        if self.isolation != "worktree" or self.merge != "pending":
+            return ""
+        return (
+            f"\n[worktree] its changes so far are on branch {self.branch} (not merged); look at them before redoing "
+            f"the work.\n{self.diff_stat}"
+        )
+
     def render(self) -> str:
         """What the parent model sees as the tool result."""
         if self.status in ("queued", "running"):  # not finished: there is no answer to read yet
             return f"Sub-agent {self.id} is still {self.status} ({self.tool_count} tool calls so far)."
         if self.status == "failed":
-            return f"Sub-agent {self.id} failed: {self.error}"
+            return f"Sub-agent {self.id} failed: {self.error}{self._left_behind()}"
         if self.status == "interrupted":
-            return f"Sub-agent {self.id} was interrupted. Partial result:\n{self.result}"
+            return f"Sub-agent {self.id} was interrupted. Partial result:\n{self.result}{self._left_behind()}"
         out = [self.result.strip() or "(the sub-agent returned no text)"]
         if self.isolation == "worktree":
             if self.merge == "no_changes":
@@ -443,7 +453,11 @@ class SubagentManager:
         except Exception as e:  # noqa: BLE001 - a child failing must come back as a result, not crash the parent
             logger.exception("sub-agent %s failed", h.id)
             h.status = "failed"
-            h.error = str(e)
+            h.error = (
+                f"it ran out of context ({e}); give the sub-agent a smaller task"
+                if isinstance(e, ContextOverflow)
+                else str(e)
+            )
             if h.worktree is not None:  # the checkout and branch of a dead child used to stay forever
                 with contextlib.suppress(Exception):
                     await self._finish_worktree(h, False)

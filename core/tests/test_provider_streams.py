@@ -143,3 +143,17 @@ async def test_openai_error_chunk_that_also_carries_choices_raises():
     with pytest.raises(ProviderError) as exc:
         await run(openai(body))
     assert "Provider returned error" in exc.value.message and exc.value.status_code == 502
+
+
+def test_cache_hits_are_read_from_every_openai_compatible_spelling():
+    from k3code.providers.openai_compat import _parse_usage
+
+    openai = _parse_usage(
+        {"prompt_tokens": 100, "completion_tokens": 5, "prompt_tokens_details": {"cached_tokens": 60}}
+    )
+    deepseek = _parse_usage({"prompt_tokens": 100, "prompt_cache_hit_tokens": 70, "prompt_cache_miss_tokens": 30})
+    moonshot = _parse_usage({"prompt_tokens": 100, "cached_tokens": 80})
+    relay = _parse_usage({"prompt_tokens": 100, "cache_read_input_tokens": 50, "cache_creation_input_tokens": 10})
+    none = _parse_usage({"prompt_tokens": 100})
+    assert [u.cache_read_tokens for u in (openai, deepseek, moonshot, relay, none)] == [60, 70, 80, 50, 0]
+    assert relay.cache_creation_tokens == 10

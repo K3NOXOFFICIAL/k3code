@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from k3code.providers.types import Message
@@ -44,10 +45,28 @@ def _call_line(call: Any) -> str:
     return f"{name}({text[:CALL_ARG_CHARS]}{'…' if len(text) > CALL_ARG_CHARS else ''})"
 
 
-def transcript_text(messages: list[Message] | list[dict[str, Any]], *, per_message: int = 1500) -> str:
+def _clip_middle(text: str, limit: int) -> str:
+    """``text`` cut to about ``limit`` characters keeping its start and its end (the end of a command's output is where
+    the result and the error are)."""
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    return f"{text[:head]}…{text[-(limit - head) :]}"
+
+
+def transcript_text(
+    messages: list[Message] | list[dict[str, Any]],
+    *,
+    per_message: int = 1500,
+    per_role: Mapping[str, int] | None = None,
+    whole_prefix: str = "",
+) -> str:
     """The conversation as text for a side model: who said what, with the tool calls the assistant made (name and
     cut-off arguments) and the name of the tool each result came from. A call has no text of its own, so a transcript
-    of ``content`` alone showed a summarizer file contents without the edits and commands that led to them."""
+    of ``content`` alone showed a summarizer file contents without the edits and commands that led to them.
+
+    ``per_message`` is how much of one message is shown; ``per_role`` overrides it for a role, and a tool result is cut
+    keeping its start and its end. A message that starts with ``whole_prefix`` (an earlier summary) is shown whole."""
     lines: list[str] = []
     for m in messages:
         get = m.get if isinstance(m, dict) else lambda k, _m=m: getattr(_m, k, None)
@@ -57,7 +76,15 @@ def transcript_text(messages: list[Message] | list[dict[str, Any]], *, per_messa
             continue
         if content:
             label = f"tool {get('name')}" if role == "tool" and get("name") else role
-            lines.append(f"{label}: {str(content)[:per_message]}")
+            text = str(content)
+            limit = (per_role or {}).get(role, per_message)
+            if whole_prefix and text.startswith(whole_prefix):
+                shown = text
+            elif role == "tool" and per_role and role in per_role:
+                shown = _clip_middle(text, limit)
+            else:
+                shown = text[:limit]
+            lines.append(f"{label}: {shown}")
         if calls := get("tool_calls") or []:
             lines.append(f"assistant called: {'; '.join(_call_line(c) for c in calls)}")
     return "\n".join(lines)

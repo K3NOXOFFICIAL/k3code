@@ -174,7 +174,12 @@ _RATE_LIMIT_PATTERNS = (
     "too many concurrent requests",
     "servicequotaexceededexception",
     "throttling",
+    "please wait before trying again",
 )
+
+# Bedrock words a throttle as "Too many tokens, please wait before trying again": it contains an overflow phrase but
+# only waiting helps, so these are checked before the overflow patterns wherever both could match
+_THROTTLE_PATTERNS = ("throttlingexception", "please wait before trying again")
 
 # Server busy, credential fine: back off on the same entry. Z.AI/Zhipu reuse
 # HTTP 429 for this, so the 429 path checks these first.
@@ -249,6 +254,20 @@ _CONTEXT_OVERFLOW_PATTERNS = (
     "error code: 413",
     "request_too_large",
     "request exceeds the maximum size",
+    # DashScope/Qwen, TGI/Together, SGLang, LiteLLM and `claude -p` word the same failure differently
+    "range of input length",
+    "`inputs` tokens",
+    "`inputs` must have less than",
+    "tokens) exceeds the maximum allowed length",
+    "contextwindowexceedederror",
+)
+
+# "Request too large ... Limit 30000, Requested 45678": the request alone is bigger than the whole per-minute bucket,
+# so waiting never admits it; only a smaller prompt does
+_REQUEST_TOO_LARGE_RE = re.compile(r"request too large.*?limit\D{1,6}(\d+).*?requested\D{1,6}(\d+)", re.S)
+
+_OUTPUT_VS_WINDOW_RE = re.compile(
+    r"is too large: (\d+)\..*?maximum context length is (\d+) tokens and your request has \d+ input tokens", re.S
 )
 
 # A rejected *output* cap ("max_tokens: 8192 > 4096, the maximum allowed number of output tokens for this model",
@@ -460,6 +479,7 @@ _MESSAGE_RULES: tuple[tuple[Sequence[str], FailoverReason], ...] = (
 )
 
 _5XX_RULES: tuple[tuple[Sequence[str], FailoverReason], ...] = (
+    (_THROTTLE_PATTERNS, _R.rate_limit),
     (_EMPTY_PROVIDER_RESPONSE_PATTERNS, _R.server),
     (_CONTEXT_OVERFLOW_PATTERNS, _R.context_overflow),
 )
@@ -469,8 +489,12 @@ _404_RULES: tuple[tuple[Sequence[str], FailoverReason], ...] = (
     (_MODEL_NOT_FOUND_PATTERNS, _R.bad_request),
 )
 
+_DAILY_CAP_WORDS = ("per day", "perday", "daily", "limit: 0")
+
+_RATE_LIMIT_ERROR_CODES = frozenset({"resource_exhausted", "throttled", "rate_limit_exceeded"})
+
 _ERROR_CODE_REASONS: dict[str, FailoverReason] = {
-    **dict.fromkeys(("resource_exhausted", "throttled", "rate_limit_exceeded"), _R.rate_limit),
+    **dict.fromkeys(_RATE_LIMIT_ERROR_CODES, _R.rate_limit),
     **dict.fromkeys(_QUOTA_ERROR_CODES, _R.quota),
     **dict.fromkeys(_MODEL_NOT_FOUND_ERROR_CODES, _R.bad_request),
     **dict.fromkeys(_CONTEXT_OVERFLOW_ERROR_CODES, _R.context_overflow),
@@ -561,6 +585,12 @@ def _status_400(c: _Ctx) -> FailoverReason:
         # but the input is what compaction can shrink: failing over through every entry never could
         return _R.context_overflow
     if code not in _CONTEXT_OVERFLOW_ERROR_CODES and any(p in msg for p in _OUTPUT_CAP_PATTERNS):
+        # vLLM words "the prompt plus max_tokens do not fit" as a rejected max_tokens. When max_tokens is a small part
+        # of the window the input is what is too big (compaction fixes that); when it is half of it or more, the cap is
+        # what this entry cannot take (another entry can)
+        found = _OUTPUT_VS_WINDOW_RE.search(msg)
+        if found and int(found[1]) * 2 <= int(found[2]):
+            return _R.context_overflow
         return _R.bad_request
     # A malformed message array is not overflow: the input can be tiny and
     # compaction cannot fix it.
@@ -571,6 +601,7 @@ def _status_400(c: _Ctx) -> FailoverReason:
     refined = _first_match(
         msg,
         (
+            (_THROTTLE_PATTERNS, _R.rate_limit),
             (_CONTEXT_OVERFLOW_PATTERNS, _R.context_overflow),
             (_MODEL_NOT_FOUND_PATTERNS, _R.bad_request),
             (_RATE_LIMIT_PATTERNS, _R.rate_limit),
@@ -604,10 +635,19 @@ def _status_404(c: _Ctx) -> FailoverReason:
     return _first_match(c.msg, _404_RULES) or _R.bad_request
 
 
+def _request_exceeds_limit(msg: str) -> bool:
+    """True for "Request too large ... Limit L, Requested R" with R > L (the wording of OpenAI and Groq's 429)."""
+    found = _REQUEST_TOO_LARGE_RE.search(msg)
+    return bool(found) and int(found[2]) > int(found[1])
+
+
 def _status_429(c: _Ctx) -> FailoverReason:
     # A structured quota code is decisive: a hard cap, not throttling.
     if c.code in _QUOTA_ERROR_CODES:
         return _R.quota
+    # Bigger than the whole per-minute bucket: waiting never admits it, compaction does.
+    if _request_exceeds_limit(c.msg):
+        return _R.context_overflow
     # Z.AI/Zhipu and others reuse 429 for server-wide overload: back off here.
     if any(p in c.msg for p in _OVERLOADED_PATTERNS):
         return _R.server
@@ -616,7 +656,10 @@ def _status_429(c: _Ctx) -> FailoverReason:
     quota_wall = c.code == "usage_limit_reached" or any(
         p in c.msg for p in ("usage_limit_reached",) + _USAGE_LIMIT_PATTERNS + _QUOTA_PATTERNS
     )
-    explicit_rate_limit = any(p in c.msg for p in _RATE_LIMIT_PATTERNS)
+    # Gemini words its per-minute throttle as "You exceeded your current quota" under RESOURCE_EXHAUSTED: that code
+    # says rate limit, unless the text names a daily cap or a zero allowance (those are walls)
+    coded_throttle = c.code in _RATE_LIMIT_ERROR_CODES and not any(p in c.msg for p in _DAILY_CAP_WORDS)
+    explicit_rate_limit = coded_throttle or any(p in c.msg for p in _RATE_LIMIT_PATTERNS)
     if quota_wall and not explicit_rate_limit and not _has_transient_signal(c):
         return _R.quota
     return _R.rate_limit
@@ -635,6 +678,8 @@ def _by_error_code(c: _Ctx) -> FailoverReason | None:
 
 def _by_message(c: _Ctx) -> FailoverReason | None:
     """Message patterns when no status settled it; status-less usage limits get the 402 split."""
+    if _request_exceeds_limit(c.msg):
+        return _R.context_overflow
     if any(p in c.msg for p in _USAGE_LIMIT_PATTERNS) and not any(
         p in c.msg for p in _OVERLOADED_PATTERNS + _CONTEXT_OVERFLOW_PATTERNS
     ):

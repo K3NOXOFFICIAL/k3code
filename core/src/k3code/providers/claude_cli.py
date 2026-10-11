@@ -214,6 +214,8 @@ def _error_from_result(result: dict[str, Any] | None, stderr: str, rc: int | Non
             status = 429
         elif "overloaded" in low:
             status = 529
+        elif "output token maximum" in low:
+            status = 400  # its own reply was too long: retrying the same call (what a 502 does) asks for the same reply
         else:
             status = 502
     return ProviderError(message=text, status_code=status, body={"error": {"message": text}})
@@ -234,7 +236,7 @@ class ClaudeCliProvider(Provider):
         thinking_models: tuple[str, ...] | list[str] = ("haiku",),
         effort: str | None = None,
         persistent: bool = True,
-        max_sessions: int = 4,
+        max_sessions: int = 5,
         idle_seconds: float = 600.0,
     ) -> None:
         self.name = name

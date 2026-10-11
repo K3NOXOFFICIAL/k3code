@@ -208,6 +208,13 @@ def unattended_prefix(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, n
     return build_argv(cwd, add_dirs, network=network)
 
 
+def shell_path() -> str:
+    """The shell a command runs under: bash where ``/bin/bash`` exists (the model writes ``[[ ]]``, ``<(...)``, arrays
+    and ``set -o pipefail``, which dash, the ``/bin/sh`` of Debian and Ubuntu, rejects or silently misreads), else
+    ``/bin/sh``. The literal path, not a PATH lookup: inside bwrap only /usr, /bin and /etc exist."""
+    return "/bin/bash" if os.access("/bin/bash", os.X_OK) else "/bin/sh"
+
+
 async def spawn_unattended_shell(
     command: str,
     *,
@@ -218,14 +225,14 @@ async def spawn_unattended_shell(
     stdout: int | None = asyncio.subprocess.PIPE,
     stderr: int | None = asyncio.subprocess.STDOUT,
 ) -> asyncio.subprocess.Process:
-    """Start ``command`` through ``/bin/sh`` inside bwrap, with the scrubbed :func:`child_env`.
+    """Start ``command`` through :func:`shell_path` inside bwrap, with the scrubbed :func:`child_env`.
 
     The single gate for unattended shell commands. Raises :class:`SandboxRefused` before anything is spawned.
     """
     prefix = await asyncio.to_thread(unattended_prefix, cwd, add_dirs)
     return await asyncio.create_subprocess_exec(
         *prefix,
-        "/bin/sh",
+        shell_path(),
         "-c",
         command,
         cwd=str(cwd),

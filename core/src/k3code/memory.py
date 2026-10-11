@@ -203,11 +203,18 @@ def fenced(label: str, body: str) -> str:
 _MANAGED_NOTE = re.compile(r"<!-- managed by k3code;[^>]*-->[ \t]*\n?")
 
 
-def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = MAX_MEMORY_TOTAL) -> str:
+def memory_prompt(
+    cwd: str | Path,
+    limit: int = MAX_MEMORY_CHARS,
+    total: int = MAX_MEMORY_TOTAL,
+    *,
+    learned: list[str] | None = None,
+) -> str:
     """User memory as written; the repository's memory files fenced as what they are (text from the repository).
 
     Each file is capped at ``limit`` characters and all of them together at ``total``; past that the rest are left
-    out with one marker line.
+    out with one marker line. ``learned``: the learned notes to show (a session's snapshot, see
+    ``LiveSession.learned_notes``); None reads learned.md now.
     """
     parts = []
     root = project_root(cwd)
@@ -232,8 +239,8 @@ def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = M
             name = m.path.name
         title = "Project rules" if m.scope == "rules" else "Project memory"
         parts.append(f"## {title} ({name})\n\n" + fenced("project instructions (from the repository):", body))
-    if learned := read_learned(cwd):
-        body = "\n".join(f"- {f}" for f in learned)[:limit]
+    if notes := (learned if learned is not None else read_learned(cwd)):
+        body = "\n".join(f"- {f}" for f in notes)[:limit]
         parts.append("## Learned project notes\n\n" + fenced(LEARNED_LABEL, body))
     return "\n\n".join(parts)
 

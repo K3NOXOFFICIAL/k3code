@@ -481,9 +481,14 @@ def _first_meaningful_line(text: str) -> Optional[str]:
 
 
 def _reindent_replacement(file_region: str, old_string: str, new_string: str) -> str:
-    """Re-anchor ``new_string``'s indentation onto the file's actual base indent after a
-    non-exact match: swap the LLM base prefix (first non-blank old_string line) for the
-    file's, preserving relative nesting; shallower lines anchor to the file base."""
+    """Re-anchor ``new_string``'s indentation onto the file's actual indentation after a
+    non-exact match. The whitespace each line of ``old_string`` has is paired with what the
+    matching file line has (the match is line for line), and a ``new_string`` line that starts
+    with one of those prefixes gets the file's: a tab-indented file edited with a
+    space-indented ``old_string`` keeps its tabs on the lines the edit repeats. A deeper level
+    the model added is spaces relative to its own unit, written as tabs in a tab file. Without
+    such a pairing: swap the model's base prefix for the file's, shallower lines anchoring to
+    the file base."""
     if not new_string:
         return new_string
     old_first = _first_meaningful_line(old_string)
@@ -495,14 +500,31 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
     if old_indent == file_indent:
         return new_string
 
+    old_lines, file_lines = old_string.split("\n"), file_region.split("\n")
+    ws_map: dict[str, str] = {}  # whitespace the model used -> what the file has on the same line
+    if len(old_lines) == len(file_lines):
+        for old_line, file_line in zip(old_lines, file_lines):
+            if old_line.strip() and file_line.strip():
+                ws_map.setdefault(_leading_whitespace(old_line), _leading_whitespace(file_line))
+    widths = sorted({len(w) for w in ws_map if " " in w and "\t" not in w})
+    unit = min((b - a for a, b in zip(widths, widths[1:])), default=4)
+
     out_lines: list[str] = []
     for line in new_string.split("\n"):
         if not line.strip():
             out_lines.append(line)
-        elif _leading_whitespace(line).startswith(old_indent):
+            continue
+        ws, body = _leading_whitespace(line), line.lstrip(" \t")
+        key = max((k for k in ws_map if ws.startswith(k)), key=len, default=None)
+        if key is not None:
+            rest = ws[len(key):]
+            if rest and "\t" in ws_map[key] + file_indent and "\t" not in rest:  # tab file, the model used spaces
+                rest = "\t" * (len(rest) // unit) + " " * (len(rest) % unit)
+            out_lines.append(ws_map[key] + rest + body)
+        elif ws.startswith(old_indent):
             out_lines.append(file_indent + line[len(old_indent):])
         else:
-            out_lines.append(file_indent + line.lstrip(" \t"))
+            out_lines.append(file_indent + body)
     return "\n".join(out_lines)
 
 

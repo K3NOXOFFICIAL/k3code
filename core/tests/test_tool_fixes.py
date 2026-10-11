@@ -40,7 +40,7 @@ async def test_a_plain_command_has_no_note_and_a_slow_one_still_times_out(tmp_pa
 async def test_ansi_codes_are_not_sent_to_the_model(tmp_path):
     res = await tool_bash({"command": "printf '\\033[31mred\\033[0m \\033[2K\\r50%%\\n'"}, cwd=tmp_path)
     assert "\x1b" in res["stdout"]  # the transcript keeps what the tool printed
-    assert format_tool_result(res) == "red \r50%"
+    assert format_tool_result(res) == "50%"  # colour codes gone; the line was erased and redrawn: the last frame
 
 
 # ── grep and glob ─────────────────────────────────────────────────────
@@ -121,10 +121,21 @@ async def test_a_block_of_several_lines_still_matches_loosely(tmp_path):
 
 async def test_a_resent_edit_answers_that_nothing_is_left_to_do(tmp_path):
     f = tmp_path / "f.py"
-    f.write_text("value = compute_the_answer()\n")
+    f.write_text("value = 1\n")
+    args = {"path": "f.py", "old_string": "value = 1\n", "new_string": "value = compute_the_answer()\n"}
+    first = await tool_edit(args, cwd=tmp_path)
+    assert first.get("ok")
+    res = await tool_edit(args, cwd=tmp_path)  # the model sends the same edit again: it is in the file
+    assert "error" not in res and "No change needed" in format_tool_result(res)
+
+
+async def test_an_old_string_that_was_never_there_is_an_error_even_if_new_string_exists_elsewhere(tmp_path):
+    f = tmp_path / "f.py"
+    f.write_text("value = compute_the_answer()\n")  # nobody edited this run: new_string is just already there
     args = {"path": "f.py", "old_string": "value = 1\n", "new_string": "value = compute_the_answer()\n"}
     res = await tool_edit(args, cwd=tmp_path)
-    assert "error" not in res and "No change needed" in format_tool_result(res)
+    assert "error" in res and "No change needed" not in str(res)
+    assert f.read_text() == "value = compute_the_answer()\n"
 
 
 # ── the arguments ─────────────────────────────────────────────────────

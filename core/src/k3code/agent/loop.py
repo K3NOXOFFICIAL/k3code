@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import context_budget
+from k3code.errors import ContextOverflow
 from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.state import PermissionState
@@ -22,6 +23,7 @@ from k3code.router import Router, RouterEvent
 from k3code.toolerrors import Failure, describe_call, failure_of
 from k3code.tools import (
     HOOK_FEEDBACK_KEY,
+    IGNORED_KEY,
     MAX_TOOL_RESULT_CHARS,
     SESSION_TOOLS,
     build_registry,
@@ -35,6 +37,8 @@ CUT_OFF_CONTINUE = (
     "Your previous answer was cut off at the output token limit. Continue exactly where it stopped; "
     "do not repeat what you already wrote."
 )
+#: the most a reply that spent its whole output limit on reasoning is retried with
+MAX_WIDENED_TOKENS = 32768
 CUT_OFF_CALL = (
     "Your reply hit the output token limit before this call's arguments were complete, so it did not run. "
     "Re-send it; split large content (a long file, a big edit) into several smaller calls."
@@ -113,6 +117,8 @@ class AgentLoop:
         #: share of the context window past which old tool results are elided
         self.elide_at_ratio = context_budget.ELIDE_AT_RATIO
         self._reads: dict[tuple[Any, ...], tuple[int, str]] = {}
+        #: True: ``_reads`` and ``_pinned`` belong to the session (share_reads) and outlive a run().
+        self._carry_reads = False
         self._step = 0
         #: M1: how much of one tool result the model is sent (the transcript keeps all of it); None = the default
         self.tool_output_chars = tool_output_chars
@@ -123,6 +129,7 @@ class AgentLoop:
         self._tool_errors = 0
         self._truncated: set[str] = set()  # ids of tool calls cut off by the output limit: never executed
         self._continuations = 0  # "continue" nudges after a text answer cut off by the output limit
+        self._widened = False  # the output limit was raised once after a reply that used all of it without writing
         #: the consecutive failed calls behind _tool_errors: (call, first error line), listed when the turn stops
         self._failed: list[tuple[str, str]] = []
         #: end a tool-error stop with an assistant message listing the failures (off when a higher tier continues)
@@ -195,10 +202,21 @@ class AgentLoop:
         prompt-cache miss at the start of every turn of a long session. Clear them when the history is rewritten."""
         self._elided, self._notes, self._carry_elision = elided, notes, True
 
+    def share_reads(self, reads: dict[tuple[Any, ...], tuple[int, str]], pinned: set[str]) -> None:
+        """Keep which files were read (and the results an "unchanged since" pointer needs to stay) in these
+        session-owned containers across runs: a file read in an earlier turn and unchanged since is answered with a
+        pointer to that result instead of being sent again. A pointer is only given while that result is still in the
+        conversation (see ``_execute_tool``), so a /clear or a rolled-back turn costs nothing but the saving. Clear them
+        where the history is rewritten."""
+        self._reads, self._pinned, self._carry_reads = reads, pinned, True
+
     def tool_specs(self) -> list[Any]:
-        """Tool specs for the model; ``exit_plan`` is only offered in plan mode."""
-        plan = self.permissions.mode == PermissionMode.PLAN
-        return [s for s in self.tools.specs() if plan or s.name != EXIT_PLAN_TOOL]
+        """Tool specs for the model. ``exit_plan`` is offered in plan mode, and always to a loop that has a plan
+        callback (a session's): the tool list is part of what the provider caches, so offering it only while plan mode
+        lasts rewrote the system prompt and the whole conversation on entering plan mode and again on leaving it. In
+        another mode it answers with an error that says so."""
+        show = self.permissions.mode == PermissionMode.PLAN or self.plan_callback is not None
+        return [s for s in self.tools.specs() if show or s.name != EXIT_PLAN_TOOL]
 
     def interrupt(self) -> None:
         """Request cancellation of the running turn (checked between steps and between streamed events)."""
@@ -238,11 +256,18 @@ class AgentLoop:
         # (another loop on a different tier may have attached its own since construction).
         self.reliability.attach_router(self.router)
         self.reliability.begin_turn()
-        self._pinned, self._reads, self._step, self._learned = set(), {}, 0, set()
+        self._step, self._learned = 0, set()
+        if not self._carry_reads:
+            self._pinned, self._reads = set(), {}
         if not self._carry_elision:
             self._elided, self._notes = set(), {}
         # an earlier run's failed calls must not count toward (or be listed in) this run's tool-error stop
         self._tool_errors, self._failed, self._truncated, self._continuations = 0, [], set(), 0
+        self._widened = False
+        if self.context_window:
+            # the reply shares the window with the prompt: a cap above a quarter of it leaves windows below ~32k
+            # unable to answer even "hi" (the prompt alone is several thousand tokens), whatever the caller passed
+            max_tokens = min(max_tokens, max(1024, self.context_window // 4))
         self.escalation_reason = None  # the REPL reuses one loop: a stop in an earlier run is not this run's
         messages: list[Message] = [
             Message(role="system", content=self.system_prompt),
@@ -338,6 +363,12 @@ class AgentLoop:
                         await aclose()  # closes the HTTP response: the provider stops generating
                     except Exception:
                         logger.debug("closing the interrupted stream failed", exc_info=True)
+            if final_message and final_message.stop_reason == "model_context_window_exceeded":
+                # the window ran out under the reply: its tail (or a call's arguments) is missing and the history is
+                # full. Not a finished answer: compact and go again, as for an overflow the provider rejects up front
+                if self.on_text_reset:
+                    await self.on_text_reset()
+                raise ContextOverflow("the model's context window was exhausted in the middle of its reply")
             if (
                 final_message
                 and not final_message.tool_calls
@@ -368,6 +399,26 @@ class AgentLoop:
                 if final_message.tool_calls:
                     tool_calls = final_message.tool_calls
                 else:
+                    if cut and not (final_message.content or "").strip():
+                        # the whole output limit went on reasoning: there is no answer to continue (a "continue"
+                        # nudge three times over cost three more full replies and still ended with nothing)
+                        messages.pop()
+                        self.reliability.save_transcript(messages)
+                        if not self._widened and max_tokens < MAX_WIDENED_TOKENS:
+                            self._widened = True
+                            max_tokens = min(max_tokens * 2, MAX_WIDENED_TOKENS)
+                            logger.info("Reply used the whole output limit without text: retrying with %d", max_tokens)
+                            continue
+                        note = (
+                            f"[The model used its whole {max_tokens}-token output limit before writing an answer. "
+                            "Raise max_tokens in the config, lower /effort, or split the request.]"
+                        )
+                        final_message = Message(role="assistant", content=note, usage=final_message.usage)
+                        messages.append(final_message)
+                        text_parts.append(note)
+                        if self.on_text_delta:
+                            await self.on_text_delta(note)
+                        cut = False
                     if cut and self._continuations < 3:
                         # the answer hit the output limit: it is not finished, so ask for the rest
                         self._continuations += 1
@@ -401,6 +452,7 @@ class AgentLoop:
 
             # Execute the tool calls and yield their results in the model's order. Consecutive read-only calls run
             # together (see _batches); every other call runs alone.
+            reply: list[tuple[ToolCall, bool, str]] = []  # (call, failed, first error line) of this reply's calls
             for batch in self._batches(tool_calls):
                 if self.interrupted:
                     logger.info("Interrupted before tool %s", batch[0].name)
@@ -428,20 +480,24 @@ class AgentLoop:
                     # Yield the tool result as a stream event
                     yield StreamEvent(type="done", message=tool_msg)
                     failure = self._observe_result(tc, result, notes)
-                    if "error" in result and "content" not in result:
-                        self._tool_errors += 1
-                        self._failed.append(
-                            (describe_call(tc.name, tc.arguments), failure.first_line if failure else "")
-                        )
-                    else:
-                        self._tool_errors, self._failed = 0, []
-                    if self.max_tool_errors and self._tool_errors >= self.max_tool_errors:
-                        self.escalation_reason = "tool_errors"
-                        if self.tool_error_stop_message:
-                            for stop_event in self._stop_for_tool_errors(messages):
-                                yield stop_event
-                        self.turn_messages = messages
-                        return
+                    reply.append((tc, _call_failed(result), failure.first_line if failure else ""))
+
+            # A reply is one step: it counts as a failed one only when every call in it failed, and the stop is judged
+            # here, after all of them ran. Counted per call, one reply of eight parallel reads of a wrong path stopped
+            # the turn (and moved it to the strong tier) before the model had seen a single error.
+            if reply and all(failed for _, failed, _ in reply):
+                self._tool_errors += 1
+                self._failed.extend((describe_call(tc.name, tc.arguments), line) for tc, _, line in reply)
+                del self._failed[:-50]
+            else:
+                self._tool_errors, self._failed = 0, []
+            if self.max_tool_errors and self._tool_errors >= self.max_tool_errors:
+                self.escalation_reason = "tool_errors"
+                if self.tool_error_stop_message:
+                    for stop_event in self._stop_for_tool_errors(messages):
+                        yield stop_event
+                self.turn_messages = messages
+                return
 
             messages.extend(notes)
             self.turn_messages = messages
@@ -573,7 +629,12 @@ class AgentLoop:
             self.on_auto_allow(tool_call.name, args, decision)
 
         read_key = self._read_key(args) if tool_call.name == "read" else None
-        if read_key is not None and (seen := self._reads.get(read_key)) and seen[1] not in self._elided:
+        if (
+            read_key is not None
+            and (seen := self._reads.get(read_key))
+            and seen[1] not in self._elided
+            and self._holds_result(seen[1])
+        ):
             step, call_id = seen
             self._pinned.add(call_id)  # the earlier result must stay in the requests: this one points at it
             return {
@@ -603,6 +664,10 @@ class AgentLoop:
             raise
         # M2: completion digest, so resume knows this call finished.
         self.reliability.journal_done(tool_call.id, result)
+        if ignored := _ignored_arguments(spec, args):
+            # an argument the tool has no parameter for was dropped: say so (a `-i` or `description` on a call that
+            # then ran with other semantics than asked looked like a success); the call itself still runs
+            result = {**result, IGNORED_KEY: ignored}
         if read_key is not None and "first" in result:
             self._reads[read_key] = (self._step if step is None else step, tool_call.id)
         post = await self._run_hooks(
@@ -617,6 +682,11 @@ class AgentLoop:
         if not self.hooks:
             return HookOutcome()
         return await self.hooks.run(event, {"tool_name": tool, **payload}, tool_name=tool)
+
+    def _holds_result(self, call_id: str) -> bool:
+        """Whether the tool result of ``call_id`` is in this run's conversation (the history it was given or what it
+        added): a pointer to a result a /clear, a rewind or a compaction removed would point at nothing."""
+        return any(m.role == "tool" and m.tool_call_id == call_id for m in self.turn_messages)
 
     def _read_key(self, args: dict[str, Any]) -> tuple[Any, ...] | None:
         """What makes two reads the same: the file (path, mtime, size) and the requested range; None if no file."""
@@ -642,7 +712,12 @@ class AgentLoop:
         # every old result at once. Judging the unelided request instead elided one more result on every step.
         view = (
             context_budget.elide_old_results(
-                wire, over=False, elided=self._elided, keep=self._pinned, notes=self._notes
+                wire,
+                over=False,
+                elided=self._elided,
+                keep=self._pinned,
+                notes=self._notes,
+                window=self.context_window,
             )
             if self._elided
             else wire
@@ -653,7 +728,9 @@ class AgentLoop:
             keep = set(self._pinned)
             if self.decide_context is not None:
                 keep |= await self._ask_decision_model(wire, threshold - overhead)
-            view = context_budget.elide_old_results(wire, over=True, elided=self._elided, keep=keep, notes=self._notes)
+            view = context_budget.elide_old_results(
+                wire, over=True, elided=self._elided, keep=keep, notes=self._notes, window=self.context_window
+            )
         return view
 
     async def _ask_decision_model(self, wire: list[Message], budget: float) -> set[str]:
@@ -661,7 +738,9 @@ class AgentLoop:
         may fill at most half of what plain elision would leave free under ``budget`` (message tokens); past that, the
         oldest kept results are elided after all. Keeping up to the threshold itself made the next step's result start a
         new batch (and a new prefix) on almost every step."""
-        candidates = context_budget.elision_candidates(wire, elided=self._elided, keep=self._pinned)
+        candidates = context_budget.elision_candidates(
+            wire, elided=self._elided, keep=self._pinned, window=self.context_window
+        )
         if not candidates:
             return set()
         try:
@@ -678,7 +757,12 @@ class AgentLoop:
         # the room left under the threshold: the other half is what the turn grows into before the next batch
         floor = context_budget.message_tokens(
             context_budget.elide_old_results(
-                wire, over=True, elided=set(self._elided), keep=self._pinned, notes=self._notes
+                wire,
+                over=True,
+                elided=set(self._elided),
+                keep=self._pinned,
+                notes=self._notes,
+                window=self.context_window,
             )
         )
         limit = floor + (budget - floor) / 2
@@ -794,7 +878,7 @@ class AgentLoop:
         ]
         stop_msg = Message(
             role="assistant",
-            content=f"I stopped because {self._tool_errors} tool calls in a row failed:\n"
+            content=f"I stopped because {len(self._failed)} tool calls in a row failed:\n"
             + "\n".join(lines)
             + "\nPlease tell me how to proceed (or fix what they need) and I will continue.",
         )
@@ -824,6 +908,31 @@ class AgentLoop:
             return {"error": "User rejected the plan; revise it and call exit_plan again."}
         self.permissions.mode = PermissionMode(target)
         return {"content": f"Plan approved; mode is now {self.permissions.mode.value}. Implement it."}
+
+
+def _call_failed(result: dict[str, Any]) -> bool:
+    """Whether a tool result counts as a failed call for the tool-error stop: an error result, or a bash command that
+    failed in earnest (exit code 2 or more, a signal, or any non-zero exit with something on stderr). Exit 1 with an
+    empty stderr is the convention of grep, diff and test runners for "no match" / "tests failed", which the model
+    handles; counting it would stop a turn that is working."""
+    if "error" in result and "content" not in result:
+        return True
+    code = result.get("exit_code")
+    if not isinstance(code, int) or code == 0:
+        return False
+    return code != 1 or bool(str(result.get("stderr") or "").strip())
+
+
+def _ignored_arguments(spec: Any, args: dict[str, Any]) -> str:
+    """A note naming the arguments of a built-in tool call that the tool does not take, or "". MCP tools are left alone:
+    their schemas are the server's, which may accept more than it declares."""
+    if spec.name.startswith("mcp__") or not isinstance(args, dict):
+        return ""
+    props = (spec.parameters or {}).get("properties") or {}
+    extra = [k for k in args if k not in props and not k.startswith("_")]
+    if not extra or not props:
+        return ""
+    return f"ignored arguments: {', '.join(extra)}; {spec.name} takes: {', '.join(props)}"
 
 
 def _preview(tool: str, args: dict[str, Any]) -> str:

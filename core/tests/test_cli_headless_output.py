@@ -46,3 +46,12 @@ def test_a_headless_run_stopped_by_the_max_turns_cap_fails_and_says_why(tmp_path
     assert res.returncode == 1, res.stderr
     assert "k3code: error: stopped after 2 model calls (the max_turns cap" in res.stderr
     assert "I stopped after 2 model calls" in res.stdout
+
+
+def test_a_headless_run_that_keeps_failing_the_same_tool_stops_and_fails(tmp_path):
+    # a missing file on every request: after autonomy.max_tool_errors failures in a row the run ends non-zero
+    step = {"type": "tool_call", "id": "c1", "name": "read", "arguments": {"path": "does-not-exist.txt"}}
+    res = _run(tmp_path, [step], extra_config="max_turns: 40\nautonomy:\n  max_tool_errors: 3\n")
+    assert res.returncode == 1, res.stderr
+    assert "k3code: error: stopped after 3 failed tool calls in a row (autonomy.max_tool_errors)" in res.stderr
+    assert "read(" in res.stderr or "does-not-exist.txt" in res.stderr

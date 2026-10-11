@@ -34,21 +34,56 @@ COMPACT_AT_RATIO = 0.7
 ELIDE_AT_RATIO = 0.5
 #: ...except the results of the last ELIDE_KEEP_CALLS tool calls and results of at most ELIDE_MIN_CHARS chars.
 ELIDE_KEEP_CALLS = 6
-ELIDE_MIN_CHARS = 2000
+#: A marker is 60-90 chars, so a result past this is a net saving to elide. At 2000 the results of a long turn of small
+#: reads and commands were never elided and the turn overflowed after a few hundred calls.
+ELIDE_MIN_CHARS = 300
+#: The kept results (ELIDE_KEEP_CALLS at most) are also bounded to this share of the window, so a few huge results do
+#: not make most of each request "recent" and un-elidable (it then re-triggered, and re-wrote the cache, every step).
+ELIDE_KEEP_SHARE = 0.15
+
+#: The largest window accepted from config or setup: past this a typo ("1e12") would switch compaction off for good.
+MAX_WINDOW = 10_000_000
+
+
+def parse_window(text: str) -> int | None:
+    """Tokens from ``32000``, ``32_000``, ``32,000``, ``32k`` or ``1m``; None for anything else (or a nonsense size)."""
+    t = text.strip().lower().replace("_", "").replace(",", "")
+    mult = 1000 if t.endswith("k") else 1_000_000 if t.endswith("m") else 1
+    try:
+        n = int(float(t.removesuffix("k").removesuffix("m")) * mult)
+    except (ValueError, OverflowError):  # "abc"; "inf" and "1e400"
+        return None
+    return n if 1000 <= n <= MAX_WINDOW else None
 
 
 def _explicit_window(config: Any, model_id: str) -> int | None:
-    """The ``models.<model_id>.context_window`` from config, or None when unset."""
+    """The ``models.<model_id>.context_window`` from config, or None when unset or not a usable size (a hand-edited
+    ``"200k"`` string works; ``[200000]``, ``-1`` or ``true`` count as unset instead of failing every prompt)."""
     entry = (getattr(config, "models", None) or {}).get(model_id) or {}
-    if isinstance(entry, dict) and entry.get("context_window"):
-        return int(entry["context_window"])
-    return None
+    raw = entry.get("context_window") if isinstance(entry, dict) else None
+    if raw is None or isinstance(raw, bool | list | dict):
+        return None
+    return parse_window(str(raw))
 
 
 def context_window(config: Any, model_id: str) -> int:
     """Tokens the model ``model_id`` takes: an explicit ``models.<id>.context_window`` entry, else the family
     window, else FALLBACK_WINDOW."""
     return _explicit_window(config, model_id) or family_window(model_id) or FALLBACK_WINDOW
+
+
+def router_window(config: Any, router: Any, fallback_model: str) -> int:
+    """The smallest context window among the models ``router`` can send to (a cheap tier or an escalated one has its
+    own), so elision starts before the tightest model overflows; ``fallback_model``'s when the router lists none."""
+    models = [e.model for e in getattr(router, "chain", None) or [] if getattr(e, "model", None)]
+    if not models:
+        return context_window(config, fallback_model)
+    return min(context_window(config, m) for m in models)
+
+
+def tool_output_limit(config: Any) -> int | None:
+    """``context.tool_output_chars`` from config: how much of one tool result the model is sent; None = the default."""
+    return int((getattr(config, "context", None) or {}).get("tool_output_chars", 0) or 0) or None
 
 
 def has_explicit_window(config: Any, model_id: str) -> bool:
@@ -154,16 +189,44 @@ def message_tokens(messages: Sequence[Message]) -> int:
     return tokens
 
 
+def kept_calls(messages: Sequence[Message], window: int | None = None) -> int:
+    """How many of the newest tool results stay whole: ELIDE_KEEP_CALLS, fewer when the newest ones already weigh
+    ELIDE_KEEP_SHARE of ``window``. Never fewer than the results of the latest step (the model has not seen them yet)
+    and never fewer than one. The count only grows as results are appended, so a result once elided stays elided."""
+    if not window:
+        return ELIDE_KEEP_CALLS
+    budget = window * ELIDE_KEEP_SHARE
+    kept = used = 0
+    for m in reversed(messages):
+        if m.role != "tool":
+            continue
+        used += text_tokens(m.content or "")
+        if used > budget or kept >= ELIDE_KEEP_CALLS:
+            break
+        kept += 1
+    trailing = 0
+    for m in reversed(messages):
+        if m.role != "tool":
+            break
+        trailing += 1
+    return max(kept, min(trailing, ELIDE_KEEP_CALLS), 1)
+
+
 def elide_marker(name: str | None, chars: int) -> str:
     return f"[earlier {name or 'tool'} result elided: {chars} chars — re-run if needed]"
 
 
 def elision_candidates(
-    messages: Sequence[Message], *, elided: set[str], keep: set[str] | frozenset[str] = frozenset()
+    messages: Sequence[Message],
+    *,
+    elided: set[str],
+    keep: set[str] | frozenset[str] = frozenset(),
+    window: int | None = None,
 ) -> list[Message]:
     """The tool results a request over the threshold would newly elide (see elide_old_results), in order."""
     tool_idx = [i for i, m in enumerate(messages) if m.role == "tool"]
-    old = tool_idx[:-ELIDE_KEEP_CALLS] if len(tool_idx) > ELIDE_KEEP_CALLS else []
+    kept = kept_calls(messages, window)
+    old = tool_idx[:-kept] if len(tool_idx) > kept else []
     return [
         messages[i]
         for i in old
@@ -180,17 +243,19 @@ def elide_old_results(
     elided: set[str],
     keep: set[str] | frozenset[str] = frozenset(),
     notes: dict[str, str] | None = None,
+    window: int | None = None,
 ) -> list[Message]:
     """The request with old tool results replaced by a marker; ``messages`` itself is not changed.
 
-    Results older than the last ELIDE_KEEP_CALLS tool results and longer than ELIDE_MIN_CHARS are elided while the
+    Results older than the newest kept_calls() tool results and longer than ELIDE_MIN_CHARS are elided while the
     request is ``over`` the threshold. A result once elided stays elided for the rest of the turn (its id is added to
     ``elided``), so the request prefix does not flip back and forth around the threshold. Ids in ``keep`` are never
     elided (a later "unchanged since" read points at them). ``notes`` (from the decision model, see
     k3code.context_select) holds what is still worth knowing of an elided result; it follows the marker.
     """
     tool_idx = [i for i, m in enumerate(messages) if m.role == "tool"]
-    old = set(tool_idx[:-ELIDE_KEEP_CALLS]) if len(tool_idx) > ELIDE_KEEP_CALLS else set()
+    kept = kept_calls(messages, window)
+    old = set(tool_idx[:-kept]) if len(tool_idx) > kept else set()
     old_calls = {messages[i].tool_call_id for i in old}
     out: list[Message] = []
     for i, m in enumerate(messages):

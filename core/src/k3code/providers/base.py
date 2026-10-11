@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import AsyncIterator
+import json
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,34 @@ class ProviderError(Exception):
 
     def __str__(self) -> str:  # pragma: no cover - trivial
         return self.message
+
+
+#: characters of a non-JSON error body shown in the message / kept for the classifier (challenge-page markers sit deep)
+ERROR_TEXT_SHOWN = 500
+ERROR_TEXT_KEPT = 4000
+
+
+def error_from_http(
+    raw: bytes, status_code: int, headers: dict[str, str], message_of: Callable[[dict[str, Any]], str]
+) -> ProviderError:
+    """The ``ProviderError`` for an HTTP error response. A JSON body is read by ``message_of``; a plain-text or HTML one
+    (a gateway, a local server, a CDN page) is the only diagnostic there is, so its text is kept: the message shows
+    the start of it and the classifier gets more of it, so an overflow or a WAF marker is still recognised."""
+    try:
+        body = json.loads(raw) if raw else {}
+    except ValueError:
+        body = {}
+    if not isinstance(body, dict):
+        body = {"message": str(body)}
+    message = message_of(body)
+    if not message and not body:
+        text = raw.decode("utf-8", "replace").strip()
+        if text:
+            message = " ".join(text[:ERROR_TEXT_SHOWN].split())
+            body = {"message": text[:ERROR_TEXT_KEPT]}
+    return ProviderError(
+        message=message or f"HTTP {status_code}", status_code=status_code, headers=dict(headers), body=body
+    )
 
 
 class Provider(abc.ABC):

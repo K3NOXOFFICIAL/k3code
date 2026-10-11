@@ -49,6 +49,7 @@ class ModelCaller:
         emit: Callable[[str, dict[str, Any]], None] | None = None,
         last_attempt: Callable[[], tuple[str, str]] | None = None,
         turn_of: Callable[[str], str] | None = None,
+        charge: Callable[[str, Any], None] | None = None,
     ) -> None:
         self._routers = routers
         self.config = config
@@ -57,6 +58,9 @@ class ModelCaller:
         self._last_attempt = last_attempt
         #: session id -> the turn id in flight, so side calls (titles, compaction, judges) join that turn's totals
         self._turn_of = turn_of
+        #: (session id, usage) → applies a call's usage to that session's budgets: a side call (compaction, scope
+        #: classifier, goal judge, advisor) is spend like any other, and was written to the usage log only
+        self._charge = charge
 
     async def complete(
         self,
@@ -166,4 +170,9 @@ class ModelCaller:
                 turn=self._turn_of(session_id) if self._turn_of else "",
                 seconds=seconds,
             )
+        if self._charge is not None and usage is not None and session_id:
+            try:
+                self._charge(session_id, usage)
+            except Exception:  # noqa: BLE001 - accounting must never fail the call it accounts for
+                logger.debug("charging a side call failed", exc_info=True)
         return CallResult(final.content or "", tier, model, provider, pt, ct)

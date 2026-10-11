@@ -60,7 +60,9 @@ from k3code.context_budget import (
     compact_threshold,
     context_window,
     overhead_tokens,
+    router_window,
     text_tokens,
+    tool_output_limit,
 )
 from k3code.context_select import decide, decision_settings
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
@@ -84,11 +86,18 @@ from k3code.gateway.protocol import (
     reply_id,
 )
 from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, StoredSession, scrub_surrogates
-from k3code.goals import CONTINUATION_PROMPT_RECOVER_TEMPLATE, MAX_KICKS_PER_WINDOW, GoalManager, make_judge
+from k3code.goals import (
+    CONTINUATION_PROMPT_RECOVER_TEMPLATE,
+    GOAL_QUOTE_CHARS,
+    MAX_KICKS_PER_WINDOW,
+    GoalManager,
+    make_judge,
+    quote,
+)
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
-from k3code.memory import fenced
+from k3code.memory import fenced, read_learned
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
@@ -119,10 +128,10 @@ from k3code.routing.tiers import (
     tier_for,
     tier_model_specs,
 )
-from k3code.session_ai import compact_messages, make_title
+from k3code.session_ai import SUMMARY_PREFIX, compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
-from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_for_model, register_todo
+from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_for_model, register_todo, render_todos
 from k3code.tools import build_registry as build_tool_registry
 from k3code.tools import jobs as tool_jobs
 from k3code.usage import UsageDB
@@ -255,6 +264,10 @@ class LiveSession:
         )
         self.todos: list[dict[str, Any]] = []
         self.todo_revision = 0
+        #: The learned notes (learned.md, written by the background review) as this session's prompt shows them: taken
+        #: when the prompt is first built, so a note written mid-session does not change the prompt (and make the
+        #: provider re-write the whole conversation); None = read them again, as after a compaction or /clear.
+        self.learned_notes: list[str] | None = None
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
         self.pending_request_id: str | None = None
         # an invalid configured permission_mode fails this session's creation with a named error (an RPC reply), not
@@ -314,6 +327,10 @@ class LiveSession:
         #: loop of each turn shares them: see AgentLoop.share_elision); emptied when a compaction rewrites the history.
         self.elided: set[str] = set()
         self.elide_notes: dict[str, str] = {}
+        #: Files read so far ((path, mtime, size, range) → (step, tool call id)) and the results a pointer to one needs
+        #: kept whole (AgentLoop.share_reads); emptied where the history is rewritten, with ``elided``.
+        self.reads: dict[tuple[Any, ...], tuple[int, str]] = {}
+        self.pinned_reads: set[str] = set()
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
         #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
@@ -511,6 +528,10 @@ def _model_label(config: Any, key: str) -> str:
 #: How many recent messages stay when a session's older messages are folded into a summary. When that happens is
 #: context_budget.compact_threshold: context.compact_at_ratio of the active model's window, or compact_at_tokens.
 CONTEXT_DEFAULTS: dict[str, Any] = {"keep_messages": 8, "compact_input_chars": 60_000}
+#: What the model is told when its turn goes on after a compaction in the middle of it.
+COMPACTED_CONTINUATION = (
+    "The context was compacted mid-task; continue where you stopped and do not repeat finished steps."
+)
 #: After a failed automatic compaction, seconds before the next turn tries again.
 COMPACT_RETRY_AFTER_S = 120.0
 
@@ -527,8 +548,11 @@ def _estimate_tokens(messages: list[dict[str, Any]], tool_output_chars: int | No
         if m.get("role") == "tool" and isinstance(c, str):
             c = clip_for_model(m.get("name"), c, tool_output_chars or MAX_TOOL_RESULT_CHARS)
         tokens += text_tokens(c) if isinstance(c, str) else text_tokens(json.dumps(c, ensure_ascii=False)) if c else 0
-        if m.get("tool_calls"):
-            tokens += text_tokens(json.dumps(m["tool_calls"], ensure_ascii=False))
+        for tc in m.get("tool_calls") or []:
+            # the name and the arguments once, as context_budget.message_tokens counts them (the whole call dict carried
+            # the arguments twice when both the parsed and the raw form were stored)
+            args = tc.get("raw_arguments") or json.dumps(tc.get("arguments") or {}, ensure_ascii=False)
+            tokens += text_tokens(str(tc.get("name") or "") + args)
     return tokens
 
 
@@ -641,6 +665,7 @@ class GatewayServer:
             emit=lambda t, p: self.emit(t, p),
             last_attempt=lambda: self.last_attempt,
             turn_of=self._turn_of,
+            charge=self._charge_side_call,
         )
         self.autonomy = PlanFirst(self)
         self.learning = LearningHub(self, self.autonomy.proposals)
@@ -1714,6 +1739,7 @@ class GatewayServer:
             try:
                 if not blocked:
                     await self._maybe_compact(session)  # a blocked prompt reaches no model, not even the summary one
+                prompt = self._with_long_goal(session, mgr, prompt)
                 n_before = len(session.stored.messages)
                 if hooked is None:
                     status, final_text = await self._run_one_turn(session, prompt)
@@ -1728,11 +1754,23 @@ class GatewayServer:
                     # The provider says the conversation does not fit: drop this attempt's messages, fold the older
                     # history into a summary, and run the prompt once more.
                     failed_attempt = session.stored.messages
-                    session.stored.messages = failed_attempt[:n_before]
-                    if await self._maybe_compact(session, force=True):
-                        status, final_text = await self._run_one_turn(session, prompt)
-                    else:  # nothing could be folded: no retry, and the failed attempt stays in the history
+                    session.stored.messages = failed_attempt[:n_before]  # fold the older history only
+                    if not await self._maybe_compact(session, force=True):
+                        # nothing could be folded: no retry, and the failed attempt stays in the history
                         session.stored.messages = failed_attempt
+                    else:
+                        prompt = self._with_long_goal(session, mgr, prompt)  # the compaction may have folded the goal
+                        if any(m.get("role") == "tool" for m in failed_attempt[n_before:]):
+                            # tools already ran in this turn: keep that work and go on from it. Running the prompt
+                            # again threw away every model call and replayed non-idempotent steps (a push, a migration)
+                            session.stored.messages = [*session.stored.messages, *failed_attempt[n_before:]]
+                            status, final_text = await self._run_one_turn(
+                                session, prompt, continuation=COMPACTED_CONTINUATION
+                            )
+                        else:
+                            status, final_text = await self._run_one_turn(session, prompt)
+                if status == "error" and isinstance(session.last_exc, ContextOverflow):
+                    self._clip_unfittable_prompt(session)
             except asyncio.CancelledError:
                 # /stop and Esc cancel the turn task: the cancellation skips _run_one_turn's outcome mapping, so the
                 # turn read 'idle' (or an earlier turn's 'failed'). Interrupted ends as completed, like TurnCancelled.
@@ -1793,6 +1831,18 @@ class GatewayServer:
                 return status, final_text
             prompt = decision.prompt
             session.goal_continuation = True  # unattended from here on: the goal drives the next turn
+
+    @staticmethod
+    def _with_long_goal(session: LiveSession, mgr: GoalManager, prompt: str) -> str:
+        """A goal continuation quotes a long goal by its start and a pointer to the message that holds it (see
+        goals.quote). When no message of the retained history holds the whole text any more (a compaction folded it, the
+        first-message anchor cut it, /clear), the prompt carries the whole goal again."""
+        state = mgr.state
+        if state is None or len(state.goal) <= GOAL_QUOTE_CHARS or quote(state.goal) not in prompt:
+            return prompt
+        if any(state.goal in str(m.get("content") or "") for m in session.stored.messages):
+            return prompt
+        return prompt.replace(quote(state.goal), state.goal)
 
     def _start_implicit_goal(self, session: LiveSession, mgr: GoalManager, text: str) -> None:
         """``autonomy.auto_continue``: an interactive prompt becomes the goal of its own turn loop, judged after each
@@ -1908,7 +1958,7 @@ class GatewayServer:
             return None  # the user's --turns budget is spent: the goal pauses
         session.goal_retry_streak += 1
         delay = GoalManager.backoff(session.goal_retry_streak - 1)
-        prompt = CONTINUATION_PROMPT_RECOVER_TEMPLATE.format(goal=state.goal, why=why)
+        prompt = CONTINUATION_PROMPT_RECOVER_TEMPLATE.format(goal=quote(state.goal), why=why)
         notice = f"↻ The goal's turn did not finish: {why}. Trying again in {delay:.0f} s; /goal clear stops it."
         return delay, prompt, notice
 
@@ -1953,6 +2003,25 @@ class GatewayServer:
         if self.automation is not None:
             self.automation.session_event(session.session_id, status, str(session.stored.meta.get("origin") or ""))
 
+    def _charge_side_call(self, session_id: str, usage: Usage) -> None:
+        """A one-shot call's usage (see ModelCaller) counts against the session's budgets and the day's ledger."""
+        live = self.live.get(session_id)
+        if live is not None and live.reliability is not None:
+            live.reliability.record_usage(usage)
+
+    def _system_prompt_for(self, session: LiveSession) -> str:
+        """The session's system prompt, with the learned notes as the session first saw them."""
+        if session.learned_notes is None:
+            session.learned_notes = read_learned(session.perms.cwd)
+        return build_system_prompt(
+            session.system_prompt,
+            cwd=session.perms.cwd,
+            config=self.config,
+            session_meta=session.stored.meta,
+            mcp=self.mcp,
+            learned=session.learned_notes,
+        )
+
     def _build_loop(
         self,
         session: LiveSession,
@@ -1968,13 +2037,7 @@ class GatewayServer:
         silent (the next tier carries on); otherwise the stop ends the turn with the list of failed calls."""
         loop = AgentLoop(
             router,
-            system_prompt=build_system_prompt(
-                session.system_prompt,
-                cwd=session.perms.cwd,
-                config=self.config,
-                session_meta=session.stored.meta,
-                mcp=self.mcp,
-            ),
+            system_prompt=self._system_prompt_for(session),
             max_turns=self.config.max_turns,
             headless=False,
             on_event=self._on_router_event,
@@ -1993,10 +2056,11 @@ class GatewayServer:
             unattended_network=bool(autonomy_cfg(self.config)["unattended_network"]),
             task_kind=kind.value,
             max_tool_errors=max_tool_errors,
-            tool_output_chars=int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None,
+            tool_output_chars=tool_output_limit(self.config),
             context_window=self._router_window(router, session),
         )
         loop.share_elision(session.elided, session.elide_notes)
+        loop.share_reads(session.reads, session.pinned_reads)
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
@@ -2097,20 +2161,40 @@ class GatewayServer:
             **router_options(self.config),
         )
 
+    def _clip_unfittable_prompt(self, session: LiveSession) -> None:
+        """A last user message that alone overflows the window is clipped in the stored history. The model never saw it;
+        left whole it was resent, and rejected, by every later prompt, and neither /compress nor /retry could help."""
+        last = session.stored.messages[-1] if session.stored.messages else {}
+        content = last.get("content")
+        if last.get("role") != "user" or not isinstance(content, str):
+            return
+        limit = context_window(self.config, self._compaction_model(session)) // 2  # chars: ~an eighth of the window
+        if len(content) <= limit:
+            return
+        marker = (
+            f"\n…[{len(content) - limit:,} characters removed: this message alone is larger than the context window]"
+        )
+        session.stored.messages[-1] = {**last, "content": content[:limit] + marker}
+        self.store.save(session.stored)
+
     def _router_window(self, router: Router, session: LiveSession) -> int:
         """The smallest context window among the models ``router`` can send to (a cheap tier or an escalated one
         has its own), so in-turn elision starts before the tightest model overflows."""
-        models = [e.model for e in getattr(router, "chain", None) or [] if e.model]
-        if not models:
-            return context_window(self.config, self._active_model(session))
-        return min(context_window(self.config, m) for m in models)
+        return router_window(self.config, router, self._active_model(session))
 
     async def _run_one_turn(
-        self, session: LiveSession, text: str, *, hooked: userhooks.HookOutcome | None = None
+        self,
+        session: LiveSession,
+        text: str,
+        *,
+        hooked: userhooks.HookOutcome | None = None,
+        continuation: str | None = None,
     ) -> tuple[str, str]:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text).
 
-        ``hooked``: the outcome of the user's hooks when the caller already ran them for ``text``."""
+        ``hooked``: the outcome of the user's hooks when the caller already ran them for ``text``. ``continuation``:
+        the turn goes on after a compaction in its middle; ``text`` is already in the history, so the hooks and the
+        scope gate (which ran for it) do not run again and the model is sent this note instead."""
         if self.halted:  # /daemon pause: nothing reaches a provider; the caller pauses the goal (status 'halted')
             return "halted", ""
         self._ensure_router(session.stored.model or None)
@@ -2184,11 +2268,13 @@ class GatewayServer:
         session.current_kind = kind.value
         prompt_blocked = False
         try:
+            if continuation is not None:
+                hooked = userhooks.HookOutcome()
             if hooked is None:
                 hooked = await self._prompt_hooks(session, loop.hooks, text)  # before anything spends a model call
             prompt_blocked = hooked.blocked
             try:
-                if not hooked.blocked:
+                if not hooked.blocked and continuation is None:
                     gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
             except Exception:  # noqa: BLE001 - the autonomy layer must never block the user's task
                 logger.exception("autonomy gate failed; running the task directly")
@@ -2223,7 +2309,7 @@ class GatewayServer:
                 loop.on_checkpoint = lambda: self._checkpoint_turn(session)
                 session.loop = loop
             history = session.history
-            prompt = gate.prompt
+            prompt = continuation if continuation is not None else gate.prompt
             if hooked.blocked:
                 gate.proceed, gate.message = False, f"Prompt blocked by a UserPromptSubmit hook: {hooked.reason}"
             elif extra := hooked.context_text():
@@ -2473,15 +2559,51 @@ class GatewayServer:
         current = session.stored.messages
         if current[: len(snapshot)] != snapshot:  # /clear or another rewrite ran during the summary call: it wins
             return 0
+        new = self._with_todos(session, snapshot[:folded], new)
         session.stored.messages = [*new, *current[len(snapshot) :]]  # what was appended meanwhile stays
         if isinstance(session.stored.meta.get("goal_started"), dict):
             session.stored.meta["goal_started"]["message"] = 0  # the indices moved; the summary covers the goal's start
         session.elided.clear()  # the history is new: nothing of it is elided yet
         session.elide_notes.clear()
+        session.reads.clear()  # and the results it pointed at may be folded
+        session.pinned_reads.clear()
+        session.learned_notes = None  # the provider's cache of it is gone anyway: show the notes written since
         session.stored.meta["compactions"] = int(session.stored.meta.get("compactions") or 0) + 1
         self.store.save(session.stored)
         logger.info("compacted %d messages of session %s (%d left)", folded, session.session_id, len(new))
         return folded
+
+    @staticmethod
+    def _with_todos(
+        session: LiveSession, folded: list[dict[str, Any]], new: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """``new`` (the compacted history) with the todo list added to its summary when the call that wrote the list was
+        folded: the model reads the list from that call's arguments, so folding it left the model without a plan the
+        panel still showed. Not when the list was cleared, when the kept tail has a todo call of its own, or when the
+        list is not from this conversation (a ``/clear`` leaves it in the meta, and nothing folded mentions it)."""
+        todos = session.stored.meta.get("todos") or []
+
+        def calls_todo(messages: list[dict[str, Any]]) -> bool:
+            return any(c.get("name") == "todo" for m in messages for c in (m.get("tool_calls") or []))
+
+        def summary_has_list(m: dict[str, Any]) -> bool:
+            content = str(m.get("content") or "")
+            return content.startswith(SUMMARY_PREFIX) and "\nTodos (" in content
+
+        summary_at = next(
+            (i for i, m in enumerate(new) if str(m.get("content") or "").startswith(SUMMARY_PREFIX)), None
+        )
+        if not todos or summary_at is None:
+            return new
+        if not (calls_todo(folded) or any(summary_has_list(m) for m in folded)) or calls_todo(new[summary_at + 1 :]):
+            return new
+        summary = new[summary_at]
+        content = str(summary.get("content") or "")
+        return [
+            *new[:summary_at],
+            {**summary, "content": f"{content}\n\n{render_todos(todos)}"},
+            *new[summary_at + 1 :],
+        ]
 
     async def _maybe_compact(self, session: LiveSession, *, force: bool = False) -> int:
         """Fold the older part of the conversation into a summary once it is large; returns how many messages folded.
@@ -2556,17 +2678,10 @@ class GatewayServer:
         """Estimated size of the session's next request: the stored conversation (its stored system entry is not sent:
         the loop builds a fresh one) plus the system prompt and the tool schemas every request carries."""
         if not session.overhead_tokens:  # no loop built yet in this daemon: the prompt and the built-in tools
-            prompt = build_system_prompt(
-                session.system_prompt,
-                cwd=session.perms.cwd,
-                config=self.config,
-                session_meta=session.stored.meta,
-                mcp=self.mcp,
-            )
+            prompt = self._system_prompt_for(session)
             session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
         conversation = [m for m in session.stored.messages if m.get("role") != "system"]
-        limit = int((getattr(self.config, "context", None) or {}).get("tool_output_chars", 0)) or None
-        return _estimate_tokens(conversation, limit) + session.overhead_tokens
+        return _estimate_tokens(conversation, tool_output_limit(self.config)) + session.overhead_tokens
 
     async def _auto_title(self, session: LiveSession, first_message: str) -> None:
         """Name a fresh session on the ``title`` task kind; best-effort, never surfaces errors."""

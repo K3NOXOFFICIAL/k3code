@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from k3code.providers.base import Provider, ProviderError, request_headers, to_provider_error
+from k3code.providers.base import Provider, ProviderError, error_from_http, request_headers, to_provider_error
 from k3code.providers.effort import anthropic_effort
 from k3code.providers.types import (
     Message,
@@ -218,15 +218,7 @@ def _add_cache_breakpoints(payload: dict[str, Any], ttl: str = "5m") -> None:
 
 
 async def _error_from_response(response: httpx.Response) -> ProviderError:
-    try:
-        text = await response.aread()
-        body = json.loads(text) if text else {}
-        if not isinstance(body, dict):
-            body = {"message": str(body)}
-    except Exception:
-        body = {}
-    message = _error_message(body) or f"HTTP {response.status_code}"
-    return ProviderError(message=message, status_code=response.status_code, headers=dict(response.headers), body=body)
+    return error_from_http(await response.aread(), response.status_code, dict(response.headers), _error_message)
 
 
 _INBAND_STATUS = {
@@ -262,7 +254,7 @@ def _parse_args(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(raw, strict=False)  # a raw newline or tab inside a string is a model slip, not a truncation
         return parsed if isinstance(parsed, dict) else {"_raw": parsed}
     except json.JSONDecodeError:
         return {"_unparsed": raw}

@@ -235,6 +235,10 @@ class Governor:
     def add_budget(self, budget: Budget) -> None:
         self._budgets[budget.scope] = budget
 
+    def remove_budget(self, scope: str) -> None:
+        """Drop the budget of ``scope`` (a temporary one, such as an orchestration's token cap)."""
+        self._budgets.pop(scope, None)
+
     def record_usage(self, prompt_tokens: int, completion_tokens: int, *, usd: float | None = None) -> None:
         """Apply a usage report (from router 'done' messages) to every budget."""
         cost = usd if usd is not None else (prompt_tokens + completion_tokens) / self.config.tokens_per_usd

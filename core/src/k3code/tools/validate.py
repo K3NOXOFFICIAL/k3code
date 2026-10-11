@@ -8,6 +8,7 @@ nothing, so it retried blind. The subset checked here is what tool schemas in k3
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 _TYPES: dict[str, tuple[type, ...]] = {
@@ -83,7 +84,13 @@ def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
         return []
     if (raw := unparsed_marker(args)) is not None:
         shown = raw[:150] + ("…" if len(raw) > 150 else "")
-        return [f"the arguments were not a valid JSON object (received: {shown})"]
+        why = ""
+        if "_unparsed" in args:  # broken JSON: say where, so the model repairs it instead of resending it
+            try:
+                json.loads(raw)
+            except json.JSONDecodeError as exc:
+                why = f": {exc.msg} at char {exc.pos}"
+        return [f"the arguments were not a valid JSON object{why} (received: {shown})"]
     if not isinstance(args, dict):
         return [f"arguments must be an object, got {type(args).__name__}"]
     props = schema.get("properties") or {}

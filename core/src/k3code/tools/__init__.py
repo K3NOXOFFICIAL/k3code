@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import os
 import re
 from collections.abc import Sequence
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.providers.types import Message, ToolSpec
-from k3code.reliability.sandbox import child_env, with_chdir
+from k3code.reliability.sandbox import child_env, shell_path, with_chdir
 from k3code.tools.fuzzy_match import (
     format_no_match_hint,
     fuzzy_find_and_replace,
@@ -270,6 +271,18 @@ async def tool_write(arguments: dict[str, Any], *, cwd: Path | None = None) -> d
     return {"ok": True, "path": str(path)}
 
 
+#: Edits that succeeded in this process, newest last: (file, hash of old_string, hash of new_string), bounded.
+_APPLIED_EDITS: dict[tuple[str, str, str], None] = {}
+_APPLIED_EDITS_MAX = 256
+
+
+def _edit_key(path: Path, old_string: str, new_string: str) -> tuple[str, str, str]:
+    def digest(text: str) -> str:
+        return hashlib.sha1(text.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()
+
+    return (str(path), digest(old_string), digest(new_string))
+
+
 async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included)."""
     path = _resolve_path(arguments["path"], cwd)
@@ -295,14 +308,20 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     new_content, count, strategy, error = fuzzy_find_and_replace(
         content, old_string, new_string, replace_all=replace_all
     )
+    applied = _edit_key(path, old_string, new_string)
     if error:
-        if count == 0 and is_already_applied(content, old_string, new_string):  # a re-sent edit: it is in the file
+        # "No change needed" only for an edit this run made itself and the model sent again: judged from the file's text
+        # alone it also answered "success" to an old_string that was never there while new_string happened to occur
+        if count == 0 and applied in _APPLIED_EDITS and is_already_applied(content, old_string, new_string):
             return {"content": f"No change needed: {path.name} already contains new_string and no longer old_string."}
         hint = format_no_match_hint(error, count, old_string, content)
         return {"error": error + hint}
     if crlf:
         new_content = new_content.replace("\n", "\r\n")
     _atomic_write(path, new_content.encode("utf-8"))
+    _APPLIED_EDITS[applied] = None
+    while len(_APPLIED_EDITS) > _APPLIED_EDITS_MAX:
+        _APPLIED_EDITS.pop(next(iter(_APPLIED_EDITS)))
     return {"ok": True, "replacements": count, "strategy": strategy}
 
 
@@ -313,33 +332,54 @@ BASH_MAX_TIMEOUT = 600
 PIPE_GRACE_S = 1.0
 
 
+#: In the sandbox (its own pid namespace: pid 1 is bwrap, pid 2 the shell) everything a command left running dies
+#: with it, silently: the pipes close, so the check that says so outside the sandbox never fires. The shell counts what
+#: is still there when the command returns.
+_LEFTOVER_TRAP = (
+    "trap 'set -- /proc/[0-9]*; [ $# -gt 2 ] && echo \"[a process this command started in the background was stopped "
+    "when the command returned; use background: true to keep one running]\"' EXIT; "
+)
+
+
+_RO_FS = "Read-only file system"
+_NO_NETWORK = re.compile(r"Could not resolve host|Temporary failure in name resolution|Network is unreachable", re.I)
+
+
+def _sandbox_hint(stderr: str, cmd: str) -> str:
+    """What the sandbox means by a failure, for the model: the raw message ("Read-only file system", "Could not resolve
+    host") does not say that the rules, not the command, are the cause, and a model retries or works around them. Only
+    asked for a failed command of a sandboxed run, so a successful call and an unsandboxed session are unchanged."""
+    if _RO_FS in stderr:
+        return (
+            "sandbox: only the project folder is writable; .git is read-only (git add/commit/branch/config cannot work "
+            "here), and /tmp and ~ are discarded after each call. Do not retry; tell the user (or report it in your "
+            "result if you are a sub-agent)."
+        )
+    if _NO_NETWORK.search(stderr):
+        return "sandbox: there is no network in this run; do not retry."
+    if "No such file" in stderr and any(p in cmd for p in ("/tmp/", "~/", "$HOME")):
+        return "sandbox: /tmp and ~ are private to each bash call and vanish; use a path inside the project."
+    return ""
+
+
 async def _spawn_shell(
     cmd: str, workdir: Path, sandbox: list[str] | None, *, merge_stderr: bool = False
 ) -> asyncio.subprocess.Process:
-    """``/bin/sh -c cmd`` in its own process group (so the whole tree can be killed), inside ``sandbox`` if given."""
+    """``bash -c cmd`` (``sh -c`` where there is no bash) in its own process group (so the whole tree can be killed),
+    inside ``sandbox`` if given."""
     stderr = asyncio.subprocess.STDOUT if merge_stderr else asyncio.subprocess.PIPE
     # start_new_session: its own process group, so the whole tree can be killed (setsid, without preexec_fn)
-    if sandbox:
-        return await asyncio.create_subprocess_exec(
-            *sandbox,
-            "/bin/sh",
-            "-c",
-            cmd,
-            cwd=workdir,
-            stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
-            stdout=asyncio.subprocess.PIPE,
-            stderr=stderr,
-            start_new_session=True,
-            env=child_env(),  # the daemon's provider keys never reach a tool
-        )
-    return await asyncio.create_subprocess_shell(
-        cmd,
+    return await asyncio.create_subprocess_exec(
+        *(sandbox or []),
+        shell_path(),
+        "-c",
+        _LEFTOVER_TRAP + cmd if sandbox and not merge_stderr else cmd,
         cwd=workdir,
         stdin=asyncio.subprocess.DEVNULL,  # the gateway's stdin is the TUI's JSON-RPC stream in stdio mode
         stdout=asyncio.subprocess.PIPE,
         stderr=stderr,
         start_new_session=True,
-        env=child_env(),
+        env=child_env(),  # the daemon's provider keys never reach a tool
     )
 
 
@@ -352,7 +392,8 @@ async def tool_bash(
     ``background: true`` starts it as a job of ``session_id`` (see ``k3code.tools.jobs``) and returns its job_id.
     """
     cmd = arguments["command"]
-    timeout = min(float(arguments.get("timeout") or BASH_DEFAULT_TIMEOUT), BASH_MAX_TIMEOUT)
+    asked = float(arguments.get("timeout") or BASH_DEFAULT_TIMEOUT)
+    timeout = min(asked, BASH_MAX_TIMEOUT)
     workdir = _resolve_path(arguments.get("cwd", "."), cwd)
     proc: asyncio.subprocess.Process | None = None
     if sandbox:
@@ -416,7 +457,14 @@ async def tool_bash(
                 "exit_code": -9,
             }
         result = {"stdout": out.text(), "stderr": err.text(), "exit_code": proc.returncode}
-        return {**result, "note": note} if note else result
+        notes = [note] if note else []
+        if asked > BASH_MAX_TIMEOUT:
+            notes.append(
+                f"timeout {asked:g} was cut to {BASH_MAX_TIMEOUT}: it is in seconds (use background: true for longer)"
+            )
+        if sandbox and proc.returncode and (hint := _sandbox_hint(result["stderr"], cmd)):
+            notes.append(hint)
+        return {**result, "note": "; ".join(notes)} if notes else result
     except Exception as e:
         return {"error": f"Failed to execute: {e}"}
     finally:
@@ -430,9 +478,26 @@ async def tool_bash(
 #: Terminal colour and cursor codes (CSI sequences): a build tool's progress bar is hundreds of tokens of them.
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
+
+def _collapse_redraws(text: str) -> str:
+    """A progress bar redraws one line with carriage returns (``\\r``): of each line only its last frame is what was
+    on the screen, and the other frames are hundreds of tokens of a pip, npm or curl download. CRLF line ends go too."""
+    if "\r" not in text:
+        return text
+    lines = []
+    for line in text.split("\n"):
+        if "\r" in line:
+            frames = [f for f in line.split("\r") if f]
+            line = frames[-1] if frames else ""
+        lines.append(line)
+    return "\n".join(lines)
+
+
 #: Where a PostToolUse hook's feedback rides on a tool result. It used to replace ``content``: a ``read`` result was
 #: then numbered a second time, and an error result with feedback looked like a success to the failure counter.
 HOOK_FEEDBACK_KEY = "hook_feedback"
+#: Where the loop notes the arguments of a built-in tool call that the tool has no parameter for (they are dropped).
+IGNORED_KEY = "ignored_arguments"
 
 
 def format_tool_result(result: dict[str, Any]) -> Any:
@@ -449,13 +514,16 @@ def format_tool_result(result: dict[str, Any]) -> Any:
     if feedback := result.get(HOOK_FEEDBACK_KEY):
         body = format_tool_result({k: v for k, v in result.items() if k != HOOK_FEEDBACK_KEY})
         return f"{body}\n\n[PostToolUse hook] {feedback}"
+    if ignored := result.get(IGNORED_KEY):
+        body = format_tool_result({k: v for k, v in result.items() if k != IGNORED_KEY})
+        return f"{body}\n[{ignored}]"
     if "content" in result and "first" in result:  # read
         return _numbered_read(result)
     if "content" in result:
         return result["content"]
     if "stdout" in result or "stderr" in result:  # bash
-        out = _ANSI.sub("", str(result.get("stdout") or "")).rstrip("\n")
-        err = _ANSI.sub("", str(result.get("stderr") or "")).rstrip("\n")
+        out = _collapse_redraws(_ANSI.sub("", str(result.get("stdout") or ""))).rstrip("\n")
+        err = _collapse_redraws(_ANSI.sub("", str(result.get("stderr") or ""))).rstrip("\n")
         code = result.get("exit_code")
         parts = [out] if out else []
         if err:
@@ -473,7 +541,9 @@ def format_tool_result(result: dict[str, Any]) -> Any:
             text = f"{text}\n[{result['warnings']}]" if text else f"[{result['warnings']}]"
         return text or "(no matches)"
     if "files" in result and isinstance(result["files"], list):  # glob
-        text = "\n".join(str(f) for f in result["files"]) or "(no files)"
+        text = "\n".join(str(f) for f in result["files"]) or (
+            "(no files; .git node_modules .venv dist are skipped: give path=dist to search inside one)"
+        )
         return f"{text}\n[{result['note']}]" if result.get("note") else text
     if result.keys() == {"ok", "path"} and result["ok"] is True:  # write
         return f"Wrote {result['path']}"
@@ -638,6 +708,36 @@ def _shown(path: Path, base: Path) -> str:
         return str(path)
 
 
+async def _run_rg(cmd: list[str], base: Path) -> tuple[int, bytes, bytes]:
+    """``cmd`` (an rg argv) run in ``base``: (exit code, stdout, stderr). TimeoutError after 10 s, with rg killed."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=base,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=child_env(),
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()  # rg kept scanning after the timeout
+        await proc.wait()
+        raise
+    return proc.returncode or 0, stdout, stderr
+
+
+def _rg_remedy(stderr: bytes) -> str | None:
+    """The rg flag its own error message asks for, when it is one that only changes how the pattern is read."""
+    text = stderr.decode("utf-8", errors="replace")
+    if re.search(r'the literal "\\[nr]" is not allowed', text):
+        return "-U"
+    if "--pcre2" in text:
+        return "--pcre2"
+    return None
+
+
 async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Search for a pattern using ripgrep or Python fallback."""
     pattern = arguments["pattern"]
@@ -666,30 +766,32 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 cmd += ["-g", f"!{exc}"]
         # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
         cmd += ["-e", pattern, "--", _shown(path, base) if path != base else "."]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            cwd=base,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=child_env(),
-        )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            code, stdout, stderr = await _run_rg(cmd, base)
+            flag = _rg_remedy(stderr) if code == 2 and not stdout.strip() else None
+            retried = ""
+            if flag:
+                # rg names the flag that makes the pattern work (a "\n" needs -U, a look-around needs --pcre2): run it
+                # once more with that flag rather than send the model to flags this tool has no argument for
+                again = await _run_rg([cmd[0], flag, *cmd[1:]], base)
+                if again[0] in (0, 1):
+                    (code, stdout, stderr), retried = (
+                        again,
+                        ("[searched in multiline mode]" if flag == "-U" else "[searched with PCRE2]"),
+                    )
         except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()  # rg kept scanning after the timeout
-            await proc.wait()
             return {"error": "grep timed out after 10 s: narrow the path or the pattern"}
         text = stdout.decode("utf-8", errors="replace").strip()
         text = "\n".join(line.removeprefix("./") for line in text.splitlines())
-        if proc.returncode == 2 and text:
+        if code == 2 and text:
             # rg exits 2 when any entry was unreadable (a root-owned dir) but still prints every other match
             note = stderr.decode("utf-8", errors="replace").strip().splitlines()[:3]
             return {"matches": text, "warnings": note}
-        if proc.returncode not in (0, 1):  # 1 = no matches; 2 with no output is rg refusing the request (a bad regex)
+        if code not in (0, 1):  # 1 = no matches; 2 with no output is rg refusing the request (a bad regex)
             reason = stderr.decode("utf-8", errors="replace").strip().splitlines()
-            return {"error": f"grep failed: {' '.join(line.strip() for line in reason[:4]) or 'rg exited 2'}"}
+            return {"error": f"grep failed: {' '.join(line.strip() for line in reason[:6]) or 'rg exited 2'}"}
+        if retried:
+            return {"matches": f"{retried}\n{text}" if text else retried}
         return {"matches": text}
     except FileNotFoundError:  # no rg installed
         # Python fallback: off the event loop, same tree rules as glob, capped
@@ -845,7 +947,11 @@ async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         path, pattern = Path("/".join(parts[:fixed]) or "/"), "/".join(parts[fixed:])
     if not path.is_dir():
         return {"error": f"Directory not found: {path}"}
-    return await asyncio.to_thread(_glob_sync, path, pattern)
+    res = await asyncio.to_thread(_glob_sync, path, pattern)
+    # relative to the session's directory, as grep prints them and read takes them (not to ``path``, which made a hit
+    # in a subdirectory a path that read could not open)
+    base = Path(cwd) if cwd else Path.cwd()
+    return {**res, "files": [_shown(path / f, base) for f in res["files"]]} if "files" in res else res
 
 
 TODO_STATUSES = ("pending", "in_progress", "completed")
@@ -1043,7 +1149,8 @@ def build_registry() -> ToolRegistry:
     reg.register(
         ToolSpec(
             name="bash",
-            description="Run a shell command (/bin/sh -c) and return its stdout, stderr and exit code.\n"
+            description="Run a shell command (bash -c) and return its stdout, stderr and exit code. "
+            "`echo` does not expand \\n: use printf.\n"
             f"Limits: killed after {BASH_DEFAULT_TIMEOUT} s by default (timeout: up to {BASH_MAX_TIMEOUT} s) or "
             f"past {MAX_OUTPUT_BYTES // (1024 * 1024)} MB of output; you see at most {MAX_TOOL_RESULT_CHARS} chars "
             "(head and tail). For servers, watchers and long builds use background: true, then bash_output.",
@@ -1124,7 +1231,8 @@ def build_registry() -> ToolRegistry:
         ToolSpec(
             name="glob",
             description="Find files matching a glob pattern (recursive under path).\n"
-            f"Limits: paths relative to path; you see at most {MAX_TOOL_RESULT_CHARS} chars (head and tail).",
+            "Limits: paths relative to the session directory, as grep prints them; you see at most "
+            f"{MAX_TOOL_RESULT_CHARS} chars (head and tail).",
             parameters={
                 "type": "object",
                 "properties": {

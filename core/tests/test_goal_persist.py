@@ -265,3 +265,36 @@ async def test_a_spend_budget_stop_a_halt_and_a_user_stop_still_pause_the_goal(t
     live.budget_stopped = False
     assert server._goal_recovery(live, mgr, "error") is not None
     await server.close()
+
+
+async def test_a_goal_stuck_on_blocked_waits_longer_each_turn_instead_of_retrying_at_full_speed():
+    mgr, slept, _ = manager()
+    mgr.set("ship it")
+    judge = judge_of(("blocked", "needs the API key", False, False))
+    for _ in range(BLOCKED_NOTICE_EVERY + 4):
+        await mgr.evaluate_after_turn("I cannot continue", judge)
+    assert slept == [15.0, 30.0, 60.0, 120.0]  # none for the first five, then the judge-failure ramp
+    await mgr.evaluate_after_turn("did it", judge_of(("done", "ok", False, False)))
+    assert mgr.state.consecutive_blocked == 0
+
+
+def test_a_long_goal_is_quoted_by_its_start_and_a_pointer_and_a_short_one_whole():
+    short = "ship the release"
+    assert goals.quote(short) == short
+    exact = "x" * goals.GOAL_QUOTE_CHARS
+    assert goals.quote(exact) == exact
+    long = "Implement the parser. " + "details " * 400
+    quoted = goals.quote(long)
+    assert quoted.startswith("Implement the parser.") and quoted.endswith(goals.GOAL_QUOTE_STUB)
+    assert len(quoted) < len(long) // 4
+
+
+async def test_continuation_prompts_quote_a_long_goal_but_the_kick_and_the_judge_get_it_whole():
+    mgr, _, _ = manager()
+    long = ("Migrate everything. " + "part " * 300).strip()
+    mgr.set(long)
+    assert long in mgr.kick_prompt()
+    assert long not in mgr.continuation_prompt() and goals.quote(long) in mgr.continuation_prompt()
+    judge = judge_of(("continue", "more to do", False, False))
+    decision = await mgr.evaluate_after_turn("step", judge)
+    assert long not in decision.prompt and goals.quote(long) in decision.prompt

@@ -113,6 +113,8 @@ async def _run_headless(
     """Run headless mode and return final result dict."""
     from k3code import userhooks
     from k3code.agent.loop import AgentLoop
+    from k3code.autonomy import autonomy_cfg
+    from k3code.context_budget import router_window, tool_output_limit
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
     from k3code.memory import fenced
@@ -147,6 +149,9 @@ async def _run_headless(
         cwd=Path.cwd(),
         reliability=reliability,
         session=session,
+        context_window=router_window(config, router, model or config.default_model),
+        tool_output_chars=tool_output_limit(config),
+        max_tool_errors=int(autonomy_cfg(config)["max_tool_errors"]),
     )
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), session)  # the directory the trust check keys on
@@ -199,6 +204,14 @@ async def _run_headless(
                 "text": final_text,
                 "tools": tool_results,
             }
+        if loop.escalation_reason in ("tool_errors", "loop_guard"):  # likewise: the loop gave up, the task is not done
+            why = (
+                f"stopped after {len(loop._failed)} failed tool calls in a row (autonomy.max_tool_errors); "
+                f"last: {loop._failed[-1][0]}: {loop._failed[-1][1]}"
+                if loop.escalation_reason == "tool_errors" and loop._failed
+                else "stopped: the model kept repeating the same call (loop guard)"
+            )
+            return {"error": loop.escalation_reason, "message": why, "text": final_text, "tools": tool_results}
         return {"text": final_text, "tools": tool_results}
     except AllProvidersUnreachable as e:
         return {"error": "all_providers_unreachable", "message": str(e), "attempts": e.attempts}
@@ -383,6 +396,8 @@ async def _run_repl(
     """Run minimal REPL."""
     from k3code import userhooks
     from k3code.agent.loop import AgentLoop
+    from k3code.autonomy import autonomy_cfg
+    from k3code.context_budget import router_window, tool_output_limit
     from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
     from k3code.extratools import register_skill_tool
     from k3code.memory import fenced
@@ -425,6 +440,9 @@ async def _run_repl(
         on_event=_print_event,
         cwd=Path.cwd(),
         reliability=reliability,
+        context_window=router_window(config, router, model or config.default_model),
+        tool_output_chars=tool_output_limit(config),
+        max_tool_errors=int(autonomy_cfg(config)["max_tool_errors"]),
     )
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
@@ -461,6 +479,7 @@ async def _run_repl(
                 print(f"[Error] {err}")
             else:
                 loop.router = make_router()  # the chain resolves the key to each provider's model id
+                loop.context_window = router_window(config, loop.router, config.default_model)
                 print(f"Model set to: {config.default_model}")
             continue
 

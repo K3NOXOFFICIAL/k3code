@@ -33,7 +33,7 @@ def test_grep_and_glob_are_plain_lists_and_say_when_empty():
     assert format_tool_result({"matches": ""}) == "(no matches)"
     assert format_tool_result({"matches": "a.py:1:x", "warnings": "2 files skipped"}) == "a.py:1:x\n[2 files skipped]"
     assert format_tool_result({"files": ["a.py", "src/b.py"]}) == "a.py\nsrc/b.py"
-    assert format_tool_result({"files": []}) == "(no files)"
+    assert format_tool_result({"files": []}).startswith("(no files; ")  # says which directories glob skips
 
 
 def test_write_edit_and_plain_errors_are_one_readable_line():

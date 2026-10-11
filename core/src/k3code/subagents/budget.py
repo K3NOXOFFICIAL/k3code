@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from k3code.subagents.runner import Handle
 
+#: What the governor's message starts with when a child hits the orchestration's token cap (scope "ultracode").
+CAP_SCOPE = "ultracode"
+CAP_ERROR = f"{CAP_SCOPE} token budget exceeded"
+
 
 class BudgetStop(Exception):
     """The orchestration ran out of agents or tokens; remaining work is not started.
@@ -57,6 +61,10 @@ class AgentBudget:
 
     def charge(self, h: Handle) -> None:
         self.tokens += h.tokens_in + h.tokens_out
+        if self.max_tokens is not None and CAP_ERROR in str(h.error or ""):
+            # the child was stopped mid-run by the session governor's ultracode cap; the tokens it used before the stop
+            # may be less than the cap in this tally, so the tally is raised to it: the run is out of tokens
+            self.tokens = max(self.tokens, self.max_tokens)
 
     def check(self) -> None:
         if self.max_tokens is not None and self.tokens >= self.max_tokens:

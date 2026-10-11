@@ -24,6 +24,10 @@ COMPACT_HEAD_CHARS = 8_000
 SUMMARY_MAX_TOKENS = 1_000
 #: The first task statement is kept verbatim (up to this many characters) so it survives any number of compactions.
 TASK_ANCHOR_CHARS = 12_000
+#: What the summary model sees of one folded message: a tool result keeps its start and its end (it used to see the
+#: first 3000 characters of everything, which is 11-18% of a long session and none of a test run's last line), a user
+#: message up to the anchor's size (a plan or a requirement sent later), an earlier summary whole.
+COMPACT_TOOL_CHARS = 400
 
 
 def clean_title(raw: str) -> str:
@@ -116,7 +120,14 @@ async def compact_messages(
     else:
         return messages, 0
     text = head_and_tail(
-        transcript_text(old, per_message=3000), max_input_chars, min(COMPACT_HEAD_CHARS, max_input_chars // 4)
+        transcript_text(
+            old,
+            per_message=3000,
+            per_role={"tool": COMPACT_TOOL_CHARS, "user": TASK_ANCHOR_CHARS},
+            whole_prefix=SUMMARY_PREFIX,
+        ),
+        max_input_chars,
+        min(COMPACT_HEAD_CHARS, max_input_chars // 4),
     )
     res = await caller.complete(
         TaskKind.COMPACTION,
@@ -136,6 +147,10 @@ async def compact_messages(
     if anchor is not None:
         content = str(anchor.get("content") or "")
         if len(content) > TASK_ANCHOR_CHARS:
-            content = content[:TASK_ANCHOR_CHARS] + "\n…[task statement truncated]"
+            # head and tail inside the same budget: a requirement written after a long paste is at its end. The result
+            # stays within the budget, so a later compaction leaves it alone (no growing "omitted" count)
+            tail = TASK_ANCHOR_CHARS // 3
+            head = TASK_ANCHOR_CHARS - tail - 48  # room for the note
+            content = f"{content[:head]}\n…[{len(content) - head - tail:,} chars omitted]…\n{content[-tail:]}"
         kept = [{**anchor, "content": content}]
     return [*system, *kept, summary, *messages[cut:]], cut

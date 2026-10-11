@@ -1,0 +1,77 @@
+"""What a session sends as its prefix must not change under it: the provider caches the system prompt and the tool list
+and re-writes the whole conversation after any change to either."""
+
+from __future__ import annotations
+
+from k3code.agent.loop import AgentLoop
+from k3code.memory import write_learned
+from k3code.permissions import PermissionMode
+from k3code.router import Router, build_chain
+from m1cmd_helpers import make_server, new_session
+from test_auto_compaction import Recording, long_history, seed
+
+
+async def test_a_note_the_background_review_writes_does_not_change_the_sessions_prompt(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    live = server.live[await new_session(server, tmp_path)]
+    write_learned(tmp_path, ["the tests live in tests/unit"])
+    first = server._system_prompt_for(live)
+    assert "the tests live in tests/unit" in first
+    write_learned(tmp_path, ["the tests live in tests/unit", "run ruff before committing"])  # the review wrote one more
+    assert server._system_prompt_for(live) == first, "the prompt is byte-identical, so the cache keeps the conversation"
+    live.learned_notes = None  # what compaction and /clear do
+    assert "run ruff before committing" in server._system_prompt_for(live)
+    await server.close()
+
+
+async def test_compaction_refreshes_the_learned_notes(tmp_path, monkeypatch):
+    server, live = await seed(tmp_path, monkeypatch, Recording(), context={"keep_messages": 6})
+    live.stored.messages = long_history()
+    live.perms.cwd = tmp_path
+    write_learned(tmp_path, ["first note"])
+    server._system_prompt_for(live)
+    write_learned(tmp_path, ["first note", "second note"])
+    assert "second note" not in server._system_prompt_for(live)
+    assert await server.compact_session(live) > 0
+    assert "second note" in server._system_prompt_for(live)
+    await server.close()
+
+
+async def test_a_new_session_reads_the_notes_as_they_are_now(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    write_learned(tmp_path, ["a note from yesterday"])
+    live = server.live[await new_session(server, tmp_path)]
+    assert "a note from yesterday" in server._system_prompt_for(live)
+    await server.close()
+
+
+def loop_with(tmp_path, *, plan_callback) -> AgentLoop:
+    router = Router(build_chain([Recording()], [["m"]]), max_retries=0)
+    return AgentLoop(router, system_prompt="t", cwd=tmp_path, permission_mode="auto", plan_callback=plan_callback)
+
+
+async def _approve(plan: str) -> str:
+    return "auto"
+
+
+def test_a_session_loop_offers_exit_plan_in_every_mode_so_its_tool_list_never_changes(tmp_path):
+    loop = loop_with(tmp_path, plan_callback=_approve)
+    before = [s.name for s in loop.tool_specs()]
+    loop.permissions.mode = PermissionMode.PLAN
+    during = [s.name for s in loop.tool_specs()]
+    loop.permissions.mode = PermissionMode.AUTO
+    after = [s.name for s in loop.tool_specs()]
+    assert before == during == after and "exit_plan" in before
+
+
+def test_a_loop_without_a_plan_approver_still_hides_exit_plan_outside_plan_mode(tmp_path):
+    loop = loop_with(tmp_path, plan_callback=None)
+    assert "exit_plan" not in [s.name for s in loop.tool_specs()]
+    loop.permissions.mode = PermissionMode.PLAN
+    assert "exit_plan" in [s.name for s in loop.tool_specs()]
+
+
+async def test_exit_plan_outside_plan_mode_says_so(tmp_path):
+    loop = loop_with(tmp_path, plan_callback=_approve)
+    result = await loop._exit_plan({"plan": "do it"})
+    assert result == {"error": "exit_plan is only available in plan mode"}

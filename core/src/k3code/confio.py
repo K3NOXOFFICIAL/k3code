@@ -181,6 +181,14 @@ def _validate_values(s: Settings) -> None:
                 permission_mode_from_config(key, value)
             except InvalidPermissionMode as e:
                 raise ConfigError(f"{key}: {value!r} is not one of ask, auto-edit, plan, auto, yolo") from e
+    from k3code.context_budget import parse_window
+
+    for model_id, entry in (getattr(s, "models", None) or {}).items():
+        raw = entry.get("context_window") if isinstance(entry, dict) else None
+        if raw is not None and (isinstance(raw, bool | list | dict) or parse_window(str(raw)) is None):
+            raise ConfigError(
+                f"models.{model_id}.context_window: must be a token count like 200000 or 200k, got {raw!r}"
+            )
     _whole("max_tokens", s.max_tokens, lo=1)
     _whole("max_turns", s.max_turns, lo=0)
     if s.temperature is not None:

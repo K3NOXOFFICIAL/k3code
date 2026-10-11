@@ -288,6 +288,8 @@ async def test_ultracode_token_budget_stops_it(tmp_path, monkeypatch):
     report = server.session.stored.messages[-1]["content"]
     assert "STOPPED" in report and "token budget exhausted" in report
     assert not (repo / "f1.txt").exists()
+    governor = server.session.reliability.governor
+    assert governor is None or "ultracode" not in governor._budgets, "the temporary cap is gone after the run"
 
 
 async def test_a_budget_stop_cancels_the_sibling_children():
@@ -335,3 +337,33 @@ def test_parsers():
     assert [f["id"] for f in d] == ["f1", "f2"]
     assert parse_votes('{"votes": {"f1": true, "f2": false}}') == {"f1": True, "f2": False}
     assert parse_votes('{"f1": true}') == {"f1": True} and parse_votes("garbage") == {}
+
+
+async def test_the_token_cap_is_charged_by_every_child_through_the_session_governor():
+    from k3code.reliability.governor import Budget, Governor
+    from k3code.subagents.budget import CAP_ERROR, CAP_SCOPE, AgentBudget
+    from k3code.subagents.runner import Handle
+
+    parent = Governor()
+    parent.add_budget(Budget(scope=CAP_SCOPE, tokens=1000))
+    kids = [Governor(), Governor()]
+    for kid in kids:
+        kid.parent = parent
+    kids[0].record_usage(450, 100)
+    assert kids[1].check_budgets() is None
+    kids[1].record_usage(450, 100)  # together 1100: the cap is reached, whichever child spent last
+    stop = kids[0].check_budgets()
+    assert stop is not None and stop.scope == CAP_SCOPE and stop.kind == "tokens"
+    parent.remove_budget(CAP_SCOPE)
+    assert kids[0].check_budgets() is None
+
+    budget = AgentBudget(max_agents=9, max_tokens=1000)
+    h = Handle(id="a", description="d", agent_type="worker", tier="main", depth=1, parent_sid="s")
+    h.tokens_in, h.error = 100, f"{CAP_ERROR}: 1004 > 1000"
+    budget.charge(h)
+    assert budget.tokens == 1000, "a child stopped by the cap leaves the run out of tokens"
+    from k3code.subagents.budget import BudgetStop
+
+    with pytest.raises(BudgetStop) as stop_info:
+        budget.take_agent()
+    assert stop_info.value.kind == "tokens"

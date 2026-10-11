@@ -295,21 +295,6 @@ def step_tiers(c: Ctx) -> dict[str, Any]:
     return {"models": out, "context_windows": windows}
 
 
-#: The largest window setup accepts: past this a typo ("1e12") would switch compaction off for good.
-MAX_WINDOW = 10_000_000
-
-
-def parse_window(text: str) -> int | None:
-    """Tokens from ``32000``, ``32_000``, ``32,000`` or ``32k``; None for anything else (or a nonsense size)."""
-    t = text.strip().lower().replace("_", "").replace(",", "")
-    mult = 1000 if t.endswith("k") else 1
-    try:
-        n = int(float(t.removesuffix("k")) * mult)
-    except (ValueError, OverflowError):  # "abc"; "inf" and "1e400"
-        return None
-    return n if 1000 <= n <= MAX_WINDOW else None
-
-
 def _context_windows(c: Ctx, model_ids: list[str]) -> dict[str, int]:
     """The real context window of each chosen model id k3code has no figure for (a gateway alias, a small local model).
 
@@ -342,7 +327,7 @@ def _context_windows(c: Ctx, model_ids: list[str]) -> dict[str, int]:
             )
         if not str(value).strip():
             continue
-        n = parse_window(str(value))
+        n = context_budget.parse_window(str(value))
         if n is None:
             c.say(
                 f"  Not a context window size: {value!r} (for {m}); keeping the {context_budget.FALLBACK_WINDOW} guess."

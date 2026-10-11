@@ -22,7 +22,8 @@ the classifier, the planner and the executor differently. Every call is recorded
 Any step may carry ``"when": "first"`` (only before a tool result is in the conversation) or
 ``"when": "after_tool"`` (only after one), so a script can call a tool once and then finish.
 ``"turn_first"`` / ``"turn_after_tool"`` do the same relative to the latest user message, so one script
-can serve several user turns.
+can serve several user turns. ``"tool_results": N`` plays the step only when the conversation holds exactly N tool
+results: one step per model reply, in order (a script of ``N`` failing calls, one each).
 
 ``text``/``tool_call``/``usage`` accumulate into one assistant turn (a final
 done event); ``error`` aborts the stream with a ProviderError so the router
@@ -100,6 +101,10 @@ class FakeProvider(Provider):
                 continue
             if (when == "turn_first" and turn_tool_result) or (when == "turn_after_tool" and not turn_tool_result):
                 continue  # same, but relative to the latest user message (multi-turn scripts)
+            if step.get("tool_results") is not None and int(step["tool_results"]) != sum(
+                m.role == "tool" for m in messages
+            ):
+                continue
             kind = step.get("type")
             if kind == "text":
                 text = str(step.get("text", ""))

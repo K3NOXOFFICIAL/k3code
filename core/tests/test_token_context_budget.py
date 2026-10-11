@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from k3code.agent.loop import AgentLoop
 from k3code.context_budget import compact_threshold, context_window
 from k3code.gateway.server import _estimate_tokens
-from k3code.providers.types import ToolCall
+from k3code.providers.types import Message, ToolCall
 from k3code.reliability import Reliability
 from k3code.router import Router, build_chain
 from k3code.routing.tiers import TaskKind
@@ -81,11 +81,11 @@ def make_loop(tmp_path, provider, *, window: int | None) -> AgentLoop:
     )
 
 
-def reads_of(tmp_path, n: int) -> list[ToolCall]:
+def reads_of(tmp_path, n: int, lines: int = 50) -> list[ToolCall]:
     calls = []
     for i in range(n):
         f = tmp_path / f"f{i}.txt"
-        f.write_text(f"file {i}\n" + ("q" * 59 + "\n") * 50)  # ~3 kB
+        f.write_text(f"file {i}\n" + ("q" * 59 + "\n") * lines)  # ~3 kB
         calls.append(ToolCall(id=f"r{i}", name="read", arguments={"path": str(f)}))
     return calls
 
@@ -103,15 +103,63 @@ async def test_old_tool_results_are_elided_from_a_big_request_but_kept_in_histor
     loop, provider = await run_reads(tmp_path, window=8_000)  # 50% = 4000 tokens; 9 results are ~7k tokens
     last_request = provider.requests[-1][0]
     sent = {m.tool_call_id: m.content for m in last_request if m.role == "tool"}
-    for i in range(3):  # older than the last 6 tool calls
+    for i in range(3):
         assert sent[f"r{i}"].startswith("[earlier read result elided: ")
         assert "re-run if needed]" in sent[f"r{i}"]
-    for i in range(3, 9):
-        assert f"file {i}" in sent[f"r{i}"] and len(sent[f"r{i}"]) > 3000
+    # the newest results are kept whole up to 15% of the window (1200 tokens: one result of ~750 here), not a fixed six
+    whole = [i for i in range(9) if f"file {i}" in sent[f"r{i}"]]
+    assert 8 in whole and len(whole) <= 3 and len(sent["r8"]) > 3000
     stored = [m.content for m in loop.turn_messages if m.role == "tool"]
     assert all(len(c) > 3000 for c in stored)  # the conversation itself keeps every result
     transcript = [m.content for m in loop.reliability.load_transcript() if m.role == "tool"]
     assert all(len(c) > 3000 for c in transcript)
+
+
+async def test_six_results_stay_whole_when_they_are_small_next_to_the_window(tmp_path):
+    calls = reads_of(tmp_path, 12, lines=8)  # ~500 chars each
+    provider = Recorder([*(tool_reply(c) for c in calls), text_reply("done")])
+    loop = make_loop(tmp_path, provider, window=6_000)  # overhead + 12 results pass 50%; 6 results are < 15%
+    async for _ in loop.run("read them all"):
+        pass
+    sent = {m.tool_call_id: m.content for m in provider.requests[-1][0] if m.role == "tool"}
+    assert sent["r0"].startswith("[earlier read result elided: ")
+    assert all(f"file {i}" in sent[f"r{i}"] for i in range(6, 12))
+
+
+def test_the_kept_count_never_falls_below_the_latest_step_and_only_grows_forward():
+    from k3code.context_budget import kept_calls
+
+    def tool(i: int, chars: int) -> Message:
+        return Message(role="tool", content="x" * chars, tool_call_id=f"t{i}", name="read")
+
+    asst = Message(role="assistant", content=None)
+    huge = [asst, *(tool(i, 40_000) for i in range(8))]  # one step of 8 parallel results, 10k tokens each
+    assert kept_calls(huge, 32_000) == 6  # the model has not seen them yet: the cap, not 1
+    assert kept_calls([asst, tool(0, 40_000)], 32_000) == 1  # always one
+    assert kept_calls([asst, tool(0, 100)], None) == 6  # no window: the fixed count
+    # boundary of the oldest kept result never moves back as results are appended
+    msgs: list[Message] = []
+    boundary = 0
+    for i in range(30):
+        msgs += [asst, tool(i, 3_000 if i % 3 else 30_000)]
+        oldest_kept = len([m for m in msgs if m.role == "tool"]) - kept_calls(msgs, 30_000)
+        assert oldest_kept >= boundary
+        boundary = oldest_kept
+
+
+def test_results_of_a_few_hundred_chars_are_elided_too():
+    from k3code.context_budget import ELIDE_MIN_CHARS, elide_old_results
+
+    msgs = []
+    for i in range(10):
+        msgs += [
+            Message(role="assistant", content=None),
+            Message(role="tool", content="o" * (ELIDE_MIN_CHARS + 50), tool_call_id=f"t{i}", name="bash"),
+        ]
+    msgs.append(Message(role="tool", content="tiny", tool_call_id="tiny", name="bash"))
+    out = elide_old_results(msgs, over=True, elided=set(), window=None)
+    assert out[1].content.startswith("[earlier bash result elided")
+    assert out[-1].content == "tiny"
 
 
 async def test_elision_runs_in_batches_so_the_request_prefix_rarely_changes(tmp_path):

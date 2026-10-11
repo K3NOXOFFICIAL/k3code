@@ -388,17 +388,26 @@ def test_an_id_with_a_context_window_in_the_config_is_not_asked_again(env: Path)
 
 @pytest.mark.parametrize(
     ("text", "tokens"),
-    [("32000", 32000), ("32_000", 32000), ("32,000", 32000), ("32k", 32000), (" 128K ", 128000), ("1.5k", 1500)],
+    [
+        ("32000", 32000),
+        ("32_000", 32000),
+        ("32,000", 32000),
+        ("32k", 32000),
+        (" 128K ", 128000),
+        ("1.5k", 1500),
+        ("1m", 1_000_000),
+        ("1.5M", 1_500_000),
+    ],
 )
 def test_parse_window_reads_plain_and_k_sizes(text: str, tokens: int) -> None:
-    from k3code.setup.steps import parse_window
+    from k3code.context_budget import parse_window
 
     assert parse_window(text) == tokens
 
 
 @pytest.mark.parametrize("text", ["", "k", "abc", "12", "-5000", "0", "inf", "1e400", "1e12", "10000001"])
 def test_parse_window_refuses_anything_else(text: str) -> None:
-    from k3code.setup.steps import parse_window
+    from k3code.context_budget import parse_window
 
     assert parse_window(text) is None
 

@@ -145,6 +145,11 @@ class _ClearCommand(CommandDef):
         if getattr(live, "streaming", False):  # the running turn's persist would put the transcript right back
             return {"type": "message", "message": "A turn is running in this session; /stop it first."}
         live.messages = []
+        live.learned_notes = None  # a new conversation: show the notes learned since this prompt was built
+        live.reads.clear()
+        live.pinned_reads.clear()
+        live.elided.clear()
+        live.elide_notes.clear()
         from k3code.gateway.sessions import StoredSession
 
         stored: StoredSession | None = ctx.store.get(session_id or "")

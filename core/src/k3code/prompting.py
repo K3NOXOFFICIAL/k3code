@@ -31,10 +31,13 @@ def build_system_prompt(
     session_meta: dict[str, Any] | None = None,
     mcp: Any = None,
     skills: bool = True,
+    learned: list[str] | None = None,
 ) -> str:
     # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
-    # come first and the learned ones (USER.md's auto section is rewritten by the distiller) come last: a rewrite
-    # then invalidates only its own tail. Nothing here may depend on the time, a counter or the turn.
+    # come first and the learned ones last. Every message follows the prompt, so any change to it makes the provider
+    # re-write the whole conversation, not only its own tail: a session therefore passes ``learned`` (a snapshot of
+    # the notes the background review writes, taken when the session's prompt is first built) and refreshes it where
+    # the history is rewritten anyway. Nothing here may depend on the time, a counter or the turn.
     parts = [base.rstrip()]
     style = outputstyle.style_text(effective_style(config, session_meta), cwd)
     if style:
@@ -51,7 +54,7 @@ def build_system_prompt(
 
     if facts := facts_prompt(cwd):  # the stored stack scan; with or without a memory file, changes on re-scan only
         parts.append(facts)
-    if mem := memory_prompt(cwd, limit=int(ctx.get("memory_chars", MAX_MEMORY_CHARS))):
+    if mem := memory_prompt(cwd, limit=int(ctx.get("memory_chars", MAX_MEMORY_CHARS)), learned=learned):
         parts.append(mem)
     from k3code.learning.gotchas import gotchas_prompt, user_gotchas_prompt
     from k3code.learning.optimizer import overlay_prompt

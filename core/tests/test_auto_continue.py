@@ -196,3 +196,22 @@ def test_implicit_is_persisted_in_the_snapshot_and_old_states_load_without_it():
     old = state.to_dict()
     del old["implicit"]
     assert GoalState.from_dict(old).implicit is False
+
+
+async def test_a_long_goal_is_put_back_in_full_once_no_message_holds_it(tmp_path, monkeypatch):
+    from k3code.goals import quote
+
+    server, _, live, mgr = await _setup(tmp_path, monkeypatch)
+    goal = ("Rebuild the billing module. " + "requirement " * 120).strip()
+    mgr.set(goal)
+    prompt = f"[Continuing toward your standing goal]\nGoal: {quote(goal)}\n\nNext step."
+    live.stored.messages = [{"role": "user", "content": f"[Standing goal]\nGoal: {goal}"}]
+    assert server._with_long_goal(live, mgr, prompt) == prompt, (
+        "the goal message is still in the history: the pointer holds"
+    )
+    live.stored.messages = [{"role": "user", "content": "[summary of earlier conversation]\nthe billing work"}]
+    restored = server._with_long_goal(live, mgr, prompt)
+    assert goal in restored and quote(goal) not in restored
+    mgr.set("short goal")
+    assert server._with_long_goal(live, mgr, "Goal: short goal") == "Goal: short goal"
+    await server.close()
