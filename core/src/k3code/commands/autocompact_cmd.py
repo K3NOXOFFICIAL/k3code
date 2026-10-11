@@ -181,6 +181,12 @@ class AutoCompactCommand(CommandDef):
         policy = autocompact_policy(ctx.config, live.stored.meta.get("autocompact") if live is not None else None)
         used = ctx._request_tokens(live) if live is not None else None
         text = describe(policy, ctx.config, self._model(ctx, live), used)
+        fixed = int(getattr(live, "overhead_tokens", 0) or 0)
+        if policy.enabled and policy.tokens and fixed and policy.tokens <= fixed:
+            text += (
+                f"\nThat is not above the ~{fixed:,} tokens every request carries before any conversation (the system "
+                "prompt and the tool list): the session would be compacted on every turn, with nothing left to fold."
+            )
         if live is not None and live.stored.meta.get("autocompact"):
             text += "\nSet for this session only (/autocompact reset --session undoes that)."
         return text

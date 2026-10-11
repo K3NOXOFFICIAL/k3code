@@ -298,3 +298,31 @@ async def test_continuation_prompts_quote_a_long_goal_but_the_kick_and_the_judge
     judge = judge_of(("continue", "more to do", False, False))
     decision = await mgr.evaluate_after_turn("step", judge)
     assert long not in decision.prompt and goals.quote(long) in decision.prompt
+
+
+async def test_a_failed_retry_does_not_leave_its_unanswered_prompt_in_the_history(tmp_path, monkeypatch, fast_retries):
+    from m1cmd_helpers import git_repo, make_server, new_session
+
+    repo = git_repo(tmp_path / "repo")
+    server, _ = make_server(tmp_path, monkeypatch, replies=["x"], autonomy={"advisor_on_goal": False})
+    sid = await new_session(server, repo)
+    live = server.live_for(server.store.get(sid))
+    mgr = server.goal_manager(live)
+    mgr.set("ship it")
+    server.goal_judge = judge_of(("done", "finished", False, False))
+    outcomes = iter(["error", "error", "error", "done"])
+
+    async def scripted_turn(session, prompt, **kw):
+        status = next(outcomes)
+        session.stored.messages = [*session.stored.messages, {"role": "user", "content": prompt}]  # persisted at once
+        session.last_error = "provider fell over" if status == "error" else ""
+        if status == "done":
+            session.stored.messages = [*session.stored.messages, {"role": "assistant", "content": "shipped"}]
+        return status, "shipped" if status == "done" else ""
+
+    server._run_one_turn = scripted_turn  # type: ignore[method-assign]
+    await asyncio.wait_for(server._run_turn_locked(live, "start"), 20)
+    users = [m["content"] for m in live.stored.messages if m["role"] == "user"]
+    # the user's own prompt, then only the retry that got an answer: not one recovery prompt per failed attempt
+    assert users[0] == "start" and len(users) == 2 and "did not finish" in users[1]
+    await server.close()

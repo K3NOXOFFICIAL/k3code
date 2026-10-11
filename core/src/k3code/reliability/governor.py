@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import shutil
 import time
@@ -27,6 +28,8 @@ from pathlib import Path
 
 from k3code.paths import home as k3code_home
 from k3code.reliability.events import EventEmitter
+
+logger = logging.getLogger(__name__)
 
 # ── PSI parsing ────────────────────────────────────────────────────────
 
@@ -117,17 +120,25 @@ class _DayLedger:
     """Process-wide spend of the current local day: ``day`` budgets are shared by every session and rolled at midnight.
 
     Each session has its own Governor, so a per-governor counter made the "day" cap per session and never reset.
-    The ledger lives in the daemon process; a daemon restart starts the day's count from zero.
+    The ledger lives in the process; ``loader`` (day -> (tokens, USD) already spent that day, read from the usage log)
+    starts the day's count from what an earlier process or a restart spent, so a restart does not hand out the cap
+    again.
     """
 
     def __init__(self) -> None:
         self.date = ""
         self.tokens = 0
         self.usd = 0.0
+        self.loader: Callable[[str], tuple[int, float]] | None = None
 
     def roll(self, today: str) -> None:
         if self.date != today:
             self.date, self.tokens, self.usd = today, 0, 0.0
+            if self.loader is not None:
+                try:
+                    self.tokens, self.usd = self.loader(today)
+                except Exception:  # noqa: BLE001 - an unreadable log means a count from zero, as before
+                    logger.debug("could not read today's spend", exc_info=True)
 
 
 DAY_LEDGER = _DayLedger()

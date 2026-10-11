@@ -129,6 +129,33 @@ class UsageDB:
         names = [c[0] for c in cur.description]
         return [dict(zip(names, r, strict=True)) for r in cur]
 
+    def day_spend(self, day: str, price_of: Any = None) -> tuple[int, float]:
+        """(tokens, USD) of the model calls and sub-agent runs recorded on ``day`` (``YYYY-MM-DD``, local): what a
+        process that starts mid-day must count towards the day's caps. A row with a provider cost uses it; else
+        ``price_of`` (a row dict -> USD or None) prices it; else the governor's blended rate applies at the caller."""
+        cur = self._db.execute(
+            "SELECT model, tokens_in, tokens_out, cost_usd, cache_read, cache_write FROM events"
+            " WHERE day = ? AND kind IN ('call', 'subagent')",
+            (day,),
+        )
+        tokens, usd = 0, 0.0
+        for model, tin, tout, cost, c_read, c_write in cur:
+            row_tokens = int(tin or 0) + int(tout or 0)
+            tokens += row_tokens
+            priced = float(cost) if cost is not None else None
+            if priced is None and price_of is not None:
+                priced = price_of(
+                    {
+                        "model": model,
+                        "prompt_tokens": int(tin or 0),
+                        "completion_tokens": int(tout or 0),
+                        "cache_read_tokens": int(c_read or 0),
+                        "cache_creation_tokens": int(c_write or 0),
+                    }
+                )
+            usd += priced if priced is not None else row_tokens / 2_000_000  # the governor's blended default
+        return tokens, usd
+
     def aggregate(
         self, by: str = "day", *, session: str | None = None, days: int | None = None
     ) -> list[dict[str, Any]]:

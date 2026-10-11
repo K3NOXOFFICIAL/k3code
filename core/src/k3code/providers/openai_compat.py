@@ -204,7 +204,7 @@ class OpenAICompatProvider(Provider):
                         if args := fn.get("arguments"):
                             slot["args"].append(args)
                 if chunk_usage := chunk.get("usage"):
-                    usage = _parse_usage(chunk_usage)
+                    usage = _parse_usage(chunk_usage, reports_cost="openrouter" in self.base_url.lower())
             if not complete:
                 # A proxy closing early or an upstream dying mid-answer ends the body cleanly: without this the
                 # half sentence became a successful turn, was saved to history and never failed over.
@@ -300,11 +300,13 @@ def _add_cache_breakpoints(wire: list[dict[str, Any]], ttl: str = "5m", *, newes
             wire[i] = {**wire[i], "content": with_cache_breakpoint(wire[i]["content"], ttl)}
 
 
-def _parse_usage(chunk_usage: dict[str, Any]) -> Any:
+def _parse_usage(chunk_usage: dict[str, Any], *, reports_cost: bool = False) -> Any:
     from k3code.providers.types import Usage
 
     details = chunk_usage.get("prompt_tokens_details") or {}
+    cost = chunk_usage.get("cost") if reports_cost else None  # OpenRouter: what the call cost, in USD
     return Usage(
+        cost_usd=float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) and cost >= 0 else None,
         prompt_tokens=int(chunk_usage.get("prompt_tokens") or 0),
         completion_tokens=int(chunk_usage.get("completion_tokens") or 0),
         # OpenAI reports cache hits in prompt_tokens_details; DeepSeek as prompt_cache_hit_tokens and Moonshot as a

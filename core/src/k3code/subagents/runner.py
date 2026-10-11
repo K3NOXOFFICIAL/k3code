@@ -96,6 +96,10 @@ class Handle:
     tail: list[str] = field(default_factory=list)
     index: int = 0
     count: int = 1
+    #: started with task(background=true), and whether its outcome has reached the model yet (task_result, or the
+    #: note the next turn starts with)
+    background: bool = False
+    reported: bool = False
 
     @property
     def done(self) -> bool:
@@ -226,6 +230,14 @@ class SubagentManager:
             for h in self.handles.values()
             if h.parent_sid == sid and h.parent_child_id == parent_child_id and h.status in ("queued", "running")
         )
+
+    def unreported(self, sid: str) -> list[Handle]:
+        """Background children of the session's own turns that finished and whose outcome the model has not seen."""
+        return [
+            h
+            for h in self.handles.values()
+            if h.parent_sid == sid and h.background and h.parent_child_id is None and h.done and not h.reported
+        ]
 
     def begin_turn(self, sid: str) -> None:
         """A new user turn: the per-turn spawn count of this session starts again."""

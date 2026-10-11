@@ -41,6 +41,22 @@ ELIDE_MIN_CHARS = 300
 #: not make most of each request "recent" and un-elidable (it then re-triggered, and re-wrote the cache, every step).
 ELIDE_KEEP_SHARE = 0.15
 
+#: Every key the code reads under ``context:`` in config.yaml (a misspelled one, such as ``compact_at_token``, is
+#: ignored).
+CONTEXT_KEYS = frozenset(
+    {
+        "autocompact",
+        "compact_at_ratio",
+        "compact_at_tokens",
+        "compact_input_chars",
+        "decision_model",
+        "keep_messages",
+        "memory_chars",
+        "skill_prompt_limit",
+        "tool_output_chars",
+    }
+)
+
 #: The largest window accepted from config or setup: past this a typo ("1e12") would switch compaction off for good.
 MAX_WINDOW = 10_000_000
 

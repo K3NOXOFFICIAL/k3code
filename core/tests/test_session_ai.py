@@ -112,3 +112,17 @@ def test_unknown_escalate_key_is_warned_about(tmp_path, monkeypatch, caplog):
         cfg = load_config(project_dir=tmp_path)
     assert "autonomy.escalate.judge_not_done is not used" in caplog.text
     assert "autonomy.escalate.tool_errors" not in caplog.text and cfg.autonomy["escalate"]["tool_errors"] == 4
+
+
+def test_a_misspelled_context_key_is_warned_about_and_the_real_ones_are_not(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from k3code.config import load_config
+    from k3code.paths import user_config_path
+
+    text = "context:\n  compact_at_token: 100000\n  compact_at_tokens: 90000\n  keep_messages: 6\n  autocompact: true\n"
+    user_config_path().write_text(text, encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="k3code.config"):
+        load_config(project_dir=tmp_path)
+    assert "context.compact_at_token is not used" in caplog.text
+    assert "context.compact_at_tokens is not used" not in caplog.text and "context.keep_messages" not in caplog.text

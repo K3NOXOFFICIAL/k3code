@@ -133,6 +133,11 @@ async def _run_headless(
     chain = build_chain(providers, _resolve_model_specs(config))
     cooldowns = CooldownStore(path=_cooldown_path())
     usage = _HeadlessUsage(session)
+    if usage.db is not None:  # each -p run is a new process: the day's caps count what the log holds for today
+        from k3code.pricing import day_loader
+        from k3code.reliability.governor import DAY_LEDGER
+
+        DAY_LEDGER.loader, DAY_LEDGER.date = day_loader(usage.db, config), ""
     router = Router(chain, cooldowns=cooldowns, on_event=usage.on_router_event, **router_options(config))
 
     # M2: reliability bundle (netwatch, persistent retry, journal, guards).

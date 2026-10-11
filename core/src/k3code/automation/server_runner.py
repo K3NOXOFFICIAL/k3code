@@ -153,6 +153,8 @@ class ServerRunner:
                 live.extra_tools = []
                 live.task_kind = ""
                 if not existing:
+                    # a fresh session made for this run: nobody will ever poll a background child it left running
+                    srv.subagents.interrupt_session(live.session_id)
                     await self._release(live)
                 elif status not in ("interrupted", "halted") and srv._pending_prompts(live) and not live.turn_in_flight:
                     # the user queued prompts behind this run: they start now as their own, attended turn

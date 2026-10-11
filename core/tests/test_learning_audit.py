@@ -595,3 +595,27 @@ async def test_a_non_utf8_file_name_in_a_tool_error_is_learned_and_reaches_no_cl
     cards = [p for p in hub.store.all() if p.kind == "project_gotcha"]
     assert cards and all(p.text.encode("utf-8") for p in cards)
     await server.close()
+
+
+async def test_the_session_review_does_not_run_for_unattended_turns(tmp_path, monkeypatch):
+    from k3code.learning import review
+
+    server, hub, live = await _hub(tmp_path, monkeypatch)
+    hub._set_state(distilled=hub.clock())
+    live.stored.messages = [
+        m for i in range(12) for m in ({"role": "user", "content": f"q{i}"}, {"role": "assistant", "content": "a"})
+    ]
+    calls: list[int] = []
+
+    async def fake_review(*args, **kw):
+        calls.append(1)
+        return {"proposals": []}
+
+    monkeypatch.setattr(review, "review_session", fake_review)
+    live.background = True  # a loop tick, a cron run, an automation
+    await hub.turn_finished(live, "done")
+    assert calls == []
+    live.background = False
+    await hub.turn_finished(live, "done")
+    assert calls == [1]
+    await server.close()

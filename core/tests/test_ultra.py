@@ -367,3 +367,21 @@ async def test_the_token_cap_is_charged_by_every_child_through_the_session_gover
     with pytest.raises(BudgetStop) as stop_info:
         budget.take_agent()
     assert stop_info.value.kind == "tokens"
+
+
+def test_a_vote_is_sent_only_the_diff_of_the_files_its_findings_name():
+    from k3code.autonomy.ultra import diff_for_files
+
+    diff = (
+        "diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n@@ -1 +1 @@\n-x\n+y\n"
+        "diff --git a/src/b.py b/src/b.py\n--- a/src/b.py\n+++ b/src/b.py\n@@ -1 +1 @@\n-p\n+q\n"
+        "diff --git a/docs/c.md b/docs/c.md\n--- a/docs/c.md\n+++ b/docs/c.md\n@@ -1 +1 @@\n-m\n+n\n"
+    )
+    only_a = diff_for_files(diff, {"src/a.py"})
+    assert "src/a.py" in only_a and "src/b.py" not in only_a and "c.md" not in only_a
+    both = diff_for_files(diff, {"a.py", "./src/b.py"})  # a suffix match and a leading ./
+    assert "src/a.py" in both and "src/b.py" in both and "c.md" not in both
+    assert diff_for_files(diff, {"nothing.py"}) == diff, (
+        "a finding that names a missing file is judged on the whole diff"
+    )
+    assert diff_for_files(diff, set()) == diff and diff_for_files(diff, {""}) == diff

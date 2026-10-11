@@ -123,6 +123,8 @@ k3code -p "fix the failing test" --json  # headless: one prompt, JSON result
 k3code daemon                            # a long-running host: sessions, schedules and automations keep running
 ```
 
+`k3code -p` and the line REPL run their own loop without the gateway, so they have the file and shell tools (read, write, edit, bash with bash_output/bash_kill, grep, glob, todo), skills and the user's hooks, but not MCP servers, sub-agents (`task`), `web_fetch`/browser or the wake words; use the TUI or `k3code attach` for those. They elide old tool results like a gateway session does and `-p` ends with an error (exit code 1) when the model keeps failing the same tools (`autonomy.max_tool_errors`) or repeating itself.
+
 A `-p` prompt whose first word is a slash command runs that command instead of asking the model: `k3code -p "/project"` prints the stored project scan (in a fresh project it says "Not scanned yet"; `k3code -p "/project rescan"` scans and stores; `k3code doctor` shows a read-only scan), and `/skills`, `/stats` and `/help` print their usual output. A command that needs a live session (`/clear`, `/compact` …) exits with an error that says so.
 
 With a daemon running, `k3code attach <session-id>` opens the TUI on one of its sessions (find ids with `/resume`; add `--readonly` to only watch). Detach any time; the session keeps working.

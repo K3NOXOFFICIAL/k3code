@@ -286,3 +286,13 @@ async def test_a_turn_reports_its_context_and_an_automatic_compaction_says_so(tm
     assert usages and all(u["context_max"] == 128_000 for u in usages)
     assert usages[-1]["compressions"] == 1
     await server.close()
+
+
+async def test_a_limit_below_the_fixed_request_overhead_is_called_out(tmp_path, monkeypatch):
+    server, live = await seed(tmp_path, monkeypatch, Recording())
+    live.overhead_tokens = 6_000  # a project with memory files, skills and MCP tools: more than the bare minimum
+    out = (await cmd(server, "/autocompact 5k --session", live.session_id))["message"]
+    assert "compacted on every turn" in out and "~6,000 tokens" in out
+    out = (await cmd(server, "/autocompact 120k --session", live.session_id))["message"]
+    assert "every turn" not in out
+    await server.close()

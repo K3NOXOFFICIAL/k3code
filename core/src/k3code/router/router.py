@@ -284,6 +284,10 @@ class Router:
                     # The provider yields its "done" event then closes normally.
                     return
                 except Exception as exc:  # noqa: BLE001 - classified below
+                    if (partial := getattr(exc, "usage", None)) is not None:
+                        if not partial.model:
+                            partial.model = target_model
+                        yield StreamEvent(type="partial_usage", usage=partial)  # billed, though no answer came of it
                     classified = classify_api_error(exc, provider=entry.provider_name, model=target_model)
                     last_reason = classified.reason
                     last_detail = summarize(exc)

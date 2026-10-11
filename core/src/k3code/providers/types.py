@@ -90,7 +90,9 @@ class StreamEvent:
 
     #: "reset": the router is retrying or failing over after this attempt already streamed output; consumers discard
     #: the partial text/tool calls they collected (the new attempt streams the whole answer again).
-    type: Literal["text_delta", "tool_call", "done", "error", "reset"]
+    #: "partial_usage": an attempt died after the provider had counted its prompt (``usage``); the consumer charges it,
+    #: the tokens were billed although no answer came of them.
+    type: Literal["text_delta", "tool_call", "done", "error", "reset", "partial_usage"]
     text: str | None = None
     tool_call: ToolCall | None = None
     message: Message | None = None  # set on "done": the full assistant message

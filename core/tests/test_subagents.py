@@ -476,3 +476,31 @@ def test_a_stopped_worktree_child_tells_the_parent_where_its_work_is():
     plain = child("failed", "pending")
     plain.isolation = "none"
     assert plain.render() == "Sub-agent sa-1 failed: boom"
+
+
+async def test_finished_background_children_are_reported_once_at_the_next_turn(tmp_path, monkeypatch):
+    from k3code.subagents.runner import Handle
+    from m1cmd_helpers import make_server, new_session
+
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    live = server.live[await new_session(server, tmp_path)]
+
+    def child(hid: str, status: str, *, background: bool, parent_child_id=None) -> Handle:
+        h = Handle(id=hid, description="d", agent_type="worker", tier="main", depth=1, parent_sid=live.session_id)
+        h.status, h.result, h.background, h.parent_child_id = status, f"result of {hid}", background, parent_child_id
+        server.subagents.handles[hid] = h
+        return h
+
+    child("sa-1", "completed", background=True)
+    child("sa-2", "failed", background=True).error = "boom"
+    child("sa-3", "running", background=True)  # not finished yet
+    child("sa-4", "completed", background=False)  # its result came back as the task call's own answer
+    polled = child("sa-5", "completed", background=True)
+    polled.reported = True  # the model already read it with task_result
+    child("sa-6", "completed", background=True, parent_child_id="sa-1")  # a grandchild: its parent reads it
+
+    note = server._finished_background_note(live)
+    assert "sa-1 (completed): result of sa-1" in note and "sa-2 (failed): boom" in note
+    assert not any(h in note for h in ("sa-3", "sa-4", "sa-5", "sa-6"))
+    assert server._finished_background_note(live) == "", "shown once"
+    await server.close()

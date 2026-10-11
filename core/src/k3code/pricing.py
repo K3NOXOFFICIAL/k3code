@@ -31,6 +31,7 @@ PRICES_PER_MTOK: tuple[tuple[str, float, float], ...] = (
     ("haiku", 1.0, 5.0),
     ("gpt-4o-mini", 0.15, 0.60),
     ("gpt-4o", 2.5, 10.0),
+    ("gpt-4.1-nano", 0.10, 0.40),
     ("gpt-4.1-mini", 0.40, 1.60),
     ("gpt-4.1", 2.0, 8.0),
 )
@@ -88,6 +89,17 @@ def estimate_usd(config: Any, usage: Any) -> float | None:
     return (
         fresh * price_in + read * price_in * read_x + written * price_in * write_x + completion * price_out
     ) / 1_000_000
+
+
+def day_loader(usage_db: Any, config: Any) -> Any:
+    """The ``DAY_LEDGER`` loader for ``usage_db``: (tokens, USD) the log already holds for a day, rows priced like live
+    calls (the provider's cost, else the price table, else the governor's blended rate)."""
+    from types import SimpleNamespace
+
+    def price(row: dict[str, Any]) -> float | None:
+        return estimate_usd(config, SimpleNamespace(cost_usd=None, **row))
+
+    return lambda day: usage_db.day_spend(day, price)
 
 
 #: EUR per USD when the config does not say: an approximation, the user sets ``eur_per_usd`` to today's rate.

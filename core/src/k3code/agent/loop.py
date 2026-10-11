@@ -335,6 +335,8 @@ class AgentLoop:
                     text_parts.append(event.text)
                     if self.on_text_delta:
                         await self.on_text_delta(event.text)
+                elif event.type == "partial_usage":
+                    self.reliability.record_usage(event.usage)  # an attempt that died after its prompt was counted
                 elif event.type == "reset":
                     # the router is retrying after partial output: forget what this attempt streamed
                     text_parts.clear()

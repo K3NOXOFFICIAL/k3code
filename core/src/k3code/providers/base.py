@@ -23,6 +23,9 @@ class ProviderError(Exception):
     status_code: int | None = None
     headers: dict[str, str] = field(default_factory=dict)
     body: dict[str, Any] = field(default_factory=dict)
+    #: What the provider had already counted when the stream broke (the prompt it read, cache numbers included), or
+    #: None: spend that no answer came of, which the router reports as a ``partial_usage`` event.
+    usage: Any = None
 
     def __post_init__(self) -> None:
         super().__init__(self.message)

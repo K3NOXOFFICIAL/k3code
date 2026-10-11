@@ -528,6 +528,7 @@ def load_config(
     _warn_unknown_escalate_keys(merged)
     _warn_unknown_agents_keys(merged)
     _warn_unknown_mode_keys(merged)
+    _warn_unknown_context_keys(merged)
     return settings
 
 
@@ -575,6 +576,16 @@ def _warn_unknown_agents_keys(merged: dict[str, Any]) -> None:
             width,
             HARD_MAX_PARALLEL,
         )
+
+
+def _warn_unknown_context_keys(merged: dict[str, Any]) -> None:
+    """A key under ``context`` that nothing reads: the ones that decide when and how a conversation is compacted would
+    otherwise be ignored without a word (``compact_at_token: 100000`` left compaction at 70% of the window)."""
+    from k3code.context_budget import CONTEXT_KEYS
+
+    section = merged.get("context")
+    for key in sorted(set(section) - CONTEXT_KEYS if isinstance(section, dict) else (), key=str):
+        logger.warning("context.%s is not used and is ignored (known keys: %s)", key, ", ".join(sorted(CONTEXT_KEYS)))
 
 
 def _warn_unknown_mode_keys(merged: dict[str, Any]) -> None:

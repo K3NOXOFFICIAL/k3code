@@ -309,7 +309,7 @@ class PlanFirst:
             try:
                 extra["advisor"] = await advisor_mod.advise(
                     server.model_caller,
-                    f"Task: {text}\n\nPlan:\n{plan}",
+                    f"Task: {text[:4000]}\n\nPlan:\n{plan}",  # the plan covers the task: a pasted log adds nothing
                     "Critique this approved plan.",
                     session_id=sid,
                     brief=True,

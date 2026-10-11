@@ -519,7 +519,13 @@ class LearningHub:
         turns = review.user_turns(msgs)
         meta = session.stored.meta
         minimum = int(self.cfg["review_min_turns"])
-        if status == "done" and turns > minimum and turns > int(meta.get("reviewed_turns", 0)) + minimum - 1:
+        unattended = bool(getattr(session, "background", False))  # loop ticks, cron, automations: synthetic prompts
+        if (
+            status == "done"
+            and not unattended
+            and turns > minimum
+            and turns > int(meta.get("reviewed_turns", 0)) + minimum - 1
+        ):
             meta["reviewed_turns"] = turns
             r = await review.review_session(
                 self.server.model_caller,

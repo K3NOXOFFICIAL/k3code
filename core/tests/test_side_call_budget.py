@@ -52,3 +52,38 @@ async def test_a_call_with_no_session_is_not_charged(tmp_path, monkeypatch):
     rel.governor.add_budget(Budget(scope="session", tokens=1_000_000))
     await server.model_caller.complete(TaskKind.TITLE, [Message(role="user", content="x")])
     assert rel.governor._budgets["session"].used_tokens == 0
+
+
+async def test_a_side_call_never_carries_the_sessions_reasoning_effort_but_the_advisor_does(tmp_path, monkeypatch):
+    from k3code.providers import effort as effort_mod
+
+    seen: dict[str, str | None] = {}
+
+    steps = [{"type": "text", "text": "ok"}]
+    server = make(tmp_path, monkeypatch, steps, mode="auto")
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+
+    original = server.model_caller._routers
+
+    class Spy:
+        def __init__(self, inner):
+            self.inner = inner
+
+        async def complete(self, messages, tools, **kw):
+            seen["effort"] = effort_mod.REASONING_EFFORT.get()
+            return await self.inner.complete(messages, tools, **kw)
+
+    class Routers:
+        def get(self, tier):
+            return Spy(original().get(tier))
+
+    server.model_caller._routers = lambda: Routers()
+    token = effort_mod.REASONING_EFFORT.set("max")
+    try:
+        await server.model_caller.complete(TaskKind.TITLE, [Message(role="user", content="x")])
+        assert seen["effort"] is None
+        await server.model_caller.complete(TaskKind.ADVISOR, [Message(role="user", content="x")])
+        assert seen["effort"] == "max"
+        assert effort_mod.REASONING_EFFORT.get() == "max", "restored after the side call"
+    finally:
+        effort_mod.REASONING_EFFORT.reset(token)

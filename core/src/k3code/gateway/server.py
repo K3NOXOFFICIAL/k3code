@@ -102,7 +102,7 @@ from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
-from k3code.pricing import estimate_usd
+from k3code.pricing import day_loader, estimate_usd
 from k3code.prompting import build_system_prompt
 from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers
@@ -110,6 +110,7 @@ from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
 from k3code.reliability import events as rev
+from k3code.reliability.governor import DAY_LEDGER
 from k3code.reliability.journal import delete_session_journal, prune_journals
 from k3code.reliability.persistent_retry import PERMANENT_REASONS, TurnCancelled
 from k3code.research.browser import BrowserManager
@@ -649,6 +650,8 @@ class GatewayServer:
         self.stopping = False
         self._client_seq = 0
         self.usage = UsageDB(self._home() / "usage.db")
+        DAY_LEDGER.loader = day_loader(self.usage, self.config)  # a restart does not hand out the day's cap again
+        DAY_LEDGER.date = ""  # and the count is read from the log on first use
         self.artifacts = ArtifactStore(self._home() / "artifacts.db")
         self._tiers: TierRouters | None = None
         self._router_cache: dict[str, TierRouters] = {}  # one TierRouters per model key (see _ensure_router)
@@ -1788,6 +1791,7 @@ class GatewayServer:
             if retry:
                 # a persistent goal does not pause on a failed or stalled turn: it waits a little (longer each time)
                 # and goes on, until it is done or the user stops it
+                self._drop_unanswered_continuation(session, prompt)
                 delay, prompt, notice = retry
                 session.emit("notification.show", {"text": notice, "level": "info", "kind": "info", "key": "goal"})
                 session.emit(
@@ -1940,6 +1944,18 @@ class GatewayServer:
         self.autonomy.drop_mode_verdict(session)
         return _Route("ultracode", "ultracode is on", f"scope {verdict.scope}", spec)
 
+    @staticmethod
+    def _drop_unanswered_continuation(session: LiveSession, prompt: str) -> None:
+        """A goal's continuation turn that failed before the model answered leaves its prompt as the last message of
+        the history; the retry sends a new one. Each failed retry used to add another (17 an hour while a provider was
+        down), all resent with every later request. The user's own prompt is never dropped."""
+        messages = session.stored.messages
+        if not session.goal_continuation or not messages:
+            return
+        last = messages[-1]
+        if last.get("role") == "user" and str(last.get("content") or "").startswith(prompt):
+            session.stored.messages = messages[:-1]
+
     def _goal_recovery(self, session: LiveSession, mgr: GoalManager, status: str) -> tuple[float, str, str] | None:
         """What a persistent goal does when its turn did not finish: ``(seconds to wait, next prompt, notice)``, or None
         to leave it to ``_block_goal_for`` (pause). Persisting covers a failed turn (no provider answered after the
@@ -2002,6 +2018,24 @@ class GatewayServer:
         """Tell the automation engine (``session_event`` triggers) that a session's run ended."""
         if self.automation is not None:
             self.automation.session_event(session.session_id, status, str(session.stored.meta.get("origin") or ""))
+
+    def _finished_background_note(self, session: LiveSession) -> str:
+        """The background sub-agents (``task(background=true)``) that finished since the model last looked, one line
+        each. Their output was only ever read by a ``task_result`` call the model had to remember to make; their spend
+        was already counted. Shown once."""
+        done = self.subagents.unreported(session.session_id)
+        for h in done:
+            h.reported = True
+        if not done:
+            return ""
+
+        def outcome(h: Any) -> str:
+            text = h.error if h.status == "failed" and h.error else h.result or h.error
+            return text.strip()[:200]
+
+        lines = [f'- {h.id} ({h.status}): {outcome(h)}  [task_result(id="{h.id}")]' for h in done]
+        head = "[Background sub-agents finished since your last turn; read the full result with task_result]"
+        return head + "\n" + "\n".join(lines)
 
     def _charge_side_call(self, session_id: str, usage: Usage) -> None:
         """A one-shot call's usage (see ModelCaller) counts against the session's budgets and the day's ledger."""
@@ -2314,6 +2348,8 @@ class GatewayServer:
                 gate.proceed, gate.message = False, f"Prompt blocked by a UserPromptSubmit hook: {hooked.reason}"
             elif extra := hooked.context_text():
                 prompt = f"{prompt}\n\n" + fenced("context from the user's hooks:", extra)
+            if not hooked.blocked and (finished := self._finished_background_note(session)):
+                prompt = f"{prompt}\n\n{finished}"
             if gate.proceed and (subtasks := self.fanout.applies(session, gate)):
                 fan = await self.fanout.run(session, text, gate.plan, subtasks)  # M4b: parallel worktree children
                 if fan is not None and fan.ok:
@@ -4053,13 +4089,20 @@ async def _tune_set(server: GatewayServer, params: dict[str, Any]) -> dict[str, 
 
 
 async def _model_save_key(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    _require(params, "provider")
-    _require(params, "key")
-    # M1: keys come from config env vars; persisting new keys is a later milestone.
-    return {"provider": params.get("provider")}
+    """The picker's "add a key" step. k3code keeps no API keys (they are secrets: they come from the environment
+    variable a provider entry names), so this answers with what to do instead of the "missing provider" a mismatch of
+    parameter names gave. The key sent is never read, logged or echoed."""
+    slug = str(params.get("slug") or params.get("provider") or "")
+    entry = next((p for p in server.config.providers if p.name == slug), None)
+    env = getattr(entry, "api_key_env", "") if entry is not None else ""
+    where = (
+        f"set {env} in the environment of the daemon" if env else "name an api_key_env in the provider's config entry"
+    )
+    raise _InvalidParams(f"k3code does not store API keys: {where}, then restart it (k3code daemon restart)")
 
 
 async def _model_disconnect(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
+    """Nothing to forget: no key is stored (see _model_save_key); unset the environment variable to disconnect."""
     return {"disconnected": False}
 
 

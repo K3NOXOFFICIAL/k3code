@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from k3code.errors import ChainExhausted
+from k3code.providers import effort as effort_mod
 from k3code.providers.types import Message, ToolSpec
 from k3code.routing.tiers import TaskKind, Tier, TierRouters, next_tier, tier_for
 
@@ -26,6 +27,13 @@ logger = logging.getLogger(__name__)
 #: what served IT: the one global "last attempt" belongs to whichever call attempted last, and a title on the cheap
 #: tier was recorded (and priced) as the strong model another call had just used.
 attempt_holder: ContextVar[list[tuple[str, str]] | None] = ContextVar("attempt_holder", default=None)
+
+
+#: One-shot calls that never get the session's reasoning effort: short mechanical answers on a cheap tier.
+NO_EFFORT_KINDS = frozenset(
+    {TaskKind.TITLE, TaskKind.COMPACTION, TaskKind.GOAL_JUDGE, TaskKind.PREVIEW, TaskKind.CLASSIFICATION}
+    | {TaskKind.CONTEXT_SELECT}
+)
 
 
 @dataclass
@@ -146,14 +154,25 @@ class ModelCaller:
         started = time.monotonic()
         attempts: list[tuple[str, str]] = []
         token = attempt_holder.set(attempts)
+        # the session's /effort is for the work it asked for: a title, a verdict or a summary at "max" spent the reply
+        # cap on reasoning and ended empty, at several times the cost
+        effort_token = effort_mod.REASONING_EFFORT.set(None) if kind in NO_EFFORT_KINDS else None
         try:
             final = await (asyncio.wait_for(coro, timeout) if timeout else coro)
         finally:
             attempt_holder.reset(token)
+            if effort_token is not None:
+                effort_mod.REASONING_EFFORT.reset(effort_token)
         seconds = time.monotonic() - started
         usage = final.usage
         provider, model = self._served(attempts, usage)
         pt, ct = (usage.prompt_tokens, usage.completion_tokens) if usage else (0, 0)
+        # charged before the row is written: the day's ledger, started from the log, must not read this call twice
+        if self._charge is not None and usage is not None and session_id:
+            try:
+                self._charge(session_id, usage)
+            except Exception:  # noqa: BLE001 - accounting must never fail the call it accounts for
+                logger.debug("charging a side call failed", exc_info=True)
         if self.usage is not None:
             self.usage.record(
                 "call",
@@ -170,9 +189,4 @@ class ModelCaller:
                 turn=self._turn_of(session_id) if self._turn_of else "",
                 seconds=seconds,
             )
-        if self._charge is not None and usage is not None and session_id:
-            try:
-                self._charge(session_id, usage)
-            except Exception:  # noqa: BLE001 - accounting must never fail the call it accounts for
-                logger.debug("charging a side call failed", exc_info=True)
         return CallResult(final.content or "", tier, model, provider, pt, ct)

@@ -39,6 +39,7 @@ def register_task_tools(
             return {"error": str(e)}
         mgr.note_spawn(parent.session_id, parent_child_id)
         if arguments.get("background"):
+            h.background = True
             return {"content": (f'Started sub-agent {h.id} in the background. Poll with task_result(id="{h.id}").')}
         await mgr.wait(h)
         return {"content": h.render()}
@@ -79,6 +80,7 @@ def register_task_tools(
             await mgr.wait(h)
         if not h.done:
             return {"content": f"Sub-agent {h.id} is still {h.status} ({h.tool_count} tool calls so far)."}
+        h.reported = True
         return {"content": h.render()}
 
     reg.register(

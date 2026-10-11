@@ -501,6 +501,9 @@ class Ultra:
             return
         self.progress(session, "ultracode", "cross-checking findings", f"{len(candidates)} candidates", budget)
         listing = json.dumps(candidates, indent=1)
+        # a vote judges named findings: the files they name are the part of the diff it needs (the whole 60 000
+        # characters went to each of the two votes, for an answer of twenty tokens)
+        vote_diff = diff_for_files(diff, {str(f.get("file") or "") for f in candidates})
 
         async def vote(lens: str, desc: str) -> dict[str, bool]:
             res = await self.server.model_caller.complete(
@@ -517,7 +520,7 @@ class Ultra:
                     Message(
                         role="user",
                         content=f"VOTE LENS: {lens}\nTask:\n{task}\n\nCandidates:\n{listing}\n\n"
-                        f"Diff:\n```diff\n{diff}\n```",
+                        f"Diff:\n```diff\n{vote_diff}\n```",
                     ),
                 ],
                 session_id=session.session_id,
@@ -544,6 +547,26 @@ class Ultra:
             session, budget, "worker", fix_prompt, "fix findings", reserved=True, isolation="worktree"
         )
         report.fix = f"{h.status}; merge: {h.merge}" + (f" ({h.branch})" if h.merge == "conflict" else "")
+
+
+def diff_for_files(diff: str, files: set[str]) -> str:
+    """The parts of a ``git diff`` for the files in ``files`` (paths as a reviewer wrote them: a suffix match, so
+    ``src/a.py`` and ``a.py`` both find it). The whole diff when no file is named or none matches: a finding that
+    names a file the diff does not have must still be judged against something."""
+    wanted = {f.strip().lstrip("./") for f in files if f and f.strip()}
+    if not wanted:
+        return diff
+    blocks = re.split(r"(?m)^(?=diff --git )", diff)
+    kept = [
+        b
+        for b in blocks
+        if b.startswith("diff --git ")
+        and any(
+            (m := re.match(r"diff --git a/(.+?) b/(.+)", b.split("\n", 1)[0])) and m.group(2).endswith(w)
+            for w in wanted
+        )
+    ]
+    return "".join(kept) if kept else diff
 
 
 #: which report label each ultra.progress phase counts towards
