@@ -172,6 +172,9 @@ class Governor:
         self._counters = _Counters()
         self._budgets: dict[str, Budget] = {}
         self._lock = asyncio.Lock()
+        #: The governor of the session this one works for (a sub-agent's): its spend counts against the parent's
+        #: session budgets as it happens, and the child stops when they are spent. The day ledger is shared anyway.
+        self.parent: Governor | None = None
 
     # ── PSI / disk ──
 
@@ -222,6 +225,8 @@ class Governor:
                 continue  # synced from the shared ledger in check_budgets
             b.used_tokens += prompt_tokens + completion_tokens
             b.used_usd += cost
+        if self.parent is not None:
+            self.parent.charge(prompt_tokens, completion_tokens, usd=cost)
 
     def charge(self, prompt_tokens: int, completion_tokens: int, *, usd: float | None = None) -> None:
         """Charge spend that happened elsewhere (a sub-agent's) to this session's own budgets.
@@ -245,7 +250,7 @@ class Governor:
                 continue
             kind = "tokens" if (b.tokens is not None and "token" in msg) else "usd"
             return BudgetExceeded(msg, scope=b.scope, kind=kind)
-        return None
+        return self.parent.check_budgets() if self.parent is not None else None
 
     def apply_usage_and_check(self, prompt_tokens: int, completion_tokens: int) -> BudgetExceeded | None:
         """Record usage then report the first violated budget."""

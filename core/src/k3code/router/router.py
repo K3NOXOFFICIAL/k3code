@@ -48,6 +48,8 @@ from k3code.router.cooldown import CooldownStore, key_fingerprint
 
 #: The shortest wait between two attempts at one endpoint, whatever Retry-After says.
 MIN_RETRY_DELAY = 0.5
+#: How long an entry that stayed broken through every retry is skipped when the chain has another (server, timeout).
+FAILOVER_COOLDOWN_S = 60.0
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +272,9 @@ class Router:
                     ):
                         streamed = True
                         if event.type == "done":  # the consumer stops reading here: record the success first
+                            for u in (event.usage, event.message.usage if event.message else None):
+                                if u is not None and not u.model:
+                                    u.model = target_model
                             self.cooldowns.record_success(
                                 provider=entry.provider_name, model=target_model, base_url=entry.base_url
                             )
@@ -350,8 +355,9 @@ class Router:
         if wait is not None:
             until = self.cooldowns.wall() + wait
             clock = time.strftime("%H:%M", time.localtime(until))
+            limited = last_reason in (FailoverReason.rate_limit, FailoverReason.quota)
             raise ChainExhausted(
-                f"all providers rate-limited until {clock} ({reason_name})",
+                f"all providers {'rate-limited' if limited else 'unavailable'} until {clock} ({reason_name})",
                 last_reason=reason_name,
                 retry_after=wait,
                 until=until,
@@ -442,6 +448,21 @@ class Router:
             fingerprint=entry.key_fingerprint,
             keyless=entry.keyless,
         )
+        if (
+            not armed
+            and reason in (FailoverReason.server, FailoverReason.timeout)
+            and len(self.chain) > 1  # a lone entry is retried on every call, as it always was: there is nowhere else
+        ):
+            # It stayed down through every retry: a hung or failing primary cost three full attempts (3 x 300 s read
+            # timeouts) on every call. Skip it briefly; a recovered entry is back after the window.
+            armed = self.cooldowns.arm(
+                reason,
+                provider=entry.provider_name,
+                model=target_model,
+                base_url=entry.base_url,
+                fixed_seconds=FAILOVER_COOLDOWN_S,
+            )
+            retry_after = retry_after if retry_after is not None else armed
         if retry_after is not None and armed:
             self._emit(
                 "router.cooldown",

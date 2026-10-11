@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -97,6 +97,8 @@ class Reliability:
         self.loop_guard = LoopGuard() if self.flags.loop_guard else None
         self.journal: ToolJournal | None = None  # opened lazily in _open_journal
         self.retry: PersistentRetry | None = None  # built in attach_router
+        #: usage -> USD (see k3code.pricing.estimate_usd); the gateway sets it, None = the governor's blended rate
+        self.price_of: Callable[[Any], float | None] | None = None
         self.unattended = False  # see set_unattended
         self._started = False
         self._net_forwarded = False
@@ -350,7 +352,9 @@ class Reliability:
         try:
             p = int(getattr(usage, "prompt_tokens", 0) or 0)
             c = int(getattr(usage, "completion_tokens", 0) or 0)
-            self.governor.record_usage(p, c)
+            # the provider's cost, else the price of the model that answered; None = the governor's blended rate
+            usd = self.price_of(usage) if self.price_of is not None else getattr(usage, "cost_usd", None)
+            self.governor.record_usage(p, c, usd=usd)
         except (TypeError, ValueError):
             logger.debug("ignoring malformed usage report: %r", usage)
 

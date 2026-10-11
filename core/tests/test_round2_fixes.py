@@ -342,3 +342,188 @@ async def test_best_effort_calls_do_not_climb_to_the_main_tier():
 
     assert await make_title(Caller(), "fix the parser") == "A title"
     assert seen[0]["escalate"] is False
+
+
+# ── budgets ───────────────────────────────────────────────────────────
+
+
+def test_prices_follow_the_model_the_provider_cache_and_the_config():
+    from k3code.config import Settings
+    from k3code.pricing import estimate_usd, model_price
+
+    cfg = Settings(models={"my-local": {"price": {"input": 0.5, "output": 1.5}}})
+    sonnet = Usage(prompt_tokens=1_000_000, completion_tokens=100_000, model="claude-sonnet-5-5")
+    assert estimate_usd(cfg, sonnet) == pytest.approx(3.0 + 1.5)  # $3 in, $15 out per million
+    cached = Usage(
+        prompt_tokens=1_000_000, completion_tokens=0, cache_read_tokens=900_000, cache_creation_tokens=0, model="sonnet"
+    )
+    assert estimate_usd(cfg, cached) == pytest.approx(0.1 * 3.0 + 0.9 * 0.1 * 3.0)  # a cache read costs a tenth
+    assert estimate_usd(cfg, Usage(prompt_tokens=2_000_000, model="my-local")) == pytest.approx(1.0)  # the config wins
+    assert estimate_usd(cfg, Usage(prompt_tokens=10, cost_usd=0.42, model="sonnet")) == 0.42  # the provider's figure
+    assert estimate_usd(cfg, Usage(prompt_tokens=10, model="mystery-model")) is None  # unknown: the blended rate
+    assert model_price(cfg, "anthropic/claude-opus-5-5") == (15.0, 75.0)
+
+
+async def test_the_router_tags_a_calls_usage_with_the_model_that_answered(tmp_path):
+    class Answers:
+        name = "fake"
+        base_url = "fake://"
+
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            msg = Message(role="assistant", content="ok", tool_calls=[], usage=Usage(prompt_tokens=5))
+            yield StreamEvent(type="done", message=msg, usage=msg.usage)
+
+        async def aclose(self) -> None:
+            return None
+
+    router = Router(build_chain([Answers()], [["claude-sonnet-5-5"]]), max_retries=0)
+    done = [e async for e in router.stream([Message(role="user", content="hi")], [])][-1]
+    assert done.usage.model == "claude-sonnet-5-5" and done.message.usage.model == "claude-sonnet-5-5"
+
+
+def test_a_child_spends_against_its_parents_budget_as_it_goes_and_stops_with_it():
+    from k3code.reliability.governor import Budget, Governor, GovernorConfig
+
+    parent, child = Governor(GovernorConfig()), Governor(GovernorConfig())
+    parent.add_budget(Budget(scope="session", tokens=100_000))
+    child.add_budget(Budget(scope="session", tokens=100_000))  # the child's own cap alone would allow it all
+    child.parent = parent
+    parent.record_usage(60_000, 0)
+    child.record_usage(30_000, 0)
+    assert parent._budgets["session"].used_tokens == 90_000  # no waiting for the child to end
+    assert child.check_budgets() is None
+    child.record_usage(20_000, 0)
+    err = child.check_budgets()
+    assert err is not None and err.scope == "session"  # the parent's budget is spent: the child stops
+
+
+async def test_a_priced_call_counts_in_dollars_and_a_provider_cost_counts_as_given(tmp_path):
+    from k3code.config import Settings
+    from k3code.pricing import estimate_usd
+
+    rel = Reliability.from_settings(None, session="p", home=tmp_path / "home")
+    rel.price_of = lambda usage: estimate_usd(Settings(), usage)
+    assert rel.governor is not None
+    rel.governor.add_budget(
+        __import__("k3code.reliability.governor", fromlist=["Budget"]).Budget(scope="session", usd=1.0)
+    )
+    rel.record_usage(Usage(prompt_tokens=200_000, completion_tokens=0, model="claude-opus-5-5"))
+    assert rel.governor._budgets["session"].used_usd == pytest.approx(3.0)  # $15 per million, not $0.10 blended
+    rel.record_usage(Usage(prompt_tokens=1_000_000, cost_usd=0.01, model="sonnet"))
+    assert rel.governor._budgets["session"].used_usd == pytest.approx(3.01)
+    assert rel.check_budgets() is not None  # over the $1 cap
+
+
+# ── the goal's done-check ─────────────────────────────────────────────
+
+
+async def test_the_goal_done_check_reads_only_what_happened_since_the_goal_was_set(tmp_path, monkeypatch):
+    seen: list[str] = []
+
+    class Spy(Recording):
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            seen.append("\n".join(str(m.content or "") for m in messages))
+            async for event in super().stream(messages, tools, model, max_tokens=max_tokens, temperature=temperature):
+                yield event
+
+    server, live = await seed(tmp_path, monkeypatch, Spy(), autonomy={"advisor_on_goal": True})
+    live.stored.messages = [
+        {"role": "user", "content": "OLD unrelated question about css"},
+        {"role": "assistant", "content": "OLD answer"},
+    ]
+    server.goal_manager(live).set("ship the parser")
+    live.stored.messages += [
+        {"role": "user", "content": "NEW work on the parser"},
+        {"role": "assistant", "content": "NEW parser done"},
+    ]
+    review = server._goal_reviewer(live)
+    assert review is not None
+    await review("ship the parser")
+    sent = "\n".join(seen)
+    assert "NEW parser done" in sent and "OLD" not in sent
+    await server.close()
+
+
+# ── a failing entry in a chain ────────────────────────────────────────
+
+
+class _Flaky:
+    """Fails with the given status until `works` is set, counting its calls."""
+
+    def __init__(self, name: str, status: int | None = 503) -> None:
+        self.name, self.base_url, self.status, self.calls = name, f"fake://{name}", status, 0
+
+    async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+        self.calls += 1
+        if self.status is not None:
+            raise ProviderError(message="upstream unavailable", status_code=self.status, headers={}, body={})
+        msg = Message(role="assistant", content="ok", tool_calls=[], usage=Usage())
+        yield StreamEvent(type="done", message=msg, usage=msg.usage)
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def _ask_router(router: Router):
+    return [e async for e in router.stream([Message(role="user", content="hi")], [])]
+
+
+async def test_a_primary_that_stayed_down_through_every_retry_is_skipped_for_a_minute_when_there_is_a_fallback():
+    primary, fallback = _Flaky("primary"), _Flaky("fallback", status=None)
+    router = Router(build_chain([primary, fallback], [["m"], ["m"]]), max_retries=1, base_delay=0.0, max_delay=0.0)
+    assert (await _ask_router(router))[-1].type == "done"
+    after_first = primary.calls
+    assert after_first == 2  # the first attempt and its one retry
+    assert (await _ask_router(router))[-1].type == "done"
+    assert primary.calls == after_first  # not called again: it was three attempts (3 x 300 s of timeouts) per call
+
+
+async def test_a_lone_entry_is_still_retried_on_every_call():
+    only = _Flaky("only")
+    router = Router(build_chain([only], [["m"]]), max_retries=1, base_delay=0.0, max_delay=0.0)
+    for _ in range(2):
+        with pytest.raises(Exception):  # noqa: B017, PT011 - ChainExhausted
+            await _ask_router(router)
+    assert only.calls == 4  # nowhere else to go: every call tries it
+
+
+async def test_a_whole_chain_that_is_down_says_unavailable_not_rate_limited():
+    from k3code.errors import ChainExhausted
+
+    a, b = _Flaky("a"), _Flaky("b")
+    router = Router(build_chain([a, b], [["m"], ["m"]]), max_retries=0, base_delay=0.0, max_delay=0.0)
+    with pytest.raises(ChainExhausted):
+        await _ask_router(router)
+    with pytest.raises(ChainExhausted) as err:  # both are cooling now
+        await _ask_router(router)
+    assert "unavailable until" in str(err.value) and "rate-limited" not in str(err.value)
+    assert 0 < err.value.retry_after <= 60
+
+
+async def test_a_stopped_turn_still_tells_the_client_it_is_over(tmp_path, monkeypatch):
+    """/stop cancels the turn task; the message.complete after the turn never ran, so the TUI kept its input on
+    "interrupting…" (a queued message waited for a second Esc)."""
+    from m1cmd_helpers import frames_of
+
+    server, _ = make_server(tmp_path, monkeypatch, ["done"])
+    sid = await new_session(server, tmp_path)
+    live = server.live[sid]
+    started = asyncio.Event()
+
+    async def hang(session, text):
+        started.set()
+        await asyncio.Event().wait()
+
+    server.autonomy.prepare = hang  # type: ignore[method-assign]
+    await rpc(server, "prompt.submit", {"text": "long task"})
+    task = live.turn_task
+    await asyncio.wait_for(started.wait(), 10)
+    assert (await rpc(server, "session.interrupt", {"session_id": sid}))["result"]["interrupted"]
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 10)
+    done = [
+        f["params"]["payload"]
+        for f in frames_of(server)
+        if f.get("params", {}).get("type") == "message.complete" and f["params"]["payload"].get("status")
+    ]
+    assert [d["status"] for d in done] == ["interrupted"]

@@ -91,6 +91,7 @@ from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
 from k3code.permissions.state import PermissionState, persist_rules, project_config_path
+from k3code.pricing import estimate_usd
 from k3code.prompting import build_system_prompt
 from k3code.providers import effort as effort_mod
 from k3code.providers import make_providers
@@ -1489,6 +1490,7 @@ class GatewayServer:
         """One Reliability bundle per session: netwatch runs while the session lives, events go to its clients."""
         if session.reliability is None:
             rel = build_reliability(self.config, session=session.session_id, home=self._home())
+            rel.price_of = lambda usage: estimate_usd(self.config, usage)  # the USD budgets use real prices
             rel.events.add(lambda e: self._on_reliability_event(session, e), key="gateway")
             session.reliability = rel
         assert self.router is not None
@@ -2045,6 +2047,7 @@ class GatewayServer:
         usage = Usage()
         error: str | None = None
         status = "done"
+        cancelled = False  # set when the turn task is cancelled (/stop, Esc)
         gate = GateResult(prompt=text)
         # bound before the try: a /stop during the scope gate reached the finally first, whose replay record then
         # raised UnboundLocalError in place of the CancelledError
@@ -2213,6 +2216,7 @@ class GatewayServer:
             status = "interrupted"
         except asyncio.CancelledError:
             status = "interrupted"
+            cancelled = True
             raise
         except Exception as e:  # noqa: BLE001
             logger.exception("turn failed")
@@ -2249,6 +2253,14 @@ class GatewayServer:
                 self.autonomy.finish(session, gate, scope_outcome, final_text, text)
             if self.learning.enabled and not prompt_blocked:
                 self.learning.spawn(self.learning.turn_finished(session, status))
+            if cancelled:
+                # /stop and Esc cancel the turn task, so the message.complete below never runs; the TUI holds its input
+                # on "interrupting…" until it hears one (a queued message waited for a second Esc)
+                session.emit(
+                    "message.complete",
+                    {"text": final_text, "usage": {}, "status": "interrupted", "error": None, "state": "completed"},
+                )
+                session.emit("status.update", {"kind": "status", "text": "", "state": "completed"})
 
         session.last_error = error or ""
         session.last_api_calls = sum(1 for m in loop.turn_messages if m.role == "assistant")
@@ -2332,6 +2344,8 @@ class GatewayServer:
         if current[: len(snapshot)] != snapshot:  # /clear or another rewrite ran during the summary call: it wins
             return 0
         session.stored.messages = [*new, *current[len(snapshot) :]]  # what was appended meanwhile stays
+        if isinstance(session.stored.meta.get("goal_started"), dict):
+            session.stored.meta["goal_started"]["message"] = 0  # the indices moved; the summary covers the goal's start
         session.elided.clear()  # the history is new: nothing of it is elided yet
         session.elide_notes.clear()
         session.stored.meta["compactions"] = int(session.stored.meta.get("compactions") or 0) + 1
@@ -2688,9 +2702,13 @@ class GatewayServer:
             return None
 
         async def review(goal: str) -> tuple[bool, list[str]]:
+            # only what happened since the goal was set: the whole session (hours of unrelated work, up to 24k
+            # characters, or a cheap-tier summary of more) was sent to the strong tier on every "done"
+            start = int((session.stored.meta.get("goal_started") or {}).get("message") or 0)
+            messages = session.stored.messages
             ctx = await advisor.condensed_context(
                 self.model_caller,
-                session.stored.messages,
+                messages[start:] if 0 < start < len(messages) else messages,
                 threshold=int(cfg["advisor_compact_chars"]),
                 session_id=session.session_id,
             )
@@ -2703,10 +2721,15 @@ class GatewayServer:
             return session.stored.meta.get("goal")
 
         def save(state: dict[str, Any] | None) -> None:
+            meta = session.stored.meta
             if state is None:
-                session.stored.meta.pop("goal", None)
+                meta.pop("goal", None)
+                meta.pop("goal_started", None)
             else:
-                session.stored.meta["goal"] = state
+                meta["goal"] = state
+                started = meta.get("goal_started") or {}
+                if started.get("at") != state.get("created_at"):  # a new goal: where in the history it begins
+                    meta["goal_started"] = {"at": state.get("created_at"), "message": len(session.stored.messages)}
             self.store.save(session.stored)
 
         return GoalManager(

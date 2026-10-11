@@ -353,9 +353,7 @@ class SubagentManager:
                 text=(h.result or h.error)[:2000],
             )
             self._record_usage(h)
-            rel = getattr(parent, "reliability", None)
-            if rel is not None and rel.governor is not None:  # the parent's session budget includes its children
-                rel.governor.charge(h.tokens_in, h.tokens_out)
+            # the parent's session budget counted this child's spend call by call (see _drive): nothing to add here
             h.loop = None  # the loop holds the child's whole history; the handle keeps only what /agents shows
             h.task = None
             self._prune()
@@ -478,6 +476,12 @@ class SubagentManager:
         server = self.server
         server._ensure_router(parent.stored.model or None)
         reliability = child_reliability(server.config, h.id, server._home())
+        parent_rel = getattr(parent, "reliability", None)
+        if reliability.governor is not None and parent_rel is not None:
+            # the child spends against its parent's session budgets as it goes, and stops when they are spent; it used
+            # to get a fresh full budget of its own (three children of a session at 95% each had the rest of 100%)
+            reliability.governor.parent = parent_rel.governor
+            reliability.price_of = parent_rel.price_of
         parent_approval = await server._approval_callback_for(parent)
         parent._approval_cb = parent_approval  # noqa: SLF001 - shared with every child of this session
         loop = self.build_loop(parent, h, atype, cwd, reliability)

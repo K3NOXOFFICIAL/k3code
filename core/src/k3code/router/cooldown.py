@@ -166,8 +166,12 @@ class CooldownStore:
         now: float | None = None,
         fingerprint: str = "",
         keyless: bool = False,
+        fixed_seconds: float | None = None,
     ) -> float | None:
         """Put an entry into cooldown until its reset window. Returns the armed seconds.
+
+        ``fixed_seconds`` arms a server-error or timeout cooldown of exactly that long: the router uses it when an entry
+        stayed broken through every retry and the chain has another to try, so the next calls go there at once.
 
         ``network_cooldown`` overrides the flat network window (0 disables arming
         on network failures); rate_limit/quota keep the reset/exponential ladder, whose step is the number of
@@ -178,6 +182,17 @@ class CooldownStore:
         A ``keyless`` entry (claude-cli: logged in with ``claude /login``, no key in the config) never arms an auth
         cooldown: nothing would clear it once the login is fixed.
         """
+        if fixed_seconds is not None and reason in (FailoverReason.server, FailoverReason.timeout):
+            monotonic_now = time.monotonic() if now is None else now
+            self.entries[_identity(provider, model, base_url)] = EntryCooldown(
+                until=monotonic_now + fixed_seconds,
+                seconds=fixed_seconds,
+                reason=reason,
+                until_wall=self.wall() + fixed_seconds,
+                fingerprint="",
+            )
+            self._save()
+            return fixed_seconds
         if reason not in _COOLDOWN_REASONS:
             return None
         key = _identity(provider, model, base_url)

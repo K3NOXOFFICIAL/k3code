@@ -31,6 +31,8 @@ class Usage:
     #: Prompt tokens read from / written to the provider's prompt cache (part of prompt_tokens; 0 = none or unknown).
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    #: The model that answered (set by the router; "" = unknown): what the USD budgets price the call by.
+    model: str = ""
 
 
 #: An Anthropic prompt-cache breakpoint: the prefix up to and including the block that carries it is cached.
