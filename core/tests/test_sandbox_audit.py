@@ -71,17 +71,18 @@ def test_planted_gitdir_file_binds_nothing_outside_the_checkout(tmp_path, target
     assert _ro_binds(argv) == baseline  # only the .git file itself, as before
 
 
-def test_planted_commondir_binds_nothing_outside_the_checkout(tmp_path):
-    """A gitdir inside the project is the command's to write, and so is the ``commondir`` file in it."""
+@pytest.mark.parametrize("common", ["{home}", "..", "../..", "../../..", "/", "{tmp}", "{home}/.aws"])
+def test_planted_commondir_binds_nothing_outside_the_checkout(tmp_path, common):
+    """A gitdir inside the project is the command's to write, and so is the ``commondir`` file in it: ``../..`` would
+    bring back the project's parent directory (every sibling project) read-only."""
     home, proj = _world(tmp_path)
     (proj / "admin").mkdir()
-    (proj / "admin" / "commondir").write_text(str(home))
+    (proj / "admin" / "commondir").write_text(common.format(home=home, tmp=tmp_path))
     (proj / ".git").write_text("not a gitdir line\n")
     baseline = _ro_binds(sandbox.build_argv(proj, home=home, bwrap=BWRAP, home_readonly=[]))
     (proj / ".git").write_text("gitdir: admin\n")
-    argv = sandbox.build_argv(proj, home=home, bwrap=BWRAP, home_readonly=[])
-    assert str(home) not in _ro_binds(argv)
-    assert _ro_binds(argv) == [*baseline, str((proj / "admin").resolve())]  # the in-project admin dir, nothing else
+    ro = _ro_binds(sandbox.build_argv(proj, home=home, bwrap=BWRAP, home_readonly=[]))
+    assert ro == [*baseline, str((proj / "admin").resolve())]  # the in-project admin dir, nothing else
 
 
 def test_planted_commondir_with_a_non_utf8_file_does_not_raise(tmp_path):

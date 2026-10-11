@@ -101,7 +101,7 @@ class LoopManager:
     ) -> dict[str, Any]:
         if not self.active:  # the row would sit 'active' and never tick here
             raise RuntimeError(
-                "loops run in another k3code process (the daemon): start it there, e.g. `k3code slash '/loop ...'`"
+                "loops run in another k3code process (the daemon): run /loop in a TUI attached to it (`k3code attach`)"
             )
         sched: Schedule | None = parse_schedule(interval) if interval else None
         now = self.clock.now()

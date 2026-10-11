@@ -54,13 +54,12 @@ _PEM = re.compile(
 _VALUE = r"""(?:(?P<q>['"])(?P<qv>(?:\\.|(?!(?P=q))[^\r\n\\]){6,}?)(?P=q)|(?P<v>[^\s'"<>,;]{6,}))"""
 _NAME_KEYWORDS = r"password|passwd|secret|token|api[_-]?key|apikey|private[_-]?key|credential|access[_-]?key|auth"
 #: `DB_PASSWORD=hunter2`, `export API_KEY: "abc123"`, `"client_secret": "xyz"` (the value stays hidden, the name stays).
-_ASSIGNMENT = re.compile(
-    rf"(?i)\b(?P<name>[A-Z0-9_.\-]*(?:{_NAME_KEYWORDS})[A-Z0-9_.\-]*)(?P<kq>['\"]?)(?P<sep>\s*[=:]\s*)" + _VALUE
-)
+#: The match starts at the keyword, not at the start of the name, so a long run of name characters is scanned once.
+_ASSIGNMENT = re.compile(rf"(?i)(?P<name>(?:{_NAME_KEYWORDS})[A-Z0-9_.\-]*+)(?P<kq>['\"]?)(?P<sep>\s*[=:]\s*)" + _VALUE)
 #: `DB_PASS=...`, `Pwd=...;` and `"pwd": "..."`: a whole `pass`/`pwd` word in the name (not `bypass`, not the command
 #: `pwd`), after `=` (or a colon behind a quoted key), so that prose such as `pass: successfully` is left alone.
 _PASS_ASSIGNMENT = re.compile(
-    r"(?i)(?<![A-Z0-9])(?P<name>(?:[A-Z0-9]+[_.\-])*(?:pass|pwd)(?:[_.\-][A-Z0-9]+)*)"
+    r"(?i)(?<![A-Z0-9])(?P<name>(?:pass|pwd)(?:[_.\-][A-Z0-9]+){0,6}+)"
     r"(?P<kq>['\"]?)(?P<sep>(?<=['\"])[ \t]*[=:][ \t]*|(?<!['\"])[ \t]*=[ \t]*)" + _VALUE
 )
 #: `git log --author="Jane Doe"` is not a credential: `auth` is a keyword, `author` is not.
@@ -84,10 +83,10 @@ _URL_SECRET = re.compile(
 _URL_CODE = re.compile(r"(?i)([?&#](?:code|auth(?:orization)?[_-]?code)=)[^&\s\"']{10,}")
 #: A command line that carries a password as an argument: `mysql -pSECRET`, `sshpass -p SECRET`, `curl -u user:SECRET`.
 _ARG = r"""(?:'[^'\n]*'|"[^"\n]*"|[^\s'"]+)"""
-_MYSQL_P = re.compile(r"(?i)(\bmysql\w*\b[^\n]*?\s-(?-i:p))(?=\S)" + _ARG)
-_SSHPASS = re.compile(r"(\bsshpass\b[^\n]*?\s-p\s*)" + _ARG)
+_MYSQL_P = re.compile(r"(?i)(\bmysql\w*\b[^\n]{0,1000}?\s-(?-i:p))(?=\S)" + _ARG)
+_SSHPASS = re.compile(r"(\bsshpass\b[^\n]{0,1000}?\s-p\s*)" + _ARG)
 _CURL_USER = re.compile(
-    r"(\bcurl\b[^\n]*?\s(?:-[A-Za-z]*[uU]\s*|--(?:proxy-)?user[=\s]\s*))"
+    r"(\bcurl\b[^\n]{0,1000}?\s(?:-[A-Za-z]*[uU]\s*|--(?:proxy-)?user[=\s]\s*))"
     r"""(?:'[^'\n]*:[^'\n]*'|"[^"\n]*:[^"\n]*"|[^\s'":]*:[^\s'"]*)"""
 )
 _SECRET_FLAG = re.compile(
@@ -103,7 +102,7 @@ def _mask_assignment(m: re.Match[str]) -> str:
     value = m["v"]
     if value is not None and (m["kq"] and _NUMBER.fullmatch(value)):
         return m.group(0)  # `"max_tokens": 100000`: a JSON number is not a credential
-    if value is not None and m["name"].lower() in ("pwd", "oldpwd") and value.startswith("/"):
+    if value is not None and m["name"] == "PWD" and value.startswith("/"):
         return m.group(0)  # the shell's `PWD=/home/user/project`
     if m["q"] and _AUTHOR.search(m["name"]) and not _OTHER_KEYWORD.search(_AUTHOR.sub("", m["name"])):
         return m.group(0)  # `--author="Jane Doe"`

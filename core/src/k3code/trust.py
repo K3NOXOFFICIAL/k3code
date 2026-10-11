@@ -122,20 +122,37 @@ def content_files(project_dir: str | Path) -> list[tuple[str, Path]]:
     return sorted(out)
 
 
-def _state(project_dir: str | Path) -> tuple[bytes | None, str | None]:
-    """(config bytes, digest over the config and the content files); the digest is None when there is nothing."""
+def _snapshot(project_dir: str | Path) -> tuple[bytes | None, str | None, list[tuple[str, bytes]]]:
+    """(config bytes, digest over the config and the content files, the content files' bytes by label), read once.
+
+    The digest is None when there is nothing. What :func:`summary_with_digest` shows is built from this one read, so
+    the digest it returns is the digest of exactly the bytes that were described.
+    """
     raw = _read(project_dir)
-    files = content_files(project_dir)
-    if not files:
-        return raw, (_digest(raw) if raw is not None and raw.strip() else None)
-    h = hashlib.sha256(raw or b"")
-    for rel, path in files:
+    blobs: list[tuple[str, bytes]] = []
+    for rel, path in content_files(project_dir):
         try:
             data = path.read_bytes()
         except OSError:
             data = b""
+        blobs.append((rel, data))
+    if not blobs:
+        return raw, (_digest(raw) if raw is not None and raw.strip() else None), blobs
+    h = hashlib.sha256(raw or b"")
+    for rel, data in blobs:
         h.update(b"\0" + rel.encode("utf-8") + b"\0" + hashlib.sha256(data).digest())
-    return raw, h.hexdigest()
+    return raw, h.hexdigest(), blobs
+
+
+def _state(project_dir: str | Path) -> tuple[bytes | None, str | None]:
+    """(config bytes, digest over the config and the content files); the digest is None when there is nothing."""
+    raw, digest, _ = _snapshot(project_dir)
+    return raw, digest
+
+
+def digest(project_dir: str | Path) -> str | None:
+    """The digest of the project's config and content files as they are on disk now; None when there is nothing."""
+    return _state(project_dir)[1]
 
 
 def _store() -> dict[str, Any]:
@@ -220,19 +237,24 @@ def subject(project_dir: str | Path) -> Path:
     return path if path.is_file() else path.parent
 
 
-def record(project_dir: str | Path, *, trusted: bool) -> bool:
-    """Remember the answer for the files as they are now. False when the project has nothing to trust."""
-    _, digest = _state(project_dir)
-    if digest is None:
+def record(project_dir: str | Path, *, trusted: bool, digest: str | None = None) -> bool:
+    """Remember the answer. False when the project has nothing to trust.
+
+    Without ``digest`` the answer covers the files as they are now. An interactive caller passes the digest of what
+    it showed (:func:`summary_with_digest`): the answer is then stored for exactly that content, so a file that
+    changed while the user was deciding is not trusted (the next start asks again) and False is returned.
+    """
+    _, current = _state(project_dir)
+    if current is None:
         return False
     projects = _store()
     projects[_key(project_dir)] = {
-        "sha256": digest,
+        "sha256": digest or current,
         "trusted": trusted,
         "decided_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
     _save(projects)
-    return True
+    return digest is None or digest == current
 
 
 def revoke(project_dir: str | Path) -> bool:
@@ -274,11 +296,20 @@ def problem(project_dir: str | Path) -> str | None:
 
 def summary(project_dir: str | Path) -> list[str] | None:
     """What the project config and content files change, one short line each; None when there is nothing."""
-    raw, digest = _state(project_dir)
-    if digest is None:
+    shown = summary_with_digest(project_dir)
+    return None if shown is None else shown[0]
+
+
+def summary_with_digest(project_dir: str | Path) -> tuple[list[str], str] | None:
+    """(the summary lines, the digest of the files they describe); None when there is nothing to trust.
+
+    Pass the digest to :func:`record` so that the answer covers what was shown, not what is on disk by then.
+    """
+    raw, sha, blobs = _snapshot(project_dir)
+    if sha is None:
         return None
     lines = describe(raw.decode("utf-8", errors="replace")) if raw is not None and raw.strip() else []
-    files = [rel for rel, _ in content_files(project_dir)]
+    files = [rel for rel, _ in blobs]
     for prefix, label in (
         ("agents/", "agents (added only: a name you or k3code already use is skipped)"),
         ("skills/", "skills (listed in the system prompt)"),
@@ -290,23 +321,22 @@ def summary(project_dir: str | Path) -> list[str] | None:
         if names:
             shown = ", ".join(names[:_MAX_RULES_SHOWN]) + (" ..." if len(names) > _MAX_RULES_SHOWN else "")
             lines.append(f"project {label}: {shown}")
-    if ".mcp.json" in files:
+    mcp_json = dict(blobs).get(".mcp.json")
+    if mcp_json is not None:
         from k3code import mcpjson
 
-        try:
-            text = (Path(project_dir).expanduser() / ".mcp.json").read_text(encoding="utf-8")
-        except OSError:
-            text = ""
-        for name, spec in mcpjson.parse(text).items():
+        for name, spec in mcpjson.parse(mcp_json.decode("utf-8", errors="replace")).items():
             what = " ".join([spec.command, *spec.args]) if spec.command else str(spec.url)
             lines.append(f"MCP server {name} in .mcp.json (starts only after /mcp enable {name}): {_short(what)}")
-    return lines
+    return lines, sha
 
 
 def describe(text: str) -> list[str]:
-    """Lines naming MCP servers, permission rules and providers, and the other top-level keys by name.
+    """Lines naming MCP servers, permission rules and providers, the value of each security-relevant key
+    (:data:`SECURITY_KEYS`, flagged ``SECURITY:``), and the other top-level keys by name.
 
-    Values that can hold secrets (MCP ``env`` and ``headers``, provider keys) are never shown.
+    Values that can hold secrets (MCP ``env`` and ``headers``, provider keys) are never shown; a shown value is
+    scrubbed of credentials and its control characters are escaped.
     """
     try:
         data = yaml.safe_load(text) or {}
@@ -329,10 +359,16 @@ def describe(text: str) -> list[str]:
             if spec.get("bearer_env"):
                 shown += f" and sends the secret in ${_short(str(spec['bearer_env']), 60)} as its bearer token"
             lines.append(shown)
+        for field_name, what in (("env", "environment variables"), ("headers", "request headers")):
+            names = spec.get(field_name)
+            if isinstance(names, dict) and names:
+                listed = ", ".join(_short(str(n), 40) for n in names)
+                lines.append(f"MCP server {name} sets {what} (names only, values not shown): {_short(listed)}")
 
     perms = data.get("permissions")
     if isinstance(perms, dict):
-        rules = _permission_rules(perms)
+        # allow rules first: eight harmless rules must not push an `allow bash` rule behind "... and N more"
+        rules = sorted(_permission_rules(perms), key=lambda rule: rule[0] != "allow")
         auto = sum(1 for action, _, _ in rules if action == "allow")
         if rules:
             lines.append(f"permission rules: {len(rules)} ({auto} allow without asking)")
@@ -364,10 +400,52 @@ def describe(text: str) -> list[str]:
         on = f" on {_short(hook.matcher, 40)}" if hook.matcher else ""
         lines.append(f"hook {hook.event}{on} runs as you, unsandboxed: {_short(hook.command)}")
 
+    lines.extend(_security_lines(data))
+
     others = sorted(str(k) for k in data if k not in ("mcp", "permissions", "providers", "mem0", "hooks"))
     if others:
         lines.append("also sets: " + ", ".join(others))
     return lines or ["no settings"]
+
+
+#: Keys a trusted project config applies whose value decides what k3code may do. ``describe`` shows each one that is
+#: set, with its value, flagged: "also sets: web" alone would hide ``web.allow_private: true``. (Dropping them from
+#: project configs would change behaviour; that is the owner's call.)
+SECURITY_KEYS: tuple[tuple[str, str], ...] = (
+    ("permission_mode", "how much k3code does without asking you"),
+    ("headless_permission", "the same for `k3code -p` runs"),
+    ("web.allow_private", "true lets the web tools reach loopback, private and cloud-metadata addresses"),
+    ("research.searxng_url", "the web tools may always reach this origin (the private-address guard skips it)"),
+    ("browser.cdp_url", "k3code may attach to the browser listening here"),
+    ("browser.executable_path", "k3code starts this program as the browser"),
+    ("automation.webhook_port", "opens a local listener for webhook triggers on this port"),
+    ("artifacts.publish_dir", "published pages are written to this directory"),
+    ("autonomy.unattended_network", "true gives unattended commands network access"),
+    ("skills.roots", "extra folders whose skills are listed in the system prompt"),
+)
+_MODE_HINTS = {
+    "yolo": "every tool call, bash included, runs without asking",
+    "auto": "most tool calls run without asking",
+}
+_MAX_VALUE = 200
+
+
+def _security_lines(data: dict[str, Any]) -> list[str]:
+    from k3code.redact import scrub_text
+
+    lines: list[str] = []
+    for dotted, why in SECURITY_KEYS:
+        value: Any = data
+        for part in dotted.split("."):
+            if not isinstance(value, dict) or part not in value:
+                break
+            value = value[part]
+        else:
+            if dotted in ("permission_mode", "headless_permission"):
+                why = _MODE_HINTS.get(str(value).strip().lower(), why)
+            # repr: control characters (an ANSI escape that redraws the screen) are escaped, strings are quoted
+            lines.append(f"SECURITY: {dotted} = {_short(scrub_text(repr(value)), _MAX_VALUE)} ({why})")
+    return lines
 
 
 def _permission_rules(perms: dict[str, Any]) -> list[tuple[str, str, str]]:
@@ -384,4 +462,6 @@ def _permission_rules(perms: dict[str, Any]) -> list[tuple[str, str, str]]:
 
 def _short(text: str, limit: int = _MAX_TEXT) -> str:
     flat = " ".join(text.split())
+    # a control character (an ANSI escape that clears the screen or recolours a line) must not hide what is described
+    flat = "".join(c if c.isprintable() else c.encode("unicode_escape").decode("ascii") for c in flat)
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"

@@ -151,6 +151,14 @@ class AutomationManager:
             await self.webhook.stop()
             self.webhook = None
 
+    def _need_active(self) -> None:
+        """Rows are armed (and fired) only by the process that holds the engine lock: one that is not it would store
+        an automation that looks active and never fires, or report a resume that arms nothing."""
+        if not self.active:
+            raise AutomationError(
+                "automations run in another k3code process (the daemon): use `k3code slash /automations ...`"
+            )
+
     def _arm(self, row: dict[str, Any]) -> None:
         if not self.active:
             return
@@ -212,10 +220,7 @@ class AutomationManager:
         cwd: str = "",
     ) -> dict[str, Any]:
         validate(trigger, action)
-        if not self.active:  # an unarmed row would look active and never fire
-            raise AutomationError(
-                "automations run in another k3code process (the daemon): use `k3code slash /automations add ...`"
-            )
+        self._need_active()
         trigger = dict(trigger)
         if trigger["type"] == "webhook":
             if self.webhook_port is None:
@@ -266,6 +271,7 @@ class AutomationManager:
         row = self.find(ref)
         if row is None:
             return False
+        self._need_active()  # the daemon disarmed it when it was paused: only the daemon can arm it again
         if row["trigger"]["type"] == "cron":  # a paused cron automation does not "miss" runs
             self.db.update(
                 "automations",

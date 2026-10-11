@@ -670,11 +670,17 @@ def _offer_project_trust(project_dir: Path) -> None:
     if (why := trust.problem(project_dir)) is not None:
         click.echo(f"{trust.config_path(project_dir)} is ignored: {why}.", err=True)
         return
+    shown = trust.summary_with_digest(project_dir)  # one read: the digest is that of the files described below
+    if shown is None:
+        return
     click.echo(f"{trust.subject(project_dir)} changes how k3code runs in this project:", err=True)
-    for line in trust.summary(project_dir) or []:
+    for line in shown[0]:
         click.echo(f"  - {line}", err=True)
     answer = click.confirm("Trust this project config?", default=False, err=True)
-    trust.record(project_dir, trusted=answer)
+    if not trust.record(project_dir, trusted=answer, digest=shown[1]):
+        click.echo(
+            "k3code: the project config changed while you were deciding; it is ignored until you trust it", err=True
+        )
 
 
 def _run_gateway() -> None:
@@ -1290,15 +1296,18 @@ def trust_cmd(path: Path | None, revoke: bool) -> None:
     if (why := trust.problem(project_dir)) is not None:
         click.echo(f"{where} cannot be trusted: {why}. Fix it first.", err=True)
         raise SystemExit(1)
-    lines = trust.summary(project_dir)
-    if lines is None:
+    shown = trust.summary_with_digest(project_dir)
+    if shown is None:
         click.echo(f"no project settings in {where}; nothing to trust")
         return
     click.echo(f"{where} changes how k3code runs in this project:")
-    for line in lines:
+    for line in shown[0]:
         click.echo(f"  - {line}")
-    trust.record(project_dir, trusted=True)
-    click.echo("trusted: the project config applies from the next start")
+    if trust.record(project_dir, trusted=True, digest=shown[1]):  # the files shown, not whatever is on disk by now
+        click.echo("trusted: the project config applies from the next start")
+    else:
+        click.echo(f"{where} changed after it was shown, so it was not trusted: run `k3code trust` again", err=True)
+        raise SystemExit(1)
 
 
 @cli.command("config-edit")

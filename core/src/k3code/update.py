@@ -591,9 +591,10 @@ class BuildStepError(subprocess.CalledProcessError):
 
 
 def _run_step(argv: list[str]) -> None:
-    r = subprocess.run(argv, capture_output=True, text=True, check=False)
-    if r.returncode:
-        raise BuildStepError(r.returncode, argv, r.stdout, r.stderr)
+    try:
+        subprocess.run(argv, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        raise BuildStepError(e.returncode, argv, e.stdout, e.stderr) from None
 
 
 def platform_binary() -> str:

@@ -2,7 +2,9 @@
 
 Sandboxed: auto/yolo sessions, and every unattended session (background run, loop tick, cron job, goal continuation,
 sub-agent) whatever its mode. Inside the sandbox ``$HOME`` is an empty tmpfs (only the cache dirs come back), the
-project is writable, and its git metadata is read-only so a command cannot plant a hook. The network stays on for
+project is writable, and its git metadata is read-only so a command cannot plant a hook (a ``.git`` file's ``gitdir:``
+is bound only when it belongs to this checkout, see :func:`_git_metadata`). The command holds no capabilities, even
+when the daemon runs as uid 0. The network stays on for
 interactive sessions; unattended runs get it only when configured (``autonomy.unattended_network``).
 
 Without ``bwrap`` (or where user namespaces are disabled) an interactive session runs unsandboxed and ``/doctor``
@@ -269,30 +271,33 @@ def _head(path: Path) -> str | None:
         return None
 
 
-def _points_back(admin: Path, root: Path) -> bool:
-    """Does the git admin dir ``admin`` belong to the checkout ``root``? A linked worktree's ``<common>/worktrees/<n>``
-    records the checkout's ``.git`` file in its ``gitdir`` file; a submodule's one records
-    the checkout in ``core.worktree``. A command in the sandbox cannot write outside the project, so it cannot forge
-    either, and a ``gitdir:`` aimed at some other directory (``$HOME``, another repo) is not bound."""
+def _is_linked_worktree(admin: Path, root: Path) -> bool:
+    """Is ``admin`` the ``<common>/worktrees/<n>`` dir of the linked worktree ``root``? Its ``gitdir`` file records the
+    checkout's ``.git`` file. A command in the sandbox cannot write outside the project, so it cannot forge this."""
+    if admin.parent.name != "worktrees" or not (admin / "HEAD").is_file():
+        return False
+    link = _head(admin / "gitdir")
+    return link is not None and (admin / link.strip()).resolve() == (root / ".git").resolve()
+
+
+def _is_submodule_gitdir(admin: Path, root: Path) -> bool:
+    """Is ``admin`` the gitdir of the submodule checked out at ``root``? Its ``core.worktree`` names the checkout."""
     if not (admin / "HEAD").is_file():
         return False
-    link = _head(admin / "gitdir") if admin.parent.name == "worktrees" else None
-    if link is not None:
-        return (admin / link.strip()).resolve() == (root / ".git").resolve()
-    config = _head(admin / "config") or ""
-    match = re.search(r"^\s*worktree\s*=\s*(.+?)\s*$", config, re.MULTILINE)
+    match = re.search(r"^\s*worktree\s*=\s*(.+?)\s*$", _head(admin / "config") or "", re.MULTILINE)
     return match is not None and (admin / match.group(1)).resolve() == root
 
 
 def _git_metadata(root: Path, home: Path | None = None) -> list[Path]:
-    """The git metadata of a checkout: ``.git`` itself, or for a linked worktree or a submodule its admin
-    dir and common dir.
+    """The git metadata of a checkout: ``.git`` itself, or for a linked worktree or a submodule its admin dir (and for
+    a worktree the common dir).
 
     The content of a ``.git`` file is text the sandboxed command can write, so ``gitdir: /root`` must not choose what
-    is bound. An admin dir is taken only when it is inside the project or points back at this checkout
-    (:func:`_points_back`), and a common dir only when it is the admin dir's own ``<common>/worktrees/<n>`` parent
-    or inside the project; none may be (or reach) ``$HOME`` or a secrets folder. Anything else is skipped: the repo
-    is then not git-aware inside the sandbox, the safe failure. A ``.git`` symlink is followed only inside the project.
+    is bound. An admin dir is taken only when it is inside the project, or is the dir that git itself links back to
+    this checkout (:func:`_is_linked_worktree`, :func:`_is_submodule_gitdir`); the common dir only when that worktree's
+    own ``<common>/worktrees/<n>`` parent or inside the project; none may be (or reach) ``$HOME`` or a secrets folder.
+    Anything else is skipped: the repo is then not git-aware inside the sandbox, the safe failure. A ``.git`` symlink
+    is followed only inside the project.
     """
     home = Path(home or Path.home())
     try:
@@ -309,18 +314,21 @@ def _git_metadata(root: Path, home: Path | None = None) -> list[Path]:
         match = _GITDIR_LINE.search(_head(dot) or "")
         if match is not None:
             gitdir = (root / match.group(1)).resolve()
+            linked = _is_linked_worktree(gitdir, root)
             if (
                 gitdir.is_dir()
-                and (_inside(gitdir, root) or _points_back(gitdir, root))
+                and (linked or _inside(gitdir, root) or _is_submodule_gitdir(gitdir, root))
                 and _meta_allowed(gitdir, home)
             ):
                 found.append(gitdir)
                 common_text = _head(gitdir / "commondir")
                 if common_text is not None:
                     common = (gitdir / common_text.strip()).resolve()
-                    if (common == gitdir.parent.parent or _inside(common, root)) and _meta_allowed(common, home):
+                    if ((linked and common == gitdir.parent.parent) or _inside(common, root)) and _meta_allowed(
+                        common, home
+                    ):
                         found.append(common)
-        return [p for p in found if p.exists()]
+        return [p for p in dict.fromkeys(found) if p.exists()]
     except (OSError, ValueError, RuntimeError):  # unreadable or looping: not git-aware, but the sandbox still builds
         logger.warning("sandbox: git metadata of %s could not be inspected, not binding it", root, exc_info=True)
         return []

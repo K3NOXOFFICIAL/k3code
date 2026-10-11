@@ -85,6 +85,7 @@ async def test_passive_engine_manages_definitions_but_arms_nothing(tmp_path, mon
     sid = await new_session(s2, tmp_path)
     out = await cmd(s2, "/loop 5m watch the build", sid)
     assert out.get("error") == "command_failed" and "another k3code process" in out["output"]
+    assert "k3code attach" in out["output"]  # a throwaway `k3code slash` session would not do for a session-bound loop
     assert e2.db.rows("loops") == []  # nothing stored that would sit 'active' and never tick
     out = await cmd(s2, "/automations add {name: x, trigger: {type: net_state}, action: {type: notify, text: a}}", sid)
     assert "another k3code process" in out["output"] and e2.db.rows("automations") == []
@@ -94,6 +95,13 @@ async def test_passive_engine_manages_definitions_but_arms_nothing(tmp_path, mon
     a = e1.automations.add(name="n", trigger={"type": "net_state"}, action={"type": "notify", "text": "hi"})
     assert await e2.automations.remove(a["id"])
     assert await e1.automations.fire(a["id"], {"event": "x"}) is None
+    # a resume the passive side cannot arm is refused, not reported as done: the holder disarmed it when it paused
+    b = e1.automations.add(name="b", trigger={"type": "net_state"}, action={"type": "notify", "text": "hi"})
+    assert await e1.automations.pause(b["id"])
+    with pytest.raises(AutomationError, match="another k3code process"):
+        await e2.automations.resume(b["id"])
+    assert e2.db.get("automations", b["id"])["state"] == "paused"
+    assert await e1.automations.resume(b["id"])
     await e2.stop()
     await e1.stop()
 
@@ -225,6 +233,22 @@ async def test_busy_webhook_port_is_logged_and_the_manager_starts(tmp_path, capl
         assert m.webhook is None
         assert any(str(port) in rec.getMessage() for rec in caplog.records)
         await m.stop()
+    finally:
+        blocker.close()
+
+
+async def test_engine_starts_when_the_configured_webhook_port_is_busy(tmp_path, monkeypatch):
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    try:
+        server, _ = make_server(tmp_path, monkeypatch, ["ok"], automation={"webhook_port": blocker.getsockname()[1]})
+        eng = AutomationEngine(server, clock=FakeClock(), use_netwatch=False)
+        server.automation = eng
+        await eng.start()  # run_daemon awaits exactly this before READY=1
+        assert eng.active and eng.automations.webhook is None
+        await eng.stop()
+        await server.close()
     finally:
         blocker.close()
 
