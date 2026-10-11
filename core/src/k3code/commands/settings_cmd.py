@@ -9,6 +9,7 @@ from k3code.commands import CommandDef
 from k3code.commands._util import reply, session_cwd
 from k3code.memory import project_memory_path, user_memory_path
 from k3code.paths import home, project_config_path, user_config_path
+from k3code.permissions.engine import PermissionMode
 
 
 def build_settings_view(ctx: Any, session_id: str | None) -> dict[str, Any]:
@@ -31,8 +32,10 @@ def build_settings_view(ctx: Any, session_id: str | None) -> dict[str, Any]:
     return {
         "model_key": (live.stored.model if live and live.stored.model else cfg.default_model),
         "model_chain": chain,
+        "model_keys": sorted({k for p in cfg.providers for k in p.models} | {cfg.default_model}),
         "effort": (live.reasoning_effort if live else None) or "default",
         "permission_mode": mode,
+        "permission_modes": [m.value for m in PermissionMode],
         "permission_rules": rules,
         "focus_mode": cfg.display.focus_mode,
         "theme": cfg.display.theme or "default",

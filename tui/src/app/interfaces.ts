@@ -146,6 +146,7 @@ export interface OverlayState {
   skillsHub: boolean;
   sudo: null | SudoReq;
   /** /tune popup: model list + effort slider + ultracode (bare /tune, /model, /effort, Ctrl+O). */
+  settingsPanel: boolean;
   tunePicker: boolean;
 }
 
@@ -442,6 +443,7 @@ export interface AppLayoutActions {
   newPromptSession: (prompt: string, modelArg?: string) => void;
   onModelSelect: (value: string) => void;
   /** The /tune popup's Enter / `s`: closes it and sends the one `tune.set`. */
+  onSettingsApply: (command: string) => void;
   onTuneApply: (params: TuneSetParams) => void;
   /** `dropSid`: the session being left, closed once attached elsewhere if it is disposable (agent view). */
   resumeById: (id: string, dropSid?: string) => void;
@@ -514,6 +516,7 @@ export interface AppOverlaysProps {
   onResumeSelect: (sessionId: string) => void;
   onSecretSubmit: (value: string) => void;
   onSudoSubmit: (pw: string) => void;
+  onSettingsApply: (command: string) => void;
   onTuneApply: (params: TuneSetParams) => void;
   pagerPageSize: number;
 }

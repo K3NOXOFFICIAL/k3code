@@ -3,13 +3,13 @@ import { useStore } from "@nanostores/react";
 import type { ReactNode } from "react";
 
 import { useGateway } from "../app/gatewayContext.js";
-import type { AppOverlaysProps } from "../app/interfaces.js";
+import { INDICATOR_STYLES, type AppOverlaysProps } from "../app/interfaces.js";
 import {
   $overlayState,
   hasFloatingPanel,
   patchOverlayState,
 } from "../app/overlayStore.js";
-import { $uiSessionId, $uiTheme } from "../app/uiStore.js";
+import { $uiSessionId, $uiState, $uiTheme } from "../app/uiStore.js";
 
 import { ActiveSessionSwitcher } from "./activeSessionSwitcher.js";
 import { FloatBox } from "./appChrome.js";
@@ -20,6 +20,7 @@ import { listRowStyle } from "./overlayPrimitives.js";
 import { PluginsHub } from "./pluginsHub.js";
 import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from "./prompts.js";
 import { SkillsHub } from "./skillsHub.js";
+import { SettingsPanel } from "./settingsPanel.js";
 import { TunePicker } from "./tunePicker.js";
 import { WidgetGrid, type WidgetGridWidget } from "./widgetGrid.js";
 
@@ -177,6 +178,7 @@ export function FloatingOverlays({
   onNewLiveSession,
   onNewPromptSession,
   onResumeSelect,
+  onSettingsApply,
   onTuneApply,
   pagerPageSize,
 }: Pick<
@@ -190,12 +192,14 @@ export function FloatingOverlays({
   | "onNewLiveSession"
   | "onNewPromptSession"
   | "onResumeSelect"
+  | "onSettingsApply"
   | "onTuneApply"
   | "pagerPageSize"
 > & { nativeMode?: boolean }) {
   const { gw } = useGateway();
   const overlay = useStore($overlayState);
   const sid = useStore($uiSessionId);
+  const ui = useStore($uiState);
   const theme = useStore($uiTheme);
 
   const hasAny = hasFloatingPanel(overlay) || completions.length;
@@ -261,6 +265,34 @@ export function FloatingOverlays({
             maxWidth={width}
             onCancel={() => patchOverlayState({ modelPicker: false })}
             onSelect={onModelSelect}
+            sessionId={sid}
+            t={theme}
+          />
+        </FloatBox>
+      ),
+    });
+  }
+
+  if (overlay.settingsPanel) {
+    widgets.push({
+      id: "settings-panel",
+      render: (width) => (
+        <FloatBox color={theme.color.border}>
+          <SettingsPanel
+            gw={gw}
+            local={{
+              busy: ui.busyInputMode,
+              compact: ui.compact,
+              details: ui.detailsMode,
+              indicator: ui.indicatorStyle,
+              indicators: [...INDICATOR_STYLES],
+              mouse: ui.mouseTracking !== "off",
+              showReasoning: ui.showReasoning,
+              statusBar: ui.statusBar,
+            }}
+            maxWidth={width}
+            onApply={onSettingsApply}
+            onClose={() => patchOverlayState({ settingsPanel: false })}
             sessionId={sid}
             t={theme}
           />

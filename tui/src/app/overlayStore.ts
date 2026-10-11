@@ -21,6 +21,7 @@ const buildOverlayState = (): OverlayState => ({
   sessions: false,
   skillsHub: false,
   sudo: null,
+  settingsPanel: false,
   tunePicker: false,
 });
 
@@ -40,6 +41,7 @@ export const $isBlocked = computed(
     pluginsHub,
     secret,
     sessions,
+    settingsPanel,
     skillsHub,
     sudo,
     tunePicker,
@@ -57,6 +59,7 @@ export const $isBlocked = computed(
       pluginsHub ||
       secret ||
       sessions ||
+      settingsPanel ||
       skillsHub ||
       sudo ||
       tunePicker ||
@@ -121,6 +124,7 @@ export const hasFloatingPanel = (overlay: OverlayState): boolean =>
     overlay.pager ||
     overlay.pluginsHub ||
     overlay.sessions ||
+    overlay.settingsPanel ||
     overlay.skillsHub ||
     overlay.tunePicker,
   );
@@ -166,6 +170,17 @@ export const patchOverlayState = (
 /** Full reset — used by session/turn teardown and tests. */
 export const resetOverlayState = () => $overlayState.set(buildOverlayState());
 
+/** Open the /settings panel; false while a prompt is waiting for an answer. */
+export const openSettingsPanel = (): boolean => {
+  if (tuneLocked($overlayState.get())) {
+    return false;
+  }
+
+  patchOverlayState({ settingsPanel: true });
+
+  return true;
+};
+
 /** Open the /tune popup; false (nothing opened) while a prompt is waiting for an answer. */
 export const openTunePicker = (): boolean => {
   if (tuneLocked($overlayState.get())) {
@@ -198,6 +213,7 @@ export const resetFlowOverlays = () =>
     modelPicker: $overlayState.get().modelPicker,
     pluginsHub: $overlayState.get().pluginsHub,
     sessions: $overlayState.get().sessions,
+    settingsPanel: $overlayState.get().settingsPanel,
     skillsHub: $overlayState.get().skillsHub,
     tunePicker: $overlayState.get().tunePicker,
   });
