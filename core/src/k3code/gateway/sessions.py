@@ -395,5 +395,9 @@ class SessionStore:
         rows = self.worked_in(limit=1)
         return self.get(rows[0][0]) if rows else None
 
+    def compact(self) -> int:
+        """Return the pages of deleted transcripts to the filesystem; bytes freed (see :func:`sqlstore.compact`)."""
+        return sqlstore.compact(self._db)
+
     def close(self) -> None:
         self._db.close()

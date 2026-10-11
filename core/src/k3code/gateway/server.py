@@ -2734,15 +2734,23 @@ class GatewayServer:
 
     def prune_retention(self, *, now: float | None = None) -> dict[str, int]:
         """Daemon start: usage rows past ``retention.usage_days``, journal files of sessions that are not live and not
-        written for ``retention.journal_days``, learning decisions past ``retention.decisions_days`` (debug bundles
-        are pruned as each is written)."""
+        written for ``retention.journal_days`` (the oldest ones beyond ``retention.journal_mb`` too), learning decisions
+        past ``retention.decisions_days`` (debug bundles are pruned as each is written)."""
         keep = retention(self.config)
         rows = self.usage.prune(keep["usage_days"], now=now)
         files = prune_journals(
-            self._home(), keep=lambda sid: sid in self.live, max_age_s=keep["journal_days"] * 86400, now=now
+            self._home(),
+            keep=lambda sid: sid in self.live,
+            max_age_s=keep["journal_days"] * 86400,
+            max_bytes=keep["journal_mb"] * 1024 * 1024,
+            now=now,
         )
         decisions = self.learning.log.prune(keep["decisions_days"])
         return {"usage_rows": rows, "journal_files": files, "decisions": decisions}
+
+    def compact_storage(self) -> int:
+        """Daemon start: return the pages that deleted transcripts left in ``sessions.db`` to the filesystem."""
+        return self.store.compact()
 
     async def resume_goals(self) -> int:
         """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.

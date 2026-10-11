@@ -261,9 +261,15 @@ class Settings(BaseModel):
         return {**dict.fromkeys(CONFIG_KEYS, True), **v}
 
 
-#: ``retention`` defaults: usage.db rows (days), closed sessions' journal files (days), debug bundles kept (count),
-#: learning decisions (days).
-RETENTION_DEFAULTS: dict[str, int] = {"usage_days": 180, "journal_days": 30, "debug_bundles": 10, "decisions_days": 365}
+#: ``retention`` defaults: usage.db rows (days), closed sessions' journal files (days), the journal directory's size
+#: cap (MB; the oldest closed files go first), debug bundles kept (count), learning decisions (days).
+RETENTION_DEFAULTS: dict[str, int] = {
+    "usage_days": 180,
+    "journal_days": 30,
+    "journal_mb": 512,
+    "debug_bundles": 10,
+    "decisions_days": 365,
+}
 
 
 def retention(config: Any) -> dict[str, int]:

@@ -355,6 +355,8 @@ class AgentLoop:
                     if self._guard_assistant("".join(text_parts), messages):
                         for stop_event in self._stop_for_input(messages):
                             yield stop_event
+                    else:
+                        self.reliability.clear_transcript()
                     return
             elif self.interrupted:
                 # Stream aborted without a final message (e.g. interrupt during
