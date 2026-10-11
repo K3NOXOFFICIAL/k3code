@@ -148,15 +148,21 @@ class HookRunner:
     async def run(
         self, event: str, payload: dict[str, Any] | None = None, *, tool_name: str | None = None
     ) -> HookOutcome:
-        """Run the event's matching hooks in order; the first block stops the rest. Never raises."""
+        """Run the event's matching hooks at once and merge their answers in config order; the first block wins and
+        the answers after it are dropped. Never raises.
+
+        The hooks run concurrently (a slow hook costs its own time, not the sum), so a hook cannot rely on an earlier
+        one having finished; the ones after a blocking hook have run by then, their answers are just not used."""
         outcome = HookOutcome()
         hooks = self.for_event(event, tool_name)
         if not hooks:
             return outcome
         data = {"session_id": self.session_id, "cwd": str(self.cwd), "hook_event_name": event, **(payload or {})}
         stdin = json.dumps(data, default=str).encode("utf-8")
-        for hook in hooks:
-            result = await self._exec(hook, stdin)
+        results = [await self._exec(hooks[0], stdin)] if len(hooks) == 1 else await asyncio.gather(
+            *(self._exec(h, stdin) for h in hooks)
+        )
+        for hook, result in zip(hooks, results, strict=True):
             if result is None:
                 continue
             code, out, err = result
