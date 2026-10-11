@@ -108,6 +108,8 @@ func TestMultiCopySavePathMessages(t *testing.T) {
 	// The prompt shows the full path.
 	m.MultiCopy.Save.Err = ""
 	m.MultiCopy.Save.Path = "~/rack/a.txt"
+	// The row is cut to the pane's width and home is a temp dir whose length follows $TMPDIR: keep the pane wider.
+	m.GetFocusedWindow().Width = len(home) + 40
 	layer := m.multiCopySaveLayer()
 	if layer == nil || !strings.Contains(stripANSIForTrace(layer.GetContent()), filepath.Join(home, "rack", "a.txt")) {
 		t.Errorf("the prompt does not show the full path")
