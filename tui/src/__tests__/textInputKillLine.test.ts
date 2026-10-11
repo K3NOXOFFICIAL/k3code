@@ -45,6 +45,10 @@ describe("killToLineStart", () => {
   it("is a no-op at the very start of the buffer", () => {
     expect(killToLineStart("abc", 0)).toEqual({ cursor: 0, value: "abc" });
   });
+
+  it("is a no-op at position 0 when the buffer starts with a newline", () => {
+    expect(killToLineStart("\nfoo", 0)).toEqual({ cursor: 0, value: "\nfoo" });
+  });
 });
 
 describe("killToLineEnd", () => {

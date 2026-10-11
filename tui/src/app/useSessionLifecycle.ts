@@ -217,6 +217,16 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   const cancelResumeScrollRef = useRef<null | (() => void)>(null);
 
+  // The draft outlives a switch or a reconnect, so its pastes do too: their `[[ … ]]` labels are still in it, and
+  // without the token the label itself would be sent. An image is the old session's attachment and goes.
+  const dropSessionTokens = useCallback(
+    () =>
+      composerActions.setComposerTokens((tokens) =>
+        tokens.filter((token) => token.kind === "paste"),
+      ),
+    [composerActions],
+  );
+
   const resetSession = useCallback(() => {
     cancelResumeScrollRef.current?.();
     cancelResumeScrollRef.current = null;
@@ -231,11 +241,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     setHistoryItems([]);
     setLastUserMsg("");
     setStickyPrompt("");
-    composerActions.setComposerTokens([]);
+    dropSessionTokens();
     // Half-prune: new session has new keys, but keep a warm pool in case
     // the user resumes back to the prior session.
     evictInkCaches("half");
-  }, [composerActions, setHistoryItems, setLastUserMsg, setStickyPrompt]);
+  }, [dropSessionTokens, setHistoryItems, setLastUserMsg, setStickyPrompt]);
 
   useEffect(
     () => () => {
@@ -255,11 +265,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       setHistoryItems(info ? [introMsg(info)] : []);
       setStickyPrompt("");
       setLastUserMsg("");
-      composerActions.setComposerTokens([]);
+      dropSessionTokens();
       patchTurnState({ activity: [] });
       patchUiState({ info, usage: usageFrom(info) });
     },
-    [composerActions, setHistoryItems, setLastUserMsg, setStickyPrompt],
+    [dropSessionTokens, setHistoryItems, setLastUserMsg, setStickyPrompt],
   );
 
   const startNewSession = useCallback(

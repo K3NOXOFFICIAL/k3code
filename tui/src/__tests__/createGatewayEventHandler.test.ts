@@ -8,6 +8,7 @@ import {
   resetOverlayState,
 } from "../app/overlayStore.js";
 import { resetServerRequestsForTests } from "../app/serverRequestStore.js";
+import { submitPrompt } from "../app/submissionCore.js";
 import { turnController } from "../app/turnController.js";
 import { getTurnState, resetTurnState } from "../app/turnStore.js";
 import { getUiState, patchUiState, resetUiState } from "../app/uiStore.js";
@@ -1957,6 +1958,58 @@ describe("createGatewayEventHandler", () => {
     expect(interruptedTranscript([], ["alpha", " beta"], "alpha beta")).toEqual(
       ["alpha beta\n\n*[interrupted]*"],
     );
+  });
+
+  it("a prompt sent while the interrupted turn unwinds does not turn its message.complete into a second reply", () => {
+    vi.useFakeTimers();
+
+    try {
+      const history: Msg[] = [];
+      const ctx = buildCtx(history);
+      ctx.gateway.gw.request = vi.fn(async () => ({ status: "queued" }));
+      const onEvent = createGatewayEventHandler(ctx);
+
+      patchUiState({ sid: "sess-1" });
+      onEvent({ payload: {}, type: "message.start" } as any);
+      onEvent({
+        payload: { text: "alpha beta" },
+        type: "message.delta",
+      } as any);
+      turnController.interruptTurn({
+        appendMessage: (msg: Msg) => history.push(msg),
+        gw: ctx.gateway.gw,
+        sid: "sess-1",
+        sys: ctx.system.sys,
+      });
+
+      // B goes out before A's turn has finished unwinding
+      submitPrompt(
+        "B",
+        {
+          appendMessage: (msg: Msg) => history.push(msg),
+          enqueue: vi.fn(),
+          expand: (text) => text,
+          gw: ctx.gateway.gw,
+          setLastUserMsg: vi.fn(),
+          sys: ctx.system.sys,
+        },
+        true,
+        undefined,
+        { skipDetectDrop: true },
+      );
+
+      onEvent({
+        payload: { status: "interrupted", text: "alpha beta" },
+        type: "message.complete",
+      } as any);
+
+      expect(
+        history.filter((m) => m.role === "assistant").map((m) => m.text),
+      ).toEqual(["alpha beta\n\n*[interrupted]*"]);
+    } finally {
+      vi.runAllTimers();
+      vi.useRealTimers();
+    }
   });
 
   it("keepBusy interrupt holds busy until the gateway settles and suppresses the cancelled turn’s final_response", () => {

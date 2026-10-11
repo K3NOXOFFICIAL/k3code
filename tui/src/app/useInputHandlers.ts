@@ -25,6 +25,7 @@ import { $agentDockCollapsed } from "./agentRoster.js";
 import { sendTurnToBackground } from "./backgroundSession.js";
 import { getInputSelection } from "./inputSelectionStore.js";
 import {
+  type BusyInputMode,
   type GatewayRpc,
   type InputHandlerActions,
   type InputHandlerContext,
@@ -203,6 +204,35 @@ export function resolveCtrlCComposerAction(opts: {
   return "exit";
 }
 
+export type QueueForceSend = "interrupt" | "send" | null;
+
+/**
+ * Ctrl+K sends the next queued message at once, like a double Enter. Only from an empty composer: with a draft the same
+ * key is the TextInput's kill-to-end, and the draft is not the queue's to wipe. 'queue' mode would only put the message
+ * back behind the running turn, so there the turn is stopped and the queue drains when it settles; the other modes
+ * interrupt or steer with the message itself.
+ */
+export function resolveQueueForceSend(opts: {
+  busy: boolean;
+  busyInputMode: BusyInputMode;
+  hasDraft: boolean;
+  hasQueue: boolean;
+  hasSession: boolean;
+}): QueueForceSend {
+  if (!opts.hasQueue || !opts.hasSession || opts.hasDraft) {
+    return null;
+  }
+
+  return opts.busy && opts.busyInputMode === "queue" ? "interrupt" : "send";
+}
+
+// ↑ / ↓ leave the draft (for the queue or history) only when no line lies above / below the cursor.
+const hasLineAbove = (input: string, cursor: number) =>
+  cursor > 0 && input.lastIndexOf("\n", cursor - 1) >= 0;
+
+const hasLineBelow = (input: string, cursor: number) =>
+  input.indexOf("\n", cursor) >= 0;
+
 /**
  * Approval / clarify / confirm overlays mount their own `useInput` handlers
  * for the in-prompt keys (arrows, numbers, Enter, sometimes Esc).  The global
@@ -348,6 +378,18 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
   };
 
+  // Back to the draft the queue was entered from, which sits in historyDraftRef like the history walk's.
+  const leaveQueue = () => {
+    const draft = cRefs.historyDraftRef.current;
+
+    if (!draft) {
+      return cActions.clearIn();
+    }
+
+    cActions.setQueueEdit(null);
+    cActions.setInput(draft);
+  };
+
   const cycleQueue = (dir: 1 | -1) => {
     const len = cRefs.queueRef.current.length;
 
@@ -355,12 +397,20 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return false;
     }
 
-    const index =
-      cState.queueEditIdx === null
-        ? dir > 0
-          ? 0
-          : len - 1
-        : (cState.queueEditIdx + dir + len) % len;
+    const at = cState.queueEditIdx;
+    const index = at === null ? (dir > 0 ? 0 : len - 1) : at + dir;
+
+    // stepping off either end of the queue returns to the draft
+    if (index < 0 || index >= len) {
+      leaveQueue();
+
+      return true;
+    }
+
+    // (a walk through history already holds the draft it started from)
+    if (at === null && cState.historyIdx === null) {
+      cRefs.historyDraftRef.current = cState.input;
+    }
 
     cActions.setQueueEdit(index);
     cActions.setHistoryIdx(null);
@@ -705,7 +755,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     // explicitly promises "Esc cancel", so honoring it takes priority over the
     // implicit selection-dismissal convention. Without an active edit, fall through.
     if (key.escape && cState.queueEditIdx !== null) {
-      return cActions.clearIn();
+      return leaveQueue();
     }
 
     if (key.escape && terminal.hasSelection) {
@@ -770,8 +820,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
 
       const noLineAbove =
         !cState.input ||
-        (cursor !== null &&
-          cState.input.lastIndexOf("\n", Math.max(0, cursor - 1)) < 0);
+        (cursor !== null && !hasLineAbove(cState.input, cursor));
 
       if (noLineAbove) {
         if (!cycleQueue(1)) {
@@ -788,9 +837,9 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         inputSel && inputSel.start === inputSel.end ? inputSel.start : null;
       const noLineBelow =
         !cState.input ||
-        (cursor !== null && cState.input.indexOf("\n", cursor) < 0);
+        (cursor !== null && !hasLineBelow(cState.input, cursor));
 
-      if (noLineBelow || cState.historyIdx !== null) {
+      if (noLineBelow) {
         if (!cycleQueue(-1)) {
           cycleHistory(1);
         }
@@ -827,7 +876,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     if (isCtrl(key, ch, "x") && cState.queueEditIdx !== null) {
       cActions.removeQueue(cState.queueEditIdx);
 
-      return cActions.clearIn();
+      return leaveQueue();
     }
 
     if (isCtrl(key, ch, "x")) {
@@ -956,8 +1005,29 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return;
     }
 
-    if (isAction(key, ch, "k") && cRefs.queueRef.current.length && live.sid) {
-      const next = cActions.dequeueItem();
+    if (isAction(key, ch, "k")) {
+      const forceSend = resolveQueueForceSend({
+        busy: live.busy,
+        busyInputMode: live.busyInputMode,
+        hasDraft: composerHasDraft(cState),
+        hasQueue: cRefs.queueRef.current.length > 0,
+        hasSession: Boolean(live.sid),
+      });
+
+      if (forceSend === "interrupt" && live.sid) {
+        // like a double Enter: busy is held, so the queue drains once on the settle edge
+        return turnController.interruptTurn(
+          {
+            appendMessage: actions.appendMessage,
+            gw: gateway.gw,
+            sid: live.sid,
+            sys: actions.sys,
+          },
+          { keepBusy: true },
+        );
+      }
+
+      const next = forceSend === "send" ? cActions.dequeueItem() : undefined;
 
       if (next) {
         cActions.setQueueEdit(null);

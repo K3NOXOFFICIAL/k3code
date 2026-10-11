@@ -1,9 +1,13 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "stream";
 
+import { renderSync } from "@k3code/ink";
+import React, { useEffect } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { ComposerToken } from "../app/interfaces.js";
 import { turnController } from "../app/turnController.js";
 import { getTurnState, resetTurnState } from "../app/turnStore.js";
 import { patchUiState, resetUiState } from "../app/uiStore.js";
@@ -11,6 +15,7 @@ import {
   hydrateLiveSessionInflight,
   liveSessionInflightMessages,
   signalFreshSessionBoundary,
+  useSessionLifecycle,
   writeActiveSessionFile,
 } from "../app/useSessionLifecycle.js";
 
@@ -124,5 +129,100 @@ describe("live session activation in-flight state", () => {
 
     expect(turnController.bufRef).toBe("");
     expect(getTurnState().streaming).toBe("");
+  });
+});
+
+describe("the composer draft across a session reset", () => {
+  const paste: ComposerToken = {
+    kind: "paste",
+    label: "[[ Done.. [412 lines] .. already on it. ]]",
+    text: "Done\nline two",
+  };
+
+  const image: ComposerToken = {
+    index: 1,
+    kind: "image",
+    label: "[[ Image 1 ]]",
+    path: "/tmp/shot.png",
+  };
+
+  // the real hook over a composer whose tokens are plain state
+  function mountLifecycle(tokens: ComposerToken[]) {
+    const held = { tokens };
+    let api: null | ReturnType<typeof useSessionLifecycle> = null;
+
+    function Probe() {
+      const lifecycle = useSessionLifecycle({
+        colsRef: { current: 80 },
+        composerActions: {
+          setComposerTokens: (next: unknown) => {
+            held.tokens =
+              typeof next === "function"
+                ? (next as (t: ComposerToken[]) => ComposerToken[])(held.tokens)
+                : (next as ComposerToken[]);
+          },
+        } as never,
+        gw: { request: vi.fn() } as never,
+        panel: vi.fn(),
+        rpc: vi.fn(async () => null),
+        scrollRef: { current: null },
+        setHistoryItems: vi.fn(),
+        setLastUserMsg: vi.fn(),
+        setSessionStartedAt: vi.fn(),
+        setStickyPrompt: vi.fn(),
+        sys: vi.fn(),
+      });
+
+      useEffect(() => {
+        api = lifecycle;
+      });
+
+      return null;
+    }
+
+    const stream = () =>
+      Object.assign(new PassThrough(), {
+        columns: 80,
+        isTTY: false,
+        rows: 24,
+      });
+
+    renderSync(React.createElement(Probe), {
+      patchConsole: false,
+      stderr: stream() as unknown as NodeJS.WriteStream,
+      stdin: stream() as unknown as NodeJS.ReadStream,
+      stdout: stream() as unknown as NodeJS.WriteStream,
+    });
+
+    return {
+      held,
+      lifecycle: async () => {
+        await vi.waitFor(() => expect(api).toBeTruthy());
+
+        return api!;
+      },
+    };
+  }
+
+  beforeEach(() => {
+    resetUiState();
+    resetTurnState();
+    turnController.fullReset();
+  });
+
+  it("resetSession keeps the pastes of the draft that stays, and drops the old session's images", async () => {
+    const mounted = mountLifecycle([paste, image]);
+
+    (await mounted.lifecycle()).resetSession();
+
+    expect(mounted.held.tokens).toEqual([paste]);
+  });
+
+  it("resetVisibleHistory does too", async () => {
+    const mounted = mountLifecycle([paste, image]);
+
+    (await mounted.lifecycle()).resetVisibleHistory();
+
+    expect(mounted.held.tokens).toEqual([paste]);
   });
 });

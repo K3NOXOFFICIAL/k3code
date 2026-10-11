@@ -1,6 +1,24 @@
-import { describe, expect, it } from "vitest";
+import { PassThrough } from "stream";
 
-import { looksLikeDroppedPath } from "../app/useComposerState.js";
+import { renderSync } from "@k3code/ink";
+import React, { useEffect } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { patchUiState, resetUiState } from "../app/uiStore.js";
+import {
+  looksLikeDroppedPath,
+  useComposerState,
+} from "../app/useComposerState.js";
+import type { GatewayClient } from "../gatewayClient.js";
+import type * as clipboardModule from "../lib/clipboard.js";
+
+const clipboard = vi.hoisted(() => ({ text: "" }));
+
+// Ctrl+V reads the system clipboard; the test says what is on it.
+vi.mock("../lib/clipboard.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof clipboardModule>()),
+  readClipboardText: vi.fn(async () => clipboard.text),
+}));
 
 describe("looksLikeDroppedPath", () => {
   it("recognizes macOS screenshot temp paths and file URIs", () => {
@@ -51,5 +69,89 @@ describe("looksLikeDroppedPath", () => {
     expect(looksLikeDroppedPath("/usr/bin/test")).toBe(true);
     expect(looksLikeDroppedPath("/tmp/file.txt")).toBe(true);
     expect(looksLikeDroppedPath("/etc/hosts")).toBe(true); // has second /
+  });
+});
+
+// The real hook, to paste into
+function mountComposer() {
+  let api: null | ReturnType<typeof useComposerState> = null;
+  const gw = { request: vi.fn(() => Promise.resolve({})) };
+
+  function Probe() {
+    const composer = useComposerState({
+      gw: gw as unknown as GatewayClient,
+      submitRef: { current: () => {} },
+      sys: vi.fn(),
+    });
+
+    useEffect(() => {
+      api = composer;
+    });
+
+    return null;
+  }
+
+  const stream = () =>
+    Object.assign(new PassThrough(), { columns: 80, isTTY: false, rows: 24 });
+
+  renderSync(React.createElement(Probe), {
+    patchConsole: false,
+    stderr: stream() as unknown as NodeJS.WriteStream,
+    stdin: stream() as unknown as NodeJS.ReadStream,
+    stdout: stream() as unknown as NodeJS.WriteStream,
+  });
+
+  return async () => {
+    await vi.waitFor(() => expect(api).toBeTruthy());
+
+    return api!;
+  };
+}
+
+describe("a Ctrl+V clipboard with Windows line endings", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  const pasteFromClipboard = async (text: string) => {
+    vi.stubEnv("K3CODE_HOME", "/nonexistent-k3code-home");
+    resetUiState();
+    patchUiState({ sid: "sess-1" });
+    clipboard.text = text;
+
+    const composer = await mountComposer()();
+
+    return {
+      composer,
+      result: await composer.actions.handleTextPaste({
+        cursor: 0,
+        hotkey: true,
+        text: "",
+        value: "",
+      }),
+    };
+  };
+
+  it("is pasted without the carriage returns", async () => {
+    const { result } = await pasteFromClipboard("a\r\n");
+
+    expect(result).toEqual({ cursor: 1, value: "a" });
+  });
+
+  it("collapses with LF line endings, so the token carries the text the agent should read", async () => {
+    const { composer, result } = await pasteFromClipboard(
+      "l1\r\nl2\r\nl3\r\nl4\r\nl5\r\n",
+    );
+
+    expect(result?.value).toContain("[5 lines]");
+    expect(composer.refs.tokensRef.current).toMatchObject([
+      { kind: "paste", text: "l1\nl2\nl3\nl4\nl5" },
+    ]);
+  });
+
+  it("treats a bare CR like a newline", async () => {
+    const { result } = await pasteFromClipboard("a\rb\r");
+
+    expect(result).toEqual({ cursor: 3, value: "a\nb" });
   });
 });

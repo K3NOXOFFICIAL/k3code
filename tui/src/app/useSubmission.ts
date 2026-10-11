@@ -264,10 +264,24 @@ export function useSubmission(opts: UseSubmissionOptions) {
     [send],
   );
 
+  // `!cmd` also runs mid-turn. It holds `busy` only when no turn does, and only until the last overlapping one ends:
+  // clearing it under a streaming turn would make Ctrl+C quit and the queue drain early. `turnRunning`: a queued
+  // `!cmd` is only sent when no turn is, however busy the drain marked the session for it.
+  const shellRuns = useRef({ count: 0, ownsBusy: false });
+
   const shellExec = useCallback(
-    (cmd: string) => {
+    (cmd: string, turnRunning = getUiState().busy) => {
+      const runs = shellRuns.current;
+
       appendMessage({ role: "user", text: `!${cmd}` });
-      patchUiState({ busy: true, status: "running…" });
+
+      if (runs.count++ === 0) {
+        runs.ownsBusy = !turnRunning;
+      }
+
+      if (runs.ownsBusy) {
+        patchUiState({ busy: true, status: "running…" });
+      }
 
       gw.request<ShellExecResponse>("shell.exec", { command: cmd })
         .then((raw) => {
@@ -288,7 +302,11 @@ export function useSubmission(opts: UseSubmissionOptions) {
           }
         })
         .catch((e: Error) => sys(`error: ${e.message}`))
-        .finally(() => patchUiState({ busy: false, status: "ready" }));
+        .finally(() => {
+          if (--runs.count === 0 && runs.ownsBusy) {
+            patchUiState({ busy: false, status: "ready" });
+          }
+        });
     },
     [appendMessage, gw, sys],
   );
@@ -330,7 +348,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
   const sendQueued = useCallback(
     (text: string, pasteSpans: readonly Span[] = [], display?: string) => {
       if (text.startsWith("!") && !pasteSpans.length) {
-        return shellExec(text.slice(1).trim());
+        return shellExec(text.slice(1).trim(), false);
       }
 
       if (typedInterpolations(text, pasteSpans).length) {
@@ -434,10 +452,11 @@ export function useSubmission(opts: UseSubmissionOptions) {
       // nothing — a detached image can't be re-attached by recalling the text.
       // Idempotent on token-free text, so re-submitting a recalled entry is
       // stable.
-      // A queued item holding pastes (Ctrl+K, a double Enter) is already
-      // expanded: sent as the drain sends it, so pasted text is never read as a
-      // slash command, `!cmd` or `{!cmd}`, and keeps its spans.
-      if (queuedSpans?.length) {
+      // A queued item (Ctrl+K, a double Enter) is already expanded: sent as the
+      // drain sends it, so pasted text is never read as a slash command, `!cmd`
+      // or `{!cmd}`, and keeps its spans. The composer is not its to clear: the
+      // draft in it is not part of the item.
+      if (queuedSpans) {
         if (!getUiState().sid) {
           return composerActions.enqueue(
             full,
@@ -447,10 +466,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         }
 
         return getUiState().busy
-          ? handleBusyInput({
-              ...queueItem(full, queuedDisplay),
-              pasteSpans: queuedSpans,
-            })
+          ? handleBusyInput(queueItem(full, queuedDisplay, queuedSpans))
           : sendQueued(full, queuedSpans, queuedDisplay);
       }
 

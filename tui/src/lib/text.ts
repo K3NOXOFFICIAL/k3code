@@ -56,14 +56,24 @@ export const compactPreview = (s: string, max: number) => {
 export const estimateTokensRough = (text: string) =>
   !text ? 0 : (text.length + 3) >> 2;
 
+const isHighSurrogate = (code: number) => code >= 0xd800 && code <= 0xdbff;
+const isLowSurrogate = (code: number) => code >= 0xdc00 && code <= 0xdfff;
+
 export const edgePreview = (s: string, head = 16, tail = 28) => {
   const one = s.replace(WS_RE, " ").trim().replace(/\]\]/g, "] ]");
 
-  return !one
-    ? ""
-    : one.length <= head + tail + 4
-      ? one
-      : `${one.slice(0, head).trimEnd()}.. ${one.slice(-tail).trimStart()}`;
+  if (one.length <= head + tail + 4) {
+    return one;
+  }
+
+  // neither edge cuts an astral character in two: half of one is a lone surrogate in the label
+  const headEnd = isHighSurrogate(one.charCodeAt(head - 1)) ? head - 1 : head;
+  const tailAt = one.length - tail;
+  const tailStart = isLowSurrogate(one.charCodeAt(tailAt))
+    ? tailAt + 1
+    : tailAt;
+
+  return `${one.slice(0, headEnd).trimEnd()}.. ${one.slice(tailStart).trimStart()}`;
 };
 
 export const pasteTokenLabel = (text: string, lineCount: number) => {

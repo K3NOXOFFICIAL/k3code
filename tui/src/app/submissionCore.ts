@@ -110,7 +110,8 @@ export function submitPrompt(
 
     patchUiState({ busy: true, status: "running…" });
     turnController.bufRef = "";
-    turnController.interrupted = false;
+    // `interrupted` stays: a turn Ctrl+C stopped may still be unwinding, and its closing events are still its own.
+    // startMessage() clears it when this prompt's turn begins.
 
     const spans = rewritten ? [] : (opts.pasteSpans ?? []);
 

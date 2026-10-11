@@ -7,6 +7,7 @@ import { getGraphemeSegmenter } from "../utils/intl.js";
 import { lruEvict } from "./lru.js";
 
 const EMOJI_REGEX = emojiRegex();
+const EMOJI_PRESENTATION_REGEX = /^\p{Emoji_Presentation}$/u;
 
 /**
  * Fallback JavaScript implementation of stringWidth when Bun.stringWidth is not available.
@@ -157,6 +158,15 @@ function getEmojiWidth(grapheme: string): number {
     ) {
       return 1;
     }
+  }
+
+  // A lone symbol that is an emoji only on request (⚠ ✔ ❤ ♥ ✈ ©, no U+FE0F) is drawn as text, in the cells
+  // eastAsianWidth gives it. Real emoji (😀 ✅ ⭐) are wide by default, and a sequence is the emoji form.
+  if (
+    grapheme.length === (first > 0xffff ? 2 : 1) &&
+    !EMOJI_PRESENTATION_REGEX.test(grapheme)
+  ) {
+    return eastAsianWidth(first, { ambiguousAsWide: false });
   }
 
   return 2;

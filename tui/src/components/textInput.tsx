@@ -408,6 +408,11 @@ export function deleteWordForward(
   };
 }
 
+// Start of the logical line that holds offset `pos`. A negative `fromIndex` is clamped to 0 by lastIndexOf, so a
+// leading "\n" would read as the newline before position 0: that case is its own.
+const lineStartAt = (s: string, pos: number) =>
+  pos <= 0 ? 0 : s.lastIndexOf("\n", pos - 1) + 1;
+
 /**
  * Move cursor one logical line up or down inside `s` while preserving the
  * column offset from the current line's start. Returns `null` when the cursor
@@ -416,7 +421,7 @@ export function deleteWordForward(
  */
 export function lineNav(s: string, p: number, dir: -1 | 1): null | number {
   const pos = snapPos(s, p);
-  const curStart = s.lastIndexOf("\n", pos - 1) + 1;
+  const curStart = lineStartAt(s, pos);
   const col = pos - curStart;
 
   if (dir < 0) {
@@ -424,7 +429,7 @@ export function lineNav(s: string, p: number, dir: -1 | 1): null | number {
       return null;
     }
 
-    const prevStart = s.lastIndexOf("\n", curStart - 2) + 1;
+    const prevStart = lineStartAt(s, curStart - 1);
 
     return snapPos(s, Math.min(prevStart + col, curStart - 1));
   }
@@ -512,7 +517,7 @@ export function killToLineStart(
   value: string,
   cursor: number,
 ): { value: string; cursor: number } {
-  const start = value.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
+  const start = lineStartAt(value, cursor);
   const from = start === cursor && cursor > 0 ? start - 1 : start;
 
   return { value: value.slice(0, from) + value.slice(cursor), cursor: from };

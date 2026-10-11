@@ -193,6 +193,18 @@ describe("edgePreview", () => {
       ),
     ).toBe("Vampire.. stained with blood");
   });
+
+  it("never cuts an astral character in two", () => {
+    const text = "a" + "\u{1F600}".repeat(40) + "\nz";
+
+    expect(edgePreview(text).isWellFormed()).toBe(true);
+    // either edge landing on the middle of an emoji
+    for (let head = 14; head <= 17; head++) {
+      for (let tail = 26; tail <= 29; tail++) {
+        expect(edgePreview(text, head, tail).isWellFormed()).toBe(true);
+      }
+    }
+  });
 });
 
 describe("thinkingPreview over-bound tail", () => {
@@ -215,6 +227,13 @@ describe("pasteTokenLabel", () => {
     expect(label.startsWith("[[ ")).toBe(true);
     expect(label).toContain("[250 lines]");
     expect(label.endsWith(" ]]")).toBe(true);
+  });
+
+  it("is well-formed for a paste of emoji", () => {
+    const label = pasteTokenLabel("a" + "\u{1F600}".repeat(40) + "\nz", 2);
+
+    expect(label.isWellFormed()).toBe(true);
+    expect(label).toContain("[2 lines]");
   });
 });
 

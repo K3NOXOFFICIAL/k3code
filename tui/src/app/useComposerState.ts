@@ -303,7 +303,10 @@ export function useComposerState({
       text,
       value,
     }: Omit<PasteEvent, "hotkey">): Promise<ComposerPasteResult | null> => {
-      const cleanedText = stripTrailingPasteNewlines(text);
+      // the hotkey path brings the clipboard's own line endings (WSL, PowerShell: \r\n); a bracketed paste is clean
+      const cleanedText = stripTrailingPasteNewlines(
+        text.replace(/\r\n?/g, "\n"),
+      );
 
       if (!cleanedText || !/[^\n]/.test(cleanedText)) {
         return bracketed ? pasteClipboardImage(value, cursor, true) : null;

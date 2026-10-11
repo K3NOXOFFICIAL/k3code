@@ -48,4 +48,8 @@ describe("lineNav", () => {
   it("handles leading newline without crashing", () => {
     expect(lineNav("\nfoo", 2, -1)).toBe(0);
   });
+
+  it("returns null at position 0 even when the buffer starts with a newline", () => {
+    expect(lineNav("\nfoo", 0, -1)).toBeNull();
+  });
 });
