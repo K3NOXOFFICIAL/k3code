@@ -272,7 +272,11 @@ class Router:
                     async for event in entry.provider.stream(
                         messages, tools, target_model, max_tokens=max_tokens, temperature=temperature
                     ):
-                        streamed = True
+                        if event.type == "partial_usage":
+                            if event.usage is not None and not event.usage.model:
+                                event.usage.model = target_model
+                        else:
+                            streamed = True
                         if event.type == "done":  # the consumer stops reading here: record the success first
                             for u in (event.usage, event.message.usage if event.message else None):
                                 if u is not None and not u.model:
@@ -284,10 +288,6 @@ class Router:
                     # The provider yields its "done" event then closes normally.
                     return
                 except Exception as exc:  # noqa: BLE001 - classified below
-                    if (partial := getattr(exc, "usage", None)) is not None:
-                        if not partial.model:
-                            partial.model = target_model
-                        yield StreamEvent(type="partial_usage", usage=partial)  # billed, though no answer came of it
                     classified = classify_api_error(exc, provider=entry.provider_name, model=target_model)
                     last_reason = classified.reason
                     last_detail = summarize(exc)

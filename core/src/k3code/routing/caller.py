@@ -32,7 +32,7 @@ attempt_holder: ContextVar[list[tuple[str, str]] | None] = ContextVar("attempt_h
 #: One-shot calls that never get the session's reasoning effort: short mechanical answers on a cheap tier.
 NO_EFFORT_KINDS = frozenset(
     {TaskKind.TITLE, TaskKind.COMPACTION, TaskKind.GOAL_JUDGE, TaskKind.PREVIEW, TaskKind.CLASSIFICATION}
-    | {TaskKind.CONTEXT_SELECT}
+    | {TaskKind.CONTEXT_SELECT, TaskKind.LEARNING, TaskKind.PROPOSAL}
 )
 
 

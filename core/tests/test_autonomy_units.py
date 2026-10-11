@@ -309,3 +309,12 @@ def test_prompt_examples_are_not_taken_from_the_eval_sets():
     assert len(evals) == 70
     for ex in re.findall(r'^Task: "(.*?)" ->', CLASSIFIER_SYSTEM, re.M):
         assert ex.lower() not in evals
+
+
+def test_the_learning_and_proposal_kinds_follow_the_classification_tier_until_set_themselves():
+    assert tier_for("learning") is Tier.CHEAP and tier_for("proposal") is Tier.CHEAP
+    # a config that sent classification calls to a tier still sends the calls that used to be classification there
+    assert tier_for("learning", {"classification": "main"}) is Tier.MAIN
+    assert tier_for("proposal", {"classification": "strong"}) is Tier.STRONG
+    assert tier_for("learning", {"classification": "main", "learning": "fast"}) is Tier.FAST
+    assert tier_for("classification", {"learning": "fast"}) is Tier.CHEAP

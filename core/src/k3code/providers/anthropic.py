@@ -120,18 +120,6 @@ class AnthropicProvider(Provider):
             raise error
         usage_in = usage_out = cache_read = cache_creation = 0
 
-        def broken(error: ProviderError) -> ProviderError:
-            """``error`` carrying what the provider had counted by now: a prompt it read is billed whether or not the
-            stream finished."""
-            if usage_in:
-                error.usage = Usage(
-                    prompt_tokens=usage_in,
-                    completion_tokens=usage_out,
-                    cache_read_tokens=cache_read,
-                    cache_creation_tokens=cache_creation,
-                )
-            return error
-
         try:
             content_parts: list[str] = []
             # tool index -> {"id", "name", "args"}
@@ -150,7 +138,7 @@ class AnthropicProvider(Provider):
                     continue
                 etype = event.get("type")
                 if etype == "error":
-                    raise broken(_inband_error(event))  # overloaded_error etc. after a 200
+                    raise _inband_error(event)  # overloaded_error etc. after a 200
                 if etype == "message_stop":
                     complete = True
                 if etype == "content_block_start":
@@ -180,6 +168,17 @@ class AnthropicProvider(Provider):
                     usage_in = sum(int(usage.get(k) or 0) for k in _INPUT_USAGE_KEYS)
                     cache_read = int(usage.get("cache_read_input_tokens") or 0)
                     cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+                    if usage_in:
+                        # the prompt is counted (and billed) from here on, whatever becomes of the stream: the consumer
+                        # charges this if the attempt is cut short (a dropped connection, /stop)
+                        yield StreamEvent(
+                            type="partial_usage",
+                            usage=Usage(
+                                prompt_tokens=usage_in,
+                                cache_read_tokens=cache_read,
+                                cache_creation_tokens=cache_creation,
+                            ),
+                        )
                 elif etype == "message_delta":
                     usage = event.get("usage") or {}
                     usage_out = int(usage.get("output_tokens") or 0)
@@ -189,11 +188,9 @@ class AnthropicProvider(Provider):
                     cache_creation = max(cache_creation, int(usage.get("cache_creation_input_tokens") or 0))
                     stop_reason = (event.get("delta") or {}).get("stop_reason") or stop_reason
             if not complete:
-                raise broken(
-                    to_provider_error(
-                        httpx.RemoteProtocolError("peer closed connection: stream ended before message_stop"),
-                        kind="anthropic",
-                    )
+                raise to_provider_error(
+                    httpx.RemoteProtocolError("peer closed connection: stream ended before message_stop"),
+                    kind="anthropic",
                 )
             usage = Usage(
                 prompt_tokens=usage_in,
@@ -220,7 +217,7 @@ class AnthropicProvider(Provider):
             )
             yield StreamEvent(type="done", message=final, usage=usage)
         except httpx.HTTPError as exc:
-            raise broken(to_provider_error(exc, kind="anthropic")) from exc
+            raise to_provider_error(exc, kind="anthropic") from exc
         finally:
             await response.aclose()
 

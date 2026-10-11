@@ -183,55 +183,111 @@ async def test_anthropic_input_counts_finalized_in_message_delta_are_used():
     assert usage.completion_tokens == 3
 
 
-async def test_a_stream_that_dies_after_the_prompt_was_counted_carries_that_usage():
+async def test_anthropic_announces_the_counted_prompt_as_soon_as_the_stream_starts():
     body = (
         'event: message_start\ndata: {"type":"message_start","message":{"usage":'
         '{"input_tokens":5,"cache_read_input_tokens":900,"cache_creation_input_tokens":40}}}\n\n'
         'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,'
         '"delta":{"type":"text_delta","text":"half"}}\n\n'
     )  # no message_stop: the connection closed
-    with pytest.raises(ProviderError) as exc:
-        await run(anthropic(body))
-    usage = exc.value.usage
+    seen = []
+    with pytest.raises(ProviderError):
+        async for event in anthropic(body).stream(MSGS, [], "m"):
+            seen.append(event)
+    first = seen[0]
+    assert first.type == "partial_usage"
+    usage = first.usage
     assert (usage.prompt_tokens, usage.cache_read_tokens, usage.cache_creation_tokens) == (945, 900, 40)
 
 
-async def test_the_loop_charges_the_tokens_of_an_attempt_that_died(tmp_path):
+class Flaky:
+    """Counts its prompt up front (a ``partial_usage``), then dies on the first call and answers on the second."""
+
+    name, base_url = "flaky", "https://flaky.test"
+
+    def __init__(self, dies: int = 1, text_before_dying: bool = True) -> None:
+        self.calls, self.dies, self.text = 0, dies, text_before_dying
+
+    async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+        from k3code.providers.types import StreamEvent, Usage
+
+        self.calls += 1
+        yield StreamEvent(type="partial_usage", usage=Usage(prompt_tokens=700))
+        if self.calls <= self.dies:
+            if self.text:
+                yield StreamEvent(type="text_delta", text="half")
+            raise ProviderError("peer closed connection", status_code=502)
+        usage = Usage(prompt_tokens=700, completion_tokens=5)
+        yield StreamEvent(type="done", message=Message(role="assistant", content="whole", usage=usage), usage=usage)
+
+    async def aclose(self):
+        pass
+
+
+def flaky_loop(tmp_path, provider):
     from k3code.agent.loop import AgentLoop
-    from k3code.providers.types import Message as Msg
-    from k3code.providers.types import StreamEvent, Usage
     from k3code.reliability.governor import Budget
     from k3code.router import Router, build_chain
 
-    class DiesOnce:
-        name, base_url = "flaky", "https://flaky.test"
+    loop = AgentLoop(
+        Router(build_chain([provider], [["m"]]), max_retries=3), system_prompt="t", cwd=tmp_path, permission_mode="yolo"
+    )
+    assert loop.reliability.governor is not None
+    loop.reliability.governor.add_budget(Budget(scope="session", tokens=1_000_000))
+    return loop
 
-        def __init__(self):
-            self.calls = 0
+
+def spent(loop) -> int:
+    return loop.reliability.governor._budgets["session"].used_tokens
+
+
+async def test_the_loop_charges_the_prompt_of_an_attempt_that_died_and_not_twice_the_one_that_finished(tmp_path):
+    provider = Flaky()
+    loop = flaky_loop(tmp_path, provider)
+    events = [e async for e in loop.run("go")]
+    assert provider.calls == 2
+    assert spent(loop) == 700 + 705, "the dead attempt's prompt, and the finished one once (not its provisional too)"
+    assert not any(e.type == "partial_usage" for e in events), "the marker does not leave the loop"
+
+
+async def test_an_attempt_that_died_before_any_text_is_charged_when_the_retry_starts(tmp_path):
+    provider = Flaky(dies=2, text_before_dying=False)  # no output, so no reset event: the next attempt's marker arrives
+    loop = flaky_loop(tmp_path, provider)
+    [e async for e in loop.run("go")]
+    assert provider.calls == 3 and spent(loop) == 700 + 700 + 705
+
+
+async def test_a_stop_while_streaming_charges_the_prompt_the_provider_had_counted(tmp_path):
+    from k3code.providers.types import StreamEvent, Usage
+
+    class Slow:
+        name, base_url = "slow", "https://slow.test"
 
         async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
-            self.calls += 1
-            if self.calls == 1:
-                yield StreamEvent(type="text_delta", text="half")
-                raise ProviderError("peer closed connection", status_code=502, usage=Usage(prompt_tokens=700))
-            usage = Usage(prompt_tokens=700, completion_tokens=5)
-            yield StreamEvent(type="done", message=Msg(role="assistant", content="whole", usage=usage), usage=usage)
+            yield StreamEvent(type="partial_usage", usage=Usage(prompt_tokens=900))
+            for i in range(50):
+                yield StreamEvent(type="text_delta", text=f"t{i}")
 
         async def aclose(self):
             pass
 
-    provider = DiesOnce()
-    loop = AgentLoop(
-        Router(build_chain([provider], [["m"]]), max_retries=2),
-        system_prompt="t",
-        cwd=tmp_path,
-        permission_mode="yolo",
-    )
-    assert loop.reliability.governor is not None
+    from k3code.agent.loop import AgentLoop
+    from k3code.reliability.governor import Budget
+    from k3code.router import Router, build_chain
+
+    loop = AgentLoop(Router(build_chain([Slow()], [["m"]]), max_retries=0), system_prompt="t", cwd=tmp_path)
     loop.reliability.governor.add_budget(Budget(scope="session", tokens=1_000_000))
+    seen = 0
+
+    async def on_delta(text: str) -> None:
+        nonlocal seen
+        seen += 1
+        if seen == 3:
+            loop.interrupt()  # /stop
+
+    loop.on_text_delta = on_delta
     [e async for e in loop.run("go")]
-    assert provider.calls == 2
-    assert loop.reliability.governor._budgets["session"].used_tokens == 700 + 705, "the dead attempt and the good one"
+    assert seen < 50 and spent(loop) == 900
 
 
 async def test_the_model_pickers_save_key_says_where_keys_come_from_and_never_echoes_one(tmp_path, monkeypatch):
@@ -244,3 +300,43 @@ async def test_the_model_pickers_save_key_says_where_keys_come_from_and_never_ec
     assert "does not store API keys" in message and "NOPE" in message
     assert fake_key not in str(res)
     await server.close()
+
+
+async def test_a_call_a_server_reports_no_usage_for_still_counts_for_the_budget_guard_only(tmp_path):
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import Message as Msg
+    from k3code.providers.types import StreamEvent, Usage
+    from k3code.reliability.governor import Budget
+    from k3code.router import Router, build_chain
+
+    class Silent:
+        name, base_url = "silent", "https://silent.test"
+
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            reply = Msg(role="assistant", content="an answer " * 40)  # no usage anywhere
+            yield StreamEvent(type="done", message=reply, usage=None)
+
+        async def aclose(self):
+            pass
+
+    loop = AgentLoop(
+        Router(build_chain([Silent()], [["m"]]), max_retries=0),
+        system_prompt="sys " * 50,
+        cwd=tmp_path,
+        permission_mode="yolo",
+    )
+    loop.reliability.governor.add_budget(Budget(scope="session", tokens=1_000_000))
+    events = [e async for e in loop.run("a question " * 20)]
+    used = loop.reliability.governor._budgets["session"].used_tokens
+    assert 100 < used < 2000, "the request and the reply, estimated"
+    assert events[-1].message.usage is None, "what is shown and logged stays empty"
+
+    class Reports(Silent):
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            usage = Usage(prompt_tokens=10, completion_tokens=2)
+            yield StreamEvent(type="done", message=Msg(role="assistant", content="ok", usage=usage), usage=usage)
+
+    loop2 = AgentLoop(Router(build_chain([Reports()], [["m"]]), max_retries=0), system_prompt="s", cwd=tmp_path)
+    loop2.reliability.governor.add_budget(Budget(scope="session", tokens=1_000_000))
+    [e async for e in loop2.run("q")]
+    assert loop2.reliability.governor._budgets["session"].used_tokens == 12, "a reported figure is never replaced"

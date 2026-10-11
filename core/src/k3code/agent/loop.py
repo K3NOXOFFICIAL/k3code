@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import itertools
 import logging
@@ -16,7 +17,7 @@ from k3code.errors import ContextOverflow
 from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.state import PermissionState
-from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall
+from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall, Usage
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
@@ -131,6 +132,7 @@ class AgentLoop:
         self._truncated: set[str] = set()  # ids of tool calls cut off by the output limit: never executed
         self._continuations = 0  # "continue" nudges after a text answer cut off by the output limit
         self._widened = False  # the output limit was raised once after a reply that used all of it without writing
+        self._last_request: tuple[list[Message], list[Any]] | None = None  # what the model call in flight was sent
         #: the consecutive failed calls behind _tool_errors: (call, first error line), listed when the turn stops
         self._failed: list[tuple[str, str]] = []
         #: end a tool-error stop with an assistant message listing the failures (off when a higher tier continues)
@@ -321,13 +323,17 @@ class AgentLoop:
             # M2: the stream goes through persistent retry (pause/park/resume). The model gets head+tail clips of
             # long tool results; ``messages`` (transcript, session, gateway) keeps every full result.
             specs = self.tool_specs()
-            stream = self.reliability.stream(
-                self.router,
-                await self._request_messages(messages, specs),
-                specs,
-                model=model,
-                max_tokens=max_tokens,
-                temperature=temperature,
+            request = await self._request_messages(messages, specs)
+            self._last_request = (request, specs)
+            stream = self._metered(
+                self.reliability.stream(
+                    self.router,
+                    request,
+                    specs,
+                    model=model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
             )
 
             tool_calls: list[ToolCall] = []
@@ -341,8 +347,6 @@ class AgentLoop:
                     text_parts.append(event.text)
                     if self.on_text_delta:
                         await self.on_text_delta(event.text)
-                elif event.type == "partial_usage":
-                    self.reliability.record_usage(event.usage)  # an attempt that died after its prompt was counted
                 elif event.type == "reset":
                     # the router is retrying after partial output: forget what this attempt streamed
                     text_parts.clear()
@@ -816,9 +820,56 @@ class AgentLoop:
         if err is not None:
             raise err
 
+    async def _metered(self, stream: Any) -> Any:
+        """``stream`` with the spend of attempts that never finished accounted for. A provider that counts the prompt
+        up front sends it as ``partial_usage``; the final message's usage replaces it, but an attempt cut short (the
+        connection dropped and the router retried, an error, /stop closing the stream) was billed for that prompt all
+        the same, and it is charged to the budgets here."""
+        pending: Usage | None = None
+        try:
+            async for event in stream:
+                if event.type == "partial_usage":
+                    if pending is not None:  # an earlier attempt died before a retry's prompt was counted
+                        self.reliability.record_usage(pending)
+                    pending = event.usage
+                    continue
+                if event.type == "reset" and pending is not None:
+                    self.reliability.record_usage(pending)
+                    pending = None
+                elif event.type == "done":
+                    pending = None
+                yield event
+        finally:
+            if pending is not None:
+                self.reliability.record_usage(pending)
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                with contextlib.suppress(Exception):
+                    await aclose()
+
     def _record_usage(self, event: StreamEvent) -> None:
         msg = event.message
-        self.reliability.record_usage(msg.usage if msg is not None else None)
+        usage = msg.usage if msg is not None else None
+        if (
+            msg is not None
+            and msg.role == "assistant"
+            and not (usage and (usage.prompt_tokens or usage.completion_tokens))
+        ):
+            # a server that sends no usage record: the caps still have to see the call. Only the budget guard gets
+            # this estimate; the usage log, /usage and the status bar keep showing nothing, not a guess as a figure
+            usage = self._estimated_usage(msg)
+        self.reliability.record_usage(usage)
+
+    def _estimated_usage(self, msg: Message) -> Usage | None:
+        """What a call that reported nothing cost, from the request that was sent and the reply that came back."""
+        if self._last_request is None:
+            return None
+        request, specs = self._last_request
+        prompt = context_budget.message_tokens(request) + context_budget.overhead_tokens(
+            f"{self.system_prompt}\n\n{self.system_suffix}", specs
+        )
+        reply = context_budget.message_tokens([msg])
+        return Usage(prompt_tokens=prompt, completion_tokens=reply) if prompt or reply else None
 
     def _drain_steer(self, messages: list[Message]) -> bool:
         """Append steering messages (never between an assistant tool_calls message and its results)."""

@@ -80,7 +80,7 @@ async def review_session(
         return {"skipped": True, "facts": [], "drafts": [], "proposals": []}
     try:
         res = await caller.complete(
-            TaskKind.CLASSIFICATION,
+            TaskKind.LEARNING,
             [Message(role="system", content=SYSTEM), Message(role="user", content=transcript(messages))],
             session_id=session_id,
             escalate=False,  # best effort: an outage of the cheap tier is not worth a call on the main one

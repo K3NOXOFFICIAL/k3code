@@ -41,6 +41,10 @@ class TaskKind(StrEnum):
     RESEARCH_SEARCH = "research_search"
     CLASSIFICATION = "classification"
     CONTEXT_SELECT = "context_select"
+    #: Background learning (session review, the daily distill, project prep, config suggestions) and the next-step
+    #: proposals: they ran as ``classification`` and were counted with the scope classifier's calls.
+    LEARNING = "learning"
+    PROPOSAL = "proposal"
 
 
 DEFAULT_POLICY: dict[TaskKind, Tier] = {
@@ -59,6 +63,15 @@ DEFAULT_POLICY: dict[TaskKind, Tier] = {
     TaskKind.RESEARCH_SEARCH: Tier.CHEAP,
     TaskKind.CLASSIFICATION: Tier.CHEAP,
     TaskKind.CONTEXT_SELECT: Tier.CHEAP,
+    TaskKind.LEARNING: Tier.CHEAP,
+    TaskKind.PROPOSAL: Tier.CHEAP,
+}
+
+#: A kind that split off another follows that one's ``task_tiers`` entry until it has an entry of its own, so a config
+#: that sent ``classification`` to a tier still does for them.
+KIND_PARENT: dict[TaskKind, TaskKind] = {
+    TaskKind.LEARNING: TaskKind.CLASSIFICATION,
+    TaskKind.PROPOSAL: TaskKind.CLASSIFICATION,
 }
 
 #: Escalation ladder: cheaper tiers climb towards ``strong``.
@@ -68,11 +81,14 @@ LADDER: tuple[Tier, ...] = (Tier.FAST, Tier.CHEAP, Tier.MAIN, Tier.STRONG)
 def tier_for(kind: TaskKind | str, overrides: dict[str, str] | None = None) -> Tier:
     """The tier for a task kind; ``overrides`` (config ``task_tiers``) win over the defaults."""
     kind = TaskKind(kind)
-    if overrides and kind.value in overrides:
-        try:
-            return Tier(overrides[kind.value])
-        except ValueError:
-            logger.warning("task_tiers: unknown tier %r for %s; using the default", overrides[kind.value], kind.value)
+    for named in (kind, KIND_PARENT.get(kind)):
+        if named is not None and overrides and named.value in overrides:
+            try:
+                return Tier(overrides[named.value])
+            except ValueError:
+                logger.warning(
+                    "task_tiers: unknown tier %r for %s; using the default", overrides[named.value], named.value
+                )
     return DEFAULT_POLICY[kind]
 
 

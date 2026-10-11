@@ -115,7 +115,7 @@ def parse_patch(text: str) -> dict[str, Any]:
 
 async def translate(caller: Any, request: str, *, session_id: str = "") -> dict[str, Any]:
     res = await caller.complete(
-        TaskKind.CLASSIFICATION,
+        TaskKind.LEARNING,
         [Message(role="system", content=SYSTEM + schema_hint()), Message(role="user", content=request[:1500])],
         session_id=session_id,
         max_tokens=600,

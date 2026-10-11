@@ -20,6 +20,7 @@ async def test_a_side_call_is_charged_to_the_sessions_budget_and_the_day_ledger(
     rel = await server._reliability_for(live)
     assert rel.governor is not None
     rel.governor.add_budget(Budget(scope="session", tokens=1_000_000))
+    rel.governor.day_ledger.roll(rel.governor.today())  # starts today's count from this test's own (empty) log
     before_day = rel.governor.day_ledger.tokens
 
     res = await server.model_caller.complete(

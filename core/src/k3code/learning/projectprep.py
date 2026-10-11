@@ -132,7 +132,7 @@ async def draft_memory(caller: Any, root: Path, info: dict[str, Any], session_id
         return template_memory(info)
     try:
         res = await caller.complete(
-            TaskKind.CLASSIFICATION,
+            TaskKind.LEARNING,
             [
                 Message(role="system", content=DRAFT_SYSTEM),
                 Message(role="user", content=f"Facts: {json.dumps(info)}\n\n{_excerpts(root)}"),

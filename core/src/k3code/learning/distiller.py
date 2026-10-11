@@ -246,7 +246,7 @@ async def polish(
     payload = json.dumps([{"key": p.key, "text": p.text, "evidence": p.evidence} for p in todo])
     try:
         res = await caller.complete(
-            TaskKind.CLASSIFICATION,
+            TaskKind.LEARNING,
             [Message(role="system", content=DISTILL_SYSTEM), Message(role="user", content=payload)],
             session_id=session_id,
             escalate=False,  # best effort: an outage of the cheap tier is not worth a call on the main one
