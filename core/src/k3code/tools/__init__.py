@@ -23,6 +23,13 @@ from k3code.tools.jobs import MAX_UNREAD_BYTES
 # ── Tool registry ──────────────────────────────────────────────────────
 
 
+#: Tools that come and go between requests of one session (``exit_plan`` only in plan mode, ``schedule_next`` only on a
+#: self-paced loop tick). The tool list leads every request, so one of them in the middle moved every tool after it;
+#: they are advertised last, where their coming and going leaves the rest of the list as it was.
+VOLATILE_TOOLS = frozenset({"exit_plan", "schedule_next"})
+MAX_ACTIVE_TOOLS = 200  # activated MCP tools a session keeps asking for (the newest win)
+
+
 class ToolRegistry:
     """Registry of available tools with JSON-schema specs."""
 
@@ -39,11 +46,14 @@ class ToolRegistry:
             self._deferred.discard(spec.name)
 
     def activate(self, names: list[str]) -> None:
-        """Start advertising the schemas of deferred tools (``mcp_tool_search``)."""
-        self._active.extend(n for n in dict.fromkeys(names) if n in self._deferred and n not in self._active)
+        """Start advertising the schemas of deferred tools (``mcp_tool_search``). A name that is not registered yet
+        (its MCP server is down at this moment) is remembered and advertised in its place once it is: dropping it
+        shrank the tool list, which is a prompt-cache miss, and lost the activation for good."""
+        self._active.extend(n for n in dict.fromkeys(names) if n not in self._active)
+        del self._active[:-MAX_ACTIVE_TOOLS]
 
     def active_names(self) -> list[str]:
-        """The deferred tools advertised so far, in activation order."""
+        """The deferred tools asked for so far, in activation order (also those not registered at the moment)."""
         return list(self._active)
 
     def get(self, name: str) -> tuple[ToolSpec, callable] | None:
@@ -52,9 +62,11 @@ class ToolRegistry:
     def specs(self) -> list[ToolSpec]:
         """The tools the model is sent: the always-on ones in registration order, then the activated deferred ones in
         activation order. The tool list leads every request, so a tool joining it in the middle (at its registration
-        place) rewrote everything after it; at the end it only extends the list."""
-        always = [spec for n, (spec, _) in self._tools.items() if n not in self._deferred]
-        return always + [self._tools[n][0] for n in self._active if n in self._tools]
+        place) rewrote everything after it; at the end it only extends the list. The volatile tools come last of all."""
+        stable = [spec for n, (spec, _) in self._tools.items() if n not in self._deferred and n not in VOLATILE_TOOLS]
+        active = [self._tools[n][0] for n in self._active if n in self._deferred and n in self._tools]
+        volatile = [spec for n, (spec, _) in self._tools.items() if n in VOLATILE_TOOLS and n not in self._deferred]
+        return stable + active + volatile
 
     def names(self) -> list[str]:
         return list(self._tools.keys())
@@ -883,7 +895,9 @@ class TodoStore:
         if error:
             return {"error": error}
         self.state[self.KEY] = todos
-        return {"content": render_todos(todos), "todos": todos}
+        # the model wrote the list a moment ago: echoing it back doubled it in the history (the TUI gets `todos`)
+        done = sum(1 for t in todos if t.get("status") == "completed")
+        return {"content": f"Todos updated ({done}/{len(todos)} done).", "todos": todos}
 
 
 TODO_SPEC = ToolSpec(

@@ -200,6 +200,9 @@ def fenced(label: str, body: str) -> str:
     return f"{label}\n{fence}text\n{body}\n{fence}"
 
 
+_MANAGED_NOTE = re.compile(r"<!-- managed by k3code;[^>]*-->[ \t]*\n?")
+
+
 def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = MAX_MEMORY_TOTAL) -> str:
     """User memory as written; the repository's memory files fenced as what they are (text from the repository).
 
@@ -219,6 +222,8 @@ def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = M
             body = body[:left] + "\n…(truncated)"
         left -= len(body)
         if m.scope == "user":
+            # the note k3code puts above the sections it rewrites is for whoever edits the file, not for the model
+            body = _MANAGED_NOTE.sub("", body).strip()
             parts.append(f"## User memory\n\n{body}")
             continue
         try:

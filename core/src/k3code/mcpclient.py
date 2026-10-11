@@ -285,6 +285,7 @@ class McpManager:
     def __init__(self, servers: dict[str, McpServerConfig] | None = None) -> None:
         self.servers = dict(servers or {})
         self._runners: dict[str, _Runner] = {}
+        self._last_tools: dict[str, list[McpToolInfo]] = {}
         self._started = False
         self._stale = False
         self._lock = asyncio.Lock()  # ensure_started runs on every turn of every session: single-flight
@@ -376,13 +377,22 @@ class McpManager:
     async def _close(self) -> None:
         await asyncio.gather(*(r.stop() for r in self._runners.values()), return_exceptions=True)
         self._runners.clear()
+        self._last_tools.clear()
         self._started = False
 
     def states(self) -> list[McpServerState]:
         return [r.state for r in self._runners.values()]
 
     def tools(self) -> list[McpToolInfo]:
-        return [t for r in self._runners.values() for t in r.state.tools]
+        """Every connected tool; a server that is restarting keeps the tools it had (a blip at a turn's start used to
+        drop them from the tool list and the system prompt: a prompt-cache miss, twice, and the loaded schemas lost)."""
+        out: list[McpToolInfo] = []
+        for name, r in self._runners.items():
+            if r.state.tools:
+                self._last_tools[name] = r.state.tools
+            if r.cfg.enabled:
+                out += self._last_tools.get(name, [])
+        return out
 
     def find(self, qualified: str) -> McpToolInfo | None:
         return next((t for t in self.tools() if t.qualified == qualified), None)

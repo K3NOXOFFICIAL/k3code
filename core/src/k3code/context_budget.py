@@ -11,7 +11,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from k3code.providers.types import Message, ToolSpec
+from k3code.providers.types import Message, ToolCall, ToolSpec
 
 #: Built-in context windows by model family (prefix of the model id, after any "vendor/" part); see context_window.
 #: sonnet, opus and haiku are the Claude Code aliases the claude-cli provider sends.
@@ -191,6 +191,7 @@ def elide_old_results(
     """
     tool_idx = [i for i, m in enumerate(messages) if m.role == "tool"]
     old = set(tool_idx[:-ELIDE_KEEP_CALLS]) if len(tool_idx) > ELIDE_KEEP_CALLS else set()
+    old_calls = {messages[i].tool_call_id for i in old}
     out: list[Message] = []
     for i, m in enumerate(messages):
         candidate = i in old and m.tool_call_id not in keep and bool(m.content)
@@ -199,5 +200,41 @@ def elide_old_results(
             marker = elide_marker(m.name, len(m.content or ""))
             note = (notes or {}).get(m.tool_call_id or "")
             m = dataclasses.replace(m, content=f"{marker}\nStill relevant: {note}" if note else marker)
+        elif m.role == "assistant" and m.tool_calls:
+            m = _elide_written_text(m, old_calls, over=over, elided=elided)
         out.append(m)
     return out
+
+
+#: Tools whose arguments are text that is on disk by now: the file a ``write`` made, the strings an ``edit`` swapped.
+_FILE_TEXT_ARGS = {"write": ("content",), "edit": ("old_string", "new_string")}
+
+
+def _call_chars(tc: ToolCall) -> int:
+    return sum(len(str(tc.arguments.get(k) or "")) for k in _FILE_TEXT_ARGS.get(tc.name, ()))
+
+
+def _elide_written_text(m: Message, old_calls: set[str | None], *, over: bool, elided: set[str]) -> Message:
+    """``m`` with the file text of its old ``write``/``edit`` calls replaced by a marker. The whole file stayed in the
+    request as the call's argument long after the result was elided (ten writes of an 8 KB file: 22 000 tokens,
+    resent every step); it is on disk and the model can read it again. Decided together with the results above, so the
+    request changes at the same moments, and a call once elided stays elided."""
+    calls = list(m.tool_calls)
+    changed = False
+    for j, tc in enumerate(calls):
+        keys = _FILE_TEXT_ARGS.get(tc.name)
+        if not keys or tc.id not in old_calls:
+            continue
+        key = f"args:{tc.id}"  # not the id itself: that one marks the call's *result* as elided
+        if key not in elided and not (over and _call_chars(tc) > ELIDE_MIN_CHARS):
+            continue
+        args = {
+            k: (
+                f"[{len(str(v))} chars elided: they are in the file now — read it if you need them]" if k in keys else v
+            )
+            for k, v in tc.arguments.items()
+        }
+        calls[j] = dataclasses.replace(tc, arguments=args, raw_arguments=None)
+        elided.add(key)
+        changed = True
+    return dataclasses.replace(m, tool_calls=calls) if changed else m

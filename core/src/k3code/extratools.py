@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import skills as skills_mod
-from k3code.mcpclient import McpManager
+from k3code.mcpclient import McpManager, qualified_name
 from k3code.providers.types import ToolSpec
 from k3code.tools import ToolRegistry
 
@@ -64,9 +64,11 @@ def _arguments(schema: dict[str, Any]) -> str:
 
 
 def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
-    """Register every connected MCP tool (schema deferred) plus ``mcp_tool_search``."""
+    """Register every connected MCP tool (schema deferred) plus ``mcp_tool_search``. The search tool is there whenever a
+    server is configured, connected or not: its coming and going with a server's blip rewrote the tool list, a
+    prompt-cache miss for the whole request each way."""
     tools = mcp.tools()
-    if not tools:
+    if not tools and not any(cfg.enabled for cfg in mcp.servers.values()):
         return
 
     def make_handler(qualified: str) -> Any:
@@ -95,9 +97,10 @@ def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
         reg.activate([t.qualified for t in hits])
         if not hits:
             return {"content": "No matching MCP tools."}
-        # the full schemas reach the model through the tool list from the next step on: repeating them here (indented
-        # JSON) doubled their tokens, so the result names each tool with its arguments
-        body = "\n".join(f"- {t.qualified}({_arguments(t.schema)}): {t.description}" for t in hits)
+        # the schemas and descriptions reach the model through the tool list from the next step on: repeating them here
+        # doubled their tokens (about 900 for six tools with ordinary descriptions), so the result names each tool with
+        # its arguments
+        body = "\n".join(f"- {t.qualified}({_arguments(t.schema)})" for t in hits)
         return {"content": f"{body}\n\nThese tools can now be called directly."}
 
     reg.register(
@@ -115,13 +118,20 @@ def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
 
 
 def mcp_prompt(mcp: McpManager, limit: int = 150) -> str:
+    """The deferred MCP tools by name, grouped per server: ``mcp__Neon__{run_sql, list_projects}`` instead of every
+    ``mcp__Neon__`` repeated (about 40% fewer tokens for 145 tools). The qualified name is the prefix + the name."""
     tools = mcp.tools()
     if not tools:
         return ""
-    names = [t.qualified for t in tools]
-    shown = ", ".join(names[:limit]) + (f", …(+{len(names) - limit} more)" if len(names) > limit else "")
+    groups: dict[str, list[str]] = {}
+    for t in tools[:limit]:
+        prefix = qualified_name(t.server, "")
+        groups.setdefault(prefix, []).append(t.qualified[len(prefix) :])
+    shown = "\n".join(f"{prefix}{{{', '.join(names)}}}" for prefix, names in groups.items())
+    more = f"\n…(+{len(tools) - limit} more)" if len(tools) > limit else ""
     return (
         "## MCP tools (deferred)\n\n"
         "These tools exist but their schemas are not loaded yet. Call `mcp_tool_search` with a name or "
-        f"keywords to load schemas, then call the tool.\n\n{shown}"
+        "keywords to load schemas, then call the tool by its full name (the prefix with one of its names).\n\n"
+        f"{shown}{more}"
     )

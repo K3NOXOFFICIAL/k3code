@@ -119,3 +119,29 @@ def test_usage_db_indexes_the_turn_column_even_in_an_old_database(tmp_path: Path
     plan = " ".join(str(r) for r in db._db.execute("EXPLAIN QUERY PLAN SELECT 1 FROM events WHERE turn = 't1'"))
     assert "events_turn" in plan
     db.close()
+
+
+def test_the_note_k3code_writes_into_user_memory_does_not_reach_the_prompt(tmp_path: Path):
+    from k3code.memory import memory_prompt, user_memory_path
+
+    path = user_memory_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "- I like short answers.\n"
+        "<!-- managed by k3code; rewritten automatically, edit outside this section -->\n"
+        "- Prefers uv over pip.\n"
+    )
+    prompt = memory_prompt(tmp_path)
+    assert "Prefers uv over pip." in prompt and "I like short answers." in prompt and "managed by k3code" not in prompt
+
+
+def test_the_skills_index_does_not_change_when_a_skill_is_used(tmp_path: Path):
+    from k3code.learning.curator import record_use
+
+    root = skills_home() / "skills"
+    for i in range(70):  # past the 60 that fit: the index has to choose
+        (root / f"s{i:02d}").mkdir(parents=True)
+        (root / f"s{i:02d}" / "SKILL.md").write_text(f"---\nname: s{i:02d}\ndescription: skill {i}\n---\nbody\n")
+    before = skills.skills_prompt(tmp_path)
+    record_use("s69", ok=True)  # a skill outside the index is loaded through the skill tool
+    assert skills.skills_prompt(tmp_path) == before

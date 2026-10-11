@@ -207,3 +207,35 @@ async def test_on_never_retries_and_a_gpt_model_never_carries_markers():
     auto = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", client=_relay(False, seen))
     await _ask(auto, "gpt-4o")
     assert seen == [False]
+
+
+def test_old_write_and_edit_text_is_elided_with_the_old_results_and_stays_elided():
+    from k3code.context_budget import ELIDE_KEEP_CALLS, elide_old_results
+    from k3code.providers.types import Message, ToolCall
+
+    big = "x" * 8000
+    msgs = [Message(role="user", content="build it")]
+    for i in range(ELIDE_KEEP_CALLS + 4):
+        name, args = (
+            ("write", {"path": f"f{i}.py", "content": big})
+            if i % 2 == 0
+            else (
+                "edit",
+                {"path": "f0.py", "old_string": big, "new_string": big + "y", "replace_all": True},
+            )
+        )
+        msgs.append(Message(role="assistant", tool_calls=[ToolCall(id=f"c{i}", name=name, arguments=args)]))
+        msgs.append(Message(role="tool", content=f"done {i}", tool_call_id=f"c{i}", name=name))
+    elided: set[str] = set()
+    under = elide_old_results(msgs, over=False, elided=elided)
+    assert under == msgs and not elided  # below the threshold nothing changes
+    over = elide_old_results(msgs, over=True, elided=elided)
+    first, last = over[1].tool_calls[0], over[-2].tool_calls[0]
+    assert "8000 chars elided" in first.arguments["content"] and first.arguments["path"] == "f0.py"
+    assert first.raw_arguments is None and last.arguments == msgs[-2].tool_calls[0].arguments  # recent calls stay whole
+    assert over[2].content == "done 0"  # the short result is not turned into an elision marker
+    edited = over[3].tool_calls[0].arguments
+    assert edited["replace_all"] is True and "chars elided" in edited["old_string"]
+    again = elide_old_results(msgs, over=False, elided=elided)  # once elided, elided: the prefix does not flip back
+    assert again == over
+    assert msgs[1].tool_calls[0].arguments["content"] == big  # the session's own history is untouched

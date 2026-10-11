@@ -519,7 +519,8 @@ class AgentLoop:
             return {"error": CUT_OFF_CALL}
         spec, handler = self.tools.get(tool_call.name) or (None, None)
         if not handler:
-            names = sorted(self.tools.names())
+            # the tools the model was sent (not the registry: deferred MCP names are in the system prompt already)
+            names = [spec.name for spec in self.tool_specs()]
             listed = ", ".join(names[:40]) + (f", … ({len(names)} in all)" if len(names) > 40 else "")
             return {"error": f"Unknown tool: {tool_call.name}. The tools are: {listed}"}
 

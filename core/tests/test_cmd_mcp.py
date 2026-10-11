@@ -43,7 +43,8 @@ async def test_manager_lists_calls_and_searches():
         assert mgr.search("mcp__fake__echo")[0].qualified == "mcp__fake__echo"
 
         prompt = mcp_prompt(mgr)
-        assert "mcp__fake__echo" in prompt and "input_schema" not in prompt and "Echo the text" not in prompt
+        assert "mcp__fake__{" in prompt and "echo" in prompt and "add" in prompt  # grouped: prefix + names
+        assert "input_schema" not in prompt and "Echo the text" not in prompt
     finally:
         await mgr.close()
 
@@ -97,7 +98,7 @@ async def test_mcp_command_status_reload_and_turn(tmp_path, monkeypatch):
         assert res["servers"][0]["tools"] == 4
 
         await submit_and_wait(server, "go")
-        assert "mcp__fake__add" in provider.seen[0][0].content  # names in prompt, deferred
+        assert "mcp__fake__{" in provider.seen[0][0].content  # names in prompt (grouped per server), deferred
         loop = server.session.loop
         assert "mcp__fake__add" in loop.tools.names() and "mcp_tool_search" in loop.tool_specs().__repr__()
         assert "mcp__fake__add" not in {s.name for s in loop.tool_specs()}

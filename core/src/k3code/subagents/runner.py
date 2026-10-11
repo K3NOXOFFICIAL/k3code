@@ -470,6 +470,8 @@ class SubagentManager:
             register_task_tools(loop.tools, server, parent, depth=h.depth + 1, parent_child_id=h.id)
         if atype.tools:
             allowed = set(atype.tools) | ({"task_result"} if "task" in atype.tools else set())
+            if "bash" in atype.tools:  # `bash` tells the model to read a background job with bash_output
+                allowed |= {"bash_output", "bash_kill"}
             for name in list(loop.tools.names()):
                 if name not in allowed and name != "exit_plan":
                     loop.tools._tools.pop(name, None)  # noqa: SLF001
