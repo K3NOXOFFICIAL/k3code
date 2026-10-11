@@ -225,6 +225,7 @@ async def test_goal_automations_do_not_leak_sessions_or_netwatch_tasks(tmp_path,
     from k3code.automation.server_runner import KEEP_FINISHED_RUNS, ServerRunner
 
     server, provider = make_server(tmp_path, monkeypatch, ["goal reply"])
+    server.config.goal.persist = False  # the fake judge never reads "goal reply": a persistent goal would keep going
     runner = ServerRunner(server)
     async with asyncio.timeout(60):  # a leak used to hang the shutdown below
         for _ in range(KEEP_FINISHED_RUNS + 6):

@@ -22,7 +22,8 @@ from k3code.setup.state import env_file_path, read_env_file, set_env_var
 if TYPE_CHECKING:
     from k3code.bundle import SensitiveItem
 
-_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")  # use fullmatch: "$" also matches before a trailing newline
+_PROVIDER_NAME = re.compile(r"[\w.\-]+")
 TIERS = ("main", "strong", "cheap", "fast")
 PERMISSION_MODES = ["ask", "auto-edit", "yolo"]
 USES = ["coding", "ops", "research", "mixed"]
@@ -56,6 +57,17 @@ class Ctx:
 
     def say(self, text: str = "") -> None:
         self.p.say(text)
+
+    def existing(self) -> dict[str, Any]:
+        """The user config as it is on disk now ({} when absent or unreadable). A re-run of a step starts from these
+        values, so an answer left out (an answers file without the key, Enter in the terminal) keeps what is set."""
+        from k3code import confio
+        from k3code.paths import user_config_path
+
+        try:
+            return confio.read_yaml(user_config_path())
+        except confio.ConfigError:
+            return {}
 
 
 def themes() -> list[str]:
@@ -197,15 +209,22 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
                 )
             if not os.environ.get(spec["api_key_env"]) and not read_env_file().get(spec["api_key_env"]):
                 c.say(f"  NOTE: {spec['api_key_env']} is not set yet. Export it, or add it to {env_file_path()}.")
+    if spec.get("name") is not None and not _PROVIDER_NAME.fullmatch(str(spec["name"])):
+        raise ValueError(f"answers: provider name {spec['name']!r} may only use letters, digits, _ . and -")
     if spec.get("preset") == "claude-cli" or spec.get("kind") == "claude-cli":  # an answers file can name it too
-        return {"name": spec.get("name") or "claude-cli", "kind": "claude-cli"}
+        return {"name": str(spec.get("name") or "claude-cli"), "kind": "claude-cli"}
     base = probe.PRESETS.get(spec.get("preset", ""), {})
     entry = {
-        "name": spec.get("name") or spec.get("preset") or f"provider{idx + 1}",
+        "name": str(spec.get("name") or spec.get("preset") or f"provider{idx + 1}"),
         "kind": spec.get("kind") or base.get("kind", "openai"),
         "base_url": spec.get("base_url") or base.get("base_url", ""),
-        "api_key_env": spec.get("api_key_env") or base.get("api_key_env", "K3CODE_API_KEY"),
+        "api_key_env": str(spec.get("api_key_env") or base.get("api_key_env", "K3CODE_API_KEY")),
     }
+    # from an answers file these reach the env file (the variable) and the config: no line breaks, no odd names
+    if not _ENV_NAME.fullmatch(entry["api_key_env"]):
+        raise ValueError(
+            f"answers: provider {entry['name']!r}: api_key_env {entry['api_key_env']!r} is not a variable name"
+        )
     if spec.get("preset") == "omniroute":
         _GATEWAYS.add(entry["name"])
     key = spec.get("api_key")
@@ -219,11 +238,15 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
 def step_providers(c: Ctx) -> dict[str, Any]:
     labels = ["primary", "secondary", "tertiary"]
     specs = c.p.raw("providers.entries")
+    if specs is not None and not (isinstance(specs, list) and all(isinstance(x, dict) for x in specs)):
+        raise ValueError(
+            "answers: providers.entries must be a list of mappings (name, preset, base_url, api_key_env...)"
+        )
     entries: list[dict[str, Any]] = []
-    for i, label in enumerate(labels):
+    # an answers file names every provider it lists (the loop used to stop at three and drop the rest unseen)
+    for i in range(len(specs) if specs is not None else len(labels)):
+        label = labels[i] if i < len(labels) else f"provider {i + 1}"
         if specs is not None:
-            if i >= len(specs):
-                break
             e = _entry_from(c, i, label, dict(specs[i]))
         else:
             e = _entry_from(c, i, label, None)
@@ -331,7 +354,13 @@ def _context_windows(c: Ctx, model_ids: list[str]) -> dict[str, int]:
 
 def step_permissions(c: Ctx) -> dict[str, Any]:
     default = c.data.get("usage", {}).get("permission_mode", "ask")
-    mode = c.p.select("permissions.mode", "Default permission mode", PERMISSION_MODES, default)
+    choices = list(PERMISSION_MODES)
+    current = c.existing().get("permission_mode")
+    if isinstance(current, str) and current in ("ask", "auto-edit", "plan", "auto", "yolo"):
+        default = current  # a re-run keeps the mode that is set (plan and auto are not offered, but they are kept)
+        if current not in choices:
+            choices.append(current)
+    mode = c.p.select("permissions.mode", "Default permission mode", choices, default)
     c.say("Hardline denies (never allowed, even in yolo):")
     for name in HARDLINE_NAMES:
         c.say(f"  - {name}")
@@ -343,6 +372,14 @@ def step_permissions(c: Ctx) -> dict[str, Any]:
         ):
             extra.append(c.p.text("permissions.rx", "Regex"))
     return {"mode": mode, "extra_hardline": [str(x) for x in extra]}
+
+
+def _url_answer(c: Ctx, key: str, label: str, current: str) -> str:
+    """A URL setting: "" clears it. In the terminal Enter keeps ``current`` and ``-`` clears; in an answers file a
+    missing key keeps it and an explicit ``""`` clears."""
+    hint = f"{label} (Enter keeps the current one, - removes it)" if current else f"{label} (blank = none)"
+    value = c.p.text(key, hint, current).strip()
+    return "" if value == "-" else value
 
 
 def step_integrations(c: Ctx) -> dict[str, Any]:
@@ -361,14 +398,18 @@ def step_integrations(c: Ctx) -> dict[str, Any]:
             parts = s["command"].split()
             s["command"], s["args"] = parts[0], parts[1:]
         out["mcp"][name] = s
-    out["mem0_url"] = c.p.text("integrations.mem0_url", "mem0 URL (blank = none)", "")
+    mem0 = c.existing().get("mem0")
+    have_mem0 = str(mem0.get("url") or "") if isinstance(mem0, dict) else ""
+    out["mem0_url"] = _url_answer(c, "integrations.mem0_url", "mem0 URL", have_mem0)
     roots = c.p.raw("integrations.skills_roots")
     out["skills_roots"] = (
         roots
         if roots is not None
         else _csv(c.p.text("integrations.skills_roots", "Skills roots (comma separated)", ""))
     )
-    out["searxng_url"] = c.p.text("integrations.searxng_url", "SearXNG URL (blank = none)", "")
+    research = c.existing().get("research")
+    have_searx = str(research.get("searxng_url") or "") if isinstance(research, dict) else ""
+    out["searxng_url"] = _url_answer(c, "integrations.searxng_url", "SearXNG URL", have_searx)
     if c.do_probe:
         for label, url in (("mem0", out["mem0_url"]), ("searxng", out["searxng_url"])):
             if url and c.p.confirm(f"integrations.test_{label}", f"Test {label} now?", True):
@@ -379,7 +420,12 @@ def step_integrations(c: Ctx) -> dict[str, Any]:
 
 def step_theme(c: Ctx) -> dict[str, Any]:
     names = themes()
-    theme = c.p.select("theme.theme", "Default theme", names, names[0])
+    have = c.existing()
+    display = have.get("display") if isinstance(have.get("display"), dict) else {}
+    panes = have.get("panes") if isinstance(have.get("panes"), dict) else {}
+    theme = c.p.select(
+        "theme.theme", "Default theme", names, display.get("theme") if display.get("theme") in names else names[0]
+    )
     if c.p.interactive:
         c.say(
             f"Preview ({theme}): \x1b[1mbold\x1b[0m \x1b[36mcyan\x1b[0m \x1b[32mgreen\x1b[0m "
@@ -387,8 +433,13 @@ def step_theme(c: Ctx) -> dict[str, Any]:
         )
     return {
         "theme": theme,
-        "focus_mode": c.p.confirm("theme.focus_mode", "Focus mode on by default?", False),
-        "keymap": c.p.select("theme.keymap", "Keymap style for k3 panes", ["k3", "tuios"], "k3"),
+        "focus_mode": c.p.confirm("theme.focus_mode", "Focus mode on by default?", display.get("focus_mode") is True),
+        "keymap": c.p.select(
+            "theme.keymap",
+            "Keymap style for k3 panes",
+            ["k3", "tuios"],
+            panes["keymap"] if panes.get("keymap") in ("k3", "tuios") else "k3",
+        ),
     }
 
 
@@ -396,8 +447,12 @@ def step_service(c: Ctx) -> dict[str, Any]:
     want = c.p.confirm("service.install", "Install the 24/7 systemd user service now?", False)
     out: dict[str, Any] = {"install": want}
     if want:
-        for line in service.install():
-            c.say("  " + line)
+        try:
+            for line in service.install():
+                c.say("  " + line)
+        except service.ServiceError as e:  # a failed install is a failed step, not a crashed wizard
+            c.say(f"  FAILED: the service was not installed: {e}")
+            out["error"] = str(e)
     c.say("To keep it running after logout: `loginctl enable-linger $USER` (needs sudo; run it yourself).")
     return out
 
@@ -493,8 +548,40 @@ def write_user_md(data: dict[str, Any]) -> Path:
     return mem
 
 
+def _deep_merge(old: Any, new: Any) -> Any:
+    """``new`` over ``old``: mappings merge key by key (what ``new`` does not name stays), anything else is replaced."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        return {**old, **{k: _deep_merge(old[k], v) if k in old else v for k, v in new.items()}}
+    return new
+
+
+def _merge_step_config(existing: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    """The existing config with the keys a step collected laid over it. Sections are merged, not replaced: a re-run of
+    `--step theme` keeps the TUI keys under ``display``, `--step usage` the other ``autonomy`` keys, `--step
+    integrations` the other MCP servers. ``providers`` is the chain the steps collected and replaces the old list.
+    The step never touches permission rules, and ``permissions.hardline`` only grows (a safety list a re-run could
+    shrink would loosen it)."""
+    merged = dict(existing)
+    for key, value in cfg.items():
+        old = existing.get(key)
+        if key == "providers" or not isinstance(old, dict) or not isinstance(value, dict):
+            merged[key] = value
+        elif key == "mcp" and isinstance(value.get("servers"), dict):  # a re-specified server replaces its old entry
+            merged[key] = {**old, "servers": {**(old.get("servers") or {}), **value["servers"]}}
+        elif key == "permissions" and "hardline" in value:
+            hardline = [
+                *(old.get("hardline") or []),
+                *(h for h in value["hardline"] if h not in (old.get("hardline") or [])),
+            ]
+            merged[key] = {**old, "hardline": hardline}
+        else:
+            merged[key] = _deep_merge(old, value)
+    return merged
+
+
 def write_config(data: dict[str, Any], only: str | None = None) -> Path:
-    """Write ``config.yaml`` from the step data. With ``only``, change just the keys that step owns."""
+    """Write ``config.yaml`` from the step data. With ``only``, change just the keys that step owns, and within them
+    just what the step collected: nothing is deleted (a section the step does not name stays as it is)."""
     from k3code import confio
     from k3code.paths import user_config_path
 
@@ -507,13 +594,9 @@ def write_config(data: dict[str, Any], only: str | None = None) -> Path:
         if "providers" in cfg and "tiers" not in data:  # keep the models already configured
             old = {p["name"]: p.get("models", {}) for p in existing.get("providers", [])}
             cfg["providers"] = [{**p, "models": old.get(p["name"], {})} for p in cfg["providers"]]
-        # a key owned by the step but now empty (e.g. all MCP servers removed) is cleared
-        merged = {k: v for k, v in existing.items() if k not in keys or k in cfg}
-    else:
-        if not cfg["providers"]:  # e.g. imported bundle already carries them
-            cfg.pop("providers")
-        merged = existing
-    merged = {**merged, **cfg}
+    elif not cfg["providers"]:  # e.g. imported bundle already carries them
+        cfg.pop("providers")
+    merged = _merge_step_config(existing, cfg)
     windows = (data.get("tiers") or {}).get("context_windows")
     if windows and only in (None, "tiers"):  # models.<id>.context_window: other keys of the id and other ids survive
         models = {k: dict(v) if isinstance(v, dict) else {} for k, v in dict(existing.get("models") or {}).items()}
@@ -521,16 +604,24 @@ def write_config(data: dict[str, Any], only: str | None = None) -> Path:
             models[model_id] = {**models.get(model_id, {}), "context_window": int(n)}
         merged["models"] = models
     if only in (None, "integrations") and "integrations" in data:
-        # the integrations answer owns searxng_url only: the user's other research.* keys (max_subquestions, ...)
-        # survive a re-run, and a blank answer clears the URL. The legacy top-level searxng key is migrated away.
-        research = {k: v for k, v in dict(existing.get("research") or {}).items() if k != "searxng_url"}
-        if url := (data.get("integrations") or {}).get("searxng_url"):
+        # The integrations answer owns searxng_url and mem0.url only: the user's other research.* and mem0.* keys
+        # survive a re-run, and a blank answer clears the URL (the step offers the current value, so a blank one is
+        # a deliberate removal). The legacy top-level searxng key is migrated away.
+        integ = data.get("integrations") or {}
+        research = {k: v for k, v in dict(merged.get("research") or {}).items() if k != "searxng_url"}
+        if url := integ.get("searxng_url"):
             research["searxng_url"] = url
         merged.pop("searxng", None)
         if research:
             merged["research"] = research
         else:
             merged.pop("research", None)
+        if "mem0_url" in integ and not integ["mem0_url"] and isinstance(merged.get("mem0"), dict):
+            mem0 = {k: v for k, v in merged["mem0"].items() if k != "url"}
+            if mem0:
+                merged["mem0"] = mem0
+            else:
+                merged.pop("mem0")
     confio.validate(merged)
     confio.write_yaml(path, merged)
     if only in (None, "providers"):
@@ -567,7 +658,7 @@ def step_secrets(c: Ctx) -> dict[str, Any]:
     asked: list[str] = []
     for prov in confio.read_yaml(user_config_path()).get("providers", []):
         name = prov.get("api_key_env", "")
-        if not name or name in have or os.environ.get(name):
+        if not name or not _ENV_NAME.fullmatch(str(name)) or name in have or os.environ.get(name):
             continue
         value = c.p.raw(f"secrets.{name}")
         if value is None:

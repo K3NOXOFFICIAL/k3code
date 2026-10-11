@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from k3code.automation.cronexpr import ScheduleError, parse_schedule
@@ -16,8 +17,12 @@ USAGE = (
 )
 
 
+_INTERVAL_LIKE = re.compile(r"\d+(?:\.\d+)?[smhdw]", re.I)
+
+
 def split_interval(args: list[str]) -> tuple[str | None, list[str]]:
-    """Peel a leading interval (``5m`` / ``daily 09:00`` / ``every 2h``) off the arguments."""
+    """Peel a leading interval (``5m`` / ``daily 09:00`` / ``every 2h``) off the arguments. A word that is shaped like
+    an interval but is not one (``0m``) raises ScheduleError instead of becoming the start of the prompt."""
     if len(args) >= 2 and args[0].lower() in ("daily", "every"):
         try:
             parse_schedule(" ".join(args[:2]))
@@ -29,7 +34,8 @@ def split_interval(args: list[str]) -> tuple[str | None, list[str]]:
             parse_schedule(args[0])
             return args[0], args[1:]
         except ScheduleError:
-            pass
+            if _INTERVAL_LIKE.fullmatch(args[0]):
+                raise
     return None, args
 
 
@@ -41,6 +47,8 @@ class LoopCommand(CommandDef):
         eng = await ctx.ensure_automation()
         args = split_args(arg)
         sub = args[0] if args else "status"
+        if sub in ("status", "list", "stop") and len(args) > (2 if sub == "stop" else 1):
+            return reply(f"Usage: {USAGE}")  # not a prompt that happens to begin with "status", "list" or "stop"
         if sub in ("status", "list") and len(args) <= 1:
             rows = (
                 eng.loops.list(active_only=(sub == "status"))
@@ -64,7 +72,12 @@ class LoopCommand(CommandDef):
             n_max = int(max_ticks) if max_ticks else DEFAULT_MAX_TICKS
         except ValueError:
             return reply("--times and --max-ticks need whole numbers.")
-        interval, rest = split_interval(args)
+        if (n_times is not None and n_times < 1) or n_max < 1:
+            return reply("--times and --max-ticks must be 1 or more.")
+        try:
+            interval, rest = split_interval(args)
+        except ScheduleError as e:
+            return reply(f"/loop: bad interval {args[0]!r}: {e}")
         prompt = " ".join(rest).strip()
         if not prompt:
             return reply(f"Usage: {USAGE}")

@@ -1,14 +1,12 @@
 """``/model chain``: show the provider/model fallback chain, and edit it in the user config.
 
 Edits go validate → backup → write: the new provider list is validated by building ``Settings`` from it,
-the existing ``config.yaml`` is copied to ``config.yaml.bak.<ts>``, then the new file is written.
-(YAML comments in the user config are not preserved by the rewrite; the backup keeps them.)
+the existing ``config.yaml`` is copied to ``config.yaml.bak-<ts>`` (``/config rollback`` restores it), then the new file
+is written. (YAML comments in the user config are not preserved by the rewrite; the backup keeps them.)
 """
 
 from __future__ import annotations
 
-import shutil
-import time
 from pathlib import Path
 from typing import Any
 
@@ -87,7 +85,7 @@ def apply_edit(providers: list[dict[str, Any]], op: str, args: list[str]) -> lis
         else:
             del out[i]
     elif op == "move":
-        if len(args) != 2 or not args[1].isdigit():
+        if len(args) != 2 or not (args[1].isascii() and args[1].isdigit()):  # '²'.isdigit() is True; int('²') fails
             raise ChainEditError("usage: /model chain move <provider> <position>  (1 = first)")
         entry = out.pop(_find(out, args[0]))
         out.insert(max(0, min(int(args[1]) - 1, len(out))), entry)
@@ -99,7 +97,10 @@ def apply_edit(providers: list[dict[str, Any]], op: str, args: list[str]) -> lis
 def edit_config(op: str, args: list[str], home: Path | None = None) -> str:
     """Validate, back up, then write; returns the backup path ('' when there was no file)."""
     path = config_path(home)
-    data: dict[str, Any] = (yaml.safe_load(path.read_text()) or {}) if path.is_file() else {}
+    try:
+        data = confio.read_yaml(path)
+    except confio.ConfigError as e:
+        raise ChainEditError(str(e)) from e
     providers = data.get("providers")
     if not providers:
         raise ChainEditError(f"no providers in {path}; the chain is defined elsewhere (project config?)")
@@ -111,15 +112,14 @@ def edit_config(op: str, args: list[str], home: Path | None = None) -> str:
         Settings(providers=[ProviderEntry(**{**p, "api_key": ""}) for p in new])
     except Exception as e:  # noqa: BLE001
         raise ChainEditError(f"invalid chain: {e}") from e
-    # 2. backup  3. write
-    backup = ""
-    if path.is_file():
-        backup = f"{path}.bak.{time.strftime('%Y%m%d-%H%M%S')}"
-        shutil.copy2(path, backup)
+    # 2. backup  3. write: the same helper /config uses, so its rollback finds this backup (a per-second name of its own
+    # made two edits in one second overwrite each other's backup and left /config rollback with an older one)
     data["providers"] = new
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, sort_keys=False))
-    return backup
+    try:
+        backup = confio.write_yaml(path, data)
+    except OSError as e:
+        raise ChainEditError(f"cannot write {path}: {e}") from e
+    return str(backup or "")
 
 
 def set_default_model(key: str, home: Path | None = None) -> tuple[bool, str]:

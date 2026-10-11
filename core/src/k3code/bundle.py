@@ -7,6 +7,7 @@ import json
 import re
 import tarfile
 import time
+import zlib
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -135,7 +136,17 @@ class Bundle:
 
 
 def read_bundle(path: Path) -> Bundle:
-    path = Path(path)
+    """Read a bundle. Anything wrong with the file (truncated gzip, a manifest that is not UTF-8 or not an object,
+    settings that are not YAML) is a BundleError: the importers catch that and nothing else."""
+    try:
+        return _read_bundle(Path(path))
+    except BundleError:
+        raise
+    except (tarfile.TarError, EOFError, OSError, zlib.error, ValueError, yaml.YAMLError) as e:
+        raise BundleError(f"not a valid .k3bundle: {e}") from e
+
+
+def _read_bundle(path: Path) -> Bundle:
     if not path.is_file():
         raise BundleError(f"no such bundle: {path}")
     try:
@@ -159,12 +170,17 @@ def read_bundle(path: Path) -> Bundle:
             manifest = json.loads(load("manifest.json"))
         except json.JSONDecodeError as e:
             raise BundleError(f"bad manifest.json: {e}") from e
+        if not isinstance(manifest, dict):
+            raise BundleError("bad manifest.json: not an object")
         if manifest.get("version") != BUNDLE_VERSION:
             raise BundleError(f"unsupported bundle version: {manifest.get('version')}")
         out = Bundle(manifest)
         for name in members:  # only whitelisted names are ever read; nothing is extracted to disk
             if name in _SETTINGS_FILES:
-                data = yaml.safe_load(load(name)) or {}
+                try:
+                    data = yaml.safe_load(load(name)) or {}
+                except yaml.YAMLError as e:
+                    raise BundleError(f"bad {name}: not valid YAML") from e
                 if isinstance(data, dict):
                     out.settings[_SETTINGS_FILES[name]] = data
             elif _SESSION_RE.match(name):
@@ -340,6 +356,8 @@ class ImportReport:
     untrusted_project: str | None = None
     #: sensitive user settings left out (no explicit yes for each, see sensitive_items)
     skipped: list[str] = field(default_factory=list)
+    #: sessions left out because their record is not a session (original id: why)
+    invalid_sessions: dict[str, str] = field(default_factory=dict)
 
     def describe(self) -> str:
         lines = []
@@ -350,6 +368,8 @@ class ImportReport:
                 f"warning: skipped {key} from the bundle (runs code, approves tools or sends keys; accept it item by "
                 "item in an interactive import, or pass --trust-bundle)"
             )
+        for sid, why in self.invalid_sessions.items():
+            lines.append(f"warning: skipped session {sid} from the bundle: {why}")
         for b in self.backups:
             lines.append(f"backup: {b}")
         for old, new in self.sessions.items():
@@ -367,6 +387,41 @@ def _usable_cwd(value: Any) -> bool:
         return bool(value) and path.is_absolute() and path.is_dir() and path != Path(path.anchor)
     except (OSError, ValueError):
         return False
+
+
+def _stored_from(obj: dict[str, Any]) -> tuple[StoredSession | None, str]:
+    """The session a bundle record describes, or ``(None, why)`` when it cannot be one. Text fields must be text and
+    ``messages`` a list of well-formed message objects (rejected otherwise); ``usage``, ``meta`` and the timestamps of
+    the wrong type are dropped (an empty value is used)."""
+    for key in ("title", "model", "provider", "cwd"):
+        if key in obj and not isinstance(obj[key], str):
+            return None, f"{key} is not text"
+    messages = obj.get("messages", [])
+    if not isinstance(messages, list):
+        return None, "messages is not a list"
+    for m in messages:
+        calls = m.get("tool_calls") if isinstance(m, dict) else None
+        if (
+            not isinstance(m, dict)
+            or not isinstance(m.get("role"), str)
+            or not (calls is None or (isinstance(calls, list) and all(isinstance(c, dict) for c in calls)))
+        ):
+            return None, "messages holds an entry that is not a message"
+    sess = StoredSession(
+        session_id=str(obj["session_id"]),
+        title=obj.get("title", ""),
+        model=obj.get("model", ""),
+        provider=obj.get("provider", ""),
+        cwd=obj.get("cwd", ""),
+        messages=messages,
+        usage=obj["usage"] if isinstance(obj.get("usage"), dict) else {},
+        meta=obj["meta"] if isinstance(obj.get("meta"), dict) else {},
+    )
+    for key in ("created_at", "updated_at"):
+        value = obj.get(key)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            setattr(sess, key, float(value))
+    return sess, ""
 
 
 def apply_bundle(
@@ -401,15 +456,11 @@ def apply_bundle(
                 rep.backups.append(str(bak))
     if sessions:
         for obj in bundle.sessions:
-            sess = StoredSession(
-                **{k: obj[k] for k in StoredSession.__dataclass_fields__ if k in obj and k != "session_id"},
-                session_id=str(obj["session_id"]),
-            )
-            sess.meta = {
-                k: v
-                for k, v in (sess.meta if isinstance(sess.meta, dict) else {}).items()
-                if k not in _UNTRUSTED_META and not k.startswith("origin")
-            }
+            sess, why = _stored_from(obj)
+            if sess is None:  # one bad record broke session.list / session.resume for the whole store
+                rep.invalid_sessions[str(obj.get("session_id"))] = why
+                continue
+            sess.meta = {k: v for k, v in sess.meta.items() if k not in _UNTRUSTED_META and not k.startswith("origin")}
             if not _usable_cwd(sess.cwd):  # another machine's path, or "/": the session works where it is imported
                 sess.cwd = str(cwd)
             old = sess.session_id

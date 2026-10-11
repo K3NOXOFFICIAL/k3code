@@ -409,6 +409,24 @@ async def tail_subagent(subagent_id: str, sock: Path | None = None, *, interval:
             writer.close()
 
 
+def _needs_a_session(command: str) -> str | None:
+    """Why ``command`` cannot run in the throwaway session ``slash_via_daemon`` deletes afterwards, else None. A loop
+    ticks into its session and a goal is stored on it: both were reported as set, then gone (the loop's rows stayed
+    active and failed on every tick)."""
+    name, _, rest = command.strip().lstrip("/").partition(" ")
+    sub = rest.split()[:1]
+    if name == "loop" and sub and sub[0] not in ("status", "list", "stop"):
+        what = "loop"
+    elif name == "goal" and sub and sub[0] not in ("status", "pause", "resume", "clear"):
+        what = "goal"
+    else:
+        return None
+    return (
+        f"error: /{name} needs a session that stays, and `k3code slash` runs in a throwaway one that is deleted "
+        f"afterwards, so the {what} would not outlive this call. Run it in the TUI (`k3code attach` / `k3code agents`)."
+    )
+
+
 async def slash_via_daemon(command: str, *, cwd: str, sock: Path | None = None, session_id: str | None = None) -> str:
     """Run one slash command (``/automations list`` …) against the running daemon and return its output text.
 
@@ -418,6 +436,8 @@ async def slash_via_daemon(command: str, *, cwd: str, sock: Path | None = None, 
     """
     from k3code.gateway.auth import AuthFailed, authenticate
 
+    if session_id is None and (why := _needs_a_session(command)):
+        return why
     sock = sock or socket_path()
     reader, writer = await asyncio.open_unix_connection(str(sock), limit=1 << 26)  # a long output is one line
     try:

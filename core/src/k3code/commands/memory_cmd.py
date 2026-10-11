@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import httpx
 
 from k3code.commands import CommandDef
-from k3code.commands._util import pop_flag, reply, session_cwd, split_args
+from k3code.commands._util import reply, session_cwd, split_args
+from k3code.config import env_value
 from k3code.memory import append_memory, project_memory_path, user_memory_path
 
 
 async def mem0_search(cfg: Any, query: str, *, client: httpx.AsyncClient | None = None) -> list[str]:
-    key = os.environ.get(cfg.mem0.api_key_env, "") if cfg.mem0.api_key_env else ""
+    key = env_value(cfg.mem0.api_key_env) if cfg.mem0.api_key_env else ""  # the environment, else the setup env file
     headers = {"Authorization": f"Token {key}", "X-API-Key": key} if key else {}
     body: dict[str, Any] = {"query": query, "limit": 8}
     if cfg.mem0.user_id:
@@ -40,7 +40,17 @@ class MemoryCommand(CommandDef):
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         args = split_args(arg)
-        user = pop_flag(args, "--user")
+        # --user is a flag first or last (or right after the sub-command); anywhere else it is part of the text
+        user = False
+        if args and args[0] == "--user":
+            user = True
+            args = args[1:]
+        elif len(args) > 1 and args[-1] == "--user":
+            user = True
+            args = args[:-1]
+        elif len(args) > 2 and args[1] == "--user" and args[0] == "add":
+            user = True
+            del args[1]
         cwd = session_cwd(ctx, session_id)
         proj = project_memory_path(cwd)
         usr = user_memory_path()

@@ -7,6 +7,22 @@ from typing import Any
 
 import yaml
 
+_TRUE = frozenset({"1", "true", "yes", "y", "on"})
+_FALSE = frozenset({"0", "false", "no", "n", "off"})
+
+
+def parse_bool(key: str, value: Any) -> bool:
+    """An answer as a yes/no: a YAML bool, 0/1, or the words yes/no, true/false, y/n, on/off (any case). ``bool("no")``
+    was True, so ``service: {install: "no"}`` installed the service. Anything else is an error, not a guess."""
+    if isinstance(value, bool):
+        return value
+    word = str(value).strip().lower()
+    if word in _TRUE:
+        return True
+    if word in _FALSE:
+        return False
+    raise ValueError(f"answers: {key} must be yes or no (true/false, on/off, 1/0), got {value!r}")
+
 
 class Prompter:
     interactive = False
@@ -36,7 +52,14 @@ class AnswerPrompter(Prompter):
 
     @classmethod
     def from_file(cls, path: Path) -> AnswerPrompter:
-        return cls(yaml.safe_load(path.read_text()) or {})
+        """ValueError (the CLI shows it) for an unreadable file, bad YAML or a top level that is not a mapping."""
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, UnicodeDecodeError, yaml.YAMLError) as e:
+            raise ValueError(f"{path}: cannot read the answers file ({e.__class__.__name__})") from e
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: the answers file must be a mapping of step names, not a {type(data).__name__}")
+        return cls(data)
 
     def raw(self, key: str, default: Any = None) -> Any:
         cur: Any = self.answers
@@ -55,7 +78,8 @@ class AnswerPrompter(Prompter):
         return "" if v is None else str(v)
 
     def confirm(self, key: str, message: str, default: bool = True) -> bool:
-        return bool(self.raw(key, default))
+        v = self.raw(key, default)
+        return default if v is None else parse_bool(key, v)
 
 
 class InteractivePrompter(Prompter):

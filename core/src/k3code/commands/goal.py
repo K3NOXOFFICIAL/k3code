@@ -28,6 +28,8 @@ class GoalCommand(CommandDef):
             ctx.emit_goal(live)
             return reply("Goal paused." if mgr.state else "No goal to pause.")
         if sub == "clear":
+            if mgr.state is None:
+                return reply("No goal to clear.")
             mgr.clear()
             ctx.emit_goal(live)
             return reply("Goal cleared.")

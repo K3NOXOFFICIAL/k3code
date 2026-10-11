@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -61,8 +62,18 @@ def read_env_file(path: Path | None = None) -> dict[str, str]:
     return out
 
 
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
 def set_env_var(name: str, value: str, path: Path | None = None) -> Path:
-    """Add/replace ``name=value`` in the env file, keeping other lines; file is always mode 0600."""
+    """Add/replace ``name=value`` in the env file, keeping other lines; file is always mode 0600.
+
+    A name that is not a variable name, or a value with a line break in it, would write a second line of the
+    caller's choosing into the file: refused (ValueError)."""
+    if not _ENV_NAME.fullmatch(name):  # fullmatch: "$" would let a trailing newline through
+        raise ValueError(f"{name!r} is not an environment variable name (letters, digits and _; no digit first)")
+    if any(c in value for c in "\r\n\0"):
+        raise ValueError(f"the value for {name} contains a line break; it would corrupt the env file")
     path = path or env_file_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = path.read_text().splitlines() if path.is_file() else []

@@ -22,6 +22,8 @@ class DaemonCommand(CommandDef):
         if arg == "resume":
             ctx.resume_daemon()
             return {"type": "message", "message": "Background work resumed."}
+        if arg:
+            return {"type": "message", "message": f"Unknown argument: {arg}. Usage: /daemon [pause|resume]"}
         live = len(ctx.live)
         if ctx.halted:
             state = f"HALTED ({ctx.halt.reason})"

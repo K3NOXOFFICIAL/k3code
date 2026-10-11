@@ -111,4 +111,7 @@ class FocusCommand(CommandDef):
         else:
             return reply("usage: /focus [on|off|status]")
         ctx.config.display.focus_mode = nxt
+        from k3code.gateway import tui_display
+
+        tui_display._persist("display.focus_mode", nxt)  # a look-and-feel choice is saved (a failure is only logged)
         return reply(f"focus view {'enabled' if nxt else 'disabled'}", focus=nxt)

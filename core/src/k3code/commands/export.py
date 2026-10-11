@@ -24,6 +24,8 @@ def run_export(
     session_only: bool = False,
     config: Any = None,
 ) -> tuple[Path, dict[str, Any]]:
+    if settings_only and session_only:
+        raise BundleError("--settings-only and --session-only exclude each other (together they export nothing)")
     if all_sessions:
         ids = [s.session_id for s in store.list(limit=100_000)]
     elif session:

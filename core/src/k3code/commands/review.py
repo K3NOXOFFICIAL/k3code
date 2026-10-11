@@ -36,7 +36,15 @@ async def collect_target(cwd: Path, target: str) -> tuple[str, str]:
     """``(description, text)`` to review; raises ValueError with a user-facing message."""
     rc, out = await _git(cwd, "rev-parse", "--is-inside-work-tree")
     in_repo = rc == 0 and out.strip() == "true"
-    path = (cwd / target).expanduser() if target else None
+    if target.startswith("-"):  # git would take it for an option: `--output=FILE..x` made git create FILE
+        raise ValueError(f"Not a review target: {target!r} (a target cannot start with '-')")
+    path: Path | None = None
+    if target:
+        try:
+            path = Path(target).expanduser()  # `~/note.py`: before the join with the session directory
+        except RuntimeError:  # `~nouser/x`
+            raise ValueError(f"Not a review target: {target!r} (no such home directory)") from None
+        path = path if path.is_absolute() else cwd / path
     if target in ("", "all"):
         if not in_repo:
             raise ValueError("Not a git repository; give /review a file or directory path.")
@@ -59,7 +67,7 @@ async def collect_target(cwd: Path, target: str) -> tuple[str, str]:
     elif ".." in target and not (path and path.exists()):
         if not in_repo:
             raise ValueError("Not a git repository.")
-        rc, text = await _git(cwd, "diff", target)
+        rc, text = await _git(cwd, "diff", target, "--")  # "--": what precedes it is a revision, never a path
         if rc != 0:
             raise ValueError(f"git diff {target} failed: {text.strip()[:200]}")
         desc = f"diff {target}"

@@ -591,15 +591,20 @@ def main(
     import asyncio
 
     from k3code import trust
-    from k3code.config import load_config
+    from k3code.config import ConfigError, load_config
     from k3code.permissions import PermissionMode
 
+    if prompt is not None and not prompt.strip():  # `-p ""` started the REPL, `-p "  "` ran a turn with nothing in it
+        raise click.UsageError("-p needs a prompt (it is empty)")
     # Load config. A project config is applied only once the user trusted this exact file. Interactive opens are
     # asked here, in this process (the TUI's gateway is a piped child and cannot ask); headless runs never ask.
     project_dir = config_dir or Path.cwd()
     if not prompt and _is_interactive():
         _offer_project_trust(project_dir)
-    config = load_config(project_dir=project_dir)
+    try:
+        config = load_config(project_dir=project_dir)
+    except ConfigError as e:
+        raise click.ClickException(str(e)) from e
     if trust.decision(project_dir) in (trust.UNDECIDED, trust.DECLINED):
         click.echo(f"k3code: ignoring {trust.subject(project_dir)} (not trusted; `k3code trust` applies it)", err=True)
     # `-p "/project"` runs the command, as the TUI would, before the provider check: no model is involved
@@ -693,10 +698,15 @@ def _run_gateway() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         force=True,  # the import-time basicConfig above already installed a handler
     )
+    from k3code.config import ConfigError
     from k3code.gateway.server import GatewayServer
 
     async def _serve() -> None:
-        server = GatewayServer()
+        try:
+            server = GatewayServer()
+        except ConfigError as e:  # the TUI shows the gateway's stderr: a message, not a traceback
+            click.echo(f"k3code: {e}", err=True)
+            raise SystemExit(78) from e  # EX_CONFIG
         try:
             await server.serve()
         finally:
@@ -732,9 +742,12 @@ def _launch_tui(
         logger.warning("TUI not available (need node + tui/dist/entry.js); falling back to REPL")
         import asyncio
 
-        from k3code.config import load_config
+        from k3code.config import ConfigError, load_config
 
-        config = load_config(project_dir=project_dir or Path.cwd())
+        try:
+            config = load_config(project_dir=project_dir or Path.cwd())
+        except ConfigError as e:
+            raise click.ClickException(str(e)) from e
         with contextlib.suppress(KeyboardInterrupt):
             asyncio.run(
                 _run_repl(
@@ -914,6 +927,7 @@ def daemon_cmd() -> None:
     """Run the long-lived host: sessions keep running while no TUI is attached (systemd: Type=notify)."""
     import asyncio
 
+    from k3code.config import ConfigError
     from k3code.daemon import DaemonAlreadyRunning, run_daemon
 
     logging.basicConfig(
@@ -928,6 +942,9 @@ def daemon_cmd() -> None:
     except DaemonAlreadyRunning as e:
         click.echo(f"k3code daemon: {e}. Use `k3code attach`, or `k3code service restart` to restart it.", err=True)
         raise SystemExit(75) from e  # EX_TEMPFAIL
+    except ConfigError as e:  # systemd shows this line in the journal instead of a traceback
+        click.echo(f"k3code daemon: {e}", err=True)
+        raise SystemExit(78) from e  # EX_CONFIG
 
 
 @cli.group("service")
@@ -970,21 +987,20 @@ def doctor_cmd(as_json: bool, no_probe: bool, install_subset: bool) -> None:
     import asyncio
 
     from k3code import doctor
-    from k3code.config import load_config
 
     if install_subset:
         checks = doctor.install_subset()
         click.echo(doctor.to_json(checks) if as_json else doctor.format_report(checks))
         return
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    checks = asyncio.run(doctor.run_checks(load_config(project_dir=Path.cwd()), probe=not no_probe))
+    checks = asyncio.run(doctor.run_checks(probe=not no_probe))  # an invalid config is a failed check, not a traceback
     click.echo(doctor.to_json(checks) if as_json else doctor.format_report(checks))
     sys.exit(1 if doctor.summary(checks)[doctor.FAIL] else 0)
 
 
 @cli.command("stats")
 @click.option("--by", type=click.Choice(["day", "session", "turn"]), default="day")
-@click.option("--days", type=int, default=None, help="Only the last N days")
+@click.option("--days", type=click.IntRange(min=1), default=None, help="Only the last N days (1 or more)")
 @click.option("--json", "as_json", is_flag=True)
 def stats_cmd(by: str, days: int | None, as_json: bool) -> None:
     """Usage per day or session from $K3CODE_HOME/usage.db."""
@@ -1061,6 +1077,8 @@ def import_cmd(path: Path, yes: bool, settings_only: bool, session_only: bool, t
     from k3code.gateway.sessions import SessionStore
     from k3code.paths import home
 
+    if settings_only and session_only:
+        raise click.UsageError("--settings-only and --session-only exclude each other")
     try:
         bundle = read_bundle(path)
     except BundleError as e:
@@ -1099,18 +1117,16 @@ def _confirm_item(item: Any) -> bool:
 @click.option("--no-probe", is_flag=True, help="Skip live provider/integration tests")
 def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, restart: bool, no_probe: bool) -> None:
     """Guided, resumable first-run setup."""
+    from k3code import service
     from k3code.setup.prompter import AnswerPrompter, InteractivePrompter
     from k3code.setup.wizard import run_setup
 
-    if non_interactive:
-        if answers is None:
-            raise click.UsageError("--non-interactive needs --answers FILE")
-        p: Any = AnswerPrompter.from_file(answers)
-    else:
-        p = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
+    if non_interactive and answers is None:
+        raise click.UsageError("--non-interactive needs --answers FILE")
     try:
+        p: Any = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
         run_setup(p, only_step=step, restart=restart, do_probe=not no_probe)
-    except ValueError as e:
+    except (ValueError, service.ServiceError) as e:  # a bad answers file or answer, a failed service install
         raise click.ClickException(str(e)) from e
     except (KeyboardInterrupt, EOFError):
         click.echo("\nInterrupted; progress saved. Re-run `k3code setup` to resume.")
@@ -1129,8 +1145,8 @@ def onboard_cmd(answers: Path | None, no_probe: bool) -> None:
 
     if answers is None and not _is_interactive():
         raise click.UsageError("`k3code onboard` needs a terminal; pass --answers FILE to run it without prompts")
-    p: Prompter = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
     try:
+        p: Prompter = AnswerPrompter.from_file(answers) if answers else InteractivePrompter()
         run_onboarding(p, do_probe=not no_probe)
     except ValueError as e:
         raise click.ClickException(str(e)) from e
@@ -1314,9 +1330,13 @@ def trust_cmd(path: Path | None, revoke: bool) -> None:
 @click.option("--project", is_flag=True, help="Edit the project config instead of the user config")
 def config_edit_cmd(project: bool) -> None:
     """Open the user (or project) config in $EDITOR."""
-    from k3code.commands.config_cmd import open_editor, target_path
+    from k3code.commands.config_cmd import edit_config_file, target_path
+    from k3code.confio import ConfigError
 
-    raise SystemExit(open_editor(target_path(Path.cwd(), project)))
+    try:
+        raise SystemExit(edit_config_file(target_path(Path.cwd(), project)))
+    except ConfigError as e:
+        raise click.ClickException(str(e)) from e
 
 
 @cli.command("memory")
@@ -1325,11 +1345,15 @@ def config_edit_cmd(project: bool) -> None:
 def memory_cmd(action: str, user: bool) -> None:
     """List memory files, or open one in $EDITOR."""
     from k3code.commands.config_cmd import open_editor
+    from k3code.confio import ConfigError
     from k3code.memory import project_memory_path, user_memory_path
 
     target = user_memory_path() if user else project_memory_path(Path.cwd())
     if action == "edit":
-        raise SystemExit(open_editor(target))
+        try:
+            raise SystemExit(open_editor(target))
+        except ConfigError as e:
+            raise click.ClickException(str(e)) from e
     for scope, p in (("user", user_memory_path()), ("project", project_memory_path(Path.cwd()))):
         click.echo(f"{scope}: {p}  " + (f"{p.stat().st_size} bytes" if p.is_file() else "(missing)"))
 

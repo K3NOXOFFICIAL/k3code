@@ -133,6 +133,12 @@ def prepare(patch: dict[str, Any], path: Path) -> tuple[dict[str, Any], dict[str
         confio.validate(merged)
     except confio.ConfigError as e:
         raise PatchRejected(f"the patch makes the config invalid: {e}") from e
+    # a plain value the model returned as text ("5") is written as the number Settings makes of it, so the file, the
+    # diff the user confirms and the live config agree
+    settings = Settings(**merged)
+    for key, value in patch.items():
+        if value is not None and not isinstance(value, dict | list) and key in Settings.model_fields:
+            merged[key] = getattr(settings, key)
     return current, merged, diff_text(current, merged)
 
 
@@ -156,9 +162,22 @@ async def run(ctx: Any, session_id: str | None, request: str, path: Path) -> str
     if getattr(ctx, "learning", None) is not None:
         live = ctx.sessions.get(session_id) if session_id else None
         ctx.learning.record("config", live, subject="update-config", choice="apply", detail={"keys": sorted(patch)})
-    for k, v in patch.items():  # live config object picks the change up
-        if hasattr(ctx.config, k) and v is not None and not isinstance(v, dict):
-            setattr(ctx.config, k, v)
-        elif isinstance(v, dict) and isinstance(getattr(ctx.config, k, None), dict):
-            setattr(ctx.config, k, merge_patch(getattr(ctx.config, k), v))
-    return f"Config updated ({path}); backup: {bak or 'none (new file)'}\n{diff}"
+    done = f"Config updated ({path}); backup: {bak or 'none (new file)'}\n{diff}"
+    try:
+        _apply_live(ctx, merged, patch)
+    except Exception as e:  # noqa: BLE001 - the file is written; say that the running config did not follow
+        return f"{done}\nBut the running config could not be updated ({e}); it applies at the next start."
+    return done
+
+
+def _apply_live(ctx: Any, merged: dict[str, Any], patch: dict[str, Any]) -> None:
+    """Make the running config follow the file the way /config set does: through ``apply_file_config`` (the files are
+    re-read and every value goes through Settings, so a section like `goal` or `display` and a coerced number are
+    right). A context without it (no server) takes the patched keys from the validated settings."""
+    apply = getattr(ctx, "apply_file_config", None)
+    if apply is not None:
+        apply()
+        return
+    settings = Settings(**merged)
+    for key in patch:
+        setattr(ctx.config, key, getattr(settings, key))

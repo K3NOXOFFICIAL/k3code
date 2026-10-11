@@ -217,6 +217,7 @@ async def test_goal_check_gate_pauses_after_the_configured_retries(tmp_path, mon
 async def test_goal_check_gate_retries_without_limit_when_configured_to_0(tmp_path, monkeypatch):
     server, provider = make_server(tmp_path, monkeypatch, replies=["done?"], autonomy=NO_ADVISOR)
     server.config.goal.gate_max_retries = 0
+    server.config.goal.persist = False  # the "blocked" verdict that ends this run pauses only a non-persistent goal
     server.goal_judge = judge = scripted_judge(["done"] * 6 + ["blocked"])
     sid = await new_session(server, tmp_path)
     await run_goal(server, sid, '/goal impossible --check "exit 1"')
@@ -230,6 +231,7 @@ async def test_goal_check_gate_retries_without_limit_when_configured_to_0(tmp_pa
 
 async def test_goal_pause_clear_status_and_blocked(tmp_path, monkeypatch):
     server, provider = make_server(tmp_path, monkeypatch, replies=["can't"], autonomy=NO_ADVISOR)
+    server.config.goal.persist = False  # goal.persist (default on) sends a blocked goal on another way instead
     server.goal_judge = scripted_judge(["blocked"])
     sid = await new_session(server, tmp_path)
     assert "No active goal" in (await cmd(server, "/goal status", sid))["output"]

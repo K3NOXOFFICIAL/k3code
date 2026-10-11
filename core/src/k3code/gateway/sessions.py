@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import sqlstore
+from k3code.gateway.protocol import scrub_surrogates
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,24 @@ EMPTY_SESSION_MAX_AGE_S = 30 * 24 * 3600.0
 #: The sweep forgets its tombstone of a deleted row after this long (a later save no longer restores it).
 SWEPT_TOMBSTONE_MAX_AGE_S = 90 * 24 * 3600.0
 SWEEP_BATCH = 200
+
+
+def _dumps(obj: Any) -> str:
+    return scrub_surrogates(json.dumps(obj, ensure_ascii=False))
+
+
+def _loads(text: str | None, want: type, session_id: str, column: str) -> Any:
+    """A JSON column as ``want`` (list or dict). A row that holds something else, or no JSON at all (an import
+    that wrote ``"messages": "notalist"``), reads as empty and is logged: one bad row broke session.list and
+    session.resume for the whole store."""
+    try:
+        value = json.loads(text or "")
+    except ValueError:
+        value = None if text else want()
+    if isinstance(value, want):
+        return value
+    logger.warning("stored session %s: %s is not a JSON %s; reading it as empty", session_id, column, want.__name__)
+    return want()
 
 
 @dataclass
@@ -86,10 +105,10 @@ class SessionStore:
         now = time.time()
         sess = StoredSession(
             session_id=uuid.uuid4().hex[:16],
-            title=title,
-            model=model,
-            provider=provider,
-            cwd=cwd,
+            title=scrub_surrogates(title),
+            model=scrub_surrogates(model),
+            provider=scrub_surrogates(provider),
+            cwd=scrub_surrogates(cwd),
             created_at=now,
             updated_at=now,
         )
@@ -106,9 +125,17 @@ class SessionStore:
         now = time.time()
         sess.created_at = sess.created_at or now
         sess.updated_at = now
+        self._scrub_columns(sess)
         self._insert_row(sess)
         self._db.commit()
         return sess
+
+    @staticmethod
+    def _scrub_columns(sess: StoredSession) -> None:
+        """The plain-text columns are bound as they are (not through JSON): one bad title failed every later save."""
+        sess.title, sess.model, sess.provider, sess.cwd = (
+            scrub_surrogates(str(v)) for v in (sess.title, sess.model, sess.provider, sess.cwd)
+        )
 
     def _insert_row(self, sess: StoredSession) -> None:
         """The full-row INSERT shared by :meth:`insert` and a save that restores a swept row; no commit."""
@@ -122,11 +149,11 @@ class SessionStore:
                 sess.model,
                 sess.provider,
                 sess.cwd,
-                json.dumps(sess.messages, ensure_ascii=False),
-                json.dumps(sess.usage, ensure_ascii=False),
+                _dumps(sess.messages),
+                _dumps(sess.usage),
                 sess.created_at,
                 sess.updated_at,
-                json.dumps(sess.meta, ensure_ascii=False),
+                _dumps(sess.meta),
             ),
         )
 
@@ -148,11 +175,11 @@ class SessionStore:
             model=row[2] or "",
             provider=row[3] or "",
             cwd=row[4] or "",
-            messages=json.loads(row[5] or "[]"),
-            usage=json.loads(row[6] or "{}"),
+            messages=_loads(row[5], list, row[0], "messages"),
+            usage=_loads(row[6], dict, row[0], "usage"),
             created_at=row[7],
             updated_at=row[8],
-            meta=json.loads(row[9] or "{}"),
+            meta=_loads(row[9], dict, row[0], "meta"),
         )
 
     def with_goal_status(self, *statuses: str) -> list[StoredSession]:
@@ -175,7 +202,7 @@ class SessionStore:
         ).fetchall()
         out: list[StoredSession] = []
         for row in rows:
-            messages = json.loads(row[5] or "[]")
+            messages = _loads(row[5], list, row[0], "messages")
             out.append(
                 StoredSession(
                     session_id=row[0],
@@ -184,7 +211,7 @@ class SessionStore:
                     provider=row[3] or "",
                     cwd=row[4] or "",
                     messages=messages,
-                    usage=json.loads(row[6] or "{}"),
+                    usage=_loads(row[6], dict, row[0], "usage"),
                     created_at=row[7],
                     updated_at=row[8],
                 )
@@ -209,6 +236,7 @@ class SessionStore:
         sweep removed it: then its tombstone is there and the row is restored from ``sess`` (another process, such
         as a standalone stdio TUI, may hold the session open past the sweep's age limit)."""
         sess.updated_at = time.time()
+        self._scrub_columns(sess)
         with self._db:
             cur = self._db.execute(
                 "UPDATE sessions SET title=?, model=?, provider=?, cwd=?, messages=?, usage=?, updated_at=?, meta=?"
@@ -218,10 +246,10 @@ class SessionStore:
                     sess.model,
                     sess.provider,
                     sess.cwd,
-                    json.dumps(sess.messages, ensure_ascii=False),
-                    json.dumps(sess.usage, ensure_ascii=False),
+                    _dumps(sess.messages),
+                    _dumps(sess.usage),
                     sess.updated_at,
-                    json.dumps(sess.meta, ensure_ascii=False),
+                    _dumps(sess.meta),
                     sess.session_id,
                 ),
             )

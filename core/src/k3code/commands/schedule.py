@@ -9,6 +9,7 @@ from k3code.automation.cronexpr import ScheduleError, parse_schedule
 from k3code.automation.nlcron import nl_to_schedule
 from k3code.commands import CommandDef
 from k3code.commands._util import pop_option, reply, split_args
+from k3code.commands.tune import known_model_keys, unknown_model_message
 from k3code.reliability import sandbox
 
 USAGE = (
@@ -46,7 +47,17 @@ class ScheduleCommand(CommandDef):
             return reply(f"Usage: {USAGE}")
         when, prompt = args[0], " ".join(args[1:]).strip()
         live = ctx.sessions.get(session_id) if session_id else None
-        workdir = str(Path(cwd).expanduser().resolve()) if cwd else (live.stored.cwd if live else str(Path.cwd()))
+        base = Path(live.stored.cwd) if live and live.stored.cwd else Path.cwd()
+        if model and model not in known_model_keys(ctx.config):
+            return reply(unknown_model_message(ctx.config, model))
+        if cwd:  # a relative one is the session's directory, not the gateway process's
+            given = Path(cwd).expanduser()
+            given = (given if given.is_absolute() else base / given).resolve()
+            if not given.is_dir():
+                return reply(f"/schedule: --cwd {cwd} is not a directory ({given})")
+            workdir = str(given)
+        else:
+            workdir = str(base)
         if not cwd and not live and sandbox.exposes_home(workdir):
             return reply(f"/schedule: the daemon runs in {workdir}; pass --cwd <project dir> for this job.")
         try:

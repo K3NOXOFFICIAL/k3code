@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code import service
-from k3code.config import Settings, default_project_dir, load_config
+from k3code.config import ConfigError, Settings, default_project_dir, load_config
 from k3code.context_budget import FALLBACK_WINDOW, compact_threshold, family_window, has_explicit_window
 from k3code.daemon import k3_home, socket_path
 from k3code.reliability.governor import read_psi
@@ -577,12 +577,20 @@ def check_searxng() -> Check:
     from k3code import confio
     from k3code.paths import user_config_path
 
-    raw = confio.read_yaml(user_config_path())
-    url = str(((raw.get("research") or {}).get("searxng_url")) or ((raw.get("searxng") or {}).get("url")) or "")
+    try:
+        raw = confio.read_yaml(user_config_path())
+    except confio.ConfigError as e:  # the config check reports it; this one only cannot look
+        return Check("searxng", WARN, f"cannot tell: {e}", "fix the config file (see the config check)")
+
+    def section(name: str) -> dict[str, Any]:
+        value = raw.get(name)
+        return value if isinstance(value, dict) else {}
+
+    url = str(section("research").get("searxng_url") or section("searxng").get("url") or "")
     if url:
         return Check("searxng", OK, f"SearXNG at {url}", data={"url": url})
-    servers = (raw.get("mcp") or {}).get("servers") or {}
-    if any("searxng" in str(name).lower() for name in servers):
+    servers = section("mcp").get("servers")
+    if any("searxng" in str(name).lower() for name in (servers if isinstance(servers, dict) else ())):
         return Check("searxng", OK, "a SearXNG MCP server is configured")
     return Check("searxng", OK, "not configured (optional: set research.searxng_url or connect a SearXNG MCP server)")
 
@@ -628,10 +636,20 @@ def install_subset(home: Path | None = None) -> list[Check]:
     return [Check(c.name, WARN if c.status == FAIL else c.status, c.detail, c.fix, c.data) for c in checks]
 
 
+def load_or_fail(project_dir: Path) -> tuple[Settings, Check | None]:
+    """The settings for the checks; a config that does not load gives the defaults plus a failed ``config`` check."""
+    try:
+        return load_config(project_dir=project_dir), None
+    except ConfigError as e:
+        return Settings(), Check("config", FAIL, str(e), "fix or remove that file, then re-run `k3code doctor`")
+
+
 async def run_checks(config: Settings | None = None, *, probe: bool = True, home: Path | None = None) -> list[Check]:
     home = home or k3_home()
-    config = config or load_config(project_dir=Path.cwd())
-    checks: list[Check] = []
+    broken: Check | None = None
+    if config is None:
+        config, broken = load_or_fail(Path.cwd())
+    checks: list[Check] = [broken] if broken is not None else []
     checks += await check_providers(config, probe=probe)
     checks.append(check_keys(config))
     checks += check_context_windows(config)

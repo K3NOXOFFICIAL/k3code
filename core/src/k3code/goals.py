@@ -6,14 +6,20 @@
 # Dropped: contracts, subgoals, wait barriers, delegation/background-process awareness.
 """Persistent session goals — the "Ralph loop".
 
-Judge failures are fail-OPEN (``continue``); repeated judge failures, a ``blocked`` verdict and an optional turn
-budget (``max_turns``, 0 = none, the default) pause the goal. The continuation is a normal user message, so the
-system prompt (and prompt caching) never changes mid-goal.
+Judge failures are fail-OPEN (``continue``). A goal is persistent by default (``goal.persist``): it keeps going until
+the judge says it is done, whatever happens on the way. A judge that cannot be reached, a check that cannot run, a
+``blocked`` verdict, empty replies and an unparseable judge reply make it wait and try again or try another way
+instead of pausing, and a failed turn is retried after a growing pause (gateway). Only what the user set stops it:
+their own turn budget (``--turns``), a check retry limit, a spend budget, ``/stop``, ``/goal pause`` or ``clear``, and
+the owner's ``/daemon pause``. With ``goal.persist: false`` the older behaviour returns: repeated judge failures, a
+``blocked`` verdict, empty replies and an unrunnable check pause the goal. The continuation is a normal user message,
+so the system prompt (and prompt caching) never changes mid-goal.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import time
@@ -22,18 +28,28 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-#: Judged turns before a goal pauses; 0 = no limit: a goal runs until it is done, judged blocked or paused.
+#: Judged turns before a goal pauses; 0 = no limit: a goal runs until it is done or the user stops it. The old default
+#: of 300 stays in goals stored before: ``GoalState.from_dict`` reads it as "no limit" unless ``--turns`` set it.
 DEFAULT_MAX_TURNS = 0
+LEGACY_DEFAULT_MAX_TURNS = 300
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
-#: Failed --check runs before a goal pauses (``goal.gate_max_retries``); 0 = no limit. Finite by default: an agent
-#: that finds the check itself wrong usually says so and the judge's ``blocked`` verdict pauses the goal, but a check
-#: that can never pass (a typo, a missing tool) would otherwise burn tokens until someone looks. /goal resume starts
-#: the count again.
-DEFAULT_GATE_MAX_RETRIES = 20
-#: ``run_gate`` exit code when the check never ran (no usable sandbox, spawn failed): the model cannot fix that, so the
-#: goal pauses at once instead of spending ``DEFAULT_GATE_MAX_RETRIES`` turns on "fix the check". A timeout is -1.
+#: Failed --check runs before a goal pauses (``goal.gate_max_retries``); 0 = no limit, the default: a goal goes on until
+#: its check passes. Set a number to bound a check that can never pass (a typo, a missing tool). /goal resume starts the
+#: count again.
+DEFAULT_GATE_MAX_RETRIES = 0
+#: ``run_gate`` exit code when the check never ran (no usable sandbox, spawn failed): the model cannot fix that, so no
+#: turn is spent on "fix the check": a persistent goal waits and runs the check again, a non-persistent one pauses at
+#: once. A timeout is -1.
 GATE_COULD_NOT_RUN = -2
+#: A persistent goal waits this long (doubling, up to the maximum) before asking the judge, or running the check, again.
+PERSIST_BACKOFF_BASE_S = 15.0
+PERSIST_BACKOFF_MAX_S = 300.0
+#: A persistent goal judged blocked this many times in a row says so (still going on; /goal clear stops it).
+BLOCKED_NOTICE_EVERY = 5
 MAX_CONSECUTIVE_PARSE_FAILURES = 3
+#: A persistent goal keeps going when the judge's replies cannot be read, but after this many turns in a row it waits
+#: (15 s doubling to five minutes) before each turn instead of spending at full speed with nothing able to say "done".
+PERSIST_PARSE_FAILURES_BEFORE_SLOWING = 5
 #: Turns in a row that ended without any text before a goal pauses: the judge is not asked about an empty reply, so
 #: nothing else would ever stop a model that answers with nothing (40+ full turns, no judge call, no failure counted).
 MAX_CONSECUTIVE_EMPTY = 3
@@ -56,6 +72,37 @@ CONTINUATION_PROMPT_TEMPLATE = (
     "If you believe the goal is complete, state so explicitly and stop. "
     "If you are blocked and need input from the user, say so clearly and stop."
 )
+#: What a persistent goal tells the model instead of "say so and stop": nobody may be there to answer, and the goal is
+#: not over until it is done.
+PERSIST_TAIL = (
+    "Do not stop to ask the user: when a decision is needed, choose the most reasonable option, say which one you "
+    "chose, and carry on. Stop only when the goal is complete, and then say so explicitly."
+)
+KICK_PROMPT_PERSIST_TEMPLATE = (
+    "[Standing goal]\nGoal: {goal}\n\nWork toward this goal. Take concrete steps. " + PERSIST_TAIL
+)
+CONTINUATION_PROMPT_PERSIST_TEMPLATE = (
+    "[Continuing toward your standing goal]\nGoal: {goal}\n\n"
+    "Continue working toward this goal. Take the next concrete step. " + PERSIST_TAIL
+)
+CONTINUATION_PROMPT_BLOCKED_TEMPLATE = (
+    "[Continuing toward your standing goal — you were judged blocked]\n"
+    "Goal: {goal}\n\n"
+    "The judge's reason: {reason}\n\n"
+    "Do not give up and do not wait for the user. Find another way: a different approach, a workaround for the "
+    "obstacle, or the most reasonable assumption (say what you assumed). Take the next concrete step. " + PERSIST_TAIL
+)
+CONTINUATION_PROMPT_EMPTY_TEMPLATE = (
+    "[Continuing toward your standing goal — your last {n} turns ended without any text]\n"
+    "Goal: {goal}\n\n"
+    "Take a concrete step with the tools, and finish with a short report of what you did and what is left. "
+    "If the goal is complete, say so explicitly."
+)
+CONTINUATION_PROMPT_RECOVER_TEMPLATE = (
+    "[Continuing toward your standing goal — the previous turn did not finish: {why}]\n"
+    "Goal: {goal}\n\n"
+    "Pick up where it stopped, with a different approach if the last one kept failing. " + PERSIST_TAIL
+)
 CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "[Continuing toward your standing goal — the completion check failed]\n"
     "Goal: {goal}\n\n"
@@ -66,6 +113,18 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "Output (tail):\n```\n{output}\n```\n\n"
     "Fix the underlying problem so the check passes, then re-run it to confirm. Do not declare the goal "
     "complete while the check fails. If the check itself is wrong or cannot pass, say so clearly and stop."
+)
+CONTINUATION_PROMPT_GATE_FAILED_PERSIST_TEMPLATE = (
+    "[Continuing toward your standing goal — the completion check failed]\n"
+    "Goal: {goal}\n\n"
+    "The check command below must pass before this goal can be declared done, and it just failed "
+    "(attempt {attempt}):\n"
+    "  $ {command}\n"
+    "Exit code: {exit_code}\n"
+    "Output (tail):\n```\n{output}\n```\n\n"
+    "Fix the underlying problem so the check passes, then re-run it to confirm. Do not declare the goal "
+    "complete while the check fails. If the check itself looks wrong, say why and keep working toward what it is "
+    "meant to verify."
 )
 
 JUDGE_SYSTEM_PROMPT = (
@@ -153,6 +212,10 @@ class GoalState:
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
     consecutive_empty_replies: int = 0
+    #: Turns in a row the judge called blocked (a persistent goal goes on and says so every BLOCKED_NOTICE_EVERY).
+    consecutive_blocked: int = 0
+    #: ``--turns N`` set ``max_turns``. Without it a stored 300 is the old default, not a choice (see from_dict).
+    max_turns_explicit: bool = False
     gates: list[GoalGate] = field(default_factory=list)
     #: Wall-clock times of automatic kicks (see GatewayServer.kick_goal); pruned to KICK_WINDOW_S.
     kick_times: list[float] = field(default_factory=list)
@@ -176,6 +239,8 @@ class GoalState:
         known = GoalGate.__dataclass_fields__
         gates = [GoalGate(**{k: v for k, v in g.items() if k in known}) for g in data.get("gates") or []]
         fields = {k: v for k, v in data.items() if k in cls.__dataclass_fields__ and k != "gates"}
+        if "max_turns_explicit" not in data and fields.get("max_turns") == LEGACY_DEFAULT_MAX_TURNS:
+            fields["max_turns"] = 0  # a goal stored when 300 was the default: nobody chose that limit
         return cls(**fields, gates=gates)
 
     def snapshot(self) -> dict[str, Any]:
@@ -288,11 +353,19 @@ class GoalManager:
         *,
         default_max_turns: int = DEFAULT_MAX_TURNS,
         default_gate_max_retries: int = DEFAULT_GATE_MAX_RETRIES,
+        persist: bool = False,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._load = load
         self._save_raw = save
         self.default_max_turns = default_max_turns
         self.default_gate_max_retries = default_gate_max_retries
+        #: ``goal.persist`` (the gateway passes the config, default on): wait and retry or try another way instead of
+        #: pausing. A bare GoalManager keeps the older pausing behaviour.
+        self.persist = persist
+        self._sleep = sleep
+        #: Called with a line of text when a persistent goal starts to wait (the gateway shows it as a toast).
+        self.on_wait: Callable[[str], None] | None = None
 
     @property
     def state(self) -> GoalState | None:
@@ -318,6 +391,7 @@ class GoalManager:
         st = GoalState(
             goal=goal.strip(),
             max_turns=self.default_max_turns if max_turns is None else max_turns,
+            max_turns_explicit=max_turns is not None and max_turns > 0,
             created_at=time.time(),
             gates=gates,
             implicit=implicit,
@@ -340,11 +414,23 @@ class GoalManager:
             return None
         s.status, s.paused_reason = "active", None
         s.consecutive_parse_failures = s.consecutive_transport_failures = s.consecutive_empty_replies = 0
+        s.consecutive_blocked = 0
         if reset_budget:
             s.turns_used = 0
         for g in s.gates:
             g.attempts = 0
         return self._save(s)
+
+    def count_recovery_turn(self) -> bool:
+        """A turn that failed or stalled still spent one of the user's ``--turns``: count it. False when that was the
+        last one (the goal pauses then); True without a budget."""
+        s = self.state
+        if s is None:
+            return False
+        s.turns_used += 1
+        s.last_turn_at = time.time()
+        self._save(s)
+        return not s.budget_spent()
 
     def clear(self) -> None:
         self._save_raw(None)
@@ -375,11 +461,20 @@ class GoalManager:
 
     def kick_prompt(self) -> str | None:
         s = self.state
-        return KICK_PROMPT_TEMPLATE.format(goal=s.goal) if s and s.status == "active" else None
+        if s is None or s.status != "active":
+            return None
+        return (KICK_PROMPT_PERSIST_TEMPLATE if self.persist and not s.implicit else KICK_PROMPT_TEMPLATE).format(
+            goal=s.goal
+        )
 
     def continuation_prompt(self) -> str | None:
         s = self.state
-        return CONTINUATION_PROMPT_TEMPLATE.format(goal=s.goal) if s and s.status == "active" else None
+        if s is None or s.status != "active":
+            return None
+        template = (
+            CONTINUATION_PROMPT_PERSIST_TEMPLATE if self.persist and not s.implicit else CONTINUATION_PROMPT_TEMPLATE
+        )
+        return template.format(goal=s.goal)
 
     def _pause_decision(self, s: GoalState, reason: str, verdict: str, why: str, message: str) -> Decision:
         if s.implicit:
@@ -406,11 +501,44 @@ class GoalManager:
         verdict, reason, parse_failed, transport_failed = await judge(s.goal, last_response)
         if (gone := self._superseded(s)) is not None:
             return gone
+        waited = 0
+        while transport_failed and self.persist:
+            # the judge model cannot be reached: no verdict, so no way to tell done from not done. Waiting for it
+            # costs nothing; a continuation turn would spend tokens on a goal that may already be finished.
+            s.consecutive_transport_failures += 1
+            s.last_verdict, s.last_reason = "continue", f"waiting for the judge model: {reason}"
+            self._save(s)
+            await self._wait(s, waited, f"The judge model is not answering ({reason}); asking again")
+            waited += 1
+            if (gone := self._superseded(s)) is not None:
+                return gone
+            verdict, reason, parse_failed, transport_failed = await judge(s.goal, last_response)
+            if (gone := self._superseded(s)) is not None:
+                return gone
         s.last_verdict, s.last_reason = verdict, reason
         s.consecutive_parse_failures = s.consecutive_parse_failures + 1 if parse_failed else 0
         s.consecutive_transport_failures = s.consecutive_transport_failures + 1 if transport_failed else 0
         s.consecutive_empty_replies = 0 if last_response.strip() else s.consecutive_empty_replies + 1
+        s.consecutive_blocked = s.consecutive_blocked + 1 if verdict == "blocked" else 0
 
+        if verdict == "blocked" and self.persist and not s.implicit:
+            # not a stop: the judge says this way is blocked, so the agent is sent to find another one
+            if s.budget_spent():
+                return self._budget_pause(s, "blocked", reason)
+            self._save(s)
+            note = (
+                f" — judged blocked {s.consecutive_blocked} turns in a row; /goal clear stops it"
+                if s.consecutive_blocked % BLOCKED_NOTICE_EVERY == 0
+                else ""
+            )
+            return Decision(
+                "active",
+                True,
+                CONTINUATION_PROMPT_BLOCKED_TEMPLATE.format(goal=s.goal, reason=reason),
+                "blocked",
+                reason,
+                f"↻ Judged blocked ({s.turns_text()}) — trying another way: {reason}{note}",
+            )
         if verdict == "blocked":
             return self._pause_decision(
                 s,
@@ -426,6 +554,21 @@ class GoalManager:
                 if (gone := self._superseded(s)) is not None:
                     return gone
                 gate.last_exit_code, gate.last_output_tail = code, tail
+                waited = 0
+                while code == GATE_COULD_NOT_RUN and self.persist:
+                    # the check cannot start (no usable sandbox, spawn failed): nothing the model can fix, so no turn
+                    # is spent on it; run it again after a pause until it can run
+                    s.last_verdict = "gate_failed"
+                    s.last_reason = f"waiting until the check can run: $ {gate.command}"
+                    self._save(s)
+                    await self._wait(s, waited, f"The check cannot run ({tail.strip()[:120]}); trying again")
+                    waited += 1
+                    if (gone := self._superseded(s)) is not None:
+                        return gone
+                    passed, code, tail = await run_gate(gate, cwd=cwd)
+                    if (gone := self._superseded(s)) is not None:
+                        return gone
+                    gate.last_exit_code, gate.last_output_tail = code, tail
                 if passed:
                     gate.attempts = 0
                     continue
@@ -453,7 +596,12 @@ class GoalManager:
                 if s.budget_spent():
                     return self._budget_pause(s, "gate_failed", s.last_reason)
                 self._save(s)
-                prompt = CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
+                template = (
+                    CONTINUATION_PROMPT_GATE_FAILED_PERSIST_TEMPLATE
+                    if self.persist
+                    else CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE
+                )
+                prompt = template.format(
                     goal=s.goal,
                     command=gate.command,
                     exit_code=code,
@@ -498,7 +646,24 @@ class GoalManager:
             self._save(s)
             return Decision("done", False, None, "done", reason, f"✓ Goal achieved: {reason}")
 
-        if s.consecutive_transport_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES:
+        if self.persist and not s.implicit and s.consecutive_empty_replies >= MAX_CONSECUTIVE_EMPTY:
+            # empty replies are not a stop either: say what is wanted and go on (an empty turn costs little)
+            if s.budget_spent():
+                return self._budget_pause(s, "continue", reason)
+            self._save(s)
+            n = s.consecutive_empty_replies
+            await self._wait(s, n - MAX_CONSECUTIVE_EMPTY, "Empty replies, so the next turn starts")  # slower each time
+            if (gone := self._superseded(s)) is not None:
+                return gone
+            return Decision(
+                "active",
+                True,
+                CONTINUATION_PROMPT_EMPTY_TEMPLATE.format(goal=s.goal, n=n),
+                "continue",
+                reason,
+                f"↻ The last {n} turns ended without any text ({s.turns_text()}) — asking for a concrete step.",
+            )
+        if not self.persist and s.consecutive_transport_failures >= MAX_CONSECUTIVE_TRANSPORT_FAILURES:
             n = s.consecutive_transport_failures
             return self._pause_decision(
                 s,
@@ -507,7 +672,7 @@ class GoalManager:
                 reason,
                 f"⏸ Goal paused — the judge model returned errors {n} turns in a row (check goal.judge_model).",
             )
-        if s.consecutive_empty_replies >= MAX_CONSECUTIVE_EMPTY:
+        if not self.persist and s.consecutive_empty_replies >= MAX_CONSECUTIVE_EMPTY:
             n = s.consecutive_empty_replies
             return self._pause_decision(
                 s,
@@ -516,7 +681,29 @@ class GoalManager:
                 reason,
                 f"⏸ Goal paused — the last {n} turns ended without any text. /goal resume tries again.",
             )
-        if s.consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
+        if self.persist and not s.implicit and s.consecutive_parse_failures >= PERSIST_PARSE_FAILURES_BEFORE_SLOWING:
+            # the judge keeps answering in a way that cannot be read, so nothing can say the goal is done: the goal goes
+            # on, but at a slowing pace (a broken judge must not spend money at full speed)
+            if s.budget_spent():
+                return self._budget_pause(s, "continue", reason)
+            self._save(s)
+            n = s.consecutive_parse_failures
+            await self._wait(
+                s,
+                n - PERSIST_PARSE_FAILURES_BEFORE_SLOWING,
+                f"The judge has not returned a readable verdict for {n} turns (check goal.judge_model); next turn",
+            )
+            if (gone := self._superseded(s)) is not None:
+                return gone
+            return Decision(
+                "active",
+                True,
+                self.continuation_prompt(),
+                "continue",
+                reason,
+                f"↻ Continuing toward goal ({s.turns_text()}); the judge returned no readable verdict for {n} turns.",
+            )
+        if not self.persist and s.consecutive_parse_failures >= MAX_CONSECUTIVE_PARSE_FAILURES:
             n = s.consecutive_parse_failures
             return self._pause_decision(
                 s,
@@ -537,6 +724,18 @@ class GoalManager:
             reason,
             f"↻ {'Auto-continuing' if s.implicit else 'Continuing toward goal'} ({progress}): {reason}",
         )
+
+    @staticmethod
+    def backoff(n: int) -> float:
+        """Seconds a persistent goal waits before the ``n``-th retry (0-based): 15, 30, 60 ... up to five minutes."""
+        return min(PERSIST_BACKOFF_MAX_S, PERSIST_BACKOFF_BASE_S * 2 ** min(n, 16))
+
+    async def _wait(self, s: GoalState, n: int, what: str) -> None:
+        delay = self.backoff(n)
+        if self.on_wait is not None:
+            with contextlib.suppress(Exception):  # a notice must never stop the goal
+                self.on_wait(f"⏳ {what} in {delay:.0f} s ({s.turns_text()}). /goal clear stops the goal.")
+        await self._sleep(delay)
 
     def _superseded(self, s: GoalState) -> Decision | None:
         """After an await (judge, check, reviewer: possibly minutes): the user may have cleared, paused or replaced

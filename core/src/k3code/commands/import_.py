@@ -18,11 +18,13 @@ class ImportCommand(CommandDef):
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         args = split_args(arg)
-        yes = pop_flag(args, "--yes") or pop_flag(args, "-y")
+        # both flags are popped: with `-y --yes x` the short circuit left `-y` as the path
+        long_yes, short_yes = pop_flag(args, "--yes"), pop_flag(args, "-y")
+        yes = long_yes or short_yes
         settings_only = pop_flag(args, "--settings-only")
         session_only = pop_flag(args, "--session-only")
         trust_bundle = pop_flag(args, "--trust-bundle")
-        if not args:
+        if not args or (settings_only and session_only):
             return reply(f"Usage: {USAGE}")
         cwd = session_cwd(ctx, session_id)
         path = Path(args[0]).expanduser()

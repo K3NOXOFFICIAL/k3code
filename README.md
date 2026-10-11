@@ -199,6 +199,18 @@ In `auto` mode every new task is classified first (`trivial`, `small`, `medium`,
 
 `/ultracode <task>` is the full pipeline: three independent plans and a judge, parallel implementation, a two-reviewer adversarial panel where a finding counts only if both agree, fixes, and a final test run, all under a token and agent budget (`ultracode.max_tokens`, `ultracode.max_agents`). It can also stay on for a whole session ([Ultracode mode](#ultracode-mode)) or run when you say its name in a prompt ([Wake words](#wake-words)).
 
+### Goals: `/goal` keeps going until it is done
+
+`/goal <objective> [--check "<cmd>"] [--turns N]` sets a goal. After every turn a small judge model says *done*, *blocked* or *continue*, and a goal goes on until the judge says done (and the `--check` command, if you gave one, exits 0). By default it does not stop on its own, whatever happens on the way (`goal.persist: true`):
+
+- A *blocked* verdict does not pause it: the agent is told to find another way or make the most reasonable assumption and say what it assumed. You are told every fifth time in a row.
+- A judge model that cannot be reached is waited for (15 s, doubling to 5 minutes) and asked again about the same answer; no turn is spent meanwhile. A check that cannot start (no usable sandbox) is retried the same way.
+- A turn that fails (no provider answered after the retries, an exception) or stops for input (a question, an approval nobody answered, the loop guard) is retried after the same growing pause, with a prompt that says why it stopped.
+- Empty replies and judge replies that cannot be read slow the goal down (the pause before each turn grows to 5 minutes) but do not stop it.
+- There is no turn limit and no limit on failed checks. A goal stored by an older version with the old default of 300 turns now reads as unlimited.
+
+What still stops it is what you set or do: `--turns N` (your own turn budget; failed turns count), `goal.gate_max_retries` (a limit on failed checks), a spend budget (`reliability.session_eur`, `day_eur` and the like), `/stop`, `/goal pause`, `/goal clear`, and `/daemon pause`. `goal.persist: false` brings back the older behaviour (a blocked verdict, repeated judge failures, empty replies and failed turns pause the goal until `/goal resume`).
+
 ### Tune: model, effort and ultracode
 
 `/tune` opens one popup with the model list, the reasoning effort slider and the ultracode switch. A bare `/model` and a bare `/effort` open the same popup. This is a sample at 100 columns (the first row is your `default_model`, and the descriptions come from `descriptions` in the provider config):
@@ -394,6 +406,9 @@ context:                            # all optional; /autocompact edits the first
   keep_messages: 8                  # recent messages kept verbatim by a compaction
   compact_input_chars: 60000        # how much of the folded part the summary model reads
   tool_output_chars: 10000          # most of one tool result the model is sent (the session keeps all of it)
+goal:
+  persist: true                   # keep going until done, whatever happens (false: pause on trouble)
+  # max_turns: 0                    # 0 = no limit (the default); gate_max_retries: 0 likewise
 autonomy:
   plan_first: true
   escalate_main: true               # a turn that stalls on the main tier continues on the strong tier (default)

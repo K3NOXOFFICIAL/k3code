@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import difflib
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,8 @@ import yaml
 from k3code import confio
 from k3code.commands import CommandDef
 from k3code.commands._util import pop_flag, reply, session_cwd, split_args
+from k3code.commands.tune import known_model_keys
+from k3code.config import Settings, default_project_dir
 from k3code.paths import project_config_path, user_config_path
 from k3code.redact import redact
 
@@ -23,29 +27,90 @@ def target_path(cwd: Path, project: bool) -> Path:
     return project_config_path(cwd) if project else user_config_path()
 
 
-def config_set(path: Path, key: str, raw: str) -> Path | None:
-    """Validate-then-write ``key=value`` into ``path``; returns the backup path (None if no prior file)."""
+#: Top-level keys a config file may carry besides the ``Settings`` fields: read straight from the YAML elsewhere
+#: (``sandbox``, ``update``) or written by the setup wizard (``tiers``, ``panes``, the legacy ``searxng``).
+EXTRA_FILE_KEYS = frozenset({"sandbox", "update", "tiers", "panes", "searxng"})
+
+
+def config_set(path: Path, key: str, raw: str, *, known_models: set[str] | None = None) -> Path | None:
+    """Validate-then-write ``key=value`` into ``path``; returns the backup path (None if no prior file).
+
+    An unknown top-level key (`permision_mode`) is refused here, though a file that already carries one still loads.
+    ``known_models``: the model keys the providers define; ``default_model`` must be one of them (or ``default``).
+    """
+    top = key.split(".")[0]
+    known = set(Settings.model_fields) | EXTRA_FILE_KEYS
+    if top not in known:
+        near = difflib.get_close_matches(top, sorted(known), n=1)
+        raise confio.ConfigError(f"unknown config key {top!r}" + (f" (did you mean {near[0]}?)" if near else ""))
+    value = confio.parse_value(raw)
+    if key == "providers" and not value:
+        raise confio.ConfigError("providers may not be empty: that would remove the whole fallback chain")
     data = confio.read_yaml(path)
-    confio.set_path(data, key, confio.parse_value(raw))
+    if key == "default_model" and known_models is not None and value != "default" and value not in known_models:
+        raise confio.ConfigError(f"default_model {value!r} is not a model key of any provider ({sorted(known_models)})")
+    confio.set_path(data, key, value)
     confio.validate(data)
     return confio.write_yaml(path, data)
 
 
 def config_rollback(path: Path) -> Path:
+    """Put the newest backup back byte for byte (its comments stay); the file as it is now is backed up first, so a
+    rollback can itself be rolled back."""
     bak = confio.latest_backup(path)
     if bak is None:
         raise confio.ConfigError(f"no backup of {path.name} to roll back to")
-    # Rolling back is itself reversible: the current file is backed up first.
-    data = confio.read_yaml(bak)
-    confio.write_yaml(path, data)
-    bak.unlink()
+    confio.restore_backup(path, bak)
     return bak
 
 
 def open_editor(path: Path) -> int:
+    """Run $VISUAL / $EDITOR on ``path``; a command that cannot start is a ConfigError, not a traceback."""
     path.parent.mkdir(parents=True, exist_ok=True)
     editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
-    return subprocess.call([*shlex.split(editor), str(path)])
+    try:
+        argv = shlex.split(editor)
+    except ValueError as e:
+        raise confio.ConfigError(f"$EDITOR is not a valid command ({e}): {editor!r}") from e
+    if not argv:
+        raise confio.ConfigError("$EDITOR is empty: set $VISUAL or $EDITOR to your editor")
+    try:
+        return subprocess.call([*argv, str(path)])
+    except OSError as e:  # FileNotFoundError, PermissionError
+        why = e.strerror or str(e)
+        raise confio.ConfigError(f"cannot run the editor {argv[0]!r} ({why}): set $VISUAL or $EDITOR") from e
+
+
+def edit_config_file(path: Path) -> int:
+    """`open_editor` for a config file: what the editor leaves must still be a valid config. If it is not, the previous
+    content is put back (the edit is kept beside it as ``<name>.rejected``) and a ConfigError says why. A changed valid
+    file gets a backup of the content it had, like every other write."""
+    before = path.read_bytes() if path.is_file() else None
+    bak: Path | None = None
+    if before is not None:
+        bak = confio.backup_path(path)
+        shutil.copy2(path, bak)
+    rc = open_editor(path)
+    after = path.read_bytes() if path.is_file() else None
+    if after == before or after is None:
+        if bak is not None:
+            bak.unlink(missing_ok=True)
+        return rc
+    try:
+        confio.validate(confio.read_yaml(path))
+    except confio.ConfigError as e:
+        rejected = path.with_name(path.name + ".rejected")
+        rejected.write_bytes(after)
+        if before is None:
+            path.unlink()
+        else:
+            confio.replace_bytes(path, before)
+        if bak is not None:
+            bak.unlink(missing_ok=True)
+        raise confio.ConfigError(
+            f"{path.name} is not valid ({e}); kept the previous content, your edit is in {rejected.name}"
+        ) from e
+    return rc
 
 
 def _learn(ctx: Any, session_id: str | None, kind: str, subject: str, choice: str) -> None:
@@ -82,12 +147,19 @@ class ConfigCommand(CommandDef):
             if len(rest) < 2:
                 return reply("Usage: /config set <key> <value> [--project]")
             try:
-                bak = config_set(path, rest[0], " ".join(rest[1:]))
+                bak = config_set(path, rest[0], " ".join(rest[1:]), known_models=known_model_keys(ctx.config))
             except confio.ConfigError as e:
                 return reply(f"Invalid config: {e}")
             ctx.apply_file_config(cwd)
             _learn(ctx, session_id, "config", rest[0], "set")
-            return reply(f"Set {rest[0]} in {path}" + (f" (backup: {bak.name})" if bak else ""))
+            note = ""
+            if project and cwd.resolve() != default_project_dir().resolve():
+                # the running config is shared by all sessions and holds only the gateway project's overlay
+                note = (
+                    " The permissions: section of this project config applies to sessions in it; other keys apply "
+                    "where this directory is the gateway's project (K3CODE_PROJECT_DIR, else its start directory)."
+                )
+            return reply(f"Set {rest[0]} in {path}" + (f" (backup: {bak.name})" if bak else "") + note)
         if sub == "edit":
             return reply(f"Edit {path} (run `$EDITOR {path}` or `k3code config edit`).", path=str(path))
         if sub == "rollback":

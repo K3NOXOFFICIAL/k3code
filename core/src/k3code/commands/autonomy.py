@@ -52,6 +52,8 @@ class ProposalsCommand(CommandDef):
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         store = ctx.autonomy.proposals
         parts = arg.split()
+        if parts and parts[0] not in ("accept", "dismiss", "all"):
+            return _msg(f"Unknown argument: {parts[0]}. Usage: /proposals [all|accept <id>|dismiss <id>]")
         if parts[:1] in (["accept"], ["dismiss"]):
             if len(parts) < 2:
                 return _msg(f"Usage: /proposals {parts[0]} <id>")

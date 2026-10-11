@@ -41,5 +41,8 @@ class OutputStyleCommand(CommandDef):
 
             config_set(user_config_path(), "output_style", name)
             ctx.apply_file_config(cwd)
-        where = "this session" + (" and the default" if make_default and live else "")
+        if live is None:
+            where = "the default (there is no session here)"
+        else:
+            where = "this session" + (" and the default" if make_default else "")
         return reply(f"Output style set to {name} for {where} (applies from the next turn).", style=name)

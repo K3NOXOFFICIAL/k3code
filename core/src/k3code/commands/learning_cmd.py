@@ -88,6 +88,8 @@ class LearnCommand(CommandDef):
         if arg.strip() == "prefs":
             prefs = hub.preferences(20)
             return reply("\n".join(f"- {p}" for p in prefs) or "Nothing learned yet.")
+        if arg.strip() != "run":  # a bare /learn or a typo used to start a full forced pass
+            return reply("Usage: /learn run (distill preferences and curate skills now) | /learn prefs")
         live = ctx.sessions.get(session_id) if session_id else None
         done = await hub.maintenance(live, force=True)
         return reply(f"Learning pass done: {done}")

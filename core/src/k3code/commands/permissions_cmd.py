@@ -5,8 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import yaml
-
+from k3code import confio
 from k3code.commands._util import pop_flag, reply, session_cwd
 from k3code.paths import project_config_path, user_config_path
 from k3code.permissions.engine import PermissionMode, builtin_defaults
@@ -48,8 +47,9 @@ def format_overview(perms: PermissionState) -> str:
 def _remove_from_config(path: Path, rule: Rule) -> bool:
     if not path.is_file():
         return False
-    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    section = (data.get("permissions") or {}).get(rule.tool)
+    data = confio.read_yaml(path)
+    perms = data.get("permissions")
+    section = perms.get(rule.tool) if isinstance(perms, dict) else None
     if isinstance(section, str):
         if rule.pattern != "*" or section != rule.action:
             return False
@@ -63,7 +63,7 @@ def _remove_from_config(path: Path, rule: Rule) -> bool:
             del data["permissions"][rule.tool]
     else:
         return False
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    confio.write_yaml(path, data)  # keeps a trusted project config trusted (a bare write left all its rules off)
     return True
 
 

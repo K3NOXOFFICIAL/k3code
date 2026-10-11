@@ -16,7 +16,11 @@ class StatsCommand(CommandDef):
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         parts = arg.split()
-        by = parts[0] if parts and parts[0] in ("session", "day", "turn") else "day"
-        days = next((int(p) for p in parts if p.isdigit()), 7 if by == "day" else None)
+        by = parts.pop(0) if parts and parts[0] in ("session", "day", "turn") else "day"
+        days: int | None = 7 if by == "day" else None
+        if parts:  # what is left is a number of days; '²'.isdigit() is True and int('²') fails, hence ascii + decimal
+            if len(parts) > 1 or not (parts[0].isascii() and parts[0].isdecimal()) or int(parts[0]) < 1:
+                return {"type": "message", "message": "Usage: /stats [session|day|turn] [days]  (days: 1 or more)"}
+            days = int(parts[0])
         rows = ctx.usage.aggregate(by, days=days)
         return {"type": "message", "message": format_stats(rows, by, getattr(ctx, "config", None))}

@@ -57,6 +57,7 @@ async def test_a_loop_guard_stop_pauses_the_goal_instead_of_continuing_it(tmp_pa
     _use(server, provider)
     sid = await new_session(server, repo)
     live = server.live[sid]
+    server.config.goal.persist = False  # a persistent goal (the default) tries another way: test_goal_persist.py
     mgr = server.goal_manager(live)
     mgr.set("fix the flaky test", max_turns=3)
     server.goal_judge = scripted_judge(["continue"])

@@ -51,11 +51,28 @@ def redact_text(text: str, secrets: list[str]) -> str:
     return text
 
 
-def safe_config(config: Any) -> dict[str, Any]:
-    cfg = config.model_dump()
+def drop_values(obj: Any, secrets: list[str]) -> Any:
+    """``obj`` with every occurrence of a known secret value replaced, whatever its shape."""
+    if isinstance(obj, dict):
+        return {k: drop_values(v, secrets) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [drop_values(v, secrets) for v in obj]
+    if isinstance(obj, str):
+        for s in secrets:
+            obj = obj.replace(s, REDACTED)
+    return obj
+
+
+def safe_config(config: Any, secrets: list[str] | None = None) -> dict[str, Any]:
+    """The config as a plain mapping with secrets out. By structure (a key named like a secret, every value under
+    ``env`` and ``headers``, a URL with a password in it), then by value (the keys this process knows). The text
+    patterns alone left an MCP server's ``postgres://user:pw@host/db`` env value and ``X-Api-Auth`` header in clear."""
+    from k3code.redact import redact
+
+    cfg = redact(config.model_dump(mode="json"))
     for p in cfg.get("providers", []):
         p["api_key"] = REDACTED if p.get("api_key") else ""
-    return cfg
+    return drop_values(cfg, secrets if secrets is not None else secret_values(config))
 
 
 def versions() -> dict[str, str]:
@@ -78,17 +95,24 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
 
     home = home or k3_home()
     secrets = secret_values(server.config)
-    events = list(server.event_log)[-n:]
+    events = list(server.event_log)[-n:] if n > 0 else []  # [-0:] is the whole list
     checks = await doctor.run_checks(server.config, probe=probe, home=home)
     parts = {
         "events.json": json.dumps(events, indent=2, default=str),
-        "config.json": json.dumps(safe_config(server.config), indent=2, default=str),
+        "config.json": json.dumps(safe_config(server.config, secrets), indent=2, default=str),
         "versions.json": json.dumps(versions(), indent=2),
         "doctor.json": doctor.to_json(checks),
     }
     out_dir = home / "debug"
     out_dir.mkdir(parents=True, exist_ok=True)
-    path = out_dir / f"{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
+    now = time.time()
+    # microseconds in the name: two dumps in one second overwrote each other
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now)) + f"-{int(now * 1e6) % 1_000_000:06d}"
+    path = out_dir / f"{stamp}.tar.gz"
+    n_dup = 0
+    while path.exists():
+        n_dup += 1
+        path = out_dir / f"{stamp}-{n_dup}.tar.gz"
     with tarfile.open(path, "w:gz") as tar:
         for name, body in parts.items():
             data = redact_text(body, secrets).encode("utf-8")

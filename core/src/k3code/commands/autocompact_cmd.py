@@ -9,6 +9,7 @@ from typing import Any
 from k3code import confio
 from k3code.commands import CommandDef
 from k3code.commands._util import pop_flag, reply, split_args
+from k3code.config import default_project_dir
 from k3code.context_budget import (
     COMPACT_AT_RATIO,
     MAX_COMPACT_RATIO,
@@ -19,7 +20,7 @@ from k3code.context_budget import (
     compact_threshold,
     context_window,
 )
-from k3code.paths import user_config_path
+from k3code.paths import project_config_path, user_config_path
 
 USAGE = (
     "Usage: /autocompact [auto | off | on | <tokens>[k|m] | <percent>% | reset] [--session]\n"
@@ -163,9 +164,11 @@ class AutoCompactCommand(CommandDef):
             ctx.apply_file_config(live.perms.cwd if live is not None else None)
             lead = f"Saved in {path}" + (f" (backup: {backup.name})." if backup else ".")
             wanted = autocompact_policy(SimpleNamespace(context=_context_of(path)))
-            if autocompact_policy(ctx.config) != wanted:  # a project config's `context:` section replaces this one
+            if autocompact_policy(ctx.config) != wanted:
+                # the config is shared by every session: the only project overlay in it is the gateway's own project
+                overlay = project_config_path(default_project_dir())
                 lead += (
-                    " A `context:` section in this project's .k3code/config.yaml replaces it here: "
+                    f" A `context:` section in the gateway project's config ({overlay}) replaces it: "
                     "edit that, or use --session."
                 )
         return reply(f"{lead}\n{self._status(ctx, live)}", autocompact=self._payload(ctx, live))

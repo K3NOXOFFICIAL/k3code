@@ -145,6 +145,7 @@ async def test_interrupted_turn_pauses_goal_with_a_reason_and_notifies(tmp_path,
 async def test_exhausted_providers_pause_the_goal_with_a_reason_and_one_notification(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     server, _ = make_server(tmp_path, monkeypatch, replies=["x"], autonomy=NO_ADVISOR)
+    server.config.goal.persist = False  # a persistent goal (the default) retries after a pause: test_goal_persist
     sid = await new_session(server, repo)
     _goal(server, sid).set("needs a provider")
 
@@ -190,8 +191,8 @@ async def test_a_finite_turn_budget_still_pauses_and_an_explicit_zero_overrides_
     assert mgr.set("unbounded", max_turns=0).max_turns == 0  # /goal --turns 0: no limit despite the config
 
 
-async def test_failing_check_pauses_after_20_retries_by_default_and_0_means_no_limit(monkeypatch):
-    # issue #49: unlimited gate retries let a check that can never pass burn tokens until someone looked
+async def test_failing_check_has_no_retry_limit_by_default_and_a_configured_one_pauses(monkeypatch):
+    # a goal goes on until its check passes; goal.gate_max_retries bounds a check that can never pass (issue #49)
     import k3code.goals as goals
 
     async def failing_gate(gate, *, cwd=None):
@@ -200,17 +201,23 @@ async def test_failing_check_pauses_after_20_retries_by_default_and_0_means_no_l
     monkeypatch.setattr(goals, "run_gate", failing_gate)
     judge = scripted_judge(["done"])
     mgr = _mem_manager()
-    assert mgr.set("ship", check="exit 1").gates[0].max_retries == goals.DEFAULT_GATE_MAX_RETRIES == 20
-    for n in range(1, 21):
+    assert mgr.set("ship", check="exit 1").gates[0].max_retries == goals.DEFAULT_GATE_MAX_RETRIES == 0
+    for _n in range(1, 61):
         decision = await mgr.evaluate_after_turn("done!", judge)
         assert decision.should_continue and decision.verdict == "gate_failed"
+    assert mgr.state.status == "active"
+    limited = _mem_manager(default_gate_max_retries=20)
+    assert limited.set("ship", check="exit 1").gates[0].max_retries == 20
+    for n in range(1, 21):
+        decision = await limited.evaluate_after_turn("done!", judge)
+        assert decision.should_continue and decision.verdict == "gate_failed"
         assert f"(attempt {n}/20):" in decision.prompt
-    paused = await mgr.evaluate_after_turn("done!", judge)
-    assert not paused.should_continue and mgr.state.status == "paused"
-    assert mgr.state.paused_reason == "check exhausted 20 retries: $ exit 1"
-    mgr.resume()  # /goal resume starts the count again
-    assert mgr.state.gates[0].attempts == 0
-    assert (await mgr.evaluate_after_turn("done!", judge)).should_continue
+    paused = await limited.evaluate_after_turn("done!", judge)
+    assert not paused.should_continue and limited.state.status == "paused"
+    assert limited.state.paused_reason == "check exhausted 20 retries: $ exit 1"
+    limited.resume()  # /goal resume starts the count again
+    assert limited.state.gates[0].attempts == 0
+    assert (await limited.evaluate_after_turn("done!", judge)).should_continue
 
     unlimited = _mem_manager(default_gate_max_retries=0)  # goal.gate_max_retries: 0
     unlimited.set("ship", check="exit 1")

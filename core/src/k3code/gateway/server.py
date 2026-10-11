@@ -80,9 +80,10 @@ from k3code.gateway.protocol import (
     encode_response,
     encode_server_request,
     next_request_id,
+    reply_id,
 )
-from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, StoredSession
-from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
+from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, StoredSession, scrub_surrogates
+from k3code.goals import CONTINUATION_PROMPT_RECOVER_TEMPLATE, MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
@@ -106,7 +107,7 @@ from k3code.research.fetch import WebFetcher
 from k3code.research.flow import Research
 from k3code.research.tools import register_web_tools
 from k3code.router import CooldownStore, Router, RouterEvent, build_chain
-from k3code.routing.caller import ModelCaller
+from k3code.routing.caller import ModelCaller, attempt_holder
 from k3code.routing.tiers import (
     Escalation,
     TaskKind,
@@ -242,6 +243,7 @@ class LiveSession:
         self.call_started: float | None = None
         self.tool_mark: float | None = None
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
+        self.persist_warned = False  # the "could not save" notification went out (once per session)
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
         #: Wall-clock start of the latest turn or job (time.time()); the agent view's "working N" counts from it.
         self.turn_started_wall = 0.0
@@ -284,6 +286,10 @@ class LiveSession:
         self.pause_text = ""
         #: Set when the loop guard or a budget stopped the turn; cleared on the next prompt.
         self.needs_input = False
+        #: The turn stopped on a spend budget the user set (reliability.*): a persistent goal respects that stop.
+        self.budget_stopped = False
+        #: Failed or stalled goal turns in a row: the pause before the next retry grows with it (GoalManager.backoff).
+        self.goal_retry_streak = 0
         #: (provider, model) of the latest router attempt, for usage rows.
         self.last_entry: tuple[str, str] = ("", "")
         #: M4a: tier and task kind of the call in flight (for usage rows); /scope override for the next task.
@@ -692,6 +698,7 @@ class GatewayServer:
         ):
             return {"closed": False, "reason": "not disposable"}
         self.live.pop(sid, None)
+        self.learning.forget_session(sid)  # the failures it was waiting on a retry for
         await tool_jobs.reap(sid)  # background bash jobs end with their session
         if live.reliability is not None:
             await live.reliability.stop()
@@ -1116,24 +1123,30 @@ class GatewayServer:
         """Parse a frame once and handle it: inline, or as a task for CONCURRENT_METHODS (they may wait for this very
         client's answer to a clarify or approval, so the read loop must stay free). At most MAX_CONCURRENT_PER_CLIENT
         such tasks run per client; one more is refused with an error rather than queued, which could deadlock."""
-        parsed = decode_frame(text)
-        obj = parsed[0]
-        if obj is not None and obj.get("method") in self.CONCURRENT_METHODS:
-            if client.in_flight >= MAX_CONCURRENT_PER_CLIENT:
-                msg = f"too many concurrent requests on this connection (at most {MAX_CONCURRENT_PER_CLIENT})"
-                self._reply(client, encode_error(obj.get("id"), TOO_MANY_REQUESTS, msg))
+        try:
+            parsed = decode_frame(text)
+            obj, err = parsed
+            # an invalid frame (err set) goes to _guarded_handle, which answers it; `method` is only trusted without err
+            if obj is not None and err is None and obj.get("method") in self.CONCURRENT_METHODS:
+                if client.in_flight >= MAX_CONCURRENT_PER_CLIENT:
+                    msg = f"too many concurrent requests on this connection (at most {MAX_CONCURRENT_PER_CLIENT})"
+                    self._reply(client, encode_error(obj.get("id"), TOO_MANY_REQUESTS, msg))
+                    return
+                client.in_flight += 1
+
+                def finished(_task: asyncio.Task[Any]) -> None:
+                    client.in_flight -= 1
+
+                task = asyncio.get_running_loop().create_task(self._guarded_handle(text, client, parsed))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+                task.add_done_callback(finished)
                 return
-            client.in_flight += 1
-
-            def finished(_task: asyncio.Task[Any]) -> None:
-                client.in_flight -= 1
-
-            task = asyncio.get_running_loop().create_task(self._guarded_handle(text, client, parsed))
-            tasks.add(task)
-            task.add_done_callback(tasks.discard)
-            task.add_done_callback(finished)
-            return
-        await self._guarded_handle(text, client, parsed)
+            await self._guarded_handle(text, client, parsed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one bad frame must never end the read loop (it ends the whole gateway)
+            logger.exception("could not take a frame")
 
     async def _guarded_handle(
         self, text: str, client: Client | None, parsed: tuple[dict[str, Any] | None, str | None] | None = None
@@ -1260,6 +1273,8 @@ class GatewayServer:
                     await live.reliability.stop()
                 except Exception:
                     logger.warning("session %s: stopping its reliability bundle failed", live.session_id, exc_info=True)
+        with contextlib.suppress(Exception):
+            await self.learning.aclose()  # cancel the spawned learning tasks, then close the decision log
         await self.mcp.close()
         for p in self.providers:
             await p.aclose()
@@ -1295,7 +1310,11 @@ class GatewayServer:
         obj, err = parsed if parsed is not None else decode_frame(text)
         if err is not None:
             kind = PARSE_ERROR if err.startswith("parse error") else INVALID_REQUEST
-            self._reply(client, encode_error(None, kind, err))
+            if err.startswith("invalid params"):
+                kind = INVALID_PARAMS
+                if obj is not None and "id" not in obj:
+                    return  # a notification gets no reply, not even an error
+            self._reply(client, encode_error(reply_id(obj), kind, err))
             return
         assert obj is not None
         req_id = obj.get("id")
@@ -1523,6 +1542,8 @@ class GatewayServer:
         sid = sess.session_id if sess else ""
         if event.kind == "router.attempt":
             self.last_attempt = (event.provider, event.model)
+            if (served := attempt_holder.get()) is not None:  # the ModelCaller call in flight in this context
+                served.append((event.provider, event.model))
             if sess is not None:
                 sess.last_entry = (event.provider, event.model)
                 sess.last_tier = str(event.extra.get("tier", "main"))
@@ -1550,7 +1571,7 @@ class GatewayServer:
             self.emit("status.update", {"kind": "status", "text": f"all providers failed ({event.reason})"})
 
     #: Notification key shared by pause/park toasts so ``resumed`` can clear them.
-    PAUSE_KEY = "k3.reliability.pause"
+    PAUSE_KEY: str = "k3.reliability.pause"  # annotated: the bare assignment reads as an API key to gitleaks
     #: Notification key of the "offline protection off" warning (NetWatch failed to start).
     NETWATCH_KEY = "k3.reliability.netwatch"
 
@@ -1690,6 +1711,29 @@ class GatewayServer:
                 return status, final_text
             if self.halted and mgr.is_active() and status == "done":
                 status = "halted"  # the halt arrived while the turn ran: no judge call, no continuation
+            retry = None
+            if status != "done" and not blocked and mgr.is_active():
+                retry = self._goal_recovery(session, mgr, status)
+            if retry:
+                # a persistent goal does not pause on a failed or stalled turn: it waits a little (longer each time)
+                # and goes on, until it is done or the user stops it
+                delay, prompt, notice = retry
+                session.emit("notification.show", {"text": notice, "level": "info", "kind": "info", "key": "goal"})
+                session.emit(
+                    "status.update", {"kind": "status", "text": f"goal retries in {delay:.0f} s", "state": "working"}
+                )
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    session.run_result = "completed"
+                    self._block_goal_for(session, "interrupted")
+                    raise
+                if mgr.is_active() and not self.halted:
+                    session.goal_continuation = True
+                    continue
+                status = "halted" if self.halted and mgr.is_active() else status
+            if status == "done":
+                session.goal_retry_streak = 0
             if status != "done" or not mgr.is_active():
                 self._block_goal_for(session, status)  # an active goal never ends silently
                 self._session_finished(session, status)
@@ -1812,6 +1856,28 @@ class GatewayServer:
         spec = await ultracode.prepare(self, session, text, context=context)
         self.autonomy.drop_mode_verdict(session)
         return _Route("ultracode", "ultracode is on", f"scope {verdict.scope}", spec)
+
+    def _goal_recovery(self, session: LiveSession, mgr: GoalManager, status: str) -> tuple[float, str, str] | None:
+        """What a persistent goal does when its turn did not finish: ``(seconds to wait, next prompt, notice)``, or None
+        to leave it to ``_block_goal_for`` (pause). Persisting covers a failed turn (no provider answered after the
+        retries, an exception) and one that stopped for input (a question, an approval nobody answered, the loop
+        guard). It does not cover what the user set or did: a spend budget, ``/stop``, ``/daemon pause``."""
+        state = mgr.state
+        if not mgr.persist or state is None or state.implicit:
+            return None
+        if status == "error":
+            why = f"it failed ({scrub_text(session.last_error or 'see the error above')[:160]})"
+        elif status == "needs_input" and not session.budget_stopped:
+            why = "it stopped for input (a question, an approval nobody answered, or the loop guard)"
+        else:
+            return None
+        if not mgr.count_recovery_turn():
+            return None  # the user's --turns budget is spent: the goal pauses
+        session.goal_retry_streak += 1
+        delay = GoalManager.backoff(session.goal_retry_streak - 1)
+        prompt = CONTINUATION_PROMPT_RECOVER_TEMPLATE.format(goal=state.goal, why=why)
+        notice = f"↻ The goal's turn did not finish: {why}. Trying again in {delay:.0f} s; /goal clear stops it."
+        return delay, prompt, notice
 
     def _block_goal_for(self, session: LiveSession, status: str) -> None:
         """A turn that did not finish leaves its active goal paused, with the reason and one notification.
@@ -2020,6 +2086,7 @@ class GatewayServer:
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
         session.perms.reload()
         session.needs_input = False
+        session.budget_stopped = False
         session.run_result = None
         session.last_error, session.last_exc, session.last_api_calls = "", None, 0
         reliability = await self._reliability_for(session)
@@ -2212,6 +2279,7 @@ class GatewayServer:
             status = "needs_input"
             error = str(e)
             session.needs_input = True
+            session.budget_stopped = True
         except TurnCancelled:
             status = "interrupted"
         except asyncio.CancelledError:
@@ -2311,6 +2379,18 @@ class GatewayServer:
             session.last_checkpoint = time.monotonic()
         except Exception:  # noqa: BLE001 - a failed checkpoint must not mask the turn's own outcome
             logger.exception("could not persist the session")
+            if not session.persist_warned:  # once per session: the transcript is not being saved
+                session.persist_warned = True
+                session.emit(
+                    "notification.show",
+                    {
+                        "text": "Could not save this session: new messages are not being stored (see the gateway log)",
+                        "level": "error",
+                        "kind": "persist",
+                        "key": f"k3.persist.{session.session_id}",
+                    },
+                    importance="essential",
+                )
 
     def _checkpoint_turn(self, session: LiveSession) -> None:
         """After a tool result: persist the in-flight turn (throttled) so kill -9, an OOM kill or a reboot loses
@@ -2620,8 +2700,13 @@ class GatewayServer:
 
         Keys present in a file are replaced by the file's value. A key that was in a file at the previous read and is
         gone now (removed by hand or rolled back by an experiment) is reset to its fresh value, not left as it was.
+
+        This config is shared by every session, so only the user config and the server's own project apply to it; the
+        project config of the session ``cwd`` (a command's session) stays out (it leaked `permission_mode: yolo` and
+        `max_turns` into every new session). A session gets its own project rules from its PermissionState.
+        ``cwd`` only picks the project whose ``.mcp.json`` the MCP servers come from.
         """
-        base = Path(cwd) if cwd else default_project_dir()
+        base = default_project_dir()
         fresh = load_config(project_dir=base)
         keys = _file_keys(base)
         changed = (keys | self._file_keys) & set(Settings.model_fields)
@@ -2631,7 +2716,7 @@ class GatewayServer:
         if "providers" in changed:
             self.router = None
             self._tiers = None
-        self.mcp.configure(mcpjson.merged(self.config.mcp.servers, base))
+        self.mcp.configure(mcpjson.merged(self.config.mcp.servers, Path(cwd) if cwd else base))
 
     def activate_session(self, session_id: str) -> LiveSession | None:
         stored = self.store.get(session_id)
@@ -2732,12 +2817,17 @@ class GatewayServer:
                     meta["goal_started"] = {"at": state.get("created_at"), "message": len(session.stored.messages)}
             self.store.save(session.stored)
 
-        return GoalManager(
+        mgr = GoalManager(
             load,
             save,
             default_max_turns=self.config.goal.max_turns,
             default_gate_max_retries=self.config.goal.gate_max_retries,
+            persist=self.config.goal.persist,
         )
+        mgr.on_wait = lambda text: session.emit(
+            "notification.show", {"text": text, "level": "info", "kind": "info", "key": "goal"}
+        )
+        return mgr
 
     async def kick_goal(self, live: LiveSession, *, source: str) -> bool:
         """Start the next turn of an active goal that has no live turn. Boot resume and the watchdog both use this.
@@ -3322,6 +3412,9 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
     ultra = params.get("ultra_mode")
     if ultra is not None and ultra not in tune_cmd.ULTRA_MODES:
         raise _InvalidParams(f"unknown ultra_mode: {ultra} (one of {', '.join(tune_cmd.ULTRA_MODES)})")
+    for key in ("cwd", "model", "provider"):
+        if params.get(key) is not None and not isinstance(params[key], str):
+            raise _InvalidParams(f"{key} must be a string")
     stored = server.store.create(
         model=params.get("model") or server.config.default_model,
         provider=params.get("provider") or "",
@@ -3333,7 +3426,11 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
     if ultra == "ultracode":  # kept in the meta, so a resume and a /fork of this session have it
         stored.meta["ultra_mode"] = ultra
         server.store.save(stored)
-    live = LiveSession(stored.session_id, stored, server)
+    try:
+        live = LiveSession(stored.session_id, stored, server)
+    except Exception:
+        server.store.delete(stored.session_id)  # e.g. a bad permission_mode: each attempt left an empty row behind
+        raise
     live.reasoning_effort = params.get("effort")
     server.session = live
     if server.learning.enabled and not params.get("background"):
@@ -3365,14 +3462,19 @@ def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[Store
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     """``cwd`` (optional) narrows the list to that project's earlier sessions: same normalised cwd, at least one
     message, no automation runs, ``limit`` applied after the filter. Without it: the newest ``limit`` of all."""
-    limit = int(params.get("limit") or 50)
+    try:
+        limit = int(params.get("limit") or 50)
+    except (TypeError, ValueError):
+        raise _InvalidParams("limit must be a whole number") from None
+    if params.get("cwd") is not None and not isinstance(params["cwd"], str):
+        raise _InvalidParams("cwd must be a string")
     cwd = _norm_cwd(params.get("cwd"))
     sessions = _project_sessions(server, cwd, max(1, limit)) if cwd else server.store.list(limit=limit)
     rows = []
     for s in sessions:
         preview = ""
         for m in s.messages:
-            if m.get("role") == "user" and m.get("content"):
+            if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
                 preview = str(m["content"])[:120]
                 break
         live = server.live.get(s.session_id)
@@ -3410,6 +3512,8 @@ def transcript_rows(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     names: dict[str, tuple[str, str]] = {}
     rows: list[dict[str, Any]] = []
     for m in messages:
+        if not isinstance(m, dict):  # a hand-edited or imported row: skip the entry, keep the resume
+            continue
         role = m.get("role")
         if role == "assistant":
             for tc in m.get("tool_calls") or []:
@@ -3499,7 +3603,7 @@ async def _session_delete(server: GatewayServer, params: dict[str, Any]) -> dict
 
 async def _session_title(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
     sid = _require(params, "session_id")
-    title = _require(params, "title")
+    title = scrub_surrogates(str(_require(params, "title")))
     # The live session's own record: saving a detached copy of the row was undone by the next save of the live one,
     # and an auto title could overwrite it.
     live = server.live.get(str(sid))
@@ -3518,7 +3622,7 @@ async def _session_interrupt(server: GatewayServer, params: dict[str, Any]) -> d
 
 
 async def _session_steer(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    text = _require(params, "text")
+    text = scrub_surrogates(str(_require(params, "text")))
     pasted = _paste_spans(params, text)
     session = server.session
     if session is None or not session.streaming:
@@ -3560,6 +3664,8 @@ async def _session_workspace_move(server: GatewayServer, params: dict[str, Any])
     if session is None:
         raise _InvalidParams("no active session")
     session.stored.cwd = str(path)
+    session.perms.cwd = path  # the permission state keeps the old directory otherwise (project rules, sandbox root)
+    session.perms.reload()
     server.store.save(session.stored)
     return {"ok": True, "cwd": str(path)}
 
@@ -3585,7 +3691,7 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
     session = server.session
     if session is None:
         raise _InvalidParams("no active session")
-    text = _require(params, "text")
+    text = scrub_surrogates(str(_require(params, "text")))  # one lone surrogate failed every save of the session
     if server.halted:
         raise _InvalidParams("daemon is halted (/daemon pause); resume with /daemon resume")
     server.last_user_activity = time.time()
@@ -3597,12 +3703,15 @@ async def _prompt_submit(server: GatewayServer, params: dict[str, Any]) -> dict[
         # `streaming = True` yet (compaction, MCP start): a second task there overwrote turn_task, so /stop missed one.
         session.pending_prompts.append(prompt)
         return {"turn_id": "", "status": "queued"}
+    model = params.get("model")
+    if model and (not isinstance(model, str) or model not in tune_cmd.known_model_keys(server.config)):
+        raise _InvalidParams(tune_cmd.unknown_model_message(server.config, str(model)))  # a typo is not stored
     if params.get("background"):
         session.background = True
         session.stored.meta["background"] = True
     if session.background and server.background_paused:
         raise _InvalidParams("background work is paused (restart-storm safe mode); resume with /daemon resume")
-    session.stored.model = params.get("model") or session.stored.model
+    session.stored.model = model or session.stored.model
     session.turn_task = asyncio.get_running_loop().create_task(server._run_turn(session, prompt))
     return {"turn_id": session.turn_task.get_name(), "status": "streaming"}
 
@@ -3731,6 +3840,8 @@ async def _slash_exec(server: GatewayServer, params: dict[str, Any]) -> dict[str
     command = str(_require(params, "command")).strip().lstrip("/")
     session_id = params.get("session_id")
     parts = command.split(None, 1)
+    if not parts:
+        raise _InvalidParams("command is empty: give a slash command name")
     name, arg = parts[0], parts[1] if len(parts) > 1 else ""
     token = _ctx_cwd.set(params.get("cwd") or None)
     try:
@@ -3841,6 +3952,7 @@ async def _config_set(server: GatewayServer, params: dict[str, Any]) -> dict[str
         raw = params.get("value")
         on = raw if isinstance(raw, bool) else str(raw).lower() in ("1", "true", "on", "yes")
         server.config.display.focus_mode = on
+        tui_display._persist("display.focus_mode", on)  # saved like the other look-and-feel choices
         return {"ok": True, "key": key, "value": "on" if server.config.display.focus_mode else "off"}
     if key == "model":  # TUI /model <key> and the model picker: switch the session's model key
         return await _config_set_model(server, params)
@@ -3997,7 +4109,10 @@ async def _complete_path(server: GatewayServer, params: dict[str, Any]) -> dict[
     """Path completion for ``@file`` / ``./x`` words, relative to the session's directory."""
     word = str(params.get("word", ""))
     raw = word.lstrip("@")
-    expanded = Path(raw).expanduser()
+    try:
+        expanded = Path(raw).expanduser()
+    except RuntimeError:  # `~nouser/x`: no such home directory
+        return {"items": []}
     directory = expanded if raw.endswith("/") else expanded.parent
     if not directory.is_absolute():
         directory = _session_dir(server, params) / directory

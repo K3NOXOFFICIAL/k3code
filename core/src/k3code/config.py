@@ -8,11 +8,16 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from k3code import trust
 
 logger = logging.getLogger(__name__)
+
+
+class ConfigError(ValueError):
+    """A config value or file is invalid; the message names the file or variable (same class as confio.ConfigError)."""
+
 
 K3CODE_HOME = Path(os.environ.get("K3CODE_HOME", Path.home() / ".k3code")).expanduser()
 
@@ -146,10 +151,15 @@ class DisplayConfig(BaseModel):
 
 class GoalConfig(BaseModel):
     max_turns: int = 0  # judged turns before a goal pauses; 0 = no limit (the goal runs until done or blocked)
-    #: failed --check runs in a row before a goal pauses; 0 = no limit. A check that can never pass would otherwise
-    #: keep the goal (and the token spend) going until someone looks; /goal resume starts the count again.
-    gate_max_retries: int = 20
+    #: failed --check runs in a row before a goal pauses; 0 = no limit (the default). Set a number to bound a check
+    #: that can never pass; /goal resume starts the count again.
+    gate_max_retries: int = 0
     judge_model: str = "cheap"
+    #: A goal keeps going until it is done: a judge that cannot be reached, a check that cannot run, a blocked verdict,
+    #: empty replies and a failed turn make it wait and try again or find another way instead of pausing. Only what the
+    #: user set stops it (--turns, gate_max_retries, a spend budget, /stop, /goal pause|clear, /daemon pause). false
+    #: brings the older pausing back.
+    persist: bool = True
 
 
 class SubagentsConfig(BaseModel):
@@ -337,11 +347,27 @@ def _current_home() -> Path:
     return Path(os.environ.get("K3CODE_HOME", Path.home() / ".k3code")).expanduser()
 
 
+def _parse_mapping(text: str, where: Path) -> dict[str, Any]:
+    """YAML text as a mapping; a parse error or a non-mapping top level is a :class:`ConfigError` naming ``where``."""
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        raise ConfigError(f"{where}: not valid YAML ({str(e).splitlines()[0] if str(e) else type(e).__name__})") from e
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ConfigError(f"{where}: top level must be a mapping, not {type(data).__name__}")
+    return data
+
+
 def _load_yaml(path: Path) -> dict[str, Any]:
-    if path.is_file():
-        with path.open() as f:
-            return yaml.safe_load(f) or {}
-    return {}
+    if not path.is_file():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError(f"{path}: cannot be read ({e.__class__.__name__})") from e
+    return _parse_mapping(text, path)
 
 
 def load_user_section(name: str) -> Any:
@@ -382,7 +408,8 @@ def load_config(
     defaults = Settings().model_dump()
 
     # 2. User config (~/.k3code/config.yaml)
-    user_config = _load_yaml(_current_home() / "config.yaml")
+    user_config_path = _current_home() / "config.yaml"
+    user_config = _load_yaml(user_config_path)
 
     # 3. Project config (<project_dir>/.k3code/config.yaml): applied only as the user trusted it (see k3code.trust)
     project_config = {}
@@ -391,7 +418,7 @@ def load_config(
         if text is None:
             logger.debug("project config %s not applied: not trusted (k3code trust applies it)", project_dir)
         else:
-            project_config = yaml.safe_load(text) or {}
+            project_config = _parse_mapping(text, trust.config_path(project_dir))
         # Providers come from the user config only: a repo's base_url plus api_key_env would send the user's key to
         # the repo author's host (trust.describe and doctor say the section is ignored).
         if isinstance(project_config, dict) and "providers" in project_config:
@@ -420,15 +447,12 @@ def load_config(
     # 5. CLI overrides
     cli = cli_overrides or {}
 
-    # Merge in order
+    # Merge in order. A file section left empty (`learning:`) is null: not set, rather than a type error.
     merged = defaults
-    merged = _merge_dicts(merged, user_config)
-    merged = _merge_dicts(merged, project_config)
+    merged = _merge_dicts(merged, {k: v for k, v in user_config.items() if v is not None})
+    merged = _merge_dicts(merged, {k: v for k, v in project_config.items() if v is not None})
     merged = _merge_dicts(merged, env_overrides)
     merged = _merge_dicts(merged, cli)
-
-    _warn_unknown_escalate_keys(merged)
-    _warn_unknown_mode_keys(merged)
 
     # Expand provider api_key_env -> api_key (api_key_env is a required field on
     # ProviderEntry, so look it up without popping it out of the dict).
@@ -437,19 +461,41 @@ def load_config(
     from k3code.setup.state import read_env_file
 
     file_env = read_env_file()
-    for p in merged.get("providers", []):
-        name = p.get("api_key_env", "")
-        p["api_key"] = os.environ.get(name) or file_env.get(name, "")
+    providers = merged.get("providers")
+    for p in providers if isinstance(providers, list) else []:
+        if isinstance(p, dict):  # anything else is reported by the validation below
+            name = p.get("api_key_env", "")
+            p["api_key"] = os.environ.get(name) or file_env.get(name, "")
 
-    return Settings(**merged)
+    try:
+        settings = Settings(**merged)
+    except ValidationError as e:
+        raise ConfigError(_describe_invalid(e, user_config_path, project_dir)) from e
+    _warn_unknown_escalate_keys(merged)
+    _warn_unknown_mode_keys(merged)
+    return settings
+
+
+def _describe_invalid(e: ValidationError, user_file: Path, project_dir: Path | None) -> str:
+    """The first validation error with the config file(s) or environment variable that can have caused it."""
+    first = e.errors()[0]
+    loc = ".".join(str(x) for x in first["loc"])
+    top = str(first["loc"][0]) if first["loc"] else ""
+    where = [str(user_file)]
+    if project_dir:
+        where.append(str(trust.config_path(project_dir)))
+    env_key = f"K3CODE_{top.upper()}"
+    via_env = f"; K3CODE_{top.upper()} is set in the environment" if top and os.environ.get(env_key, "").strip() else ""
+    return f"invalid config: {loc}: {first['msg']} (from {' or '.join(where)}{via_env})"
 
 
 def _warn_unknown_escalate_keys(merged: dict[str, Any]) -> None:
     """A key under ``autonomy.escalate`` that nothing reads would be ignored without a word: say so."""
     from k3code.autonomy import ESCALATE_KEYS
 
-    section = (merged.get("autonomy") or {}).get("escalate") or {}
-    for key in sorted(set(section) - ESCALATE_KEYS):
+    auto = merged.get("autonomy")
+    section = auto.get("escalate") if isinstance(auto, dict) else None
+    for key in sorted(set(section) - ESCALATE_KEYS if isinstance(section, dict) else (), key=str):
         logger.warning(
             "autonomy.escalate.%s is not used and is ignored (known keys: %s)", key, ", ".join(sorted(ESCALATE_KEYS))
         )

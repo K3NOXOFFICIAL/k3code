@@ -6,10 +6,9 @@ import logging
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
 
 from k3code import trust
-from k3code.config import load_config
+from k3code.config import ConfigError, load_config
 from k3code.permissions import InvalidPermissionMode, permission_mode_from_config
 
 
@@ -66,5 +65,6 @@ def test_unknown_permission_mode_env_gets_the_normal_error(project: Path, monkey
 
 def test_malformed_int_env_is_a_field_validation_error(project: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("K3CODE_MAX_TURNS", "abc")
-    with pytest.raises(ValidationError, match="max_turns"):
+    # a ConfigError (the CLI prints it) naming the field and the variable; the pydantic error is its cause
+    with pytest.raises(ConfigError, match="max_turns.*K3CODE_MAX_TURNS"):
         load_config(project_dir=project)

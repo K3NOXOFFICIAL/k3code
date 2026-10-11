@@ -7,6 +7,7 @@ from typing import Any
 
 from k3code import chain_config
 from k3code.commands import CommandDef, CommandRegistry, tune
+from k3code.commands._util import split_args
 from k3code.commands.autocompact_cmd import AutoCompactCommand
 from k3code.commands.autonomy import AdvisorCommand, GoCommand, PreviewCommand, ProposalsCommand, ScopeCommand
 from k3code.commands.daemon import DaemonCommand
@@ -193,13 +194,18 @@ class _RenameCommand(CommandDef):
             return {"type": "message", "message": "Usage: /rename <title>"}
         if not session_id:
             return {"type": "message", "message": "No active session."}
-        stored = ctx.store.get(session_id)
+        # imported here: the gateway package imports this module
+        from k3code.gateway.sessions import scrub_surrogates
+
+        # The live session's own record: saving a detached copy of the row was undone by the next save of the live one
+        live = ctx.sessions.get(session_id)
+        stored = live.stored if live is not None else ctx.store.get(session_id)
         if stored is None:
             return {"type": "message", "message": "Session not found."}
-        stored.title = arg
+        stored.title = scrub_surrogates(arg)
         ctx.store.save(stored)
-        ctx.emit("session.title", {"session_id": session_id, "title": arg})
-        return {"type": "message", "message": f"Renamed to: {arg}"}
+        ctx.emit("session.title", {"session_id": session_id, "title": stored.title})
+        return {"type": "message", "message": f"Renamed to: {stored.title}"}
 
 
 class _ResumeCommand(CommandDef):
@@ -227,7 +233,8 @@ class _AddDirCommand(CommandDef):
             dirs = live.perms.add_dirs
             return {"type": "message", "message": "Added dirs: " + (", ".join(dirs) if dirs else "(none)")}
         base = Path(live.stored.cwd or ".")
-        path = Path(arg).expanduser()
+        words = split_args(arg)  # `/add-dir "my dir"`: the quotes are not part of the name
+        path = Path(words[0] if len(words) == 1 else arg).expanduser()
         path = (path if path.is_absolute() else base / path).resolve()
         if not path.is_dir():
             return {"type": "message", "message": f"Not a directory: {path}"}
