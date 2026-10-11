@@ -55,9 +55,21 @@ export function reconnectBackoffDelayMs(
   attempt: number,
   options: ReconnectBackoffOptions = {},
 ): number {
-  const baseDelayMs = options.baseDelayMs ?? DEFAULT_BASE_DELAY_MS;
-  const capMs = options.capMs ?? DEFAULT_CAP_MS;
-  const exponent = Math.min(Math.max(0, Math.trunc(attempt)), MAX_EXPONENT);
+  // setTimeout(NaN) fires at once, so a NaN or negative delay is a reconnect storm: whatever is not a
+  // usable number falls back to the default (an infinite cap is a real value: no cap).
+  const baseDelayMs =
+    typeof options.baseDelayMs === "number" &&
+    Number.isFinite(options.baseDelayMs) &&
+    options.baseDelayMs >= 0
+      ? options.baseDelayMs
+      : DEFAULT_BASE_DELAY_MS;
+  const capMs =
+    typeof options.capMs === "number" && options.capMs >= 0
+      ? options.capMs
+      : DEFAULT_CAP_MS;
+  const exponent = Number.isNaN(attempt)
+    ? 0
+    : Math.min(Math.max(0, Math.trunc(attempt)), MAX_EXPONENT);
   const ceiling = Math.min(capMs, baseDelayMs * 2 ** exponent);
 
   return options.jitter === false ? ceiling : Math.random() * ceiling;

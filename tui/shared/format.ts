@@ -7,8 +7,18 @@
 export function compactNumber(value: null | number | undefined): string {
   const num = Number(value ?? 0);
 
+  // Infinity is not "nothing": reading "0" for it hid a division by zero upstream.
+  if (num === Number.POSITIVE_INFINITY) {
+    return "∞";
+  }
+
   if (!Number.isFinite(num) || num <= 0) {
     return "0";
+  }
+
+  // toFixed switches to exponent notation at 1e21 ("1e+21M"); past 1e15 the unit rungs say nothing anyway.
+  if (num >= 1e15) {
+    return num.toExponential(1).replace(".0e", "e");
   }
 
   const scaled = (v: number, suffix: string) =>

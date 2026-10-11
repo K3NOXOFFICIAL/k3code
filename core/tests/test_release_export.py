@@ -5,8 +5,10 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 from typing import NamedTuple
 
@@ -134,3 +136,112 @@ def test_without_rule_files_only_the_generic_checks_run_and_it_says_so(tmp_path:
     (tree / "a.txt").write_text(f"{HOST} only\n", encoding="utf-8")
     result = _scan(tree, empty)
     assert result.returncode == 0 and "no name rules" in result.stderr
+
+
+# --- the scan must fail closed -------------------------------------------------------------------------------------
+
+
+def _scan_tree(tmp_path: Path, rule_bytes: bytes, content: str, **env: str) -> subprocess.CompletedProcess[str]:
+    folder = tmp_path / "rules"
+    folder.mkdir()
+    (folder / "personal.re").write_bytes(rule_bytes)
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "notes.txt").write_text(content, encoding="utf-8")
+    return subprocess.run(
+        ["sh", str(SCRIPT), "--scan", str(tree)],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**_env(folder), **env},
+    )
+
+
+@pytest.mark.parametrize("rule", ["(" + HOST, "(?i)" + HOST, HOST + "\\", HOST + ")(" + HOST + "[", "(" + FIRST])
+def test_a_rule_that_is_not_a_valid_regex_stops_the_scan(tmp_path: Path, rule: str) -> None:
+    """grep exits 2 on `(name`, which the scan used to swallow (`|| true`): it printed "scan passed" over a tree that
+    held the name. `(?i)` is only a warning in grep and then matches the literal "?i", which is no better."""
+    result = _scan_tree(tmp_path, f"# names\n{rule}\n".encode(), f"written by {HOST}\n")
+    assert result.returncode != 0
+    assert "scan passed" not in result.stdout
+    assert "personal.re line 2" in result.stderr  # the line number, so the owner can find the rule ...
+    assert HOST not in result.stdout + result.stderr  # ... and never the rule itself
+
+
+def test_crlf_rule_files_still_match(tmp_path: Path) -> None:
+    """A rule file saved with Windows line endings used to end every regex in a carriage return, so nothing matched
+    and the scan passed."""
+    result = _scan_tree(tmp_path, f"{HOST}\r\n{FIRST}\r\n".encode(), f"written by {HOST}\n")
+    assert result.returncode != 0
+    assert "notes.txt" in result.stderr
+    assert "scan passed" not in result.stdout
+
+
+def test_a_grep_that_fails_is_not_a_clean_scan(tmp_path: Path) -> None:
+    """Exit status 2 from any of the scan's greps (an unreadable file, ...) must fail the scan, not read as "no
+    match"."""
+    real_grep = shutil.which("grep")
+    assert real_grep
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    # fail only the tailnet-address pass, whose pattern holds "100"
+    (stub / "grep").write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do case $a in *100*) echo "grep: boom" >&2; exit 2 ;; esac; done\n'
+        f'exec {real_grep} "$@"\n'
+    )
+    (stub / "grep").chmod(0o755)
+    result = _scan_tree(tmp_path, b"", "nothing here\n", PATH=f"{stub}:{os.environ['PATH']}")
+    assert result.returncode != 0
+    assert "scan passed" not in result.stdout
+    assert "did not run to the end" in result.stderr
+
+
+def test_a_signal_stops_the_build_and_removes_its_scratch_dir(tmp_path: Path) -> None:
+    """The EXIT/HUP/INT/TERM trap only cleaned up, so SIGTERM during gzip let the build run on to "wrote ..." and exit
+    0. It must end the build (128+15) and remove the scratch directory."""
+    repo = tmp_path / "repo"
+    (repo / "scripts" / "release").mkdir(parents=True)
+    shutil.copy(SCRIPT, repo / "scripts" / "release" / "build_release.sh")
+    (repo / "VERSION").write_text("0.0.1\n", encoding="utf-8")
+    (repo / "a.txt").write_text("hello\n", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env.update(HOME=str(home), K3_RELEASE_RULES=str(tmp_path / "no-rules"), TMPDIR=str(tmp_path / "tmp"))
+    (tmp_path / "tmp").mkdir()
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+    subprocess.run([*git, "init", "-q", "-b", "Main"], cwd=repo, env=env, check=True)
+    subprocess.run([*git, "add", "-A"], cwd=repo, env=env, check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "init"], cwd=repo, env=env, check=True)
+    real_gzip = shutil.which("gzip")
+    assert real_gzip
+    stub, mark = tmp_path / "stub", tmp_path / "gzip-started"
+    stub.mkdir()
+    (stub / "gzip").write_text(f'#!/bin/sh\n: > "{mark}"\nsleep 2\nexec {real_gzip} "$@"\n')
+    (stub / "gzip").chmod(0o755)
+    env["PATH"] = f"{stub}:{env['PATH']}"
+    out = tmp_path / "out"
+    proc = subprocess.Popen(
+        ["sh", str(repo / "scripts" / "release" / "build_release.sh"), "-o", str(out), "HEAD"],
+        cwd=repo,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        for _ in range(300):
+            if mark.exists():
+                break
+            time.sleep(0.1)
+        assert mark.exists(), "the build never reached gzip"
+        proc.send_signal(signal.SIGTERM)
+        stdout, _stderr = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 128 + signal.SIGTERM
+    assert "wrote" not in stdout
+    assert not (out / "SHA256SUMS").exists()
+    assert list((tmp_path / "tmp").iterdir()) == []

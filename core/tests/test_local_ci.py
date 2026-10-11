@@ -266,6 +266,77 @@ def test_a_missing_tool_fails_its_area_with_an_install_hint(tmp_path: Path) -> N
     assert "missing shellcheck" in r.stdout
 
 
+def test_changed_with_an_unresolvable_base_is_a_usage_error(tmp_path: Path) -> None:
+    """`die` ran inside `< <(changed_files)`, which only ended that subshell: the loop read nothing and check.sh
+    printed "nothing to check" and exited 0, though --help promises 2."""
+    env = _env(tmp_path)
+    repo = _repo(tmp_path, env, {"README.md": "x\n"})  # no origin/Main
+    env["K3CODE_CI_ROOT"] = str(repo)
+    for args in (["--changed"], ["--changed", "--plan"], ["--changed", "--base", "nope/nope"]):
+        r = _run(["bash", str(CHECK), *args], REPO, env)
+        assert r.returncode == 2, (args, r.stdout, r.stderr)
+        assert "to compare with" in r.stderr
+        assert "nothing to check" not in r.stdout
+
+
+@pytest.mark.parametrize("empty", ["", ",", " ", ", ,"])
+def test_only_with_no_area_is_an_error_not_every_area(tmp_path: Path, empty: str) -> None:
+    r = _run(["bash", str(CHECK), "--plan", "--only", empty], REPO, _env(tmp_path))
+    assert r.returncode == 2, r.stdout
+    assert "--only needs an area" in r.stderr
+    assert "mode:" not in r.stdout  # it did not go on to plan the full check
+
+
+def _no_sha256_path(tmp: Path, bindir: Path) -> str:
+    """PATH = the stubs plus the system tools check.sh needs for the tui area, and neither sha256sum nor shasum."""
+    sysbin = tmp / "sysbin"
+    sysbin.mkdir()
+    for tool in ("bash", "git", "nice", "date", "find", "sort", "head", "tail", "tee", "sed", "cat", "mkdir", "dirname",
+                 "cut", "rm", "uname", "tr"):  # fmt: skip
+        src = shutil.which(tool)
+        assert src, tool
+        (sysbin / tool).symlink_to(src)
+    return f"{bindir}:{sysbin}"
+
+
+def _npm_ci_runs(tmp: Path) -> int:
+    log = tmp / "npm.log"
+    return sum(1 for line in log.read_text().splitlines() if line == "ci") if log.exists() else 0
+
+
+def test_tui_deps_hashes_the_lock_with_shasum_and_never_trusts_an_empty_hash(tmp_path: Path) -> None:
+    """tui_deps compared `sha256sum`'s (empty, on stock macOS) output with an empty stamp and skipped `npm ci`
+    forever."""
+    env = _env(tmp_path)
+    repo = _ci_repo(tmp_path, env)
+    bindir = _stub_bin(tmp_path)
+    (bindir / "npm").write_text(
+        f'#!/bin/sh\necho "$1" >> "{tmp_path}/npm.log"\n[ "$1" = ci ] && mkdir -p node_modules\nexit 0\n'
+    )
+    path = _no_sha256_path(tmp_path, bindir)
+    env.update(PATH=path, K3CODE_CI_ROOT=str(repo), K3CODE_CI_LOG_DIR=str(tmp_path / "logs"))
+    bash = shutil.which("bash") or "bash"
+
+    def run_tui() -> None:
+        r = _run([bash, str(CHECK), "--only", "tui", "--quick"], REPO, env)
+        assert r.returncode == 0, r.stdout + r.stderr
+
+    # no hash tool at all: nothing to compare, so every run installs
+    run_tui()
+    run_tui()
+    assert _npm_ci_runs(tmp_path) == 2
+    assert not (repo / "tui" / "node_modules" / ".k3ci-lock").exists()
+    # shasum (the macOS tool): the lock's hash is stamped and the second run skips npm ci
+    shasum = tmp_path / "bin" / "shasum"
+    shasum.write_text('#!/bin/sh\n[ "$1 $2" = "-a 256" ] || exit 1\nprintf "%s  %s\\n" 0123abcd "$3"\n')
+    shasum.chmod(0o755)
+    run_tui()  # the stamp is missing: installs and stamps
+    assert (repo / "tui" / "node_modules" / ".k3ci-lock").read_text().strip() == "0123abcd"
+    run_tui()
+    assert _npm_ci_runs(tmp_path) == 3
+    assert "npm ci skipped" in (tmp_path / "logs" / "tui.log").read_text()
+
+
 # --- hooks ---------------------------------------------------------------------------------------------------------
 
 
@@ -483,3 +554,135 @@ def test_update_rejects_an_asset_that_does_not_match_sha256sums(
     rel = upd.Release(tag="v1.2.3", version="1.2.3", body="", prerelease=False, assets={n: n for n in names})
     with pytest.raises(ValueError, match="k3-linux-amd64"):
         upd.install_release(rel, None, uv="uv")
+
+
+# --- strip_git_env -------------------------------------------------------------------------------------------------
+
+
+def test_strip_git_env_drops_the_repository_variables_and_keeps_the_credential_ones(tmp_path: Path) -> None:
+    """strip_git_env unset every GIT_* variable, which also removed GIT_ASKPASS, GIT_SSL_CAINFO and the GIT_CONFIG_COUNT
+    / KEY_n / VALUE_n set an environment authenticates its fetch and push with."""
+    keep = {
+        "GIT_ASKPASS": "/bin/askpass",
+        "GIT_SSL_CAINFO": "/etc/ca.pem",
+        "GIT_SSH_COMMAND": "ssh -i /k",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.extraheader",
+        "GIT_CONFIG_VALUE_0": "Authorization: x",
+        "GIT_CONFIG_PARAMETERS": "'a.b=c'",
+    }
+    drop = {
+        "GIT_DIR": "/nonexistent/.git",
+        "GIT_WORK_TREE": "/nonexistent",
+        "GIT_INDEX_FILE": "/nonexistent/index",
+        "GIT_OBJECT_DIRECTORY": "/nonexistent/objects",
+        "GIT_COMMON_DIR": "/nonexistent/common",
+        "GIT_PREFIX": "sub/",
+    }
+    env = _env(tmp_path)
+    env.update(keep)
+    env.update(drop)
+    script = '. "$1"; strip_git_env; for v in "${@:2}"; do printf "%s=%s\\n" "$v" "${!v-<unset>}"; done'
+    names = [*keep, *drop]
+    r = _run(["bash", "-c", script, "x", str(REPO / "scripts" / "ci" / "lib.sh"), *names], tmp_path, env)
+    assert r.returncode == 0, r.stderr
+    got = dict(line.split("=", 1) for line in r.stdout.splitlines())
+    assert {k: got[k] for k in keep} == keep
+    assert {k: got[k] for k in drop} == {k: "<unset>" for k in drop}
+
+
+# --- release.sh: the TUI tarball -----------------------------------------------------------------------------------
+
+
+def _release_sandbox(tmp: Path) -> tuple[Path, dict[str, str]]:
+    """A repository holding copies of release.sh, build_release.sh and lib.sh, a bare origin, and stub uv / npm / go /
+    gh: `release.sh --dry-run --no-check 0.0.1` runs there start to finish without building anything real."""
+    env = _env(tmp)
+    origin = tmp / "origin.git"
+    _run(["git", "init", "-q", "--bare", "-b", "Main", str(origin)], tmp, env)
+    repo = _repo(
+        tmp,
+        env,
+        {
+            ".gitignore": ".k3dev/\ntui/dist/\n",
+            "VERSION": "0.0.1\n",
+            "CHANGELOG.md": "# Changelog\n\n## [0.0.1] - 2026-01-01\n\n- first\n",
+            "core/pyproject.toml": "",
+            "panes/cmd/k3/main.go": "",
+            "tui/package.json": "{}\n",
+        },
+    )
+    for rel in ("scripts/ci/lib.sh", "scripts/release/release.sh", "scripts/release/build_release.sh"):
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(REPO / rel, repo / rel)
+    _git(repo, env, "add", "-A")
+    _git(repo, env, "commit", "-q", "-m", "scripts")
+    _git(repo, env, "remote", "add", "origin", str(origin))
+    _git(repo, env, "push", "-q", "origin", "Main")
+    _git(repo, env, "fetch", "-q", "origin")
+    bindir = tmp / "bin"
+    bindir.mkdir()
+    (bindir / "uv").write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        '  build) while [ $# -gt 0 ]; do [ "$1" = --out-dir ] && out=$2; shift; done\n'
+        '         mkdir -p "$out"; echo wheel > "$out/k3code-0.0.1-py3-none-any.whl" ;;\n'
+        '  export) while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo reqs > "$out" ;;\n'
+        "esac\n"
+    )
+    (bindir / "npm").write_text(
+        "#!/bin/sh\n"
+        'echo "$*" >> "$STUB_LOG"\n'
+        'if [ "$1 $2" = "run build" ]; then\n'
+        '  [ -z "$NPM_FAIL_BUILD" ] || exit 1\n'
+        "  mkdir -p dist; echo fresh > dist/entry.js\n"
+        "fi\n"
+    )
+    (bindir / "go").write_text(
+        '#!/bin/sh\nwhile [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done; echo bin > "$out"\n'
+    )
+    (bindir / "gh").write_text("#!/bin/sh\nexit 0\n")
+    for f in bindir.iterdir():
+        f.chmod(0o755)
+    rules = tmp / "no-rules"
+    rules.mkdir()
+    env.update(PATH=f"{bindir}:{env['PATH']}", K3_RELEASE_RULES=str(rules), STUB_LOG=str(tmp / "stub.log"))
+    return repo, env
+
+
+def test_release_does_not_ship_a_stale_tui_tarball_when_the_build_fails(tmp_path: Path) -> None:
+    """The TUI steps ran in a subshell on the left of `||`, where errexit is off: only tar's status counted, so a
+    failing `npm run build` left an earlier tui/dist to be packed and released."""
+    repo, env = _release_sandbox(tmp_path)
+    stale = repo / "tui" / "dist"
+    stale.mkdir()
+    (stale / "stale.js").write_text("old build\n")
+    env["NPM_FAIL_BUILD"] = "1"
+    r = _run(["bash", str(repo / "scripts" / "release" / "release.sh"), "--dry-run", "--no-check", "0.0.1"], repo, env)
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert "the TUI build failed" in r.stderr
+    assert not list((repo / ".k3dev" / "release" / "0.0.1" / "assets").glob("k3code-tui-*"))
+    assert "release: k3 binaries" not in r.stdout  # it stopped there
+
+
+def test_release_packs_a_fresh_tui_build_and_not_the_old_dist(tmp_path: Path) -> None:
+    repo, env = _release_sandbox(tmp_path)
+    stale = repo / "tui" / "dist"
+    stale.mkdir()
+    (stale / "stale.js").write_text("old build\n")
+    r = _run(["bash", str(repo / "scripts" / "release" / "release.sh"), "--dry-run", "--no-check", "0.0.1"], repo, env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    with tarfile.open(repo / ".k3dev" / "release" / "0.0.1" / "assets" / "k3code-tui-0.0.1.tar.gz") as tf:
+        assert sorted(tf.getnames()) == ["dist", "dist/entry.js"]
+
+
+@pytest.mark.parametrize("bad", ["1.2.3..", "1.2.3.", "1.2.3-", "1.2.3-.x", "1.2.3-rc..1", "1.2", "v1.2.3", "1.2.3 "])
+def test_release_rejects_a_malformed_version(bad: str) -> None:
+    r = subprocess.run(["bash", str(RELEASE), "--list-assets", bad], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "not a version" in r.stderr, (bad, r.stdout, r.stderr)
+
+
+@pytest.mark.parametrize("good", ["1.2.3", "1.2.3-rc.1", "1.2.3.dev1", "1.2.3.4", "10.0.0"])
+def test_release_accepts_the_usual_versions(good: str) -> None:
+    assert _assets(good)[1] == f"k3code-{good}-requirements.txt"

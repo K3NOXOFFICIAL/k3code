@@ -49,7 +49,10 @@ _SUMMARY_MAX = 150  # tuios refuses a held summary over 160 bytes
 _CALL_TIMEOUT = 5.0
 _HOLD_TIMEOUT = 310.0
 
-#: JSON-RPC methods a read-only pane may not send
+#: JSON-RPC methods a read-only pane may not send. A deny-list on purpose: the TUI of a watch-only attach sends many
+#: read methods of its own (session.resume, the completions, the usage and process polls, ...) and a method missing from
+#: an allow-list would break the window instead of failing safe. tests/test_panes.py classifies every method the gateway
+#: registers, so a new one cannot be added without deciding which side it is on.
 READONLY_BLOCKED = frozenset(
     {
         "prompt.submit",
@@ -74,6 +77,17 @@ READONLY_BLOCKED = frozenset(
         "model.save_key",
         "model.disconnect",
         "subagent.interrupt",
+        # the rest of what changes a session, the daemon or the user's files
+        "session.undo",  # drops the last turn
+        "session.close",  # closes the live session
+        "session.save",  # writes the transcript into the session's working directory
+        "session.workspace.move",
+        "shell.exec",  # runs the user's command
+        "reload.mcp",  # restarts the daemon's MCP servers
+        "reload.env",  # re-reads config.yaml and the key file into the running gateway
+        "delegation.pause",
+        "subagent.steer",
+        "browser.manage",  # connects to / drops the browser the tools use
     }
 )
 
@@ -332,6 +346,8 @@ class PaneLink:
             self.reporter.report(payload["state"], str(payload.get("text") or ""))
         elif etype == "pane.open" and isinstance(payload, dict):
             self.open_pane(payload)
+        elif etype == "request.cancel":  # the gateway frames it as a request today; an event is the same thing
+            self._cancel(str(payload.get("id", "")))
 
     # ── approvals ─────────────────────────────────────────────────────
 

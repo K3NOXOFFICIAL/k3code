@@ -16,6 +16,9 @@ import (
 // current mode. k3keys touches app and input, but neither may import k3keys
 // (the reason this lives on hook variables rather than calls).
 func Install(state *KeyState, bindings map[Mode]map[string]string) {
+	// A misspelled action would otherwise swallow its key without a word.
+	warnUnknownActions(bindings, actionKnown)
+
 	// PreHandler intercepts key events before tuios processes them
 	input.PreHandler = func(msg tea.Msg, o *app.OS) (bool, tea.Model, tea.Cmd) {
 		keyMsg, ok := msg.(tea.KeyPressMsg)
@@ -66,4 +69,11 @@ func Install(state *KeyState, bindings map[Mode]map[string]string) {
 		}
 		return hints
 	}
+}
+
+// actionKnown reports whether the dispatcher runs action, the way
+// input.RunActionByName finds it: a dispatcher handler, a [[keybindings.command]]
+// entry or one of the prefix work actions.
+func actionKnown(action string) bool {
+	return app.PrefixWorkActions[action] || input.GetDispatcher().HasAction(action)
 }

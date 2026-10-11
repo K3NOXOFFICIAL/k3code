@@ -73,7 +73,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 [ -n "$VER" ] || die "usage: release.sh [--dry-run [--no-check]] VERSION | --list-assets VERSION"
-printf '%s\n' "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$' ||
+printf '%s\n' "$VER" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$' ||
   die "not a version: $VER (expected 1.2.3 or 1.2.3-rc.1, without a leading v)"
 if [ "$LIST" = 1 ]; then
   asset_names "$VER"
@@ -145,12 +145,16 @@ echo "release: locked requirements"
   -o "$ASSETS/k3code-$VER-requirements.txt")
 
 echo "release: TUI tarball"
+# A subshell on the left of || runs with errexit off, so the steps are chained with && (a plain list would pack
+# whatever tui/dist an earlier build left behind when `npm run build` fails, since only tar's status would count),
+# and a stale dist is removed first (it is git-ignored, so removing it cannot dirty the tree).
+rm -rf tui/dist
 (
-  cd tui
-  npm ci --no-audit --no-fund
-  npm run build:ink
-  npm run build
-  tar -czf "$ASSETS/k3code-tui-$VER.tar.gz" dist
+  cd tui &&
+    npm ci --no-audit --no-fund &&
+    npm run build:ink &&
+    npm run build &&
+    tar -czf "$ASSETS/k3code-tui-$VER.tar.gz" dist
 ) >"$OUT/build/tui.log" 2>&1 || die "the TUI build failed; see $OUT/build/tui.log"
 
 echo "release: k3 binaries"

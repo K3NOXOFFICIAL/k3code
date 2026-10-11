@@ -29,9 +29,35 @@ export interface FuzzyMatch {
 
 const WORD_BOUNDARY = /[-_/.\s]/;
 
-/** Length-preserving search fold: lower-case and `[-_.]` → space. */
+/**
+ * Lower-case one code point without changing its length. `toLowerCase()` is not
+ * length-preserving: "İ" (U+0130) becomes "i" plus a combining dot, two UTF-16
+ * units, which shifts every later index and made positions point past the end
+ * of the original. Such a character folds to the first code point of its
+ * lower-case form ("i", so `istanbul` finds `İstanbul`) when that keeps the
+ * length, and is left as it was otherwise.
+ */
+function foldChar(ch: string): string {
+  const lower = ch.toLowerCase();
+
+  if (lower.length === ch.length) {
+    return lower;
+  }
+
+  const base = String.fromCodePoint(lower.codePointAt(0)!);
+
+  return base.length === ch.length ? base : ch;
+}
+
+/** Length-preserving search fold: lower-case (per code point) and `[-_.]` → space. */
 export function searchFold(value: string): string {
-  return value.toLowerCase().replace(/[-_.]/g, " ");
+  let folded = "";
+
+  for (const ch of value) {
+    folded += foldChar(ch);
+  }
+
+  return folded.replace(/[-_.]/g, " ");
 }
 
 function isBoundary(target: string, index: number): boolean {

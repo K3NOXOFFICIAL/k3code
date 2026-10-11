@@ -136,6 +136,14 @@ var defaultBindings = map[Mode]map[string]string{
 	},
 }
 
+// pseudoActions are the actions handleAction runs itself rather than handing to
+// the tuios dispatcher.
+var pseudoActions = map[string]bool{
+	"k3:chooser": true, "k3:mode:panes": true, "k3:mode:tabs": true, "k3:mode:sessions": true,
+	"k3:mode:resize": true, "k3:mode:search": true, "k3:mode:agents": true,
+	"k3:lock": true, "k3:typing": true, "esc": true,
+}
+
 // globalKeys are the typing-mode keys that also work in every other mode.
 var globalKeys = map[string]bool{
 	"alt+left": true, "alt+right": true, "alt+up": true, "alt+down": true,
@@ -182,8 +190,10 @@ func (s *KeyState) Handle(key string, bindings map[Mode]map[string]string) ([]st
 		}
 	}
 
-	// Check for action in current mode
-	if action, ok := modeBindings[key]; ok {
+	// Check for action in current mode. An empty action is how a user unbinds a
+	// key (`"alt+n" = ""`, as in the global-key branch above): it is no binding,
+	// so it neither runs an action named "" nor swallows the key in Typing mode.
+	if action, ok := modeBindings[key]; ok && action != "" {
 		return s.handleAction(action)
 	}
 

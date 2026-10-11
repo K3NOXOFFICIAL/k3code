@@ -66,7 +66,8 @@ export function mix(a: string, b: string, t: number): string {
   const pa = parseColor(a);
   const pb = parseColor(b);
 
-  if (!pa || !pb) {
+  // A t that is not a number would put NaN in every channel ("#NaNNaNNaN").
+  if (!pa || !pb || !Number.isFinite(t)) {
     return a;
   }
 
@@ -142,6 +143,9 @@ export function readableOn(
   return best;
 }
 
+const DEFAULT_STEP = 0.2;
+const MIN_STEP = 0.001;
+
 /**
  * Step-mix `color` toward the pole opposite `bg` (white on a dark background,
  * black on a light one) until the contrast ratio clears `min`. Each rung
@@ -154,13 +158,20 @@ export function readableOn(
  * from it and a finer ladder lands visibly different fills (nous `#3b6acb` vs
  * `#3f70d8`). The TUI's chainable form opts into 0.05 for less hue loss.
  * The accumulating loop (rather than `i * step`) is deliberate — it is the
- * exact float sequence the old desktop ladder produced.
+ * exact float sequence the old desktop ladder produced. A step that cannot
+ * advance the ladder (zero, negative, NaN, infinite) falls back to the default;
+ * a tiny one is raised to `MIN_STEP`, so the loop always ends.
+ *
+ * The pole is white on a dark background and black on a light one, except when
+ * that pole cannot reach `min` against `bg` and the other one gets closer (a
+ * mid-tone background: `#b0b0b0` caps at 2.17:1 with white and reaches 9.68:1
+ * with black). Whenever the usual pole can reach `min` nothing changes.
  */
 export function ensureContrast(
   color: string,
   bg: string,
   min: number,
-  step = 0.2,
+  step = DEFAULT_STEP,
 ): string {
   const bgLuminance = relativeLuminance(bg);
 
@@ -174,10 +185,18 @@ export function ensureContrast(
     return color;
   }
 
-  const pole = bgLuminance < 0.5 ? "#ffffff" : "#000000";
+  const rung =
+    Number.isFinite(step) && step > 0 ? Math.max(step, MIN_STEP) : DEFAULT_STEP;
+  const usual = bgLuminance < 0.5 ? "#ffffff" : "#000000";
+  const other = usual === "#ffffff" ? "#000000" : "#ffffff";
+  const usualMax = contrastRatio(usual, bg) ?? 0;
+  const pole =
+    usualMax >= min || (contrastRatio(other, bg) ?? 0) <= usualMax
+      ? usual
+      : other;
   let best = color;
 
-  for (let amount = step; amount <= 1.0001; amount += step) {
+  for (let amount = rung; amount <= 1.0001; amount += rung) {
     best = mix(color, pole, Math.min(amount, 1));
 
     const stepRatio = contrastRatio(best, bg);

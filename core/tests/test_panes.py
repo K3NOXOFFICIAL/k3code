@@ -9,6 +9,7 @@ import pytest
 
 from fake_tuios import FakeTuios
 from k3code.integrations.panes import (
+    READONLY_BLOCKED,
     PaneLink,
     clean_summary,
     k3code_argv,
@@ -169,6 +170,10 @@ async def test_inbox_deny_resolves_the_gateway_approval(tuios, tmp_path, monkeyp
     assert tuios.verbs("request-approval")[0]["tool"] == "bash"
     cancels = [f for f in frames_of(server) if f.get("method") == "request.cancel"]
     assert cancels and cancels[0]["params"]["reason"].startswith("answered")
+    # It carries an id like a request, but nobody answers a cancel: the TUI's channel (tui/shared/json-rpc-channel.ts,
+    # json-rpc-channel.test.ts) delivers an id-bearing request.cancel as an event and sends no reply. Changing this
+    # shape means changing that side, the attach bridge (daemon.py) and docs/tui-contract.md together.
+    assert isinstance(cancels[0].get("id"), str)
 
 
 async def test_inbox_always_resolves_as_always(tuios, tmp_path, monkeypatch):
@@ -196,6 +201,33 @@ def test_answering_in_the_pane_cancels_the_hold(tuios):
     gate.set()
     link.join()
     assert injected == []  # the pane's own answer won; the Inbox answer is dropped
+
+
+def cancel_frame(shape: str, req_id: str = "approval-7") -> str:
+    params = {"id": req_id, "method": "approval", "reason": "timeout"}
+    if shape == "request":  # what the gateway and the attach bridge send today: a frame with an id of its own
+        return json.dumps({"jsonrpc": "2.0", "id": "k3-1", "method": "request.cancel", "params": params})
+    return json.dumps({"jsonrpc": "2.0", "method": "event", "params": {"type": "request.cancel", "payload": params}})
+
+
+@pytest.mark.parametrize("shape", ["request", "event"])
+def test_a_withdrawn_request_cancels_the_hold(tuios, shape):
+    """The gateway withdrew the approval (timeout, interrupt): the Inbox hold goes too, whichever way the frame is
+    framed."""
+    import threading
+
+    gate = threading.Event()
+    tuios.answers["request-approval"] = lambda p: (gate.wait(3), {"decision": "once"})[1]
+    injected: list = []
+    link = PaneLink.from_env(lambda *a: injected.append(a), environ=tuios.env())
+    link.on_server_line(approval_frame())
+    tuios.wait_for("request-approval")
+    hold = link._holds["approval-7"]
+    link.on_server_line(cancel_frame(shape))
+    assert hold.cancelled and "approval-7" not in link._holds
+    gate.set()
+    link.join()
+    assert injected == []
 
 
 # ── new panes ────────────────────────────────────────────────────────
@@ -290,6 +322,76 @@ def test_readonly_refuses_tune_set_but_not_tune_get(tuios):
         assert readonly_verdict(json.loads(line)) == err  # the daemon's own read-only attach filters the same way
     get = json.dumps({"jsonrpc": "2.0", "id": 8, "method": "tune.get", "params": {}})
     assert link.on_client_line(get) is None and readonly_verdict(json.loads(get)) is None
+
+
+#: Gateway methods a watch-only attach may call: reads, plus the attach flow itself (session.resume / activate / create)
+#: and a few acknowledgements that change nothing. Every other registered method is in READONLY_BLOCKED.
+READONLY_ALLOWED = frozenset(
+    {
+        "commands.catalog",
+        "complete.path",
+        "complete.slash",
+        "config.get",
+        "delegation.status",
+        "image.detach",  # an acknowledgement
+        "input.detect_drop",
+        "model.options",
+        "paste.collapse",  # stores the composer's own large paste under the gateway home, nothing of the session
+        "process.list",
+        "session.activate",
+        "session.active_list",
+        "session.control.read",
+        "session.create",
+        "session.events.since",
+        "session.events.stats",
+        "session.list",
+        "session.most_recent",
+        "session.resume",
+        "session.status",
+        "session.usage",
+        "setup.status",
+        "skills.reload",  # lists what a fresh scan finds
+        "spawn_tree.save",  # an acknowledgement
+        "subagent.list",
+        "subagent.tail",
+        "system.battery",
+        "tune.get",
+    }
+)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        *("prompt.submit", "prompt.background", "session.interrupt", "session.steer", "session.delete", "tune.set"),
+        *("session.undo", "session.close", "session.save", "session.workspace.move", "shell.exec", "reload.mcp"),
+        *("reload.env", "delegation.pause", "subagent.steer", "subagent.interrupt", "browser.manage", "config.set"),
+    ],
+)
+def test_readonly_blocks_every_method_that_changes_something(method):
+    assert method in READONLY_BLOCKED
+    obj = {"jsonrpc": "2.0", "id": 11, "method": method, "params": {}}
+    err = readonly_verdict(obj)
+    assert err and json.loads(err)["error"] == {"code": -32000, "message": "this pane is read-only"}
+
+
+@pytest.mark.parametrize("method", sorted(READONLY_ALLOWED))
+def test_readonly_lets_the_reads_and_the_attach_flow_through(method):
+    assert readonly_verdict({"jsonrpc": "2.0", "id": 12, "method": method, "params": {}}) is None
+
+
+def test_every_gateway_method_is_classified_for_the_readonly_attach():
+    """Why a deny-list stays safe: this fails when the gateway registers a method that is in neither list, so a new
+    mutating method cannot reach a watch-only attach unnoticed. Add it to READONLY_BLOCKED (panes.py) when it changes
+    anything, else to READONLY_ALLOWED above."""
+    from k3code.gateway.server import _HANDLERS
+
+    registered = set(_HANDLERS)
+    assert not READONLY_BLOCKED & READONLY_ALLOWED
+    assert not (READONLY_BLOCKED | READONLY_ALLOWED) - registered, "a listed method the gateway no longer registers"
+    assert not registered - READONLY_BLOCKED - READONLY_ALLOWED, sorted(
+        registered - READONLY_BLOCKED - READONLY_ALLOWED
+    )
 
 
 async def test_fanout_panes_config_emits_pane_open(tmp_path, monkeypatch):

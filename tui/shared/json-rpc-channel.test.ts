@@ -440,4 +440,115 @@ describe("JsonRpcRequestChannel", () => {
       (JSON.parse(third) as { result?: { answer?: string } }).result?.answer,
     ).toBe("yes");
   });
+
+  // The gateway frames `request.cancel` like a request (it carries an id: `k3-N` from
+  // the gateway, `cancel-<id>` from the attach bridge) but nobody answers a
+  // cancel. It was classified as a server request, no handler took it, and the
+  // channel replied -32601, so the approval card stayed open after a timeout,
+  // an interrupt or an answer in the Inbox.
+  describe("request.cancel", () => {
+    const cancelFrame = (id: unknown) =>
+      JSON.stringify({
+        id,
+        jsonrpc: "2.0",
+        method: "request.cancel",
+        params: { id: "approval-1", method: "approval", reason: "timeout" },
+      });
+
+    it.each(["k3-9", "cancel-approval-1"])(
+      "delivers the id-bearing frame %s as a request.cancel event and sends no reply",
+      (id) => {
+        const events: Array<{ type: string; payload: unknown }> = [];
+        const handled: string[] = [];
+        const { sent, transport } = spyTransport();
+        const channel = new JsonRpcRequestChannel({
+          onEvent: (ev) => void events.push(ev),
+          onUnhandledRequest: (req) => void handled.push(req.method),
+        });
+
+        channel.attach(transport);
+        channel.onRequest((req) => void handled.push(req.method));
+        channel.handleFrame(cancelFrame(id));
+
+        expect(events).toEqual([
+          {
+            type: "request.cancel",
+            payload: {
+              id: "approval-1",
+              method: "approval",
+              reason: "timeout",
+            },
+          },
+        ]);
+        expect(sent).toEqual([]); // not even a -32601
+        expect(handled).toEqual([]); // no server-request handler sees it
+      },
+    );
+
+    it("still delivers the event-shaped cancel the same way", () => {
+      const events: string[] = [];
+      const channel = new JsonRpcRequestChannel({
+        onEvent: (ev) => void events.push(ev.type),
+      });
+
+      channel.attach(spyTransport().transport);
+      channel.handleFrame(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          method: "event",
+          params: {
+            type: "request.cancel",
+            payload: { id: "a", method: "approval", reason: "timeout" },
+          },
+        }),
+      );
+      expect(events).toEqual(["request.cancel"]);
+    });
+
+    it("never settles a pending call of ours, whatever id the cancel carries", async () => {
+      const { transport, last } = spyTransport();
+      // numeric request ids: a cancel frame with the same number would reach the response branch
+      const channel = new JsonRpcRequestChannel({
+        createRequestId: (n) => n,
+        onEvent: () => undefined,
+      });
+
+      channel.attach(transport);
+
+      const pending = channel.request("session.list");
+      const ours = last().id;
+      let settled = false;
+
+      void pending.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+      // a cancel whose id equals one of our request ids
+      channel.handleFrame(cancelFrame(ours));
+      await Promise.resolve();
+      expect(settled).toBe(false);
+
+      channel.handleFrame(
+        JSON.stringify({ id: ours, jsonrpc: "2.0", result: { ok: true } }),
+      );
+      await expect(pending).resolves.toEqual({ ok: true });
+    });
+
+    it("ignores a cancel without params instead of throwing", () => {
+      const events: unknown[] = [];
+      const channel = new JsonRpcRequestChannel({
+        onEvent: (ev) => void events.push(ev),
+      });
+
+      channel.attach(spyTransport().transport);
+      channel.handleFrame(
+        JSON.stringify({
+          id: "k3-1",
+          jsonrpc: "2.0",
+          method: "request.cancel",
+        }),
+      );
+      expect(events).toEqual([{ type: "request.cancel", payload: {} }]);
+    });
+  });
 });

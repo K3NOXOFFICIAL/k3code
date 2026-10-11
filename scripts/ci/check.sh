@@ -62,6 +62,7 @@ while [ $# -gt 0 ]; do
     --plan) PLAN=1 ;;
     --only)
       [ $# -ge 2 ] || die "--only needs an area ($ALL_AREAS)"
+      [ -n "${2//[, ]/}" ] || die "--only needs an area ($ALL_AREAS), not an empty value"
       for a in ${2//,/ }; do
         valid_area "$a" || die "unknown area: $a (areas: $ALL_AREAS)"
         ONLY="$ONLY $a"
@@ -100,7 +101,10 @@ changed_files() {
 }
 
 changed_areas() {
-  local f areas=" secrets "
+  local f files areas=" secrets "
+  # Not `done < <(changed_files)`: a die inside a process substitution only ends that subshell, the loop would read
+  # nothing and "nothing to check" would exit 0 for a base that cannot be resolved.
+  files=$(changed_files) || exit 2
   add() { case $areas in *" $1 "*) ;; *) areas="$areas$1 " ;; esac; }
   while IFS= read -r f; do
     case $f in
@@ -114,7 +118,7 @@ changed_areas() {
       scripts/*.py) add core ;;
       *.sh | install/*) add shell ;;
     esac
-  done < <(changed_files)
+  done <<<"$files"
   echo "$areas"
 }
 
@@ -201,18 +205,29 @@ area_core() {
   fi
 }
 
-# npm ci when tui/node_modules does not match package-lock.json (a stamp holds the lock's hash).
+# lock_hash FILE: the sha256 of FILE, from sha256sum or, where that does not exist (stock macOS), shasum -a 256. Empty
+# when neither works.
+lock_hash() {
+  if have sha256sum; then
+    sha256sum -- "$1" | cut -d' ' -f1
+  elif have shasum; then
+    shasum -a 256 -- "$1" | cut -d' ' -f1
+  fi
+}
+
+# npm ci when tui/node_modules does not match package-lock.json (a stamp holds the lock's hash). Without a hash there
+# is nothing to compare, so npm ci runs and nothing is stamped: an empty hash must never "match" an empty stamp.
 tui_deps() {
   local want have_sum=""
-  want=$(sha256sum package-lock.json | cut -d' ' -f1)
+  want=$(lock_hash package-lock.json)
   [ -f node_modules/.k3ci-lock ] && have_sum=$(cat node_modules/.k3ci-lock)
-  if [ -d node_modules ] && [ "$want" = "$have_sum" ]; then
+  if [ -n "$want" ] && [ -d node_modules ] && [ "$want" = "$have_sum" ]; then
     echo "node_modules matches package-lock.json; npm ci skipped"
     return 0
   fi
   # step runs this under `|| rc=$?`, where errexit is off: stamp only an install that succeeded.
   npm ci --no-audit --no-fund || return $?
-  echo "$want" >node_modules/.k3ci-lock
+  if [ -n "$want" ]; then echo "$want" >node_modules/.k3ci-lock; fi
 }
 
 # vitest without the known-failing upstream tests in .ci-test-excludes (one glob per line).
@@ -254,6 +269,10 @@ area_panes() {
     # ./internal/app takes ~4 min alone and several times that when other checks share the machine; the default
     # 10 min package timeout then kills it mid-test (issue #52)
     step "go test input app" panes go test -timeout 30m ./internal/input/ ./internal/app/
+    # internal/testutil's own tests take ~5 min (they build and run other packages); this one is the guard that every
+    # package with tests isolates the XDG tree (a package without a TestMain fails it, see internal/k3keys) and takes
+    # well under a second
+    step "go test xdg isolation" panes go test -run '^TestEveryTestPackageIsolatesTheXDGTree$' ./internal/testutil/
   fi
 }
 

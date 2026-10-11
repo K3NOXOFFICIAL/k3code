@@ -494,6 +494,21 @@ export class JsonRpcRequestChannel {
       this.lastLivenessAt = Date.now();
     }
 
+    // `request.cancel` withdraws a server request that is still open (timeout, interrupt, answered in the Inbox). The
+    // gateway and the attach bridge frame it like a request, with an id (`k3-N`, `cancel-<id>`), but nobody answers a
+    // cancel: as a server request it found no handler, drew a -32601 and never closed the card. It is the
+    // `request.cancel` event, delivered without a reply, and before the response branch so that its id can never
+    // settle a call of ours.
+    if (frame.method === "request.cancel") {
+      this.options.onEvent?.({
+        type: "request.cancel",
+        payload:
+          frame.params && typeof frame.params === "object" ? frame.params : {},
+      } as GatewayEvent);
+
+      return frame;
+    }
+
     if (isServerRequestFrame(frame)) {
       const params =
         frame.params && typeof frame.params === "object"

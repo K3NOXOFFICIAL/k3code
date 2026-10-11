@@ -96,4 +96,44 @@ describe("reconnectBackoffDelayMs", () => {
       randomSpy.mockRestore();
     }
   });
+
+  // setTimeout(NaN) fires immediately: a NaN delay is a reconnect storm.
+  it("never returns NaN or a negative delay, whatever the attempt or the options", () => {
+    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(1);
+
+    try {
+      expect(reconnectBackoffDelayMs(Number.NaN, { baseDelayMs: 300 })).toBe(
+        300,
+      );
+      expect(
+        reconnectBackoffDelayMs(Number.POSITIVE_INFINITY, {
+          baseDelayMs: 300,
+          capMs: 15_000,
+        }),
+      ).toBe(15_000);
+      expect(
+        reconnectBackoffDelayMs(Number.NEGATIVE_INFINITY, { baseDelayMs: 300 }),
+      ).toBe(300);
+
+      for (const bad of [Number.NaN, -1, Number.NEGATIVE_INFINITY]) {
+        const delay = reconnectBackoffDelayMs(2, {
+          baseDelayMs: bad,
+          capMs: bad,
+        });
+
+        expect(Number.isFinite(delay) && delay >= 0).toBe(true);
+        expect(delay).toBe(1200); // the defaults: 300 * 2**2
+      }
+
+      // an infinite cap means "no cap", and is not a bad value
+      expect(
+        reconnectBackoffDelayMs(20, {
+          baseDelayMs: 100,
+          capMs: Number.POSITIVE_INFINITY,
+        }),
+      ).toBe(100 * 2 ** 20);
+    } finally {
+      randomSpy.mockRestore();
+    }
+  });
 });

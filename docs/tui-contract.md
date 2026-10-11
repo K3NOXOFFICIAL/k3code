@@ -254,6 +254,15 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `tour` | `{action, surface?, selector?, title?, text?, side?, steps?, step_index?}` | `{value}` | | **cut** (desktop) |
 | `request.cancel` | `{id, method, reason}` | — | ✅ | M1-core |
 
+`request.cancel` is a notification that is framed like a request. The gateway (and the attach bridge, `daemon.py`) send it
+as `{"jsonrpc":"2.0","id":"k3-N","method":"request.cancel","params":{id,method,reason}}`: `params.id` is the request that
+is withdrawn (`timeout`, `interrupted`, `answered in the Inbox`), the frame's own `id` only makes it a valid JSON-RPC line.
+Nobody answers it. A client must hand it to its event handler as the `request.cancel` event (the same event the generated
+contract lists) and never reply, never treat it as a request of its own and never let its `id` settle a call of its own:
+`tui/shared/json-rpc-channel.ts` does exactly that for either framing (an id-bearing frame or a `method:"event"` frame of
+type `request.cancel`), and `core/src/k3code/integrations/panes.py` cancels its Inbox hold for both. Treated as a server
+request it drew a `-32601` and the approval card stayed open after a timeout, an interrupt or an answer in the Inbox.
+
 ---
 
 ## Transport

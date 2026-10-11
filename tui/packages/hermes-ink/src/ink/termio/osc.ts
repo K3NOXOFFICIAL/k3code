@@ -644,23 +644,37 @@ function* splitTabStatusPairs(data: string): Generator<[string, string]> {
 
 // Output generators
 
+// C0, DEL and C1: nothing a terminal would act on is left in the text.
+// eslint-disable-next-line no-control-regex -- removing control characters is the point
+const CONTROL_CHARS_RE = /[\x00-\x1f\x7f-\x9f]/g;
+
+function stripControls(text: string): string {
+  return text.replace(CONTROL_CHARS_RE, "");
+}
+
 /** Start a hyperlink (OSC 8). Auto-assigns an id= param derived from the URL
  *  so terminals group wrapped lines of the same link together (the spec says
  *  cells with matching URI *and* nonempty id are joined; without an id each
  *  wrapped line is a separate link — inconsistent hover, partial tooltips).
  *  Empty url = close sequence (empty params per spec). */
 export function link(url: string, params?: Record<string, string>): string {
-  if (!url) {
+  // The URL comes from message text. A BEL or ESC \ in it would end this
+  // OSC early and whatever follows would run as a sequence of its own (an
+  // OSC 52 clipboard write, a title change), so every control character is
+  // dropped from the URL and the params. A URL that was only controls is empty.
+  const clean = stripControls(url);
+
+  if (!clean) {
     return LINK_END;
   }
 
-  const p = { id: osc8Id(url), ...params };
+  const p = { id: osc8Id(clean), ...params };
 
   const paramStr = Object.entries(p)
-    .map(([k, v]) => `${k}=${v}`)
+    .map(([k, v]) => `${stripControls(k)}=${stripControls(String(v))}`)
     .join(":");
 
-  return osc(OSC.HYPERLINK, paramStr, url);
+  return osc(OSC.HYPERLINK, paramStr, clean);
 }
 
 function osc8Id(url: string): string {

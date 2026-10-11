@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import { supportsOsc52Clipboard } from "../../utils/env.js";
 
 import {
+  link,
+  LINK_END,
   shouldEmitClipboardSequence,
   shouldUseNativeClipboard,
 } from "./osc.js";
@@ -258,5 +260,68 @@ describe("shouldUseNativeClipboard", () => {
         "xterm",
       ),
     ).toBe(false);
+  });
+});
+
+// A hyperlink URL comes from message text. Unsanitised it ended the OSC 8 early
+// with its own BEL and what followed ran as a new sequence (here an OSC 52
+// clipboard write).
+describe("link", () => {
+  // eslint-disable-next-line no-control-regex -- counting control characters is the point
+  const CONTROLS = /[\x00-\x1f\x7f-\x9f]/g;
+
+  /** Control characters in `seq` other than the ESC that opens it and the terminator (BEL, or ESC \\ under Kitty). */
+  const strays = (seq: string) => {
+    // eslint-disable-next-line no-control-regex
+    const body = seq.replace(/^\x1b\]/, "").replace(/(?:\x07|\x1b\\)$/, "");
+
+    return body.match(CONTROLS) ?? [];
+  };
+
+  it("passes an ordinary URL through, with its id", () => {
+    const seq = link("https://example.com/a?b=c&d=é#f");
+
+    expect(seq).toMatch(
+      // eslint-disable-next-line no-control-regex
+      /^\x1b\]8;id=[0-9a-z]+;https:\/\/example\.com\/a\?b=c&d=é#f(?:\x07|\x1b\\)$/,
+    );
+    expect(strays(seq)).toEqual([]);
+  });
+
+  it("cannot be ended early by a BEL or ST inside the URL", () => {
+    const seq = link("https://a/\x07\x1b]52;c;ZXZpbA==\x07x");
+
+    expect(seq).not.toContain("\x1b]52");
+    expect(strays(seq)).toEqual([]);
+    expect(seq).toContain("https://a/]52;c;ZXZpbA==x"); // the text stays, as plain text
+    expect(link("https://a/\x1b\\\x1b]0;pwned\x07")).not.toContain("\x1b]0;");
+  });
+
+  it("drops C0, DEL and C1 controls from the URL", () => {
+    for (let code = 0; code < 0xa0; code++) {
+      if (code >= 0x20 && code < 0x7f) {
+        continue;
+      }
+
+      const seq = link(`https://a/${String.fromCharCode(code)}b`);
+
+      expect(strays(seq), `U+${code.toString(16)}`).toEqual([]);
+      expect(seq).toContain("https://a/b");
+    }
+  });
+
+  it("drops controls from the params too", () => {
+    const seq = link("https://a/", {
+      id: "x\x1b]52;c;QQ==\x07y",
+      "k\x07": "v\x9d",
+    });
+
+    expect(strays(seq)).toEqual([]);
+    expect(seq).not.toContain("\x1b]52");
+  });
+
+  it("treats an empty URL, or one that is nothing but controls, as the close sequence", () => {
+    expect(link("")).toBe(LINK_END);
+    expect(link("\x07\x1b\x9c")).toBe(LINK_END);
   });
 });

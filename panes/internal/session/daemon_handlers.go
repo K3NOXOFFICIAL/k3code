@@ -13,8 +13,8 @@ func (d *Daemon) handleHello(cs *connState, msg *Message) error {
 		return fmt.Errorf("invalid hello payload: %w", err)
 	}
 
-	cs.hello = &payload
 	cs.mu.Lock()
+	cs.hello = &payload
 	changed := cs.treeOps != payload.LayoutTreeOps || cs.scratchWS != payload.ScratchWorkspaces
 	cs.treeOps = payload.LayoutTreeOps
 	cs.scratchWS = payload.ScratchWorkspaces
@@ -38,7 +38,10 @@ func (d *Daemon) handleHello(cs *connState, msg *Message) error {
 		return d.replyError(cs, msg, ErrCodeInvalidMessage, clientProtocolRefusal(d.version, &payload))
 	}
 
-	// Store client's graphics capabilities for PTY pixel size reporting
+	// Store client's graphics capabilities for PTY pixel size reporting.
+	// sessionCellSize reads the cell size from other connections' handlers,
+	// so these are written under cs.mu.
+	cs.mu.Lock()
 	cs.pixelWidth = payload.PixelWidth
 	cs.pixelHeight = payload.PixelHeight
 	cs.cellWidth = payload.CellWidth
@@ -47,6 +50,7 @@ func (d *Daemon) handleHello(cs *connState, msg *Message) error {
 	cs.sixelGraphics = payload.SixelGraphics
 	cs.kittyAnimation = payload.KittyAnimation
 	cs.terminalName = payload.TerminalName
+	cs.mu.Unlock()
 
 	if payload.CellWidth > 0 && payload.CellHeight > 0 {
 		LogBasic("Client %s capabilities: cell=%dx%d pixels, kitty=%v, sixel=%v, term=%s",

@@ -61,12 +61,17 @@ post_status() {
   note "posted $K3CI_CONTEXT=$state on ${sha:0:12} ($slug): $desc"
 }
 
-# strip_git_env: drop every GIT_* variable. A git hook exports GIT_DIR and friends; a test suite that runs git in a
-# temporary repository would otherwise write into this one.
+# strip_git_env: drop the variables that point git at a repository. A git hook exports GIT_DIR and friends; a test
+# suite that runs git in a temporary repository would otherwise write into this one. The list is git's own (`git
+# rev-parse --local-env-vars`: GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, ...), not every GIT_*: GIT_ASKPASS,
+# GIT_SSH_COMMAND, GIT_SSL_CAINFO, GIT_AUTHOR_* and the like survive, and so do GIT_CONFIG_COUNT (with its KEY_n and
+# VALUE_n) and GIT_CONFIG_PARAMETERS (what `git -c` passes on), which git also counts as "local" but which carry the
+# credentials of an environment that authenticates through them: the fetch and push of merge-pr.sh and release.sh
+# need those.
 strip_git_env() {
   local v
-  for v in $(compgen -e); do
-    case $v in GIT_*) unset "$v" ;; esac
+  for v in $(git rev-parse --local-env-vars 2>/dev/null); do
+    case $v in GIT_CONFIG_COUNT | GIT_CONFIG_PARAMETERS) ;; *) unset "$v" ;; esac
   done
 }
 

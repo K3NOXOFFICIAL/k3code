@@ -33,15 +33,41 @@ for f in replacements.txt messages.txt mailmap; do
 done
 HERE=$(cd "$(dirname "$0")" && pwd)
 
+# --work is deleted and recreated, so it must be a directory this script made (it leaves a marker file in it) or one
+# that does not exist or is empty, and never the home directory, the checkout, or anything that contains them.
+MARKER=.k3code-rewrite-work
+refuse_work() { echo "rewrite_history: refusing --work $WORK: $1" >&2; exit 2; }
+[ -n "$WORK" ] || refuse_work "empty path"
+[ ! -L "$WORK" ] || refuse_work "a symbolic link"
+if [ -e "$WORK" ]; then
+  [ -d "$WORK" ] || refuse_work "not a directory"
+  work_real=$(cd "$WORK" && pwd -P)
+else
+  parent=$(cd "$(dirname -- "$WORK")" 2>/dev/null && pwd -P) || refuse_work "its parent directory does not exist"
+  work_real=${parent%/}/$(basename -- "$WORK")
+fi
+repo_real=$(cd "$HERE/../.." && pwd -P)
+home_real=$(cd "${HOME:-/nonexistent}" 2>/dev/null && pwd -P || true)
+for guarded in / "$repo_real" "$home_real"; do
+  [ -n "$guarded" ] || continue
+  # $work_real is $guarded or a directory containing it
+  case "${guarded%/}/" in "${work_real%/}"/*) refuse_work "it is, or contains, $guarded" ;; esac
+done
+if [ -d "$WORK" ] && [ -n "$(ls -A "$WORK")" ] && [ ! -f "$WORK/$MARKER" ]; then
+  refuse_work "not empty and not made by this script (no $MARKER inside); pass an empty or new directory"
+fi
+
 rm -rf "$WORK"
 mkdir -p "$WORK"
+: >"$WORK/$MARKER"
 # Branches and tags only: GitHub's read-only refs/pull/* would bring the old history back.
 git init -q --bare "$WORK/repo.git"
 git -C "$WORK/repo.git" fetch -q "$SRC" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
 git -C "$WORK/repo.git" symbolic-ref HEAD refs/heads/Main
 if [ -n "$MAIN_ONLY" ]; then
   # Commits reachable only from the other branches are neither rewritten nor pushed.
-  git -C "$WORK/repo.git" for-each-ref --format='%(refname)' refs/heads | grep -v '^refs/heads/Main$' |
+  # (grep -v exits 1 when Main is the only branch, which pipefail would make the end of the script)
+  git -C "$WORK/repo.git" for-each-ref --format='%(refname)' refs/heads | { grep -v '^refs/heads/Main$' || true; } |
     xargs -r -n1 git -C "$WORK/repo.git" update-ref -d
 fi
 
@@ -63,17 +89,64 @@ fi
 echo "== verification"
 fail=0
 cd "$WORK/repo.git"
+
+# count_hits MODE PATTERN < input: how many lines of stdin match. grep exits 1 for "none", which is fine, and 2 for an
+# error (a pattern this grep cannot read, no -P support), which must not read as "none": it is returned.
+count_hits() {
+  local n rc=0
+  n=$(LC_ALL=C grep -a -c "$1" -e "$2") || rc=$?
+  [ "$rc" -le 1 ] || return "$rc"
+  echo "$n"
+}
+
+# glob_to_ere GLOB: an approximation of the glob as an extended regex, matched anywhere on a line: `*` is any run of
+# characters, `?` any one, a [...] class stays a class (a `[!...]` negation is NOT translated: it reads as a literal !).
+# Verified against fixtures, not against filter-repo itself (not installed here): a glob rule is the one form to look at
+# by hand if the verification ever surprises.
+glob_to_ere() {
+  printf '%s' "$1" | sed -e 's/[.^$+(){}|\\]/\\&/g' -e 's/\*/.*/g' -e 's/?/./g'
+}
+
+# parse_rule RULE: sets `mode` (the grep option) and `lhs` (what to look for) from one git-filter-repo --replace-text
+# rule, `[literal:|regex:|glob:]PATTERN[==>REPLACEMENT]`. The replacement starts at the LAST `==>`, as filter-repo reads
+# it, and a pattern with no prefix is a literal.
+parse_rule() {
+  local rule=${1%$'\r'}
+  lhs=${rule%==>*}
+  case $lhs in
+    regex:*) mode=-P; lhs=${lhs#regex:} ;;
+    glob:*) mode=-E; lhs=$(glob_to_ere "${lhs#glob:}") ;;
+    literal:*) mode=-F; lhs=${lhs#literal:} ;;
+    *) mode=-F ;;
+  esac
+}
+
 # every rule's left-hand side must be gone from all contents and messages
-while IFS= read -r rule; do
-  [ -z "$rule" ] && continue
-  lhs=${rule%%==>*}
-  if [[ $lhs == regex:* ]]; then lhs=${lhs#regex:}; mode=-P; else mode=-F; fi
-  n=$(git log --all -p --format=%B | grep -c $mode -- "$lhs" || true)
-  [ "$n" = 0 ] || { echo "FAIL: a removed value is still present ($n lines)"; fail=1; }
+lineno=0
+while IFS= read -r rule || [ -n "$rule" ]; do
+  lineno=$((lineno + 1))
+  [ -n "${rule%$'\r'}" ] || continue
+  parse_rule "$rule"
+  [ -n "$lhs" ] || continue # filter-repo skips an empty pattern too
+  rc=0
+  n=$(git log --all -p --format=%B | count_hits "$mode" "$lhs") || rc=$?
+  if [ "$rc" != 0 ]; then
+    echo "FAIL: messages.txt line $lineno could not be checked (exit $rc); not treating it as clean"
+    fail=1
+  elif [ "$n" != 0 ]; then
+    echo "FAIL: a removed value is still present ($n lines; messages.txt line $lineno)"
+    fail=1
+  fi
 done < "$RULES/messages.txt"
 addr=$(sed -n 's/.*> <\(.*\)>$/\1/p' "$RULES/mailmap")
-n=$(git log --all --format='%ae%n%ce' | grep -cF -- "$addr" || true)
-[ "$n" = 0 ] || { echo "FAIL: the personal address is still an author/committer"; fail=1; }
+if [ -n "$addr" ]; then
+  rc=0
+  n=$(git log --all --format='%ae%n%ce' | count_hits -F "$addr") || rc=$?
+  { [ "$rc" = 0 ] && [ "$n" = 0 ]; } || { echo "FAIL: the personal address is still an author/committer (or could not be checked)"; fail=1; }
+else
+  echo "FAIL: no personal address found in the mailmap (expected 'Name <public> <personal>' lines); cannot verify it is gone"
+  fail=1
+fi
 big=$(git rev-list --objects --all | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' |
   awk '$1=="blob" && $2>5000000' | wc -l)
 [ "$big" = 0 ] || { echo "FAIL: $big blob(s) over 5 MB"; fail=1; }

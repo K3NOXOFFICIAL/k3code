@@ -140,3 +140,31 @@ func ParseUserBindings(cfg Config) map[Mode]map[string]string {
 
 	return result
 }
+
+// warnUnknownActions reports every binding whose action is neither a k3
+// pseudo-action nor one known() accepts. Such a key is consumed and does
+// nothing (the dispatcher logs "not handled" for each press), so a typo in
+// keys.toml would otherwise be silent. An empty action is a deliberate
+// unbinding and is not reported.
+func warnUnknownActions(bindings map[Mode]map[string]string, known func(string) bool) {
+	modes := make([]int, 0, len(bindings))
+	for mode := range bindings {
+		modes = append(modes, int(mode))
+	}
+	sort.Ints(modes)
+	for _, m := range modes {
+		binds := bindings[Mode(m)]
+		keys := make([]string, 0, len(binds))
+		for key := range binds {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			action := binds[key]
+			if action == "" || pseudoActions[action] || known(action) {
+				continue
+			}
+			fmt.Fprintf(warnOut, "k3: keys.toml: %s key %q: unknown action %q, the key does nothing\n", Mode(m), key, action)
+		}
+	}
+}

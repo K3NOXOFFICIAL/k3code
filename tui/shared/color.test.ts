@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   contrastRatio,
+  darken,
   ensureContrast,
+  lighten,
   mix,
   parseColor,
   readableOn,
@@ -94,4 +96,81 @@ describe("contrast", () => {
     expect(ensureContrast("#3D2F13", "#ffffff", 3.9)).toBe("#3D2F13");
     expect(ensureContrast("ansi256(245)", "#ffffff", 3.9)).toBe("ansi256(245)");
   });
+});
+
+// The pole used to be picked by `bgLuminance < 0.5`, which sends a mid-tone
+// background toward white even when white can never reach the floor.
+describe("ensureContrast on mid-tone backgrounds", () => {
+  it("goes toward the pole that can reach the floor (#a0a0a0 on #b0b0b0)", () => {
+    const fixed = ensureContrast("#a0a0a0", "#b0b0b0", 4.5);
+
+    expect(contrastRatio(fixed, "#b0b0b0")!).toBeGreaterThanOrEqual(4.5);
+    // darker than the input: it went toward black
+    expect(parseColor(fixed)![0]).toBeLessThan(0xa0);
+  });
+
+  it.each([
+    ["#202020", "#303030", 4.5],
+    ["#a0a0a0", "#9a9a9a", 3],
+    ["#c8c8c8", "#9e9e9e", 4.5],
+  ])(
+    "ensureContrast(%s on %s) clears %s whenever a pole can",
+    (color, bg, min) => {
+      const best = Math.max(
+        contrastRatio("#000000", bg)!,
+        contrastRatio("#ffffff", bg)!,
+      );
+
+      expect(best).toBeGreaterThanOrEqual(min);
+      expect(
+        contrastRatio(ensureContrast(color, bg, min), bg)!,
+      ).toBeGreaterThanOrEqual(min);
+    },
+  );
+
+  // Shipped presets are derived from this ladder: whenever the old pole could
+  // reach the floor, the result must stay byte-identical.
+  it.each([
+    ["#3a3a5c", "#101014", 4.5, undefined, "#89899d"],
+    ["#0053fd", "#161616", 4.5, undefined, "#6698fe"],
+    ["#4f9e5e", "#ffffff", 4.5, undefined, "#3f7e4b"],
+    ["#cba6f7", "#ffffff", 7, undefined, "#514263"],
+    ["#FFF8DC", "#ffffff", 3.9, undefined, "#666358"],
+    ["#3b6acb", "#101014", 4.5, 0.05, "#4f79d0"],
+    ["#808080", "#6b6b6b", 4.5, undefined, "#ffffff"],
+    ["#202020", "#303030", 4.5, undefined, "#a6a6a6"],
+  ] as const)(
+    "keeps the shipped ladder: ensureContrast(%s on %s, %s, %s) = %s",
+    (color, bg, min, step, expected) => {
+      expect(ensureContrast(color, bg, min, step)).toBe(expected);
+    },
+  );
+});
+
+describe("ensureContrast with a step that cannot advance", () => {
+  // A zero or negative step never leaves the loop: these used to hang the process.
+  it.each([
+    0,
+    -0.2,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    1e-12,
+  ])("terminates and still clears the floor for step %s", (step) => {
+    const fixed = ensureContrast("#777777", "#ffffff", 4.5, step);
+
+    expect(contrastRatio(fixed, "#ffffff")!).toBeGreaterThanOrEqual(4.5);
+  });
+});
+
+describe("mix with a t that is not a number", () => {
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+    "returns the first color for t=%s",
+    (t) => {
+      expect(mix("#102030", "#ffffff", t)).toBe("#102030");
+      expect(mix("#102030", "#102030", t)).toBe("#102030");
+      expect(lighten("#102030", t)).toBe("#102030");
+      expect(darken("#102030", t)).toBe("#102030");
+    },
+  );
 });
