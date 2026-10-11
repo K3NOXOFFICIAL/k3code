@@ -46,6 +46,32 @@ class StoredSession:
     meta: dict[str, Any] = field(default_factory=dict)  # per-session extras: add_dirs, mode
 
 
+@dataclass
+class SessionSummary:
+    """A session without its transcript: what a listing shows, read from columns, never by parsing ``messages``."""
+
+    session_id: str
+    title: str = ""
+    model: str = ""
+    provider: str = ""
+    cwd: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    message_count: int = 0
+    preview: str = ""
+
+
+PREVIEW_CHARS = 120
+
+
+def summarize_messages(messages: list[dict[str, Any]]) -> tuple[int, str]:
+    """``(message count, preview)``: the preview is the first non-empty user message, cut to ``PREVIEW_CHARS``."""
+    for m in messages:
+        if m.get("role") == "user" and m.get("content"):
+            return len(messages), str(m["content"])[:PREVIEW_CHARS]
+    return len(messages), ""
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
@@ -71,6 +97,11 @@ class SessionStore:
         self._db.execute(_SCHEMA)
         with contextlib.suppress(sqlite3.OperationalError):  # column already exists
             self._db.execute("ALTER TABLE sessions ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
+        # -1 = not computed yet (a row written before these columns existed): the first listing fills it in
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._db.execute("ALTER TABLE sessions ADD COLUMN message_count INTEGER NOT NULL DEFAULT -1")
+        with contextlib.suppress(sqlite3.OperationalError):
+            self._db.execute("ALTER TABLE sessions ADD COLUMN preview TEXT NOT NULL DEFAULT ''")
         self._db.execute("CREATE INDEX IF NOT EXISTS sessions_updated_at ON sessions (updated_at)")
         self._db.execute(
             "CREATE TABLE IF NOT EXISTS swept_sessions (session_id TEXT PRIMARY KEY, swept_at REAL NOT NULL)"
@@ -89,8 +120,9 @@ class SessionStore:
             updated_at=now,
         )
         self._db.execute(
-            "INSERT INTO sessions (session_id, title, model, provider, cwd, messages, usage, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO sessions"
+            " (session_id, title, model, provider, cwd, messages, usage, created_at, updated_at, message_count)"
+            " VALUES (?,?,?,?,?,?,?,?,?,0)",
             (sess.session_id, sess.title, sess.model, sess.provider, sess.cwd, "[]", "{}", now, now),
         )
         self._db.commit()
@@ -107,10 +139,12 @@ class SessionStore:
 
     def _insert_row(self, sess: StoredSession) -> None:
         """The full-row INSERT shared by :meth:`insert` and a save that restores a swept row; no commit."""
+        count, preview = summarize_messages(sess.messages)
         self._db.execute(
             "INSERT INTO sessions"
-            " (session_id, title, model, provider, cwd, messages, usage, created_at, updated_at, meta)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " (session_id, title, model, provider, cwd, messages, usage, created_at, updated_at, meta,"
+            " message_count, preview)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 sess.session_id,
                 sess.title,
@@ -122,6 +156,8 @@ class SessionStore:
                 sess.created_at,
                 sess.updated_at,
                 json.dumps(sess.meta, ensure_ascii=False),
+                count,
+                preview,
             ),
         )
 
@@ -161,30 +197,57 @@ class SessionStore:
         ).fetchall()
         return [s for s in (self.get(row[0]) for row in ids) if s is not None]
 
-    def list(self, *, limit: int = 50, include_automation: bool = True, offset: int = 0) -> list[StoredSession]:
+    _SUMMARY_COLUMNS = "session_id, title, model, provider, cwd, created_at, updated_at, message_count, preview"
+
+    def list(self, *, limit: int = 50, include_automation: bool = True, offset: int = 0) -> list[SessionSummary]:
+        """The newest sessions as summaries. Reads columns only: a transcript can be hundreds of MB and is never parsed."""
         where = "" if include_automation else " WHERE COALESCE(json_extract(meta, '$.origin'), '') != 'automation'"
         rows = self._db.execute(
-            "SELECT session_id, title, model, provider, cwd, messages, usage, created_at, updated_at"
-            f" FROM sessions{where} ORDER BY updated_at DESC LIMIT ? OFFSET ?",  # noqa: S608
+            f"SELECT {self._SUMMARY_COLUMNS} FROM sessions{where}"  # noqa: S608
+            " ORDER BY updated_at DESC LIMIT ? OFFSET ?",
             (max(1, limit), max(0, offset)),
         ).fetchall()
-        out: list[StoredSession] = []
-        for row in rows:
-            messages = json.loads(row[5] or "[]")
-            out.append(
-                StoredSession(
-                    session_id=row[0],
-                    title=row[1] or "",
-                    model=row[2] or "",
-                    provider=row[3] or "",
-                    cwd=row[4] or "",
-                    messages=messages,
-                    usage=json.loads(row[6] or "{}"),
-                    created_at=row[7],
-                    updated_at=row[8],
-                )
-            )
+        return [self._summary(row) for row in rows]
+
+    def summaries(self, ids: list[str]) -> list[SessionSummary]:
+        """Summaries of ``ids`` in that order; an id with no row is skipped."""
+        out: list[SessionSummary] = []
+        for sid in ids:
+            row = self._db.execute(
+                f"SELECT {self._SUMMARY_COLUMNS} FROM sessions WHERE session_id = ?",  # noqa: S608
+                (sid,),
+            ).fetchone()
+            if row is not None:
+                out.append(self._summary(row))
         return out
+
+    def _summary(self, row: tuple[Any, ...]) -> SessionSummary:
+        count, preview = row[7], row[8] or ""
+        if count < 0:  # written before the columns existed: parse this one transcript once and keep the answer
+            count, preview = self._backfill_summary(row[0])
+        return SessionSummary(
+            session_id=row[0],
+            title=row[1] or "",
+            model=row[2] or "",
+            provider=row[3] or "",
+            cwd=row[4] or "",
+            created_at=row[5],
+            updated_at=row[6],
+            message_count=count,
+            preview=preview,
+        )
+
+    def _backfill_summary(self, session_id: str) -> tuple[int, str]:
+        row = self._db.execute("SELECT messages FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if row is None:
+            return 0, ""
+        count, preview = summarize_messages(json.loads(row[0] or "[]"))
+        with self._db:  # `message_count < 0`: a save that landed since the read has the real values already
+            self._db.execute(
+                "UPDATE sessions SET message_count=?, preview=? WHERE session_id=? AND message_count < 0",
+                (count, preview, session_id),
+            )
+        return count, preview
 
     def worked_in(self, *, limit: int) -> list[tuple[str, str]]:
         """``(session_id, cwd)`` of the newest ``limit`` sessions with at least one message and no automation origin.
@@ -204,10 +267,11 @@ class SessionStore:
         sweep removed it: then its tombstone is there and the row is restored from ``sess`` (another process, such
         as a standalone stdio TUI, may hold the session open past the sweep's age limit)."""
         sess.updated_at = time.time()
+        count, preview = summarize_messages(sess.messages)
         with self._db:
             cur = self._db.execute(
-                "UPDATE sessions SET title=?, model=?, provider=?, cwd=?, messages=?, usage=?, updated_at=?, meta=?"
-                " WHERE session_id=?",
+                "UPDATE sessions SET title=?, model=?, provider=?, cwd=?, messages=?, usage=?, updated_at=?, meta=?,"
+                " message_count=?, preview=? WHERE session_id=?",
                 (
                     sess.title,
                     sess.model,
@@ -217,6 +281,8 @@ class SessionStore:
                     json.dumps(sess.usage, ensure_ascii=False),
                     sess.updated_at,
                     json.dumps(sess.meta, ensure_ascii=False),
+                    count,
+                    preview,
                     sess.session_id,
                 ),
             )

@@ -74,7 +74,7 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
-from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, StoredSession
+from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary, StoredSession
 from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
@@ -3212,7 +3212,7 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
 _SESSION_LIST_SCAN_CAP = 2000
 
 
-def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[StoredSession]:
+def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[SessionSummary]:
     """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised)."""
     spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
     ids: list[str] = []
@@ -3223,7 +3223,7 @@ def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[Store
             ids.append(sid)
             if len(ids) >= limit:
                 break
-    return [s for s in map(server.store.get, ids) if s is not None]
+    return server.store.summaries(ids)
 
 
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3234,20 +3234,16 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
     sessions = _project_sessions(server, cwd, max(1, limit)) if cwd else server.store.list(limit=limit)
     rows = []
     for s in sessions:
-        preview = ""
-        for m in s.messages:
-            if m.get("role") == "user" and m.get("content"):
-                preview = str(m["content"])[:120]
-                break
+        preview = s.preview
         live = server.live.get(s.session_id)
-        state = live.state if live is not None else ("completed" if s.messages else "new")
+        state = live.state if live is not None else ("completed" if s.message_count else "new")
         rows.append(
             {
                 "id": s.session_id,
                 "title": s.title or preview or "Session",
                 "preview": preview,
                 "started_at": s.created_at,
-                "message_count": len(s.messages),
+                "message_count": s.message_count,
                 "status": state,
                 "state": state,
                 "cwd": _norm_cwd(s.cwd),

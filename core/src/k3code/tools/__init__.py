@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import json
 import os
 import shutil
 import time
@@ -365,7 +366,20 @@ async def tool_bash(
                 await asyncio.shield(_kill_group(proc))
 
 
+#: What is stored of one tool result (transcript, messages.json, sessions.db); the model is sent far less
+#: (MAX_TOOL_RESULT_CHARS), this only stops one runaway result from bloating every checkpoint.
+MAX_STORED_RESULT_CHARS = 1_000_000
+
+
 def format_tool_result(result: dict[str, Any]) -> Any:
+    """``_format_tool_result`` with a string result capped at ``MAX_STORED_RESULT_CHARS`` (head + tail)."""
+    out = _format_tool_result(result)
+    if isinstance(out, str) and len(out) > MAX_STORED_RESULT_CHARS:
+        return clip_head_tail(out, MAX_STORED_RESULT_CHARS)
+    return out
+
+
+def _format_tool_result(result: dict[str, Any]) -> Any:
     """What the model, the journal and the TUI see of one tool result.
 
     ``bash``, ``grep`` and ``glob`` carry free text; they used to be sent as the Python repr of their dict, which
@@ -407,7 +421,7 @@ def format_tool_result(result: dict[str, Any]) -> Any:
         return f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
     if result.keys() == {"error"}:
         return f"Error: {result['error']}"
-    return str(result)
+    return json.dumps(result, ensure_ascii=False, default=str)
 
 
 def _numbered_read(result: dict[str, Any]) -> str:
