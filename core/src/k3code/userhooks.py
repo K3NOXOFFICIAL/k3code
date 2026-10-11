@@ -159,8 +159,10 @@ class HookRunner:
             return outcome
         data = {"session_id": self.session_id, "cwd": str(self.cwd), "hook_event_name": event, **(payload or {})}
         stdin = json.dumps(data, default=str).encode("utf-8")
-        results = [await self._exec(hooks[0], stdin)] if len(hooks) == 1 else await asyncio.gather(
-            *(self._exec(h, stdin) for h in hooks)
+        results = (
+            [await self._exec(hooks[0], stdin)]
+            if len(hooks) == 1
+            else await asyncio.gather(*(self._exec(h, stdin) for h in hooks))
         )
         for hook, result in zip(hooks, results, strict=True):
             if result is None:

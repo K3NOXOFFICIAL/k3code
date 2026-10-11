@@ -284,6 +284,24 @@ def test_proposal_dedup_and_dismiss_persist(tmp_path):
     assert dedup_key("a", "x y") != dedup_key("b", "x y")
 
 
+def test_status_changes_rewrite_the_file_instead_of_piling_up_snapshots(tmp_path):
+    store = ProposalStore(tmp_path)
+    for i in range(3):
+        store.add("improvement", f"idea {i}", f"do {i}")
+    for _ in range(4):
+        store.set_status("p2", "accepted")
+        store.set_status("p2", "pending")
+    store.set_status("p2", "dismissed")
+    assert len(store.path.read_text().splitlines()) == 3  # one line per proposal, not one per change
+    assert [(p.id, p.status) for p in ProposalStore(tmp_path).all()] == [
+        ("p1", "pending"),
+        ("p2", "dismissed"),
+        ("p3", "pending"),
+    ]
+    assert not store.path.with_name(store.path.name + ".tmp").exists()
+    assert store.set_status("nope", "dismissed") is None
+
+
 def test_parse_proposals_limits_and_validates():
     raw = json.dumps(
         [{"kind": "improvement", "text": f"t{i}", "action": f"a{i}"} for i in range(5)]

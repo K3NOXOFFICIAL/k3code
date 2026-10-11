@@ -32,9 +32,7 @@ print(json.dumps({"plain": plain, "reverse": reverse, "forward": forward, "promp
 
 def _run(seed: str, cwd: Path, home: Path) -> dict:
     env = {"PYTHONHASHSEED": seed, "K3CODE_HOME": str(home), "HOME": str(home), "PATH": "/usr/bin:/bin"}
-    out = subprocess.run(
-        [sys.executable, "-c", _PROBE, str(cwd)], env=env, capture_output=True, text=True, check=True
-    )
+    out = subprocess.run([sys.executable, "-c", _PROBE, str(cwd)], env=env, capture_output=True, text=True, check=True)
     return json.loads(out.stdout.splitlines()[-1])
 
 
