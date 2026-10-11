@@ -43,19 +43,33 @@ def register_task_tools(
         await mgr.wait(h)
         return {"content": h.render()}
 
-    def parallel_when(arguments: dict[str, Any]) -> bool:
+    def parallel_when(arguments: Any) -> bool:
         """Several ``task`` calls of one reply may run at the same time when each child can only read: an explorer or
         planner (tools within read/grep/glob) in the shared checkout. A child that can write, runs a command or works
-        in a worktree stays a barrier. Unknown agent types are serial."""
-        if str(arguments.get("isolation") or "none") != "none":
-            return False
+        in a worktree stays a barrier. Anything unexpected (a list where a name belongs, an unknown type) is serial:
+        the call then gets its normal invalid-arguments answer."""
         try:
-            atype = mgr.resolve_type(arguments.get("agent_type") or None, parent.perms.cwd)
-        except (ValueError, AttributeError):
+            if not isinstance(arguments, dict) or str(arguments.get("isolation") or "none") != "none":
+                return False
+            name = arguments.get("agent_type")
+            if name is not None and not isinstance(name, str):
+                return False
+            atype = mgr.resolve_type(name or None, parent.perms.cwd)
+            return bool(atype.tools) and set(atype.tools) <= READ_ONLY_TOOLS
+        except Exception:  # noqa: BLE001 - this only decides whether a call may overlap; it must never raise
             return False
-        return bool(atype.tools) and set(atype.tools) <= READ_ONLY_TOOLS
+
+    def parallel_limit() -> int:
+        """How many task calls may start together: what the session's parallel limit still allows. A longer run of
+        read-only calls is cut into chunks of this size, so none is refused that running them in turn would have run."""
+        try:
+            limits = session_limits(server.config, parent)
+            return max(1, limits.max_parallel - mgr.live(parent.session_id, parent_child_id))
+        except Exception:  # noqa: BLE001
+            return 1
 
     tool_task.parallel_when = parallel_when  # type: ignore[attr-defined]  # read by AgentLoop._parallel_ok
+    tool_task.parallel_limit = parallel_limit  # type: ignore[attr-defined]  # read by AgentLoop._batches
 
     async def tool_task_result(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         h = mgr.handles.get(str(arguments.get("id") or ""))

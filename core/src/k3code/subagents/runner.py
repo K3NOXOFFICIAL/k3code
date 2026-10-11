@@ -68,6 +68,12 @@ class Handle:
     last_tool: str = ""
     tokens_in: int = 0
     tokens_out: int = 0
+    #: prompt tokens the provider read from / wrote to its cache for this child (part of tokens_in; 0 = none or
+    #: unknown), and the first call's own numbers: they tell a child reusing a sibling's prefix from its own
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    calls: int = 0
+    first_call: dict[str, int] = field(default_factory=dict)
     started_at: float = 0.0  # time.monotonic(): durations only
     finished_at: float = 0.0
     #: wall clock (Unix seconds) at start: what clients get as ``started_at``; the TUI turned the monotonic value
@@ -106,6 +112,8 @@ class Handle:
             "tool_count": self.tool_count,
             "tokens_in": self.tokens_in,
             "tokens_out": self.tokens_out,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
             "branch": self.branch,
             "merge": self.merge,
             "diff_stat": self.diff_stat,
@@ -389,6 +397,10 @@ class SubagentManager:
             "session_id": h.parent_sid,
             "input_tokens": h.tokens_in,
             "output_tokens": h.tokens_out,
+            "cache_read_tokens": h.cache_read_tokens,
+            "cache_write_tokens": h.cache_write_tokens,
+            "calls": h.calls,
+            "first_call": dict(h.first_call),
             **extra,
         }
 
@@ -487,6 +499,8 @@ class SubagentManager:
                 model=h.model,
                 tokens_in=h.tokens_in,
                 tokens_out=h.tokens_out,
+                cache_read=h.cache_read_tokens,
+                cache_write=h.cache_write_tokens,
                 seconds=h.finished_at - h.started_at,
                 tier=h.tier,
                 task_kind=TaskKind.SUBAGENT.value,
@@ -612,6 +626,15 @@ class SubagentManager:
                     if msg.usage:
                         h.tokens_in += msg.usage.prompt_tokens
                         h.tokens_out += msg.usage.completion_tokens
+                        h.cache_read_tokens += msg.usage.cache_read_tokens
+                        h.cache_write_tokens += msg.usage.cache_creation_tokens
+                        if not h.calls:
+                            h.first_call = {
+                                "prompt": msg.usage.prompt_tokens,
+                                "cache_read": msg.usage.cache_read_tokens,
+                                "cache_write": msg.usage.cache_creation_tokens,
+                            }
+                        h.calls += 1
                     if msg.content:
                         final = msg.content
                         if msg.tool_calls:

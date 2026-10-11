@@ -47,6 +47,8 @@ def test_a_number_out_of_range_or_an_unknown_word_is_refused(args):
 def test_the_aliases_match_the_whole_argument_only():
     assert alias_args("agents 20") == "20"
     assert alias_args("agents auto") == "auto"
+    assert alias_args("agents parallel 6") == "parallel 6" and alias_args("agents 20 --session") == "20"
+    assert alias_args("agents -3") == "-3" and alias_args("agents 99") == "99"  # out of range: the usage line answers
     assert alias_args("agents") == "" and alias_args("agents status") == "status"
     assert alias_args("agents reset --save") == "reset --save"
     assert alias_args("dynamic off") == "dynamic off" and alias_args("dynamic") == "dynamic status"
@@ -77,7 +79,7 @@ async def test_status_shows_each_limit_and_where_it_came_from(tmp_path, monkeypa
     out = res["output"]
     assert "max agents per /ultracode run: 20 (config)" in out
     assert "dynamic sizing: on" in out and "running at once: 4" in out
-    assert "a fan-out runs min(3, 4) = 3" in out
+    assert "a fan-out runs min(3 [autonomy.fanout.max_parallel], 4) = 3" in out
     assert res["agent_limits"] == {
         "max_agents": 20,
         "dynamic": True,
@@ -191,10 +193,12 @@ async def test_status_in_the_agents_overlay_reports_what_runs(tmp_path, monkeypa
     res = (await rpc(server, "delegation.status", {}))["result"]
     assert res["max_concurrent_children"] == 4  # the fan-out's 5, held to the session's parallel limit of 4
     assert res["max_spawn_depth"] == 2 and res["dynamic"] is True and res["max_agents"] == 12
-    assert res["live"] == {"children": 0, "queued": 0}
+    assert res["live"] == {"children": 0, "queued": 0, "total": 0}
     await cmd(server, "/maxagents parallel 2", live.session_id)
     res = (await rpc(server, "delegation.status", {"session_id": live.session_id}))["result"]
     assert res["max_concurrent_children"] == 2 and res["max_parallel"] == 2
+    res = (await rpc(server, "delegation.status", {}))["result"]  # the TUI sends none: the current session's
+    assert res["max_parallel"] == 2
     await server.close()
 
 
@@ -207,4 +211,60 @@ async def test_a_fork_and_a_background_session_inherit_the_limits(tmp_path, monk
     await cmd(server, "/maxagents 33", live.session_id)
     child = server._fresh_session_like(live, background=True)
     assert child.stored.meta["agent_limits"] == {"max_agents": 33}
+    await server.close()
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "agents parallel 6",
+        "agents 20 --session",
+        "agents reset",
+        "agents -3",
+        "agents 99",
+        "agents 0",
+        "dynamic maybe-not",
+    ],
+)
+async def test_every_settings_form_of_the_alias_is_handled_and_never_starts_a_paid_run(tmp_path, monkeypatch, line):
+    server, live = await seed(tmp_path, monkeypatch)
+    started: list[str] = []
+    monkeypatch.setattr(server, "start_job", lambda live_, label, factory: started.append(label))
+    out = await cmd(server, f"/ultracode {line}", live.session_id)
+    if line.startswith("dynamic maybe"):  # an unknown word stays a task
+        assert started == [f"/ultracode {line}"]
+    else:
+        assert started == []
+        assert "Sub-agent limits" in out["output"] or "Usage: /maxagents" in out["output"]
+    await server.close()
+
+
+async def test_status_says_when_a_trusted_project_config_replaces_the_section(tmp_path, monkeypatch):
+    from k3code import trust
+
+    server, live = await seed(tmp_path, monkeypatch)
+    project = tmp_path / "proj"
+    (project / ".k3code").mkdir(parents=True)
+    (project / ".k3code" / "config.yaml").write_text("ultracode:\n  min_scope: medium\n", encoding="utf-8")
+    monkeypatch.setenv("K3CODE_PROJECT_DIR", str(project))
+    trust.record(project, trusted=True)
+    out = (await cmd(server, "/maxagents", live.session_id))["output"]
+    assert "a trusted project config has its own `ultracode:` section" in out
+    await server.close()
+
+
+async def test_the_live_counts_are_the_sessions_own_and_the_total_is_the_gateways(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    server, live = await seed(tmp_path, monkeypatch)
+    other = await new_session(server, tmp_path)
+    handles = server.subagents.handles
+    handles["a"] = SimpleNamespace(parent_sid=live.session_id, status="running", parent_child_id=None, done=False)
+    handles["b"] = SimpleNamespace(parent_sid=live.session_id, status="queued", parent_child_id=None, done=False)
+    handles["c"] = SimpleNamespace(parent_sid=other, status="running", parent_child_id=None, done=False)
+    res = (await rpc(server, "delegation.status", {"session_id": live.session_id}))["result"]
+    assert res["live"] == {"children": 2, "queued": 1, "total": 3}
+    res = (await rpc(server, "delegation.status", {"session_id": other}))["result"]
+    assert res["live"] == {"children": 1, "queued": 0, "total": 3}
+    handles.clear()
     await server.close()

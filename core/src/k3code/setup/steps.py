@@ -494,10 +494,7 @@ def build_config(data: dict[str, Any]) -> dict[str, Any]:
         "output_style": usage.get("output_style", "default"),
         "display": {"theme": theme.get("theme", ""), "focus_mode": bool(theme.get("focus_mode", False))},
         "tiers": {"main": "default", "strong": "strong", "cheap": "cheap", "fast": "fast", "background": "cheap"},
-        "autonomy": {
-            "plan_first": bool(usage.get("plan_first", False)),
-            "fanout": {"max_parallel": int(usage.get("fanout_cap", 3))},
-        },
+        "autonomy": _autonomy_section(usage),
         "panes": {"keymap": theme.get("keymap", "k3")},
     }
     if perms.get("extra_hardline"):
@@ -512,6 +509,18 @@ def build_config(data: dict[str, Any]) -> dict[str, Any]:
         # research.searxng_url is the key the research tools read (a top-level "searxng" was silently dropped)
         cfg["research"] = {"searxng_url": integ["searxng_url"]}
     return cfg
+
+
+def _autonomy_section(usage: dict[str, Any]) -> dict[str, Any]:
+    """The ``autonomy`` section for the chosen use. The fan-out cap is held to ``autonomy.agents.max_parallel``
+    (default 4), so a use that asks for more also raises that, or its cap would be quietly lowered to 4."""
+    from k3code.autonomy.agents import DEFAULT_MAX_PARALLEL, HARD_MAX_PARALLEL
+
+    cap = int(usage.get("fanout_cap", 3))
+    section: dict[str, Any] = {"plan_first": bool(usage.get("plan_first", False)), "fanout": {"max_parallel": cap}}
+    if cap > DEFAULT_MAX_PARALLEL:
+        section["agents"] = {"max_parallel": min(cap, HARD_MAX_PARALLEL)}
+    return section
 
 
 def user_md(data: dict[str, Any]) -> str:

@@ -150,7 +150,8 @@ class _Runner:
                     if not isinstance(e, asyncio.CancelledError):
                         self.state.status = "failed"
                         self.state.error = _describe(e)
-                    self.ready.set()  # whoever waits for this server need not sit through the teardown below
+                    self.ended_at = time.monotonic()  # the restart throttle counts from here, not from the end of
+                    self.ready.set()  # the teardown below; whoever waits for this server need not sit through it
                     raise
                 self.state.status = "connected"
                 self.connected_once = True

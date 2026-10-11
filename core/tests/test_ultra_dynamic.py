@@ -121,7 +121,10 @@ async def test_a_small_scope_runs_one_planner_and_no_judge(tmp_path, monkeypatch
     ]
     server = make(tmp_path, monkeypatch, script, mode="auto", autonomy=cfg())
     await call(server, "session.create", {"cwd": str(repo)})
-    report = await server.ultra.ultracode(server.session, "add one file", scope="small")
+    from types import SimpleNamespace
+
+    rated = SimpleNamespace(scope="small", risk="low", needs_plan=False, source="classifier")
+    report = await server.ultra.ultracode(server.session, "add one file", verdict=rated)
     planners = [h for h in server.subagents.handles.values() if h.agent_type == "planner"]
     assert [h.description for h in planners] == ["plan: mvp-first"]
     calls = [c for p in server.providers for c in p.log]
@@ -308,3 +311,222 @@ async def test_the_final_tests_run_after_a_fix_changed_the_tree(tmp_path, monkey
     report = server.session.stored.messages[-1]["content"]
     assert "pass (true)" in report and "not repeated" not in report
     assert "final tests" in [e["phase"] for e in events(server, "ultra.progress")]
+
+
+REWORK_ONE = [
+    {
+        "type": "tool_call",
+        "id": "w1r",
+        "match": "REWORK",
+        "when": "first",
+        "name": "write",
+        "arguments": {"path": "f1.txt", "content": "better\n"},
+    },
+    {"type": "text", "match": "REWORK", "when": "after_tool", "text": "worker 1 fixed"},
+]
+
+
+def first_review_fails_script(*extra):
+    return [
+        *PLANNERS,
+        JUDGE,
+        *worker(1, "f1.txt"),
+        *worker(2, "f2.txt"),
+        *worker(3, "f3.txt"),
+        *REWORK_ONE,
+        {"type": "text", "match": "Subtask: STEP-ONE", "text": "no test. VERDICT: fail"},
+        reviewer("STEP-TWO"),
+        reviewer("STEP-THREE"),
+        {"type": "text", "match": "worker 1 fixed", "text": "fine now. VERDICT: pass"},
+        *extra,
+    ]
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_one_failed_review_at_the_default_budget_does_not_starve_the_other_subtasks(tmp_path, monkeypatch):
+    """The rework and re-review of one subtask took the agents the others' reviewers needed: nothing merged, the panel
+    never ran, and the report said the final tests passed on an unchanged tree."""
+    repo = git_repo(tmp_path / "repo")
+    server = make(
+        tmp_path,
+        monkeypatch,
+        first_review_fails_script(LENS_C, LENS_S, VOTE_C, VOTE_S, *FIXER),
+        mode="auto",
+        autonomy=cfg(),
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    done = events(server, "fanout.done")[0]
+    states = {p["subtask_id"]: p["state"] for p in events(server, "fanout.progress")}
+    assert states["t2"] == "merged" and states["t3"] == "merged", done["summary"]
+    assert (repo / "f2.txt").exists() and (repo / "f3.txt").exists()
+    assert "## Review panel\nnot run" not in report and "candidate finding(s)" in report
+    assert states["t1"] in ("skipped", "merged")  # it may be out of budget for its retry; it is reported either way
+    assert len(server.subagents.handles) <= 12
+    if states["t1"] == "skipped":
+        assert "## PARTIAL" in report and "[skipped] STEP-ONE add f1" in report
+        assert "on 2/3 merged subtasks" in report
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_when_nothing_merged_the_report_does_not_claim_the_tests_passed(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    idle = [{"type": "text", "match": f"YOUR subtask (t{i})", "text": "nothing to change"} for i in (1, 2, 3)]
+    server = make(tmp_path, monkeypatch, [*PLANNERS, JUDGE, *idle], mode="auto", autonomy=cfg())
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "not run: nothing was merged" in report and "pass (true)" not in report
+    assert "## PARTIAL" in report and "the worker made no changes" in report
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+@pytest.mark.parametrize("max_agents", [8, 9, 10, 11, 12])
+async def test_a_failed_review_never_leaves_more_than_its_own_subtask_unresolved(tmp_path, monkeypatch, max_agents):
+    repo = git_repo(tmp_path / "repo")
+    server = make(
+        tmp_path,
+        monkeypatch,
+        first_review_fails_script(LENS_C, LENS_S, VOTE_C, VOTE_S, *FIXER),
+        mode="auto",
+        autonomy=cfg(),
+        ultracode={"max_agents": max_agents},
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    done = events(server, "fanout.done")[0]
+    unresolved = done["escalated"]
+    assert done["merged"] + unresolved == done["total"]
+    if done["total"] >= 3:  # a small budget packs everything into one worker, which has nothing to starve
+        assert done["merged"] >= 2, done["summary"]
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_progress_carries_elapsed_seconds_and_the_report_a_timing_line(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [
+            *PLANNERS,
+            JUDGE,
+            *worker(1, "f1.txt"),
+            *worker(2, "f2.txt"),
+            *worker(3, "f3.txt"),
+            reviewer("STEP-ONE"),
+            reviewer("STEP-TWO"),
+            reviewer("STEP-THREE"),
+            LENS_C,
+            LENS_S,
+            VOTE_C,
+            VOTE_S,
+            *FIXER,
+        ],
+        mode="auto",
+        autonomy=cfg(),
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    elapsed = [e["elapsed_s"] for e in events(server, "ultra.progress") if e["command"] == "ultracode"]
+    assert elapsed and elapsed == sorted(elapsed) and all(isinstance(x, float) for x in elapsed)
+    report = server.session.stored.messages[-1]["content"]
+    line = next(ln for ln in report.splitlines() if ln.startswith("Timing: "))
+    for label in ("planning", "implementing", "review", "tests"):
+        assert f"{label} " in line, line
+    assert server.ultra._clocks == {}  # nothing left behind
+
+
+def test_the_timing_line_adds_up_the_phases_that_count_towards_each_label():
+    from k3code.autonomy.ultra import timing_line
+
+    marks = [
+        ("start", 0.0),
+        ("planning", 0.0),
+        ("judging", 10.0),
+        ("implementing", 25.0),
+        ("adversarial review", 100.0),
+        ("cross-checking findings", 110.0),
+        ("final tests", 130.0),
+    ]
+    assert timing_line(marks, 190.0) == "planning 25s, implementing 75s, review 30s, tests 60s"
+    assert timing_line([("start", 0.0), ("planning", 1.0), ("stopped", 5.0)], 9.0) == "planning 4s"
+    assert timing_line([], 5.0) == ""
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_the_final_tests_run_when_the_session_is_in_a_subdirectory_of_the_repo(tmp_path, monkeypatch):
+    """The fan-out tests the repository root; a run started in a subdirectory tests that directory at the end."""
+    repo = git_repo(tmp_path / "repo")
+    (repo / "pkg").mkdir()
+    (repo / "pkg" / "keep.txt").write_text("x\n")
+    from test_fanout import git
+
+    git(repo, "add", "-A")
+    git(repo, "commit", "-m", "pkg")
+    server = make(
+        tmp_path,
+        monkeypatch,
+        [
+            *PLANNERS,
+            JUDGE,
+            *worker(1, "f1.txt"),
+            *worker(2, "f2.txt"),
+            *worker(3, "f3.txt"),
+            reviewer("STEP-ONE"),
+            reviewer("STEP-TWO"),
+            reviewer("STEP-THREE"),
+            LENS_C,
+            LENS_S,
+            {
+                "type": "text",
+                "match": "VOTE LENS: correctness",
+                "text": json.dumps({"votes": {"f1": True, "f2": False}}),
+            },
+            {
+                "type": "text",
+                "match": "VOTE LENS: security/robustness",
+                "text": json.dumps({"votes": {"f1": False, "f2": True}}),
+            },
+        ],
+        mode="auto",
+        autonomy=cfg(),
+    )
+    await call(server, "session.create", {"cwd": str(repo / "pkg")})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "not repeated" not in report
+    assert "final tests" in [e["phase"] for e in events(server, "ultra.progress")]
+
+
+async def test_when_the_only_planner_fails_the_next_angle_is_tried_and_the_run_goes_on(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    repo = git_repo(tmp_path / "repo")
+    rated = SimpleNamespace(scope="small", risk="low", needs_plan=False, source="classifier")
+    script = [
+        {"type": "text", "match": "ANGLE: mvp-first", "text": ""},  # the one planner says nothing
+        {"type": "text", "match": "ANGLE: risk-first", "text": "RISK-PLAN: guard f1"},
+        JUDGE,
+        *worker(1, "f1.txt"),
+        reviewer("add one file"),
+        {"type": "text", "match": "LENS:", "text": "[]"},
+    ]
+    server = make(tmp_path, monkeypatch, script, mode="auto", autonomy=cfg())
+    await call(server, "session.create", {"cwd": str(repo)})
+    report = await server.ultra.ultracode(server.session, "add one file", verdict=rated)
+    planners = [h.description for h in server.subagents.handles.values() if h.agent_type == "planner"]
+    assert planners == ["plan: mvp-first", "plan: risk-first"]
+    assert not any("plan judge" in c["text"] for p in server.providers for c in p.log)  # one plan: nothing to judge
+    assert (repo / "f1.txt").exists() and "Review panel" in report
+
+
+async def test_a_task_the_safety_floor_touched_keeps_all_three_planners(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    repo = git_repo(tmp_path / "repo")
+    risky = SimpleNamespace(scope="small", risk="high", needs_plan=True, source="classifier")
+    server = make(tmp_path, monkeypatch, [*PLANNERS, JUDGE], mode="auto", autonomy=cfg(), ultracode={"max_agents": 3})
+    await call(server, "session.create", {"cwd": str(repo)})
+    await server.ultra.ultracode(server.session, "rotate the production credentials", verdict=risky)
+    assert len([h for h in server.subagents.handles.values() if h.agent_type == "planner"]) == 3

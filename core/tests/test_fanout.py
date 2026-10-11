@@ -360,3 +360,56 @@ def test_active_rows_include_running_children():
     fake = SimpleNamespace(live={}, subagents=SimpleNamespace(handles={"sa-1": h}))
     rows = GatewayServer._active_rows(fake, None)
     assert rows[0]["id"] == "sa-1" and rows[0]["origin"] == "subagent" and rows[0]["background"]
+
+
+# ── plan-first fan-out: which subtasks a plan gives (dynamic sizing on, and the older reading when it is off) ──
+
+
+def _applies(plan_steps: str, suggestions: list[str], *, dynamic: bool = True):
+    from types import SimpleNamespace
+
+    from k3code.autonomy.fanout import FanoutExecutor
+    from k3code.autonomy.scope import ScopeVerdict
+    from k3code.config import Settings
+
+    server = SimpleNamespace(config=Settings(autonomy={"agents": {"dynamic": dynamic}}))
+    verdict = ScopeVerdict(
+        scope="large", parallelizable=True, fanout_candidate=True, suggested_subtasks=suggestions, source="classifier"
+    )
+    plan = (
+        f"## Goal\nx\n## Steps\n{plan_steps}\n## Files\nnone\n## Risks\nnone\n## Verification\nrun\n## Estimate\nlarge"
+    )
+    gate = SimpleNamespace(verdict=verdict, plan=plan)
+    return FanoutExecutor(server).applies(SimpleNamespace(background=False, reliability=None), gate)
+
+
+SUGGESTED = ["edit cli.py", "document cli.py"]
+
+
+def test_dependent_steps_are_not_fanned_out_by_falling_back_to_the_classifiers_guess():
+    steps = "1. edit core/cli.py\n2. document core/cli.py\n3. test core/cli.py"
+    assert _applies(steps, SUGGESTED) == []  # one unit: a single piece of work
+    assert _applies(steps, SUGGESTED, dynamic=False) == SUGGESTED  # the older reading is unchanged
+
+
+def test_a_step_that_says_after_step_n_is_one_unit_with_it():
+    assert _applies("1. create the schema\n2. migrate the rows after step 1", SUGGESTED) == []
+
+
+def test_only_top_level_steps_become_subtasks():
+    steps = "1. add the parser\n   - handle commas\n   - handle quotes\n2. add the writer\n   - flush on close\n"
+    assert _applies(steps, []) == ["add the parser", "add the writer"]
+    older = _applies(steps, [], dynamic=False)
+    assert len(older) == 5  # the sub-bullets were read as steps
+
+
+def test_a_plan_with_fewer_than_two_steps_leaves_the_classifiers_suggestions_to_decide():
+    assert _applies("1. do all of it", SUGGESTED) == SUGGESTED
+    assert _applies("just prose, no list", SUGGESTED) == SUGGESTED
+
+
+def test_the_plans_steps_beat_the_classifiers_suggestions_when_there_are_two_independent_ones():
+    assert _applies("1. build the api [files: api/]\n2. build the ui [files: ui/]", SUGGESTED) == [
+        "build the api",
+        "build the ui",
+    ]

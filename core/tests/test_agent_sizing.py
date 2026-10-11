@@ -79,18 +79,31 @@ def test_pack_joins_contiguous_units_and_drops_none():
     assert pack(["a", "b"], 0) == []
 
 
+def verdict(scope="small", *, risk="low", needs_plan=False, source="classifier"):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(scope=scope, risk=risk, needs_plan=needs_plan, source=source)
+
+
+ALL = ["mvp-first", "risk-first", "architecture-first"]
+
+
 @pytest.mark.parametrize(
-    ("scope", "angles"),
+    ("given", "angles"),
     [
-        ("small", ["mvp-first"]),
-        ("medium", ["mvp-first", "risk-first"]),
-        ("large", ["mvp-first", "risk-first", "architecture-first"]),
-        ("huge", ["mvp-first", "risk-first", "architecture-first"]),
-        (None, ["mvp-first", "risk-first", "architecture-first"]),  # no verdict: the full panel
+        (verdict("small"), ["mvp-first"]),
+        (verdict("trivial"), ["mvp-first"]),
+        (verdict("medium"), ALL),
+        (verdict("large"), ALL),
+        (verdict("small", risk="high"), ALL),  # the safety floor found a danger class
+        (verdict("small", needs_plan=True), ALL),
+        (verdict("small", source="override"), ALL),  # /scope small: the user said so, nobody measured
+        (verdict("small", source="fallback"), ALL),  # the classifier was down
+        (None, ALL),  # /ultracode <task>, the wake word
     ],
 )
-def test_planner_count_follows_the_scope(scope, angles):
-    assert pick_planners(scope) == angles
+def test_one_planner_only_for_a_classifier_rated_small_low_risk_task(given, angles):
+    assert pick_planners(given) == angles
 
 
 def sized(n_units: int, left: int | None, **kw):
@@ -110,10 +123,10 @@ def test_the_default_budget_pays_for_three_workers_and_keeps_the_review_tail():
 
 def test_a_bigger_budget_buys_more_workers_up_to_the_scope_and_the_limit():
     assert sized(8, 13).workers == 5  # (13 - 3 held) // 2
-    assert sized(8, 17).workers == 6  # no verdict: six workers is the most it keeps busy
-    assert sized(8, 17, scope="medium").workers == 2
-    assert sized(8, 60, scope="large").workers == 4
-    assert sized(8, 60, scope="huge").workers == 6
+    assert sized(8, 17).workers == 7  # (17 - 3 held) // 2: no scope caps it below the budget
+    assert sized(8, 17, scope="medium").workers == 7
+    assert sized(8, 60, scope="large").workers == 8  # the limit of eight, whatever the budget
+    assert sized(8, 60, scope="huge").workers == 8
     assert sized(2, 60).workers == 2  # never more than the plan has units
 
 
@@ -149,3 +162,62 @@ def test_a_property_the_workers_never_outspend_the_budget_they_were_sized_from()
             if got.workers:
                 assert got.workers * 2 + got.hold <= max(left, 2)
                 assert got.workers <= max(1, min(n, MAX_SUBTASKS))
+
+
+# ── what the parser takes from a plan ──
+
+
+def test_the_files_marker_names_a_steps_files_and_is_not_part_of_its_title():
+    steps = top_level_steps(
+        plan("1. add the parser [files: core/parse.py, core/lex.py] (parallel)\n2. write docs [files: docs/]")
+    )
+    assert [s.title for s in steps] == ["add the parser", "write docs"]
+    assert steps[0].paths == {"core/parse.py", "core/lex.py"} and steps[1].paths == {"docs"}
+    assert steps[0].parallel and not steps[1].parallel
+
+
+def test_two_steps_that_name_the_same_file_stay_together_even_when_both_are_marked_parallel():
+    got = units(
+        "1. add a flag [files: cli.py] (parallel)\n2. document the flag [files: cli.py] (parallel)\n3. add tests"
+    )
+    assert got == ["add a flag; then document the flag (in this order)", "add tests"]
+
+
+def test_marked_steps_that_overlap_are_one_unit():
+    grouped = group_steps(
+        top_level_steps(
+            plan("1. a [files: cli.py] (parallel)\n2. b [files: cli.py] (parallel)\n3. c [files: other.py]")
+        )
+    )
+    assert [[s.title for s in u] for u in grouped] == [["a", "b"], ["c"]]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "1. read/write the config and node.js bits\n2. open and/or close the file",  # prose with slashes and a product
+    ],
+)
+def test_prose_that_looks_like_a_path_does_not_join_steps(text):
+    assert len(group_steps(top_level_steps(plan(text)))) == 2
+
+
+def test_a_known_extension_or_a_directory_is_a_path_and_nothing_else_is():
+    steps = top_level_steps(plan("1. edit src/app/main.py and README.md\n2. clear build/ output\n3. see read/write"))
+    assert steps[0].paths == {"src/app/main.py", "readme.md"}
+    assert steps[1].paths == {"build"} and steps[2].paths == frozenset()
+
+
+def test_numbered_items_are_the_steps_when_bullets_share_their_indent():
+    steps = top_level_steps(plan("1. build the thing\n- note: keep it small\n2. test the thing\n- note: use pytest"))
+    assert [s.title for s in steps] == ["build the thing", "test the thing"]
+
+
+def test_a_code_fence_inside_steps_is_not_steps():
+    text = "1. run the generator\n```\n- not a step\n- nor this\n```\n2. check the output"
+    assert [s.title for s in top_level_steps(plan(text))] == ["run the generator", "check the output"]
+
+
+def test_a_step_can_wait_for_several_steps():
+    grouped = group_steps(top_level_steps(plan("1. a\n2. b\n3. c\n4. d after steps 1 and 3")))
+    assert [[s.title for s in u] for u in grouped] == [["a", "c", "d after steps 1 and 3"], ["b"]]

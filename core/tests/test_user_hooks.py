@@ -328,3 +328,41 @@ async def test_the_stop_hook_runs_after_the_client_has_the_answer_but_before_the
     assert at_complete == [False]  # the client had its answer while the hook was still running
     assert marker.exists()  # and the turn (so the next prompt, the goal judge) still waited for it
     assert server.session.stored.messages[-1]["content"] == "hi"
+
+
+async def _stop_hook_server(tmp_path: Path, monkeypatch, command: str):
+    server = make(tmp_path, monkeypatch, [{"type": "text", "match": "HELLO", "text": "hi"}], **NO_GATE)
+    _user_config(tmp_path, f"  Stop:\n    - {{command: '{command}'}}\n")
+    answered = asyncio.Event()
+    write = server._write
+
+    def spy(line: str) -> None:
+        if '"message.complete"' in line:
+            answered.set()
+        write(line)
+
+    server._write = spy  # type: ignore[method-assign]
+    await start(server, tmp_path)
+    await call(server, "prompt.submit", {"text": "HELLO"})
+    await asyncio.wait_for(answered.wait(), 10)
+    return server
+
+
+async def test_quitting_right_after_the_answer_lets_a_short_stop_hook_finish(tmp_path: Path, monkeypatch) -> None:
+    marker = tmp_path / "stop.done"
+    server = await _stop_hook_server(tmp_path, monkeypatch, f"sleep 0.4; touch {marker}")
+    assert server.session.stop_hook_running and not marker.exists()
+    await server.close()
+    assert marker.exists()
+
+
+async def test_a_stop_hook_that_outlasts_the_shutdown_grace_is_killed_and_close_returns(
+    tmp_path: Path, monkeypatch
+) -> None:
+    marker = tmp_path / "stop.done"
+    monkeypatch.setattr("k3code.gateway.server.GatewayServer.STOP_HOOK_GRACE_S", 0.3)
+    server = await _stop_hook_server(tmp_path, monkeypatch, f"sleep 30; touch {marker}")
+    began = time.monotonic()
+    await server.close()
+    assert time.monotonic() - began < 8
+    assert not marker.exists()

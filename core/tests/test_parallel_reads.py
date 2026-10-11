@@ -171,3 +171,54 @@ async def test_three_explorer_calls_in_one_reply_take_the_time_of_one(tmp_path):
     await run(loop)
     assert time.monotonic() - began < 0.9  # in a row: 1.2 s
     assert log[:3] == ["start e0", "start e1", "start e2"]
+
+
+def register_limited(loop: AgentLoop, log: list[str], limit: int, delay: float = 0.1) -> list[int]:
+    """A `job` tool whose handler allows ``limit`` calls together; returns the peak concurrency as it runs."""
+    peak = [0]
+    live = [0]
+
+    async def handler(args, cwd=None):
+        live[0] += 1
+        peak[0] = max(peak[0], live[0])
+        log.append(f"start {args['who']}")
+        await asyncio.sleep(delay)
+        live[0] -= 1
+        return {"content": args["who"]}
+
+    handler.parallel_when = lambda args: True  # type: ignore[attr-defined]
+    handler.parallel_limit = lambda: limit  # type: ignore[attr-defined]
+    loop.tools.register(ToolSpec(name="job", description="job", parameters=PARAMS, side_effect=True), handler)
+    return peak
+
+
+@pytest.mark.asyncio
+async def test_a_long_run_of_parallel_calls_is_cut_to_what_the_tool_allows_and_none_is_refused(tmp_path):
+    log: list[str] = []
+    loop = make_loop(tmp_path, [[job(f"c{i}", f"e{i}", "reader") for i in range(6)]])
+    peak = register_limited(loop, log, limit=4)
+    results = await run(loop)
+    assert [m.tool_call_id for m in results] == [f"c{i}" for i in range(6)]  # all six ran, in call order
+    assert peak[0] == 4  # four together, then the other two
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [["explorer"], {"x": 1}, 7, ""])
+async def test_a_predicate_that_gets_odd_arguments_never_breaks_the_turn(tmp_path, bad):
+    """`agent_type` as a list raised a TypeError out of loop.run before the call could be answered."""
+    loop = make_loop(
+        tmp_path, [[ToolCall(id="c0", name="job", arguments={"who": "a", "agent_type": bad}), job("c1", "b", "reader")]]
+    )
+    seen: list[object] = []
+
+    async def handler(args, cwd=None):
+        return {"content": "ok"}
+
+    def when(args):
+        seen.append(args.get("agent_type"))
+        return {}[args["agent_type"]] if isinstance(args.get("agent_type"), list) else True  # raises for a list
+
+    handler.parallel_when = when  # type: ignore[attr-defined]
+    loop.tools.register(ToolSpec(name="job", description="job", parameters=PARAMS, side_effect=True), handler)
+    results = await run(loop)
+    assert [m.tool_call_id for m in results] == ["c0", "c1"]

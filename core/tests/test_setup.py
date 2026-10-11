@@ -401,3 +401,14 @@ def test_parse_window_refuses_anything_else(text: str) -> None:
     from k3code.setup.steps import parse_window
 
     assert parse_window(text) is None
+
+
+def test_a_use_that_asks_for_a_wide_fanout_also_raises_the_sessions_parallel_limit() -> None:
+    """The fan-out is held to autonomy.agents.max_parallel (4): a research setup's 6 would have been 4 without it."""
+    from k3code.setup.steps import build_config
+
+    research = build_config({"usage": {"primary": "research", "fanout_cap": 6, "plan_first": False}})
+    assert research["autonomy"] == {"plan_first": False, "fanout": {"max_parallel": 6}, "agents": {"max_parallel": 6}}
+    coding = build_config({"usage": {"primary": "coding", "fanout_cap": 4, "plan_first": True}})
+    assert coding["autonomy"] == {"plan_first": True, "fanout": {"max_parallel": 4}}  # 4 is the default already
+    assert "agents" not in build_config({"usage": {"fanout_cap": 2}})["autonomy"]

@@ -162,10 +162,11 @@ async def test_the_plan_critique_does_not_hold_back_the_task(tmp_path, monkeypat
     server = make(tmp_path, monkeypatch, [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
     caller = server.model_caller
     real = caller.complete
+    release = asyncio.Event()
 
     async def slow(kind, messages, **kw):
         if "brief critique" in " ".join(str(getattr(m, "content", "")) for m in messages):
-            await asyncio.sleep(0.6)
+            await release.wait()  # the advisor answers only when the test lets it
         return await real(kind, messages, **kw)
 
     monkeypatch.setattr(caller, "complete", slow)
@@ -179,9 +180,33 @@ async def test_the_plan_critique_does_not_hold_back_the_task(tmp_path, monkeypat
     assert ("message.complete", "done") in order  # the task finished ...
     assert [o for o in order if o[0] == "plan.show"] == [("plan.show", "proposed")]  # ... before the critique came
     assert server.session.stored.messages[-1]["content"] == "implemented"
-    await asyncio.sleep(0.9)
+    release.set()
+    await asyncio.gather(*list(server._bg_tasks))
     approved = events(server, "plan.show")[-1]
     assert approved["status"] == "approved" and "watch edge case X" in approved["advisor"]
+    assert [p["status"] for p in events(server, "plan.show")] == ["proposed", "approved"]  # exactly one verdict
+
+
+async def test_closing_the_gateway_cancels_a_critique_that_is_still_running(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
+    caller = server.model_caller
+    real = caller.complete
+    started = asyncio.Event()
+
+    async def hang(kind, messages, **kw):
+        if "brief critique" in " ".join(str(getattr(m, "content", "")) for m in messages):
+            started.set()
+            await asyncio.sleep(60)
+        return await real(kind, messages, **kw)
+
+    monkeypatch.setattr(caller, "complete", hang)
+    await start(server, tmp_path)
+    await run_turn(server, "add a --verbose flag to the CLI")
+    await asyncio.wait_for(started.wait(), 5)
+    assert server._bg_tasks
+    await server.close()
+    assert not server._bg_tasks
+    assert [p["status"] for p in events(server, "plan.show")] == ["proposed"]
 
 
 async def test_medium_in_auto_plans_on_strong_and_auto_approves(tmp_path, monkeypatch):

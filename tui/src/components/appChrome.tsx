@@ -418,7 +418,8 @@ function SpawnHud({ t }: { t: Theme }) {
   }
 
   const maxDepth = delegation.maxSpawnDepth;
-  const maxConc = delegation.maxConcurrentChildren;
+  // the cap on a session's own sub-agents; the fan-out width (`maxConcurrentChildren`) is a different, lower number
+  const maxConc = delegation.maxParallel ?? delegation.maxConcurrentChildren;
   const depth = Math.max(0, totals.maxDepthFromHere);
   const active = totals.activeCount;
 

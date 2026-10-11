@@ -211,8 +211,8 @@ k3code picks the number of sub-agents from the task instead of using a fixed cou
 
 How `/ultracode` sizes a run when `dynamic` is on:
 
-- **Planners.** A small task gets one planner (no judge call), a medium one two, a large or huge one three. A task you start with `/ultracode <task>` or the word `ultracode` has no rating, so it keeps three.
-- **Workers.** The plan's top-level steps are grouped into units that can run apart: steps the planner marked `(parallel)` stay separate and the unmarked ones form one chain; without marks, steps that name the same file, or say "after step 2", stay together. The units are packed into as many workers as the budget pays for (each worker costs itself plus its reviewer; a rework after a rejection comes out of the same pool, and a subtask that cannot get one is reported as skipped), as the task's scope can keep busy (1 for small, 2 medium, 4 large, 6 huge), and never more than 8. At the default budget of 12 that is at most three workers. Nothing is dropped: extra units are joined into a worker's task, in order.
+- **Planners.** A task the classifier rated trivial or small, low risk and needing no plan gets one planner (no judge call; if it fails, the next angle is tried). Everything else keeps three: a medium or larger task, one the safety floor flagged (credentials, migrations, force pushes), one you rated with `/scope`, one the classifier could not rate, and a task you start with `/ultracode <task>` or the word `ultracode`.
+- **Workers.** The plan's top-level steps are grouped into units that can run apart: steps the planner marked `(parallel)` stay separate and the unmarked ones form one chain; steps that name the same file (the planner ends each step with `[files: path/a.py, path/b/]`), or say "after step 2", always stay together. The units are packed into as many workers as the budget pays for (each worker costs itself plus its reviewer; a rework after a rejection comes out of the same pool, and a subtask that cannot get one is reported as skipped), and never more than 8 (a trivial or small task is one worker). At the default budget of 12 that is at most three workers. Nothing is dropped: extra units are joined into a worker's task, in order.
 - **The review is kept.** Three agents (the two review lenses and the fixer) are held back from the fan-out, so a wide plan can never use up the budget before its review and final tests. A run that cannot afford even one worker and its reviewer stops before it starts and tells you to raise `/maxagents`. A report whose panel never ran says "not run", not "0 findings".
 - **Width.** Workers run `min(workers, autonomy.fanout.max_parallel, autonomy.agents.max_parallel)` at a time (2 when the subtasks look IO-heavy: install, build, docker, ...). Both ceilings used to stop at 3 whatever was configured.
 
@@ -222,7 +222,7 @@ The same limits apply when the model starts agents itself with the `task` tool: 
 /maxagents                    show the limits, where each came from, and what is running
 /maxagents 20                 up to 20 agents per /ultracode run, for this session
 /maxagents auto               let each run size itself (up to 24)
-/maxagents parallel 6         six sub-agents at once
+/maxagents parallel 6         up to six sub-agents at once (a fan-out also asks for autonomy.fanout.max_parallel)
 /maxagents dynamic off        the fixed shape (also: /ultracode dynamic off)
 /maxagents reset              back to the config
 /maxagents 20 --save          keep it in your config.yaml

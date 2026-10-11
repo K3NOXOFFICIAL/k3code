@@ -66,7 +66,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 |--------|--------|--------|-------|
 | `session.compress` | `{session_id, target_tokens?}` | `{compressed: boolean}` | Context compaction |
 | `session.close` | `{session_id, disposable_only?}` | `{closed: boolean, reason?}` | Close without delete. `disposable_only` (default false; send it after attaching elsewhere) closes only an empty, idle session with no active loop or automation bound to it (its stored row stays); a session with messages, work or a bound automation is left alone with `{closed: false, reason}`, not an error |
-| `delegation.status` | `{session_id?}` | `{paused, max_spawn_depth, max_concurrent_children, max_agents, dynamic, max_parallel, max_nested, max_spawns, live: {children, queued}}` | Sub-agent panel. `max_concurrent_children` is the width a fan-out really gets (its own ceiling, held to `max_parallel`, the governor's cap), not the raw config key; `max_agents` is a number or `"auto"`. `session_id` is optional (the TUI sends none) and adds that session's `/maxagents` |
+| `delegation.status` | `{session_id?}` | `{paused, max_spawn_depth, max_concurrent_children, max_agents, dynamic, max_parallel, max_nested, max_spawns, live: {children, queued, total}}` | Sub-agent panel. `max_concurrent_children` is the width a fan-out really gets (its own ceiling, held to `max_parallel`, the governor's cap), not the raw config key; `max_agents` is a number or `"auto"`. `session_id` is optional (the TUI sends none: the current session is used) and brings that session's `/maxagents`; `live.children` and `live.queued` are that session's sub-agents, `live.total` is the gateway's |
 | `delegation.pause` | `{paused}` | `{paused: boolean}` | Pause delegation |
 | `subagent.list` | `{session_id}` | `{subagents: ActiveSubagent[]}` | Sub-agent panel |
 | `subagent.steer` | `{session_id, subagent_id, text}` | `{steered: boolean}` | Steer sub-agent |
@@ -370,7 +370,7 @@ Events (all carry `session_id`): `subagent.spawn_requested|start|tool|progress|c
 `fanout.plan {fanout_id, subtasks[], max_parallel, io_heavy, require_tests, test_command}`,
 `fanout.progress {fanout_id, subtask_id, title, state, detail, done, total, subagent_ids}` (states: running, reviewing,
 retrying, merging, testing, merged, escalated, failed, skipped), `fanout.done {fanout_id, ok, merged, escalated, total,
-tests, summary}`, `ultra.progress {command, phase, detail, agents, tokens, max_agents, max_tokens}`,
+tests, summary}`, `ultra.progress {command, phase, detail, agents, tokens, max_agents, max_tokens, elapsed_s?}`,
 `research.progress {phase, detail}`, `session.background_done {session_id, state, origin_session}`; background
 sessions also notify through `notification.show {kind: "background"}`.
 
@@ -441,8 +441,8 @@ A prompt that waited in the queue is routed when it drains. Wake words are also 
 loop, cron and automation ticks and sub-agents never reach this step. `k3code -p` and the line REPL do not use the
 gateway, so none of this applies there.
 
-**`ultra.progress`** `{command, phase, detail, agents?, tokens?, max_agents?, max_tokens?}` (`command` is `ultracode`,
-`ultraplan` or `ultraresearch`). Two phases are new and come first, before any work, without the budget fields:
+**`ultra.progress`** `{command, phase, detail, agents?, tokens?, max_agents?, max_tokens?, elapsed_s?}` (`command` is `ultracode`,
+`ultraplan` or `ultraresearch`; `elapsed_s` is the seconds since the run began and only `ultracode` sends it). Two phases are new and come first, before any work, without the budget fields:
 `"wake word"` with detail `"<word>" in your message`, and `"ultracode is on"` with detail `scope <level>`. The
 pipeline's own phases are unchanged: `planning`, `judging`, `implementing`, `adversarial review`,
 `cross-checking findings`, `fixing`, `final tests` and `stopped`. A wake word on `ultraresearch` is followed by

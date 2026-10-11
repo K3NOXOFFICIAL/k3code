@@ -96,7 +96,7 @@ export interface DelegationStatus {
     tool_count?: number;
   }[];
   dynamic?: boolean;
-  live?: { children?: number; queued?: number };
+  live?: { children?: number; queued?: number; total?: number };
   max_agents?: number | string;
   max_concurrent_children?: number;
   max_nested?: number;

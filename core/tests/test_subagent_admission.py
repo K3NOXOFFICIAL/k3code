@@ -188,3 +188,46 @@ async def test_the_task_tool_runs_in_parallel_only_for_read_only_agent_types(tmp
     assert not when({"agent_type": "worker"}) and not when({})  # the default type writes
     assert not when({"agent_type": "reviewer"})  # it has bash
     assert not when({"agent_type": "no-such-type"})
+
+
+@pytest.mark.parametrize("bad", [["explorer"], {"a": 1}, 3, ""])
+async def test_odd_agent_types_make_a_call_serial_instead_of_raising(tmp_path, monkeypatch, bad):
+    server, sess = await session(tmp_path, monkeypatch)
+    when = tools(server, sess).parallel_when
+    assert when({"agent_type": bad}) is False
+    assert when("not a dict") is False and when(None) is False
+
+
+async def test_the_batch_size_is_what_the_session_still_allows(tmp_path, monkeypatch):
+    server, sess = await session(tmp_path, monkeypatch, agents={"max_parallel": 4})
+    limit = tools(server, sess).parallel_limit
+    assert limit() == 4
+    server.subagents.handles["a"] = SimpleNamespace(
+        parent_sid=sess.session_id, parent_child_id=None, status="running", done=False
+    )
+    assert limit() == 3
+    for i in range(6):
+        server.subagents.handles[f"b{i}"] = SimpleNamespace(
+            parent_sid=sess.session_id, parent_child_id=None, status="running", done=False
+        )
+    assert limit() == 1  # never below one: the admission check then answers the call
+    server.subagents.handles.clear()
+
+
+async def test_two_children_never_have_two_approval_questions_open(tmp_path, monkeypatch):
+    server, sess = await session(tmp_path, monkeypatch)
+    approve = await server._approval_callback_for(sess)
+    open_now = peak = 0
+
+    async def ask(kind, payload, sid):
+        nonlocal open_now, peak
+        open_now += 1
+        peak = max(peak, open_now)
+        await asyncio.sleep(0.05)
+        open_now -= 1
+        return {"choice": "once"}
+
+    monkeypatch.setattr(server, "_ask_client", ask)
+    results = await asyncio.gather(*(approve("bash", {"command": f"echo {i}"}) for i in range(4)))
+    assert [r.choice for r in results] == ["once"] * 4
+    assert peak == 1

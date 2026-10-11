@@ -124,14 +124,14 @@ class UltraCodeCommand(CommandDef):
         )
 
     async def prepare(
-        self, ctx: Any, live: Any, arg: str, *, context: str = "", scope: str | None = None
+        self, ctx: Any, live: Any, arg: str, *, context: str = "", verdict: Any = None
     ) -> JobSpec | dict[str, Any]:
-        """``scope``: the classifier's rating of the task, known only on the always-on mode path; it sizes the run."""
+        """``verdict``: the classifier's rating of the task, known only on the always-on mode path; it sizes the run."""
         if not arg:
             return reply("Usage: /ultracode <task>")
         return JobSpec(
             f"/ultracode {arg}",
-            lambda: ctx.ultra.ultracode(live, arg, context=context, scope=scope),
+            lambda: ctx.ultra.ultracode(live, arg, context=context, verdict=verdict),
             "ultracode started: plan → fan-out → review panel → fixes → tests. See the agent strip.",
         )
 

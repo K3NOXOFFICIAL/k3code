@@ -312,7 +312,13 @@ class NetWatch:
         return self._state
 
     def add_provider(self, name: str, base_url: str) -> None:
-        self._providers[name] = ProviderProbeState(name=name, base_url=base_url.rstrip("/"))
+        url = base_url.rstrip("/")
+        known = self._providers.get(name)
+        if known is not None and known.base_url == url:
+            # a turn registers its providers every time: replacing the state forgot the failures counted so far (the
+            # threshold was never reached across turns) and started a probe cycle per turn
+            return
+        self._providers[name] = ProviderProbeState(name=name, base_url=url)
         self._kick()  # re-probe promptly with the new provider
 
     def remove_provider(self, name: str) -> None:

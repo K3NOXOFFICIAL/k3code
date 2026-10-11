@@ -145,3 +145,54 @@ async def test_a_failing_early_start_does_not_leave_an_unretrieved_error(tmp_pat
     gc.collect()
     assert seen == []  # the turn's own ensure_started reports a failure; the early one stays quiet
     await server.close()
+
+
+async def test_the_failure_time_is_stamped_when_the_connect_fails_not_after_the_teardown(monkeypatch):
+    monkeypatch.setattr(mcpclient, "CONNECT_TIMEOUT", 0.5)
+    manager = McpManager({"hang": HANG})
+    try:
+        await manager.ensure_started()
+        runner = manager._runners["hang"]
+        assert runner.state.status == "failed" and runner.ended_at > 0
+        assert runner.ended_at >= runner.started_at + 0.4  # at the connect timeout; the teardown may still be running
+    finally:
+        await manager.close()
+
+
+async def test_a_server_that_never_connected_is_throttled_from_its_failure_not_from_its_launch(monkeypatch):
+    manager = McpManager({"s": MISSING})
+    try:
+        await manager.ensure_started()
+        old = manager._runners["s"]
+        now = time.monotonic()
+        old.started_at, old.ended_at = now - 100, now - 1  # launched long ago, but it failed a second ago
+        await manager.ensure_started()
+        assert manager._runners["s"] is old  # inside the 30 s pause that follows a failure
+        old.ended_at = now - 100  # the pause is over
+        await manager.ensure_started()
+        assert manager._runners["s"] is not old
+    finally:
+        await manager.close()
+
+
+async def test_close_cancels_an_early_start_that_is_still_running(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, monkeypatch, ["unused"])
+    started = asyncio.Event()
+    cancelled: list[bool] = []
+
+    async def start_early():
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    async def close():
+        pass
+
+    server.mcp = SimpleNamespace(cold=True, start_early=start_early, close=close)
+    server._kick_mcp()
+    await asyncio.wait_for(started.wait(), 2)
+    await server.close()
+    assert cancelled == [True] and not server._bg_tasks

@@ -107,6 +107,8 @@ class Subtask:
     detail: str = ""
     review: str = ""
     worktree: wt_mod.Worktree | None = None
+    #: agents of the budget already taken for this subtask's worker and first reviewer (see FanoutExecutor.run)
+    prepaid: int = 0
 
     def row(self) -> dict[str, Any]:
         return {
@@ -128,6 +130,7 @@ class FanoutResult:
     stopped_kind: str = ""  # "agents" | "tokens" (see BudgetStop.kind)
     tests_passed: int = 0  # merged subtasks whose merged result passed the tests
     tests_failed: int = 0  # merge attempts rejected because the tests failed
+    tested_in: str = ""  # the directory the merged result was tested in (the repository root)
 
     def by_state(self, *states: str) -> list[Subtask]:
         return [s for s in self.subtasks if s.state in states]
@@ -145,6 +148,14 @@ class FanoutResult:
         if self.stopped:
             lines.append(f"Stopped early: {self.stopped}")
         return "\n".join(lines)
+
+    def unresolved_lines(self) -> list[str]:
+        """One line per subtask that was not merged: its state, why, and the branch that keeps its work."""
+        out = []
+        for s in self.by_state("escalated", "failed", "skipped", "queued", "running", "retrying"):
+            where = f"; its work is on branch {s.worktree.branch}" if s.worktree is not None else ""
+            out.append(f"- [{s.state}] {s.title}{' — ' + s.detail if s.detail else ''}{where}")
+        return out
 
     def escalation_prompt(self, task: str) -> str:
         bad = self.by_state("escalated", "failed", "skipped")
@@ -172,10 +183,10 @@ class FanoutExecutor:
             return []
         if session.background or not v.parallelizable:
             return []
-        if session_limits(self.server.config, session).dynamic:
-            sized = self.size_from_plan(session, gate.plan, v.scope)
-            if sized:
-                return sized
+        if session_limits(self.server.config, session).dynamic and len(top_level_steps(gate.plan)) >= 2:
+            # a plan with steps says what depends on what: when they come down to one unit this is one piece of work,
+            # not a case for the classifier's guess or the older line-by-line reading
+            return self.size_from_plan(session, gate.plan, v.scope)
         return extract_subtasks(v, gate.plan)
 
     def size_from_plan(self, session: Any, plan: str, scope: str | None) -> list[str]:
@@ -228,7 +239,10 @@ class FanoutExecutor:
             cap = max(1, min(cap, width))
         fid = f"fo-{uuid.uuid4().hex[:6]}"
         result = FanoutResult(
-            fid, [Subtask(f"t{i + 1}", t) for i, t in enumerate(subtasks)], test_command=test_cmd if need_tests else ""
+            fid,
+            [Subtask(f"t{i + 1}", t) for i, t in enumerate(subtasks)],
+            test_command=test_cmd if need_tests else "",
+            tested_in=str(repo),
         )
         sid = session.session_id
         session.emit(
@@ -258,6 +272,7 @@ class FanoutExecutor:
             merge_lock,
             self,
         )
+        self._prepay(ctx)
         try:
             await asyncio.gather(*(self._one(ctx, st) for st in result.subtasks))
         except asyncio.CancelledError:
@@ -302,20 +317,56 @@ class FanoutExecutor:
             },
         )
 
-    async def _spawn(self, ctx: _Ctx, st: Subtask, agent_type: str, prompt: str, description: str, **kw: Any) -> Handle:
-        if ctx.budget is not None:
+    def _prepay(self, ctx: _Ctx) -> None:
+        """Take the worker and the first reviewer of every subtask from the budget now, in plan order. A rework or a
+        re-review draws on what is left after that, so one rejected result can never use up the agents that a sibling's
+        reviewer needs (at the default 12 it did: nothing merged and the review panel never ran). A subtask the budget
+        cannot pay for is skipped before it starts."""
+        budget = ctx.budget
+        if budget is None:
+            return
+        for st in ctx.result.subtasks:
+            try:
+                budget.take_agent()
+                st.prepaid = 1
+                budget.take_agent()
+                st.prepaid = 2
+            except BudgetStop as e:
+                budget.refund(st.prepaid)
+                st.prepaid = 0
+                ctx.result.stopped = ctx.result.stopped or str(e)
+                ctx.result.stopped_kind = ctx.result.stopped_kind or e.kind
+                for rest in ctx.result.subtasks[ctx.result.subtasks.index(st) :]:
+                    rest.state, rest.detail = "skipped", str(e)
+                return
+
+    def _take(self, ctx: _Ctx, st: Subtask) -> None:
+        """The agent for the next child of ``st``: its prepaid one, else a new one from the budget."""
+        if ctx.budget is None:
+            return
+        if st.prepaid > 0:
+            st.prepaid -= 1
+        else:
             ctx.budget.take_agent()
+
+    async def _spawn(self, ctx: _Ctx, st: Subtask, agent_type: str, prompt: str, description: str, **kw: Any) -> Handle:
+        self._take(ctx, st)
         mgr = self.server.subagents
         idx = int(st.id[1:]) - 1
-        h = mgr.spawn(
-            ctx.session,
-            description=description,
-            prompt=prompt,
-            agent_type=agent_type,
-            index=idx,
-            count=len(ctx.result.subtasks),
-            **kw,
-        )
+        try:
+            h = mgr.spawn(
+                ctx.session,
+                description=description,
+                prompt=prompt,
+                agent_type=agent_type,
+                index=idx,
+                count=len(ctx.result.subtasks),
+                **kw,
+            )
+        except BaseException:
+            if ctx.budget is not None:  # nothing started: the agent is not spent
+                ctx.budget.refund(1)
+            raise
         st.handles.append(h)
         if self.cfg.get("panes"):  # k3 panes: one read-only pane per child (the pane's process opens it)
             ctx.session.emit("pane.open", {"subagent_id": h.id, "name": f"fan {st.id} {st.title}"[:40]})
@@ -337,6 +388,9 @@ class FanoutExecutor:
         )
 
     async def _one(self, ctx: _Ctx, st: Subtask) -> None:
+        if st.state == "skipped":  # the budget could not pay for it (see _prepay)
+            self.progress(ctx, st, "skipped", st.detail)
+            return
         try:
             async with ctx.sem:
                 self.progress(ctx, st, "running")
@@ -378,6 +432,10 @@ class FanoutExecutor:
         except Exception as e:  # noqa: BLE001 - one subtask must not take the others down
             logger.exception("fan-out subtask %s crashed", st.id)
             self.progress(ctx, st, "failed", f"{type(e).__name__}: {e}")
+        finally:
+            if ctx.budget is not None and st.prepaid:  # a reviewer that never ran: its agent goes back to the pool
+                ctx.budget.refund(st.prepaid)
+                st.prepaid = 0
 
     async def _review(self, ctx: _Ctx, st: Subtask, worker: Handle) -> str:
         """Reviewer child against the acceptance criteria. Returns "" on pass, else the findings."""

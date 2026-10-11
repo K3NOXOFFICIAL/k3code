@@ -9,6 +9,8 @@ export interface DelegationState {
   maxAgents: null | number | string;
   // Last known caps from `delegation.status` RPC.  null until fetched.
   maxConcurrentChildren: null | number;
+  // Sub-agents of a session running at once (`autonomy.agents.max_parallel`): the cap on the model's own task calls.
+  maxParallel: null | number;
   maxSpawnDepth: null | number;
   // True when spawning is globally paused (see tools/delegate_tool.py).
   paused: boolean;
@@ -20,6 +22,7 @@ const buildState = (): DelegationState => ({
   dynamic: null,
   maxAgents: null,
   maxConcurrentChildren: null,
+  maxParallel: null,
   maxSpawnDepth: null,
   paused: false,
   updatedAt: null,
@@ -86,6 +89,10 @@ export const applyDelegationStatus = (
 
   if (typeof r.dynamic === "boolean") {
     patch.dynamic = r.dynamic;
+  }
+
+  if (typeof r.max_parallel === "number") {
+    patch.maxParallel = r.max_parallel;
   }
 
   if (typeof r.paused === "boolean") {

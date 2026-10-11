@@ -51,3 +51,22 @@ describe("applyDelegationStatus", () => {
     });
   });
 });
+
+describe("applyDelegationStatus max_parallel", () => {
+  afterEach(() => resetDelegationState());
+
+  it("keeps the per-session cap apart from the fan-out width", () => {
+    applyDelegationStatus({ max_concurrent_children: 3, max_parallel: 4 });
+
+    expect($delegationState.get()).toMatchObject({
+      maxConcurrentChildren: 3,
+      maxParallel: 4,
+    });
+  });
+
+  it("leaves it unset for a gateway that does not send it", () => {
+    applyDelegationStatus({ max_concurrent_children: 3 });
+
+    expect($delegationState.get().maxParallel).toBeNull();
+  });
+});

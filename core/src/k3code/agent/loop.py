@@ -483,7 +483,10 @@ class AgentLoop:
         # a tool with side effects can still say that THIS call has none another call could observe (`task` with a
         # read-only agent type): its handler carries the predicate
         when = getattr(handler, "parallel_when", None)
-        return bool(when is not None and when(tc.arguments))
+        try:
+            return bool(when is not None and when(tc.arguments))
+        except Exception:  # noqa: BLE001 - a predicate that fails makes the call serial, never an error of the turn
+            return False
 
     def _batches(self, tool_calls: list[ToolCall]) -> list[list[ToolCall]]:
         """Split the calls of one reply into batches: runs of consecutive parallel-safe calls, and singletons."""
@@ -492,7 +495,8 @@ class AgentLoop:
 
         def flush() -> None:
             if len(run) > 1 and all(self._plain_allow(tc) for tc in run):
-                batches.append(list(run))
+                size = self._batch_size(run)
+                batches.extend(list(run[i : i + size]) for i in range(0, len(run), size))
             else:
                 batches.extend([tc] for tc in run)
             run.clear()
@@ -505,6 +509,18 @@ class AgentLoop:
                 batches.append([tc])
         flush()
         return batches
+
+    def _batch_size(self, run: list[ToolCall]) -> int:
+        """Most calls of ``run`` that may start together: a tool whose handler has a ``parallel_limit`` caps it."""
+        size = len(run)
+        for tc in run:
+            limit = getattr(self.tools.get(tc.name)[1], "parallel_limit", None)
+            if limit is not None:
+                try:
+                    size = min(size, max(1, int(limit())))
+                except Exception:  # noqa: BLE001
+                    size = 1
+        return size
 
     def _plain_allow(self, tc: ToolCall) -> bool:
         spec = self.tools.get(tc.name)[0]

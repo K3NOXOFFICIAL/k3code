@@ -72,7 +72,8 @@ JUDGE_SYSTEM = (
     "(feasibility, completeness, risk handling), then write ONE final plan that grafts the best ideas of the "
     'others onto the strongest. Reply with a first line `SCORES: {"<angle>": <score>, ...}` (JSON) and then the '
     "final plan in markdown with exactly the sections: " + ", ".join(f"## {s}" for s in PLAN_SECTIONS) + ". "
-    "In Steps, prefer independent steps that can run in parallel and mark them (parallel)."
+    "In Steps, prefer independent steps that can run in parallel and mark them (parallel); end each step with the "
+    "files it changes as [files: path/a.py, path/b/]."
 )
 
 
@@ -101,7 +102,8 @@ def planner_prompt(task: str, angle: str) -> str:
         f"ANGLE: {angle}\nWrite an implementation plan for this task from one angle only: {ANGLES[angle]}\n\n"
         f"Task:\n{task}\n\nStudy the repository first (read-only). Return the plan as markdown with the sections "
         + ", ".join(PLAN_SECTIONS)
-        + ". Mark steps that are independent of each other with (parallel)."
+        + ". Mark steps that are independent of each other with (parallel), and end each step with the files it "
+        "changes as [files: path/a.py, path/b/]."
     )
 
 
@@ -162,11 +164,18 @@ def ultra_cfg(config: Any) -> dict[str, Any]:
 class Ultra:
     def __init__(self, server: Any) -> None:
         self.server = server
+        #: per running /ultracode, by session: (phase, monotonic time it began); the first entry is the run's start
+        self._clocks: dict[str, list[tuple[str, float]]] = {}
 
     def progress(
         self, session: Any, command: str, phase: str, detail: str = "", budget: AgentBudget | None = None
     ) -> None:
         payload = {"session_id": session.session_id, "command": command, "phase": phase, "detail": detail}
+        clock = self._clocks.get(session.session_id) if command == "ultracode" else None
+        if clock is not None:  # seconds since the run started: the measure every "it got faster" claim needs
+            now = time.monotonic()
+            clock.append((phase, now))
+            payload["elapsed_s"] = round(now - clock[0][1], 1)
         if budget is not None:
             payload.update(
                 agents=budget.agents, tokens=budget.tokens, max_agents=budget.max_agents, max_tokens=budget.max_tokens
@@ -188,6 +197,7 @@ class Ultra:
         width: int | None = None,
     ) -> UltraPlan:
         angles = list(angles or ANGLES)
+        judge_wanted = len(angles) > 1  # more than one planner was asked for: the judge reads what comes back
         brief = with_hook_context(task, context)
         mgr = self.server.subagents
         noun = "planner" if len(angles) == 1 else "independent planners"
@@ -214,6 +224,12 @@ class Ultra:
 
         try:
             done = await gather_or_cancel(*(one(i, a) for i, a in enumerate(angles)))
+            plans = [(a, h.result) for a, h in done if h and h.status == "completed" and h.result.strip()]
+            if not plans and len(angles) == 1:  # the only planner failed: one more angle, not the end of the run
+                spare = next((a for a in ANGLES if a not in angles), None)
+                if spare is not None:
+                    angles = [*angles, spare]
+                    done = [*done, await one(1, spare)]
         except asyncio.CancelledError:
             mgr.interrupt_session(session.session_id)
             raise
@@ -224,7 +240,7 @@ class Ultra:
             )
         scores: dict[str, float] = {}
         note = ""
-        if len(angles) == 1:  # one planner was asked for (a small task): there is nothing to judge
+        if not judge_wanted:  # one planner was asked for (a task rated small): there is nothing to judge
             final = plans[0][1]
         else:
             self.progress(session, command, "judging", f"{len(plans)} plans", budget)
@@ -283,15 +299,20 @@ class Ultra:
 
     # ── /ultracode ──
 
-    async def ultracode(self, session: Any, task: str, *, context: str = "", scope: str | None = None) -> str:
-        """Plan, fan out, review, fix, test. ``scope`` is the classifier's rating of the task when there is one (the
-        always-on mode path); with dynamic sizing it picks the planner count, and bounds the workers."""
+    async def ultracode(
+        self, session: Any, task: str, *, context: str = "", scope: str | None = None, verdict: Any = None
+    ) -> str:
+        """Plan, fan out, review, fix, test. ``verdict`` is the classifier's rating of the task when there is one (the
+        always-on mode path); with dynamic sizing it decides how many planners run. ``scope`` alone (no verdict) only
+        bounds the workers."""
+        scope = scope or getattr(verdict, "scope", None)
         cfg = ultra_cfg(self.server.config)
         limits = session_limits(self.server.config, session)
         brief = with_hook_context(task, context)  # the agents' prompts; the report and its title keep ``task``
         budget = AgentBudget(limits.budget_agents, int(cfg["max_tokens"]))
         report = _Report(task)
         cwd = Path(session.perms.cwd)
+        self._clocks[session.session_id] = [("start", time.monotonic())]
         try:
             up = await self.ultraplan(
                 session,
@@ -299,7 +320,7 @@ class Ultra:
                 budget=budget,
                 command="ultracode",
                 context=context,
-                angles=pick_planners(scope) if limits.dynamic else None,
+                angles=pick_planners(verdict) if limits.dynamic else None,
                 width=limits.max_parallel,
             )
             report.plan_path = str(up.path)
@@ -310,6 +331,7 @@ class Ultra:
             detail = ""
             if limits.dynamic:
                 subtasks, width, detail = self.size_fanout(session, limits, up.plan, task, scope, budget)
+                report.sizing = detail
             else:
                 subtasks = extract_subtasks(plan_verdict(up.plan), up.plan) or [task]
                 if limits.auto:  # no sizing, but "auto" still keeps only what the plan uses
@@ -335,7 +357,11 @@ class Ultra:
         except BudgetStop as e:
             report.stopped = str(e)
             self.progress(session, "ultracode", "stopped", str(e), budget)
+        except BaseException:
+            self._clocks.pop(session.session_id, None)  # a failed or cancelled run leaves no clock behind
+            raise
         report.budget = budget.summary()
+        report.timing = timing_line(self._clocks.pop(session.session_id, []), time.monotonic())
         text = report.render()
         path = write_artifact_file(
             self.server, "review", cwd / ".k3code" / "reports", f"ultracode {task}", text, session=session.session_id
@@ -380,12 +406,18 @@ class Ultra:
     ) -> None:
         test_cmd = self.server.fanout.cfg.get("test_command") or detect_test_command(cwd) or ""
         fan = report.fanout
+        if fan is not None and not fan.by_state("merged") and not report.fix:
+            # nothing was merged and nothing fixed: the tree is as it was, a test run on it says nothing about the work
+            report.tests = "not run: nothing was merged"
+            return
         if (
             test_cmd
             and tree_after_fan
             and fan is not None
             and fan.tests == "pass"
             and fan.test_command == test_cmd
+            and fan.tested_in
+            and Path(fan.tested_in).resolve() == Path(cwd).resolve()  # the fan-out tested the repo root
             and not report.fix  # no fixer merged since
             and await wt_mod.head_sha(cwd) == tree_after_fan
             and not (await wt_mod.git(cwd, "status", "--porcelain"))[1].strip()
@@ -397,7 +429,10 @@ class Ultra:
         if test_cmd:
             self.progress(session, "ultracode", "final tests", test_cmd, budget)
             ok, tail = await run_tests(test_cmd, cwd, float(self.server.fanout.cfg["test_timeout"]))
-            report.tests = f"{'pass' if ok else 'FAIL'} ({test_cmd})" + ("" if ok else f"\n{tail[-1500:]}")
+            merged = (
+                f" on {len(fan.by_state('merged'))}/{len(fan.subtasks)} merged subtasks" if fan and not fan.ok else ""
+            )
+            report.tests = f"{'pass' if ok else 'FAIL'} ({test_cmd}){merged}" + ("" if ok else f"\n{tail[-1500:]}")
         else:
             report.tests = "no test command detected"
 
@@ -496,6 +531,28 @@ class Ultra:
         report.fix = f"{h.status}; merge: {h.merge}" + (f" ({h.branch})" if h.merge == "conflict" else "")
 
 
+#: which report label each ultra.progress phase counts towards
+_TIMING_LABELS = {
+    "planning": "planning",
+    "judging": "planning",
+    "implementing": "implementing",
+    "adversarial review": "review",
+    "cross-checking findings": "review",
+    "fixing": "review",
+    "final tests": "tests",
+}
+
+
+def timing_line(marks: list[tuple[str, float]], end: float) -> str:
+    """``planning 41s, implementing 180s, review 35s, tests 90s`` from the phases a run went through ("" for none)."""
+    spent: dict[str, float] = {}
+    for (phase, began), (_, ended) in zip(marks, [*marks[1:], ("end", end)], strict=False):
+        label = _TIMING_LABELS.get(phase)
+        if label:
+            spent[label] = spent.get(label, 0.0) + max(0.0, ended - began)
+    return ", ".join(f"{label} {seconds:.0f}s" for label, seconds in spent.items())
+
+
 @dataclass
 class _Report:
     task: str
@@ -510,6 +567,8 @@ class _Report:
     notes: list[str] = field(default_factory=list)
     stopped: str = ""
     budget: str = ""
+    timing: str = ""
+    sizing: str = ""
 
     def render(self) -> str:
         out = [f"# ultracode report\n\nTask: {self.task}"]
@@ -517,6 +576,8 @@ class _Report:
             out.append(f"Plan: {self.plan_path}")
         if self.fanout is not None:
             out.append("\n## Implementation\n" + self.fanout.summary())
+            if unresolved := self.fanout.unresolved_lines():
+                out.append("\n## PARTIAL\nThese subtasks were not merged:\n" + "\n".join(unresolved))
         rejected = len(self.candidates) - len(self.confirmed)
         if self.panel_ran:
             out.append(
@@ -534,6 +595,10 @@ class _Report:
         if self.stopped:
             out.append(f"\n## STOPPED\n{self.stopped}. Work that had not started was skipped.")
         out.append(f"\nBudget used: {self.budget}")
+        if self.sizing:
+            out.append(f"Sizing: {self.sizing}")
+        if self.timing:
+            out.append(f"Timing: {self.timing}")
         return "\n".join(out)
 
 

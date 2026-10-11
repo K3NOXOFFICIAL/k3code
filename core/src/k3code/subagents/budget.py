@@ -35,6 +35,10 @@ class AgentBudget:
         if self.max_agents is not None:
             self.max_agents = max(self.agents, min(self.max_agents, int(n)))
 
+    def refund(self, n: int = 1) -> None:
+        """Give back ``n`` agents taken for work that did not happen (a spawn that failed, a prepaid slot not used)."""
+        self.agents = max(0, self.agents - max(0, int(n)))
+
     def left(self, *, reserved: bool = False) -> int | None:
         """Agents that may still be taken (None = no limit); ``reserved=True`` counts the held-back ones too."""
         if self.max_agents is None:

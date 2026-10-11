@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 from k3code.autonomy.plan_first import parse_plan
 
@@ -16,22 +17,26 @@ from k3code.autonomy.plan_first import parse_plan
 MAX_SUBTASKS = 8
 #: tail of an /ultracode run held back from the fan-out: two lens reviewers and one fixer
 REVIEW_HOLD = 3
-#: workers a scope can keep busy: bounds the serial per-merge test runs behind the merge lock
-SCOPE_WORKERS = {"trivial": 1, "small": 1, "medium": 2, "large": 4, "huge": 6}
-#: independent planners per scope (the judge is skipped for one)
-SCOPE_PLANNERS = {"trivial": 1, "small": 1, "medium": 2, "large": 3, "huge": 3}
+#: workers a scope can keep busy: a trivial or small task is one piece of work. Larger ones are bounded by the budget
+#: and by MAX_SUBTASKS (no evidence supports a tighter cut per scope)
+SCOPE_WORKERS = {"trivial": 1, "small": 1}
 #: planner angles in the order a smaller panel keeps them
 PLANNER_ANGLES = ("mvp-first", "risk-first", "architecture-first")
 #: a worker plus its reviewer, on a guess of tokens per agent: only matters when the token budget is nearly spent
 DEFAULT_TOKENS_PER_AGENT = 150_000
 
-_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)(?:\d+[.)]|[-*])[ \t]+(?P<text>.+?)[ \t]*$", re.M)
+_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<mark>\d+[.)]|[-*])[ \t]+(?P<text>.+?)[ \t]*$", re.M)
 _PARALLEL_RE = re.compile(r"\(\s*parallel\s*\)", re.I)
-_DEP_RE = re.compile(r"\b(?:after|depends?\s+on|requires?|following|once)\s+(?:the\s+)?steps?\s+(\d+)", re.I)
-_PATH_RE = re.compile(
-    r"(?<![\w/.-])(?:[\w.-]+/)+[\w.-]+(?![\w/-])"
-    r"|\b[\w-]+\.(?:py|pyi|ts|tsx|js|jsx|mjs|go|rs|md|ya?ml|json|toml|sh|c|h|cpp|java|rb|css|html|sql)\b"
+_FILES_RE = re.compile(r"\[\s*files?\s*:([^\]]*)\]", re.I)
+_FENCE_RE = re.compile(r"```.*?```", re.S)
+_DEP_RE = re.compile(
+    r"\b(?:after|depends?\s+on|requires?|following|once)\s+(?:the\s+)?steps?\s+(\d+(?:\s*(?:,|and|&)\s*\d+)*)", re.I
 )
+_EXT = r"(?:py|pyi|ts|tsx|js|jsx|mjs|go|rs|md|ya?ml|json|toml|sh|c|h|cpp|java|rb|css|html|sql)"
+#: a path names a file (a known extension) or a directory (a trailing slash); "read/write" and "and/or" are prose
+_PATH_RE = re.compile(rf"(?<![\w/.-])(?:[\w.-]+/)*[\w-]+\.{_EXT}(?![\w/-])|(?<![\w/.-])(?:[\w.-]+/)+(?![\w-])")
+#: names that look like files but are products ("node.js", "next.js")
+_NOT_FILES = frozenset({"node.js", "next.js", "vue.js", "react.js", "express.js", "nuxt.js", "three.js", "d3.js"})
 
 
 @dataclass(frozen=True)
@@ -68,36 +73,46 @@ class AgentPlan:
         return f"{text}; {budget_text}" if budget_text else text
 
 
+def _paths_in(text: str) -> frozenset[str]:
+    found = (p.lower().strip("./") for p in _PATH_RE.findall(text))
+    return frozenset(p for p in found if p and p not in _NOT_FILES)
+
+
 def top_level_steps(plan: str) -> list[Step]:
     """The plan's top-level Steps: numbered or bulleted items at the outermost indent only (a sub-bullet is detail of
-    its step, not a step of its own). ``(parallel)`` is removed from the title and kept as a flag."""
-    steps_text = parse_plan(plan).get("Steps", "")
-    items = [(len(m.group("indent").expandtabs(4)), m.group("text")) for m in _ITEM_RE.finditer(steps_text)]
+    its step, not a step of its own; neither is a line inside a code fence). When numbered and bulleted items share
+    that indent, the numbered ones are the steps. ``(parallel)`` is removed from the title and kept as a flag; a
+    ``[files: a.py, b/]`` marker is removed too and, when present, names the step's files instead of a guess."""
+    steps_text = _FENCE_RE.sub("", parse_plan(plan).get("Steps", ""))
+    items = [
+        (len(m.group("indent").expandtabs(4)), m.group("mark"), m.group("text")) for m in _ITEM_RE.finditer(steps_text)
+    ]
     if not items:
         return []
-    top = min(indent for indent, _ in items)
+    top = min(indent for indent, _, _ in items)
+    at_top = [(mark, text) for indent, mark, text in items if indent == top]
+    if any(mark[0].isdigit() for mark, _ in at_top):
+        at_top = [(mark, text) for mark, text in at_top if mark[0].isdigit()]
     out: list[Step] = []
-    for indent, text in items:
-        if indent != top:
-            continue
-        title = " ".join(_PARALLEL_RE.sub("", text).split())
-        out.append(
-            Step(
-                title=title,
-                parallel=bool(_PARALLEL_RE.search(text)),
-                paths=frozenset(p.lower().strip("./") for p in _PATH_RE.findall(text)),
-                deps=tuple(int(n) for n in _DEP_RE.findall(text)),
-            )
+    for _, text in at_top:
+        marked = _FILES_RE.search(text)
+        title = " ".join(_FILES_RE.sub("", _PARALLEL_RE.sub("", text)).split())
+        deps = tuple(int(n) for found in _DEP_RE.findall(text) for n in re.findall(r"\d+", found))
+        paths = (
+            frozenset(p.strip().lower().strip("./") for p in marked.group(1).split(",") if p.strip())
+            if marked
+            else _paths_in(text)
         )
+        out.append(Step(title=title, parallel=bool(_PARALLEL_RE.search(text)), paths=paths, deps=deps))
     return out
 
 
 def group_steps(steps: list[Step]) -> list[list[Step]]:
     """The steps as independent units, in plan order: what must run one after another stays together.
 
-    A step that says it waits for another joins it. When the planner marked some steps ``(parallel)`` they are
-    separate units and the unmarked ones form ONE sequential unit; with no marks, steps that name the same file or
-    directory join (they would conflict at merge time) and the others stay separate."""
+    A step that says it waits for another joins it, and so do steps that name the same file or directory. When the
+    planner marked some steps ``(parallel)`` they are separate units otherwise, and the unmarked ones form ONE
+    sequential unit."""
     n = len(steps)
     root = list(range(n))
 
@@ -120,14 +135,14 @@ def group_steps(steps: list[Step]) -> list[list[Step]]:
         chain = [i for i, s in enumerate(steps) if not s.parallel]
         for a, b in zip(chain, chain[1:], strict=False):
             union(a, b)
-    else:
-        owner: dict[str, int] = {}
-        for i, step in enumerate(steps):
-            for path in step.paths:
-                if path in owner:
-                    union(i, owner[path])
-                else:
-                    owner[path] = i
+    # two steps that name the same file or directory would conflict at merge time, whatever the planner said
+    owner: dict[str, int] = {}
+    for i, step in enumerate(steps):
+        for path in step.paths:
+            if path in owner:
+                union(i, owner[path])
+            else:
+                owner[path] = i
     groups: dict[int, list[Step]] = {}
     for i, step in enumerate(steps):
         groups.setdefault(find(i), []).append(step)
@@ -156,11 +171,18 @@ def pack(units: list[str], n: int) -> list[str]:
     return out
 
 
-def pick_planners(scope: str | None) -> list[str]:
-    """The planner angles to run: one for a small change, two for a medium one, all three otherwise (and when the
-    task has no verdict, as with the explicit ``/ultracode <task>`` and its wake word)."""
-    n = SCOPE_PLANNERS.get(scope or "", len(PLANNER_ANGLES))
-    return list(PLANNER_ANGLES[:n])
+def pick_planners(verdict: Any = None) -> list[str]:
+    """The planner angles to run. One (and no judge call) only for a task the classifier rated trivial or small, low
+    risk, with no plan wanted: nothing else has evidence behind it. A task with no verdict (``/ultracode <task>``, the
+    wake word), one from ``/scope`` or the fallback heuristics, and anything the safety floor touched keep all three."""
+    one = (
+        verdict is not None
+        and getattr(verdict, "source", "") == "classifier"
+        and getattr(verdict, "risk", "") == "low"
+        and not getattr(verdict, "needs_plan", True)
+        and getattr(verdict, "scope", "") in ("trivial", "small")
+    )
+    return list(PLANNER_ANGLES[:1] if one else PLANNER_ANGLES)
 
 
 def size_agents(
@@ -191,7 +213,7 @@ def size_agents(
     fit = (left - hold) // 2 if left is not None else MAX_SUBTASKS
     caps = {
         "plan steps": g,
-        f"scope {scope}" if scope else "scope": SCOPE_WORKERS.get(scope or "", SCOPE_WORKERS["huge"]),
+        f"scope {scope}" if scope else "scope": SCOPE_WORKERS.get(scope or "", MAX_SUBTASKS),
         "agent budget": fit,
         "limit": MAX_SUBTASKS,
     }

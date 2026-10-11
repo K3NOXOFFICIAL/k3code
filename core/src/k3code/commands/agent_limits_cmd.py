@@ -7,7 +7,10 @@ by accident.
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+import yaml
 
 from k3code import confio
 from k3code.autonomy.agents import (
@@ -80,18 +83,24 @@ def parse(args: list[str]) -> dict[str, Any] | None:
     raise AgentLimitsError(f"Unknown setting: {' '.join(args)}")
 
 
+_NUMBER = re.compile(r"^-?\d+(\.\d+)?$")
+
+
 def alias_args(arg: str) -> str | None:
-    """``/ultracode agents <N|auto|status|reset>`` and ``/ultracode dynamic <on|off|status>`` as /maxagents arguments,
-    or None when ``arg`` is anything else. Only the whole argument counts: ``agents should review X`` is a task."""
+    """``/ultracode agents <N|auto|status|reset>``, ``agents parallel <N>`` and ``dynamic <on|off|status>`` as
+    /maxagents arguments, or None when ``arg`` is anything else. Only the whole argument counts:
+    ``agents should review X`` is a task. A number that is out of range is still a settings line (the usage message
+    answers it), never a task."""
     words = split_args(arg)
     save = ["--save"] if "--save" in words else []
-    words = [w for w in words if w != "--save"]
+    words = [w for w in words if w not in ("--save", "--session")]  # --session is what a setting is anyway
     if not words:
         return None
     head, rest = words[0].lower(), [w.lower() for w in words[1:]]
-    if head == "agents" and len(rest) <= 1:
-        known = not rest or rest[0] in (AUTO, "status", "reset") or whole_number(_int(rest[0]), lo=0) is not None
-        return " ".join([*rest, *save]) if known else None
+    if head == "agents":
+        one = len(rest) == 1 and (rest[0] in (AUTO, "status", "reset") or _NUMBER.match(rest[0]) is not None)
+        parallel = len(rest) == 2 and rest[0] == "parallel" and _NUMBER.match(rest[1]) is not None
+        return " ".join([*rest, *save]) if (not rest or one or parallel) else None
     if head == "dynamic" and len(rest) <= 1 and (not rest or rest[0] in ("on", "off", "status")):
         return " ".join(["dynamic", *(rest or ["status"]), *save])
     return None
@@ -122,6 +131,19 @@ def write_user_config(changes: dict[str, Any]) -> tuple[Any, Any]:
         _set_path(data, _KEYS[key], value)
     confio.validate(data)
     return path, confio.write_yaml(path, data)
+
+
+def project_sections() -> list[str]:
+    """The sections among ``ultracode`` and ``autonomy`` that the gateway's trusted project config sets: such a section
+    replaces the user's whole section, so the settings made here for it would not take effect."""
+    from k3code import trust
+
+    try:
+        text = trust.trusted_text(default_project_dir())
+        data = yaml.safe_load(text) if text else None
+    except Exception:  # noqa: BLE001 - a hint only
+        return []
+    return [k for k in ("ultracode", "autonomy") if isinstance(data, dict) and isinstance(data.get(k), dict)]
 
 
 def payload(limits: AgentLimits, live: int = 0) -> dict[str, Any]:
@@ -155,7 +177,8 @@ def describe(limits: AgentLimits, live: int = 0) -> str:
             else " - one worker per plan step, three planners"
         ),
         f"running at once: {limits.max_parallel}{src('max_parallel')} - the model's own task calls; "
-        f"a fan-out runs min({limits.fanout_parallel}, {limits.max_parallel}) = {limits.fanout_width}",
+        f"a fan-out runs min({limits.fanout_parallel} [autonomy.fanout.max_parallel], {limits.max_parallel}) = "
+        f"{limits.fanout_width}",
         f"sub-agents of a sub-agent: {limits.max_nested}; task calls per turn: {limits.max_spawns or 'no limit'} "
         "(config: autonomy.agents)",
         f"live now: {live}",
@@ -234,6 +257,11 @@ class MaxAgentsCommand(CommandDef):
         if live is not None:
             live.emit("session.info", live.live_info())
         text = describe(limits, running)
+        if sections := project_sections():
+            text += (
+                f"\n  note: a trusted project config has its own {' and '.join(f'`{k}:`' for k in sections)} "
+                "section, which replaces the whole section of yours for this gateway"
+            )
         applies = (
             "The model's task calls follow this at once; /ultracode and fan-out use it from their next run."
             if lead

@@ -28,8 +28,8 @@ PLAN_ADDENDUM = (
     "\n\nYou are in PLANNING mode: read-only. Explore the repo as needed, then call exit_plan ONCE with a "
     "plan in markdown with exactly these sections: "
     + ", ".join(f"## {s}" for s in PLAN_SECTIONS)
-    + ". Estimate = rough size/time. In Steps, mark each step that does not depend on another with (parallel). "
-    "Do not implement anything."
+    + ". Estimate = rough size/time. In Steps, mark each step that does not depend on another with (parallel) "
+    "and end each step with the files it changes as [files: path/a.py, path/b/]. Do not implement anything."
 )
 
 
@@ -298,8 +298,8 @@ class PlanFirst:
             show("approved", **extra)
 
         task = asyncio.ensure_future(critique())
-        server._side_tasks.add(task)
-        task.add_done_callback(server._side_tasks.discard)
+        server._bg_tasks.add(task)  # close() cancels it: no strong-tier call is paid for after the gateway stopped
+        task.add_done_callback(server._bg_tasks.discard)
         return cap
 
     # ── proposer ──

@@ -180,3 +180,41 @@ async def test_a_sub_agent_records_the_model_on_its_own_answer_not_the_gateways_
     assert h.status == "completed", h.error
     assert h.model == "m"
     assert [e["model"] for e in events(server, "subagent.complete")][-1] == "m"
+
+
+async def test_a_sub_agent_records_the_cache_tokens_of_its_calls(tmp_path, monkeypatch):
+    from k3code.providers.types import Usage
+
+    repo = git_repo(tmp_path / "repo")
+    server, provider = make_server(tmp_path, monkeypatch, replies=["child done"])
+    real_stream = provider.stream
+
+    async def stream(messages, tools, model, **kw):
+        async for ev in real_stream(messages, tools, model, **kw):
+            if ev.type == "done" and ev.message is not None:
+                ev.message.usage = Usage(1000, 10, cache_read_tokens=800, cache_creation_tokens=150, model="m")
+            yield ev
+
+    provider.stream = stream  # type: ignore[method-assign]
+    sid = await new_session(server, repo)
+    live = server.live_for(server.store.get(sid))
+    h = await server.subagents.run(live, description="d", prompt="p")
+    assert h.status == "completed", h.error
+    assert (h.cache_read_tokens, h.cache_write_tokens, h.calls) == (800, 150, 1)
+    assert h.first_call == {"prompt": 1000, "cache_read": 800, "cache_write": 150}
+    assert h.tokens_in == 1000  # the budget and the token counts are unchanged
+    done = events(server, "subagent.complete")[-1]
+    assert (done["cache_read_tokens"], done["cache_write_tokens"], done["calls"]) == (800, 150, 1)
+    row = server.usage._db.execute(
+        "SELECT cache_read, cache_write, tokens_in FROM events WHERE kind = 'subagent'"
+    ).fetchone()
+    assert tuple(row) == (800, 150, 1000)
+
+
+async def test_a_sub_agent_whose_provider_reports_no_cache_shows_zero(tmp_path, monkeypatch):
+    repo = git_repo(tmp_path / "repo")
+    server, _ = make_server(tmp_path, monkeypatch, replies=["child done"])
+    sid = await new_session(server, repo)
+    live = server.live_for(server.store.get(sid))
+    h = await server.subagents.run(live, description="d", prompt="p")
+    assert (h.cache_read_tokens, h.cache_write_tokens) == (0, 0)

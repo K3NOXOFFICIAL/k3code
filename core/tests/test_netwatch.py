@@ -411,3 +411,37 @@ async def test_probes_share_one_tls_context(monkeypatch):
         with pytest.raises(httpx.HTTPError):
             await netwatch.http_probe("http://127.0.0.1:9/", 0.5)  # nothing listens there
     assert len(built) == 1
+
+
+async def test_registering_the_same_provider_every_turn_keeps_its_failure_count():
+    """A turn registers its providers each time; replacing the state meant the threshold was never reached."""
+    from k3code.reliability.netwatch import NetWatch
+
+    async def failing(base_url: str, timeout: float):
+        raise OSError("down")
+
+    nw = NetWatch(
+        internet_probe=_internet(InternetProbeResult(ok=True, latency_ms=10.0)),
+        provider_probe=failing,
+        nm_probe=_nm_probe,
+        config=_config(provider_fail_threshold=3),
+    )
+    for _ in range(3):  # three turns
+        nw.add_provider("p", "https://p.test/v1/")
+        await nw._probe_all()
+    assert nw.provider_state("p") is NetState.PROVIDER_DOWN
+    assert nw.state is NetState.PROVIDER_DOWN
+
+
+async def test_a_provider_whose_url_changed_starts_afresh_and_a_known_one_does_not_kick_a_probe():
+    nw = _watch()
+    nw._wakeup = asyncio.Event()  # it is None before start(), which would make the check vacuous
+    nw.add_provider("p", "https://a.test")
+    assert nw._wakeup.is_set()
+    nw._wakeup.clear()
+    nw.add_provider("p", "https://a.test/")  # same provider, trailing slash
+    assert not nw._wakeup.is_set()
+    first = nw._providers["p"]
+    first.consecutive_fails = 2
+    nw.add_provider("p", "https://b.test")  # moved: the old count is not its
+    assert nw._providers["p"].consecutive_fails == 0 and nw._wakeup.is_set()

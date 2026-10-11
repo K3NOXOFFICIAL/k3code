@@ -276,6 +276,9 @@ class LiveSession:
             self.control["goal"] = GoalState.from_dict(stored.meta["goal"]).snapshot()
         #: Background/cron/loop sessions run bash inside the sandbox.
         self.background = bool(stored.meta.get("background"))
+        #: one approval question at a time: sub-agents of one session can ask side by side, and the TUI shows one
+        self.approval_lock = asyncio.Lock()
+        self.stop_hook_running = False  # the Stop hook runs after message.complete; shutdown gives it a moment
         #: True while a /goal continuation runs: nobody is watching, so bash is sandboxed even in a foreground session.
         self.goal_continuation = False
         self.reliability: Reliability | None = None
@@ -626,6 +629,8 @@ class GatewayServer:
         self._tiers: TierRouters | None = None
         self._router_cache: dict[str, TierRouters] = {}  # one TierRouters per model key (see _ensure_router)
         self._side_tasks: set[asyncio.Task[Any]] = set()  # fire-and-forget work (titles)
+        #: work that belongs to a turn but outlives its start (MCP early start, plan critique); close() cancels it
+        self._bg_tasks: set[asyncio.Future[Any]] = set()
         self._idle_sweeper: asyncio.Task[None] | None = None
         #: (provider, model) of the most recent router attempt on any task (side calls read it).
         self.last_attempt: tuple[str, str] = ("", "")
@@ -1256,10 +1261,24 @@ class GatewayServer:
 
     async def close(self) -> None:
         self.stopping = True
+        pending = list(self._bg_tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         if self.automation is not None:
             await self.automation.stop()
         await self.web_fetcher.aclose()
         await self.browser.close()
+        # a Stop hook that is running after its turn's answer was sent gets a moment to finish (quitting right after an
+        # answer used to kill it); a hook that outlasts the grace is killed with its turn below
+        finishing = [
+            live.turn_task
+            for live in self.live.values()
+            if live.stop_hook_running and live.turn_task is not None and not live.turn_task.done()
+        ]
+        if finishing:
+            await asyncio.wait(finishing, timeout=self.STOP_HOOK_GRACE_S)
         cancelled = []
         for live in self.live.values():
             if live.turn_task is not None and not live.turn_task.done():
@@ -1662,6 +1681,8 @@ class GatewayServer:
         if self.halted or not self.mcp.cold:
             return
         task = asyncio.ensure_future(self.mcp.start_early())
+        self._bg_tasks.add(task)  # held, so it is not collected mid-start and close() can cancel it
+        task.add_done_callback(self._bg_tasks.discard)
         task.add_done_callback(lambda t: t.cancelled() or t.exception())  # the turn's own call reports a failure
 
     async def _run_turn_locked(self, session: LiveSession, text: str) -> tuple[str, str]:
@@ -1865,7 +1886,7 @@ class GatewayServer:
         if verdict.source == "fallback" or SCOPES.index(verdict.scope) < SCOPES.index(min_scope):
             return None  # trivial, or the classifier is down: not worth a pipeline; the gate reuses this verdict
         ultracode: Any = self.commands.get("ultracode")
-        spec = await ultracode.prepare(self, session, text, context=context, scope=verdict.scope)
+        spec = await ultracode.prepare(self, session, text, context=context, verdict=verdict)
         self.autonomy.drop_mode_verdict(session)
         return _Route("ultracode", "ultracode is on", f"scope {verdict.scope}", spec)
 
@@ -2370,12 +2391,15 @@ class GatewayServer:
             # The Stop hook cannot change the turn (a hook that asks to continue is logged and ignored), so the client
             # no longer waits for it: message.complete went out above. The session lock is still held, so the next
             # prompt and the goal's judge run after it, as before.
+            session.stop_hook_running = True
             try:
                 stopped = await loop.hooks.run("Stop", {"stop_hook_active": False})
                 if stopped.blocked:  # Claude Code would continue the turn; k3code ends it and logs the reason
                     logger.info("a Stop hook asked to continue the turn (not supported): %s", stopped.reason[:200])
             except Exception:  # noqa: BLE001 - the turn is over; a failing hook must not turn it into an error
                 logger.exception("the Stop hook failed")
+            finally:
+                session.stop_hook_running = False
         if (
             status == "done"
             and not prompt_blocked
@@ -2386,6 +2410,9 @@ class GatewayServer:
             self._side_tasks.add(task)
             task.add_done_callback(self._side_tasks.discard)
         return status, final_text
+
+    #: Seconds shutdown waits for a Stop hook that is still running after its turn's answer.
+    STOP_HOOK_GRACE_S = 10.0
 
     #: Minimum seconds between mid-turn checkpoints (each one rewrites the session's message list).
     CHECKPOINT_EVERY_S = 3.0
@@ -2628,24 +2655,26 @@ class GatewayServer:
             pattern = ", ".join(r.pattern for r in rules)
             self.usage.record("approval", session=session.session_id, detail=tool_name)
             try:
-                result = await self._ask_client(
-                    "approval",
-                    {
-                        "request_id": next_request_id("approval"),
-                        "command": _command_for_tool(tool_name, arguments),
-                        "description": decision.message
-                        or arguments.get("description")
-                        or arguments.get("path")
-                        or arguments.get("pattern")
-                        or "",
-                        "choices": ["once", "session", "always", "deny"],
-                        "allow_permanent": True,
-                        "allow_session": True,
-                        "tool_name": tool_name,
-                        "pattern": pattern,
-                    },
-                    session.session_id,
-                )
+                # one question at a time per session: sub-agents running side by side each ask for their own tools
+                async with session.approval_lock:
+                    result = await self._ask_client(
+                        "approval",
+                        {
+                            "request_id": next_request_id("approval"),
+                            "command": _command_for_tool(tool_name, arguments),
+                            "description": decision.message
+                            or arguments.get("description")
+                            or arguments.get("path")
+                            or arguments.get("pattern")
+                            or "",
+                            "choices": ["once", "session", "always", "deny"],
+                            "allow_permanent": True,
+                            "allow_session": True,
+                            "tool_name": tool_name,
+                            "pattern": pattern,
+                        },
+                        session.session_id,
+                    )
             except (asyncio.CancelledError, RuntimeError):
                 return ApprovalResult("deny", "approval request cancelled")
             choice = str(result.get("choice", "deny")).lower()
@@ -4364,14 +4393,17 @@ async def _commands_catalog(server: GatewayServer, params: dict[str, Any]) -> di
 
 
 async def _delegation_status(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
-    """The delegation caps in force; ``session_id`` (optional, the TUI sends none) adds that session's /maxagents."""
+    """The delegation caps in force for a session (``session_id``, else the current one: the TUI sends none) and what
+    is running: ``live.children`` counts that session's sub-agents, ``live.total`` every session's."""
     from k3code.reliability.governor import Governor
     from k3code.subagents.runner import MAX_DEPTH
 
-    live = server.live.get(str(params.get("session_id") or ""))
+    live = server._session_for(str(params.get("session_id") or "") or None)
     limits = session_limits(server.config, live) if live is not None else agent_limits(server.config)
-    queued = sum(1 for h in server.subagents.handles.values() if h.status == "queued")
-    running = sum(1 for h in server.subagents.handles.values() if h.status == "running")
+    handles = server.subagents.handles.values()
+    mine = [h for h in handles if live is not None and h.parent_sid == live.session_id]
+    queued = sum(1 for h in mine if h.status == "queued")
+    running = sum(1 for h in mine if h.status == "running")
     return {
         "paused": server.subagents.paused,
         "max_spawn_depth": MAX_DEPTH,
@@ -4382,7 +4414,11 @@ async def _delegation_status(server: GatewayServer, params: dict[str, Any]) -> d
         "max_parallel": limits.max_parallel,
         "max_nested": limits.max_nested,
         "max_spawns": limits.max_spawns,
-        "live": {"children": running + queued, "queued": queued},
+        "live": {
+            "children": running + queued,
+            "queued": queued,
+            "total": sum(1 for h in handles if h.status in ("queued", "running")),
+        },
     }
 
 

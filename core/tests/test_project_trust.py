@@ -209,3 +209,40 @@ def test_a_config_that_cannot_be_applied_is_not_offered_for_trust(project: Path,
     assert refused.exit_code == 1
     assert "cannot be trusted" in refused.output
     assert trust.decision(project) == trust.UNDECIDED
+
+
+# ── the text the user is shown is parsed the way the text that is applied is ──
+
+# libyaml reads these where the pure-Python loader raises (a tab after a colon, a tab at the end of a value)
+LOADER_SPLIT = ["max_turns:\t7\n", "max_turns: 7\t\n", "\ufeffmax_turns: 7\n", "a:\tb\nmax_turns: 7\n"]
+
+
+@pytest.mark.parametrize("text", LOADER_SPLIT)
+def test_a_project_file_is_applied_only_if_the_trust_summary_could_read_it(project: Path, text: str) -> None:
+    """trust.describe parses with yaml.safe_load; the applied file used libyaml's loader, which accepts more."""
+    import yaml
+
+    _config_file(project).write_text(text, encoding="utf-8")
+    trust.record(project, trusted=True)
+    try:
+        yaml.safe_load(text)
+        shown_parses = True
+    except yaml.YAMLError:
+        shown_parses = False
+    if shown_parses:
+        assert load_config(project_dir=project).max_turns in (0, 7)  # applied (or not a max_turns file)
+    else:
+        assert trust.describe(text)[0].endswith("so it is ignored")  # the user was told it is ignored ...
+        with pytest.raises(Exception, match="not valid YAML"):  # ... and it is not applied under another reading
+            load_config(project_dir=project)
+
+
+def test_the_user_config_keeps_the_fast_loader_and_the_project_one_does_not(monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code import config as config_mod
+
+    seen: list[object] = []
+    real = config_mod.yaml.load
+    monkeypatch.setattr(config_mod.yaml, "load", lambda text, Loader: seen.append(Loader) or real(text, Loader=Loader))
+    config_mod._parse_mapping("a: 1\n", Path("user.yaml"))
+    config_mod._parse_mapping("a: 1\n", Path("project.yaml"), pure=True)
+    assert seen == [config_mod._YAML_LOADER, config_mod.yaml.SafeLoader]

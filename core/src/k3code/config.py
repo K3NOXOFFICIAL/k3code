@@ -370,10 +370,15 @@ def _current_home() -> Path:
 _YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 
 
-def _parse_mapping(text: str, where: Path) -> dict[str, Any]:
-    """YAML text as a mapping; a parse error or a non-mapping top level is a :class:`ConfigError` naming ``where``."""
+def _parse_mapping(text: str, where: Path, *, pure: bool = False) -> dict[str, Any]:
+    """YAML text as a mapping; a parse error or a non-mapping top level is a :class:`ConfigError` naming ``where``.
+
+    ``pure``: the pure-Python loader, for text the user was asked to trust. The trust summary parses with
+    ``yaml.safe_load``; libyaml accepts documents it rejects (a tab after a colon) and reads a few differently, so
+    applying a project file with the other loader could apply something other than what was shown."""
     try:
-        data = yaml.load(text, Loader=_YAML_LOADER)  # noqa: S506 - a safe loader (the C one when libyaml is there)
+        loader = yaml.SafeLoader if pure else _YAML_LOADER
+        data = yaml.load(text, Loader=loader)  # noqa: S506 - a safe loader (libyaml's when present and allowed)
     except yaml.YAMLError as e:
         raise ConfigError(f"{where}: not valid YAML ({str(e).splitlines()[0] if str(e) else type(e).__name__})") from e
     if data is None:
@@ -463,7 +468,7 @@ def load_config(
         if text is None:
             logger.debug("project config %s not applied: not trusted (k3code trust applies it)", project_dir)
         else:
-            project_config = _parse_mapping(text, trust.config_path(project_dir))
+            project_config = _parse_mapping(text, trust.config_path(project_dir), pure=True)
         # Providers come from the user config only: a repo's base_url plus api_key_env would send the user's key to
         # the repo author's host (trust.describe and doctor say the section is ignored).
         if isinstance(project_config, dict) and "providers" in project_config:

@@ -982,6 +982,16 @@ export function createGatewayEventHandler(
           info = { ...info, stored_session_id: storedSid };
         }
 
+        // /maxagents changes the session's sub-agent limits: the caps the agents view shows come from the gateway
+        const limitsOf = (i: unknown) =>
+          JSON.stringify(
+            (i as { agent_limits?: unknown } | undefined)?.agent_limits ?? null,
+          );
+
+        if (limitsOf(info) !== limitsOf(getUiState().info)) {
+          refreshDelegationStatus(true);
+        }
+
         patchUiState((state) => ({
           ...state,
           info,
