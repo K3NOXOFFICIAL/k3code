@@ -70,9 +70,14 @@ def test_prompt_cache_off_sends_no_breakpoints():
     assert breakpoints(payload) == 0 and payload["system"] == "SYSTEM PROMPT"
 
 
-def test_openai_compatible_marks_messages_only_when_on_and_the_model_is_claude():
+def test_openai_compatible_marks_messages_only_for_claude_ids_and_never_on_openai_itself():
     auto = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k")
-    assert breakpoints(auto._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)) == 0
+    assert breakpoints(auto._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)) > 0
+    assert breakpoints(auto._payload(conversation(), TOOLS, "gpt-4o", max_tokens=100, temperature=None)) == 0
+    openai = OpenAICompatProvider(name="o", base_url="https://api.openai.com/v1", api_key="k")
+    assert breakpoints(openai._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)) == 0
+    off = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", prompt_cache="off")
+    assert breakpoints(off._payload(conversation(), TOOLS, "claude-test", max_tokens=100, temperature=None)) == 0
     on = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", prompt_cache="on")
     assert breakpoints(on._payload(conversation(), TOOLS, "gpt-4o", max_tokens=100, temperature=None)) == 0
     payload = on._payload(conversation(), TOOLS, "anthropic/claude-test", max_tokens=100, temperature=None)
@@ -161,3 +166,24 @@ def test_the_usage_wire_payload_carries_the_cache_tokens():
         "cache_read_tokens": 800,
         "cache_write_tokens": 150,
     }
+
+
+async def test_openai_auto_cache_drops_cache_control_once_a_relay_rejects_it():
+    sent: list[dict] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        sent.append(body)
+        if "cache_control" in json.dumps(body):
+            return httpx.Response(400, json={"error": {"message": "Unrecognized field: cache_control"}})
+        chunk = {"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}
+        return httpx.Response(200, content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode())
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    p = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", client=client)
+    events = [e async for e in p.stream(conversation(), TOOLS, "claude-test")]
+    assert any(getattr(e, "text", None) == "ok" for e in events)
+    assert len(sent) == 2 and not p.prompt_cache  # one rejected try, then plain requests for good
+    [e async for e in p.stream(conversation(), TOOLS, "claude-test")]
+    assert len(sent) == 3
+    await client.aclose()

@@ -553,7 +553,9 @@ async def test_a_stopped_turn_is_persisted_and_the_user_prompt_survives(tmp_path
         store=SessionStore(tmp_path / "s.db"),
     )
     srv._write = lambda s: None
-    stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
+    proj = tmp_path / "proj"  # not tmp_path: that holds K3CODE_HOME, and a root containing it asks before bash runs
+    proj.mkdir(exist_ok=True)
+    stored = srv.store.create(title="t", model="default", cwd=str(proj))
     live = srv.live_for(stored)
 
     started = asyncio.Event()
@@ -598,7 +600,9 @@ async def test_tool_results_checkpoint_the_turn_before_it_ends(tmp_path, monkeyp
     )
     srv._write = lambda s: None
     srv.CHECKPOINT_EVERY_S = 0.0
-    stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
+    proj = tmp_path / "proj"  # not tmp_path: that holds K3CODE_HOME, and a root containing it asks before bash runs
+    proj.mkdir()
+    stored = srv.store.create(title="t", model="default", cwd=str(proj))
     live = srv.live_for(stored)
     saved_sizes: list[int] = []
     real_save = srv.store.save
@@ -623,7 +627,9 @@ async def test_idle_sessions_stop_their_netwatch_and_rearm_on_the_next_turn(tmp_
         store=SessionStore(tmp_path / "s.db"),
     )
     srv._write = lambda s: None
-    stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
+    proj = tmp_path / "proj"  # not tmp_path: that holds K3CODE_HOME, and a root containing it asks before bash runs
+    proj.mkdir(exist_ok=True)
+    stored = srv.store.create(title="t", model="default", cwd=str(proj))
     live = srv.live_for(stored)
     await srv._run_turn(live, "hi")
     assert live.reliability is not None and live.reliability._started  # armed for the turn
@@ -680,7 +686,9 @@ async def test_the_prompt_and_the_tool_call_are_on_disk_before_the_first_tool_ru
         config=Settings(providers=[prov], default_model="default", permission_mode="yolo"), store=SessionStore(db)
     )
     srv._write = lambda s: None
-    stored = srv.store.create(title="t", model="default", cwd=str(tmp_path))
+    proj = tmp_path / "proj"  # not tmp_path: that holds K3CODE_HOME, and a root containing it asks before bash runs
+    proj.mkdir(exist_ok=True)
+    stored = srv.store.create(title="t", model="default", cwd=str(proj))
     live = srv.live_for(stored)
     task = asyncio.create_task(srv._run_turn(live, "run the long thing"))
     try:
@@ -740,7 +748,9 @@ async def test_session_resume_reports_a_running_turn(tmp_path, monkeypatch):
     prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE")
     server = make_server(config=Settings(providers=[prov]))
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
-    stored = server.store.create(title="t", model="m", cwd=str(tmp_path))
+    proj = tmp_path / "proj"  # not tmp_path: that holds K3CODE_HOME, and a root containing it asks before bash runs
+    proj.mkdir(exist_ok=True)
+    stored = server.store.create(title="t", model="m", cwd=str(proj))
     live = server.live_for(stored)
     live.streaming = True
     line = {"jsonrpc": "2.0", "id": 7, "method": "session.resume", "params": {"session_id": stored.session_id}}

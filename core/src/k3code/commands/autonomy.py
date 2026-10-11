@@ -129,26 +129,94 @@ class GoCommand(CommandDef):
         return {"type": "send", "message": task, "text": task, "notice": f"Running for real: {task}"}
 
 
+ADVISOR_USAGE = (
+    "/advisor                     show the session advisor\n"
+    "/advisor <model-key>|on|off  set the session advisor (on = strong tier); add --default to keep it\n"
+    "/advisor ask [question]      one-shot critique of the conversation\n"
+    "/advisor accept              add the last critique to the conversation"
+)
+
+
+def _advisor_label(key: str) -> str:
+    return "off" if not key else "strong tier" if key == advisor.STRONG else key
+
+
 class AdvisorCommand(CommandDef):
     def __init__(self) -> None:
-        super().__init__(name="advisor", help="Critical review from the strong tier: /advisor [question|accept]")
+        super().__init__(
+            name="advisor",
+            help="Session advisor the model can consult: /advisor [<model-key>|on|off|ask [question]|accept] "
+            "[--default]",
+        )
 
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
+        from k3code.commands.tune import known_model_keys, unknown_model_message
+
         live = _live(ctx, session_id)
+        words = arg.split()
+        make_default = "--default" in words
+        words = [w for w in words if w != "--default"]
+        head = words[0] if words else ""
+        if head == "accept":
+            return self._accept(ctx, live)
+        if head == "ask":
+            return await self._ask(ctx, live, " ".join(words[1:]))
+        default = str(autonomy_cfg(ctx.config).get("advisor", "") or "")
+        meta = live.stored.meta if live is not None else None
+        if not head:
+            cur = advisor.session_advisor(meta, default)
+            return _msg(f"Advisor: {_advisor_label(cur)}\n{ADVISOR_USAGE}", advisor=cur or None)
+        if head in ("off", "none"):
+            key = ""
+        elif head in ("on", advisor.STRONG):
+            key = advisor.STRONG
+        elif head in known_model_keys(ctx.config):
+            key = head
+        elif len(words) == 1 and not make_default:
+            return _msg(f"{unknown_model_message(ctx.config, head)}\n{ADVISOR_USAGE}")
+        else:  # free text: the old one-shot form
+            return await self._ask(ctx, live, " ".join(words))
+        if live is not None:
+            live.stored.meta[advisor.META_KEY] = key
+            ctx.store.save(live.stored)
+        if make_default or live is None:
+            from k3code.commands.config_cmd import config_set
+            from k3code.paths import user_config_path
+
+            config_set(user_config_path(), "autonomy.advisor", key or '""')
+            from k3code.commands._util import session_cwd
+
+            ctx.apply_file_config(session_cwd(ctx, session_id))
+        where = "this session" if live is not None else "the default"
+        if make_default and live is not None:
+            where += " and the default"
+        if not key:
+            return _msg(f"Advisor off for {where}.", advisor=None)
+        return _msg(
+            f"Advisor set to {_advisor_label(key)} for {where}: the model can consult it with the `advisor` tool "
+            "from the next turn.",
+            advisor=key,
+        )
+
+    @staticmethod
+    def _accept(ctx: Any, live: Any) -> dict[str, Any]:
         if live is None:
             return _msg("No active session.")
-        if arg.strip() == "accept":
-            if not live.pending_advisor:
-                return _msg("No advisor review waiting; run /advisor first.")
-            if getattr(live, "streaming", False):
-                # mid-turn the loop owns the transcript (its persist overwrites stored rows): steer it in instead
-                live.steer_queue.append(f"Advisor review:\n{live.pending_advisor}")
-                live.pending_advisor = ""
-                return _msg("Advisor review added to the running turn.")
-            live.messages = [*live.messages, {"role": "user", "content": f"Advisor review:\n{live.pending_advisor}"}]
-            ctx.store.save(live.stored)
+        if not live.pending_advisor:
+            return _msg("No advisor review waiting; run /advisor ask first.")
+        if getattr(live, "streaming", False):
+            # mid-turn the loop owns the transcript (its persist overwrites stored rows): steer it in instead
+            live.steer_queue.append(f"Advisor review:\n{live.pending_advisor}")
             live.pending_advisor = ""
-            return _msg("Advisor review added to the conversation.")
+            return _msg("Advisor review added to the running turn.")
+        live.messages = [*live.messages, {"role": "user", "content": f"Advisor review:\n{live.pending_advisor}"}]
+        ctx.store.save(live.stored)
+        return _msg("Advisor review added to the conversation.")
+
+    @staticmethod
+    async def _ask(ctx: Any, live: Any, question: str) -> dict[str, Any]:
+        if live is None:
+            return _msg("No active session.")
         cfg = autonomy_cfg(ctx.config)
         context = await advisor.condensed_context(
             ctx.model_caller,
@@ -156,7 +224,11 @@ class AdvisorCommand(CommandDef):
             threshold=int(cfg["advisor_compact_chars"]),
             session_id=live.session_id,
         )
-        text = await advisor.advise(ctx.model_caller, context, arg, session_id=live.session_id)
+        key = advisor.session_advisor(live.stored.meta, str(cfg.get("advisor", "") or ""))
+        router = None
+        if key and key != advisor.STRONG and hasattr(ctx, "_router_for"):
+            router = ctx._router_for(key)
+        text = await advisor.advise(ctx.model_caller, context, question, session_id=live.session_id, router=router)
         live.pending_advisor = text
-        live.emit("advisor.show", {"session_id": live.session_id, "text": text, "question": arg})
+        live.emit("advisor.show", {"session_id": live.session_id, "text": text, "question": question})
         return _msg(text + "\n\n(side note: not in the conversation; /advisor accept to add it)", tag="advisor")

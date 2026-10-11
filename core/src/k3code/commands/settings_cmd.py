@@ -40,6 +40,7 @@ def build_settings_view(ctx: Any, session_id: str | None) -> dict[str, Any]:
         "focus_mode": cfg.display.focus_mode,
         "theme": cfg.display.theme or "default",
         "output_style": style,
+        "advisor": (ctx.session_advisor(live) or None) if live and hasattr(ctx, "session_advisor") else None,
         "output_styles": outputstyle.available(cwd),
         "providers": [
             {
