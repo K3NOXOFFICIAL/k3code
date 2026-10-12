@@ -203,6 +203,10 @@ def protected_path(path: str) -> bool:
     return False
 
 
+def _stricter(a: Decision, b: Decision) -> Decision:
+    return max((a, b), key=lambda d: (_RANK[d.action], d.needs_human))
+
+
 def decide(
     *,
     mode: PermissionMode | str,
@@ -234,11 +238,17 @@ def decide(
         bash_cwd = _abs(str(args.get("cwd") or "."), cwd_s)
         dec = _decide_bash(mode, str(args.get("command", "")), ruleset, hardline_extra, roots, bash_cwd)
     elif tool in EDIT_TOOLS or tool in READ_TOOLS:
-        path = _abs(str(args.get("path") or args.get("file") or "."), cwd_s)
+        raw = os.path.expanduser(str(args.get("path") or args.get("file") or "."))
+        path = _abs(raw, cwd_s)
         if tool == "glob":
             path = _glob_base(path, str(args.get("pattern") or ""))
         dec = _decide_path(mode, tool, path, roots, ruleset)
-        if tool in EDIT_TOOLS and dec.action != "deny" and protected_path(path):
+        # The tools and the kernel follow a symlink before they apply a `..` (`link/../x` is `<target of link>/../x`),
+        # `_abs` applied it first: decide the file that is really reached as well, and take the stricter answer.
+        reached = os.path.realpath(os.path.join(cwd_s, raw))
+        if tool != "glob" and reached != os.path.realpath(path):
+            dec = _stricter(dec, _decide_path(mode, tool, reached, roots, ruleset))
+        if tool in EDIT_TOOLS and dec.action != "deny" and (protected_path(path) or protected_path(reached)):
             # the edit tools run in the daemon, outside the sandbox: only a deny rule beats this, no allow rule, mode or
             # hook approval does (yolo and auto included; headless, an unattended run and a sub-agent it is a deny)
             dec.action, dec.needs_human, dec.always_ask = "ask", True, True

@@ -22,6 +22,7 @@ from k3code.permissions import Rule, decide, engine
 from k3code.providers.types import ToolCall
 from k3code.reliability import sandbox
 from k3code.subagents import worktree
+from k3code.tools import tool_write
 from m1cmd_helpers import git_repo
 
 MODES = ["default", "accept-edits", "auto", "yolo"]
@@ -248,6 +249,169 @@ def test_a_dot_git_file_of_a_linked_worktree_is_protected(tmp_path: Path) -> Non
             assert dec.action == "ask" and dec.always_ask, (mode, tool)
     for layers in _rule_layers(Rule("edit", "*", "allow")):
         assert decide(mode="auto", tool="write", args={"path": ".git"}, cwd=wt, **layers).action == "ask"
+
+
+# ── a symlink followed by `..` ──
+#
+# `link/../x` is `<target of link>/../x` to the kernel and to the tools (`Path.resolve()`), but a lexical clean-up reads
+# it as `x` next to `link`: the engine has to decide the file that is really reached, not the one the text suggests.
+
+
+def _dotdot_project(tmp_path: Path) -> tuple[Path, Path]:
+    """A project with ``hl -> .git/hooks``, ``lnk -> ~/sub`` and ``inner -> real/deep`` (links a plain ``ln -s`` in the
+    project makes), plus the files they lead to. Returns (project, home)."""
+    proj = tmp_path / "proj"
+    (proj / ".git" / "hooks").mkdir(parents=True)
+    (proj / ".git" / "config").write_text("[core]\n")
+    (proj / "real" / "deep").mkdir(parents=True)
+    home = _home()
+    (home / "sub").mkdir()
+    (home / ".bashrc").write_text("# rc\n")
+    (home / ".ssh").mkdir()
+    _symlink(proj / "hl", proj / ".git" / "hooks")
+    _symlink(proj / "lnk", home / "sub")
+    _symlink(proj / "inner", proj / "real" / "deep")  # a link that stays inside the project
+    return proj, home
+
+
+def _spellings(proj: Path, rel: str) -> list[str]:
+    """The path as the model may write it: relative, or absolute (the ``..`` is kept in both)."""
+    return [rel, f"{proj}/{rel}"]
+
+
+# git-internal files reached through ``hl -> .git/hooks``
+GIT_DOTDOT = [
+    "hl/../config",
+    "hl/../config.worktree",
+    "hl/../info/attributes",
+    "hl/../hooks/pre-commit",
+    "hl/./../config",
+    "hl//../config",
+]
+
+
+@pytest.mark.parametrize("tool", ["write", "edit"])
+@pytest.mark.parametrize("rel", GIT_DOTDOT)
+def test_a_symlink_followed_by_dotdot_does_not_hide_a_git_internal_file(tmp_path: Path, tool: str, rel: str) -> None:
+    proj, _ = _dotdot_project(tmp_path)
+    for spelling in _spellings(proj, rel):
+        for mode in MODES:
+            dec = decide(mode=mode, tool=tool, args={"path": spelling}, cwd=proj)
+            assert dec.action == "ask" and dec.needs_human and dec.always_ask, (mode, spelling, dec)
+            assert decide(mode=mode, tool=tool, args={"path": spelling}, cwd=proj, headless=True).action == "deny"
+        assert decide(mode="plan", tool=tool, args={"path": spelling}, cwd=proj).action == "deny"
+
+
+@pytest.mark.parametrize("tool", ["write", "edit"])
+@pytest.mark.parametrize("pattern", ["*", "{root}/*", "{root}/hl/*", "{root}/.git/*"])
+def test_no_allow_rule_turns_the_dotdot_ask_back_into_an_allow(tmp_path: Path, tool: str, pattern: str) -> None:
+    proj, _ = _dotdot_project(tmp_path)
+    rule = Rule("edit", pattern.format(root=proj), "allow")
+    for layers in _rule_layers(rule):
+        for spelling in _spellings(proj, "hl/../config"):
+            for mode in MODES:
+                dec = decide(mode=mode, tool=tool, args={"path": spelling}, cwd=proj, **layers)
+                assert dec.action == "ask" and dec.always_ask, (mode, spelling, layers, dec)
+
+
+@pytest.mark.parametrize("tool", ["write", "edit"])
+def test_a_deny_rule_still_denies_through_a_dotdot_link(tmp_path: Path, tool: str) -> None:
+    proj, _ = _dotdot_project(tmp_path)
+    rules = [Rule("edit", "*", "allow"), Rule("edit", f"{proj}/.git/*", "deny")]
+    for mode in MODES:
+        dec = decide(mode=mode, tool=tool, args={"path": "hl/../config"}, cwd=proj, user_rules=rules)
+        assert dec.action == "deny", mode
+
+
+# startup files and keys of the home directory reached through ``lnk -> ~/sub``
+HOME_DOTDOT = [
+    "lnk/../.bashrc",
+    "lnk/../.zshrc",
+    "lnk/../.profile",
+    "lnk/../.gitconfig",
+    "lnk/../.ssh/authorized_keys",
+    "lnk/../.ssh/config",
+    "lnk/../.config/git/config",
+    "lnk/../.aws/credentials",
+]
+
+
+@pytest.mark.parametrize("tool", ["write", "edit"])
+@pytest.mark.parametrize("rel", HOME_DOTDOT)
+def test_a_symlink_followed_by_dotdot_does_not_hide_a_home_startup_file_or_key(
+    tmp_path: Path, tool: str, rel: str
+) -> None:
+    proj, _ = _dotdot_project(tmp_path)
+    for spelling in _spellings(proj, rel):
+        for mode in MODES:
+            dec = decide(mode=mode, tool=tool, args={"path": spelling}, cwd=proj)
+            if mode == "auto":  # the file is outside the project roots, which auto mode never writes
+                assert dec.action == "deny", (mode, spelling, dec)
+            else:
+                assert dec.action == "ask" and dec.needs_human and dec.always_ask, (mode, spelling, dec)
+            assert decide(mode=mode, tool=tool, args={"path": spelling}, cwd=proj, headless=True).action == "deny"
+        # a rule that allows the path does not help either
+        for layers in _rule_layers(Rule("edit", "*", "allow")):
+            for mode in MODES:
+                dec = decide(mode=mode, tool=tool, args={"path": spelling}, cwd=proj, **layers)
+                assert dec.action == "ask" and dec.always_ask, (mode, spelling, layers, dec)
+
+
+async def test_the_dotdot_spellings_really_reach_the_protected_files(tmp_path: Path) -> None:
+    """Control for the tests above: the write tool follows the link first, so the file it writes is the protected one
+    (the engine has to decide that file, not the text of the path)."""
+    proj, home = _dotdot_project(tmp_path)
+    for rel, target in [("hl/../config", proj / ".git" / "config"), ("lnk/../.bashrc", home / ".bashrc")]:
+        for spelling in _spellings(proj, rel):
+            target.write_text("before\n")
+            result = await tool_write({"path": spelling, "content": f"[filter]\n# {spelling}\n"}, cwd=proj)
+            assert result.get("ok"), result
+            assert target.read_text().startswith("[filter]"), spelling
+            assert not (proj / Path(rel).name).exists()  # nothing was written where the lexical reading puts it
+
+
+def test_a_dotdot_link_that_stays_in_the_project_keeps_its_decision(tmp_path: Path) -> None:
+    proj, _ = _dotdot_project(tmp_path)
+    for spelling in _spellings(proj, "inner/../notes.txt"):  # = real/notes.txt
+        assert decide(mode="default", tool="write", args={"path": spelling}, cwd=proj).action == "ask"
+        for mode in ("accept-edits", "auto", "yolo"):
+            for tool in ("write", "edit"):
+                dec = decide(mode=mode, tool=tool, args={"path": spelling}, cwd=proj)
+                assert dec.action == "allow" and not dec.always_ask, (mode, spelling, dec)
+
+
+def test_a_dotdot_link_out_of_the_project_is_outside_the_roots(tmp_path: Path) -> None:
+    """``lnk/../x`` is ``~/x``, not ``<project>/x``: auto mode (project roots only) refuses it, the others ask."""
+    proj, home = _dotdot_project(tmp_path)
+    for spelling in _spellings(proj, "lnk/../notes.txt"):
+        for tool in ("write", "edit"):
+            assert decide(mode="auto", tool=tool, args={"path": spelling}, cwd=proj).action == "deny", spelling
+            for mode in ("default", "accept-edits"):
+                dec = decide(mode=mode, tool=tool, args={"path": spelling}, cwd=proj)
+                assert dec.action == "ask" and not dec.always_ask, (mode, spelling, dec)
+    # as for any path outside the roots, a rule that names the file the tool really reaches still applies
+    allow = Rule("edit", f"{os.path.realpath(home)}/notes.txt", "allow")
+    dec = decide(mode="auto", tool="write", args={"path": "lnk/../notes.txt"}, cwd=proj, user_rules=[allow])
+    assert dec.action == "allow"
+
+
+@pytest.mark.parametrize("rel", ["lnk/../.ssh/id_ed25519", "lnk/../.aws/credentials", "lnk/../.gnupg/secring.gpg"])
+def test_reading_a_credential_file_through_a_dotdot_link_is_denied(tmp_path: Path, rel: str) -> None:
+    proj, _ = _dotdot_project(tmp_path)
+    for spelling in _spellings(proj, rel):
+        for mode in MODES:
+            for tool in ("read", "grep"):
+                dec = decide(mode=mode, tool=tool, args={"path": spelling}, cwd=proj)
+                assert dec.action == "deny" and dec.hardline == "sensitive-path", (mode, tool, spelling, dec)
+
+
+def test_reading_an_ordinary_file_through_a_dotdot_link_asks_outside_the_project(tmp_path: Path) -> None:
+    proj, _ = _dotdot_project(tmp_path)
+    for mode in MODES:
+        dec = decide(mode=mode, tool="read", args={"path": "lnk/../notes.txt"}, cwd=proj)
+        assert dec.action == ("allow" if mode == "yolo" else "ask"), (mode, dec)
+        # inside the project it stays a plain read
+        assert decide(mode=mode, tool="read", args={"path": "inner/../notes.txt"}, cwd=proj).action == "allow"
 
 
 class _R:
