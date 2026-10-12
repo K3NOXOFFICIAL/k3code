@@ -352,8 +352,11 @@ PIPE_GRACE_S = 1.0
 #: with it, silently: the pipes close, so the check that says so outside the sandbox never fires. The shell counts what
 #: is still there when the command returns.
 _LEFTOVER_TRAP = (
-    "trap 'set -- /proc/[0-9]*; [ $# -gt 2 ] && echo \"[a process this command started in the background was stopped "
-    "when the command returned; use background: true to keep one running]\"' EXIT; "
+    # `set +x` first: a command that traced itself (`set -x`) would print the trap's own lines; the leading newline
+    # keeps the note off the end of output that has none (`printf started`)
+    "trap '{ set +x; } 2>/dev/null; set -- /proc/[0-9]*; [ $# -gt 2 ] && "
+    'printf "\\n[a process this command started in the background was stopped when the command returned; '
+    "use background: true to keep one running]\\n\"' EXIT; "
 )
 
 

@@ -252,6 +252,16 @@ async def test_a_sandboxed_background_child_is_reported_as_stopped(tmp_path):
 
 
 @needs_bwrap
+async def test_the_leftover_note_starts_on_its_own_line_and_is_not_traced(tmp_path):
+    argv = sandbox.build_argv(tmp_path, [], network=False)
+    res = await tool_bash({"command": "sleep 60 & printf started"}, cwd=tmp_path, sandbox=argv)
+    assert res["stdout"].startswith("started\n[a process this command started"), res["stdout"]
+    traced = await tool_bash({"command": "set -x; sleep 60 & echo hi"}, cwd=tmp_path, sandbox=argv)
+    assert "started in the background was stopped" in traced["stdout"]
+    assert "/proc/" not in traced["stderr"] and "-gt" not in traced["stderr"], "the trap's own lines are not traced"
+
+
+@needs_bwrap
 async def test_a_sandboxed_command_without_leftovers_prints_nothing_extra_and_keeps_its_exit_code(tmp_path):
     argv = sandbox.build_argv(tmp_path, [], network=False)
     assert (await tool_bash({"command": "echo plain"}, cwd=tmp_path, sandbox=argv))["stdout"] == "plain\n"
