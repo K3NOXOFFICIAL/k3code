@@ -1264,6 +1264,84 @@ def test_from_source_builds_the_tui_outside_the_checkout(tmp_path: Path) -> None
     assert not (src / "tui" / "dist").exists()
 
 
+def _checkout_with_a_failing_tui(tmp_path: Path) -> tuple[Path, Path]:
+    """A checkout whose TUI cannot build (npm cannot reach the registry), and the PATH dir with the node/npm stubs."""
+    src = _mini_checkout(tmp_path)
+    (src / "tui").mkdir()
+    (src / "tui" / "package.json").write_text("{}\n")
+    tools = stub_bin(tmp_path, "node", 'echo "v22.0.0"\n')
+    stub_bin(tmp_path, "npm", 'echo "npm ERR! network request to https://registry.npmjs.org/ failed" >&2\nexit 1\n')
+    return src, tools
+
+
+def test_a_failed_tui_build_is_a_warning_for_an_install(tmp_path: Path) -> None:
+    """A fresh install without a working npm still gets k3code, on the line REPL."""
+    src, tools = _checkout_with_a_failing_tui(tmp_path)
+    r = run(
+        tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", drop=("K3_SKIP_TUI",), path_front=tools
+    )
+    assert r.returncode == 0, r.stderr
+    assert "WARNING: the TUI did not build" in r.stderr
+    current = tmp_path / DATA_REL / "current"
+    assert (current / ".complete").is_file() and not (current / "tui" / "dist").exists()
+
+
+def test_k3_require_tui_fails_the_build_when_the_tui_does_not_build(tmp_path: Path) -> None:
+    """`k3code update` sets K3_REQUIRE_TUI: its build is staged with --no-activate, and a version without the TUI used
+    to be staged, switched to and reported as updated (exit 0) when the npm registry was unreachable."""
+    src, tools = _checkout_with_a_failing_tui(tmp_path)
+    args = ("--from-source", "--yes", "--minimal", "--no-activate", "--print-version")
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        *args,
+        env_extra={"K3_REQUIRE_TUI": "1"},
+        drop=("K3_SKIP_TUI",),
+        path_front=tools,
+    )
+    assert r.returncode != 0
+    assert "npm ERR! network request" in r.stderr and "the TUI did not build" in r.stderr
+    assert not r.stdout.strip()  # no version name: nothing to activate
+    versions = tmp_path / DATA_REL / "versions"
+    assert not versions.exists() or list(versions.iterdir()) == []  # the half-built version is gone, no .complete
+
+
+def test_k3_require_tui_does_not_fail_a_build_that_skips_the_tui(tmp_path: Path) -> None:
+    """No node (or K3_SKIP_TUI) is a skip, not a failed build: a machine without node keeps updating."""
+    src, _tools = _checkout_with_a_failing_tui(tmp_path)
+    r = run(
+        tmp_path,
+        src / "install" / "install.sh",
+        "--from-source",
+        "--yes",
+        "--minimal",
+        "--no-activate",
+        "--print-version",
+        env_extra={"K3_REQUIRE_TUI": "1"},  # K3_SKIP_TUI=1 is the run() default
+    )
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip().startswith("9.9.9-src")
+
+
+@pytest.mark.parametrize("builds", [True, False])
+def test_a_failed_k3_build_is_recorded_for_the_updater(tmp_path: Path, builds: bool) -> None:
+    src = _mini_checkout(tmp_path)
+    (src / "panes").mkdir()
+    build = 'build) while [ $# -gt 0 ]; do [ "$1" = -o ] && touch "$2"; shift; done ;; esac\n'
+    fail = 'build) echo "go: module lookup disabled by GOPROXY=off" >&2; exit 1 ;; esac\n'
+    go = stub_bin(tmp_path, "go", 'case "$1" in ' + (build if builds else fail))
+    r = run(tmp_path, src / "install" / "install.sh", "--from-source", "--minimal", drop=("K3_SKIP_GO",), path_front=go)
+    assert r.returncode == 0, r.stderr  # k3 is optional: the install goes on
+    current = (tmp_path / DATA_REL / "current").resolve()
+    assert (current / ".complete").is_file()
+    if builds:
+        assert (current / "bin" / "k3").is_file() and not (current / ".degraded").exists()
+    else:
+        assert "WARNING: the k3 pane binary did not build" in r.stderr
+        assert not (current / "bin" / "k3").exists()
+        assert (current / ".degraded").read_text().startswith("k3:")
+
+
 def test_the_tui_build_dir_is_recorded_in_the_lock_with_a_single_slash(tmp_path: Path) -> None:
     # the recording side of the leftover-build-dir cleanup: with a TMPDIR ending in "/" the lock must name
     # "<tmp>/k3code-tui.X", the form the next run's strict prefix check accepts
