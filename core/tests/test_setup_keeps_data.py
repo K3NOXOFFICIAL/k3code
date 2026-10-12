@@ -117,12 +117,14 @@ def test_a_user_md_from_an_older_setup_is_backed_up_and_its_notes_kept(env: Path
         "- Primary use: ; languages: ; frameworks: \n- System: , shell , editor , toolchains , tailscale False\n"
         "- I prefer tabs\n\n" + distiller.HEADING + "\n- learned one\n"
     )
-    write_user_md({"about": {"name": "kk"}})
+    said: list[str] = []
+    write_user_md({"about": {"name": "kk"}}, said.append)
     text = _user_md().read_text()
     assert "- I prefer tabs" in text and "- learned one" in text
     assert "Name/handle: kk" in text and "Name/handle: old" not in text
     (bak,) = _backups()
     assert "Name/handle: old" in bak.read_text() and "- I prefer tabs" in bak.read_text()
+    assert len(said) == 1 and bak.name in said[0]  # the user is told where the copy went
     write_user_md({"about": {"name": "kk"}})
     assert _user_md().read_text() == text and len(_backups()) == 1
 

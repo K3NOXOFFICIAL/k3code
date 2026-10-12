@@ -50,7 +50,7 @@ def run_setup(
             data = {k: v for k, v in state["data"].items() if not (step.name == "providers" and k == "tiers")}
             write_config(data, only=step.name)
             if step.name in ("about", "system", "usage"):
-                write_user_md(state["data"])
+                write_user_md(state["data"], p.say)
         save_state(state)
     if not only_step and all(n in state["completed"] for n in STEP_NAMES):
         state["done"] = True  # keep the data so `--step X` can rewrite config from it

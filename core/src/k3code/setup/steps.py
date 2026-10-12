@@ -518,7 +518,7 @@ _USER_MD_OLD_LINE = re.compile(
 )
 
 
-def write_user_md(data: dict[str, Any]) -> Path:
+def write_user_md(data: dict[str, Any], say: Callable[[str], None] | None = None) -> Path:
     """Put the setup answers into USER.md inside a marked block; the user's own lines and the learned preferences
     around it are never touched. A USER.md from before the block existed is backed up (``USER.md.bak-<ts>``) and
     gets the block; its lines that setup itself wrote are replaced by the block, everything else stays."""
@@ -535,7 +535,10 @@ def write_user_md(data: dict[str, Any]) -> Path:
         new = old[: m.start()] + block + old[m.end() :]
     else:
         if old.strip():
-            private_file(confio.backup_path(mem)).write_text(old, encoding="utf-8")
+            bak = confio.backup_path(mem)
+            private_file(bak).write_text(old, encoding="utf-8")
+            if say:
+                say(f"  {mem.name} had no setup block: saved a copy as {bak.name}; your own lines are kept.")
         rest = _USER_MD_OLD_LINE.sub("", _USER_MD_MARKER.sub("", old if old.endswith("\n") else old + "\n"))
         rest = re.sub(r"\A\s*# About the user[ \t]*\n", "", rest).strip("\n")
         new = "# About the user\n\n" + block + (f"\n{rest}\n" if rest else "")
@@ -656,7 +659,7 @@ def step_summary(c: Ctx) -> dict[str, Any]:
     from k3code.config import load_config
 
     path = write_config(c.data)
-    mem = write_user_md(c.data)
+    mem = write_user_md(c.data, c.say)
     c.say(f"Wrote {path} and {mem}")
     checks = asyncio.run(doctor.run_checks(load_config(), probe=c.do_probe))
     c.say(doctor.format_report(checks))
