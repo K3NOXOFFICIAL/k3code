@@ -14,6 +14,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from k3code.permissions.engine import grep_excludes, sensitive_path
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, shell_path, with_chdir
 from k3code.tools.fuzzy_match import (
@@ -739,12 +740,14 @@ def _shown(path: Path, base: Path) -> str:
         return str(path)
 
 
-async def _run_rg(cmd: list[str], base: Path) -> tuple[int, list[str], bytes, str]:
-    """``cmd`` (an rg argv) run in ``base``: (exit code, output lines, stderr, cut). Reading stops one line past
-    MAX_SEARCH_RESULTS or at SEARCH_BUDGET_S, with rg killed; ``cut`` then says why the lines are partial."""
+async def _run_rg(cmd: list[str], cwd: Path, base: Path) -> tuple[int, list[str], bytes, str]:
+    """``cmd`` (an rg argv with ``--null``) run in ``cwd``: (exit code, output lines, stderr, cut). Each match line
+    names its file as :func:`_shown` relative to ``base``; a file ``sensitive_path`` names is dropped, whatever glob
+    or ignore file let rg reach it. Reading stops one line past MAX_SEARCH_RESULTS or at SEARCH_BUDGET_S, with rg
+    killed; ``cut`` then says why the lines are partial."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
-        cwd=base,
+        cwd=cwd,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -754,6 +757,7 @@ async def _run_rg(cmd: list[str], base: Path) -> tuple[int, list[str], bytes, st
     errors = asyncio.ensure_future(proc.stderr.read())  # read alongside: a full stderr pipe would stall rg's output
     lines: list[str] = []
     cut = ""
+    shown: dict[bytes, str | None] = {}  # per file name rg printed: how it is shown, None for a sensitive path
     deadline = time.monotonic() + SEARCH_BUDGET_S
     while True:
         try:
@@ -763,7 +767,16 @@ async def _run_rg(cmd: list[str], base: Path) -> tuple[int, list[str], bytes, st
             break
         if not raw:
             break
-        lines.append(raw.decode("utf-8", errors="replace").rstrip("\n"))
+        name, nul, rest = raw.rstrip(b"\n").partition(b"\0")
+        if not nul:  # a search of one file prints no name: that file is the search path, checked by the caller
+            lines.append(raw.decode("utf-8", errors="replace").rstrip("\n"))
+            continue
+        if name not in shown:
+            secret = sensitive_path(os.path.join(cwd, os.fsdecode(name)))
+            shown[name] = None if secret else _shown(cwd / name.decode("utf-8", errors="replace"), base)
+        if (where := shown[name]) is None:
+            continue
+        lines.append(f"{where}:{rest.decode('utf-8', errors='replace')}")
         if len(lines) > MAX_SEARCH_RESULTS:  # one past the cap proves the cut; stop rg instead of reading on
             lines = lines[:MAX_SEARCH_RESULTS]
             cut = f"truncated to the first {MAX_SEARCH_RESULTS} matching lines: {_NARROW}"
@@ -831,49 +844,60 @@ def _rg_remedy(stderr: bytes) -> str | None:
 
 
 async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S."""
+    """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S.
+
+    Files ``sensitive_path`` names (dotenv files, key directories, the daemon's env file) are never searched or
+    reported: the permission engine only sees ``path``, while an include glob or a repository's own ``.ignore``
+    (``!.env``) reopens hidden files to rg, and the fallback walks them anyway."""
     pattern = arguments["pattern"]
     base = Path(cwd) if cwd else Path.cwd()
     path = _resolve_path(arguments.get("path", "."), cwd)
     include = _glob_list(arguments.get("include"))
     exclude = _glob_list(arguments.get("exclude"))
+    if sensitive_path(str(path)):
+        return {"error": f"Hardline deny (sensitive-path): {path}"}
     if not path.exists():
         shown = _shown(path, base)
         hint = ": path is a file or a directory, not a glob; put the glob in include" if set("*?[") & set(shown) else ""
         return {"error": f"Path not found: {shown}{hint}"}
     try:
         # --hidden: .github, .eslintrc.json and the like are code too (glob lists them and the Python fallback searches
-        # them); .git stays out, and so do the credential files (below)
-        cmd = ["rg", "--line-number", "--no-heading", "--color=never", "--hidden", "-g", "!.git"]
+        # them); .git stays out, and so do the credential files (below). --null ends each file name with a NUL, so
+        # the file of every match is known whatever its name holds.
+        cmd = ["rg", "--null", "--line-number", "--no-heading", "--color=never", "--hidden", "-g", "!.git"]
         cmd += ["--max-columns", str(GREP_MAX_COLUMNS), "--max-columns-preview"]
-        # dependency trees, caches and other sessions' worktrees, unless the search is inside one on purpose
-        if not SKIP_DIRS.intersection(path.parts):
-            for skipped in sorted(SKIP_DIRS - {".git"}):
-                cmd += ["-g", f"!{skipped}"]
-        if not _skipped_subpath(path.as_posix()):
-            for sub in SKIP_SUBPATHS:
-                cmd += ["-g", f"!**/{sub}/"]
         if include:
             for inc in include if isinstance(include, list) else [include]:
                 cmd += ["-g", inc]
         if exclude:
             for exc in exclude if isinstance(exclude, list) else [exclude]:
                 cmd += ["-g", f"!{exc}"]
+        # dependency trees, caches and other sessions' worktrees, unless the search is inside one on purpose; after the
+        # include globs, since rg's last matching glob wins and ``include: "*"`` would switch them off
+        if not SKIP_DIRS.intersection(path.parts):
+            for skipped in sorted(SKIP_DIRS - {".git"}):
+                cmd += ["-g", f"!{skipped}"]
+        if not _skipped_subpath(path.as_posix()):
+            for sub in SKIP_SUBPATHS:
+                cmd += ["-g", f"!**/{sub}/"]
+        # rg anchors globs where it runs: in the session's directory, or at the search root when that lies outside it,
+        # so the credential excludes below cover every directory the search can reach
+        target = Path(os.path.normpath(path))
+        root = target if target.is_dir() else target.parent
+        run_dir = base if root.is_relative_to(base) else root
         # hidden files are searched and an include glob overrides rg's filters; the last glob wins, so the credential
         # files (dotenv files, the secret directories under the search root) are kept out again after every other glob
-        from k3code.permissions.engine import grep_excludes
-
-        for glob in grep_excludes(str(base)):
+        for glob in grep_excludes(str(run_dir)):
             cmd += ["--iglob", glob]
         # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
-        cmd += ["-e", pattern, "--", _shown(path, base) if path != base else "."]
-        code, lines, stderr, cut = await _run_rg(cmd, base)
+        cmd += ["-e", pattern, "--", _shown(target, run_dir) if target != run_dir else "."]
+        code, lines, stderr, cut = await _run_rg(cmd, run_dir, base)
         flag = _rg_remedy(stderr) if code == 2 and not lines else None
         retried = ""
         if flag:
             # rg names the flag that makes the pattern work (a "\n" needs -U, a look-around needs --pcre2): run it
             # once more with that flag rather than send the model to flags this tool has no argument for
-            again = await _run_rg([cmd[0], flag, *cmd[1:]], base)
+            again = await _run_rg([cmd[0], flag, *cmd[1:]], run_dir, base)
             if again[0] in (0, 1):
                 (code, lines, stderr, cut), retried = (
                     again,
@@ -881,7 +905,6 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 )
             elif again[0] == 2 and not again[1]:
                 code, lines, stderr, cut = again  # the flag did not help: its error is about the pattern itself
-        lines = [line.removeprefix("./") for line in lines]
         # a search of one file prints no path, so a line of its text could read like `path:12:`: leave those alone
         text = ("\n".join(lines) if path.is_file() else _group_by_file(lines)).strip()
         if retried:
@@ -1101,8 +1124,6 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: P
     else:
         root, candidates = path, _iter_tree(path, deadline)
     matches: list[str] = []
-    from k3code.permissions.engine import sensitive_path
-
     timed_out = False
     for rel, is_dir in candidates:
         if rel is None or time.monotonic() > deadline:
@@ -1111,11 +1132,11 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: P
         if is_dir:
             continue
         fp = root / rel
-        if sensitive_path(str(fp)):  # the tree walk lists hidden files too: dotenv files and key directories stay out
-            continue
         if includes and not any(Path(fp.name).match(p) for p in includes):
             continue
         if excludes and any(Path(fp.name).match(p) for p in excludes):
+            continue
+        if sensitive_path(str(fp)):  # the walk lists hidden files: dotenv files and key directories stay unread
             continue
         try:
             text = fp.read_text(encoding="utf-8", errors="replace")

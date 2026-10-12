@@ -218,6 +218,196 @@ async def test_grep_pattern_that_looks_like_a_flag_is_searched_as_text(temp_dir)
     assert "notes.txt\n1:the flag --files is literal here" in result["matches"]
 
 
+# ── grep never hands a credential file to the model (K3NOX-68, GitHub #138) ──
+
+
+def _secret_project(root: Path) -> Path:
+    (root / ".env").write_text("API_KEY=sk-dotenv-secret\n")
+    (root / ".env.local").write_text("API_KEY=sk-local-secret\n")
+    (root / ".env.example").write_text("API_KEY=example-template\n")
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (root / "node_modules" / "pkg" / "a.js").write_text("API_KEY in a dependency\n")
+    (root / "app.py").write_text("API_KEY = os.environ['API_KEY']\n")
+    return root
+
+
+def _flat(matches: str) -> str:
+    """grep's grouped result (a file's path, then its ``line:text`` matches) as ``path:line:text`` lines."""
+    out, current = [], ""
+    for line in matches.splitlines():
+        number, sep, _ = line.partition(":")
+        if sep and number.isdigit() and current:
+            out.append(f"{current}:{line}")
+        elif line:
+            current = line
+    return "\n".join(out)
+
+
+def _no_rg(monkeypatch, root: Path) -> None:
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("PATH", str(root / "no-bin"))  # no rg (and no git): the Python fallback
+
+
+@pytest.fixture
+def rg():
+    import shutil
+
+    if not shutil.which("rg"):
+        pytest.skip("rg not installed")
+
+
+@pytest.mark.parametrize("include", ["*", ".env*", ["*.py", ".*"], "**"])
+async def test_grep_include_glob_does_not_reopen_dotenv_files_or_node_modules(temp_dir, rg, include):
+    # rg's last matching glob wins and an include glob overrides its hidden-file filter: `include: "*"` used to
+    # return .env (and node_modules) while read/grep of `.env` itself is a sensitive-path hardline deny.
+    _secret_project(temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": ".", "include": include}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"]
+    assert "node_modules" not in res["matches"]
+    if include != ".env*":
+        assert "app.py:1:API_KEY" in _flat(res["matches"])
+    # rg's credential excludes (grep_excludes) keep every .env.* out, templates too: stricter than sensitive_path,
+    # which the Python fallback applies (test_grep_fallback_skips_dotenv_files still finds the template there)
+
+
+async def test_grep_ignore_file_negation_does_not_reopen_dotenv(temp_dir, rg):
+    # A hostile repository can whitelist its .env for rg without any include: `!.env` in .ignore or .gitignore.
+    _secret_project(temp_dir)
+    (temp_dir / ".ignore").write_text("!.env\n!.env.local\n")
+    res = await tool_grep({"pattern": "API_KEY", "path": "."}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"]
+    assert "app.py:1:API_KEY" in _flat(res["matches"])
+
+
+async def test_grep_include_can_still_search_inside_node_modules_by_path(temp_dir, rg):
+    _secret_project(temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": "node_modules/pkg", "include": "*.js"}, cwd=temp_dir)
+    assert "a.js:1:API_KEY in a dependency" in _flat(res["matches"])
+
+
+async def test_grep_fallback_skips_dotenv_files(temp_dir, monkeypatch):
+    # The Python fallback walks hidden files (and `git ls-files -co` lists a .env that is not ignored).
+    _secret_project(temp_dir)
+    _no_rg(monkeypatch, temp_dir)
+    for include in (None, "*", ".env*"):
+        args = {"pattern": "API_KEY", "path": ".", **({"include": include} if include else {})}
+        res = await tool_grep(args, cwd=temp_dir)
+        assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"], include
+        assert "API_KEY=example-template" in res["matches"], include
+    assert "app.py" in (await tool_grep({"pattern": "API_KEY", "path": "."}, cwd=temp_dir))["matches"]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_grep_of_a_home_directory_skips_key_and_k3code_secret_files(temp_dir, monkeypatch, fallback):
+    import shutil
+
+    if not fallback and not shutil.which("rg"):
+        pytest.skip("rg not installed")
+    home = temp_dir / "home"
+    for rel, text in {
+        ".ssh/id_ed25519": "API_KEY ssh-private-key",
+        ".aws/credentials": "API_KEY aws_secret_access_key",
+        ".config/k3code/env": "API_KEY=sk-daemon-env",
+        "notes/todo.txt": "API_KEY rotate me",
+    }.items():
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text(text + "\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    if fallback:
+        _no_rg(monkeypatch, temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": str(home), "include": "*"}, cwd=temp_dir)
+    assert "todo.txt:1:API_KEY rotate me" in _flat(res["matches"])
+    for secret in ("ssh-private-key", "aws_secret_access_key", "sk-daemon-env"):
+        assert secret not in res["matches"]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_grep_of_a_dotenv_file_itself_is_refused(temp_dir, monkeypatch, fallback):
+    _secret_project(temp_dir)
+    if fallback:
+        _no_rg(monkeypatch, temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": ".env"}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in str(res)
+    assert "sensitive-path" in res["error"]
+    template = await tool_grep({"pattern": "API_KEY", "path": ".env.example"}, cwd=temp_dir)
+    assert "example-template" in template["matches"]
+
+
+_HOME_SECRETS = {
+    ".ssh/id_ed25519": "API_KEY ssh-private-key",
+    ".aws/credentials": "API_KEY aws_secret_access_key",
+    ".config/k3code/env": "API_KEY=sk-daemon-env",
+    "notes/todo.txt": "API_KEY rotate me",
+}
+
+
+def _fake_home(root: Path, monkeypatch) -> Path:
+    home = root / "home"
+    for rel, text in _HOME_SECRETS.items():
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text(text + "\n")
+    (home / "proj").mkdir()
+    (home / "proj" / "app.py").write_text("API_KEY = 1\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    return home
+
+
+@pytest.mark.parametrize("include", [None, "*"])
+async def test_grep_of_home_from_a_project_in_it_never_searches_the_key_directories(temp_dir, rg, monkeypatch, include):
+    # K3NOX-106: the session is ~/proj and the search is ~ (an added directory). rg anchors its globs where it runs,
+    # so the credential excludes have to be built for (and rg run at) the search root, not the session's directory.
+    import k3code.tools as tools
+
+    home = _fake_home(temp_dir, monkeypatch)
+    reached: list[str] = []
+    real = tools.sensitive_path
+
+    def spy(path: str) -> bool:
+        reached.append(path)
+        return real(path)
+
+    monkeypatch.setattr(tools, "sensitive_path", spy)
+    args = {"pattern": "API_KEY", "path": str(home), **({"include": include} if include else {})}
+    res = await tool_grep(args, cwd=home / "proj")
+    flat = _flat(res["matches"])
+    assert f"{home}/notes/todo.txt:1:API_KEY rotate me" in flat and "app.py:1:API_KEY = 1" in flat
+    for secret in ("ssh-private-key", "aws_secret_access_key", "sk-daemon-env"):
+        assert secret not in res["matches"]
+    # rg pruned the key directories: no file in them came back for the result filter to drop
+    assert not [p for p in reached if any(d in p for d in ("/.ssh", "/.aws", "/.config/k3code"))], reached
+
+
+async def test_grep_drops_a_sensitive_file_even_when_rg_reaches_it(temp_dir, rg, monkeypatch):
+    # the result filter on its own: with the credential excludes gone, rg searches ~/.ssh and the rest, and still
+    # nothing from them reaches the model
+    import k3code.tools as tools
+
+    home = _fake_home(temp_dir, monkeypatch)
+    monkeypatch.setattr(tools, "grep_excludes", lambda base: [])
+    res = await tool_grep({"pattern": "API_KEY", "path": str(home), "include": "*"}, cwd=home / "proj")
+    assert f"{home}/notes/todo.txt:1:API_KEY rotate me" in _flat(res["matches"])
+    for secret in ("ssh-private-key", "aws_secret_access_key", "sk-daemon-env"):
+        assert secret not in res["matches"]
+
+
+def test_grep_excludes_prune_the_key_directories_under_real_rg(temp_dir, rg, monkeypatch):
+    # the anchored `!/.ssh` globs grep_excludes builds, checked against the rg on this host (not only as strings)
+    import subprocess
+
+    from k3code.permissions.engine import grep_excludes
+
+    home = _fake_home(temp_dir, monkeypatch)
+    (home / "proj" / ".env").write_text("API_KEY=sk-dotenv\n")
+    cmd = ["rg", "--files", "--hidden", "-g", "*"]  # an include glob: the excludes must win over it
+    for glob in grep_excludes(str(home)):
+        cmd += ["--iglob", glob]
+    listed = subprocess.run(cmd, cwd=home, capture_output=True, text=True, check=False).stdout.splitlines()
+    assert sorted(listed) == ["notes/todo.txt", "proj/app.py"], listed
+
+
 async def test_glob_finds(temp_dir):
     (temp_dir / "a.py").write_text("")
     (temp_dir / "b.txt").write_text("")
