@@ -335,6 +335,22 @@ async def test_grep_of_a_dotenv_file_itself_is_refused(temp_dir, monkeypatch, fa
     assert "example-template" in template["matches"]
 
 
+async def test_grep_falls_back_to_the_filtered_python_search_when_rg_cannot_start(temp_dir, monkeypatch):
+    # rg on PATH but not runnable (no exec permission, a broken binary): any OSError at spawn, not only "not found"
+    _secret_project(temp_dir)
+    real = asyncio.create_subprocess_exec
+
+    async def unrunnable_rg(*cmd, **kwargs):
+        if cmd and cmd[0] == "rg":
+            raise PermissionError(13, "Permission denied", "rg")
+        return await real(*cmd, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unrunnable_rg)
+    res = await tool_grep({"pattern": "API_KEY", "path": "."}, cwd=temp_dir)
+    assert "app.py:1:API_KEY" in _flat(res["matches"])
+    assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"]
+
+
 _HOME_SECRETS = {
     ".ssh/id_ed25519": "API_KEY ssh-private-key",
     ".aws/credentials": "API_KEY aws_secret_access_key",

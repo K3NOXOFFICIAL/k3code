@@ -921,8 +921,8 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         if not text and (hints := _no_match_hints(pattern, include)):
             return {"matches": "", "warnings": f"no matches. Check: {hints}"}
         return {"matches": text}
-    except FileNotFoundError:  # no rg installed
-        # Python fallback: off the event loop, same tree rules as glob, capped
+    except OSError:  # no rg installed, or one that cannot start (no exec permission, a broken binary)
+        # Python fallback: off the event loop, same tree rules as glob, capped, sensitive files skipped
         return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude, base)
 
 
