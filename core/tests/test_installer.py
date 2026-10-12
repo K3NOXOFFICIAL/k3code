@@ -1300,7 +1300,8 @@ def test_k3_require_tui_fails_the_build_when_the_tui_does_not_build(tmp_path: Pa
         path_front=tools,
     )
     assert r.returncode != 0
-    assert "npm ERR! network request" in r.stderr and "the TUI did not build" in r.stderr
+    assert "npm ERR! network request" in r.stderr and "ERROR: the TUI did not build" in r.stderr
+    assert "line REPL" not in r.stderr  # the fallback is not taken, so it is not announced (and the tail is short)
     assert not r.stdout.strip()  # no version name: nothing to activate
     versions = tmp_path / DATA_REL / "versions"
     assert not versions.exists() or list(versions.iterdir()) == []  # the half-built version is gone, no .complete

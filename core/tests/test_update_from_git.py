@@ -34,8 +34,11 @@ if [ -n "${K3_STUB_FAIL:-}" ]; then
   exit 3
 fi
 if [ -n "${K3_STUB_TUI_BROKEN:-}" ] && [ "${K3_REQUIRE_TUI:-}" = 1 ]; then # an installer that fails a broken TUI build
-  echo "npm ERR! network request to https://registry.npmjs.org/ failed" >&2
+  echo "npm ERR! FetchError: request to https://registry.npmjs.org/x.tgz failed, reason: getaddrinfo ENOTFOUND" >&2
+  i=0 # npm prints its reason first and then a stack trace of about thirty lines
+  while [ $i -lt 30 ]; do echo "npm ERR!     at Socket.emit (node:events:531:35)" >&2; i=$((i + 1)); done
   echo "k3code-install: ERROR: the TUI did not build (output above); nothing was activated" >&2
+  echo "k3code-install: FAILED (exit 1). Log: /somewhere/install.log" >&2
   exit 1
 fi
 if [ -n "${K3_STUB_PARTS+x}" ]; then # stage versions/<version> in the data dir like install.sh: tui, k3, failed-k3
@@ -257,7 +260,8 @@ def test_a_broken_tui_build_fails_the_update_and_keeps_the_active_version(remote
     monkeypatch.setenv("K3_STUB_TUI_BROKEN", "1")
     r = CliRunner().invoke(cli, ["update", "--yes"])
     assert r.exit_code != 0 and "Traceback" not in r.output
-    assert "the installer failed (exit 1)" in r.output and "npm ERR! network request" in r.output
+    assert "the installer failed (exit 1)" in r.output
+    assert "reason: getaddrinfo ENOTFOUND" in r.output  # the cause npm prints first, not just the end of its trace
     assert (remote["logs"] / "args.tui").read_text().strip() == "1"
     assert no_release == []  # not activated, nothing pruned
     assert Path(os.readlink(data / "current")).name == cur
