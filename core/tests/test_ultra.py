@@ -248,6 +248,28 @@ async def test_ultracode_no_agreement_means_no_fix(tmp_path, monkeypatch):
     assert not any("Fix these confirmed" in c["text"] for p in server.providers for c in p.log)
 
 
+async def test_ultracode_lenses_without_an_answer_are_not_a_clean_review(tmp_path, monkeypatch):
+    # issue #97: a lens that dies or replies without the findings array used to read as "review panel found nothing"
+    repo = git_repo(tmp_path / "repo")
+    dead = [
+        {"type": "text", "match": "LENS: correctness\nAdversarially", "text": "I could not finish the review."},
+        {"type": "text", "match": "LENS: security/robustness\nAdversarially", "text": "Out of budget."},
+    ]
+    server = make(tmp_path, monkeypatch, code_steps(*dead), mode="auto", autonomy=cfg())
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "review INCOMPLETE" in report
+    assert "correctness lens (no findings array)" in report and "security/robustness lens" in report
+    assert "review panel found nothing" not in report
+    lens_runs = [
+        h.description
+        for h in server.subagents.handles.values()
+        if h.description in ("review: correctness", "review: security/robustness")
+    ]
+    assert len(lens_runs) == 4  # each lens was asked once more
+
+
 async def test_ultracode_agent_budget_stops_it(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     server = make(
