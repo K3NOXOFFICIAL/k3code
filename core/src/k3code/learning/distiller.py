@@ -243,7 +243,9 @@ def _auto_end(lines: list[str], start: int) -> tuple[int, bool]:
     return len(lines), False
 
 
-def write_auto_section(path: Path, prefs: list[Preference], heading: str = HEADING, known: Collection[str] = ()) -> None:
+def write_auto_section(
+    path: Path, prefs: list[Preference], heading: str = HEADING, known: Collection[str] = ()
+) -> None:
     """Replace the auto section of ``path`` (the heading through the end marker); all other text is preserved byte
     for byte. A section from before the end marker may hold lines the user added after it was written (they cannot be
     told apart from ours): those stay, moved above the heading. ``known`` is the text of the preferences an earlier
@@ -263,7 +265,11 @@ def write_auto_section(path: Path, prefs: list[Preference], heading: str = HEADI
             new = "".join(lines[:start]) + section + tail
         else:
             ours = {f"- {t}" for t in (*known, *(p.text for p in prefs))} | {"- (nothing learned yet)"}
-            mine = [ln for ln in lines[start + 1 : end] if ln.strip() and ln.strip() not in ours and not ln.strip().startswith("<!-- managed by k3code")]
+            mine = [
+                ln
+                for ln in lines[start + 1 : end]
+                if ln.strip() and ln.strip() not in ours and not ln.strip().startswith("<!-- managed by k3code")
+            ]
             kept = "".join(ln if ln.endswith("\n") else ln + "\n" for ln in mine)
             new = "".join(lines[:start]) + (kept + "\n" if kept else "") + section + ("\n" + tail if tail else "")
     _write_user_memory(path, new)

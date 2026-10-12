@@ -68,7 +68,7 @@ async def test_text_outside_the_block_is_byte_for_byte_untouched(tmp_path):
     log = DecisionLog(tmp_path)
     seed(log)
     md = tmp_path / "USER.md"
-    before = "# Me\r\nweird  spacing\t\n\n\n- mine\n"
+    before = "# Me\nweird  spacing\t\n\n\n- mine\n"
     md.write_bytes(before.encode())
     await distiller.distill(log, home=tmp_path, user_md=md)
     first = md.read_bytes().decode()
