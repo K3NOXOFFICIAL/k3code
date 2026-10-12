@@ -619,7 +619,9 @@ def write_config(data: dict[str, Any], only: str | None = None) -> Path:
         chain = []
         for e in cfg["providers"]:
             old = by_name.get(e["name"], {})
-            models = old.get("models", {}) if keep_models else _with_tier_models(old.get("models"), e["models"])
+            # no tier models collected for the entry (a summary-only run, a chain made elsewhere): the ones it has stay
+            keep = keep_models or not e["models"]
+            models = old.get("models", {}) if keep else _with_tier_models(old.get("models"), e["models"])
             chain.append({**old, **{k: v for k, v in e.items() if k != "models"}, "models": models})
         merged["providers"] = chain
     windows = (data.get("tiers") or {}).get("context_windows")
