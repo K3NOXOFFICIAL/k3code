@@ -742,6 +742,25 @@ def test_a_variable_that_holds_a_credential_name_is_resolved_or_asked(proj: Path
     _assert_hardline("d=.en; cat ${d}v", proj)
 
 
+# K3NOX-106: commands run under bash now, which decodes $'...' (dash left it literal): the credential checks read the
+# decoded spelling too
+ANSI_C_CREDENTIAL_READS = [
+    r"cat $'\x2eenv'",
+    r"cat $'\056env'",
+    r"cat $'\x2e'env",
+    r"head -5 $'\x2eenv'",
+    r"grep -r KEY $'\x2eenv'",
+    r"cp $'\x2eenv' /tmp/x",
+    r"cat ~/$'\x2essh'/id_rsa",
+]
+
+
+@pytest.mark.parametrize("cmd", ANSI_C_CREDENTIAL_READS)
+def test_an_ansi_c_quoted_credential_name_is_decoded_before_the_credential_checks(proj: Path, cmd: str) -> None:
+    (proj / ".env").write_text("K=1\n")
+    _assert_hardline(cmd, proj)
+
+
 READ_WITH_EXPANSION = [
     "cat $(echo .e)nv",
     "cat `echo .e`nv",

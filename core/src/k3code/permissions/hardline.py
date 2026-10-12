@@ -354,7 +354,7 @@ def _ansi_c(m: re.Match[str]) -> str:
     return shlex.quote(_unescape(m.group(1)))
 
 
-def _decode_ansi_c(text: str) -> str:
+def decode_ansi_c(text: str) -> str:
     """``text`` with its ``$'...'`` words decoded (``$'\\x72m'`` is ``rm``)."""
     return _ANSI_C.sub(_ansi_c, text)
 
@@ -999,7 +999,7 @@ def _cut_short(sub: str, env: dict[str, list[str]]) -> bool:
     if cut:
         return True
     for text in texts:
-        for spelling in dict.fromkeys((text, _decode_ansi_c(text)) if "$'" in text else (text,)):
+        for spelling in dict.fromkeys((text, decode_ansi_c(text)) if "$'" in text else (text,)):
             for t in (*_tokens(spelling), *_tokens(strip_redirects(spelling))):
                 if "{" in t and "," in t and _brace_expand(t, BRACE_WORDS_CAP)[1]:
                     return True
@@ -1012,7 +1012,7 @@ def _argvs(sub: str, env: dict[str, list[str]]) -> list[list[str]]:
     command line assigns, with the values put in (``a=rm; $a -rf /`` is ``rm -rf /``)."""
     out: list[list[str]] = []
     for text in expand_assigned(sub, env):
-        for spelling in dict.fromkeys((text, _decode_ansi_c(text)) if "$'" in text else (text,)):
+        for spelling in dict.fromkeys((text, decode_ansi_c(text)) if "$'" in text else (text,)):
             stripped = _tokens(strip_redirects(spelling))
             for toks in (_tokens(spelling), stripped, brace_words(stripped)):
                 argv = normalize_argv(toks)
@@ -1597,7 +1597,7 @@ def _launcher_payloads(sub: str) -> tuple[list[str], list[str]]:
     def quoted(args: list[str]) -> list[str]:
         return [t for t in args if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
 
-    spellings = (sub, _decode_ansi_c(sub)) if "$'" in sub else (sub,)
+    spellings = (sub, decode_ansi_c(sub)) if "$'" in sub else (sub,)
     for toks in [t for sp in spellings for t in (_tokens(sp), _tokens(strip_redirects(sp)))]:
         pre = _strip_wrappers(toks)
         if len(pre) > 1 and os.path.basename(pre[0]) == "eval":

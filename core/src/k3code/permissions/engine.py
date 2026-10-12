@@ -675,10 +675,12 @@ def _sub_secret_access(
     sub: str, piped: bool, cwd: str, home: str, env: dict[str, list[str]] | None = None
 ) -> str | None:
     """``sub`` as written and, when it uses a variable the command line assigns, with the values put in
-    (``f=.env; cat $f`` reads ``.env``)."""
+    (``f=.env; cat $f`` reads ``.env``); each also with its ``$'...'`` words decoded, as bash runs them
+    (``cat $'\\x2eenv'`` reads ``.env``)."""
     worst: str | None = None
     for text in hardline.expand_assigned(sub, env or {}):
-        worst = _worse(worst, _text_secret_access(text, piped, cwd, home))
+        for spelling in dict.fromkeys((text, hardline.decode_ansi_c(text)) if "$'" in text else (text,)):
+            worst = _worse(worst, _text_secret_access(spelling, piped, cwd, home))
     return worst
 
 
