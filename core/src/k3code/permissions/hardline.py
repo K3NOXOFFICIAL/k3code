@@ -878,11 +878,17 @@ def strip_redirects(sub: str, heredocs: bool = True, legacy: bool = False) -> st
 # ── brace expansion, variables the command line assigns, working directories ──
 
 _BRACE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+#: The most spellings the checks look at: words of one brace expansion, combinations of the values the line assigns
+#: its variables, directories a cd may lead to. Past one the line is not judged on what was kept (see capped).
+BRACE_WORDS_CAP = 64
+COMBINATIONS_CAP = 16
+DIRS_CAP = 32
 
 
-def brace_expand(word: str, limit: int = 64) -> list[str]:
-    """The words the shell makes of ``a{b,c}d`` (``abd``, ``acd``); capped so a pathological word cannot explode."""
+def _brace_expand(word: str, limit: int) -> tuple[list[str], bool]:
+    """(the words of ``word``, True when the cap or the depth limit dropped some)."""
     out = [word]
+    cut = False
     for _ in range(8):
         nxt: list[str] = []
         changed = False
@@ -893,10 +899,16 @@ def brace_expand(word: str, limit: int = 64) -> list[str]:
                 continue
             changed = True
             nxt.extend(w[: m.start()] + alt + w[m.end() :] for alt in m.group(1).split(","))
+        cut = cut or len(nxt) > limit
         out = nxt[:limit]
         if not changed:
-            break
-    return out
+            return out, cut
+    return out, cut or any(_BRACE.search(w) for w in out)
+
+
+def brace_expand(word: str, limit: int = BRACE_WORDS_CAP) -> list[str]:
+    """The words the shell makes of ``a{b,c}d`` (``abd``, ``acd``); capped so a pathological word cannot explode."""
+    return _brace_expand(word, limit)[0]
 
 
 def brace_words(tokens: list[str]) -> list[str]:
@@ -957,20 +969,41 @@ def assignments(parsed: Parsed) -> dict[str, list[str]]:
     return {k: v for k, v in values.items() if k not in tainted}
 
 
+def _expand_assigned(text: str, env: dict[str, list[str]]) -> tuple[list[str], bool]:
+    """(the texts of :func:`expand_assigned`, True when the cap dropped combinations)."""
+    if not env or "$" not in text:
+        return [text], False
+    names = sorted({m.group(1) or m.group(2) for m in _VAR.finditer(text)} & env.keys())
+    if not names:
+        return [text], False
+    combos: list[dict[str, str]] = [{}]
+    cut = False
+    for n in names:
+        combos = [{**c, n: v} for c in combos for v in env[n]]
+        cut = cut or len(combos) > COMBINATIONS_CAP
+        combos = combos[:COMBINATIONS_CAP]
+    texts = (_VAR.sub(lambda m, c=c: c.get(m.group(1) or m.group(2), m.group(0)), text) for c in combos)
+    return list(dict.fromkeys(texts)), cut
+
+
 def expand_assigned(text: str, env: dict[str, list[str]]) -> list[str]:
     """``text`` with the variables the command line assigns replaced by their values, one text per combination of
     values (capped). ``[text]`` when it uses none of them. Unassigned variables stay as written."""
-    if not env or "$" not in text:
-        return [text]
-    names = sorted({m.group(1) or m.group(2) for m in _VAR.finditer(text)} & env.keys())
-    if not names:
-        return [text]
-    combos: list[dict[str, str]] = [{}]
-    for n in names:
-        combos = [{**c, n: v} for c in combos for v in env[n]][:16]
-    return list(
-        dict.fromkeys(_VAR.sub(lambda m, c=c: c.get(m.group(1) or m.group(2), m.group(0)), text) for c in combos)
-    )
+    return _expand_assigned(text, env)[0]
+
+
+def _cut_short(sub: str, env: dict[str, list[str]]) -> bool:
+    """Did a cap drop spellings of ``sub`` (combinations of assigned values, or words of one of its brace
+    expansions)? Then the checks saw only some of what the shell may run."""
+    texts, cut = _expand_assigned(sub, env)
+    if cut:
+        return True
+    for text in texts:
+        for spelling in dict.fromkeys((text, _decode_ansi_c(text)) if "$'" in text else (text,)):
+            for t in (*_tokens(spelling), *_tokens(strip_redirects(spelling))):
+                if "{" in t and "," in t and _brace_expand(t, BRACE_WORDS_CAP)[1]:
+                    return True
+    return False
 
 
 def _argvs(sub: str, env: dict[str, list[str]]) -> list[list[str]]:
@@ -997,6 +1030,7 @@ class _Scope:
     #: followed in order, so a directory stays in once it was named)
     dirs: list[str] = field(default_factory=list)
     cd_unknown: bool = False  # a cd to a directory chosen by an expansion
+    dirs_cut: bool = False  # more directories than DIRS_CAP: the ones past it were not kept
 
 
 def _scope(parsed: Parsed, cwd: str | None, home: str) -> _Scope:
@@ -1016,7 +1050,10 @@ def _scope(parsed: Parsed, cwd: str | None, home: str) -> _Scope:
             for base in list(scope.dirs) or [""]:
                 new = os.path.normpath(word if os.path.isabs(word) else os.path.join(base, word))
                 new = "/" + new.lstrip("/") if new.startswith("//") else new
-                if os.path.isabs(new) and new not in scope.dirs and len(scope.dirs) < 32:
+                if os.path.isabs(new) and new not in scope.dirs:
+                    if len(scope.dirs) >= DIRS_CAP:
+                        scope.dirs_cut = True
+                        continue
                     scope.dirs.append(new)
     return scope
 
@@ -1235,14 +1272,31 @@ def _find_check(argv: list[str], cwd: str | None, home: str, dirs: list[str]) ->
 # ── what a person has to decide ──
 
 
+def capped(parsed: Parsed, cwd: str | None, home: str, scope: _Scope | None = None) -> str | None:
+    """Why the checks saw only some spellings of the command line, else None: it gives a variable more values, has a
+    brace expansion with more words, or cds to more directories than the caps keep. A deny that a dropped spelling
+    would have hit (``a=x1; ... a=rm; $a -rf /``) did not fire, so nothing vouches for the line."""
+    scope = scope or _scope(parsed, cwd, home)
+    if scope.dirs_cut:
+        return f"the line cds to more than {DIRS_CAP} directories"
+    if any(_cut_short(sub, scope.env) for sub in _all_subs(parsed)):
+        return (
+            f"a variable has more than {COMBINATIONS_CAP} values or a brace expansion more than {BRACE_WORDS_CAP} words"
+        )
+    return None
+
+
 def needs_human(parsed: Parsed, cwd: str | None, home: str) -> str | None:
     """Why the command line cannot be vouched for even though no hardline rule fired, else None: a shell reads a
     script that is not on the command line, the command itself or an ``rm`` argument is a shell expansion whose value
-    is not known here (``$cmd -rf /``, ``rm -rf $(echo /)``), or an ``rm -r`` of a whole directory runs after a
-    ``cd`` to an unknown one. The engine asks a person (and never auto-allows)."""
+    is not known here (``$cmd -rf /``, ``rm -rf $(echo /)``), an ``rm -r`` of a whole directory runs after a ``cd`` to
+    an unknown one, or a cap dropped spellings the checks never saw (:func:`capped`). The engine asks a person (and
+    never auto-allows)."""
     if parsed.opaque_script:
         return parsed.opaque_script
     scope = _scope(parsed, cwd, home)
+    if cut := capped(parsed, cwd, home, scope):
+        return cut
     for sub in _all_subs(parsed, shell_only=True):
         for argv in _argvs(sub, scope.env):
             if UNRESOLVED.search(expand_vars(argv[0], cwd, home)):

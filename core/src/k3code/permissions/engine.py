@@ -778,6 +778,10 @@ def _decide_bash(
         # nested past the parse limit: the hardline could not look inside, and yolo has nobody to ask
         hit = "nesting-too-deep"
         return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
+    if mode == PermissionMode.YOLO and hardline.capped(parsed, cwd, home):
+        # past an expansion cap the hardline judged only some spellings, and yolo has nobody to ask
+        hit = "expansion-capped"
+        return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
     subs = parsed.subs
     # an open quote or a quote inside a comment: the shell may not run what was parsed, so no rule vouches for it.
     # Same for what the line leaves open: a shell reading a script that is not on it, a command or rm argument that is

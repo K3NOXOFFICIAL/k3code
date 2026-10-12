@@ -316,6 +316,36 @@ def test_an_assigned_command_name_is_resolved_or_asked(proj: Path) -> None:
     _assert_needs_human('"$tool" --version', proj)
 
 
+# K3NOX-106: past a cap (16 combinations of assigned values, 64 brace words, 32 cd directories) the checks used to
+# judge only the spellings they kept, so padding a line turned its own deny into an allow
+_PAD = "".join(f"a=x{i}; " for i in range(16))
+PAST_THE_CAPS = [
+    _PAD + "a=rm; $a -rf /",  # the 17th value of $a was never put in
+    "".join(f"f=a{i}; " for i in range(16)) + "f=.env; cat $f",
+    "rm -rf {" + ",".join(f"d{i}" for i in range(64)) + ",/}",  # the 65th brace word was dropped
+]
+
+
+@pytest.mark.parametrize("cmd", PAST_THE_CAPS)
+def test_a_line_past_an_expansion_cap_is_asked_never_allowed(proj: Path, cmd: str) -> None:
+    _assert_needs_human(cmd, proj)
+    d = _bash(cmd, "yolo", proj)
+    assert d.action == "deny" and d.hardline, (d.action, d.message)  # yolo has nobody to ask
+
+
+def test_a_line_that_cds_past_the_directory_cap_is_asked_never_allowed(proj: Path) -> None:
+    cmd = "".join(f"cd {proj}/d{i}; " for i in range(32)) + "cd /; rm -rf *"  # the 33rd directory was dropped
+    _assert_needs_human(cmd, proj)
+    assert _bash(cmd, "yolo", proj).action == "deny"
+
+
+def test_a_line_at_the_caps_is_still_resolved(proj: Path) -> None:
+    _assert_hardline("".join(f"a=x{i}; " for i in range(15)) + "a=rm; $a -rf /", proj)  # 16 values: all checked
+    _assert_hardline("rm -rf {" + ",".join(f"d{i}" for i in range(63)) + ",/}", proj)  # 64 words: all checked
+    d = _bash("mkdir -p src/{a,b,c}/{x,y}", "auto", proj)
+    assert not d.needs_human and d.action == "allow", d.message
+
+
 RM_UNRESOLVED = [
     "rm -rf $(echo /)",
     "rm -rf `echo /`",
