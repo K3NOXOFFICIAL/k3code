@@ -32,6 +32,11 @@ import {
   shortCwd,
 } from "../domain/paths.js";
 import { sessionScopedModelArg } from "../domain/slash.js";
+import {
+  type DashboardChange,
+  dashboardSummary,
+  type DashboardUi,
+} from "../domain/dashboard.js";
 import { tuneSummary } from "../domain/tune.js";
 import { type GatewayClient } from "../gatewayClient.js";
 import type {
@@ -1468,6 +1473,25 @@ export function useMainApp(gw: GatewayClient) {
     slashRef.current(`/model ${value}`);
   }, []);
 
+  // /dashboard popup: Enter. The draft is painted first (the fields that waited for Enter too), then one config.set
+  // per changed key; a key the gateway refuses is named in the transcript instead of silently reverting on restart.
+  const onDashboardSave = useCallback(
+    (changes: DashboardChange[], patch: Partial<DashboardUi>) => {
+      patchUiState(patch);
+      patchOverlayState({ dashboard: null });
+      sys(dashboardSummary(changes));
+
+      for (const { key, value } of changes) {
+        void rpc("config.set", { key, value }).then((r) => {
+          if (r === null) {
+            sys(`could not save ${key}: it applies to this session only`);
+          }
+        });
+      }
+    },
+    [rpc, sys],
+  );
+
   // /tune popup: Enter / `s`. One tune.set carries the model, effort and ultracode changes; the gateway answers with
   // what changed and pushes a session.info, which updates the status line.
   const onTuneApply = useCallback(
@@ -1622,6 +1646,7 @@ export function useMainApp(gw: GatewayClient) {
       newLiveSession: (dropSid?: string) =>
         session.newLiveSession(undefined, undefined, dropSid),
       newPromptSession,
+      onDashboardSave,
       onModelSelect,
       onTuneApply,
       // Resuming a cold session from the overlay CLOSES the current one, so it
@@ -1646,6 +1671,7 @@ export function useMainApp(gw: GatewayClient) {
       clearSelection,
       closeLiveSession,
       newPromptSession,
+      onDashboardSave,
       onModelSelect,
       onTuneApply,
       session,

@@ -140,6 +140,7 @@ const CTRL_C_ORDER = [
   "secret",
   "modelPicker",
   "tunePicker",
+  "dashboard",
   "skillsHub",
   "pluginsHub",
   "sessions",
@@ -363,6 +364,8 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         return patchOverlayState({ modelPicker: false });
       case "tunePicker":
         return patchOverlayState({ tunePicker: false });
+      case "dashboard":
+        return patchOverlayState({ dashboard: null });
       case "skillsHub":
         return patchOverlayState({ skillsHub: false });
       case "pluginsHub":

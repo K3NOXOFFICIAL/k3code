@@ -208,6 +208,11 @@ Notes:
 | Tune popup                  | `Tab`               | Toggle ultracode                                  |
 | Tune popup                  | `Enter`, `s`        | Apply as the default, or for this session only    |
 | Tune popup                  | `Esc`, `Ctrl+C`     | Close without applying                            |
+| Dashboard (`/dashboard`)    | `Up/Down`           | Move between rows                                 |
+| Dashboard popup             | `Left/Right`        | Change the row's value                            |
+| Dashboard popup             | `Tab`, `1-3`        | Change tab                                        |
+| Dashboard popup             | `Enter`             | Save the changes                                  |
+| Dashboard popup             | `Esc`, `Ctrl+C`     | Close and put everything back                     |
 
 Notes:
 
@@ -255,6 +260,19 @@ A withdrawn question (timeout, interrupt) arrives as a `request.cancel` event ca
 
 These are stateful UI branches in `app.tsx`, not separate screens.
 
+## Mouse
+
+Mouse tracking defaults to `all`: the wheel scrolls, a click moves the cursor
+or presses a chip, and hover works. The price is that the terminal itself no
+longer sees the mouse: a plain drag selects inside the TUI (right-click or
+`/copy` copies it), and the terminal's own selection needs **Shift** held
+(**Option** in macOS terminals). `wheel` keeps only scrolling and clicks, so the
+terminal still selects by drag; `buttons` adds drags; `off` leaves the mouse
+entirely to the terminal. Set it with `/mouse [off|wheel|buttons|all]` or the
+Input tab of `/dashboard`; the choice is saved in `display.mouse_tracking`.
+`K3CODE_TUI_MOUSE_TRACKING=0` and `K3CODE_TUI_DISABLE_MOUSE=1` force it off at
+startup, and Termux starts with it off.
+
 ## Commands
 
 The following commands are handled directly by the TUI client. Unrecognized commands fall through to the Python gateway via `slash.exec` and `command.dispatch`.
@@ -283,6 +301,31 @@ The following commands are handled directly by the TUI client. Unrecognized comm
 `/tune` — the Tune popup (also `Ctrl+O`): model, reasoning effort and ultracode.
 A bare `/model` or `/effort` opens the same popup, not the provider/key picker;
 `/model --refresh` still opens the provider picker.
+
+### Dashboard (`dashboard.ts`)
+
+`/dashboard` (alias `/display`) — one tabbed popup for the settings that
+otherwise take a dozen commands. `/dashboard [look|details|input]` opens it on
+that tab. It stays shut while an approval, question, password or confirm prompt
+is waiting, and reads no key or click while one is up.
+
+| Tab     | Rows                                                                                                |
+| ------- | --------------------------------------------------------------------------------------------------- |
+| Look    | status bar position, indicator style, compact layout, battery                                       |
+| Details | the global details mode and the four sections (thinking, tool calls, sub-agents, activity)          |
+| Input   | mouse tracking (`off`, `wheel`, `buttons`, `all`), what a message typed while busy does, focus view |
+
+`←/→` (or `h`/`l`, space) change the row, `↑/↓` move, `Tab`/`Shift+Tab` or `1-3`
+change tab, `Enter` saves (one `config.set` per changed key), `Esc` or `Ctrl+C`
+puts everything back. Rows paint live while the popup is open; focus view waits
+for `Enter` because the gateway stashes and restores state when it changes.
+
+Mouse: a click on a tab or on a row only moves the cursor; a click on a chip
+(`[top]`, `off`…) is the control and picks that option. The wheel walks the
+rows. The pure state, keys, layout and hit-testing are in `src/domain/dashboard.ts`
+(unit-tested without a terminal); `src/components/dashboard.tsx` only paints the
+lines and feeds keys and clicks in. A later tab is one more entry in
+`DASHBOARD_TABS` and rows in `DASHBOARD_FIELDS`.
 
 ### Ops (`ops.ts`)
 
@@ -433,6 +476,7 @@ ui-tui/
       messageLine.tsx            transcript rows
       modelPicker.tsx            model switch picker
       tunePicker.tsx             Tune popup: model, effort and ultracode (/tune, Ctrl+O)
+      dashboard.tsx              Dashboard popup: look, details and input settings (/dashboard, /display)
       overlayControls.tsx        shared overlay control buttons
       pluginsHub.tsx             plugins hub overlay
       prompts.tsx                approval + clarify flows

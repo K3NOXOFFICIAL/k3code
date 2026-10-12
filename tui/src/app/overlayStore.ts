@@ -1,5 +1,7 @@
 import { atom, computed } from "nanostores";
 
+import type { DashboardTabId } from "../domain/dashboard.js";
+
 import type { OverlayState } from "./interfaces.js";
 import { $uiState } from "./uiStore.js";
 
@@ -11,6 +13,7 @@ const buildOverlayState = (): OverlayState => ({
   approval: null,
   clarify: null,
   confirm: null,
+  dashboard: null,
   ambient: [],
   widget: null,
   journey: false,
@@ -34,6 +37,7 @@ export const $isBlocked = computed(
     approval,
     clarify,
     confirm,
+    dashboard,
     journey,
     modelPicker,
     pager,
@@ -51,6 +55,7 @@ export const $isBlocked = computed(
       approval ||
       clarify ||
       confirm ||
+      dashboard ||
       journey ||
       modelPicker ||
       pager ||
@@ -79,7 +84,7 @@ export const $isBlocked = computed(
  *   (`ActiveWidgetSlot`, `sdk/host.tsx:209`, outside the ComposerPane
  *   subtree) so it can anchor the full-screen absolute `Overlay`
  *   (`components/overlay.tsx`) against the whole terminal.
- * - The FloatingOverlays set — `modelPicker`, `tunePicker`, `pager`,
+ * - The FloatingOverlays set — `modelPicker`, `tunePicker`, `dashboard`, `pager`,
  *   `sessions`, `skillsHub`, `pluginsHub` — but ONLY when the rule sits at
  *   the top.  That panel is `position="absolute" bottom="100%"` inside
  *   ComposerPane's relative Box (`appOverlays.tsx:387`), so it grows UPWARD
@@ -117,6 +122,7 @@ export const $isBlocked = computed(
  */
 export const hasFloatingPanel = (overlay: OverlayState): boolean =>
   Boolean(
+    overlay.dashboard ||
     overlay.modelPicker ||
     overlay.pager ||
     overlay.pluginsHub ||
@@ -127,8 +133,8 @@ export const hasFloatingPanel = (overlay: OverlayState): boolean =>
 
 /**
  * A question to the user is open (approval, clarify, sudo/secret password,
- * confirm): it owns the keyboard. The /tune popup neither opens over one nor
- * reads a key while one is up.
+ * confirm): it owns the keyboard. The /tune and /dashboard popups neither open
+ * over one nor read a key or click while one is up.
  */
 export const tuneLocked = (
   overlay: Pick<
@@ -177,6 +183,17 @@ export const openTunePicker = (): boolean => {
   return true;
 };
 
+/** Open the /dashboard popup on `tab`; false (nothing opened) while a prompt is waiting for an answer. */
+export const openDashboard = (tab: DashboardTabId = "look"): boolean => {
+  if (tuneLocked($overlayState.get())) {
+    return false;
+  }
+
+  patchOverlayState({ dashboard: tab });
+
+  return true;
+};
+
 /**
  * Soft reset: drop FLOW-scoped overlays (approval / clarify / confirm / sudo
  * / secret / pager) but PRESERVE user-toggled ones — agents dashboard, agent view, model
@@ -193,6 +210,7 @@ export const resetFlowOverlays = () =>
     agentsInitialAgentId: $overlayState.get().agentsInitialAgentId,
     agentView: $overlayState.get().agentView,
     ambient: $overlayState.get().ambient,
+    dashboard: $overlayState.get().dashboard,
     widget: $overlayState.get().widget,
     journey: $overlayState.get().journey,
     modelPicker: $overlayState.get().modelPicker,

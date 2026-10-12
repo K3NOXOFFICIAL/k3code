@@ -23,7 +23,10 @@ async def test_indicator_set_get_and_saved(tmp_path, monkeypatch):
     ("key", "value", "field", "stored", "wire"),
     [
         ("battery", "on", "battery", True, "on"),
-        ("mouse", False, "mouse_tracking", False, "off"),
+        ("mouse", False, "mouse_tracking", "off", "off"),
+        ("mouse", "wheel", "mouse_tracking", "wheel", "wheel"),
+        ("mouse", "buttons", "mouse_tracking", "buttons", "buttons"),
+        ("mouse", "on", "mouse_tracking", "all", "all"),
         ("density", "off", "tui_compact", False, "off"),
         ("statusbar", "top", "tui_statusbar", "top", "top"),
         ("theme", "dark", "tui_theme", "dark", "dark"),
@@ -35,6 +38,14 @@ async def test_tui_keys_map_to_display_fields(tmp_path, monkeypatch, key, value,
     r = await call(server, "config.set", {"key": key, "value": value})
     assert r["value"] == wire
     assert server.config.display.model_dump()[field] == stored
+
+
+async def test_mouse_preset_survives_a_restart(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    await call(server, "config.set", {"key": "mouse", "value": "wheel"})
+    assert read_yaml(user_config_path())["display"]["mouse_tracking"] == "wheel"
+    with pytest.raises(Exception):  # noqa: B017 - the helper raises on a JSON-RPC error reply
+        await call(server, "config.set", {"key": "mouse", "value": "sideways"})
 
 
 async def test_details_section_override(tmp_path, monkeypatch):

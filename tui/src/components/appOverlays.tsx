@@ -20,6 +20,7 @@ import { listRowStyle } from "./overlayPrimitives.js";
 import { PluginsHub } from "./pluginsHub.js";
 import { ApprovalPrompt, ClarifyPrompt, ConfirmPrompt } from "./prompts.js";
 import { SkillsHub } from "./skillsHub.js";
+import { Dashboard } from "./dashboard.js";
 import { TunePicker } from "./tunePicker.js";
 import { WidgetGrid, type WidgetGridWidget } from "./widgetGrid.js";
 
@@ -173,6 +174,7 @@ export function FloatingOverlays({
   nativeMode = false,
   onActiveSessionSelect,
   onActiveSessionClose,
+  onDashboardSave,
   onModelSelect,
   onNewLiveSession,
   onNewPromptSession,
@@ -186,6 +188,7 @@ export function FloatingOverlays({
   | "completions"
   | "onActiveSessionSelect"
   | "onActiveSessionClose"
+  | "onDashboardSave"
   | "onModelSelect"
   | "onNewLiveSession"
   | "onNewPromptSession"
@@ -280,6 +283,25 @@ export function FloatingOverlays({
             onApply={onTuneApply}
             onCancel={() => patchOverlayState({ tunePicker: false })}
             sessionId={sid}
+            t={theme}
+          />
+        </FloatBox>
+      ),
+    });
+  }
+
+  if (overlay.dashboard) {
+    const initialTab = overlay.dashboard;
+
+    widgets.push({
+      id: "dashboard",
+      render: (width) => (
+        <FloatBox color={theme.color.border}>
+          <Dashboard
+            initialTab={initialTab}
+            maxWidth={width}
+            onCancel={() => patchOverlayState({ dashboard: null })}
+            onSave={onDashboardSave}
             t={theme}
           />
         </FloatBox>

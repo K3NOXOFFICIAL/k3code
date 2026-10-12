@@ -15,13 +15,14 @@ from k3code.paths import user_config_path
 
 logger = logging.getLogger(__name__)
 
-# TUI key -> (display field, kind). kind "bool" accepts true/false/on/off; "str" any short string.
+# TUI key -> (display field, kind). kind "bool" accepts true/false/on/off; "mouse" one of MOUSE_MODES (a bool still
+# means all/off); "str" any short string.
 KEYS: dict[str, tuple[str, str]] = {
     "theme": ("tui_theme", "str"),
     "indicator": ("tui_status_indicator", "str"),
     "statusbar": ("tui_statusbar", "str"),
     "battery": ("battery", "bool"),
-    "mouse": ("mouse_tracking", "bool"),
+    "mouse": ("mouse_tracking", "mouse"),
     "density": ("tui_compact", "bool"),
     "busy": ("busy_input_mode", "str"),
     "details_mode": ("details_mode", "str"),
@@ -30,6 +31,21 @@ KEYS: dict[str, tuple[str, str]] = {
 
 _TRUE = ("1", "true", "on", "yes")
 _FALSE = ("0", "false", "off", "no")
+MOUSE_MODES = ("off", "wheel", "buttons", "all")  # what the TUI's /mouse presets mean; see useConfigSync.ts
+_MOUSE_ALIASES = {
+    "on": "all",
+    "any": "all",
+    "full": "all",
+    "true": "all",
+    "yes": "all",
+    "1": "all",
+    "scroll": "wheel",
+    "button": "buttons",
+    "click": "buttons",
+    "false": "off",
+    "no": "off",
+    "0": "off",
+}
 
 
 class DisplayValueError(ValueError):
@@ -50,6 +66,14 @@ def handles(key: str) -> bool:
 
 
 def _coerce(raw: Any, kind: str) -> Any:
+    if kind == "mouse":
+        if isinstance(raw, bool):
+            return "all" if raw else "off"
+        text = str(raw).strip().lower()
+        mode = _MOUSE_ALIASES.get(text, text)
+        if mode not in MOUSE_MODES:
+            raise DisplayValueError(f"expected one of {', '.join(MOUSE_MODES)}, got {raw!r}")
+        return mode
     if kind == "bool":
         if isinstance(raw, bool):
             return raw

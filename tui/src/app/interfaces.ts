@@ -8,6 +8,11 @@ import type {
 } from "react";
 
 import type { PasteEvent } from "../components/textInput.js";
+import type {
+  DashboardChange,
+  DashboardTabId,
+  DashboardUi,
+} from "../domain/dashboard.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import type { SessionCloseResponse, TuneSetParams } from "../gatewayTypes.js";
 import type { QueueItem } from "../hooks/useQueue.js";
@@ -147,6 +152,8 @@ export interface OverlayState {
   sudo: null | SudoReq;
   /** /tune popup: model list + effort slider + ultracode (bare /tune, /model, /effort, Ctrl+O). */
   tunePicker: boolean;
+  /** /dashboard (/display) popup: the tab it is open on; null = closed. */
+  dashboard: DashboardTabId | null;
 }
 
 export interface PagerState {
@@ -441,6 +448,11 @@ export interface AppLayoutActions {
   newLiveSession: (dropSid?: string) => void;
   newPromptSession: (prompt: string, modelArg?: string) => void;
   onModelSelect: (value: string) => void;
+  /** The /dashboard popup's Enter: closes it, applies the draft and sends one `config.set` per changed key. */
+  onDashboardSave: (
+    changes: DashboardChange[],
+    patch: Partial<DashboardUi>,
+  ) => void;
   /** The /tune popup's Enter / `s`: closes it and sends the one `tune.set`. */
   onTuneApply: (params: TuneSetParams) => void;
   /** `dropSid`: the session being left, closed once attached elsewhere if it is disposable (agent view). */
@@ -514,6 +526,10 @@ export interface AppOverlaysProps {
   onResumeSelect: (sessionId: string) => void;
   onSecretSubmit: (value: string) => void;
   onSudoSubmit: (pw: string) => void;
+  onDashboardSave: (
+    changes: DashboardChange[],
+    patch: Partial<DashboardUi>,
+  ) => void;
   onTuneApply: (params: TuneSetParams) => void;
   pagerPageSize: number;
 }
