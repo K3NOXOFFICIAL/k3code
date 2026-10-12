@@ -18,7 +18,7 @@ from k3code import __version__ as k3_version
 from k3code import confio, trust
 from k3code.gateway.sessions import SessionStore, StoredSession
 from k3code.paths import project_config_path, user_config_path
-from k3code.redact import REDACTED, redact, redact_session_json
+from k3code.redact import REDACTED, drop_values, redact, redact_session_json
 
 BUNDLE_VERSION = 1
 MAX_MEMBER_BYTES = 200 * 1024 * 1024
@@ -60,19 +60,6 @@ def _known_secrets(config: Any, cwd: Path) -> list[str]:
     return secret_values(config)
 
 
-def _drop_values(obj: Any, secrets: list[str]) -> Any:
-    """``obj`` with every occurrence of a known secret value replaced, whatever its shape (scrub_text is by shape)."""
-    if isinstance(obj, dict):
-        return {k: _drop_values(v, secrets) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_drop_values(v, secrets) for v in obj]
-    if isinstance(obj, str):
-        for s in secrets:
-            if s in obj:
-                obj = obj.replace(s, REDACTED)
-    return obj
-
-
 def write_bundle(
     path: Path,
     *,
@@ -89,14 +76,14 @@ def write_bundle(
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                data = _drop_values(redact(confio.read_yaml(src)), secrets)
+                data = drop_values(redact(confio.read_yaml(src)), secrets)
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
     exported: list[str] = []
     for sid in session_ids:
         stored = store.get(sid)
         if stored is None:
             raise BundleError(f"unknown session: {sid}")
-        session = _drop_values(session_to_dict(stored), secrets)
+        session = drop_values(session_to_dict(stored), secrets)
         files[f"sessions/{sid}.json"] = json.dumps(session, ensure_ascii=False, indent=1).encode()
         exported.append(sid)
     manifest = {
