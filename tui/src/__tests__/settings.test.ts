@@ -76,9 +76,9 @@ describe("settings panel state", () => {
   it("Esc closes although Ink flags it as meta", () => {
     const s = initSettingsState(snap);
 
-    expect(
-      settingsKey(s, "", { escape: true, meta: true }).action.type,
-    ).toBe("close");
+    expect(settingsKey(s, "", { escape: true, meta: true }).action.type).toBe(
+      "close",
+    );
   });
 
   it("Esc with meta clears the search before it closes", () => {
