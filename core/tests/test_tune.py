@@ -353,6 +353,20 @@ async def test_tune_get_effort_is_unknown_when_nothing_resolves():
     assert row["key"] == "blank" and row["resolved"] == [] and row["effort"] is None
 
 
+async def test_settings_get_returns_the_view_with_its_option_lists_and_text(server, tmp_path):
+    """settings.get feeds the interactive /settings panel: the view, its option lists and the plain text."""
+    sid = await _session(server, tmp_path)
+    await m1.cmd(server, "/tune cheap effort high", sid)
+    res = (await m1.rpc(server, "settings.get", {"session_id": sid}))["result"]
+    view = res["settings"]
+    assert view["model_key"] == "cheap" and view["effort"] == "high"
+    assert {"cheap", "default"} <= set(view["model_keys"])
+    assert "plan" in view["permission_modes"] and view["permission_mode"] in view["permission_modes"]
+    assert res["output"].startswith("model:        cheap")
+    bare = (await m1.rpc(server, "settings.get", {}))["result"]
+    assert bare["settings"]["model_keys"] == view["model_keys"] and "output" in bare
+
+
 async def test_tune_get_without_a_session_and_with_an_unknown_one(server):
     res = (await m1.rpc(server, "tune.get", {}))["result"]
     assert res["has_session"] is False and res["effort"] is None and res["ultra_mode"] == "off"

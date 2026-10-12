@@ -592,11 +592,53 @@ async def test_escape_bash_with_home_as_cwd_cannot_write_into_home(tmp_path, mon
     class _R:
         chain: list = []
 
-    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="yolo")  # type: ignore[arg-type]
     touch = f"touch {home}/escaped.txt"
+    # unattended: nobody can approve, so bash at $HOME stays refused (with a hint to use a project directory)
+    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="yolo", unattended=True)  # type: ignore[arg-type]
     result = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": touch}))
-    assert "bash refused" in result.get("error", "")
+    assert "bash refused" in result.get("error", "") and "project directory" in result["error"]
     assert not (home / "escaped.txt").exists(), "sandboxed bash with cwd $HOME wrote into $HOME"
+    # interactive without a prompter: the command needs approval, which nobody gave
+    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="yolo")  # type: ignore[arg-type]
+    result = await loop._execute_tool(ToolCall(id="c2", name="bash", arguments={"command": touch}))
+    assert "requires approval" in result.get("error", "")
+    assert not (home / "escaped.txt").exists(), "bash at $HOME ran without approval"
+
+
+async def test_bash_at_home_asks_per_command_in_an_interactive_session(tmp_path, monkeypatch):
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import ToolCall
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+
+    class _R:
+        chain: list = []
+
+    asked: list[str] = []
+
+    class _Answer:
+        def __init__(self, allowed: bool) -> None:
+            self.allowed, self.reason = allowed, ""
+
+    async def approve(name, args, decision):
+        asked.append(decision.message)
+        return _Answer(args["command"].startswith("echo"))
+
+    loop = AgentLoop(_R(), system_prompt="x", cwd=home, permission_mode="auto")  # type: ignore[arg-type]
+    loop.approval_callback = approve
+    ok = await loop._execute_tool(ToolCall(id="c1", name="bash", arguments={"command": "echo hi > note.txt"}))
+    assert "error" not in ok and (home / "note.txt").read_text().strip() == "hi"  # approved: runs, unsandboxed
+    no = await loop._execute_tool(ToolCall(id="c2", name="bash", arguments={"command": "touch x"}))
+    assert "User denied" in no["error"] and not (home / "x").exists()
+    assert len(asked) == 2 and all("home directory" in m for m in asked)
+    # a project below $HOME keeps the normal sandboxed, prompt-free path
+    proj = home / "proj"
+    proj.mkdir()
+    loop = AgentLoop(_R(), system_prompt="x", cwd=proj, permission_mode="auto")  # type: ignore[arg-type]
+    assert not loop._home_rooted()
 
 
 @pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")

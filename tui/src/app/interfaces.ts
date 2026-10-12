@@ -151,6 +151,7 @@ export interface OverlayState {
   skillsHub: boolean;
   sudo: null | SudoReq;
   /** /tune popup: model list + effort slider + ultracode (bare /tune, /model, /effort, Ctrl+O). */
+  settingsPanel: boolean;
   tunePicker: boolean;
   /** /dashboard (/display) popup: the tab it is open on; null = closed. */
   dashboard: DashboardTabId | null;
@@ -454,6 +455,7 @@ export interface AppLayoutActions {
     patch: Partial<DashboardUi>,
   ) => void;
   /** The /tune popup's Enter / `s`: closes it and sends the one `tune.set`. */
+  onSettingsApply: (command: string) => void;
   onTuneApply: (params: TuneSetParams) => void;
   /** `dropSid`: the session being left, closed once attached elsewhere if it is disposable (agent view). */
   resumeById: (id: string, dropSid?: string) => void;
@@ -530,6 +532,7 @@ export interface AppOverlaysProps {
     changes: DashboardChange[],
     patch: Partial<DashboardUi>,
   ) => void;
+  onSettingsApply: (command: string) => void;
   onTuneApply: (params: TuneSetParams) => void;
   pagerPageSize: number;
 }

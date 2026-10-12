@@ -43,6 +43,11 @@ def build_system_prompt(
     style = outputstyle.style_text(effective_style(config, session_meta), cwd)
     if style:
         parts.append(style)
+    from k3code.autonomy import advisor as _advisor
+    from k3code.autonomy import autonomy_cfg
+
+    if _advisor.session_advisor(session_meta, autonomy_cfg(config).get("advisor", "")):  # the `advisor` tool exists
+        parts.append(_advisor.PROMPT_NOTE)
     ctx = getattr(config, "context", None) or {}  # M1: prompt-size knobs the optimizer may tune (defaults unchanged)
     # ``skills=False``: the caller has no skill tool, so an index of skills it cannot call would only cost tokens
     if skills and (

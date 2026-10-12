@@ -396,6 +396,7 @@ const ComposerPane = memo(function ComposerPane({
     onNewLiveSession: actions.newLiveSession,
     onNewPromptSession: actions.newPromptSession,
     onResumeSelect: actions.resumeById,
+    onSettingsApply: actions.onSettingsApply,
     onTuneApply: actions.onTuneApply,
     pagerPageSize: composer.pagerPageSize,
   };

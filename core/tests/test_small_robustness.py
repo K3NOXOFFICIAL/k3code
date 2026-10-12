@@ -108,6 +108,11 @@ def _tree(root: Path) -> None:
         "dist/e.py",
         ".git/hooks/f.py",
         "build/g.py",
+        ".cache/uv/h.py",
+        "pkg/__pycache__/i.py",
+        ".claude/worktrees/w1/j.py",
+        ".claude/jobs/k/tmp/k.py",
+        ".claude/agents/l.py",
         "README.md",
     ):
         p = root / rel
@@ -118,7 +123,9 @@ def _tree(root: Path) -> None:
 async def test_glob_skips_vendor_dirs_without_git(tmp_path, no_git_env):
     _tree(tmp_path)
     res = await tool_glob({"pattern": "*.py"}, cwd=tmp_path)
-    assert res["files"] == ["build/g.py", "src/a.py", "src/pkg/b.py"]
+    # outside a work tree caches, build output and other sessions' worktrees are skipped like ripgrep would;
+    # other dot directories stay searchable
+    assert res["files"] == [".claude/agents/l.py", "src/a.py", "src/pkg/b.py"]
     assert (await tool_glob({"pattern": "src/*.py"}, cwd=tmp_path))["files"] == ["src/a.py"]
     assert (await tool_glob({"pattern": "**/pkg"}, cwd=tmp_path))["files"] == ["src/pkg"]
 
@@ -130,7 +137,8 @@ async def test_glob_honours_gitignore_in_a_work_tree(tmp_path, no_git_env):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, capture_output=True)
     assert (tmp_path / ".git" / "HEAD").is_file()  # the repository is the test's own
     res = await tool_glob({"pattern": "*.py"}, cwd=tmp_path)
-    assert res["files"] == ["src/a.py", "src/pkg/b.py"]  # build/ ignored by .gitignore, the rest by SKIP_DIRS
+    # build/ ignored by .gitignore, caches by SKIP_DIRS, other sessions' worktrees by SKIP_SUBPATHS
+    assert res["files"] == [".claude/agents/l.py", "src/a.py", "src/pkg/b.py"]
 
 
 async def test_glob_omits_files_deleted_from_the_work_tree(tmp_path, no_git_env):
@@ -172,7 +180,7 @@ async def test_glob_and_the_grep_fallback_run_off_the_event_loop(tmp_path, no_gi
     assert len(ran) == 2
     # the path of each file, relative to the session's directory (its matches follow as `line:text`)
     hits = {line for line in res["matches"].splitlines() if line and not line[0].isdigit()}
-    assert hits == {"src/a.py", "src/pkg/b.py", "build/g.py", "README.md"}
+    assert hits == {"src/a.py", "src/pkg/b.py", ".claude/agents/l.py", "README.md"}
 
 
 async def test_the_grep_fallback_caps_its_matches(tmp_path, no_git_env, monkeypatch):
@@ -198,3 +206,36 @@ async def test_project_prep_scans_risks_off_the_event_loop(tmp_path, monkeypatch
     monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "k3home"))
     await projectprep.prepare(tmp_path, store=ProposalStore(tmp_path / "k3home"))
     assert "scan_risks" in ran
+
+
+async def test_glob_without_git_uses_the_same_skips_with_and_without_rg(tmp_path, no_git_env, monkeypatch):
+    _tree(tmp_path)
+    (tmp_path / ".gitignore").write_text("src/pkg/\n")  # rg honours it even outside a repository
+    has_rg = bool(shutil.which("rg"))
+    with_rg = (await tool_glob({"pattern": "*.py"}, cwd=tmp_path))["files"]
+    monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
+    walked = (await tool_glob({"pattern": "*.py"}, cwd=tmp_path))["files"]
+    assert walked == [".claude/agents/l.py", "src/a.py", "src/pkg/b.py"]
+    if has_rg:
+        assert with_rg == [".claude/agents/l.py", "src/a.py"]
+
+
+async def test_glob_and_grep_stop_at_the_time_budget_with_a_hint(tmp_path, no_git_env, monkeypatch):
+    import k3code.tools as tools
+
+    _tree(tmp_path)
+    monkeypatch.setattr(tools, "SEARCH_BUDGET_S", -1.0)  # already past the deadline
+    res = await tool_glob({"pattern": "*.py"}, cwd=tmp_path)
+    assert res["files"] == [] and "stopped after" in res["note"] and "narrow" in res["note"]
+    monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))  # the Python grep fallback
+    res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
+    assert "stopped after" in res["warnings"]
+
+
+async def test_grep_stops_reading_at_the_result_cap(tmp_path, no_git_env):
+    if not shutil.which("rg"):
+        pytest.skip("rg not installed")
+    (tmp_path / "big.txt").write_text("needle\n" * (MAX_SEARCH_RESULTS * 3))
+    res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
+    assert len(res["matches"].splitlines()) == MAX_SEARCH_RESULTS + 1  # the file's path, then its matches
+    assert "truncated" in res["warnings"]

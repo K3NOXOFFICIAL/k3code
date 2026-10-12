@@ -842,7 +842,7 @@ describe("createSlashHandler", () => {
       },
     });
 
-    expect(createSlashHandler(ctx)("/settings")).toBe(true);
+    expect(createSlashHandler(ctx)("/settings text")).toBe(true);
     await vi.waitFor(() =>
       expect(ctx.transcript.page).toHaveBeenCalledWith(
         "model: default\neffort: default",

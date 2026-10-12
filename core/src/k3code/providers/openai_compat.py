@@ -40,13 +40,15 @@ class OpenAICompatProvider(Provider):
         cache_ttl: str = "5m",
     ) -> None:
         self.name = name
-        #: Anthropic-style cache_control inside messages, for Claude model ids only (plain OpenAI endpoints cache by
-        #: themselves). "on" always sends it; "auto" sends it until the endpoint answers 400 to a request with it and
-        #: accepts the same request without (some relays reject the field): it is dropped for the rest of the run.
-        self.prompt_cache = prompt_cache in ("on", "auto")
-        self._cache_probing = prompt_cache == "auto"
-        self.cache_ttl = cache_ttl
         self.base_url = base_url.rstrip("/")
+        #: Anthropic-style cache_control inside messages for Claude model ids. "auto" sends it to every endpoint but
+        #: OpenAI's own (which caches by itself): a Claude id there means a relay to Anthropic (OpenRouter, LiteLLM,
+        #: OmniRoute), where an uncached turn re-bills the whole prompt. A relay that rejects the field turns it off.
+        self._cache_auto = prompt_cache == "auto"
+        self.prompt_cache = prompt_cache == "on" or (
+            self._cache_auto and httpx.URL(self.base_url).host != "api.openai.com"
+        )
+        self.cache_ttl = cache_ttl
         self.api_key = api_key
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
         self._owns_client = client is None
@@ -100,11 +102,10 @@ class OpenAICompatProvider(Provider):
         self, messages: list[Message], tools: list[ToolSpec], model: str, *, max_tokens: int, temperature: float | None
     ) -> httpx.Response:
         """The streaming response to the request, or the ProviderError of its HTTP status. With ``prompt_cache: auto`` a
-        400 to a request that carried cache breakpoints is answered by the same request without them: if that works
-        the endpoint does not take the field, and no later request carries it."""
-        rejected: ProviderError | None = None
+        400 that names ``cache_control`` is answered by the same request without the breakpoints, and no later request
+        carries them."""
         while True:
-            marked = self.prompt_cache and "claude" in model.lower()
+            cached = self.prompt_cache and "claude" in model.lower()
             request = self._client.build_request(
                 "POST",
                 self._url(),
@@ -126,19 +127,14 @@ class OpenAICompatProvider(Provider):
                     body={},
                 )
             if response.status_code < 400:
-                if rejected is not None:
-                    logger.warning(
-                        "%s does not take prompt-cache breakpoints: sending Claude requests without", self.name
-                    )
                 return response
             error = await _error_from_response(response)
             await response.aclose()
-            if rejected is None and response.status_code == 400 and marked and self._cache_probing:
-                rejected, self.prompt_cache = error, False
+            rejected = response.status_code == 400 and "cache_control" in f"{error.message} {error.body}"
+            if cached and self._cache_auto and rejected:
+                logger.warning("%s does not take prompt-cache breakpoints: sending Claude requests without", self.name)
+                self.prompt_cache = False  # an auto guess this relay refuses: drop it for good, resend once
                 continue
-            if rejected is not None:  # it failed without the breakpoints too: they were not the problem
-                self.prompt_cache = True
-                raise rejected
             raise error
 
     async def stream(

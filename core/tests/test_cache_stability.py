@@ -177,6 +177,8 @@ async def test_auto_drops_the_markers_for_good_when_the_relay_rejects_them():
 
 
 async def test_a_400_that_has_nothing_to_do_with_the_markers_is_raised_and_the_markers_stay():
+    import httpx
+
     from k3code.providers.base import ProviderError
 
     seen: list[bool] = []
@@ -185,12 +187,18 @@ async def test_a_400_that_has_nothing_to_do_with_the_markers_is_raised_and_the_m
     )
     ok = await _ask(p)  # markers accepted: a normal answer
     assert ok[-1].type == "done"
-    never = OpenAICompatProvider(
-        name="o", base_url="https://relay.test/v1", api_key="k", client=_relay(False, [], status_without=400)
-    )
+
+    def too_long(request: httpx.Request) -> httpx.Response:
+        seen.append(b"cache_control" in request.content)
+        return httpx.Response(400, json={"error": {"message": "maximum context length is 1000 tokens"}})
+
+    seen.clear()
+    rejecting = httpx.AsyncClient(transport=httpx.MockTransport(too_long))
+    never = OpenAICompatProvider(name="o", base_url="https://relay.test/v1", api_key="k", client=rejecting)
     with pytest.raises(ProviderError) as err:
         await _ask(never)
-    assert err.value.status_code == 400 and never.prompt_cache  # it failed both ways: not the markers' fault
+    # a 400 that does not name cache_control is not the markers' fault: raised at once, no resend, markers kept
+    assert err.value.status_code == 400 and seen == [True] and never.prompt_cache
 
 
 async def test_on_never_retries_and_a_gpt_model_never_carries_markers():

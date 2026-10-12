@@ -1506,6 +1506,10 @@ export function useMainApp(gw: GatewayClient) {
     [rpc, sys],
   );
 
+  const onSettingsApply = useCallback((command: string) => {
+    slashRef.current(command);
+  }, []);
+
   const closeLiveSession = useCallback(
     async (id: string) => {
       patchUiState({ status: "closing session…" });
@@ -1648,6 +1652,7 @@ export function useMainApp(gw: GatewayClient) {
       newPromptSession,
       onDashboardSave,
       onModelSelect,
+      onSettingsApply,
       onTuneApply,
       // Resuming a cold session from the overlay CLOSES the current one, so it
       // must respect the busy guard just like the `/resume` slash path.
@@ -1673,6 +1678,7 @@ export function useMainApp(gw: GatewayClient) {
       newPromptSession,
       onDashboardSave,
       onModelSelect,
+      onSettingsApply,
       onTuneApply,
       session,
     ],

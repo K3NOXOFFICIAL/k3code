@@ -254,6 +254,17 @@ def _refuse_root(root: Path, home: Path) -> None:
             )
 
 
+def root_refusal(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, home: Path | None = None) -> str | None:
+    """Why :func:`build_argv` would refuse these roots (see :func:`_refuse_root`), or None when it would not."""
+    home = Path(home or Path.home())
+    try:
+        for root in [Path(cwd).resolve(), *(Path(d).resolve() for d in add_dirs)]:
+            _refuse_root(root, home)
+    except SandboxRefused as exc:
+        return str(exc)
+    return None
+
+
 def _meta_allowed(path: Path, home: Path) -> bool:
     """May ``path`` (a git admin dir named by repository-controlled text) be bound? Never ``$HOME`` or a directory
     above it, nor anything at or around a secrets folder. Fails closed when it cannot be inspected."""

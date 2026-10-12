@@ -8,7 +8,9 @@ import dataclasses
 import hashlib
 import os
 import re
-from collections.abc import Sequence
+import shutil
+import time
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -737,8 +739,9 @@ def _shown(path: Path, base: Path) -> str:
         return str(path)
 
 
-async def _run_rg(cmd: list[str], base: Path) -> tuple[int, bytes, bytes]:
-    """``cmd`` (an rg argv) run in ``base``: (exit code, stdout, stderr). TimeoutError after 10 s, with rg killed."""
+async def _run_rg(cmd: list[str], base: Path) -> tuple[int, list[str], bytes, str]:
+    """``cmd`` (an rg argv) run in ``base``: (exit code, output lines, stderr, cut). Reading stops one line past
+    MAX_SEARCH_RESULTS or at SEARCH_BUDGET_S, with rg killed; ``cut`` then says why the lines are partial."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=base,
@@ -747,14 +750,31 @@ async def _run_rg(cmd: list[str], base: Path) -> tuple[int, bytes, bytes]:
         stderr=asyncio.subprocess.PIPE,
         env=child_env(),
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
-    except TimeoutError:
+    assert proc.stdout is not None and proc.stderr is not None
+    errors = asyncio.ensure_future(proc.stderr.read())  # read alongside: a full stderr pipe would stall rg's output
+    lines: list[str] = []
+    cut = ""
+    deadline = time.monotonic() + SEARCH_BUDGET_S
+    while True:
+        try:
+            raw = await asyncio.wait_for(proc.stdout.readline(), timeout=max(0.0, deadline - time.monotonic()))
+        except TimeoutError:
+            cut = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(lines)} matching lines so far: {_NARROW}"
+            break
+        if not raw:
+            break
+        lines.append(raw.decode("utf-8", errors="replace").rstrip("\n"))
+        if len(lines) > MAX_SEARCH_RESULTS:  # one past the cap proves the cut; stop rg instead of reading on
+            lines = lines[:MAX_SEARCH_RESULTS]
+            cut = f"truncated to the first {MAX_SEARCH_RESULTS} matching lines: {_NARROW}"
+            break
+    if cut:
         with contextlib.suppress(ProcessLookupError):
-            proc.kill()  # rg kept scanning after the timeout
-        await proc.wait()
-        raise
-    return proc.returncode or 0, stdout, stderr
+            proc.kill()
+        await proc.stdout.read()  # drain: wait() only returns once the pipes do, and a full one never would
+    stderr = await errors
+    await proc.wait()
+    return (0 if cut else proc.returncode or 0), lines, stderr, cut
 
 
 _MATCH_LINE = re.compile(r"^(.+?):(\d+):(.*)$")
@@ -811,7 +831,7 @@ def _rg_remedy(stderr: bytes) -> str | None:
 
 
 async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Search for a pattern using ripgrep or Python fallback."""
+    """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S."""
     pattern = arguments["pattern"]
     base = Path(cwd) if cwd else Path.cwd()
     path = _resolve_path(arguments.get("path", "."), cwd)
@@ -826,9 +846,13 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         # them); .git stays out, and so do the credential files (below)
         cmd = ["rg", "--line-number", "--no-heading", "--color=never", "--hidden", "-g", "!.git"]
         cmd += ["--max-columns", str(GREP_MAX_COLUMNS), "--max-columns-preview"]
-        if not SKIP_DIRS.intersection(path.parts):  # without a .gitignore rg would search node_modules and dist
+        # dependency trees, caches and other sessions' worktrees, unless the search is inside one on purpose
+        if not SKIP_DIRS.intersection(path.parts):
             for skipped in sorted(SKIP_DIRS - {".git"}):
                 cmd += ["-g", f"!{skipped}"]
+        if not _skipped_subpath(path.as_posix()):
+            for sub in SKIP_SUBPATHS:
+                cmd += ["-g", f"!**/{sub}/"]
         if include:
             for inc in include if isinstance(include, list) else [include]:
                 cmd += ["-g", inc]
@@ -843,27 +867,27 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
             cmd += ["--iglob", glob]
         # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
         cmd += ["-e", pattern, "--", _shown(path, base) if path != base else "."]
-        try:
-            code, stdout, stderr = await _run_rg(cmd, base)
-            flag = _rg_remedy(stderr) if code == 2 and not stdout.strip() else None
-            retried = ""
-            if flag:
-                # rg names the flag that makes the pattern work (a "\n" needs -U, a look-around needs --pcre2): run it
-                # once more with that flag rather than send the model to flags this tool has no argument for
-                again = await _run_rg([cmd[0], flag, *cmd[1:]], base)
-                if again[0] in (0, 1):
-                    (code, stdout, stderr), retried = (
-                        again,
-                        ("[searched in multiline mode]" if flag == "-U" else "[searched with PCRE2]"),
-                    )
-                elif again[0] == 2 and not again[1].strip():
-                    code, stdout, stderr = again  # the flag did not help: its error is about the pattern itself
-        except TimeoutError:
-            return {"error": "grep timed out after 10 s: narrow the path or the pattern"}
-        text = stdout.decode("utf-8", errors="replace").strip()
-        lines = [line.removeprefix("./") for line in text.splitlines()]
+        code, lines, stderr, cut = await _run_rg(cmd, base)
+        flag = _rg_remedy(stderr) if code == 2 and not lines else None
+        retried = ""
+        if flag:
+            # rg names the flag that makes the pattern work (a "\n" needs -U, a look-around needs --pcre2): run it
+            # once more with that flag rather than send the model to flags this tool has no argument for
+            again = await _run_rg([cmd[0], flag, *cmd[1:]], base)
+            if again[0] in (0, 1):
+                (code, lines, stderr, cut), retried = (
+                    again,
+                    ("[searched in multiline mode]" if flag == "-U" else "[searched with PCRE2]"),
+                )
+            elif again[0] == 2 and not again[1]:
+                code, lines, stderr, cut = again  # the flag did not help: its error is about the pattern itself
+        lines = [line.removeprefix("./") for line in lines]
         # a search of one file prints no path, so a line of its text could read like `path:12:`: leave those alone
-        text = "\n".join(lines) if path.is_file() else _group_by_file(lines)
+        text = ("\n".join(lines) if path.is_file() else _group_by_file(lines)).strip()
+        if retried:
+            text = f"{retried}\n{text}" if text else retried
+        if cut:
+            return {"matches": text, "warnings": cut}
         if code == 2 and text:
             # rg exits 2 when any entry was unreadable (a root-owned dir) but still prints every other match
             note = stderr.decode("utf-8", errors="replace").strip().splitlines()[:3]
@@ -871,8 +895,6 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         if code not in (0, 1):  # 1 = no matches; 2 with no output is rg refusing the request (a bad regex)
             reason = stderr.decode("utf-8", errors="replace").strip().splitlines()
             return {"error": f"grep failed: {' '.join(line.strip() for line in reason[:6]) or 'rg exited 2'}"}
-        if retried:
-            return {"matches": f"{retried}\n{text}" if text else retried}
         if not text and (hints := _no_match_hints(pattern, include)):
             return {"matches": "", "warnings": f"no matches. Check: {hints}"}
         return {"matches": text}
@@ -881,10 +903,37 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude, base)
 
 
-#: Directories glob and the grep fallback never enter (rg skips them through .gitignore or as hidden).
-SKIP_DIRS = frozenset({".git", "node_modules", ".venv", "dist"})
-#: Most paths a glob returns, and most lines the grep fallback returns; past it the result says it was cut.
+#: Directories glob and the grep fallback never enter, even inside a git work tree where .gitignore may not list
+#: them: dependencies, virtualenvs and caches are never source.
+SKIP_DIRS = frozenset(
+    {
+        ".git",
+        "node_modules",
+        ".venv",
+        "venv",
+        "dist",
+        ".cache",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+    }
+)
+#: Outside a work tree nothing filters build output either (ripgrep-like defaults); inside one a tracked ``build/``
+#: or ``target/`` is source, and .gitignore already drops an untracked one.
+WALK_SKIP_DIRS = SKIP_DIRS | {"build", "target"}
+#: Sub-paths never entered at any depth: other sessions' worktrees and background-job scratch directories.
+SKIP_SUBPATHS = (".claude/worktrees", ".claude/jobs")
+#: Most paths a glob returns, and most lines grep returns; past it the result says it was cut.
 MAX_SEARCH_RESULTS = 1000
+#: Wall-clock budget of one glob or grep; past it the partial result comes back with a note to narrow the search.
+SEARCH_BUDGET_S = 10.0
+_NARROW = "narrow the pattern or pass a smaller path (a project directory, not $HOME)"
+
+
+def _skipped_subpath(rel: str) -> bool:
+    return any(rel == s or rel.endswith("/" + s) or rel.startswith(s + "/") or f"/{s}/" in rel for s in SKIP_SUBPATHS)
 
 
 def _git_files(path: Path) -> list[str] | None:
@@ -896,7 +945,7 @@ def _git_files(path: Path) -> list[str] | None:
         out = subprocess.run(
             ["git", "-C", str(path), "ls-files", "-co", "--exclude-standard", "-z"],
             capture_output=True,
-            timeout=15,
+            timeout=SEARCH_BUDGET_S,
             check=False,
             env=child_env(),
         )
@@ -908,21 +957,71 @@ def _git_files(path: Path) -> list[str] | None:
     return [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f and os.path.lexists(path / f)]
 
 
-def _tree(path: Path) -> tuple[list[str], list[str]]:
-    """(files, directories) under ``path`` as relative posix paths, without SKIP_DIRS: from git when ``path`` is in a
-    work tree (so ``.gitignore`` holds), else from a walk that prunes them."""
+def _iter_tree(path: Path, deadline: float) -> Iterator[tuple[str | None, bool]]:
+    """Yield ``(relative posix path, is_dir)`` under ``path``: from git when ``path`` is in a work tree (so
+    ``.gitignore`` holds), else from a walk pruning WALK_SKIP_DIRS and SKIP_SUBPATHS. Past ``deadline``
+    (``time.monotonic``) it yields ``(None, False)`` once and stops, so the caller can say the result is partial."""
     tracked = _git_files(path)
     if tracked:  # empty: not a work tree, or a path git ignores as a whole (asked for on purpose): walk it
-        files = [f for f in tracked if not SKIP_DIRS.intersection(f.split("/")[:-1])]
+        files = [f for f in tracked if not SKIP_DIRS.intersection(f.split("/")[:-1]) and not _skipped_subpath(f)]
         dirs = sorted({"/".join(f.split("/")[:i]) for f in files for i in range(1, f.count("/") + 1)})
-        return files, dirs
-    files, dirs = [], []
+        yield from ((f, False) for f in files)
+        yield from ((d, True) for d in dirs)
+        return
+    if shutil.which("rg"):
+        yield from _rg_files(path, deadline)
+        return
     for root, subdirs, names in os.walk(path):
-        subdirs[:] = [d for d in subdirs if d not in SKIP_DIRS]
+        if time.monotonic() > deadline:
+            yield None, False
+            return
         rel = Path(root).relative_to(path).as_posix()
         prefix = "" if rel == "." else rel + "/"
-        dirs.extend(prefix + d for d in subdirs)
-        files.extend(prefix + n for n in names)
+        subdirs[:] = sorted(d for d in subdirs if d not in WALK_SKIP_DIRS and not _skipped_subpath(prefix + d))
+        yield from ((prefix + d, True) for d in subdirs)
+        yield from ((prefix + n, False) for n in sorted(names))
+
+
+def _rg_files(path: Path, deadline: float) -> Iterator[tuple[str | None, bool]]:
+    """``_iter_tree`` outside a work tree via ``rg --files``: parallel, honours every nested .gitignore, and lists all
+    of a home directory in about two seconds where a Python walk needs minutes. Directories come from file paths."""
+    import subprocess
+
+    cmd = ["rg", "--files", "--hidden", "--no-require-git", "--no-messages"]
+    for d in sorted(WALK_SKIP_DIRS):
+        cmd += ["-g", f"!{d}/"]
+    for sub in SKIP_SUBPATHS:
+        cmd += ["-g", f"!**/{sub}/"]
+    proc = subprocess.Popen(
+        cmd, cwd=path, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=child_env()
+    )
+    assert proc.stdout is not None
+    seen: set[str] = set()
+    try:
+        for raw in proc.stdout:
+            if time.monotonic() > deadline:
+                yield None, False
+                return
+            rel = raw.decode("utf-8", errors="replace").rstrip("\n").removeprefix("./")
+            parts = rel.split("/")
+            for i in range(1, len(parts)):
+                d = "/".join(parts[:i])
+                if d not in seen:
+                    seen.add(d)
+                    yield d, True
+            yield rel, False
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _tree(path: Path) -> tuple[list[str], list[str]]:
+    """(files, directories) under ``path`` as relative posix paths (see ``_iter_tree``), within the search budget."""
+    files: list[str] = []
+    dirs: list[str] = []
+    for rel, is_dir in _iter_tree(path, time.monotonic() + SEARCH_BUDGET_S):
+        if rel is not None:
+            (dirs if is_dir else files).append(rel)
     return files, dirs
 
 
@@ -945,25 +1044,45 @@ def _glob_match(rel: str, pattern: str) -> bool:
 def _capped(items: list[str]) -> tuple[list[str], str]:
     if len(items) <= MAX_SEARCH_RESULTS:
         return items, ""
-    note = f"truncated to the first {MAX_SEARCH_RESULTS} results: narrow the pattern or path"
-    return items[:MAX_SEARCH_RESULTS], note
+    return items[:MAX_SEARCH_RESULTS], f"truncated to the first {MAX_SEARCH_RESULTS} results: {_NARROW}"
+
+
+def _shallowest(paths: list[str]) -> list[str]:
+    """The MAX_SEARCH_RESULTS shallowest of ``paths``: cutting the sorted list lost whole top-level folders (an
+    alphabetical tail)."""
+    return sorted(paths, key=lambda p: (p.rstrip("/").count("/"), p))[:MAX_SEARCH_RESULTS]
 
 
 def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
-    files, dirs = _tree(path)
-    patterns = _expand_braces(pattern)
-    matched = [p for p in (*files, *dirs) if any(_glob_match(p, pat) for pat in patterns)]
-    if pattern.strip() in (
-        "*",
-        "./*",
-    ):  # a bare * is a listing of the folder, like ls (the read tool sends models here)
-        matched = [p for p in matched if "/" not in p.rstrip("/")]
-    note = ""
-    if len(matched) > MAX_SEARCH_RESULTS:
-        # keep the shallowest: cutting the sorted list lost whole top-level folders (an alphabetical tail)
-        matched = sorted(matched, key=lambda p: (p.rstrip("/").count("/"), p))[:MAX_SEARCH_RESULTS]
-        note = f"truncated to the {MAX_SEARCH_RESULTS} shallowest results: narrow the pattern or path"
-    return {"files": sorted(matched), **({"note": note} if note else {})}
+    import fnmatch
+
+    # a bare * is a listing of the folder, like ls (the read tool sends models here)
+    listing = pattern.strip() in ("*", "./*")
+    # The last pattern segment must match the basename: one compiled regex rejects nearly every path of a big tree
+    # before the recursive matcher runs (a home directory has close to a million entries).
+    checks = []
+    for pat in _expand_braces(pattern):
+        last = [p for p in pat.split("/") if p not in ("", ".")][-1:] or ["**"]
+        checks.append(((lambda _: True) if last[0] == "**" else re.compile(fnmatch.translate(last[0])).match, pat))
+    found: list[str] = []
+    cut = timed_out = False
+    for rel, _ in _iter_tree(path, time.monotonic() + SEARCH_BUDGET_S):
+        if rel is None:
+            timed_out = True
+            break
+        if listing and "/" in rel:
+            continue
+        name = rel.rpartition("/")[2]
+        if any(basename_ok(name) and _glob_match(rel, pat) for basename_ok, pat in checks):
+            found.append(rel)
+            if len(found) > 4 * MAX_SEARCH_RESULTS:  # bounded memory: only the shallowest can survive the cut
+                found, cut = _shallowest(found), True
+    if len(found) > MAX_SEARCH_RESULTS:
+        found, cut = _shallowest(found), True
+    note = f"truncated to the {MAX_SEARCH_RESULTS} shallowest results: {_NARROW}" if cut else ""
+    if timed_out:
+        note = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(found)} results so far: {_NARROW}"
+    return {"files": sorted(found), **({"note": note} if note else {})}
 
 
 def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: Path | None = None) -> dict[str, Any]:
@@ -976,11 +1095,22 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: P
     except re.error as e:
         return {"error": f"grep failed: invalid regex {pattern!r}: {e}"}
     base = base or Path.cwd()
-    candidates = [path] if path.is_file() else [path / f for f in _tree(path)[0]]
+    deadline = time.monotonic() + SEARCH_BUDGET_S
+    if path.is_file():
+        root, candidates = path.parent, iter([(path.name, False)])
+    else:
+        root, candidates = path, _iter_tree(path, deadline)
     matches: list[str] = []
     from k3code.permissions.engine import sensitive_path
 
-    for fp in candidates:
+    timed_out = False
+    for rel, is_dir in candidates:
+        if rel is None or time.monotonic() > deadline:
+            timed_out = True
+            break
+        if is_dir:
+            continue
+        fp = root / rel
         if sensitive_path(str(fp)):  # the tree walk lists hidden files too: dotenv files and key directories stay out
             continue
         if includes and not any(Path(fp.name).match(p) for p in includes):
@@ -998,6 +1128,8 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: P
         if len(matches) > MAX_SEARCH_RESULTS:
             break
     shown, note = _capped(matches)
+    if timed_out:
+        note = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(shown)} matching lines so far: {_NARROW}"
     return {"matches": _group_by_file(shown), **({"warnings": note} if note else {})}
 
 
@@ -1029,7 +1161,8 @@ def _expand_braces(pattern: str) -> list[str]:
 
 
 async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Find files matching a glob pattern (skipping .git, node_modules, .venv, dist and what .gitignore ignores).
+    """Find files matching a glob pattern (skipping .git, node_modules, .venv, dist and what .gitignore ignores;
+    outside a git tree also caches and build output). Stops at MAX_SEARCH_RESULTS or SEARCH_BUDGET_S.
 
     ``{a,b}`` groups are expanded, and an absolute pattern searches from the directory its first wildcard is under."""
     pattern = arguments["pattern"]
