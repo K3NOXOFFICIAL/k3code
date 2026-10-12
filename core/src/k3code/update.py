@@ -823,14 +823,15 @@ def vet_staged(version: str) -> list[str]:
     module proxy unreachable) is a complete version, and an update used to switch to it and report success.
 
     A TUI that the active version has and ``version`` lacks refuses the update (``SourceUpdateError``): the staged dir
-    is removed, unless it is the previous version, so that the next update builds it again instead of finding it
-    installed. install.sh fails that build itself under K3_REQUIRE_TUI; this covers a ref whose installer predates it
-    and a TUI that was skipped (Node could not be fetched). k3 is optional, so a missing one only warns."""
+    is removed, unless it is the previous version or one that a process runs from (the installer reuses an installed
+    build of the same commit), so that the next update builds it again instead of finding it installed. install.sh
+    fails that build itself under K3_REQUIRE_TUI; this covers a ref whose installer predates it and a TUI that was
+    skipped (Node could not be fetched). k3 is optional, so a missing one only warns."""
     cur = current_version()
     if not cur or cur == version:
         return []
     if has_file(cur, TUI_ENTRY) and not has_file(version, TUI_ENTRY):
-        if version != previous_version():
+        if version not in {previous_version(), *running_versions()}:
             shutil.rmtree(versions_dir() / version, ignore_errors=True)
         raise SourceUpdateError(
             f"{version} was not activated: its TUI is missing (the build failed or was skipped: is the npm registry "

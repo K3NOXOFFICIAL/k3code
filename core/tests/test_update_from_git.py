@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -287,6 +288,25 @@ def test_a_refused_version_that_is_the_previous_one_is_not_deleted(remote, data,
     r = CliRunner().invoke(cli, ["update", "--yes"])
     assert r.exit_code != 0 and no_release == []
     assert (data / "versions" / STAGED).is_dir()
+
+
+@pytest.mark.skipif(not Path("/proc/self/cwd").exists(), reason="needs /proc")
+def test_a_refused_version_that_a_process_runs_from_is_not_deleted(remote, data, no_release, monkeypatch):
+    """The installer reuses an installed build of the same commit: a daemon may still run from the version that is
+    refused (it is neither current nor previous)."""
+    cur = _install(data, "1234567aaaa")
+    _give(data / "versions" / cur, "tui")
+    staged = data / "versions" / STAGED
+    staged.mkdir()
+    monkeypatch.setenv("K3_STUB_PARTS", "")
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=staged)
+    try:
+        r = CliRunner().invoke(cli, ["update", "--yes"])
+        assert r.exit_code != 0 and no_release == []
+        assert staged.is_dir()
+    finally:
+        proc.kill()
+        proc.wait()
 
 
 def test_without_a_tui_to_lose_a_tui_less_build_is_fine(remote, data, no_release, monkeypatch):
