@@ -27,6 +27,11 @@ async def test_auto_section_rewritten_user_text_preserved(tmp_path):
     md = tmp_path / "memory" / "USER.md"
     md.parent.mkdir(parents=True)
     md.write_text("# Me\nI like tabs.\n\n## Learned preferences (auto)\n- stale old line\n\n## My notes\nkeep this\n")
+    # what the previous distill wrote: its line is ours to replace (any other line in the old section is kept)
+    (tmp_path / "learning").mkdir(exist_ok=True)
+    (tmp_path / "learning" / "preferences.json").write_text(
+        json.dumps({"old": {"text": "stale old line", "confidence": 0.8, "evidence": 5}})
+    )
     prefs = await distiller.distill(log, home=tmp_path, user_md=md)
     text = md.read_text()
     assert "I like tabs." in text and "## My notes\nkeep this" in text and "stale old line" not in text

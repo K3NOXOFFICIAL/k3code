@@ -10,7 +10,7 @@ import json
 import os
 import re
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,11 @@ from k3code.routing.tiers import TaskKind
 
 HEADING = "## Learned preferences (auto)"
 _NOTE = "<!-- managed by k3code; rewritten automatically, edit outside this section -->"
+#: Closes the managed block. Only the lines from the heading to this marker are ever rewritten; whatever follows
+#: it (``/memory add --user`` appends at the end of the file) is the user's. Files from before the marker ended
+#: the block at the next heading, which swallowed those lines (issue #91).
+_END = "<!-- /k3code:auto -->"
+_HEADING_LINE = re.compile(r"#{1,2} ")
 TEST_RE = re.compile(
     r"\b(pytest|npm test|npm run test|yarn test|pnpm test|cargo test|go test|make test|uv run pytest)\b"
 )
@@ -182,8 +187,7 @@ def _write_user_memory(path: Path, text: str) -> None:
 
 
 def add_user_line(path: Path, text: str, heading: str = HEADING) -> None:
-    """Add ``- text`` to ``path`` above the auto section (the distiller rewrites that section, and everything below
-    its heading up to the next one, on every run)."""
+    """Add ``- text`` to ``path`` above the auto section (the distiller rewrites that section on every run)."""
     text = scrub_text(text.strip())
     existing = path.read_text(encoding="utf-8") if path.is_file() else ""
     lines = existing.splitlines(keepends=True)
@@ -228,10 +232,24 @@ async def polish(caller: Any, prefs: list[Preference], *, session_id: str = "") 
     return prefs
 
 
-def write_auto_section(path: Path, prefs: list[Preference], heading: str = HEADING) -> None:
-    """Replace the auto section of ``path``; all other text is preserved byte for byte."""
+def _auto_end(lines: list[str], start: int) -> tuple[int, bool]:
+    """Where the auto section that starts at ``lines[start]`` ends: just past its end marker (closed), or, in a file
+    from before the marker, at the next heading or the end of the file."""
+    for i in range(start + 1, len(lines)):
+        if lines[i].strip() == _END:
+            return i + 1, True
+        if _HEADING_LINE.match(lines[i]):
+            return i, False
+    return len(lines), False
+
+
+def write_auto_section(path: Path, prefs: list[Preference], heading: str = HEADING, known: Collection[str] = ()) -> None:
+    """Replace the auto section of ``path`` (the heading through the end marker); all other text is preserved byte
+    for byte. A section from before the end marker may hold lines the user added after it was written (they cannot be
+    told apart from ours): those stay, moved above the heading. ``known`` is the text of the preferences an earlier
+    run wrote, which are dropped with the old section."""
     body = "\n".join(f"- {p.text}" for p in prefs) or "- (nothing learned yet)"
-    section = f"{heading}\n{_NOTE}\n{body}\n"
+    section = f"{heading}\n{_NOTE}\n{body}\n{_END}\n"
     text = path.read_text(encoding="utf-8") if path.is_file() else ""
     lines = text.splitlines(keepends=True)
     start = next((i for i, ln in enumerate(lines) if ln.strip() == heading), None)
@@ -239,9 +257,15 @@ def write_auto_section(path: Path, prefs: list[Preference], heading: str = HEADI
         sep = "" if not text or text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
         new = text + sep + section
     else:
-        end = next((i for i in range(start + 1, len(lines)) if re.match(r"#{1,2} ", lines[i])), len(lines))
+        end, closed = _auto_end(lines, start)
         tail = "".join(lines[end:])
-        new = "".join(lines[:start]) + section + ("\n" + tail if tail else "")
+        if closed:
+            new = "".join(lines[:start]) + section + tail
+        else:
+            ours = {f"- {t}" for t in (*known, *(p.text for p in prefs))} | {"- (nothing learned yet)"}
+            mine = [ln for ln in lines[start + 1 : end] if ln.strip() and ln.strip() not in ours and not ln.strip().startswith("<!-- managed by k3code")]
+            kept = "".join(ln if ln.endswith("\n") else ln + "\n" for ln in mine)
+            new = "".join(lines[:start]) + (kept + "\n" if kept else "") + section + ("\n" + tail if tail else "")
     _write_user_memory(path, new)
 
 
@@ -255,7 +279,7 @@ def read_auto_section(path: Path, heading: str = HEADING) -> list[str]:
         return []
     out = []
     for ln in lines[i + 1 :]:
-        if re.match(r"#{1,2} ", ln):
+        if ln.strip() == _END or _HEADING_LINE.match(ln):
             break
         if ln.startswith("- ") and "(nothing learned" not in ln:
             out.append(ln[2:].strip())
@@ -374,7 +398,8 @@ async def distill(
 ) -> list[Preference]:
     prefs, suggestions = derive(log, min_evidence=min_evidence)
     prefs = await polish(caller, prefs, session_id=session_id)
-    write_auto_section(user_md, prefs)
+    last = [p.text for p in load_preferences(home, top=1_000_000)]  # what the previous run wrote, to migrate USER.md
+    write_auto_section(user_md, prefs, known=last)
     write_preferences_json(home, prefs)
     # blocking HTTP (up to 10 s per preference): never on the event loop that serves every session
     await asyncio.to_thread(store_mem0, config, prefs, mem0_post, home / "learning" / MEM0_POSTED)

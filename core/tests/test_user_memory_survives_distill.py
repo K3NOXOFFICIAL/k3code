@@ -50,9 +50,10 @@ async def test_distill_keeps_added_lines_across_repeated_runs(tmp_path, monkeypa
     md = user_memory_path()
     md.parent.mkdir(parents=True)
     md.write_text("# Me\nI like tabs.\n", encoding="utf-8")  # no managed block yet
+    polish = FakeCaller('[{"key": "avoid:m-x:review", "text": "dislikes m-x for reviews"}]')
     res = await MemoryCommand().handle(_Ctx(), None, "add --user first note")
     assert "Added" in res["output"]
-    await distiller.distill(log, home=tmp_path, user_md=md, caller=FakeCaller('[{"key": "avoid:m-x:review", "text": "dislikes m-x for reviews"}]'))
+    await distiller.distill(log, home=tmp_path, user_md=md, caller=polish)
     await MemoryCommand().handle(_Ctx(), None, "add --user second note")
     await distiller.distill(log, home=tmp_path, user_md=md)
     await distiller.distill(log, home=tmp_path, user_md=md)
@@ -99,7 +100,7 @@ async def test_old_format_file_is_migrated_without_losing_anything(tmp_path):
         "- machine line from last time\n- never use tabs\n\n## My notes\nkeep this\n",
         encoding="utf-8",
     )
-    (tmp_path / "learning").mkdir()
+    (tmp_path / "learning").mkdir(exist_ok=True)
     (tmp_path / "learning" / "preferences.json").write_text(
         json.dumps({"k": {"text": "machine line from last time", "confidence": 0.8, "evidence": 5}}), encoding="utf-8"
     )
