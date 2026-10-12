@@ -900,6 +900,19 @@ def test_unambiguous_catastrophes_are_hardline_denied(proj: Path, cmd: str) -> N
     _assert_hardline(cmd, proj)
 
 
+def test_the_fork_bomb_rule_is_linear_and_still_catches_long_and_suffix_names() -> None:
+    # K3NOX-106: the regex tried every start of a long word, so `echo aaaa...` (20k) took seconds on the event loop
+    import time
+
+    started = time.perf_counter()
+    for text in ("echo " + "a" * 20_000, "a" * 20_000 + "() { b }", "f() { " + "a" * 20_000 + " | b }"):
+        assert hardline.check(text, cwd="/work/proj", home="/home/user") is None
+    assert time.perf_counter() - started < 1.0
+    name = "a" * 300  # no length cap on the name: a long one is no way around the rule
+    assert hardline.check(f"{name}(){{ {name}|{name}& }};{name}") == "fork-bomb"
+    assert hardline.check("x.f(){ f|f& }; x.f") == "fork-bomb"  # as before: the body's name ends the word in front
+
+
 NEW_HARDLINE_CONTROLS = [
     "echo x > /dev/null",
     "echo x > /dev/stderr",

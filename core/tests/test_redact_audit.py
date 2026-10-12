@@ -190,3 +190,16 @@ def test_long_runs_of_name_characters_are_scrubbed_in_linear_time(text):
     start = time.monotonic()
     assert scrub_text(text) == text
     assert time.monotonic() - start < 2.0
+
+
+def test_the_curl_password_scrub_is_linear() -> None:
+    # K3NOX-106: an unterminated quote full of colons after `curl -u` backtracked once per colon (27 s at 20 KB); the
+    # first stderr line of a failing command is scrubbed on the event loop
+    import time
+
+    started = time.perf_counter()
+    for text in ("curl " * 50 + '-u "' + "a:" * 10_000, "curl -u '" + "a:" * 10_000, "curl -u " + "a:" * 10_000):
+        scrub_text(text)
+    assert time.perf_counter() - started < 1.0
+    assert "hunter22" not in scrub_text('curl -u "admin:hunter22" https://x')  # quoted forms still masked
+    assert "hunter22" not in scrub_text("curl -u 'admin:a:hunter22' https://x")

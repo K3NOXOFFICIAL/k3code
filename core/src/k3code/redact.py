@@ -87,7 +87,8 @@ _MYSQL_P = re.compile(r"(?i)(\bmysql\w*\b[^\n]{0,1000}?\s-(?-i:p))(?=\S)" + _ARG
 _SSHPASS = re.compile(r"(\bsshpass\b[^\n]{0,1000}?\s-p\s*)" + _ARG)
 _CURL_USER = re.compile(
     r"(\bcurl\b[^\n]{0,1000}?\s(?:-[A-Za-z]*[uU]\s*|--(?:proxy-)?user[=\s]\s*))"
-    r"""(?:'[^'\n]*:[^'\n]*'|"[^"\n]*:[^"\n]*"|[^\s'":]*:[^\s'"]*)"""
+    # the part before the first colon cannot hold one: an unclosed quote full of colons is scanned once, not per colon
+    r"""(?:'[^'\n:]*:[^'\n]*'|"[^"\n:]*:[^"\n]*"|[^\s'":]*:[^\s'"]*)"""
 )
 _SECRET_FLAG = re.compile(
     r"(?i)--?(?:password|passwd|token|api[_-]?key|apikey|secret|client[_-]?secret|auth(?:[_-]?token)?)"

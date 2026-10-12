@@ -38,12 +38,8 @@ HARDLINE_PATTERNS: list[tuple[str, str]] = [
     # cat .env / *.env, but not the committed templates (.env.example ...)
     ("dotenv-cat", r"\bcat\b[^\n;|&]*\.env\b(?!\.(?:example|sample|template|dist)\b)"),
     ("git-push-force-main", r"\bgit\b[^\n;|&]*\bpush\b(?=[^\n;|&]*--force)(?=[^\n;|&]*\b(?:main|master)\b)"),
-    # `:(){ :|:& };:` and `f(){ f|f& }; f`: a function that pipes itself into itself
-    (
-        "fork-bomb",
-        r"([\w:.-]+)\s*\(\)\s*\{\s*\1\s*\|\s*\1\s*&?\s*\}"
-        r"|\bfunction\s+([\w:.-]+)\s*(?:\(\))?\s*\{\s*\2\s*\|\s*\2\s*&?\s*\}",
-    ),
+    # `function f { f|f& }; f`: a function that pipes itself into itself (`f(){ f|f& }` is _fork_bomb's)
+    ("fork-bomb", r"\bfunction\s+([\w:.-]+)\s*(?:\(\))?\s*\{\s*\1\s*\|\s*\1\s*&?\s*\}"),
 ]
 
 #: Remote hosts whose services must never be restarted from here. ``ssh <host> "<remote command>"`` can carry
@@ -329,10 +325,23 @@ def _user_pattern(rx: str) -> re.Pattern[str]:
         return re.compile(re.escape(rx))
 
 
+#: ``(){ f|f& }``: the body of a fork bomb, from its ``()`` on (the name in front is checked by _fork_bomb).
+_FORK_BODY = re.compile(r"\(\)\s*\{\s*([\w:.-]+)\s*\|\s*\1\s*&?\s*\}")
+
+
+def _fork_bomb(text: str) -> bool:
+    """``:(){ :|:& };:`` / ``f(){ f|f& }``: a function whose body pipes its own name into itself. Matched from each
+    ``()`` and checked back to the word in front, which must end with that name: linear in the line, where one regex
+    from the name on tried every start of a long word (quadratic, seconds for a 10k-character command)."""
+    return any(text[: m.start()].rstrip().endswith(m.group(1)) for m in _FORK_BODY.finditer(text))
+
+
 def _match(text: str, extra_patterns: list[str] | None) -> str | None:
     for name, rx in _COMPILED:
         if rx.search(text):
             return name
+    if _fork_bomb(text):
+        return "fork-bomb"
     for i, rx in enumerate(extra_patterns or []):
         if _user_pattern(str(rx)).search(text):
             return f"config-hardline-{i}"
