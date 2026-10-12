@@ -193,3 +193,32 @@ async def test_a_cloudflare_page_over_http_is_a_server_error_not_an_auth_failure
     page = b"<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body></body></html>"
     err = await failing_call(403, page, "text/html")
     assert classify_api_error(err, provider="o", model="m").reason == R.server
+
+
+async def test_an_error_wrapped_in_a_one_element_array_is_read_like_any_other():
+    body = b'[{"error": {"message": "Request contains an invalid argument.", "status": "INVALID_ARGUMENT"}}]'
+    err = await failing_call(400, body, "application/json")
+    assert err.message == "Request contains an invalid argument." and err.body["error"]["status"] == "INVALID_ARGUMENT"
+
+
+async def test_a_long_page_without_whitespace_is_cut_to_the_shown_length_and_kept_longer_for_the_classifier():
+    from k3code.providers.base import ERROR_TEXT_KEPT, ERROR_TEXT_SHOWN
+
+    page = "<html>" + "x" * 3500 + "cf-error-details" + "y" * 3000 + "</html>"
+    err = await failing_call(502, page.encode(), "text/html")
+    assert len(err.message) == ERROR_TEXT_SHOWN == 500
+    assert len(err.body["message"]) == ERROR_TEXT_KEPT and err.body["message"].startswith("<html>")
+    assert "cf-error-details" in err.body["message"], "a marker deep in the page still reaches the classifier"
+    assert classify_api_error(err, provider="o", model="m").reason == R.server
+
+
+@pytest.mark.parametrize(
+    ("message", "status", "expected"),
+    [
+        ("You exceeded your daily quota for this API", 429, R.quota),
+        ("Daily token limit reached", 429, R.rate_limit),
+        ("ThrottlingException: Rate exceeded", None, R.rate_limit),
+    ],
+)
+def test_quota_and_throttle_wordings(message, status, expected):
+    assert reason_of(message, status) == expected

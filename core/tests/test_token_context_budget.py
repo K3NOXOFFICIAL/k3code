@@ -333,3 +333,28 @@ def test_at_most_six_of_the_newest_results_are_protected_whatever_the_window():
     asst = Message(role="assistant", content=None)
     many = [asst, *(Message(role="tool", content="x", tool_call_id=f"t{i}", name="read") for i in range(30))]
     assert kept_calls(many, 10_000_000) == ELIDE_KEEP_CALLS == 6
+
+
+def test_the_compaction_trigger_counts_elided_results_as_their_markers():
+    """A 40-read turn of 38 KB files on a 100k window: the request is ~42k tokens, and the estimate said 408k, so the
+    next turn compacted (a summary call, and the detail gone) for nothing."""
+    msgs: list[dict] = []
+    for i in range(40):
+        msgs.append(
+            {"role": "assistant", "content": None, "tool_calls": [{"id": f"r{i}", "name": "read", "arguments": {}}]}
+        )
+        msgs.append({"role": "tool", "name": "read", "tool_call_id": f"r{i}", "content": "x" * 38_000})
+        msgs.append(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": f"w{i}", "name": "write", "arguments": {"path": "a", "content": "y" * 8_000}}],
+            }
+        )
+        msgs.append({"role": "tool", "name": "write", "tool_call_id": f"w{i}", "content": "Wrote a"})
+    whole = _estimate_tokens(msgs, 10_000)
+    elided = {f"r{i}" for i in range(36)} | {f"args:w{i}" for i in range(36)}
+    short = _estimate_tokens(msgs, 10_000, elided)
+    assert short < whole // 3, (short, whole)
+    # the four newest steps are still counted whole
+    assert short > 4 * 2_500

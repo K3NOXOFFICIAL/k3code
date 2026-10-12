@@ -30,7 +30,7 @@ import sys
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,10 +55,12 @@ from k3code.commands.builtin import build_registry as build_commands
 from k3code.commands.ultra_cmd import JobSpec, typed_mode_word
 from k3code.config import Settings, default_project_dir, load_config, retention
 from k3code.context_budget import (
+    ELIDE_MIN_CHARS,
     AutoCompact,
     autocompact_policy,
     compact_threshold,
     context_window,
+    elide_marker,
     overhead_tokens,
     router_window,
     text_tokens,
@@ -551,22 +553,31 @@ COMPACTED_CONTINUATION = (
 COMPACT_RETRY_AFTER_S = 120.0
 
 
-def _estimate_tokens(messages: list[dict[str, Any]], tool_output_chars: int | None = None) -> int:
+def _estimate_tokens(
+    messages: list[dict[str, Any]], tool_output_chars: int | None = None, elided: Collection[str] = ()
+) -> int:
     """Rough size of what a conversation sends (see context_budget.text_tokens), tool calls included.
 
     Tool results are counted as the model receives them (head+tail clip to ``context.tool_output_chars``), so the
-    stored full text does not trigger compaction early; everything else is counted as stored.
+    stored full text does not trigger compaction early; everything else is counted as stored. ``elided``: the ids the
+    loop has replaced by a marker in its requests (a result's own id; ``args:<id>`` for the file text of a call): they
+    are counted as the marker, or a session that elides well kept compacting a request a tenth of the size.
     """
     tokens = 0
     for m in messages:
         c = m.get("content")
         if m.get("role") == "tool" and isinstance(c, str):
-            c = clip_for_model(m.get("name"), c, tool_output_chars or MAX_TOOL_RESULT_CHARS)
+            if m.get("tool_call_id") in elided and len(c) > ELIDE_MIN_CHARS:
+                c = elide_marker(m.get("name"), len(c))
+            else:
+                c = clip_for_model(m.get("name"), c, tool_output_chars or MAX_TOOL_RESULT_CHARS)
         tokens += text_tokens(c) if isinstance(c, str) else text_tokens(json.dumps(c, ensure_ascii=False)) if c else 0
         for tc in m.get("tool_calls") or []:
             # the name and the arguments once, as context_budget.message_tokens counts them (the whole call dict carried
             # the arguments twice when both the parsed and the raw form were stored)
             args = tc.get("raw_arguments") or json.dumps(tc.get("arguments") or {}, ensure_ascii=False)
+            if f"args:{tc.get('id')}" in elided and len(args) > ELIDE_MIN_CHARS:
+                args = args[: ELIDE_MIN_CHARS // 4] + " " * 40  # the text of the call is a marker of about this size
             tokens += text_tokens(str(tc.get("name") or "") + args)
     return tokens
 
@@ -2756,7 +2767,7 @@ class GatewayServer:
             prompt = self._system_prompt_for(session)
             session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
         conversation = [m for m in session.stored.messages if m.get("role") != "system"]
-        return _estimate_tokens(conversation, tool_output_limit(self.config)) + session.overhead_tokens
+        return _estimate_tokens(conversation, tool_output_limit(self.config), session.elided) + session.overhead_tokens
 
     async def _auto_title(self, session: LiveSession, first_message: str) -> None:
         """Name a fresh session on the ``title`` task kind; best-effort, never surfaces errors."""

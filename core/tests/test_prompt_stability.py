@@ -110,3 +110,18 @@ async def test_what_other_sessions_and_background_writers_change_does_not_reach_
     live.refresh_prompt_inputs()  # a compaction, /clear or a move to another project
     assert "rolls back changes often" in server._system_prompt_for(live)
     await server.close()
+
+
+async def test_clear_shows_the_notes_learned_since_the_prompt_was_built(tmp_path, monkeypatch):
+    from m1cmd_helpers import rpc
+
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    sid = await new_session(server, tmp_path)
+    live = server.live[sid]
+    write_learned(tmp_path, ["first note"])
+    first = server._system_prompt_for(live)
+    write_learned(tmp_path, ["first note", "second note"])
+    assert server._system_prompt_for(live) == first
+    await rpc(server, "slash.exec", {"command": "clear", "session_id": sid})
+    assert "second note" in server._system_prompt_for(live)
+    await server.close()

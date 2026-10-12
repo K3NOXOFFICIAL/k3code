@@ -189,3 +189,35 @@ async def test_the_max_turns_cap_covers_the_whole_task_across_an_overflow_contin
     await server._run_turn(live, "keep reading")
     assert provider.requests == 4, "two before the overflow and the two that are left of the four, not four more"
     await server.close()
+
+
+async def test_the_continuation_does_not_run_the_prompt_hooks_or_the_scope_gate_again(tmp_path, monkeypatch):
+    target = tmp_path / "notes.txt"
+    target.write_text("the answer is 42\n")
+    server, _ = make_server(
+        tmp_path, monkeypatch, ["unused"], context={"compact_at_tokens": 10_000_000, "keep_messages": 6}
+    )
+    provider = Scripted(str(target))
+    server.router = Router(build_chain([provider], [["m"]]), max_retries=0)
+    server._oneshot_routers = {"default": server.router}  # type: ignore[attr-defined]
+    server._tiers = None
+    live = server.live[await new_session(server, tmp_path)]
+    live.stored.messages = long_history()
+    calls = {"prepare": 0, "hooks": 0}
+    prepare, hooks = server.autonomy.prepare, server._prompt_hooks
+
+    async def counting_prepare(*args, **kwargs):
+        calls["prepare"] += 1
+        return await prepare(*args, **kwargs)
+
+    async def counting_hooks(*args, **kwargs):
+        calls["hooks"] += 1
+        return await hooks(*args, **kwargs)
+
+    server.autonomy.prepare = counting_prepare  # type: ignore[method-assign]
+    server._prompt_hooks = counting_hooks  # type: ignore[method-assign]
+    status, _ = await server._run_turn(live, "read notes.txt and tell me the answer")
+    assert status == "done" and COMPACTED_CONTINUATION in [m["content"] for m in live.stored.messages]
+    assert calls["prepare"] == 1, "the scope gate ran for the prompt, not again for its continuation"
+    assert calls["hooks"] <= 1
+    await server.close()

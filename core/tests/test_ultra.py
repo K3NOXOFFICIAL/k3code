@@ -284,12 +284,24 @@ async def test_ultracode_token_budget_stops_it(tmp_path, monkeypatch):
         ultracode={"max_tokens": 300},
     )
     await call(server, "session.create", {"cwd": str(repo)})
+    from k3code.reliability.governor import Governor
+
+    held: list[int | None] = []
+    real_add = Governor.add_budget
+
+    def spy(self, budget):
+        if budget.scope == "ultracode":
+            held.append(budget.tokens)
+        return real_add(self, budget)
+
+    monkeypatch.setattr(Governor, "add_budget", spy)
     await run_job(server, "ultracode add three files")
     report = server.session.stored.messages[-1]["content"]
     assert "STOPPED" in report and "token budget exhausted" in report
     assert not (repo / "f1.txt").exists()
+    assert held == [300], "the cap was a budget of the session's governor while the run lasted"
     governor = server.session.reliability.governor
-    assert governor is None or "ultracode" not in governor._budgets, "the temporary cap is gone after the run"
+    assert governor is not None and "ultracode" not in governor._budgets, "the temporary cap is gone after the run"
 
 
 async def test_a_budget_stop_cancels_the_sibling_children():

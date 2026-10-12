@@ -46,6 +46,8 @@ def error_from_http(
         body = json.loads(raw) if raw else {}
     except ValueError:
         body = {}
+    if isinstance(body, list) and len(body) == 1 and isinstance(body[0], dict):
+        body = body[0]  # Google's endpoints wrap the error in a one-element array: [{"error": {...}}]
     if not isinstance(body, dict):
         body = {"message": str(body)}
     message = message_of(body)

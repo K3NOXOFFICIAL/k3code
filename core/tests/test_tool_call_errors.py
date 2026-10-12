@@ -514,3 +514,29 @@ async def test_a_search_of_one_file_is_left_as_rg_prints_it(tmp_path):
     (tmp_path / "log.txt").write_text("host:34:up\nplain\n")
     res = await tool_grep({"pattern": "host", "path": "log.txt"}, cwd=tmp_path)
     assert res["matches"] == "1:host:34:up"
+
+
+def test_the_redraw_collapse_covers_stderr_and_the_ignored_note_exempts_what_it_must():
+    from types import SimpleNamespace
+
+    from k3code.agent.loop import _ignored_arguments
+
+    shown = format_tool_result({"stdout": "", "stderr": "10%\r50%\r100%\ndone\n", "exit_code": 1})
+    assert "[stderr]\n100%\ndone" in shown and "50%" not in shown
+    read = SimpleNamespace(name="read", parameters={"properties": {"path": {}, "offset": {}}})
+    assert _ignored_arguments(read, {"path": "a", "_unparsed": "x"}) == "", "provider markers are not arguments"
+    assert "extra" in _ignored_arguments(read, {"path": "a", "extra": 2})
+    mcp = SimpleNamespace(name="mcp__s__t", parameters={"properties": {"a": {}}})
+    assert _ignored_arguments(mcp, {"a": 1, "extra": 2}) == "", "an MCP server may take more than it declares"
+
+
+async def test_the_memory_of_applied_edits_stays_bounded(tmp_path, monkeypatch):
+    from k3code import tools as tools_mod
+    from k3code.tools import tool_edit
+
+    monkeypatch.setattr(tools_mod, "_APPLIED_EDITS", {})
+    for i in range(tools_mod._APPLIED_EDITS_MAX + 44):
+        f = tmp_path / f"f{i}.txt"
+        f.write_text("old\n")
+        assert (await tool_edit({"path": f.name, "old_string": "old", "new_string": "new"}, cwd=tmp_path))["ok"]
+    assert len(tools_mod._APPLIED_EDITS) <= tools_mod._APPLIED_EDITS_MAX
