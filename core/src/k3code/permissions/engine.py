@@ -849,11 +849,13 @@ def sensitive_path(path: str) -> bool:
 
 def secret_store(path: str) -> bool:
     """``path`` (absolute) is in a key or credential store (``sensitive_path`` without the dotenv files): the secret
-    dirs of ``$HOME``, a process environment, a Windows profile's keys and AppData. Path as written and realpath."""
+    dirs of ``$HOME``, a process environment, a Windows profile's keys and AppData. Path as written and realpath,
+    compared case-insensitively: on drvfs (``/mnt/c``) and macOS ``~/.SSH`` is ``~/.ssh`` (issue #133)."""
     dirs = [os.path.normpath(d) for d in _secret_dirs()]
-    dirs += [os.path.realpath(d) for d in dirs]
+    dirs = [d.lower() for d in dict.fromkeys(dirs + [os.path.realpath(d) for d in dirs])]
     for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
-        if _PROC_ENVIRON.match(p) or any(p == d or p.startswith(d.rstrip("/") + "/") for d in dirs):
+        folded = p.lower()
+        if _PROC_ENVIRON.match(p) or any(folded == d or folded.startswith(d.rstrip("/") + "/") for d in dirs):
             return True
         if windows_profile_secret(p):
             return True

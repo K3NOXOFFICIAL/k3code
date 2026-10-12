@@ -124,8 +124,9 @@ def test_writes_into_linux_home_keys_need_a_person_and_dotenv_writes_do_not(
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(engine, "_mounted_windows_drives", lambda: ())
-    d = decide(mode="auto", tool="write", args={"path": "~/.ssh/authorized_keys"}, cwd=home)
-    assert (d.action, d.needs_human) == ("ask", True)
+    for spelling in ("~/.ssh/authorized_keys", "~/.SSH/authorized_keys"):  # .SSH is .ssh on drvfs and macOS
+        d = decide(mode="auto", tool="write", args={"path": spelling}, cwd=home)
+        assert (d.action, d.needs_human) == ("ask", True), spelling
     proj = tmp_path / "proj"
     proj.mkdir()
     assert decide(mode="auto", tool="write", args={"path": ".env"}, cwd=proj).action == "allow"
