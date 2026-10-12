@@ -83,6 +83,16 @@ def _print_event(event: RouterEvent) -> None:
         logger.info("%s %s", event.kind, event.detail)
 
 
+def _warn_unsandboxed(mode: str) -> None:
+    """An auto/yolo run whose bash has no sandbox here (bwrap unusable): said once on stderr, not only in the log."""
+    what = (
+        "yolo mode runs every command on this machine"
+        if mode == "yolo"
+        else "auto mode refuses each command it would have run in the sandbox (nobody can approve it here)"
+    )
+    sys.stderr.write(f"[k3code] no sandbox: bubblewrap is unusable here, so {what}; see k3code doctor\n")
+
+
 def _build_reliability(config: Any, session: str) -> Reliability:
     """M2: build the reliability bundle from the config's reliability dict."""
     from k3code.paths import home as k3code_home
@@ -148,6 +158,7 @@ async def _run_headless(
         reliability=reliability,
         session=session,
     )
+    loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), session)  # the directory the trust check keys on
 
@@ -426,6 +437,7 @@ async def _run_repl(
         cwd=Path.cwd(),
         reliability=reliability,
     )
+    loop.on_unsandboxed = lambda: _warn_unsandboxed(loop.permissions.mode.value)
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
     hooks_started = False
