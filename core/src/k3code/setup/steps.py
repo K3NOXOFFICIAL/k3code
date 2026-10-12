@@ -221,7 +221,8 @@ def step_providers(c: Ctx) -> dict[str, Any]:
     from k3code import confio
     from k3code.paths import user_config_path
 
-    chain = [str(p.get("name")) for p in confio.read_yaml(user_config_path()).get("providers") or [] if isinstance(p, dict)]
+    entries = confio.read_yaml(user_config_path()).get("providers") or []
+    chain = [str(p.get("name")) for p in entries if isinstance(p, dict)]
     if chain:
         c.say(f"  config.yaml has the provider chain {', '.join(chain)}; this step replaces it with the entries below.")
     labels = ["primary", "secondary", "tertiary"]

@@ -82,7 +82,8 @@ def _backups() -> list[Path]:
 def test_a_step_rerun_keeps_notes_and_learned_preferences_in_user_md(env: Path) -> None:
     run_setup(AnswerPrompter(ANSWERS), do_probe=False)
     memory.append_memory(_user_md(), "always answer in German")
-    distiller.write_auto_section(_user_md(), [distiller.Preference(key="k", text="prefers tabs", confidence=0.8, evidence=3)])
+    pref = distiller.Preference(key="k", text="prefers tabs", confidence=0.8, evidence=3)
+    distiller.write_auto_section(_user_md(), [pref])
     _step("system", {"system": {"confirm": True, "shell": "fish"}})
     text = _user_md().read_text()
     assert "- always answer in German" in text
@@ -201,7 +202,7 @@ def test_a_step_rerun_writes_only_the_keys_it_owns(env: Path) -> None:
     cfg["display"]["density"] = "compact"  # TUI display settings the wizard never asks about
     cfg["autonomy"]["review"] = {"gate": True}
     cfg["autonomy"]["fanout"]["floor"] = 1
-    cfg["permissions"]["allow"] = ["git status"]
+    cfg["permissions"]["bash"] = {"git status*": "allow"}
     cfg["tiers"]["main"] = "strong"
     cfg["panes"]["border"] = "round"
     _put_cfg(cfg)
@@ -214,7 +215,7 @@ def test_a_step_rerun_writes_only_the_keys_it_owns(env: Path) -> None:
     assert now["autonomy"]["review"] == {"gate": True}
     assert now["autonomy"]["plan_first"] is False and now["autonomy"]["fanout"] == {"max_parallel": 6, "floor": 1}
     assert now["permission_mode"] == "yolo"
-    assert now["permissions"] == {"allow": ["git status"]}  # the hardline answer is now empty: cleared, rest kept
+    assert now["permissions"] == {"bash": {"git status*": "allow"}}  # hardline cleared, the rest kept
     assert now["tiers"]["main"] == "strong"  # no step asks about the tier map
 
 
@@ -222,7 +223,8 @@ def test_a_full_run_over_an_existing_config_keeps_keys_it_does_not_ask_about(env
     run_setup(AnswerPrompter(ANSWERS), do_probe=False)
     cfg = _cfg()
     cfg["display"]["density"] = "compact"
-    cfg["permissions"]["allow"] = ["git status"]
+    cfg["permissions"]["bash"] = {"git status*": "allow"}
     _put_cfg(cfg)
     run_setup(AnswerPrompter(ANSWERS), restart=True, do_probe=False)
-    assert _cfg()["display"]["density"] == "compact" and _cfg()["permissions"]["allow"] == ["git status"]
+    assert _cfg()["display"]["density"] == "compact"
+    assert _cfg()["permissions"]["bash"] == {"git status*": "allow"}
