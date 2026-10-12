@@ -230,3 +230,20 @@ def test_a_full_run_over_an_existing_config_keeps_keys_it_does_not_ask_about(env
     run_setup(AnswerPrompter(ANSWERS), restart=True, do_probe=False)
     assert _cfg()["display"]["density"] == "compact"
     assert _cfg()["permissions"]["bash"] == {"git status*": "allow"}
+
+
+def test_summary_after_a_fast_onboarding_keeps_the_tier_models(env: Path) -> None:
+    _fast(env, "http://127.0.0.1:9/v1")
+    before = _cfg()
+    assert before["providers"][0]["models"] == {"default": "m"}
+    _step("summary")
+    assert _cfg()["providers"] == before["providers"]
+
+
+def test_summary_keeps_hand_edited_tier_models_over_the_saved_answers(env: Path) -> None:
+    run_setup(AnswerPrompter(ANSWERS), do_probe=False)  # state says: gw has m-main, m-strong, ...
+    cfg = _cfg()
+    cfg["providers"][0]["models"] = {"default": "hand", "cheap": "hand-cheap"}
+    _put_cfg(cfg)
+    _step("summary")
+    assert _cfg()["providers"][0]["models"] == {"default": "hand", "cheap": "hand-cheap"}
