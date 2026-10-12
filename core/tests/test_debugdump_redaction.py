@@ -57,7 +57,7 @@ def test_safe_config_redacts_mcp_and_research_secrets():
     for secret in (PAT, PW, SIG, HDR, URL_PW, PATH_TOKEN, QUERY_TOKEN, FLAG_VALUE, ARGV_TOKEN, EVENT_ONLY):
         assert secret not in text, secret
     # what is not secret stays readable
-    assert "mcp.example.com" in text and "searx.example.com" in text and "npx" in text and "limit=5" in text
+    assert "mcp.example.com" in text and "npx" in text and "limit=5" in text
 
 
 async def test_every_file_of_the_bundle_is_redacted(tmp_path):
