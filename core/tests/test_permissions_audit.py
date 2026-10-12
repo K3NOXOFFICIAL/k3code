@@ -672,6 +672,18 @@ def test_reading_a_hook_or_config_is_still_allowed(proj: Path) -> None:
         assert decide(mode="auto", tool="read", args={"path": path}, cwd=proj).action == "allow", path
 
 
+@pytest.mark.parametrize("pattern", ["*", "**", "{proj}/**", "{proj}/*", "{proj}/.git/**", "{proj}/.git/*/*"])
+def test_a_broad_edit_allow_rule_does_not_cover_code_locations(proj: Path, pattern: str) -> None:
+    # K3NOX-106: only the builtin layer was checked, so any user or project `edit: allow` let a hook be planted
+    rules = [Rule(tool="edit", pattern=pattern.format(proj=proj), action="allow")]
+    for path in (".git/hooks/pre-commit", ".envrc", ".husky/pre-commit", ".git/config"):
+        for mode in ("default", "accept-edits", "auto", "yolo"):
+            d = decide(mode=mode, tool="write", args={"path": path}, cwd=proj, user_rules=rules)
+            assert (d.action, d.needs_human) == ("ask", True), (pattern, path, mode, d.action)
+            assert "runs as code" in (d.message or "")
+    assert decide(mode="auto", tool="write", args={"path": "src/a.py"}, cwd=proj, user_rules=rules).action == "allow"
+
+
 def test_an_explicit_allow_rule_for_a_hook_path_is_honoured(proj: Path) -> None:
     rules = [Rule(tool="edit", pattern=f"{proj}/.husky/*", action="allow")]
     d = decide(mode="auto", tool="write", args={"path": ".husky/pre-commit"}, cwd=proj, user_rules=rules)

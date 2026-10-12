@@ -875,7 +875,10 @@ def _decide_path(mode: PermissionMode, tool: str, path: str, roots: list[str], r
         elif not is_edit and rule.action == "ask":
             # an in-process read outside the roots is never auto-allowed: a person approves it (or adds a read rule)
             dec.needs_human = True
-    if is_edit and dec.action != "deny" and rule.layer == 0 and _code_location(path):
+    # a rule lets such an edit through only when its own pattern names a code location (`.husky/*`): a broad
+    # `edit: allow` (`*`, `<project>/**`) was written for source files
+    explicit = rule.layer != 0 and rule.action == "allow" and bool(_CODE_LOCATION.search(rule.pattern))
+    if is_edit and dec.action != "deny" and not explicit and _code_location(path):
         # the edit tools run in the daemon, outside the sandbox: a planted git hook, `core.fsmonitor`, husky hook or
         # .envrc runs on the user's next git command / cd. Only an explicit rule of the user's lets it through.
         dec.action, dec.needs_human, dec.always_ask = "ask", True, True
