@@ -839,9 +839,9 @@ def vet_staged(version: str) -> list[str]:
         if version not in {previous_version(), *running_versions()}:
             shutil.rmtree(versions_dir() / version, ignore_errors=True)
         raise SourceUpdateError(
-            f"{version} was not activated: its TUI is missing (the build failed or was skipped; the installer's messages "
-            f"are in {data_dir() / 'install.log'}) and {cur} stays current. Run `k3code update` again when the TUI "
-            "can build."
+            f"{version} was not activated: its TUI is missing (the build failed or was skipped; the installer's "
+            f"messages are in {data_dir() / 'install.log'}) and {cur} stays current. Run `k3code update` again when "
+            "the TUI can build."
         )
     if has_file(version, K3_BINARY):
         return []
