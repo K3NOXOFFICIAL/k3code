@@ -99,18 +99,29 @@ def edit_config_file(path: Path) -> int:
     try:
         confio.validate(confio.read_yaml(path))
     except confio.ConfigError as e:
-        rejected = path.with_name(path.name + ".rejected")
-        rejected.write_bytes(after)
         if before is None:
             path.unlink()
         else:
             confio.replace_bytes(path, before)
         if bak is not None:
             bak.unlink(missing_ok=True)
-        raise confio.ConfigError(
-            f"{path.name} is not valid ({e}); kept the previous content, your edit is in {rejected.name}"
-        ) from e
+        rejected = path.with_name(path.name + ".rejected")
+        kept = f"your edit is in {rejected.name}" if _write_new(rejected, after) else "your edit could not be kept"
+        raise confio.ConfigError(f"{path.name} is not valid ({e}); kept the previous content, {kept}") from e
     return rc
+
+
+def _write_new(path: Path, data: bytes) -> bool:
+    """Write ``data`` to ``path`` as a new regular file (0600), whatever was there before. Never through a symlink: a
+    repository can ship ``.k3code/config.yaml.rejected -> ~/.bashrc``. False when it cannot be written."""
+    try:
+        path.unlink(missing_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    except OSError:
+        return False
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    return True
 
 
 def _learn(ctx: Any, session_id: str | None, kind: str, subject: str, choice: str) -> None:

