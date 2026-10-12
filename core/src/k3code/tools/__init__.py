@@ -822,11 +822,11 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         if is_dir:
             continue
         fp = base / rel
-        if sensitive_path(str(fp)):  # the walk lists hidden files: dotenv files and key directories stay unread
-            continue
         if includes and not any(Path(fp.name).match(p) for p in includes):
             continue
         if excludes and any(Path(fp.name).match(p) for p in excludes):
+            continue
+        if sensitive_path(str(fp)):  # the walk lists hidden files: dotenv files and key directories stay unread
             continue
         try:
             text = fp.read_text(encoding="utf-8", errors="replace")
