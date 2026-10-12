@@ -168,7 +168,7 @@ def redact(obj: Any, *, _force: bool = False, _argv: bool = False) -> Any:
         if obj == "":
             return obj
         # not a secret by name or shape: it can still carry one (a URL with ?api_key=, an arg list with --token x)
-        return REDACTED if _force or looks_like_secret(obj) else scrub_urls(scrub_text(obj))
+        return REDACTED if _force or looks_like_secret(obj) else scrub_text(scrub_urls(obj))
     return obj
 
 
