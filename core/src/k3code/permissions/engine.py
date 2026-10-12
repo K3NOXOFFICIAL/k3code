@@ -999,7 +999,7 @@ def suggest_rules(tool: str, dec: Decision) -> list[Rule]:
         # A leading VAR=value is dropped: "always" on `API_KEY=sk-... curl x` wrote the key into config.yaml.
         out: list[Rule] = []
         for p in dict.fromkeys(_drop_assignments(p) for p in dec.patterns):
-            if not p or hardline.is_launcher(p) or p.split()[0] in hardline.RESERVED_WORDS:
+            if not p.strip() or hardline.is_launcher(p) or p.split()[0] in hardline.RESERVED_WORDS:
                 continue
             pattern = exact_rule_pattern(p) if hardline.wildcard_unsafe(p) else f"{p} *"
             if pattern and not _carries_secret(pattern):

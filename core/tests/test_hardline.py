@@ -237,3 +237,10 @@ def test_builtin_git_allows_do_not_cover_lookalike_subcommands_or_external_progr
         assert action(cmd) == "ask", cmd
     for cmd in ("git diff", "git diff --stat", "git log", "git log --oneline -5", "git status", "git status -s"):
         assert action(cmd) == "allow", cmd
+
+
+def test_suggest_rules_skips_a_blank_command_word(tmp_path):
+    # K3NOX-106: `" " ls` has the prefix " ", and `p.split()[0]` raised IndexError, ending the turn
+    d = decide(mode="default", tool="bash", args={"command": '" " ls'}, cwd=tmp_path)
+    assert d.action == "ask"
+    assert suggest_rules("bash", d) == []
