@@ -453,6 +453,12 @@ class FanoutExecutor:
         )
         r = await self._spawn(ctx, st, "reviewer", prompt, f"review: {st.title}"[:60])
         st.review = r.result
+        if r.status != "completed":
+            # a reviewer that died has said nothing: never "pass". Out of tokens ends the subtask (its work stays on its
+            # branch); any other failure leaves the result unreviewed and unmerged
+            if ctx.budget is not None:
+                ctx.budget.stop_if_capped(r)
+            return f"the reviewer did not finish ({r.error or r.status}), so this result was not reviewed"
         verdict = parse_verdict(r.result)
         return r.result if verdict is False else ""
 

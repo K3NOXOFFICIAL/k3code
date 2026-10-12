@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from k3code.agent.loop import AgentLoop
 from k3code.context_budget import compact_threshold, context_window
 from k3code.gateway.server import _estimate_tokens
@@ -137,6 +139,12 @@ def test_the_kept_count_never_falls_below_the_latest_step_and_only_grows_forward
     assert kept_calls(huge, 32_000) == 6  # the model has not seen them yet: the cap, not 1
     assert kept_calls([asst, tool(0, 40_000)], 32_000) == 1  # always one
     assert kept_calls([asst, tool(0, 100)], None) == 6  # no window: the fixed count
+    # a lesson, a loop-guard note or a steering message appended behind the results does not make them old
+    step = [asst, *(tool(i, 40_000) for i in range(3))]
+    assert kept_calls(step, 32_000) == 3
+    assert kept_calls([*step, Message(role="system", content="note")], 32_000) == 3
+    assert kept_calls([*step, Message(role="user", content="stop that")], 32_000) == 3
+    assert kept_calls([*step, asst, Message(role="user", content="next")], 32_000) == 1  # a later step: only the budget
     # boundary of the oldest kept result never moves back as results are appended
     msgs: list[Message] = []
     boundary = 0
@@ -145,6 +153,22 @@ def test_the_kept_count_never_falls_below_the_latest_step_and_only_grows_forward
         oldest_kept = len([m for m in msgs if m.role == "tool"]) - kept_calls(msgs, 30_000)
         assert oldest_kept >= boundary
         boundary = oldest_kept
+
+
+def test_a_result_the_session_elided_stays_elided_when_a_larger_window_keeps_more_whole():
+    from k3code.context_budget import elide_old_results
+
+    msgs = []
+    for i in range(10):
+        msgs += [
+            Message(role="assistant", content=None),
+            Message(role="tool", content=f"file {i} " + "o" * 4000, tool_call_id=f"c{i}", name="read"),
+        ]
+    elided: set[str] = set()
+    small = elide_old_results(msgs, over=True, elided=elided, window=8_000)  # keeps one result whole
+    assert [m.content.startswith("[earlier") for m in small if m.role == "tool"].count(True) == 9
+    big = elide_old_results(msgs, over=False, elided=elided, window=200_000)  # the same session, a bigger model
+    assert all(m.content.startswith("[earlier") for m in big if m.role == "tool" and m.tool_call_id != "c9")
 
 
 def test_results_of_a_few_hundred_chars_are_elided_too():
@@ -228,3 +252,84 @@ async def test_the_active_model_honours_tiers_main(tmp_path, monkeypatch):
     server.config.default_model = "default"
     assert server._active_model(live) == "tier-main-model"
     await server.close()
+
+
+# ── arguments that are elsewhere by now ───────────────────────────────────────────────────────────────────────────
+
+
+def _call_message(i: int, name: str, args: dict) -> Message:
+    return Message(role="assistant", content=None, tool_calls=[ToolCall(id=f"k{i}", name=name, arguments=args)])
+
+
+def _result(i: int, name: str, text: str = "ok") -> Message:
+    return Message(role="tool", content=text, tool_call_id=f"k{i}", name=name)
+
+
+def test_a_cut_off_calls_half_written_arguments_do_not_ride_along_in_every_request():
+    from k3code.context_budget import CUT_CALL_KEEP_CHARS, shrink_cut_calls
+
+    cut = Message(
+        role="assistant",
+        content=None,
+        tool_calls=[ToolCall(id="c1", name="write", arguments={"_unparsed": "x" * 30_000}, raw_arguments="y" * 30_000)],
+    )
+    ok = Message(
+        role="assistant", content=None, tool_calls=[ToolCall(id="c2", name="bash", arguments={"command": "ls"})]
+    )
+    out = shrink_cut_calls([cut, ok])
+    shown = out[0].tool_calls[0]
+    assert (
+        len(shown.arguments["_unparsed"]) < CUT_CALL_KEEP_CHARS + 40
+        and "cut off: 30000 chars" in shown.arguments["_unparsed"]
+    )
+    assert shown.raw_arguments is None and out[1] is ok
+    assert cut.tool_calls[0].arguments["_unparsed"] == "x" * 30_000, "the stored message keeps all of it"
+    plain = [ok]
+    assert shrink_cut_calls(plain) is plain
+
+
+def test_superseded_todo_lists_are_elided_but_the_newest_stays():
+    from k3code.context_budget import elide_old_results
+
+    def todos(n: int) -> dict:
+        return {"todos": [{"content": f"step {i} " + "d" * 40, "status": "pending"} for i in range(n)]}
+
+    msgs: list[Message] = []
+    for i in range(10):
+        msgs += [_call_message(i, "todo", todos(10)), _result(i, "todo")]
+    out = elide_old_results(msgs, over=True, elided=set(), window=None)
+    args = [m.tool_calls[0].arguments["todos"] for m in out if m.role == "assistant"]
+    assert all(isinstance(a, str) and a.startswith("[a list of 10 items") for a in args[:4]), args[:4]  # old steps
+    assert isinstance(args[-1], list), "the newest list is the one the model works from"
+
+
+@pytest.mark.parametrize(
+    ("command", "elided"),
+    [
+        ("cat > app.py <<'EOF'\n" + "print(1)\n" * 60 + "EOF", True),
+        ("cat <<EOF >> notes.md\n" + "line\n" * 80 + "EOF", True),
+        ("tee out.txt <<'X'\n" + "line\n" * 80 + "X", True),
+        ("python - <<'EOF'\n" + "print(1)\n" * 60 + "EOF", False),  # a script that is not on disk
+        ("python - <<'EOF' 2>/dev/null\n" + "print(1)\n" * 60 + "EOF", False),
+        ("cat > app.py <<'EOF'\nprint(1)\nEOF", False),  # small
+    ],
+)
+def test_heredoc_text_a_bash_command_wrote_to_a_file_is_elided_from_old_calls(command, elided):
+    from k3code.context_budget import elide_old_results
+
+    msgs: list[Message] = []
+    for i in range(9):
+        msgs += [_call_message(i, "bash", {"command": command if i == 0 else f"echo {i}"}), _result(i, "bash")]
+    out = elide_old_results(msgs, over=True, elided=set(), window=None)
+    first = out[0].tool_calls[0].arguments["command"]
+    assert first != command if elided else first == command
+    if elided:
+        assert first.splitlines()[0] == command.splitlines()[0] and "they are in the file now" in first
+
+
+def test_at_most_six_of_the_newest_results_are_protected_whatever_the_window():
+    from k3code.context_budget import ELIDE_KEEP_CALLS, kept_calls
+
+    asst = Message(role="assistant", content=None)
+    many = [asst, *(Message(role="tool", content="x", tool_call_id=f"t{i}", name="read") for i in range(30))]
+    assert kept_calls(many, 10_000_000) == ELIDE_KEEP_CALLS == 6

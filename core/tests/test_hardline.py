@@ -54,6 +54,9 @@ def test_hardline_denied(command: str) -> None:
         "systemctl --user restart app",
         "dd if=/dev/zero of=image.bin bs=1M count=10",
         "print report.env.txt",
+        "find ~ -name '*.pyc' -delete",
+        "find ~/project -type f -delete",
+        "find . -delete",
     ],
 )
 def test_hardline_allowed(command: str) -> None:

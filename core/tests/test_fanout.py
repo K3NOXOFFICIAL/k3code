@@ -442,3 +442,45 @@ def test_the_plans_steps_beat_the_classifiers_suggestions_when_there_are_two_ind
         "build the api",
         "build the ui",
     ]
+
+
+async def test_a_reviewer_that_died_never_counts_as_a_pass():
+    """A reviewer stopped by the ultracode token cap said nothing: the worker's result was merged as if it passed (and a
+    reviewer that had written `VERDICT: fail` before the stop was lost)."""
+    from types import SimpleNamespace
+
+    from k3code.autonomy.fanout import FanoutExecutor, Subtask
+    from k3code.subagents.budget import CAP_ERROR, AgentBudget, BudgetStop
+    from k3code.subagents.runner import Handle
+
+    def handle(status: str, error: str = "", result: str = "") -> Handle:
+        h = Handle(id="r", description="d", agent_type="reviewer", tier="main", depth=1, parent_sid="s")
+        h.status, h.error, h.result = status, error, result
+        return h
+
+    ex = FanoutExecutor.__new__(FanoutExecutor)
+    ex.progress = lambda *a, **k: None  # type: ignore[method-assign]
+    ctx = SimpleNamespace(plan="", budget=AgentBudget(max_agents=9, max_tokens=1000))
+    st = Subtask(id="t1", title="add files")
+    worker_done = handle("completed", result="done")
+    worker_done.diff = worker_done.diff_stat = ""
+
+    async def spawn_returning(h: Handle):
+        async def spawn(*args, **kwargs):
+            return h
+
+        ex._spawn = spawn  # type: ignore[method-assign]
+
+    await spawn_returning(handle("failed", f"{CAP_ERROR}: 1700 > 1000"))
+    with pytest.raises(BudgetStop) as stop:
+        await ex._review(ctx, st, worker_done)
+    assert stop.value.kind == "tokens"
+
+    await spawn_returning(handle("failed", "provider exploded"))
+    problem = await ex._review(ctx, st, worker_done)
+    assert "did not finish" in problem and "provider exploded" in problem, "unreviewed work is not a pass"
+
+    await spawn_returning(handle("completed", result="all good. VERDICT: pass"))
+    assert await ex._review(ctx, st, worker_done) == ""
+    await spawn_returning(handle("completed", result="broken. VERDICT: fail"))
+    assert "VERDICT: fail" in await ex._review(ctx, st, worker_done)

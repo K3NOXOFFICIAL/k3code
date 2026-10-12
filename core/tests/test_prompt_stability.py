@@ -75,3 +75,38 @@ async def test_exit_plan_outside_plan_mode_says_so(tmp_path):
     loop = loop_with(tmp_path, plan_callback=_approve)
     result = await loop._exit_plan({"plan": "do it"})
     assert result == {"error": "exit_plan is only available in plan mode"}
+
+
+async def test_moving_the_workspace_shows_the_new_projects_notes_not_the_old_ones(tmp_path, monkeypatch):
+    from m1cmd_helpers import rpc
+
+    a, b = tmp_path / "projA", tmp_path / "projB"
+    a.mkdir()
+    b.mkdir()
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    live = server.live[await new_session(server, a)]
+    write_learned(a, ["A-NOTE: the tests live in tests/unit"])
+    write_learned(b, ["B-NOTE: run make check"])
+    assert "A-NOTE" in server._system_prompt_for(live)
+    await rpc(server, "session.workspace.move", {"path": str(b)})
+    prompt = server._system_prompt_for(live)
+    assert "B-NOTE" in prompt and "A-NOTE" not in prompt
+    await server.close()
+
+
+async def test_what_other_sessions_and_background_writers_change_does_not_reach_a_live_prompt(tmp_path, monkeypatch):
+    from k3code import memory as memory_mod
+
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    live = server.live[await new_session(server, tmp_path)]
+    user_file = memory_mod.user_memory_path()
+    user_file.parent.mkdir(parents=True, exist_ok=True)
+    user_file.write_text("- I like short answers\n")
+    first = server._system_prompt_for(live)
+    assert "I like short answers" in first
+    # the daily distill (run by another session) rewrites USER.md; a stack re-scan and an accepted gotcha land too
+    user_file.write_text("- I like short answers\n\n## Learned preferences (auto)\n- rolls back changes often\n")
+    assert server._system_prompt_for(live) == first, "byte-identical: the provider keeps the conversation cached"
+    live.refresh_prompt_inputs()  # a compaction, /clear or a move to another project
+    assert "rolls back changes often" in server._system_prompt_for(live)
+    await server.close()

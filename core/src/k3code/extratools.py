@@ -99,7 +99,9 @@ def register_mcp_tools(reg: ToolRegistry, mcp: McpManager) -> None:
         hits = mcp.search(query)
         reg.activate([t.qualified for t in hits])
         if not hits:
-            return {"content": "No matching MCP tools."}
+            servers = sorted({t.server for t in mcp.tools()}) if hasattr(mcp, "tools") else []
+            seen = f" Servers connected: {', '.join(servers)}." if servers else " No MCP server is connected."
+            return {"content": f"No matching MCP tools.{seen}"}
         # the schemas and descriptions reach the model through the tool list from the next step on: repeating them here
         # doubled their tokens (about 900 for six tools with ordinary descriptions), so the result names each tool with
         # its arguments

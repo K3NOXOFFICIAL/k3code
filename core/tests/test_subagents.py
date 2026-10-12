@@ -217,7 +217,9 @@ async def test_worktree_outside_git_repo_shares_cwd(tmp_path, monkeypatch):
     server = make(tmp_path, monkeypatch, steps, **NO_GATE)
     await start(server, tmp_path)
     await run_turn(server, "PARENT")
-    assert last_tool_result(server) == "no repo"
+    result = last_tool_result(server)
+    assert result.startswith("no repo")
+    assert "[isolation] worktree isolation was requested" in result and "is not a git repository" in result
 
 
 @pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
@@ -499,8 +501,12 @@ async def test_finished_background_children_are_reported_once_at_the_next_turn(t
     polled.reported = True  # the model already read it with task_result
     child("sa-6", "completed", background=True, parent_child_id="sa-1")  # a grandchild: its parent reads it
 
-    note = server._finished_background_note(live)
+    note, handles = server._finished_background_note(live)
     assert "sa-1 (completed): result of sa-1" in note and "sa-2 (failed): boom" in note
     assert not any(h in note for h in ("sa-3", "sa-4", "sa-5", "sa-6"))
-    assert server._finished_background_note(live) == "", "shown once"
+    assert [h.id for h in handles] == ["sa-1", "sa-2"]
+    assert server._finished_background_note(live)[0] == note, "shown until the model has answered the prompt it is in"
+    for h in handles:  # what the turn does once the model answered
+        h.reported = True
+    assert server._finished_background_note(live) == ("", []), "shown once"
     await server.close()

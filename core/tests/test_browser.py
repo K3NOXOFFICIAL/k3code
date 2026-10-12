@@ -253,11 +253,25 @@ async def test_the_agent_browse_tool_reports_stops_and_missing_playwright(monkey
     def missing():
         raise BrowserUnavailable(b.INSTALL_HINT)
 
+    import importlib.util
+
     monkeypatch.setattr(b, "playwright_module", missing)
+    real_find_spec = importlib.util.find_spec
+    # the package is importable (so the tool is offered) but the import itself fails: the call says why
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name, *a: object() if name == "playwright" else real_find_spec(name, *a)
+    )
     reg = _Registry()
     register_web_tools(reg, SimpleNamespace(research={}), browser=BrowserManager(challenge_wait=0))
     out = await reg.handlers["web_browse"]({"url": "https://ok.test/a"})
     assert "unavailable" in out["error"] and "playwright" in out["error"].lower()
+    # no Playwright installed: the tool is not offered at all (its schema would cost tokens on every request)
+    monkeypatch.setattr(
+        importlib.util, "find_spec", lambda name, *a: None if name == "playwright" else real_find_spec(name, *a)
+    )
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}), browser=BrowserManager(challenge_wait=0))
+    assert "web_browse" not in reg.handlers and "web_fetch" in reg.handlers
 
 
 @respx.mock

@@ -60,6 +60,20 @@ async def test_an_earlier_summary_is_shown_whole_to_the_next_one():
     assert "NEXT STEP: run the migration" in caller.calls[0][1].content
 
 
+async def test_a_long_first_prompt_does_not_push_the_earlier_summary_out_of_the_next_summarizers_input():
+    first = "context dump " + "z" * 40_000 + " FINAL REQUIREMENT: keep the public API unchanged"
+    msgs = [{"role": "user", "content": first}, *filler(12)]
+    new, folded = await compact_messages(FakeCaller("DECISION-ALPHA: use the sqlite backend"), msgs, keep=4)
+    assert folded > 0 and len(new[0]["content"]) > 8_000  # the anchor alone is bigger than the summarizer's head
+
+    second = FakeCaller("DECISION-ALPHA and DECISION-BETA")
+    await compact_messages(second, [*new, *filler(100, tool="r" * 900)], keep=4)
+    seen = second.calls[0][1].content
+    assert "DECISION-ALPHA: use the sqlite backend" in seen, "the first summary reaches the second one"
+    assert "FINAL REQUIREMENT" in seen, "and the gist of the task is still shown, the rest is kept verbatim"
+    assert len(seen) < 60_000 + 200
+
+
 # ── the todo list ─────────────────────────────────────────────────────────────────────────────────────────────────
 
 TODOS = [
@@ -164,11 +178,69 @@ async def test_a_second_review_summarizes_only_what_is_new_since_the_first():
     # a conversation that does not start the same way is summarized from its own start
     other = [{"role": "user", "content": "something else entirely " + "z" * 400}] + convo(14)[1:]
     await condensed_context(FakeCaller("S"), other, threshold=2000, memo=memo)
-    caller3 = FakeCaller("S3")
-    await condensed_context(caller3, other, threshold=2000, memo={"n": 4, "sig": "stale", "summary": "old"})
-    assert "[summary so far]" not in caller3.calls[0][1].content
+    # short messages, so the "[summary so far]" prefix survives the cut to the last 4000 characters: only the signature
+    # check can keep a memo of another conversation out
+    short = [{"role": r, "content": f"{r} {i}"} for i in range(12) for r in ("user", "assistant")]
+    stale = FakeCaller("S3")
+    await condensed_context(stale, short, threshold=300, memo={"n": 4, "sig": "stale", "summary": "OLDSUMMARY"})
+    assert "OLDSUMMARY" not in stale.calls[0][1].content
+    fresh_memo: dict = {}
+    first = FakeCaller("COVERED")
+    await condensed_context(first, short[:20], threshold=300, memo=fresh_memo)
+    again = FakeCaller("S4")
+    await condensed_context(again, short, threshold=300, memo=fresh_memo)
+    assert "[summary so far]\nCOVERED" in again.calls[0][1].content, "a memo of this conversation is used"
 
     # no memo: as before
     caller4 = FakeCaller("S4")
     await condensed_context(caller4, convo(10), threshold=2000)
     assert "[summary so far]" not in caller4.calls[0][1].content
+
+
+async def test_an_empty_summary_is_not_remembered_as_covering_the_messages_it_failed_to_summarize():
+    from k3code.autonomy.advisor import condensed_context
+
+    convo = [
+        m
+        for i in range(14)
+        for m in (
+            {"role": "user", "content": f"ask {i} " + "q" * 300},
+            {"role": "assistant", "content": f"did {i} " + "a" * 300},
+        )
+    ]
+    caller = FakeCaller("", "SUMMARY")  # a reasoning model that spent its budget without writing
+    memo: dict = {}
+    text = await condensed_context(caller, convo, threshold=2000, memo=memo)
+    assert memo == {}, "nothing was summarized, so nothing is covered"
+    assert "ask 13" in text, "the review still gets a hard-truncated transcript"
+    await condensed_context(caller, convo, threshold=2000, memo=memo)
+    assert "[summary so far]" not in caller.calls[1][1].content, "the second call summarizes from the start"
+    assert memo["summary"] == "SUMMARY"
+
+
+async def test_a_read_pointer_whose_result_was_folded_is_reworded_and_one_that_is_still_there_is_kept():
+    from k3code.context_budget import POINTER_CALL_RE, read_pointer
+
+    assert POINTER_CALL_RE.match(read_pointer(3, "call_9")).group(1) == "call_9"
+
+    def step(i: int, content: str) -> list[dict]:
+        return [
+            {"role": "assistant", "content": None, "tool_calls": [{"id": f"r{i}", "name": "read", "arguments": {}}]},
+            {"role": "tool", "name": "read", "tool_call_id": f"r{i}", "content": content},
+        ]
+
+    msgs = [
+        {"role": "user", "content": "first task"},
+        *step(1, "     1\tSECRET_MARKER " + "x" * 600),
+        *filler(10),
+        {"role": "user", "content": "look again"},
+        *step(2, read_pointer(1, "r1")),  # points at the folded read
+        *step(3, "     1\tfresh read " + "y" * 600),
+        *step(4, read_pointer(2, "r3")),  # points at a result that is still in the history
+        {"role": "assistant", "content": "done"},
+    ]
+    new, folded = await compact_messages(FakeCaller("summary"), msgs, keep=7)
+    assert folded > 0
+    kept = {m["tool_call_id"]: m["content"] for m in new if m.get("role") == "tool"}
+    assert "r1" not in kept and "above still holds" not in kept["r2"] and "summary above" in kept["r2"]
+    assert kept["r4"].startswith("[unchanged since the read at step 2 (call r3)")

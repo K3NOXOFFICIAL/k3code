@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -209,8 +210,9 @@ def message_tokens(messages: Sequence[Message]) -> int:
 
 def kept_calls(messages: Sequence[Message], window: int | None = None) -> int:
     """How many of the newest tool results stay whole: ELIDE_KEEP_CALLS, fewer when the newest ones already weigh
-    ELIDE_KEEP_SHARE of ``window``. Never fewer than the results of the latest step (the model has not seen them yet)
-    and never fewer than one. The count only grows as results are appended, so a result once elided stays elided."""
+    ELIDE_KEEP_SHARE of ``window``. Never fewer than the results of the latest step (the model has not seen them yet;
+    up to ELIDE_KEEP_CALLS of them) and never fewer than one. The count only grows as results are appended, so a result
+    once elided stays elided."""
     if not window:
         return ELIDE_KEEP_CALLS
     budget = window * ELIDE_KEEP_SHARE
@@ -222,12 +224,26 @@ def kept_calls(messages: Sequence[Message], window: int | None = None) -> int:
         if used > budget or kept >= ELIDE_KEEP_CALLS:
             break
         kept += 1
+    # the results after the last assistant message; a lesson, a loop-guard note or a steering message the loop appends
+    # behind them does not make them old
     trailing = 0
     for m in reversed(messages):
-        if m.role != "tool":
+        if m.role == "assistant":
             break
-        trailing += 1
+        trailing += m.role == "tool"
     return max(kept, min(trailing, ELIDE_KEEP_CALLS), 1)
+
+
+def read_pointer(step: int, call_id: str) -> str:
+    """What a repeated read of an unchanged file answers: a pointer to the earlier result in the conversation."""
+    return (
+        f"[unchanged since the read at step {step} (call {call_id}): same path, size and modification time; "
+        "that result above still holds]"
+    )
+
+
+#: The call id a read pointer points at.
+POINTER_CALL_RE = re.compile(r"^\[unchanged since the read at step \d+ \(call ([^)]+)\)")
 
 
 def elide_marker(name: str | None, chars: int) -> str:
@@ -275,16 +291,21 @@ def elide_old_results(
     kept = kept_calls(messages, window)
     old = set(tool_idx[:-kept]) if len(tool_idx) > kept else set()
     old_calls = {messages[i].tool_call_id for i in old}
+    newest_todo = next(
+        (tc.id for m in reversed(messages) if m.role == "assistant" for tc in m.tool_calls if tc.name == "todo"), None
+    )
     out: list[Message] = []
     for i, m in enumerate(messages):
-        candidate = i in old and m.tool_call_id not in keep and bool(m.content)
+        # a result once elided stays elided wherever it now sits: a larger window (a /model switch) keeps more of the
+        # newest results whole, but must not show the ones the session already elided again
+        candidate = (i in old or m.tool_call_id in elided) and m.tool_call_id not in keep and bool(m.content)
         if candidate and (m.tool_call_id in elided or (over and len(m.content or "") > ELIDE_MIN_CHARS)):
             elided.add(m.tool_call_id or "")
             marker = elide_marker(m.name, len(m.content or ""))
             note = (notes or {}).get(m.tool_call_id or "")
             m = dataclasses.replace(m, content=f"{marker}\nStill relevant: {note}" if note else marker)
         elif m.role == "assistant" and m.tool_calls:
-            m = _elide_written_text(m, old_calls, over=over, elided=elided)
+            m = _elide_written_text(m, old_calls, over=over, elided=elided, newest_todo=newest_todo)
         out.append(m)
     return out
 
@@ -293,30 +314,95 @@ def elide_old_results(
 _FILE_TEXT_ARGS = {"write": ("content",), "edit": ("old_string", "new_string")}
 
 
+#: Of the arguments of a call cut off at the output limit (they never parsed), the model is sent this many characters.
+CUT_CALL_KEEP_CHARS = 200
+
+
+def shrink_cut_calls(messages: list[Message]) -> list[Message]:
+    """``messages`` with the raw arguments of unparsed (cut-off) tool calls reduced to their start. The call is
+    answered with an error and never runs, yet its whole half-written text (a 32 KB ``write``: ~8k tokens) rode along
+    in every later request. The call has not been on the wire before its error result goes out, so even the first
+    request that carries it sends the short form (nothing cached is rewritten)."""
+    out = messages
+    for i, m in enumerate(messages):
+        if m.role != "assistant" or not m.tool_calls:
+            continue
+        calls, changed = [], False
+        for tc in m.tool_calls:
+            raw = tc.arguments.get("_unparsed") if isinstance(tc.arguments, dict) else None
+            if isinstance(raw, str) and len(raw) > 2 * CUT_CALL_KEEP_CHARS:
+                short = f"{raw[:CUT_CALL_KEEP_CHARS]}…[cut off: {len(raw)} chars]"
+                tc, changed = dataclasses.replace(tc, arguments={"_unparsed": short}, raw_arguments=None), True
+            calls.append(tc)
+        if changed:
+            if out is messages:
+                out = list(messages)
+            out[i] = dataclasses.replace(m, tool_calls=calls)
+    return out
+
+
 def _call_chars(tc: ToolCall) -> int:
     return sum(len(str(tc.arguments.get(k) or "")) for k in _FILE_TEXT_ARGS.get(tc.name, ()))
 
 
-def _elide_written_text(m: Message, old_calls: set[str | None], *, over: bool, elided: set[str]) -> Message:
-    """``m`` with the file text of its old ``write``/``edit`` calls replaced by a marker. The whole file stayed in the
-    request as the call's argument long after the result was elided (ten writes of an 8 KB file: 22 000 tokens,
-    resent every step); it is on disk and the model can read it again. Decided together with the results above, so the
-    request changes at the same moments, and a call once elided stays elided."""
-    calls = list(m.tool_calls)
-    changed = False
-    for j, tc in enumerate(calls):
-        keys = _FILE_TEXT_ARGS.get(tc.name)
-        if not keys or tc.id not in old_calls:
-            continue
-        key = f"args:{tc.id}"  # not the id itself: that one marks the call's *result* as elided
-        if key not in elided and not (over and _call_chars(tc) > ELIDE_MIN_CHARS):
-            continue
-        args = {
+#: A shell command that writes the text of a heredoc to a file: the first line has ``<<`` and a redirect (or tee) to a
+#: path that is not /dev/ or an fd. A ``python - <<EOF`` script is not on disk, so it is not matched.
+_HEREDOC_TO_FILE = re.compile(r"<<-?\s*['\"]?\w+['\"]?.*?(?:>>?|\btee\b(?:\s+-a)?)\s*(?!/dev/|&)[\w./~$\"'-]+")
+_HEREDOC_TO_FILE_BEFORE = re.compile(r"(?:>>?|\btee\b(?:\s+-a)?)\s*(?!/dev/|&)[\w./~$\"'-]+.*?<<-?\s*['\"]?\w+['\"]?")
+
+
+def _heredoc_first_line(command: str) -> str | None:
+    """The first line of ``command`` when it writes a heredoc to a file (the rest is the file's text), else None."""
+    first, sep, _ = command.partition("\n")
+    if not sep or not (_HEREDOC_TO_FILE.search(first) or _HEREDOC_TO_FILE_BEFORE.search(first)):
+        return None
+    return first
+
+
+def _shrunk_arguments(tc: ToolCall, newest_todo: str | None) -> dict[str, Any] | None:
+    """``tc``'s arguments with the text that is elsewhere by now replaced by a marker, or None when there is none worth
+    replacing: the file text of a ``write``/``edit``, the text of a heredoc a ``bash`` command wrote to a file, and a
+    ``todo`` list a later call replaced (the tool takes the whole list every time)."""
+    args = tc.arguments
+    if keys := _FILE_TEXT_ARGS.get(tc.name):
+        if _call_chars(tc) <= ELIDE_MIN_CHARS:
+            return None
+        return {
             k: (
                 f"[{len(str(v))} chars elided: they are in the file now — read it if you need them]" if k in keys else v
             )
-            for k, v in tc.arguments.items()
+            for k, v in args.items()
         }
+    if tc.name == "todo" and tc.id != newest_todo:
+        todos = args.get("todos")
+        if isinstance(todos, list) and len(json.dumps(todos)) > ELIDE_MIN_CHARS:
+            return {**args, "todos": f"[a list of {len(todos)} items, replaced by a later todo call]"}
+    command = args.get("command") if tc.name == "bash" else None
+    first = _heredoc_first_line(command) if isinstance(command, str) and len(command) > ELIDE_MIN_CHARS else None
+    if first is not None:
+        left = len(str(command)) - len(first)
+        return {**args, "command": f"{first}\n[{left} chars of text elided: they are in the file now — read it]"}
+    return None
+
+
+def _elide_written_text(
+    m: Message, old_calls: set[str | None], *, over: bool, elided: set[str], newest_todo: str | None = None
+) -> Message:
+    """``m`` with the text of its old calls replaced by a marker where it is somewhere else by now (see
+    _shrunk_arguments). The whole file stayed in the request as the call's argument long after the result was elided
+    (ten writes of an 8 KB file: 22 000 tokens, resent every step); it is on disk and the model can read it again.
+    Decided together with the results above, so the request changes at the same moments, and a call once elided stays
+    elided."""
+    calls = list(m.tool_calls)
+    changed = False
+    for j, tc in enumerate(calls):
+        if tc.id not in old_calls:
+            continue
+        key = f"args:{tc.id}"  # not the id itself: that one marks the call's *result* as elided
+        if key not in elided and not over:
+            continue
+        if (args := _shrunk_arguments(tc, newest_todo)) is None:
+            continue
         calls[j] = dataclasses.replace(tc, arguments=args, raw_arguments=None)
         elided.add(key)
         changed = True

@@ -44,3 +44,16 @@ async def test_after_a_clear_the_file_is_read_in_full_again(tmp_path, monkeypatc
     await call(server, "slash.exec", {"command": "clear"})
     await run_turn(server, "read data.txt once more")
     assert "line one" in tool_results(server)[-1], "no pointer to a result the clear removed"
+
+
+async def test_after_an_undo_the_file_is_read_in_full_again(tmp_path, monkeypatch):
+    """/undo rewinds the history without clearing the read bookkeeping: no pointer to a removed result may go out."""
+    server = await start(tmp_path, monkeypatch)
+    await run_turn(server, "read data.txt")
+    await run_turn(server, "read data.txt again")
+    assert tool_results(server)[1].startswith("[unchanged since the read")
+    await call(server, "session.undo", {})
+    await call(server, "session.undo", {})  # both turns are gone: the first result is no longer in the conversation
+    assert tool_results(server) == []
+    await run_turn(server, "read data.txt a third time")
+    assert "line one" in tool_results(server)[-1], "the model has never seen the content in this conversation"

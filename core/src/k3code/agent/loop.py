@@ -31,7 +31,7 @@ from k3code.tools import (
     clip_tool_results,
     format_tool_result,
 )
-from k3code.tools.validate import drop_null_options, invalid_arguments
+from k3code.tools.validate import LEGACY_ARGUMENTS, invalid_arguments, normalize_arguments
 from k3code.userhooks import HookOutcome, HookRunner
 
 CUT_OFF_CONTINUE = (
@@ -40,6 +40,9 @@ CUT_OFF_CONTINUE = (
 )
 #: the most a reply that spent its whole output limit on reasoning is retried with
 MAX_WIDENED_TOKENS = 32768
+#: failed calls the stop message can list (a run of failures can be longer)
+MAX_LISTED_FAILURES = 50
+LOOP_GUARD_NOT_RUN = "Error: not run. The loop guard stopped this call: the same call had already been made repeatedly."
 CUT_OFF_CALL = (
     "Your reply hit the output token limit before this call's arguments were complete, so it did not run. "
     "Re-send it; split large content (a long file, a big edit) into several smaller calls."
@@ -135,6 +138,7 @@ class AgentLoop:
         self._last_request: tuple[list[Message], list[Any]] | None = None  # what the model call in flight was sent
         #: the consecutive failed calls behind _tool_errors: (call, first error line), listed when the turn stops
         self._failed: list[tuple[str, str]] = []
+        self.failed_calls = 0  # how many calls that was (only the last MAX_LISTED_FAILURES are kept in the list)
         #: end a tool-error stop with an assistant message listing the failures (off when a higher tier continues)
         self.tool_error_stop_message = True
         #: called after every tool call with (call, result, failure or None); the gateway's learning hub records
@@ -270,6 +274,7 @@ class AgentLoop:
             self._elided, self._notes = set(), {}
         # an earlier run's failed calls must not count toward (or be listed in) this run's tool-error stop
         self._tool_errors, self._failed, self._truncated, self._continuations = 0, [], set(), 0
+        self.failed_calls = 0
         self._widened = False
         if self.context_window:
             # the reply shares the window with the prompt: a cap above a quarter of it leaves windows below ~32k
@@ -416,14 +421,24 @@ class AgentLoop:
                         # nudge three times over cost three more full replies and still ended with nothing)
                         messages.pop()
                         self.reliability.save_transcript(messages)
-                        if not self._widened and max_tokens < MAX_WIDENED_TOKENS:
+                        # the clamp of run(): the reply shares the window with the prompt, so a retry above a quarter of
+                        # it can be refused outright (a 32k window asked for 16k next to an 18k prompt)
+                        ceiling = MAX_WIDENED_TOKENS
+                        if self.context_window:
+                            ceiling = min(ceiling, max(1024, self.context_window // 4))
+                        if not self._widened and max_tokens < ceiling:
                             self._widened = True
-                            max_tokens = min(max_tokens * 2, MAX_WIDENED_TOKENS)
+                            max_tokens = min(max_tokens * 2, ceiling)
                             logger.info("Reply used the whole output limit without text: retrying with %d", max_tokens)
                             continue
+                        advice = (
+                            "Lower /effort, split the request, or use a model with a larger context window."
+                            if max_tokens >= ceiling < MAX_WIDENED_TOKENS
+                            else "Raise max_tokens in the config, lower /effort, or split the request."
+                        )
                         note = (
                             f"[The model used its whole {max_tokens}-token output limit before writing an answer. "
-                            "Raise max_tokens in the config, lower /effort, or split the request.]"
+                            f"{advice}]"
                         )
                         final_message = Message(role="assistant", content=note, usage=final_message.usage)
                         messages.append(final_message)
@@ -458,6 +473,10 @@ class AgentLoop:
             notes: list[Message] = []
             stop = await self._guard_tool_calls(tool_calls, notes)
             if stop:
+                # none of this reply's calls ran: say so in the history (a call with no result is labelled "may have
+                # run" on the next turn, which is false, and breaks the prefix the provider has cached)
+                for tc in tool_calls:
+                    messages.append(Message(role="tool", content=LOOP_GUARD_NOT_RUN, tool_call_id=tc.id, name=tc.name))
                 for stop_event in self._stop_for_input(messages):
                     yield stop_event
                 return
@@ -500,9 +519,10 @@ class AgentLoop:
             if reply and all(failed for _, failed, _ in reply):
                 self._tool_errors += 1
                 self._failed.extend((describe_call(tc.name, tc.arguments), line) for tc, _, line in reply)
-                del self._failed[:-50]
+                self.failed_calls += len(reply)
+                del self._failed[:-MAX_LISTED_FAILURES]
             else:
-                self._tool_errors, self._failed = 0, []
+                self._tool_errors, self._failed, self.failed_calls = 0, [], 0
             if self.max_tool_errors and self._tool_errors >= self.max_tool_errors:
                 self.escalation_reason = "tool_errors"
                 if self.tool_error_stop_message:
@@ -592,7 +612,7 @@ class AgentLoop:
 
     def _plain_allow(self, tc: ToolCall) -> bool:
         spec = self.tools.get(tc.name)[0]
-        args = drop_null_options(tc.arguments, spec.parameters)
+        args = normalize_arguments(tc.name, tc.arguments, spec.parameters)
         if invalid_arguments(tc.name, spec.parameters, args) is not None:
             return True  # answered with an error before any permission check
         return self.permissions.decide(tc.name, args, headless=self.headless).action == "allow"
@@ -617,7 +637,7 @@ class AgentLoop:
             listed = ", ".join(names[:40]) + (f", … ({len(names)} in all)" if len(names) > 40 else "")
             return {"error": f"Unknown tool: {tool_call.name}. The tools are: {listed}"}
 
-        args = drop_null_options(tool_call.arguments, spec.parameters)
+        args = normalize_arguments(tool_call.name, tool_call.arguments, spec.parameters)
         if tool_call.name == EXIT_PLAN_TOOL:
             return await self._exit_plan(args)
         # before the permission prompt: a call the handler cannot run is not worth an approval
@@ -649,10 +669,7 @@ class AgentLoop:
         ):
             step, call_id = seen
             self._pinned.add(call_id)  # the earlier result must stay in the requests: this one points at it
-            return {
-                "content": f"[unchanged since the read at step {step} (call {call_id}): same path, size and "
-                "modification time; that result above still holds]"
-            }
+            return {"content": context_budget.read_pointer(step, call_id)}
         # M2: fsync a journal intent before the tool runs.
         self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
         try:
@@ -707,7 +724,7 @@ class AgentLoop:
         try:
             path = _resolve_path(str(args.get("path", "")), self.cwd)
             st = path.stat()
-        except (OSError, ValueError):
+        except (OSError, ValueError, RuntimeError):  # RuntimeError: "~user" with no such user
             return None
         window = tuple(args.get(k) for k in ("offset", "limit", "start", "end"))
         return (str(path), st.st_mtime_ns, st.st_size, window)
@@ -715,7 +732,9 @@ class AgentLoop:
     async def _request_messages(self, messages: list[Message], specs: list[Any]) -> list[Message]:
         """What the provider is sent: long tool results clipped, and once the request passes ``elide_at_ratio`` of the
         context window, old tool results elided. ``messages`` (transcript, session) keeps every full result."""
-        wire = clip_tool_results(messages, self.tool_output_chars or MAX_TOOL_RESULT_CHARS)
+        wire = context_budget.shrink_cut_calls(
+            clip_tool_results(messages, self.tool_output_chars or MAX_TOOL_RESULT_CHARS)
+        )
         if not self.context_window:
             return wire
         # Elide in batches, because every elision rewrites the request from that message on (the provider's prompt
@@ -937,7 +956,9 @@ class AgentLoop:
         ]
         stop_msg = Message(
             role="assistant",
-            content=f"I stopped because {len(self._failed)} tool calls in a row failed:\n"
+            content=f"I stopped because {self.failed_calls} tool calls in a row failed"
+            + (f" (the last {len(self._failed)} are listed)" if self.failed_calls > len(self._failed) else "")
+            + ":\n"
             + "\n".join(lines)
             + "\nPlease tell me how to proceed (or fix what they need) and I will continue.",
         )
@@ -988,7 +1009,8 @@ def _ignored_arguments(spec: Any, args: dict[str, Any]) -> str:
     if spec.name.startswith("mcp__") or not isinstance(args, dict):
         return ""
     props = (spec.parameters or {}).get("properties") or {}
-    extra = [k for k in args if k not in props and not k.startswith("_")]
+    legacy = LEGACY_ARGUMENTS.get(spec.name, ())
+    extra = [k for k in args if k not in props and k not in legacy and not k.startswith("_")]
     if not extra or not props:
         return ""
     return f"ignored arguments: {', '.join(extra)}; {spec.name} takes: {', '.join(props)}"

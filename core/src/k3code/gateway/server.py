@@ -269,6 +269,12 @@ class LiveSession:
         #: when the prompt is first built, so a note written mid-session does not change the prompt (and make the
         #: provider re-write the whole conversation); None = read them again, as after a compaction or /clear.
         self.learned_notes: list[str] | None = None
+        #: ... and the rest of what background writers change in the prompt (project facts, the user memory file the
+        #: daily distill rewrites, accepted gotchas, the optimizer overlay), taken on the same terms
+        self.prompt_frozen: dict[str, Any] = {}
+        #: model calls a turn already made before a compaction in its middle restarted it (the max_turns cap is the
+        #: user's limit on the task, not on each piece of it)
+        self.turns_carried = 0
         #: The goal reviewer's summary of the conversation so far (autonomy.advisor.condensed_context).
         self.advisor_memo: dict[str, Any] = {}
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
@@ -350,6 +356,12 @@ class LiveSession:
         self.task_kind: str = ""
         #: /go after /ultraplan: {task, plan, path}; consumed by the next turn's scope gate.
         self.preapproved_plan: dict[str, Any] | None = None
+
+    def refresh_prompt_inputs(self) -> None:
+        """Read the learned notes and the other background-written parts of the prompt afresh at the next turn (the
+        conversation is being rewritten anyway: a compaction, /clear, a move to another project)."""
+        self.learned_notes = None
+        self.prompt_frozen.clear()
 
     @property
     def turn_in_flight(self) -> bool:
@@ -1556,13 +1568,18 @@ class GatewayServer:
         assert self._tiers is not None
         return self._tiers
 
-    async def _reliability_for(self, session: LiveSession) -> Reliability:
-        """One Reliability bundle per session: netwatch runs while the session lives, events go to its clients."""
+    def _ensure_reliability(self, session: LiveSession) -> Reliability:
+        """The session's Reliability bundle, built on first use (not started: see _reliability_for)."""
         if session.reliability is None:
             rel = build_reliability(self.config, session=session.session_id, home=self._home())
             rel.price_of = lambda usage: estimate_usd(self.config, usage)  # the USD budgets use real prices
             rel.events.add(lambda e: self._on_reliability_event(session, e), key="gateway")
             session.reliability = rel
+        return session.reliability
+
+    async def _reliability_for(self, session: LiveSession) -> Reliability:
+        """One Reliability bundle per session: netwatch runs while the session lives, events go to its clients."""
+        self._ensure_reliability(session)
         assert self.router is not None
         session.reliability.register_providers(self.router.chain)
         try:
@@ -1760,7 +1777,12 @@ class GatewayServer:
                     # history into a summary, and run the prompt once more.
                     failed_attempt = session.stored.messages
                     session.stored.messages = failed_attempt[:n_before]  # fold the older history only
-                    if not await self._maybe_compact(session, force=True):
+                    try:
+                        folded = await self._maybe_compact(session, force=True)
+                    except BaseException:  # /stop during the summary call: the turn's prompt and tool work stay
+                        session.stored.messages = failed_attempt
+                        raise
+                    if not folded:
                         # nothing could be folded: no retry, and the failed attempt stays in the history
                         session.stored.messages = failed_attempt
                     else:
@@ -1769,9 +1791,14 @@ class GatewayServer:
                             # tools already ran in this turn: keep that work and go on from it. Running the prompt
                             # again threw away every model call and replayed non-idempotent steps (a push, a migration)
                             session.stored.messages = [*session.stored.messages, *failed_attempt[n_before:]]
-                            status, final_text = await self._run_one_turn(
-                                session, prompt, continuation=COMPACTED_CONTINUATION
-                            )
+                            ran = failed_attempt[n_before:]
+                            session.turns_carried = sum(1 for m in ran if m["role"] == "assistant")
+                            try:
+                                status, final_text = await self._run_one_turn(
+                                    session, prompt, continuation=COMPACTED_CONTINUATION
+                                )
+                            finally:
+                                session.turns_carried = 0
                         else:
                             status, final_text = await self._run_one_turn(session, prompt)
                 if status == "error" and isinstance(session.last_exc, ContextOverflow):
@@ -2021,15 +2048,15 @@ class GatewayServer:
         if self.automation is not None:
             self.automation.session_event(session.session_id, status, str(session.stored.meta.get("origin") or ""))
 
-    def _finished_background_note(self, session: LiveSession) -> str:
+    def _finished_background_note(self, session: LiveSession) -> tuple[str, list[Any]]:
         """The background sub-agents (``task(background=true)``) that finished since the model last looked, one line
-        each. Their output was only ever read by a ``task_result`` call the model had to remember to make; their spend
-        was already counted. Shown once."""
+        each (and the handles they came from). Their output was only ever read by a ``task_result`` call the model had
+        to remember to make; their spend was already counted. The handles are marked reported once the model has
+        answered the prompt that carries the note: a prompt dropped by an overflow rerun or a goal retry never
+        reached it."""
         done = self.subagents.unreported(session.session_id)
-        for h in done:
-            h.reported = True
         if not done:
-            return ""
+            return "", []
 
         def outcome(h: Any) -> str:
             text = h.error if h.status == "failed" and h.error else h.result or h.error
@@ -2037,13 +2064,13 @@ class GatewayServer:
 
         lines = [f'- {h.id} ({h.status}): {outcome(h)}  [task_result(id="{h.id}")]' for h in done]
         head = "[Background sub-agents finished since your last turn; read the full result with task_result]"
-        return head + "\n" + "\n".join(lines)
+        return head + "\n" + "\n".join(lines), done
 
     def _charge_side_call(self, session_id: str, usage: Usage) -> None:
         """A one-shot call's usage (see ModelCaller) counts against the session's budgets and the day's ledger."""
         live = self.live.get(session_id)
-        if live is not None and live.reliability is not None:
-            live.reliability.record_usage(usage)
+        if live is not None:  # the bundle may not exist yet: a resumed session's compaction runs before its first turn
+            self._ensure_reliability(live).record_usage(usage)
 
     def _system_prompt_for(self, session: LiveSession) -> str:
         """The session's system prompt, with the learned notes as the session first saw them."""
@@ -2056,6 +2083,7 @@ class GatewayServer:
             session_meta=session.stored.meta,
             mcp=self.mcp,
             learned=session.learned_notes,
+            frozen=session.prompt_frozen,
         )
 
     def _build_loop(
@@ -2074,7 +2102,7 @@ class GatewayServer:
         loop = AgentLoop(
             router,
             system_prompt=self._system_prompt_for(session),
-            max_turns=self.config.max_turns,
+            max_turns=max(1, self.config.max_turns - session.turns_carried) if self.config.max_turns else 0,
             headless=False,
             on_event=self._on_router_event,
             cwd=session.perms.cwd,
@@ -2350,8 +2378,11 @@ class GatewayServer:
                 gate.proceed, gate.message = False, f"Prompt blocked by a UserPromptSubmit hook: {hooked.reason}"
             elif extra := hooked.context_text():
                 prompt = f"{prompt}\n\n" + fenced("context from the user's hooks:", extra)
-            if not hooked.blocked and (finished := self._finished_background_note(session)):
-                prompt = f"{prompt}\n\n{finished}"
+            noted: list[Any] = []  # background handles whose note this prompt carries, until the model answers it
+            if not hooked.blocked:
+                finished, noted = self._finished_background_note(session)
+                if finished:
+                    prompt = f"{prompt}\n\n{finished}"
             if gate.proceed and (subtasks := self.fanout.applies(session, gate)):
                 fan = await self.fanout.run(session, text, gate.plan, subtasks)  # M4b: parallel worktree children
                 if fan is not None and fan.ok:
@@ -2375,6 +2406,11 @@ class GatewayServer:
                     history=history,
                 ):
                     self._on_stream_event(session, event)
+                    answered = event.type == "done" and event.message is not None and event.message.role == "assistant"
+                    if noted and answered:
+                        for h in noted:
+                            h.reported = True
+                        noted = []
                 attempt_reason = loop.escalation_reason or ""
                 if "loop_guard" in attempt_reason:  # counted on every tier, not only when a cheap start escalates
                     self.usage.record(
@@ -2605,7 +2641,7 @@ class GatewayServer:
         session.elide_notes.clear()
         session.reads.clear()  # and the results it pointed at may be folded
         session.pinned_reads.clear()
-        session.learned_notes = None  # the provider's cache of it is gone anyway: show the notes written since
+        session.refresh_prompt_inputs()  # the provider's cache of it is gone anyway: show what was written since
         session.advisor_memo.clear()
         session.stored.meta["compactions"] = int(session.stored.meta.get("compactions") or 0) + 1
         self.store.save(session.stored)
@@ -3877,6 +3913,7 @@ async def _session_workspace_move(server: GatewayServer, params: dict[str, Any])
     session.stored.cwd = str(path)
     session.perms.cwd = path  # the permission state keeps the old directory otherwise (project rules, sandbox root)
     session.perms.reload()
+    session.refresh_prompt_inputs()  # the new project's notes, not the old one's, are shown from the next prompt on
     server.store.save(session.stored)
     return {"ok": True, "cwd": str(path)}
 

@@ -445,6 +445,11 @@ def build_reliability(config: Any, session: str, home: Path | None = None) -> Re
     apply_eur_budgets(settings, config)
     rel = Reliability.from_settings(settings, session=session, home=home)
     show_money_in(rel, config)
+    # the USD budgets count real prices in every front end; without this `-p` and the REPL counted tokens at the
+    # governor's blended rate (an Opus call at an eighth of its price)
+    from k3code.pricing import estimate_usd
+
+    rel.price_of = lambda usage: estimate_usd(config, usage)
     return rel
 
 

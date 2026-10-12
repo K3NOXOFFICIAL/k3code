@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
+
 from k3code.providers.types import Message
 from k3code.reliability.governor import Budget
+from k3code.routing.caller import NO_EFFORT_KINDS
 from k3code.routing.tiers import TaskKind
 from test_autonomy_gateway import call, make
 
@@ -88,3 +91,68 @@ async def test_a_side_call_never_carries_the_sessions_reasoning_effort_but_the_a
         assert effort_mod.REASONING_EFFORT.get() == "max", "restored after the side call"
     finally:
         effort_mod.REASONING_EFFORT.reset(token)
+
+
+async def test_a_side_call_before_the_sessions_first_turn_is_charged_too(tmp_path, monkeypatch):
+    """A resumed session's first compaction (or a first-turn classifier) runs before any turn built the bundle."""
+    import time
+
+    from k3code.reliability.governor import DAY_LEDGER
+
+    steps = [{"type": "text", "text": "a title"}, {"type": "usage", "prompt_tokens": 500, "completion_tokens": 100}]
+    server = make(tmp_path, monkeypatch, steps, mode="auto")
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    live = server.session
+    server._ensure_router(None)
+    assert live.reliability is None, "no turn has run"
+    DAY_LEDGER.roll(time.strftime("%Y-%m-%d"))
+    before = DAY_LEDGER.tokens
+    await server.model_caller.complete(TaskKind.TITLE, [Message(role="user", content="x")], session_id=live.session_id)
+    assert live.reliability is not None
+    assert DAY_LEDGER.tokens - before == 600
+    await server.close()
+
+
+@pytest.mark.parametrize("kind", sorted(NO_EFFORT_KINDS, key=lambda k: k.value))
+async def test_every_side_call_kind_that_should_think_little_drops_the_sessions_effort(tmp_path, monkeypatch, kind):
+    from k3code.providers import effort as effort_mod
+
+    seen: dict[str, str | None] = {}
+    server = make(tmp_path, monkeypatch, [{"type": "text", "text": "ok"}], mode="auto")
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    original = server.model_caller._routers
+
+    class Spy:
+        def __init__(self, inner):
+            self.inner = inner
+
+        async def complete(self, messages, tools, **kw):
+            seen["effort"] = effort_mod.REASONING_EFFORT.get()
+            return await self.inner.complete(messages, tools, **kw)
+
+    class Routers:
+        def get(self, tier):
+            return Spy(original().get(tier))
+
+    server.model_caller._routers = lambda: Routers()
+    token = effort_mod.REASONING_EFFORT.set("max")
+    try:
+        await server.model_caller.complete(kind, [Message(role="user", content="x")])
+        assert seen["effort"] is None, kind
+    finally:
+        effort_mod.REASONING_EFFORT.reset(token)
+    await server.close()
+
+
+async def test_the_first_side_call_of_a_cold_daemon_is_counted_once_by_the_day_ledger(tmp_path, monkeypatch):
+    """Charge, then log: the ledger reads the log on first use, so a row written first would be counted twice."""
+    from k3code.reliability.governor import DAY_LEDGER
+
+    steps = [{"type": "text", "text": "a title"}, {"type": "usage", "prompt_tokens": 500, "completion_tokens": 100}]
+    server = make(tmp_path, monkeypatch, steps, mode="auto")  # the server starts with a cold ledger
+    await call(server, "session.create", {"cwd": str(tmp_path)})
+    live = server.session
+    server._ensure_router(None)
+    await server.model_caller.complete(TaskKind.TITLE, [Message(role="user", content="x")], session_id=live.session_id)
+    assert DAY_LEDGER.tokens == 600
+    await server.close()

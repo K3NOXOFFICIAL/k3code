@@ -94,6 +94,16 @@ async def test_read_of_a_huge_file_is_refused_or_streamed_as_a_range(temp_dir, m
     assert "error" in await tool_read({"path": str(f), "start": 1, "end": 1}, cwd=temp_dir)
 
 
+async def test_a_large_binary_file_is_not_streamed_as_text_either(temp_dir, monkeypatch):
+    import k3code.tools as tools
+
+    monkeypatch.setattr(tools, "MAX_READ_BYTES", 100)
+    f = temp_dir / "disk.img"
+    f.write_bytes(b"\x7fELF\x00\x01" + b"\xff\x00" * 200)
+    result = await tool_read({"path": str(f), "start": 1, "end": 5}, cwd=temp_dir)
+    assert "binary file" in result["error"]
+
+
 async def test_write_file(temp_dir):
     f = temp_dir / "new.txt"
     result = await tool_write({"path": str(f), "content": "hello"}, cwd=temp_dir)
@@ -205,7 +215,7 @@ async def test_grep_pattern_that_looks_like_a_flag_is_searched_as_text(temp_dir)
     # Without -e/--, rg reads "--files" as its own option and lists file names instead of matching the line.
     (temp_dir / "notes.txt").write_text("the flag --files is literal here\n")
     result = await tool_grep({"pattern": "--files", "path": "."}, cwd=temp_dir)
-    assert "notes.txt:1:the flag --files is literal here" in result["matches"]
+    assert "notes.txt\n1:the flag --files is literal here" in result["matches"]
 
 
 async def test_glob_finds(temp_dir):

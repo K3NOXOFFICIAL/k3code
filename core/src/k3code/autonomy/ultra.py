@@ -482,6 +482,8 @@ class Ultra:
         diff = diff[:60000]
         self.progress(session, "ultracode", "adversarial review", ", ".join(LENSES), budget)
 
+        missing: list[str] = []  # lenses whose reviewer died
+
         async def lens_review(lens: str, desc: str) -> list[dict[str, Any]]:
             prompt = (
                 f"LENS: {lens}\nAdversarially review this change through one lens only: {desc}.\n\nTask:\n{task}\n\n"
@@ -490,6 +492,11 @@ class Ultra:
                 "(an empty array if you find nothing). Report only real problems."
             )
             h = await self.run_child(session, budget, "reviewer", prompt, f"review: {lens}", reserved=True)
+            if h.status != "completed":  # no answer is not "no findings"
+                budget.stop_if_capped(h)
+                missing.append(lens)
+                report.notes.append(f"the {lens} reviewer did not finish ({h.error or h.status}): that lens is missing")
+                return []
             return parse_findings(h.result)
 
         results = await gather_or_cancel(*(lens_review(k, v) for k, v in LENSES.items()))
@@ -497,7 +504,9 @@ class Ultra:
         report.panel_ran = True
         report.candidates = candidates
         if not candidates:
-            report.notes.append("review panel found nothing")
+            report.notes.append(
+                "review panel found nothing in the lenses that finished" if missing else "review panel found nothing"
+            )
             return
         self.progress(session, "ultracode", "cross-checking findings", f"{len(candidates)} candidates", budget)
         listing = json.dumps(candidates, indent=1)
@@ -549,24 +558,49 @@ class Ultra:
         report.fix = f"{h.status}; merge: {h.merge}" + (f" ({h.branch})" if h.merge == "conflict" else "")
 
 
+_GIT_ESCAPE = re.compile(r"\\([0-7]{3})")
+
+
+def _unquote_git_path(path: str) -> str:
+    """A path as git prints it in a header: non-ASCII bytes come as ``\\303\\251`` inside double quotes."""
+    path = path.strip().strip('"')
+    if "\\" not in path:
+        return path
+    raw = _GIT_ESCAPE.sub(lambda m: chr(int(m.group(1), 8)), path).encode("latin-1", "replace")
+    return raw.decode("utf-8", "replace")
+
+
+def _wanted_path(path: str) -> str:
+    """A finding's file as a repository-relative suffix: without ``:line``, ``./``, or the quoting around it."""
+    path = re.sub(r":\d+(?:-\d+)?$", "", path.strip().strip('"`'))
+    return path.removeprefix("./")
+
+
+def _names_same_file(wanted: str, header_path: str) -> bool:
+    """Whether a finding's ``wanted`` path and a diff header's path are one file: one is the tail of the other at a
+    directory boundary (``a.py`` for ``src/a.py``, or an absolute path for a repository-relative one)."""
+    a, b = "/" + wanted.lstrip("/"), "/" + header_path.lstrip("/")
+    return a.endswith(b) or b.endswith(a)
+
+
 def diff_for_files(diff: str, files: set[str]) -> str:
-    """The parts of a ``git diff`` for the files in ``files`` (paths as a reviewer wrote them: a suffix match, so
-    ``src/a.py`` and ``a.py`` both find it). The whole diff when no file is named or none matches: a finding that
-    names a file the diff does not have must still be judged against something."""
-    wanted = {f.strip().lstrip("./") for f in files if f and f.strip()}
+    """The parts of a ``git diff`` for the files in ``files`` (paths as a reviewer wrote them: ``a.py`` or ``src/a.py``,
+    an absolute path, ``a.py:12`` as grep prints it; git's quoted headers and both names of a rename are read). The
+    whole diff when no file is named or when any one of them matches no hunk: a finding that names a file the diff
+    does not have must still be judged against something, and a vote judges all its findings on one diff."""
+    wanted = {w for f in files if f and f.strip() and (w := _wanted_path(f))}
     if not wanted:
         return diff
-    blocks = re.split(r"(?m)^(?=diff --git )", diff)
-    kept = [
-        b
-        for b in blocks
-        if b.startswith("diff --git ")
-        and any(
-            (m := re.match(r"diff --git a/(.+?) b/(.+)", b.split("\n", 1)[0])) and m.group(2).endswith(w)
-            for w in wanted
-        )
-    ]
-    return "".join(kept) if kept else diff
+    blocks = [b for b in re.split(r"(?m)^(?=diff --git )", diff) if b.startswith("diff --git ")]
+    header = re.compile(r'diff --git "?a/(.+?)"? "?b/(.+?)"?$')
+    names: list[tuple[str, ...]] = []
+    for b in blocks:
+        m = header.match(b.split("\n", 1)[0])
+        names.append(tuple(_unquote_git_path(g) for g in m.groups()) if m else ())
+    kept_idx = {i for i, ns in enumerate(names) if any(_names_same_file(w, n) for w in wanted for n in ns)}
+    if any(not any(_names_same_file(w, n) for ns in names for n in ns) for w in wanted):
+        return diff
+    return "".join(blocks[i] for i in sorted(kept_idx)) or diff
 
 
 #: which report label each ultra.progress phase counts towards

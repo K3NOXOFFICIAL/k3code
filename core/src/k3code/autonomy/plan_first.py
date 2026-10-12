@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 PLAN_SECTIONS = ("Goal", "Steps", "Files", "Risks", "Verification", "Estimate")
 
+#: What plan mode denies outright (and the job tools that only address what bash started): the planner is not sent them.
+PLAN_DENIED_TOOLS = ("write", "edit", "bash", "bash_output", "bash_kill")
 PLAN_ADDENDUM = (
     "\n\nYou are in PLANNING mode: read-only. Explore the repo as needed, then call exit_plan ONCE with a "
     "plan in markdown with exactly these sections: "
@@ -70,7 +72,12 @@ def planner_history(history: list[Message], keep: int) -> list[Message]:
             older[-1] = Message(role="user", content=f"{older[-1].content or ''}\n\n{m.content or ''}")
         elif m.role == "user" or (m.role == "assistant" and not m.tool_calls and (m.content or "").strip()):
             older.append(m)
-    return [*older, *history[cut:]]
+    tail = history[cut:]
+    if older and tail and older[-1].role == "user" and tail[0].role == "user":
+        # the last older turn had no answer in words (a /stop, a turn that ended on a tool): one user turn, not two
+        older[-1] = Message(role="user", content=f"{older[-1].content or ''}\n\n{tail[0].content or ''}")
+        tail = tail[1:]
+    return [*older, *tail]
 
 
 def parse_plan(text: str) -> dict[str, str]:
@@ -274,6 +281,8 @@ class PlanFirst:
             tool_output_chars=tool_output_limit(server.config),
             context_window=server._router_window(router, session),
         )
+        for name in PLAN_DENIED_TOOLS:  # plan mode refuses them: their schemas would be paid for on every planning call
+            loop.tools._tools.pop(name, None)  # noqa: SLF001
         loop.hooks = userhooks.load(session.perms.cwd, sid)  # the planner's read tools see the user's hooks too
         loop.max_turns_stop_message = False  # its last text is taken as the plan: a stop notice is not one
         session.current_kind = TaskKind.PLAN.value

@@ -497,8 +497,6 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
         return new_string
     old_indent = _leading_whitespace(old_first)
     file_indent = _leading_whitespace(file_first)
-    if old_indent == file_indent:
-        return new_string
 
     old_lines, file_lines = old_string.split("\n"), file_region.split("\n")
     ws_map: dict[str, str] = {}  # whitespace the model used -> what the file has on the same line
@@ -506,6 +504,9 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
         for old_line, file_line in zip(old_lines, file_lines):
             if old_line.strip() and file_line.strip():
                 ws_map.setdefault(_leading_whitespace(old_line), _leading_whitespace(file_line))
+    # the first lines may agree (a `def` or a `build:` at column 0) while the lines under them do not
+    if old_indent == file_indent and all(used == has for used, has in ws_map.items()):
+        return new_string
     widths = sorted({len(w) for w in ws_map if " " in w and "\t" not in w})
     unit = min((b - a for a, b in zip(widths, widths[1:])), default=4)
 
@@ -627,7 +628,9 @@ def format_no_match_hint(error: Optional[str], match_count: int,
         return ""
     lead = ""
     lines = [ln for ln in old_string.split("\n") if ln.strip()]
-    if len(lines) >= 1 and sum(bool(_NUMBERED_LINE.match(ln)) for ln in lines) * 2 > len(lines):
+    own = [ln for ln in content.split("\n") if ln.strip()]
+    file_is_numbered = sum(bool(_NUMBERED_LINE.match(ln)) for ln in own) * 2 > len(own)  # a TSV: the digits are data
+    if lines and not file_is_numbered and sum(bool(_NUMBERED_LINE.match(ln)) for ln in lines) * 2 > len(lines):
         # the text was copied from `read`'s output, which numbers its lines (`    12\tcode`): the numbers are not in the file
         lead = (
             "\n\nold_string starts its lines with line numbers (`12<TAB>`), as `read` prints them. They are not part of "

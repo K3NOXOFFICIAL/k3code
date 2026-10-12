@@ -46,6 +46,17 @@ def request_headers(cfg: McpServerConfig) -> dict[str, str]:
     return headers
 
 
+_BRACES = re.compile(r"(\S*?)\{([^{}]*)\}")
+
+
+def _expand_names(query: str) -> str:
+    """``query`` lower-cased, without a leading ``select:``, ``prefix{a, b}`` written out as ``prefixa, prefixb``."""
+    q = query.strip().lower()
+    if q.startswith("select:"):
+        q = q[len("select:") :].strip()
+    return _BRACES.sub(lambda m: ", ".join(m.group(1) + n.strip() for n in m.group(2).split(",") if n.strip()), q)
+
+
 @dataclass
 class McpToolInfo:
     server: str
@@ -478,13 +489,15 @@ class McpManager:
         return {"error": text or "MCP tool error"} if _attr(res, "is_error", "isError") else {"content": text}
 
     def search(self, query: str, limit: int = 8) -> list[McpToolInfo]:
-        """Tools whose qualified name/description match ``query`` (exact names first)."""
-        q = query.strip().lower()
+        """Tools whose qualified name/description match ``query`` (exact names first). The notations the prompt itself
+        prints work: ``select:a,b``, ``mcp__server__{a, b}``, a comma or space separated list of names."""
+        q = _expand_names(query)
         words = [w for w in re.split(r"[\s,]+", q) if w]
         scored = []
         for t in self.tools():
             hay = f"{t.qualified} {t.description}".lower()
-            if q == t.qualified.lower() or q == t.name.lower():
+            names = {t.qualified.lower(), t.name.lower()}
+            if q in names or names.intersection(words):
                 score = 100
             else:
                 score = sum(hay.count(w) for w in words)

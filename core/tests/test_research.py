@@ -745,3 +745,38 @@ async def test_agent_web_search_chain_is_searxng_then_duckduckgo_then_mcp(tmp_pa
         reg, SimpleNamespace(research={"keyless_fallback": False}), mcp=FakeMcp([mcp_tool("hub_searxng__search")])
     )
     assert "http://h.test" in (await reg.handlers["web_search"]({"query": "q"}))["content"]
+
+
+async def test_a_long_page_is_read_in_pieces_with_start_index():
+    import httpx
+
+    from k3code.research import tools
+
+    words = " ".join(f"w{i:05d}" for i in range(6_000))  # ~48,000 characters of readable text
+    html = f"<html><body><main><p>{words}</p></main></body></html>"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=html.encode())
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        _, first = await tools.fetch_page("https://example.com/long", client=client)
+        assert "w00000" in first and "w05999" not in first
+        marker = re.search(
+            r"\[page cut: characters 0-(\d+) of (\d+) are shown; continue with start_index=(\d+)\]", first
+        )
+        assert marker and marker.group(1) == marker.group(3)
+        _, second = await tools.fetch_page("https://example.com/long", client=client, start=int(marker.group(3)))
+        assert second.startswith("w") or second.startswith(" w") or "w" in second[:12]
+        assert "w00000" not in second and len(second) <= tools.MAX_FETCH_CHARS
+        # the pieces together reach the end of the page
+        seen_end, start = False, 0
+        for _ in range(10):
+            _, piece = await tools.fetch_page("https://example.com/long", client=client, start=start)
+            seen_end = seen_end or "w05999" in piece
+            nxt = re.search(r"continue with start_index=(\d+)\]", piece)
+            if not nxt:
+                break
+            start = int(nxt.group(1))
+        assert seen_end
+        _, past = await tools.fetch_page("https://example.com/long", client=client, start=10_000_000)
+        assert "past the end of the page" in past

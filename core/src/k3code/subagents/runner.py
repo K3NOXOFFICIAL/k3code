@@ -100,6 +100,9 @@ class Handle:
     #: note the next turn starts with)
     background: bool = False
     reported: bool = False
+    #: worktree isolation was asked for and could not be had (not a git repository): the child worked in the parent's
+    #: checkout, which the parent must be told, or it trusts the work to be on a branch it can discard
+    isolation_note: str = ""
 
     @property
     def done(self) -> bool:
@@ -137,11 +140,12 @@ class Handle:
         """What the parent model sees as the tool result."""
         if self.status in ("queued", "running"):  # not finished: there is no answer to read yet
             return f"Sub-agent {self.id} is still {self.status} ({self.tool_count} tool calls so far)."
+        note = f"\n[isolation] {self.isolation_note}" if self.isolation_note else ""
         if self.status == "failed":
-            return f"Sub-agent {self.id} failed: {self.error}{self._left_behind()}"
+            return f"Sub-agent {self.id} failed: {self.error}{self._left_behind()}{note}"
         if self.status == "interrupted":
-            return f"Sub-agent {self.id} was interrupted. Partial result:\n{self.result}{self._left_behind()}"
-        out = [self.result.strip() or "(the sub-agent returned no text)"]
+            return f"Sub-agent {self.id} was interrupted. Partial result:\n{self.result}{self._left_behind()}{note}"
+        out = [self.result.strip() or "(the sub-agent returned no text)", note]
         if self.isolation == "worktree":
             if self.merge == "no_changes":
                 out.append("\n[worktree] no file changes.")
@@ -450,6 +454,10 @@ class SubagentManager:
                     h.branch = h.worktree.branch
                 else:
                     h.isolation = "none"  # not a git repo: the child shares the parent's cwd
+                    h.isolation_note = (
+                        f"worktree isolation was requested, but {cwd} is not a git repository: the sub-agent worked "
+                        "directly in your checkout, so its edits are already there"
+                    )
             h.cwd = str(cwd)
             self._emit(parent, "subagent.start", h)
             await self._drive(parent, h, atype, prompt, cwd)

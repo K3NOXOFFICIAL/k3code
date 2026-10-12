@@ -228,6 +228,9 @@ async def test_medium_in_auto_plans_on_strong_and_auto_approves(tmp_path, monkey
     assert "Approved plan" in main_call["text"] and "Add flag" in main_call["text"]
     planner_call = next(c for p in server.providers for c in p.log if "PLANNING mode" in c["text"])
     assert "exit_plan" in planner_call["tools"]  # only offered in plan mode, where edits are denied
+    # and the tools plan mode refuses are not even described to the planner (568 schema tokens per planning call)
+    assert not {"write", "edit", "bash", "bash_output", "bash_kill"} & set(planner_call["tools"])
+    assert {"read", "grep", "glob"} <= set(planner_call["tools"])
     # a session's loop lists exit_plan in every mode (a tool list that changed with the mode made the provider re-write
     # the whole conversation on entering and on leaving plan mode); outside plan mode it answers with an error
     assert "exit_plan" in main_call["tools"]

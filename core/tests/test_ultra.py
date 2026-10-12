@@ -385,3 +385,71 @@ def test_a_vote_is_sent_only_the_diff_of_the_files_its_findings_name():
         "a finding that names a missing file is judged on the whole diff"
     )
     assert diff_for_files(diff, set()) == diff and diff_for_files(diff, {""}) == diff
+
+
+async def test_a_review_lens_that_died_is_not_a_lens_that_found_nothing():
+    from types import SimpleNamespace
+
+    from k3code.autonomy.ultra import Ultra
+    from k3code.subagents.budget import CAP_ERROR, AgentBudget, BudgetStop
+    from k3code.subagents.runner import Handle
+
+    def dead(error: str) -> Handle:
+        h = Handle(id="r", description="d", agent_type="reviewer", tier="main", depth=1, parent_sid="s")
+        h.status, h.error, h.result = "failed", error, ""
+        return h
+
+    for error, stops in [(f"{CAP_ERROR}: 1530 > 1500", True), ("provider exploded", False)]:
+        ex = Ultra.__new__(Ultra)
+        ex.progress = lambda *a, **k: None  # type: ignore[method-assign]
+        ex.server = SimpleNamespace(model_caller=None)
+
+        async def run_child(*args, _h=dead(error), **kwargs):
+            return _h
+
+        ex.run_child = run_child  # type: ignore[method-assign]
+        report = SimpleNamespace(notes=[], panel_ran=False, candidates=[])
+        session = SimpleNamespace(perms=SimpleNamespace(cwd="."))
+
+        async def fake_git(*args, **kwargs):
+            return 0, "diff --git a/x b/x\n+x\n"
+
+        import k3code.autonomy.ultra as ultra_mod
+
+        orig = ultra_mod.wt_mod.git
+        ultra_mod.wt_mod.git = fake_git  # type: ignore[assignment]
+        try:
+            budget = AgentBudget(max_agents=9, max_tokens=1500)
+            if stops:
+                with pytest.raises(BudgetStop):
+                    await ex.review_and_fix(session, budget, report, "task", "plan", "base")
+            else:
+                await ex.review_and_fix(session, budget, report, "task", "plan", "base")
+                assert any("did not finish" in n for n in report.notes)
+                assert "review panel found nothing" not in report.notes
+                assert "review panel found nothing in the lenses that finished" in report.notes
+        finally:
+            ultra_mod.wt_mod.git = orig  # type: ignore[assignment]
+
+
+def test_diff_for_files_reads_the_paths_the_way_reviewers_and_git_write_them():
+    from k3code.autonomy.ultra import diff_for_files
+
+    def block(old: str, new: str, body: str = "x") -> str:
+        return f"diff --git a/{old} b/{new}\n--- a/{old}\n+++ b/{new}\n@@ -1 +1 @@\n-{body}\n+y\n"
+
+    a, b = block("src/a.py", "src/a.py"), block("src/b.py", "src/b.py")
+    moved = block("old_name.py", "new_name.py")
+    quoted = (
+        'diff --git "a/caf\\303\\251.py" "b/caf\\303\\251.py"\n--- "a/caf\\303\\251.py"\n+++ x\n@@ -1 +1 @@\n-q\n+r\n'
+    )
+    diff = a + b + moved + quoted
+    assert diff_for_files(diff, {"src/a.py:12"}) == a, "grep prints path:line"
+    assert diff_for_files(diff, {"/work/repo/src/b.py"}) == b, "an absolute path names the file too"
+    assert diff_for_files(diff, {"old_name.py"}) == moved and diff_for_files(diff, {"new_name.py"}) == moved
+    assert diff_for_files(diff, {"café.py"}) == quoted, "git quotes non-ASCII names in its headers"
+    assert diff_for_files(diff, {".github/ci.yml"}) == diff
+    # one finding names a file the diff does not have: its vote needs the whole diff, not just the other file's hunk
+    assert diff_for_files(diff, {"src/a.py", "missing.py"}) == diff
+    assert diff_for_files(a + b, {"a.py"}) == a, "a name that is only the tail of a directory name does not match"
+    assert diff_for_files(block("src/data.py", "src/data.py"), {"a.py"}) != "", "no false suffix match"

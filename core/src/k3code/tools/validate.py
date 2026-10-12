@@ -9,6 +9,7 @@ nothing, so it retried blind. The subset checked here is what tool schemas in k3
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 _TYPES: dict[str, tuple[type, ...]] = {
@@ -78,6 +79,28 @@ def drop_null_options(args: dict[str, Any], schema: dict[str, Any] | None) -> di
     return {k: v for k, v in args.items() if v is not None or keeps_null(k)}
 
 
+#: Names models use for a parameter these tools call something else (Claude Code's spellings): renamed instead of
+#: dropped, so the call runs with the meaning the model gave it. A dropped ``run_in_background`` held a dev server
+#: call for its whole 120 s timeout, a dropped ``subagent_type`` ran the sub-agent as the default worker.
+ARGUMENT_ALIASES: dict[str, dict[str, str]] = {
+    "bash": {"run_in_background": "background"},
+    "task": {"subagent_type": "agent_type"},
+    "todo": {"items": "todos"},
+}
+#: Arguments a handler still takes that its schema no longer lists (so they are not "ignored").
+LEGACY_ARGUMENTS: dict[str, frozenset[str]] = {"read": frozenset({"start", "end"})}
+
+
+def normalize_arguments(tool: str, args: dict[str, Any], schema: dict[str, Any] | None) -> dict[str, Any]:
+    """``args`` as the handler should get them: null options dropped, aliased names renamed (unless the model sent the
+    real name too, then the alias stays and is reported as ignored)."""
+    args = drop_null_options(args, schema)
+    aliases = ARGUMENT_ALIASES.get(tool)
+    if not aliases or not isinstance(args, dict) or not any(k in aliases for k in args):
+        return args
+    return {(aliases[k] if k in aliases and aliases[k] not in args else k): v for k, v in args.items()}
+
+
 def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
     """What is wrong with ``args`` for ``schema`` (empty = nothing found)."""
     if not isinstance(schema, dict) or schema.get("type", "object") != "object":
@@ -87,9 +110,9 @@ def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
         why = ""
         if "_unparsed" in args:  # broken JSON: say where, so the model repairs it instead of resending it
             try:
-                json.loads(raw)
+                json.loads(raw, strict=False)  # the providers' parsers are lenient about raw control characters too
             except json.JSONDecodeError as exc:
-                why = f": {exc.msg} at char {exc.pos}"
+                why = f": {exc.msg} (char {exc.pos})"
         return [f"the arguments were not a valid JSON object{why} (received: {shown})"]
     if not isinstance(args, dict):
         return [f"arguments must be an object, got {type(args).__name__}"]
@@ -109,7 +132,37 @@ def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
         enum = prop.get("enum")
         if isinstance(enum, list) and value not in enum:
             problems.append(f"'{name}' must be one of {enum!r}, got {value!r}")
+        item_type = (prop.get("items") or {}).get("type") if isinstance(prop.get("items"), dict) else None
+        if isinstance(value, list | tuple) and isinstance(item_type, str):
+            problems += [
+                f"'{name}[{i}]' must be {item_type}, got {type(item).__name__}"
+                for i, item in enumerate(value)
+                if not _is(item, item_type)
+            ]
+        if name in PATH_ARGUMENTS and isinstance(value, str) and (bad := _unusable_path(value)):
+            problems.append(f"'{name}' {bad}")
     return problems
+
+
+#: Arguments that name a file or directory: a value the operating system cannot take as one is refused up front (it
+#: raised out of the permission check and ended the whole turn in an error, with the call marked as possibly run).
+PATH_ARGUMENTS = frozenset({"path", "cwd", "file_path", "notebook_path"})
+
+
+def _unusable_path(value: str) -> str:
+    """Why ``value`` can never be a path ("" when it can)."""
+    if "\x00" in value:
+        return "contains a NUL byte"
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return "contains an unpaired surrogate character"
+    if value.startswith("~") and not value.startswith(("~/", "~\\")) and value != "~":
+        try:
+            Path(value).expanduser()
+        except RuntimeError:
+            return f"starts with {value.split('/', 1)[0]!r}, which is no user's home directory"
+    return ""
 
 
 def invalid_arguments(tool: str, schema: dict[str, Any] | None, args: Any) -> str | None:

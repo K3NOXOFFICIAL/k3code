@@ -300,13 +300,23 @@ def _add_cache_breakpoints(wire: list[dict[str, Any]], ttl: str = "5m", *, newes
             wire[i] = {**wire[i], "content": with_cache_breakpoint(wire[i]["content"], ttl)}
 
 
+def _is_amount(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and value >= 0
+
+
 def _parse_usage(chunk_usage: dict[str, Any], *, reports_cost: bool = False) -> Any:
     from k3code.providers.types import Usage
 
     details = chunk_usage.get("prompt_tokens_details") or {}
     cost = chunk_usage.get("cost") if reports_cost else None  # OpenRouter: what the call cost, in USD
+    if _is_amount(cost) and chunk_usage.get("is_byok") is True:
+        # with the user's own key `cost` is only OpenRouter's fee; what the upstream provider charges is reported apart
+        breakdown = chunk_usage.get("cost_details")
+        upstream = breakdown.get("upstream_inference_cost") if isinstance(breakdown, dict) else None
+        if _is_amount(upstream):
+            cost = cost + upstream
     return Usage(
-        cost_usd=float(cost) if isinstance(cost, int | float) and not isinstance(cost, bool) and cost >= 0 else None,
+        cost_usd=float(cost) if _is_amount(cost) else None,
         prompt_tokens=int(chunk_usage.get("prompt_tokens") or 0),
         completion_tokens=int(chunk_usage.get("completion_tokens") or 0),
         # OpenAI reports cache hits in prompt_tokens_details; DeepSeek as prompt_cache_hit_tokens and Moonshot as a

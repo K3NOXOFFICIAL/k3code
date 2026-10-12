@@ -9,6 +9,7 @@ import logging
 from typing import Any
 
 from k3code.autonomy.advisor import summary_system, transcript_text
+from k3code.context_budget import POINTER_CALL_RE
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 
@@ -24,6 +25,8 @@ COMPACT_HEAD_CHARS = 8_000
 SUMMARY_MAX_TOKENS = 1_000
 #: The first task statement is kept verbatim (up to this many characters) so it survives any number of compactions.
 TASK_ANCHOR_CHARS = 12_000
+#: Of the anchor, the summary model reads this many characters (the anchor itself is kept whole in the result).
+ANCHOR_SUMMARY_CHARS = 2_500
 #: What the summary model sees of one folded message: a tool result keeps its start and its end (it used to see the
 #: first 3000 characters of everything, which is 11-18% of a long session and none of a test run's last line), a user
 #: message up to the anchor's size (a plan or a requirement sent later), an earlier summary whole.
@@ -84,6 +87,15 @@ def head_and_tail(text: str, limit: int, head: int) -> str:
     return text[:head] + "\n…[middle of the conversation omitted]…\n" + text[-(limit - head) :]
 
 
+def _anchor_gist(content: str) -> str:
+    if len(content) <= ANCHOR_SUMMARY_CHARS:
+        return content
+    head = ANCHOR_SUMMARY_CHARS * 3 // 4
+    return (
+        f"{content[:head]}\n…[the rest of this message is kept verbatim]…\n{content[-(ANCHOR_SUMMARY_CHARS - head) :]}"
+    )
+
+
 def task_anchor(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
     """The first user message that is a real task, not an earlier summary."""
     for m in messages:
@@ -119,9 +131,13 @@ async def compact_messages(
             break
     else:
         return messages, 0
+    # The anchor is kept verbatim in the result, so the summary model only needs its gist. At full size it filled the
+    # head of the input and pushed the earlier summary, which follows it, into the omitted middle: a second compaction
+    # then summarized without what the first had kept.
+    shown = [{**m, "content": _anchor_gist(str(m.get("content") or ""))} if m is anchor else m for m in old]
     text = head_and_tail(
         transcript_text(
-            old,
+            shown,
             per_message=3000,
             per_role={"tool": COMPACT_TOOL_CHARS, "user": TASK_ANCHOR_CHARS},
             whole_prefix=SUMMARY_PREFIX,
@@ -153,4 +169,23 @@ async def compact_messages(
             head = TASK_ANCHOR_CHARS - tail - 48  # room for the note
             content = f"{content[:head]}\n…[{len(content) - head - tail:,} chars omitted]…\n{content[-tail:]}"
         kept = [{**anchor, "content": content}]
-    return [*system, *kept, summary, *messages[cut:]], cut
+    return [*system, *kept, summary, *_without_dangling_pointers(messages[cut:])], cut
+
+
+DANGLING_POINTER = (
+    "[unchanged since an earlier read of this file, which is now only in the summary above: "
+    "read it again if you need its text]"
+)
+
+
+def _without_dangling_pointers(tail: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """``tail`` with every "unchanged since the read" answer whose earlier result is not in it (it was folded into the
+    summary, now or by an earlier compaction) reworded: it told the model that content "above still holds" when only a
+    summary of it does."""
+    here = {m.get("tool_call_id") for m in tail if m.get("role") == "tool"}
+
+    def dangling(m: dict[str, Any]) -> bool:
+        hit = POINTER_CALL_RE.match(str(m.get("content") or "")) if m.get("role") == "tool" else None
+        return hit is not None and hit.group(1) not in here
+
+    return [{**m, "content": DANGLING_POINTER} if dangling(m) else m for m in tail]

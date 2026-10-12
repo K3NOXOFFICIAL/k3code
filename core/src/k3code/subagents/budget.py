@@ -66,6 +66,12 @@ class AgentBudget:
             # may be less than the cap in this tally, so the tally is raised to it: the run is out of tokens
             self.tokens = max(self.tokens, self.max_tokens)
 
+    def stop_if_capped(self, h: Handle) -> None:
+        """Raise BudgetStop when ``h`` was stopped mid-run by the orchestration's token cap: what it had not yet said
+        (a reviewer's verdict, a lens's findings) is missing, which must end the run, not read as "found nothing"."""
+        if self.max_tokens is not None and CAP_ERROR in str(h.error or ""):
+            raise BudgetStop(f"token budget exhausted ({self.tokens}/{self.max_tokens} tokens)", "tokens")
+
     def check(self) -> None:
         if self.max_tokens is not None and self.tokens >= self.max_tokens:
             raise BudgetStop(f"token budget exhausted ({self.tokens}/{self.max_tokens} tokens)", "tokens")

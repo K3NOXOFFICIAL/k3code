@@ -219,6 +219,15 @@ class BrowserManager:
         self._cdp: Any = None  # the browser attached over CDP, when browser.manage connected to browser.cdp_url
         self._pw: Any = None
 
+    def available(self) -> bool:
+        """Whether a page could be rendered here: a launcher was given, or the optional Playwright package is
+        installed. Without it every web_browse call fails, and its schema is tokens in every request."""
+        if self._launch != self._launch_playwright:
+            return True
+        import importlib.util
+
+        return importlib.util.find_spec("playwright") is not None
+
     @classmethod
     def from_config(cls, config: Any) -> BrowserManager:
         cfg = dict(getattr(config, "browser", None) or {})

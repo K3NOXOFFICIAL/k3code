@@ -49,3 +49,21 @@ def test_two_prompts_with_only_tool_work_between_them_become_one_user_turn():
 def test_a_short_history_is_unchanged():
     history = turn(0) + turn(1)
     assert planner_history(history, keep=8) == history
+
+
+def test_two_user_prompts_are_not_left_side_by_side_at_the_cut():
+    from k3code.autonomy.plan_first import planner_history
+    from k3code.providers.types import Message
+
+    history = [
+        Message(role="user", content="req 1"),
+        Message(role="assistant", content=None),  # a turn that ended on a tool call: no answer in words
+        Message(role="user", content="req 2"),
+        Message(role="assistant", content="answer 2"),
+        Message(role="user", content="req 3"),
+        Message(role="assistant", content="answer 3"),
+    ]
+    out = planner_history(history, keep=3)
+    roles = [m.role for m in out]
+    assert all(a != b for a, b in zip(roles, roles[1:], strict=False)), roles
+    assert out[0].role == "user" and "req 1" in out[0].content

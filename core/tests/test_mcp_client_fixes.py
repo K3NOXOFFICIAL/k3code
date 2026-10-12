@@ -131,3 +131,26 @@ async def test_a_call_after_the_server_died_revives_it_within_the_turn(monkeypat
         assert await manager.call("mcp__fake__echo", {"text": "again"}) == {"content": "echo:again"}
     finally:
         await manager.close()
+
+
+def test_mcp_search_reads_the_notations_the_system_prompt_prints():
+    from k3code.mcpclient import McpToolInfo
+
+    tools = [
+        McpToolInfo("Neon", "run_sql", "Run a SQL statement", {}),
+        McpToolInfo("Neon", "list_projects", "List projects", {}),
+        McpToolInfo("github", "get_me", "The signed-in user", {}),
+    ]
+    manager = McpManager({})
+    manager.tools = lambda: tools  # type: ignore[method-assign]
+
+    def names(query: str) -> set[str]:
+        return {t.qualified for t in manager.search(query)}
+
+    both = {"mcp__Neon__run_sql", "mcp__Neon__list_projects"}
+    assert names("mcp__Neon__{run_sql, list_projects}") == both  # as the prompt prints them
+    assert names("select:mcp__Neon__run_sql,mcp__Neon__list_projects") == both  # both, not the last one only
+    assert names("select:mcp__Neon__run_sql") == {"mcp__Neon__run_sql"}
+    assert names("mcp__Neon__run_sql mcp__Neon__list_projects") == both
+    assert names("run_sql") == {"mcp__Neon__run_sql"}
+    assert names("zzzz qqqq") == set()

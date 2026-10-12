@@ -128,25 +128,27 @@ async def fetch_page(
     client: httpx.AsyncClient | None = None,
     fetcher: WebFetcher | None = None,
     browser: BrowserManager | None = None,
+    start: int = 0,
 ) -> tuple[str, str]:
     """(title, text) of a web page through the shared fetch layer (cache, per-host rate, robots.txt, deadline).
-    A 403 or a challenge page is read in the browser when one is given. Raises ``Stopped`` at a CAPTCHA, a login
-    wall or a paywall; ``FetchStatus`` for other non-2xx answers; ``FetchRefused`` for robots.txt; httpx errors."""
+    A 403 or a challenge page is read in the browser when one is given. ``start`` is the character the text is shown
+    from (a long page is read in pieces). Raises ``Stopped`` at a CAPTCHA, a login wall or a paywall; ``FetchStatus``
+    for other non-2xx answers; ``FetchRefused`` for robots.txt; httpx errors."""
     if fetcher is not None:
-        return await _read_page(fetcher, url, browser)
+        return await _read_page(fetcher, url, browser, start)
     own = WebFetcher(client=client, deadline=timeout)  # no shared fetcher: a short-lived one for this call
     try:
-        return await _read_page(own, url, browser)
+        return await _read_page(own, url, browser, start)
     finally:
         await own.aclose()
 
 
-async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | None) -> tuple[str, str]:
+async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | None, start: int = 0) -> tuple[str, str]:
     got = await fetcher.get(url)
     verdict = classify(got.status, got.body)
     if verdict is Verdict.BLOCKED and browser is not None:
         try:
-            return await _read_rendered(browser, url, fetcher)
+            return await _read_rendered(browser, url, fetcher, start)
         except BrowserUnavailable as e:  # the error said only "install Playwright": say what was refused as well
             raise BrowserUnavailable(f"HTTP {got.status} for {url} (a blocked page): {e}") from None
     if verdict in STOP_VERDICTS:
@@ -160,7 +162,7 @@ async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | No
     else:
         title, text = url, got.body
     note = "\n[page cut: the fetch deadline or the size cap was reached]" if got.truncated else ""
-    return title or url, _cap_page(text, note)
+    return title or url, _cap_page(text, note, start)
 
 
 def _is_text(content_type: str) -> bool:
@@ -170,17 +172,23 @@ def _is_text(content_type: str) -> bool:
     return not main or main.startswith("text/") or main.endswith(("json", "xml", "javascript", "x-www-form-urlencoded"))
 
 
-def _cap_page(text: str, note: str = "") -> str:
-    """``text`` + ``note`` within MAX_FETCH_CHARS: a longer page keeps its start, and says how much of it that is (the
-    note used to be appended before the cut and fell off the end of a long page, which then looked complete)."""
+def _cap_page(text: str, note: str = "", start: int = 0) -> str:
+    """``text`` + ``note`` within MAX_FETCH_CHARS, from character ``start``: a longer page keeps its start and says how
+    much of it that is and where to go on (the note used to be appended before the cut and fell off the end of a long
+    page, which then looked complete; with no way to ask for the rest, the retry returned the same piece)."""
+    total = len(text)
+    if start > 0:
+        if start >= total:
+            return f"[start_index {start} is past the end of the page: it has {total} characters]{note}"
+        text = text[start:]
     if len(text) + len(note) <= MAX_FETCH_CHARS:
         return text + note
-    marker = f"\n[page cut: the first {{}} of {len(text)} characters are shown]"
-    keep = MAX_FETCH_CHARS - len(note) - len(marker) - len(str(MAX_FETCH_CHARS))
-    return text[:keep] + marker.format(keep) + note
+    marker = f"\n[page cut: characters {start}-{{}} of {total} are shown; continue with start_index={{}}]"
+    keep = MAX_FETCH_CHARS - len(note) - len(marker) - 2 * len(str(total))
+    return text[:keep] + marker.format(start + keep, start + keep) + note
 
 
-async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher) -> tuple[str, str]:
+async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher, start: int = 0) -> tuple[str, str]:
     """A page the browser renders. The same stop rules apply: a CAPTCHA, a login or a paywall ends the read. The
     browser's own navigation is admitted like any other request: robots.txt, then a token of the host's bucket."""
     await fetcher.admit(url)
@@ -191,7 +199,7 @@ async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher)
     if verdict is not Verdict.OK:
         raise RuntimeError(f"still blocked in the browser (HTTP {page.status}) at {url}; not solved, not retried")
     title, text = await asyncio.to_thread(extract_text, page.html)  # off the event loop: parsing is CPU-bound
-    return title or url, _cap_page(text, "\n[page cut: the size cap was reached]" if page.truncated else "")
+    return title or url, _cap_page(text, "\n[page cut: the size cap was reached]" if page.truncated else "", start)
 
 
 class SearxngSearch:
@@ -571,7 +579,8 @@ def register_web_tools(
     async def tool_fetch(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         url = str(arguments.get("url") or "")
         try:
-            title, text = await fetch_page(url, fetcher=fetcher, browser=browser)
+            start = max(0, int(arguments.get("start_index") or 0))
+            title, text = await fetch_page(url, fetcher=fetcher, browser=browser, start=start)
         except Exception as e:  # noqa: BLE001
             return {"error": f"web_fetch failed: {e}"}
         return {"content": f"# {title}\n{url}\n\n{text}"}
@@ -619,24 +628,32 @@ def register_web_tools(
             name="web_fetch",
             description="Fetch a web page and return its readable text. A page that blocks "
             "plain HTTP is read in a browser; CAPTCHAs, logins and paywalls stop.\n"
-            f"Limits: http(s) only; text cut at {MAX_FETCH_CHARS} chars; about 20 s per page "
-            "(research.fetch_deadline).",
-            parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+            f"Limits: http(s) only; text cut at {MAX_FETCH_CHARS} chars (start_index continues a long page); about "
+            "20 s per page (research.fetch_deadline).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "start_index": {"type": "integer", "description": "Character to continue a cut page from"},
+                },
+                "required": ["url"],
+            },
             side_effect=False,
         ),
         tool_fetch,
     )
-    reg.register(
-        ToolSpec(
-            name="web_browse",
-            description="Render a page in a real Chromium (for pages that need JavaScript) "
-            "and return its readable text. Reads only: it never clicks, types or "
-            "logs in. Needs the optional Playwright install.",
-            parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
-            side_effect=False,
-        ),
-        tool_browse,
-    )
+    if browser.available():  # without Playwright every call would only fail, and the schema costs tokens each request
+        reg.register(
+            ToolSpec(
+                name="web_browse",
+                description="Render a page in a real Chromium (for pages that need JavaScript) "
+                "and return its readable text. Reads only: it never clicks, types or "
+                "logs in. Needs the optional Playwright install.",
+                parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+                side_effect=False,
+            ),
+            tool_browse,
+        )
     reg.register(
         ToolSpec(
             name="web_search",

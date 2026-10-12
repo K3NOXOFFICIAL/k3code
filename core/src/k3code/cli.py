@@ -211,7 +211,7 @@ async def _run_headless(
             }
         if loop.escalation_reason in ("tool_errors", "loop_guard"):  # likewise: the loop gave up, the task is not done
             why = (
-                f"stopped after {len(loop._failed)} failed tool calls in a row (autonomy.max_tool_errors); "
+                f"stopped after {loop.failed_calls} failed tool calls in a row (autonomy.max_tool_errors); "
                 f"last: {loop._failed[-1][0]}: {loop._failed[-1][1]}"
                 if loop.escalation_reason == "tool_errors" and loop._failed
                 else "stopped: the model kept repeating the same call (loop guard)"
@@ -452,6 +452,11 @@ async def _run_repl(
     register_skill_tool(loop.tools, Path.cwd(), list(config.skills.roots))
     loop.hooks = userhooks.load(project_dir or Path.cwd(), "repl")
     hooks_started = False
+    # the conversation: every run starts from the messages the one before ended with (each prompt used to be a new
+    # conversation), and keeps which results were elided / which files were read, as a gateway session does
+    history: list[Any] = []
+    loop.share_elision(set(), {})
+    loop.share_reads({}, set())
 
     print("k3code REPL (type /exit to quit, /model <name> to switch, /stop to cancel a stuck turn)")
     print(f"Permission mode: {permission_mode.value}")
@@ -519,8 +524,11 @@ async def _run_repl(
                 extra_parts.append(submitted.context_text())
                 if extra := "\n".join(c for c in extra_parts if c):
                     run_input = f"{user_input}\n\n" + fenced("context from the user's hooks:", extra)
-            async for _ in loop.run(run_input, max_tokens=config.max_tokens, temperature=config.temperature):
+            async for _ in loop.run(
+                run_input, max_tokens=config.max_tokens, temperature=config.temperature, history=history
+            ):
                 pass
+            history = [m for m in loop.turn_messages if m.role != "system"]
             if loop.hooks:
                 await loop.hooks.run("Stop", {"stop_hook_active": False})
             print()  # newline after streaming

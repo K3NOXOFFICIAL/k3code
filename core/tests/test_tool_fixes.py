@@ -63,9 +63,9 @@ async def test_grep_prints_paths_relative_to_the_session_and_cuts_long_lines(tmp
     (tmp_path / "src" / "a.py").write_text("needle\n" + "needle " + "x" * 2000 + "\n")
     res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
     lines = res["matches"].splitlines()
-    assert lines[0] == "src/a.py:1:needle" and all(len(line) < 400 for line in lines)
+    assert lines[:2] == ["src/a.py", "1:needle"] and all(len(line) < 400 for line in lines)
     inside = await tool_grep({"pattern": "needle", "path": "src"}, cwd=tmp_path)
-    assert inside["matches"].splitlines()[0] == "src/a.py:1:needle"
+    assert inside["matches"].splitlines()[:2] == ["src/a.py", "1:needle"]
 
 
 async def test_grep_skips_node_modules_without_a_gitignore(tmp_path):
@@ -73,7 +73,7 @@ async def test_grep_skips_node_modules_without_a_gitignore(tmp_path):
     (tmp_path / "node_modules" / "dep.js").write_text("needle\n")
     (tmp_path / "app.js").write_text("needle\n")
     res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
-    assert res["matches"] == "app.js:1:needle"
+    assert res["matches"] == "app.js\n1:needle"
 
 
 async def test_glob_takes_braces_and_absolute_patterns(tmp_path):
@@ -210,7 +210,7 @@ def test_a_long_page_keeps_its_start_and_says_how_much_of_it_that_is():
     capped = _cap_page(page, "\n[page cut: the size cap was reached]")
     assert len(capped) <= MAX_FETCH_CHARS < 10_000  # no second, silent clip on the way to the model
     assert capped.startswith("p" * 9_000)
-    assert "of 30000 characters are shown]" in capped and capped.endswith("the size cap was reached]")
+    assert "of 30000 are shown; continue with start_index=" in capped and capped.endswith("the size cap was reached]")
     assert _cap_page("short page") == "short page"
     assert len(_cap_page("x" * (MAX_FETCH_CHARS - 5), "\n[note]")) <= MAX_FETCH_CHARS
 

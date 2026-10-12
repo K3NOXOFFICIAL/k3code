@@ -170,7 +170,8 @@ async def test_glob_and_the_grep_fallback_run_off_the_event_loop(tmp_path, no_gi
     await tool_glob({"pattern": "*.py"}, cwd=tmp_path)
     res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
     assert len(ran) == 2
-    hits = {line.split(":")[0] for line in res["matches"].splitlines()}  # relative to the session's directory
+    # the path of each file, relative to the session's directory (its matches follow as `line:text`)
+    hits = {line for line in res["matches"].splitlines() if line and not line[0].isdigit()}
     assert hits == {"src/a.py", "src/pkg/b.py", "build/g.py", "README.md"}
 
 
@@ -178,7 +179,8 @@ async def test_the_grep_fallback_caps_its_matches(tmp_path, no_git_env, monkeypa
     (tmp_path / "big.txt").write_text("needle\n" * (MAX_SEARCH_RESULTS + 50))
     monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
     res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
-    assert len(res["matches"].splitlines()) == MAX_SEARCH_RESULTS and "truncated" in res["warnings"]
+    assert len(res["matches"].splitlines()) == MAX_SEARCH_RESULTS + 1  # the file's path, then its matches
+    assert "truncated" in res["warnings"]
 
 
 async def test_project_prep_scans_risks_off_the_event_loop(tmp_path, monkeypatch):

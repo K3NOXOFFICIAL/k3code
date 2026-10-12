@@ -691,7 +691,7 @@ def test_the_grep_tool_never_reaches_key_directories_under_a_home_root(home: Pat
     (home / ".config" / "k3code" / "env").write_text("THE-KEY-MATERIAL\n")
     (home / "notes.txt").write_text("THE-KEY-MATERIAL in prose\n")
     out = _grep({"pattern": "THE-KEY-MATERIAL", "include": "*"}, home)
-    assert out["matches"].splitlines() == ["notes.txt:1:THE-KEY-MATERIAL in prose"]
+    assert out["matches"].splitlines() == ["notes.txt", "1:THE-KEY-MATERIAL in prose"]
 
 
 def test_the_python_fallback_skips_dotenv_files_too(dotenv_project: Path) -> None:
@@ -816,6 +816,10 @@ NEW_HARDLINE = [
     "sudo find / -type f -delete",
     "find /* -delete",
     "find / -mindepth 1 -maxdepth 1 -delete",
+    "find ~ -delete",
+    "find $HOME -delete",
+    "find ~/ -type f -delete",
+    "find ~ -depth -delete",
     ":(){ :|:& };:",
     ":(){ :|: & };:",
     ":() { : | : & } ; :",

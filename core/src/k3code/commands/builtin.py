@@ -145,7 +145,7 @@ class _ClearCommand(CommandDef):
         if getattr(live, "streaming", False):  # the running turn's persist would put the transcript right back
             return {"type": "message", "message": "A turn is running in this session; /stop it first."}
         live.messages = []
-        live.learned_notes = None  # a new conversation: show the notes learned since this prompt was built
+        live.refresh_prompt_inputs()  # a new conversation: show what was learned since this prompt was built
         live.reads.clear()
         live.pinned_reads.clear()
         live.elided.clear()

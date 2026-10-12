@@ -241,6 +241,7 @@ class ServerRunner:
             return await self.run_prompt(mgr.kick_prompt() or objective, session_id=session_id)
         finally:
             if created:  # run_prompt sees an existing session here and skips its own release: do it for the fresh one
+                srv.subagents.interrupt_session(live.session_id)  # a background child nobody will ever poll
                 await self._release(live)
 
     def notify(self, text: str, level: str = "info", key: str = "") -> None:

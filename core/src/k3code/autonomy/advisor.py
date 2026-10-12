@@ -130,6 +130,10 @@ async def condensed_context(
             max_tokens=600,
             timeout=45,
         )
+        # e.g. a reasoning model that spent its budget thinking: a memo of "" would hide the part it covers from every
+        # later call
+        if not res.text.strip():
+            raise ValueError("the summary model returned no text")
         if memo is not None:
             memo.update(n=len(old), sig=_signature(old), summary=res.text)
         return f"[summary of earlier conversation]\n{res.text}\n\n[recent messages]\n{tail}"

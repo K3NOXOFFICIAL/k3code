@@ -268,11 +268,15 @@ class Router:
             while True:
                 self._emit("router.attempt", entry, attempt=attempt + 1)
                 streamed = False  # this attempt already yielded output the consumer has collected
+                counted = (
+                    False  # ... or the prompt it was billed for (partial_usage): its spend is the consumer's to book
+                )
                 try:
                     async for event in entry.provider.stream(
                         messages, tools, target_model, max_tokens=max_tokens, temperature=temperature
                     ):
                         if event.type == "partial_usage":
+                            counted = True
                             if event.usage is not None and not event.usage.model:
                                 event.usage.model = target_model
                         else:
@@ -299,10 +303,12 @@ class Router:
                         auth_failed.add(entry_index)
                     if classified.reason is FailoverReason.context_overflow:
                         raise ContextOverflow(summarize(exc, limit=500)) from exc
-                    if streamed:
+                    if streamed or counted:
                         # The next attempt (same entry or the next one) streams the answer from the start: tell the
-                        # consumer to drop what it has, or it would see "Hello Hello world".
-                        streamed = False
+                        # consumer to drop what it has, or it would see "Hello Hello world". An attempt that only
+                        # counted its prompt gets one too: the consumer books that prompt as spent, and the next
+                        # attempt may be a provider that counts nothing up front.
+                        streamed = counted = False
                         yield StreamEvent(type="reset")
                     cooldown = self._cooldown_seconds(classified)
                     if cooldown is not None or classified.immediate_failover:

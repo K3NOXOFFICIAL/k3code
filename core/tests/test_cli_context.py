@@ -82,3 +82,37 @@ def test_the_repl_loop_gets_the_window_too(tmp_path, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
     asyncio.run(cli_mod._run_repl(model=None, permission_mode=PermissionMode.YOLO, config=config))
     assert max(reader.elided_markers) > 0
+
+
+def test_the_repl_keeps_the_conversation_across_prompts(tmp_path, monkeypatch):
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    seen: list[list[tuple[str, str]]] = []
+
+    class Echo(Provider):
+        def __init__(self) -> None:
+            self.name, self.base_url, self.api_key = "echo", "fake://", ""
+
+        async def aclose(self) -> None:
+            return None
+
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            seen.append([(m.role, str(m.content or "")) for m in messages if m.role != "system"])
+            reply = Message(role="assistant", content=f"answer {len(seen)}")
+            yield StreamEvent(type="text_delta", text=reply.content)
+            yield StreamEvent(type="done", message=reply, usage=Usage())
+
+    import k3code.providers as providers_mod
+
+    monkeypatch.setattr(providers_mod, "make_providers", lambda entries: [Echo()])
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    config = Settings(providers=[prov], default_model="default")
+    inputs = iter(["my secret word is pineapple", "what was my secret word?", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+    asyncio.run(cli_mod._run_repl(model=None, permission_mode=PermissionMode.YOLO, config=config))
+    assert seen[0] == [("user", "my secret word is pineapple")]
+    assert seen[1] == [
+        ("user", "my secret word is pineapple"),
+        ("assistant", "answer 1"),
+        ("user", "what was my secret word?"),
+    ]

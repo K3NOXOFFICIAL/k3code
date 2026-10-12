@@ -1189,13 +1189,25 @@ def _find_payloads(args: list[str]) -> list[str]:
     return out
 
 
+#: ``find`` tests that pick some of the files under a root (``-type`` and ``-maxdepth`` only shape the walk).
+_FIND_SELECTORS = frozenset(
+    {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-lname", "-ilname"}
+    | {"-newer", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-size", "-user", "-group", "-empty"}
+    | {"-perm", "-samefile", "-inum", "-uid", "-gid", "-nouser", "-nogroup", "-newerct", "-newerat", "-newermt"}
+)
+
+
 def _find_check(argv: list[str], cwd: str | None, home: str, dirs: list[str]) -> str | None:
-    """``find / ... -delete``."""
+    """``find / ... -delete``, and ``find ~ -delete`` / ``find ~ -type f -delete`` (the whole home directory, with no
+    test that picks some of its files: ``find ~ -name '*.pyc' -delete`` is an ordinary clean-up)."""
     if not argv or argv[0] != "find" or "-delete" not in argv:
         return None
     for root in _find_roots(argv[1:]):
-        if any(p in ("/", "/*") for p in _resolved(root, cwd, home, dirs)):
+        resolved = _resolved(root, cwd, home, dirs)
+        if any(p in ("/", "/*") for p in resolved):
             return "find-delete-root"
+        if any(p in (home, home + "/*") for p in resolved) and not _FIND_SELECTORS.intersection(argv):
+            return "rm-rf-home"
     return None
 
 

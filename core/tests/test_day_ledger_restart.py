@@ -63,3 +63,56 @@ def test_an_unreadable_log_counts_from_zero_as_before():
     ledger.loader = broken
     ledger.roll(today())
     assert (ledger.tokens, ledger.usd) == (0, 0.0)
+
+
+def test_cached_prompt_tokens_and_only_model_call_rows_count_in_the_log_totals(tmp_path):
+    db = UsageDB(tmp_path / "usage.db")
+    # one fully cached Opus 5.5 prompt of 1M tokens: a read costs 5% of the $4 input price
+    db.record("call", model="claude-opus-5-5", tokens_in=1_000_000, cache_read=1_000_000)
+    db.record("tool", model="claude-opus-5-5", tokens_in=500_000, tokens_out=500_000)  # not a model call
+    tokens, usd = day_loader(db, Settings())(today())
+    assert tokens == 1_000_000 and usd == pytest.approx(4.0 * 0.05)
+    # and a cache write is billed at 125% of the input price
+    db.record("call", model="claude-sonnet-5-5", tokens_in=1_000_000, cache_write=1_000_000)
+    _, usd = day_loader(db, Settings())(today())
+    assert usd == pytest.approx(4.0 * 0.05 + 2.0 * 1.25)
+
+
+def test_a_governor_with_an_empty_ledger_and_a_day_budget_is_quiet():
+    gov = Governor(day_ledger=_DayLedger())
+    gov.add_budget(Budget(scope="day", tokens=1))
+    assert gov.check_budgets() is None, "nothing counted: the control the restart tests are measured against"
+
+
+def test_a_gateway_daemon_starts_its_day_from_the_usage_log(tmp_path, monkeypatch):
+    """The wiring, not the ledger alone: a new GatewayServer reads what the log holds before it counts a token."""
+    from k3code.reliability.governor import DAY_LEDGER
+    from m1cmd_helpers import make_server
+
+    server, _ = make_server(tmp_path, monkeypatch, ["ok"])
+    server.usage.record("call", model="claude-opus-5-5", tokens_in=1_500_000, tokens_out=50_000)
+    gov = Governor(day_ledger=DAY_LEDGER)
+    gov.add_budget(Budget(scope="day", tokens=1_000_000))
+    err = gov.check_budgets()
+    assert err is not None and err.scope == "day", "1.55M tokens are in today's log: the 1M cap holds after a restart"
+
+
+def test_a_headless_run_starts_its_day_from_the_usage_log(tmp_path, monkeypatch):
+    import asyncio
+
+    from k3code import cli as cli_mod
+    from k3code.config import ProviderEntry
+    from k3code.permissions import PermissionMode
+    from k3code.reliability.governor import DAY_LEDGER
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    seed = UsageDB(tmp_path / "home" / "usage.db")
+    seed.record("call", model="claude-opus-5-5", tokens_in=1_500_000, tokens_out=50_000)
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    config = Settings(providers=[prov], default_model="default", reliability={"day_tokens": 1_000_000})
+    result = asyncio.run(
+        cli_mod._run_headless("go", model=None, permission_mode=PermissionMode.YOLO, config=config, json_output=True)
+    )
+    assert result is not None and result.get("error") == "budget_exceeded", result
+    DAY_LEDGER.loader, DAY_LEDGER.date = None, ""  # leave the process-wide ledger as the other tests expect it

@@ -84,3 +84,108 @@ async def test_an_overflow_before_any_tool_ran_reruns_the_prompt_as_before(tmp_p
     assert status == "done"
     assert COMPACTED_CONTINUATION not in [m["content"] for m in live.stored.messages]
     await server.close()
+
+
+async def test_a_background_note_is_not_lost_when_an_overflow_reruns_the_prompt(tmp_path, monkeypatch):
+    from k3code.subagents.runner import Handle
+    from test_auto_compaction import Recording, seed
+
+    prompts: list[str] = []
+
+    class Noting(Recording):
+        async def stream(self, messages, tools, model, **kw):
+            users = [str(m.content) for m in messages if m.role == "user"]
+            if users and "NEWPROMPT" in users[-1]:
+                prompts.append(users[-1])
+            async for event in super().stream(messages, tools, model, **kw):
+                yield event
+
+    provider = Noting(overflow_over=6000)
+    server, live = await seed(
+        tmp_path, monkeypatch, provider, context={"compact_at_tokens": 10_000_000, "keep_messages": 6}
+    )
+    h = Handle(id="sa-1", description="d", agent_type="worker", tier="main", depth=1, parent_sid=live.session_id)
+    h.status, h.result, h.background = "completed", "BGRESULT", True
+    server.subagents.handles["sa-1"] = h
+    status, text = await server._run_turn(live, "NEWPROMPT please")
+    assert status == "done", (text, live.last_error)
+    assert len(prompts) == 2 and all("BGRESULT" in p for p in prompts), "the rerun carries the note as well"
+    assert h.reported, "and the model has answered it by now"
+    await server.close()
+
+
+async def test_stop_during_the_overflow_summary_keeps_the_prompt_and_the_tool_work(tmp_path, monkeypatch):
+    import asyncio
+
+    target = tmp_path / "notes.txt"
+    target.write_text("the answer is 42\n")
+    started = asyncio.Event()
+
+    class Hanging(Scripted):
+        async def stream(self, messages, tools, model, **kw):
+            if messages and "summarize" in str(messages[0].content).lower() and not tools:
+                started.set()
+                await asyncio.sleep(3600)  # the summary call never answers
+            async for event in super().stream(messages, tools, model, **kw):
+                yield event
+
+    server, _ = make_server(
+        tmp_path, monkeypatch, ["unused"], context={"compact_at_tokens": 10_000_000, "keep_messages": 6}
+    )
+    provider = Hanging(str(target))
+    server.router = Router(build_chain([provider], [["m"]]), max_retries=0)
+    server._oneshot_routers = {"default": server.router}  # type: ignore[attr-defined]
+    server._tiers = None
+    live = server.live[await new_session(server, tmp_path)]
+    live.stored.messages = long_history()
+    task = asyncio.create_task(server._run_turn(live, "read notes.txt and tell me the answer"))
+    await asyncio.wait_for(started.wait(), timeout=20)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    msgs = live.stored.messages
+    assert "read notes.txt and tell me the answer" in [m["content"] for m in msgs if m["role"] == "user"]
+    assert sum(1 for m in msgs if m["role"] == "tool") == 1
+    await server.close()
+
+
+async def test_the_max_turns_cap_covers_the_whole_task_across_an_overflow_continuation(tmp_path, monkeypatch):
+    target = tmp_path / "notes.txt"
+    target.write_text("".join(f"line {i}\n" for i in range(50)))
+
+    class Looping:
+        """Always asks for another read; its third request overflows once."""
+
+        name, base_url = "fake", "fake://"
+
+        def __init__(self) -> None:
+            self.requests = 0  # model requests answered (the summary call and the refused request do not count)
+
+        async def stream(self, messages, tools, model, **kw):
+            if messages and "summarize" in str(messages[0].content).lower() and not tools:
+                reply = Message(role="assistant", content="a short summary")
+            else:
+                n = self.requests + 1
+                if n == 3 and not getattr(self, "refused", False):
+                    self.refused = True
+                    raise ProviderError("maximum context length is 1000 tokens, however you requested 9000", 400)
+                self.requests += 1
+                call = ToolCall(id=f"c{self.requests}", name="read", arguments={"path": str(target), "offset": n})
+                reply = Message(role="assistant", content=None, tool_calls=[call])
+            yield StreamEvent(type="done", message=reply, usage=Usage())
+
+        async def aclose(self) -> None:
+            return None
+
+    server, _ = make_server(
+        tmp_path, monkeypatch, ["unused"], context={"compact_at_tokens": 10_000_000, "keep_messages": 4}
+    )
+    server.config.max_turns = 4
+    provider = Looping()
+    server.router = Router(build_chain([provider], [["m"]]), max_retries=0)
+    server._oneshot_routers = {"default": server.router}  # type: ignore[attr-defined]
+    server._tiers = None
+    live = server.live[await new_session(server, tmp_path)]
+    live.stored.messages = long_history()
+    await server._run_turn(live, "keep reading")
+    assert provider.requests == 4, "two before the overflow and the two that are left of the four, not four more"
+    await server.close()

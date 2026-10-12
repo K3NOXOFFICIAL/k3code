@@ -323,3 +323,21 @@ async def test_unattended_runs_refuse_to_default_to_the_daemons_home_cwd(tmp_pat
     assert (await runner.run_prompt("hi")).status == "completed"
     await eng.stop()
     await server.close()
+
+
+async def test_a_goal_run_stops_the_background_children_it_leaves_behind(tmp_path, monkeypatch):
+    from k3code.automation.server_runner import ServerRunner
+
+    server, provider = make_server(tmp_path, monkeypatch, ["goal reply"])
+    server.config.goal.persist = False
+    interrupted: list[str] = []
+    real = server.subagents.interrupt_session
+
+    def spy(session_id: str):
+        interrupted.append(session_id)
+        return real(session_id)
+
+    server.subagents.interrupt_session = spy  # type: ignore[method-assign]
+    await ServerRunner(server).start_goal("tidy the repo", None, str(tmp_path))
+    assert len(interrupted) == 1, "the fresh session's background children are stopped once the run is over"
+    await server.close()

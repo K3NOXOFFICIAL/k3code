@@ -32,6 +32,7 @@ def build_system_prompt(
     mcp: Any = None,
     skills: bool = True,
     learned: list[str] | None = None,
+    frozen: dict[str, Any] | None = None,
 ) -> str:
     # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
     # come first and the learned ones last. Every message follows the prompt, so any change to it makes the provider
@@ -50,20 +51,29 @@ def build_system_prompt(
         parts.append(index)
     if mcp is not None and (m := mcp_prompt(mcp)):
         parts.append(m)
-    from k3code.learning.projectprep import facts_prompt
-
-    if facts := facts_prompt(cwd):  # the stored stack scan; with or without a memory file, changes on re-scan only
-        parts.append(facts)
-    if mem := memory_prompt(cwd, limit=int(ctx.get("memory_chars", MAX_MEMORY_CHARS)), learned=learned):
-        parts.append(mem)
     from k3code.learning.gotchas import gotchas_prompt, user_gotchas_prompt
     from k3code.learning.optimizer import overlay_prompt
+    from k3code.learning.projectprep import facts_prompt
 
-    if gotchas := gotchas_prompt(cwd):  # accepted project gotchas; changes only when one is accepted
+    # What background writers change (a re-scan of the stack, the daily distill of USER.md, an accepted gotcha, the
+    # optimizer) is taken once per session when ``frozen`` is given: from any other session, one of them rewrote this
+    # session's prompt and with it the provider's cache of the whole conversation.
+    def once(key: str, make: Any) -> str:
+        if frozen is None:
+            return make()
+        if key not in frozen:
+            frozen[key] = make()
+        return frozen[key]
+
+    if facts := once("facts", lambda: facts_prompt(cwd)):  # the stored stack scan
+        parts.append(facts)
+    mem_limit = int(ctx.get("memory_chars", MAX_MEMORY_CHARS))
+    if mem := memory_prompt(cwd, limit=mem_limit, learned=learned, frozen=frozen):
+        parts.append(mem)
+    if gotchas := once("gotchas", lambda: gotchas_prompt(cwd)):  # accepted project gotchas
         parts.append(gotchas)
-    if machine := user_gotchas_prompt():  # lines learned alike in several projects; changes only when one is added
+    if machine := once("machine_gotchas", user_gotchas_prompt):  # lines learned alike in several projects
         parts.append(machine)
-
-    if overlay := overlay_prompt():
+    if overlay := once("overlay", overlay_prompt):
         parts.append(overlay)
     return "\n\n".join(parts) + "\n"

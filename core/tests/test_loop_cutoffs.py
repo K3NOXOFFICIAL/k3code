@@ -75,6 +75,25 @@ async def test_the_widened_limit_never_passes_the_bound(tmp_path):
     assert p.limits == [MAX_WIDENED_TOKENS], "already at the bound: no retry, just the notice"
 
 
+async def test_the_widened_retry_stays_within_a_quarter_of_the_window(tmp_path):
+    # a 32k window clamps the first call to 8192; doubling would ask 16384 next to an 18k prompt, which servers refuse
+    p = Recording([reply(None, "max_tokens")])
+    texts: list[str] = []
+
+    async def collect(delta: str) -> None:
+        texts.append(delta)
+
+    loop = loop_for(p, tmp_path, context_window=32_768)
+    loop.on_text_delta = collect
+    [e async for e in loop.run("go", max_tokens=16384)]
+    assert p.limits == [8192], "the clamp is already the ceiling: no wider retry"
+    assert "larger context window" in "".join(texts) and "Raise max_tokens" not in "".join(texts)
+    # a window with room still gets the one wider retry, up to its quarter
+    p = Recording([reply(None, "max_tokens"), reply("answer")])
+    [e async for e in loop_for(p, tmp_path, context_window=48_000).run("go", max_tokens=8192)]
+    assert p.limits == [8192, 12_000]
+
+
 async def test_a_cut_off_reply_with_text_is_still_continued(tmp_path):
     p = Recording([reply("part one", "max_tokens"), reply(" part two")])
     [e async for e in loop_for(p, tmp_path).run("go")]

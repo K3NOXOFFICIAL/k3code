@@ -84,3 +84,21 @@ def test_other_tools_keep_clipping_and_the_marker_says_how_to_get_the_rest():
     grep_sent, bash_sent = (m.content for m in clip_tool_results(msgs))
     assert len(grep_sent) < 10_300 and "grep a narrower pattern" in grep_sent
     assert len(bash_sent) < 10_300 and "head, tail or sed -n" in bash_sent
+
+
+async def test_a_negative_offset_reads_the_end_of_the_file(tmp_path):
+    f = tmp_path / "app.log"
+    f.write_text("".join(f"row {i}\n" for i in range(1, 101)))
+    text = await read_text(f, offset=-5)
+    assert [ln.split("\t")[1] for ln in text.split("\n")[:5]] == [f"row {n}" for n in range(96, 101)]
+    assert "row 95" not in text and "row 96" in text
+    assert "row 1\n" in await read_text(f, offset=-500), "more than the file has: all of it"
+    two = await read_text(f, offset=-5, limit=2)
+    assert "row 96" in two and "row 97" in two and "row 98" not in two
+
+
+async def test_a_limit_below_one_is_an_error_not_one_line(tmp_path):
+    f = tmp_path / "a.txt"
+    f.write_text("one\ntwo\n")
+    assert (await tool_read({"path": str(f), "limit": 0}))["error"].startswith("limit must be at least 1")
+    assert "error" in await tool_read({"path": str(f), "offset": "x"})

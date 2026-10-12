@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from k3code.paths import ensure_private_dir, home, private_file, project_state_dir
 from k3code.redact import REDACTED, scrub_text
@@ -209,19 +210,25 @@ def memory_prompt(
     total: int = MAX_MEMORY_TOTAL,
     *,
     learned: list[str] | None = None,
+    frozen: dict[str, Any] | None = None,
 ) -> str:
     """User memory as written; the repository's memory files fenced as what they are (text from the repository).
 
     Each file is capped at ``limit`` characters and all of them together at ``total``; past that the rest are left
     out with one marker line. ``learned``: the learned notes to show (a session's snapshot, see
-    ``LiveSession.learned_notes``); None reads learned.md now.
+    ``LiveSession.learned_notes``); None reads learned.md now. ``frozen``: a session's dict that keeps the user memory
+    file's text as the session first saw it (the daily distill rewrites it from any session; the project's files are
+    the repository's and are read each time).
     """
     parts = []
     root = project_root(cwd)
     files = load_memory(cwd)
     left = total
     for i, m in enumerate(files):
-        body = m.text if len(m.text) <= limit else m.text[:limit] + "\n…(truncated)"
+        text = m.text
+        if frozen is not None and m.scope == "user":
+            text = frozen.setdefault("user_memory", text)
+        body = text if len(text) <= limit else text[:limit] + "\n…(truncated)"
         if left <= 0:
             parts.append(TOTAL_MARKER.format(n=len(files) - i, cap=total))
             break

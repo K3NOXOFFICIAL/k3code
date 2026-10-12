@@ -37,6 +37,16 @@ PRICES_PER_MTOK: tuple[tuple[str, float, float], ...] = (
 )
 CACHE_READ_MULTIPLE = 0.1
 CACHE_WRITE_MULTIPLE = 1.25
+#: Claude models whose cache read is cheaper than 10% of the input price (documented rates; the first match wins).
+CLAUDE_CACHE_READ_MULTIPLES: tuple[tuple[str, float], ...] = (
+    ("fable-5-1", 0.025),
+    ("mythos-5-1", 0.025),
+    ("opus-5-5", 0.05),
+)
+#: A prompt above this many tokens is billed at the second rate card of the models that have two.
+LONG_PROMPT_TOKENS = 100_000
+#: Haiku 5's rates for a prompt above LONG_PROMPT_TOKENS (input, output USD per million tokens).
+HAIKU_5_LONG_PROMPT = (0.50, 2.50)
 #: Names that are Claude models without "claude" in the id (the aliases of the claude-cli provider, the 5-family).
 CLAUDE_NAMES = ("claude", "opus", "sonnet", "haiku", "fable", "mythos")
 #: What a cached prompt token costs next to a fresh one, for the other families that price it (OpenAI's cached input is
@@ -58,10 +68,19 @@ def model_price(config: Any, model: str) -> tuple[float, float] | None:
         except (KeyError, TypeError, ValueError):
             pass
     name = model.lower().rsplit("/", 1)[-1]
+    dashed = name.replace(".", "-")  # gateways (OpenRouter, LiteLLM) write claude-opus-4.1 where Anthropic writes 4-1
+    if dashed.endswith("opus-4"):  # "claude-opus-4" on its own is Opus 4.0; the needles below need a minor version
+        return 15.0, 75.0
     for needle, price_in, price_out in PRICES_PER_MTOK:
-        if needle in name:
+        if needle in name or needle in dashed:
             return price_in, price_out
     return None
+
+
+def _configured_price(config: Any, model: str) -> bool:
+    """Whether the config names a price for ``model`` itself (then no built-in rate card is second-guessed)."""
+    entry = ((getattr(config, "models", None) or {}).get(model) or {}).get("price")
+    return isinstance(entry, dict)
 
 
 def estimate_usd(config: Any, usage: Any) -> float | None:
@@ -78,9 +97,13 @@ def estimate_usd(config: Any, usage: Any) -> float | None:
     prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
     read = int(getattr(usage, "cache_read_tokens", 0) or 0)
     written = int(getattr(usage, "cache_creation_tokens", 0) or 0)
-    name = str(getattr(usage, "model", "")).lower()
+    model = str(getattr(usage, "model", "") or "")
+    name = model.lower()
+    dashed = name.replace(".", "-")
+    if "haiku-5" in dashed and prompt > LONG_PROMPT_TOKENS and not _configured_price(config, model):
+        price_in, price_out = HAIKU_5_LONG_PROMPT
     if any(n in name for n in CLAUDE_NAMES):
-        read_x = CACHE_READ_MULTIPLE
+        read_x = next((x for needle, x in CLAUDE_CACHE_READ_MULTIPLES if needle in dashed), CACHE_READ_MULTIPLE)
         write_x = getattr(usage, "cache_write_multiple", None) or CACHE_WRITE_MULTIPLE  # the 1-hour cache costs 2x
     else:  # no documented write surcharge; a read is discounted only for the families that say so
         read_x = next((x for needle, x in CACHE_READ_MULTIPLES if needle in name), 1.0)

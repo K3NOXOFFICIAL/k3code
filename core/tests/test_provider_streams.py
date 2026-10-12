@@ -168,6 +168,21 @@ def test_openrouters_reported_cost_is_kept_only_for_openrouter():
     assert _parse_usage({"prompt_tokens": 1, "cost": -1}, reports_cost=True).cost_usd is None
 
 
+def test_an_openrouter_call_on_the_users_own_key_counts_the_upstream_charge_too():
+    from k3code.providers.openai_compat import _parse_usage
+
+    byok = {
+        "prompt_tokens": 100_000,
+        "cost": 0.0,
+        "is_byok": True,
+        "cost_details": {"upstream_inference_cost": 0.52},
+    }
+    assert _parse_usage(byok, reports_cost=True).cost_usd == pytest.approx(0.52)
+    # without the flag the upstream figure is not added (it could already be inside `cost`)
+    assert _parse_usage({**byok, "is_byok": False, "cost": 0.6}, reports_cost=True).cost_usd == pytest.approx(0.6)
+    assert _parse_usage({**byok, "cost_details": ["not", "a", "dict"]}, reports_cost=True).cost_usd == 0.0
+
+
 async def test_anthropic_input_counts_finalized_in_message_delta_are_used():
     body = (
         'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":0}}}\n\n'
@@ -257,6 +272,36 @@ async def test_an_attempt_that_died_before_any_text_is_charged_when_the_retry_st
     assert provider.calls == 3 and spent(loop) == 700 + 700 + 705
 
 
+async def test_an_attempt_that_died_is_charged_when_the_failover_provider_counts_nothing_up_front(tmp_path):
+    from k3code.agent.loop import AgentLoop
+    from k3code.providers.types import StreamEvent, Usage
+    from k3code.reliability.governor import Budget
+    from k3code.router import Router, build_chain
+
+    class Plain:
+        """An OpenAI-compatible server: usage only arrives with the final message."""
+
+        name, base_url = "plain", "https://plain.test"
+
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            usage = Usage(prompt_tokens=700, completion_tokens=5)
+            yield StreamEvent(type="done", message=Message(role="assistant", content="ok", usage=usage), usage=usage)
+
+        async def aclose(self):
+            pass
+
+    dying = Flaky(dies=1, text_before_dying=False)
+    loop = AgentLoop(
+        Router(build_chain([dying, Plain()], [["m"], ["m"]]), max_retries=0),
+        system_prompt="t",
+        cwd=tmp_path,
+        permission_mode="yolo",
+    )
+    loop.reliability.governor.add_budget(Budget(scope="session", tokens=1_000_000))
+    [e async for e in loop.run("go")]
+    assert dying.calls == 1 and spent(loop) == 700 + 705
+
+
 async def test_a_stop_while_streaming_charges_the_prompt_the_provider_had_counted(tmp_path):
     from k3code.providers.types import StreamEvent, Usage
 
@@ -340,3 +385,60 @@ async def test_a_call_a_server_reports_no_usage_for_still_counts_for_the_budget_
     loop2.reliability.governor.add_budget(Budget(scope="session", tokens=1_000_000))
     [e async for e in loop2.run("q")]
     assert loop2.reliability.governor._budgets["session"].used_tokens == 12, "a reported figure is never replaced"
+
+
+async def test_the_one_hour_cache_ttl_is_priced_by_the_provider_that_asked_for_it():
+    def provider(ttl: str, cache: str = "auto") -> AnthropicProvider:
+        return AnthropicProvider(
+            name="a",
+            base_url="https://a.test",
+            api_key="k",
+            client=client(OK_ANTHROPIC),
+            cache_ttl=ttl,
+            prompt_cache=cache,
+        )
+
+    assert (await run(provider("1h")))[-1].usage.cache_write_multiple == 2.0
+    assert (await run(provider("5m")))[-1].usage.cache_write_multiple is None
+    assert (await run(provider("1h", cache="off")))[-1].usage.cache_write_multiple is None, "no cache, no surcharge"
+
+
+COST_BODY = (
+    'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+    'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"cost":%s}}\n\n'
+    "data: [DONE]\n\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("base_url", "cost", "expected"),
+    [
+        ("https://openrouter.ai/api/v1", "0.0042", 0.0042),
+        ("https://openrouter.ai/api/v1", "0", 0.0),  # a free model: nothing to pay, not a price-table guess
+        ("https://my-vllm.internal/v1", "5.0", None),  # another server's `cost` is not assumed to be dollars
+    ],
+)
+async def test_a_cost_field_is_dollars_only_from_openrouter(base_url, cost, expected):
+    provider = OpenAICompatProvider(name="o", base_url=base_url, api_key="k", client=client(COST_BODY % cost))
+    assert (await run(provider))[-1].usage.cost_usd == expected
+
+
+async def test_the_router_names_the_model_a_partial_usage_belongs_to():
+    from k3code.providers.types import StreamEvent, Usage
+    from k3code.router import Router, build_chain
+
+    class Counting:
+        name, base_url = "p", "https://p.test"
+
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            yield StreamEvent(type="partial_usage", usage=Usage(prompt_tokens=700))
+            done = Usage(prompt_tokens=700, completion_tokens=5)
+            yield StreamEvent(type="done", message=Message(role="assistant", content="ok", usage=done), usage=done)
+
+        async def aclose(self):
+            pass
+
+    router = Router(build_chain([Counting()], [["claude-opus-5-5"]]), max_retries=0)
+    events = [e async for e in router.stream(MSGS, [], model="claude-opus-5-5")]
+    partial = next(e for e in events if e.type == "partial_usage")
+    assert partial.usage.model == "claude-opus-5-5", "an attempt that died is priced as the model it was sent to"
