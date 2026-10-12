@@ -553,20 +553,45 @@ _RG_EXCLUDES = ("!node_modules/", "!__pycache__/", "!.venv/", "!**/.claude/workt
 _RG_MAX_COLUMNS = 400
 
 
+def _grep_line(raw: str) -> tuple[str, bool]:
+    """An ``rg --null`` output line as ``path:line:text``, and whether it comes from a credential file
+    (``sensitive_path``: dotenv files, ``~/.ssh`` ...). An include glob such as ``*`` or ``.env*`` turns rg's
+    hidden-file filter off, so this is what keeps ``.env`` out of a search."""
+    from k3code.permissions.engine import sensitive_path
+
+    path, sep, rest = raw.partition("\0")
+    if not sep:
+        return raw, False  # one file searched: rg prints no name, and the engine has decided on that path already
+    return f"{path}:{rest}", sensitive_path(os.path.abspath(path))
+
+
+def _note_withheld(result: dict[str, Any], note: str) -> dict[str, Any]:
+    """``result`` with ``note`` added to its warnings (a string, or a list of stderr lines)."""
+    warnings = result.get("warnings")
+    if isinstance(warnings, list):
+        result["warnings"] = [*warnings, note]
+    else:
+        result["warnings"] = f"{warnings}; {note}" if warnings else note
+    return result
+
+
 async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S."""
+    """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S.
+    Lines from credential files are never returned (see _grep_line)."""
     pattern = arguments["pattern"]
     path = _resolve_path(arguments.get("path", "."), cwd)
     include = arguments.get("include")
     exclude = arguments.get("exclude")
     try:
-        cmd = ["rg", "--line-number", "--no-heading", "--color=never"]
+        # --null: a NUL after each file name, so a credential file is told apart even with ':' in its path
+        cmd = ["rg", "--line-number", "--no-heading", "--color=never", "--null"]
         cmd += [f"--max-columns={_RG_MAX_COLUMNS}", "--max-columns-preview"]
-        for glob in _RG_EXCLUDES:
-            cmd += ["-g", glob]
         if include:
             for inc in include if isinstance(include, list) else [include]:
                 cmd += ["-g", inc]
+        # the last matching glob wins: the excludes come after include, so `include: "*"` cannot bring node_modules back
+        for glob in _RG_EXCLUDES:
+            cmd += ["-g", glob]
         if exclude:
             for exc in exclude if isinstance(exclude, list) else [exclude]:
                 cmd += ["-g", f"!{exc}"]
@@ -581,6 +606,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         )
         assert proc.stdout is not None and proc.stderr is not None
         lines: list[str] = []
+        withheld = 0
         cut = ""
         deadline = time.monotonic() + SEARCH_BUDGET_S
         while True:
@@ -591,7 +617,11 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 break
             if not raw:
                 break
-            lines.append(raw.decode("utf-8", errors="replace").rstrip("\n"))
+            line, secret = _grep_line(raw.decode("utf-8", errors="replace").rstrip("\n"))
+            if secret:
+                withheld += 1
+                continue
+            lines.append(line)
             if len(lines) > MAX_SEARCH_RESULTS:  # one past the cap proves the cut; stop rg instead of reading on
                 lines = lines[:MAX_SEARCH_RESULTS]
                 cut = f"truncated to the first {MAX_SEARCH_RESULTS} matching lines: {_NARROW}"
@@ -600,17 +630,22 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
             await proc.communicate()  # not wait(): it only returns once the pipes drain, and a full one never would
-            return {"matches": "\n".join(lines).strip(), "warnings": cut}
-        stderr = await proc.stderr.read()
-        await proc.wait()
-        matches = "\n".join(lines).strip()
-        if proc.returncode == 2 and matches:
-            # rg exits 2 when any entry was unreadable (a root-owned dir) but still prints every other match
-            note = stderr.decode("utf-8", errors="replace").strip().splitlines()[:3]
-            return {"matches": matches, "warnings": note}
-        if proc.returncode not in (0, 1):  # 1 = no matches
-            raise RuntimeError(stderr.decode("utf-8", errors="replace"))
-        return {"matches": matches}
+            result: dict[str, Any] = {"matches": "\n".join(lines).strip(), "warnings": cut}
+        else:
+            stderr = await proc.stderr.read()
+            await proc.wait()
+            matches = "\n".join(lines).strip()
+            if proc.returncode == 2 and (matches or withheld):
+                # rg exits 2 when any entry was unreadable (a root-owned dir) but still prints every other match
+                note = stderr.decode("utf-8", errors="replace").strip().splitlines()[:3]
+                result = {"matches": matches, "warnings": note}
+            elif proc.returncode not in (0, 1):  # 1 = no matches
+                raise RuntimeError(stderr.decode("utf-8", errors="replace"))
+            else:
+                result = {"matches": matches}
+        if withheld:
+            _note_withheld(result, f"{withheld} matching line(s) in credential files (.env, keys) not shown")
+        return result
     except (FileNotFoundError, RuntimeError):
         # Python fallback (no rg): off the event loop, same tree rules as glob, capped
         return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude)
@@ -787,6 +822,8 @@ def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
 def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict[str, Any]:
     import re
 
+    from k3code.permissions.engine import sensitive_path
+
     includes = include if isinstance(include, list) else [include] if include else []
     excludes = exclude if isinstance(exclude, list) else [exclude] if exclude else []
     rx = re.compile(pattern)
@@ -796,6 +833,7 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
     else:
         base, candidates = path, _iter_tree(path, deadline)
     matches: list[str] = []
+    skipped = 0
     timed_out = False
     for rel, is_dir in candidates:
         if rel is None or time.monotonic() > deadline:
@@ -808,6 +846,9 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
             continue
         if excludes and any(Path(fp.name).match(p) for p in excludes):
             continue
+        if sensitive_path(str(fp)):  # the tree walk lists hidden files too: dotenv files and key dirs stay out
+            skipped += 1
+            continue
         try:
             text = fp.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -818,7 +859,10 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
     shown, note = _capped(matches)
     if timed_out:
         note = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(shown)} matching lines so far: {_NARROW}"
-    return {"matches": "\n".join(shown), **({"warnings": note} if note else {})}
+    result = {"matches": "\n".join(shown), **({"warnings": note} if note else {})}
+    if skipped:
+        _note_withheld(result, f"{skipped} credential file(s) (.env, keys) not searched")
+    return result
 
 
 async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
