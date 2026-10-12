@@ -253,15 +253,24 @@ def _redirects_ok(plain: str, roots: list[str], cwd: str) -> bool:
     return True
 
 
-def _voids_allow(sub: str, rule: Rule, ruleset: list[Rule], roots: list[str], cwd: str) -> bool:
+def _voids_allow(
+    sub: str,
+    rule: Rule,
+    ruleset: list[Rule],
+    roots: list[str],
+    cwd: str,
+    heredocs: list[hardline.Heredoc] | None = None,
+) -> bool:
     """A redirect or command substitution turns an allowed prefix into something else (``ls > ~/.bashrc``,
     ``git commit -m "$(evil)"``). Builtin read-only allows never cover either. A rule the user approved (session /
     project / user layer) still covers redirects into the project and substitutions whose contents are themselves
     allowed. Before, an "always allow git commit" also allowed ``git commit > ~/.bashrc`` and ``git commit -m
-    "$(evil)"``."""
+    "$(evil)"``. The substitutions in the body of an unquoted heredoc (``cat <<EOF``) run too: they count like those
+    on the command line (``sub`` has no body)."""
     plain = _HARMLESS_REDIRECT.sub("", sub)
     has_redirect = bool(_REDIRECT.search(plain))
-    has_subst = bool(_SUBSTITUTION.search(plain))
+    body_payloads = [p for h in heredocs or () for p in h.payloads]
+    has_subst = bool(_SUBSTITUTION.search(plain)) or bool(body_payloads)
     if rule.layer == 0:
         # the builtin read-only allowlist covers the project only: `cat /etc/x`, `grep -r k ~` and `ls $DIR` ask
         return has_redirect or has_subst or any(_arg_outside(a, roots, cwd) for a in _path_args(sub))
@@ -270,6 +279,9 @@ def _voids_allow(sub: str, rule: Rule, ruleset: list[Rule], roots: list[str], cw
     if not has_subst:
         return False
     nested = hardline.parse(sub).nested
+    for payload in body_payloads:
+        inner = hardline.parse(payload)
+        nested = [*nested, *inner.subs, *inner.nested]
     return not nested or any(
         evaluate("bash", n, ruleset, default="ask").action != "allow" or hardline.is_launcher(n) for n in nested
     )
@@ -702,9 +714,13 @@ def _decide_bash(
             action="deny", patterns=prefixes, message=f"Auto mode writes only inside the project roots: {command[:120]}"
         )
     worst: Rule | None = None
-    for sub in subs:
+    for k, sub in enumerate(subs):
         rule = evaluate("bash", sub, ruleset, default="ask")
-        if rule.action == "allow" and _voids_allow(sub, rule, ruleset, roots, cwd):
+        # no rule vouches for a program fed to an interpreter through a heredoc (`bash <<EOF`, `cat <<EOF | sh`): the
+        # command line does not say what runs
+        if rule.action == "allow" and (
+            parsed.code_heredoc[k] or _voids_allow(sub, rule, ruleset, roots, cwd, parsed.heredocs[k])
+        ):
             rule = Rule(tool="bash", pattern="*", action="ask")
         if rule.action == "allow" and rule.layer == 0 and "\n" in sub:
             unsafe = True  # the builtin read-only allowlist covers one-line commands only
