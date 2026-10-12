@@ -125,6 +125,27 @@ def test_onboard_fast_api_writes_a_loadable_config_and_keeps_the_key_out_of_it(r
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
 
 
+def test_onboard_fast_stops_on_an_unreadable_config_before_it_stores_the_key(root) -> None:
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    user_config_path().write_text("providers: [unclosed\n  - : :\n")  # not YAML
+    answers = _answers(
+        root,
+        {
+            "onboard": {
+                "mode": "fast",
+                "provider": "api",
+                "endpoint": "http://127.0.0.1:9/v1/",
+                "key": "sk-SECRET-EARLY",
+                "model": "m",
+            }
+        },
+    )
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code != 0 and "Traceback" not in r.output, r.output
+    env_file = root / "xdg" / "k3code" / "env"
+    assert not env_file.exists() or "SECRET-EARLY" not in env_file.read_text(), "the key was stored before the config"
+
+
 def test_onboard_full_runs_the_wizard_and_records_the_answer(root, monkeypatch) -> None:
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(ob, "run_setup", lambda p, **kw: calls.append(kw))

@@ -156,3 +156,34 @@ async def test_the_first_side_call_of_a_cold_daemon_is_counted_once_by_the_day_l
     await server.model_caller.complete(TaskKind.TITLE, [Message(role="user", content="x")], session_id=live.session_id)
     assert DAY_LEDGER.tokens == 600
     await server.close()
+
+
+async def test_an_advisor_call_that_thought_its_whole_cap_away_is_asked_again_without_the_effort():
+    from types import SimpleNamespace
+
+    from k3code.providers import effort as effort_mod
+    from k3code.routing.caller import ModelCaller
+
+    seen: list[str | None] = []
+
+    class Router:
+        async def complete(self, messages, tools, **kw):
+            seen.append(effort_mod.REASONING_EFFORT.get())
+            text = "" if len(seen) == 1 else "VERDICT: pass"
+            return SimpleNamespace(content=text, usage=None)
+
+    class Routers:
+        def get(self, tier):
+            return Router()
+
+    caller = ModelCaller(lambda: Routers(), SimpleNamespace(task_tiers=None), None)
+    token = effort_mod.REASONING_EFFORT.set("max")
+    try:
+        res = await caller.complete(TaskKind.ADVISOR, [Message(role="user", content="x")], max_tokens=500)
+        assert res.text == "VERDICT: pass" and seen == ["max", None]
+        assert effort_mod.REASONING_EFFORT.get() == "max", "restored after the retry"
+        seen.clear()
+        res = await caller.complete(TaskKind.TITLE, [Message(role="user", content="x")])  # no effort to drop: one call
+        assert len(seen) == 1 and res.text == ""
+    finally:
+        effort_mod.REASONING_EFFORT.reset(token)

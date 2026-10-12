@@ -57,6 +57,11 @@ def test_hardline_denied(command: str) -> None:
         "find ~ -name '*.pyc' -delete",
         "find ~/project -type f -delete",
         "find . -delete",
+        "find ~ -name '*.pyc' | xargs rm",
+        "echo build | xargs rm -rf",
+        "echo ~/project | xargs rm -rf",
+        "find . | xargs rm -rf",
+        "echo ~ | xargs ls",
     ],
 )
 def test_hardline_allowed(command: str) -> None:

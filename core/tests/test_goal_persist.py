@@ -326,3 +326,48 @@ async def test_a_failed_retry_does_not_leave_its_unanswered_prompt_in_the_histor
     # the user's own prompt, then only the retry that got an answer: not one recovery prompt per failed attempt
     assert users[0] == "start" and len(users) == 2 and "did not finish" in users[1]
     await server.close()
+
+
+async def _prompt_after(kind: str, mgr: GoalManager) -> str:
+    if kind == "continue":
+        return (await mgr.evaluate_after_turn("step", judge_of(("continue", "more", False, False)))).prompt
+    if kind == "blocked":
+        return (await mgr.evaluate_after_turn("stuck", judge_of(("blocked", "needs a key", False, False)))).prompt
+    if kind == "advisor":
+
+        async def reviewer(goal):
+            return True, ["the tests were not run"]
+
+        return (
+            await mgr.evaluate_after_turn("done!", judge_of(("done", "ok", False, False)), reviewer=reviewer)
+        ).prompt
+    assert kind == "empty"
+    decision = None
+    for _ in range(goals.MAX_CONSECUTIVE_EMPTY):
+        decision = await mgr.evaluate_after_turn("", judge_of(("continue", "nothing said", False, False)))
+    assert decision is not None
+    return decision.prompt
+
+
+@pytest.mark.parametrize("kind", ["continue", "blocked", "advisor", "empty"])
+async def test_every_prompt_that_continues_a_goal_quotes_a_long_one(kind):
+    mgr, _, _ = manager()
+    long = ("Migrate everything. " + "part " * 300).strip()
+    mgr.set(long)
+    prompt = await _prompt_after(kind, mgr)
+    assert long not in prompt and goals.quote(long) in prompt, kind
+
+
+async def test_the_retry_prompt_of_a_failed_turn_quotes_a_long_goal_too(tmp_path, monkeypatch):
+    from m1cmd_helpers import make_server, new_session
+
+    server, _ = make_server(tmp_path, monkeypatch, replies=["x"])
+    sid = await new_session(server, tmp_path)
+    live = server.live[sid]
+    mgr = server.goal_manager(live)
+    long = ("Migrate everything. " + "part " * 300).strip()
+    mgr.set(long)
+    live.last_error = "boom"
+    delay, prompt, notice = server._goal_recovery(live, mgr, "error")
+    assert long not in prompt and goals.quote(long) in prompt
+    await server.close()

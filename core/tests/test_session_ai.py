@@ -126,3 +126,28 @@ def test_a_misspelled_context_key_is_warned_about_and_the_real_ones_are_not(tmp_
         load_config(project_dir=tmp_path)
     assert "context.compact_at_token is not used" in caplog.text
     assert "context.compact_at_tokens is not used" not in caplog.text and "context.keep_messages" not in caplog.text
+
+
+def test_every_context_key_the_code_reads_is_quiet_in_a_config(tmp_path, monkeypatch, caplog):
+    import logging
+
+    from k3code.config import load_config
+    from k3code.context_budget import CONTEXT_KEYS
+    from k3code.paths import user_config_path
+
+    values = {
+        "autocompact": "true",
+        "compact_at_ratio": "0.6",
+        "compact_at_tokens": "90000",
+        "compact_input_chars": "60000",
+        "decision_model": "false",
+        "keep_messages": "6",
+        "memory_chars": "20000",
+        "skill_prompt_limit": "20",
+        "tool_output_chars": "10000",
+    }
+    assert set(values) == set(CONTEXT_KEYS), "a new context key needs a value here and a place in CONTEXT_KEYS"
+    user_config_path().write_text("context:\n" + "".join(f"  {k}: {v}\n" for k, v in values.items()), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="k3code.config"):
+        load_config(project_dir=tmp_path)
+    assert "is not used" not in caplog.text, caplog.text

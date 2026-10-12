@@ -31,7 +31,9 @@ async def test_a_requirement_at_the_end_of_a_long_first_prompt_survives_every_co
     assert folded > 0
     anchor = new[0]["content"]
     assert instruction in anchor and anchor.startswith("context dump") and len(anchor) <= TASK_ANCHOR_CHARS
-    assert "chars omitted" in anchor
+    head = TASK_ANCHOR_CHARS - TASK_ANCHOR_CHARS // 3 - 48
+    omitted = len(first) - head - TASK_ANCHOR_CHARS // 3
+    assert f"…[{omitted:,} chars omitted]…" in anchor, "the note states exactly how much was left out"
     # twelve more rounds: the anchor is never re-clipped (so its omitted count stays true) and the requirement stays
     for _ in range(12):
         new, _ = await compact_messages(caller, [*new, *filler(8)], keep=4)
@@ -49,7 +51,8 @@ async def test_the_summary_model_reads_the_end_of_tool_results_and_long_user_mes
     assert "== 3 failed, 41 passed ==" in seen, "a tool result keeps its end, where the verdict is"
     assert "LAST STEP: publish the release notes" in seen, "a later plan is not cut at 3000 characters"
     # and a tool result is not shown whole
-    assert max(len(line) for line in seen.splitlines() if line.startswith("tool bash")) < COMPACT_TOOL_CHARS + 40
+    assert COMPACT_TOOL_CHARS == 400, "the number this test is written for"
+    assert max(len(line) for line in seen.splitlines() if line.startswith("tool bash")) < 440
 
 
 async def test_an_earlier_summary_is_shown_whole_to_the_next_one():

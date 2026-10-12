@@ -159,6 +159,11 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any
 
 def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
     """Fast setup: one provider with defaults for everything else. Picks what is already set up here first."""
+    from k3code import confio
+
+    # read the config first: one that cannot be read stops the wizard here, not after the API key was asked for and
+    # written to the env file
+    before = confio.read_yaml(user_config_path()).get("providers") or []
     found = detect_providers() if p.interactive else {}
     for name, why in found.items():
         p.say(f"  found {name}: {why}")
@@ -184,9 +189,6 @@ def run_fast(p: Prompter, *, do_probe: bool = True) -> None:
         "providers": {"entries": [entry]},
         "tiers": {"models": {entry["name"]: tiers} if tiers else {}},
     }
-    from k3code import confio
-
-    before = confio.read_yaml(user_config_path()).get("providers") or []
     path = write_config(data, only="providers")  # keeps the rest of an existing config untouched
     p.say(f"Wrote {path}: provider {entry['name']} ({entry['kind']}), default model {model or '(not set yet)'}.")
     if kept := _keep_other_providers(path, before, entry):

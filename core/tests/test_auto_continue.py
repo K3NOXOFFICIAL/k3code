@@ -215,3 +215,28 @@ async def test_a_long_goal_is_put_back_in_full_once_no_message_holds_it(tmp_path
     mgr.set("short goal")
     assert server._with_long_goal(live, mgr, "Goal: short goal") == "Goal: short goal"
     await server.close()
+
+
+async def test_a_continuation_run_through_the_turn_loop_gets_the_long_goal_back_in_full(tmp_path, monkeypatch):
+    """The two call sites in _run_turn_locked, not only the helper: the prompt that reaches the model carries the goal
+    whole when no message of the history holds it any more."""
+    from k3code.goals import quote
+
+    server, _, live, mgr = await _setup(tmp_path, monkeypatch)
+    goal = ("Rebuild the billing module. " + "requirement " * 120).strip()
+    mgr.set(goal)
+    live.stored.messages = [{"role": "user", "content": "[summary of earlier conversation]\nthe billing work"}]
+    sent: list[str] = []
+
+    async def fake_one_turn(session, text, **kw):
+        sent.append(text)
+        return "done", "ok"
+
+    async def judge(g, response):
+        return "done", "finished", False, False
+
+    server._run_one_turn = fake_one_turn  # type: ignore[method-assign]
+    server.goal_judge = judge  # type: ignore[assignment]
+    await server._run_turn_locked(live, f"[Continuing toward your standing goal]\nGoal: {quote(goal)}\n\nNext step.")
+    assert sent and goal in sent[0] and quote(goal) not in sent[0]
+    await server.close()

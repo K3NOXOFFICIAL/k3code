@@ -148,6 +148,8 @@ class ModelCaller:
         max_tokens: int,
         timeout: float | None,
         router: Any = None,
+        *,
+        retried: bool = False,
     ) -> CallResult:
         router = router if router is not None else routers.get(tier)
         coro = router.complete(messages, tools, max_tokens=max_tokens)
@@ -189,4 +191,20 @@ class ModelCaller:
                 turn=self._turn_of(session_id) if self._turn_of else "",
                 seconds=seconds,
             )
-        return CallResult(final.content or "", tier, model, provider, pt, ct)
+        result = CallResult(final.content or "", tier, model, provider, pt, ct)
+        if (
+            not result.text.strip()
+            and not retried
+            and kind not in NO_EFFORT_KINDS
+            and effort_mod.REASONING_EFFORT.get()
+        ):
+            # a thinking model spent the whole cap on reasoning (a 500-token verdict at /effort max) and wrote nothing:
+            # the call above is billed and logged; ask once more without the effort rather than return an empty answer
+            quiet = effort_mod.REASONING_EFFORT.set(None)
+            try:
+                return await self._once(
+                    routers, kind, tier, messages, session_id, tools, max_tokens, timeout, router, retried=True
+                )
+            finally:
+                effort_mod.REASONING_EFFORT.reset(quiet)
+        return result

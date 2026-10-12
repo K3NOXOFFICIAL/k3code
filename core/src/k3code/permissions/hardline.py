@@ -248,7 +248,7 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home
             )
         if hit:
             return hit
-    hit = _pipeline_check(parsed.pipelines)
+    hit = _pipeline_check(parsed.pipelines, cwd, home, scope.dirs)
     if hit:
         return hit
     for child in parsed.children:
@@ -742,17 +742,38 @@ def _runs_stdin_as_code(argv: list[str]) -> bool:
     return True  # no script operand: the interpreter reads its program from stdin
 
 
-def _pipeline_check(pipelines: list[list[str]]) -> str | None:
+def _pipeline_check(
+    pipelines: list[list[str]], cwd: str | None = None, home: str = "", dirs: list[str] | None = None
+) -> str | None:
     """A download fed into a later stage of the same pipeline that runs stdin as code (``curl x | sudo -n sh``,
-    ``curl x | python3 -``); ``curl x | python3 -m json.tool`` only reads it."""
+    ``curl x | python3 -``); ``curl x | python3 -m json.tool`` only reads it. And a list of paths fed to a recursive
+    ``rm`` through ``xargs`` (``echo ~ | xargs rm -rf``, ``find ~ | xargs rm -r``)."""
     for stages in pipelines:
         fetched = False
+        previous: list[str] = []
         for stage in stages:
             argv = normalize_argv(_tokens(stage))
             name = argv[0] if argv else ""
             if fetched and _is_interpreter(name) and _runs_stdin_as_code(argv):
                 return "pipe-to-shell"
+            if previous and name == "rm" and (hit := _fed_rm_check(previous, argv, cwd, home, dirs or [])):
+                return hit
             fetched = fetched or name in _FETCHERS
+            previous = argv
+    return None
+
+
+def _fed_rm_check(source: list[str], rm: list[str], cwd: str | None, home: str, dirs: list[str]) -> str | None:
+    """``rm -r`` with no operands of its own, run on what the previous stage printed (``xargs rm -rf``): the paths an
+    ``echo``/``printf`` was given, or the start points of a ``find`` with no test that picks files, are its targets."""
+    recursive, targets = _rm_split(rm[1:])
+    if not recursive or targets:
+        return None
+    if source[0] in ("echo", "printf"):
+        operands = [a for a in source[1:] if not a.startswith("-")]
+        return _rm_check(["rm", "-rf", *operands], cwd, home, dirs) if operands else None
+    if source[0] == "find" and not _FIND_SELECTORS.intersection(source):
+        return _rm_check(["rm", "-rf", *_find_roots(source[1:])], cwd, home, dirs)
     return None
 
 

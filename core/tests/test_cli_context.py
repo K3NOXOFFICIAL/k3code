@@ -116,3 +116,110 @@ def test_the_repl_keeps_the_conversation_across_prompts(tmp_path, monkeypatch):
         ("assistant", "answer 1"),
         ("user", "what was my secret word?"),
     ]
+
+
+def test_a_headless_run_clips_tool_results_to_context_tool_output_chars(tmp_path, monkeypatch):
+    # the k3code home sits beside the project: a sandboxed bash refuses a working directory that contains it
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path.parent / f"{tmp_path.name}-k3home"))
+    monkeypatch.chdir(tmp_path)
+    sizes: list[int] = []
+
+    class Printer(Provider):
+        def __init__(self) -> None:
+            self.name, self.base_url, self.api_key = "printer", "fake://", ""
+
+        async def aclose(self) -> None:
+            return None
+
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            results = [str(m.content or "") for m in messages if m.role == "tool"]
+            if not results:
+                call = ToolCall(id="b1", name="bash", arguments={"command": "yes xxxxxxxxxxxxxxxxxxxx | head -c 30000"})
+                reply = Message(role="assistant", content=None, tool_calls=[call])
+            else:
+                sizes.append(len(results[-1]))
+                reply = Message(role="assistant", content="done")
+                yield StreamEvent(type="text_delta", text="done")
+            yield StreamEvent(type="done", message=reply, usage=Usage())
+
+    import k3code.providers as providers_mod
+
+    monkeypatch.setattr(providers_mod, "make_providers", lambda entries: [Printer()])
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    config = Settings(providers=[prov], default_model="default", context={"tool_output_chars": 1_000})
+    result = asyncio.run(
+        cli_mod._run_headless("go", model=None, permission_mode=PermissionMode.YOLO, config=config, json_output=True)
+    )
+    assert result is not None and result.get("text") == "done", result
+    assert sizes and sizes[0] < 1_400, f"a 30 000-character result clipped to the configured 1 000: {sizes}"
+
+
+def test_the_repl_stops_on_repeated_tool_failures_like_the_gateway(tmp_path, monkeypatch):
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    requests: list[int] = []
+
+    class Failing(Provider):
+        def __init__(self) -> None:
+            self.name, self.base_url, self.api_key = "failing", "fake://", ""
+
+        async def aclose(self) -> None:
+            return None
+
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            requests.append(len(messages))
+            call = ToolCall(id=f"c{len(requests)}", name="read", arguments={"path": f"missing{len(requests)}.txt"})
+            reply = Message(role="assistant", content=None, tool_calls=[call])
+            yield StreamEvent(type="done", message=reply, usage=Usage())
+
+    import k3code.providers as providers_mod
+
+    monkeypatch.setattr(providers_mod, "make_providers", lambda entries: [Failing()])
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    config = Settings(providers=[prov], default_model="default", autonomy={"max_tool_errors": 3})
+    inputs = iter(["go", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+    asyncio.run(cli_mod._run_repl(model=None, permission_mode=PermissionMode.YOLO, config=config))
+    assert len(requests) == 3, "three failed steps in a row end the turn, as they do in a gateway session"
+
+
+def test_the_repl_takes_the_window_of_the_model_it_switches_to(tmp_path, monkeypatch):
+    models = {"m": {"context_window": 2_000_000}, "m2": {"context_window": 40_000}}
+    config, reader = _setup(monkeypatch, tmp_path, models=models)
+    config.providers[0].models = {"default": "m", "small": "m2"}
+    inputs = iter(["/model small", "go", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(inputs))
+    asyncio.run(cli_mod._run_repl(model=None, permission_mode=PermissionMode.YOLO, config=config))
+    assert max(reader.elided_markers) > 0, "the 40k window of the switched-to model is what the loop elides by"
+
+
+def test_a_headless_run_that_repeats_one_call_ends_as_a_loop_guard_stop(tmp_path, monkeypatch):
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path.parent / f"{tmp_path.name}-k3home"))
+    monkeypatch.chdir(tmp_path)
+    n = 0
+
+    class Repeater(Provider):
+        def __init__(self) -> None:
+            self.name, self.base_url, self.api_key = "repeater", "fake://", ""
+
+        async def aclose(self) -> None:
+            return None
+
+        async def stream(self, messages, tools, model, *, max_tokens=8192, temperature=None):
+            nonlocal n
+            n += 1
+            call = ToolCall(id=f"c{n}", name="bash", arguments={"command": "echo same"})
+            yield StreamEvent(
+                type="done", message=Message(role="assistant", content=None, tool_calls=[call]), usage=Usage()
+            )
+
+    import k3code.providers as providers_mod
+
+    monkeypatch.setattr(providers_mod, "make_providers", lambda entries: [Repeater()])
+    prov = ProviderEntry(name="t", kind="openai", base_url="http://t", api_key_env="NOPE", models={"default": "m"})
+    config = Settings(providers=[prov], default_model="default")
+    result = asyncio.run(
+        cli_mod._run_headless("go", model=None, permission_mode=PermissionMode.YOLO, config=config, json_output=True)
+    )
+    assert result is not None and result.get("error") == "loop_guard", result
+    assert n < 10, "the guard ended it long before max_turns"

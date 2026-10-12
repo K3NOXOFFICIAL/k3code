@@ -207,6 +207,12 @@ async def test_ultracode_accepts_only_findings_both_reviewers_agree_on(tmp_path,
     # the fixer only got the confirmed finding
     fixer_call = next(c for p in server.providers for c in p.log if "Fix these confirmed review findings" in c["text"])
     assert "REAL-BUG" in fixer_call["text"] and "NITPICK" not in fixer_call["text"]
+    # each vote judged the findings against the diff of the files they name (f1, f2), not the whole diff (f3 too)
+    votes = [c for p in server.providers for c in p.log if "VOTE LENS:" in c["text"]]
+    assert len(votes) == 2
+    for vote in votes:
+        assert "diff --git a/f1.txt" in vote["text"] and "diff --git a/f2.txt" in vote["text"]
+        assert "f3.txt" not in vote["text"]
     assert (repo / "fixed.txt").read_text() == "fixed f1\n"  # fix merged back
     assert "Final tests" in report and "pass (true)" in report
     assert "Budget used:" in report

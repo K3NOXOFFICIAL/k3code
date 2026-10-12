@@ -763,3 +763,31 @@ def test_the_classifier_reads_a_capped_prompt_but_the_floor_sees_all_of_it():
     assert short == "Task:\nsmall ask\n\nRepo: repo\n"
     verdict, _ = parse_reply('{"scope":"small","needs_plan":false,"risk":"low","reason":"x"}')
     assert apply_floor(verdict, prompt).risk == "high", "the safety floor scans the whole prompt"
+
+
+async def test_the_planner_is_not_sent_the_old_tool_results_of_the_session(tmp_path, monkeypatch):
+    server = make(tmp_path, monkeypatch, [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
+    await start(server, tmp_path)
+    old: list[dict] = [
+        {"role": "user", "content": "OLD-ASK read the big file"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "o1", "name": "read", "arguments": {"path": "x"}}],
+        },
+        {"role": "tool", "name": "read", "tool_call_id": "o1", "content": "OLD-TOOL-RESULT " + "z" * 2000},
+        {"role": "assistant", "content": "OLD-ANSWER I read it"},
+    ]
+    recent = [
+        m
+        for i in range(10)
+        for m in (
+            {"role": "user", "content": f"recent ask {i}"},
+            {"role": "assistant", "content": f"recent answer {i}"},
+        )
+    ]
+    server.session.stored.messages = [*old, *recent]
+    await run_turn(server, "add a --verbose flag to the CLI")
+    planner_call = next(c for p in server.providers for c in p.log if "PLANNING mode" in c["text"])
+    assert "OLD-ASK" in planner_call["text"] and "OLD-ANSWER" in planner_call["text"], "what was asked and answered"
+    assert "OLD-TOOL-RESULT" not in planner_call["text"], "not the tool output of every earlier step"
