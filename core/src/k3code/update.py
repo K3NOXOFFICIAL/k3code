@@ -294,7 +294,7 @@ def rollback(
 #: The installer builds both on a best-effort basis, so a version without one is complete, just poorer.
 TUI_ENTRY = Path("tui") / "dist" / "entry.js"
 K3_BINARY = Path("bin") / "k3"
-#: install.sh writes ``k3: <why>`` here when it tried to build the k3 binary and failed (a skipped build leaves nothing).
+#: install.sh writes ``k3: <why>`` here when it tried to build the k3 binary and failed (a skip leaves nothing).
 DEGRADED_FILE = ".degraded"
 
 
