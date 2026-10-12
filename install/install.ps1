@@ -272,7 +272,8 @@ if ($LASTEXITCODE -eq 0) {
 } else {
   foreach ($n in @('k3.cmd', 'k3.exe')) { Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $shimDir $n) }
 }
-if ($launcher -and $PSScriptRoot -and -not $launcher.StartsWith($PSScriptRoot)) { # downloaded: a temp file
+# downloaded (also when piped into iex, where $PSScriptRoot is empty): a temp file
+if ($launcher -and -not ($PSScriptRoot -and $launcher.StartsWith($PSScriptRoot))) {
   Remove-Item -Force -ErrorAction SilentlyContinue $launcher
 }
 [pscustomobject]@{ distro = $script:Distro; prefix = $prefix } | ConvertTo-Json |
