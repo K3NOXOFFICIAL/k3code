@@ -19,6 +19,7 @@ from k3code.autonomy.plan_first import PLAN_SECTIONS, parse_plan
 from k3code.autonomy.scope import ScopeVerdict
 from k3code.memory import fenced
 from k3code.providers.types import Message
+from k3code.reliability.sandbox import HARNESS_GIT_DIFF_FLAGS
 from k3code.routing.tiers import TaskKind
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.budget import AgentBudget, BudgetStop
@@ -321,7 +322,7 @@ class Ultra:
         cwd = Path(session.perms.cwd)
         diff = ""
         if base:
-            _, diff = await wt_mod.git(cwd, "diff", f"{base}..HEAD")
+            _, diff = await wt_mod.git(cwd, "diff", *HARNESS_GIT_DIFF_FLAGS, f"{base}..HEAD")
         if not diff.strip():
             report.notes.append("nothing to review: no committed changes")
             return

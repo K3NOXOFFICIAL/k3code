@@ -3,7 +3,7 @@
 Modes: ``default`` (ask edits + non-allowlisted bash), ``accept-edits``
 (edits allowed, bash asks), ``plan`` (read-only + ``exit_plan``), ``auto``
 (everything not denied allowed, side effects logged), ``yolo`` (everything
-except hardline).
+except hardline and the edits of protected files, see :func:`protected_path`, which always ask).
 """
 
 from __future__ import annotations
@@ -117,6 +117,8 @@ class Decision:
     auto_allowed: bool = False  # mode auto-allowed a would-be ask (log me)
     #: an ask that auto mode must not convert: a human answers it, an unattended run treats it as a deny
     needs_human: bool = False
+    #: an ask that no mode and no rule converts, yolo included (see protected_path); headless it is a deny
+    always_ask: bool = False
 
 
 def builtin_defaults() -> list[Rule]:
@@ -148,6 +150,57 @@ def _inside(path: str, roots: list[str]) -> bool:
     real = os.path.realpath(path)
     real_roots = [os.path.realpath(r) for r in roots]
     return any(real == r or real.startswith(r.rstrip("/") + "/") for r in real_roots)
+
+
+#: Files the edit tools never change without a person, in any mode and whatever the rules say: git runs them (hooks, a
+#: ``filter`` or ``diff`` driver or ``core.fsmonitor`` in a git config, ``.gitattributes`` choosing the driver, the
+#: ``.git`` FILE of a linked worktree naming its git directory), direnv runs ``.envrc`` on the next ``cd``, husky its
+#: hooks on the next commit, and ``.k3code/config*`` sets permission rules and hooks. ``write`` and ``edit`` run in the
+#: daemon, outside the sandbox, and the harness's own git runs there too (scope classification, worktrees).
+#: Matched at any depth and case-insensitively; ``.git`` stands for everything under it.
+_PROTECTED = re.compile(
+    r"(?:^|/)(?:\.git|\.gitattributes|\.gitmodules|\.envrc|\.husky|\.k3code/config[^/]*)(?:/|$)", re.IGNORECASE
+)
+#: The same in the home directory: shell startup files, user git config, fish config (``$HOME`` secret dirs such as
+#: ``~/.ssh`` come from _secret_dirs).
+_HOME_PROTECTED = (
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".profile",
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+    ".kshrc",
+    ".cshrc",
+    ".tcshrc",
+    ".login",
+    ".gitconfig",
+    ".config/git",
+    ".config/fish",
+)
+
+
+def protected_path(path: str) -> bool:
+    """``path`` (absolute) is a file the edit tools never change without a person (see _PROTECTED), a shell startup
+    file or git config in the home directory, or under a credential directory (``~/.ssh``, ``~/.config/k3code``).
+    Checked on the path as written and on its realpath, so a symlink does not hide the target."""
+    home = os.path.expanduser("~")
+    homes = (os.path.normpath(home), os.path.realpath(home))
+    guarded = [os.path.join(h, rel) for h in homes for rel in _HOME_PROTECTED]
+    secrets = _secret_dirs()
+    guarded += [*map(os.path.normpath, secrets), *map(os.path.realpath, secrets)]
+    guarded = [g.casefold().rstrip(os.sep) for g in guarded]
+    for p in dict.fromkeys((os.path.normpath(path), os.path.realpath(path))):
+        if _PROTECTED.search(p.replace("\\", "/")):
+            return True
+        low = p.casefold()
+        if any(low == g or low.startswith(g + os.sep) for g in guarded):
+            return True
+    return False
 
 
 def decide(
@@ -185,6 +238,11 @@ def decide(
         if tool == "glob":
             path = _glob_base(path, str(args.get("pattern") or ""))
         dec = _decide_path(mode, tool, path, roots, ruleset)
+        if tool in EDIT_TOOLS and dec.action != "deny" and protected_path(path):
+            # the edit tools run in the daemon, outside the sandbox: only a deny rule beats this, no allow rule, mode or
+            # hook approval does (yolo and auto included; headless, an unattended run and a sub-agent it is a deny)
+            dec.action, dec.needs_human, dec.always_ask = "ask", True, True
+            dec.message = f"Edits a file that runs as code or holds credentials; confirm it yourself: {path}"
     elif tool == EXIT_PLAN_TOOL:
         dec = Decision(action="allow", patterns=["*"])
     else:
@@ -200,7 +258,7 @@ def decide(
 
 
 def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
-    if dec.hardline is None and dec.action != "deny":
+    if dec.hardline is None and dec.action != "deny" and not dec.always_ask:
         if mode == PermissionMode.YOLO:
             dec.action = "allow"
         elif mode == PermissionMode.AUTO and dec.action == "ask" and not dec.needs_human:

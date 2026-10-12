@@ -39,8 +39,24 @@ SANDBOXED_MODES = (PermissionMode.AUTO, PermissionMode.YOLO)
 #: the sandboxed command and for every unsandboxed child too (tools, gates, fan-out, git, MCP stdio): see
 #: :func:`child_env`.
 ENV_ALLOW = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ", "NO_COLOR", "COLORTERM")
-#: Harness git never runs a hook or a fsmonitor program: a sandboxed command could have written one into .git.
+#: Harness git (worktrees, merges, triggers, scope classification) runs in the daemon, outside the sandbox, on a
+#: repository the model may have written to. It never runs a hook or a fsmonitor program, and it reads no system or
+#: global git config (see :data:`HARNESS_GIT_ENV`). Diff callers add :data:`HARNESS_GIT_DIFF_FLAGS`.
+#:
+#: What this cannot prevent: a filter (``filter.<name>.clean``/``smudge``), a diff or merge driver, a signing program
+#: or an include, defined in the repository's own config (``.git/config``, ``.git/config.worktree``) still runs when
+#: git touches a file it applies to (``status``, ``add``, ``merge``, ``commit``), because git has no switch that
+#: ignores a configured driver by name. That is closed at the source: the write and edit tools always ask before they
+#: change those files (see :func:`k3code.permissions.engine.protected_path`) and the sandbox binds the git metadata
+#: read-only. It stays open for a repository config changed by anything else (an unsandboxed command someone
+#: approved, a process outside k3code) and for a driver the user keeps in the repository on purpose.
 HARNESS_GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false")
+#: Environment of harness git: no system or global config (``~/.gitconfig`` could define a driver or an alias too).
+#: The cost is that the user's own settings do not apply to it either (``safe.directory``, LFS filters, a global
+#: ignore file).
+HARNESS_GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+#: ``git diff`` runs ``diff.external`` and the textconv drivers by default; the harness only needs the plain text.
+HARNESS_GIT_DIFF_FLAGS = ("--no-ext-diff", "--no-textconv")
 #: A failed probe is retried after this many seconds (one slow probe used to disable the sandbox for the whole
 #: daemon lifetime: every unattended session then ran bash on the real $HOME).
 REPROBE_AFTER_S = 60.0
@@ -144,8 +160,14 @@ def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
 
 
 def harness_git_argv(*args: str) -> list[str]:
-    """``git`` argv for the harness itself (worktrees, merges, triggers, status): hooks and fsmonitor disabled."""
+    """``git`` argv for the harness itself (worktrees, merges, triggers, status): hooks and fsmonitor disabled. Run it
+    with :func:`harness_git_env`."""
     return ["git", *HARNESS_GIT_CONFIG, *args]
+
+
+def harness_git_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The :func:`child_env` of a harness git process: no system or global git config (see HARNESS_GIT_ENV)."""
+    return child_env({**(extra or {}), **HARNESS_GIT_ENV})
 
 
 def unattended_prefix(cwd: Path | str, add_dirs: Iterable[Path | str] = (), *, network: bool = False) -> list[str]:

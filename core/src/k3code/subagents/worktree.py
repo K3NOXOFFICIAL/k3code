@@ -8,9 +8,9 @@ import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
-from k3code.reliability.sandbox import child_env, harness_git_argv
+from k3code.reliability.sandbox import HARNESS_GIT_DIFF_FLAGS, harness_git_argv, harness_git_env
 
-_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true", "GIT_CONFIG_NOSYSTEM": "1"}
+_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"}
 
 
 async def git(cwd: str | Path, *args: str, timeout: float = 60) -> tuple[int, str]:
@@ -22,7 +22,7 @@ async def git(cwd: str | Path, *args: str, timeout: float = 60) -> tuple[int, st
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env=child_env(_GIT_ENV),
+        env=harness_git_env(_GIT_ENV),
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
@@ -110,7 +110,7 @@ async def create(parent_cwd: str | Path, child_id: str) -> Worktree | None:
 async def commit_all(wt: Worktree, message: str) -> bool:
     """Commit whatever the child left in its worktree (so the branch carries it). True if a commit was made."""
     await git(wt.path, "add", "-A")
-    rc, _ = await git(wt.path, "diff", "--cached", "--quiet")
+    rc, _ = await git(wt.path, "diff", *HARNESS_GIT_DIFF_FLAGS, "--cached", "--quiet")
     if rc == 0:
         return False
     rc, out = await git(
@@ -122,12 +122,12 @@ async def commit_all(wt: Worktree, message: str) -> bool:
 
 
 async def diff(wt: Worktree, limit: int = 200_000) -> str:
-    _, out = await git(wt.repo, "diff", f"{wt.base}...{wt.branch}")
+    _, out = await git(wt.repo, "diff", *HARNESS_GIT_DIFF_FLAGS, f"{wt.base}...{wt.branch}")
     return out if len(out) <= limit else out[:limit] + "\n[diff truncated]"
 
 
 async def diff_stat(wt: Worktree) -> str:
-    _, out = await git(wt.repo, "diff", "--stat", f"{wt.base}...{wt.branch}")
+    _, out = await git(wt.repo, "diff", *HARNESS_GIT_DIFF_FLAGS, "--stat", f"{wt.base}...{wt.branch}")
     return out.strip()
 
 
@@ -228,5 +228,5 @@ async def bring_parent_into(wt: Worktree, parent_sha: str) -> tuple[bool, str]:
 
 
 async def conflicted_files(path: str | Path) -> list[str]:
-    _, out = await git(path, "diff", "--name-only", "--diff-filter=U")
+    _, out = await git(path, "diff", *HARNESS_GIT_DIFF_FLAGS, "--name-only", "--diff-filter=U")
     return [x for x in out.splitlines() if x.strip()]
