@@ -115,6 +115,10 @@ describe("a Ctrl+V clipboard with Windows line endings", () => {
 
   const pasteFromClipboard = async (text: string) => {
     vi.stubEnv("K3CODE_HOME", "/nonexistent-k3code-home");
+    // over SSH Ctrl+V waits for the terminal's OSC 52 answer instead of reading the clipboard: a local terminal here
+    for (const name of ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]) {
+      vi.stubEnv(name, "");
+    }
     resetUiState();
     patchUiState({ sid: "sess-1" });
     clipboard.text = text;
