@@ -52,7 +52,11 @@ def _provider(responses):
 
 @pytest.mark.parametrize(
     "exc",
-    [sqlite3.OperationalError("database is locked"), sqlite3.OperationalError("database or disk is full"), OSError(28, "ENOSPC")],
+    [
+        sqlite3.OperationalError("database is locked"),
+        sqlite3.OperationalError("database or disk is full"),
+        OSError(28, "ENOSPC"),
+    ],
 )
 def test_record_swallows_write_errors(tmp_path: Path, exc: Exception):
     db = UsageDB(tmp_path / "usage.db")
