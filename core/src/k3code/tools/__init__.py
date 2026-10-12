@@ -12,6 +12,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from k3code.permissions.engine import sensitive_path
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
@@ -548,28 +549,36 @@ async def _kill_group(proc: asyncio.subprocess.Process) -> None:
 
 
 #: rg excludes on top of its own defaults (.gitignore, hidden files): dependency trees and other sessions' worktrees.
+#: They go after the include globs: rg's last matching glob wins, so ``include: "*"`` would switch them off.
 _RG_EXCLUDES = ("!node_modules/", "!__pycache__/", "!.venv/", "!**/.claude/worktrees/", "!**/.claude/jobs/")
 #: Longest line rg prints in full; minified bundles and data blobs would otherwise fill the context with one match.
 _RG_MAX_COLUMNS = 400
 
 
 async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S."""
+    """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S.
+
+    Files ``sensitive_path`` names (dotenv files, key directories, the daemon's env file) are never searched or
+    reported: the permission engine only sees ``path``, while an include glob or a repository's own ``.ignore``
+    (``!.env``) reopens hidden files to rg, and the fallback walks them anyway."""
     pattern = arguments["pattern"]
     path = _resolve_path(arguments.get("path", "."), cwd)
     include = arguments.get("include")
     exclude = arguments.get("exclude")
+    if sensitive_path(str(path)):
+        return {"error": f"Hardline deny (sensitive-path): {path}"}
     try:
-        cmd = ["rg", "--line-number", "--no-heading", "--color=never"]
+        # --null ends each file name with a NUL, so the file of every match is known whatever its name holds
+        cmd = ["rg", "--null", "--line-number", "--no-heading", "--color=never"]
         cmd += [f"--max-columns={_RG_MAX_COLUMNS}", "--max-columns-preview"]
-        for glob in _RG_EXCLUDES:
-            cmd += ["-g", glob]
         if include:
             for inc in include if isinstance(include, list) else [include]:
                 cmd += ["-g", inc]
         if exclude:
             for exc in exclude if isinstance(exclude, list) else [exclude]:
                 cmd += ["-g", f"!{exc}"]
+        for glob in _RG_EXCLUDES:
+            cmd += ["-g", glob]
         # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
         cmd += ["-e", pattern, "--", str(path)]
         proc = await asyncio.create_subprocess_exec(
@@ -582,6 +591,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         assert proc.stdout is not None and proc.stderr is not None
         lines: list[str] = []
         cut = ""
+        secret: dict[bytes, bool] = {}  # per file name rg printed: is it a sensitive path
         deadline = time.monotonic() + SEARCH_BUDGET_S
         while True:
             try:
@@ -591,7 +601,15 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 break
             if not raw:
                 break
-            lines.append(raw.decode("utf-8", errors="replace").rstrip("\n"))
+            name, nul, rest = raw.rstrip(b"\n").partition(b"\0")
+            if not nul:  # a search of one file prints no name: that file is `path`, checked above
+                lines.append(raw.decode("utf-8", errors="replace").rstrip("\n"))
+                continue
+            if (hide := secret.get(name)) is None:
+                hide = secret[name] = sensitive_path(os.path.abspath(os.fsdecode(name)))
+            if hide:
+                continue
+            lines.append(f"{name.decode('utf-8', errors='replace')}:{rest.decode('utf-8', errors='replace')}")
             if len(lines) > MAX_SEARCH_RESULTS:  # one past the cap proves the cut; stop rg instead of reading on
                 lines = lines[:MAX_SEARCH_RESULTS]
                 cut = f"truncated to the first {MAX_SEARCH_RESULTS} matching lines: {_NARROW}"
@@ -804,6 +822,8 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         if is_dir:
             continue
         fp = base / rel
+        if sensitive_path(str(fp)):  # the walk lists hidden files: dotenv files and key directories stay unread
+            continue
         if includes and not any(Path(fp.name).match(p) for p in includes):
             continue
         if excludes and any(Path(fp.name).match(p) for p in excludes):

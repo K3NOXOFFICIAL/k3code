@@ -208,6 +208,111 @@ async def test_grep_pattern_that_looks_like_a_flag_is_searched_as_text(temp_dir)
     assert "notes.txt:1:the flag --files is literal here" in result["matches"]
 
 
+# ── grep never hands a credential file to the model (K3NOX-68, GitHub #138) ──
+
+
+def _secret_project(root: Path) -> Path:
+    (root / ".env").write_text("API_KEY=sk-dotenv-secret\n")
+    (root / ".env.local").write_text("API_KEY=sk-local-secret\n")
+    (root / ".env.example").write_text("API_KEY=example-template\n")
+    (root / "node_modules" / "pkg").mkdir(parents=True)
+    (root / "node_modules" / "pkg" / "a.js").write_text("API_KEY in a dependency\n")
+    (root / "app.py").write_text("API_KEY = os.environ['API_KEY']\n")
+    return root
+
+
+def _no_rg(monkeypatch, root: Path) -> None:
+    for key in [k for k in os.environ if k.startswith("GIT_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("PATH", str(root / "no-bin"))  # no rg (and no git): the Python fallback
+
+
+@pytest.fixture
+def rg():
+    import shutil
+
+    if not shutil.which("rg"):
+        pytest.skip("rg not installed")
+
+
+@pytest.mark.parametrize("include", ["*", ".env*", ["*.py", ".*"], "**"])
+async def test_grep_include_glob_does_not_reopen_dotenv_files_or_node_modules(temp_dir, rg, include):
+    # rg's last matching glob wins and an include glob overrides its hidden-file filter: `include: "*"` used to
+    # return .env (and node_modules) while read/grep of `.env` itself is a sensitive-path hardline deny.
+    _secret_project(temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": ".", "include": include}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"]
+    assert "node_modules" not in res["matches"]
+    if include != ".env*":
+        assert "app.py:1:API_KEY" in res["matches"]
+    if include in ("*", ".env*", "**"):
+        assert ".env.example:1:API_KEY=example-template" in res["matches"]  # a template is no secret
+
+
+async def test_grep_ignore_file_negation_does_not_reopen_dotenv(temp_dir, rg):
+    # A hostile repository can whitelist its .env for rg without any include: `!.env` in .ignore or .gitignore.
+    _secret_project(temp_dir)
+    (temp_dir / ".ignore").write_text("!.env\n!.env.local\n")
+    res = await tool_grep({"pattern": "API_KEY", "path": "."}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"]
+    assert "app.py:1:API_KEY" in res["matches"]
+
+
+async def test_grep_include_can_still_search_inside_node_modules_by_path(temp_dir, rg):
+    _secret_project(temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": "node_modules/pkg", "include": "*.js"}, cwd=temp_dir)
+    assert "a.js:1:API_KEY in a dependency" in res["matches"]
+
+
+async def test_grep_fallback_skips_dotenv_files(temp_dir, monkeypatch):
+    # The Python fallback walks hidden files (and `git ls-files -co` lists a .env that is not ignored).
+    _secret_project(temp_dir)
+    _no_rg(monkeypatch, temp_dir)
+    for include in (None, "*", ".env*"):
+        args = {"pattern": "API_KEY", "path": ".", **({"include": include} if include else {})}
+        res = await tool_grep(args, cwd=temp_dir)
+        assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"], include
+        assert "API_KEY=example-template" in res["matches"], include
+    assert "app.py" in (await tool_grep({"pattern": "API_KEY", "path": "."}, cwd=temp_dir))["matches"]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_grep_of_a_home_directory_skips_key_and_k3code_secret_files(temp_dir, monkeypatch, fallback):
+    import shutil
+
+    if not fallback and not shutil.which("rg"):
+        pytest.skip("rg not installed")
+    home = temp_dir / "home"
+    for rel, text in {
+        ".ssh/id_ed25519": "API_KEY ssh-private-key",
+        ".aws/credentials": "API_KEY aws_secret_access_key",
+        ".config/k3code/env": "API_KEY=sk-daemon-env",
+        "notes/todo.txt": "API_KEY rotate me",
+    }.items():
+        (home / rel).parent.mkdir(parents=True, exist_ok=True)
+        (home / rel).write_text(text + "\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    if fallback:
+        _no_rg(monkeypatch, temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": str(home), "include": "*"}, cwd=temp_dir)
+    assert "todo.txt:1:API_KEY rotate me" in res["matches"]
+    for secret in ("ssh-private-key", "aws_secret_access_key", "sk-daemon-env"):
+        assert secret not in res["matches"]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_grep_of_a_dotenv_file_itself_is_refused(temp_dir, monkeypatch, fallback):
+    _secret_project(temp_dir)
+    if fallback:
+        _no_rg(monkeypatch, temp_dir)
+    res = await tool_grep({"pattern": "API_KEY", "path": ".env"}, cwd=temp_dir)
+    assert "sk-dotenv-secret" not in str(res)
+    assert "sensitive-path" in res["error"]
+    template = await tool_grep({"pattern": "API_KEY", "path": ".env.example"}, cwd=temp_dir)
+    assert "example-template" in template["matches"]
+
+
 async def test_glob_finds(temp_dir):
     (temp_dir / "a.py").write_text("")
     (temp_dir / "b.txt").write_text("")
