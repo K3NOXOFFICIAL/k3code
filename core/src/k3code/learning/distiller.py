@@ -313,7 +313,10 @@ def load_preferences(home: Path, top: int = 5) -> list[Preference]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
-    prefs = [Preference(v["text"], float(v["confidence"]), int(v["evidence"]), k) for k, v in data.items()]
+    try:
+        prefs = [Preference(v["text"], float(v["confidence"]), int(v["evidence"]), k) for k, v in data.items()]
+    except (AttributeError, KeyError, TypeError, ValueError):  # valid JSON of the wrong shape: nothing known
+        return []
     prefs.sort(key=lambda p: (-p.confidence, -p.evidence))
     return prefs[:top]
 
