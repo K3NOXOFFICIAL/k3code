@@ -73,7 +73,7 @@ async def test_text_outside_the_block_is_byte_for_byte_untouched(tmp_path):
     await distiller.distill(log, home=tmp_path, user_md=md)
     first = md.read_bytes().decode()
     assert first.startswith(before)
-    after = "\n- added later, no heading after it\nmore text, no trailing newline"  # no heading: Main would drop it
+    after = "\n- added later, no heading after it\nmore text, no trailing newline"  # no heading after it
     md.write_bytes((first + after).encode())
     await distiller.distill(log, home=tmp_path, user_md=md)
     now = md.read_bytes().decode()
@@ -86,7 +86,13 @@ async def test_distill_survives_a_malformed_preferences_json(tmp_path):
     seed(log)
     (tmp_path / "learning").mkdir(exist_ok=True)
     md = tmp_path / "USER.md"
-    for bad in ("[]", "null", '{"k": 1}', '{"k": {"confidence": 1}}', '{"k": {"text": "t", "confidence": "x", "evidence": 1}}'):
+    for bad in (
+        "[]",
+        "null",
+        '{"k": 1}',
+        '{"k": {"confidence": 1}}',
+        '{"k": {"text": "t", "confidence": "x", "evidence": 1}}',
+    ):
         (tmp_path / "learning" / "preferences.json").write_text(bad, encoding="utf-8")
         await distiller.distill(log, home=tmp_path, user_md=md)  # must repair the file, not raise
         assert distiller.read_auto_section(md) == ["avoids model m-x for review tasks"]
