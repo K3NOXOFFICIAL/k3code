@@ -11,7 +11,7 @@ from k3code.learning.decisions import DecisionLog
 from k3code.memory import append_memory, user_memory_path
 from learn_helpers import FakeCaller
 
-MARK_START = distiller.HEADING
+HEADING = distiller.HEADING
 
 
 def seed(log: DecisionLog) -> None:
@@ -60,7 +60,7 @@ async def test_distill_keeps_added_lines_across_repeated_runs(tmp_path, monkeypa
     text = md.read_text(encoding="utf-8")
     assert text.startswith("# Me\nI like tabs.\n- first note\n")
     assert "- second note\n" in text
-    assert text.count(MARK_START) == 1
+    assert text.count(HEADING) == 1
     assert distiller.read_auto_section(md) == ["avoids model m-x for review tasks"]
 
 
@@ -73,12 +73,23 @@ async def test_text_outside_the_block_is_byte_for_byte_untouched(tmp_path):
     await distiller.distill(log, home=tmp_path, user_md=md)
     first = md.read_bytes().decode()
     assert first.startswith(before)
-    after = "\n## Notes\nmore text, no trailing newline"
+    after = "\n- added later, no heading after it\nmore text, no trailing newline"  # no heading: Main would drop it
     md.write_bytes((first + after).encode())
     await distiller.distill(log, home=tmp_path, user_md=md)
     now = md.read_bytes().decode()
     assert now.startswith(before) and now.endswith(after)
-    assert now.count(MARK_START) == 1
+    assert now.count(HEADING) == 1
+
+
+async def test_distill_survives_a_malformed_preferences_json(tmp_path):
+    log = DecisionLog(tmp_path)
+    seed(log)
+    (tmp_path / "learning").mkdir(exist_ok=True)
+    md = tmp_path / "USER.md"
+    for bad in ("[]", "null", '{"k": 1}', '{"k": {"confidence": 1}}', '{"k": {"text": "t", "confidence": "x", "evidence": 1}}'):
+        (tmp_path / "learning" / "preferences.json").write_text(bad, encoding="utf-8")
+        await distiller.distill(log, home=tmp_path, user_md=md)  # must repair the file, not raise
+        assert distiller.read_auto_section(md) == ["avoids model m-x for review tasks"]
 
 
 def test_read_auto_section_ignores_lines_after_the_block(tmp_path):
@@ -108,7 +119,7 @@ async def test_old_format_file_is_migrated_without_losing_anything(tmp_path):
     text = md.read_text(encoding="utf-8")
     assert "- never use tabs\n" in text and "I like tabs." in text and "## My notes\nkeep this" in text
     assert "machine line from last time" not in text
-    assert text.index("- never use tabs") < text.index(MARK_START) < text.index("## My notes")
+    assert text.index("- never use tabs") < text.index(HEADING) < text.index("## My notes")
     again = md.read_text(encoding="utf-8")
     await distiller.distill(log, home=tmp_path, user_md=md)
     assert md.read_text(encoding="utf-8") == again  # a second run changes nothing
