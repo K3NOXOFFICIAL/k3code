@@ -886,10 +886,10 @@ acquire_source() {
 
 # ---- build -----------------------------------------------------------------
 tui_failed() { # tui_failed WHY: the TUI was built and the build failed (a skipped one is not a failure)
-  log "WARNING: $1; k3code will use the line REPL"
   # `k3code update` stages with --no-activate and must not switch to a version that lost the TUI because the npm
   # registry was unreachable; the half-built version is removed on exit, so the next update builds it again
   if [ "${K3_REQUIRE_TUI:-0}" = 1 ]; then die "$1; nothing was activated"; fi
+  log "WARNING: $1; k3code will use the line REPL"
 }
 
 build_tui() {

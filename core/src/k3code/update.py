@@ -806,6 +806,11 @@ def pull_checkout(checkout: Path) -> None:
     raise SourceUpdateError(f"git pull failed in {checkout}:\n{err[:600]}")
 
 
+#: How much of a failed installer's output an error shows. npm names its reason in the first lines of a stack trace
+#: of about thirty, so the last few lines alone would show only the trace.
+INSTALLER_TAIL_LINES = 40
+
+
 def _installer_env(**extra: str) -> dict[str, str]:
     """The environment for install.sh: an install made as root (``--allow-root``) must stay updatable as root, and a
     TUI build that fails (npm unreachable) must fail the staging instead of leaving a version without the TUI to
@@ -834,9 +839,9 @@ def vet_staged(version: str) -> list[str]:
         if version not in {previous_version(), *running_versions()}:
             shutil.rmtree(versions_dir() / version, ignore_errors=True)
         raise SourceUpdateError(
-            f"{version} was not activated: its TUI is missing (the build failed or was skipped: is the npm registry "
-            f"reachable? the output is in {data_dir() / 'install.log'}) and {cur} stays current. Run `k3code update` "
-            "again when the TUI can build."
+            f"{version} was not activated: its TUI is missing (the build failed or was skipped; the installer's messages "
+            f"are in {data_dir() / 'install.log'}) and {cur} stays current. Run `k3code update` again when the TUI "
+            "can build."
         )
     if has_file(version, K3_BINARY):
         return []
@@ -853,7 +858,8 @@ def vet_staged(version: str) -> list[str]:
     if holder == cur:
         kept += "; `k3code update --rollback` goes back to it"
     why = "its build failed" if failed else "it was not built"
-    return [f"warning: {version} has no k3 multi-window binary ({why}; see {data_dir() / 'install.log'}): {kept}"]
+    log = data_dir() / "install.log"
+    return [f"warning: {version} has no k3 multi-window binary ({why}; the installer's messages are in {log}): {kept}"]
 
 
 def update_from_source(checkout: Path, *, pull: bool = True) -> str:
@@ -876,7 +882,7 @@ def update_from_source(checkout: Path, *, pull: bool = True) -> str:
         env=_installer_env(),
     )
     if r.returncode:
-        tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
+        tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-INSTALLER_TAIL_LINES:])
         raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
     return r.stdout.strip().splitlines()[-1]
 
@@ -1011,7 +1017,7 @@ def update_from_git(url: str, ref: str) -> str:
             env=_installer_env(K3CODE_DATA=str(data_dir()), GIT_TERMINAL_PROMPT="0"),
         )
         if r.returncode or not r.stdout.strip():
-            tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
+            tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-INSTALLER_TAIL_LINES:])
             raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
         return r.stdout.strip().splitlines()[-1]
     finally:
