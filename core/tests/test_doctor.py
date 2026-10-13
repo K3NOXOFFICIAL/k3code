@@ -385,3 +385,31 @@ def test_doctor_clears_a_providers_auth_cooldown_when_its_key_answers(monkeypatc
     left = CooldownStore(path=path)
     assert left.reason_of(provider="good", model="m") is None
     assert left.reason_of(provider="bad", model="m") is FailoverReason.auth
+
+
+def test_tui_hint_for_an_install_without_sources_does_not_send_you_to_a_tui_dir(monkeypatch):
+    """An install keeps only tui/dist, so when its build failed or was skipped there is no `tui/` to `cd` into. The
+    hint must say what works: the installer keeps a version it already built, so it needs an uninstall first."""
+    from k3code import doctor
+    from k3code.paths import NodeChoice
+
+    node = NodeChoice("/fake/node", "v22.1.0", "PATH", "the node on PATH, Node >= 20")
+    monkeypatch.setattr("k3code.paths.resolve_node", lambda: node)
+    monkeypatch.setattr(doctor, "find_repo_root", lambda: None)
+    check = doctor.check_tui()
+    assert check.status == doctor.WARN
+    assert "cd tui" not in check.fix
+    assert "uninstall.sh" in check.fix and "install.sh" in check.fix
+
+
+def test_tui_hint_for_a_source_checkout_still_builds_in_the_checkout(monkeypatch, tmp_path):
+    from k3code import doctor
+    from k3code.paths import NodeChoice
+
+    (tmp_path / "tui").mkdir()
+    (tmp_path / "tui" / "package.json").write_text("{}")
+    node = NodeChoice("/fake/node", "v22.1.0", "PATH", "the node on PATH, Node >= 20")
+    monkeypatch.setattr("k3code.paths.resolve_node", lambda: node)
+    monkeypatch.setattr(doctor, "find_repo_root", lambda: tmp_path)
+    check = doctor.check_tui()
+    assert check.status == doctor.WARN and "npm run build" in check.fix

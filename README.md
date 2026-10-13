@@ -47,11 +47,11 @@ k3code plans before it acts, can run several agents in parallel, retries through
 
 - **Linux** on x86_64 is the tested platform: a clean install was tested in a Fedora 44 container. aarch64 (arm64) is accepted but untested.
 - **macOS** (Intel and Apple silicon) uses the same installer. It is untested; the 24/7 service and the bubblewrap sandbox are Linux-only.
-- **Windows** runs k3code inside [WSL 2](https://learn.microsoft.com/windows/wsl/install). `install\install.ps1` sets up WSL with Ubuntu if needed, runs the Linux installer there and adds `k3code` and `k3` commands to Windows. Native Windows, Git Bash and Cygwin are not supported. Untested on a real Windows machine so far.
+- **Windows** runs k3code inside [WSL 2](https://learn.microsoft.com/windows/wsl/install). `install\install.ps1` sets up WSL with Ubuntu if needed, runs the Linux installer there and adds `k3code` and `k3` commands to Windows. Native Windows, Git Bash and Cygwin are not supported. On a real Windows machine only the scripts have run: Windows PowerShell 5.1 has parsed `install.ps1` and `uninstall.ps1` and run `install.ps1 -Help`, and the failures PowerShell 5.1 and the older WSL of Windows 10 caused are fixed (see the CHANGELOG). An install, update and uninstall through a real WSL 2 distribution have not been run; those are tested against a stand-in for `wsl.exe` on Linux (see [Status](#status)).
 - You need `git`, `curl` or `wget`, a POSIX shell and network access during install. Everything else is fetched into your home directory without root, when it is not already installed:
   - [`uv`](https://docs.astral.sh/uv/), which provides Python ≥ 3.12;
   - a private Node 22, from nodejs.org and checked against its published checksums, to build and run the TUI;
-  - the Go toolchain `panes/go.mod` asks for, from the Go module proxy, to build the `k3` binary. Its module cache is deleted after the build.
+  - the Go toolchain `panes/go.mod` asks for, from go.dev (the installer checks the download against the sha256 go.dev lists), to build the `k3` binary. The build then fetches the `k3` module dependencies through the Go module proxy; that module cache is deleted after the build.
 - `bubblewrap` (`bwrap`), which sandboxes unattended runs on Linux, comes from your package manager. The installer installs it only when that needs no password (root or passwordless sudo); otherwise it prints the command to run (presetup repeats it after the install). `--no-install-deps` turns off that install and every toolchain download (uv, Python, Node, Go, Chromium); the packages (PyPI for the core, npm for the TUI, Go modules for the `k3` binary) are still fetched, so the install needs network access.
 - Optional: `systemd --user` for the 24/7 service.
 
@@ -312,6 +312,8 @@ k3code attach <session-id>     # open the TUI on a daemon session; detach any ti
 k3code agents                  # open the TUI on the daemon with the agent view showing
 ```
 
+**On WSL (Windows)** the unit needs systemd, which WSL starts only when `/etc/wsl.conf` has `systemd=true` under `[boot]` (then run `wsl --shutdown` in PowerShell); without it `k3code service install` writes the unit files but its `systemctl --user` steps report `failed`, and nothing starts the daemon: run `k3code daemon` yourself. WSL can also shut a distribution down once it is idle (`instanceIdleTimeout` and `vmIdleTimeout`, see [Microsoft's WSL settings](https://learn.microsoft.com/windows/wsl/wsl-config)), and then everything in it stops, the daemon and its sessions included; `loginctl enable-linger` does not prevent that. Keep a WSL terminal open for unattended runs, or raise those timeouts in `%UserProfile%\.wslconfig`. None of this has been tested on a real WSL machine, and the behaviour listed below was verified on Linux only.
+
 What keeps it alive and safe when nobody is watching:
 
 - **Offline handling.** A connectivity monitor distinguishes *online*, *degraded*, *provider down*, *captive portal* and *offline*. Offline: the turn pauses (no error) and resumes by itself once the network is back, usually within a minute (while offline the probe backs off from every 5 s to every 60 s). A single provider being down is a failover, not a pause. A provider that answers its own probe (an Ollama on loopback, a vLLM on the LAN) keeps the state *online* even where the internet probe fails, so a local-only setup on a host with no internet does not pause.
@@ -490,7 +492,7 @@ What is not verified yet:
 
 - **Live models.** Many scripted checks use a scripted fake provider. The live-model rows ran through the `claude-cli` provider (a local Claude Code login), not through a gateway.
 - **Long unattended runs.** A 30-minute daemon soak passed. The 72-hour soak is pending.
-- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. The installer tests ran on macOS while CI ran on GitHub Actions; a macOS run is now a manual step before a release ([`docs/RELEASING.md`](docs/RELEASING.md)). Windows (`install.ps1` via WSL) is tested only against a stand-in for `wsl.exe` on Linux: `scripts/ci/platforms.sh` installs, updates, rolls back and uninstalls through it into an Ubuntu container, and on clean Ubuntu, Debian and Alpine containers.
+- **Platforms.** Only Linux on x86_64 has been tested. A clean install was tested in a Fedora 44 container. The installer tests ran on macOS while CI ran on GitHub Actions; a macOS run is now a manual step before a release ([`docs/RELEASING.md`](docs/RELEASING.md)). Windows (`install.ps1` via WSL): Windows PowerShell 5.1 has parsed both scripts and run `install.ps1 -Help`, but an install, update and uninstall through a real WSL 2 distribution have not been run. They are tested against a stand-in for `wsl.exe` on Linux: `scripts/ci/platforms.sh` installs, updates, rolls back and uninstalls through it into an Ubuntu container, and on clean Ubuntu, Debian and Alpine containers.
 - **Updates.** There is no release yet, so the update and rollback path has only been tested against local version directories.
 
 | | Milestone | Built | Verified so far |

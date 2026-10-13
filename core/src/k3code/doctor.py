@@ -429,7 +429,15 @@ def check_tui() -> Check:
     used = f"node {choice.version} ({choice.reason}: {choice.path})"
     data = {"node": choice.version, "path": choice.path, "source": choice.source}
     if entry is None or not entry.is_file():
-        return Check("tui", WARN, f"{used}, TUI build missing", "cd tui && npm install && npm run build", data)
+        # An install keeps only tui/dist, so with no sources there is no tui/ to build in. The installer keeps a
+        # version it already built (`version X already installed`), so only an uninstall makes it build again.
+        build_fix = (
+            "cd tui && npm install && npm run build"
+            if root
+            else f"check Node.js >= {MIN_NODE_MAJOR} with npm and the network, run `sh install/uninstall.sh` (it keeps "
+            "your data), then `sh install/install.sh` again; re-running the installer alone keeps this version as it is"
+        )
+        return Check("tui", WARN, f"{used}, TUI build missing", build_fix, data)
     if choice.major < MIN_NODE_MAJOR:  # only K3CODE_NODE can name a node that old
         return Check("tui", WARN, f"{used} is old", f"use Node.js >= {MIN_NODE_MAJOR} (or unset {NODE_ENV})", data)
     return Check("tui", OK, f"{used}, tui/dist/entry.js present", data=data)
