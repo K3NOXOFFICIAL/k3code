@@ -1418,7 +1418,7 @@ class GatewayServer:
 
     # ── router wiring ─────────────────────────────────────────────────
 
-    def _ensure_router(self, model: str | None = None) -> None:
+    def _ensure_router(self, model: str | None = None) -> TierRouters:
         """Provider chain + routers, built once per provider config and once per model key.
 
         Sessions with different model keys (a cron job with ``model:`` next to an interactive session) used to
@@ -1426,12 +1426,15 @@ class GatewayServer:
         dir per claude-cli provider, none of the old ones closed. Routers are now cached per key; when the provider
         config itself is replaced (/config reload) only the blocks that changed get a new provider (see
         ``_swap_providers``).
+
+        Returns the key's routers. ``self.router`` / ``self._tiers`` follow whichever turn called this last, so a
+        turn keeps the returned value instead of reading them again after an await (#130).
         """
         key = model or self.config.default_model
         # _router_cfg None: a router injected from outside (tests) is taken as is
         current = self._router_cfg is None or self._router_cfg is self.config.providers
         if self.router is not None and self._chain_key == key and current:
-            return
+            return self.tier_routers()
         if self._router_cfg is not self.config.providers:  # first build, or the provider config was replaced
             self._swap_providers()
             self._router_cache = {}
@@ -1445,6 +1448,7 @@ class GatewayServer:
         self._tiers = tiers
         self.router = tiers.get(Tier.MAIN)
         self._chain_key = key
+        return tiers
 
     def _swap_providers(self) -> None:
         """Providers for ``config.providers``: a block whose settings did not change keeps its provider.
@@ -2025,7 +2029,7 @@ class GatewayServer:
         ``hooked``: the outcome of the user's hooks when the caller already ran them for ``text``."""
         if self.halted:  # /daemon pause: nothing reaches a provider; the caller pauses the goal (status 'halted')
             return "halted", ""
-        self._ensure_router(session.stored.model or None)
+        tiers = self._ensure_router(session.stored.model or None)
         assert self.router is not None
         session.turn_id = uuid.uuid4().hex[:12]
         session.perms.cwd = Path(session.stored.cwd or Path.cwd())  # session cwd, never the process cwd
@@ -2065,7 +2069,7 @@ class GatewayServer:
         loop = self._build_loop(
             session,
             reliability,
-            self.tier_routers().get(tier),
+            tiers.get(tier),
             kind,
             approval,
             max_tool_errors=max_errors,
@@ -2120,7 +2124,7 @@ class GatewayServer:
                 loop = self._build_loop(
                     session,
                     reliability,
-                    self.tier_routers().get(tier),
+                    tiers.get(tier),
                     kind,
                     approval,
                     max_tool_errors=max_errors,
@@ -2195,7 +2199,7 @@ class GatewayServer:
                 loop = self._build_loop(
                     session,
                     reliability,
-                    self.tier_routers().get(tier),
+                    tiers.get(tier),
                     kind,
                     approval,
                     max_tool_errors=max_errors if tier in (Tier.FAST, Tier.CHEAP) else main_errors,
@@ -2314,7 +2318,7 @@ class GatewayServer:
             if loop.turn_messages:
                 stored = session.stored
                 stored.messages = _serialize_messages(loop.turn_messages)
-                stored.model = stored.model or self._chain_key or self.config.default_model
+                stored.model = stored.model or self.config.default_model  # keyless: runs on default
                 snapshot = dataclasses.replace(
                     stored, meta=copy.deepcopy(stored.meta), usage=copy.deepcopy(stored.usage)
                 )
@@ -2380,7 +2384,7 @@ class GatewayServer:
         session.last_checkpoint = time.monotonic()
         messages = _serialize_messages(loop.turn_messages)
         session.stored.messages = messages
-        session.stored.model = session.stored.model or self._chain_key or self.config.default_model
+        session.stored.model = session.stored.model or self.config.default_model  # keyless: runs on default (#130)
         session.checkpoint_task = asyncio.create_task(
             self._write_checkpoint(session.session_id, messages, session.stored.model)
         )
