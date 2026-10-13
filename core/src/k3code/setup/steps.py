@@ -54,6 +54,7 @@ class Ctx:
     data: dict[str, Any]  # results of previous steps
     do_probe: bool = True
     cwd: Path = field(default_factory=Path.cwd)
+    only_step: str | None = None  # set for `setup --step X`: the one step that runs
 
     def say(self, text: str = "") -> None:
         self.p.say(text)
@@ -659,10 +660,12 @@ def step_summary(c: Ctx) -> dict[str, Any]:
 
     from k3code import doctor
     from k3code.config import load_config
+    from k3code.paths import user_config_path
 
-    path = write_config(c.data)
+    # `--step summary` owns no config keys: config.yaml is left as it is. The end of a full run writes it.
+    path = user_config_path() if c.only_step else write_config(c.data)
     mem = write_user_md(c.data, c.say)
-    c.say(f"Wrote {path} and {mem}")
+    c.say(f"Wrote {mem}" if c.only_step else f"Wrote {path} and {mem}")
     checks = asyncio.run(doctor.run_checks(load_config(), probe=c.do_probe))
     c.say(doctor.format_report(checks))
     return {"config": str(path)}

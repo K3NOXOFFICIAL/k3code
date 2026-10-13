@@ -247,3 +247,28 @@ def test_summary_keeps_hand_edited_tier_models_over_the_saved_answers(env: Path)
     _put_cfg(cfg)
     _step("summary")
     assert _cfg()["providers"][0]["models"] == {"default": "hand", "cheap": "hand-cheap"}
+
+
+def test_summary_alone_leaves_a_hand_edited_config_as_it_is(env: Path) -> None:
+    run_setup(AnswerPrompter(ANSWERS), do_probe=False)  # the saved answers say: theme midnight
+    cfg = _cfg()
+    cfg["display"]["theme"] = "nord"
+    _put_cfg(cfg)
+    user_config_path().chmod(0o600)
+    before = user_config_path().read_text()
+    _step("summary")
+    assert user_config_path().read_text() == before
+    assert (user_config_path().stat().st_mode & 0o777, _user_md().stat().st_mode & 0o777) == (0o600, 0o600)
+
+
+def test_summary_after_a_partial_run_writes_no_keys_of_steps_that_never_ran(env: Path) -> None:
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    _put_cfg({"display": {"theme": "dracula"}})
+    _step("about")
+    _step("tiers")  # the saved answers now hold about and tiers only
+    before = user_config_path().read_text()
+    _step("summary")
+    assert user_config_path().read_text() == before
+    cfg = _cfg()
+    assert cfg["display"] == {"theme": "dracula"}
+    assert not {"permission_mode", "output_style", "autonomy", "panes"} & cfg.keys()

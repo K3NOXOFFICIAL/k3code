@@ -24,13 +24,11 @@ def run_setup(
     state = load_state()
     if state.get("done") and not only_step:  # a finished run: start a fresh one
         state = {"completed": [], "data": {}}
-    ctx = Ctx(p=p, data=state["data"], do_probe=do_probe, cwd=cwd or Path.cwd())
+    ctx = Ctx(p=p, data=state["data"], do_probe=do_probe, cwd=cwd or Path.cwd(), only_step=only_step)
     if only_step and only_step != "providers":
         # The chain is whatever config.yaml says now (fast onboarding, /config and hand edits never touch the saved
         # answers); the saved answers are not changed by this.
         ctx.data = {**state["data"], "providers": {"entries": _chain_in_config()}}
-        if only_step == "summary":  # writes nothing about the tiers: the models in config.yaml are the truth
-            ctx.data["tiers"] = {**ctx.data.get("tiers", {}), "models": {}}
     if only_step == "secrets":  # extra step: not part of the numbered flow
         todo = [Step("secrets", step_secrets, "Missing API keys")]
     elif only_step:
