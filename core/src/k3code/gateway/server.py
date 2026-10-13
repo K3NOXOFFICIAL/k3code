@@ -39,7 +39,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from k3code import confio, mcpjson, userhooks, wakewords
 from k3code import skills as skills_mod
-from k3code._version import __version__
+from k3code._version import build_version
 from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, autonomy_cfg
@@ -374,7 +374,7 @@ class LiveSession:
         return {
             "model": _model_label(config, key),
             "model_key": key,
-            "version": __version__,
+            "version": build_version(),  # the banner: which build this daemon started as
             "tools": self._tools_info(),
             "skills": self._skills_info(),
             "provider": self.stored.provider,
@@ -3795,7 +3795,7 @@ async def _setup_status(server: GatewayServer, params: dict[str, Any]) -> dict[s
     return {
         "provider_configured": bool(server.config.providers),
         "ready": bool(server.config.providers),
-        "version": __version__,  # doctor compares it with the installed `current` to spot a stale daemon
+        "version": build_version(),  # doctor and `k3code update` compare it with `current` to spot a stale daemon
     }
 
 

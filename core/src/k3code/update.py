@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from k3code import service
+from k3code._version import recorded_build
 from k3code.paths import GATEWAY_ENV_VARS, data_dir, home, user_config_path
 from k3code.setup.state import env_file_path
 
@@ -60,6 +61,45 @@ def previous_version() -> str | None:
     except OSError:
         return None
     return v if v and (versions_dir() / v).is_dir() else None
+
+
+def stale_build() -> str | None:
+    """The build this process runs when ``current`` names another one (it keeps the old code until restarted)."""
+    running, installed = recorded_build(), current_version()
+    return running if running and installed and running != installed else None
+
+
+def stale_daemon_build() -> str | None:
+    """The build the daemon reports on its socket when ``current`` names another one; None when it is not running.
+
+    A daemon that predates build names reports the plain version (``0.1.0``) for any ``0.1.0-src.<sha>``: that is
+    not comparable, so it is not called stale (doctor's daemon-version check makes the same call).
+    """
+    import asyncio
+
+    from k3code import doctor
+
+    installed = current_version()
+    try:
+        running = str(asyncio.run(doctor.check_daemon()).data.get("version") or "")
+    except Exception:  # noqa: BLE001 - a daemon that does not answer is doctor's business, not the update's
+        return None
+    if not running or not installed or running == installed or installed.startswith(f"{running}-"):
+        return None
+    return running
+
+
+def current_lines(cur: str | None, behind: str | None, who: str = "running: ") -> str:
+    """``current: X``, and when a process still runs the build ``behind``, the line that says to restart."""
+    if behind is None:
+        return f"current: {cur}"
+    how = f": systemctl --user restart {service.UNIT_NAME}" if service.is_installed() else ""
+    return f"current: {cur}\n{who}{behind} (restart to use {cur}{how})"
+
+
+def up_to_date(behind: str | None, text: str) -> str:
+    """``text`` ("Already up to date."), unless a process still runs the build before the active one."""
+    return "Nothing newer to install." if behind else text
 
 
 def switch_to(version: str) -> None:
