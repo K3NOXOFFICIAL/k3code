@@ -20,7 +20,8 @@ from typing import Any
 import httpx
 
 from k3code import service
-from k3code.paths import GATEWAY_ENV_VARS, data_dir, user_config_path
+from k3code.paths import GATEWAY_ENV_VARS, data_dir, home, user_config_path
+from k3code.setup.state import env_file_path
 
 DEFAULT_REPO = "K3NOXOFFICIAL/k3code"
 #: The GitHub-compatible releases API; K3CODE_UPDATE_API or update.api point it at a mirror.
@@ -738,6 +739,11 @@ def apply_detached(*, unit_installed: Callable[[], bool] = service.is_installed)
     it was restarting: systemd SIGTERMed the whole cgroup (the poller included), so the auto-rollback branch could
     never run and the shutdown hung on the executor thread. A transient ``systemd-run --user`` unit survives it.
     Without a unit there is nothing to restart, and no systemd to ask on macOS or most WSL setups: a detached process.
+
+    A transient unit starts from the user manager's environment, not ours. The daemon's unit hands it K3CODE_DATA and
+    K3CODE_HOME (``Environment=``) and the provider and GitHub keys (``EnvironmentFile=``); the update gets the same,
+    so it updates the install the daemon runs from and can reach a private repository. The keys stay in the file:
+    nothing secret goes on a command line or into the unit's properties.
     """
     exe = shutil.which("k3code") or str(Path(sys.argv[0]).resolve())
     if not unit_installed():
@@ -750,7 +756,19 @@ def apply_detached(*, unit_installed: Callable[[], bool] = service.is_installed)
         )
     unit = f"k3code-update-{int(time.time())}"
     r = subprocess.run(
-        [runner, "--user", "--collect", "--quiet", f"--unit={unit}", exe, "update", "--yes"],
+        [
+            runner,
+            "--user",
+            "--collect",
+            "--quiet",
+            f"--unit={unit}",
+            f"--setenv=K3CODE_DATA={data_dir()}",
+            f"--setenv=K3CODE_HOME={home()}",
+            f"--property=EnvironmentFile=-{env_file_path().absolute()}",
+            exe,
+            "update",
+            "--yes",
+        ],
         capture_output=True,
         text=True,
         check=False,
