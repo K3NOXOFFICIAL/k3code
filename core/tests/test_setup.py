@@ -4,6 +4,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -401,3 +402,79 @@ def test_parse_window_refuses_anything_else(text: str) -> None:
     from k3code.setup.steps import parse_window
 
     assert parse_window(text) is None
+
+
+def _record_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every network call setup and doctor would make, recorded and refused."""
+    import httpx
+
+    from k3code import doctor
+
+    calls: list[str] = []
+
+    def get(url: str, *_a: object, **_kw: object) -> None:
+        calls.append(str(url))
+        raise httpx.ConnectError("blocked in test")
+
+    async def provider_probe(base_url: str, timeout: float = 5.0) -> None:
+        calls.append(base_url)
+        raise OSError("blocked in test")
+
+    async def internet_probe(_cfg: object) -> SimpleNamespace:
+        calls.append("internet")
+        return SimpleNamespace(captive=False, ok=False, latency_ms=None)
+
+    monkeypatch.setattr(httpx, "get", get)
+    monkeypatch.setattr(doctor, "_default_provider_probe", provider_probe)
+    monkeypatch.setattr(doctor, "default_internet_probe", internet_probe)
+    return calls
+
+
+class _Interactive(AnswerPrompter):
+    interactive = True
+
+
+def test_providers_test_false_makes_no_network_call_in_tiers_or_summary(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from k3code import doctor
+    from k3code.setup import detect
+
+    calls = _record_network(monkeypatch)
+    sandbox_probes: list[bool] = []
+
+    def check_sandbox(probe: bool = True) -> doctor.Check:  # local, not a network call: it must still run for real
+        sandbox_probes.append(probe)
+        return doctor.Check("sandbox", doctor.OK, "stub")
+
+    monkeypatch.setattr(doctor, "check_sandbox", check_sandbox)
+    monkeypatch.setattr(detect, "sandbox_state", lambda probe=True: "usable")
+    run_setup(AnswerPrompter(ANSWERS))  # no --no-probe; the answers file says providers.test: false
+    assert calls == []
+    assert sandbox_probes == [True]
+
+
+def test_providers_test_true_still_probes_the_providers_in_the_summary(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from k3code.setup import detect
+
+    calls = _record_network(monkeypatch)
+    monkeypatch.setattr(detect, "sandbox_state", lambda probe=True: "usable")
+    run_setup(AnswerPrompter({**ANSWERS, "providers": {**ANSWERS["providers"], "test": True}}))
+    assert "http://127.0.0.1:9/v1/models" in calls and "https://api.anthropic.com/v1/models" in calls
+    assert "internet" in calls
+
+
+def test_tiers_lists_models_only_for_a_tier_nobody_answered(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.setup import steps
+
+    calls = _record_network(monkeypatch)
+    entry = {"name": "gw", "kind": "openai", "base_url": "http://127.0.0.1:9/v1", "api_key_env": "OMNIROUTE_API_KEY"}
+    data = {"providers": {"entries": [entry], "live": True}}
+    steps.step_tiers(steps.Ctx(p=AnswerPrompter({"tiers": ANSWERS["tiers"]}), data=data))
+    assert calls == []  # every tier answered: nothing to choose from a model list
+    steps.step_tiers(steps.Ctx(p=_Interactive({"tiers": {"main": "m-main"}}), data=data))
+    assert calls == ["http://127.0.0.1:9/v1/models"]
+    steps.step_tiers(steps.Ctx(p=_Interactive({}), data={"providers": {"entries": [entry], "live": False}}))
+    assert len(calls) == 1  # the user declined live tests: they type the ids
