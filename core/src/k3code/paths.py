@@ -93,7 +93,7 @@ def main_checkout(root: str | Path) -> Path | None:
         admin = (top / pointer.removeprefix("gitdir:").strip()).resolve()
         common = (admin / (admin / "commondir").read_text(encoding="utf-8").strip()).resolve()
         recorded = (admin / (admin / "gitdir").read_text(encoding="utf-8").strip()).resolve()
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):  # RuntimeError: resolve() on a symlink loop (Python < 3.13)
         return None
     if recorded != dotgit or admin.parent != common / "worktrees" or common.name != ".git":
         return None
