@@ -408,6 +408,36 @@ def test_declining_a_vendor_key_and_giving_none_does_not_probe_with_it_and_says_
     assert old not in out
 
 
+def test_keeping_the_old_shared_key_is_not_the_default_and_the_question_says_why(root, monkeypatch) -> None:
+    """Security review of #204: every endpoint used to share K3CODE_API_KEY, so the key in it may be another vendor's
+    (#114), yet "Keep the K3CODE_API_KEY key?" defaulted to yes and pressing Enter kept sending it to this endpoint."""
+    from k3code import confio
+    from k3code.setup.state import set_env_var
+
+    b = "http://127.0.0.1:18082/v1"
+    vendor_a_key = "fake-" + "vendor-a-key"
+    set_env_var("K3CODE_API_KEY", vendor_a_key)
+    confio.write_yaml(
+        user_config_path(),
+        {"providers": [{"name": "endpoint", "kind": "openai", "base_url": b, "api_key_env": "K3CODE_API_KEY"}]},
+    )
+    asked: list[tuple[str, bool]] = []
+
+    class Recording(Scripted):
+        def confirm(self, key: str, message: str, default: bool = True) -> bool:
+            if key == "onboard.keep_key":
+                asked.append((message, default))
+            return super().confirm(key, message, default)
+
+    probes = _record_probes(monkeypatch)
+    ob.run_fast(Recording({"onboard": {"mode": "fast", "provider": "api", "endpoint": b, "model": "m"}}), do_probe=True)
+
+    [(message, default)] = asked
+    assert default is False and "another endpoint" in message
+    assert all(key != vendor_a_key for _url, key in probes), probes
+    assert load_config(project_dir=root).providers[0].api_key != vendor_a_key
+
+
 def test_fast_api_never_takes_over_a_vendor_key_variable_for_another_url(root, monkeypatch) -> None:
     """The old wizard wrote an openai entry with an edited URL on OPENAI_API_KEY; fast setup for that URL passed the
     variable on, so the OpenAI key kept going to the other host."""

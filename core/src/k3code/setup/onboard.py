@@ -145,7 +145,11 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> 
     existing = os.environ.get(env_name) or read_env_file().get(env_name, "")
     where = "your environment" if os.environ.get(env_name) else f"the env file {env_file_path()}"
     key = str(p.raw("onboard.key", "") or "").strip() if not p.interactive else ""
-    kept = bool(existing and not key and p.confirm("onboard.keep_key", f"Keep the {env_name} key from {where}?", True))
+    question = f"Keep the {env_name} key from {where}?"
+    shared = env_name == "K3CODE_API_KEY"  # every endpoint used to share it, so its key may be another vendor's (#114)
+    if shared:
+        question += " (the old shared variable: it may hold another endpoint's key)"
+    kept = bool(existing and not key and p.confirm("onboard.keep_key", question, not shared))
     if kept:
         p.say(f"  using {env_name} from {where}")
     elif preset != "local" and not key:
