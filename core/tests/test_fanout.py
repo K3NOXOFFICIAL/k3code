@@ -6,7 +6,9 @@ import json
 import subprocess
 from pathlib import Path
 
-from k3code.autonomy.fanout import detect_test_command, extract_subtasks, parse_verdict
+import pytest
+
+from k3code.autonomy.fanout import detect_test_command, extract_subtasks, parse_verdict, run_tests
 from k3code.autonomy.scope import ScopeVerdict
 from m1cmd_helpers import git_repo
 from test_autonomy_gateway import PLAN, call, events, make, run_turn
@@ -205,6 +207,33 @@ async def test_reviewer_rejection_sends_work_back_once(tmp_path, monkeypatch):
     assert "retrying" in states and states[-1] == "merged"
 
 
+async def test_a_reviewer_without_a_verdict_escalates_instead_of_passing(tmp_path, monkeypatch):
+    # issue #97: a review with no VERDICT line (a crash, a stop, a ramble) used to count as a pass and was merged
+    repo = git_repo(tmp_path / "repo")
+    subs = ["SUB-ONE add f1", "SUB-TWO add f2"]
+    steps = [
+        classify(subs),
+        *PLANNER,
+        *worker(1, "f1.txt"),
+        *worker(2, "f2.txt"),
+        reviewer(subs[0]),
+        {"type": "text", "match": "Subtask: SUB-TWO add f2", "text": "I ran out of time before deciding."},
+        {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"},
+    ]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 1 and done["escalated"] == 1, done["summary"]
+    assert (repo / "f1.txt").exists() and not (repo / "f2.txt").exists()  # the unreviewed work was not merged
+    t2 = [p for p in events(server, "fanout.progress") if p["subtask_id"] == "t2"]
+    assert t2[-1]["state"] == "escalated" and "no review verdict" in t2[-1]["detail"]
+    assert not any("--- REWORK ---" in c["text"] for p in server.providers for c in p.log)  # not the worker's fault
+    reviewers = [h for h in server.subagents.handles.values() if h.agent_type == "reviewer"]
+    assert len(reviewers) == 3  # SUB-ONE once, SUB-TWO asked once more
+    assert "k3/" in git(repo, "branch")  # the escalated child's branch survives
+
+
 async def test_failing_tests_are_sent_back_once_then_pass(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     subs = ["SUB-ONE add f1", "SUB-TWO add bad"]
@@ -234,6 +263,44 @@ async def test_failing_tests_are_sent_back_once_then_pass(tmp_path, monkeypatch)
     t2 = [p for p in events(server, "fanout.progress") if p["subtask_id"] == "t2"]
     assert any(p["state"] == "retrying" and "tests failed" in p["detail"] for p in t2)
     assert git(repo, "log", "--oneline", "--merges").count("Merge k3/") == 2
+
+
+async def test_work_reworked_after_failing_tests_is_reviewed_again_before_it_merges(tmp_path, monkeypatch):
+    # the rework after a failed test run (or a conflict) went straight back to the merge: what it added was never
+    # reviewed
+    repo = git_repo(tmp_path / "repo")
+    subs = ["SUB-ONE add f1", "SUB-TWO add bad"]
+    steps = [
+        classify(subs),
+        *PLANNER,
+        *worker(1, "f1.txt"),
+        *worker(2, "bad.txt"),
+        reviewer(subs[0]),
+        reviewer(subs[1]),
+        {
+            "type": "tool_call",
+            "id": "rm",
+            "match": "--- REWORK ---",
+            "when": "first",
+            "name": "bash",
+            "arguments": {"command": "rm bad.txt && echo unreviewed > unreviewed.txt"},
+        },
+        {"type": "text", "match": "--- REWORK ---", "when": "after_tool", "text": "REWORK-REPORT done"},
+        # the second review of SUB-TWO carries the rework's report and rejects it
+        {"type": "text", "match": "REWORK-REPORT", "text": "\nunreviewed.txt is unrelated. VERDICT: fail"},
+        {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"},
+    ]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="test ! -f bad.txt")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 1 and done["escalated"] == 1, done["summary"]
+    assert not (repo / "unreviewed.txt").exists() and "unreviewed.txt" not in git(repo, "ls-files")
+    t2_reviews = [h for h in server.subagents.handles.values() if h.description == "review: SUB-TWO add bad"]
+    assert len(t2_reviews) == 2
+    t2 = [p for p in events(server, "fanout.progress") if p["subtask_id"] == "t2"]
+    assert t2[-1]["state"] == "escalated" and "unreviewed.txt is unrelated" in t2[-1]["detail"]
+    assert "k3/" in git(repo, "branch")  # the escalated child's branch survives
 
 
 async def test_persistent_failure_escalates_to_parent_and_keeps_branch(tmp_path, monkeypatch):
@@ -276,6 +343,61 @@ async def test_not_a_git_repo_runs_normally(tmp_path, monkeypatch):
     assert server.session.stored.messages[-1]["content"] == "did it sequentially"
 
 
+@pytest.mark.parametrize("staged", [True, False])
+async def test_uncommitted_changes_skip_fanout_and_run_normally(tmp_path, monkeypatch, staged):
+    """#98: workers branch from HEAD and merge into the user's checkout. With a staged edit git refuses every merge
+    (with an unstaged one, every merge touching that file), after all the workers and a rework each were paid for."""
+    repo = git_repo(tmp_path / "repo")
+    (repo / "a.py").write_text("x = 2\n")
+    if staged:
+        git(repo, "add", "a.py")
+    steps = [classify(SUBS), *PLANNER, {"type": "text", "match": "Approved plan", "text": "did it sequentially"}]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    assert not events(server, "fanout.plan")
+    assert not [h for h in server.subagents.handles.values() if h.agent_type == "worker"]
+    notes = [n["text"] for n in events(server, "notification.show") if n.get("kind") == "fanout"]
+    assert notes and "uncommitted changes" in notes[0] and "a.py" in notes[0], notes
+    assert server.session.stored.messages[-1]["content"] == "did it sequentially"
+    assert git(repo, "status", "--porcelain").startswith("M " if staged else " M")  # the user's edit is untouched
+
+
+async def test_checkout_dirtied_during_fanout_is_not_a_conflict_and_not_reworked(tmp_path, monkeypatch):
+    """#98: a merge git refuses to start (the checkout's own changes are in the way) was reported as a 'merge
+    conflict with what was already merged' and sent back to the worker, who cannot fix the user's checkout."""
+    from k3code.subagents import worktree as wt_mod
+
+    repo = git_repo(tmp_path / "repo")
+    subs = ["SUB-ONE add f1", "SUB-TWO add f2"]
+    steps = [
+        *steps_for(subs, sleep=0),
+        {"type": "text", "match": "--- REWORK ---", "text": "rework ran"},
+        {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"},
+    ]
+    real_trial = wt_mod.merge_trial
+
+    async def user_stages_an_edit_first(tree):
+        (repo / "a.py").write_text("x = 2\n")
+        git(repo, "add", "a.py")  # the user stages an edit while the workers run
+        return await real_trial(tree)
+
+    monkeypatch.setattr(wt_mod, "merge_trial", user_stages_an_edit_first)
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 0 and done["escalated"] == 2, done["summary"]
+    prog = events(server, "fanout.progress")
+    assert "retrying" not in {p["state"] for p in prog}  # no rework agent spent on the checkout's problem
+    assert len([h for h in server.subagents.handles.values() if h.agent_type == "worker"]) == 2
+    details = [p["detail"] for p in prog if p["state"] == "escalated"]
+    assert all("merge conflict" not in d and "uncommitted changes" in d and "a.py" in d for d in details), details
+    assert git(repo, "diff", "--cached", "--name-only").split() == ["a.py"]  # the user's staged edit is untouched
+    assert "k3/" in git(repo, "branch")  # the work stays on its branch for the parent
+    assert server.session.stored.messages[-1]["content"] == "parent handled it"
+
+
 async def test_fanout_disabled_by_config(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     steps = [classify(SUBS), *PLANNER, {"type": "text", "match": "Approved plan", "text": "sequential"}]
@@ -304,11 +426,65 @@ def test_detect_test_command(tmp_path):
     (tmp_path / "go.mod").write_text("")
     assert detect_test_command(tmp_path) == "go test ./..."
     (tmp_path / "pytest.ini").write_text("")
-    assert detect_test_command(tmp_path) == "python -m pytest -q -x"
+    assert detect_test_command(tmp_path) == "python3 -m pytest -q -x"  # stock Ubuntu has no `python`
     (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}')
     assert detect_test_command(tmp_path) == "npm test --silent"
     (tmp_path / "package.json").write_text('{"scripts": {}}')
-    assert detect_test_command(tmp_path) == "python -m pytest -q -x"
+    assert detect_test_command(tmp_path) == "python3 -m pytest -q -x"
+    fake_python(tmp_path, has_pytest=True)
+    assert detect_test_command(tmp_path) == ".venv/bin/python -m pytest -q -x"
+
+
+def fake_python(root: Path, *, has_pytest: bool) -> None:
+    """A stand-in ``.venv/bin/python``: ``-m pytest`` passes; ``import pytest`` works only when ``has_pytest``."""
+    py = root / ".venv" / "bin" / "python"
+    py.parent.mkdir(parents=True, exist_ok=True)
+    missing = "echo \"ModuleNotFoundError: No module named 'pytest'\" >&2; exit 1"
+    py.write_text(f'#!/bin/sh\ncase "$*" in *"import pytest"*) {"exit 0" if has_pytest else missing};; esac\nexit 0\n')
+    py.chmod(0o755)
+
+
+async def test_detected_pytest_uses_the_project_venv_inside_the_sandbox(tmp_path):
+    """Issue #96: `python -m pytest` exited 127 in the sandbox (no `python`, the venv not on PATH)."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("")
+    fake_python(project, has_pytest=True)
+    cmd = detect_test_command(project)
+    assert cmd == ".venv/bin/python -m pytest -q -x"
+    assert await run_tests(cmd, project, 60) == (True, "")
+
+
+async def test_fanout_skipped_when_the_detected_test_runner_is_missing_in_the_sandbox(tmp_path, monkeypatch):
+    """Issue #96: every merge would fail its tests, rework and escalate; the parent runs the task instead."""
+    repo = git_repo(tmp_path / "repo")
+    (repo / "pyproject.toml").write_text("")
+    fake_python(repo, has_pytest=False)
+    steps = [classify(SUBS), *PLANNER, {"type": "text", "match": "Approved plan", "text": "did it sequentially"}]
+    server = make_fan(tmp_path, monkeypatch, steps, repo)
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    assert not events(server, "fanout.plan")
+    notes = [n["text"] for n in events(server, "notification.show") if n.get("kind") == "fanout"]
+    assert len(notes) == 1 and notes[0].startswith("fan-out skipped")
+    assert ".venv/bin/python -m pytest" in notes[0] and "No module named 'pytest'" in notes[0]
+    assert server.session.stored.messages[-1]["content"] == "did it sequentially"
+
+
+async def test_fanout_skipped_when_the_sandbox_is_unusable(tmp_path, monkeypatch):
+    """Issue #96: without bwrap every child's bash and every merge's tests are refused."""
+    from k3code.reliability import sandbox
+
+    repo = git_repo(tmp_path / "repo")
+    steps = [classify(SUBS), *PLANNER, {"type": "text", "match": "Approved plan", "text": "did it sequentially"}]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    assert not events(server, "fanout.plan")
+    notes = [n["text"] for n in events(server, "notification.show") if n.get("kind") == "fanout"]
+    assert len(notes) == 1 and "bubblewrap is unusable" in notes[0]
+    assert server.session.stored.messages[-1]["content"] == "did it sequentially"
 
 
 async def test_merge_conflict_between_children_is_resolved_by_the_child(tmp_path, monkeypatch):

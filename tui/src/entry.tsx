@@ -26,6 +26,7 @@ import { openExternalUrl } from "./lib/openExternalUrl.js";
 import { recordParentLifecycle } from "./lib/parentLog.js";
 import {
   clearNativeTuiFrame,
+  clearStartupScreen,
   resetTerminalModes,
 } from "./lib/terminalModes.js";
 
@@ -64,7 +65,7 @@ process.on("exit", () => {
 if (TERMUX_TUI_MODE || NATIVE_MODE) {
   process.stdout.write("\n");
 } else {
-  process.stdout.write("\x1b[2J\x1b[H\x1b[3J");
+  clearStartupScreen();
 }
 
 const gw = new GatewayClient();

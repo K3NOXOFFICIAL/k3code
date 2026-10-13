@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -28,6 +29,7 @@ printf '%s\\n' "$@" >"$K3_STUB_ARGS"
 printf '%s\\n' "$(cd "$(dirname "$0")/.." && pwd)" >"$K3_STUB_DIR"
 printf '%s\\n' "${K3CODE_DATA:-}" >"$K3_STUB_DATA"
 printf '%s\\n' "${K3_ALLOW_ROOT:-unset}" >"$K3_STUB_ARGS.root"
+printf '%s\\n' "${K3_REQUIRE_TUI:-unset}" >"$K3_STUB_ARGS.tui"
 echo "k3code-install: installing the k3code core" >&2
 echo "npm warn deprecated noise that only a failure message needs" >&2
 if [ -n "${K3_STUB_GATE:-}" ]; then # build on only once the test has seen the line above (it gives up after 10 s)
@@ -40,6 +42,22 @@ if [ -n "${K3_STUB_FAIL:-}" ]; then
   echo "building the TUI" >&2
   echo "npm ERR! something broke" >&2
   exit 3
+fi
+if [ -n "${K3_STUB_TUI_BROKEN:-}" ] && [ "${K3_REQUIRE_TUI:-}" = 1 ]; then # an installer that fails a broken TUI build
+  echo "npm ERR! FetchError: request to https://registry.npmjs.org/x.tgz failed, reason: getaddrinfo ENOTFOUND" >&2
+  i=0 # npm prints its reason first and then a stack trace of about thirty lines
+  while [ $i -lt 30 ]; do echo "npm ERR!     at Socket.emit (node:events:531:35)" >&2; i=$((i + 1)); done
+  echo "k3code-install: ERROR: the TUI did not build (output above); nothing was activated" >&2
+  echo "k3code-install: FAILED (exit 1). Log: /somewhere/install.log" >&2
+  exit 1
+fi
+if [ -n "${K3_STUB_PARTS+x}" ]; then # stage versions/<version> in the data dir like install.sh: tui, k3, failed-k3
+  v=${K3_STUB_VERSION:-0.1.0-src.fffffff}
+  d=$K3CODE_DATA/versions/$v
+  mkdir -p "$d" && echo "$v" >"$d/.complete"
+  case " $K3_STUB_PARTS " in *" tui "*) mkdir -p "$d/tui/dist" && : >"$d/tui/dist/entry.js" ;; esac
+  case " $K3_STUB_PARTS " in *" k3 "*) mkdir -p "$d/bin" && : >"$d/bin/k3" ;; esac
+  case " $K3_STUB_PARTS " in *" failed-k3 "*) echo "k3: the go build failed" >"$d/.degraded" ;; esac
 fi
 echo "log line on stdout"
 echo "${K3_STUB_VERSION:-0.1.0-src.fffffff}"
@@ -356,6 +374,111 @@ def test_an_installer_that_kept_the_installed_build_is_not_activated(remote, dat
     monkeypatch.setenv("K3_STUB_VERSION", cur)
     r = CliRunner().invoke(cli, ["update", "--yes"])
     assert r.exit_code != 0 and f"kept the installed {cur}" in r.output and no_release == []
+
+
+# -- a build that lost the TUI or the k3 binary (#95) -------------------------------
+
+
+def _give(version_dir: Path, *parts: str) -> None:
+    """Put the TUI and/or the k3 binary into a version dir, where doctor and prune look for them."""
+    if "tui" in parts:
+        (version_dir / "tui" / "dist").mkdir(parents=True)
+        (version_dir / "tui" / "dist" / "entry.js").write_text("//\n")
+    if "k3" in parts:
+        (version_dir / "bin").mkdir()
+        (version_dir / "bin" / "k3").write_text("k3\n")
+
+
+def test_a_broken_tui_build_fails_the_update_and_keeps_the_active_version(remote, data, no_release, monkeypatch):
+    """npm unreachable during the build: the update said "updated to ..." (exit 0) and switched to a version without
+    the TUI. Now the installer is told to fail that build, and the update stops with its output."""
+    cur = _install(data, "1234567aaaa")
+    _give(data / "versions" / cur, "tui", "k3")
+    monkeypatch.setenv("K3_STUB_TUI_BROKEN", "1")
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code != 0 and "Traceback" not in r.output
+    assert "the installer failed (exit 1)" in r.output
+    assert "reason: getaddrinfo ENOTFOUND" in r.output  # the cause npm prints first, not just the end of its trace
+    assert (remote["logs"] / "args.tui").read_text().strip() == "1"
+    assert no_release == []  # not activated, nothing pruned
+    assert Path(os.readlink(data / "current")).name == cur
+    assert [p.name for p in (data / "versions").iterdir()] == [cur]
+
+
+def test_a_staged_version_that_lost_the_tui_is_refused_and_removed(remote, data, no_release, monkeypatch):
+    """The target ref's installer may predate K3_REQUIRE_TUI: it builds without the TUI and exits 0. The update
+    compares the staged version with the active one and refuses; the staged dir goes so that the next update builds
+    it again instead of finding it "already installed"."""
+    cur = _install(data, "1234567aaaa")
+    _give(data / "versions" / cur, "tui", "k3")
+    monkeypatch.setenv("K3_STUB_PARTS", "k3")
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code != 0 and "Traceback" not in r.output
+    assert STAGED in r.output and "TUI" in r.output and f"{cur} stays current" in r.output
+    assert no_release == []
+    assert not (data / "versions" / STAGED).exists()
+    assert Path(os.readlink(data / "current")).name == cur
+
+
+def test_a_refused_version_that_is_the_previous_one_is_not_deleted(remote, data, no_release, monkeypatch):
+    cur = _install(data, "1234567aaaa")
+    _give(data / "versions" / cur, "tui")
+    (data / "previous").write_text(STAGED + "\n")
+    (data / "versions" / STAGED).mkdir()  # previous_version() only names a dir that exists
+    monkeypatch.setenv("K3_STUB_PARTS", "")
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code != 0 and no_release == []
+    assert (data / "versions" / STAGED).is_dir()
+
+
+@pytest.mark.skipif(not Path("/proc/self/cwd").exists(), reason="needs /proc")
+def test_a_refused_version_that_a_process_runs_from_is_not_deleted(remote, data, no_release, monkeypatch):
+    """The installer reuses an installed build of the same commit: a daemon may still run from the version that is
+    refused (it is neither current nor previous)."""
+    cur = _install(data, "1234567aaaa")
+    _give(data / "versions" / cur, "tui")
+    staged = data / "versions" / STAGED
+    staged.mkdir()
+    monkeypatch.setenv("K3_STUB_PARTS", "")
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=staged)
+    try:
+        r = CliRunner().invoke(cli, ["update", "--yes"])
+        assert r.exit_code != 0 and no_release == []
+        assert staged.is_dir()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_without_a_tui_to_lose_a_tui_less_build_is_fine(remote, data, no_release, monkeypatch):
+    """A machine without node never had the TUI: the update must not demand one."""
+    _install(data, "1234567aaaa")
+    monkeypatch.setenv("K3_STUB_PARTS", "")
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert "warning" not in r.output and no_release == [STAGED, "pruned"]
+
+
+def test_a_staged_version_that_lost_k3_is_activated_with_a_loud_warning(remote, data, no_release, monkeypatch):
+    """k3 is optional, so the update goes on, but not silently: the output names the version that still has it."""
+    cur = _install(data, "1234567aaaa")
+    _give(data / "versions" / cur, "tui", "k3")
+    monkeypatch.setenv("K3_STUB_PARTS", "tui")
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert no_release == [STAGED, "pruned"]
+    assert f"warning: {STAGED} has no k3" in r.output and f"{cur} still has it" in r.output
+    assert "k3code update --rollback" in r.output
+    assert r.output.index(f"updated to {STAGED}") < r.output.index("warning:")  # the last thing the user reads
+
+
+def test_a_failed_k3_build_is_reported_even_when_no_version_has_k3(remote, data, no_release, monkeypatch):
+    _install(data, "1234567aaaa")
+    monkeypatch.setenv("K3_STUB_PARTS", "failed-k3")
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert f"warning: {STAGED} has no k3" in r.output and "its build failed" in r.output
+    assert "no installed version has it" in r.output
 
 
 def test_without_ref_or_checkout_the_old_error_remains_with_a_way_out(data, no_release):

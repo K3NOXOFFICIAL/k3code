@@ -942,3 +942,25 @@ async def test_a_rewritten_history_keeps_one_idle_process_per_conversation(pshim
         assert len([s for s in p._pool if not s.busy]) <= 1
     assert len(_lines(tmp_path, ".spawns")) >= 2  # the elisions did force full renders
     await _close_and_check(p, tmp_path)
+
+
+def test_login_status_reads_claude_auth_status(fake_claude) -> None:
+    """`claude` on PATH says nothing about a login: `claude auth status` does (issue #146)."""
+    from k3code.providers.claude_cli import login_status
+
+    for state, expected in (("in", True), ("out", False), ("old", None), ("garbage", None)):
+        fake_claude(state)
+        assert login_status() is expected, state  # None = cannot tell (an old Claude Code, odd output)
+
+
+def test_login_status_cannot_tell_without_the_command_or_when_it_hangs(fake_claude, monkeypatch) -> None:
+    import time
+
+    from k3code.providers.claude_cli import login_status
+
+    fake_claude("hang")
+    start = time.monotonic()
+    assert login_status(timeout=0.5) is None
+    assert time.monotonic() - start < 10
+    monkeypatch.setenv("PATH", "")
+    assert login_status() is None

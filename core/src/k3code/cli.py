@@ -714,16 +714,17 @@ def _launch_tui(
     project config the user was asked to trust) reach the spawned gateway through K3CODE_PERMISSION_MODE and
     K3CODE_PROJECT_DIR.
     """
-    from k3code.paths import find_node
+    from k3code.paths import find_node, node_problem
 
     node = find_node()
     repo_root = _find_repo_root()
     entry = repo_root / "tui" / "dist" / "entry.js" if repo_root else None
     if node is None or entry is None or not entry.is_file():
+        why = node_problem() if node is None else "need tui/dist/entry.js"
         if require:
-            click.echo("The TUI is not available (need node + tui/dist/entry.js).", err=True)
+            click.echo(f"The TUI is not available ({why}).", err=True)
             sys.exit(1)
-        logger.warning("TUI not available (need node + tui/dist/entry.js); falling back to REPL")
+        logger.warning("TUI not available (%s); falling back to REPL", why)
         import asyncio
 
         from k3code.config import load_config
@@ -1269,9 +1270,15 @@ def update_cmd(
         except (OSError, ValueError, httpx.HTTPError) as e:
             raise click.ClickException(f"update failed: {e}. Nothing was activated.") from e
         ver = rel.version
+    try:
+        warnings = upd.vet_staged(ver)  # refuses a version that lost the TUI; nothing is switched or pruned then
+    except upd.SourceUpdateError as e:
+        raise click.ClickException(str(e)) from e
     res = upd.activate(ver)
     click.echo(res.message)
     if res.ok:
+        for line in warnings:
+            click.echo(line)
         upd.prune()
     raise SystemExit(0 if res.ok else 1)
 

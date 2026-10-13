@@ -24,6 +24,8 @@
 # Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
 #   K3_NO_DOWNLOAD (= --no-install-deps), K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv,
 #   no network), K3_EDITABLE (--from-source only), K3_BWRAP (the bubblewrap binary to probe).
+# K3_REQUIRE_TUI=1 (set by `k3code update`): a TUI build that was tried and failed fails the run, so no version without
+# the TUI is staged for an update. Without it such a failure is a warning and k3code uses the line REPL.
 set -eu
 
 DEFAULT_URL=https://github.com/K3NOXOFFICIAL/k3code.git
@@ -937,6 +939,13 @@ acquire_source() {
 }
 
 # ---- build -----------------------------------------------------------------
+tui_failed() { # tui_failed WHY: the TUI was built and the build failed (a skipped one is not a failure)
+  # `k3code update` stages with --no-activate and must not switch to a version that lost the TUI because the npm
+  # registry was unreachable; the half-built version is removed on exit, so the next update builds it again
+  if [ "${K3_REQUIRE_TUI:-0}" = 1 ]; then die "$1; nothing was activated"; fi
+  log "WARNING: $1; k3code will use the line REPL"
+}
+
 build_tui() {
   if [ "${K3_SKIP_TUI:-0}" = 1 ]; then return 0; fi
   if [ "$NODE_OK" != 1 ]; then
@@ -950,7 +959,7 @@ build_tui() {
     # cleanup removes it on exit; after a SIGKILL the run that takes over the lock finds it here
     record_tmp tui "$TUI_TMP"
     if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then
-      log "WARNING: could not copy the TUI sources to $TUI_TMP; k3code will use the line REPL"
+      tui_failed "could not copy the TUI sources to $TUI_TMP"
       return 0
     fi
     tui=$TUI_TMP/tui
@@ -961,7 +970,7 @@ build_tui() {
     # Build receipts belong to the build tooling; nothing at runtime reads them.
     rm -f "$VERDIR/tui/dist/hermes-build.json" "$VERDIR/tui/dist/.k3code-product"
   else
-    log "WARNING: the TUI did not build (output above); k3code will use the line REPL"
+    tui_failed "the TUI did not build (output above)"
   fi
   return 0
 }
@@ -975,6 +984,7 @@ build_panes() {
   log "building the k3 pane binary"
   if ! (cd "$SRC_ROOT/panes" && go_isolate "$GO" && CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
     log "WARNING: the k3 pane binary did not build (output above); the multi-window binary is missing"
+    printf 'k3: the go build failed\n' >"$VERDIR/.degraded" # k3code update reports it (k3 is optional: the version stays)
   fi
   if [ -d "$DATA/go/path" ]; then rm -rf "$DATA/go/path"; fi # the module cache is only needed during the build
   return 0
@@ -1278,13 +1288,37 @@ chromium_present() { # the marker from an earlier run and the browser it names a
   return 1
 }
 
+# A downloaded headless shell can still fail to start: Playwright does not install the system libraries it links
+# (libnss3, libnspr4 and libasound2 are missing on a bare Ubuntu). Start it once; on a failure name what the loader
+# cannot find. The health subset that follows prints the install command. Returns 1 only when it ran and failed.
+chromium_starts() {
+  b=""
+  for f in "$DATA"/browsers/chromium_headless_shell-*/*/chrome-headless-shell "$DATA"/browsers/chromium_headless_shell-*/*/headless_shell; do
+    if [ -x "$f" ]; then
+      b=$f
+      break
+    fi
+  done
+  if [ -z "$b" ]; then return 0; fi # nothing to start (a stub run, or the download is elsewhere)
+  if have timeout; then out=$(timeout 20 "$b" --version 2>&1) && return 0; else out=$("$b" --version 2>&1) && return 0; fi
+  missing=""
+  if have ldd; then missing=$(ldd "$b" 2>/dev/null | sed -n 's/^[[:space:]]*\(.*\) => not found.*/\1/p' | tr '\n' ' ') || missing=""; fi
+  if [ -n "$missing" ]; then
+    log "presetup: WARNING: Chromium is downloaded but cannot start: missing system libraries: ${missing% }"
+    say "      the browser tool stays off until they are installed (the health check below gives the command)"
+  else
+    log "presetup: WARNING: Chromium is downloaded but failed to run: $(printf '%s\n' "$out" | head -n 1)"
+  fi
+  return 1
+}
+
 presetup_chromium() {
   if [ "${K3CODE_SKIP_CHROMIUM:-0}" = 1 ]; then
     log "presetup: Chromium skipped (K3CODE_SKIP_CHROMIUM=1)"
     return 0
   fi
   if chromium_present; then
-    log "presetup: Chromium already installed in $DATA/browsers"
+    if chromium_starts; then log "presetup: Chromium already installed in $DATA/browsers"; fi
     return 0
   fi
   if [ "${K3_STUB_VENV:-0}" = 1 ]; then # tests: nothing is downloaded; the marker records the decision
@@ -1308,7 +1342,7 @@ presetup_chromium() {
   fi
   mkdir -p "$DATA/presetup"
   printf '%s\n' "$PLAYWRIGHT_VERSION" >"$DATA/presetup/chromium-$PLAYWRIGHT_VERSION"
-  log "presetup: Chromium installed in $DATA/browsers"
+  if chromium_starts; then log "presetup: Chromium installed in $DATA/browsers"; fi
   return 0
 }
 presetup_doctor() {

@@ -40,6 +40,7 @@ import os
 import pwd
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import uuid
@@ -199,6 +200,32 @@ def _clean_env(thinking_tokens: int | None = 0) -> dict[str, str]:
     if thinking_tokens is not None:
         env["MAX_THINKING_TOKENS"] = str(max(0, int(thinking_tokens)))
     return env
+
+
+def login_status(command: str = DEFAULT_COMMAND, timeout: float = 6.0) -> bool | None:
+    """Whether Claude Code is logged in, from `claude auth status` (~1 s): ``False`` only when it says so.
+
+    ``None`` = cannot tell (no such command, an older Claude Code without `auth status`, a timeout, odd output): the
+    callers treat it as "no complaint". Runs with the provider's own environment, so it reads the login a turn uses."""
+    binary = shutil.which(command)
+    if binary is None:
+        return None
+    try:
+        done = subprocess.run(
+            [binary, "auth", "status"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_clean_env(),
+            cwd=tempfile.gettempdir(),
+            check=False,
+        )
+        info = json.loads(done.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    logged_in = info.get("loggedIn") if isinstance(info, dict) else None
+    return logged_in if isinstance(logged_in, bool) else None
 
 
 def _error_from_result(result: dict[str, Any] | None, stderr: str, rc: int | None) -> ProviderError:

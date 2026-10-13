@@ -84,6 +84,111 @@ def test_browser_check_reports_playwright_and_chromium(monkeypatch, tmp_path):
     assert chk.status == doctor.OK and "Playwright and Chromium" in chk.detail
 
 
+def _browser_with_tools(monkeypatch, tmp_path, ldd_out=None, apt=True, apt_knows=()):
+    """An executable Chromium binary (an old-layout name) and a PATH holding only fake tools: ``ldd`` printing
+    ``ldd_out`` (none when None), ``apt-get`` and ``apt-cache`` (knowing only the packages in ``apt_knows``)."""
+    import importlib.util
+
+    from k3code import doctor
+
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "playwright" else None)
+    shell_dir = tmp_path / "data" / "browsers" / "chromium_headless_shell-1" / "chrome-linux"
+    shell_dir.mkdir(parents=True)
+    binary = shell_dir / "headless_shell"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    tools = {}
+    if ldd_out is not None:
+        tools["ldd"] = "".join(f"echo '{ln}'\n" for ln in ldd_out)
+    if apt:
+        tools["apt-get"] = "exit 0\n"
+        tools["apt-cache"] = 'case "$2" in ' + "|".join(apt_knows or ("-",)) + ") exit 0 ;; *) exit 100 ;; esac\n"
+    for name, body in tools.items():
+        (bindir / name).write_text("#!/bin/sh\n" + body)
+        (bindir / name).chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+    return doctor
+
+
+NSPR_NSS_ALSA_MISSING = (
+    "\tlinux-vdso.so.1 (0x00007ffd)",
+    "\tlibnspr4.so => not found",
+    "\tlibnss3.so => not found",
+    "\tlibnssutil3.so => not found",
+    "\tlibasound.so.2 => not found",
+    "\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f)",
+)
+
+
+def test_browser_check_names_the_libraries_a_chromium_binary_cannot_load(monkeypatch, tmp_path):
+    """#113: the binary is there and executable but the loader cannot start it; the warning names the libraries
+    and the apt packages, and does not send the user to the installer, which cannot fix it."""
+    doctor = _browser_with_tools(monkeypatch, tmp_path, NSPR_NSS_ALSA_MISSING, apt_knows=("libasound2t64",))
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN
+    assert "cannot start" in chk.detail
+    for lib in ("libnspr4.so", "libnss3.so", "libnssutil3.so", "libasound.so.2"):
+        assert lib in chk.detail
+    assert chk.fix == "sudo apt-get install -y libnspr4 libnss3 libasound2t64"
+    assert "installer" not in chk.fix + chk.detail
+
+
+def test_browser_check_picks_the_alsa_package_this_release_has(monkeypatch, tmp_path):
+    """Ubuntu 24.04 renamed libasound2 to libasound2t64; older releases still ship libasound2."""
+    doctor = _browser_with_tools(monkeypatch, tmp_path, ("\tlibasound.so.2 => not found",))
+    assert doctor.check_browser().fix == "sudo apt-get install -y libasound2"
+
+
+def test_browser_check_sends_other_missing_libraries_to_playwright_install_deps(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path, ("\tlibgbm.so.1 => not found", "\tlibnss3.so => not found"))
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN and "libgbm.so.1" in chk.detail
+    assert chk.fix.startswith("sudo ") and "-m playwright install-deps chromium-headless-shell" in chk.fix
+
+
+def test_browser_check_without_apt_names_the_libraries_only(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path, NSPR_NSS_ALSA_MISSING, apt=False)
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN and "libnspr4.so" in chk.detail
+    assert "package" in chk.fix and "libnss3.so" in chk.fix and "apt-get" not in chk.fix
+
+
+def test_browser_check_is_ok_when_ldd_finds_every_library(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path, ("\tlibc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x00007f)",))
+    assert doctor.check_browser().status == doctor.OK
+
+
+def test_browser_check_without_ldd_cannot_tell_and_stays_ok(monkeypatch, tmp_path):
+    doctor = _browser_with_tools(monkeypatch, tmp_path)
+    assert doctor.check_browser().status == doctor.OK
+
+
+def test_browser_check_finds_the_headless_shell_playwright_installs(monkeypatch, tmp_path):
+    """#104: Playwright 1.63 names the binary chrome-headless-shell; the check only knew chrome and headless_shell, so
+    every fresh install warned 'no executable browser' and told the user to re-run an installer that skips Chromium."""
+    import importlib.util
+
+    from k3code import doctor
+
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.delenv("PLAYWRIGHT_BROWSERS_PATH", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "playwright" else None)
+    shell_dir = tmp_path / "data" / "browsers" / "chromium_headless_shell-1243" / "chrome-headless-shell-linux64"
+    shell_dir.mkdir(parents=True)
+    chk = doctor.check_browser()
+    assert chk.status == doctor.WARN and "re-run the installer" not in chk.fix  # the installer keeps the directory
+    assert "playwright install --force --only-shell chromium" in chk.fix
+    binary = shell_dir / "chrome-headless-shell"
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o755)
+    chk = doctor.check_browser()
+    assert chk.status == doctor.OK and chk.data["exe"] == str(binary)
+
+
 def test_env_file_check_flags_a_loose_mode_and_export_lines(monkeypatch, tmp_path):
     from k3code import doctor
 
@@ -329,16 +434,33 @@ def test_doctor_clears_a_providers_auth_cooldown_when_its_key_answers(monkeypatc
     assert left.reason_of(provider="bad", model="m") is FailoverReason.auth
 
 
+async def test_claude_cli_on_path_but_not_logged_in_is_a_warning(fake_claude):
+    """`claude` being on PATH made doctor green; the first turn then failed 401 (issue #146)."""
+    from k3code import doctor
+    from k3code.config import ProviderEntry, Settings
+
+    cfg = Settings(providers=[ProviderEntry(name="claude-cli", kind="claude-cli")])
+    fake_claude("out")
+    row = next(c for c in await doctor.check_providers(cfg) if c.name == "provider:claude-cli")
+    assert row.status == doctor.WARN and "not logged in" in row.detail
+    assert "`claude`" in row.fix and "/login" in row.fix
+    for state in ("in", "old"):  # logged in, or a Claude Code that cannot say: no complaint
+        fake_claude(state)
+        row = next(c for c in await doctor.check_providers(cfg) if c.name == "provider:claude-cli")
+        assert row.status == doctor.OK and "Claude Code CLI at" in row.detail, state
+    fake_claude("out")
+    row = next(c for c in await doctor.check_providers(cfg, probe=False) if c.name == "provider:claude-cli")
+    assert row.status == doctor.OK  # --no-probe: claude is not run
+
+
 def test_tui_hint_for_an_install_without_sources_does_not_send_you_to_a_tui_dir(monkeypatch):
     """An install keeps only tui/dist, so when its build failed or was skipped there is no `tui/` to `cd` into. The
     hint must say what works: the installer keeps a version it already built, so it needs an uninstall first."""
-    from types import SimpleNamespace
-
     from k3code import doctor
+    from k3code.paths import NodeChoice
 
-    monkeypatch.setattr("k3code.paths.find_node", lambda: "/fake/node")
+    monkeypatch.setattr("k3code.paths.resolve_node", lambda: NodeChoice("/fake/node", "v22.1.0", "PATH", "on PATH"))
     monkeypatch.setattr(doctor, "find_repo_root", lambda: None)
-    monkeypatch.setattr(doctor.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="v22.1.0\n"))
     check = doctor.check_tui()
     assert check.status == doctor.WARN
     assert "cd tui" not in check.fix
@@ -346,14 +468,13 @@ def test_tui_hint_for_an_install_without_sources_does_not_send_you_to_a_tui_dir(
 
 
 def test_tui_hint_for_a_source_checkout_still_builds_in_the_checkout(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-
     from k3code import doctor
 
     (tmp_path / "tui").mkdir()
     (tmp_path / "tui" / "package.json").write_text("{}")
-    monkeypatch.setattr("k3code.paths.find_node", lambda: "/fake/node")
+    from k3code.paths import NodeChoice
+
+    monkeypatch.setattr("k3code.paths.resolve_node", lambda: NodeChoice("/fake/node", "v22.1.0", "PATH", "on PATH"))
     monkeypatch.setattr(doctor, "find_repo_root", lambda: tmp_path)
-    monkeypatch.setattr(doctor.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="v22.1.0\n"))
     check = doctor.check_tui()
     assert check.status == doctor.WARN and "npm run build" in check.fix

@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+import shlex
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -30,7 +31,19 @@ logger = logging.getLogger(__name__)
 
 MAX_SUBTASKS = 8
 IO_HEAVY_RE = re.compile(r"\b(install|build|compile|download|bundle|docker|index|crawl|migrat\w+)\b", re.I)
-VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail)", re.I)
+#: The verdict the reply ends with (markdown emphasis and a full stop may follow): a mention earlier in the reply,
+#: a quote of the pass line or a word such as "passing" is no verdict.
+VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail)[\s*_`.]*\Z", re.I)
+#: Diff characters a reviewer prompt carries; past it the reviewer is told so and pointed at the worktree.
+REVIEW_DIFF_CHARS = 20000
+#: Reviewer runs per review before it counts as unavailable (a crash, a stop or a reply without a verdict).
+REVIEW_ATTEMPTS = 2
+#: Seconds the sandboxed check that a detected test command's program is there may take.
+PROBE_TIMEOUT = 30
+
+
+class ReviewUnavailable(Exception):
+    """No reviewer returned a verdict: the gate stays shut and the subtask goes to the parent."""
 
 
 # ── helpers ──
@@ -48,7 +61,11 @@ def extract_subtasks(verdict: Any, plan: str) -> list[str]:
 
 
 def detect_test_command(repo: str | Path) -> str | None:
-    """pytest, npm test, go test or cargo test, by marker files."""
+    """pytest, npm test, go test or cargo test, by marker files.
+
+    pytest runs with the project's ``.venv`` interpreter when there is one, else ``python3``: the tests run in the
+    sandbox, where no venv is active and stock Ubuntu has no ``python``.
+    """
     root = Path(repo)
     pkg = root / "package.json"
     if pkg.is_file():
@@ -59,7 +76,8 @@ def detect_test_command(repo: str | Path) -> str | None:
             pass
     py = [root / n for n in ("pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml")]
     if any(p.is_file() for p in py) or (root / "tests").is_dir():
-        return "python -m pytest -q -x"
+        python = ".venv/bin/python" if (root / ".venv" / "bin" / "python").is_file() else "python3"
+        return f"{python} -m pytest -q -x"
     if (root / "go.mod").is_file():
         return "go test ./..."
     if (root / "Cargo.toml").is_file():
@@ -89,10 +107,35 @@ async def run_tests(cmd: str, cwd: str | Path, timeout: float = 600) -> tuple[bo
     return ok, text[-4000:]
 
 
+async def preflight(repo: str | Path, test_cmd: str, *, detected: bool) -> str:
+    """Why fan-out cannot work here, or "" when it can.
+
+    Without a usable bwrap every child's bash call and every merge's test run is refused. A detected test command
+    whose program is missing in the sandbox (``$HOME`` is hidden there, so ``~/.local/bin`` is gone) or, for pytest,
+    cannot import it, fails every merge. A configured ``test_command`` is the user's choice and is not probed.
+    """
+    from k3code.reliability import sandbox
+
+    if not await asyncio.to_thread(sandbox.usable):
+        return "bubblewrap is unusable here, so sub-agents could not run commands or test a merge; see /doctor"
+    if not (test_cmd and detected):
+        return ""
+    exe = shlex.quote(shlex.split(test_cmd)[0])
+    probe = f"{exe} -c 'import pytest'" if " -m pytest" in test_cmd else f"command -v {exe}"
+    ok, out = await run_tests(probe, repo, PROBE_TIMEOUT)
+    if ok:
+        return ""
+    reason = (out.strip().splitlines() or [f"{exe}: not found"])[-1]
+    return (
+        f"the detected test command `{test_cmd}` cannot run in the sandbox ({reason}); "
+        "set autonomy.fanout.test_command to one that can"
+    )
+
+
 def parse_verdict(text: str) -> bool | None:
-    """True = pass, False = fail, None = the reviewer gave no verdict."""
-    found = VERDICT_RE.findall(text or "")
-    return None if not found else found[-1].lower() == "pass"
+    """True = pass, False = fail, None = the reply does not end with a verdict."""
+    m = VERDICT_RE.search(text or "")
+    return None if m is None else m.group(1).lower() == "pass"
 
 
 @dataclass
@@ -193,8 +236,22 @@ class FanoutExecutor:
         cfg = self.cfg
         repo = await wt_mod.repo_root(cwd)
         assert repo is not None
+        if dirty := await wt_mod.uncommitted(repo):  # workers start from HEAD and every merge lands in this checkout
+            files = ", ".join(dirty[:5]) + (f" and {len(dirty) - 5} more" if len(dirty) > 5 else "")
+            session.emit(
+                "notification.show",
+                {
+                    "text": f"fan-out skipped: the checkout has uncommitted changes ({files}); commit or stash them",
+                    "level": "info",
+                    "kind": "fanout",
+                },
+            )
+            return None
         test_cmd = (cfg.get("test_command") or detect_test_command(repo)) or ""
         need_tests = cfg["require_tests"] if require_tests is None else require_tests
+        if why := await preflight(repo, test_cmd if need_tests else "", detected=not cfg.get("test_command")):
+            session.emit("notification.show", {"text": f"fan-out skipped: {why}", "level": "warning", "kind": "fanout"})
+            return None
         io_heavy = any(IO_HEAVY_RE.search(s) for s in subtasks)
         gov = session.reliability.governor if session.reliability and session.reliability.governor else Governor()
         cap = gov.agent_cap(int(cfg["max_parallel"]), io_heavy=io_heavy)
@@ -346,25 +403,54 @@ class FanoutExecutor:
         except BudgetStop as e:
             ctx.result.stopped = ctx.result.stopped or str(e)
             self.progress(ctx, st, "skipped", str(e))
+        except ReviewUnavailable as e:  # reworking would not help: the work was never judged
+            self.progress(ctx, st, "escalated", f"no review verdict: {e}")
         except Exception as e:  # noqa: BLE001 - one subtask must not take the others down
             logger.exception("fan-out subtask %s crashed", st.id)
             self.progress(ctx, st, "failed", f"{type(e).__name__}: {e}")
 
-    async def _review(self, ctx: _Ctx, st: Subtask, worker: Handle) -> str:
-        """Reviewer child against the acceptance criteria. Returns "" on pass, else the findings."""
-        self.progress(ctx, st, "reviewing")
+    def review_prompt(self, ctx: _Ctx, st: Subtask, worker: Handle) -> str:
         verification = parse_plan(ctx.plan).get("Verification", "").strip()
-        prompt = (
+        diff = worker.diff or ""
+        wt = worker.worktree or st.worktree
+        where = (
+            f"The change is not in your working directory: it is on branch {wt.branch} in the worktree {wt.path} "
+            f"(`git -C {wt.path} diff {wt.base}` shows all of it). Read the files there.\n"
+            if wt is not None
+            else ""
+        )
+        cut = (
+            f"\nThe diff above is CUT at {REVIEW_DIFF_CHARS} of {len(diff)} characters: read the rest in the worktree "
+            "before you give a verdict.\n"
+            if len(diff) > REVIEW_DIFF_CHARS
+            else ""
+        )
+        return (
             f"Review one worker's result against its acceptance criteria.\n\nSubtask: {st.title}\n"
             f"Acceptance criteria: the subtask is fully done, correct and does not touch unrelated code."
             + (f" Plan verification: {verification}" if verification else "")
-            + f"\n\nWorker report:\n{worker.result}\n\nDiff ({worker.diff_stat or 'no stat'}):\n```diff\n"
-            f"{worker.diff[:20000]}\n```\nEnd with 'VERDICT: pass' or 'VERDICT: fail'."
+            + f"\n{where}\nWorker report:\n{worker.result}\n\nDiff ({worker.diff_stat or 'no stat'}):\n```diff\n"
+            f"{diff[:REVIEW_DIFF_CHARS]}\n```\n{cut}End with 'VERDICT: pass' or 'VERDICT: fail'."
         )
-        r = await self._spawn(ctx, st, "reviewer", prompt, f"review: {st.title}"[:60])
-        st.review = r.result
-        verdict = parse_verdict(r.result)
-        return r.result if verdict is False else ""
+
+    async def _review(self, ctx: _Ctx, st: Subtask, worker: Handle) -> str:
+        """Reviewer child against the acceptance criteria. Returns "" on an explicit 'VERDICT: pass', else the
+        findings. A reviewer that fails, is stopped or ends without a verdict is run once more; when none gives a
+        verdict this raises ReviewUnavailable: the gate never opens without a pass."""
+        self.progress(ctx, st, "reviewing")
+        prompt = self.review_prompt(ctx, st, worker)
+        problem = ""
+        for _ in range(REVIEW_ATTEMPTS):
+            r = await self._spawn(ctx, st, "reviewer", prompt, f"review: {st.title}"[:60])
+            st.review = r.result or ""
+            if r.status != "completed":
+                problem = f"the reviewer {r.status}" + (f": {r.error}" if r.error else "")
+                continue
+            verdict = parse_verdict(r.result)
+            if verdict is not None:
+                return "" if verdict else r.result
+            problem = "the reviewer ended without a 'VERDICT: pass' or 'VERDICT: fail' line"
+        raise ReviewUnavailable(problem)
 
     async def _rework(self, ctx: _Ctx, st: Subtask, problem: str) -> Handle:
         assert st.worktree is not None
@@ -390,8 +476,10 @@ class FanoutExecutor:
             async with ctx.merge_lock:  # one merge + test run at a time
                 self.progress(ctx, st, "merging")
                 ok, out = await wt_mod.merge_trial(wt)
-                error = ""
-                if not ok:
+                error, blocked = "", not ok and out.startswith(wt_mod.BLOCKED)
+                if blocked:
+                    error = out[:1500]
+                elif not ok:
                     error = f"merge conflict with what was already merged:\n{out[-1500:]}"
                 elif ctx.test_cmd:
                     self.progress(ctx, st, "testing")
@@ -410,7 +498,7 @@ class FanoutExecutor:
                     await wt_mod.abort_merge(wt)
                     error = f"could not commit the merge: {cout}"
                 parent_head = await wt_mod.head_sha(wt.repo)
-            if st.attempts >= 1:
+            if st.attempts >= 1 or blocked:  # the child cannot clean the user's checkout: no rework for that
                 self.progress(ctx, st, "escalated", error)
                 return
             st.attempts += 1
@@ -427,6 +515,10 @@ class FanoutExecutor:
             h = await self._rework(ctx, st, problem)
             if h.status != "completed":
                 self.progress(ctx, st, "escalated", f"{error}\n(retry {h.status}: {h.error})")
+                return
+            err = await self._review(ctx, st, h)  # the rework is new work: it merges only after its own pass
+            if err:
+                self.progress(ctx, st, "escalated", f"{error}\nThe reviewer rejected the fix:\n{err}")
                 return
 
     async def _cleanup(self, result: FanoutResult) -> None:

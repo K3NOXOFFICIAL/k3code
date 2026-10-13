@@ -7,8 +7,6 @@ import json
 import os
 import platform
 import re
-import shutil
-import subprocess
 import sys
 import tarfile
 import time
@@ -65,10 +63,10 @@ def versions() -> dict[str, str]:
         k3 = version("k3code")
     except PackageNotFoundError:
         k3 = "unknown"
-    node = shutil.which("node")
-    node_v = (
-        subprocess.run([node, "--version"], capture_output=True, text=True, check=False).stdout.strip() if node else ""
-    )
+    from k3code.paths import resolve_node
+
+    node = resolve_node()
+    node_v = node.version or node.old.split(" ")[0]
     return {"k3code": k3, "python": sys.version.split()[0], "platform": platform.platform(), "node": node_v}
 
 
