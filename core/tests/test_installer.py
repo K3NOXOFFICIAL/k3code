@@ -547,6 +547,43 @@ def test_check_reports_the_node_floor_of_20(tmp_path: Path) -> None:
     assert "node 18" not in r.stderr
 
 
+def _check_without_node(tmp_path: Path, ldd_says: str, loader_file_exists: bool) -> str:
+    """--check on a Linux host with no node, a network tool, an `ldd` that prints LDD_SAYS and, when
+    LOADER_FILE_EXISTS, a /lib/ld-musl-* file (what Debian/Ubuntu's musl package puts on a glibc system)."""
+    real_ls = shutil.which("ls")
+    stub_bin(tmp_path, "ldd", f"cat <<'EOF'\n{ldd_says}\nEOF\nexit 1\n")
+    stub_bin(
+        tmp_path,
+        "ls",
+        f'case "$*" in */ld-musl-*) exit {0 if loader_file_exists else 2} ;; esac\nexec {real_ls} "$@"\n',
+    )
+    r = run(
+        tmp_path,
+        INSTALL,
+        "--check",
+        env_extra={"PATH": _path_without(tmp_path, "node")},
+        drop=("K3_NO_DOWNLOAD",),
+        path_front=tmp_path / "stubbin",
+    )
+    assert r.returncode == 0, r.stderr
+    (line,) = [ln for ln in r.stderr.splitlines() if "node 20+ with npm" in ln]
+    return line
+
+
+@linux_only
+def test_a_glibc_host_with_the_musl_package_still_gets_a_private_node(tmp_path: Path) -> None:
+    line = _check_without_node(tmp_path, "ldd (Debian GLIBC 2.36-9+deb12u10) 2.36", loader_file_exists=True)
+    assert "a private Node 22 is fetched" in line
+
+
+@linux_only
+def test_a_musl_host_gets_no_private_node(tmp_path: Path) -> None:
+    line = _check_without_node(
+        tmp_path, "musl libc (x86_64)\nVersion 1.2.5\nDynamic Program Loader", loader_file_exists=False
+    )
+    assert "optional: builds the TUI" in line
+
+
 def test_uninstall_removes_presetup_leftovers_and_keeps_user_data(tmp_path: Path) -> None:
     assert run(tmp_path, INSTALL, "--from-source", "--yes").returncode == 0
     data = tmp_path / ".local" / "share" / "k3code"
