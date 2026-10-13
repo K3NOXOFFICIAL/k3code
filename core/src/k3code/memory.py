@@ -4,6 +4,7 @@ root down to the session's directory, nearest last. A line ``@path`` imports ano
 
 from __future__ import annotations
 
+import codecs
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ MAX_MEMORY_CHARS = 20_000  # per file, as injected into the prompt
 MAX_MEMORY_TOTAL = 40_000  # all memory files together
 MAX_IMPORT_DEPTH = 5
 MAX_IMPORT_BYTES = 1 << 20  # an @import larger than this is refused, not read
+_CHUNK = 1 << 16  # bytes read at a time from a memory file
 _SNIFF_BYTES = 8192  # the start of an import checked for NUL bytes (a binary file)
 TOTAL_MARKER = "…(memory truncated: {n} more file(s) left out, the {cap}-character total is reached)"
 _IMPORT = re.compile(r"^@(\S+)$")
@@ -91,7 +93,8 @@ def write_learned(cwd: str | Path, facts: list[str]) -> Path:
 class MemoryFile:
     scope: str  # "user" | "rules" | "project"
     path: Path
-    text: str  # with its @imports expanded
+    text: str  # with its @imports expanded; cut where the caps cut it (see load_memory)
+    truncated: bool = False  # the file goes on past ``text``
 
 
 def _within(path: Path, roots: tuple[Path, ...]) -> bool:
@@ -103,17 +106,40 @@ def _import_target(spec: str, base: Path) -> Path:
     return p.resolve()
 
 
-@dataclass
-class _Budget:
-    left: int  # characters the expansion may still emit, shared by a file and everything it imports
-
-
-def _read_head(path: Path, chars: int) -> str:
-    """The first ``chars`` characters of ``path``'s text, reading at most 4 bytes for each (the longest a UTF-8
-    character takes), so a file of any size costs a bounded read."""
+def _read_head(path: Path, chars: int, lead: bool) -> tuple[str, int, bool]:
+    """The start of ``path``'s text, read in chunks until it holds ``chars`` characters (leading whitespace not
+    counted when ``lead``, it is dropped), so a file of any size costs a bounded read. Returns the text, the byte
+    offset where reading stopped and whether that is the end of the file."""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pieces: list[str] = []
+    held = pos = 0
     with path.open("rb") as f:
-        data = f.read(4 * max(chars, 0))
-    return data.decode("utf-8", errors="replace")[: max(chars, 0)]
+        while True:
+            chunk = f.read(_CHUNK)
+            eof = not chunk
+            pos += len(chunk)
+            text = decoder.decode(chunk, final=eof)
+            if lead:
+                text = text.lstrip()
+                lead = not text
+            pieces.append(text)
+            held += len(text)
+            if eof or held >= chars:
+                break
+    return "".join(pieces), pos - (0 if eof else len(decoder.getstate()[0])), eof
+
+
+def _has_more(path: Path, offset: int) -> bool:
+    """Whether ``path`` holds anything but whitespace from byte ``offset`` on (read in chunks, stops at the first)."""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    with path.open("rb") as f:
+        f.seek(offset)
+        while True:
+            chunk = f.read(_CHUNK)
+            if decoder.decode(chunk, final=not chunk).strip():
+                return True
+            if not chunk:
+                return False
 
 
 def _import_refusal(target: Path) -> str:
@@ -125,13 +151,102 @@ def _import_refusal(target: Path) -> str:
         return "not a text file" if b"\0" in f.read(_SNIFF_BYTES) else ""
 
 
+def _expand(path: Path, roots: tuple[Path, ...], stack: tuple[Path, ...], want: int, lead: bool) -> tuple[str, bool]:
+    """``expand_imports`` cut to ``want`` characters: the text, and whether anything but whitespace was left out.
+
+    The text is exactly the start of the full expansion (``lead``: with its leading whitespace dropped) and holds
+    ``want`` characters when something was left out, fewer when the file ended first.
+    """
+    while True:
+        text, more, short = _expand_once(path, roots, stack, want, lead)
+        if not short:
+            return text, more
+        want += short  # the expansion came out shorter than what was read (CRLF, an import that vanished): read on
+
+
+def _expand_once(
+    path: Path, roots: tuple[Path, ...], stack: tuple[Path, ...], want: int, lead: bool
+) -> tuple[str, bool, int]:
+    """One pass of ``_expand`` over the first ``want`` characters; the last value is how many are still missing
+    when the file goes on past what was read (0 when the pass is final)."""
+    from k3code.permissions.engine import sensitive_path
+
+    resolved = path.resolve()
+    stack = (*stack, resolved)
+    head, end, eof = _read_head(path, want, lead)
+    pieces = head.splitlines(keepends=True)
+    pending = False  # the last line may go on past what was read; an @import line cut short is not guessed at
+    if pieces and not eof and (pieces[-1].endswith("\r") or pieces[-1].splitlines()[0] == pieces[-1]):
+        pending = _IMPORT.match(pieces[-1].strip()) is not None or pieces[-1].strip() == "@"
+        if pending:
+            pieces.pop()
+    lines = [p.splitlines()[0] for p in pieces]
+
+    parts: list[str] = []
+    left = want
+    started = not lead
+    more = False
+
+    def add(part: str) -> None:
+        """Append ``part``, cut where ``want`` runs out. Whitespace before the first text is dropped."""
+        nonlocal left, started, more
+        if not started:
+            part = part.lstrip()
+            if not part:
+                return
+            started = True
+        sep = 1 if parts else 0
+        if sep + len(part) <= left:
+            parts.append(part)
+            left -= sep + len(part)
+            return
+        keep = max(left - sep, 0)
+        more = more or bool(part[keep:].strip())
+        parts.append(part[:keep])
+        left = 0
+
+    in_fence = False
+    short = 0
+    for i, line in enumerate(lines):
+        if left <= 0:
+            more = more or any(rest.strip() for rest in lines[i:])
+            break
+        if _FENCE_LINE.match(line):
+            in_fence = not in_fence
+        m = None if in_fence else _IMPORT.match(line.strip())
+        if m is None:
+            add(line)
+            continue
+        target = _import_target(m.group(1), resolved.parent)
+        if not target.is_file():
+            add(line)
+        elif target in stack:
+            add(f"({line.strip()} not imported: it imports itself)")
+        elif not _within(target, roots) or sensitive_path(str(target)):
+            add(f"({line.strip()} not imported: outside the allowed directories)")
+        elif len(stack) > MAX_IMPORT_DEPTH:
+            add(f"({line.strip()} not imported: imports nest at most {MAX_IMPORT_DEPTH} deep)")
+        elif why := _import_refusal(target):
+            add(f"({line.strip()} not imported: {why})")
+        else:
+            room = left - (1 if parts else 0)
+            if room <= 0:
+                more = True
+                break
+            text, cut = _expand(target, roots, stack, room, not started)
+            add(text if cut else text.rstrip("\n"))
+            if cut:
+                more = True
+                break
+    else:
+        short = 0 if eof else left
+    if short > 0:
+        return "", False, short
+    return "\n".join(parts), more or pending or (not eof and _has_more(path, end)), 0
+
+
 def expand_imports(
-    path: Path,
-    roots: tuple[Path, ...],
-    _stack: tuple[Path, ...] = (),
-    *,
-    max_chars: int = MAX_MEMORY_TOTAL,
-    _budget: _Budget | None = None,
+    path: Path, roots: tuple[Path, ...], _stack: tuple[Path, ...] = (), *, max_chars: int = MAX_MEMORY_TOTAL
 ) -> str:
     """``path``'s text with each line ``@relative/or/~/path`` replaced by that file's text (recursively).
 
@@ -141,44 +256,10 @@ def expand_imports(
     prose), and lines inside a code fence are never imports. An import larger than MAX_IMPORT_BYTES or not text is
     replaced by a marker line.
 
-    The expansion reads and emits at most ``max_chars`` + 1 characters in all, however large the files are; the
-    extra one tells the caller the text was cut.
+    The text is cut at ``max_chars`` characters in all, however large the files are, and the files are read only that
+    far (see ``_expand`` for the cut).
     """
-    from k3code.permissions.engine import sensitive_path
-
-    budget = _budget if _budget is not None else _Budget(max(max_chars, 0) + 1)
-    resolved = path.resolve()
-    stack = (*_stack, resolved)
-    out: list[str] = []
-
-    def emit(line: str) -> None:
-        out.append(line)
-        budget.left -= len(line) + 1
-
-    in_fence = False
-    for line in _read_head(path, budget.left).splitlines():
-        if budget.left <= 0:
-            break
-        if _FENCE_LINE.match(line):
-            in_fence = not in_fence
-        m = None if in_fence else _IMPORT.match(line.strip())
-        if m is None:
-            emit(line)
-            continue
-        target = _import_target(m.group(1), resolved.parent)
-        if not target.is_file():
-            emit(line)
-        elif target in stack:
-            emit(f"({line.strip()} not imported: it imports itself)")
-        elif not _within(target, roots) or sensitive_path(str(target)):
-            emit(f"({line.strip()} not imported: outside the allowed directories)")
-        elif len(stack) > MAX_IMPORT_DEPTH:
-            emit(f"({line.strip()} not imported: imports nest at most {MAX_IMPORT_DEPTH} deep)")
-        elif why := _import_refusal(target):
-            emit(f"({line.strip()} not imported: {why})")
-        else:
-            out.append(expand_imports(target, roots, stack, _budget=budget).rstrip("\n"))
-    return "\n".join(out)
+    return _expand(path, roots, _stack, max(max_chars, 0), False)[0]
 
 
 def _readable(path: Path, roots: tuple[Path, ...]) -> bool:
@@ -203,8 +284,9 @@ def load_memory(cwd: str | Path, max_chars: int = MAX_MEMORY_TOTAL) -> list[Memo
     """Existing memory files in prompt order: the user's, the project's rules, then the instruction files from the
     repository root down to ``cwd`` (more specific, later). A file whose text another one already gave is skipped.
 
-    Each file's text, imports included, is cut at ``max_chars`` + 1 characters (see expand_imports): a larger file is
-    never read whole.
+    A file is never read whole: its text, imports included, is cut at ``max_chars`` + 1 characters, so a caller
+    that shows ``max_chars`` of it can tell the file went on. The text is what the full expansion stripped of
+    whitespace would start with; ``truncated`` says whether more than whitespace was left out.
     """
     root = project_root(cwd)
     candidates: list[tuple[str, Path, tuple[Path, ...]]] = []
@@ -221,12 +303,13 @@ def load_memory(cwd: str | Path, max_chars: int = MAX_MEMORY_TOTAL) -> list[Memo
         if not path.is_file() or not _readable(path, roots):
             continue
         try:
-            text = expand_imports(path, roots, max_chars=max_chars).strip()
+            text, cut = _expand(path, roots, (), max(max_chars, 0) + 1, True)
         except OSError:
             continue
+        text = text if cut else text.strip()  # a cut text ends where the cap fell, whitespace or not
         if text and text not in seen:
             seen.add(text)
-            out.append(MemoryFile(scope, path, text))
+            out.append(MemoryFile(scope, path, text, cut))
     return out
 
 
@@ -248,7 +331,8 @@ def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = M
     files = load_memory(cwd, max_chars=min(limit, total))  # what a file can contribute; the rest is never read
     left = total
     for i, m in enumerate(files):
-        body = m.text if len(m.text) <= limit else m.text[:limit] + "\n…(truncated)"
+        cut = m.truncated or len(m.text) > limit
+        body = m.text[:limit] + "\n…(truncated)" if cut else m.text
         if left <= 0:
             parts.append(TOTAL_MARKER.format(n=len(files) - i, cap=total))
             break
