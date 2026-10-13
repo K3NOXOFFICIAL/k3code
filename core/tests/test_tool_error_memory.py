@@ -7,14 +7,18 @@ import os
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from k3code.config import Settings
 from k3code.learning import gotchas
 from k3code.learning.decisions import DecisionLog
 from k3code.prompting import build_system_prompt
 from k3code.providers.types import ToolCall
 from k3code.toolerrors import failure_of
+from k3code.userhooks import Hook
 from test_learning_gateway import make_server, shown
 from test_permissions_gateway import call, run_turn
+from test_user_hooks import _loop
 
 FAKE_KEY = "sk-" + "z" * 24  # built at run time: the secret scan must not see a literal
 
@@ -394,3 +398,48 @@ async def test_an_auto_line_alone_never_reaches_the_machine_file(tmp_path, monke
     )
     assert not (hub.home / "gotchas.md").exists()
     assert "Known pitfalls" not in build_system_prompt("base", cwd=tmp_path / "b", config=Settings())
+
+
+ROOTS_MSG = "Auto mode writes only inside the project roots"
+
+
+@pytest.mark.parametrize(
+    ("mode", "tool", "args", "hooks", "message"),
+    [
+        ("yolo", "bash", {"command": "rm -rf /"}, [], "Hardline deny ("),
+        ("yolo", "read", {"path": ".env"}, [], "Hardline deny (sensitive-path)"),
+        ("auto", "bash", {"command": "echo x > {outside}/x"}, [], ROOTS_MSG),
+        ("auto", "write", {"path": "{outside}/x", "content": "x"}, [], ROOTS_MSG),
+        ("plan", "write", {"path": "x", "content": "x"}, [], "Plan mode is read-only"),
+        (
+            "yolo",
+            "bash",
+            {"command": "touch ran"},
+            [Hook("PreToolUse", "echo 'no touching today' >&2; exit 2", matcher="bash")],
+            "Blocked by a PreToolUse hook: no touching today",
+        ),
+    ],
+    ids=["hardline-bash", "hardline-sensitive-read", "auto-roots-bash", "auto-roots-write", "plan-mode", "hook-block"],
+)
+async def test_a_policy_denial_is_not_a_project_tool_error(tmp_path, monkeypatch, mode, tool, args, hooks, message):
+    """The permission engine's and a PreToolUse hook's refusals say what the policy is, not what the project is like:
+    the real result of each goes through the loop's observer into the hub and nothing is recorded or proposed."""
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    proj, outside = tmp_path / "proj", tmp_path / "elsewhere"
+    proj.mkdir()
+    outside.mkdir()
+    loop = _loop(proj, hooks, mode=mode)
+    sess = _session(server, proj)
+    loop.on_tool_outcome = lambda tc, result, failure: hub.tool_outcome(sess, tc, result, failure)
+    args = {k: v.format(outside=outside) if isinstance(v, str) else v for k, v in args.items()}
+    tc = ToolCall(id="d1", name=tool, arguments=args)
+    failures = []
+    for _ in range(3):  # a recurring signature is what proposes a gotcha
+        result = await loop._execute_tool(tc)
+        assert result["error"].startswith(message)  # the real message: this test follows it if it is reworded
+        failures.append(loop._observe_result(tc, result, []))
+    assert hub.log.query("tool_error", actor=None) == []
+    assert not [p for p in hub.store.all() if p.kind == "project_gotcha"]
+    assert [f and f.error_class for f in failures] == ["denied"] * 3  # still a failure: the loop guard counts it
+    assert not (proj / "ran").exists()

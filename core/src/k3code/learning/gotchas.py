@@ -43,8 +43,8 @@ HEADING = "## Known pitfalls in this project"
 MACHINE_HEADING = "## Known pitfalls on this machine"
 #: projects an identical auto-learned line must be in before it goes to the user-level gotchas
 PROMOTE_PROJECTS = 2
-#: failure classes that say nothing about the project: a user's denial (E6 learns from its reason) and a call the
-#: model got wrong (its schema says so)
+#: failure classes that say nothing about the project: a denial (a user's, whose reason E6 learns from, or the
+#: policy's: hardline, auto-mode roots, plan mode, a hook) and a call the model got wrong (its schema says so)
 NOT_PROJECT = frozenset({"denied", "invalid_arguments"})
 
 
