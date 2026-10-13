@@ -5,6 +5,7 @@ import os
 import stat
 from pathlib import Path
 
+import httpx
 import pytest
 import yaml
 from click.testing import CliRunner
@@ -401,3 +402,66 @@ def test_parse_window_refuses_anything_else(text: str) -> None:
     from k3code.setup.steps import parse_window
 
     assert parse_window(text) is None
+
+
+class _AsksModels(AnswerPrompter):
+    """An interactive wizard that records the model choices a tier menu offers."""
+
+    interactive = True
+
+    def __init__(self, answers: dict[str, object]) -> None:
+        super().__init__(answers)
+        self.offered: list[list[str]] = []
+
+    def select(self, key: str, message: str, choices: list[str], default: str | None = None) -> str:
+        self.offered.append(choices)
+        return choices[0]
+
+
+def _models_endpoint_wanting(monkeypatch: pytest.MonkeyPatch, key: str) -> None:
+    """A fake /models that answers 401 to any key but `key`, as a real provider would."""
+    from k3code.setup import probe
+
+    def get(url: str, headers: dict[str, str] | None = None, **_kw: object) -> httpx.Response:
+        good = (headers or {}).get("Authorization") == f"Bearer {key}"
+        return httpx.Response(200, json={"data": [{"id": "m-one"}, {"id": "m-two"}]}) if good else httpx.Response(401)
+
+    monkeypatch.setattr(probe.httpx, "get", get)
+
+
+def _entry_with_key_only_in_env_file(key: str) -> dict[str, str]:
+    entry = {"name": "p", "kind": "openai", "base_url": "http://fake.invalid/v1", "api_key_env": "K3CODE_TEST_FILE_KEY"}
+    st.set_env_var(entry["api_key_env"], key)
+    return entry
+
+
+def test_wizard_live_test_uses_a_key_that_is_only_in_the_env_file(
+    env: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from k3code.setup import steps
+
+    key = "fake-" + os.urandom(6).hex()  # built at run time: never a real credential
+    entry = _entry_with_key_only_in_env_file(key)
+    monkeypatch.delenv(entry["api_key_env"], raising=False)
+    _models_endpoint_wanting(monkeypatch, key)
+    spec = {"name": "p", "base_url": entry["base_url"], "api_key_env": entry["api_key_env"]}
+    answers = {"providers": {"entries": [spec], "test": True}}
+    out = steps.step_providers(steps.Ctx(p=AnswerPrompter(answers), data={}))
+    shown = capsys.readouterr().out
+    assert out["tested"] == {"p": True}
+    assert "p: OK" in shown and key not in shown
+
+
+def test_wizard_tier_menu_lists_models_for_a_key_that_is_only_in_the_env_file(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from k3code.setup import steps
+
+    key = "fake-" + os.urandom(6).hex()
+    entry = _entry_with_key_only_in_env_file(key)
+    monkeypatch.delenv(entry["api_key_env"], raising=False)
+    _models_endpoint_wanting(monkeypatch, key)
+    asker = _AsksModels({})
+    out = steps.step_tiers(steps.Ctx(p=asker, data={"providers": {"entries": [entry]}}))
+    assert asker.offered and asker.offered[0] == ["m-one", "m-two", "(type one)"]
+    assert out["models"]["p"] == dict.fromkeys(steps.TIERS, "m-one")
