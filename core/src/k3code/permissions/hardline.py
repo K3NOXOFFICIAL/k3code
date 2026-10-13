@@ -763,15 +763,21 @@ class Parsed:
     #: per sub: the ``ssh host`` stages of its pipeline that run a heredoc fed to it as a script on that host
     remote_heredoc: list[list[str]] = field(default_factory=list)
     open_heredoc: bool = False  # a heredoc with no line after it to start its body
+    open_bracket: bool = False  # a ${, [, a=( ... still open at the end (see _scan)
     children: list[Parsed] = field(default_factory=list)  # the parsed payloads
 
 
-def _match_paren(text: str, open_idx: int) -> int:
+_LINE_END = re.compile(r"[ \t]*(?:\n|$)")
+
+
+def _match_paren(text: str, open_idx: int, arith: bool | None = None) -> int:
     """Index of the ``)`` that closes the ``(`` at ``open_idx`` (quote, escape, comment and heredoc aware); -1 when
-    unbalanced."""
+    unbalanced. In arithmetic (``arith``; by default when the text there is ``((``) a ``<<`` is a shift and a ``#``
+    starts no comment."""
     depth, i, n = 0, open_idx, len(text)
     heredocs: list[HeredocWord] = []
-    arith = text.startswith("((", open_idx)  # $((...)): a << in it is a shift
+    if arith is None:
+        arith = text.startswith("((", open_idx)  # $((...)): a << in it is a shift
     while i < n:
         c = text[i]
         if c == "\\":
@@ -803,7 +809,7 @@ def _match_paren(text: str, open_idx: int) -> int:
         if c == "\n" and heredocs:
             i = _skip_heredoc_bodies(text, i + 1, heredocs)
             continue
-        if c == "#" and i > open_idx + 1 and text[i - 1] in " \t\n;&|()<>":
+        if c == "#" and not arith and i > open_idx + 1 and text[i - 1] in " \t\n;&|()<>":
             eol = text.find("\n", i)
             i = n if eol < 0 else eol
             continue
@@ -817,19 +823,21 @@ def _match_paren(text: str, open_idx: int) -> int:
     return -1
 
 
-def _is_arith(text: str, i: int) -> bool:
-    """The ``((`` at ``i`` is an arithmetic command, where ``<<`` is a shift: it closes with ``))`` (``((a) )`` is two
-    subshells)."""
-    end = _match_paren(text, i)
-    return end > 0 and text[end - 1] == ")" and _match_paren(text, i + 1) == end - 1
+def _arith_end(text: str, i: int) -> int:
+    """Index of the last ``)`` of the arithmetic command ``((...))`` at ``i``, where ``<<`` is a shift, or -1 when it
+    is not one: as in bash, the inner ``(`` must close right before a ``)`` (``((a) )`` is two subshells)."""
+    inner = _match_paren(text, i + 1, arith=True)
+    return inner + 1 if inner > 0 and text.startswith(")", inner + 1) else -1
 
 
 def _scan(text: str) -> Parsed:
     """Quote-aware split into simple commands and pipelines, plus the payloads of the substitutions found on the way.
     ``#`` starts a comment only at the start of a word outside quotes; ``\\<newline>`` joins lines; ``<<`` starts a
-    heredoc only outside quotes (its body is not commands; the substitutions in an unquoted body are payloads of the
+    heredoc only outside quotes and outside an open ``((...))``, ``${...}``, ``$[...]``, ``[...]`` or ``a=(...)``,
+    however far back it opened (its body is not commands; the substitutions in an unquoted body are payloads of the
     command it is fed to). In ``((...))`` a ``<<`` is a shift; one that bash may not read as a heredoc, or whose body
-    end bash may see elsewhere (in ``${...}``, ``a[...]``, an odd delimiter word), makes the command unterminated."""
+    end bash may see elsewhere (in the other brackets, an odd delimiter word), makes the command unterminated and the
+    next lines stay commands."""
     out = Parsed()
     cur: list[str] = []
     cur_payloads: list[str] = []
@@ -837,7 +845,11 @@ def _scan(text: str) -> Parsed:
     pipe: list[str] = []
     heredocs: list[HeredocWord] = []  # the heredocs started on this line
     heredoc_info: list[tuple[bool, int]] = []  # per delimiter: quoted, index of the sub it is fed to
-    arith: list[int] = []  # where the open (( start
+    # the open brackets, innermost last: "((" (with the index of its last ")"), "${", "{" (inside "${"), "[" (also for
+    # "$["), "=(" and "=(!" (an a=(...) with an operator in it), "$(" (a substitution whose payload ends in an open
+    # bracket); the last two never close. A closer that does not match the innermost is ignored, so an unsure bracket
+    # stays open: a << then needs a person instead of hiding the next lines
+    ctx: list[tuple[str, int]] = []
     i, n = 0, len(text)
 
     def emit(s: str) -> None:
@@ -872,6 +884,10 @@ def _scan(text: str) -> Parsed:
         inner = _scan(payload)
         # `$(cat <<EOF)`: bash reads the body from the lines after the substitution
         out.unterminated = out.unterminated or inner.open_heredoc
+        if inner.open_bracket:
+            # `$(a[)...`: bash reads on past a ) in a bracket, so where the substitution ends is unsure
+            out.unterminated = True
+            ctx.append(("$(", -1))
         return end + 1, text[at : at + open_len] + inner.clean.strip() + ")"
 
     def backtick(at: int) -> tuple[int, str]:
@@ -884,7 +900,11 @@ def _scan(text: str) -> Parsed:
         return end + 1, text[at : end + 1]
 
     while i < n:
+        while ctx and ctx[-1][0] == "((" and i > ctx[-1][1]:
+            ctx.pop()  # past the )) of an arithmetic command
         c = text[i]
+        if ctx and ctx[-1][0] == "=(" and (c in ";|&" or (c in "<>" and text[i + 1 : i + 2] != "(")):
+            ctx[-1] = ("=(!", -1)  # an operator in a=(...): bash drops the rest of the line, heredocs included
         if c == "\\" and i + 1 < n:
             if text[i + 1] != "\n":  # \<newline> is a line continuation: both go
                 emit(text[i : i + 2])
@@ -931,19 +951,34 @@ def _scan(text: str) -> Parsed:
         elif text.startswith(("$(", "<(", ">("), i):
             i, s = subst(i, 2)
             emit(s)
+        elif text.startswith(("${", "$["), i):
+            ctx.append(("${" if text[i + 1] == "{" else "[", -1))
+            emit(text[i : i + 2])
+            i += 2
+        elif c in "[]{}":
+            top = ctx[-1][0] if ctx else ""
+            if c == "[" or (c == "{" and top in ("${", "{")):  # a bare { opens nothing outside ${...}
+                ctx.append((c, -1))
+            elif (c == "]" and top == "[") or (c == "}" and top in ("${", "{")):
+                ctx.pop()
+            emit(c)
+            i += 1
         elif c == "`":
             i, s = backtick(i)
             emit(s)
         elif text.startswith("<<<", i):
             emit("<<<")
             i += 3
-        elif text.startswith("<<", i) and arith and _is_arith(text, arith[-1]):
-            emit("<<")  # a shift
+        elif text.startswith("<<", i) and ctx:
+            # in ((...)) a shift; in the other brackets bash reads no heredoc either (or fails on the line), but where
+            # its word or line ends is unsure, and so is a shift at the end of a line (a heredoc with no word outside)
+            if any(kind != "((" for kind, _ in ctx) or _LINE_END.match(text, i + 2):
+                out.unterminated = True
+            emit("<<")
             i += 2
         elif text.startswith("<<", i):
             end, heredoc = _heredoc_word(text, i)
-            word = re.split(r"[ \t]", "".join(cur))[-1]
-            if heredoc and word.count("${") <= word.count("}") and word.count("[") <= word.count("]"):
+            if heredoc:
                 heredocs.append(heredoc)
                 heredoc_info.append((heredoc[2], len(out.subs)))  # the sub being built gets this index
                 emit(text[i:end])
@@ -954,6 +989,12 @@ def _scan(text: str) -> Parsed:
                 i += 2
         elif c == "\n":
             flush("\n")
+            if heredocs and ctx:
+                # `cat <<EOF ${x:-<newline>...}`: bash reads the body after the line the bracket closes on; the next
+                # lines stay commands
+                out.unterminated = True
+                heredocs.clear()
+                heredoc_info.clear()
             bodies: list[str] = []
             i = _skip_heredoc_bodies(text, i + 1, heredocs, bodies)
             for (quoted, k), body in zip(heredoc_info, bodies, strict=True):
@@ -983,10 +1024,16 @@ def _scan(text: str) -> Parsed:
                 flush("&")  # a lone & backgrounds the command; what follows is another command
             i += 1
         elif c in "()":
-            if text.startswith("((", i):
-                arith.append(i)
-            elif text.startswith("))", i) and arith:
-                arith.pop()
+            top = ctx[-1][0] if ctx else ""
+            if c == "(":
+                if top == "=(":
+                    ctx[-1] = ("=(!", -1)
+                elif cur and cur[-1] == "=":
+                    ctx.append(("=(", -1))  # a=(...), also a=((...)): no arithmetic
+                elif top != "((" and text.startswith("((", i) and (end := _arith_end(text, i)) > 0:
+                    ctx.append(("((", end))
+            elif top == "=(":
+                ctx.pop()
             flush(c)
             i += 1
         else:
@@ -994,6 +1041,7 @@ def _scan(text: str) -> Parsed:
             i += 1
     flush("")
     out.open_heredoc = bool(heredocs)
+    out.open_bracket = any(kind != "((" or end >= n for kind, end in ctx)
     out.clean = "".join(clean)
     out.code_heredoc, out.remote_heredoc = _code_heredocs(out)
     return out

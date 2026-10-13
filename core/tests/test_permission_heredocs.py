@@ -330,6 +330,11 @@ SHIFTS = [
     f"echo $((1 << y))\n{HIDDEN}\ny\n",
     # `((a) )` is two subshells: there the << is a heredoc
     f"((cat <<y) )\n'\ny\n{HIDDEN}\n",
+    # the )) on a later line, a )) inside the arithmetic, a # (no comment in arithmetic), a function body
+    f"((x = 1 << y\n))\n{HIDDEN}\ny\n",
+    f"((x = (1 + (2)) << y))\n{HIDDEN}\ny\n",
+    f"(( x = 1 << y # ))\n{HIDDEN}\ny\n",
+    f"f() ((x = 1 << y))\n{HIDDEN}\ny\n",
 ]
 
 
@@ -362,6 +367,67 @@ UNSURE = [
     f"echo $(cat <<EOF)\nEOF\n{HIDDEN}\n",
     f"echo `cat <<EOF`\nEOF\n{HIDDEN}\n",
 ]
+# a << anywhere inside an open ${...}, $[...], [...] or a=(...), however far back it opened (blanks, separators and
+# newlines included): bash reads no heredoc there (or fails on the line) and runs the next lines
+IN_A_WORD = [
+    "a[1 <<y]=1",
+    "a[ 1<<y ]=1",
+    "a[b[1] <<y]=1",
+    "a[${x]} <<y]=1",
+    "a[1 <<y]+=1",
+    "a[1|2 <<y]=1",
+    "a[1 <<y\n]=1",
+    "a[1\n<<y]=1",
+    "x=1 a[1 <<y]=1",
+    "a[1]=2 b[1 <<y]=1",
+    "echo hi | a[1 <<y]=1",
+    "! a[1 <<y]=1",
+    "f() { a[1 <<y]=1; }",
+    "echo ${a[1 <<y]}",
+    "echo ${a[ 1 <<y ]}",
+    "echo ${#a[1 <<y]}",
+    "echo ${!a[1 <<y]:-x}",
+    "echo ${a[1 <<y]}${b[2 <<y]}",
+    "echo $((1 << 2)) ${a[1 <<y]}",
+    "echo }${x:-<<y}",
+    'echo "}"${x:-<<y}',
+    'echo ${x:-"}"<<y}',
+    "echo ${x:-'}'<<y}",
+    "echo ${x:-\\}<<y}",
+    "echo ${x:-\n<<y}",
+    "[[ ${x:-<<y} ]]",
+    "echo $[ 1 << y ]",
+    "echo $[1 <<y]",
+    "echo ]$[1<<y]",
+    "x=$[\n1<<y]",
+    "a=(1<<y)",
+    "a=( 1 <<y )",
+    "a=(\n1 <<y)",
+    "a=(1\n2 <<y)",
+    "a+=(1<<y)",
+    "a=((1) <<y)",
+    "a=([)]=1 <<y)",
+    "declare -A m=([a]=1<<y)",
+    "declare -a m=(1<<y)",
+    "local m=(1<<y)",
+    "readonly m=(1<<y)",
+    "typeset -a m=(1 <<y)",
+    # a heredoc started before a ${...} that runs on to a later line: bash reads the body after the word ends
+    "cat <<EOF ${x:-\n${\nEOF\n}<<y }\nEOF",
+    # an operator in a=(...): bash fails on the line and drops the rest of it, the heredoc too
+    "a=(;)<<y",
+    "a=(1 2>&1) <<y",
+    "a=(1 || 2) <<y",
+    "a=(1 (2)) <<y",
+    "a=(())<<y",
+    "((x=(())<<y)",
+    "a=(;) && cat <<y",
+    # a ) inside a bracket does not close a substitution: bash reads on, and the << is in the bracket
+    "echo $(a[)<<y]\ny\n)",
+    "cat <(a[)<<y]\ny\n)",
+    "echo $(echo ${x:-)<<y}\ny\n)",
+]
+UNSURE += [f"{line}\n{HIDDEN}\ny\n" for line in IN_A_WORD]
 
 
 @pytest.mark.parametrize("cmd", UNSURE)
@@ -369,6 +435,32 @@ def test_a_heredoc_the_parser_cannot_place_needs_a_person(tmp_path: Path, cmd: s
     assert parse(cmd).unterminated, cmd
     _not_allowed(cmd, tmp_path)
     assert check(cmd, cwd=str(tmp_path)) == "rm-rf-home"
+    # yolo runs whatever the hardline lets through: it must see the lines bash runs
+    assert _bash(cmd, "yolo", tmp_path).hardline == "rm-rf-home"
+
+
+# a [...], ${...}, a=(...) or ((...)) closed before the << leaves an everyday heredoc as it was
+CLOSED_BEFORE = [
+    "[ -f x ] && cat <<'EOF'",
+    "[[ -n $x ]] && cat <<EOF",
+    "echo ${x} ${a[1]} ${b[$i]:-[x]} && cat <<EOF",
+    "a=(1 2); cat <<EOF",
+    "a[1]=2 cat <<EOF",
+    "x=$((1 << 2)); cat <<EOF",
+    "((n++)); cat <<EOF",
+    "let n=1<<EOF",
+    "echo {a,b}<<EOF",
+    "echo }] <<EOF",
+]
+
+
+@pytest.mark.parametrize("line", CLOSED_BEFORE)
+def test_a_heredoc_after_a_closed_bracket_or_brace_keeps_its_body(tmp_path: Path, line: str) -> None:
+    cmd = f"{line}\n{HIDDEN}\nEOF\n"
+    p = parse(cmd)
+    assert not p.unterminated, cmd
+    assert [h.body for hs in p.heredocs for h in hs] == [f"{HIDDEN}\n"], cmd
+    assert check(cmd, cwd=str(tmp_path)) is None
 
 
 QUOTED_WORDS = ["\\EOF", "E'OF'", 'E"O"F', "'E'OF", "'EOF'"]
