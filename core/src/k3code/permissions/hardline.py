@@ -11,6 +11,7 @@ lone ``&``, a quote or a substitution.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shlex
@@ -78,6 +79,34 @@ _WRAPPERS = frozenset(
         "chrt",
     }
 )
+#: Windows interpreters reached from a WSL install through interop: ``powershell.exe``, ``cmd.exe``, ``pwsh``,
+#: ``wsl.exe`` and the classic script hosts all run arbitrary code from their arguments, so they count as launchers
+#: (never an ``always allow <prefix>`` rule) and the hardline looks inside what they are told to run. Matched after
+#: lower-casing and dropping a Windows executable suffix, because drvfs (``/mnt/c``) is case-insensitive and interop
+#: invokes ``foo.exe``: ``PowerShell.exe`` and ``/mnt/c/.../powershell.exe`` are the same program (issue #169).
+WINDOWS_LAUNCHERS = frozenset(
+    {
+        "powershell",
+        "pwsh",
+        "cmd",
+        "wsl",
+        "wslg",
+        "cscript",
+        "wscript",
+        "mshta",
+        "rundll32",
+        "regsvr32",
+    }
+)
+#: How interop spells a Windows interpreter binary (``powershell.exe``); not script/data suffixes like ``.ps1``.
+_WINDOWS_EXEC_SUFFIX = re.compile(r"\.(?:exe|com|bat)$")
+
+
+def _windows_launcher(name: str) -> bool:
+    """``name`` (an argv0 basename) is a Windows interpreter reached through WSL interop (see WINDOWS_LAUNCHERS)."""
+    return _WINDOWS_EXEC_SUFFIX.sub("", name.lower()) in WINDOWS_LAUNCHERS
+
+
 #: Commands that run arbitrary code from their arguments: an "always allow <prefix>" rule must never be offered for
 #: them (one click on `python3 *` or `ssh *` would otherwise allow everything).
 LAUNCHERS = frozenset(
@@ -132,16 +161,23 @@ _WILDCARD_UNSAFE_PAIRS = frozenset(
 )
 
 
+def _is_launcher_name(name: str) -> bool:
+    """``name`` (an argv0 basename) runs code from its arguments: a POSIX launcher (LAUNCHERS) or a Windows
+    interpreter reached through WSL interop (WINDOWS_LAUNCHERS)."""
+    return name in LAUNCHERS or _windows_launcher(name)
+
+
 def wildcard_unsafe(command: str) -> bool:
     """``command`` (or a rule pattern) starts with a command that must never get a ``<prefix> *`` rule (see
-    WILDCARD_UNSAFE), including ``git -c key=value ...`` (a config value can name a program to run)."""
+    WILDCARD_UNSAFE and WINDOWS_LAUNCHERS), including ``git -c key=value ...`` (a config value can name a program to
+    run)."""
     toks = _tokens(command)
     while toks and _is_assignment(toks[0]):
         toks = toks[1:]
     if not toks:
         return False
     root = os.path.basename(toks[0])
-    if root in WILDCARD_UNSAFE or root.startswith(_WILDCARD_UNSAFE_PREFIXES):
+    if root in WILDCARD_UNSAFE or root.startswith(_WILDCARD_UNSAFE_PREFIXES) or _windows_launcher(root):
         return True
     if root == "git":
         i = 1
@@ -178,6 +214,65 @@ _DANGEROUS_RM_TARGETS = frozenset(
         "/srv",
     }
 )
+
+#: Top-level folders of a Windows drive whose recursive delete wipes the host side (lower case, as drvfs folds case).
+_WINDOWS_DRIVE_SUBDIRS = frozenset({"users", "windows", "program files", "program files (x86)", "programdata"})
+#: The default WSL automount: a Windows drive is mounted at ``/mnt/<letter>``. A custom ``automount.root`` is read
+#: from /proc/mounts instead (see :func:`windows_drives`).
+_DEFAULT_MNT_DRIVE = re.compile(r"^(/mnt/[a-z0-9])(?:/|$)")
+
+
+def windows_drives(mounts: str | None = None) -> list[str]:
+    """Mount points (lower case, trailing slash dropped) of the Windows drives WSL mounts: ``drvfs``, or ``9p`` with
+    ``aname=drvfs`` on WSL 2, read from ``mounts`` or ``/proc/mounts``. Empty off WSL. Lets a custom ``automount.root``
+    (e.g. ``/win/c``) be protected like the default ``/mnt/c`` (issue #169)."""
+    if mounts is None:
+        mounts = _read_proc_mounts()
+    out: list[str] = []
+    for line in mounts.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and (fields[2] == "drvfs" or (fields[2] == "9p" and "aname=drvfs" in fields[3])):
+            point = fields[1].replace("\\040", " ").rstrip("/").lower() or "/"
+            if point not in out:
+                out.append(point)
+    return out
+
+
+@functools.cache
+def _read_proc_mounts() -> str:
+    try:
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def _windows_drive_of(base: str, drives: list[str]) -> str | None:
+    """The Windows drive root ``base`` (lower case) sits on or is: a drvfs mount from ``drives``, or the default
+    ``/mnt/<letter>`` automount."""
+    for d in drives:
+        d = d.rstrip("/")
+        if base == d or base.startswith(d + "/"):
+            return d
+    m = _DEFAULT_MNT_DRIVE.match(base)
+    return m.group(1) if m else None
+
+
+def windows_rm_target(base: str, drives: list[str]) -> bool:
+    """``base`` (an expanded rm target, lower case, a trailing ``/*`` glob allowed) is a Windows drive root, a drive
+    glob, one of its system folders (Users, Windows, ...) or a profile root ``<drive>/Users/<name>`` under one of the
+    WSL ``drives`` or the default ``/mnt/<letter>``. Deleting any of these wipes the host side of a WSL install."""
+    if base.endswith("/*"):
+        base = base[:-2]
+    drive = _windows_drive_of(base, drives)
+    if drive is None:
+        return False
+    if base == drive:
+        return True
+    rest = base[len(drive) + 1 :].split("/")
+    if len(rest) == 1 and rest[0] in _WINDOWS_DRIVE_SUBDIRS:
+        return True
+    return len(rest) == 2 and rest[0] == "users"  # a per-user profile root (its name is not known in advance)
 
 
 def check(
@@ -646,11 +741,14 @@ def _rm_check(argv: list[str], cwd: str | None, home: str) -> str | None:
     if not recursive:
         return None
     dangerous = _DANGEROUS_RM_TARGETS | {home, home + "/*"}
+    drives = windows_drives()
     for t in targets:
         target = _expand_target(t, cwd, home) if t else t
         if target in dangerous:
             homeish = "~" in t or "HOME" in t or t.startswith("/home") or target in (home, home + "/*")
             return "rm-rf-home" if homeish else "rm-rf-root"
+        if target and windows_rm_target(target.lower(), drives):
+            return "rm-rf-root"  # a Windows drive, system folder or profile reached through WSL (issue #169)
     return None
 
 
@@ -875,7 +973,7 @@ def _launcher_payloads(sub: str) -> list[str]:
     if len(pre) > 1 and os.path.basename(pre[0]) == "eval":
         out.append(" ".join(pre[1:]))
     real = normalize_argv(toks)
-    if real and real[0] in LAUNCHERS:
+    if real and _is_launcher_name(real[0]):
         out += [t for t in real[1:] if not t.startswith("-") and re.search(r"\s|[;&|$`<>()]", t)]
     if real:
         out += ssh_option_commands(real[0], real[1:])
@@ -930,10 +1028,10 @@ def command_prefix(sub_command: str) -> str:
 def is_launcher(sub_command: str) -> bool:
     """True when the command runs code given in its arguments (shells, ssh, interpreters, xargs, find, sudo ...)."""
     tokens = _tokens(sub_command)
-    if tokens and os.path.basename(tokens[0]) in LAUNCHERS:
+    if tokens and _is_launcher_name(os.path.basename(tokens[0])):
         return True
     real = _strip_wrappers(tokens)
-    return bool(real) and os.path.basename(real[0]) in LAUNCHERS
+    return bool(real) and _is_launcher_name(os.path.basename(real[0]))
 
 
 #: Shell tokenising for the engine's argument checks (quote-aware, wrappers such as sudo/env stripped).
