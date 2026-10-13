@@ -1527,6 +1527,28 @@ def test_a_newer_checkout_over_an_older_install_gets_no_downgrade_notice(tmp_pat
     assert OLDER_NOTICE in r.stderr
 
 
+def test_a_git_install_records_the_remote_it_was_made_from(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    r = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", "main", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert (home / DATA_REL / "current" / ".url").read_text().strip() == f"file://{src}"
+
+
+def test_the_recorded_remote_keeps_no_credentials(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    fake = "fake-" + "token-" + str(os.getpid())  # built at run time: not a real credential
+    url = f"https://builder:{fake}@mirror.invalid/k3code.git"
+    (home / ".gitconfig").write_text(f'[url "file://{src}"]\n\tinsteadOf = {url}\n')
+    r = run(home, INSTALL, "--from-git", url, "--ref", "main", "--minimal")
+    assert r.returncode == 0, r.stderr
+    assert (home / DATA_REL / "current" / ".url").read_text().strip() == "https://mirror.invalid/k3code.git"
+    assert fake not in "".join(p.read_text() for p in (home / DATA_REL).rglob(".url"))
+
+
 def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
     src = _source_repo(tmp_path)  # its first commit is the tag v0.0.1
     (src / "VERSION").write_text("0.0.2\n")

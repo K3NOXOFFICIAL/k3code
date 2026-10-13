@@ -404,12 +404,14 @@ def update_settings() -> dict[str, Any]:
 
     s = confio.read_yaml(user_config_path()).get("update") or {}
     repo = s.get("repo", DEFAULT_REPO)
+    # the git remote a `install.sh --from-git` install updates from: update.url, else update.repo, else the remote
+    # the install was made from (a fork or mirror), else the default repository
+    url = s.get("url") or (None if "repo" in s else git_url())
     return {
         "channel": s.get("channel", "stable"),
         "repo": repo,
         "source": s.get("source", ""),
-        # the git remote a `install.sh --from-git` install updates from (a fork or mirror may set its own)
-        "url": s.get("url") or f"https://github.com/{repo}.git",
+        "url": url or f"https://github.com/{repo}.git",
         "api": os.environ.get("K3CODE_UPDATE_API") or s.get("api") or DEFAULT_API,
     }
 
@@ -963,6 +965,15 @@ def git_ref() -> str | None:
     except OSError:
         return None
     return ref or None
+
+
+def git_url() -> str | None:
+    """The remote the active version was built from (``install.sh --from-git``); None when it was not recorded."""
+    try:
+        url = (current_link() / ".url").read_text().strip()
+    except OSError:
+        return None
+    return url or None
 
 
 def is_commit_sha(ref: str) -> bool:

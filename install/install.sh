@@ -744,6 +744,17 @@ recorded_version() {
   printf '%s' "$found"
 }
 
+plain_url() { # plain_url URL: an http(s) URL without its user:password@ part, so no credential is ever stored
+  case "$1" in
+    http://* | https://*)
+      pu_rest=${1#*://}
+      pu_auth=${pu_rest%%/*}
+      printf '%s://%s%s\n' "${1%%://*}" "${pu_auth##*@}" "${pu_rest#"$pu_auth"}"
+      ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 installed_ref() { # the ref the active version was built from, if it was recorded
   if [ -f "$DATA/current/.ref" ]; then cat "$DATA/current/.ref"; fi
   return 0
@@ -1004,6 +1015,10 @@ record_origin() {
   if [ "$FROM" = git ] && [ "$(cat "$VERDIR/.ref" 2>/dev/null)" != "$REF" ]; then
     printf '%s\n' "$REF" >"$VERDIR/.ref.new"
     mv -f "$VERDIR/.ref.new" "$VERDIR/.ref"
+  fi
+  # `k3code update` follows the same remote (a fork or mirror, not upstream)
+  if [ "$FROM" = git ] && [ "$(cat "$VERDIR/.url" 2>/dev/null)" != "$(plain_url "$GIT_URL")" ]; then
+    plain_url "$GIT_URL" >"$VERDIR/.url"
   fi
   return 0
 }
