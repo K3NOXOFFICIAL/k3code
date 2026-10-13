@@ -400,3 +400,48 @@ async def test_a_known_secret_is_dropped_also_when_percent_encoded(tmp_path, mon
     server.emit("tool_result", {"output": f"GET https://x.example.com/a?q={quote(known, safe='')} 401"})
     files = _bundle_text(await debugdump.write_bundle(server, 50, home=tmp_path, probe=False))
     assert "Sec%2Cret" not in files["events.json"]
+
+
+# K3NOX-493: a token-shaped URL user name is hidden whatever follows it
+
+USER_TOKEN = "Zq81" + "xYw9Pq2L" + "mN7tK3vB"  # the user name is the credential (`https://<token>:x-oauth-basic@`)
+
+
+@pytest.mark.parametrize("password", [":*", ":?", ":****", ":*?", ":", ""])
+@pytest.mark.parametrize("scheme", ["https", "ssh", "git+https"])
+def test_a_token_shaped_url_user_name_is_hidden_whatever_follows_it(scheme, password):
+    from k3code.redact import redact_session_json, scrub_text
+    from k3code.toolerrors import failure_of
+
+    # pip prints an index URL whose user name is the token as `https://<token>:****@host`
+    text = f"pip install --index-url {scheme}://{USER_TOKEN}{password}@pkgs.example.com/simple x"
+    assert USER_TOKEN not in scrub_text(text)
+    assert USER_TOKEN not in json.dumps(redact({"cmd": text}))
+    assert USER_TOKEN not in json.dumps(redact_session_json({"messages": [{"content": text}]}))
+    failure = failure_of("bash", {"command": "pip install x"}, {"exit_code": 1, "stderr": f"ERROR: {text}"})
+    assert failure is not None and USER_TOKEN not in failure.first_line + failure.signature
+
+
+@pytest.mark.parametrize("password", [":*", ":****", ":", ""])  # a `?` starts the query: scrub_text covers `<token>:?@`
+def test_scrub_urls_hides_a_token_shaped_user_name_whatever_follows_it(password):
+    from k3code.redact import scrub_urls
+
+    out = scrub_urls(f"https://{USER_TOKEN}{password}@pkgs.example.com/simple")
+    assert USER_TOKEN not in out and out.startswith(f"https://{REDACTED}") and out.endswith("@pkgs.example.com/simple")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://alice:*@h.example.com/x",
+        "curl https://*:*@*",
+        "ssh://git@github.com/o/r.git",
+        "https://bob@h.example.com",
+    ],
+)
+def test_an_ordinary_url_user_name_and_a_glob_password_stay(url):
+    from k3code.redact import scrub_text
+
+    assert scrub_text(url) == url
+    assert redact({"permissions": {"bash": {url: "deny"}}}) == {"permissions": {"bash": {url: "deny"}}}
+
