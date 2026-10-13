@@ -16,8 +16,9 @@
 # Everything k3code needs is fetched into your home directory, without root: uv (and through it Python),
 # a private Node runtime (PREFIX/share/k3code/node, for the TUI) and a Go toolchain (PREFIX/share/k3code/go,
 # to build the k3 pane binary) when they are not on PATH. bubblewrap is installed through the system package
-# manager only when that works without a password (root or passwordless sudo). --no-install-deps fetches
-# nothing. The installer never runs onboarding; it ends by telling you to run `k3code onboard`.
+# manager only when that works without a password (root or passwordless sudo). --no-install-deps fetches none of
+# these toolchains; the PyPI, npm and Go module packages the build needs still download. The installer never
+# runs onboarding; it ends by telling you to run `k3code onboard`.
 # Presetup (after activation; --minimal skips it) checks the sandbox, installs Chromium for the browser tool and
 # prints a health subset. It never fails the install.
 # Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
@@ -54,7 +55,8 @@ Options:
   --prefix DIR          install into DIR/bin and DIR/share/k3code (default: ~/.local)
   --from-bundle FILE    after installing, import a k3code export (settings and sessions)
   --yes, -y             accepted for older callers; with it, presetup never prompts for sudo
-  --no-install-deps     install nothing (no uv, Python, Node, Go); fail or skip with the hints instead
+  --no-install-deps     fetch no toolchains (uv, Python, Node, Go, bubblewrap, Chromium; fail or skip with the hints
+                        instead); PyPI, npm and Go module packages still download
   --minimal             skip presetup: no sandbox check, no Chromium, no doctor subset
   --check               print the platform and dependency report, change nothing
   --allow-root          install as root anyway (for example in a container); refused by default
