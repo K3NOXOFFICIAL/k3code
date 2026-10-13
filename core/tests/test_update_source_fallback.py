@@ -86,6 +86,56 @@ def test_an_install_without_a_checkout_still_gets_the_token_advice(tmp_path, mon
     assert r.exit_code != 0 and "GITHUB_TOKEN" in r.output and "Traceback" not in r.output
 
 
+# -- a recorded checkout that is gone is not the same as no recorded checkout --------------------------------------
+
+
+def test_a_moved_checkout_is_named_not_blamed_on_the_github_api(checkout, monkeypatch):
+    moved = checkout.rename(checkout.with_name("clone copy"))  # the issue's "clone copy with spaces"
+    (checkout.parent / "data" / "source_path").write_text(str(checkout))  # still recorded at the old place
+    monkeypatch.setattr(upd, "github_token", lambda: None)
+    monkeypatch.setattr(upd, "fetch_latest", _deny)
+    monkeypatch.setattr(upd, "update_from_source", lambda *a, **k: pytest.fail("there is nothing to build from"))
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code != 0 and "Traceback" not in r.output
+    assert str(checkout) in r.output and "does not exist" in r.output and "update.source" in r.output
+    assert "404" in r.output  # the release lookup failure stays visible, after the path
+    assert moved.exists()
+
+
+def test_a_moved_checkout_is_named_when_there_is_no_release_either(checkout, monkeypatch):
+    checkout.rename(checkout.with_name("clone copy"))
+    monkeypatch.setattr(upd, "github_token", lambda: None)
+    monkeypatch.setattr(upd, "fetch_latest", lambda *a, **k: None)
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code != 0 and str(checkout) in r.output and "does not exist" in r.output
+    assert "keeps no checkout or git ref" not in r.output
+
+
+def test_from_source_names_the_recorded_path_when_it_is_gone(checkout, monkeypatch):
+    checkout.rename(checkout.with_name("clone copy"))
+    monkeypatch.setattr(upd, "update_from_source", lambda *a, **k: pytest.fail("there is nothing to build from"))
+    for extra in ([], ["--no-pull"], ["--check"]):
+        r = CliRunner().invoke(cli, ["update", "--from-source", "--yes", *extra])
+        assert r.exit_code != 0, r.output
+        assert str(checkout) in r.output and "does not exist" in r.output and "update.source" in r.output
+        assert "no source checkout known" not in r.output
+
+
+def test_a_recorded_path_that_is_not_a_git_checkout_says_so(checkout, monkeypatch):
+    (checkout / ".git").rmdir()
+    r = CliRunner().invoke(cli, ["update", "--from-source", "--no-pull", "--yes"])
+    assert r.exit_code != 0 and str(checkout) in r.output and "not a git checkout" in r.output
+    assert "does not exist" not in r.output and "no source checkout known" not in r.output
+
+
+def test_from_source_with_no_recorded_checkout_keeps_its_own_message(tmp_path, monkeypatch):
+    monkeypatch.setenv("K3CODE_DATA", str(tmp_path / "data"))
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    r = CliRunner().invoke(cli, ["update", "--from-source", "--yes"])
+    assert r.exit_code != 0 and "no source checkout known; set update.source in config.yaml" in r.output
+    assert "does not exist" not in r.output
+
+
 def test_from_wsl_a_windows_clone_is_pulled_with_windows_git(monkeypatch):
     monkeypatch.setattr(upd, "_in_wsl", lambda: True)
     monkeypatch.setattr(
