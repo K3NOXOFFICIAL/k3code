@@ -16,7 +16,9 @@
 #        k3-{linux,darwin}-{amd64,arm64}            the k3 pane binary, CGO_ENABLED=0 cross builds
 #        SHA256SUMS                                 a sha256 line for every other asset
 #   4. the release notes: the CHANGELOG.md section of VERSION
-#   5. git tag -a vVERSION, git push origin vVERSION, gh release create (--prerelease when VERSION contains "-")
+#   5. gh release create --draft with every asset (--prerelease when VERSION contains "-"), a check that the draft holds
+#      them all, then gh release edit --draft=false. GitHub creates the tag vVERSION at the checked commit only when it
+#      publishes, so a run that fails earlier leaves no tag: rerun the same command (it replaces a leftover draft).
 #
 # --dry-run checks the preconditions without stopping on them (each one that fails is printed), runs the full check
 # without --post, builds everything into .k3dev/release/VERSION/ and prints what it would publish. --no-check (only
@@ -206,16 +208,26 @@ echo "release: assets of $TAG (from ${SHA:0:12}) in ${ASSETS#"$ROOT"/}:"
 if [ "$DRY" = 1 ]; then
   echo
   echo "release: --dry-run, would now run:"
-  echo "  git tag -a $TAG -m 'k3code $VER' ${SHA:0:12}"
-  echo "  git push origin refs/tags/$TAG"
-  echo "  gh release create $TAG <the assets above> --title $TAG --notes-file ${NOTES#"$ROOT"/} --verify-tag ${flags[*]-}"
+  echo "  gh release create $TAG <the assets above> --draft --target ${SHA:0:12} --title $TAG --notes-file ${NOTES#"$ROOT"/} ${flags[*]-}"
+  echo "  gh release edit $TAG --draft=false   (GitHub then creates the tag $TAG at ${SHA:0:12})"
   [ "$problems" = 0 ] || echo "release: $problems precondition(s) failed (above): a real release would have refused"
   exit 0
 fi
 
 # --- 5. publish --------------------------------------------------------------------------------------------------
-git tag -a "$TAG" -m "k3code $VER" "$SHA"
-# The full check passed on this exact commit a moment ago (step 1); the pre-push hook would run it again.
-K3CODE_SKIP_HOOKS=1 git push origin "refs/tags/$TAG"
-gh release create "$TAG" "$ASSETS"/* --title "$TAG" --notes-file "$NOTES" --verify-tag ${flags[@]+"${flags[@]}"}
+# The tag must not exist before the release does: install.sh takes the newest v* tag at once, and release.sh refuses a
+# tag that exists, so a tag left behind by a failed upload would be installed and block the rerun. The release is made
+# as a draft (no tag) with every asset, checked, and only then published; GitHub creates the tag at $SHA when it does.
+stale=$(gh release list --limit 100 --json tagName,isDraft \
+  --jq ".[] | select(.isDraft and .tagName == \"$TAG\") | .tagName") || die "gh release list failed; is gh signed in (gh auth status)?"
+if [ -n "$stale" ]; then
+  note "replacing the draft release $TAG that an earlier run left behind"
+  gh release delete "$TAG" --yes
+fi
+gh release create "$TAG" "$ASSETS"/* --draft --target "$SHA" --title "$TAG" --notes-file "$NOTES" ${flags[@]+"${flags[@]}"}
+uploaded=$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort) || die "gh release view $TAG failed"
+local_assets=$(cd "$ASSETS" && printf '%s\n' * | sort)
+[ "$uploaded" = "$local_assets" ] ||
+  die "the draft release $TAG holds [$(tr '\n' ' ' <<<"$uploaded")], not [$(tr '\n' ' ' <<<"$local_assets")]; it stays a draft, no tag exists: rerun"
+gh release edit "$TAG" --draft=false
 echo "release: $TAG published"

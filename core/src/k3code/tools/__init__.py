@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import dataclasses
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -134,6 +135,43 @@ def _atomic_write(path: Path, data: bytes) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+#: The tools FileStamps guards: they change a file, so the model must have seen what is in it now.
+FILE_TOOLS = frozenset({"write", "edit"})
+
+
+class FileStamps:
+    """What a session last saw of each file it read, wrote or edited: real path → (mtime_ns, size).
+
+    ``write`` and ``edit`` refuse an existing file the session has not seen, or one that changed on disk since (the
+    user's editor, a formatter, another agent): write replaced the whole file and that change was gone without a word.
+    """
+
+    def __init__(self) -> None:
+        self._seen: dict[str, tuple[int, int]] = {}
+
+    def record(self, path: Path) -> None:
+        with contextlib.suppress(OSError):
+            st = path.stat()
+            self._seen[os.path.realpath(path)] = (st.st_mtime_ns, st.st_size)
+
+    def refusal(self, tool: str, path: Path) -> str | None:
+        """Why ``tool`` may not change ``path`` now, or None. A file that does not exist yet is always fine."""
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        if not path.is_file():
+            return None  # the tool reports what is wrong with it
+        seen = self._seen.get(os.path.realpath(path))
+        if seen is None:
+            return f"{path} exists and you have not read it: read it before you {tool} it"
+        if seen != (st.st_mtime_ns, st.st_size):
+            return (
+                f"{path} changed since you read it (by the user or another program): read it again before you {tool} it"
+            )
+        return None
 
 
 #: Files larger than this are only read as an explicit line range (streamed, never loaded whole).
@@ -300,8 +338,23 @@ def _edit_key(path: Path, old_string: str, new_string: str) -> tuple[str, str, s
     return (str(path), digest(old_string), digest(new_string))
 
 
-async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included)."""
+@dataclasses.dataclass
+class EditPlan:
+    """What ``edit`` will write: the file's text before and after, both with LF line ends."""
+
+    path: Path
+    before: str
+    after: str
+    crlf: bool  # written back with CRLF line ends
+    count: int
+    strategy: str
+    key: tuple[str, str, str] | None = None  # see _edit_key: remembered once the edit is written
+    already_applied: bool = False  # the model sent an edit this run already made: nothing to write (before == after)
+
+
+def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan | dict[str, Any]:
+    """The change ``edit`` would make, or its error result; nothing is written. The approval prompt shows the same
+    change (issue #131), so this is the one place the replacement is computed."""
     path = _resolve_path(arguments["path"], cwd)
     if not path.is_file():
         return {"error": _not_a_file(path)}
@@ -330,16 +383,26 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         # "No change needed" only for an edit this run made itself and the model sent again: judged from the file's text
         # alone it also answered "success" to an old_string that was never there while new_string happened to occur
         if count == 0 and applied in _APPLIED_EDITS and is_already_applied(content, old_string, new_string):
-            return {"content": f"No change needed: {path.name} already contains new_string and no longer old_string."}
+            return EditPlan(path, content, content, crlf, 0, "already applied", applied, already_applied=True)
         hint = format_no_match_hint(error, count, old_string, content)
         return {"error": error + hint}
-    if crlf:
-        new_content = new_content.replace("\n", "\r\n")
-    _atomic_write(path, new_content.encode("utf-8"))
-    _APPLIED_EDITS[applied] = None
-    while len(_APPLIED_EDITS) > _APPLIED_EDITS_MAX:
-        _APPLIED_EDITS.pop(next(iter(_APPLIED_EDITS)))
-    return {"ok": True, "replacements": count, "strategy": strategy}
+    return EditPlan(path, content, new_content, crlf, count, strategy, applied)
+
+
+async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
+    """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included)."""
+    plan = plan_edit(arguments, cwd=cwd)
+    if isinstance(plan, dict):
+        return plan
+    if plan.already_applied:
+        return {"content": f"No change needed: {plan.path.name} already contains new_string and no longer old_string."}
+    new_content = plan.after.replace("\n", "\r\n") if plan.crlf else plan.after
+    _atomic_write(plan.path, new_content.encode("utf-8"))
+    if plan.key is not None:
+        _APPLIED_EDITS[plan.key] = None
+        while len(_APPLIED_EDITS) > _APPLIED_EDITS_MAX:
+            _APPLIED_EDITS.pop(next(iter(_APPLIED_EDITS)))
+    return {"ok": True, "replacements": plan.count, "strategy": plan.strategy}
 
 
 #: bash: seconds before a foreground command is killed, when the call names no timeout, and the most it may name.
@@ -541,9 +604,20 @@ def _collapse_redraws(text: str) -> str:
 HOOK_FEEDBACK_KEY = "hook_feedback"
 #: Where the loop notes the arguments of a built-in tool call that the tool has no parameter for (they are dropped).
 IGNORED_KEY = "ignored_arguments"
+#: What is stored of one tool result (transcript, messages.json, sessions.db); the model is sent far less
+#: (MAX_TOOL_RESULT_CHARS), this only stops one runaway result from bloating every checkpoint.
+MAX_STORED_RESULT_CHARS = 1_000_000
 
 
 def format_tool_result(result: dict[str, Any]) -> Any:
+    """``_format_tool_result`` with a string result capped at ``MAX_STORED_RESULT_CHARS`` (head + tail)."""
+    out = _format_tool_result(result)
+    if isinstance(out, str) and len(out) > MAX_STORED_RESULT_CHARS:
+        return clip_head_tail(out, MAX_STORED_RESULT_CHARS)
+    return out
+
+
+def _format_tool_result(result: dict[str, Any]) -> Any:
     """What the model, the journal and the TUI see of one tool result.
 
     ``bash``, ``grep`` and ``glob`` carry free text; they used to be sent as the Python repr of their dict, which
@@ -555,10 +629,10 @@ def format_tool_result(result: dict[str, Any]) -> Any:
     hook's word (``HOOK_FEEDBACK_KEY``) follows the result it is about.
     """
     if feedback := result.get(HOOK_FEEDBACK_KEY):
-        body = format_tool_result({k: v for k, v in result.items() if k != HOOK_FEEDBACK_KEY})
+        body = _format_tool_result({k: v for k, v in result.items() if k != HOOK_FEEDBACK_KEY})
         return f"{body}\n\n[PostToolUse hook] {feedback}"
     if ignored := result.get(IGNORED_KEY):
-        body = format_tool_result({k: v for k, v in result.items() if k != IGNORED_KEY})
+        body = _format_tool_result({k: v for k, v in result.items() if k != IGNORED_KEY})
         return f"{body}\n[{ignored}]"
     if "content" in result and "first" in result:  # read
         return _numbered_read(result)
@@ -597,7 +671,7 @@ def format_tool_result(result: dict[str, Any]) -> Any:
         return f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
     if result.keys() == {"error"}:
         return f"Error: {result['error']}"
-    return str(result)
+    return json.dumps(result, ensure_ascii=False, default=str)
 
 
 def _numbered_read(result: dict[str, Any]) -> str:
@@ -789,12 +863,13 @@ def _shown(path: Path, base: Path) -> str:
         return str(path)
 
 
-async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tuple[int, list[str], bytes, str]:
-    """``cmd`` (an rg argv with ``--null``) run in ``cwd``: (exit code, output lines, stderr, cut). ``named``: rg
-    prints the file of each match (a directory search); each line then starts with it as :func:`_shown` relative to
-    ``base`` and a NUL (a file name may hold a colon, which :func:`_group_by_file` must not cut at), and a file
-    ``sensitive_path`` names is dropped, whatever glob or ignore file let rg reach it. Reading stops one line past
-    MAX_SEARCH_RESULTS or at SEARCH_BUDGET_S, with rg killed; ``cut`` then says why the lines are partial."""
+async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tuple[int, list[str], bytes, str, int]:
+    """``cmd`` (an rg argv with ``--null``) run in ``cwd``: (exit code, output lines, stderr, cut, withheld).
+    ``named``: rg prints the file of each match (a directory search); each line then starts with it as :func:`_shown`
+    relative to ``base`` and a NUL (a file name may hold a colon, which :func:`_group_by_file` must not cut at), and a
+    file ``sensitive_path`` names is dropped, whatever glob or ignore file let rg reach it; ``withheld`` counts the
+    lines dropped so. Reading stops one line past MAX_SEARCH_RESULTS or at SEARCH_BUDGET_S, with rg killed; ``cut``
+    then says why the lines are partial."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -807,6 +882,7 @@ async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tupl
     errors = asyncio.ensure_future(proc.stderr.read())  # read alongside: a full stderr pipe would stall rg's output
     lines: list[str] = []
     cut = ""
+    withheld = 0
     shown: dict[bytes, str | None] = {}  # per file name rg printed: how it is shown, None for a sensitive path
     pending = b""  # the start of a file name that holds a newline (rg prints it as it is)
     deadline = time.monotonic() + SEARCH_BUDGET_S
@@ -831,6 +907,7 @@ async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tupl
                     secret = sensitive_path(os.path.join(cwd, os.fsdecode(name)))
                     shown[name] = None if secret else _shown(cwd / name.decode("utf-8", errors="replace"), base)
                 if (where := shown[name]) is None:
+                    withheld += 1
                     continue
                 text = rest.rstrip(b"\n").decode("utf-8", errors="replace")
                 lines.append(f"{where}\0{text}")
@@ -849,7 +926,17 @@ async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tupl
             proc.kill()
         errors.cancel()
         raise
-    return (0 if cut else proc.returncode or 0), lines, stderr, cut
+    return (0 if cut else proc.returncode or 0), lines, stderr, cut, withheld
+
+
+def _note_withheld(result: dict[str, Any], note: str) -> dict[str, Any]:
+    """``result`` with ``note`` added to its warnings (a string, or a list of stderr lines)."""
+    warnings = result.get("warnings")
+    if isinstance(warnings, list):
+        result["warnings"] = [*warnings, note]
+    else:
+        result["warnings"] = f"{warnings}; {note}" if warnings else note
+    return result
 
 
 def _group_by_file(lines: list[str]) -> str:
@@ -962,7 +1049,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
         cmd += ["-e", pattern, "--", _shown(target, run_dir) if target != run_dir else "."]
         named = target.is_dir()
-        code, lines, stderr, cut = await _run_rg(cmd, run_dir, base, named=named)
+        code, lines, stderr, cut, withheld = await _run_rg(cmd, run_dir, base, named=named)
         flag = _rg_remedy(stderr) if code == 2 and not lines else None
         retried = ""
         if flag:
@@ -970,28 +1057,32 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
             # once more with that flag rather than send the model to flags this tool has no argument for
             again = await _run_rg([cmd[0], flag, *cmd[1:]], run_dir, base, named=named)
             if again[0] in (0, 1):
-                (code, lines, stderr, cut), retried = (
+                (code, lines, stderr, cut, withheld), retried = (
                     again,
                     ("[searched in multiline mode]" if flag == "-U" else "[searched with PCRE2]"),
                 )
             elif again[0] == 2 and not again[1]:
-                code, lines, stderr, cut = again  # the flag did not help: its error is about the pattern itself
+                code, lines, stderr, cut, withheld = again  # the flag did not help: its error is the pattern's own
         # a search of one file prints no path, so a line of its text could read like `path:12:`: leave those alone
         text = ("\n".join(lines) if not named else _group_by_file(lines)).strip()
         if retried:
             text = f"{retried}\n{text}" if text else retried
         if cut:
-            return {"matches": text, "warnings": cut}
-        if code == 2 and text:
+            result: dict[str, Any] = {"matches": text, "warnings": cut}
+        elif code == 2 and (text or withheld):
             # rg exits 2 when any entry was unreadable (a root-owned dir) but still prints every other match
             note = stderr.decode("utf-8", errors="replace").strip().splitlines()[:3]
-            return {"matches": text, "warnings": note}
-        if code not in (0, 1):  # 1 = no matches; 2 with no output is rg refusing the request (a bad regex)
+            result = {"matches": text, "warnings": note}
+        elif code not in (0, 1):  # 1 = no matches; 2 with no output is rg refusing the request (a bad regex)
             reason = stderr.decode("utf-8", errors="replace").strip().splitlines()
             return {"error": f"grep failed: {' '.join(line.strip() for line in reason[:6]) or 'rg exited 2'}"}
-        if not text and (hints := _no_match_hints(pattern, include)):
-            return {"matches": "", "warnings": f"no matches. Check: {hints}"}
-        return {"matches": text}
+        elif not text and not withheld and (hints := _no_match_hints(pattern, include)):
+            result = {"matches": "", "warnings": f"no matches. Check: {hints}"}
+        else:
+            result = {"matches": text}
+        if withheld:
+            _note_withheld(result, f"{withheld} matching line(s) in credential files (.env, keys) not shown")
+        return result
     except OSError:  # no rg installed, or one that cannot start (no exec permission, a broken binary)
         # Python fallback: off the event loop, same tree rules as glob, capped, sensitive files skipped
         return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude, base)
@@ -1040,7 +1131,9 @@ def _skipped_subpath(rel: str) -> bool:
 
 def _git_files(path: Path) -> list[str] | None:
     """Files under ``path`` that git tracks or would track (``.gitignore`` honoured), relative to ``path``; None when
-    ``path`` is not in a git work tree or git is missing."""
+    ``path`` is not in a git work tree or git is missing. An index entry whose file is gone (deleted or moved without
+    staging) is listed too: callers stat only the paths they keep, since one stat per listed file took minutes for a
+    big checkout on WSL's /mnt/c."""
     import subprocess
 
     try:
@@ -1055,21 +1148,26 @@ def _git_files(path: Path) -> list[str] | None:
         return None
     if out.returncode != 0:
         return None
-    # -c lists index entries whose file is gone (deleted or moved without staging): the work tree decides.
-    return [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f and os.path.lexists(path / f)]
+    return [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f]
 
 
 def _iter_tree(path: Path, deadline: float, *, top_only: bool = False) -> Iterator[tuple[str | None, bool]]:
     """Yield ``(relative posix path, is_dir)`` under ``path``: from git when ``path`` is in a work tree (so
-    ``.gitignore`` holds), else from a walk pruning WALK_SKIP_DIRS and SKIP_SUBPATHS. Past ``deadline``
-    (``time.monotonic``) it yields ``(None, False)`` once and stops, so the caller can say the result is partial.
+    ``.gitignore`` holds; that listing may name a file deleted from the work tree, see ``_git_files``), else from a
+    walk pruning WALK_SKIP_DIRS and SKIP_SUBPATHS. Past ``deadline`` (``time.monotonic``) it yields ``(None, False)``
+    once and stops, so the caller can say the result is partial.
     ``top_only``: the entries of ``path`` itself (one directory read outside a work tree, no walk)."""
     tracked = _git_files(path)
     if tracked:  # empty: not a work tree, or a path git ignores as a whole (asked for on purpose): walk it
         files = [f for f in tracked if not SKIP_DIRS.intersection(f.split("/")[:-1]) and not _skipped_subpath(f)]
         dirs = sorted({"/".join(f.split("/")[:i]) for f in files for i in range(1, f.count("/") + 1)})
-        yield from ((f, False) for f in files if not (top_only and "/" in f))
-        yield from ((d, True) for d in dirs if not (top_only and "/" in d))
+        for entries, is_dir in ((files, False), (dirs, True)):
+            for rel in entries:
+                if time.monotonic() > deadline:
+                    yield None, False
+                    return
+                if not (top_only and "/" in rel):
+                    yield rel, is_dir
         return
     if top_only:
         with os.scandir(path) as entries:
@@ -1181,7 +1279,10 @@ def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
             timed_out = True
             break
         name = rel.rpartition("/")[2]
-        if any(basename_ok(name) and _glob_match(rel, pat) for basename_ok, pat in checks):
+        # the work tree decides on a hit the index still lists (see _git_files); a stat per listed path would not
+        if any(basename_ok(name) and _glob_match(rel, pat) for basename_ok, pat in checks) and os.path.lexists(
+            path / rel
+        ):
             found.append(rel)
             if len(found) > 4 * MAX_SEARCH_RESULTS:  # enough to cut from: the walk of a big tree stops here
                 stopped = True
@@ -1196,6 +1297,47 @@ def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
     return {"files": sorted(found), **({"note": note} if note else {})}
 
 
+#: The grep fallback treats a file with a NUL byte in its first _BINARY_SNIFF_BYTES as binary (as ripgrep does), reads
+#: in pieces of at most _GREP_PIECE_BYTES and looks at the clock every _GREP_CLOCK_BYTES: read_text of a 300 MB binary
+#: took 2.6 GB of memory and ran past the time budget.
+_BINARY_SNIFF_BYTES = 8192
+_GREP_PIECE_BYTES = 1 << 20
+_GREP_CLOCK_BYTES = 64 * 1024
+
+
+def _grep_file(fp: Path, shown: str, rx: Any, deadline: float, *, named: bool = False) -> Iterator[str | None]:
+    """``shown NUL line:text`` (see :func:`_group_by_file`) for each line of ``fp`` that ``rx`` matches, streamed, cut
+    to GREP_MAX_COLUMNS like rg's preview. A binary file found in a walk is skipped; one ``named`` on purpose gives a
+    single ``shown: binary file matches`` line, as rg says. Past ``deadline`` (``time.monotonic``) it yields None once
+    and stops. A line longer than _GREP_PIECE_BYTES is searched piece by piece under its own line number, so a match
+    across a piece edge, or an anchor at one, is approximate."""
+    with fp.open("rb") as f:
+        binary = b"\0" in f.read(_BINARY_SNIFF_BYTES)
+        if binary and not named:
+            return
+        f.seek(0)
+        number, line_start, unclocked = 0, True, 0
+        for raw in iter(lambda: f.readline(_GREP_PIECE_BYTES), b""):
+            unclocked += len(raw)
+            if unclocked >= _GREP_CLOCK_BYTES:
+                unclocked = 0
+                if time.monotonic() > deadline:
+                    yield None
+                    return
+            if line_start:  # a piece of a longer line keeps that line's number
+                number += 1
+            line_start = raw.endswith(b"\n")
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not rx.search(line):
+                continue
+            if binary:
+                yield f"{shown}: binary file matches"
+                return
+            if len(line) > GREP_MAX_COLUMNS:
+                line = line[:GREP_MAX_COLUMNS] + " [... omitted end of long line]"
+            yield f"{shown}\0{number}:{line}"
+
+
 def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: Path | None = None) -> dict[str, Any]:
     import re
 
@@ -1207,11 +1349,13 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: P
         return {"error": f"grep failed: invalid regex {pattern!r}: {e}"}
     base = base or Path.cwd()
     deadline = time.monotonic() + SEARCH_BUDGET_S
-    if path.is_file():
+    named = path.is_file()
+    if named:
         root, candidates = path.parent, iter([(path.name, False)])
     else:
         root, candidates = path, _iter_tree(path, deadline)
     matches: list[str] = []
+    skipped = 0
     timed_out = False
     for rel, is_dir in candidates:
         if rel is None or time.monotonic() > deadline:
@@ -1225,21 +1369,27 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: P
         if excludes and any(Path(fp.name).match(p) for p in excludes):
             continue
         if sensitive_path(str(fp)):  # the walk lists hidden files: dotenv files and key directories stay unread
+            skipped += 1
             continue
         try:
-            text = fp.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            for hit in _grep_file(fp, _shown(fp, base), rx, deadline, named=named):
+                if hit is None:
+                    timed_out = True
+                    break
+                matches.append(hit)
+                if len(matches) > MAX_SEARCH_RESULTS:
+                    break
+        except OSError:  # unreadable, or an index entry deleted from the work tree (see _git_files)
             continue
-        shown = _shown(fp, base)
-        matches.extend(
-            f"{shown}\0{i}:{line[:GREP_MAX_COLUMNS]}" for i, line in enumerate(text.splitlines(), 1) if rx.search(line)
-        )
-        if len(matches) > MAX_SEARCH_RESULTS:
+        if timed_out or len(matches) > MAX_SEARCH_RESULTS:
             break
     shown, note = _capped(matches)
     if timed_out:
         note = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(shown)} matching lines so far: {_NARROW}"
-    return {"matches": _group_by_file(shown), **({"warnings": note} if note else {})}
+    result: dict[str, Any] = {"matches": _group_by_file(shown), **({"warnings": note} if note else {})}
+    if skipped:
+        _note_withheld(result, f"{skipped} credential file(s) (.env, keys) not searched")
+    return result
 
 
 def _expand_braces(pattern: str) -> list[str]:
@@ -1457,7 +1607,8 @@ def build_registry() -> ToolRegistry:
         ToolSpec(
             name="write",
             description="Write a file, creating parents.\n"
-            "Limits: replaces the whole file atomically (an existing file keeps its mode); UTF-8 text only.",
+            "Limits: replaces the whole file atomically (an existing file keeps its mode); UTF-8 text only; an "
+            "existing file must be read first and unchanged since.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -1475,7 +1626,7 @@ def build_registry() -> ToolRegistry:
             name="edit",
             description="Edit a file by replacing old_string with new_string.\n"
             "Limits: old_string must match exactly once unless replace_all (whitespace-tolerant matching is a "
-            "fallback); UTF-8 files only; line endings are kept.",
+            "fallback); UTF-8 files only; line endings are kept; the file must be read first and unchanged since.",
             parameters={
                 "type": "object",
                 "properties": {

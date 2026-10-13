@@ -63,7 +63,6 @@ TIER_MODELS: dict[str, dict[str, str]] = {
     },
     "claude-cli": {"main": CLAUDE_CLI_MODEL, "strong": "opus", "cheap": "haiku", "fast": "haiku"},
 }
-MAX_MODEL_CHOICES = 15
 
 
 def detect_providers() -> dict[str, str]:
@@ -96,8 +95,8 @@ def _pick_model(p: Prompter, name: str, ids: list[str]) -> str:
         return p.text("onboard.model", "Model id for everyday work (blank = set it later)", "").strip()
     if not p.interactive:
         return str(p.raw("onboard.model", ids[0]))
-    shown = ids[:MAX_MODEL_CHOICES]
-    pick = p.select("onboard.model", f"Model for everyday work ({len(ids)} available)", [*shown, "(type one)"])
+    shown = ids[: probe.MAX_MODEL_CHOICES]
+    pick = p.select("onboard.model", f"Model for everyday work ({len(ids)} available)", ["(type one)", *shown], ids[0])
     if pick == "(type one)":
         return p.text("onboard.model.custom", "Model id", "").strip()
     return pick
@@ -141,6 +140,8 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool) -> tuple[dict[str, Any
     entry = _entry_from(Ctx(p=p, data={}), 0, "primary", spec)
     if entry is None:  # only the interactive branch of _entry_from returns None
         raise ValueError("no provider entry was built")
+    if preset == "local" and not key and not existing:
+        entry["api_key_env"] = ""  # Ollama takes no key: an empty name declares the entry keyless (#107)
     if not key and not existing and preset != "local":
         p.say(f"  NOTE: {env_name} is not set yet. Export it, or add it to {env_file_path()}.")
 

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from k3code.paths import ensure_private_dir, home, private_file, project_state_dir
+from k3code.paths import ensure_private_dir, home, main_checkout, private_file, project_state_dir
 from k3code.redact import REDACTED, scrub_text
 
 PROJECT_FILES = ("K3CODE.md", "AGENTS.md", "CLAUDE.md")  # all that exist are read, in this order
@@ -17,6 +17,8 @@ RULES_DIR = (".k3code", "rules")
 MAX_MEMORY_CHARS = 20_000  # per file, as injected into the prompt
 MAX_MEMORY_TOTAL = 40_000  # all memory files together
 MAX_IMPORT_DEPTH = 5
+MAX_IMPORT_BYTES = 1 << 20  # an @import larger than this is refused, not read
+_SNIFF_BYTES = 8192  # the start of an import checked for NUL bytes (a binary file)
 TOTAL_MARKER = "…(memory truncated: {n} more file(s) left out, the {cap}-character total is reached)"
 _IMPORT = re.compile(r"^@(\S+)$")
 _FENCE_LINE = re.compile(r"^\s*(```|~~~)")
@@ -35,6 +37,13 @@ def project_root(cwd: str | Path) -> Path:
         if (d / ".git").exists():
             return d
     return start
+
+
+def identity_root(cwd: str | Path) -> Path:
+    """The directory a project's remembered state (learned notes, stack facts) is keyed by: ``project_root``, but a
+    linked git worktree (a fan-out child's) is its main checkout. The files a session reads stay its own tree's."""
+    root = project_root(cwd)
+    return main_checkout(root) or root
 
 
 def user_memory_path() -> Path:
@@ -64,7 +73,7 @@ def clean_fact(text: str) -> str:
 
 def learned_notes_path(cwd: str | Path) -> Path:
     """``$K3CODE_HOME/projects/<key>/learned.md``: learned facts live outside the repository, never in its files."""
-    return project_state_dir(project_root(cwd)) / LEARNED_FILE
+    return project_state_dir(identity_root(cwd)) / LEARNED_FILE
 
 
 def read_learned(cwd: str | Path) -> list[str]:
@@ -102,47 +111,87 @@ def _import_target(spec: str, base: Path) -> Path:
     return p.resolve()
 
 
+@dataclass
+class _Budget:
+    left: int  # characters the expansion may still emit, shared by a file and everything it imports
+
+
+def _read_head(path: Path, chars: int) -> str:
+    """The first ``chars`` characters of ``path``'s text, reading at most 4 bytes for each (the longest a UTF-8
+    character takes), so a file of any size costs a bounded read."""
+    with path.open("rb") as f:
+        data = f.read(4 * max(chars, 0))
+    return data.decode("utf-8", errors="replace")[: max(chars, 0)]
+
+
+def _import_refusal(target: Path) -> str:
+    """Why ``target`` is not imported, or '' when it may be: a file past MAX_IMPORT_BYTES or with a NUL byte near
+    its start (a binary, not text) is never pulled into a prompt."""
+    if target.stat().st_size > MAX_IMPORT_BYTES:
+        return f"larger than {MAX_IMPORT_BYTES >> 20} MB"
+    with target.open("rb") as f:
+        return "not a text file" if b"\0" in f.read(_SNIFF_BYTES) else ""
+
+
 def expand_imports(
-    path: Path, roots: tuple[Path, ...], _stack: tuple[Path, ...] = (), _emitted: set[Path] | None = None
+    path: Path,
+    roots: tuple[Path, ...],
+    _stack: tuple[Path, ...] = (),
+    _emitted: set[Path] | None = None,
+    *,
+    max_chars: int = MAX_MEMORY_TOTAL,
+    _budget: _Budget | None = None,
 ) -> str:
     """``path``'s text with each line ``@relative/or/~/path`` replaced by that file's text (recursively).
 
     An import is resolved against the importing file's directory and must stay inside ``roots`` (the repository for
     project files, the home directory for the user's memory); a key or credential location is never read. Imports
     nest at most MAX_IMPORT_DEPTH deep and a cycle is cut. A line naming no file stays as written (``@property`` in
-    prose), and lines inside a code fence are never imports. ``_emitted`` collects the files whose text went into the
-    prompt: a file imported after it was already included (``CLAUDE.md`` holding ``@AGENTS.md`` next to AGENTS.md)
-    is not repeated.
+    prose), and lines inside a code fence are never imports. An import larger than MAX_IMPORT_BYTES or not text is
+    replaced by a marker line. ``_emitted`` collects the files whose text went into the prompt: a file imported after
+    it was already included (``CLAUDE.md`` holding ``@AGENTS.md`` next to AGENTS.md) is not repeated.
+
+    The expansion reads and emits at most ``max_chars`` + 1 characters in all, however large the files are; the
+    extra one tells the caller the text was cut.
     """
     from k3code.permissions.engine import sensitive_path
 
+    budget = _budget if _budget is not None else _Budget(max(max_chars, 0) + 1)
     resolved = path.resolve()
     stack = (*_stack, resolved)
     if _emitted is not None:
         _emitted.add(resolved)
-    text = path.read_text(encoding="utf-8", errors="replace")
     out: list[str] = []
+
+    def emit(line: str) -> None:
+        out.append(line)
+        budget.left -= len(line) + 1
+
     in_fence = False
-    for line in text.splitlines():
+    for line in _read_head(path, budget.left).splitlines():
+        if budget.left <= 0:
+            break
         if _FENCE_LINE.match(line):
             in_fence = not in_fence
         m = None if in_fence else _IMPORT.match(line.strip())
         if m is None:
-            out.append(line)
+            emit(line)
             continue
         target = _import_target(m.group(1), resolved.parent)
         if not target.is_file():
-            out.append(line)
+            emit(line)
         elif target in stack:
-            out.append(f"({line.strip()} not imported: it imports itself)")
+            emit(f"({line.strip()} not imported: it imports itself)")
         elif not _within(target, roots) or sensitive_path(str(target)):
-            out.append(f"({line.strip()} not imported: outside the allowed directories)")
+            emit(f"({line.strip()} not imported: outside the allowed directories)")
         elif len(stack) > MAX_IMPORT_DEPTH:
-            out.append(f"({line.strip()} not imported: imports nest at most {MAX_IMPORT_DEPTH} deep)")
+            emit(f"({line.strip()} not imported: imports nest at most {MAX_IMPORT_DEPTH} deep)")
         elif _emitted is not None and target in _emitted:
-            out.append(f"({line.strip()} not repeated: it is already in the instructions)")
+            emit(f"({line.strip()} not repeated: it is already in the instructions)")
+        elif why := _import_refusal(target):
+            emit(f"({line.strip()} not imported: {why})")
         else:
-            out.append(expand_imports(target, roots, stack, _emitted).rstrip("\n"))
+            out.append(expand_imports(target, roots, stack, _emitted, _budget=budget).rstrip("\n"))
     return "\n".join(out)
 
 
@@ -164,9 +213,13 @@ def _chain(root: Path, cwd: Path) -> list[Path]:
     return [*reversed([d for d in (cwd, *cwd.parents) if d == root or root in d.parents])]
 
 
-def load_memory(cwd: str | Path) -> list[MemoryFile]:
+def load_memory(cwd: str | Path, max_chars: int = MAX_MEMORY_TOTAL) -> list[MemoryFile]:
     """Existing memory files in prompt order: the user's, the project's rules, then the instruction files from the
-    repository root down to ``cwd`` (more specific, later). A file whose text another one already gave is skipped."""
+    repository root down to ``cwd`` (more specific, later). A file whose text another one already gave is skipped.
+
+    Each file's text, imports included, is cut at ``max_chars`` + 1 characters (see expand_imports): a larger file is
+    never read whole.
+    """
     root = project_root(cwd)
     candidates: list[tuple[str, Path, tuple[Path, ...]]] = []
     user = user_memory_path()
@@ -185,7 +238,7 @@ def load_memory(cwd: str | Path) -> list[MemoryFile]:
         if path.resolve() in emitted:  # an earlier file imported this one: its text is in the prompt already
             continue
         try:
-            text = expand_imports(path, roots, _emitted=emitted).strip()
+            text = expand_imports(path, roots, max_chars=max_chars, _emitted=emitted).strip()
         except OSError:
             continue
         if text and text not in seen:
@@ -222,7 +275,7 @@ def memory_prompt(
     """
     parts = []
     root = project_root(cwd)
-    files = load_memory(cwd)
+    files = load_memory(cwd, max_chars=min(limit, total))  # what a file can contribute; the rest is never read
     left = total
     for i, m in enumerate(files):
         text = m.text

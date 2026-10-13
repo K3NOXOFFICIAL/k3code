@@ -11,15 +11,41 @@ import type { Color, TextStyles } from "./styles.js";
  * downgrades to the nearest 6×6×6 cube color: rgb(215,119,87) → idx 174
  * rgb(215,135,135) — washed-out salmon.
  *
+ * Windows Terminal under WSL is the same case: the Windows launcher starts
+ * the distro with `wsl.exe`, which does not set COLORTERM, and chalk does not
+ * look at WT_SESSION, so it stops at level 2 on TERM=xterm-256color. Every
+ * terminal that can host a WSL distro (Windows Terminal, conhost, mintty,
+ * VS Code) renders 24-bit color, so WT_SESSION and WSL_DISTRO_NAME count as
+ * truecolor evidence unless COLORTERM or FORCE_COLOR says something.
+ *
  * Gated on level === 2 (not < 3) to respect NO_COLOR / FORCE_COLOR=0 —
  * those yield level 0 and are an explicit "no colors" request. Desktop VS
  * Code sets COLORTERM=truecolor itself, so this is a no-op there (already 3).
  *
- * Must run BEFORE the tmux clamp — if tmux is running inside a VS Code
- * terminal, tmux's passthrough limitation wins and we want level 2.
+ * Never inside tmux: its passthrough limitation wins and we want level 2
+ * (the tmux clamp below would undo a boost anyway).
  */
-function boostChalkLevelForXtermJs(): boolean {
-  if (process.env.TERM_PROGRAM === "vscode" && chalk.level === 2) {
+export function shouldBoostChalkLevelForTruecolorTerminal(
+  env: NodeJS.ProcessEnv = process.env,
+  level = chalk.level,
+): boolean {
+  if (level !== 2 || env.TMUX) {
+    return false;
+  }
+
+  if (env.TERM_PROGRAM === "vscode") {
+    return true;
+  }
+
+  return (
+    (env.COLORTERM ?? "").trim() === "" &&
+    !("FORCE_COLOR" in env) &&
+    Boolean(env.WT_SESSION || env.WSL_DISTRO_NAME)
+  );
+}
+
+function boostChalkLevelForTruecolorTerminal(): boolean {
+  if (shouldBoostChalkLevelForTruecolorTerminal()) {
     chalk.level = 3;
 
     return true;
@@ -117,7 +143,7 @@ function clampChalkLevelForTmux(): boolean {
 // Computed once at module load — terminal/tmux environment doesn't change mid-session.
 // Order matters: boost first; then tmux can still clamp RGB to 256.
 // Exported for debugging — tree-shaken if unused.
-export const CHALK_BOOSTED_FOR_XTERMJS = boostChalkLevelForXtermJs();
+export const CHALK_BOOSTED_FOR_XTERMJS = boostChalkLevelForTruecolorTerminal();
 export const CHALK_CLAMPED_FOR_TMUX = clampChalkLevelForTmux();
 export const CHALK_USES_RICH_EIGHT_BIT_DOWNGRADE =
   shouldUseRichEightBitDowngradeForLegacyAppleTerminal();

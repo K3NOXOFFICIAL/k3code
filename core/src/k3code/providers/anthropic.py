@@ -11,6 +11,7 @@ import httpx
 
 from k3code.providers.base import Provider, ProviderError, error_from_http, request_headers, to_provider_error
 from k3code.providers.effort import anthropic_effort
+from k3code.providers.stall import StreamWatchdog
 from k3code.providers.types import (
     Message,
     StreamEvent,
@@ -39,16 +40,23 @@ class AnthropicProvider(Provider):
         name: str,
         base_url: str = "https://api.anthropic.com",
         api_key: str,
+        keyless: bool = False,
         client: httpx.AsyncClient | None = None,
         prompt_cache: str = "auto",
         cache_ttl: str = "5m",
+        first_event_timeout: float | None = None,
+        idle_timeout: float | None = None,
     ) -> None:
         self.name = name
+        #: stall limits in seconds (see stall.py); None = the defaults for the model
+        self._first_event_timeout = first_event_timeout
+        self._idle_timeout = idle_timeout
         #: auto and on both mark cache breakpoints here (the native API supports them); off sends none
         self.prompt_cache = prompt_cache != "off"
         self.cache_ttl = cache_ttl
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.keyless = keyless  # api_key_env "": the endpoint takes no key, send no key header
         self._client = client or httpx.AsyncClient(timeout=_TIMEOUT)
         self._owns_client = client is None
 
@@ -107,11 +115,14 @@ class AnthropicProvider(Provider):
         request = self._client.build_request(
             "POST",
             self._url(),
-            headers=request_headers("anthropic", self.api_key),
+            headers=request_headers("anthropic", self.api_key, keyless=self.keyless),
             json=self._payload(messages, tools, model, max_tokens=max_tokens, temperature=temperature),
         )
+        watchdog = StreamWatchdog.for_model(
+            "anthropic", model, first_event=self._first_event_timeout, idle=self._idle_timeout
+        )
         try:
-            response = await self._client.send(request, stream=True)
+            response = await watchdog.guard(self._client.send(request, stream=True))
         except httpx.HTTPError as exc:
             raise to_provider_error(exc, kind="anthropic") from exc
         if response.status_code >= 400:
@@ -126,7 +137,7 @@ class AnthropicProvider(Provider):
             tool_blocks: dict[int, dict[str, Any]] = {}
             stop_reason: str | None = None  # message_delta.delta.stop_reason: end_turn, tool_use, max_tokens, ...
             complete = False  # message_stop arrived
-            async for line in response.aiter_lines():
+            async for line in watchdog.lines(response):
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
@@ -139,6 +150,8 @@ class AnthropicProvider(Provider):
                 etype = event.get("type")
                 if etype == "error":
                     raise _inband_error(event)  # overloaded_error etc. after a 200
+                if etype != "ping":  # a ping is the relay's keepalive, not the model's progress
+                    watchdog.progress()
                 if etype == "message_stop":
                     complete = True
                 if etype == "content_block_start":

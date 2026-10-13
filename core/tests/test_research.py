@@ -207,6 +207,90 @@ def test_extract_text_prefers_main_and_strips_noise():
     assert extract_text("<p>plain &amp; simple</p>")[1] == "plain & simple"
 
 
+def test_extract_text_keeps_code_blocks_verbatim_in_fences():
+    """Issue #99: whitespace was collapsed over the whole page, <pre> included, so code lost its indentation."""
+    code = "def main():\n    for i in range(3):\n\n        print(i)  # two  spaces\n\treturn a &lt; b\n"
+    highlighted = '<span class="k">def</span> <span class="nf">f</span>():\n    <span class="k">return</span> 1'
+    _, text = extract_text(
+        f"<p>An   example:</p><pre><code>{code}</code></pre><p>Then   this:</p><pre>{highlighted}</pre><p>End.</p>"
+    )
+    assert text == (
+        "An example:\n\n```\ndef main():\n    for i in range(3):\n\n        print(i)  # two  spaces\n"
+        "\treturn a < b\n```\n\nThen this:\n\n```\ndef f():\n    return 1\n```\n\nEnd."
+    )
+    # a highlighter that puts each line in a block keeps one line per line; <br> is a line break
+    lines = '<div class="ec-line"><div class="code">def f():</div></div><div class="ec-line">    return 1</div>'
+    assert extract_text(f"<pre><code>{lines}</code></pre>")[1] == "```\ndef f():\n    return 1\n```"
+    assert extract_text("<pre>a<br>  b</pre>")[1] == "```\na\n  b\n```"
+    # a fence inside the code (a Markdown how-to) gets a longer fence around it
+    assert extract_text("<pre>```\nrm -rf build\n```</pre>")[1] == "````\n```\nrm -rf build\n```\n````"
+
+
+def test_extract_text_keeps_link_targets_resolved_against_the_page_url():
+    """Issue #99: link targets were dropped, so the model could not follow a docs page to the next one."""
+    page = (
+        '<p>See the <a href="/docs/config">config\n   guide</a> and <a href="examples.html">examples</a>.</p>'
+        '<p>Also <a href="https://other.test/a?b=1&amp;section=2">elsewhere</a>, <a href="#top">top</a>, '
+        '<a href="javascript:void(0)">menu</a> and <a href="mailto:x@y.test">mail</a>.'
+        '<a href="/logo"><img src="logo.png"></a></p>'
+    )
+    _, text = extract_text(page, "https://site.test/guide/start.html")
+    assert text == (
+        "See the [config guide](https://site.test/docs/config) and [examples](https://site.test/guide/examples.html)."
+        "\n\nAlso [elsewhere](https://other.test/a?b=1&section=2), top, menu and mail."
+    )
+    # a <base href> changes what relative links resolve against; with no page URL they stay relative
+    base = '<base href="https://cdn.test/v2/"><a href="api.html">API</a>'
+    assert extract_text(base, "https://site.test/")[1] == "[API](https://cdn.test/v2/api.html)"
+    assert extract_text('<a href="/x">x</a>')[1] == "[x](/x)"
+
+
+def test_extract_text_renders_table_rows_as_pipe_rows():
+    """Issue #99: table cells were glued together (``timeoutint30``)."""
+    page = (
+        "<p>Options:</p><table><caption>The <b>big</b> <i>table</i></caption>"
+        "<thead><tr><th>Name</th><th>Type</th><th>Default</th></tr></thead>\n<tbody>\n"
+        '<tr class="row-odd"><td><p>timeout</p></td>\n<td><p>int</p></td>\n<td><p>30</p></td>\n</tr>\n'
+        "<tr><td>-v<td>verbose, see\n<a href='/v'>levels</a><td></tr>\n"  # the end tags of cells may be left out
+        "<td>-q</td><td>quiet</td>"  # and so may a row's start tag
+        "</tbody></table><p>After.</p>"
+    )
+    _, text = extract_text(page, "https://site.test/")
+    assert text == (
+        "Options:\n\nThe big table\n| Name | Type | Default |\n| timeout | int | 30 |\n"
+        "| -v | verbose, see [levels](https://site.test/v) | |\n| -q | quiet |\n\nAfter."
+    )
+
+
+def test_extract_text_layout_tables_and_code_in_cells_keep_their_lines():
+    """A table that lays out a page (an essay in a cell, line numbers beside code) is not flattened into one row."""
+    essay = "<p>" + " ".join(["A long paragraph."] * 60) + "</p><p>Second paragraph.</p>"
+    _, text = extract_text(f"<table><tr><td>menu</td><td>{essay}</td></tr></table>")
+    assert text.startswith("| menu |") and text.endswith("paragraph.\n\nSecond paragraph.\n |")
+    numbered = "<table><tr><td><pre>1\n2</pre></td><td><pre>def f():\n    return 1</pre></td></tr></table>"
+    assert "\n```\n1\n2\n```\n" in extract_text(numbered)[1]
+    assert "\n```\ndef f():\n    return 1\n```\n" in extract_text(numbered)[1]
+
+
+@pytest.mark.parametrize(
+    ("markup", "text"),
+    [
+        ("<p>a\0b</p>", "ab"),  # a NUL in the page cannot pose as the parser's code-block mark
+        ('<p><a href="http://[::1">bad</a> then <a href="/ok">ok</a></p>', "bad then [ok](https://s.test/ok)"),
+        ("<p>x</p><pre>  a\n    b", "x\n\n```\n  a\n    b\n```"),  # an unclosed <pre>
+        ('<a href="/1">one <a href="/2">two</a> three', "[one](https://s.test/1) [two](https://s.test/2) three"),
+        ('<a href="/c"><pre>code\n  x</pre></a>', "```\ncode\n  x\n```"),  # code in a link stays code
+        ("<pre>a<nav>b</pre></nav>c   d<pre>k\n    i</pre>", "```\na\n```\nc d\n\n```\nk\n    i\n```"),
+        (
+            "<table><tr><td>o<table><tr><td>i1</td><td>i2</td></tr></table></td><td>o2</td></tr></table>",
+            "| o | i1 | i2 | | o2 |",
+        ),
+    ],
+)
+def test_extract_text_malformed_markup_loses_no_text_and_keeps_code_apart(markup, text):
+    assert extract_text(markup, "https://s.test/")[1] == text
+
+
 def test_parse_search_text_json_and_plain():
     j = json.dumps({"results": [{"title": "X", "url": "http://x.test", "content": "c"}]})
     assert parse_search_text(j) == [Hit("X", "http://x.test", "c")]

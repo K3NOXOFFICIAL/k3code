@@ -421,3 +421,40 @@ def test_a_use_that_asks_for_a_wide_fanout_also_raises_the_sessions_parallel_lim
     coding = build_config({"usage": {"primary": "coding", "fanout_cap": 4, "plan_first": True}})
     assert coding["autonomy"] == {"plan_first": True, "fanout": {"max_parallel": 4}}  # 4 is the default already
     assert "agents" not in build_config({"usage": {"fanout_cap": 2}})["autonomy"]
+
+
+class _TierMenus(AnswerPrompter):
+    """Interactive: keeps each tier menu with the entry it preselected, and takes the preselected entry."""
+
+    interactive = True
+
+    def __init__(self) -> None:
+        super().__init__({})
+        self.menus: dict[str, tuple[list[str], str | None]] = {}
+
+    def select(self, key: str, message: str, choices: list[str], default: str | None = None) -> str:
+        self.menus[key] = (choices, default)
+        return super().select(key, message, choices, default)
+
+
+def test_tier_menus_are_capped_ranked_and_offer_type_one_first(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#122: each of the four tier menus listed every id alphabetically, with '(type one)' at the very end."""
+    from k3code.setup import probe
+    from k3code.setup.steps import Ctx, step_tiers
+
+    class _Models:
+        status_code = 200
+
+        def json(self) -> dict:
+            return {"data": [*({"id": f"01-lab/m-{n:03d}"} for n in range(300)), {"id": "openai/gpt-5"}]}
+
+    monkeypatch.setattr(probe.httpx, "get", lambda *_a, **_kw: _Models())
+    p = _TierMenus()
+    entry = {"name": "or", "kind": "openai", "base_url": "http://127.0.0.1:9/v1", "api_key_env": "OR_TEST_KEY"}
+    out = step_tiers(Ctx(p=p, data={"providers": {"entries": [entry]}}))
+    assert sorted(p.menus) == ["tiers.or.cheap", "tiers.or.fast", "tiers.or.main", "tiers.or.strong"]
+    for choices, default in p.menus.values():
+        assert choices[:3] == ["(type one)", "openai/gpt-5", "01-lab/m-000"]
+        assert len(choices) == probe.MAX_MODEL_CHOICES + 1
+        assert default == "openai/gpt-5"
+    assert out["models"]["or"] == dict.fromkeys(("main", "strong", "cheap", "fast"), "openai/gpt-5")

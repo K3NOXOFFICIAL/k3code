@@ -398,6 +398,15 @@ def _has_marker(d: Path, names: set[str] | None = None) -> bool:
     return any(_matches(d, names, m) for m in MARKERS)
 
 
+def _is_plain_dir(p: Path) -> bool:
+    """A directory that is not a symlink. An entry the filesystem refuses to stat (``pagefile.sys`` on a Windows drive
+    root under WSL) is not one: Python before 3.14 raises EACCES from ``is_dir`` there."""
+    try:
+        return p.is_dir() and not p.is_symlink()
+    except OSError:
+        return False
+
+
 def _scan_dirs(root: Path, names: set[str]) -> list[str]:
     """Relative directories to scan: ".", first-level subdirectories, workspace members (inside the root only).
 
@@ -408,7 +417,7 @@ def _scan_dirs(root: Path, names: set[str]) -> list[str]:
     for n in sorted(names):
         if n.startswith(".") or n in SKIP_DIRS:
             continue
-        if (root / n).is_dir() and not (root / n).is_symlink() and (not plain or _has_marker(root / n)):
+        if _is_plain_dir(root / n) and (not plain or _has_marker(root / n)):
             dirs.add(n)
             if plain and len(dirs) > MAX_FIRST_LEVEL_DIRS:  # "." is one of them
                 break

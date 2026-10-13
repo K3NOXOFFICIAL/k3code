@@ -99,17 +99,20 @@ def write_yaml(path: Path, data: dict[str, Any], *, backup: bool = True, keep_tr
     """Write ``data`` as YAML; the previous file is copied to ``.bak-<ts>`` first. Returns the backup.
 
     The write is atomic and keeps the file's mode; the backup keeps it too (a 0600 config has 0600 backups) and only
-    the newest ``KEEP_BACKUPS`` are kept.
+    the newest ``KEEP_BACKUPS`` are kept. A write that would not change the file's bytes makes no backup (and returns
+    None): rewriting the same config must not pile up identical ``.bak-*`` files.
 
     ``keep_trust=False`` for content someone else wrote (an imported bundle): a project config written that way is
     left untrusted until the user approves it with `k3code trust`.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+    raw = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode("utf-8")
     bak: Path | None = None
     if backup and path.is_file():
+        if path.read_bytes() == raw:
+            return None
         bak = backup_path(path)
         shutil.copy2(path, bak)
-    raw = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode("utf-8")
     if keep_trust:
         with trust.keeping_trust(path):
             replace_bytes(path, raw)

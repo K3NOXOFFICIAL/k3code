@@ -153,7 +153,7 @@ async def test_debug_dump_contains_no_secrets(tmp_path, monkeypatch):
         blob = b"".join(tar.extractfile(n).read() for n in names)
     for s in (secret, "tok-another-secret-value", "abcdefghijklmnop"):
         assert s.encode() not in blob
-    assert b"[REDACTED]" in blob
+    assert b"<redacted>" in blob
 
 
 async def test_debug_command_toggles_and_dumps(tmp_path, monkeypatch):

@@ -437,6 +437,7 @@ _NETWORK_ERROR_TYPES = frozenset(
 _TIMEOUT_ERROR_TYPES = frozenset(
     {
         "ReadTimeout",
+        "StreamStalled",
         "ConnectTimeout",
         "PoolTimeout",
         "WriteTimeout",

@@ -648,7 +648,6 @@ def test_edit_tools_ask_in_every_mode_for_code_locations(proj: Path, tool: str, 
         ".github/workflows/ci.yml",
         "src/a.py",
         "hooks/pre-commit",
-        ".gitattributes",
         "docs/.git-notes",
         ".envrc.md",
         ".husky.md",
@@ -684,10 +683,18 @@ def test_a_broad_edit_allow_rule_does_not_cover_code_locations(proj: Path, patte
     assert decide(mode="auto", tool="write", args={"path": "src/a.py"}, cwd=proj, user_rules=rules).action == "allow"
 
 
-def test_an_explicit_allow_rule_for_a_hook_path_is_honoured(proj: Path) -> None:
+def test_no_allow_rule_lifts_the_ask_for_a_hook_path_not_even_one_that_names_it(proj: Path) -> None:
+    # the branch let a rule through whose own pattern named the code location (`.husky/*`); the protected-file ask of
+    # `protected_path` overrides every allow rule (only a deny rule beats it)
     rules = [Rule(tool="edit", pattern=f"{proj}/.husky/*", action="allow")]
-    d = decide(mode="auto", tool="write", args={"path": ".husky/pre-commit"}, cwd=proj, user_rules=rules)
-    assert d.action == "allow"
+    for mode in ("default", "accept-edits", "auto", "yolo"):
+        d = decide(mode=mode, tool="write", args={"path": ".husky/pre-commit"}, cwd=proj, user_rules=rules)
+        assert (d.action, d.needs_human, d.always_ask) == ("ask", True, True), mode
+    deny = [*rules, Rule(tool="edit", pattern=f"{proj}/.husky/*", action="deny")]
+    assert (
+        decide(mode="yolo", tool="write", args={"path": ".husky/pre-commit"}, cwd=proj, user_rules=deny).action
+        == "deny"
+    )
 
 
 # ── 6. .env protection ──
@@ -1100,3 +1107,48 @@ def test_the_exact_pattern_helper_refuses_a_secret_and_the_state_writer_double_c
 )
 def test_ordinary_always_rules_are_unchanged(proj: Path, cmd: str, expected: list[str]) -> None:
     assert [r.pattern for r in suggest_rules("bash", _bash(cmd, "default", proj))] == expected
+
+
+# ── merge of the heredoc readers: a script fed to a shell, and what is left opaque ──
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "base64 -d <<'EOF' | sh\ncm0gLXJmIC8K\nEOF",  # a transformer between the heredoc and the shell
+        "cat <<'EOF' | tr a-z A-Z | sh\necho hi\nEOF",
+        "cat <<'EOF' | tee /dev/null | sh\necho hi\nEOF",
+        "base64 -d <<< cm0gLXJmIC8K | sh",
+    ],
+)
+def test_a_script_a_transforming_stage_hands_to_a_shell_needs_a_human(proj: Path, cmd: str) -> None:
+    _assert_needs_human(cmd, proj)
+
+
+@pytest.mark.parametrize(
+    "cmd", ["cat <<'EOF' | sh\necho hi\nEOF", "cat <<EOF | sudo -n bash\necho hi\nEOF", "bash <<'EOF'\necho hi\nEOF"]
+)
+def test_a_heredoc_a_shell_reads_is_its_script_and_needs_no_human(proj: Path, cmd: str) -> None:
+    assert not parse(cmd).opaque_script
+    d = _bash(cmd, "auto", proj)
+    assert d.action == "allow" and d.auto_allowed and not d.needs_human
+
+
+def test_the_parser_fallback_keeps_the_per_command_lists_in_step(proj: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def too_deep(command: str, depth: int):
+        raise RecursionError
+
+    monkeypatch.setattr(hardline, "_parse", too_deep)
+    p = parse("echo hi")
+    assert len(p.heredocs) == len(p.code_heredoc) == len(p.remote_heredoc) == len(p.sub_payloads) == len(p.subs) == 1
+    d = _bash("echo hi", "default", proj, rules=[Rule(tool="bash", pattern="echo *", action="allow")])
+    assert d.action == "ask" and d.needs_human  # nothing vouches for what could not be parsed
+
+
+@pytest.mark.parametrize(
+    "path", [".env", "sub/.env", ".npmrc", ".ssh/config", "deploy/.bashrc", "keys/authorized_keys"]
+)
+def test_edit_tools_ask_for_credential_and_startup_file_names_at_any_depth(proj: Path, path: str) -> None:
+    for mode in ("default", "accept-edits", "auto", "yolo"):
+        d = decide(mode=mode, tool="write", args={"path": path}, cwd=proj)
+        assert (d.action, d.needs_human, d.always_ask) == ("ask", True, True), (mode, path)

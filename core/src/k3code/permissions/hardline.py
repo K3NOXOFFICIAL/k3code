@@ -215,10 +215,11 @@ def check(
 
     The regexes run on the cleaned command line (comments, line continuations and heredoc bodies removed) and on every
     simple command, its normalised argv (:func:`normalize_argv`) and everything nested inside it (``$(...)``,
-    backticks, ``<(...)``, ``bash -c "..."``, ``eval``, ``ssh host "..."``, a script fed to a shell). The structural
-    checks (rm targets, git push, environment dumps, downloads fed to a shell, block devices, ``find / -delete``) run
-    on the normalised argv and the pipelines. ``cwd`` and ``home`` expand ``$PWD``, ``~`` and ``$HOME`` in rm targets
-    and resolve relative ones (also after a ``cd``); home defaults to the real one.
+    backticks, ``<(...)``, ``bash -c "..."``, ``eval``, ``ssh host "..."``, the substitutions of an unquoted heredoc
+    body and the script a heredoc, a here-string or an ``echo`` feeds to a shell). The structural checks (rm targets,
+    git push, environment dumps, downloads fed to a shell, block devices, ``find / -delete``) run on the normalised
+    argv and the pipelines. ``cwd`` and ``home`` expand ``$PWD``, ``~`` and ``$HOME`` in rm targets and resolve
+    relative ones (also after a ``cd``); home defaults to the real one.
     """
     home = home if home is not None else os.path.expanduser("~")
     parsed = parse(command)
@@ -255,40 +256,76 @@ def _check_parsed(parsed: Parsed, extra: list[str] | None, cwd: str | None, home
     return None
 
 
-_HEREDOC_START = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+#: A pending heredoc: (delimiter, ``<<-`` strips leading tabs, quoted).
+HeredocWord = tuple[str, bool, bool]
 
 
-def _read_heredoc_bodies(text: str, i: int, delims: list[str]) -> tuple[int, list[str]]:
-    """From the start of a line at ``i``, read the bodies of the pending heredocs ``delims`` (consumed): (the index
-    after them, the bodies)."""
+def _heredoc_word(text: str, i: int) -> tuple[int, HeredocWord | None]:
+    """The ``<<``/``<<-`` at ``i`` and its delimiter word, read the way bash reads it: the whole word up to a blank or
+    an operator, quotes removed; a quote or a backslash anywhere in it makes the body data (``E'OF'`` is ``EOF``,
+    quoted). Returns the index after the word, and None when the word is missing or bash versions read it differently
+    (``$'EOF'``, ``\\<newline>``, an open quote, ``$(``): the caller then cannot tell where the body ends."""
+    tabs = text.startswith("<<-", i)
+    i += 3 if tabs else 2
     n = len(text)
-    bodies: list[str] = []
+    while i < n and text[i] in " \t":
+        i += 1
+    start, word, quoted = i, [], False
+    while i < n and text[i] not in " \t\n;&|()<>":
+        c = text[i]
+        if c == "\\" and i + 1 < n and text[i + 1] != "\n":
+            word.append(text[i + 1])
+            quoted, i = True, i + 2
+        elif c in "'\"" and (j := text.find(c, i + 1)) > 0 and not (c == '"' and re.search(r"[\\$`]", text[i:j])):
+            word.append(text[i + 1 : j])
+            quoted, i = True, j + 1
+        elif c in "\\'\"`" or text.startswith(("$'", '$"', "$(", "${", "$["), i) or (c == "#" and i == start):
+            return i, None
+        else:
+            word.append(c)
+            i += 1
+    return i, (("".join(word), tabs, quoted) if i > start else None)
+
+
+def _skip_heredoc_bodies(text: str, i: int, delims: list[HeredocWord], bodies: list[str] | None = None) -> int:
+    """From the start of a line at ``i``, skip the bodies of the pending heredocs ``delims`` (consumed). A body ends at
+    the first line that is exactly its delimiter (``<<-`` strips leading tabs only); in an unquoted body a line that
+    ends in an odd number of backslashes runs on into the next before that comparison, as in bash. ``bodies``
+    collects the text of each body, without its delimiter line."""
+    n = len(text)
     while delims:
-        delim = delims.pop(0)
-        start = i
-        end = i
+        delim, tabs, quoted = delims.pop(0)
+        start = end = i
         while i < n:
-            eol = text.find("\n", i)
-            eol = n if eol < 0 else eol
-            line = text[i:eol].strip()
-            nxt = eol + 1
-            if line == delim:
-                i = nxt
+            end, line = i, ""
+            while True:
+                eol = text.find("\n", i)
+                eol = n if eol < 0 else eol
+                part, i = text[i:eol], eol + 1
+                if quoted or (len(part) - len(part.rstrip("\\"))) % 2 == 0 or i >= n:
+                    line += part
+                    break
+                line += part[:-1]
+            if (line.lstrip("\t") if tabs else line) == delim:
                 break
-            end = eol
-            i = nxt
-        bodies.append(text[start:end])
-    return i, bodies
+        else:
+            end = n  # no delimiter line: the body runs to the end of the text
+        if bodies is not None:
+            bodies.append(text[start:end])
+    return i
 
 
-def _skip_heredoc_bodies(text: str, i: int, delims: list[str]) -> int:
-    """From the start of a line at ``i``, skip the bodies of the pending heredocs ``delims`` (consumed)."""
-    return _read_heredoc_bodies(text, i, delims)[0]
+def _subst_payload(text: str, at: int, end: int) -> str:
+    """The payload of the ``$(``/``<(``/``>(`` at ``at`` that closes at ``end``. ``$((...))`` is arithmetic: its payload
+    is the ``((...))`` command it equals, where a ``<<`` is a shift."""
+    return text[at + 1 : end + 1] if text.startswith("$((", at) else text[at + 2 : end]
 
 
-def _body_payloads(body: str) -> list[str]:
-    """The ``$(...)`` and backtick payloads in the body of an unquoted heredoc: the shell runs them when it builds the
-    text. An unclosed one is returned from its opener on, so that parsing it reports it."""
+def _body_payloads(body: str) -> tuple[list[str], bool]:
+    """The ``$(...)`` and backtick payloads of an unquoted heredoc body (the shell runs them), and whether one is
+    unterminated. Quotes mean nothing in a body, a backslash escapes the next character (``\\$(x)`` is text) and
+    ``\\<newline>`` is removed, as on the command line (``$\\<newline>(x)`` runs)."""
+    body = re.sub(r"\\([\s\S])", lambda m: "" if m.group(1) == "\n" else m.group(0), body)
     out: list[str] = []
     i, n = 0, len(body)
     while i < n:
@@ -298,20 +335,20 @@ def _body_payloads(body: str) -> list[str]:
         elif body.startswith("$(", i):
             end = _match_paren(body, i + 1)
             if end < 0:
-                out.append(body[i:])
-                break
-            out.append(body[i + 2 : end])
+                return [*out, body[i + 2 :]], True
+            out.append(_subst_payload(body, i, end))
             i = end + 1
         elif c == "`":
-            end = body.find("`", i + 1)
-            if end < 0:
-                out.append(body[i:])
-                break
-            out.append(body[i + 1 : end])
-            i = end + 1
+            j = i + 1
+            while j < n and body[j] != "`":
+                j += 2 if body[j] == "\\" else 1
+            if j >= n:
+                return [*out, body[i + 1 :]], True
+            out.append(body[i + 1 : j])
+            i = j + 1
         else:
             i += 1
-    return out
+    return out, False
 
 
 @functools.lru_cache(maxsize=256)
@@ -1457,6 +1494,16 @@ def risky(parsed: Parsed) -> str | None:
 
 
 @dataclass
+class Heredoc:
+    """A heredoc fed to a command. Its body is data when the delimiter is quoted; an unquoted body is expanded by the
+    shell, so the ``$(...)`` and backtick ``payloads`` in it run."""
+
+    body: str
+    quoted: bool
+    payloads: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Parsed:
     """A shell command line taken apart: the top-level simple commands and everything nested inside them."""
 
@@ -1468,13 +1515,21 @@ class Parsed:
     comment_quote: bool = False
     pipelines: list[list[str]] = field(default_factory=list)  # the subs grouped by | and |&
     clean: str = ""  # the line without comments, line continuations and heredoc bodies (what the regexes see)
-    sub_payloads: list[list[str]] = field(default_factory=list)  # $(...)/`...`/<(...) payloads per sub
+    #: $(...)/`...`/<(...) payloads per sub, those of its unquoted heredoc bodies included
+    sub_payloads: list[list[str]] = field(default_factory=list)
+    heredocs: list[list[Heredoc]] = field(default_factory=list)  # per sub: the heredocs fed to it
+    #: per sub: "shell" or "other" when an interpreter runs a heredoc fed to it as its program, the sub itself
+    #: (``bash <<EOF``) or a later stage of its pipeline (``cat <<EOF | sh``); "" otherwise
+    code_heredoc: list[str] = field(default_factory=list)
+    #: per sub: the ``ssh host`` stages of its pipeline that run a heredoc fed to it as a script on that host
+    remote_heredoc: list[list[str]] = field(default_factory=list)
+    open_heredoc: bool = False  # a heredoc with no line after it to start its body
+    open_bracket: bool = False  # a ${, [, a=( ... still open at the end (see _scan)
     children: list[Parsed] = field(default_factory=list)  # the parsed payloads
     #: nesting past the parse limit: what is inside was not parsed (``unterminated`` is set too)
     too_deep: bool = False
     #: a shell reads a script from a pipe or file that is not on the command line: why it cannot be checked ("" if not)
     opaque_script: str = ""
-    heredocs: list[tuple[int, bool, str]] = field(default_factory=list)  # (sub index, delimiter quoted, body)
     #: parsed from a quoted argument of an awk / sed / python / find ... command: looked at like shell code (a denied
     #: command cannot hide there) but it is most likely no shell code, so needs_human does not judge it
     script: bool = False
@@ -1483,11 +1538,17 @@ class Parsed:
     legacy_subs: list[str] = field(default_factory=list)
 
 
-def _match_paren(text: str, open_idx: int) -> int:
+_LINE_END = re.compile(r"[ \t]*(?:\n|$)")
+
+
+def _match_paren(text: str, open_idx: int, arith: bool | None = None) -> int:
     """Index of the ``)`` that closes the ``(`` at ``open_idx`` (quote, escape, comment and heredoc aware); -1 when
-    unbalanced."""
+    unbalanced. In arithmetic (``arith``; by default when the text there is ``((``) a ``<<`` is a shift and a ``#``
+    starts no comment."""
     depth, i, n = 0, open_idx, len(text)
-    heredocs: list[str] = []
+    heredocs: list[HeredocWord] = []
+    if arith is None:
+        arith = text.startswith("((", open_idx)  # $((...)): a << in it is a shift
     while i < n:
         c = text[i]
         if c == "\\":
@@ -1510,15 +1571,16 @@ def _match_paren(text: str, open_idx: int) -> int:
         if text.startswith("<<<", i):
             i += 3
             continue
-        m = _HEREDOC_START.match(text, i) if c == "<" else None
-        if m:
-            heredocs.append(m.group(2))
-            i = m.end()
+        if text.startswith("<<", i) and not arith:
+            i, heredoc = _heredoc_word(text, i)
+            if heredoc is None:
+                return -1  # where the body ends is unknown
+            heredocs.append(heredoc)
             continue
         if c == "\n" and heredocs:
             i = _skip_heredoc_bodies(text, i + 1, heredocs)
             continue
-        if c == "#" and i > open_idx + 1 and text[i - 1] in " \t\n;&|()<>":
+        if c == "#" and not arith and i > open_idx + 1 and text[i - 1] in " \t\n;&|()<>":
             eol = text.find("\n", i)
             i = n if eol < 0 else eol
             continue
@@ -1532,6 +1594,13 @@ def _match_paren(text: str, open_idx: int) -> int:
     return -1
 
 
+def _arith_end(text: str, i: int) -> int:
+    """Index of the last ``)`` of the arithmetic command ``((...))`` at ``i``, where ``<<`` is a shift, or -1 when it
+    is not one: as in bash, the inner ``(`` must close right before a ``)`` (``((a) )`` is two subshells)."""
+    inner = _match_paren(text, i + 1, arith=True)
+    return inner + 1 if inner > 0 and text.startswith(")", inner + 1) else -1
+
+
 #: How many ``$(...)`` levels _scan follows before it stops looking inside (the call stack is finite).
 _MAX_SCAN_NEST = 48
 
@@ -1539,14 +1608,23 @@ _MAX_SCAN_NEST = 48
 def _scan(text: str, _nest: int = 0) -> Parsed:
     """Quote-aware split into simple commands and pipelines, plus the payloads of the substitutions found on the way.
     ``#`` starts a comment only at the start of a word outside quotes; ``\\<newline>`` joins lines; ``<<`` starts a
-    heredoc only outside quotes (its body is data, not commands; an unquoted heredoc still runs the ``$(...)`` in it,
-    and a shell reading one runs the body: see _stdin_scripts)."""
+    heredoc only outside quotes and outside an open ``((...))``, ``${...}``, ``$[...]``, ``[...]`` or ``a=(...)``,
+    however far back it opened (its body is not commands; the substitutions in an unquoted body are payloads of the
+    command it is fed to; a shell reading one runs the body: see _code_heredocs). In ``((...))`` a ``<<`` is a shift;
+    one that bash may not read as a heredoc, or whose body end bash may see elsewhere (in the other brackets, an odd
+    delimiter word), makes the command unterminated and the next lines stay commands."""
     out = Parsed()
     cur: list[str] = []
     cur_payloads: list[str] = []
     clean: list[str] = []
     pipe: list[str] = []
-    heredocs: list[tuple[str, bool, int]] = []  # pending: (delimiter, quoted, index of the sub that opened it)
+    heredocs: list[HeredocWord] = []  # the heredocs started on this line
+    heredoc_info: list[tuple[bool, int]] = []  # per delimiter: quoted, index of the sub it is fed to
+    # the open brackets, innermost last: "((" (with the index of its last ")"), "${", "{" (inside "${"), "[" (also for
+    # "$["), "=(" and "=(!" (an a=(...) with an operator in it), "$(" (a substitution whose payload ends in an open
+    # bracket); the last two never close. A closer that does not match the innermost is ignored, so an unsure bracket
+    # stays open: a << then needs a person instead of hiding the next lines
+    ctx: list[tuple[str, int]] = []
     i, n = 0, len(text)
 
     def emit(s: str) -> None:
@@ -1559,6 +1637,7 @@ def _scan(text: str, _nest: int = 0) -> Parsed:
         if part:
             out.subs.append(part)
             out.sub_payloads.append(list(cur_payloads))
+            out.heredocs.append([])
             pipe.append(part)
         elif piped and not pipe and out.pipelines:
             pipe = out.pipelines.pop()  # `(a) | b`: the subshell feeds b
@@ -1575,12 +1654,21 @@ def _scan(text: str, _nest: int = 0) -> Parsed:
         if end < 0:
             out.unterminated = True
             end = n
-        payload = text[at + open_len : end]
+        payload = _subst_payload(text, at, end)
         cur_payloads.append(payload)
         if _nest >= _MAX_SCAN_NEST:  # not followed: the payload is never checked, so this needs a person
             out.unterminated = out.too_deep = True
             return end + 1, text[at : end + 1]
-        return end + 1, text[at : at + open_len] + _scan(payload, _nest + 1).clean.strip() + ")"
+        inner = _scan(payload, _nest + 1)
+        if inner.too_deep:
+            out.unterminated = out.too_deep = True
+        # `$(cat <<EOF)`: bash reads the body from the lines after the substitution
+        out.unterminated = out.unterminated or inner.open_heredoc
+        if inner.open_bracket:
+            # `$(a[)...`: bash reads on past a ) in a bracket, so where the substitution ends is unsure
+            out.unterminated = True
+            ctx.append(("$(", -1))
+        return end + 1, text[at : at + open_len] + inner.clean.strip() + ")"
 
     def backtick(at: int) -> tuple[int, str]:
         end = text.find("`", at + 1)
@@ -1588,10 +1676,15 @@ def _scan(text: str, _nest: int = 0) -> Parsed:
             out.unterminated = True
             end = n
         cur_payloads.append(text[at + 1 : end])
+        out.unterminated = out.unterminated or _scan(text[at + 1 : end], _nest + 1).open_heredoc
         return end + 1, text[at : end + 1]
 
     while i < n:
+        while ctx and ctx[-1][0] == "((" and i > ctx[-1][1]:
+            ctx.pop()  # past the )) of an arithmetic command
         c = text[i]
+        if ctx and ctx[-1][0] == "=(" and (c in ";|&" or (c in "<>" and text[i + 1 : i + 2] != "(")):
+            ctx[-1] = ("=(!", -1)  # an operator in a=(...): bash drops the rest of the line, heredocs included
         if c == "\\" and i + 1 < n:
             if text[i + 1] != "\n":  # \<newline> is a line continuation: both go
                 emit(text[i : i + 2])
@@ -1638,19 +1731,40 @@ def _scan(text: str, _nest: int = 0) -> Parsed:
         elif text.startswith(("$(", "<(", ">("), i):
             i, s = subst(i, 2)
             emit(s)
+        elif text.startswith(("${", "$["), i):
+            ctx.append(("${" if text[i + 1] == "{" else "[", -1))
+            emit(text[i : i + 2])
+            i += 2
+        elif c in "[]{}":
+            top = ctx[-1][0] if ctx else ""
+            if c == "[" or (c == "{" and top in ("${", "{")):  # a bare { opens nothing outside ${...}
+                ctx.append((c, -1))
+            elif (c == "]" and top == "[") or (c == "}" and top in ("${", "{")):
+                ctx.pop()
+            emit(c)
+            i += 1
         elif c == "`":
             i, s = backtick(i)
             emit(s)
         elif text.startswith("<<<", i):
             emit("<<<")
             i += 3
+        elif text.startswith("<<", i) and ctx:
+            # in ((...)) a shift; in the other brackets bash reads no heredoc either (or fails on the line), but where
+            # its word or line ends is unsure, and so is a shift at the end of a line (a heredoc with no word outside)
+            if any(kind != "((" for kind, _ in ctx) or _LINE_END.match(text, i + 2):
+                out.unterminated = True
+            emit("<<")
+            i += 2
         elif text.startswith("<<", i):
-            m = _HEREDOC_START.match(text, i)
-            if m:
-                heredocs.append((m.group(2), bool(m.group(1)), len(out.subs)))
-                emit(m.group(0))
-                i = m.end()
+            end, heredoc = _heredoc_word(text, i)
+            if heredoc:
+                heredocs.append(heredoc)
+                heredoc_info.append((heredoc[2], len(out.subs)))  # the sub being built gets this index
+                emit(text[i:end])
+                i = end
             else:
+                out.unterminated = True
                 emit("<<")
                 i += 2
         elif text.startswith(">|", i):  # the noclobber override is a redirection, not a pipe
@@ -1658,12 +1772,20 @@ def _scan(text: str, _nest: int = 0) -> Parsed:
             i += 2
         elif c == "\n":
             flush("\n")
-            i, bodies = _read_heredoc_bodies(text, i + 1, [h[0] for h in heredocs])
-            for (_, quoted, idx), body in zip(heredocs, bodies, strict=True):
-                out.heredocs.append((idx, quoted, body))
-                if not quoted and idx < len(out.sub_payloads):  # the shell expands an unquoted body
-                    out.sub_payloads[idx].extend(_body_payloads(body))
-            heredocs.clear()
+            if heredocs and ctx:
+                # `cat <<EOF ${x:-<newline>...}`: bash reads the body after the line the bracket closes on; the next
+                # lines stay commands
+                out.unterminated = True
+                heredocs.clear()
+                heredoc_info.clear()
+            bodies: list[str] = []
+            i = _skip_heredoc_bodies(text, i + 1, heredocs, bodies)
+            for (quoted, k), body in zip(heredoc_info, bodies, strict=True):
+                payloads, open_ = ([], False) if quoted else _body_payloads(body)
+                out.heredocs[k].append(Heredoc(body, quoted, payloads))
+                out.sub_payloads[k].extend(payloads)
+                out.unterminated = out.unterminated or open_
+            heredoc_info.clear()
         elif text[i : i + 2] in ("&&", "||"):
             flush(text[i : i + 2])
             i += 2
@@ -1685,33 +1807,105 @@ def _scan(text: str, _nest: int = 0) -> Parsed:
                 flush("&")  # a lone & backgrounds the command; what follows is another command
             i += 1
         elif c in "()":
+            top = ctx[-1][0] if ctx else ""
+            if c == "(":
+                if top == "=(":
+                    ctx[-1] = ("=(!", -1)
+                elif cur and cur[-1] == "=":
+                    ctx.append(("=(", -1))  # a=(...), also a=((...)): no arithmetic
+                elif top != "((" and text.startswith("((", i) and (end := _arith_end(text, i)) > 0:
+                    ctx.append(("((", end))
+            elif top == "=(":
+                ctx.pop()
             flush(c)
             i += 1
         else:
             emit(c)
             i += 1
     flush("")
+    out.open_heredoc = bool(heredocs)
+    out.open_bracket = any(kind != "((" or end >= n for kind, end in ctx)
     out.clean = "".join(clean)
+    out.code_heredoc, out.remote_heredoc = _code_heredocs(out)
     return out
 
 
-def _ssh_remote_command(args: list[str]) -> str:
-    """The remote command of ``ssh`` ``args``: everything after the host, joined (``ssh host rm -rf /``)."""
-    short_val = SSH_VALUE_OPTS["ssh"]
-    i = 0
+_REDIRECT_WORD = re.compile(r"(?:\d*|&)(?:<<?<?|>>?|<>|[<>]&)")
+
+
+def _without_redirects(words: list[str]) -> list[str]:
+    """``words`` without the redirections (``<<EOF``, ``2>&1``, ``> out``, ``<<< text``): a redirect is not the script
+    operand of ``bash <<EOF``."""
+    out: list[str] = []
+    skip = False
+    for word in words:
+        if skip:
+            skip = False
+            continue
+        m = _REDIRECT_WORD.match(word)
+        if m:
+            skip = m.end() == len(word)  # a lone operator takes the next word as its target
+        else:
+            out.append(word)
+    return out
+
+
+def _ssh_command(args: list[str]) -> list[str]:
+    """The remote command of ``ssh`` with arguments ``args`` ([] when there is none). Like ssh: options also after the
+    host name, ``--`` ends them."""
+    host, i = False, 0
     while i < len(args):
         a = args[i]
         i += 1
         if a == "--":
-            i += 1  # the host
-            break
-        if not a.startswith("-"):
-            break  # the host
-        for k, ch in enumerate(a[1:], 1):
-            if ch in short_val:
-                i += 0 if a[k + 1 :] else 1
-                break
-    return " ".join(args[i:])
+            return args[i:] if host else args[i + 1 :]
+        if a.startswith("-") and len(a) > 1:
+            for k, ch in enumerate(a[1:], 1):
+                if ch in SSH_VALUE_OPTS["ssh"]:
+                    i += 0 if a[k + 1 :] else 1
+                    break
+        elif host:
+            return args[i - 1 :]
+        else:
+            host = True
+    return []
+
+
+def _stdin_program(stage: str) -> str:
+    """ "shell" or "other" when ``stage`` is an interpreter that executes its stdin as a program (``bash``,
+    ``python3 -``, ``sudo sh -s``, ``ssh host`` with no command: the remote login shell), else ""."""
+    argv = normalize_argv(_without_redirects(_tokens(stage)))
+    if argv[:1] == ["ssh"]:
+        remote = _ssh_command(argv[1:])
+        return _stdin_program(" ".join(remote)) if remote else "shell"
+    if not (argv and _is_interpreter(argv[0]) and _runs_stdin_as_code(argv)):
+        return ""
+    return "shell" if argv[0] in _SHELLS or argv[0] in ("source", ".") else "other"
+
+
+def _code_heredocs(parsed: Parsed) -> tuple[list[str], list[list[str]]]:
+    """Per sub: what runs a heredoc fed to it as a program, the sub itself or a later stage of its pipeline, and the
+    ssh stages among them (see Parsed.code_heredoc, Parsed.remote_heredoc)."""
+    out = [""] * len(parsed.subs)
+    remote: list[list[str]] = [[] for _ in parsed.subs]
+    if not any(parsed.heredocs):
+        return out, remote
+    base = 0  # the pipelines list the subs in order
+    for stages in parsed.pipelines:
+        runs = [_stdin_program(s) for s in stages]
+        argvs = [normalize_argv(_without_redirects(_tokens(s))) for s in stages]
+        ssh = [shlex.join(a) if a[:1] == ["ssh"] and r == "shell" else "" for a, r in zip(argvs, runs, strict=True)]
+        for k in range(len(stages)):
+            if parsed.heredocs[base + k]:
+                out[base + k] = "shell" if "shell" in runs[k:] else next((r for r in runs[k:] if r), "")
+                remote[base + k] = [s for s in ssh[k:] if s]
+        base += len(stages)
+    return out, remote
+
+
+def _ssh_remote_command(args: list[str]) -> str:
+    """The remote command of ``ssh`` ``args``: everything after the host, joined (``ssh host rm -rf /``)."""
+    return " ".join(_ssh_command(args))
 
 
 #: Commands whose quoted arguments are shell code (the others in LAUNCHERS only take a script or a pattern there).
@@ -1792,38 +1986,54 @@ def _literal_output(stage: str, env: dict[str, list[str]]) -> list[str] | None:
     return [t for t in dict.fromkeys([*texts, *decoded]) if t.strip()]
 
 
+#: Stages that print their stdin unchanged (a ``cat <<EOF`` in front of a shell hands it the body as written).
+_PASSTHROUGH = {"cat": frozenset({"-"}), "tee": frozenset({"-", "-a", "-i", "/dev/null"})}
+
+
+def _passthrough(stage: str) -> bool:
+    argv = normalize_argv(_tokens(strip_redirects(stage)))
+    return bool(argv) and argv[0] in _PASSTHROUGH and set(argv[1:]) <= _PASSTHROUGH[argv[0]]
+
+
 def _stdin_scripts(parsed: Parsed) -> list[str]:
-    """The scripts a shell is fed on stdin that can be read off the command line: a heredoc body, a here-string, or
-    what the previous stage of the pipeline ``echo``/``printf``s. Anything else (``cat x | sh``, ``base64 -d | bash``,
-    ``sh < file``) is a script that is not on the command line: ``parsed.opaque_script`` says so."""
+    """The scripts a shell is fed on stdin that can be read off the command line: a here-string, or what the previous
+    stage of the pipeline ``echo``/``printf``s. (The body of a heredoc a shell runs is parsed as a script by
+    :func:`_parse`, see Parsed.code_heredoc; so is one a ``cat <<EOF`` hands to it down the pipe.) Anything else
+    (``cat x | sh``, ``base64 -d | bash``, ``sh < file``, ``base64 -d <<EOF | sh``) is a script that is not on the
+    command line: ``parsed.opaque_script`` says so."""
     why = "a shell reads a script that is not on the command line (a pipe or a file feeds it)"
     env = assignments(parsed)
     scripts: list[str] = []
-    bodies: dict[int, list[str]] = {}
-    for idx, _quoted, body in parsed.heredocs:
-        bodies.setdefault(idx, []).append(body)
-    producers: dict[str, list[str]] = {}
+    feeder: dict[int, int] = {}  # sub index -> index of the previous stage of its pipeline
+    base = 0  # the pipelines list the subs in order
     for stages in parsed.pipelines:
-        for j in range(1, len(stages)):
-            producers.setdefault(stages[j], []).append(stages[j - 1])
+        feeder.update({base + j: base + j - 1 for j in range(1, len(stages))})
+        base += len(stages)
+    mapped = base == len(parsed.subs)
     for k, sub in enumerate(parsed.subs):
         argv = normalize_argv(_tokens(strip_redirects(sub)))
         if not argv or argv[0] not in _SHELLS or not _runs_stdin_as_code(argv):
             continue
-        scripts += bodies.get(k, [])
         words = [" ".join(_tokens(m.group(1))) for m in _HERESTRING.finditer(sub)]
         scripts += words
         files = [f for f in _STDIN_FILE.findall(sub) if f != "/dev/null"]
         if files:
             parsed.opaque_script = why
-        if bodies.get(k) or words or files:
+        if parsed.heredocs[k] and parsed.code_heredoc[k] != "shell":
+            scripts += [h.body for h in parsed.heredocs[k]]  # not marked as a program: still look at the body
+        if parsed.heredocs[k] or words or files:
+            continue  # a heredoc fed to this shell is its script, see above
+        if not mapped:
+            parsed.opaque_script = why  # the pipelines do not line up with the commands: the producer is unknown
             continue
-        for producer in producers.get(sub, []):
-            texts = _literal_output(producer, env)
-            if texts is None:
-                parsed.opaque_script = why
-            else:
-                scripts += texts
+        if k not in feeder:
+            continue
+        producer = feeder[k]
+        texts = _literal_output(parsed.subs[producer], env)
+        if texts is not None:
+            scripts += texts
+        elif not (parsed.heredocs[producer] and _passthrough(parsed.subs[producer])):
+            parsed.opaque_script = why
     return scripts
 
 
@@ -1837,7 +2047,15 @@ def parse(command: str, _depth: int = 0) -> Parsed:
     except RecursionError:  # the stack ran out before the limit did: nothing below was checked
         text = command.strip()
         return Parsed(
-            subs=[text], unterminated=True, too_deep=True, pipelines=[[text]], clean=command, sub_payloads=[[]]
+            subs=[text],
+            unterminated=True,
+            too_deep=True,
+            pipelines=[[text]],
+            clean=command,
+            sub_payloads=[[]],
+            heredocs=[[]],  # one entry per sub in each of these, as _scan keeps them
+            code_heredoc=[""],
+            remote_heredoc=[[]],
         )
 
 
@@ -1856,7 +2074,11 @@ def _parse(command: str, depth: int) -> Parsed:
         legacy = _scan(command.replace(">|", "> |"))
         parsed.legacy_subs = legacy.subs
         payloads.append((command.replace(">|", "> |"), True))
-    if payloads and depth >= _MAX_DEPTH:  # cut off: what is inside is not checked, so a person has to decide
+    # a heredoc a shell runs is its script (`bash <<'EOF'`, `cat <<EOF | sh`): checked like `bash -c "..."`, except for
+    # its quotes (a stray one in a comment of a long script is not worth a prompt). The program of another
+    # interpreter is not shell: such a heredoc is only kept out of the allowlist (see engine._decide_bash).
+    scripts = [(k, h.body) for k, hs in enumerate(parsed.heredocs) if parsed.code_heredoc[k] == "shell" for h in hs]
+    if (payloads or scripts) and depth >= _MAX_DEPTH:  # cut off: what is inside is not checked, so a person decides
         parsed.unterminated = parsed.too_deep = True
         return parsed
     for payload, is_script in payloads:
@@ -1868,6 +2090,17 @@ def _parse(command: str, depth: int) -> Parsed:
         parsed.comment_quote = parsed.comment_quote or inner.comment_quote
         parsed.too_deep = parsed.too_deep or inner.too_deep
         parsed.opaque_script = parsed.opaque_script or inner.opaque_script
+    for k, body in scripts:
+        inner = _parse(body, depth + 1)
+        parsed.children.append(inner)
+        parsed.nested.extend([*inner.subs, *inner.nested])
+        if inner.too_deep:
+            parsed.unterminated = parsed.too_deep = True
+        parsed.opaque_script = parsed.opaque_script or inner.opaque_script
+        # `ssh host <<EOF` runs the body on host: each command is also checked as `ssh host '<command>'`, the
+        # spelling the rules about remote hosts match
+        remote = [*inner.subs, *inner.nested]
+        parsed.children += [_scan(f"{ssh} {shlex.quote(c)}") for ssh in parsed.remote_heredoc[k] for c in remote]
     return parsed
 
 

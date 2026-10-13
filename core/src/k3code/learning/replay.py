@@ -24,8 +24,10 @@ from pathlib import Path
 from typing import Any
 
 from k3code.learning.fsutil import write_text_atomic
+from k3code.paths import ensure_private_dir, private_file
 from k3code.providers.fake import FakeProvider
 from k3code.providers.types import Message
+from k3code.skills import PROMPT_LIMIT
 from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_for_model
 
 RECORD_PARTS = ("learning", "replay", "turns.jsonl")
@@ -65,12 +67,14 @@ class ReplayStore:
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         if len(line) > MAX_RECORD_CHARS:
             return False
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as f:
+        ensure_private_dir(self.path.parent)
+        with private_file(self.path).open("a", encoding="utf-8") as f:
             f.write(line + "\n")
         if self.path.stat().st_size > MAX_FILE_BYTES:
             lines = self.path.read_text(encoding="utf-8", errors="replace").splitlines()
-            write_text_atomic(self.path, "\n".join(lines[len(lines) // 2 :]) + "\n")  # never truncated first
+            write_text_atomic(
+                self.path, "\n".join(lines[len(lines) // 2 :]) + "\n", private=True
+            )  # 0600, never cut first
         return True
 
     def load(self, limit: int | None = None) -> list[dict[str, Any]]:
@@ -310,7 +314,7 @@ async def token_candidates(context: dict[str, Any], turns: list[dict[str, Any]])
     turns = turns[-MAX_REPLAY_TURNS:]
     now_clip = int(context.get("tool_output_chars", 10_000))
     now_memory = int(context.get("memory_chars", 20_000))
-    now_skills = int(context.get("skill_prompt_limit", 60))
+    now_skills = int(context.get("skill_prompt_limit", PROMPT_LIMIT))
     specs: list[tuple[Candidate, dict[str, Any], str]] = []
     if now_clip > TOOL_CLIP_CANDIDATE:
         specs.append(

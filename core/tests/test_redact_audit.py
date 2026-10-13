@@ -203,3 +203,27 @@ def test_the_curl_password_scrub_is_linear() -> None:
     assert time.perf_counter() - started < 1.0
     assert "hunter22" not in scrub_text('curl -u "admin:hunter22" https://x')  # quoted forms still masked
     assert "hunter22" not in scrub_text("curl -u 'admin:a:hunter22' https://x")
+
+
+@pytest.mark.parametrize(
+    "rule",
+    ["curl -u *:* *", "curl --user *:*", "mysql -p* -h *", "sshpass -p * ssh *", "curl -u user:?? *"],
+)
+def test_a_glob_only_command_line_password_is_a_pattern_not_a_credential(rule: str) -> None:
+    # a deny rule exported with a glob where the password sits must still match after an import
+    assert scrub_text(rule) == rule
+    assert redact({"permissions": {"bash": {rule: "deny"}}}) == {"permissions": {"bash": {rule: "deny"}}}
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("curl -u admin:hunter22pw https://x", "hunter22pw"),
+        ("curl -u 'admin:*hunter22pw' https://x", "hunter22pw"),
+        ("mysql -h db -phunter22pw", "hunter22pw"),
+        ("sshpass -p hunter22pw ssh host", "hunter22pw"),
+        ("curl https://x/?code=hunter22pwcode", "hunter22pwcode"),
+    ],
+)
+def test_a_command_line_password_that_is_not_only_glob_characters_is_still_hidden(text: str, secret: str) -> None:
+    assert secret not in scrub_text(text)

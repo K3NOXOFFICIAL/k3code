@@ -30,6 +30,7 @@ from k3code.learning import (
 from k3code.learning.decisions import DecisionLog, project_id
 from k3code.learning.fsutil import encodable, write_text_atomic
 from k3code.learning.updateconfig import merge_patch
+from k3code.paths import ensure_private_dir
 from k3code.redact import scrub_text
 
 logger = logging.getLogger(__name__)
@@ -107,7 +108,8 @@ class LearningHub:
         return data if isinstance(data, dict) else {}
 
     def _set_state(self, **kv: Any) -> None:
-        write_text_atomic(self._state_path, json.dumps({**self._state(), **kv}))
+        ensure_private_dir(self._state_path.parent)
+        write_text_atomic(self._state_path, json.dumps({**self._state(), **kv}), private=True)
 
     def spawn(self, coro: Any) -> None:
         task = asyncio.get_running_loop().create_task(coro)
@@ -230,6 +232,8 @@ class LearningHub:
         else the user-level one, else the working retry recorded on an earlier row in the window (``hint``). Small
         file reads, no model call."""
         pid = self.log.project_for(cwd)  # cached per cwd
+        if self._gotcha_dismissed(pid, tool, sig):
+            return None
         for path in (gotchas.gotchas_path(pid, self.home), gotchas.auto_gotchas_path(pid, self.home)):
             if (known := gotchas.lesson(path, tool, sig)) is not None:
                 return gotchas.reminder(tool, sig, known)
@@ -241,6 +245,8 @@ class LearningHub:
         """Learn or propose a gotcha for a recurring signature; returns the working retry seen for it in the window
         (its hint), or ""."""
         pid = self.log.project_for(cwd)
+        if self._gotcha_dismissed(pid, tool, sig):
+            return ""
         rows = [
             r
             for r in self.log.query("tool_error", project=pid, since=self.clock() - gotchas.WINDOW, actor=None)
@@ -268,10 +274,18 @@ class LearningHub:
             session.session_id,
             payload={"project": pid, "line": line},
             project=pid,
-            key=dedup_key("project_gotcha", f"{pid} {tool} {sig}"),
+            key=self._gotcha_key(pid, tool, sig),
         )
         if p is not None:
             self.emit(session, [p])
+
+    @staticmethod
+    def _gotcha_key(pid: str, tool: str, sig: str) -> str:
+        return dedup_key("project_gotcha", f"{pid} {tool} {sig}")
+
+    def _gotcha_dismissed(self, pid: str, tool: str, sig: str) -> bool:
+        """Whether the card for this signature was dismissed: it is then neither reminded nor learned again."""
+        return self.store.dismissed(self._gotcha_key(pid, tool, sig))
 
     def _auto_gotcha(self, session: Any, pid: str, tool: str, sig: str, hint: str, line: str) -> None:
         """Note a self-verified gotcha (a retry worked) for the in-turn reminders, propose its card and tell the
@@ -349,6 +363,10 @@ class LearningHub:
         return made
 
     def decide(self, p: Proposal, choice: str, session: Any = None) -> None:
+        if choice == "dismiss" and p.kind == "project_gotcha" and p.payload.get("project") and p.payload.get("line"):
+            # the card's line was also noted for reminders (``_auto_gotcha``): dismissing it forgets that line too
+            auto = gotchas.auto_gotchas_path(str(p.payload["project"]), self.home)
+            gotchas.remove_gotcha(auto, str(p.payload["line"]))
         self.record(
             "proposal",
             session,
@@ -501,8 +519,9 @@ class LearningHub:
             cwd = session.perms.cwd
             ctx = self.server.config.context or {}
             tok_in, tok_out = self.server.usage.turn_tokens(turn_id) if turn_id else (0, 0)
-            skill_limit = int(ctx.get("skill_prompt_limit", PROMPT_LIMIT))  # the limit the system prompt is built with
-            skill_text = skills_prompt(cwd, list(self.server.config.skills.roots), limit=skill_limit)
+            skill_text = skills_prompt(
+                cwd, list(self.server.config.skills.roots), limit=int(ctx.get("skill_prompt_limit", PROMPT_LIMIT))
+            )
             record = replay.build_record(
                 turn=turn_id,
                 session=session.session_id,
@@ -528,20 +547,19 @@ class LearningHub:
             return
         await self.mine_if_changed(session)
         msgs = session.stored.messages
-        turns = review.user_turns(msgs)
         meta = session.stored.meta
+        turns = review.session_turns(meta, msgs)
+        reviewed = int(meta.get("reviewed_turns", 0))
+        if reviewed > turns:  # a mark from before the total was kept: it counted the compacted list, which is shorter
+            reviewed = 0
         minimum = int(self.cfg["review_min_turns"])
         unattended = bool(getattr(session, "background", False))  # loop ticks, cron, automations: synthetic prompts
-        if (
-            status == "done"
-            and not unattended
-            and turns > minimum
-            and turns > int(meta.get("reviewed_turns", 0)) + minimum - 1
-        ):
+        if status == "done" and not unattended and turns > minimum and turns > reviewed + minimum - 1:
             meta["reviewed_turns"] = turns
             r = await review.review_session(
                 self.server.model_caller,
                 msgs,
+                turns=turns,
                 store=self.store,
                 cwd=Path(session.stored.cwd or "."),
                 config=self.server.config,
@@ -617,6 +635,8 @@ class LearningHub:
         return done
 
     async def run_optimizer(self, session: Any = None) -> list[Proposal]:
+        """Analyse the week and propose changes. Only while ``learning.optimizer.enabled`` is on are gate-approved
+        candidates applied by themselves; while it is off (the default) they become proposals for a human."""
         m = self.metrics(since=self.clock() - WEEK)
         if m["sessions"] < int(self.cfg["optimizer"]["min_sessions"]):
             return []
@@ -632,7 +652,7 @@ class LearningHub:
         # a candidate the A/B window already judged worse and rolled back is never auto-applied again: it goes to
         # the proposal store, whose dedup key latches it for the human path
         for c in cands:
-            if c["auto_ok"] and self._rolled_back_before(c["patch"]):
+            if c["auto_ok"] and (not self.cfg["optimizer"]["enabled"] or self._rolled_back_before(c["patch"])):
                 c["auto_ok"] = False
         for c in cands:
             if c["auto_ok"] and not self._already_in_effect(c["patch"]):

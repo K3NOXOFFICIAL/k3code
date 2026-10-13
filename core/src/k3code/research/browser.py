@@ -193,7 +193,8 @@ def scrubbed_env(home: Path | None = None) -> dict[str, str]:
 
 
 class BrowserManager:
-    """One Chromium per gateway, with a persistent context per site. Launched on first use, never at start-up."""
+    """A persistent context (its own Chromium) per site, launched on first use, never at start-up. At most
+    ``max_sites`` stay open, the least recently used closing first, and one unused for ``idle_close`` seconds closes."""
 
     def __init__(
         self,
@@ -206,6 +207,8 @@ class BrowserManager:
         launcher: Callable[[str], Awaitable[Any]] | None = None,
         allow_private: bool = False,
         allow_origins: frozenset[tuple[str, str, int]] = frozenset(),
+        max_sites: int = 3,
+        idle_close: float = 300.0,
     ) -> None:
         self.allow_private, self.allow_origins = allow_private, allow_origins  # SSRF guard escape hatches
         self.home = home
@@ -214,10 +217,16 @@ class BrowserManager:
         self.challenge_wait = challenge_wait
         #: ``browser.cdp_url``: empty (the default) means k3code never attaches to a running browser
         self.cdp_url = cdp_url
+        self.max_sites, self.idle_close = max_sites, idle_close
         self._launch = launcher or self._launch_playwright
-        self._contexts: dict[str, Any] = {}
+        self._contexts: dict[str, Any] = {}  # in order of use: the least recently used site first
+        self._site_locks: dict[str, asyncio.Lock] = {}  # one launch or close of a site's profile at a time
+        self._busy: dict[str, int] = {}  # reads in progress per site: a site being read is never closed
+        self._used: dict[str, float] = {}  # monotonic time a site was last used
+        self._reaper: asyncio.Task[None] | None = None
         self._cdp: Any = None  # the browser attached over CDP, when browser.manage connected to browser.cdp_url
         self._pw: Any = None
+        self._pw_lock = asyncio.Lock()
 
     def available(self) -> bool:
         """Whether a page could be rendered here: a launcher was given, or the optional Playwright package is
@@ -282,16 +291,19 @@ class BrowserManager:
             return self._state([f"could not attach to the configured browser ({type(e).__name__})"])
         return self._state(["browser connected via CDP to browser.cdp_url"])
 
-    async def attach_cdp(self, endpoint: str) -> None:
+    async def _driver(self) -> Any:
+        """The one Playwright driver, started on first use however many launches race for it."""
         mod = playwright_module()
-        if self._pw is None:
-            self._pw = await mod.async_playwright().start()
-        self._cdp = await self._pw.chromium.connect_over_cdp(endpoint)
+        async with self._pw_lock:
+            if self._pw is None:
+                self._pw = await mod.async_playwright().start()
+            return self._pw
+
+    async def attach_cdp(self, endpoint: str) -> None:
+        self._cdp = await (await self._driver()).chromium.connect_over_cdp(endpoint)
 
     async def _launch_playwright(self, site: str) -> Any:
-        mod = playwright_module()
-        if self._pw is None:
-            self._pw = await mod.async_playwright().start()
+        pw = await self._driver()
         profile = profile_dir(site, self.home)
         profile.mkdir(parents=True, exist_ok=True)
         downloads_dir(self.home).mkdir(parents=True, exist_ok=True)
@@ -307,7 +319,7 @@ class BrowserManager:
         if self.executable_path:
             opts["executable_path"] = self.executable_path
         try:
-            return await self._pw.chromium.launch_persistent_context(str(profile), **opts)
+            return await pw.chromium.launch_persistent_context(str(profile), **opts)
         except Exception as e:  # noqa: BLE001
             if "Executable doesn't exist" in str(e) or "playwright install" in str(e).lower():
                 raise BrowserUnavailable(
@@ -318,11 +330,45 @@ class BrowserManager:
     async def context_for(self, site: str) -> Any:
         if self._cdp is not None:  # attached by the user's own choice: the browser's own context, no k3code profile
             return self._cdp.contexts[0] if self._cdp.contexts else await self._cdp.new_context()
-        if site not in self._contexts:
-            ctx = await self._launch(site)
-            await self._guard(ctx)  # once per context: covers every page, popups' first requests and WebSockets
-            self._contexts[site] = ctx
-        return self._contexts[site]
+        async with self._site_locks.setdefault(site, asyncio.Lock()):  # concurrent first reads share one launch
+            if site not in self._contexts:
+                ctx = await self._launch(site)
+                await self._guard(ctx)  # once per context: covers every page, popups' first requests and WebSockets
+                self._contexts[site] = ctx
+                if self.idle_close > 0 and (self._reaper is None or self._reaper.done()):
+                    self._reaper = asyncio.get_running_loop().create_task(self._reap_idle())
+            self._touch(site)
+            return self._contexts[site]
+
+    def _touch(self, site: str) -> None:
+        self._contexts[site] = self._contexts.pop(site)  # now the most recently used
+        self._used[site] = time.monotonic()
+
+    async def _close_site(self, site: str, idle_for: float = 0.0) -> None:
+        """Closes a site's context, and so its Chromium, unless it is being read or was used in the last ``idle_for``
+        seconds. Under the site's lock, so a new launch on the same profile waits until the old one is gone."""
+        async with self._site_locks.setdefault(site, asyncio.Lock()):
+            if site not in self._contexts or self._busy.get(site):
+                return
+            if time.monotonic() - self._used.get(site, 0.0) < idle_for:
+                return
+            ctx = self._contexts.pop(site)
+            self._used.pop(site, None)
+            with suppress(Exception):  # shielded: an interrupted read must not leave a half-closed Chromium behind
+                await asyncio.shield(ctx.close())
+
+    async def _evict(self) -> None:
+        for site in list(self._contexts):  # the least recently used first; sites being read are skipped
+            if len(self._contexts) <= self.max_sites:
+                return
+            await self._close_site(site)
+
+    async def _reap_idle(self) -> None:
+        """Closes every site unused for ``idle_close`` seconds; ends when none is open, the next launch restarts it."""
+        while self._contexts:
+            await asyncio.sleep(self.idle_close / 2)
+            for site in list(self._contexts):
+                await self._close_site(site, idle_for=self.idle_close)
 
     async def _guard(self, target: Any) -> None:
         """The SSRF guard inside Chromium: every request and WebSocket of ``target`` (a context, or a page of the user's
@@ -334,18 +380,27 @@ class BrowserManager:
         """Renders ``url`` and returns what the page shows. Reads only: no clicks, no typing, no form submits."""
         site = urlparse(url).hostname or ""
         await acheck_url(url, allow_private=self.allow_private, allow_origins=self.allow_origins)  # raises BlockedURL
-        ctx = await self.context_for(site)
-        page = await ctx.new_page()
-        if self._cdp is not None:
-            await self._guard(page)  # the user's own context is not routed: this page is (its popups are not)
-        saved: list[str] = []
-        pending: list[asyncio.Future[Any]] = []
-        page.on("download", lambda d: pending.append(asyncio.ensure_future(self._save_download(d, saved))))
+        self._busy[site] = self._busy.get(site, 0) + 1
         try:
-            return await self._read(page, url, saved, pending)
+            ctx = await self.context_for(site)
+            page = await ctx.new_page()
+            if self._cdp is not None:
+                await self._guard(page)  # the user's own context is not routed: this page is (its popups are not)
+            saved: list[str] = []
+            pending: list[asyncio.Future[Any]] = []
+            page.on("download", lambda d: pending.append(asyncio.ensure_future(self._save_download(d, saved))))
+            try:
+                return await self._read(page, url, saved, pending)
+            finally:
+                with suppress(Exception):
+                    await page.close()
         finally:
-            with suppress(Exception):
-                await page.close()
+            self._busy[site] -= 1
+            if not self._busy[site]:
+                del self._busy[site]
+            if site in self._contexts:
+                self._touch(site)
+            await self._evict()
 
     def _verdict(self) -> Callable[[str], Awaitable[bool]]:
         """Whether a URL may be requested. Verdicts are cached per origin for a minute, so a page with many
@@ -440,10 +495,14 @@ class BrowserManager:
         saved.append(str(dest))
 
     async def close(self) -> None:
+        if self._reaper is not None and self._reaper is not asyncio.current_task():
+            self._reaper.cancel()
+        self._reaper = None
         for ctx in list(self._contexts.values()):
             with suppress(Exception):
                 await ctx.close()
         self._contexts.clear()
+        self._used.clear()
         self._cdp = None  # the user's own browser keeps running: only the connection is dropped
         if self._pw is not None:
             with suppress(Exception):

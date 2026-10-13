@@ -23,10 +23,12 @@ from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
 from k3code.toolerrors import Failure, describe_call, failure_of
 from k3code.tools import (
+    FILE_TOOLS,
     HOOK_FEEDBACK_KEY,
     IGNORED_KEY,
     MAX_TOOL_RESULT_CHARS,
     SESSION_TOOLS,
+    FileStamps,
     build_registry,
     clip_tool_results,
     format_tool_result,
@@ -126,6 +128,9 @@ class AgentLoop:
         #: True: ``_reads`` and ``_pinned`` belong to the session (share_reads) and outlive a run().
         self._carry_reads = False
         self._step = 0
+        #: What this loop's model has seen of each file; write and edit refuse one it has not, or that changed since.
+        #: Kept across run()s; the gateway hands every loop of a session the session's own (turns and tiers share it).
+        self.file_stamps = FileStamps()
         #: M1: how much of one tool result the model is sent (the transcript keeps all of it); None = the default
         self.tool_output_chars = tool_output_chars
         #: M4a: what this loop is for (routes to a tier; tagged on usage rows).
@@ -464,6 +469,8 @@ class AgentLoop:
                     if self._guard_assistant("".join(text_parts), messages):
                         for stop_event in self._stop_for_input(messages):
                             yield stop_event
+                    else:
+                        self.reliability.clear_transcript()
                     return
             elif self.interrupted:
                 # Stream aborted without a final message (e.g. interrupt during
@@ -503,19 +510,20 @@ class AgentLoop:
                     results = await asyncio.gather(
                         *(self._execute_tool(tc, step=n) for tc, n in zip(batch, steps, strict=True))
                     )
-                # The batch has finished: its results join the conversation together and it is saved once. The save
-                # writes the whole conversation, so one per result made a reply of N parallel calls N rewrites.
+                # The batch has finished: its results join the conversation together and it is saved once, after they
+                # were handed on. The save writes the whole conversation, so one per result made a reply of N parallel
+                # calls N rewrites.
                 tool_msgs = [
                     Message(role="tool", content=format_tool_result(result), tool_call_id=tc.id, name=tc.name)
                     for tc, result in zip(batch, results, strict=True)
                 ]
                 messages.extend(tool_msgs)
-                self.reliability.save_transcript(messages)
                 for tc, result, tool_msg in zip(batch, results, tool_msgs, strict=True):
                     # Yield the tool result as a stream event
                     yield StreamEvent(type="done", message=tool_msg)
                     failure = self._observe_result(tc, result, notes)
                     reply.append((tc, _call_failed(result), failure.first_line if failure else ""))
+                self.reliability.save_transcript(messages)
 
             # A reply is one step: it counts as a failed one only when every call in it failed, and the stop is judged
             # here, after all of them ran. Counted per call, one reply of eight parallel reads of a wrong path stopped
@@ -533,6 +541,7 @@ class AgentLoop:
                     for stop_event in self._stop_for_tool_errors(messages):
                         yield stop_event
                 self.turn_messages = messages
+                self.reliability.save_transcript(messages)  # the stop message joins the checkpoint
                 return
 
             messages.extend(notes)
@@ -651,6 +660,8 @@ class AgentLoop:
         decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
         if decision.action == "deny":  # hardline and deny rules: no hook can turn these into an allow
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
+        if decision.always_ask and (self.background or self.unattended):  # nobody is there to confirm it
+            return {"error": f"Permission denied (unattended run): {decision.message}"}
         # the bwrap probe behind _home_rooted runs a subprocess: off the event loop, like _sandbox_argv below
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
         if home_rooted:
@@ -686,7 +697,13 @@ class AgentLoop:
         ):
             step, call_id = seen
             self._pinned.add(call_id)  # the earlier result must stay in the requests: this one points at it
+            if (path := self._tool_path(args)) is not None:
+                self.file_stamps.record(path)  # the pointed-at result is this file as it is now: a write may follow
             return {"content": context_budget.read_pointer(step, call_id)}
+        # after the approval (the user may have saved the file while it was open), never before it: a refusal there
+        # would tell the model whether a file outside the project exists without anyone being asked
+        if (stale := self._stale_file(tool_call.name, args)) is not None:
+            return {"error": stale}
         # M2: fsync a journal intent before the tool runs.
         self.reliability.journal_intent(tool_call, side_effect=spec.side_effect)
         try:
@@ -719,6 +736,9 @@ class AgentLoop:
             result = {**result, IGNORED_KEY: ignored}
         if read_key is not None and "first" in result:
             self._reads[read_key] = (self._step if step is None else step, tool_call.id)
+        seen = (tool_call.name == "read" and "first" in result) or (tool_call.name in FILE_TOOLS and result.get("ok"))
+        if seen and (path := self._tool_path(args)) is not None:
+            self.file_stamps.record(path)
         post = await self._run_hooks(
             "PostToolUse", tool_call.name, {"tool_input": args, "tool_response": format_tool_result(result)}
         )
@@ -736,6 +756,21 @@ class AgentLoop:
         """Whether the tool result of ``call_id`` is in this run's conversation (the history it was given or what it
         added): a pointer to a result a /clear, a rewind or a compaction removed would point at nothing."""
         return any(m.role == "tool" and m.tool_call_id == call_id for m in self.turn_messages)
+
+    def _tool_path(self, args: dict[str, Any]) -> Path | None:
+        """The file a read, write or edit call names, resolved as the tool resolves it; None if it cannot be."""
+        from k3code.tools import _resolve_path
+
+        try:
+            return _resolve_path(str(args.get("path", "")), self.cwd)
+        except (OSError, ValueError, RuntimeError):  # RuntimeError: "~user" with no such user
+            return None
+
+    def _stale_file(self, name: str, args: dict[str, Any]) -> str | None:
+        """write/edit: why the file may not be changed now (see FileStamps), or None."""
+        if name not in FILE_TOOLS or (path := self._tool_path(args)) is None:
+            return None
+        return self.file_stamps.refusal(name, path)
 
     def _read_key(self, args: dict[str, Any]) -> tuple[Any, ...] | None:
         """What makes two reads the same: the file (path, mtime, size) and the requested range; None if no file."""

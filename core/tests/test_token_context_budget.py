@@ -113,8 +113,7 @@ async def test_old_tool_results_are_elided_from_a_big_request_but_kept_in_histor
     assert 8 in whole and len(whole) <= 3 and len(sent["r8"]) > 3000
     stored = [m.content for m in loop.turn_messages if m.role == "tool"]
     assert all(len(c) > 3000 for c in stored)  # the conversation itself keeps every result
-    transcript = [m.content for m in loop.reliability.load_transcript() if m.role == "tool"]
-    assert all(len(c) > 3000 for c in transcript)
+    assert loop.reliability.load_transcript() is None  # a finished turn leaves no checkpoint behind
 
 
 async def test_six_results_stay_whole_when_they_are_small_next_to_the_window(tmp_path):

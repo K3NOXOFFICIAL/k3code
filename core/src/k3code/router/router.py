@@ -38,6 +38,7 @@ from typing import Any
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
 from k3code.providers.base import Provider
 from k3code.providers.retry_utils import jittered_backoff
+from k3code.providers.stall import is_stall
 from k3code.providers.types import Message, StreamEvent, ToolSpec
 from k3code.router.classifier import (
     FailoverReason,
@@ -52,6 +53,9 @@ MIN_RETRY_DELAY = 0.5
 FAILOVER_COOLDOWN_S = 60.0
 
 logger = logging.getLogger(__name__)
+
+#: retries of the same entry after a stream stalled (see providers/stall.py)
+STALL_RETRIES = 1
 
 # ── Chain entries ──────────────────────────────────────────────────────
 
@@ -322,8 +326,9 @@ class Router:
                             retry_after=cooldown,
                         )
                         break
-                    # retryable: same entry with backoff, max_retries times, then fail over
-                    if attempt >= self.max_retries:
+                    # retryable: same entry with backoff, max_retries times, then fail over. A stalled stream is not a
+                    # blip: it cost its whole stall limit, so it gets one retry, not max_retries.
+                    if attempt >= (min(self.max_retries, STALL_RETRIES) if is_stall(exc) else self.max_retries):
                         self._failover(entry, target_model, classified.reason, attempt, exc, entry_index=entry_index)
                         break
                     attempt += 1

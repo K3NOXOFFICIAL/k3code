@@ -148,6 +148,12 @@ async def _sweep_empty_sessions(server: Any) -> None:
         )
     except Exception:
         logger.exception("retention pruning failed")
+    try:
+        freed = server.compact_storage()
+        if freed:
+            logger.info("compacted sessions.db: %d MB returned to the filesystem", freed // (1 << 20))
+    except Exception:
+        logger.exception("sessions.db compaction failed")
 
 
 SAFE_MODE_NOTICE = (

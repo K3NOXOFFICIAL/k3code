@@ -143,18 +143,34 @@ def leading_system_parts(messages: list[Message]) -> list[str]:
     return parts
 
 
+def _reminder_text(content: str) -> str:
+    """A mid-conversation system note as the text a user-side message carries."""
+    return f"<system-reminder>\n{content}\n</system-reminder>"
+
+
 def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
-    """Serialize messages for chat-completions-compatible providers. The leading system messages become ONE system
-    message: several in a row are refused by some chat templates (and by some servers), and only the native Anthropic
-    API has a use for the split."""
+    """Serialize messages for chat-completions-compatible providers.
+
+    The leading system messages become ONE system message: several in a row are refused by some chat templates (and by
+    some servers), and only the native Anthropic API has a use for the split.
+
+    A system message later in the conversation (the loop guard's note) is sent as a ``<system-reminder>`` user message,
+    as ``messages_to_anthropic`` does: chat templates that want the system message first (Mistral, Gemma) answer
+    HTTP 400 to it, and a relay that hoists it into a Claude system prompt rewrote the start of every request from then
+    on. It joins the user message after it when there is one, so user and assistant turns still alternate.
+    """
     out: list[dict[str, Any]] = []
     leading = True  # still inside the run of system messages the conversation starts with
+    notes: list[str] = []
     for m in normalize_tool_pairs(messages):
         if m.role not in _ROLE_OPENAI:
             raise ValueError(f"unknown role: {m.role}")
-        if m.role != "system":
-            leading = False
-        elif leading and out:
+        if m.role == "system" and not leading:
+            if m.content:
+                notes.append(_reminder_text(m.content))
+            continue
+        leading = leading and m.role == "system"
+        if m.role == "system" and out:  # a second leading system message joins the first
             out[-1]["content"] = f"{out[-1]['content']}\n\n{m.content or ''}".rstrip()
             continue
         entry: dict[str, Any] = {"role": m.role, "content": m.content if m.content is not None else ""}
@@ -173,7 +189,15 @@ def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
             entry["tool_call_id"] = m.tool_call_id
             if m.name:
                 entry["name"] = m.name
+        if notes:
+            if m.role == "user":
+                entry["content"] = "\n\n".join([*notes, *([m.content] if m.content else [])])
+            else:
+                out.append({"role": "user", "content": "\n\n".join(notes)})
+            notes = []
         out.append(entry)
+    if notes:  # notes after the last message
+        out.append({"role": "user", "content": "\n\n".join(notes)})
     return out
 
 
@@ -211,7 +235,7 @@ def messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str, 
             if leading:
                 system_parts.append(m.content)
                 continue
-            reminder = {"type": "text", "text": f"<system-reminder>\n{m.content}\n</system-reminder>"}
+            reminder = {"type": "text", "text": _reminder_text(m.content)}
             if rest and rest[-1]["role"] == "user":
                 _attach_reminders(rest[-1], [reminder])
             else:

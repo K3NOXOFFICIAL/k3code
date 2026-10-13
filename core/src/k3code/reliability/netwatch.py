@@ -7,7 +7,8 @@ States and their meaning (M2 task spec):
 - ``PROVIDER_DOWN``: the internet works, but registered provider endpoints do
   not. One provider being down does NOT mean offline — it means "fail over".
 - ``CAPTIVE``: an HTTP probe was redirected to a captive portal page.
-- ``OFFLINE``: no usable internet connectivity.
+- ``OFFLINE``: no usable internet connectivity: the generic probe fails and no provider endpoint answers its own
+  probe (a provider that does answer, say on loopback or the LAN, keeps the state ``ONLINE``).
 
 Signals: NetworkManager over ``nmcli`` (subprocess, degrade gracefully when
 absent), a per-endpoint HTTP probe per registered provider base URL, and a
@@ -58,6 +59,8 @@ class ProviderProbeState:
     last_ok: float = 0.0
     last_fail: float = 0.0
     consecutive_fails: int = 0
+    #: The most recent probe got an answer (``state`` only turns PROVIDER_DOWN after several fails).
+    answering: bool = False
 
 
 @dataclass
@@ -470,14 +473,17 @@ class NetWatch:
                 status, _body, _final = await self._probes.provider(prov.base_url, self.config.provider_probe_timeout)
                 if 0 < status < 500:
                     prov.state = NetState.ONLINE
+                    prov.answering = True
                     prov.last_ok = time.monotonic()
                     prov.consecutive_fails = 0
                 else:
+                    prov.answering = False
                     prov.consecutive_fails += 1
                     prov.last_fail = time.monotonic()
                     if prov.consecutive_fails >= self.config.provider_fail_threshold:
                         prov.state = NetState.PROVIDER_DOWN
             except Exception:
+                prov.answering = False
                 prov.consecutive_fails += 1
                 prov.last_fail = time.monotonic()
                 if prov.consecutive_fails >= self.config.provider_fail_threshold:
@@ -492,6 +498,11 @@ class NetWatch:
         if internet.captive:
             return NetState.CAPTIVE
         if not internet.ok:
+            # The generic probe stands in for "can we reach a provider". One that answered its own probe in this
+            # round proves it: an Ollama or vLLM on loopback or the LAN of a host with no internet, or gstatic and
+            # 1.1.1.1 blocked on a network that lets the provider through.
+            if any(p.answering for p in self._providers.values()):
+                return NetState.ONLINE
             return NetState.OFFLINE
         # Internet works: a specific provider being down is not offline.
         if provider_states and self.all_providers_down():

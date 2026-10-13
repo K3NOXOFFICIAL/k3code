@@ -156,6 +156,9 @@ async def test_the_model_gets_the_clipped_result_and_the_transcript_keeps_the_fu
     cat = ToolCall(id="c1", name="bash", arguments={"command": f"cat {target}"})
     provider = Recorder([tool_reply(cat), text_reply("done")])
     loop = make_loop(tmp_path, provider, session="clip")
+    saved: list[list[Message]] = []
+    real_save = loop.reliability.save_transcript
+    loop.reliability.save_transcript = lambda msgs: (saved.append(list(msgs)), real_save(msgs))[1]
     async for _ in loop.run("read the file"):
         pass
     full = next(m.content for m in loop.turn_messages if m.role == "tool")
@@ -163,8 +166,9 @@ async def test_the_model_gets_the_clipped_result_and_the_transcript_keeps_the_fu
     sent = next(m.content for m in provider.requests[1][0] if m.role == "tool")
     assert sent == clip_for_model("bash", full)
     assert f"truncated {len(full) - 10_000} chars" in sent
-    stored = [m.content for m in loop.reliability.load_transcript() if m.role == "tool"]
-    assert stored == [full]  # the transcript on disk keeps every char the tool returned
+    stored = [m.content for m in saved[-1] if m.role == "tool"]
+    assert stored == [full]  # the checkpoint written during the turn keeps every char the tool returned
+    assert loop.reliability.load_transcript() is None  # and the clean finish removed it
 
 
 async def test_each_request_starts_with_the_exact_bytes_of_the_one_before(tmp_path):

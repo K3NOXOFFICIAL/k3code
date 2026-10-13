@@ -6,7 +6,7 @@ import React, {
 import { c as _c } from "react/compiler-runtime";
 
 import instances from "../instances.js";
-import { CURSOR_HOME, ERASE_SCREEN, ERASE_SCROLLBACK } from "../termio/csi.js";
+import { CURSOR_HOME, ERASE_SCREEN } from "../termio/csi.js";
 import {
   DISABLE_MOUSE_TRACKING,
   enableMouseTrackingFor,
@@ -77,9 +77,9 @@ export function AlternateScreen(t0: Props) {
       // 1003 hover events asserted, picking 'wheel' or 'buttons' without
       // an unconditional DISABLE would silently leave hover on and defeat
       // the point of the preset.
+      // No ERASE_SCROLLBACK: ESC[3J reaches the primary buffer's scrollback on most terminals, and the alt screen is blank anyway (#151).
       writeRaw(
         ENTER_ALT_SCREEN +
-          ERASE_SCROLLBACK +
           ERASE_SCREEN +
           CURSOR_HOME +
           DISABLE_MOUSE_TRACKING +

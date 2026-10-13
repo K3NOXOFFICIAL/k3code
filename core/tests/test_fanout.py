@@ -206,6 +206,15 @@ async def test_reviewer_rejection_sends_work_back_once(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     subs = ["SUB-ONE add f1", "SUB-TWO add f2"]
     rework = [
+        # a file is read before it is rewritten (#100: write refuses one this loop has not read)
+        {
+            "type": "tool_call",
+            "id": "r2",
+            "match": "REWORK",
+            "when": "first",
+            "name": "read",
+            "arguments": {"path": "f2.txt"},
+        },
         {
             "type": "tool_call",
             "id": "w2",
@@ -240,6 +249,33 @@ async def test_reviewer_rejection_sends_work_back_once(tmp_path, monkeypatch):
     assert "retrying" in states and states[-1] == "merged"
 
 
+async def test_a_reviewer_without_a_verdict_escalates_instead_of_passing(tmp_path, monkeypatch):
+    # issue #97: a review with no VERDICT line (a crash, a stop, a ramble) used to count as a pass and was merged
+    repo = git_repo(tmp_path / "repo")
+    subs = ["SUB-ONE add f1", "SUB-TWO add f2"]
+    steps = [
+        classify(subs),
+        *PLANNER,
+        *worker(1, "f1.txt"),
+        *worker(2, "f2.txt"),
+        reviewer(subs[0]),
+        {"type": "text", "match": "Subtask: SUB-TWO add f2", "text": "I ran out of time before deciding."},
+        {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"},
+    ]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 1 and done["escalated"] == 1, done["summary"]
+    assert (repo / "f1.txt").exists() and not (repo / "f2.txt").exists()  # the unreviewed work was not merged
+    t2 = [p for p in events(server, "fanout.progress") if p["subtask_id"] == "t2"]
+    assert t2[-1]["state"] == "escalated" and "no review verdict" in t2[-1]["detail"]
+    assert not any("--- REWORK ---" in c["text"] for p in server.providers for c in p.log)  # not the worker's fault
+    reviewers = [h for h in server.subagents.handles.values() if h.agent_type == "reviewer"]
+    assert len(reviewers) == 3  # SUB-ONE once, SUB-TWO asked once more
+    assert "k3/" in git(repo, "branch")  # the escalated child's branch survives
+
+
 async def test_failing_tests_are_sent_back_once_then_pass(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     subs = ["SUB-ONE add f1", "SUB-TWO add bad"]
@@ -269,6 +305,44 @@ async def test_failing_tests_are_sent_back_once_then_pass(tmp_path, monkeypatch)
     t2 = [p for p in events(server, "fanout.progress") if p["subtask_id"] == "t2"]
     assert any(p["state"] == "retrying" and "tests failed" in p["detail"] for p in t2)
     assert git(repo, "log", "--oneline", "--merges").count("Merge k3/") == 2
+
+
+async def test_work_reworked_after_failing_tests_is_reviewed_again_before_it_merges(tmp_path, monkeypatch):
+    # the rework after a failed test run (or a conflict) went straight back to the merge: what it added was never
+    # reviewed
+    repo = git_repo(tmp_path / "repo")
+    subs = ["SUB-ONE add f1", "SUB-TWO add bad"]
+    steps = [
+        classify(subs),
+        *PLANNER,
+        *worker(1, "f1.txt"),
+        *worker(2, "bad.txt"),
+        reviewer(subs[0]),
+        reviewer(subs[1]),
+        {
+            "type": "tool_call",
+            "id": "rm",
+            "match": "--- REWORK ---",
+            "when": "first",
+            "name": "bash",
+            "arguments": {"command": "rm bad.txt && echo unreviewed > unreviewed.txt"},
+        },
+        {"type": "text", "match": "--- REWORK ---", "when": "after_tool", "text": "REWORK-REPORT done"},
+        # the second review of SUB-TWO carries the rework's report and rejects it
+        {"type": "text", "match": "REWORK-REPORT", "text": "\nunreviewed.txt is unrelated. VERDICT: fail"},
+        {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"},
+    ]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="test ! -f bad.txt")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 1 and done["escalated"] == 1, done["summary"]
+    assert not (repo / "unreviewed.txt").exists() and "unreviewed.txt" not in git(repo, "ls-files")
+    t2_reviews = [h for h in server.subagents.handles.values() if h.description == "review: SUB-TWO add bad"]
+    assert len(t2_reviews) == 2
+    t2 = [p for p in events(server, "fanout.progress") if p["subtask_id"] == "t2"]
+    assert t2[-1]["state"] == "escalated" and "unreviewed.txt is unrelated" in t2[-1]["detail"]
+    assert "k3/" in git(repo, "branch")  # the escalated child's branch survives
 
 
 async def test_persistent_failure_escalates_to_parent_and_keeps_branch(tmp_path, monkeypatch):
@@ -309,6 +383,61 @@ async def test_not_a_git_repo_runs_normally(tmp_path, monkeypatch):
     await run_turn(server, "do the big thing")
     assert not events(server, "fanout.plan")
     assert server.session.stored.messages[-1]["content"] == "did it sequentially"
+
+
+@pytest.mark.parametrize("staged", [True, False])
+async def test_uncommitted_changes_skip_fanout_and_run_normally(tmp_path, monkeypatch, staged):
+    """#98: workers branch from HEAD and merge into the user's checkout. With a staged edit git refuses every merge
+    (with an unstaged one, every merge touching that file), after all the workers and a rework each were paid for."""
+    repo = git_repo(tmp_path / "repo")
+    (repo / "a.py").write_text("x = 2\n")
+    if staged:
+        git(repo, "add", "a.py")
+    steps = [classify(SUBS), *PLANNER, {"type": "text", "match": "Approved plan", "text": "did it sequentially"}]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    assert not events(server, "fanout.plan")
+    assert not [h for h in server.subagents.handles.values() if h.agent_type == "worker"]
+    notes = [n["text"] for n in events(server, "notification.show") if n.get("kind") == "fanout"]
+    assert notes and "uncommitted changes" in notes[0] and "a.py" in notes[0], notes
+    assert server.session.stored.messages[-1]["content"] == "did it sequentially"
+    assert git(repo, "status", "--porcelain").startswith("M " if staged else " M")  # the user's edit is untouched
+
+
+async def test_checkout_dirtied_during_fanout_is_not_a_conflict_and_not_reworked(tmp_path, monkeypatch):
+    """#98: a merge git refuses to start (the checkout's own changes are in the way) was reported as a 'merge
+    conflict with what was already merged' and sent back to the worker, who cannot fix the user's checkout."""
+    from k3code.subagents import worktree as wt_mod
+
+    repo = git_repo(tmp_path / "repo")
+    subs = ["SUB-ONE add f1", "SUB-TWO add f2"]
+    steps = [
+        *steps_for(subs, sleep=0),
+        {"type": "text", "match": "--- REWORK ---", "text": "rework ran"},
+        {"type": "text", "match": "needs you (escalated)", "text": "parent handled it"},
+    ]
+    real_trial = wt_mod.merge_trial
+
+    async def user_stages_an_edit_first(tree):
+        (repo / "a.py").write_text("x = 2\n")
+        git(repo, "add", "a.py")  # the user stages an edit while the workers run
+        return await real_trial(tree)
+
+    monkeypatch.setattr(wt_mod, "merge_trial", user_stages_an_edit_first)
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    done = events(server, "fanout.done")[0]
+    assert not done["ok"] and done["merged"] == 0 and done["escalated"] == 2, done["summary"]
+    prog = events(server, "fanout.progress")
+    assert "retrying" not in {p["state"] for p in prog}  # no rework agent spent on the checkout's problem
+    assert len([h for h in server.subagents.handles.values() if h.agent_type == "worker"]) == 2
+    details = [p["detail"] for p in prog if p["state"] == "escalated"]
+    assert all("merge conflict" not in d and "uncommitted changes" in d and "a.py" in d for d in details), details
+    assert git(repo, "diff", "--cached", "--name-only").split() == ["a.py"]  # the user's staged edit is untouched
+    assert "k3/" in git(repo, "branch")  # the work stays on its branch for the parent
+    assert server.session.stored.messages[-1]["content"] == "parent handled it"
 
 
 async def test_fanout_disabled_by_config(tmp_path, monkeypatch):
@@ -356,6 +485,15 @@ async def test_merge_conflict_between_children_is_resolved_by_the_child(tmp_path
         *worker(2, "shared.txt", content="from two\n"),
         reviewer(subs[0]),
         reviewer(subs[1]),
+        # the child reads the conflicted file before it writes the resolution (#100)
+        {
+            "type": "tool_call",
+            "id": "see",
+            "match": "conflicts in",
+            "when": "first",
+            "name": "read",
+            "arguments": {"path": "shared.txt"},
+        },
         {
             "type": "tool_call",
             "id": "fix",
@@ -449,7 +587,7 @@ async def test_a_reviewer_that_died_never_counts_as_a_pass():
     reviewer that had written `VERDICT: fail` before the stop was lost)."""
     from types import SimpleNamespace
 
-    from k3code.autonomy.fanout import FanoutExecutor, Subtask
+    from k3code.autonomy.fanout import FanoutExecutor, ReviewUnavailable, Subtask
     from k3code.subagents.budget import CAP_ERROR, AgentBudget, BudgetStop
     from k3code.subagents.runner import Handle
 
@@ -477,8 +615,8 @@ async def test_a_reviewer_that_died_never_counts_as_a_pass():
     assert stop.value.kind == "tokens"
 
     await spawn_returning(handle("failed", "provider exploded"))
-    problem = await ex._review(ctx, st, worker_done)
-    assert "did not finish" in problem and "provider exploded" in problem, "unreviewed work is not a pass"
+    with pytest.raises(ReviewUnavailable, match="provider exploded"):  # asked twice, no verdict: not a pass
+        await ex._review(ctx, st, worker_done)
 
     await spawn_returning(handle("completed", result="all good. VERDICT: pass"))
     assert await ex._review(ctx, st, worker_done) == ""
@@ -499,7 +637,8 @@ async def test_a_reviewer_that_died_has_the_same_result_reviewed_again_not_rewor
         h = Handle(id="h", description="d", agent_type=agent_type, tier="main", depth=1, parent_sid="s")
         h.status, h.error, h.result = status, error, result
         h.diff = h.diff_stat = ""
-        h.worktree, h.merge = object(), "merged"  # type: ignore[assignment]
+        h.worktree = SimpleNamespace(branch="k3/t1", path="/wt/t1", base="abc")  # type: ignore[assignment]
+        h.merge = "merged"
         return h
 
     def dead() -> Handle:
@@ -540,11 +679,11 @@ async def test_a_reviewer_that_died_has_the_same_result_reviewed_again_not_rewor
     # the reviewer dies, the next one passes it: merged, and the worker was never sent back
     states, reworks, merges, st = await play(dead(), verdict_of("pass"))
     assert reworks == [] and merges == ["t1"] and st.attempts == 0
-    assert states == ["running", "reviewing", "retrying", "reviewing"]
+    assert states == ["running", "reviewing"]
 
     # both die: the result stays unreviewed and unmerged, with no rework either
-    states, reworks, merges, _ = await play(dead(), dead())
-    assert reworks == [] and merges == [] and states[-1] == "escalated"
+    states, reworks, merges, st = await play(dead(), dead())
+    assert reworks == [] and merges == [] and states[-1] == "escalated" and st.attempts == 0
 
     # the second reviewer really rejects it: that is a rejection, and the worker is sent back once, as for any other
     states, reworks, merges, st = await play(dead(), verdict_of("fail"), verdict_of("pass"))

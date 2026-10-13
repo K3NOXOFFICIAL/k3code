@@ -275,16 +275,35 @@ async def test_a_parallel_batch_is_saved_once_after_all_its_results_not_once_per
     for n in names:
         register(loop, n, [], side_effect=False)
     saves: list[list[str]] = []
+    on_disk: list[list[str]] = []  # the tool results the checkpoint file held right after each save
     real = reliability.save_transcript
-    monkeypatch.setattr(
-        reliability,
-        "save_transcript",
-        lambda msgs: (saves.append([m.role for m in msgs]), real(msgs))[1],
-    )
+
+    def spy(msgs):
+        real(msgs)
+        saves.append([m.role for m in msgs])
+        saved = reliability.load_transcript() or []
+        on_disk.append([m.tool_call_id for m in saved if m.role == "tool"])
+
+    monkeypatch.setattr(reliability, "save_transcript", spy)
     results = await run(loop)
     assert [m.tool_call_id for m in results] == ["c0", "c1", "c2", "c3"]  # still reported in call order
-    after_results = [roles for roles in saves if roles[-1] == "tool"]
+    after_results = [i for i, roles in enumerate(saves) if roles[-1] == "tool"]
     assert len(after_results) == 1, saves
-    assert after_results[0].count("tool") == len(names)  # and that one save holds every result of the batch
-    saved = reliability.load_transcript()
-    assert saved is not None and [m.tool_call_id for m in saved if m.role == "tool"] == ["c0", "c1", "c2", "c3"]
+    assert saves[after_results[0]].count("tool") == len(names)  # and that one save holds every result of the batch
+    # the checkpoint written then has them in call order (a turn that ends cleanly removes it afterwards)
+    assert on_disk[after_results[0]] == ["c0", "c1", "c2", "c3"]
+
+
+@pytest.mark.asyncio
+async def test_transcript_is_saved_once_per_tool_batch_not_per_result(tmp_path):
+    log: list[str] = []
+    loop = make_loop(tmp_path, [calls_for("a", "b", "c")])
+    for n in ("a", "b", "c"):
+        register(loop, n, log, side_effect=False)
+    saves: list[int] = []
+    real = loop.reliability.save_transcript
+    loop.reliability.save_transcript = lambda msgs: (saves.append(len(msgs)), real(msgs))[1]
+    await run(loop)
+    # system + user + assistant = 3 messages before the batch; the 3 results land together in ONE save (6),
+    # never as the intermediate 4 and 5 that one-save-per-result produced
+    assert 6 in saves and 4 not in saves and 5 not in saves, saves

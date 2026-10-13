@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tracemalloc
 from pathlib import Path
 
 from k3code import memory
@@ -138,6 +139,78 @@ def test_import_outside_the_repository_or_a_secret_is_refused(tmp_path: Path, mo
     text = load_memory(root)[0].text
     assert "OUTSIDE-SECRET" not in text and "HOME-NOTES" not in text and "TOKEN=abc" not in text
     assert text.count("not imported: outside the allowed directories") == 4
+
+
+def _write_big(path: Path, megabytes: int) -> Path:
+    """A text file of ``megabytes`` MB, written a megabyte at a time."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    megabyte = ("x" * 1023 + "\n") * 1024
+    with path.open("w", encoding="utf-8") as f:
+        for _ in range(megabytes):
+            f.write(megabyte)
+    return path
+
+
+def _peak_bytes(fn) -> int:
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def test_a_huge_memory_file_is_not_read_whole(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _write_big(root / "K3CODE.md", 32)
+    prompt = ""
+
+    def build() -> None:
+        nonlocal prompt
+        prompt = memory_prompt(root)
+
+    assert _peak_bytes(build) < 4 << 20  # reading it whole needs 32 MB as bytes plus 32 MB as text
+    assert "x" * 1023 in prompt and prompt.count("x") <= 20_000 and "…(truncated)" in prompt
+
+
+def test_a_huge_import_is_refused_not_read(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _write_big(root / "docs" / "huge.log", 32)
+    _write(root / "K3CODE.md", "before\n@docs/huge.log\nafter")
+    text = ""
+
+    def build() -> None:
+        nonlocal text
+        text = load_memory(root)[0].text
+
+    assert _peak_bytes(build) < 4 << 20
+    assert text.splitlines() == ["before", "(@docs/huge.log not imported: larger than 1 MB)", "after"]
+
+
+def test_a_binary_import_is_refused(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    (root / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(range(256)) * 8)
+    _write(root / "K3CODE.md", "before\n@logo.png\nafter")
+    assert load_memory(root)[0].text.splitlines() == ["before", "(@logo.png not imported: not a text file)", "after"]
+
+
+def test_imports_stop_at_the_total_cap(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    for i in range(5):
+        _write(root / f"part{i}.md", f"P{i}\n" + "y" * 600_000)  # under the 1 MB import limit each
+    _write(root / "K3CODE.md", "top\n" + "\n".join(f"@part{i}.md" for i in range(5)) + "\nTAIL")
+    text = load_memory(root)[0].text
+    assert len(text) <= memory.MAX_MEMORY_TOTAL + 1  # one past the cap, so the prompt can tell it was cut
+    assert "P0" in text and "P1" not in text and "TAIL" not in text
+    prompt = memory_prompt(root)
+    assert len(prompt) < memory.MAX_MEMORY_TOTAL + 1_000 and "…(truncated)" in prompt
+
+
+def test_multibyte_text_keeps_the_character_cap(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _write(root / "K3CODE.md", "é" * 30_000)  # two bytes a character: the cap counts characters
+    prompt = memory_prompt(root)
+    assert "é" * 20_000 in prompt and "é" * 20_001 not in prompt
 
 
 def test_user_memory_may_import_from_the_home_directory(tmp_path: Path, monkeypatch) -> None:

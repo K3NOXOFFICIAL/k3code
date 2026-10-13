@@ -956,3 +956,35 @@ async def test_a_rewritten_history_keeps_one_idle_process_per_conversation(pshim
         assert len([s for s in p._pool if not s.busy]) <= 1
     assert len(_lines(tmp_path, ".spawns")) >= 2  # the elisions did force full renders
     await _close_and_check(p, tmp_path)
+
+
+def test_sweep_removes_workdirs_of_dead_runs_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scratch dirs left by a killed run go; a live run's dir, an unrelated dir and a fresh untagged dir stay."""
+    import time
+
+    from k3code.providers import claude_cli
+
+    monkeypatch.setattr(claude_cli.tempfile, "tempdir", str(tmp_path))
+    dead = tmp_path / "k3code-claude-cli.99999999.abc"
+    live = tmp_path / f"k3code-claude-cli.{os.getpid()}.abc"
+    old_untagged = tmp_path / "k3code-claude-cli.oldone"
+    fresh_untagged = tmp_path / "k3code-claude-cli.fresh"
+    other = tmp_path / "something-else"
+    for d in (dead, live, old_untagged, fresh_untagged, other):
+        d.mkdir()
+    long_ago = time.time() - 3 * 86400
+    os.utime(old_untagged, (long_ago, long_ago))
+    assert claude_cli._sweep_workdirs() == 2
+    assert not dead.exists() and not old_untagged.exists()
+    assert live.exists() and fresh_untagged.exists() and other.exists()
+
+
+def test_workdir_is_tagged_with_the_pid_and_removed_at_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from k3code.providers import claude_cli
+
+    monkeypatch.setattr(claude_cli.tempfile, "tempdir", str(tmp_path))
+    prov = claude_cli.ClaudeCliProvider(name="c")
+    cwd = Path(prov._cwd())
+    assert cwd.name.startswith(f"k3code-claude-cli.{os.getpid()}.")
+    asyncio.run(prov.aclose())
+    assert not cwd.exists()

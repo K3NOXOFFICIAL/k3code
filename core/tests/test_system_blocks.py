@@ -62,7 +62,10 @@ def test_chat_completions_providers_get_one_system_message():
         "content": "a\n\nb",
     }
     later = [*msgs("a", "b"), Message(role="system", content="a note later in the conversation")]
-    assert [m["role"] for m in messages_to_openai(later)] == ["system", "user", "system"], "only the leading run merges"
+    wire = messages_to_openai(later)
+    # only the leading run merges; a note later in the conversation is a user reminder, not a second system message
+    assert [m["role"] for m in wire] == ["system", "user", "user"]
+    assert "a note later in the conversation" in wire[-1]["content"]
 
 
 class Seen:

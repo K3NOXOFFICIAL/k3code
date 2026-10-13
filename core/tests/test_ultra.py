@@ -260,6 +260,55 @@ async def test_ultracode_no_agreement_means_no_fix(tmp_path, monkeypatch):
     assert not any("Fix these confirmed" in c["text"] for p in server.providers for c in p.log)
 
 
+DEAD_LENSES = [
+    {"type": "text", "match": "LENS: correctness\nAdversarially", "text": "I could not finish the review."},
+    {"type": "text", "match": "LENS: security/robustness\nAdversarially", "text": "Out of budget."},
+]
+
+
+async def test_ultracode_lenses_without_an_answer_are_not_a_clean_review(tmp_path, monkeypatch):
+    # issue #97: a lens that dies or replies without the findings array used to read as "review panel found nothing"
+    repo = git_repo(tmp_path / "repo")
+    # 3 planners + 3 workers + 3 reviewers + 2 lenses asked twice: one more than the default 12 agents
+    server = make(
+        tmp_path, monkeypatch, code_steps(*DEAD_LENSES), mode="auto", autonomy=cfg(), ultracode={"max_agents": 13}
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "review INCOMPLETE" in report
+    assert "correctness lens (no findings array)" in report and "security/robustness lens" in report
+    assert "review panel found nothing" not in report
+    lens_runs = [
+        h.description
+        for h in server.subagents.handles.values()
+        if h.description in ("review: correctness", "review: security/robustness")
+    ]
+    assert len(lens_runs) == 4  # each lens was asked once more
+
+
+@pytest.mark.parametrize("max_agents", [12, 10], ids=["retry-refused", "second-lens-refused"])
+async def test_a_budget_stop_in_the_review_panel_still_says_the_review_is_incomplete(tmp_path, monkeypatch, max_agents):
+    # the budget ran out inside the panel (a lens retry, or a lens that never started): the report said
+    # "0 candidate finding(s)" plus STOPPED and nothing about the lenses that never answered
+    repo = git_repo(tmp_path / "repo")
+    server = make(
+        tmp_path,
+        monkeypatch,
+        code_steps(*DEAD_LENSES),
+        mode="auto",
+        autonomy=cfg(),
+        ultracode={"max_agents": max_agents},
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "STOPPED" in report and f"agent budget exhausted ({max_agents}/{max_agents} agents)" in report
+    assert "review INCOMPLETE" in report
+    assert "correctness lens (" in report and "security/robustness lens (" in report
+    assert "found nothing" not in report
+
+
 async def test_ultracode_agent_budget_stops_it(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     server = make(
@@ -443,7 +492,7 @@ async def test_a_review_lens_that_died_is_not_a_lens_that_found_nothing():
                     await ex.review_and_fix(session, budget, report, "task", "plan", "base")
             else:
                 await ex.review_and_fix(session, budget, report, "task", "plan", "base")
-                assert any("did not finish" in n for n in report.notes)
+                assert any("review INCOMPLETE" in n and "provider exploded" in n for n in report.notes)
                 # no lens answered: the report says the panel did not review the change, not "0 candidates"
                 # and not that it found nothing in the lenses that finished (none did)
                 assert report.panel_ran is False
@@ -479,8 +528,8 @@ async def test_a_panel_with_one_lens_left_still_counts_as_run(monkeypatch):
     session = SimpleNamespace(perms=SimpleNamespace(cwd="."))
     await ex.review_and_fix(session, AgentBudget(max_agents=9, max_tokens=1500), report, "task", "plan", "base")
     assert report.panel_ran is True, "one lens answered: the panel ran, and the dead one is listed as missing"
-    assert any("did not finish" in n for n in report.notes)
-    assert "review panel found nothing in the lenses that finished" in report.notes
+    assert any("review INCOMPLETE" in n and "security/robustness lens" in n for n in report.notes)
+    assert "the lenses that answered found nothing" in report.notes
     assert "0 candidate finding(s)" in report.render()
 
 

@@ -16,7 +16,7 @@ from typing import Any
 from k3code.autonomy.proposals import Proposal, ProposalStore, dedup_key
 from k3code.learning.fsutil import write_text_atomic
 from k3code.learning.ranking import jaccard, tokens
-from k3code.paths import home
+from k3code.paths import home, private_file
 from k3code.skills import parse_frontmatter
 
 logger = logging.getLogger(__name__)
@@ -46,10 +46,9 @@ def record_use(name: str, *, ok: bool = True, clock: Callable[[], float] = time.
     e["failures"] += 0 if ok else 1
     e["last_used"] = clock()
     path = _usage_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     # temp file + rename: a crash (or a second process) mid-write left a truncated file, which load_usage then read
     # as empty and the next write made every count start over
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp = private_file(path.with_name(f"{path.name}.{os.getpid()}.tmp"))  # 0600; a missing skills/ is made 0700
     tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
     os.replace(tmp, path)
 
@@ -127,7 +126,7 @@ def curate(
     marks = {s["name"]: {"state": "stale", "reason": why, "at": now} for s, why in stale}
     if root.is_dir():
         try:
-            write_text_atomic(root / ".curator.json", json.dumps(marks, indent=1))
+            write_text_atomic(root / ".curator.json", json.dumps(marks, indent=1), private=True)
         except OSError as e:  # the marks are a courtesy to /skills: the proposals below do not depend on them
             logger.warning("skills curator: %s not written: %s", root / ".curator.json", e)
     proposals: list[Proposal] = []

@@ -23,6 +23,8 @@
 # Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
 #   K3_NO_DOWNLOAD (= --no-install-deps), K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv,
 #   no network), K3_EDITABLE (--from-source only), K3_BWRAP (the bubblewrap binary to probe).
+# K3_REQUIRE_TUI=1 (set by `k3code update`): a TUI build that was tried and failed fails the run, so no version without
+# the TUI is staged for an update. Without it such a failure is a warning and k3code uses the line REPL.
 set -eu
 
 DEFAULT_URL=https://github.com/K3NOXOFFICIAL/k3code.git
@@ -274,7 +276,17 @@ detect_platform() {
   case "$ARCH" in x86_64 | amd64) NODE_ARCH=x64 GO_ARCH=amd64 ;; *) NODE_ARCH=arm64 GO_ARCH=arm64 ;; esac
   case "$PLATFORM" in Linux) NODE_OS=linux GO_OS=linux ;; *) NODE_OS=darwin GO_OS=darwin ;; esac
   MUSL=0
-  if [ "$PLATFORM" = Linux ] && ls /lib/ld-musl-* >/dev/null 2>&1; then MUSL=1; fi # Alpine: no official Node build
+  if [ "$PLATFORM" = Linux ] && running_on_musl; then MUSL=1; fi # Alpine: no official Node build
+}
+
+running_on_musl() { # the C library this system runs on; a /lib/ld-musl-* file alone proves nothing (Debian's musl package ships one)
+  if have ldd; then
+    case $(ldd --version 2>&1 || true) in
+      *[Mm][Uu][Ss][Ll]*) return 0 ;;
+      *GLIBC* | *GNU*) return 1 ;;
+    esac
+  fi
+  [ -e /etc/alpine-release ]
 }
 
 detect_pm() {
@@ -706,6 +718,17 @@ recorded_version() {
   printf '%s' "$found"
 }
 
+plain_url() { # plain_url URL: an http(s) URL without its user:password@ part, so no credential is ever stored
+  case "$1" in
+    http://* | https://*)
+      pu_rest=${1#*://}
+      pu_auth=${pu_rest%%/*}
+      printf '%s://%s%s\n' "${1%%://*}" "${pu_auth##*@}" "${pu_rest#"$pu_auth"}"
+      ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
 installed_ref() { # the ref the active version was built from, if it was recorded
   if [ -f "$DATA/current/.ref" ]; then cat "$DATA/current/.ref"; fi
   return 0
@@ -883,6 +906,13 @@ acquire_source() {
 }
 
 # ---- build -----------------------------------------------------------------
+tui_failed() { # tui_failed WHY: the TUI was built and the build failed (a skipped one is not a failure)
+  # `k3code update` stages with --no-activate and must not switch to a version that lost the TUI because the npm
+  # registry was unreachable; the half-built version is removed on exit, so the next update builds it again
+  if [ "${K3_REQUIRE_TUI:-0}" = 1 ]; then die "$1; nothing was activated"; fi
+  log "WARNING: $1; k3code will use the line REPL"
+}
+
 build_tui() {
   if [ "${K3_SKIP_TUI:-0}" = 1 ]; then return 0; fi
   if [ "$NODE_OK" != 1 ]; then
@@ -896,7 +926,7 @@ build_tui() {
     # cleanup removes it on exit; after a SIGKILL the run that takes over the lock finds it here
     printf '%s\n' "$TUI_TMP" >"$LOCK/tui_tmp"
     if ! (cd "$SRC_ROOT" && tar -cf - --exclude=node_modules --exclude=dist tui) | (cd "$TUI_TMP" && tar -xf -); then
-      log "WARNING: could not copy the TUI sources to $TUI_TMP; k3code will use the line REPL"
+      tui_failed "could not copy the TUI sources to $TUI_TMP"
       return 0
     fi
     tui=$TUI_TMP/tui
@@ -907,7 +937,7 @@ build_tui() {
     # Build receipts belong to the build tooling; nothing at runtime reads them.
     rm -f "$VERDIR/tui/dist/hermes-build.json" "$VERDIR/tui/dist/.k3code-product"
   else
-    log "WARNING: the TUI did not build (output above); k3code will use the line REPL"
+    tui_failed "the TUI did not build (output above)"
   fi
   return 0
 }
@@ -925,6 +955,7 @@ build_panes() {
   esac
   if ! (cd "$SRC_ROOT/panes" && "$@" CGO_ENABLED=0 "$GO" build -trimpath -ldflags "-s -w" -o "$VERDIR/bin/k3" ./cmd/k3 >&2); then
     log "WARNING: the k3 pane binary did not build (output above); the multi-window binary is missing"
+    printf 'k3: the go build failed\n' >"$VERDIR/.degraded" # k3code update reports it (k3 is optional: the version stays)
   fi
   if [ -d "$DATA/go/path" ]; then rm -rf "$DATA/go/path"; fi # the module cache is only needed during the build
   return 0
@@ -954,6 +985,12 @@ install_core_copy() {
 install_version() {
   if [ -f "$VERDIR/.complete" ]; then
     log "version $VER already installed"
+    # The build is reused, but the ref asked for now is what the install follows: a SHA pins it, a branch or tag does
+    # not (`k3code update` reads .ref). A temp file and a rename, so an interrupted write never leaves a torn .ref.
+    if [ "$FROM" = git ] && [ "$(cat "$VERDIR/.ref" 2>/dev/null)" != "$REF" ]; then
+      printf '%s\n' "$REF" >"$VERDIR/.ref.new"
+      mv -f "$VERDIR/.ref.new" "$VERDIR/.ref"
+    fi
     return 0
   fi
   log "installing version $VER into $VERDIR"
@@ -986,7 +1023,10 @@ install_version() {
     "$VERDIR/venv/bin/k3code" --version >&2 || die "the new version does not start (k3code --version failed); nothing was activated"
   fi
   if [ "$FROM" = source ]; then printf '%s\n' "$SOURCE_PATH" >"$DATA/source_path"; fi
-  if [ "$FROM" = git ]; then printf '%s\n' "$REF" >"$VERDIR/.ref"; fi
+  if [ "$FROM" = git ]; then
+    printf '%s\n' "$REF" >"$VERDIR/.ref"
+    plain_url "$GIT_URL" >"$VERDIR/.url" # `k3code update` follows the same remote (a fork or mirror, not upstream)
+  fi
   printf '%s\n' "$VER" >"$VERDIR/.complete"
   BUILDING=""
   return 0

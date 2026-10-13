@@ -39,6 +39,7 @@ def test_detached_update_carries_the_install_tree_and_api_but_never_a_secret(
         returncode, stdout, stderr = 0, "", ""
 
     monkeypatch.setenv("HOME", str(tmp_path / "me"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)  # the env file is $XDG_CONFIG_HOME/k3code/env, else ~/.config
     monkeypatch.setenv("K3CODE_DATA", "/srv/k3/data")
     monkeypatch.setenv("K3CODE_HOME", "/srv/k3/home")
     monkeypatch.setenv("K3CODE_UPDATE_API", "https://mirror.example/api")
@@ -206,9 +207,9 @@ def test_a_failed_uv_step_names_the_reason(data: Path, tmp_path: Path, monkeypat
     uv = _fake_uv(
         tmp_path, 'if [ "$2" = install ]; then echo "error: no matching distribution found for foo" >&2; exit 2; fi'
     )
-    with pytest.raises(subprocess.CalledProcessError) as err:  # the type the CLI already catches
+    with pytest.raises(upd.ReleaseBuildError) as err:  # the type the CLI catches to show uv's own words
         upd.install_release(rel, None, uv=uv)
-    assert "no matching distribution found for foo" in str(err.value) and "exited 2" in str(err.value)
+    assert "no matching distribution found for foo" in str(err.value) and "failed (exit 2)" in str(err.value)
     assert not (data / "versions" / "9.0.0").exists()
 
 

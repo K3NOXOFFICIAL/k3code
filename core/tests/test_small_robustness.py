@@ -271,3 +271,117 @@ async def test_grep_stops_reading_at_the_result_cap(tmp_path, no_git_env):
     res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
     assert len(res["matches"].splitlines()) == MAX_SEARCH_RESULTS + 1  # the file's path, then its matches
     assert "truncated" in res["warnings"]
+
+
+def _git_init(root: Path) -> None:
+    assert shutil.which("git")
+    subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
+    assert (root / ".git" / "HEAD").is_file()  # the repository is the test's own
+
+
+async def test_glob_in_a_work_tree_stats_only_its_hits(tmp_path, no_git_env, monkeypatch):
+    # An lstat per listed file took about 157 s for a 45k-file checkout on WSL /mnt/c (#77)
+    for i in range(200):
+        (tmp_path / f"f{i:03d}.txt").write_text("")
+    (tmp_path / "a.py").write_text("")
+    _git_init(tmp_path)
+    checked: list[str] = []
+    real = os.path.lexists
+
+    def spy(p):
+        checked.append(Path(p).name)
+        return real(p)
+
+    monkeypatch.setattr(os.path, "lexists", spy)
+    res = await tool_glob({"pattern": "*.py"}, cwd=tmp_path)
+    assert res["files"] == ["a.py"]
+    assert checked == ["a.py"]
+
+
+def test_the_work_tree_listing_stops_at_the_deadline(tmp_path, no_git_env):
+    import time
+
+    from k3code.tools import _git_files, _iter_tree
+
+    _tree(tmp_path)
+    _git_init(tmp_path)
+    assert _git_files(tmp_path)  # the git listing, not the rg or walk fallback, is what has to stop
+    assert list(_iter_tree(tmp_path, time.monotonic() - 1.0)) == [(None, False)]
+
+
+async def test_the_grep_fallback_skips_a_200_mb_binary_without_reading_it(tmp_path, no_git_env, monkeypatch):
+    import tracemalloc
+
+    with (tmp_path / "big.bin").open("wb") as f:
+        f.write(b"needle\n")
+        f.truncate(200 * 1024 * 1024)  # sparse: NUL bytes after the first line, nothing on disk
+    (tmp_path / "a.py").write_text("needle\n")
+    monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
+    tracemalloc.start()
+    try:
+        res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert res["matches"] == f"{tmp_path / 'a.py'}:1:needle"
+    assert peak < 16 * 1024 * 1024
+
+
+async def test_the_grep_fallback_streams_a_large_text_file(tmp_path, no_git_env, monkeypatch):
+    import tracemalloc
+
+    big = tmp_path / "big.log"
+    with big.open("w") as f:
+        for _ in range(64 * 1024):
+            f.write("x" * 1023 + "\n")
+        f.write("needle\n")
+        f.write("y" * (8 * 1024 * 1024) + " needle\n")  # one 8 MB line: read in bounded pieces, not whole
+    monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
+    tracemalloc.start()
+    try:
+        res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    hits = [line.split(":")[1] for line in res["matches"].splitlines()]
+    assert hits == [str(64 * 1024 + 1), str(64 * 1024 + 2)]
+    assert peak < 16 * 1024 * 1024
+
+
+@pytest.mark.parametrize("line,count", [("x\n", 500_000), ("x" * (2 << 20) + "\n", 8)], ids=["short", "long"])
+def test_the_grep_fallback_checks_the_deadline_inside_a_file(tmp_path, monkeypatch, line, count):
+    import types
+
+    import k3code.tools as tools
+
+    ticks = iter(range(1_000_000))
+    monkeypatch.setattr(tools, "time", types.SimpleNamespace(monotonic=lambda: float(next(ticks))))
+    big = tmp_path / "big.txt"
+    big.write_text(line * count)  # no match, so only the clock can stop the search before the end of the file
+    res = tools._grep_fallback("needle", big, None, None)
+    assert "stopped after" in res.get("warnings", "")
+
+
+async def test_the_grep_fallback_cuts_long_matching_lines_like_rg(tmp_path, no_git_env, monkeypatch):
+    import tracemalloc
+
+    (tmp_path / "bundle.min.js").write_text(("needle" + "y" * 1018) * 32 * 1024)  # 32 MB on one line
+    (tmp_path / "a.js").write_text("x" * 500 + " needle\n")
+    monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
+    tracemalloc.start()
+    try:
+        res = await tool_grep({"pattern": "needle"}, cwd=tmp_path)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert f"{tmp_path / 'a.js'}:1:{'x' * 400} [... omitted end of long line]" in res["matches"].splitlines()
+    assert peak < 16 * 1024 * 1024
+
+
+async def test_the_grep_fallback_says_a_named_binary_file_matches(tmp_path, no_git_env, monkeypatch):
+    lib = tmp_path / "lib.so"
+    lib.write_bytes(b"\x7fELF\x00\x00 SYMBOL_NAME\n" + b"\x00" * 100)
+    monkeypatch.setenv("PATH", str(tmp_path / "no-bin"))
+    res = await tool_grep({"pattern": "SYMBOL_NAME", "path": str(lib)}, cwd=tmp_path)
+    assert res["matches"] == f"{lib}: binary file matches"
+    assert (await tool_grep({"pattern": "absent", "path": str(lib)}, cwd=tmp_path))["matches"] == ""

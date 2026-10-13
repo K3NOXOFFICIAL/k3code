@@ -163,7 +163,7 @@ class FileChangeTrigger(Trigger):
 
 
 async def git_out(cwd: str, *args: str) -> str:
-    from k3code.reliability.sandbox import child_env, harness_git_argv
+    from k3code.reliability.sandbox import harness_git_argv, harness_git_env
 
     proc = await asyncio.create_subprocess_exec(
         *harness_git_argv(*args),
@@ -171,7 +171,7 @@ async def git_out(cwd: str, *args: str) -> str:
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
-        env=child_env(),
+        env=harness_git_env(),
     )
     out, _ = await proc.communicate()
     return out.decode().strip() if proc.returncode == 0 else ""

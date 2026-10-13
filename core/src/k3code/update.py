@@ -20,13 +20,15 @@ from typing import Any
 import httpx
 
 from k3code import service
-from k3code.paths import GATEWAY_ENV_VARS, data_dir, user_config_path
+from k3code.paths import GATEWAY_ENV_VARS, data_dir, home, user_config_path
+from k3code.setup.state import env_file_path
 
 DEFAULT_REPO = "K3NOXOFFICIAL/k3code"
 #: The GitHub-compatible releases API; K3CODE_UPDATE_API or update.api point it at a mirror.
 DEFAULT_API = "https://api.github.com"
 KEEP_VERSIONS = 3
 DAEMON_WAIT_SECONDS = 120
+DAEMON_NOT_STARTED = "daemon not running, not started"
 
 
 def versions_dir() -> Path:
@@ -160,6 +162,15 @@ def daemon_healthy() -> bool:
     return service.active_state() == "active"
 
 
+def daemon_is_stopped() -> bool:
+    """True when systemd says the unit is ``inactive``, which is what ``systemctl --user stop`` leaves.
+
+    A restart would start it, so an update or rollback leaves it alone (``install.sh`` does the same). ``failed`` (it
+    crashed) and ``activating`` (it is waiting out an automatic restart) are not stopped: the restart is what brings
+    them back. Without systemd the answer is no, and ``restart()`` reports that as before."""
+    return service.active_state() == "inactive"
+
+
 def wait_healthy(
     healthy: Callable[[], bool] = daemon_healthy,
     timeout: float = DAEMON_WAIT_SECONDS,
@@ -232,11 +243,14 @@ def activate(
     restart: Callable[[], None] = restart_daemon,
     healthy: Callable[[], bool] = daemon_healthy,
     daemon_installed: Callable[[], bool] = service.is_installed,
+    daemon_stopped: Callable[[], bool] = daemon_is_stopped,
     smoke: Callable[[Path], tuple[bool, str]] = smoke_test,
     wait: Callable[..., bool] = wait_healthy,
     carry: Callable[[Path, Path], str | None] = carry_playwright,
 ) -> UpdateResult:
     """Smoke-test ``versions/<version>``, switch to it, restart the daemon; roll back on any failure.
+
+    A daemon that was stopped before the switch stays stopped: the new version is activated and nothing is started.
 
     Release, source and git updates all pass through here, so this is where the new venv gets the optional Playwright
     package the current one has (before the smoke test, which then runs the venv as it will be used)."""
@@ -250,9 +264,12 @@ def activate(
         if version not in (prev, previous_version()):  # a staged build that never ran: do not leave it behind
             shutil.rmtree(vdir, ignore_errors=True)
         return UpdateResult(False, version, f"smoke test failed, not switching: {detail}", log=[*log, detail])
+    stopped = daemon_installed() and daemon_stopped()  # asked before the switch, as the installer asks before its own
     switch_to(version)
     log.append(f"switched current -> {version} (was {prev})")
-    if daemon_installed():
+    if stopped:
+        log.append(DAEMON_NOT_STARTED)
+    elif daemon_installed():
         try:
             restart()
             up = wait(healthy)
@@ -270,18 +287,24 @@ def activate(
                 log.append(f"daemon unhealthy after {DAEMON_WAIT_SECONDS}s; rolled back to {prev}")
                 return UpdateResult(False, version, log[-1], rolled_back=True, log=log)
             return UpdateResult(False, version, "daemon unhealthy and no previous version to roll back to", log=log)
-    warnings = "".join(f"\n{line}" for line in log if line.startswith("warning:"))
-    return UpdateResult(True, version, f"updated to {version}{warnings}", log=log)
+    notes = "".join(f"\n{line}" for line in log if line.startswith("warning:") or line == DAEMON_NOT_STARTED)
+    return UpdateResult(True, version, f"updated to {version}{notes}", log=log)
 
 
 def rollback(
-    *, restart: Callable[[], None] = restart_daemon, daemon_installed: Callable[[], bool] = service.is_installed
+    *,
+    restart: Callable[[], None] = restart_daemon,
+    daemon_installed: Callable[[], bool] = service.is_installed,
+    daemon_stopped: Callable[[], bool] = daemon_is_stopped,
 ) -> UpdateResult:
     prev = previous_version()
     cur = current_version()
     if not prev:
         return UpdateResult(False, cur or "", "no previous version to roll back to")
+    stopped = daemon_installed() and daemon_stopped()
     switch_to(prev)  # records `cur` as the new previous, so rollback twice toggles
+    if stopped:
+        return UpdateResult(True, prev, f"rolled back {cur} -> {prev}\n{DAEMON_NOT_STARTED}", rolled_back=True)
     if daemon_installed():
         try:
             restart()
@@ -290,10 +313,70 @@ def rollback(
     return UpdateResult(True, prev, f"rolled back {cur} -> {prev}", rolled_back=True)
 
 
+#: What shows that a version dir has the TUI (the file doctor's check_tui looks for) and the k3 multi-window binary.
+#: The installer builds both on a best-effort basis, so a version without one is complete, just poorer.
+TUI_ENTRY = Path("tui") / "dist" / "entry.js"
+K3_BINARY = Path("bin") / "k3"
+#: install.sh writes ``k3: <why>`` here when it tried to build the k3 binary and failed (a skip leaves nothing).
+DEGRADED_FILE = ".degraded"
+
+
+def has_file(version: str, rel: Path) -> bool:
+    return (versions_dir() / version / rel).is_file()
+
+
+def newest_first(versions: list[str]) -> list[str]:
+    """``versions`` by build time (``.complete``, else the dir), newest first.
+
+    Not by name: the ``-src.<sha>`` suffix of a git or source build compares as a plain string, which says nothing
+    about age (prune kept an old build and deleted a newer one). Equal times fall back to the version number."""
+
+    def built_at(version: str) -> float:
+        d = versions_dir() / version
+        for p in (d / ".complete", d):
+            with contextlib.suppress(OSError):
+                return p.stat().st_mtime
+        return 0.0
+
+    return sorted(versions, key=lambda v: (built_at(v), version_key(v)), reverse=True)
+
+
+def running_versions(proc: Path = Path("/proc")) -> set[str]:
+    """The ``versions/<name>`` dirs that a running process executes from or sits in (needs /proc: empty elsewhere).
+
+    A venv python's ``exe`` is the base interpreter, so the version shows in the command line (the script and the
+    shebang interpreter), as install.sh's daemon_version reads it; the TUI's node and gateway processes name it the
+    same way. What cannot be read (another user's process, one that just exited) is skipped."""
+    base = versions_dir()
+    prefixes = "|".join(re.escape(f"{p}/") for p in {str(base), str(base.resolve())})
+    name_after_prefix = re.compile(f"(?:{prefixes})([^/\\s]+)")
+    try:
+        pids = [p for p in proc.iterdir() if p.name.isdigit()]
+    except OSError:
+        return set()
+    found: set[str] = set()
+    for pid in pids:
+        texts: list[str] = []
+        for link in ("exe", "cwd"):
+            with contextlib.suppress(OSError):
+                texts.append(os.readlink(pid / link))
+        with contextlib.suppress(OSError):
+            texts.append((pid / "cmdline").read_bytes().replace(b"\0", b"\n").decode(errors="replace"))
+        found.update(m.group(1) for text in texts for m in name_after_prefix.finditer(text))
+    return found
+
+
 def prune(keep: int = KEEP_VERSIONS) -> list[str]:
-    """Delete the oldest version dirs beyond ``keep``, never the current or previous one."""
-    protected = {current_version(), previous_version()}
-    vers = sorted(installed_versions(), key=version_key, reverse=True)
+    """Delete the version dirs beyond the ``keep`` newest builds, oldest first by build time.
+
+    Never the current or previous one, one that a running process executes from (a daemon or TUI that lost its
+    directory fails on its next lazy import), nor, when the current version has no k3 binary, the newest version
+    that still has one (a rollback or a retried build needs it)."""
+    cur = current_version()
+    protected = {cur, previous_version(), *running_versions()}
+    vers = newest_first(installed_versions())
+    if cur and not has_file(cur, K3_BINARY):
+        protected.add(next((v for v in vers if has_file(v, K3_BINARY)), None))
     removed = []
     for v in vers[keep:]:
         if v not in protected:
@@ -330,12 +413,14 @@ def update_settings() -> dict[str, Any]:
 
     s = confio.read_yaml(user_config_path()).get("update") or {}
     repo = s.get("repo", DEFAULT_REPO)
+    # the git remote a `install.sh --from-git` install updates from: update.url, else update.repo, else the remote
+    # the install was made from (a fork or mirror), else the default repository
+    url = s.get("url") or (None if "repo" in s else git_url())
     return {
         "channel": s.get("channel", "stable"),
         "repo": repo,
         "source": s.get("source", ""),
-        # the git remote a `install.sh --from-git` install updates from (a fork or mirror may set its own)
-        "url": s.get("url") or f"https://github.com/{repo}.git",
+        "url": url or f"https://github.com/{repo}.git",
         "api": os.environ.get("K3CODE_UPDATE_API") or s.get("api") or DEFAULT_API,
     }
 
@@ -460,6 +545,19 @@ class InstallLockHeld(OSError):
     """Another install or update into the same install root holds its lock."""
 
 
+class ReleaseBuildError(RuntimeError):
+    """A ``uv`` step of building a release failed; the message ends with the last lines of uv's own output."""
+
+
+def _run_uv(cmd: list[str], what: str) -> None:
+    """Run one ``uv`` step of a release build; a failure carries the end of uv's output (the cause comes last)."""
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        tail = "\n".join(((e.stderr or "").strip() or (e.stdout or "").strip()).splitlines()[-8:])
+        raise ReleaseBuildError(f"{what} failed (exit {e.returncode}):\n{tail}") from e
+
+
 def _pid_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -581,22 +679,6 @@ def install_release(rel: Release, token: str | None, uv: str | None = None, *, a
         return _build_release(rel, token, uv, allow_unpinned=allow_unpinned)
 
 
-class BuildStepError(subprocess.CalledProcessError):
-    """A uv step failed; ``str()`` carries the tail of its stderr (capture_output used to hide why)."""
-
-    def __str__(self) -> str:
-        tail = "\n".join((self.stderr or self.stdout or "").strip().splitlines()[-6:])
-        step = " ".join([Path(str(self.cmd[0])).name, *map(str, self.cmd[1:3])])
-        return f"`{step}` exited {self.returncode}" + (f":\n{tail}" if tail else "")
-
-
-def _run_step(argv: list[str]) -> None:
-    try:
-        subprocess.run(argv, capture_output=True, text=True, check=True)
-    except subprocess.CalledProcessError as e:
-        raise BuildStepError(e.returncode, argv, e.stdout, e.stderr) from None
-
-
 def platform_binary() -> str:
     """The release asset holding the ``k3`` binary for this machine (``k3-linux-amd64``)."""
     import platform
@@ -636,15 +718,15 @@ def _build_release(rel: Release, token: str | None, uv: str | None, *, allow_unp
         wheel = next((p for n, p in files.items() if n.endswith(".whl")), None)
         if wheel is None:
             raise ValueError("release has no wheel")
-        _run_step([uv, "venv", "--python", ">=3.12", str(vdir / "venv")])
+        _run_uv([uv, "venv", "--python", ">=3.12", str(vdir / "venv")], "uv venv")
         py = str(vdir / "venv" / "bin" / "python")
         reqs = next((p for n, p in files.items() if n.endswith(REQUIREMENTS_SUFFIX)), None)
         if reqs is None:  # allow_unpinned: an older release, resolved as before
-            _run_step([uv, "pip", "install", "--python", py, str(wheel)])
+            _run_uv([uv, "pip", "install", "--python", py, str(wheel)], "uv pip install")
         else:
             pip = [uv, "pip", "install", "--python", py]
-            _run_step([*pip, "--require-hashes", "-r", str(reqs)])
-            _run_step([*pip, "--no-deps", str(wheel)])
+            _run_uv([*pip, "--require-hashes", "-r", str(reqs)], "uv pip install")
+            _run_uv([*pip, "--no-deps", str(wheel)], "uv pip install")
         tui = next((p for n, p in files.items() if n.startswith("k3code-tui") and n.endswith(".tar.gz")), None)
         if tui:
             (vdir / "tui").mkdir()
@@ -696,20 +778,22 @@ def spawn_update(exe: str) -> str:
     )
 
 
-#: What a transient ``systemd-run --user`` unit would lose (it starts from the user manager's environment, not the
-#: daemon's): which install tree and release API this update works on.
-_UNIT_ENV = ("K3CODE_DATA", "K3CODE_HOME", "K3CODE_ROOT", "K3CODE_UPDATE_API")
+#: What a transient ``systemd-run --user`` unit would lose besides the install tree (it starts from the user manager's
+#: environment, not the daemon's), passed on when the daemon has it: a dev checkout, the release API a mirror serves.
+_UNIT_ENV = ("K3CODE_ROOT", "K3CODE_UPDATE_API")
 
 
 def _transient_env() -> list[str]:
-    """``systemd-run`` arguments that give the update the daemon's environment. argv is readable by every local user:
-    no key or token goes on it. GITHUB_TOKEN and the rest come from the file the daemon's own unit reads."""
-    args = [
+    """``systemd-run`` arguments that give the update the daemon's environment: the install tree (``K3CODE_DATA``,
+    ``K3CODE_HOME``) and what :data:`_UNIT_ENV` names. argv is readable by every local user: no key or token goes on
+    it. GITHUB_TOKEN and the rest come from the file the daemon's own unit reads."""
+    args = [f"--setenv=K3CODE_DATA={data_dir()}", f"--setenv=K3CODE_HOME={home()}"]
+    args += [
         f"--setenv={k}={v}"
         for k in _UNIT_ENV
         if (v := os.environ.get(k)) and not (k == "K3CODE_UPDATE_API" and "@" in v)  # userinfo in a URL is a secret
     ]
-    return [*args, f"--property=EnvironmentFile=-{Path.home() / '.config' / 'k3code' / 'env'}"]
+    return [*args, f"--property=EnvironmentFile=-{env_file_path().absolute()}"]
 
 
 def apply_detached(*, unit_installed: Callable[[], bool] = service.is_installed) -> str:
@@ -719,6 +803,11 @@ def apply_detached(*, unit_installed: Callable[[], bool] = service.is_installed)
     it was restarting: systemd SIGTERMed the whole cgroup (the poller included), so the auto-rollback branch could
     never run and the shutdown hung on the executor thread. A transient ``systemd-run --user`` unit survives it.
     Without a unit there is nothing to restart, and no systemd to ask on macOS or most WSL setups: a detached process.
+
+    A transient unit starts from the user manager's environment, not ours. The daemon's unit hands it K3CODE_DATA and
+    K3CODE_HOME (``Environment=``) and the provider and GitHub keys (``EnvironmentFile=``); the update gets the same,
+    so it updates the install the daemon runs from and can reach a private repository. The keys stay in the file:
+    nothing secret goes on a command line or into the unit's properties.
     """
     exe = shutil.which("k3code") or str(Path(sys.argv[0]).resolve())
     if not unit_installed():
@@ -778,6 +867,15 @@ def _in_wsl() -> bool:
         return False
 
 
+def installer_command(args: str) -> str:
+    """The installer command for a hint, in backticks. On Windows k3code runs in WSL, where the installer a user
+    starts from is `install.ps1` (there is no `sh` in PowerShell); `install.sh` still works inside WSL."""
+    sh = f"`sh install.sh {args}`"
+    if not _in_wsl():
+        return sh
+    return f"`powershell -ExecutionPolicy Bypass -File install\\install.ps1 {args}` or, inside WSL, {sh}"
+
+
 def git_pull_command(checkout: Path) -> list[str]:
     """The command that fast-forwards ``checkout``.
 
@@ -811,13 +909,60 @@ def pull_checkout(checkout: Path) -> None:
     raise SourceUpdateError(f"git pull failed in {checkout}:\n{err[:600]}")
 
 
+#: How much of a failed installer's output an error shows. npm names its reason in the first lines of a stack trace
+#: of about thirty, so the last few lines alone would show only the trace.
+INSTALLER_TAIL_LINES = 40
+
+
 def _installer_env(**extra: str) -> dict[str, str]:
-    """The environment for install.sh: an install made as root (``--allow-root``) must stay updatable as root. An
-    environment variable, unlike a flag, is ignored by an older installer."""
-    env = {**os.environ, **extra}
+    """The environment for install.sh: an install made as root (``--allow-root``) must stay updatable as root, and a
+    TUI build that fails (npm unreachable) must fail the staging instead of leaving a version without the TUI to
+    switch to. An environment variable, unlike a flag, is ignored by an older installer (see vet_staged)."""
+    env = {**os.environ, "K3_REQUIRE_TUI": "1", **extra}
     if os.geteuid() == 0:
         env["K3_ALLOW_ROOT"] = "1"
     return env
+
+
+def vet_staged(version: str) -> list[str]:
+    """Compare ``version``, staged and not yet active, with the active one; the warning lines to show after the switch.
+
+    The installer builds the TUI and the k3 binary on a best-effort basis, so a build that lost one (npm or the Go
+    module proxy unreachable) is a complete version, and an update used to switch to it and report success.
+
+    A TUI that the active version has and ``version`` lacks refuses the update (``SourceUpdateError``): the staged dir
+    is removed, unless it is the previous version or one that a process runs from (the installer reuses an installed
+    build of the same commit), so that the next update builds it again instead of finding it installed. install.sh
+    fails that build itself under K3_REQUIRE_TUI; this covers a ref whose installer predates it and a TUI that was
+    skipped (Node could not be fetched). k3 is optional, so a missing one only warns."""
+    cur = current_version()
+    if not cur or cur == version:
+        return []
+    if has_file(cur, TUI_ENTRY) and not has_file(version, TUI_ENTRY):
+        if version not in {previous_version(), *running_versions()}:
+            shutil.rmtree(versions_dir() / version, ignore_errors=True)
+        raise SourceUpdateError(
+            f"{version} was not activated: its TUI is missing (the build failed or was skipped; the installer's "
+            f"messages are in {data_dir() / 'install.log'}) and {cur} stays current. Run `k3code update` again when "
+            "the TUI can build."
+        )
+    if has_file(version, K3_BINARY):
+        return []
+    try:
+        failed = any(
+            line.startswith("k3:") for line in (versions_dir() / version / DEGRADED_FILE).read_text().splitlines()
+        )
+    except OSError:
+        failed = False
+    holder = next((v for v in newest_first(installed_versions()) if v != version and has_file(v, K3_BINARY)), None)
+    if holder is None and not failed:
+        return []  # nothing was lost and nothing is known to have failed (no Go on this machine)
+    kept = "no installed version has it" if holder is None else f"{holder} still has it"
+    if holder == cur:
+        kept += "; `k3code update --rollback` goes back to it"
+    why = "its build failed" if failed else "it was not built"
+    log = data_dir() / "install.log"
+    return [f"warning: {version} has no k3 multi-window binary ({why}; the installer's messages are in {log}): {kept}"]
 
 
 def update_from_source(checkout: Path, *, pull: bool = True) -> str:
@@ -840,7 +985,7 @@ def update_from_source(checkout: Path, *, pull: bool = True) -> str:
         env=_installer_env(),
     )
     if r.returncode:
-        tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
+        tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-INSTALLER_TAIL_LINES:])
         raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
     return r.stdout.strip().splitlines()[-1]
 
@@ -867,6 +1012,15 @@ def git_ref() -> str | None:
     except OSError:
         return None
     return ref or None
+
+
+def git_url() -> str | None:
+    """The remote the active version was built from (``install.sh --from-git``); None when it was not recorded."""
+    try:
+        url = (current_link() / ".url").read_text().strip()
+    except OSError:
+        return None
+    return url or None
 
 
 def is_commit_sha(ref: str) -> bool:
@@ -935,7 +1089,7 @@ def remote_head(url: str, ref: str) -> str:
             return refs[name]
     raise SourceUpdateError(
         f"'{ref}' was not found on {url}: the branch or tag this install follows is gone. Reinstall from another "
-        f"one: `sh install.sh --from-git {url} --ref Main`"
+        f"one: {installer_command(f'--from-git {url} --ref Main')}"
     )
 
 
@@ -975,7 +1129,7 @@ def update_from_git(url: str, ref: str) -> str:
             env=_installer_env(K3CODE_DATA=str(data_dir()), GIT_TERMINAL_PROMPT="0"),
         )
         if r.returncode or not r.stdout.strip():
-            tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
+            tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-INSTALLER_TAIL_LINES:])
             raise SourceUpdateError(f"the installer failed (exit {r.returncode}):\n{tail}")
         return r.stdout.strip().splitlines()[-1]
     finally:

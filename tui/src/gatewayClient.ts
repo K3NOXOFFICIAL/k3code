@@ -15,12 +15,15 @@ import { reconnectBackoffDelayMs } from "@k3code/shared/reconnect-backoff";
 
 import type { AnyGatewayEvent } from "./gatewayTypes.js";
 import { CircularBuffer } from "./lib/circularBuffer.js";
+import { readBoundedLines } from "./lib/boundedLines.js";
 import { recordParentLifecycle } from "./lib/parentLog.js";
 
 const MAX_GATEWAY_LOG_LINES = 200;
 const MAX_LOG_LINE_BYTES = 4096;
 const MAX_BUFFERED_EVENTS = 2000;
 const MAX_LOG_PREVIEW = 240;
+// The gateway caps a frame at 8M chars; anything longer is a runaway line, dropped before it is ever parsed.
+const MAX_FRAME_CHARS = 16 * 1024 * 1024;
 const STARTUP_TIMEOUT_MS = Math.max(
   5000,
   parseInt(process.env.K3CODE_TUI_STARTUP_TIMEOUT_MS ?? "15000", 10) || 15000,
@@ -237,7 +240,7 @@ export class GatewayClient extends EventEmitter {
   private readyTimer: ReturnType<typeof setTimeout> | null = null;
   private subscribed = false;
   private drainGeneration = 0;
-  private stdoutRl: ReturnType<typeof createInterface> | null = null;
+  private stopStdout: (() => void) | null = null;
   private stderrRl: ReturnType<typeof createInterface> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempts = 0;
@@ -401,9 +404,9 @@ export class GatewayClient extends EventEmitter {
     this.bufferedEvents.clear();
     this.bufferedRequests = [];
     this.pendingExit = undefined;
-    this.stdoutRl?.close();
+    this.stopStdout?.();
     this.stderrRl?.close();
-    this.stdoutRl = null;
+    this.stopStdout = null;
     this.stderrRl = null;
     this.clearReadyTimer();
   }
@@ -579,11 +582,31 @@ export class GatewayClient extends EventEmitter {
     const stdin = this.proc.stdin!;
     this.channel.attach({ send: (text) => void stdin.write(text + "\n") });
 
-    this.stdoutRl = createInterface({ input: this.proc.stdout! });
-    this.stdoutRl.on("line", (raw) => {
-      if (!this.channel.handleFrame(raw)) {
-        this.protocolError("malformed stdout", raw, "(empty line)");
-      }
+    this.stopStdout = readBoundedLines(this.proc.stdout!, {
+      maxChars: MAX_FRAME_CHARS,
+      onLine: (raw) => {
+        try {
+          if (!this.channel.handleFrame(raw)) {
+            this.protocolError("malformed stdout", raw, "(empty line)");
+          }
+        } catch (error) {
+          if (!(error instanceof RangeError)) {
+            throw error;
+          }
+
+          this.protocolError(
+            "frame too large to parse",
+            raw.slice(0, MAX_LOG_PREVIEW),
+            String(error),
+          );
+        }
+      },
+      onOversize: (chars, head) =>
+        this.protocolError(
+          `oversized stdout frame dropped (${chars} chars)`,
+          head,
+          "(no preview)",
+        ),
     });
 
     this.stderrRl = createInterface({ input: this.proc.stderr! });

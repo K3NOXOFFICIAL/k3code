@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 from types import SimpleNamespace
+
+import pytest
 
 from k3code.config import Settings
 from k3code.learning import gotchas
@@ -13,8 +16,10 @@ from k3code.learning.decisions import DecisionLog
 from k3code.prompting import build_system_prompt
 from k3code.providers.types import ToolCall
 from k3code.toolerrors import failure_of
+from k3code.userhooks import Hook
 from test_learning_gateway import make_server, shown
 from test_permissions_gateway import call, run_turn
+from test_user_hooks import _loop
 
 FAKE_KEY = "sk-" + "z" * 24  # built at run time: the secret scan must not see a literal
 
@@ -48,6 +53,24 @@ async def test_failures_are_recorded_scrubbed_with_class_and_project(tmp_path, m
     res = {"stdout": "", "stderr": "", "exit_code": 1}
     hub.tool_outcome(_session(server, tmp_path), tc, res, failure_of("bash", tc.arguments, res))
     assert len(hub.log.query("tool_error", actor=None)) == 1
+
+
+async def test_a_key_that_is_the_whole_error_line_is_not_stored_as_the_error_class(tmp_path, monkeypatch):
+    # a short first line without a colon becomes the class verbatim; the class is a column of its own in decisions.db
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    s = _session(server, tmp_path)
+    for result in (
+        {"error": FAKE_KEY},  # the whole error line
+        {"error": f"{FAKE_KEY}: rejected"},  # the part before the first colon
+        {"error": f"Authorization: Bearer {FAKE_KEY}"},  # a credential shape that spans the colon
+    ):
+        tc = ToolCall(id="k", name="db", arguments={})
+        hub.tool_outcome(s, tc, result, failure_of("db", tc.arguments, result))
+    stored = sqlite3.connect(hub.home / "learning" / "decisions.db").execute("SELECT choice, subject FROM decisions")
+    rows = stored.fetchall()
+    assert len(rows) == 3
+    assert FAKE_KEY not in json.dumps(rows)
 
 
 async def test_third_repeat_in_a_project_proposes_a_gotcha_with_the_followup_hint(tmp_path, monkeypatch):
@@ -217,6 +240,40 @@ async def test_a_hintless_recurring_failure_still_waits_for_the_card(tmp_path, m
     _fail(hub, _session(server, tmp_path, "s3"), "npm t3", "sh: 1: npm: not found")
     assert [p.kind for p in hub.store.all() if p.kind == "project_gotcha"] == ["project_gotcha"]
     assert not gotchas.gotchas_path(hub.log.project_for(str(tmp_path))).exists()
+
+
+async def test_dismissing_an_auto_learned_card_forgets_its_line_and_ends_its_reminders(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    sess = await call(server, "session.create", {"cwd": str(tmp_path)})
+    hub = server.learning
+    frames: list = []
+    s = _recording_session(tmp_path, "s1", frames)
+    _fail(hub, s, "python x.py", "sh: 1: python: not found")
+    _ok(hub, s, "python3 x.py")
+    _fail(hub, s, "python y.py", "sh: 1: python: not found")
+    (p,) = [p for p in hub.store.all() if p.kind == "project_gotcha"]
+    auto = gotchas.auto_gotchas_path(hub.log.project_for(str(tmp_path)))
+    assert auto.is_file()
+    out = await call(
+        server, "command.dispatch", {"name": "proposals", "arg": f"dismiss {p.id}", "session_id": sess["session_id"]}
+    )
+    assert "will not come back" in out["output"]
+    assert not auto.exists()  # the line the card was about is gone, not just the card
+    notified = len([t for t, _ in frames if t == "notification"])
+    for i in range(3):  # the failing call again: no reminder (from the file or the earlier rows), nothing relearned
+        tc = ToolCall(id="x", name="bash", arguments={"command": f"python z{i}.py"})
+        result = {"stdout": "", "stderr": "sh: 1: python: not found", "exit_code": 127}
+        assert hub.tool_outcome(s, tc, result, failure_of("bash", tc.arguments, result)) is None
+        _ok(hub, s, f"python3 z{i}.py")
+    assert not auto.exists()
+    assert len([t for t, _ in frames if t == "notification"]) == notified
+    assert len([q for q in hub.store.all() if q.kind == "project_gotcha"]) == 1
+    # the dismissal is about that signature: another recurring failure is learned as before
+    other = "sh: 1: node: not found"
+    _fail(hub, s, "node a.js", other)
+    _ok(hub, s, "nodejs a.js")
+    _fail(hub, s, "node b.js", other)
+    assert "node: not found" in auto.read_text(encoding="utf-8")
 
 
 def test_auto_learning_refuses_redacted_hints_and_non_project_classes():
@@ -411,3 +468,48 @@ async def test_an_auto_line_alone_never_reaches_the_machine_file(tmp_path, monke
     )
     assert not (hub.home / "gotchas.md").exists()
     assert "Known pitfalls" not in build_system_prompt("base", cwd=tmp_path / "b", config=Settings())
+
+
+ROOTS_MSG = "Auto mode writes only inside the project roots"
+
+
+@pytest.mark.parametrize(
+    ("mode", "tool", "args", "hooks", "message"),
+    [
+        ("yolo", "bash", {"command": "rm -rf /"}, [], "Hardline deny ("),
+        ("yolo", "read", {"path": ".env"}, [], "Hardline deny (sensitive-path)"),
+        ("auto", "bash", {"command": "echo x > {outside}/x"}, [], ROOTS_MSG),
+        ("auto", "write", {"path": "{outside}/x", "content": "x"}, [], ROOTS_MSG),
+        ("plan", "write", {"path": "x", "content": "x"}, [], "Plan mode is read-only"),
+        (
+            "yolo",
+            "bash",
+            {"command": "touch ran"},
+            [Hook("PreToolUse", "echo 'no touching today' >&2; exit 2", matcher="bash")],
+            "Blocked by a PreToolUse hook: no touching today",
+        ),
+    ],
+    ids=["hardline-bash", "hardline-sensitive-read", "auto-roots-bash", "auto-roots-write", "plan-mode", "hook-block"],
+)
+async def test_a_policy_denial_is_not_a_project_tool_error(tmp_path, monkeypatch, mode, tool, args, hooks, message):
+    """The permission engine's and a PreToolUse hook's refusals say what the policy is, not what the project is like:
+    the real result of each goes through the loop's observer into the hub and nothing is recorded or proposed."""
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    proj, outside = tmp_path / "proj", tmp_path / "elsewhere"
+    proj.mkdir()
+    outside.mkdir()
+    loop = _loop(proj, hooks, mode=mode)
+    sess = _session(server, proj)
+    loop.on_tool_outcome = lambda tc, result, failure: hub.tool_outcome(sess, tc, result, failure)
+    args = {k: v.format(outside=outside) if isinstance(v, str) else v for k, v in args.items()}
+    tc = ToolCall(id="d1", name=tool, arguments=args)
+    failures = []
+    for _ in range(3):  # a recurring signature is what proposes a gotcha
+        result = await loop._execute_tool(tc)
+        assert result["error"].startswith(message)  # the real message: this test follows it if it is reworded
+        failures.append(loop._observe_result(tc, result, []))
+    assert hub.log.query("tool_error", actor=None) == []
+    assert not [p for p in hub.store.all() if p.kind == "project_gotcha"]
+    assert [f and f.error_class for f in failures] == ["denied"] * 3  # still a failure: the loop guard counts it
+    assert not (proj / "ran").exists()

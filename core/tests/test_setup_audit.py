@@ -105,49 +105,44 @@ def test_step_integrations_keeps_mcp_skills_mem0(env: Path) -> None:
     assert cfg["mem0"] == {"api_key_env": "MEM_KEY", "user_id": "me"} and "b" in cfg["mcp"]["servers"]
 
 
+def test_an_answers_file_that_lists_no_servers_or_roots_clears_them_and_a_silent_one_keeps_them(env: Path) -> None:
+    _seed()
+    run_setup(AnswerPrompter({"integrations": {}}), only_step="integrations", do_probe=False)
+    cfg = _cfg()
+    assert set(cfg["mcp"]["servers"]) == {"a"} and cfg["skills"] == {"roots": ["/opt/skills"]}  # no key: no change
+    run_setup(
+        AnswerPrompter({"integrations": {"mcp": [], "skills_roots": []}}), only_step="integrations", do_probe=False
+    )
+    cfg = _cfg()
+    assert "mcp" not in cfg and "skills" not in cfg  # an explicit empty list is the request to remove them
+    assert cfg["mem0"]["url"] == "http://mem.test"  # and nothing else of the integrations moves
+
+
+def test_the_hardline_only_grows_whatever_a_rerun_answers(env: Path) -> None:
+    _seed()
+    for answers in ({"extra_hardline": []}, {"extra_hardline": ["foo", "baz"]}, {}):
+        run_setup(AnswerPrompter({"permissions": answers}), only_step="permissions", do_probe=False)
+    assert _cfg()["permissions"]["hardline"] == ["foo", "baz"]
+
+
 # ── H4 ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize(
-    ("raw", "want"),
-    [
-        ("no", False),
-        ("false", False),
-        ("Off", False),
-        ("0", False),
-        (0, False),
-        ("yes", True),
-        ("Y", True),
-        ("true", True),
-        ("on", True),
-        (1, True),
-        (True, True),
-        (False, False),
-    ],
-)
-def test_parse_bool(raw, want) -> None:
-    from k3code.setup.prompter import parse_bool
-
-    assert parse_bool("k", raw) is want
-
-
-def test_parse_bool_rejects_nonsense() -> None:
-    from k3code.setup.prompter import parse_bool
-
-    with pytest.raises(ValueError, match="service.install"):
-        parse_bool("service.install", "maybe")
-
-
 def test_answers_file_no_does_not_install_the_service(env: Path, monkeypatch) -> None:
+    """bool("no") was True. A quoted "false" is read as false; "no" is no boolean and is refused, not guessed at."""
     calls: list[str] = []
     monkeypatch.setattr(service, "install", lambda **_: calls.append("install") or ["done"])
     answers = env / "a.yaml"
-    answers.write_text('service: {install: "no"}\ntheme: {focus_mode: "false", theme: mono}\n')
+    answers.write_text('service: {install: "false"}\ntheme: {focus_mode: "false", theme: mono}\n')
     r = CliRunner().invoke(cli, ["setup", "--non-interactive", "--answers", str(answers), "--step", "service"])
     assert r.exit_code == 0, r.output
     r = CliRunner().invoke(cli, ["setup", "--non-interactive", "--answers", str(answers), "--step", "theme"])
     assert r.exit_code == 0, r.output
     assert calls == [] and _cfg()["display"]["focus_mode"] is False
+    answers.write_text('service: {install: "no"}\n')
+    r = CliRunner().invoke(cli, ["setup", "--non-interactive", "--answers", str(answers), "--step", "service"])
+    assert r.exit_code != 0 and "service.install" in r.output and "Traceback" not in r.output
+    assert calls == []
 
 
 def test_service_error_is_a_failed_step_not_a_traceback(env: Path, monkeypatch) -> None:
@@ -166,7 +161,7 @@ def test_invalid_yes_no_answer_is_a_cli_error(env: Path) -> None:
     answers = env / "a.yaml"
     answers.write_text("theme: {focus_mode: maybe}\n")
     r = CliRunner().invoke(cli, ["setup", "--non-interactive", "--answers", str(answers), "--step", "theme"])
-    assert r.exit_code == 1 and "theme.focus_mode" in r.output and "Traceback" not in r.output
+    assert r.exit_code == 2 and "theme.focus_mode" in r.output and "Traceback" not in r.output  # a usage error
 
 
 # ── L6 ────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -187,7 +182,7 @@ def test_bad_answers_file_is_a_cli_error(env: Path, content: str) -> None:
     answers.write_text(content)
     for args in (["setup", "--non-interactive", "--answers", str(answers)], ["onboard", "--answers", str(answers)]):
         r = CliRunner().invoke(cli, args)
-        assert r.exit_code == 1 and "Traceback" not in r.output and str(answers) in r.output, (args, r.output)
+        assert r.exit_code == 2 and "Traceback" not in r.output and str(answers) in r.output, (args, r.output)  # usage
         assert not isinstance(r.exception, (yaml.YAMLError, AttributeError, TypeError)), r.exception
 
 

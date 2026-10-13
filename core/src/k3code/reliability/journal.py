@@ -78,6 +78,7 @@ class ToolJournal:
         ensure_private_dir(self.dir)  # tool args and results: 0700/0600 whatever the umask
         self.path = self.dir / f"{session}.jsonl"
         self._fh = private_file(self.path).open("a", encoding="utf-8")
+        self._pure: set[str] = set()  # in-flight side-effect-free call ids: their records are not fsync'd
         self._end_torn_line()
 
     def _end_torn_line(self) -> None:
@@ -114,7 +115,10 @@ class ToolJournal:
         """Append + fsync an ``intent`` record before the tool runs.
 
         Raw args are kept only for side-effect-free tools (re-run verbatim on resume). A side-effect tool is never
-        re-run, only reported INTERRUPTED, so its args (file contents, commands with tokens) stay out of the file."""
+        re-run, only reported INTERRUPTED, so its args (file contents, commands with tokens) stay out of the file.
+
+        Only a side-effect intent is fsync'd: resume acts on those alone, and a pure call lost to a crash is simply
+        asked again. A gathered batch of reads no longer blocks the loop on one fsync per call."""
         h = args_digest(args)
         rec = {
             "type": "intent",
@@ -128,24 +132,31 @@ class ToolJournal:
         if raw_args and not side_effect:
             # Store args for pure tools so they can be re-run verbatim on resume.
             rec["args"] = args
-        self._append(rec)
+        if side_effect:
+            self._pure.discard(call_id)
+        else:
+            self._pure.add(call_id)
+        self._append(rec, durable=side_effect)
         return rec["ts"]
 
     def record_done(self, call_id: str, result: Any) -> None:
-        """Append a ``done`` record with a result digest."""
+        """Append a ``done`` record with a result digest (fsync'd unless the call was side-effect-free)."""
         self._append(
             {
                 "type": "done",
                 "id": call_id,
                 "digest": result_digest(result),
                 "ts": time.time(),
-            }
+            },
+            durable=call_id not in self._pure,
         )
+        self._pure.discard(call_id)
 
-    def _append(self, rec: dict[str, Any]) -> None:
+    def _append(self, rec: dict[str, Any], *, durable: bool = True) -> None:
         self._fh.write(json.dumps(rec, default=str) + "\n")
         self._fh.flush()
-        os.fsync(self._fh.fileno())
+        if durable:
+            os.fsync(self._fh.fileno())
 
     # ── resume ──
 
@@ -247,27 +258,52 @@ def delete_session_journal(home: Path, session: str) -> int:
 
 
 def prune_journals(
-    home: Path, *, keep: Callable[[str], bool], max_age_s: float = JOURNAL_MAX_AGE_S, now: float | None = None
+    home: Path,
+    *,
+    keep: Callable[[str], bool],
+    max_age_s: float = JOURNAL_MAX_AGE_S,
+    max_bytes: int | None = None,
+    now: float | None = None,
 ) -> int:
     """Remove journal files not written for ``max_age_s`` whose session is not ``keep(session)`` (live, in use).
 
-    Every session (and every ``k3code -p`` run) leaves an fsync'd jsonl here and nothing removed it. Returns files
-    removed."""
+    Every session (and every ``k3code -p`` run) leaves an fsync'd jsonl here and nothing removed it. When the files
+    left still add up to more than ``max_bytes``, the oldest closed ones go until they fit. Returns files removed."""
     jdir = home / "journal"
     if not jdir.is_dir():
         return 0
     cutoff = (time.time() if now is None else now) - max_age_s
     removed = 0
+    left: list[tuple[float, int, Path]] = []  # closed files that survived the age check: (mtime, size, path)
+    total = 0
     for path in jdir.iterdir():
         sid = _session_of(path.name)
-        if sid is None or keep(sid):
+        if sid is None:
             continue
         try:
-            if path.is_file() and path.stat().st_mtime < cutoff:
+            if not path.is_file():
+                continue
+            st = path.stat()
+            if keep(sid):
+                total += st.st_size
+            elif st.st_mtime < cutoff:
                 path.unlink()
                 removed += 1
+            else:
+                total += st.st_size
+                left.append((st.st_mtime, st.st_size, path))
         except FileNotFoundError:
             continue
+    if max_bytes is not None:
+        for _mtime, size, path in sorted(left):
+            if total <= max_bytes:
+                break
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            total -= size
+            removed += 1
     return removed
 
 

@@ -7,6 +7,7 @@ with the reason printed, when Playwright or its Chromium is not installed.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import re
 import threading
@@ -94,6 +95,7 @@ class FakeContext:
     def __init__(self, pages: dict, log: list) -> None:
         self._pages, self.log = pages, log
         self.guards: list = []  # route / route_web_socket registrations (the SSRF guard), not page actions
+        self.closed = False
 
     async def new_page(self) -> FakePage:
         return FakePage(self._pages, self.log)
@@ -105,6 +107,7 @@ class FakeContext:
         self.guards.append(("route_web_socket", pattern, handler))
 
     async def close(self) -> None:
+        self.closed = True
         self.log.append(("context-close",))
 
 
@@ -203,6 +206,20 @@ async def test_a_403_escalates_to_the_browser_and_reads_what_renders():
     title, text = await fetch_page("https://blocked.test/article", fetcher=fetcher(), browser=browser)
     assert title == "Real Title" and "word word" in text
     assert [e for e in log if e[0] == "goto"] == [("goto", "https://blocked.test/article")]  # one navigation only
+
+
+@respx.mock
+async def test_a_page_read_in_the_browser_keeps_its_links_absolute():
+    """Issue #99: the browser path resolves relative links against the rendered page's URL too."""
+    respx.get("https://blocked.test/docs/").mock(return_value=httpx.Response(403, text=CHALLENGE))
+    page = '<html><body><main><p>Next: <a href="step2.html">step 2</a></p></main></body></html>'
+    browser, _log = fake_browser({"https://blocked.test/docs/": (200, page)})
+    _, text = await fetch_page("https://blocked.test/docs/", fetcher=fetcher(), browser=browser)
+    assert text == "Next: [step 2](https://blocked.test/docs/step2.html)"
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}), fetcher=fetcher(), browser=browser)
+    out = await reg.handlers["web_browse"]({"url": "https://blocked.test/docs/"})
+    assert out["content"].endswith("Next: [step 2](https://blocked.test/docs/step2.html)")
 
 
 @respx.mock
@@ -460,7 +477,7 @@ async def test_a_huge_dom_is_capped_and_parsed_off_the_event_loop(monkeypatch):
 
     seen: list[str] = []
     real = t.extract_text
-    monkeypatch.setattr(t, "extract_text", lambda m: (seen.append(threading.current_thread().name), real(m))[1])
+    monkeypatch.setattr(t, "extract_text", lambda m, *a: (seen.append(threading.current_thread().name), real(m, *a))[1])
 
     class Browser:
         async def fetch(self, url):
@@ -511,6 +528,149 @@ async def test_launch_blocks_service_workers(monkeypatch, tmp_path):
     monkeypatch.setattr(b, "playwright_module", lambda: SimpleNamespace(async_playwright=lambda: _PW()))
     await BrowserManager(home=tmp_path)._launch_playwright("public.test")
     assert seen["service_workers"] == "block"
+
+
+# ── one Chromium per site, however many reads race for it, and none kept forever ──
+
+
+class SlowPage(FakePage):
+    """Takes a while to load, and fails like Playwright if its context is closed while it loads."""
+
+    def __init__(self, ctx: FakeContext, pages: dict, log: list) -> None:
+        super().__init__(pages, log)
+        self.ctx = ctx
+
+    async def goto(self, url: str, **kw):
+        await asyncio.sleep(0.3)
+        if self.ctx.closed:
+            raise RuntimeError("Target page, context or browser has been closed")
+        return await super().goto(url, **kw)
+
+
+def slow_browser(
+    pages: dict, *, slow_sites: frozenset = frozenset(), slow_close: frozenset = frozenset(), **kw
+) -> tuple[BrowserManager, list, dict]:
+    """A launcher that takes a while to start, like Chromium; ``made`` holds every context it launched, per site.
+    Pages of ``slow_sites`` load slowly; contexts of ``slow_close`` take a while to close."""
+    log: list = []
+    made: dict[str, list[FakeContext]] = {}
+
+    async def launcher(site: str):
+        log.append(("launch", site))
+        await asyncio.sleep(0.05)
+        ctx = FakeContext(pages, log)
+        if site in slow_sites:
+            ctx.new_page = lambda: _ready(SlowPage(ctx, pages, log))
+        if site in slow_close:
+
+            async def close() -> None:
+                log.append(("close-start", site))
+                await asyncio.sleep(0.1)
+                ctx.closed = True
+                log.append(("close-done", site))
+
+            ctx.close = close
+        made.setdefault(site, []).append(ctx)
+        return ctx
+
+    return BrowserManager(challenge_wait=0, launcher=launcher, **kw), log, made
+
+
+async def _ready(value):
+    return value
+
+
+async def test_concurrent_reads_of_one_site_launch_one_browser():
+    pages = {f"https://docs.test/p{i}": (200, ARTICLE) for i in range(3)}
+    browser, log, made = slow_browser(pages)
+    got = await asyncio.gather(*(browser.fetch(f"https://docs.test/p{i}") for i in range(3)))
+    assert [p.status for p in got] == [200, 200, 200]
+    assert [e for e in log if e[0] == "launch"] == [("launch", "docs.test")]
+    assert len(made["docs.test"]) == 1 and len(made["docs.test"][0].guards) == 2
+
+
+async def test_concurrent_launches_start_one_playwright_driver(monkeypatch, tmp_path):
+    starts: list = []
+
+    class _Chromium:
+        async def launch_persistent_context(self, _profile, **_opts):
+            return SimpleNamespace()
+
+    class _PW:
+        async def start(self):
+            starts.append(1)
+            await asyncio.sleep(0.05)
+            return SimpleNamespace(chromium=_Chromium(), stop=lambda: _ready(None))
+
+    monkeypatch.setattr(b, "playwright_module", lambda: SimpleNamespace(async_playwright=lambda: _PW()))
+    browser = BrowserManager(home=tmp_path)
+    await asyncio.gather(browser._launch_playwright("a.test"), browser._launch_playwright("b.test"))
+    assert len(starts) == 1
+
+
+async def test_past_max_sites_the_least_recently_used_site_is_closed():
+    pages = {f"https://{h}.test/": (200, ARTICLE) for h in "abc"}
+    browser, _log, made = slow_browser(pages, max_sites=2)
+    for h in "abac":
+        await browser.fetch(f"https://{h}.test/")
+    assert set(browser._contexts) == {"a.test", "c.test"}
+    assert made["b.test"][0].closed and not made["a.test"][0].closed and not made["c.test"][0].closed
+
+
+async def test_a_site_being_read_is_never_closed_under_its_reader():
+    pages = {"https://slow.test/": (200, ARTICLE), "https://fast.test/": (200, ARTICLE)}
+    browser, _log, made = slow_browser(pages, slow_sites=frozenset({"slow.test"}), max_sites=1, idle_close=0.01)
+    slow = asyncio.ensure_future(browser.fetch("https://slow.test/"))
+    await asyncio.sleep(0.07)  # the slow site is launched and mid-read
+    await browser.fetch("https://fast.test/")  # over max_sites, and the idle reaper runs every 5 ms
+    assert not slow.done() and not made["slow.test"][0].closed
+    assert made["fast.test"][0].closed  # the one past the cap that nobody is reading
+    assert (await slow).status == 200
+
+
+async def test_a_site_unused_for_idle_close_is_closed_and_relaunched_on_next_use():
+    browser, log, made = slow_browser({"https://idle.test/": (200, ARTICLE)}, idle_close=0.05)
+    await browser.fetch("https://idle.test/")
+    await _until(log, ("context-close",))
+    assert made["idle.test"][0].closed and not browser.connected
+    await browser.fetch("https://idle.test/")
+    assert [e for e in log if e[0] == "launch"] == [("launch", "idle.test")] * 2
+    reaper = browser._reaper
+    await browser.close()
+    await asyncio.gather(reaper, return_exceptions=True)
+    assert reaper.cancelled()
+
+
+async def _until(log: list, entry: tuple) -> None:
+    for _ in range(200):
+        if entry in log:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"{entry} never happened")
+
+
+async def test_a_site_relaunched_while_it_closes_waits_for_the_close():
+    pages = {"https://a.test/": (200, ARTICLE), "https://b.test/": (200, ARTICLE)}
+    browser, log, _made = slow_browser(pages, slow_close=frozenset({"a.test"}), max_sites=1)
+    await browser.fetch("https://a.test/")
+    evicting = asyncio.ensure_future(browser.fetch("https://b.test/"))  # past max_sites: a closes, slowly
+    await _until(log, ("close-start", "a.test"))
+    await browser.fetch("https://a.test/")  # the same profile: its launch must wait for the close
+    await evicting
+    relaunch = [i for i, e in enumerate(log) if e == ("launch", "a.test")][1]
+    assert log.index(("close-done", "a.test")) < relaunch
+
+
+async def test_an_interrupted_read_still_finishes_closing_the_site_it_evicts():
+    pages = {"https://a.test/": (200, ARTICLE), "https://b.test/": (200, ARTICLE)}
+    browser, log, made = slow_browser(pages, slow_close=frozenset({"a.test"}), max_sites=1)
+    await browser.fetch("https://a.test/")
+    evicting = asyncio.ensure_future(browser.fetch("https://b.test/"))
+    await _until(log, ("close-start", "a.test"))
+    evicting.cancel()  # the turn is interrupted while b's read closes a
+    await asyncio.gather(evicting, return_exceptions=True)
+    await _until(log, ("close-done", "a.test"))  # a half-closed Chromium would keep a's profile locked
+    assert made["a.test"][0].closed
 
 
 class _Sink(BaseHTTPRequestHandler):

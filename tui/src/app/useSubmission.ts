@@ -1,6 +1,13 @@
+import type { ScrollBoxHandle } from "@k3code/ink";
 import { looksLikeSlashCommand, parseSlashCommand } from "@k3code/shared/slash";
 import type { Span } from "@k3code/shared/wake-words";
-import { type MutableRefObject, useCallback, useEffect, useRef } from "react";
+import {
+  type MutableRefObject,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useRef,
+} from "react";
 
 import { TYPING_IDLE_MS } from "../config/timing.js";
 import {
@@ -142,6 +149,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
     composerRefs,
     composerState,
     gw,
+    scrollRef,
     setLastUserMsg,
     slashRef,
     submitRef,
@@ -648,6 +656,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return composerActions.setInput("");
       }
 
+      // Enter sends the prompt: jump to the end of the transcript so its echo and the reply are in view even after the
+      // user scrolled up to read (#154).
+      scrollRef?.current?.scrollToBottom();
       dispatchSubmission([...composerState.inputBuf, value].join("\n"));
     },
     [
@@ -657,6 +668,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       composerState,
       dispatchSubmission,
       gw,
+      scrollRef,
       sys,
     ],
   );
@@ -698,6 +710,7 @@ export interface UseSubmissionOptions {
   composerRefs: ComposerRefs;
   composerState: ComposerState;
   gw: GatewayClient;
+  scrollRef?: RefObject<null | ScrollBoxHandle>;
   setLastUserMsg: (value: string) => void;
   slashRef: MutableRefObject<(cmd: string) => boolean>;
   submitRef: MutableRefObject<(value: string) => void>;

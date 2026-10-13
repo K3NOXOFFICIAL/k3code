@@ -15,7 +15,14 @@ from typing import Any
 from k3code.artifacts import write_artifact_file
 from k3code.autonomy import DEFAULT_MIN_SCOPE
 from k3code.autonomy.agents import DEFAULT_MAX_AGENTS, AgentLimits, session_limits
-from k3code.autonomy.fanout import IO_HEAVY_RE, FanoutResult, detect_test_command, extract_subtasks, run_tests
+from k3code.autonomy.fanout import (
+    IO_HEAVY_RE,
+    REVIEW_ATTEMPTS,
+    FanoutResult,
+    detect_test_command,
+    extract_subtasks,
+    run_tests,
+)
 from k3code.autonomy.plan_first import PLAN_SECTIONS, parse_plan
 from k3code.autonomy.scope import ScopeVerdict
 from k3code.autonomy.sizing import (
@@ -30,12 +37,16 @@ from k3code.memory import fenced
 from k3code.paths import ignore_generated
 from k3code.providers.types import Message
 from k3code.reliability.governor import Budget, Governor
+from k3code.reliability.sandbox import HARNESS_GIT_DIFF_FLAGS
 from k3code.routing.tiers import TaskKind
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.budget import CAP_SCOPE, AgentBudget, BudgetStop
 from k3code.subagents.runner import Handle
 
 logger = logging.getLogger(__name__)
+
+#: Diff characters the review panel's prompts carry; past it the lenses are told so and read the rest themselves.
+REVIEW_DIFF_CHARS = 60000
 
 
 async def gather_or_cancel[T](*aws: Awaitable[T]) -> list[T]:
@@ -120,8 +131,8 @@ def parse_judge(text: str) -> tuple[dict[str, float], str]:
     return scores, body.strip()
 
 
-def parse_findings(text: str) -> list[dict[str, Any]]:
-    """The last JSON array of objects in a reviewer's reply."""
+def findings_list(text: str) -> list[dict[str, Any]] | None:
+    """The last JSON array of objects in a reviewer's reply; None when it has none (no answer is not "no findings")."""
     for m in reversed(list(re.finditer(r"\[\s*(?:\{.*?\}\s*,?\s*)*\]", text or "", re.S))):
         try:
             data = json.loads(m.group(0))
@@ -129,7 +140,12 @@ def parse_findings(text: str) -> list[dict[str, Any]]:
             continue
         if isinstance(data, list):
             return [d for d in data if isinstance(d, dict) and d.get("issue")]
-    return []
+    return None
+
+
+def parse_findings(text: str) -> list[dict[str, Any]]:
+    """The last JSON array of objects in a reviewer's reply."""
+    return findings_list(text) or []
 
 
 def dedupe_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -355,10 +371,10 @@ class Ultra:
                     report.notes.append(f"fan-out stopped early ({fan.stopped}); what was merged is still reviewed")
                 else:
                     raise BudgetStop(fan.stopped, fan.stopped_kind or "agents")
-            if fan is None:  # no git repo: one worker, in place
+            if fan is None:  # no git repo, or uncommitted changes in the checkout: one worker, in place
                 prompt = f"Implement this task following the plan.\n\nTask:\n{brief}\n\nPlan:\n{up.plan}"
                 h = await self.run_child(session, budget, "worker", prompt, "implement")
-                report.notes.append(f"implementation (single worker, no git repo): {h.status}")
+                report.notes.append(f"implementation (single worker in place, fan-out skipped): {h.status}")
             elif not fan.ok:
                 report.notes.append("fan-out left unresolved subtasks:\n" + fan.summary())
 
@@ -475,38 +491,61 @@ class Ultra:
         cwd = Path(session.perms.cwd)
         diff = ""
         if base:
-            _, diff = await wt_mod.git(cwd, "diff", f"{base}..HEAD")
+            _, diff = await wt_mod.git(cwd, "diff", *HARNESS_GIT_DIFF_FLAGS, f"{base}..HEAD")
         if not diff.strip():
             report.notes.append("nothing to review: no committed changes")
             return
-        diff = diff[:60000]
+        cut = ""
+        if len(diff) > REVIEW_DIFF_CHARS:
+            cut = (
+                f"\nThe diff above is CUT at {REVIEW_DIFF_CHARS} of {len(diff)} characters: run "
+                f"`git diff {base}..HEAD` or read the changed files for the rest.\n"
+            )
+            report.notes.append(f"the review panel saw the first {REVIEW_DIFF_CHARS} of {len(diff)} diff characters")
+        diff = diff[:REVIEW_DIFF_CHARS]
         self.progress(session, "ultracode", "adversarial review", ", ".join(LENSES), budget)
-
-        missing: list[str] = []  # lenses whose reviewer died
+        # a lens leaves this only with an answer: one the budget stopped before it answered stays in it
+        unanswered: dict[str, str] = dict.fromkeys(LENSES, "the budget ran out before it answered")
 
         async def lens_review(lens: str, desc: str) -> list[dict[str, Any]]:
             prompt = (
                 f"LENS: {lens}\nAdversarially review this change through one lens only: {desc}.\n\nTask:\n{task}\n\n"
-                f"Diff:\n```diff\n{diff}\n```\nRead the code if you need more context. Reply with a JSON array of "
+                f"Diff:\n```diff\n{diff}\n```\n{cut}Read the code if you need more context. Reply with a JSON array of "
                 'findings: [{"file": "...", "line": 0, "severity": "high|med|low", "issue": "..."}] '
                 "(an empty array if you find nothing). Report only real problems."
             )
-            h = await self.run_child(session, budget, "reviewer", prompt, f"review: {lens}", reserved=True)
-            if h.status != "completed":  # no answer is not "no findings"
-                budget.stop_if_capped(h)
-                missing.append(lens)
-                report.notes.append(f"the {lens} reviewer did not finish ({h.error or h.status}): that lens is missing")
-                return []
-            return parse_findings(h.result)
+            for _ in range(REVIEW_ATTEMPTS):  # a lens that fails or answers without the array is asked once more
+                h = await self.run_child(session, budget, "reviewer", prompt, f"review: {lens}", reserved=True)
+                if h.status != "completed":
+                    budget.stop_if_capped(h)  # cut off by the token cap: no rerun can pay for the missing answer
+                found = findings_list(h.result) if h.status == "completed" else None
+                if found is not None:
+                    unanswered.pop(lens, None)
+                    return found
+                unanswered[lens] = f"{h.status}: {h.error}" if h.status != "completed" else "no findings array"
+            return []
 
-        results = await gather_or_cancel(*(lens_review(k, v) for k, v in LENSES.items()))
+        def note_unanswered() -> None:
+            if unanswered:  # a dead lens is not a lens that found nothing: say the review is incomplete
+                report.notes.append(
+                    "review INCOMPLETE: no answer from the "
+                    + ", ".join(f"{lens} lens ({why})" for lens, why in unanswered.items())
+                )
+
+        try:
+            results = await gather_or_cancel(*(lens_review(k, v) for k, v in LENSES.items()))
+        except BudgetStop:  # the report is cut short here: it still says which lenses never answered
+            note_unanswered()
+            raise
         candidates = dedupe_findings([f for r in results for f in r])
-        report.panel_ran = len(missing) < len(LENSES)  # every lens dead: the change was not reviewed
+        report.panel_ran = len(unanswered) < len(LENSES)  # every lens dead: the change was not reviewed
         report.candidates = candidates
+        note_unanswered()
         if not candidates:
-            # with every lens dead the report's "not run" header and the per-lens notes already say so
+            # with every lens dead the report's "not run" header and the incomplete note already say so
             if report.panel_ran:
-                report.notes.append("review panel found nothing" + (" in the lenses that finished" if missing else ""))
+                nothing = "the lenses that answered found nothing" if unanswered else "review panel found nothing"
+                report.notes.append(nothing)
             return
         self.progress(session, "ultracode", "cross-checking findings", f"{len(candidates)} candidates", budget)
         listing = json.dumps(candidates, indent=1)

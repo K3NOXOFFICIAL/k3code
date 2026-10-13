@@ -81,6 +81,8 @@ def render_text(v: dict[str, Any]) -> str:
     provs = ", ".join(
         f"{p['name']} [claude-cli] uses the Claude Code login"
         if p["kind"] == "claude-cli"
+        else f"{p['name']} [{p['kind']}] takes no key"  # api_key_env "": a keyless endpoint such as Ollama
+        if not p["api_key_env"]
         else f"{p['name']} [{p['kind']}] key {'set' if p['key_set'] else 'MISSING'} ({p['api_key_env']})"
         for p in v["providers"]
     )

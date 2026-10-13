@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import copy
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -88,7 +90,12 @@ from k3code.gateway.protocol import (
     next_request_id,
     reply_id,
 )
-from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, StoredSession, scrub_surrogates
+from k3code.gateway.sessions import (
+    EMPTY_SESSION_MAX_AGE_S,
+    SessionStore,
+    SessionSummary,
+    scrub_surrogates,
+)
 from k3code.goals import (
     CONTINUATION_PROMPT_RECOVER_TEMPLATE,
     GOAL_QUOTE_CHARS,
@@ -108,7 +115,7 @@ from k3code.permissions.state import PermissionState, persist_rules, project_con
 from k3code.pricing import day_loader, estimate_usd
 from k3code.prompting import build_system_prompt
 from k3code.providers import effort as effort_mod
-from k3code.providers import make_providers
+from k3code.providers import make_providers, provider_signature
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage
 from k3code.redact import redact, scrub_text
 from k3code.reliability import BudgetExceeded, DiskGuardFull, Reliability, build_reliability
@@ -135,7 +142,7 @@ from k3code.routing.tiers import (
 from k3code.session_ai import SUMMARY_PREFIX, compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
-from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_for_model, register_todo, render_todos
+from k3code.tools import MAX_TOOL_RESULT_CHARS, FileStamps, clip_for_model, register_todo, render_todos
 from k3code.tools import build_registry as build_tool_registry
 from k3code.tools import jobs as tool_jobs
 from k3code.usage import UsageDB
@@ -147,32 +154,43 @@ logger = logging.getLogger("k3code.gateway")
 MAX_FRAME_BYTES = 8 << 20
 #: Long-running requests (CONCURRENT_METHODS) one connection may have in flight; more are refused, not queued.
 MAX_CONCURRENT_PER_CLIENT = 8
-#: Methods only an authenticated connection (``gateway.auth``) may call: they run commands, change permissions or
-#: modes, rewrite config, restart MCP servers or move a session. The stdio client (the TUI's own child) is trusted.
-PRIVILEGED_METHODS = frozenset(
+#: Methods a socket peer may call before ``gateway.auth``: each reads k3code's own state and changes nothing (the
+#: ``k3code doctor`` probe, listings, the settings view). Every other method needs an authenticated connection: a
+#: turn (``prompt.submit``), a steer, an undo, attaching to or creating a session, a shell command, a mode or config
+#: change, an attachment, a path listing, ... A method added to ``_HANDLERS`` is privileged until it is listed here.
+#: The stdio client (the TUI's own child) is trusted.
+OPEN_METHODS = frozenset(
     {
-        "shell.exec",
-        "config.set",
-        "session.mode.set",
-        "session.mode.cycle",
-        "session.workspace.move",
-        "reload.mcp",
-        "model.save_key",
-        "model.disconnect",
-        # slash commands reach the same switches (/permissions yolo, /mcp reload, /config set ...)
-        "slash.exec",
-        "command.dispatch",
+        "setup.status",
+        "system.battery",
+        "commands.catalog",
+        "complete.slash",
+        "input.detect_drop",
+        "model.options",
+        "tune.get",
+        "settings.get",
+        "config.get",
+        "session.list",
+        "session.active_list",
+        "session.most_recent",
+        "session.status",
+        "session.usage",
+        "session.control.read",
+        "session.events.since",
+        "session.events.stats",
+        "subagent.list",
+        "subagent.tail",
+        "process.list",
+        "delegation.status",
     }
 )
 
 
 def _requires_auth(method: str, params: Any) -> bool:
-    if method in PRIVILEGED_METHODS:
-        return True
-    if method == "browser.manage":  # status/disconnect are harmless; connect attaches to a CDP endpoint
+    if method == "browser.manage":  # status is a read; connect attaches to a CDP endpoint, disconnect drops it
         action = params.get("action") if isinstance(params, dict) else None
-        return str(action or "status").strip().lower() == "connect"
-    return False
+        return str(action or "status").strip().lower() != "status"
+    return method not in OPEN_METHODS
 
 
 #: Emitted for gateway.ready; the TUI repaints its palette from this.
@@ -258,6 +276,7 @@ class LiveSession:
         self.tool_mark: float | None = None
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
         self.persist_warned = False  # the "could not save" notification went out (once per session)
+        self.checkpoint_task: asyncio.Task[None] | None = None  # the checkpoint write in flight, if any
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
         #: Wall-clock start of the latest turn or job (time.time()); the agent view's "working N" counts from it.
         self.turn_started_wall = 0.0
@@ -280,6 +299,8 @@ class LiveSession:
         self.turns_carried = 0
         #: The goal reviewer's summary of the conversation so far (autonomy.advisor.condensed_context).
         self.advisor_memo: dict[str, Any] = {}
+        #: what this session's model has seen of each file: every loop of it (turns, tiers) checks write/edit against it
+        self.file_stamps = FileStamps()
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
         self.pending_request_id: str | None = None
         # an invalid configured permission_mode fails this session's creation with a named error (an RPC reply), not
@@ -612,7 +633,7 @@ class Client:
         self.closed = False
         self.pending_bytes = 0  # queued for the peer but not yet accepted by its socket (see MAX_CLIENT_BACKLOG)
         self.close_peer: Callable[[], None] | None = None  # drops the connection (socket clients)
-        #: May call PRIVILEGED_METHODS and answer approvals. The stdio pipe is; a socket peer after gateway.auth.
+        #: May call any method, not only OPEN_METHODS, and answer approvals: the stdio pipe, a socket peer after auth.
         self.authenticated = authenticated
         self.in_flight = 0  # running CONCURRENT_METHODS tasks of this client (capped at MAX_CONCURRENT_PER_CLIENT)
 
@@ -650,6 +671,8 @@ class GatewayServer:
         self.browser = BrowserManager.from_config(self.config)  # launched on first use, never at start-up
         self.goal_judge: Any = None  # test hook: async (goal, last_text, session) -> (verdict, reason)
         self.providers: list[Any] = []
+        self._provider_sigs: list[dict[str, Any]] = []  # provider_signature of the entries self.providers came from
+        self._retiring: dict[int, Any] = {}  # replaced providers not closed yet (id -> provider), see _retire_providers
         self.router: Router | None = None
         self.cooldowns = CooldownStore(path=self._home() / "cooldowns.json")
         self._running = False
@@ -1353,6 +1376,7 @@ class GatewayServer:
         with contextlib.suppress(Exception):
             await self.learning.aclose()  # cancel the spawned learning tasks, then close the decision log
         await self.mcp.close()
+        await self._close_retired()
         for p in self.providers:
             await p.aclose()
         self.store.close()
@@ -1415,14 +1439,13 @@ class GatewayServer:
         if method == gw_auth.AUTH_METHOD:
             self._authenticate(client, req_id, params)
             return
-        if not client.authenticated and _requires_auth(method, params):
-            msg = f"{method} needs an authenticated connection (send {gw_auth.AUTH_METHOD} with the daemon token first)"
-            self._reply(client, encode_error(req_id, UNAUTHORIZED, msg))
-            return
-
         handler = _HANDLERS.get(method)
         if handler is None:
             self._reply(client, encode_error(req_id, METHOD_NOT_FOUND, f"Method not found: {method}"))
+            return
+        if not client.authenticated and _requires_auth(method, params):
+            msg = f"{method} needs an authenticated connection (send {gw_auth.AUTH_METHOD} with the daemon token first)"
+            self._reply(client, encode_error(req_id, UNAUTHORIZED, msg))
             return
 
         try:
@@ -1528,8 +1551,9 @@ class GatewayServer:
 
         Sessions with different model keys (a cron job with ``model:`` next to an interactive session) used to
         rebuild the whole stack on every alternating turn: new httpx clients, a new cooldown store, a stray temp
-        dir per claude-cli provider, none of the old ones closed. Routers are now cached per key; the providers
-        and the cooldown store are rebuilt only when the provider config itself is replaced (/config reload).
+        dir per claude-cli provider, none of the old ones closed. Routers are now cached per key; when the provider
+        config itself is replaced (/config reload) only the blocks that changed get a new provider (see
+        ``_swap_providers``).
         """
         key = model or self.config.default_model
         # _router_cfg None: a router injected from outside (tests) is taken as is
@@ -1537,11 +1561,9 @@ class GatewayServer:
         if self.router is not None and self._chain_key == key and current:
             return
         if self._router_cfg is not self.config.providers:  # first build, or the provider config was replaced
-            self._retire_providers(self.providers)
-            self.providers = make_providers(self.config.providers)
-            self.cooldowns = CooldownStore(path=self._home() / "cooldowns.json")
+            self._swap_providers()
             self._router_cache = {}
-            self.__dict__.pop("_oneshot_routers", None)  # one-shot routers hold chains of the replaced providers
+            self.__dict__.pop("_oneshot_routers", None)  # one-shot routers hold chains with the old model specs
             self._router_cfg = self.config.providers
         tiers = self._router_cache.get(key)
         if tiers is None:
@@ -1552,15 +1574,62 @@ class GatewayServer:
         self.router = tiers.get(Tier.MAIN)
         self._chain_key = key
 
+    def _swap_providers(self) -> None:
+        """Providers for ``config.providers``: a block whose settings did not change keeps its provider.
+
+        A turn keeps the router it started with, and with it these provider objects: closing them under it made its
+        next call fail with "client has been closed", and a claude-cli provider takes its warm processes down. So
+        only a changed or removed block is rebuilt and retired. The cooldown store stays: its keys name the endpoint,
+        and an auth cooldown is tied to the key's fingerprint, so a replaced key does not inherit it.
+        """
+        entries = self.config.providers
+        sigs = [provider_signature(e) for e in entries]
+        spare = list(zip(self._provider_sigs, self.providers, strict=False))
+        fresh: list[Any] = []
+        for entry, sig in zip(entries, sigs, strict=True):
+            hit = next((i for i, (old_sig, _) in enumerate(spare) if old_sig == sig), None)
+            fresh.append(spare.pop(hit)[1] if hit is not None else make_providers([entry])[0])
+        if not fresh:  # K3CODE_FAKE_PROVIDER still gives a chain without entries one scripted provider
+            fresh = make_providers(entries)
+        kept = {id(p) for p in fresh}
+        self._retire_providers([p for p in self.providers if id(p) not in kept])
+        self.providers, self._provider_sigs = fresh, sigs
+
+    #: A replaced provider is closed once no turn is in flight (after PROVIDER_DRAIN_S at most); polled this often.
+    PROVIDER_DRAIN_S = 900.0
+    PROVIDER_DRAIN_POLL_S = 2.0
+
     def _retire_providers(self, providers: list[Any]) -> None:
-        """Close replaced providers in the background (their httpx pools / temp dirs would otherwise wait for GC)."""
-        for p in providers:
-            try:
-                task = asyncio.get_running_loop().create_task(p.aclose())
-            except RuntimeError:  # no running loop (sync setup in tests): nothing to await it on
+        """Close replaced providers in the background once the turns that may hold them are done.
+
+        Their httpx pools / temp dirs would otherwise wait for GC; but a turn in flight still calls them through the
+        router it started with, so the close waits for the sessions to go quiet (``PROVIDER_DRAIN_S`` at most).
+        """
+        if not providers:
+            return
+        try:
+            task = asyncio.get_running_loop().create_task(self._close_when_drained(providers))
+        except RuntimeError:  # no running loop (sync setup in tests): nothing to await it on
+            return
+        self._retiring.update({id(p): p for p in providers})
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
+
+    async def _close_when_drained(self, providers: list[Any]) -> None:
+        deadline = time.monotonic() + self.PROVIDER_DRAIN_S
+        while not self.stopping and time.monotonic() < deadline and any(s.turn_in_flight for s in self.live.values()):
+            await asyncio.sleep(self.PROVIDER_DRAIN_POLL_S)
+        await self._close_retired(providers)
+
+    async def _close_retired(self, providers: list[Any] | None = None) -> None:
+        """Close retired providers (all of them by default); one that is already closed is skipped."""
+        for p in list(self._retiring.values()) if providers is None else providers:
+            if self._retiring.pop(id(p), None) is None:
                 continue
-            self._side_tasks.add(task)
-            task.add_done_callback(self._side_tasks.discard)
+            try:
+                await p.aclose()
+            except Exception:  # noqa: BLE001 - one provider failing to close must not keep the others open
+                logger.warning("closing retired provider %s failed", getattr(p, "name", "?"), exc_info=True)
 
     _chain_key: str | None = None
     _router_cfg: Any = None  # the config.providers object the cached providers/routers were built from
@@ -2142,6 +2211,7 @@ class GatewayServer:
         loop.share_reads(session.reads, session.pinned_reads)
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
         loop.take_steer = lambda: _take_all(session.steer_queue)
+        loop.file_stamps = session.file_stamps
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         self._register_advisor(loop, session)
         loop.hooks = userhooks.load(session.perms.cwd, session.session_id)  # re-read per loop: config edits apply
@@ -2515,7 +2585,7 @@ class GatewayServer:
             session.idle_since = time.monotonic()
             # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
             # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
-            self._persist_turn(session, loop)
+            await self._persist_turn(session, loop)
             self.learning.record_turn_replay(
                 session,
                 list(loop.turn_messages),
@@ -2600,30 +2670,50 @@ class GatewayServer:
     #: Minimum seconds between mid-turn checkpoints (each one rewrites the session's message list).
     CHECKPOINT_EVERY_S = 3.0
 
-    def _persist_turn(self, session: LiveSession, loop: AgentLoop) -> None:
-        """Write the loop's conversation so far to the session store. Never raises: it runs in ``finally``."""
+    async def _persist_turn(self, session: LiveSession, loop: AgentLoop) -> None:
+        """Write the loop's conversation so far to the session store. Never raises: it runs in ``finally``.
+
+        The JSON encoding and the SQLite write run on the store's writer thread, queued behind any checkpoint still
+        in flight (so a stale checkpoint can never land after this write). Shielded: a cancellation of the turn
+        (``/stop``, shutdown) must not drop the write."""
         try:
-            if loop.turn_messages:
-                if (active := loop.tools.active_names()) != (session.stored.meta.get("mcp_active") or []):
-                    session.stored.meta["mcp_active"] = active
-                session.stored.messages = _serialize_messages(loop.turn_messages)
-                session.stored.model = session.stored.model or self._chain_key or self.config.default_model
-                self.store.save(session.stored)
             session.last_checkpoint = time.monotonic()
+            pending = session.checkpoint_task
+            if pending is not None and not pending.done():
+                await asyncio.wait({pending})  # its write is queued first, so it cannot land after this one
+            if loop.turn_messages:
+                stored = session.stored
+                if (tools := getattr(loop, "tools", None)) is not None and (active := tools.active_names()) != (
+                    stored.meta.get("mcp_active") or []
+                ):
+                    stored.meta["mcp_active"] = active  # the MCP tools this conversation switched on
+                stored.messages = _serialize_messages(loop.turn_messages)
+                stored.model = stored.model or self._chain_key or self.config.default_model
+                snapshot = dataclasses.replace(
+                    stored, meta=copy.deepcopy(stored.meta), usage=copy.deepcopy(stored.usage)
+                )
+                await asyncio.shield(self.store.save_async(snapshot))
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 - a failed checkpoint must not mask the turn's own outcome
             logger.exception("could not persist the session")
-            if not session.persist_warned:  # once per session: the transcript is not being saved
-                session.persist_warned = True
-                session.emit(
-                    "notification.show",
-                    {
-                        "text": "Could not save this session: new messages are not being stored (see the gateway log)",
-                        "level": "error",
-                        "kind": "persist",
-                        "key": f"k3.persist.{session.session_id}",
-                    },
-                    importance="essential",
-                )
+            self._warn_persist_failed(session)
+
+    def _warn_persist_failed(self, session: LiveSession) -> None:
+        """Tell the user, once per session, that the transcript is not being saved."""
+        if session.persist_warned:
+            return
+        session.persist_warned = True
+        session.emit(
+            "notification.show",
+            {
+                "text": "Could not save this session: new messages are not being stored (see the gateway log)",
+                "level": "error",
+                "kind": "persist",
+                "key": f"k3.persist.{session.session_id}",
+            },
+            importance="essential",
+        )
 
     def session_advisor(self, session: LiveSession) -> str:
         """The session's advisor: a model key, ``advisor.STRONG`` or "" when off (``/advisor``)."""
@@ -2669,12 +2759,27 @@ class GatewayServer:
         loop.tools.register(advisor.TOOL_SPEC, handler)
 
     def _checkpoint_turn(self, session: LiveSession) -> None:
-        """After a tool result: persist the in-flight turn (throttled) so kill -9, an OOM kill or a reboot loses
-        seconds of work instead of the whole turn."""
+        """After a tool result: persist the in-flight turn (throttled, one at a time, off the event loop) so kill -9,
+        an OOM kill or a reboot loses seconds of work instead of the whole turn."""
         loop = session.loop
-        if loop is None or time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+        if loop is None or not loop.turn_messages:
             return
-        self._persist_turn(session, loop)
+        if time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+            return
+        if session.checkpoint_task is not None and not session.checkpoint_task.done():
+            return
+        session.last_checkpoint = time.monotonic()
+        messages = _serialize_messages(loop.turn_messages)
+        session.stored.messages = messages
+        session.stored.model = session.stored.model or self._chain_key or self.config.default_model
+        session.checkpoint_task = asyncio.create_task(self._write_checkpoint(session, messages, session.stored.model))
+
+    async def _write_checkpoint(self, session: LiveSession, messages: list[dict[str, Any]], model: str) -> None:
+        try:
+            await self.store.checkpoint_async(session.session_id, messages, model)
+        except Exception:  # noqa: BLE001 - the next checkpoint or the end of the turn writes it again
+            logger.exception("could not checkpoint the session")
+            self._warn_persist_failed(session)
 
     def autocompact_policy(self, session: LiveSession) -> AutoCompact:
         """When this session compacts on its own: its own /autocompact --session setting, else the config's."""
@@ -2913,11 +3018,15 @@ class GatewayServer:
             try:
                 # one question at a time per session: sub-agents running side by side each ask for their own tools
                 async with session.approval_lock:
+                    # made once it is this call's turn to ask: an edit approved meanwhile has changed the file
+                    preview = await _change_preview(tool_name, arguments, session.perms.cwd)
                     result = await self._ask_client(
                         "approval",
                         {
                             "request_id": next_request_id("approval"),
                             "command": _command_for_tool(tool_name, arguments),
+                            # what an edit/write would change (a unified diff); clients that predate it ignore it
+                            **({"preview": preview} if preview else {}),
                             "description": decision.message
                             or arguments.get("description")
                             or arguments.get("path")
@@ -3018,6 +3127,10 @@ class GatewayServer:
         fresh = load_config(project_dir=base)
         keys = _file_keys(base)
         changed = (keys | self._file_keys) & set(Settings.model_fields)
+        if "providers" in changed and fresh.providers == self.config.providers:
+            # Same chain: keep the list, so the providers and routers built from it stay as they are (a turn of
+            # another session may be calling them) instead of being rebuilt by the next turn.
+            changed.discard("providers")
         for key in changed:
             setattr(self.config, key, getattr(fresh, key))
         self._file_keys = keys
@@ -3243,15 +3356,23 @@ class GatewayServer:
 
     def prune_retention(self, *, now: float | None = None) -> dict[str, int]:
         """Daemon start: usage rows past ``retention.usage_days``, journal files of sessions that are not live and not
-        written for ``retention.journal_days``, learning decisions past ``retention.decisions_days`` (debug bundles
-        are pruned as each is written)."""
+        written for ``retention.journal_days`` (the oldest ones beyond ``retention.journal_mb`` too), learning decisions
+        past ``retention.decisions_days`` (debug bundles are pruned as each is written)."""
         keep = retention(self.config)
         rows = self.usage.prune(keep["usage_days"], now=now)
         files = prune_journals(
-            self._home(), keep=lambda sid: sid in self.live, max_age_s=keep["journal_days"] * 86400, now=now
+            self._home(),
+            keep=lambda sid: sid in self.live,
+            max_age_s=keep["journal_days"] * 86400,
+            max_bytes=keep["journal_mb"] * 1024 * 1024,
+            now=now,
         )
         decisions = self.learning.log.prune(keep["decisions_days"])
         return {"usage_rows": rows, "journal_files": files, "decisions": decisions}
+
+    def compact_storage(self) -> int:
+        """Daemon start: return the pages that deleted transcripts left in ``sessions.db`` to the filesystem."""
+        return self.store.compact()
 
     async def resume_goals(self) -> int:
         """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.
@@ -3650,6 +3771,20 @@ def _stored_tool_call(tc: ToolCall) -> dict[str, Any]:
     return stored
 
 
+async def _change_preview(tool_name: str, arguments: dict[str, Any], cwd: Path) -> str | None:
+    """The approval prompt's diff for a write/edit (see tools.preview), read off the event loop; None for other tools
+    and whenever it cannot be made: a preview must never stand in the way of the prompt itself."""
+    if tool_name not in ("write", "edit"):
+        return None
+    from k3code.tools.preview import change_preview
+
+    try:
+        return await asyncio.to_thread(change_preview, tool_name, arguments, cwd)
+    except Exception:  # noqa: BLE001
+        logger.warning("approval preview failed for %s", tool_name, exc_info=True)
+        return None
+
+
 def _command_for_tool(tool_name: str, arguments: dict[str, Any]) -> str:
     """Human-readable command line shown in the approval prompt."""
     if tool_name == "bash":
@@ -3758,7 +3893,7 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
 _SESSION_LIST_SCAN_CAP = 2000
 
 
-def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[StoredSession]:
+def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[SessionSummary]:
     """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised)."""
     spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
     ids: list[str] = []
@@ -3769,7 +3904,7 @@ def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[Store
             ids.append(sid)
             if len(ids) >= limit:
                 break
-    return [s for s in map(server.store.get, ids) if s is not None]
+    return server.store.summaries(ids)
 
 
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3785,20 +3920,16 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
     sessions = _project_sessions(server, cwd, max(1, limit)) if cwd else server.store.list(limit=limit)
     rows = []
     for s in sessions:
-        preview = ""
-        for m in s.messages:
-            if isinstance(m, dict) and m.get("role") == "user" and m.get("content"):
-                preview = str(m["content"])[:120]
-                break
+        preview = s.preview
         live = server.live.get(s.session_id)
-        state = live.state if live is not None else ("completed" if s.messages else "new")
+        state = live.state if live is not None else ("completed" if s.message_count else "new")
         rows.append(
             {
                 "id": s.session_id,
                 "title": s.title or preview or "Session",
                 "preview": preview,
                 "started_at": s.created_at,
-                "message_count": len(s.messages),
+                "message_count": s.message_count,
                 "status": state,
                 "state": state,
                 "cwd": _norm_cwd(s.cwd),

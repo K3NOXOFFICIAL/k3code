@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from k3code.paths import ignore_generated
-from k3code.reliability.sandbox import child_env, harness_git_argv
+from k3code.reliability.sandbox import HARNESS_GIT_DIFF_FLAGS, harness_git_argv, harness_git_env
 
-_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true", "GIT_CONFIG_NOSYSTEM": "1"}
+_GIT_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_EDITOR": "true"}
 
 
 async def git(cwd: str | Path, *args: str, timeout: float = 60) -> tuple[int, str]:
@@ -23,7 +23,7 @@ async def git(cwd: str | Path, *args: str, timeout: float = 60) -> tuple[int, st
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env=child_env(_GIT_ENV),
+        env=harness_git_env(_GIT_ENV),
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
@@ -70,6 +70,18 @@ async def merge_in_progress(repo: str | Path) -> bool:
 
 _BUSY = "a merge is already in progress in this checkout; it was left untouched"
 
+#: How :func:`merge_trial` reports a merge git refused to start (no MERGE_HEAD), e.g. "Your local changes to the
+#: following files would be overwritten by merge". Not a conflict between branches: no rework of the child fixes it.
+BLOCKED = "the merge did not start: uncommitted changes in the checkout are in the way (not a conflict)"
+
+
+async def uncommitted(repo: str | Path) -> list[str]:
+    """Tracked paths with staged or unstaged changes in the checkout; untracked files do not count."""
+    rc, out = await git(repo, "status", "--porcelain", "--untracked-files=no")
+    if rc != 0:
+        return [out.strip() or "git status failed"]  # cannot tell it is clean: treat it as dirty
+    return [line[3:] for line in out.splitlines() if line.strip()]
+
 
 async def repo_root(path: str | Path) -> Path | None:
     rc, out = await git(path, "rev-parse", "--show-toplevel")
@@ -109,7 +121,7 @@ async def create(parent_cwd: str | Path, child_id: str) -> Worktree | None:
 async def commit_all(wt: Worktree, message: str) -> bool:
     """Commit whatever the child left in its worktree (so the branch carries it). True if a commit was made."""
     await git(wt.path, "add", "-A")
-    rc, _ = await git(wt.path, "diff", "--cached", "--quiet")
+    rc, _ = await git(wt.path, "diff", *HARNESS_GIT_DIFF_FLAGS, "--cached", "--quiet")
     if rc == 0:
         return False
     rc, out = await git(
@@ -121,12 +133,12 @@ async def commit_all(wt: Worktree, message: str) -> bool:
 
 
 async def diff(wt: Worktree, limit: int = 200_000) -> str:
-    _, out = await git(wt.repo, "diff", f"{wt.base}...{wt.branch}")
+    _, out = await git(wt.repo, "diff", *HARNESS_GIT_DIFF_FLAGS, f"{wt.base}...{wt.branch}")
     return out if len(out) <= limit else out[:limit] + "\n[diff truncated]"
 
 
 async def diff_stat(wt: Worktree) -> str:
-    _, out = await git(wt.repo, "diff", "--stat", f"{wt.base}...{wt.branch}")
+    _, out = await git(wt.repo, "diff", *HARNESS_GIT_DIFF_FLAGS, "--stat", f"{wt.base}...{wt.branch}")
     return out.strip()
 
 
@@ -179,7 +191,8 @@ async def merge_trial(wt: Worktree) -> tuple[bool, str]:
     """Merge the branch into the parent checkout WITHOUT committing, so tests can run on the result.
 
     On conflict the merge is aborted. Follow with :func:`commit_merge` or :func:`abort_merge`. While a trial is
-    open (MERGE_HEAD exists) no other merge starts; it is not aborted by anyone but its owner.
+    open (MERGE_HEAD exists) no other merge starts; it is not aborted by anyone but its owner. A merge git refused
+    to start returns :data:`BLOCKED` followed by git's output.
     """
     async with repo_lock(wt.repo):
         if await merge_in_progress(wt.repo):
@@ -191,6 +204,8 @@ async def merge_trial(wt: Worktree) -> tuple[bool, str]:
             raise
         if rc == 0:
             return True, out.strip()
+        if not await merge_in_progress(wt.repo):  # refused before it started: nothing to abort
+            return False, f"{BLOCKED}\n{out.strip()}"
         await git(wt.repo, "merge", "--abort")
         return False, out.strip()
 
@@ -227,5 +242,5 @@ async def bring_parent_into(wt: Worktree, parent_sha: str) -> tuple[bool, str]:
 
 
 async def conflicted_files(path: str | Path) -> list[str]:
-    _, out = await git(path, "diff", "--name-only", "--diff-filter=U")
+    _, out = await git(path, "diff", *HARNESS_GIT_DIFF_FLAGS, "--name-only", "--diff-filter=U")
     return [x for x in out.splitlines() if x.strip()]

@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from k3code.paths import private_file
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind
 
@@ -104,12 +105,14 @@ class _Snapshot:
 
 
 class ProposalStore:
-    """Append-only jsonl: each line is a proposal snapshot; the last line per id wins.
+    """jsonl, one line per proposal: the last line per id wins. New proposals are appended; a status change rewrites
+    the file so it holds no superseded snapshots (older files may still carry some).
 
-    The daemon, a standalone gateway and the CLI share the file. ``add`` reads, checks and appends under an exclusive
-    lock on ``proposals.jsonl.lock``, so two processes never hand out one id (the later line replaced the earlier
-    proposal, and accepting a card applied another proposal's payload). The parsed file is kept until its size,
-    inode or mtime changes: mining checks hundreds of candidates, each of which used to re-read the whole file."""
+    The daemon, a standalone gateway and the CLI share the file. ``add`` and ``set_status`` read, check and write under
+    an exclusive lock on ``proposals.jsonl.lock``, so two processes never hand out one id (the later line replaced the
+    earlier proposal, and accepting a card applied another proposal's payload). The file and the lock are 0600 (what the
+    owner approved). The parsed file is kept until its size, inode or mtime changes: mining checks hundreds of
+    candidates, each of which used to re-read the whole file."""
 
     def __init__(self, home: Path) -> None:
         self.path = Path(home) / "proposals.jsonl"
@@ -118,9 +121,9 @@ class ProposalStore:
 
     @contextlib.contextmanager
     def _locked(self) -> Iterator[None]:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock = private_file(self.path.with_name(self.path.name + ".lock"))
         with self._mutex:
-            fd = os.open(self.path.with_name(self.path.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+            fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 yield
@@ -154,13 +157,16 @@ class ProposalStore:
         self._snap = snap
         return snap
 
+    @staticmethod
+    def _line(p: Proposal) -> bytes:
+        return (json.dumps(p.as_dict(), ensure_ascii=False) + "\n").encode("utf-8", "replace")
+
     def _write(self, p: Proposal) -> Proposal:
         """Append ``p``; returns it as stored (a lone surrogate in its text is a ``?`` on disk, so in memory too)."""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         before = self._snap
-        line = (json.dumps(p.as_dict(), ensure_ascii=False) + "\n").encode("utf-8", "replace")
+        line = self._line(p)
         stored = Proposal(**json.loads(line))
-        with self.path.open("ab") as f:
+        with private_file(self.path).open("ab") as f:  # what the owner approved: 0600
             f.write(line)
         sig = self._sig()
         if before is not None and sig is not None and before.sig[0] == sig[0] and before.sig[1] + len(line) == sig[1]:
@@ -210,13 +216,26 @@ class ProposalStore:
             )
             return self._write(p)
 
+    def dismissed(self, key: str) -> bool:
+        """Whether the proposal with this dedup key was dismissed."""
+        return any(p.key == key and p.status == "dismissed" for p in self.all())
+
     def set_status(self, pid: str, status: str) -> Proposal | None:
         with self._locked():
             p = self.get(pid)
             if p is None:
                 return None
             p.status = status
-            return self._write(p)
+            self._rewrite([p if q.id == pid else q for q in self.all()])
+            return self.get(pid)  # as stored
+
+    def _rewrite(self, proposals: list[Proposal]) -> None:
+        """Replace the file by one line per proposal, so status changes do not pile up superseded snapshots. Called
+        with the lock held; the replacement is atomic (a reader sees the old file or the new one) and 0600."""
+        tmp = private_file(self.path.with_name(self.path.name + ".tmp"))
+        tmp.write_bytes(b"".join(self._line(q) for q in proposals))
+        tmp.replace(self.path)
+        self._snap = None
 
 
 async def propose(

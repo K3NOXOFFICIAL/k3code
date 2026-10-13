@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from k3code import daemon, paths
+from k3code.setup.state import env_file_path
 
 UNIT_NAME = "k3code.service"
 RECOVER_UNIT_NAME = "k3code-recover.service"
@@ -55,7 +56,7 @@ RestrictRealtime=yes
 # Deliberately no ProtectHome/ProtectSystem/PrivateTmp/PrivateNetwork: the daemon runs bubblewrap and the user's tools.
 Environment=K3CODE_LOG_LEVEL=INFO
 {extra_env}# Provider API keys (K3CODE_API_KEY=..., OMNIROUTE_API_KEY=...) go here, chmod 600:
-EnvironmentFile=-%h/.config/k3code/env
+EnvironmentFile=-{env_file}
 
 [Install]
 WantedBy=default.target
@@ -80,6 +81,7 @@ RestrictRealtime=yes
 """
 
 DEFAULT_EXEC_START = "%h/.local/share/k3code/current/venv/bin/k3code daemon"
+DEFAULT_ENV_FILE = "%h/.config/k3code/env"
 
 
 def _unit_quote(text: str) -> str:
@@ -115,11 +117,24 @@ def default_extra_env() -> str:
     )
 
 
+def default_env_file() -> str:
+    """The ``EnvironmentFile=`` path: where the setup wizard stores provider keys (``$XDG_CONFIG_HOME/k3code/env``),
+    spelled ``%h/.config/k3code/env`` when that is the default location. The unit is a different process tree that
+    never sees the shell's XDG_CONFIG_HOME, so a non-default location has to be written into it. systemd takes the
+    path unquoted (a quoted one is "not absolute"), so only ``%``, which is a specifier, is escaped."""
+    path = env_file_path()
+    if path == Path.home() / ".config" / "k3code" / "env":
+        return DEFAULT_ENV_FILE
+    return str(path.absolute()).replace("%", "%%")
+
+
 def render_unit(exec_start: str | None = None) -> str:
-    """The unit text. An explicit ``exec_start`` is used as given, with no K3CODE_DATA / K3CODE_HOME lines."""
+    """The unit text. An explicit ``exec_start`` is used as given, with no K3CODE_DATA / K3CODE_HOME lines and the
+    default env file."""
     return UNIT_TEMPLATE.format(
         exec_start=exec_start or default_exec_start(),
         extra_env="" if exec_start else default_extra_env(),
+        env_file=DEFAULT_ENV_FILE if exec_start else default_env_file(),
         start_interval=START_LIMIT_INTERVAL_S,
         start_burst=START_LIMIT_BURST,
         recover_unit=RECOVER_UNIT_NAME,

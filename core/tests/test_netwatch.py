@@ -112,6 +112,71 @@ async def test_provider_down_is_not_offline():
     assert nw.state.usable_for_llm  # fail-over signal, not a pause signal
 
 
+async def test_answering_provider_keeps_state_usable_without_internet():
+    """No internet (or gstatic and 1.1.1.1 blocked) but a loopback/LAN provider answers: ONLINE, not OFFLINE (#124)."""
+
+    async def provider(base_url: str, timeout: float):
+        return (200, "{}", base_url)
+
+    nw = NetWatch(
+        internet_probe=_internet(InternetProbeResult(ok=False)),
+        provider_probe=provider,
+        nm_probe=_nm_probe,
+    )
+    nw.add_provider("local", "http://127.0.0.1:11434/v1")
+    await nw._probe_all()
+
+    assert nw.state is NetState.ONLINE
+
+
+async def test_no_internet_and_no_answering_provider_is_offline():
+    """The generic probe still decides when no provider answers: an error or a 5xx is not an answer."""
+    replies = iter([ConnectionError("down"), (503, "", "u")])
+
+    async def provider(base_url: str, timeout: float):
+        reply = next(replies)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    nw = NetWatch(
+        _config(provider_fail_threshold=3),
+        internet_probe=_internet(InternetProbeResult(ok=False)),
+        provider_probe=provider,
+        nm_probe=_nm_probe,
+    )
+    nw.add_provider("local", "http://127.0.0.1:11434/v1")
+    await nw._probe_all()
+    assert nw.state is NetState.OFFLINE
+    await nw._probe_all()
+    assert nw.state is NetState.OFFLINE
+
+
+async def test_provider_that_stops_answering_no_longer_holds_the_state_up():
+    """The provider's own state needs several fails to turn PROVIDER_DOWN; the answer of this round is what counts."""
+    up = True
+
+    async def provider(base_url: str, timeout: float):
+        if up:
+            return (200, "{}", base_url)
+        raise ConnectionError("down")
+
+    nw = NetWatch(
+        _config(provider_fail_threshold=3),
+        internet_probe=_internet(InternetProbeResult(ok=False)),
+        provider_probe=provider,
+        nm_probe=_nm_probe,
+    )
+    nw.add_provider("local", "http://127.0.0.1:11434/v1")
+    await nw._probe_all()
+    assert nw.state is NetState.ONLINE
+
+    up = False
+    await nw._probe_all()
+    assert nw.provider_state("local") is NetState.ONLINE  # one fail is below the threshold
+    assert nw.state is NetState.OFFLINE
+
+
 async def test_single_provider_down_does_not_sink_state():
     """One healthy provider keeps the global state usable."""
 
