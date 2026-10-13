@@ -276,7 +276,17 @@ detect_platform() {
   case "$ARCH" in x86_64 | amd64) NODE_ARCH=x64 GO_ARCH=amd64 ;; *) NODE_ARCH=arm64 GO_ARCH=arm64 ;; esac
   case "$PLATFORM" in Linux) NODE_OS=linux GO_OS=linux ;; *) NODE_OS=darwin GO_OS=darwin ;; esac
   MUSL=0
-  if [ "$PLATFORM" = Linux ] && ls /lib/ld-musl-* >/dev/null 2>&1; then MUSL=1; fi # Alpine: no official Node build
+  if [ "$PLATFORM" = Linux ] && running_on_musl; then MUSL=1; fi # Alpine: no official Node build
+}
+
+running_on_musl() { # the C library this system runs on; a /lib/ld-musl-* file alone proves nothing (Debian's musl package ships one)
+  if have ldd; then
+    case $(ldd --version 2>&1 || true) in
+      *[Mm][Uu][Ss][Ll]*) return 0 ;;
+      *GLIBC* | *GNU*) return 1 ;;
+    esac
+  fi
+  [ -e /etc/alpine-release ]
 }
 
 detect_pm() {
