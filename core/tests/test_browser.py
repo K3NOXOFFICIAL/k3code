@@ -206,6 +206,20 @@ async def test_a_403_escalates_to_the_browser_and_reads_what_renders():
 
 
 @respx.mock
+async def test_a_page_read_in_the_browser_keeps_its_links_absolute():
+    """Issue #99: the browser path resolves relative links against the rendered page's URL too."""
+    respx.get("https://blocked.test/docs/").mock(return_value=httpx.Response(403, text=CHALLENGE))
+    page = '<html><body><main><p>Next: <a href="step2.html">step 2</a></p></main></body></html>'
+    browser, _log = fake_browser({"https://blocked.test/docs/": (200, page)})
+    _, text = await fetch_page("https://blocked.test/docs/", fetcher=fetcher(), browser=browser)
+    assert text == "Next: [step 2](https://blocked.test/docs/step2.html)"
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}), fetcher=fetcher(), browser=browser)
+    out = await reg.handlers["web_browse"]({"url": "https://blocked.test/docs/"})
+    assert out["content"].endswith("Next: [step 2](https://blocked.test/docs/step2.html)")
+
+
+@respx.mock
 async def test_a_403_without_a_browser_is_reported_not_retried():
     respx.get("https://blocked.test/x").mock(return_value=httpx.Response(403, text=CHALLENGE))
     with pytest.raises(FetchStatus):
@@ -429,7 +443,7 @@ async def test_a_huge_dom_is_capped_and_parsed_off_the_event_loop(monkeypatch):
 
     seen: list[str] = []
     real = t.extract_text
-    monkeypatch.setattr(t, "extract_text", lambda m: (seen.append(threading.current_thread().name), real(m))[1])
+    monkeypatch.setattr(t, "extract_text", lambda m, *a: (seen.append(threading.current_thread().name), real(m, *a))[1])
 
     class Browser:
         async def fetch(self, url):
