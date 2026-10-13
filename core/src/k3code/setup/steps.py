@@ -171,6 +171,34 @@ def key_env_for(name: str, taken: Collection[str] = ()) -> str:
     return var
 
 
+def key_env_at(base_url: str, name: str, before: Sequence[Any], taken: Collection[str] = ()) -> str:
+    """The key variable of entry ``name`` at ``base_url``, which is not a vendor preset at its own URL.
+
+    ``before`` is the provider chain in the config now. Its entry for the same URL passes its variable on, unless an
+    entry for another URL or one in ``taken`` uses it, or it is a vendor preset's (that one holds the vendor's key).
+    Otherwise a new one that holds no value yet: a leftover key belongs to some other endpoint (#114, #120)."""
+    url = base_url.rstrip("/")
+    entries = [e for e in before if isinstance(e, dict)]
+    olds = [(str(e.get("base_url") or "").rstrip("/"), str(e.get("api_key_env") or "")) for e in entries]
+    used = {*taken, *(var for at, var in olds if at != url), *(s["api_key_env"] for s in probe.PRESETS.values())}
+    same = next((var for at, var in olds if at == url), "")
+    if same and same not in used:
+        return same
+    return key_env_for(name, used | set(os.environ) | set(read_env_file()))
+
+
+def _key_env(name: str, base_url: str, preset: dict[str, str], others: Sequence[dict[str, Any]]) -> str:
+    """A vendor preset's variable only at that vendor's own URL: at another URL the vendor's key would go there, and
+    that entry's key would replace the vendor's. Anything else: :func:`key_env_at` over the configured chain."""
+    if preset.get("api_key_env") and base_url.rstrip("/") == preset["base_url"].rstrip("/"):
+        return preset["api_key_env"]
+    from k3code import confio
+    from k3code.paths import user_config_path
+
+    before = confio.read_yaml(user_config_path()).get("providers") or []
+    return key_env_at(base_url, name, before, {str(e.get("api_key_env")) for e in others})
+
+
 def _entry_from(
     c: Ctx, idx: int, label: str, spec: dict[str, Any] | None, others: Sequence[dict[str, Any]] = ()
 ) -> dict[str, Any] | None:
@@ -178,7 +206,6 @@ def _entry_from(
 
     ``others`` are the entries already built in this run: a name or key variable made up here differs from theirs."""
     names = {str(e.get("name")) for e in others}
-    key_envs = {str(e.get("api_key_env")) for e in others}
     if spec is None:
         if not c.p.confirm(f"providers.add{idx}", f"Add a {label} provider?", idx == 0):
             return None
@@ -204,7 +231,7 @@ def _entry_from(
             "",
             secret=True,
         )
-        spec["api_key_env"] = base.get("api_key_env") or key_env_for(spec["name"], key_envs)
+        spec["api_key_env"] = _key_env(spec["name"], spec["base_url"], base, others)
         if key.strip():
             spec["api_key"] = key.strip()
         else:
@@ -227,11 +254,12 @@ def _entry_from(
         return {"name": spec.get("name") or "claude-cli", "kind": "claude-cli"}
     base = probe.PRESETS.get(spec.get("preset", ""), {})
     name = spec.get("name") or unique_name(spec.get("preset") or f"provider{idx + 1}", names)
+    url = spec.get("base_url") or base.get("base_url", "")
     entry = {
         "name": name,
         "kind": spec.get("kind") or base.get("kind", "openai"),
-        "base_url": spec.get("base_url") or base.get("base_url", ""),
-        "api_key_env": spec.get("api_key_env") or base.get("api_key_env") or key_env_for(name, key_envs),
+        "base_url": url,
+        "api_key_env": spec.get("api_key_env") or _key_env(name, url, base, others),
     }
     if spec.get("preset") == "omniroute":
         _GATEWAYS.add(entry["name"])

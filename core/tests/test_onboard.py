@@ -406,3 +406,21 @@ def test_declining_a_vendor_key_and_giving_none_does_not_probe_with_it_and_says_
     out = capsys.readouterr().out
     assert "ANTHROPIC_API_KEY" in out and "still stored" in out and "not set yet" not in out
     assert old not in out
+
+
+def test_fast_api_never_takes_over_a_vendor_key_variable_for_another_url(root, monkeypatch) -> None:
+    """The old wizard wrote an openai entry with an edited URL on OPENAI_API_KEY; fast setup for that URL passed the
+    variable on, so the OpenAI key kept going to the other host."""
+    from k3code import confio
+
+    local = "http://127.0.0.1:18083/v1"
+    openai_key = "fake-" + "openai-key"
+    monkeypatch.setenv("OPENAI_API_KEY", openai_key)
+    confio.write_yaml(
+        user_config_path(),
+        {"providers": [{"name": "openai", "kind": "openai", "base_url": local, "api_key_env": "OPENAI_API_KEY"}]},
+    )
+    _fast_api(root, local)
+    prov = load_config(project_dir=root).providers[0]
+    assert prov.base_url == local
+    assert prov.api_key_env != "OPENAI_API_KEY" and prov.api_key != openai_key

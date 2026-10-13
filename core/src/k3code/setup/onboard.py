@@ -16,7 +16,15 @@ from k3code.paths import home, user_config_path
 from k3code.setup import probe
 from k3code.setup.prompter import Prompter
 from k3code.setup.state import env_file_path, read_env_file
-from k3code.setup.steps import Ctx, _entry_from, key_env_for, offer_project_recipes, unique_name, write_config
+from k3code.setup.steps import (
+    Ctx,
+    _entry_from,
+    key_env_at,
+    key_env_for,
+    offer_project_recipes,
+    unique_name,
+    write_config,
+)
 from k3code.setup.wizard import run_setup
 
 QUESTION = "Fast setup (API endpoint + key) or full setup?"
@@ -106,16 +114,10 @@ def _pick_model(p: Prompter, name: str, ids: list[str]) -> str:
 def _custom_names(base: str, before: list[Any]) -> tuple[str, str]:
     """Name and key variable for a custom endpoint, never those of another endpoint already configured (#114, #120).
 
-    The entry being replaced (same endpoint) passes its variable on, unless another endpoint uses it too. A new
-    variable is one that holds no value yet: a leftover key belongs to some other endpoint."""
-    olds = [e for e in before if isinstance(e, dict)]
-    others = [e for e in olds if str(e.get("base_url") or "").rstrip("/") != base]
-    used = {str(e.get("api_key_env") or "") for e in others}
-    same = next((str(e.get("api_key_env") or "") for e in olds if e not in others), "")
+    The entry being replaced (same endpoint) passes its variable on, the same rule as the wizard (key_env_at)."""
+    others = [e for e in before if isinstance(e, dict) and str(e.get("base_url") or "").rstrip("/") != base]
     name = unique_name("endpoint", {str(e.get("name")) for e in others})
-    if same and same not in used:
-        return name, same
-    return name, key_env_for(name, used | set(os.environ) | set(read_env_file()))
+    return name, key_env_at(base, name, before)
 
 
 def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> tuple[dict[str, Any], str]:
