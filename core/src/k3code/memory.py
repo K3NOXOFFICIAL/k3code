@@ -244,24 +244,47 @@ def fenced(label: str, body: str) -> str:
     return f"{label}\n{fence}text\n{body}\n{fence}"
 
 
+def _claim_order(files: list[MemoryFile], root: Path) -> list[int]:
+    """Indexes of ``files`` by who gets the total budget first: the user's memory, then the instruction files from
+    the working directory outward (a directory's own files in their file order), then the rules."""
+
+    def key(i: int) -> tuple[int, int]:
+        m = files[i]
+        if m.scope != "project":
+            return (0 if m.scope == "user" else 2, 0)
+        try:
+            return (1, -len(m.path.relative_to(root).parts))
+        except ValueError:
+            return (1, 0)
+
+    return sorted(range(len(files)), key=key)
+
+
 def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = MAX_MEMORY_TOTAL) -> str:
     """User memory as written; the repository's memory files fenced as what they are (text from the repository).
 
-    Each file is capped at ``limit`` characters and all of them together at ``total``; past that the rest are left
-    out with one marker line.
+    Each file is capped at ``limit`` characters and all of them together at ``total``. The budget goes to the user's
+    memory first, then to the files nearest ``cwd`` and outward, so what runs out is the repository root's text, not
+    the rules of the directory being worked in; the files that fit keep the prompt order (nearest last) and one marker
+    line says how many were left out.
     """
     parts = []
     root = project_root(cwd)
     files = load_memory(cwd, max_chars=min(limit, total))  # what a file can contribute; the rest is never read
+    bodies: dict[int, str] = {}
     left = total
-    for i, m in enumerate(files):
-        body = m.text if len(m.text) <= limit else m.text[:limit] + "\n…(truncated)"
+    for i in _claim_order(files, root):
+        body = files[i].text if len(files[i].text) <= limit else files[i].text[:limit] + "\n…(truncated)"
         if left <= 0:
-            parts.append(TOTAL_MARKER.format(n=len(files) - i, cap=total))
-            break
+            continue
         if len(body) > left:
             body = body[:left] + "\n…(truncated)"
         left -= len(body)
+        bodies[i] = body
+    for i, m in enumerate(files):
+        if i not in bodies:
+            continue
+        body = bodies[i]
         if m.scope == "user":
             parts.append(f"## User memory\n\n{body}")
             continue
@@ -271,6 +294,8 @@ def memory_prompt(cwd: str | Path, limit: int = MAX_MEMORY_CHARS, total: int = M
             name = m.path.name
         title = "Project rules" if m.scope == "rules" else "Project memory"
         parts.append(f"## {title} ({name})\n\n" + fenced("project instructions (from the repository):", body))
+    if len(bodies) < len(files):
+        parts.append(TOTAL_MARKER.format(n=len(files) - len(bodies), cap=total))
     if learned := read_learned(cwd):
         body = "\n".join(f"- {f}" for f in learned)[:limit]
         parts.append("## Learned project notes\n\n" + fenced(LEARNED_LABEL, body))

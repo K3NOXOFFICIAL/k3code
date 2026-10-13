@@ -92,10 +92,41 @@ def test_per_file_and_total_caps(tmp_path: Path) -> None:
     assert "b" * 15_000 in prompt
     assert "c" * 4_900 in prompt and "c" * 5_001 not in prompt  # the rest of the 40k total (markers count too)
     assert prompt.count("…(truncated)") == 2
-    _write(root / "pkg" / "K3CODE.md", "d" * 10)
+
+
+def test_total_cap_keeps_the_nearest_files_and_trims_the_root(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    for name, fill in (("K3CODE.md", "k"), ("AGENTS.md", "a"), ("CLAUDE.md", "c")):
+        _write(root / name, fill * 20_000)
+    _write(root / "pkg" / "K3CODE.md", "MOST SPECIFIC RULE: never touch pkg/gen")
     prompt = memory_prompt(root / "pkg")
-    assert "d" * 10 not in prompt
+    assert "## Project memory (pkg/K3CODE.md)" in prompt and "MOST SPECIFIC RULE: never touch pkg/gen" in prompt
+    assert prompt.index("k" * 20_000) < prompt.index("MOST SPECIFIC")  # still nearest last in the prompt
+    assert "a" * 19_000 in prompt and "c" * 20_000 not in prompt  # the last root file is what was cut
     assert memory.TOTAL_MARKER.format(n=1, cap=memory.MAX_MEMORY_TOTAL) in prompt
+    assert len(prompt) < memory.MAX_MEMORY_TOTAL + 1_000
+
+
+def test_total_cap_trims_the_farthest_file_first(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _write(root / "K3CODE.md", "r" * 20_000)
+    _write(root / "pkg" / "K3CODE.md", "p" * 10_000)
+    _write(root / "pkg" / "sub" / "K3CODE.md", "s" * 20_000)
+    prompt = memory_prompt(root / "pkg" / "sub")
+    assert "s" * 20_000 in prompt and "p" * 10_000 in prompt  # the two nearest files whole
+    assert "r" * 9_000 in prompt and "r" * 20_000 not in prompt  # the root file is what loses its tail
+    assert prompt.index("r" * 9_000) < prompt.index("p" * 9_000) < prompt.index("s" * 9_000)
+    assert memory.TOTAL_MARKER.format(n=1, cap=memory.MAX_MEMORY_TOTAL) not in prompt  # trimmed, none left out
+
+
+def test_total_cap_keeps_the_users_memory(tmp_path: Path, monkeypatch) -> None:
+    root = _repo(tmp_path)
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    _write(tmp_path / "home" / "memory" / "USER.md", "USER PREFERENCE")
+    for name in ("K3CODE.md", "AGENTS.md", "CLAUDE.md"):
+        _write(root / name, name[0] * 20_000)
+    prompt = memory_prompt(root)
+    assert "USER PREFERENCE" in prompt
 
 
 def test_import_relative_to_the_importing_file(tmp_path: Path) -> None:
