@@ -47,8 +47,9 @@ def session_to_dict(s: StoredSession, secrets: list[str] | None = None) -> dict[
     return redact_session_json(drop_values(asdict(s), secrets or []))
 
 
-def _known_secrets(config: Any, cwd: Path) -> list[str]:
-    """Every secret value this process knows (configured provider keys, secret-named env vars), longest first."""
+def _known_secrets(config: Any, cwd: Path) -> tuple[list[str], list[str]]:
+    """Every secret value this process knows (configured provider keys, secret-named env vars), longest first; and
+    the same without the guessed ones (``debugdump.secret_values(guesses=False)``)."""
     from k3code.debugdump import secret_values
 
     if config is None:
@@ -58,7 +59,25 @@ def _known_secrets(config: Any, cwd: Path) -> list[str]:
             config = load_config(project_dir=cwd)
         except Exception:  # noqa: BLE001 - a config that does not load still leaves the env vars to check
             config = None
-    return secret_values(config)
+    return secret_values(config), secret_values(config, guesses=False)
+
+
+def _drop_rules(tool: str, rules: Any, secrets: list[str], certain: list[str]) -> Any:
+    if not isinstance(rules, dict):  # `bash: ask`, or the hardline regexes
+        return drop_values(rules, certain if tool == "hardline" else secrets)
+    return {drop_values(p, secrets if a == "allow" else certain): drop_values(a, secrets) for p, a in rules.items()}
+
+
+def _drop_known(settings: dict[str, Any], secrets: list[str], certain: list[str]) -> dict[str, Any]:
+    """``settings`` without the known secret values (``drop_values``). A deny or ask rule's pattern and a hardline
+    regex lose only the ``certain`` ones: hiding a guessed value (an MCP root path, a region) there leaves a rule that
+    never matches, and the import then allows what it denied. An allow rule loses every known value (it asks again)."""
+    return {
+        drop_values(key, secrets): {tool: _drop_rules(tool, rules, secrets, certain) for tool, rules in value.items()}
+        if key == "permissions" and isinstance(value, dict)
+        else drop_values(value, secrets)
+        for key, value in settings.items()
+    }
 
 
 def write_bundle(
@@ -71,13 +90,13 @@ def write_bundle(
     config: Any = None,
 ) -> dict[str, Any]:
     """Write the bundle; returns the manifest. ``config`` names the keys to drop (default: loaded for ``cwd``)."""
-    secrets = _known_secrets(config, cwd)
+    secrets, certain = _known_secrets(config, cwd)
     files: dict[str, bytes] = {}
     if settings:
         for name, kind in _SETTINGS_FILES.items():
             src = user_config_path() if kind == "user" else project_config_path(cwd)
             if src.is_file():
-                data = redact(drop_values(confio.read_yaml(src), secrets))
+                data = redact(_drop_known(confio.read_yaml(src), secrets, certain))
                 files[name] = yaml.safe_dump(data, sort_keys=False, allow_unicode=True).encode()
     exported: list[str] = []
     for sid in session_ids:

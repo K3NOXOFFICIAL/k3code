@@ -38,15 +38,22 @@ _AUTH_SCHEME = re.compile(r"(?i)(?:bearer|basic|token|digest|negotiate|api-?key|
 _ORDINARY_PART = re.compile(r"[A-Z]?[a-z]+[0-9]{0,4}|[A-Z]+|[0-9]{1,5}")
 
 
+def _secret_shape(value: str) -> bool:
+    """``value`` is or carries a credential the shape scrubber knows (a prefixed token, a URL password, ``?token=``)."""
+    return looks_like_secret(value) or scrub_text(scrub_urls(value)) != value
+
+
 def _ordinary(value: str) -> bool:
     """An MCP env/header value that is a word, path, address, locale or MIME type rather than a credential: hiding it
     wherever it appears would break every setting that repeats it (`http://127.0.0.1:4000/v1`)."""
-    if looks_like_secret(value) or scrub_text(scrub_urls(value)) != value:
+    if _secret_shape(value):
         return False
     if value.isalpha():
         return True
-    if value.startswith(("/", "~")):  # a path, unless a segment is token-shaped (standard base64 can start with `/`)
-        return not any(_token_shaped(seg, 16) for seg in re.split(r"[/~]", value))
+    if value.startswith(("/", "~")):  # a path, unless it is only tokens (standard base64 can start with `/`): one
+        # ordinary word makes it a path whatever its directories are called (`/Users/dev/Code/MyAwesomeProject`)
+        segs = [seg for seg in re.split(r"[/~]", value) if seg]
+        return any(_ORDINARY_PART.fullmatch(seg) for seg in segs) or not any(_token_shaped(seg, 16) for seg in segs)
     if not re.search(r"[/.:]", value):
         return False
     return all(_ORDINARY_PART.fullmatch(p) for p in re.split(r"[/.:@?&=#_\-]+", value) if p)
@@ -62,10 +69,13 @@ def _env_refs(obj: Any) -> set[str]:
     return set()
 
 
-def secret_values(config: Any = None) -> list[str]:
+def secret_values(config: Any = None, *, guesses: bool = True) -> list[str]:
     """Every secret value this process knows, longest first: env vars that look secret, provider keys, the variables
     ``*_env`` settings name (``bearer_env``), and MCP env/header values that are secret by name or by shape. Each also
-    in its JSON-escaped form, for JSON text inside a tool result, and percent-encoded, for a URL."""
+    in its JSON-escaped form, for JSON text inside a tool result, and percent-encoded, for a URL.
+
+    ``guesses=False`` leaves out the MCP values known only because they are no ordinary word, path or address (a
+    region, a database name): a deny rule that names one must keep it (see ``bundle.write_bundle``)."""
     from k3code.config import env_value
 
     values: set[str] = set()
@@ -84,7 +94,8 @@ def secret_values(config: Any = None) -> list[str]:
         for name, value in [*(getattr(cfg, "env", None) or {}).items(), *(getattr(cfg, "headers", None) or {}).items()]:
             if not isinstance(value, str):
                 continue
-            if _SECRET_NAME.search(name) or is_secret_key(name) or (len(value) >= 8 and not _ordinary(value)):
+            known = _SECRET_NAME.search(name) or is_secret_key(name) or _secret_shape(value)
+            if known or (guesses and len(value) >= 8 and not _ordinary(value)):
                 values.add(value)
             if m := _AUTH_SCHEME.fullmatch(value.strip()):
                 values.add(m.group(1))
