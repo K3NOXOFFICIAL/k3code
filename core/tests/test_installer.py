@@ -1223,6 +1223,34 @@ def test_a_short_sha_is_resolved_or_refused_clearly(tmp_path: Path) -> None:
     assert "full 40-character SHA" in old.stderr
 
 
+def test_reinstalling_a_built_commit_rewrites_its_ref(tmp_path: Path) -> None:
+    src = _source_repo(tmp_path)
+    sha = _git(src, "rev-parse", "HEAD")
+    home = tmp_path / "home"
+    home.mkdir()
+    ref_file = home / DATA_REL / "current" / ".ref"
+
+    def install(ref: str) -> subprocess.CompletedProcess[str]:
+        r = run(home, INSTALL, "--from-git", f"file://{src}", "--ref", ref, "--minimal")
+        assert r.returncode == 0, r.stderr
+        return r
+
+    install(sha)
+    assert ref_file.read_text().strip() == sha  # an install of a full SHA is pinned
+
+    # main is the same commit: the build is reused, but the install now follows the branch (update --check stops
+    # saying "pinned")
+    again = install("main")
+    assert "already installed" in again.stderr
+    assert ref_file.read_text().strip() == "main"
+
+    # and the other way round: asking for a commit pins an install that followed a branch
+    pinned = install(sha)
+    assert "already installed" in pinned.stderr
+    assert ref_file.read_text().strip() == sha
+    assert not list(ref_file.parent.glob(".ref.*"))  # no temp file left behind
+
+
 def _download_stub(root: Path, files: dict[str, bytes]) -> tuple[Path, Path]:
     """A curl stand-in that serves ``files`` by the last path segment of the URL (go.dev's release list as
     ``releases.json``), refuses anything else, and logs every URL."""
