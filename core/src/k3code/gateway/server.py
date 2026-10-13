@@ -124,32 +124,43 @@ logger = logging.getLogger("k3code.gateway")
 MAX_FRAME_BYTES = 8 << 20
 #: Long-running requests (CONCURRENT_METHODS) one connection may have in flight; more are refused, not queued.
 MAX_CONCURRENT_PER_CLIENT = 8
-#: Methods only an authenticated connection (``gateway.auth``) may call: they run commands, change permissions or
-#: modes, rewrite config, restart MCP servers or move a session. The stdio client (the TUI's own child) is trusted.
-PRIVILEGED_METHODS = frozenset(
+#: Methods a socket peer may call before ``gateway.auth``: each reads k3code's own state and changes nothing (the
+#: ``k3code doctor`` probe, listings, the settings view). Every other method needs an authenticated connection: a
+#: turn (``prompt.submit``), a steer, an undo, attaching to or creating a session, a shell command, a mode or config
+#: change, an attachment, a path listing, ... A method added to ``_HANDLERS`` is privileged until it is listed here.
+#: The stdio client (the TUI's own child) is trusted.
+OPEN_METHODS = frozenset(
     {
-        "shell.exec",
-        "config.set",
-        "session.mode.set",
-        "session.mode.cycle",
-        "session.workspace.move",
-        "reload.mcp",
-        "model.save_key",
-        "model.disconnect",
-        # slash commands reach the same switches (/permissions yolo, /mcp reload, /config set ...)
-        "slash.exec",
-        "command.dispatch",
+        "setup.status",
+        "system.battery",
+        "commands.catalog",
+        "complete.slash",
+        "input.detect_drop",
+        "model.options",
+        "tune.get",
+        "settings.get",
+        "config.get",
+        "session.list",
+        "session.active_list",
+        "session.most_recent",
+        "session.status",
+        "session.usage",
+        "session.control.read",
+        "session.events.since",
+        "session.events.stats",
+        "subagent.list",
+        "subagent.tail",
+        "process.list",
+        "delegation.status",
     }
 )
 
 
 def _requires_auth(method: str, params: Any) -> bool:
-    if method in PRIVILEGED_METHODS:
-        return True
-    if method == "browser.manage":  # status/disconnect are harmless; connect attaches to a CDP endpoint
+    if method == "browser.manage":  # status is a read; connect attaches to a CDP endpoint, disconnect drops it
         action = params.get("action") if isinstance(params, dict) else None
-        return str(action or "status").strip().lower() == "connect"
-    return False
+        return str(action or "status").strip().lower() != "status"
+    return method not in OPEN_METHODS
 
 
 #: Emitted for gateway.ready; the TUI repaints its palette from this.
@@ -549,7 +560,7 @@ class Client:
         self.closed = False
         self.pending_bytes = 0  # queued for the peer but not yet accepted by its socket (see MAX_CLIENT_BACKLOG)
         self.close_peer: Callable[[], None] | None = None  # drops the connection (socket clients)
-        #: May call PRIVILEGED_METHODS and answer approvals. The stdio pipe is; a socket peer after gateway.auth.
+        #: May call any method, not only OPEN_METHODS, and answer approvals: the stdio pipe, a socket peer after auth.
         self.authenticated = authenticated
         self.in_flight = 0  # running CONCURRENT_METHODS tasks of this client (capped at MAX_CONCURRENT_PER_CLIENT)
 
@@ -1320,14 +1331,13 @@ class GatewayServer:
         if method == gw_auth.AUTH_METHOD:
             self._authenticate(client, req_id, params)
             return
-        if not client.authenticated and _requires_auth(method, params):
-            msg = f"{method} needs an authenticated connection (send {gw_auth.AUTH_METHOD} with the daemon token first)"
-            self._reply(client, encode_error(req_id, UNAUTHORIZED, msg))
-            return
-
         handler = _HANDLERS.get(method)
         if handler is None:
             self._reply(client, encode_error(req_id, METHOD_NOT_FOUND, f"Method not found: {method}"))
+            return
+        if not client.authenticated and _requires_auth(method, params):
+            msg = f"{method} needs an authenticated connection (send {gw_auth.AUTH_METHOD} with the daemon token first)"
+            self._reply(client, encode_error(req_id, UNAUTHORIZED, msg))
             return
 
         try:
