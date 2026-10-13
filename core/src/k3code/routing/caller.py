@@ -94,11 +94,26 @@ class ModelCaller:
         kind = TaskKind(kind)
         routers = self._routers()
         tier = tier or tier_for(kind, getattr(self.config, "task_tiers", None))
-        if router is not None:
-            return await self._once(routers, kind, tier, messages, session_id, tools or [], max_tokens, timeout, router)
+        if router is not None:  # no escalation follows: every entry gets its try
+            return await self._once(
+                routers, kind, tier, messages, session_id, tools or [], max_tokens, timeout, router, retry_skipped=True
+            )
         while True:
             try:
-                return await self._once(routers, kind, tier, messages, session_id, tools or [], max_tokens, timeout)
+                # under a deadline, entries skipped for a window are not retried when the next tier will be asked
+                # instead (with a deadline of its own); where nothing follows, they are the last chance of the call
+                escalates = escalate and next_tier(tier) is not None
+                return await self._once(
+                    routers,
+                    kind,
+                    tier,
+                    messages,
+                    session_id,
+                    tools or [],
+                    max_tokens,
+                    timeout,
+                    retry_skipped=not escalates,
+                )
             except ChainExhausted as exc:
                 nxt = next_tier(tier) if escalate else None
                 if nxt is None:
@@ -153,6 +168,7 @@ class ModelCaller:
         timeout: float | None,
         attempts: list[tuple[str, str]],
         book_dead: Callable[[Usage, tuple[str, str]], None],
+        retry_skipped: bool = True,
     ) -> Message:
         """The router's final message. An attempt that died after the provider counted its prompt (``partial_usage``) is
         spend all the same: ``book_dead`` gets it, as the agent loop's ``_metered`` does for a turn.
@@ -162,9 +178,11 @@ class ModelCaller:
         stream = getattr(router, "stream", None)
         if stream is None:  # a router that only completes (a test double) has no attempts to meter
             return await router.complete(messages, tools, max_tokens=max_tokens)
-        # (no second pass over the entries skipped for a window either: it would run inside the deadline and leave the
-        # tier escalation, which gets a fresh deadline, no time)
-        under_deadline = {"stall_retries": 0, "retry_deferred": False} if timeout else {}
+        # (``retry_skipped`` False: no second pass over the entries skipped for a window either: it would run inside
+        # the deadline and leave the tier escalation, which gets a fresh deadline, no time)
+        under_deadline: dict[str, Any] = {"stall_retries": 0} if timeout else {}
+        if timeout and not retry_skipped:
+            under_deadline["retry_deferred"] = False
         events = stream(messages, tools, max_tokens=max_tokens, **under_deadline)
         pending: Usage | None = None
         served = ("", "")  # who the pending prompt was sent to: the attempts list moves on with the next one
@@ -249,6 +267,7 @@ class ModelCaller:
         router: Any = None,
         *,
         retried: bool = False,
+        retry_skipped: bool = True,
     ) -> CallResult:
         router = router if router is not None else routers.get(tier)
         started = time.monotonic()
@@ -266,6 +285,7 @@ class ModelCaller:
                 timeout,
                 attempts,
                 lambda usage, served: self._book(usage, served, session_id, tier, kind, detail=CUT_SHORT),
+                retry_skipped,
             )
             final = await (asyncio.wait_for(coro, timeout) if timeout else coro)
         finally:
@@ -290,7 +310,17 @@ class ModelCaller:
             quiet = effort_mod.REASONING_EFFORT.set(None)
             try:
                 again = await self._once(
-                    routers, kind, tier, messages, session_id, tools, max_tokens, timeout, router, retried=True
+                    routers,
+                    kind,
+                    tier,
+                    messages,
+                    session_id,
+                    tools,
+                    max_tokens,
+                    timeout,
+                    router,
+                    retried=True,
+                    retry_skipped=retry_skipped,
                 )
             except Exception:  # noqa: BLE001 - the first answer was valid, if empty: the retry must not replace it
                 logger.debug("the retry without the effort failed; keeping the first answer", exc_info=True)

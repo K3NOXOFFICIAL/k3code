@@ -56,7 +56,8 @@ FAILOVER_COOLDOWN_S = 60.0
 #: The reasons that arm it. Such a window only steers calls toward an entry that is free: it is not a reset to wait
 #: for, so a chain whose entries are all in one is tried again at once (see ``_walk`` and ``earliest_reset``).
 _DEAD_ENTRY_REASONS = frozenset({FailoverReason.server, FailoverReason.timeout})
-_PERMANENT = frozenset({FailoverReason.auth, FailoverReason.bad_request})  # no wait fixes these
+#: No wait fixes these (the same set as PersistentRetry.PERMANENT_REASONS).
+_PERMANENT = frozenset({FailoverReason.auth, FailoverReason.bad_request, FailoverReason.ssl_cert})
 
 logger = logging.getLogger(__name__)
 

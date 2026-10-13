@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from k3code.bundle import BundleError, apply_bundle, read_bundle, sensitive_items
+from k3code.bundle import BundleError, apply_bundle, pending_sensitive, read_bundle
 from k3code.commands import CommandDef
 from k3code.commands._util import pop_flag, reply, session_cwd, split_args
 
@@ -45,12 +45,14 @@ class ImportCommand(CommandDef):
                 return reply("Import cancelled.")
         # MCP servers, permission rules, provider endpoints and hooks: one explicit yes each. --yes does not cover
         # them (only --trust-bundle does); with --yes and no --trust-bundle they are skipped with a warning.
-        accepted: set[str] = set()
+        # (a yes is kept for the item it was given for: its key and the text shown, not the key alone, since the same
+        # key can come from the user settings and from the project's when those are the same file)
+        accepted: set[tuple[str, str]] = set()
         if not trust_bundle and not yes and not session_only:
-            for item in sensitive_items(bundle):
+            for item in pending_sensitive(bundle, cwd):
                 answer = await ctx.clarify(item.text() + f"\nApply {item.key}?", ["Skip", "Apply"], session_id)
                 if str(answer.get("answer", "")).strip().lower() in ("apply", "yes", "y"):
-                    accepted.add(item.key)
+                    accepted.add((item.key, item.text()))
         try:
             rep = apply_bundle(
                 bundle,
@@ -58,7 +60,7 @@ class ImportCommand(CommandDef):
                 cwd=cwd,
                 settings=not session_only,
                 sessions=not settings_only,
-                accept=lambda item: item.key in accepted,
+                accept=lambda item: (item.key, item.text()) in accepted,
                 trust_bundle=trust_bundle,
             )
         except (BundleError, ValueError) as e:

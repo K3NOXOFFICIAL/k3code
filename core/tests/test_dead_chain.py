@@ -398,6 +398,13 @@ async def test_a_deadline_bound_call_asks_the_router_not_to_retry_skipped_entrie
     assert seen[0].get("retry_deferred") is False and seen[0].get("stall_retries") == 0
     assert "retry_deferred" not in seen[1]
 
+    # where no tier escalation follows, the skipped entries are the call's last chance: they are retried
+    seen.clear()
+    await caller.complete(TaskKind.TITLE, MSGS, session_id="s1", timeout=15.0, escalate=False)
+    await caller.complete(TaskKind.TITLE, MSGS, session_id="s1", timeout=15.0, router=Spy())
+    await caller.complete(TaskKind.ADVISOR, MSGS, session_id="s1", timeout=45.0)  # already on the top tier
+    assert [("retry_deferred" in kw, kw.get("stall_retries")) for kw in seen] == [(False, 0)] * 3
+
 
 async def test_a_retried_entry_does_not_hide_the_reset_another_entry_is_waiting_for():
     """A (in a window) answers 400 once tried; B is rate-limited for an hour. The chain must still be a wait, not a
@@ -424,3 +431,19 @@ async def test_an_offline_chain_is_unreachable_even_when_an_entry_was_in_a_windo
             _arm_window(router, 0)
         with pytest.raises(AllProvidersUnreachable):
             await drain(router.stream(MSGS, [], max_tokens=10, temperature=None))
+
+
+async def test_a_certificate_error_of_a_retried_entry_does_not_hide_the_reset_either():
+    def bad_certificate() -> Exception:
+        return to_provider_error(
+            httpx.ConnectError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed"), kind="openai"
+        )
+
+    for armed in (True, False):
+        a, b = Entry("a", fail=bad_certificate), Entry("b", fail=rate_limited)
+        router = router_of([a, b])
+        if armed:
+            _arm_window(router, 0)
+        with pytest.raises(ChainExhausted) as err:
+            await drain(router.stream(MSGS, [], max_tokens=10, temperature=None))
+        assert err.value.last_reason == "rate_limit", armed

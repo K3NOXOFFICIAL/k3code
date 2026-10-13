@@ -203,7 +203,7 @@ def _hidden_in_part(obj: Any, path: str = "") -> list[str]:
         for i, v in enumerate(obj):
             here = f"{path}[{i}]"
             if _placeholder(v) and v != REDACTED:
-                found.append(f"{here} (a list entry: written as it stands)")
+                found.append(f"{here} (a list entry)")
             else:
                 found.extend(_hidden_in_part(v, here))
     return found
@@ -320,6 +320,14 @@ _SCALAR_SENSITIVE: tuple[tuple[str, ...], ...] = (
 )
 
 
+#: What an unset setting of `_SCALAR_SENSITIVE` stands for (the defaults of k3code.autonomy.DEFAULTS).
+_SCALAR_DEFAULTS: dict[tuple[str, ...], Any] = {
+    ("autonomy", "unattended_network"): False,
+    ("autonomy", "gate_modes"): ["auto"],
+    ("autonomy", "fanout", "test_command"): "",
+}
+
+
 def _at(settings: dict[str, Any], path: tuple[str, ...]) -> Any:
     cur: Any = settings
     for part in path:
@@ -383,6 +391,8 @@ def sensitive_items(
             items.append(SensitiveItem("providers", ("providers",), diff))
     for path in _SCALAR_SENSITIVE:
         new, old = _at(incoming, path), _at(have, path)
+        if old is None:  # unset here means the default: a bundle that says the default changes nothing
+            old = _SCALAR_DEFAULTS.get(path)
         if new is not None and not _placeholder(new) and new != old:
             items.append(SensitiveItem(".".join(path), path, [f"{_show(old)} → {_show(new)}"]))
     if "hooks" in incoming and incoming["hooks"] != have.get("hooks"):
@@ -431,7 +441,8 @@ class ImportReport:
             shown = ", ".join(self.hidden[:5]) + (f" and {len(self.hidden) - 5} more" if len(self.hidden) > 5 else "")
             lines.append(
                 "note: the bundle hides all or part of these values; a setting is not written (the value here is "
-                f"kept), a list entry is: {shown}"
+                "kept); a list entry is written as it stands unless the list here has the same length: "
+                f"{shown}"
             )
         for sid, why in self.invalid_sessions.items():
             lines.append(f"warning: skipped session {sid} from the bundle: {why}")
@@ -496,6 +507,33 @@ def _same_file(a: Path, b: Path) -> bool:
         return False
 
 
+def _targets(bundle: Bundle, cwd: Path) -> list[tuple[str, dict[str, Any], Path, bool]]:
+    """What :func:`apply_bundle` writes where: ``(kind, settings, file, gated)``. ``gated``: the file is the user's own
+    ``config.yaml`` (the user settings always; the project settings too when the working directory is ``$HOME``, where
+    the project's config IS the user's), so the sensitive items need a yes. An export made from ``$HOME`` carries the
+    same file as its user and its project settings: they are one write, asked about once."""
+    user_file, project_file = user_config_path(), project_config_path(cwd)
+    same = _same_file(project_file, user_file)
+    user, project = bundle.settings.get("user"), bundle.settings.get("project")
+    if same and user is not None and project is not None:
+        return [("user", merge_settings(user, project), user_file, True)]
+    return [
+        (kind, incoming, user_file if kind == "user" else project_file, kind == "user" or same)
+        for kind, incoming in bundle.settings.items()
+    ]
+
+
+def pending_sensitive(bundle: Bundle, cwd: Path) -> list[SensitiveItem]:
+    """The sensitive items :func:`apply_bundle` will ask about (or skip), for a caller that asks before it applies: the
+    same items, from the same settings and files, so a yes can be matched to the item it was given for."""
+    return [
+        item
+        for _kind, incoming, target, gated in _targets(bundle, cwd)
+        if gated
+        for item in sensitive_items(bundle, confio.read_yaml(target), incoming=incoming)
+    ]
+
+
 def apply_bundle(
     bundle: Bundle,
     *,
@@ -510,11 +548,8 @@ def apply_bundle(
     when ``accept(item)`` says yes; without either it is skipped and the report says so."""
     rep = ImportReport()
     if settings:
-        for kind, incoming in bundle.settings.items():
-            target = user_config_path() if kind == "user" else project_config_path(cwd)
-            # the project's settings are the user's own file too when the working directory is $HOME (K3CODE_HOME at
-            # its default): everything below the gate then applied unasked
-            if (kind == "user" or _same_file(target, user_config_path())) and not trust_bundle:
+        for kind, incoming, target, gated in _targets(bundle, cwd):
+            if gated and not trust_bundle:
                 for item in sensitive_items(bundle, confio.read_yaml(target), incoming=incoming):
                     if accept is None or not accept(item):
                         incoming = _without(incoming, item.path)
