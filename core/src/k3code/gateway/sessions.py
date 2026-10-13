@@ -339,6 +339,29 @@ class SessionStore:
             self._insert_row(sess)
         logger.info("restored stored session %s removed by the empty-session sweep", sess.session_id)
 
+    def save_meta(self, session_id: str, meta: dict[str, Any], title: str | None = None) -> bool:
+        """Write only the meta (and the title, when given), not the transcript: a goal state change or a mode switch
+        rewrote the whole message list on the event loop (200 ms for 12 MB). The goal-status index follows the meta
+        column by itself. False when there is no row (:meth:`save` restores a row the start sweep removed)."""
+        now = time.time()
+        with self._db:
+            if title is None:
+                cur = self._db.execute(
+                    "UPDATE sessions SET meta=?, updated_at=? WHERE session_id=?", (_dumps(meta), now, session_id)
+                )
+            else:
+                cur = self._db.execute(
+                    "UPDATE sessions SET title=?, meta=?, updated_at=? WHERE session_id=?",
+                    (scrub_surrogates(str(title)), _dumps(meta), now, session_id),
+                )
+        return cur.rowcount > 0
+
+    def save_meta_of(self, sess: StoredSession) -> None:
+        """:meth:`save` for a change that touched only ``sess.meta`` and ``sess.title``."""
+        sess.updated_at = time.time()
+        if not self.save_meta(sess.session_id, sess.meta, sess.title):
+            self.save(sess)  # no row: a swept one is restored from ``sess``, a deleted one stays gone
+
     def checkpoint(self, session_id: str, messages: list[dict[str, Any]], model: str = "") -> None:
         """Write only the transcript (and the model, when the row has none): a mid-turn checkpoint must not carry the
         title or meta it was snapshotted with over a newer value saved in between. A missing row stays missing."""

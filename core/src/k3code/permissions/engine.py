@@ -154,6 +154,12 @@ def _inside(path: str, roots: list[str]) -> bool:
     return any(real == r or real.startswith(r.rstrip("/") + "/") for r in real_roots)
 
 
+def inside_roots(path: str | Path, cwd: str | Path, add_dirs: list[str] | None = None) -> bool:
+    """``path`` (absolute) lies in the project: under the session cwd or one of its ``add_dirs``, the roots ``decide``
+    judges "inside" by (symlinks resolved on both sides)."""
+    return _inside(_norm(path), [_norm(cwd), *[_norm(d) for d in (add_dirs or [])]])
+
+
 #: Files the edit tools never change without a person, in any mode and whatever the rules say: git runs them (hooks, a
 #: ``filter`` or ``diff`` driver or ``core.fsmonitor`` in a git config, ``.gitattributes`` choosing the driver, the
 #: ``.git`` FILE of a linked worktree naming its git directory), direnv runs ``.envrc`` on the next ``cd``, husky its

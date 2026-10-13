@@ -22,7 +22,7 @@ import yaml
 from pydantic import ValidationError
 
 from k3code import trust
-from k3code.config import ConfigError, Settings, _parse_mapping
+from k3code.config import RETENTION_DEFAULTS, ConfigError, Settings, _parse_mapping
 
 __all__ = ["ConfigError"]  # one class for "this config is invalid": config.py raises it too
 
@@ -203,7 +203,7 @@ def _validate_values(s: Settings) -> None:
     enabled = s.learning.get("enabled")
     if enabled is not None and not isinstance(enabled, bool):
         raise ConfigError(f"learning.enabled: must be true/false, got {enabled!r}")
-    for key in ("usage_days", "journal_days", "debug_bundles", "decisions_days"):
+    for key in RETENTION_DEFAULTS:  # every pruning key, also one added later (journal_mb was missed by a fixed list)
         if key in s.retention:
             _number(f"retention.{key}", s.retention[key], above=0)
 

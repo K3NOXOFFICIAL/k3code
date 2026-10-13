@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from k3code.redact import scrub_text
+from k3code.tools.validate import normalize_arguments
 
 SIGNATURE_CHARS = 160
 
@@ -21,8 +22,16 @@ _HEX = re.compile(r"\b(?:0x)?(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-
 _NUMBER = re.compile(r"(?<![A-Za-z_<])\d+(?:\.\d+)?")
 _EXCEPTION = re.compile(r"^Tool execution failed: ([A-Za-z_][\w.]*):")
 #: how a refusal by policy starts (lower case): the permission engine's hardline, auto-mode root and plan-mode
-#: messages and the agent loop's PreToolUse hook block. They say nothing about the project, so they are "denied".
-_POLICY_DENIALS = ("hardline deny", "auto mode writes only", "plan mode is read-only", "blocked by a pretooluse hook")
+#: messages, the agent loop's PreToolUse hook block and the read-before-write guard (tools.FileStamps: "Refused: you
+#: have not read ..." / "Refused: <path> changed since you read it ..."). They say nothing about the project, so they
+#: are "denied".
+_POLICY_DENIALS = (
+    "hardline deny",
+    "auto mode writes only",
+    "plan mode is read-only",
+    "blocked by a pretooluse hook",
+    "refused: ",
+)
 
 
 @dataclass(frozen=True)
@@ -89,7 +98,9 @@ def failure_of(tool: str, args: dict[str, Any] | None, result: dict[str, Any]) -
 
 def describe_call(tool: str, args: dict[str, Any] | None) -> str:
     """``bash `npm test` `` / ``read src/x.py``: the call in a note or a list, scrubbed, one line."""
-    args = args or {}
+    # the spellings the loop renames before it runs the call (``file_path`` is ``path``): a call described by its raw
+    # arguments was just "edit" in the failed-calls list, the loop-guard label and the TUI
+    args = normalize_arguments(tool, args, None) if isinstance(args, dict) else {}
     if tool == "bash":
         what = first_line(str(args.get("command", "")))[:120]
         return f"bash `{scrub_text(what)}`"

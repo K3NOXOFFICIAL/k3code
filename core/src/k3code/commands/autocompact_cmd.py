@@ -153,7 +153,7 @@ class AutoCompactCommand(CommandDef):
                 new = autocompact_policy(SimpleNamespace(context=apply_changes(section, changes)))
                 live.stored.meta["autocompact"] = {"enabled": new.enabled, "tokens": new.tokens, "ratio": new.ratio}
                 lead = "For this session only:"
-            ctx.store.save(live.stored)
+            ctx.store.save_meta_of(live.stored)
         else:
             if changes is None:
                 return reply("reset only applies to a session's own setting: /autocompact reset --session")

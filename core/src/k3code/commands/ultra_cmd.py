@@ -54,7 +54,7 @@ class UltraPlanCommand(CommandDef):
         async def job() -> str:
             up = await ctx.ultra.ultraplan(live, arg, context=context)
             live.stored.meta["ultra_plan"] = {"task": arg, "plan": up.plan, "path": str(up.path or "")}
-            ctx.store.save(live.stored)
+            ctx.store.save_meta_of(live.stored)
             ctx.ultra.show_plan(live, up)
             scores = ", ".join(f"{k} {v:g}" for k, v in up.scores.items())
             head = f"Plan for: {arg}\n(planners: {', '.join(up.angles)}{'; judge scores: ' + scores if scores else ''})"
@@ -143,7 +143,7 @@ class UltraCodeCommand(CommandDef):
             live.stored.meta.pop("ultra_mode", None)
         else:
             live.stored.meta["ultra_mode"] = mode
-        ctx.store.save(live.stored)
+        ctx.store.save_meta_of(live.stored)
         live.emit("session.info", live.live_info())
         return reply(_mode_text(ctx, mode))
 

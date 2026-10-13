@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import itertools
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -16,6 +17,7 @@ from k3code import context_budget
 from k3code.errors import ContextOverflow
 from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
+from k3code.permissions.engine import inside_roots
 from k3code.permissions.state import PermissionState
 from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall, Usage
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
@@ -68,7 +70,8 @@ class ApprovalResult:
         return self.allowed
 
 
-#: Asked when the engine says "ask": (tool, arguments, decision) → answer.
+#: Asked when the engine says "ask": (tool, arguments, decision) → answer. A callback that also takes ``cwd`` is told
+#: the folder the call runs in (a sub-agent's worktree is not its parent's): see AgentLoop._approval_kwargs.
 ApprovalCallback = Callable[[str, dict[str, Any], Decision], Awaitable[ApprovalResult]]
 #: exit_plan: (plan text) → mode to switch to ("default"/"accept-edits"), or None if rejected.
 PlanCallback = Callable[[str], Awaitable[str | None]]
@@ -674,6 +677,12 @@ class AgentLoop:
                 auto_allowed=False,
                 message="no sandbox at the home directory: approve to run unsandboxed, or start k3code in a project",
             )
+        # A refusal that is certain costs no prompt and no hook: it used to be found after the person had approved, who
+        # then approved the retry too. Only inside the project: there the model can list and read anyway, so saying the
+        # file exists gives nothing away. Outside it the check stays after the approval (below), where it also catches
+        # a save made while the prompt was open.
+        if (stale := self._stale_file(tool_call.name, args, project_only=True)) is not None:
+            return {"error": stale}
         pre = await self._run_hooks("PreToolUse", tool_call.name, {"tool_input": args})
         if pre.blocked:
             return {"error": f"Blocked by a PreToolUse hook: {pre.reason}"}
@@ -681,7 +690,9 @@ class AgentLoop:
         if decision.action == "ask" and not (pre.approved and not decision.needs_human):
             if self.approval_callback is None:
                 return {"error": f"Permission denied: {tool_call.name} requires approval (no prompter)"}
-            answer = await self.approval_callback(tool_call.name, args, decision)
+            answer = await self.approval_callback(
+                tool_call.name, args, decision, **self._approval_kwargs(self.approval_callback)
+            )
             if not answer.allowed:
                 what = _preview(tool_call.name, args)
                 return {"error": f"User denied: {what}" + (f" — {answer.reason}" if answer.reason else "")}
@@ -700,8 +711,9 @@ class AgentLoop:
             if (path := self._tool_path(args)) is not None:
                 self.file_stamps.record(path)  # the pointed-at result is this file as it is now: a write may follow
             return {"content": context_budget.read_pointer(step, call_id)}
-        # after the approval (the user may have saved the file while it was open), never before it: a refusal there
-        # would tell the model whether a file outside the project exists without anyone being asked
+        # after the approval too (the user may have saved the file while it was open), and for a file outside the
+        # project only here, never before it: a refusal there would tell the model whether that file exists without
+        # anyone being asked
         if (stale := self._stale_file(tool_call.name, args)) is not None:
             return {"error": stale}
         # M2: fsync a journal intent before the tool runs.
@@ -737,11 +749,17 @@ class AgentLoop:
         if read_key is not None and "first" in result:
             self._reads[read_key] = (self._step if step is None else step, tool_call.id)
         seen = (tool_call.name == "read" and "first" in result) or (tool_call.name in FILE_TOOLS and result.get("ok"))
-        if seen and (path := self._tool_path(args)) is not None:
-            self.file_stamps.record(path)
+        stamped = self._tool_path(args) if seen else None
+        if stamped is not None:
+            self.file_stamps.record(stamped)
         post = await self._run_hooks(
             "PostToolUse", tool_call.name, {"tool_input": args, "tool_response": format_tool_result(result)}
         )
+        if stamped is not None and tool_call.name in FILE_TOOLS and self.hooks:
+            # A formatter hook (prettier, black, gofmt) rewrote the file this call changed: that is the file as the
+            # session left it, not a change by someone else, or the next edit of it was refused as "changed since you
+            # read it". Not for a read: what the model was shown is then no longer what is on disk.
+            self.file_stamps.record(stamped)
         feedback = "\n".join(t for t in (post.reason if post.blocked else "", post.context_text()) if t)
         if feedback:  # the tool already ran: the hook's word joins its result for the model (format_tool_result)
             result = {**result, HOOK_FEEDBACK_KEY: feedback}
@@ -766,11 +784,27 @@ class AgentLoop:
         except (OSError, ValueError, RuntimeError):  # RuntimeError: "~user" with no such user
             return None
 
-    def _stale_file(self, name: str, args: dict[str, Any]) -> str | None:
-        """write/edit: why the file may not be changed now (see FileStamps), or None."""
+    def _stale_file(self, name: str, args: dict[str, Any], *, project_only: bool = False) -> str | None:
+        """write/edit: why the file may not be changed now (see FileStamps), or None. ``project_only``: judge only a
+        file inside the project roots (the permission engine's: the cwd and add-dirs, symlinks resolved)."""
         if name not in FILE_TOOLS or (path := self._tool_path(args)) is None:
             return None
+        if project_only and not inside_roots(path, self.permissions.cwd, self.permissions.add_dirs):
+            return None
         return self.file_stamps.refusal(name, path)
+
+    def _approval_kwargs(self, callback: ApprovalCallback) -> dict[str, Any]:
+        """``cwd`` (what the tool resolves a relative path against) for a callback that takes it, none for the older
+        3-argument shape. The gateway's callback is one per session, shared by its sub-agents: without the cwd it
+        previewed an edit of a sub-agent working in a worktree against the parent's checkout. Asked per call: callers
+        set ``approval_callback`` after the loop is built."""
+        try:
+            params = inspect.signature(callback).parameters.values()
+        except (TypeError, ValueError):  # a builtin or a callable object that hides its signature
+            return {}
+        named = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        takes = any(p.kind is p.VAR_KEYWORD or (p.name == "cwd" and p.kind in named) for p in params)
+        return {"cwd": self.cwd} if takes else {}
 
     def _read_key(self, args: dict[str, Any]) -> tuple[Any, ...] | None:
         """What makes two reads the same: the file (path, mtime, size) and the requested range; None if no file."""

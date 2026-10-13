@@ -255,6 +255,10 @@ def fenced(label: str, body: str) -> str:
 
 
 _MANAGED_NOTE = re.compile(r"<!-- managed by k3code;[^>]*-->[ \t]*\n?")
+#: The line that closes that block (learning.distiller._END): as much a note to the editor as the one above.
+_MANAGED_END = re.compile(r"^[ \t]*<!-- /k3code:auto -->[ \t]*(?:\n|$)", re.MULTILINE)
+#: The begin and end lines `k3code setup` writes around the block it rewrites (setup.steps.USER_MD_BEGIN/END).
+_SETUP_MARKER = re.compile(r"^[ \t]*<!-- k3code:setup (?:begin\b.*?|end) -->[ \t]*(?:\n|$)", re.MULTILINE)
 
 
 def memory_prompt(
@@ -289,8 +293,9 @@ def memory_prompt(
             body = body[:left] + "\n…(truncated)"
         left -= len(body)
         if m.scope == "user":
-            # the note k3code puts above the sections it rewrites is for whoever edits the file, not for the model
-            body = _MANAGED_NOTE.sub("", body).strip()
+            # the note k3code puts above the sections it rewrites, and the marker that ends them, are for whoever
+            # edits the file, not for the model
+            body = _SETUP_MARKER.sub("", _MANAGED_END.sub("", _MANAGED_NOTE.sub("", body))).strip()
             parts.append(f"## User memory\n\n{body}")
             continue
         try:

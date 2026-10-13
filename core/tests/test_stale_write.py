@@ -97,14 +97,19 @@ async def test_what_the_session_wrote_edited_or_read_again_it_may_change(tmp_pat
     assert f.read_text() == "v = 2\n"
 
 
-async def test_the_check_runs_after_the_approval_prompt_never_before_it(tmp_path):
-    """Before the prompt a refusal would tell the model whether a file exists without anyone being asked (a read outside
-    the project needs a human); after it, it catches a save made while the prompt was open."""
-    f = tmp_path / "f.py"
+async def test_the_check_runs_after_the_approval_prompt_for_a_file_outside_the_project(tmp_path):
+    """Before the prompt a refusal would tell the model whether a file outside the project exists without anyone being
+    asked (a read there needs a human too); after it, it catches a save made while the prompt was open. (Inside the
+    project the check also runs before the prompt: see test_stale_write_seams.)"""
+    project = tmp_path / "project"
+    project.mkdir()
+    f = tmp_path / "f.py"  # outside the project
     f.write_text("x = 1\n")
     asked: list[str] = []
 
     async def approve(tool, args, decision):
+        if tool == "read":  # outside the project a read is asked too; it is not what this test counts
+            return ApprovalResult("once")
         asked.append(args.get("content", ""))
         if args.get("content") == "deny me":
             return ApprovalResult("deny")
@@ -117,7 +122,7 @@ async def test_the_check_runs_after_the_approval_prompt_never_before_it(tmp_path
         ToolCall(id="w2", name="write", arguments={"path": str(f), "content": "x = 2\n"}),
     ]
     provider = Recorder([*(tool_reply(c) for c in script), text_reply("done")])
-    loop = make_loop(tmp_path, provider, window=None)
+    loop = make_loop(project, provider, window=None)
     loop.permissions.mode, loop.headless, loop.approval_callback = PermissionMode.DEFAULT, False, approve
     async for _ in loop.run("change the file"):
         pass

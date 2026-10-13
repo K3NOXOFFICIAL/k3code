@@ -306,6 +306,9 @@ STRATEGIES: list[tuple[str, Callable[[str, str], list[Span]]]] = [
 # Matches from these only *approximately* resemble old_string — fine for one
 # unique replacement, never safe under replace_all.
 SIMILARITY_STRATEGIES = frozenset({"block_anchor", "context_aware"})
+#: The similarity strategies compare line by line: seconds of work on a file past this size (3.8 s a call on 1.9 MB,
+#: and a failed edit plans twice), for a guess the model has to check anyway. Larger files get the others only.
+SIMILARITY_MAX_CHARS = 1_000_000
 
 
 # ── Orchestrator ─────────────────────────────────────────────────────────
@@ -368,6 +371,8 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
         return content, 0, None, IDENTICAL_STRINGS_ERROR
 
     for strategy_name, strategy_fn in STRATEGIES:
+        if strategy_name in SIMILARITY_STRATEGIES and len(content) > SIMILARITY_MAX_CHARS:
+            continue
         matches = strategy_fn(content, old_string)
         if not matches:
             continue

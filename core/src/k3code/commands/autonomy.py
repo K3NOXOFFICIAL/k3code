@@ -180,7 +180,7 @@ class AdvisorCommand(CommandDef):
             return await self._ask(ctx, live, " ".join(words))
         if live is not None:
             live.stored.meta[advisor.META_KEY] = key
-            ctx.store.save(live.stored)
+            ctx.store.save_meta_of(live.stored)
         if make_default or live is None:
             from k3code.commands.config_cmd import config_set
             from k3code.paths import user_config_path

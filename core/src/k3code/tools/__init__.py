@@ -151,25 +151,58 @@ class FileStamps:
     def __init__(self) -> None:
         self._seen: dict[str, tuple[int, int]] = {}
 
+    #: Most files a session keeps across a close and resume (the newest ones); the rest are read again when edited.
+    KEEP = 200
+
+    def export(self) -> dict[str, list[int]]:
+        """The newest ``KEEP`` stamps as JSON-able ``path → [mtime_ns, size]``, for the session's stored meta: stamps
+        in memory alone were lost with the live session, so a resumed one refused the first edit of every file its
+        history shows as read."""
+        return {path: list(stamp) for path, stamp in list(self._seen.items())[-self.KEEP :]}
+
+    def load(self, data: Any) -> None:
+        """Take stamps from :meth:`export`. Anything else (a hand-edited or damaged meta) is skipped, not raised on.
+        The mtime and size are compared as before, so a file changed meanwhile is still refused."""
+        if not isinstance(data, dict):
+            return
+        good = {
+            path: (stamp[0], stamp[1])
+            for path, stamp in data.items()
+            if isinstance(path, str)
+            and isinstance(stamp, (list, tuple))
+            and len(stamp) == 2
+            and all(isinstance(n, int) and not isinstance(n, bool) for n in stamp)
+        }
+        self._seen.update(list(good.items())[-self.KEEP :])
+
     def record(self, path: Path) -> None:
         with contextlib.suppress(OSError):
             st = path.stat()
             self._seen[os.path.realpath(path)] = (st.st_mtime_ns, st.st_size)
 
     def refusal(self, tool: str, path: Path) -> str | None:
-        """Why ``tool`` may not change ``path`` now, or None. A file that does not exist yet is always fine."""
+        """Why ``tool`` may not change ``path`` now, or None. A file that does not exist yet, an empty one and one the
+        model may not read at all (see ``sensitive_path``) are always fine. Both texts start with "Refused:" so the
+        learning hub files them as policy (toolerrors._POLICY_DENIALS), not as something wrong with the project."""
         try:
             st = path.stat()
         except OSError:
             return None
         if not path.is_file():
             return None  # the tool reports what is wrong with it
+        if st.st_size == 0:
+            return None  # nothing in it to lose (a touched file, an empty __init__.py)
+        if sensitive_path(str(path)):
+            # read is a hardline deny for these (.env, ~/.ssh ...): "read it first" could never be satisfied, so every
+            # attempt cost prompts and failed calls. The person approves the change from its diff instead.
+            return None
         seen = self._seen.get(os.path.realpath(path))
         if seen is None:
-            return f"{path} exists and you have not read it: read it before you {tool} it"
+            return f"Refused: you have not read {path}: read it before you {tool} it"
         if seen != (st.st_mtime_ns, st.st_size):
             return (
-                f"{path} changed since you read it (by the user or another program): read it again before you {tool} it"
+                f"Refused: {path} changed since you read it (by the user or another program): "
+                f"read it again before you {tool} it"
             )
         return None
 
@@ -352,6 +385,10 @@ class EditPlan:
     already_applied: bool = False  # the model sent an edit this run already made: nothing to write (before == after)
 
 
+#: A failed edit of a file longer than this (chars) gets no near-match hint (see plan_edit).
+HINT_MAX_CHARS = 1_000_000
+
+
 def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan | dict[str, Any]:
     """The change ``edit`` would make, or its error result; nothing is written. The approval prompt shows the same
     change (issue #131), so this is the one place the replacement is computed."""
@@ -384,7 +421,9 @@ def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan
         # alone it also answered "success" to an old_string that was never there while new_string happened to occur
         if count == 0 and applied in _APPLIED_EDITS and is_already_applied(content, old_string, new_string):
             return EditPlan(path, content, content, crlf, 0, "already applied", applied, already_applied=True)
-        hint = format_no_match_hint(error, count, old_string, content)
+        # The "Did you mean" search scores every line of the file: seconds on a 2 MB one, once for the approval preview
+        # and again when the edit runs (on the event loop). Past 1 MB the edit fails with the plain no-match message.
+        hint = format_no_match_hint(error, count, old_string, content) if len(content) <= HINT_MAX_CHARS else ""
         return {"error": error + hint}
     return EditPlan(path, content, new_content, crlf, count, strategy, applied)
 

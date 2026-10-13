@@ -209,7 +209,7 @@ class MaxAgentsCommand(CommandDef):
             if live is None:
                 return reply("No active session: reset drops a session's own settings.")
             live.stored.meta.pop("agent_limits", None)
-            ctx.store.save(live.stored)
+            ctx.store.save_meta_of(live.stored)
             return self._answer(ctx, live, "Back to the config's limits for this session.")
         if not changes:
             return self._answer(ctx, live, "")
@@ -224,7 +224,7 @@ class MaxAgentsCommand(CommandDef):
                 for key in changes:  # a setting saved for good replaces the session's own, or it would hide it
                     own.pop(key, None)
                 live.stored.meta["agent_limits"] = own
-                ctx.store.save(live.stored)
+                ctx.store.save_meta_of(live.stored)
             now = agent_limits(ctx.config)
             effective = {
                 "max_agents": now.describe_max_agents() if now.auto else now.max_agents,
@@ -243,7 +243,7 @@ class MaxAgentsCommand(CommandDef):
             own = clean_override(live.stored.meta.get("agent_limits"))
             own.update(changes)
             live.stored.meta["agent_limits"] = own
-            ctx.store.save(live.stored)
+            ctx.store.save_meta_of(live.stored)
             lead = "For this session only (add --save to keep it)."
         return self._answer(ctx, live, lead)
 

@@ -247,7 +247,7 @@ class _AddDirCommand(CommandDef):
         if str(path) not in live.perms.add_dirs:
             live.perms.add_dirs.append(str(path))
         live.stored.meta["add_dirs"] = list(live.perms.add_dirs)
-        ctx.store.save(live.stored)
+        ctx.store.save_meta_of(live.stored)
         return {"type": "message", "message": f"Added {path} to this session's roots."}
 
 

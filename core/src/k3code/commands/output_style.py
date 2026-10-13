@@ -34,7 +34,7 @@ class OutputStyleCommand(CommandDef):
             return reply(f"Unknown output style: {name}. Available: {', '.join(outputstyle.available(cwd))}")
         if live is not None:
             live.stored.meta["output_style"] = name
-            ctx.store.save(live.stored)
+            ctx.store.save_meta_of(live.stored)
         if make_default or live is None:
             from k3code.commands.config_cmd import config_set
             from k3code.paths import user_config_path

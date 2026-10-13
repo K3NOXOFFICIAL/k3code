@@ -118,14 +118,20 @@ def safe_config(config: Any, secrets: list[str] | None = None) -> dict[str, Any]
     return cfg
 
 
-def scrub_json(body: str, secrets: list[str]) -> str:
+#: Event fields that are secret by name (``key``) but hold a notification id (``k3.halt``) or a model slot. The names
+#: are exempt in events.json only; a value of secret shape is still hidden.
+_EVENT_FIELDS = frozenset({"key", "model_key"})
+
+
+def scrub_json(body: str, secrets: list[str], *, keep: frozenset[str] = frozenset()) -> str:
     """A JSON document through the same two passes, known values first: a shape pass can cut a secret at a `,` or a
-    quote and leave its tail for the value pass to miss (text that is not JSON gets ``redact_text`` only)."""
+    quote and leave its tail for the value pass to miss (text that is not JSON gets ``redact_text`` only). ``keep``:
+    field names ``redact`` does not treat as secret by name."""
     try:
         data = json.loads(body)
     except ValueError:
         return redact_text(body, secrets)
-    return json.dumps(redact(drop_values(data, secrets)), indent=2, default=str)
+    return json.dumps(redact(drop_values(data, secrets), keep=keep), indent=2, default=str)
 
 
 def versions() -> dict[str, str]:
@@ -168,7 +174,8 @@ async def write_bundle(server: Any, n: int = 200, home: Path | None = None, *, p
         path = out_dir / f"{stamp}-{n_dup}.tar.gz"
     with tarfile.open(path, "w:gz") as tar:
         for name, body in parts.items():
-            data = redact_text(scrub_json(body, secrets), secrets).encode("utf-8")
+            keep = _EVENT_FIELDS if name == "events.json" else frozenset()
+            data = redact_text(scrub_json(body, secrets, keep=keep), secrets).encode("utf-8")
             info = tarfile.TarInfo(name)
             info.size = len(data)
             info.mtime = int(time.time())

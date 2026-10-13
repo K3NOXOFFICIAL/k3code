@@ -301,6 +301,9 @@ class LiveSession:
         self.advisor_memo: dict[str, Any] = {}
         #: what this session's model has seen of each file: every loop of it (turns, tiers) checks write/edit against it
         self.file_stamps = FileStamps()
+        #: ... seeded from the meta (see _persist_turn): a resumed, forked or daemon-restarted session would otherwise
+        #: refuse the first edit of every file its history shows as read
+        self.file_stamps.load(stored.meta.get("file_stamps"))
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
         self.pending_request_id: str | None = None
         # an invalid configured permission_mode fails this session's creation with a named error (an RPC reply), not
@@ -419,7 +422,7 @@ class LiveSession:
         """Switch permission mode, persist it, and tell the client."""
         self.perms.mode = mode
         self.stored.meta["mode"] = mode.value
-        self.server.store.save(self.stored)
+        self.server.store.save_meta_of(self.stored)
         self.emit("session.info", self.live_info())
 
     @property
@@ -2687,17 +2690,32 @@ class GatewayServer:
                     stored.meta.get("mcp_active") or []
                 ):
                     stored.meta["mcp_active"] = active  # the MCP tools this conversation switched on
+                if (stamps := getattr(session, "file_stamps", None)) is not None and (seen := stamps.export()):
+                    stored.meta["file_stamps"] = seen  # what it has read: a resumed session starts from it
                 stored.messages = _serialize_messages(loop.turn_messages)
                 stored.model = stored.model or self._chain_key or self.config.default_model
                 snapshot = dataclasses.replace(
                     stored, meta=copy.deepcopy(stored.meta), usage=copy.deepcopy(stored.usage)
                 )
-                await asyncio.shield(self.store.save_async(snapshot))
+                await asyncio.shield(self._write_snapshot(stored, snapshot))
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001 - a failed checkpoint must not mask the turn's own outcome
             logger.exception("could not persist the session")
             self._warn_persist_failed(session)
+
+    async def _write_snapshot(self, stored: Any, snapshot: Any) -> None:
+        """Write ``snapshot`` on the writer thread, then repair what it may have undone. A command that saved newer
+        meta or a new title on the loop thread before the writer got to the snapshot (a Shift-Tab, /autocompact) was
+        overwritten by it; the live values go back, without the transcript. Shielded with the write, so a cancelled
+        turn does not leave the stale snapshot as the last writer."""
+        await self.store.save_async(snapshot)
+        if stored.meta == snapshot.meta and stored.title == snapshot.title:
+            return
+        try:
+            self.store.save_meta(stored.session_id, stored.meta, stored.title)
+        except Exception:  # noqa: BLE001 - may run detached, after the store closed (shutdown)
+            logger.warning("could not refresh the meta of session %s after its write", stored.session_id, exc_info=True)
 
     def _warn_persist_failed(self, session: LiveSession) -> None:
         """Tell the user, once per session, that the transcript is not being saved."""
@@ -2934,7 +2952,7 @@ class GatewayServer:
         title = await make_title(self.model_caller, first_message, session_id=session.session_id)
         if title and not session.stored.title:
             session.stored.title = title
-            self.store.save(session.stored)
+            self.store.save_meta_of(session.stored)
             session.emit("session.title", {"session_id": session.session_id, "title": title})
 
     def _announce_tool(self, session: LiveSession, tc: ToolCall) -> None:
@@ -3010,16 +3028,23 @@ class GatewayServer:
                 session.announced_tools.clear()
 
     async def _approval_callback_for(self, session: LiveSession) -> Any:
-        async def approve(tool_name: str, arguments: dict[str, Any], decision: Any = None) -> ApprovalResult:
+        async def approve(
+            tool_name: str, arguments: dict[str, Any], decision: Any = None, *, cwd: Path | str | None = None
+        ) -> ApprovalResult:
+            # ``cwd``: where the call runs. This callback is shared by the session's sub-agents, and one in a worktree
+            # resolves its relative paths there, so the preview read the parent's file (or none) for its diff.
             decision = decision or session.perms.decide(tool_name, arguments)
-            rules = suggest_rules(tool_name, decision)
+            # a file the person must confirm every time (.env, .husky/ ...) is never allowed by a rule: offering
+            # "session" or "always" would write one that can never apply
+            once_only = bool(decision.always_ask)
+            rules = [] if once_only else suggest_rules(tool_name, decision)
             pattern = ", ".join(r.pattern for r in rules)
             self.usage.record("approval", session=session.session_id, detail=tool_name)
             try:
                 # one question at a time per session: sub-agents running side by side each ask for their own tools
                 async with session.approval_lock:
                     # made once it is this call's turn to ask: an edit approved meanwhile has changed the file
-                    preview = await _change_preview(tool_name, arguments, session.perms.cwd)
+                    preview = await _change_preview(tool_name, arguments, cwd or session.perms.cwd)
                     result = await self._ask_client(
                         "approval",
                         {
@@ -3032,9 +3057,9 @@ class GatewayServer:
                             or arguments.get("path")
                             or arguments.get("pattern")
                             or "",
-                            "choices": ["once", "session", "always", "deny"],
-                            "allow_permanent": True,
-                            "allow_session": True,
+                            "choices": ["once", "deny"] if once_only else ["once", "session", "always", "deny"],
+                            "allow_permanent": not once_only,
+                            "allow_session": not once_only,
                             "tool_name": tool_name,
                             "pattern": pattern,
                         },
@@ -3045,6 +3070,8 @@ class GatewayServer:
             choice = str(result.get("choice", "deny")).lower()
             if choice not in ("once", "session", "always"):
                 choice = "deny"
+            elif once_only:
+                choice = "once"  # a client that answers "session"/"always" anyway: nothing is remembered
             reason = str(result.get("reason") or result.get("text") or "").strip()
             if choice in ("session", "always"):
                 session.perms.session_rules.extend(rules)
@@ -3239,7 +3266,7 @@ class GatewayServer:
                 started = meta.get("goal_started") or {}
                 if started.get("at") != state.get("created_at"):  # a new goal: where in the history it begins
                     meta["goal_started"] = {"at": state.get("created_at"), "message": len(session.stored.messages)}
-            self.store.save(session.stored)
+            self.store.save_meta_of(session.stored)  # not save(): that rewrote the whole transcript on the loop
 
         mgr = GoalManager(
             load,
@@ -3600,7 +3627,7 @@ class GatewayServer:
         session.stored.meta["origin_session"] = session.session_id
         if session.loop is not None:
             session.loop.background = True  # bash is sandboxed from now on
-        self.store.save(session.stored)
+        self.store.save_meta_of(session.stored)
         fresh = self._fresh_session_like(session)
         if client is not None:
             self.attach(client, fresh)
@@ -4055,7 +4082,7 @@ async def _session_title(server: GatewayServer, params: dict[str, Any]) -> dict[
     if stored is None:
         raise _InvalidParams(f"unknown session: {sid}")
     stored.title = str(title)
-    server.store.save(stored)
+    server.store.save_meta_of(stored)
     server.emit("session.title", {"session_id": str(sid), "title": stored.title})
     return {"ok": True, "title": stored.title}
 
@@ -4463,7 +4490,7 @@ async def _config_set_reasoning(server: GatewayServer, params: dict[str, Any]) -
         live.stored.meta.pop("reasoning_effort", None)
     else:
         live.stored.meta["reasoning_effort"] = live.reasoning_effort
-    server.store.save(live.stored)
+    server.store.save_meta_of(live.stored)
     live.emit("session.info", live.live_info())
     return {"ok": True, "key": "reasoning", "value": value}
 

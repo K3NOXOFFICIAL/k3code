@@ -29,8 +29,9 @@ _SESSION_RE = re.compile(r"^sessions/([A-Za-z0-9_\-]{1,64})\.json$")
 #: background / automation-origin markers that make the daemon run or resume the session on its own, and an armed
 #: ``ultra_mode`` (ultracode spawns parallel sub-agents on the next prompt, which the importer never chose), and the
 #: goal: an active one is resumed by the daemon's boot resume and watchdog, which would run the bundle author's goal
-#: text and ``--check`` command unattended, and ``agent_limits`` (a /maxagents raise: more sub-agents, more spend).
-_UNTRUSTED_META = frozenset({"mode", "add_dirs", "background", "ultra_mode", "goal", "agent_limits"})
+#: text and ``--check`` command unattended, and ``agent_limits`` (a /maxagents raise: more sub-agents, more spend), and
+#: ``file_stamps`` (another machine's paths and times: they could let a first write skip the read-first check).
+_UNTRUSTED_META = frozenset({"mode", "add_dirs", "background", "ultra_mode", "goal", "agent_limits", "file_stamps"})
 
 
 class BundleError(ValueError):
@@ -181,11 +182,17 @@ def _read_bundle(path: Path) -> Bundle:
     return out
 
 
+def _placeholder(value: Any) -> bool:
+    """A string holding the marker: ``<redacted>`` itself or a value ``redact()`` hid a part of (a token-shaped URL
+    segment: ``https://gateway.ai.cloudflare.com/v1/<redacted>/gw/openai``). Either way the real value is not in it."""
+    return isinstance(value, str) and REDACTED in value
+
+
 def _strip_redacted(obj: Any) -> Any:
-    """Drop ``<redacted>`` values from the dicts inside ``obj``. A list keeps the marker in place: without it every
-    later argument of ``--model <redacted> --port 9000`` would shift (``--model --port 9000``)."""
+    """Drop placeholder values and keys from the dicts inside ``obj``. A list keeps the marker in place: without it
+    every later argument of ``--model <redacted> --port 9000`` would shift (``--model --port 9000``)."""
     if isinstance(obj, dict):
-        return {k: _strip_redacted(v) for k, v in obj.items() if v != REDACTED}
+        return {k: _strip_redacted(v) for k, v in obj.items() if not _placeholder(k) and not _placeholder(v)}
     if isinstance(obj, list):
         return [_strip_redacted(v) for v in obj]
     return obj
@@ -193,10 +200,10 @@ def _strip_redacted(obj: Any) -> Any:
 
 def _has_redacted(obj: Any) -> bool:
     if isinstance(obj, dict):
-        return any(v == REDACTED or _has_redacted(v) for v in obj.values())
+        return any(_placeholder(k) or _has_redacted(v) for k, v in obj.items())
     if isinstance(obj, list):
-        return any(v == REDACTED or _has_redacted(v) for v in obj)
-    return False
+        return any(_has_redacted(v) for v in obj)
+    return _placeholder(obj)
 
 
 def _merge_list(existing: list[Any], incoming: list[Any]) -> list[Any]:
@@ -209,7 +216,7 @@ def _merge_list(existing: list[Any], incoming: list[Any]) -> list[Any]:
         return _strip_redacted(incoming)
     out: list[Any] = []
     for old, new in zip(existing, incoming, strict=True):
-        if new == REDACTED:
+        if _placeholder(new):
             out.append(old)
         elif isinstance(new, dict) and isinstance(old, dict):
             out.append(merge_settings(old, new))
@@ -221,10 +228,11 @@ def _merge_list(existing: list[Any], incoming: list[Any]) -> list[Any]:
 
 
 def merge_settings(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
-    """Deep-merge ``incoming`` over ``existing``; ``<redacted>`` never overwrites (or creates) a value."""
+    """Deep-merge ``incoming`` over ``existing``; a placeholder (``<redacted>``, or a string it is part of) never
+    overwrites or creates a value, and a key holding it is skipped."""
     out = dict(existing)
     for k, v in incoming.items():
-        if v == REDACTED:
+        if _placeholder(k) or _placeholder(v):
             continue
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = merge_settings(out[k], v)
@@ -296,7 +304,7 @@ def sensitive_items(bundle: Bundle, existing: dict[str, Any] | None = None) -> l
     old_servers = (have.get("mcp") or {}).get("servers") or {} if isinstance(have.get("mcp"), dict) else {}
     for name, spec in servers.items() if isinstance(servers, dict) else []:
         old = old_servers.get(name) if isinstance(old_servers, dict) else None
-        if spec != old and spec != REDACTED:
+        if spec != old and not _placeholder(spec):
             diff = [f"{k}: {_show((old or {}).get(k))} → {_show(v)}" for k, v in (spec or {}).items()]
             items.append(SensitiveItem(f"mcp.servers.{name}", ("mcp", "servers", name), diff or [_show(spec)]))
     perms = incoming.get("permissions")
@@ -312,13 +320,13 @@ def sensitive_items(bundle: Bundle, existing: dict[str, Any] | None = None) -> l
         for p in (p for p in providers if isinstance(p, dict)):
             old = old_by_name.get(p.get("name")) or {}
             for k in ("base_url", "api_key_env"):
-                if p.get(k) != old.get(k):
+                if p.get(k) != old.get(k) and not _placeholder(p.get(k)):  # a hidden value changes nothing on import
                     diff.append(f"providers.{p.get('name', '?')}.{k}: {_show(old.get(k))} → {_show(p.get(k))}")
         if diff:
             items.append(SensitiveItem("providers", ("providers",), diff))
     for path in _SCALAR_SENSITIVE:
         new, old = _at(incoming, path), _at(have, path)
-        if new is not None and new != REDACTED and new != old:
+        if new is not None and not _placeholder(new) and new != old:
             items.append(SensitiveItem(".".join(path), path, [f"{_show(old)} → {_show(new)}"]))
     if "hooks" in incoming and incoming["hooks"] != have.get("hooks"):
         items.append(SensitiveItem("hooks", ("hooks",), [f"{_show(have.get('hooks'))} → {_show(incoming['hooks'])}"]))

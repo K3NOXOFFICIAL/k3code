@@ -3,7 +3,8 @@
 A value is replaced by ``"<redacted>"`` when its key matches ``key|token|secret|password``
 (env-var *names* such as ``api_key_env`` are kept; numbers/bools are never secrets) or when
 the value itself looks like a credential (known prefixes, JWTs, bearer headers, URL userinfo,
-long opaque tokens). Dict keys are scrubbed too (a permission rule such as ``npx tool --token sk-...`` is a key).
+long opaque tokens). Dict keys are scrubbed too, by shape only (a permission rule such as ``npx tool --token sk-...``
+is a key; a long model id is a name).
 """
 
 from __future__ import annotations
@@ -233,12 +234,26 @@ def _flag_value(flag: str, value: str) -> bool:
     return bool(_SECRET_FLAG.fullmatch(flag)) or (bool(_KEY_FLAG.fullmatch(flag)) and _token_shaped(value, 8))
 
 
-def redact(obj: Any, *, _force: bool = False, _argv: bool = False) -> Any:
-    """Deep copy of ``obj`` with secrets replaced by ``"<redacted>"``."""
+def _redact_key(key: Any) -> Any:
+    """A dict key can carry a secret too (`permissions.bash` stores an approved command as the key): scrub it by shape,
+    never by ``looks_like_secret``. A long model id (`claude-sonnet-4-5-20250929-thinking-extended-1m`) is opaque to
+    that check but a name: two of them as ``models`` keys would collapse into one `<redacted>` key."""
+    return _scrub_key(scrub_urls(key)) if isinstance(key, str) else key
+
+
+def redact(obj: Any, *, keep: frozenset[str] = frozenset(), _force: bool = False, _argv: bool = False) -> Any:
+    """Deep copy of ``obj`` with secrets replaced by ``"<redacted>"``.
+
+    ``keep`` names fields that are not secret by their name (``key`` of a notification event); their values are
+    still scrubbed by shape, and a secret parent (``headers``) still hides them.
+    """
     if isinstance(obj, dict):
-        return {  # a key can carry a secret too (`permissions.bash` stores an approved command as the key)
-            redact(k) if isinstance(k, str) else k: redact(
-                v, _force=_force or is_secret_key(k) or str(k).lower() in _SECRET_SECTIONS, _argv=k == "args"
+        return {
+            _redact_key(k): redact(
+                v,
+                keep=keep,
+                _force=_force or (is_secret_key(k) and k not in keep) or str(k).lower() in _SECRET_SECTIONS,
+                _argv=k == "args",
             )
             for k, v in obj.items()
         }
@@ -257,7 +272,7 @@ def redact(obj: Any, *, _force: bool = False, _argv: bool = False) -> Any:
                 if _token_shaped(value, 20):
                     out.append(f"{name}{eq}{REDACTED}")
                     continue
-            out.append(redact(v, _force=_force))
+            out.append(redact(v, keep=keep, _force=_force))
         return out
     if isinstance(obj, str):
         if obj == "":

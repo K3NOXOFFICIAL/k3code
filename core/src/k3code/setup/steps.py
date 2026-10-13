@@ -167,6 +167,25 @@ def step_usage(c: Ctx) -> dict[str, Any]:
     return out
 
 
+def _env_var_set(name: str) -> bool:
+    return bool(os.environ.get(name) or read_env_file().get(name))
+
+
+def _api_key_env(spec: dict[str, Any], base: dict[str, Any]) -> str:
+    """The variable an entry's key comes from. An explicit empty name declares an endpoint that takes no key (#107).
+    With no name given: the preset's, but the local preset (Ollama) is keyless unless a key comes with it or one is
+    already set up for it."""
+    given = spec.get("api_key_env")
+    if isinstance(given, str) and not given.strip():
+        return ""
+    if given:
+        return str(given)
+    name = base.get("api_key_env", "K3CODE_API_KEY")
+    if spec.get("preset") == "local" and not spec.get("api_key") and not _env_var_set(name):
+        return ""
+    return name
+
+
 def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> dict[str, Any] | None:
     """Build one provider entry (interactive: ask; answers: ``spec``). Secrets go to the env file only."""
     if spec is None:
@@ -198,12 +217,18 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
         if key.strip():
             spec["api_key"] = key.strip()
         else:
+            local = preset == "local"  # Ollama takes no key: a blank name declares the entry keyless (#107)
+            hint = "; blank = this endpoint takes no key" if local else ""
             while True:
                 name = c.p.text(
                     f"providers.env{idx}",
-                    "Name of the environment variable that holds the key (letters, digits, _; e.g. K3CODE_API_KEY)",
-                    spec["api_key_env"],
+                    "Name of the environment variable that holds the key (letters, digits, _; e.g. K3CODE_API_KEY"
+                    f"{hint})",
+                    "" if local and not _env_var_set(spec["api_key_env"]) else spec["api_key_env"],
                 ).strip()
+                if local and not name:
+                    spec["api_key_env"] = ""
+                    break
                 if _ENV_NAME.match(name):
                     spec["api_key_env"] = name
                     break
@@ -211,7 +236,7 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
                     f"  '{name}' is not a valid environment variable name (no '-' or spaces). "
                     "Enter the variable NAME, not the key."
                 )
-            if not os.environ.get(spec["api_key_env"]) and not read_env_file().get(spec["api_key_env"]):
+            if spec["api_key_env"] and not _env_var_set(spec["api_key_env"]):
                 c.say(f"  NOTE: {spec['api_key_env']} is not set yet. Export it, or add it to {env_file_path()}.")
     if spec.get("name") is not None and not _PROVIDER_NAME.fullmatch(str(spec["name"])):
         raise ValueError(f"answers: provider name {spec['name']!r} may only use letters, digits, _ . and -")
@@ -222,10 +247,10 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
         "name": str(spec.get("name") or spec.get("preset") or f"provider{idx + 1}"),
         "kind": spec.get("kind") or base.get("kind", "openai"),
         "base_url": spec.get("base_url") or base.get("base_url", ""),
-        "api_key_env": str(spec.get("api_key_env") or base.get("api_key_env", "K3CODE_API_KEY")),
+        "api_key_env": _api_key_env(spec, base),
     }
     # from an answers file these reach the env file (the variable) and the config: no line breaks, no odd names
-    if not _ENV_NAME.fullmatch(entry["api_key_env"]):
+    if entry["api_key_env"] and not _ENV_NAME.fullmatch(entry["api_key_env"]):
         raise ValueError(
             f"answers: provider {entry['name']!r}: api_key_env {entry['api_key_env']!r} is not a variable name"
         )
@@ -233,6 +258,8 @@ def _entry_from(c: Ctx, idx: int, label: str, spec: dict[str, Any] | None) -> di
         _GATEWAYS.add(entry["name"])
     key = spec.get("api_key")
     if key:
+        if not entry["api_key_env"]:
+            raise ValueError(f"answers: provider {entry['name']!r}: api_key needs an api_key_env to be stored under")
         set_env_var(entry["api_key_env"], str(key))
         os.environ[entry["api_key_env"]] = str(key)
         c.say(f"  stored {entry['api_key_env']} in {env_file_path()} (0600)")
