@@ -700,6 +700,31 @@ def _run_gateway() -> None:
         asyncio.run(_serve())
 
 
+# The TUI's own reset (tui/src/lib/terminalModes.ts TERMINAL_MODE_RESET, kept equal by a test), minus the default
+# colours it only restores when it painted them: mouse and locator reporting, focus events, bracketed paste, the
+# alternate screen, the kitty keyboard and modifyOtherKeys modes, attributes, and last the cursor.
+_TERMINAL_RESET = (
+    "\x1b[0'z\x1b[0'{"
+    "\x1b[?2029l\x1b[?1016l\x1b[?1015l\x1b[?1006l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l"
+    "\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[<u\x1b[>4m\x1b[0m\x1b[?25h"
+)
+
+
+def _restore_terminal() -> None:
+    """Put the terminal back after a TUI that exited abnormally (OOM kill, crash): the shell would otherwise stay in
+    the alternate screen with mouse tracking and bracketed paste on and the cursor hidden. Harmless after a TUI that
+    did reset. Nothing is written when stdout is not a terminal."""
+    with contextlib.suppress(OSError, ValueError):
+        if sys.stdout.isatty():
+            sys.stdout.write(_TERMINAL_RESET)
+            sys.stdout.flush()
+
+
+def _exit_status(returncode: int) -> int:
+    """A child killed by signal N has returncode -N (``sys.exit(-9)`` gives 247): report 128 + N, as a shell does."""
+    return 128 - returncode if returncode < 0 else returncode
+
+
 def _launch_tui(
     *,
     model: str | None = None,
@@ -754,7 +779,9 @@ def _launch_tui(
         env["K3CODE_PROJECT_DIR"] = str(project_dir.resolve())  # config.default_project_dir() in the gateway
     logger.info("launching TUI: %s %s", node, entry)
     result = subprocess.run([node, str(entry)], env=env, check=False)
-    sys.exit(result.returncode)
+    if result.returncode != 0:
+        _restore_terminal()  # a TUI that died on a signal never ran its own exit reset
+    sys.exit(_exit_status(result.returncode))
 
 
 def _find_repo_root() -> Path | None:
