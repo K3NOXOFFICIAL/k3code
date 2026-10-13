@@ -35,7 +35,7 @@ DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 class BlockedURL(RuntimeError):
-    """The URL is not http(s), or its host resolves to an address the guard refuses."""
+    """The URL is not http(s), its host resolves to an address the guard refuses, or the name does not resolve."""
 
 
 def _parse(url: str) -> Origin:
@@ -108,7 +108,7 @@ def vetted_addresses(host: str) -> list[str]:
         return [str(ip)]
     answers = _resolve(host)
     if not answers:
-        raise BlockedURL(f"blocked: {host} could not be resolved")
+        raise BlockedURL(f"could not resolve {host} (DNS failed: no network or no such host)")
     for raw in answers:
         ip = _literal(raw)
         if ip is None or _refused(ip):

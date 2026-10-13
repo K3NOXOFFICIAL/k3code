@@ -563,6 +563,10 @@ class SubagentManager:
             session_meta={**(parent.stored.meta or {}), advisor_mod.META_KEY: ""},
             mcp=None,
             skills=not atype.tools or "skill" in atype.tools,
+            # the parent's snapshot of what background writers change (a copy: a child in a worktree must not store
+            # its own into it), so siblings spawned before and after a learned note was written share one block
+            learned=getattr(parent, "learned_notes", None),
+            frozen=dict(getattr(parent, "prompt_frozen", None) or {}),
         )
         note = ""
         if h.isolation == "worktree":

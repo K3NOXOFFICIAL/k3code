@@ -11,6 +11,13 @@ from k3code.commands._util import reply, session_cwd, split_args
 USAGE = "Usage: /mcp | /mcp reload | /mcp enable <name> | /mcp disable <name>"
 
 
+def _index_changed(ctx: Any) -> None:
+    """The servers were changed on purpose: every live session's prompt names the tools that exist now, not the ones
+    it first saw (the index is kept per session against servers that connect late)."""
+    for live in getattr(ctx, "live", {}).values():
+        live.prompt_frozen.pop("mcp", None)
+
+
 class McpCommand(CommandDef):
     def __init__(self) -> None:
         super().__init__(
@@ -26,6 +33,7 @@ class McpCommand(CommandDef):
         if args and args[0] == "reload" and len(args) == 1:
             ctx.apply_file_config(cwd)
             await ctx.mcp.reload(mcpjson.merged(ctx.config.mcp.servers, cwd))
+            _index_changed(ctx)
             note = "Reloaded.\n"
         elif args and args[0] in ("enable", "disable") and len(args) == 2:
             name = args[1]
@@ -35,6 +43,7 @@ class McpCommand(CommandDef):
             mcpjson.set_enabled(cwd, name, servers[name] if args[0] == "enable" else None)
             ctx.apply_file_config(cwd)  # the merged server set changed: restarted on ensure_started below
             await ctx.mcp.ensure_started()
+            _index_changed(ctx)
             note = f"{name} {args[0]}d.\n"
         elif args:
             return reply(USAGE)

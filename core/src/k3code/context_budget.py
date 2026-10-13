@@ -42,6 +42,12 @@ ELIDE_MIN_CHARS = 300
 #: The kept results (ELIDE_KEEP_CALLS at most) are also bounded to this share of the window, so a few huge results do
 #: not make most of each request "recent" and un-elidable (it then re-triggered, and re-wrote the cache, every step).
 ELIDE_KEEP_SHARE = 0.15
+#: The results after the last assistant message are new to the model: all of them stay whole (also past
+#: ELIDE_KEEP_CALLS) while together they weigh at most this share of the window, newest first. A step of ten parallel
+#: reads used to reach the model with four of them already elided. Past the share the oldest results of the batch are
+#: elided before the model sees them, a trade of those for room: a batch of ten 850-token reads in a 12k window (83% of
+#: it with the tool schemas) keeps its newest five.
+ELIDE_NEW_SHARE = 0.4
 
 #: Every key the code reads under ``context:`` in config.yaml (a misspelled one, such as ``compact_at_token``, is
 #: ignored).
@@ -194,13 +200,60 @@ def compact_resume_at(after_fold: int, threshold: int, window: int) -> int:
     return max(after_fold, min(after_fold + int(threshold * COMPACT_REGROWTH), int(window * MAX_COMPACT_RATIO)))
 
 
+def _class_table() -> bytes:
+    """text_tokens's byte classes: a lower-case letter ``a``; an upper-case letter or a digit ``U``; white space, a line
+    end or a rule character (``- = _ * # ~ .``) ``b`` (blank); any other ASCII ``p`` (punctuation); the lead byte of
+    a 2-, 3- or 4-byte UTF-8 character ``2`` ``3`` ``4``. A continuation byte is dropped (see _CONTINUATION)."""
+    table = bytearray(b"p" * 256)
+    for first, end, cls in ((97, 123, b"a"), (65, 91, b"U"), (48, 58, b"U"), (0xC0, 0xE0, b"2"), (0xE0, 0xF0, b"3")):
+        table[first:end] = cls * (end - first)
+    table[0xF0:] = b"4" * 16
+    for c in b" \t\r\n-=_*#~.":
+        table[c] = ord("b")
+    return bytes(table)
+
+
+_CLASSES = _class_table()
+_CONTINUATION = bytes(range(0x80, 0xC0))  # a multi-byte character is counted once, at its lead byte
+#: A tokenizer takes a run of blanks (indentation, padding, a banner of ``=====``) as one token or a few; counted at
+#: their length, a page of spaces was 30 times too large. A run of 16 counts as 4, as often as it takes.
+_BLANK_RUN, _BLANK_RUN_SHORT = b"b" * 16, b"bbbb"
+#: ASCII text of at most this many characters is chars // 4; a longer text over _SAMPLE_OVER is judged on three
+#: windows of _SAMPLE_PART characters (its start, middle and end) and scaled: the estimate runs on every message of
+#: every request, and its cost must not grow with the size of a tool result.
+_SMALL_TEXT = 96
+_SAMPLE_OVER = 1000
+_SAMPLE_PART = 96
+
+
 def text_tokens(text: str) -> int:
-    """Estimated tokens of ``text``: ~4 characters per token, plus half a token for every UTF-8 byte past the first of
-    a character (CJK text and emoji take about a token per character, of which chars // 4 counted a quarter)."""
+    """Estimated tokens of ``text``: five characters a token of lower-case letters and blanks, more for what a
+    tokenizer splits finely: capitals and digits, punctuation, and above all a change between lower case and
+    capitals or digits (the mark of a hash, a UUID, base64, hex: two characters a token). A CJK character is a token or
+    so, an emoji two or three. Fitted to the cl100k counts of source files, docs, JSON, logs, diffs and dense output
+    (hex, base64, ANSI colours): within +-30% for ordinary text, where chars // 4 was 2-3 times too small for the
+    dense kinds and 30 times too large for a page of blanks (tests/test_elision_twelfth.py)."""
     n = len(text)
-    if text.isascii():
+    ascii_only = text.isascii()
+    if n <= _SMALL_TEXT and ascii_only:
         return n // 4
-    return n // 4 + (len(text.encode("utf-8", "ignore")) - n) // 2
+    scale = 1.0
+    if n > _SAMPLE_OVER:
+        mid, part = n // 2, _SAMPLE_PART
+        text = text[:part] + text[mid - part // 2 : mid + part // 2] + text[-part:]
+        scale = n / len(text)
+    classes = text.encode("utf-8", "ignore").translate(_CLASSES, _CONTINUATION)
+    if (shorter := classes.replace(_BLANK_RUN, _BLANK_RUN_SHORT)) is not classes:
+        classes = shorter.replace(_BLANK_RUN, _BLANK_RUN_SHORT)  # twice: a run of 256 is 16 runs of 16, then 4
+    count = classes.count
+    # ``aU`` changes: about half of all the changes between lower case and capitals or digits (each way: twice 0.55)
+    cost = 1.1 * count(b"aU") + 0.28 * count(b"U") + 0.47 * count(b"p")
+    if ascii_only:
+        cost += 0.2 * len(classes)
+    else:
+        two, three, four = count(b"2"), count(b"3"), count(b"4")
+        cost += 0.2 * (len(classes) - two - three - four) + 0.63 * two + 1.2 * three + 2.6 * four
+    return int(cost * scale)
 
 
 def overhead_tokens(system_prompt: str, specs: Sequence[ToolSpec]) -> int:
@@ -226,9 +279,9 @@ def message_tokens(messages: Sequence[Message]) -> int:
 
 def kept_calls(messages: Sequence[Message], window: int | None = None) -> int:
     """How many of the newest tool results stay whole: ELIDE_KEEP_CALLS, fewer when the newest ones already weigh
-    ELIDE_KEEP_SHARE of ``window``. Never fewer than the results of the latest step (the model has not seen them yet;
-    up to ELIDE_KEEP_CALLS of them) and never fewer than one. The count only grows as results are appended, so a result
-    once elided stays elided."""
+    ELIDE_KEEP_SHARE of ``window``. Never fewer than the results of the latest step (the model has not seen them yet:
+    ELIDE_KEEP_CALLS of them, and more while they weigh at most ELIDE_NEW_SHARE of ``window``) and never fewer than
+    one. The count only grows as results are appended, so a result once elided stays elided."""
     if not window:
         return ELIDE_KEEP_CALLS
     budget = window * ELIDE_KEEP_SHARE
@@ -242,12 +295,48 @@ def kept_calls(messages: Sequence[Message], window: int | None = None) -> int:
         kept += 1
     # the results after the last assistant message; a lesson, a loop-guard note or a steering message the loop appends
     # behind them does not make them old
-    trailing = 0
+    trailing = new = 0
+    new_used, fits = 0, True  # ``new``: how many of the trailing results, newest first, fit ELIDE_NEW_SHARE together
     for m in reversed(messages):
         if m.role == "assistant":
             break
-        trailing += m.role == "tool"
-    return max(kept, min(trailing, ELIDE_KEEP_CALLS), 1)
+        if m.role == "tool":
+            trailing += 1
+            new_used += text_tokens(m.content or "") if fits else 0
+            fits = fits and new_used <= window * ELIDE_NEW_SHARE
+            new += fits
+    return max(kept, min(trailing, ELIDE_KEEP_CALLS), new, 1)
+
+
+#: One tool result is sent at most this share of the window (head and tail), but never fewer than RESULT_FLOOR_CHARS:
+#: a 60 000-char read is 15 000 tokens, which a 16k window cannot take (the turn failed, and so did every later prompt,
+#: as the result was too fresh to elide and not foldable).
+RESULT_SHARE = 0.2
+RESULT_FLOOR_CHARS = 4_000
+#: A request past FIT_AT_RATIO of the window, after the elision, has its largest tool results cut down to SHRINK_SHARE
+#: of it (SHRINK_FLOOR_CHARS at least), largest first, until it is within FIT_TARGET_RATIO: the last resort that keeps a
+#: session usable when what cannot be elided (the newest results, pinned ones) does not fit.
+FIT_AT_RATIO = 0.85
+FIT_TARGET_RATIO = 0.75
+SHRINK_SHARE = 0.05
+SHRINK_FLOOR_CHARS = 1_500
+
+
+#: The least a reply is clamped to when the request leaves little room (see AgentLoop._reply_limit).
+REPLY_MIN_TOKENS = 256
+
+
+def result_chars(text: str, window: int, share: float = RESULT_SHARE, floor: int = RESULT_FLOOR_CHARS) -> int:
+    """How many chars of the tool result ``text`` fit ``share`` of a ``window`` of tokens, by the chars per token of
+    that very text (a CJK or hex result has fewer than an English one), at least ``floor``; its whole length when it
+    fits."""
+    budget = window * share
+    if len(text) * 2 <= budget:  # even at two tokens a char
+        return len(text)
+    tokens = text_tokens(text)
+    if tokens <= budget:
+        return len(text)
+    return max(floor, int(len(text) * budget / tokens))
 
 
 def read_pointer(step: int, call_id: str) -> str:
@@ -262,19 +351,35 @@ def read_pointer(step: int, call_id: str) -> str:
 POINTER_CALL_RE = re.compile(r"^\[unchanged since the read at step \d+ \(call ([^)]+)\)")
 
 
+#: What an elision marker says about getting the result back. Repeating a read, grep or glob gives it again; for these
+#: a repeat does not: a job's output is returned once, an advisor answers differently, a command may have side effects.
+_NO_RERUN = {
+    "bash": "re-run only if repeating the command is safe",
+    "bash_output": "a job's output is returned once and not repeated",
+    "advisor": "asking again may answer differently",
+    "task": "a sub-agent's report is not kept; delegate again only if you need it",
+}
+
+
 def elide_marker(name: str | None, chars: int) -> str:
-    return f"[earlier {name or 'tool'} result elided: {chars} chars — re-run if needed]"
+    return f"[earlier {name or 'tool'} result elided: {chars} chars — {_NO_RERUN.get(name or '', 're-run if needed')}]"
 
 
-#: Results that are not elided while they are at most PINNED_RESULT_CHARS long: a loaded skill is the method for the
-#: whole task, and a sub-agent's report is gone with its run (the handle id is not in the call, so a ``task_result``
-#: cannot fetch it; a re-run is a whole child run).
-PINNED_RESULT_TOOLS = frozenset({"skill", "task"})
+#: Results that are not elided while they are at most PINNED_RESULT_CHARS long: a sub-agent's report is gone with its
+#: run (the handle id is not in the call, so a ``task_result`` cannot fetch it; a re-run is a whole child run), a job's
+#: output is returned once (the next ``bash_output`` answers "no new output"), and an advisor's answer cost a stronger
+#: model's call that would answer differently.
+PINNED_RESULT_TOOLS = frozenset({"task", "bash_output", "advisor"})
 PINNED_RESULT_CHARS = 12_000
+#: Pinned whatever their size: a loaded skill is the method for the whole task. (The clip of one result to the window,
+#: tools.clip_for_model, and AgentLoop._fit_to_window still shorten it.)
+ALWAYS_PINNED_TOOLS = frozenset({"skill"})
 
 
 def _pinned(m: Message) -> bool:
-    return m.name in PINNED_RESULT_TOOLS and len(m.content or "") <= PINNED_RESULT_CHARS
+    return m.name in ALWAYS_PINNED_TOOLS or (
+        m.name in PINNED_RESULT_TOOLS and len(m.content or "") <= PINNED_RESULT_CHARS
+    )
 
 
 def elision_candidates(
@@ -336,7 +441,9 @@ def elide_old_results(
             note = (notes or {}).get(m.tool_call_id or "")
             m = dataclasses.replace(m, content=f"{marker}\nStill relevant: {note}" if note else marker)
         elif m.role == "assistant" and m.tool_calls:
-            m = _elide_written_text(m, old_calls, over=over, elided=elided, superseded=superseded)
+            m = _elide_written_text(
+                m, old_calls, over=over, elided=elided, superseded=superseded, results=(messages, i)
+            )
         out.append(m)
     return out
 
@@ -486,16 +593,37 @@ def _shrunk_arguments(tc: ToolCall, superseded: Collection[int]) -> dict[str, An
     return None
 
 
+def _failed_calls(messages: Sequence[Message], at: int) -> set[str | None]:
+    """Ids of the calls of the assistant message ``messages[at]`` whose result (the tool messages right behind it) says
+    the call did not do its work: an error (``Error: ...``: denied, refused, no such text to replace) or, for a command,
+    a non-zero exit code. Matched in that block only: a provider that numbers every call "0" must not let a failed call
+    shield a later one."""
+    failed: set[str | None] = set()
+    for r in itertools.takewhile(lambda r: r.role == "tool", (messages[j] for j in range(at + 1, len(messages)))):
+        text = r.content or ""
+        if text.startswith("Error:") or "[exit code " in text[-120:]:
+            failed.add(r.tool_call_id)
+    return failed
+
+
 def _elide_written_text(
-    m: Message, old_calls: set[str | None], *, over: bool, elided: set[str], superseded: Collection[int] = ()
+    m: Message,
+    old_calls: set[str | None],
+    *,
+    over: bool,
+    elided: set[str],
+    superseded: Collection[int] = (),
+    results: tuple[Sequence[Message], int] = ((), -1),
 ) -> Message:
     """``m`` with the text of its old calls replaced by a marker where it is somewhere else by now (see
     _shrunk_arguments). The whole file stayed in the request as the call's argument long after the result was elided
     (ten writes of an 8 KB file: 22 000 tokens, resent every step); it is on disk and the model can read it again.
-    Decided together with the results above, so the request changes at the same moments, and a call once elided stays
-    elided, also when a larger window keeps its result whole."""
+    Not for a call that failed (``results``: the messages and the index of ``m`` in them): its text is in no file, and
+    the model may need it to retry. Decided together with the results above, so the request changes at the same
+    moments, and a call once elided stays elided, also when a larger window keeps its result whole."""
     calls = list(m.tool_calls)
     changed = False
+    failed: set[str | None] | None = None
     for j, tc in enumerate(calls):
         key = f"args:{tc.id}"  # not the id itself: that one marks the call's *result* as elided
         if tc.id not in old_calls and key not in elided:
@@ -503,6 +631,10 @@ def _elide_written_text(
         if key not in elided and not over:
             continue
         if (args := _shrunk_arguments(tc, superseded)) is None:
+            continue
+        if failed is None:
+            failed = _failed_calls(*results)
+        if tc.id in failed and key not in elided:
             continue
         calls[j] = dataclasses.replace(tc, arguments=args, raw_arguments=None)
         elided.add(key)

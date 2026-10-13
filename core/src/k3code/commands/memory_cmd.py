@@ -38,6 +38,14 @@ class MemoryCommand(CommandDef):
             help="List memory files; /memory add <text> [--user] | edit [--user] | mem0 <query>",
         )
 
+    @staticmethod
+    def _read_again(ctx: Any, session_id: str | None, user: bool) -> None:
+        """The session's prompt holds the memory files as it first saw them, against the daily distill's rewrites and
+        edits made outside; a line added or a file edited with the command is the user's own, meant to apply now."""
+        live = ctx.sessions.get(session_id) if session_id and hasattr(ctx, "sessions") else None
+        if live is not None:
+            live.prompt_frozen.pop("user_memory" if user else "project_memory", None)
+
     async def handle(self, ctx: Any, session_id: str | None, arg: str) -> dict[str, Any]:
         args = split_args(arg)
         # --user is a flag first or last (or right after the sub-command); anywhere else it is part of the text
@@ -61,13 +69,11 @@ class MemoryCommand(CommandDef):
             if not text:
                 return reply("Usage: /memory add <text> [--user]")
             append_memory(target, text)
-            live = ctx.sessions.get(session_id) if session_id and hasattr(ctx, "sessions") else None
-            if user and live is not None:
-                # the session's prompt holds the user file as it first saw it, against the daily distill's rewrites;
-                # this line is the user's own, written to take effect now
-                live.prompt_frozen.pop("user_memory", None)
+            self._read_again(ctx, session_id, user)
             return reply(f"Added to {target}", path=str(target))
         if sub == "edit":
+            # the user is about to change the file (a turn between this and the save reads the old text once more)
+            self._read_again(ctx, session_id, user)
             return reply(f"Edit {target} (the CLI opens $EDITOR; here, open it yourself).", path=str(target))
         if sub == "mem0":
             query = " ".join(args[1:]).strip()

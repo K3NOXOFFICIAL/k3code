@@ -161,7 +161,7 @@ async def test_a_rewrite_during_the_summary_call_wins(tmp_path, monkeypatch):
 
 
 def test_non_ascii_text_costs_more_than_a_quarter_token_per_character():
-    assert text_tokens("a" * 4000) == 1000
+    assert 700 <= text_tokens("a" * 4000) <= 1000  # about five characters a token of letters
     assert 10_000 <= text_tokens("漢" * 10_000) <= 15_000  # a token or so per character
     plain = "the quick brown fox jumps over the lazy dog, again and again. " * 100
     assert text_tokens(plain.replace("quick", "quïck")) <= text_tokens(plain) * 1.1  # an accent now and then
@@ -170,13 +170,13 @@ def test_non_ascii_text_costs_more_than_a_quarter_token_per_character():
 def test_the_estimate_follows_the_configured_tool_output_limit():
     msgs = [{"role": "tool", "name": "bash", "tool_call_id": "1", "content": "x" * 50_000}]
     assert _estimate_tokens(msgs) < 3_000  # the default clip: head and tail of 10k chars
-    assert _estimate_tokens(msgs, 50_000) == 12_500  # what a loop with context.tool_output_chars=50000 sends
+    assert _estimate_tokens(msgs, 50_000) == text_tokens("x" * 50_000)  # a loop with context.tool_output_chars=50000
 
 
 def test_the_system_prompt_is_counted_once():
     system = "s" * 40_000
     msgs = [Message(role="system", content=system), Message(role="user", content="hi")]
-    assert overhead_tokens(system, []) >= 10_000
+    assert overhead_tokens(system, []) >= 7_000
     assert message_tokens(msgs) < 10  # the request's system prompt is overhead_tokens' to count
     assert message_tokens([SimpleNamespace(role="system", content="x" * 400, tool_calls=[])]) == 0
 

@@ -342,6 +342,11 @@ async def _read_rendered(
     return title or url, _cap_page(text, note, start, limit)
 
 
+#: A failure to reach the host at all (no network, no route, DNS down): the same whichever backend is asked, unlike an
+#: HTTP error or a page that is not JSON.
+UNREACHABLE = (httpx.ConnectError, httpx.ConnectTimeout)
+
+
 class SearxngSearch:
     """SearXNG JSON search; probes the instance once and stays disabled (with a reason) if unreachable."""
 
@@ -350,6 +355,7 @@ class SearxngSearch:
         self._client = client
         self._ok: bool | None = None
         self.reason = ""
+        self.unreachable = False  # the probe could not connect (as opposed to an answer that was not JSON)
 
     async def _get(self, params: dict[str, str]) -> httpx.Response:
         own = self._client is None
@@ -373,6 +379,7 @@ class SearxngSearch:
             self._ok = True
         except Exception as e:  # noqa: BLE001
             self._ok = False
+            self.unreachable = isinstance(e, UNREACHABLE)
             self.reason = (
                 f"SearXNG at {self.url} is unreachable or not returning JSON ({type(e).__name__}); "
                 "set research.searxng_url to a working instance"
@@ -660,22 +667,32 @@ def pick_tools(
 
 async def fallback_search(
     query: str, n: int, *, searx: SearxngSearch, ddg: DuckDuckGoSearch | None, mcp: Any = None
-) -> tuple[list[Hit], list[str], bool]:
+) -> tuple[list[Hit], list[str], bool, bool]:
     """The agent's ``web_search`` chain: SearXNG, then keyless DuckDuckGo, then a connected MCP search tool. The first
-    source with hits wins. Returns (hits, notes, answered); ``answered`` is False when no source could be asked."""
+    source with hits wins. Returns (hits, notes, answered, unreachable); ``answered`` is False when no source could be
+    asked, ``unreachable`` that every source that was tried failed to connect (the network is down, not the setup)."""
     notes: list[str] = []
     answered = False
+    tried = unreachable = 0  # sources that failed, and of those the ones that could not even be connected to
+
+    def failed(down: bool) -> None:
+        nonlocal tried, unreachable
+        tried, unreachable = tried + 1, unreachable + down
+
     if not await searx.available():
         notes.append(f"SearXNG: {searx.reason}")
+        if searx.url:  # a SearXNG that is not configured was never asked
+            failed(searx.unreachable)
     else:
         try:
             hits = await searx.search(query, n)
         except Exception as e:  # noqa: BLE001 - one dead source must not end the chain
             notes.append(f"SearXNG failed: {type(e).__name__}")
+            failed(isinstance(e, UNREACHABLE))
         else:
             answered = True
             if hits:
-                return hits, notes, True
+                return hits, notes, True, False
             notes.append("SearXNG: no results")
     if ddg is None:
         notes.append("keyless DuckDuckGo fallback is off (research.keyless_fallback)")
@@ -684,10 +701,11 @@ async def fallback_search(
             hits = await ddg.search(query, n)
         except Exception as e:  # noqa: BLE001
             notes.append(f"DuckDuckGo failed: {type(e).__name__}")
+            failed(isinstance(e, UNREACHABLE))
         else:
             answered = True
             if hits:
-                return hits, notes, True
+                return hits, notes, True, False
             notes.append("DuckDuckGo: no results")
     tool = mcp_search_tool(mcp)
     if tool is None:
@@ -697,12 +715,13 @@ async def fallback_search(
             hits = await mcp_search_hits(mcp, tool, query, n)
         except Exception as e:  # noqa: BLE001
             notes.append(f"MCP {tool.qualified} failed: {str(e)[:120]}")
+            failed(False)
         else:
             answered = True
             if hits:
-                return hits, notes, True
+                return hits, notes, True, False
             notes.append("MCP search: no results")
-    return [], notes, answered
+    return [], notes, answered, not answered and tried > 0 and tried == unreachable
 
 
 def register_web_tools(
@@ -758,13 +777,15 @@ def register_web_tools(
         query = str(arguments.get("query") or "").strip()
         if not query:
             return {"error": "web_search needs a query"}
-        hits, notes, answered = await fallback_search(
+        hits, notes, answered, unreachable = await fallback_search(
             query, int(arguments.get("limit") or 5), searx=searx, ddg=ddg, mcp=mcp
         )
         if hits:
             return {"content": "\n".join(f"- {h.title}\n  {h.url}\n  {h.snippet[:200]}" for h in hits)}
         if answered:
             return {"content": "no results"}
+        if unreachable:  # setting up a backend would not help, and a retry fails the same way
+            return {"error": "web_search failed: network unreachable (no backend answered); do not retry"}
         return {"error": f"web_search is disabled: {'; '.join(notes)}"}
 
     reg.register(

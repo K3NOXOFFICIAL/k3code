@@ -71,8 +71,12 @@ def build_system_prompt(
         index := once("skills", lambda: skills_prompt(cwd, list(config.skills.roots), limit=limit), empty_ok=False)
     ):
         parts.append(index)
-    if mcp is not None and (m := mcp_prompt(mcp)):
-        parts.append(m)
+    # a server that connects after the first turn adds its names to the index: kept out until the prompt is refreshed
+    # (``mcp_tool_search`` finds its tools meanwhile, and a restarting server keeps its tools: McpManager._last_tools).
+    # Nothing yet is only kept once the servers have been started: a size estimate before the first turn asks too
+    index = once("mcp", lambda: mcp_prompt(mcp), empty_ok=not getattr(mcp, "cold", False)) if mcp is not None else ""
+    if index:
+        parts.append(index)
     from k3code.learning.gotchas import gotchas_prompt, user_gotchas_prompt
     from k3code.learning.optimizer import overlay_prompt
     from k3code.learning.projectprep import facts_prompt

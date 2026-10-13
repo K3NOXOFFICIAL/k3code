@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from k3code.config import ConfigError
-from k3code.context_budget import FALLBACK_WINDOW, context_window
+from k3code.context_budget import FALLBACK_WINDOW, context_window, text_tokens
 from k3code.gateway.server import _estimate_tokens
 from k3code.providers.base import ProviderError
 from k3code.providers.openai_compat import OpenAICompatProvider
@@ -67,7 +67,7 @@ def test_tool_call_arguments_are_counted_once_by_the_compaction_estimator():
     ]
     assert _estimate_tokens(stored) == message_tokens(sent)
     parsed_only = [{"role": "assistant", "content": None, "tool_calls": [{**call, "raw_arguments": None}]}]
-    assert abs(_estimate_tokens(parsed_only) - 1000) < 30, "about 4000 chars / 4, not double"
+    assert _estimate_tokens(parsed_only) < 1.2 * text_tokens("z" * 4000), "the 4000 chars once, not double"
 
 
 def test_the_estimate_counts_a_cut_off_call_as_the_start_the_model_is_sent():

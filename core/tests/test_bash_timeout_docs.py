@@ -13,7 +13,8 @@ from k3code.tools import build_registry, tool_bash
 
 async def test_timeout_says_how_long_and_how_to_go_on(tmp_path):
     res = await tool_bash({"command": "sleep 5", "timeout": 0.3}, cwd=tmp_path)
-    assert res["error"] == "Command timed out after 0.3s; retry with timeout up to 600 or background: true"
+    assert res["error"].startswith("Command timed out after 0.3s; retry with timeout up to 600 or background: true")
+    assert "waits for input" in res["error"]  # more time does not help a command that waits for a terminal
 
 
 def test_bash_schema_documents_default_and_max_timeout():

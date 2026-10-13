@@ -145,12 +145,12 @@ def test_which_results_count_as_failed_calls(result, failed):
 
 async def test_an_argument_a_builtin_tool_does_not_take_is_named_in_its_result(tmp_path):
     (tmp_path / "a.txt").write_text("Hello\n")
-    call = ToolCall(id="g1", name="grep", arguments={"pattern": "hello", "-n": True, "path": "."})
+    call = ToolCall(id="g1", name="grep", arguments={"pattern": "hello", "multiline": True, "path": "."})
     provider = Replies([[call]])
     loop = loop_for(tmp_path, provider)
     await drain(loop)
     result = next(m for m in provider.seen[1] if m.role == "tool")
-    assert "ignored arguments: -n" in str(result.content) and "grep takes:" in str(result.content)
+    assert "ignored arguments: multiline" in str(result.content) and "grep takes:" in str(result.content)
 
 
 async def test_a_call_with_only_known_arguments_gets_no_note(tmp_path):
@@ -458,7 +458,8 @@ async def test_glob_paths_are_relative_to_the_session_directory(tmp_path):
     res = await tool_glob({"pattern": "*.py", "path": "src/pkg"}, cwd=tmp_path)
     assert res["files"] == ["src/pkg/mod.py"], "a path that read takes as it is"
     assert (await tool_glob({"pattern": "*.py", "path": "src"}, cwd=tmp_path))["files"] == ["src/pkg/mod.py"]
-    assert "give path=dist" in format_tool_result({"files": []})
+    skipped = format_tool_result(await tool_glob({"pattern": "dist/*.js"}, cwd=tmp_path))
+    assert skipped.startswith("(no files)") and "give path=dist" in skipped
 
 
 # ── tool-call JSON from the model ─────────────────────────────────────────────────────────────────────────────────

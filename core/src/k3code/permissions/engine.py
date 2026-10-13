@@ -103,7 +103,10 @@ PURE_TOOLS = frozenset(
 EDIT_TOOLS = frozenset({"write", "edit"})
 READ_TOOLS = frozenset({"read", "grep", "glob"})  # path-taking read-only tools
 EXIT_PLAN_TOOL = "exit_plan"
-PLAN_MSG = "Plan mode is read-only; present the plan with exit_plan."
+PLAN_HINT = "explore with read, glob and grep, then call exit_plan."
+#: Both plan-mode messages start with "Plan mode is read-only": toolerrors.py counts a refusal that starts so as a
+#: policy denial, not as an error of the project.
+PLAN_MSG = f"Plan mode is read-only; bash/write/edit are unavailable: {PLAN_HINT}"
 
 
 @dataclass
@@ -282,7 +285,7 @@ def decide(
         rule = evaluate(tool, "*", ruleset, default=base)
         dec = Decision(action=rule.action, patterns=["*"], rule=rule)
         if mode == PermissionMode.PLAN and tool not in PURE_TOOLS:
-            dec.action, dec.message = "deny", PLAN_MSG
+            dec.action, dec.message = "deny", f"Plan mode is read-only; {tool} is unavailable: {PLAN_HINT}"
 
     return _finish(dec, mode, headless)
 
@@ -299,7 +302,10 @@ def _finish(dec: Decision, mode: PermissionMode, headless: bool) -> Decision:
             dec.action, dec.auto_allowed = "allow", True
     if dec.action == "ask" and headless:
         dec.action = "deny"
-        dec.message = dec.message or HEADLESS_ASK_DENIED
+        # a specific reason (a path outside the project, a credential file) stays first; the model also hears that
+        # nobody can answer, and `k3code -p` counts the refusal by that sentence
+        stop = "" if (dec.message or ".").endswith(".") else "."
+        dec.message = f"{dec.message}{stop} {HEADLESS_ASK_DENIED}" if dec.message else HEADLESS_ASK_DENIED
     if dec.action == "deny" and not dec.message:
         dec.message = f"Denied by rule {dec.rule.tool}:{dec.rule.pattern}" if dec.rule else "Denied."
     return dec
@@ -871,13 +877,20 @@ def _force_push_ask(why: str, prefixes: list[str], command: str) -> Decision:
     )
 
 
+#: What a hardline denial adds for the rules that have a way to do the same thing legitimately.
+_HARDLINE_HINTS = {
+    "env-dump": " (it prints secrets: set a variable with `VAR=x cmd`, read a plain one with `printenv NAME`)",
+}
+
+
 def _decide_bash(
     mode: PermissionMode, command: str, ruleset: list[Rule], extra: list[str] | None, roots: list[str], cwd: str
 ) -> Decision:
     home = os.path.expanduser("~")
     hit = hardline.check(command, extra, cwd=cwd, home=home)
     if hit:
-        return Decision(action="deny", message=f"Hardline deny ({hit}): {command[:120]}", hardline=hit)
+        message = f"Hardline deny ({hit}): {command[:120]}{_HARDLINE_HINTS.get(hit, '')}"
+        return Decision(action="deny", message=message, hardline=hit)
     parsed = hardline.parse(command)
     if parsed.too_deep and mode == PermissionMode.YOLO:
         # nested past the parse limit: the hardline could not look inside, and yolo has nobody to ask
@@ -1034,6 +1047,8 @@ def grep_excludes(base: str) -> list[str]:
 def _glob_base(path: str, pattern: str) -> str:
     """The directory a glob of ``pattern`` under ``path`` starts from: its literal leading segments count, so a
     pattern such as ``../../.ssh/*`` is decided as ``~/.ssh``."""
+    if pattern.startswith("~"):  # tool_glob expands it: ``~/.ssh/*`` is the home directory's, not a folder named ``~``
+        pattern = os.path.expanduser(pattern)
     if os.path.isabs(pattern):
         return os.path.normpath(pattern)  # pathlib refuses it; decide the absolute prefix anyway
     literal: list[str] = []

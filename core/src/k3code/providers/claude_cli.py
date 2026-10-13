@@ -536,7 +536,10 @@ class ClaudeCliProvider(Provider):
             self._detach(s)
         # Everything up to the reservation below is synchronous, so concurrent checkouts see each other's slots.
         if len(self._pool) + self._spawning >= self.max_sessions:
-            idle = [s for s in self._pool if not s.busy]
+            # Only a conversation whose last reply was text can go: one whose last reply asked for tools is waiting for
+            # them (a parent whose sub-agents are running) and will be back with their results; its slot taken, the
+            # whole conversation is rendered again to a new process. The newcomer runs one-shot instead.
+            idle = [s for s in self._pool if not s.busy and not s.last_calls]
             if not idle:
                 await self._drop(*doomed)
                 return None, "", fps

@@ -33,7 +33,7 @@ HARDLINE_PATTERNS: list[tuple[str, str]] = [
     ("dd-to-device", r"\bdd\b.*\bof=/dev/"),  # dd of=/dev/...
     ("pipe-to-shell", r"\bcurl\b[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),  # curl ... | sh
     ("wget-pipe-to-shell", r"\bwget\b[^|]*-O\s*-\s*[^|]*\|\s*(?:sudo\s+)?(?:sh|bash)\b"),
-    ("env-dump", r"^\s*(?:sudo\s+)?(?:env|printenv)\b"),  # env / printenv
+    # env-dump (env / printenv printing the environment) is token based: see _env_dump_check
     # (?i): drvfs (/mnt/c) and macOS open ~/.ssh for ~/.SSH and .env for .ENV
     ("ssh-key-cat", r"(?i)\bcat\b[^\n;|&]*\.ssh/"),  # cat ~/.ssh/...
     # cat .env / *.env, but not the committed templates (.env.example ...)
@@ -68,6 +68,7 @@ HARDLINE_NAMES: list[str] = [
     "recursive-chmod-root",  # chmod/chown/chgrp -R on / (_recursive_root_check)
     "find-delete-root",  # find / ... -delete (_find_check)
     "nesting-too-deep",  # yolo only: nesting past the parse limit cannot be checked, and yolo has nobody to ask
+    "env-dump",  # env / printenv / export -p / set printing the environment (_env_dump_check)
     *(n for n, _ in HARDLINE_PATTERNS),
     *(n for n, _ in HARDLINE_SIMPLE_PATTERNS),
 ]
@@ -484,7 +485,7 @@ _WRAPPER_SPECS: dict[str, tuple[str, frozenset[str], int]] = {
         0,
     ),
     "doas": ("uC", frozenset(), 0),
-    "env": ("uSC", frozenset({"--unset", "--split-string", "--chdir"}), 0),
+    "env": ("uSCPa", frozenset({"--unset", "--split-string", "--chdir", "--argv0"}), 0),
     "xargs": (
         "nIPdLaEs",
         frozenset({"--max-args", "--max-procs", "--delimiter", "--max-lines", "--arg-file", "--eof", "--max-chars"}),
@@ -690,6 +691,14 @@ def _skip_wrapper_options(
     return prefix + args[i + positionals :]
 
 
+def _env_prints(rest: list[str]) -> bool:
+    """``env`` with only assignments left to run (``env -- A=1``, ``env -S A=1``), or an expansion where the command
+    goes (``env $X``, ``env A=1 $(cmd)``, ``env -- A=1 $X``: empty, it prints too), prints the environment: it stays
+    the command. (After ``--`` or ``-S`` the words may start with assignments: the command is the first other word.)"""
+    command = next((t for t in rest if not _is_assignment(t)), None)
+    return command is None or UNRESOLVED.search(command) is not None
+
+
 #: Wrappers added by the second audit. ``normalize_argv(..., legacy=True)`` leaves them (and the reserved words) alone:
 #: the engine's credential scan and rule forms look at both spellings, so teaching the normaliser more never lets a
 #: command through that an older reading stopped.
@@ -730,7 +739,7 @@ def normalize_argv(tokens: list[str], reads: list[str] | None = None, *, legacy:
         if spec is None or (legacy and name in _NEW_WRAPPERS):
             return argv
         rest = _skip_wrapper_options(name, argv[1:], spec, reads, legacy)
-        if not rest:
+        if not rest or (name == "env" and _env_prints(rest)):
             return argv
         argv = rest
     return argv
@@ -933,12 +942,29 @@ def _git_push_check(argv: list[str]) -> str | None:
     return None
 
 
+#: Variables that hold, or may hold, a credential: redact.py's key / token / secret / password / credential words, a
+#: whole-word PASS and the URL / URI / DSN a password is often written into. ``printenv`` does not print them.
+_SECRET_ENV_NAME = re.compile(
+    r"(?i)key|token|secret|pass(?:w|ph)|pwd|credential|authoriz|cookie|conn(?:ection)?[_-]?str"
+    r"|(?<![a-z])(?:pass|auth|url|uri|dsn)(?![a-z])"
+)
+#: A ``printenv`` argument that is no name but an expansion or a glob (its value is not known here).
+_ENV_NAME_EXPANSION = re.compile(r"[$`*?\[\]{}~\\]")
+
+
 def _env_dump_check(argv: list[str]) -> str | None:
-    """``env`` / ``printenv`` / ``export -p`` / ``set`` printing the environment (secrets) to the transcript."""
+    """``env`` / ``printenv`` / ``export -p`` / ``set`` printing the environment (secrets) to the transcript. ``env``
+    only gets here when it has no command to run (:func:`normalize_argv` drops it otherwise: ``env A=1 cmd`` is
+    ``cmd``). ``printenv NAME`` prints one variable: only a plain, non-credential name is let through."""
     if not argv:
         return None
     name, args = argv[0], argv[1:]
-    if name in ("env", "printenv") or (name == "export" and set(args) <= {"-p"}) or (name == "set" and not args):
+    if name == "printenv":
+        names = [a for a in args if not a.startswith("-")]
+        if names and not any(_ENV_NAME_EXPANSION.search(n) or _SECRET_ENV_NAME.search(n) for n in names):
+            return None
+        return "env-dump"
+    if name == "env" or (name == "export" and set(args) <= {"-p"}) or (name == "set" and not args):
         return "env-dump"
     return None
 

@@ -15,6 +15,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from k3code.context_budget import RESULT_FLOOR_CHARS, result_chars
 from k3code.permissions.engine import grep_excludes, sensitive_path
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, shell_path, with_chdir
@@ -23,14 +24,14 @@ from k3code.tools.fuzzy_match import (
     fuzzy_find_and_replace,
     is_already_applied,
 )
-from k3code.tools.jobs import MAX_UNREAD_BYTES
+from k3code.tools.jobs import MAX_UNREAD_BYTES, MAX_WAIT_S
 
 # ── Tool registry ──────────────────────────────────────────────────────
 
 
-#: Tools that come and go between requests of one session (``exit_plan`` only in plan mode, ``schedule_next`` only on a
-#: self-paced loop tick). The tool list leads every request, so one of them in the middle moved every tool after it;
-#: they are advertised last, where their coming and going leaves the rest of the list as it was.
+#: Tools that come and go between requests of one session (``exit_plan`` only in plan mode, ``schedule_next`` once a
+#: self-paced loop has ticked in the session). The tool list leads every request, so one of them in the middle moved
+#: every tool after it; they are advertised last, where their coming and going leaves the rest of the list as it was.
 VOLATILE_TOOLS = frozenset({"exit_plan", "schedule_next"})
 MAX_ACTIVE_TOOLS = 200  # activated MCP tools a session keeps asking for (the newest win)
 
@@ -260,8 +261,14 @@ def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
                     break  # the char budget is spent: the model continues with offset
                 selected.append(line)
             number += 1
-    if not selected:
-        return {"content": "", "lines": f"{start}-{start} (past the end of the file)"}
+    if not selected:  # the end came before line `start`: the file has number - 1 lines
+        return {
+            "content": "",
+            "lines": f"{start}-{start} (past the end of the file)",
+            "first": start,
+            "last": start - 1,
+            "total": number - 1,
+        }
     last = start + len(selected) - 1
     return {"content": "\n".join(selected), "lines": f"{start}-{last}", "first": start, "last": last, "total": None}
 
@@ -330,8 +337,9 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     if size > MAX_READ_BYTES:
         # read_bytes() of a multi-GB log took the shared daemon's memory with it: stream only the requested lines.
         if not explicit:
+            mb = -(-size * 10 // (1024 * 1024)) / 10  # one decimal, rounded up: 10.0 MB would not be over a 10 MB limit
             return {
-                "error": f"File is {size // (1024 * 1024)} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB): "
+                "error": f"File is {mb:.1f} MB (limit {MAX_READ_BYTES // (1024 * 1024)} MB): "
                 "pass offset and limit (or start and end) to read a line range, or use grep to find what you need"
             }
         if first < 0:
@@ -375,8 +383,11 @@ async def tool_write(arguments: dict[str, Any], *, cwd: Path | None = None) -> d
     blocker = next((p for p in path.parents if p.exists() and not p.is_dir()), None)
     if blocker is not None:  # a file where a folder is needed: mkdir would say "File exists" about the wrong thing
         return {"error": f"{blocker} is a file, so {path} cannot be created under it"}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(path, content.encode("utf-8"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(path, content.encode("utf-8"))
+    except PermissionError:  # its message names the temp file next to the target (.name.k3tmp-...), not the target
+        return {"error": f"permission denied: {path}"}
     return {"ok": True, "path": str(path)}
 
 
@@ -457,7 +468,10 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     if plan.already_applied:
         return {"content": f"No change needed: {plan.path.name} already contains new_string and no longer old_string."}
     new_content = plan.after.replace("\n", "\r\n") if plan.crlf else plan.after
-    _atomic_write(plan.path, new_content.encode("utf-8"))
+    try:
+        _atomic_write(plan.path, new_content.encode("utf-8"))
+    except PermissionError:
+        return {"error": f"permission denied: {plan.path}"}
     if plan.key is not None:
         _APPLIED_EDITS[plan.key] = None
         while len(_APPLIED_EDITS) > _APPLIED_EDITS_MAX:
@@ -487,26 +501,55 @@ _LEFTOVER_TRAP = (
 _RO_FS = "Read-only file system"
 _ABS_PATH = re.compile(r"/[^\s:'\"`]+")
 _NO_NETWORK = re.compile(r"Could not resolve host|Temporary failure in name resolution|Network is unreachable", re.I)
+# curl "error setting certificate file", git "error setting certificate verify locations", pip/requests "Could not
+# find a suitable TLS CA certificate bundle, invalid path"
+_NO_CA_BUNDLE = re.compile(r"error setting certificate|TLS CA certificate bundle", re.I)
+_NOT_FOUND = re.compile(r"\bnot found\b", re.I)  # bash: "node: command not found", dash: "node: not found"
+# the git commands that write .git: with it read-only, `git stash` fails with exit 1 and not a word
+_GIT_WRITE = re.compile(
+    r"(?:^|[;&|(]\s*)git(?:\s+-[Cc]\s+\S+)*\s+"
+    r"(?:stash|add|commit|checkout|switch|restore|reset|merge|rebase|pull|cherry-pick|revert|tag|rm|mv)\b"
+)
 
 
-def _sandbox_hint(stderr: str, cmd: str, *, network: bool = False, roots: Iterable[Path | str] = ()) -> str:
+def _sandbox_hint(
+    stderr: str,
+    cmd: str,
+    *,
+    network: bool = False,
+    roots: Iterable[Path | str] = (),
+    exit_code: int | None = None,
+    silent: bool = False,
+) -> str:
     """What the sandbox means by a failure, for the model: the raw message ("Read-only file system", "Could not resolve
     host") does not say that the rules, not the command, are the cause, and a model retries or works around them. Only
     asked for a failed command of a sandboxed run, so a successful call and an unsandboxed session are unchanged.
     ``network``: the sandbox leaves the network on (an interactive session; only unattended runs cut it). ``roots``:
     the folders it keeps (the project, added dirs): a file missing there is just missing, however the project is placed
-    (under the home or /tmp is the usual case)."""
-    if _RO_FS in stderr:
-        return (
-            "sandbox: only the project folder is writable; .git is read-only (git add/commit/branch/config cannot work "
-            "here), and /tmp and ~ are discarded after each call. Do not retry; tell the user (or report it in your "
-            "result if you are a sub-agent)."
-        )
+    (under the home or /tmp is the usual case). ``exit_code``, ``silent`` (no output at all): a git command that writes
+    .git fails with neither a message nor a code worth reading."""
+    read_only = (
+        "sandbox: only the project folder is writable; .git is read-only (git add/commit/branch/config cannot work "
+        "here), and /tmp and ~ are discarded after each call. Do not retry; tell the user (or report it in your "
+        "result if you are a sub-agent)."
+    )
+    if _RO_FS in stderr or (silent and exit_code and _GIT_WRITE.search(cmd)):
+        return read_only
     if _NO_NETWORK.search(stderr) and not network:
         return "sandbox: there is no network in this run; do not retry."
+    if _NO_CA_BUNDLE.search(stderr):
+        return (
+            "sandbox: the TLS CA bundle file the environment names (SSL_CERT_FILE, CURL_CA_BUNDLE ...) is not "
+            "readable here: only /usr, /etc and the project are visible. Do not retry; tell the user."
+        )
+    if exit_code == 127 and _NOT_FOUND.search(stderr):
+        return (
+            "sandbox: only /usr, /etc and the project are visible; a tool installed under ~ or /opt is not "
+            "(sandbox.home_readonly lists $HOME entries to show read-only). Do not retry; tell the user."
+        )
     # the file that is missing is under /tmp or the home, and outside the folders the sandbox keeps: not just a command
     # that mentions one, and not a project that happens to live there
-    missing = [p for line in stderr.splitlines() if "No such file" in line for p in _ABS_PATH.findall(line)]
+    missing = [p for line in stderr.splitlines() if "no such file" in line.lower() for p in _ABS_PATH.findall(line)]
     kept = tuple(f"{root}/" for root in roots)
     if any(p.startswith(("/tmp/", f"{Path.home()}/")) and not p.startswith(kept) for p in missing):
         return "sandbox: /tmp and ~ are private to each bash call and vanish; use a path inside the project."
@@ -544,8 +587,13 @@ async def tool_bash(
     """
     cmd = arguments["command"]
     asked = float(arguments.get("timeout") or BASH_DEFAULT_TIMEOUT)
+    if asked < 0:  # it used to read "timed out after -5s" without having run
+        return {"error": f"timeout must be a positive number of seconds, got {arguments['timeout']!r}"}
     timeout = min(asked, BASH_MAX_TIMEOUT)
     workdir = _resolve_path(arguments.get("cwd", "."), cwd)
+    if not workdir.is_dir():  # spawning there would fail with a Python repr: Errno 2, PosixPath(...)
+        what = "is not a directory" if workdir.exists() else "does not exist (relative to the session directory)"
+        return {"error": f"cwd {workdir} {what}"}
     proc: asyncio.subprocess.Process | None = None
     if sandbox:
         sandbox = with_chdir(sandbox, workdir)  # the command starts in the requested cwd, not the session's
@@ -586,7 +634,8 @@ async def tool_bash(
             await _kill_group(proc)
             return {
                 "error": f"Command timed out after {timeout:g}s; retry with timeout up to {BASH_MAX_TIMEOUT} "
-                "or background: true",
+                "or background: true (not if it waits for input: there is no terminal and stdin is closed, so pass "
+                "what it asks for as arguments)",
                 "stdout": out.text(),
                 "stderr": err.text(),
                 "exit_code": -1,
@@ -617,7 +666,10 @@ async def tool_bash(
         if sandbox and proc.returncode:
             # the folders bound into the sandbox, not the call's cwd: a cwd of /tmp or ~ is the private tmpfs there
             kept = [sandbox[i + 1] for i, arg in enumerate(sandbox) if arg in ("--bind", "--ro-bind")]
-            if hint := _sandbox_hint(result["stderr"], cmd, network=network_on, roots=kept):
+            silent = not (result["stdout"].strip() or result["stderr"].strip())
+            if hint := _sandbox_hint(
+                result["stderr"], cmd, network=network_on, roots=kept, exit_code=proc.returncode, silent=silent
+            ):
                 notes.append(hint)
         return {**result, "note": "; ".join(notes)} if notes else result
     except Exception as e:
@@ -714,14 +766,13 @@ def _format_tool_result(result: dict[str, Any]) -> Any:
         return "\n".join(parts) if parts else "(no output)"
     if "matches" in result:  # grep
         text = str(result.get("matches") or "")
-        if result.get("warnings"):
-            text = f"{text}\n[{result['warnings']}]" if text else f"[{result['warnings']}]"
+        if warnings := result.get("warnings"):
+            if isinstance(warnings, list):  # rg's stderr lines (an unreadable directory), one bracket each
+                warnings = "]\n[".join(str(w) for w in warnings)
+            text = f"{text}\n[{warnings}]" if text else f"[{warnings}]"
         return text or "(no matches)"
     if "files" in result and isinstance(result["files"], list):  # glob
-        text = "\n".join(str(f) for f in result["files"]) or (
-            "(no files; dependency and cache folders such as .git node_modules .venv dist .terraform are skipped, "
-            "tracked files in them too: give path=dist to search inside one)"
-        )
+        text = "\n".join(str(f) for f in result["files"]) or "(no files)"
         return f"{text}\n[{result['note']}]" if result.get("note") else text
     if result.keys() == {"ok", "path"} and result["ok"] is True:  # write
         return f"Wrote {result['path']}"
@@ -854,17 +905,44 @@ def _grep_resume(text: str, at: int) -> str:
     return ""
 
 
-def clip_for_model(name: str | None, text: str, limit: int = _MAX_CHARS) -> str:
-    """What the model is sent of one tool result: ``read`` keeps its own budget, others are clipped to ``limit``."""
+def _clip_streams(text: str, at: int, limit: int, hint: str) -> str:
+    """A bash result with both streams (stdout, then ``[stderr]`` and the notes and exit code after it, from
+    ``text[at]``), clipped to ``limit`` chars with a head+tail budget for each stream (stdout 2/3, stderr 1/3; one that
+    needs less leaves the rest to the other). Cut as one text, the end of a long stdout (the test summary, the
+    failures) fell in the dropped middle while a long stderr (compiler noise) kept its tail."""
+    out, err = text[: at - 1], text[at:]
+    for_out = limit * 2 // 3
+    if len(out) < for_out:
+        for_out = len(out)
+    elif len(err) < limit - for_out:
+        for_out = limit - len(err)
+    return f"{clip_head_tail(out, for_out, hint)}\n{clip_head_tail(err, limit - for_out, hint)}"
+
+
+def clip_for_model(name: str | None, text: str, limit: int = _MAX_CHARS, window: int | None = None) -> str:
+    """What the model is sent of one tool result: ``read`` keeps its own budget, others are clipped to ``limit``. With
+    ``window`` (the context window in tokens) a result is also held to a share of it (context_budget.result_chars)."""
     if name in ("read", "skill"):  # a skill is loaded to be followed whole: its own cap (MAX_SKILL_CHARS) applies
         limit = max(limit, _READ_RESULT_CHARS)
+    if window and len(text) > RESULT_FLOOR_CHARS:
+        limit = min(limit, result_chars(text, window))
+    if name == "bash" and len(text) > limit and (split := text.find("\n[stderr]\n")) > 0:
+        return _clip_streams(text, split + 1, limit, _CLIP_HINTS["bash"])
     return clip_head_tail(
         text, limit, _CLIP_HINTS.get(name or "", _CLIP_HINT_DEFAULT), resume=_grep_resume if name == "grep" else None
     )
 
 
-def clip_tool_results(messages: Sequence[Message], limit: int = _MAX_CHARS) -> list[Message]:
-    """The messages a provider receives: every tool result over its limit becomes its head+tail clip (clip_for_model).
+def shrink_result(name: str | None, text: str, chars: int) -> str:
+    """``text``, a tool result, cut to ``chars``: its head and tail, and how to see the rest (the clip of
+    clip_for_model, without the allowance a read or a skill gets)."""
+    hint = _CLIP_HINTS.get(name or "", _CLIP_HINT_DEFAULT)
+    return clip_head_tail(text, chars, hint, resume=_grep_resume if name == "grep" else None)
+
+
+def clip_tool_results(messages: Sequence[Message], limit: int = _MAX_CHARS, window: int | None = None) -> list[Message]:
+    """The messages a provider receives: every tool result over its limit becomes its head+tail clip (clip_for_model;
+    ``window``: the context window, which a single result may take a share of).
 
     Pure per message, so one history always yields the same bytes for the same prefix (prompt caches can hit). The
     input list and its messages are untouched: the transcript and the session keep the full results.
@@ -872,7 +950,7 @@ def clip_tool_results(messages: Sequence[Message], limit: int = _MAX_CHARS) -> l
     out: list[Message] = []
     for m in messages:
         if m.role == "tool" and m.content:
-            clipped = clip_for_model(m.name, m.content, limit)
+            clipped = clip_for_model(m.name, m.content, limit, window)
             if clipped is not m.content:
                 m = dataclasses.replace(m, content=clipped)
         out.append(m)
@@ -923,13 +1001,17 @@ def _shown(path: Path, base: Path) -> str:
         return str(path)
 
 
-async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tuple[int, list[str], bytes, str, int]:
+async def _run_rg(
+    cmd: list[str], cwd: Path, base: Path, *, named: bool, limit: int | None = None, records: bool = False
+) -> tuple[int, list[str], bytes, str, int]:
     """``cmd`` (an rg argv with ``--null``) run in ``cwd``: (exit code, output lines, stderr, cut, withheld).
     ``named``: rg prints the file of each match (a directory search); each line then starts with it as :func:`_shown`
     relative to ``base`` and a NUL (a file name may hold a colon, which :func:`_group_by_file` must not cut at), and a
     file ``sensitive_path`` names is dropped, whatever glob or ignore file let rg reach it; ``withheld`` counts the
-    lines dropped so. Reading stops one line past MAX_SEARCH_RESULTS or at SEARCH_BUDGET_S, with rg killed; ``cut``
-    then says why the lines are partial."""
+    lines dropped so. Reading stops one line past ``limit`` (the model's head_limit, at most MAX_SEARCH_RESULTS) or at
+    SEARCH_BUDGET_S, with rg killed; ``cut`` then says why the lines are partial. ``records``: rg ends each file name
+    with a NUL and no newline (``-l --null``)."""
+    limit = min(limit or MAX_SEARCH_RESULTS, MAX_SEARCH_RESULTS)
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -949,7 +1031,10 @@ async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tupl
     try:
         while True:
             try:
-                raw = await asyncio.wait_for(proc.stdout.readline(), timeout=max(0.0, deadline - time.monotonic()))
+                read = proc.stdout.readuntil(b"\0") if records else proc.stdout.readline()
+                raw = await asyncio.wait_for(read, timeout=max(0.0, deadline - time.monotonic()))
+            except asyncio.IncompleteReadError as end:  # readuntil at the end of the output
+                raw = end.partial
             except TimeoutError:
                 cut = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(lines)} matching lines so far: {_NARROW}"
                 break
@@ -971,9 +1056,13 @@ async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tupl
                     continue
                 text = rest.rstrip(b"\n").decode("utf-8", errors="replace")
                 lines.append(f"{where}\0{text}")
-            if len(lines) > MAX_SEARCH_RESULTS:  # one past the cap proves the cut; stop rg instead of reading on
-                lines = lines[:MAX_SEARCH_RESULTS]
-                cut = f"truncated to the first {MAX_SEARCH_RESULTS} matching lines: {_NARROW}"
+            if len(lines) > limit:  # one past the cap proves the cut; stop rg instead of reading on
+                lines = lines[:limit]
+                cut = (
+                    f"truncated to the first {limit} matching lines: {_NARROW}"
+                    if limit == MAX_SEARCH_RESULTS
+                    else f"showing the first {limit} (head_limit); there are more"
+                )
                 break
         if cut:
             with contextlib.suppress(ProcessLookupError):
@@ -1029,6 +1118,16 @@ def _glob_list(value: Any) -> Any:
     return value
 
 
+def _positive_int(value: Any) -> int | None:
+    """``value`` when it is a positive whole number (not a bool), else None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _head_limit(arguments: dict[str, Any]) -> int | None:
+    """grep's and glob's head_limit: how many lines or paths to return; 0, a negative number or none given: all."""
+    return _positive_int(arguments.get("head_limit"))
+
+
 # an escaped pipe that is not part of a `\|\|` run (a literal pair of pipes on purpose) or after a backslash
 _BRE_ALTERNATION = re.compile(r"(?<![\\|])\\\|(?!\\\|)")
 # a wildcard, a brace group or an extension; an include with none of them is a word or a folder
@@ -1044,6 +1143,37 @@ def _no_match_hints(pattern: str, include: Any) -> str:
     if any(not _FILE_GLOB.search(inc) for inc in includes):
         hints.append("include is a file-name glob (one entry per glob in a list), not a folder or a language")
     return "; ".join(hints)
+
+
+#: Characters that make a pattern a regex; a backslash is left out (``\b`` and ``\w`` are meant as regex).
+_REGEX_CHARS = re.compile(r"[$^+*?()\[\]{}|]")
+
+
+async def _no_match_note(pattern: str, include: Any, cmd: list[str], cwd: Path, base: Path, took: float) -> str:
+    """:func:`_no_match_hints`, led by this one: the text of a regex that found nothing, taken literally, does occur
+    (``$5.00``, ``foo.bar[0]``, ``a+b``: the model meant it as text). One more search, run only after a miss and not
+    after a slow one, with the same filters as ``cmd`` (the rg argv of the search)."""
+    note = _no_match_hints(pattern, include)
+    text = pattern.removeprefix("(?i)")
+    if not _REGEX_CHARS.search(text) or took > SEARCH_BUDGET_S / 3:
+        return note
+    at = cmd.index("-e")
+    files, counts = "-l" in cmd[:at], "--count" in cmd[:at]
+    # -F, the names of the files whatever was searched, no context lines (a later -A/-B beats the search's own -C)
+    literal = [*cmd[:at], "-F", "--with-filename", "-A", "0", "-B", "0", *(["-i"] if text != pattern else [])]
+    _, lines, _, cut, _ = await _run_rg(
+        [*literal, "-e", text, *cmd[at + 2 :]], cwd, base, named=True, limit=20, records=files
+    )
+    if not lines:
+        return note
+    where, _, rest = lines[0].partition("\0")
+    first = where if files or counts else f"{where}:{rest.split(':', 1)[0]}"
+    found = (
+        f"its literal text occurs ({len(lines)}{'+' * bool(cut)} place{'s' * (len(lines) > 1 or bool(cut))}, "
+        f"first {first}): "
+        "escape ( ) [ ] { } . + * ? $ ^ | with a backslash"
+    )
+    return f"{found}; {note}" if note else found
 
 
 def _rg_remedy(stderr: bytes) -> str | None:
@@ -1067,6 +1197,10 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     path = _resolve_path(arguments.get("path", "."), cwd)
     include = _glob_list(arguments.get("include"))
     exclude = _glob_list(arguments.get("exclude"))
+    mode = arguments.get("output_mode") or "content"
+    if mode not in ("content", "files_with_matches", "count"):
+        return {"error": f"output_mode must be content, files_with_matches or count, got {mode!r}"}
+    limit = _head_limit(arguments)
     if sensitive_path(str(path)):
         return {"error": f"Hardline deny (sensitive-path): {path}"}
     if not path.exists():
@@ -1079,6 +1213,17 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         # the file of every match is known whatever its name holds.
         cmd = ["rg", "--null", "--line-number", "--no-heading", "--color=never", "--hidden", "-g", "!.git"]
         cmd += ["--max-columns", str(GREP_MAX_COLUMNS), "--max-columns-preview"]
+        cmd += ["--no-require-git"]  # a .gitignore holds outside a work tree too, as it does for glob (_rg_files)
+        if mode != "content":  # just the paths (-l stops at a file's first match), or `path NUL count`
+            cmd += ["-l"] if mode == "files_with_matches" else ["--count", "--with-filename"]
+        else:
+            context = [(f, n) for f in ("-A", "-B", "-C") if (n := _positive_int(arguments.get(f)))]
+            for flag, n in context:
+                cmd += [flag, str(n)]
+            if context:  # its `--` line has no file name: the parser would take it for one
+                cmd += ["--no-context-separator"]
+        if arguments.get("type"):
+            cmd += ["-t", str(arguments["type"])]
         if include:
             for inc in include if isinstance(include, list) else [include]:
                 cmd += ["-g", inc]
@@ -1108,14 +1253,20 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
             cmd += ["--iglob", glob]
         # -e and -- keep a pattern such as "--files" a literal search term, never an rg option
         cmd += ["-e", pattern, "--", _shown(target, run_dir) if target != run_dir else "."]
-        named = target.is_dir()
-        code, lines, stderr, cut, withheld = await _run_rg(cmd, run_dir, base, named=named)
+        listing = mode != "content"  # a file per line: rg names it even for a search of one file
+        named = target.is_dir() or listing
+        records = mode == "files_with_matches"
+        started = time.monotonic()
+        code, lines, stderr, cut, withheld = await _run_rg(
+            cmd, run_dir, base, named=named, limit=limit, records=records
+        )
+        took = time.monotonic() - started
         flag = _rg_remedy(stderr) if code == 2 and not lines else None
         retried = ""
         if flag:
             # rg names the flag that makes the pattern work (a "\n" needs -U, a look-around needs --pcre2): run it
             # once more with that flag rather than send the model to flags this tool has no argument for
-            again = await _run_rg([cmd[0], flag, *cmd[1:]], run_dir, base, named=named)
+            again = await _run_rg([cmd[0], flag, *cmd[1:]], run_dir, base, named=named, limit=limit, records=records)
             if again[0] in (0, 1):
                 (code, lines, stderr, cut, withheld), retried = (
                     again,
@@ -1123,8 +1274,12 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 )
             elif again[0] == 2 and not again[1]:
                 code, lines, stderr, cut, withheld = again  # the flag did not help: its error is the pattern's own
+        if mode == "count":
+            lines = [line.replace("\0", ":", 1) for line in lines]
+        elif listing:
+            lines = [line.partition("\0")[0] for line in lines]
         # a search of one file prints no path, so a line of its text could read like `path:12:`: leave those alone
-        text = ("\n".join(lines) if not named else _group_by_file(lines)).strip()
+        text = ("\n".join(lines) if not named or listing else _group_by_file(lines)).strip()
         if retried:
             text = f"{retried}\n{text}" if text else retried
         if cut:
@@ -1136,7 +1291,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         elif code not in (0, 1):  # 1 = no matches; 2 with no output is rg refusing the request (a bad regex)
             reason = stderr.decode("utf-8", errors="replace").strip().splitlines()
             return {"error": f"grep failed: {' '.join(line.strip() for line in reason[:6]) or 'rg exited 2'}"}
-        elif not text and not withheld and (hints := _no_match_hints(pattern, include)):
+        elif not text and not withheld and (hints := await _no_match_note(pattern, include, cmd, run_dir, base, took)):
             result = {"matches": "", "warnings": f"no matches. Check: {hints}"}
         else:
             result = {"matches": text}
@@ -1145,7 +1300,10 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         return result
     except OSError:  # no rg installed, or one that cannot start (no exec permission, a broken binary)
         # Python fallback: off the event loop, same tree rules as glob, capped, sensitive files skipped
-        return await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude, base)
+        found = await asyncio.to_thread(_grep_fallback, pattern, path, include, exclude, base, mode, limit)
+        if "matches" in found and (unsupported := [k for k in ("-A", "-B", "-C", "type") if arguments.get(k)]):
+            _note_withheld(found, f"{', '.join(unsupported)} ignored: ripgrep is not installed")
+        return found
 
 
 #: Directories glob and the grep fallback never enter, even inside a git work tree where .gitignore may not list
@@ -1357,6 +1515,55 @@ def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
     return {"files": sorted(found), **({"note": note} if note else {})}
 
 
+def _glob_ignored(path: Path, pattern: str) -> list[str]:
+    """Files under ``path`` that ``pattern`` matches and .gitignore hides from glob (untracked and ignored, not in a
+    skipped folder); [] outside a git work tree, when git is slow (a big ignored tree) or the pattern is no pathspec."""
+    import subprocess
+
+    specs = []
+    for pat in _expand_braces(pattern):
+        pat = "/".join(p for p in pat.split("/") if p not in ("", "."))
+        if pat:
+            specs += [f":(glob){pat}"] + ([] if pat.startswith("**/") else [f":(glob)**/{pat}"])
+    if not specs:
+        return []
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(path), "ls-files", "-oi", "--exclude-standard", "-z", "--", *specs],
+            capture_output=True,
+            timeout=1.5,  # an empty glob must stay quick: the walk of a huge ignored tree is not waited for
+            check=False,
+            env=child_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f] if out.returncode == 0 else []
+    return [
+        f
+        for f in found
+        if not SKIP_DIRS.intersection(f.split("/")[:-1])
+        and not _skipped_subpath(f)
+        and not sensitive_path(str(path / f))
+    ]
+
+
+def _glob_empty_note(path: Path, pattern: str) -> str:
+    """What a glob that found nothing may have missed: matches .gitignore hides, or a skipped folder the pattern names;
+    "" for a plain miss (a typo needs no explanation)."""
+    notes = []
+    if ignored := _glob_ignored(path, pattern):
+        notes.append(
+            f"{len(ignored)} ignored by .gitignore match ({', '.join(ignored[:2])}) and glob does not list ignored "
+            "files: use bash ls"
+        )
+    skipped = sorted(SKIP_DIRS.intersection(re.split(r"[/{},]", pattern)) - {".git"})
+    if skipped:
+        notes.append(
+            f"{', '.join(skipped)} is skipped (dependencies, caches): give path={skipped[0]} to search inside it"
+        )
+    return "; ".join(notes)
+
+
 #: The grep fallback treats a file with a NUL byte in its first _BINARY_SNIFF_BYTES as binary (as ripgrep does), reads
 #: in pieces of at most _GREP_PIECE_BYTES and looks at the clock every _GREP_CLOCK_BYTES: read_text of a 300 MB binary
 #: took 2.6 GB of memory and ran past the time budget.
@@ -1398,7 +1605,15 @@ def _grep_file(fp: Path, shown: str, rx: Any, deadline: float, *, named: bool = 
             yield f"{shown}\0{number}:{line}"
 
 
-def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: Path | None = None) -> dict[str, Any]:
+def _grep_fallback(
+    pattern: str,
+    path: Path,
+    include: Any,
+    exclude: Any,
+    base: Path | None = None,
+    mode: str = "content",
+    limit: int | None = None,
+) -> dict[str, Any]:
     import re
 
     includes = include if isinstance(include, list) else [include] if include else []
@@ -1415,6 +1630,8 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: P
     else:
         root, candidates = path, _iter_tree(path, deadline)
     matches: list[str] = []
+    counts: dict[str, int] = {}  # per file name, for the modes that list files
+    cap = min(limit or MAX_SEARCH_RESULTS, MAX_SEARCH_RESULTS)
     skipped = 0
     timed_out = False
     for rel, is_dir in candidates:
@@ -1432,18 +1649,29 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: P
             skipped += 1
             continue
         try:
-            for hit in _grep_file(fp, _shown(fp, base), rx, deadline, named=named):
+            name = _shown(fp, base)
+            for hit in _grep_file(fp, name, rx, deadline, named=named):
                 if hit is None:
                     timed_out = True
                     break
-                matches.append(hit)
-                if len(matches) > MAX_SEARCH_RESULTS:
-                    break
+                if mode == "content":
+                    matches.append(hit)
+                    if len(matches) > cap:
+                        break
+                else:
+                    counts[name] = counts.get(name, 0) + 1
+                    if mode == "files_with_matches":
+                        break
         except OSError:  # unreadable, or an index entry deleted from the work tree (see _git_files)
             continue
-        if timed_out or len(matches) > MAX_SEARCH_RESULTS:
+        if timed_out or len(matches) > cap or len(counts) > cap:
             break
-    shown, note = _capped(matches)
+    if mode != "content":
+        matches = [name if mode == "files_with_matches" else f"{name}:{n}" for name, n in counts.items()]
+    if len(matches) > cap < MAX_SEARCH_RESULTS:  # the model's head_limit, not the tool's cap
+        shown, note = matches[:cap], f"showing the first {cap} (head_limit); there are more"
+    else:
+        shown, note = _capped(matches)
     if timed_out:
         note = f"search stopped after {SEARCH_BUDGET_S:.0f} s with {len(shown)} matching lines so far: {_NARROW}"
     result: dict[str, Any] = {"matches": _group_by_file(shown), **({"warnings": note} if note else {})}
@@ -1486,6 +1714,8 @@ async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     ``{a,b}`` groups are expanded, and an absolute pattern searches from the directory its first wildcard is under."""
     pattern = arguments["pattern"]
     path = _resolve_path(arguments.get("path", "."), cwd)
+    if pattern.startswith("~"):  # ~/notes/*.txt: the permission check expands it the same way (_glob_base)
+        pattern = os.path.expanduser(pattern)
     if pattern.startswith("/"):  # /repo/src/**/*.py: the part before the first wildcard is the directory to search
         parts = pattern.split("/")
         fixed = next((i for i, part in enumerate(parts) if any(c in part for c in "*?[{")), len(parts) - 1)
@@ -1498,7 +1728,16 @@ async def tool_glob(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     # relative to the session's directory, as grep prints them and read takes them (not to ``path``, which made a hit
     # in a subdirectory a path that read could not open)
     base = Path(cwd) if cwd else Path.cwd()
-    return {**res, "files": [_shown(path / f, base) for f in res["files"]]} if "files" in res else res
+    if "files" not in res:
+        return res
+    files = [_shown(path / f, base) for f in res["files"]]
+    note = res.get("note", "")
+    if (limit := _head_limit(arguments)) and len(files) > limit:
+        cut = f"showing the first {limit} of {len(files)} (head_limit)"
+        files, note = files[:limit], f"{note}; {cut}" if note else cut
+    elif not files and not note:
+        note = await asyncio.to_thread(_glob_empty_note, path, pattern)
+    return {**res, "files": files, **({"note": note} if note else {})}
 
 
 TODO_STATUSES = ("pending", "in_progress", "completed")
@@ -1602,12 +1841,19 @@ def register_todo(reg: ToolRegistry, state: dict[str, Any] | None = None) -> Tod
 async def tool_bash_output(
     arguments: dict[str, Any], *, cwd: Path | None = None, session_id: str = ""
 ) -> dict[str, Any]:
-    """New output of a background job since the last read, and whether it still runs."""
+    """New output of a background job since the last read, and whether it still runs. ``wait``: seconds to block for
+    some when there is none yet (at most MAX_WAIT_S)."""
     from k3code.tools import jobs
 
-    res = await jobs.REGISTRY.read(session_id, str(arguments["job_id"]))
+    try:
+        asked = float(arguments.get("wait") or 0)
+    except (TypeError, ValueError):
+        return {"error": f"wait must be a number of seconds, got {arguments['wait']!r}"}
+    res = await jobs.REGISTRY.read(session_id, str(arguments["job_id"]), max(0.0, min(asked, MAX_WAIT_S)))
     if isinstance(res.get("content"), str):  # the same clean-up bash output gets: colour codes, progress-bar redraws
         res = {**res, "content": _collapse_redraws(_ANSI.sub("", res["content"]))}
+        if asked > MAX_WAIT_S:
+            res["content"] += f"\n[wait {asked:g} was cut to {MAX_WAIT_S}: it is in seconds]"
     return res
 
 
@@ -1738,12 +1984,19 @@ def build_registry() -> ToolRegistry:
         ToolSpec(
             name="bash_output",
             description="Output a background bash job printed since the last read, and whether it still runs "
-            "(or its exit code).\n"
+            "(or its exit code). A quiet job: pass wait instead of polling it again and again.\n"
             f"Limits: keeps the newest {MAX_UNREAD_BYTES // 1024} KB of unread output per job; you see at most "
             f"{MAX_TOOL_RESULT_CHARS} chars (head and tail).",
             parameters={
                 "type": "object",
-                "properties": {"job_id": {"type": "string", "description": "From bash with background: true"}},
+                "properties": {
+                    "job_id": {"type": "string", "description": "From bash with background: true"},
+                    "wait": {
+                        "type": "number",
+                        "description": f"Seconds to block (max {MAX_WAIT_S}) until the job prints something or exits, "
+                        "when it has printed nothing yet: use it instead of polling a quiet job",
+                    },
+                },
                 "required": ["job_id"],
             },
             side_effect=False,
@@ -1769,7 +2022,8 @@ def build_registry() -> ToolRegistry:
             name="grep",
             description="Search for a regex in files (ripgrep; .gitignore is respected). Each file's path once, "
             "then line:text of its matches.\n"
-            f"Limits: stops after 10 s; you see at most {MAX_TOOL_RESULT_CHARS} chars (head and tail).",
+            f"Limits: stops after 10 s; you see at most {MAX_TOOL_RESULT_CHARS} chars (head and tail); "
+            "head_limit and output_mode give less.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -1777,6 +2031,12 @@ def build_registry() -> ToolRegistry:
                     "path": {"type": "string", "default": "."},
                     "include": {"type": ["string", "array"], "items": {"type": "string"}},
                     "exclude": {"type": ["string", "array"], "items": {"type": "string"}},
+                    "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"]},
+                    "head_limit": {"type": "integer"},
+                    "-A": {"type": "integer"},
+                    "-B": {"type": "integer"},
+                    "-C": {"type": "integer"},
+                    "type": {"type": "string"},
                 },
                 "required": ["pattern"],
             },
@@ -1787,7 +2047,8 @@ def build_registry() -> ToolRegistry:
     reg.register(
         ToolSpec(
             name="glob",
-            description="Find files matching a glob pattern (recursive under path).\n"
+            description="Find files matching a glob pattern (recursive under path); files .gitignore ignores are not "
+            "listed.\n"
             "Limits: paths relative to the session directory, as grep prints them; you see at most "
             f"{MAX_TOOL_RESULT_CHARS} chars (head and tail).",
             parameters={
@@ -1795,6 +2056,7 @@ def build_registry() -> ToolRegistry:
                 "properties": {
                     "pattern": {"type": "string"},
                     "path": {"type": "string", "default": "."},
+                    "head_limit": {"type": "integer"},
                 },
                 "required": ["pattern"],
             },

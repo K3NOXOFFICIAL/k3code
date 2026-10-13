@@ -259,6 +259,30 @@ _MANAGED_NOTE = re.compile(r"<!-- managed by k3code;[^>]*-->[ \t]*\n?")
 _MANAGED_END = re.compile(r"^[ \t]*<!-- /k3code:auto -->[ \t]*(?:\n|$)", re.MULTILINE)
 #: The begin and end lines `k3code setup` writes around the block it rewrites (setup.steps.USER_MD_BEGIN/END).
 _SETUP_MARKER = re.compile(r"^[ \t]*<!-- k3code:setup (?:begin\b.*?|end) -->[ \t]*(?:\n|$)", re.MULTILINE)
+#: What the first distill writes into a USER.md that had nothing yet (learning.distiller.write_auto_section), as the
+#: model is shown it: a section with nothing in it.
+_NOTHING_LEARNED = "## Learned preferences (auto)\n- (nothing learned yet)"
+
+
+def _user_body(text: str) -> str:
+    """The user's memory as the model sees it: the notes k3code puts above the sections it rewrites, and the marker
+    that ends them, are for whoever edits the file, not for the model."""
+    return _SETUP_MARKER.sub("", _MANAGED_END.sub("", _MANAGED_NOTE.sub("", text))).strip()
+
+
+def _frozen_files(files: list[MemoryFile], frozen: dict[str, Any], cwd: str | Path) -> list[MemoryFile]:
+    """``files`` as the session first saw them: the user's file by its text (``""``: there was none, and its first
+    appearance, the first distill, waits like its later rewrites), the project's and the rules' as a set (a file the
+    model or a checkout changes, adds or removes is not seen until the prompt is refreshed; ``user_memory`` and
+    ``project_memory`` are the keys ``/memory add`` and an accepted proposal drop). The set is kept with the directory
+    it was read for, so a copy of the dict in another directory (a sub-agent's worktree) reads its own."""
+    user = next((m for m in files if m.scope == "user"), None)
+    text = frozen.setdefault("user_memory", user.text if user else "")
+    mine = [MemoryFile("user", user.path if user else user_memory_path(), text)] if text else []
+    here = str(Path(cwd).resolve())
+    if frozen.get("project_memory", ("",))[0] != here:
+        frozen["project_memory"] = (here, tuple(m for m in files if m.scope != "user"))
+    return [*mine, *frozen["project_memory"][1]]
 
 
 def memory_prompt(
@@ -273,18 +297,21 @@ def memory_prompt(
 
     Each file is capped at ``limit`` characters and all of them together at ``total``; past that the rest are left
     out with one marker line. ``learned``: the learned notes to show (a session's snapshot, see
-    ``LiveSession.learned_notes``); None reads learned.md now. ``frozen``: a session's dict that keeps the user memory
-    file's text as the session first saw it (the daily distill rewrites it from any session; the project's files are
-    the repository's and are read each time).
+    ``LiveSession.learned_notes``); None reads learned.md now. ``frozen``: a session's dict that keeps the memory files
+    as the session first saw them: the user's (the daily distill rewrites it from any session) and the project's and
+    rules' (the model's own edit of AGENTS.md, a checkout or an editor changes them). Every change to the prompt makes
+    the provider re-write the whole cached conversation, so they are read again where the history is rewritten anyway
+    (``LiveSession.refresh_prompt_inputs``) and where the user wrote one on purpose (``/memory add``).
     """
     parts = []
     root = project_root(cwd)
     files = load_memory(cwd, max_chars=min(limit, total))  # what a file can contribute; the rest is never read
+    if frozen is not None:
+        files = _frozen_files(files, frozen, cwd)
+    files = [m for m in files if not (m.scope == "user" and _user_body(m.text) == _NOTHING_LEARNED)]
     left = total
     for i, m in enumerate(files):
         text = m.text
-        if frozen is not None and m.scope == "user":
-            text = frozen.setdefault("user_memory", text)
         body = text if len(text) <= limit else text[:limit] + "\n…(truncated)"
         if left <= 0:
             parts.append(TOTAL_MARKER.format(n=len(files) - i, cap=total))
@@ -293,10 +320,7 @@ def memory_prompt(
             body = body[:left] + "\n…(truncated)"
         left -= len(body)
         if m.scope == "user":
-            # the note k3code puts above the sections it rewrites, and the marker that ends them, are for whoever
-            # edits the file, not for the model
-            body = _SETUP_MARKER.sub("", _MANAGED_END.sub("", _MANAGED_NOTE.sub("", body))).strip()
-            parts.append(f"## User memory\n\n{body}")
+            parts.append(f"## User memory\n\n{_user_body(body)}")
             continue
         try:
             name = m.path.relative_to(root).as_posix()

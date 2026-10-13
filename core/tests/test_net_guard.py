@@ -92,8 +92,9 @@ def test_the_host_is_the_idna2008_name_httpx_connects_to():
 
 
 def test_an_unresolvable_name_is_refused():
-    with pytest.raises(BlockedURL, match="nowhere.test could not be resolved"):
+    with pytest.raises(BlockedURL) as err:
         check_url("http://nowhere.test/")
+    assert str(err.value) == "could not resolve nowhere.test (DNS failed: no network or no such host)"
 
 
 def test_an_ipv6_zone_id_literal_is_refused():

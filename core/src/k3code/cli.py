@@ -753,14 +753,29 @@ def _unanswered_note(result: dict[str, Any]) -> str:
     usually reports it as its own failure, so the person who ran it hears the way out too. "" when none were."""
     from k3code.permissions.engine import HEADLESS_ASK_DENIED
 
-    refused = [t for t in result.get("tools") or [] if HEADLESS_ASK_DENIED in str(t.get("result") or "")]
+    plain: list[dict[str, Any]] = []  # a bare ask: `--permission auto` answers it
+    person: list[dict[str, Any]] = []  # an ask with its own reason (outside the project, a credential file) in front
+    for t in result.get("tools") or []:
+        before, found, _ = str(t.get("result") or "").partition(HEADLESS_ASK_DENIED)
+        if found:
+            (person if before.removeprefix("Error:").strip() else plain).append(t)
+    refused = plain + person
     if not refused:
         return ""
-    names = ", ".join(sorted({str(t.get("name")) for t in refused}))
+
+    def named(calls: list[dict[str, Any]]) -> str:
+        return ", ".join(sorted({str(t.get("name")) for t in calls}))
+
+    head = f"k3code: {len(refused)} tool call(s) ({named(refused)}) were refused: a -p run cannot ask for approval."
+    sandbox = "bash in the sandbox; deny rules and the hardline list still refuse"
+    person_way = "a path inside the project, or a person to confirm them in an interactive run"
+    if not person:
+        return f"{head} `--permission auto` allows them ({sandbox}), or set headless_permission in the config."
+    if not plain:
+        return f"{head} `--permission auto` would not change that: they need {person_way}."
     return (
-        f"k3code: {len(refused)} tool call(s) ({names}) were refused: a -p run cannot ask for approval. "
-        "`--permission auto` allows them (bash in the sandbox; deny rules and the hardline list still refuse), or set "
-        "headless_permission in the config."
+        f"{head} {len(plain)} ({named(plain)}) would pass with `--permission auto` ({sandbox}) or headless_permission "
+        f"in the config; {len(person)} ({named(person)}) need {person_way}."
     )
 
 

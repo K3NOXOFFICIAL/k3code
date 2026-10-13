@@ -19,7 +19,7 @@ from k3code.paths import home as k3code_home
 from k3code.permissions import EXIT_PLAN_TOOL, Decision, PermissionMode
 from k3code.permissions.engine import inside_roots
 from k3code.permissions.state import PermissionState
-from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall, Usage
+from k3code.providers.types import INVALID_TOOL_CALL, Message, StreamEvent, ToolCall, Usage, unique_call_ids
 from k3code.reliability import Reliability, ReliabilitySettings, sandbox
 from k3code.reliability.loopguard import Verdict
 from k3code.router import Router, RouterEvent
@@ -34,6 +34,7 @@ from k3code.tools import (
     build_registry,
     clip_tool_results,
     format_tool_result,
+    shrink_result,
 )
 from k3code.tools.validate import LEGACY_ARGUMENTS, invalid_arguments, normalize_arguments
 from k3code.userhooks import HookOutcome, HookRunner
@@ -154,6 +155,8 @@ class AgentLoop:
         self._continuations = 0  # "continue" nudges after a text answer cut off by the output limit
         self._widened = False  # the output limit was raised once after a reply that used all of it without writing
         self._last_request: tuple[list[Message], list[Any]] | None = None  # what the model call in flight was sent
+        #: estimated tokens of the request _request_messages built last (None: no window); see _reply_limit
+        self._request_used: int | None = None
         #: the consecutive failed calls behind _tool_errors: (call, first error line), listed when the turn stops
         self._failed: list[tuple[str, str]] = []
         self.failed_calls = 0  # how many calls that was (only the last MAX_LISTED_FAILURES are kept in the list)
@@ -351,13 +354,14 @@ class AgentLoop:
             specs = self.tool_specs()
             request = await self._request_messages(messages, specs)
             self._last_request = (request, specs)
+            reply_limit = self._reply_limit(max_tokens)  # the output limit of this request: the window may allow less
             stream = self._metered(
                 self.reliability.stream(
                     self.router,
                     request,
                     specs,
                     model=model,
-                    max_tokens=max_tokens,
+                    max_tokens=reply_limit,
                     temperature=temperature,
                 )
             )
@@ -389,6 +393,7 @@ class AgentLoop:
                     tool_calls.append(event.tool_call)
                 elif event.type == "done" and event.message:
                     final_message = event.message
+                    unique_call_ids(final_message, messages)  # before anything stores or echoes the calls' ids
                     # M2: usage accounting + budget check from every completion.
                     self._record_usage(event)
                     self._check_budgets("after model completion")
@@ -447,18 +452,23 @@ class AgentLoop:
                         ceiling = MAX_WIDENED_TOKENS
                         if self.context_window:
                             ceiling = min(ceiling, max(1024, self.context_window // 4))
-                        if not self._widened and max_tokens < ceiling:
+                        # the window left less than the cap (see _reply_limit): a larger cap would be clamped to the
+                        # same room, an identical paid call
+                        boxed_in = reply_limit < max_tokens
+                        if not self._widened and not boxed_in and max_tokens < ceiling:
                             self._widened = True
                             max_tokens = min(max_tokens * 2, ceiling)
                             logger.info("Reply used the whole output limit without text: retrying with %d", max_tokens)
                             continue
                         advice = (
-                            "Lower /effort, split the request, or use a model with a larger context window."
+                            "The window leaves no more room: /compact, split the request, or lower /effort."
+                            if boxed_in
+                            else "Lower /effort, split the request, or use a model with a larger context window."
                             if max_tokens >= ceiling < MAX_WIDENED_TOKENS
                             else "Raise max_tokens in the config, lower /effort, or split the request."
                         )
                         note = (
-                            f"[The model used its whole {max_tokens}-token output limit before writing an answer. "
+                            f"[The model used its whole {reply_limit}-token output limit before writing an answer. "
                             f"{advice}]"
                         )
                         final_message = Message(role="assistant", content=note, usage=final_message.usage)
@@ -835,8 +845,9 @@ class AgentLoop:
         """What the provider is sent: long tool results clipped, and once the request passes ``elide_at_ratio`` of the
         context window, old tool results elided. ``messages`` (transcript, session) keeps every full result."""
         wire = context_budget.shrink_cut_calls(
-            clip_tool_results(messages, self.tool_output_chars or MAX_TOOL_RESULT_CHARS)
+            clip_tool_results(messages, self.tool_output_chars or MAX_TOOL_RESULT_CHARS, self.context_window)
         )
+        self._request_used = None
         if not self.context_window:
             return wire
         # Elide in batches, because every elision rewrites the request from that message on (the provider's prompt
@@ -857,14 +868,67 @@ class AgentLoop:
         )
         overhead = context_budget.overhead_tokens(f"{self.system_prompt}\n\n{self.system_suffix}", specs)
         threshold = self.context_window * self.elide_at_ratio
-        if overhead + context_budget.message_tokens(view) > threshold:
+        used = overhead + context_budget.message_tokens(view)
+        if used > threshold:
             keep = set(self._pinned)
             if self.decide_context is not None:
                 keep |= await self._ask_decision_model(wire, threshold - overhead)
             view = context_budget.elide_old_results(
                 wire, over=True, elided=self._elided, keep=keep, notes=self._notes, window=self.context_window
             )
+            used = overhead + context_budget.message_tokens(view)
+        view, self._request_used = self._fit_to_window(view, overhead, used)
         return view
+
+    def _fit_to_window(self, view: list[Message], overhead: int, used: int) -> tuple[list[Message], int]:
+        """``view`` with tool results cut down where the request, after the elision, still does not fit the window, and
+        its estimated tokens. What elision cannot take away (the newest results, a pinned skill) filled a small window
+        and left no turn possible, and ``/compact`` had nothing to fold. A result cut down stays cut down (``clip:<id>``
+        in ``_elided``, which a session keeps), so the request prefix changes only when more is cut; the largest
+        results go first, to SHRINK_SHARE of the window each, until the request is within FIT_TARGET_RATIO of it."""
+        window = self.context_window or 0
+        marked = {k[5:] for k in self._elided if k.startswith("clip:")}
+        last = next((i for i in range(len(view) - 1, -1, -1) if view[i].role == "assistant"), -1)
+        out = list(view) if marked or used > window * context_budget.FIT_AT_RATIO else view
+        cut = context_budget.SHRINK_SHARE, context_budget.SHRINK_FLOOR_CHARS
+        # earlier cuts, for results the model has seen (a provider that reuses call ids must not catch the new ones)
+        for i, m in enumerate(out):
+            if m.role == "tool" and m.content and m.tool_call_id in marked and i < last:
+                chars = context_budget.result_chars(m.content, window, *cut)
+                out[i] = replace(m, content=shrink_result(m.name, m.content, chars))
+                used -= context_budget.text_tokens(m.content) - context_budget.text_tokens(out[i].content or "")
+        if used <= window * context_budget.FIT_AT_RATIO:
+            return out, used
+        by_size = sorted(
+            (-context_budget.text_tokens(m.content), i)
+            for i, m in enumerate(out)
+            if m.role == "tool" and m.content and m.tool_call_id and m.tool_call_id not in marked
+        )
+        for _, i in by_size:  # the largest first (the older of two equal ones)
+            if used <= window * context_budget.FIT_TARGET_RATIO:
+                break
+            m = out[i]
+            chars = context_budget.result_chars(m.content or "", window, *cut)
+            if chars >= len(m.content or ""):
+                continue
+            out[i] = replace(m, content=shrink_result(m.name, m.content or "", chars))
+            used -= context_budget.text_tokens(m.content or "") - context_budget.text_tokens(out[i].content or "")
+            self._elided.add(f"clip:{m.tool_call_id}")
+            logger.info("Request over the window: result %s cut to %d chars", m.tool_call_id, chars)
+        return out, used
+
+    def _reply_limit(self, cap: int) -> int:
+        """``cap`` tokens of reply, fewer when the window leaves fewer after the request just built: a provider rejects
+        a request whose prompt and ``max_tokens`` together pass the window (a 6 700-token prompt with max_tokens 2000 in
+        an 8k window). The estimate is rough (it counts English prose about a tenth high), so 2% of the window and a few
+        tokens stay free, and the reply is never limited below REPLY_MIN_TOKENS: an estimate that leaves less room than
+        that is as likely too large as too small. A request that does not fit the window itself fails either way, and an
+        overflow is compacted and retried."""
+        used = self._request_used
+        if not self.context_window or used is None:
+            return cap
+        room = self.context_window - used - self.context_window // 50 - 32
+        return min(cap, max(room, context_budget.REPLY_MIN_TOKENS))
 
     async def _ask_decision_model(self, wire: list[Message], budget: float) -> set[str]:
         """Ids of old results the decision model keeps whole (its notes for the others go to ``_notes``). What it keeps
@@ -1045,8 +1109,9 @@ class AgentLoop:
 
     def _observe_result(self, tc: ToolCall, result: dict[str, Any], notes: list[Message]) -> Failure | None:
         """Tell the learning hook and the loop guard how a call went; queue into ``notes`` the hook's lesson for the
-        failure (once per signature per run) and the guard's reminder (one per step: the request guard's note, when
-        there is one, already says to change approach; a lesson does not count against it)."""
+        failure (once per signature per run, and not when the conversation already holds it) and the guard's reminder
+        (one per step: the request guard's note, when there is one, already says to change approach; a lesson does not
+        count against it)."""
         tag = "[learned] "
         failure = failure_of(tc.name, tc.arguments, result)
         if self.on_tool_outcome is not None:
@@ -1057,7 +1122,10 @@ class AgentLoop:
                 learned = None
             if learned and failure is not None and (tc.name, failure.signature) not in self._learned:
                 self._learned.add((tc.name, failure.signature))
-                notes.append(Message(role="system", content=tag + learned))
+                # not again when an earlier turn of the session (the history of this run) already holds the lesson: five
+                # turns of the same failure left five identical notes in every later request
+                if not any(m.role == "system" and m.content == tag + learned for m in self.turn_messages):
+                    notes.append(Message(role="system", content=tag + learned))
         digest = hashlib.sha1(str(format_tool_result(result)).encode("utf-8", "replace")).hexdigest()[:12]
         outcome = self.reliability.observe_tool_result(
             tc, failure.signature if failure else None, describe_call(tc.name, tc.arguments), digest

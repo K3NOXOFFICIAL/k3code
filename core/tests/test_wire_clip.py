@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 from k3code import prompting
 from k3code.agent.loop import AgentLoop
+from k3code.context_budget import text_tokens
 from k3code.gateway.server import _estimate_tokens
 from k3code.providers.types import Message, StreamEvent, ToolCall, Usage, messages_to_openai
 from k3code.reliability import Reliability
@@ -209,8 +210,8 @@ def test_the_volatile_part_of_the_system_prompt_comes_last(tmp_path, monkeypatch
 def test_compaction_counts_a_tool_result_as_the_model_receives_it():
     big = "z" * 35_000
     tool_msg = {"role": "tool", "content": big, "tool_call_id": "c", "name": "bash"}
-    assert _estimate_tokens([tool_msg]) == len(clip_for_model("bash", big)) // 4
-    assert _estimate_tokens([{"role": "user", "content": big}]) == 35_000 // 4
+    assert _estimate_tokens([tool_msg]) == text_tokens(clip_for_model("bash", big))
+    assert _estimate_tokens([{"role": "user", "content": big}]) == text_tokens(big)
 
 
 async def test_after_compaction_a_turn_sends_the_summary_and_the_tail_not_the_old_history(tmp_path, monkeypatch):

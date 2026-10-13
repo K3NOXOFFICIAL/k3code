@@ -988,3 +988,35 @@ def test_workdir_is_tagged_with_the_pid_and_removed_at_close(tmp_path: Path, mon
     assert cwd.name.startswith(f"k3code-claude-cli.{os.getpid()}.")
     asyncio.run(prov.aclose())
     assert not cwd.exists()
+
+
+async def test_a_conversation_waiting_for_its_tools_keeps_its_process_when_the_pool_is_full(
+    pshim: Path, tmp_path: Path
+) -> None:
+    """A parent whose sub-agents run is idle between its reply and their results. Taking its slot for a sub-agent
+    meant its next call rendered the whole conversation to a new process; the newcomer runs one-shot instead."""
+    p = ClaudeCliProvider(name="cc", command=str(pshim), max_sessions=1)
+    parent = [Message(role="system", content="SYS"), Message(role="user", content="delegate the work")]
+    a1 = await _step(p, parent, tmp_path, _bash("ls"))  # the reply asks for tools: the parent waits for them
+    (waiting,) = p._pool
+    await _step(p, [Message(role="user", content="a sub-agent's task")], tmp_path, "child answer")
+    spawns = _lines(tmp_path, ".spawns")
+    assert len(spawns) == 2 and "--input-format" not in spawns[1]["argv"]  # a one-shot process, not a pooled one
+    assert p._pool == [waiting] and waiting.proc.returncode is None
+    results = [Message(role="tool", content="a.py", tool_call_id=c.id, name="bash") for c in a1.tool_calls]
+    await _step(p, [*parent, a1, *results], tmp_path, "all done")
+    sent = _lines(tmp_path, ".msgs")
+    assert len(_lines(tmp_path, ".spawns")) == 2 and sent[-1]["pid"] == waiting.proc.pid
+    assert "delegate the work" not in sent[-1]["text"] and sent[-1]["text"].startswith("[tool result 1/1: bash")
+    await _close_and_check(p, tmp_path)
+
+
+async def test_a_finished_conversation_still_makes_room_for_a_waiting_one(pshim: Path, tmp_path: Path) -> None:
+    p = ClaudeCliProvider(name="cc", command=str(pshim), max_sessions=2)
+    parent = [Message(role="user", content="delegate the work")]
+    await _step(p, parent, tmp_path, _bash("ls"))  # waiting for its tools
+    await _step(p, [Message(role="user", content="first child")], tmp_path, "done")  # finished, still pooled
+    pids = [s["pid"] for s in _lines(tmp_path, ".spawns")]
+    await _step(p, [Message(role="user", content="second child")], tmp_path, "done")  # takes the finished one's slot
+    assert len(_lines(tmp_path, ".spawns")) == 3 and _alive(pids[0]) and not _alive(pids[1]) and len(p._pool) == 2
+    await _close_and_check(p, tmp_path)

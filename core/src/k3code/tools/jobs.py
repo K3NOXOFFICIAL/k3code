@@ -20,6 +20,8 @@ from typing import Any
 MAX_UNREAD_BYTES = 1024 * 1024
 #: Last output bytes kept per job for the process list's preview (independent of what bash_output has read).
 TAIL_BYTES = 2048
+#: The most seconds one ``bash_output`` call blocks for new output (its ``wait``).
+MAX_WAIT_S = 60
 
 
 @dataclass
@@ -36,6 +38,7 @@ class Job:
     cwd: str = ""
     exited_at: float | None = None
     tail: bytearray = field(default_factory=bytearray)
+    activity: asyncio.Event = field(default_factory=asyncio.Event)  # set by new output and by the exit (a read's wait)
 
     @property
     def running(self) -> bool:
@@ -49,6 +52,7 @@ class Job:
             self.dropped += over
         self.tail += chunk
         del self.tail[:-TAIL_BYTES]
+        self.activity.set()
 
     def info(self) -> dict[str, Any]:
         return {
@@ -127,25 +131,37 @@ class JobRegistry:
                 job.feed(chunk)
         job.exit_code = await job.proc.wait()
         job.exited_at = time.time()
+        job.activity.set()
 
     def get(self, session_id: str, job_id: str) -> Job | None:
         """The job, only for the session that started it."""
         job = self._jobs.get(job_id)
         return job if job is not None and job.session_id == session_id else None
 
-    async def read(self, session_id: str, job_id: str) -> dict[str, Any]:
+    async def read(self, session_id: str, job_id: str, wait: float = 0.0) -> dict[str, Any]:
+        """What the job printed since the last read. ``wait`` (seconds): when it has printed nothing and still runs,
+        block until it prints something or exits, for at most this long."""
         job = self.get(session_id, job_id)
         if job is None:
             return {"error": f"no job {job_id!r} in this session (jobs: {self._ids_of(session_id) or 'none'})"}
         await asyncio.sleep(0)  # let the reader take what the pipe already holds
+        if wait > 0 and job.running and not job.unread:
+            job.activity.clear()  # no await between the check and the clear: output arriving later sets it again
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(job.activity.wait(), timeout=wait)
         text = bytes(job.unread).decode("utf-8", errors="replace")
         job.unread.clear()
         dropped, job.dropped = job.dropped, 0
-        state = f"running (pid {job.proc.pid})" if job.running else f"exited with code {job.exit_code}"
+        # the age makes an idle poll differ from the last one: the same words twice read as a loop (loop guard)
+        if job.running:
+            state = f"running (pid {job.proc.pid}) for {_age(time.time() - job.started)}"
+        else:
+            state = f"exited with code {job.exit_code}"
         parts = [f"[{job.id} {state}]"]
         if dropped:
             parts.append(f"[{dropped} bytes of output were dropped: read sooner to keep them]")
-        parts.append(text.rstrip("\n") if text else "(no new output)")
+        idle = "(no new output; pass wait to block until there is some)" if job.running else "(no new output)"
+        parts.append(text.rstrip("\n") if text else idle)
         return {"content": "\n".join(parts)}
 
     async def kill(self, session_id: str, job_id: str) -> dict[str, Any]:
@@ -192,6 +208,12 @@ class JobRegistry:
         return ", ".join(j.id for j in self._jobs.values() if j.session_id == session_id)
 
 
+def _age(seconds: float) -> str:
+    """``45s``, ``3m05s``: how long a job has run."""
+    n = max(0, int(seconds))
+    return f"{n}s" if n < 60 else f"{n // 60}m{n % 60:02d}s"
+
+
 async def _stop(job: Job) -> None:
     from k3code.tools import _kill_group
 
@@ -203,6 +225,7 @@ async def _stop(job: Job) -> None:
         job.exit_code = job.proc.returncode
     if job.exited_at is None:
         job.exited_at = time.time()
+    job.activity.set()
 
 
 #: The process-wide registry (the gateway serves every session from one event loop).

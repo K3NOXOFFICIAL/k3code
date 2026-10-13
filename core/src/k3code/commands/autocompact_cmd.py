@@ -189,7 +189,9 @@ class AutoCompactCommand(CommandDef):
 
     @staticmethod
     def _model(ctx: Any, live: Any) -> str:
-        return ctx._active_model(live) if live is not None else ctx.config.default_model
+        """The model whose window the session is compacted by: the smallest one its next turn can run on (the trigger's
+        own choice), not the first model of the main tier."""
+        return ctx._compaction_model(live) if live is not None else ctx.config.default_model
 
     def _status(self, ctx: Any, live: Any) -> str:
         policy = autocompact_policy(ctx.config, live.stored.meta.get("autocompact") if live is not None else None)

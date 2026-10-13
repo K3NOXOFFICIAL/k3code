@@ -38,12 +38,20 @@ def test_grep_and_glob_are_plain_lists_and_say_when_empty():
     assert format_tool_result({"matches": ""}) == "(no matches)"
     assert format_tool_result({"matches": "a.py:1:x", "warnings": "2 files skipped"}) == "a.py:1:x\n[2 files skipped]"
     assert format_tool_result({"files": ["a.py", "src/b.py"]}) == "a.py\nsrc/b.py"
-    assert format_tool_result({"files": []}).startswith("(no files; ")  # says which directories glob skips
+    assert format_tool_result({"files": []}) == "(no files)"  # a plain miss needs no explanation
+    assert format_tool_result({"files": [], "note": "why"}) == "(no files)\n[why]"
+    # rg's stderr lines (an unreadable directory) are one bracket each, not a list repr
+    denied = ["rg: ./a: Permission denied", "rg: ./b: Permission denied"]
+    shown = format_tool_result({"matches": "", "warnings": denied})
+    assert shown == "[rg: ./a: Permission denied]\n[rg: ./b: Permission denied]"
 
 
-def test_an_empty_glob_names_the_cache_folders_it_skips_tracked_files_in_them_too():
-    shown = format_tool_result({"files": []})
-    assert ".terraform" in shown and "tracked files in them too" in shown
+async def test_an_empty_glob_names_a_skipped_folder_the_pattern_asks_for(tmp_path):
+    (tmp_path / ".terraform").mkdir()
+    (tmp_path / ".terraform" / "main.tf").write_text("x\n")
+    shown = format_tool_result(await tool_glob({"pattern": ".terraform/*.tf"}, cwd=tmp_path))
+    assert ".terraform is skipped" in shown and "path=.terraform" in shown
+    assert format_tool_result(await tool_glob({"pattern": "*.tf"}, cwd=tmp_path)) == "(no files)"
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")

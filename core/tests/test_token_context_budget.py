@@ -535,7 +535,9 @@ def test_at_most_six_of_the_newest_results_are_protected_whatever_the_window():
     from k3code.context_budget import ELIDE_KEEP_CALLS, kept_calls
 
     asst = Message(role="assistant", content=None)
-    many = [asst, *(Message(role="tool", content="x", tool_call_id=f"t{i}", name="read") for i in range(30))]
+    # one result per step: the model has seen the older ones (a batch of results it has not seen yet is protected
+    # beyond six while it fits a share of the window: see tests/test_elision_twelfth.py)
+    many = [m for i in range(30) for m in (asst, Message(role="tool", content="x", tool_call_id=f"t{i}", name="read"))]
     assert kept_calls(many, 10_000_000) == ELIDE_KEEP_CALLS == 6
 
 
@@ -585,6 +587,9 @@ def test_a_loaded_skill_and_a_sub_agents_report_are_not_elided_like_old_bash_out
         if m.role == "tool"
     }
     assert out["c0"].startswith("# Skill: migrate") and out["c1"].startswith("Callers of old_api")
-    assert out["c2"].startswith("[earlier skill result elided"), "a skill past the size cap is elided like the rest"
+    assert out["c2"].startswith("# Skill: huge"), "a skill is the method for the whole task: pinned whatever its size"
     assert out["c3"].startswith("[earlier bash result elided")
-    assert {m.tool_call_id for m in elision_candidates(msgs, elided=set())} == {"c2", *(f"c{i}" for i in range(3, 14))}
+    assert {m.tool_call_id for m in elision_candidates(msgs, elided=set())} == {f"c{i}" for i in range(3, 14)}
+    big_report = step(20, "task", "Callers of old_api: " + "t" * (PINNED_RESULT_CHARS + 1))
+    msgs = [*msgs[:1], *big_report, *msgs[1:]]
+    assert {m.tool_call_id for m in elision_candidates(msgs, elided=set())} >= {"c20"}  # a report past the cap is not

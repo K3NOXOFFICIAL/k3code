@@ -60,6 +60,20 @@ ENV_ALLOW = (
     "CURL_CA_BUNDLE",
     "NODE_EXTRA_CA_CERTS",
 )
+#: Set for every child: nobody is at a terminal, so a program that would open an editor, a pager or a prompt must fail
+#: (or go on) at once instead of waiting for the timeout. ``GIT_EDITOR=true`` takes a message as it stands (``rebase
+#: --continue``, ``commit --amend``, ``revert``; a plain ``commit`` has none and aborts). ``GIT_SEQUENCE_EDITOR=false``
+#: refuses a bare ``rebase -i`` (``:`` would "succeed" without the edit the model asked for; a command that sets it
+#: itself, ``GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash``, still works).
+NONINTERACTIVE_ENV = {
+    "GIT_EDITOR": "true",
+    "GIT_SEQUENCE_EDITOR": "false",
+    "EDITOR": "false",
+    "VISUAL": "false",
+    "PAGER": "cat",
+    "GIT_PAGER": "cat",
+    "GIT_TERMINAL_PROMPT": "0",
+}
 #: Proxy settings, passed on only when the URL carries no credentials (see network_env).
 PROXY_ENV = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy")
 #: Harness git (worktrees, merges, triggers, scope classification) runs in the daemon, outside the sandbox, on a
@@ -196,13 +210,15 @@ def network_env() -> dict[str, str]:
 
 
 def child_env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The environment every child process gets: :data:`ENV_ALLOW` from the daemon, plus ``extra``.
+    """The environment every child process gets: :data:`ENV_ALLOW` from the daemon, :data:`NONINTERACTIVE_ENV`, plus
+    ``extra``.
 
     Provider keys (``OMNIROUTE_API_KEY``, ``K3CODE_API_KEY``, ...) are never passed to a child, so a tool, a gate,
     a fan-out worker or a git trigger cannot print them. Nor does a child learn where the daemon's socket is, not even
     from ``extra`` (an MCP server's configured ``env``): only an authenticated client may drive the daemon.
     """
     env = {name: os.environ[name] for name in ENV_ALLOW if name in os.environ}
+    env.update(NONINTERACTIVE_ENV)
     env.update(network_env())
     env.update(extra or {})
     for name in GATEWAY_ENV_VARS:
@@ -380,6 +396,27 @@ def _git_metadata(root: Path, home: Path | None = None) -> list[Path]:
         return []
 
 
+#: The variables that name a CA bundle file (``SSL_CERT_DIR`` names a folder: it is not bound).
+CA_FILE_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS")
+
+
+def _ca_bundles(visible: Iterable[Path | str], home: Path) -> list[Path]:
+    """The CA bundle files :data:`CA_FILE_VARS` name (they stay in the command's environment) that the sandbox would
+    hide: one under ``$HOME`` or /tmp (a corporate or proxy CA) is an empty path there, and every https command then
+    failed (curl 77, pip "invalid path"). Only those exact files, bound read-only; none that is already visible
+    (``visible``: the system dirs, the project) or that is, or lies in or around, a secrets folder."""
+    seen: list[Path] = []
+    for name in CA_FILE_VARS:
+        value = os.environ.get(name, "")
+        path = Path(value)
+        if not value or not path.is_absolute() or not path.is_file() or path in seen:
+            continue
+        if any(path.is_relative_to(Path(v)) for v in visible) or not _meta_allowed(path, home):
+            continue
+        seen.append(path)
+    return seen
+
+
 def exposes_home(path: Path | str, home: Path | None = None) -> bool:
     """True when binding ``path`` would bring back all of ``$HOME``: it is ``$HOME`` or contains it (``/``)."""
     home = Path(home or Path.home()).resolve()
@@ -482,6 +519,8 @@ def build_argv(
         value = os.environ.get(name)
         if value is not None:
             argv += ["--setenv", name, value]
+    for name, value in NONINTERACTIVE_ENV.items():
+        argv += ["--setenv", name, value]
     if network:  # a proxy is of no use to a command with no network
         for name, value in network_env().items():
             argv += ["--setenv", name, value]
@@ -518,6 +557,8 @@ def build_argv(
     uv = home / HOME_UV
     if uv.is_dir():
         argv += ["--ro-bind", str(uv), str(uv)]
+    for ca in _ca_bundles([*shown, *roots, cache, uv], home):
+        argv += ["--ro-bind", str(ca), str(ca)]
     seen: set[str] = set()
     for root in roots:
         p = str(root)

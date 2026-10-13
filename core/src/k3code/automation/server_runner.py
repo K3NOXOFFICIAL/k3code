@@ -41,31 +41,40 @@ def _default_cwd(cwd: str) -> tuple[str, str]:
     return str(here), ""
 
 
-def _schedule_next_installer(tick: TickContext) -> Any:
-    async def handler(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
+_SCHEDULE_NEXT = ToolSpec(
+    name="schedule_next",
+    description="Self-paced /loop only: say how many seconds from now the next tick should run (60-3600) and why.",
+    parameters={
+        "type": "object",
+        "properties": {"seconds": {"type": "number"}, "reason": {"type": "string"}},
+        "required": ["seconds"],
+    },
+    side_effect=False,
+)
+
+
+class _ScheduleNext:
+    """Installs ``schedule_next`` on a turn's registry. It stays on the session for every turn once a self-paced tick
+    has run there (the user's own turns share the conversation with the ticks): a tool list that gains the tool for a
+    tick and loses it for the next user turn is a prompt-cache miss for the whole request, twice per tick. ``tick`` is
+    set only while a self-paced tick runs; the tool answers with an error outside one."""
+
+    def __init__(self) -> None:
+        self.tick: TickContext | None = None
+
+    async def handler(self, arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
+        if self.tick is None:
+            return {"error": "no self-paced loop is active"}
         try:
             seconds = float(arguments.get("seconds"))
         except (TypeError, ValueError):
             return {"error": "schedule_next needs a numeric `seconds`"}
-        applied = tick.schedule_next(seconds, str(arguments.get("reason") or ""))
+        applied = self.tick.schedule_next(seconds, str(arguments.get("reason") or ""))
         note = "" if applied == seconds else f" (clamped from {seconds:g}s to the 60-3600s range)"
         return {"content": f"Next tick in {applied:g}s{note}."}
 
-    spec = ToolSpec(
-        name="schedule_next",
-        description="Self-paced /loop only: say how many seconds from now the next tick should run (60-3600) and why.",
-        parameters={
-            "type": "object",
-            "properties": {"seconds": {"type": "number"}, "reason": {"type": "string"}},
-            "required": ["seconds"],
-        },
-        side_effect=False,
-    )
-
-    def install(reg: Any) -> None:
-        reg.register(spec, handler)
-
-    return install
+    def __call__(self, reg: Any) -> None:
+        reg.register(_SCHEDULE_NEXT, self.handler)
 
 
 class ServerRunner:
@@ -124,7 +133,12 @@ class ServerRunner:
                 await asyncio.sleep(BUSY_POLL_S)
             prev_background = live.background
             live.background = True
-            live.extra_tools = [_schedule_next_installer(tick)] if tick is not None else []
+            scheduler = next((i for i in live.extra_tools if isinstance(i, _ScheduleNext)), None)
+            if scheduler is None and tick is not None:
+                scheduler = _ScheduleNext()
+                live.extra_tools.append(scheduler)  # for good: every later turn of this session advertises it too
+            if scheduler is not None:
+                scheduler.tick = tick
             live.task_kind = kind  # tier policy: loop_tick / cron_job / background_turn (cheap by default)
             if model and not existing:
                 live.stored.model = model
@@ -150,7 +164,8 @@ class ServerRunner:
                 status, text = "error", str(e)
             finally:
                 live.background = prev_background if existing else True
-                live.extra_tools = []
+                if scheduler is not None:
+                    scheduler.tick = None
                 live.task_kind = ""
                 if not existing:
                     # a fresh session made for this run: nobody will ever poll a background child it left running

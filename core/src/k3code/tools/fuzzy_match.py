@@ -377,18 +377,19 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
         if not matches:
             continue
 
+        if len(matches) > 1 and strategy_name in SIMILARITY_STRATEGIES:
+            # Blocks that merely look like old_string (every line >= 0.80 alike) are no matches: twelve test functions
+            # of one shape all pass, and "Found 12 matches" sent the model after text that exists nowhere. This is the
+            # plain no-match error, so the "Did you mean" hint shows the closest block and its first differing line.
+            return content, 0, None, (
+                f"Could not find an exact match for old_string in the file ({len(matches)} blocks resemble it, "
+                f"none is identical).")
         if len(matches) > 1 and not replace_all:
             locations = _format_match_locations(content, matches)
             return content, 0, None, (
                 f"Found {len(matches)} matches for old_string. "
                 f"Provide more context to make it unique, or use replace_all=True. "
                 f"Matches:\n{locations}")
-        if replace_all and len(matches) > 1 and strategy_name in SIMILARITY_STRATEGIES:
-            return content, 0, None, (
-                f"Found {len(matches)} approximate matches via the "
-                f"'{strategy_name}' strategy; replace_all only applies to exact "
-                f"matches. Provide the precise text (whitespace included) so an "
-                f"exact/line-trimmed match can be made.")
 
         # Non-exact matches came through some normalization, so new_string may
         # carry serialization drift the file doesn't have.
@@ -586,8 +587,41 @@ def _visualize_whitespace(line: str) -> str:
     return prefix.replace("\t", "→").replace(" ", "·") + stripped
 
 
-def find_closest_lines(old_string: str, content: str, context_lines: int = 2, max_results: int = 3) -> str:
-    """Numbered snippets of the lines most similar to old_string's anchor line, or ''."""
+def _first_difference(old_lines: list[str], block: list[str], first_no: int) -> str:
+    """Where ``block`` (file lines from number ``first_no``) first departs from ``old_lines``, as the two lines
+    side by side, or ''. Compared without indentation; text that is the same but for indentation names the first
+    line indented differently."""
+    def show(line: str) -> str:
+        return line.rstrip() if len(line) <= 160 else line.rstrip()[:157] + "..."
+
+    stripped_old, stripped_block = [l.strip() for l in old_lines], [l.strip() for l in block]
+    sm = SequenceMatcher(None, stripped_old, stripped_block, autojunk=False)
+    for tag, i1, _i2, j1, _j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag == "delete":  # old_string has lines the file does not
+            return f"First difference: old_string line {i1 + 1} is not in the file: {show(old_lines[i1].strip())}"
+        if tag == "insert":  # the file has lines old_string leaves out
+            return (
+                f"First difference at line {first_no + j1}: the file has {show(block[j1].strip())}, "
+                f"old_string has no such line")
+        return (
+            f"First difference at line {first_no + j1}:\n"
+            f"  file has: {show(block[j1].strip())}\n"
+            f"  you sent: {show(old_lines[i1].strip())}")
+    for i, (sent, has) in enumerate(zip(old_lines, block)):
+        if sent != has:
+            return (
+                f"First difference at line {first_no + i}, the indentation (→ = tab, · = space):\n"
+                f"  file has: {_visualize_whitespace(has)}\n"
+                f"  you sent: {_visualize_whitespace(sent)}")
+    return ""
+
+
+def find_closest_lines(old_string: str, content: str, context_lines: int = 2, max_results: int = 10) -> str:
+    """Numbered lines of the one place in ``content`` most like old_string, then the first line where they differ, or ''.
+    The candidates are the ``max_results`` lines most like old_string's anchor line; each is scored on the whole block
+    (three overlapping windows of the same few lines cost three times the tokens of the one that was wanted)."""
     if not old_string or not content:
         return ""
     old_lines = old_string.splitlines()
@@ -595,9 +629,10 @@ def find_closest_lines(old_string: str, content: str, context_lines: int = 2, ma
     if not old_lines or not content_lines:
         return ""
 
-    anchor = old_lines[0].strip() or next((l.strip() for l in old_lines if l.strip()), "")
-    if not anchor:
+    lead = next((i for i, l in enumerate(old_lines) if l.strip()), None)
+    if lead is None:
         return ""
+    anchor = old_lines[lead].strip()
 
     scored = sorted(((SequenceMatcher(None, anchor, line.strip()).ratio(), i)
                      for i, line in enumerate(content_lines) if line.strip()), key=lambda x: -x[0])
@@ -605,26 +640,33 @@ def find_closest_lines(old_string: str, content: str, context_lines: int = 2, ma
     if not top:
         return ""
 
-    parts = []
-    seen_ranges = set()
-    for _, line_idx in top:
-        start = max(0, line_idx - context_lines)
-        end = min(len(content_lines), line_idx + len(old_lines) + context_lines)
-        if (start, end) in seen_ranges:
-            continue
-        seen_ranges.add((start, end))
-        parts.append("\n".join(
-            f"{start + j + 1:4d}| {content_lines[start + j]}" for j in range(end - start)))
-    result = "\n---\n".join(parts)
+    stripped_old = [l.strip() for l in old_lines]
+
+    def block_start(line_idx: int) -> int:
+        return max(0, line_idx - lead)
+
+    def block_score(line_idx: int) -> float:
+        begin = block_start(line_idx)
+        block = [l.strip() for l in content_lines[begin:begin + len(old_lines)]]
+        # autojunk on: blocks of 200+ lines rank approximately, instead of ten quadratic comparisons of repeated lines
+        return SequenceMatcher(None, stripped_old, block).ratio()
+
+    best_idx = max((idx for _, idx in top), key=block_score)  # ties: the line most like the anchor
+    begin = block_start(best_idx)
+    start = max(0, begin - context_lines)
+    end = min(len(content_lines), begin + len(old_lines) + context_lines)
+    result = "\n".join(f"{start + j + 1:4d}| {content_lines[start + j]}" for j in range(end - start))
+    if diff := _first_difference(old_lines, content_lines[begin:begin + len(old_lines)], begin + 1):
+        result += "\n\n" + diff
 
     # Whitespace-shaped miss: best line equals the anchor once stripped. Show
     # both with visible leading whitespace so the model copies the file's.
-    best_line = content_lines[top[0][1]]
-    if best_line.strip() == anchor and best_line != old_lines[0]:
+    best_line = content_lines[best_idx]
+    if best_line.strip() == anchor and best_line != old_lines[lead]:
         result += (
             "\n\nWhitespace difference detected (→ = tab, · = space):\n"
             f"  file has: {_visualize_whitespace(best_line)}\n"
-            f"  you sent: {_visualize_whitespace(old_lines[0])}\n"
+            f"  you sent: {_visualize_whitespace(old_lines[lead])}\n"
             "Use the exact whitespace shown in 'file has'.")
     return result
 
@@ -649,7 +691,7 @@ def format_no_match_hint(error: Optional[str], match_count: int,
             "the file: send the lines without them."
         )
     hint = find_closest_lines(old_string, content)
-    return lead + ("\n\nDid you mean one of these sections?\n" + hint if hint else "")
+    return lead + ("\n\nDid you mean this section?\n" + hint if hint else "")
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

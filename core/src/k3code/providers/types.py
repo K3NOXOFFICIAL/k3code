@@ -131,6 +131,24 @@ def normalize_tool_pairs(messages: list[Message]) -> list[Message]:
     return out
 
 
+def unique_call_ids(reply: Message, conversation: list[Message]) -> None:
+    """Rename, in place, the calls of ``reply`` whose id an earlier call of ``conversation`` already has.
+
+    Some local OpenAI-compatible servers number a reply's calls ``call_0``, ``call_1`` ... afresh every time. Everything
+    keyed by the id (the elided results, the notes and pins, the "unchanged since" pointers) then took a new result for
+    the old one with the same id. The new id keeps the old one as its start and stays within what Anthropic accepts in
+    an id (letters, digits, ``_`` and ``-``); it is made before the reply is stored or echoed back, so the call and its
+    result agree everywhere. A provider whose ids are unique (every real one but those servers) is not touched."""
+    used = {tc.id for m in conversation if m.role == "assistant" for tc in m.tool_calls}
+    for tc in reply.tool_calls:
+        if tc.id and tc.id in used:
+            n = 1
+            while f"{tc.id}_{n}" in used:
+                n += 1
+            tc.id = f"{tc.id}_{n}"
+        used.add(tc.id)
+
+
 def leading_system_parts(messages: list[Message]) -> list[str]:
     """The text of the system messages the conversation starts with, one entry per message (empty ones left out). A loop
     sends two when the second is what differs between agents that share the first (see ``AgentLoop.system_suffix``)."""

@@ -9,6 +9,8 @@ nothing, so it retried blind. The subset checked here is what tool schemas in k3
 from __future__ import annotations
 
 import json
+import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +93,9 @@ ARGUMENT_ALIASES: dict[str, dict[str, str]] = {
     "edit": {"file_path": "path", "old_str": "old_string", "new_str": "new_string"},
     "skill": {"skill": "name"},
     "grep": {"glob": "include"},
+    # Claude Code's BashOutput takes `bash_id` and KillShell `shell_id`; models mix the two up
+    "bash_output": {"bash_id": "job_id", "shell_id": "job_id"},
+    "bash_kill": {"shell_id": "job_id", "bash_id": "job_id"},
 }
 #: Arguments a handler still takes that its schema no longer lists (so they are not "ignored").
 LEGACY_ARGUMENTS: dict[str, frozenset[str]] = {"read": frozenset({"start", "end"})}
@@ -102,6 +107,8 @@ def normalize_arguments(tool: str, args: dict[str, Any], schema: dict[str, Any] 
     as null is an unused option like any other: it is dropped here, not renamed into a null that the real name's type
     rejects."""
     args = drop_null_options(args, schema)
+    if tool == "grep" and isinstance(args, dict) and args.get("-n") is True:
+        args = {k: v for k, v in args.items() if k != "-n"}  # grep always numbers its lines: nothing to ignore
     if tool == "grep" and isinstance(args, dict) and isinstance(args.get("-i"), bool):
         # Claude Code's case flag has no argument here: the regex takes it inline. Left as an ignored argument, the
         # search ran case-sensitively and answered "no matches" for a word that is there
@@ -110,13 +117,53 @@ def normalize_arguments(tool: str, args: dict[str, Any], schema: dict[str, Any] 
         if ignore_case and isinstance(args.get("pattern"), str) and not args["pattern"].startswith("(?i)"):
             args["pattern"] = "(?i)" + args["pattern"]
     aliases = ARGUMENT_ALIASES.get(tool)
-    if not aliases or not isinstance(args, dict) or not any(k in aliases for k in args):
+    if aliases and isinstance(args, dict) and any(k in aliases for k in args):
+        args = {
+            (aliases[k] if k in aliases and aliases[k] not in args else k): v
+            for k, v in args.items()
+            if v is not None or k not in aliases
+        }
+    return coerce_strings(args, schema)
+
+
+_INTEGER_TEXT = re.compile(r"[+-]?[0-9]+")
+_NUMBER_TEXT = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def _from_text(text: str, types: list[str]) -> Any:
+    """The integer, number or array ``text`` spells when ``types`` take one (None when it spells none cleanly)."""
+    bare = text.strip()
+    if ("integer" in types or "number" in types) and _INTEGER_TEXT.fullmatch(bare):
+        return int(bare)
+    if "number" in types and _NUMBER_TEXT.fullmatch(bare):
+        number = float(bare)
+        return number if math.isfinite(number) else None
+    if "array" in types and bare.startswith("["):
+        try:
+            value = json.loads(bare)
+        except ValueError:
+            return None
+        return value if isinstance(value, list) else None
+    return None
+
+
+def coerce_strings(args: Any, schema: dict[str, Any] | None) -> Any:
+    """``args`` with a number or an array that the model sent as a string (``"offset": "3"``, ``"todos": "[{...}]"``)
+    made the value its parameter asks for: only where the schema takes no string and the text reads cleanly as that
+    value. Anything else stays as sent for :func:`check_arguments` to refuse."""
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(props, dict) or not isinstance(args, dict) or not any(isinstance(v, str) for v in args.values()):
         return args
-    return {
-        (aliases[k] if k in aliases and aliases[k] not in args else k): v
-        for k, v in args.items()
-        if v is not None or k not in aliases
-    }
+    out = dict(args)
+    for name, value in args.items():
+        prop = props.get(name)
+        typ = prop.get("type") if isinstance(prop, dict) else None
+        types = typ if isinstance(typ, list) else [typ] if isinstance(typ, str) else []
+        if isinstance(value, str) and types and not any(_is(value, t) for t in types):
+            coerced = _from_text(value, types)
+            if coerced is not None:
+                out[name] = coerced
+    return out
 
 
 def check_arguments(schema: dict[str, Any] | None, args: Any, *, local_paths: bool = True) -> list[str]:

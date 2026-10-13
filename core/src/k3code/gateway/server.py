@@ -27,6 +27,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -57,7 +58,11 @@ from k3code.commands.builtin import build_registry as build_commands
 from k3code.commands.ultra_cmd import JobSpec, typed_mode_word
 from k3code.config import Settings, default_project_dir, load_config, retention
 from k3code.context_budget import (
+    COMPACT_AT_RATIO,
     ELIDE_MIN_CHARS,
+    POINTER_CALL_RE,
+    SHRINK_FLOOR_CHARS,
+    SHRINK_SHARE,
     AutoCompact,
     autocompact_policy,
     compact_resume_at,
@@ -66,6 +71,7 @@ from k3code.context_budget import (
     cut_call_text,
     elide_marker,
     overhead_tokens,
+    result_chars,
     router_window,
     text_tokens,
     tool_output_limit,
@@ -108,7 +114,7 @@ from k3code.goals import (
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
 from k3code.mcpclient import McpManager
-from k3code.memory import fenced, read_learned
+from k3code.memory import MemoryFile, fenced, read_learned
 from k3code.paths import project_config_path as _proj_cfg
 from k3code.paths import user_config_path as _user_cfg
 from k3code.permissions import MODE_CYCLE_NAMES, PermissionMode, permission_mode_from_config, suggest_rules
@@ -143,7 +149,7 @@ from k3code.routing.tiers import (
 from k3code.session_ai import SUMMARY_PREFIX, compact_messages, make_title
 from k3code.subagents import SubagentManager
 from k3code.subagents.tools import register_task_tools
-from k3code.tools import MAX_TOOL_RESULT_CHARS, FileStamps, clip_for_model, register_todo, render_todos
+from k3code.tools import MAX_TOOL_RESULT_CHARS, FileStamps, clip_for_model, register_todo, render_todos, shrink_result
 from k3code.tools import build_registry as build_tool_registry
 from k3code.tools import jobs as tool_jobs
 from k3code.usage import UsageDB
@@ -293,7 +299,8 @@ class LiveSession:
         #: provider re-write the whole conversation); None = read them again, as after a compaction or /clear.
         self.learned_notes: list[str] | None = None
         #: ... and the rest of what background writers change in the prompt (project facts, the user memory file the
-        #: daily distill rewrites, accepted gotchas, the optimizer overlay), taken on the same terms
+        #: daily distill rewrites, accepted gotchas, the optimizer overlay, the project memory files, the MCP index),
+        #: taken on the same terms
         self.prompt_frozen: dict[str, Any] = {}
         #: model calls a turn already made before a compaction in its middle restarted it (the max_turns cap is the
         #: user's limit on the task, not on each piece of it)
@@ -373,10 +380,26 @@ class LiveSession:
         #: loop of each turn shares them: see AgentLoop.share_elision); emptied when a compaction rewrites the history.
         self.elided: set[str] = set()
         self.elide_notes: dict[str, str] = {}
+        #: Prompt tokens the provider counted / the estimate of the conversation part of that request (a moving
+        #: average, kept within RATIO_MIN..RATIO_MAX): code, JSON and non-English text take far more tokens than the
+        #: estimate says. _request_tokens applies it. ``token_ratio_model``: the model key it was measured for (a switch
+        #: starts again); ``token_ratio_stale``: the next sample replaces it instead of joining the average;
+        #: ``token_samples``: eligible calls seen since (sampled, see GatewayServer._calibrate). Kept in the meta.
+        self.token_ratio = 1.0
+        self.token_ratio_model = stored.model or ""
+        self.token_ratio_stale = True
+        self.token_samples = 0
+        if isinstance(saved := stored.meta.get("token_ratio"), dict) and saved.get("model") == self.token_ratio_model:
+            with contextlib.suppress(TypeError, ValueError):
+                self.token_ratio = min(RATIO_MAX, max(RATIO_MIN, float(saved.get("ratio"))))
+                self.token_ratio_stale = False
         #: Files read so far ((path, mtime, size, range) → (step, tool call id)) and the results a pointer to one needs
         #: kept whole (AgentLoop.share_reads); emptied where the history is rewritten, with ``elided``.
         self.reads: dict[tuple[Any, ...], tuple[int, str]] = {}
         self.pinned_reads: set[str] = set()
+        # ... and what a resumed, forked or restarted session needs to send the requests the provider has cached
+        _restore_elision(self)
+        _restore_snapshot(self)
         #: /advisor text awaiting "accept" (kept out of the main context until then).
         self.pending_advisor: str = ""
         #: Tool installers run on each turn's registry (loop sessions add ``schedule_next``).
@@ -393,12 +416,15 @@ class LiveSession:
         self.task_kind: str = ""
         #: /go after /ultraplan: {task, plan, path}; consumed by the next turn's scope gate.
         self.preapproved_plan: dict[str, Any] | None = None
+        #: The scope gate's result for the turn last run (its verdict and approved plan), for a rerun of the prompt.
+        self.turn_gate: GateResult | None = None
 
     def refresh_prompt_inputs(self) -> None:
         """Read the learned notes and the other background-written parts of the prompt afresh at the next turn (the
         conversation is being rewritten anyway: a compaction, /clear, a move to another project)."""
         self.learned_notes = None
         self.prompt_frozen.clear()
+        self.stored.meta.pop("prompt_snapshot", None)
 
     @property
     def turn_in_flight(self) -> bool:
@@ -586,10 +612,40 @@ COMPACTED_CONTINUATION = (
 )
 #: After a failed automatic compaction, seconds before the next turn tries again.
 COMPACT_RETRY_AFTER_S = 120.0
+#: Of the smallest context window the summary call can run on, this share is the most its input takes (the system
+#: prompt and the summary itself are the rest, with room for the estimate being low).
+SUMMARY_INPUT_SHARE = 0.4
+#: The estimate of a request is corrected by the ratio of what the provider counted to what was estimated, within these
+#: bounds, from requests whose conversation alone is estimated at CALIBRATE_MIN_TOKENS (a small one is mostly the system
+#: prompt, and what a provider adds of its own would count for far too much), one eligible call in CALIBRATE_EVERY (each
+#: sample estimates the whole conversation); a new sample counts RATIO_WEIGHT.
+RATIO_MIN, RATIO_MAX = 0.5, 3.0
+CALIBRATE_MIN_TOKENS = 4_000
+CALIBRATE_EVERY = 4
+RATIO_WEIGHT = 0.3
+#: What a session keeps in its meta of the state its requests are built from, so that a resumed, forked or restarted
+#: session sends the requests the provider has cached: the ids of the tool results (and call arguments) elided so far,
+#: at most this many, the newest first (a session that elides more asks for the older ones again: they come back whole
+#: until the request is long, and are all elided again at once), and the decision model's notes on them, up to this
+#: many characters.
+ELIDED_META_IDS = 2_000
+ELIDE_NOTES_META_CHARS = 40_000
+#: The prompt snapshot (the learned notes and the inputs frozen with them, see LiveSession.prompt_frozen) is kept for as
+#: long as the longest provider cache (cache_marker "1h") may still hold the prompt built from it: a session resumed
+#: later reads the files afresh, as it always did. It is not kept when it is over this many characters.
+SNAPSHOT_MAX_AGE_S = 3_600
+SNAPSHOT_META_CHARS = 60_000
+#: A todo list as render_todos writes it (in a summary, where the model may have restated it).
+TODO_BLOCK_RE = re.compile(r"Todos \(\d+/\d+ done\):\n(?:\[[ >x]\] .*(?:\n|$))*")
+#: How often one turn is compacted and gone on after a context overflow (each needs the steps made since the last).
+MAX_OVERFLOW_FOLDS = 10
 
 
 def _estimate_tokens(
-    messages: list[dict[str, Any]], tool_output_chars: int | None = None, elided: Collection[str] = ()
+    messages: list[dict[str, Any]],
+    tool_output_chars: int | None = None,
+    elided: Collection[str] = (),
+    window: int | None = None,
 ) -> int:
     """Rough size of what a conversation sends (see context_budget.text_tokens), tool calls included.
 
@@ -597,6 +653,8 @@ def _estimate_tokens(
     stored full text does not trigger compaction early; everything else is counted as stored. ``elided``: the ids the
     loop has replaced by a marker in its requests (a result's own id; ``args:<id>`` for the file text of a call): they
     are counted as the marker, or a session that elides well kept compacting a request a tenth of the size.
+    ``window``: the context window, which the loop holds one result to a share of (``clip:<id>`` in ``elided``: a result
+    it cut down further to fit the request in the window).
     """
     tokens = 0
     for m in messages:
@@ -605,7 +663,10 @@ def _estimate_tokens(
             if m.get("tool_call_id") in elided and len(c) > ELIDE_MIN_CHARS:
                 c = elide_marker(m.get("name"), len(c))
             else:
-                c = clip_for_model(m.get("name"), c, tool_output_chars or MAX_TOOL_RESULT_CHARS)
+                c = clip_for_model(m.get("name"), c, tool_output_chars or MAX_TOOL_RESULT_CHARS, window)
+                if window and f"clip:{m.get('tool_call_id')}" in elided:
+                    cut = result_chars(c, window, SHRINK_SHARE, SHRINK_FLOOR_CHARS)
+                    c = shrink_result(m.get("name"), c, cut)
         tokens += text_tokens(c) if isinstance(c, str) else text_tokens(json.dumps(c, ensure_ascii=False)) if c else 0
         for tc in m.get("tool_calls") or []:
             # the name and the arguments once, as context_budget.message_tokens counts them (the whole call dict carried
@@ -617,6 +678,77 @@ def _estimate_tokens(
                 args = args[: ELIDE_MIN_CHARS // 4] + " " * 40  # the text of the call is a marker of about this size
             tokens += text_tokens(str(tc.get("name") or "") + args)
     return tokens
+
+
+def _history_ids(messages: list[dict[str, Any]]) -> list[str]:
+    """The ids the elision state can name, in the order of the history: a tool result by its call's id (and as
+    ``clip:<id>`` when the loop cut it down), the text of a call's arguments as ``args:<id>`` (see _estimate_tokens)."""
+    ids: list[str] = []
+    for m in messages:
+        if m.get("role") == "tool":
+            ids.extend((str(m.get("tool_call_id") or ""), f"clip:{m.get('tool_call_id') or ''}"))
+        ids.extend(f"args:{tc.get('id')}" for tc in m.get("tool_calls") or [])
+    return ids
+
+
+def _elision_meta(messages: list[dict[str, Any]], elided: Collection[str], notes: dict[str, str]) -> dict[str, Any]:
+    """The meta keys that keep ``elided`` and ``notes`` (only ids the history still has, the newest ELIDED_META_IDS of
+    them): ``{"elided": [...], "elide_notes": {...}}``, a key left out when there is nothing in it."""
+    present = [i for i in _history_ids(messages) if i in elided][-ELIDED_META_IDS:]
+    kept, size = {}, 0
+    for i in reversed(present):
+        if (note := notes.get(i)) and size + len(note) <= ELIDE_NOTES_META_CHARS:
+            kept[i], size = note, size + len(note)
+    return {**({"elided": present} if present else {}), **({"elide_notes": kept} if kept else {})}
+
+
+def _restore_elision(session: LiveSession) -> None:
+    """Give a session the elision state its meta kept (see _elision_meta), and pin again the results that an
+    "unchanged since the read" answer of the history points at (they are never elided: the pointer would dangle)."""
+    messages = session.stored.messages
+    here = set(_history_ids(messages))
+    saved = session.stored.meta.get("elided")
+    if isinstance(saved, list):
+        session.elided.update(i for i in saved if isinstance(i, str) and i in here)
+    notes = session.stored.meta.get("elide_notes")
+    if isinstance(notes, dict):
+        session.elide_notes.update({k: v for k, v in notes.items() if isinstance(v, str) and k in here})
+    for m in messages:
+        if m.get("role") == "tool" and (hit := POINTER_CALL_RE.match(str(m.get("content") or ""))):
+            session.pinned_reads.add(hit.group(1))
+
+
+def _snapshot_meta(session: LiveSession) -> dict[str, Any] | None:
+    """The session's prompt snapshot for its meta (see SNAPSHOT_MAX_AGE_S), or None when there is none or it is big."""
+    frozen: dict[str, Any] = {}
+    for key, value in session.prompt_frozen.items():
+        if key == "project_memory" and isinstance(value, tuple) and len(value) == 2:
+            frozen[key] = [value[0], [[f.scope, str(f.path), f.text] for f in value[1]]]
+        elif isinstance(value, str):
+            frozen[key] = value
+    if session.learned_notes is None and not frozen:
+        return None
+    snapshot = {"at": time.time(), "learned": session.learned_notes, "frozen": frozen}
+    return snapshot if len(json.dumps(snapshot, ensure_ascii=False)) <= SNAPSHOT_META_CHARS else None
+
+
+def _restore_snapshot(session: LiveSession) -> None:
+    """Give a session the prompt snapshot its meta kept, when it is recent (see SNAPSHOT_MAX_AGE_S)."""
+    saved = session.stored.meta.get("prompt_snapshot")
+    try:
+        if not isinstance(saved, dict) or time.time() - float(saved["at"]) > SNAPSHOT_MAX_AGE_S:
+            return
+        learned = saved.get("learned")
+        frozen: dict[str, Any] = {}
+        for key, value in dict(saved.get("frozen") or {}).items():
+            if key == "project_memory":
+                frozen[key] = (str(value[0]), tuple(MemoryFile(str(a), Path(b), str(c)) for a, b, c in value[1]))
+            elif isinstance(value, str):
+                frozen[key] = value
+        session.learned_notes = [str(x) for x in learned] if isinstance(learned, list) else None
+        session.prompt_frozen.update(frozen)
+    except (KeyError, TypeError, ValueError):
+        logger.debug("the saved prompt snapshot of %s is unusable", session.session_id, exc_info=True)
 
 
 def _socket_is_live(path: Path) -> bool:
@@ -1871,39 +2003,44 @@ class GatewayServer:
                 else:  # the typed prompt's hooks ran above; a retry or a goal's next prompt runs its own
                     status, final_text = await self._run_one_turn(session, prompt, hooked=hooked)
                     hooked = None
-                if (
+                pin: dict[str, Any] | None = None  # the turn's prompt: a fold that reaches into the turn keeps it
+                folds = carried = 0  # compactions in this turn; model calls made before them (turns_carried)
+                while (
                     status == "error"
                     and isinstance(session.last_exc, ContextOverflow)
                     and self.autocompact_policy(session).enabled  # /autocompact off: the user compacts, with /compact
+                    and folds < MAX_OVERFLOW_FOLDS
                 ):
-                    # The provider says the conversation does not fit: drop this attempt's messages, fold the older
-                    # history into a summary, and run the prompt once more.
+                    # The provider says the conversation does not fit: fold the older history (and the earlier steps of
+                    # this turn when it is long) into a summary, and go on; a turn that goes on long enough folds again.
                     failed_attempt = session.stored.messages
-                    session.stored.messages = failed_attempt[:n_before]  # fold the older history only
-                    try:
-                        folded = await self._maybe_compact(session, force=True)
-                    except BaseException:  # /stop during the summary call: the turn's prompt and tool work stay
-                        session.stored.messages = failed_attempt
-                        raise
-                    if not folded:
+                    ran = failed_attempt[n_before:]
+                    ran_tools = any(m.get("role") == "tool" for m in ran)
+                    if pin is None:
+                        pin = next((m for m in ran if m.get("role") == "user"), None)
+                    # a further fold needs the steps the last retry made (else it overflowed at its first call)
+                    if (folds and not ran_tools) or not await self._fold_after_overflow(
+                        session, failed_attempt, n_before, pin
+                    ):
                         # nothing could be folded: no retry, and the failed attempt stays in the history
                         session.stored.messages = failed_attempt
-                    else:
-                        prompt = self._with_long_goal(session, mgr, prompt)  # the compaction may have folded the goal
-                        if any(m.get("role") == "tool" for m in failed_attempt[n_before:]):
-                            # tools already ran in this turn: keep that work and go on from it. Running the prompt
-                            # again threw away every model call and replayed non-idempotent steps (a push, a migration)
-                            session.stored.messages = [*session.stored.messages, *failed_attempt[n_before:]]
-                            ran = failed_attempt[n_before:]
-                            session.turns_carried = sum(1 for m in ran if m["role"] == "assistant")
-                            try:
-                                status, final_text = await self._run_one_turn(
-                                    session, prompt, continuation=COMPACTED_CONTINUATION
-                                )
-                            finally:
-                                session.turns_carried = 0
-                        else:
-                            status, final_text = await self._run_one_turn(session, prompt)
+                        break
+                    folds += 1
+                    prompt = self._with_long_goal(session, mgr, prompt)  # the compaction may have folded the goal
+                    if not ran_tools:
+                        status, final_text = await self._run_one_turn(session, prompt, reuse_gate=session.turn_gate)
+                        break
+                    # tools already ran in this turn: keep that work and go on from it. Running the prompt again threw
+                    # away every model call and replayed non-idempotent steps (a push, a migration)
+                    n_before = len(session.stored.messages)  # a further overflow folds what this retry makes
+                    carried += sum(1 for m in ran if m["role"] == "assistant")
+                    session.turns_carried = carried
+                    try:
+                        status, final_text = await self._run_one_turn(
+                            session, prompt, continuation=COMPACTED_CONTINUATION
+                        )
+                    finally:
+                        session.turns_carried = 0
                 if status == "error" and isinstance(session.last_exc, ContextOverflow):
                     self._clip_unfittable_prompt(session)
             except asyncio.CancelledError:
@@ -1967,6 +2104,32 @@ class GatewayServer:
                 return status, final_text
             prompt = decision.prompt
             session.goal_continuation = True  # unattended from here on: the goal drives the next turn
+
+    async def _fold_after_overflow(
+        self, session: LiveSession, failed_attempt: list[dict[str, Any]], n_before: int, pin: dict[str, Any] | None
+    ) -> bool:
+        """Compact the conversation of a turn the provider rejected as too long; True when the turn can go on.
+
+        ``failed_attempt``: the stored messages, the turn's own (from ``n_before`` on: its prompt, ``pin``, and the
+        calls and results of the steps it made) among them. When tools ran, the whole conversation is folded: a long
+        single turn (one prompt, hundreds of tool calls) leaves the older history next to nothing to fold, and a fold
+        of that alone cost a summary and left the retry as long as it was. compact_messages cuts where most is freed,
+        the turn's prompt and last steps stay whole. On True the stored messages are what the retry starts from."""
+        ran_tools = any(m.get("role") == "tool" for m in failed_attempt[n_before:])
+        half = context_window(self.config, self._compaction_model(session)) // 2
+        session.stored.messages = failed_attempt if ran_tools else failed_attempt[:n_before]
+        folded = 0
+        try:
+            for _ in range(2):  # the second only when the first (a cut at the turn's prompt) left the request long
+                if not (done := await self._maybe_compact(session, force=True, pin=pin)):
+                    break
+                folded += done
+                if not ran_tools or self._request_tokens(session) <= half:
+                    break
+        except BaseException:  # /stop during the summary call: the turn's prompt and tool work stay
+            session.stored.messages = failed_attempt
+            raise
+        return bool(folded)
 
     @staticmethod
     def _with_long_goal(session: LiveSession, mgr: GoalManager, prompt: str) -> str:
@@ -2333,6 +2496,15 @@ class GatewayServer:
             return self._active_model(session)
         return min(models, key=lambda m: context_window(self.config, m))
 
+    def _summary_window(self, session: LiveSession) -> int:
+        """The smallest context window among the models the summary call can run on (the ``compaction`` kind's tier: the
+        cheap one by default), which the summary's input is sized to: ``_compaction_model`` looks at the main tier."""
+        tier = tier_for(TaskKind.COMPACTION, self.config.task_tiers)
+        models: list[str] = []
+        for spec in tier_model_specs(self.config, tier, key=session.stored.model or self.config.default_model):
+            models.extend(m for m in ([spec] if isinstance(spec, str) else spec) if m)
+        return min((context_window(self.config, m) for m in models), default=context_window(self.config, ""))
+
     def _decision_router(self, decision: Any) -> Router | None:
         """The router for ``context.decision_model.model`` (on its ``provider`` block, or on every block), or None
         when no model is named: the call then goes to the tier ``task_tiers.context_select`` picks (cheap)."""
@@ -2351,19 +2523,44 @@ class GatewayServer:
 
     def _clip_unfittable_prompt(self, session: LiveSession) -> None:
         """A last user message that alone overflows the window is clipped in the stored history. The model never saw it;
-        left whole it was resent, and rejected, by every later prompt, and neither /compress nor /retry could help."""
+        left whole it was resent, and rejected, by every later prompt, and neither /compress nor /retry could help.
+        One that fits the window (with the system prompt, the tools and a reply) is never touched: the overflow came
+        from the history or the reply, and a clipped message loses what the user wrote."""
         last = session.stored.messages[-1] if session.stored.messages else {}
         content = last.get("content")
         if last.get("role") != "user" or not isinstance(content, str):
             return
-        limit = context_window(self.config, self._compaction_model(session)) // 2  # chars: ~an eighth of the window
-        if len(content) <= limit:
+        window = context_window(self.config, self._compaction_model(session))
+        room = window - self._request_tokens(session, []) - min(self.config.max_tokens, window // 8)
+        tokens = text_tokens(content)
+        if tokens <= room:
             return
-        marker = (
-            f"\n…[{len(content) - limit:,} characters removed: this message alone is larger than the context window]"
+        limit = max(1000, len(content) * max(room // 2, 1) // tokens)  # chars: half of what the window leaves
+        removed = len(content) - limit
+        marker = f"\n…[{removed:,} characters removed: this message alone is larger than the context window]"
+        session.emit(
+            "notification.show",
+            {
+                "text": f"Your message is larger than the {window:,}-token context window: the last {removed:,} of its "
+                f"{len(content):,} characters were cut",
+                "level": "warning",
+                "kind": "ttl",
+                "ttl_ms": 15000,
+                "key": f"k3.prompt_clipped.{session.session_id}",
+            },
         )
         session.stored.messages[-1] = {**last, "content": content[:limit] + marker}
         self.store.save(session.stored)
+
+    def _fits_tier(self, session: LiveSession, tier: Tier, prompt: str) -> bool:
+        """Whether the session's next request (its conversation and ``prompt``) is within the share of the smallest
+        window of ``tier`` at which a session is compacted. A trivial prompt starts on the cheap tier, whose models may
+        take far less than the main one: a long history was sent to a 32k model and rejected."""
+        router = self.tier_routers().get(tier)
+        if router is None:
+            return True
+        window = self._router_window(router, session)
+        return self._request_tokens(session) + text_tokens(prompt) <= int(window * COMPACT_AT_RATIO)
 
     def _router_window(self, router: Router, session: LiveSession) -> int:
         """The smallest context window among the models ``router`` can send to (a cheap tier or an escalated one
@@ -2377,12 +2574,15 @@ class GatewayServer:
         *,
         hooked: userhooks.HookOutcome | None = None,
         continuation: str | None = None,
+        reuse_gate: GateResult | None = None,
     ) -> tuple[str, str]:
         """Execute one prompt end-to-end, emitting wire events. Returns (status, final_text).
 
         ``hooked``: the outcome of the user's hooks when the caller already ran them for ``text``. ``continuation``:
         the turn goes on after a compaction in its middle; ``text`` is already in the history, so the hooks and the
-        scope gate (which ran for it) do not run again and the model is sent this note instead."""
+        scope gate (which ran for it) do not run again and the model is sent this note instead. ``reuse_gate``: the
+        gate of an earlier attempt at ``text`` (kept in ``session.turn_gate``): the prompt runs again after an overflow
+        with the verdict and the plan it had, not through a second classifier call, planning turn and approval."""
         if self.halted:  # /daemon pause: nothing reaches a provider; the caller pauses the goal (status 'halted')
             return "halted", ""
         self._ensure_router(session.stored.model or None)
@@ -2395,6 +2595,7 @@ class GatewayServer:
         session.budget_stopped = False
         session.run_result = None
         session.last_error, session.last_exc, session.last_api_calls = "", None, 0
+        session.turn_gate = None
         reliability = await self._reliability_for(session)
         reliability.set_unattended(session.background)  # unattended: provider exhaustion parks instead of failing
         await self.mcp.ensure_started()
@@ -2470,7 +2671,11 @@ class GatewayServer:
             prompt_blocked = hooked.blocked
             try:
                 if not hooked.blocked and continuation is None:
-                    gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
+                    if reuse_gate is not None:
+                        gate = dataclasses.replace(reuse_gate)
+                    else:
+                        gate = await self.autonomy.prepare(session, text)  # M4a: scope gate + planning turn
+                    session.turn_gate = dataclasses.replace(gate)  # as the gate decided it: a rerun after an overflow
             except Exception:  # noqa: BLE001 - the autonomy layer must never block the user's task
                 logger.exception("autonomy gate failed; running the task directly")
             session.current_kind = kind.value
@@ -2484,6 +2689,7 @@ class GatewayServer:
                 and gate.proceed
                 and gate.verdict is not None
                 and gate.verdict.scope == "trivial"
+                and self._fits_tier(session, Tier.CHEAP, gate.prompt)
             ):
                 # A trivial task is "unimportant work": start it on the cheap tier. The loop escalates to main when the
                 # attempt stalls (tool errors, loop guard), so a task the cheap model cannot do still gets done.
@@ -2737,6 +2943,7 @@ class GatewayServer:
                 if (stamps := getattr(session, "file_stamps", None)) is not None and (seen := stamps.export()):
                     stored.meta["file_stamps"] = seen  # what it has read: a resumed session starts from it
                 stored.messages = _serialize_messages(loop.turn_messages)
+                self._save_request_state(session, stored)
                 stored.model = stored.model or self._chain_key or self.config.default_model
                 snapshot = dataclasses.replace(
                     stored, meta=copy.deepcopy(stored.meta), usage=copy.deepcopy(stored.usage)
@@ -2747,6 +2954,23 @@ class GatewayServer:
         except Exception:  # noqa: BLE001 - a failed checkpoint must not mask the turn's own outcome
             logger.exception("could not persist the session")
             self._warn_persist_failed(session)
+
+    @staticmethod
+    def _save_request_state(session: LiveSession, stored: Any) -> None:
+        """Put into the meta what the session builds its requests from and a resumed, forked or restarted one would
+        otherwise guess afresh: the estimate's correction, what is elided, the prompt snapshot. A key is dropped when
+        there is nothing in it any more (a compaction or /clear emptied it)."""
+        if not getattr(session, "token_ratio_stale", True):
+            stored.meta["token_ratio"] = {"ratio": round(session.token_ratio, 3), "model": session.token_ratio_model}
+        for key in ("elided", "elide_notes"):
+            stored.meta.pop(key, None)
+        stored.meta.update(
+            _elision_meta(stored.messages, getattr(session, "elided", ()), getattr(session, "elide_notes", {}))
+        )
+        if hasattr(session, "prompt_frozen") and (snapshot := _snapshot_meta(session)) is not None:
+            stored.meta["prompt_snapshot"] = snapshot
+        else:
+            stored.meta.pop("prompt_snapshot", None)
 
     async def _write_snapshot(self, stored: Any, snapshot: Any) -> None:
         """Write ``snapshot`` on the writer thread, then repair what it may have undone. A command that saved newer
@@ -2847,10 +3071,13 @@ class GatewayServer:
         """When this session compacts on its own: its own /autocompact --session setting, else the config's."""
         return autocompact_policy(self.config, session.stored.meta.get("autocompact"))
 
-    async def compact_session(self, session: LiveSession, *, instructions: str = "") -> int:
+    async def compact_session(
+        self, session: LiveSession, *, instructions: str = "", pin: dict[str, Any] | None = None
+    ) -> int:
         """Fold the older part of the session's conversation into a summary (the cheap ``compaction`` tier); returns how
         many messages were folded (0 = nothing to fold). Raises when the summary call fails. What stays verbatim is
-        ``context.keep_messages``; ``instructions`` is what the summary should focus on (``/compact <focus>``)."""
+        ``context.keep_messages``; ``instructions`` is what the summary should focus on (``/compact <focus>``);
+        ``pin``: the prompt of the turn in progress, kept verbatim after the summary when it is folded."""
         cfg = {**CONTEXT_DEFAULTS, **dict(getattr(self.config, "context", None) or {})}
         snapshot = list(session.stored.messages)
         new, folded = await compact_messages(
@@ -2860,6 +3087,9 @@ class GatewayServer:
             session_id=session.session_id,
             max_input_chars=int(cfg["compact_input_chars"]),
             instructions=instructions,
+            pin=pin,
+            max_input_tokens=int(self._summary_window(session) * SUMMARY_INPUT_SHARE),
+            window=context_window(self.config, self._compaction_model(session)),
         )
         if not folded:
             return 0
@@ -2872,6 +3102,9 @@ class GatewayServer:
             session.stored.meta["goal_started"]["message"] = 0  # the indices moved; the summary covers the goal's start
         session.elided.clear()  # the history is new: nothing of it is elided yet
         session.elide_notes.clear()
+        for key in ("elided", "elide_notes", "token_ratio"):  # the meta kept them for the history that is gone
+            session.stored.meta.pop(key, None)
+        session.token_ratio_stale, session.token_samples = True, 0  # a summary is not what the ratio was measured on
         session.reads.clear()  # and the results it pointed at may be folded
         session.pinned_reads.clear()
         session.refresh_prompt_inputs()  # the provider's cache of it is gone anyway: show what was written since
@@ -2942,14 +3175,17 @@ class GatewayServer:
         if not (calls_todo(folded) or any(summary_has_list(m) for m in folded)) or calls_todo(new[summary_at + 1 :]):
             return new
         summary = new[summary_at]
-        content = str(summary.get("content") or "")
+        # the list the summary model restated from the earlier summary is replaced, not doubled
+        content = TODO_BLOCK_RE.sub("", str(summary.get("content") or "")).rstrip()
         return [
             *new[:summary_at],
             {**summary, "content": f"{content}\n\n{render_todos(todos)}"},
             *new[summary_at + 1 :],
         ]
 
-    async def _maybe_compact(self, session: LiveSession, *, force: bool = False) -> int:
+    async def _maybe_compact(
+        self, session: LiveSession, *, force: bool = False, pin: dict[str, Any] | None = None
+    ) -> int:
         """Fold the older part of the conversation into a summary once it is large; returns how many messages folded.
 
         Nothing compacted automatically, so a `/loop` living in one session grew its history forever: every tick
@@ -2958,6 +3194,7 @@ class GatewayServer:
         the turn goes on. ``/autocompact`` decides whether and at what size (the policy); ``force`` (the retry after a
         ContextOverflow) skips the size test. After a fold that leaves the request over the limit (see
         LiveSession.compact_unfoldable) the next automatic one waits for the history to grow; ``force`` never waits.
+        ``pin``: see compact_session.
         """
         if self.halted:  # the compaction call is a model call too
             return 0
@@ -2981,11 +3218,22 @@ class GatewayServer:
                 return 0
         session.emit("status.update", {"kind": "compacting", "text": "compacting the conversation", "state": "working"})
         try:
-            folded = await self.compact_session(session)
-        except Exception:  # noqa: BLE001 - e.g. every provider rate-limited: the turn proceeds with the long history
+            folded = await self.compact_session(session, pin=pin)
+        except Exception as exc:  # noqa: BLE001 - e.g. every provider rate-limited: the turn proceeds with the long history
             logger.warning("automatic compaction failed", exc_info=True)
             session.compact_retry_at = time.monotonic() + COMPACT_RETRY_AFTER_S
             folded = 0
+            session.emit(
+                "notification.show",
+                {
+                    "text": f"Compaction failed ({type(exc).__name__}: {str(exc)[:200]}): the conversation is sent "
+                    f"whole; the next try is in {COMPACT_RETRY_AFTER_S:.0f} s",
+                    "level": "warning",
+                    "kind": "ttl",
+                    "ttl_ms": 15000,
+                    "key": f"k3.compact_failed.{session.session_id}",
+                },
+            )
         finally:  # always: the TUI shows "compacting" until it hears this
             session.emit("status.update", {"kind": "compacted", "text": "compaction done", "state": session.state})
         if folded:
@@ -3034,14 +3282,59 @@ class GatewayServer:
         """Tell the clients the session's context size (after a compaction, /clear or a model switch)."""
         session.emit("session.usage", {"usage": self.context_fields(session)})
 
-    def _request_tokens(self, session: LiveSession) -> int:
+    def _request_tokens(self, session: LiveSession, messages: list[dict[str, Any]] | None = None) -> int:
         """Estimated size of the session's next request: the stored conversation (its stored system entry is not sent:
-        the loop builds a fresh one) plus the system prompt and the tool schemas every request carries."""
+        the loop builds a fresh one; ``messages`` stands in for it) plus the system prompt and the tool schemas every
+        request carries."""
         if not session.overhead_tokens:  # no loop built yet in this daemon: the prompt and the built-in tools
             prompt = self._system_prompt_for(session)
             session.overhead_tokens = overhead_tokens(prompt, build_tool_registry().specs())
-        conversation = [m for m in session.stored.messages if m.get("role") != "system"]
-        return _estimate_tokens(conversation, tool_output_limit(self.config), session.elided) + session.overhead_tokens
+        stored = session.stored.messages if messages is None else messages
+        conversation = [m for m in stored if m.get("role") != "system"]
+        counted = self._conversation_tokens(session, conversation)
+        # the correction is for the conversation: the system prompt and the tools are estimated well, and the ratio was
+        # measured without them
+        return int(counted * self._token_ratio(session)) + session.overhead_tokens
+
+    def _conversation_tokens(self, session: LiveSession, conversation: list[dict[str, Any]]) -> int:
+        """Estimated tokens of ``conversation`` as the session's loop sends it: results elided or cut down."""
+        window = context_window(self.config, self._compaction_model(session))
+        return _estimate_tokens(conversation, tool_output_limit(self.config), session.elided, window)
+
+    @staticmethod
+    def _token_ratio(session: LiveSession) -> float:
+        """The session's correction for the token estimate; a switch to another model key starts it again."""
+        if session.token_ratio_model != (session.stored.model or ""):
+            session.token_ratio_model = session.stored.model or ""
+            session.token_ratio, session.token_ratio_stale, session.token_samples = 1.0, True, 0
+        return session.token_ratio
+
+    def _calibrate(self, session: LiveSession, usage: Usage) -> None:
+        """Compare the prompt the provider counted with the estimate of the request it counted (the loop's messages: the
+        reply that ends the call is not in them yet), so that the compaction trigger and the status bar judge by what
+        the provider will say. Not for claude-cli (the only provider that reports a cost): its count includes the
+        Claude Code prompt and tools, which this estimate does not know."""
+        loop = session.loop
+        # a call made before the turn's own loop has run (the planning turn reports through here) is not a request of
+        # its conversation
+        if loop is None or not loop.turn_messages or usage.prompt_tokens < CALIBRATE_MIN_TOKENS:
+            return
+        if usage.cost_usd is not None:
+            return
+        self._token_ratio(session)
+        session.token_samples += 1
+        if session.token_samples > 1 and session.token_samples % CALIBRATE_EVERY != 1:
+            return
+        conversation = [m for m in _serialize_messages(loop.turn_messages) if m["role"] != "system"]
+        counted = self._conversation_tokens(session, conversation)
+        carried = usage.prompt_tokens - session.overhead_tokens
+        if counted < CALIBRATE_MIN_TOKENS or carried <= 0:
+            return
+        sample = min(RATIO_MAX, max(RATIO_MIN, carried / counted))
+        if not session.token_ratio_stale:
+            sample = session.token_ratio * (1 - RATIO_WEIGHT) + sample * RATIO_WEIGHT
+        session.token_ratio = sample
+        session.token_ratio_stale = False
 
     async def _auto_title(self, session: LiveSession, first_message: str) -> None:
         """Name a fresh session on the ``title`` task kind; best-effort, never surfaces errors."""
@@ -3114,6 +3407,7 @@ class GatewayServer:
                 if u:
                     session.prompt_tokens_total += u.prompt_tokens
                     session.cache_read_tokens_total += u.cache_read_tokens
+                    self._calibrate(session, u)
                 session.call_started = None
                 session.tool_mark = time.monotonic()  # the loop executes the tool calls right after this message
                 if u:

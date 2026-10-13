@@ -386,6 +386,7 @@ class LearningHub:
                 session.perms.reload()
             if payload.get("type") == "mcp":
                 await self._reload_mcp(str(payload.get("root") or cwd))
+                _unfreeze(session, "mcp")  # the accepted server's tool names join the index
             if payload.get("type") == "commands":
                 _unfreeze(session, "facts")  # the confirmed commands replace the scanned ones in the facts block
             return msg
@@ -403,6 +404,7 @@ class LearningHub:
             )
             if session is not None:
                 session.perms.reload()
+            _unfreeze(session, "project_memory")  # an accepted "create K3CODE.md" applies to this conversation
             return msg
         if p.kind == "skill":
             return curator.apply(payload)
