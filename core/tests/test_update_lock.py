@@ -310,7 +310,8 @@ def test_rollback_holds_the_lock_while_it_switches_and_restarts(data: Path) -> N
         pid = data / LOCK / "pid"
         seen.append((pid.read_text().strip() if pid.is_file() else "", upd.current_version() or ""))
 
-    res = upd.rollback(restart=restart, daemon_installed=lambda: True)
+    # a running daemon (#232: a stopped one is left stopped, so nothing would restart)
+    res = upd.rollback(restart=restart, daemon_installed=lambda: True, daemon_stopped=lambda: False)
     assert res.ok and upd.current_version() == "1.0.0"
     assert seen == [(str(os.getpid()), "1.0.0")]  # an update cannot start building while the daemon restarts
     assert not (data / LOCK).exists()
