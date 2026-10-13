@@ -79,7 +79,7 @@ async def _probe_key(p: Any) -> tuple[bool, float | None, str]:
 async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     checks: list[Check] = []
     if not config.providers:
-        return [Check("providers", FAIL, "no providers configured", f"add providers to {k3_home() / 'config.yaml'}")]
+        return [Check("providers", FAIL, "no providers configured", "run `k3code onboard` to add one")]
     results: list[tuple[bool, float | None, str]] = []
     if probe:
         results = await asyncio.gather(
