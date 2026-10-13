@@ -1863,6 +1863,7 @@ class GatewayServer:
             context_window=self._router_window(router, session),
         )
         loop.on_checkpoint = lambda: self._checkpoint_turn(session)  # prompt + tool call hit the disk before the tool
+        loop.on_turn_start = lambda: self._checkpoint_turn(session, force=True)  # and the prompt before the model
         loop.take_steer = lambda: _take_all(session.steer_queue)
         register_todo(loop.tools, session.stored.meta)  # the list lives in the session's meta and is saved with it
         self._register_advisor(loop, session)
@@ -2289,13 +2290,18 @@ class GatewayServer:
 
         loop.tools.register(advisor.TOOL_SPEC, handler)
 
-    def _checkpoint_turn(self, session: LiveSession) -> None:
+    def _checkpoint_turn(self, session: LiveSession, *, force: bool = False) -> None:
         """After a tool result: persist the in-flight turn (throttled) so kill -9, an OOM kill or a reboot loses
-        seconds of work instead of the whole turn."""
+        seconds of work instead of the whole turn. ``force`` skips the throttle and leaves its clock alone: the turn's
+        start, which a prompt drained right after the previous turn would otherwise fall inside of, and which must not
+        close the throttle on the turn's first tool call."""
         loop = session.loop
-        if loop is None or time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+        if loop is None or (not force and time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S):
             return
+        last = session.last_checkpoint
         self._persist_turn(session, loop)
+        if force:
+            session.last_checkpoint = last
 
     async def _maybe_compact(self, session: LiveSession, *, force: bool = False) -> int:
         """Fold the older part of the conversation into a summary once it is large; returns how many messages folded.
