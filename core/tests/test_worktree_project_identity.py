@@ -118,3 +118,14 @@ async def test_a_git_file_that_is_not_a_worktree_of_that_repo_is_its_own_project
     (forged / ".claude" / "skills" / "deploy" / "SKILL.md").write_text(SKILL, encoding="utf-8")
     assert trust.decision(forged) == trust.UNDECIDED  # not the trust answer of the repo it points at
     assert skills.discover(forged) == []
+
+
+def test_a_git_file_pointing_into_a_symlink_loop_is_its_own_project(tmp_path: Path) -> None:
+    """``Path.resolve()`` raises RuntimeError on a symlink loop before Python 3.13; it must not reach a prompt build."""
+    (tmp_path / "loop").symlink_to(tmp_path / "loop")
+    hostile = tmp_path / "hostile"
+    hostile.mkdir()
+    (hostile / ".git").write_text(f"gitdir: {tmp_path / 'loop' / 'worktrees' / 'x'}\n", encoding="utf-8")
+    assert main_checkout(hostile) is None
+    assert memory.identity_root(hostile) == hostile.resolve()
+    assert trust.decision(hostile) == trust.NONE
