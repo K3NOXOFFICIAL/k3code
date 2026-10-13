@@ -56,9 +56,9 @@ def test_a_windows_profile_or_above_is_no_sandbox_root(root: str, refused: bool)
     assert sandbox.windows_profile_root(root, ["/mnt/c"]) is refused
     if refused:
         with pytest.raises(sandbox.SandboxRefused, match="Windows user profile|\\$HOME"):
-            sandbox._refuse_root(Path(root), Path("/home/nobody-here"), ["/mnt/c"])
+            sandbox._refuse_root(Path(root), Path("/home/guest"), ["/mnt/c"])
     else:
-        sandbox._refuse_root(Path(root), Path("/home/nobody-here"), ["/mnt/c"])
+        sandbox._refuse_root(Path(root), Path("/home/guest"), ["/mnt/c"])
 
 
 def test_not_wsl_means_no_windows_refusal() -> None:
