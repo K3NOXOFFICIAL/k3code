@@ -143,3 +143,70 @@ async def test_openai_error_chunk_that_also_carries_choices_raises():
     with pytest.raises(ProviderError) as exc:
         await run(openai(body))
     assert "Provider returned error" in exc.value.message and exc.value.status_code == 502
+
+
+def dropping_client(body: str, error: Exception) -> httpx.AsyncClient:
+    """A 200 stream that sends ``body`` and then dies with a transport ``error`` (the connection drops mid-read)."""
+
+    async def chunks():
+        yield body.encode()
+        raise error
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=chunks())
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+OPENAI_FINISHED = (
+    'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n'
+    'data: {"choices":[{"delta":{"content":" world"},"finish_reason":"stop"}]}\n\n'
+)
+
+
+@pytest.mark.parametrize("error", [httpx.RemoteProtocolError("peer closed connection"), httpx.ReadError("reset")])
+async def test_openai_drop_after_finish_reason_still_yields_the_whole_answer(error):
+    provider = OpenAICompatProvider(
+        name="o", base_url="https://o.test/v1", api_key="k", client=dropping_client(OPENAI_FINISHED, error)
+    )
+    events = await run(provider)
+    done = [e for e in events if e.type == "done"]
+    assert len(done) == 1 and done[0].message.content == "Hello world"
+    assert done[0].message.stop_reason == "stop"
+
+
+async def test_openai_drop_before_finish_reason_still_raises():
+    body = 'data: {"choices":[{"delta":{"content":"Half a sent"}}]}\n\n'
+    provider = OpenAICompatProvider(
+        name="o",
+        base_url="https://o.test/v1",
+        api_key="k",
+        client=dropping_client(body, httpx.RemoteProtocolError("peer closed connection")),
+    )
+    with pytest.raises(ProviderError) as exc:
+        await run(provider)
+    assert classify_api_error(exc.value, provider="o", model="m").reason == FailoverReason.server
+
+
+@pytest.mark.parametrize("error", [httpx.RemoteProtocolError("peer closed connection"), httpx.ReadError("reset")])
+async def test_anthropic_drop_after_message_stop_still_yields_the_whole_answer(error):
+    provider = AnthropicProvider(
+        name="a", base_url="https://a.test", api_key="k", client=dropping_client(OK_ANTHROPIC, error)
+    )
+    events = await run(provider)
+    done = [e for e in events if e.type == "done"]
+    assert len(done) == 1 and done[0].message.content == "Hi"
+    assert done[0].usage.completion_tokens == 1
+
+
+async def test_anthropic_drop_before_message_stop_still_raises():
+    body = OK_ANTHROPIC.replace('event: message_stop\ndata: {"type":"message_stop"}\n\n', "")
+    provider = AnthropicProvider(
+        name="a",
+        base_url="https://a.test",
+        api_key="k",
+        client=dropping_client(body, httpx.RemoteProtocolError("peer closed connection")),
+    )
+    with pytest.raises(ProviderError) as exc:
+        await run(provider)
+    assert classify_api_error(exc.value, provider="a", model="m").reason == FailoverReason.server

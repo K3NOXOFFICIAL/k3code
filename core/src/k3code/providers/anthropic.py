@@ -130,54 +130,61 @@ class AnthropicProvider(Provider):
             usage_in = usage_out = cache_read = cache_creation = 0
             stop_reason: str | None = None  # message_delta.delta.stop_reason: end_turn, tool_use, max_tokens, ...
             complete = False  # message_stop arrived
-            async for line in watchdog.lines(response):
-                if not line.startswith("data:"):
-                    continue
-                data = line[5:].strip()
-                if not data:
-                    continue
-                try:
-                    event = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                etype = event.get("type")
-                if etype == "error":
-                    raise _inband_error(event)  # overloaded_error etc. after a 200
-                if etype != "ping":  # a ping is the relay's keepalive, not the model's progress
-                    watchdog.progress()
-                if etype == "message_stop":
-                    complete = True
-                if etype == "content_block_start":
-                    block = event.get("content_block") or {}
-                    if block.get("type") == "tool_use":
-                        tool_blocks[event.get("index", 0)] = {
-                            "id": block.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
-                            "name": block.get("name") or "",
-                            "args": [],
-                        }
-                elif etype == "content_block_delta":
-                    delta = event.get("delta") or {}
-                    if delta.get("type") == "text_delta":
-                        text = delta.get("text") or ""
-                        if text:
-                            content_parts.append(text)
-                            yield StreamEvent(type="text_delta", text=text)
-                    elif delta.get("type") == "input_json_delta":
-                        slot = tool_blocks.get(event.get("index", 0))
-                        if slot is not None and (partial := delta.get("partial_json")):
-                            slot["args"].append(partial)
-                elif etype == "message_start":
-                    message = event.get("message") or {}
-                    usage = message.get("usage") or {}
-                    # prompt tokens = every input token the model read, cache hits and cache writes included, the same
-                    # definition as the claude-cli provider and the OpenAI-compatible one (whose count already has them)
-                    usage_in = sum(int(usage.get(k) or 0) for k in _INPUT_USAGE_KEYS)
-                    cache_read = int(usage.get("cache_read_input_tokens") or 0)
-                    cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
-                elif etype == "message_delta":
-                    usage = event.get("usage") or {}
-                    usage_out = int(usage.get("output_tokens") or 0)
-                    stop_reason = (event.get("delta") or {}).get("stop_reason") or stop_reason
+            try:
+                async for line in watchdog.lines(response):
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if not data:
+                        continue
+                    try:
+                        event = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    etype = event.get("type")
+                    if etype == "error":
+                        raise _inband_error(event)  # overloaded_error etc. after a 200
+                    if etype != "ping":  # a ping is the relay's keepalive, not the model's progress
+                        watchdog.progress()
+                    if etype == "message_stop":
+                        complete = True
+                    if etype == "content_block_start":
+                        block = event.get("content_block") or {}
+                        if block.get("type") == "tool_use":
+                            tool_blocks[event.get("index", 0)] = {
+                                "id": block.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
+                                "name": block.get("name") or "",
+                                "args": [],
+                            }
+                    elif etype == "content_block_delta":
+                        delta = event.get("delta") or {}
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text") or ""
+                            if text:
+                                content_parts.append(text)
+                                yield StreamEvent(type="text_delta", text=text)
+                        elif delta.get("type") == "input_json_delta":
+                            slot = tool_blocks.get(event.get("index", 0))
+                            if slot is not None and (partial := delta.get("partial_json")):
+                                slot["args"].append(partial)
+                    elif etype == "message_start":
+                        message = event.get("message") or {}
+                        usage = message.get("usage") or {}
+                        # prompt tokens = every input token the model read, cache hits and cache writes included, the
+                        # same definition as the claude-cli provider and the OpenAI-compatible one (whose count already
+                        # has them)
+                        usage_in = sum(int(usage.get(k) or 0) for k in _INPUT_USAGE_KEYS)
+                        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+                        cache_creation = int(usage.get("cache_creation_input_tokens") or 0)
+                    elif etype == "message_delta":
+                        usage = event.get("usage") or {}
+                        usage_out = int(usage.get("output_tokens") or 0)
+                        stop_reason = (event.get("delta") or {}).get("stop_reason") or stop_reason
+            except httpx.HTTPError:
+                if not complete:
+                    raise
+                # The answer is whole: a connection that drops while we wait for the trailing usage chunk (or the
+                # close) must not discard it and trigger a re-request; usage stays whatever arrived so far.
             if not complete:
                 raise to_provider_error(
                     httpx.RemoteProtocolError("peer closed connection: stream ended before message_stop"),
