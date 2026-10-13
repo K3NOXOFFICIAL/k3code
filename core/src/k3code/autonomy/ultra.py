@@ -348,7 +348,8 @@ class Ultra:
             report.notes.append(f"the review panel saw the first {REVIEW_DIFF_CHARS} of {len(diff)} diff characters")
         diff = diff[:REVIEW_DIFF_CHARS]
         self.progress(session, "ultracode", "adversarial review", ", ".join(LENSES), budget)
-        unanswered: dict[str, str] = {}
+        # a lens leaves this only with an answer: one the budget stopped before it answered stays in it
+        unanswered: dict[str, str] = dict.fromkeys(LENSES, "the budget ran out before it answered")
 
         async def lens_review(lens: str, desc: str) -> list[dict[str, Any]]:
             prompt = (
@@ -366,15 +367,21 @@ class Ultra:
                 unanswered[lens] = f"{h.status}: {h.error}" if h.status != "completed" else "no findings array"
             return []
 
-        results = await gather_or_cancel(*(lens_review(k, v) for k, v in LENSES.items()))
+        def note_unanswered() -> None:
+            if unanswered:  # a dead lens is not a lens that found nothing: say the review is incomplete
+                report.notes.append(
+                    "review INCOMPLETE: no answer from the "
+                    + ", ".join(f"{lens} lens ({why})" for lens, why in unanswered.items())
+                )
+
+        try:
+            results = await gather_or_cancel(*(lens_review(k, v) for k, v in LENSES.items()))
+        except BudgetStop:  # the report is cut short here: it still says which lenses never answered
+            note_unanswered()
+            raise
         candidates = dedupe_findings([f for r in results for f in r])
         report.candidates = candidates
-        if unanswered:
-            # a dead lens is not a lens that found nothing: say the review is incomplete
-            report.notes.append(
-                "review INCOMPLETE: no answer from the "
-                + ", ".join(f"{lens} lens ({why})" for lens, why in unanswered.items())
-            )
+        note_unanswered()
         if not candidates:
             nothing = "the lenses that answered found nothing" if unanswered else "review panel found nothing"
             report.notes.append(nothing)
