@@ -494,6 +494,17 @@ def check_sandbox(probe: bool = True) -> Check:
                 "interactive auto/yolo bash runs unsandboxed",
                 "allow unprivileged user namespaces for bwrap (try: bwrap --ro-bind / / true)",
             )
+        # bwrap starting is not enough either: a resolver file the sandbox cannot read means no host name resolves
+        hidden = sandbox.hidden_name_lookup_files() if probe else []
+        if hidden:
+            return Check(
+                "sandbox",
+                WARN,
+                f"bubblewrap at {path}, but sandboxed commands cannot read {', '.join(hidden)}: host name lookups "
+                "there may fail (git fetch, pip/npm install, curl)",
+                f"see where it links to (ls -l {hidden[0]}); the sandbox never shows a file under $HOME or the "
+                "k3code home",
+            )
         return Check("sandbox", OK, f"bubblewrap at {path}")
     return Check(
         "sandbox",
