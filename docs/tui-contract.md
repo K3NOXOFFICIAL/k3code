@@ -241,7 +241,7 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | Request | Params | Result | TUI Handles | Classification |
 |---------|--------|--------|-------------|----------------|
 | `clarify` | `{question, choices?, multi_select?, questions?, answers?}` | `{answer?, answers?}` | ✅ | M1-core |
-| `approval` | `{request_id, command, description, choices[], allow_permanent?, allow_session?, smart_denied?, tool_name?, session_id_hint?, ...}` | `{choice, all?}` | ✅ | M1-core |
+| `approval` | `{request_id, command, description, preview?, choices[], allow_permanent?, allow_session?, smart_denied?, tool_name?, session_id_hint?, ...}` | `{choice, all?}` | ✅ | M1-core |
 | `sudo` | `{command}` | `{value}` | | M1-core |
 | `secret` | `{env_var, prompt, metadata?}` | `{value}` | | M1-core |
 | `vault.unlock_prompt` | `{backend, display_name}` | `{value}` | | **cut** |
@@ -253,6 +253,8 @@ This document maps every JSON-RPC method and server→client event in the vendor
 | `preview.act` | `{action, ref?, selector?, text?, key?, submit?, full?, to?, amount?, max?, allow_shortcut?}` | `{value}` | | **cut** (desktop) |
 | `tour` | `{action, surface?, selector?, title?, text?, side?, steps?, step_index?}` | `{value}` | | **cut** (desktop) |
 | `request.cancel` | `{id, method, reason}` | — | ✅ | M1-core |
+
+`approval.preview` is sent only for `write` and `edit`: the change the call would make, as a unified diff (a new file is listed as `+` lines), capped at 200 lines of 400 characters. A file too large or not UTF-8, or an edit that will fail, gets a one-line note in parentheses instead; if making the preview fails, the field is left out and the request is sent anyway. The TUI draws it under the command, 16 rows at a time; `[` and `]` page through the rest.
 
 ---
 

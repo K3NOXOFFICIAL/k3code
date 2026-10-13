@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -46,10 +47,6 @@ def _is_omniroute(name: str, base_url: str) -> bool:
     return any(m in text for m in OMNIROUTE_MARKERS)
 
 
-async def _noop_probe() -> tuple[bool, float | None, str]:
-    return True, None, "local"
-
-
 async def _probe_provider(base_url: str, timeout: float = 5.0) -> tuple[bool, float | None, str]:
     start = time.monotonic()
     try:
@@ -76,6 +73,14 @@ async def _probe_key(p: Any) -> tuple[bool, float | None, str]:
     return False, ms, detail
 
 
+async def _probe_claude_login() -> tuple[bool, float | None, str]:
+    """`claude` on PATH is not a login. Only a Claude Code that says it is logged out fails; no answer is fine."""
+    from k3code.providers import claude_cli
+
+    logged_in = await asyncio.to_thread(claude_cli.login_status)
+    return logged_in is not False, None, "not logged in" if logged_in is False else "local"
+
+
 async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     checks: list[Check] = []
     if not config.providers:
@@ -84,10 +89,10 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     if probe:
         results = await asyncio.gather(
             *(
-                _noop_probe()
+                _probe_claude_login()
                 if p.kind == "claude-cli"
-                else _probe_key(p)
-                if p.api_key or (p.api_key_env and os.environ.get(p.api_key_env))
+                else _probe_key(p)  # a keyless entry (api_key_env "") lists its models without a key
+                if p.api_key or not p.api_key_env or os.environ.get(p.api_key_env)
                 else _probe_provider(p.base_url)
                 for p in config.providers
             )
@@ -95,14 +100,16 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
     for i, p in enumerate(config.providers):
         if p.kind == "claude-cli":  # local binary, nothing to reach over HTTP
             path = shutil.which("claude")
+            logged_out = bool(path and probe and not results[i][0])
+            if not path:
+                status, detail = FAIL, "Claude Code CLI not found on PATH"
+                fix = "install Claude Code and run `claude` once to log in, or remove this entry"
+            elif logged_out:
+                status, detail, fix = WARN, f"Claude Code CLI at {path}, but not logged in", "run `claude`, then /login"
+            else:
+                status, detail, fix = OK, f"Claude Code CLI at {path}", ""
             checks.append(
-                Check(
-                    f"provider:{p.name}",
-                    OK if path else FAIL,
-                    f"Claude Code CLI at {path}" if path else "Claude Code CLI not found on PATH",
-                    "" if path else "install Claude Code and run `claude` once to log in, or remove this entry",
-                    {"kind": "claude-cli", "command": path or ""},
-                )
+                Check(f"provider:{p.name}", status, detail, fix, {"kind": "claude-cli", "command": path or ""})
             )
             continue
         if not probe:
@@ -114,7 +121,7 @@ async def check_providers(config: Settings, probe: bool = True) -> list[Check]:
         if ok and not keyless:
             # the key answered: an auth cooldown armed by an earlier rejection is stale (the key was fixed in place)
             clear_auth_cooldowns(k3_home() / "cooldowns.json", provider=p.name)
-        if ok and keyless:
+        if ok and keyless and p.api_key_env:
             # only reachability was probed: an endpoint that answers 401 is up, but every call to it fails over
             checks.append(
                 Check(
@@ -197,14 +204,18 @@ def check_keys(config: Settings) -> Check:
     missing = [
         p.api_key_env
         for p in config.providers
-        if p.kind != "claude-cli" and not (p.api_key or os.environ.get(p.api_key_env))
+        # claude-cli uses the local login, and an entry with api_key_env "" (Ollama) declares that it takes no key
+        if p.kind != "claude-cli" and p.api_key_env and not (p.api_key or os.environ.get(p.api_key_env))
     ]
     if not config.providers:
         return Check("api-keys", WARN, "no providers, nothing to check")
     if missing:
         fake = bool(os.environ.get("K3CODE_FAKE_PROVIDER"))
         # FAIL only when no chain entry can run: a keyless fallback behind a working entry is a warning
-        usable = any(p.kind == "claude-cli" or p.api_key or os.environ.get(p.api_key_env) for p in config.providers)
+        usable = any(
+            p.kind == "claude-cli" or not p.api_key_env or p.api_key or os.environ.get(p.api_key_env)
+            for p in config.providers
+        )
         return Check(
             "api-keys",
             WARN if fake or usable else FAIL,
@@ -212,7 +223,7 @@ def check_keys(config: Settings) -> Check:
             "export them, or put them in ~/.config/k3code/env for the systemd unit",
             {"missing": sorted(set(missing))},
         )
-    keyed = sum(1 for p in config.providers if p.kind != "claude-cli")  # claude-cli uses the local login, no key
+    keyed = sum(1 for p in config.providers if p.kind != "claude-cli" and p.api_key_env)  # claude-cli, keyless: none
     return Check("api-keys", OK, f"{keyed} key env var(s) present" if keyed else "no provider needs a key")
 
 
@@ -413,29 +424,22 @@ def find_repo_root() -> Path | None:
 
 
 def check_tui() -> Check:
-    from k3code.paths import find_node
+    from k3code.paths import MIN_NODE_MAJOR, NODE_ENV, resolve_node
 
-    node = find_node()
+    choice = resolve_node()
     root = find_repo_root()
     entry = root / "tui" / "dist" / "entry.js" if root else None
-    version = ""
-    if node:
-        r = subprocess.run([node, "--version"], capture_output=True, text=True, check=False)
-        version = r.stdout.strip()
-    if not node:
-        return Check("tui", FAIL, "node not found", "install Node.js >= 20")
-    major = int(version.lstrip("v").split(".")[0] or 0) if version else 0
+    fix = f"install Node.js >= {MIN_NODE_MAJOR}, run the k3code installer, or set {NODE_ENV}"
+    if not choice.path:
+        status = WARN if choice.old else FAIL
+        return Check("tui", status, choice.reason, fix, {"node": choice.old.split(" ")[0]} if choice.old else {})
+    used = f"node {choice.version} ({choice.reason}: {choice.path})"
+    data = {"node": choice.version, "path": choice.path, "source": choice.source}
     if entry is None or not entry.is_file():
-        return Check(
-            "tui",
-            WARN,
-            f"node {version}, TUI build missing",
-            "cd tui && npm install && npm run build",
-            {"node": version},
-        )
-    if major < 20:
-        return Check("tui", WARN, f"node {version} is old", "upgrade to Node.js >= 20", {"node": version})
-    return Check("tui", OK, f"node {version}, tui/dist/entry.js present", data={"node": version})
+        return Check("tui", WARN, f"{used}, TUI build missing", "cd tui && npm install && npm run build", data)
+    if choice.major < MIN_NODE_MAJOR:  # only K3CODE_NODE can name a node that old
+        return Check("tui", WARN, f"{used} is old", f"use Node.js >= {MIN_NODE_MAJOR} (or unset {NODE_ENV})", data)
+    return Check("tui", OK, f"{used}, tui/dist/entry.js present", data=data)
 
 
 def check_home(home: Path) -> Check:
@@ -528,6 +532,46 @@ def check_isolation() -> Check:
     return Check("hermes-isolation", OK, "no Hermes env; k3code reads only its own config and environment")
 
 
+# The libraries a bare Debian/Ubuntu is missing for Chromium's headless shell (seen on a fresh Ubuntu 24.04 WSL), and
+# the apt package that ships each. Any other missing library is left to Playwright, which keeps the full list.
+_CHROMIUM_APT_LIBS = {
+    "libnspr4.so": "libnspr4",
+    "libnss3.so": "libnss3",
+    "libnssutil3.so": "libnss3",
+    "libasound.so.2": "libasound2",
+}
+
+
+def _missing_libraries(binary: Path) -> list[str]:
+    """The shared libraries the loader cannot find for ``binary``, from ldd (the browser itself is not started)."""
+    ldd = shutil.which("ldd")
+    if ldd is None:
+        return []
+    try:
+        r = subprocess.run([ldd, str(binary)], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [ln.split("=>")[0].strip() for ln in r.stdout.splitlines() if ln.rstrip().endswith("=> not found")]
+
+
+def _apt_package(name: str) -> str:
+    """Ubuntu 24.04 renamed some libraries to ``<name>t64`` (libasound2 among them); older releases keep ``name``."""
+    try:
+        r = subprocess.run(["apt-cache", "show", name + "t64"], capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return name
+    return name + "t64" if r.returncode == 0 else name
+
+
+def _libraries_fix(missing: list[str]) -> str:
+    if shutil.which("apt-get") is None:
+        return f"install the packages that provide {', '.join(missing)} with your system package manager"
+    packages = [_CHROMIUM_APT_LIBS.get(lib) for lib in missing]
+    if None in packages:
+        return f"sudo {shlex.quote(sys.executable)} -m playwright install-deps chromium-headless-shell"
+    return "sudo apt-get install -y " + " ".join(_apt_package(p) for p in dict.fromkeys(packages) if p)
+
+
 def check_browser() -> Check:
     """The optional browser tool: Playwright importable and Chromium where presetup puts it (local probe only)."""
     import importlib.util
@@ -538,23 +582,37 @@ def check_browser() -> Check:
     location = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or data_dir() / "browsers")
     has_chromium = location.is_dir() and any(location.glob("chromium*"))
     if has_playwright and has_chromium:
-        # a directory is not a browser: look for the executable (never launched here)
+        # a directory is not a browser: look for the executable (never launched here); Playwright 1.63's headless
+        # shell is chrome-headless-shell, older builds named it headless_shell
+        names = ("chrome-headless-shell", "chrome-headless-shell.exe", "chrome", "headless_shell", "chrome.exe")
         binary = next(
             (
                 p
                 for d in location.glob("chromium*")
-                for name in ("chrome", "headless_shell", "chrome.exe")
+                for name in names
                 for p in d.rglob(name)
                 if p.is_file() and os.access(p, os.X_OK)
             ),
             None,
         )
         if binary is None:
+            # the installer and a plain `playwright install` both skip a directory they already installed into
             return Check(
                 "browser",
                 WARN,
                 f"Chromium directory at {location} has no executable browser; the browser tool is off",
-                "re-run the installer without --minimal",
+                f"PLAYWRIGHT_BROWSERS_PATH={location} {sys.executable} -m playwright install"
+                " --force --only-shell chromium",
+            )
+        missing = _missing_libraries(binary)
+        if missing:
+            return Check(
+                "browser",
+                WARN,
+                f"Chromium at {location} cannot start: the system libraries {', '.join(missing)} are missing; "
+                "the browser tool is off",
+                _libraries_fix(missing),
+                data={"path": str(location), "exe": str(binary), "missing_libraries": missing},
             )
         return Check(
             "browser", OK, f"Playwright and Chromium at {location}", data={"path": str(location), "exe": str(binary)}

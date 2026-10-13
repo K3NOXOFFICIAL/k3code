@@ -1110,6 +1110,7 @@ export function useMainApp(gw: GatewayClient) {
     composerRefs,
     composerState,
     gw,
+    scrollRef,
     setLastUserMsg,
     slashRef,
     submitRef,

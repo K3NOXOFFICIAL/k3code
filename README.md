@@ -85,7 +85,7 @@ The installer creates a versioned install under `~/.local/share/k3code/` and lin
 
 Useful flags: `--ref REF` (a tag, branch or commit), `--prefix DIR`, `--no-install-deps` (fetch nothing; fail or skip with hints instead), `--check` (reports the platform and missing dependencies, changes nothing), `--from-bundle FILE` (imports a `k3code export`), `--minimal` (skips presetup, below), `--force` (replace a `k3code` or `k3` in `~/.local/bin` that is not this installer's link), `--allow-root` (the installer refuses root and sudo otherwise, for example for a container). Uninstall with `sh install/uninstall.sh`; it removes the versions, the links and the Chromium location under `~/.local/share/k3code`, and keeps your data (`~/.k3code`, `~/.config/k3code`) unless you pass `--purge`, which asks you to type `yes` (`--purge --yes` without asking).
 
-**Presetup** runs after the install and is on by default; it never fails the install. It checks the sandbox (`bwrap`): when it is missing, it prints the install command for your distribution and runs nothing (it asks for a `sudo` run only on an interactive terminal, never with `--yes`). It installs Chromium for the browser tool (the headless shell, about 115 MiB download and about 266 MB on disk; `K3CODE_SKIP_CHROMIUM=1` skips only this), and prints a health subset (`k3code doctor --install`, warnings only). `--minimal` skips all of it.
+**Presetup** runs after the install and is on by default; it never fails the install. It checks the sandbox (`bwrap`): when it is missing, it prints the install command for your distribution and runs nothing (it asks for a `sudo` run only on an interactive terminal, never with `--yes`). It installs Chromium for the browser tool (the headless shell, about 115 MiB download and about 266 MB on disk; `K3CODE_SKIP_CHROMIUM=1` skips only this) and starts it once; when the system libraries it needs are missing (a bare Ubuntu lacks `libnss3`, `libnspr4` and `libasound2`), it names them as a warning and `k3code doctor` gives the install command. Then it prints a health subset (`k3code doctor --install`, warnings only). `--minimal` skips all of it.
 
 ### First run
 
@@ -95,7 +95,7 @@ k3code doctor     # health checks with fix hints
 k3code            # start the TUI
 ```
 
-A plain interactive start with no provider configured asks once, "fast or full setup?", and does not ask again (the answer is kept in `$K3CODE_HOME/onboarding.json`). Fast asks only for an API endpoint and key (or the `claude-cli` provider); run over an existing config, it puts that provider first and keeps your other providers behind it as fallbacks. Full runs the whole setup wizard. Nothing is forced: `k3code onboard` works at any time, and a headless `-p` or piped run without a provider prints one hint and exits with code 78 instead of prompting.
+A plain interactive start with no provider configured asks once, "fast or full setup?", and does not ask again (the answer is kept in `$K3CODE_HOME/onboarding.json`). Fast asks only for an API endpoint and key (or the `claude-cli` provider) and checks the key against the endpoint's model list before storing it: a key the endpoint rejects is not stored (interactively it asks again, up to three keys; with `--answers` it exits 1, and `--no-probe` skips the check); run over an existing config, it puts that provider first and keeps your other providers behind it as fallbacks. Full runs the whole setup wizard. Nothing is forced: `k3code onboard` works at any time, and a headless `-p` or piped run without a provider prints one hint and exits with code 78 instead of prompting.
 
 The full wizard has 12 steps: `welcome`, `about`, `system`, `usage`, `providers`, `tiers`, `permissions`, `integrations`, `theme`, `service`, `tour`, `summary`. It asks about you, your system, what you mainly use k3code for, your provider chain, model tiers, permissions, optional integrations (MCP, mem0, skills), the theme, and whether to install the 24/7 service. When asked for a provider key, the input is hidden and the key is saved in `~/.config/k3code/env` (mode 0600); the config only names the variable. Run one step again with `k3code setup --step NAME`.
 
@@ -178,7 +178,7 @@ The command-line flag `--permission` takes `ask`, `auto-edit`, `auto` or `yolo`.
 
 In `auto` mode every new task is classified first (`trivial`, `small`, `medium`, `large`, `huge`; override with `/scope`). Small, low-risk tasks run directly. Anything bigger gets a read-only planning turn on the strong tier, then runs.
 
-`large` and `huge` tasks with independent parts are split into parallel workers in separate git worktrees (this needs a git repository with at least one commit). Each result is reviewed and merged, and tested before it is kept when the project has a test command: set `autonomy.fanout.test_command`, or it is detected for pytest, npm, Go and Cargo projects.
+`large` and `huge` tasks with independent parts are split into parallel workers in separate git worktrees (this needs a git repository with at least one commit). Each result is reviewed and merged, and tested before it is kept when the project has a test command: set `autonomy.fanout.test_command`, or it is detected for pytest, npm, Go and Cargo projects (pytest runs with the project's `.venv/bin/python` when there is one, else `python3`). The tests run in the sandbox, so when bubblewrap is unusable or a detected test command cannot start there, fan-out is skipped with a notice and the task runs as one turn.
 
 `/ultracode <task>` is the full pipeline: three independent plans and a judge, parallel implementation, a two-reviewer adversarial panel where a finding counts only if both agree, fixes, and a final test run, all under a token and agent budget (`ultracode.max_tokens`, `ultracode.max_agents`). It can also stay on for a whole session ([Ultracode mode](#ultracode-mode)) or run when you say its name in a prompt ([Wake words](#wake-words)).
 
@@ -351,7 +351,8 @@ providers:                          # the fallback chain, in order (add as many 
   - name: gateway
     kind: openai                    # openai-compatible, or: anthropic
     base_url: https://your-gateway.example/v1
-    api_key_env: GATEWAY_API_KEY    # the NAME of an environment variable (or a key in ~/.config/k3code/env)
+    api_key_env: GATEWAY_API_KEY    # the NAME of an environment variable (or a key in ~/.config/k3code/env);
+                                    #   "" for a server that takes no key (Ollama): no key header is sent
     models:
       default: [model-a, model-b]   # tried in order before moving to the next provider
       strong: model-strong          # planning, review, advisor

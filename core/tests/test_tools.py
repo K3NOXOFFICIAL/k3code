@@ -9,7 +9,16 @@ from pathlib import Path
 
 import pytest
 
-from k3code.tools import build_registry, tool_bash, tool_edit, tool_glob, tool_grep, tool_read, tool_write
+from k3code.tools import (
+    build_registry,
+    format_tool_result,
+    tool_bash,
+    tool_edit,
+    tool_glob,
+    tool_grep,
+    tool_read,
+    tool_write,
+)
 
 # ── Fixtures ───────────────────────────────────────────────────────────
 
@@ -142,6 +151,61 @@ async def test_edit_replace_all(temp_dir):
     assert result["ok"] is True
     assert result["replacements"] == 2
     assert f.read_text() == "bar\nbar\n"
+
+
+async def test_edit_by_similarity_shows_the_text_it_replaced(temp_dir):
+    # #103: old_string only resembled the file, a different value was rewritten and the result did not say which
+    f = temp_dir / "conf.py"
+    f.write_text("MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 30\n")
+    result = await tool_edit(
+        {
+            "path": str(f),
+            "old_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 35",
+            "new_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 60",
+        },
+        cwd=temp_dir,
+    )
+    assert result["strategy"] == "context_aware"
+    assert format_tool_result(result) == (
+        "Edited: 1 replacement (matched by context_aware, not exactly)\n"
+        "old_string is not in the file; it replaced this similar text at lines 1-3. Check it is what you meant:\n"
+        "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 30"
+    )
+
+    f.write_bytes(b"# conf\r\nMAX_RETRIES = 3\r\nDELAY = 2\r\nTIMEOUT = 30\r\n")  # matched as LF text, written as CRLF
+    result = await tool_edit(
+        {
+            "path": str(f),
+            "old_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 35",
+            "new_string": "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 60",
+        },
+        cwd=temp_dir,
+    )
+    assert (result["line"], result["replaced"]) == (2, "MAX_RETRIES = 3\nDELAY = 2\nTIMEOUT = 30")
+    assert f.read_bytes() == b"# conf\r\nMAX_RETRIES = 3\r\nDELAY = 2\r\nTIMEOUT = 60\r\n"
+
+    g = temp_dir / "g.py"
+    g.write_text("import os\n\ndef g():\n    x = 1\n    y = 2\n    z = 3\n    return x\n")
+    result = await tool_edit(
+        {
+            "path": str(g),
+            "old_string": "def g():\n    x = 10\n    y = 20\n    q = 99\n    return x",
+            "new_string": "def g():\n    x = 7\n    return x",
+        },
+        cwd=temp_dir,
+    )
+    assert result["strategy"] == "block_anchor"
+    text = format_tool_result(result)
+    assert "at lines 3-7" in text
+    assert text.endswith("def g():\n    x = 1\n    y = 2\n    z = 3\n    return x")  # z = 3 is gone: now it says so
+
+
+async def test_edit_with_a_precise_match_stays_one_line(temp_dir):
+    f = temp_dir / "conf.py"
+    f.write_text("TIMEOUT = 30\n")
+    result = await tool_edit({"path": str(f), "old_string": " TIMEOUT = 30", "new_string": "TIMEOUT = 6"}, cwd=temp_dir)
+    assert result == {"ok": True, "replacements": 1, "strategy": "line_trimmed"}
+    assert format_tool_result(result) == "Edited: 1 replacement (matched by line_trimmed, not exactly)"
 
 
 async def test_bash_simple(temp_dir):

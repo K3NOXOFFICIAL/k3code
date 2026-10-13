@@ -15,6 +15,8 @@ from typing import Any
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
+    SIMILARITY_STRATEGIES,
+    STRATEGIES,
     format_no_match_hint,
     fuzzy_find_and_replace,
 )
@@ -227,8 +229,21 @@ async def tool_write(arguments: dict[str, Any], *, cwd: Path | None = None) -> d
     return {"ok": True, "path": str(path)}
 
 
-async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included)."""
+@dataclasses.dataclass
+class EditPlan:
+    """What ``edit`` will write: the file's text before and after, both with LF line ends."""
+
+    path: Path
+    before: str
+    after: str
+    crlf: bool  # written back with CRLF line ends
+    count: int
+    strategy: str
+
+
+def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan | dict[str, Any]:
+    """The change ``edit`` would make, or its error result; nothing is written. The approval prompt shows the same
+    change (issue #131), so this is the one place the replacement is computed."""
     path = _resolve_path(arguments["path"], cwd)
     if not path.is_file():
         return {"error": f"File not found: {path}"}
@@ -255,10 +270,26 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     if error:
         hint = format_no_match_hint(error, count, old_string, content)
         return {"error": error + hint}
-    if crlf:
-        new_content = new_content.replace("\n", "\r\n")
-    _atomic_write(path, new_content.encode("utf-8"))
-    return {"ok": True, "replacements": count, "strategy": strategy}
+    return EditPlan(path, content, new_content, crlf, count, strategy)
+
+
+async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
+    """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included)."""
+    plan = plan_edit(arguments, cwd=cwd)
+    if isinstance(plan, dict):
+        return plan
+    result: dict[str, Any] = {"ok": True, "replacements": plan.count, "strategy": plan.strategy}
+    if plan.strategy in SIMILARITY_STRATEGIES:
+        # old_string only resembles what was replaced (a value the model misremembered): name the file's real text.
+        # Such a match is always unique, so the strategy finds the same one span again.
+        old_string = arguments["old_string"]
+        if plan.crlf:
+            old_string = old_string.replace("\r\n", "\n")  # plan.before has LF line ends, as plan_edit matched it
+        [(start, end)] = dict(STRATEGIES)[plan.strategy](plan.before, old_string)
+        result.update(replaced=plan.before[start:end], line=plan.before.count("\n", 0, start) + 1)
+    new_content = plan.after.replace("\n", "\r\n") if plan.crlf else plan.after
+    _atomic_write(plan.path, new_content.encode("utf-8"))
+    return result
 
 
 #: bash: seconds before a foreground command is killed, when the call names no timeout, and the most it may name.
@@ -401,10 +432,19 @@ def format_tool_result(result: dict[str, Any]) -> Any:
         return f"{text}\n[{result['note']}]" if result.get("note") else text
     if result.keys() == {"ok", "path"} and result["ok"] is True:  # write
         return f"Wrote {result['path']}"
-    if result.keys() == {"ok", "replacements", "strategy"} and result["ok"] is True:  # edit
+    if result.keys() - {"replaced", "line"} == {"ok", "replacements", "strategy"} and result["ok"] is True:  # edit
         n = result["replacements"]
         how = "" if result["strategy"] == "exact" else f" (matched by {result['strategy']}, not exactly)"
-        return f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
+        text = f"Edited: {n} replacement{'' if n == 1 else 's'}{how}"
+        if "replaced" in result:  # a similarity match: the text it replaced is not old_string
+            first = result["line"]
+            last = first + result["replaced"].count("\n")
+            where = f"line {first}" if first == last else f"lines {first}-{last}"
+            text += (
+                f"\nold_string is not in the file; it replaced this similar text at {where}. "
+                f"Check it is what you meant:\n{result['replaced']}"
+            )
+        return text
     if result.keys() == {"error"}:
         return f"Error: {result['error']}"
     return str(result)
@@ -662,7 +702,9 @@ def _skipped_subpath(rel: str) -> bool:
 
 def _git_files(path: Path) -> list[str] | None:
     """Files under ``path`` that git tracks or would track (``.gitignore`` honoured), relative to ``path``; None when
-    ``path`` is not in a git work tree or git is missing."""
+    ``path`` is not in a git work tree or git is missing. An index entry whose file is gone (deleted or moved without
+    staging) is listed too: callers stat only the paths they keep, since one stat per listed file took minutes for a
+    big checkout on WSL's /mnt/c."""
     import subprocess
 
     try:
@@ -677,20 +719,24 @@ def _git_files(path: Path) -> list[str] | None:
         return None
     if out.returncode != 0:
         return None
-    # -c lists index entries whose file is gone (deleted or moved without staging): the work tree decides.
-    return [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f and os.path.lexists(path / f)]
+    return [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f]
 
 
 def _iter_tree(path: Path, deadline: float) -> Iterator[tuple[str | None, bool]]:
     """Yield ``(relative posix path, is_dir)`` under ``path``: from git when ``path`` is in a work tree (so
-    ``.gitignore`` holds), else from a walk pruning WALK_SKIP_DIRS and SKIP_SUBPATHS. Past ``deadline``
-    (``time.monotonic``) it yields ``(None, False)`` once and stops, so the caller can say the result is partial."""
+    ``.gitignore`` holds; that listing may name a file deleted from the work tree, see ``_git_files``), else from a
+    walk pruning WALK_SKIP_DIRS and SKIP_SUBPATHS. Past ``deadline`` (``time.monotonic``) it yields ``(None, False)``
+    once and stops, so the caller can say the result is partial."""
     tracked = _git_files(path)
     if tracked:  # empty: not a work tree, or a path git ignores as a whole (asked for on purpose): walk it
         files = [f for f in tracked if not SKIP_DIRS.intersection(f.split("/")[:-1]) and not _skipped_subpath(f)]
         dirs = sorted({"/".join(f.split("/")[:i]) for f in files for i in range(1, f.count("/") + 1)})
-        yield from ((f, False) for f in files)
-        yield from ((d, True) for d in dirs)
+        for entries, is_dir in ((files, False), (dirs, True)):
+            for rel in entries:
+                if time.monotonic() > deadline:
+                    yield None, False
+                    return
+                yield rel, is_dir
         return
     if shutil.which("rg"):
         yield from _rg_files(path, deadline)
@@ -785,7 +831,8 @@ def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
         if rel is None:
             timed_out = True
             break
-        if basename_ok(rel.rpartition("/")[2]) and _glob_match(rel, pattern):
+        # the work tree decides on a hit the index still lists (see _git_files); a stat per listed path would not
+        if basename_ok(rel.rpartition("/")[2]) and _glob_match(rel, pattern) and os.path.lexists(path / rel):
             found.append(rel)
             if len(found) > MAX_SEARCH_RESULTS:  # one past the cap proves the cut; no need to walk further
                 break
@@ -805,6 +852,47 @@ def _search_glob_match(rel: str, pattern: str) -> bool:
     return _match_parts(rel.split("/"), pattern.lstrip("/").split("/"))
 
 
+#: The grep fallback treats a file with a NUL byte in its first _BINARY_SNIFF_BYTES as binary (as ripgrep does), reads
+#: in pieces of at most _GREP_PIECE_BYTES and looks at the clock every _GREP_CLOCK_BYTES: read_text of a 300 MB binary
+#: took 2.6 GB of memory and ran past the time budget.
+_BINARY_SNIFF_BYTES = 8192
+_GREP_PIECE_BYTES = 1 << 20
+_GREP_CLOCK_BYTES = 64 * 1024
+
+
+def _grep_file(fp: Path, rx: Any, deadline: float, *, named: bool = False) -> Iterator[str | None]:
+    """``path:line:text`` for each line of ``fp`` that ``rx`` matches, streamed, cut to _RG_MAX_COLUMNS like rg's
+    preview. A binary file found in a walk is skipped; one ``named`` on purpose gives a single ``path: binary file
+    matches`` line, as rg says. Past ``deadline`` (``time.monotonic``) it yields None once and stops. A line longer than
+    _GREP_PIECE_BYTES is searched piece by piece under its own line number, so a match across a piece edge, or an
+    anchor at one, is approximate."""
+    with fp.open("rb") as f:
+        binary = b"\0" in f.read(_BINARY_SNIFF_BYTES)
+        if binary and not named:
+            return
+        f.seek(0)
+        number, line_start, unclocked = 0, True, 0
+        for raw in iter(lambda: f.readline(_GREP_PIECE_BYTES), b""):
+            unclocked += len(raw)
+            if unclocked >= _GREP_CLOCK_BYTES:
+                unclocked = 0
+                if time.monotonic() > deadline:
+                    yield None
+                    return
+            if line_start:  # a piece of a longer line keeps that line's number
+                number += 1
+            line_start = raw.endswith(b"\n")
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not rx.search(line):
+                continue
+            if binary:
+                yield f"{fp}: binary file matches"
+                return
+            if len(line) > _RG_MAX_COLUMNS:
+                line = line[:_RG_MAX_COLUMNS] + " [... omitted end of long line]"
+            yield f"{fp}:{number}:{line}"
+
+
 def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict[str, Any]:
     import re
 
@@ -812,7 +900,8 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
     excludes = exclude if isinstance(exclude, list) else [exclude] if exclude else []
     rx = re.compile(pattern)
     deadline = time.monotonic() + SEARCH_BUDGET_S
-    if path.is_file():
+    named = path.is_file()
+    if named:
         base, candidates = path.parent, iter([(path.name, False)])
     else:
         base, candidates = path, _iter_tree(path, deadline)
@@ -830,11 +919,16 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         if excludes and any(_search_glob_match(rel, p) for p in excludes):
             continue
         try:
-            text = fp.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            for hit in _grep_file(fp, rx, deadline, named=named):
+                if hit is None:
+                    timed_out = True
+                    break
+                matches.append(hit)
+                if len(matches) > MAX_SEARCH_RESULTS:
+                    break
+        except OSError:  # unreadable, or an index entry deleted from the work tree (see _git_files)
             continue
-        matches.extend(f"{fp}:{i}:{line}" for i, line in enumerate(text.splitlines(), 1) if rx.search(line))
-        if len(matches) > MAX_SEARCH_RESULTS:
+        if timed_out or len(matches) > MAX_SEARCH_RESULTS:
             break
     shown, note = _capped(matches)
     if timed_out:
