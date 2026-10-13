@@ -199,6 +199,26 @@ async def test_fetch_page_resolves_links_against_the_url_after_redirects():
     assert text == "Read the [guide](https://docs.test/docs/v2/guide.html)."
 
 
+async def test_a_fetched_page_is_parsed_off_the_event_loop(monkeypatch):
+    """Links and tables make the parse heavier (a link-dense 2 MiB page takes seconds): it must not stall the daemon."""
+    import threading
+
+    from k3code.research import tools as t
+
+    seen: list[str] = []
+    real = t.extract_text
+    monkeypatch.setattr(t, "extract_text", lambda m, *a: (seen.append(threading.current_thread().name), real(m, *a))[1])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=PAGE)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        _, text = await fetch_page("https://plain.test/p", client=client)
+    assert text == "hello world" and seen and seen[0] != threading.main_thread().name
+
+
 async def test_redirect_hops_are_checked_against_robots_and_the_host_bucket():
     clock, hits = FakeClock(), []
 

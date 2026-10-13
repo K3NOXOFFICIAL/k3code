@@ -271,7 +271,7 @@ async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | No
     if not 200 <= got.status < 300:
         raise FetchStatus(got.status, url)
     if "html" in got.content_type or got.body.lstrip().lower().startswith(("<!doctype", "<html")):
-        title, text = extract_text(got.body, got.url)
+        title, text = await asyncio.to_thread(extract_text, got.body, got.url)  # off the event loop: CPU-bound
     else:
         title, text = url, got.body
     if got.truncated:
