@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from k3code.autonomy.proposals import ProposalStore, dedup_key
-from k3code.learning.decisions import DecisionLog
+from k3code.learning.decisions import DecisionLog, project_id
 from k3code.paths import ensure_private_dir, private_file
 from k3code.providers.types import Message
 from k3code.redact import scrub_text
@@ -293,9 +293,17 @@ MEM0_POSTED = "mem0_posted.json"
 MEM0_POSTED_MAX = 2000
 
 
-def _posted_key(m: Any, text: str) -> str:
-    """Same text to the same mem0 target = same key; another url, agent or user posts again."""
-    return hashlib.sha256(f"{m.url}\0{m.agent_id}\0{m.user_id}\0{text}".encode()).hexdigest()[:24]
+def project_scope(cwd: str | Path, project: str = "") -> dict[str, str]:
+    """The mem0 scope of a fact that is only true of one project: its stable id and a short repo name."""
+    pid = project or project_id(cwd)
+    repo = re.split(r"[/:]", pid)[-1] if pid.startswith("git:") else Path(cwd).resolve().name
+    return {"project": pid, "repo": repo or "project", "scope": "project"}
+
+
+def _posted_key(m: Any, text: str, scope: dict[str, str] | None = None) -> str:
+    """Same text to the same mem0 target = same key; another url, agent, user or project posts again."""
+    where = f"\0{scope['project']}" if scope else ""
+    return hashlib.sha256(f"{m.url}\0{m.agent_id}\0{m.user_id}{where}\0{text}".encode()).hexdigest()[:24]
 
 
 def _load_posted(path: Path) -> list[str]:
@@ -318,11 +326,14 @@ def store_mem0(
     prefs: list[Preference],
     post: Callable[[str, dict[str, Any], dict[str, str]], None] | None = None,
     posted: Path | None = None,
+    scope: dict[str, str] | None = None,
 ) -> int:
     """Store each preference as a mem0 memory when mem0 is configured. The key comes from the env only.
 
     ``posted`` is a JSON file of what was already sent: a preference posted before is skipped (the daily distill
-    re-derives every preference and posted each one again, every day). Returns how many were posted now."""
+    re-derives every preference and posted each one again, every day). ``scope`` (see :func:`project_scope`) marks
+    a project fact: it names the project in the text and metadata, so another repo's recall does not read it as a
+    trait of the user. Returns how many were posted now."""
     m = getattr(config, "mem0", None)
     if m is None or not m.url:
         return 0
@@ -339,14 +350,20 @@ def store_mem0(
 
     n = 0
     for p in prefs:
-        key = _posted_key(m, p.text)
+        key = _posted_key(m, p.text, scope)
         if key in seen:
             continue
+        label = f"Project fact ({scope['repo']}, learned by k3code)" if scope else "User preference (learned by k3code)"
         body = {
-            "messages": [{"role": "user", "content": f"User preference (learned by k3code): {p.text}"}],
+            "messages": [{"role": "user", "content": f"{label}: {p.text}"}],
             "agent_id": m.agent_id,
             **({"user_id": m.user_id} if m.user_id else {}),
-            "metadata": {"confidence": p.confidence, "evidence": p.evidence, "source": "k3code-distiller"},
+            "metadata": {
+                "confidence": p.confidence,
+                "evidence": p.evidence,
+                "source": "k3code-distiller",
+                **(scope or {}),
+            },
         }
         try:
             post(m.url.rstrip("/") + "/memories", body, headers)

@@ -135,3 +135,74 @@ async def test_review_mem0_writes_do_not_block_the_event_loop_thread(tmp_path):
         mem0_post=lambda u, b, h: threads.append(threading.current_thread()),
     )
     assert threads and all(t is not threading.main_thread() for t in threads)
+
+
+def _git_repo(path, remote):
+    import subprocess
+
+    path.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(path), "remote", "add", "origin", remote], check=True)
+
+
+async def _review_into_mem0(tmp_path, repo, *, project=""):
+    from k3code.config import Mem0Config, Settings
+
+    sent: list[dict] = []
+    await review.review_session(
+        FakeCaller(REPLY),
+        convo(8),
+        store=ProposalStore(tmp_path),
+        cwd=repo,
+        config=Settings(mem0=Mem0Config(url="http://m")),
+        min_turns=6,
+        mem0_post=lambda u, b, h: sent.append(b),
+        project=project,
+    )
+    return sent
+
+
+async def test_review_facts_posted_to_mem0_carry_the_project_scope(tmp_path, monkeypatch):
+    """A project fact ('tests run with uv run pytest') posted bare is recalled in every other repo as a user trait."""
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    repo = tmp_path / "billing"
+    _git_repo(repo, "https://x-access-token:ghp_notarealtoken@github.com/secretco/secretco-billing.git")
+    (body,) = await _review_into_mem0(tmp_path, repo)
+    assert body["metadata"]["scope"] == "project"
+    assert body["metadata"]["project"] == "git:github.com/secretco/secretco-billing"
+    assert body["metadata"]["repo"] == "secretco-billing"
+    text = body["messages"][0]["content"]
+    assert "secretco-billing" in text and "uv run pytest -q" in text
+    assert "ghp_notarealtoken" not in json.dumps(body)  # the remote's userinfo never leaves the machine
+    assert body["metadata"]["source"] == "k3code-distiller"  # what a mem0 filter already keys on stays
+
+
+async def test_review_facts_scope_a_repo_without_a_remote_by_its_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    (tmp_path / "scratch").mkdir()
+    (body,) = await _review_into_mem0(tmp_path, tmp_path / "scratch")
+    assert body["metadata"]["project"].startswith("path:") and body["metadata"]["repo"] == "scratch"
+    assert "scratch" in body["messages"][0]["content"]
+
+
+async def test_the_same_fact_in_two_projects_is_posted_for_each(tmp_path, monkeypatch):
+    """The posted ledger de-duplicates by text; a fact true in one repo must still reach mem0 for the other."""
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    for name in ("a", "b"):
+        (tmp_path / name).mkdir()
+    sent = await _review_into_mem0(tmp_path, tmp_path / "a")
+    sent += await _review_into_mem0(tmp_path, tmp_path / "b")
+    assert [s["metadata"]["repo"] for s in sent] == ["a", "b"]
+    again = await _review_into_mem0(tmp_path, tmp_path / "a")
+    assert again == []  # but the same fact in the same project is still posted once
+
+
+def test_a_user_preference_stays_unscoped(tmp_path):
+    from k3code.config import Mem0Config, Settings
+
+    sent: list[dict] = []
+    cfg = Settings(mem0=Mem0Config(url="http://m"))
+    distiller.store_mem0(cfg, [distiller.Preference("prefers tabs", 0.9, 4)], lambda u, b, h: sent.append(b))
+    (body,) = sent
+    assert body["messages"][0]["content"] == "User preference (learned by k3code): prefers tabs"
+    assert set(body["metadata"]) == {"confidence", "evidence", "source"}

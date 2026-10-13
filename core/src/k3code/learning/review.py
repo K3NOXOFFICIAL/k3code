@@ -96,13 +96,16 @@ async def review_session(
 
         merged = list(dict.fromkeys([*read_learned(cwd), *facts]))[-30:]
         write_learned(cwd, merged)
-        # store_mem0 is blocking HTTP (10 s per fact): never on the gateway's event loop
+        # store_mem0 is blocking HTTP (10 s per fact) and project_scope may run git: never on the gateway's event
+        # loop. The facts are about this project (commands, hosts, conventions), so mem0 gets them scoped to it.
         await asyncio.to_thread(
-            distiller.store_mem0,
-            config,
-            [distiller.Preference(f, 0.6, 1) for f in facts],
-            mem0_post,
-            home() / "learning" / distiller.MEM0_POSTED,  # a fact seen again in a later review is not posted again
+            lambda: distiller.store_mem0(
+                config,
+                [distiller.Preference(f, 0.6, 1) for f in facts],
+                mem0_post,
+                home() / "learning" / distiller.MEM0_POSTED,  # a fact seen again in a later review is not posted again
+                distiller.project_scope(cwd, project),
+            )
         )
     drafts: list[str] = []
     props: list[Proposal] = []
