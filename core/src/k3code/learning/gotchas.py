@@ -98,12 +98,60 @@ def remove_gotcha(path: Path, line: str) -> bool:
     return True
 
 
+#: ``project_id`` per resolved cwd with the stamp of the git config it was read under: the prompt is built on every
+#: turn and every token estimate, and ``project_id`` spawns ``git config`` (blocking, 3 s timeout) each time
+_PID_CACHE: dict[str, tuple[tuple[Any, ...], str]] = {}
+_PID_CACHE_MAX = 256
+
+
+def _git_config_stamp(cwd: Path) -> tuple[Any, ...]:
+    """Identify the repository config that decides ``remote.origin.url`` for ``cwd``: (path, mtime_ns, size).
+
+    A linked worktree (fan-out workers) has a ``.git`` file; its config is the main repository's, found through
+    ``commondir``. ``()`` when ``cwd`` is in no repository, which a later ``git init`` changes. Reads two or three
+    small files, no process.
+    """
+    try:
+        for d in (cwd, *cwd.parents):
+            dot_git = d / ".git"
+            if dot_git.is_dir():
+                git_dir = dot_git
+            elif dot_git.is_file():
+                text = dot_git.read_text(encoding="utf-8", errors="replace").strip()
+                git_dir = (d / text.removeprefix("gitdir:").strip()).resolve()
+            else:
+                continue
+            common = git_dir / "commondir"
+            if common.is_file():
+                git_dir = (git_dir / common.read_text(encoding="utf-8", errors="replace").strip()).resolve()
+            config = git_dir / "config"
+            st = config.stat()
+            return (str(config), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return ("unreadable",)
+    return ()
+
+
+def _cached_project_id(cwd: str | Path) -> str:
+    """``project_id(cwd)``, with the ``git config`` call made again only when the repository config changed."""
+    key = str(Path(cwd).resolve())
+    stamp = _git_config_stamp(Path(key))  # taken first: a change during the call leaves a stamp that no longer matches
+    hit = _PID_CACHE.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    pid = project_id(cwd)
+    if key not in _PID_CACHE and len(_PID_CACHE) >= _PID_CACHE_MAX:
+        _PID_CACHE.pop(next(iter(_PID_CACHE)))  # oldest first; one entry per worktree a daemon ever served
+    _PID_CACHE[key] = (stamp, pid)
+    return pid
+
+
 def gotchas_prompt(cwd: str | Path, home: Path | None = None) -> str:
     """The fenced block for the system prompt, or "" when the project has no gotchas."""
     root = home or k3code_home()
     if not (root / "projects").is_dir():  # no project ever accepted one: skip the git call behind project_id
         return ""
-    entries = _entries(gotchas_path(project_id(cwd), root))[-MAX_LINES:]
+    entries = _entries(gotchas_path(_cached_project_id(cwd), root))[-MAX_LINES:]
     return _block(HEADING, "Tool failures that kept recurring here, and what worked instead. Avoid them.", entries)
 
 
