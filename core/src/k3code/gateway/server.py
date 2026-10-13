@@ -113,6 +113,7 @@ from k3code.routing.tiers import (
 )
 from k3code.session_ai import compact_messages, make_title
 from k3code.subagents import SubagentManager
+from k3code.subagents import worktree as wt_mod
 from k3code.subagents.tools import register_task_tools
 from k3code.tools import FileStamps, clip_for_model, register_todo
 from k3code.tools import build_registry as build_tool_registry
@@ -870,6 +871,7 @@ class GatewayServer:
         if not stdio:
             self.clients.remove(self._stdio_client)
         self._idle_sweeper = asyncio.get_running_loop().create_task(self._idle_sweep_loop(), name="k3-idle-sweeper")
+        reaper = asyncio.get_running_loop().create_task(self._reap_at_start(), name="k3-worktree-reaper")
         try:
             if socket_path is not None:
                 await self.start_socket(socket_path)
@@ -883,6 +885,33 @@ class GatewayServer:
             self.shutdown()
         finally:
             self._idle_sweeper.cancel()
+            reaper.cancel()
+
+    #: How many of the newest sessions' working directories the start-up reap looks at.
+    REAP_SESSIONS = 200
+
+    async def _reap_at_start(self) -> None:
+        try:  # housekeeping: it must never hurt the gateway it runs in, but a failure must be visible
+            await self.reap_orphan_worktrees()
+        except Exception:
+            logger.exception("reaping orphaned worktrees failed")
+
+    async def reap_orphan_worktrees(self) -> None:
+        """Reap what fan-out and sub-agent workers left behind when their process died (``worktree.reap``), in each
+        repository these sessions worked in: nothing else removes a dead worker's checkout and branch."""
+        cwds = dict.fromkeys(cwd for _, cwd in self.store.worked_in(limit=self.REAP_SESSIONS) if cwd)
+        for cwd in cwds:
+            if not Path(cwd).is_dir():
+                continue
+            reaped = await wt_mod.reap(cwd)
+            if reaped is not None and (reaped.worktrees or reaped.merged or reaped.expired):
+                logger.info(
+                    "reaped in %s: %d orphaned worktree(s), %d merged and %d expired k3/* branch(es)",
+                    reaped.repo,
+                    len(reaped.worktrees),
+                    len(reaped.merged),
+                    len(reaped.expired),
+                )
 
     async def _serve_stdio(self) -> None:
         loop = asyncio.get_running_loop()
