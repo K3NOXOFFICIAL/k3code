@@ -19,6 +19,7 @@ from k3code.cli import cli
 from k3code.paths import user_config_path
 
 STAGED = "0.1.0-src.fffffff"
+PROGRESS = "k3code-install: installing the k3code core"
 
 STUB_INSTALLER = """#!/bin/sh
 # stand-in for install.sh: records how it was called and from where, then prints a version name
@@ -26,6 +27,13 @@ printf '%s\\n' "$@" >"$K3_STUB_ARGS"
 printf '%s\\n' "$(cd "$(dirname "$0")/.." && pwd)" >"$K3_STUB_DIR"
 printf '%s\\n' "${K3CODE_DATA:-}" >"$K3_STUB_DATA"
 printf '%s\\n' "${K3_ALLOW_ROOT:-unset}" >"$K3_STUB_ARGS.root"
+echo "k3code-install: installing the k3code core" >&2
+echo "npm warn deprecated noise that only a failure message needs" >&2
+if [ -n "${K3_STUB_GATE:-}" ]; then # build on only once the test has seen the line above (it gives up after 10 s)
+  i=0
+  while [ ! -e "$K3_STUB_GATE" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+  [ -e "$K3_STUB_GATE" ] || { echo "the progress line was not shown while the installer ran" >&2; exit 4; }
+fi
 if [ -n "${K3_STUB_FAIL:-}" ]; then
   echo "building the TUI" >&2
   echo "npm ERR! something broke" >&2
@@ -145,6 +153,43 @@ def test_a_newer_head_is_staged_by_the_refs_own_installer_and_activated(remote, 
     assert clone.parent.parent == data and clone.parent.name.startswith(".update-git-") and not clone.exists()
     assert (remote["logs"] / "data").read_text().strip() == str(data)
     assert sorted(p.name for p in data.iterdir()) == ["current", "versions"]
+
+
+def test_the_installers_progress_is_shown_between_latest_and_updated(remote, data, no_release):
+    _install(data, "1234567aaaa")
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert r.output.index("latest:") < r.output.index(PROGRESS) < r.output.index(f"updated to {STAGED}")
+    assert "npm warn" not in r.output  # the build tools' own output stays out of the way (a failure shows its tail)
+
+
+def test_progress_lines_arrive_while_the_installer_is_still_running(remote, data, monkeypatch, tmp_path):
+    gate = tmp_path / "gate"
+    monkeypatch.setenv("K3_STUB_GATE", str(gate))
+    seen: list[str] = []
+
+    def progress(line: str) -> None:
+        seen.append(line)
+        gate.touch()  # the installer builds on only now: output read after it exits would never get here
+
+    assert upd.update_from_git(remote["url"], "main", progress=progress) == STAGED
+    assert seen == [PROGRESS]
+
+
+def test_a_failing_progress_display_does_not_stop_the_installer_or_its_later_lines(tmp_path):
+    installer = tmp_path / "install" / "install.sh"
+    installer.parent.mkdir()
+    installer.write_text(
+        '#!/bin/sh\necho "k3code-install: one" >&2\necho "k3code-install: two" >&2\necho 0.1.0-src.abc\n'
+    )
+    seen: list[str] = []
+
+    def progress(line: str) -> None:
+        seen.append(line)
+        raise OSError("stderr is gone")
+
+    assert upd.update_from_source(tmp_path, pull=False, progress=progress) == "0.1.0-src.abc"
+    assert seen == ["k3code-install: one", "k3code-install: two"]
 
 
 @pytest.mark.parametrize("uid", [0, 1000])

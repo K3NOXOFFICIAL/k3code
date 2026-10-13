@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -821,11 +822,50 @@ def _installer_env(**extra: str) -> dict[str, str]:
     return env
 
 
-def update_from_source(checkout: Path, *, pull: bool = True) -> str:
-    """``git pull --ff-only`` then stage a new version via the installer (``--no-activate``); returns its name."""
+#: What install.sh puts in front of its own progress lines ("installing the k3code core", "building the TUI ...").
+INSTALLER_PREFIX = "k3code-install:"
+
+
+def _show_progress(line: str) -> None:
+    print(line, file=sys.stderr, flush=True)
+
+
+def _run_installer(
+    cmd: list[str], *, env: dict[str, str], progress: Callable[[str], None], stdin: int | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the installer with its output captured, handing its own progress lines to ``progress`` as they appear.
+
+    A build takes 13-25 s warm and minutes cold, and ``capture_output`` kept all of it back until the end. The tools it
+    runs (npm, uv, go) write a lot more to the same stderr; that is only kept, for the failure message."""
+    rfd, wfd = os.pipe()
+    lines: list[str] = []
+
+    def pump() -> None:
+        with os.fdopen(rfd, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                lines.append(line)
+                if line.startswith(INSTALLER_PREFIX):
+                    # keep reading whatever the display does: a pump that stops lets the pipe fill and blocks the build
+                    with contextlib.suppress(Exception):
+                        progress(line.rstrip("\n"))
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    try:
+        r = subprocess.run(cmd, check=False, stdout=subprocess.PIPE, stderr=wfd, text=True, stdin=stdin, env=env)
+    finally:
+        os.close(wfd)
+        reader.join()
+    return subprocess.CompletedProcess(r.args, r.returncode, r.stdout, "".join(lines))
+
+
+def update_from_source(checkout: Path, *, pull: bool = True, progress: Callable[[str], None] = _show_progress) -> str:
+    """``git pull --ff-only`` then stage a new version via the installer (``--no-activate``); returns its name.
+
+    The installer's progress lines go to ``progress`` (stderr by default) while it builds."""
     if pull:
         pull_checkout(checkout)
-    r = subprocess.run(
+    r = _run_installer(
         [
             "sh",
             str(checkout / "install" / "install.sh"),
@@ -835,10 +875,8 @@ def update_from_source(checkout: Path, *, pull: bool = True) -> str:
             "--no-activate",
             "--print-version",
         ],
-        check=False,
-        capture_output=True,
-        text=True,
         env=_installer_env(),
+        progress=progress,
     )
     if r.returncode:
         tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
@@ -940,8 +978,10 @@ def remote_head(url: str, ref: str) -> str:
     )
 
 
-def update_from_git(url: str, ref: str) -> str:
+def update_from_git(url: str, ref: str, *, progress: Callable[[str], None] = _show_progress) -> str:
     """Stage a new version from ``ref`` on ``url`` via that ref's own installer (``--no-activate``); its name.
+
+    The installer's progress lines go to ``progress`` (stderr by default) while it builds.
 
     The installer comes from a shallow fetch of the ref into a temporary directory under the data dir (never
     ``versions/``, which prune and the version list read), removed again whatever happens. ``--from-git`` (not
@@ -956,7 +996,7 @@ def update_from_git(url: str, ref: str) -> str:
         installer = src / "install" / "install.sh"
         if not installer.is_file():
             raise SourceUpdateError(f"'{ref}' on {url} has no install/install.sh: it is not a k3code repository")
-        r = subprocess.run(
+        r = _run_installer(
             [
                 "sh",
                 str(installer),
@@ -969,11 +1009,9 @@ def update_from_git(url: str, ref: str) -> str:
                 "--no-activate",
                 "--print-version",
             ],
-            check=False,
-            capture_output=True,
-            text=True,
             stdin=subprocess.DEVNULL,
             env=_installer_env(K3CODE_DATA=str(data_dir()), GIT_TERMINAL_PROMPT="0"),
+            progress=progress,
         )
         if r.returncode or not r.stdout.strip():
             tail = "\n".join((r.stderr or r.stdout or "").strip().splitlines()[-8:])
