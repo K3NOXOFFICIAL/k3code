@@ -403,7 +403,9 @@ class LearningHub:
             cwd = session.perms.cwd
             ctx = self.server.config.context or {}
             tok_in, tok_out = self.server.usage.turn_tokens(turn_id) if turn_id else (0, 0)
-            skill_text = skills_prompt(cwd, list(self.server.config.skills.roots), limit=PROMPT_LIMIT)
+            skill_text = skills_prompt(
+                cwd, list(self.server.config.skills.roots), limit=int(ctx.get("skill_prompt_limit", PROMPT_LIMIT))
+            )
             record = replay.build_record(
                 turn=turn_id,
                 session=session.session_id,
