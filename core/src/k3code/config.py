@@ -47,6 +47,9 @@ class ProviderEntry(BaseModel):
     persistent: bool = True
     max_sessions: int = 4
     idle_seconds: float = 600.0
+    #: claude-cli only: seconds one model step (one call, or one turn of a live process) may take in all before it is
+    #: killed and counts as a timeout. The router then fails over to the next entry without retrying this one.
+    timeout_seconds: float = Field(default=300.0, gt=0)
     #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
     #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
     prompt_cache: str = "auto"

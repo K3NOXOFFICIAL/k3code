@@ -64,6 +64,7 @@ def make_providers(entries: list[ProviderEntry]) -> list[Provider]:
                     persistent=entry.persistent,
                     max_sessions=entry.max_sessions,
                     idle_seconds=entry.idle_seconds,
+                    timeout=entry.timeout_seconds,
                 )
             )
     return providers

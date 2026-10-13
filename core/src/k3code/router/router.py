@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from k3code.errors import AllProvidersUnreachable, ChainExhausted, ContextOverflow
-from k3code.providers.base import Provider
+from k3code.providers.base import Provider, ProviderDeadline
 from k3code.providers.retry_utils import jittered_backoff
 from k3code.providers.stall import is_stall
 from k3code.providers.types import Message, StreamEvent, ToolSpec
@@ -307,7 +307,13 @@ class Router:
                         break
                     # retryable: same entry with backoff, max_retries times, then fail over. A stalled stream is not a
                     # blip: it cost its whole stall limit, so it gets one retry, not max_retries.
-                    if attempt >= (min(self.max_retries, STALL_RETRIES) if is_stall(exc) else self.max_retries):
+                    if isinstance(exc, ProviderDeadline):
+                        retries = 0
+                    elif is_stall(exc):
+                        retries = min(self.max_retries, STALL_RETRIES)
+                    else:
+                        retries = self.max_retries
+                    if attempt >= retries:
                         self._failover(entry, target_model, classified.reason, attempt, exc, entry_index=entry_index)
                         break
                     attempt += 1
