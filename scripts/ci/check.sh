@@ -246,6 +246,7 @@ area_panes() {
     step "go build ./cmd/k3" panes go build -o "${LOG_DIR:-<logs>}/k3" ./cmd/k3
   fi
   step "go vet" panes go vet ./internal/k3keys/... ./internal/harness/... ./cmd/k3/
+  step "go test cmd/k3" panes go test ./cmd/k3/
   if full; then
     step "go test -race" panes go test -race ./internal/k3keys/... ./internal/harness/...
     # ./internal/app takes ~4 min alone and several times that when other checks share the machine; the default

@@ -19,7 +19,7 @@ npx vitest run                    # tui/.ci-test-excludes is empty, so CI runs e
 
 # panes (the k3 multi-window terminal): Go, only the packages we depend on
 cd panes && go build ./cmd/k3
-go test ./internal/k3keys/... ./internal/harness/... ./internal/input/ ./internal/app/
+go test ./internal/k3keys/... ./internal/harness/... ./internal/input/ ./internal/app/ ./cmd/k3/
 ```
 
 Do not run `go test ./...` in `panes/`. Its upstream remote-sync tests recurse without bound.
