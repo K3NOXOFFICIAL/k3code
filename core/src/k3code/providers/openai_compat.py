@@ -251,14 +251,22 @@ def _parse_usage(chunk_usage: dict[str, Any]) -> Any:
     from k3code.providers.types import Usage
 
     details = chunk_usage.get("prompt_tokens_details") or {}
+    cache_creation = int(
+        details.get("cache_write_tokens")
+        or details.get("cache_creation_tokens")
+        or chunk_usage.get("cache_creation_input_tokens")
+        or 0
+    )
+    prompt_tokens = int(chunk_usage.get("prompt_tokens") or 0)
+    # OmniRoute leaves cache writes out of prompt_tokens and says so; Usage counts them in
+    if details.get("cache_creation_in_prompt") is False:
+        prompt_tokens += cache_creation
     return Usage(
-        prompt_tokens=int(chunk_usage.get("prompt_tokens") or 0),
+        prompt_tokens=prompt_tokens,
         completion_tokens=int(chunk_usage.get("completion_tokens") or 0),
         # OpenAI reports cache hits in prompt_tokens_details; relays to Anthropic pass its own fields on
         cache_read_tokens=int(details.get("cached_tokens") or chunk_usage.get("cache_read_input_tokens") or 0),
-        cache_creation_tokens=int(
-            details.get("cache_write_tokens") or chunk_usage.get("cache_creation_input_tokens") or 0
-        ),
+        cache_creation_tokens=cache_creation,
     )
 
 
