@@ -1112,6 +1112,173 @@ def test_uninstall_with_a_broken_k3code_prints_one_line_not_a_traceback(tmp_path
     assert "disable --now k3code.service k3code-recover.service" in calls.read_text()
 
 
+def fake_install_root(tmp_path: Path) -> Path:
+    """An install root as uninstall.sh recognises one (versions/ and a current link) with no real install in it."""
+    data = tmp_path / DATA_REL
+    (data / "versions" / "v1" / "bin").mkdir(parents=True)
+    (data / "current").symlink_to(data / "versions" / "v1")
+    return data
+
+
+def start_k3code_process(program: Path, *, ignore_term: bool = False) -> subprocess.Popen[bytes]:
+    """A long-running `sh <program>`, so the install's script path is argv[1] like a venv's `python .../bin/k3code`."""
+    trap = "trap '' TERM" if ignore_term else "trap 'kill $!; exit 0' TERM"
+    program.write_text(f"#!/bin/sh\n{trap}\nsleep 60 &\nwait $!\n")
+    proc = subprocess.Popen(
+        ["sh", str(program)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+    )
+    deadline = time.monotonic() + 5
+    while str(program).encode() not in Path(f"/proc/{proc.pid}/cmdline").read_bytes():  # fork has not exec'd yet
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    return proc
+
+
+@linux_only
+def test_uninstall_refuses_to_delete_the_tree_under_a_running_k3code(tmp_path: Path) -> None:
+    # A daemon or TUI started by hand is not a systemd unit; deleting its install root left it running on a deleted tree
+    # (and with --purge it recreated ~/.k3code). Without --yes and a terminal to ask on, uninstall lists it and stops.
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code")
+    try:
+        r = run(tmp_path, UNINSTALL)
+        assert r.returncode != 0
+        assert str(proc.pid) in r.stderr and "versions/v1/bin/k3code" in r.stderr
+        assert "--yes" in r.stderr
+        assert (data / "current").is_symlink()  # nothing was removed
+        assert proc.poll() is None  # and nothing was killed
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+def test_uninstall_yes_stops_the_processes_running_from_the_install(tmp_path: Path) -> None:
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code")
+    try:
+        r = run(tmp_path, UNINSTALL, "--yes")
+        assert r.returncode == 0, r.stderr
+        assert str(proc.pid) in r.stderr
+        assert proc.wait(timeout=5) is not None  # stopped before the tree went
+        assert not data.exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+def test_uninstall_yes_kills_a_process_that_ignores_term(tmp_path: Path) -> None:
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code", ignore_term=True)
+    try:
+        r = run(tmp_path, UNINSTALL, "--yes", env_extra={"K3_UNINSTALL_STOP_WAIT": "1"})
+        assert r.returncode == 0, r.stderr
+        assert proc.wait(timeout=5) == -9
+        assert not data.exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+@pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
+@pytest.mark.parametrize("answer", ["yes", "no"])
+def test_uninstall_asks_on_the_terminal_before_stopping_a_running_k3code(tmp_path: Path, answer: str) -> None:
+    data = fake_install_root(tmp_path)
+    proc = start_k3code_process(data / "versions" / "v1" / "bin" / "k3code")
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "XDG_CONFIG_HOME": str(tmp_path / ".config")}
+    master, slave = os.openpty()
+    try:
+        # setsid --ctty: a new session whose controlling terminal is the pty, so uninstall.sh can open /dev/tty
+        uninstall = subprocess.Popen(
+            ["setsid", "--ctty", "sh", str(UNINSTALL)], stdin=slave, stdout=slave, stderr=slave, env=env
+        )
+        os.close(slave)
+        slave = -1
+        out, answered = b"", False
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master], [], [], 1)
+            if ready:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:  # EIO: every writer to the terminal is gone
+                    break
+                if not chunk:
+                    break
+                out += chunk
+                if not answered and b"Type yes" in out:
+                    os.write(master, answer.encode() + b"\n")
+                    answered = True
+            elif uninstall.poll() is not None:
+                break
+        if uninstall.poll() is None:
+            uninstall.kill()
+        rc = uninstall.wait()
+        text = out.decode(errors="replace")
+        assert str(proc.pid) in text
+        if answer == "yes":
+            assert rc == 0, text
+            assert proc.wait(timeout=5) is not None
+            assert not data.exists()
+        else:
+            assert rc != 0, text
+            assert proc.poll() is None  # declined: still running, and the install is still there
+            assert (data / "current").is_symlink()
+    finally:
+        os.close(master)
+        if slave >= 0:
+            os.close(slave)
+        proc.kill()
+        proc.wait()
+
+
+@linux_only
+def test_uninstall_leaves_alone_a_process_that_is_not_from_the_install(tmp_path: Path) -> None:
+    data = fake_install_root(tmp_path)
+    (tmp_path / "elsewhere").mkdir()
+    proc = start_k3code_process(tmp_path / "elsewhere" / "k3code")
+    try:
+        r = run(tmp_path, UNINSTALL)
+        assert r.returncode == 0, r.stderr
+        assert not data.exists()
+        assert proc.poll() is None
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize("linger", ["yes", "no"])
+def test_uninstall_says_to_undo_linger_only_when_it_is_on(tmp_path: Path, linger: str) -> None:
+    # `k3code service install` advises `loginctl enable-linger`; uninstalling the unit leaves that setting behind
+    units = tmp_path / ".config" / "systemd" / "user"
+    units.mkdir(parents=True)
+    (units / "k3code.service").write_text("[Unit]\n")
+    stubs = stub_bin(tmp_path, "systemctl", "exit 0\n")
+    stub_bin(tmp_path, "loginctl", f'echo "Linger={linger}"\n')
+    r = run(tmp_path, UNINSTALL, path_front=stubs)
+    assert r.returncode == 0, r.stderr
+    assert ("loginctl disable-linger" in r.stderr) == (linger == "yes")
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason="needs PowerShell (pwsh)")
+def test_uninstall_ps1_names_windowsonly_when_the_distro_is_gone(tmp_path: Path) -> None:
+    # The WSL distribution was unregistered: uninstall.sh cannot run, and the failure had to say how to still clean up
+    wsl = tmp_path / "wsl"
+    wsl.write_text("#!/bin/sh\necho 'There is no distribution with the supplied name.' >&2\nexit 1\n")
+    wsl.chmod(0o755)
+    appdata = tmp_path / "appdata"
+    (appdata / "k3code").mkdir(parents=True)
+    (appdata / "k3code" / "wsl.json").write_text(f'{{"distro": "Gone", "prefix": "{tmp_path}/.local"}}')
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "LOCALAPPDATA": str(appdata), "K3_WSL": str(wsl)}
+    cmd = ["pwsh", "-NoProfile", "-Command", f"& '{REPO / 'install' / 'uninstall.ps1'}'; exit $LASTEXITCODE"]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+    assert r.returncode != 0
+    assert "-WindowsOnly" in r.stderr
+    assert (appdata / "k3code" / "wsl.json").is_file()  # nothing on the Windows side was touched
+
+
 def _git(src: Path, *args: str) -> str:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     cmd = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-C", str(src), *args]

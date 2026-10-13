@@ -72,7 +72,9 @@ if (-not $WindowsOnly) {
   } else {
     & $Wsl -d $cfg.distro --exec sh -lc "curl -fsSL $(Quote-Sh $RawUrl) | sh -s -- $($shArgs -join ' ')"
   }
-  if ($LASTEXITCODE -ne 0) { Die "uninstall.sh failed in $($cfg.distro); the Windows shims are left in place" }
+  if ($LASTEXITCODE -ne 0) {
+    Die "uninstall.sh failed in $($cfg.distro); the Windows shims are left in place (if that distribution is gone, run this again with -WindowsOnly to remove them)"
+  }
 }
 
 foreach ($n in @('k3code.exe', 'k3.exe', 'k3code.cmd', 'k3.cmd', 'k3code.exe.old-*', 'k3.exe.old-*')) {
