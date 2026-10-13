@@ -67,7 +67,8 @@ TIER_MODELS: dict[str, dict[str, str]] = {
 }
 MAX_MODEL_CHOICES = 15
 MAX_KEY_TRIES = 3  # keys asked for before a rejected one has to be saved anyway or given up on (#147)
-_PASTED = re.compile(r"^(?:(?i:export)\s+)?(?:[A-Z_][A-Z0-9_]*=|(?i:bearer)\s+)")
+# `NAME=` counts only with a value after it: "ABCD1234=" and "ABCDEFGH==" are keys (all capitals, padded), not a NAME.
+_PASTED = re.compile(r"^(?:(?i:export)\s+)?(?:[A-Z_][A-Z0-9_]*=(?=[^=\s])|(?i:bearer)\s+)")
 
 
 def detect_providers() -> dict[str, str]:

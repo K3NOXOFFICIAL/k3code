@@ -394,6 +394,13 @@ def test_a_wrong_url_is_told_apart_from_a_bad_key(root, endpoint, path, hint) ->
     assert ("redirects to /v1/models" in r.output) == (path == "/moved")  # a redirect names where it leads
 
 
+def test_an_all_capitals_key_with_padding_is_stored_as_given(root) -> None:
+    key = "ABCDEFGH12345678=="
+    r = _onboard(root, _closed_port_url(), key)  # unreachable: the key cannot be checked, so it is saved as typed
+    assert r.exit_code == 0, r.output
+    assert load_config(project_dir=root).providers[0].api_key == key
+
+
 def test_a_redirect_target_is_printed_without_credentials(root, endpoint) -> None:
     r = _onboard(root, f"{endpoint}/leaky", GOOD)
     assert r.exit_code == 0, r.output
@@ -490,6 +497,9 @@ def test_interactive_network_failure_offers_retry_save_or_cancel(root, monkeypat
         (f"bearer  {GOOD}", GOOD),
         ("sk-ant-abc=def", "sk-ant-abc=def"),  # an "=" inside a key is not a NAME= prefix
         ("sk-" + "A" * 20 + "==", "sk-" + "A" * 20 + "=="),
+        ("ABCD1234=", "ABCD1234="),  # all capitals and digits, padded: still a key, not an empty NAME=
+        ("ABCDEFGH12345678==", "ABCDEFGH12345678=="),
+        ('"ABCD1234="', "ABCD1234="),
         ("", ""),
     ],
 )
