@@ -117,12 +117,31 @@ def normalize_tool_pairs(messages: list[Message]) -> list[Message]:
     return out
 
 
+def _reminder_text(content: str) -> str:
+    """A mid-conversation system note as the text a user-side message carries."""
+    return f"<system-reminder>\n{content}\n</system-reminder>"
+
+
 def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
-    """Serialize messages for chat-completions-compatible providers."""
+    """Serialize messages for chat-completions-compatible providers.
+
+    Only the leading system messages stay ``system`` messages. A system message later in the conversation (the loop
+    guard's note) is sent as a ``<system-reminder>`` user message, as ``messages_to_anthropic`` does: chat templates
+    that want the system message first (Mistral, Gemma) answer HTTP 400 to it, and a relay that hoists it into a
+    Claude system prompt rewrote the start of every request from then on. It joins the user message after it when
+    there is one, so user and assistant turns still alternate.
+    """
     out: list[dict[str, Any]] = []
+    leading = True
+    notes: list[str] = []
     for m in normalize_tool_pairs(messages):
         if m.role not in _ROLE_OPENAI:
             raise ValueError(f"unknown role: {m.role}")
+        if m.role == "system" and not leading:
+            if m.content:
+                notes.append(_reminder_text(m.content))
+            continue
+        leading = leading and m.role == "system"
         entry: dict[str, Any] = {"role": m.role, "content": m.content if m.content is not None else ""}
         if m.role == "assistant" and m.tool_calls:
             entry["tool_calls"] = [
@@ -139,7 +158,15 @@ def messages_to_openai(messages: list[Message]) -> list[dict[str, Any]]:
             entry["tool_call_id"] = m.tool_call_id
             if m.name:
                 entry["name"] = m.name
+        if notes:
+            if m.role == "user":
+                entry["content"] = "\n\n".join([*notes, *([m.content] if m.content else [])])
+            else:
+                out.append({"role": "user", "content": "\n\n".join(notes)})
+            notes = []
         out.append(entry)
+    if notes:  # notes after the last message
+        out.append({"role": "user", "content": "\n\n".join(notes)})
     return out
 
 
@@ -177,7 +204,7 @@ def messages_to_anthropic(messages: list[Message]) -> tuple[str, list[dict[str, 
             if leading:
                 system_parts.append(m.content)
                 continue
-            reminder = {"type": "text", "text": f"<system-reminder>\n{m.content}\n</system-reminder>"}
+            reminder = {"type": "text", "text": _reminder_text(m.content)}
             if rest and rest[-1]["role"] == "user":
                 _attach_reminders(rest[-1], [reminder])
             else:
