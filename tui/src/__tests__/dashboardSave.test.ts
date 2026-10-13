@@ -8,14 +8,17 @@ import {
   resetOverlayState,
 } from "../app/overlayStore.js";
 import { getUiState, patchUiState, resetUiState } from "../app/uiStore.js";
+import { applyDisplay } from "../app/useConfigSync.js";
 import {
   applySnapshot,
   type DashboardChange,
   dashboardKey,
   type DashboardSnapshot,
   initDashboardState,
+  SECTION_DEFAULT,
   setField,
 } from "../domain/dashboard.js";
+import { SECTION_NAMES, sectionMode } from "../domain/details.js";
 
 const SNAP: DashboardSnapshot = {
   effort: "default",
@@ -194,5 +197,82 @@ describe("saveDashboard", () => {
       key: "details_mode.thinking",
       value: "collapsed",
     });
+  });
+
+  it("the details panels painted after Enter are the ones the next config poll keeps: the global mode moved, a row back on default", () => {
+    patchUiState({
+      detailsMode: "expanded",
+      detailsModeCommandOverride: false,
+      sections: {},
+    });
+
+    const written: Record<string, string> = {};
+    const rpc = vi.fn((_method: string, params: Record<string, unknown>) => {
+      written[String(params.key)] = String(params.value);
+
+      return Promise.resolve({});
+    });
+    let state = initDashboardState(getUiState(), "details");
+
+    state = setField(state, "details", "collapsed").state;
+    state = setField(state, "section.tools", SECTION_DEFAULT).state;
+
+    const { action } = dashboardKey(state, "", { return: true });
+
+    if (action.type !== "save") {
+      throw new Error(`Enter did not save: ${action.type}`);
+    }
+
+    saveDashboard(action.changes, action.patch, {
+      rpc,
+      run: vi.fn(),
+      sys: vi.fn(),
+    });
+
+    const shown = () => {
+      const ui = getUiState();
+
+      return {
+        flag: ui.detailsModeCommandOverride,
+        modes: SECTION_NAMES.map((name) =>
+          sectionMode(
+            name,
+            ui.detailsMode,
+            ui.sections,
+            ui.detailsModeCommandOverride,
+          ),
+        ),
+      };
+    };
+    const painted = shown();
+
+    // Tool calls keeps its built-in mode, expanded; the other three follow the saved global mode
+    expect(painted.modes).toEqual([
+      "collapsed",
+      "expanded",
+      "collapsed",
+      "collapsed",
+    ]);
+
+    // Tool calls was default and still is: nothing to write for it
+    expect(written).toEqual({
+      details_mode: "collapsed",
+      "details_mode.activity": "collapsed",
+      "details_mode.subagents": "collapsed",
+      "details_mode.thinking": "collapsed",
+    });
+
+    // the poll reads back what config.set wrote: the global mode and the pinned sections
+    const sections = Object.fromEntries(
+      Object.entries(written)
+        .filter(([key, value]) => key.startsWith("details_mode.") && value)
+        .map(([key, value]) => [key.slice("details_mode.".length), value]),
+    );
+
+    applyDisplay(
+      { config: { display: { details_mode: written.details_mode, sections } } },
+      vi.fn(),
+    );
+    expect(shown()).toEqual(painted);
   });
 });

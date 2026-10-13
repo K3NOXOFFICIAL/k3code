@@ -15,6 +15,7 @@ import {
   dashboardKey,
   dashboardLayout,
   dashboardPatch,
+  dashboardRevert,
   dashboardScreen,
   type DashboardSnapshot,
   type DashboardState,
@@ -256,6 +257,19 @@ describe("dashboardKey", () => {
     expect(press(look, "6").state.tab).toBe(5);
   });
 
+  it("a number past the last tab changes nothing, whichever tab it is pressed on (it must not wrap round)", () => {
+    for (const tab of DASHBOARD_TABS) {
+      const start = onTab(tab.id);
+
+      for (const digit of ["7", "8", "9", "0"]) {
+        const step = press(start, digit);
+
+        expect(step.state, `${digit} on ${tab.id}`).toBe(start);
+        expect(step.action).toEqual({ type: "none" });
+      }
+    }
+  });
+
   it("previews a field live and leaves a field that waits for Enter alone", () => {
     const look = press(onTab("look"), "", { rightArrow: true });
 
@@ -350,7 +364,8 @@ describe("details tab", () => {
     expect(step.action).toMatchObject({
       patch: {
         detailsMode: "expanded",
-        detailsModeCommandOverride: true,
+        // the config poll turns the flag off again, so the draft does not claim it (every row is pinned anyway)
+        detailsModeCommandOverride: false,
         sections: {
           activity: "expanded",
           subagents: "expanded",
@@ -404,7 +419,7 @@ describe("details tab", () => {
     expect(after.find((l) => l.includes("Activity"))).not.toContain("→");
   });
 
-  it("the preview keeps the command-override flag the ui had unless the global moved", () => {
+  it("the preview keeps the command-override flag the ui had, even when the global moved", () => {
     const origin = { ...UI, detailsModeCommandOverride: true };
     const values = initDashboardState(origin, "details").values;
 
@@ -417,6 +432,91 @@ describe("details tab", () => {
     expect(dashboardPatch(values, UI)).toMatchObject({
       detailsModeCommandOverride: false,
     });
+    expect(dashboardPatch({ ...values, details: "hidden" }, UI)).toMatchObject({
+      detailsModeCommandOverride: false,
+    });
+  });
+
+  it("a row put back on default says what the next config poll makes of it, not what the global mode moved to", () => {
+    // collapsed -> hidden pins all four; Thinking goes back to default, whose built-in mode is expanded
+    const hidden = press(onTab("details"), "", { leftArrow: true }).state;
+    const step = setField(hidden, "section.thinking", SECTION_DEFAULT);
+    const rows = dashboardScreen(step.state, LAYOUT).map(lineText);
+
+    expect(rows.find((l) => l.includes("Thinking"))).toContain("→ expanded");
+    expect(step.action).toEqual({
+      patch: expect.objectContaining({
+        detailsMode: "hidden",
+        detailsModeCommandOverride: false,
+        sections: { activity: "hidden", subagents: "hidden", tools: "hidden" },
+      }),
+      type: "preview",
+    });
+  });
+
+  it("after a /details command a default row follows the global mode, as the ui does until the next poll", () => {
+    const state = initDashboardState(
+      { ...UI, detailsModeCommandOverride: true },
+      "details",
+    );
+    const rows = dashboardScreen(state, LAYOUT).map(lineText);
+
+    expect(rows.find((l) => l.includes("Thinking"))).toContain("→ collapsed");
+    expect(rows.find((l) => l.includes("Activity"))).toContain("→ collapsed");
+  });
+
+  it("no section row left on default pins the invalid mode default", () => {
+    const { values } = onTab("details");
+    const pinned = dashboardPatch({ ...values, "section.tools": "hidden" }, UI);
+
+    expect(pinned.sections).toEqual({ tools: "hidden" });
+    // a Look preview and the save both leave every unpinned row out of the sections
+    expect(dashboardPatch(values, UI).sections).toEqual({});
+    expect(dashboardPatch(values, UI, false).sections).toEqual({});
+    expect(press(onTab("look"), "", { rightArrow: true }).action).toEqual({
+      patch: expect.objectContaining({ sections: {} }),
+      type: "preview",
+    });
+  });
+});
+
+describe("what Esc puts back", () => {
+  it("is the painted rows the draft moved, at the values the popup found", () => {
+    expect(dashboardRevert(onTab("look"))).toEqual({});
+    expect(
+      dashboardRevert(run(onTab("look"), ["l"], ["j"], ["l"]).state),
+    ).toEqual({ indicatorStyle: "kaomoji", statusBar: "top" });
+    // moved and moved back: the last preview already painted the original
+    expect(dashboardRevert(run(onTab("look"), ["l"], ["h"]).state)).toEqual({});
+  });
+
+  it("is the mode and the sections for a moved global details mode, never the command-override flag", () => {
+    const moved = press(onTab("details"), "", { rightArrow: true }).state;
+
+    expect(dashboardRevert(moved)).toEqual({
+      detailsMode: "collapsed",
+      sections: {},
+    });
+    expect(
+      dashboardRevert({
+        ...moved,
+        origin: { ...moved.origin, detailsModeCommandOverride: true },
+      }),
+    ).not.toHaveProperty("detailsModeCommandOverride");
+  });
+
+  it("leaves a field the popup never paints alone: the Context chip, Focus view, Show thinking and the Session rows", () => {
+    const focus = run(onTab("input"), ["j"], ["j"], ["l"]).state;
+    const context = run(onTab("context"), ["l"]).state;
+    const session = run(ready("session"), ["l"], ["j"], ["l"]).state;
+
+    expect(focus.values.focus).toBe("on");
+    expect(context.values.autocompact).toBe("50%");
+    expect(session.values.model).toBe("b");
+
+    for (const state of [focus, context, session]) {
+      expect(dashboardRevert(state)).toEqual({});
+    }
   });
 });
 
@@ -479,6 +579,18 @@ describe("dashboardScreen", () => {
       .join(" ");
 
     expect(hint).toContain("Shift-drag");
+  });
+
+  it("does not promise native selection for wheel: it reports the mouse like all, and only off gives it back", () => {
+    const mouse = DASHBOARD_FIELDS.find((f) => f.id === "mouse")!;
+
+    // 1000 + 1006 is enough to take plain drags from the terminal; only "off" sends no mode at all
+    expect(mouse.options).toEqual(["all", "buttons", "wheel", "off"]);
+    expect(mouse.hint).not.toMatch(/keeps selection|still selects/);
+    expect(mouse.hint).toMatch(/Shift-drag[^.]*; off gives the mouse back\./);
+    expect(mouse.hint.indexOf("wheel:")).toBeLessThan(
+      mouse.hint.indexOf("Shift-drag"),
+    );
   });
 
   it("tells a locked popup to wait for the question", () => {
@@ -744,6 +856,7 @@ describe("the Context tab (/autocompact)", () => {
       [{ compact_at_tokens: 2_000_000 }, "2m"],
       [{ compact_at_tokens: 123_456 }, "123456"],
       [{ compact_at_ratio: 0.65 }, "65%"],
+      [{ compact_at_ratio: 1 }, "100%"],
       [{ compact_at_ratio: 2 }, "auto"],
       [{ compact_at_tokens: "lots", compact_at_ratio: "x" }, "auto"],
     ] as const) {
@@ -1553,6 +1666,18 @@ describe("search", () => {
     expect(rows).toHaveLength(L6016.bodyRows - 1);
     expect(rows.filter((l) => l.active).map((l) => l.field)).toEqual([9]);
     expect(rows[0]!.field).toBeGreaterThan(0);
+  });
+
+  it("keeps the cursor row in the middle of the painted matches, and the first and last window full", () => {
+    const state = kept(ready("look"), "o");
+    const firstRow = (cursor: number) =>
+      dashboardScreen({ ...state, cursor }, L6016).find(
+        (l) => l.kind === "row",
+      )!.field;
+
+    // 18 matches, 5 of them painted
+    expect(currentFields(state)).toHaveLength(18);
+    expect([0, 2, 3, 9, 15, 17].map(firstRow)).toEqual([0, 0, 1, 7, 13, 13]);
   });
 });
 

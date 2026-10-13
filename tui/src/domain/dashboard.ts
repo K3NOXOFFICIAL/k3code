@@ -148,7 +148,7 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
   })),
   {
     group: "Input",
-    hint: "all: wheel scrolls, a click moves the cursor. Select text with Shift-drag (Option-drag on macOS). wheel: scroll only, the terminal keeps selection.",
+    hint: "all: wheel scrolls, a click moves the cursor. wheel: only those. Select text with Shift-drag (Option-drag on macOS); off gives the mouse back.",
     id: "mouse",
     key: "mouse",
     label: "Mouse",
@@ -322,8 +322,8 @@ export function dashboardValues(ui: DashboardUi): DashboardValues {
 
 /**
  * The ui the draft `values` describe, built on `origin` so a field the popup
- * does not own (and the `/details` command-override flag, unless the global
- * mode moved) is kept. `onlyPreview` leaves out the fields that wait for Enter.
+ * does not own (and the `/details` command-override flag) is kept.
+ * `onlyPreview` leaves out the fields that wait for Enter.
  */
 export function dashboardPatch(
   values: DashboardValues,
@@ -363,8 +363,9 @@ export function dashboardPatch(
   if (include("details")) {
     patch.detailsMode = details;
     patch.sections = sections;
-    patch.detailsModeCommandOverride =
-      origin.detailsModeCommandOverride || details !== origin.detailsMode;
+    // Kept even when the global mode moved: the next config poll turns the flag off, and a row left on `default` would
+    // then flip to its built-in section default. Moving the global mode pins all four rows, so it would change none.
+    patch.detailsModeCommandOverride = origin.detailsModeCommandOverride;
   }
 
   if (include("mouse")) {
@@ -385,12 +386,33 @@ export function dashboardPatch(
   return patch;
 }
 
+/**
+ * What Esc, or a close that saves nothing, puts back: the painted fields the
+ * draft moved off what the popup found, at their original values. Anything
+ * else keeps the value the ui has now (the Context chip, Focus view, Show
+ * thinking, the details override flag, a row left alone), which a config poll
+ * may have refreshed while the popup was open.
+ */
+export function dashboardRevert(state: DashboardState): Partial<DashboardUi> {
+  const draft = dashboardPatch(state.values, state.origin);
+  const found = dashboardPatch(dashboardValues(state.origin), state.origin);
+  const back: Partial<DashboardUi> = {};
+
+  for (const key of Object.keys(found) as (keyof DashboardUi)[]) {
+    if (JSON.stringify(draft[key]) !== JSON.stringify(found[key])) {
+      Object.assign(back, { [key]: found[key] });
+    }
+  }
+
+  return back;
+}
+
 // ── State ────────────────────────────────────────────────────────────
 
 export interface DashboardState {
   /** Row within the list the screen shows: the tab's fields, or the rows the search matches. */
   cursor: number;
-  /** The ui as the popup found it: what Esc puts back. */
+  /** The ui as the popup found it: what the draft is built on, and (`dashboardRevert`) what Esc puts back of it. */
   origin: DashboardUi;
   /** Index into DASHBOARD_TABS. */
   tab: number;
@@ -646,8 +668,9 @@ export function autocompactLabel(context: unknown): string {
 /**
  * The `config.set` calls Enter sends: only fields that moved off what the
  * popup found, in a stable order. Moving the global details mode moves the
- * four section rows with it, so all four are sent and a restart shows the same
- * panels as now instead of the built-in section defaults.
+ * four section rows with it, so each that differs from the saved one is sent
+ * and a restart shows the same panels as now; a row put back on `default` is
+ * sent as "" and shows its built-in section default, as its note says.
  */
 export function dashboardChanges(state: DashboardState): DashboardChange[] {
   const moved = (id: string) => state.values[id] !== state.base[id];
@@ -723,7 +746,7 @@ export type DashboardAction =
   | { type: "none" }
   /** Paint this slice of the ui now (a field moved). */
   | { patch: Partial<DashboardUi>; type: "preview" }
-  /** Close; put the ui back to `revert`. */
+  /** Close; `revert` is the ui as the popup found it, of which `dashboardRevert` says what to put back. */
   | { revert: DashboardUi; type: "cancel" }
   /** Close and send `changes`; `patch` is every field of the draft, including the ones that waited for Enter. */
   | {
@@ -1303,11 +1326,9 @@ function defaultNote(state: DashboardState, f: DashboardField): string {
     return "";
   }
 
-  const override =
-    state.values.details !== state.origin.detailsMode ||
-    state.origin.detailsModeCommandOverride;
+  const mode = state.values.details as DetailsMode;
 
-  return ` → ${sectionMode(name, state.values.details as DetailsMode, {}, override)}`;
+  return ` → ${sectionMode(name, mode, {}, state.origin.detailsModeCommandOverride)}`;
 }
 
 function rowLine(

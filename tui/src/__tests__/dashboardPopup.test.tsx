@@ -215,6 +215,50 @@ describe("Dashboard popup", () => {
     expect(getUiState().statusBar).toBe("top");
   });
 
+  it("Esc leaves a field the popup does not paint as a config poll left it, and still puts back a row it moved", async () => {
+    const t = mount();
+
+    await settle();
+    t.stdin.send(RIGHT);
+    await waitFor(() => expect(getUiState().statusBar).toBe("bottom"));
+    // the poll lands while the popup is open: /autocompact never updates the ui itself
+    patchUiState({ autocompact: "50%", focusView: true, showReasoning: true });
+    t.stdin.send(ESC);
+    await waitFor(() => expect(t.onCancel).toHaveBeenCalledTimes(1));
+
+    expect(getUiState()).toMatchObject({
+      autocompact: "50%",
+      focusView: true,
+      showReasoning: true,
+      statusBar: "top",
+    });
+    t.stop();
+  });
+
+  it("closing a popup nothing was moved in (Esc, or Ctrl+C unmounting it) keeps what a config poll set meanwhile", async () => {
+    patchUiState({ detailsModeCommandOverride: true });
+
+    const esc = mount("context");
+
+    await settle();
+    patchUiState({ autocompact: "50%", detailsModeCommandOverride: false });
+    esc.stdin.send(ESC);
+    await waitFor(() => expect(esc.onCancel).toHaveBeenCalledTimes(1));
+    expect(getUiState().autocompact).toBe("50%");
+    expect(getUiState().detailsModeCommandOverride).toBe(false);
+    esc.stop();
+
+    patchUiState({ autocompact: "auto", detailsModeCommandOverride: true });
+
+    const ctrlC = mount("context");
+
+    await settle();
+    patchUiState({ autocompact: "60%", detailsModeCommandOverride: false });
+    ctrlC.stop();
+    expect(getUiState().autocompact).toBe("60%");
+    expect(getUiState().detailsModeCommandOverride).toBe(false);
+  });
+
   it("Enter hands the changes and the whole draft to onSave and leaves the ui as painted", async () => {
     const t = mount("input");
 

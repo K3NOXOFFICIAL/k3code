@@ -10,6 +10,7 @@ import {
   dashboardClickAt,
   dashboardKey,
   dashboardLayout,
+  dashboardRevert,
   dashboardScreen,
   type DashboardState,
   type DashboardStep,
@@ -41,11 +42,11 @@ const toneColor = (t: Theme, tone: DashboardTone) =>
  * Session and Status tabs of one popup. ←/→ change a row, ↑/↓ move, Tab changes
  * tab, `/` searches every tab, Enter saves, Esc puts it all back. Rows paint
  * live as they change; closing without saving (Esc, Ctrl+C, a session switch)
- * restores the ui the popup found. A click on a tab or a row only moves the
- * cursor; a click on a chip picks that option. The Session rows and the Status
- * text come from `settings.get`, which answers after the popup is open. While
- * a question is open the popup reads no key and no click, so the prompt owns
- * the input.
+ * puts back the rows it moved and leaves every other field as the ui has it
+ * now. A click on a tab or a row only moves the cursor; a click on a chip
+ * picks that option. The Session rows and the Status text come from
+ * `settings.get`, which answers after the popup is open. While a question is
+ * open the popup reads no key and no click, so the prompt owns the input.
  */
 export function Dashboard({
   gw,
@@ -75,7 +76,7 @@ export function Dashboard({
   useEffect(
     () => () => {
       if (!settled.current) {
-        patchUiState(live.current.origin);
+        patchUiState(dashboardRevert(live.current));
       }
     },
     [],
@@ -144,7 +145,7 @@ export function Dashboard({
       patchUiState(action.patch);
     } else if (action.type === "cancel") {
       settled.current = true;
-      patchUiState(action.revert);
+      patchUiState(dashboardRevert(live.current));
       onCancel();
     } else if (action.type === "save") {
       settled.current = true;

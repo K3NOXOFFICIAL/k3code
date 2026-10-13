@@ -269,12 +269,13 @@ Mouse tracking defaults to `all`: the wheel scrolls, a click moves the cursor
 or presses a chip, and hover works. The price is that the terminal itself no
 longer sees the mouse: a plain drag selects inside the TUI (right-click or
 `/copy` copies it), and the terminal's own selection needs **Shift** held
-(**Option** in macOS terminals). `wheel` keeps only scrolling and clicks, so the
-terminal still selects by drag; `buttons` adds drags; `off` leaves the mouse
-entirely to the terminal. Set it with `/mouse [off|wheel|buttons|all]` or the
-Input tab of `/dashboard`; the choice is saved in `display.mouse_tracking`.
-`K3CODE_TUI_MOUSE_TRACKING=0` and `K3CODE_TUI_DISABLE_MOUSE=1` force it off at
-startup, and Termux starts with it off.
+(**Option** in macOS terminals). `wheel` keeps only scrolling and clicks (no
+drags, no hover) and the terminal's own selection still needs Shift; `buttons`
+adds drags; only `off` leaves the mouse entirely to the terminal. Set it with
+`/mouse [off|wheel|buttons|all]` or the Input tab of `/dashboard`; the choice
+is saved in `display.mouse_tracking`. `K3CODE_TUI_MOUSE_TRACKING=0` and
+`K3CODE_TUI_DISABLE_MOUSE=1` force it off at startup, and Termux starts with it
+off.
 
 ## Commands
 
