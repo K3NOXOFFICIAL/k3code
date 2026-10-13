@@ -15,6 +15,7 @@ model-controlled and runs with hooks and fsmonitor disabled (see :func:`harness_
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import re
@@ -45,6 +46,11 @@ HARNESS_GIT_CONFIG = ("-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=fa
 #: daemon lifetime: every unattended session then ran bash on the real $HOME).
 REPROBE_AFTER_S = 60.0
 _GITDIR_LINE = re.compile(r"^gitdir:\s*(.+?)\s*$", re.MULTILINE)
+#: Files the C library reads to resolve a host name. Any of them may be a link out of the bound system dirs (WSL 2:
+#: /etc/resolv.conf -> /mnt/wsl/resolv.conf; Debian resolvconf: -> ../run/resolvconf/resolv.conf): see
+#: :func:`_name_lookup_argv`.
+NAME_LOOKUP_FILES = ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf", "/etc/host.conf", "/etc/gai.conf")
+_MAX_LINKS = 40  # the kernel's limit before ELOOP
 
 
 class SandboxRefused(RuntimeError):
@@ -240,6 +246,65 @@ def exposes_home(path: Path | str, home: Path | None = None) -> bool:
     return home.is_relative_to(Path(path).resolve())
 
 
+def _link_walk(path: str) -> tuple[list[tuple[str, str]], str]:
+    """Resolve the absolute ``path`` as the kernel does, one component at a time. Returns every link met on the way as
+    ``(where, target)``, ``where`` free of links itself, and the path it ends at. Raises ``OSError`` on a loop."""
+    links: list[tuple[str, str]] = []
+    pending = [p for p in path.split("/") if p][::-1]
+    done = "/"
+    while pending:
+        part = pending.pop()
+        if part == "..":
+            done = os.path.dirname(done)
+        elif part != ".":
+            here = os.path.join(done, part)
+            if not os.path.islink(here):
+                done = here
+                continue
+            if len(links) >= _MAX_LINKS:
+                raise OSError(errno.ELOOP, "too many levels of symbolic links", path)
+            target = os.readlink(here)
+            links.append((here, target))
+            if target.startswith("/"):
+                done = "/"
+            pending += [p for p in target.split("/") if p][::-1]
+    return links, done
+
+
+def _name_lookup_argv(shown: Sequence[str], hidden: Sequence[Path]) -> list[str]:
+    """bwrap ops that keep each :data:`NAME_LOOKUP_FILES` entry readable when it links out of ``shown`` (the system
+    dirs already in the sandbox): the links on the way are recreated and the file at the end is bound read-only at its
+    own path. A file whose link or bind would land inside or above ``hidden`` ($HOME, the k3code home), or on or above
+    a shown dir or /tmp, is left out: the sandbox keeps hiding those, and an op that collides with another mount fails
+    the whole sandbox."""
+    shown_paths = [Path(s) for s in shown]
+    mounted = (*hidden, *shown_paths, Path("/tmp"))
+
+    def clashes(dest: Path) -> bool:
+        return any(dest.is_relative_to(h) for h in hidden) or any(m.is_relative_to(dest) for m in mounted)
+
+    out: list[str] = []
+    placed: set[str] = set()
+    for name in NAME_LOOKUP_FILES:
+        try:
+            links, end = _link_walk(name)
+        except (OSError, ValueError):
+            logger.debug("sandbox: cannot follow %s", name, exc_info=True)
+            continue
+        if not links or not os.path.isfile(end):
+            continue
+        ops = [("--symlink", target, where) for where, target in links] + [("--ro-bind", end, end)]
+        ops = [op for op in ops if not any(Path(op[2]).is_relative_to(s) for s in shown_paths)]
+        if any(clashes(Path(op[2])) for op in ops):
+            logger.warning("sandbox: %s links to %s, which the sandbox does not show; names may not resolve", name, end)
+            continue
+        for op in ops:
+            if op[2] not in placed:
+                placed.add(op[2])
+                out += op
+    return out
+
+
 def build_argv(
     cwd: Path | str,
     add_dirs: Iterable[Path | str] = (),
@@ -275,19 +340,30 @@ def build_argv(
         if value is not None:
             argv += ["--setenv", name, value]
     # System: read-only. /bin, /lib* are usually symlinks into /usr; recreate them as symlinks.
+    shown = ["/proc", "/dev"]
     for path in ("/usr", "/etc"):
         if os.path.isdir(path):
             argv += ["--ro-bind", path, path]
+            shown.append(path)
     for path in ("/bin", "/sbin", "/lib", "/lib32", "/lib64"):
         if os.path.islink(path):
             argv += ["--symlink", os.readlink(path), path]
+            shown.append(path)
         elif os.path.isdir(path):
             argv += ["--ro-bind", path, path]
+            shown.append(path)
     # /etc/resolv.conf is often a link into /run; keep name resolution working (when the network is on).
     for path in ("/run/systemd/resolve", "/run/NetworkManager"):
         if os.path.isdir(path):
             argv += ["--ro-bind", path, path]
+            shown.append(path)
     argv += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+    # A resolver file linked anywhere else (WSL 2: /mnt/wsl/resolv.conf) is bound at its own path, after the /tmp
+    # tmpfs and before $HOME is masked; never from $HOME or the k3code home. Both spellings of those count: the later
+    # mounts use the given path, and a link recreated above it would make bwrap fail to place them.
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    private = [home, paths.home(), *([Path(xdg) / "k3code"] if xdg else [])]
+    argv += _name_lookup_argv(shown, [*private, *(Path(os.path.realpath(p)) for p in private)])
     # $HOME hidden behind an empty tmpfs, then only the cache dirs and the project are bound back.
     argv += ["--tmpfs", str(home)]
     cache = home / HOME_CACHE
@@ -313,7 +389,6 @@ def build_argv(
     for path in _home_readonly_paths(home, extra, [*roots, cache]):
         argv += ["--ro-bind", str(path), str(path)]
     # $HOME secrets are masked again after the project binds: a bind above them would re-expose them
-    xdg = os.environ.get("XDG_CONFIG_HOME")
     secrets = [home / s for s in HOME_SECRETS] + ([Path(xdg) / "k3code"] if xdg else [])
     for path in dict.fromkeys(str(p) for p in secrets):
         if os.path.isdir(path):
@@ -372,3 +447,26 @@ def _probe_bwrap() -> bool:
     except (OSError, subprocess.SubprocessError, SandboxRefused):
         return False
     return r.returncode == 0
+
+
+def hidden_name_lookup_files() -> list[str]:
+    """The :data:`NAME_LOOKUP_FILES` readable here but not inside the sandbox, where host names then do not resolve
+    although the network is on. Reads files only, no lookup. Spawns bwrap (up to 10 s); [] when it cannot run."""
+    path = bwrap_path()
+    wanted = [f for f in NAME_LOOKUP_FILES if os.access(f, os.R_OK)]
+    if path is None or not wanted:
+        return []
+    script = 'for f; do [ -r "$f" ] || echo "$f"; done'
+    try:
+        with tempfile.TemporaryDirectory(prefix="k3code-bwrap-") as scratch:
+            r = subprocess.run(
+                [*build_argv(scratch, bwrap=path), "/bin/sh", "-c", script, "sh", *wanted],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                env=child_env(),
+            )
+    except (OSError, subprocess.SubprocessError, SandboxRefused):
+        return []
+    return [f for f in r.stdout.splitlines() if f in wanted] if r.returncode == 0 else []
