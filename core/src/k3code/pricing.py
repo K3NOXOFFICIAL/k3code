@@ -117,12 +117,32 @@ def estimate_usd(config: Any, usage: Any) -> float | None:
     ) / 1_000_000
 
 
+def one_hour_write_multiple(config: Any, provider: str, model: str) -> float | None:
+    """2.0 when the provider entry named ``provider`` writes a 1-hour cache for ``model`` (what the providers set on a
+    live call: Anthropic's own API, or a Claude relay on the chat-completions wire), else None."""
+    for entry in getattr(config, "providers", None) or []:
+        if getattr(entry, "name", None) != provider or getattr(entry, "cache_ttl", "5m") != "1h":
+            continue
+        if getattr(entry, "prompt_cache", "auto") == "off":
+            return None
+        if getattr(entry, "kind", "") == "anthropic" or "claude" in model.lower():
+            return 2.0
+        return None
+    return None
+
+
 def day_loader(usage_db: Any, config: Any) -> Any:
     """The ``DAY_LEDGER`` loader for ``usage_db``: (tokens, USD) the log already holds for a day, rows priced like live
     calls (the provider's cost, else the price table, else the governor's blended rate)."""
     from types import SimpleNamespace
 
     def price(row: dict[str, Any]) -> float | None:
+        # the providers set the 2x write price of a 1-hour cache on the live usage; the log keeps only the tokens, so
+        # the entry's own setting stands in for it (a restart used to price those writes at the 5-minute 1.25x)
+        if (
+            x := one_hour_write_multiple(config, str(row.get("provider") or ""), str(row.get("model") or ""))
+        ) is not None:
+            row = {**row, "cache_write_multiple": x}
         return estimate_usd(config, SimpleNamespace(cost_usd=None, **row))
 
     return lambda day: usage_db.day_spend(day, price)

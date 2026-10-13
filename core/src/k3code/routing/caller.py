@@ -18,11 +18,16 @@ from typing import Any
 
 from k3code.errors import ChainExhausted
 from k3code.providers import effort as effort_mod
+from k3code.providers.stall import CALL_DEADLINE
 from k3code.providers.types import Message, ToolSpec, Usage
 from k3code.routing.tiers import TaskKind, Tier, TierRouters, next_tier, tier_for
 from k3code.usage import CUT_SHORT
 
 logger = logging.getLogger(__name__)
+
+#: A call with at least this long a deadline (seconds) caps the stall limits that would outlast it (providers/stall.py).
+#: Shorter ones (titles, judges: 15-60 s) keep the provider's own limits: a slow first token there is not a stall.
+LONG_DEADLINE_S = 75.0
 
 #: (provider, model) of the router attempts of the call in flight in this context, newest last. ``_once`` installs a
 #: fresh list around its router call and the gateway's router-event callback appends to it, so a call is priced by
@@ -161,6 +166,8 @@ class ModelCaller:
         pending: Usage | None = None
         served = ("", "")  # who the pending prompt was sent to: the attempts list moves on with the next one
         final: Message | None = None
+        # a long deadline (compaction) leaves a stall limit of 300 s (a local server) no way to fire first
+        deadline = CALL_DEADLINE.set(timeout) if timeout and timeout >= LONG_DEADLINE_S else None
         try:
             async for event in events:
                 if event.type == "partial_usage" and event.usage is not None:
@@ -174,6 +181,8 @@ class ModelCaller:
                 elif event.type == "done" and event.message is not None:
                     pending, final = None, event.message  # the final usage replaces the prompt count
         finally:
+            if deadline is not None:
+                CALL_DEADLINE.reset(deadline)
             if pending is not None:  # the walk ended in an error, or the deadline cancelled it
                 book_dead(pending, served)
             aclose = getattr(events, "aclose", None)

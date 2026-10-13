@@ -275,3 +275,73 @@ async def test_a_skipped_dead_entry_stays_skipped_when_the_free_one_after_it_ans
     _arm_window(router, 0)
     events = await drain(router.stream(MSGS, [], max_tokens=10, temperature=None))
     assert events[-1].message.content == "from b" and (a.calls, b.calls) == (0, 1)
+
+
+# ── a long deadline caps the stall limits that could never fire inside it ───────────────────────────────────────────
+
+
+def test_stall_limits_that_outlast_a_call_deadline_are_cut_to_a_share_of_it():
+    from k3code.providers.stall import CALL_DEADLINE, DEADLINE_SHARE, StreamWatchdog
+
+    token = CALL_DEADLINE.set(90.0)
+    try:
+        local = StreamWatchdog(first_event=300.0, idle=300.0)  # a local server's limits
+        remote = StreamWatchdog(first_event=60.0, idle=120.0)  # the defaults: the first fires inside 90 s, idle not
+    finally:
+        CALL_DEADLINE.reset(token)
+    assert (local.first_event, local.idle) == (90.0 * DEADLINE_SHARE, 90.0 * DEADLINE_SHARE)
+    assert (remote.first_event, remote.idle) == (60.0, 90.0 * DEADLINE_SHARE)
+    assert StreamWatchdog(first_event=300.0, idle=300.0).first_event == 300.0  # no deadline: as configured
+
+
+async def test_only_a_call_with_a_long_deadline_sets_it_for_the_providers():
+    from k3code.providers.stall import CALL_DEADLINE
+
+    seen: list[float | None] = []
+
+    class Spy(Entry):
+        async def stream(self, messages, tools, model, **kwargs):
+            seen.append(CALL_DEADLINE.get())
+            async for event in super().stream(messages, tools, model, **kwargs):
+                yield event
+
+    books = SimpleNamespace(rows=[], db=None)
+    router = Router(build_chain([Spy("a")], [["m"]]), sleep=no_sleep)
+    caller = ModelCaller(
+        lambda: {t: router for t in Tier},
+        SimpleNamespace(task_tiers=None, providers=[]),
+        SimpleNamespace(record=lambda kind, **kw: books.rows.append(kind)),
+    )
+    await caller.complete(TaskKind.COMPACTION, MSGS, session_id="s1", timeout=90.0)
+    await caller.complete(TaskKind.TITLE, MSGS, session_id="s1", timeout=15.0)
+    await caller.complete(TaskKind.TITLE, MSGS, session_id="s1")
+    assert seen == [90.0, None, None]
+    assert CALL_DEADLINE.get() is None  # reset afterwards
+
+
+async def test_a_hung_local_primary_fails_over_inside_a_long_deadline():
+    """A keyless/local entry has a 300 s stall limit; a 90 s compaction deadline cut it off before it could fire, so the
+    second entry was never tried. The watchdog the entry builds now gets 90 s x the share (0.6) as its first-event
+    limit; the stub reports it and stalls at once."""
+    import k3code.routing.caller as caller_mod
+    from k3code.providers.stall import StreamWatchdog
+
+    class Hangs(Entry):
+        async def stream(self, messages, tools, model, **kwargs):
+            wd = StreamWatchdog(first_event=300.0, idle=300.0)  # what the provider builds for a local server
+            self.limit = wd.first_event
+            await asyncio.sleep(0)  # (the real guard would now wait for the first byte)
+            raise stalled()
+            yield  # pragma: no cover
+
+    a, b = Hangs("a"), Entry("b", reply="from b")
+    router = router_of([a, b])
+    books = SimpleNamespace(rows=[])
+    caller = ModelCaller(
+        lambda: {t: router for t in Tier},
+        SimpleNamespace(task_tiers=None, providers=[]),
+        SimpleNamespace(record=lambda kind, **kw: books.rows.append(kind)),
+    )
+    assert caller_mod.LONG_DEADLINE_S <= 90.0
+    reply = await caller.complete(TaskKind.COMPACTION, MSGS, session_id="s1", timeout=90.0)
+    assert reply.text == "from b" and a.limit == 90.0 * 0.6

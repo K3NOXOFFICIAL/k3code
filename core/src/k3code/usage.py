@@ -160,12 +160,12 @@ class UsageDB:
         ``price_of`` (a row dict -> USD or None) prices it; else the governor's blended rate applies at the caller. A
         sub-agent row adds up all of one run's calls (``aggregated``), not one request."""
         cur = self._db.execute(
-            "SELECT model, tokens_in, tokens_out, cost_usd, cache_read, cache_write, kind FROM events"
+            "SELECT model, tokens_in, tokens_out, cost_usd, cache_read, cache_write, kind, provider FROM events"
             " WHERE day = ? AND kind IN ('call', 'subagent')",
             (day,),
         )
         tokens, usd = 0, 0.0
-        for model, tin, tout, cost, c_read, c_write, kind in cur:
+        for model, tin, tout, cost, c_read, c_write, kind, provider in cur:
             row_tokens = int(tin or 0) + int(tout or 0)
             tokens += row_tokens
             priced = float(cost) if cost is not None else None
@@ -173,6 +173,7 @@ class UsageDB:
                 priced = price_of(
                     {
                         "model": model,
+                        "provider": provider or "",
                         "prompt_tokens": int(tin or 0),
                         "completion_tokens": int(tout or 0),
                         "cache_read_tokens": int(c_read or 0),

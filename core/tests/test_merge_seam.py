@@ -471,3 +471,44 @@ def test_the_import_report_names_the_values_the_bundle_hides_in_part(tmp_path) -
     assert rep.hidden == ["user: hooks.PreToolUse[0].command", "user: mcp.servers.s.args[0]"]
     assert "not written, the bundle hides" in rep.describe() and "hooks.PreToolUse[0].command" in rep.describe()
     assert not any("mem0" in h for h in rep.hidden)
+
+
+def test_the_day_ledger_rebuilt_from_the_log_prices_a_one_hour_cache_write_like_the_live_one(tmp_path) -> None:
+    """The live ledger priced the 2x write of a 1-hour cache; the one rebuilt from the log after a restart priced the
+    same tokens at 1.25x (the log keeps tokens, not the multiple), so the day's USD caps started from too little."""
+    import time
+    from types import SimpleNamespace
+
+    from k3code.config import ProviderEntry
+    from k3code.pricing import day_loader, estimate_usd
+    from k3code.providers.types import Usage
+    from k3code.usage import UsageDB
+
+    day = time.strftime("%Y-%m-%d")
+    model = "claude-sonnet-4-5"
+
+    def rebuilt(ttl: str, *, kind: str = "anthropic", prompt_cache: str = "auto", provider: str = "p", m: str = model):
+        entry = ProviderEntry(
+            name="p", kind=kind, base_url="https://x.test/v1", api_key_env="K", cache_ttl=ttl, prompt_cache=prompt_cache
+        )
+        cfg = SimpleNamespace(currency="USD", providers=[entry])
+        db = UsageDB(tmp_path / f"u-{ttl}-{kind}-{prompt_cache}-{provider}-{m}.db")
+        db.record("call", provider=provider, model=m, tokens_in=100_000, tokens_out=100, cache_write=90_000)
+        return day_loader(db, cfg)(day)[1]
+
+    live = estimate_usd(
+        SimpleNamespace(currency="USD"),
+        Usage(
+            prompt_tokens=100_000,
+            completion_tokens=100,
+            cache_creation_tokens=90_000,
+            cache_write_multiple=2.0,
+            model=model,
+        ),
+    )
+    five = rebuilt("5m")
+    assert rebuilt("1h") == pytest.approx(live) and live > five
+    assert rebuilt("1h", prompt_cache="off") == pytest.approx(five)  # no breakpoints sent: no 1-hour write
+    assert rebuilt("1h", provider="other") == pytest.approx(five)  # another provider's entry says nothing
+    assert rebuilt("1h", kind="openai", m="gpt-5") == pytest.approx(rebuilt("5m", kind="openai", m="gpt-5"))
+    assert rebuilt("1h", kind="openai") == pytest.approx(live)  # a Claude relay on the chat-completions wire

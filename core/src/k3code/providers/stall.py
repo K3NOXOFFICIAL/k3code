@@ -12,6 +12,7 @@ import asyncio
 import ipaddress
 import time
 from collections.abc import AsyncIterator, Awaitable
+from contextvars import ContextVar
 from typing import TypeVar
 
 import httpx
@@ -24,6 +25,13 @@ FIRST_EVENT_TIMEOUT = 60.0
 IDLE_TIMEOUT = 120.0
 #: Where a reasoning model can be silent for a long time and still be working (the old read timeout).
 REASONING_TIMEOUT = 300.0
+
+#: The deadline (seconds) of the side call being made, when it is long enough to matter (compaction: 90). A stall limit
+#: that is not shorter than it could never fire inside it: the deadline would cut the call off first and the next
+#: entry of the chain would never be tried. ModelCaller sets it; :class:`StreamWatchdog` reads it.
+CALL_DEADLINE: ContextVar[float | None] = ContextVar("call_deadline", default=None)
+#: Such a limit is cut to this share of the deadline, which leaves the rest to the entry that is failed over to.
+DEADLINE_SHARE = 0.6
 
 T = TypeVar("T")
 
@@ -65,6 +73,9 @@ class StreamWatchdog:
     """A deadline that every progress event pushes out; waiting past it raises :class:`StreamStalled`."""
 
     def __init__(self, *, first_event: float, idle: float) -> None:
+        if (deadline := CALL_DEADLINE.get()) is not None:
+            first_event = first_event if first_event < deadline else deadline * DEADLINE_SHARE
+            idle = idle if idle < deadline else deadline * DEADLINE_SHARE
         self.first_event = first_event
         self.idle = idle
         self._started = False
