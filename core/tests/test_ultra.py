@@ -408,7 +408,7 @@ def test_a_vote_is_sent_only_the_diff_of_the_files_its_findings_name():
 async def test_a_review_lens_that_died_is_not_a_lens_that_found_nothing():
     from types import SimpleNamespace
 
-    from k3code.autonomy.ultra import Ultra
+    from k3code.autonomy.ultra import Ultra, _Report
     from k3code.subagents.budget import CAP_ERROR, AgentBudget, BudgetStop
     from k3code.subagents.runner import Handle
 
@@ -426,7 +426,7 @@ async def test_a_review_lens_that_died_is_not_a_lens_that_found_nothing():
             return _h
 
         ex.run_child = run_child  # type: ignore[method-assign]
-        report = SimpleNamespace(notes=[], panel_ran=False, candidates=[])
+        report = _Report(task="task")
         session = SimpleNamespace(perms=SimpleNamespace(cwd="."))
 
         async def fake_git(*args, **kwargs):
@@ -446,8 +446,40 @@ async def test_a_review_lens_that_died_is_not_a_lens_that_found_nothing():
                 assert any("did not finish" in n for n in report.notes)
                 assert "review panel found nothing" not in report.notes
                 assert "review panel found nothing in the lenses that finished" in report.notes
+                # no lens answered: the report says the panel did not review the change, not "0 candidates"
+                assert report.panel_ran is False
+                assert "not run: the change was not reviewed by the panel" in report.render()
         finally:
             ultra_mod.wt_mod.git = orig  # type: ignore[assignment]
+
+
+async def test_a_panel_with_one_lens_left_still_counts_as_run(monkeypatch):
+    from types import SimpleNamespace
+
+    import k3code.autonomy.ultra as ultra_mod
+    from k3code.autonomy.ultra import Ultra, _Report
+    from k3code.subagents.budget import AgentBudget
+    from k3code.subagents.runner import Handle
+
+    async def run_child(session, budget, kind, prompt, *args, **kwargs):
+        h = Handle(id="r", description="d", agent_type="reviewer", tier="main", depth=1, parent_sid="s")
+        alive = "LENS: correctness" in prompt
+        h.status, h.error, h.result = ("completed", "", "[]") if alive else ("failed", "provider exploded", "")
+        return h
+
+    async def fake_git(*args, **kwargs):
+        return 0, "diff --git a/x b/x\n+x\n"
+
+    monkeypatch.setattr(ultra_mod.wt_mod, "git", fake_git)
+    ex = Ultra.__new__(Ultra)
+    ex.progress = lambda *a, **k: None  # type: ignore[method-assign]
+    ex.run_child = run_child  # type: ignore[method-assign]
+    report = _Report(task="task")
+    session = SimpleNamespace(perms=SimpleNamespace(cwd="."))
+    await ex.review_and_fix(session, AgentBudget(max_agents=9, max_tokens=1500), report, "task", "plan", "base")
+    assert report.panel_ran is True, "one lens answered: the panel ran, and the dead one is listed as missing"
+    assert any("did not finish" in n for n in report.notes)
+    assert "0 candidate finding(s)" in report.render()
 
 
 def test_diff_for_files_reads_the_paths_the_way_reviewers_and_git_write_them():
@@ -470,4 +502,14 @@ def test_diff_for_files_reads_the_paths_the_way_reviewers_and_git_write_them():
     # one finding names a file the diff does not have: its vote needs the whole diff, not just the other file's hunk
     assert diff_for_files(diff, {"src/a.py", "missing.py"}) == diff
     assert diff_for_files(a + b, {"a.py"}) == a, "a name that is only the tail of a directory name does not match"
-    assert diff_for_files(block("src/data.py", "src/data.py"), {"a.py"}) != "", "no false suffix match"
+    data = block("src/data.py", "src/data.py")
+    assert diff_for_files(data + a, {"a.py"}) == a, (
+        "a name that ends the same but not at a directory boundary is no match"
+    )
+    # a longer relative path is not the shallower file of the same name: the finding names a file the diff lacks, so
+    # its vote gets the whole diff (the root conftest.py's hunk alone has nothing to do with tests/conftest.py)
+    root = block("conftest.py", "conftest.py")
+    assert diff_for_files(root + a, {"tests/conftest.py"}) == root + a
+    assert diff_for_files(root + a, {"tests/conftest.py", "src/a.py"}) == root + a
+    assert diff_for_files(root + a, {"conftest.py"}) == root and diff_for_files(root + a, {"./conftest.py"}) == root
+    assert diff_for_files(root + a, {"/work/repo/conftest.py"}) == root, "an absolute path ends in the header's path"

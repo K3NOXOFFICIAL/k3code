@@ -96,3 +96,22 @@ async def test_an_edit_whose_whitespace_already_matches_is_not_reindented(tmp_pa
         tmp_path, "f.py", text, "def f(x):\n    if x:\n        return 1", "def f(x):\n    if x:\n        return 2"
     )
     assert out == "def f(x):\n    if x:\n        return 2\n"
+
+
+async def test_a_new_string_in_the_files_own_indentation_is_not_shifted_by_the_slip_in_old_string(tmp_path):
+    text = "def f():\n    a = 1\n    b = 2\n    return a + b\n"
+    out = await edit(tmp_path, "a.py", text, "def f():\n  a = 1\n", "def f():\n    a = 10\n")  # old is two-space
+    assert out == "def f():\n    a = 10\n    b = 2\n    return a + b\n"
+    compile(out, "a.py", "exec")
+    text = "services:\n  web:\n    image: a\n    ports: x\n"
+    out = await edit(
+        tmp_path, "b.yaml", text, "services:\n   web:\n     image: a\n", "services:\n  web:\n    image: b\n"
+    )
+    assert out == "services:\n  web:\n    image: b\n    ports: x\n"
+
+
+async def test_a_new_string_that_repeats_the_slip_of_old_string_is_still_corrected(tmp_path):
+    text = "def f():\n    a = 1\n    b = 2\n    return a + b\n"
+    out = await edit(tmp_path, "a.py", text, "def f():\n  a = 1\n", "def f():\n  a = 10\n")
+    assert out == "def f():\n    a = 10\n    b = 2\n    return a + b\n"
+    compile(out, "a.py", "exec")

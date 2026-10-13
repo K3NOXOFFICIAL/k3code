@@ -242,6 +242,26 @@ async def test_medium_in_auto_plans_on_strong_and_auto_approves(tmp_path, monkey
     assert server.session.perms.mode.value == "auto"  # plan approval did not leave auto mode
 
 
+async def test_the_planner_is_sent_the_job_tools_when_the_session_has_a_background_job(tmp_path, monkeypatch):
+    """Plan mode allows bash_output / bash_kill, so a job started in an earlier turn can be read while planning."""
+    from k3code.tools import jobs
+
+    server = make(tmp_path, monkeypatch, [verdict("medium"), *PLANNER, *ADVISOR_BRIEF, *EXECUTOR, *PROPOSER])
+    await start(server, tmp_path)
+    sid = server.session.session_id
+    proc = await asyncio.create_subprocess_shell(
+        "echo built", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    jobs.REGISTRY.add(sid, "make", proc, cwd=str(tmp_path))  # an exited job is still the session's job
+    try:
+        await run_turn(server, "add a --verbose flag to the CLI")
+    finally:
+        await jobs.REGISTRY.reap(sid)
+    planner_call = next(c for p in server.providers for c in p.log if "PLANNING mode" in c["text"])
+    assert {"bash_output", "bash_kill"} <= set(planner_call["tools"])
+    assert not {"write", "edit", "bash"} & set(planner_call["tools"])  # what plan mode refuses is still not described
+
+
 async def test_high_risk_in_auto_requires_approval(tmp_path, monkeypatch):
     steps = [verdict("small", risk="high", needs_plan=True), *PLANNER, *EXECUTOR]
     server = make(tmp_path, monkeypatch, steps)

@@ -190,6 +190,35 @@ def test_claude_codes_spellings_are_renamed_not_dropped():
     }
 
 
+def test_an_unused_claude_code_option_sent_as_null_is_dropped_not_renamed_into_a_null():
+    from k3code.tools import build_registry
+    from k3code.tools.validate import invalid_arguments, normalize_arguments
+
+    bash = build_registry().get("bash")[0].parameters
+    args = normalize_arguments("bash", {"command": "echo hi", "run_in_background": None}, bash)
+    assert args == {"command": "echo hi"} and invalid_arguments("bash", bash, args) is None
+    task = {
+        "type": "object",
+        "properties": {"prompt": {"type": "string"}, "agent_type": {"type": "string"}},
+        "required": ["prompt"],
+    }
+    args = normalize_arguments("task", {"prompt": "p", "subagent_type": None}, task)
+    assert args == {"prompt": "p"} and invalid_arguments("task", task, args) is None
+    # a null next to the other spelling of the same option: the value wins whichever name carries it
+    both = {"command": "x", "background": True, "run_in_background": None}
+    assert normalize_arguments("bash", both, bash) == {"command": "x", "background": True}
+    both = {"command": "x", "background": None, "run_in_background": True}
+    assert normalize_arguments("bash", both, bash) == {"command": "x", "background": True}
+
+
+async def test_a_bash_call_that_sends_claude_codes_background_option_as_null_runs(tmp_path):
+    call = ToolCall(id="b1", name="bash", arguments={"command": "echo hi", "run_in_background": None})
+    provider = Replies([[call]])
+    await drain(loop_for(tmp_path, provider))
+    shown = str(next(m for m in provider.seen[1] if m.role == "tool").content)
+    assert shown.startswith("hi") and "invalid arguments" not in shown
+
+
 async def test_a_bash_call_in_claude_codes_spelling_starts_a_job_instead_of_waiting_for_the_timeout(tmp_path):
     call = ToolCall(id="b1", name="bash", arguments={"command": "sleep 30", "run_in_background": True})
     provider = Replies([[call]])
@@ -240,7 +269,43 @@ def test_sandbox_failures_are_explained():
     assert _sandbox_hint("", "true") == ""
 
 
+def test_the_private_tmp_hint_is_not_given_for_a_file_missing_inside_the_project(monkeypatch):
+    from k3code.tools import _sandbox_hint
+
+    monkeypatch.setenv("HOME", "/home/someone")
+    home_err = "cat: /home/someone/proj/missing.txt: No such file or directory"
+    # the project lies under the home: a missing file in it is missing, not discarded
+    assert _sandbox_hint(home_err, "cat x", roots=["/home/someone/proj"]) == ""
+    assert "private to each bash call" in _sandbox_hint(home_err, "cat x")  # no roots given: as before
+    # a file outside the kept folders, and a sibling whose name only starts like the project's
+    assert "private to each bash call" in _sandbox_hint(
+        home_err.replace("/proj/", "/other/"), "cat x", roots=["/home/someone/proj"]
+    )
+    assert "private to each bash call" in _sandbox_hint(
+        home_err.replace("/proj/", "/proj2/"), "cat x", roots=["/home/someone/proj"]
+    )
+    # the same for a project under /tmp, with the path in quotes
+    tmp_err = "python3: can't open file '/tmp/proj/nope.py': [Errno 2] No such file or directory"
+    assert _sandbox_hint(tmp_err, "python3 /tmp/proj/nope.py", roots=[Path("/tmp/proj")]) == ""
+    assert "private to each bash call" in _sandbox_hint(tmp_err, "python3 /tmp/proj/nope.py")
+
+
 needs_bwrap = pytest.mark.skipif(not sandbox.usable(), reason="bubblewrap is unusable here")
+
+
+@needs_bwrap
+async def test_a_missing_file_in_a_project_under_the_home_gets_no_private_tmp_hint(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    proj = home / "proj"
+    proj.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    argv = sandbox.build_argv(proj, [], network=False)
+    res = await tool_bash({"command": f"cat {proj}/missing.txt"}, cwd=proj, sandbox=argv)
+    assert res["exit_code"] != 0 and "No such file" in res["stderr"]
+    assert "private to each bash call" not in format_tool_result(res)
+    # a file the model parked in the (discarded) home outside the project still gets the explanation
+    gone = await tool_bash({"command": f"cat {home}/notes.txt"}, cwd=proj, sandbox=argv)
+    assert "private to each bash call" in format_tool_result(gone)
 
 
 @needs_bwrap
@@ -365,6 +430,29 @@ def test_output_that_is_only_cr_separated_records_says_that_frames_were_dropped(
     assert format_tool_result({"stdout": "10%\r50%\r100%\n", "stderr": "", "exit_code": 0}) == "100%"
 
 
+async def test_cr_separated_records_say_that_frames_were_dropped_after_other_output_too(tmp_path):
+    from k3code.tools import _collapse_redraws, jobs, tool_bash_output
+
+    note = "3 earlier carriage-return frames dropped"
+    assert note in _collapse_redraws("[job1 exited with code 0]\nid\r1,a\r2,b\r3,c\r")
+    # a progress bar that ends its line, with or without text before it, is no data
+    assert _collapse_redraws("head\n10%\r50%\r100%\n") == "head\n100%\n"
+    records = r"id,name\r1,alice\r2,bob\r3,carol\r"
+    res = await tool_bash({"command": f"echo header; printf '{records}'"}, cwd=tmp_path)
+    shown = format_tool_result(res)
+    assert shown.startswith("header\n3,carol") and note in shown
+    started = await tool_bash({"command": f"printf '{records}'", "background": True}, cwd=tmp_path, session_id="s-cr")
+    try:
+        for _ in range(50):
+            out = await tool_bash_output({"job_id": started["content"].split()[1]}, session_id="s-cr")
+            if "carol" in out["content"]:
+                break
+            await asyncio.sleep(0.1)
+        assert "3,carol" in out["content"] and note in out["content"]
+    finally:
+        await jobs.reap("s-cr")
+
+
 @pytest.mark.skipif(shutil.which("rg") is None, reason="needs ripgrep")
 async def test_grep_searches_hidden_directories_but_keeps_git_and_credential_files_out(tmp_path):
     (tmp_path / ".github" / "workflows").mkdir(parents=True)
@@ -428,6 +516,35 @@ async def test_grep_forms_that_cannot_match_say_so_instead_of_finding_nothing(tm
     # a glob in path
     err = (await tool_grep({"pattern": "x", "path": "src/*.py"}, cwd=tmp_path))["error"]
     assert "not a glob" in err
+
+
+def test_the_no_match_hints_name_the_slips_and_stay_silent_for_a_correct_search():
+    from k3code.tools import _no_match_hints
+
+    # a file glob and a deliberate pair of literal pipes: nothing to check
+    assert _no_match_hints("zzz", "*.py") == ""
+    assert _no_match_hints("zzz", ["*.py", "Cargo.toml", ".env*"]) == ""
+    assert _no_match_hints(r"\|\|", ["*.py"]) == ""
+    assert _no_match_hints("zzz", None) == ""
+    # the slips: a folder or a language as include, grep's `\|` between two words
+    assert "file-name glob" in _no_match_hints("zzz", "src")
+    assert "file-name glob" in _no_match_hints("zzz", ["*.py", "python"])
+    assert "literal pipe" in _no_match_hints(r"foo\|bar", None)
+    both = _no_match_hints(r"foo\|bar", "src")
+    assert "literal pipe" in both and "file-name glob" in both
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="needs ripgrep")
+async def test_grep_skips_the_caches_of_common_toolchains_unless_searched_on_purpose(tmp_path):
+    cache_dirs = (".next", ".nuxt", ".nox", ".gradle", ".terraform", ".turbo", ".svelte-kit", ".parcel-cache")
+    for name in cache_dirs:
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "gen.js").write_text("needle\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("needle\n")
+    assert (await tool_grep({"pattern": "needle"}, cwd=tmp_path))["matches"] == "src/app.py\n1:needle"
+    assert (await tool_glob({"pattern": "*.js"}, cwd=tmp_path))["files"] == []
+    assert "gen.js" in (await tool_grep({"pattern": "needle", "path": ".next"}, cwd=tmp_path))["matches"]
     # a non-string include item is named instead of crashing the tool
     schema = {"type": "object", "properties": {"include": {"type": ["string", "array"], "items": {"type": "string"}}}}
     assert check_arguments(schema, {"include": [1, 2]}) == [
@@ -496,7 +613,7 @@ async def test_bash_output_is_cleaned_like_bash_output(tmp_path):
 def test_grep_results_name_each_file_once():
     from k3code.tools import _group_by_file
 
-    lines = ["a.py:3:import os", "a.py:9:os.exit()", "b/c.py:1:os = 1", "12:text of a single-file search"]
+    lines = ["a.py\x003:import os", "a.py\x009:os.exit()", "b/c.py\x001:os = 1", "12:text of a single-file search"]
     assert _group_by_file(lines).splitlines() == [
         "a.py",
         "3:import os",
@@ -507,6 +624,34 @@ def test_grep_results_name_each_file_once():
         "12:text of a single-file search",
     ]
     assert _group_by_file([]) == ""
+
+
+def test_grouping_cuts_a_path_at_its_end_not_at_the_first_colon_and_number():
+    from k3code.tools import _group_by_file
+
+    log = "logs/2024-01-01T10:30:00.log"
+    assert _group_by_file([f"{log}\x002:ERROR boom", f"{log}\x007:ERROR again"]).splitlines() == [
+        log,
+        "2:ERROR boom",
+        "7:ERROR again",
+    ]
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="needs ripgrep")
+async def test_grep_names_a_file_whose_name_holds_a_time_stamp(tmp_path):
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "2024-01-01T10:30:00.log").write_text("ok\nERROR boom\n")
+    res = await tool_grep({"pattern": "ERROR"}, cwd=tmp_path)
+    assert res["matches"] == "logs/2024-01-01T10:30:00.log\n2:ERROR boom"
+
+
+async def test_the_python_fallback_names_a_file_whose_name_holds_a_time_stamp(tmp_path):
+    from k3code.tools import _grep_fallback
+
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "2024-01-01T10:30:00.log").write_text("ok\nERROR boom\n")
+    res = _grep_fallback("ERROR", tmp_path, None, None, tmp_path)
+    assert res["matches"] == "logs/2024-01-01T10:30:00.log\n2:ERROR boom"
 
 
 @pytest.mark.skipif(shutil.which("rg") is None, reason="needs ripgrep")

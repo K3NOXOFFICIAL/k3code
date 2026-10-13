@@ -46,7 +46,9 @@ def request_headers(cfg: McpServerConfig) -> dict[str, str]:
     return headers
 
 
-_BRACES = re.compile(r"(\S*?)\{([^{}]*)\}")
+#: ``prefix{a, b}``. The prefix starts at the start of a word (or after a brace), so a long word is scanned once: a lazy
+#: ``\S*?`` tried from every position of it, and a 20,000 character query took seconds on the event loop.
+_BRACES = re.compile(r"(?<![^\s{}])([^\s{}]*)\{([^{}]*)\}")
 
 
 def _expand_names(query: str) -> str:
@@ -490,17 +492,22 @@ class McpManager:
 
     def search(self, query: str, limit: int = 8) -> list[McpToolInfo]:
         """Tools whose qualified name/description match ``query`` (exact names first). The notations the prompt itself
-        prints work: ``select:a,b``, ``mcp__server__{a, b}``, a comma or space separated list of names."""
+        prints work: ``select:a,b``, ``mcp__server__{a, b}``, a comma or space separated list of names. ``select:``
+        and a full qualified name pick exactly those tools: ``get_issue`` does not bring in ``get_issue_comments``."""
         q = _expand_names(query)
         words = [w for w in re.split(r"[\s,]+", q) if w]
+        tools = self.tools()
+        qualified = {t.qualified.lower() for t in tools}
+        # activating a tool sends its schema with every later request: a name asked for must not pull in others
+        keywords = [] if query.strip().lower().startswith("select:") else [w for w in words if w not in qualified]
         scored = []
-        for t in self.tools():
+        for t in tools:
             hay = f"{t.qualified} {t.description}".lower()
             names = {t.qualified.lower(), t.name.lower()}
             if q in names or names.intersection(words):
                 score = 100
             else:
-                score = sum(hay.count(w) for w in words)
+                score = sum(hay.count(w) for w in keywords)
             if score:
                 scored.append((score, t))
         scored.sort(key=lambda p: (-p[0], p[1].qualified))

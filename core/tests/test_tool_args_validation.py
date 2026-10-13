@@ -95,3 +95,17 @@ def test_validator_subset():
     assert check_arguments(schema, {"mode": "a", "zzz": 1}) == ["unexpected argument 'zzz'"]
     assert check_arguments({"type": "object", "properties": {}}, {"zzz": 1}) == []  # extras allowed by default
     assert compact_schema(schema) == "{mode: a|b, n?: integer, x?: string|array, flag?: boolean}"
+
+
+def test_a_remote_path_of_an_mcp_tool_is_not_judged_by_the_local_user_list():
+    import uuid
+
+    from k3code.tools.validate import invalid_arguments
+
+    schema = {"type": "object", "properties": {"path": {"type": "string"}}}
+    remote = f"~nouser{uuid.uuid4().hex}/app.log"  # no such user on this machine
+    assert "no user's home directory" in invalid_arguments("read", schema, {"path": remote})
+    assert invalid_arguments("mcp__ssh__read", schema, {"path": remote}) is None
+    # what no path can hold stays refused for every tool
+    assert "NUL byte" in invalid_arguments("mcp__ssh__read", schema, {"path": "a\x00b"})
+    assert "surrogate" in invalid_arguments("mcp__ssh__read", schema, {"path": "a\udc80b"})

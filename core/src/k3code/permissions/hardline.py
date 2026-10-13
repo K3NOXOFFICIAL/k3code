@@ -758,38 +758,80 @@ def _runs_stdin_as_code(argv: list[str]) -> bool:
     return True  # no script operand: the interpreter reads its program from stdin
 
 
+def _xargs_replace(tokens: list[str]) -> str:
+    """The replace string of the ``xargs`` in ``tokens`` (``-I TOK``, ``-ITOK``, ``-i[TOK]``, ``--replace[=TOK]``; the
+    last two default to ``{}``): the word its command line repeats once per input item. "" when it has none."""
+    short_val, long_val, _ = _WRAPPER_SPECS["xargs"]
+    start = next((k for k, t in enumerate(tokens) if os.path.basename(t) == "xargs"), len(tokens))
+    token = ""
+    i = start + 1
+    while i < len(tokens) and tokens[i].startswith("-") and tokens[i] != "--":  # the options end at the command
+        a = tokens[i]
+        i += 1
+        if a.startswith("--"):
+            key, eq, value = a.partition("=")
+            if key == "--replace":
+                token = value or "{}"
+            elif key in long_val and not eq:
+                i += 1
+            continue
+        for k, ch in enumerate(a[1:], 1):
+            if ch == "i":
+                token = a[k + 1 :] or "{}"
+                break
+            if ch in short_val:
+                value = a[k + 1 :]
+                if not value and i < len(tokens):
+                    value, i = tokens[i], i + 1
+                if ch == "I":
+                    token = value
+                break
+    return token
+
+
 def _pipeline_check(
     pipelines: list[list[str]], cwd: str | None = None, home: str = "", dirs: list[str] | None = None
 ) -> str | None:
     """A download fed into a later stage of the same pipeline that runs stdin as code (``curl x | sudo -n sh``,
     ``curl x | python3 -``); ``curl x | python3 -m json.tool`` only reads it. And a list of paths fed to a recursive
-    ``rm`` through ``xargs`` (``echo ~ | xargs rm -rf``, ``find ~ | xargs rm -r``)."""
+    ``rm`` through ``xargs`` (``echo ~ | xargs rm -rf``, ``find ~ | xargs -I{} rm -r {}``)."""
     for stages in pipelines:
         fetched = False
         previous: list[str] = []
         for stage in stages:
-            argv = normalize_argv(_tokens(stage))
+            tokens = _tokens(stage)
+            argv = normalize_argv(tokens)
             name = argv[0] if argv else ""
             if fetched and _is_interpreter(name) and _runs_stdin_as_code(argv):
                 return "pipe-to-shell"
-            if previous and name == "rm" and (hit := _fed_rm_check(previous, argv, cwd, home, dirs or [])):
-                return hit
+            if previous and name == "rm":
+                hit = _fed_rm_check(previous, argv, cwd, home, dirs or [], _xargs_replace(tokens))
+                if hit:
+                    return hit
             fetched = fetched or name in _FETCHERS
             previous = argv
     return None
 
 
-def _fed_rm_check(source: list[str], rm: list[str], cwd: str | None, home: str, dirs: list[str]) -> str | None:
+def _fed_rm_check(
+    source: list[str], rm: list[str], cwd: str | None, home: str, dirs: list[str], replace: str = ""
+) -> str | None:
     """``rm -r`` with no operands of its own, run on what the previous stage printed (``xargs rm -rf``): the paths an
-    ``echo``/``printf`` was given, or the start points of a ``find`` with no test that picks files, are its targets."""
+    ``echo``/``printf`` was given, or the start points of a ``find`` with no test that picks files, are its targets.
+    With a replace string (``xargs -I{} rm -rf {}``) they go in where the operands hold it."""
     recursive, targets = _rm_split(rm[1:])
-    if not recursive or targets:
+    if not recursive or (targets and not (replace and any(replace in t for t in targets))):
         return None
     if source[0] in ("echo", "printf"):
-        operands = [a for a in source[1:] if not a.startswith("-")]
-        return _rm_check(["rm", "-rf", *operands], cwd, home, dirs) if operands else None
-    if source[0] == "find" and not _FIND_SELECTORS.intersection(source):
-        return _rm_check(["rm", "-rf", *_find_roots(source[1:])], cwd, home, dirs)
+        fed = [a for a in source[1:] if not a.startswith("-")]
+    elif source[0] == "find" and not _find_picks_some(source[1:]):
+        fed = _find_roots(source[1:])
+    else:
+        return None
+    for operands in [[t.replace(replace, f) for t in targets] for f in fed] if targets else [fed]:
+        hit = _rm_check(["rm", "-rf", *operands], cwd, home, dirs)
+        if hit:
+            return hit
     return None
 
 
@@ -1266,22 +1308,57 @@ def _find_payloads(args: list[str]) -> list[str]:
 #: ``find`` tests that pick some of the files under a root (``-type`` and ``-maxdepth`` only shape the walk).
 _FIND_SELECTORS = frozenset(
     {"-name", "-iname", "-path", "-ipath", "-wholename", "-iwholename", "-regex", "-iregex", "-lname", "-ilname"}
-    | {"-newer", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-size", "-user", "-group", "-empty"}
-    | {"-perm", "-samefile", "-inum", "-uid", "-gid", "-nouser", "-nogroup", "-newerct", "-newerat", "-newermt"}
+    | {"-newer", "-anewer", "-cnewer", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-used", "-size"}
+    | {"-user", "-group", "-empty", "-perm", "-samefile", "-inum", "-uid", "-gid", "-nouser", "-nogroup", "-links"}
+    | {"-xtype", "-fstype", "-readable", "-writable", "-executable", "-context"}
 )
+#: ``-newerXY``: a time of the file (a, B, c, m) against a time of the reference (the same, or t: a date string).
+_FIND_NEWER = re.compile(r"-newer[aBcm][aBcmt]")
+
+
+def _find_picks_some(args: list[str]) -> bool:
+    """The tests of a ``find`` expression (``args``, up to its action) are true for only some of the files: every ``-o``
+    branch holds a selector or a ( group ) that is, and not a negated one. ``! -name keep`` and ``-not -user me`` pick
+    the complement, ``-name x -o -delete`` runs the action on whatever ``-name x`` does not match."""
+    branches = [False]
+    negated = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a in ("!", "-not"):
+            negated = not negated
+            continue
+        if a in ("-o", "-or"):
+            branches.append(False)
+        elif a == "(":
+            start, depth = i, 1
+            while i < len(args) and depth:
+                depth += (args[i] == "(") - (args[i] == ")")
+                i += 1
+            branches[-1] = branches[-1] or (not negated and _find_picks_some(args[start : i - 1]))
+        elif a in _FIND_SELECTORS or _FIND_NEWER.fullmatch(a):
+            branches[-1] = branches[-1] or not negated
+        negated = False
+    return all(branches)
 
 
 def _find_check(argv: list[str], cwd: str | None, home: str, dirs: list[str]) -> str | None:
-    """``find / ... -delete``, and ``find ~ -delete`` / ``find ~ -type f -delete`` (the whole home directory, with no
-    test that picks some of its files: ``find ~ -name '*.pyc' -delete`` is an ordinary clean-up)."""
+    """``find / ... -delete``, and ``find ~ -delete`` / ``find ~ -type f -delete`` (the whole home directory or a system
+    one like /etc, with no test that picks some of its files: ``find ~ -name '*.pyc' -delete`` is an ordinary
+    clean-up; a negated test, one on the far side of ``-o`` or one after ``-delete`` picks nothing, see
+    :func:`_find_picks_some`)."""
     if not argv or argv[0] != "find" or "-delete" not in argv:
         return None
+    picks_some = _find_picks_some(argv[1 : argv.index("-delete")])
     for root in _find_roots(argv[1:]):
         resolved = _resolved(root, cwd, home, dirs)
         if any(p in ("/", "/*") for p in resolved):
             return "find-delete-root"
-        if any(p in (home, home + "/*") for p in resolved) and not _FIND_SELECTORS.intersection(argv):
-            return "rm-rf-home"
+        if not picks_some:
+            for p in resolved:
+                if hit := _protected_hit(p, home):
+                    return hit
     return None
 
 

@@ -453,9 +453,14 @@ class SubagentManager:
                     cwd = h.worktree.path
                     h.branch = h.worktree.branch
                 else:
-                    h.isolation = "none"  # not a git repo: the child shares the parent's cwd
+                    h.isolation = "none"  # not a git repo, or one with no commit yet: the child shares the parent's cwd
+                    why = (
+                        "has no commits yet (commit once to get worktree isolation)"
+                        if await wt_mod.repo_root(cwd) is not None
+                        else "is not a git repository"
+                    )
                     h.isolation_note = (
-                        f"worktree isolation was requested, but {cwd} is not a git repository: the sub-agent worked "
+                        f"worktree isolation was requested, but {cwd} {why}: the sub-agent worked "
                         "directly in your checkout, so its edits are already there"
                     )
             h.cwd = str(cwd)

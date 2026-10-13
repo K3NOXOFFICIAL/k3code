@@ -109,6 +109,8 @@ class Subtask:
     worktree: wt_mod.Worktree | None = None
     #: agents of the budget already taken for this subtask's worker and first reviewer (see FanoutExecutor.run)
     prepaid: int = 0
+    #: the last reviewer died instead of answering: the work was never judged, so it is reviewed again, not reworked
+    review_died: bool = False
 
     def row(self) -> dict[str, Any]:
         return {
@@ -419,6 +421,12 @@ class FanoutExecutor:
                     self.progress(ctx, st, "failed", "the worker made no changes")
                     return
                 err = await self._review(ctx, st, h)
+                if err and st.review_died:  # a reviewer that died rejected nothing: the same result is reviewed again
+                    self.progress(ctx, st, "retrying", err)
+                    err = await self._review(ctx, st, h)
+                    if err and st.review_died:
+                        self.progress(ctx, st, "escalated", f"review failed after a retry: {err}")
+                        return
                 if err:  # sent back once, then escalated
                     st.attempts += 1
                     self.progress(ctx, st, "retrying", err)
@@ -453,7 +461,8 @@ class FanoutExecutor:
         )
         r = await self._spawn(ctx, st, "reviewer", prompt, f"review: {st.title}"[:60])
         st.review = r.result
-        if r.status != "completed":
+        st.review_died = r.status != "completed"
+        if st.review_died:
             # a reviewer that died has said nothing: never "pass". Out of tokens ends the subtask (its work stays on its
             # branch); any other failure leaves the result unreviewed and unmerged
             if ctx.budget is not None:

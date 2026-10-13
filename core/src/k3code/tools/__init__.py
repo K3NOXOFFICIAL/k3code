@@ -10,7 +10,7 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -151,6 +151,8 @@ def _read_range(path: Path, start: int, end: int) -> dict[str, Any]:
             raw = f.readline(MAX_READ_BYTES + 1)  # bounded: one endless line must not be loaded whole either
             if not raw:
                 break
+            if number >= start and b"\x00" in raw:  # the same check a small file gets, on the lines asked for
+                return {"error": _BINARY_FILE.format(path=path, size=path.stat().st_size)}
             if len(raw) > MAX_READ_BYTES and not raw.endswith(b"\n"):
                 if number >= start:
                     return too_big
@@ -243,10 +245,7 @@ async def tool_read(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
             }
         if first < 0:
             return {"error": "a negative offset (the end of the file) needs the file in memory: use bash `tail -n N`"}
-        with path.open("rb") as f:
-            if b"\x00" in f.read(8192):  # the same check a small file gets: a disk image is not text
-                return {"error": _BINARY_FILE.format(path=path, size=size)}
-        return _read_range(path, first, first + (count or READ_DEFAULT_LIMIT) - 1)
+        return _read_range(path, first, first + (count or READ_DEFAULT_LIMIT) - 1)  # refuses a window that holds a NUL
     raw = path.read_bytes()
     if b"\x00" in raw[:8192]:  # a binary file read as text is U+FFFD and NULs: tens of thousands of useless tokens
         return {"error": _BINARY_FILE.format(path=path, size=size)}
@@ -364,14 +363,17 @@ _LEFTOVER_TRAP = (
 
 
 _RO_FS = "Read-only file system"
+_ABS_PATH = re.compile(r"/[^\s:'\"`]+")
 _NO_NETWORK = re.compile(r"Could not resolve host|Temporary failure in name resolution|Network is unreachable", re.I)
 
 
-def _sandbox_hint(stderr: str, cmd: str, *, network: bool = False) -> str:
+def _sandbox_hint(stderr: str, cmd: str, *, network: bool = False, roots: Iterable[Path | str] = ()) -> str:
     """What the sandbox means by a failure, for the model: the raw message ("Read-only file system", "Could not resolve
     host") does not say that the rules, not the command, are the cause, and a model retries or works around them. Only
     asked for a failed command of a sandboxed run, so a successful call and an unsandboxed session are unchanged.
-    ``network``: the sandbox leaves the network on (an interactive session; only unattended runs cut it)."""
+    ``network``: the sandbox leaves the network on (an interactive session; only unattended runs cut it). ``roots``:
+    the folders it keeps (the project, added dirs): a file missing there is just missing, however the project is placed
+    (under the home or /tmp is the usual case)."""
     if _RO_FS in stderr:
         return (
             "sandbox: only the project folder is writable; .git is read-only (git add/commit/branch/config cannot work "
@@ -380,8 +382,11 @@ def _sandbox_hint(stderr: str, cmd: str, *, network: bool = False) -> str:
         )
     if _NO_NETWORK.search(stderr) and not network:
         return "sandbox: there is no network in this run; do not retry."
-    # the file that is missing is under /tmp or the home, not just a command that mentions one
-    if "No such file" in stderr and any(p in stderr for p in ("/tmp/", str(Path.home()) + "/")):
+    # the file that is missing is under /tmp or the home, and outside the folders the sandbox keeps: not just a command
+    # that mentions one, and not a project that happens to live there
+    missing = [p for line in stderr.splitlines() if "No such file" in line for p in _ABS_PATH.findall(line)]
+    kept = tuple(f"{root}/" for root in roots)
+    if any(p.startswith(("/tmp/", f"{Path.home()}/")) and not p.startswith(kept) for p in missing):
         return "sandbox: /tmp and ~ are private to each bash call and vanish; use a path inside the project."
     return ""
 
@@ -487,8 +492,10 @@ async def tool_bash(
                 f"timeout {asked:g} was cut to {BASH_MAX_TIMEOUT}: it is in seconds (use background: true for longer)"
             )
         network_on = "--unshare-net" not in (sandbox or ())
-        if sandbox and proc.returncode and (hint := _sandbox_hint(result["stderr"], cmd, network=network_on)):
-            notes.append(hint)
+        if sandbox and proc.returncode:
+            kept = [workdir, *(sandbox[i + 1] for i, arg in enumerate(sandbox) if arg in ("--bind", "--ro-bind"))]
+            if hint := _sandbox_hint(result["stderr"], cmd, network=network_on, roots=kept):
+                notes.append(hint)
         return {**result, "note": "; ".join(notes)} if notes else result
     except Exception as e:
         return {"error": f"Failed to execute: {e}"}
@@ -517,8 +524,9 @@ def _collapse_redraws(text: str) -> str:
             line = frames[-1] if frames else ""
         lines.append(line)
     out = "\n".join(lines)
-    if dropped and "\n" not in text.rstrip("\r"):
-        # no newline at all: a progress bar, or a file whose lines end in a bare CR (an old Mac export): say what went
+    if dropped and "\r" in text.rsplit("\n", 1)[-1]:
+        # the text ends in CR frames, not in a line end: a progress bar, or a file whose lines end in a bare CR (an old
+        # Mac export; any text before it, a header or a job's status line, does not make it one that ended its line)
         out += (
             f"\n[{dropped} earlier carriage-return frames dropped; a file with CR line ends reads with tr '\\r' '\\n']"
         )
@@ -659,25 +667,59 @@ _CLIP_HINT_DEFAULT = "narrow the request to see the rest"
 _READ_RESULT_CHARS = READ_MAX_CHARS + 1000
 
 
-def clip_head_tail(text: str, limit: int = _MAX_CHARS, hint: str = _CLIP_HINT_DEFAULT) -> str:
+def clip_head_tail(
+    text: str,
+    limit: int = _MAX_CHARS,
+    hint: str = _CLIP_HINT_DEFAULT,
+    *,
+    resume: Callable[[str, int], str] | None = None,
+) -> str:
     """``text`` cut to ``limit`` chars: the first 3/5 and the last 2/5 are kept, the middle becomes a marker that
-    states how many chars it dropped and (``hint``) how to see them. Text within the limit is returned unchanged."""
+    states how many chars it dropped and (``hint``) how to see them. Text within the limit is returned unchanged.
+    ``resume(text, i)``: a line to put before the tail, which starts at ``text[i]``: what the tail cannot say itself."""
     if len(text) <= limit:
         return text
     head = limit * 3 // 5
     tail = limit - head
     dropped = len(text) - head - tail
+    note = resume(text, len(text) - tail) if resume else ""
     return (
         f"{text[:head]}\n... [truncated {dropped} chars from the middle of {len(text)}; "
-        f"first {head} and last {tail} shown; {hint}] ...\n{text[-tail:]}"
+        f"first {head} and last {tail} shown; {hint}] ...\n{note}{text[-tail:]}"
     )
+
+
+_LINE_NUMBER = re.compile(r"\d+:")
+
+
+def _grep_resume(text: str, at: int) -> str:
+    """The file a clipped grep result's tail belongs to, as ``(continues in <path>)\\n``, or "" when the tail shows it.
+    A path stands once above its matches (:func:`_group_by_file`), so a tail that starts in the middle of a file read
+    as bare ``12:text`` lines of no file at all."""
+    end = text.find("\n", at)
+    end = len(text) if end < 0 else end
+    while end > 0:
+        start = text.rfind("\n", 0, end) + 1
+        line = text[start:end]
+        # a path is the line above a ``12:text`` line (a ``[note]`` can be one too, in a search of a single file)
+        if (
+            line
+            and not _LINE_NUMBER.match(line)
+            and _LINE_NUMBER.match(text, end + 1)
+            and not (line.startswith("[") and line.endswith("]"))
+        ):
+            return "" if start >= at else f"(continues in {line})\n"
+        end = start - 1
+    return ""
 
 
 def clip_for_model(name: str | None, text: str, limit: int = _MAX_CHARS) -> str:
     """What the model is sent of one tool result: ``read`` keeps its own budget, others are clipped to ``limit``."""
     if name in ("read", "skill"):  # a skill is loaded to be followed whole: its own cap (MAX_SKILL_CHARS) applies
         limit = max(limit, _READ_RESULT_CHARS)
-    return clip_head_tail(text, limit, _CLIP_HINTS.get(name or "", _CLIP_HINT_DEFAULT))
+    return clip_head_tail(
+        text, limit, _CLIP_HINTS.get(name or "", _CLIP_HINT_DEFAULT), resume=_grep_resume if name == "grep" else None
+    )
 
 
 def clip_tool_results(messages: Sequence[Message], limit: int = _MAX_CHARS) -> list[Message]:
@@ -742,10 +784,10 @@ def _shown(path: Path, base: Path) -> str:
 
 async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tuple[int, list[str], bytes, str]:
     """``cmd`` (an rg argv with ``--null``) run in ``cwd``: (exit code, output lines, stderr, cut). ``named``: rg
-    prints the file of each match (a directory search); each line then names it as :func:`_shown` relative to
-    ``base``, and a file ``sensitive_path`` names is dropped, whatever glob or ignore file let rg reach it. Reading
-    stops one line past MAX_SEARCH_RESULTS or at SEARCH_BUDGET_S, with rg killed; ``cut`` then says why the lines
-    are partial."""
+    prints the file of each match (a directory search); each line then starts with it as :func:`_shown` relative to
+    ``base`` and a NUL (a file name may hold a colon, which :func:`_group_by_file` must not cut at), and a file
+    ``sensitive_path`` names is dropped, whatever glob or ignore file let rg reach it. Reading stops one line past
+    MAX_SEARCH_RESULTS or at SEARCH_BUDGET_S, with rg killed; ``cut`` then says why the lines are partial."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -784,7 +826,7 @@ async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tupl
                 if (where := shown[name]) is None:
                     continue
                 text = rest.rstrip(b"\n").decode("utf-8", errors="replace")
-                lines.append(f"{where}:{text}")
+                lines.append(f"{where}\0{text}")
             if len(lines) > MAX_SEARCH_RESULTS:  # one past the cap proves the cut; stop rg instead of reading on
                 lines = lines[:MAX_SEARCH_RESULTS]
                 cut = f"truncated to the first {MAX_SEARCH_RESULTS} matching lines: {_NARROW}"
@@ -803,29 +845,26 @@ async def _run_rg(cmd: list[str], cwd: Path, base: Path, *, named: bool) -> tupl
     return (0 if cut else proc.returncode or 0), lines, stderr, cut
 
 
-_MATCH_LINE = re.compile(r"^(.+?):(\d+):(.*)$", re.DOTALL)  # a file name may hold a newline
-
-
 def _group_by_file(lines: list[str]) -> str:
-    """``path:line:text`` lines as rg's heading layout: the path once, then ``line:text`` under it, a blank line between
-    files. The path was repeated on every match (a third of a typical result), and a result cut at the size limit lost
-    matches the shorter form would have kept. A line that is not in that form (a single-file search prints no path)
-    stays as it is."""
+    """``path NUL line:text`` lines as rg's heading layout: the path once, then ``line:text`` under it, a blank line
+    between files. The path was repeated on every match (a third of a typical result), and a result cut at the size
+    limit lost matches the shorter form would have kept. A NUL ends the path, not a colon: a file name may hold
+    ``:30:`` (a time stamp) or a newline, and cut at the first colon it became a path that does not exist. A line
+    without one (a single-file search prints no path) stays as it is."""
     out: list[str] = []
     current: str | None = None
     for line in lines:
-        m = _MATCH_LINE.match(line)
-        if m is None:
+        path, nul, rest = line.partition("\0")
+        if not nul:
             out.append(line)
             current = None
             continue
-        path, number, text = m.groups()
         if path != current:
             if current is not None:
                 out.append("")
             out.append(path)
             current = path
-        out.append(f"{number}:{text}")
+        out.append(rest)
     return "\n".join(out)
 
 
@@ -836,12 +875,17 @@ def _glob_list(value: Any) -> Any:
     return value
 
 
+_BRE_ALTERNATION = re.compile(r"[^\s|\\]\\\|[^\s|\\]")
+_FILE_GLOB = re.compile(r"[*?\[]|\.\w+$")  # a wildcard or an extension; an include with neither is a word or a folder
+
+
 def _no_match_hints(pattern: str, include: Any) -> str:
     """Why a search that found nothing may have been asked wrongly (the common slips), or ""."""
     hints = []
-    if "\\|" in pattern:
+    if _BRE_ALTERNATION.search(pattern):  # `\|\|` is a literal pair of pipes on purpose: only `a\|b` is the slip
         hints.append("\\| is a literal pipe in this regex flavor: write | for alternation")
-    if include:
+    includes = include if isinstance(include, list) else [include] if include else []
+    if any(not _FILE_GLOB.search(inc) for inc in includes):
         hints.append("include is a file-name glob (one entry per glob in a list), not a folder or a language")
     return "; ".join(hints)
 
@@ -959,6 +1003,14 @@ SKIP_DIRS = frozenset(
         ".pytest_cache",
         ".ruff_cache",
         ".tox",
+        ".nox",
+        ".gradle",
+        ".terraform",
+        ".next",
+        ".nuxt",
+        ".svelte-kit",
+        ".turbo",
+        ".parcel-cache",
     }
 )
 #: Outside a work tree nothing filters build output either (ripgrep-like defaults); inside one a tracked ``build/``
@@ -1171,7 +1223,7 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any, base: P
             continue
         shown = _shown(fp, base)
         matches.extend(
-            f"{shown}:{i}:{line[:GREP_MAX_COLUMNS]}" for i, line in enumerate(text.splitlines(), 1) if rx.search(line)
+            f"{shown}\0{i}:{line[:GREP_MAX_COLUMNS]}" for i, line in enumerate(text.splitlines(), 1) if rx.search(line)
         )
         if len(matches) > MAX_SEARCH_RESULTS:
             break

@@ -244,3 +244,118 @@ def test_suggest_rules_skips_a_blank_command_word(tmp_path):
     d = decide(mode="default", tool="bash", args={"command": '" " ls'}, cwd=tmp_path)
     assert d.action == "ask"
     assert suggest_rules("bash", d) == []
+
+
+def _fed(command: str) -> str | None:
+    return hardline.check(command, cwd="/work/proj", home="/home/user")
+
+
+@pytest.mark.parametrize(
+    ("command", "rule"),
+    [
+        ("echo / | xargs -I{} rm -rf {}", "rm-rf-root"),
+        ("echo ~ | xargs -I % rm -rf %", "rm-rf-home"),
+        ("echo / | xargs -i rm -rf {}", "rm-rf-root"),
+        ("echo / | xargs --replace rm -rf {}", "rm-rf-root"),
+        ("echo / | xargs --replace=@ rm -rf @", "rm-rf-root"),
+        ("echo / | sudo xargs -n 1 -0I{} rm -rf {}", "rm-rf-root"),
+        ("find ~ | xargs -I{} rm -rf {}", "rm-rf-home"),
+        ("find / -maxdepth 1 | xargs -I{} rm -rf {}", "rm-rf-root"),
+        ("find ~ -mindepth 1 -maxdepth 1 -print0 | xargs -0 -I{} rm -rf {}", "rm-rf-home"),
+        ("printf '%s\\n' ~ | xargs -I{} rm -rf {}", "rm-rf-home"),
+        ("echo /tmp/a / | xargs -I{} rm -rf {}", "rm-rf-root"),  # one of several items
+        ("echo / | xargs rm -rf", "rm-rf-root"),  # without a replace string, as before
+    ],
+)
+def test_xargs_with_a_replace_string_feeds_rm_like_xargs_without_one(command: str, rule: str) -> None:
+    assert _fed(command) == rule
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo /tmp/x | xargs -I{} rm -rf {}",
+        "echo build | xargs -I{} rm -rf {}",
+        "echo ~/project | xargs -I{} rm -rf {}/obj",
+        "find ~/proj -name build | xargs -I{} rm -rf {}",
+        "echo ~ | xargs -I{} ls {}",
+        "echo / | xargs -n 1 echo",
+    ],
+)
+def test_xargs_with_a_replace_string_on_ordinary_paths_is_not_hardline(command: str) -> None:
+    assert _fed(command) is None, command
+
+
+def test_the_replace_string_is_read_from_xargs_options_only() -> None:
+    replace = hardline._xargs_replace
+    assert replace(["xargs", "-I", "%", "rm", "-rf", "%"]) == "%"
+    assert replace(["xargs", "-I{}", "rm", "{}"]) == "{}"
+    assert replace(["xargs", "-i", "rm", "{}"]) == "{}" and replace(["xargs", "-iXX", "rm", "XX"]) == "XX"
+    assert replace(["xargs", "--replace", "rm"]) == "{}" and replace(["xargs", "--replace=@", "rm"]) == "@"
+    assert replace(["sudo", "-n", "xargs", "-n", "1", "-0I", "@", "rm", "@"]) == "@", "-n takes a value"
+    assert replace(["xargs", "-n1", "rm", "-i", "-rf"]) == "", "-i after the command belongs to rm"
+    assert replace(["xargs", "rm", "-rf"]) == "" and replace(["rm", "-rf", "-i"]) == ""
+
+
+@pytest.mark.parametrize(
+    ("command", "rule"),
+    [
+        ("find ~ ! -name keep -delete", "rm-rf-home"),
+        ("find ~ -mindepth 1 ! -name keep -delete", "rm-rf-home"),
+        ("find ~ -not -user root -delete", "rm-rf-home"),
+        ("find ~ -name '*.pyc' -o -delete", "rm-rf-home"),
+        ("find ~ -delete -name '*.pyc'", "rm-rf-home"),
+        ("find ~ \\( -name a -o ! -name b \\) -delete", "rm-rf-home"),
+        ("find ~ -path ~/keep -prune -o -type f -delete", "rm-rf-home"),
+        ("find ~ ! -name keep | xargs rm -rf", "rm-rf-home"),
+        ("find ~ -not -name keep | xargs -I{} rm -rf {}", "rm-rf-home"),
+        ("find / ! -name keep -delete", "find-delete-root"),
+        ("find /home -delete", "rm-rf-home"),
+        ("find /etc -delete", "rm-rf-root"),
+        ("find /usr -type f -delete", "rm-rf-root"),
+        ("find /var -mindepth 1 ! -name keep -delete", "rm-rf-root"),
+    ],
+)
+def test_a_find_selector_that_is_negated_or_not_applied_picks_nothing(command: str, rule: str) -> None:
+    assert _fed(command) == rule
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find ~ -name '*.pyc' -delete",
+        "find ~ \\( -name '*.pyc' -o -name '*.pyo' \\) -delete",
+        "find ~ -type f -name '*.tmp' ! -name keep.tmp -delete",
+        "find ~ -name a -o -name b -delete",
+        "find ~ -path ~/keep -prune -o -name '*.tmp' -delete",
+        "find ~ -name '*.pyc' | xargs rm -rf",
+        "find ~ -name x -o -name y | xargs rm -rf",
+        "find /etc -name '*.bak' -delete",
+        "find /usr/local/share -type f -delete",
+        "find ~/proj ! -name keep -delete",
+        "find ~ ! -name keep -print",
+    ],
+)
+def test_a_find_clean_up_that_picks_files_is_not_hardline(command: str) -> None:
+    assert _fed(command) is None, command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find ~ -xtype l -delete",
+        "find ~ -type f -links +1 -delete",
+        "find ~ -type f -anewer x -delete",
+        "find ~ -type f -cnewer x -delete",
+        "find ~ -type f -newerBm x -delete",
+        "find ~ -type f -newerac x -delete",
+        "find ~ -type f -newermt 2020-01-01 -delete",
+        "find ~ -type f -fstype tmpfs -delete",
+        "find ~ -type f -readable -delete",
+        "find ~ -type f -writable -delete",
+        "find ~ -type f -executable -delete",
+        "find ~ -xtype l | xargs rm -r",
+    ],
+)
+def test_find_tests_that_select_by_link_time_filesystem_or_access_are_selectors(command: str) -> None:
+    assert _fed(command) is None, command

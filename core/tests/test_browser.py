@@ -274,6 +274,23 @@ async def test_the_agent_browse_tool_reports_stops_and_missing_playwright(monkey
     assert "web_browse" not in reg.handlers and "web_fetch" in reg.handlers
 
 
+async def test_the_agent_browse_tool_leaves_room_for_its_header():
+    """A long URL above the page put the result over what the model is sent: the loop cut its middle."""
+    from k3code.providers.types import Message
+    from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_tool_results
+
+    url = "https://ok.test/a?utm=" + "x" * 680
+    words = " ".join(f"w{i:05d}" for i in range(6_000))
+    page = f"<html><head><title>Real Title</title></head><body><main><p>{words}</p></main></body></html>"
+    browser, _log = fake_browser({url: (200, page)})
+    reg = _Registry()
+    register_web_tools(reg, SimpleNamespace(research={}), fetcher=fetcher(), browser=browser)
+    content = (await reg.handlers["web_browse"]({"url": url}))["content"]
+    assert "continue with start_index=" in content
+    sent = clip_tool_results([Message(role="tool", name="web_browse", content=content, tool_call_id="1")])
+    assert sent[0].content == content and len(content) <= MAX_TOOL_RESULT_CHARS
+
+
 @respx.mock
 async def test_fetch_still_works_without_playwright_and_says_so_for_a_blocked_page(monkeypatch):
     def missing():

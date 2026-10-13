@@ -501,7 +501,7 @@ class Ultra:
 
         results = await gather_or_cancel(*(lens_review(k, v) for k, v in LENSES.items()))
         candidates = dedupe_findings([f for r in results for f in r])
-        report.panel_ran = True
+        report.panel_ran = len(missing) < len(LENSES)  # every lens dead: the change was not reviewed
         report.candidates = candidates
         if not candidates:
             report.notes.append(
@@ -577,10 +577,11 @@ def _wanted_path(path: str) -> str:
 
 
 def _names_same_file(wanted: str, header_path: str) -> bool:
-    """Whether a finding's ``wanted`` path and a diff header's path are one file: one is the tail of the other at a
-    directory boundary (``a.py`` for ``src/a.py``, or an absolute path for a repository-relative one)."""
+    """Whether a finding's ``wanted`` path and a diff header's path are one file: a relative ``wanted`` is the tail of
+    the header's path at a directory boundary (``a.py`` for ``src/a.py``, never ``tests/conftest.py`` for
+    ``conftest.py``); an absolute one ends in the repository-relative header's path (the root is not known here)."""
     a, b = "/" + wanted.lstrip("/"), "/" + header_path.lstrip("/")
-    return a.endswith(b) or b.endswith(a)
+    return b.endswith(a) or (wanted.startswith("/") and a.endswith(b))
 
 
 def diff_for_files(diff: str, files: set[str]) -> str:

@@ -780,3 +780,35 @@ async def test_a_long_page_is_read_in_pieces_with_start_index():
         assert seen_end
         _, past = await tools.fetch_page("https://example.com/long", client=client, start=10_000_000)
         assert "past the end of the page" in past
+
+
+async def test_web_fetch_leaves_room_for_its_header_and_a_lowered_tool_output_limit():
+    """The page was cut at 9,500 chars whatever sat above it: a long URL or a small context.tool_output_chars made the
+    loop cut the middle of the result again, and the 'continue with start_index' marker skipped what was lost."""
+    from k3code.providers.types import Message
+    from k3code.research.fetch import WebFetcher
+    from k3code.research.tools import register_web_tools
+    from k3code.tools import MAX_TOOL_RESULT_CHARS, clip_tool_results
+
+    words = " ".join(f"w{i:05d}" for i in range(6_000))
+    page = f"<html><body><main><p>{words}</p></main></body></html>"
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/html"}, content=page.encode())
+
+    cases = [  # (url, context.tool_output_chars or None for the default)
+        ("https://example.com/a", None),
+        ("https://example.com/a?utm=" + "x" * 680, None),
+        ("https://example.com/a", 6_000),
+    ]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        for url, configured in cases:
+            reg = _Registry()
+            config = SimpleNamespace(research={}, context={"tool_output_chars": configured} if configured else {})
+            register_web_tools(reg, config, fetcher=WebFetcher(client=client, respect_robots=False))
+            content = (await reg.handlers["web_fetch"]({"url": url}))["content"]
+            limit = configured or MAX_TOOL_RESULT_CHARS
+            sent = clip_tool_results([Message(role="tool", name="web_fetch", content=content, tool_call_id="1")], limit)
+            assert sent[0].content == content, (url[:30], configured)  # the loop cut nothing: the marker is true
+            marker = re.search(r"characters 0-(\d+) of \d+ are shown; continue with start_index=(\d+)\]", content)
+            assert marker and marker.group(1) == marker.group(2)

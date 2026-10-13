@@ -22,13 +22,17 @@ from k3code.permissions.state import PermissionState
 from k3code.providers.types import Message
 from k3code.routing.tiers import TaskKind, Tier
 from k3code.session_ai import split_for_compaction
+from k3code.tools import jobs
 
 logger = logging.getLogger(__name__)
 
 PLAN_SECTIONS = ("Goal", "Steps", "Files", "Risks", "Verification", "Estimate")
 
-#: What plan mode denies outright (and the job tools that only address what bash started): the planner is not sent them.
-PLAN_DENIED_TOOLS = ("write", "edit", "bash", "bash_output", "bash_kill")
+#: What plan mode denies outright: the planner is not sent them.
+PLAN_DENIED_TOOLS = ("write", "edit", "bash")
+#: Plan mode allows these (they only address the session's background jobs): the planner is sent them only when the
+#: session has a job, so a job started in an earlier turn can still be read while planning.
+PLAN_JOB_TOOLS = ("bash_output", "bash_kill")
 PLAN_ADDENDUM = (
     "\n\nYou are in PLANNING mode: read-only. Explore the repo as needed, then call exit_plan ONCE with a "
     "plan in markdown with exactly these sections: "
@@ -281,7 +285,8 @@ class PlanFirst:
             tool_output_chars=tool_output_limit(server.config),
             context_window=server._router_window(router, session),
         )
-        for name in PLAN_DENIED_TOOLS:  # plan mode refuses them: their schemas would be paid for on every planning call
+        withheld = PLAN_DENIED_TOOLS if jobs.list_jobs(sid) else (*PLAN_DENIED_TOOLS, *PLAN_JOB_TOOLS)
+        for name in withheld:  # their schemas would be paid for on every planning call
             loop.tools._tools.pop(name, None)  # noqa: SLF001
         loop.hooks = userhooks.load(session.perms.cwd, sid)  # the planner's read tools see the user's hooks too
         loop.max_turns_stop_message = False  # its last text is taken as the plan: a stop notice is not one

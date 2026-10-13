@@ -507,6 +507,13 @@ def _reindent_replacement(file_region: str, old_string: str, new_string: str) ->
     # the first lines may agree (a `def` or a `build:` at column 0) while the lines under them do not
     if old_indent == file_indent and all(used == has for used, has in ws_map.items()):
         return new_string
+    # the model's own slip is in old_string only: when no line of new_string uses a whitespace the model got wrong
+    # (used != has), new_string already follows the file and is left alone
+    wrong = {used for used, has in ws_map.items() if used != has}
+    if wrong and old_indent == file_indent:
+        new_ws = {_leading_whitespace(line) for line in new_string.split("\n") if line.strip()}
+        if not wrong & new_ws:
+            return new_string
     widths = sorted({len(w) for w in ws_map if " " in w and "\t" not in w})
     unit = min((b - a for a, b in zip(widths, widths[1:])), default=4)
 

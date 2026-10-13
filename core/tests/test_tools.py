@@ -104,6 +104,20 @@ async def test_a_large_binary_file_is_not_streamed_as_text_either(temp_dir, monk
     assert "binary file" in result["error"]
 
 
+async def test_a_large_file_that_starts_with_nul_padding_is_still_read_by_range(temp_dir, monkeypatch):
+    import k3code.tools as tools
+
+    monkeypatch.setattr(tools, "MAX_READ_BYTES", 100)
+    f = temp_dir / "app.log"  # a log that was truncated in place keeps NULs at its start
+    f.write_bytes(b"\x00" * 200 + b"\n" + "".join(f"line{i}\n" for i in range(2, 30)).encode())
+    result = await tool_read({"path": str(f), "start": 2, "end": 4}, cwd=temp_dir)
+    assert result["content"] == "line2\nline3\nline4"
+    result = await tool_read({"path": str(f), "offset": 10, "limit": 2}, cwd=temp_dir)
+    assert result["content"] == "line10\nline11"
+    # a window that does hold the NULs is not text
+    assert "binary file" in (await tool_read({"path": str(f), "start": 1, "end": 3}, cwd=temp_dir))["error"]
+
+
 async def test_write_file(temp_dir):
     f = temp_dir / "new.txt"
     result = await tool_write({"path": str(f), "content": "hello"}, cwd=temp_dir)

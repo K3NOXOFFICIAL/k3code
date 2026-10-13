@@ -93,16 +93,23 @@ LEGACY_ARGUMENTS: dict[str, frozenset[str]] = {"read": frozenset({"start", "end"
 
 def normalize_arguments(tool: str, args: dict[str, Any], schema: dict[str, Any] | None) -> dict[str, Any]:
     """``args`` as the handler should get them: null options dropped, aliased names renamed (unless the model sent the
-    real name too, then the alias stays and is reported as ignored)."""
+    real name too, then the alias stays and is reported as ignored). An aliased name sent as null is an unused option
+    like any other: it is dropped here, not renamed into a null that the real name's type rejects."""
     args = drop_null_options(args, schema)
     aliases = ARGUMENT_ALIASES.get(tool)
     if not aliases or not isinstance(args, dict) or not any(k in aliases for k in args):
         return args
-    return {(aliases[k] if k in aliases and aliases[k] not in args else k): v for k, v in args.items()}
+    return {
+        (aliases[k] if k in aliases and aliases[k] not in args else k): v
+        for k, v in args.items()
+        if v is not None or k not in aliases
+    }
 
 
-def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
-    """What is wrong with ``args`` for ``schema`` (empty = nothing found)."""
+def check_arguments(schema: dict[str, Any] | None, args: Any, *, local_paths: bool = True) -> list[str]:
+    """What is wrong with ``args`` for ``schema`` (empty = nothing found). ``local_paths``: a path argument names a file
+    of this machine; an MCP tool's may name one on the server (``~deploy/app.log``), so only what no path can hold is
+    refused for it."""
     if not isinstance(schema, dict) or schema.get("type", "object") != "object":
         return []
     if (raw := unparsed_marker(args)) is not None:
@@ -139,7 +146,7 @@ def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
                 for i, item in enumerate(value)
                 if not _is(item, item_type)
             ]
-        if name in PATH_ARGUMENTS and isinstance(value, str) and (bad := _unusable_path(value)):
+        if name in PATH_ARGUMENTS and isinstance(value, str) and (bad := _unusable_path(value, local_paths)):
             problems.append(f"'{name}' {bad}")
     return problems
 
@@ -149,15 +156,16 @@ def check_arguments(schema: dict[str, Any] | None, args: Any) -> list[str]:
 PATH_ARGUMENTS = frozenset({"path", "cwd", "file_path", "notebook_path"})
 
 
-def _unusable_path(value: str) -> str:
-    """Why ``value`` can never be a path ("" when it can)."""
+def _unusable_path(value: str, local: bool = True) -> str:
+    """Why ``value`` can never be a path ("" when it can); ``local``: a path of this machine, where ``~name`` must be a
+    user (Path.expanduser raises for one that is not)."""
     if "\x00" in value:
         return "contains a NUL byte"
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
         return "contains an unpaired surrogate character"
-    if value.startswith("~") and not value.startswith(("~/", "~\\")) and value != "~":
+    if local and value.startswith("~") and not value.startswith(("~/", "~\\")) and value != "~":
         try:
             Path(value).expanduser()
         except RuntimeError:
@@ -167,7 +175,7 @@ def _unusable_path(value: str) -> str:
 
 def invalid_arguments(tool: str, schema: dict[str, Any] | None, args: Any) -> str | None:
     """The error the model gets for a call its tool's schema rejects, or None when the call passes."""
-    problems = check_arguments(schema, args)
+    problems = check_arguments(schema, args, local_paths=not tool.startswith("mcp__"))
     if not problems:
         return None
     return f"invalid arguments for {tool}: {'; '.join(problems)} (expected: {compact_schema(schema or {})})"

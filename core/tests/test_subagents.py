@@ -222,6 +222,25 @@ async def test_worktree_outside_git_repo_shares_cwd(tmp_path, monkeypatch):
     assert "[isolation] worktree isolation was requested" in result and "is not a git repository" in result
 
 
+async def test_worktree_in_a_repo_without_commits_says_so_and_shares_cwd(tmp_path, monkeypatch):
+    """A fresh ``git init`` is a repository: the note named the wrong cause ("is not a git repository")."""
+    repo = tmp_path / "fresh"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    steps = [
+        task_call("CHILD-N hi", isolation="worktree"),
+        final("ok"),
+        {"type": "text", "match": "CHILD-N", "text": "no commits"},
+    ]
+    server = make(tmp_path, monkeypatch, steps, **NO_GATE)
+    await start(server, repo)
+    await run_turn(server, "PARENT")
+    result = last_tool_result(server)
+    assert result.startswith("no commits")
+    assert "[isolation] worktree isolation was requested" in result and "has no commits yet" in result
+    assert "is not a git repository" not in result
+
+
 @pytest.mark.skipif(not (shutil.which("bwrap") and sandbox.usable()), reason="bwrap unavailable here")
 async def test_child_of_a_foreground_default_mode_parent_runs_bash_sandboxed(tmp_path, monkeypatch):
     from k3code.subagents import runner

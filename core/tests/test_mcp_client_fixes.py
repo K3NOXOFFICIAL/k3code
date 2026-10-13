@@ -154,3 +154,48 @@ def test_mcp_search_reads_the_notations_the_system_prompt_prints():
     assert names("mcp__Neon__run_sql mcp__Neon__list_projects") == both
     assert names("run_sql") == {"mcp__Neon__run_sql"}
     assert names("zzzz qqqq") == set()
+
+
+def test_mcp_search_by_name_activates_those_tools_and_no_others():
+    """``select:search`` activated eight tools and ``get_issue`` brought in ``get_issue_comments``: every activated
+    schema is sent with each later request, and the tool list change rewrites the prompt cache."""
+    from k3code.mcpclient import McpToolInfo
+
+    tools = [
+        McpToolInfo("gh", "get_issue", "Get an issue", {}),
+        McpToolInfo("gh", "get_issue_comments", "Get the comments of an issue", {}),
+        McpToolInfo("gh", "get_issue_labels", "Get the labels of an issue", {}),
+        McpToolInfo("gh", "search_code", "Search code", {}),
+        McpToolInfo("fs", "search", "Search files by name", {}),
+        McpToolInfo("web", "search", "Search the web", {}),
+        McpToolInfo("fs", "read_file", "Read a file", {}),
+        McpToolInfo("fs", "write_file", "Write a file", {}),
+    ]
+    manager = McpManager({})
+    manager.tools = lambda: tools  # type: ignore[method-assign]
+
+    def names(query: str) -> set[str]:
+        return {t.qualified for t in manager.search(query)}
+
+    assert names("select:search") == {"mcp__fs__search", "mcp__web__search"}  # not search_code, not a description hit
+    assert names("select:read_file,write_file") == {"mcp__fs__read_file", "mcp__fs__write_file"}
+    assert names("select:read,write") == set()  # names only: no tool is called just `read`
+    for query in ("select:mcp__gh__get_issue", "mcp__gh__{get_issue}", "mcp__gh__get_issue"):
+        assert names(query) == {"mcp__gh__get_issue"}, query
+    # keywords still search the descriptions, and a qualified name next to them keeps its own exactness
+    assert names("comments") == {"mcp__gh__get_issue_comments"}
+    assert names("mcp__gh__get_issue labels") == {"mcp__gh__get_issue", "mcp__gh__get_issue_labels"}
+
+
+def test_mcp_search_notation_expands_in_linear_time():
+    """The lazy ``\\S*?`` prefix was rescanned from every position: 20,000 characters without a space took seconds."""
+    import time
+
+    from k3code.mcpclient import _expand_names
+
+    assert _expand_names("mcp__Neon__{run_sql, list_projects}") == "mcp__neon__run_sql, mcp__neon__list_projects"
+    assert _expand_names("select:a{b,c}d {e}") == "ab, acd e"
+    for text in ("a" * 40_000, "a" * 40_000 + "{", "{a" * 20_000):
+        start = time.monotonic()
+        _expand_names(text)
+        assert time.monotonic() - start < 1.0, text[:3]  # about 9 s before, a few ms after

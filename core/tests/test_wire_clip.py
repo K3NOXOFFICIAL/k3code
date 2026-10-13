@@ -77,6 +77,37 @@ def test_clip_keeps_the_head_and_the_tail_and_states_how_many_chars_were_dropped
     assert len(clipped) - (head + tail) < 200  # the marker is the only addition
 
 
+def grouped_grep(files: int = 3, hits: int = 150) -> str:
+    """A grep result as the tool prints it: each path once, its matches as ``line:text`` under it."""
+    groups = []
+    for f in range(files):
+        matches = [f"{n}:def handler_{f}_{n}(): return {n}  # handler" for n in range(1, hits + 1)]
+        groups.append("\n".join([f"src/mod_{f}.py", *matches]))
+    return "\n\n".join(groups)
+
+
+def test_a_clipped_grep_result_names_the_file_its_tail_belongs_to():
+    text = grouped_grep()
+    clipped = clip_for_model("grep", text, 5000)
+    tail = clipped.split("] ...\n", 1)[1]
+    assert tail.startswith("(continues in src/mod_2.py)\n")
+    assert tail.endswith(text[-2000:])  # the kept tail is the same as before
+    assert clipped.startswith(text[:3000])
+
+
+def test_a_clipped_grep_tail_that_starts_at_a_path_is_left_alone_and_other_text_gets_no_path():
+    tail = "b/file.py\n1:xxxx\n2:"
+    tail += "y" * (40 - len(tail))
+    text = "a.py\n" + "1:z\n" * 200 + "\n" + tail
+    assert clip_for_model("grep", text, 100).endswith("] ...\n" + tail)
+    # no path above the tail: a search of one file, and text that is no grep result at all
+    single = "[searched in multiline mode]\n" + "\n".join(f"{n}:foo" for n in range(1, 400))
+    assert "continues in" not in clip_for_model("grep", single, 1000)
+    assert "continues in" not in clip_for_model("grep", "x" * 5000, 1000)
+    # only grep results are given a path
+    assert "continues in" not in clip_for_model("bash", grouped_grep(), 5000)
+
+
 def test_text_within_the_limit_is_returned_unchanged():
     assert clip_head_tail("x" * 10_000) == "x" * 10_000
     short = [Message(role="tool", content="y" * 10_000, tool_call_id="c1", name="read")]

@@ -484,3 +484,73 @@ async def test_a_reviewer_that_died_never_counts_as_a_pass():
     assert await ex._review(ctx, st, worker_done) == ""
     await spawn_returning(handle("completed", result="broken. VERDICT: fail"))
     assert "VERDICT: fail" in await ex._review(ctx, st, worker_done)
+
+
+async def test_a_reviewer_that_died_has_the_same_result_reviewed_again_not_reworked():
+    """A dead reviewer rejected nothing. The worker used to be sent back anyway ("A reviewer rejected your result:
+    the reviewer did not finish ..."), which cost a second worker and a second reviewer for work nobody had judged."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from k3code.autonomy.fanout import FanoutExecutor, Subtask
+    from k3code.subagents.runner import Handle
+
+    def handle(agent_type: str, status: str = "completed", error: str = "", result: str = "") -> Handle:
+        h = Handle(id="h", description="d", agent_type=agent_type, tier="main", depth=1, parent_sid="s")
+        h.status, h.error, h.result = status, error, result
+        h.diff = h.diff_stat = ""
+        h.worktree, h.merge = object(), "merged"  # type: ignore[assignment]
+        return h
+
+    def dead() -> Handle:
+        return handle("reviewer", "failed", "provider exploded")
+
+    def verdict_of(v: str) -> Handle:
+        return handle("reviewer", result=f"looked at it. VERDICT: {v}")
+
+    async def play(*reviews: Handle) -> tuple[list[str], list[str], list[str], Subtask]:
+        """Run one subtask whose reviewers answer in turn: (the states it went through, the reworks, the merges)."""
+        states: list[str] = []
+        reworks: list[str] = []
+        merges: list[str] = []
+        queue = list(reviews)
+        done = handle("worker", result="done")
+
+        async def spawn(ctx, st, agent_type, *args, **kwargs):
+            return done if agent_type == "worker" else queue.pop(0)
+
+        async def rework(ctx, st, problem):
+            reworks.append(problem)
+            return done
+
+        async def merge(ctx, st):
+            merges.append(st.id)
+
+        ex = FanoutExecutor.__new__(FanoutExecutor)
+        ex._spawn, ex._rework, ex._merge = spawn, rework, merge  # type: ignore[method-assign]
+        ex.progress = lambda ctx, st, state, detail="": states.append(state)  # type: ignore[method-assign]
+        ex.worker_prompt = lambda ctx, st: "work"  # type: ignore[method-assign]
+        ctx = SimpleNamespace(
+            sem=asyncio.Semaphore(1), budget=None, plan="", result=SimpleNamespace(stopped="", stopped_kind="")
+        )
+        st = Subtask(id="t1", title="add files")
+        await ex._one(ctx, st)
+        return states, reworks, merges, st
+
+    # the reviewer dies, the next one passes it: merged, and the worker was never sent back
+    states, reworks, merges, st = await play(dead(), verdict_of("pass"))
+    assert reworks == [] and merges == ["t1"] and st.attempts == 0
+    assert states == ["running", "reviewing", "retrying", "reviewing"]
+
+    # both die: the result stays unreviewed and unmerged, with no rework either
+    states, reworks, merges, _ = await play(dead(), dead())
+    assert reworks == [] and merges == [] and states[-1] == "escalated"
+
+    # the second reviewer really rejects it: that is a rejection, and the worker is sent back once, as for any other
+    states, reworks, merges, st = await play(dead(), verdict_of("fail"), verdict_of("pass"))
+    assert len(reworks) == 1 and "VERDICT: fail" in reworks[0] and "did not finish" not in reworks[0]
+    assert merges == ["t1"] and st.attempts == 1
+
+    # and a plain rejection is reworked as before
+    _, reworks, merges, _ = await play(verdict_of("fail"), verdict_of("pass"))
+    assert len(reworks) == 1 and merges == ["t1"]

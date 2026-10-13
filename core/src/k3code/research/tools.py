@@ -31,6 +31,7 @@ from k3code.research.browser import (
     stop_report,
 )
 from k3code.research.fetch import UA, FetchRefused, FetchStatus, WebFetcher
+from k3code.tools import MAX_TOOL_RESULT_CHARS
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ DEFAULT_SEARXNG = ""  # no default instance: web_search stays off until research
 #: The most of a page web_fetch returns. Under the 10,000 characters the model is sent of any tool result (see
 #: k3code.tools.clip_for_model): above them the middle of the page was cut a second time, silently.
 MAX_FETCH_CHARS = 9_500
+#: The most of a page's title the ``# title`` line above a fetched page shows (a title can be a whole URL).
+_TITLE_ROOM = 200
 
 
 @dataclass
@@ -129,26 +132,29 @@ async def fetch_page(
     fetcher: WebFetcher | None = None,
     browser: BrowserManager | None = None,
     start: int = 0,
+    limit: int = MAX_FETCH_CHARS,
 ) -> tuple[str, str]:
     """(title, text) of a web page through the shared fetch layer (cache, per-host rate, robots.txt, deadline).
     A 403 or a challenge page is read in the browser when one is given. ``start`` is the character the text is shown
-    from (a long page is read in pieces). Raises ``Stopped`` at a CAPTCHA, a login wall or a paywall; ``FetchStatus``
-    for other non-2xx answers; ``FetchRefused`` for robots.txt; httpx errors."""
+    from (a long page is read in pieces) and cut to ``limit`` chars. Raises ``Stopped`` at a CAPTCHA, a login wall or a
+    paywall; ``FetchStatus`` for other non-2xx answers; ``FetchRefused`` for robots.txt; httpx errors."""
     if fetcher is not None:
-        return await _read_page(fetcher, url, browser, start)
+        return await _read_page(fetcher, url, browser, start, limit)
     own = WebFetcher(client=client, deadline=timeout)  # no shared fetcher: a short-lived one for this call
     try:
-        return await _read_page(own, url, browser, start)
+        return await _read_page(own, url, browser, start, limit)
     finally:
         await own.aclose()
 
 
-async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | None, start: int = 0) -> tuple[str, str]:
+async def _read_page(
+    fetcher: WebFetcher, url: str, browser: BrowserManager | None, start: int = 0, limit: int = MAX_FETCH_CHARS
+) -> tuple[str, str]:
     got = await fetcher.get(url)
     verdict = classify(got.status, got.body)
     if verdict is Verdict.BLOCKED and browser is not None:
         try:
-            return await _read_rendered(browser, url, fetcher, start)
+            return await _read_rendered(browser, url, fetcher, start, limit)
         except BrowserUnavailable as e:  # the error said only "install Playwright": say what was refused as well
             raise BrowserUnavailable(f"HTTP {got.status} for {url} (a blocked page): {e}") from None
     if verdict in STOP_VERDICTS:
@@ -162,7 +168,7 @@ async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | No
     else:
         title, text = url, got.body
     note = "\n[page cut: the fetch deadline or the size cap was reached]" if got.truncated else ""
-    return title or url, _cap_page(text, note, start)
+    return title or url, _cap_page(text, note, start, limit)
 
 
 def _is_text(content_type: str) -> bool:
@@ -172,8 +178,15 @@ def _is_text(content_type: str) -> bool:
     return not main or main.startswith("text/") or main.endswith(("json", "xml", "javascript", "x-www-form-urlencoded"))
 
 
-def _cap_page(text: str, note: str = "", start: int = 0) -> str:
-    """``text`` + ``note`` within MAX_FETCH_CHARS, from character ``start``: a longer page keeps its start and says how
+def _page_room(budget: int, header: int) -> int:
+    """The chars of page text that fit ``budget`` (what the model is sent of one tool result) under a ``header`` of
+    that many chars, at most MAX_FETCH_CHARS. Over that the loop clips the middle of the result, which no marker in
+    the page can name; the floor keeps a huge URL from leaving no room."""
+    return max(min(MAX_FETCH_CHARS, budget - header), budget // 2)
+
+
+def _cap_page(text: str, note: str = "", start: int = 0, limit: int = MAX_FETCH_CHARS) -> str:
+    """``text`` + ``note`` within ``limit`` chars, from character ``start``: a longer page keeps its start and says how
     much of it that is and where to go on (the note used to be appended before the cut and fell off the end of a long
     page, which then looked complete; with no way to ask for the rest, the retry returned the same piece)."""
     total = len(text)
@@ -181,14 +194,16 @@ def _cap_page(text: str, note: str = "", start: int = 0) -> str:
         if start >= total:
             return f"[start_index {start} is past the end of the page: it has {total} characters]{note}"
         text = text[start:]
-    if len(text) + len(note) <= MAX_FETCH_CHARS:
+    if len(text) + len(note) <= limit:
         return text + note
     marker = f"\n[page cut: characters {start}-{{}} of {total} are shown; continue with start_index={{}}]"
-    keep = MAX_FETCH_CHARS - len(note) - len(marker) - 2 * len(str(total))
+    keep = max(0, limit - len(note) - len(marker) - 2 * len(str(total)))
     return text[:keep] + marker.format(start + keep, start + keep) + note
 
 
-async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher, start: int = 0) -> tuple[str, str]:
+async def _read_rendered(
+    browser: BrowserManager, url: str, fetcher: WebFetcher, start: int = 0, limit: int = MAX_FETCH_CHARS
+) -> tuple[str, str]:
     """A page the browser renders. The same stop rules apply: a CAPTCHA, a login or a paywall ends the read. The
     browser's own navigation is admitted like any other request: robots.txt, then a token of the host's bucket."""
     await fetcher.admit(url)
@@ -199,7 +214,8 @@ async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher,
     if verdict is not Verdict.OK:
         raise RuntimeError(f"still blocked in the browser (HTTP {page.status}) at {url}; not solved, not retried")
     title, text = await asyncio.to_thread(extract_text, page.html)  # off the event loop: parsing is CPU-bound
-    return title or url, _cap_page(text, "\n[page cut: the size cap was reached]" if page.truncated else "", start)
+    note = "\n[page cut: the size cap was reached]" if page.truncated else ""
+    return title or url, _cap_page(text, note, start, limit)
 
 
 class SearxngSearch:
@@ -575,15 +591,18 @@ def register_web_tools(
     ddg = DuckDuckGoSearch() if bool(cfg.get("keyless_fallback", True)) else None
     fetcher = fetcher or WebFetcher.from_config(cfg, getattr(config, "web", None))
     browser = browser or BrowserManager.from_config(config)
+    # what the model is sent of one result: the page and the header above it must fit, or the loop cuts the middle
+    budget = int((getattr(config, "context", None) or {}).get("tool_output_chars", 0) or 0) or MAX_TOOL_RESULT_CHARS
 
     async def tool_fetch(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         url = str(arguments.get("url") or "")
         try:
             start = max(0, int(arguments.get("start_index") or 0))
-            title, text = await fetch_page(url, fetcher=fetcher, browser=browser, start=start)
+            room = _page_room(budget, len(url) + _TITLE_ROOM + 5)
+            title, text = await fetch_page(url, fetcher=fetcher, browser=browser, start=start, limit=room)
         except Exception as e:  # noqa: BLE001
             return {"error": f"web_fetch failed: {e}"}
-        return {"content": f"# {title}\n{url}\n\n{text}"}
+        return {"content": f"# {title[:_TITLE_ROOM]}\n{url}\n\n{text}"}
 
     async def tool_browse(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         url = str(arguments.get("url") or "")
@@ -608,7 +627,8 @@ def register_web_tools(
             return {"error": f"web_browse: still blocked (HTTP {page.status}) at {url}; not solved, not retried"}
         title, text = await asyncio.to_thread(extract_text, page.html)
         note = "\n[page cut: the size cap was reached]" if page.truncated else ""
-        return {"content": f"# {title or url}\n{page.url}\n\n{_cap_page(text, note)}"}
+        head = f"# {(title or url)[:_TITLE_ROOM]}\n{page.url}\n\n"
+        return {"content": head + _cap_page(text, note, limit=_page_room(budget, len(head)))}
 
     async def tool_search(arguments: dict[str, Any], *, cwd: Any = None) -> dict[str, Any]:
         query = str(arguments.get("query") or "").strip()
