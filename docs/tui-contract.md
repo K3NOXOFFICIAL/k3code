@@ -268,24 +268,31 @@ This document maps every JSON-RPC method and server→client event in the vendor
 - **Heartbeat:** None (stdio is reliable); liveness via `gateway.ready` replay_epoch on reconnect
 
 ### WebSocket (Attach mode)
-- **Env:** `HERMES_TUI_GATEWAY_URL` (ws:// or wss://)
+- **Env:** `K3CODE_TUI_GATEWAY_URL` (ws:// or wss://)
 - **Framing:** JSON-RPC 2.0 over WebSocket frames
 - **Heartbeat:** `gateway.ready.heartbeat=true` enables ping/pong (30s interval, 90s deadline)
-- **Sidecar:** `HERMES_TUI_SIDECAR_URL` mirrors events to dashboard
+- **Sidecar:** `K3CODE_TUI_SIDECAR_URL` mirrors events to dashboard
 - **Reconnect:** Exponential backoff (1s base, 30s cap, no jitter)
 
 ### Environment Variables
 
 | Variable | Purpose |
 |----------|---------|
-| `HERMES_TUI_GATEWAY_URL` | Attach to existing gateway (WS URL) |
-| `HERMES_TUI_SIDECAR_URL` | Mirror events to sidecar (WS URL) |
-| `HERMES_PYTHON` | Python interpreter for spawned gateway |
-| `HERMES_CWD` | Working directory for gateway |
-| `HERMES_PYTHON_SRC_ROOT` | Hermes source root (import guard) |
-| `HERMES_TUI_STARTUP_TIMEOUT_MS` | Startup timeout (default 15s) |
-| `HERMES_TUI_RPC_TIMEOUT_MS` | RPC timeout (default 120s) |
-| `HERMES_VOICE` | Enable voice (default 0) |
+| `K3CODE_TUI_GATEWAY_URL` | Attach to existing gateway (WS URL) |
+| `K3CODE_TUI_SIDECAR_URL` | Mirror events to sidecar (WS URL) |
+| `K3CODE_PYTHON` | Python interpreter for spawned gateway |
+| `K3CODE_CWD` | Working directory for gateway |
+| `K3CODE_PYTHON_SRC_ROOT` | Source root of the Python gateway (import guard) |
+| `K3CODE_TUI_STARTUP_TIMEOUT_MS` | Startup timeout (default 15s) |
+| `K3CODE_TUI_RPC_TIMEOUT_MS` | RPC timeout (default 120s) |
+| `K3CODE_TUI_FORCE_OSC52` | `1` forces the OSC 52 clipboard escape sequence, `0` suppresses it (also `K3CODE_TUI_CLIPBOARD_OSC52`, `K3CODE_TUI_COPY_OSC52`) |
+| `K3CODE_TUI_DIM` | `1` uses ANSI dim, `0` uses a dimmed colour instead |
+| `K3CODE_TUI_TRUECOLOR` | `1` keeps truecolor on Apple Terminal |
+| `K3CODE_TUI_DISABLE_MOUSE_CLICKS` | `1` ignores mouse clicks |
+| `K3CODE_PTY_HOST` | `dashboard` when a dashboard terminal hosts the TUI |
+| `K3CODE_INK_DEBUG_ERRORS` | Any value prints internal Ink errors to stderr |
+
+The terminal knobs (`K3CODE_TUI_FORCE_OSC52` and its two aliases, `_DIM`, `_TRUECOLOR`, `_DISABLE_MOUSE_CLICKS`, `K3CODE_PTY_HOST`, `K3CODE_INK_DEBUG_ERRORS`) also read their old `HERMES_*` name as a fallback; `K3CODE_` wins when both are set. `K3CODE_CWD` falls back to `HERMES_CWD` when the TUI spawns the gateway directly. The other rows read `K3CODE_*` only. `tui/src/__tests__/envPrefix.test.ts` fails on a `HERMES_` read in the TUI sources with no `K3CODE_` counterpart in the same file.
 
 ### Gateway Launch (k3code Integration)
 
@@ -300,10 +307,10 @@ k3code (CLI)
 **Configuration location in TUI:** `tui/src/gatewayClient.ts` → `resolvePython()`, `startSpawnedGateway()`, `startAttachedGateway()`
 
 The TUI decides the transport:
-1. If `HERMES_TUI_GATEWAY_URL` is set → WebSocket attach mode
+1. If `K3CODE_TUI_GATEWAY_URL` is set → WebSocket attach mode
 2. Otherwise → spawn `python -m tui_gateway.entry` as child process
 
-For k3code: `k3code` sets `HERMES_TUI_GATEWAY_URL` empty, lets TUI spawn the stdio gateway.
+For k3code: `k3code` leaves `K3CODE_TUI_GATEWAY_URL` unset, lets TUI spawn the stdio gateway.
 
 ---
 
