@@ -113,6 +113,43 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
+#: The tools FileStamps guards: they change a file, so the model must have seen what is in it now.
+FILE_TOOLS = frozenset({"write", "edit"})
+
+
+class FileStamps:
+    """What a session last saw of each file it read, wrote or edited: real path → (mtime_ns, size).
+
+    ``write`` and ``edit`` refuse an existing file the session has not seen, or one that changed on disk since (the
+    user's editor, a formatter, another agent): write replaced the whole file and that change was gone without a word.
+    """
+
+    def __init__(self) -> None:
+        self._seen: dict[str, tuple[int, int]] = {}
+
+    def record(self, path: Path) -> None:
+        with contextlib.suppress(OSError):
+            st = path.stat()
+            self._seen[os.path.realpath(path)] = (st.st_mtime_ns, st.st_size)
+
+    def refusal(self, tool: str, path: Path) -> str | None:
+        """Why ``tool`` may not change ``path`` now, or None. A file that does not exist yet is always fine."""
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        if not path.is_file():
+            return None  # the tool reports what is wrong with it
+        seen = self._seen.get(os.path.realpath(path))
+        if seen is None:
+            return f"{path} exists and you have not read it: read it before you {tool} it"
+        if seen != (st.st_mtime_ns, st.st_size):
+            return (
+                f"{path} changed since you read it (by the user or another program): read it again before you {tool} it"
+            )
+        return None
+
+
 #: Files larger than this are only read as an explicit line range (streamed, never loaded whole).
 MAX_READ_BYTES = 10 * 1024 * 1024
 
@@ -1117,7 +1154,8 @@ def build_registry() -> ToolRegistry:
         ToolSpec(
             name="write",
             description="Write a file, creating parents.\n"
-            "Limits: replaces the whole file atomically (an existing file keeps its mode); UTF-8 text only.",
+            "Limits: replaces the whole file atomically (an existing file keeps its mode); UTF-8 text only; an "
+            "existing file must be read first and unchanged since.",
             parameters={
                 "type": "object",
                 "properties": {
@@ -1135,7 +1173,7 @@ def build_registry() -> ToolRegistry:
             name="edit",
             description="Edit a file by replacing old_string with new_string.\n"
             "Limits: old_string must match exactly once unless replace_all (whitespace-tolerant matching is a "
-            "fallback); UTF-8 files only; line endings are kept.",
+            "fallback); UTF-8 files only; line endings are kept; the file must be read first and unchanged since.",
             parameters={
                 "type": "object",
                 "properties": {
