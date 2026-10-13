@@ -143,7 +143,8 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> 
     existing = os.environ.get(env_name) or read_env_file().get(env_name, "")
     where = "your environment" if os.environ.get(env_name) else f"the env file {env_file_path()}"
     key = str(p.raw("onboard.key", "") or "").strip() if not p.interactive else ""
-    if existing and not key and p.confirm("onboard.keep_key", f"Keep the {env_name} key from {where}?", True):
+    kept = bool(existing and not key and p.confirm("onboard.keep_key", f"Keep the {env_name} key from {where}?", True))
+    if kept:
         p.say(f"  using {env_name} from {where}")
     elif preset != "local" and not key:
         key = p.text(
@@ -152,17 +153,26 @@ def _api_entry(p: Prompter, name: str, *, do_probe: bool, before: list[Any]) -> 
             "",
             secret=True,
         ).strip()
+    # Declined and nothing typed: the key in that variable is not this endpoint's, so it is not used for it.
+    declined = bool(existing) and not kept and not key
+    if declined:
+        existing = ""
+        if preset == "custom":  # a variable of its own; a vendor preset's variable is fixed and keeps its key
+            taken = {str(e.get("api_key_env") or "") for e in before if isinstance(e, dict)}
+            spec["api_key_env"] = env_name = key_env_for(spec["name"], taken | set(os.environ) | set(read_env_file()))
     if key:
         spec["api_key"] = key
     entry = _entry_from(Ctx(p=p, data={}), 0, "primary", spec)
     if entry is None:  # only the interactive branch of _entry_from returns None
         raise ValueError("no provider entry was built")
-    if not key and not existing and preset != "local":
+    if declined and preset != "custom":
+        p.say(f"  NOTE: the {env_name} key is still stored; replace it in {env_file_path()} or export a new one.")
+    elif not key and not existing and preset != "local":
         p.say(f"  NOTE: {env_name} is not set yet. Export it, or add it to {env_file_path()}.")
 
     ids: list[str] = []
     answered = p.raw("onboard.model", None) if not p.interactive else None
-    if do_probe and not answered:
+    if do_probe and not answered and not declined:
         ok, _ms, ids, detail = probe.list_models(entry, key or existing or os.environ.get(env_name, ""))
         if not ok:
             p.say(f"  could not list models ({detail}); check the key and URL with `k3code doctor`")

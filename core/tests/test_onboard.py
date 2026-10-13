@@ -350,3 +350,59 @@ def test_fast_onboarding_of_a_second_endpoint_keeps_the_first_with_its_own_key(r
         ("http://127.0.0.1:18081/v1", "fake-key-a"),
         ("http://127.0.0.1:18082/v1", "fake-key-b"),
     ]
+
+
+def _record_probes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Every (base_url, key) fast setup lists models with; the answer is a plain failure."""
+    seen: list[tuple[str, str]] = []
+
+    def fake(entry: dict[str, Any], key: str, timeout: float = 8.0) -> tuple[bool, float, list[str], str]:
+        seen.append((entry["base_url"], key))
+        return False, 0.0, [], "HTTP 401"
+
+    monkeypatch.setattr(ob.probe, "list_models", fake)
+    return seen
+
+
+def test_declining_the_stored_key_and_giving_none_never_sends_that_key_to_the_endpoint(
+    root, monkeypatch, capsys
+) -> None:
+    """Security review of #204: after "n" and a blank key the entry still used the declined variable, so vendor A's
+    key (left on the shared K3CODE_API_KEY by the old code) kept going to endpoint B, and B was probed with it."""
+    from k3code import confio
+    from k3code.setup.state import set_env_var
+
+    b = "http://127.0.0.1:18082/v1"
+    vendor_a_key = "fake-" + "vendor-a-key"
+    set_env_var("K3CODE_API_KEY", vendor_a_key)
+    confio.write_yaml(
+        user_config_path(),
+        {"providers": [{"name": "endpoint", "kind": "openai", "base_url": b, "api_key_env": "K3CODE_API_KEY"}]},
+    )
+    probes = _record_probes(monkeypatch)
+    p = Scripted({"onboard": {"mode": "fast", "provider": "api", "endpoint": b, "keep_key": False, "model": "m"}})
+    ob.run_fast(p, do_probe=True)
+
+    assert "onboard.keep_key" in p.asked
+    assert all(key != vendor_a_key for _url, key in probes), probes
+    prov = load_config(project_dir=root).providers[0]
+    assert prov.api_key_env != "K3CODE_API_KEY" and prov.api_key != vendor_a_key
+    assert f"NOTE: {prov.api_key_env} is not set yet" in capsys.readouterr().out
+
+
+def test_declining_a_vendor_key_and_giving_none_does_not_probe_with_it_and_says_it_is_still_stored(
+    root, monkeypatch, capsys
+) -> None:
+    """The same for a preset: its variable is fixed, so the old key stays there, but it is not used to probe and the
+    output no longer claims nothing is stored."""
+    from k3code.setup.state import set_env_var
+
+    old = "fake-" + "wrong-anthropic-key"
+    set_env_var("ANTHROPIC_API_KEY", old)
+    probes = _record_probes(monkeypatch)
+    ob.run_fast(Scripted({"onboard": {"mode": "fast", "provider": "anthropic", "keep_key": False}}), do_probe=True)
+
+    assert probes == []
+    out = capsys.readouterr().out
+    assert "ANTHROPIC_API_KEY" in out and "still stored" in out and "not set yet" not in out
+    assert old not in out
