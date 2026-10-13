@@ -71,7 +71,7 @@ def failure_of(tool: str, args: dict[str, Any] | None, result: dict[str, Any]) -
     and the exit code, then the first line of stderr).
     """
     if "error" in result and "content" not in result:
-        line = first_line(result["error"])
+        line = scrub_text(first_line(result["error"]))  # first: the class is a piece of this line and is stored as is
         cls = _error_class(line)
         if tool == "bash" and cls == "timeout":
             line = f"{_program(str((args or {}).get('command', '')))}: {line}"
