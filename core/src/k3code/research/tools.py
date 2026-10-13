@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 
@@ -48,18 +48,27 @@ class Hit:
 # ── readability-lite ──
 
 _SKIP = {"script", "style", "noscript", "nav", "footer", "header", "aside", "form", "svg", "iframe"}
-_BLOCK = {"p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "tr", "section", "article", "pre", "blockquote"}
+_BLOCK = {"p", "div", "br", "li", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "pre", "blockquote"}
+_PRE = "\0"  # marks where a <pre> block starts and ends in the parts; removed from the page's own text
+_FLAT_ROW = 1000  # a longer table row is page layout, not data: it keeps its line breaks
 
 
 class _Text(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, base_url: str = "") -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
         self.title = ""
+        self.base = base_url
         self._skip = 0
         self._in_title = False
         self._main_depth = 0
         self.main_parts: list[str] = []
+        self._pre = 0
+        self._pre_in: list[list[str]] = []  # the lists that got the open <pre>'s start mark: they get its end mark
+        self._link: tuple[str, int, int] | None = None  # target, where its text starts in parts and main_parts
+        self._row: tuple[int, int] | None = None  # where the open table row starts in parts and main_parts
+        self._cells = 0
+        self._tables: list[tuple[tuple[int, int] | None, int]] = []  # the open row of each enclosing table
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         if tag in _SKIP:
@@ -68,10 +77,41 @@ class _Text(HTMLParser):
             self._in_title = True
         elif tag in ("main", "article"):
             self._main_depth += 1
+        elif tag == "base":
+            self.base = self._target(dict(attrs).get("href")) or self.base
+        if self._pre:  # inside <pre> only the text and its line breaks count
+            self._pre += tag == "pre"
+            if tag == "br":
+                self._emit("\n")
+            elif tag in _BLOCK:
+                self._line_break()
+            return
         if tag in _BLOCK:
             self._emit("\n")
         if tag in ("h1", "h2", "h3"):
             self._emit("\n# ")
+        if tag == "pre":
+            self._pre = 1
+            self._pre_in = [] if self._skip else [self.parts, self.main_parts] if self._main_depth else [self.parts]
+            for parts in self._pre_in:
+                parts.append("\n" + _PRE)
+        elif tag == "a":
+            self._close_link()  # an <a> closes an open one, as in a browser
+            target = self._target(dict(attrs).get("href"))
+            if target and not self._skip:
+                self._link = (target, len(self.parts), len(self.main_parts))
+        elif tag == "table":
+            self._tables.append((self._row, self._cells))
+            self._row, self._cells = None, 0
+            self._emit("\n\n")
+        elif tag == "tr":
+            self._end_row()
+            self._start_row()
+        elif tag in ("td", "th"):  # the end tag of a cell may be left out: the separator goes before each cell
+            if self._row is None:
+                self._start_row()
+            self._emit(" | " if self._cells else "| ")
+            self._cells += 1
 
     def handle_endtag(self, tag: str) -> None:
         if tag in _SKIP and self._skip:
@@ -80,8 +120,82 @@ class _Text(HTMLParser):
             self._in_title = False
         elif tag in ("main", "article") and self._main_depth:
             self._main_depth -= 1
+        if self._pre:
+            if tag == "pre":
+                self._pre -= 1
+                if not self._pre:
+                    self._end_pre()
+            elif tag in _BLOCK:
+                self._line_break()
+            return
         if tag in _BLOCK:
             self._emit("\n")
+        if tag == "a":
+            self._close_link()
+        elif tag == "tr":
+            self._end_row()
+        elif tag == "table" and self._tables:
+            self._end_row()
+            self._row, self._cells = self._tables.pop()
+            self._emit("\n\n")
+
+    def close(self) -> None:
+        super().close()
+        if self._pre:  # an unclosed <pre> still ends its code block
+            self._pre = 0
+            self._end_pre()
+
+    def _end_pre(self) -> None:
+        for parts in self._pre_in:
+            parts.append(_PRE + "\n")
+        self._pre_in = []
+
+    def _line_break(self) -> None:
+        """A block inside <pre> (a highlighter's line) starts a new line, unless one has just started."""
+        if self.parts and self.parts[-1][-1:] not in ("\n", _PRE):
+            self._emit("\n")
+
+    def _target(self, href: str | None) -> str | None:
+        """The absolute URL of an href; None for an in-page anchor or a non-web scheme (javascript:, mailto:)."""
+        href = (href or "").replace(_PRE, "").strip()
+        if not href or href.startswith("#"):
+            return None
+        try:
+            url = urljoin(self.base, href)
+            scheme = urlparse(url).scheme
+        except ValueError:  # a malformed URL is left out; it must not end the parse of the page
+            return None
+        return url.replace(" ", "%20") if scheme in ("", "http", "https") else None
+
+    def _close_link(self) -> None:
+        """``[text](target)`` in place of the link's text. A link with no text (an icon, an image) stays as it is."""
+        if self._link is None:
+            return
+        target, at, main_at = self._link
+        self._link = None
+        for parts, start in ((self.parts, at), (self.main_parts, main_at)):
+            raw = "".join(parts[start:])
+            text = " ".join(raw.split())
+            if text and _PRE not in raw:
+                lead, trail = raw[: len(raw) - len(raw.lstrip())], raw[len(raw.rstrip()) :]
+                parts[start:] = [f"{lead}[{text}]({target}){trail}"]
+
+    def _start_row(self) -> None:
+        self._emit("\n")
+        self._row, self._cells = (len(self.parts), len(self.main_parts)), 0
+
+    def _end_row(self) -> None:
+        """``| a | b |`` on one line; a row that holds code or is too long to be data keeps its line breaks."""
+        if self._row is None:
+            return
+        if self._cells:
+            self._emit(" |")
+        for parts, start in zip((self.parts, self.main_parts), self._row, strict=True):
+            row = "".join(parts[start:])
+            flat = " ".join(row.split())
+            if _PRE not in row and len(flat) <= _FLAT_ROW:
+                parts[start:] = [flat]
+        self._row, self._cells = None, 0
 
     def _emit(self, s: str) -> None:
         if self._skip:
@@ -94,22 +208,32 @@ class _Text(HTMLParser):
         if self._in_title:
             self.title += data
         elif not self._skip:
-            self._emit(data)
+            if self._tables and self._row is None and not self._pre and data.isspace():
+                data = "" if "\n" in data else " "  # the line breaks between rows would put blank lines into the table
+            self._emit(data.replace(_PRE, ""))
 
 
-def extract_text(markup: str) -> tuple[str, str]:
-    """(title, text) from HTML: scripts/nav/footers dropped, <main>/<article> preferred, whitespace collapsed."""
-    p = _Text()
+def extract_text(markup: str, base_url: str = "") -> tuple[str, str]:
+    """(title, text) from HTML as Markdown: scripts/nav/footers dropped, <main>/<article> preferred, <pre> kept
+    verbatim in a code fence, links as ``[text](url)`` resolved against ``base_url`` (the page's URL), table rows as
+    ``| a | b |``, whitespace collapsed outside code."""
+    p = _Text(base_url)
     try:
         p.feed(markup)
         p.close()
     except Exception:  # noqa: BLE001 - malformed markup: use whatever was parsed
         logger.debug("html parse error", exc_info=True)
     chunks = p.main_parts if len("".join(p.main_parts).strip()) > 400 else p.parts
-    text = html.unescape("".join(chunks))
-    text = re.sub(r"[ \t\r\f\v]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text).strip()
-    return re.sub(r"\s+", " ", p.title).strip(), text
+    # The parser has decoded the entities: a second unescape would turn "&section=" in a URL into "§ion=".
+    pieces = "".join(chunks).split(_PRE)
+    for i in range(0, len(pieces), 2):  # outside <pre>
+        text = re.sub(r"[ \t\r\f\v]+", " ", pieces[i])
+        pieces[i] = re.sub(r"\n\s*\n+", "\n\n", text)
+    for i in range(1, len(pieces), 2):  # a <pre> block as it was, in a fence longer than any run of backticks in it
+        code = pieces[i].replace("\r\n", "\n").strip("\n")
+        fence = "`" * max([3, *(len(run) + 1 for run in re.findall(r"`+", code))])
+        pieces[i] = f"{fence}\n{code}\n{fence}"
+    return re.sub(r"\s+", " ", p.title).strip(), "".join(pieces).strip()
 
 
 def _safe_url(url: str) -> str | None:
@@ -147,7 +271,7 @@ async def _read_page(fetcher: WebFetcher, url: str, browser: BrowserManager | No
     if not 200 <= got.status < 300:
         raise FetchStatus(got.status, url)
     if "html" in got.content_type or got.body.lstrip().lower().startswith(("<!doctype", "<html")):
-        title, text = extract_text(got.body)
+        title, text = extract_text(got.body, got.url)
     else:
         title, text = url, got.body
     if got.truncated:
@@ -165,7 +289,7 @@ async def _read_rendered(browser: BrowserManager, url: str, fetcher: WebFetcher)
         raise Stopped(stop_report(verdict, url))
     if verdict is not Verdict.OK:
         raise RuntimeError(f"still blocked in the browser (HTTP {page.status}) at {url}; not solved, not retried")
-    title, text = await asyncio.to_thread(extract_text, page.html)  # off the event loop: parsing is CPU-bound
+    title, text = await asyncio.to_thread(extract_text, page.html, page.url)  # off the event loop: CPU-bound
     if page.truncated:
         text += "\n[page cut: the size cap was reached]"
     return title or url, text[:MAX_FETCH_CHARS]
@@ -548,7 +672,7 @@ def register_web_tools(
             return {"error": stop_report(verdict, url)}
         if verdict is not Verdict.OK:
             return {"error": f"web_browse: still blocked (HTTP {page.status}) at {url}; not solved, not retried"}
-        title, text = await asyncio.to_thread(extract_text, page.html)
+        title, text = await asyncio.to_thread(extract_text, page.html, page.url)
         if page.truncated:
             text += "\n[page cut: the size cap was reached]"
         return {"content": f"# {title or url}\n{page.url}\n\n{text[:MAX_FETCH_CHARS]}"}
