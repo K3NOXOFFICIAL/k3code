@@ -128,9 +128,10 @@ class AgentLoop:
         self._failed: list[tuple[str, str]] = []
         #: end a tool-error stop with an assistant message listing the failures (off when a higher tier continues)
         self.tool_error_stop_message = True
-        #: called after every tool call with (call, result, failure or None); the gateway's learning hub records
-        #: tool errors with it. A string it returns is a lesson for the failure, sent after the step's tool results.
-        self.on_tool_outcome: Callable[[ToolCall, dict[str, Any], Failure | None], str | None] | None = None
+        #: called after every tool call with (call, result, failure or None, reply=): the gateway's learning hub
+        #: records tool errors with it. ``reply`` is one object per model reply, shared by the calls it asked for
+        #: together. A string it returns is a lesson for the failure, sent after the step's tool results.
+        self.on_tool_outcome: Callable[..., str | None] | None = None
         #: (tool, signature) pairs whose lesson was already sent this run: one reminder per signature per turn
         self._learned: set[tuple[str, str]] = set()
         #: Set when the loop stopped before the task was done: "tool_errors" | "loop_guard" (the attempt looks stuck)
@@ -381,6 +382,7 @@ class AgentLoop:
 
             # Execute the tool calls and yield their results in the model's order. Consecutive read-only calls run
             # together (see _batches); every other call runs alone.
+            reply = object()  # tells the outcome hook which calls the model asked for before it saw any result
             for batch in self._batches(tool_calls):
                 if self.interrupted:
                     logger.info("Interrupted before tool %s", batch[0].name)
@@ -406,7 +408,7 @@ class AgentLoop:
                     messages.append(tool_msg)
                     # Yield the tool result as a stream event
                     yield StreamEvent(type="done", message=tool_msg)
-                    failure = self._observe_result(tc, result, notes)
+                    failure = self._observe_result(tc, result, notes, reply)
                     if "error" in result and "content" not in result:
                         self._tool_errors += 1
                         self._failed.append(
@@ -759,7 +761,9 @@ class AgentLoop:
             return False
         return outcome.verdict is Verdict.STOP
 
-    def _observe_result(self, tc: ToolCall, result: dict[str, Any], notes: list[Message]) -> Failure | None:
+    def _observe_result(
+        self, tc: ToolCall, result: dict[str, Any], notes: list[Message], reply: object
+    ) -> Failure | None:
         """Tell the learning hook and the loop guard how a call went; queue into ``notes`` the hook's lesson for the
         failure (once per signature per run) and the guard's reminder (one per step: the request guard's note, when
         there is one, already says to change approach; a lesson does not count against it)."""
@@ -767,7 +771,7 @@ class AgentLoop:
         failure = failure_of(tc.name, tc.arguments, result)
         if self.on_tool_outcome is not None:
             try:
-                learned = self.on_tool_outcome(tc, result, failure)
+                learned = self.on_tool_outcome(tc, result, failure, reply=reply)
             except Exception:  # noqa: BLE001 - learning must never break a turn
                 logger.warning("tool outcome hook failed", exc_info=True)
                 learned = None

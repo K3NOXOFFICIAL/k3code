@@ -48,8 +48,9 @@ class LearningHub:
         self.replays = replay.ReplayStore(self.home)
         self._state_path = self.home / "learning" / "state.json"
         self._tasks: set[asyncio.Task[Any]] = set()
-        #: (session id, tool) -> (tool_error row id, signature, the failed call's args): waits for the retry that works
-        self._last_failure: dict[tuple[str, str], tuple[int, str, dict[str, Any]]] = {}
+        #: (session id, tool) -> (tool_error row id, signature, the failed call's args, the model reply it came from):
+        #: waits for the retry that works, which is the next call of the tool after that reply
+        self._last_failure: dict[tuple[str, str], tuple[int, str, dict[str, Any], object | None]] = {}
 
     # ── config / state ──
 
@@ -121,26 +122,38 @@ class LearningHub:
     async def _mine_later(self, session: Any) -> None:
         self.mine_permissions(session)
 
-    def tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> str | None:
+    def tool_outcome(
+        self, session: Any, call: Any, result: dict[str, Any], failure: Any, *, reply: object | None = None
+    ) -> str | None:
         """Record a failed tool call as a ``tool_error``; the next call of that tool in the session that looks like a
-        retry and works becomes the row's hint. A signature seen REPEATS times in the project within WINDOW proposes
-        a project gotcha. Returns a reminder for the model when the failure already has a lesson (the agent loop sends
-        it after the step's tool results), else None. Never raises: it runs inside the turn."""
+        retry and works becomes the row's hint. ``reply`` says which model reply asked for the call (the same object
+        for every call of one reply, None when unknown): a call of the same reply is no retry, the model had not seen
+        the failure yet. A signature seen REPEATS times in the project within WINDOW proposes a project gotcha.
+        Returns a reminder for the model when the failure already has a lesson (the agent loop sends it after the
+        step's tool results), else None. Never raises: it runs inside the turn."""
         if not self.enabled or session is None:
             return None
         try:
-            return self._tool_outcome(session, call, result, failure)
+            return self._tool_outcome(session, call, result, failure, reply)
         except Exception:  # noqa: BLE001 - learning must never break a turn
             logger.warning("tool error learning failed", exc_info=True)
             return None
 
-    def _tool_outcome(self, session: Any, call: Any, result: dict[str, Any], failure: Any) -> str | None:
+    def _tool_outcome(
+        self, session: Any, call: Any, result: dict[str, Any], failure: Any, reply: object | None
+    ) -> str | None:
         cwd = str(session.perms.cwd)
         key = (session.session_id, call.name)
+        pending = self._last_failure.get(key)
+        if pending is not None and (reply is None or reply is not pending[3]):
+            # the first call of the tool after the failing reply ends the wait, retry or not (a call of the failing
+            # reply itself is skipped: it was asked for before the model saw the failure)
+            del self._last_failure[key]
+        else:
+            pending = None
         if failure is None:
-            pending = self._last_failure.pop(key, None)
             if pending is not None:
-                row_id, sig, failed_args = pending
+                row_id, sig, failed_args, _ = pending
                 hint = gotchas.followup_hint(call.name, failed_args, call.arguments)
                 if hint:
                     self.log.update_detail(row_id, followup=hint)
@@ -159,7 +172,7 @@ class LearningHub:
             detail={"tool": call.name, "error": failure.first_line},
             actor="auto" if getattr(session, "background", False) else "user",
         )
-        self._last_failure[key] = (row_id, failure.signature, dict(call.arguments))
+        self._last_failure[key] = (row_id, failure.signature, dict(call.arguments), reply)
         hint = self._maybe_gotcha(session, cwd, call.name, failure.signature)
         return self._known_fix(cwd, call.name, failure.signature, hint)
 

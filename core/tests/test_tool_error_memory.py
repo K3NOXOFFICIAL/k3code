@@ -10,15 +10,18 @@ from types import SimpleNamespace
 
 import pytest
 
+from k3code.agent.loop import AgentLoop
 from k3code.config import Settings
 from k3code.learning import decisions, gotchas
 from k3code.learning.decisions import DecisionLog
 from k3code.prompting import build_system_prompt
 from k3code.providers.types import ToolCall
+from k3code.router import Router, build_chain
 from k3code.toolerrors import failure_of
 from k3code.userhooks import Hook
 from test_learning_gateway import make_server, shown
 from test_permissions_gateway import call, run_turn
+from test_result_loop_guard import _Batch
 from test_user_hooks import _loop
 
 FAKE_KEY = "sk-" + "z" * 24  # built at run time: the secret scan must not see a literal
@@ -28,15 +31,15 @@ def _session(server, cwd, sid="s1"):
     return SimpleNamespace(session_id=sid, perms=SimpleNamespace(cwd=cwd), background=False, emit=lambda *a, **k: None)
 
 
-def _fail(hub, sess, command, stderr, code=127):
+def _fail(hub, sess, command, stderr, code=127, **kw):
     tc = ToolCall(id="x", name="bash", arguments={"command": command})
     result = {"stdout": "", "stderr": stderr, "exit_code": code}
-    hub.tool_outcome(sess, tc, result, failure_of("bash", tc.arguments, result))
+    hub.tool_outcome(sess, tc, result, failure_of("bash", tc.arguments, result), **kw)
 
 
-def _ok(hub, sess, command):
+def _ok(hub, sess, command, **kw):
     tc = ToolCall(id="y", name="bash", arguments={"command": command})
-    hub.tool_outcome(sess, tc, {"stdout": "fine", "stderr": "", "exit_code": 0}, None)
+    hub.tool_outcome(sess, tc, {"stdout": "fine", "stderr": "", "exit_code": 0}, None, **kw)
 
 
 async def test_failures_are_recorded_scrubbed_with_class_and_project(tmp_path, monkeypatch):
@@ -523,15 +526,107 @@ async def test_a_policy_denial_is_not_a_project_tool_error(tmp_path, monkeypatch
     outside.mkdir()
     loop = _loop(proj, hooks, mode=mode)
     sess = _session(server, proj)
-    loop.on_tool_outcome = lambda tc, result, failure: hub.tool_outcome(sess, tc, result, failure)
+    loop.on_tool_outcome = lambda tc, result, failure, **kw: hub.tool_outcome(sess, tc, result, failure, **kw)
     args = {k: v.format(outside=outside) if isinstance(v, str) else v for k, v in args.items()}
     tc = ToolCall(id="d1", name=tool, arguments=args)
     failures = []
     for _ in range(3):  # a recurring signature is what proposes a gotcha
         result = await loop._execute_tool(tc)
         assert result["error"].startswith(message)  # the real message: this test follows it if it is reworded
-        failures.append(loop._observe_result(tc, result, []))
+        failures.append(loop._observe_result(tc, result, [], object()))
     assert hub.log.query("tool_error", actor=None) == []
     assert not [p for p in hub.store.all() if p.kind == "project_gotcha"]
     assert [f and f.error_class for f in failures] == ["denied"] * 3  # still a failure: the loop guard counts it
     assert not (proj / "ran").exists()
+
+
+@pytest.mark.parametrize(
+    ("failed", "retry"),
+    [
+        ("python x.py", "python3 x.py"),  # a swapped tool on the same target
+        ("npm test", "pnpm test"),
+        ("git push origin main", "git push --set-upstream origin main"),  # the same program and subcommand
+        ("npm test", "cd app && npm test --silent"),  # a prefix does not hide the retry
+        ("CI=1 make build", "make build -j1"),
+    ],
+)
+def test_a_variation_of_the_failed_command_is_a_retry(failed, retry):
+    hint = gotchas.followup_hint("bash", {"command": failed}, {"command": retry})
+    assert hint == f"`{retry}` worked instead"
+
+
+@pytest.mark.parametrize(
+    ("failed", "next_call"),
+    [
+        ("npm test", "cat package.json | grep test"),  # one word in common is no retry
+        ("make test", "echo test passed"),
+        ("npm install left-pad", "rm left-pad"),
+        ("docker build .", "cat Dockerfile"),
+        ("cat a.txt", "cat b.txt"),  # the same program on another target
+        ("python x.py", "python y.py"),
+        ("npm test", "npm test"),  # not even a change
+    ],
+)
+def test_a_next_call_that_only_shares_a_word_is_no_retry(failed, next_call):
+    assert gotchas.followup_hint("bash", {"command": failed}, {"command": next_call}) == ""
+
+
+def test_a_call_of_another_tool_with_other_arguments_is_no_hint():
+    # "worked with different path" said nothing about the project, and it was learned for any two reads
+    assert gotchas.followup_hint("read", {"path": "gone.txt"}, {"path": "here.txt"}) == ""
+    assert gotchas.followup_hint("edit", {"path": "a", "old_string": "x"}, {"path": "a", "old_string": "y"}) == ""
+
+
+def _followups(hub):
+    return [r["detail"].get("followup") for r in hub.log.query("tool_error", actor=None)]
+
+
+async def test_a_call_of_the_same_reply_is_not_a_retry(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    s = _session(server, tmp_path)
+    reply = object()  # the model asked for both calls at once, before it saw either result
+    _fail(hub, s, "npm test", "sh: 1: npm: not found", reply=reply)
+    _ok(hub, s, "pnpm test", reply=reply)
+    assert _followups(hub) == [None]
+    _fail(hub, s, "npm test", "sh: 1: npm: not found", reply=object())
+    _ok(hub, s, "pnpm test", reply=object())  # a later reply: the model had seen the error
+    assert _followups(hub) == [None, "`pnpm test` worked instead"]
+
+
+async def test_only_the_next_call_of_a_tool_can_be_its_retry(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    s = _session(server, tmp_path)
+    _fail(hub, s, "npm test", "sh: 1: npm: not found")
+    _ok(hub, s, "ls")  # the next bash call is not a retry ...
+    _ok(hub, s, "pnpm test")  # ... and a later one does not become one
+    assert _followups(hub) == [None]
+    _fail(hub, s, "npm test", "sh: 1: npm: not found")
+    _fail(hub, s, "grep -q x f", "", code=1)  # a failure nothing records is still the next bash call
+    _ok(hub, s, "pnpm test")
+    assert _followups(hub) == [None, None]
+
+
+SCRIPT = 'test "$1" = good || { echo "bad input" >&2; exit 1; }'
+
+
+async def test_a_turn_learns_a_hint_only_from_a_retry_in_a_later_reply(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    (tmp_path / "t.sh").write_text(SCRIPT + "\n", encoding="utf-8")
+    bad = ToolCall(id="b", name="bash", arguments={"command": "sh t.sh bad"})
+    good = ToolCall(id="g", name="bash", arguments={"command": "sh t.sh good"})
+    s = _session(server, tmp_path)
+    for replies in ([[bad, good]], [[bad], [good]]):  # one reply with both calls, then one call per reply
+        provider = _Batch(replies)
+        loop = AgentLoop(
+            Router(build_chain([provider], [["m"]]), max_retries=0),
+            system_prompt="t",
+            permission_mode="yolo",
+            cwd=tmp_path,
+            max_turns=10,
+        )
+        loop.on_tool_outcome = lambda c, r, f, **kw: hub.tool_outcome(s, c, r, f, **kw)
+        _ = [e async for e in loop.run("go")]
+    assert _followups(hub) == [None, "`sh t.sh good` worked instead"]

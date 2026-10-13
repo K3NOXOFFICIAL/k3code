@@ -159,7 +159,7 @@ async def test_a_learned_lesson_is_sent_once_per_signature_per_run_and_beside_th
     loop, _ = _loop(tmp_path, [])
     provider = _Batch([step])
     loop.router = Router(build_chain([provider], [["m"]]), max_retries=0)
-    loop.on_tool_outcome = lambda call, result, failure: "use the replica" if failure else None
+    loop.on_tool_outcome = lambda call, result, failure, **_: "use the replica" if failure else None
     await _drain(loop)
     notes = [m.content for m in provider.seen[1] if m.role == "system"][1:]
     assert notes[0] == "[learned] use the replica" and len(notes) == 2  # one lesson for three identical failures
@@ -169,3 +169,21 @@ async def test_a_learned_lesson_is_sent_once_per_signature_per_run_and_beside_th
     provider.seen.clear()
     await _drain(loop)  # a new run reminds again
     assert [m.content for m in provider.seen[1]].count("[learned] use the replica") == 1
+
+
+@pytest.mark.asyncio
+async def test_the_hook_is_told_which_model_reply_a_call_came_from(tmp_path):
+    first = [ToolCall(id="a", name="db", arguments={"n": 1}), ToolCall(id="b", name="db", arguments={"n": 2})]
+    loop, _ = _loop(tmp_path, [])
+    loop.router = Router(
+        build_chain([_Batch([first, [ToolCall(id="c", name="db", arguments={"n": 3})]])], [["m"]]), max_retries=0
+    )
+    seen: dict[str, object] = {}
+
+    def hook(call, result, failure, *, reply=None):
+        seen[call.id] = reply
+
+    loop.on_tool_outcome = hook
+    await _drain(loop)
+    assert seen["a"] is not None and seen["a"] is seen["b"]  # calls the model asked for together
+    assert seen["c"] is not None and seen["c"] is not seen["a"]
