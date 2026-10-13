@@ -1162,6 +1162,8 @@ def update_cmd(
         raise SystemExit(0 if res.ok else 1)
     cfg = upd.update_settings()
     cur = upd.current_version()
+    daemon_behind = upd.stale_daemon_build()
+    block = upd.current_lines(cur, daemon_behind, "daemon:  ")  # `current:`, and the daemon's build if it is behind
     rel = None
     git_ref = None
     if not from_source:
@@ -1198,16 +1200,16 @@ def update_cmd(
             raise click.ClickException(str(e)) from e
         if upd.is_commit_sha(git_ref):
             click.echo(
-                f"current: {cur}\nThis install is pinned to commit {git_ref[:12]}: there is nothing to update. "
+                f"{block}\nThis install is pinned to commit {git_ref[:12]}: there is nothing to update. "
                 f"Reinstall with `sh install.sh --from-git --ref Main` to follow a branch."
             )
             return
-        click.echo(f"current: {cur}\nlatest:  {head[:7]} ({git_ref})")
+        click.echo(f"{block}\nlatest:  {head[:7]} ({git_ref})")
         if check:
             return
         have = upd.installed_sha()
         if have and head.startswith(have):
-            click.echo("Already up to date.")
+            click.echo(upd.up_to_date(daemon_behind, "Already up to date."))
             return
         if not yes:
             click.confirm(f"Update to {head[:7]} ({git_ref})?", abort=True)
@@ -1224,7 +1226,7 @@ def update_cmd(
         src = upd.source_checkout()
         if src is None or not (src / ".git").exists():
             raise click.ClickException("no source checkout known; set update.source in config.yaml")
-        click.echo(f"current: {cur}\nsource: {src}")
+        click.echo(f"{block}\nsource: {src}")
         if check:
             return
         if not yes:
@@ -1234,14 +1236,14 @@ def update_cmd(
         except upd.SourceUpdateError as e:
             raise click.ClickException(str(e)) from e
         if ver == cur:  # the checkout builds the version that is already active
-            click.echo(f"Already up to date ({ver}).")
+            click.echo(upd.up_to_date(daemon_behind, f"Already up to date ({ver})."))
             return
     else:
         assert rel is not None
-        click.echo(f"current: {cur}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
+        click.echo(f"{block}\nlatest:  {rel.version}\n\n{rel.body.strip()[:2000]}")
         if check or not upd.is_newer(rel.version, cur):
             if not check:
-                click.echo("Already up to date.")
+                click.echo(upd.up_to_date(daemon_behind, "Already up to date."))
             return
         if not yes:
             click.confirm(f"Update to {rel.version}?", abort=True)
