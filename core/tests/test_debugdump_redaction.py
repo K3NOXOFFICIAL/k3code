@@ -293,3 +293,74 @@ def test_export_drops_a_known_secret_before_the_shape_pass(tmp_path, monkeypatch
     with tarfile.open(out) as tar:
         blob = "\n".join(tar.extractfile(n).read().decode() for n in tar.getnames())
     assert tail not in blob
+
+
+# K3NOX-363: a glob value is a permission pattern, not a credential; `--clientsecret` is a credential flag again
+
+#: Deny rules that carry no secret but put a glob where a credential would sit (after `--pat`, in `?sig=`, `u:*@`).
+GLOB_DENY_RULES = [
+    "* --pat *",
+    "* --bearer *",
+    "gh * --pat=*",
+    "curl *?sig=*",
+    "curl *&signature=?*",
+    "* --bearer ** *",
+    "curl https://*:*@*",
+    "curl *://*:*@*",
+]
+
+
+def test_glob_values_in_permission_keys_stay_patterns():
+    # two of them must not collapse into one `... <redacted>` key either
+    perms = {"bash": dict.fromkeys(GLOB_DENY_RULES, "deny")}
+    assert redact({"permissions": perms}) == {"permissions": perms}
+
+
+@pytest.mark.parametrize("rule", GLOB_DENY_RULES)
+def test_a_deny_rule_survives_export_and_trusted_import(rule, tmp_path):
+    from k3code import bundle
+    from k3code.gateway.sessions import SessionStore
+    from k3code.paths import user_config_path
+    from k3code.permissions.rules import evaluate
+    from k3code.permissions.state import permissions_from_text
+
+    _write_user_config({"permissions": {"bash": {rule: "deny"}}})
+    out = tmp_path / "x.k3bundle"
+    bundle.write_bundle(out, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, session_ids=[])
+    user_config_path().unlink()  # a new device: only the bundle's rules are there
+    store = SessionStore(tmp_path / "t.db")
+    bundle.apply_bundle(bundle.read_bundle(out), store=store, cwd=tmp_path, sessions=False, trust_bundle=True)
+    rules, _ = permissions_from_text(user_config_path().read_text())
+    command = rule.replace("*", "x" + "abc").replace("?", "q")
+    assert evaluate("bash", command, rules).action == "deny"
+
+
+@pytest.mark.parametrize(
+    "rule, secret",
+    [
+        ("x --pat " + PW, PW),
+        ("x --bearer=" + PW, PW),
+        ("x --pat *" + PW, PW),
+        ("x --pat " + PW + "?", PW),
+        ("curl https://h.example.com/a?sig=" + SIG + "*", SIG),
+        ("curl https://u:" + URL_PW + "@h.example.com/*", URL_PW),
+        ("curl https://u:*" + URL_PW + "@h.example.com/*", URL_PW),
+    ],
+)
+def test_a_value_that_is_not_only_glob_characters_is_still_hidden(rule, secret):
+    from k3code.redact import scrub_text
+
+    assert secret not in scrub_text(rule)
+    assert secret not in json.dumps(redact({"permissions": {"bash": {rule: "allow"}}}))
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["--clientsecret", "--clientSecret", "--CLIENTSECRET", "-clientsecret", "--oauth-clientsecret", "--client-secret"],
+)
+def test_client_secret_flags_hide_their_value(flag):
+    from k3code.redact import scrub_text
+
+    assert PW not in scrub_text(f"tool {flag} {PW}")
+    assert PW not in scrub_text(f"tool {flag}={PW}")
+    assert redact({"args": [flag, PW]})["args"] == [flag, REDACTED]

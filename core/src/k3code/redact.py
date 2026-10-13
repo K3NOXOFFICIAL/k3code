@@ -22,7 +22,7 @@ _PREFIXED = re.compile(
     r"|xox[abprs]-[A-Za-z0-9\-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{30,}|glpat-[A-Za-z0-9_\-]{16,}"
     r"|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{4,}|Bearer\s+[A-Za-z0-9._\-~+/]{16,}"
     r"|Bearer\s+(?=[A-Za-z0-9._\-~+/]*[0-9._\-~+/])[A-Za-z0-9._\-~+/]{6,}"
-    r"|://[^/\s:@]+:[^/\s@]+@)"
+    r"|://[^/\s:@]+:(?![*?]+@)[^/\s@]+@)"
 )
 _OPAQUE = re.compile(r"[A-Za-z0-9_\-]{32,}")
 
@@ -55,16 +55,17 @@ _AUTH_HEADER = re.compile(
 )
 _URL_SECRET = re.compile(
     r"(?i)([?&](?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|token|secret|client[_-]?secret|key|password|"
-    r"passwd|pwd|sig|signature)=)[^&\s\"']+"
+    r"passwd|pwd|sig|signature)=)([^&\s\"']+)"
 )
 #: A flag that takes a credential: `--token`, `--github-token`, `--pat`, `--api-key`, `--client-secret` ... A `--no-`
 #: flag takes none, and `key` names one only after a credential word (`--sort-key`, `--recv-key` are not secrets).
 _FLAG_NAME = (
-    r"--?(?!no[_-])(?:[a-z0-9]+[_-])*(?:password|passwd|pwd|token|apikey|secret|bearer|credentials?|pat|"
-    r"auth(?:[_-]?token)?|(?:api|access|private|secret|client|auth|license|subscription|account|master|signing)[_-]?key)"
+    r"--?(?!no[_-])(?:[a-z0-9]+[_-])*(?:password|passwd|pwd|token|apikey|(?:client[_-]?)?secret|bearer|"
+    r"credentials?|pat|auth(?:[_-]?token)?|"
+    r"(?:api|access|private|secret|client|auth|license|subscription|account|master|signing)[_-]?key)"
 )
 _SECRET_FLAG = re.compile(r"(?i)" + _FLAG_NAME)
-_FLAG_SECRET = re.compile(r"(?i)((?:^|\s)" + _FLAG_NAME + r"(?:=|\s+))[^\s'\"-][^\s'\"]*")
+_FLAG_SECRET = re.compile(r"(?i)((?:^|\s)" + _FLAG_NAME + r"(?:=|\s+))([^\s'\"-][^\s'\"]*)")
 #: A bare `--key` hides its value only when that is token-shaped (`sort --key=2,2`, `--key docs/a.txt` stay).
 _KEY_FLAG = re.compile(r"(?i)--?key")
 _KEY_FLAG_VALUE = re.compile(r"(?i)((?:^|\s)--?key(?:=|\s+))([^\s'\"-][^\s'\"]*)")
@@ -73,6 +74,13 @@ _TOKEN_CHARS = re.compile(r"[A-Za-z0-9_\-+=~]+")
 _BASE64 = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 _HEX = re.compile(r"[0-9a-fA-F]+")
 _SLUG_WORD = re.compile(r"[a-z]+[0-9]{0,4}|[0-9]{1,8}")
+#: A value made only of glob characters is a permission pattern (`* --pat *`, `curl *?sig=*`), not a credential:
+#: hiding it turns an exported deny rule into one that never matches.
+_GLOB = re.compile(r"[*?]+")
+
+
+def _hide(value: str) -> str:
+    return value if _GLOB.fullmatch(value) else REDACTED
 
 
 def scrub_text(text: str) -> str:
@@ -84,9 +92,9 @@ def scrub_text(text: str) -> str:
     text = _PEM.sub(REDACTED, text)
     text = _PREFIXED.sub(REDACTED, text)
     text = _AUTH_HEADER.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", text)
-    text = _ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{REDACTED}{m.group(3)}", text)
-    text = _URL_SECRET.sub(lambda m: f"{m.group(1)}{REDACTED}", text)
-    text = _FLAG_SECRET.sub(lambda m: f"{m.group(1)}{REDACTED}", text)
+    text = _ASSIGNMENT.sub(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_hide(m.group(4))}{m.group(3)}", text)
+    text = _URL_SECRET.sub(lambda m: f"{m.group(1)}{_hide(m.group(2))}", text)
+    text = _FLAG_SECRET.sub(lambda m: f"{m.group(1)}{_hide(m.group(2))}", text)
     return _KEY_FLAG_VALUE.sub(lambda m: m.group(1) + (REDACTED if _token_shaped(m.group(2), 8) else m.group(2)), text)
 
 
@@ -117,8 +125,8 @@ def _scrub_url(url: str) -> str:
     authority, path, query, frag = m.group(1), m.group(2), m.group(3) or "", m.group(4) or ""
     user, at, host = authority.rpartition("@")
     if at:
-        name, colon, _pw = user.partition(":")
-        user = f"{name}:{REDACTED}" if colon else (REDACTED if _token_shaped(user, 20) else user)
+        name, colon, pw = user.partition(":")
+        user = f"{name}:{_hide(pw)}" if colon else (REDACTED if _token_shaped(user, 20) else user)
         authority = f"{user}@{host}"
     path = "/".join(REDACTED if _token_shaped(seg, 20) else seg for seg in path.split("/"))
     if query:
