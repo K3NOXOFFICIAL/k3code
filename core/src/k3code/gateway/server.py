@@ -3796,6 +3796,7 @@ async def _setup_status(server: GatewayServer, params: dict[str, Any]) -> dict[s
         "provider_configured": bool(server.config.providers),
         "ready": bool(server.config.providers),
         "version": __version__,  # doctor compares it with the installed `current` to spot a stale daemon
+        "background_paused": server.background_paused,  # restart-storm safe mode; doctor warns about it
     }
 
 

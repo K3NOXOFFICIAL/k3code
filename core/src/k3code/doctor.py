@@ -21,6 +21,7 @@ from k3code import service
 from k3code.config import Settings, default_project_dir, load_config
 from k3code.context_budget import FALLBACK_WINDOW, compact_threshold, family_window, has_explicit_window
 from k3code.daemon import k3_home, socket_path
+from k3code.halt import load_halt
 from k3code.reliability.governor import read_psi
 from k3code.reliability.journal import ToolJournal
 from k3code.reliability.netwatch import NetWatchConfig, _default_provider_probe, default_internet_probe
@@ -280,12 +281,39 @@ async def check_daemon(sock: Path | None = None) -> Check:
             if reply.get("id") == "doctor":
                 break
         ms = (time.monotonic() - start) * 1000
-        version = str((reply.get("result") or {}).get("version") or "")
-        return Check("daemon", OK, f"answering on {sock} ({ms:.0f} ms)", data={"socket": str(sock), "version": version})
+        result = reply.get("result") or {}
+        version = str(result.get("version") or "")
+        data = {"socket": str(sock), "version": version}
+        if result.get("background_paused"):  # restart-storm safe mode is in the daemon's memory only
+            return Check(
+                "daemon",
+                WARN,
+                f"answering on {sock} ({ms:.0f} ms) but background work is paused (restart-storm safe mode)",
+                "fix what keeps restarting the daemon (journalctl --user -u k3code), then /daemon resume "
+                "(or: k3code slash /daemon resume)",
+                data,
+            )
+        return Check("daemon", OK, f"answering on {sock} ({ms:.0f} ms)", data=data)
     except (OSError, TimeoutError, ValueError, ConnectionError) as e:
         return Check("daemon", FAIL, f"not answering: {e}", "restart: systemctl --user restart k3code")
     finally:
         writer.close()
+
+
+def check_halt(home: Path) -> Check:
+    """``/daemon pause`` is persisted in ``halt.json``, so it is visible without the daemon (and with --no-probe) and it
+    outlasts a daemon restart: until ``/daemon resume`` nothing reaches a provider."""
+    halt = load_halt(home)
+    if halt is None:
+        return Check("daemon-paused", OK, "background work not halted")
+    since = time.strftime("%Y-%m-%d %H:%M", time.localtime(halt.since)) if halt.since else "unknown time"
+    return Check(
+        "daemon-paused",
+        WARN,
+        f"background work is halted ({halt.reason}, since {since}): no turn, loop, job or sub-agent starts",
+        "/daemon resume (or: k3code slash /daemon resume)",
+        {"reason": halt.reason, "since": halt.since},
+    )
 
 
 def check_systemd() -> Check:
@@ -487,19 +515,41 @@ def check_vendor() -> Check:
     return Check("vendor", FAIL, last, "fix VENDOR.toml / the vendored file headers")
 
 
-def check_sandbox(probe: bool = True) -> Check:
+#: Ubuntu 23.10+ (24.04 LTS) sets this to 1: an unprivileged program may create a user namespace only under an
+#: AppArmor profile that allows ``userns``, and bwrap has none by default.
+_APPARMOR_USERNS = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+
+
+def _unusable_bwrap_fix(bwrap: str) -> str:
+    try:
+        restricted = _APPARMOR_USERNS.read_text().strip() == "1"
+    except OSError:
+        restricted = False
+    if restricted:
+        return (
+            "Ubuntu restricts user namespaces with AppArmor. Allow bwrap: write these 3 lines to "
+            "/etc/apparmor.d/bwrap: `abi <abi/4.0>,` `include <tunables/global>` "
+            f"`profile bwrap {bwrap} flags=(unconfined) {{ userns, }}`, then `sudo apparmor_parser -r "
+            "/etc/apparmor.d/bwrap`; or lift the restriction for every program: "
+            "`sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist it in /etc/sysctl.d/)"
+        )
+    return "allow unprivileged user namespaces for bwrap (run `bwrap --ro-bind / / true` to see why it fails)"
+
+
+def check_sandbox() -> Check:
     from k3code.reliability import sandbox
 
     path = sandbox.bwrap_path()
     if path:
-        # bwrap present is not enough: user namespaces may be blocked, and then every sandboxed command fails
-        if probe and not sandbox.usable():
+        # bwrap present is not enough: user namespaces may be blocked, and then every sandboxed command fails. The
+        # self-test is local and cheap, so --no-probe (which skips the network) runs it too.
+        if not sandbox.usable():
             return Check(
                 "sandbox",
                 WARN,
                 "bubblewrap is installed but unusable (user namespaces blocked?); unattended bash is refused, "
                 "interactive auto/yolo bash runs unsandboxed",
-                "allow unprivileged user namespaces for bwrap (try: bwrap --ro-bind / / true)",
+                _unusable_bwrap_fix(path),
             )
         return Check("sandbox", OK, f"bubblewrap at {path}")
     return Check(
@@ -640,6 +690,7 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
     daemon_check = await check_daemon() if probe else Check("daemon", OK, "probe skipped")
     checks.append(daemon_check)
     checks += [
+        check_halt(home),
         check_daemon_version(daemon_check.data.get("version")),
         check_systemd(),
         check_linger(),
@@ -649,8 +700,8 @@ async def run_checks(config: Settings | None = None, *, probe: bool = True, home
         check_home(home),
         check_journal(home),
         check_vendor(),
-        # the probe runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
-        await asyncio.to_thread(check_sandbox, probe),
+        # the self-test runs bwrap (up to 10 s): off the event loop, since /doctor also runs inside the daemon
+        await asyncio.to_thread(check_sandbox),
         check_isolation(),
         await asyncio.to_thread(check_project, default_project_dir()),  # the stack scan reads the tree
     ]

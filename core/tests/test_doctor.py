@@ -36,16 +36,76 @@ def test_sandbox_is_ok_when_bwrap_is_usable(monkeypatch):
     assert chk.status == doctor.OK and "/usr/bin/bwrap" in chk.detail
 
 
-def test_sandbox_no_probe_does_not_run_bwrap(monkeypatch):
+async def test_sandbox_no_probe_still_reports_an_unusable_bwrap(monkeypatch, tmp_path):
+    """--no-probe skips network probes, not the local bwrap self-test: it printed "bubblewrap at ..." as OK on a host
+    where every sandboxed command fails (and so did the summary step of `setup --no-probe`)."""
+    from k3code import doctor
+    from k3code.config import Settings
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    checks = {c.name: c for c in await doctor.run_checks(Settings(), probe=False, home=tmp_path)}
+    assert checks["sandbox"].status == doctor.WARN
+    assert checks["sandbox"].detail.startswith("bubblewrap is installed but unusable")
+
+
+def test_sandbox_hint_names_the_ubuntu_apparmor_fix(monkeypatch, tmp_path):
+    """Ubuntu 23.10+/24.04 blocks user namespaces for bwrap through AppArmor; the old hint ("try: bwrap --ro-bind / /
+    true") was a test, not a fix."""
     from k3code import doctor
     from k3code.reliability import sandbox
 
-    def must_not_probe():
-        raise AssertionError("--no-probe must not spawn bwrap")
-
+    restrict = tmp_path / "apparmor_restrict_unprivileged_userns"
+    monkeypatch.setattr(doctor, "_APPARMOR_USERNS", restrict)
     monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
-    monkeypatch.setattr(sandbox, "usable", must_not_probe)
-    assert doctor.check_sandbox(probe=False).status == doctor.OK
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    restrict.write_text("1\n")
+    chk = doctor.check_sandbox()
+    assert chk.status == doctor.WARN
+    assert "AppArmor" in chk.fix and "kernel.apparmor_restrict_unprivileged_userns=0" in chk.fix
+    assert "/etc/apparmor.d/bwrap" in chk.fix and "userns" in chk.fix and "/usr/bin/bwrap" in chk.fix
+    restrict.write_text("0\n")  # not the Ubuntu restriction: no AppArmor advice
+    assert "AppArmor" not in doctor.check_sandbox().fix
+    restrict.unlink()
+    assert "AppArmor" not in doctor.check_sandbox().fix
+
+
+async def test_doctor_warns_while_the_daemon_is_halted(tmp_path):
+    """`/daemon pause` persists halt.json; doctor (also --no-probe, also while the daemon is down) said nothing."""
+    from k3code import doctor
+    from k3code.config import Settings
+    from k3code.halt import set_halt
+
+    before = {c.name: c for c in await doctor.run_checks(Settings(), probe=False, home=tmp_path)}
+    assert before["daemon-paused"].status == doctor.OK
+    set_halt(tmp_path, "/daemon pause")
+    after = {c.name: c for c in await doctor.run_checks(Settings(), probe=False, home=tmp_path)}
+    assert after["daemon-paused"].status == doctor.WARN
+    assert "/daemon pause" in after["daemon-paused"].detail and "/daemon resume" in after["daemon-paused"].fix
+
+
+async def test_check_daemon_warns_in_restart_storm_safe_mode(tmp_path):
+    import asyncio
+
+    from k3code import __version__, doctor
+
+    sock = tmp_path / "d.sock"
+
+    async def handle(reader, writer):
+        await reader.readline()
+        result = b'{"ready":true,"background_paused":true,"version":"' + __version__.encode() + b'"}'
+        writer.write(b'{"jsonrpc":"2.0","id":"doctor","result":' + result + b"}\n")
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_unix_server(handle, path=str(sock))
+    try:
+        chk = await doctor.check_daemon(sock)
+    finally:
+        server.close()
+    assert chk.status == doctor.WARN and "paused" in chk.detail and "/daemon resume" in chk.fix
+    assert chk.data["version"] == __version__  # the stale-daemon check still reads it
 
 
 def test_install_subset_never_fails_and_covers_browser_and_searxng(monkeypatch):
@@ -327,3 +387,12 @@ def test_doctor_clears_a_providers_auth_cooldown_when_its_key_answers(monkeypatc
     left = CooldownStore(path=path)
     assert left.reason_of(provider="good", model="m") is None
     assert left.reason_of(provider="bad", model="m") is FailoverReason.auth
+
+
+async def test_setup_status_reports_safe_mode_to_doctor():
+    from k3code.gateway.server import GatewayServer, _setup_status
+
+    server = GatewayServer()
+    assert (await _setup_status(server, {}))["background_paused"] is False
+    server.background_paused = True
+    assert (await _setup_status(server, {}))["background_paused"] is True
