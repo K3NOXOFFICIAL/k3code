@@ -20,7 +20,8 @@
 # nothing. The installer never runs onboarding; it ends by telling you to run `k3code onboard`.
 # Presetup (after activation; --minimal skips it) checks the sandbox, installs Chromium for the browser tool and
 # prints a health subset. It never fails the install.
-# Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
+# Env: K3CODE_SKIP_CHROMIUM=1 (presetup: no Chromium), K3_CONNECT_TIMEOUT=SECS (a download connection gives up after
+#   SECS seconds and is retried; default 15). Mostly for tests: K3CODE_DATA, K3_BIN_DIR, K3_INSTALL_LOG,
 #   K3_NO_DOWNLOAD (= --no-install-deps), K3_SKIP_PIP, K3_SKIP_TUI, K3_SKIP_GO, K3_STUB_VENV (fake core, no uv,
 #   no network), K3_EDITABLE (--from-source only), K3_BWRAP (the bubblewrap binary to probe).
 set -eu
@@ -105,13 +106,33 @@ cleanup() {
 have() { command -v "$1" >/dev/null 2>&1; }
 have_git() { git --version >/dev/null 2>&1; } # macOS ships a /usr/bin/git stub that fails without the developer tools
 
-fetch() { # fetch URL FILE: https only, whichever downloader is there
+# curl -s and wget -q say nothing while they wait for a connection and retry it, so a proxy or a firewall that swallows
+# connections looked like a hang. Say so every SECS seconds, until the installer (PID) is gone or the download ends.
+fetch_still_trying() { # fetch_still_trying PID HOST SECS
+  waited=0
+  while sleep "$3" >/dev/null 2>&1 && kill -0 "$1" 2>/dev/null; do # sleep's output closed: an orphaned sleep must not hold a pipe open
+    waited=$((waited + $3))
+    log "still trying to download from $2 (${waited}s): a connection attempt gives up after ${3}s and is retried; Ctrl-C stops"
+  done
+}
+
+fetch() { # fetch URL FILE: https only, whichever downloader is there; a connection attempt gives up after K3_CONNECT_TIMEOUT s (15)
   case "$1" in https://*) ;; *) return 1 ;; esac
+  secs=${K3_CONNECT_TIMEOUT:-15}
+  case "$secs" in '' | *[!0-9]* | 0) secs=15 ;; esac
+  site=${1#https://}
+  site=${site%%/*}
+  fetch_still_trying "$$" "${site##*@}" "$secs" &
+  watcher=$!
+  fetch_rc=0
   if have curl; then
-    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 "$1" -o "$2"
+    curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout "$secs" --retry 3 "$1" -o "$2" || fetch_rc=$?
   else # BusyBox wget (Alpine) has no --https-only and GNU wget applies it only to recursive fetches: the case above is the guard
-    wget -q --tries=3 -O "$2" "$1"
+    wget -q -T "$secs" --tries=3 -O "$2" "$1" || fetch_rc=$? # -T: GNU wget bounds DNS, connect and read with it, BusyBox the read
   fi
+  kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
+  return "$fetch_rc"
 }
 
 ask_tty() { # ask_tty QUESTION: asks on the terminal only, never with --yes; no terminal means no
