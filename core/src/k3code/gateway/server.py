@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import copy
+import dataclasses
 import hashlib
 import hmac
 import json
@@ -74,7 +76,7 @@ from k3code.gateway.protocol import (
     encode_server_request,
     next_request_id,
 )
-from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, StoredSession
+from k3code.gateway.sessions import EMPTY_SESSION_MAX_AGE_S, SessionStore, SessionSummary
 from k3code.goals import MAX_KICKS_PER_WINDOW, GoalManager, make_judge
 from k3code.halt import Halt, clear_halt, load_halt, set_halt
 from k3code.learning.hub import LearningHub
@@ -234,6 +236,7 @@ class LiveSession:
         self.call_started: float | None = None
         self.tool_mark: float | None = None
         self.last_checkpoint = 0.0  # monotonic time of the last mid-turn persist (see GatewayServer._checkpoint_turn)
+        self.checkpoint_task: asyncio.Task[None] | None = None  # the checkpoint write in flight, if any
         self.idle_since = time.monotonic()  # when the last turn ended (the idle sweeper stops netwatch after a while)
         #: Wall-clock start of the latest turn or job (time.time()); the agent view's "working N" counts from it.
         self.turn_started_wall = 0.0
@@ -2174,7 +2177,7 @@ class GatewayServer:
             session.idle_since = time.monotonic()
             # Persist whatever the loop accumulated, also on error and on /stop or shutdown (CancelledError):
             # this used to sit after the try block, which a cancellation skipped, so the whole turn vanished.
-            self._persist_turn(session, loop)
+            await self._persist_turn(session, loop)
             self.learning.record_turn_replay(
                 session,
                 list(loop.turn_messages),
@@ -2235,14 +2238,27 @@ class GatewayServer:
     #: Minimum seconds between mid-turn checkpoints (each one rewrites the session's message list).
     CHECKPOINT_EVERY_S = 3.0
 
-    def _persist_turn(self, session: LiveSession, loop: AgentLoop) -> None:
-        """Write the loop's conversation so far to the session store. Never raises: it runs in ``finally``."""
+    async def _persist_turn(self, session: LiveSession, loop: AgentLoop) -> None:
+        """Write the loop's conversation so far to the session store. Never raises: it runs in ``finally``.
+
+        The JSON encoding and the SQLite write run on the store's writer thread, queued behind any checkpoint still
+        in flight (so a stale checkpoint can never land after this write). Shielded: a cancellation of the turn
+        (``/stop``, shutdown) must not drop the write."""
         try:
-            if loop.turn_messages:
-                session.stored.messages = _serialize_messages(loop.turn_messages)
-                session.stored.model = session.stored.model or self._chain_key or self.config.default_model
-                self.store.save(session.stored)
             session.last_checkpoint = time.monotonic()
+            pending = session.checkpoint_task
+            if pending is not None and not pending.done():
+                await asyncio.wait({pending})  # its write is queued first, so it cannot land after this one
+            if loop.turn_messages:
+                stored = session.stored
+                stored.messages = _serialize_messages(loop.turn_messages)
+                stored.model = stored.model or self._chain_key or self.config.default_model
+                snapshot = dataclasses.replace(
+                    stored, meta=copy.deepcopy(stored.meta), usage=copy.deepcopy(stored.usage)
+                )
+                await asyncio.shield(self.store.save_async(snapshot))
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 - a failed checkpoint must not mask the turn's own outcome
             logger.exception("could not persist the session")
 
@@ -2290,12 +2306,28 @@ class GatewayServer:
         loop.tools.register(advisor.TOOL_SPEC, handler)
 
     def _checkpoint_turn(self, session: LiveSession) -> None:
-        """After a tool result: persist the in-flight turn (throttled) so kill -9, an OOM kill or a reboot loses
-        seconds of work instead of the whole turn."""
+        """After a tool result: persist the in-flight turn (throttled, one at a time, off the event loop) so kill -9,
+        an OOM kill or a reboot loses seconds of work instead of the whole turn."""
         loop = session.loop
-        if loop is None or time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+        if loop is None or not loop.turn_messages:
             return
-        self._persist_turn(session, loop)
+        if time.monotonic() - session.last_checkpoint < self.CHECKPOINT_EVERY_S:
+            return
+        if session.checkpoint_task is not None and not session.checkpoint_task.done():
+            return
+        session.last_checkpoint = time.monotonic()
+        messages = _serialize_messages(loop.turn_messages)
+        session.stored.messages = messages
+        session.stored.model = session.stored.model or self._chain_key or self.config.default_model
+        session.checkpoint_task = asyncio.create_task(
+            self._write_checkpoint(session.session_id, messages, session.stored.model)
+        )
+
+    async def _write_checkpoint(self, session_id: str, messages: list[dict[str, Any]], model: str) -> None:
+        try:
+            await self.store.checkpoint_async(session_id, messages, model)
+        except Exception:  # noqa: BLE001 - the next checkpoint or the end of the turn writes it again
+            logger.exception("could not checkpoint the session")
 
     async def _maybe_compact(self, session: LiveSession, *, force: bool = False) -> int:
         """Fold the older part of the conversation into a summary once it is large; returns how many messages folded.
@@ -2734,15 +2766,23 @@ class GatewayServer:
 
     def prune_retention(self, *, now: float | None = None) -> dict[str, int]:
         """Daemon start: usage rows past ``retention.usage_days``, journal files of sessions that are not live and not
-        written for ``retention.journal_days``, learning decisions past ``retention.decisions_days`` (debug bundles
-        are pruned as each is written)."""
+        written for ``retention.journal_days`` (the oldest ones beyond ``retention.journal_mb`` too), learning decisions
+        past ``retention.decisions_days`` (debug bundles are pruned as each is written)."""
         keep = retention(self.config)
         rows = self.usage.prune(keep["usage_days"], now=now)
         files = prune_journals(
-            self._home(), keep=lambda sid: sid in self.live, max_age_s=keep["journal_days"] * 86400, now=now
+            self._home(),
+            keep=lambda sid: sid in self.live,
+            max_age_s=keep["journal_days"] * 86400,
+            max_bytes=keep["journal_mb"] * 1024 * 1024,
+            now=now,
         )
         decisions = self.learning.log.prune(keep["decisions_days"])
         return {"usage_rows": rows, "journal_files": files, "decisions": decisions}
+
+    def compact_storage(self) -> int:
+        """Daemon start: return the pages that deleted transcripts left in ``sessions.db`` to the filesystem."""
+        return self.store.compact()
 
     async def resume_goals(self) -> int:
         """Boot: continue each goal that was active, or paused by a graceful stop, when the daemon last ran.
@@ -3212,7 +3252,7 @@ async def _session_create(server: GatewayServer, params: dict[str, Any]) -> dict
 _SESSION_LIST_SCAN_CAP = 2000
 
 
-def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[StoredSession]:
+def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[SessionSummary]:
     """The ``limit`` newest non-empty, non-automation sessions whose normalised cwd is ``cwd`` (already normalised)."""
     spelled: dict[str, str | None] = {}  # one realpath per distinct stored spelling
     ids: list[str] = []
@@ -3223,7 +3263,7 @@ def _project_sessions(server: GatewayServer, cwd: str, limit: int) -> list[Store
             ids.append(sid)
             if len(ids) >= limit:
                 break
-    return [s for s in map(server.store.get, ids) if s is not None]
+    return server.store.summaries(ids)
 
 
 async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[str, Any]:
@@ -3234,20 +3274,16 @@ async def _session_list(server: GatewayServer, params: dict[str, Any]) -> dict[s
     sessions = _project_sessions(server, cwd, max(1, limit)) if cwd else server.store.list(limit=limit)
     rows = []
     for s in sessions:
-        preview = ""
-        for m in s.messages:
-            if m.get("role") == "user" and m.get("content"):
-                preview = str(m["content"])[:120]
-                break
+        preview = s.preview
         live = server.live.get(s.session_id)
-        state = live.state if live is not None else ("completed" if s.messages else "new")
+        state = live.state if live is not None else ("completed" if s.message_count else "new")
         rows.append(
             {
                 "id": s.session_id,
                 "title": s.title or preview or "Session",
                 "preview": preview,
                 "started_at": s.created_at,
-                "message_count": len(s.messages),
+                "message_count": s.message_count,
                 "status": state,
                 "state": state,
                 "cwd": _norm_cwd(s.cwd),

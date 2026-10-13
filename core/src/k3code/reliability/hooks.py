@@ -12,6 +12,7 @@ has, using the ``reliability.*`` / ``net.state`` kinds from
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -293,6 +294,14 @@ class Reliability:
             os.replace(tmp, path)
         except OSError as e:
             logger.debug("transcript not saved (%s)", e)
+
+    def clear_transcript(self) -> None:
+        """A turn that ended cleanly has nothing left to resume: the session store holds the conversation."""
+        path = self._transcript_path()
+        if path is None:
+            return
+        with contextlib.suppress(OSError):
+            path.unlink()
 
     def load_transcript(self) -> list[Message] | None:
         path = self._transcript_path()

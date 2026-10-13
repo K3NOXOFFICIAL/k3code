@@ -230,27 +230,52 @@ def delete_session_journal(home: Path, session: str) -> int:
 
 
 def prune_journals(
-    home: Path, *, keep: Callable[[str], bool], max_age_s: float = JOURNAL_MAX_AGE_S, now: float | None = None
+    home: Path,
+    *,
+    keep: Callable[[str], bool],
+    max_age_s: float = JOURNAL_MAX_AGE_S,
+    max_bytes: int | None = None,
+    now: float | None = None,
 ) -> int:
     """Remove journal files not written for ``max_age_s`` whose session is not ``keep(session)`` (live, in use).
 
-    Every session (and every ``k3code -p`` run) leaves an fsync'd jsonl here and nothing removed it. Returns files
-    removed."""
+    Every session (and every ``k3code -p`` run) leaves an fsync'd jsonl here and nothing removed it. When the files
+    left still add up to more than ``max_bytes``, the oldest closed ones go until they fit. Returns files removed."""
     jdir = home / "journal"
     if not jdir.is_dir():
         return 0
     cutoff = (time.time() if now is None else now) - max_age_s
     removed = 0
+    left: list[tuple[float, int, Path]] = []  # closed files that survived the age check: (mtime, size, path)
+    total = 0
     for path in jdir.iterdir():
         sid = _session_of(path.name)
-        if sid is None or keep(sid):
+        if sid is None:
             continue
         try:
-            if path.is_file() and path.stat().st_mtime < cutoff:
+            if not path.is_file():
+                continue
+            st = path.stat()
+            if keep(sid):
+                total += st.st_size
+            elif st.st_mtime < cutoff:
                 path.unlink()
                 removed += 1
+            else:
+                total += st.st_size
+                left.append((st.st_mtime, st.st_size, path))
         except FileNotFoundError:
             continue
+    if max_bytes is not None:
+        for _mtime, size, path in sorted(left):
+            if total <= max_bytes:
+                break
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+            total -= size
+            removed += 1
     return removed
 
 

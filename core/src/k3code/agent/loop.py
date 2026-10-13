@@ -355,6 +355,8 @@ class AgentLoop:
                     if self._guard_assistant("".join(text_parts), messages):
                         for stop_event in self._stop_for_input(messages):
                             yield stop_event
+                    else:
+                        self.reliability.clear_transcript()
                     return
             elif self.interrupted:
                 # Stream aborted without a final message (e.g. interrupt during
@@ -397,7 +399,6 @@ class AgentLoop:
                         name=tc.name,
                     )
                     messages.append(tool_msg)
-                    self.reliability.save_transcript(messages)
                     # Yield the tool result as a stream event
                     yield StreamEvent(type="done", message=tool_msg)
                     failure = self._observe_result(tc, result, notes)
@@ -414,7 +415,12 @@ class AgentLoop:
                             for stop_event in self._stop_for_tool_errors(messages):
                                 yield stop_event
                         self.turn_messages = messages
+                        self.reliability.save_transcript(messages)
                         return
+
+                # one write per batch: rewriting the whole conversation after every result made N results cost N full
+                # serialisations of an ever-growing transcript
+                self.reliability.save_transcript(messages)
 
             messages.extend(notes)
             self.turn_messages = messages
