@@ -138,6 +138,83 @@ describe("chalk level at load", () => {
   });
 });
 
+describe("NO_COLOR", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  async function loadWith(noColor: string | undefined) {
+    vi.resetModules();
+
+    for (const key of ["COLORTERM", "FORCE_COLOR", "NO_COLOR", "TMUX"]) {
+      vi.stubEnv(key, undefined);
+    }
+
+    if (noColor !== undefined) {
+      vi.stubEnv("NO_COLOR", noColor);
+    }
+
+    const { default: chalk } = await import("chalk");
+
+    chalk.level = 3;
+
+    const colorize = await import("./colorize.js");
+    const screen = await import("./screen.js");
+
+    return { chalk, ...colorize, ...screen };
+  }
+
+  it("emits no colour SGR for any colour format when NO_COLOR is set", async () => {
+    const { applyTextStyles, colorize } = await loadWith("1");
+
+    for (const color of [
+      "ansi:red",
+      "ansi:blueBright",
+      "#ff6ab4",
+      "rgb(255,105,180)",
+      "ansi256(173)",
+    ]) {
+      expect(colorize("x", color, "foreground")).toBe("x");
+      expect(colorize("x", color, "background")).toBe("x");
+    }
+
+    expect(
+      applyTextStyles("x", { color: "#ff6ab4", backgroundColor: "ansi:red" }),
+    ).toBe("x");
+  });
+
+  it("keeps bold, dim and inverse when NO_COLOR is set", async () => {
+    const { applyTextStyles } = await loadWith("1");
+
+    expect(
+      applyTextStyles("x", { bold: true, color: "#ff6ab4", inverse: true }),
+    ).toBe("\u001b[1m\u001b[7mx\u001b[27m\u001b[22m");
+    expect(applyTextStyles("x", { dim: true })).toBe("\u001b[2mx\u001b[22m");
+  });
+
+  it("keeps the search-match overlay free of colour", async () => {
+    const { StylePool } = await loadWith("1");
+    const pool = new StylePool();
+    const id = pool.withCurrentMatch(pool.none);
+
+    const sgr = pool.transition(pool.none, id);
+
+    expect(sgr).not.toContain("\u001b[33m");
+    expect(sgr).toContain("\u001b[7m");
+  });
+
+  it("still colours when NO_COLOR is unset or empty", async () => {
+    for (const value of [undefined, ""]) {
+      const { colorize } = await loadWith(value);
+
+      expect(colorize("x", "#ff6ab4", "foreground")).toBe(
+        "\u001b[38;2;255;106;180mx\u001b[39m",
+      );
+    }
+  });
+});
+
 describe("shouldUseRichEightBitDowngradeForLegacyAppleTerminal", () => {
   it("uses Rich-compatible 256-color downgrade on legacy Apple Terminal", () => {
     expect(
