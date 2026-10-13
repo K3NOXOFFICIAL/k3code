@@ -508,6 +508,8 @@ class AgentLoop:
         decision = self.permissions.decide(tool_call.name, args, headless=self.headless)
         if decision.action == "deny":  # hardline and deny rules: no hook can turn these into an allow
             return {"error": decision.message or f"Permission denied: {tool_call.name}"}
+        if decision.always_ask and (self.background or self.unattended):  # nobody is there to confirm it
+            return {"error": f"Permission denied (unattended run): {decision.message}"}
         # the bwrap probe behind _home_rooted runs a subprocess: off the event loop, like _sandbox_argv below
         home_rooted = tool_call.name == "bash" and await asyncio.to_thread(self._home_rooted)
         if home_rooted:

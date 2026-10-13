@@ -231,7 +231,7 @@ def repo_summary(cwd: Path, *, max_files: int = 5000) -> str:
     top = ", ".join(f"{e}×{n}" for e, n in sorted(exts.items(), key=lambda kv: -kv[1])[:5]) or "none"
     try:
         # harness git: hooks and fsmonitor off, scrubbed env (the repo may hold a hook a sandboxed command wrote)
-        from k3code.reliability.sandbox import child_env, harness_git_argv
+        from k3code.reliability.sandbox import harness_git_argv, harness_git_env
 
         out = subprocess.run(
             harness_git_argv("status", "--porcelain"),
@@ -239,7 +239,7 @@ def repo_summary(cwd: Path, *, max_files: int = 5000) -> str:
             capture_output=True,
             text=True,
             timeout=5,
-            env=child_env(),
+            env=harness_git_env(),
             stdin=subprocess.DEVNULL,
         )
         git = f"{len(out.stdout.splitlines())} changed files" if out.returncode == 0 else "not a git repo"
