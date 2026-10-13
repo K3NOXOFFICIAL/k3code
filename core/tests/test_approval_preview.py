@@ -89,9 +89,14 @@ def _write_a_txt() -> ToolCall:
     return ToolCall(id="w", name="write", arguments={"path": "a.txt", "content": "new\n"})
 
 
+def _read_a_txt() -> ToolCall:
+    # write refuses an existing file that was not read first (stale-write guard)
+    return ToolCall(id="r", name="read", arguments={"path": "a.txt"})
+
+
 async def test_the_approval_frame_carries_the_preview(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "a.txt").write_text("old\n")
-    server, _ = make_server(tmp_path, [_write_a_txt(), "ok"], monkeypatch)  # default mode: a write asks
+    server, _ = make_server(tmp_path, [_read_a_txt(), _write_a_txt(), "ok"], monkeypatch)  # default mode: a write asks
     await call(server, "session.create", {"cwd": str(tmp_path)})
     seen = await run_turn(server, "go", [{"choice": "once"}])
     assert len(seen) == 1 and seen[0]["params"]["command"] == "write a.txt"
@@ -105,7 +110,7 @@ async def test_a_preview_that_fails_never_blocks_the_prompt(tmp_path: Path, monk
 
     monkeypatch.setattr(preview_mod, "change_preview", broken)
     (tmp_path / "a.txt").write_text("old\n")
-    server, _ = make_server(tmp_path, [_write_a_txt(), "ok"], monkeypatch)
+    server, _ = make_server(tmp_path, [_read_a_txt(), _write_a_txt(), "ok"], monkeypatch)
     await call(server, "session.create", {"cwd": str(tmp_path)})
     seen = await run_turn(server, "go", [{"choice": "once"}])
     # the person is still asked, just without a diff, and their answer still applies
