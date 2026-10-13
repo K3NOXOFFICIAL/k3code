@@ -1,5 +1,5 @@
 import { Box, Text, useInput, wrapAnsi } from "@k3code/ink";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { isMac } from "../lib/platform.js";
 import { clarifyBatchRevisitState } from "../lib/text.js";
@@ -38,16 +38,25 @@ export function approvalOptions(req: ApprovalReq): readonly ApprovalChoice[] {
 }
 
 type ApprovalKey = {
+  ctrl?: boolean;
   downArrow?: boolean;
   escape?: boolean;
+  isPasted?: boolean;
+  meta?: boolean;
   return?: boolean;
   upArrow?: boolean;
 };
 
 type ApprovalAction =
+  | { kind: "arm" }
   | { kind: "choose"; choice: ApprovalChoice }
+  | { kind: "disarm" }
   | { kind: "move"; delta: -1 | 1 }
   | { kind: "noop" };
+
+// Any character outside the C0/C1 control ranges.
+// eslint-disable-next-line no-control-regex
+const TEXT_RE = /[^\x00-\x1f\x7f-\x9f]/;
 
 /**
  * Pure key-dispatch for the approval prompt — exported so the regression
@@ -57,35 +66,56 @@ type ApprovalAction =
  *
  * Esc and number keys both terminate the prompt; Esc maps to deny (parity
  * with the global Ctrl+C handler that already calls cancelOverlayFromCtrlC
- * for approvals).  Numbers 1..opts.length pick the labelled choice.  Enter
- * confirms the current selection.  ↑/↓ moves the selection within bounds.
+ * for approvals).  One typed digit 1..opts.length picks the labelled choice.
+ * Enter confirms the current selection.  ↑/↓ moves the selection within
+ * bounds.
+ *
+ * The prompt takes every key while it is open, so text typed for the
+ * composer lands here.  Any other text, a paste or a typing burst ("3 tests
+ * failed" arrives as one string) disarms the prompt: until ↑/↓ re-arm it,
+ * Enter and the allow digits do nothing and only deny answers.
  */
 export function approvalAction(
   ch: string,
   key: ApprovalKey,
   sel: number,
   opts: readonly ApprovalChoice[] = APPROVAL_OPTS,
+  disarmed = false,
 ): ApprovalAction {
   if (key.escape) {
     return { kind: "choose", choice: "deny" };
   }
 
-  const n = parseInt(ch, 10);
+  const n = !key.isPasted && /^\d$/.test(ch) ? Number(ch) : NaN;
 
   if (n >= 1 && n <= opts.length) {
-    return { kind: "choose", choice: opts[n - 1]! };
+    const choice = opts[n - 1]!;
+
+    return disarmed && choice !== "deny"
+      ? { kind: "noop" }
+      : { kind: "choose", choice };
   }
 
   if (key.return) {
-    return { kind: "choose", choice: opts[sel]! };
+    return disarmed ? { kind: "noop" } : { kind: "choose", choice: opts[sel]! };
   }
 
-  if (key.upArrow && sel > 0) {
-    return { kind: "move", delta: -1 };
+  if (key.upArrow || key.downArrow) {
+    const delta = key.upArrow ? -1 : 1;
+    const next = sel + delta;
+
+    if (next >= 0 && next < opts.length) {
+      return { kind: "move", delta };
+    }
+
+    return disarmed ? { kind: "arm" } : { kind: "noop" };
   }
 
-  if (key.downArrow && sel < opts.length - 1) {
-    return { kind: "move", delta: 1 };
+  if (
+    key.isPasted ||
+    (Number.isNaN(n) && !key.ctrl && !key.meta && TEXT_RE.test(ch))
+  ) {
+    return { kind: "disarm" };
   }
 
   return { kind: "noop" };
@@ -97,17 +127,40 @@ export function ApprovalPrompt({
   req,
   t,
 }: ApprovalPromptProps) {
-  const [sel, setSel] = useState(0);
+  const [view, setView] = useState({ disarmed: false, sel: 0 });
+  // Ink handles all keys of one stdin read in one batch, before a re-render,
+  // so the handler reads and writes this ref: "x" then Enter in one read must
+  // see the prompt already disarmed, ↓ then Enter the moved selection.
+  const live = useRef(view);
+  const { disarmed, sel } = view;
   const opts = approvalOptions(req);
 
-  useInput((ch, key) => {
-    const action = approvalAction(ch, key, sel, opts);
+  useInput((ch, key, event) => {
+    const cur = live.current;
+
+    const action = approvalAction(
+      ch,
+      { ...key, isPasted: Boolean(event.keypress.isPasted) },
+      cur.sel,
+      opts,
+      cur.disarmed,
+    );
 
     if (action.kind === "choose") {
       onChoice(action.choice);
-    } else if (action.kind === "move") {
-      setSel((s) => s + action.delta);
+
+      return;
     }
+
+    if (action.kind === "noop") {
+      return;
+    }
+
+    live.current =
+      action.kind === "move"
+        ? { disarmed: false, sel: cur.sel + action.delta }
+        : { ...cur, disarmed: action.kind === "disarm" };
+    setView(live.current);
   });
 
   // Wrap long single-line commands to the panel width instead of clipping the
@@ -160,10 +213,16 @@ export function ApprovalPrompt({
         </Text>
       ))}
 
-      <Text color={t.color.muted}>
-        ↑/↓ select · Enter confirm · 1-{opts.length} quick pick · Esc/Ctrl+C
-        deny
-      </Text>
+      {disarmed ? (
+        <Text color={t.color.warn}>
+          typed text ignored · ↑/↓ to choose again · Esc/Ctrl+C deny
+        </Text>
+      ) : (
+        <Text color={t.color.muted}>
+          ↑/↓ select · Enter confirm · 1-{opts.length} quick pick · Esc/Ctrl+C
+          deny
+        </Text>
+      )}
     </Box>
   );
 }

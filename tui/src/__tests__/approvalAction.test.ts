@@ -81,9 +81,19 @@ describe("approvalAction — pure key dispatch for ApprovalPrompt", () => {
     });
   });
 
-  it("returns noop for unrelated keystrokes (printable letters etc.)", () => {
-    expect(approvalAction("a", {}, 0)).toEqual({ kind: "noop" });
-    expect(approvalAction(" ", {}, 0)).toEqual({ kind: "noop" });
+  it("disarms on typed text instead of letting it pass silently", () => {
+    // A letter, a space or any other printable key is not an answer; it
+    // disarms the prompt so the Enter that usually follows cannot approve.
+    expect(approvalAction("a", {}, 0)).toEqual({ kind: "disarm" });
+    expect(approvalAction(" ", {}, 0)).toEqual({ kind: "disarm" });
+    expect(approvalAction("é", {}, 0)).toEqual({ kind: "disarm" });
+  });
+
+  it("does not disarm on keys that carry no text", () => {
+    expect(approvalAction("", {}, 0)).toEqual({ kind: "noop" });
+    expect(approvalAction("\t", {}, 0)).toEqual({ kind: "noop" });
+    expect(approvalAction("x", { ctrl: true }, 0)).toEqual({ kind: "noop" });
+    expect(approvalAction("x", { meta: true }, 0)).toEqual({ kind: "noop" });
   });
 
   it("respects a reduced option set when permanent allow is disabled", () => {
@@ -119,6 +129,56 @@ describe("approvalAction — pure key dispatch for ApprovalPrompt", () => {
       choice: "deny",
     });
     expect(approvalAction("3", {}, 0, opts)).toEqual({ kind: "noop" });
+  });
+
+  it("quick-picks only on one typed digit, never on a burst or a paste", () => {
+    // A buffered typing burst and a bracketed paste reach useInput as one
+    // string; reading its leading digit would answer the prompt.
+    expect(approvalAction("3 tests failed", {}, 0)).toEqual({
+      kind: "disarm",
+    });
+    expect(approvalAction("2nd try", {}, 0)).toEqual({ kind: "disarm" });
+    expect(approvalAction("1", { isPasted: true }, 0)).toEqual({
+      kind: "disarm",
+    });
+    expect(approvalAction("", { isPasted: true }, 0)).toEqual({
+      kind: "disarm",
+    });
+  });
+
+  it("disarmed: Enter and allow digits do nothing, deny still works", () => {
+    expect(approvalAction("", { return: true }, 0, undefined, true)).toEqual({
+      kind: "noop",
+    });
+    expect(approvalAction("1", {}, 0, undefined, true)).toEqual({
+      kind: "noop",
+    });
+    expect(approvalAction("3", {}, 0, undefined, true)).toEqual({
+      kind: "noop",
+    });
+    expect(approvalAction("4", {}, 0, undefined, true)).toEqual({
+      kind: "choose",
+      choice: "deny",
+    });
+    expect(approvalAction("", { escape: true }, 0, undefined, true)).toEqual({
+      kind: "choose",
+      choice: "deny",
+    });
+    expect(approvalAction("d", {}, 0, undefined, true)).toEqual({
+      kind: "disarm",
+    });
+  });
+
+  it("disarmed: ↑/↓ re-arm, also at the edges", () => {
+    expect(approvalAction("", { downArrow: true }, 0, undefined, true)).toEqual(
+      { kind: "move", delta: 1 },
+    );
+    expect(approvalAction("", { upArrow: true }, 0, undefined, true)).toEqual({
+      kind: "arm",
+    });
+    expect(approvalAction("", { downArrow: true }, 3, undefined, true)).toEqual(
+      { kind: "arm" },
+    );
   });
 
   it("uses explicit gateway choices as the prompt contract", () => {
