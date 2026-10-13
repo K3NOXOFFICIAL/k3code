@@ -132,6 +132,19 @@ def test_openai_usage_reports_cached_tokens():
     assert (u.cache_read_tokens, u.cache_creation_tokens) == (80, 0)
 
 
+def test_omniroute_cache_writes_are_parsed_and_counted_in_prompt_tokens():
+    # OmniRoute's claude-to-openai translator: prompt_tokens = input + cache read, writes only in the details (#129)
+    from k3code.providers.openai_compat import _parse_usage
+
+    details = {"cached_tokens": 90000, "cache_creation_tokens": 10000, "cache_creation_in_prompt": False}
+    u = _parse_usage({"prompt_tokens": 90005, "completion_tokens": 300, "prompt_tokens_details": details})
+    assert (u.prompt_tokens, u.cache_read_tokens, u.cache_creation_tokens) == (100005, 90000, 10000)
+    # without the flag the writes are taken to be part of prompt_tokens already
+    details = {"cached_tokens": 90000, "cache_creation_tokens": 10000}
+    u = _parse_usage({"prompt_tokens": 100005, "completion_tokens": 300, "prompt_tokens_details": details})
+    assert (u.prompt_tokens, u.cache_read_tokens, u.cache_creation_tokens) == (100005, 90000, 10000)
+
+
 def test_usage_db_records_cache_tokens_and_migrates_an_old_database(tmp_path):
     path = tmp_path / "usage.db"
     old = sqlite3.connect(path)
