@@ -78,6 +78,7 @@ class ToolJournal:
         ensure_private_dir(self.dir)  # tool args and results: 0700/0600 whatever the umask
         self.path = self.dir / f"{session}.jsonl"
         self._fh = private_file(self.path).open("a", encoding="utf-8")
+        self._pure: set[str] = set()  # in-flight side-effect-free call ids: their records are not fsync'd
 
     def close(self) -> None:
         if self._fh and not self._fh.closed:
@@ -97,7 +98,10 @@ class ToolJournal:
         """Append + fsync an ``intent`` record before the tool runs.
 
         Raw args are kept only for side-effect-free tools (re-run verbatim on resume). A side-effect tool is never
-        re-run, only reported INTERRUPTED, so its args (file contents, commands with tokens) stay out of the file."""
+        re-run, only reported INTERRUPTED, so its args (file contents, commands with tokens) stay out of the file.
+
+        Only a side-effect intent is fsync'd: resume acts on those alone, and a pure call lost to a crash is simply
+        asked again. A gathered batch of reads no longer blocks the loop on one fsync per call."""
         h = args_digest(args)
         rec = {
             "type": "intent",
@@ -111,24 +115,31 @@ class ToolJournal:
         if raw_args and not side_effect:
             # Store args for pure tools so they can be re-run verbatim on resume.
             rec["args"] = args
-        self._append(rec)
+        if side_effect:
+            self._pure.discard(call_id)
+        else:
+            self._pure.add(call_id)
+        self._append(rec, durable=side_effect)
         return rec["ts"]
 
     def record_done(self, call_id: str, result: Any) -> None:
-        """Append a ``done`` record with a result digest."""
+        """Append a ``done`` record with a result digest (fsync'd unless the call was side-effect-free)."""
         self._append(
             {
                 "type": "done",
                 "id": call_id,
                 "digest": result_digest(result),
                 "ts": time.time(),
-            }
+            },
+            durable=call_id not in self._pure,
         )
+        self._pure.discard(call_id)
 
-    def _append(self, rec: dict[str, Any]) -> None:
+    def _append(self, rec: dict[str, Any], *, durable: bool = True) -> None:
         self._fh.write(json.dumps(rec, default=str) + "\n")
         self._fh.flush()
-        os.fsync(self._fh.fileno())
+        if durable:
+            os.fsync(self._fh.fileno())
 
     # ── resume ──
 
