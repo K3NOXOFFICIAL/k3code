@@ -274,9 +274,11 @@ The following commands are handled directly by the TUI client. Unrecognized comm
 ### Session (`session.ts`)
 
 `/model`, `/sessions` (aliases `/switch`, `/session`, `/resume`),
-`/bg`, `/btw`, `/image`, `/personality`,
-`/compress`, `/branch` (alias `/fork`), `/voice`, `/skin`,
-`/indicator`, `/yolo`, `/reasoning`, `/fast`, `/busy`, `/verbose`, `/usage`
+`/image`, `/theme`, `/pet`, `/indicator`, `/yolo`, `/reasoning`, `/busy`,
+`/usage`
+
+`/bg`, `/branch`, `/fork` and `/compact` (alias `/compress`) are not TUI
+commands: they run in the Python gateway through `slash.exec`.
 
 ### Tune (`tune.ts`)
 
