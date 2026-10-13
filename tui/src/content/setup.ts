@@ -8,13 +8,13 @@ export const buildSetupRequiredSections = (): PanelSection[] => [
   },
   {
     rows: [
-      ["/setup", "run the first-time setup wizard in-place (adds a provider)"],
+      [
+        "/setup",
+        "run `k3code onboard` in-place: fast setup asks only for an endpoint and key",
+      ],
       ["/model", "pick a model (needs a session — add a provider first)"],
-      ["Ctrl+C", "exit and run `k3code setup` manually"],
+      ["Ctrl+C", "exit and run `k3code onboard` manually"],
     ],
     title: "Actions",
-  },
-  {
-    text: "In the dashboard the Models page sets the profile default; on Desktop it is Settings -> Models.",
   },
 ];

@@ -542,6 +542,21 @@ def test_doctor_clears_a_providers_auth_cooldown_when_its_key_answers(monkeypatc
     assert left.reason_of(provider="bad", model="m") is FailoverReason.auth
 
 
+def test_no_provider_check_points_at_onboard(monkeypatch, tmp_path):
+    """First-run guidance names one command: an empty config told people to hand-edit config.yaml while the README,
+    the installer and the headless hint all say `k3code onboard`."""
+    import asyncio
+
+    from k3code import doctor
+    from k3code.config import Settings
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path))
+    (chk,) = asyncio.run(doctor.check_providers(Settings()))
+    assert chk.status == doctor.FAIL and chk.detail == "no providers configured"
+    assert "`k3code onboard`" in chk.fix
+    assert "config.yaml" not in chk.fix
+
+
 async def test_setup_status_reports_safe_mode_to_doctor():
     from k3code.gateway.server import GatewayServer, _setup_status
 
