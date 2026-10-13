@@ -351,6 +351,26 @@ async def test_grep_falls_back_to_the_filtered_python_search_when_rg_cannot_star
     assert "sk-dotenv-secret" not in res["matches"] and "sk-local-secret" not in res["matches"]
 
 
+async def test_a_cancelled_grep_does_not_leave_rg_running(temp_dir, monkeypatch):
+    import k3code.tools as tools
+
+    started: list[asyncio.subprocess.Process] = []
+    real = asyncio.create_subprocess_exec
+
+    async def spawn(*cmd, **kwargs):
+        started.append(await real(*cmd, **kwargs))
+        return started[-1]
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    task = asyncio.create_task(tools._run_rg(["sleep", "30"], temp_dir, temp_dir, named=True))  # an rg that hangs
+    while not started:
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.wait_for(started[0].wait(), timeout=5) is not None
+
+
 _HOME_SECRETS = {
     ".ssh/id_ed25519": "API_KEY ssh-private-key",
     ".aws/credentials": "API_KEY aws_secret_access_key",
@@ -394,6 +414,48 @@ async def test_grep_of_home_from_a_project_in_it_never_searches_the_key_director
         assert secret not in res["matches"]
     # rg pruned the key directories: no file in them came back for the result filter to drop
     assert not [p for p in reached if any(d in p for d in ("/.ssh", "/.aws", "/.config/k3code"))], reached
+
+
+async def test_grep_checks_a_file_name_that_holds_a_newline_as_one_name(temp_dir, rg, monkeypatch):
+    # rg prints a newline in a file name as it is, so the name came in two lines: the part before the newline passed
+    # unchecked, the part after it named no real file. Here `proj/a<newline>b` is a symlink to the home directory.
+    home = _fake_home(temp_dir, monkeypatch)
+    proj = home / "proj"
+    (proj / "a\nb").symlink_to(home)
+    (proj / "x\ny.py").write_text("API_KEY = 2\n")
+    res = await tool_grep({"pattern": "API_KEY", "path": str(proj / "a\nb")}, cwd=proj)
+    for secret in ("ssh-private-key", "aws_secret_access_key", "sk-daemon-env"):
+        assert secret not in res["matches"]
+    assert "API_KEY rotate me" in res["matches"]
+    found = (await tool_grep({"pattern": "API_KEY", "path": "."}, cwd=proj))["matches"]
+    assert "x\ny.py\n1:API_KEY = 2" in found and "app.py\n1:API_KEY = 1" in found  # a newline name still shows
+
+
+async def test_grep_through_a_symlink_to_home_never_searches_the_key_directories(temp_dir, rg, monkeypatch):
+    # the search root is inside the project by its path but is the home directory by its realpath: the credential
+    # excludes are built where rg really searches
+    import k3code.tools as tools
+
+    home = _fake_home(temp_dir, monkeypatch)
+    (home / "proj" / "link").symlink_to(home)
+    reached: list[str] = []
+    real = tools.sensitive_path
+    monkeypatch.setattr(tools, "sensitive_path", lambda p: reached.append(p) or real(p))
+    link = str(home / "proj" / "link")  # absolute: a relative path is resolved before the search, this one is not
+    res = await tool_grep({"pattern": "API_KEY", "path": link, "include": "*"}, cwd=home / "proj")
+    assert "API_KEY rotate me" in res["matches"]
+    assert not [p for p in reached if any(d in p for d in ("/.ssh", "/.aws", "/.config/k3code"))], reached
+
+
+async def test_grep_skips_dependency_folders_when_the_project_itself_sits_under_a_skipped_name(temp_dir, rg):
+    # only the part of the path below the session's directory says whether the search is inside node_modules on purpose
+    proj = temp_dir / ".cache" / "proj"
+    (proj / "src").mkdir(parents=True)
+    (proj / "node_modules" / "m").mkdir(parents=True)
+    (proj / "src" / "a.js").write_text("NEEDLE src\n")
+    (proj / "node_modules" / "m" / "i.js").write_text("NEEDLE dep\n")
+    res = await tool_grep({"pattern": "NEEDLE"}, cwd=proj)
+    assert "src/a.js" in res["matches"] and "node_modules" not in res["matches"]
 
 
 async def test_grep_drops_a_sensitive_file_even_when_rg_reaches_it(temp_dir, rg, monkeypatch):

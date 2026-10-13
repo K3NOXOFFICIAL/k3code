@@ -164,6 +164,38 @@ async def test_glob_caps_its_results_and_says_so(tmp_path, no_git_env):
     assert format_tool_result(res).endswith(f"[{res['note']}]")
 
 
+async def test_a_bare_star_reads_one_directory_not_the_tree(tmp_path, no_git_env, monkeypatch):
+    # a listing of /usr walked all of it until the time budget ran out and then showed only part of the top level
+    import k3code.tools as tools
+
+    _tree(tmp_path)
+    monkeypatch.setattr(tools, "SEARCH_BUDGET_S", -1.0)  # no time for a walk: one directory read needs none
+    res = await tool_glob({"pattern": "*"}, cwd=tmp_path)
+    assert res["files"] == [".claude", "README.md", "pkg", "src"] and "note" not in res  # the walk's skips hold
+
+
+async def test_a_broad_glob_stops_after_a_bounded_number_of_matches(tmp_path, no_git_env, monkeypatch):
+    import k3code.tools as tools
+
+    many = tmp_path / "many"
+    many.mkdir()
+    for i in range(5 * MAX_SEARCH_RESULTS):
+        (many / f"f{i:05d}.txt").write_text("")
+    pulled = 0
+    real = tools._iter_tree
+
+    def counting(*args, **kwargs):
+        nonlocal pulled
+        for item in real(*args, **kwargs):
+            pulled += 1
+            yield item
+
+    monkeypatch.setattr(tools, "_iter_tree", counting)
+    res = await tool_glob({"pattern": "*.txt"}, cwd=tmp_path)
+    assert len(res["files"]) == MAX_SEARCH_RESULTS and "truncated" in res["note"]
+    assert pulled < 4 * MAX_SEARCH_RESULTS + 10, pulled  # it stopped reading the tree
+
+
 async def test_glob_and_the_grep_fallback_run_off_the_event_loop(tmp_path, no_git_env, monkeypatch):
     _tree(tmp_path)
     ran: list[str] = []
