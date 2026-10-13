@@ -17,6 +17,22 @@ describe("applyDisplay", () => {
     resetUiState();
   });
 
+  it("reads /autocompact from the context section, and a failed poll keeps what it knew", () => {
+    applyDisplay(
+      { config: { context: { compact_at_tokens: 120_000 }, display: {} } },
+      vi.fn(),
+    );
+    expect($uiState.get().autocompact).toBe("120k");
+
+    applyDisplay(null, vi.fn());
+    expect($uiState.get().autocompact).toBe("120k");
+
+    applyDisplay({ config: { context: { autocompact: false } } }, vi.fn());
+    expect($uiState.get().autocompact).toBe("off");
+    applyDisplay({ config: { display: {} } }, vi.fn());
+    expect($uiState.get().autocompact).toBe("auto");
+  });
+
   it("fans every display flag out to $uiState and the bell callback", () => {
     const setBell = vi.fn();
 

@@ -130,6 +130,8 @@ export interface ConfigApprovalsConfig {
 export interface ConfigFullResponse {
   config?: {
     approvals?: ConfigApprovalsConfig;
+    /** `/autocompact` lives here: `autocompact`, `compact_at_tokens`, `compact_at_ratio`. */
+    context?: Record<string, unknown>;
     display?: ConfigDisplayConfig;
     paste_collapse_threshold?: number;
     paste_collapse_char_threshold?: number;

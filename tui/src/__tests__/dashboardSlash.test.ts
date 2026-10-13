@@ -46,6 +46,7 @@ describe("/dashboard and /display", () => {
     ["/dashboard details", "details"],
     ["/display Input", "input"],
     ["/dashboard 2", "details"],
+    ["/dashboard context", "context"],
   ])("%j opens the popup on %s and nothing else", (line, tab) => {
     const ctx = buildCtx();
 
@@ -62,7 +63,7 @@ describe("/dashboard and /display", () => {
     run(ctx, "/dashboard colours");
     expect(getOverlayState().dashboard).toBeNull();
     expect(ctx.transcript.sys).toHaveBeenCalledWith(
-      "usage: /dashboard [look|details|input]",
+      "usage: /dashboard [look|details|input|context]",
     );
   });
 

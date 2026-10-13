@@ -170,6 +170,8 @@ export interface TranscriptRow {
 }
 
 export interface UiState {
+  /** `/autocompact` as saved: `auto`, `off`, a limit (`120k`) or a share of the window (`65%`). */
+  autocompact: string;
   battery: boolean;
   batteryStatus: BatteryInfo | null;
   bgTasks: Set<string>;

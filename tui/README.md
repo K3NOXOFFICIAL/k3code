@@ -210,7 +210,7 @@ Notes:
 | Tune popup                  | `Esc`, `Ctrl+C`     | Close without applying                            |
 | Dashboard (`/dashboard`)    | `Up/Down`           | Move between rows                                 |
 | Dashboard popup             | `Left/Right`        | Change the row's value                            |
-| Dashboard popup             | `Tab`, `1-3`        | Change tab                                        |
+| Dashboard popup             | `Tab`, `1-4`        | Change tab                                        |
 | Dashboard popup             | `Enter`             | Save the changes                                  |
 | Dashboard popup             | `Esc`, `Ctrl+C`     | Close and put everything back                     |
 
@@ -305,20 +305,23 @@ A bare `/model` or `/effort` opens the same popup, not the provider/key picker;
 ### Dashboard (`dashboard.ts`)
 
 `/dashboard` (alias `/display`) — one tabbed popup for the settings that
-otherwise take a dozen commands. `/dashboard [look|details|input]` opens it on
+otherwise take a dozen commands. `/dashboard [look|details|input|context]` opens it on
 that tab. It stays shut while an approval, question, password or confirm prompt
 is waiting, and reads no key or click while one is up.
 
-| Tab     | Rows                                                                                                |
-| ------- | --------------------------------------------------------------------------------------------------- |
-| Look    | status bar position, indicator style, compact layout, battery                                       |
-| Details | the global details mode and the four sections (thinking, tool calls, sub-agents, activity)          |
-| Input   | mouse tracking (`off`, `wheel`, `buttons`, `all`), what a message typed while busy does, focus view |
+| Tab     | Rows                                                                                                             |
+| ------- | ---------------------------------------------------------------------------------------------------------------- |
+| Look    | status bar position, indicator style, compact layout, battery                                                    |
+| Details | the global details mode and the four sections (thinking, tool calls, sub-agents, activity)                       |
+| Input   | mouse tracking (`off`, `wheel`, `buttons`, `all`), what a message typed while busy does, focus view              |
+| Context | `/autocompact`: `auto`, 50-90% of the window or `off` (a saved token limit such as `120k` shows as its own chip) |
 
-`←/→` (or `h`/`l`, space) change the row, `↑/↓` move, `Tab`/`Shift+Tab` or `1-3`
+`←/→` (or `h`/`l`, space) change the row, `↑/↓` move, `Tab`/`Shift+Tab` or `1-4`
 change tab, `Enter` saves (one `config.set` per changed key), `Esc` or `Ctrl+C`
 puts everything back. Rows paint live while the popup is open; focus view waits
-for `Enter` because the gateway stashes and restores state when it changes.
+for `Enter` because the gateway stashes and restores state when it changes, and the
+Context row is applied by running `/autocompact <value>` on `Enter` (the command
+checks and saves it, and says what it did).
 
 Mouse: a click on a tab or on a row only moves the cursor; a click on a chip
 (`[top]`, `off`…) is the control and picks that option. The wheel walks the

@@ -24,10 +24,11 @@ async def test_a_command_that_leaves_a_child_running_returns_when_it_exits(tmp_p
     """`sleep 100 & echo started` waited for the child's pipes and reported a timeout, with the work done."""
     started = time.monotonic()
     res = await tool_bash({"command": "sleep 100 & echo started", "timeout": 20}, cwd=tmp_path)
-    assert time.monotonic() - started < 6
-    assert res["exit_code"] == 0 and res["stdout"] == "started\n" and "error" not in res
+    elapsed = time.monotonic() - started
+    assert elapsed < 6, f"took {elapsed:.1f}s: {res}"  # the result is in the message: this one is host-sensitive
+    assert res["exit_code"] == 0 and res["stdout"] == "started\n" and "error" not in res, res
     text = format_tool_result(res)
-    assert text.startswith("started") and "background was stopped" in text and "exit code" not in text
+    assert text.startswith("started") and "background was stopped" in text and "exit code" not in text, text
 
 
 async def test_a_plain_command_has_no_note_and_a_slow_one_still_times_out(tmp_path):

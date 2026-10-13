@@ -25,26 +25,32 @@ import { SECTION_NAMES, sectionMode } from "./details.js";
  * applied by Enter only. Enter sends one `config.set` per changed key.
  */
 
-export type DashboardTabId = "details" | "input" | "look";
+export type DashboardTabId = "context" | "details" | "input" | "look";
 
 export const DASHBOARD_TABS: readonly { id: DashboardTabId; label: string }[] =
   [
     { id: "look", label: "Look" },
     { id: "details", label: "Details" },
     { id: "input", label: "Input" },
+    { id: "context", label: "Context" },
   ];
 
 /** A section row that follows the global details mode (or the built-in default) rather than pinning one. */
 export const SECTION_DEFAULT = "default";
 
 export interface DashboardField {
+  /**
+   * A slash command that applies the value in place of `config.set`: the
+   * command checks and saves it itself (`/autocompact 70%`).
+   */
+  command?: (value: string) => string;
   /** One line under the list while the cursor is on the row. */
   hint: string;
   id: string;
-  /** The `config.set` key a change is sent under. */
+  /** The `config.set` key a change is sent under (the name in a summary when `command` applies it). */
   key: string;
   label: string;
-  /** Choices in the order ←/→ walk them. */
+  /** Choices in the order ←/→ walk them; a value the ui already has that is not one of them is added at the end. */
   options: readonly string[];
   /** Painted while the popup is open; false = applied when Enter saves. */
   preview: boolean;
@@ -142,6 +148,16 @@ export const DASHBOARD_FIELDS: readonly DashboardField[] = [
     preview: false,
     tab: "input",
   },
+  {
+    command: (value) => `/autocompact ${value}`,
+    hint: "When the conversation is folded into a summary; auto is 70% of the window. Enter saves it for all sessions (/autocompact 120k sets a limit).",
+    id: "autocompact",
+    key: "autocompact",
+    label: "Autocompact",
+    options: ["auto", "50%", "60%", "70%", "80%", "90%", "off"],
+    preview: false,
+    tab: "context",
+  },
 ];
 
 const byId = new Map(DASHBOARD_FIELDS.map((f) => [f.id, f] as const));
@@ -154,6 +170,7 @@ export const fieldsOf = (tab: DashboardTabId): DashboardField[] =>
 /** The part of the ui state the popup reads, previews and puts back. */
 export type DashboardUi = Pick<
   UiState,
+  | "autocompact"
   | "battery"
   | "busyInputMode"
   | "compact"
@@ -170,6 +187,7 @@ export type DashboardUi = Pick<
 export type DashboardValues = Record<string, string>;
 
 export const dashboardUi = (ui: DashboardUi): DashboardUi => ({
+  autocompact: ui.autocompact,
   battery: ui.battery,
   busyInputMode: ui.busyInputMode,
   compact: ui.compact,
@@ -187,6 +205,7 @@ const onOff = (v: boolean) => (v ? "on" : "off");
 /** What each row shows for this ui. A section without an override is `default`. */
 export function dashboardValues(ui: DashboardUi): DashboardValues {
   const values: DashboardValues = {
+    autocompact: ui.autocompact,
     battery: onOff(ui.battery),
     busy: ui.busyInputMode,
     density: onOff(ui.compact),
@@ -263,6 +282,8 @@ export function dashboardPatch(
     patch.focusView = values.focus === "on";
   }
 
+  // `autocompact` is not painted: its command saves it, and the config sync reads the saved value back
+
   return patch;
 }
 
@@ -279,7 +300,13 @@ export interface DashboardState {
   values: DashboardValues;
   /** The values as the popup found them: what "changed" is measured against. */
   base: DashboardValues;
+  /** The chips of each row: the field's options, plus the value the ui had if it is none of them (a `120k` limit). */
+  options: Record<string, readonly string[]>;
 }
+
+/** The chips of a row: ``f.options``, with ``value`` added at the end when it is not among them. */
+const chipsFor = (f: DashboardField, value: string | undefined) =>
+  value && !f.options.includes(value) ? [...f.options, value] : f.options;
 
 export function initDashboardState(
   ui: DashboardUi,
@@ -291,6 +318,9 @@ export function initDashboardState(
   return {
     base: { ...values },
     cursor: 0,
+    options: Object.fromEntries(
+      DASHBOARD_FIELDS.map((f) => [f.id, chipsFor(f, values[f.id])]),
+    ),
     origin,
     tab: Math.max(
       0,
@@ -303,7 +333,7 @@ export function initDashboardState(
 export const currentFields = (state: DashboardState): DashboardField[] =>
   fieldsOf(DASHBOARD_TABS[state.tab]!.id);
 
-/** `/dashboard [look|details|input]`, `/display ...`: a tab by name or number, else null. */
+/** `/dashboard [look|details|input|context]`, `/display ...`: a tab by name or number, else null. */
 export function parseDashboardTab(arg: string): DashboardTabId | null {
   const word = arg.trim().toLowerCase();
   const byNumber = DASHBOARD_TABS[Number(word) - 1];
@@ -319,9 +349,43 @@ export function parseDashboardTab(arg: string): DashboardTabId | null {
 // ── Changes ──────────────────────────────────────────────────────────
 
 export interface DashboardChange {
+  /** The slash command that applies it, for a field that has one (it saves the value itself); else `config.set`. */
+  command?: string;
   key: string;
   /** The `config.set` value: "" resets a section override. */
   value: string;
+}
+
+/**
+ * ``context`` of ``config.get full`` as a chip: ``off``, a token limit (``120k``), a share of the window (``65%``) or
+ * ``auto``, the same words ``/autocompact`` takes. A hand-edited value that is none of them counts as ``auto``.
+ */
+export function autocompactLabel(context: unknown): string {
+  const c = (context && typeof context === "object" ? context : {}) as {
+    autocompact?: unknown;
+    compact_at_ratio?: unknown;
+    compact_at_tokens?: unknown;
+  };
+
+  if (c.autocompact === false) {
+    return "off";
+  }
+
+  const tokens = Number(c.compact_at_tokens);
+
+  if (Number.isFinite(tokens) && tokens > 0) {
+    return tokens % 1_000_000 === 0
+      ? `${tokens / 1_000_000}m`
+      : tokens % 1000 === 0
+        ? `${tokens / 1000}k`
+        : String(Math.round(tokens));
+  }
+
+  const ratio = Number(c.compact_at_ratio);
+
+  return Number.isFinite(ratio) && ratio > 0 && ratio <= 1
+    ? `${Math.round(ratio * 100)}%`
+    : "auto";
 }
 
 /**
@@ -340,7 +404,13 @@ export function dashboardChanges(state: DashboardState): DashboardChange[] {
     }
 
     if (moved(f.id)) {
-      out.push({ key: f.key, value: state.values[f.id]! });
+      const value = state.values[f.id]!;
+
+      out.push({
+        ...(f.command ? { command: f.command(value) } : {}),
+        key: f.key,
+        value,
+      });
     }
   }
 
@@ -400,11 +470,17 @@ const cancelStep = (state: DashboardState): DashboardStep => ({
   state,
 });
 
-/** The value after `delta` steps through the options (wraps: a row is a ring of chips). */
-function stepped(f: DashboardField, value: string, delta: number): string {
-  const i = Math.max(0, f.options.indexOf(value));
+/** The value after `delta` steps through the row's chips (wraps: a row is a ring of chips). */
+function stepped(
+  state: DashboardState,
+  f: DashboardField,
+  value: string,
+  delta: number,
+): string {
+  const chips = state.options[f.id] ?? f.options;
+  const i = Math.max(0, chips.indexOf(value));
 
-  return f.options[(i + delta + f.options.length) % f.options.length]!;
+  return chips[(i + delta + chips.length) % chips.length]!;
 }
 
 /** Pick `value` on a field: the row's own value, and with the global details mode the four sections too. */
@@ -415,7 +491,11 @@ export function setField(
 ): DashboardStep {
   const f = byId.get(id);
 
-  if (!f || !f.options.includes(value) || state.values[id] === value) {
+  if (
+    !f ||
+    !(state.options[id] ?? f.options).includes(value) ||
+    state.values[id] === value
+  ) {
     return { action: { type: "none" }, state };
   }
 
@@ -509,7 +589,7 @@ export function dashboardKey(
       ? setField(
           state,
           field.id,
-          stepped(field, state.values[field.id]!, delta),
+          stepped(state, field, state.values[field.id]!, delta),
         )
       : same;
 
@@ -717,7 +797,7 @@ function rowLine(
 
   let col = head.length;
 
-  for (const option of f.options) {
+  for (const option of state.options[f.id] ?? f.options) {
     const picked = option === value;
     const text = picked ? `[${option}]` : ` ${option} `;
 

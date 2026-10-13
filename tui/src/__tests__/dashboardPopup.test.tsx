@@ -169,6 +169,19 @@ describe("Dashboard popup", () => {
     expect(getUiState().busyInputMode).toBe("steer");
   });
 
+  it("the Context tab hands its change over as the /autocompact command", async () => {
+    const t = mount("context");
+
+    await waitFor(() => expect(t.frame()).toContain("Autocompact"));
+    t.stdin.send(`${RIGHT}${RIGHT}${ENTER}`);
+    await waitFor(() => expect(t.onSave).toHaveBeenCalledTimes(1));
+
+    expect(t.onSave.mock.calls[0]![0]).toEqual([
+      { command: "/autocompact 60%", key: "autocompact", value: "60%" },
+    ]);
+    t.stop();
+  });
+
   it("a field that waits for Enter does not touch the ui before it", async () => {
     const t = mount("input");
 

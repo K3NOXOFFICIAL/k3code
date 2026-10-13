@@ -1,6 +1,7 @@
 import type { MouseTrackingMode } from "@k3code/ink";
 import { useEffect, useRef } from "react";
 
+import { autocompactLabel } from "../domain/dashboard.js";
 import { resolveDetailsMode, resolveSections } from "../domain/details.js";
 import type { GatewayClient } from "../gatewayClient.js";
 import type {
@@ -308,6 +309,8 @@ export const applyDisplay = (
   }
 
   patchUiState({
+    // a failed poll (cfg null) keeps the last known setting
+    ...(cfg ? { autocompact: autocompactLabel(cfg.config?.context) } : {}),
     battery: !!d.battery,
     busyInputMode: normalizeBusyInputMode(d.busy_input_mode),
     compact: !!d.tui_compact,

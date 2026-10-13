@@ -1,8 +1,11 @@
-import { parseDashboardTab } from "../../../domain/dashboard.js";
+import {
+  DASHBOARD_TABS,
+  parseDashboardTab,
+} from "../../../domain/dashboard.js";
 import { openDashboard } from "../../overlayStore.js";
 import type { SlashCommand } from "../types.js";
 
-const USAGE = "/dashboard [look|details|input]";
+const USAGE = `/dashboard [${DASHBOARD_TABS.map((t) => t.id).join("|")}]`;
 
 /**
  * `/dashboard` and its alias `/display` open one tabbed popup (Look, Details,

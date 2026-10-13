@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  autocompactLabel,
   currentFields,
   DASHBOARD_FIELDS,
   DASHBOARD_TABS,
@@ -27,6 +28,7 @@ import {
 } from "../domain/dashboard.js";
 
 const UI: DashboardUi = {
+  autocompact: "auto",
   battery: false,
   busyInputMode: "queue",
   compact: false,
@@ -66,15 +68,16 @@ const run = (
   return { actions, state: cur };
 };
 
-const onTab = (tab: "details" | "input" | "look") =>
+const onTab = (tab: "context" | "details" | "input" | "look") =>
   initDashboardState(UI, tab);
 
 describe("dashboard fields", () => {
-  it("lists look, details and input rows, each with distinct ids and keys", () => {
+  it("lists look, details, input and context rows, each with distinct ids and keys", () => {
     expect(DASHBOARD_TABS.map((t) => t.id)).toEqual([
       "look",
       "details",
       "input",
+      "context",
     ]);
     expect(new Set(DASHBOARD_FIELDS.map((f) => f.id)).size).toBe(
       DASHBOARD_FIELDS.length,
@@ -166,15 +169,17 @@ describe("dashboardKey", () => {
     expect(next.tab).toBe(1);
     expect(next.cursor).toBe(0);
     expect(press(next, "", { shift: true, tab: true }).state.tab).toBe(0);
+    // from the first tab, Shift+Tab wraps round to the last
     expect(press(onTab("look"), "", { shift: true, tab: true }).state.tab).toBe(
-      2,
+      3,
     );
     expect(press(onTab("look"), "", { tab: true }).state.tab).toBe(1);
     expect(press(onTab("look"), "3").state.tab).toBe(2);
 
     const look = onTab("look");
 
-    expect(press(look, "4").state).toBe(look);
+    expect(press(look, "5").state).toBe(look);
+    expect(press(look, "4").state.tab).toBe(3);
   });
 
   it("previews a field live and leaves a field that waits for Enter alone", () => {
@@ -375,6 +380,22 @@ describe("dashboardScreen", () => {
     expect(lineText(active[0]!)).toContain("While busy");
     expect(lineText(active[0]!)).toContain("[steer]");
     expect(lineText(active[0]!)).toContain(" queue ");
+  });
+
+  it("shows every hint whole at 80 columns: none is cut with an ellipsis", () => {
+    const layout = dashboardLayout({ cols: 80, rows: 24 });
+
+    for (const f of DASHBOARD_FIELDS) {
+      const tab = DASHBOARD_TABS.find((t) => t.id === f.tab)!.id;
+      const state = initDashboardState(UI, tab);
+      const row = fieldsOf(tab).indexOf(f);
+      const shown = dashboardScreen({ ...state, cursor: row }, layout)
+        .filter((l) => l.kind === "hint")
+        .map((l) => lineText(l).trim())
+        .join(" ");
+
+      expect(shown.replace(/\s+/g, " ").trim(), f.id).toBe(f.hint);
+    }
   });
 
   it("shows the mouse trade-off under the mouse row", () => {
@@ -599,5 +620,96 @@ describe("dashboardSummary", () => {
         { key: "details_mode.activity", value: "hidden" },
       ]),
     ).toBe("display: mouse=wheel  tools=default activity=hidden");
+  });
+});
+
+describe("the Context tab (/autocompact)", () => {
+  it("has the autocompact row and opens by name or number", () => {
+    expect(DASHBOARD_TABS.map((t) => t.id)).toContain("context");
+    expect(fieldsOf("context").map((f) => f.key)).toEqual(["autocompact"]);
+    expect(parseDashboardTab("context")).toBe("context");
+    expect(parseDashboardTab("4")).toBe("context");
+  });
+
+  it("names the saved setting with the words /autocompact takes", () => {
+    for (const [context, label] of [
+      [undefined, "auto"],
+      [null, "auto"],
+      [{}, "auto"],
+      [{ autocompact: false }, "off"],
+      [{ autocompact: false, compact_at_tokens: 120_000 }, "off"],
+      [{ compact_at_tokens: 120_000 }, "120k"],
+      [{ compact_at_tokens: 2_000_000 }, "2m"],
+      [{ compact_at_tokens: 123_456 }, "123456"],
+      [{ compact_at_ratio: 0.65 }, "65%"],
+      [{ compact_at_ratio: 2 }, "auto"],
+      [{ compact_at_tokens: "lots", compact_at_ratio: "x" }, "auto"],
+    ] as const) {
+      expect(autocompactLabel(context)).toBe(label);
+    }
+  });
+
+  it("a limit the list does not have is a chip too, so the popup shows what is saved", () => {
+    const state = initDashboardState({ ...UI, autocompact: "120k" }, "context");
+    const text = dashboardScreen(state, LAYOUT).map(lineText);
+
+    expect(state.values.autocompact).toBe("120k");
+    expect(text.find((l) => l.includes("Autocompact"))).toContain("[120k]");
+    expect(text.find((l) => l.includes("Autocompact"))).toContain(" off ");
+    // the chip is the last one: → wraps round to auto, ← goes back to off
+    expect(
+      press(state, "", { rightArrow: true }).state.values.autocompact,
+    ).toBe("auto");
+    expect(press(state, "", { leftArrow: true }).state.values.autocompact).toBe(
+      "off",
+    );
+    // a row whose value is in the list gets no extra chip
+    expect(
+      dashboardScreen(onTab("context"), LAYOUT)
+        .map(lineText)
+        .find((l) => l.includes("Autocompact")),
+    ).not.toContain("120k");
+  });
+
+  it("is applied by its own command on Enter, never previewed and never sent as a config key", () => {
+    const moved = press(onTab("context"), "", { rightArrow: true });
+
+    expect(moved.state.values.autocompact).toBe("50%");
+    expect(moved.action).toEqual({ type: "none" });
+
+    const save = press(moved.state, "", { return: true }).action;
+
+    expect(save).toMatchObject({
+      changes: [
+        { command: "/autocompact 50%", key: "autocompact", value: "50%" },
+      ],
+      type: "save",
+    });
+    // the command saves it and the config sync reads it back: the ui is not painted with it
+    expect(save.type === "save" && "autocompact" in save.patch).toBe(false);
+  });
+
+  it("choosing off or auto sends exactly those words", () => {
+    const off = press(onTab("context"), "", { leftArrow: true });
+
+    expect(off.state.values.autocompact).toBe("off");
+    expect(dashboardChanges(off.state)).toEqual([
+      { command: "/autocompact off", key: "autocompact", value: "off" },
+    ]);
+
+    const auto = initDashboardState({ ...UI, autocompact: "70%" }, "context");
+
+    expect(
+      dashboardChanges(press(auto, "", { leftArrow: true }).state)[0]?.command,
+    ).toBe("/autocompact 60%");
+    expect(dashboardChanges(auto)).toEqual([]);
+  });
+
+  it("the summary names it like any other key", () => {
+    expect(
+      dashboardSummary([
+        { command: "/autocompact off", key: "autocompact", value: "off" },
+      ]),
+    ).toBe("display: autocompact=off");
   });
 });

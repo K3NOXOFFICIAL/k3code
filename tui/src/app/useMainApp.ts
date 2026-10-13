@@ -1481,7 +1481,13 @@ export function useMainApp(gw: GatewayClient) {
       patchOverlayState({ dashboard: null });
       sys(dashboardSummary(changes));
 
-      for (const { key, value } of changes) {
+      for (const { command, key, value } of changes) {
+        if (command) {
+          slashRef.current(command); // the command checks, saves and says what it did
+
+          continue;
+        }
+
         void rpc("config.set", { key, value }).then((r) => {
           if (r === null) {
             sys(`could not save ${key}: it applies to this session only`);
