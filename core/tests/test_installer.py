@@ -1981,18 +1981,35 @@ def test_k3_allow_root_lets_a_root_run_install_like_the_flag(tmp_path: Path) -> 
     assert (home / DATA_REL / "current").is_symlink()
 
 
-def _fetch_only(root: Path, url: str, tool_body: str, tool: str) -> subprocess.CompletedProcess[str]:
-    """Run install.sh's fetch() alone, with ``tool`` the only downloader on a PATH that holds nothing else."""
+def _shell_function(lines: list[str], name: str) -> list[str]:
+    """The definition of ``name`` in install.sh: one line for ``name() { ...; }``, else up to the closing ``}``."""
+    start = next(i for i, ln in enumerate(lines) if ln.startswith(f"{name}() {{"))
+    return lines[start : start + 1] if lines[start].endswith("}") else lines[start : lines.index("}", start) + 1]
+
+
+def _fetch_only(
+    root: Path,
+    url: str,
+    tool_body: str,
+    tool: str,
+    env_extra: dict[str, str] | None = None,
+    runner: tuple[str, ...] = ("/bin/sh",),
+) -> subprocess.CompletedProcess[str]:
+    """Run install.sh's fetch() alone, with ``tool`` the only downloader on a PATH that holds nothing else but sleep."""
     root.mkdir(parents=True, exist_ok=True)
     text = INSTALL.read_text().splitlines()
-    keep = [ln for ln in text if ln.startswith("have() ")]
-    start = next(i for i, ln in enumerate(text) if ln.startswith("fetch() {"))
-    end = text.index("}", start)
+    names = ("have", "redact", "say", "log", "fetch_still_trying", "fetch")
+    body = [ln for name in names for ln in _shell_function(text, name)]
     script = root / "fetch.sh"
-    script.write_text("\n".join([*keep, *text[start : end + 1], f'fetch "$1" "{root}/out"', ""]))
+    script.write_text("\n".join(["set -eu", 'INSTALL_LOG=""', *body, f'fetch "$1" "{root}/out"', ""]))
     bin_dir = stub_bin(root, tool, tool_body)
+    (bin_dir / "sleep").symlink_to(shutil.which("sleep") or "/bin/sleep")  # the "still trying" watcher sleeps
     return subprocess.run(
-        ["/bin/sh", str(script), url], env={"PATH": str(bin_dir)}, capture_output=True, text=True, check=False
+        [*runner, str(script), url],
+        env={"PATH": str(bin_dir), **(env_extra or {})},
+        capture_output=True,
+        text=True,
+        check=False,
     )
 
 
@@ -2039,3 +2056,66 @@ def test_a_bad_signature_on_the_node_checksum_list_skips_the_tui(tmp_path: Path)
     assert "signature on nodejs.org's SHASUMS256.txt is bad" in r.stderr, r.stderr
     assert "SHASUMS256.txt.asc" in log.read_text()
     assert not (home / DATA_REL / "node").exists()
+
+
+def _args_stub(calls: Path) -> str:
+    return f'echo "$*" >"{calls}"\n'
+
+
+@pytest.mark.parametrize(("tool", "flag"), [("curl", "--connect-timeout 15"), ("wget", "-T 15")], ids=["curl", "wget"])
+def test_a_download_gives_up_on_a_connection_after_15_seconds(tmp_path: Path, tool: str, flag: str) -> None:
+    calls = tmp_path / "calls"
+    r = _fetch_only(tmp_path, "https://example.invalid/x", _args_stub(calls), tool)
+    assert r.returncode == 0, r.stderr
+    assert f" {flag} " in f" {calls.read_text()} "
+
+
+@pytest.mark.parametrize(("given", "used"), [("7", "7"), ("", "15"), ("0", "15"), ("soon", "15"), ("-3", "15")])
+def test_the_connect_timeout_can_be_changed_and_junk_is_ignored(tmp_path: Path, given: str, used: str) -> None:
+    calls = tmp_path / "calls"
+    r = _fetch_only(
+        tmp_path, "https://example.invalid/x", _args_stub(calls), "curl", env_extra={"K3_CONNECT_TIMEOUT": given}
+    )
+    assert r.returncode == 0, r.stderr
+    assert f"--connect-timeout {used} " in f"{calls.read_text()} "
+
+
+def test_a_download_that_cannot_connect_says_it_is_still_trying(tmp_path: Path) -> None:
+    # the 75 s of silence behind a proxy that swallows connections: curl -s says nothing while it waits and retries
+    curl = "sleep 3\nexit 28\n"
+    t0 = time.monotonic()
+    r = _fetch_only(
+        tmp_path, "https://alice:s3cr3t-token@example.invalid/x", curl, "curl", env_extra={"K3_CONNECT_TIMEOUT": "1"}
+    )
+    assert r.returncode == 28
+    assert time.monotonic() - t0 < 10
+    lines = [ln for ln in r.stderr.splitlines() if "still trying" in ln]
+    assert lines, r.stderr
+    assert "example.invalid (1s)" in lines[0] and "gives up after 1s" in lines[0]
+    assert "s3cr3t" not in r.stderr and "alice" not in r.stderr  # the credentials of a URL never reach the terminal
+    assert len(lines) >= 2 and "(2s)" in lines[1]  # and it keeps saying so while the wait goes on
+
+
+def test_a_download_that_answers_is_quiet_and_leaves_no_watcher_behind(tmp_path: Path) -> None:
+    t0 = time.monotonic()
+    r = _fetch_only(tmp_path, "https://example.invalid/x", "exit 0\n", "curl", env_extra={"K3_CONNECT_TIMEOUT": "30"})
+    assert r.returncode == 0
+    assert r.stderr == ""
+    assert time.monotonic() - t0 < 10  # a watcher still holding stderr open would keep subprocess.run waiting 30 s
+
+
+def test_the_still_trying_watcher_ends_with_the_installer(tmp_path: Path) -> None:
+    # a killed installer cannot clean up: the watcher notices that its parent is gone and stays silent. The outer
+    # shell reaps the killed one (a zombie still answers kill -0) and exits while the watcher holds the pipe open.
+    curl = 'kill -9 "$PPID"\nexit 0\n'
+    t0 = time.monotonic()
+    r = _fetch_only(
+        tmp_path,
+        "https://example.invalid/x",
+        curl,
+        "curl",
+        env_extra={"K3_CONNECT_TIMEOUT": "1"},
+        runner=("/bin/sh", "-c", 'sh "$0" "$@"; exit 0'),
+    )
+    assert time.monotonic() - t0 < 10
+    assert "still trying" not in r.stderr
