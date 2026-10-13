@@ -32,8 +32,22 @@ def test_sandbox_is_ok_when_bwrap_is_usable(monkeypatch):
 
     monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
     monkeypatch.setattr(sandbox, "usable", lambda: True)
+    monkeypatch.setattr(sandbox, "hidden_name_lookup_files", lambda: [])
     chk = doctor.check_sandbox()
     assert chk.status == doctor.OK and "/usr/bin/bwrap" in chk.detail
+
+
+def test_sandbox_warns_when_names_cannot_resolve_inside_it(monkeypatch):
+    """#137: on WSL 2 bwrap started fine, so /doctor said OK, while /etc/resolv.conf was missing in the sandbox."""
+    from k3code import doctor
+    from k3code.reliability import sandbox
+
+    monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
+    monkeypatch.setattr(sandbox, "usable", lambda: True)
+    monkeypatch.setattr(sandbox, "hidden_name_lookup_files", lambda: ["/etc/resolv.conf"])
+    chk = doctor.check_sandbox()
+    assert chk.status == doctor.WARN
+    assert "cannot read /etc/resolv.conf" in chk.detail and "ls -l /etc/resolv.conf" in chk.fix
 
 
 def test_sandbox_no_probe_does_not_run_bwrap(monkeypatch):
@@ -45,6 +59,7 @@ def test_sandbox_no_probe_does_not_run_bwrap(monkeypatch):
 
     monkeypatch.setattr(sandbox, "bwrap_path", lambda: "/usr/bin/bwrap")
     monkeypatch.setattr(sandbox, "usable", must_not_probe)
+    monkeypatch.setattr(sandbox, "hidden_name_lookup_files", must_not_probe)
     assert doctor.check_sandbox(probe=False).status == doctor.OK
 
 
