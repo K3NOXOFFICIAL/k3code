@@ -209,3 +209,54 @@ def test_apply_detached_without_a_unit_needs_no_systemd(data: Path, monkeypatch:
     assert out.read_text().strip() == "update --yes sock=none"  # the daemon's socket is never handed to the child
     assert "updating" in upd.update_log_path().read_text()
     assert int(sid.read_text()) != os.getsid(0)
+
+
+def test_the_systemd_run_update_sees_the_daemons_install_root_home_and_keys(
+    data: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A transient unit starts from the user manager's environment, not the daemon's. The daemon gets K3CODE_DATA and
+    K3CODE_HOME from `Environment=` lines and its keys from `EnvironmentFile=`, so an update started without them
+    updated ~/.local/share/k3code (a different install) and could not authenticate to a private repository."""
+    from k3code.setup.state import set_env_var
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    seen = tmp_path / "seen.txt"
+    # a stand-in for systemd-run: runs the command with the manager's environment plus only what the unit is given
+    runner = bin_dir / "systemd-run"
+    runner.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "env = {'PATH': '/usr/bin:/bin'}\n"
+        "args = sys.argv[1:]\n"
+        "while args[0].startswith('-'):\n"
+        "    opt = args.pop(0)\n"
+        "    if opt.startswith('--setenv='):\n"
+        "        name, eq, value = opt.removeprefix('--setenv=').partition('=')\n"
+        "        env[name] = value if eq else os.environ[name]\n"
+        "    elif opt.startswith('--property=EnvironmentFile=-'):\n"
+        "        path = opt.removeprefix('--property=EnvironmentFile=-')\n"
+        "        if os.path.exists(path):\n"
+        "            env.update(ln.split('=', 1) for ln in open(path).read().splitlines() if '=' in ln)\n"
+        "    elif opt not in ('--user', '--collect', '--quiet') and not opt.startswith('--unit='):\n"
+        "        sys.exit(f'unsupported option {opt}')\n"
+        "os.execve(args[0], args, env)\n"
+    )
+    runner.chmod(0o755)
+    exe = bin_dir / "k3code"
+    exe.write_text(
+        "#!/bin/sh\n"
+        f'echo "data=$K3CODE_DATA home=$K3CODE_HOME token=$GITHUB_TOKEN args=$*" > {shlex.quote(str(seen))}\n'
+    )
+    exe.chmod(0o755)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    fake_token = "fake-" + "token"
+    set_env_var("GITHUB_TOKEN", fake_token)  # where the setup wizard keeps it; the daemon reads it as EnvironmentFile
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(upd.shutil, "which", lambda name: str(bin_dir / name))
+
+    msg = upd.apply_detached(unit_installed=lambda: True)
+
+    assert "background" in msg
+    assert seen.read_text().strip() == f"data={data} home={data / 'home'} token={fake_token} args=update --yes"
