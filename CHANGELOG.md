@@ -44,6 +44,7 @@ All notable changes are listed here. Until version 1.0, any release may change t
 - **`sandbox.home_readonly`** (user config only): `$HOME` entries that stay visible, read-only, inside the bash sandbox, for example `[".myapp"]`. The sandbox hid all of `$HOME`, so a model that checks a marker file in the home folder could never see it and repeated its first-run question in every `auto`/`yolo` session.
 
 ### Fixed
+- **A usage.db write error no longer fails a turn.** Recording a usage event (a model call, tool, failover or approval) is best effort: a locked or full database, a read-only disk or a closed connection used to raise out of the router callback, abort the failover to the next provider and fail the turn. The error is now logged at warning level (at most once a minute) and the event is dropped. Nothing changes while writes succeed (issue #148).
 
 - **Config errors no longer show part of a provider key (issue #167).** A provider block in `config.yaml` that failed validation (no `base_url`, `name` or `kind`) made the error repeat the whole block, including the end of the API key from `api_key_env` or the env file. The key is now filled in only after the config has been validated, and it no longer appears when a loaded config is printed. The error still says which provider block is wrong and why.
 ||||||| f0416ce6
