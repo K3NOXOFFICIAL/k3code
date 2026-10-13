@@ -70,6 +70,13 @@ class ProviderEntry(BaseModel):
     first_event_timeout: float | None = None
     idle_timeout: float | None = None
 
+    @field_validator("first_event_timeout", "idle_timeout", mode="before")
+    @classmethod
+    def reject_a_boolean_stall_limit(cls, v: Any, info: Any) -> Any:
+        if isinstance(v, bool):  # YAML `true` would become 1.0 s and fail every reply over
+            raise ValueError(f"{info.field_name} must be a number of seconds above 0")
+        return v
+
     @field_validator("first_event_timeout", "idle_timeout")
     @classmethod
     def validate_stall_limit(cls, v: float | None, info: Any) -> float | None:
@@ -380,7 +387,7 @@ def retention(config: Any) -> dict[str, int]:
     for key in out:
         value = raw.get(key)
         if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
-            out[key] = int(value)
+            out[key] = max(1, int(value))  # 0.5 passes the check and must not read as 0 (prune everything)
     return out
 
 

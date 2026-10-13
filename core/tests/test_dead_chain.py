@@ -236,3 +236,42 @@ async def test_a_summary_whose_first_entry_hangs_is_answered_by_the_second_insid
     hits.update(A=0, B=0)
     await caller.complete(TaskKind.COMPACTION, MSGS, timeout=0.7)
     assert hits == {"A": 0, "B": 1}, "the hung entry was cooled down, not left to hang the next call too"
+
+
+# ── an entry skipped for a "free" later entry is tried after all when that one turns out dead ───────────────────────
+
+
+def _arm_window(router: Router, index: int) -> None:
+    e = router.chain[index]
+    router.cooldowns.arm(
+        FailoverReason.server, provider=e.provider_name, model=e.model, base_url=e.base_url, fixed_seconds=60.0
+    )
+
+
+async def test_a_skipped_dead_entry_is_tried_when_the_free_one_after_it_is_dead_too():
+    """A recovered while its 60 s window ran; B looked free, so A was skipped, B failed: the walk ended with a healthy
+    entry never tried and no wait to park on (an attended turn died, an unattended one gave up its parks)."""
+    a, b = Entry("a", reply="from a"), Entry("b", fail=server_error)
+    router = router_of([a, b])
+    _arm_window(router, 0)
+    events = await drain(router.stream(MSGS, [], max_tokens=10, temperature=None))
+    assert events[-1].message.content == "from a"
+    assert (a.calls, b.calls) == (1, 3)
+
+
+async def test_two_skipped_dead_entries_are_both_tried_when_the_free_one_after_them_is_dead():
+    a, b, c = Entry("a", fail=server_error), Entry("b", reply="from b"), Entry("c", fail=server_error)
+    router = router_of([a, b, c])
+    _arm_window(router, 0)
+    _arm_window(router, 1)
+    events = await drain(router.stream(MSGS, [], max_tokens=10, temperature=None))
+    assert events[-1].message.content == "from b"
+    assert (a.calls, b.calls, c.calls) == (3, 1, 3)  # c fails first; then a (dead too) and b, in chain order
+
+
+async def test_a_skipped_dead_entry_stays_skipped_when_the_free_one_after_it_answers():
+    a, b = Entry("a", reply="from a"), Entry("b", reply="from b")
+    router = router_of([a, b])
+    _arm_window(router, 0)
+    events = await drain(router.stream(MSGS, [], max_tokens=10, temperature=None))
+    assert events[-1].message.content == "from b" and (a.calls, b.calls) == (0, 1)

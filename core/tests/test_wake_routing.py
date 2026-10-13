@@ -963,9 +963,44 @@ async def test_a_context_overflow_retry_runs_its_own_hooks(tmp_path, monkeypatch
     await server.close()
 
 
-async def test_mode_on_in_a_checkout_with_uncommitted_changes_is_a_normal_turn_and_says_why(tmp_path, monkeypatch):
-    """/ultracode refuses such a checkout; a typed prompt of the always-on mode is answered, not refused."""
-    server = make(tmp_path, monkeypatch, [NORMAL])
+def ultra_dirty_notices(server: Any) -> list[dict]:
+    return [e for e in events(server, "notification.show") if str(e.get("key", "")).startswith("k3.ultra_dirty.")]
+
+
+async def test_mode_on_in_a_checkout_with_uncommitted_changes_is_a_normal_turn_and_says_why_once(tmp_path, monkeypatch):
+    """/ultracode refuses such a checkout; a prompt of the always-on mode that it would have taken is answered, not
+    refused, and the user hears why once for as long as the checkout stays dirty (then again after it was clean)."""
+    server = make(tmp_path, monkeypatch, [verdict("small"), NORMAL])
+    pipe = pipeline(server, monkeypatch)
+    state = {"dirty": ["a.py"]}
+
+    async def dirty(_cwd: Any) -> list[str]:
+        return state["dirty"]
+
+    monkeypatch.setattr("k3code.gateway.server.dirty_checkout", dirty)
+    await start(server, tmp_path)
+    server.session.ultra_mode = "ultracode"
+    await submit(server, "add a --verbose flag to the CLI")
+    assert pipe.calls == [] and progress(server) == []
+    assert classifier_calls(server) == 1  # rated once: the ordinary gate reuses the mode's verdict
+    assert transcript(server)[-1] == ("assistant", "NORMAL-TURN")
+    (shown,) = ultra_dirty_notices(server)
+    assert "a.py" in shown["text"] and "commit or stash" in shown["text"]
+    assert shown["kind"] == "ttl" and shown["ttl_ms"] > 0  # it goes away by itself
+    await submit(server, "and another one")
+    assert len(ultra_dirty_notices(server)) == 1 and pipe.calls == []  # not repeated at every prompt
+    state["dirty"] = []  # committed
+    await submit(server, "now add a --quiet flag too")
+    assert [c[0] for c in pipe.calls] == ["ultracode"]  # clean again: the pipeline runs
+    state["dirty"] = ["b.py"]
+    await submit(server, "one more change please")
+    assert len(ultra_dirty_notices(server)) == 2  # a new dirty spell is announced again
+
+
+async def test_mode_on_a_trivial_prompt_in_a_dirty_checkout_says_nothing(tmp_path, monkeypatch):
+    server = make(
+        tmp_path, monkeypatch, [verdict("trivial"), NORMAL], autonomy={"degrade_trivial": False, "proposals": False}
+    )
     pipe = pipeline(server, monkeypatch)
 
     async def dirty(_cwd: Any) -> list[str]:
@@ -974,12 +1009,5 @@ async def test_mode_on_in_a_checkout_with_uncommitted_changes_is_a_normal_turn_a
     monkeypatch.setattr("k3code.gateway.server.dirty_checkout", dirty)
     await start(server, tmp_path)
     server.session.ultra_mode = "ultracode"
-    await submit(server, "add a --verbose flag to the CLI")
-    assert pipe.calls == [] and progress(server) == []
-    assert classifier_calls(server) == 1  # the ordinary gate's own rating: none was spent on a run that cannot start
-    assert transcript(server)[-1] == ("assistant", "NORMAL-TURN")
-    shown = [e for e in events(server, "notification.show") if "ultracode" in str(e.get("kind"))]
-    assert len(shown) == 1 and "a.py" in shown[0]["text"] and "commit or stash" in shown[0]["text"]
-    await submit(server, "and another one")
-    shown = [e for e in events(server, "notification.show") if "ultracode" in str(e.get("kind"))]
-    assert {e["key"] for e in shown} == {f"k3.ultra_dirty.{server.session.session_id}"}  # one key: shown once
+    await submit(server, "what does the retry flag do?")
+    assert pipe.calls == [] and ultra_dirty_notices(server) == []  # ultracode would not have taken it anyway

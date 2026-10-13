@@ -20,6 +20,7 @@ from k3code.errors import ChainExhausted
 from k3code.providers import effort as effort_mod
 from k3code.providers.types import Message, ToolSpec, Usage
 from k3code.routing.tiers import TaskKind, Tier, TierRouters, next_tier, tier_for
+from k3code.usage import CUT_SHORT
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +251,7 @@ class ModelCaller:
                 max_tokens,
                 timeout,
                 attempts,
-                lambda usage, served: self._book(usage, served, session_id, tier, kind, detail="attempt cut short"),
+                lambda usage, served: self._book(usage, served, session_id, tier, kind, detail=CUT_SHORT),
             )
             final = await (asyncio.wait_for(coro, timeout) if timeout else coro)
         finally:

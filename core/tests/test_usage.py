@@ -115,3 +115,27 @@ async def test_gateway_call_rows_carry_the_turn_id(tmp_path, monkeypatch):
     turns = {r["turn"] for r in rows}
     assert len(turns) == 2 and "" not in turns
     assert {g["key"] for g in server.usage.aggregate("turn")} == turns
+
+
+def test_the_row_of_an_attempt_cut_short_adds_tokens_but_is_not_another_call(tmp_path):
+    """A side call whose first attempt died after the provider counted its prompt writes a second row for those
+    tokens; /usage and /stats counted it as a second model call (and the optimizer's rates with it)."""
+    from k3code.learning.decisions import DecisionLog
+    from k3code.learning.optimizer import collect
+    from k3code.usage import CUT_SHORT
+
+    db = UsageDB(tmp_path / "usage.db")
+    kw = {"session": "s1", "provider": "p", "model": "m", "tier": "cheap", "task_kind": "title"}
+    db.record("call", tokens_in=1000, tokens_out=0, detail=CUT_SHORT, **kw)
+    db.record("call", tokens_in=1000, tokens_out=5, **kw)
+    (g,) = db.aggregate("session")
+    assert g["calls"] == 1 and g["tokens_in"] == 2000  # the tokens were spent; the call was one
+    assert g["by_tier"]["cheap"]["calls"] == 1 and g["by_tier"]["cheap"]["tokens_in"] == 2000
+    assert g["by_kind"]["title"] == 1 and g["tokens_by_kind"]["title"]["calls"] == 1
+    assert g["tokens_by_kind"]["title"]["tokens_in"] == 2000
+    rows = [
+        {"ts": 1.0, "session": "s1", "kind": "call", "tier": "cheap", "task_kind": "title", "detail": d}
+        for d in (CUT_SHORT, "")
+    ]
+    out = collect(rows, DecisionLog(tmp_path / "dec.db"), [], since=0.0)
+    assert out["tiers"]["cheap"]["calls"] == 1

@@ -157,7 +157,10 @@ def _inside(path: str, roots: list[str]) -> bool:
 def inside_roots(path: str | Path, cwd: str | Path, add_dirs: list[str] | None = None) -> bool:
     """``path`` (absolute) lies in the project: under the session cwd or one of its ``add_dirs``, the roots ``decide``
     judges "inside" by (symlinks resolved on both sides)."""
-    return _inside(_norm(path), [_norm(cwd), *[_norm(d) for d in (add_dirs or [])]])
+    roots = [_norm(cwd), *[_norm(d) for d in (add_dirs or [])]]
+    # also the path as the kernel reads it: `link/../x` is `<target of link>/../x`, which `_norm` (lexical) collapsed
+    # to a file inside the project while the file reached lies outside it (`decide` takes the stricter of the two)
+    return _inside(_norm(path), roots) and _inside(str(path), roots)
 
 
 #: Files the edit tools never change without a person, in any mode and whatever the rules say: git runs them (hooks, a
@@ -259,9 +262,15 @@ def decide(
         reached = os.path.realpath(os.path.join(cwd_s, raw))
         if tool != "glob" and reached != os.path.realpath(path):
             dec = _stricter(dec, _decide_path(mode, tool, reached, roots, ruleset))
-        if tool in EDIT_TOOLS and dec.action != "deny" and (protected_path(path) or protected_path(reached)):
+        if (
+            tool in EDIT_TOOLS
+            and dec.action != "deny"
+            and (protected_path(path) or protected_path(reached) or sensitive_path(path) or sensitive_path(reached))
+        ):
             # the edit tools run in the daemon, outside the sandbox: only a deny rule beats this, no allow rule, mode or
-            # hook approval does (yolo and auto included; headless, an unattended run and a sub-agent it is a deny)
+            # hook approval does (yolo and auto included; headless, an unattended run and a sub-agent it is a deny).
+            # A file the model may not read (`sensitive_path`: .env.local, ~/.ssh, ...) is changed only on a person's
+            # say: the read-first rule does not apply to it, so the approved diff is the only check there is
             dec.action, dec.needs_human, dec.always_ask = "ask", True, True
             dec.message = f"Edits a file that runs as code or holds credentials; confirm it yourself: {path}"
     elif tool == EXIT_PLAN_TOOL:

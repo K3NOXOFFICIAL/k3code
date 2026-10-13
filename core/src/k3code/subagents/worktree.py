@@ -183,8 +183,9 @@ async def remove(wt: Worktree, *, keep_branch: bool) -> None:
 
 
 async def head_sha(repo: str | Path) -> str:
-    _, out = await git(repo, "rev-parse", "HEAD")
-    return out.strip()
+    """The commit HEAD names, or "" when it names none (a repository with no commit: git prints its error text)."""
+    code, out = await git(repo, "rev-parse", "HEAD")
+    return out.strip() if code == 0 else ""
 
 
 async def merge_trial(wt: Worktree) -> tuple[bool, str]:

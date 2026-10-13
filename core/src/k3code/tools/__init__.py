@@ -150,6 +150,9 @@ class FileStamps:
 
     def __init__(self) -> None:
         self._seen: dict[str, tuple[int, int]] = {}
+        #: Files a hook rewrote after this session's own edit: the stamp is the file as the hook left it, which the
+        #: model has not seen, so a `write` (it replaces the whole file) needs a fresh read first.
+        self._absorbed: set[str] = set()
 
     #: Most files a session keeps across a close and resume (the newest ones); the rest are read again when edited.
     KEEP = 200
@@ -175,10 +178,19 @@ class FileStamps:
         }
         self._seen.update(list(good.items())[-self.KEEP :])
 
-    def record(self, path: Path) -> None:
+    def record(self, path: Path, *, absorbed: bool = False) -> None:
+        """``path`` as it is now. ``absorbed``: a hook rewrote it after the model's own edit (see ``_absorbed``)."""
         with contextlib.suppress(OSError):
             st = path.stat()
-            self._seen[os.path.realpath(path)] = (st.st_mtime_ns, st.st_size)
+            key = os.path.realpath(path)
+            self._seen.pop(key, None)  # newest last: `export` keeps the files worked on most recently
+            self._seen[key] = (st.st_mtime_ns, st.st_size)
+            (self._absorbed.add if absorbed else self._absorbed.discard)(key)
+
+    def clear(self) -> None:
+        """Forget everything (`/clear`: a new conversation has seen none of these files)."""
+        self._seen.clear()
+        self._absorbed.clear()
 
     def refusal(self, tool: str, path: Path) -> str | None:
         """Why ``tool`` may not change ``path`` now, or None. A file that does not exist yet, an empty one and one the
@@ -196,13 +208,19 @@ class FileStamps:
             # read is a hardline deny for these (.env, ~/.ssh ...): "read it first" could never be satisfied, so every
             # attempt cost prompts and failed calls. The person approves the change from its diff instead.
             return None
-        seen = self._seen.get(os.path.realpath(path))
+        key = os.path.realpath(path)
+        seen = self._seen.get(key)
         if seen is None:
             return f"Refused: you have not read {path}: read it before you {tool} it"
         if seen != (st.st_mtime_ns, st.st_size):
             return (
                 f"Refused: {path} changed since you read it (by the user or another program): "
                 f"read it again before you {tool} it"
+            )
+        if tool == "write" and key in self._absorbed:
+            return (
+                f"Refused: a hook rewrote {path} after your edit, so you have not seen it as it is now: "
+                f"read it before you {tool} it whole"
             )
         return None
 

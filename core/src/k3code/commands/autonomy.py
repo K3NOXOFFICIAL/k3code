@@ -123,7 +123,7 @@ class GoCommand(CommandDef):
         from k3code.commands.ultra_cmd import go_for_ultraplan
 
         if (planned := go_for_ultraplan(live)) is not None:
-            ctx.store.save(live.stored)
+            ctx.store.save_meta_of(live.stored)
             return planned
         task = (live.stored.meta.get("preview_task") if live else None) or ""
         if not task:

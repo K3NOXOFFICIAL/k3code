@@ -755,11 +755,19 @@ class AgentLoop:
         post = await self._run_hooks(
             "PostToolUse", tool_call.name, {"tool_input": args, "tool_response": format_tool_result(result)}
         )
-        if stamped is not None and tool_call.name in FILE_TOOLS and self.hooks:
+        if (
+            stamped is not None
+            and tool_call.name in FILE_TOOLS
+            and not post.blocked
+            and self.hooks
+            and self.hooks.for_event("PostToolUse", tool_call.name)
+        ):
             # A formatter hook (prettier, black, gofmt) rewrote the file this call changed: that is the file as the
             # session left it, not a change by someone else, or the next edit of it was refused as "changed since you
-            # read it". Not for a read: what the model was shown is then no longer what is on disk.
-            self.file_stamps.record(stamped)
+            # read it". Not for a read: what the model was shown is then no longer what is on disk. A later `write`
+            # still needs a fresh read (`absorbed`): whatever the hook's window let in (a save of the user's) would be
+            # replaced unseen.
+            self.file_stamps.record(stamped, absorbed=True)
         feedback = "\n".join(t for t in (post.reason if post.blocked else "", post.context_text()) if t)
         if feedback:  # the tool already ran: the hook's word joins its result for the model (format_tool_result)
             result = {**result, HOOK_FEEDBACK_KEY: feedback}

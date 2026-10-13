@@ -19,6 +19,7 @@ from k3code.learning.decisions import DecisionLog
 from k3code.learning.fsutil import write_text_atomic
 from k3code.learning.updateconfig import PatchRejected, check_patch, merge_patch
 from k3code.paths import ensure_private_dir, home, private_file, user_config_path
+from k3code.usage import CUT_SHORT
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ def collect(
     ev = [r for r in usage_rows if since <= r["ts"] < until]
     sessions = {r["session"] for r in ev if r["session"]}
     n_sess = max(1, len(sessions))
-    calls = [r for r in ev if r["kind"] == "call"]
+    calls = [r for r in ev if r["kind"] == "call" and r.get("detail") != CUT_SHORT]  # a dead attempt is no extra call
     by_tier: dict[str, dict[str, int]] = {}
     for r in calls:
         by_tier.setdefault(r["tier"] or "main", _tier_row())["calls"] += 1

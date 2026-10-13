@@ -304,6 +304,7 @@ class LiveSession:
         #: ... seeded from the meta (see _persist_turn): a resumed, forked or daemon-restarted session would otherwise
         #: refuse the first edit of every file its history shows as read
         self.file_stamps.load(stored.meta.get("file_stamps"))
+        self.ultra_dirty_noted = False  # the always-on ultracode told the user its checkout is dirty (once a spell)
         self.pending_approval: asyncio.Future[dict[str, Any]] | None = None
         self.pending_request_id: str | None = None
         # an invalid configured permission_mode fails this session's creation with a named error (an RPC reply), not
@@ -2049,24 +2050,29 @@ class GatewayServer:
             or text.lstrip().startswith("/")
         ):
             return None
-        if dirty := await dirty_checkout(Path(session.perms.cwd)):
-            # /ultracode refuses a checkout with uncommitted changes (the fan-out merges into it): a typed prompt is
-            # answered by an ordinary turn instead of by that refusal, and the user is told once why nothing ran
-            session.emit(
-                "notification.show",
-                {
-                    "text": f"ultracode is on but skipped for this prompt: {dirty_text(dirty)}",
-                    "level": "info",
-                    "kind": "ultracode",
-                    "key": f"k3.ultra_dirty.{session.session_id}",
-                },
-            )
-            return None
         session.emit("status.update", {"kind": "status", "text": "checking scope", "state": "working"})
         verdict = await self.autonomy.mode_verdict(session, text)
         min_scope = str(ultra_cfg(self.config)["min_scope"])
         if verdict.source == "fallback" or SCOPES.index(verdict.scope) < SCOPES.index(min_scope):
             return None  # trivial, or the classifier is down: not worth a pipeline; the gate reuses this verdict
+        if dirty := await dirty_checkout(Path(session.perms.cwd)):
+            # /ultracode refuses a checkout with uncommitted changes (the fan-out merges into it): this prompt, one
+            # ultracode would have taken, is answered by an ordinary turn instead of that refusal (the gate reuses the
+            # verdict), and the user is told once per dirty spell, for a few seconds
+            if not session.ultra_dirty_noted:
+                session.ultra_dirty_noted = True
+                session.emit(
+                    "notification.show",
+                    {
+                        "text": f"ultracode is on but skipped for this prompt: {dirty_text(dirty)}",
+                        "level": "info",
+                        "kind": "ttl",
+                        "ttl_ms": 15000,
+                        "key": f"k3.ultra_dirty.{session.session_id}",
+                    },
+                )
+            return None
+        session.ultra_dirty_noted = False
         ultracode: Any = self.commands.get("ultracode")
         spec = await ultracode.prepare(self, session, text, context=context, verdict=verdict)
         self.autonomy.drop_mode_verdict(session)

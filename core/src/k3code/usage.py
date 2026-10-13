@@ -50,6 +50,9 @@ CREATE INDEX IF NOT EXISTS events_session ON events(session);
 #: Event kinds written to the table (every ``record`` call uses one of these; a test greps the sources for it).
 #: ``escalated`` = a quality escalation (the attempt stalled); ``outage`` = a tier moved on because its providers
 #: were all unreachable (not a quality signal); ``loop_guard`` = the loop guard fired on any tier.
+#: The ``detail`` of the row of an attempt that died after the provider had counted its prompt: its tokens are spent and
+#: charged, but it is not another model call (``/usage`` and ``/stats`` call counts, the optimizer's rates).
+CUT_SHORT = "attempt cut short"
 KINDS = ("call", "failover", "retry", "pause", "tool", "approval", "escalated", "outage", "loop_guard", "subagent")
 
 
@@ -199,7 +202,7 @@ class UsageDB:
             args.append(time.time() - days * 86400)
         sql = (
             "SELECT ts, day, session, kind, provider, model, tokens_in, tokens_out, cost_usd, seconds, tier,"
-            " task_kind, turn, cache_read, cache_write FROM events"
+            " task_kind, turn, cache_read, cache_write, detail FROM events"
         )
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -222,6 +225,7 @@ class UsageDB:
             turn,
             c_read,
             c_write,
+            detail,
         ) in rows:
             key = {"day": day, "session": sess, "turn": turn}[by]
             g = groups.setdefault(
@@ -259,19 +263,20 @@ class UsageDB:
             if cost is not None:
                 g["cost_usd"] = (g["cost_usd"] or 0.0) + cost
             if kind == "call":
-                g["calls"] += 1
-                calls[key][f"{provider}/{model}"] += 1
+                n = 0 if detail == CUT_SHORT else 1  # the tokens of a dead attempt count, it is not another call
+                g["calls"] += n
+                calls[key][f"{provider}/{model}"] += n
                 if tier:
                     t = g["by_tier"].setdefault(tier, {"calls": 0, "tokens_in": 0, "tokens_out": 0})
-                    t["calls"] += 1
+                    t["calls"] += n
                     t["tokens_in"] += t_in
                     t["tokens_out"] += t_out
                     if cost is not None:  # only providers that report a cost (claude-cli) add this key
                         t["cost_usd"] = t.get("cost_usd", 0.0) + cost
                 if task_kind:
-                    g["by_kind"][task_kind] = g["by_kind"].get(task_kind, 0) + 1
+                    g["by_kind"][task_kind] = g["by_kind"].get(task_kind, 0) + n
                     k = g["tokens_by_kind"].setdefault(task_kind, {"calls": 0, "tokens_in": 0, "tokens_out": 0})
-                    k["calls"] += 1
+                    k["calls"] += n
                     k["tokens_in"] += t_in
                     k["tokens_out"] += t_out
             elif kind == "failover":

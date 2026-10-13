@@ -393,3 +393,112 @@ def test_a_failed_edit_of_a_file_over_a_megabyte_gets_the_plain_no_match_message
     on_big = plan_edit({"path": str(big), **near_miss})
     assert "Did you mean" in on_small["error"]
     assert on_big == {"error": "Could not find a match for old_string in the file"}
+
+
+# ── the ninth pass: the stamps and the project check, once more ─────────────────────────────────────────────────────
+
+
+async def test_a_write_after_a_hooked_edit_needs_a_fresh_read(tmp_path):
+    """What the hook's window let in (a save of the user's) cannot be told from the hook's own rewrite, so the
+    whole-file `write` that would replace it unseen needs a read first; an `edit` is not held up (its old_string must
+    still match)."""
+    f = tmp_path / "a.py"
+    f.write_text("x=1\ny=2\n")
+    script = [
+        call("r", "read", path=str(f)),
+        call("e", "edit", path=str(f), old_string="x=1", new_string="x = 10"),
+        call("w1", "write", path=str(f), content="whole\n"),
+        call("r2", "read", path=str(f)),
+        call("w2", "write", path=str(f), content="whole\n"),
+    ]
+    loop = loop_for(tmp_path, script, mode=PermissionMode.YOLO)
+    loop.hooks = formatter_hook(tmp_path, f)
+    results = await run(loop)
+    assert "Edited: 1 replacement" in results["e"]
+    assert "Refused: a hook rewrote" in results["w1"] and "read it before you write it whole" in results["w1"]
+    assert "Wrote" in results["w2"] and f.read_text().startswith("whole\n")
+
+
+async def test_a_hook_that_does_not_match_the_edit_does_not_hold_up_a_whole_file_write(tmp_path):
+    """Only a hook that ran for the edit can have rewritten the file: a PostToolUse hook for bash changes nothing."""
+    f = tmp_path / "a.py"
+    f.write_text("x=1\ny=2\n")
+    script = [
+        call("r", "read", path=str(f)),
+        call("e", "edit", path=str(f), old_string="x=1", new_string="x = 10"),
+        call("w", "write", path=str(f), content="whole\n"),
+    ]
+    loop = loop_for(tmp_path, script, mode=PermissionMode.YOLO)
+    loop.hooks = userhooks.HookRunner([userhooks.Hook("PostToolUse", "true", "bash")], cwd=tmp_path)
+    results = await run(loop)
+    assert "Wrote" in results["w"] and f.read_text() == "whole\n"
+
+
+def test_the_stamps_kept_across_a_resume_are_the_newest_not_the_first(tmp_path):
+    stamps = FileStamps()
+    files = []
+    for i in range(FileStamps.KEEP + 50):
+        f = tmp_path / f"f{i}.txt"
+        f.write_text("x")
+        files.append(f)
+        stamps.record(f)
+    stamps.record(files[0])  # the file worked on last: first inserted, but newest
+    kept = stamps.export()
+    assert len(kept) == FileStamps.KEEP
+    assert str(files[0]) in kept and str(files[1]) not in kept
+    fresh = FileStamps()
+    fresh.load(kept)
+    assert fresh.refusal("edit", files[0]) is None
+    stamps.clear()
+    assert stamps.export() == {} and stamps.refusal("edit", files[0]) is not None
+
+
+def test_a_link_followed_by_dotdot_is_judged_by_the_file_it_reaches(tmp_path):
+    project, outside = tmp_path / "project", tmp_path / "outside"
+    (outside / "sub").mkdir(parents=True)
+    project.mkdir()
+    (project / "link").symlink_to(outside / "sub")
+    (outside / "x.txt").write_text("secret")
+    (project / "x.txt").write_text("mine")
+    lexical = project / "link" / ".." / "x.txt"  # normpath says project/x.txt; the kernel reaches outside/x.txt
+    assert not inside_roots(str(lexical), project)
+    assert inside_roots(project / "x.txt", project)
+
+
+async def test_clear_forgets_what_the_session_had_read(tmp_path):
+    from k3code.commands.builtin import _ClearCommand
+    from k3code.gateway.sessions import StoredSession
+
+    stamps_meta = {str(tmp_path / "a.py"): [1, 2]}
+
+    class Store:
+        """The row as the database holds it: a copy with the stamps in its meta."""
+
+        saved: list[dict] = []
+
+        def get(self, _sid: str) -> StoredSession:
+            return StoredSession(session_id="s1", cwd=str(tmp_path), meta={"file_stamps": dict(stamps_meta)})
+
+        def save(self, sess: StoredSession) -> None:
+            self.saved.append(dict(sess.meta))
+
+    stored = StoredSession(session_id="s1", cwd=str(tmp_path), meta={"file_stamps": dict(stamps_meta)})
+    f = tmp_path / "a.py"
+    f.write_text("x")
+    live = SimpleNamespace(
+        messages=[],
+        stored=stored,
+        streaming=False,
+        reads={},
+        pinned_reads=set(),
+        elided=set(),
+        elide_notes={},
+        refresh_prompt_inputs=lambda: None,
+        file_stamps=FileStamps(),
+    )
+    live.file_stamps.record(f)
+    store = Store()
+    await _ClearCommand().handle(SimpleNamespace(sessions={"s1": live}, store=store), "s1", "")
+    assert live.file_stamps.refusal("edit", f) is not None
+    assert "file_stamps" not in live.stored.meta
+    assert store.saved and all("file_stamps" not in meta for meta in store.saved)  # what is written has none

@@ -147,6 +147,8 @@ class _ClearCommand(CommandDef):
         live.messages = []
         live.refresh_prompt_inputs()  # a new conversation: show what was learned since this prompt was built
         live.reads.clear()
+        live.file_stamps.clear()  # the new conversation has seen none of these files (and the saved ones go below)
+        live.stored.meta.pop("file_stamps", None)
         live.pinned_reads.clear()
         live.elided.clear()
         live.elide_notes.clear()
@@ -155,6 +157,7 @@ class _ClearCommand(CommandDef):
         stored: StoredSession | None = ctx.store.get(session_id or "")
         if stored is not None:
             stored.messages = []
+            stored.meta.pop("file_stamps", None)
             ctx.store.save(stored)
         return {"type": "message", "message": "Session cleared."}
 
@@ -209,7 +212,7 @@ class _RenameCommand(CommandDef):
         if stored is None:
             return {"type": "message", "message": "Session not found."}
         stored.title = scrub_surrogates(arg)
-        ctx.store.save(stored)
+        ctx.store.save_meta_of(stored)
         ctx.emit("session.title", {"session_id": session_id, "title": stored.title})
         return {"type": "message", "message": f"Renamed to: {stored.title}"}
 

@@ -188,6 +188,27 @@ def _placeholder(value: Any) -> bool:
     return isinstance(value, str) and REDACTED in value
 
 
+def _hidden_in_part(obj: Any, path: str = "") -> list[str]:
+    """Where ``obj`` has a string that holds the marker among other text (``redact()`` hid part of it, or it is the
+    user's own text): the exact marker is the exporter's ordinary "hidden" and is not listed."""
+    found: list[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            here = f"{path}.{k}" if path else str(k)
+            if (_placeholder(k) and k != REDACTED) or (_placeholder(v) and v != REDACTED):
+                found.append(here)
+            else:
+                found.extend(_hidden_in_part(v, here))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            here = f"{path}[{i}]"
+            if _placeholder(v) and v != REDACTED:
+                found.append(here)
+            else:
+                found.extend(_hidden_in_part(v, here))
+    return found
+
+
 def _strip_redacted(obj: Any) -> Any:
     """Drop placeholder values and keys from the dicts inside ``obj``. A list keeps the marker in place: without it
     every later argument of ``--model <redacted> --port 9000`` would shift (``--model --port 9000``)."""
@@ -206,12 +227,32 @@ def _has_redacted(obj: Any) -> bool:
     return _placeholder(obj)
 
 
+def _names(items: list[Any]) -> list[str] | None:
+    """The ``name`` of every entry when all of them are dicts with a distinct, plain name; else None."""
+    names = [x.get("name") if isinstance(x, dict) else None for x in items]
+    if not items or not all(isinstance(n, str) and n and not _placeholder(n) for n in names):
+        return None
+    return names if len(set(names)) == len(names) else None  # type: ignore[return-value]
+
+
 def _merge_list(existing: list[Any], incoming: list[Any]) -> list[Any]:
     """An incoming list holding placeholders, over a list of the same length (the bundle's own export, imported on the
     machine it came from): each placeholder keeps what is there, so a round trip does not delete ``--token=…`` from an
     ``args`` list or the ``command`` of a hook. Lists of another length are not aligned, so
     the placeholder stays where it is (see ``_strip_redacted``): it never overwrites a real value, and it does not shift
     the arguments after it."""
+    old_names, new_names = _names(existing), _names(incoming)
+    if old_names is not None and new_names is not None:
+        # entries that carry a name (the providers) are matched by it: matched by position, a bundle that lists the same
+        # providers in another order paired one provider's key with another's endpoint, and `sensitive_items` (which
+        # compares by name) had nothing to show for it
+        have = dict(zip(old_names, existing, strict=True))
+        return [
+            merge_settings(have[name], new) if name in have else _strip_redacted(new)
+            for name, new in zip(new_names, incoming, strict=True)
+        ]
+    if any(isinstance(x, dict) and "name" in x for x in (*existing, *incoming)):
+        return _strip_redacted(incoming)  # names that are missing, repeated or hidden: nothing to match them by
     if len(existing) != len(incoming):
         return _strip_redacted(incoming)
     out: list[Any] = []
@@ -357,6 +398,9 @@ class ImportReport:
     skipped: list[str] = field(default_factory=list)
     #: sessions left out because their record is not a session (original id: why)
     invalid_sessions: dict[str, str] = field(default_factory=dict)
+    #: settings the bundle hides in part (a value holding ``<redacted>`` among other text): left as they are on this
+    #: machine, or not written; a value that really contains that text is among them
+    hidden: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
         lines = []
@@ -367,6 +411,9 @@ class ImportReport:
                 f"warning: skipped {key} from the bundle (runs code, approves tools or sends keys; accept it item by "
                 "item in an interactive import, or pass --trust-bundle)"
             )
+        if self.hidden:
+            shown = ", ".join(self.hidden[:5]) + (f" and {len(self.hidden) - 5} more" if len(self.hidden) > 5 else "")
+            lines.append(f"note: not written, the bundle hides all or part of them (kept as they are here): {shown}")
         for sid, why in self.invalid_sessions.items():
             lines.append(f"warning: skipped session {sid} from the bundle: {why}")
         for b in self.backups:
@@ -444,6 +491,7 @@ def apply_bundle(
                     if accept is None or not accept(item):
                         incoming = _without(incoming, item.path)
                         rep.skipped.append(item.key)
+            rep.hidden.extend(f"{kind}: {where}" for where in _hidden_in_part(incoming))
             merged = merge_settings(confio.read_yaml(target), incoming)
             confio.validate(merged)
             # the bundle's project settings are its author's: never trusted on the user's behalf (see k3code.trust)

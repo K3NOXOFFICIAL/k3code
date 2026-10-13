@@ -300,3 +300,174 @@ def test_file_stamps_are_not_carried_in_by_an_imported_bundle() -> None:
     from k3code.bundle import _UNTRUSTED_META
 
     assert "file_stamps" in _UNTRUSTED_META
+
+
+# ── entries with a name are matched by it, not by position ──────────────────────────────────────────────────────
+
+
+def _named_provider(name: str, url: str, env: str) -> dict:
+    return {"name": name, "kind": "openai", "base_url": url, "api_key_env": env, "models": {}}
+
+
+def test_providers_listed_in_another_order_keep_their_own_endpoint_and_key() -> None:
+    """Matched by position, a bundle that lists the same providers in another order (each with its endpoint hidden in
+    part) paired one provider's key with another's endpoint, and `sensitive_items` (by name) showed nothing."""
+    from k3code.bundle import merge_settings
+
+    have = {
+        "providers": [
+            _named_provider("corp-relay", "https://llm.corp.example/v1", "RELAY_KEY"),
+            _named_provider("anthropic", "https://api.anthropic.com", "ANTHROPIC_API_KEY"),
+        ]
+    }
+    hidden = "https://x.example/<redacted>"
+    bundle = {
+        "providers": [
+            _named_provider("anthropic", hidden, "ANTHROPIC_API_KEY"),
+            _named_provider("corp-relay", hidden, "RELAY_KEY"),
+        ]
+    }
+    merged = {p["name"]: p for p in merge_settings(have, bundle)["providers"]}
+    assert merged["anthropic"]["base_url"] == "https://api.anthropic.com"
+    assert merged["anthropic"]["api_key_env"] == "ANTHROPIC_API_KEY"
+    assert merged["corp-relay"]["base_url"] == "https://llm.corp.example/v1"
+    assert merged["corp-relay"]["api_key_env"] == "RELAY_KEY"
+
+
+def test_a_provider_the_bundle_adds_gets_no_placeholder_endpoint_and_one_it_drops_goes() -> None:
+    from k3code.bundle import merge_settings
+
+    have = {
+        "providers": [
+            _named_provider("a", "https://a.example/v1", "A_KEY"),
+            _named_provider("b", "https://b.example/v1", "B_KEY"),
+        ]
+    }
+    bundle = {
+        "providers": [
+            _named_provider("a", "https://x/<redacted>", "A_KEY"),
+            _named_provider("c", "https://x/<redacted>", "C_KEY"),
+        ]
+    }
+    merged = merge_settings(have, bundle)["providers"]
+    assert [p["name"] for p in merged] == ["a", "c"]
+    assert merged[0]["base_url"] == "https://a.example/v1"
+    assert "base_url" not in merged[1] and merged[1]["api_key_env"] == "C_KEY"
+
+
+def test_entries_without_distinct_names_are_not_matched_by_position() -> None:
+    from k3code.bundle import merge_settings
+
+    have = {
+        "providers": [
+            _named_provider("a", "https://a.example/v1", "A_KEY"),
+            _named_provider("a", "https://b.example/v1", "B_KEY"),
+        ]
+    }
+    bundle = {
+        "providers": [
+            _named_provider("a", "https://x/<redacted>", "B_KEY"),
+            _named_provider("a", "https://x/<redacted>", "A_KEY"),
+        ]
+    }
+    merged = merge_settings(have, bundle)["providers"]
+    assert all("base_url" not in p for p in merged)  # nothing real is attached to a key it was not paired with
+    assert [p["api_key_env"] for p in merged] == ["B_KEY", "A_KEY"]
+
+
+def test_unnamed_entries_such_as_hooks_still_align_by_position() -> None:
+    from k3code.bundle import merge_settings
+
+    have = {"hooks": {"PreToolUse": [{"matcher": "*", "command": "secret-cmd --key=k"}]}}
+    bundle = {"hooks": {"PreToolUse": [{"matcher": "*", "command": "<redacted>"}]}}
+    assert merge_settings(have, bundle) == have
+
+
+# ── the ninth pass: small seams of the eighth ───────────────────────────────────────────────────────────────────────
+
+
+def test_a_boolean_is_not_a_stall_limit() -> None:
+    from pydantic import ValidationError
+
+    from k3code.config import ProviderEntry
+
+    for key in ("first_event_timeout", "idle_timeout"):
+        with pytest.raises(ValidationError, match=key):
+            ProviderEntry(name="p", kind="openai", base_url="https://x.test/v1", api_key_env="K", **{key: True})
+    entry = ProviderEntry(
+        name="p", kind="openai", base_url="https://x.test/v1", api_key_env="K", first_event_timeout=45
+    )
+    assert entry.first_event_timeout == 45
+
+
+def test_a_retention_value_below_one_reads_as_one_not_as_zero() -> None:
+    """0.5 passes the validation (above 0) and used to read as int(0.5) == 0: prune every usage row / journal."""
+    from types import SimpleNamespace
+
+    from k3code.config import retention
+
+    assert retention(SimpleNamespace(retention={"journal_mb": 0.5, "usage_days": 0.2}))["journal_mb"] == 1
+    assert retention(SimpleNamespace(retention={"usage_days": 0.2}))["usage_days"] == 1
+    assert retention(SimpleNamespace(retention={"journal_mb": 7.9}))["journal_mb"] == 7
+
+
+async def test_a_repository_with_no_commit_has_no_head(tmp_path) -> None:
+    """git prints its error for `rev-parse HEAD` there; that text is not a commit (the fan-out and /ultracode take a
+    non-empty answer to mean there is something to branch from, and spent a run on a repository with nothing in it)."""
+    import subprocess
+
+    from k3code.subagents import worktree
+
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    assert await worktree.head_sha(tmp_path) == ""
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "first"],
+        cwd=tmp_path,
+        check=True,
+    )
+    assert len(await worktree.head_sha(tmp_path)) == 40
+
+
+async def test_rename_and_go_after_an_ultraplan_write_only_the_meta_and_title() -> None:
+    from types import SimpleNamespace
+
+    from k3code.commands.autonomy import GoCommand
+    from k3code.commands.builtin import _RenameCommand
+    from k3code.gateway.sessions import StoredSession
+
+    class Store:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def save(self, _sess: StoredSession) -> None:
+            self.calls.append("save")
+
+        def save_meta_of(self, _sess: StoredSession) -> None:
+            self.calls.append("save_meta_of")
+
+    stored = StoredSession(session_id="s1", cwd="/tmp", meta={"ultra_plan": {"task": "do it", "plan": "p", "path": ""}})
+    live = SimpleNamespace(stored=stored, preapproved_plan=None)
+    store = Store()
+    ctx = SimpleNamespace(sessions={"s1": live}, store=store, emit=lambda *_a, **_k: None)
+    await _RenameCommand().handle(ctx, "s1", "a new title")
+    assert stored.title == "a new title" and store.calls == ["save_meta_of"]
+    await GoCommand().handle(ctx, "s1", "")
+    assert "ultra_plan" not in stored.meta and live.preapproved_plan and store.calls == ["save_meta_of"] * 2
+
+
+def test_the_import_report_names_the_values_the_bundle_hides_in_part(tmp_path) -> None:
+    """A hook command or MCP argument that really contains the text `<redacted>` is shown to the user, accepted, and
+    then not written (it cannot be told from a part the exporter hid); the report now says so, not nothing."""
+    from k3code.bundle import Bundle, apply_bundle
+    from k3code.gateway.sessions import SessionStore
+
+    incoming = {
+        "hooks": {"PreToolUse": [{"matcher": "bash", "command": "grep -v '<redacted>' /tmp/log"}]},
+        "mcp": {"servers": {"s": {"command": "npx", "args": ["--flag=<redacted>"]}}},
+        "mem0": {"api_key": "<redacted>"},  # the exporter's ordinary hidden value: not listed
+    }
+    bundle = Bundle(manifest={"version": 1}, settings={"user": incoming})
+    rep = apply_bundle(bundle, store=SessionStore(tmp_path / "s.db"), cwd=tmp_path, sessions=False, trust_bundle=True)
+    assert rep.hidden == ["user: hooks.PreToolUse[0].command", "user: mcp.servers.s.args[0]"]
+    assert "not written, the bundle hides" in rep.describe() and "hooks.PreToolUse[0].command" in rep.describe()
+    assert not any("mem0" in h for h in rep.hidden)

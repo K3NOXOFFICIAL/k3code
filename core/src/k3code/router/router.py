@@ -256,8 +256,19 @@ class Router:
         all_auth = True  # tracks "every failure and every cooldown seen so far was an auth rejection"
         saw_limit = False  # a rate limit or quota failure (or cooldown) was seen: the wait below is its reset
         auth_failed: set[int] = set()  # entries rejected in this walk (a first rejection arms no cooldown)
-        entry_index = 0
-        while entry_index < len(self.chain):
+        order = list(range(len(self.chain)))
+        deferred: list[int] = []
+        second_pass = False
+        pos = 0
+        while True:
+            if pos >= len(order):
+                if deferred and not second_pass:
+                    order.extend(deferred)
+                    second_pass = True
+                    continue
+                break
+            entry_index = order[pos]
+            pos += 1
             entry = self.chain[entry_index]
             target_model = model if entry_index == 0 and model else entry.model
             skip_reason = self._skip_in_cooldown(entry, target_model)
@@ -269,10 +280,14 @@ class Router:
                     base_url=entry.base_url,
                     fingerprint=entry.key_fingerprint,
                 )
-                if cooled in _DEAD_ENTRY_REASONS and not self._free_entry_after(entry_index):
+                if cooled in _DEAD_ENTRY_REASONS and second_pass:
+                    skip_reason = None
+                elif cooled in _DEAD_ENTRY_REASONS and not self._free_entry_after(entry_index):
                     # No live entry left to go to: skipping this one would only turn a dead chain into a 60 s wait
                     # (and, unattended, a park that never counts against its cap). Try it, as before the window.
                     skip_reason = None
+            if skip_reason is not None and cooled in _DEAD_ENTRY_REASONS:
+                deferred.append(entry_index)
             if skip_reason is not None:
                 logger.debug(
                     "skipping %s/%s: cooldown %.0fs remaining (%s)",
@@ -286,7 +301,6 @@ class Router:
                     all_network = all_network and cooled is FailoverReason.network
                     all_auth = all_auth and cooled is FailoverReason.auth
                     saw_limit = saw_limit or cooled in (FailoverReason.rate_limit, FailoverReason.quota)
-                entry_index += 1
                 continue
             attempt = 0
             while True:
@@ -372,7 +386,6 @@ class Router:
                         extra={"delay": delay},
                     )
                     await self._sleep(delay)
-            entry_index += 1
         # every entry exhausted
         self._emit_exhausted(last_reason, last_detail)
         if all_network and last_reason is not None:

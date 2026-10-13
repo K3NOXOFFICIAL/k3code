@@ -589,3 +589,24 @@ async def test_harness_diff_runs_neither_a_textconv_nor_an_external_diff_program
             assert not marker.exists(), f"harness git ran the program of {key}"
         finally:
             git("config", "--unset", key)
+
+
+# Files the model may not read (`sensitive_path`) are exempt from the read-first rule of `write` and `edit`: the
+# person's approval of the diff is then the only check, so they are confirmed every time, like `.env` itself.
+UNREADABLE_DOTENV = [".env.local", ".env.production", ".env.test", "config/.env.staging", ".ENV.LOCAL"]
+
+
+@pytest.mark.parametrize("rel", UNREADABLE_DOTENV)
+def test_a_dotenv_variant_the_model_cannot_read_is_confirmed_every_time(tmp_path: Path, rel: str) -> None:
+    for tool in ("write", "edit"):
+        for mode in MODES:
+            dec = decide(mode=mode, tool=tool, args={"path": rel}, cwd=tmp_path)
+            assert dec.action == "ask" and dec.needs_human and dec.always_ask, (mode, tool, rel, dec)
+            assert decide(mode=mode, tool=tool, args={"path": rel}, cwd=tmp_path, headless=True).action == "deny"
+    for layers in _rule_layers(Rule("edit", "*", "allow")):
+        assert decide(mode="yolo", tool="write", args={"path": rel}, cwd=tmp_path, **layers).action == "ask"
+
+
+def test_a_template_dotenv_file_is_still_an_ordinary_file(tmp_path: Path) -> None:
+    for rel in (".env.example", ".env.sample", ".env.template", ".env.dist"):
+        assert decide(mode="yolo", tool="write", args={"path": rel}, cwd=tmp_path).action == "allow", rel
