@@ -37,6 +37,30 @@ export function approvalOptions(req: ApprovalReq): readonly ApprovalChoice[] {
   return req.allowPermanent === false ? APPROVAL_OPTS_NO_ALWAYS : APPROVAL_OPTS;
 }
 
+/**
+ * The row text for `choice`, followed by the rules it adds when the gateway
+ * names them: "Always allow" on `touch a.txt` stores the whole family
+ * (`allow bash touch * [project]`), so the prompt says so before it is stored.
+ */
+export function approvalLabel(
+  req: ApprovalReq,
+  choice: ApprovalChoice,
+): string {
+  const label = req.labels?.[choice] ?? LABELS[choice];
+  const rules =
+    choice === "always" || choice === "session"
+      ? req.rules?.[choice]
+      : undefined;
+
+  if (!rules) {
+    return label;
+  }
+
+  return rules.length > 0
+    ? `${label} · ${rules.join(", ")}`
+    : `${label} · adds no rule, allows this call only`;
+}
+
 type ApprovalKey = {
   downArrow?: boolean;
   escape?: boolean;
@@ -155,7 +179,7 @@ export function ApprovalPrompt({
         <Text key={o}>
           <Text color={t.color.muted} {...chipRowProps(t, sel === i)}>
             {sel === i ? "▸ " : "  "}
-            {i + 1}. {req.labels?.[o] ?? LABELS[o]}
+            {i + 1}. {approvalLabel(req, o)}
           </Text>
         </Text>
       ))}

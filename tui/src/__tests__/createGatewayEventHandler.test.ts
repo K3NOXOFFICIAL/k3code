@@ -1565,6 +1565,23 @@ describe("createGatewayEventHandler", () => {
     });
   });
 
+  it("keeps the rules each approval choice stores, an empty list included", () => {
+    serverRequest("approval", {
+      command: "touch /home/u/pa1.txt",
+      description: "bash",
+      rules: { always: ["allow bash touch * [project]"], session: [] },
+    });
+
+    expect(getOverlayState().approval?.rules).toEqual({
+      always: ["allow bash touch * [project]"],
+      session: [],
+    });
+
+    serverRequest("approval", { command: "Approve this plan?" });
+
+    expect(getOverlayState().approval?.rules).toBeUndefined();
+  });
+
   it("declines the requests a terminal cannot answer so the channel fails them fast", () => {
     for (const method of [
       "preview.act",

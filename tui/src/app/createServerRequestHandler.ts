@@ -1,6 +1,6 @@
 import type { ServerRequest } from "@k3code/shared/json-rpc-channel";
 
-import type { ClarifyBatchQuestion } from "../types.js";
+import type { ApprovalReq, ClarifyBatchQuestion } from "../types.js";
 
 import { patchOverlayState } from "./overlayStore.js";
 import { rememberServerRequest } from "./serverRequestStore.js";
@@ -16,6 +16,25 @@ const strList = (v: unknown): null | string[] =>
   Array.isArray(v) && v.length > 0
     ? v.filter((c): c is string => typeof c === "string")
     : null;
+
+// Unlike strList, an empty list is kept: it says the choice stores no rule.
+const approvalRules = (v: unknown): ApprovalReq["rules"] => {
+  if (!v || typeof v !== "object") {
+    return undefined;
+  }
+
+  const out: NonNullable<ApprovalReq["rules"]> = {};
+
+  for (const choice of ["always", "session"] as const) {
+    const list = (v as Record<string, unknown>)[choice];
+
+    if (Array.isArray(list)) {
+      out[choice] = list.filter((r): r is string => typeof r === "string");
+    }
+  }
+
+  return out;
+};
 
 /**
  * The Ink TUI's answer to the backend's server→client requests
@@ -106,6 +125,7 @@ export function createServerRequestHandler(
                 ? (p.labels as Record<string, string>)
                 : undefined,
             requestId: request.id,
+            rules: approvalRules(p.rules),
             smartDenied: p.smart_denied === true,
           },
         });
