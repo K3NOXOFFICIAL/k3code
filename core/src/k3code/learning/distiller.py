@@ -344,8 +344,7 @@ def store_mem0(
             continue
         body = {
             "messages": [{"role": "user", "content": f"User preference (learned by k3code): {p.text}"}],
-            "agent_id": m.agent_id,
-            **({"user_id": m.user_id} if m.user_id else {}),
+            **m.identifiers(),
             "metadata": {"confidence": p.confidence, "evidence": p.evidence, "source": "k3code-distiller"},
         }
         try:
