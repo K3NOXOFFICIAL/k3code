@@ -265,3 +265,34 @@ def test_onboard_clears_auth_cooldowns_for_the_rewritten_provider(root) -> None:
     r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])
     assert r.exit_code == 0, r.output
     assert CooldownStore(path=path).reason_of(provider="endpoint", model="m-fast") is None
+
+
+def test_detect_offers_claude_cli_only_while_claude_is_logged_in(root, monkeypatch, fake_claude) -> None:
+    """`claude` on PATH is not a login: a logged-out one is not "found", an unknown state counts as before."""
+    monkeypatch.setattr(ob.probe, "probe_url", lambda *a, **k: (False, 0.0, "down"))
+    fake_claude("in")
+    assert "logged in" in ob.detect_providers()["claude-cli"]
+    fake_claude("out")
+    assert "claude-cli" not in ob.detect_providers()
+    fake_claude("old")  # a Claude Code without `auth status`: cannot tell
+    assert "claude-cli" in ob.detect_providers()
+
+
+def test_fast_claude_cli_says_when_claude_is_not_logged_in(root, fake_claude) -> None:
+    """The unattended default (`claude` exists, no onboard.provider) used to end with a plain "Ready"."""
+    fake_claude("out")
+    answers = _answers(root, {"onboard": {"mode": "fast"}})
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers)])
+    assert r.exit_code == 0, r.output
+    assert "not logged in" in r.output and "`claude`" in r.output and "/login" in r.output
+    assert [(p.name, p.kind) for p in load_config(project_dir=root).providers] == [("claude-cli", "claude-cli")]
+
+
+def test_fast_claude_cli_has_no_login_note_when_logged_in_or_unprobed(root, fake_claude) -> None:
+    answers = _answers(root, {"onboard": {"mode": "fast", "provider": "claude-cli"}})
+    fake_claude("in")
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers)])
+    assert r.exit_code == 0 and "not logged in" not in r.output, r.output
+    fake_claude("out")
+    r = CliRunner().invoke(cli, ["onboard", "--answers", str(answers), "--no-probe"])  # --no-probe: claude is not run
+    assert r.exit_code == 0 and "not logged in" not in r.output, r.output
