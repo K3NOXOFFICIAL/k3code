@@ -6,7 +6,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from k3code.autonomy.fanout import detect_test_command, extract_subtasks, parse_verdict
+from k3code.autonomy.fanout import detect_test_command, extract_subtasks, parse_verdict, run_tests
 from k3code.autonomy.scope import ScopeVerdict
 from m1cmd_helpers import git_repo
 from test_autonomy_gateway import PLAN, call, events, make, run_turn
@@ -304,11 +304,65 @@ def test_detect_test_command(tmp_path):
     (tmp_path / "go.mod").write_text("")
     assert detect_test_command(tmp_path) == "go test ./..."
     (tmp_path / "pytest.ini").write_text("")
-    assert detect_test_command(tmp_path) == "python -m pytest -q -x"
+    assert detect_test_command(tmp_path) == "python3 -m pytest -q -x"  # stock Ubuntu has no `python`
     (tmp_path / "package.json").write_text('{"scripts": {"test": "jest"}}')
     assert detect_test_command(tmp_path) == "npm test --silent"
     (tmp_path / "package.json").write_text('{"scripts": {}}')
-    assert detect_test_command(tmp_path) == "python -m pytest -q -x"
+    assert detect_test_command(tmp_path) == "python3 -m pytest -q -x"
+    fake_python(tmp_path, has_pytest=True)
+    assert detect_test_command(tmp_path) == ".venv/bin/python -m pytest -q -x"
+
+
+def fake_python(root: Path, *, has_pytest: bool) -> None:
+    """A stand-in ``.venv/bin/python``: ``-m pytest`` passes; ``import pytest`` works only when ``has_pytest``."""
+    py = root / ".venv" / "bin" / "python"
+    py.parent.mkdir(parents=True, exist_ok=True)
+    missing = "echo \"ModuleNotFoundError: No module named 'pytest'\" >&2; exit 1"
+    py.write_text(f'#!/bin/sh\ncase "$*" in *"import pytest"*) {"exit 0" if has_pytest else missing};; esac\nexit 0\n')
+    py.chmod(0o755)
+
+
+async def test_detected_pytest_uses_the_project_venv_inside_the_sandbox(tmp_path):
+    """Issue #96: `python -m pytest` exited 127 in the sandbox (no `python`, the venv not on PATH)."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "pyproject.toml").write_text("")
+    fake_python(project, has_pytest=True)
+    cmd = detect_test_command(project)
+    assert cmd == ".venv/bin/python -m pytest -q -x"
+    assert await run_tests(cmd, project, 60) == (True, "")
+
+
+async def test_fanout_skipped_when_the_detected_test_runner_is_missing_in_the_sandbox(tmp_path, monkeypatch):
+    """Issue #96: every merge would fail its tests, rework and escalate; the parent runs the task instead."""
+    repo = git_repo(tmp_path / "repo")
+    (repo / "pyproject.toml").write_text("")
+    fake_python(repo, has_pytest=False)
+    steps = [classify(SUBS), *PLANNER, {"type": "text", "match": "Approved plan", "text": "did it sequentially"}]
+    server = make_fan(tmp_path, monkeypatch, steps, repo)
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    assert not events(server, "fanout.plan")
+    notes = [n["text"] for n in events(server, "notification.show") if n.get("kind") == "fanout"]
+    assert len(notes) == 1 and notes[0].startswith("fan-out skipped")
+    assert ".venv/bin/python -m pytest" in notes[0] and "No module named 'pytest'" in notes[0]
+    assert server.session.stored.messages[-1]["content"] == "did it sequentially"
+
+
+async def test_fanout_skipped_when_the_sandbox_is_unusable(tmp_path, monkeypatch):
+    """Issue #96: without bwrap every child's bash and every merge's tests are refused."""
+    from k3code.reliability import sandbox
+
+    repo = git_repo(tmp_path / "repo")
+    steps = [classify(SUBS), *PLANNER, {"type": "text", "match": "Approved plan", "text": "did it sequentially"}]
+    server = make_fan(tmp_path, monkeypatch, steps, repo, test_command="true")
+    monkeypatch.setattr(sandbox, "usable", lambda: False)
+    await start_in(server, repo)
+    await run_turn(server, "do the big thing")
+    assert not events(server, "fanout.plan")
+    notes = [n["text"] for n in events(server, "notification.show") if n.get("kind") == "fanout"]
+    assert len(notes) == 1 and "bubblewrap is unusable" in notes[0]
+    assert server.session.stored.messages[-1]["content"] == "did it sequentially"
 
 
 async def test_merge_conflict_between_children_is_resolved_by_the_child(tmp_path, monkeypatch):

@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import re
+import shlex
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,8 @@ logger = logging.getLogger(__name__)
 MAX_SUBTASKS = 8
 IO_HEAVY_RE = re.compile(r"\b(install|build|compile|download|bundle|docker|index|crawl|migrat\w+)\b", re.I)
 VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail)", re.I)
+#: Seconds the sandboxed check that a detected test command's program is there may take.
+PROBE_TIMEOUT = 30
 
 
 # ── helpers ──
@@ -48,7 +51,11 @@ def extract_subtasks(verdict: Any, plan: str) -> list[str]:
 
 
 def detect_test_command(repo: str | Path) -> str | None:
-    """pytest, npm test, go test or cargo test, by marker files."""
+    """pytest, npm test, go test or cargo test, by marker files.
+
+    pytest runs with the project's ``.venv`` interpreter when there is one, else ``python3``: the tests run in the
+    sandbox, where no venv is active and stock Ubuntu has no ``python``.
+    """
     root = Path(repo)
     pkg = root / "package.json"
     if pkg.is_file():
@@ -59,7 +66,8 @@ def detect_test_command(repo: str | Path) -> str | None:
             pass
     py = [root / n for n in ("pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml")]
     if any(p.is_file() for p in py) or (root / "tests").is_dir():
-        return "python -m pytest -q -x"
+        python = ".venv/bin/python" if (root / ".venv" / "bin" / "python").is_file() else "python3"
+        return f"{python} -m pytest -q -x"
     if (root / "go.mod").is_file():
         return "go test ./..."
     if (root / "Cargo.toml").is_file():
@@ -87,6 +95,31 @@ async def run_tests(cmd: str, cwd: str | Path, timeout: float = 600) -> tuple[bo
     text = out.decode("utf-8", "replace")
     ok = proc.returncode == 0 or (proc.returncode == 5 and "pytest" in cmd)
     return ok, text[-4000:]
+
+
+async def preflight(repo: str | Path, test_cmd: str, *, detected: bool) -> str:
+    """Why fan-out cannot work here, or "" when it can.
+
+    Without a usable bwrap every child's bash call and every merge's test run is refused. A detected test command
+    whose program is missing in the sandbox (``$HOME`` is hidden there, so ``~/.local/bin`` is gone) or, for pytest,
+    cannot import it, fails every merge. A configured ``test_command`` is the user's choice and is not probed.
+    """
+    from k3code.reliability import sandbox
+
+    if not await asyncio.to_thread(sandbox.usable):
+        return "bubblewrap is unusable here, so sub-agents could not run commands or test a merge; see /doctor"
+    if not (test_cmd and detected):
+        return ""
+    exe = shlex.quote(shlex.split(test_cmd)[0])
+    probe = f"{exe} -c 'import pytest'" if " -m pytest" in test_cmd else f"command -v {exe}"
+    ok, out = await run_tests(probe, repo, PROBE_TIMEOUT)
+    if ok:
+        return ""
+    reason = (out.strip().splitlines() or [f"{exe}: not found"])[-1]
+    return (
+        f"the detected test command `{test_cmd}` cannot run in the sandbox ({reason}); "
+        "set autonomy.fanout.test_command to one that can"
+    )
 
 
 def parse_verdict(text: str) -> bool | None:
@@ -195,6 +228,9 @@ class FanoutExecutor:
         assert repo is not None
         test_cmd = (cfg.get("test_command") or detect_test_command(repo)) or ""
         need_tests = cfg["require_tests"] if require_tests is None else require_tests
+        if why := await preflight(repo, test_cmd if need_tests else "", detected=not cfg.get("test_command")):
+            session.emit("notification.show", {"text": f"fan-out skipped: {why}", "level": "warning", "kind": "fanout"})
+            return None
         io_heavy = any(IO_HEAVY_RE.search(s) for s in subtasks)
         gov = session.reliability.governor if session.reliability and session.reliability.governor else Governor()
         cap = gov.agent_cap(int(cfg["max_parallel"]), io_heavy=io_heavy)
