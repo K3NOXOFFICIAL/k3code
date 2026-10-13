@@ -987,15 +987,36 @@ install_core_copy() {
   REQS=""
 }
 
+# put_file FILE VALUE: FILE holds VALUE. It is only written when it differs (a repeated run changes nothing), through a
+# temp file and a rename, so an interrupted write never leaves a torn file.
+put_file() {
+  if [ "$(cat "$1" 2>/dev/null)" != "$2" ]; then
+    printf '%s\n' "$2" >"$1.new"
+    mv -f "$1.new" "$1"
+  fi
+  return 0
+}
+
+# A git build and a source build of one commit share the version name, so the version may be complete already: the way
+# this run was asked for is recorded on every run, not only on a build. A git install keeps `.ref` and `.url` (the ref
+# and the remote `k3code update` follows: a SHA pins it, a branch or tag does not; a fork or mirror, not upstream) and
+# no checkout path; a source install keeps the checkout path and neither (it follows the checkout).
+record_origin() {
+  if [ "$FROM" = source ]; then
+    put_file "$DATA/source_path" "$SOURCE_PATH"
+    rm -f "$VERDIR/.ref" "$VERDIR/.url"
+  fi
+  if [ "$FROM" = git ]; then
+    put_file "$VERDIR/.ref" "$REF"
+    put_file "$VERDIR/.url" "$(plain_url "$GIT_URL")"
+  fi
+  return 0
+}
+
 install_version() {
   if [ -f "$VERDIR/.complete" ]; then
     log "version $VER already installed"
-    # The build is reused, but the ref asked for now is what the install follows: a SHA pins it, a branch or tag does
-    # not (`k3code update` reads .ref). A temp file and a rename, so an interrupted write never leaves a torn .ref.
-    if [ "$FROM" = git ] && [ "$(cat "$VERDIR/.ref" 2>/dev/null)" != "$REF" ]; then
-      printf '%s\n' "$REF" >"$VERDIR/.ref.new"
-      mv -f "$VERDIR/.ref.new" "$VERDIR/.ref"
-    fi
+    record_origin # the build is reused, but the ref, remote and checkout asked for now are what the install follows
     return 0
   fi
   log "installing version $VER into $VERDIR"
@@ -1027,11 +1048,7 @@ install_version() {
   if [ "${K3_SKIP_PIP:-0}" != 1 ]; then
     "$VERDIR/venv/bin/k3code" --version >&2 || die "the new version does not start (k3code --version failed); nothing was activated"
   fi
-  if [ "$FROM" = source ]; then printf '%s\n' "$SOURCE_PATH" >"$DATA/source_path"; fi
-  if [ "$FROM" = git ]; then
-    printf '%s\n' "$REF" >"$VERDIR/.ref"
-    plain_url "$GIT_URL" >"$VERDIR/.url" # `k3code update` follows the same remote (a fork or mirror, not upstream)
-  fi
+  record_origin
   if [ -n "${COMMIT_TIME:-}" ]; then printf '%s\n' "$COMMIT_TIME" >"$VERDIR/.committed"; fi
   printf '%s\n' "$VER" >"$VERDIR/.complete"
   BUILDING=""
