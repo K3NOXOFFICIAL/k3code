@@ -76,19 +76,27 @@ def _identity(provider: str, model: str, base_url: str) -> tuple[str, str, str]:
 
 @dataclass
 class EntryCooldown:
-    """One entry's cooldown window on the monotonic clock."""
+    """One entry's cooldown window: a monotonic deadline and, next to it, the wall-clock reset."""
 
     until: float
     seconds: float
     reason: FailoverReason
-    #: wall-clock epoch of the reset (what survives a restart in ``cooldowns.json``)
+    #: wall-clock epoch of the reset (what survives a restart in ``cooldowns.json``); 0 = unknown, ignored
     until_wall: float = 0.0
     #: fingerprint of the credential an auth cooldown was armed for (empty for other reasons)
     fingerprint: str = ""
 
+    def remaining_at(self, monotonic: float, wall: float) -> float:
+        """Seconds left, from whichever clock says the window ends first. The monotonic clock stops while the host
+        sleeps (laptop lid, WSL2 host sleep) and the wall clock does not, so a window that reset meanwhile is over."""
+        left = self.until - monotonic
+        if self.until_wall > 0:
+            left = min(left, self.until_wall - wall)
+        return max(0.0, left)
+
     @property
     def remaining(self) -> float:
-        return max(0.0, self.until - time.monotonic())
+        return self.remaining_at(time.monotonic(), time.time())
 
 
 @dataclass
@@ -227,6 +235,10 @@ class CooldownStore:
             return None
         return entry
 
+    def _left(self, entry: EntryCooldown, now: float | None) -> float:
+        """Seconds left on ``entry``; ``now`` overrides the monotonic clock (tests), ``wall`` is the wall clock."""
+        return entry.remaining_at(time.monotonic() if now is None else now, self.wall())
+
     def in_cooldown(
         self,
         *,
@@ -241,8 +253,7 @@ class CooldownStore:
         entry = self._live_entry(provider, model, base_url, fingerprint)
         if entry is None:
             return False
-        monotonic_now = time.monotonic() if now is None else now
-        if entry.until <= monotonic_now:
+        if self._left(entry, now) <= 0:
             # Expired windows are dropped so a long-lived store never grows unbounded.
             self.entries.pop(_identity(provider, model, base_url), None)
             return False
@@ -260,8 +271,7 @@ class CooldownStore:
         entry = self._live_entry(provider, model, base_url, fingerprint)
         if entry is None:
             return 0.0
-        monotonic_now = time.monotonic() if now is None else now
-        return max(0.0, entry.until - monotonic_now)
+        return self._left(entry, now)
 
     def reason_of(
         self, *, provider: str, model: str, base_url: str = "", fingerprint: str | None = None
@@ -294,7 +304,8 @@ class CooldownStore:
     def only_network_cooling(self) -> bool:
         """True when at least one entry is cooling and every active cooldown is a network one."""
         now = time.monotonic()
-        active = [e for e in self.entries.values() if e.until > now]
+        wall = self.wall()
+        active = [e for e in self.entries.values() if e.remaining_at(now, wall) > 0]
         return bool(active) and all(e.reason is FailoverReason.network for e in active)
 
 

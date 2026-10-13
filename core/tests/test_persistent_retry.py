@@ -204,6 +204,32 @@ async def test_rate_limit_parks_with_retry_after():
     assert router.calls == 2
 
 
+async def test_a_park_ends_at_its_wall_clock_time_when_the_monotonic_clock_stopped():
+    """The host slept through a 1 h park: the monotonic clock did not count the sleep, the wall clock did."""
+    wall = {"t": 1_700_000_000.0}
+    router = FakeRouter(fails=1, error=ChainExhausted("limited", retry_after=3600.0, last_reason="rate_limit"))
+    clock = FakeClock()
+
+    async def sleep(delay: float) -> None:
+        await clock.sleep(delay)
+        if len(clock.slept) == 1:
+            wall["t"] += 3660  # suspend: only the wall clock noticed
+        assert len(clock.slept) < 50, "still parked long after the wall-clock reset"
+
+    retry = PersistentRetry(
+        router,
+        FakeNetWatch(NetState.ONLINE),
+        config=RetryConfig(poll_interval=0.5),
+        sleep=sleep,
+        monotonic=clock.monotonic,
+        wall=lambda: wall["t"],
+    )
+    await _drain(retry.stream([Message(role="user", content="x")], []))
+
+    assert router.calls == 2
+    assert clock.now - 1000.0 < 5.0
+
+
 async def test_rate_limit_without_retry_after_uses_ladder():
     router = FakeRouter(fails=1, error=ChainExhausted("limited", last_reason="quota"))
     retry, clock, events, seen = _retry(router, netwatch=FakeNetWatch(NetState.ONLINE))
