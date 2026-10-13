@@ -431,8 +431,7 @@ def store_mem0(
         label = f"Project fact ({scope['repo']}, learned by k3code)" if scope else "User preference (learned by k3code)"
         body = {
             "messages": [{"role": "user", "content": f"{label}: {p.text}"}],
-            "agent_id": m.agent_id,
-            **({"user_id": m.user_id} if m.user_id else {}),
+            **m.identifiers(),
             "metadata": {
                 "confidence": p.confidence,
                 "evidence": p.evidence,
