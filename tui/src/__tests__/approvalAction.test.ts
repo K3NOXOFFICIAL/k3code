@@ -199,19 +199,34 @@ describe("approvalAction — pure key dispatch for ApprovalPrompt", () => {
   });
 
   it("pages the change preview with [ and ] without touching the choice", () => {
-    expect(approvalAction("[", {}, 1)).toEqual({ kind: "scroll", delta: -1 });
-    expect(approvalAction("]", {}, 1)).toEqual({ kind: "scroll", delta: 1 });
-  });
-
-  it("scrolls while disarmed, but a pasted [ or ] disarms", () => {
-    expect(approvalAction("]", {}, 0, undefined, true)).toEqual({
+    expect(approvalAction("[", {}, 1, undefined, false, true)).toEqual({
+      kind: "scroll",
+      delta: -1,
+    });
+    expect(approvalAction("]", {}, 1, undefined, false, true)).toEqual({
       kind: "scroll",
       delta: 1,
     });
-    expect(approvalAction("[", { isPasted: true }, 0)).toEqual({
+  });
+
+  it("scrolls while disarmed, but a pasted [ or ] disarms", () => {
+    expect(approvalAction("]", {}, 0, undefined, true, true)).toEqual({
+      kind: "scroll",
+      delta: 1,
+    });
+    expect(
+      approvalAction("[", { isPasted: true }, 0, undefined, false, true),
+    ).toEqual({ kind: "disarm" });
+    expect(approvalAction("[x] done", {}, 0, undefined, false, true)).toEqual({
       kind: "disarm",
     });
-    expect(approvalAction("[x] done", {}, 0)).toEqual({ kind: "disarm" });
+  });
+
+  it("[ and ] are typed text when there is nothing to page", () => {
+    // A shell command or a short preview has no `[ / ] scroll` footer, so the
+    // keys must not keep the prompt armed for the Enter after them.
+    expect(approvalAction("]", {}, 0)).toEqual({ kind: "disarm" });
+    expect(approvalAction("[", {}, 0)).toEqual({ kind: "disarm" });
   });
 });
 

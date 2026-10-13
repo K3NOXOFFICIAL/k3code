@@ -109,8 +109,9 @@ const TEXT_RE = /[^\x00-\x1f\x7f-\x9f]/;
  * with the global Ctrl+C handler that already calls cancelOverlayFromCtrlC
  * for approvals).  One typed digit 1..opts.length picks the labelled choice.
  * Enter confirms the current selection.  ↑/↓ moves the selection within
- * bounds.  `[` / `]` page the change preview of an edit/write (PgUp/PgDn
- * already scroll the transcript while a prompt is open).
+ * bounds.  `[` / `]` page the change preview of an edit/write when it is
+ * `scrollable` (PgUp/PgDn already scroll the transcript while a prompt is
+ * open); without one they are typed text.
  *
  * The prompt takes every key while it is open, so text typed for the
  * composer lands here.  Any other text, a paste or a typing burst ("3 tests
@@ -124,12 +125,13 @@ export function approvalAction(
   sel: number,
   opts: readonly ApprovalChoice[] = APPROVAL_OPTS,
   disarmed = false,
+  scrollable = false,
 ): ApprovalAction {
   if (key.escape) {
     return { kind: "choose", choice: "deny" };
   }
 
-  if (!key.isPasted && (ch === "[" || ch === "]")) {
+  if (scrollable && !key.isPasted && (ch === "[" || ch === "]")) {
     return { kind: "scroll", delta: ch === "[" ? -1 : 1 };
   }
 
@@ -195,6 +197,8 @@ export function ApprovalPrompt({
       cur.sel,
       opts,
       cur.disarmed,
+      // the condition that shows the `[ / ] scroll` footer below
+      Boolean(diff && diff.total > DIFF_VIEW_LINES),
     );
 
     if (action.kind === "choose") {

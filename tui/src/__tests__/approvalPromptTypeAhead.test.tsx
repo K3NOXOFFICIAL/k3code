@@ -107,6 +107,15 @@ describe("ApprovalPrompt ignores typed text", () => {
     expect(await drive(["\x1b[200~3\x1b[201~", ENTER])).toEqual([]);
   });
 
+  it("[ or ] then Enter approves nothing when there is no preview to page", async () => {
+    // The drive() request is a shell command: no `[ / ] scroll` footer.
+    expect(await drive(["]", ENTER])).toEqual([]);
+    expect(await drive(["[", ENTER])).toEqual([]);
+    expect(await drive([`a[i]${ENTER}`])).toEqual([]);
+    // Kitty keyboard protocol: `]` and Enter as two keys of one read.
+    expect(await drive([`\x1b[93u${ENTER}`])).toEqual([]);
+  });
+
   it("deny still answers once disarmed", async () => {
     expect(await drive(["d", ENTER, "4"])).toEqual(["deny"]);
   });
