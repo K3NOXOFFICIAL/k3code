@@ -2457,12 +2457,15 @@ class GatewayServer:
             rules = suggest_rules(tool_name, decision)
             pattern = ", ".join(r.pattern for r in rules)
             self.usage.record("approval", session=session.session_id, detail=tool_name)
+            preview = await _change_preview(tool_name, arguments, session.perms.cwd)
             try:
                 result = await self._ask_client(
                     "approval",
                     {
                         "request_id": next_request_id("approval"),
                         "command": _command_for_tool(tool_name, arguments),
+                        # what an edit/write would change (a unified diff); clients that predate it ignore it
+                        **({"preview": preview} if preview else {}),
                         "description": decision.message
                         or arguments.get("description")
                         or arguments.get("path")
@@ -3149,6 +3152,20 @@ def _stored_tool_call(tc: ToolCall) -> dict[str, Any]:
     if tc.raw_arguments is not None:
         stored["raw_arguments"] = tc.raw_arguments
     return stored
+
+
+async def _change_preview(tool_name: str, arguments: dict[str, Any], cwd: Path) -> str | None:
+    """The approval prompt's diff for a write/edit (see tools.preview), read off the event loop; None for other tools
+    and whenever it cannot be made: a preview must never stand in the way of the prompt itself."""
+    if tool_name not in ("write", "edit"):
+        return None
+    from k3code.tools.preview import change_preview
+
+    try:
+        return await asyncio.to_thread(change_preview, tool_name, arguments, cwd)
+    except Exception:  # noqa: BLE001
+        logger.warning("approval preview failed for %s", tool_name, exc_info=True)
+        return None
 
 
 def _command_for_tool(tool_name: str, arguments: dict[str, Any]) -> str:
