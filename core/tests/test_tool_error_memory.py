@@ -202,6 +202,40 @@ async def test_a_hintless_recurring_failure_still_waits_for_the_card(tmp_path, m
     assert not gotchas.gotchas_path(hub.log.project_for(str(tmp_path))).exists()
 
 
+async def test_dismissing_an_auto_learned_card_forgets_its_line_and_ends_its_reminders(tmp_path, monkeypatch):
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    sess = await call(server, "session.create", {"cwd": str(tmp_path)})
+    hub = server.learning
+    frames: list = []
+    s = _recording_session(tmp_path, "s1", frames)
+    _fail(hub, s, "python x.py", "sh: 1: python: not found")
+    _ok(hub, s, "python3 x.py")
+    _fail(hub, s, "python y.py", "sh: 1: python: not found")
+    (p,) = [p for p in hub.store.all() if p.kind == "project_gotcha"]
+    auto = gotchas.auto_gotchas_path(hub.log.project_for(str(tmp_path)))
+    assert auto.is_file()
+    out = await call(
+        server, "command.dispatch", {"name": "proposals", "arg": f"dismiss {p.id}", "session_id": sess["session_id"]}
+    )
+    assert "will not come back" in out["output"]
+    assert not auto.exists()  # the line the card was about is gone, not just the card
+    notified = len([t for t, _ in frames if t == "notification"])
+    for i in range(3):  # the failing call again: no reminder (from the file or the earlier rows), nothing relearned
+        tc = ToolCall(id="x", name="bash", arguments={"command": f"python z{i}.py"})
+        result = {"stdout": "", "stderr": "sh: 1: python: not found", "exit_code": 127}
+        assert hub.tool_outcome(s, tc, result, failure_of("bash", tc.arguments, result)) is None
+        _ok(hub, s, f"python3 z{i}.py")
+    assert not auto.exists()
+    assert len([t for t, _ in frames if t == "notification"]) == notified
+    assert len([q for q in hub.store.all() if q.kind == "project_gotcha"]) == 1
+    # the dismissal is about that signature: another recurring failure is learned as before
+    other = "sh: 1: node: not found"
+    _fail(hub, s, "node a.js", other)
+    _ok(hub, s, "nodejs a.js")
+    _fail(hub, s, "node b.js", other)
+    assert "node: not found" in auto.read_text(encoding="utf-8")
+
+
 def test_auto_learning_refuses_redacted_hints_and_non_project_classes():
     assert gotchas.auto_ok("exit 127", "`python3 x.py` worked instead")
     assert not gotchas.auto_ok("exit 127", "")

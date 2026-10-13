@@ -7,7 +7,8 @@ NOT_PROJECT, nor a hint the scrubber redacted something in). A line is tool outp
 untrusted text: an auto-learned line goes to ``gotchas.auto.md`` next to the project's ``gotchas.md``, feeds only the
 in-turn reminder below, and is proposed as a card at the same time (the session gets a one-line notification). A
 hintless signature, or any signature with the setting off, waits for REPEATS sightings and is proposed as a card
-without being noted. Only an accepted card appends to ``gotchas.md`` in the project's directory under the k3code home
+without being noted. Dismissing a card forgets its auto-learned line and ends the reminders for that signature. Only
+an accepted card appends to ``gotchas.md`` in the project's directory under the k3code home
 (never a file in the repository), and only that file goes into the system prompt, as a fenced "known pitfalls in this
 project" block of at most MAX_LINES lines, oldest dropped.
 
@@ -77,6 +78,20 @@ def append_gotcha(path: Path, line: str) -> None:
     entries = [e for e in _entries(path) if e != entry] + [entry]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(entries[-MAX_LINES:]) + "\n", encoding="utf-8")
+
+
+def remove_gotcha(path: Path, line: str) -> bool:
+    """Drop the entry ``line`` was appended as from ``path`` (the file goes with its last one); True if it was there."""
+    entry = "- " + " ".join(scrub_text(line).split())
+    entries = _entries(path)
+    kept = [e for e in entries if e != entry]
+    if len(kept) == len(entries):
+        return False
+    if kept:
+        path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    else:
+        path.unlink(missing_ok=True)
+    return True
 
 
 def gotchas_prompt(cwd: str | Path, home: Path | None = None) -> str:

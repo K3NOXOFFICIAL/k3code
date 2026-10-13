@@ -137,6 +137,10 @@ class ProposalStore:
         self._write(p)
         return p
 
+    def dismissed(self, key: str) -> bool:
+        """Whether the proposal with this dedup key was dismissed."""
+        return any(p.key == key and p.status == "dismissed" for p in self.all())
+
     def set_status(self, pid: str, status: str) -> Proposal | None:
         p = self.get(pid)
         if p is None:
