@@ -48,8 +48,12 @@ class ProviderEntry(BaseModel):
     max_sessions: int = 4
     idle_seconds: float = 600.0
     #: Prompt-cache breakpoints (cache_control): auto = on for kind anthropic, off for openai; on for an openai entry
-    #: marks messages Anthropic-style only when the model id looks like Claude (a relay to Anthropic passes it on).
+    #: marks messages Anthropic-style when the model id looks like Claude (a relay to Anthropic passes it on); ``on``
+    #: marks every model id, which a gateway alias in front of Claude needs.
     prompt_cache: str = "auto"
+    #: openai kind, ``prompt_cache: auto``: globs (case-insensitive, whole id, e.g. ``auto/*``) of further model ids
+    #: that get the breakpoints.
+    cache_models: list[str] = Field(default_factory=list)
 
     @field_validator("prompt_cache")
     @classmethod
