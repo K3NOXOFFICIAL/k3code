@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -306,11 +307,47 @@ def _load_posted(path: Path) -> list[str]:
     return [str(k) for k in data] if isinstance(data, list) else []
 
 
-def _save_posted(path: Path, keys: list[str]) -> None:
+def _write_private_json(path: Path, data: Any) -> None:
     ensure_private_dir(path.parent)
     tmp = private_file(path.with_name(f"{path.name}.{os.getpid()}.tmp"))
-    tmp.write_text(json.dumps(keys[-MEM0_POSTED_MAX:]), encoding="utf-8")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
     os.replace(tmp, path)
+
+
+def _save_posted(path: Path, keys: list[str]) -> None:
+    _write_private_json(path, keys[-MEM0_POSTED_MAX:])
+
+
+#: What mem0 did not take (it was down, or the pass stopped before the item): the next pass posts it first. A review
+#: fact is derived once, so without this a failed post lost it (a preference is re-derived by the daily distill).
+MEM0_OUTBOX = "mem0_outbox.json"
+MEM0_OUTBOX_MAX = 200
+#: One store_mem0 pass at a time: two passes would read the same ledger and outbox and overwrite each other's writes.
+_MEM0_LOCK = threading.Lock()
+
+
+def _load_outbox(path: Path) -> list[Preference]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return [Preference(str(e["text"]), float(e["confidence"]), int(e["evidence"])) for e in data]
+    except (OSError, ValueError, TypeError, KeyError):
+        return []
+
+
+def _save_outbox(path: Path, items: list[Preference]) -> None:
+    if not items:
+        path.unlink(missing_ok=True)
+        return
+    _write_private_json(
+        path,
+        [{"text": p.text, "confidence": p.confidence, "evidence": p.evidence} for p in items[-MEM0_OUTBOX_MAX:]],
+    )
+
+
+def _refused(exc: Exception) -> bool:
+    """mem0 answered and refused this one body (400, 413, 422): retrying cannot work and the next item may be fine.
+    Anything else (no connection, a timeout, 401/403, 429, 5xx) means mem0 is not usable for the rest of the pass."""
+    return getattr(getattr(exc, "response", None), "status_code", 0) in (400, 413, 422)
 
 
 def store_mem0(
@@ -318,46 +355,62 @@ def store_mem0(
     prefs: list[Preference],
     post: Callable[[str, dict[str, Any], dict[str, str]], None] | None = None,
     posted: Path | None = None,
+    outbox: Path | None = None,
 ) -> int:
     """Store each preference as a mem0 memory when mem0 is configured. The key comes from the env only.
 
     ``posted`` is a JSON file of what was already sent: a preference posted before is skipped (the daily distill
-    re-derives every preference and posted each one again, every day). Returns how many were posted now."""
+    re-derives every preference and posted each one again, every day). ``outbox`` is a JSON file of what could not be
+    sent: it is posted first on the next pass. The first failed post ends the pass (a host that does not answer would
+    cost the connect timeout once, not once per item) and every item not yet sent goes to the outbox.
+    Returns how many were posted now."""
     m = getattr(config, "mem0", None)
     if m is None or not m.url:
         return 0
-    done = _load_posted(posted) if posted is not None else []
-    seen = set(done)
-    headers = {"Content-Type": "application/json"}
-    if m.api_key_env and os.environ.get(m.api_key_env):
-        headers["Authorization"] = f"Token {os.environ[m.api_key_env]}"
-    if post is None:
-        import httpx
+    with _MEM0_LOCK:
+        done = _load_posted(posted) if posted is not None else []
+        seen = set(done)
+        queued = _load_outbox(outbox) if outbox is not None else []
+        headers = {"Content-Type": "application/json"}
+        if m.api_key_env and os.environ.get(m.api_key_env):
+            headers["Authorization"] = f"Token {os.environ[m.api_key_env]}"
+        if post is None:
+            import httpx
 
-        def post(url: str, body: dict[str, Any], hdrs: dict[str, str]) -> None:  # noqa: F811
-            httpx.post(url, json=body, headers=hdrs, timeout=10).raise_for_status()
+            def post(url: str, body: dict[str, Any], hdrs: dict[str, str]) -> None:  # noqa: F811
+                httpx.post(url, json=body, headers=hdrs, timeout=httpx.Timeout(10, connect=2)).raise_for_status()
 
-    n = 0
-    for p in prefs:
-        key = _posted_key(m, p.text)
-        if key in seen:
-            continue
-        body = {
-            "messages": [{"role": "user", "content": f"User preference (learned by k3code): {p.text}"}],
-            "agent_id": m.agent_id,
-            **({"user_id": m.user_id} if m.user_id else {}),
-            "metadata": {"confidence": p.confidence, "evidence": p.evidence, "source": "k3code-distiller"},
-        }
-        try:
-            post(m.url.rstrip("/") + "/memories", body, headers)
+        n = 0
+        unsent: list[Preference] = []
+        down = False
+        for p in [*queued, *prefs]:
+            key = _posted_key(m, p.text)
+            if key in seen:
+                continue
+            seen.add(key)  # one try per text and pass, whether it came from the outbox or from prefs
+            if down:
+                unsent.append(p)
+                continue
+            body = {
+                "messages": [{"role": "user", "content": f"User preference (learned by k3code): {p.text}"}],
+                "agent_id": m.agent_id,
+                **({"user_id": m.user_id} if m.user_id else {}),
+                "metadata": {"confidence": p.confidence, "evidence": p.evidence, "source": "k3code-distiller"},
+            }
+            try:
+                post(m.url.rstrip("/") + "/memories", body, headers)
+            except Exception as e:  # noqa: BLE001 - mem0 is best effort; what it did not take waits in the outbox
+                if not _refused(e):
+                    down = True
+                    unsent.append(p)
+                continue
             n += 1
-        except Exception:  # noqa: BLE001 - mem0 is best effort (a failed one is tried again next time)
-            continue
-        seen.add(key)
-        done.append(key)
-    if posted is not None and n:
-        _save_posted(posted, done)
-    return n
+            done.append(key)
+        if posted is not None and n:
+            _save_posted(posted, done)
+        if outbox is not None and (unsent or queued):
+            _save_outbox(outbox, unsent)
+        return n
 
 
 async def distill(
@@ -376,8 +429,10 @@ async def distill(
     prefs = await polish(caller, prefs, session_id=session_id)
     write_auto_section(user_md, prefs)
     write_preferences_json(home, prefs)
-    # blocking HTTP (up to 10 s per preference): never on the event loop that serves every session
-    await asyncio.to_thread(store_mem0, config, prefs, mem0_post, home / "learning" / MEM0_POSTED)
+    # blocking HTTP (2 s to connect, 10 s per request): never on the event loop that serves every session
+    await asyncio.to_thread(
+        store_mem0, config, prefs, mem0_post, home / "learning" / MEM0_POSTED, home / "learning" / MEM0_OUTBOX
+    )
     if proposals is not None:
         propose_denial_preferences(log, proposals)
         for s in suggestions:

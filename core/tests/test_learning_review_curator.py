@@ -135,3 +135,41 @@ async def test_review_mem0_writes_do_not_block_the_event_loop_thread(tmp_path):
         mem0_post=lambda u, b, h: threads.append(threading.current_thread()),
     )
     assert threads and all(t is not threading.main_thread() for t in threads)
+
+
+async def test_review_facts_that_mem0_did_not_take_are_posted_by_a_later_review(tmp_path, monkeypatch):
+    import httpx
+
+    from k3code.config import Mem0Config, Settings
+
+    monkeypatch.setenv("K3CODE_HOME", str(tmp_path / "home"))
+    (tmp_path / "repo").mkdir()
+    cfg = Settings(mem0=Mem0Config(url="http://m"))
+    attempts: list[str] = []
+
+    def down(url, body, headers):
+        attempts.append(body["messages"][0]["content"])
+        raise httpx.ConnectTimeout("blackhole")
+
+    def run(reply, post):
+        return review.review_session(
+            FakeCaller(reply),
+            convo(8),
+            store=ProposalStore(tmp_path),
+            cwd=tmp_path / "repo",
+            config=cfg,
+            min_turns=6,
+            mem0_post=post,
+        )
+
+    await run(json.dumps({"facts": ["deploys go through make ship", "the db host is db1.internal"]}), down)
+    assert len(attempts) == 1  # the outage stopped the pass at the first fact
+    sent: list[str] = []
+    await run(
+        json.dumps({"facts": ["tests run with pytest -x"]}), lambda u, b, h: sent.append(b["messages"][0]["content"])
+    )
+    assert sent == [
+        "User preference (learned by k3code): deploys go through make ship",
+        "User preference (learned by k3code): the db host is db1.internal",
+        "User preference (learned by k3code): tests run with pytest -x",
+    ]

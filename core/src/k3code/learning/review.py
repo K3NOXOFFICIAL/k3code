@@ -96,13 +96,14 @@ async def review_session(
 
         merged = list(dict.fromkeys([*read_learned(cwd), *facts]))[-30:]
         write_learned(cwd, merged)
-        # store_mem0 is blocking HTTP (10 s per fact): never on the gateway's event loop
+        # store_mem0 is blocking HTTP (2 s to connect, 10 s per request): never on the gateway's event loop
         await asyncio.to_thread(
             distiller.store_mem0,
             config,
             [distiller.Preference(f, 0.6, 1) for f in facts],
             mem0_post,
             home() / "learning" / distiller.MEM0_POSTED,  # a fact seen again in a later review is not posted again
+            home() / "learning" / distiller.MEM0_OUTBOX,  # a fact mem0 did not take goes out with the next review's
         )
     drafts: list[str] = []
     props: list[Proposal] = []

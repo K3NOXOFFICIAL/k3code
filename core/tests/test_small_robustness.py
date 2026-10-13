@@ -4,11 +4,13 @@ blocking scans off the event loop."""
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
 
+import httpx
 import pytest
 
 from k3code import skills as skills_mod
@@ -97,6 +99,104 @@ def test_a_failed_mem0_post_is_tried_again(tmp_path):
     prefs = [distiller.Preference("prefers small commits", 0.8, 3)]
     assert distiller.store_mem0(cfg, prefs, lambda *a: 1 / 0, posted) == 0
     assert distiller.store_mem0(cfg, prefs, lambda *a: None, posted) == 1
+
+
+def _mem0_cfg() -> Settings:
+    return Settings(mem0=Mem0Config(url="http://mem0.test", api_key_env="NOPE", agent_id="a"))
+
+
+def _twelve() -> list[distiller.Preference]:
+    return [distiller.Preference(f"fact number {i}", 0.6, 1) for i in range(12)]
+
+
+def test_mem0_outage_stops_the_pass_at_the_first_failed_post(tmp_path):
+    attempts: list[str] = []
+
+    def down(url, body, headers):
+        attempts.append(body["messages"][0]["content"])
+        raise httpx.ConnectTimeout("blackhole")
+
+    assert distiller.store_mem0(_mem0_cfg(), _twelve(), down, tmp_path / "posted.json") == 0
+    assert len(attempts) == 1  # it was 12: about 120 s of a worker thread against a host that does not answer
+
+
+def test_unposted_mem0_items_wait_in_an_outbox_and_go_out_on_the_next_pass(tmp_path):
+    posted, outbox = tmp_path / "posted.json", tmp_path / "learning" / "mem0_outbox.json"
+    cfg = _mem0_cfg()
+
+    def down(url, body, headers):
+        raise httpx.ConnectError("refused")
+
+    assert distiller.store_mem0(cfg, _twelve(), down, posted, outbox) == 0
+    assert [e["text"] for e in json.loads(outbox.read_text())] == [p.text for p in _twelve()]
+    sent: list[str] = []
+    # the next pass has nothing new (a review fact is not derived again), yet the queued twelve go out, oldest first
+    assert distiller.store_mem0(cfg, [], lambda u, b, h: sent.append(b["messages"][0]["content"]), posted, outbox) == 12
+    assert sent == [f"User preference (learned by k3code): fact number {i}" for i in range(12)]
+    assert not outbox.exists()
+    # and are not posted a third time
+    assert distiller.store_mem0(cfg, _twelve(), lambda *a: sent.append("again"), posted, outbox) == 0
+    assert len(sent) == 12
+
+
+def test_mem0_outbox_keeps_what_the_outage_cut_off_and_does_not_repeat_itself(tmp_path):
+    posted, outbox = tmp_path / "posted.json", tmp_path / "mem0_outbox.json"
+    cfg = _mem0_cfg()
+    calls: list[str] = []
+
+    def dies_on_the_third(url, body, headers):
+        calls.append(body["messages"][0]["content"])
+        if len(calls) == 3:
+            raise httpx.ReadTimeout("slow")
+
+    assert distiller.store_mem0(cfg, _twelve(), dies_on_the_third, posted, outbox) == 2
+    queued = [e["text"] for e in json.loads(outbox.read_text())]
+    assert queued == [f"fact number {i}" for i in range(2, 12)]  # the failed one and the nine never tried
+    # the same preferences derived again do not queue twice
+    assert distiller.store_mem0(cfg, _twelve(), lambda *a: 1 / 0, posted, outbox) == 0
+    assert [e["text"] for e in json.loads(outbox.read_text())] == queued
+
+
+def test_mem0_refusal_of_one_item_does_not_stop_the_pass_or_clog_the_outbox(tmp_path):
+    posted, outbox = tmp_path / "posted.json", tmp_path / "mem0_outbox.json"
+    sent: list[str] = []
+
+    def refuses_the_second(url, body, headers):
+        text = body["messages"][0]["content"]
+        if text.endswith("fact number 1"):
+            req = httpx.Request("POST", url)
+            raise httpx.HTTPStatusError("bad", request=req, response=httpx.Response(422, request=req))
+        sent.append(text)
+
+    assert distiller.store_mem0(_mem0_cfg(), _twelve(), refuses_the_second, posted, outbox) == 11
+    assert len(sent) == 11
+    assert not outbox.exists()  # a body mem0 refuses will not be accepted later; it must not block the queue
+
+
+def test_mem0_outbox_is_bounded_and_private(tmp_path):
+    outbox = tmp_path / "learning" / "mem0_outbox.json"
+    many = [distiller.Preference(f"fact number {i}", 0.6, 1) for i in range(distiller.MEM0_OUTBOX_MAX + 30)]
+    old_umask = os.umask(0)
+    try:
+        distiller.store_mem0(_mem0_cfg(), many, lambda *a: 1 / 0, tmp_path / "posted.json", outbox)
+    finally:
+        os.umask(old_umask)
+    kept = [e["text"] for e in json.loads(outbox.read_text())]
+    assert len(kept) == distiller.MEM0_OUTBOX_MAX and kept[-1] == f"fact number {len(many) - 1}"  # the newest stay
+    assert outbox.stat().st_mode & 0o777 == 0o600 and outbox.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_mem0_post_connects_within_two_seconds(monkeypatch):
+    seen: dict[str, object] = {}
+
+    def fake_post(url, **kw):
+        seen.update(kw)
+        return httpx.Response(200, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    assert distiller.store_mem0(_mem0_cfg(), _twelve()[:1]) == 1
+    timeout = seen["timeout"]
+    assert isinstance(timeout, httpx.Timeout) and timeout.connect == 2 and timeout.read == 10
 
 
 def _tree(root: Path) -> None:
