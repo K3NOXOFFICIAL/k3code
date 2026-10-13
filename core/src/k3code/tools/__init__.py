@@ -651,7 +651,9 @@ def _skipped_subpath(rel: str) -> bool:
 
 def _git_files(path: Path) -> list[str] | None:
     """Files under ``path`` that git tracks or would track (``.gitignore`` honoured), relative to ``path``; None when
-    ``path`` is not in a git work tree or git is missing."""
+    ``path`` is not in a git work tree or git is missing. An index entry whose file is gone (deleted or moved without
+    staging) is listed too: callers stat only the paths they keep, since one stat per listed file took minutes for a
+    big checkout on WSL's /mnt/c."""
     import subprocess
 
     try:
@@ -666,20 +668,24 @@ def _git_files(path: Path) -> list[str] | None:
         return None
     if out.returncode != 0:
         return None
-    # -c lists index entries whose file is gone (deleted or moved without staging): the work tree decides.
-    return [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f and os.path.lexists(path / f)]
+    return [f for f in out.stdout.decode("utf-8", errors="replace").split("\0") if f]
 
 
 def _iter_tree(path: Path, deadline: float) -> Iterator[tuple[str | None, bool]]:
     """Yield ``(relative posix path, is_dir)`` under ``path``: from git when ``path`` is in a work tree (so
-    ``.gitignore`` holds), else from a walk pruning WALK_SKIP_DIRS and SKIP_SUBPATHS. Past ``deadline``
-    (``time.monotonic``) it yields ``(None, False)`` once and stops, so the caller can say the result is partial."""
+    ``.gitignore`` holds; that listing may name a file deleted from the work tree, see ``_git_files``), else from a
+    walk pruning WALK_SKIP_DIRS and SKIP_SUBPATHS. Past ``deadline`` (``time.monotonic``) it yields ``(None, False)``
+    once and stops, so the caller can say the result is partial."""
     tracked = _git_files(path)
     if tracked:  # empty: not a work tree, or a path git ignores as a whole (asked for on purpose): walk it
         files = [f for f in tracked if not SKIP_DIRS.intersection(f.split("/")[:-1]) and not _skipped_subpath(f)]
         dirs = sorted({"/".join(f.split("/")[:i]) for f in files for i in range(1, f.count("/") + 1)})
-        yield from ((f, False) for f in files)
-        yield from ((d, True) for d in dirs)
+        for entries, is_dir in ((files, False), (dirs, True)):
+            for rel in entries:
+                if time.monotonic() > deadline:
+                    yield None, False
+                    return
+                yield rel, is_dir
         return
     if shutil.which("rg"):
         yield from _rg_files(path, deadline)
@@ -774,7 +780,8 @@ def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
         if rel is None:
             timed_out = True
             break
-        if basename_ok(rel.rpartition("/")[2]) and _glob_match(rel, pattern):
+        # the work tree decides on a hit the index still lists (see _git_files); a stat per listed path would not
+        if basename_ok(rel.rpartition("/")[2]) and _glob_match(rel, pattern) and os.path.lexists(path / rel):
             found.append(rel)
             if len(found) > MAX_SEARCH_RESULTS:  # one past the cap proves the cut; no need to walk further
                 break
@@ -784,6 +791,47 @@ def _glob_sync(path: Path, pattern: str) -> dict[str, Any]:
     return {"files": files, **({"note": note} if note else {})}
 
 
+#: The grep fallback treats a file with a NUL byte in its first _BINARY_SNIFF_BYTES as binary (as ripgrep does), reads
+#: in pieces of at most _GREP_PIECE_BYTES and looks at the clock every _GREP_CLOCK_BYTES: read_text of a 300 MB binary
+#: took 2.6 GB of memory and ran past the time budget.
+_BINARY_SNIFF_BYTES = 8192
+_GREP_PIECE_BYTES = 1 << 20
+_GREP_CLOCK_BYTES = 64 * 1024
+
+
+def _grep_file(fp: Path, rx: Any, deadline: float, *, named: bool = False) -> Iterator[str | None]:
+    """``path:line:text`` for each line of ``fp`` that ``rx`` matches, streamed, cut to _RG_MAX_COLUMNS like rg's
+    preview. A binary file found in a walk is skipped; one ``named`` on purpose gives a single ``path: binary file
+    matches`` line, as rg says. Past ``deadline`` (``time.monotonic``) it yields None once and stops. A line longer than
+    _GREP_PIECE_BYTES is searched piece by piece under its own line number, so a match across a piece edge, or an
+    anchor at one, is approximate."""
+    with fp.open("rb") as f:
+        binary = b"\0" in f.read(_BINARY_SNIFF_BYTES)
+        if binary and not named:
+            return
+        f.seek(0)
+        number, line_start, unclocked = 0, True, 0
+        for raw in iter(lambda: f.readline(_GREP_PIECE_BYTES), b""):
+            unclocked += len(raw)
+            if unclocked >= _GREP_CLOCK_BYTES:
+                unclocked = 0
+                if time.monotonic() > deadline:
+                    yield None
+                    return
+            if line_start:  # a piece of a longer line keeps that line's number
+                number += 1
+            line_start = raw.endswith(b"\n")
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not rx.search(line):
+                continue
+            if binary:
+                yield f"{fp}: binary file matches"
+                return
+            if len(line) > _RG_MAX_COLUMNS:
+                line = line[:_RG_MAX_COLUMNS] + " [... omitted end of long line]"
+            yield f"{fp}:{number}:{line}"
+
+
 def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict[str, Any]:
     import re
 
@@ -791,7 +839,8 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
     excludes = exclude if isinstance(exclude, list) else [exclude] if exclude else []
     rx = re.compile(pattern)
     deadline = time.monotonic() + SEARCH_BUDGET_S
-    if path.is_file():
+    named = path.is_file()
+    if named:
         base, candidates = path.parent, iter([(path.name, False)])
     else:
         base, candidates = path, _iter_tree(path, deadline)
@@ -809,11 +858,16 @@ def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict
         if excludes and any(Path(fp.name).match(p) for p in excludes):
             continue
         try:
-            text = fp.read_text(encoding="utf-8", errors="replace")
-        except OSError:
+            for hit in _grep_file(fp, rx, deadline, named=named):
+                if hit is None:
+                    timed_out = True
+                    break
+                matches.append(hit)
+                if len(matches) > MAX_SEARCH_RESULTS:
+                    break
+        except OSError:  # unreadable, or an index entry deleted from the work tree (see _git_files)
             continue
-        matches.extend(f"{fp}:{i}:{line}" for i, line in enumerate(text.splitlines(), 1) if rx.search(line))
-        if len(matches) > MAX_SEARCH_RESULTS:
+        if timed_out or len(matches) > MAX_SEARCH_RESULTS:
             break
     shown, note = _capped(matches)
     if timed_out:
