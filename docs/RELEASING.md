@@ -74,12 +74,14 @@ case; the logs stay in `.k3dev/merge-pr/42-<time>/ci/`.
 
 ## Releasing
 
-1. Set the version in `VERSION` (the core wheel reads it from there), add a `## [X.Y.Z] - <date>` section to
-   `CHANGELOG.md`, merge that to `Main`.
+1. Set the version in `VERSION` (the core wheel reads it from there). In `CHANGELOG.md` rename `## Unreleased` to
+   `## [X.Y.Z] - <date>` and put a fresh, empty `## Unreleased` above it, so the release notes (the `## [X.Y.Z]` section
+   alone) hold everything since the last release. Merge that to `Main`.
 2. On an up-to-date, clean `Main`: `scripts/release/release.sh --dry-run X.Y.Z`, then `scripts/release/release.sh X.Y.Z`.
 
 `release.sh` refuses unless `Main` is checked out, the tree is clean, `HEAD` is `origin/Main`, `X.Y.Z` equals `VERSION`,
-`CHANGELOG.md` has the heading and the tag does not exist. Then it runs `check.sh --post`, runs the personal-data scan
+`CHANGELOG.md` has the heading and nothing is left under `## Unreleased` (blank lines and `###` subheadings do not
+count) and the tag does not exist. Then it runs `check.sh --post`, runs the personal-data scan
 of `scripts/release/build_release.sh` on the source export (the export itself is not published; GitHub attaches
 source archives to every release), builds the assets into `.k3dev/release/X.Y.Z/assets/`, creates the annotated tag
 `vX.Y.Z`, pushes it and runs `gh release create` with the CHANGELOG section as notes. A version with a `-`

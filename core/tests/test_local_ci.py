@@ -440,6 +440,56 @@ def test_release_ships_what_release_yml_shipped() -> None:
         assert needle in text
 
 
+def _release_changelog_setup(tmp: Path, changelog: str) -> tuple[Path, dict[str, str]]:
+    """A copy of release.sh in a repository on Main with a bare origin, VERSION 1.2.3 and the given CHANGELOG.md. The
+    check it would run next fails, so a run that gets past the preconditions stops there and builds nothing."""
+    env = _env(tmp)
+    origin = tmp / "origin.git"
+    _run(["git", "init", "-q", "--bare", "-b", "Main", str(origin)], tmp, env)
+    files = {
+        ".gitignore": ".k3dev/\n",
+        "VERSION": "1.2.3\n",
+        "CHANGELOG.md": changelog,
+        "scripts/ci/check.sh": "#!/bin/sh\nexit 1\n",
+    }
+    for rel in ("scripts/ci/lib.sh", "scripts/release/release.sh"):
+        files[rel] = (REPO / rel).read_text()
+    repo = _repo(tmp, env, files)
+    _git(repo, env, "remote", "add", "origin", str(origin))
+    _git(repo, env, "push", "-q", "origin", "Main")
+    env["PATH"] = f"{_stub_bin(tmp)}:{env['PATH']}"
+    return repo, env
+
+
+_FOLDED = "# Changelog\n\n## Unreleased\n\n## [1.2.3] - 2026-01-01\n\n- a change\n"
+_UNFOLDED = "# Changelog\n\n## Unreleased\n\n### Fixed\n\n- not in the notes\n\n## [1.2.3] - 2026-01-01\n\n- a change\n"
+
+
+@pytest.mark.parametrize("dry", [False, True])
+def test_release_refuses_while_changelog_unreleased_has_content(tmp_path: Path, dry: bool) -> None:
+    """The notes are the '## [X.Y.Z]' section only, so whatever '## Unreleased' holds would be left out of them."""
+    repo, env = _release_changelog_setup(tmp_path, _UNFOLDED)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), *(["--dry-run"] if dry else []), "1.2.3"], repo, env)
+    verb = "a real release would refuse" if dry else "refused"
+    assert f"{verb}: CHANGELOG.md '## Unreleased' still holds 1 line" in r.stderr, r.stderr
+    assert "## [1.2.3] - <date>" in r.stderr  # it says what to do
+    if not dry:
+        assert r.returncode == 2 and "1 precondition(s) failed; nothing was built or published" in r.stderr
+        assert "the full check failed" not in r.stderr  # it stopped before the check
+
+
+@pytest.mark.parametrize("dry", [False, True])
+@pytest.mark.parametrize(
+    "text", [_FOLDED, _FOLDED.replace("## Unreleased\n", "## [Unreleased]\n\n### Added\n\n### Fixed\n")]
+)
+def test_release_accepts_an_empty_changelog_unreleased(tmp_path: Path, dry: bool, text: str) -> None:
+    """Folded: '## Unreleased' is empty (blank lines and '###' subheadings only), so the preconditions pass."""
+    repo, env = _release_changelog_setup(tmp_path, text)
+    r = _run(["bash", str(repo / "scripts/release/release.sh"), *(["--dry-run"] if dry else []), "1.2.3"], repo, env)
+    assert "Unreleased" not in r.stderr and "precondition" not in r.stderr, r.stderr
+    assert "the full check failed" in r.stderr  # past the preconditions, stopped at the stubbed check
+
+
 @pytest.mark.parametrize(("plat", "machine", "arch"), [("linux", "x86_64", "amd64"), ("darwin", "arm64", "arm64")])
 def test_update_installs_the_assets_release_sh_publishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plat: str, machine: str, arch: str
