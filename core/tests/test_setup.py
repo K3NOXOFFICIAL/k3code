@@ -405,6 +405,68 @@ def test_parse_window_refuses_anything_else(text: str) -> None:
     assert parse_window(text) is None
 
 
+BAD_STATE_FILES = [
+    "null",
+    "[]",
+    '"text"',
+    "42",
+    '{"completed": ["welcome", "ab',  # cut off mid-write
+    '{"completed": "welcome", "data": {}}',
+    '{"completed": [1, 2], "data": {}}',
+    '{"completed": [], "data": []}',
+    '{"completed": null, "data": {}}',
+]
+
+FRESH_STATE = {"completed": [], "data": {}}
+
+
+@pytest.mark.parametrize("text", BAD_STATE_FILES)
+def test_load_state_starts_over_from_an_unusable_file_and_keeps_a_backup(env: Path, text: str) -> None:
+    st.state_path().parent.mkdir(parents=True)
+    st.state_path().write_text(text)
+    said: list[str] = []
+    assert st.load_state(said.append) == FRESH_STATE
+    assert said and "saved progress was unreadable, starting over" in said[0] and "setup_state.json" in said[0]
+    backups = [p for p in st.state_path().parent.iterdir() if p.name.startswith("setup_state.json.")]
+    assert [p.read_text() for p in backups] == [text]  # the bad file is kept, not deleted
+    assert not st.state_path().exists()
+
+
+def test_load_state_says_nothing_about_a_missing_or_good_file(env: Path) -> None:
+    said: list[str] = []
+    assert st.load_state(said.append) == FRESH_STATE
+    st.save_state({"completed": ["welcome"], "data": {"welcome": {"mode": "fresh"}}, "done": True})
+    assert st.load_state(said.append)["completed"] == ["welcome"]
+    assert said == []
+    assert [p.name for p in st.state_path().parent.iterdir()] == ["setup_state.json"]
+
+
+@pytest.mark.parametrize("text", BAD_STATE_FILES)
+def test_setup_runs_through_an_unusable_state_file(env: Path, text: str, capsys: pytest.CaptureFixture[str]) -> None:
+    st.state_path().parent.mkdir(parents=True)
+    st.state_path().write_text(text)
+    state = run_setup(AnswerPrompter(ANSWERS), do_probe=False)
+    assert state["done"]
+    assert "saved progress was unreadable, starting over" in capsys.readouterr().out
+
+
+def test_setup_step_rerun_cli_survives_a_null_state_file(env: Path) -> None:
+    st.state_path().parent.mkdir(parents=True)
+    st.state_path().write_text("null")
+    answers = env / "answers.yaml"
+    answers.write_text(yaml.safe_dump(ANSWERS))
+    r = CliRunner().invoke(cli, ["setup", "--step", "theme", "--answers", str(answers), "--no-probe"])
+    assert r.exit_code == 0, r.output
+    assert "saved progress was unreadable, starting over" in r.output
+    assert "AttributeError" not in r.output
+
+
+def test_setup_without_terminal_or_answers_refuses_to_prompt(env: Path) -> None:
+    r = CliRunner().invoke(cli, ["setup"])
+    assert r.exit_code == 2 and "needs a terminal" in r.output
+    assert not st.state_path().exists()
+
+
 class _AsksModels(AnswerPrompter):
     """An interactive wizard that records the model choices a tier menu offers."""
 

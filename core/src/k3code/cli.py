@@ -1200,6 +1200,8 @@ def setup_cmd(step: str | None, non_interactive: bool, answers: Path | None, res
         if answers is None:
             raise click.UsageError("--non-interactive needs --answers FILE")
         p: Any = _answers_prompter(answers)
+    elif answers is None and not _is_interactive():
+        raise click.UsageError("`k3code setup` needs a terminal; pass --answers FILE to run it without prompts")
     else:
         p = _answers_prompter(answers) if answers else InteractivePrompter()
     try:
