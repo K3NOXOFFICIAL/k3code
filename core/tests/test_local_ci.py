@@ -99,7 +99,10 @@ def test_full_plan_runs_every_former_ci_job(tmp_path: Path) -> None:
     for cmd in (
         "(cd core && uv run ruff check . ../scripts)",
         "(cd core && uv run ruff format --check . ../scripts)",
-        "(cd core && timeout --kill-after=30 2700 uv run pytest -q)",  # a stalled run fails (issue #42)
+        # a stalled run fails (issue #42); the suite runs in parallel, the `serial` tests alone after it
+        "(cd core && timeout --kill-after=30 2700 uv run pytest -q -n ",
+        " -m not serial --basetemp ",
+        "(cd core && timeout --kill-after=30 2700 uv run pytest -q -m serial --basetemp ",
         "(cd tui && npm run build:ink)",
         "(cd tui && npm run typecheck)",
         "(cd tui && npm run lint)",

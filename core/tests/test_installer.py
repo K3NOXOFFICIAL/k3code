@@ -1241,6 +1241,7 @@ def _path_without(root: Path, name: str) -> str:
 
 
 @linux_only
+@pytest.mark.serial  # a pty as the controlling terminal
 @pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
 @pytest.mark.parametrize("answer", ["y", "n"])
 def test_bwrap_install_is_asked_on_the_terminal_though_stdin_is_not_one(tmp_path: Path, answer: str) -> None:
@@ -1430,6 +1431,7 @@ def test_uninstall_yes_kills_a_process_that_ignores_term(tmp_path: Path) -> None
 
 
 @linux_only
+@pytest.mark.serial  # a pty as the controlling terminal
 @pytest.mark.skipif(shutil.which("setsid") is None, reason="needs util-linux setsid")
 @pytest.mark.parametrize("answer", ["yes", "no"])
 def test_uninstall_asks_on_the_terminal_before_stopping_a_running_k3code(tmp_path: Path, answer: str) -> None:
