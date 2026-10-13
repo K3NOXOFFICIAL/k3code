@@ -216,6 +216,49 @@ def test_a_ref_gone_from_the_remote_is_a_clear_error(remote, data, no_release):
     assert "'gone' was not found on" in r.output and no_release == []
 
 
+PS1 = "powershell -ExecutionPolicy Bypass -File install\\install.ps1"
+
+
+def test_a_pinned_commit_hint_names_install_ps1_in_wsl(data, no_release, monkeypatch):
+    sha = "a" * 40
+    _install(data, sha, ref=sha)
+    monkeypatch.setattr(upd, "_in_wsl", lambda: True)
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert f"`{PS1} --from-git --ref Main`" in r.output and "`sh install.sh --from-git --ref Main`" in r.output
+
+
+def test_a_pinned_commit_hint_outside_wsl_names_only_install_sh(data, no_release, monkeypatch):
+    sha = "a" * 40
+    _install(data, sha, ref=sha)
+    monkeypatch.setattr(upd, "_in_wsl", lambda: False)
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code == 0, r.output
+    assert "`sh install.sh --from-git --ref Main`" in r.output and "install.ps1" not in r.output
+
+
+def test_a_ref_gone_hint_names_install_ps1_in_wsl(remote, data, no_release, monkeypatch):
+    _install(data, "1234567aaaa", ref="gone")
+    monkeypatch.setattr(upd, "_in_wsl", lambda: True)
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code != 0 and f"`{PS1} --from-git {remote['url']} --ref Main`" in r.output
+    assert f"`sh install.sh --from-git {remote['url']} --ref Main`" in r.output
+
+
+def test_the_no_checkout_no_ref_hint_names_install_ps1_in_wsl(data, no_release, monkeypatch):
+    _install(data, "1234567aaaa", ref=None)
+    monkeypatch.setattr(upd, "_in_wsl", lambda: True)
+    r = CliRunner().invoke(cli, ["update", "--yes"])
+    assert r.exit_code != 0 and f"`{PS1} --from-git`" in r.output and "`sh install.sh --from-git`" in r.output
+
+
+def test_installer_command_spells_install_ps1_only_where_a_windows_user_can_run_it(monkeypatch):
+    monkeypatch.setattr(upd, "_in_wsl", lambda: False)
+    assert upd.installer_command("--from-git") == "`sh install.sh --from-git`"
+    monkeypatch.setattr(upd, "_in_wsl", lambda: True)
+    assert upd.installer_command("--from-git") == f"`{PS1} --from-git` or, inside WSL, `sh install.sh --from-git`"
+
+
 def test_an_auth_failure_reaching_the_remote_gives_advice_not_a_traceback(data, no_release, monkeypatch):
     _install(data, "1234567aaaa")
     fail = subprocess.CompletedProcess([], 128, "", "fatal: could not read Username for 'https://github.com'\n")
