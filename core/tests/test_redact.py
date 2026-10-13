@@ -6,6 +6,13 @@ import pytest
 
 from k3code.redact import REDACTED, redact, redact_session_json, scrub_text
 
+# Fake credentials for the prose cases are built at run time: the repo's secret scan rejects a literal that looks real.
+PASSWORD = "hunter2" * 2
+HEX_TOKEN = "".join(("9f8e7d6c", "5b4a3928", "1706f5e4", "d3c2b1a0"))
+API_KEY = "sk" + "1234567890abcdef"
+AWS_KEY = "wJalrXUtn" + "FEMI7K7MDENG"
+GIT_SHA = "a94a8fe5ccb19ba6" + "1c4c0873d391e987982fbbd3"
+
 
 @pytest.mark.parametrize(
     "text, secret",
@@ -30,6 +37,26 @@ def test_free_text_credentials_are_scrubbed(text, secret):
 
 
 @pytest.mark.parametrize(
+    "text, secret",
+    [
+        (f"The user's AWS password is {PASSWORD} for the DB", PASSWORD),
+        (f"deploy token is {HEX_TOKEN}", HEX_TOKEN),
+        (f"the api key was {API_KEY}.", API_KEY),
+        ("Secret is 'correcthorse'", "correcthorse"),
+        ("the staging password was set to Tr0ub4dor&3 yesterday", "Tr0ub4dor&3"),
+        (f"AWS_SECRET_KEY is {AWS_KEY}", AWS_KEY),
+    ],
+)
+def test_a_credential_stated_in_prose_is_scrubbed(text, secret):
+    out = scrub_text(text)
+    assert secret not in out and REDACTED in out, out
+
+
+def test_the_prose_rule_keeps_the_sentence_around_the_value():
+    assert scrub_text(f"The password is {PASSWORD}. Rotate it.") == f"The password is {REDACTED}. Rotate it."
+
+
+@pytest.mark.parametrize(
     "text",
     [
         "the author wrote a long paragraph about authentication in general",
@@ -38,10 +65,37 @@ def test_free_text_credentials_are_scrubbed(text, secret):
         "tokens per second: 1234; keyboard layout: us",
         "see https://example.com/docs?page=2&sort=asc",
         "PASSWORD_MIN_LENGTH=",  # nothing to hide
+        "the password is stored in the vault",  # no digit: a sentence, not a value
+        "the key is to run the tests first",
+        "the token is 42",  # too short to be a credential
+        "monkey is banana12345",  # `key` inside a word
+        f"see commit 934ae07 and the 40-char hash {GIT_SHA}",  # opaque only on request
     ],
 )
 def test_ordinary_text_is_left_alone(text):
     assert scrub_text(text) == text
+
+
+def test_a_standalone_long_token_is_scrubbed_only_when_asked():
+    text = f"log in with {HEX_TOKEN} on the box"
+    assert scrub_text(text) == text  # a git SHA looks the same: session exports and tool errors keep them
+    out = scrub_text(text, opaque=True)
+    assert HEX_TOKEN not in out and out == f"log in with {REDACTED} on the box"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "LongCamelCaseIdentifierWithoutDigitsAtAllInIt",  # no digit
+        "12345678901234567890123456789012",  # no letter
+        "x" * 40,
+        "short9f8e7d6c5b4a",  # under 32
+        "k3nox-224-prose-secret-scrub-in-the-memory-area",  # a slug: the rule is alnum runs only
+        "tests/test_learning_review_curator_for_python_v3.py",
+    ],
+)
+def test_the_standalone_token_rule_leaves_other_long_words_alone(text):
+    assert scrub_text(text, opaque=True) == text
 
 
 def test_mcp_server_env_headers_and_args_are_redacted_by_default():

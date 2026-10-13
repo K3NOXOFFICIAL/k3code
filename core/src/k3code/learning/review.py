@@ -36,11 +36,13 @@ def user_turns(messages: list[dict[str, Any]]) -> int:
 
 
 def transcript(messages: list[dict[str, Any]], limit: int = 7000) -> str:
+    """The user and assistant turns, scrubbed (the cheap-tier model may be another provider) and then clipped, so a
+    secret cut by the clip is not left half there."""
     lines = []
     for m in messages:
         c = m.get("content")
         if isinstance(c, str) and m.get("role") in ("user", "assistant"):
-            lines.append(f"{m['role']}: {c[:600]}")
+            lines.append(f"{m['role']}: {scrub_text(c, opaque=True)[:600]}")
     return "\n".join(lines)[-limit:]
 
 
