@@ -144,3 +144,51 @@ async def test_experiments_count_each_interactive_session_once(tmp_path, monkeyp
     await run_turn(server, "go", [])
     await hub.drain()
     assert hub.experiments.get("x1")["sessions_done"] == 1
+
+
+def _review_session(tmp_path, frames):
+    """A live-session stand-in with enough user turns for the background review."""
+    from types import SimpleNamespace
+
+    msgs = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(16)]
+    return SimpleNamespace(
+        session_id="s1",
+        perms=SimpleNamespace(cwd=tmp_path),
+        background=False,
+        emit=lambda t, p: frames.append((t, p)),
+        stored=SimpleNamespace(messages=msgs, meta={}, cwd=str(tmp_path)),
+    )
+
+
+def _skills_reply(*names):
+    steps = {
+        "lint-fix": "run the linter and fix every warning",
+        "cut-release": "bump the version and tag the release",
+        "ship-it": "build the image and restart the unit",
+    }
+    skills = [{"name": n, "description": f"d {n}", "body": f"1. {steps[n]}\n2. check it"} for n in names]
+    return json.dumps({"facts": [], "skills": skills})
+
+
+async def test_session_review_skill_cards_use_the_ranker_and_the_weekly_limit(tmp_path, monkeypatch):
+    from learn_helpers import FakeCaller
+
+    server, _ = make_server(tmp_path, ["ok"], monkeypatch)
+    hub = server.learning
+    server.model_caller = FakeCaller(_skills_reply("lint-fix", "cut-release", "ship-it"))
+    server.config.learning = {"skill_cards_per_week": 2}
+    frames: list = []
+    await hub.turn_finished(_review_session(tmp_path, frames), "done")
+    cards = [p for p in hub.store.all() if p.kind == "skill"]
+    assert len(cards) == 2  # the project's weekly allowance, not all three
+    assert [t for t, _ in frames].count("proposal.show") == 2
+    # a project that keeps dismissing skill cards is not offered new ones: the ranker is applied
+    pid = hub.log.project_for(str(tmp_path))
+    for _ in range(12):
+        hub.log.record("proposal", subject="x", choice="dismiss", detail={"kind": "skill"}, project=pid)
+    server.config.learning = {"skill_cards_per_week": 9}
+    server.model_caller = FakeCaller(_skills_reply("ship-it"))
+    s = _review_session(tmp_path, frames)
+    s.stored.meta["reviewed_turns"] = 0
+    await hub.turn_finished(s, "done")
+    assert len([p for p in hub.store.all() if p.kind == "skill"]) == 2

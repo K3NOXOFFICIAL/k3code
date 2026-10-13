@@ -432,6 +432,7 @@ class LearningHub:
         minimum = int(self.cfg["review_min_turns"])
         if status == "done" and turns > minimum and turns > int(meta.get("reviewed_turns", 0)) + minimum - 1:
             meta["reviewed_turns"] = turns
+            project = project_id(session.stored.cwd or ".")
             r = await review.review_session(
                 self.server.model_caller,
                 msgs,
@@ -440,7 +441,9 @@ class LearningHub:
                 config=self.server.config,
                 min_turns=minimum,
                 session_id=session.session_id,
-                project=project_id(session.stored.cwd or "."),
+                project=project,
+                ranker=self.ranker(project),
+                max_skill_cards=int(self.cfg["skill_cards_per_week"]),
             )
             self.emit(session, r["proposals"])
         # Once per session and experiment (this ran on every turn), and never for background/cron/loop runs.
