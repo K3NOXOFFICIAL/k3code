@@ -13,6 +13,7 @@ from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from k3code.permissions.engine import sensitive_path
 from k3code.providers.types import Message, ToolSpec
 from k3code.reliability.sandbox import child_env, with_chdir
 from k3code.tools.fuzzy_match import (
@@ -624,16 +625,20 @@ _RG_EXCLUDES = ("!node_modules/", "!__pycache__/", "!.venv/", "!**/.claude/workt
 _RG_MAX_COLUMNS = 400
 
 
-def _grep_line(raw: str) -> tuple[str, bool]:
+def _grep_line(raw: bytes, verdicts: dict[bytes, bool]) -> tuple[str, bool]:
     """An ``rg --null`` output line as ``path:line:text``, and whether it comes from a credential file
     (``sensitive_path``: dotenv files, ``~/.ssh`` ...). An include glob such as ``*`` or ``.env*`` turns rg's
-    hidden-file filter off, so this is what keeps ``.env`` out of a search."""
-    from k3code.permissions.engine import sensitive_path
+    hidden-file filter off, so this is what keeps ``.env`` out of a search.
 
-    path, sep, rest = raw.partition("\0")
-    if not sep:
-        return raw, False  # one file searched: rg prints no name, and the engine has decided on that path already
-    return f"{path}:{rest}", sensitive_path(os.path.abspath(path))
+    The file name stays bytes until the check: decoded with replacement characters first, a path with bytes that
+    are not UTF-8 (a home directory named so) would no longer match ``~/.ssh`` and the like. ``verdicts`` caches
+    the answer per file name (the check resolves symlinks, too slow to repeat for every matching line)."""
+    name, sep, rest = raw.partition(b"\0")
+    if not sep:  # one file searched: rg prints no name, and tool_grep has decided on that path already
+        return raw.decode("utf-8", errors="replace"), False
+    if (hide := verdicts.get(name)) is None:
+        hide = verdicts[name] = sensitive_path(os.path.abspath(os.fsdecode(name)))
+    return f"{name.decode('utf-8', errors='replace')}:{rest.decode('utf-8', errors='replace')}", hide
 
 
 def _note_withheld(result: dict[str, Any], note: str) -> dict[str, Any]:
@@ -648,11 +653,17 @@ def _note_withheld(result: dict[str, Any], note: str) -> dict[str, Any]:
 
 async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
     """Search for a pattern using ripgrep or Python fallback; stops at MAX_SEARCH_RESULTS lines or SEARCH_BUDGET_S.
-    Lines from credential files are never returned (see _grep_line)."""
+
+    Lines from credential files (``sensitive_path``: dotenv files, key directories, the daemon's env file) are
+    never returned (see _grep_line), and a sensitive ``path`` is refused here: the permission engine only sees
+    ``path``, while an include glob or a repository's own ``.ignore`` (``!.env``) reopens hidden files to rg,
+    and the fallback walks them anyway."""
     pattern = arguments["pattern"]
     path = _resolve_path(arguments.get("path", "."), cwd)
     include = arguments.get("include")
     exclude = arguments.get("exclude")
+    if sensitive_path(str(path)):
+        return {"error": f"Hardline deny (sensitive-path): {path}"}
     try:
         # --null: a NUL after each file name, so a credential file is told apart even with ':' in its path
         cmd = ["rg", "--line-number", "--no-heading", "--color=never", "--null"]
@@ -679,6 +690,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
         lines: list[str] = []
         withheld = 0
         cut = ""
+        verdicts: dict[bytes, bool] = {}  # per file name rg printed: is it a sensitive path
         deadline = time.monotonic() + SEARCH_BUDGET_S
         while True:
             try:
@@ -688,7 +700,7 @@ async def tool_grep(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
                 break
             if not raw:
                 break
-            line, secret = _grep_line(raw.decode("utf-8", errors="replace").rstrip("\n"))
+            line, secret = _grep_line(raw.rstrip(b"\n"), verdicts)
             if secret:
                 withheld += 1
                 continue
@@ -940,8 +952,6 @@ def _grep_file(fp: Path, rx: Any, deadline: float, *, named: bool = False) -> It
 
 def _grep_fallback(pattern: str, path: Path, include: Any, exclude: Any) -> dict[str, Any]:
     import re
-
-    from k3code.permissions.engine import sensitive_path
 
     includes = include if isinstance(include, list) else [include] if include else []
     excludes = exclude if isinstance(exclude, list) else [exclude] if exclude else []
