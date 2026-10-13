@@ -102,14 +102,16 @@ def data(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return d
 
 
-def _install(data: Path, sha: str, ref: str | None = "main") -> str:
-    """A complete git-built version `0.1.0-src.<sha7>` made current, with `.ref` when given."""
+def _install(data: Path, sha: str, ref: str | None = "main", url: str | None = None) -> str:
+    """A complete git-built version `0.1.0-src.<sha7>` made current, with `.ref` and `.url` when given."""
     ver = f"0.1.0-src.{sha[:7]}"
     vdir = data / "versions" / ver
     vdir.mkdir(parents=True)
     (vdir / ".complete").write_text(ver + "\n")
     if ref is not None:
         (vdir / ".ref").write_text(ref + "\n")
+    if url is not None:
+        (vdir / ".url").write_text(url + "\n")
     (data / "current").symlink_to(vdir)
     return ver
 
@@ -374,6 +376,36 @@ def test_a_published_release_still_wins_over_a_recorded_ref(data, no_release, mo
     r = CliRunner().invoke(cli, ["update", "--yes"])
     assert r.exit_code == 0, r.output
     assert "latest:  0.2.0" in r.output and no_release == ["0.2.0", "pruned"]
+
+
+def test_an_install_from_a_mirror_updates_from_that_mirror(remote, data, no_release):
+    """#156: the remote recorded at install time is the one `update` checks and builds from, not the upstream repo."""
+    user_config_path().write_text("")  # no update.url: only the recorded remote can tell where to look
+    _install(data, "1234567aaaa", url=remote["url"])
+    checked = CliRunner().invoke(cli, ["update", "--check"])
+    assert checked.exit_code == 0, checked.output
+    assert f"made from git (main of {remote['url']})" in checked.output
+    assert f"latest:  {remote['head'][:7]} (main)" in checked.output
+    applied = CliRunner().invoke(cli, ["update", "--yes"])
+    assert applied.exit_code == 0, applied.output
+    assert (remote["logs"] / "args").read_text().splitlines()[:2] == ["--from-git", remote["url"]]
+
+
+def test_an_explicit_update_url_or_repo_wins_over_the_recorded_remote(data, tmp_path):
+    _install(data, "1234567aaaa", url="https://mirror.invalid/k3code.git")
+    assert upd.update_settings()["url"] == "https://mirror.invalid/k3code.git"
+    user_config_path().parent.mkdir(parents=True, exist_ok=True)
+    user_config_path().write_text("update:\n  url: https://other.invalid/k3code.git\n")
+    assert upd.update_settings()["url"] == "https://other.invalid/k3code.git"
+    user_config_path().write_text("update:\n  repo: me/fork\n")
+    assert upd.update_settings()["url"] == "https://github.com/me/fork.git"
+
+
+def test_an_install_without_a_recorded_remote_follows_the_default_repository(data):
+    assert upd.update_settings()["url"] == "https://github.com/K3NOXOFFICIAL/k3code.git"
+    _install(data, "1234567aaaa")  # made before the remote was recorded
+    assert upd.git_url() is None
+    assert upd.update_settings()["url"] == "https://github.com/K3NOXOFFICIAL/k3code.git"
 
 
 # -- update.py --------------------------------------------------------------------
