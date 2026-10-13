@@ -227,8 +227,21 @@ async def tool_write(arguments: dict[str, Any], *, cwd: Path | None = None) -> d
     return {"ok": True, "path": str(path)}
 
 
-async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
-    """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included)."""
+@dataclasses.dataclass
+class EditPlan:
+    """What ``edit`` will write: the file's text before and after, both with LF line ends."""
+
+    path: Path
+    before: str
+    after: str
+    crlf: bool  # written back with CRLF line ends
+    count: int
+    strategy: str
+
+
+def plan_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> EditPlan | dict[str, Any]:
+    """The change ``edit`` would make, or its error result; nothing is written. The approval prompt shows the same
+    change (issue #131), so this is the one place the replacement is computed."""
     path = _resolve_path(arguments["path"], cwd)
     if not path.is_file():
         return {"error": f"File not found: {path}"}
@@ -255,10 +268,17 @@ async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> di
     if error:
         hint = format_no_match_hint(error, count, old_string, content)
         return {"error": error + hint}
-    if crlf:
-        new_content = new_content.replace("\n", "\r\n")
-    _atomic_write(path, new_content.encode("utf-8"))
-    return {"ok": True, "replacements": count, "strategy": strategy}
+    return EditPlan(path, content, new_content, crlf, count, strategy)
+
+
+async def tool_edit(arguments: dict[str, Any], *, cwd: Path | None = None) -> dict[str, Any]:
+    """Edit a file using fuzzy find-and-replace, preserving its bytes outside the edit (line endings included)."""
+    plan = plan_edit(arguments, cwd=cwd)
+    if isinstance(plan, dict):
+        return plan
+    new_content = plan.after.replace("\n", "\r\n") if plan.crlf else plan.after
+    _atomic_write(plan.path, new_content.encode("utf-8"))
+    return {"ok": True, "replacements": plan.count, "strategy": plan.strategy}
 
 
 #: bash: seconds before a foreground command is killed, when the call names no timeout, and the most it may name.
