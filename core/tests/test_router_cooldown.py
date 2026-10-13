@@ -223,6 +223,65 @@ def test_expired_cooldowns_are_dropped_on_load(tmp_path):
     assert not CooldownStore(path=path, wall=lambda: wall["t"]).in_cooldown(provider="a", model="m")
 
 
+# ── a host that sleeps: the monotonic clock stops, the wall clock does not ──
+
+
+def test_cooldown_ends_at_its_wall_clock_reset_when_the_monotonic_clock_stood_still():
+    """CLOCK_MONOTONIC excludes host suspend (laptop lid, WSL2 host sleep): a 1 h park armed in the evening was still
+    counting awake-time seconds the next morning, after the provider's window had long reset."""
+    wall = {"t": 1_000_000.0}
+    store = CooldownStore(wall=lambda: wall["t"])
+    store.arm(FailoverReason.quota, provider="a", model="m", retry_after=3600, now=500.0)
+    kw = {"provider": "a", "model": "m", "now": 500.0}  # the monotonic clock does not move
+    wall["t"] += 100
+    assert store.in_cooldown(**kw)
+    assert 3400 < store.remaining_seconds(**kw) <= 3500
+    wall["t"] += 3600  # the host slept past the reset
+    assert not store.in_cooldown(**kw)
+    assert store.remaining_seconds(**kw) == 0.0
+    assert store.entries == {}  # and the expired window is dropped
+
+
+def test_network_cooldown_is_not_active_once_its_wall_clock_window_passed():
+    wall = {"t": 1_000_000.0}
+    store = CooldownStore(wall=lambda: wall["t"])
+    store.arm(FailoverReason.network, provider="n", model="m", network_cooldown=60)
+    assert store.only_network_cooling()
+    wall["t"] += 61  # the real monotonic clock has moved by microseconds
+    assert not store.only_network_cooling()
+
+
+async def test_a_park_ends_when_the_host_slept_through_the_reset():
+    """End to end: the chain parks for 1 h, the host sleeps (wall +1 h 1 min, monotonic +the poll chunk), the park
+    ends at the next poll and the next attempt reaches the provider instead of being skipped as still cooling."""
+    wall = {"t": 1_700_000_000.0}
+    a = Scripted("a", [err429(3600), "recovered"])
+    router, store, _, _ = make([a], store=CooldownStore(wall=lambda: wall["t"]))
+    clock = {"now": 1000.0}
+    slept: list[float] = []
+
+    async def sleep(d: float) -> None:
+        slept.append(d)
+        clock["now"] += d
+        if len(slept) == 1:
+            wall["t"] += 3660  # suspend: only the wall clock noticed
+        assert len(slept) < 50, "still parked long after the wall-clock reset"
+
+    pr = PersistentRetry(
+        router,
+        None,
+        config=RetryConfig(poll_interval=0.5),
+        events=EventEmitter(),
+        sleep=sleep,
+        monotonic=lambda: clock["now"],
+        wall=lambda: wall["t"],
+    )
+    texts = [ev.message.content async for ev in pr.stream(MSGS, []) if ev.type == "done" and ev.message]
+    assert texts == ["recovered"]
+    assert clock["now"] - 1000.0 < 5.0, "must not count out the awake-time seconds of a window that already reset"
+    assert a.calls == 2
+
+
 def test_corrupt_cooldown_file_is_ignored(tmp_path):
     path = tmp_path / "cooldowns.json"
     path.write_text("{not json")
