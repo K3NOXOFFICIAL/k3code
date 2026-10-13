@@ -32,12 +32,13 @@ def build_system_prompt(
     mcp: Any = None,
     skills: bool = True,
     advisor: bool = True,
+    attended: bool = True,
 ) -> str:
     # The prompt is sent as one prefix that provider caches match from the top, so the sections that change rarely
     # come first and the learned ones (USER.md's auto section is rewritten by the distiller) come last: a rewrite
     # then invalidates only its own tail. Nothing here may depend on the time, a counter or the turn.
     parts = [base.rstrip()]
-    style = outputstyle.style_text(effective_style(config, session_meta), cwd)
+    style = outputstyle.style_text(effective_style(config, session_meta), cwd, attended=attended)
     if style:
         parts.append(style)
     from k3code.autonomy import advisor as _advisor
