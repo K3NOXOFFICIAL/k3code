@@ -4,8 +4,8 @@
 
 Per subtask: worker child (own worktree) -> reviewer child against the acceptance criteria -> sequential
 merge into the parent checkout with the project's tests run on the merged result before it is committed.
-A failing review, merge or test goes back to that child ONCE with the error; after that it is escalated to
-the parent (the branch is kept, the parent model gets the details).
+A failing review, merge or test goes back to that child ONCE with the error (when the budget pays for the rework
+and its re-review); after that it is escalated to the parent (the branch is kept, the parent model gets the details).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Any
 from k3code.autonomy import autonomy_cfg
 from k3code.autonomy.agents import session_limits
 from k3code.autonomy.plan_first import parse_plan
-from k3code.autonomy.sizing import group_steps, size_agents, top_level_steps, unit_text
+from k3code.autonomy.sizing import REVIEW_ATTEMPTS, WORKER_AGENTS, group_steps, size_agents, top_level_steps, unit_text
 from k3code.reliability.governor import Governor
 from k3code.subagents import worktree as wt_mod
 from k3code.subagents.budget import AgentBudget, BudgetStop
@@ -37,8 +37,7 @@ IO_HEAVY_RE = re.compile(r"\b(install|build|compile|download|bundle|docker|index
 VERDICT_RE = re.compile(r"VERDICT:\s*(pass|fail)[\s*_`.]*\Z", re.I)
 #: Diff characters a reviewer prompt carries; past it the reviewer is told so and pointed at the worktree.
 REVIEW_DIFF_CHARS = 20000
-#: Reviewer runs per review before it counts as unavailable (a crash, a stop or a reply without a verdict).
-REVIEW_ATTEMPTS = 2
+# REVIEW_ATTEMPTS (reviewer runs per review) is defined in sizing, which sizes the agent budget from it.
 
 
 class ReviewUnavailable(Exception):
@@ -101,6 +100,21 @@ async def run_tests(cmd: str, cwd: str | Path, timeout: float = 600) -> tuple[bo
     return ok, text[-4000:]
 
 
+def dirty_text(dirty: list[str]) -> str:
+    """Why a checkout with uncommitted tracked changes cannot be fanned out into (and what to do about it)."""
+    files = ", ".join(dirty[:5]) + (f" and {len(dirty) - 5} more" if len(dirty) > 5 else "")
+    return f"the checkout has uncommitted changes ({files}); commit or stash them"
+
+
+async def dirty_checkout(cwd: str | Path) -> list[str]:
+    """The tracked files with uncommitted changes when ``cwd`` is in a git repository with a commit, which the fan-out
+    refuses for them; [] for a clean one, and for a directory without a repository or a commit (those run in place)."""
+    repo = await wt_mod.repo_root(cwd)
+    if repo is None or not await wt_mod.head_sha(cwd):
+        return []
+    return await wt_mod.uncommitted(repo)
+
+
 def parse_verdict(text: str) -> bool | None:
     """True = pass, False = fail, None = the reply does not end with a verdict."""
     m = VERDICT_RE.search(text or "")
@@ -117,7 +131,8 @@ class Subtask:
     detail: str = ""
     review: str = ""
     worktree: wt_mod.Worktree | None = None
-    #: agents of the budget already taken for this subtask's worker and first reviewer (see FanoutExecutor.run)
+    #: agents of the budget already taken for this subtask's worker and first reviewer (see FanoutExecutor.run), and
+    #: for its rework and the re-review once it is sent back (see _reserve_rework)
     prepaid: int = 0
 
     def row(self) -> dict[str, Any]:
@@ -229,8 +244,8 @@ class FanoutExecutor:
     ) -> FanoutResult | None:
         cwd = Path(session.perms.cwd)
         limits = session_limits(self.server.config, session)
-        if budget is None and limits.dynamic:  # plan-first had no spend bound: worker, reviewer, rework, re-review each
-            budget = AgentBudget(max_agents=4 * len(subtasks))
+        if budget is None and limits.dynamic:  # plan-first had no spend bound: what each worker can use (see sizing)
+            budget = AgentBudget(max_agents=WORKER_AGENTS * len(subtasks))
         if await wt_mod.repo_root(cwd) is None or not await wt_mod.head_sha(cwd):
             session.emit(
                 "notification.show",
@@ -241,14 +256,9 @@ class FanoutExecutor:
         repo = await wt_mod.repo_root(cwd)
         assert repo is not None
         if dirty := await wt_mod.uncommitted(repo):  # workers start from HEAD and every merge lands in this checkout
-            files = ", ".join(dirty[:5]) + (f" and {len(dirty) - 5} more" if len(dirty) > 5 else "")
             session.emit(
                 "notification.show",
-                {
-                    "text": f"fan-out skipped: the checkout has uncommitted changes ({files}); commit or stash them",
-                    "level": "info",
-                    "kind": "fanout",
-                },
+                {"text": f"fan-out skipped: {dirty_text(dirty)}", "level": "info", "kind": "fanout"},
             )
             return None
         test_cmd = (cfg.get("test_command") or detect_test_command(repo)) or ""
@@ -373,6 +383,27 @@ class FanoutExecutor:
         else:
             ctx.budget.take_agent()
 
+    def _reserve_rework(self, ctx: _Ctx, st: Subtask) -> str:
+        """Take the agents of a rework and of its re-review now: "" when both are paid for, else why they are not (and
+        nothing is taken). A rework is new work that merges only after its own pass, so one whose re-review the budget
+        refuses spends an agent and merges nothing. Check and take happen together, with no await between them: reworks
+        running side by side cannot both count the same free agent. Agents it does not use are refunded by _one."""
+        budget = ctx.budget
+        if budget is None:
+            return ""
+        need = max(0, 2 - st.prepaid)
+        free = budget.left()
+        if free is not None and free < need:
+            held = f", {budget.reserved} held back for the review" if budget.reserved else ""
+            return (
+                f"agent budget exhausted ({budget.agents}/{budget.max_agents} agents{held}): "
+                f"a rework and its re-review need {need} more"
+            )
+        for _ in range(need):
+            budget.take_agent()
+            st.prepaid += 1
+        return ""
+
     async def _spawn(self, ctx: _Ctx, st: Subtask, agent_type: str, prompt: str, description: str, **kw: Any) -> Handle:
         self._take(ctx, st)
         mgr = self.server.subagents
@@ -441,6 +472,9 @@ class FanoutExecutor:
                     return
                 err = await self._review(ctx, st, h)
                 if err:  # sent back once, then escalated
+                    if why := self._reserve_rework(ctx, st):  # nothing is spent on a rework that could not be reviewed
+                        self.progress(ctx, st, "escalated", f"{why}; the reviewer rejected the result:\n{err}")
+                        return
                     st.attempts += 1
                     self.progress(ctx, st, "retrying", err)
                     h = await self._rework(ctx, st, f"A reviewer rejected your result:\n{err}")
@@ -556,6 +590,9 @@ class FanoutExecutor:
                 parent_head = await wt_mod.head_sha(wt.repo)
             if st.attempts >= 1 or blocked:  # the child cannot clean the user's checkout: no rework for that
                 self.progress(ctx, st, "escalated", error)
+                return
+            if why := self._reserve_rework(ctx, st):  # nothing is spent on a rework that could not be reviewed
+                self.progress(ctx, st, "escalated", f"{error}\n(no rework: {why})")
                 return
             st.attempts += 1
             self.progress(ctx, st, "retrying", error)

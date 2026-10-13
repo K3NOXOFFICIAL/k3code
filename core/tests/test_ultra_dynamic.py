@@ -48,7 +48,8 @@ def four_step_script(*extra):
 @pytest.mark.usefixtures("sandbox_optional")
 async def test_four_subtasks_at_the_default_budget_still_get_the_review_panel_and_the_tests(tmp_path, monkeypatch):
     """Before: 4 workers + 4 reviewers + 3 planners = 11 of 12; the panel ran out of agents and the report said
-    '0 candidate finding(s)'. Now the fan-out packs to three workers and the review tail stays paid for."""
+    '0 candidate finding(s)'. Now the fan-out packs to two workers and the review tail (both lenses asked twice, and
+    the fixer) stays paid for."""
     repo = git_repo(tmp_path / "repo")
     server = make(
         tmp_path,
@@ -62,17 +63,16 @@ async def test_four_subtasks_at_the_default_budget_still_get_the_review_panel_an
     report = server.session.stored.messages[-1]["content"]
     assert "STOPPED" not in report
     assert "2 candidate finding(s); 1 confirmed by both reviewers" in report
-    assert "pass (true)" in report and "Budget used: 12/12 agents" in report
+    assert "pass (true)" in report and "Budget used: 10/12 agents" in report
     types = sorted(h.agent_type for h in server.subagents.handles.values())
-    assert types.count("planner") == 3 and types.count("worker") == 4 and types.count("reviewer") == 5
+    assert types.count("planner") == 3 and types.count("worker") == 3 and types.count("reviewer") == 4
     plan = events(server, "fanout.plan")[0]
     assert [s["title"] for s in plan["subtasks"]] == [
         "STEP-ONE add f1; then STEP-TWO add f2 (in this order)",
-        "STEP-THREE add f3",
-        "STEP-FOUR add f4",
+        "STEP-THREE add f3; then STEP-FOUR add f4 (in this order)",
     ]
     details = [e["detail"] for e in events(server, "ultra.progress") if e["phase"] == "implementing"]
-    assert any("4 step(s) -> 4 unit(s) -> 3 worker(s), width 3" in d and "3 held for the review" in d for d in details)
+    assert any("4 step(s) -> 4 unit(s) -> 2 worker(s), width 2" in d and "5 held for the review" in d for d in details)
 
 
 async def test_with_dynamic_sizing_off_the_old_shape_runs_and_the_report_says_the_panel_did_not_run(
@@ -173,8 +173,9 @@ async def test_max_agents_auto_is_trimmed_to_what_the_plan_uses(tmp_path, monkey
     await run_job(server, "ultracode add two files")
     report = server.session.stored.messages[-1]["content"]
     assert "STOPPED" not in report
-    # 3 planners + 3 held for the review + (a worker, its reviewer and one rework) for each of the 2 steps = 12 of 24
-    assert "/12 agents" in report and "/24 agents" not in report
+    # 3 planners + 5 held for the review + (a worker and a rework, and the reviews of both, each asked twice) for each
+    # of the 2 steps = 20 of 24
+    assert "/20 agents" in report and "/24 agents" not in report
 
 
 async def test_a_session_override_changes_the_budget_of_the_next_run(tmp_path, monkeypatch):
@@ -343,9 +344,10 @@ def first_review_fails_script(*extra):
 
 
 @pytest.mark.usefixtures("sandbox_optional")
-async def test_one_failed_review_at_the_default_budget_does_not_starve_the_other_subtasks(tmp_path, monkeypatch):
+async def test_one_failed_review_at_a_tight_budget_does_not_starve_the_other_subtasks(tmp_path, monkeypatch):
     """The rework and re-review of one subtask took the agents the others' reviewers needed: nothing merged, the panel
-    never ran, and the report said the final tests passed on an unchanged tree."""
+    never ran, and the report said the final tests passed on an unchanged tree. 14 agents is the smallest budget that
+    still fans three steps into three workers (3 planners, 3 workers, 3 reviewers and the 5 held for the review)."""
     repo = git_repo(tmp_path / "repo")
     server = make(
         tmp_path,
@@ -353,6 +355,7 @@ async def test_one_failed_review_at_the_default_budget_does_not_starve_the_other
         first_review_fails_script(LENS_C, LENS_S, VOTE_C, VOTE_S, *FIXER),
         mode="auto",
         autonomy=cfg(),
+        ultracode={"max_agents": 14},
     )
     await call(server, "session.create", {"cwd": str(repo)})
     await run_job(server, "ultracode add three files")
@@ -362,10 +365,10 @@ async def test_one_failed_review_at_the_default_budget_does_not_starve_the_other
     assert states["t2"] == "merged" and states["t3"] == "merged", done["summary"]
     assert (repo / "f2.txt").exists() and (repo / "f3.txt").exists()
     assert "## Review panel\nnot run" not in report and "candidate finding(s)" in report
-    assert states["t1"] in ("skipped", "merged")  # it may be out of budget for its retry; it is reported either way
-    assert len(server.subagents.handles) <= 12
-    if states["t1"] == "skipped":
-        assert "## PARTIAL" in report and "[skipped] STEP-ONE add f1" in report
+    assert states["t1"] in ("escalated", "merged")  # no agents left for its retry: it is reported, with no spend
+    assert len(server.subagents.handles) <= 14
+    if states["t1"] == "escalated":
+        assert "## PARTIAL" in report and "[escalated] STEP-ONE add f1" in report
         assert "on 2/3 merged subtasks" in report
 
 
@@ -530,3 +533,131 @@ async def test_a_task_the_safety_floor_touched_keeps_all_three_planners(tmp_path
     await call(server, "session.create", {"cwd": str(repo)})
     await server.ultra.ultracode(server.session, "rotate the production credentials", verdict=risky)
     assert len([h for h in server.subagents.handles.values() if h.agent_type == "planner"]) == 3
+
+
+# ── a rework needs two agents: itself and its re-review ──
+
+ONE_STEP = (
+    "## Goal\nAdd a file\n## Steps\n1. STEP-ONE add f1\n## Files\nnone\n## Risks\nnone\n"
+    "## Verification\nfile exists\n## Estimate\nsmall"
+)
+
+
+def rework_of(i: int, name: str) -> list[dict]:
+    """What worker ``i`` does when the reviewer's rejection ("t<i> needs a test") is sent back to it."""
+    key = f"t{i} needs a test"
+    return [
+        {
+            "type": "tool_call",
+            "id": f"r{i}",
+            "match": key,
+            "when": "first",
+            "name": "write",
+            "arguments": {"path": name, "content": "better\n"},
+        },
+        {"type": "text", "match": key, "when": "after_tool", "text": f"reworked {i}"},
+    ]
+
+
+def two_step_rework_script(*, both_rejected: bool, second_takes: float = 0.0):
+    """Two steps; STEP-ONE's first review fails (STEP-TWO's too when ``both_rejected``), each rework then passes.
+    ``second_takes``: seconds STEP-TWO's worker works, so that STEP-ONE's review comes back first."""
+    two_judge = {**JUDGE, "text": 'SCORES: {"mvp-first": 6}\n' + TWO_STEPS}
+    fails = [{"type": "text", "match": "Subtask: STEP-ONE", "text": "t1 needs a test. VERDICT: fail"}]
+    passes = [{"type": "text", "match": "reworked 1", "text": "fine now. VERDICT: pass"}]
+    reworks = rework_of(1, "f1.txt")
+    if both_rejected:
+        fails.append({"type": "text", "match": "Subtask: STEP-TWO", "text": "t2 needs a test. VERDICT: fail"})
+        passes.append({"type": "text", "match": "reworked 2", "text": "fine now. VERDICT: pass"})
+        reworks += rework_of(2, "f2.txt")
+    else:
+        fails.append(reviewer("STEP-TWO"))
+    return [
+        *PLANNERS,
+        two_judge,
+        *worker(1, "f1.txt"),
+        *worker(2, "f2.txt", sleep=second_takes),
+        *reworks,
+        *fails,
+        *passes,
+        LENS_C,
+        LENS_S,
+        VOTE_C,
+        VOTE_S,
+        *FIXER,
+    ]
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+@pytest.mark.parametrize("both_rejected", [False, True], ids=["one-rejected", "both-rejected"])
+async def test_max_agents_auto_pays_for_a_rework_and_its_rereview(tmp_path, monkeypatch, both_rejected):
+    """`auto` trimmed the budget to three agents per worker, so a rejected subtask's rework ran, its re-review was
+    refused and nothing merged. Both rejected: one of the two used to be left unmerged."""
+    repo = git_repo(tmp_path / "repo")
+    server = make(
+        tmp_path,
+        monkeypatch,
+        two_step_rework_script(both_rejected=both_rejected),
+        mode="auto",
+        autonomy=cfg(),
+        ultracode={"max_agents": "auto"},
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add two files")
+    report = server.session.stored.messages[-1]["content"]
+    states = {p["subtask_id"]: (p["state"], p["detail"]) for p in events(server, "fanout.progress")}
+    assert [state for state, _ in states.values()] == ["merged", "merged"], states
+    assert "agent budget exhausted" not in report and "STOPPED" not in report
+    reworks = [h.description for h in server.subagents.handles.values() if h.description.startswith("fix: STEP")]
+    assert len(reworks) == (2 if both_rejected else 1)
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_max_agents_auto_pays_for_the_rework_after_a_failed_merge_and_its_rereview(tmp_path, monkeypatch):
+    """The merge-rework path: the first merge's tests fail, the worker is reworked, and the rework's re-review used
+    to be refused (6 of 9 agents used, 3 held back), so the rework was lost."""
+    repo = git_repo(tmp_path / "repo")
+    one = {**JUDGE, "text": 'SCORES: {"mvp-first": 6}\n' + ONE_STEP}
+    flaky = "mkdir -p .k3code && (test -f .k3code/ran || (touch .k3code/ran; exit 1))"  # fails on the first merge only
+    script = [
+        *PLANNERS,
+        one,
+        *worker(1, "f1.txt"),
+        *REWORK_ONE,
+        reviewer("add a file"),
+        LENS_C,
+        LENS_S,
+        VOTE_C,
+        VOTE_S,
+        *FIXER,
+    ]
+    fan = {"enabled": True, "max_parallel": 3, "require_tests": True, "test_command": flaky}
+    server = make(
+        tmp_path, monkeypatch, script, mode="auto", autonomy=cfg(fanout=fan), ultracode={"max_agents": "auto"}
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add a file")
+    report = server.session.stored.messages[-1]["content"]
+    states = [(p["state"], p["detail"][:60]) for p in events(server, "fanout.progress")]
+    assert [state for state, _ in states][-1] == "merged" and "retrying" in [state for state, _ in states], states
+    assert "1/1 subtasks merged" in report and "agent budget exhausted" not in report
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_a_rework_whose_rereview_the_budget_cannot_pay_is_not_started(tmp_path, monkeypatch):
+    """Both subtasks are rejected; 15 agents leave three free ones after the planners, the workers and their first
+    reviewers (the tail is held). The first rework takes two (itself and its re-review). The second saw one left, ran
+    its rework anyway and was then refused its re-review: an agent spent for a result that could not merge."""
+    repo = git_repo(tmp_path / "repo")
+    script = two_step_rework_script(both_rejected=True, second_takes=0.4)
+    server = make(tmp_path, monkeypatch, script, mode="auto", autonomy=cfg(), ultracode={"max_agents": 15})
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add two files")
+    report = server.session.stored.messages[-1]["content"]
+    states = {p["subtask_id"]: (p["state"], p["detail"]) for p in events(server, "fanout.progress")}
+    assert states["t1"][0] == "merged", states
+    assert states["t2"][0] == "escalated" and "a rework and its re-review need 2 more" in states["t2"][1], states
+    assert "t2 needs a test" in states["t2"][1]  # the rejection is kept for the parent
+    handles = [h.description for h in server.subagents.handles.values()]
+    assert "fix: STEP-ONE add f1" in handles and "fix: STEP-TWO add f2" not in handles
+    assert "Budget used: 12/15 agents" in report and "[escalated] STEP-TWO add f2" in report

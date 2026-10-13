@@ -6,6 +6,10 @@ import pytest
 
 from k3code.autonomy.sizing import (
     MAX_SUBTASKS,
+    REVIEW_ATTEMPTS,
+    REVIEW_HOLD,
+    REVIEW_LENSES,
+    WORKER_AGENTS,
     group_steps,
     pack,
     pick_planners,
@@ -13,6 +17,7 @@ from k3code.autonomy.sizing import (
     top_level_steps,
     unit_text,
 )
+from k3code.autonomy.ultra import LENSES
 
 
 def plan(steps: str) -> str:
@@ -112,19 +117,31 @@ def sized(n_units: int, left: int | None, **kw):
     )
 
 
-def test_the_default_budget_pays_for_three_workers_and_keeps_the_review_tail():
-    for n, workers in ((3, 3), (4, 3), (5, 3), (8, 3)):
+def test_the_review_tail_pays_for_every_lens_asked_again_and_the_fixer():
+    # a lens that answers without its findings is asked once more: that must never take the fixer's agent
+    assert len(LENSES) == REVIEW_LENSES
+    assert REVIEW_HOLD == len(LENSES) * REVIEW_ATTEMPTS + 1 == 5
+
+
+def test_a_worker_is_sized_for_its_rework_and_both_reviews_each_asked_again():
+    # worker + rework, and the review of the result and the re-review of the rework, each asked REVIEW_ATTEMPTS times
+    assert WORKER_AGENTS == 2 + 2 * REVIEW_ATTEMPTS == 6
+
+
+def test_the_default_budget_pays_for_two_workers_and_keeps_the_review_tail():
+    for n in (3, 4, 5, 8):
         got = sized(n, 9)  # 12 agents minus 3 planners
-        assert got.workers == workers and got.hold == 3
+        assert got.workers == 2 and got.hold == REVIEW_HOLD
         assert got.workers * 2 + got.hold <= 9
-    assert sized(4, 9).subtasks == ["u0; then u1 (in this order)", "u2", "u3"]
-    assert "4 units packed into 3 worker(s) by the agent budget" in sized(4, 9).reasons
+    assert sized(4, 9).subtasks == ["u0; then u1 (in this order)", "u2; then u3 (in this order)"]
+    assert "4 units packed into 2 worker(s) by the agent budget" in sized(4, 9).reasons
+    assert sized(3, 11).workers == 3  # three workers need 14 agents: 3 planners, 3 workers, 3 reviewers, the tail
 
 
 def test_a_bigger_budget_buys_more_workers_up_to_the_scope_and_the_limit():
-    assert sized(8, 13).workers == 5  # (13 - 3 held) // 2
-    assert sized(8, 17).workers == 7  # (17 - 3 held) // 2: no scope caps it below the budget
-    assert sized(8, 17, scope="medium").workers == 7
+    assert sized(8, 13).workers == 4  # (13 - 5 held) // 2
+    assert sized(8, 17).workers == 6  # (17 - 5 held) // 2: no scope caps it below the budget
+    assert sized(8, 17, scope="medium").workers == 6
     assert sized(8, 60, scope="large").workers == 8  # the limit of eight, whatever the budget
     assert sized(8, 60, scope="huge").workers == 8
     assert sized(2, 60).workers == 2  # never more than the plan has units
@@ -137,7 +154,7 @@ def test_one_unit_or_a_small_scope_runs_the_whole_task_as_one_worker():
 
 def test_a_tight_budget_cuts_the_tail_before_it_cuts_the_workers():
     got = sized(4, 4)
-    assert got.workers == 1 and got.hold == 2  # (4 - 3) // 2 would be no worker: the tail shrinks to 2
+    assert got.workers == 1 and got.hold == 2  # (4 - 5) // 2 would be no worker: the tail shrinks to 2
     assert any("review tail cut" in r for r in got.reasons)
     tiny = sized(4, 1)
     assert tiny.workers == 0 and "raise it with /maxagents" in tiny.reasons[0]
@@ -145,7 +162,7 @@ def test_a_tight_budget_cuts_the_tail_before_it_cuts_the_workers():
 
 def test_width_is_bounded_by_workers_and_the_cap():
     assert sized(3, 9, width_cap=2).width == 2
-    assert sized(3, 9, width_cap=8).width == 3
+    assert sized(3, 11, width_cap=8).width == 3
     assert sized(1, 9, width_cap=4).width == 1
 
 

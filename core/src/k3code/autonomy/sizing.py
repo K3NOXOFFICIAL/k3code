@@ -15,8 +15,16 @@ from k3code.autonomy.plan_first import parse_plan
 
 #: a run never fans out into more workers than this (the same bound ``extract_subtasks`` has always had)
 MAX_SUBTASKS = 8
-#: tail of an /ultracode run held back from the fan-out: two lens reviewers and one fixer
-REVIEW_HOLD = 3
+#: reviewer runs per review before it counts as unavailable (a crash, a stop or a reply without a verdict or findings)
+REVIEW_ATTEMPTS = 2
+#: lenses of the /ultracode review panel (``ultra.LENSES``; a test keeps the two equal)
+REVIEW_LENSES = 2
+#: tail of an /ultracode run held back from the fan-out: every lens asked REVIEW_ATTEMPTS times, and one fixer. A lens
+#: that asks again must never take the fixer's agent: a confirmed finding would go unfixed and the tests unrun
+REVIEW_HOLD = REVIEW_LENSES * REVIEW_ATTEMPTS + 1
+#: agents one worker can use: itself, one rework, and the two reviews (the result and the rework), each asked
+#: REVIEW_ATTEMPTS times. A rework whose re-review the budget refuses spends an agent and merges nothing
+WORKER_AGENTS = 2 + 2 * REVIEW_ATTEMPTS
 #: workers a scope can keep busy: a trivial or small task is one piece of work. Larger ones are bounded by the budget
 #: and by MAX_SUBTASKS (no evidence supports a tighter cut per scope)
 SCOPE_WORKERS = {"trivial": 1, "small": 1}

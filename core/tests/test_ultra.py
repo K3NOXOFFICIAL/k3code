@@ -195,7 +195,12 @@ def code_steps(*extra):
 async def test_ultracode_accepts_only_findings_both_reviewers_agree_on(tmp_path, monkeypatch):
     repo = git_repo(tmp_path / "repo")
     server = make(
-        tmp_path, monkeypatch, code_steps(LENS_C, LENS_S, VOTE_C, VOTE_S, *FIXER), mode="auto", autonomy=cfg()
+        tmp_path,
+        monkeypatch,
+        code_steps(LENS_C, LENS_S, VOTE_C, VOTE_S, *FIXER),
+        mode="auto",
+        autonomy=cfg(),
+        ultracode={"max_agents": 14},  # three workers: 3 planners, 3 workers, 3 reviewers and the 5 held for the review
     )
     await call(server, "session.create", {"cwd": str(repo)})
     await run_job(server, "ultracode add three files")
@@ -269,7 +274,7 @@ DEAD_LENSES = [
 async def test_ultracode_lenses_without_an_answer_are_not_a_clean_review(tmp_path, monkeypatch):
     # issue #97: a lens that dies or replies without the findings array used to read as "review panel found nothing"
     repo = git_repo(tmp_path / "repo")
-    # 3 planners + 3 workers + 3 reviewers + 2 lenses asked twice: one more than the default 12 agents
+    # 2 lenses asked twice is within the review tail even at 13 agents (the default 12 holds 5 for it as well)
     server = make(
         tmp_path, monkeypatch, code_steps(*DEAD_LENSES), mode="auto", autonomy=cfg(), ultracode={"max_agents": 13}
     )
@@ -287,15 +292,16 @@ async def test_ultracode_lenses_without_an_answer_are_not_a_clean_review(tmp_pat
     assert len(lens_runs) == 4  # each lens was asked once more
 
 
-@pytest.mark.parametrize("max_agents", [12, 10], ids=["retry-refused", "second-lens-refused"])
+@pytest.mark.parametrize("max_agents", [8, 6], ids=["retry-refused", "second-lens-refused"])
 async def test_a_budget_stop_in_the_review_panel_still_says_the_review_is_incomplete(tmp_path, monkeypatch, max_agents):
     # the budget ran out inside the panel (a lens retry, or a lens that never started): the report said
-    # "0 candidate finding(s)" plus STOPPED and nothing about the lenses that never answered
+    # "0 candidate finding(s)" plus STOPPED and nothing about the lenses that never answered. The review tail covers
+    # every lens asked twice, so only a budget too small for it (here the tail is cut to 3 and to 1) gets this far
     repo = git_repo(tmp_path / "repo")
     server = make(
         tmp_path,
         monkeypatch,
-        code_steps(*DEAD_LENSES),
+        code_steps(*DEAD_LENSES, reviewer("add three files")),  # a budget this small packs the plan into one worker
         mode="auto",
         autonomy=cfg(),
         ultracode={"max_agents": max_agents},
@@ -564,3 +570,239 @@ def test_diff_for_files_reads_the_paths_the_way_reviewers_and_git_write_them():
     assert diff_for_files(root + a, {"tests/conftest.py", "src/a.py"}) == root + a
     assert diff_for_files(root + a, {"conftest.py"}) == root and diff_for_files(root + a, {"./conftest.py"}) == root
     assert diff_for_files(root + a, {"/work/repo/conftest.py"}) == root, "an absolute path ends in the header's path"
+
+
+# ── the review tail: lenses asked again, and the fixer ──
+
+ONE_FINDING = json.dumps([{"file": "x", "line": 1, "severity": "high", "issue": "REAL"}])
+
+
+def scripted_panel(monkeypatch, correctness_replies: list[str]):
+    """An ``Ultra`` whose review children are scripted: the correctness lens answers from ``correctness_replies`` in
+    turn (the last one repeats), the other lens always finds the one bug, and the fixer works. Returns the Ultra and
+    the list of descriptions the children ran under."""
+    from types import SimpleNamespace
+
+    import k3code.autonomy.ultra as ultra_mod
+    from k3code.autonomy.ultra import Ultra
+    from k3code.subagents.runner import Handle
+
+    ran: list[str] = []
+    asked = {"correctness": 0}
+
+    def done(result: str) -> Handle:
+        h = Handle(id="r", description="d", agent_type="reviewer", tier="main", depth=1, parent_sid="s")
+        h.status, h.error, h.result = "completed", "", result
+        return h
+
+    async def fake_git(*args, **kwargs):
+        return 0, "diff --git a/x b/x\n+x\n"
+
+    async def run(session, *, description, prompt, agent_type, **kwargs):
+        ran.append(description)
+        if agent_type == "worker":
+            return done("fixed")
+        if "LENS: correctness" in prompt:
+            asked["correctness"] += 1
+            return done(correctness_replies[min(asked["correctness"], len(correctness_replies)) - 1])
+        return done(ONE_FINDING)
+
+    async def complete(*args, **kwargs):
+        return SimpleNamespace(text=json.dumps({"votes": {"f1": True}}), prompt_tokens=1, completion_tokens=1)
+
+    monkeypatch.setattr(ultra_mod.wt_mod, "git", fake_git)
+    ex = Ultra.__new__(Ultra)
+    ex.progress = lambda *a, **k: None  # type: ignore[method-assign]
+    ex.server = SimpleNamespace(model_caller=SimpleNamespace(complete=complete), subagents=SimpleNamespace(run=run))
+    return ex, ran
+
+
+@pytest.mark.parametrize("flaky", [False, True], ids=["lenses-answer", "one-lens-asked-again"])
+async def test_a_lens_that_is_asked_again_never_takes_the_fixers_agent(monkeypatch, flaky):
+    """A lens that answers without its findings array is asked once more. At the default 12 agents that retry took the
+    agent held back for the fixer: a finding both reviewers confirmed was never fixed."""
+    from types import SimpleNamespace
+
+    from k3code.autonomy.sizing import REVIEW_HOLD
+    from k3code.autonomy.ultra import _Report
+    from k3code.subagents.budget import AgentBudget
+
+    ex, ran = scripted_panel(monkeypatch, ["I looked but wrote no array", ONE_FINDING] if flaky else [ONE_FINDING])
+    budget = AgentBudget(max_agents=12)
+    budget.agents = 12 - REVIEW_HOLD  # the fan-out used everything but the tail that was held back
+    budget.reserve(REVIEW_HOLD)
+    report = _Report(task="t")
+    session = SimpleNamespace(perms=SimpleNamespace(cwd="."), session_id="s")
+    await ex.review_and_fix(session, budget, report, "t", "plan", "base")
+    assert report.fix.startswith("completed"), (ran, report.notes)
+    assert ran.count("review: correctness") == (2 if flaky else 1) and ran[-1] == "fix findings"
+    assert report.stopped == "" and budget.agents <= budget.max_agents
+
+
+async def test_a_fixer_the_agent_budget_refuses_is_a_stop_not_an_error(monkeypatch):
+    from types import SimpleNamespace
+
+    from k3code.autonomy.ultra import _Report
+    from k3code.subagents.budget import AgentBudget
+
+    ex, ran = scripted_panel(monkeypatch, [ONE_FINDING])
+    budget = AgentBudget(max_agents=2)  # the two lenses fit, the fixer does not
+    report = _Report(task="t")
+    session = SimpleNamespace(perms=SimpleNamespace(cwd="."), session_id="s")
+    await ex.review_and_fix(session, budget, report, "t", "plan", "base")  # does not raise: the tests still run
+    assert "fix findings" not in ran and report.fix == ""  # "" is what tells the final tests that nothing was fixed
+    assert report.stopped == "agent budget exhausted (2/2 agents)"
+    assert any("1 confirmed finding(s) were not fixed" in n for n in report.notes)
+    assert len(report.confirmed) == 1
+
+
+async def test_a_fixer_the_token_cap_refuses_still_ends_the_run(monkeypatch):
+    from types import SimpleNamespace
+
+    from k3code.autonomy.ultra import _Report
+    from k3code.subagents.budget import AgentBudget, BudgetStop
+
+    ex, ran = scripted_panel(monkeypatch, [ONE_FINDING])
+    budget = AgentBudget(max_agents=9, max_tokens=100)
+
+    async def complete(*args, **kwargs):  # the votes spend the last of the tokens
+        budget.tokens = 100
+        return SimpleNamespace(text=json.dumps({"votes": {"f1": True}}), prompt_tokens=0, completion_tokens=0)
+
+    ex.server.model_caller.complete = complete
+    session = SimpleNamespace(perms=SimpleNamespace(cwd="."), session_id="s")
+    with pytest.raises(BudgetStop) as stop:
+        await ex.review_and_fix(session, budget, _Report(task="t"), "t", "plan", "base")
+    assert stop.value.kind == "tokens"
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_one_lens_asked_again_still_leaves_the_confirmed_finding_fixed_at_the_default_budget(
+    tmp_path, monkeypatch
+):
+    import k3code.autonomy.ultra as ultra_mod
+
+    real = ultra_mod.findings_list
+    seen = {"n": 0}
+
+    def flaky(text):
+        if "NITPICK" in (text or "") and seen["n"] == 0:  # the correctness lens's first reply
+            seen["n"] += 1
+            return None
+        return real(text)
+
+    monkeypatch.setattr(ultra_mod, "findings_list", flaky)
+    repo = git_repo(tmp_path / "repo")
+    server = make(
+        tmp_path, monkeypatch, code_steps(LENS_C, LENS_S, VOTE_C, VOTE_S, *FIXER), mode="auto", autonomy=cfg()
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "1 confirmed by both reviewers" in report and "STOPPED" not in report
+    assert (repo / "fixed.txt").exists(), "a finding both reviewers confirmed was never fixed"
+    assert "pass (true)" in report
+    lenses = [h.description for h in server.subagents.handles.values() if h.description == "review: correctness"]
+    assert len(lenses) == 2  # it was asked again
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_a_fixer_with_no_agent_left_does_not_cost_the_run_its_final_tests(tmp_path, monkeypatch):
+    """7 agents: 3 planners, one worker and its reviewer, and a review tail cut to the two lenses. The fixer is refused;
+    the final tests spend no agent and must still run (the report said "Final tests: not run")."""
+    repo = git_repo(tmp_path / "repo")
+    script = code_steps(LENS_C, LENS_S, VOTE_C, VOTE_S, *FIXER, reviewer("add three files"))
+    server = make(tmp_path, monkeypatch, script, mode="auto", autonomy=cfg(), ultracode={"max_agents": 7})
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "1 confirmed by both reviewers" in report and not (repo / "fixed.txt").exists()
+    assert "## STOPPED\nagent budget exhausted (7/7 agents)" in report
+    assert "were not fixed" in report
+    assert "## Final tests\npass (true)" in report
+
+
+# ── a checkout the fan-out would refuse ──
+
+IN_PLACE = [
+    {
+        "type": "tool_call",
+        "id": "ip",
+        "match": "Implement this task following the plan",
+        "when": "first",
+        "name": "write",
+        "arguments": {"path": "f1.txt", "content": "new work\n"},
+    },
+    {"type": "text", "match": "Implement this task following the plan", "when": "after_tool", "text": "done in place"},
+]
+
+
+@pytest.mark.parametrize("staged", [False, True], ids=["unstaged", "staged"])
+async def test_ultracode_refuses_a_checkout_with_uncommitted_changes_before_it_spends_an_agent(
+    tmp_path, monkeypatch, staged
+):
+    """The fan-out refuses such a checkout, but only after 3 planners and the judge had been paid: the run then fell
+    back to one worker in place, whose changes the review panel (it reads the committed diff) never saw."""
+    repo = git_repo(tmp_path / "repo")
+    (repo / "a.py").write_text("x = 2  # the user's work in progress\n")  # tracked, uncommitted
+    if staged:
+        git(repo, "add", "a.py")
+    server = make(
+        tmp_path, monkeypatch, [*PLANNERS, JUDGE, *IN_PLACE, LENS_C, LENS_S, VOTE_C, VOTE_S, *FIXER], autonomy=cfg()
+    )
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert report.startswith("/ultracode not started: the checkout has uncommitted changes (a.py); commit or stash")
+    assert "No agent was spent" in report
+    assert not server.subagents.handles and sum(len(p.log) for p in server.providers) == 0
+    assert (repo / "a.py").read_text() == "x = 2  # the user's work in progress\n"
+    assert not (repo / ".k3code" / "reports").exists() and not (repo / ".k3code" / "plans").exists()
+
+
+async def test_the_refusal_names_the_files_the_way_the_fanout_does(tmp_path, monkeypatch):
+    from k3code.autonomy.fanout import dirty_checkout, dirty_text
+
+    repo = git_repo(tmp_path / "repo")
+    for i in range(7):
+        (repo / f"m{i}.py").write_text("x = 1\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-qm", "more files")
+    for i in range(7):
+        (repo / f"m{i}.py").write_text("x = 2\n")
+    dirty = await dirty_checkout(repo)
+    assert len(dirty) == 7
+    assert dirty_text(dirty) == (
+        "the checkout has uncommitted changes (m0.py, m1.py, m2.py, m3.py, m4.py and 2 more); commit or stash them"
+    )
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_untracked_files_do_not_stop_ultracode(tmp_path, monkeypatch):
+    # the fan-out only minds tracked changes (a worker starts from HEAD): an untracked file is no reason to refuse
+    repo = git_repo(tmp_path / "repo")
+    (repo / "notes.txt").write_text("not tracked\n")
+    server = make(tmp_path, monkeypatch, [*PLANNERS, JUDGE], mode="auto", autonomy=cfg(), ultracode={"max_agents": 3})
+    await call(server, "session.create", {"cwd": str(repo)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "/ultracode not started" not in report and "STOPPED" in report
+    assert len([h for h in server.subagents.handles.values() if h.agent_type == "planner"]) == 3
+
+
+@pytest.mark.usefixtures("sandbox_optional")
+async def test_outside_a_git_repository_one_worker_runs_in_place_and_the_report_says_it_was_not_reviewed(
+    tmp_path, monkeypatch
+):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    server = make(tmp_path, monkeypatch, [*PLANNERS, JUDGE, *IN_PLACE], mode="auto", autonomy=cfg())
+    await call(server, "session.create", {"cwd": str(plain)})
+    await run_job(server, "ultracode add three files")
+    report = server.session.stored.messages[-1]["content"]
+    assert "/ultracode not started" not in report
+    assert (plain / "f1.txt").read_text() == "new work\n"
+    assert "implementation (single worker in place, fan-out skipped): completed" in report
+    assert "the review panel did not run: the single worker changed the checkout in place" in report
+    assert "nothing to review: no committed changes" not in report
+    assert "## Review panel\nnot run" in report and "Final tests\npass (true)" in report

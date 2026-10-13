@@ -17,16 +17,19 @@ from k3code.autonomy import DEFAULT_MIN_SCOPE
 from k3code.autonomy.agents import DEFAULT_MAX_AGENTS, AgentLimits, session_limits
 from k3code.autonomy.fanout import (
     IO_HEAVY_RE,
-    REVIEW_ATTEMPTS,
     FanoutResult,
     detect_test_command,
+    dirty_checkout,
+    dirty_text,
     extract_subtasks,
     run_tests,
 )
 from k3code.autonomy.plan_first import PLAN_SECTIONS, parse_plan
 from k3code.autonomy.scope import ScopeVerdict
 from k3code.autonomy.sizing import (
+    REVIEW_ATTEMPTS,
     REVIEW_HOLD,
+    WORKER_AGENTS,
     group_steps,
     pick_planners,
     size_agents,
@@ -321,6 +324,10 @@ class Ultra:
         """Plan, fan out, review, fix, test. ``verdict`` is the classifier's rating of the task when there is one (the
         always-on mode path); with dynamic sizing it decides how many planners run. ``scope`` alone (no verdict) only
         bounds the workers."""
+        if dirty := await dirty_checkout(Path(session.perms.cwd)):
+            # the fan-out refuses a dirty checkout, and a run that only finds out after the planners and the judge has
+            # spent them for nothing: the in-place worker it falls back to leaves the review panel nothing to read
+            return f"/ultracode not started: {dirty_text(dirty)}. No agent was spent."
         scope = scope or getattr(verdict, "scope", None)
         cfg = ultra_cfg(self.server.config)
         limits = session_limits(self.server.config, session)
@@ -362,7 +369,7 @@ class Ultra:
             else:
                 subtasks = extract_subtasks(plan_verdict(up.plan), up.plan) or [task]
                 if limits.auto:  # no sizing, but "auto" still keeps only what the plan uses
-                    budget.trim(budget.agents + REVIEW_HOLD + 3 * len(subtasks))
+                    budget.trim(budget.agents + REVIEW_HOLD + WORKER_AGENTS * len(subtasks))
             self.progress(session, "ultracode", "implementing", detail, budget)
             fan = await self.server.fanout.run(session, brief, up.plan, subtasks, budget=budget, width=width)
             report.fanout = fan
@@ -371,7 +378,8 @@ class Ultra:
                     report.notes.append(f"fan-out stopped early ({fan.stopped}); what was merged is still reviewed")
                 else:
                     raise BudgetStop(fan.stopped, fan.stopped_kind or "agents")
-            if fan is None:  # no git repo, or uncommitted changes in the checkout: one worker, in place
+            if fan is None:  # no git repo (or no commit yet), or the checkout got dirty meanwhile: one worker, in place
+                report.in_place = True
                 prompt = f"Implement this task following the plan.\n\nTask:\n{brief}\n\nPlan:\n{up.plan}"
                 h = await self.run_child(session, budget, "worker", prompt, "implement")
                 report.notes.append(f"implementation (single worker in place, fan-out skipped): {h.status}")
@@ -424,8 +432,8 @@ class Ultra:
             why = "; ".join(sized.reasons) or "no agents left for the implementation"
             raise BudgetStop(f"agent budget exhausted ({budget.agents}/{budget.max_agents} agents): {why}", "agents")
         budget.reserve(sized.hold)
-        if limits.auto:  # what the plan uses: each worker and its reviewer, one rework apiece, and the review tail
-            budget.trim(budget.agents + sized.hold + 3 * sized.workers)
+        if limits.auto:  # what the plan uses: what each worker can use (a rework and both reviews) and the review tail
+            budget.trim(budget.agents + sized.hold + WORKER_AGENTS * sized.workers)
         held = f"{sized.hold} held for the review" if sized.hold else "none held for the review"
         detail = sized.describe(len(steps), f"budget {budget.max_agents}: {budget.agents} used, {held}")
         if sized.reasons:
@@ -493,7 +501,12 @@ class Ultra:
         if base:
             _, diff = await wt_mod.git(cwd, "diff", *HARNESS_GIT_DIFF_FLAGS, f"{base}..HEAD")
         if not diff.strip():
-            report.notes.append("nothing to review: no committed changes")
+            report.notes.append(
+                "the review panel did not run: the single worker changed the checkout in place (fan-out skipped), "
+                "and the panel reads committed changes only"
+                if report.in_place
+                else "nothing to review: no committed changes"
+            )
             return
         cut = ""
         if len(diff) > REVIEW_DIFF_CHARS:
@@ -591,9 +604,18 @@ class Ultra:
             f"Fix these confirmed review findings (both reviewers agreed they are real). "
             f"Task context:\n{task}\n\nFindings:\n{json.dumps(confirmed, indent=1)}\n\nKeep changes minimal."
         )
-        h = await self.run_child(
-            session, budget, "worker", fix_prompt, "fix findings", reserved=True, isolation="worktree"
-        )
+        try:
+            h = await self.run_child(
+                session, budget, "worker", fix_prompt, "fix findings", reserved=True, isolation="worktree"
+            )
+        except BudgetStop as e:
+            if e.kind != "agents":  # out of tokens: the run ends here, final tests included
+                raise
+            # the final tests spend no agent: a fixer the agent budget refused must not cost the run its test result
+            report.stopped = str(e)
+            report.notes.append(f"the {len(confirmed)} confirmed finding(s) were not fixed: the fixer could not start")
+            self.progress(session, "ultracode", "stopped", str(e), budget)
+            return
         report.fix = f"{h.status}; merge: {h.merge}" + (f" ({h.branch})" if h.merge == "conflict" else "")
 
 
@@ -681,6 +703,8 @@ class _Report:
     budget: str = ""
     timing: str = ""
     sizing: str = ""
+    #: the fan-out was skipped and one worker changed the checkout itself: nothing it did is in the committed diff
+    in_place: bool = False
 
     def render(self) -> str:
         out = [f"# ultracode report\n\nTask: {self.task}"]

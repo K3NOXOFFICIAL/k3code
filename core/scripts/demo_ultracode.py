@@ -1,4 +1,4 @@
-"""Fake-provider demo: /ultracode on a temp git repo with 3 parallel subtasks. Prints an event summary + git graph.
+"""Fake-provider demo: /ultracode on a temp git repo with parallel subtasks (2 workers at the default 12 agents). Prints an event summary + git graph.
 
 Run: cd core && uv run python scripts/demo_ultracode.py
 """

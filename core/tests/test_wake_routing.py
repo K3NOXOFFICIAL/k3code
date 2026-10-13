@@ -961,3 +961,25 @@ async def test_a_context_overflow_retry_runs_its_own_hooks(tmp_path, monkeypatch
     # once for the typed prompt (ahead of routing), once for the retry's own turn
     assert count.read_text().split() == ["prompt", "prompt"]
     await server.close()
+
+
+async def test_mode_on_in_a_checkout_with_uncommitted_changes_is_a_normal_turn_and_says_why(tmp_path, monkeypatch):
+    """/ultracode refuses such a checkout; a typed prompt of the always-on mode is answered, not refused."""
+    server = make(tmp_path, monkeypatch, [NORMAL])
+    pipe = pipeline(server, monkeypatch)
+
+    async def dirty(_cwd: Any) -> list[str]:
+        return ["a.py"]
+
+    monkeypatch.setattr("k3code.gateway.server.dirty_checkout", dirty)
+    await start(server, tmp_path)
+    server.session.ultra_mode = "ultracode"
+    await submit(server, "add a --verbose flag to the CLI")
+    assert pipe.calls == [] and progress(server) == []
+    assert classifier_calls(server) == 1  # the ordinary gate's own rating: none was spent on a run that cannot start
+    assert transcript(server)[-1] == ("assistant", "NORMAL-TURN")
+    shown = [e for e in events(server, "notification.show") if "ultracode" in str(e.get("kind"))]
+    assert len(shown) == 1 and "a.py" in shown[0]["text"] and "commit or stash" in shown[0]["text"]
+    await submit(server, "and another one")
+    shown = [e for e in events(server, "notification.show") if "ultracode" in str(e.get("kind"))]
+    assert {e["key"] for e in shown} == {f"k3.ultra_dirty.{server.session.session_id}"}  # one key: shown once

@@ -46,7 +46,7 @@ from k3code.agent.loop import AgentLoop, ApprovalResult
 from k3code.artifacts import ArtifactStore
 from k3code.autonomy import advisor, autonomy_cfg
 from k3code.autonomy.agents import agent_limits, clean_override, session_limits
-from k3code.autonomy.fanout import FanoutExecutor
+from k3code.autonomy.fanout import FanoutExecutor, dirty_checkout, dirty_text
 from k3code.autonomy.plan_first import GateResult, PlanFirst
 from k3code.autonomy.scope import SCOPES
 from k3code.autonomy.ultra import Ultra, ultra_cfg
@@ -2048,6 +2048,19 @@ class GatewayServer:
             or session.preapproved_plan  # /go after /ultraplan: the plan is approved, the gate hands it to fan-out
             or text.lstrip().startswith("/")
         ):
+            return None
+        if dirty := await dirty_checkout(Path(session.perms.cwd)):
+            # /ultracode refuses a checkout with uncommitted changes (the fan-out merges into it): a typed prompt is
+            # answered by an ordinary turn instead of by that refusal, and the user is told once why nothing ran
+            session.emit(
+                "notification.show",
+                {
+                    "text": f"ultracode is on but skipped for this prompt: {dirty_text(dirty)}",
+                    "level": "info",
+                    "kind": "ultracode",
+                    "key": f"k3.ultra_dirty.{session.session_id}",
+                },
+            )
             return None
         session.emit("status.update", {"kind": "status", "text": "checking scope", "state": "working"})
         verdict = await self.autonomy.mode_verdict(session, text)

@@ -693,3 +693,131 @@ async def test_a_reviewer_that_died_has_the_same_result_reviewed_again_not_rewor
     # and a plain rejection is reworked as before
     _, reworks, merges, _ = await play(verdict_of("fail"), verdict_of("pass"))
     assert len(reworks) == 1 and merges == ["t1"]
+
+
+def test_a_rework_takes_the_agents_of_itself_and_its_rereview_together_or_none():
+    from types import SimpleNamespace
+
+    from k3code.autonomy.fanout import FanoutExecutor, Subtask
+    from k3code.subagents.budget import AgentBudget
+
+    ex = FanoutExecutor.__new__(FanoutExecutor)
+
+    def reserve(budget: AgentBudget | None, st: Subtask) -> str:
+        return ex._reserve_rework(SimpleNamespace(budget=budget), st)
+
+    # two free agents: both are taken now, and the rework and its re-review are then paid from them
+    budget, st = AgentBudget(max_agents=9), Subtask(id="t1", title="x")
+    budget.agents = 7
+    assert reserve(budget, st) == "" and budget.agents == 9 and st.prepaid == 2
+
+    # one free agent: nothing is taken, and the reason names what was missing
+    budget, st = AgentBudget(max_agents=9), Subtask(id="t1", title="x")
+    budget.agents = 8
+    why = reserve(budget, st)
+    assert "agent budget exhausted (8/9 agents)" in why and "a rework and its re-review need 2 more" in why
+    assert budget.agents == 8 and st.prepaid == 0
+
+    # the agents held back for the review are not free ones
+    budget, st = AgentBudget(max_agents=9), Subtask(id="t1", title="x")
+    budget.agents = 5
+    budget.reserve(3)
+    assert "3 held back for the review" in reserve(budget, st) and budget.agents == 5
+
+    # an agent already paid for counts: only the missing one is taken
+    budget, st = AgentBudget(max_agents=9), Subtask(id="t1", title="x", prepaid=1)
+    budget.agents = 8
+    assert reserve(budget, st) == "" and budget.agents == 9 and st.prepaid == 2
+
+    # two reworks side by side cannot both count the same free agents
+    budget = AgentBudget(max_agents=9)
+    budget.agents = 6
+    first, second = Subtask(id="t1", title="x"), Subtask(id="t2", title="y")
+    assert reserve(budget, first) == "" and reserve(budget, second) != ""
+    assert budget.agents == 8 and second.prepaid == 0
+
+    # no budget, or one without a limit: nothing to check
+    assert reserve(None, Subtask(id="t1", title="x")) == ""
+    unlimited, st = AgentBudget(), Subtask(id="t1", title="x")
+    assert reserve(unlimited, st) == "" and st.prepaid == 2
+
+
+async def test_a_rejected_result_is_escalated_not_reworked_when_the_budget_cannot_review_the_rework():
+    import asyncio
+    from types import SimpleNamespace
+
+    from k3code.autonomy.fanout import FanoutExecutor, Subtask
+    from k3code.subagents.budget import AgentBudget
+    from k3code.subagents.runner import Handle
+
+    def handle(agent_type: str, result: str) -> Handle:
+        h = Handle(id="h", description="d", agent_type=agent_type, tier="main", depth=1, parent_sid="s")
+        h.status, h.result, h.diff, h.diff_stat = "completed", result, "", ""
+        h.worktree = SimpleNamespace(branch="k3/t1", path="/wt/t1", base="abc")  # type: ignore[assignment]
+        h.merge = "merged"
+        return h
+
+    spawned: list[str] = []
+    states: list[tuple[str, str]] = []
+
+    async def spawn(ctx, st, agent_type, *args, **kwargs):
+        spawned.append(agent_type)
+        return handle(agent_type, "no test. VERDICT: fail" if agent_type == "reviewer" else "done")
+
+    async def rework(ctx, st, problem):
+        spawned.append("rework")
+        return handle("worker", "done")
+
+    ex = FanoutExecutor.__new__(FanoutExecutor)
+    ex._spawn, ex._rework = spawn, rework  # type: ignore[method-assign]
+    ex.progress = lambda ctx, st, state, detail="": states.append((state, detail))  # type: ignore[method-assign]
+    ex.worker_prompt = lambda ctx, st: "work"  # type: ignore[method-assign]
+    budget = AgentBudget(max_agents=9)
+    budget.agents = 8  # one free agent: a rework would run, and its re-review would be refused
+    ctx = SimpleNamespace(
+        sem=asyncio.Semaphore(1), budget=budget, plan="", result=SimpleNamespace(stopped="", stopped_kind="")
+    )
+    st = Subtask(id="t1", title="add files")
+    await ex._one(ctx, st)
+    assert spawned == ["worker", "reviewer"]  # no rework
+    assert states[-1][0] == "escalated" and "a rework and its re-review need 2 more" in states[-1][1]
+    assert "no test. VERDICT: fail" in states[-1][1] and st.attempts == 0
+    assert budget.agents == 8 and st.prepaid == 0  # nothing was spent on it
+
+
+async def test_a_failed_merge_is_escalated_not_reworked_when_the_budget_cannot_review_the_rework(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    import k3code.autonomy.fanout as fanout_mod
+    from k3code.autonomy.fanout import FanoutExecutor, Subtask
+    from k3code.subagents.budget import AgentBudget
+
+    async def merge_trial(wt):
+        return False, "CONFLICT in a.py"
+
+    async def head_sha(repo):
+        return "abc"
+
+    monkeypatch.setattr(fanout_mod.wt_mod, "merge_trial", merge_trial)
+    monkeypatch.setattr(fanout_mod.wt_mod, "head_sha", head_sha)
+    states: list[tuple[str, str]] = []
+    reworks: list[str] = []
+
+    async def rework(ctx, st, problem):
+        reworks.append(problem)
+        raise AssertionError("a rework with no agent for its re-review must not start")
+
+    ex = FanoutExecutor.__new__(FanoutExecutor)
+    ex._rework = rework  # type: ignore[method-assign]
+    ex.progress = lambda ctx, st, state, detail="": states.append((state, detail))  # type: ignore[method-assign]
+    budget = AgentBudget(max_agents=9)
+    budget.agents = 8
+    ctx = SimpleNamespace(merge_lock=asyncio.Lock(), test_cmd="", sem=asyncio.Semaphore(1), budget=budget)
+    st = Subtask(
+        id="t1", title="add files", worktree=SimpleNamespace(repo="/r", path="/wt", branch="k3/t1", base="abc")
+    )
+    await ex._merge(ctx, st)
+    assert reworks == [] and st.attempts == 0 and budget.agents == 8
+    assert states[-1][0] == "escalated"
+    assert "merge conflict" in states[-1][1] and "a rework and its re-review need 2 more" in states[-1][1]
