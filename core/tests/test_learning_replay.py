@@ -5,8 +5,17 @@ from __future__ import annotations
 import asyncio
 
 from k3code.learning import replay
-from k3code.learning.replay import Candidate, ReplayStore, auto_ok, build_record, evaluate_sync, tier_pass_delta
+from k3code.learning.replay import (
+    SKILLS_CANDIDATE,
+    Candidate,
+    ReplayStore,
+    auto_ok,
+    build_record,
+    evaluate_sync,
+    tier_pass_delta,
+)
 from k3code.providers.types import Message, ToolCall
+from k3code.skills import PROMPT_LIMIT
 
 
 def turn(
@@ -107,6 +116,20 @@ def test_the_store_round_trips_skips_torn_lines_and_never_holds_text(tmp_path):
     loaded = store.load()
     assert len(loaded) == 1 and loaded[0]["turn"] == "t1" and loaded[0]["passed"] is True
     assert secret not in store.path.read_text(encoding="utf-8")  # sizes and outcomes only
+
+
+def test_token_candidates_default_the_skills_limit_to_the_prompt_limit():
+    """The default stayed a literal 60 after the prompt listing was cut to 30 (#85)."""
+    turns = [turn(i, skills=[80] * (PROMPT_LIMIT + 5)) for i in range(5)]
+    cands = asyncio.run(replay.token_candidates({}, turns))
+    skills = next(c for c in cands if "skill_prompt_limit" in c["patch"]["context"])
+    assert skills["title"] == f"List {SKILLS_CANDIDATE} skills in the prompt, not {PROMPT_LIMIT}"
+    # a configured limit still wins over the default
+    configured = asyncio.run(replay.token_candidates({"skill_prompt_limit": 25}, turns))
+    assert next(c for c in configured if "skill_prompt_limit" in c["patch"]["context"])["title"].endswith("not 25")
+    # a listing already at the candidate size has nothing to cut
+    at_candidate = asyncio.run(replay.token_candidates({"skill_prompt_limit": SKILLS_CANDIDATE}, turns))
+    assert all("skill_prompt_limit" not in c["patch"]["context"] for c in at_candidate)
 
 
 def test_the_auto_gate_needs_a_real_reduction_and_a_bounded_pass_drop():
